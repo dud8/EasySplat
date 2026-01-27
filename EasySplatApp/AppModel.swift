@@ -196,7 +196,7 @@ enum AppConfig {
             return env
         }
         guard let url = Bundle.main.url(forResource: "public_key_ed25519", withExtension: "txt"),
-              let text = try? String(contentsOf: url) else {
+              let text = try? String(contentsOf: url, encoding: .utf8) else {
             return ""
         }
         return text.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -209,7 +209,7 @@ enum AppConfig {
 
     private static func readURLResource(named: String) -> URL? {
         guard let url = Bundle.main.url(forResource: named, withExtension: "txt"),
-              let text = try? String(contentsOf: url) else { return nil }
+              let text = try? String(contentsOf: url, encoding: .utf8) else { return nil }
         return URL(string: text.trimmingCharacters(in: .whitespacesAndNewlines))
     }
 }

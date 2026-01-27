@@ -1,10 +1,11 @@
-import XCTest
+import Foundation
+import Testing
 @testable import EasySplatApp
-import EasySplatCore
+@testable import EasySplatCore
 
 @MainActor
-final class AppModelTests: XCTestCase {
-    func testStartProjectTransitionsToViewer() async throws {
+struct AppModelTests {
+    @Test func startProjectTransitionsToViewer() async throws {
         let tempBase = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
         try FileManager.default.createDirectory(at: tempBase, withIntermediateDirectories: true)
         let input = tempBase.appendingPathComponent("input.mov")
@@ -20,13 +21,14 @@ final class AppModelTests: XCTestCase {
 
         await model.startProject(inputURL: input, isFolder: false)
 
-        XCTAssertEqual(model.viewState, .viewer)
-        XCTAssertNotNil(model.currentProjectURL)
-        XCTAssertNotNil(model.outputPlyURL)
-        if let projectURL = model.currentProjectURL {
-            let metadataURL = projectURL.appendingPathComponent("project.json")
-            XCTAssertTrue(FileManager.default.fileExists(atPath: metadataURL.path))
+        #expect(model.viewState == .viewer)
+        #expect(model.currentProjectURL != nil)
+        #expect(model.outputPlyURL != nil)
+        guard let projectURL = model.currentProjectURL else {
+            throw AppModelTestError.missingProjectURL
         }
+        let metadataURL = projectURL.appendingPathComponent("project.json")
+        #expect(FileManager.default.fileExists(atPath: metadataURL.path))
     }
 }
 
@@ -68,4 +70,8 @@ final class MockPipelineRunner: PipelineRunning {
         metadata.state = PipelineState(stage: .done, attempt: 0, lastError: nil, resumeToken: nil)
         try ProjectMetadataStore.save(metadata, to: paths.metadataURL)
     }
+}
+
+private enum AppModelTestError: Error {
+    case missingProjectURL
 }

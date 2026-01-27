@@ -1,0 +1,42 @@
+{
+  "originHash" : "7c1e75a6527a17a9b02cd4ffbc43e1a52dea3e0256d9de807ea73d1c6a336b35",
+  "pins" : [
+    {
+      "identity" : "metalsplatter",
+      "kind" : "remoteSourceControl",
+      "location" : "https://github.com/scier/MetalSplatter.git",
+      "state" : {
+        "revision" : "221348301cae5e14388410b9ed080c3d61cbfbbc",
+        "version" : "0.1.1"
+      }
+    },
+    {
+      "identity" : "sparkle",
+      "kind" : "remoteSourceControl",
+      "location" : "https://github.com/sparkle-project/Sparkle.git",
+      "state" : {
+        "revision" : "5581748cef2bae787496fe6d61139aebe0a451f6",
+        "version" : "2.8.1"
+      }
+    },
+    {
+      "identity" : "swift-syntax",
+      "kind" : "remoteSourceControl",
+      "location" : "https://github.com/swiftlang/swift-syntax.git",
+      "state" : {
+        "revision" : "9b6d2d09c474336c8a5477a669ca976e58586f75",
+        "version" : "603.0.0-prerelease-2025-12-17"
+      }
+    },
+    {
+      "identity" : "swift-testing",
+      "kind" : "remoteSourceControl",
+      "location" : "https://github.com/swiftlang/swift-testing.git",
+      "state" : {
+        "branch" : "main",
+        "revision" : "91e6561afc485fe7cc159e4d2083421f7d4cfb8b"
+      }
+    }
+  ],
+  "version" : 3
+}

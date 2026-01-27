@@ -65,7 +65,7 @@ public final class PipelineRunner: @unchecked Sendable {
             let videoURL = paths.originalsURL.appendingPathComponent(sourceName)
             emit(.stageStarted(stage: .extractFrames))
             let extractor = FrameExtractor()
-            let rawFrames = try extractor.extractFrames(
+            let rawFrames = try await extractor.extractFrames(
                 from: videoURL,
                 to: paths.framesRawURL,
                 options: FrameExtractionOptions(targetCount: targetFrames, maxDimension: maxDim),
@@ -325,16 +325,24 @@ private final class PipelineLogger: @unchecked Sendable {
         var line = data
         line.append(0x0A)
         guard let handle = eventsHandle else { return }
-        try? handle.seekToEnd()
-        try? handle.write(contentsOf: line)
+        do {
+            try handle.seekToEnd()
+            try handle.write(contentsOf: line)
+        } catch {
+            return
+        }
     }
 
     private func appendLogLine(_ line: String, isError: Bool) {
         guard let handle = logHandle else { return }
         let prefix = isError ? "[err] " : ""
         if let data = "\(prefix)\(line)\n".data(using: .utf8) {
-            try? handle.seekToEnd()
-            try? handle.write(contentsOf: data)
+            do {
+                try handle.seekToEnd()
+                try handle.write(contentsOf: data)
+            } catch {
+                return
+            }
         }
     }
 }

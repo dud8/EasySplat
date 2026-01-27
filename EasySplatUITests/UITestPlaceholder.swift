@@ -1,3 +1,4 @@
+#if canImport(XCTest)
 import XCTest
 
 #if !SWIFT_PACKAGE
@@ -14,4 +15,5 @@ final class EasySplatUITests: XCTestCase {
         throw XCTSkip("UI tests require Xcode UI test runner. Skipped in SwiftPM.")
     }
 }
+#endif
 #endif

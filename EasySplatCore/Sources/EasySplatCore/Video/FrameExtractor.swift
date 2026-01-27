@@ -27,12 +27,14 @@ public final class FrameExtractor {
         to outputDir: URL,
         options: FrameExtractionOptions,
         progress: @escaping @Sendable (Double, String) -> Void
-    ) throws -> [URL] {
-        let asset = AVAsset(url: videoURL)
-        guard let track = asset.tracks(withMediaType: .video).first else {
+    ) async throws -> [URL] {
+        let asset = AVURLAsset(url: videoURL)
+        let tracks = try await asset.loadTracks(withMediaType: .video)
+        guard let track = tracks.first else {
             throw ExtractionError.invalidVideo
         }
-        let durationSeconds = CMTimeGetSeconds(asset.duration)
+        let duration = try await asset.load(.duration)
+        let durationSeconds = CMTimeGetSeconds(duration)
         guard durationSeconds > 0 else { throw ExtractionError.invalidVideo }
 
         let sampleCount = max(options.targetCount * 2, options.targetCount)
@@ -40,29 +42,66 @@ public final class FrameExtractor {
 
         let generator = AVAssetImageGenerator(asset: asset)
         generator.appliesPreferredTrackTransform = true
-        let maxSize = track.naturalSize
+        let maxSize = try await track.load(.naturalSize)
         let scale = min(options.maxDimension / max(maxSize.width, maxSize.height), 1.0)
         generator.maximumSize = CGSize(width: maxSize.width * scale, height: maxSize.height * scale)
 
-        var outputURLs: [URL] = []
-        for index in 0..<sampleCount {
-            let time = CMTimeMakeWithSeconds(Double(index) * step, preferredTimescale: 600)
-            do {
-                let cgImage = try generator.copyCGImage(at: time, actualTime: nil)
-                let fileURL = outputDir.appendingPathComponent(String(format: "frame_%06d.jpg", index))
-                try writeJPEG(cgImage: cgImage, to: fileURL)
-                outputURLs.append(fileURL)
-                progress(Double(index + 1) / Double(sampleCount), "Extracting frames")
-            } catch {
-                continue
-            }
+        let times = (0..<sampleCount).map { index in
+            CMTimeMakeWithSeconds(Double(index) * step, preferredTimescale: 600)
         }
-
-        if outputURLs.isEmpty { throw ExtractionError.extractionFailed }
-        return outputURLs
+        return try await generateImages(
+            generator: generator,
+            times: times,
+            outputDir: outputDir,
+            progress: progress
+        )
     }
 
-    private func writeJPEG(cgImage: CGImage, to url: URL) throws {
+    private func generateImages(
+        generator: AVAssetImageGenerator,
+        times: [CMTime],
+        outputDir: URL,
+        progress: @escaping @Sendable (Double, String) -> Void
+    ) async throws -> [URL] {
+        guard !times.isEmpty else { throw ExtractionError.extractionFailed }
+        let requestedTimes = times.map { NSValue(time: $0) }
+
+        return try await withCheckedThrowingContinuation { continuation in
+            let state = FrameExtractionState(count: times.count)
+
+            generator.generateCGImagesAsynchronously(forTimes: requestedTimes) { requestedTime, cgImage, _, result, _ in
+                let snapshot = state.withLock { state -> (progress: Double, isComplete: Bool, urls: [URL]?) in
+                    if result == .succeeded,
+                       let cgImage,
+                       let index = times.firstIndex(where: { CMTimeCompare($0, requestedTime) == 0 }) {
+                        let fileURL = outputDir.appendingPathComponent(String(format: "frame_%06d.jpg", index))
+                        if (try? Self.writeJPEG(cgImage: cgImage, to: fileURL)) != nil {
+                            state.outputURLs[index] = fileURL
+                        }
+                    }
+
+                    state.completed += 1
+                    let progressValue = Double(state.completed) / Double(times.count)
+                    if state.completed == times.count {
+                        return (progressValue, true, state.outputURLs.compactMap { $0 })
+                    }
+                    return (progressValue, false, nil)
+                }
+
+                progress(snapshot.progress, "Extracting frames")
+
+                if snapshot.isComplete {
+                    if let urls = snapshot.urls, !urls.isEmpty {
+                        continuation.resume(returning: urls)
+                    } else {
+                        continuation.resume(throwing: ExtractionError.extractionFailed)
+                    }
+                }
+            }
+        }
+    }
+
+    private static func writeJPEG(cgImage: CGImage, to url: URL) throws {
         guard let destination = CGImageDestinationCreateWithURL(url as CFURL, UTType.jpeg.identifier as CFString, 1, nil) else {
             throw ExtractionError.extractionFailed
         }
@@ -70,5 +109,22 @@ public final class FrameExtractor {
         if !CGImageDestinationFinalize(destination) {
             throw ExtractionError.extractionFailed
         }
+    }
+}
+
+private final class FrameExtractionState: @unchecked Sendable {
+    var completed: Int
+    var outputURLs: [URL?]
+    private let lock = NSLock()
+
+    init(count: Int) {
+        self.completed = 0
+        self.outputURLs = Array(repeating: nil, count: count)
+    }
+
+    func withLock<T>(_ body: (FrameExtractionState) -> T) -> T {
+        lock.lock()
+        defer { lock.unlock() }
+        return body(self)
     }
 }

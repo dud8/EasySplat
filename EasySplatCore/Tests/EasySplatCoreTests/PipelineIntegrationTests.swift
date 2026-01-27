@@ -1,10 +1,11 @@
-import XCTest
+import Foundation
+import Testing
 @testable import EasySplatCore
 import ImageIO
 import UniformTypeIdentifiers
 
-final class PipelineIntegrationTests: XCTestCase {
-    func testPipelineSuccessWithGlomap() async throws {
+struct PipelineIntegrationTests {
+    @Test func testPipelineSuccessWithGlomap() async throws {
         let temp = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
         let projectURL = temp.appendingPathComponent("Test.easysplatproj", isDirectory: true)
         let sourcePhotos = temp.appendingPathComponent("SourcePhotos", isDirectory: true)
@@ -49,10 +50,10 @@ final class PipelineIntegrationTests: XCTestCase {
         try await pipeline.run { _ in }
 
         let output = projectURL.appendingPathComponent("Output/splat.ply")
-        XCTAssertTrue(FileManager.default.fileExists(atPath: output.path))
+        #expect(FileManager.default.fileExists(atPath: output.path))
     }
 
-    func testPipelineGlomapFallbackToColmap() async throws {
+    @Test func testPipelineGlomapFallbackToColmap() async throws {
         let temp = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
         let projectURL = temp.appendingPathComponent("Test.easysplatproj", isDirectory: true)
         let sourcePhotos = temp.appendingPathComponent("SourcePhotos", isDirectory: true)
@@ -97,23 +98,23 @@ final class PipelineIntegrationTests: XCTestCase {
 
         try await pipeline.run { _ in }
         let output = projectURL.appendingPathComponent("Output/splat.ply")
-        XCTAssertTrue(FileManager.default.fileExists(atPath: output.path))
+        #expect(FileManager.default.fileExists(atPath: output.path))
     }
 
-    func testPipelineFailsOnLowQuality() async {
+    @Test func testPipelineFailsOnLowQuality() async throws {
         let temp = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
         let projectURL = temp.appendingPathComponent("Test.easysplatproj", isDirectory: true)
         let sourcePhotos = temp.appendingPathComponent("SourcePhotos", isDirectory: true)
-        try? FileManager.default.createDirectory(at: sourcePhotos, withIntermediateDirectories: true)
-        try? writeTestImage(url: sourcePhotos.appendingPathComponent("img1.jpg"), value: 20)
-        try? writeTestImage(url: sourcePhotos.appendingPathComponent("img2.jpg"), value: 40)
+        try FileManager.default.createDirectory(at: sourcePhotos, withIntermediateDirectories: true)
+        try writeTestImage(url: sourcePhotos.appendingPathComponent("img1.jpg"), value: 20)
+        try writeTestImage(url: sourcePhotos.appendingPathComponent("img2.jpg"), value: 40)
 
         let metadata = ProjectMetadata(title: "Test",
                                        input: .photos(folder: sourcePhotos.path),
                                        preset: PresetSpec(mode: .object, quality: .draft))
         let paths = ProjectPaths(root: projectURL)
-        try? paths.ensureDirectories()
-        try? ProjectMetadataStore.save(metadata, to: paths.metadataURL)
+        try paths.ensureDirectories()
+        try ProjectMetadataStore.save(metadata, to: paths.metadataURL)
 
         let toolchain = ToolchainPaths(
             root: temp,
@@ -137,23 +138,27 @@ final class PipelineIntegrationTests: XCTestCase {
             tooling: .init(runner: runner)
         )
 
-        await XCTAssertThrowsErrorAsync {
+        var didThrow = false
+        do {
             try await pipeline.run { _ in }
+        } catch {
+            didThrow = true
         }
+        #expect(didThrow)
     }
 
-    func testPipelineFailsOnMissingImages() async {
+    @Test func testPipelineFailsOnMissingImages() async throws {
         let temp = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
         let projectURL = temp.appendingPathComponent("Test.easysplatproj", isDirectory: true)
         let sourcePhotos = temp.appendingPathComponent("SourcePhotos", isDirectory: true)
-        try? FileManager.default.createDirectory(at: sourcePhotos, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: sourcePhotos, withIntermediateDirectories: true)
 
         let metadata = ProjectMetadata(title: "Test",
                                        input: .photos(folder: sourcePhotos.path),
                                        preset: PresetSpec(mode: .object, quality: .draft))
         let paths = ProjectPaths(root: projectURL)
-        try? paths.ensureDirectories()
-        try? ProjectMetadataStore.save(metadata, to: paths.metadataURL)
+        try paths.ensureDirectories()
+        try ProjectMetadataStore.save(metadata, to: paths.metadataURL)
 
         let toolchain = ToolchainPaths(
             root: temp,
@@ -172,25 +177,29 @@ final class PipelineIntegrationTests: XCTestCase {
             tooling: .init(runner: runner)
         )
 
-        await XCTAssertThrowsErrorAsync {
+        var didThrow = false
+        do {
             try await pipeline.run { _ in }
+        } catch {
+            didThrow = true
         }
+        #expect(didThrow)
     }
 
-    func testPipelineFailsOnMatcherError() async {
+    @Test func testPipelineFailsOnMatcherError() async throws {
         let temp = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
         let projectURL = temp.appendingPathComponent("Test.easysplatproj", isDirectory: true)
         let sourcePhotos = temp.appendingPathComponent("SourcePhotos", isDirectory: true)
-        try? FileManager.default.createDirectory(at: sourcePhotos, withIntermediateDirectories: true)
-        try? writeTestImage(url: sourcePhotos.appendingPathComponent("img1.jpg"), value: 20)
-        try? writeTestImage(url: sourcePhotos.appendingPathComponent("img2.jpg"), value: 40)
+        try FileManager.default.createDirectory(at: sourcePhotos, withIntermediateDirectories: true)
+        try writeTestImage(url: sourcePhotos.appendingPathComponent("img1.jpg"), value: 20)
+        try writeTestImage(url: sourcePhotos.appendingPathComponent("img2.jpg"), value: 40)
 
         let metadata = ProjectMetadata(title: "Test",
                                        input: .photos(folder: sourcePhotos.path),
                                        preset: PresetSpec(mode: .object, quality: .draft))
         let paths = ProjectPaths(root: projectURL)
-        try? paths.ensureDirectories()
-        try? ProjectMetadataStore.save(metadata, to: paths.metadataURL)
+        try paths.ensureDirectories()
+        try ProjectMetadataStore.save(metadata, to: paths.metadataURL)
 
         let toolchain = ToolchainPaths(
             root: temp,
@@ -210,25 +219,29 @@ final class PipelineIntegrationTests: XCTestCase {
             tooling: .init(runner: runner)
         )
 
-        await XCTAssertThrowsErrorAsync {
+        var didThrow = false
+        do {
             try await pipeline.run { _ in }
+        } catch {
+            didThrow = true
         }
+        #expect(didThrow)
     }
 
-    func testPipelineFailsOnBrushError() async {
+    @Test func testPipelineFailsOnBrushError() async throws {
         let temp = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
         let projectURL = temp.appendingPathComponent("Test.easysplatproj", isDirectory: true)
         let sourcePhotos = temp.appendingPathComponent("SourcePhotos", isDirectory: true)
-        try? FileManager.default.createDirectory(at: sourcePhotos, withIntermediateDirectories: true)
-        try? writeTestImage(url: sourcePhotos.appendingPathComponent("img1.jpg"), value: 20)
-        try? writeTestImage(url: sourcePhotos.appendingPathComponent("img2.jpg"), value: 40)
+        try FileManager.default.createDirectory(at: sourcePhotos, withIntermediateDirectories: true)
+        try writeTestImage(url: sourcePhotos.appendingPathComponent("img1.jpg"), value: 20)
+        try writeTestImage(url: sourcePhotos.appendingPathComponent("img2.jpg"), value: 40)
 
         let metadata = ProjectMetadata(title: "Test",
                                        input: .photos(folder: sourcePhotos.path),
                                        preset: PresetSpec(mode: .object, quality: .draft))
         let paths = ProjectPaths(root: projectURL)
-        try? paths.ensureDirectories()
-        try? ProjectMetadataStore.save(metadata, to: paths.metadataURL)
+        try paths.ensureDirectories()
+        try ProjectMetadataStore.save(metadata, to: paths.metadataURL)
 
         let toolchain = ToolchainPaths(
             root: temp,
@@ -251,25 +264,29 @@ final class PipelineIntegrationTests: XCTestCase {
             tooling: .init(runner: runner)
         )
 
-        await XCTAssertThrowsErrorAsync {
+        var didThrow = false
+        do {
             try await pipeline.run { _ in }
+        } catch {
+            didThrow = true
         }
+        #expect(didThrow)
     }
 
-    func testPipelineFailsWhenOutputMissing() async {
+    @Test func testPipelineFailsWhenOutputMissing() async throws {
         let temp = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
         let projectURL = temp.appendingPathComponent("Test.easysplatproj", isDirectory: true)
         let sourcePhotos = temp.appendingPathComponent("SourcePhotos", isDirectory: true)
-        try? FileManager.default.createDirectory(at: sourcePhotos, withIntermediateDirectories: true)
-        try? writeTestImage(url: sourcePhotos.appendingPathComponent("img1.jpg"), value: 20)
-        try? writeTestImage(url: sourcePhotos.appendingPathComponent("img2.jpg"), value: 40)
+        try FileManager.default.createDirectory(at: sourcePhotos, withIntermediateDirectories: true)
+        try writeTestImage(url: sourcePhotos.appendingPathComponent("img1.jpg"), value: 20)
+        try writeTestImage(url: sourcePhotos.appendingPathComponent("img2.jpg"), value: 40)
 
         let metadata = ProjectMetadata(title: "Test",
                                        input: .photos(folder: sourcePhotos.path),
                                        preset: PresetSpec(mode: .object, quality: .draft))
         let paths = ProjectPaths(root: projectURL)
-        try? paths.ensureDirectories()
-        try? ProjectMetadataStore.save(metadata, to: paths.metadataURL)
+        try paths.ensureDirectories()
+        try ProjectMetadataStore.save(metadata, to: paths.metadataURL)
 
         let toolchain = ToolchainPaths(
             root: temp,
@@ -292,9 +309,13 @@ final class PipelineIntegrationTests: XCTestCase {
             tooling: .init(runner: runner)
         )
 
-        await XCTAssertThrowsErrorAsync {
+        var didThrow = false
+        do {
             try await pipeline.run { _ in }
+        } catch {
+            didThrow = true
         }
+        #expect(didThrow)
     }
 
     private func writeTestImage(url: URL, value: UInt8) throws {
@@ -316,21 +337,20 @@ final class PipelineIntegrationTests: XCTestCase {
                 shouldInterpolate: false,
                 intent: .defaultIntent
               ) else {
-            return
+            throw PipelineTestError.imageCreationFailed
         }
         guard let destination = CGImageDestinationCreateWithURL(url as CFURL, UTType.jpeg.identifier as CFString, 1, nil) else {
-            return
+            throw PipelineTestError.destinationCreationFailed
         }
         CGImageDestinationAddImage(destination, cgImage, nil)
-        _ = CGImageDestinationFinalize(destination)
+        guard CGImageDestinationFinalize(destination) else {
+            throw PipelineTestError.destinationFinalizeFailed
+        }
     }
 }
 
-private func XCTAssertThrowsErrorAsync(_ expression: @escaping () async throws -> Void) async {
-    do {
-        try await expression()
-        XCTFail("Expected error to be thrown")
-    } catch {
-        XCTAssertTrue(true)
-    }
+private enum PipelineTestError: Error {
+    case imageCreationFailed
+    case destinationCreationFailed
+    case destinationFinalizeFailed
 }

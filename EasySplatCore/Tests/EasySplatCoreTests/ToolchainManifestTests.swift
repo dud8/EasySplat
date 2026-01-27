@@ -1,9 +1,10 @@
-import XCTest
+import Foundation
+import Testing
 @testable import EasySplatCore
 import CryptoKit
 
-final class ToolchainManifestTests: XCTestCase {
-    func testManifestSignatureVerification() throws {
+struct ToolchainManifestTests {
+    @Test func manifestSignatureVerification() throws {
         let key = Curve25519.Signing.PrivateKey()
         let publicKey = key.publicKey.rawRepresentation.base64EncodedString()
 
@@ -26,10 +27,10 @@ final class ToolchainManifestTests: XCTestCase {
         let signature = try key.signature(for: data)
         manifest.signatureEd25519 = Data(signature).base64EncodedString()
 
-        XCTAssertTrue(manifest.verifying(publicKeyBase64: publicKey))
+        #expect(manifest.verifying(publicKeyBase64: publicKey))
     }
 
-    func testManifestRejectsMissingSignature() throws {
+    @Test func manifestRejectsMissingSignature() throws {
         let key = Curve25519.Signing.PrivateKey()
         let publicKey = key.publicKey.rawRepresentation.base64EncodedString()
 
@@ -42,6 +43,6 @@ final class ToolchainManifestTests: XCTestCase {
             signatureEd25519: ""
         )
 
-        XCTAssertFalse(manifest.verifying(publicKeyBase64: publicKey))
+        #expect(!manifest.verifying(publicKeyBase64: publicKey))
     }
 }
