@@ -11,7 +11,7 @@ let package = Package(
     dependencies: [
         .package(url: "https://github.com/scier/MetalSplatter.git", from: "0.1.1"),
         .package(url: "https://github.com/sparkle-project/Sparkle.git", from: "2.7.3"),
-        .package(url: "https://github.com/swiftlang/swift-testing.git", branch: "main")
+        .package(url: "https://github.com/swiftlang/swift-testing.git", exact: "6.0.2")
     ],
     targets: [
         .target(
