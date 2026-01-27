@@ -33,13 +33,13 @@ struct ManifestTool {
             }
 
             if command == "generate-keypair" {
-                let parser = ArgParser(Array(args.dropFirst()))
+                var parser = ArgParser(Array(args.dropFirst()))
                 let pubOut = try parser.require("--public-key-out")
                 let privOut = try parser.require("--private-key-out")
                 try generateKeypair(publicOut: URL(fileURLWithPath: pubOut), privateOut: URL(fileURLWithPath: privOut))
                 exit(ExitCode.ok.rawValue)
             } else {
-                let parser = ArgParser(Array(args))
+                var parser = ArgParser(Array(args))
                 let zipPath = try parser.require("--zip")
                 let version = try parser.require("--version")
                 let publishedAt = try parser.require("--published-at")
