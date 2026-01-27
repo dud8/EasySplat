@@ -34,7 +34,7 @@ jobs:
 
       - name: Install dependencies
         run: |
-          brew install cmake ninja boost eigen freeimage glog gflags suitesparse ceres-solver qt glew cgal libomp
+          brew install cmake ninja boost eigen freeimage glog gflags suitesparse ceres-solver qt glew cgal libomp openimageio
 
       - name: Build COLMAP
         run: scripts/toolchain/build_colmap.sh
