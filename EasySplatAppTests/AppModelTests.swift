@@ -55,7 +55,7 @@ final class MockPipelineRunner: PipelineRunning {
         self.config = config
     }
 
-    func run(events: @escaping (PipelineEvent) -> Void) async throws {
+    func run(events: @escaping @Sendable (PipelineEvent) -> Void) async throws {
         events(.stageStarted(stage: .importInput))
         events(.stageFinished(stage: .importInput))
 

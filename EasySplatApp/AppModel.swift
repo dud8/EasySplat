@@ -80,8 +80,9 @@ final class AppModel: ObservableObject {
             self.toolchainPaths = toolchain
 
             let runner = pipelineRunnerFactory(projectURL, .init(toolchain: toolchain, preset: metadata.preset))
-            try await runner.run { [weak self] event in
-                Task { @MainActor in self?.handle(event: event) }
+            let forwarder = EventForwarder(model: self)
+            try await runner.run { event in
+                forwarder.handle(event)
             }
 
             if let output = try? ProjectMetadataStore.load(from: paths.metadataURL).outputs?.splatPlyPath {
@@ -143,8 +144,22 @@ final class AppModel: ObservableObject {
     }
 }
 
+private final class EventForwarder: @unchecked Sendable {
+    private weak var model: AppModel?
+
+    init(model: AppModel) {
+        self.model = model
+    }
+
+    func handle(_ event: PipelineEvent) {
+        Task { @MainActor in
+            self.model?.handle(event: event)
+        }
+    }
+}
+
 protocol PipelineRunning {
-    func run(events: @escaping (PipelineEvent) -> Void) async throws
+    func run(events: @escaping @Sendable (PipelineEvent) -> Void) async throws
 }
 
 extension PipelineRunner: PipelineRunning {}

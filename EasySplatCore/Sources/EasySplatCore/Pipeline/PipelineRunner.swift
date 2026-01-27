@@ -40,14 +40,14 @@ public final class PipelineRunner: @unchecked Sendable {
         self.tooling = tooling
     }
 
-    public func run(events: @escaping (PipelineEvent) -> Void) async throws {
+    public func run(events: @escaping @Sendable (PipelineEvent) -> Void) async throws {
         let paths = ProjectPaths(root: projectURL)
         try paths.ensureDirectories()
 
         var metadata = try ProjectMetadataStore.load(from: paths.metadataURL)
         let logger = PipelineLogger(eventsURL: paths.eventsLogURL, logURL: paths.pipelineLogURL, emit: events)
 
-        func emit(_ event: PipelineEvent) {
+        let emit: @Sendable (PipelineEvent) -> Void = { event in
             logger.emit(event)
         }
 
@@ -284,15 +284,16 @@ private extension PipelineRunner {
     }
 }
 
-private final class PipelineLogger {
+private final class PipelineLogger: @unchecked Sendable {
     private let eventsURL: URL
     private let logURL: URL
-    private let emit: (PipelineEvent) -> Void
+    private let emit: @Sendable (PipelineEvent) -> Void
     private let encoder: JSONEncoder
     private let logHandle: FileHandle?
     private let eventsHandle: FileHandle?
+    private let lock = NSLock()
 
-    init(eventsURL: URL, logURL: URL, emit: @escaping (PipelineEvent) -> Void) {
+    init(eventsURL: URL, logURL: URL, emit: @escaping @Sendable (PipelineEvent) -> Void) {
         self.eventsURL = eventsURL
         self.logURL = logURL
         self.emit = emit
@@ -311,10 +312,12 @@ private final class PipelineLogger {
 
     func emit(_ event: PipelineEvent) {
         emit(event)
+        lock.lock()
         appendEvent(event)
         if case let .stageLog(_, line, isError) = event {
             appendLogLine(line, isError: isError)
         }
+        lock.unlock()
     }
 
     private func appendEvent(_ event: PipelineEvent) {
