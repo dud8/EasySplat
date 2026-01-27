@@ -23,27 +23,10 @@ final class SplatViewerController: ObservableObject {
     }
 
     func computeBounds(for url: URL) async throws {
-        var buffer = SplatMemoryBuffer()
-        let reader = AutodetectSceneReader(url)
-        try await buffer.read(from: reader)
-        guard !buffer.points.isEmpty else {
-            currentBounds = nil
-            return
-        }
-        var minPoint = SIMD3<Float>(repeating: .greatestFiniteMagnitude)
-        var maxPoint = SIMD3<Float>(repeating: -.greatestFiniteMagnitude)
-        for point in buffer.points {
-            let pos = SIMD3<Float>(point.position.x, point.position.y, point.position.z)
-            minPoint = simd.min(minPoint, pos)
-            maxPoint = simd.max(maxPoint, pos)
-        }
-        let center = (minPoint + maxPoint) * 0.5
-        let radius = simd_length(maxPoint - minPoint) * 0.5
-        if radius.isFinite {
-            currentBounds = (center: center, radius: radius)
-        } else {
-            currentBounds = nil
-        }
+        let bounds = try await Task.detached {
+            try BoundsCalculator.computeBounds(for: url)
+        }.value
+        currentBounds = bounds
     }
 }
 
@@ -99,7 +82,7 @@ struct MetalKitSceneView: NSViewRepresentable {
         Task {
             do {
                 controller.isLoading = true
-                try await renderer.load(splatURL.map { ModelIdentifier.gaussianSplat($0) })
+                try renderer.load(splatURL.map { ModelIdentifier.gaussianSplat($0) })
                 if let url = splatURL {
                     try await controller.computeBounds(for: url)
                 }
@@ -110,6 +93,50 @@ struct MetalKitSceneView: NSViewRepresentable {
                 controller.errorMessage = error.localizedDescription
                 print("Error loading model: \(error.localizedDescription)")
             }
+        }
+    }
+}
+
+private enum BoundsCalculator {
+    static func computeBounds(for url: URL) throws -> (center: SIMD3<Float>, radius: Float)? {
+        let collector = BoundsCollector()
+        let reader = SplatPLYSceneReader(url)
+        reader.read(to: collector)
+
+        if let error = collector.error {
+            throw error
+        }
+        guard collector.hasPoints else { return nil }
+        let minPoint = collector.minPoint
+        let maxPoint = collector.maxPoint
+        let center = (minPoint + maxPoint) * 0.5
+        let radius = simd_length(maxPoint - minPoint) * 0.5
+        return radius.isFinite ? (center: center, radius: radius) : nil
+    }
+
+    private final class BoundsCollector: NSObject, SplatSceneReaderDelegate {
+        fileprivate var minPoint = SIMD3<Float>(repeating: .greatestFiniteMagnitude)
+        fileprivate var maxPoint = SIMD3<Float>(repeating: -.greatestFiniteMagnitude)
+        fileprivate var hasPoints = false
+        fileprivate var error: Error?
+
+        func didStartReading(withPointCount pointCount: UInt32) {}
+
+        func didRead(points: [SplatScenePoint]) {
+            for point in points {
+                let pos = point.position
+                minPoint = simd.min(minPoint, pos)
+                maxPoint = simd.max(maxPoint, pos)
+            }
+            if !points.isEmpty {
+                hasPoints = true
+            }
+        }
+
+        func didFinishReading() {}
+
+        func didFailReading(withError error: Error?) {
+            self.error = error
         }
     }
 }

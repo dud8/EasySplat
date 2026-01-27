@@ -1,4 +1,4 @@
-// swift-tools-version: 6.1
+// swift-tools-version: 6.0
 import PackageDescription
 
 let package = Package(
@@ -9,7 +9,7 @@ let package = Package(
         .executable(name: "EasySplatApp", targets: ["EasySplatApp"])
     ],
     dependencies: [
-        .package(url: "https://github.com/scier/MetalSplatter.git", revision: "0c286e79b3ad5c5b95e4aeea7a3d7653613fe0e0"),
+        .package(url: "https://github.com/scier/MetalSplatter.git", from: "0.1.1"),
         .package(url: "https://github.com/sparkle-project/Sparkle.git", from: "2.7.3")
     ],
     targets: [

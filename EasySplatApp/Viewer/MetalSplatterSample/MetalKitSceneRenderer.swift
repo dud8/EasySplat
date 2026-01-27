@@ -19,7 +19,7 @@ class MetalKitSceneRenderer: NSObject, MTKViewDelegate {
 
     var model: ModelIdentifier?
     var modelRenderer: (any ModelRenderer)?
-    @MainActor private(set) var lastLoadError: String? = nil
+    private(set) var lastLoadError: String? = nil
 
     let inFlightSemaphore = DispatchSemaphore(value: Constants.maxSimultaneousRenders)
 
@@ -41,12 +41,12 @@ class MetalKitSceneRenderer: NSObject, MTKViewDelegate {
         self.commandQueue = queue
         self.metalKitView = metalKitView
         metalKitView.colorPixelFormat = MTLPixelFormat.bgra8Unorm_srgb
-        metalKitView.depthStencilPixelFormat = MTLPixelFormat.depth32Float
+        metalKitView.depthStencilPixelFormat = MTLPixelFormat.depth32Float_stencil8
         metalKitView.sampleCount = 1
         metalKitView.clearColor = MTLClearColor(red: 0, green: 0, blue: 0, alpha: 0)
     }
 
-    func load(_ model: ModelIdentifier?) async throws {
+    func load(_ model: ModelIdentifier?) throws {
         guard model != self.model else { return }
         self.model = model
 
@@ -58,11 +58,11 @@ class MetalKitSceneRenderer: NSObject, MTKViewDelegate {
                 let splat = try SplatRenderer(device: device,
                                               colorFormat: metalKitView.colorPixelFormat,
                                               depthFormat: metalKitView.depthStencilPixelFormat,
-                                              stencilFormat: .invalid,
+                                              stencilFormat: metalKitView.depthStencilPixelFormat,
                                               sampleCount: metalKitView.sampleCount,
                                               maxViewCount: 1,
                                               maxSimultaneousRenders: Constants.maxSimultaneousRenders)
-                try await splat.read(from: url)
+                try splat.readPLY(from: url)
                 modelRenderer = splat
             case .none:
                 break
@@ -73,7 +73,7 @@ class MetalKitSceneRenderer: NSObject, MTKViewDelegate {
         }
     }
 
-    private var viewport: ModelRendererViewportDescriptor {
+    private var viewportCamera: ModelRenderer.CameraMatrices {
         let aspect = max(drawableSize.width / max(drawableSize.height, 1), 0.1)
         let projectionMatrix = matrix_perspective_right_hand(fovyRadians: Float(Constants.fovy.radians),
                                                              aspectRatio: Float(aspect),
@@ -88,17 +88,13 @@ class MetalKitSceneRenderer: NSObject, MTKViewDelegate {
         // happens to be a useful default for the most common datasets at the moment.
         let commonUpCalibration = matrix4x4_rotation(radians: .pi, axis: SIMD3<Float>(0, 0, 1))
 
-        let viewport = MTLViewport(originX: 0, originY: 0, width: drawableSize.width, height: drawableSize.height, znear: 0, zfar: 1)
-
-        return ModelRendererViewportDescriptor(viewport: viewport,
-                                               projectionMatrix: projectionMatrix,
-                                               viewMatrix: translationMatrix * pitchMatrix * yawMatrix * commonUpCalibration * centerTranslation,
-                                               screenSize: SIMD2(x: Int(drawableSize.width), y: Int(drawableSize.height)))
+        return (projection: projectionMatrix,
+                view: translationMatrix * pitchMatrix * yawMatrix * commonUpCalibration * centerTranslation,
+                screenSize: SIMD2(x: Int(drawableSize.width), y: Int(drawableSize.height)))
     }
 
     func draw(in view: MTKView) {
         guard let modelRenderer else { return }
-        guard let drawable = view.currentDrawable else { return }
 
         _ = inFlightSemaphore.wait(timeout: DispatchTime.distantFuture)
 
@@ -111,24 +107,15 @@ class MetalKitSceneRenderer: NSObject, MTKViewDelegate {
         commandBuffer.addCompletedHandler { (_ commandBuffer)-> Swift.Void in
             semaphore.signal()
         }
+        modelRenderer.willRender(viewportCameras: [viewportCamera])
 
-        let didRender: Bool
-        do {
-            didRender = try modelRenderer.render(viewports: [viewport],
-                                                 colorTexture: view.multisampleColorTexture ?? drawable.texture,
-                                                 colorStoreAction: view.multisampleColorTexture == nil ? .store : .multisampleResolve,
-                                                 depthTexture: view.depthStencilTexture,
-                                                 rasterizationRateMap: nil,
-                                                 renderTargetArrayLength: 0,
-                                                 to: commandBuffer)
-        } catch {
-            Self.log.error("Unable to render scene: \(error.localizedDescription)")
-            didRender = false
-        }
-
-        // Only present if rendering occurred; otherwise drop the frame
-        if didRender {
-            commandBuffer.present(drawable)
+        if let renderPassDescriptor = view.currentRenderPassDescriptor,
+           let renderEncoder = commandBuffer.makeRenderCommandEncoder(descriptor: renderPassDescriptor) {
+            modelRenderer.render(viewportCameras: [viewportCamera], to: renderEncoder)
+            renderEncoder.endEncoding()
+            if let drawable = view.currentDrawable {
+                commandBuffer.present(drawable)
+            }
         }
 
         commandBuffer.commit()
