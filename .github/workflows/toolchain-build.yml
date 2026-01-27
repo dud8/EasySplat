@@ -1,0 +1,76 @@
+name: Toolchain Build
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Toolchain version (semver)"
+        required: true
+        type: string
+  push:
+    tags:
+      - "toolchain-v*"
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve version
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            VERSION="${{ inputs.version }}"
+            TAG="toolchain-v${VERSION}"
+          else
+            TAG="${{ github.ref_name }}"
+            VERSION="${TAG#toolchain-v}"
+          fi
+          echo "VERSION=$VERSION" >> $GITHUB_ENV
+          echo "TAG=$TAG" >> $GITHUB_ENV
+
+      - name: Install dependencies
+        run: |
+          brew install cmake ninja boost eigen freeimage glog gflags suitesparse ceres-solver qt glew cgal
+
+      - name: Build COLMAP
+        run: scripts/toolchain/build_colmap.sh
+
+      - name: Build GLOMAP
+        run: scripts/toolchain/build_glomap.sh
+
+      - name: Build Brush
+        run: scripts/toolchain/build_brush.sh
+
+      - name: Package toolchain
+        run: scripts/toolchain/package_toolchain.sh --version "$VERSION"
+
+      - name: Generate manifest
+        env:
+          TOOLCHAIN_SIGNING_KEY_BASE64: ${{ secrets.TOOLCHAIN_SIGNING_KEY_BASE64 }}
+        run: |
+          if [ -z "$TOOLCHAIN_SIGNING_KEY_BASE64" ]; then
+            echo "Missing TOOLCHAIN_SIGNING_KEY_BASE64 secret"
+            exit 1
+          fi
+          ZIP="Toolchains/out/toolchain-macos-arm64-$VERSION.zip"
+          ARTIFACT_URL="https://github.com/${{ github.repository }}/releases/download/$TAG/toolchain-macos-arm64-$VERSION.zip"
+          swift run --package-path Tools/ManifestTool ManifestTool \
+            --zip "$ZIP" \
+            --version "$VERSION" \
+            --published-at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            --artifact-url "$ARTIFACT_URL" \
+            --private-key "$TOOLCHAIN_SIGNING_KEY_BASE64" \
+            --manifest-out "Toolchains/out/manifest.json"
+
+      - name: Upload release assets
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ env.TAG }}
+          target_commitish: ${{ github.sha }}
+          files: |
+            Toolchains/out/toolchain-macos-arm64-${{ env.VERSION }}.zip
+            Toolchains/out/manifest.json
