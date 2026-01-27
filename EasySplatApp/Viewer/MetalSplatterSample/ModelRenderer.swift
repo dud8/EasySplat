@@ -8,7 +8,7 @@ public struct ModelRendererViewportDescriptor {
     var screenSize: SIMD2<Int>
 }
 
-public protocol ModelRenderer: Sendable {
+public protocol ModelRenderer {
     /// Renders to the given command buffer.
     /// - Returns: `true` if rendering was performed, `false` if the frame should be dropped.
     @discardableResult

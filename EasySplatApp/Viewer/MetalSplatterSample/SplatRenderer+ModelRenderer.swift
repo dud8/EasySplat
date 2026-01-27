@@ -10,11 +10,11 @@ extension SplatRenderer: ModelRenderer {
                        rasterizationRateMap: MTLRasterizationRateMap?,
                        renderTargetArrayLength: Int,
                        to commandBuffer: MTLCommandBuffer) throws -> Bool {
-        let remappedViewports = viewports.map { viewport -> ViewportDescriptor in
-            ViewportDescriptor(viewport: viewport.viewport,
-                               projectionMatrix: viewport.projectionMatrix,
-                               viewMatrix: viewport.viewMatrix,
-                               screenSize: viewport.screenSize)
+        let remappedViewports = viewports.map { viewport -> SplatRenderer.ViewportDescriptor in
+            SplatRenderer.ViewportDescriptor(viewport: viewport.viewport,
+                                             projectionMatrix: viewport.projectionMatrix,
+                                             viewMatrix: viewport.viewMatrix,
+                                             screenSize: viewport.screenSize)
         }
         return try render(viewports: remappedViewports,
                           colorTexture: colorTexture,

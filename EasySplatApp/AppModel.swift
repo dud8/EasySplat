@@ -69,13 +69,13 @@ final class AppModel: ObservableObject {
             try ProjectMetadataStore.save(metadata, to: paths.metadataURL)
 
             statusText = "Downloading tools"
+            let progressForwarder = ProgressForwarder(model: self)
             let toolchain = try await toolchainManager.ensureToolchain(
                 manifestURL: AppConfig.toolchainManifestURL,
                 publicKeyBase64: AppConfig.toolchainPublicKeyBase64,
                 targetName: "macos-arm64"
             ) { fraction, message in
-                self.progress = fraction * 0.2
-                self.statusText = message
+                progressForwarder.update(fraction: fraction, message: message)
             }
             self.toolchainPaths = toolchain
 
@@ -96,7 +96,7 @@ final class AppModel: ObservableObject {
         }
     }
 
-    private func handle(event: PipelineEvent) {
+    fileprivate func handle(event: PipelineEvent) {
         switch event {
         case .stageStarted(let stage):
             self.stage = stage
@@ -154,6 +154,22 @@ private final class EventForwarder: @unchecked Sendable {
     func handle(_ event: PipelineEvent) {
         Task { @MainActor in
             self.model?.handle(event: event)
+        }
+    }
+}
+
+private final class ProgressForwarder: @unchecked Sendable {
+    private weak var model: AppModel?
+
+    init(model: AppModel) {
+        self.model = model
+    }
+
+    func update(fraction: Double, message: String) {
+        Task { @MainActor in
+            guard let model = self.model else { return }
+            model.progress = fraction * 0.2
+            model.statusText = message
         }
     }
 }

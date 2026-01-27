@@ -3,6 +3,7 @@ import MetalKit
 import AppKit
 import SplatIO
 
+@MainActor
 final class SplatViewerController: ObservableObject {
     @Published var errorMessage: String? = nil
     @Published var isLoading: Bool = false
@@ -46,6 +47,7 @@ final class SplatViewerController: ObservableObject {
     }
 }
 
+@MainActor
 struct MetalKitSceneView: NSViewRepresentable {
     var splatURL: URL?
     var controller: SplatViewerController

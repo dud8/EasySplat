@@ -1,5 +1,6 @@
 import SwiftUI
 import UniformTypeIdentifiers
+import EasySplatCore
 
 struct HomeView: View {
     @EnvironmentObject private var model: AppModel

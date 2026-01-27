@@ -58,6 +58,7 @@ class MetalKitSceneRenderer: NSObject, MTKViewDelegate {
                 let splat = try SplatRenderer(device: device,
                                               colorFormat: metalKitView.colorPixelFormat,
                                               depthFormat: metalKitView.depthStencilPixelFormat,
+                                              stencilFormat: .invalid,
                                               sampleCount: metalKitView.sampleCount,
                                               maxViewCount: 1,
                                               maxSimultaneousRenders: Constants.maxSimultaneousRenders)
