@@ -10,8 +10,7 @@ let package = Package(
     ],
     dependencies: [
         .package(url: "https://github.com/scier/MetalSplatter.git", from: "0.1.1"),
-        .package(url: "https://github.com/sparkle-project/Sparkle.git", from: "2.7.3"),
-        .package(url: "https://github.com/swiftlang/swift-testing.git", exact: "6.0.2")
+        .package(url: "https://github.com/sparkle-project/Sparkle.git", from: "2.7.3")
     ],
     targets: [
         .target(
@@ -34,19 +33,12 @@ let package = Package(
         ),
         .testTarget(
             name: "EasySplatCoreTests",
-            dependencies: [
-                "EasySplatCore",
-                .product(name: "Testing", package: "swift-testing")
-            ],
+            dependencies: ["EasySplatCore"],
             path: "EasySplatCore/Tests/EasySplatCoreTests"
         ),
         .testTarget(
             name: "EasySplatAppTests",
-            dependencies: [
-                "EasySplatApp",
-                "EasySplatCore",
-                .product(name: "Testing", package: "swift-testing")
-            ],
+            dependencies: ["EasySplatApp", "EasySplatCore"],
             path: "EasySplatAppTests"
         ),
         .testTarget(

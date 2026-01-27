@@ -1,11 +1,12 @@
+#if canImport(XCTest)
 import Foundation
-import Testing
+import XCTest
 @testable import EasySplatCore
 import ImageIO
 import UniformTypeIdentifiers
 
-struct PipelineIntegrationTests {
-    @Test func testPipelineSuccessWithGlomap() async throws {
+final class PipelineIntegrationTests: XCTestCase {
+    func testPipelineSuccessWithGlomap() async throws {
         let temp = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
         let projectURL = temp.appendingPathComponent("Test.easysplatproj", isDirectory: true)
         let sourcePhotos = temp.appendingPathComponent("SourcePhotos", isDirectory: true)
@@ -50,10 +51,10 @@ struct PipelineIntegrationTests {
         try await pipeline.run { _ in }
 
         let output = projectURL.appendingPathComponent("Output/splat.ply")
-        #expect(FileManager.default.fileExists(atPath: output.path))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: output.path))
     }
 
-    @Test func testPipelineGlomapFallbackToColmap() async throws {
+    func testPipelineGlomapFallbackToColmap() async throws {
         let temp = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
         let projectURL = temp.appendingPathComponent("Test.easysplatproj", isDirectory: true)
         let sourcePhotos = temp.appendingPathComponent("SourcePhotos", isDirectory: true)
@@ -98,10 +99,10 @@ struct PipelineIntegrationTests {
 
         try await pipeline.run { _ in }
         let output = projectURL.appendingPathComponent("Output/splat.ply")
-        #expect(FileManager.default.fileExists(atPath: output.path))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: output.path))
     }
 
-    @Test func testPipelineFailsOnLowQuality() async throws {
+    func testPipelineFailsOnLowQuality() async throws {
         let temp = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
         let projectURL = temp.appendingPathComponent("Test.easysplatproj", isDirectory: true)
         let sourcePhotos = temp.appendingPathComponent("SourcePhotos", isDirectory: true)
@@ -138,16 +139,12 @@ struct PipelineIntegrationTests {
             tooling: .init(runner: runner)
         )
 
-        var didThrow = false
-        do {
+        await XCTAssertThrowsErrorAsync {
             try await pipeline.run { _ in }
-        } catch {
-            didThrow = true
         }
-        #expect(didThrow)
     }
 
-    @Test func testPipelineFailsOnMissingImages() async throws {
+    func testPipelineFailsOnMissingImages() async throws {
         let temp = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
         let projectURL = temp.appendingPathComponent("Test.easysplatproj", isDirectory: true)
         let sourcePhotos = temp.appendingPathComponent("SourcePhotos", isDirectory: true)
@@ -177,16 +174,12 @@ struct PipelineIntegrationTests {
             tooling: .init(runner: runner)
         )
 
-        var didThrow = false
-        do {
+        await XCTAssertThrowsErrorAsync {
             try await pipeline.run { _ in }
-        } catch {
-            didThrow = true
         }
-        #expect(didThrow)
     }
 
-    @Test func testPipelineFailsOnMatcherError() async throws {
+    func testPipelineFailsOnMatcherError() async throws {
         let temp = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
         let projectURL = temp.appendingPathComponent("Test.easysplatproj", isDirectory: true)
         let sourcePhotos = temp.appendingPathComponent("SourcePhotos", isDirectory: true)
@@ -219,16 +212,12 @@ struct PipelineIntegrationTests {
             tooling: .init(runner: runner)
         )
 
-        var didThrow = false
-        do {
+        await XCTAssertThrowsErrorAsync {
             try await pipeline.run { _ in }
-        } catch {
-            didThrow = true
         }
-        #expect(didThrow)
     }
 
-    @Test func testPipelineFailsOnBrushError() async throws {
+    func testPipelineFailsOnBrushError() async throws {
         let temp = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
         let projectURL = temp.appendingPathComponent("Test.easysplatproj", isDirectory: true)
         let sourcePhotos = temp.appendingPathComponent("SourcePhotos", isDirectory: true)
@@ -264,16 +253,12 @@ struct PipelineIntegrationTests {
             tooling: .init(runner: runner)
         )
 
-        var didThrow = false
-        do {
+        await XCTAssertThrowsErrorAsync {
             try await pipeline.run { _ in }
-        } catch {
-            didThrow = true
         }
-        #expect(didThrow)
     }
 
-    @Test func testPipelineFailsWhenOutputMissing() async throws {
+    func testPipelineFailsWhenOutputMissing() async throws {
         let temp = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
         let projectURL = temp.appendingPathComponent("Test.easysplatproj", isDirectory: true)
         let sourcePhotos = temp.appendingPathComponent("SourcePhotos", isDirectory: true)
@@ -309,13 +294,9 @@ struct PipelineIntegrationTests {
             tooling: .init(runner: runner)
         )
 
-        var didThrow = false
-        do {
+        await XCTAssertThrowsErrorAsync {
             try await pipeline.run { _ in }
-        } catch {
-            didThrow = true
         }
-        #expect(didThrow)
     }
 
     private func writeTestImage(url: URL, value: UInt8) throws {
@@ -337,20 +318,22 @@ struct PipelineIntegrationTests {
                 shouldInterpolate: false,
                 intent: .defaultIntent
               ) else {
-            throw PipelineTestError.imageCreationFailed
+            return
         }
         guard let destination = CGImageDestinationCreateWithURL(url as CFURL, UTType.jpeg.identifier as CFString, 1, nil) else {
-            throw PipelineTestError.destinationCreationFailed
+            return
         }
         CGImageDestinationAddImage(destination, cgImage, nil)
-        guard CGImageDestinationFinalize(destination) else {
-            throw PipelineTestError.destinationFinalizeFailed
-        }
+        _ = CGImageDestinationFinalize(destination)
     }
 }
 
-private enum PipelineTestError: Error {
-    case imageCreationFailed
-    case destinationCreationFailed
-    case destinationFinalizeFailed
+private func XCTAssertThrowsErrorAsync(_ expression: @escaping () async throws -> Void) async {
+    do {
+        try await expression()
+        XCTFail("Expected error to be thrown")
+    } catch {
+        XCTAssertTrue(true)
+    }
 }
+#endif

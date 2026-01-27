@@ -2,7 +2,11 @@
 set -euo pipefail
 
 if command -v xcrun >/dev/null 2>&1; then
-  xcrun swift test --allow-unsafe-flags
+  if ! xcrun --sdk macosx --show-sdk-platform-path >/dev/null 2>&1; then
+    echo "Xcode is required to run tests (XCTest is not available in Command Line Tools)." >&2
+    exit 1
+  fi
+  xcrun swift test --disable-swift-testing --enable-xctest
 else
-  swift test --allow-unsafe-flags
+  swift test --disable-swift-testing --enable-xctest
 fi

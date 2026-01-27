@@ -1,11 +1,12 @@
+#if canImport(XCTest)
 import Foundation
-import Testing
+import XCTest
 @testable import EasySplatCore
 import ImageIO
 import UniformTypeIdentifiers
 
-struct FrameSelectorTests {
-    @Test func selectFramesReturnsTargetCount() throws {
+final class FrameSelectorTests: XCTestCase {
+    func testSelectFramesReturnsTargetCount() throws {
         let dir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
         try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: dir) }
@@ -18,7 +19,7 @@ struct FrameSelectorTests {
 
         let selector = FrameSelector()
         let selected = selector.selectFrames(from: urls, targetCount: 3) { _, _ in }
-        #expect(selected.count == 3)
+        XCTAssertEqual(selected.count, 3)
     }
 
     private func writeImage(url: URL, size: Int, value: UInt8) throws {
@@ -50,21 +51,16 @@ struct FrameSelectorTests {
                 shouldInterpolate: false,
                 intent: .defaultIntent
               ) else {
-            throw FrameSelectorTestError.imageCreationFailed
+            XCTFail("Failed to create image")
+            return
         }
 
         guard let destination = CGImageDestinationCreateWithURL(url as CFURL, UTType.png.identifier as CFString, 1, nil) else {
-            throw FrameSelectorTestError.destinationCreationFailed
+            XCTFail("Failed to create destination")
+            return
         }
         CGImageDestinationAddImage(destination, cgImage, nil)
-        guard CGImageDestinationFinalize(destination) else {
-            throw FrameSelectorTestError.destinationFinalizeFailed
-        }
+        XCTAssertTrue(CGImageDestinationFinalize(destination))
     }
 }
-
-private enum FrameSelectorTestError: Error {
-    case imageCreationFailed
-    case destinationCreationFailed
-    case destinationFinalizeFailed
-}
+#endif

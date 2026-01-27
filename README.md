@@ -79,3 +79,4 @@ Run all tests:
 ```
 
 Note: UI test target is a placeholder in SwiftPM (XCUITest requires an Xcode project).
+Note: `./scripts/test.sh` requires a full Xcode install (Command Line Tools alone do not include XCTest).

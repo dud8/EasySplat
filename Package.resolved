@@ -1,5 +1,5 @@
 {
-  "originHash" : "1f82f8bbb033ec1e06b5a5c904d74bd8fb9b1c7f460e2168c4073f8315d4b9e3",
+  "originHash" : "1fe22de323f469589265a898f5b14b7582e25e8183530b3376ab8003c0aab885",
   "pins" : [
     {
       "identity" : "metalsplatter",
@@ -17,24 +17,6 @@
       "state" : {
         "revision" : "5581748cef2bae787496fe6d61139aebe0a451f6",
         "version" : "2.8.1"
-      }
-    },
-    {
-      "identity" : "swift-syntax",
-      "kind" : "remoteSourceControl",
-      "location" : "https://github.com/swiftlang/swift-syntax.git",
-      "state" : {
-        "revision" : "0687f71944021d616d34d922343dcef086855920",
-        "version" : "600.0.1"
-      }
-    },
-    {
-      "identity" : "swift-testing",
-      "kind" : "remoteSourceControl",
-      "location" : "https://github.com/swiftlang/swift-testing.git",
-      "state" : {
-        "revision" : "cd448bbe5cc989d8693ca75e9b08593eb143dea1",
-        "version" : "6.0.2"
       }
     }
   ],

@@ -1,33 +1,35 @@
-import Testing
+#if canImport(XCTest)
+import XCTest
 @testable import EasySplatCore
 
-struct ReconstructionScorerTests {
-    @Test func parseModelAnalyzerOutput() {
+final class ReconstructionScorerTests: XCTestCase {
+    func testParseModelAnalyzerOutput() {
         let sample = """
         Registered images: 120 / 200
         Mean reprojection error: 1.23
         """
         let score = ReconstructionScorer.parseModelAnalyzerOutput(sample)
-        #expect(score.registeredImages == 120)
-        #expect(score.totalImages == 200)
-        #expect(score.meanReprojectionError != nil)
-        #expect(abs((score.meanReprojectionError ?? 0) - 1.23) < 0.01)
+        XCTAssertEqual(score.registeredImages, 120)
+        XCTAssertEqual(score.totalImages, 200)
+        XCTAssertNotNil(score.meanReprojectionError)
+        XCTAssertEqual(score.meanReprojectionError ?? 0, 1.23, accuracy: 0.01)
     }
 
-    @Test func parseModelAnalyzerOutputMissingReprojection() {
+    func testParseModelAnalyzerOutputMissingReprojection() {
         let sample = """
         Registered images: 10 / 20
         """
         let score = ReconstructionScorer.parseModelAnalyzerOutput(sample)
-        #expect(score.registeredImages == 10)
-        #expect(score.totalImages == 20)
-        #expect(score.meanReprojectionError == nil)
+        XCTAssertEqual(score.registeredImages, 10)
+        XCTAssertEqual(score.totalImages, 20)
+        XCTAssertNil(score.meanReprojectionError)
     }
 
-    @Test func acceptableThresholds() {
+    func testAcceptableThresholds() {
         let score = ReconstructionScore(registeredImages: 70, totalImages: 100, meanReprojectionError: 1.0)
-        #expect(ReconstructionScorer.isAcceptable(score, mode: .object))
+        XCTAssertTrue(ReconstructionScorer.isAcceptable(score, mode: .object))
         let low = ReconstructionScore(registeredImages: 40, totalImages: 100, meanReprojectionError: 1.0)
-        #expect(!ReconstructionScorer.isAcceptable(low, mode: .object))
+        XCTAssertFalse(ReconstructionScorer.isAcceptable(low, mode: .object))
     }
 }
+#endif

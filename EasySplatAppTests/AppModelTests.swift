@@ -1,11 +1,12 @@
+#if canImport(XCTest)
 import Foundation
-import Testing
+import XCTest
 @testable import EasySplatApp
 @testable import EasySplatCore
 
 @MainActor
-struct AppModelTests {
-    @Test func startProjectTransitionsToViewer() async throws {
+final class AppModelTests: XCTestCase {
+    func testStartProjectTransitionsToViewer() async throws {
         let tempBase = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
         try FileManager.default.createDirectory(at: tempBase, withIntermediateDirectories: true)
         let input = tempBase.appendingPathComponent("input.mov")
@@ -21,14 +22,15 @@ struct AppModelTests {
 
         await model.startProject(inputURL: input, isFolder: false)
 
-        #expect(model.viewState == .viewer)
-        #expect(model.currentProjectURL != nil)
-        #expect(model.outputPlyURL != nil)
+        XCTAssertEqual(model.viewState, .viewer)
+        XCTAssertNotNil(model.currentProjectURL)
+        XCTAssertNotNil(model.outputPlyURL)
         guard let projectURL = model.currentProjectURL else {
-            throw AppModelTestError.missingProjectURL
+            XCTFail("Missing project URL")
+            return
         }
         let metadataURL = projectURL.appendingPathComponent("project.json")
-        #expect(FileManager.default.fileExists(atPath: metadataURL.path))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: metadataURL.path))
     }
 }
 
@@ -71,7 +73,4 @@ final class MockPipelineRunner: PipelineRunning {
         try ProjectMetadataStore.save(metadata, to: paths.metadataURL)
     }
 }
-
-private enum AppModelTestError: Error {
-    case missingProjectURL
-}
+#endif
