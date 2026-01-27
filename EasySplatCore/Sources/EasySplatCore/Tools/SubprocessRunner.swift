@@ -20,15 +20,6 @@ public extension SubprocessRunning {
     ) throws -> SubprocessResult {
         try run(launchPath, arguments, currentDirectory: nil, environment: [:], onStdout: onStdout, onStderr: onStderr)
     }
-
-    func run(
-        _ launchPath: String,
-        _ arguments: [String],
-        currentDirectory: URL? = nil,
-        environment: [String: String] = [:]
-    ) throws -> SubprocessResult {
-        try run(launchPath, arguments, currentDirectory: currentDirectory, environment: environment, onStdout: { _ in }, onStderr: { _ in })
-    }
 }
 
 public struct SubprocessResult: Sendable {
