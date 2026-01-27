@@ -19,4 +19,4 @@ jobs:
             sudo xcode-select -s /Applications/Xcode_16.0.app
           fi
       - name: Run tests
-        run: xcrun swift test
+        run: xcrun swift test --allow-unsafe-flags
