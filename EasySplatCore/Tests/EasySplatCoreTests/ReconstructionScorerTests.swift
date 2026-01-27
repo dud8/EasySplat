@@ -10,7 +10,18 @@ final class ReconstructionScorerTests: XCTestCase {
         let score = ReconstructionScorer.parseModelAnalyzerOutput(sample)
         XCTAssertEqual(score.registeredImages, 120)
         XCTAssertEqual(score.totalImages, 200)
-        XCTAssertEqual(score.meanReprojectionError, 1.23, accuracy: 0.01)
+        XCTAssertNotNil(score.meanReprojectionError)
+        XCTAssertEqual(score.meanReprojectionError ?? 0, 1.23, accuracy: 0.01)
+    }
+
+    func testParseModelAnalyzerOutputMissingReprojection() {
+        let sample = """
+        Registered images: 10 / 20
+        """
+        let score = ReconstructionScorer.parseModelAnalyzerOutput(sample)
+        XCTAssertEqual(score.registeredImages, 10)
+        XCTAssertEqual(score.totalImages, 20)
+        XCTAssertNil(score.meanReprojectionError)
     }
 
     func testAcceptableThresholds() {

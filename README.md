@@ -75,7 +75,7 @@ Alternatively, open `Package.swift` in Xcode and run the `EasySplatApp` scheme.
 Run all tests:
 
 ```
-swift test
+./scripts/test.sh
 ```
 
 Note: UI test target is a placeholder in SwiftPM (XCUITest requires an Xcode project).
