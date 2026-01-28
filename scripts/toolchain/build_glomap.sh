@@ -7,14 +7,17 @@ SRC="$WORK/src"
 BUILD="$WORK/build"
 INSTALL="$WORK/install"
 COLMAP_INSTALL="${COLMAP_INSTALL:-$ROOT/Toolchains/build/colmap/install}"
+GLOMAP_REF="${GLOMAP_REF:-bfa9af89be8d8d49a58deeed3ef28d7960a37d06}"
 COLMAP_CONFIG_DIR=""
 OPENMP_ROOT=""
 
 mkdir -p "$WORK"
 
 if [ ! -d "$SRC/.git" ]; then
-  git clone --depth 1 https://github.com/colmap/glomap.git "$SRC"
+  git clone https://github.com/colmap/glomap.git "$SRC"
 fi
+git -C "$SRC" fetch --depth 1 origin "$GLOMAP_REF"
+git -C "$SRC" checkout -q FETCH_HEAD
 
 if command -v brew >/dev/null 2>&1; then
   OPENMP_ROOT="$(brew --prefix libomp 2>/dev/null || true)"
@@ -34,6 +37,7 @@ fi
 CMAKE_ARGS=(
   -DCMAKE_BUILD_TYPE=Release
   -DCMAKE_INSTALL_PREFIX="$INSTALL"
+  -DCMAKE_FIND_PACKAGE_PREFER_CONFIG=ON
   -DFETCH_COLMAP=OFF
   -DCOLMAP_DIR="$COLMAP_CONFIG_DIR"
   -Dcolmap_DIR="$COLMAP_CONFIG_DIR"
