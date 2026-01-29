@@ -34,6 +34,32 @@ public struct ProjectMetadata: Codable, Sendable {
 public enum InputSpec: Codable, Sendable {
     case video(files: [String])
     case photos(folder: String)
+    case mixed(videos: [String], photosFolder: String)
+
+    public var videoFiles: [String] {
+        switch self {
+        case .video(let files):
+            return files
+        case .photos:
+            return []
+        case .mixed(let videos, _):
+            return videos
+        }
+    }
+
+    public var photosFolder: String? {
+        switch self {
+        case .video:
+            return nil
+        case .photos(let folder):
+            return folder
+        case .mixed(_, let photosFolder):
+            return photosFolder
+        }
+    }
+
+    public var hasVideos: Bool { !videoFiles.isEmpty }
+    public var hasPhotos: Bool { photosFolder != nil }
 }
 
 public enum CaptureMode: String, Codable, Sendable {

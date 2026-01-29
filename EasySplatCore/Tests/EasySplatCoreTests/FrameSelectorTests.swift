@@ -22,6 +22,54 @@ final class FrameSelectorTests: XCTestCase {
         XCTAssertEqual(selected.count, 3)
     }
 
+    func testSelectFramesTargetCountZeroReturnsEmpty() throws {
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+
+        let urls = try (0..<2).map { index in
+            let url = dir.appendingPathComponent("img_\(index).png")
+            try writeImage(url: url, size: 32, value: UInt8(index * 50))
+            return url
+        }
+
+        let selector = FrameSelector()
+        let selected = selector.selectFrames(from: urls, targetCount: 0) { _, _ in }
+        XCTAssertTrue(selected.isEmpty)
+    }
+
+    func testSelectFramesTargetCountOneReturnsSingleFrame() throws {
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+
+        let urls = try (0..<3).map { index in
+            let url = dir.appendingPathComponent("img_\(index).png")
+            try writeImage(url: url, size: 32, value: UInt8(index * 70))
+            return url
+        }
+
+        let selector = FrameSelector()
+        let selected = selector.selectFrames(from: urls, targetCount: 1) { _, _ in }
+        XCTAssertEqual(selected.count, 1)
+    }
+
+    func testSelectFramesFallsBackWhenAllClipped() throws {
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+
+        let urls = try (0..<4).map { index in
+            let url = dir.appendingPathComponent("img_\(index).png")
+            try writeSolidImage(url: url, size: 32, value: 0)
+            return url
+        }
+
+        let selector = FrameSelector()
+        let selected = selector.selectFrames(from: urls, targetCount: 2) { _, _ in }
+        XCTAssertEqual(selected.count, 2)
+    }
+
     private func writeImage(url: URL, size: Int, value: UInt8) throws {
         let width = size
         let height = size
@@ -35,6 +83,39 @@ final class FrameSelectorTests: XCTestCase {
                 pixels[row + x] = UInt8(pixel)
             }
         }
+        let colorSpace = CGColorSpaceCreateDeviceGray()
+        let data = Data(bytes: &pixels, count: pixels.count)
+        guard let provider = CGDataProvider(data: data as CFData),
+              let cgImage = CGImage(
+                width: width,
+                height: height,
+                bitsPerComponent: 8,
+                bitsPerPixel: 8,
+                bytesPerRow: bytesPerRow,
+                space: colorSpace,
+                bitmapInfo: CGBitmapInfo(rawValue: CGImageAlphaInfo.none.rawValue),
+                provider: provider,
+                decode: nil,
+                shouldInterpolate: false,
+                intent: .defaultIntent
+              ) else {
+            XCTFail("Failed to create image")
+            return
+        }
+
+        guard let destination = CGImageDestinationCreateWithURL(url as CFURL, UTType.png.identifier as CFString, 1, nil) else {
+            XCTFail("Failed to create destination")
+            return
+        }
+        CGImageDestinationAddImage(destination, cgImage, nil)
+        XCTAssertTrue(CGImageDestinationFinalize(destination))
+    }
+
+    private func writeSolidImage(url: URL, size: Int, value: UInt8) throws {
+        let width = size
+        let height = size
+        let bytesPerRow = width
+        var pixels = [UInt8](repeating: value, count: width * height)
         let colorSpace = CGColorSpaceCreateDeviceGray()
         let data = Data(bytes: &pixels, count: pixels.count)
         guard let provider = CGDataProvider(data: data as CFData),

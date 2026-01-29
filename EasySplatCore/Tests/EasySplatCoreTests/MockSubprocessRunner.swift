@@ -32,4 +32,22 @@ final class MockSubprocessRunner: @unchecked Sendable, SubprocessRunning {
         script.onRun?(arguments)
         return script.result
     }
+
+    func runAsync(
+        _ launchPath: String,
+        _ arguments: [String],
+        currentDirectory: URL?,
+        environment: [String: String],
+        onStdout: @escaping @Sendable (String) -> Void,
+        onStderr: @escaping @Sendable (String) -> Void
+    ) async throws -> SubprocessResult {
+        try run(
+            launchPath,
+            arguments,
+            currentDirectory: currentDirectory,
+            environment: environment,
+            onStdout: onStdout,
+            onStderr: onStderr
+        )
+    }
 }

@@ -52,6 +52,7 @@ public final class FrameExtractor {
         return try await generateImages(
             generator: generator,
             times: times,
+            stepSeconds: step,
             outputDir: outputDir,
             progress: progress
         )
@@ -60,20 +61,22 @@ public final class FrameExtractor {
     private func generateImages(
         generator: AVAssetImageGenerator,
         times: [CMTime],
+        stepSeconds: Double,
         outputDir: URL,
         progress: @escaping @Sendable (Double, String) -> Void
     ) async throws -> [URL] {
         guard !times.isEmpty else { throw ExtractionError.extractionFailed }
         let requestedTimes = times.map { NSValue(time: $0) }
+        let maxIndex = max(times.count - 1, 0)
 
         return try await withCheckedThrowingContinuation { continuation in
             let state = FrameExtractionState(count: times.count)
 
             generator.generateCGImagesAsynchronously(forTimes: requestedTimes) { requestedTime, cgImage, _, result, _ in
+                let index = Self.indexForRequestedTime(requestedTime, stepSeconds: stepSeconds, maxIndex: maxIndex)
                 let snapshot = state.withLock { state -> (progress: Double, isComplete: Bool, urls: [URL]?) in
                     if result == .succeeded,
-                       let cgImage,
-                       let index = times.firstIndex(where: { CMTimeCompare($0, requestedTime) == 0 }) {
+                       let cgImage {
                         let fileURL = outputDir.appendingPathComponent(String(format: "frame_%06d.jpg", index))
                         if (try? Self.writeJPEG(cgImage: cgImage, to: fileURL)) != nil {
                             state.outputURLs[index] = fileURL
@@ -109,6 +112,13 @@ public final class FrameExtractor {
         if !CGImageDestinationFinalize(destination) {
             throw ExtractionError.extractionFailed
         }
+    }
+
+    private static func indexForRequestedTime(_ time: CMTime, stepSeconds: Double, maxIndex: Int) -> Int {
+        guard stepSeconds > 0 else { return 0 }
+        let seconds = CMTimeGetSeconds(time)
+        let rawIndex = Int(round(seconds / stepSeconds))
+        return min(max(rawIndex, 0), maxIndex)
     }
 }
 

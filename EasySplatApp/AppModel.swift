@@ -81,7 +81,7 @@ final class AppModel: ObservableObject {
 
             let runner = pipelineRunnerFactory(projectURL, .init(toolchain: toolchain, preset: metadata.preset))
             let forwarder = EventForwarder(model: self)
-            try await runner.run { event in
+            try await runner.run(resumeFrom: nil) { event in
                 forwarder.handle(event)
             }
 
@@ -175,7 +175,7 @@ private final class ProgressForwarder: @unchecked Sendable {
 }
 
 protocol PipelineRunning {
-    func run(events: @escaping @Sendable (PipelineEvent) -> Void) async throws
+    func run(resumeFrom lastCompletedStage: PipelineStage?, events: @escaping @Sendable (PipelineEvent) -> Void) async throws
 }
 
 extension PipelineRunner: PipelineRunning {}

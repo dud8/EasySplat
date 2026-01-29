@@ -14,7 +14,7 @@ public enum ReconstructionScorer {
 
         let lines = text.split(separator: "\n")
         for line in lines {
-            if line.contains("Registered images") {
+            if line.lowercased().contains("registered images") {
                 let numbers = line.components(separatedBy: CharacterSet.decimalDigits.inverted).compactMap(Int.init)
                 if numbers.count >= 2 {
                     registered = numbers[0]
@@ -39,5 +39,18 @@ public enum ReconstructionScorer {
         if ratio < threshold { return false }
         if let reproj = score.meanReprojectionError, reproj > 2.5 { return false }
         return true
+    }
+
+    public static func summary(_ score: ReconstructionScore) -> String {
+        let ratio = score.totalImages > 0 ? Double(score.registeredImages) / Double(score.totalImages) : 0.0
+        let percent = ratio * 100.0
+        let percentText = String(format: "%.1f", percent)
+        let reprojText: String
+        if let reproj = score.meanReprojectionError {
+            reprojText = String(format: "%.2f", reproj)
+        } else {
+            reprojText = "n/a"
+        }
+        return "registered \(score.registeredImages)/\(score.totalImages) (\(percentText)%), mean reprojection error \(reprojText)"
     }
 }
