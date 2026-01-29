@@ -6,6 +6,27 @@ import ImageIO
 import UniformTypeIdentifiers
 
 final class PipelineIntegrationTests: XCTestCase {
+    private var previousBackendEnv: String?
+
+    override func setUp() {
+        super.setUp()
+        if let value = getenv("EASYSPLAT_SFM_BACKEND") {
+            previousBackendEnv = String(cString: value)
+        } else {
+            previousBackendEnv = nil
+        }
+        setenv("EASYSPLAT_SFM_BACKEND", "colmap", 1)
+    }
+
+    override func tearDown() {
+        if let previousBackendEnv {
+            setenv("EASYSPLAT_SFM_BACKEND", previousBackendEnv, 1)
+        } else {
+            unsetenv("EASYSPLAT_SFM_BACKEND")
+        }
+        super.tearDown()
+    }
+
     func testPipelineSuccessWithGlomap() async throws {
         let temp = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
         let projectURL = temp.appendingPathComponent("Test.easysplatproj", isDirectory: true)
@@ -22,12 +43,7 @@ final class PipelineIntegrationTests: XCTestCase {
         try paths.ensureDirectories()
         try ProjectMetadataStore.save(metadata, to: paths.metadataURL)
 
-        let toolchain = ToolchainPaths(
-            root: temp,
-            colmap: URL(fileURLWithPath: "/mock/colmap"),
-            glomap: URL(fileURLWithPath: "/mock/glomap"),
-            brush: URL(fileURLWithPath: "/mock/brush")
-        )
+        let toolchain = try makeToolchain(root: temp)
 
         let runner = MockSubprocessRunner(scripts: [
             .init(path: "/mock/colmap", argsPrefix: ["feature_extractor"], result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""), onRun: nil),
@@ -55,6 +71,138 @@ final class PipelineIntegrationTests: XCTestCase {
         XCTAssertTrue(FileManager.default.fileExists(atPath: output.path))
     }
 
+    func testPipelineSuccessWithLearnedMatching() async throws {
+        setenv("EASYSPLAT_SFM_BACKEND", "learned", 1)
+        defer { setenv("EASYSPLAT_SFM_BACKEND", "colmap", 1) }
+
+        let temp = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        let projectURL = temp.appendingPathComponent("Test.easysplatproj", isDirectory: true)
+        let sourcePhotos = temp.appendingPathComponent("SourcePhotos", isDirectory: true)
+        try FileManager.default.createDirectory(at: sourcePhotos, withIntermediateDirectories: true)
+        for index in 0..<20 {
+            try writeTestImage(url: sourcePhotos.appendingPathComponent("img\(index).jpg"), value: UInt8(index % 255))
+        }
+
+        let metadata = ProjectMetadata(title: "Test",
+                                       input: .photos(folder: sourcePhotos.path),
+                                       preset: PresetSpec(mode: .object, quality: .draft))
+        let paths = ProjectPaths(root: projectURL)
+        try paths.ensureDirectories()
+        try ProjectMetadataStore.save(metadata, to: paths.metadataURL)
+
+        let toolchain = try makeToolchain(root: temp, createLearnedFiles: true)
+
+        let runner = MockSubprocessRunner(scripts: [
+            .init(path: toolchain.learnedSfm.matchTool.path, argsPrefix: ["--images"], result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""), onRun: nil),
+            .init(path: "/mock/colmap", argsPrefix: ["feature_importer"], result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""), onRun: nil),
+            .init(path: "/mock/colmap", argsPrefix: ["matches_importer"], result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""), onRun: nil),
+            .init(path: "/mock/glomap", argsPrefix: ["mapper"], result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""), onRun: { _ in try? self.writeSparseModel(at: projectURL) }),
+            .init(path: "/mock/colmap", argsPrefix: ["model_analyzer"], result: .init(exitCode: 0, terminationReason: .exit, stdout: "Registered images: 10 / 10\nMean reprojection error: 1.0\n", stderr: ""), onRun: nil),
+            .init(path: "/mock/brush", argsPrefix: ["train"], result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""), onRun: { args in
+                guard args.count > 1 else { return }
+                let dataset = URL(fileURLWithPath: args[1])
+                let training = dataset.deletingLastPathComponent()
+                let ply = training.appendingPathComponent("mock.ply")
+                try? "ply".write(to: ply, atomically: true, encoding: .utf8)
+            })
+        ])
+
+        let pipeline = PipelineRunner(
+            projectURL: projectURL,
+            config: .init(toolchain: toolchain, preset: metadata.preset),
+            tooling: .init(runner: runner)
+        )
+
+        try await pipeline.run { _ in }
+
+        let output = projectURL.appendingPathComponent("Output/splat.ply")
+        XCTAssertTrue(FileManager.default.fileExists(atPath: output.path))
+    }
+
+    func testResumeAfterLearnedMatchingFallsBackToColmap() async throws {
+        let previousBackend = getenv("EASYSPLAT_SFM_BACKEND").map { String(cString: $0) }
+        let previousMapper = getenv("EASYSPLAT_SFM_MAPPER").map { String(cString: $0) }
+        setenv("EASYSPLAT_SFM_BACKEND", "learned", 1)
+        setenv("EASYSPLAT_SFM_MAPPER", "colmap", 1)
+        defer {
+            if let previousBackend {
+                setenv("EASYSPLAT_SFM_BACKEND", previousBackend, 1)
+            } else {
+                unsetenv("EASYSPLAT_SFM_BACKEND")
+            }
+            if let previousMapper {
+                setenv("EASYSPLAT_SFM_MAPPER", previousMapper, 1)
+            } else {
+                unsetenv("EASYSPLAT_SFM_MAPPER")
+            }
+        }
+
+        let temp = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        let projectURL = temp.appendingPathComponent("Test.easysplatproj", isDirectory: true)
+        let sourcePhotos = temp.appendingPathComponent("SourcePhotos", isDirectory: true)
+        try FileManager.default.createDirectory(at: sourcePhotos, withIntermediateDirectories: true)
+        for index in 0..<5 {
+            try writeTestImage(url: sourcePhotos.appendingPathComponent("img\(index).jpg"), value: UInt8(index % 255))
+        }
+
+        let metadata = ProjectMetadata(
+            title: "Test",
+            input: .photos(folder: sourcePhotos.path),
+            preset: PresetSpec(mode: .object, quality: .draft),
+            state: PipelineState(stage: .sfmMapping, attempt: 1, lastError: "failed", resumeToken: nil)
+        )
+        let paths = ProjectPaths(root: projectURL)
+        try paths.ensureDirectories()
+        try ProjectMetadataStore.save(metadata, to: paths.metadataURL)
+
+        let originalsPhotos = paths.originalsURL.appendingPathComponent(sourcePhotos.lastPathComponent, isDirectory: true)
+        try FileManager.default.createDirectory(at: originalsPhotos, withIntermediateDirectories: true)
+        for index in 0..<2 {
+            try writeTestImage(url: originalsPhotos.appendingPathComponent("img\(index).jpg"), value: UInt8(index % 255))
+        }
+
+        try FileManager.default.createDirectory(at: paths.framesSelectedURL, withIntermediateDirectories: true)
+        try writeTestImage(url: paths.framesSelectedURL.appendingPathComponent("frame_000001.jpg"), value: 42)
+
+        FileManager.default.createFile(atPath: paths.colmapDatabaseURL.path, contents: Data())
+        try FileManager.default.createDirectory(at: paths.sfmLearnedFeaturesURL, withIntermediateDirectories: true)
+        FileManager.default.createFile(
+            atPath: paths.sfmLearnedFeaturesURL.appendingPathComponent("features.bin").path,
+            contents: Data([0x0])
+        )
+        try "0 1\n".write(to: paths.sfmLearnedMatchListURL, atomically: true, encoding: .utf8)
+
+        let toolchain = try makeToolchain(root: temp)
+        let runner = MockSubprocessRunner(scripts: [
+            .init(path: "/mock/colmap", argsPrefix: ["mapper"], result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""), onRun: nil),
+            .init(path: "/mock/colmap", argsPrefix: ["feature_extractor"], result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""), onRun: nil),
+            .init(path: "/mock/colmap", argsPrefix: ["exhaustive_matcher"], result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""), onRun: nil),
+            .init(path: "/mock/colmap", argsPrefix: ["mapper"], result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""), onRun: { _ in
+                try? self.writeSparseModel(at: projectURL)
+            }),
+            .init(path: "/mock/colmap", argsPrefix: ["model_analyzer"], result: .init(exitCode: 0, terminationReason: .exit, stdout: "Registered images: 5 / 5\nMean reprojection error: 1.0\n", stderr: ""), onRun: nil),
+            .init(path: "/mock/brush", argsPrefix: ["train"], result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""), onRun: { args in
+                guard args.count > 1 else { return }
+                let dataset = URL(fileURLWithPath: args[1])
+                let training = dataset.deletingLastPathComponent()
+                let ply = training.appendingPathComponent("mock.ply")
+                try? "ply".write(to: ply, atomically: true, encoding: .utf8)
+            })
+        ])
+
+        let pipeline = PipelineRunner(
+            projectURL: projectURL,
+            config: .init(toolchain: toolchain, preset: metadata.preset),
+            tooling: .init(runner: runner)
+        )
+
+        try await pipeline.run(resumeFrom: .sfmMatching) { _ in }
+
+        XCTAssertTrue(runner.calls.contains { $0.0 == "/mock/colmap" && $0.1.first == "feature_extractor" })
+        let output = projectURL.appendingPathComponent("Output/splat.ply")
+        XCTAssertTrue(FileManager.default.fileExists(atPath: output.path))
+    }
+
     func testPipelineAcceptsModelAnalyzerOutputInStderr() async throws {
         let temp = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
         let projectURL = temp.appendingPathComponent("Test.easysplatproj", isDirectory: true)
@@ -71,12 +219,7 @@ final class PipelineIntegrationTests: XCTestCase {
         try paths.ensureDirectories()
         try ProjectMetadataStore.save(metadata, to: paths.metadataURL)
 
-        let toolchain = ToolchainPaths(
-            root: temp,
-            colmap: URL(fileURLWithPath: "/mock/colmap"),
-            glomap: URL(fileURLWithPath: "/mock/glomap"),
-            brush: URL(fileURLWithPath: "/mock/brush")
-        )
+        let toolchain = try makeToolchain(root: temp)
 
         let runner = MockSubprocessRunner(scripts: [
             .init(path: "/mock/colmap", argsPrefix: ["feature_extractor"], result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""), onRun: nil),
@@ -119,12 +262,7 @@ final class PipelineIntegrationTests: XCTestCase {
         try paths.ensureDirectories()
         try ProjectMetadataStore.save(metadata, to: paths.metadataURL)
 
-        let toolchain = ToolchainPaths(
-            root: temp,
-            colmap: URL(fileURLWithPath: "/mock/colmap"),
-            glomap: URL(fileURLWithPath: "/mock/glomap"),
-            brush: URL(fileURLWithPath: "/mock/brush")
-        )
+        let toolchain = try makeToolchain(root: temp)
 
         let runner = MockSubprocessRunner(scripts: [
             .init(path: "/mock/colmap", argsPrefix: ["feature_extractor"], result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""), onRun: nil),
@@ -168,12 +306,7 @@ final class PipelineIntegrationTests: XCTestCase {
         try paths.ensureDirectories()
         try ProjectMetadataStore.save(metadata, to: paths.metadataURL)
 
-        let toolchain = ToolchainPaths(
-            root: temp,
-            colmap: URL(fileURLWithPath: "/mock/colmap"),
-            glomap: URL(fileURLWithPath: "/mock/glomap"),
-            brush: URL(fileURLWithPath: "/mock/brush")
-        )
+        let toolchain = try makeToolchain(root: temp)
 
         let dyldError = """
         dyld: Library not loaded: @rpath/libcrypto.3.dylib
@@ -236,12 +369,7 @@ final class PipelineIntegrationTests: XCTestCase {
         try paths.ensureDirectories()
         try ProjectMetadataStore.save(metadata, to: paths.metadataURL)
 
-        let toolchain = ToolchainPaths(
-            root: temp,
-            colmap: URL(fileURLWithPath: "/mock/colmap"),
-            glomap: URL(fileURLWithPath: "/mock/glomap"),
-            brush: URL(fileURLWithPath: "/mock/brush")
-        )
+        let toolchain = try makeToolchain(root: temp)
 
         let runner = MockSubprocessRunner(scripts: [
             .init(path: "/mock/colmap", argsPrefix: ["feature_extractor"], result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""), onRun: nil),
@@ -284,12 +412,7 @@ final class PipelineIntegrationTests: XCTestCase {
         try paths.ensureDirectories()
         try ProjectMetadataStore.save(metadata, to: paths.metadataURL)
 
-        let toolchain = ToolchainPaths(
-            root: temp,
-            colmap: URL(fileURLWithPath: "/mock/colmap"),
-            glomap: URL(fileURLWithPath: "/mock/glomap"),
-            brush: URL(fileURLWithPath: "/mock/brush")
-        )
+        let toolchain = try makeToolchain(root: temp)
 
         let runner = MockSubprocessRunner(scripts: [
             .init(path: "/mock/colmap", argsPrefix: ["feature_extractor"], result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""), onRun: nil),
@@ -333,12 +456,7 @@ final class PipelineIntegrationTests: XCTestCase {
         try paths.ensureDirectories()
         try ProjectMetadataStore.save(metadata, to: paths.metadataURL)
 
-        let toolchain = ToolchainPaths(
-            root: temp,
-            colmap: URL(fileURLWithPath: "/mock/colmap"),
-            glomap: URL(fileURLWithPath: "/mock/glomap"),
-            brush: URL(fileURLWithPath: "/mock/brush")
-        )
+        let toolchain = try makeToolchain(root: temp)
 
         let runner = MockSubprocessRunner(scripts: [
             .init(path: "/mock/colmap", argsPrefix: ["feature_extractor"], result: .init(exitCode: 1, terminationReason: .exit, stdout: "", stderr: "no images"), onRun: nil)
@@ -371,12 +489,7 @@ final class PipelineIntegrationTests: XCTestCase {
         try paths.ensureDirectories()
         try ProjectMetadataStore.save(metadata, to: paths.metadataURL)
 
-        let toolchain = ToolchainPaths(
-            root: temp,
-            colmap: URL(fileURLWithPath: "/mock/colmap"),
-            glomap: URL(fileURLWithPath: "/mock/glomap"),
-            brush: URL(fileURLWithPath: "/mock/brush")
-        )
+        let toolchain = try makeToolchain(root: temp)
 
         let runner = MockSubprocessRunner(scripts: [
             .init(path: "/mock/colmap", argsPrefix: ["feature_extractor"], result: .init(exitCode: 1, terminationReason: .exit, stdout: "", stderr: "fail"), onRun: nil),
@@ -423,12 +536,7 @@ final class PipelineIntegrationTests: XCTestCase {
         try paths.ensureDirectories()
         try ProjectMetadataStore.save(metadata, to: paths.metadataURL)
 
-        let toolchain = ToolchainPaths(
-            root: temp,
-            colmap: URL(fileURLWithPath: "/mock/colmap"),
-            glomap: URL(fileURLWithPath: "/mock/glomap"),
-            brush: URL(fileURLWithPath: "/mock/brush")
-        )
+        let toolchain = try makeToolchain(root: temp)
 
         var featureRuns: [[String]] = []
         let runner = MockSubprocessRunner(scripts: [
@@ -481,12 +589,7 @@ final class PipelineIntegrationTests: XCTestCase {
         try paths.ensureDirectories()
         try ProjectMetadataStore.save(metadata, to: paths.metadataURL)
 
-        let toolchain = ToolchainPaths(
-            root: temp,
-            colmap: URL(fileURLWithPath: "/mock/colmap"),
-            glomap: URL(fileURLWithPath: "/mock/glomap"),
-            brush: URL(fileURLWithPath: "/mock/brush")
-        )
+        let toolchain = try makeToolchain(root: temp)
 
         let runner = MockSubprocessRunner(scripts: [
             .init(path: "/mock/colmap", argsPrefix: ["feature_extractor"], result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""), onRun: nil),
@@ -521,12 +624,7 @@ final class PipelineIntegrationTests: XCTestCase {
         try paths.ensureDirectories()
         try ProjectMetadataStore.save(metadata, to: paths.metadataURL)
 
-        let toolchain = ToolchainPaths(
-            root: temp,
-            colmap: URL(fileURLWithPath: "/mock/colmap"),
-            glomap: URL(fileURLWithPath: "/mock/glomap"),
-            brush: URL(fileURLWithPath: "/mock/brush")
-        )
+        let toolchain = try makeToolchain(root: temp)
 
         let runner = MockSubprocessRunner(scripts: [
             .init(path: "/mock/colmap", argsPrefix: ["feature_extractor"], result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""), onRun: nil),
@@ -562,12 +660,7 @@ final class PipelineIntegrationTests: XCTestCase {
         try paths.ensureDirectories()
         try ProjectMetadataStore.save(metadata, to: paths.metadataURL)
 
-        let toolchain = ToolchainPaths(
-            root: temp,
-            colmap: URL(fileURLWithPath: "/mock/colmap"),
-            glomap: URL(fileURLWithPath: "/mock/glomap"),
-            brush: URL(fileURLWithPath: "/mock/brush")
-        )
+        let toolchain = try makeToolchain(root: temp)
 
         let runner = MockSubprocessRunner(scripts: [
             .init(path: "/mock/colmap", argsPrefix: ["feature_extractor"], result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""), onRun: nil),
@@ -628,6 +721,17 @@ final class PipelineIntegrationTests: XCTestCase {
     private func value(for flag: String, in args: [String]) -> String? {
         guard let index = args.firstIndex(of: flag), index + 1 < args.count else { return nil }
         return args[index + 1]
+    }
+
+    private func makeToolchain(root: URL, createLearnedFiles: Bool = false) throws -> ToolchainPaths {
+        let learned = try TestToolchains.learnedSfmToolchain(root: root, createFiles: createLearnedFiles)
+        return ToolchainPaths(
+            root: root,
+            colmap: URL(fileURLWithPath: "/mock/colmap"),
+            glomap: URL(fileURLWithPath: "/mock/glomap"),
+            brush: URL(fileURLWithPath: "/mock/brush"),
+            learnedSfm: learned
+        )
     }
 }
 

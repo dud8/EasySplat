@@ -5,19 +5,23 @@ public final class PipelineRunner: @unchecked Sendable {
         public var colmap: ColmapRunner
         public var glomap: GlomapRunner
         public var brush: BrushRunner
+        public var learnedMatching: LearnedMatchingRunning
 
         public init(colmap: ColmapRunner = ColmapRunner(),
                     glomap: GlomapRunner = GlomapRunner(),
-                    brush: BrushRunner = BrushRunner()) {
+                    brush: BrushRunner = BrushRunner(),
+                    learnedMatching: LearnedMatchingRunning = LearnedMatchingRunner()) {
             self.colmap = colmap
             self.glomap = glomap
             self.brush = brush
+            self.learnedMatching = learnedMatching
         }
 
         public init(runner: SubprocessRunning) {
             self.colmap = ColmapRunner(runner: runner)
             self.glomap = GlomapRunner(runner: runner)
             self.brush = BrushRunner(runner: runner)
+            self.learnedMatching = LearnedMatchingRunner(runner: runner)
         }
     }
     public struct PipelineConfig: Sendable {
@@ -212,7 +216,82 @@ public final class PipelineRunner: @unchecked Sendable {
             }
 
             try Task.checkCancellation()
+            let backendPolicy = sfmBackendPolicy()
+            let learnedOutputsAvailable = backendPolicy == .learned && learnedOutputsExist(paths: paths)
+            let learnedStagesComplete = !shouldRunStage(.sfmFeatures) && !shouldRunStage(.sfmMatching)
+            let shouldAttemptLearned = backendPolicy == .learned && (shouldRunStage(.sfmFeatures) || shouldRunStage(.sfmMatching))
+            var learnedMatchingCompleted = learnedOutputsAvailable && learnedStagesComplete
+
+            if shouldAttemptLearned {
+                do {
+                    let device = learnedDevicePreference()
+                    let pairing: String = (metadata.input.hasVideos && !metadata.input.hasPhotos) ? "video" : "photos"
+                    let (overlap, stride, loopK): (Int, Int, Int) = {
+                        if pairing == "video" {
+                            return (colmapMatchOptions.sequentialOverlap, 5, 3)
+                        }
+                        return (0, 0, 20)
+                    }()
+                    let learnedConfig = LearnedMatchingConfig(
+                        device: device,
+                        maxImageSize: colmapMaxImageSize,
+                        sequentialOverlap: overlap,
+                        stride: stride,
+                        loopK: loopK,
+                        pairing: pairing
+                    )
+
+                    currentStage = .sfmFeatures
+                    emit(.stageStarted(stage: .sfmFeatures))
+                    emit(.stageLog(stage: .sfmFeatures, line: "Running learned matching on \(device) (\(pairing)).", isError: false))
+
+                    self.removeIfExists(paths.colmapDatabaseURL)
+                    try self.resetDirectory(paths.colmapSparseURL)
+                    try self.resetDirectory(paths.sfmLearnedFeaturesURL)
+                    self.removeIfExists(paths.sfmLearnedMatchListURL)
+
+                    try await tooling.learnedMatching.run(
+                        toolchain: config.toolchain.learnedSfm,
+                        images: paths.framesSelectedURL,
+                        outFeatures: paths.sfmLearnedFeaturesURL,
+                        outMatchList: paths.sfmLearnedMatchListURL,
+                        config: learnedConfig,
+                        onLog: { line, isErr in emit(.stageLog(stage: .sfmFeatures, line: line, isError: isErr)) }
+                    )
+
+                    try await tooling.colmap.runFeatureImporter(
+                        colmapPath: config.toolchain.colmap,
+                        database: paths.colmapDatabaseURL,
+                        imagePath: paths.framesSelectedURL,
+                        importPath: paths.sfmLearnedFeaturesURL,
+                        cameraModel: cameraModel(for: metadata.preset),
+                        options: colmapExtractOptions,
+                        onLog: { line, isErr in emit(.stageLog(stage: .sfmFeatures, line: line, isError: isErr)) }
+                    )
+
+                    emit(.stageFinished(stage: .sfmFeatures))
+                    markStageComplete(.sfmFeatures)
+
+                    currentStage = .sfmMatching
+                    emit(.stageStarted(stage: .sfmMatching))
+                    try await tooling.colmap.runMatchesImporter(
+                        colmapPath: config.toolchain.colmap,
+                        database: paths.colmapDatabaseURL,
+                        matchListPath: paths.sfmLearnedMatchListURL,
+                        matchType: "raw",
+                        options: colmapMatchOptions,
+                        onLog: { line, isErr in emit(.stageLog(stage: .sfmMatching, line: line, isError: isErr)) }
+                    )
+                    emit(.stageFinished(stage: .sfmMatching))
+                    markStageComplete(.sfmMatching)
+                    learnedMatchingCompleted = true
+                } catch {
+                    emit(.stageLog(stage: .sfmMatching, line: "Learned matching failed; falling back to COLMAP. \(error)", isError: true))
+                    learnedMatchingCompleted = false
+                }
+            }
             let runFeatures: (Bool) async throws -> Void = { force in
+                guard !learnedMatchingCompleted else { return }
                 guard force || shouldRunStage(.sfmFeatures) else { return }
                 currentStage = .sfmFeatures
                 emit(.stageStarted(stage: .sfmFeatures))
@@ -244,6 +323,7 @@ public final class PipelineRunner: @unchecked Sendable {
             }
 
             let runMatching: (Bool) async throws -> Void = { force in
+                guard !learnedMatchingCompleted else { return }
                 guard force || shouldRunStage(.sfmMatching) else { return }
                 currentStage = .sfmMatching
                 emit(.stageStarted(stage: .sfmMatching))
@@ -509,153 +589,162 @@ public final class PipelineRunner: @unchecked Sendable {
                 if shouldRunStage(.sfmMapping) {
                     currentStage = .sfmMapping
                     emit(.stageStarted(stage: .sfmMapping))
-                    let mappingProgress = ColmapMappingProgressTracker(totalImages: selectedFrames.count)
-                    let onMappingLog: @Sendable (String, Bool) -> Void = { line, isErr in
-                        emit(.stageLog(stage: .sfmMapping, line: line, isError: isErr))
-                        if let update = mappingProgress.ingest(line) {
-                            emit(.stageProgress(stage: .sfmMapping, fraction: update.fraction, message: update.message))
+                        let mappingProgress = ColmapMappingProgressTracker(totalImages: selectedFrames.count)
+                        let onMappingLog: @Sendable (String, Bool) -> Void = { line, isErr in
+                            emit(.stageLog(stage: .sfmMapping, line: line, isError: isErr))
+                            if let update = mappingProgress.ingest(line) {
+                                emit(.stageProgress(stage: .sfmMapping, fraction: update.fraction, message: update.message))
+                            }
                         }
-                    }
-                    var mappingSucceeded = false
-                    var lastMappingError: Error?
+                        var mappingSucceeded = false
+                        var lastMappingError: Error?
 
-                    let mapperAttempts: [SfmMapperPreference] = {
-                        switch mapperPreference {
-                        case .colmap:
-                            return [.colmap]
-                        case .glomap:
-                            if disableGlomapForThisRun {
+                        let mapperAttempts: [SfmMapperPreference] = {
+                            switch mapperPreference {
+                            case .colmap:
                                 return [.colmap]
+                            case .glomap:
+                                if disableGlomapForThisRun {
+                                    return [.colmap]
+                                }
+                                return [.glomap, .colmap]
                             }
-                            return [.glomap, .colmap]
-                        }
-                    }()
+                        }()
 
-                    let mapperLabel: String = {
-                        switch mapperPreference {
-                        case .colmap:
-                            return "COLMAP"
-                        case .glomap:
-                            return disableGlomapForThisRun ? "COLMAP (GLOMAP disabled for this run)" : "GLOMAP"
-                        }
-                    }()
-                    emit(.stageLog(
-                        stage: .sfmMapping,
-                        line: "Mapping preference: \(mapperLabel).",
-                        isError: false
-                    ))
+                        let mapperLabel: String = {
+                            switch mapperPreference {
+                            case .colmap:
+                                return "COLMAP"
+                            case .glomap:
+                                return disableGlomapForThisRun ? "COLMAP (GLOMAP disabled for this run)" : "GLOMAP"
+                            }
+                        }()
+                        emit(.stageLog(
+                            stage: .sfmMapping,
+                            line: "Mapping preference: \(mapperLabel).",
+                            isError: false
+                        ))
 
-                    for (index, mapper) in mapperAttempts.enumerated() {
-                        do {
-                            if mapper == .glomap {
-                                try await self.tooling.glomap.runMapper(
-                                    glomapPath: self.config.toolchain.glomap,
-                                    database: paths.colmapDatabaseURL,
-                                    imagePath: paths.framesSelectedURL,
-                                    outputPath: paths.colmapSparseURL,
-                                    onLog: onMappingLog
-                                )
-                            } else {
-                                try await self.tooling.colmap.runMapper(
+                        for (index, mapper) in mapperAttempts.enumerated() {
+                            do {
+                                if mapper == .glomap {
+                                    try await self.tooling.glomap.runMapper(
+                                        glomapPath: self.config.toolchain.glomap,
+                                        database: paths.colmapDatabaseURL,
+                                        imagePath: paths.framesSelectedURL,
+                                        outputPath: paths.colmapSparseURL,
+                                        onLog: onMappingLog
+                                    )
+                                } else {
+                                    try await self.tooling.colmap.runMapper(
+                                        colmapPath: self.config.toolchain.colmap,
+                                        database: paths.colmapDatabaseURL,
+                                        imagePath: paths.framesSelectedURL,
+                                        outputPath: paths.colmapSparseURL,
+                                        options: colmapMatchOptions,
+                                        onLog: onMappingLog
+                                    )
+                                }
+
+                                let modelURL = paths.colmapSparseURL.appendingPathComponent("0", isDirectory: true)
+                                guard sparseModelFilesExist(at: modelURL) else {
+                                    throw PipelineError.outputMissing
+                                }
+
+                                let report = try await self.tooling.colmap.runModelAnalyzer(
                                     colmapPath: self.config.toolchain.colmap,
-                                    database: paths.colmapDatabaseURL,
-                                    imagePath: paths.framesSelectedURL,
-                                    outputPath: paths.colmapSparseURL,
-                                    options: colmapMatchOptions,
-                                    onLog: onMappingLog
+                                    modelPath: modelURL,
+                                    options: colmapMatchOptions
                                 )
-                            }
-
-                            let modelURL = paths.colmapSparseURL.appendingPathComponent("0", isDirectory: true)
-                            guard sparseModelFilesExist(at: modelURL) else {
-                                throw PipelineError.outputMissing
-                            }
-
-                            let report = try await self.tooling.colmap.runModelAnalyzer(
-                                colmapPath: self.config.toolchain.colmap,
-                                modelPath: modelURL,
-                                options: colmapMatchOptions
-                            )
-                            let score = ReconstructionScorer.parseModelAnalyzerOutput(report)
-                            emit(.stageLog(
-                                stage: .sfmMapping,
-                                line: "Reconstruction score: \(ReconstructionScorer.summary(score)).",
-                                isError: false
-                            ))
-                            if ReconstructionScorer.isAcceptable(score, mode: metadata.preset.mode) {
-                                mappingSucceeded = true
-                                break
-                            } else {
-                                lastMappingError = PipelineError.lowQualityReconstruction(score)
-                            }
-                        } catch {
-                            if mapper == .glomap,
-                               !disableGlomapForThisRun,
-                               glomapErrorIndicatesMissingOpenSSL(error) {
-                                disableGlomapForThisRun = true
+                                let score = ReconstructionScorer.parseModelAnalyzerOutput(report)
                                 emit(.stageLog(
                                     stage: .sfmMapping,
-                                    line: "GLOMAP failed to launch (missing OpenSSL dylibs / rpath). This is a toolchain packaging issue; falling back to COLMAP for the rest of this run.",
-                                    isError: true
+                                    line: "Reconstruction score: \(ReconstructionScorer.summary(score)).",
+                                    isError: false
                                 ))
+                                if ReconstructionScorer.isAcceptable(score, mode: metadata.preset.mode) {
+                                    mappingSucceeded = true
+                                    break
+                                } else {
+                                    lastMappingError = PipelineError.lowQualityReconstruction(score)
+                                }
+                            } catch {
+                                if mapper == .glomap,
+                                   !disableGlomapForThisRun,
+                                   glomapErrorIndicatesMissingOpenSSL(error) {
+                                    disableGlomapForThisRun = true
+                                    emit(.stageLog(
+                                        stage: .sfmMapping,
+                                        line: "GLOMAP failed to launch (missing OpenSSL dylibs / rpath). This is a toolchain packaging issue; falling back to COLMAP for the rest of this run.",
+                                        isError: true
+                                    ))
+                                }
+                                lastMappingError = error
                             }
-                            lastMappingError = error
+                            if !mappingSucceeded,
+                               index == 0,
+                               mapperPreference == .glomap,
+                               mapper == .glomap {
+                                emit(.stageLog(stage: .sfmMapping, line: "GLOMAP mapping failed; trying COLMAP mapper.", isError: true))
+                            }
                         }
-                        if !mappingSucceeded,
-                           index == 0,
-                           mapperPreference == .glomap,
-                           mapper == .glomap {
-                            emit(.stageLog(stage: .sfmMapping, line: "GLOMAP mapping failed; trying COLMAP mapper.", isError: true))
-                        }
-                    }
 
-                    if !mappingSucceeded,
-                       let pipelineError = lastMappingError as? PipelineError,
-                       case .lowQualityReconstruction = pipelineError,
-                       lastUsedSequentialMatcher,
-                       !didRetryWithHigherSequentialOverlap {
-                        let previousOverlap = colmapMatchOptions.sequentialOverlap
-                        let increasedOverlap = min(30, max(previousOverlap + 5, previousOverlap * 2))
-                        if increasedOverlap > previousOverlap {
-                            didRetryWithHigherSequentialOverlap = true
-                            colmapMatchOptions.sequentialOverlap = increasedOverlap
-                            emit(.stageLog(
-                                stage: .sfmMapping,
-                                line: "Reconstruction quality was low. Retrying with higher sequential overlap (\(previousOverlap) -> \(increasedOverlap)).",
-                                isError: true
-                            ))
+                        if !mappingSucceeded, learnedMatchingCompleted {
+                            emit(.stageLog(stage: .sfmMapping, line: "Learned matching did not yield a stable reconstruction. Retrying with COLMAP matching.", isError: true))
+                            emit(.stageFinished(stage: .sfmMapping))
+                            self.removeIfExists(paths.sfmLearnedURL)
+                            learnedMatchingCompleted = false
                             forceSfMRun = true
                             continue sfmAttemptLoop
                         }
-                    }
 
-                    if !mappingSucceeded,
-                       let pipelineError = lastMappingError as? PipelineError,
-                       case .lowQualityReconstruction = pipelineError,
-                       try await applyFewerFramesRetry("Reconstruction quality was low; retrying with fewer frames and exhaustive matching", false) {
-                        forceSfMRun = true
-                        continue sfmAttemptLoop
-                    }
-
-                    guard mappingSucceeded else {
-                        let debugMessage: String
-                        if let pipelineError = lastMappingError as? PipelineError,
-                           case let .lowQualityReconstruction(score) = pipelineError {
-                            debugMessage = "Low-quality reconstruction. \(ReconstructionScorer.summary(score))."
-                        } else if let colmapError = lastMappingError as? ColmapRunnerError {
-                            debugMessage = debugDescription(for: colmapError)
-                        } else {
-                            debugMessage = "\(lastMappingError ?? PipelineError.lowQualityReconstruction(.init(registeredImages: 0, totalImages: 0, meanReprojectionError: nil)))"
+                        if !mappingSucceeded,
+                           let pipelineError = lastMappingError as? PipelineError,
+                           case .lowQualityReconstruction = pipelineError,
+                           lastUsedSequentialMatcher,
+                           !didRetryWithHigherSequentialOverlap {
+                            let previousOverlap = colmapMatchOptions.sequentialOverlap
+                            let increasedOverlap = min(30, max(previousOverlap + 5, previousOverlap * 2))
+                            if increasedOverlap > previousOverlap {
+                                didRetryWithHigherSequentialOverlap = true
+                                colmapMatchOptions.sequentialOverlap = increasedOverlap
+                                emit(.stageLog(
+                                    stage: .sfmMapping,
+                                    line: "Reconstruction quality was low. Retrying with higher sequential overlap (\(previousOverlap) -> \(increasedOverlap)).",
+                                    isError: true
+                                ))
+                                forceSfMRun = true
+                                continue sfmAttemptLoop
+                            }
                         }
-                        emitFailure(
-                            stage: .sfmMapping,
-                            userMessage: "I couldn't get a stable camera solve. Try a slower capture and more light.",
-                            debugMessage: debugMessage
-                        )
-                        throw lastMappingError ?? PipelineError.lowQualityReconstruction(.init(registeredImages: 0, totalImages: 0, meanReprojectionError: nil))
-                    }
-                    emit(.stageFinished(stage: .sfmMapping))
-                    markStageComplete(.sfmMapping)
+
+                        if !mappingSucceeded,
+                           let pipelineError = lastMappingError as? PipelineError,
+                           case .lowQualityReconstruction = pipelineError,
+                           try await applyFewerFramesRetry("Reconstruction quality was low; retrying with fewer frames and exhaustive matching", false) {
+                            forceSfMRun = true
+                            continue sfmAttemptLoop
+                        }
+
+                        guard mappingSucceeded else {
+                            let debugMessage: String
+                            if let pipelineError = lastMappingError as? PipelineError,
+                               case let .lowQualityReconstruction(score) = pipelineError {
+                                debugMessage = "Low-quality reconstruction. \(ReconstructionScorer.summary(score))."
+                            } else if let colmapError = lastMappingError as? ColmapRunnerError {
+                                debugMessage = debugDescription(for: colmapError)
+                            } else {
+                                debugMessage = "\(lastMappingError ?? PipelineError.lowQualityReconstruction(.init(registeredImages: 0, totalImages: 0, meanReprojectionError: nil)))"
+                            }
+                            emitFailure(
+                                stage: .sfmMapping,
+                                userMessage: "I couldn't get a stable camera solve. Try a slower capture and more light.",
+                                debugMessage: debugMessage
+                            )
+                            throw lastMappingError ?? PipelineError.lowQualityReconstruction(.init(registeredImages: 0, totalImages: 0, meanReprojectionError: nil))
+                        }
+                        emit(.stageFinished(stage: .sfmMapping))
+                        markStageComplete(.sfmMapping)
                 }
 
                 break
@@ -811,6 +900,32 @@ private extension PipelineRunner {
         return .glomap
     }
 
+    func sfmBackendPolicy() -> SfmBackend {
+        let env = ProcessInfo.processInfo.environment
+        if let value = env["EASYSPLAT_SFM_BACKEND"]?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() {
+            if value == "colmap" { return .colmap }
+            if value == "learned" { return .learned }
+        }
+        return .learned
+    }
+
+    func learnedOutputsExist(paths: ProjectPaths) -> Bool {
+        let fm = FileManager.default
+        guard fm.fileExists(atPath: paths.sfmLearnedMatchListURL.path) else { return false }
+        guard fm.fileExists(atPath: paths.sfmLearnedFeaturesURL.path) else { return false }
+        let contents = (try? fm.contentsOfDirectory(at: paths.sfmLearnedFeaturesURL, includingPropertiesForKeys: nil)) ?? []
+        return !contents.isEmpty
+    }
+
+    func learnedDevicePreference() -> String {
+        let env = ProcessInfo.processInfo.environment
+        if let value = env["EASYSPLAT_LEARNED_DEVICE"]?.trimmingCharacters(in: .whitespacesAndNewlines),
+           !value.isEmpty {
+            return value
+        }
+        return "mps"
+    }
+
     func shouldUseColmapGpu(colmapPath: URL) -> Bool {
         if let override = colmapGpuOverride() {
             return override
@@ -883,17 +998,20 @@ private extension PipelineRunner {
             self.removeIfExists(paths.framesSelectedURL)
             self.removeIfExists(paths.colmapDatabaseURL)
             self.removeIfExists(paths.colmapSparseURL)
+            self.removeIfExists(paths.sfmLearnedURL)
             self.removeIfExists(paths.trainingURL)
             self.removeIfExists(paths.outputURL)
         case .selectFrames:
             self.removeIfExists(paths.framesSelectedURL)
             self.removeIfExists(paths.colmapDatabaseURL)
             self.removeIfExists(paths.colmapSparseURL)
+            self.removeIfExists(paths.sfmLearnedURL)
             self.removeIfExists(paths.trainingURL)
             self.removeIfExists(paths.outputURL)
         case .sfmFeatures, .sfmMatching:
             self.removeIfExists(paths.colmapDatabaseURL)
             self.removeIfExists(paths.colmapSparseURL)
+            self.removeIfExists(paths.sfmLearnedURL)
             self.removeIfExists(paths.trainingURL)
             self.removeIfExists(paths.outputURL)
         case .sfmMapping:
