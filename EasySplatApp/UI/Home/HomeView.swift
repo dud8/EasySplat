@@ -37,7 +37,7 @@ struct HomeView: View {
                             }
                         }
                     Button("Choose Photos Folder…") { showFolderImporter = true }
-                        .buttonStyle(.bordered)
+                        .buttonStyle(SecondaryButtonStyle())
                         .fileImporter(
                             isPresented: $showFolderImporter,
                             allowedContentTypes: [UTType.folder],
@@ -73,7 +73,7 @@ struct HomeView: View {
                     Button("Clear All") {
                         model.clearPendingInputs()
                     }
-                    .buttonStyle(.bordered)
+                    .buttonStyle(SecondaryButtonStyle())
                     .controlSize(.small)
                 }
             }
@@ -98,7 +98,7 @@ struct HomeView: View {
                     Button("Remove") {
                         model.pendingPhotosFolderURL = nil
                     }
-                    .buttonStyle(.bordered)
+                    .buttonStyle(SecondaryButtonStyle())
                     .controlSize(.small)
                 }
             }
@@ -113,7 +113,7 @@ struct HomeView: View {
                         Button("Remove") {
                             model.pendingVideoURLs.remove(at: index)
                         }
-                        .buttonStyle(.bordered)
+                        .buttonStyle(SecondaryButtonStyle())
                         .controlSize(.small)
                     }
                 }
@@ -129,7 +129,14 @@ struct HomeView: View {
             }
         }
         .padding(16)
-        .background(RoundedRectangle(cornerRadius: 14).fill(Theme.surface))
+        .background(
+            RoundedRectangle(cornerRadius: Theme.Radius.card, style: .continuous)
+                .fill(Theme.surface)
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: Theme.Radius.card, style: .continuous)
+                .stroke(Theme.border)
+        )
     }
 
     private var settingsPanel: some View {

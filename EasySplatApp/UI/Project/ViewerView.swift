@@ -21,7 +21,7 @@ struct ViewerView: View {
                     Button("Show in Finder") {
                         NSWorkspace.shared.activateFileViewerSelecting([plyURL])
                     }
-                    .buttonStyle(.bordered)
+                    .buttonStyle(SecondaryButtonStyle())
 
                     if let brush = model.toolchainPaths?.brush {
                         Button("Open in Brush") {
@@ -38,7 +38,7 @@ struct ViewerView: View {
             Button("Start Another") {
                 model.viewState = .home
             }
-            .buttonStyle(.bordered)
+            .buttonStyle(SecondaryButtonStyle())
         }
         .padding(32)
     }

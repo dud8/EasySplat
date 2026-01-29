@@ -19,7 +19,14 @@ struct ProjectListView: View {
                 ForEach(projects) { project in
                     projectRow(project)
                         .padding(12)
-                        .background(RoundedRectangle(cornerRadius: 12).fill(Theme.surface))
+                        .background(
+                            RoundedRectangle(cornerRadius: 12, style: .continuous)
+                                .fill(Theme.surface)
+                        )
+                        .overlay(
+                            RoundedRectangle(cornerRadius: 12, style: .continuous)
+                                .stroke(Theme.border)
+                        )
                 }
             }
         }
@@ -73,17 +80,17 @@ struct ProjectListView: View {
                 Button("Open/Resume") {
                     model.resumeProject(at: project.url)
                 }
-                .buttonStyle(.bordered)
+                .buttonStyle(SecondaryButtonStyle())
 
                 Button("Show in Finder") {
                     NSWorkspace.shared.activateFileViewerSelecting([project.url])
                 }
-                .buttonStyle(.bordered)
+                .buttonStyle(SecondaryButtonStyle())
 
                 Button("Delete") {
                     projectToDelete = project
                 }
-                .buttonStyle(.bordered)
+                .buttonStyle(SecondaryButtonStyle())
             }
         }
     }

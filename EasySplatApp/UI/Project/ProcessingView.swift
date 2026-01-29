@@ -14,8 +14,7 @@ struct ProcessingView: View {
                 VStack(alignment: .leading, spacing: 12) {
                     Text(model.statusText)
                         .font(.headline)
-                    ProgressView(value: model.progress)
-                        .progressViewStyle(.linear)
+                    ShimmeringProgressView(progress: model.progress)
                     if let error = model.lastError {
                         Text(error)
                             .foregroundStyle(.red)
@@ -37,13 +36,13 @@ struct ProcessingView: View {
                     Button("Show in Finder") {
                         NSWorkspace.shared.activateFileViewerSelecting([projectURL])
                     }
-                    .buttonStyle(.bordered)
+                    .buttonStyle(SecondaryButtonStyle())
                 }
 
                 Button("Cancel") {
                     showCancelConfirm = true
                 }
-                .buttonStyle(.bordered)
+                .buttonStyle(SecondaryButtonStyle())
             }
         }
         .padding(32)

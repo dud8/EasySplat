@@ -15,7 +15,7 @@ struct SplatViewerView: View {
                 Button("Fit") { controller.fitToView() }
                 Button("Controls") { showHelp.toggle() }
             }
-            .buttonStyle(.bordered)
+            .buttonStyle(SecondaryButtonStyle())
             .padding(12)
             .background(.ultraThinMaterial)
             .clipShape(RoundedRectangle(cornerRadius: 12))

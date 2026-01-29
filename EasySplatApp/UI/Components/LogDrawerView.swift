@@ -7,18 +7,21 @@ struct LogDrawerView: View {
     let copyText: String?
 
     @State private var expanded = false
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
-            Button(action: { expanded.toggle() }) {
+            Button(action: toggleExpanded) {
                 HStack {
                     Text(expanded ? "Hide Details" : "Show Details")
                         .font(.subheadline.weight(.medium))
                     Spacer()
-                    Image(systemName: expanded ? "chevron.down" : "chevron.right")
+                    Image(systemName: "chevron.right")
+                        .rotationEffect(.degrees(expanded ? 90 : 0))
+                        .animation(reduceMotion ? nil : Theme.Motion.hover, value: expanded)
                 }
             }
-            .buttonStyle(.plain)
+            .buttonStyle(DisclosureButtonStyle())
 
             if expanded {
                 ScrollView {
@@ -57,7 +60,7 @@ struct LogDrawerView: View {
                                     pasteboard.clearContents()
                                     pasteboard.setString(copyText, forType: .string)
                                 }
-                                .buttonStyle(.bordered)
+                                .buttonStyle(SecondaryButtonStyle())
                                 .controlSize(.small)
                             }
                             .padding(.top, 4)
@@ -66,7 +69,25 @@ struct LogDrawerView: View {
                 }
                 .frame(maxHeight: 180)
                 .padding(8)
-                .background(RoundedRectangle(cornerRadius: 10).fill(Theme.surface))
+                .background(
+                    RoundedRectangle(cornerRadius: 10, style: .continuous)
+                        .fill(Theme.surface)
+                )
+                .overlay(
+                    RoundedRectangle(cornerRadius: 10, style: .continuous)
+                        .stroke(Theme.border)
+                )
+                .transition(.opacity.combined(with: .move(edge: .top)))
+            }
+        }
+    }
+
+    private func toggleExpanded() {
+        if reduceMotion {
+            expanded.toggle()
+        } else {
+            withAnimation(Theme.Motion.reveal) {
+                expanded.toggle()
             }
         }
     }

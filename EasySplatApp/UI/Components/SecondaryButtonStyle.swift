@@ -1,12 +1,12 @@
 import SwiftUI
 
-struct PrimaryButtonStyle: ButtonStyle {
+struct SecondaryButtonStyle: ButtonStyle {
     func makeBody(configuration: Configuration) -> some View {
-        PrimaryButtonBody(configuration: configuration)
+        SecondaryButtonBody(configuration: configuration)
     }
 }
 
-private struct PrimaryButtonBody: View {
+private struct SecondaryButtonBody: View {
     let configuration: ButtonStyle.Configuration
 
     @Environment(\.isEnabled) private var isEnabled
@@ -23,13 +23,17 @@ private struct PrimaryButtonBody: View {
         return configuration.label
             .padding(.horizontal, padding.horizontal)
             .padding(.vertical, padding.vertical)
-            .foregroundStyle(.white.opacity(isEnabled ? 1.0 : 0.7))
+            .foregroundStyle(isEnabled ? .primary : .secondary)
             .background(
                 RoundedRectangle(cornerRadius: Theme.Radius.button, style: .continuous)
-                    .fill(Theme.accent.opacity(isEnabled ? 1.0 : 0.6))
+                    .fill(Theme.surface)
                     .overlay(
                         RoundedRectangle(cornerRadius: Theme.Radius.button, style: .continuous)
                             .fill(overlayColor)
+                    )
+                    .overlay(
+                        RoundedRectangle(cornerRadius: Theme.Radius.button, style: .continuous)
+                            .strokeBorder(borderColor, lineWidth: 1)
                     )
                     .shadow(color: shadow.color, radius: shadow.radius, x: 0, y: shadow.y)
             )
@@ -44,15 +48,28 @@ private struct PrimaryButtonBody: View {
 
     private var overlayColor: Color {
         if !isEnabled {
-            return Color.black.opacity(0.05)
+            return Color.clear
         }
         if configuration.isPressed {
-            return Color.black.opacity(0.12)
+            return Theme.accent.opacity(0.10)
         }
         if isHovering {
-            return Color.white.opacity(0.08)
+            return Theme.accent.opacity(0.06)
         }
         return Color.clear
+    }
+
+    private var borderColor: Color {
+        if !isEnabled {
+            return Theme.border.opacity(0.6)
+        }
+        if configuration.isPressed {
+            return Theme.accent.opacity(0.32)
+        }
+        if isHovering {
+            return Theme.accent.opacity(0.25)
+        }
+        return Theme.border
     }
 
     private var resolvedScale: CGFloat {
@@ -60,10 +77,10 @@ private struct PrimaryButtonBody: View {
             return 1.0
         }
         if configuration.isPressed {
-            return 0.985
+            return 0.99
         }
         if isHovering {
-            return 1.015
+            return 1.01
         }
         return 1.0
     }
@@ -71,22 +88,22 @@ private struct PrimaryButtonBody: View {
     private var resolvedShadow: (color: Color, radius: CGFloat, y: CGFloat) {
         guard isEnabled else { return (.clear, 0, 0) }
         if configuration.isPressed {
-            return (Color.black.opacity(0.12), 2, 1)
+            return (Color.black.opacity(0.06), 2, 1)
         }
         if isHovering {
-            return (Color.black.opacity(0.18), 6, 3)
+            return (Color.black.opacity(0.08), 4, 2)
         }
-        return (Color.black.opacity(0.14), 4, 2)
+        return (.clear, 0, 0)
     }
 
     private func paddingForControlSize(_ controlSize: ControlSize) -> (horizontal: CGFloat, vertical: CGFloat) {
         switch controlSize {
         case .mini:
-            return (12, 6)
+            return (10, 5)
         case .small:
-            return (14, 8)
+            return (12, 7)
         default:
-            return (18, 10)
+            return (16, 9)
         }
     }
 }
