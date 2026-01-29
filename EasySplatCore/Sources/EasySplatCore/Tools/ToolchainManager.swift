@@ -6,6 +6,29 @@ public struct ToolchainPaths: Sendable {
     public var colmap: URL
     public var glomap: URL
     public var brush: URL
+    public var learnedSfm: LearnedSfmToolchain
+
+    public init(root: URL, colmap: URL, glomap: URL, brush: URL, learnedSfm: LearnedSfmToolchain) {
+        self.root = root
+        self.colmap = colmap
+        self.glomap = glomap
+        self.brush = brush
+        self.learnedSfm = learnedSfm
+    }
+}
+
+public struct LearnedSfmToolchain: Sendable {
+    public var root: URL
+    public var matchTool: URL
+    public var python: URL
+    public var models: URL
+
+    public init(root: URL, matchTool: URL, python: URL, models: URL) {
+        self.root = root
+        self.matchTool = matchTool
+        self.python = python
+        self.models = models
+    }
 }
 
 public protocol ToolchainManaging: Sendable {
@@ -161,7 +184,32 @@ public final class ToolchainManager: @unchecked Sendable, ToolchainManaging {
             }
         }
 
-        return ToolchainPaths(root: root, colmap: colmap, glomap: glomap, brush: brush)
+        let learnedRoot = root.appendingPathComponent("learned_sfm", isDirectory: true)
+        let learnedMatchTool = learnedRoot.appendingPathComponent("bin/easysplat_match")
+        let learnedPython = learnedRoot.appendingPathComponent("python/bin/python3")
+        let learnedModels = learnedRoot.appendingPathComponent("models", isDirectory: true)
+
+        guard fileManager.fileExists(atPath: learnedMatchTool.path) else {
+            throw ToolchainError.missingBinary("learned_sfm/bin/easysplat_match")
+        }
+        guard fileManager.fileExists(atPath: learnedPython.path) else {
+            throw ToolchainError.missingBinary("learned_sfm/python/bin/python3")
+        }
+        guard fileManager.fileExists(atPath: learnedModels.path) else {
+            throw ToolchainError.missingLibrary("learned_sfm/models")
+        }
+
+        ensureExecutable(at: learnedMatchTool)
+        ensureExecutable(at: learnedPython)
+
+        let learnedSfm = LearnedSfmToolchain(
+            root: learnedRoot,
+            matchTool: learnedMatchTool,
+            python: learnedPython,
+            models: learnedModels
+        )
+
+        return ToolchainPaths(root: root, colmap: colmap, glomap: glomap, brush: brush, learnedSfm: learnedSfm)
     }
 
     private func ensureExecutable(at url: URL) {

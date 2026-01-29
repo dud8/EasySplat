@@ -102,6 +102,67 @@ public final class ColmapRunner {
         try checkResult(result, command: "feature_extractor")
     }
 
+    public func runFeatureImporter(
+        colmapPath: URL,
+        database: URL,
+        imagePath: URL,
+        importPath: URL,
+        cameraModel: String,
+        options: ColmapOptions,
+        onLog: @escaping @Sendable (String, Bool) -> Void
+    ) async throws {
+        let args = [
+            "feature_importer",
+            "--database_path", database.path,
+            "--image_path", imagePath.path,
+            "--import_path", importPath.path,
+            "--ImageReader.single_camera", "1",
+            "--ImageReader.camera_model", cameraModel,
+            "--FeatureExtraction.use_gpu", options.useGPU ? "1" : "0",
+            "--FeatureExtraction.num_threads", "\(options.extractThreads)"
+        ]
+        let result = try await runner.runAsync(
+            colmapPath.path,
+            args,
+            currentDirectory: nil,
+            environment: options.environment,
+            onStdout: { onLog($0, false) },
+            onStderr: { onLog($0, true) }
+        )
+        try checkResult(result, command: "feature_importer")
+    }
+
+    public func runMatchesImporter(
+        colmapPath: URL,
+        database: URL,
+        matchListPath: URL,
+        matchType: String,
+        options: ColmapOptions,
+        onLog: @escaping @Sendable (String, Bool) -> Void
+    ) async throws {
+        let args = [
+            "matches_importer",
+            "--database_path", database.path,
+            "--match_list_path", matchListPath.path,
+            "--match_type", matchType,
+            "--FeatureMatching.use_gpu", options.useGPU ? "1" : "0",
+            "--FeatureMatching.num_threads", "\(options.matchThreads)"
+        ]
+        var finalArgs = args
+        if let maxNumMatches = options.maxNumMatches {
+            finalArgs.append(contentsOf: ["--FeatureMatching.max_num_matches", "\(maxNumMatches)"])
+        }
+        let result = try await runner.runAsync(
+            colmapPath.path,
+            finalArgs,
+            currentDirectory: nil,
+            environment: options.environment,
+            onStdout: { onLog($0, false) },
+            onStderr: { onLog($0, true) }
+        )
+        try checkResult(result, command: "matches_importer")
+    }
+
     public func runMatcherSequential(
         colmapPath: URL,
         database: URL,

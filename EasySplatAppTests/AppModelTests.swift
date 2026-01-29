@@ -55,11 +55,18 @@ final class MockToolchainManager: ToolchainManaging {
         targetName: String,
         onProgress: @escaping @Sendable (Double, String) -> Void
     ) async throws -> ToolchainPaths {
+        let learned = LearnedSfmToolchain(
+            root: URL(fileURLWithPath: "/mock/learned_sfm"),
+            matchTool: URL(fileURLWithPath: "/mock/learned_sfm/bin/easysplat_match"),
+            python: URL(fileURLWithPath: "/mock/learned_sfm/python/bin/python3"),
+            models: URL(fileURLWithPath: "/mock/learned_sfm/models")
+        )
         return ToolchainPaths(
             root: URL(fileURLWithPath: "/tmp/toolchain"),
             colmap: URL(fileURLWithPath: "/mock/colmap"),
             glomap: URL(fileURLWithPath: "/mock/glomap"),
-            brush: URL(fileURLWithPath: "/mock/brush")
+            brush: URL(fileURLWithPath: "/mock/brush"),
+            learnedSfm: learned
         )
     }
 }
