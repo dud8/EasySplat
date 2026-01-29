@@ -75,4 +75,27 @@ trap cleanup EXIT
 export EASYSPLAT_TOOLCHAIN_MANIFEST_URL="http://localhost:$PORT/manifest.json"
 export EASYSPLAT_TOOLCHAIN_PUBLIC_KEY_BASE64="$(cat "$PUB")"
 
+# If a previous install left a broken toolchain around (e.g. missing rpaths / OpenSSL dylibs),
+# ToolchainManager may reuse it and then COLMAP/GLOMAP will fail hours into a run. Validate and
+# proactively wipe the installed toolchain so the app re-installs from our freshly-built zip.
+INSTALLED_TOOLCHAIN="$HOME/Library/Application Support/EasySplat/Toolchains/$VERSION"
+validate_installed_toolchain() {
+  test -x "$INSTALLED_TOOLCHAIN/bin/colmap" || return 1
+  test -x "$INSTALLED_TOOLCHAIN/bin/glomap" || return 1
+  test -f "$INSTALLED_TOOLCHAIN/lib/libcrypto.3.dylib" || return 1
+  test -f "$INSTALLED_TOOLCHAIN/lib/libssl.3.dylib" || return 1
+
+  otool -l "$INSTALLED_TOOLCHAIN/bin/colmap" | grep -q "@executable_path/../lib" || return 1
+  otool -l "$INSTALLED_TOOLCHAIN/bin/glomap" | grep -q "@executable_path/../lib" || return 1
+  otool -L "$INSTALLED_TOOLCHAIN/bin/colmap" | grep -q "@rpath/libcrypto.3.dylib" || return 1
+  otool -L "$INSTALLED_TOOLCHAIN/bin/glomap" | grep -q "@rpath/libcrypto.3.dylib" || return 1
+}
+
+if [ -d "$INSTALLED_TOOLCHAIN" ]; then
+  if ! validate_installed_toolchain; then
+    echo "Installed toolchain looks invalid; removing: $INSTALLED_TOOLCHAIN" >&2
+    rm -rf "$INSTALLED_TOOLCHAIN"
+  fi
+fi
+
 swift run --package-path "$ROOT" EasySplatApp
