@@ -23,14 +23,14 @@ final class ColmapLogProgressTests: XCTestCase {
             XCTFail("Expected matching progress update")
             return
         }
-        XCTAssertEqual(step1.message, "Matching views (block 1/25)")
+        XCTAssertEqual(step1.message, "Matching views (block 1/25, tile 1/5 x 1/5)")
         XCTAssertEqual(step1.fraction, 1.0 / 25.0, accuracy: 0.0001)
 
         guard let step2 = tracker.ingest("I20260128 22:06:52.960593 pairing.cc:213] Processing block [1/5, 2/5]") else {
             XCTFail("Expected matching progress update")
             return
         }
-        XCTAssertEqual(step2.message, "Matching views (block 2/25)")
+        XCTAssertEqual(step2.message, "Matching views (block 2/25, tile 1/5 x 2/5)")
         XCTAssertEqual(step2.fraction, 2.0 / 25.0, accuracy: 0.0001)
 
         XCTAssertNil(tracker.ingest("I20260128 22:06:52.960593 pairing.cc:213] Processing block [1/5, 2/5]"))
@@ -39,7 +39,7 @@ final class ColmapLogProgressTests: XCTestCase {
             XCTFail("Expected matching progress update")
             return
         }
-        XCTAssertEqual(final.message, "Matching views (block 25/25)")
+        XCTAssertEqual(final.message, "Matching views (block 25/25, tile 5/5 x 5/5)")
         XCTAssertEqual(final.fraction, 0.99, accuracy: 0.0001)
     }
 

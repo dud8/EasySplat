@@ -53,7 +53,7 @@ final class ColmapMatchingProgressTracker: @unchecked Sendable {
         defer { lock.unlock() }
         guard fraction > lastFraction else { return nil }
         lastFraction = fraction
-        let message = "Matching views (block \(completedBlocks)/\(totalBlocks))"
+        let message = "Matching views (block \(completedBlocks)/\(totalBlocks), tile \(outerIndex)/\(outerTotal) x \(innerIndex)/\(innerTotal))"
         return (fraction, message)
     }
 

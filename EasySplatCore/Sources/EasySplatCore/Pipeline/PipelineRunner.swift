@@ -55,8 +55,10 @@ public final class PipelineRunner: @unchecked Sendable {
         var didEmitFailure = false
         var didRetryWithFewerFrames = false
         var didRetryWithCpu = false
+        var didRetryWithHigherSequentialOverlap = false
         var forceExhaustiveMatching = false
         var disableGlomapForThisRun = false
+        var lastUsedSequentialMatcher = false
 
         if metadata.state.lastError != nil {
             try? cleanForRetry(failedStage: metadata.state.stage, paths: paths)
@@ -235,13 +237,6 @@ public final class PipelineRunner: @unchecked Sendable {
                 guard force || shouldRunStage(.sfmMatching) else { return }
                 currentStage = .sfmMatching
                 emit(.stageStarted(stage: .sfmMatching))
-                let matchingProgress = ColmapMatchingProgressTracker()
-                let onMatchingLog: @Sendable (String, Bool) -> Void = { line, isErr in
-                    emit(.stageLog(stage: .sfmMatching, line: line, isError: isErr))
-                    if let update = matchingProgress.ingest(line) {
-                        emit(.stageProgress(stage: .sfmMatching, fraction: update.fraction, message: update.message))
-                    }
-                }
                 emit(.stageLog(
                     stage: .sfmMatching,
                     line: colmapMatchOptions.useGPU ? "Using GPU for COLMAP matching." : "Using CPU for COLMAP matching.",
@@ -252,41 +247,150 @@ public final class PipelineRunner: @unchecked Sendable {
                     input: metadata.input,
                     forceExhaustive: forceExhaustiveMatching
                 )
-                if useSequential {
-                    do {
+
+                final class MatchingProgressState: @unchecked Sendable {
+                    private let lock = NSLock()
+                    private var latestBlockMessage: String?
+
+                    func updateBlockMessage(_ message: String) {
+                        lock.lock()
+                        latestBlockMessage = message
+                        lock.unlock()
+                    }
+
+                    func blockMessage() -> String? {
+                        lock.lock()
+                        defer { lock.unlock() }
+                        return latestBlockMessage
+                    }
+                }
+
+                let exhaustiveFallbackMaxFrames = 60
+                lastUsedSequentialMatcher = useSequential
+
+                func runMatcherWithProgress(
+                    expectedPairs: Int,
+                    run: @escaping (@escaping @Sendable (String, Bool) -> Void) async throws -> Void
+                ) async throws {
+                    let state = MatchingProgressState()
+                    let blockProgress = ColmapMatchingProgressTracker()
+                    let onLog: @Sendable (String, Bool) -> Void = { line, isErr in
+                        emit(.stageLog(stage: .sfmMatching, line: line, isError: isErr))
+                        if let update = blockProgress.ingest(line) {
+                            state.updateBlockMessage(update.message)
+                        }
+                    }
+
+                    let poller = ColmapDatabaseProgressPoller(databasePath: paths.colmapDatabaseURL)
+                    let pollTask = Task.detached(priority: .utility) { [expectedPairs, poller, state, emit] in
+                        let denom = max(1, expectedPairs)
+                        var lastFraction: Double = 0
+                        var lastProcessed = -1
+
+                        while !Task.isCancelled {
+                            let processed = (try? poller.readProcessedPairCount()) ?? 0
+                            let rawFraction = Double(processed) / Double(denom)
+                            let clamped = max(0, min(0.99, rawFraction))
+                            if clamped > lastFraction {
+                                lastFraction = clamped
+                            }
+
+                            // Emit when we see new pairs, or periodically so the UI can show it's alive.
+                            if processed != lastProcessed || processed == 0 {
+                                lastProcessed = processed
+                                let base = state.blockMessage()
+                                let message: String
+                                if let base {
+                                    message = "\(base), pairs \(processed)/\(denom)"
+                                } else {
+                                    message = "Matching views (pairs \(processed)/\(denom))"
+                                }
+                                emit(.stageProgress(stage: .sfmMatching, fraction: lastFraction, message: message))
+                            }
+
+                            try? await Task.sleep(for: .seconds(1))
+                        }
+                    }
+                    defer { pollTask.cancel() }
+
+                    try await run(onLog)
+                }
+
+                func runSequential() async throws {
+                    let expected = ColmapPairEstimator.expectedSequentialPairs(
+                        imageCount: selectedFrames.count,
+                        overlap: colmapMatchOptions.sequentialOverlap
+                    )
+                    try await runMatcherWithProgress(expectedPairs: expected) { onLog in
                         try await self.tooling.colmap.runMatcherSequential(
                             colmapPath: self.config.toolchain.colmap,
                             database: paths.colmapDatabaseURL,
                             options: colmapMatchOptions,
-                            onLog: onMatchingLog
+                            onLog: onLog
                         )
-                    } catch {
-                        emit(.stageLog(stage: .sfmMatching, line: "Sequential matcher failed. Rebuilding database and retrying with exhaustive matcher.", isError: true))
-                        self.removeIfExists(paths.colmapDatabaseURL)
-                        try self.resetDirectory(paths.colmapSparseURL)
-                        try await self.tooling.colmap.runFeatureExtractor(
-                            colmapPath: self.config.toolchain.colmap,
-                            database: paths.colmapDatabaseURL,
-                            imagePath: paths.framesSelectedURL,
-                            maxImageSize: colmapMaxImageSize,
-                            cameraModel: self.cameraModel(for: metadata.preset),
-                            options: colmapExtractOptions,
-                            onLog: onMatchingLog
-                        )
+                    }
+                }
+
+                func runExhaustive() async throws {
+                    let expected = ColmapPairEstimator.expectedExhaustivePairs(imageCount: selectedFrames.count)
+                    try await runMatcherWithProgress(expectedPairs: expected) { onLog in
                         try await self.tooling.colmap.runMatcherExhaustive(
                             colmapPath: self.config.toolchain.colmap,
                             database: paths.colmapDatabaseURL,
                             options: colmapMatchOptions,
-                            onLog: onMatchingLog
+                            onLog: onLog
                         )
                     }
+                }
+
+                if useSequential {
+                    do {
+                        try await runSequential()
+                    } catch {
+                        let previousOverlap = colmapMatchOptions.sequentialOverlap
+                        let increasedOverlap = min(30, max(previousOverlap + 5, previousOverlap * 2))
+                        if increasedOverlap > previousOverlap {
+                            emit(.stageLog(
+                                stage: .sfmMatching,
+                                line: "Sequential matcher failed. Retrying sequential matching with higher overlap (\(previousOverlap) -> \(increasedOverlap)).",
+                                isError: true
+                            ))
+                            colmapMatchOptions.sequentialOverlap = increasedOverlap
+                            do {
+                                try await runSequential()
+                            } catch {
+                                emit(.stageLog(
+                                    stage: .sfmMatching,
+                                    line: "Sequential matcher failed again. Rebuilding database and retrying with exhaustive matching on fewer frames.",
+                                    isError: true
+                                ))
+                                let reduced = try self.downsampleSelectedFrames(to: exhaustiveFallbackMaxFrames, paths: paths)
+                                if let reduced {
+                                    selectedFrames = reduced
+                                }
+                                forceExhaustiveMatching = true
+                                lastUsedSequentialMatcher = false
+
+                                self.removeIfExists(paths.colmapDatabaseURL)
+                                try self.resetDirectory(paths.colmapSparseURL)
+                                try await self.tooling.colmap.runFeatureExtractor(
+                                    colmapPath: self.config.toolchain.colmap,
+                                    database: paths.colmapDatabaseURL,
+                                    imagePath: paths.framesSelectedURL,
+                                    maxImageSize: colmapMaxImageSize,
+                                    cameraModel: self.cameraModel(for: metadata.preset),
+                                    options: colmapExtractOptions,
+                                    onLog: { line, isErr in emit(.stageLog(stage: .sfmMatching, line: line, isError: isErr)) }
+                                )
+                                try await runExhaustive()
+                            }
+                        } else {
+                            throw error
+                        }
+                    }
                 } else {
-                    try await self.tooling.colmap.runMatcherExhaustive(
-                        colmapPath: self.config.toolchain.colmap,
-                        database: paths.colmapDatabaseURL,
-                        options: colmapMatchOptions,
-                        onLog: onMatchingLog
-                    )
+                    lastUsedSequentialMatcher = false
+                    try await runExhaustive()
                 }
                 emit(.stageFinished(stage: .sfmMatching))
                 markStageComplete(.sfmMatching)
@@ -482,6 +586,26 @@ public final class PipelineRunner: @unchecked Sendable {
                     if !mappingSucceeded,
                        let pipelineError = lastMappingError as? PipelineError,
                        case .lowQualityReconstruction = pipelineError,
+                       lastUsedSequentialMatcher,
+                       !didRetryWithHigherSequentialOverlap {
+                        let previousOverlap = colmapMatchOptions.sequentialOverlap
+                        let increasedOverlap = min(30, max(previousOverlap + 5, previousOverlap * 2))
+                        if increasedOverlap > previousOverlap {
+                            didRetryWithHigherSequentialOverlap = true
+                            colmapMatchOptions.sequentialOverlap = increasedOverlap
+                            emit(.stageLog(
+                                stage: .sfmMapping,
+                                line: "Reconstruction quality was low. Retrying with higher sequential overlap (\(previousOverlap) -> \(increasedOverlap)).",
+                                isError: true
+                            ))
+                            forceSfMRun = true
+                            continue sfmAttemptLoop
+                        }
+                    }
+
+                    if !mappingSucceeded,
+                       let pipelineError = lastMappingError as? PipelineError,
+                       case .lowQualityReconstruction = pipelineError,
                        try await applyFewerFramesRetry("Reconstruction quality was low; retrying with fewer frames and exhaustive matching", false) {
                         forceSfMRun = true
                         continue sfmAttemptLoop
@@ -633,7 +757,8 @@ private extension PipelineRunner {
     }
 
     func colmapOptionsForMatching() -> ColmapOptions {
-        let matchThreads = 1
+        let cores = ProcessInfo.processInfo.activeProcessorCount
+        let matchThreads = min(8, max(2, cores / 2))
         return ColmapOptions(
             useGPU: false,
             extractThreads: matchThreads,
@@ -944,7 +1069,6 @@ private extension PipelineRunner {
     func shouldUseSequential(selectedFrames: [URL], input: InputSpec, forceExhaustive: Bool) -> Bool {
         if forceExhaustive { return false }
         guard input.hasVideos, !input.hasPhotos else { return false }
-        if input.videoFiles.count != 1 { return false }
         if selectedFrames.count < 30 { return false }
         return true
     }
