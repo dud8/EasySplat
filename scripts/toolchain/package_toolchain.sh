@@ -25,6 +25,7 @@ fi
 COLMAP_INSTALL="${COLMAP_INSTALL:-$ROOT/Toolchains/build/colmap/install}"
 GLOMAP_INSTALL="${GLOMAP_INSTALL:-$ROOT/Toolchains/build/glomap/install}"
 BRUSH_INSTALL="${BRUSH_INSTALL:-$ROOT/Toolchains/build/brush/install}"
+LEARNED_SFM_INSTALL="${LEARNED_SFM_INSTALL:-$ROOT/Toolchains/build/learned_sfm/install}"
 
 OUT="$ROOT/Toolchains/out"
 BIN="$OUT/bin"
@@ -39,6 +40,12 @@ cp "$GLOMAP_INSTALL/bin/glomap" "$BIN/glomap"
 cp "$BRUSH_INSTALL/bin/brush" "$BIN/brush"
 
 chmod +x "$BIN/colmap" "$BIN/glomap" "$BIN/brush"
+
+if [ ! -d "$LEARNED_SFM_INSTALL/learned_sfm" ]; then
+  echo "learned_sfm bundle not found at $LEARNED_SFM_INSTALL/learned_sfm. Build it before packaging." >&2
+  exit 1
+fi
+cp -R "$LEARNED_SFM_INSTALL/learned_sfm" "$OUT/learned_sfm"
 
 if ! command -v install_name_tool >/dev/null 2>&1; then
   echo "install_name_tool not found; cannot package portable GLOMAP dependencies." >&2
@@ -131,7 +138,7 @@ test -f "$LIB/libcrypto.3.dylib" || { echo "missing bundled libcrypto.3.dylib" >
 test -f "$LIB/libssl.3.dylib" || { echo "missing bundled libssl.3.dylib" >&2; exit 1; }
 
 pushd "$OUT" >/dev/null
-zip -r "$ZIP" bin lib
+zip -r "$ZIP" bin lib learned_sfm
 popd >/dev/null
 
 echo "Packaged toolchain: $ZIP"

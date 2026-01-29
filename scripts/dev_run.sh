@@ -24,10 +24,16 @@ ZIP="$OUT/toolchain-macos-arm64-$VERSION.zip"
 MANIFEST="$TOOLCHAINS/manifest.json"
 PUB="$TOOLCHAINS/public_key_ed25519.txt"
 PRIV="$TOOLCHAINS/private_key_ed25519.txt"
+LEARNED_SFM_INSTALL="${LEARNED_SFM_INSTALL:-$ROOT/Toolchains/build/learned_sfm/install}"
+LEARNED_SFM_BUNDLE="$LEARNED_SFM_INSTALL/learned_sfm"
+LEARNED_SFM_BUILD="$ROOT/scripts/toolchain/build_learned_sfm.sh"
 
 toolchain_zip_valid() {
   test -f "$ZIP" || return 1
   unzip -l "$ZIP" | grep -q "lib/libcrypto.3.dylib" || return 1
+  unzip -l "$ZIP" | grep -q "learned_sfm/bin/easysplat_match" || return 1
+  unzip -l "$ZIP" | grep -q "learned_sfm/python/bin/python3" || return 1
+  unzip -l "$ZIP" | grep -q "learned_sfm/models" || return 1
 
   local tmp
   tmp="$(mktemp -d)"
@@ -38,11 +44,30 @@ toolchain_zip_valid() {
   rm -rf "$tmp"
 }
 
+ensure_learned_sfm_bundle() {
+  if [ -d "$LEARNED_SFM_BUNDLE" ]; then
+    return 0
+  fi
+  if [ -x "$LEARNED_SFM_BUILD" ]; then
+    "$LEARNED_SFM_BUILD"
+  fi
+  if [ ! -d "$LEARNED_SFM_BUNDLE" ]; then
+    echo "learned_sfm bundle not found at $LEARNED_SFM_BUNDLE." >&2
+    if [ -x "$LEARNED_SFM_BUILD" ]; then
+      echo "Tried to run $LEARNED_SFM_BUILD, but the bundle is still missing." >&2
+    else
+      echo "Provide it via LEARNED_SFM_INSTALL or add a build script at $LEARNED_SFM_BUILD." >&2
+    fi
+    exit 1
+  fi
+}
+
 if ! toolchain_zip_valid; then
   "$ROOT/scripts/toolchain/build_openssl.sh"
   test -x "$ROOT/Toolchains/build/colmap/install/bin/colmap" || "$ROOT/scripts/toolchain/build_colmap.sh"
   test -x "$ROOT/Toolchains/build/glomap/install/bin/glomap" || "$ROOT/scripts/toolchain/build_glomap.sh"
   test -x "$ROOT/Toolchains/build/brush/install/bin/brush" || "$ROOT/scripts/toolchain/build_brush.sh"
+  ensure_learned_sfm_bundle
   "$ROOT/scripts/toolchain/package_toolchain.sh" --version "$VERSION"
 fi
 
@@ -84,6 +109,9 @@ validate_installed_toolchain() {
   test -x "$INSTALLED_TOOLCHAIN/bin/glomap" || return 1
   test -f "$INSTALLED_TOOLCHAIN/lib/libcrypto.3.dylib" || return 1
   test -f "$INSTALLED_TOOLCHAIN/lib/libssl.3.dylib" || return 1
+  test -x "$INSTALLED_TOOLCHAIN/learned_sfm/bin/easysplat_match" || return 1
+  test -x "$INSTALLED_TOOLCHAIN/learned_sfm/python/bin/python3" || return 1
+  test -d "$INSTALLED_TOOLCHAIN/learned_sfm/models" || return 1
 
   otool -l "$INSTALLED_TOOLCHAIN/bin/colmap" | grep -q "@executable_path/../lib" || return 1
   otool -l "$INSTALLED_TOOLCHAIN/bin/glomap" | grep -q "@executable_path/../lib" || return 1
