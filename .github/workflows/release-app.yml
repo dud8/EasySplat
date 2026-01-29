@@ -59,7 +59,7 @@ jobs:
       - name: Create DMG
         run: |
           scripts/release/create_dmg.sh \
-            --app-path "build/Export/EasySplatApp.app" \
+            --app-path "build/Export/EasySplat.app" \
             --out "build/EasySplat-$VERSION.dmg"
 
       - name: Upload release asset

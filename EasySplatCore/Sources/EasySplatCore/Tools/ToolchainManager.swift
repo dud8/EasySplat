@@ -18,7 +18,7 @@ public protocol ToolchainManaging: Sendable {
 }
 
 public final class ToolchainManager: @unchecked Sendable, ToolchainManaging {
-    public enum ToolchainError: Error {
+    public enum ToolchainError: Error, LocalizedError {
         case invalidManifest
         case signatureFailed
         case artifactNotFound
@@ -26,6 +26,40 @@ public final class ToolchainManager: @unchecked Sendable, ToolchainManaging {
         case hashMismatch
         case unzipFailed
         case missingBinary(String)
+        case missingLibrary(String)
+        case invalidToolchain(String)
+        case noApplicationSupportDirectory
+        case invalidArtifactURL(String)
+        case fileIOFailed(String)
+
+        public var errorDescription: String? {
+            switch self {
+            case .invalidManifest:
+                return "Toolchain manifest is invalid."
+            case .signatureFailed:
+                return "Toolchain signature verification failed."
+            case .artifactNotFound:
+                return "Toolchain artifact not found for this Mac."
+            case .downloadFailed:
+                return "Failed to download the toolchain."
+            case .hashMismatch:
+                return "Downloaded toolchain did not match the expected checksum."
+            case .unzipFailed:
+                return "Failed to unpack the downloaded toolchain."
+            case .missingBinary(let name):
+                return "Toolchain is missing required binary: \(name)."
+            case .missingLibrary(let name):
+                return "Toolchain is missing required library: \(name)."
+            case .invalidToolchain(let message):
+                return "Toolchain is invalid. \(message)"
+            case .noApplicationSupportDirectory:
+                return "Unable to locate the Application Support directory."
+            case .invalidArtifactURL(let urlString):
+                return "Toolchain artifact URL is invalid: \(urlString)"
+            case .fileIOFailed(let message):
+                return message
+            }
+        }
     }
 
     private let fileManager = FileManager.default
@@ -36,7 +70,13 @@ public final class ToolchainManager: @unchecked Sendable, ToolchainManaging {
     }
 
     public func toolchainRoot() -> URL {
-        let base = fileManager.urls(for: .applicationSupportDirectory, in: .userDomainMask).first!
+        (try? toolchainRootURL()) ?? fileManager.temporaryDirectory.appendingPathComponent("EasySplat/Toolchains", isDirectory: true)
+    }
+
+    private func toolchainRootURL() throws -> URL {
+        guard let base = fileManager.urls(for: .applicationSupportDirectory, in: .userDomainMask).first else {
+            throw ToolchainError.noApplicationSupportDirectory
+        }
         return base.appendingPathComponent("EasySplat/Toolchains", isDirectory: true)
     }
 
@@ -54,34 +94,80 @@ public final class ToolchainManager: @unchecked Sendable, ToolchainManaging {
             throw ToolchainError.artifactNotFound
         }
 
-        let versionedRoot = toolchainRoot().appendingPathComponent(manifest.version, isDirectory: true)
+        let artifactURL: URL
+        if let url = URL(string: artifact.url) {
+            artifactURL = url
+        } else {
+            throw ToolchainError.invalidArtifactURL(artifact.url)
+        }
+
+        let versionedRoot = try toolchainRootURL().appendingPathComponent(manifest.version, isDirectory: true)
         if fileManager.fileExists(atPath: versionedRoot.path) {
+            do {
+                return try validateToolchain(root: versionedRoot)
+            } catch {
+                try? fileManager.removeItem(at: versionedRoot)
+            }
+        }
+
+        do {
+            try fileManager.createDirectory(at: versionedRoot, withIntermediateDirectories: true)
+            let zipURL = versionedRoot.appendingPathComponent("toolchain.zip")
+            try await downloadFile(url: artifactURL, to: zipURL, onProgress: onProgress)
+
+            let computedHash = try sha256Hex(url: zipURL)
+            guard computedHash.lowercased() == artifact.sha256.lowercased() else {
+                throw ToolchainError.hashMismatch
+            }
+
+            try unzip(zipURL: zipURL, to: versionedRoot)
+            try fileManager.removeItem(at: zipURL)
+
             return try validateToolchain(root: versionedRoot)
+        } catch {
+            try? fileManager.removeItem(at: versionedRoot)
+            throw error
         }
-
-        try fileManager.createDirectory(at: versionedRoot, withIntermediateDirectories: true)
-        let zipURL = versionedRoot.appendingPathComponent("toolchain.zip")
-        try await downloadFile(url: URL(string: artifact.url)!, to: zipURL, onProgress: onProgress)
-
-        let computedHash = try sha256Hex(url: zipURL)
-        guard computedHash.lowercased() == artifact.sha256.lowercased() else {
-            throw ToolchainError.hashMismatch
-        }
-
-        try unzip(zipURL: zipURL, to: versionedRoot)
-        try fileManager.removeItem(at: zipURL)
-
-        return try validateToolchain(root: versionedRoot)
     }
 
     private func validateToolchain(root: URL) throws -> ToolchainPaths {
         let colmap = root.appendingPathComponent("bin/colmap")
         let glomap = root.appendingPathComponent("bin/glomap")
         let brush = root.appendingPathComponent("bin/brush")
+        ensureExecutable(at: colmap)
+        ensureExecutable(at: glomap)
+        ensureExecutable(at: brush)
         guard fileManager.isExecutableFile(atPath: colmap.path) else { throw ToolchainError.missingBinary("colmap") }
         guard fileManager.isExecutableFile(atPath: glomap.path) else { throw ToolchainError.missingBinary("glomap") }
         guard fileManager.isExecutableFile(atPath: brush.path) else { throw ToolchainError.missingBinary("brush") }
+
+        // Validate OpenSSL dylibs and that COLMAP/GLOMAP can at least launch. Avoid requiring Xcode tools
+        // (like `otool`) at runtime, since end users may not have them installed.
+        let libcrypto = root.appendingPathComponent("lib/libcrypto.3.dylib")
+        let libssl = root.appendingPathComponent("lib/libssl.3.dylib")
+        guard fileManager.fileExists(atPath: libcrypto.path) else { throw ToolchainError.missingLibrary("libcrypto.3.dylib") }
+        guard fileManager.fileExists(atPath: libssl.path) else { throw ToolchainError.missingLibrary("libssl.3.dylib") }
+
+        let colmapCheck = try runner.run(colmap.path, ["-h"])
+        guard colmapCheck.exitCode == 0 else {
+            throw ToolchainError.invalidToolchain("COLMAP failed to launch (exit \(colmapCheck.exitCode)).")
+        }
+
+        let glomapCheck = try runner.run(glomap.path, ["--help"])
+        if glomapCheck.exitCode != 0 {
+            let text = "\(glomapCheck.stdout)\n\(glomapCheck.stderr)".lowercased()
+            if text.contains("library not loaded") || text.contains("no lc_rpath") || text.contains("@rpath/libcrypto.3.dylib") {
+                throw ToolchainError.invalidToolchain("GLOMAP failed to launch (missing dylib/rpath).")
+            }
+        }
+
         return ToolchainPaths(root: root, colmap: colmap, glomap: glomap, brush: brush)
+    }
+
+    private func ensureExecutable(at url: URL) {
+        guard fileManager.fileExists(atPath: url.path) else { return }
+        if fileManager.isExecutableFile(atPath: url.path) { return }
+        try? fileManager.setAttributes([.posixPermissions: 0o755], ofItemAtPath: url.path)
     }
 
     private func downloadManifest(url: URL) async throws -> ToolchainManifest {
@@ -100,19 +186,18 @@ public final class ToolchainManager: @unchecked Sendable, ToolchainManaging {
         request.httpMethod = "GET"
         let (stream, response) = try await URLSession.shared.bytes(for: request)
         guard (response as? HTTPURLResponse)?.statusCode == 200 else { throw ToolchainError.downloadFailed }
+
         let expected = response.expectedContentLength
-        try fileManager.createDirectory(at: destination.deletingLastPathComponent(), withIntermediateDirectories: true)
-        fileManager.createFile(atPath: destination.path, contents: nil)
-        let handle = try FileHandle(forWritingTo: destination)
-        var received: Int64 = 0
-        for try await byte in stream {
-            handle.write(Data([byte]))
-            received += 1
-            if expected > 0 {
-                onProgress(Double(received) / Double(expected), "Downloading toolchain")
-            }
+        let writer = BufferedByteStreamWriter(fileManager: fileManager)
+        do {
+            try await writer.write(bytes: stream, to: destination, expectedLength: expected, onProgress: onProgress)
+        } catch is CancellationError {
+            throw CancellationError()
+        } catch let error as URLError {
+            throw error
+        } catch {
+            throw ToolchainError.fileIOFailed("Failed to write toolchain to disk. \(error.localizedDescription)")
         }
-        try handle.close()
     }
 
     private func sha256Hex(url: URL) throws -> String {

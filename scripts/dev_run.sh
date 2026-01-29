@@ -25,10 +25,24 @@ MANIFEST="$TOOLCHAINS/manifest.json"
 PUB="$TOOLCHAINS/public_key_ed25519.txt"
 PRIV="$TOOLCHAINS/private_key_ed25519.txt"
 
-if [ ! -f "$ZIP" ]; then
-  "$ROOT/scripts/toolchain/build_colmap.sh"
-  "$ROOT/scripts/toolchain/build_glomap.sh"
-  "$ROOT/scripts/toolchain/build_brush.sh"
+toolchain_zip_valid() {
+  test -f "$ZIP" || return 1
+  unzip -l "$ZIP" | grep -q "lib/libcrypto.3.dylib" || return 1
+
+  local tmp
+  tmp="$(mktemp -d)"
+  unzip -p "$ZIP" bin/glomap >"$tmp/glomap" 2>/dev/null || { rm -rf "$tmp"; return 1; }
+  chmod +x "$tmp/glomap"
+  otool -l "$tmp/glomap" | grep -q "@executable_path/../lib" || { rm -rf "$tmp"; return 1; }
+  otool -L "$tmp/glomap" | grep -q "@rpath/libcrypto.3.dylib" || { rm -rf "$tmp"; return 1; }
+  rm -rf "$tmp"
+}
+
+if ! toolchain_zip_valid; then
+  "$ROOT/scripts/toolchain/build_openssl.sh"
+  test -x "$ROOT/Toolchains/build/colmap/install/bin/colmap" || "$ROOT/scripts/toolchain/build_colmap.sh"
+  test -x "$ROOT/Toolchains/build/glomap/install/bin/glomap" || "$ROOT/scripts/toolchain/build_glomap.sh"
+  test -x "$ROOT/Toolchains/build/brush/install/bin/brush" || "$ROOT/scripts/toolchain/build_brush.sh"
   "$ROOT/scripts/toolchain/package_toolchain.sh" --version "$VERSION"
 fi
 
@@ -44,7 +58,7 @@ swift run --package-path "$ROOT/Tools/ManifestTool" ManifestTool \
   --zip "$ZIP" \
   --version "$VERSION" \
   --published-at "$PUBLISHED_AT" \
-  --artifact-url "http://localhost:$PORT/$(basename "$ZIP")" \
+  --artifact-url "http://localhost:$PORT/out/$(basename "$ZIP")" \
   --private-key "$(cat "$PRIV")" \
   --manifest-out "$MANIFEST"
 

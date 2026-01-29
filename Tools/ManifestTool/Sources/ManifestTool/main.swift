@@ -50,7 +50,7 @@ struct ManifestTool {
                 let zipURL = URL(fileURLWithPath: zipPath)
                 let size = try FileManager.default.attributesOfItem(atPath: zipURL.path)[.size] as? UInt64 ?? 0
                 let sha = try sha256Hex(url: zipURL)
-                let contents = ["bin/colmap", "bin/glomap", "bin/brush"]
+                let contents = ["bin/colmap", "bin/glomap", "bin/brush", "lib/libcrypto.3.dylib", "lib/libssl.3.dylib"]
 
                 let formatter = ISO8601DateFormatter()
                 guard let date = formatter.date(from: publishedAt) else {

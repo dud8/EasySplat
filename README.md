@@ -17,14 +17,72 @@ This builds the local toolchain, serves it, and launches the app:
 ./scripts/dev_run.sh
 ```
 
+## Build a DMG locally (from scratch)
+
+1) Install dependencies (once):
+
+```
+brew install create-dmg cmake ninja boost eigen freeimage glog gflags suitesparse ceres-solver qt glew cgal libomp openimageio
+```
+If this is your first Xcode install, accept the license:
+
+```
+sudo xcodebuild -license accept
+```
+
+2) Build toolchain + app + DMG:
+
+```
+./scripts/release/build_dmg.sh --version 0.1.0
+```
+
+By default the manifest/artifact URLs are set to `http://localhost:8000/...`. If you want the DMG to point at a hosted toolchain instead, pass URLs explicitly:
+
+```
+./scripts/release/build_dmg.sh \
+  --version 0.1.0 \
+  --manifest-url "https://your-host/manifest.json" \
+  --artifact-url "https://your-host/toolchain-macos-arm64-0.1.0.zip"
+```
+
+The DMG will be created at `release/DMG/EasySplat-0.1.0.dmg`.
+If `create-dmg` fails to unmount with a "Resource busy" error, re-run with (skips Finder layout):
+
+```
+EASYSPLAT_DMG_SKIP_JENKINS=1 ./scripts/release/build_dmg.sh --version 0.1.0
+```
+You can also increase retries or force sandbox-safe mode:
+
+```
+EASYSPLAT_DMG_HDIUTIL_RETRIES=40 EASYSPLAT_DMG_SANDBOX_SAFE=1 ./scripts/release/build_dmg.sh --version 0.1.0
+```
+If you keep the default localhost URLs, start a local server before launching the app:
+
+```
+cd Toolchains
+python3 -m http.server 8000
+```
+
 ## Requirements (development)
 
 - macOS 15+ on Apple Silicon
-- Xcode 16+ (Swift 5.9) or the Xcode Command Line Tools
+- Xcode 16+ (Swift 6) or the Xcode Command Line Tools
 - Toolchain build dependencies:
   - `git`, `cmake`, `ninja`
   - COLMAP/GLOMAP deps (e.g. Eigen, Ceres, Boost, Glog, Gflags, OpenCV, SQLite3)
   - Rust toolchain (for Brush)
+  - `create-dmg` (for DMG packaging)
+
+## Release (GitHub Actions)
+
+1) Build the toolchain (uploads `toolchain-macos-arm64-<version>.zip` + `manifest.json`):
+   - Run the **Toolchain Build** workflow, or push tag `toolchain-v<version>`.
+   - Requires repo secret `TOOLCHAIN_SIGNING_KEY_BASE64` (base64 private key).
+
+2) Build the app + DMG (uploads `EasySplat-<version>.dmg`):
+   - Run the **Release App** workflow, or push tag `v<version>`.
+   - Requires repo secret `TOOLCHAIN_PUBLIC_KEY_BASE64` (base64 public key).
+   - Expects the matching toolchain release tag `toolchain-v<version>`.
 
 ## Manual dev setup (optional)
 
