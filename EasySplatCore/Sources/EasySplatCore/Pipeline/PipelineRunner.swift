@@ -115,7 +115,9 @@ public final class PipelineRunner: @unchecked Sendable {
                 markStageComplete(.importInput)
             }
 
-            let (targetFrames, maxDim) = framePreset(for: metadata.preset.quality)
+            let frameProfile = frameExtractionProfile(for: metadata.preset.quality)
+            let targetFrames = frameProfile.targetCount
+            let maxDim = frameProfile.maxDimension
             var colmapMaxImageSize = Int(maxDim)
             var colmapExtractOptions = colmapOptionsForExtraction()
             var colmapMatchOptions = colmapOptionsForMatching()
@@ -145,7 +147,15 @@ public final class PipelineRunner: @unchecked Sendable {
                         _ = try await extractor.extractFrames(
                             from: videoURL,
                             to: rawDir,
-                            options: FrameExtractionOptions(targetCount: perVideoTarget, maxDimension: maxDim),
+                            options: FrameExtractionOptions(
+                                targetCount: perVideoTarget,
+                                maxDimension: maxDim,
+                                targetFPS: frameProfile.targetFPS,
+                                minDistanceRatio: frameProfile.minDistanceRatio,
+                                sharpnessFloor: frameProfile.sharpnessFloor,
+                                sharpnessRatio: frameProfile.sharpnessRatio,
+                                outputFormat: frameProfile.outputFormat
+                            ),
                             progress: { fraction, message in
                                 let scaled = (Double(index) / totalVideos) + (fraction / totalVideos)
                                 emit(.stageProgress(stage: .extractFrames, fraction: scaled, message: message))
@@ -176,7 +186,7 @@ public final class PipelineRunner: @unchecked Sendable {
                             if perVideoTarget == 0 {
                                 continue
                             }
-                            let chosen = selector.selectFrames(from: rawFrames, targetCount: perVideoTarget) { fraction, message in
+                            let chosen = selector.selectFrames(from: rawFrames, targetCount: perVideoTarget, mode: .smartExtracted) { fraction, message in
                                 let scaled = (Double(index) / totalVideos) + (fraction / totalVideos)
                                 emit(.stageProgress(stage: .selectFrames, fraction: scaled, message: message))
                             }
@@ -286,9 +296,13 @@ public final class PipelineRunner: @unchecked Sendable {
                         let denom = max(1, expectedPairs)
                         var lastFraction: Double = 0
                         var lastProcessed = -1
+                        var lastEmit = Date.distantPast
 
                         while !Task.isCancelled {
-                            let processed = (try? poller.readProcessedPairCount()) ?? 0
+                            var processed = (try? poller.readProcessedPairCount()) ?? 0
+                            if lastProcessed >= 0, processed < lastProcessed {
+                                processed = lastProcessed
+                            }
                             let rawFraction = Double(processed) / Double(denom)
                             let clamped = max(0, min(0.99, rawFraction))
                             if clamped > lastFraction {
@@ -296,8 +310,11 @@ public final class PipelineRunner: @unchecked Sendable {
                             }
 
                             // Emit when we see new pairs, or periodically so the UI can show it's alive.
-                            if processed != lastProcessed || processed == 0 {
+                            let now = Date()
+                            let shouldEmitZeroHeartbeat = processed == 0 && now.timeIntervalSince(lastEmit) >= 10
+                            if processed != lastProcessed || shouldEmitZeroHeartbeat {
                                 lastProcessed = processed
+                                lastEmit = now
                                 let base = state.blockMessage()
                                 let message: String
                                 if let base {
@@ -364,9 +381,18 @@ public final class PipelineRunner: @unchecked Sendable {
                                     line: "Sequential matcher failed again. Rebuilding database and retrying with exhaustive matching on fewer frames.",
                                     isError: true
                                 ))
+                                let previousCount = selectedFrames.count
                                 let reduced = try self.downsampleSelectedFrames(to: exhaustiveFallbackMaxFrames, paths: paths)
                                 if let reduced {
                                     selectedFrames = reduced
+                                }
+                                didRetryWithFewerFrames = true
+                                if previousCount != selectedFrames.count {
+                                    emit(.stageLog(
+                                        stage: .sfmMatching,
+                                        line: "Reduced matching frames \(previousCount) -> \(selectedFrames.count) for exhaustive fallback.",
+                                        isError: true
+                                    ))
                                 }
                                 forceExhaustiveMatching = true
                                 lastUsedSequentialMatcher = false
@@ -1026,7 +1052,8 @@ private extension PipelineRunner {
         case .extractFrames:
             guard metadata.input.hasVideos else { return true }
             for index in metadata.input.videoFiles.indices {
-                let perVideoTarget = targetCountForVideo(index: index, total: metadata.input.videoFiles.count, targetCount: framePreset(for: metadata.preset.quality).0)
+                let profile = frameExtractionProfile(for: metadata.preset.quality)
+                let perVideoTarget = targetCountForVideo(index: index, total: metadata.input.videoFiles.count, targetCount: profile.targetCount)
                 if perVideoTarget == 0 { continue }
                 let rawDir = rawFramesDirectory(index: index, paths: paths)
                 if !fm.fileExists(atPath: rawDir.path) { return false }
@@ -1051,11 +1078,48 @@ private extension PipelineRunner {
         }
     }
 
-    func framePreset(for quality: QualityPreset) -> (Int, CGFloat) {
+    struct FrameExtractionProfile {
+        let targetCount: Int
+        let maxDimension: CGFloat
+        let targetFPS: Int
+        let minDistanceRatio: Double
+        let sharpnessFloor: Double
+        let sharpnessRatio: Double
+        let outputFormat: FrameOutputFormat
+    }
+
+    func frameExtractionProfile(for quality: QualityPreset) -> FrameExtractionProfile {
         switch quality {
-        case .draft: return (120, 1024)
-        case .standard: return (250, 1600)
-        case .ultra: return (500, 2048)
+        case .draft:
+            return FrameExtractionProfile(
+                targetCount: 120,
+                maxDimension: 1024,
+                targetFPS: 2,
+                minDistanceRatio: 0.20,
+                sharpnessFloor: 30.0,
+                sharpnessRatio: 0.5,
+                outputFormat: .jpeg
+            )
+        case .standard:
+            return FrameExtractionProfile(
+                targetCount: 250,
+                maxDimension: 1600,
+                targetFPS: 3,
+                minDistanceRatio: 0.20,
+                sharpnessFloor: 40.0,
+                sharpnessRatio: 0.6,
+                outputFormat: .jpeg
+            )
+        case .ultra:
+            return FrameExtractionProfile(
+                targetCount: 500,
+                maxDimension: 2048,
+                targetFPS: 4,
+                minDistanceRatio: 0.20,
+                sharpnessFloor: 50.0,
+                sharpnessRatio: 0.65,
+                outputFormat: .png
+            )
         }
     }
 

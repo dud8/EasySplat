@@ -26,6 +26,7 @@ struct ColmapDatabaseProgressPoller: Sendable {
                 NSLocalizedDescriptionKey: "Failed to open COLMAP database at \(databasePath.path)"
             ])
         }
+        sqlite3_busy_timeout(db, 250)
 
         if let count = queryCount(db: db, sql: "SELECT COUNT(*) FROM two_view_geometries;") {
             return count
@@ -53,4 +54,3 @@ struct ColmapDatabaseProgressPoller: Sendable {
         return Int(value)
     }
 }
-

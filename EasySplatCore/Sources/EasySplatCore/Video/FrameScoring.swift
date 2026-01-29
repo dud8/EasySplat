@@ -4,6 +4,7 @@ import ImageIO
 
 public struct FrameScore: Sendable {
     public var blurScore: Double
+    public var laplacianScore: Double
     public var brightness: Double
     public var clippedFraction: Double
     public var dHash: UInt64
@@ -14,11 +15,16 @@ public enum FrameScoring {
         guard let cgImage = loadCGImage(url: url) else {
             throw NSError(domain: "FrameScoring", code: 1)
         }
+        return scoreFrame(cgImage: cgImage)
+    }
+
+    public static func scoreFrame(cgImage: CGImage) -> FrameScore {
         let grayscale = grayscalePixels(cgImage: cgImage, width: 64, height: 64)
         let blur = blurScore(pixels: grayscale, width: 64, height: 64)
+        let laplacian = laplacianVariance(pixels: grayscale, width: 64, height: 64)
         let (brightness, clipped) = exposureScore(pixels: grayscale)
         let hash = dHash(pixels: grayscale, width: 64, height: 64)
-        return FrameScore(blurScore: blur, brightness: brightness, clippedFraction: clipped, dHash: hash)
+        return FrameScore(blurScore: blur, laplacianScore: laplacian, brightness: brightness, clippedFraction: clipped, dHash: hash)
     }
 
     private static func loadCGImage(url: URL) -> CGImage? {
@@ -67,6 +73,33 @@ public enum FrameScoring {
             }
         }
         return Double(sumDiff) / Double(width * height)
+    }
+
+    private static func laplacianVariance(pixels: [UInt8], width: Int, height: Int) -> Double {
+        guard width > 2, height > 2 else { return 0 }
+        var sum: Double = 0
+        var sumSquares: Double = 0
+        var count: Double = 0
+        for y in 1..<(height - 1) {
+            let row = y * width
+            let prev = (y - 1) * width
+            let next = (y + 1) * width
+            for x in 1..<(width - 1) {
+                let center = Double(pixels[row + x])
+                let up = Double(pixels[prev + x])
+                let down = Double(pixels[next + x])
+                let left = Double(pixels[row + x - 1])
+                let right = Double(pixels[row + x + 1])
+                let value = (4.0 * center) - up - down - left - right
+                sum += value
+                sumSquares += value * value
+                count += 1
+            }
+        }
+        guard count > 0 else { return 0 }
+        let mean = sum / count
+        let variance = (sumSquares / count) - (mean * mean)
+        return variance
     }
 
     private static func exposureScore(pixels: [UInt8]) -> (Double, Double) {
