@@ -20,7 +20,10 @@ final class AppModelTests: XCTestCase {
             MockPipelineRunner(projectURL: projectURL, config: config)
         }
 
-        await model.startProject(inputURL: input, isFolder: false)
+        model.addInputs(urls: [input])
+        model.startFromPendingSelection()
+
+        try await waitForViewState(model: model, state: .viewer)
 
         XCTAssertEqual(model.viewState, .viewer)
         XCTAssertNotNil(model.currentProjectURL)
@@ -31,6 +34,17 @@ final class AppModelTests: XCTestCase {
         }
         let metadataURL = projectURL.appendingPathComponent("project.json")
         XCTAssertTrue(FileManager.default.fileExists(atPath: metadataURL.path))
+    }
+
+    private func waitForViewState(model: AppModel, state: AppModel.ViewState, timeout: TimeInterval = 2.0) async throws {
+        let deadline = Date().addingTimeInterval(timeout)
+        while Date() < deadline {
+            if model.viewState == state {
+                return
+            }
+            try await Task.sleep(nanoseconds: 50_000_000)
+        }
+        XCTFail("Timed out waiting for viewState to become \(state)")
     }
 }
 

@@ -46,11 +46,16 @@ struct MetalKitSceneView: NSViewRepresentable {
 
     func makeNSView(context: NSViewRepresentableContext<MetalKitSceneView>) -> MTKView {
         let metalKitView = InteractiveMTKView()
-        if let metalDevice = MTLCreateSystemDefaultDevice() {
-            metalKitView.device = metalDevice
+        guard let metalDevice = MTLCreateSystemDefaultDevice() else {
+            controller.errorMessage = "Metal is not available on this Mac."
+            controller.isLoading = false
+            return metalKitView
         }
+        metalKitView.device = metalDevice
 
         guard let renderer = MetalKitSceneRenderer(metalKitView) else {
+            controller.errorMessage = "Failed to initialize Metal renderer."
+            controller.isLoading = false
             return metalKitView
         }
         context.coordinator.renderer = renderer

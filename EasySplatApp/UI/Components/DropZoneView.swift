@@ -1,9 +1,10 @@
 import SwiftUI
+import Foundation
 
 struct DropZoneView: View {
     let title: String
     let subtitle: String
-    let onDropURL: (URL) -> Void
+    let onDropURLs: ([URL]) -> Void
 
     @State private var isTargeted = false
 
@@ -22,13 +23,41 @@ struct DropZoneView: View {
             .padding(28)
         }
         .onDrop(of: [.fileURL], isTargeted: $isTargeted) { providers in
-            guard let provider = providers.first else { return false }
-            _ = provider.loadObject(ofClass: URL.self) { url, _ in
-                if let url {
-                    DispatchQueue.main.async { onDropURL(url) }
+            let group = DispatchGroup()
+            let collector = URLCollector()
+            for provider in providers {
+                group.enter()
+                _ = provider.loadObject(ofClass: URL.self) { url, _ in
+                    if let url {
+                        collector.append(url)
+                    }
+                    group.leave()
                 }
             }
-            return true
+            group.notify(queue: .main) {
+                let urls = collector.urls()
+                if !urls.isEmpty {
+                    onDropURLs(urls)
+                }
+            }
+            return !providers.isEmpty
         }
+    }
+}
+
+private final class URLCollector: @unchecked Sendable {
+    private var storage: [URL] = []
+    private let lock = NSLock()
+
+    func append(_ url: URL) {
+        lock.lock()
+        storage.append(url)
+        lock.unlock()
+    }
+
+    func urls() -> [URL] {
+        lock.lock()
+        defer { lock.unlock() }
+        return storage
     }
 }

@@ -7,9 +7,13 @@ struct StepperProgressView: View {
     private let displayStages: [PipelineStage] = [
         .importInput,
         .extractFrames,
+        .selectFrames,
+        .sfmFeatures,
+        .sfmMatching,
         .sfmMapping,
         .trainBrush,
-        .exportSplat
+        .exportSplat,
+        .done
     ]
 
     var body: some View {

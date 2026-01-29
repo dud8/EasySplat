@@ -3,6 +3,7 @@ import AppKit
 
 struct ProcessingView: View {
     @EnvironmentObject private var model: AppModel
+    @State private var showCancelConfirm = false
 
     var body: some View {
         VStack(alignment: .leading, spacing: 20) {
@@ -20,20 +21,42 @@ struct ProcessingView: View {
                             .foregroundStyle(.red)
                             .font(.subheadline)
                     }
-                    LogDrawerView(lines: model.logLines)
+                    LogDrawerView(
+                        lines: model.logLines,
+                        detailsText: model.errorDetails,
+                        copyText: model.errorDetailsText
+                    )
                 }
                 Spacer()
                 StepperProgressView(currentStage: model.stage)
                     .frame(width: 220)
             }
 
-            if let projectURL = model.currentProjectURL {
-                Button("Show in Finder") {
-                    NSWorkspace.shared.activateFileViewerSelecting([projectURL])
+            HStack(spacing: 12) {
+                if let projectURL = model.currentProjectURL {
+                    Button("Show in Finder") {
+                        NSWorkspace.shared.activateFileViewerSelecting([projectURL])
+                    }
+                    .buttonStyle(.bordered)
+                }
+
+                Button("Cancel") {
+                    showCancelConfirm = true
                 }
                 .buttonStyle(.bordered)
             }
         }
         .padding(32)
+        .confirmationDialog("Cancel this project?", isPresented: $showCancelConfirm, titleVisibility: .visible) {
+            Button("Keep Project") {
+                model.cancelCurrentProject(deleteProject: false)
+            }
+            Button("Delete Project", role: .destructive) {
+                model.cancelCurrentProject(deleteProject: true)
+            }
+            Button("Continue", role: .cancel) {}
+        } message: {
+            Text("You can keep the project folder to resume later, or delete it to start fresh.")
+        }
     }
 }
