@@ -9,8 +9,13 @@ struct BufferedByteStreamWriter {
         bytes: S,
         to destination: URL,
         expectedLength: Int64,
+        label: String,
         onProgress: @escaping @Sendable (Double, String) -> Void
     ) async throws where S.Element == UInt8 {
+        func formatBytes(_ value: Int64) -> String {
+            ByteCountFormatter.string(fromByteCount: value, countStyle: .file)
+        }
+
         try fileManager.createDirectory(at: destination.deletingLastPathComponent(), withIntermediateDirectories: true)
         _ = fileManager.createFile(atPath: destination.path, contents: nil)
 
@@ -18,6 +23,8 @@ struct BufferedByteStreamWriter {
         var received: Int64 = 0
         var buffer: [UInt8] = []
         buffer.reserveCapacity(bufferSize)
+        let startedAt = Date()
+        var lastUpdate = Date.distantPast
 
         do {
             defer { try? handle.close() }
@@ -30,8 +37,12 @@ struct BufferedByteStreamWriter {
                     try handle.write(contentsOf: Data(buffer))
                     buffer.removeAll(keepingCapacity: true)
 
-                    if expectedLength > 0 {
-                        onProgress(Double(received) / Double(expectedLength), "Downloading toolchain")
+                    if expectedLength > 0, Date().timeIntervalSince(lastUpdate) >= 0.2 {
+                        lastUpdate = Date()
+                        let elapsed = max(Date().timeIntervalSince(startedAt), 0.001)
+                        let rate = Int64(Double(received) / elapsed)
+                        let message = "\(label) \(formatBytes(received))/\(formatBytes(expectedLength)) (\(formatBytes(rate))/s)"
+                        onProgress(Double(received) / Double(expectedLength), message)
                     }
                 }
             }
@@ -41,7 +52,10 @@ struct BufferedByteStreamWriter {
             }
 
             if expectedLength > 0 {
-                onProgress(1.0, "Downloading toolchain")
+                let elapsed = max(Date().timeIntervalSince(startedAt), 0.001)
+                let rate = Int64(Double(received) / elapsed)
+                let message = "\(label) \(formatBytes(received))/\(formatBytes(expectedLength)) (\(formatBytes(rate))/s)"
+                onProgress(1.0, message)
             }
         } catch {
             try? handle.close()
@@ -50,4 +64,3 @@ struct BufferedByteStreamWriter {
         }
     }
 }
-

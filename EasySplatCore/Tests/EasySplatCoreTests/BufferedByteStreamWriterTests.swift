@@ -19,7 +19,7 @@ final class BufferedByteStreamWriterTests: XCTestCase {
 
         let destination = dir.appendingPathComponent("out.bin")
         let writer = BufferedByteStreamWriter(fileManager: .default)
-        try await writer.write(bytes: stream, to: destination, expectedLength: Int64(expected.count), onProgress: { _, _ in })
+        try await writer.write(bytes: stream, to: destination, expectedLength: Int64(expected.count), label: "Test", onProgress: { _, _ in })
 
         let data = try Data(contentsOf: destination)
         XCTAssertEqual(Array(data), expected)
@@ -43,7 +43,7 @@ final class BufferedByteStreamWriterTests: XCTestCase {
         let writer = BufferedByteStreamWriter(fileManager: .default)
 
         do {
-            try await writer.write(bytes: stream, to: destination, expectedLength: 2048, onProgress: { _, _ in })
+            try await writer.write(bytes: stream, to: destination, expectedLength: 2048, label: "Test", onProgress: { _, _ in })
             XCTFail("Expected write to throw")
         } catch {
             XCTAssertFalse(FileManager.default.fileExists(atPath: destination.path))
@@ -51,4 +51,3 @@ final class BufferedByteStreamWriterTests: XCTestCase {
     }
 }
 #endif
-

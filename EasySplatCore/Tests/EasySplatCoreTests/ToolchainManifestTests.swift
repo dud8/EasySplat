@@ -31,6 +31,33 @@ final class ToolchainManifestTests: XCTestCase {
         XCTAssertTrue(manifest.verifying(publicKeyBase64: publicKey))
     }
 
+    func testManifestSignatureVerificationMultipleArtifacts() throws {
+        let key = Curve25519.Signing.PrivateKey()
+        let publicKey = key.publicKey.rawRepresentation.base64EncodedString()
+
+        var manifest = ToolchainManifest(
+            version: "1.0.0",
+            publishedAt: Date(),
+            artifacts: [
+                .init(name: "macos-arm64-core", url: "https://example.com/core.zip", sha256: "abc", sizeBytes: 123, contents: ["bin/colmap"]),
+                .init(name: "macos-arm64-models", url: "https://example.com/models.zip", sha256: "def", sizeBytes: 456, contents: ["learned_sfm/models/checkpoints"]),
+            ],
+            signatureEd25519: ""
+        )
+
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.sortedKeys, .withoutEscapingSlashes]
+        encoder.dateEncodingStrategy = .iso8601
+
+        var signable = manifest
+        signable.signatureEd25519 = ""
+        let data = try encoder.encode(signable)
+        let signature = try key.signature(for: data)
+        manifest.signatureEd25519 = Data(signature).base64EncodedString()
+
+        XCTAssertTrue(manifest.verifying(publicKeyBase64: publicKey))
+    }
+
     func testManifestRejectsMissingSignature() throws {
         let key = Curve25519.Signing.PrivateKey()
         let publicKey = key.publicKey.rawRepresentation.base64EncodedString()

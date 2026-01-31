@@ -20,7 +20,8 @@ done
 
 TOOLCHAINS="$ROOT/Toolchains"
 OUT="$TOOLCHAINS/out"
-ZIP="$OUT/toolchain-macos-arm64-$VERSION.zip"
+CORE_ZIP="$OUT/toolchain-macos-arm64-$VERSION-core.zip"
+MODELS_ZIP="$OUT/toolchain-macos-arm64-$VERSION-models.zip"
 MANIFEST="$TOOLCHAINS/manifest.json"
 PUB="$TOOLCHAINS/public_key_ed25519.txt"
 PRIV="$TOOLCHAINS/private_key_ed25519.txt"
@@ -28,33 +29,60 @@ LEARNED_SFM_INSTALL="${LEARNED_SFM_INSTALL:-$ROOT/Toolchains/build/learned_sfm/i
 LEARNED_SFM_BUNDLE="$LEARNED_SFM_INSTALL/learned_sfm"
 LEARNED_SFM_BUILD="$ROOT/scripts/toolchain/build_learned_sfm.sh"
 
-toolchain_zip_valid() {
-  test -f "$ZIP" || return 1
-  unzip -l "$ZIP" | grep -q "lib/libcrypto.3.dylib" || return 1
-  unzip -l "$ZIP" | grep -q "learned_sfm/bin/easysplat_match" || return 1
-  unzip -l "$ZIP" | grep -q "learned_sfm/python/bin/python3" || return 1
-  unzip -l "$ZIP" | grep -q "learned_sfm/models" || return 1
+core_zip_valid() {
+  test -f "$CORE_ZIP" || return 1
+  unzip -l "$CORE_ZIP" | grep -q "lib/libcrypto.3.dylib" || return 1
+  unzip -l "$CORE_ZIP" | grep -q "learned_sfm/bin/easysplat_match" || return 1
+  unzip -l "$CORE_ZIP" | grep -q "learned_sfm/python/bin/python3" || return 1
+  unzip -l "$CORE_ZIP" | grep -q "learned_sfm/vendor/mast3r/mast3r/__init__.py" || return 1
 
   local tmp
   tmp="$(mktemp -d)"
-  unzip -p "$ZIP" bin/glomap >"$tmp/glomap" 2>/dev/null || { rm -rf "$tmp"; return 1; }
+  unzip -p "$CORE_ZIP" bin/glomap >"$tmp/glomap" 2>/dev/null || { rm -rf "$tmp"; return 1; }
   chmod +x "$tmp/glomap"
   otool -l "$tmp/glomap" | grep -q "@executable_path/../lib" || { rm -rf "$tmp"; return 1; }
   otool -L "$tmp/glomap" | grep -q "@rpath/libcrypto.3.dylib" || { rm -rf "$tmp"; return 1; }
   rm -rf "$tmp"
 }
 
+models_zip_valid() {
+  test -f "$MODELS_ZIP" || return 1
+  unzip -l "$MODELS_ZIP" | grep -q "learned_sfm/models/checkpoints/" || return 1
+  unzip -l "$MODELS_ZIP" | grep -q "learned_sfm/models/checkpoints/.*\\.pth" || return 1
+}
+
 ensure_learned_sfm_bundle() {
+  local build_log="$ROOT/Toolchains/build/learned_sfm/build.log"
+  mkdir -p "$(dirname "$build_log")"
+  local ok=0
   if [ -d "$LEARNED_SFM_BUNDLE" ]; then
-    return 0
+    if [ -x "$LEARNED_SFM_BUNDLE/bin/easysplat_match" ] && \
+       [ -x "$LEARNED_SFM_BUNDLE/python/bin/python3" ] && \
+       [ -d "$LEARNED_SFM_BUNDLE/models" ] && \
+       [ -d "$LEARNED_SFM_BUNDLE/vendor/mast3r/mast3r" ]; then
+      ok=1
+    fi
   fi
-  if [ -x "$LEARNED_SFM_BUILD" ]; then
-    "$LEARNED_SFM_BUILD"
-  fi
-  if [ ! -d "$LEARNED_SFM_BUNDLE" ]; then
-    echo "learned_sfm bundle not found at $LEARNED_SFM_BUNDLE." >&2
+  if [ "$ok" -eq 0 ]; then
     if [ -x "$LEARNED_SFM_BUILD" ]; then
-      echo "Tried to run $LEARNED_SFM_BUILD, but the bundle is still missing." >&2
+      set +e
+      "$LEARNED_SFM_BUILD" 2>&1 | tee "$build_log"
+      local build_status=${PIPESTATUS[0]}
+      set -e
+      if [ "$build_status" -ne 0 ]; then
+        echo "learned_sfm build failed. See log: $build_log" >&2
+      fi
+    fi
+  fi
+  if [ ! -x "$LEARNED_SFM_BUNDLE/bin/easysplat_match" ] || \
+     [ ! -x "$LEARNED_SFM_BUNDLE/python/bin/python3" ] || \
+     [ ! -d "$LEARNED_SFM_BUNDLE/models" ] || \
+     [ ! -d "$LEARNED_SFM_BUNDLE/vendor/mast3r/mast3r" ]; then
+    echo "learned_sfm bundle incomplete at $LEARNED_SFM_BUNDLE." >&2
+    echo "Required: bin/easysplat_match, python/bin/python3, models/, vendor/mast3r/." >&2
+    if [ -x "$LEARNED_SFM_BUILD" ]; then
+      echo "Tried to run $LEARNED_SFM_BUILD, but the bundle is still incomplete." >&2
+      echo "See build log: $build_log" >&2
     else
       echo "Provide it via LEARNED_SFM_INSTALL or add a build script at $LEARNED_SFM_BUILD." >&2
     fi
@@ -62,12 +90,14 @@ ensure_learned_sfm_bundle() {
   fi
 }
 
-if ! toolchain_zip_valid; then
+if ! core_zip_valid || ! models_zip_valid; then
   "$ROOT/scripts/toolchain/build_openssl.sh"
   test -x "$ROOT/Toolchains/build/colmap/install/bin/colmap" || "$ROOT/scripts/toolchain/build_colmap.sh"
   test -x "$ROOT/Toolchains/build/glomap/install/bin/glomap" || "$ROOT/scripts/toolchain/build_glomap.sh"
   test -x "$ROOT/Toolchains/build/brush/install/bin/brush" || "$ROOT/scripts/toolchain/build_brush.sh"
   ensure_learned_sfm_bundle
+  # Remove any previous zips that may have been created without learned_sfm binaries.
+  rm -f "$CORE_ZIP" "$MODELS_ZIP"
   "$ROOT/scripts/toolchain/package_toolchain.sh" --version "$VERSION"
 fi
 
@@ -80,10 +110,12 @@ fi
 PUBLISHED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 
 swift run --package-path "$ROOT/Tools/ManifestTool" ManifestTool \
-  --zip "$ZIP" \
   --version "$VERSION" \
   --published-at "$PUBLISHED_AT" \
-  --artifact-url "http://localhost:$PORT/out/$(basename "$ZIP")" \
+  --core-zip "$CORE_ZIP" \
+  --core-url "http://localhost:$PORT/out/$(basename "$CORE_ZIP")" \
+  --models-zip "$MODELS_ZIP" \
+  --models-url "http://localhost:$PORT/out/$(basename "$MODELS_ZIP")" \
   --private-key "$(cat "$PRIV")" \
   --manifest-out "$MANIFEST"
 
@@ -112,6 +144,9 @@ validate_installed_toolchain() {
   test -x "$INSTALLED_TOOLCHAIN/learned_sfm/bin/easysplat_match" || return 1
   test -x "$INSTALLED_TOOLCHAIN/learned_sfm/python/bin/python3" || return 1
   test -d "$INSTALLED_TOOLCHAIN/learned_sfm/models" || return 1
+  test -d "$INSTALLED_TOOLCHAIN/learned_sfm/models/checkpoints" || return 1
+  find "$INSTALLED_TOOLCHAIN/learned_sfm/models/checkpoints" -maxdepth 1 -type f -name "*.pth" | grep -q . || return 1
+  test -d "$INSTALLED_TOOLCHAIN/learned_sfm/vendor/mast3r/mast3r" || return 1
 
   otool -l "$INSTALLED_TOOLCHAIN/bin/colmap" | grep -q "@executable_path/../lib" || return 1
   otool -l "$INSTALLED_TOOLCHAIN/bin/glomap" | grep -q "@executable_path/../lib" || return 1

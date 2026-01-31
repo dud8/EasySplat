@@ -93,9 +93,7 @@ final class PipelineIntegrationTests: XCTestCase {
         let toolchain = try makeToolchain(root: temp, createLearnedFiles: true)
 
         let runner = MockSubprocessRunner(scripts: [
-            .init(path: toolchain.learnedSfm.matchTool.path, argsPrefix: ["--images"], result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""), onRun: nil),
-            .init(path: "/mock/colmap", argsPrefix: ["feature_importer"], result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""), onRun: nil),
-            .init(path: "/mock/colmap", argsPrefix: ["matches_importer"], result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""), onRun: nil),
+            .init(path: toolchain.learnedSfm.matchTool.path, argsPrefix: ["--images"], result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""), onRun: { _ in try? self.writeLearnedOutputs(at: projectURL) }),
             .init(path: "/mock/glomap", argsPrefix: ["mapper"], result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""), onRun: { _ in try? self.writeSparseModel(at: projectURL) }),
             .init(path: "/mock/colmap", argsPrefix: ["model_analyzer"], result: .init(exitCode: 0, terminationReason: .exit, stdout: "Registered images: 10 / 10\nMean reprojection error: 1.0\n", stderr: ""), onRun: nil),
             .init(path: "/mock/brush", argsPrefix: ["train"], result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""), onRun: { args in
@@ -716,6 +714,15 @@ final class PipelineIntegrationTests: XCTestCase {
             let url = modelURL.appendingPathComponent(name)
             FileManager.default.createFile(atPath: url.path, contents: Data([0x00]))
         }
+    }
+
+    private func writeLearnedOutputs(at projectURL: URL) throws {
+        let paths = ProjectPaths(root: projectURL)
+        FileManager.default.createFile(atPath: paths.colmapDatabaseURL.path, contents: Data())
+        try FileManager.default.createDirectory(at: paths.sfmLearnedFeaturesURL, withIntermediateDirectories: true)
+        let features = paths.sfmLearnedFeaturesURL.appendingPathComponent("features.bin")
+        FileManager.default.createFile(atPath: features.path, contents: Data([0x00]))
+        try "0 1\n".write(to: paths.sfmLearnedMatchListURL, atomically: true, encoding: .utf8)
     }
 
     private func value(for flag: String, in args: [String]) -> String? {

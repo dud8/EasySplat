@@ -17,6 +17,9 @@ This builds the local toolchain, serves it, and launches the app:
 ./scripts/dev_run.sh
 ```
 
+Note: the learned matcher downloads several GB of model weights on first run.
+Set `EASYSPLAT_LEARNED_RETRIEVAL=1` to also download retrieval weights and dependencies.
+
 ## Build a DMG locally (from scratch)
 
 1) Install dependencies (once):
@@ -71,6 +74,7 @@ python3 -m http.server 8000
   - `git`, `cmake`, `ninja`
   - COLMAP/GLOMAP deps (e.g. Eigen, Ceres, Boost, Glog, Gflags, OpenCV, SQLite3)
   - Rust toolchain (for Brush)
+  - Python 3 + pip (for learned matching)
   - `create-dmg` (for DMG packaging)
 
 ## Release (GitHub Actions)
@@ -86,12 +90,13 @@ python3 -m http.server 8000
 
 ## Manual dev setup (optional)
 
-1) Build the toolchain (COLMAP/GLOMAP/Brush):
+1) Build the toolchain (COLMAP/GLOMAP/Brush/Learned matching):
 
 ```
 ./scripts/toolchain/build_colmap.sh
 ./scripts/toolchain/build_glomap.sh
 ./scripts/toolchain/build_brush.sh
+./scripts/toolchain/build_learned_sfm.sh
 ./scripts/toolchain/package_toolchain.sh --version 0.1.0
 ```
 
@@ -138,3 +143,7 @@ Run all tests:
 
 Note: UI test target is a placeholder in SwiftPM (XCUITest requires an Xcode project).
 Note: `./scripts/test.sh` requires a full Xcode install (Command Line Tools alone do not include XCTest).
+
+## Learned matching notes
+
+EasySplat's learned matcher uses MASt3R (CC BY-NC-SA 4.0). The build script downloads several GB of model weights on first run.

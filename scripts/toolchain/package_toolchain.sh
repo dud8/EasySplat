@@ -30,7 +30,8 @@ LEARNED_SFM_INSTALL="${LEARNED_SFM_INSTALL:-$ROOT/Toolchains/build/learned_sfm/i
 OUT="$ROOT/Toolchains/out"
 BIN="$OUT/bin"
 LIB="$OUT/lib"
-ZIP="$OUT/toolchain-macos-arm64-$VERSION.zip"
+CORE_ZIP="$OUT/toolchain-macos-arm64-$VERSION-core.zip"
+MODELS_ZIP="$OUT/toolchain-macos-arm64-$VERSION-models.zip"
 
 rm -rf "$OUT"
 mkdir -p "$BIN" "$LIB"
@@ -43,6 +44,27 @@ chmod +x "$BIN/colmap" "$BIN/glomap" "$BIN/brush"
 
 if [ ! -d "$LEARNED_SFM_INSTALL/learned_sfm" ]; then
   echo "learned_sfm bundle not found at $LEARNED_SFM_INSTALL/learned_sfm. Build it before packaging." >&2
+  exit 1
+fi
+if [ ! -x "$LEARNED_SFM_INSTALL/learned_sfm/bin/easysplat_match" ]; then
+  echo "learned_sfm bundle missing bin/easysplat_match. Rebuild learned_sfm." >&2
+  exit 1
+fi
+if [ ! -x "$LEARNED_SFM_INSTALL/learned_sfm/python/bin/python3" ]; then
+  echo "learned_sfm bundle missing python/bin/python3. Rebuild learned_sfm." >&2
+  exit 1
+fi
+PY_BIN="$LEARNED_SFM_INSTALL/learned_sfm/python/bin/python3"
+if ! /usr/bin/file "$PY_BIN" | grep -q "arm64"; then
+  echo "learned_sfm python is not arm64 (Rosetta build detected). Rebuild learned_sfm on Apple Silicon." >&2
+  exit 1
+fi
+if [ ! -d "$LEARNED_SFM_INSTALL/learned_sfm/models" ]; then
+  echo "learned_sfm bundle missing models/. Rebuild learned_sfm." >&2
+  exit 1
+fi
+if [ ! -d "$LEARNED_SFM_INSTALL/learned_sfm/vendor/mast3r/mast3r" ]; then
+  echo "learned_sfm bundle missing vendor/mast3r. Rebuild learned_sfm." >&2
   exit 1
 fi
 cp -R "$LEARNED_SFM_INSTALL/learned_sfm" "$OUT/learned_sfm"
@@ -138,7 +160,9 @@ test -f "$LIB/libcrypto.3.dylib" || { echo "missing bundled libcrypto.3.dylib" >
 test -f "$LIB/libssl.3.dylib" || { echo "missing bundled libssl.3.dylib" >&2; exit 1; }
 
 pushd "$OUT" >/dev/null
-zip -r "$ZIP" bin lib learned_sfm
+zip -r "$CORE_ZIP" bin lib learned_sfm/bin learned_sfm/python learned_sfm/app learned_sfm/vendor
+zip -r "$MODELS_ZIP" learned_sfm/models
 popd >/dev/null
 
-echo "Packaged toolchain: $ZIP"
+echo "Packaged toolchain (core): $CORE_ZIP"
+echo "Packaged toolchain (models): $MODELS_ZIP"

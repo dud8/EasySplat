@@ -1,4 +1,5 @@
 import Foundation
+import Dispatch
 
 public final class PipelineRunner: @unchecked Sendable {
     public struct Tooling {
@@ -130,6 +131,9 @@ public final class PipelineRunner: @unchecked Sendable {
             colmapExtractOptions.useGPU = preferColmapGpu
             colmapMatchOptions.useGPU = preferColmapGpu
             var selectedFrames: [URL] = []
+            var selectedFrameManifest: [SelectedFrameMapping] = []
+            var learnedPairsFile: URL? = nil
+            var learnedMpsAvailable = false
 
             if metadata.input.hasVideos {
                 if shouldRunStage(.extractFrames) {
@@ -176,8 +180,10 @@ public final class PipelineRunner: @unchecked Sendable {
                     currentStage = .selectFrames
                     emit(.stageStarted(stage: .selectFrames))
                     try self.resetDirectory(paths.framesSelectedURL)
+                    self.removeIfExists(paths.framesSelectedManifestURL)
+                    self.removeIfExists(paths.sfmPairListURL)
                     let selector = FrameSelector()
-                    var candidates: [URL] = []
+                    var groups: [SelectedFrameGroup] = []
 
                     if metadata.input.hasVideos {
                         let videos = metadata.input.videoFiles
@@ -194,17 +200,41 @@ public final class PipelineRunner: @unchecked Sendable {
                                 let scaled = (Double(index) / totalVideos) + (fraction / totalVideos)
                                 emit(.stageProgress(stage: .selectFrames, fraction: scaled, message: message))
                             }
-                            candidates.append(contentsOf: chosen)
+                            if !chosen.isEmpty {
+                                let groupId = String(format: "video_%03d", index)
+                                groups.append(.init(id: groupId, frames: chosen, isVideo: true))
+                                emit(.stageLog(
+                                    stage: .selectFrames,
+                                    line: "Selected \(chosen.count) of \(rawFrames.count) frames from \(groupId).",
+                                    isError: false
+                                ))
+                            }
                         }
                     }
 
                     if let photosFolder = metadata.input.photosFolder {
                         let sourceFolder = paths.originalsURL.appendingPathComponent(URL(fileURLWithPath: photosFolder).lastPathComponent, isDirectory: true)
                         let photos = try loadPhotos(in: sourceFolder)
-                        candidates.append(contentsOf: photos)
+                        if !photos.isEmpty {
+                            groups.append(.init(id: "photos", frames: photos, isVideo: false))
+                            emit(.stageLog(
+                                stage: .selectFrames,
+                                line: "Using \(photos.count) photos from \(sourceFolder.lastPathComponent).",
+                                isError: false
+                            ))
+                        }
                     }
 
-                    selectedFrames = try copySelected(candidates, to: paths.framesSelectedURL)
+                    let selection = try copySelected(
+                        groups: groups,
+                        to: paths.framesSelectedURL,
+                        manifestURL: paths.framesSelectedManifestURL,
+                        progress: { fraction, message in
+                            emit(.stageProgress(stage: .selectFrames, fraction: fraction, message: message))
+                        }
+                    )
+                    selectedFrames = selection.frames
+                    selectedFrameManifest = selection.manifest
                     emit(.stageFinished(stage: .selectFrames))
                     markStageComplete(.selectFrames)
                 }
@@ -214,15 +244,46 @@ public final class PipelineRunner: @unchecked Sendable {
             if selectedFrames.isEmpty {
                 throw PipelineError.invalidInput
             }
+            if selectedFrameManifest.isEmpty {
+                selectedFrameManifest = (try? loadSelectedFrameManifest(from: paths.framesSelectedManifestURL)) ?? []
+            }
 
             try Task.checkCancellation()
             let backendPolicy = sfmBackendPolicy()
+            if backendPolicy == .learned {
+                do {
+                    emit(.stageProgress(stage: .sfmFeatures, fraction: 0.01, message: "Probing learned MPS"))
+                    let timeout = learnedMpsProbeTimeoutSeconds()
+                    let probe = try await runWithTimeout(seconds: timeout) {
+                        try await LearnedMpsProbe.run(python: self.config.toolchain.learnedSfm.python)
+                    }
+                    learnedMpsAvailable = probe.isMpsUsable
+                    emit(.stageLog(
+                        stage: .sfmFeatures,
+                        line: "Learned MPS available: \(learnedMpsAvailable ? "yes" : "no").",
+                        isError: !learnedMpsAvailable
+                    ))
+                    if !learnedMpsAvailable, let failure = probe.failure {
+                        emit(.stageLog(stage: .sfmFeatures, line: "Learned MPS probe: \(failure)", isError: true))
+                    }
+                } catch is TimeoutError {
+                    learnedMpsAvailable = false
+                    emit(.stageLog(stage: .sfmFeatures, line: "Learned MPS probe timed out; skipping learned matching.", isError: true))
+                } catch {
+                    learnedMpsAvailable = false
+                    emit(.stageLog(stage: .sfmFeatures, line: "Learned MPS probe failed; skipping learned matching. \(error)", isError: true))
+                }
+            }
             let learnedOutputsAvailable = backendPolicy == .learned && learnedOutputsExist(paths: paths)
             let learnedStagesComplete = !shouldRunStage(.sfmFeatures) && !shouldRunStage(.sfmMatching)
-            let shouldAttemptLearned = backendPolicy == .learned && (shouldRunStage(.sfmFeatures) || shouldRunStage(.sfmMatching))
+            let shouldAttemptLearned = backendPolicy == .learned && learnedMpsAvailable && (shouldRunStage(.sfmFeatures) || shouldRunStage(.sfmMatching))
             var learnedMatchingCompleted = learnedOutputsAvailable && learnedStagesComplete
 
             if shouldAttemptLearned {
+                struct LearnedMatchingWatchdogError: Error {
+                    let seconds: Int
+                }
+
                 do {
                     let device = learnedDevicePreference()
                     let pairing: String = (metadata.input.hasVideos && !metadata.input.hasPhotos) ? "video" : "photos"
@@ -232,61 +293,180 @@ public final class PipelineRunner: @unchecked Sendable {
                         }
                         return (0, 0, 20)
                     }()
-                    let learnedConfig = LearnedMatchingConfig(
-                        device: device,
-                        maxImageSize: colmapMaxImageSize,
-                        sequentialOverlap: overlap,
-                        stride: stride,
-                        loopK: loopK,
-                        pairing: pairing
-                    )
+                    let learnedMaxImageSize = learnedMaxImageSizePreference(colmapMaxImageSize: colmapMaxImageSize, preset: metadata.preset)
 
                     currentStage = .sfmFeatures
                     emit(.stageStarted(stage: .sfmFeatures))
+
+                    learnedPairsFile = nil
+                    if pairing == "video", metadata.input.videoFiles.count > 1 {
+                        do {
+                            if selectedFrameManifest.isEmpty {
+                                emit(.stageLog(
+                                    stage: .sfmFeatures,
+                                    line: "Selected-frame manifest missing; learned matching will pair across all frames.",
+                                    isError: true
+                                ))
+                                self.removeIfExists(paths.sfmPairListURL)
+                            } else {
+                                let available = Set(selectedFrames.map { $0.lastPathComponent })
+                                let groups = frameGroups(from: selectedFrameManifest, allowedNames: available)
+                                let bridgeCount = learnedPairBridgeCount(overlap: overlap)
+                                let pairs = PairListBuilder.buildPairs(
+                                    groups: groups,
+                                    overlap: overlap,
+                                    stride: stride,
+                                    bridgeCount: bridgeCount
+                                )
+                                if pairs.isEmpty {
+                                    self.removeIfExists(paths.sfmPairListURL)
+                                } else {
+                                    try PairListBuilder.writePairs(pairs, to: paths.sfmPairListURL)
+                                    learnedPairsFile = paths.sfmPairListURL
+                                    emit(.stageLog(
+                                        stage: .sfmFeatures,
+                                        line: "Learned matching pairs: \(pairs.count) (bridges: \(bridgeCount)).",
+                                        isError: false
+                                    ))
+                                }
+                            }
+                        } catch {
+                            self.removeIfExists(paths.sfmPairListURL)
+                            emit(.stageLog(
+                                stage: .sfmFeatures,
+                                line: "Failed to build learned pairs list; falling back to default pairing. \(error)",
+                                isError: true
+                            ))
+                        }
+                    } else {
+                        self.removeIfExists(paths.sfmPairListURL)
+                    }
+                    let learnedConfig = LearnedMatchingConfig(
+                        device: device,
+                        maxImageSize: learnedMaxImageSize,
+                        sequentialOverlap: overlap,
+                        stride: stride,
+                        loopK: loopK,
+                        pairing: pairing,
+                        cameraModel: cameraModel(for: metadata.preset),
+                        requireDevice: true,
+                        offline: true,
+                        pairsFile: learnedPairsFile
+                    )
                     emit(.stageLog(stage: .sfmFeatures, line: "Running learned matching on \(device) (\(pairing)).", isError: false))
+                    if learnedMaxImageSize != colmapMaxImageSize {
+                        emit(.stageLog(
+                            stage: .sfmFeatures,
+                            line: "Learned matching max image size: \(learnedMaxImageSize)px (COLMAP: \(colmapMaxImageSize)px).",
+                            isError: false
+                        ))
+                    }
 
                     self.removeIfExists(paths.colmapDatabaseURL)
                     try self.resetDirectory(paths.colmapSparseURL)
                     try self.resetDirectory(paths.sfmLearnedFeaturesURL)
                     self.removeIfExists(paths.sfmLearnedMatchListURL)
 
-                    try await tooling.learnedMatching.run(
-                        toolchain: config.toolchain.learnedSfm,
-                        images: paths.framesSelectedURL,
-                        outFeatures: paths.sfmLearnedFeaturesURL,
-                        outMatchList: paths.sfmLearnedMatchListURL,
-                        config: learnedConfig,
-                        onLog: { line, isErr in emit(.stageLog(stage: .sfmFeatures, line: line, isError: isErr)) }
-                    )
+                    let watchdogSeconds = learnedWatchdogSeconds()
+                    let progressTracker = LearnedMatchingProgressTracker()
 
-                    try await tooling.colmap.runFeatureImporter(
-                        colmapPath: config.toolchain.colmap,
-                        database: paths.colmapDatabaseURL,
-                        imagePath: paths.framesSelectedURL,
-                        importPath: paths.sfmLearnedFeaturesURL,
-                        cameraModel: cameraModel(for: metadata.preset),
-                        options: colmapExtractOptions,
-                        onLog: { line, isErr in emit(.stageLog(stage: .sfmFeatures, line: line, isError: isErr)) }
-                    )
+                    final class LastLogTimeBox: @unchecked Sendable {
+                        private let queue = DispatchQueue(label: "EasySplat.learnedMatching.lastLog")
+                        private var lastLogTime = Date()
+
+                        func bump() {
+                            queue.sync {
+                                lastLogTime = Date()
+                            }
+                        }
+
+                        func silenceSeconds() -> TimeInterval {
+                            queue.sync {
+                                Date().timeIntervalSince(lastLogTime)
+                            }
+                        }
+                    }
+
+                    let lastLog = LastLogTimeBox()
+                    let learnedMatching = tooling.learnedMatching
+                    let learnedToolchain = config.toolchain.learnedSfm
+                    let imagesURL = paths.framesSelectedURL
+                    let outDatabaseURL = paths.colmapDatabaseURL
+                    let outFeaturesURL = paths.sfmLearnedFeaturesURL
+                    let outMatchListURL = paths.sfmLearnedMatchListURL
+
+                    let onLearnedLog: @Sendable (String, Bool) -> Void = { line, isErr in
+                        lastLog.bump()
+
+                        emit(.stageLog(stage: .sfmFeatures, line: line, isError: isErr))
+                        if let update = progressTracker.ingest(line) {
+                            emit(.stageProgress(stage: .sfmFeatures, fraction: update.fraction, message: update.message))
+                        }
+                    }
+
+                    try await withThrowingTaskGroup(of: Void.self) { group in
+                        group.addTask {
+                            try await learnedMatching.run(
+                                toolchain: learnedToolchain,
+                                images: imagesURL,
+                                outDatabase: outDatabaseURL,
+                                outFeatures: outFeaturesURL,
+                                outMatchList: outMatchListURL,
+                                config: learnedConfig,
+                                onLog: onLearnedLog
+                            )
+                        }
+                        group.addTask {
+                            do {
+                                while true {
+                                    try await Task.sleep(nanoseconds: 5 * 1_000_000_000)
+                                    try Task.checkCancellation()
+
+                                    if lastLog.silenceSeconds() > Double(watchdogSeconds) {
+                                        throw LearnedMatchingWatchdogError(seconds: watchdogSeconds)
+                                    }
+                                }
+                            } catch is CancellationError {
+                                return
+                            }
+                        }
+
+                        do {
+                            _ = try await group.next()
+                            group.cancelAll()
+                            while let _ = try await group.next() {}
+                        } catch {
+                            group.cancelAll()
+                            throw error
+                        }
+                    }
+
+                    guard learnedOutputsExist(paths: paths) else {
+                        throw PipelineError.outputMissing
+                    }
 
                     emit(.stageFinished(stage: .sfmFeatures))
                     markStageComplete(.sfmFeatures)
 
                     currentStage = .sfmMatching
                     emit(.stageStarted(stage: .sfmMatching))
-                    try await tooling.colmap.runMatchesImporter(
-                        colmapPath: config.toolchain.colmap,
-                        database: paths.colmapDatabaseURL,
-                        matchListPath: paths.sfmLearnedMatchListURL,
-                        matchType: "raw",
-                        options: colmapMatchOptions,
-                        onLog: { line, isErr in emit(.stageLog(stage: .sfmMatching, line: line, isError: isErr)) }
-                    )
                     emit(.stageFinished(stage: .sfmMatching))
                     markStageComplete(.sfmMatching)
                     learnedMatchingCompleted = true
                 } catch {
-                    emit(.stageLog(stage: .sfmMatching, line: "Learned matching failed; falling back to COLMAP. \(error)", isError: true))
+                    if let stalled = error as? LearnedMatchingWatchdogError {
+                        emit(.stageLog(
+                            stage: .sfmFeatures,
+                            line: "Learned matching produced no output for \(stalled.seconds)s; falling back to COLMAP.",
+                            isError: true
+                        ))
+                    } else {
+                        emit(.stageLog(
+                            stage: .sfmFeatures,
+                            line: "Learned matching failed; falling back to COLMAP. \(error)",
+                            isError: true
+                        ))
+                    }
                     learnedMatchingCompleted = false
                 }
             }
@@ -806,6 +986,21 @@ private extension PipelineRunner {
         case outputMissing
     }
 
+    struct TimeoutError: Error {}
+
+    struct SelectedFrameGroup: Sendable {
+        let id: String
+        let frames: [URL]
+        let isVideo: Bool
+    }
+
+    struct SelectedFrameMapping: Codable, Sendable {
+        let outputFileName: String
+        let groupId: String
+        let isVideo: Bool
+        let sourcePath: String
+    }
+
     var supportedImageExtensions: Set<String> {
         ["jpg", "jpeg", "png", "heic"]
     }
@@ -835,10 +1030,95 @@ private extension PipelineRunner {
         let tempSelected = paths.framesSelectedURL.deletingLastPathComponent()
             .appendingPathComponent("selected_retry", isDirectory: true)
         try self.resetDirectory(tempSelected)
-        _ = try copySelected(reduced, to: tempSelected)
+        let newSelection = try copySelected(reduced, to: tempSelected)
         self.removeIfExists(paths.framesSelectedURL)
         try FileManager.default.moveItem(at: tempSelected, to: paths.framesSelectedURL)
+        if FileManager.default.fileExists(atPath: paths.framesSelectedManifestURL.path),
+           let manifest = try? loadSelectedFrameManifest(from: paths.framesSelectedManifestURL) {
+            let manifestByFile = Dictionary(manifest.map { ($0.outputFileName, $0) }, uniquingKeysWith: { first, _ in first })
+            var updated: [SelectedFrameMapping] = []
+            updated.reserveCapacity(newSelection.count)
+            for (index, original) in reduced.enumerated() where index < newSelection.count {
+                let oldName = original.lastPathComponent
+                guard let entry = manifestByFile[oldName] else { continue }
+                let newName = newSelection[index].lastPathComponent
+                updated.append(SelectedFrameMapping(
+                    outputFileName: newName,
+                    groupId: entry.groupId,
+                    isVideo: entry.isVideo,
+                    sourcePath: entry.sourcePath
+                ))
+            }
+            try? saveSelectedFrameManifest(updated, to: paths.framesSelectedManifestURL)
+        }
         return try loadImages(in: paths.framesSelectedURL)
+    }
+
+    func copySelected(
+        groups: [SelectedFrameGroup],
+        to directory: URL,
+        manifestURL: URL,
+        progress: ((Double, String) -> Void)? = nil
+    ) throws -> (frames: [URL], manifest: [SelectedFrameMapping]) {
+        let fm = FileManager.default
+        var output: [URL] = []
+        var manifest: [SelectedFrameMapping] = []
+        let total = groups.reduce(0) { $0 + $1.frames.count }
+        var index = 0
+        var copied = 0
+        for group in groups {
+            for frame in group.frames {
+                let ext = frame.pathExtension.isEmpty ? "jpg" : frame.pathExtension
+                let dest = directory.appendingPathComponent(String(format: "frame_%06d.%@", index, ext))
+                if fm.fileExists(atPath: dest.path) { try fm.removeItem(at: dest) }
+                try fm.copyItem(at: frame, to: dest)
+                output.append(dest)
+                manifest.append(SelectedFrameMapping(
+                    outputFileName: dest.lastPathComponent,
+                    groupId: group.id,
+                    isVideo: group.isVideo,
+                    sourcePath: frame.path
+                ))
+                index += 1
+                copied += 1
+                if let progress, total > 0, copied % 5 == 0 || copied == total {
+                    let fraction = Double(copied) / Double(total)
+                    progress(fraction, "Copying selected frames \(copied)/\(total)")
+                }
+            }
+        }
+        try saveSelectedFrameManifest(manifest, to: manifestURL)
+        return (output, manifest)
+    }
+
+    func saveSelectedFrameManifest(_ manifest: [SelectedFrameMapping], to url: URL) throws {
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+        let data = try encoder.encode(manifest)
+        try data.write(to: url, options: [.atomic])
+    }
+
+    func loadSelectedFrameManifest(from url: URL) throws -> [SelectedFrameMapping] {
+        let data = try Data(contentsOf: url)
+        return try JSONDecoder().decode([SelectedFrameMapping].self, from: data)
+    }
+
+    func frameGroups(from manifest: [SelectedFrameMapping], allowedNames: Set<String>) -> [FrameGroup] {
+        var order: [String] = []
+        var framesByGroup: [String: [String]] = [:]
+        var isVideoByGroup: [String: Bool] = [:]
+        for entry in manifest {
+            guard allowedNames.contains(entry.outputFileName) else { continue }
+            if framesByGroup[entry.groupId] == nil {
+                order.append(entry.groupId)
+            }
+            framesByGroup[entry.groupId, default: []].append(entry.outputFileName)
+            isVideoByGroup[entry.groupId] = entry.isVideo
+        }
+        return order.compactMap { groupId in
+            guard let files = framesByGroup[groupId], !files.isEmpty else { return nil }
+            return FrameGroup(id: groupId, fileNames: files, isVideo: isVideoByGroup[groupId] ?? false)
+        }
     }
 
     func sparseModelFilesExist(at url: URL) -> Bool {
@@ -911,6 +1191,7 @@ private extension PipelineRunner {
 
     func learnedOutputsExist(paths: ProjectPaths) -> Bool {
         let fm = FileManager.default
+        guard fm.fileExists(atPath: paths.colmapDatabaseURL.path) else { return false }
         guard fm.fileExists(atPath: paths.sfmLearnedMatchListURL.path) else { return false }
         guard fm.fileExists(atPath: paths.sfmLearnedFeaturesURL.path) else { return false }
         let contents = (try? fm.contentsOfDirectory(at: paths.sfmLearnedFeaturesURL, includingPropertiesForKeys: nil)) ?? []
@@ -924,6 +1205,67 @@ private extension PipelineRunner {
             return value
         }
         return "mps"
+    }
+
+    func learnedMaxImageSizePreference(colmapMaxImageSize: Int, preset: PresetSpec) -> Int {
+        let env = ProcessInfo.processInfo.environment
+        if let raw = env["EASYSPLAT_LEARNED_MAX_IMAGE_SIZE"]?.trimmingCharacters(in: .whitespacesAndNewlines),
+           let override = Int(raw),
+           override > 0 {
+            return override
+        }
+        if preset.quality == .ultra {
+            return colmapMaxImageSize
+        }
+        return min(colmapMaxImageSize, 1024)
+    }
+
+    func learnedWatchdogSeconds() -> Int {
+        let env = ProcessInfo.processInfo.environment
+        if let raw = env["EASYSPLAT_LEARNED_WATCHDOG_SECONDS"]?.trimmingCharacters(in: .whitespacesAndNewlines),
+           let override = Int(raw),
+           override > 0 {
+            return override
+        }
+        return 600
+    }
+
+    func learnedMpsProbeTimeoutSeconds() -> Int {
+        let env = ProcessInfo.processInfo.environment
+        if let raw = env["EASYSPLAT_LEARNED_MPS_PROBE_TIMEOUT"]?.trimmingCharacters(in: .whitespacesAndNewlines),
+           let override = Int(raw),
+           override > 0 {
+            return override
+        }
+        return 60
+    }
+
+    func runWithTimeout<T: Sendable>(seconds: Int, operation: @Sendable @escaping () async throws -> T) async throws -> T {
+        let timeoutNanos = UInt64(max(1, seconds)) * 1_000_000_000
+        return try await withThrowingTaskGroup(of: T.self) { group in
+            group.addTask {
+                try await operation()
+            }
+            group.addTask {
+                try await Task.sleep(nanoseconds: timeoutNanos)
+                throw TimeoutError()
+            }
+            guard let result = try await group.next() else {
+                throw TimeoutError()
+            }
+            group.cancelAll()
+            return result
+        }
+    }
+
+    func learnedPairBridgeCount(overlap: Int) -> Int {
+        let env = ProcessInfo.processInfo.environment
+        if let raw = env["EASYSPLAT_LEARNED_PAIR_BRIDGE"]?.trimmingCharacters(in: .whitespacesAndNewlines),
+           let override = Int(raw),
+           override >= 0 {
+            return override
+        }
+        return min(3, max(0, overlap))
     }
 
     func shouldUseColmapGpu(colmapPath: URL) -> Bool {
@@ -996,6 +1338,8 @@ private extension PipelineRunner {
         case .extractFrames:
             self.removeIfExists(paths.framesRawURL)
             self.removeIfExists(paths.framesSelectedURL)
+            self.removeIfExists(paths.framesSelectedManifestURL)
+            self.removeIfExists(paths.sfmPairListURL)
             self.removeIfExists(paths.colmapDatabaseURL)
             self.removeIfExists(paths.colmapSparseURL)
             self.removeIfExists(paths.sfmLearnedURL)
@@ -1003,6 +1347,8 @@ private extension PipelineRunner {
             self.removeIfExists(paths.outputURL)
         case .selectFrames:
             self.removeIfExists(paths.framesSelectedURL)
+            self.removeIfExists(paths.framesSelectedManifestURL)
+            self.removeIfExists(paths.sfmPairListURL)
             self.removeIfExists(paths.colmapDatabaseURL)
             self.removeIfExists(paths.colmapSparseURL)
             self.removeIfExists(paths.sfmLearnedURL)
@@ -1251,6 +1597,7 @@ private extension PipelineRunner {
     func shouldUseSequential(selectedFrames: [URL], input: InputSpec, forceExhaustive: Bool) -> Bool {
         if forceExhaustive { return false }
         guard input.hasVideos, !input.hasPhotos else { return false }
+        guard input.videoFiles.count == 1 else { return false }
         if selectedFrames.count < 30 { return false }
         return true
     }

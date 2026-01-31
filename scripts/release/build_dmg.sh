@@ -4,7 +4,8 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 VERSION=""
 MANIFEST_URL=""
-ARTIFACT_URL=""
+CORE_ARTIFACT_URL=""
+MODELS_ARTIFACT_URL=""
 PORT="${EASYSPLAT_DEV_PORT:-8000}"
 
 while [[ $# -gt 0 ]]; do
@@ -18,7 +19,15 @@ while [[ $# -gt 0 ]]; do
       shift 2
       ;;
     --artifact-url)
-      ARTIFACT_URL="$2"
+      CORE_ARTIFACT_URL="$2"
+      shift 2
+      ;;
+    --core-artifact-url)
+      CORE_ARTIFACT_URL="$2"
+      shift 2
+      ;;
+    --models-artifact-url)
+      MODELS_ARTIFACT_URL="$2"
       shift 2
       ;;
     --port)
@@ -33,15 +42,18 @@ while [[ $# -gt 0 ]]; do
 done
 
 if [ -z "$VERSION" ]; then
-  echo "Usage: build_dmg.sh --version <semver> [--manifest-url <url>] [--artifact-url <url>] [--port <port>]" >&2
+  echo "Usage: build_dmg.sh --version <semver> [--manifest-url <url>] [--core-artifact-url <url>] [--models-artifact-url <url>] [--port <port>]" >&2
   exit 1
 fi
 
 if [ -z "$MANIFEST_URL" ]; then
   MANIFEST_URL="http://localhost:$PORT/manifest.json"
 fi
-if [ -z "$ARTIFACT_URL" ]; then
-  ARTIFACT_URL="http://localhost:$PORT/toolchain-macos-arm64-$VERSION.zip"
+if [ -z "$CORE_ARTIFACT_URL" ]; then
+  CORE_ARTIFACT_URL="http://localhost:$PORT/toolchain-macos-arm64-$VERSION-core.zip"
+fi
+if [ -z "$MODELS_ARTIFACT_URL" ]; then
+  MODELS_ARTIFACT_URL="http://localhost:$PORT/toolchain-macos-arm64-$VERSION-models.zip"
 fi
 
 if command -v xcodebuild >/dev/null 2>&1; then
@@ -53,7 +65,8 @@ fi
 
 TOOLCHAINS="$ROOT/Toolchains"
 OUT="$TOOLCHAINS/out"
-ZIP="$OUT/toolchain-macos-arm64-$VERSION.zip"
+CORE_ZIP="$OUT/toolchain-macos-arm64-$VERSION-core.zip"
+MODELS_ZIP="$OUT/toolchain-macos-arm64-$VERSION-models.zip"
 MANIFEST="$TOOLCHAINS/manifest.json"
 PUB="$TOOLCHAINS/public_key_ed25519.txt"
 PRIV="$TOOLCHAINS/private_key_ed25519.txt"
@@ -62,6 +75,7 @@ PRIV="$TOOLCHAINS/private_key_ed25519.txt"
 "$ROOT/scripts/toolchain/build_openssl.sh"
 "$ROOT/scripts/toolchain/build_glomap.sh"
 "$ROOT/scripts/toolchain/build_brush.sh"
+"$ROOT/scripts/toolchain/build_learned_sfm.sh"
 "$ROOT/scripts/toolchain/package_toolchain.sh" --version "$VERSION"
 
 if [ ! -f "$PUB" ] || [ ! -f "$PRIV" ]; then
@@ -73,10 +87,12 @@ fi
 PUBLISHED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 
 swift run --package-path "$ROOT/Tools/ManifestTool" ManifestTool \
-  --zip "$ZIP" \
   --version "$VERSION" \
   --published-at "$PUBLISHED_AT" \
-  --artifact-url "$ARTIFACT_URL" \
+  --core-zip "$CORE_ZIP" \
+  --core-url "$CORE_ARTIFACT_URL" \
+  --models-zip "$MODELS_ZIP" \
+  --models-url "$MODELS_ARTIFACT_URL" \
   --private-key "$(cat "$PRIV")" \
   --manifest-out "$MANIFEST"
 
