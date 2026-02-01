@@ -25,16 +25,25 @@ MODELS_ZIP="$OUT/toolchain-macos-arm64-$VERSION-models.zip"
 MANIFEST="$TOOLCHAINS/manifest.json"
 PUB="$TOOLCHAINS/public_key_ed25519.txt"
 PRIV="$TOOLCHAINS/private_key_ed25519.txt"
-LEARNED_SFM_INSTALL="${LEARNED_SFM_INSTALL:-$ROOT/Toolchains/build/learned_sfm/install}"
-LEARNED_SFM_BUNDLE="$LEARNED_SFM_INSTALL/learned_sfm"
-LEARNED_SFM_BUILD="$ROOT/scripts/toolchain/build_learned_sfm.sh"
+VGGT_MPS_INSTALL="${VGGT_MPS_INSTALL:-$ROOT/Toolchains/build/vggt_mps/install}"
+VGGT_MPS_BUNDLE="$VGGT_MPS_INSTALL/vggt_mps"
+VGGT_MPS_BUILD="$ROOT/scripts/toolchain/build_vggt_mps.sh"
+
+toolchain_inputs_newer() {
+  # In dev, we want the locally-built toolchain zips to reflect the current workspace.
+  test -f "$CORE_ZIP" || return 1
+  find "$ROOT/Tools/VggtSfm" -type f -newer "$CORE_ZIP" -print -quit | grep -q . && return 0
+  find "$ROOT/scripts/toolchain" -type f -newer "$CORE_ZIP" -print -quit | grep -q . && return 0
+  return 1
+}
 
 core_zip_valid() {
   test -f "$CORE_ZIP" || return 1
   unzip -l "$CORE_ZIP" | grep -q "lib/libcrypto.3.dylib" || return 1
-  unzip -l "$CORE_ZIP" | grep -q "learned_sfm/bin/easysplat_match" || return 1
-  unzip -l "$CORE_ZIP" | grep -q "learned_sfm/python/bin/python3" || return 1
-  unzip -l "$CORE_ZIP" | grep -q "learned_sfm/vendor/mast3r/mast3r/__init__.py" || return 1
+  unzip -l "$CORE_ZIP" | grep -q "vggt_mps/bin/easysplat_vggt_sfm" || return 1
+  unzip -l "$CORE_ZIP" | grep -q "vggt_mps/python/bin/python3" || return 1
+  unzip -l "$CORE_ZIP" | grep -q "vggt_mps/vendor/vggt/vggt/models/vggt.py" || return 1
+  unzip -l "$CORE_ZIP" | grep -q "bin/brush.real" || return 1
 
   local tmp
   tmp="$(mktemp -d)"
@@ -47,58 +56,69 @@ core_zip_valid() {
 
 models_zip_valid() {
   test -f "$MODELS_ZIP" || return 1
-  unzip -l "$MODELS_ZIP" | grep -q "learned_sfm/models/checkpoints/" || return 1
-  unzip -l "$MODELS_ZIP" | grep -q "learned_sfm/models/checkpoints/.*\\.pth" || return 1
+  unzip -l "$MODELS_ZIP" | grep -q "vggt_mps/models/vggt_model\\.pt" || return 1
 }
 
-ensure_learned_sfm_bundle() {
-  local build_log="$ROOT/Toolchains/build/learned_sfm/build.log"
+ensure_vggt_mps_bundle() {
+  local build_log="$ROOT/Toolchains/build/vggt_mps/build.log"
   mkdir -p "$(dirname "$build_log")"
   local ok=0
-  if [ -d "$LEARNED_SFM_BUNDLE" ]; then
-    if [ -x "$LEARNED_SFM_BUNDLE/bin/easysplat_match" ] && \
-       [ -x "$LEARNED_SFM_BUNDLE/python/bin/python3" ] && \
-       [ -d "$LEARNED_SFM_BUNDLE/models" ] && \
-       [ -d "$LEARNED_SFM_BUNDLE/vendor/mast3r/mast3r" ]; then
+  if [ -d "$VGGT_MPS_BUNDLE" ]; then
+    if [ -x "$VGGT_MPS_BUNDLE/bin/easysplat_vggt_sfm" ] && \
+       [ -x "$VGGT_MPS_BUNDLE/python/bin/python3" ] && \
+       [ -f "$VGGT_MPS_BUNDLE/models/vggt_model.pt" ] && \
+       [ -f "$VGGT_MPS_BUNDLE/vendor/vggt/vggt/models/vggt.py" ]; then
       ok=1
     fi
   fi
   if [ "$ok" -eq 0 ]; then
-    if [ -x "$LEARNED_SFM_BUILD" ]; then
+    if [ -x "$VGGT_MPS_BUILD" ]; then
       set +e
-      "$LEARNED_SFM_BUILD" 2>&1 | tee "$build_log"
+      "$VGGT_MPS_BUILD" 2>&1 | tee "$build_log"
       local build_status=${PIPESTATUS[0]}
       set -e
       if [ "$build_status" -ne 0 ]; then
-        echo "learned_sfm build failed. See log: $build_log" >&2
+        echo "vggt_mps build failed. See log: $build_log" >&2
       fi
     fi
   fi
-  if [ ! -x "$LEARNED_SFM_BUNDLE/bin/easysplat_match" ] || \
-     [ ! -x "$LEARNED_SFM_BUNDLE/python/bin/python3" ] || \
-     [ ! -d "$LEARNED_SFM_BUNDLE/models" ] || \
-     [ ! -d "$LEARNED_SFM_BUNDLE/vendor/mast3r/mast3r" ]; then
-    echo "learned_sfm bundle incomplete at $LEARNED_SFM_BUNDLE." >&2
-    echo "Required: bin/easysplat_match, python/bin/python3, models/, vendor/mast3r/." >&2
-    if [ -x "$LEARNED_SFM_BUILD" ]; then
-      echo "Tried to run $LEARNED_SFM_BUILD, but the bundle is still incomplete." >&2
+  if [ ! -x "$VGGT_MPS_BUNDLE/bin/easysplat_vggt_sfm" ] || \
+     [ ! -x "$VGGT_MPS_BUNDLE/python/bin/python3" ] || \
+     [ ! -f "$VGGT_MPS_BUNDLE/models/vggt_model.pt" ] || \
+     [ ! -f "$VGGT_MPS_BUNDLE/vendor/vggt/vggt/models/vggt.py" ]; then
+    echo "vggt_mps bundle incomplete at $VGGT_MPS_BUNDLE." >&2
+    echo "Required: bin/easysplat_vggt_sfm, python/bin/python3, models/vggt_model.pt, vendor/vggt/." >&2
+    if [ -x "$VGGT_MPS_BUILD" ]; then
+      echo "Tried to run $VGGT_MPS_BUILD, but the bundle is still incomplete." >&2
       echo "See build log: $build_log" >&2
     else
-      echo "Provide it via LEARNED_SFM_INSTALL or add a build script at $LEARNED_SFM_BUILD." >&2
+      echo "Provide it via VGGT_MPS_INSTALL or add a build script at $VGGT_MPS_BUILD." >&2
     fi
     exit 1
   fi
 }
 
-if ! core_zip_valid || ! models_zip_valid; then
+refresh_vggt_mps_app() {
+  # The vggt_mps bundle includes a copy of Tools/VggtSfm as its "app" python package root.
+  # Keep it in sync with the workspace so dev builds pick up local fixes without a full rebuild.
+  if [ -d "$VGGT_MPS_BUNDLE" ]; then
+    rm -rf "$VGGT_MPS_BUNDLE/app"
+    cp -R "$ROOT/Tools/VggtSfm" "$VGGT_MPS_BUNDLE/app"
+  fi
+}
+
+REBUILT_TOOLCHAIN=0
+if ! core_zip_valid || ! models_zip_valid || toolchain_inputs_newer; then
   "$ROOT/scripts/toolchain/build_openssl.sh"
   test -x "$ROOT/Toolchains/build/colmap/install/bin/colmap" || "$ROOT/scripts/toolchain/build_colmap.sh"
   test -x "$ROOT/Toolchains/build/glomap/install/bin/glomap" || "$ROOT/scripts/toolchain/build_glomap.sh"
   test -x "$ROOT/Toolchains/build/brush/install/bin/brush" || "$ROOT/scripts/toolchain/build_brush.sh"
-  ensure_learned_sfm_bundle
-  # Remove any previous zips that may have been created without learned_sfm binaries.
+  ensure_vggt_mps_bundle
+  refresh_vggt_mps_app
+  # Remove any previous zips that may have been created without vggt_mps binaries.
   rm -f "$CORE_ZIP" "$MODELS_ZIP"
   "$ROOT/scripts/toolchain/package_toolchain.sh" --version "$VERSION"
+  REBUILT_TOOLCHAIN=1
 fi
 
 if [ ! -f "$PUB" ] || [ ! -f "$PRIV" ]; then
@@ -141,12 +161,13 @@ validate_installed_toolchain() {
   test -x "$INSTALLED_TOOLCHAIN/bin/glomap" || return 1
   test -f "$INSTALLED_TOOLCHAIN/lib/libcrypto.3.dylib" || return 1
   test -f "$INSTALLED_TOOLCHAIN/lib/libssl.3.dylib" || return 1
-  test -x "$INSTALLED_TOOLCHAIN/learned_sfm/bin/easysplat_match" || return 1
-  test -x "$INSTALLED_TOOLCHAIN/learned_sfm/python/bin/python3" || return 1
-  test -d "$INSTALLED_TOOLCHAIN/learned_sfm/models" || return 1
-  test -d "$INSTALLED_TOOLCHAIN/learned_sfm/models/checkpoints" || return 1
-  find "$INSTALLED_TOOLCHAIN/learned_sfm/models/checkpoints" -maxdepth 1 -type f -name "*.pth" | grep -q . || return 1
-  test -d "$INSTALLED_TOOLCHAIN/learned_sfm/vendor/mast3r/mast3r" || return 1
+  test -x "$INSTALLED_TOOLCHAIN/vggt_mps/bin/easysplat_vggt_sfm" || return 1
+  test -x "$INSTALLED_TOOLCHAIN/vggt_mps/python/bin/python3" || return 1
+  test -f "$INSTALLED_TOOLCHAIN/vggt_mps/models/vggt_model.pt" || return 1
+  test -f "$INSTALLED_TOOLCHAIN/vggt_mps/vendor/vggt/vggt/models/vggt.py" || return 1
+  if head -c 2 "$INSTALLED_TOOLCHAIN/bin/brush" 2>/dev/null | grep -q "#!"; then
+    test -x "$INSTALLED_TOOLCHAIN/bin/brush.real" || return 1
+  fi
 
   otool -l "$INSTALLED_TOOLCHAIN/bin/colmap" | grep -q "@executable_path/../lib" || return 1
   otool -l "$INSTALLED_TOOLCHAIN/bin/glomap" | grep -q "@executable_path/../lib" || return 1
@@ -155,7 +176,13 @@ validate_installed_toolchain() {
 }
 
 if [ -d "$INSTALLED_TOOLCHAIN" ]; then
-  if ! validate_installed_toolchain; then
+  if [ "$REBUILT_TOOLCHAIN" -eq 1 ]; then
+    echo "Toolchain zips were rebuilt; removing installed toolchain to force re-install: $INSTALLED_TOOLCHAIN" >&2
+    rm -rf "$INSTALLED_TOOLCHAIN"
+  elif [ -f "$INSTALLED_TOOLCHAIN/vggt_mps/app/easysplat_vggt_sfm/run.py" ] && [ "$CORE_ZIP" -nt "$INSTALLED_TOOLCHAIN/vggt_mps/app/easysplat_vggt_sfm/run.py" ]; then
+    echo "Installed toolchain predates core zip; removing to force re-install: $INSTALLED_TOOLCHAIN" >&2
+    rm -rf "$INSTALLED_TOOLCHAIN"
+  elif ! validate_installed_toolchain; then
     echo "Installed toolchain looks invalid; removing: $INSTALLED_TOOLCHAIN" >&2
     rm -rf "$INSTALLED_TOOLCHAIN"
   fi

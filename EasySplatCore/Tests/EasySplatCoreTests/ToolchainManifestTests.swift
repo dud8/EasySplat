@@ -40,7 +40,7 @@ final class ToolchainManifestTests: XCTestCase {
             publishedAt: Date(),
             artifacts: [
                 .init(name: "macos-arm64-core", url: "https://example.com/core.zip", sha256: "abc", sizeBytes: 123, contents: ["bin/colmap"]),
-                .init(name: "macos-arm64-models", url: "https://example.com/models.zip", sha256: "def", sizeBytes: 456, contents: ["learned_sfm/models/checkpoints"]),
+                .init(name: "macos-arm64-models", url: "https://example.com/models.zip", sha256: "def", sizeBytes: 456, contents: ["vggt_mps/models/vggt_model.pt"]),
             ],
             signatureEd25519: ""
         )
@@ -70,6 +70,74 @@ final class ToolchainManifestTests: XCTestCase {
             ],
             signatureEd25519: ""
         )
+
+        XCTAssertFalse(manifest.verifying(publicKeyBase64: publicKey))
+    }
+
+    func testManifestRejectsInvalidSignatureBase64() throws {
+        let key = Curve25519.Signing.PrivateKey()
+        let publicKey = key.publicKey.rawRepresentation.base64EncodedString()
+
+        let manifest = ToolchainManifest(
+            version: "1.0.0",
+            publishedAt: Date(),
+            artifacts: [
+                .init(name: "macos-arm64", url: "https://example.com/toolchain.zip", sha256: "abc", sizeBytes: 123, contents: ["bin/colmap"])
+            ],
+            signatureEd25519: "not base64"
+        )
+
+        XCTAssertFalse(manifest.verifying(publicKeyBase64: publicKey))
+    }
+
+    func testManifestRejectsInvalidPublicKeyBase64() throws {
+        let key = Curve25519.Signing.PrivateKey()
+
+        var manifest = ToolchainManifest(
+            version: "1.0.0",
+            publishedAt: Date(),
+            artifacts: [
+                .init(name: "macos-arm64", url: "https://example.com/toolchain.zip", sha256: "abc", sizeBytes: 123, contents: ["bin/colmap"])
+            ],
+            signatureEd25519: ""
+        )
+
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.sortedKeys, .withoutEscapingSlashes]
+        encoder.dateEncodingStrategy = .iso8601
+
+        var signable = manifest
+        signable.signatureEd25519 = ""
+        let data = try encoder.encode(signable)
+        let signature = try key.signature(for: data)
+        manifest.signatureEd25519 = Data(signature).base64EncodedString()
+
+        XCTAssertFalse(manifest.verifying(publicKeyBase64: "not base64"))
+    }
+
+    func testManifestRejectsTamperedData() throws {
+        let key = Curve25519.Signing.PrivateKey()
+        let publicKey = key.publicKey.rawRepresentation.base64EncodedString()
+
+        var manifest = ToolchainManifest(
+            version: "1.0.0",
+            publishedAt: Date(),
+            artifacts: [
+                .init(name: "macos-arm64", url: "https://example.com/toolchain.zip", sha256: "abc", sizeBytes: 123, contents: ["bin/colmap"])
+            ],
+            signatureEd25519: ""
+        )
+
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.sortedKeys, .withoutEscapingSlashes]
+        encoder.dateEncodingStrategy = .iso8601
+
+        var signable = manifest
+        signable.signatureEd25519 = ""
+        let data = try encoder.encode(signable)
+        let signature = try key.signature(for: data)
+        manifest.signatureEd25519 = Data(signature).base64EncodedString()
+        manifest.version = "1.0.1"
 
         XCTAssertFalse(manifest.verifying(publicKeyBase64: publicKey))
     }

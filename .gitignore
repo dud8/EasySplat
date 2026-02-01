@@ -9,3 +9,5 @@ Tools/ManifestTool/.build/
 .DS_Store
 build/
 /release/
+__pycache__/
+*.pyc

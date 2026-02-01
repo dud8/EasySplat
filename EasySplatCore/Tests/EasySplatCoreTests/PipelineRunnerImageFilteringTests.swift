@@ -20,8 +20,8 @@ final class PipelineRunnerImageFilteringTests: XCTestCase {
         try FileManager.default.createDirectory(at: projectURL, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: projectURL) }
 
-        let learned = try TestToolchains.learnedSfmToolchain(root: projectURL)
-        let toolchain = ToolchainPaths(root: projectURL, colmap: projectURL, glomap: projectURL, brush: projectURL, learnedSfm: learned)
+        let vggt = try TestToolchains.vggtToolchain(root: projectURL)
+        let toolchain = ToolchainPaths(root: projectURL, colmap: projectURL, glomap: projectURL, brush: projectURL, vggt: vggt)
         let config = PipelineRunner.PipelineConfig(toolchain: toolchain, preset: PresetSpec(mode: .object, quality: .standard))
         let runner = PipelineRunner(projectURL: projectURL, config: config)
 

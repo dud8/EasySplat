@@ -63,15 +63,16 @@ struct ManifestTool {
                         "bin/colmap",
                         "bin/glomap",
                         "bin/brush",
+                        "bin/brush.real",
                         "lib/libcrypto.3.dylib",
                         "lib/libssl.3.dylib",
-                        "learned_sfm/bin/easysplat_match",
-                        "learned_sfm/python/bin/python3",
-                        "learned_sfm/app/easysplat_learned/match.py",
-                        "learned_sfm/vendor/mast3r/mast3r/__init__.py",
+                        "vggt_mps/bin/easysplat_vggt_sfm",
+                        "vggt_mps/python/bin/python3",
+                        "vggt_mps/app/easysplat_vggt_sfm/run.py",
+                        "vggt_mps/vendor/vggt/vggt/models/vggt.py",
                     ]
                     let modelsContents = [
-                        "learned_sfm/models/checkpoints"
+                        "vggt_mps/models/vggt_model.pt"
                     ]
 
                     artifacts = [
@@ -85,7 +86,19 @@ struct ManifestTool {
                     let zipURL = URL(fileURLWithPath: zipPath)
                     let size = try FileManager.default.attributesOfItem(atPath: zipURL.path)[.size] as? UInt64 ?? 0
                     let sha = try sha256Hex(url: zipURL)
-                    let contents = ["bin/colmap", "bin/glomap", "bin/brush", "lib/libcrypto.3.dylib", "lib/libssl.3.dylib"]
+                    let contents = [
+                        "bin/colmap",
+                        "bin/glomap",
+                        "bin/brush",
+                        "bin/brush.real",
+                        "lib/libcrypto.3.dylib",
+                        "lib/libssl.3.dylib",
+                        "vggt_mps/bin/easysplat_vggt_sfm",
+                        "vggt_mps/python/bin/python3",
+                        "vggt_mps/app/easysplat_vggt_sfm/run.py",
+                        "vggt_mps/vendor/vggt/vggt/models/vggt.py",
+                        "vggt_mps/models/vggt_model.pt",
+                    ]
 
                     artifacts = [
                         .init(name: "macos-arm64", url: artifactURL, sha256: sha, sizeBytes: size, contents: contents)

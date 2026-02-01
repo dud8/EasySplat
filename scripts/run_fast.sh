@@ -34,7 +34,14 @@ if [ ! -x "$TOOLCHAIN_ROOT/bin/colmap" ] || \
   exit 1
 fi
 
+if head -c 2 "$TOOLCHAIN_ROOT/bin/brush" 2>/dev/null | grep -q "#!"; then
+  if [ ! -x "$TOOLCHAIN_ROOT/bin/brush.real" ]; then
+    echo "Local toolchain brush wrapper is missing brush.real at: $TOOLCHAIN_ROOT/bin/brush.real" >&2
+    echo "Run ./scripts/dev_run.sh once to rebuild/install the toolchain, then retry." >&2
+    exit 1
+  fi
+fi
+
 export EASYSPLAT_LOCAL_TOOLCHAIN_ROOT="$TOOLCHAIN_ROOT"
 
 swift run --package-path "$ROOT" EasySplatApp
-

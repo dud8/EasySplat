@@ -1,5 +1,6 @@
 import Foundation
 
+@available(*, deprecated, message: "learned_sfm / MASt3R is deprecated; use vggt-mps instead.")
 struct LearnedMatchingProgressTracker {
     func ingest(_ line: String) -> (fraction: Double, message: String)? {
         if let progress = parsePairProgress(line) {

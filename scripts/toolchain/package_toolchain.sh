@@ -25,7 +25,7 @@ fi
 COLMAP_INSTALL="${COLMAP_INSTALL:-$ROOT/Toolchains/build/colmap/install}"
 GLOMAP_INSTALL="${GLOMAP_INSTALL:-$ROOT/Toolchains/build/glomap/install}"
 BRUSH_INSTALL="${BRUSH_INSTALL:-$ROOT/Toolchains/build/brush/install}"
-LEARNED_SFM_INSTALL="${LEARNED_SFM_INSTALL:-$ROOT/Toolchains/build/learned_sfm/install}"
+VGGT_MPS_INSTALL="${VGGT_MPS_INSTALL:-$ROOT/Toolchains/build/vggt_mps/install}"
 
 OUT="$ROOT/Toolchains/out"
 BIN="$OUT/bin"
@@ -38,36 +38,60 @@ mkdir -p "$BIN" "$LIB"
 
 cp "$COLMAP_INSTALL/bin/colmap" "$BIN/colmap"
 cp "$GLOMAP_INSTALL/bin/glomap" "$BIN/glomap"
-cp "$BRUSH_INSTALL/bin/brush" "$BIN/brush"
 
-chmod +x "$BIN/colmap" "$BIN/glomap" "$BIN/brush"
+# Brush has changed CLI shapes over time (some versions used subcommands like `train`).
+# Package a tiny wrapper so both `brush <dataset>` and `brush train <dataset>` work.
+cp "$BRUSH_INSTALL/bin/brush" "$BIN/brush.real"
+cat >"$BIN/brush" <<'SCRIPT'
+#!/usr/bin/env bash
+set -euo pipefail
+DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REAL="$DIR/brush.real"
+if [ "${1:-}" = "train" ]; then
+  shift
+fi
+exec "$REAL" "$@"
+SCRIPT
 
-if [ ! -d "$LEARNED_SFM_INSTALL/learned_sfm" ]; then
-  echo "learned_sfm bundle not found at $LEARNED_SFM_INSTALL/learned_sfm. Build it before packaging." >&2
+chmod +x "$BIN/colmap" "$BIN/glomap" "$BIN/brush" "$BIN/brush.real"
+
+if [ ! -d "$VGGT_MPS_INSTALL/vggt_mps" ]; then
+  echo "vggt_mps bundle not found at $VGGT_MPS_INSTALL/vggt_mps. Build it before packaging." >&2
   exit 1
 fi
-if [ ! -x "$LEARNED_SFM_INSTALL/learned_sfm/bin/easysplat_match" ]; then
-  echo "learned_sfm bundle missing bin/easysplat_match. Rebuild learned_sfm." >&2
+if [ ! -x "$VGGT_MPS_INSTALL/vggt_mps/bin/easysplat_vggt_sfm" ]; then
+  echo "vggt_mps bundle missing bin/easysplat_vggt_sfm. Rebuild vggt_mps." >&2
   exit 1
 fi
-if [ ! -x "$LEARNED_SFM_INSTALL/learned_sfm/python/bin/python3" ]; then
-  echo "learned_sfm bundle missing python/bin/python3. Rebuild learned_sfm." >&2
+if [ ! -x "$VGGT_MPS_INSTALL/vggt_mps/python/bin/python3" ]; then
+  echo "vggt_mps bundle missing python/bin/python3. Rebuild vggt_mps." >&2
   exit 1
 fi
-PY_BIN="$LEARNED_SFM_INSTALL/learned_sfm/python/bin/python3"
+PY_BIN="$VGGT_MPS_INSTALL/vggt_mps/python/bin/python3"
 if ! /usr/bin/file "$PY_BIN" | grep -q "arm64"; then
-  echo "learned_sfm python is not arm64 (Rosetta build detected). Rebuild learned_sfm on Apple Silicon." >&2
+  echo "vggt_mps python is not arm64 (Rosetta build detected). Rebuild vggt_mps on Apple Silicon." >&2
   exit 1
 fi
-if [ ! -d "$LEARNED_SFM_INSTALL/learned_sfm/models" ]; then
-  echo "learned_sfm bundle missing models/. Rebuild learned_sfm." >&2
+if [ -L "$PY_BIN" ]; then
+  target="$(readlink "$PY_BIN" || true)"
+  if [[ "$target" == /* ]]; then
+    echo "vggt_mps python3 is an absolute symlink ($target). Rebuild vggt_mps with bundled CPython (no external Python dependency)." >&2
+    exit 1
+  fi
+fi
+if [ ! -d "$VGGT_MPS_INSTALL/vggt_mps/models" ]; then
+  echo "vggt_mps bundle missing models/. Rebuild vggt_mps." >&2
   exit 1
 fi
-if [ ! -d "$LEARNED_SFM_INSTALL/learned_sfm/vendor/mast3r/mast3r" ]; then
-  echo "learned_sfm bundle missing vendor/mast3r. Rebuild learned_sfm." >&2
+if [ ! -f "$VGGT_MPS_INSTALL/vggt_mps/models/vggt_model.pt" ]; then
+  echo "vggt_mps bundle missing models/vggt_model.pt. Rebuild vggt_mps." >&2
   exit 1
 fi
-cp -R "$LEARNED_SFM_INSTALL/learned_sfm" "$OUT/learned_sfm"
+if [ ! -f "$VGGT_MPS_INSTALL/vggt_mps/vendor/vggt/vggt/models/vggt.py" ]; then
+  echo "vggt_mps bundle missing vendor/vggt. Rebuild vggt_mps." >&2
+  exit 1
+fi
+cp -R "$VGGT_MPS_INSTALL/vggt_mps" "$OUT/vggt_mps"
 
 if ! command -v install_name_tool >/dev/null 2>&1; then
   echo "install_name_tool not found; cannot package portable GLOMAP dependencies." >&2
@@ -160,8 +184,8 @@ test -f "$LIB/libcrypto.3.dylib" || { echo "missing bundled libcrypto.3.dylib" >
 test -f "$LIB/libssl.3.dylib" || { echo "missing bundled libssl.3.dylib" >&2; exit 1; }
 
 pushd "$OUT" >/dev/null
-zip -r "$CORE_ZIP" bin lib learned_sfm/bin learned_sfm/python learned_sfm/app learned_sfm/vendor
-zip -r "$MODELS_ZIP" learned_sfm/models
+zip -r "$CORE_ZIP" bin lib vggt_mps/bin vggt_mps/python vggt_mps/app vggt_mps/vendor
+zip -r "$MODELS_ZIP" vggt_mps/models
 popd >/dev/null
 
 echo "Packaged toolchain (core): $CORE_ZIP"

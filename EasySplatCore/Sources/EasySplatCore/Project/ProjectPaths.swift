@@ -23,6 +23,10 @@ public struct ProjectPaths: Sendable {
     public var logsURL: URL { root.appendingPathComponent("Logs", isDirectory: true) }
     public var pipelineLogURL: URL { logsURL.appendingPathComponent("pipeline.log") }
     public var eventsLogURL: URL { logsURL.appendingPathComponent("events.jsonl") }
+    public var colmapLogURL: URL { logsURL.appendingPathComponent("colmap.log") }
+    public var glomapLogURL: URL { logsURL.appendingPathComponent("glomap.log") }
+    public var vggtLogURL: URL { logsURL.appendingPathComponent("vggt.log") }
+    public var brushLogURL: URL { logsURL.appendingPathComponent("brush.log") }
 
     public func ensureDirectories() throws {
         let fm = FileManager.default

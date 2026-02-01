@@ -12,8 +12,13 @@ struct ProcessingView: View {
 
             HStack(alignment: .top, spacing: 24) {
                 VStack(alignment: .leading, spacing: 12) {
-                    Text(model.statusText)
+                    Text(model.statusTitle)
                         .font(.headline)
+                    if let detail = model.statusDetail, !detail.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                        Text(detail)
+                            .font(.subheadline)
+                            .foregroundStyle(.secondary)
+                    }
                     ShimmeringProgressView(progress: model.progress)
                     if let error = model.lastError {
                         Text(error)
@@ -22,7 +27,7 @@ struct ProcessingView: View {
                     }
                     LogDrawerView(
                         lines: model.logLines,
-                        detailsText: model.errorDetails,
+                        detailsText: model.processingDetailsText,
                         copyText: model.errorDetailsText
                     )
                 }

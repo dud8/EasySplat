@@ -418,6 +418,7 @@ Do not
 ### Processing Screen (`EasySplatApp/UI/Project/ProcessingView.swift`)
 - Primary focus is progress and current status
 - Stepper is secondary but always visible
+- Status headline stays stable per stage; a detail line shows live progress when available
 - Errors are shown in red and must be short, direct
 - Log drawer remains collapsed by default
 
@@ -452,6 +453,8 @@ The UI must remain calm and clear when data is missing, partial, or in transitio
 ### Processing Screen
 - Error present
   - Show the error in red beneath status.
+- Status detail present
+  - Show the live detail line under the headline and mirror it in the log drawer details.
 - Log drawer expanded with no content
   - Show: "No details yet."
 

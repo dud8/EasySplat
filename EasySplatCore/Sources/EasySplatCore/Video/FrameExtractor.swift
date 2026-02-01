@@ -83,8 +83,11 @@ public final class FrameExtractor {
         let videoFPS = nominalFPS > 0 ? nominalFPS : 30.0
         let preferredTransform = try await track.load(.preferredTransform)
         let targetFPS = Self.effectiveTargetFPS(options: options, duration: durationSeconds, videoFPS: videoFPS)
+        // Batch is roughly one second of video frames so progress updates feel steady without being spammy.
         let batchSize = max(1, Int(round(videoFPS)))
         let totalFramesEstimate = Int(round(durationSeconds * videoFPS))
+
+        progress(0.0, "Extracting frames (analyzing video)")
 
         let reader = try AVAssetReader(asset: asset)
         let outputSettings: [String: Any] = [
@@ -114,6 +117,7 @@ public final class FrameExtractor {
         var outputURLs: [URL] = []
         var frameIndex = 0
         var batchCount = 0
+        var lastProgressFrameIndex = 0
 
         func flushBatch() {
             guard !bufferScores.isEmpty else { return }
@@ -158,9 +162,13 @@ public final class FrameExtractor {
             frameIndex += 1
             batchCount += 1
 
-            if totalFramesEstimate > 0 && frameIndex % 5 == 0 {
+            if totalFramesEstimate > 0 && (frameIndex - lastProgressFrameIndex) >= batchSize {
+                lastProgressFrameIndex = frameIndex
                 let fraction = min(Double(frameIndex) / Double(totalFramesEstimate), 1.0)
-                progress(fraction, "Extracting frames")
+                progress(
+                    fraction,
+                    "Extracting frames (scanned \(frameIndex)/\(totalFramesEstimate), selected \(savedCount))"
+                )
             }
 
             if batchCount >= batchSize {
@@ -191,7 +199,7 @@ public final class FrameExtractor {
             throw ExtractionError.extractionFailed
         }
 
-        progress(1.0, "Extracting frames")
+        progress(1.0, "Extracted \(outputURLs.count) frame(s)")
         return outputURLs
     }
 
@@ -266,3 +274,11 @@ private final class WriteErrorState: @unchecked Sendable {
         return current
     }
 }
+
+#if DEBUG
+extension FrameExtractor {
+    static func test_effectiveTargetFPS(options: FrameExtractionOptions, duration: Double, videoFPS: Double) -> Int {
+        effectiveTargetFPS(options: options, duration: duration, videoFPS: videoFPS)
+    }
+}
+#endif

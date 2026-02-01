@@ -77,17 +77,23 @@ public final class SubprocessRunner: @unchecked Sendable, SubprocessRunning {
         let collectedErr = OutputBuffer()
         let stdoutLines = SubprocessLineBuffer()
         let stderrLines = SubprocessLineBuffer()
+        let stdoutDecoder = Utf8StreamDecoder()
+        let stderrDecoder = Utf8StreamDecoder()
 
         stdoutPipe.fileHandleForReading.readabilityHandler = { handle in
             let data = handle.availableData
-            guard !data.isEmpty, let text = String(data: data, encoding: .utf8) else { return }
+            guard !data.isEmpty else { return }
+            let text = stdoutDecoder.decode(data)
+            guard !text.isEmpty else { return }
             collectedOut.append(text)
             stdoutLines.append(text).forEach { line in onStdout(line) }
         }
 
         stderrPipe.fileHandleForReading.readabilityHandler = { handle in
             let data = handle.availableData
-            guard !data.isEmpty, let text = String(data: data, encoding: .utf8) else { return }
+            guard !data.isEmpty else { return }
+            let text = stderrDecoder.decode(data)
+            guard !text.isEmpty else { return }
             collectedErr.append(text)
             stderrLines.append(text).forEach { line in onStderr(line) }
         }
@@ -97,6 +103,15 @@ public final class SubprocessRunner: @unchecked Sendable, SubprocessRunning {
 
         stdoutPipe.fileHandleForReading.readabilityHandler = nil
         stderrPipe.fileHandleForReading.readabilityHandler = nil
+
+        if let remaining = stdoutDecoder.flush(), !remaining.isEmpty {
+            collectedOut.append(remaining)
+            stdoutLines.append(remaining).forEach { line in onStdout(line) }
+        }
+        if let remaining = stderrDecoder.flush(), !remaining.isEmpty {
+            collectedErr.append(remaining)
+            stderrLines.append(remaining).forEach { line in onStderr(line) }
+        }
 
         if let remaining = stdoutLines.flush() {
             onStdout(remaining)
@@ -140,17 +155,23 @@ public final class SubprocessRunner: @unchecked Sendable, SubprocessRunning {
         let collectedErr = OutputBuffer()
         let stdoutLines = SubprocessLineBuffer()
         let stderrLines = SubprocessLineBuffer()
+        let stdoutDecoder = Utf8StreamDecoder()
+        let stderrDecoder = Utf8StreamDecoder()
 
         stdoutPipe.fileHandleForReading.readabilityHandler = { handle in
             let data = handle.availableData
-            guard !data.isEmpty, let text = String(data: data, encoding: .utf8) else { return }
+            guard !data.isEmpty else { return }
+            let text = stdoutDecoder.decode(data)
+            guard !text.isEmpty else { return }
             collectedOut.append(text)
             stdoutLines.append(text).forEach { line in onStdout(line) }
         }
 
         stderrPipe.fileHandleForReading.readabilityHandler = { handle in
             let data = handle.availableData
-            guard !data.isEmpty, let text = String(data: data, encoding: .utf8) else { return }
+            guard !data.isEmpty else { return }
+            let text = stderrDecoder.decode(data)
+            guard !text.isEmpty else { return }
             collectedErr.append(text)
             stderrLines.append(text).forEach { line in onStderr(line) }
         }
@@ -162,6 +183,16 @@ public final class SubprocessRunner: @unchecked Sendable, SubprocessRunning {
                 process.terminationHandler = { proc in
                     stdoutPipe.fileHandleForReading.readabilityHandler = nil
                     stderrPipe.fileHandleForReading.readabilityHandler = nil
+
+                    if let remaining = stdoutDecoder.flush(), !remaining.isEmpty {
+                        collectedOut.append(remaining)
+                        stdoutLines.append(remaining).forEach { line in onStdout(line) }
+                    }
+                    if let remaining = stderrDecoder.flush(), !remaining.isEmpty {
+                        collectedErr.append(remaining)
+                        stderrLines.append(remaining).forEach { line in onStderr(line) }
+                    }
+
                     if let remaining = stdoutLines.flush() {
                         onStdout(remaining)
                     }
@@ -207,6 +238,110 @@ private final class OutputBuffer: @unchecked Sendable {
     }
 }
 
+private final class Utf8StreamDecoder: @unchecked Sendable {
+    private let lock = NSLock()
+    private var pending = Data()
+
+    func decode(_ data: Data) -> String {
+        lock.lock()
+        pending.append(data)
+        let cut = validUtf8PrefixLength(pending)
+        if cut <= 0 {
+            lock.unlock()
+            return ""
+        }
+        let prefix = pending.prefix(cut)
+        pending.removeFirst(cut)
+        lock.unlock()
+        return String(decoding: prefix, as: UTF8.self)
+    }
+
+    func flush() -> String? {
+        lock.lock()
+        guard !pending.isEmpty else {
+            lock.unlock()
+            return nil
+        }
+        let remainder = pending
+        pending.removeAll(keepingCapacity: true)
+        lock.unlock()
+        return String(decoding: remainder, as: UTF8.self)
+    }
+
+    private func validUtf8PrefixLength(_ data: Data) -> Int {
+        // We only trim off an incomplete trailing UTF-8 sequence. Most tool output is valid UTF-8,
+        // but read boundaries can split multi-byte scalars (e.g. emoji), so decoding must be incremental.
+        let count = data.count
+        guard count > 0 else { return 0 }
+
+        // Find how many continuation bytes (10xxxxxx) are at the end.
+        var continuationCount = 0
+        var idx = count - 1
+        while idx >= 0 {
+            let byte = data[data.index(data.startIndex, offsetBy: idx)]
+            if (byte & 0xC0) == 0x80 {
+                continuationCount += 1
+                idx -= 1
+                continue
+            }
+            break
+        }
+        let startIndex: Int
+        if continuationCount == 0 {
+            startIndex = count - 1
+        } else {
+            if continuationCount > 3 {
+                // Invalid trailing sequence; let String(decoding:) handle it.
+                return count
+            }
+            guard idx >= 0 else { return 0 }
+            startIndex = idx
+        }
+
+        let startByte = data[data.index(data.startIndex, offsetBy: startIndex)]
+        guard let expectedLength = expectedUtf8Length(for: startByte) else {
+            // Invalid start byte; treat the buffer as decodable (String(decoding:) will replace as needed).
+            return count
+        }
+
+        let availableLength = count - startIndex
+        if availableLength < expectedLength {
+            return startIndex
+        }
+        return count
+    }
+
+    private func expectedUtf8Length(for byte: UInt8) -> Int? {
+        if (byte & 0x80) == 0x00 {
+            return 1
+        }
+        if (byte & 0xE0) == 0xC0 {
+            return 2
+        }
+        if (byte & 0xF0) == 0xE0 {
+            return 3
+        }
+        if (byte & 0xF8) == 0xF0 {
+            return 4
+        }
+        return nil
+    }
+}
+
+#if DEBUG
+struct TestUtf8StreamDecoder {
+    private var decoder = Utf8StreamDecoder()
+
+    mutating func decode(_ bytes: [UInt8]) -> String {
+        decoder.decode(Data(bytes))
+    }
+
+    mutating func flush() -> String? {
+        decoder.flush()
+    }
+}
+#endif
+
 final class SubprocessLineBuffer: @unchecked Sendable {
     private let lock = NSLock()
     private var remainder = ""
@@ -215,16 +350,32 @@ final class SubprocessLineBuffer: @unchecked Sendable {
         lock.lock()
         remainder += chunk
         var lines: [String] = []
-        while let range = remainder.range(of: "\n") {
-            var line = String(remainder[..<range.lowerBound])
-            if line.hasSuffix("\r") {
-                line.removeLast()
+        // Split on both "\n" and "\r" so we can capture progress bars that redraw the current
+        // line using carriage returns (e.g., indicatif). In Swift's `Character` view, "\r\n"
+        // can be treated as a single extended grapheme cluster, so scan Unicode scalars.
+        while true {
+            guard let scalarIndex = remainder.unicodeScalars.firstIndex(where: { $0.value == 10 || $0.value == 13 }) else {
+                lock.unlock()
+                return lines
             }
+            guard let delimiterStart = scalarIndex.samePosition(in: remainder) else {
+                lock.unlock()
+                return lines
+            }
+
+            let line = String(remainder[..<delimiterStart])
             lines.append(line)
-            remainder.removeSubrange(remainder.startIndex..<range.upperBound)
+
+            var scalarEnd = remainder.unicodeScalars.index(after: scalarIndex)
+            if remainder.unicodeScalars[scalarIndex].value == 13,
+               scalarEnd < remainder.unicodeScalars.endIndex,
+               remainder.unicodeScalars[scalarEnd].value == 10 {
+                // Consume CRLF as a single delimiter.
+                scalarEnd = remainder.unicodeScalars.index(after: scalarEnd)
+            }
+            let delimiterEnd = scalarEnd.samePosition(in: remainder) ?? remainder.endIndex
+            remainder.removeSubrange(remainder.startIndex..<delimiterEnd)
         }
-        lock.unlock()
-        return lines
     }
 
     func flush() -> String? {

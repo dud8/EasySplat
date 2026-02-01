@@ -6,17 +6,43 @@ public struct ToolchainPaths: Sendable {
     public var colmap: URL
     public var glomap: URL
     public var brush: URL
-    public var learnedSfm: LearnedSfmToolchain
+    public var vggt: VggtToolchain
 
-    public init(root: URL, colmap: URL, glomap: URL, brush: URL, learnedSfm: LearnedSfmToolchain) {
+    @available(*, deprecated, message: "learned_sfm / MASt3R is deprecated; use vggt-mps instead.")
+    public var learnedSfm: LearnedSfmToolchain?
+
+    public init(
+        root: URL,
+        colmap: URL,
+        glomap: URL,
+        brush: URL,
+        vggt: VggtToolchain,
+        learnedSfm: LearnedSfmToolchain? = nil
+    ) {
         self.root = root
         self.colmap = colmap
         self.glomap = glomap
         self.brush = brush
+        self.vggt = vggt
         self.learnedSfm = learnedSfm
     }
 }
 
+public struct VggtToolchain: Sendable {
+    public var root: URL
+    public var sfmTool: URL
+    public var python: URL
+    public var models: URL
+
+    public init(root: URL, sfmTool: URL, python: URL, models: URL) {
+        self.root = root
+        self.sfmTool = sfmTool
+        self.python = python
+        self.models = models
+    }
+}
+
+@available(*, deprecated, message: "learned_sfm / MASt3R is deprecated; use vggt-mps instead.")
 public struct LearnedSfmToolchain: Sendable {
     public var root: URL
     public var matchTool: URL
@@ -118,13 +144,14 @@ public final class ToolchainManager: @unchecked Sendable, ToolchainManaging {
         onProgress: @escaping @Sendable (Double, String) -> Void
     ) async throws -> ToolchainPaths {
         if let localRoot = localToolchainOverrideURL() {
-            onProgress(0.0, "Checking installed tools")
+            onProgress(-1.0, "Checking installed tools")
+            onProgress(-1.0, "Validating tools")
             let toolchain = try validateToolchain(root: localRoot)
             onProgress(1.0, "Tools ready (local)")
             return toolchain
         }
 
-        onProgress(0.0, "Checking installed tools")
+        onProgress(-1.0, "Checking installed tools")
         let manifest = try await downloadManifest(url: manifestURL)
         guard manifest.verifying(publicKeyBase64: publicKeyBase64) else {
             throw ToolchainError.signatureFailed
@@ -132,10 +159,12 @@ public final class ToolchainManager: @unchecked Sendable, ToolchainManaging {
 
         let versionedRoot = try toolchainRootURL().appendingPathComponent(manifest.version, isDirectory: true)
 
-        if fileManager.fileExists(atPath: versionedRoot.path),
-           let toolchain = try? validateToolchain(root: versionedRoot) {
-            onProgress(1.0, "Tools ready (cached)")
-            return toolchain
+        if fileManager.fileExists(atPath: versionedRoot.path) {
+            onProgress(-1.0, "Validating tools")
+            if let toolchain = try? validateToolchain(root: versionedRoot) {
+                onProgress(1.0, "Tools ready (cached)")
+                return toolchain
+            }
         }
 
         // Backward compatible: older manifests shipped a single monolithic artifact ("macos-arm64").
@@ -155,10 +184,11 @@ public final class ToolchainManager: @unchecked Sendable, ToolchainManaging {
                     throw ToolchainError.hashMismatch
                 }
 
-                onProgress(0.0, "Unpacking tools")
+                onProgress(-1.0, "Unpacking tools")
                 try unzip(zipURL: zipURL, to: versionedRoot)
                 try fileManager.removeItem(at: zipURL)
 
+                onProgress(-1.0, "Validating tools")
                 let toolchain = try validateToolchain(root: versionedRoot)
                 onProgress(1.0, "Tools ready")
                 return toolchain
@@ -183,6 +213,7 @@ public final class ToolchainManager: @unchecked Sendable, ToolchainManaging {
             try await ensureArtifact(coreArtifact, root: versionedRoot, state: &state, onProgress: onProgress)
             try await ensureArtifact(modelsArtifact, root: versionedRoot, state: &state, onProgress: onProgress)
 
+            onProgress(-1.0, "Validating tools")
             let toolchain = try validateToolchain(root: versionedRoot)
             onProgress(1.0, "Tools ready")
             return toolchain
@@ -196,12 +227,17 @@ public final class ToolchainManager: @unchecked Sendable, ToolchainManaging {
         let colmap = root.appendingPathComponent("bin/colmap")
         let glomap = root.appendingPathComponent("bin/glomap")
         let brush = root.appendingPathComponent("bin/brush")
+        let brushReal = root.appendingPathComponent("bin/brush.real")
         ensureExecutable(at: colmap)
         ensureExecutable(at: glomap)
         ensureExecutable(at: brush)
         guard fileManager.isExecutableFile(atPath: colmap.path) else { throw ToolchainError.missingBinary("colmap") }
         guard fileManager.isExecutableFile(atPath: glomap.path) else { throw ToolchainError.missingBinary("glomap") }
         guard fileManager.isExecutableFile(atPath: brush.path) else { throw ToolchainError.missingBinary("brush") }
+        if fileHasShebang(at: brush) {
+            ensureExecutable(at: brushReal)
+            guard fileManager.isExecutableFile(atPath: brushReal.path) else { throw ToolchainError.missingBinary("brush.real") }
+        }
 
         // Validate OpenSSL dylibs and that COLMAP/GLOMAP can at least launch. Avoid requiring Xcode tools
         // (like `otool`) at runtime, since end users may not have them installed.
@@ -223,55 +259,90 @@ public final class ToolchainManager: @unchecked Sendable, ToolchainManaging {
             }
         }
 
-        let learnedRoot = root.appendingPathComponent("learned_sfm", isDirectory: true)
-        let learnedMatchTool = learnedRoot.appendingPathComponent("bin/easysplat_match")
-        let learnedPython = learnedRoot.appendingPathComponent("python/bin/python3")
-        let learnedModels = learnedRoot.appendingPathComponent("models", isDirectory: true)
-        let learnedCheckpoints = learnedModels.appendingPathComponent("checkpoints", isDirectory: true)
-        let learnedVendor = learnedRoot.appendingPathComponent("vendor/mast3r/mast3r", isDirectory: true)
-
-        guard fileManager.fileExists(atPath: learnedMatchTool.path) else {
-            throw ToolchainError.missingBinary("learned_sfm/bin/easysplat_match")
-        }
-        guard fileManager.fileExists(atPath: learnedPython.path) else {
-            throw ToolchainError.missingBinary("learned_sfm/python/bin/python3")
-        }
-        guard fileManager.fileExists(atPath: learnedModels.path) else {
-            throw ToolchainError.missingLibrary("learned_sfm/models")
-        }
-        guard fileManager.fileExists(atPath: learnedCheckpoints.path) else {
-            throw ToolchainError.missingLibrary("learned_sfm/models/checkpoints")
-        }
-        let checkpointFiles = (try? fileManager.contentsOfDirectory(at: learnedCheckpoints, includingPropertiesForKeys: nil)) ?? []
-        if !checkpointFiles.contains(where: { $0.pathExtension.lowercased() == "pth" }) {
-            throw ToolchainError.missingLibrary("learned_sfm/models/checkpoints/*.pth")
-        }
-        guard fileManager.fileExists(atPath: learnedVendor.path) else {
-            throw ToolchainError.missingLibrary("learned_sfm/vendor/mast3r")
+        let brushCheck = try runner.run(brush.path, ["--help"])
+        guard brushCheck.exitCode == 0 else {
+            throw ToolchainError.invalidToolchain("Brush failed to launch (exit \(brushCheck.exitCode)).")
         }
 
-        ensureExecutable(at: learnedMatchTool)
-        ensureExecutable(at: learnedPython)
+        let vggtRoot = root.appendingPathComponent("vggt_mps", isDirectory: true)
+        let vggtSfmTool = vggtRoot.appendingPathComponent("bin/easysplat_vggt_sfm")
+        let vggtPython = vggtRoot.appendingPathComponent("python/bin/python3")
+        let vggtModels = vggtRoot.appendingPathComponent("models", isDirectory: true)
+        let vggtModelFile = vggtModels.appendingPathComponent("vggt_model.pt")
+        // Upstream VGGT uses namespace packages (no __init__.py), so validate via a stable module file.
+        let vggtVendorSentinel = vggtRoot.appendingPathComponent("vendor/vggt/vggt/models/vggt.py")
 
-        let pythonArch = try? runner.run("/usr/bin/file", [learnedPython.path])
-        if let output = pythonArch?.stdout.lowercased(), !output.contains("arm64") {
-            throw ToolchainError.invalidToolchain("learned_sfm python is not arm64 (Rosetta build detected).")
+        guard fileManager.fileExists(atPath: vggtSfmTool.path) else {
+            throw ToolchainError.missingBinary("vggt_mps/bin/easysplat_vggt_sfm")
+        }
+        guard fileManager.fileExists(atPath: vggtPython.path) else {
+            throw ToolchainError.missingBinary("vggt_mps/python/bin/python3")
+        }
+        guard fileManager.fileExists(atPath: vggtModels.path) else {
+            throw ToolchainError.missingLibrary("vggt_mps/models")
+        }
+        guard fileManager.fileExists(atPath: vggtModelFile.path) else {
+            throw ToolchainError.missingLibrary("vggt_mps/models/vggt_model.pt")
+        }
+        guard fileManager.fileExists(atPath: vggtVendorSentinel.path) else {
+            throw ToolchainError.missingLibrary("vggt_mps/vendor/vggt")
         }
 
-        let learnedSfm = LearnedSfmToolchain(
-            root: learnedRoot,
-            matchTool: learnedMatchTool,
-            python: learnedPython,
-            models: learnedModels
+        ensureExecutable(at: vggtSfmTool)
+        ensureExecutable(at: vggtPython)
+
+        let vggtPythonArch = try? runner.run("/usr/bin/file", [vggtPython.path])
+        if let output = vggtPythonArch?.stdout.lowercased(), !output.contains("arm64") {
+            throw ToolchainError.invalidToolchain("vggt_mps python is not arm64 (Rosetta build detected).")
+        }
+
+        let vggt = VggtToolchain(
+            root: vggtRoot,
+            sfmTool: vggtSfmTool,
+            python: vggtPython,
+            models: vggtModels
         )
 
-        return ToolchainPaths(root: root, colmap: colmap, glomap: glomap, brush: brush, learnedSfm: learnedSfm)
+        // Optional legacy toolchain component. Keep for potential future use, but do not require it.
+        let learnedRoot = root.appendingPathComponent("learned_sfm", isDirectory: true)
+        var learnedSfm: LearnedSfmToolchain?
+        if fileManager.fileExists(atPath: learnedRoot.path) {
+            let learnedMatchTool = learnedRoot.appendingPathComponent("bin/easysplat_match")
+            let learnedPython = learnedRoot.appendingPathComponent("python/bin/python3")
+            let learnedModels = learnedRoot.appendingPathComponent("models", isDirectory: true)
+            let learnedCheckpoints = learnedModels.appendingPathComponent("checkpoints", isDirectory: true)
+            let learnedVendor = learnedRoot.appendingPathComponent("vendor/mast3r/mast3r", isDirectory: true)
+
+            if fileManager.fileExists(atPath: learnedMatchTool.path),
+               fileManager.fileExists(atPath: learnedPython.path),
+               fileManager.fileExists(atPath: learnedModels.path),
+               fileManager.fileExists(atPath: learnedCheckpoints.path),
+               fileManager.fileExists(atPath: learnedVendor.path) {
+                ensureExecutable(at: learnedMatchTool)
+                ensureExecutable(at: learnedPython)
+                learnedSfm = LearnedSfmToolchain(
+                    root: learnedRoot,
+                    matchTool: learnedMatchTool,
+                    python: learnedPython,
+                    models: learnedModels
+                )
+            }
+        }
+
+        return ToolchainPaths(root: root, colmap: colmap, glomap: glomap, brush: brush, vggt: vggt, learnedSfm: learnedSfm)
     }
 
     private func ensureExecutable(at url: URL) {
         guard fileManager.fileExists(atPath: url.path) else { return }
         if fileManager.isExecutableFile(atPath: url.path) { return }
         try? fileManager.setAttributes([.posixPermissions: 0o755], ofItemAtPath: url.path)
+    }
+
+    private func fileHasShebang(at url: URL) -> Bool {
+        guard let handle = try? FileHandle(forReadingFrom: url) else { return false }
+        defer { try? handle.close() }
+        guard let data = try? handle.read(upToCount: 2), data.count == 2 else { return false }
+        return data[0] == 0x23 && data[1] == 0x21
     }
 
     private func downloadManifest(url: URL) async throws -> ToolchainManifest {
@@ -360,6 +431,12 @@ public final class ToolchainManager: @unchecked Sendable, ToolchainManaging {
         guard let url = URL(string: urlString) else {
             throw ToolchainError.invalidArtifactURL(urlString)
         }
+        guard let scheme = url.scheme else {
+            throw ToolchainError.invalidArtifactURL(urlString)
+        }
+        if scheme != "file", url.host == nil {
+            throw ToolchainError.invalidArtifactURL(urlString)
+        }
         return url
     }
 
@@ -395,11 +472,11 @@ public final class ToolchainManager: @unchecked Sendable, ToolchainManaging {
         }
 
         if name.hasSuffix("-core") {
-            onProgress(0.0, "Unpacking tools (core)")
+            onProgress(-1.0, "Unpacking tools (core)")
         } else if name.hasSuffix("-models") {
-            onProgress(0.0, "Unpacking tools (models)")
+            onProgress(-1.0, "Unpacking tools (models)")
         } else {
-            onProgress(0.0, "Unpacking tools")
+            onProgress(-1.0, "Unpacking tools")
         }
 
         try unzip(zipURL: zipURL, to: root)
@@ -423,28 +500,60 @@ public final class ToolchainManager: @unchecked Sendable, ToolchainManaging {
         let colmap = root.appendingPathComponent("bin/colmap")
         let glomap = root.appendingPathComponent("bin/glomap")
         let brush = root.appendingPathComponent("bin/brush")
+        let brushReal = root.appendingPathComponent("bin/brush.real")
         let libcrypto = root.appendingPathComponent("lib/libcrypto.3.dylib")
         let libssl = root.appendingPathComponent("lib/libssl.3.dylib")
-        let learned = root.appendingPathComponent("learned_sfm", isDirectory: true)
-        let learnedMatchTool = learned.appendingPathComponent("bin/easysplat_match")
-        let learnedPython = learned.appendingPathComponent("python/bin/python3")
-        let learnedVendor = learned.appendingPathComponent("vendor/mast3r/mast3r", isDirectory: true)
+        let vggt = root.appendingPathComponent("vggt_mps", isDirectory: true)
+        let vggtSfmTool = vggt.appendingPathComponent("bin/easysplat_vggt_sfm")
+        let vggtPython = vggt.appendingPathComponent("python/bin/python3")
+        // Upstream VGGT uses namespace packages (no __init__.py). Validate via a stable module file.
+        let vggtVendorSentinel = vggt.appendingPathComponent("vendor/vggt/vggt/models/vggt.py")
+
+        let brushOK: Bool = {
+            guard fileManager.isExecutableFile(atPath: brush.path) else { return false }
+            if fileHasShebang(at: brush) {
+                return fileManager.isExecutableFile(atPath: brushReal.path)
+            }
+            return true
+        }()
 
         return fileManager.isExecutableFile(atPath: colmap.path)
             && fileManager.isExecutableFile(atPath: glomap.path)
-            && fileManager.isExecutableFile(atPath: brush.path)
+            && brushOK
             && fileManager.fileExists(atPath: libcrypto.path)
             && fileManager.fileExists(atPath: libssl.path)
-            && fileManager.fileExists(atPath: learnedMatchTool.path)
-            && fileManager.fileExists(atPath: learnedPython.path)
-            && fileManager.fileExists(atPath: learnedVendor.path)
+            && fileManager.fileExists(atPath: vggtSfmTool.path)
+            && fileManager.fileExists(atPath: vggtPython.path)
+            && fileManager.fileExists(atPath: vggtVendorSentinel.path)
     }
 
     private func modelsToolchainLooksInstalled(root: URL) -> Bool {
-        let checkpoints = root
-            .appendingPathComponent("learned_sfm/models/checkpoints", isDirectory: true)
-        guard fileManager.fileExists(atPath: checkpoints.path) else { return false }
-        let files = (try? fileManager.contentsOfDirectory(at: checkpoints, includingPropertiesForKeys: nil)) ?? []
-        return files.contains(where: { $0.pathExtension.lowercased() == "pth" })
+        let model = root
+            .appendingPathComponent("vggt_mps/models/vggt_model.pt")
+        return fileManager.fileExists(atPath: model.path)
     }
 }
+
+#if DEBUG
+extension ToolchainManager {
+    func test_validateToolchain(root: URL) throws -> ToolchainPaths {
+        try validateToolchain(root: root)
+    }
+
+    func test_coreToolchainLooksInstalled(root: URL) -> Bool {
+        coreToolchainLooksInstalled(root: root)
+    }
+
+    func test_modelsToolchainLooksInstalled(root: URL) -> Bool {
+        modelsToolchainLooksInstalled(root: root)
+    }
+
+    func test_fileHasShebang(at url: URL) -> Bool {
+        fileHasShebang(at: url)
+    }
+
+    func test_sha256Hex(url: URL) throws -> String {
+        try sha256Hex(url: url)
+    }
+}
+#endif

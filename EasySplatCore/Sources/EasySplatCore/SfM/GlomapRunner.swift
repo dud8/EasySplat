@@ -20,6 +20,7 @@ public final class GlomapRunner {
             "--image_path", imagePath.path,
             "--output_path", outputPath.path
         ]
+        onLog("EasySplat: glomap argv: \(glomapPath.path) \(args.joined(separator: " "))", false)
         let result = try await runner.runAsync(glomapPath.path, args, onStdout: { onLog($0, false) }, onStderr: { onLog($0, true) })
         guard result.exitCode == 0 else {
             throw SubprocessFailure(

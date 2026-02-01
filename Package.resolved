@@ -1,15 +1,6 @@
 {
-  "originHash" : "1fe22de323f469589265a898f5b14b7582e25e8183530b3376ab8003c0aab885",
+  "originHash" : "0f98916cae2cf305d497e6abe56059cc033c09abb079d07540147647d9e3ff8a",
   "pins" : [
-    {
-      "identity" : "metalsplatter",
-      "kind" : "remoteSourceControl",
-      "location" : "https://github.com/scier/MetalSplatter.git",
-      "state" : {
-        "revision" : "221348301cae5e14388410b9ed080c3d61cbfbbc",
-        "version" : "0.1.1"
-      }
-    },
     {
       "identity" : "sparkle",
       "kind" : "remoteSourceControl",

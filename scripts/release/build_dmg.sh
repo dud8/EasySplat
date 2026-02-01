@@ -75,7 +75,7 @@ PRIV="$TOOLCHAINS/private_key_ed25519.txt"
 "$ROOT/scripts/toolchain/build_openssl.sh"
 "$ROOT/scripts/toolchain/build_glomap.sh"
 "$ROOT/scripts/toolchain/build_brush.sh"
-"$ROOT/scripts/toolchain/build_learned_sfm.sh"
+"$ROOT/scripts/toolchain/build_vggt_mps.sh"
 "$ROOT/scripts/toolchain/package_toolchain.sh" --version "$VERSION"
 
 if [ ! -f "$PUB" ] || [ ! -f "$PRIV" ]; then

@@ -9,7 +9,7 @@ let package = Package(
         .executable(name: "EasySplatApp", targets: ["EasySplatApp"])
     ],
     dependencies: [
-        .package(url: "https://github.com/scier/MetalSplatter.git", from: "0.1.1"),
+        .package(path: "ThirdParty/MetalSplatter"),
         .package(url: "https://github.com/sparkle-project/Sparkle.git", from: "2.7.3")
     ],
     targets: [

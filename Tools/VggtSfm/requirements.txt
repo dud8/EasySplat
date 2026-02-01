@@ -1,0 +1,9 @@
+# Runtime deps are primarily satisfied by the toolchain's bundled CPython + vendored VGGT.
+# This file documents the minimum imports used by EasySplat's VGGT bridge.
+torch
+torchvision
+numpy
+Pillow
+huggingface_hub
+einops
+safetensors

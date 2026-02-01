@@ -151,7 +151,8 @@ def main() -> int:
         from dust3r.utils.image import load_images
     except Exception as exc:  # noqa: BLE001
         log(f"Failed to import MASt3R/DUSt3R: {exc}")
-        log("Rebuild the learned_sfm toolchain via ./scripts/dev_run.sh.")
+        log("learned_sfm (MASt3R) is deprecated and is no longer built by default.")
+        log("If you still need it, rebuild via: ./scripts/toolchain/build_learned_sfm.sh")
         return 1
 
     models_dir = Path(args.models_dir)

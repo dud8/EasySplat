@@ -91,6 +91,7 @@ public final class ColmapRunner {
         if let maxNumFeatures = options.maxNumFeatures {
             finalArgs.append(contentsOf: ["--SiftExtraction.max_num_features", "\(maxNumFeatures)"])
         }
+        onLog("EasySplat: colmap argv: \(colmapPath.path) \(finalArgs.joined(separator: " "))", false)
         let result = try await runner.runAsync(
             colmapPath.path,
             finalArgs,
@@ -121,6 +122,7 @@ public final class ColmapRunner {
             "--FeatureExtraction.use_gpu", options.useGPU ? "1" : "0",
             "--FeatureExtraction.num_threads", "\(options.extractThreads)"
         ]
+        onLog("EasySplat: colmap argv: \(colmapPath.path) \(args.joined(separator: " "))", false)
         let result = try await runner.runAsync(
             colmapPath.path,
             args,
@@ -152,6 +154,7 @@ public final class ColmapRunner {
         if let maxNumMatches = options.maxNumMatches {
             finalArgs.append(contentsOf: ["--FeatureMatching.max_num_matches", "\(maxNumMatches)"])
         }
+        onLog("EasySplat: colmap argv: \(colmapPath.path) \(finalArgs.joined(separator: " "))", false)
         let result = try await runner.runAsync(
             colmapPath.path,
             finalArgs,
@@ -183,6 +186,7 @@ public final class ColmapRunner {
         if options.useBruteForceMatcher {
             finalArgs.append(contentsOf: ["--SiftMatching.cpu_brute_force_matcher", "1"])
         }
+        onLog("EasySplat: colmap argv: \(colmapPath.path) \(finalArgs.joined(separator: " "))", false)
         let result = try await runner.runAsync(
             colmapPath.path,
             finalArgs,
@@ -216,6 +220,7 @@ public final class ColmapRunner {
         if let blockSize = options.exhaustiveBlockSize {
             finalArgs.append(contentsOf: ["--ExhaustiveMatching.block_size", "\(blockSize)"])
         }
+        onLog("EasySplat: colmap argv: \(colmapPath.path) \(finalArgs.joined(separator: " "))", false)
         let result = try await runner.runAsync(
             colmapPath.path,
             finalArgs,
@@ -241,6 +246,7 @@ public final class ColmapRunner {
             "--image_path", imagePath.path,
             "--output_path", outputPath.path
         ]
+        onLog("EasySplat: colmap argv: \(colmapPath.path) \(args.joined(separator: " "))", false)
         let result = try await runner.runAsync(
             colmapPath.path,
             args,

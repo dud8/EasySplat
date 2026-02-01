@@ -1,24 +1,44 @@
 # EasySplat
 
-EasySplat is a macOS‑only (Apple Silicon) desktop app that turns videos or image folders into Gaussian splats using COLMAP/GLOMAP + Brush, with a beginner‑friendly UI and progress tracking.
+EasySplat is a macOS-only (Apple Silicon) desktop app that turns videos or image folders into 3D Gaussian splats using a bundled toolchain (primarily VGGT-MPS + Brush), with a beginner-friendly UI and progress tracking.
+
+COLMAP/GLOMAP support remains in the toolchain as a fallback / legacy path. The older MASt3R-based learned matcher is currently deprecated.
+
+The app downloads a signed `manifest.json` that lists toolchain artifacts (typically split into a smaller “core” zip and a large “models” zip).
 
 ## Quick start (recommended)
 
 1) Download the latest `EasySplat-<version>.dmg` from GitHub Releases.
 2) Drag `EasySplat.app` into Applications.
 3) First launch: right‑click → Open (unsigned app).
-4) The app auto‑downloads the toolchain on first run.
+4) The app auto-downloads the toolchain on first run (this can be a large download).
+
+## Repo layout (for contributors)
+
+- `EasySplatApp/`: SwiftUI app.
+- `EasySplatCore/`: core library (pipeline + toolchain integration).
+- `Tools/ManifestTool/`: Swift CLI to generate keypairs and sign manifests.
+- `Tools/VggtSfm/`: Python package shipped in the toolchain (VGGT → COLMAP bridge).
+- `Tools/LearnedSfm/`: legacy/deprecated learned SfM path.
+- `ThirdParty/MetalSplatter/`: vendored SwiftPM dependency.
+- `Toolchains/`: local toolchain build outputs (`build/`, `out/`), plus dev-only keys/manifest (gitignored).
+- `scripts/`: development, testing, and release automation.
 
 ## Developer one‑liner
 
-This builds the local toolchain, serves it, and launches the app:
+This builds/refreshes the local toolchain, serves `Toolchains/`, and launches the app with env overrides:
 
 ```
 ./scripts/dev_run.sh
 ```
 
-Note: the learned matcher downloads several GB of model weights on first run.
-Set `EASYSPLAT_LEARNED_RETRIEVAL=1` to also download retrieval weights and dependencies.
+Note: VGGT downloads a large (multi-GB) model as part of the toolchain build.
+
+If you already have a toolchain installed and just want to run the app:
+
+```
+./scripts/run_fast.sh --version 0.1.0
+```
 
 ## Build a DMG locally (from scratch)
 
@@ -39,13 +59,14 @@ sudo xcodebuild -license accept
 ./scripts/release/build_dmg.sh --version 0.1.0
 ```
 
-By default the manifest/artifact URLs are set to `http://localhost:8000/...`. If you want the DMG to point at a hosted toolchain instead, pass URLs explicitly:
+By default the app built into the DMG will be configured to read a manifest URL. If you want the DMG to point at a hosted toolchain, pass URLs explicitly:
 
 ```
 ./scripts/release/build_dmg.sh \
   --version 0.1.0 \
   --manifest-url "https://your-host/manifest.json" \
-  --artifact-url "https://your-host/toolchain-macos-arm64-0.1.0.zip"
+  --core-artifact-url "https://your-host/toolchain-macos-arm64-0.1.0-core.zip" \
+  --models-artifact-url "https://your-host/toolchain-macos-arm64-0.1.0-models.zip"
 ```
 
 The DMG will be created at `release/DMG/EasySplat-0.1.0.dmg`.
@@ -59,7 +80,18 @@ You can also increase retries or force sandbox-safe mode:
 ```
 EASYSPLAT_DMG_HDIUTIL_RETRIES=40 EASYSPLAT_DMG_SANDBOX_SAFE=1 ./scripts/release/build_dmg.sh --version 0.1.0
 ```
-If you keep the default localhost URLs, start a local server before launching the app:
+
+If you want a locally-built DMG to use a local toolchain server (handy for testing), start a local server and pass localhost URLs that match `Toolchains/` layout:
+
+```
+./scripts/release/build_dmg.sh \
+  --version 0.1.0 \
+  --manifest-url "http://localhost:8000/manifest.json" \
+  --core-artifact-url "http://localhost:8000/out/toolchain-macos-arm64-0.1.0-core.zip" \
+  --models-artifact-url "http://localhost:8000/out/toolchain-macos-arm64-0.1.0-models.zip"
+```
+
+Then serve `Toolchains/`:
 
 ```
 cd Toolchains
@@ -69,34 +101,34 @@ python3 -m http.server 8000
 ## Requirements (development)
 
 - macOS 15+ on Apple Silicon
-- Xcode 16+ (Swift 6) or the Xcode Command Line Tools
+- Xcode 16+ (Swift 6). (Tests require a full Xcode install; Command Line Tools alone do not include XCTest.)
 - Toolchain build dependencies:
   - `git`, `cmake`, `ninja`
   - COLMAP/GLOMAP deps (e.g. Eigen, Ceres, Boost, Glog, Gflags, OpenCV, SQLite3)
   - Rust toolchain (for Brush)
-  - Python 3 + pip (for learned matching)
+  - Network access for large downloads (VGGT model + Python wheels)
   - `create-dmg` (for DMG packaging)
 
 ## Release (GitHub Actions)
 
-1) Build the toolchain (uploads `toolchain-macos-arm64-<version>.zip` + `manifest.json`):
-   - Run the **Toolchain Build** workflow, or push tag `toolchain-v<version>`.
-   - Requires repo secret `TOOLCHAIN_SIGNING_KEY_BASE64` (base64 private key).
+Release automation lives in `.github/workflows/` and `scripts/release/`.
 
-2) Build the app + DMG (uploads `EasySplat-<version>.dmg`):
-   - Run the **Release App** workflow, or push tag `v<version>`.
-   - Requires repo secret `TOOLCHAIN_PUBLIC_KEY_BASE64` (base64 public key).
-   - Expects the matching toolchain release tag `toolchain-v<version>`.
+At a high level:
+- A toolchain release publishes a signed `manifest.json` plus the referenced toolchain artifacts.
+- An app release embeds the manifest URL + public key into the app bundle and packages a DMG.
+
+If you change toolchain artifact naming/layout (e.g. core/models split), update both the scripts and the workflows to match.
 
 ## Manual dev setup (optional)
 
-1) Build the toolchain (COLMAP/GLOMAP/Brush/Learned matching):
+1) Build the toolchain:
 
 ```
+./scripts/toolchain/build_openssl.sh
 ./scripts/toolchain/build_colmap.sh
 ./scripts/toolchain/build_glomap.sh
 ./scripts/toolchain/build_brush.sh
-./scripts/toolchain/build_learned_sfm.sh
+./scripts/toolchain/build_vggt_mps.sh
 ./scripts/toolchain/package_toolchain.sh --version 0.1.0
 ```
 
@@ -108,10 +140,12 @@ swift run --package-path Tools/ManifestTool ManifestTool generate-keypair \
   --private-key-out Toolchains/private_key_ed25519.txt
 
 swift run --package-path Tools/ManifestTool ManifestTool \
-  --zip Toolchains/out/toolchain-macos-arm64-0.1.0.zip \
+  --core-zip Toolchains/out/toolchain-macos-arm64-0.1.0-core.zip \
+  --core-url http://localhost:8000/out/toolchain-macos-arm64-0.1.0-core.zip \
+  --models-zip Toolchains/out/toolchain-macos-arm64-0.1.0-models.zip \
+  --models-url http://localhost:8000/out/toolchain-macos-arm64-0.1.0-models.zip \
   --version 0.1.0 \
   --published-at 2026-01-27T00:00:00Z \
-  --artifact-url http://localhost:8000/toolchain-macos-arm64-0.1.0.zip \
   --private-key "$(cat Toolchains/private_key_ed25519.txt)" \
   --manifest-out Toolchains/manifest.json
 ```
@@ -144,6 +178,6 @@ Run all tests:
 Note: UI test target is a placeholder in SwiftPM (XCUITest requires an Xcode project).
 Note: `./scripts/test.sh` requires a full Xcode install (Command Line Tools alone do not include XCTest).
 
-## Learned matching notes
+## Deprecated: learned_sfm / MASt3R
 
-EasySplat's learned matcher uses MASt3R (CC BY-NC-SA 4.0). The build script downloads several GB of model weights on first run.
+The MASt3R‑based learned matcher is deprecated for now. The current default SfM backend is VGGT‑MPS.

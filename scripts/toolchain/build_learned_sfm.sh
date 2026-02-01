@@ -20,6 +20,8 @@ MAST3R_CKPT_URL="https://download.europe.naverlabs.com/ComputerVision/MASt3R/MAS
 MAST3R_RETRIEVAL_URL="https://download.europe.naverlabs.com/ComputerVision/MASt3R/MASt3R_ViTLarge_BaseDecoder_512_catmlpdpt_metric_retrieval_trainingfree.pth"
 MAST3R_CODEBOOK_URL="https://download.europe.naverlabs.com/ComputerVision/MASt3R/MASt3R_ViTLarge_BaseDecoder_512_catmlpdpt_metric_retrieval_codebook.pkl"
 
+echo "WARNING: learned_sfm (MASt3R) is deprecated. Prefer VGGT via ./scripts/toolchain/build_vggt_mps.sh" >&2
+
 if [ "$(uname -m)" != "arm64" ]; then
   echo "learned_sfm build must run on Apple Silicon (arm64). Refusing to build under Rosetta." >&2
   exit 1

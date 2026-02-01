@@ -1,5 +1,6 @@
 import Foundation
 
+@available(*, deprecated, message: "learned_sfm / MASt3R is deprecated; use vggt-mps instead.")
 public struct LearnedMatchingConfig: Sendable {
     public var device: String
     public var maxImageSize: Int
@@ -37,6 +38,7 @@ public struct LearnedMatchingConfig: Sendable {
     }
 }
 
+@available(*, deprecated, message: "learned_sfm / MASt3R is deprecated; use vggt-mps instead.")
 public protocol LearnedMatchingRunning: Sendable {
     func run(
         toolchain: LearnedSfmToolchain,
@@ -49,12 +51,14 @@ public protocol LearnedMatchingRunning: Sendable {
     ) async throws
 }
 
+@available(*, deprecated, message: "learned_sfm / MASt3R is deprecated; use vggt-mps instead.")
 public enum LearnedMatchingError: Error {
     case missingTool
     case missingModels
     case commandFailed(String)
 }
 
+@available(*, deprecated, message: "learned_sfm / MASt3R is deprecated; use vggt-mps instead.")
 public final class LearnedMatchingRunner: @unchecked Sendable, LearnedMatchingRunning {
     private let runner: SubprocessRunning
 

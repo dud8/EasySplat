@@ -1,5 +1,6 @@
 import Foundation
 
+@available(*, deprecated, message: "learned_sfm / MASt3R is deprecated; use vggt-mps instead.")
 public struct LearnedMpsProbeResult: Codable, Sendable {
     public let pythonMachine: String
     public let platform: String
@@ -14,6 +15,7 @@ public struct LearnedMpsProbeResult: Codable, Sendable {
     }
 }
 
+@available(*, deprecated, message: "learned_sfm / MASt3R is deprecated; use vggt-mps instead.")
 public enum LearnedMpsProbeError: Error, LocalizedError {
     case commandFailed(String)
     case invalidOutput
@@ -28,6 +30,7 @@ public enum LearnedMpsProbeError: Error, LocalizedError {
     }
 }
 
+@available(*, deprecated, message: "learned_sfm / MASt3R is deprecated; use vggt-mps instead.")
 public enum LearnedMpsProbe {
     public static func run(
         python: URL,
