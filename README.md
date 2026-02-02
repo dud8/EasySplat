@@ -26,19 +26,20 @@ The app downloads a signed `manifest.json` that lists toolchain artifacts (typic
 
 ## Developer one‑liner
 
-This builds/refreshes the local toolchain, serves `Toolchains/`, and launches the app with env overrides:
+The unified dev runner chooses the fast path when a valid toolchain is already installed, and only rebuilds when needed:
 
 ```
-./scripts/dev_run.sh
+./scripts/run.sh
 ```
 
-Note: VGGT downloads a large (multi-GB) model as part of the toolchain build.
+Common options:
+- `--fast`: force the cached-toolchain path (no rebuild/download).
+- `--rebuild`: force a toolchain rebuild (preserves models when possible).
+- `--version <semver>`: select a toolchain version (default `0.1.0`).
 
-If you already have a toolchain installed and just want to run the app:
+Note: VGGT downloads a large (multi-GB) model the first time the toolchain is built.
 
-```
-./scripts/run_fast.sh --version 0.1.0
-```
+Backward-compatible wrappers are still available (`./scripts/dev_run.sh`, `./scripts/run_fast.sh`), but `./scripts/run.sh` is the recommended entry point.
 
 ## Build a DMG locally (from scratch)
 

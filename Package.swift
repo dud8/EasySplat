@@ -16,7 +16,8 @@ let package = Package(
         .target(
             name: "EasySplatCore",
             dependencies: [],
-            path: "EasySplatCore/Sources/EasySplatCore"
+            path: "EasySplatCore/Sources/EasySplatCore",
+            exclude: ["AGENTS.md"]
         ),
         .executableTarget(
             name: "EasySplatApp",
@@ -27,6 +28,7 @@ let package = Package(
                 .product(name: "Sparkle", package: "Sparkle")
             ],
             path: "EasySplatApp",
+            exclude: ["AGENTS.md"],
             resources: [
                 .process("Resources")
             ]
@@ -34,7 +36,8 @@ let package = Package(
         .testTarget(
             name: "EasySplatCoreTests",
             dependencies: ["EasySplatCore"],
-            path: "EasySplatCore/Tests/EasySplatCoreTests"
+            path: "EasySplatCore/Tests/EasySplatCoreTests",
+            exclude: ["AGENTS.md"]
         ),
         .testTarget(
             name: "EasySplatAppTests",
