@@ -4,6 +4,7 @@ import ImageIO
 import UniformTypeIdentifiers
 
 public final class PipelineRunner: @unchecked Sendable {
+
     public struct Tooling {
         public var colmap: ColmapRunner
         public var glomap: GlomapRunner
@@ -332,16 +333,24 @@ public final class PipelineRunner: @unchecked Sendable {
                         ]
                     )
                     emit(.stageLog(stage: .sfmFeatures, line: "VGGT tool log: \(paths.vggtLogURL.lastPathComponent)", isError: false))
-
+                    let vggtImagesCount = selectedFrames.count
+                    let vggtProgress = VggtSfmProgressTracker(totalImages: vggtImagesCount)
+                    let onVggtLog: @Sendable (String, Bool) -> Void = { line, isErr in
+                        vggtToolLog.append(stream: isErr ? "stderr" : "stdout", line: line)
+                        if let update = vggtProgress.ingest(line) {
+                            emit(.stageProgress(stage: .sfmFeatures, fraction: update.fraction, message: update.message))
+                        }
+                        if Self.shouldEmitToolLogLine(line, isError: isErr) {
+                            emit(.stageLog(stage: .sfmFeatures, line: line, isError: isErr))
+                        }
+                    }
+                    emit(.stageProgress(stage: .sfmFeatures, fraction: 0.0, message: "Starting VGGT (\(vggtImagesCount) images)…"))
                     try await self.tooling.vggtSfm.run(
                         toolchain: self.config.toolchain.vggt,
                         images: paths.framesSelectedURL,
                         outSparse: sparseZero,
                         config: vggtConfig,
-                        onLog: { line, isErr in
-                            vggtToolLog.append(stream: isErr ? "stderr" : "stdout", line: line)
-                            emit(.stageLog(stage: .sfmFeatures, line: line, isError: isErr))
-                        }
+                        onLog: onVggtLog
                     )
 
                     guard sparseModelFilesExist(at: sparseZero) else {
@@ -520,23 +529,6 @@ public final class PipelineRunner: @unchecked Sendable {
                     let watchdogSeconds = learnedWatchdogSeconds()
                     let progressTracker = LearnedMatchingProgressTracker()
 
-                    final class LastLogTimeBox: @unchecked Sendable {
-                        private let queue = DispatchQueue(label: "EasySplat.learnedMatching.lastLog")
-                        private var lastLogTime = Date()
-
-                        func bump() {
-                            queue.sync {
-                                lastLogTime = Date()
-                            }
-                        }
-
-                        func silenceSeconds() -> TimeInterval {
-                            queue.sync {
-                                Date().timeIntervalSince(lastLogTime)
-                            }
-                        }
-                    }
-
                     let lastLog = LastLogTimeBox()
                     let learnedMatching = tooling.learnedMatching
                     guard let learnedToolchain = config.toolchain.learnedSfm else {
@@ -565,7 +557,9 @@ public final class PipelineRunner: @unchecked Sendable {
                         lastLog.bump()
 
                         learnedToolLog.append(stream: isErr ? "stderr" : "stdout", line: line)
-                        emit(.stageLog(stage: .sfmFeatures, line: line, isError: isErr))
+                        if Self.shouldEmitToolLogLine(line, isError: isErr) {
+                            emit(.stageLog(stage: .sfmFeatures, line: line, isError: isErr))
+                        }
                         if let update = progressTracker.ingest(line) {
                             emit(.stageProgress(stage: .sfmFeatures, fraction: update.fraction, message: update.message))
                         }
@@ -657,7 +651,9 @@ public final class PipelineRunner: @unchecked Sendable {
                 let featureProgress = ColmapFeatureProgressTracker()
                 let onFeaturesLog: @Sendable (String, Bool) -> Void = { line, isErr in
                     colmapToolLog.append(stream: isErr ? "stderr" : "stdout", line: line)
-                    emit(.stageLog(stage: .sfmFeatures, line: line, isError: isErr))
+                    if Self.shouldEmitToolLogLine(line, isError: isErr) {
+                        emit(.stageLog(stage: .sfmFeatures, line: line, isError: isErr))
+                    }
                     if let update = featureProgress.ingest(line) {
                         emit(.stageProgress(stage: .sfmFeatures, fraction: update.fraction, message: update.message))
                     }
@@ -737,7 +733,9 @@ public final class PipelineRunner: @unchecked Sendable {
                     let blockProgress = ColmapMatchingProgressTracker()
                     let onLog: @Sendable (String, Bool) -> Void = { line, isErr in
                         colmapToolLog.append(stream: isErr ? "stderr" : "stdout", line: line)
-                        emit(.stageLog(stage: .sfmMatching, line: line, isError: isErr))
+                        if Self.shouldEmitToolLogLine(line, isError: isErr) {
+                            emit(.stageLog(stage: .sfmMatching, line: line, isError: isErr))
+                        }
                         if let update = blockProgress.ingest(line) {
                             state.updateBlockMessage(update.message)
                         }
@@ -860,7 +858,9 @@ public final class PipelineRunner: @unchecked Sendable {
                                     options: colmapExtractOptions,
                                     onLog: { line, isErr in
                                         colmapToolLog.append(stream: isErr ? "stderr" : "stdout", line: line)
-                                        emit(.stageLog(stage: .sfmMatching, line: line, isError: isErr))
+                                        if Self.shouldEmitToolLogLine(line, isError: isErr) {
+                                            emit(.stageLog(stage: .sfmMatching, line: line, isError: isErr))
+                                        }
                                     }
                                 )
                                 try await runExhaustive()
@@ -995,7 +995,9 @@ public final class PipelineRunner: @unchecked Sendable {
                     emit(.stageLog(stage: .sfmMapping, line: "Tool logs: \(toolLogNames)", isError: false))
                         let mappingProgress = ColmapMappingProgressTracker(totalImages: selectedFrames.count)
                         let onMappingLog: @Sendable (String, Bool) -> Void = { line, isErr in
-                            emit(.stageLog(stage: .sfmMapping, line: line, isError: isErr))
+                            if Self.shouldEmitToolLogLine(line, isError: isErr) {
+                                emit(.stageLog(stage: .sfmMapping, line: line, isError: isErr))
+                            }
                             if let update = mappingProgress.ingest(line) {
                                 emit(.stageProgress(stage: .sfmMapping, fraction: update.fraction, message: update.message))
                             }
@@ -1168,12 +1170,34 @@ public final class PipelineRunner: @unchecked Sendable {
             if shouldRunStage(.trainBrush) {
                 currentStage = .trainBrush
                 emit(.stageStarted(stage: .trainBrush))
+                let brushPlan = brushTrainingPlan(for: metadata.preset)
+                if let totalSteps = brushPlan.totalSteps {
+                    emit(.stageLog(
+                        stage: .trainBrush,
+                        line: "Training target: \(formatStepCount(totalSteps)) steps",
+                        isError: false
+                    ))
+                }
+                if let exportEvery = brushPlan.exportEvery {
+                    emit(.stageLog(
+                        stage: .trainBrush,
+                        line: "Preview updates every \(formatStepCount(exportEvery)) steps",
+                        isError: false
+                    ))
+                }
                 let datasetPrepWeight = 0.20
                 let datasetURL = try prepareBrushDataset(paths: paths, progress: { fraction, message in
                     // Keep overall stage progress monotonic: dataset prep is the first slice.
                     emit(.stageProgress(stage: .trainBrush, fraction: datasetPrepWeight * fraction, message: message))
                 })
-                emit(.stageProgress(stage: .trainBrush, fraction: -1.0, message: "Training model"))
+                let trainingStartedAt = Date()
+                let initialStatus = trainingStatusMessage(
+                    elapsed: 0,
+                    progress: nil,
+                    latestExportStep: nil,
+                    totalSteps: brushPlan.totalSteps
+                )
+                emit(.stageProgress(stage: .trainBrush, fraction: -1.0, message: initialStatus))
                 emit(.stageLog(stage: .trainBrush, line: "Running Brush training...", isError: false))
 
                 let brushToolLog = ToolLogWriter(fileURL: paths.brushLogURL, toolName: "brush")
@@ -1190,44 +1214,21 @@ public final class PipelineRunner: @unchecked Sendable {
                 // Poll for exported .ply files so the user sees forward progress.
                 final class BrushProgressBox: @unchecked Sendable {
                     private let lock = NSLock()
-                    private var lastSeenAt = Date.distantPast
                     private var lastSeenStep: Int?
                     private var lastSeenTotal: Int?
-                    private var lastEmittedAt = Date.distantPast
-                    private var lastEmittedStep: Int?
-                    private var lastEmittedTotal: Int?
 
-                    func noteSeen(step: Int, total: Int) {
+                    func latestProgress() -> BrushTrainProgress? {
                         lock.lock()
-                        lastSeenAt = Date()
+                        defer { lock.unlock() }
+                        guard let step = lastSeenStep, let total = lastSeenTotal else { return nil }
+                        return BrushTrainProgress(step: step, total: total)
+                    }
+
+                    func update(step: Int, total: Int) {
+                        lock.lock()
                         lastSeenStep = step
                         lastSeenTotal = total
                         lock.unlock()
-                    }
-
-                    func shouldEmit(step: Int, total: Int, minInterval: TimeInterval) -> Bool {
-                        lock.lock()
-                        defer { lock.unlock() }
-                        let now = Date()
-                        lastSeenAt = now
-                        lastSeenStep = step
-                        lastSeenTotal = total
-                        if now.timeIntervalSince(lastEmittedAt) < minInterval {
-                            return false
-                        }
-                        if lastEmittedStep == step && lastEmittedTotal == total {
-                            return false
-                        }
-                        lastEmittedAt = now
-                        lastEmittedStep = step
-                        lastEmittedTotal = total
-                        return true
-                    }
-
-                    func timeSinceLastProgress() -> TimeInterval {
-                        lock.lock()
-                        defer { lock.unlock() }
-                        return Date().timeIntervalSince(lastSeenAt)
                     }
                 }
 
@@ -1235,35 +1236,69 @@ public final class PipelineRunner: @unchecked Sendable {
 
                 let monitorTask = Task { [trainingURL = paths.trainingURL, brushProgress] in
                     var lastSeen: String? = nil
-                    let startedAt = Date()
-                    var lastHeartbeatAt = Date.distantPast
+                    var latestExportStep: Int? = nil
+                    var lastEmittedStep: Int? = nil
+                    var lastEmittedTotal: Int? = nil
+                    var lastEmittedExportStep: Int? = nil
+                    var lastStatusAt = Date.distantPast
+                    var lastExportCheckAt = Date.distantPast
+                    let statusInterval: TimeInterval = 1.0
+                    let exportCheckInterval: TimeInterval = 5.0
                     while !Task.isCancelled {
-                        if let export = latestBrushExport(in: trainingURL) {
-                            let name = export.file.lastPathComponent
-                            if name != lastSeen {
-                                lastSeen = name
-                                let stepSuffix: String = {
-                                    guard let step = export.step else { return "" }
-                                    return " (step \(step))"
-                                }()
-                                emit(.stageLog(stage: .trainBrush, line: "Brush export: \(name)\(stepSuffix)", isError: false))
-                            }
-                        } else {
-                            let now = Date()
-                            // Only emit heartbeats when Brush isn't producing progress updates.
-                            if brushProgress.timeSinceLastProgress() >= 30, now.timeIntervalSince(lastHeartbeatAt) >= 30 {
-                                lastHeartbeatAt = now
-                                let elapsed = Int(now.timeIntervalSince(startedAt))
-                                let mins = elapsed / 60
-                                let secs = elapsed % 60
-                                emit(.stageProgress(
-                                    stage: .trainBrush,
-                                    fraction: -1.0,
-                                    message: String(format: "Training model (running for %dm %02ds)", mins, secs)
-                                ))
+                        let now = Date()
+                        if now.timeIntervalSince(lastExportCheckAt) >= exportCheckInterval {
+                            lastExportCheckAt = now
+                            if let export = latestBrushExport(in: trainingURL) {
+                                let name = export.file.lastPathComponent
+                                if name != lastSeen {
+                                    lastSeen = name
+                                    if let step = export.step {
+                                        latestExportStep = step
+                                        emit(.stageLog(
+                                            stage: .trainBrush,
+                                            line: "Saved a preview at \(formatStepCount(step)) steps",
+                                            isError: false
+                                        ))
+                                    } else {
+                                        emit(.stageLog(stage: .trainBrush, line: "Saved a preview model", isError: false))
+                                    }
+                                }
                             }
                         }
-                        try? await Task.sleep(nanoseconds: 10_000_000_000)
+                        if now.timeIntervalSince(lastStatusAt) >= statusInterval {
+                            lastStatusAt = now
+                            let elapsed = now.timeIntervalSince(trainingStartedAt)
+                            let progress = brushProgress.latestProgress()
+                            let shouldEmit: Bool = {
+                                if let progress {
+                                    return progress.step != lastEmittedStep
+                                        || progress.total != lastEmittedTotal
+                                        || latestExportStep != lastEmittedExportStep
+                                }
+                                return latestExportStep != lastEmittedExportStep
+                            }()
+                            if shouldEmit {
+                                if let progress {
+                                    lastEmittedStep = progress.step
+                                    lastEmittedTotal = progress.total
+                                }
+                                lastEmittedExportStep = latestExportStep
+                                let fraction: Double = {
+                                    guard let progress else { return -1.0 }
+                                    let f = Double(progress.step) / Double(progress.total)
+                                    let weighted = datasetPrepWeight + (1.0 - datasetPrepWeight) * f
+                                    return min(0.99, max(0.0, weighted))
+                                }()
+                                let status = trainingStatusMessage(
+                                    elapsed: elapsed,
+                                    progress: progress,
+                                    latestExportStep: latestExportStep,
+                                    totalSteps: brushPlan.totalSteps
+                                )
+                                emit(.stageProgress(stage: .trainBrush, fraction: fraction, message: status))
+                            }
+                        }
+                        try? await Task.sleep(nanoseconds: 1_000_000_000)
                     }
                 }
                 defer { monitorTask.cancel() }
@@ -1271,27 +1306,21 @@ public final class PipelineRunner: @unchecked Sendable {
                 try await self.tooling.brush.runTrain(
                     brushPath: self.config.toolchain.brush,
                     datasetPath: datasetURL,
+                    totalSteps: brushPlan.totalSteps,
+                    exportEvery: brushPlan.exportEvery,
                     onLog: { line, isErr in
                         brushToolLog.append(stream: isErr ? "stderr" : "stdout", line: line)
 
-                        if !isErr,
-                           let progress = self.brushTrainStepProgress(from: line),
+                        if let progress = self.brushTrainStepProgress(from: line),
                            progress.total > 0,
                            progress.step >= 0,
-                           progress.step <= progress.total,
-                           brushProgress.shouldEmit(step: progress.step, total: progress.total, minInterval: 1.0) {
-                            let f = Double(progress.step) / Double(progress.total)
-                            let weighted = datasetPrepWeight + (1.0 - datasetPrepWeight) * f
-                            let clamped = min(0.99, max(0.0, weighted))
-                            emit(.stageProgress(
-                                stage: .trainBrush,
-                                fraction: clamped,
-                                message: "Training model (\(progress.step)/\(progress.total) steps)"
-                            ))
-                            return
+                           progress.step <= progress.total {
+                            brushProgress.update(step: progress.step, total: progress.total)
                         }
 
-                        emit(.stageLog(stage: .trainBrush, line: line, isError: isErr))
+                        if Self.shouldEmitToolLogLine(line, isError: isErr) {
+                            emit(.stageLog(stage: .trainBrush, line: line, isError: isErr))
+                        }
                     }
                 )
                 emit(.stageFinished(stage: .trainBrush))
@@ -2243,6 +2272,88 @@ private extension PipelineRunner {
         let total: Int
     }
 
+    struct BrushTrainingPlan: Sendable {
+        let totalSteps: Int?
+        let exportEvery: Int?
+    }
+
+    func brushTrainingPlan(for preset: PresetSpec) -> BrushTrainingPlan {
+        switch preset.quality {
+        case .draft:
+            return BrushTrainingPlan(totalSteps: 20_000, exportEvery: 5_000)
+        case .standard:
+            return BrushTrainingPlan(totalSteps: 40_000, exportEvery: 5_000)
+        case .ultra:
+            return BrushTrainingPlan(totalSteps: 80_000, exportEvery: 10_000)
+        }
+    }
+
+    func trainingStatusMessage(
+        elapsed: TimeInterval,
+        progress: BrushTrainProgress?,
+        latestExportStep: Int?,
+        totalSteps: Int?
+    ) -> String {
+        let elapsedText = formatElapsed(elapsed)
+        if let progress, progress.total > 0 {
+            let stepText = formatStepCount(progress.step)
+            let totalText = formatStepCount(progress.total)
+            return "Training model - \(stepText)/\(totalText) steps (running \(elapsedText))"
+        }
+        if let totalSteps {
+            let fallbackStep = max(0, latestExportStep ?? 0)
+            let clamped = min(fallbackStep, totalSteps)
+            let stepText = formatStepCount(clamped)
+            let totalText = formatStepCount(totalSteps)
+            return "Training model - \(stepText)/\(totalText) steps (running \(elapsedText))"
+        }
+        if let latestExportStep {
+            let stepText = formatStepCount(latestExportStep)
+            return "Training model - \(stepText) steps (running \(elapsedText))"
+        }
+        return "Training model - running \(elapsedText)"
+    }
+
+    func formatStepCount(_ value: Int) -> String {
+        let raw = String(max(0, value))
+        var grouped: [Character] = []
+        var count = 0
+        for ch in raw.reversed() {
+            if count != 0 && count % 3 == 0 {
+                grouped.append(",")
+            }
+            grouped.append(ch)
+            count += 1
+        }
+        return String(grouped.reversed())
+    }
+
+    func formatElapsed(_ elapsed: TimeInterval) -> String {
+        let total = max(0, Int(elapsed))
+        let mins = total / 60
+        let secs = total % 60
+        return String(format: "%dm %02ds", mins, secs)
+    }
+
+    private static func shouldEmitToolLogLine(_ line: String, isError: Bool) -> Bool {
+        let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return false }
+        if isError {
+            return true
+        }
+        if trimmed.hasPrefix("EasySplat:") {
+            return true
+        }
+        let lower = trimmed.lowercased()
+        if lower.contains("warning") || lower.contains("warn") {
+            return true
+        }
+        if lower.contains("error") || lower.contains("fatal") || lower.contains("failed") {
+            return true
+        }
+        return false
+    }
+
     func brushTrainStepProgress(from line: String) -> BrushTrainProgress? {
         // Brush's CLI progress bar includes a "{pos}/{len}" segment (often updated via "\r").
         // We parse the first "<digits>/<digits>" occurrence and treat it as step progress.
@@ -2341,6 +2452,24 @@ private final class StageTimingTracker: @unchecked Sendable {
         let hours = totalSeconds / 3600
         let minutes = (totalSeconds % 3600) / 60
         return "\(hours)h \(minutes)m"
+    }
+}
+
+private final class LastLogTimeBox: @unchecked Sendable {
+    private let lock = NSLock()
+    private var lastLogTime = Date()
+
+    func bump() {
+        lock.lock()
+        lastLogTime = Date()
+        lock.unlock()
+    }
+
+    func silenceSeconds() -> TimeInterval {
+        lock.lock()
+        let silence = Date().timeIntervalSince(lastLogTime)
+        lock.unlock()
+        return silence
     }
 }
 
@@ -2472,6 +2601,11 @@ struct TestBrushTrainProgress: Sendable {
     let total: Int
 }
 
+struct TestBrushTrainingPlan: Sendable {
+    let totalSteps: Int?
+    let exportEvery: Int?
+}
+
 extension PipelineRunner {
     func loadImagesForTesting(in directory: URL) throws -> [URL] {
         try loadImages(in: directory)
@@ -2533,6 +2667,36 @@ extension PipelineRunner {
     func test_brushTrainStepProgress(from line: String) -> TestBrushTrainProgress? {
         guard let progress = brushTrainStepProgress(from: line) else { return nil }
         return TestBrushTrainProgress(step: progress.step, total: progress.total)
+    }
+
+    func test_brushTrainingPlan(for preset: PresetSpec) -> TestBrushTrainingPlan {
+        let plan = brushTrainingPlan(for: preset)
+        return TestBrushTrainingPlan(totalSteps: plan.totalSteps, exportEvery: plan.exportEvery)
+    }
+
+    func test_trainingStatusMessage(
+        elapsed: TimeInterval,
+        step: Int?,
+        total: Int?,
+        latestExportStep: Int?,
+        totalSteps: Int?
+    ) -> String {
+        let progress: BrushTrainProgress?
+        if let step, let total {
+            progress = BrushTrainProgress(step: step, total: total)
+        } else {
+            progress = nil
+        }
+        return trainingStatusMessage(
+            elapsed: elapsed,
+            progress: progress,
+            latestExportStep: latestExportStep,
+            totalSteps: totalSteps
+        )
+    }
+
+    func test_shouldEmitToolLogLine(_ line: String, isError: Bool) -> Bool {
+        Self.shouldEmitToolLogLine(line, isError: isError)
     }
 
     func test_colmapGpuOverride() -> Bool? {

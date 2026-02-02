@@ -10,6 +10,8 @@ public final class BrushRunner {
     public func runTrain(
         brushPath: URL,
         datasetPath: URL,
+        totalSteps: Int? = nil,
+        exportEvery: Int? = nil,
         onLog: @escaping @Sendable (String, Bool) -> Void
     ) async throws {
         let fm = FileManager.default
@@ -40,9 +42,26 @@ public final class BrushRunner {
             // Brush uses env_logger; without RUST_LOG, it may default to a very quiet level.
             environment["RUST_LOG"] = "info"
         }
+        if ProcessInfo.processInfo.environment["TERM"] == nil {
+            environment["TERM"] = "xterm-256color"
+        }
 
         func runBrush(_ arguments: [String]) async throws -> SubprocessResult {
             do {
+                if let ptyRunner = runner as? PseudoTTYCapableSubprocessRunning {
+                    do {
+                        return try await ptyRunner.runAsyncPseudoTTY(
+                            brushPath.path,
+                            arguments,
+                            currentDirectory: workingDirectory,
+                            environment: environment,
+                            onStdout: { onLog($0, false) },
+                            onStderr: { onLog($0, true) }
+                        )
+                    } catch let error as PseudoTTYFailure {
+                        onLog("EasySplat: pseudo-tty unavailable (\(error.localizedDescription)); retrying without tty.", true)
+                    }
+                }
                 return try await runner.runAsync(
                     brushPath.path,
                     arguments,
@@ -51,6 +70,8 @@ public final class BrushRunner {
                     onStdout: { onLog($0, false) },
                     onStderr: { onLog($0, true) }
                 )
+            } catch is CancellationError {
+                throw CancellationError()
             } catch {
                 throw SubprocessFailure(
                     tool: "brush",
@@ -71,15 +92,24 @@ public final class BrushRunner {
             return value
         }
 
+        func resolveInt(_ key: String, fallback: Int?) -> Int? {
+            if let envValue = intEnv(key) {
+                return envValue
+            }
+            return fallback
+        }
+
         // Brush CLI changed from `brush train <dataset>` to `brush <dataset>`; attempt the
         // modern form first and fall back to the legacy form when it looks required.
-        var primaryArgs: [String] = []
-        if let totalSteps = intEnv("EASYSPLAT_BRUSH_TOTAL_STEPS") {
-            primaryArgs += ["--total-steps", "\(totalSteps)"]
+        var flagArgs: [String] = []
+        if let resolvedTotalSteps = resolveInt("EASYSPLAT_BRUSH_TOTAL_STEPS", fallback: totalSteps) {
+            flagArgs += ["--total-steps", "\(resolvedTotalSteps)"]
         }
-        if let exportEvery = intEnv("EASYSPLAT_BRUSH_EXPORT_EVERY") {
-            primaryArgs += ["--export-every", "\(exportEvery)"]
+        if let resolvedExportEvery = resolveInt("EASYSPLAT_BRUSH_EXPORT_EVERY", fallback: exportEvery) {
+            flagArgs += ["--export-every", "\(resolvedExportEvery)"]
         }
+
+        var primaryArgs = flagArgs
         primaryArgs.append(datasetPath.path)
 
         onLog("EasySplat: running brush (cwd=\(workingDirectory.path))", false)
@@ -101,20 +131,37 @@ public final class BrushRunner {
 
         if looksLikeLegacySubcommandRequired {
             onLog("EasySplat: brush CLI looks like it requires legacy `train` subcommand; retrying.", true)
-            let legacyArgs = ["train", datasetPath.path]
+            let legacyArgs = ["train"] + flagArgs + [datasetPath.path]
             onLog("EasySplat: brush argv: \(brushPath.path) \(legacyArgs.joined(separator: " "))", false)
             let legacy = try await runBrush(legacyArgs)
-            guard legacy.exitCode == 0 else {
-                throw SubprocessFailure(
-                    tool: "brush",
-                    command: "train",
-                    exitCode: legacy.exitCode,
-                    terminationReason: legacy.terminationReason,
-                    stdoutTail: TextTails.tailLines(legacy.stdout, limit: 40),
-                    stderrTail: TextTails.tailLines(legacy.stderr, limit: 40)
-                )
+            if legacy.exitCode == 0 {
+                return
             }
-            return
+            if !flagArgs.isEmpty {
+                onLog("EasySplat: brush legacy CLI rejected training flags; retrying without flags.", true)
+                let legacyFallbackArgs = ["train", datasetPath.path]
+                onLog("EasySplat: brush argv: \(brushPath.path) \(legacyFallbackArgs.joined(separator: " "))", false)
+                let legacyFallback = try await runBrush(legacyFallbackArgs)
+                guard legacyFallback.exitCode == 0 else {
+                    throw SubprocessFailure(
+                        tool: "brush",
+                        command: "train",
+                        exitCode: legacyFallback.exitCode,
+                        terminationReason: legacyFallback.terminationReason,
+                        stdoutTail: TextTails.tailLines(legacyFallback.stdout, limit: 40),
+                        stderrTail: TextTails.tailLines(legacyFallback.stderr, limit: 40)
+                    )
+                }
+                return
+            }
+            throw SubprocessFailure(
+                tool: "brush",
+                command: "train",
+                exitCode: legacy.exitCode,
+                terminationReason: legacy.terminationReason,
+                stdoutTail: TextTails.tailLines(legacy.stdout, limit: 40),
+                stderrTail: TextTails.tailLines(legacy.stderr, limit: 40)
+            )
         }
 
         throw SubprocessFailure(

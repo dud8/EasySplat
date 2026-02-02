@@ -51,8 +51,7 @@ final class PipelineIntegrationTests: XCTestCase {
             .init(path: toolchain.glomap.path, argsPrefix: ["mapper"], result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""), onRun: { _ in try? self.writeSparseModel(at: projectURL) }),
             .init(path: toolchain.colmap.path, argsPrefix: ["model_analyzer"], result: .init(exitCode: 0, terminationReason: .exit, stdout: "Registered images: 10 / 10\nMean reprojection error: 1.0\n", stderr: ""), onRun: nil),
             .init(path: toolchain.brush.path, argsPrefix: [], result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""), onRun: { args in
-                let datasetArg = args.first == "train" ? args.dropFirst().first : args.first
-                guard let datasetArg else { return }
+                guard let datasetArg = args.last else { return }
                 let dataset = URL(fileURLWithPath: datasetArg)
                 let training = dataset.deletingLastPathComponent()
                 let ply = training.appendingPathComponent("mock.ply")
@@ -96,8 +95,7 @@ final class PipelineIntegrationTests: XCTestCase {
         let runner = MockSubprocessRunner(scripts: [
             .init(path: toolchain.vggt.sfmTool.path, argsPrefix: ["--images"], result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""), onRun: { _ in try? self.writeSparseModel(at: projectURL) }),
             .init(path: toolchain.brush.path, argsPrefix: [], result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""), onRun: { args in
-                let datasetArg = args.first == "train" ? args.dropFirst().first : args.first
-                guard let datasetArg else { return }
+                guard let datasetArg = args.last else { return }
                 let dataset = URL(fileURLWithPath: datasetArg)
                 let training = dataset.deletingLastPathComponent()
                 let ply = training.appendingPathComponent("mock.ply")
@@ -115,6 +113,127 @@ final class PipelineIntegrationTests: XCTestCase {
 
         let output = projectURL.appendingPathComponent("Output/splat.ply")
         XCTAssertTrue(FileManager.default.fileExists(atPath: output.path))
+    }
+
+    func testPipelineVggtEmitsProgressWhileRunning() async throws {
+        setenv("EASYSPLAT_SFM_BACKEND", "vggt", 1)
+        defer { setenv("EASYSPLAT_SFM_BACKEND", "colmap", 1) }
+
+        let temp = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        let projectURL = temp.appendingPathComponent("Test.easysplatproj", isDirectory: true)
+        let sourcePhotos = temp.appendingPathComponent("SourcePhotos", isDirectory: true)
+        try FileManager.default.createDirectory(at: sourcePhotos, withIntermediateDirectories: true)
+        for index in 0..<20 {
+            try writeTestImage(url: sourcePhotos.appendingPathComponent("img\(index).jpg"), value: UInt8(index % 255))
+        }
+
+        let metadata = ProjectMetadata(title: "Test",
+                                       input: .photos(folder: sourcePhotos.path),
+                                       preset: PresetSpec(mode: .object, quality: .draft))
+        let paths = ProjectPaths(root: projectURL)
+        try paths.ensureDirectories()
+        try ProjectMetadataStore.save(metadata, to: paths.metadataURL)
+
+        let toolchain = try makeToolchain(root: temp, createVggtFiles: true)
+
+        final class SlowVggt: @unchecked Sendable, VggtSfmRunning {
+            private let delayNanoseconds: UInt64
+
+            init(delayNanoseconds: UInt64) {
+                self.delayNanoseconds = delayNanoseconds
+            }
+
+            func run(
+                toolchain: VggtToolchain,
+                images: URL,
+                outSparse: URL,
+                config: VggtSfmConfig,
+                onLog: @escaping @Sendable (String, Bool) -> Void
+            ) async throws {
+                onLog("VGGT: loading model weights...", false)
+                try await Task.sleep(nanoseconds: delayNanoseconds)
+                onLog("VGGT: chunking enabled (chunk=6, overlap=2, stride=4).", false)
+
+                for chunk in [
+                    "VGGT: chunk 1/4 images[0:6]",
+                    "VGGT: chunk 2/4 images[4:10]",
+                    "VGGT: chunk 3/4 images[8:14]",
+                    "VGGT: chunk 4/4 images[12:20]"
+                ] {
+                    onLog(chunk, false)
+                    try await Task.sleep(nanoseconds: delayNanoseconds)
+                }
+
+                onLog("VGGT: writing COLMAP model to \(outSparse.path) (points=1234)", false)
+                try FileManager.default.createDirectory(at: outSparse, withIntermediateDirectories: true)
+                for name in ["cameras.bin", "images.bin", "points3D.bin", "cameras.txt", "points3D.txt"] {
+                    let url = outSparse.appendingPathComponent(name)
+                    FileManager.default.createFile(atPath: url.path, contents: Data([0x00]))
+                }
+                let imagesTxt = outSparse.appendingPathComponent("images.txt")
+                let text = """
+                # Image list with two lines per image:
+                #   IMAGE_ID, QW, QX, QY, QZ, TX, TY, TZ, CAMERA_ID, NAME
+                1 1 0 0 0 0 0 0 1 frame_000000.jpg
+                """
+                try text.write(to: imagesTxt, atomically: true, encoding: .utf8)
+                onLog("VGGT: done", false)
+            }
+        }
+
+        let runner = MockSubprocessRunner(scripts: [
+            .init(path: toolchain.brush.path, argsPrefix: [], result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""), onRun: { args in
+                guard let datasetArg = args.last else { return }
+                let dataset = URL(fileURLWithPath: datasetArg)
+                let training = dataset.deletingLastPathComponent()
+                let ply = training.appendingPathComponent("mock.ply")
+                try? "ply".write(to: ply, atomically: true, encoding: .utf8)
+            })
+        ])
+
+        var tooling = PipelineRunner.Tooling(runner: runner)
+        tooling.vggtSfm = SlowVggt(delayNanoseconds: 300_000_000)
+
+        final class LockedEvents: @unchecked Sendable {
+            private let lock = NSLock()
+            private var events: [PipelineEvent] = []
+
+            func append(_ event: PipelineEvent) {
+                lock.lock()
+                events.append(event)
+                lock.unlock()
+            }
+
+            func snapshot() -> [PipelineEvent] {
+                lock.lock()
+                let copy = events
+                lock.unlock()
+                return copy
+            }
+        }
+
+        let sink = LockedEvents()
+        let pipeline = PipelineRunner(
+            projectURL: projectURL,
+            config: .init(toolchain: toolchain, preset: metadata.preset),
+            tooling: tooling
+        )
+
+        try await pipeline.run { event in
+            sink.append(event)
+        }
+
+        let progressEvents = sink.snapshot().compactMap { event -> (fraction: Double, message: String)? in
+            guard case let .stageProgress(stage, fraction, message) = event,
+                  stage == .sfmFeatures else {
+                return nil
+            }
+            return (fraction, message)
+        }
+
+        XCTAssertTrue(progressEvents.contains(where: { $0.message.contains("Starting VGGT") }))
+        XCTAssertTrue(progressEvents.contains(where: { $0.message.contains("VGGT chunk") }))
+        XCTAssertGreaterThan(progressEvents.map(\.fraction).max() ?? 0, 0.0)
     }
 
     func testPipelineAcceptsModelAnalyzerOutputInStderr() async throws {
@@ -141,8 +260,7 @@ final class PipelineIntegrationTests: XCTestCase {
             .init(path: toolchain.glomap.path, argsPrefix: ["mapper"], result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""), onRun: { _ in try? self.writeSparseModel(at: projectURL) }),
             .init(path: toolchain.colmap.path, argsPrefix: ["model_analyzer"], result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: "Registered images: 10 / 10\nMean reprojection error: 1.0\n"), onRun: nil),
             .init(path: toolchain.brush.path, argsPrefix: [], result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""), onRun: { args in
-                let datasetArg = args.first == "train" ? args.dropFirst().first : args.first
-                guard let datasetArg else { return }
+                guard let datasetArg = args.last else { return }
                 let dataset = URL(fileURLWithPath: datasetArg)
                 let training = dataset.deletingLastPathComponent()
                 let ply = training.appendingPathComponent("mock.ply")
@@ -186,8 +304,7 @@ final class PipelineIntegrationTests: XCTestCase {
             .init(path: toolchain.colmap.path, argsPrefix: ["mapper"], result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""), onRun: { _ in try? self.writeSparseModel(at: projectURL) }),
             .init(path: toolchain.colmap.path, argsPrefix: ["model_analyzer"], result: .init(exitCode: 0, terminationReason: .exit, stdout: "Registered images: 10 / 10\nMean reprojection error: 1.0\n", stderr: ""), onRun: nil),
             .init(path: toolchain.brush.path, argsPrefix: [], result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""), onRun: { args in
-                let datasetArg = args.first == "train" ? args.dropFirst().first : args.first
-                guard let datasetArg else { return }
+                guard let datasetArg = args.last else { return }
                 let dataset = URL(fileURLWithPath: datasetArg)
                 let training = dataset.deletingLastPathComponent()
                 let ply = training.appendingPathComponent("mock.ply")
@@ -244,8 +361,7 @@ final class PipelineIntegrationTests: XCTestCase {
             .init(path: toolchain.colmap.path, argsPrefix: ["model_analyzer"], result: .init(exitCode: 0, terminationReason: .exit, stdout: "Registered images: 10 / 10\nMean reprojection error: 1.0\n", stderr: ""), onRun: nil),
 
             .init(path: toolchain.brush.path, argsPrefix: [], result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""), onRun: { args in
-                let datasetArg = args.first == "train" ? args.dropFirst().first : args.first
-                guard let datasetArg else { return }
+                guard let datasetArg = args.last else { return }
                 let dataset = URL(fileURLWithPath: datasetArg)
                 let training = dataset.deletingLastPathComponent()
                 let ply = training.appendingPathComponent("mock.ply")
@@ -294,8 +410,7 @@ final class PipelineIntegrationTests: XCTestCase {
             .init(path: toolchain.colmap.path, argsPrefix: ["mapper"], result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""), onRun: { _ in try? self.writeSparseModel(at: projectURL) }),
             .init(path: toolchain.colmap.path, argsPrefix: ["model_analyzer"], result: .init(exitCode: 0, terminationReason: .exit, stdout: "Registered images: 10 / 10\nMean reprojection error: 1.0\n", stderr: ""), onRun: nil),
             .init(path: toolchain.brush.path, argsPrefix: [], result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""), onRun: { args in
-                let datasetArg = args.first == "train" ? args.dropFirst().first : args.first
-                guard let datasetArg else { return }
+                guard let datasetArg = args.last else { return }
                 let dataset = URL(fileURLWithPath: datasetArg)
                 let training = dataset.deletingLastPathComponent()
                 let ply = training.appendingPathComponent("mock.ply")
@@ -416,8 +531,7 @@ final class PipelineIntegrationTests: XCTestCase {
             .init(path: toolchain.glomap.path, argsPrefix: ["mapper"], result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""), onRun: { _ in try? self.writeSparseModel(at: projectURL) }),
             .init(path: toolchain.colmap.path, argsPrefix: ["model_analyzer"], result: .init(exitCode: 0, terminationReason: .exit, stdout: "Registered images: 80 / 80\nMean reprojection error: 1.0\n", stderr: ""), onRun: nil),
             .init(path: toolchain.brush.path, argsPrefix: [], result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""), onRun: { args in
-                let datasetArg = args.first == "train" ? args.dropFirst().first : args.first
-                guard let datasetArg else { return }
+                guard let datasetArg = args.last else { return }
                 let dataset = URL(fileURLWithPath: datasetArg)
                 let training = dataset.deletingLastPathComponent()
                 let ply = training.appendingPathComponent("mock.ply")
@@ -469,8 +583,7 @@ final class PipelineIntegrationTests: XCTestCase {
             .init(path: toolchain.glomap.path, argsPrefix: ["mapper"], result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""), onRun: { _ in try? self.writeSparseModel(at: projectURL) }),
             .init(path: toolchain.colmap.path, argsPrefix: ["model_analyzer"], result: .init(exitCode: 0, terminationReason: .exit, stdout: "Registered images: 10 / 10\nMean reprojection error: 1.0\n", stderr: ""), onRun: nil),
             .init(path: toolchain.brush.path, argsPrefix: [], result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""), onRun: { args in
-                let datasetArg = args.first == "train" ? args.dropFirst().first : args.first
-                guard let datasetArg else { return }
+                guard let datasetArg = args.last else { return }
                 let dataset = URL(fileURLWithPath: datasetArg)
                 let training = dataset.deletingLastPathComponent()
                 let ply = training.appendingPathComponent("mock.ply")

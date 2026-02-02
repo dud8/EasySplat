@@ -1,4 +1,7 @@
 import Foundation
+#if canImport(Darwin)
+import Darwin
+#endif
 
 public protocol SubprocessRunning: Sendable {
     func run(
@@ -18,6 +21,27 @@ public protocol SubprocessRunning: Sendable {
         onStdout: @escaping @Sendable (String) -> Void,
         onStderr: @escaping @Sendable (String) -> Void
     ) async throws -> SubprocessResult
+}
+
+public protocol PseudoTTYCapableSubprocessRunning: SubprocessRunning {
+    func runAsyncPseudoTTY(
+        _ launchPath: String,
+        _ arguments: [String],
+        currentDirectory: URL?,
+        environment: [String: String],
+        onStdout: @escaping @Sendable (String) -> Void,
+        onStderr: @escaping @Sendable (String) -> Void
+    ) async throws -> SubprocessResult
+}
+
+struct PseudoTTYFailure: Error, LocalizedError, Sendable {
+    let function: String
+    let errnoCode: Int32
+
+    var errorDescription: String? {
+        let message = String(cString: strerror(errnoCode))
+        return "Pseudo-tty setup failed in \(function): \(message) (\(errnoCode))"
+    }
 }
 
 public extension SubprocessRunning {
@@ -47,7 +71,7 @@ public struct SubprocessResult: Sendable {
     public let stderr: String
 }
 
-public final class SubprocessRunner: @unchecked Sendable, SubprocessRunning {
+public final class SubprocessRunner: @unchecked Sendable, SubprocessRunning, PseudoTTYCapableSubprocessRunning {
     public init() {}
 
     public func run(
@@ -209,7 +233,7 @@ public final class SubprocessRunner: @unchecked Sendable, SubprocessRunning {
             }
         }, onCancel: {
             if process.isRunning {
-                process.terminate()
+                Self.requestGracefulTermination(process)
             }
         })
 
@@ -219,7 +243,160 @@ public final class SubprocessRunner: @unchecked Sendable, SubprocessRunning {
 
         return result
     }
+
+    public func runAsyncPseudoTTY(
+        _ launchPath: String,
+        _ arguments: [String],
+        currentDirectory: URL? = nil,
+        environment: [String: String] = [:],
+        onStdout: @escaping @Sendable (String) -> Void = { _ in },
+        onStderr: @escaping @Sendable (String) -> Void = { _ in }
+    ) async throws -> SubprocessResult {
+        #if canImport(Darwin)
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: launchPath)
+        process.arguments = arguments
+        if let currentDirectory {
+            process.currentDirectoryURL = currentDirectory
+        }
+        if !environment.isEmpty {
+            process.environment = process.environment?.merging(environment) { _, new in new } ?? environment
+        }
+
+        let stdoutTTY = try PseudoTTYPair.open()
+        let stderrTTY = try PseudoTTYPair.open()
+        process.standardOutput = stdoutTTY.slaveHandle
+        process.standardError = stderrTTY.slaveHandle
+
+        let collectedOut = OutputBuffer()
+        let collectedErr = OutputBuffer()
+        let stdoutLines = SubprocessLineBuffer()
+        let stderrLines = SubprocessLineBuffer()
+        let stdoutDecoder = Utf8StreamDecoder()
+        let stderrDecoder = Utf8StreamDecoder()
+
+        stdoutTTY.masterHandle.readabilityHandler = { handle in
+            let data = handle.availableData
+            guard !data.isEmpty else { return }
+            let text = stdoutDecoder.decode(data)
+            guard !text.isEmpty else { return }
+            collectedOut.append(text)
+            stdoutLines.append(text).forEach { line in onStdout(line) }
+        }
+
+        stderrTTY.masterHandle.readabilityHandler = { handle in
+            let data = handle.availableData
+            guard !data.isEmpty else { return }
+            let text = stderrDecoder.decode(data)
+            guard !text.isEmpty else { return }
+            collectedErr.append(text)
+            stderrLines.append(text).forEach { line in onStderr(line) }
+        }
+
+        try process.run()
+        stdoutTTY.slaveHandle.closeFile()
+        stderrTTY.slaveHandle.closeFile()
+
+        let result = try await withTaskCancellationHandler(operation: {
+            try await withCheckedThrowingContinuation { continuation in
+                process.terminationHandler = { proc in
+                    stdoutTTY.masterHandle.readabilityHandler = nil
+                    stderrTTY.masterHandle.readabilityHandler = nil
+
+                    if let remaining = stdoutDecoder.flush(), !remaining.isEmpty {
+                        collectedOut.append(remaining)
+                        stdoutLines.append(remaining).forEach { line in onStdout(line) }
+                    }
+                    if let remaining = stderrDecoder.flush(), !remaining.isEmpty {
+                        collectedErr.append(remaining)
+                        stderrLines.append(remaining).forEach { line in onStderr(line) }
+                    }
+
+                    if let remaining = stdoutLines.flush() {
+                        onStdout(remaining)
+                    }
+                    if let remaining = stderrLines.flush() {
+                        onStderr(remaining)
+                    }
+
+                    stdoutTTY.masterHandle.closeFile()
+                    stderrTTY.masterHandle.closeFile()
+
+                    continuation.resume(returning: SubprocessResult(
+                        exitCode: proc.terminationStatus,
+                        terminationReason: proc.terminationReason,
+                        stdout: collectedOut.value(),
+                        stderr: collectedErr.value()
+                    ))
+                }
+            }
+        }, onCancel: {
+            if process.isRunning {
+                Self.requestGracefulTermination(process)
+            }
+        })
+
+        if Task.isCancelled {
+            throw CancellationError()
+        }
+
+        return result
+        #else
+        return try await runAsync(
+            launchPath,
+            arguments,
+            currentDirectory: currentDirectory,
+            environment: environment,
+            onStdout: onStdout,
+            onStderr: onStderr
+        )
+        #endif
+    }
 }
+
+#if canImport(Darwin)
+private extension SubprocessRunner {
+    static func requestGracefulTermination(_ process: Process) {
+        let pid = process.processIdentifier
+        guard pid > 0 else {
+            process.terminate()
+            return
+        }
+
+        func isAlive(_ pid: pid_t) -> Bool {
+            if kill(pid, 0) == 0 { return true }
+            return errno == EPERM
+        }
+
+        _ = kill(pid, SIGINT)
+
+        Task.detached {
+            try? await Task.sleep(nanoseconds: 12_000_000_000)
+            guard isAlive(pid) else { return }
+            _ = kill(pid, SIGTERM)
+            try? await Task.sleep(nanoseconds: 3_000_000_000)
+            guard isAlive(pid) else { return }
+            _ = kill(pid, SIGKILL)
+        }
+    }
+}
+
+private struct PseudoTTYPair {
+    let masterHandle: FileHandle
+    let slaveHandle: FileHandle
+
+    static func open() throws -> PseudoTTYPair {
+        var master: Int32 = -1
+        var slave: Int32 = -1
+        if openpty(&master, &slave, nil, nil, nil) != 0 {
+            throw PseudoTTYFailure(function: "openpty", errnoCode: errno)
+        }
+        let masterHandle = FileHandle(fileDescriptor: master, closeOnDealloc: true)
+        let slaveHandle = FileHandle(fileDescriptor: slave, closeOnDealloc: true)
+        return PseudoTTYPair(masterHandle: masterHandle, slaveHandle: slaveHandle)
+    }
+}
+#endif
 
 private final class OutputBuffer: @unchecked Sendable {
     private let lock = NSLock()

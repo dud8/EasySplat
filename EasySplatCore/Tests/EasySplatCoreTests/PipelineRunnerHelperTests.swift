@@ -206,6 +206,63 @@ final class PipelineRunnerHelperTests: XCTestCase {
         XCTAssertEqual(progress?.total, 345)
     }
 
+    func testToolLogFiltering() throws {
+        let root = try TestFileBuilder.makeTempDir()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let runner = makeRunner(projectURL: root)
+
+        XCTAssertTrue(runner.test_shouldEmitToolLogLine("EasySplat: colmap argv: /bin/colmap", isError: false))
+        XCTAssertTrue(runner.test_shouldEmitToolLogLine("warning: low confidence", isError: false))
+        XCTAssertTrue(runner.test_shouldEmitToolLogLine("ERROR: failed to open", isError: false))
+        XCTAssertTrue(runner.test_shouldEmitToolLogLine("something bad", isError: true))
+        XCTAssertFalse(runner.test_shouldEmitToolLogLine("normal progress line", isError: false))
+        XCTAssertFalse(runner.test_shouldEmitToolLogLine("   ", isError: false))
+    }
+
+    func testBrushTrainingPlanForQualityPresets() throws {
+        let root = try TestFileBuilder.makeTempDir()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let runner = makeRunner(projectURL: root)
+
+        let draft = runner.test_brushTrainingPlan(for: PresetSpec(mode: .object, quality: .draft))
+        XCTAssertEqual(draft.totalSteps, 20_000)
+        XCTAssertEqual(draft.exportEvery, 5_000)
+
+        let standard = runner.test_brushTrainingPlan(for: PresetSpec(mode: .object, quality: .standard))
+        XCTAssertEqual(standard.totalSteps, 40_000)
+        XCTAssertEqual(standard.exportEvery, 5_000)
+
+        let ultra = runner.test_brushTrainingPlan(for: PresetSpec(mode: .room, quality: .ultra))
+        XCTAssertEqual(ultra.totalSteps, 80_000)
+        XCTAssertEqual(ultra.exportEvery, 10_000)
+    }
+
+    func testTrainingStatusMessageFormatting() throws {
+        let root = try TestFileBuilder.makeTempDir()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let runner = makeRunner(projectURL: root)
+
+        let progressMessage = runner.test_trainingStatusMessage(
+            elapsed: 65,
+            step: 1000,
+            total: 10000,
+            latestExportStep: nil,
+            totalSteps: 10000
+        )
+        XCTAssertTrue(progressMessage.contains("1,000/10,000 steps"))
+        XCTAssertTrue(progressMessage.contains("running 1m 05s"))
+
+        let exportMessage = runner.test_trainingStatusMessage(
+            elapsed: 90,
+            step: nil,
+            total: nil,
+            latestExportStep: 30000,
+            totalSteps: 60000
+        )
+        XCTAssertTrue(exportMessage.contains("30,000/60,000 steps"))
+        XCTAssertFalse(exportMessage.contains("target"))
+    }
+
     private func makeRunner(projectURL: URL) -> PipelineRunner {
         let vggt = VggtToolchain(root: projectURL, sfmTool: projectURL, python: projectURL, models: projectURL)
         let toolchain = ToolchainPaths(root: projectURL, colmap: projectURL, glomap: projectURL, brush: projectURL, vggt: vggt)

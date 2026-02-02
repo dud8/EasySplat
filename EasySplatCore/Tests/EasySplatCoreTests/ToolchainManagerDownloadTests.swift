@@ -53,6 +53,15 @@ final class ToolchainManagerDownloadTests: XCTestCase {
     }
 
     func testEnsureToolchainHashMismatch() async throws {
+        let previousOverride = getenv("EASYSPLAT_LOCAL_TOOLCHAIN_ROOT").map { String(cString: $0) }
+        unsetenv("EASYSPLAT_LOCAL_TOOLCHAIN_ROOT")
+        defer {
+            if let previousOverride {
+                setenv("EASYSPLAT_LOCAL_TOOLCHAIN_ROOT", previousOverride, 1)
+            } else {
+                unsetenv("EASYSPLAT_LOCAL_TOOLCHAIN_ROOT")
+            }
+        }
         let manifestURL = URL(string: "https://example.com/manifest.json")!
         let artifactURL = URL(string: "https://example.com/toolchain.zip")!
 

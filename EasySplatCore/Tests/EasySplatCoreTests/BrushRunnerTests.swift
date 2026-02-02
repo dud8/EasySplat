@@ -47,16 +47,22 @@ final class BrushRunnerTests: XCTestCase {
 
         var calls: [[String]] = []
         let mock = MockSubprocessRunner(scripts: [
-            .init(path: brush.path, argsPrefix: [dataset.path], result: .init(exitCode: 1, terminationReason: .exit, stdout: "", stderr: "unrecognized subcommand"), onRun: { args in
+            .init(path: brush.path, argsPrefix: ["--total-steps", "200", "--export-every", "20", dataset.path], result: .init(exitCode: 1, terminationReason: .exit, stdout: "", stderr: "unrecognized subcommand"), onRun: { args in
                 calls.append(args)
             }),
-            .init(path: brush.path, argsPrefix: ["train", dataset.path], result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""), onRun: { args in
+            .init(path: brush.path, argsPrefix: ["train", "--total-steps", "200", "--export-every", "20", dataset.path], result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""), onRun: { args in
                 calls.append(args)
             })
         ])
 
         let runner = BrushRunner(runner: mock)
-        try await runner.runTrain(brushPath: brush, datasetPath: dataset, onLog: { _, _ in })
+        try await runner.runTrain(
+            brushPath: brush,
+            datasetPath: dataset,
+            totalSteps: 200,
+            exportEvery: 20,
+            onLog: { _, _ in }
+        )
 
         XCTAssertEqual(calls.count, 2)
         XCTAssertEqual(calls[1].first, "train")
@@ -86,6 +92,34 @@ final class BrushRunnerTests: XCTestCase {
 
         let runner = BrushRunner(runner: mock)
         try await runner.runTrain(brushPath: brush, datasetPath: dataset, onLog: { _, _ in })
+
+        XCTAssertTrue(captured.contains("--total-steps"))
+        XCTAssertTrue(captured.contains("--export-every"))
+    }
+
+    func testRunTrainUsesExplicitSettingsWhenEnvMissing() async throws {
+        let root = try TestFileBuilder.makeTempDir()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let brush = root.appendingPathComponent("brush")
+        try TestFileBuilder.createExecutable(at: brush)
+        let dataset = root.appendingPathComponent("dataset", isDirectory: true)
+        try FileManager.default.createDirectory(at: dataset, withIntermediateDirectories: true)
+
+        var captured: [String] = []
+        let mock = MockSubprocessRunner(scripts: [
+            .init(path: brush.path, argsPrefix: ["--total-steps", "150", "--export-every", "25", dataset.path], result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""), onRun: { args in
+                captured = args
+            })
+        ])
+
+        let runner = BrushRunner(runner: mock)
+        try await runner.runTrain(
+            brushPath: brush,
+            datasetPath: dataset,
+            totalSteps: 150,
+            exportEvery: 25,
+            onLog: { _, _ in }
+        )
 
         XCTAssertTrue(captured.contains("--total-steps"))
         XCTAssertTrue(captured.contains("--export-every"))

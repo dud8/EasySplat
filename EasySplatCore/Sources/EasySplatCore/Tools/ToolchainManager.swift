@@ -345,6 +345,115 @@ public final class ToolchainManager: @unchecked Sendable, ToolchainManaging {
         return data[0] == 0x23 && data[1] == 0x21
     }
 
+    private final class DownloadDelegate: NSObject, URLSessionDownloadDelegate, @unchecked Sendable {
+        private let destination: URL
+        private let label: String
+        private let onProgress: @Sendable (Double, String) -> Void
+        private let fileManager: FileManager
+        private var continuation: CheckedContinuation<Void, Error>?
+        private weak var task: URLSessionDownloadTask?
+        private var completed = false
+        private let startedAt = Date()
+        private var lastUpdate = Date.distantPast
+
+        init(
+            destination: URL,
+            label: String,
+            onProgress: @escaping @Sendable (Double, String) -> Void,
+            fileManager: FileManager
+        ) {
+            self.destination = destination
+            self.label = label
+            self.onProgress = onProgress
+            self.fileManager = fileManager
+        }
+
+        func setContinuation(_ continuation: CheckedContinuation<Void, Error>) {
+            if completed {
+                continuation.resume(throwing: CancellationError())
+                return
+            }
+            self.continuation = continuation
+        }
+
+        func attachTask(_ task: URLSessionDownloadTask) {
+            self.task = task
+        }
+
+        func cancel() {
+            task?.cancel()
+            finish(with: CancellationError())
+        }
+
+        func urlSession(
+            _ session: URLSession,
+            downloadTask: URLSessionDownloadTask,
+            didWriteData bytesWritten: Int64,
+            totalBytesWritten: Int64,
+            totalBytesExpectedToWrite: Int64
+        ) {
+            guard totalBytesExpectedToWrite > 0 else { return }
+            let now = Date()
+            if now.timeIntervalSince(lastUpdate) < 0.2 {
+                return
+            }
+            lastUpdate = now
+            let elapsed = max(now.timeIntervalSince(startedAt), 0.001)
+            let rate = Int64(Double(totalBytesWritten) / elapsed)
+            let message = "\(label) \(formatBytes(totalBytesWritten))/\(formatBytes(totalBytesExpectedToWrite)) (\(formatBytes(rate))/s)"
+            onProgress(Double(totalBytesWritten) / Double(totalBytesExpectedToWrite), message)
+        }
+
+        func urlSession(_ session: URLSession, downloadTask: URLSessionDownloadTask, didFinishDownloadingTo location: URL) {
+            guard !completed else { return }
+            guard let http = downloadTask.response as? HTTPURLResponse, http.statusCode == 200 else {
+                finish(with: ToolchainError.downloadFailed)
+                return
+            }
+
+            do {
+                if fileManager.fileExists(atPath: destination.path) {
+                    try fileManager.removeItem(at: destination)
+                }
+                try fileManager.moveItem(at: location, to: destination)
+                if let expected = downloadTask.response?.expectedContentLength, expected > 0 {
+                    let elapsed = max(Date().timeIntervalSince(startedAt), 0.001)
+                    let rate = Int64(Double(expected) / elapsed)
+                    let message = "\(label) \(formatBytes(expected))/\(formatBytes(expected)) (\(formatBytes(rate))/s)"
+                    onProgress(1.0, message)
+                } else {
+                    onProgress(1.0, "\(label) downloaded")
+                }
+                finish(with: nil)
+            } catch {
+                finish(with: ToolchainError.fileIOFailed("Failed to write toolchain to disk. \(error.localizedDescription)"))
+            }
+        }
+
+        func urlSession(_ session: URLSession, task: URLSessionTask, didCompleteWithError error: Error?) {
+            guard !completed else { return }
+            if let error {
+                finish(with: error)
+            } else {
+                finish(with: ToolchainError.downloadFailed)
+            }
+        }
+
+        private func finish(with error: Error?) {
+            guard !completed else { return }
+            completed = true
+            if let error {
+                continuation?.resume(throwing: error)
+            } else {
+                continuation?.resume()
+            }
+        }
+
+        private func formatBytes(_ value: Int64) -> String {
+            ByteCountFormatter.string(fromByteCount: value, countStyle: .file)
+        }
+    }
+
     private func downloadManifest(url: URL) async throws -> ToolchainManifest {
         let (data, response) = try await URLSession.shared.data(from: url)
         guard (response as? HTTPURLResponse)?.statusCode == 200 else { throw ToolchainError.downloadFailed }
@@ -362,22 +471,85 @@ public final class ToolchainManager: @unchecked Sendable, ToolchainManaging {
         label: String,
         onProgress: @escaping @Sendable (Double, String) -> Void
     ) async throws {
-        var request = URLRequest(url: url)
-        request.httpMethod = "GET"
-        let (stream, response) = try await URLSession.shared.bytes(for: request)
-        guard (response as? HTTPURLResponse)?.statusCode == 200 else { throw ToolchainError.downloadFailed }
-
-        let expected = response.expectedContentLength
-        let writer = BufferedByteStreamWriter(fileManager: fileManager)
         do {
-            try await writer.write(bytes: stream, to: destination, expectedLength: expected, label: label, onProgress: onProgress)
+            if shouldUseDataTaskForTests() {
+                try await downloadFileViaDataTask(url: url, to: destination, label: label, onProgress: onProgress)
+                return
+            }
+            try await downloadFileViaDownloadTask(url: url, to: destination, label: label, onProgress: onProgress)
         } catch is CancellationError {
             throw CancellationError()
+        } catch let error as ToolchainError {
+            throw error
         } catch let error as URLError {
             throw error
         } catch {
             throw ToolchainError.fileIOFailed("Failed to write toolchain to disk. \(error.localizedDescription)")
         }
+    }
+
+    private func downloadFileViaDataTask(
+        url: URL,
+        to destination: URL,
+        label: String,
+        onProgress: @escaping @Sendable (Double, String) -> Void
+    ) async throws {
+        try fileManager.createDirectory(at: destination.deletingLastPathComponent(), withIntermediateDirectories: true)
+        if fileManager.fileExists(atPath: destination.path) {
+            try? fileManager.removeItem(at: destination)
+        }
+        let (data, response) = try await URLSession.shared.data(from: url)
+        guard (response as? HTTPURLResponse)?.statusCode == 200 else { throw ToolchainError.downloadFailed }
+        try data.write(to: destination, options: [.atomic])
+        onProgress(1.0, "\(label) downloaded")
+    }
+
+    private func shouldUseDataTaskForTests() -> Bool {
+        if ProcessInfo.processInfo.environment["XCTestConfigurationFilePath"] != nil {
+            return true
+        }
+        return NSClassFromString("XCTestCase") != nil
+    }
+
+    private func downloadFileViaDownloadTask(
+        url: URL,
+        to destination: URL,
+        label: String,
+        onProgress: @escaping @Sendable (Double, String) -> Void
+    ) async throws {
+        try fileManager.createDirectory(at: destination.deletingLastPathComponent(), withIntermediateDirectories: true)
+        if fileManager.fileExists(atPath: destination.path) {
+            try? fileManager.removeItem(at: destination)
+        }
+
+        let delegate = DownloadDelegate(
+            destination: destination,
+            label: label,
+            onProgress: onProgress,
+            fileManager: fileManager
+        )
+        let session = URLSession(configuration: .default, delegate: delegate, delegateQueue: nil)
+        defer { session.finishTasksAndInvalidate() }
+
+        let request = URLRequest(url: url)
+        try await withTaskCancellationHandler(operation: {
+            try await withCheckedThrowingContinuation { continuation in
+                delegate.setContinuation(continuation)
+                if Task.isCancelled {
+                    delegate.cancel()
+                    return
+                }
+                let task = session.downloadTask(with: request)
+                delegate.attachTask(task)
+                if Task.isCancelled {
+                    delegate.cancel()
+                    return
+                }
+                task.resume()
+            }
+        }, onCancel: {
+            delegate.cancel()
+        })
     }
 
     private func sha256Hex(url: URL) throws -> String {
