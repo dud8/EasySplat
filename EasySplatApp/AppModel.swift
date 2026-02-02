@@ -27,12 +27,15 @@ final class AppModel: ObservableObject {
     @Published var progress: Double? = nil
     @Published var statusTitle: String = "Ready to start"
     @Published var statusDetail: String? = nil
+    @Published var stageStartedAt: Date? = nil
+    @Published var lastPipelineEventAt: Date? = nil
     @Published var logLines: [String] = []
     @Published var lastError: String? = nil
     @Published var errorDetails: String? = nil
     @Published var outputPlyURL: URL? = nil
     @Published var currentProjectURL: URL? = nil
     @Published var toolchainPaths: ToolchainPaths? = nil
+    @Published private(set) var stopAction: StopAction? = nil
 
     @Published var captureMode: CaptureMode = .object
     @Published var qualityPreset: QualityPreset = .standard
@@ -48,6 +51,18 @@ final class AppModel: ObservableObject {
     private var lastProgressLogAt: Date = .distantPast
     private var lastProgressLogMessage: String = ""
     private var lastProgressLogStage: PipelineStage? = nil
+    private var lastTrainingImagesBucket: Int = -1
+    private var lastTrainingSparseBucket: Int = -1
+    private var lastTrainingStepsBucket: Int = -1
+
+    enum StopAction {
+        case keepProject
+        case deleteProject
+    }
+
+    var isStopping: Bool {
+        stopAction != nil
+    }
 
     var processingDetailsText: String? {
         if lastError != nil {
@@ -155,19 +170,33 @@ final class AppModel: ObservableObject {
     }
 
     func cancelCurrentProject(deleteProject: Bool) {
-        currentTask?.cancel()
-        currentTask = nil
-        let projectURL = currentProjectURL
-        reset()
-        viewState = .home
-        if deleteProject, let projectURL {
-            try? FileManager.default.removeItem(at: projectURL)
+        guard currentTask != nil else {
+            let projectURL = currentProjectURL
+            reset()
+            viewState = .home
+            if deleteProject, let projectURL {
+                try? FileManager.default.removeItem(at: projectURL)
+            }
+            refreshProjectSummaries()
+            return
         }
-        refreshProjectSummaries()
+
+        stopAction = deleteProject ? .deleteProject : .keepProject
+        lastError = nil
+        errorDetails = nil
+        statusTitle = deleteProject ? "Stopping and deleting…" : "Saving progress…"
+        statusDetail = "Stopping at the next safe point (up to 15 seconds)…"
+        progress = nil
+        currentTask?.cancel()
     }
 
     private func startProject(input: InputSpec, title: String) async {
-        defer { currentTask = nil }
+        defer {
+            currentTask = nil
+            if stopAction != nil {
+                completeStop()
+            }
+        }
         reset()
         viewState = .processing
         statusTitle = "Preparing project"
@@ -213,6 +242,9 @@ final class AppModel: ObservableObject {
         } catch is CancellationError {
             return
         } catch {
+            if stopAction != nil {
+                return
+            }
             // PipelineRunner emits `.pipelineFailed(...)` with better user/debug messages. Avoid overwriting
             // those with the default `Error.localizedDescription`.
             if lastError == nil {
@@ -239,7 +271,12 @@ final class AppModel: ObservableObject {
     }
 
     private func resumeProjectTask(at url: URL) async {
-        defer { currentTask = nil }
+        defer {
+            currentTask = nil
+            if stopAction != nil {
+                completeStop()
+            }
+        }
         reset()
         viewState = .processing
         statusTitle = "Preparing project"
@@ -289,6 +326,9 @@ final class AppModel: ObservableObject {
         } catch is CancellationError {
             return
         } catch {
+            if stopAction != nil {
+                return
+            }
             // PipelineRunner emits `.pipelineFailed(...)` with better user/debug messages. Avoid overwriting
             // those with the default `Error.localizedDescription`.
             if lastError == nil {
@@ -315,31 +355,41 @@ final class AppModel: ObservableObject {
     }
 
     fileprivate func handle(event: PipelineEvent) {
+        let now = Date()
         switch event {
         case .stageStarted(let stage):
             self.stage = stage
             self.progress = nil
             self.statusTitle = stage.displayName
             self.statusDetail = nil
+            self.stageStartedAt = now
+            self.lastPipelineEventAt = now
             appendLogLine("[\(stage.displayName)] started")
         case .stageProgress(let stage, let fraction, let message):
             self.stage = stage
             self.progress = fraction < 0 ? nil : fraction
             self.statusTitle = stage.displayName
             self.statusDetail = message
+            self.lastPipelineEventAt = now
             maybeAppendProgressLog(stage: stage, message: message)
         case .stageLog(let stage, let line, let isError):
             let errPrefix = isError ? "[err] " : ""
+            self.lastPipelineEventAt = now
             appendLogLine("\(errPrefix)[\(stage.displayName)] \(line)")
         case .stageFinished(let stage):
             self.stage = stage
             self.progress = 1.0
+            self.lastPipelineEventAt = now
             appendLogLine("[\(stage.displayName)] finished")
         case .pipelineFailed(_, let userMessage, let debugMessage):
+            if stopAction != nil {
+                return
+            }
             self.lastError = userMessage
             self.statusTitle = userMessage
             self.statusDetail = nil
             self.progress = nil
+            self.lastPipelineEventAt = now
             self.errorDetails = debugMessage
             appendLogLine("[err] \(userMessage)")
         }
@@ -348,6 +398,36 @@ final class AppModel: ObservableObject {
     private func maybeAppendProgressLog(stage: PipelineStage, message: String) {
         let trimmed = message.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return }
+
+        if stage == .trainBrush {
+            if trimmed.hasPrefix("Preparing training dataset (images)") {
+                if let ratio = parseProgressRatio(trimmed) {
+                    let bucket = bucketedPercent(current: ratio.current, total: ratio.total)
+                    if bucket == lastTrainingImagesBucket {
+                        return
+                    }
+                    lastTrainingImagesBucket = bucket
+                }
+            } else if trimmed.hasPrefix("Preparing training dataset (sparse)") {
+                if let ratio = parseProgressRatio(trimmed) {
+                    let bucket = bucketedPercent(current: ratio.current, total: ratio.total)
+                    if bucket == lastTrainingSparseBucket {
+                        return
+                    }
+                    lastTrainingSparseBucket = bucket
+                }
+            } else if trimmed.hasPrefix("Training model") {
+                if let ratio = parseProgressRatio(trimmed) {
+                    let bucket = bucketedPercent(current: ratio.current, total: ratio.total)
+                    if bucket == lastTrainingStepsBucket {
+                        return
+                    }
+                    lastTrainingStepsBucket = bucket
+                } else {
+                    return
+                }
+            }
+        }
 
         // Keep "Details" verbose enough to be useful, but don't spam one line per frame.
         let now = Date()
@@ -365,6 +445,43 @@ final class AppModel: ObservableObject {
         appendLogLine("[\(stage.displayName)] \(trimmed)")
     }
 
+    private func parseProgressRatio(_ message: String) -> (current: Int, total: Int)? {
+        let chars = Array(message)
+        var index = 0
+        while index < chars.count {
+            if chars[index].isNumber {
+                let start = index
+                var end = index
+                while end < chars.count, chars[end].isNumber || chars[end] == "," {
+                    end += 1
+                }
+                if end < chars.count, chars[end] == "/" {
+                    let secondStart = end + 1
+                    var secondEnd = secondStart
+                    while secondEnd < chars.count, chars[secondEnd].isNumber || chars[secondEnd] == "," {
+                        secondEnd += 1
+                    }
+                    if secondStart < secondEnd {
+                        let left = String(chars[start..<end]).replacingOccurrences(of: ",", with: "")
+                        let right = String(chars[secondStart..<secondEnd]).replacingOccurrences(of: ",", with: "")
+                        if let current = Int(left), let total = Int(right) {
+                            return (current, total)
+                        }
+                    }
+                }
+                index = end
+            }
+            index += 1
+        }
+        return nil
+    }
+
+    private func bucketedPercent(current: Int, total: Int, bucketSize: Int = 10) -> Int {
+        guard total > 0 else { return 0 }
+        let percent = Int((Double(current) / Double(total) * 100.0).rounded(.down))
+        return max(0, (percent / bucketSize) * bucketSize)
+    }
+
     private func appendLogLine(_ line: String) {
         logLines.append(line)
         if logLines.count > 500 {
@@ -377,12 +494,34 @@ final class AppModel: ObservableObject {
         progress = nil
         statusTitle = "Ready"
         statusDetail = nil
+        stageStartedAt = nil
+        lastPipelineEventAt = nil
         logLines = []
+        lastProgressLogAt = .distantPast
+        lastProgressLogMessage = ""
+        lastProgressLogStage = nil
+        lastTrainingImagesBucket = -1
+        lastTrainingSparseBucket = -1
+        lastTrainingStepsBucket = -1
         lastError = nil
         errorDetails = nil
         outputPlyURL = nil
         toolchainPaths = nil
         currentProjectURL = nil
+        stopAction = nil
+    }
+
+    private func completeStop() {
+        let action = stopAction
+        stopAction = nil
+
+        let projectURL = currentProjectURL
+        reset()
+        viewState = .home
+        if action == .deleteProject, let projectURL {
+            try? FileManager.default.removeItem(at: projectURL)
+        }
+        refreshProjectSummaries()
     }
 
     private func loadPipelineLogTail(projectURL: URL, maxLines: Int = 200, maxBytes: Int = 64 * 1024) -> [String] {

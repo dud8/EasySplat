@@ -60,7 +60,6 @@ private struct IndeterminateBar: View {
     let shouldShimmer: Bool
 
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
-    @State private var startTime = Date().timeIntervalSinceReferenceDate
 
     var body: some View {
         GeometryReader { proxy in
@@ -76,15 +75,14 @@ private struct IndeterminateBar: View {
                     .offset(x: (width - segmentWidth) / 2)
             } else {
                 TimelineView(.animation) { context in
-                    let elapsed = context.date.timeIntervalSinceReferenceDate - startTime
                     let duration = 1.35
-                    let phase = CGFloat((elapsed / duration).truncatingRemainder(dividingBy: 1.0))
+                    let now = context.date.timeIntervalSinceReferenceDate
+                    let phase = CGFloat(now.truncatingRemainder(dividingBy: duration) / duration)
                     let x = startX + travel * phase
 
                     RoundedRectangle(cornerRadius: cornerRadius)
                         .fill(fillColor)
                         .frame(width: segmentWidth, height: proxy.size.height)
-                        .offset(x: x)
                         .overlay {
                             if shouldShimmer {
                                 ShimmerOverlay(
@@ -100,6 +98,7 @@ private struct IndeterminateBar: View {
                                     )
                             }
                         }
+                        .offset(x: x)
                 }
             }
         }
@@ -112,8 +111,6 @@ private struct ShimmerOverlay: View {
     let gapDuration: Double
     let intensity: ShimmerIntensity
 
-    @State private var startTime = Date().timeIntervalSinceReferenceDate
-
     var body: some View {
         if !isActive {
             Color.clear
@@ -121,9 +118,9 @@ private struct ShimmerOverlay: View {
             TimelineView(.animation) { context in
                 GeometryReader { proxy in
                     let size = proxy.size
-                    let elapsed = context.date.timeIntervalSinceReferenceDate - startTime
+                    let now = context.date.timeIntervalSinceReferenceDate
                     let cycleDuration = passDuration + gapDuration
-                    let cycleTime = elapsed.truncatingRemainder(dividingBy: cycleDuration)
+                    let cycleTime = now.truncatingRemainder(dividingBy: cycleDuration)
 
                     if cycleTime <= passDuration {
                         let phase = CGFloat(cycleTime / passDuration)

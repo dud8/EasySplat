@@ -25,7 +25,7 @@ struct LogDrawerView: View {
 
             if expanded {
                 ScrollView {
-                    VStack(alignment: .leading, spacing: 4) {
+                    LazyVStack(alignment: .leading, spacing: 4) {
                         if let detailsText, !detailsText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
                             Text(detailsText)
                                 .font(.caption.monospaced())

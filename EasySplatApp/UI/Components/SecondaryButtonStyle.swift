@@ -1,13 +1,21 @@
 import SwiftUI
 
 struct SecondaryButtonStyle: ButtonStyle {
+    enum Variant {
+        case standard
+        case subtleAccent
+    }
+
+    var variant: Variant = .standard
+
     func makeBody(configuration: Configuration) -> some View {
-        SecondaryButtonBody(configuration: configuration)
+        SecondaryButtonBody(configuration: configuration, variant: variant)
     }
 }
 
 private struct SecondaryButtonBody: View {
     let configuration: ButtonStyle.Configuration
+    let variant: SecondaryButtonStyle.Variant
 
     @Environment(\.isEnabled) private var isEnabled
     @Environment(\.controlSize) private var controlSize
@@ -29,6 +37,10 @@ private struct SecondaryButtonBody: View {
                     .fill(Theme.surface)
                     .overlay(
                         RoundedRectangle(cornerRadius: Theme.Radius.button, style: .continuous)
+                            .fill(baseTintOverlayColor)
+                    )
+                    .overlay(
+                        RoundedRectangle(cornerRadius: Theme.Radius.button, style: .continuous)
                             .fill(overlayColor)
                     )
                     .overlay(
@@ -44,6 +56,16 @@ private struct SecondaryButtonBody: View {
             }
             .animation(reduceMotion ? nil : Theme.Motion.hover, value: isHovering)
             .animation(reduceMotion ? nil : Theme.Motion.press, value: configuration.isPressed)
+    }
+
+    private var baseTintOverlayColor: Color {
+        guard isEnabled else { return Color.clear }
+        switch variant {
+        case .standard:
+            return Color.clear
+        case .subtleAccent:
+            return Color.clear
+        }
     }
 
     private var overlayColor: Color {
@@ -69,7 +91,12 @@ private struct SecondaryButtonBody: View {
         if isHovering {
             return Theme.accent.opacity(0.25)
         }
-        return Theme.border
+        switch variant {
+        case .standard:
+            return Theme.border
+        case .subtleAccent:
+            return Theme.accent.opacity(0.14)
+        }
     }
 
     private var resolvedScale: CGFloat {
