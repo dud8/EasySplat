@@ -271,6 +271,16 @@ final class PipelineRunnerHelperTests: XCTestCase {
         XCTAssertTrue(progressMessage.contains("1,000/10,000 steps"))
         XCTAssertTrue(progressMessage.contains("running 1m 05s"))
 
+        let etaMessage = runner.test_trainingStatusMessage(
+            elapsed: 65,
+            step: 1000,
+            total: 10000,
+            latestExportStep: nil,
+            totalSteps: 10000,
+            etaSeconds: 754
+        )
+        XCTAssertTrue(etaMessage.contains("ETA 12m 34s"))
+
         let exportMessage = runner.test_trainingStatusMessage(
             elapsed: 90,
             step: nil,
@@ -280,6 +290,27 @@ final class PipelineRunnerHelperTests: XCTestCase {
         )
         XCTAssertTrue(exportMessage.contains("30,000/60,000 steps"))
         XCTAssertFalse(exportMessage.contains("target"))
+    }
+
+    func testTrainingEtaEstimatorThresholdsAndSmoothing() {
+        let root = try? TestFileBuilder.makeTempDir()
+        defer {
+            if let root {
+                try? FileManager.default.removeItem(at: root)
+            }
+        }
+        let runner = makeRunner(projectURL: root ?? URL(fileURLWithPath: "/tmp"))
+
+        let early = runner.test_trainingEtaEstimate(rates: [1, 1, 1, 1], step: 25, total: 100)
+        XCTAssertNil(early)
+
+        let eta = runner.test_trainingEtaEstimate(rates: [1, 1, 1, 1, 1], step: 25, total: 100)
+        XCTAssertNotNil(eta)
+        XCTAssertEqual(eta ?? 0, 75, accuracy: 0.001)
+
+        let smoothed = runner.test_trainingEtaEstimate(rates: [1, 1, 1, 1, 1, 2], step: 25, total: 100)
+        XCTAssertNotNil(smoothed)
+        XCTAssertEqual(smoothed ?? 0, 62.5, accuracy: 0.1)
     }
 
     private func makeRunner(projectURL: URL) -> PipelineRunner {

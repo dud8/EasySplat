@@ -167,6 +167,54 @@ final class AppModelTests: XCTestCase {
         XCTAssertTrue(text.contains("Logs:"))
     }
 
+    func testTrainingConsentRememberedSkipsPrompt() async {
+        let tempBase = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        let model = AppModel(toolchainManager: MockToolchainManager(), projectBaseURL: tempBase) { _, config in
+            MockPipelineRunner(projectURL: tempBase, config: config)
+        }
+        UserDefaults.standard.set(true, forKey: AppModel.trainingConsentRememberedKey)
+        defer { UserDefaults.standard.removeObject(forKey: AppModel.trainingConsentRememberedKey) }
+
+        let allowed = await model.awaitTrainingConsent()
+        XCTAssertTrue(allowed)
+        XCTAssertFalse(model.isShowingTrainingConsent)
+    }
+
+    func testTrainingConsentShowsAndResolves() async {
+        let tempBase = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        let model = AppModel(toolchainManager: MockToolchainManager(), projectBaseURL: tempBase) { _, config in
+            MockPipelineRunner(projectURL: tempBase, config: config)
+        }
+        UserDefaults.standard.removeObject(forKey: AppModel.trainingConsentRememberedKey)
+
+        let task = Task { await model.awaitTrainingConsent() }
+        await Task.yield()
+
+        XCTAssertTrue(model.isShowingTrainingConsent)
+        model.resolveTrainingConsent(accepted: true, remember: false)
+        let allowed = await task.value
+        XCTAssertTrue(allowed)
+    }
+
+    func testTrainingConsentCancellationReturnsFalse() async {
+        let tempBase = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        let model = AppModel(toolchainManager: MockToolchainManager(), projectBaseURL: tempBase) { _, config in
+            MockPipelineRunner(projectURL: tempBase, config: config)
+        }
+        UserDefaults.standard.removeObject(forKey: AppModel.trainingConsentRememberedKey)
+
+        let task = Task { await model.awaitTrainingConsent() }
+        await Task.yield()
+
+        XCTAssertTrue(model.isShowingTrainingConsent)
+        task.cancel()
+        await Task.yield()
+
+        let allowed = await task.value
+        XCTAssertFalse(allowed)
+        XCTAssertFalse(model.isShowingTrainingConsent)
+    }
+
     private func waitForViewState(model: AppModel, state: AppModel.ViewState, timeout: TimeInterval = 2.0) async throws {
         let deadline = Date().addingTimeInterval(timeout)
         while Date() < deadline {

@@ -35,10 +35,16 @@ public final class PipelineRunner: @unchecked Sendable {
     public struct PipelineConfig: Sendable {
         public var toolchain: ToolchainPaths
         public var preset: PresetSpec
+        public var trainingGate: (@Sendable () async throws -> Void)?
 
-        public init(toolchain: ToolchainPaths, preset: PresetSpec) {
+        public init(
+            toolchain: ToolchainPaths,
+            preset: PresetSpec,
+            trainingGate: (@Sendable () async throws -> Void)? = nil
+        ) {
             self.toolchain = toolchain
             self.preset = preset
+            self.trainingGate = trainingGate
         }
     }
 
@@ -201,7 +207,6 @@ public final class PipelineRunner: @unchecked Sendable {
                     try self.resetDirectory(paths.framesSelectedURL)
                     self.removeIfExists(paths.framesSelectedManifestURL)
                     self.removeIfExists(paths.sfmPairListURL)
-                    let selector = FrameSelector()
                     var groups: [SelectedFrameGroup] = []
 
                     if metadata.input.hasVideos {
@@ -211,22 +216,38 @@ public final class PipelineRunner: @unchecked Sendable {
                             try Task.checkCancellation()
                             let rawDir = rawFramesDirectory(index: index, paths: paths)
                             let rawFrames = try loadImages(in: rawDir)
-                            let perVideoTarget = targetCountForVideo(index: index, total: videos.count, targetCount: targetFrames)
-                            if perVideoTarget == 0 {
-                                continue
-                            }
-                            let chosen = selector.selectFrames(from: rawFrames, targetCount: perVideoTarget, mode: .smartExtracted) { fraction, message in
-                                let scaled = (Double(index) / totalVideos) + (fraction / totalVideos)
-                                emit(.stageProgress(stage: .selectFrames, fraction: scaled, message: message))
-                            }
+                            guard !rawFrames.isEmpty else { continue }
+                            let sharpnessByFrame = scoreSharpnessForFrames(
+                                rawFrames,
+                                progress: { fraction, message in
+                                    let scaled = (Double(index) / totalVideos) + (fraction / totalVideos)
+                                    emit(.stageProgress(stage: .selectFrames, fraction: scaled, message: message))
+                                }
+                            )
+                            let filterResult = filterVeryBlurryVideoFrames(
+                                frames: rawFrames,
+                                sharpnessByFrame: sharpnessByFrame,
+                                profile: frameProfile,
+                                maxDropFraction: 0.25,
+                                floorScale: 0.5
+                            )
+                            let chosen = filterResult.frames
                             if !chosen.isEmpty {
                                 let groupId = String(format: "video_%03d", index)
                                 groups.append(.init(id: groupId, frames: chosen, isVideo: true))
-                                emit(.stageLog(
-                                    stage: .selectFrames,
-                                    line: "Selected \(chosen.count) of \(rawFrames.count) frames from \(groupId).",
-                                    isError: false
-                                ))
+                                if filterResult.dropped > 0 {
+                                    emit(.stageLog(
+                                        stage: .selectFrames,
+                                        line: "Filtered \(filterResult.dropped) very blurry frame(s) from \(groupId) (kept \(chosen.count) of \(rawFrames.count)).",
+                                        isError: false
+                                    ))
+                                } else {
+                                    emit(.stageLog(
+                                        stage: .selectFrames,
+                                        line: "Kept all extracted frames from \(groupId) (no downsampling).",
+                                        isError: false
+                                    ))
+                                }
                             }
                         }
                     }
@@ -1176,6 +1197,9 @@ public final class PipelineRunner: @unchecked Sendable {
             if shouldRunStage(.trainBrush) {
                 currentStage = .trainBrush
                 emit(.stageStarted(stage: .trainBrush))
+                if let trainingGate = config.trainingGate {
+                    try await trainingGate()
+                }
                 let brushPlan = brushTrainingPlan(for: metadata.preset)
                 let overrideExportEvery = brushExportEveryOverride()
                 let adaptiveExportEvery = overrideExportEvery ?? brushAdaptiveExportEvery(
@@ -1183,28 +1207,7 @@ public final class PipelineRunner: @unchecked Sendable {
                     logURL: paths.brushLogURL
                 )
                 let effectiveExportEvery = adaptiveExportEvery ?? brushPlan.exportEvery
-                if let totalSteps = brushPlan.totalSteps {
-                    emit(.stageLog(
-                        stage: .trainBrush,
-                        line: "Training target: \(formatStepCount(totalSteps)) steps",
-                        isError: false
-                    ))
-                }
-                if let exportEvery = effectiveExportEvery {
-                    let label: String
-                    if overrideExportEvery != nil {
-                        label = "Snapshots every \(formatStepCount(exportEvery)) steps (override)"
-                    } else if adaptiveExportEvery != nil {
-                        label = "Snapshots every \(formatStepCount(exportEvery)) steps (adaptive)"
-                    } else {
-                        label = "Snapshots every \(formatStepCount(exportEvery)) steps"
-                    }
-                    emit(.stageLog(
-                        stage: .trainBrush,
-                        line: label,
-                        isError: false
-                    ))
-                }
+                // Suppress non-step training logs; details should only update on the configured step cadence.
                 let datasetURL = try prepareBrushDataset(paths: paths, progress: { _, message in
                     // Dataset prep progress is noisy; keep the bar indeterminate until training begins.
                     emit(.stageProgress(stage: .trainBrush, fraction: -1.0, message: message))
@@ -1214,10 +1217,11 @@ public final class PipelineRunner: @unchecked Sendable {
                     elapsed: 0,
                     progress: nil,
                     latestExportStep: nil,
-                    totalSteps: brushPlan.totalSteps
+                    totalSteps: brushPlan.totalSteps,
+                    etaSeconds: nil
                 )
                 emit(.stageProgress(stage: .trainBrush, fraction: -1.0, message: initialStatus))
-                emit(.stageLog(stage: .trainBrush, line: "Running Brush training...", isError: false))
+                // Suppress non-step training logs; details should only update on the configured step cadence.
 
                 let brushToolLog = ToolLogWriter(fileURL: paths.brushLogURL, toolName: "brush")
                 brushToolLog.beginSection(
@@ -1227,7 +1231,7 @@ public final class PipelineRunner: @unchecked Sendable {
                         "tool": self.config.toolchain.brush.path
                     ]
                 )
-                emit(.stageLog(stage: .trainBrush, line: "Brush tool log: \(paths.brushLogURL.lastPathComponent)", isError: false))
+                // Suppress non-step training logs; details should only update on the configured step cadence.
 
                 // Brush can take a long time and may not emit newline-delimited logs frequently.
                 // Poll for exported .ply files so the user sees forward progress.
@@ -1255,6 +1259,8 @@ public final class PipelineRunner: @unchecked Sendable {
                 let statusGate = TrainingStatusGate()
                 let exportStepBox = BrushExportStepBox()
                 let rateBox = BrushTrainingRateBox()
+                let etaEstimator = BrushTrainingEtaEstimator()
+                let stepLogGate = BrushTrainingStepLogGate(stepInterval: 1_000)
                 let snapshotManager = BrushSnapshotManager(
                     defaultExportEvery: effectiveExportEvery,
                     minSteps: Self.brushSnapshotMinSteps(),
@@ -1272,16 +1278,21 @@ public final class PipelineRunner: @unchecked Sendable {
                         let f = Double(progress.step) / Double(progress.total)
                         return min(0.99, max(0.0, f))
                     }()
+                    let etaSeconds: TimeInterval? = {
+                        guard let progress else { return nil }
+                        return etaEstimator.estimateRemainingSeconds(step: progress.step, total: progress.total)
+                    }()
                     let status = self.trainingStatusMessage(
                         elapsed: elapsed,
                         progress: progress,
                         latestExportStep: latestExportStep,
-                        totalSteps: brushPlan.totalSteps
+                        totalSteps: brushPlan.totalSteps,
+                        etaSeconds: etaSeconds
                     )
                     emit(.stageProgress(stage: .trainBrush, fraction: fraction, message: status))
                 }
 
-                let monitorTask = Task { [trainingURL = paths.trainingURL, emitTrainingStatus, exportStepBox, snapshotManager, rateBox] in
+                let monitorTask = Task { [trainingURL = paths.trainingURL, emitTrainingStatus, exportStepBox, snapshotManager, rateBox, self] in
                     var lastSeen: String? = nil
                     var lastExportCheckAt = Date.distantPast
                     let exportCheckInterval: TimeInterval = 5.0
@@ -1295,6 +1306,7 @@ public final class PipelineRunner: @unchecked Sendable {
                                     lastSeen = name
                                     if let step = export.step {
                                         exportStepBox.update(step: step)
+                                        self.updateBrushResumeSnapshot(from: export.file, trainingURL: trainingURL)
                                         let decision = snapshotManager.handleSnapshot(
                                             file: export.file,
                                             step: step,
@@ -1304,14 +1316,10 @@ public final class PipelineRunner: @unchecked Sendable {
                                             try? FileManager.default.removeItem(at: deleteURL)
                                         }
                                         if decision.keep {
-                                            emit(.stageLog(
-                                                stage: .trainBrush,
-                                                line: "Saved a snapshot at \(formatStepCount(step)) steps",
-                                                isError: false
-                                            ))
+                                            // Keep snapshots silently; training logs must be step-gated.
                                         }
                                     } else {
-                                        emit(.stageLog(stage: .trainBrush, line: "Saved a preview model", isError: false))
+                                        // Keep snapshots silently; training logs must be step-gated.
                                     }
                                 }
                             }
@@ -1321,6 +1329,10 @@ public final class PipelineRunner: @unchecked Sendable {
                     }
                 }
                 defer { monitorTask.cancel() }
+
+                defer {
+                    updateResumeSnapshotFromLatestExport(trainingURL: paths.trainingURL)
+                }
 
                 try await self.tooling.brush.runTrain(
                     brushPath: self.config.toolchain.brush,
@@ -1337,9 +1349,25 @@ public final class PipelineRunner: @unchecked Sendable {
                            progress.step <= progress.total {
                             brushProgress.update(step: progress.step, total: progress.total)
                             emitTrainingStatus(Date())
+                            if stepLogGate.shouldEmit(step: progress.step) {
+                                let now = Date()
+                                let etaSeconds = etaEstimator.estimateRemainingSeconds(
+                                    step: progress.step,
+                                    total: progress.total
+                                )
+                                let message = self.trainingStatusMessage(
+                                    elapsed: now.timeIntervalSince(trainingStartedAt),
+                                    progress: progress,
+                                    latestExportStep: exportStepBox.latestStep(),
+                                    totalSteps: brushPlan.totalSteps,
+                                    etaSeconds: etaSeconds
+                                )
+                                emit(.stageLog(stage: .trainBrush, line: message, isError: false))
+                            }
                         }
                         if let rate = self.brushTrainStepRate(from: cleaned) {
                             rateBox.update(rate: rate)
+                            etaEstimator.update(rate: rate)
                         }
 
                         // Brush tends to write status spinners and "ok" lines to stderr, often via "\r"
@@ -1357,8 +1385,8 @@ public final class PipelineRunner: @unchecked Sendable {
                         let looksErrorish = Self.looksLikeErrorishLine(lower)
                         let effectiveIsErr = isErr && looksErrorish
 
-                        if Self.shouldEmitToolLogLine(trimmed, isError: effectiveIsErr) {
-                            emit(.stageLog(stage: .trainBrush, line: trimmed, isError: effectiveIsErr))
+                        if effectiveIsErr, Self.shouldEmitToolLogLine(trimmed, isError: effectiveIsErr) {
+                            emit(.stageLog(stage: .trainBrush, line: trimmed, isError: true))
                         }
                     }
                 )
@@ -2085,6 +2113,67 @@ private extension PipelineRunner {
             .sorted { $0.lastPathComponent < $1.lastPathComponent }
     }
 
+    struct BlurFilterResult: Sendable {
+        let frames: [URL]
+        let dropped: Int
+    }
+
+    func scoreSharpnessForFrames(
+        _ frames: [URL],
+        progress: (Double, String) -> Void
+    ) -> [URL: Double] {
+        guard !frames.isEmpty else { return [:] }
+        let total = Double(frames.count)
+        var results: [URL: Double] = [:]
+        results.reserveCapacity(frames.count)
+        for (index, url) in frames.enumerated() {
+            if let score = try? FrameScoring.scoreFrame(at: url) {
+                results[url] = max(score.blurScore, score.laplacianScore)
+            }
+            if index % 10 == 0 || index + 1 == frames.count {
+                let fraction = min(Double(index + 1) / total, 1.0)
+                progress(fraction, "Analyzing frame sharpness")
+            }
+        }
+        return results
+    }
+
+    func filterVeryBlurryVideoFrames(
+        frames: [URL],
+        sharpnessByFrame: [URL: Double],
+        profile: FrameExtractionProfile,
+        maxDropFraction: Double,
+        floorScale: Double
+    ) -> BlurFilterResult {
+        guard !frames.isEmpty else { return BlurFilterResult(frames: [], dropped: 0) }
+        let safeFraction = max(0.0, min(1.0, maxDropFraction))
+        let maxDropCount = Int((Double(frames.count) * safeFraction).rounded(.down))
+        guard maxDropCount > 0 else { return BlurFilterResult(frames: frames, dropped: 0) }
+        let floor = max(0.0, profile.sharpnessFloor * floorScale)
+
+        var candidates: [(URL, Double)] = []
+        candidates.reserveCapacity(frames.count)
+        for url in frames {
+            guard let sharpness = sharpnessByFrame[url] else { continue }
+            if sharpness < floor {
+                candidates.append((url, sharpness))
+            }
+        }
+        guard !candidates.isEmpty else { return BlurFilterResult(frames: frames, dropped: 0) }
+
+        let toDrop: Set<URL>
+        if candidates.count <= maxDropCount {
+            toDrop = Set(candidates.map { $0.0 })
+        } else {
+            let worst = candidates.sorted { $0.1 < $1.1 }.prefix(maxDropCount)
+            toDrop = Set(worst.map { $0.0 })
+        }
+        guard !toDrop.isEmpty else { return BlurFilterResult(frames: frames, dropped: 0) }
+        let filtered = frames.filter { !toDrop.contains($0) }
+        let dropped = frames.count - filtered.count
+        return BlurFilterResult(frames: filtered, dropped: dropped)
+    }
+
     func targetCountForVideo(index: Int, total: Int, targetCount: Int) -> Int {
         guard total > 0 else { return targetCount }
         let base = targetCount / total
@@ -2356,6 +2445,38 @@ private extension PipelineRunner {
         }
     }
 
+    final class BrushTrainingEtaEstimator: @unchecked Sendable {
+        private let lock = NSLock()
+        private var smoothedRate: Double?
+        private var sampleCount: Int = 0
+        private let minSamples = 5
+        private let minStep = 25
+        private let alpha: Double = 0.2
+
+        func update(rate: Double) {
+            guard rate > 0 else { return }
+            lock.lock()
+            if let existing = smoothedRate {
+                smoothedRate = alpha * rate + (1.0 - alpha) * existing
+            } else {
+                smoothedRate = rate
+            }
+            sampleCount += 1
+            lock.unlock()
+        }
+
+        func estimateRemainingSeconds(step: Int, total: Int) -> TimeInterval? {
+            lock.lock()
+            defer { lock.unlock() }
+            guard sampleCount >= minSamples else { return nil }
+            guard step >= minStep else { return nil }
+            guard total > step else { return nil }
+            guard let rate = smoothedRate, rate > 0 else { return nil }
+            let remainingSteps = total - step
+            return Double(remainingSteps) / rate
+        }
+    }
+
     final class BrushSnapshotManager: @unchecked Sendable {
         private let lock = NSLock()
         private let defaultExportEvery: Int?
@@ -2448,6 +2569,28 @@ private extension PipelineRunner {
         }
     }
 
+    final class BrushTrainingStepLogGate: @unchecked Sendable {
+        private let lock = NSLock()
+        private let stepInterval: Int
+        private var lastEmittedStep: Int?
+
+        init(stepInterval: Int) {
+            self.stepInterval = max(1, stepInterval)
+        }
+
+        func shouldEmit(step: Int) -> Bool {
+            guard step > 0 else { return false }
+            guard step % stepInterval == 0 else { return false }
+            lock.lock()
+            defer { lock.unlock() }
+            if lastEmittedStep == step {
+                return false
+            }
+            lastEmittedStep = step
+            return true
+        }
+    }
+
     func brushTrainingPlan(for preset: PresetSpec) -> BrushTrainingPlan {
         switch preset.quality {
         case .draft:
@@ -2463,24 +2606,26 @@ private extension PipelineRunner {
         elapsed: TimeInterval,
         progress: BrushTrainProgress?,
         latestExportStep: Int?,
-        totalSteps: Int?
+        totalSteps: Int?,
+        etaSeconds: TimeInterval?
     ) -> String {
         let elapsedText = formatElapsed(elapsed)
+        let etaText = etaSeconds.map { " • ETA \(formatElapsed($0))" } ?? ""
         if let progress, progress.total > 0 {
             let stepText = formatStepCount(progress.step)
             let totalText = formatStepCount(progress.total)
-            return "Training model - \(stepText)/\(totalText) steps (running \(elapsedText))"
+            return "Training model - \(stepText)/\(totalText) steps\(etaText) (running \(elapsedText))"
         }
         if let totalSteps {
             let fallbackStep = max(0, latestExportStep ?? 0)
             let clamped = min(fallbackStep, totalSteps)
             let stepText = formatStepCount(clamped)
             let totalText = formatStepCount(totalSteps)
-            return "Training model - \(stepText)/\(totalText) steps (running \(elapsedText))"
+            return "Training model - \(stepText)/\(totalText) steps\(etaText) (running \(elapsedText))"
         }
         if let latestExportStep {
             let stepText = formatStepCount(latestExportStep)
-            return "Training model - \(stepText) steps (running \(elapsedText))"
+            return "Training model - \(stepText) steps\(etaText) (running \(elapsedText))"
         }
         return "Training model - running \(elapsedText)"
     }
@@ -2523,6 +2668,47 @@ private extension PipelineRunner {
         let clamped = Self.clampStepCount(rawSteps, min: Self.brushSnapshotMinSteps(), max: Self.brushSnapshotMaxSteps())
         if clamped <= 0 { return nil }
         return min(clamped, totalSteps)
+    }
+
+    private func updateResumeSnapshotFromLatestExport(trainingURL: URL) {
+        guard let exportURL = latestBrushUncompressedExport(in: trainingURL) else { return }
+        updateBrushResumeSnapshot(from: exportURL, trainingURL: trainingURL)
+    }
+
+    private func updateBrushResumeSnapshot(from exportURL: URL, trainingURL: URL) {
+        guard exportURL.lastPathComponent.hasSuffix(".ply"),
+              !exportURL.lastPathComponent.hasSuffix(".compressed.ply") else { return }
+        let destURL = trainingURL.appendingPathComponent("latest_snapshot.ply")
+        if exportURL.resolvingSymlinksInPath() == destURL.resolvingSymlinksInPath() {
+            return
+        }
+        copyItemReplacing(source: exportURL, destination: destURL)
+    }
+
+    private func latestBrushUncompressedExport(in trainingURL: URL) -> URL? {
+        let fm = FileManager.default
+        let enumerator = fm.enumerator(at: trainingURL, includingPropertiesForKeys: [.contentModificationDateKey], options: [.skipsHiddenFiles])
+        var latest: (URL, Date)?
+        while let item = enumerator?.nextObject() as? URL {
+            guard item.pathExtension.lowercased() == "ply" else { continue }
+            if item.lastPathComponent.hasSuffix(".compressed.ply") { continue }
+            let date = (try? item.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate) ?? Date.distantPast
+            if latest == nil || date > latest!.1 {
+                latest = (item, date)
+            }
+        }
+        return latest?.0
+    }
+
+    private func copyItemReplacing(source: URL, destination: URL) {
+        let fm = FileManager.default
+        if source.resolvingSymlinksInPath() == destination.resolvingSymlinksInPath() {
+            return
+        }
+        if fm.fileExists(atPath: destination.path) {
+            try? fm.removeItem(at: destination)
+        }
+        try? fm.copyItem(at: source, to: destination)
     }
 
     private func brushRecentStepRates(from logURL: URL, maxSamples: Int) -> [Double] {
@@ -3065,6 +3251,32 @@ extension PipelineRunner {
         targetCountForVideo(index: index, total: total, targetCount: targetCount)
     }
 
+    func test_filterVeryBlurryVideoFrames(
+        frames: [URL],
+        sharpnessByFrame: [URL: Double],
+        sharpnessFloor: Double,
+        maxDropFraction: Double,
+        floorScale: Double
+    ) -> (frames: [URL], dropped: Int) {
+        let profile = FrameExtractionProfile(
+            targetCount: 0,
+            maxDimension: 0,
+            targetFPS: 1,
+            minDistanceRatio: 0,
+            sharpnessFloor: sharpnessFloor,
+            sharpnessRatio: 0,
+            outputFormat: .jpeg
+        )
+        let result = filterVeryBlurryVideoFrames(
+            frames: frames,
+            sharpnessByFrame: sharpnessByFrame,
+            profile: profile,
+            maxDropFraction: maxDropFraction,
+            floorScale: floorScale
+        )
+        return (result.frames, result.dropped)
+    }
+
     func test_frameExtractionProfile(for quality: QualityPreset) -> TestFrameExtractionProfile {
         let profile = frameExtractionProfile(for: quality)
         return TestFrameExtractionProfile(
@@ -3109,7 +3321,8 @@ extension PipelineRunner {
         step: Int?,
         total: Int?,
         latestExportStep: Int?,
-        totalSteps: Int?
+        totalSteps: Int?,
+        etaSeconds: TimeInterval? = nil
     ) -> String {
         let progress: BrushTrainProgress?
         if let step, let total {
@@ -3121,8 +3334,17 @@ extension PipelineRunner {
             elapsed: elapsed,
             progress: progress,
             latestExportStep: latestExportStep,
-            totalSteps: totalSteps
+            totalSteps: totalSteps,
+            etaSeconds: etaSeconds
         )
+    }
+
+    func test_trainingEtaEstimate(rates: [Double], step: Int, total: Int) -> TimeInterval? {
+        let estimator = BrushTrainingEtaEstimator()
+        for rate in rates {
+            estimator.update(rate: rate)
+        }
+        return estimator.estimateRemainingSeconds(step: step, total: total)
     }
 
     func test_shouldEmitToolLogLine(_ line: String, isError: Bool) -> Bool {

@@ -1,6 +1,7 @@
 import Foundation
 import SwiftUI
 import UniformTypeIdentifiers
+import AppKit
 import EasySplatCore
 
 @MainActor
@@ -36,6 +37,7 @@ final class AppModel: ObservableObject {
     @Published var currentProjectURL: URL? = nil
     @Published var toolchainPaths: ToolchainPaths? = nil
     @Published private(set) var stopAction: StopAction? = nil
+    @Published var isShowingTrainingConsent: Bool = false
 
     @Published var captureMode: CaptureMode = .object
     @Published var qualityPreset: QualityPreset = .standard
@@ -58,10 +60,32 @@ final class AppModel: ObservableObject {
     private var lastStageLogMessage: String = ""
     private var lastStageLogStage: PipelineStage? = nil
     private let trainingStepLogInterval = 20
+    private var trainingConsentContinuation: CheckedContinuation<Bool, Never>?
+    private var trainingConsentPauseStartedAt: Date?
+    private var trainingConsentPausedDuration: TimeInterval = 0
+    private var exitIntent: ExitIntent = .none
+    private weak var pendingCloseWindow: NSWindow?
+    private var allowNextWindowClose = false
+    private var pendingSnapshotRevealURL: URL?
+    private var pendingSnapshotRevealRequiresExit: Bool = false
+
+    static let trainingConsentRememberedKey = "EasySplatTrainingConsentRemembered"
 
     enum StopAction {
         case keepProject
         case deleteProject
+    }
+
+    enum ExitIntent {
+        case none
+        case quit
+        case closeWindow
+    }
+
+    enum ExitDecision {
+        case save
+        case delete
+        case cancel
     }
 
     var isStopping: Bool {
@@ -173,7 +197,23 @@ final class AppModel: ObservableObject {
         currentTask = Task { await resumeProjectTask(at: url) }
     }
 
-    func cancelCurrentProject(deleteProject: Bool) {
+    func cancelCurrentProject(deleteProject: Bool, exitIntent: ExitIntent = .none, window: NSWindow? = nil) {
+        if exitIntent != .none {
+            self.exitIntent = exitIntent
+            self.pendingCloseWindow = window
+        }
+
+        if !deleteProject,
+           exitIntent != .none,
+           stage == .trainBrush,
+           let projectURL = currentProjectURL {
+            let snapshotURL = ProjectPaths(root: projectURL)
+                .trainingURL
+                .appendingPathComponent("latest_snapshot.ply")
+            pendingSnapshotRevealURL = snapshotURL
+            pendingSnapshotRevealRequiresExit = true
+        }
+
         guard currentTask != nil else {
             let projectURL = currentProjectURL
             reset()
@@ -182,16 +222,159 @@ final class AppModel: ObservableObject {
                 try? FileManager.default.removeItem(at: projectURL)
             }
             refreshProjectSummaries()
+            finalizeExitIfNeeded()
             return
         }
 
         stopAction = deleteProject ? .deleteProject : .keepProject
         lastError = nil
         errorDetails = nil
-        statusTitle = deleteProject ? "Stopping and deleting…" : "Saving progress…"
-        statusDetail = "Stopping at the next safe point (up to 15 seconds)…"
+        if deleteProject {
+            statusTitle = "Stopping and deleting…"
+            statusDetail = "Stopping at the next safe point (up to 15 seconds)…"
+        } else if stage == .trainBrush {
+            statusTitle = "Exporting snapshot…"
+            statusDetail = "Exporting the latest snapshot (training restarts from scratch on resume)."
+        } else {
+            statusTitle = "Saving progress…"
+            statusDetail = "Stopping at the next safe point (up to 15 seconds)…"
+        }
         progress = nil
         currentTask?.cancel()
+    }
+
+    func awaitTrainingConsent() async -> Bool {
+        if UserDefaults.standard.bool(forKey: Self.trainingConsentRememberedKey) {
+            return true
+        }
+        if trainingConsentContinuation != nil {
+            return false
+        }
+        if Task.isCancelled {
+            return false
+        }
+        return await withTaskCancellationHandler(operation: {
+            await withCheckedContinuation { continuation in
+                if Task.isCancelled {
+                    continuation.resume(returning: false)
+                    return
+                }
+                trainingConsentContinuation = continuation
+                isShowingTrainingConsent = true
+                if stage == .trainBrush, trainingConsentPauseStartedAt == nil {
+                    trainingConsentPauseStartedAt = Date()
+                }
+            }
+        }, onCancel: { [weak self] in
+            guard let self else { return }
+            Task { @MainActor in
+                self.resolveTrainingConsent(accepted: false, remember: false)
+            }
+        })
+    }
+
+    func resolveTrainingConsent(accepted: Bool, remember: Bool) {
+        guard let continuation = trainingConsentContinuation else { return }
+        trainingConsentContinuation = nil
+        isShowingTrainingConsent = false
+        if let pauseStartedAt = trainingConsentPauseStartedAt {
+            trainingConsentPausedDuration += Date().timeIntervalSince(pauseStartedAt)
+            trainingConsentPauseStartedAt = nil
+        }
+        if remember && accepted {
+            UserDefaults.standard.set(true, forKey: Self.trainingConsentRememberedKey)
+        }
+        continuation.resume(returning: accepted)
+    }
+
+    func elapsedSinceStageStart(now: Date) -> TimeInterval? {
+        guard let startedAt = stageStartedAt else { return nil }
+        var pausedDuration = trainingConsentPausedDuration
+        if let pauseStartedAt = trainingConsentPauseStartedAt {
+            pausedDuration += now.timeIntervalSince(pauseStartedAt)
+        }
+        let elapsed = now.timeIntervalSince(startedAt) - pausedDuration
+        return max(0, elapsed)
+    }
+
+    func presentExitConfirmation(for stage: PipelineStage?) -> ExitDecision {
+        let isTraining = stage == .trainBrush
+        let alert = NSAlert()
+        alert.alertStyle = .warning
+        alert.messageText = isTraining ? "Training in progress" : "Stop this project?"
+        alert.informativeText = isTraining
+            ? "Exporting keeps only a snapshot. If you resume, training starts over from scratch."
+            : "You can save and resume later, or delete the project."
+        alert.addButton(withTitle: isTraining ? "Export Snapshot" : "Save Project")
+        alert.addButton(withTitle: "Delete Project")
+        alert.addButton(withTitle: "Cancel")
+        let response = alert.runModal()
+        switch response {
+        case .alertFirstButtonReturn:
+            return .save
+        case .alertSecondButtonReturn:
+            return .delete
+        default:
+            return .cancel
+        }
+    }
+
+    func registerExitIntent(_ intent: ExitIntent, window: NSWindow? = nil) {
+        exitIntent = intent
+        pendingCloseWindow = window
+    }
+
+    func consumeWindowCloseBypass(for window: NSWindow) -> Bool {
+        guard allowNextWindowClose, pendingCloseWindow === window else { return false }
+        allowNextWindowClose = false
+        pendingCloseWindow = nil
+        exitIntent = .none
+        return true
+    }
+
+    private func makeTrainingGate() -> (@Sendable () async throws -> Void) {
+        let modelBox = WeakAppModelBox(self)
+        return {
+            guard let model = modelBox.value else { return }
+            let allowed = await model.awaitTrainingConsent()
+            if !allowed {
+                await model.cancelCurrentProject(deleteProject: false)
+                throw CancellationError()
+            }
+        }
+    }
+
+    private func finalizeExitIfNeeded() {
+        let intent = exitIntent
+
+        switch intent {
+        case .none:
+            break
+        case .quit:
+            exitIntent = .none
+            pendingCloseWindow = nil
+            NSApp.reply(toApplicationShouldTerminate: true)
+            NSApp.terminate(nil)
+        case .closeWindow:
+            if let window = pendingCloseWindow {
+                allowNextWindowClose = true
+                window.performClose(nil)
+            }
+        }
+    }
+
+    private func presentSnapshotRevealIfAvailable(_ snapshotURL: URL) {
+        guard FileManager.default.fileExists(atPath: snapshotURL.path) else { return }
+        let alert = NSAlert()
+        alert.alertStyle = .informational
+        alert.messageText = "Snapshot exported"
+        alert.informativeText = "You can open the snapshot in Finder before exiting."
+        alert.addButton(withTitle: "Open in Finder")
+        alert.addButton(withTitle: "Continue")
+        let response = alert.runModal()
+        if response == .alertFirstButtonReturn {
+            NSWorkspace.shared.activateFileViewerSelecting([snapshotURL])
+        }
     }
 
     private func startProject(input: InputSpec, title: String) async {
@@ -232,7 +415,10 @@ final class AppModel: ObservableObject {
             }
             self.toolchainPaths = toolchain
 
-            let runner = pipelineRunnerFactory(projectURL, .init(toolchain: toolchain, preset: metadata.preset))
+            let runner = pipelineRunnerFactory(
+                projectURL,
+                .init(toolchain: toolchain, preset: metadata.preset, trainingGate: makeTrainingGate())
+            )
             let forwarder = EventForwarder(model: self)
             try await runner.run(resumeFrom: nil) { event in
                 forwarder.handle(event)
@@ -324,7 +510,10 @@ final class AppModel: ObservableObject {
             }
             self.toolchainPaths = toolchain
 
-            let runner = pipelineRunnerFactory(url, .init(toolchain: toolchain, preset: metadata.preset))
+            let runner = pipelineRunnerFactory(
+                url,
+                .init(toolchain: toolchain, preset: metadata.preset, trainingGate: makeTrainingGate())
+            )
             let forwarder = EventForwarder(model: self)
             let resumeStage = resumeStage(from: metadata)
             try await runner.run(resumeFrom: resumeStage) { event in
@@ -592,6 +781,12 @@ final class AppModel: ObservableObject {
         toolchainPaths = nil
         currentProjectURL = nil
         stopAction = nil
+        isShowingTrainingConsent = false
+        trainingConsentContinuation = nil
+        trainingConsentPauseStartedAt = nil
+        trainingConsentPausedDuration = 0
+        pendingSnapshotRevealURL = nil
+        pendingSnapshotRevealRequiresExit = false
     }
 
     private func completeStop() {
@@ -599,12 +794,18 @@ final class AppModel: ObservableObject {
         stopAction = nil
 
         let projectURL = currentProjectURL
+        let snapshotURL = pendingSnapshotRevealURL
+        let shouldOfferSnapshot = pendingSnapshotRevealRequiresExit
         reset()
         viewState = .home
         if action == .deleteProject, let projectURL {
             try? FileManager.default.removeItem(at: projectURL)
         }
         refreshProjectSummaries()
+        if shouldOfferSnapshot, let snapshotURL {
+            presentSnapshotRevealIfAvailable(snapshotURL)
+        }
+        finalizeExitIfNeeded()
     }
 
     private func loadPipelineLogTail(projectURL: URL, maxLines: Int = 200, maxBytes: Int = 64 * 1024) -> [String] {
@@ -765,6 +966,14 @@ final class AppModel: ObservableObject {
         }
 
         projectSummaries = summaries.sorted { $0.createdAt > $1.createdAt }
+    }
+}
+
+private final class WeakAppModelBox: @unchecked Sendable {
+    weak var value: AppModel?
+
+    init(_ value: AppModel) {
+        self.value = value
     }
 }
 

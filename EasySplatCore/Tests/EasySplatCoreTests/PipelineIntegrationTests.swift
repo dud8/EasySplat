@@ -71,6 +71,58 @@ final class PipelineIntegrationTests: XCTestCase {
         XCTAssertTrue(FileManager.default.fileExists(atPath: output.path))
     }
 
+    func testTrainingGateInvokedBeforeTraining() async throws {
+        let temp = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        let projectURL = temp.appendingPathComponent("Test.easysplatproj", isDirectory: true)
+        let sourcePhotos = temp.appendingPathComponent("SourcePhotos", isDirectory: true)
+        try FileManager.default.createDirectory(at: sourcePhotos, withIntermediateDirectories: true)
+        for index in 0..<10 {
+            try writeTestImage(url: sourcePhotos.appendingPathComponent("img\(index).jpg"), value: UInt8(index % 255))
+        }
+
+        let metadata = ProjectMetadata(title: "Test",
+                                       input: .photos(folder: sourcePhotos.path),
+                                       preset: PresetSpec(mode: .object, quality: .draft))
+        let paths = ProjectPaths(root: projectURL)
+        try paths.ensureDirectories()
+        try ProjectMetadataStore.save(metadata, to: paths.metadataURL)
+
+        let toolchain = try makeToolchain(root: temp)
+        let gateFlag = TrainingGateFlag()
+
+        let runner = MockSubprocessRunner(scripts: [
+            .init(path: toolchain.colmap.path, argsPrefix: ["feature_extractor"], result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""), onRun: nil),
+            .init(path: toolchain.colmap.path, argsPrefix: ["exhaustive_matcher"], result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""), onRun: nil),
+            .init(path: toolchain.glomap.path, argsPrefix: ["mapper"], result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""), onRun: { _ in try? self.writeSparseModel(at: projectURL) }),
+            .init(path: toolchain.colmap.path, argsPrefix: ["model_analyzer"], result: .init(exitCode: 0, terminationReason: .exit, stdout: "Registered images: 10 / 10\nMean reprojection error: 1.0\n", stderr: ""), onRun: nil),
+            .init(path: toolchain.brush.path, argsPrefix: [], result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""), onRun: nil)
+        ])
+
+        let pipeline = PipelineRunner(
+            projectURL: projectURL,
+            config: .init(
+                toolchain: toolchain,
+                preset: metadata.preset,
+                trainingGate: {
+                    await gateFlag.setCalled()
+                    throw CancellationError()
+                }
+            ),
+            tooling: .init(runner: runner)
+        )
+
+        do {
+            try await pipeline.run { _ in }
+            XCTFail("Expected training gate cancellation")
+        } catch is CancellationError {
+            // expected
+        }
+
+        let wasCalled = await gateFlag.wasCalled()
+        XCTAssertTrue(wasCalled)
+        XCTAssertFalse(runner.calls.contains(where: { $0.0 == toolchain.brush.path }))
+    }
+
     func testPipelineSuccessWithVggt() async throws {
         setenv("EASYSPLAT_SFM_BACKEND", "vggt", 1)
         defer { setenv("EASYSPLAT_SFM_BACKEND", "colmap", 1) }
@@ -852,6 +904,18 @@ final class PipelineIntegrationTests: XCTestCase {
             vggt: vggt,
             learnedSfm: learned
         )
+    }
+}
+
+private actor TrainingGateFlag {
+    private var called = false
+
+    func setCalled() {
+        called = true
+    }
+
+    func wasCalled() -> Bool {
+        called
     }
 }
 

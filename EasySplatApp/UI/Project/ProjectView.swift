@@ -21,5 +21,6 @@ struct RootView: View {
         .animation(reduceMotion ? nil : Theme.Motion.reveal, value: model.viewState)
         .tint(Theme.accent)
         .background(Theme.background)
+        .background(WindowAccessor())
     }
 }

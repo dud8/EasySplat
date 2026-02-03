@@ -38,9 +38,9 @@ public final class BrushRunner {
 
         let workingDirectory = datasetPath.deletingLastPathComponent()
         var environment = ["RUST_BACKTRACE": "1"]
-        if ProcessInfo.processInfo.environment["RUST_LOG"] == nil {
-            // Brush uses env_logger; without RUST_LOG, it may default to a very quiet level.
-            environment["RUST_LOG"] = "info"
+        if let override = ProcessInfo.processInfo.environment["EASYSPLAT_BRUSH_RUST_LOG"],
+           !override.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            environment["RUST_LOG"] = override
         }
         if ProcessInfo.processInfo.environment["TERM"] == nil {
             environment["TERM"] = "xterm-256color"
