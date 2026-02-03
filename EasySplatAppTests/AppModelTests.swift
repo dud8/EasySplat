@@ -110,6 +110,26 @@ final class AppModelTests: XCTestCase {
         XCTAssertEqual(model.outputPlyURL, output)
     }
 
+    func testLoadPipelineLogTailWithInvalidUtf8() throws {
+        let tempBase = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(at: tempBase, withIntermediateDirectories: true)
+        let projectURL = tempBase.appendingPathComponent("Project.easysplatproj", isDirectory: true)
+        try FileManager.default.createDirectory(at: projectURL, withIntermediateDirectories: true)
+        let paths = ProjectPaths(root: projectURL)
+        try paths.ensureDirectories()
+
+        var logData = Data([0xF0, 0x9F])
+        logData.append(contentsOf: "Hello log\n".utf8)
+        try logData.write(to: paths.pipelineLogURL, options: [.atomic])
+
+        let model = AppModel(toolchainManager: MockToolchainManager(), projectBaseURL: tempBase) { _, config in
+            MockPipelineRunner(projectURL: projectURL, config: config)
+        }
+
+        let lines = model.test_loadPipelineLogTail(projectURL: projectURL)
+        XCTAssertTrue(lines.contains { $0.contains("Hello log") })
+    }
+
     func testRefreshProjectSummariesStatusMapping() throws {
         let base = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
         try FileManager.default.createDirectory(at: base, withIntermediateDirectories: true)

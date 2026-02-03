@@ -54,6 +54,10 @@ final class AppModel: ObservableObject {
     private var lastTrainingImagesBucket: Int = -1
     private var lastTrainingSparseBucket: Int = -1
     private var lastTrainingStepsBucket: Int = -1
+    private var lastStageLogAt: Date = .distantPast
+    private var lastStageLogMessage: String = ""
+    private var lastStageLogStage: PipelineStage? = nil
+    private let trainingStepLogInterval = 20
 
     enum StopAction {
         case keepProject
@@ -287,7 +291,16 @@ final class AppModel: ObservableObject {
             let paths = ProjectPaths(root: url)
             let metadata = try ProjectMetadataStore.load(from: paths.metadataURL)
             currentProjectURL = url
-            logLines = loadPipelineLogTail(projectURL: url)
+            logLines = []
+            let previousLines = loadPipelineLogTail(projectURL: url)
+            if !previousLines.isEmpty {
+                appendLogLine("========== PREVIOUS LOG (from Logs/pipeline.log) ==========")
+                for line in previousLines {
+                    appendLogLine("[previous] \(line)")
+                }
+            }
+            appendLogLine("========== NEW LOG START (current run) ==========")
+            appendLogLine("Resumed project")
 
             if let output = metadata.outputs?.splatPlyPath {
                 let outputURL = url.appendingPathComponent(output)
@@ -366,16 +379,43 @@ final class AppModel: ObservableObject {
             self.lastPipelineEventAt = now
             appendLogLine("[\(stage.displayName)] started")
         case .stageProgress(let stage, let fraction, let message):
+            let previousStage = self.stage
             self.stage = stage
+            if previousStage != stage || self.stageStartedAt == nil {
+                self.stageStartedAt = now
+            }
             self.progress = fraction < 0 ? nil : fraction
             self.statusTitle = stage.displayName
             self.statusDetail = message
             self.lastPipelineEventAt = now
             maybeAppendProgressLog(stage: stage, message: message)
         case .stageLog(let stage, let line, let isError):
+            if self.stage != stage || self.stageStartedAt == nil {
+                self.stage = stage
+                self.stageStartedAt = now
+            }
+            let sanitized = sanitizeLogLine(line)
+            let trimmed = sanitized.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !trimmed.isEmpty else { return }
+
+            // Backstop against tools that spam redraw/progress output: keep Details useful, not noisy.
+            let minInterval: TimeInterval = 0.5
+            if stage == lastStageLogStage {
+                if trimmed == lastStageLogMessage {
+                    return
+                }
+                if now.timeIntervalSince(lastStageLogAt) < minInterval {
+                    return
+                }
+            }
+
+            lastStageLogStage = stage
+            lastStageLogMessage = trimmed
+            lastStageLogAt = now
+
             let errPrefix = isError ? "[err] " : ""
             self.lastPipelineEventAt = now
-            appendLogLine("\(errPrefix)[\(stage.displayName)] \(line)")
+            appendLogLine("\(errPrefix)[\(stage.displayName)] \(trimmed)")
         case .stageFinished(let stage):
             self.stage = stage
             self.progress = 1.0
@@ -418,7 +458,7 @@ final class AppModel: ObservableObject {
                 }
             } else if trimmed.hasPrefix("Training model") {
                 if let ratio = parseProgressRatio(trimmed) {
-                    let bucket = bucketedPercent(current: ratio.current, total: ratio.total)
+                    let bucket = bucketedSteps(current: ratio.current, bucketSize: trainingStepLogInterval)
                     if bucket == lastTrainingStepsBucket {
                         return
                     }
@@ -482,11 +522,51 @@ final class AppModel: ObservableObject {
         return max(0, (percent / bucketSize) * bucketSize)
     }
 
+    private func bucketedSteps(current: Int, bucketSize: Int) -> Int {
+        guard bucketSize > 0 else { return current }
+        return max(0, (current / bucketSize) * bucketSize)
+    }
+
     private func appendLogLine(_ line: String) {
         logLines.append(line)
         if logLines.count > 500 {
             logLines.removeFirst(logLines.count - 500)
         }
+    }
+
+    private func sanitizeLogLine(_ line: String) -> String {
+        // Strip ANSI escape sequences (common in CLI progress redraws).
+        let scalars = Array(line.unicodeScalars)
+        var output: [UnicodeScalar] = []
+        output.reserveCapacity(scalars.count)
+        var index = 0
+        while index < scalars.count {
+            let scalar = scalars[index]
+            if scalar.value == 0x1B {
+                if index + 1 < scalars.count, scalars[index + 1].value == 0x5B {
+                    index += 2
+                    while index < scalars.count {
+                        let value = scalars[index].value
+                        if value >= 0x40 && value <= 0x7E {
+                            index += 1
+                            break
+                        }
+                        index += 1
+                    }
+                    continue
+                }
+                index += 1
+                continue
+            }
+            // Drop other C0 control characters.
+            if scalar.value < 32 || scalar.value == 127 {
+                index += 1
+                continue
+            }
+            output.append(scalar)
+            index += 1
+        }
+        return String(String.UnicodeScalarView(output))
     }
 
     private func reset() {
@@ -503,6 +583,9 @@ final class AppModel: ObservableObject {
         lastTrainingImagesBucket = -1
         lastTrainingSparseBucket = -1
         lastTrainingStepsBucket = -1
+        lastStageLogAt = .distantPast
+        lastStageLogMessage = ""
+        lastStageLogStage = nil
         lastError = nil
         errorDetails = nil
         outputPlyURL = nil
@@ -535,15 +618,42 @@ final class AppModel: ObservableObject {
         do {
             try handle.seek(toOffset: fileSize - readSize)
             let data = try handle.readToEnd() ?? Data()
-            guard let text = String(data: data, encoding: .utf8) else { return [] }
-            let lines = text.split(separator: "\n", omittingEmptySubsequences: false).map(String.init)
-            if lines.count > maxLines {
-                return Array(lines.suffix(maxLines))
+            let text = String(decoding: data, as: UTF8.self)
+            let rawLines = text.split(separator: "\n", omittingEmptySubsequences: false).map(String.init)
+            var cleaned: [String] = []
+            cleaned.reserveCapacity(min(maxLines, rawLines.count))
+            var last: String = ""
+            for raw in rawLines {
+                let sanitized = sanitizeLogLine(raw).trimmingCharacters(in: .whitespacesAndNewlines)
+                guard !sanitized.isEmpty else { continue }
+                guard shouldKeepLoadedLogLine(sanitized) else { continue }
+                if sanitized == last { continue }
+                cleaned.append(sanitized)
+                last = sanitized
             }
-            return lines
+            if cleaned.count > maxLines {
+                return Array(cleaned.suffix(maxLines))
+            }
+            return cleaned
         } catch {
             return []
         }
+    }
+
+    private func shouldKeepLoadedLogLine(_ line: String) -> Bool {
+        let lower = line.lowercased()
+        if lower.contains("[training model]") {
+            if lower.contains("completed loading") || lower.contains("evaluating every") {
+                return false
+            }
+            if lower.contains("🖌") || lower.contains("░") || lower.contains("▓") || lower.contains("█") || lower.contains("•") || lower.contains("·") {
+                return false
+            }
+            if lower.contains("[2k") || lower.contains("[1b") {
+                return false
+            }
+        }
+        return true
     }
 
     private func createProjectDirectory(title: String) throws -> URL {
@@ -734,3 +844,11 @@ enum AppConfig {
         return URL(string: text.trimmingCharacters(in: .whitespacesAndNewlines))
     }
 }
+
+#if DEBUG
+extension AppModel {
+    func test_loadPipelineLogTail(projectURL: URL, maxLines: Int = 200, maxBytes: Int = 64 * 1024) -> [String] {
+        loadPipelineLogTail(projectURL: projectURL, maxLines: maxLines, maxBytes: maxBytes)
+    }
+}
+#endif

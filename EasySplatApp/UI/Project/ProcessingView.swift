@@ -6,7 +6,6 @@ import Combine
 struct ProcessingView: View {
     @EnvironmentObject private var model: AppModel
     @State private var showReturnConfirm = false
-    @State private var now: Date = Date()
 
     var body: some View {
         VStack(alignment: .leading, spacing: 20) {
@@ -18,14 +17,16 @@ struct ProcessingView: View {
                     Text(model.statusTitle)
                         .font(.headline)
                     if let detail = model.statusDetail, !detail.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                        Text(detail)
+                        Text(summaryDetail(detail))
                             .font(.subheadline)
                             .foregroundStyle(.secondary)
                     }
-                    if let timingText {
-                        Text(timingText)
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
+                    TimelineView(.periodic(from: .now, by: 1.0)) { context in
+                        if let timingText = timingText(now: context.date) {
+                            Text(timingText)
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        }
                     }
                     ShimmeringProgressView(progress: model.progress)
                     if model.isStopping {
@@ -70,6 +71,33 @@ struct ProcessingView: View {
             }
         }
         .padding(32)
+        .overlay {
+            if model.isStopping {
+                ZStack {
+                    Color.black.opacity(0.18)
+                        .ignoresSafeArea()
+                    VStack(spacing: 12) {
+                        ProgressView()
+                            .controlSize(.regular)
+                        Text(model.stopAction == .deleteProject ? "Stopping and deleting…" : "Saving progress…")
+                            .font(.headline)
+                        Text("Stopping at the next safe point (up to 15 seconds).")
+                            .font(.subheadline)
+                            .foregroundStyle(.secondary)
+                    }
+                    .padding(20)
+                    .background(
+                        RoundedRectangle(cornerRadius: 12, style: .continuous)
+                            .fill(Theme.surface)
+                    )
+                    .overlay(
+                        RoundedRectangle(cornerRadius: 12, style: .continuous)
+                            .stroke(Theme.border)
+                    )
+                }
+                .transition(.opacity)
+            }
+        }
         .confirmationDialog("Cancel this project?", isPresented: $showReturnConfirm, titleVisibility: .visible) {
             Button("Keep Project") {
                 model.cancelCurrentProject(deleteProject: false)
@@ -80,9 +108,6 @@ struct ProcessingView: View {
             Button("Continue", role: .cancel) {}
         } message: {
             Text("You can keep the project folder to resume later, or delete it to start fresh.")
-        }
-        .onReceive(Timer.publish(every: 1, on: .main, in: .common).autoconnect()) { value in
-            now = value
         }
     }
 
@@ -97,7 +122,7 @@ struct ProcessingView: View {
         return String(format: "%dm %02ds", minutes, seconds)
     }
 
-    private var timingText: String? {
+    private func timingText(now: Date) -> String? {
         guard let startedAt = model.stageStartedAt else { return nil }
 
         var parts = ["Elapsed \(formatElapsed(now.timeIntervalSince(startedAt)))"]
@@ -110,5 +135,11 @@ struct ProcessingView: View {
             }
         }
         return parts.joined(separator: " • ")
+    }
+
+    private func summaryDetail(_ detail: String) -> String {
+        guard model.stage == .trainBrush else { return detail }
+        guard let range = detail.range(of: " (running ") else { return detail }
+        return String(detail[..<range.lowerBound])
     }
 }

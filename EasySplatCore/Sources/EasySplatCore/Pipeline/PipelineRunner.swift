@@ -340,8 +340,9 @@ public final class PipelineRunner: @unchecked Sendable {
                         if let update = vggtProgress.ingest(line) {
                             emit(.stageProgress(stage: .sfmFeatures, fraction: update.fraction, message: update.message))
                         }
-                        if Self.shouldEmitToolLogLine(line, isError: isErr) {
-                            emit(.stageLog(stage: .sfmFeatures, line: line, isError: isErr))
+                        let sanitized = Self.sanitizeToolLogLine(line)
+                        if Self.shouldEmitToolLogLine(sanitized, isError: isErr) {
+                            emit(.stageLog(stage: .sfmFeatures, line: sanitized, isError: isErr))
                         }
                     }
                     emit(.stageProgress(stage: .sfmFeatures, fraction: 0.0, message: "Starting VGGT (\(vggtImagesCount) images)…"))
@@ -557,8 +558,9 @@ public final class PipelineRunner: @unchecked Sendable {
                         lastLog.bump()
 
                         learnedToolLog.append(stream: isErr ? "stderr" : "stdout", line: line)
-                        if Self.shouldEmitToolLogLine(line, isError: isErr) {
-                            emit(.stageLog(stage: .sfmFeatures, line: line, isError: isErr))
+                        let sanitized = Self.sanitizeToolLogLine(line)
+                        if Self.shouldEmitToolLogLine(sanitized, isError: isErr) {
+                            emit(.stageLog(stage: .sfmFeatures, line: sanitized, isError: isErr))
                         }
                         if let update = progressTracker.ingest(line) {
                             emit(.stageProgress(stage: .sfmFeatures, fraction: update.fraction, message: update.message))
@@ -651,8 +653,9 @@ public final class PipelineRunner: @unchecked Sendable {
                 let featureProgress = ColmapFeatureProgressTracker()
                 let onFeaturesLog: @Sendable (String, Bool) -> Void = { line, isErr in
                     colmapToolLog.append(stream: isErr ? "stderr" : "stdout", line: line)
-                    if Self.shouldEmitToolLogLine(line, isError: isErr) {
-                        emit(.stageLog(stage: .sfmFeatures, line: line, isError: isErr))
+                    let sanitized = Self.sanitizeToolLogLine(line)
+                    if Self.shouldEmitToolLogLine(sanitized, isError: isErr) {
+                        emit(.stageLog(stage: .sfmFeatures, line: sanitized, isError: isErr))
                     }
                     if let update = featureProgress.ingest(line) {
                         emit(.stageProgress(stage: .sfmFeatures, fraction: update.fraction, message: update.message))
@@ -733,8 +736,9 @@ public final class PipelineRunner: @unchecked Sendable {
                     let blockProgress = ColmapMatchingProgressTracker()
                     let onLog: @Sendable (String, Bool) -> Void = { line, isErr in
                         colmapToolLog.append(stream: isErr ? "stderr" : "stdout", line: line)
-                        if Self.shouldEmitToolLogLine(line, isError: isErr) {
-                            emit(.stageLog(stage: .sfmMatching, line: line, isError: isErr))
+                        let sanitized = Self.sanitizeToolLogLine(line)
+                        if Self.shouldEmitToolLogLine(sanitized, isError: isErr) {
+                            emit(.stageLog(stage: .sfmMatching, line: sanitized, isError: isErr))
                         }
                         if let update = blockProgress.ingest(line) {
                             state.updateBlockMessage(update.message)
@@ -858,8 +862,9 @@ public final class PipelineRunner: @unchecked Sendable {
                                     options: colmapExtractOptions,
                                     onLog: { line, isErr in
                                         colmapToolLog.append(stream: isErr ? "stderr" : "stdout", line: line)
-                                        if Self.shouldEmitToolLogLine(line, isError: isErr) {
-                                            emit(.stageLog(stage: .sfmMatching, line: line, isError: isErr))
+                                        let sanitized = Self.sanitizeToolLogLine(line)
+                                        if Self.shouldEmitToolLogLine(sanitized, isError: isErr) {
+                                            emit(.stageLog(stage: .sfmMatching, line: sanitized, isError: isErr))
                                         }
                                     }
                                 )
@@ -995,8 +1000,9 @@ public final class PipelineRunner: @unchecked Sendable {
                     emit(.stageLog(stage: .sfmMapping, line: "Tool logs: \(toolLogNames)", isError: false))
                         let mappingProgress = ColmapMappingProgressTracker(totalImages: selectedFrames.count)
                         let onMappingLog: @Sendable (String, Bool) -> Void = { line, isErr in
-                            if Self.shouldEmitToolLogLine(line, isError: isErr) {
-                                emit(.stageLog(stage: .sfmMapping, line: line, isError: isErr))
+                            let sanitized = Self.sanitizeToolLogLine(line)
+                            if Self.shouldEmitToolLogLine(sanitized, isError: isErr) {
+                                emit(.stageLog(stage: .sfmMapping, line: sanitized, isError: isErr))
                             }
                             if let update = mappingProgress.ingest(line) {
                                 emit(.stageProgress(stage: .sfmMapping, fraction: update.fraction, message: update.message))
@@ -1171,6 +1177,12 @@ public final class PipelineRunner: @unchecked Sendable {
                 currentStage = .trainBrush
                 emit(.stageStarted(stage: .trainBrush))
                 let brushPlan = brushTrainingPlan(for: metadata.preset)
+                let overrideExportEvery = brushExportEveryOverride()
+                let adaptiveExportEvery = overrideExportEvery ?? brushAdaptiveExportEvery(
+                    plan: brushPlan,
+                    logURL: paths.brushLogURL
+                )
+                let effectiveExportEvery = adaptiveExportEvery ?? brushPlan.exportEvery
                 if let totalSteps = brushPlan.totalSteps {
                     emit(.stageLog(
                         stage: .trainBrush,
@@ -1178,17 +1190,24 @@ public final class PipelineRunner: @unchecked Sendable {
                         isError: false
                     ))
                 }
-                if let exportEvery = brushPlan.exportEvery {
+                if let exportEvery = effectiveExportEvery {
+                    let label: String
+                    if overrideExportEvery != nil {
+                        label = "Snapshots every \(formatStepCount(exportEvery)) steps (override)"
+                    } else if adaptiveExportEvery != nil {
+                        label = "Snapshots every \(formatStepCount(exportEvery)) steps (adaptive)"
+                    } else {
+                        label = "Snapshots every \(formatStepCount(exportEvery)) steps"
+                    }
                     emit(.stageLog(
                         stage: .trainBrush,
-                        line: "Preview updates every \(formatStepCount(exportEvery)) steps",
+                        line: label,
                         isError: false
                     ))
                 }
-                let datasetPrepWeight = 0.20
-                let datasetURL = try prepareBrushDataset(paths: paths, progress: { fraction, message in
-                    // Keep overall stage progress monotonic: dataset prep is the first slice.
-                    emit(.stageProgress(stage: .trainBrush, fraction: datasetPrepWeight * fraction, message: message))
+                let datasetURL = try prepareBrushDataset(paths: paths, progress: { _, message in
+                    // Dataset prep progress is noisy; keep the bar indeterminate until training begins.
+                    emit(.stageProgress(stage: .trainBrush, fraction: -1.0, message: message))
                 })
                 let trainingStartedAt = Date()
                 let initialStatus = trainingStatusMessage(
@@ -1233,16 +1252,38 @@ public final class PipelineRunner: @unchecked Sendable {
                 }
 
                 let brushProgress = BrushProgressBox()
+                let statusGate = TrainingStatusGate()
+                let exportStepBox = BrushExportStepBox()
+                let rateBox = BrushTrainingRateBox()
+                let snapshotManager = BrushSnapshotManager(
+                    defaultExportEvery: effectiveExportEvery,
+                    minSteps: Self.brushSnapshotMinSteps(),
+                    maxSteps: Self.brushSnapshotMaxSteps(),
+                    totalSteps: brushPlan.totalSteps
+                )
 
-                let monitorTask = Task { [trainingURL = paths.trainingURL, brushProgress] in
+                let emitTrainingStatus: @Sendable (Date) -> Void = { [self] now in
+                    let progress = brushProgress.latestProgress()
+                    let latestExportStep = exportStepBox.latestStep()
+                    guard statusGate.shouldEmit(now: now) else { return }
+                    let elapsed = now.timeIntervalSince(trainingStartedAt)
+                    let fraction: Double = {
+                        guard let progress else { return -1.0 }
+                        let f = Double(progress.step) / Double(progress.total)
+                        return min(0.99, max(0.0, f))
+                    }()
+                    let status = self.trainingStatusMessage(
+                        elapsed: elapsed,
+                        progress: progress,
+                        latestExportStep: latestExportStep,
+                        totalSteps: brushPlan.totalSteps
+                    )
+                    emit(.stageProgress(stage: .trainBrush, fraction: fraction, message: status))
+                }
+
+                let monitorTask = Task { [trainingURL = paths.trainingURL, emitTrainingStatus, exportStepBox, snapshotManager, rateBox] in
                     var lastSeen: String? = nil
-                    var latestExportStep: Int? = nil
-                    var lastEmittedStep: Int? = nil
-                    var lastEmittedTotal: Int? = nil
-                    var lastEmittedExportStep: Int? = nil
-                    var lastStatusAt = Date.distantPast
                     var lastExportCheckAt = Date.distantPast
-                    let statusInterval: TimeInterval = 1.0
                     let exportCheckInterval: TimeInterval = 5.0
                     while !Task.isCancelled {
                         let now = Date()
@@ -1253,52 +1294,30 @@ public final class PipelineRunner: @unchecked Sendable {
                                 if name != lastSeen {
                                     lastSeen = name
                                     if let step = export.step {
-                                        latestExportStep = step
-                                        emit(.stageLog(
-                                            stage: .trainBrush,
-                                            line: "Saved a preview at \(formatStepCount(step)) steps",
-                                            isError: false
-                                        ))
+                                        exportStepBox.update(step: step)
+                                        let decision = snapshotManager.handleSnapshot(
+                                            file: export.file,
+                                            step: step,
+                                            stepsPerSecond: rateBox.latestRate()
+                                        )
+                                        if let deleteURL = decision.delete {
+                                            try? FileManager.default.removeItem(at: deleteURL)
+                                        }
+                                        if decision.keep {
+                                            emit(.stageLog(
+                                                stage: .trainBrush,
+                                                line: "Saved a snapshot at \(formatStepCount(step)) steps",
+                                                isError: false
+                                            ))
+                                        }
                                     } else {
                                         emit(.stageLog(stage: .trainBrush, line: "Saved a preview model", isError: false))
                                     }
                                 }
                             }
                         }
-                        if now.timeIntervalSince(lastStatusAt) >= statusInterval {
-                            lastStatusAt = now
-                            let elapsed = now.timeIntervalSince(trainingStartedAt)
-                            let progress = brushProgress.latestProgress()
-                            let shouldEmit: Bool = {
-                                if let progress {
-                                    return progress.step != lastEmittedStep
-                                        || progress.total != lastEmittedTotal
-                                        || latestExportStep != lastEmittedExportStep
-                                }
-                                return latestExportStep != lastEmittedExportStep
-                            }()
-                            if shouldEmit {
-                                if let progress {
-                                    lastEmittedStep = progress.step
-                                    lastEmittedTotal = progress.total
-                                }
-                                lastEmittedExportStep = latestExportStep
-                                let fraction: Double = {
-                                    guard let progress else { return -1.0 }
-                                    let f = Double(progress.step) / Double(progress.total)
-                                    let weighted = datasetPrepWeight + (1.0 - datasetPrepWeight) * f
-                                    return min(0.99, max(0.0, weighted))
-                                }()
-                                let status = trainingStatusMessage(
-                                    elapsed: elapsed,
-                                    progress: progress,
-                                    latestExportStep: latestExportStep,
-                                    totalSteps: brushPlan.totalSteps
-                                )
-                                emit(.stageProgress(stage: .trainBrush, fraction: fraction, message: status))
-                            }
-                        }
-                        try? await Task.sleep(nanoseconds: 1_000_000_000)
+                        emitTrainingStatus(now)
+                        try? await Task.sleep(nanoseconds: 250_000_000)
                     }
                 }
                 defer { monitorTask.cancel() }
@@ -1307,19 +1326,39 @@ public final class PipelineRunner: @unchecked Sendable {
                     brushPath: self.config.toolchain.brush,
                     datasetPath: datasetURL,
                     totalSteps: brushPlan.totalSteps,
-                    exportEvery: brushPlan.exportEvery,
+                    exportEvery: effectiveExportEvery,
                     onLog: { line, isErr in
                         brushToolLog.append(stream: isErr ? "stderr" : "stdout", line: line)
 
-                        if let progress = self.brushTrainStepProgress(from: line),
+                        let cleaned = Self.stripAnsiCodes(line)
+                        if let progress = self.brushTrainStepProgress(from: cleaned),
                            progress.total > 0,
                            progress.step >= 0,
                            progress.step <= progress.total {
                             brushProgress.update(step: progress.step, total: progress.total)
+                            emitTrainingStatus(Date())
+                        }
+                        if let rate = self.brushTrainStepRate(from: cleaned) {
+                            rateBox.update(rate: rate)
                         }
 
-                        if Self.shouldEmitToolLogLine(line, isError: isErr) {
-                            emit(.stageLog(stage: .trainBrush, line: line, isError: isErr))
+                        // Brush tends to write status spinners and "ok" lines to stderr, often via "\r"
+                        // redraws. Those would drown out our own stage progress updates, so only surface
+                        // lines that look like real warnings/errors.
+                        let sanitized = Self.sanitizeToolLogLine(cleaned)
+                        let trimmed = sanitized.trimmingCharacters(in: .whitespacesAndNewlines)
+                        guard !trimmed.isEmpty else { return }
+
+                        if Self.looksLikeBrushSpinnerLine(trimmed) {
+                            return
+                        }
+
+                        let lower = trimmed.lowercased()
+                        let looksErrorish = Self.looksLikeErrorishLine(lower)
+                        let effectiveIsErr = isErr && looksErrorish
+
+                        if Self.shouldEmitToolLogLine(trimmed, isError: effectiveIsErr) {
+                            emit(.stageLog(stage: .trainBrush, line: trimmed, isError: effectiveIsErr))
                         }
                     }
                 )
@@ -2041,6 +2080,7 @@ private extension PipelineRunner {
         let fm = FileManager.default
         guard fm.fileExists(atPath: directory.path) else { return [] }
         return try fm.contentsOfDirectory(at: directory, includingPropertiesForKeys: nil)
+            .filter { !$0.hasDirectoryPath }
             .filter { supportedImageExtensions.contains($0.pathExtension.lowercased()) }
             .sorted { $0.lastPathComponent < $1.lastPathComponent }
     }
@@ -2277,6 +2317,137 @@ private extension PipelineRunner {
         let exportEvery: Int?
     }
 
+    final class BrushExportStepBox: @unchecked Sendable {
+        private let lock = NSLock()
+        private var latest: Int?
+
+        func update(step: Int) {
+            lock.lock()
+            latest = step
+            lock.unlock()
+        }
+
+        func latestStep() -> Int? {
+            lock.lock()
+            defer { lock.unlock() }
+            return latest
+        }
+    }
+
+    struct BrushSnapshotDecision: Sendable {
+        let keep: Bool
+        let delete: URL?
+    }
+
+    final class BrushTrainingRateBox: @unchecked Sendable {
+        private let lock = NSLock()
+        private var latest: Double?
+
+        func update(rate: Double) {
+            lock.lock()
+            latest = rate
+            lock.unlock()
+        }
+
+        func latestRate() -> Double? {
+            lock.lock()
+            defer { lock.unlock() }
+            return latest
+        }
+    }
+
+    final class BrushSnapshotManager: @unchecked Sendable {
+        private let lock = NSLock()
+        private let defaultExportEvery: Int?
+        private let minSteps: Int
+        private let maxSteps: Int
+        private let totalSteps: Int?
+        private var lastKeptStep: Int?
+        private var lastKeptFile: URL?
+
+        init(
+            defaultExportEvery: Int?,
+            minSteps: Int,
+            maxSteps: Int,
+            totalSteps: Int?
+        ) {
+            self.defaultExportEvery = defaultExportEvery
+            self.minSteps = minSteps
+            self.maxSteps = maxSteps
+            self.totalSteps = totalSteps
+        }
+
+        func handleSnapshot(file: URL, step: Int, stepsPerSecond: Double?) -> BrushSnapshotDecision {
+            lock.lock()
+            defer { lock.unlock() }
+
+            if let lastKeptFile, lastKeptFile.resolvingSymlinksInPath() == file.resolvingSymlinksInPath() {
+                lastKeptStep = step
+                return BrushSnapshotDecision(keep: true, delete: nil)
+            }
+
+            let targetStepInterval = snapshotStepInterval(stepsPerSecond: stepsPerSecond)
+            let shouldKeep: Bool
+            if let lastKeptStep {
+                if step < lastKeptStep {
+                    shouldKeep = true
+                } else if let totalSteps, step >= max(0, totalSteps - targetStepInterval) {
+                    shouldKeep = true
+                } else {
+                    shouldKeep = (step - lastKeptStep) >= targetStepInterval
+                }
+            } else {
+                shouldKeep = true
+            }
+
+            if shouldKeep {
+                let delete = lastKeptFile
+                lastKeptStep = step
+                lastKeptFile = file
+                return BrushSnapshotDecision(keep: true, delete: delete)
+            }
+            return BrushSnapshotDecision(keep: false, delete: file)
+        }
+
+        private func snapshotStepInterval(stepsPerSecond: Double?) -> Int {
+            let fallback = defaultExportEvery ?? minSteps
+            guard let rate = stepsPerSecond, rate > 0 else {
+                return clampStepCount(fallback)
+            }
+            let estimatedTotalSeconds: TimeInterval? = {
+                guard let totalSteps else { return nil }
+                return Double(totalSteps) / rate
+            }()
+            let targetSeconds = PipelineRunner.brushSnapshotTargetSeconds(estimatedTotalSeconds: estimatedTotalSeconds)
+            let rawSteps = Int((rate * targetSeconds).rounded())
+            return clampStepCount(rawSteps)
+        }
+
+        private func clampStepCount(_ value: Int) -> Int {
+            let safeMin = max(1, minSteps)
+            let safeMax = max(safeMin, maxSteps)
+            if value < safeMin { return safeMin }
+            if value > safeMax { return safeMax }
+            return value
+        }
+    }
+
+    final class TrainingStatusGate: @unchecked Sendable {
+        private let lock = NSLock()
+        private var lastEmitAt: Date = .distantPast
+        private let minInterval: TimeInterval = 1.0
+
+        func shouldEmit(now: Date) -> Bool {
+            lock.lock()
+            defer { lock.unlock() }
+            if now.timeIntervalSince(lastEmitAt) < minInterval {
+                return false
+            }
+            lastEmitAt = now
+            return true
+        }
+    }
+
     func brushTrainingPlan(for preset: PresetSpec) -> BrushTrainingPlan {
         switch preset.quality {
         case .draft:
@@ -2335,16 +2506,153 @@ private extension PipelineRunner {
         return String(format: "%dm %02ds", mins, secs)
     }
 
+    private func brushExportEveryOverride() -> Int? {
+        Self.envInt("EASYSPLAT_BRUSH_EXPORT_EVERY")
+    }
+
+    private func brushAdaptiveExportEvery(plan: BrushTrainingPlan, logURL: URL) -> Int? {
+        guard let totalSteps = plan.totalSteps, totalSteps > 0 else { return nil }
+        let rates = brushRecentStepRates(from: logURL, maxSamples: 12)
+        guard !rates.isEmpty else { return nil }
+        let sorted = rates.sorted()
+        let median = sorted[sorted.count / 2]
+        guard median > 0 else { return nil }
+        let estimatedTotalSeconds = Double(totalSteps) / median
+        let targetSeconds = Self.brushSnapshotTargetSeconds(estimatedTotalSeconds: estimatedTotalSeconds)
+        let rawSteps = Int((median * targetSeconds).rounded())
+        let clamped = Self.clampStepCount(rawSteps, min: Self.brushSnapshotMinSteps(), max: Self.brushSnapshotMaxSteps())
+        if clamped <= 0 { return nil }
+        return min(clamped, totalSteps)
+    }
+
+    private func brushRecentStepRates(from logURL: URL, maxSamples: Int) -> [Double] {
+        guard let text = readTail(from: logURL, maxBytes: 512 * 1024) else { return [] }
+        let lines = text.split(separator: "\n", omittingEmptySubsequences: false)
+        var rates: [Double] = []
+        rates.reserveCapacity(maxSamples)
+        for line in lines {
+            if let rate = brushTrainStepRate(from: String(line)), rate > 0 {
+                rates.append(rate)
+            }
+        }
+        if rates.count > maxSamples {
+            return Array(rates.suffix(maxSamples))
+        }
+        return rates
+    }
+
+    private func readTail(from url: URL, maxBytes: Int) -> String? {
+        guard maxBytes > 0 else { return nil }
+        guard FileManager.default.fileExists(atPath: url.path) else { return nil }
+        guard let handle = try? FileHandle(forReadingFrom: url) else { return nil }
+        defer { try? handle.close() }
+
+        let end = (try? handle.seekToEnd()) ?? 0
+        let offset = end > UInt64(maxBytes) ? end - UInt64(maxBytes) : 0
+        do {
+            try handle.seek(toOffset: offset)
+            let data = try handle.readToEnd() ?? Data()
+            if data.isEmpty { return nil }
+            return String(data: data, encoding: .utf8)
+        } catch {
+            return nil
+        }
+    }
+
+    private static func brushSnapshotTargetSeconds(estimatedTotalSeconds: TimeInterval?) -> TimeInterval {
+        let minSeconds = brushSnapshotMinSeconds()
+        let maxSeconds = brushSnapshotMaxSeconds()
+        let defaultSeconds = brushSnapshotDefaultSeconds()
+        guard let estimatedTotalSeconds else {
+            return clampSeconds(defaultSeconds, min: minSeconds, max: maxSeconds)
+        }
+
+        let target: TimeInterval
+        switch estimatedTotalSeconds {
+        case ..<600:
+            target = minSeconds
+        case ..<1800:
+            target = max(minSeconds, 30)
+        case ..<3600:
+            target = max(minSeconds, 60)
+        case ..<7200:
+            target = max(minSeconds, 120)
+        default:
+            target = max(minSeconds, 300)
+        }
+        return clampSeconds(target, min: minSeconds, max: maxSeconds)
+    }
+
+    private static func brushSnapshotMinSteps() -> Int {
+        Self.envInt("EASYSPLAT_BRUSH_SNAPSHOT_MIN_STEPS") ?? 5
+    }
+
+    private static func brushSnapshotMaxSteps() -> Int {
+        Self.envInt("EASYSPLAT_BRUSH_SNAPSHOT_MAX_STEPS") ?? 5_000
+    }
+
+    private static func brushSnapshotMinSeconds() -> TimeInterval {
+        Self.envDouble("EASYSPLAT_BRUSH_SNAPSHOT_MIN_SECONDS") ?? 20
+    }
+
+    private static func brushSnapshotMaxSeconds() -> TimeInterval {
+        Self.envDouble("EASYSPLAT_BRUSH_SNAPSHOT_MAX_SECONDS") ?? 300
+    }
+
+    private static func brushSnapshotDefaultSeconds() -> TimeInterval {
+        Self.envDouble("EASYSPLAT_BRUSH_SNAPSHOT_DEFAULT_SECONDS") ?? 120
+    }
+
+    private static func clampSeconds(_ value: TimeInterval, min minValue: TimeInterval, max maxValue: TimeInterval) -> TimeInterval {
+        let safeMin = Swift.max(0, minValue)
+        let safeMax = Swift.max(safeMin, maxValue)
+        if value < safeMin { return safeMin }
+        if value > safeMax { return safeMax }
+        return value
+    }
+
+    private static func clampStepCount(_ value: Int, min minValue: Int, max maxValue: Int) -> Int {
+        let safeMin = Swift.max(1, minValue)
+        let safeMax = Swift.max(safeMin, maxValue)
+        if value < safeMin { return safeMin }
+        if value > safeMax { return safeMax }
+        return value
+    }
+
+    private static func envInt(_ key: String) -> Int? {
+        guard let raw = ProcessInfo.processInfo.environment[key]?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !raw.isEmpty,
+              let value = Int(raw),
+              value > 0 else { return nil }
+        return value
+    }
+
+    private static func envDouble(_ key: String) -> Double? {
+        guard let raw = ProcessInfo.processInfo.environment[key]?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !raw.isEmpty,
+              let value = Double(raw),
+              value > 0 else { return nil }
+        return value
+    }
+
     private static func shouldEmitToolLogLine(_ line: String, isError: Bool) -> Bool {
-        let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
+        let trimmed = sanitizeToolLogLine(line).trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return false }
+        let lower = trimmed.lowercased()
+        if looksLikeProgressBar(trimmed),
+           !(lower.contains("warning")
+             || lower.contains("warn")
+             || lower.contains("error")
+             || lower.contains("fatal")
+             || lower.contains("failed")) {
+            return false
+        }
         if isError {
             return true
         }
         if trimmed.hasPrefix("EasySplat:") {
             return true
         }
-        let lower = trimmed.lowercased()
         if lower.contains("warning") || lower.contains("warn") {
             return true
         }
@@ -2353,6 +2661,110 @@ private extension PipelineRunner {
         }
         return false
     }
+
+    private static func sanitizeToolLogLine(_ line: String) -> String {
+        let stripped = stripAnsiCodes(line)
+        var scalars: [UnicodeScalar] = []
+        scalars.reserveCapacity(stripped.unicodeScalars.count)
+        for scalar in stripped.unicodeScalars {
+            if scalar.value == 9 {
+                scalars.append(scalar)
+                continue
+            }
+            if scalar.value < 32 || scalar.value == 127 {
+                continue
+            }
+            scalars.append(scalar)
+        }
+        return String(String.UnicodeScalarView(scalars))
+    }
+
+    private static func stripAnsiCodes(_ line: String) -> String {
+        let scalars = Array(line.unicodeScalars)
+        var output: [UnicodeScalar] = []
+        output.reserveCapacity(scalars.count)
+        var index = 0
+        while index < scalars.count {
+            let scalar = scalars[index]
+            if scalar.value == 0x1B {
+                // Skip ANSI escape sequences: ESC [ ... final-byte
+                if index + 1 < scalars.count, scalars[index + 1].value == 0x5B {
+                    index += 2
+                    while index < scalars.count {
+                        let value = scalars[index].value
+                        if value >= 0x40 && value <= 0x7E {
+                            index += 1
+                            break
+                        }
+                        index += 1
+                    }
+                    continue
+                } else {
+                    index += 1
+                    continue
+                }
+            }
+            output.append(scalar)
+            index += 1
+        }
+        return String(String.UnicodeScalarView(output))
+    }
+
+    private static func looksLikeProgressBar(_ line: String) -> Bool {
+        let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return false }
+        let lower = trimmed.lowercased()
+        if lower.contains("steps") && (lower.contains("/s") || lower.contains("remaining") || lower.contains("eta")) {
+            return true
+        }
+        if lower.contains("it/s") && (lower.contains("remaining") || lower.contains("eta")) {
+            return true
+        }
+        // Many CLIs redraw a spinner/progress bar using box characters.
+        if trimmed.contains("░") || trimmed.contains("▓") || trimmed.contains("█") || trimmed.contains("▉") || trimmed.contains("▊") {
+            return true
+        }
+        let nonWhitespace = trimmed.unicodeScalars.filter { !$0.properties.isWhitespace }.count
+        guard nonWhitespace > 0 else { return false }
+        let alnumCount = trimmed.unicodeScalars.filter { CharacterSet.alphanumerics.contains($0) }.count
+        if alnumCount * 3 < nonWhitespace {
+            return true
+        }
+        return false
+    }
+
+    private static func looksLikeErrorishLine(_ lowercasedLine: String) -> Bool {
+        // Conservative: these are the kinds of tokens we want to surface live in the UI.
+        if lowercasedLine.contains("error") || lowercasedLine.contains("fatal") || lowercasedLine.contains("failed") {
+            return true
+        }
+        if lowercasedLine.contains("panic") || lowercasedLine.contains("traceback") || lowercasedLine.contains("exception") {
+            return true
+        }
+        if lowercasedLine.contains("warning") || lowercasedLine.contains("warn") {
+            return true
+        }
+        return false
+    }
+
+    private static func looksLikeBrushSpinnerLine(_ line: String) -> Bool {
+        let lower = line.lowercased()
+        guard lower.contains("training") else { return false }
+        // Brush prints a stylized status row like "·•░▓█🖌️ Training" many times.
+        if line.contains("🖌") || line.contains("·") || line.contains("•") {
+            return true
+        }
+        if line.contains("░") || line.contains("▓") || line.contains("█") || line.contains("▉") || line.contains("▊") {
+            return true
+        }
+        return false
+    }
+
+    private static let brushStepRateRegex: NSRegularExpression = {
+        let pattern = #"([0-9]+(?:\.[0-9]+)?)\s*(?:it)?/s"#
+        return (try? NSRegularExpression(pattern: pattern, options: [.caseInsensitive]))
+            ?? (try! NSRegularExpression(pattern: "$^", options: []))
+    }()
 
     func brushTrainStepProgress(from line: String) -> BrushTrainProgress? {
         // Brush's CLI progress bar includes a "{pos}/{len}" segment (often updated via "\r").
@@ -2412,6 +2824,16 @@ private extension PipelineRunner {
 
         return nil
     }
+
+    func brushTrainStepRate(from line: String) -> Double? {
+        let range = NSRange(line.startIndex..<line.endIndex, in: line)
+        guard let match = Self.brushStepRateRegex.firstMatch(in: line, range: range) else { return nil }
+        guard match.numberOfRanges > 1, let rateRange = Range(match.range(at: 1), in: line) else { return nil }
+        let value = Double(line[rateRange])
+        guard let value, value > 0 else { return nil }
+        return value
+    }
+
 }
 
 private final class StageTimingTracker: @unchecked Sendable {
@@ -2611,6 +3033,10 @@ extension PipelineRunner {
         try loadImages(in: directory)
     }
 
+    func loadPhotosForTesting(in directory: URL) throws -> [URL] {
+        try loadPhotos(in: directory)
+    }
+
     func test_downsampleFrames(_ frames: [URL], targetCount: Int) -> [URL] {
         downsampleFrames(frames, targetCount: targetCount)
     }
@@ -2667,6 +3093,10 @@ extension PipelineRunner {
     func test_brushTrainStepProgress(from line: String) -> TestBrushTrainProgress? {
         guard let progress = brushTrainStepProgress(from: line) else { return nil }
         return TestBrushTrainProgress(step: progress.step, total: progress.total)
+    }
+
+    func test_brushTrainStepRate(from line: String) -> Double? {
+        brushTrainStepRate(from: line)
     }
 
     func test_brushTrainingPlan(for preset: PresetSpec) -> TestBrushTrainingPlan {

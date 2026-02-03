@@ -206,6 +206,23 @@ final class PipelineRunnerHelperTests: XCTestCase {
         XCTAssertEqual(progress?.total, 345)
     }
 
+    func testBrushTrainStepRateParsing() throws {
+        let root = try TestFileBuilder.makeTempDir()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let runner = makeRunner(projectURL: root)
+        let firstRate = runner.test_brushTrainStepRate(from: "Steps (0.9195/s, 12h remaining)")
+        XCTAssertNotNil(firstRate)
+        if let firstRate {
+            XCTAssertEqual(firstRate, 0.9195, accuracy: 0.0001)
+        }
+        let secondRate = runner.test_brushTrainStepRate(from: "speed: 5.2 it/s")
+        XCTAssertNotNil(secondRate)
+        if let secondRate {
+            XCTAssertEqual(secondRate, 5.2, accuracy: 0.0001)
+        }
+        XCTAssertNil(runner.test_brushTrainStepRate(from: "no rate here"))
+    }
+
     func testToolLogFiltering() throws {
         let root = try TestFileBuilder.makeTempDir()
         defer { try? FileManager.default.removeItem(at: root) }
@@ -215,6 +232,8 @@ final class PipelineRunnerHelperTests: XCTestCase {
         XCTAssertTrue(runner.test_shouldEmitToolLogLine("warning: low confidence", isError: false))
         XCTAssertTrue(runner.test_shouldEmitToolLogLine("ERROR: failed to open", isError: false))
         XCTAssertTrue(runner.test_shouldEmitToolLogLine("something bad", isError: true))
+        XCTAssertFalse(runner.test_shouldEmitToolLogLine("\u{1B}[2K\u{1B}[1B", isError: true))
+        XCTAssertFalse(runner.test_shouldEmitToolLogLine("██████ 70/40000 Steps (0.9/s, 12h remaining)", isError: true))
         XCTAssertFalse(runner.test_shouldEmitToolLogLine("normal progress line", isError: false))
         XCTAssertFalse(runner.test_shouldEmitToolLogLine("   ", isError: false))
     }

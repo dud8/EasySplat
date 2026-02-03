@@ -30,6 +30,30 @@ final class PipelineRunnerImageFilteringTests: XCTestCase {
         XCTAssertEqual(images.first?.lastPathComponent, "frame_000001.jpg")
     }
 
+    func testLoadPhotosFiltersDirectories() throws {
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+
+        let imageURL = dir.appendingPathComponent("photo.jpg")
+        try writeImage(url: imageURL, size: 16, value: 42)
+        let bundleDir = dir.appendingPathComponent("album.jpg", isDirectory: true)
+        try FileManager.default.createDirectory(at: bundleDir, withIntermediateDirectories: true)
+
+        let projectURL = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(at: projectURL, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: projectURL) }
+
+        let vggt = try TestToolchains.vggtToolchain(root: projectURL)
+        let toolchain = ToolchainPaths(root: projectURL, colmap: projectURL, glomap: projectURL, brush: projectURL, vggt: vggt)
+        let config = PipelineRunner.PipelineConfig(toolchain: toolchain, preset: PresetSpec(mode: .object, quality: .standard))
+        let runner = PipelineRunner(projectURL: projectURL, config: config)
+
+        let photos = try runner.loadPhotosForTesting(in: dir)
+        XCTAssertEqual(photos.count, 1)
+        XCTAssertEqual(photos.first?.lastPathComponent, "photo.jpg")
+    }
+
     private func writeImage(url: URL, size: Int, value: UInt8) throws {
         let width = size
         let height = size
