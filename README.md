@@ -2,7 +2,7 @@
 
 EasySplat is a macOS-only (Apple Silicon) desktop app that turns videos or image folders into 3D Gaussian splats using a bundled toolchain (primarily VGGT-MPS + Brush), with a beginner-friendly UI and progress tracking.
 
-COLMAP/GLOMAP support remains in the toolchain as a fallback / legacy path. The older MASt3R-based learned matcher is currently deprecated.
+COLMAP/GLOMAP support remains in the toolchain as a fallback / legacy path.
 
 The app downloads a signed `manifest.json` that lists toolchain artifacts (typically split into a smaller “core” zip and a large “models” zip).
 
@@ -19,7 +19,6 @@ The app downloads a signed `manifest.json` that lists toolchain artifacts (typic
 - `EasySplatCore/`: core library (pipeline + toolchain integration).
 - `Tools/ManifestTool/`: Swift CLI to generate keypairs and sign manifests.
 - `Tools/VggtSfm/`: Python package shipped in the toolchain (VGGT → COLMAP bridge).
-- `Tools/LearnedSfm/`: legacy/deprecated learned SfM path.
 - `ThirdParty/MetalSplatter/`: vendored SwiftPM dependency.
 - `Toolchains/`: local toolchain build outputs (`build/`, `out/`), plus dev-only keys/manifest (gitignored).
 - `scripts/`: development, testing, and release automation.
@@ -178,7 +177,3 @@ Run all tests:
 
 Note: UI test target is a placeholder in SwiftPM (XCUITest requires an Xcode project).
 Note: `./scripts/test.sh` requires a full Xcode install (Command Line Tools alone do not include XCTest).
-
-## Deprecated: learned_sfm / MASt3R
-
-The MASt3R‑based learned matcher is deprecated for now. The current default SfM backend is VGGT‑MPS.

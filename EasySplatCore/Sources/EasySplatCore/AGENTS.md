@@ -5,7 +5,7 @@ Core library that orchestrates toolchain management and the end-to-end reconstru
 ## Key layout
 - `Pipeline/`: pipeline stages, progress events, logging, and retry logic (`PipelineRunner`, `PipelineStage`, `PipelineEvent`).
 - `Project/`: project metadata and file layout (`ProjectPaths`, `ProjectMetadataStore`).
-- `SfM/`: wrappers around COLMAP/GLOMAP/VGGT plus learned matching helpers.
+- `SfM/`: wrappers around COLMAP/GLOMAP/VGGT.
 - `Tools/`: toolchain manifest parsing, downloads, validation, and subprocess utilities (`ToolchainManager`, `SubprocessRunner`).
 - `Video/`: frame extraction and selection heuristics.
 - `Training/`: Brush training runner.
@@ -16,7 +16,6 @@ Core library that orchestrates toolchain management and the end-to-end reconstru
 - Run external binaries via `SubprocessRunner`; route stdout/stderr through `ToolLogWriter` and `TextTails`.
 - Toolchain changes must stay compatible with `ToolchainManifest` and `ToolchainManager` validation rules.
 - Keep pipeline stage transitions emitting `PipelineEvent` updates for UI progress tracking.
-- Respect deprecated learned SfM paths; prefer VGGT-MPS where possible.
 
 ## Tests
 - Add or update tests in `EasySplatCore/Tests/EasySplatCoreTests/` when changing pipeline logic, toolchain validation, or path rules.
