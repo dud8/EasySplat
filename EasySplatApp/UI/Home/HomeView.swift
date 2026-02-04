@@ -140,31 +140,56 @@ struct HomeView: View {
     }
 
     private var settingsPanel: some View {
-        HStack(spacing: 20) {
-            VStack(alignment: .leading, spacing: 6) {
-                Text("Mode")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                Picker("Mode", selection: $model.captureMode) {
-                    Text("Object").tag(CaptureMode.object)
-                    Text("Room").tag(CaptureMode.room)
-                }
-                .pickerStyle(.segmented)
-                .frame(width: 220)
-            }
-            VStack(alignment: .leading, spacing: 6) {
-                Text("Quality")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                Picker("Quality", selection: $model.qualityPreset) {
-                    Text("Draft").tag(QualityPreset.draft)
-                    Text("Standard").tag(QualityPreset.standard)
-                    Text("Ultra").tag(QualityPreset.ultra)
-                }
-                .pickerStyle(.segmented)
-                .frame(width: 320)
-            }
+        ViewThatFits(in: .horizontal) {
+            settingsPanelHorizontal
+            settingsPanelVertical
         }
         .padding(.top, 8)
+    }
+
+    private var settingsPanelHorizontal: some View {
+        HStack(spacing: 20) {
+            modePicker
+                .frame(minWidth: 180, maxWidth: 240, alignment: .leading)
+                .layoutPriority(1)
+            qualityPicker
+                .frame(minWidth: 240, maxWidth: 360, alignment: .leading)
+                .layoutPriority(1)
+        }
+    }
+
+    private var settingsPanelVertical: some View {
+        VStack(alignment: .leading, spacing: 16) {
+            modePicker
+            qualityPicker
+        }
+        .frame(maxWidth: 420, alignment: .leading)
+    }
+
+    private var modePicker: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Text("Mode")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+            Picker("Mode", selection: $model.captureMode) {
+                Text("Object").tag(CaptureMode.object)
+                Text("Room").tag(CaptureMode.room)
+            }
+            .pickerStyle(.segmented)
+        }
+    }
+
+    private var qualityPicker: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Text("Quality")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+            Picker("Quality", selection: $model.qualityPreset) {
+                Text("Draft").tag(QualityPreset.draft)
+                Text("Standard").tag(QualityPreset.standard)
+                Text("Ultra").tag(QualityPreset.ultra)
+            }
+            .pickerStyle(.segmented)
+        }
     }
 }

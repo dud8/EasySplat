@@ -18,14 +18,14 @@ private struct DisclosureButtonBody: View {
         return configuration.label
             .padding(8)
             .background(
-                RoundedRectangle(cornerRadius: 8, style: .continuous)
+                RoundedRectangle(cornerRadius: Theme.Radius.button, style: .continuous)
                     .fill(hoverBackground)
                     .overlay(
-                        RoundedRectangle(cornerRadius: 8, style: .continuous)
+                        RoundedRectangle(cornerRadius: Theme.Radius.button, style: .continuous)
                             .strokeBorder(hoverBorder, lineWidth: 1)
                     )
             )
-            .contentShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+            .contentShape(RoundedRectangle(cornerRadius: Theme.Radius.button, style: .continuous))
             .onHover { hovering in
                 isHovering = hovering
             }

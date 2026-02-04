@@ -54,12 +54,15 @@ Current tokens:
 - `Theme.success`: completion and positive state
 - `Theme.subtle`: secondary text
 
+Destructive color
+- Destructive actions use the system red via `SecondaryButtonStyle(variant: .destructive)`.
+
 Rules
 - Do not introduce hard-coded colors in views. Always use Theme tokens.
 - Accent is reserved for primary actions and active states (current step, primary buttons).
 - Border is low-contrast; do not use it for emphasis.
 - Success is reserved for completed steps and ready states.
-- For destructive actions, use the system-provided destructive role and default red text.
+- For destructive actions, use `SecondaryButtonStyle(variant: .destructive)` and a destructive role.
 
 ### Typography
 We use SwiftUI system fonts with consistent semantic roles. Do not introduce custom fonts or new styles without updating this guide.
@@ -86,7 +89,7 @@ Radius tokens (from `Theme.Radius`):
 
 Rules
 - Use continuous corners (`style: .continuous`) for all cards and controls.
-- Do not invent new corner radius sizes unless absolutely necessary. If you do, add a token and update this guide.
+- Do not invent new corner radius sizes. Always use `Theme.Radius.button`, `Theme.Radius.card`, or `Theme.Radius.dropZone`.
 
 ### Elevation and depth
 Depth is subtle and used sparingly for hover affordance.
@@ -116,6 +119,7 @@ The UI currently uses a small, consistent set of spacing values:
 Rules
 - All screens should use a single, consistent outer padding value.
 - Keep the main content column left-aligned unless a specific viewer requires centering.
+- Avoid hard-coded widths for pickers and segmented controls. Prefer adaptive sizing with `ViewThatFits` and min/max width constraints.
 
 ### Composition guidance
 - Prefer vertical stacks with clear grouping.
@@ -134,7 +138,8 @@ Rules
 Rules
 - Each screen should have a single primary action, if any.
 - Secondary actions should never visually compete with the primary action.
-- Destructive actions should use a destructive role and be secondary in prominence.
+- Destructive actions must use `SecondaryButtonStyle(variant: .destructive)` plus a destructive role and remain secondary in prominence.
+- Use `SecondaryButtonStyle(variant: .subtleAccent)` for “return” or “back” actions that should be noticeable but not primary.
 
 ### Hover and press feedback
 Hover and press feedback is required for every interactive control.
@@ -209,9 +214,14 @@ Purpose
 Visual
 - Background: `Theme.surface`
 - Border: `Theme.border`
-- Text: `.primary`
+- Text: `.primary` (or red for `.destructive`)
 - Hover: subtle accent tint and border tint
 - Press: slightly stronger tint
+
+Variants
+- `.standard`: default secondary styling
+- `.subtleAccent`: faint accent-tinted fill to highlight soft-priority actions (must be visibly distinct from `.standard`)
+- `.destructive`: red-tinted border and label to signal destructive actions
 
 Interaction
 - Same motion rules as primary
@@ -263,12 +273,16 @@ Purpose
 
 Visual
 - Card surface with subtle border
-- Active stage uses accent
-- Completed stages use success
+- Active stage uses accent and a ring indicator
+- Completed stages use success with a checkmark indicator
+- Upcoming stages use a hollow indicator
 
 Motion
 - Active step breathes when Reduce Motion is off
 - Static when Reduce Motion is on
+
+Accessibility
+- Each stage must include an explicit accessibility value: “Completed”, “In progress”, or “Upcoming”.
 
 ### LogDrawerView (`EasySplatApp/UI/Components/LogDrawerView.swift`)
 Purpose
@@ -278,6 +292,7 @@ Behavior
 - Disclosure button toggles visibility
 - Transition uses opacity + move when Reduce Motion is off
 - Instant toggle when Reduce Motion is on
+- Do not show a divider unless there is actual detail text
 
 Visual
 - Logs are monospaced caption text
@@ -292,7 +307,11 @@ Visual
 - Status indicator uses `Theme.success`, `Theme.accent`, or red for failure
 
 Interaction
-- Row actions are all secondary buttons
+- Row actions are secondary buttons; destructive actions use `SecondaryButtonStyle(variant: .destructive)`
+
+Layout
+- Project titles must truncate to a single line.
+- Status labels must remain visible (use fixed size or layout priority).
 
 ### Viewer Overlay (`EasySplatApp/Viewer/SplatViewerView.swift`)
 Purpose
@@ -389,6 +408,39 @@ After (preferred)
 
 Why
 - Transitions should be subtle and legible, and never override accessibility preferences.
+
+### Segmented controls: responsive sizing
+Before (avoid)
+```
+Picker("Quality", selection: $model.qualityPreset) { ... }
+    .pickerStyle(.segmented)
+    .frame(width: 320)
+```
+After (preferred)
+```
+ViewThatFits(in: .horizontal) {
+    HStack { qualityPicker; modePicker }
+    VStack(alignment: .leading) { qualityPicker; modePicker }
+}
+```
+
+Why
+- Segmented controls must remain readable at narrow window sizes and under localization.
+
+### Buttons: destructive actions
+Before (avoid)
+```
+Button("Delete") { ... }
+    .buttonStyle(SecondaryButtonStyle())
+```
+After (preferred)
+```
+Button("Delete", role: .destructive) { ... }
+    .buttonStyle(SecondaryButtonStyle(variant: .destructive))
+```
+
+Why
+- Destructive actions must be visually distinct and clearly risky without stealing primary-action emphasis.
 
 ### Card surfaces
 Before (avoid)
@@ -507,6 +559,7 @@ Reduce Motion
 Contrast
 - Text must be legible on `Theme.surface` and `Theme.background`
 - Avoid using color alone to convey meaning
+- For status, include a secondary cue (icon, shape, or label) plus an explicit accessibility value
 
 Touch/Click targets
 - Buttons must remain at least the size implied by their padding and control size
@@ -535,6 +588,8 @@ If you add or change UI:
 1) Implement using existing styles or extend them in `Theme`.
 2) Update this document with any new component rules.
 3) Validate Reduce Motion behavior.
-4) Ensure the new UI preserves the "simple surface, rich feedback" principle.
+4) Ensure no hard-coded radii or fixed-width segmented controls were introduced.
+5) Ensure status is communicated with non-color cues and accessibility values.
+6) Ensure the new UI preserves the "simple surface, rich feedback" principle.
 
 The style guide must stay current. If it drifts from the actual UI, it is no longer authoritative.

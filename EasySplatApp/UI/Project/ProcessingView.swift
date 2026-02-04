@@ -96,11 +96,11 @@ struct ProcessingView: View {
                     }
                     .padding(20)
                     .background(
-                        RoundedRectangle(cornerRadius: 12, style: .continuous)
+                        RoundedRectangle(cornerRadius: Theme.Radius.card, style: .continuous)
                             .fill(Theme.surface)
                     )
                     .overlay(
-                        RoundedRectangle(cornerRadius: 12, style: .continuous)
+                        RoundedRectangle(cornerRadius: Theme.Radius.card, style: .continuous)
                             .stroke(Theme.border)
                     )
                 }

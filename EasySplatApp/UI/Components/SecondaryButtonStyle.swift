@@ -4,6 +4,7 @@ struct SecondaryButtonStyle: ButtonStyle {
     enum Variant {
         case standard
         case subtleAccent
+        case destructive
     }
 
     var variant: Variant = .standard
@@ -31,7 +32,7 @@ private struct SecondaryButtonBody: View {
         return configuration.label
             .padding(.horizontal, padding.horizontal)
             .padding(.vertical, padding.vertical)
-            .foregroundStyle(isEnabled ? .primary : .secondary)
+            .foregroundStyle(labelColor)
             .background(
                 RoundedRectangle(cornerRadius: Theme.Radius.button, style: .continuous)
                     .fill(Theme.surface)
@@ -64,7 +65,9 @@ private struct SecondaryButtonBody: View {
         case .standard:
             return Color.clear
         case .subtleAccent:
-            return Color.clear
+            return accentColor.opacity(0.08)
+        case .destructive:
+            return accentColor.opacity(0.06)
         }
     }
 
@@ -73,10 +76,10 @@ private struct SecondaryButtonBody: View {
             return Color.clear
         }
         if configuration.isPressed {
-            return Theme.accent.opacity(0.10)
+            return accentColor.opacity(0.12)
         }
         if isHovering {
-            return Theme.accent.opacity(0.06)
+            return accentColor.opacity(0.08)
         }
         return Color.clear
     }
@@ -86,16 +89,18 @@ private struct SecondaryButtonBody: View {
             return Theme.border.opacity(0.6)
         }
         if configuration.isPressed {
-            return Theme.accent.opacity(0.32)
+            return accentColor.opacity(0.32)
         }
         if isHovering {
-            return Theme.accent.opacity(0.25)
+            return accentColor.opacity(0.25)
         }
         switch variant {
         case .standard:
             return Theme.border
         case .subtleAccent:
-            return Theme.accent.opacity(0.14)
+            return accentColor.opacity(0.16)
+        case .destructive:
+            return accentColor.opacity(0.3)
         }
     }
 
@@ -132,5 +137,24 @@ private struct SecondaryButtonBody: View {
         default:
             return (16, 9)
         }
+    }
+
+    private var accentColor: Color {
+        switch variant {
+        case .standard, .subtleAccent:
+            return Theme.accent
+        case .destructive:
+            return .red
+        }
+    }
+
+    private var labelColor: Color {
+        if !isEnabled {
+            return .secondary
+        }
+        if variant == .destructive {
+            return accentColor
+        }
+        return .primary
     }
 }

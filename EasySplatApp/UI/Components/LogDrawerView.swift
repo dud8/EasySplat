@@ -10,6 +10,11 @@ struct LogDrawerView: View {
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     var body: some View {
+        let trimmedDetailsText = detailsText?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        let hasDetailsText = !trimmedDetailsText.isEmpty
+        let rawCopyText = copyText ?? ""
+        let hasCopyText = !rawCopyText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+
         VStack(alignment: .leading, spacing: 8) {
             Button(action: toggleExpanded) {
                 HStack {
@@ -26,15 +31,15 @@ struct LogDrawerView: View {
             if expanded {
                 ScrollView {
                     LazyVStack(alignment: .leading, spacing: 4) {
-                        if let detailsText, !detailsText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                            Text(detailsText)
+                        if hasDetailsText {
+                            Text(trimmedDetailsText)
                                 .font(.caption.monospaced())
                                 .foregroundStyle(.secondary)
                                 .frame(maxWidth: .infinity, alignment: .leading)
                         }
 
                         if !lines.isEmpty {
-                            if detailsText != nil {
+                            if hasDetailsText {
                                 Divider()
                             }
                             ForEach(lines.indices, id: \.self) { index in
@@ -45,20 +50,20 @@ struct LogDrawerView: View {
                             }
                         }
 
-                        if (detailsText == nil || detailsText?.isEmpty == true) && lines.isEmpty {
+                        if !hasDetailsText && lines.isEmpty {
                             Text("No details yet.")
                                 .font(.caption)
                                 .foregroundStyle(.secondary)
                                 .frame(maxWidth: .infinity, alignment: .leading)
                         }
 
-                        if let copyText, !copyText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                        if hasCopyText {
                             HStack {
                                 Spacer()
                                 Button("Copy Details") {
                                     let pasteboard = NSPasteboard.general
                                     pasteboard.clearContents()
-                                    pasteboard.setString(copyText, forType: .string)
+                                    pasteboard.setString(rawCopyText, forType: .string)
                                 }
                                 .buttonStyle(SecondaryButtonStyle())
                                 .controlSize(.small)
@@ -70,11 +75,11 @@ struct LogDrawerView: View {
                 .frame(maxHeight: 180)
                 .padding(8)
                 .background(
-                    RoundedRectangle(cornerRadius: 10, style: .continuous)
+                    RoundedRectangle(cornerRadius: Theme.Radius.card, style: .continuous)
                         .fill(Theme.surface)
                 )
                 .overlay(
-                    RoundedRectangle(cornerRadius: 10, style: .continuous)
+                    RoundedRectangle(cornerRadius: Theme.Radius.card, style: .continuous)
                         .stroke(Theme.border)
                 )
                 .transition(.opacity.combined(with: .move(edge: .top)))

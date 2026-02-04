@@ -20,16 +20,18 @@ struct StepperProgressView: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
             ForEach(displayStages, id: \.self) { stage in
-                let isCurrent = stage == currentStage
+                let status = status(for: stage)
+                let color = statusColor(for: status)
                 HStack(spacing: 10) {
-                    Circle()
-                        .fill(color(for: stage))
-                        .frame(width: 10, height: 10)
+                    StageIndicator(status: status, color: color)
                     Text(stage.displayName)
                         .font(.subheadline.weight(.medium))
-                        .foregroundStyle(color(for: stage))
+                        .foregroundStyle(color)
                 }
-                .modifier(BreathingOpacity(isActive: isCurrent))
+                .modifier(BreathingOpacity(isActive: status == .current))
+                .accessibilityElement(children: .combine)
+                .accessibilityLabel(Text(stage.displayName))
+                .accessibilityValue(Text(accessibilityValue(for: status)))
             }
         }
         .padding(16)
@@ -43,15 +45,72 @@ struct StepperProgressView: View {
         )
     }
 
-    private func color(for stage: PipelineStage) -> Color {
-        guard let currentStage else { return Theme.subtle }
-        if stage == currentStage { return Theme.accent }
+    private func status(for stage: PipelineStage) -> StageStatus {
+        guard let currentStage else { return .upcoming }
+        if stage == currentStage { return .current }
         if let currentIndex = displayStages.firstIndex(of: currentStage),
            let stageIndex = displayStages.firstIndex(of: stage),
            stageIndex < currentIndex {
-            return Theme.success
+            return .completed
         }
-        return Theme.subtle
+        return .upcoming
+    }
+
+    private func statusColor(for status: StageStatus) -> Color {
+        switch status {
+        case .completed:
+            return Theme.success
+        case .current:
+            return Theme.accent
+        case .upcoming:
+            return Theme.subtle
+        }
+    }
+
+    private func accessibilityValue(for status: StageStatus) -> String {
+        switch status {
+        case .completed:
+            return "Completed"
+        case .current:
+            return "In progress"
+        case .upcoming:
+            return "Upcoming"
+        }
+    }
+}
+
+private enum StageStatus {
+    case completed
+    case current
+    case upcoming
+}
+
+private struct StageIndicator: View {
+    let status: StageStatus
+    let color: Color
+
+    var body: some View {
+        ZStack {
+            switch status {
+            case .completed:
+                Circle()
+                    .fill(color)
+                Image(systemName: "checkmark")
+                    .font(.system(size: 7, weight: .bold))
+                    .foregroundStyle(.white)
+            case .current:
+                Circle()
+                    .strokeBorder(color, lineWidth: 2)
+                Circle()
+                    .fill(color)
+                    .frame(width: 4, height: 4)
+            case .upcoming:
+                Circle()
+                    .strokeBorder(color.opacity(0.7), lineWidth: 2)
+            }
+        }
+        .frame(width: 12, height: 12)
+        .accessibilityHidden(true)
     }
 }
 
