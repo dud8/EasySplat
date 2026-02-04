@@ -17,13 +17,16 @@ public enum ReconstructionScorer {
             if line.lowercased().contains("registered images") {
                 let numbers = line.components(separatedBy: CharacterSet.decimalDigits.inverted).compactMap(Int.init)
                 if numbers.count >= 2 {
-                    registered = numbers[0]
-                    total = numbers[1]
+                    let last = numbers[numbers.count - 1]
+                    let prev = numbers[numbers.count - 2]
+                    registered = prev
+                    total = last
                 }
             }
             if line.lowercased().contains("mean reprojection error") {
                 let parts = line.components(separatedBy: CharacterSet(charactersIn: "0123456789.").inverted)
-                if let value = parts.compactMap(Double.init).first {
+                let values = parts.compactMap(Double.init)
+                if let value = values.last {
                     reprojection = value
                 }
             }

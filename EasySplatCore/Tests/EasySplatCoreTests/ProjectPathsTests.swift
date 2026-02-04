@@ -14,7 +14,6 @@ final class ProjectPathsTests: XCTestCase {
         XCTAssertTrue(fm.fileExists(atPath: paths.framesRawURL.path))
         XCTAssertTrue(fm.fileExists(atPath: paths.framesSelectedURL.path))
         XCTAssertTrue(fm.fileExists(atPath: paths.colmapSparseURL.path))
-        XCTAssertTrue(fm.fileExists(atPath: paths.sfmLearnedFeaturesURL.path))
         XCTAssertTrue(fm.fileExists(atPath: paths.trainingURL.path))
         XCTAssertTrue(fm.fileExists(atPath: paths.outputURL.path))
         XCTAssertTrue(fm.fileExists(atPath: paths.logsURL.path))

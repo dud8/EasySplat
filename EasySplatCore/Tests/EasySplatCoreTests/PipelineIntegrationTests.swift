@@ -870,8 +870,7 @@ final class PipelineIntegrationTests: XCTestCase {
 
     private func makeToolchain(
         root: URL,
-        createVggtFiles: Bool = false,
-        createLearnedFiles: Bool = false
+        createVggtFiles: Bool = false
     ) throws -> ToolchainPaths {
         let fm = FileManager.default
         let toolchainRoot = root.appendingPathComponent("Toolchain", isDirectory: true)
@@ -895,14 +894,12 @@ final class PipelineIntegrationTests: XCTestCase {
         let brush = try writeStub("brush")
 
         let vggt = try TestToolchains.vggtToolchain(root: toolchainRoot, createFiles: createVggtFiles)
-        let learned = createLearnedFiles ? try TestToolchains.learnedSfmToolchain(root: toolchainRoot, createFiles: true) : nil
         return ToolchainPaths(
             root: toolchainRoot,
             colmap: colmap,
             glomap: glomap,
             brush: brush,
-            vggt: vggt,
-            learnedSfm: learned
+            vggt: vggt
         )
     }
 }

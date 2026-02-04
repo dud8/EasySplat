@@ -1,4 +1,5 @@
 import argparse
+import copy
 import gc
 import math
 import os
@@ -134,6 +135,67 @@ def _write_colmap_text_model(
         f.write(f"# Number of points: {len(points_xyz)}, mean track length: 0\n")
         for idx, (xyz, rgb) in enumerate(zip(points_xyz, points_rgb), start=1):
             f.write(f"{idx} {xyz[0]} {xyz[1]} {xyz[2]} {int(rgb[0])} {int(rgb[1])} {int(rgb[2])} 1.0\n")
+
+
+def _rename_colmap_recons_and_rescale_camera(
+    reconstruction,
+    image_paths: list[str],
+    original_coords: np.ndarray,
+    img_size: int,
+    shift_point2d_to_original_res: bool,
+    shared_camera: bool,
+):
+    rescale_camera = True
+    resize_ratio = 1.0
+
+    for pyimageid in reconstruction.images:
+        pyimage = reconstruction.images[pyimageid]
+        pycamera = reconstruction.cameras[pyimage.camera_id]
+        pyimage.name = image_paths[pyimageid - 1]
+
+        if rescale_camera:
+            pred_params = copy.deepcopy(pycamera.params)
+
+            real_image_size = original_coords[pyimageid - 1, -2:]
+            resize_ratio = max(real_image_size) / img_size
+            pred_params = pred_params * resize_ratio
+            real_pp = real_image_size / 2
+            pred_params[-2:] = real_pp
+
+            pycamera.params = pred_params
+            pycamera.width = real_image_size[0]
+            pycamera.height = real_image_size[1]
+
+        if shift_point2d_to_original_res:
+            top_left = original_coords[pyimageid - 1, :2]
+            for point2D in pyimage.points2D:
+                point2D.xy = (point2D.xy - top_left) * resize_ratio
+
+        if shared_camera:
+            rescale_camera = False
+
+    return reconstruction
+
+
+def _load_images_square(
+    image_paths: list[Path],
+    target_size: int,
+):
+    from vggt.utils.load_fn import load_and_preprocess_images_square
+
+    images_cpu, original_coords = load_and_preprocess_images_square(
+        [str(p) for p in image_paths],
+        target_size=int(target_size),
+    )
+
+    original_coords_np = original_coords.cpu().numpy()
+    original_sizes_wh: list[tuple[int, int]] = []
+    for row in original_coords_np:
+        w = int(round(float(row[4])))
+        h = int(round(float(row[5])))
+        original_sizes_wh.append((w, h))
+
+    return images_cpu, original_coords, original_sizes_wh
 
 
 def _load_state_dict(path: Path, device: torch.device) -> dict:
@@ -342,6 +404,17 @@ def main(argv: list[str] | None = None) -> int:
     # because VGGT's global attention scales superlinearly with the number of views.
     parser.add_argument("--chunk-size", type=int, default=int(os.environ.get("EASYSPLAT_VGGT_CHUNK_SIZE", "6")))
     parser.add_argument("--chunk-overlap", type=int, default=int(os.environ.get("EASYSPLAT_VGGT_CHUNK_OVERLAP", "2")))
+    parser.add_argument("--use-ba", action="store_true", default=False, help="Enable bundle adjustment refinement.")
+    parser.add_argument("--max-reproj-error", type=float, default=8.0)
+    parser.add_argument("--shared-camera", action="store_true", default=False)
+    parser.add_argument("--camera-type", type=str, default="SIMPLE_PINHOLE")
+    parser.add_argument("--vis-thresh", type=float, default=0.2)
+    parser.add_argument("--query-frame-num", type=int, default=8)
+    parser.add_argument("--max-query-pts", type=int, default=4096)
+    parser.add_argument("--keypoint-extractor", type=str, default="aliked+sp")
+    parser.add_argument("--fine-tracking", dest="fine_tracking", action="store_true", default=True)
+    parser.add_argument("--no-fine-tracking", dest="fine_tracking", action="store_false")
+    parser.add_argument("--ba-max-frames", type=int, default=0)
     args = parser.parse_args(argv)
 
     images_dir = Path(args.images)
@@ -385,6 +458,118 @@ def main(argv: list[str] | None = None) -> int:
     model.load_state_dict(state)
     model.eval()
     model = model.to(device)
+
+    if args.use_ba:
+        max_ba_frames = int(args.ba_max_frames or 0)
+        if max_ba_frames <= 0 and device.type == "mps":
+            max_ba_frames = 32
+        if max_ba_frames > 0 and len(image_paths) > max_ba_frames:
+            print(
+                "VGGT: BA disabled for long sequences; falling back to feed-forward.",
+                file=sys.stderr
+            )
+        else:
+            ba_failed = False
+            try:
+                import pycolmap  # noqa: F401
+                from vggt.dependency.track_predict import predict_tracks
+                from vggt.dependency.np_to_pycolmap import batch_np_matrix_to_pycolmap
+                from vggt.utils.geometry import unproject_depth_map_to_point_map
+            except Exception as e:
+                print(f"VGGT: BA dependencies unavailable: {e}", file=sys.stderr)
+                ba_failed = True
+
+            if not ba_failed:
+                print("VGGT: BA enabled (tracking + bundle adjustment).")
+                images_cpu, original_coords, _ = _load_images_square(image_paths, int(args.img_load_resolution))
+                images = images_cpu.to(device)
+
+                vggt_res = int(args.vggt_resolution)
+                images_resized = F.interpolate(images, size=(vggt_res, vggt_res), mode="bilinear", align_corners=False)
+
+                with torch.no_grad():
+                    if device.type == "cuda":
+                        with torch.cuda.amp.autocast(dtype=dtype, enabled=True):
+                            images_batched = images_resized[None]
+                            aggregated_tokens_list, ps_idx = model.aggregator(images_batched)
+                    else:
+                        images_batched = images_resized[None]
+                        aggregated_tokens_list, ps_idx = model.aggregator(images_batched)
+
+                    pose_enc = model.camera_head(aggregated_tokens_list)[-1]
+                    from vggt.utils.pose_enc import pose_encoding_to_extri_intri
+                    extrinsic, intrinsic = pose_encoding_to_extri_intri(pose_enc, images_resized.shape[-2:])
+                    depth_map, depth_conf = model.depth_head(aggregated_tokens_list, images_batched, ps_idx)
+
+                extrinsic_np = extrinsic.squeeze(0).cpu().numpy()
+                intrinsic_np = intrinsic.squeeze(0).cpu().numpy()
+
+                points_3d = unproject_depth_map_to_point_map(depth_map, extrinsic, intrinsic)
+
+                image_size = np.array(images.shape[-2:])
+                scale = float(args.img_load_resolution) / float(vggt_res)
+
+                # Predict tracks and build reconstruction with BA.
+                pred_tracks, pred_vis_scores, pred_confs, points_3d, points_rgb = predict_tracks(
+                    images,
+                    conf=depth_conf,
+                    points_3d=points_3d,
+                    masks=None,
+                    max_query_pts=int(args.max_query_pts),
+                    query_frame_num=int(args.query_frame_num),
+                    keypoint_extractor=str(args.keypoint_extractor),
+                    fine_tracking=bool(args.fine_tracking),
+                )
+                _maybe_empty_cache(device)
+
+                intrinsic_np[:, :2, :] *= scale
+                track_mask = pred_vis_scores > float(args.vis_thresh)
+
+                reconstruction, valid_track_mask = batch_np_matrix_to_pycolmap(
+                    points_3d,
+                    extrinsic_np,
+                    intrinsic_np,
+                    pred_tracks,
+                    image_size,
+                    masks=track_mask,
+                    max_reproj_error=float(args.max_reproj_error),
+                    shared_camera=bool(args.shared_camera),
+                    camera_type=str(args.camera_type),
+                    points_rgb=points_rgb,
+                )
+
+                if reconstruction is None:
+                    print("VGGT: BA reconstruction failed; falling back to feed-forward.", file=sys.stderr)
+                    ba_failed = True
+
+            if not ba_failed:
+                ba_options = pycolmap.BundleAdjustmentOptions()
+                pycolmap.bundle_adjustment(reconstruction, ba_options)
+
+                reconstruction = _rename_colmap_recons_and_rescale_camera(
+                    reconstruction,
+                    [p.name for p in image_paths],
+                    original_coords.cpu().numpy(),
+                    img_size=int(args.img_load_resolution),
+                    shift_point2d_to_original_res=True,
+                    shared_camera=bool(args.shared_camera),
+                )
+
+                out_sparse.mkdir(parents=True, exist_ok=True)
+                if hasattr(reconstruction, "write_text"):
+                    reconstruction.write_text(str(out_sparse))
+                else:
+                    reconstruction.write(str(out_sparse))
+
+                images_txt = out_sparse / "images.txt"
+                if not images_txt.exists():
+                    print("VGGT: expected images.txt missing after BA write; falling back to feed-forward.", file=sys.stderr)
+                    ba_failed = True
+
+            if not ba_failed:
+                print("VGGT: done")
+                return 0
+            print("VGGT: BA failed; continuing with feed-forward.", file=sys.stderr)
 
     # Chunked VGGT inference
     total_images = len(image_paths)

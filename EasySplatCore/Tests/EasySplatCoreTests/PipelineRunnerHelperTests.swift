@@ -54,26 +54,6 @@ final class PipelineRunnerHelperTests: XCTestCase {
         ))
     }
 
-    func testFrameGroupsFiltering() throws {
-        let root = try TestFileBuilder.makeTempDir()
-        defer { try? FileManager.default.removeItem(at: root) }
-        let runner = makeRunner(projectURL: root)
-
-        let manifest: [TestSelectedFrameMapping] = [
-            .init(outputFileName: "a.jpg", groupId: "video_000", isVideo: true, sourcePath: "/a.jpg"),
-            .init(outputFileName: "b.jpg", groupId: "video_000", isVideo: true, sourcePath: "/b.jpg"),
-            .init(outputFileName: "c.jpg", groupId: "video_001", isVideo: true, sourcePath: "/c.jpg"),
-            .init(outputFileName: "d.jpg", groupId: "photos", isVideo: false, sourcePath: "/d.jpg")
-        ]
-
-        let groups = runner.test_frameGroups(from: manifest, allowedNames: ["b.jpg", "c.jpg", "d.jpg"])
-        XCTAssertEqual(groups.count, 3)
-        XCTAssertEqual(groups[0].id, "video_000")
-        XCTAssertEqual(groups[0].fileNames, ["b.jpg"])
-        XCTAssertEqual(groups[1].id, "video_001")
-        XCTAssertEqual(groups[2].id, "photos")
-    }
-
     func testDownsampleSelectedFramesUpdatesManifest() throws {
         let root = try TestFileBuilder.makeTempDir()
         defer { try? FileManager.default.removeItem(at: root) }
@@ -168,6 +148,57 @@ final class PipelineRunnerHelperTests: XCTestCase {
         let updatedData = try Data(contentsOf: paths.framesSelectedManifestURL)
         let updated = try JSONDecoder().decode([TestSelectedFrameMapping].self, from: updatedData)
         XCTAssertEqual(updated.first?.outputFileName, "frame_000000.jpg")
+    }
+
+    func testVggtPreferencesFromEnv() throws {
+        let root = try TestFileBuilder.makeTempDir()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let runner = makeRunner(projectURL: root)
+
+        setenv("EASYSPLAT_VGGT_USE_BA", "0", 1)
+        setenv("EASYSPLAT_VGGT_MAX_REPROJ_ERROR", "9.5", 1)
+        setenv("EASYSPLAT_VGGT_SHARED_CAMERA", "1", 1)
+        setenv("EASYSPLAT_VGGT_CAMERA_TYPE", "PINHOLE", 1)
+        setenv("EASYSPLAT_VGGT_VIS_THRESH", "0.35", 1)
+        setenv("EASYSPLAT_VGGT_QUERY_FRAMES", "12", 1)
+        setenv("EASYSPLAT_VGGT_MAX_QUERY_PTS", "1024", 1)
+        setenv("EASYSPLAT_VGGT_FINE_TRACKING", "0", 1)
+        setenv("EASYSPLAT_VGGT_KEYPOINT_EXTRACTOR", "aliked", 1)
+        setenv("EASYSPLAT_VGGT_BA_MAX_FRAMES", "77", 1)
+        defer {
+            unsetenv("EASYSPLAT_VGGT_USE_BA")
+            unsetenv("EASYSPLAT_VGGT_MAX_REPROJ_ERROR")
+            unsetenv("EASYSPLAT_VGGT_SHARED_CAMERA")
+            unsetenv("EASYSPLAT_VGGT_CAMERA_TYPE")
+            unsetenv("EASYSPLAT_VGGT_VIS_THRESH")
+            unsetenv("EASYSPLAT_VGGT_QUERY_FRAMES")
+            unsetenv("EASYSPLAT_VGGT_MAX_QUERY_PTS")
+            unsetenv("EASYSPLAT_VGGT_FINE_TRACKING")
+            unsetenv("EASYSPLAT_VGGT_KEYPOINT_EXTRACTOR")
+            unsetenv("EASYSPLAT_VGGT_BA_MAX_FRAMES")
+        }
+
+        XCTAssertFalse(runner.test_vggtUseBundleAdjustmentPreference())
+        XCTAssertEqual(runner.test_vggtMaxReprojectionErrorPreference(), 9.5)
+        XCTAssertTrue(runner.test_vggtSharedCameraPreference())
+        XCTAssertEqual(runner.test_vggtCameraTypePreference(), "PINHOLE")
+        XCTAssertEqual(runner.test_vggtVisibilityThresholdPreference(), 0.35)
+        XCTAssertEqual(runner.test_vggtQueryFrameCountPreference(), 12)
+        XCTAssertEqual(runner.test_vggtMaxQueryPointsPreference(), 1024)
+        XCTAssertFalse(runner.test_vggtFineTrackingPreference())
+        XCTAssertEqual(runner.test_vggtKeypointExtractorPreference(), "aliked")
+        XCTAssertEqual(runner.test_vggtBaMaxFramesLimit(autoTuneTier: nil), 77)
+    }
+
+    func testVggtBaMaxFramesLimitDefaults() throws {
+        let root = try TestFileBuilder.makeTempDir()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let runner = makeRunner(projectURL: root)
+
+        XCTAssertEqual(runner.test_vggtBaMaxFramesLimit(autoTuneTier: .low), 24)
+        XCTAssertEqual(runner.test_vggtBaMaxFramesLimit(autoTuneTier: .mid), 48)
+        XCTAssertEqual(runner.test_vggtBaMaxFramesLimit(autoTuneTier: .high), 96)
+        XCTAssertEqual(runner.test_vggtBaMaxFramesLimit(autoTuneTier: nil), 32)
     }
 
     func testBrushExportStepParsing() throws {

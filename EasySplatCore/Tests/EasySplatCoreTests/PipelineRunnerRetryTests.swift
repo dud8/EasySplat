@@ -69,14 +69,12 @@ final class PipelineRunnerRetryTests: XCTestCase {
         try paths.ensureDirectories()
 
         TestFileBuilder.createFile(at: paths.framesSelectedManifestURL, data: Data([0x01]))
-        TestFileBuilder.createFile(at: paths.sfmPairListURL, data: Data([0x02]))
         TestFileBuilder.createFile(at: paths.colmapDatabaseURL, data: Data([0x03]))
 
         let runner = makeRunner(projectURL: root)
         try runner.test_cleanForRetry(failedStage: .selectFrames, paths: paths)
 
         XCTAssertFalse(FileManager.default.fileExists(atPath: paths.framesSelectedManifestURL.path))
-        XCTAssertFalse(FileManager.default.fileExists(atPath: paths.sfmPairListURL.path))
         XCTAssertFalse(FileManager.default.fileExists(atPath: paths.colmapDatabaseURL.path))
     }
 

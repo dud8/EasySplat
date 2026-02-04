@@ -109,8 +109,7 @@ enum ToolchainFixtureBuilder {
             colmap: fixture.colmap,
             glomap: fixture.glomap,
             brush: fixture.brush,
-            vggt: vggt,
-            learnedSfm: nil
+            vggt: vggt
         )
     }
 }

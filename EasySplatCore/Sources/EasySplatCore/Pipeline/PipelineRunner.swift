@@ -10,18 +10,15 @@ public final class PipelineRunner: @unchecked Sendable {
         public var glomap: GlomapRunner
         public var brush: BrushRunner
         public var vggtSfm: VggtSfmRunning
-        public var learnedMatching: LearnedMatchingRunning
 
         public init(colmap: ColmapRunner = ColmapRunner(),
                     glomap: GlomapRunner = GlomapRunner(),
                     brush: BrushRunner = BrushRunner(),
-                    vggtSfm: VggtSfmRunning = VggtSfmRunner(),
-                    learnedMatching: LearnedMatchingRunning = LearnedMatchingRunner()) {
+                    vggtSfm: VggtSfmRunning = VggtSfmRunner()) {
             self.colmap = colmap
             self.glomap = glomap
             self.brush = brush
             self.vggtSfm = vggtSfm
-            self.learnedMatching = learnedMatching
         }
 
         public init(runner: SubprocessRunning) {
@@ -29,7 +26,6 @@ public final class PipelineRunner: @unchecked Sendable {
             self.glomap = GlomapRunner(runner: runner)
             self.brush = BrushRunner(runner: runner)
             self.vggtSfm = VggtSfmRunner(runner: runner)
-            self.learnedMatching = LearnedMatchingRunner(runner: runner)
         }
     }
     public struct PipelineConfig: Sendable {
@@ -147,9 +143,6 @@ public final class PipelineRunner: @unchecked Sendable {
             colmapMatchOptions.useGPU = preferColmapGpu
             var selectedFrames: [URL] = []
             var selectedFrameManifest: [SelectedFrameMapping] = []
-            var learnedPairsFile: URL? = nil
-            var learnedMpsAvailable = false
-
             if metadata.input.hasVideos {
                 if shouldRunStage(.extractFrames) {
                     currentStage = .extractFrames
@@ -206,7 +199,6 @@ public final class PipelineRunner: @unchecked Sendable {
                     emit(.stageStarted(stage: .selectFrames))
                     try self.resetDirectory(paths.framesSelectedURL)
                     self.removeIfExists(paths.framesSelectedManifestURL)
-                    self.removeIfExists(paths.sfmPairListURL)
                     var groups: [SelectedFrameGroup] = []
 
                     if metadata.input.hasVideos {
@@ -299,13 +291,31 @@ public final class PipelineRunner: @unchecked Sendable {
                 selectedFrameManifest = (try? loadSelectedFrameManifest(from: paths.framesSelectedManifestURL)) ?? selectedFrameManifest
             }
 
+            var autoTuneProfile: AutoTuneProfile? = nil
+            if shouldAutoTune() {
+                let detected = HardwareProfile.detect()
+                let tune = AutoTuner.make(
+                    profile: detected,
+                    preset: metadata.preset,
+                    selectedFrameCount: selectedFrames.count
+                )
+                autoTuneProfile = tune
+                applyAutoTune(
+                    tune,
+                    colmapMaxImageSize: &colmapMaxImageSize,
+                    colmapExtractOptions: &colmapExtractOptions,
+                    colmapMatchOptions: &colmapMatchOptions
+                )
+                emit(.stageLog(stage: .sfmFeatures, line: tune.summary(profile: detected), isError: false))
+            }
+
             try Task.checkCancellation()
             var backendPolicy = sfmBackendPolicy()
-            let enableDeprecatedLearned = ProcessInfo.processInfo.environment["EASYSPLAT_ENABLE_DEPRECATED_LEARNED"] == "1"
-            if backendPolicy == .learned && !enableDeprecatedLearned {
+
+            if backendPolicy == .vggt, let autoTuneProfile, !autoTuneProfile.vggtAllowed {
                 emit(.stageLog(
                     stage: .sfmFeatures,
-                    line: "SfM backend learned_sfm (MASt3R) is deprecated and disabled; falling back to COLMAP. Set EASYSPLAT_ENABLE_DEPRECATED_LEARNED=1 to override.",
+                    line: "Auto-tune disabled VGGT on this hardware tier; falling back to COLMAP + GLOMAP.",
                     isError: true
                 ))
                 backendPolicy = .colmap
@@ -325,17 +335,47 @@ public final class PipelineRunner: @unchecked Sendable {
                     try self.resetDirectory(paths.colmapSparseURL)
                     try self.resetDirectory(sparseZero)
 
+                    let vggtDevice = vggtDevicePreference()
+                    let baMaxFrames = vggtBaMaxFramesLimit(autoTune: autoTuneProfile)
+                    var useBA = vggtUseBundleAdjustmentPreference()
+                    if useBA, vggtDevice == "mps", baMaxFrames > 0, selectedFrames.count > baMaxFrames {
+                        emit(.stageLog(
+                            stage: .sfmFeatures,
+                            line: "Auto-tune disabled VGGT bundle adjustment (frames=\(selectedFrames.count) > limit=\(baMaxFrames)).",
+                            isError: true
+                        ))
+                        useBA = false
+                    }
+
                     let vggtConfig = VggtSfmConfig(
-                        device: vggtDevicePreference(),
-                        imageLoadResolution: vggtImageLoadResolutionPreference(preset: metadata.preset),
-                        vggtFixedResolution: vggtFixedResolutionPreference(),
+                        device: vggtDevice,
+                        imageLoadResolution: vggtImageLoadResolutionValue(
+                            preset: metadata.preset,
+                            autoTune: autoTuneProfile
+                        ),
+                        vggtFixedResolution: vggtFixedResolutionValue(autoTune: autoTuneProfile),
                         confidenceThreshold: vggtConfidenceThresholdPreference(),
-                        maxPoints: vggtMaxPointsPreference(preset: metadata.preset)
+                        maxPoints: vggtMaxPointsValue(preset: metadata.preset, autoTune: autoTuneProfile),
+                        useBundleAdjustment: useBA,
+                        maxReprojectionError: vggtMaxReprojectionErrorPreference(),
+                        sharedCamera: vggtSharedCameraPreference(),
+                        cameraType: vggtCameraTypePreference(),
+                        visibilityThreshold: vggtVisibilityThresholdPreference(),
+                        queryFrameCount: vggtQueryFrameCountPreference(),
+                        maxQueryPoints: vggtMaxQueryPointsPreference(),
+                        fineTracking: vggtFineTrackingPreference(),
+                        keypointExtractor: vggtKeypointExtractorPreference(),
+                        bundleAdjustmentMaxFrames: baMaxFrames
                     )
 
                     emit(.stageLog(
                         stage: .sfmFeatures,
                         line: "Running VGGT on \(vggtConfig.device) (load=\(vggtConfig.imageLoadResolution)px, vggt=\(vggtConfig.vggtFixedResolution)px, maxPoints=\(vggtConfig.maxPoints)).",
+                        isError: false
+                    ))
+                    emit(.stageLog(
+                        stage: .sfmFeatures,
+                        line: "VGGT BA: use=\(vggtConfig.useBundleAdjustment) maxFrames=\(vggtConfig.bundleAdjustmentMaxFrames) maxReproj=\(vggtConfig.maxReprojectionError) sharedCamera=\(vggtConfig.sharedCamera) cameraType=\(vggtConfig.cameraType) visThresh=\(vggtConfig.visibilityThreshold) queryFrames=\(vggtConfig.queryFrameCount) maxQueryPts=\(vggtConfig.maxQueryPoints) fineTracking=\(vggtConfig.fineTracking) keypointExtractor=\(vggtConfig.keypointExtractor).",
                         isError: false
                     ))
 
@@ -345,6 +385,16 @@ public final class PipelineRunner: @unchecked Sendable {
                         metadata: [
                             "device": vggtConfig.device,
                             "images": paths.framesSelectedURL.path,
+                            "useBA": "\(vggtConfig.useBundleAdjustment)",
+                            "maxFrames": "\(vggtConfig.bundleAdjustmentMaxFrames)",
+                            "maxReprojError": "\(vggtConfig.maxReprojectionError)",
+                            "sharedCamera": "\(vggtConfig.sharedCamera)",
+                            "cameraType": vggtConfig.cameraType,
+                            "visThresh": "\(vggtConfig.visibilityThreshold)",
+                            "queryFrames": "\(vggtConfig.queryFrameCount)",
+                            "maxQueryPts": "\(vggtConfig.maxQueryPoints)",
+                            "fineTracking": "\(vggtConfig.fineTracking)",
+                            "keypointExtractor": vggtConfig.keypointExtractor,
                             "maxPoints": "\(vggtConfig.maxPoints)",
                             "modelsDir": self.config.toolchain.vggt.models.path,
                             "outSparse": sparseZero.path,
@@ -417,245 +467,7 @@ public final class PipelineRunner: @unchecked Sendable {
                     markStageComplete(.sfmMapping)
                 }
             } else {
-                if backendPolicy == .learned {
-                do {
-                    emit(.stageProgress(stage: .sfmFeatures, fraction: 0.01, message: "Probing learned MPS"))
-                    let timeout = learnedMpsProbeTimeoutSeconds()
-                    let probe = try await runWithTimeout(seconds: timeout) {
-                        guard let learnedToolchain = self.config.toolchain.learnedSfm else {
-                            return LearnedMpsProbeResult(
-                                pythonMachine: "missing",
-                                platform: "missing",
-                                torchVersion: "missing",
-                                mpsBuilt: false,
-                                mpsAvailable: false,
-                                mpsAllocOK: false,
-                                failure: "learned_sfm toolchain missing"
-                            )
-                        }
-                        return try await LearnedMpsProbe.run(python: learnedToolchain.python)
-                    }
-                    learnedMpsAvailable = probe.isMpsUsable
-                    emit(.stageLog(
-                        stage: .sfmFeatures,
-                        line: "Learned MPS available: \(learnedMpsAvailable ? "yes" : "no").",
-                        isError: !learnedMpsAvailable
-                    ))
-                    if !learnedMpsAvailable, let failure = probe.failure {
-                        emit(.stageLog(stage: .sfmFeatures, line: "Learned MPS probe: \(failure)", isError: true))
-                    }
-                } catch is TimeoutError {
-                    learnedMpsAvailable = false
-                    emit(.stageLog(stage: .sfmFeatures, line: "Learned MPS probe timed out; skipping learned matching.", isError: true))
-                } catch {
-                    learnedMpsAvailable = false
-                    emit(.stageLog(stage: .sfmFeatures, line: "Learned MPS probe failed; skipping learned matching. \(error)", isError: true))
-                }
-            }
-            let learnedOutputsAvailable = backendPolicy == .learned && learnedOutputsExist(paths: paths)
-            let learnedStagesComplete = !shouldRunStage(.sfmFeatures) && !shouldRunStage(.sfmMatching)
-            let shouldAttemptLearned = backendPolicy == .learned &&
-                (self.config.toolchain.learnedSfm != nil) &&
-                learnedMpsAvailable &&
-                (shouldRunStage(.sfmFeatures) || shouldRunStage(.sfmMatching))
-            var learnedMatchingCompleted = learnedOutputsAvailable && learnedStagesComplete
-
-            if shouldAttemptLearned {
-                struct LearnedMatchingWatchdogError: Error {
-                    let seconds: Int
-                }
-
-                do {
-                    let device = learnedDevicePreference()
-                    let pairing: String = (metadata.input.hasVideos && !metadata.input.hasPhotos) ? "video" : "photos"
-                    let (overlap, stride, loopK): (Int, Int, Int) = {
-                        if pairing == "video" {
-                            return (colmapMatchOptions.sequentialOverlap, 5, 3)
-                        }
-                        return (0, 0, 20)
-                    }()
-                    let learnedMaxImageSize = learnedMaxImageSizePreference(colmapMaxImageSize: colmapMaxImageSize, preset: metadata.preset)
-
-                    currentStage = .sfmFeatures
-                    emit(.stageStarted(stage: .sfmFeatures))
-
-                    learnedPairsFile = nil
-                    if pairing == "video", metadata.input.videoFiles.count > 1 {
-                        do {
-                            if selectedFrameManifest.isEmpty {
-                                emit(.stageLog(
-                                    stage: .sfmFeatures,
-                                    line: "Selected-frame manifest missing; learned matching will pair across all frames.",
-                                    isError: true
-                                ))
-                                self.removeIfExists(paths.sfmPairListURL)
-                            } else {
-                                let available = Set(selectedFrames.map { $0.lastPathComponent })
-                                let groups = frameGroups(from: selectedFrameManifest, allowedNames: available)
-                                let bridgeCount = learnedPairBridgeCount(overlap: overlap)
-                                let pairs = PairListBuilder.buildPairs(
-                                    groups: groups,
-                                    overlap: overlap,
-                                    stride: stride,
-                                    bridgeCount: bridgeCount
-                                )
-                                if pairs.isEmpty {
-                                    self.removeIfExists(paths.sfmPairListURL)
-                                } else {
-                                    try PairListBuilder.writePairs(pairs, to: paths.sfmPairListURL)
-                                    learnedPairsFile = paths.sfmPairListURL
-                                    emit(.stageLog(
-                                        stage: .sfmFeatures,
-                                        line: "Learned matching pairs: \(pairs.count) (bridges: \(bridgeCount)).",
-                                        isError: false
-                                    ))
-                                }
-                            }
-                        } catch {
-                            self.removeIfExists(paths.sfmPairListURL)
-                            emit(.stageLog(
-                                stage: .sfmFeatures,
-                                line: "Failed to build learned pairs list; falling back to default pairing. \(error)",
-                                isError: true
-                            ))
-                        }
-                    } else {
-                        self.removeIfExists(paths.sfmPairListURL)
-                    }
-                    let learnedConfig = LearnedMatchingConfig(
-                        device: device,
-                        maxImageSize: learnedMaxImageSize,
-                        sequentialOverlap: overlap,
-                        stride: stride,
-                        loopK: loopK,
-                        pairing: pairing,
-                        cameraModel: cameraModel(for: metadata.preset),
-                        requireDevice: true,
-                        offline: true,
-                        pairsFile: learnedPairsFile
-                    )
-                    emit(.stageLog(stage: .sfmFeatures, line: "Running learned matching on \(device) (\(pairing)).", isError: false))
-                    if learnedMaxImageSize != colmapMaxImageSize {
-                        emit(.stageLog(
-                            stage: .sfmFeatures,
-                            line: "Learned matching max image size: \(learnedMaxImageSize)px (COLMAP: \(colmapMaxImageSize)px).",
-                            isError: false
-                        ))
-                    }
-
-                    self.removeIfExists(paths.colmapDatabaseURL)
-                    try self.resetDirectory(paths.colmapSparseURL)
-                    try self.resetDirectory(paths.sfmLearnedFeaturesURL)
-                    self.removeIfExists(paths.sfmLearnedMatchListURL)
-
-                    let watchdogSeconds = learnedWatchdogSeconds()
-                    let progressTracker = LearnedMatchingProgressTracker()
-
-                    let lastLog = LastLogTimeBox()
-                    let learnedMatching = tooling.learnedMatching
-                    guard let learnedToolchain = config.toolchain.learnedSfm else {
-                        throw LearnedMatchingError.missingTool
-                    }
-                    let imagesURL = paths.framesSelectedURL
-                    let outDatabaseURL = paths.colmapDatabaseURL
-                    let outFeaturesURL = paths.sfmLearnedFeaturesURL
-                    let outMatchListURL = paths.sfmLearnedMatchListURL
-
-                    let learnedToolLogURL = paths.logsURL.appendingPathComponent("learned_sfm.log")
-                    let learnedToolLog = ToolLogWriter(fileURL: learnedToolLogURL, toolName: "learned_sfm")
-                    learnedToolLog.beginSection(
-                        title: "matching",
-                        metadata: [
-                            "database": outDatabaseURL.path,
-                            "device": device,
-                            "images": imagesURL.path,
-                            "maxImageSize": "\(learnedMaxImageSize)",
-                            "pairing": pairing
-                        ]
-                    )
-                    emit(.stageLog(stage: .sfmFeatures, line: "Learned SfM tool log: \(learnedToolLogURL.lastPathComponent)", isError: false))
-
-                    let onLearnedLog: @Sendable (String, Bool) -> Void = { line, isErr in
-                        lastLog.bump()
-
-                        learnedToolLog.append(stream: isErr ? "stderr" : "stdout", line: line)
-                        let sanitized = Self.sanitizeToolLogLine(line)
-                        if Self.shouldEmitToolLogLine(sanitized, isError: isErr) {
-                            emit(.stageLog(stage: .sfmFeatures, line: sanitized, isError: isErr))
-                        }
-                        if let update = progressTracker.ingest(line) {
-                            emit(.stageProgress(stage: .sfmFeatures, fraction: update.fraction, message: update.message))
-                        }
-                    }
-
-                    try await withThrowingTaskGroup(of: Void.self) { group in
-                        group.addTask {
-                            try await learnedMatching.run(
-                                toolchain: learnedToolchain,
-                                images: imagesURL,
-                                outDatabase: outDatabaseURL,
-                                outFeatures: outFeaturesURL,
-                                outMatchList: outMatchListURL,
-                                config: learnedConfig,
-                                onLog: onLearnedLog
-                            )
-                        }
-                        group.addTask {
-                            do {
-                                while true {
-                                    try await Task.sleep(nanoseconds: 5 * 1_000_000_000)
-                                    try Task.checkCancellation()
-
-                                    if lastLog.silenceSeconds() > Double(watchdogSeconds) {
-                                        throw LearnedMatchingWatchdogError(seconds: watchdogSeconds)
-                                    }
-                                }
-                            } catch is CancellationError {
-                                return
-                            }
-                        }
-
-                        do {
-                            _ = try await group.next()
-                            group.cancelAll()
-                            while let _ = try await group.next() {}
-                        } catch {
-                            group.cancelAll()
-                            throw error
-                        }
-                    }
-
-                    guard learnedOutputsExist(paths: paths) else {
-                        throw PipelineError.outputMissing
-                    }
-
-                    emit(.stageFinished(stage: .sfmFeatures))
-                    markStageComplete(.sfmFeatures)
-
-                    currentStage = .sfmMatching
-                    emit(.stageStarted(stage: .sfmMatching))
-                    emit(.stageFinished(stage: .sfmMatching))
-                    markStageComplete(.sfmMatching)
-                    learnedMatchingCompleted = true
-                } catch {
-                    if let stalled = error as? LearnedMatchingWatchdogError {
-                        emit(.stageLog(
-                            stage: .sfmFeatures,
-                            line: "Learned matching produced no output for \(stalled.seconds)s; falling back to COLMAP.",
-                            isError: true
-                        ))
-                    } else {
-                        emit(.stageLog(
-                            stage: .sfmFeatures,
-                            line: "Learned matching failed; falling back to COLMAP. \(error)",
-                            isError: true
-                        ))
-                    }
-                    learnedMatchingCompleted = false
-                }
-            }
             let runFeatures: (Bool) async throws -> Void = { force in
-                guard !learnedMatchingCompleted else { return }
                 guard force || shouldRunStage(.sfmFeatures) else { return }
                 currentStage = .sfmFeatures
                 emit(.stageStarted(stage: .sfmFeatures))
@@ -703,7 +515,6 @@ public final class PipelineRunner: @unchecked Sendable {
             }
 
             let runMatching: (Bool) async throws -> Void = { force in
-                guard !learnedMatchingCompleted else { return }
                 guard force || shouldRunStage(.sfmMatching) else { return }
                 currentStage = .sfmMatching
                 emit(.stageStarted(stage: .sfmMatching))
@@ -1131,15 +942,6 @@ public final class PipelineRunner: @unchecked Sendable {
                             }
                         }
 
-                        if !mappingSucceeded, learnedMatchingCompleted {
-                            emit(.stageLog(stage: .sfmMapping, line: "Learned matching did not yield a stable reconstruction. Retrying with COLMAP matching.", isError: true))
-                            emit(.stageFinished(stage: .sfmMapping))
-                            self.removeIfExists(paths.sfmLearnedURL)
-                            learnedMatchingCompleted = false
-                            forceSfMRun = true
-                            continue sfmAttemptLoop
-                        }
-
                         if !mappingSucceeded,
                            let pipelineError = lastMappingError as? PipelineError,
                            case .lowQualityReconstruction = pipelineError,
@@ -1437,8 +1239,6 @@ private extension PipelineRunner {
         case outputMissing
     }
 
-    struct TimeoutError: Error {}
-
     struct SelectedFrameGroup: Sendable {
         let id: String
         let frames: [URL]
@@ -1643,24 +1443,6 @@ private extension PipelineRunner {
         return try JSONDecoder().decode([SelectedFrameMapping].self, from: data)
     }
 
-    func frameGroups(from manifest: [SelectedFrameMapping], allowedNames: Set<String>) -> [FrameGroup] {
-        var order: [String] = []
-        var framesByGroup: [String: [String]] = [:]
-        var isVideoByGroup: [String: Bool] = [:]
-        for entry in manifest {
-            guard allowedNames.contains(entry.outputFileName) else { continue }
-            if framesByGroup[entry.groupId] == nil {
-                order.append(entry.groupId)
-            }
-            framesByGroup[entry.groupId, default: []].append(entry.outputFileName)
-            isVideoByGroup[entry.groupId] = entry.isVideo
-        }
-        return order.compactMap { groupId in
-            guard let files = framesByGroup[groupId], !files.isEmpty else { return nil }
-            return FrameGroup(id: groupId, fileNames: files, isVideo: isVideoByGroup[groupId] ?? false)
-        }
-    }
-
     func sparseModelFilesExist(at url: URL) -> Bool {
         let fm = FileManager.default
         let binFiles = ["cameras.bin", "images.bin", "points3D.bin"]
@@ -1725,88 +1507,8 @@ private extension PipelineRunner {
         if let value = env["EASYSPLAT_SFM_BACKEND"]?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() {
             if value == "colmap" { return .colmap }
             if value == "vggt" || value == "vggt-mps" { return .vggt }
-            if value == "learned" { return .learned }
         }
         return .vggt
-    }
-
-    func learnedOutputsExist(paths: ProjectPaths) -> Bool {
-        let fm = FileManager.default
-        guard fm.fileExists(atPath: paths.colmapDatabaseURL.path) else { return false }
-        guard fm.fileExists(atPath: paths.sfmLearnedMatchListURL.path) else { return false }
-        guard fm.fileExists(atPath: paths.sfmLearnedFeaturesURL.path) else { return false }
-        let contents = (try? fm.contentsOfDirectory(at: paths.sfmLearnedFeaturesURL, includingPropertiesForKeys: nil)) ?? []
-        return !contents.isEmpty
-    }
-
-    func learnedDevicePreference() -> String {
-        let env = ProcessInfo.processInfo.environment
-        if let value = env["EASYSPLAT_LEARNED_DEVICE"]?.trimmingCharacters(in: .whitespacesAndNewlines),
-           !value.isEmpty {
-            return value
-        }
-        return "mps"
-    }
-
-    func learnedMaxImageSizePreference(colmapMaxImageSize: Int, preset: PresetSpec) -> Int {
-        let env = ProcessInfo.processInfo.environment
-        if let raw = env["EASYSPLAT_LEARNED_MAX_IMAGE_SIZE"]?.trimmingCharacters(in: .whitespacesAndNewlines),
-           let override = Int(raw),
-           override > 0 {
-            return override
-        }
-        if preset.quality == .ultra {
-            return colmapMaxImageSize
-        }
-        return min(colmapMaxImageSize, 1024)
-    }
-
-    func learnedWatchdogSeconds() -> Int {
-        let env = ProcessInfo.processInfo.environment
-        if let raw = env["EASYSPLAT_LEARNED_WATCHDOG_SECONDS"]?.trimmingCharacters(in: .whitespacesAndNewlines),
-           let override = Int(raw),
-           override > 0 {
-            return override
-        }
-        return 600
-    }
-
-    func learnedMpsProbeTimeoutSeconds() -> Int {
-        let env = ProcessInfo.processInfo.environment
-        if let raw = env["EASYSPLAT_LEARNED_MPS_PROBE_TIMEOUT"]?.trimmingCharacters(in: .whitespacesAndNewlines),
-           let override = Int(raw),
-           override > 0 {
-            return override
-        }
-        return 60
-    }
-
-    func runWithTimeout<T: Sendable>(seconds: Int, operation: @Sendable @escaping () async throws -> T) async throws -> T {
-        let timeoutNanos = UInt64(max(1, seconds)) * 1_000_000_000
-        return try await withThrowingTaskGroup(of: T.self) { group in
-            group.addTask {
-                try await operation()
-            }
-            group.addTask {
-                try await Task.sleep(nanoseconds: timeoutNanos)
-                throw TimeoutError()
-            }
-            guard let result = try await group.next() else {
-                throw TimeoutError()
-            }
-            group.cancelAll()
-            return result
-        }
-    }
-
-    func learnedPairBridgeCount(overlap: Int) -> Int {
-        let env = ProcessInfo.processInfo.environment
-        if let raw = env["EASYSPLAT_LEARNED_PAIR_BRIDGE"]?.trimmingCharacters(in: .whitespacesAndNewlines),
-           let override = Int(raw),
-           override >= 0 {
-            return override
-        }
-        return min(3, max(0, overlap))
     }
 
     func vggtDevicePreference() -> String {
@@ -1872,11 +1574,185 @@ private extension PipelineRunner {
         }
     }
 
+    func vggtUseBundleAdjustmentPreference() -> Bool {
+        boolEnvValue("EASYSPLAT_VGGT_USE_BA", default: true)
+    }
+
+    func vggtMaxReprojectionErrorPreference() -> Double {
+        let env = ProcessInfo.processInfo.environment
+        if let raw = env["EASYSPLAT_VGGT_MAX_REPROJ_ERROR"]?.trimmingCharacters(in: .whitespacesAndNewlines),
+           let override = Double(raw),
+           override > 0 {
+            return override
+        }
+        return 8.0
+    }
+
+    func vggtSharedCameraPreference() -> Bool {
+        boolEnvValue("EASYSPLAT_VGGT_SHARED_CAMERA", default: false)
+    }
+
+    func vggtCameraTypePreference() -> String {
+        let env = ProcessInfo.processInfo.environment
+        if let value = env["EASYSPLAT_VGGT_CAMERA_TYPE"]?.trimmingCharacters(in: .whitespacesAndNewlines),
+           !value.isEmpty {
+            return value
+        }
+        return "SIMPLE_PINHOLE"
+    }
+
+    func vggtVisibilityThresholdPreference() -> Double {
+        let env = ProcessInfo.processInfo.environment
+        if let raw = env["EASYSPLAT_VGGT_VIS_THRESH"]?.trimmingCharacters(in: .whitespacesAndNewlines),
+           let override = Double(raw),
+           override > 0 {
+            return override
+        }
+        return 0.2
+    }
+
+    func vggtQueryFrameCountPreference() -> Int {
+        let env = ProcessInfo.processInfo.environment
+        if let raw = env["EASYSPLAT_VGGT_QUERY_FRAMES"]?.trimmingCharacters(in: .whitespacesAndNewlines),
+           let override = Int(raw),
+           override > 0 {
+            return override
+        }
+        return 8
+    }
+
+    func vggtMaxQueryPointsPreference() -> Int {
+        let env = ProcessInfo.processInfo.environment
+        if let raw = env["EASYSPLAT_VGGT_MAX_QUERY_PTS"]?.trimmingCharacters(in: .whitespacesAndNewlines),
+           let override = Int(raw),
+           override > 0 {
+            return override
+        }
+        return 4096
+    }
+
+    func vggtFineTrackingPreference() -> Bool {
+        boolEnvValue("EASYSPLAT_VGGT_FINE_TRACKING", default: true)
+    }
+
+    func vggtKeypointExtractorPreference() -> String {
+        let env = ProcessInfo.processInfo.environment
+        if let value = env["EASYSPLAT_VGGT_KEYPOINT_EXTRACTOR"]?.trimmingCharacters(in: .whitespacesAndNewlines),
+           !value.isEmpty {
+            return value
+        }
+        return "aliked+sp"
+    }
+
+    func vggtBaMaxFramesPreference() -> Int? {
+        let env = ProcessInfo.processInfo.environment
+        if let raw = env["EASYSPLAT_VGGT_BA_MAX_FRAMES"]?.trimmingCharacters(in: .whitespacesAndNewlines),
+           let override = Int(raw),
+           override > 0 {
+            return override
+        }
+        return nil
+    }
+
+    func vggtBaMaxFramesLimit(autoTune: AutoTuneProfile?) -> Int {
+        if let override = vggtBaMaxFramesPreference() {
+            return override
+        }
+        guard let autoTune else {
+            return 32
+        }
+        switch autoTune.tier {
+        case .low:
+            return 24
+        case .mid:
+            return 48
+        case .high:
+            return 96
+        }
+    }
+
+    func vggtImageLoadResolutionValue(preset: PresetSpec, autoTune: AutoTuneProfile?) -> Int {
+        if !hasEnvValue("EASYSPLAT_VGGT_IMG_LOAD_RESOLUTION"), let autoTune {
+            return autoTune.vggtImageLoadResolution
+        }
+        return vggtImageLoadResolutionPreference(preset: preset)
+    }
+
+    func vggtFixedResolutionValue(autoTune: AutoTuneProfile?) -> Int {
+        if !hasEnvValue("EASYSPLAT_VGGT_RESOLUTION"), let autoTune {
+            return autoTune.vggtFixedResolution
+        }
+        return vggtFixedResolutionPreference()
+    }
+
+    func vggtMaxPointsValue(preset: PresetSpec, autoTune: AutoTuneProfile?) -> Int {
+        if !hasEnvValue("EASYSPLAT_VGGT_MAX_POINTS"), let autoTune {
+            return autoTune.vggtMaxPoints
+        }
+        return vggtMaxPointsPreference(preset: preset)
+    }
+
     func shouldUseColmapGpu(colmapPath: URL) -> Bool {
         if let override = colmapGpuOverride() {
             return override
         }
         return detectColmapGpuSupport(colmapPath: colmapPath)
+    }
+
+    func shouldAutoTune() -> Bool {
+        if let value = ProcessInfo.processInfo.environment["EASYSPLAT_AUTOTUNE"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased() {
+            if ["0", "false", "no"].contains(value) { return false }
+        }
+        return true
+    }
+
+    func hasEnvValue(_ key: String) -> Bool {
+        if let value = ProcessInfo.processInfo.environment[key]?.trimmingCharacters(in: .whitespacesAndNewlines) {
+            return !value.isEmpty
+        }
+        return false
+    }
+
+    func boolEnvValue(_ key: String, default defaultValue: Bool) -> Bool {
+        if let value = ProcessInfo.processInfo.environment[key]?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() {
+            if ["1", "true", "yes"].contains(value) { return true }
+            if ["0", "false", "no"].contains(value) { return false }
+        }
+        return defaultValue
+    }
+
+    func applyAutoTune(
+        _ tune: AutoTuneProfile,
+        colmapMaxImageSize: inout Int,
+        colmapExtractOptions: inout ColmapOptions,
+        colmapMatchOptions: inout ColmapOptions
+    ) {
+        if let cap = tune.colmapMaxImageSizeCap {
+            colmapMaxImageSize = min(colmapMaxImageSize, cap)
+        }
+
+        colmapExtractOptions.maxNumFeatures = tune.colmapMaxNumFeatures
+        colmapMatchOptions.maxNumFeatures = tune.colmapMaxNumFeatures
+        colmapMatchOptions.maxNumMatches = tune.colmapMaxNumMatches
+        colmapExtractOptions.sequentialOverlap = tune.sequentialOverlap
+        colmapMatchOptions.sequentialOverlap = tune.sequentialOverlap
+        colmapMatchOptions.exhaustiveBlockSize = tune.exhaustiveBlockSize
+
+        if tune.threadCap > 0 {
+            colmapExtractOptions.extractThreads = min(colmapExtractOptions.extractThreads, tune.threadCap)
+            colmapMatchOptions.matchThreads = min(colmapMatchOptions.matchThreads, tune.threadCap)
+            updateThreadEnvironment(&colmapExtractOptions, threadCount: colmapExtractOptions.extractThreads)
+            updateThreadEnvironment(&colmapMatchOptions, threadCount: colmapMatchOptions.matchThreads)
+        }
+    }
+
+    func updateThreadEnvironment(_ options: inout ColmapOptions, threadCount: Int) {
+        if options.environment.isEmpty { return }
+        options.environment["OMP_NUM_THREADS"] = "\(threadCount)"
+        options.environment["OPENBLAS_NUM_THREADS"] = "\(threadCount)"
+        options.environment["MKL_NUM_THREADS"] = "\(threadCount)"
     }
 
     func colmapGpuOverride() -> Bool? {
@@ -1943,25 +1819,20 @@ private extension PipelineRunner {
             self.removeIfExists(paths.framesRawURL)
             self.removeIfExists(paths.framesSelectedURL)
             self.removeIfExists(paths.framesSelectedManifestURL)
-            self.removeIfExists(paths.sfmPairListURL)
             self.removeIfExists(paths.colmapDatabaseURL)
             self.removeIfExists(paths.colmapSparseURL)
-            self.removeIfExists(paths.sfmLearnedURL)
             self.removeIfExists(paths.trainingURL)
             self.removeIfExists(paths.outputURL)
         case .selectFrames:
             self.removeIfExists(paths.framesSelectedURL)
             self.removeIfExists(paths.framesSelectedManifestURL)
-            self.removeIfExists(paths.sfmPairListURL)
             self.removeIfExists(paths.colmapDatabaseURL)
             self.removeIfExists(paths.colmapSparseURL)
-            self.removeIfExists(paths.sfmLearnedURL)
             self.removeIfExists(paths.trainingURL)
             self.removeIfExists(paths.outputURL)
         case .sfmFeatures, .sfmMatching:
             self.removeIfExists(paths.colmapDatabaseURL)
             self.removeIfExists(paths.colmapSparseURL)
-            self.removeIfExists(paths.sfmLearnedURL)
             self.removeIfExists(paths.trainingURL)
             self.removeIfExists(paths.outputURL)
         case .sfmMapping:
@@ -3188,12 +3059,6 @@ struct TestSelectedFrameMapping: Codable, Sendable {
     let sourcePath: String
 }
 
-struct TestFrameGroup: Sendable {
-    let id: String
-    let fileNames: [String]
-    let isVideo: Bool
-}
-
 struct TestFrameExtractionProfile: Sendable {
     let targetCount: Int
     let maxDimension: CGFloat
@@ -3229,18 +3094,6 @@ extension PipelineRunner {
 
     func test_downsampleSelectedFrames(to targetCount: Int, paths: ProjectPaths) throws -> [URL]? {
         try downsampleSelectedFrames(to: targetCount, paths: paths)
-    }
-
-    func test_frameGroups(from manifest: [TestSelectedFrameMapping], allowedNames: Set<String>) -> [TestFrameGroup] {
-        let internalManifest = manifest.map { SelectedFrameMapping(
-            outputFileName: $0.outputFileName,
-            groupId: $0.groupId,
-            isVideo: $0.isVideo,
-            sourcePath: $0.sourcePath
-        ) }
-        return frameGroups(from: internalManifest, allowedNames: allowedNames).map {
-            TestFrameGroup(id: $0.id, fileNames: $0.fileNames, isVideo: $0.isVideo)
-        }
     }
 
     func test_normalizeSelectedImagesForTooling(paths: ProjectPaths) throws -> Int {
@@ -3353,6 +3206,61 @@ extension PipelineRunner {
 
     func test_colmapGpuOverride() -> Bool? {
         colmapGpuOverride()
+    }
+
+    func test_vggtUseBundleAdjustmentPreference() -> Bool {
+        vggtUseBundleAdjustmentPreference()
+    }
+
+    func test_vggtMaxReprojectionErrorPreference() -> Double {
+        vggtMaxReprojectionErrorPreference()
+    }
+
+    func test_vggtSharedCameraPreference() -> Bool {
+        vggtSharedCameraPreference()
+    }
+
+    func test_vggtCameraTypePreference() -> String {
+        vggtCameraTypePreference()
+    }
+
+    func test_vggtVisibilityThresholdPreference() -> Double {
+        vggtVisibilityThresholdPreference()
+    }
+
+    func test_vggtQueryFrameCountPreference() -> Int {
+        vggtQueryFrameCountPreference()
+    }
+
+    func test_vggtMaxQueryPointsPreference() -> Int {
+        vggtMaxQueryPointsPreference()
+    }
+
+    func test_vggtFineTrackingPreference() -> Bool {
+        vggtFineTrackingPreference()
+    }
+
+    func test_vggtKeypointExtractorPreference() -> String {
+        vggtKeypointExtractorPreference()
+    }
+
+    func test_vggtBaMaxFramesLimit(autoTuneTier: HardwareProfile.Tier?) -> Int {
+        let autoTune = autoTuneTier.map { tier in
+            AutoTuneProfile(
+                tier: tier,
+                vggtImageLoadResolution: 0,
+                vggtFixedResolution: 0,
+                vggtMaxPoints: 0,
+                colmapMaxNumFeatures: 0,
+                colmapMaxNumMatches: 0,
+                sequentialOverlap: 0,
+                exhaustiveBlockSize: 0,
+                threadCap: 0,
+                colmapMaxImageSizeCap: nil,
+                vggtAllowed: true
+            )
+        }
+        return vggtBaMaxFramesLimit(autoTune: autoTune)
     }
 
     func test_colmapErrorIndicatesGpuFailure(_ error: ColmapRunnerError) -> Bool {

@@ -11,8 +11,8 @@ BIN_DIR="$INSTALL_DIR/bin"
 VENDOR_DIR="$INSTALL_DIR/vendor"
 VGGT_VENDOR="$VENDOR_DIR/vggt"
 
-VGGT_MPS_REF="${VGGT_MPS_REF:-v2.0.0}"
-VGGT_MPS_REPO="$BUILD_DIR/vggt-mps"
+VGGT_UPSTREAM_REF="${VGGT_UPSTREAM_REF:-main}"
+VGGT_UPSTREAM_REPO="$BUILD_DIR/vggt-upstream"
 
 VGGT_MODEL_URL="${VGGT_MODEL_URL:-https://huggingface.co/facebook/VGGT-1B/resolve/main/model.pt}"
 VGGT_MODEL_FILE="$MODELS_DIR/vggt_model.pt"
@@ -20,7 +20,9 @@ VGGT_MODEL_FILE="$MODELS_DIR/vggt_model.pt"
 # Use a self-contained CPython distribution so the packaged toolchain doesn't depend on the
 # developer's local Python install (Homebrew/Conda/etc.). This makes the toolchain portable.
 PYTHON_STANDALONE_TAG="${EASYSPLAT_PYTHON_STANDALONE_TAG:-20260127}"
-PYTHON_STANDALONE_VERSION="${EASYSPLAT_PYTHON_VERSION:-3.13.11}"
+# Prefer a Python version with pycolmap wheels available (3.11.x) to avoid
+# fragile source builds on user machines.
+PYTHON_STANDALONE_VERSION="${EASYSPLAT_PYTHON_VERSION:-3.11.9}"
 PYTHON_STANDALONE_ASSET="cpython-${PYTHON_STANDALONE_VERSION}+${PYTHON_STANDALONE_TAG}-aarch64-apple-darwin-install_only_stripped.tar.gz"
 PYTHON_STANDALONE_URL="https://github.com/indygreg/python-build-standalone/releases/download/${PYTHON_STANDALONE_TAG}/${PYTHON_STANDALONE_ASSET}"
 PYTHON_STANDALONE_TARBALL="$BUILD_DIR/$PYTHON_STANDALONE_ASSET"
@@ -116,7 +118,7 @@ mkdir -p "$BUILD_DIR" "$INSTALL_DIR" "$MODELS_DIR" "$BIN_DIR"
 ensure_python
 require_arm64_python
 
-ensure_repo "$VGGT_MPS_REPO" "https://github.com/jmanhype/vggt-mps.git" "$VGGT_MPS_REF"
+ensure_repo "$VGGT_UPSTREAM_REPO" "https://github.com/facebookresearch/vggt.git" "$VGGT_UPSTREAM_REF"
 
 # Install the runtime deps for EasySplat's VGGT bridge.
 # Note: upstream vggt/requirements.txt pins torch==2.3.1 which doesn't have wheels for newer
@@ -133,16 +135,34 @@ if command -v rsync >/dev/null 2>&1; then
     --exclude "__pycache__" \
     --exclude ".pytest_cache" \
     --exclude "*.pyc" \
-    "$VGGT_MPS_REPO/repo/vggt/" "$VGGT_VENDOR/"
+    "$VGGT_UPSTREAM_REPO/" "$VGGT_VENDOR/"
 else
   rm -rf "$VGGT_VENDOR"
   mkdir -p "$VGGT_VENDOR"
-  cp -R "$VGGT_MPS_REPO/repo/vggt/." "$VGGT_VENDOR/"
+  cp -R "$VGGT_UPSTREAM_REPO/." "$VGGT_VENDOR/"
 fi
 
 if [ ! -f "$VGGT_VENDOR/vggt/models/vggt.py" ]; then
   echo "VGGT vendor tree missing expected module: vggt/models/vggt.py" >&2
   exit 1
+fi
+
+PATCH_FILE="$VGGT_VENDOR/vggt/layers/block.py"
+if [ -f "$PATCH_FILE" ]; then
+  PATCH_FILE="$PATCH_FILE" PYTHONNOUSERSITE=1 "$PYTHON_DIR/bin/python3" - <<'PY'
+import os
+from pathlib import Path
+
+path = Path(os.environ["PATCH_FILE"])
+text = path.read_text(encoding="utf-8")
+if "drop_path2" not in text and "drop_path1(ffn_residual_func" in text:
+    updated = text.replace(
+        "drop_path1(ffn_residual_func(x))",
+        "drop_path2(ffn_residual_func(x))"
+    )
+    if updated != text:
+        path.write_text(updated, encoding="utf-8")
+PY
 fi
 
 # Install EasySplat's VGGT -> COLMAP bridge app code.
@@ -180,6 +200,7 @@ import sys
 try:
     from vggt.models.vggt import VGGT  # noqa: F401
     import easysplat_vggt_sfm  # noqa: F401
+    import pycolmap  # noqa: F401
 except Exception as exc:  # noqa: BLE001
     sys.stderr.write(f"vggt_mps import sanity check failed: {exc}\n")
     raise SystemExit(1)

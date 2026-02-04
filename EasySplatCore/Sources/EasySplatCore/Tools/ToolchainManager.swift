@@ -8,23 +8,18 @@ public struct ToolchainPaths: Sendable {
     public var brush: URL
     public var vggt: VggtToolchain
 
-    @available(*, deprecated, message: "learned_sfm / MASt3R is deprecated; use vggt-mps instead.")
-    public var learnedSfm: LearnedSfmToolchain?
-
     public init(
         root: URL,
         colmap: URL,
         glomap: URL,
         brush: URL,
-        vggt: VggtToolchain,
-        learnedSfm: LearnedSfmToolchain? = nil
+        vggt: VggtToolchain
     ) {
         self.root = root
         self.colmap = colmap
         self.glomap = glomap
         self.brush = brush
         self.vggt = vggt
-        self.learnedSfm = learnedSfm
     }
 }
 
@@ -37,21 +32,6 @@ public struct VggtToolchain: Sendable {
     public init(root: URL, sfmTool: URL, python: URL, models: URL) {
         self.root = root
         self.sfmTool = sfmTool
-        self.python = python
-        self.models = models
-    }
-}
-
-@available(*, deprecated, message: "learned_sfm / MASt3R is deprecated; use vggt-mps instead.")
-public struct LearnedSfmToolchain: Sendable {
-    public var root: URL
-    public var matchTool: URL
-    public var python: URL
-    public var models: URL
-
-    public init(root: URL, matchTool: URL, python: URL, models: URL) {
-        self.root = root
-        self.matchTool = matchTool
         self.python = python
         self.models = models
     }
@@ -303,33 +283,7 @@ public final class ToolchainManager: @unchecked Sendable, ToolchainManaging {
             models: vggtModels
         )
 
-        // Optional legacy toolchain component. Keep for potential future use, but do not require it.
-        let learnedRoot = root.appendingPathComponent("learned_sfm", isDirectory: true)
-        var learnedSfm: LearnedSfmToolchain?
-        if fileManager.fileExists(atPath: learnedRoot.path) {
-            let learnedMatchTool = learnedRoot.appendingPathComponent("bin/easysplat_match")
-            let learnedPython = learnedRoot.appendingPathComponent("python/bin/python3")
-            let learnedModels = learnedRoot.appendingPathComponent("models", isDirectory: true)
-            let learnedCheckpoints = learnedModels.appendingPathComponent("checkpoints", isDirectory: true)
-            let learnedVendor = learnedRoot.appendingPathComponent("vendor/mast3r/mast3r", isDirectory: true)
-
-            if fileManager.fileExists(atPath: learnedMatchTool.path),
-               fileManager.fileExists(atPath: learnedPython.path),
-               fileManager.fileExists(atPath: learnedModels.path),
-               fileManager.fileExists(atPath: learnedCheckpoints.path),
-               fileManager.fileExists(atPath: learnedVendor.path) {
-                ensureExecutable(at: learnedMatchTool)
-                ensureExecutable(at: learnedPython)
-                learnedSfm = LearnedSfmToolchain(
-                    root: learnedRoot,
-                    matchTool: learnedMatchTool,
-                    python: learnedPython,
-                    models: learnedModels
-                )
-            }
-        }
-
-        return ToolchainPaths(root: root, colmap: colmap, glomap: glomap, brush: brush, vggt: vggt, learnedSfm: learnedSfm)
+        return ToolchainPaths(root: root, colmap: colmap, glomap: glomap, brush: brush, vggt: vggt)
     }
 
     private func ensureExecutable(at url: URL) {

@@ -6,19 +6,49 @@ public struct VggtSfmConfig: Sendable {
     public var vggtFixedResolution: Int
     public var confidenceThreshold: Double
     public var maxPoints: Int
+    public var useBundleAdjustment: Bool
+    public var maxReprojectionError: Double
+    public var sharedCamera: Bool
+    public var cameraType: String
+    public var visibilityThreshold: Double
+    public var queryFrameCount: Int
+    public var maxQueryPoints: Int
+    public var fineTracking: Bool
+    public var keypointExtractor: String
+    public var bundleAdjustmentMaxFrames: Int
 
     public init(
         device: String = "mps",
         imageLoadResolution: Int = 1024,
         vggtFixedResolution: Int = 518,
         confidenceThreshold: Double = 5.0,
-        maxPoints: Int = 100_000
+        maxPoints: Int = 100_000,
+        useBundleAdjustment: Bool = true,
+        maxReprojectionError: Double = 8.0,
+        sharedCamera: Bool = false,
+        cameraType: String = "SIMPLE_PINHOLE",
+        visibilityThreshold: Double = 0.2,
+        queryFrameCount: Int = 8,
+        maxQueryPoints: Int = 4096,
+        fineTracking: Bool = true,
+        keypointExtractor: String = "aliked+sp",
+        bundleAdjustmentMaxFrames: Int = 0
     ) {
         self.device = device
         self.imageLoadResolution = imageLoadResolution
         self.vggtFixedResolution = vggtFixedResolution
         self.confidenceThreshold = confidenceThreshold
         self.maxPoints = maxPoints
+        self.useBundleAdjustment = useBundleAdjustment
+        self.maxReprojectionError = maxReprojectionError
+        self.sharedCamera = sharedCamera
+        self.cameraType = cameraType
+        self.visibilityThreshold = visibilityThreshold
+        self.queryFrameCount = queryFrameCount
+        self.maxQueryPoints = maxQueryPoints
+        self.fineTracking = fineTracking
+        self.keypointExtractor = keypointExtractor
+        self.bundleAdjustmentMaxFrames = bundleAdjustmentMaxFrames
     }
 }
 
@@ -68,8 +98,30 @@ public final class VggtSfmRunner: @unchecked Sendable, VggtSfmRunning {
             "--vggt-resolution", "\(config.vggtFixedResolution)",
             "--conf-thres", "\(config.confidenceThreshold)",
             "--max-points", "\(config.maxPoints)",
-            "--models-dir", toolchain.models.path
+            "--models-dir", toolchain.models.path,
+            "--max-reproj-error", "\(config.maxReprojectionError)",
+            "--camera-type", config.cameraType,
+            "--vis-thresh", "\(config.visibilityThreshold)",
+            "--query-frame-num", "\(config.queryFrameCount)",
+            "--max-query-pts", "\(config.maxQueryPoints)",
+            "--keypoint-extractor", config.keypointExtractor
         ]
+        var argsWithBA = args
+        if config.useBundleAdjustment {
+            argsWithBA.append("--use-ba")
+        }
+        if config.bundleAdjustmentMaxFrames > 0 {
+            argsWithBA.append("--ba-max-frames")
+            argsWithBA.append("\(config.bundleAdjustmentMaxFrames)")
+        }
+        if config.sharedCamera {
+            argsWithBA.append("--shared-camera")
+        }
+        if config.fineTracking {
+            argsWithBA.append("--fine-tracking")
+        } else {
+            argsWithBA.append("--no-fine-tracking")
+        }
 
         var environment = [
             "PYTHONUNBUFFERED": "1",
@@ -86,11 +138,11 @@ public final class VggtSfmRunner: @unchecked Sendable, VggtSfmRunning {
         }
 
         onLog("EasySplat: running vggt-mps (cwd=\(toolchain.root.path))", false)
-        onLog("EasySplat: vggt argv: \(toolchain.sfmTool.path) \(args.joined(separator: " "))", false)
+        onLog("EasySplat: vggt argv: \(toolchain.sfmTool.path) \(argsWithBA.joined(separator: " "))", false)
 
         let result = try await runner.runAsync(
             toolchain.sfmTool.path,
-            args,
+            argsWithBA,
             currentDirectory: toolchain.root,
             environment: environment,
             onStdout: { onLog($0, false) },
