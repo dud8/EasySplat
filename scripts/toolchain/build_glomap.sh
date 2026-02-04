@@ -7,10 +7,14 @@ SRC="$WORK/src"
 BUILD="$WORK/build"
 INSTALL="$WORK/install"
 COLMAP_INSTALL="${COLMAP_INSTALL:-$ROOT/Toolchains/build/colmap/install}"
+if [[ "$COLMAP_INSTALL" != /* ]]; then
+  COLMAP_INSTALL="$ROOT/$COLMAP_INSTALL"
+fi
 GLOMAP_REF="${GLOMAP_REF:-bfa9af89be8d8d49a58deeed3ef28d7960a37d06}"
 COLMAP_CONFIG_DIR=""
 OPENMP_ROOT=""
 BOOST_ROOT=""
+EXTERNAL_CXX_FLAGS=()
 
 mkdir -p "$WORK"
 
@@ -19,6 +23,28 @@ if [ ! -d "$SRC/.git" ]; then
 fi
 git -C "$SRC" fetch --depth 1 origin "$GLOMAP_REF"
 git -C "$SRC" checkout -q FETCH_HEAD
+
+if ! grep -q "COLMAP_INCLUDE_DIR" "$SRC/glomap/CMakeLists.txt"; then
+  python - <<'PY'
+import os
+from pathlib import Path
+
+path = Path(os.environ["SRC"]) / "glomap" / "CMakeLists.txt"
+text = path.read_text()
+needle = "add_library(glomap ${SOURCES} ${HEADERS})"
+if needle in text:
+    insert = """add_library(glomap ${SOURCES} ${HEADERS})
+if(NOT FETCH_COLMAP)
+    if(DEFINED COLMAP_INCLUDE_DIR AND COLMAP_INCLUDE_DIR)
+        target_include_directories(glomap BEFORE PUBLIC "${COLMAP_INCLUDE_DIR}")
+    endif()
+endif()"""
+    text = text.replace(needle, insert)
+    path.write_text(text)
+else:
+    raise SystemExit("Expected anchor not found in glomap/CMakeLists.txt")
+PY
+fi
 
 if command -v brew >/dev/null 2>&1; then
   OPENMP_ROOT="$(brew --prefix libomp 2>/dev/null || true)"
@@ -49,6 +75,8 @@ COMMON_ARGS=(
   -DCMAKE_BUILD_TYPE=Release
   -DCMAKE_INSTALL_PREFIX="$INSTALL"
   -DCMAKE_FIND_PACKAGE_PREFER_CONFIG=ON
+  -DCMAKE_FIND_PACKAGE_TARGETS_GLOBAL=ON
+  -DCMAKE_CXX_COMPILE_OBJECT="<CMAKE_CXX_COMPILER> <DEFINES> <FLAGS> <INCLUDES> -o <OBJECT> -c <SOURCE>"
 )
 
 if [ -n "$OPENMP_ROOT" ]; then
@@ -60,13 +88,21 @@ fi
 
 EXTERNAL_ARGS=()
 if [ "$USE_EXTERNAL" -eq 1 ]; then
+  EXTERNAL_CXX_FLAGS+=("-I$COLMAP_INSTALL/include")
+  if [ -d "/opt/homebrew/include/suitesparse" ]; then
+    EXTERNAL_CXX_FLAGS+=("-I/opt/homebrew/include/suitesparse")
+  fi
   EXTERNAL_ARGS=(
     -DFETCH_COLMAP=OFF
+    -DCOLMAP_INCLUDE_DIR="$COLMAP_INSTALL/include"
     -DCOLMAP_DIR="$COLMAP_CONFIG_DIR"
     -DCMAKE_PREFIX_PATH="$COLMAP_CONFIG_DIR;$COLMAP_INSTALL"
     -DCMAKE_FIND_PACKAGE_NO_PACKAGE_REGISTRY=ON
     -DCMAKE_FIND_PACKAGE_NO_SYSTEM_PACKAGE_REGISTRY=ON
   )
+  if [ "${#EXTERNAL_CXX_FLAGS[@]}" -gt 0 ]; then
+    EXTERNAL_ARGS+=(-DCMAKE_CXX_FLAGS="$(printf '%s ' "${EXTERNAL_CXX_FLAGS[@]}")")
+  fi
 fi
 
 FALLBACK_ARGS=(
