@@ -1,8 +1,8 @@
 # EasySplat
 
-EasySplat is a macOS-only (Apple Silicon) desktop app that turns videos or image folders into 3D Gaussian splats using a bundled toolchain (primarily VGGT-MPS + Brush), with a beginner-friendly UI and progress tracking.
+EasySplat is a macOS-only (Apple Silicon) desktop app that turns videos or image folders into 3D Gaussian splats using a bundled toolchain (primarily FastVGGT-MPS + Brush), with a beginner-friendly UI and progress tracking.
 
-COLMAP/GLOMAP support remains in the toolchain as a fallback / legacy path.
+COLMAP/GLOMAP is also used as the refinement backend for FastVGGT seed models.
 
 The app downloads a signed `manifest.json` that lists toolchain artifacts (typically split into a smaller “core” zip and a large “models” zip).
 
@@ -19,6 +19,7 @@ The app downloads a signed `manifest.json` that lists toolchain artifacts (typic
 - `EasySplatCore/`: core library (pipeline + toolchain integration).
 - `Tools/ManifestTool/`: Swift CLI to generate keypairs and sign manifests.
 - `Tools/VggtSfm/`: Python package shipped in the toolchain (VGGT → COLMAP bridge).
+- `Tools/FastVggtSfm/`: Python package shipped in the toolchain (FastVGGT → COLMAP seed export).
 - `ThirdParty/MetalSplatter/`: vendored SwiftPM dependency.
 - `Toolchains/`: local toolchain build outputs (`build/`, `out/`), plus dev-only keys/manifest (gitignored).
 - `scripts/`: development, testing, and release automation.
@@ -39,6 +40,28 @@ Common options:
 Note: VGGT downloads a large (multi-GB) model the first time the toolchain is built.
 
 Backward-compatible wrappers are still available (`./scripts/dev_run.sh`, `./scripts/run_fast.sh`), but `./scripts/run.sh` is the recommended entry point.
+
+## FastVGGT refinement defaults
+
+FastVGGT now uses a two-step path:
+- `sfmFeatures`: FastVGGT exports a seed COLMAP model.
+- `sfmMatching`/`sfmMapping`: COLMAP/GLOMAP refines that seed model (point triangulation, optional bundle adjustment, then mapper fallback when needed).
+
+Defaults:
+- FastVGGT remains the default backend.
+- Default fallback order is `FastVGGT -> COLMAP` (automatic VGGT grace fallback is removed).
+- Refinement is required by default.
+- Bundle adjustment is enabled by default, but runs via COLMAP `bundle_adjuster` (not pycolmap in the FastVGGT Python bridge).
+- FastVGGT toolchain builds no longer require `pycolmap` by default.
+
+Useful overrides:
+- `EASYSPLAT_FASTVGGT_REQUIRE_REFINED_MODEL=0`: allow seed-model fallback when refinement cannot produce an acceptable model.
+- `EASYSPLAT_FASTVGGT_USE_BA=0`: skip `bundle_adjuster` and keep triangulation-only refinement.
+- `EASYSPLAT_FASTVGGT_BA_MAX_ITERS=<n>`: set BA max iterations (default `50`).
+- `EASYSPLAT_FASTVGGT_BA_REFINE_FOCAL=0|1`: toggle focal refinement (default `1`).
+- `EASYSPLAT_FASTVGGT_BA_REFINE_PP=0|1`: toggle principal-point refinement (default `0`).
+- `EASYSPLAT_FASTVGGT_BA_REFINE_EXTRA=0|1`: toggle extra-parameter refinement (default `0`).
+- Deprecated and ignored: `EASYSPLAT_FASTVGGT_TRACK_MODE`, `EASYSPLAT_FASTVGGT_REFINEMENT_POLICY`, `EASYSPLAT_FASTVGGT_WATCHDOG_SECONDS`, `EASYSPLAT_FASTVGGT_MAX_TRACKS_PROFILE`, `EASYSPLAT_FASTVGGT_ALLOW_TRACK_ONLY_DEGRADE`, `EASYSPLAT_ENABLE_VGGT_GRACE_FALLBACK`.
 
 ## Build a DMG locally (from scratch)
 
@@ -129,6 +152,7 @@ If you change toolchain artifact naming/layout (e.g. core/models split), update 
 ./scripts/toolchain/build_glomap.sh
 ./scripts/toolchain/build_brush.sh
 ./scripts/toolchain/build_vggt_mps.sh
+./scripts/toolchain/build_fastvggt_mps.sh
 ./scripts/toolchain/package_toolchain.sh --version 0.1.0
 ```
 

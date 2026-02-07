@@ -26,6 +26,7 @@ COLMAP_INSTALL="${COLMAP_INSTALL:-$ROOT/Toolchains/build/colmap/install}"
 GLOMAP_INSTALL="${GLOMAP_INSTALL:-$ROOT/Toolchains/build/glomap/install}"
 BRUSH_INSTALL="${BRUSH_INSTALL:-$ROOT/Toolchains/build/brush/install}"
 VGGT_MPS_INSTALL="${VGGT_MPS_INSTALL:-$ROOT/Toolchains/build/vggt_mps/install}"
+FASTVGGT_MPS_INSTALL="${FASTVGGT_MPS_INSTALL:-$ROOT/Toolchains/build/fastvggt_mps/install}"
 
 OUT="$ROOT/Toolchains/out"
 BIN="$OUT/bin"
@@ -92,6 +93,44 @@ if [ ! -f "$VGGT_MPS_INSTALL/vggt_mps/vendor/vggt/vggt/models/vggt.py" ]; then
   exit 1
 fi
 cp -R "$VGGT_MPS_INSTALL/vggt_mps" "$OUT/vggt_mps"
+
+if [ ! -d "$FASTVGGT_MPS_INSTALL/fastvggt_mps" ]; then
+  echo "fastvggt_mps bundle not found at $FASTVGGT_MPS_INSTALL/fastvggt_mps. Build it before packaging." >&2
+  exit 1
+fi
+if [ ! -x "$FASTVGGT_MPS_INSTALL/fastvggt_mps/bin/easysplat_fastvggt_sfm" ]; then
+  echo "fastvggt_mps bundle missing bin/easysplat_fastvggt_sfm. Rebuild fastvggt_mps." >&2
+  exit 1
+fi
+if [ ! -x "$FASTVGGT_MPS_INSTALL/fastvggt_mps/python/bin/python3" ]; then
+  echo "fastvggt_mps bundle missing python/bin/python3. Rebuild fastvggt_mps." >&2
+  exit 1
+fi
+FAST_PY_BIN="$FASTVGGT_MPS_INSTALL/fastvggt_mps/python/bin/python3"
+if ! /usr/bin/file "$FAST_PY_BIN" | grep -q "arm64"; then
+  echo "fastvggt_mps python is not arm64 (Rosetta build detected). Rebuild fastvggt_mps on Apple Silicon." >&2
+  exit 1
+fi
+if [ -L "$FAST_PY_BIN" ]; then
+  target="$(readlink "$FAST_PY_BIN" || true)"
+  if [[ "$target" == /* ]]; then
+    echo "fastvggt_mps python3 is an absolute symlink ($target). Rebuild fastvggt_mps with bundled CPython." >&2
+    exit 1
+  fi
+fi
+if [ ! -d "$FASTVGGT_MPS_INSTALL/fastvggt_mps/models" ]; then
+  echo "fastvggt_mps bundle missing models/. Rebuild fastvggt_mps." >&2
+  exit 1
+fi
+if [ ! -f "$FASTVGGT_MPS_INSTALL/fastvggt_mps/models/fastvggt_model.pt" ]; then
+  echo "fastvggt_mps bundle missing models/fastvggt_model.pt. Rebuild fastvggt_mps." >&2
+  exit 1
+fi
+if [ ! -f "$FASTVGGT_MPS_INSTALL/fastvggt_mps/vendor/fastvggt/vggt/models/vggt.py" ]; then
+  echo "fastvggt_mps bundle missing vendor/fastvggt. Rebuild fastvggt_mps." >&2
+  exit 1
+fi
+cp -R "$FASTVGGT_MPS_INSTALL/fastvggt_mps" "$OUT/fastvggt_mps"
 
 if ! command -v install_name_tool >/dev/null 2>&1; then
   echo "install_name_tool not found; cannot package portable GLOMAP dependencies." >&2
@@ -184,8 +223,8 @@ test -f "$LIB/libcrypto.3.dylib" || { echo "missing bundled libcrypto.3.dylib" >
 test -f "$LIB/libssl.3.dylib" || { echo "missing bundled libssl.3.dylib" >&2; exit 1; }
 
 pushd "$OUT" >/dev/null
-zip -r "$CORE_ZIP" bin lib vggt_mps/bin vggt_mps/python vggt_mps/app vggt_mps/vendor
-zip -r "$MODELS_ZIP" vggt_mps/models
+zip -r "$CORE_ZIP" bin lib vggt_mps/bin vggt_mps/python vggt_mps/app vggt_mps/vendor fastvggt_mps/bin fastvggt_mps/python fastvggt_mps/app fastvggt_mps/vendor
+zip -r "$MODELS_ZIP" vggt_mps/models fastvggt_mps/models
 popd >/dev/null
 
 echo "Packaged toolchain (core): $CORE_ZIP"

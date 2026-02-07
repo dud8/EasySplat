@@ -39,11 +39,20 @@ jobs:
       - name: Build COLMAP
         run: scripts/toolchain/build_colmap.sh
 
+      - name: Build OpenSSL
+        run: scripts/toolchain/build_openssl.sh
+
       - name: Build GLOMAP
         run: scripts/toolchain/build_glomap.sh
 
       - name: Build Brush
         run: scripts/toolchain/build_brush.sh
+
+      - name: Build VGGT-MPS bundle
+        run: scripts/toolchain/build_vggt_mps.sh
+
+      - name: Build FastVGGT-MPS bundle
+        run: scripts/toolchain/build_fastvggt_mps.sh
 
       - name: Package toolchain
         run: scripts/toolchain/package_toolchain.sh --version "$VERSION"
@@ -56,13 +65,17 @@ jobs:
             echo "Missing TOOLCHAIN_SIGNING_KEY_BASE64 secret"
             exit 1
           fi
-          ZIP="Toolchains/out/toolchain-macos-arm64-$VERSION.zip"
-          ARTIFACT_URL="https://github.com/${{ github.repository }}/releases/download/$TAG/toolchain-macos-arm64-$VERSION.zip"
+          CORE_ZIP="Toolchains/out/toolchain-macos-arm64-$VERSION-core.zip"
+          MODELS_ZIP="Toolchains/out/toolchain-macos-arm64-$VERSION-models.zip"
+          CORE_URL="https://github.com/${{ github.repository }}/releases/download/$TAG/toolchain-macos-arm64-$VERSION-core.zip"
+          MODELS_URL="https://github.com/${{ github.repository }}/releases/download/$TAG/toolchain-macos-arm64-$VERSION-models.zip"
           swift run --package-path Tools/ManifestTool ManifestTool \
-            --zip "$ZIP" \
+            --core-zip "$CORE_ZIP" \
+            --core-url "$CORE_URL" \
+            --models-zip "$MODELS_ZIP" \
+            --models-url "$MODELS_URL" \
             --version "$VERSION" \
             --published-at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
-            --artifact-url "$ARTIFACT_URL" \
             --private-key "$TOOLCHAIN_SIGNING_KEY_BASE64" \
             --manifest-out "Toolchains/out/manifest.json"
 
@@ -72,5 +85,6 @@ jobs:
           tag_name: ${{ env.TAG }}
           target_commitish: ${{ github.sha }}
           files: |
-            Toolchains/out/toolchain-macos-arm64-${{ env.VERSION }}.zip
+            Toolchains/out/toolchain-macos-arm64-${{ env.VERSION }}-core.zip
+            Toolchains/out/toolchain-macos-arm64-${{ env.VERSION }}-models.zip
             Toolchains/out/manifest.json

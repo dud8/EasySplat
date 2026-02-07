@@ -1,0 +1,1 @@
+"""EasySplat FastVGGT bridge package."""

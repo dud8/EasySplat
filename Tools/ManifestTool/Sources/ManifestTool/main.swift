@@ -70,9 +70,14 @@ struct ManifestTool {
                         "vggt_mps/python/bin/python3",
                         "vggt_mps/app/easysplat_vggt_sfm/run.py",
                         "vggt_mps/vendor/vggt/vggt/models/vggt.py",
+                        "fastvggt_mps/bin/easysplat_fastvggt_sfm",
+                        "fastvggt_mps/python/bin/python3",
+                        "fastvggt_mps/app/easysplat_fastvggt_sfm/run.py",
+                        "fastvggt_mps/vendor/fastvggt/vggt/models/vggt.py",
                     ]
                     let modelsContents = [
-                        "vggt_mps/models/vggt_model.pt"
+                        "vggt_mps/models/vggt_model.pt",
+                        "fastvggt_mps/models/fastvggt_model.pt",
                     ]
 
                     artifacts = [
@@ -98,6 +103,11 @@ struct ManifestTool {
                         "vggt_mps/app/easysplat_vggt_sfm/run.py",
                         "vggt_mps/vendor/vggt/vggt/models/vggt.py",
                         "vggt_mps/models/vggt_model.pt",
+                        "fastvggt_mps/bin/easysplat_fastvggt_sfm",
+                        "fastvggt_mps/python/bin/python3",
+                        "fastvggt_mps/app/easysplat_fastvggt_sfm/run.py",
+                        "fastvggt_mps/vendor/fastvggt/vggt/models/vggt.py",
+                        "fastvggt_mps/models/fastvggt_model.pt",
                     ]
 
                     artifacts = [

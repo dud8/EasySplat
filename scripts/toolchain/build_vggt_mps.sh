@@ -11,8 +11,9 @@ BIN_DIR="$INSTALL_DIR/bin"
 VENDOR_DIR="$INSTALL_DIR/vendor"
 VGGT_VENDOR="$VENDOR_DIR/vggt"
 
+VGGT_SOURCE="${VGGT_SOURCE:-$ROOT/ThirdParty/VGGT}"
+VGGT_UPSTREAM_REPO="${VGGT_UPSTREAM_REPO:-}"
 VGGT_UPSTREAM_REF="${VGGT_UPSTREAM_REF:-main}"
-VGGT_UPSTREAM_REPO="$BUILD_DIR/vggt-upstream"
 
 VGGT_MODEL_URL="${VGGT_MODEL_URL:-https://huggingface.co/facebook/VGGT-1B/resolve/main/model.pt}"
 VGGT_MODEL_FILE="$MODELS_DIR/vggt_model.pt"
@@ -118,7 +119,15 @@ mkdir -p "$BUILD_DIR" "$INSTALL_DIR" "$MODELS_DIR" "$BIN_DIR"
 ensure_python
 require_arm64_python
 
-ensure_repo "$VGGT_UPSTREAM_REPO" "https://github.com/facebookresearch/vggt.git" "$VGGT_UPSTREAM_REF"
+if [ -d "$VGGT_SOURCE/vggt" ]; then
+  : # vendored source
+elif [ -n "$VGGT_UPSTREAM_REPO" ]; then
+  VGGT_SOURCE="$VGGT_UPSTREAM_REPO"
+  ensure_repo "$VGGT_UPSTREAM_REPO" "https://github.com/facebookresearch/vggt.git" "$VGGT_UPSTREAM_REF"
+else
+  echo "VGGT source not found at $VGGT_SOURCE. Ensure ThirdParty/VGGT exists or set VGGT_UPSTREAM_REPO." >&2
+  exit 1
+fi
 
 # Install the runtime deps for EasySplat's VGGT bridge.
 # Note: upstream vggt/requirements.txt pins torch==2.3.1 which doesn't have wheels for newer
@@ -127,42 +136,29 @@ ensure_repo "$VGGT_UPSTREAM_REPO" "https://github.com/facebookresearch/vggt.git"
 pip_install -r "$ROOT/Tools/VggtSfm/requirements.txt"
 verify_torch_mps
 
-# Vendor the upstream VGGT repo so toolchain runs offline (no pip editable install needed).
+# Vendor the minimal VGGT sources so toolchain runs offline (no pip editable install needed).
 if command -v rsync >/dev/null 2>&1; then
-  mkdir -p "$VENDOR_DIR"
+  rm -rf "$VGGT_VENDOR"
+  mkdir -p "$VGGT_VENDOR"
   rsync -a --delete \
-    --exclude ".git" \
     --exclude "__pycache__" \
-    --exclude ".pytest_cache" \
     --exclude "*.pyc" \
-    "$VGGT_UPSTREAM_REPO/" "$VGGT_VENDOR/"
+    "$VGGT_SOURCE/vggt/" "$VGGT_VENDOR/vggt/"
+  if [ -f "$VGGT_SOURCE/LICENSE.txt" ]; then
+    cp -f "$VGGT_SOURCE/LICENSE.txt" "$VGGT_VENDOR/LICENSE.txt"
+  fi
 else
   rm -rf "$VGGT_VENDOR"
   mkdir -p "$VGGT_VENDOR"
-  cp -R "$VGGT_UPSTREAM_REPO/." "$VGGT_VENDOR/"
+  cp -R "$VGGT_SOURCE/vggt" "$VGGT_VENDOR/"
+  if [ -f "$VGGT_SOURCE/LICENSE.txt" ]; then
+    cp -f "$VGGT_SOURCE/LICENSE.txt" "$VGGT_VENDOR/LICENSE.txt"
+  fi
 fi
 
 if [ ! -f "$VGGT_VENDOR/vggt/models/vggt.py" ]; then
   echo "VGGT vendor tree missing expected module: vggt/models/vggt.py" >&2
   exit 1
-fi
-
-PATCH_FILE="$VGGT_VENDOR/vggt/layers/block.py"
-if [ -f "$PATCH_FILE" ]; then
-  PATCH_FILE="$PATCH_FILE" PYTHONNOUSERSITE=1 "$PYTHON_DIR/bin/python3" - <<'PY'
-import os
-from pathlib import Path
-
-path = Path(os.environ["PATCH_FILE"])
-text = path.read_text(encoding="utf-8")
-if "drop_path2" not in text and "drop_path1(ffn_residual_func" in text:
-    updated = text.replace(
-        "drop_path1(ffn_residual_func(x))",
-        "drop_path2(ffn_residual_func(x))"
-    )
-    if updated != text:
-        path.write_text(updated, encoding="utf-8")
-PY
 fi
 
 # Install EasySplat's VGGT -> COLMAP bridge app code.
@@ -183,6 +179,7 @@ VENDOR_VGGT="$ROOT/vendor/vggt"
 export PYTHONNOUSERSITE=1
 export PYTHONPATH="$APP:$VENDOR_VGGT${PYTHONPATH:+:$PYTHONPATH}"
 export TORCH_HOME="$ROOT/models"
+export KMP_DUPLICATE_LIB_OK=TRUE
 exec "$PY" -m easysplat_vggt_sfm.run "$@"
 SCRIPT
   chmod +x "$BIN_DIR/easysplat_vggt_sfm"
@@ -195,7 +192,7 @@ if [ ! -x "$BIN_DIR/easysplat_vggt_sfm" ]; then
   exit 1
 fi
 
-PYTHONNOUSERSITE=1 PYTHONPATH="$APP_DIR:$VGGT_VENDOR" "$PYTHON_DIR/bin/python3" - <<'PY'
+KMP_DUPLICATE_LIB_OK=TRUE PYTHONNOUSERSITE=1 PYTHONPATH="$APP_DIR:$VGGT_VENDOR" "$PYTHON_DIR/bin/python3" - <<'PY'
 import sys
 try:
     from vggt.models.vggt import VGGT  # noqa: F401
