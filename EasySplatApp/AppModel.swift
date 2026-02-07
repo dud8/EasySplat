@@ -38,6 +38,7 @@ final class AppModel: ObservableObject {
     @Published var toolchainPaths: ToolchainPaths? = nil
     @Published private(set) var stopAction: StopAction? = nil
     @Published var isShowingTrainingConsent: Bool = false
+    @Published var isLivePreviewEnabled: Bool = false
 
     @Published var captureMode: CaptureMode = .object
     @Published var qualityPreset: QualityPreset = .standard
@@ -45,6 +46,7 @@ final class AppModel: ObservableObject {
     @Published var pendingPhotosFolderURL: URL? = nil
     @Published var projectSummaries: [ProjectSummary] = []
     @Published var selectionWarning: String? = nil
+    @Published var recoveryPromptProject: ProjectSummary? = nil
 
     private let toolchainManager: ToolchainManaging
     private let pipelineRunnerFactory: (URL, PipelineRunner.PipelineConfig) -> PipelineRunning
@@ -59,7 +61,10 @@ final class AppModel: ObservableObject {
     private var lastStageLogAt: Date = .distantPast
     private var lastStageLogMessage: String = ""
     private var lastStageLogStage: PipelineStage? = nil
-    private let trainingStepLogInterval = 20
+    private var lastToolchainMilestoneMessage: String = ""
+    private var toolchainDownloadBucketByLabel: [String: Int] = [:]
+    private let trainingStepLogInterval = 120
+    private let trainingProgressLogMinInterval: TimeInterval = 3.0
     private var trainingConsentContinuation: CheckedContinuation<Bool, Never>?
     private var trainingConsentPauseStartedAt: Date?
     private var trainingConsentPausedDuration: TimeInterval = 0
@@ -68,6 +73,9 @@ final class AppModel: ObservableObject {
     private var allowNextWindowClose = false
     private var pendingSnapshotRevealURL: URL?
     private var pendingSnapshotRevealRequiresExit: Bool = false
+    private var forcedExitTask: Task<Void, Never>?
+    private var ignoredRecoveryProjectIDs: Set<UUID> = []
+    private static let forcedExitTimeoutNanoseconds: UInt64 = 25_000_000_000
 
     static let trainingConsentRememberedKey = "EasySplatTrainingConsentRemembered"
 
@@ -90,6 +98,13 @@ final class AppModel: ObservableObject {
 
     var isStopping: Bool {
         stopAction != nil
+    }
+
+    var trainingSnapshotURL: URL? {
+        guard let currentProjectURL else { return nil }
+        return ProjectPaths(root: currentProjectURL)
+            .trainingURL
+            .appendingPathComponent("latest_snapshot.ply")
     }
 
     var processingDetailsText: String? {
@@ -193,8 +208,36 @@ final class AppModel: ObservableObject {
     }
 
     func resumeProject(at url: URL) {
+        clearRecoveryPromptSuppression(for: url)
         currentTask?.cancel()
         currentTask = Task { await resumeProjectTask(at: url) }
+    }
+
+    func resumeInterruptedProject(_ project: ProjectSummary) {
+        recoveryPromptProject = nil
+        clearRecoveryPromptSuppression(for: project.url)
+        currentTask?.cancel()
+        currentTask = Task { await resumeProjectTask(at: project.url) }
+    }
+
+    func keepInterruptedProjectForLater(_ project: ProjectSummary) {
+        suppressRecoveryPrompt(for: project.url)
+        if recoveryPromptProject?.id == project.id {
+            recoveryPromptProject = nil
+        }
+    }
+
+    func deleteInterruptedProject(_ project: ProjectSummary) {
+        ignoredRecoveryProjectIDs.insert(project.id)
+        if recoveryPromptProject?.id == project.id {
+            recoveryPromptProject = nil
+        }
+        if currentProjectURL == project.url {
+            cancelCurrentProject(deleteProject: true)
+            return
+        }
+        try? FileManager.default.removeItem(at: project.url)
+        refreshProjectSummaries()
     }
 
     func cancelCurrentProject(deleteProject: Bool, exitIntent: ExitIntent = .none, window: NSWindow? = nil) {
@@ -216,6 +259,9 @@ final class AppModel: ObservableObject {
 
         guard currentTask != nil else {
             let projectURL = currentProjectURL
+            if !deleteProject, let projectURL {
+                suppressRecoveryPrompt(for: projectURL, clearLastRunStartedAt: true)
+            }
             reset()
             viewState = .home
             if deleteProject, let projectURL {
@@ -241,6 +287,7 @@ final class AppModel: ObservableObject {
         }
         progress = nil
         currentTask?.cancel()
+        scheduleForcedExitIfNeeded()
     }
 
     func awaitTrainingConsent() async -> Bool {
@@ -322,6 +369,9 @@ final class AppModel: ObservableObject {
     func registerExitIntent(_ intent: ExitIntent, window: NSWindow? = nil) {
         exitIntent = intent
         pendingCloseWindow = window
+        if isStopping {
+            scheduleForcedExitIfNeeded()
+        }
     }
 
     func consumeWindowCloseBypass(for window: NSWindow) -> Bool {
@@ -344,7 +394,113 @@ final class AppModel: ObservableObject {
         }
     }
 
+    private func scheduleForcedExitIfNeeded() {
+        guard exitIntent != .none else { return }
+        forcedExitTask?.cancel()
+        let intent = exitIntent
+        forcedExitTask = Task { [weak self, weak window = pendingCloseWindow] in
+            try? await Task.sleep(nanoseconds: Self.forcedExitTimeoutNanoseconds)
+            await MainActor.run {
+                guard let self else { return }
+                guard self.stopAction != nil else { return }
+                self.forceFinalizeExit(intent: intent, window: window)
+            }
+        }
+    }
+
+    private func cancelForcedExitIfNeeded() {
+        forcedExitTask?.cancel()
+        forcedExitTask = nil
+    }
+
+    private func forceFinalizeExit(intent: ExitIntent, window: NSWindow?) {
+        switch intent {
+        case .none:
+            return
+        case .quit:
+            exitIntent = .none
+            pendingCloseWindow = nil
+            NSApp.reply(toApplicationShouldTerminate: true)
+            NSApp.terminate(nil)
+        case .closeWindow:
+            exitIntent = .none
+            pendingCloseWindow = nil
+            if let window {
+                allowNextWindowClose = true
+                window.performClose(nil)
+            }
+        }
+    }
+
+    private func maybePresentInterruptedProjectPrompt() {
+        guard viewState == .home else { return }
+        if let current = recoveryPromptProject,
+           projectSummaries.contains(where: { $0.id == current.id }) {
+            return
+        }
+        let next = projectSummaries.first { summary in
+            summary.isInterrupted && !summary.isActive && !ignoredRecoveryProjectIDs.contains(summary.id)
+        }
+        recoveryPromptProject = next
+    }
+
+    @discardableResult
+    private func mutateProjectMetadata(
+        at projectURL: URL,
+        mutation: (inout ProjectMetadata) -> Void
+    ) -> ProjectMetadata? {
+        let metadataURL = ProjectPaths(root: projectURL).metadataURL
+        guard var metadata = try? ProjectMetadataStore.load(from: metadataURL) else {
+            return nil
+        }
+        mutation(&metadata)
+        do {
+            try ProjectMetadataStore.save(metadata, to: metadataURL)
+            return metadata
+        } catch {
+            return nil
+        }
+    }
+
+    private func metadataID(for projectURL: URL) -> UUID? {
+        let metadataURL = ProjectPaths(root: projectURL).metadataURL
+        return (try? ProjectMetadataStore.load(from: metadataURL))?.id
+    }
+
+    private func suppressRecoveryPrompt(for projectURL: URL, clearLastRunStartedAt: Bool = false) {
+        let id: UUID?
+        if let metadata = mutateProjectMetadata(at: projectURL, mutation: { metadata in
+            metadata.recoveryPromptSuppressed = true
+            if clearLastRunStartedAt {
+                metadata.lastRunStartedAt = nil
+            }
+        }) {
+            id = metadata.id
+        } else {
+            id = metadataID(for: projectURL)
+        }
+        guard let id else { return }
+        ignoredRecoveryProjectIDs.insert(id)
+        if recoveryPromptProject?.id == id {
+            recoveryPromptProject = nil
+        }
+    }
+
+    private func clearRecoveryPromptSuppression(for projectURL: URL) {
+        let id: UUID?
+        if let metadata = mutateProjectMetadata(at: projectURL, mutation: { metadata in
+            metadata.recoveryPromptSuppressed = false
+        }) {
+            id = metadata.id
+        } else {
+            id = metadataID(for: projectURL)
+        }
+        guard let id else { return }
+        ignoredRecoveryProjectIDs.remove(id)
+    }
+
     private func finalizeExitIfNeeded() {
+        cancelForcedExitIfNeeded()
         let intent = exitIntent
 
         switch intent {
@@ -660,7 +816,12 @@ final class AppModel: ObservableObject {
 
         // Keep "Details" verbose enough to be useful, but don't spam one line per frame.
         let now = Date()
-        let minInterval: TimeInterval = 1.5
+        let minInterval: TimeInterval
+        if stage == .trainBrush && trimmed.hasPrefix("Training model") {
+            minInterval = trainingProgressLogMinInterval
+        } else {
+            minInterval = 1.5
+        }
         if stage == lastProgressLogStage && trimmed == lastProgressLogMessage && now.timeIntervalSince(lastProgressLogAt) < minInterval {
             return
         }
@@ -723,6 +884,47 @@ final class AppModel: ObservableObject {
         }
     }
 
+    private func maybeAppendToolchainProgressLog(fraction: Double, message: String) {
+        let sanitized = sanitizeLogLine(message)
+        let trimmed = sanitized.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return }
+
+        if fraction < 0 {
+            guard trimmed != lastToolchainMilestoneMessage else { return }
+            lastToolchainMilestoneMessage = trimmed
+            appendLogLine("[Tools] \(trimmed)")
+            return
+        }
+
+        let clamped = min(max(fraction, 0.0), 1.0)
+        let bucket = Int((clamped * 100.0).rounded(.down) / 10.0) * 10
+        let label = toolchainProgressLabel(from: trimmed)
+        if toolchainDownloadBucketByLabel[label] == bucket {
+            return
+        }
+        toolchainDownloadBucketByLabel[label] = bucket
+        appendLogLine("[Tools] \(trimmed)")
+    }
+
+    private func toolchainProgressLabel(from message: String) -> String {
+        guard let open = message.firstIndex(of: "("),
+              let close = message[open...].firstIndex(of: ")"),
+              open < close else {
+            return "tools"
+        }
+        let inner = message[message.index(after: open)..<close]
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased()
+        return inner.isEmpty ? "tools" : inner
+    }
+
+    fileprivate func handleToolchainProgress(fraction: Double, message: String) {
+        progress = fraction < 0 ? nil : fraction
+        statusTitle = "Downloading tools"
+        statusDetail = message
+        maybeAppendToolchainProgressLog(fraction: fraction, message: message)
+    }
+
     private func sanitizeLogLine(_ line: String) -> String {
         // Strip ANSI escape sequences (common in CLI progress redraws).
         let scalars = Array(line.unicodeScalars)
@@ -759,6 +961,7 @@ final class AppModel: ObservableObject {
     }
 
     private func reset() {
+        cancelForcedExitIfNeeded()
         stage = nil
         progress = nil
         statusTitle = "Ready"
@@ -775,6 +978,8 @@ final class AppModel: ObservableObject {
         lastStageLogAt = .distantPast
         lastStageLogMessage = ""
         lastStageLogStage = nil
+        lastToolchainMilestoneMessage = ""
+        toolchainDownloadBucketByLabel = [:]
         lastError = nil
         errorDetails = nil
         outputPlyURL = nil
@@ -782,11 +987,13 @@ final class AppModel: ObservableObject {
         currentProjectURL = nil
         stopAction = nil
         isShowingTrainingConsent = false
+        isLivePreviewEnabled = false
         trainingConsentContinuation = nil
         trainingConsentPauseStartedAt = nil
         trainingConsentPausedDuration = 0
         pendingSnapshotRevealURL = nil
         pendingSnapshotRevealRequiresExit = false
+        recoveryPromptProject = nil
     }
 
     private func completeStop() {
@@ -794,6 +1001,9 @@ final class AppModel: ObservableObject {
         stopAction = nil
 
         let projectURL = currentProjectURL
+        if action == .keepProject, let projectURL {
+            suppressRecoveryPrompt(for: projectURL, clearLastRunStartedAt: true)
+        }
         let snapshotURL = pendingSnapshotRevealURL
         let shouldOfferSnapshot = pendingSnapshotRevealRequiresExit
         reset()
@@ -942,6 +1152,13 @@ final class AppModel: ObservableObject {
             let outputExists = outputURL.map { FileManager.default.fileExists(atPath: $0.path) } ?? false
             let isActive = currentProjectURL == url && viewState == .processing
             let isRetrying = isActive && metadata.state.lastError != nil
+            let hasInterruptionEvidence = metadata.checkpoint != nil || metadata.lastRunStartedAt != nil
+            let isInterrupted = !isActive
+                && !outputExists
+                && metadata.state.lastError == nil
+                && metadata.state.stage != .done
+                && hasInterruptionEvidence
+                && metadata.recoveryPromptSuppressed != true
             let status: ProjectStatus
             if isActive {
                 status = .inProgress
@@ -960,12 +1177,15 @@ final class AppModel: ObservableObject {
                 status: status,
                 isActive: isActive,
                 isRetrying: isRetrying,
+                isInterrupted: isInterrupted,
+                checkpointUpdatedAt: metadata.checkpoint?.updatedAt,
                 lastError: metadata.state.lastError,
                 outputPlyURL: outputURL
             ))
         }
 
         projectSummaries = summaries.sorted { $0.createdAt > $1.createdAt }
+        maybePresentInterruptedProjectPrompt()
     }
 }
 
@@ -991,7 +1211,7 @@ private final class EventForwarder: @unchecked Sendable {
     }
 }
 
-    private final class ProgressForwarder: @unchecked Sendable {
+private final class ProgressForwarder: @unchecked Sendable {
     private weak var model: AppModel?
 
     init(model: AppModel) {
@@ -1001,9 +1221,7 @@ private final class EventForwarder: @unchecked Sendable {
     func update(fraction: Double, message: String) {
         Task { @MainActor in
             guard let model = self.model else { return }
-            model.progress = fraction < 0 ? nil : fraction
-            model.statusTitle = "Downloading tools"
-            model.statusDetail = message
+            model.handleToolchainProgress(fraction: fraction, message: message)
         }
     }
 }
@@ -1058,6 +1276,10 @@ enum AppConfig {
 extension AppModel {
     func test_loadPipelineLogTail(projectURL: URL, maxLines: Int = 200, maxBytes: Int = 64 * 1024) -> [String] {
         loadPipelineLogTail(projectURL: projectURL, maxLines: maxLines, maxBytes: maxBytes)
+    }
+
+    func test_applyToolchainProgress(fraction: Double, message: String) {
+        handleToolchainProgress(fraction: fraction, message: message)
     }
 }
 #endif

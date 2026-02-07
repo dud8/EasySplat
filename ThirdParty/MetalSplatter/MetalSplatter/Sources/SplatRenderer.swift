@@ -18,7 +18,7 @@ public class SplatRenderer {
     }
 
     private static let log =
-        Logger(subsystem: Bundle.module.bundleIdentifier!,
+        Logger(subsystem: Bundle.module.bundleIdentifier ?? "MetalSplatter",
                category: "SplatRenderer")
 
     public struct CameraDescriptor {

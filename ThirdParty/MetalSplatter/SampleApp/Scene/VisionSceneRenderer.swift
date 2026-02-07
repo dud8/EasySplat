@@ -18,7 +18,7 @@ extension LayerRenderer.Clock.Instant.Duration {
 
 class VisionSceneRenderer {
     private static let log =
-        Logger(subsystem: Bundle.main.bundleIdentifier!,
+        Logger(subsystem: Bundle.main.bundleIdentifier ?? "MetalSplatterSampleApp",
                category: "CompsitorServicesSceneRenderer")
 
     let layerRenderer: LayerRenderer
@@ -222,4 +222,3 @@ class VisionSceneRenderer {
 }
 
 #endif // os(visionOS)
-

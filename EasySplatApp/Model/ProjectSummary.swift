@@ -8,6 +8,8 @@ struct ProjectSummary: Identifiable {
     let status: ProjectStatus
     let isActive: Bool
     let isRetrying: Bool
+    let isInterrupted: Bool
+    let checkpointUpdatedAt: Date?
     let lastError: String?
     let outputPlyURL: URL?
 }

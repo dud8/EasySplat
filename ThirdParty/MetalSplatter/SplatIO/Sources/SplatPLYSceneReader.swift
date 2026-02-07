@@ -162,9 +162,9 @@ private struct PointElementMapping {
     let positionXPropertyIndex: Int
     let positionYPropertyIndex: Int
     let positionZPropertyIndex: Int
-    let normalXPropertyIndex: Int
-    let normalYPropertyIndex: Int
-    let normalZPropertyIndex: Int
+    let normalXPropertyIndex: Int?
+    let normalYPropertyIndex: Int?
+    let normalZPropertyIndex: Int?
     let colorPropertyIndices: Color
     let scaleXPropertyIndex: Int
     let scaleYPropertyIndex: Int
@@ -184,9 +184,14 @@ private struct PointElementMapping {
         let positionXPropertyIndex = try headerElement.index(forFloat32PropertyNamed: PropertyName.positionX)
         let positionYPropertyIndex = try headerElement.index(forFloat32PropertyNamed: PropertyName.positionY)
         let positionZPropertyIndex = try headerElement.index(forFloat32PropertyNamed: PropertyName.positionZ)
-        let normalXPropertyIndex = try headerElement.index(forFloat32PropertyNamed: PropertyName.normalX)
-        let normalYPropertyIndex = try headerElement.index(forFloat32PropertyNamed: PropertyName.normalY)
-        let normalZPropertyIndex = try headerElement.index(forFloat32PropertyNamed: PropertyName.normalZ)
+        let normalXPropertyIndex = try headerElement.index(forOptionalFloat32PropertyNamed: PropertyName.normalX)
+        let normalYPropertyIndex = try headerElement.index(forOptionalFloat32PropertyNamed: PropertyName.normalY)
+        let normalZPropertyIndex = try headerElement.index(forOptionalFloat32PropertyNamed: PropertyName.normalZ)
+        let hasAnyNormal = normalXPropertyIndex != nil || normalYPropertyIndex != nil || normalZPropertyIndex != nil
+        let hasAllNormals = normalXPropertyIndex != nil && normalYPropertyIndex != nil && normalZPropertyIndex != nil
+        if hasAnyNormal && !hasAllNormals {
+            throw SplatPLYSceneReader.Error.unsupportedFileContents("Incomplete normal property set")
+        }
 
         let color: Color
         if let sh0_rPropertyIndex = try headerElement.index(forOptionalFloat32PropertyNamed: PropertyName.sh0_r),
@@ -252,9 +257,13 @@ private struct PointElementMapping {
         result.position.x = try element.float32Value(forPropertyIndex: positionXPropertyIndex)
         result.position.y = try element.float32Value(forPropertyIndex: positionYPropertyIndex)
         result.position.z = try element.float32Value(forPropertyIndex: positionZPropertyIndex)
-        result.normal.x = try element.float32Value(forPropertyIndex: normalXPropertyIndex)
-        result.normal.y = try element.float32Value(forPropertyIndex: normalYPropertyIndex)
-        result.normal.z = try element.float32Value(forPropertyIndex: normalZPropertyIndex)
+        if let normalXPropertyIndex, let normalYPropertyIndex, let normalZPropertyIndex {
+            result.normal.x = try element.float32Value(forPropertyIndex: normalXPropertyIndex)
+            result.normal.y = try element.float32Value(forPropertyIndex: normalYPropertyIndex)
+            result.normal.z = try element.float32Value(forPropertyIndex: normalZPropertyIndex)
+        } else {
+            result.normal = .zero
+        }
 
         switch colorPropertyIndices {
         case .sphericalHarmonic(let r, let g, let b, let sphericalHarmonicsPropertyIndices):

@@ -5,6 +5,7 @@ struct LogDrawerView: View {
     let lines: [String]
     let detailsText: String?
     let copyText: String?
+    var maxExpandedHeight: CGFloat = 180
 
     @State private var expanded = false
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
@@ -72,7 +73,7 @@ struct LogDrawerView: View {
                         }
                     }
                 }
-                .frame(maxHeight: 180)
+                .frame(maxHeight: maxExpandedHeight)
                 .padding(8)
                 .background(
                     RoundedRectangle(cornerRadius: Theme.Radius.card, style: .continuous)

@@ -11,7 +11,7 @@ public class SampleBoxRenderer {
     }
 
     private static let log =
-        Logger(subsystem: Bundle.module.bundleIdentifier!,
+        Logger(subsystem: Bundle.module.bundleIdentifier ?? "SampleBoxRenderer",
                category: "SampleBoxRenderer")
 
     enum Error: Swift.Error {

@@ -34,6 +34,7 @@ class MetalKitSceneRenderer: NSObject, MTKViewDelegate {
     private let defaultPan: SIMD2<Float> = .zero
 
     var drawableSize: CGSize = .zero
+    private static let modelLoadQueue = DispatchQueue(label: "com.easysplat.model-load", qos: .userInitiated)
 
     init?(_ metalKitView: MTKView) {
         guard let device = metalKitView.device else { return nil }
@@ -45,10 +46,15 @@ class MetalKitSceneRenderer: NSObject, MTKViewDelegate {
         metalKitView.depthStencilPixelFormat = MTLPixelFormat.depth32Float_stencil8
         metalKitView.sampleCount = 1
         metalKitView.clearColor = MTLClearColor(red: 0, green: 0, blue: 0, alpha: 0)
+        metalKitView.enableSetNeedsDisplay = true
+        metalKitView.isPaused = true
+        metalKitView.preferredFramesPerSecond = 24
     }
 
-    func load(_ model: ModelIdentifier?) throws {
-        guard model != self.model else { return }
+    func load(_ model: ModelIdentifier?, forceReload: Bool = false) async throws {
+        if !forceReload, model == self.model {
+            return
+        }
         self.model = model
 
         modelRenderer = nil
@@ -56,22 +62,48 @@ class MetalKitSceneRenderer: NSObject, MTKViewDelegate {
         do {
             switch model {
             case .gaussianSplat(let url):
-                let splat = try SplatRenderer(device: device,
-                                              colorFormat: metalKitView.colorPixelFormat,
-                                              depthFormat: metalKitView.depthStencilPixelFormat,
-                                              stencilFormat: metalKitView.depthStencilPixelFormat,
-                                              sampleCount: metalKitView.sampleCount,
-                                              maxViewCount: 1,
-                                              maxSimultaneousRenders: Constants.maxSimultaneousRenders)
-                try splat.readPLY(from: url)
+                let splat = try await loadSplatRenderer(from: url)
                 modelRenderer = splat
+                requestDraw()
             case .none:
+                requestDraw()
                 break
             }
         } catch {
             lastLoadError = error.localizedDescription
             throw error
         }
+    }
+
+    private func loadSplatRenderer(from url: URL) async throws -> SplatRenderer {
+        let device = self.device
+        let colorFormat = metalKitView.colorPixelFormat
+        let depthFormat = metalKitView.depthStencilPixelFormat
+        let sampleCount = metalKitView.sampleCount
+
+        return try await withCheckedThrowingContinuation { continuation in
+            Self.modelLoadQueue.async {
+                do {
+                    let splat = try SplatRenderer(
+                        device: device,
+                        colorFormat: colorFormat,
+                        depthFormat: depthFormat,
+                        stencilFormat: depthFormat,
+                        sampleCount: sampleCount,
+                        maxViewCount: 1,
+                        maxSimultaneousRenders: Constants.maxSimultaneousRenders
+                    )
+                    try splat.readPLY(from: url)
+                    continuation.resume(returning: splat)
+                } catch {
+                    continuation.resume(throwing: error)
+                }
+            }
+        }
+    }
+
+    private func requestDraw() {
+        metalKitView.draw()
     }
 
     private var viewportCamera: ModelRenderer.CameraMatrices {
@@ -124,19 +156,23 @@ class MetalKitSceneRenderer: NSObject, MTKViewDelegate {
 
     func mtkView(_ view: MTKView, drawableSizeWillChange size: CGSize) {
         drawableSize = size
+        requestDraw()
     }
 
     func orbit(deltaX: Float, deltaY: Float) {
         yaw += deltaX * Constants.orbitSpeed
         pitch = max(min(pitch + deltaY * Constants.orbitSpeed, .pi / 2 - 0.01), -.pi / 2 + 0.01)
+        requestDraw()
     }
 
     func zoom(delta: Float) {
         distance = max(Constants.minDistance, min(Constants.maxDistance, distance + delta * Constants.zoomSpeed))
+        requestDraw()
     }
 
     func pan(deltaX: Float, deltaY: Float) {
         pan += SIMD2<Float>(deltaX * Constants.panSpeed, -deltaY * Constants.panSpeed)
+        requestDraw()
     }
 
     func resetCamera() {
@@ -144,6 +180,7 @@ class MetalKitSceneRenderer: NSObject, MTKViewDelegate {
         pitch = defaultPitch
         distance = defaultDistance
         pan = defaultPan
+        requestDraw()
     }
 
     func fitToView() {
@@ -151,6 +188,7 @@ class MetalKitSceneRenderer: NSObject, MTKViewDelegate {
         yaw = 0
         pitch = 0
         pan = .zero
+        requestDraw()
     }
 
     func applyBounds(center: SIMD3<Float>, radius: Float) {
@@ -159,6 +197,7 @@ class MetalKitSceneRenderer: NSObject, MTKViewDelegate {
         let paddedRadius = max(radius, 0.01) * 1.2
         let targetDistance = paddedRadius / tanf(fov * 0.5)
         distance = max(Constants.minDistance, min(Constants.maxDistance, targetDistance))
+        requestDraw()
     }
 }
 

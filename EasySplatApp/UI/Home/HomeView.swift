@@ -61,6 +61,34 @@ struct HomeView: View {
         .onAppear {
             model.refreshProjectSummaries()
         }
+        .alert(
+            "Resume interrupted project?",
+            isPresented: Binding(
+                get: { model.recoveryPromptProject != nil },
+                set: { isPresented in
+                    if !isPresented, let project = model.recoveryPromptProject {
+                        model.keepInterruptedProjectForLater(project)
+                    }
+                }
+            ),
+            presenting: model.recoveryPromptProject
+        ) { project in
+            Button("Resume") {
+                model.resumeInterruptedProject(project)
+            }
+            Button("Keep for later", role: .cancel) {
+                model.keepInterruptedProjectForLater(project)
+            }
+            Button("Delete", role: .destructive) {
+                model.deleteInterruptedProject(project)
+            }
+        } message: { project in
+            if let updatedAt = project.checkpointUpdatedAt {
+                Text("Found unfinished progress for \"\(project.title)\" (last checkpoint: \(updatedAt.formatted(date: .abbreviated, time: .shortened))).")
+            } else {
+                Text("Found unfinished progress for \"\(project.title)\".")
+            }
+        }
     }
 
     private var selectedInputsPanel: some View {

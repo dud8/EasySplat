@@ -473,6 +473,12 @@ Do not
 - Status headline stays stable per stage; a detail line shows live progress when available
 - Errors are shown in red and must be short, direct
 - Log drawer remains collapsed by default
+- During Brush training, show an optional “Show live preview” checkbox (default off). If enabled, embed the preview below the progress bar with a short secondary caption (“May slow training. Updates every few minutes.”).
+- When live preview is enabled, keep the left status column scrollable so Details and controls remain accessible at smaller window heights.
+- Training live-preview overlays use compact viewer controls (Reset/Fit/Controls) so controls stay visible but do not dominate the preview canvas.
+- On larger windows, scale preview and expanded Details panel heights with available space while keeping current visual hierarchy and readability.
+- Training live preview polling is adaptive by training progress (`5s` early, `10s` mid, `15s` late) to reduce reload churn near the tail end of training.
+- While users are actively manipulating the preview, defer applying new snapshot reloads until the interaction is idle, then apply only the latest queued snapshot.
 
 ### Viewer Screen (`EasySplatApp/UI/Project/ViewerView.swift`)
 - Splat preview is the center of attention

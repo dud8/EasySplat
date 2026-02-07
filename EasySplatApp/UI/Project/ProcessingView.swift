@@ -12,52 +12,81 @@ struct ProcessingView: View {
             Text("Building your 3D memory")
                 .font(.title2.weight(.semibold))
 
-            HStack(alignment: .top, spacing: 24) {
-                VStack(alignment: .leading, spacing: 12) {
-                    Text(model.statusTitle)
-                        .font(.headline)
-                    if let detail = model.statusDetail, !detail.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                        Text(summaryDetail(detail))
-                            .font(.subheadline)
-                            .foregroundStyle(.secondary)
-                    }
-                    TimelineView(.periodic(from: .now, by: 1.0)) { context in
-                        if let timingText = timingText(now: context.date) {
-                            Text(timingText)
-                                .font(.caption)
-                                .foregroundStyle(.secondary)
+            GeometryReader { geometry in
+                let availableHeight = geometry.size.height
+                let previewHeight = min(420, max(260, availableHeight * 0.38))
+                let detailsHeight = min(320, max(180, availableHeight * 0.26))
+
+                HStack(alignment: .top, spacing: 24) {
+                    ScrollView {
+                        VStack(alignment: .leading, spacing: 12) {
+                            Text(model.statusTitle)
+                                .font(.headline)
+                            if let detail = model.statusDetail, !detail.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                                Text(summaryDetail(detail))
+                                    .font(.subheadline)
+                                    .foregroundStyle(.secondary)
+                            }
+                            TimelineView(.periodic(from: .now, by: 1.0)) { context in
+                                if let timingText = timingText(now: context.date) {
+                                    Text(timingText)
+                                        .font(.caption)
+                                        .foregroundStyle(.secondary)
+                                }
+                            }
+                            if model.stage == .trainBrush {
+                                Text("Training in progress. Closing now exports a snapshot only; resuming restarts from scratch.")
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                            }
+                            ShimmeringProgressView(progress: model.progress)
+                            if model.stage == .trainBrush {
+                                VStack(alignment: .leading, spacing: 8) {
+                                    Toggle("Show live preview", isOn: $model.isLivePreviewEnabled)
+                                        .toggleStyle(.checkbox)
+                                        .disabled(model.isStopping)
+                                    Text("May slow training. Updates every few minutes.")
+                                        .font(.caption)
+                                        .foregroundStyle(.secondary)
+                                    if model.isLivePreviewEnabled, let snapshotURL = model.trainingSnapshotURL {
+                                        TrainingLivePreviewView(
+                                            snapshotURL: snapshotURL,
+                                            preferredHeight: previewHeight,
+                                            trainingProgressFraction: model.progress
+                                        )
+                                    }
+                                }
+                            }
+                            if model.isStopping {
+                                HStack(spacing: 10) {
+                                    ProgressView()
+                                        .controlSize(.small)
+                                    Text(stoppingStatusText)
+                                        .font(.subheadline)
+                                        .foregroundStyle(.secondary)
+                                }
+                            }
+                            if let error = model.lastError {
+                                Text(error)
+                                    .foregroundStyle(.red)
+                                    .font(.subheadline)
+                            }
+                            LogDrawerView(
+                                lines: model.logLines,
+                                detailsText: model.processingDetailsText,
+                                copyText: model.errorDetailsText,
+                                maxExpandedHeight: detailsHeight
+                            )
                         }
                     }
-                    if model.stage == .trainBrush {
-                        Text("Training in progress. Closing now exports a snapshot only; resuming restarts from scratch.")
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
-                    }
-                    ShimmeringProgressView(progress: model.progress)
-                    if model.isStopping {
-                        HStack(spacing: 10) {
-                            ProgressView()
-                                .controlSize(.small)
-                            Text(stoppingStatusText)
-                                .font(.subheadline)
-                                .foregroundStyle(.secondary)
-                        }
-                    }
-                    if let error = model.lastError {
-                        Text(error)
-                            .foregroundStyle(.red)
-                            .font(.subheadline)
-                    }
-                    LogDrawerView(
-                        lines: model.logLines,
-                        detailsText: model.processingDetailsText,
-                        copyText: model.errorDetailsText
-                    )
+                    .frame(maxWidth: .infinity, alignment: .topLeading)
+
+                    StepperProgressView(currentStage: model.stage)
+                        .frame(width: 220)
                 }
-                Spacer()
-                StepperProgressView(currentStage: model.stage)
-                    .frame(width: 220)
+                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
             }
+            .frame(maxHeight: .infinity)
 
             HStack(spacing: 12) {
                 if let projectURL = model.currentProjectURL {
@@ -75,6 +104,7 @@ struct ProcessingView: View {
                 .disabled(model.isStopping)
             }
         }
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
         .padding(32)
         .sheet(isPresented: $model.isShowingTrainingConsent) {
             TrainingConsentSheet()
