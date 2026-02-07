@@ -12,6 +12,7 @@ final class ColmapRunnerTests: XCTestCase {
                 result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""),
                 onRun: { args in
                     XCTAssertEqual(self.value(for: "--SiftExtraction.max_num_features", in: args), "5000")
+                    XCTAssertEqual(self.value(for: "--ImageReader.single_camera", in: args), "1")
                 }
             )
         ])
@@ -29,6 +30,36 @@ final class ColmapRunnerTests: XCTestCase {
                 matchThreads: 1,
                 sequentialOverlap: 10,
                 maxNumFeatures: 5000
+            ),
+            onLog: { _, _ in }
+        )
+    }
+
+    func testFeatureExtractorAllowsPerImageCameras() async throws {
+        let runner = MockSubprocessRunner(scripts: [
+            .init(
+                path: "/mock/colmap",
+                argsPrefix: ["feature_extractor"],
+                result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""),
+                onRun: { args in
+                    XCTAssertEqual(self.value(for: "--ImageReader.single_camera", in: args), "0")
+                }
+            )
+        ])
+
+        let colmap = ColmapRunner(runner: runner)
+        try await colmap.runFeatureExtractor(
+            colmapPath: URL(fileURLWithPath: "/mock/colmap"),
+            database: URL(fileURLWithPath: "/tmp/db"),
+            imagePath: URL(fileURLWithPath: "/tmp/images"),
+            maxImageSize: 1024,
+            cameraModel: "SIMPLE_PINHOLE",
+            singleCamera: false,
+            options: ColmapOptions(
+                useGPU: false,
+                extractThreads: 2,
+                matchThreads: 1,
+                sequentialOverlap: 10
             ),
             onLog: { _, _ in }
         )
@@ -89,6 +120,109 @@ final class ColmapRunnerTests: XCTestCase {
                 sequentialOverlap: 5,
                 maxNumMatches: 9000,
                 useBruteForceMatcher: true
+            ),
+            onLog: { _, _ in }
+        )
+    }
+
+    func testPointTriangulatorUsesSeedAndOutputPaths() async throws {
+        let runner = MockSubprocessRunner(scripts: [
+            .init(
+                path: "/mock/colmap",
+                argsPrefix: ["point_triangulator"],
+                result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""),
+                onRun: { args in
+                    XCTAssertEqual(self.value(for: "--database_path", in: args), "/tmp/db")
+                    XCTAssertEqual(self.value(for: "--image_path", in: args), "/tmp/images")
+                    XCTAssertEqual(self.value(for: "--input_path", in: args), "/tmp/seed")
+                    XCTAssertEqual(self.value(for: "--output_path", in: args), "/tmp/sparse")
+                }
+            )
+        ])
+
+        let colmap = ColmapRunner(runner: runner)
+        try await colmap.runPointTriangulator(
+            colmapPath: URL(fileURLWithPath: "/mock/colmap"),
+            database: URL(fileURLWithPath: "/tmp/db"),
+            imagePath: URL(fileURLWithPath: "/tmp/images"),
+            inputPath: URL(fileURLWithPath: "/tmp/seed"),
+            outputPath: URL(fileURLWithPath: "/tmp/sparse"),
+            options: ColmapOptions(useGPU: false, extractThreads: 1, matchThreads: 1, sequentialOverlap: 10),
+            onLog: { _, _ in }
+        )
+    }
+
+    func testBundleAdjusterPassesRefinementKnobs() async throws {
+        let runner = MockSubprocessRunner(scripts: [
+            .init(
+                path: "/mock/colmap",
+                argsPrefix: ["bundle_adjuster"],
+                result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""),
+                onRun: { args in
+                    XCTAssertEqual(self.value(for: "--input_path", in: args), "/tmp/in")
+                    XCTAssertEqual(self.value(for: "--output_path", in: args), "/tmp/out")
+                    XCTAssertEqual(self.value(for: "--BundleAdjustmentCeres.max_num_iterations", in: args), "35")
+                    XCTAssertEqual(self.value(for: "--BundleAdjustment.refine_focal_length", in: args), "0")
+                    XCTAssertEqual(self.value(for: "--BundleAdjustment.refine_principal_point", in: args), "1")
+                    XCTAssertEqual(self.value(for: "--BundleAdjustment.refine_extra_params", in: args), "1")
+                }
+            )
+        ])
+
+        let colmap = ColmapRunner(runner: runner)
+        try await colmap.runBundleAdjuster(
+            colmapPath: URL(fileURLWithPath: "/mock/colmap"),
+            inputPath: URL(fileURLWithPath: "/tmp/in"),
+            outputPath: URL(fileURLWithPath: "/tmp/out"),
+            options: ColmapOptions(useGPU: false, extractThreads: 1, matchThreads: 1, sequentialOverlap: 10),
+            bundleOptions: ColmapBundleAdjustmentOptions(
+                maxNumIterations: 35,
+                refineFocalLength: false,
+                refinePrincipalPoint: true,
+                refineExtraParams: true
+            ),
+            onLog: { _, _ in }
+        )
+    }
+
+    func testBundleAdjusterRetriesWithLegacyIterationFlag() async throws {
+        let runner = MockSubprocessRunner(scripts: [
+            .init(
+                path: "/mock/colmap",
+                argsPrefix: ["bundle_adjuster"],
+                result: .init(
+                    exitCode: 1,
+                    terminationReason: .exit,
+                    stdout: "",
+                    stderr: "Failed to parse options - unrecognised option '--BundleAdjustmentCeres.max_num_iterations'."
+                ),
+                onRun: { args in
+                    XCTAssertEqual(self.value(for: "--BundleAdjustmentCeres.max_num_iterations", in: args), "20")
+                    XCTAssertNil(self.value(for: "--BundleAdjustment.max_num_iterations", in: args))
+                }
+            ),
+            .init(
+                path: "/mock/colmap",
+                argsPrefix: ["bundle_adjuster"],
+                result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""),
+                onRun: { args in
+                    XCTAssertEqual(self.value(for: "--BundleAdjustment.max_num_iterations", in: args), "20")
+                    XCTAssertNil(self.value(for: "--BundleAdjustmentCeres.max_num_iterations", in: args))
+                }
+            )
+        ])
+
+        let colmap = ColmapRunner(runner: runner)
+        try await colmap.runBundleAdjuster(
+            colmapPath: URL(fileURLWithPath: "/mock/colmap"),
+            inputPath: URL(fileURLWithPath: "/tmp/in"),
+            outputPath: URL(fileURLWithPath: "/tmp/out"),
+            options: ColmapOptions(useGPU: false, extractThreads: 1, matchThreads: 1, sequentialOverlap: 10),
+            bundleOptions: ColmapBundleAdjustmentOptions(
+                maxNumIterations: 20,
+                refineFocalLength: true,
+                refinePrincipalPoint: false,
+                refineExtraParams: false
             ),
             onLog: { _, _ in }
         )

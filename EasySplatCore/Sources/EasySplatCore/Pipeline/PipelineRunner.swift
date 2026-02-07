@@ -1,6 +1,7 @@
 import Foundation
 import Dispatch
 import ImageIO
+import SQLite3
 import UniformTypeIdentifiers
 
 public final class PipelineRunner: @unchecked Sendable {
@@ -10,15 +11,18 @@ public final class PipelineRunner: @unchecked Sendable {
         public var glomap: GlomapRunner
         public var brush: BrushRunner
         public var vggtSfm: VggtSfmRunning
+        public var fastVggtSfm: FastVggtSfmRunning
 
         public init(colmap: ColmapRunner = ColmapRunner(),
                     glomap: GlomapRunner = GlomapRunner(),
                     brush: BrushRunner = BrushRunner(),
-                    vggtSfm: VggtSfmRunning = VggtSfmRunner()) {
+                    vggtSfm: VggtSfmRunning = VggtSfmRunner(),
+                    fastVggtSfm: FastVggtSfmRunning = FastVggtSfmRunner()) {
             self.colmap = colmap
             self.glomap = glomap
             self.brush = brush
             self.vggtSfm = vggtSfm
+            self.fastVggtSfm = fastVggtSfm
         }
 
         public init(runner: SubprocessRunning) {
@@ -26,6 +30,7 @@ public final class PipelineRunner: @unchecked Sendable {
             self.glomap = GlomapRunner(runner: runner)
             self.brush = BrushRunner(runner: runner)
             self.vggtSfm = VggtSfmRunner(runner: runner)
+            self.fastVggtSfm = FastVggtSfmRunner(runner: runner)
         }
     }
     public struct PipelineConfig: Sendable {
@@ -73,6 +78,23 @@ public final class PipelineRunner: @unchecked Sendable {
         var forceExhaustiveMatching = false
         var disableGlomapForThisRun = false
         var lastUsedSequentialMatcher = false
+        let resumeValidationMode = lastCompletedStage != nil
+        let hasInterruptionEvidence = metadata.checkpoint != nil || metadata.lastRunStartedAt != nil
+        let wasInterrupted = metadata.state.lastError == nil
+            && metadata.state.stage != .done
+            && hasInterruptionEvidence
+        let skipTraining: Bool = {
+            guard let raw = ProcessInfo.processInfo.environment["EASYSPLAT_SKIP_TRAINING"]?
+                .trimmingCharacters(in: .whitespacesAndNewlines),
+                !raw.isEmpty else {
+                return false
+            }
+            return raw == "1" || raw.lowercased() == "true" || raw.lowercased() == "yes"
+        }()
+
+        metadata.recoveryPromptSuppressed = false
+        metadata.lastRunStartedAt = Date()
+        try? ProjectMetadataStore.save(metadata, to: paths.metadataURL)
 
         if metadata.state.lastError != nil {
             try? cleanForRetry(failedStage: metadata.state.stage, paths: paths)
@@ -99,31 +121,75 @@ public final class PipelineRunner: @unchecked Sendable {
             PipelineStage.allCases.firstIndex(of: stage) ?? 0
         }
 
-        func shouldRunStage(_ stage: PipelineStage) -> Bool {
+        func writeCheckpoint(
+            stage: PipelineStage,
+            progress: Double? = nil,
+            message: String? = nil,
+            details: PipelineCheckpointDetails? = nil
+        ) {
+            metadata.checkpoint = PipelineCheckpoint(
+                stage: stage,
+                updatedAt: Date(),
+                progressFraction: progress,
+                message: message,
+                details: details
+            )
+            try? ProjectMetadataStore.save(metadata, to: paths.metadataURL)
+        }
+
+        func shouldRunStage(_ stage: PipelineStage) throws -> Bool {
             guard let lastCompletedStage else { return true }
             if stageIndex(stage) <= stageIndex(lastCompletedStage) {
-                return !isStageComplete(stage, paths: paths, metadata: metadata)
+                if !resumeValidationMode {
+                    return !isStageComplete(stage, paths: paths, metadata: metadata)
+                }
+                switch try validateStageOutput(stage, paths: paths, metadata: metadata) {
+                case .valid:
+                    return false
+                case .missing:
+                    return true
+                case .corrupt(let reason):
+                    emit(.stageLog(
+                        stage: stage,
+                        line: "Detected partial/corrupt stage output for resume (\(reason)). Re-running \(stage.displayName).",
+                        isError: true
+                    ))
+                    try? cleanForRetry(failedStage: stage, paths: paths)
+                    try? paths.ensureDirectories()
+                    return true
+                }
             }
             return true
         }
 
         func markStageComplete(_ stage: PipelineStage) {
             metadata.state = PipelineState(stage: stage, attempt: metadata.state.attempt, lastError: nil, resumeToken: nil)
+            metadata.checkpoint = nil
             try? ProjectMetadataStore.save(metadata, to: paths.metadataURL)
         }
 
         func emitFailure(stage: PipelineStage, userMessage: String, debugMessage: String) {
             didEmitFailure = true
             metadata.state = PipelineState(stage: stage, attempt: metadata.state.attempt, lastError: userMessage, resumeToken: nil)
+            metadata.checkpoint = nil
+            metadata.lastRunStartedAt = nil
             try? ProjectMetadataStore.save(metadata, to: paths.metadataURL)
             emit(.pipelineFailed(stage: stage, userMessage: userMessage, debugMessage: debugMessage))
         }
 
         do {
+            if wasInterrupted, let checkpoint = metadata.checkpoint {
+                emit(.stageLog(
+                    stage: checkpoint.stage,
+                    line: "Recovered interrupted run checkpoint from \(checkpoint.updatedAt.formatted(date: .abbreviated, time: .standard)); validating resume outputs.",
+                    isError: false
+                ))
+            }
             try Task.checkCancellation()
-            if shouldRunStage(.importInput) {
+            if try shouldRunStage(.importInput) {
                 currentStage = .importInput
                 emit(.stageStarted(stage: .importInput))
+                writeCheckpoint(stage: .importInput, progress: 0, message: "Import started")
                 try importInputs(metadata: metadata, paths: paths, progress: { fraction, message in
                     emit(.stageProgress(stage: .importInput, fraction: fraction, message: message))
                 })
@@ -144,9 +210,15 @@ public final class PipelineRunner: @unchecked Sendable {
             var selectedFrames: [URL] = []
             var selectedFrameManifest: [SelectedFrameMapping] = []
             if metadata.input.hasVideos {
-                if shouldRunStage(.extractFrames) {
+                if try shouldRunStage(.extractFrames) {
                     currentStage = .extractFrames
                     emit(.stageStarted(stage: .extractFrames))
+                    writeCheckpoint(stage: .extractFrames, progress: 0, message: "Frame extraction started")
+                    emit(.stageLog(
+                        stage: .extractFrames,
+                        line: "Target frames: \(targetFrames).",
+                        isError: false
+                    ))
                     let extractor = FrameExtractor()
                     let videos = metadata.input.videoFiles
                     let totalVideos = Double(max(videos.count, 1))
@@ -187,6 +259,17 @@ public final class PipelineRunner: @unchecked Sendable {
                             line: "Wrote \(extracted.count) extracted frame(s) from \(sourceName).",
                             isError: false
                         ))
+                        writeCheckpoint(
+                            stage: .extractFrames,
+                            progress: Double(index + 1) / totalVideos,
+                            message: "Extracted \(extracted.count) frames from \(sourceName)",
+                            details: .extractFrames(ExtractFramesCheckpoint(
+                                videoIndex: index,
+                                videoName: sourceName,
+                                extractedCount: extracted.count,
+                                targetCount: perVideoTarget
+                            ))
+                        )
                     }
                     emit(.stageFinished(stage: .extractFrames))
                     markStageComplete(.extractFrames)
@@ -194,9 +277,10 @@ public final class PipelineRunner: @unchecked Sendable {
             }
 
             if metadata.input.hasVideos || metadata.input.hasPhotos {
-                if shouldRunStage(.selectFrames) {
+                if try shouldRunStage(.selectFrames) {
                     currentStage = .selectFrames
                     emit(.stageStarted(stage: .selectFrames))
+                    writeCheckpoint(stage: .selectFrames, progress: 0, message: "Frame selection started")
                     try self.resetDirectory(paths.framesSelectedURL)
                     self.removeIfExists(paths.framesSelectedManifestURL)
                     var groups: [SelectedFrameGroup] = []
@@ -267,6 +351,16 @@ public final class PipelineRunner: @unchecked Sendable {
                     )
                     selectedFrames = selection.frames
                     selectedFrameManifest = selection.manifest
+                    writeCheckpoint(
+                        stage: .selectFrames,
+                        progress: 1.0,
+                        message: "Selected \(selection.frames.count) frames",
+                        details: .selectFrames(SelectFramesCheckpoint(
+                            groupsProcessed: groups.count,
+                            selectedCount: selection.frames.count,
+                            manifestPath: paths.framesSelectedManifestURL.path
+                        ))
+                    )
                     emit(.stageFinished(stage: .selectFrames))
                     markStageComplete(.selectFrames)
                 }
@@ -310,25 +404,695 @@ public final class PipelineRunner: @unchecked Sendable {
             }
 
             try Task.checkCancellation()
-            var backendPolicy = sfmBackendPolicy()
-
-            if backendPolicy == .vggt, let autoTuneProfile, !autoTuneProfile.vggtAllowed {
+            let backendOverride = sfmBackendOverride()
+            var backendOrder = sfmBackendFallbackOrder(override: backendOverride)
+            let deprecatedFastVggtEnvKeys = [
+                "EASYSPLAT_FASTVGGT_TRACK_MODE",
+                "EASYSPLAT_FASTVGGT_REFINEMENT_POLICY",
+                "EASYSPLAT_FASTVGGT_WATCHDOG_SECONDS",
+                "EASYSPLAT_FASTVGGT_MAX_TRACKS_PROFILE",
+                "EASYSPLAT_FASTVGGT_ALLOW_TRACK_ONLY_DEGRADE",
+                "EASYSPLAT_ENABLE_VGGT_GRACE_FALLBACK"
+            ]
+            for key in deprecatedFastVggtEnvKeys where hasEnvValue(key) {
                 emit(.stageLog(
                     stage: .sfmFeatures,
-                    line: "Auto-tune disabled VGGT on this hardware tier; falling back to COLMAP + GLOMAP.",
+                    line: "Deprecated env '\(key)' is ignored. FastVGGT now uses external COLMAP/GLOMAP refinement.",
                     isError: true
                 ))
-                backendPolicy = .colmap
             }
 
-            if backendPolicy == .vggt {
+            if let autoTuneProfile, !autoTuneProfile.vggtAllowed,
+               backendOrder.contains(where: { $0 == .fastvggt || $0 == .vggt }) {
+                let name: String = {
+                    if let override = backendOverride {
+                        return override == .fastvggt ? "FastVGGT" : "VGGT"
+                    }
+                    return "FastVGGT/VGGT"
+                }()
+                emit(.stageLog(
+                    stage: .sfmFeatures,
+                    line: "Auto-tune disabled \(name) on this hardware tier; falling back to COLMAP + GLOMAP.",
+                    isError: true
+                ))
+                backendOrder = [.colmap]
+            }
+
+            let backendName: (SfmBackend) -> String = { backend in
+                switch backend {
+                case .fastvggt:
+                    return "FastVGGT"
+                case .vggt:
+                    return "VGGT"
+                case .colmap:
+                    return "COLMAP + GLOMAP"
+                }
+            }
+
+            for (index, backendPolicy) in backendOrder.enumerated() {
+                do {
+                    if backendPolicy == .fastvggt {
+                        let fm = FileManager.default
+                        let seedZero = paths.colmapSeedModelURL
+                        let sparseZero = paths.colmapSparseURL.appendingPathComponent("0", isDirectory: true)
+                        let fastRequireRefined = fastvggtRequireRefinedModelPreference()
+                        let fastUseBA = fastvggtUseBundleAdjustmentPreference()
+                        let fastCameraType = vggtCameraTypePreference()
+                        let fastSharedCamera = vggtSharedCameraPreference()
+                        let fastBAOptions = ColmapBundleAdjustmentOptions(
+                            maxNumIterations: fastvggtBaMaxIterationsPreference(),
+                            refineFocalLength: fastvggtBaRefineFocalPreference(),
+                            refinePrincipalPoint: fastvggtBaRefinePrincipalPointPreference(),
+                            refineExtraParams: fastvggtBaRefineExtraParamsPreference()
+                        )
+                        let fastRefinementOptions = tuneFastVggtRefinementColmapOptions(
+                            frameCount: selectedFrames.count,
+                            extractOptions: colmapExtractOptions,
+                            matchOptions: colmapMatchOptions
+                        )
+                        let fastColmapExtractOptions = fastRefinementOptions.extract
+                        let fastColmapMatchOptions = fastRefinementOptions.match
+
+                        if try shouldRunStage(.sfmFeatures) {
+                            currentStage = .sfmFeatures
+                            emit(.stageStarted(stage: .sfmFeatures))
+                            writeCheckpoint(
+                                stage: .sfmFeatures,
+                                progress: 0,
+                                message: "FastVGGT seed export started",
+                                details: .sfmFeatures(SfmFeaturesCheckpoint(
+                                    databasePath: paths.colmapDatabaseURL.path,
+                                    imageCount: selectedFrames.count
+                                ))
+                            )
+                            emit(.stageLog(stage: .sfmFeatures, line: "SfM backend: fastvggt-mps.", isError: false))
+
+                            self.removeIfExists(paths.colmapDatabaseURL)
+                            try self.resetDirectory(paths.colmapSeedURL)
+                            try self.resetDirectory(seedZero)
+                            try self.resetDirectory(paths.colmapSparseURL)
+
+                            let fastDevice = vggtDevicePreference()
+                            let fastConfig = FastVggtSfmConfig(
+                                device: fastDevice,
+                                dtype: fastvggtDtypePreference(),
+                                vggtFixedResolution: vggtFixedResolutionValue(autoTune: autoTuneProfile),
+                                confidenceThreshold: fastvggtConfidenceThresholdPreference(),
+                                maxPoints: vggtMaxPointsValue(preset: metadata.preset, autoTune: autoTuneProfile),
+                                merging: fastvggtMergingPreference(),
+                                mergeRatio: fastvggtMergeRatioPreference(),
+                                sharedCamera: fastSharedCamera,
+                                cameraType: fastCameraType
+                            )
+
+                            emit(.stageLog(
+                                stage: .sfmFeatures,
+                                line: "Running FastVGGT on \(fastConfig.device) (vggt=\(fastConfig.vggtFixedResolution)px, maxPoints=\(fastConfig.maxPoints), merging=\(fastConfig.merging), mergeRatio=\(fastConfig.mergeRatio)).",
+                                isError: false
+                            ))
+                            emit(.stageLog(
+                                stage: .sfmFeatures,
+                                line: "FastVGGT output: sharedCamera=\(fastConfig.sharedCamera) cameraType=\(fastConfig.cameraType).",
+                                isError: false
+                            ))
+                            emit(.stageLog(
+                                stage: .sfmFeatures,
+                                line: "FastVGGT refinement policy: external COLMAP (useBA=\(fastUseBA) requireRefined=\(fastRequireRefined) baMaxIters=\(fastBAOptions.maxNumIterations) refineFocal=\(fastBAOptions.refineFocalLength) refinePP=\(fastBAOptions.refinePrincipalPoint) refineExtra=\(fastBAOptions.refineExtraParams)).",
+                                isError: false
+                            ))
+
+                            let fastToolLog = ToolLogWriter(fileURL: paths.fastvggtLogURL, toolName: "fastvggt-mps")
+                            fastToolLog.beginSection(
+                                title: "sfm",
+                                metadata: [
+                                    "device": fastConfig.device,
+                                    "dtype": fastConfig.dtype,
+                                    "images": paths.framesSelectedURL.path,
+                                    "sharedCamera": "\(fastConfig.sharedCamera)",
+                                    "cameraType": fastConfig.cameraType,
+                                    "maxPoints": "\(fastConfig.maxPoints)",
+                                    "merging": "\(fastConfig.merging)",
+                                    "mergeRatio": "\(fastConfig.mergeRatio)",
+                                    "modelsDir": self.config.toolchain.fastvggt.models.path,
+                                    "outSeedSparse": seedZero.path,
+                                    "tool": self.config.toolchain.fastvggt.sfmTool.path,
+                                    "vggtResolution": "\(fastConfig.vggtFixedResolution)"
+                                ]
+                            )
+                            emit(.stageLog(stage: .sfmFeatures, line: "FastVGGT tool log: \(paths.fastvggtLogURL.lastPathComponent)", isError: false))
+                            let fastImagesCount = selectedFrames.count
+                            let fastProgress = FastVggtSfmProgressTracker(totalImages: fastImagesCount)
+                            let onFastLog: @Sendable (String, Bool) -> Void = { line, isErr in
+                                fastToolLog.append(stream: isErr ? "stderr" : "stdout", line: line)
+                                if let update = fastProgress.ingest(line) {
+                                    emit(.stageProgress(stage: .sfmFeatures, fraction: update.fraction, message: update.message))
+                                }
+                                let sanitized = Self.sanitizeToolLogLine(line)
+                                if Self.shouldEmitToolLogLine(sanitized, isError: isErr) {
+                                    emit(.stageLog(stage: .sfmFeatures, line: sanitized, isError: isErr))
+                                }
+                            }
+                            emit(.stageProgress(stage: .sfmFeatures, fraction: 0.0, message: "Starting FastVGGT (\(fastImagesCount) images)…"))
+                            try await self.tooling.fastVggtSfm.run(
+                                toolchain: self.config.toolchain.fastvggt,
+                                images: paths.framesSelectedURL,
+                                outSparse: seedZero,
+                                config: fastConfig,
+                                onLog: onFastLog
+                            )
+
+                            guard sparseModelFilesExist(at: seedZero) else {
+                                throw PipelineError.outputMissing
+                            }
+                            let imagesTxt = seedZero.appendingPathComponent("images.txt")
+                            if try ColmapTextModelNormalizer.normalizeImagesTxtIfNeeded(at: imagesTxt) {
+                                emit(.stageLog(
+                                    stage: .sfmFeatures,
+                                    line: "Normalized FastVGGT seed COLMAP model (added missing POINTS2D lines to images.txt).",
+                                    isError: false
+                                ))
+                            }
+
+                            if !fm.fileExists(atPath: paths.colmapDatabaseURL.path) {
+                                fm.createFile(atPath: paths.colmapDatabaseURL.path, contents: Data())
+                            }
+
+                            writeCheckpoint(
+                                stage: .sfmFeatures,
+                                progress: 1.0,
+                                message: "FastVGGT seed model ready",
+                                details: .sfmFeatures(SfmFeaturesCheckpoint(
+                                    databasePath: paths.colmapDatabaseURL.path,
+                                    imageCount: selectedFrames.count
+                                ))
+                            )
+                            emit(.stageFinished(stage: .sfmFeatures))
+                            markStageComplete(.sfmFeatures)
+                        } else if sparseModelFilesExist(at: seedZero) && !fm.fileExists(atPath: paths.colmapDatabaseURL.path) {
+                            fm.createFile(atPath: paths.colmapDatabaseURL.path, contents: Data())
+                        }
+
+                        if try shouldRunStage(.sfmMatching) {
+                            currentStage = .sfmMatching
+                            emit(.stageStarted(stage: .sfmMatching))
+                            writeCheckpoint(
+                                stage: .sfmMatching,
+                                progress: 0,
+                                message: "FastVGGT refinement matching started",
+                                details: .sfmMatching(SfmMatchingCheckpoint(
+                                    databasePath: paths.colmapDatabaseURL.path,
+                                    expectedPairs: nil,
+                                    processedPairs: 0
+                                ))
+                            )
+
+                            let colmapToolLog = ToolLogWriter(fileURL: paths.colmapLogURL, toolName: "colmap")
+                            colmapToolLog.beginSection(
+                                title: "fastvggt_matching",
+                                metadata: [
+                                    "database": paths.colmapDatabaseURL.path,
+                                    "images": paths.framesSelectedURL.path,
+                                    "tool": self.config.toolchain.colmap.path
+                                ]
+                            )
+                            emit(.stageLog(stage: .sfmMatching, line: "COLMAP tool log: \(paths.colmapLogURL.lastPathComponent)", isError: false))
+                            if !fastRefinementOptions.notes.isEmpty {
+                                for note in fastRefinementOptions.notes {
+                                    emit(.stageLog(stage: .sfmMatching, line: note, isError: false))
+                                }
+                            }
+                            emit(.stageLog(
+                                stage: .sfmMatching,
+                                line: fastColmapExtractOptions.useGPU ? "Using GPU for COLMAP feature extraction." : "Using CPU for COLMAP feature extraction.",
+                                isError: false
+                            ))
+                            emit(.stageLog(
+                                stage: .sfmMatching,
+                                line: "FastVGGT refinement matching options: overlap=\(fastColmapMatchOptions.sequentialOverlap), maxMatches=\(fastColmapMatchOptions.maxNumMatches.map(String.init) ?? "default"), threads=\(fastColmapMatchOptions.matchThreads).",
+                                isError: false
+                            ))
+                            emit(.stageProgress(stage: .sfmMatching, fraction: 0.02, message: "Matching views: extracting local features…"))
+                            let featureProgress = ColmapFeatureProgressTracker()
+                            try await self.tooling.colmap.runFeatureExtractor(
+                                colmapPath: self.config.toolchain.colmap,
+                                database: paths.colmapDatabaseURL,
+                                imagePath: paths.framesSelectedURL,
+                                maxImageSize: colmapMaxImageSize,
+                                cameraModel: fastCameraType,
+                                singleCamera: fastSharedCamera,
+                                options: fastColmapExtractOptions,
+                                onLog: { line, isErr in
+                                    colmapToolLog.append(stream: isErr ? "stderr" : "stdout", line: line)
+                                    let sanitized = Self.sanitizeToolLogLine(line)
+                                    if Self.shouldEmitToolLogLine(sanitized, isError: isErr) {
+                                        emit(.stageLog(stage: .sfmMatching, line: sanitized, isError: isErr))
+                                    }
+                                    if let update = featureProgress.ingest(line) {
+                                        let scaledFraction = min(0.30, update.fraction * 0.30)
+                                        let message = update.message.replacingOccurrences(
+                                            of: "Finding features",
+                                            with: "Matching views: extracting local features"
+                                        )
+                                        emit(.stageProgress(stage: .sfmMatching, fraction: scaledFraction, message: message))
+                                    }
+                                }
+                            )
+                            emit(.stageProgress(stage: .sfmMatching, fraction: 0.30, message: "Matching views: starting pair matching…"))
+
+                            let useSequential = self.shouldUseSequential(
+                                selectedFrames: selectedFrames,
+                                input: metadata.input,
+                                forceExhaustive: forceExhaustiveMatching
+                            )
+                            lastUsedSequentialMatcher = useSequential
+
+                            final class MatchingProgressState: @unchecked Sendable {
+                                private let lock = NSLock()
+                                private var latestBlockMessage: String?
+
+                                func updateBlockMessage(_ message: String) {
+                                    lock.lock()
+                                    latestBlockMessage = message
+                                    lock.unlock()
+                                }
+
+                                func blockMessage() -> String? {
+                                    lock.lock()
+                                    defer { lock.unlock() }
+                                    return latestBlockMessage
+                                }
+                            }
+
+                            func runMatcherWithProgress(
+                                expectedPairs: Int,
+                                run: @escaping (@escaping @Sendable (String, Bool) -> Void) async throws -> Void
+                            ) async throws {
+                                let state = MatchingProgressState()
+                                let blockProgress = ColmapMatchingProgressTracker()
+                                let onLog: @Sendable (String, Bool) -> Void = { line, isErr in
+                                    colmapToolLog.append(stream: isErr ? "stderr" : "stdout", line: line)
+                                    let sanitized = Self.sanitizeToolLogLine(line)
+                                    if Self.shouldEmitToolLogLine(sanitized, isError: isErr) {
+                                        emit(.stageLog(stage: .sfmMatching, line: sanitized, isError: isErr))
+                                    }
+                                    if let update = blockProgress.ingest(line) {
+                                        state.updateBlockMessage(update.message)
+                                    }
+                                }
+
+                                let poller = ColmapDatabaseProgressPoller(databasePath: paths.colmapDatabaseURL)
+                                let pollTask = Task.detached(priority: .utility) { [expectedPairs, poller, state, emit] in
+                                    let denom = max(1, expectedPairs)
+                                    var lastFraction: Double = 0
+                                    var lastProcessed = -1
+                                    var lastEmit = Date.distantPast
+
+                                    while !Task.isCancelled {
+                                        var processed = (try? poller.readProcessedPairCount()) ?? 0
+                                        if lastProcessed >= 0, processed < lastProcessed {
+                                            processed = lastProcessed
+                                        }
+                                        let rawFraction = Double(processed) / Double(denom)
+                                        let clamped = max(0, min(0.99, rawFraction))
+                                        if clamped > lastFraction {
+                                            lastFraction = clamped
+                                        }
+
+                                        let now = Date()
+                                        let shouldEmitZeroHeartbeat = processed == 0 && now.timeIntervalSince(lastEmit) >= 10
+                                        if processed != lastProcessed || shouldEmitZeroHeartbeat {
+                                            lastProcessed = processed
+                                            lastEmit = now
+                                            let base = state.blockMessage()
+                                            let message: String
+                                            if let base {
+                                                message = "\(base), pairs \(processed)/\(denom)"
+                                            } else {
+                                                message = "Matching views (pairs \(processed)/\(denom))"
+                                            }
+                                            let scaledFraction = min(0.99, 0.30 + (lastFraction * 0.69))
+                                            emit(.stageProgress(stage: .sfmMatching, fraction: scaledFraction, message: message))
+                                        }
+
+                                        try? await Task.sleep(for: .seconds(1))
+                                    }
+                                }
+                                defer { pollTask.cancel() }
+
+                                try await run(onLog)
+                            }
+
+                            func runSequentialMatcher() async throws {
+                                let expected = ColmapPairEstimator.expectedSequentialPairs(
+                                    imageCount: selectedFrames.count,
+                                    overlap: fastColmapMatchOptions.sequentialOverlap
+                                )
+                                emit(.stageLog(
+                                    stage: .sfmMatching,
+                                    line: "FastVGGT refinement matching: sequential matcher (target pairs ≈ \(expected)).",
+                                    isError: false
+                                ))
+                                try await runMatcherWithProgress(expectedPairs: expected) { onLog in
+                                    try await self.tooling.colmap.runMatcherSequential(
+                                        colmapPath: self.config.toolchain.colmap,
+                                        database: paths.colmapDatabaseURL,
+                                        options: fastColmapMatchOptions,
+                                        onLog: onLog
+                                    )
+                                }
+                            }
+
+                            func runExhaustiveMatcher() async throws {
+                                let expected = ColmapPairEstimator.expectedExhaustivePairs(imageCount: selectedFrames.count)
+                                emit(.stageLog(
+                                    stage: .sfmMatching,
+                                    line: "FastVGGT refinement matching: exhaustive matcher (target pairs ≈ \(expected)).",
+                                    isError: false
+                                ))
+                                try await runMatcherWithProgress(expectedPairs: expected) { onLog in
+                                    try await self.tooling.colmap.runMatcherExhaustive(
+                                        colmapPath: self.config.toolchain.colmap,
+                                        database: paths.colmapDatabaseURL,
+                                        options: fastColmapMatchOptions,
+                                        onLog: onLog
+                                    )
+                                }
+                            }
+
+                            do {
+                                if useSequential {
+                                    try await runSequentialMatcher()
+                                } else {
+                                    try await runExhaustiveMatcher()
+                                }
+                            } catch {
+                                if useSequential {
+                                    emit(.stageLog(
+                                        stage: .sfmMatching,
+                                        line: "Sequential matcher failed during FastVGGT refinement; retrying with exhaustive matching.",
+                                        isError: true
+                                    ))
+                                    lastUsedSequentialMatcher = false
+                                    try await runExhaustiveMatcher()
+                                } else {
+                                    throw error
+                                }
+                            }
+
+                            let expectedPairs = lastUsedSequentialMatcher
+                                ? ColmapPairEstimator.expectedSequentialPairs(
+                                    imageCount: selectedFrames.count,
+                                    overlap: fastColmapMatchOptions.sequentialOverlap
+                                )
+                                : ColmapPairEstimator.expectedExhaustivePairs(imageCount: selectedFrames.count)
+                            let processedPairs = (try? ColmapDatabaseProgressPoller(databasePath: paths.colmapDatabaseURL).readProcessedPairCount()) ?? 0
+                            writeCheckpoint(
+                                stage: .sfmMatching,
+                                progress: 1.0,
+                                message: "FastVGGT refinement matching completed",
+                                details: .sfmMatching(SfmMatchingCheckpoint(
+                                    databasePath: paths.colmapDatabaseURL.path,
+                                    expectedPairs: expectedPairs,
+                                    processedPairs: processedPairs
+                                ))
+                            )
+                            emit(.stageFinished(stage: .sfmMatching))
+                            markStageComplete(.sfmMatching)
+                        }
+
+                        if try shouldRunStage(.sfmMapping) {
+                            currentStage = .sfmMapping
+                            emit(.stageStarted(stage: .sfmMapping))
+                            writeCheckpoint(
+                                stage: .sfmMapping,
+                                progress: 0,
+                                message: "FastVGGT refinement mapping started",
+                                details: .sfmMapping(SfmMappingCheckpoint(
+                                    mapper: "fastvggt-refinement",
+                                    sparsePath: sparseZero.path,
+                                    registeredImages: nil
+                                ))
+                            )
+
+                            let colmapToolLog = ToolLogWriter(fileURL: paths.colmapLogURL, toolName: "colmap")
+                            colmapToolLog.beginSection(
+                                title: "fastvggt_refinement",
+                                metadata: [
+                                    "database": paths.colmapDatabaseURL.path,
+                                    "images": paths.framesSelectedURL.path,
+                                    "seed": seedZero.path,
+                                    "output": sparseZero.path,
+                                    "tool": self.config.toolchain.colmap.path,
+                                    "useBA": fastUseBA ? "1" : "0",
+                                    "requireRefined": fastRequireRefined ? "1" : "0"
+                                ]
+                            )
+                            let mappingProgress = ColmapMappingProgressTracker(totalImages: selectedFrames.count)
+                            let onMappingLog: @Sendable (String, Bool) -> Void = { line, isErr in
+                                let sanitized = Self.sanitizeToolLogLine(line)
+                                if Self.shouldEmitToolLogLine(sanitized, isError: isErr) {
+                                    emit(.stageLog(stage: .sfmMapping, line: sanitized, isError: isErr))
+                                }
+                                if let update = mappingProgress.ingest(line) {
+                                    emit(.stageProgress(stage: .sfmMapping, fraction: update.fraction, message: update.message))
+                                }
+                            }
+
+                            var acceptedModelURL: URL?
+                            var acceptedMapper = "fastvggt-refinement"
+                            var lastMappingError: Error?
+
+                            do {
+                                guard sparseModelFilesExist(at: seedZero) else {
+                                    throw PipelineError.outputMissing
+                                }
+                                if try ColmapTextModelNormalizer.remapSeedModelIDsToDatabase(
+                                    seedModelURL: seedZero,
+                                    databaseURL: paths.colmapDatabaseURL
+                                ) {
+                                    emit(.stageLog(
+                                        stage: .sfmMapping,
+                                        line: "Aligned FastVGGT seed model IDs with COLMAP database IDs.",
+                                        isError: false
+                                    ))
+                                }
+                                try self.resetDirectory(paths.colmapSparseURL)
+                                try self.resetDirectory(sparseZero)
+                                emit(.stageLog(stage: .sfmMapping, line: "Running refinement: point_triangulator.", isError: false))
+                                try await self.tooling.colmap.runPointTriangulator(
+                                    colmapPath: self.config.toolchain.colmap,
+                                    database: paths.colmapDatabaseURL,
+                                    imagePath: paths.framesSelectedURL,
+                                    inputPath: seedZero,
+                                    outputPath: sparseZero,
+                                    options: fastColmapMatchOptions,
+                                    onLog: { line, isErr in
+                                        colmapToolLog.append(stream: isErr ? "stderr" : "stdout", line: line)
+                                        onMappingLog(line, isErr)
+                                    }
+                                )
+
+                                var refinedModelURL = sparseZero
+                                if fastUseBA {
+                                    let baOutput = paths.colmapSparseURL.appendingPathComponent("0_ba", isDirectory: true)
+                                    self.removeIfExists(baOutput)
+                                    try fm.createDirectory(at: baOutput, withIntermediateDirectories: true)
+                                    emit(.stageLog(stage: .sfmMapping, line: "Running refinement: bundle_adjuster.", isError: false))
+                                    try await self.tooling.colmap.runBundleAdjuster(
+                                        colmapPath: self.config.toolchain.colmap,
+                                        inputPath: sparseZero,
+                                        outputPath: baOutput,
+                                        options: fastColmapMatchOptions,
+                                        bundleOptions: fastBAOptions,
+                                        onLog: { line, isErr in
+                                            colmapToolLog.append(stream: isErr ? "stderr" : "stdout", line: line)
+                                            onMappingLog(line, isErr)
+                                        }
+                                    )
+                                    guard sparseModelFilesExist(at: baOutput) else {
+                                        throw PipelineError.outputMissing
+                                    }
+                                    self.removeIfExists(sparseZero)
+                                    try fm.moveItem(at: baOutput, to: sparseZero)
+                                    refinedModelURL = sparseZero
+                                }
+
+                                let report = try await self.tooling.colmap.runModelAnalyzer(
+                                    colmapPath: self.config.toolchain.colmap,
+                                    modelPath: refinedModelURL,
+                                    options: fastColmapMatchOptions
+                                )
+                                for line in report.split(separator: "\n", omittingEmptySubsequences: false) {
+                                    colmapToolLog.append(stream: "stdout", line: String(line))
+                                }
+                                let score = ReconstructionScorer.parseModelAnalyzerOutput(report)
+                                emit(.stageLog(
+                                    stage: .sfmMapping,
+                                    line: "FastVGGT refinement score: \(ReconstructionScorer.summary(score)).",
+                                    isError: false
+                                ))
+                                if ReconstructionScorer.isAcceptable(score, mode: metadata.preset.mode) {
+                                    acceptedModelURL = refinedModelURL
+                                    acceptedMapper = fastUseBA ? "point_triangulator+bundle_adjuster" : "point_triangulator"
+                                } else {
+                                    lastMappingError = PipelineError.lowQualityReconstruction(score)
+                                }
+                            } catch {
+                                lastMappingError = error
+                            }
+
+                            if acceptedModelURL == nil {
+                                emit(.stageLog(
+                                    stage: .sfmMapping,
+                                    line: "FastVGGT refinement was not usable; trying mapper fallback.",
+                                    isError: true
+                                ))
+
+                                let usesGlomap = mapperPreference == .glomap && !disableGlomapForThisRun
+                                let glomapToolLog: ToolLogWriter? = {
+                                    guard usesGlomap else { return nil }
+                                    let log = ToolLogWriter(fileURL: paths.glomapLogURL, toolName: "glomap")
+                                    log.beginSection(
+                                        title: "mapper_fallback",
+                                        metadata: [
+                                            "database": paths.colmapDatabaseURL.path,
+                                            "images": paths.framesSelectedURL.path,
+                                            "output": paths.colmapSparseURL.path,
+                                            "tool": self.config.toolchain.glomap.path
+                                        ]
+                                    )
+                                    return log
+                                }()
+
+                                let mapperAttempts: [SfmMapperPreference] = {
+                                    switch mapperPreference {
+                                    case .colmap:
+                                        return [.colmap]
+                                    case .glomap:
+                                        if disableGlomapForThisRun {
+                                            return [.colmap]
+                                        }
+                                        return [.glomap, .colmap]
+                                    }
+                                }()
+
+                                for (attemptIndex, mapper) in mapperAttempts.enumerated() {
+                                    do {
+                                        try self.resetDirectory(paths.colmapSparseURL)
+                                        if mapper == .glomap {
+                                            try await self.tooling.glomap.runMapper(
+                                                glomapPath: self.config.toolchain.glomap,
+                                                database: paths.colmapDatabaseURL,
+                                                imagePath: paths.framesSelectedURL,
+                                                outputPath: paths.colmapSparseURL,
+                                                onLog: { line, isErr in
+                                                    glomapToolLog?.append(stream: isErr ? "stderr" : "stdout", line: line)
+                                                    onMappingLog(line, isErr)
+                                                }
+                                            )
+                                        } else {
+                                            try await self.tooling.colmap.runMapper(
+                                                colmapPath: self.config.toolchain.colmap,
+                                                database: paths.colmapDatabaseURL,
+                                                imagePath: paths.framesSelectedURL,
+                                                outputPath: paths.colmapSparseURL,
+                                                options: fastColmapMatchOptions,
+                                                onLog: { line, isErr in
+                                                    colmapToolLog.append(stream: isErr ? "stderr" : "stdout", line: line)
+                                                    onMappingLog(line, isErr)
+                                                }
+                                            )
+                                        }
+
+                                        guard sparseModelFilesExist(at: sparseZero) else {
+                                            throw PipelineError.outputMissing
+                                        }
+                                        let report = try await self.tooling.colmap.runModelAnalyzer(
+                                            colmapPath: self.config.toolchain.colmap,
+                                            modelPath: sparseZero,
+                                            options: fastColmapMatchOptions
+                                        )
+                                        let score = ReconstructionScorer.parseModelAnalyzerOutput(report)
+                                        emit(.stageLog(
+                                            stage: .sfmMapping,
+                                            line: "Mapper fallback score: \(ReconstructionScorer.summary(score)).",
+                                            isError: false
+                                        ))
+                                        if ReconstructionScorer.isAcceptable(score, mode: metadata.preset.mode) {
+                                            acceptedModelURL = sparseZero
+                                            acceptedMapper = mapper == .glomap ? "glomap" : "colmap"
+                                            break
+                                        }
+                                        lastMappingError = PipelineError.lowQualityReconstruction(score)
+                                    } catch {
+                                        if mapper == .glomap,
+                                           !disableGlomapForThisRun,
+                                           glomapErrorIndicatesMissingOpenSSL(error) {
+                                            disableGlomapForThisRun = true
+                                            emit(.stageLog(
+                                                stage: .sfmMapping,
+                                                line: "GLOMAP failed to launch (missing OpenSSL dylibs / rpath). Falling back to COLMAP mapper.",
+                                                isError: true
+                                            ))
+                                        }
+                                        lastMappingError = error
+                                    }
+
+                                    if attemptIndex == 0, mapper == .glomap {
+                                        emit(.stageLog(stage: .sfmMapping, line: "GLOMAP mapping failed; trying COLMAP mapper.", isError: true))
+                                    }
+                                }
+                            }
+
+                            if acceptedModelURL == nil, !fastRequireRefined, sparseModelFilesExist(at: seedZero) {
+                                emit(.stageLog(
+                                    stage: .sfmMapping,
+                                    line: "Refinement unavailable; accepting FastVGGT seed model because EASYSPLAT_FASTVGGT_REQUIRE_REFINED_MODEL=0.",
+                                    isError: true
+                                ))
+                                try self.resetDirectory(paths.colmapSparseURL)
+                                try self.resetDirectory(sparseZero)
+                                let seedFiles = try fm.contentsOfDirectory(at: seedZero, includingPropertiesForKeys: nil, options: [.skipsHiddenFiles])
+                                for file in seedFiles {
+                                    try fm.copyItem(at: file, to: sparseZero.appendingPathComponent(file.lastPathComponent))
+                                }
+                                acceptedModelURL = sparseZero
+                                acceptedMapper = "fastvggt-seed"
+                            }
+
+                            guard let finalSparseModel = acceptedModelURL else {
+                                throw lastMappingError ?? PipelineError.outputMissing
+                            }
+                            writeCheckpoint(
+                                stage: .sfmMapping,
+                                progress: 1.0,
+                                message: "FastVGGT refinement completed",
+                                details: .sfmMapping(SfmMappingCheckpoint(
+                                    mapper: acceptedMapper,
+                                    sparsePath: finalSparseModel.path,
+                                    registeredImages: nil
+                                ))
+                            )
+                            emit(.stageFinished(stage: .sfmMapping))
+                            markStageComplete(.sfmMapping)
+                        }
+                    } else if backendPolicy == .vggt {
                 let fm = FileManager.default
                 let sparseZero = paths.colmapSparseURL.appendingPathComponent("0", isDirectory: true)
 
                 // VGGT produces a COLMAP-format sparse model directly (no database/matching/mapping).
-                if shouldRunStage(.sfmFeatures) {
+                if try shouldRunStage(.sfmFeatures) {
                     currentStage = .sfmFeatures
                     emit(.stageStarted(stage: .sfmFeatures))
+                    writeCheckpoint(
+                        stage: .sfmFeatures,
+                        progress: 0,
+                        message: "VGGT SfM started",
+                        details: .sfmFeatures(SfmFeaturesCheckpoint(
+                            databasePath: paths.colmapDatabaseURL.path,
+                            imageCount: selectedFrames.count
+                        ))
+                    )
                     emit(.stageLog(stage: .sfmFeatures, line: "SfM backend: vggt-mps.", isError: false))
 
                     self.removeIfExists(paths.colmapDatabaseURL)
@@ -442,35 +1206,73 @@ public final class PipelineRunner: @unchecked Sendable {
                         fm.createFile(atPath: paths.colmapDatabaseURL.path, contents: Data())
                     }
 
+                    writeCheckpoint(
+                        stage: .sfmFeatures,
+                        progress: 1.0,
+                        message: "VGGT sparse model ready",
+                        details: .sfmFeatures(SfmFeaturesCheckpoint(
+                            databasePath: paths.colmapDatabaseURL.path,
+                            imageCount: selectedFrames.count
+                        ))
+                    )
                     emit(.stageFinished(stage: .sfmFeatures))
                     markStageComplete(.sfmFeatures)
                 } else if sparseModelFilesExist(at: sparseZero) && !fm.fileExists(atPath: paths.colmapDatabaseURL.path) {
                     fm.createFile(atPath: paths.colmapDatabaseURL.path, contents: Data())
                 }
 
-                if shouldRunStage(.sfmMatching) {
+                if try shouldRunStage(.sfmMatching) {
                     currentStage = .sfmMatching
                     emit(.stageStarted(stage: .sfmMatching))
+                    writeCheckpoint(
+                        stage: .sfmMatching,
+                        progress: 1.0,
+                        message: "VGGT path skips matching",
+                        details: .sfmMatching(SfmMatchingCheckpoint(
+                            databasePath: paths.colmapDatabaseURL.path,
+                            expectedPairs: nil,
+                            processedPairs: nil
+                        ))
+                    )
                     emit(.stageLog(stage: .sfmMatching, line: "VGGT produces a sparse model directly; skipping matching.", isError: false))
                     emit(.stageFinished(stage: .sfmMatching))
                     markStageComplete(.sfmMatching)
                 }
 
-                if shouldRunStage(.sfmMapping) {
+                if try shouldRunStage(.sfmMapping) {
                     currentStage = .sfmMapping
                     emit(.stageStarted(stage: .sfmMapping))
                     guard sparseModelFilesExist(at: sparseZero) else {
                         throw PipelineError.outputMissing
                     }
+                    writeCheckpoint(
+                        stage: .sfmMapping,
+                        progress: 1.0,
+                        message: "VGGT sparse model accepted",
+                        details: .sfmMapping(SfmMappingCheckpoint(
+                            mapper: "vggt",
+                            sparsePath: sparseZero.path,
+                            registeredImages: nil
+                        ))
+                    )
                     emit(.stageLog(stage: .sfmMapping, line: "VGGT produced sparse model; skipping mapping.", isError: false))
                     emit(.stageFinished(stage: .sfmMapping))
                     markStageComplete(.sfmMapping)
                 }
             } else {
             let runFeatures: (Bool) async throws -> Void = { force in
-                guard force || shouldRunStage(.sfmFeatures) else { return }
+                guard try (force || shouldRunStage(.sfmFeatures)) else { return }
                 currentStage = .sfmFeatures
                 emit(.stageStarted(stage: .sfmFeatures))
+                writeCheckpoint(
+                    stage: .sfmFeatures,
+                    progress: 0,
+                    message: "COLMAP feature extraction started",
+                    details: .sfmFeatures(SfmFeaturesCheckpoint(
+                        databasePath: paths.colmapDatabaseURL.path,
+                        imageCount: selectedFrames.count
+                    ))
+                )
                 let colmapToolLog = ToolLogWriter(fileURL: paths.colmapLogURL, toolName: "colmap")
                 colmapToolLog.beginSection(
                     title: "feature_extractor",
@@ -510,14 +1312,33 @@ public final class PipelineRunner: @unchecked Sendable {
                     options: colmapExtractOptions,
                     onLog: onFeaturesLog
                 )
+                writeCheckpoint(
+                    stage: .sfmFeatures,
+                    progress: 1.0,
+                    message: "COLMAP feature extraction completed",
+                    details: .sfmFeatures(SfmFeaturesCheckpoint(
+                        databasePath: paths.colmapDatabaseURL.path,
+                        imageCount: selectedFrames.count
+                    ))
+                )
                 emit(.stageFinished(stage: .sfmFeatures))
                 markStageComplete(.sfmFeatures)
             }
 
             let runMatching: (Bool) async throws -> Void = { force in
-                guard force || shouldRunStage(.sfmMatching) else { return }
+                guard try (force || shouldRunStage(.sfmMatching)) else { return }
                 currentStage = .sfmMatching
                 emit(.stageStarted(stage: .sfmMatching))
+                writeCheckpoint(
+                    stage: .sfmMatching,
+                    progress: 0,
+                    message: "COLMAP matching started",
+                    details: .sfmMatching(SfmMatchingCheckpoint(
+                        databasePath: paths.colmapDatabaseURL.path,
+                        expectedPairs: nil,
+                        processedPairs: 0
+                    ))
+                )
                 emit(.stageLog(
                     stage: .sfmMatching,
                     line: colmapMatchOptions.useGPU ? "Using GPU for COLMAP matching." : "Using CPU for COLMAP matching.",
@@ -710,6 +1531,23 @@ public final class PipelineRunner: @unchecked Sendable {
                     lastUsedSequentialMatcher = false
                     try await runExhaustive()
                 }
+                let expectedPairs = lastUsedSequentialMatcher
+                    ? ColmapPairEstimator.expectedSequentialPairs(
+                        imageCount: selectedFrames.count,
+                        overlap: colmapMatchOptions.sequentialOverlap
+                    )
+                    : ColmapPairEstimator.expectedExhaustivePairs(imageCount: selectedFrames.count)
+                let processedPairs = (try? ColmapDatabaseProgressPoller(databasePath: paths.colmapDatabaseURL).readProcessedPairCount()) ?? 0
+                writeCheckpoint(
+                    stage: .sfmMatching,
+                    progress: 1.0,
+                    message: "COLMAP matching completed",
+                    details: .sfmMatching(SfmMatchingCheckpoint(
+                        databasePath: paths.colmapDatabaseURL.path,
+                        expectedPairs: expectedPairs,
+                        processedPairs: processedPairs
+                    ))
+                )
                 emit(.stageFinished(stage: .sfmMatching))
                 markStageComplete(.sfmMatching)
             }
@@ -798,9 +1636,19 @@ public final class PipelineRunner: @unchecked Sendable {
                 }
 
                 try Task.checkCancellation()
-                if shouldRunStage(.sfmMapping) {
+                if try shouldRunStage(.sfmMapping) {
                     currentStage = .sfmMapping
                     emit(.stageStarted(stage: .sfmMapping))
+                    writeCheckpoint(
+                        stage: .sfmMapping,
+                        progress: 0,
+                        message: "Camera mapping started",
+                        details: .sfmMapping(SfmMappingCheckpoint(
+                            mapper: mapperPreference.rawValue,
+                            sparsePath: paths.colmapSparseURL.appendingPathComponent("0", isDirectory: true).path,
+                            registeredImages: nil
+                        ))
+                    )
                     let colmapToolLog = ToolLogWriter(fileURL: paths.colmapLogURL, toolName: "colmap")
                     colmapToolLog.beginSection(
                         title: "mapper",
@@ -910,6 +1758,16 @@ public final class PipelineRunner: @unchecked Sendable {
                                     colmapToolLog.append(stream: "stdout", line: String(line))
                                 }
                                 let score = ReconstructionScorer.parseModelAnalyzerOutput(report)
+                                writeCheckpoint(
+                                    stage: .sfmMapping,
+                                    progress: 0.95,
+                                    message: "Mapping score: \(ReconstructionScorer.summary(score))",
+                                    details: .sfmMapping(SfmMappingCheckpoint(
+                                        mapper: mapper == .glomap ? "glomap" : "colmap",
+                                        sparsePath: modelURL.path,
+                                        registeredImages: score.registeredImages
+                                    ))
+                                )
                                 emit(.stageLog(
                                     stage: .sfmMapping,
                                     line: "Reconstruction score: \(ReconstructionScorer.summary(score)).",
@@ -987,6 +1845,17 @@ public final class PipelineRunner: @unchecked Sendable {
                             )
                             throw lastMappingError ?? PipelineError.lowQualityReconstruction(.init(registeredImages: 0, totalImages: 0, meanReprojectionError: nil))
                         }
+                        let finalSparseModel = paths.colmapSparseURL.appendingPathComponent("0", isDirectory: true)
+                        writeCheckpoint(
+                            stage: .sfmMapping,
+                            progress: 1.0,
+                            message: "Camera mapping completed",
+                            details: .sfmMapping(SfmMappingCheckpoint(
+                                mapper: mapperPreference.rawValue,
+                                sparsePath: finalSparseModel.path,
+                                registeredImages: nil
+                            ))
+                        )
                         emit(.stageFinished(stage: .sfmMapping))
                         markStageComplete(.sfmMapping)
                 }
@@ -994,14 +1863,62 @@ public final class PipelineRunner: @unchecked Sendable {
                 break
             }
             }
+            } catch {
+                if error is CancellationError {
+                    throw error
+                }
+                if Task.isCancelled {
+                    throw CancellationError()
+                }
+                let isLast = index == backendOrder.count - 1
+                if isLast {
+                    throw error
+                }
+                let nextBackend = backendOrder[index + 1]
+                let debug = failureMessages(for: error, stage: .sfmFeatures).debugMessage
+                let prefix = backendPolicy == .fastvggt ? "FastVGGT quality fallback" : "\(backendName(backendPolicy)) failed"
+                emit(.stageLog(
+                    stage: .sfmFeatures,
+                    line: "\(prefix) (\(debug)). Falling back to \(backendName(nextBackend)).",
+                    isError: true
+                ))
+                try? cleanForRetry(failedStage: .sfmFeatures, paths: paths)
+                continue
+            }
+            break
+        }
 
             try Task.checkCancellation()
-            if shouldRunStage(.trainBrush) {
+            if skipTraining {
+                emit(.stageLog(
+                    stage: .sfmMapping,
+                    line: "Stopping early after SfM (EASYSPLAT_SKIP_TRAINING=1).",
+                    isError: false
+                ))
+                metadata.lastRunStartedAt = nil
+                try? ProjectMetadataStore.save(metadata, to: paths.metadataURL)
+                return
+            }
+            if try shouldRunStage(.trainBrush) {
                 currentStage = .trainBrush
                 emit(.stageStarted(stage: .trainBrush))
+                writeCheckpoint(
+                    stage: .trainBrush,
+                    progress: 0,
+                    message: "Brush training started",
+                    details: .trainBrush(TrainBrushCheckpoint(
+                        latestExportStep: nil,
+                        latestExportPath: nil,
+                        progressStep: nil,
+                        progressTotal: brushTrainingPlan(for: metadata.preset).totalSteps,
+                        stepsPerSecond: nil,
+                        resumeSnapshotPath: paths.trainingURL.appendingPathComponent("latest_snapshot.ply").path
+                    ))
+                )
                 if let trainingGate = config.trainingGate {
                     try await trainingGate()
                 }
+                clearBrushResumeSnapshot(in: paths.trainingURL)
                 let brushPlan = brushTrainingPlan(for: metadata.preset)
                 let overrideExportEvery = brushExportEveryOverride()
                 let adaptiveExportEvery = overrideExportEvery ?? brushAdaptiveExportEvery(
@@ -1057,12 +1974,28 @@ public final class PipelineRunner: @unchecked Sendable {
                     }
                 }
 
+                final class CheckpointPulseGate: @unchecked Sendable {
+                    private let lock = NSLock()
+                    private var lastWriteAt: Date = .distantPast
+
+                    func shouldWrite(now: Date, minInterval: TimeInterval) -> Bool {
+                        lock.lock()
+                        defer { lock.unlock() }
+                        if now.timeIntervalSince(lastWriteAt) < minInterval {
+                            return false
+                        }
+                        lastWriteAt = now
+                        return true
+                    }
+                }
+
                 let brushProgress = BrushProgressBox()
                 let statusGate = TrainingStatusGate()
                 let exportStepBox = BrushExportStepBox()
                 let rateBox = BrushTrainingRateBox()
                 let etaEstimator = BrushTrainingEtaEstimator()
-                let stepLogGate = BrushTrainingStepLogGate(stepInterval: 1_000)
+                let stepLogGate = BrushTrainingStepLogGate(stepInterval: 1_500)
+                let checkpointGate = CheckpointPulseGate()
                 let snapshotManager = BrushSnapshotManager(
                     defaultExportEvery: effectiveExportEvery,
                     minSteps: Self.brushSnapshotMinSteps(),
@@ -1094,7 +2027,15 @@ public final class PipelineRunner: @unchecked Sendable {
                     emit(.stageProgress(stage: .trainBrush, fraction: fraction, message: status))
                 }
 
-                let monitorTask = Task { [trainingURL = paths.trainingURL, emitTrainingStatus, exportStepBox, snapshotManager, rateBox, self] in
+                let monitorTask = Task { [
+                    trainingURL = paths.trainingURL,
+                    trainingStartedAt,
+                    emitTrainingStatus,
+                    exportStepBox,
+                    snapshotManager,
+                    rateBox,
+                    self
+                ] in
                     var lastSeen: String? = nil
                     var lastExportCheckAt = Date.distantPast
                     let exportCheckInterval: TimeInterval = 5.0
@@ -1102,7 +2043,7 @@ public final class PipelineRunner: @unchecked Sendable {
                         let now = Date()
                         if now.timeIntervalSince(lastExportCheckAt) >= exportCheckInterval {
                             lastExportCheckAt = now
-                            if let export = latestBrushExport(in: trainingURL) {
+                            if let export = latestBrushExport(in: trainingURL, minModificationDate: trainingStartedAt) {
                                 let name = export.file.lastPathComponent
                                 if name != lastSeen {
                                     lastSeen = name
@@ -1120,11 +2061,49 @@ public final class PipelineRunner: @unchecked Sendable {
                                         if decision.keep {
                                             // Keep snapshots silently; training logs must be step-gated.
                                         }
+                                        self.persistCheckpoint(
+                                            paths: paths,
+                                            stage: .trainBrush,
+                                            progress: nil,
+                                            message: "Saved training snapshot at step \(step)",
+                                            details: .trainBrush(TrainBrushCheckpoint(
+                                                latestExportStep: step,
+                                                latestExportPath: export.file.path,
+                                                progressStep: brushProgress.latestProgress()?.step,
+                                                progressTotal: brushProgress.latestProgress()?.total ?? brushPlan.totalSteps,
+                                                stepsPerSecond: rateBox.latestRate(),
+                                                resumeSnapshotPath: trainingURL.appendingPathComponent("latest_snapshot.ply").path
+                                            ))
+                                        )
                                     } else {
                                         // Keep snapshots silently; training logs must be step-gated.
                                     }
                                 }
                             }
+                        }
+                        if checkpointGate.shouldWrite(now: now, minInterval: 15.0) {
+                            let progress = brushProgress.latestProgress()
+                            let fraction: Double? = {
+                                guard let progress, progress.total > 0 else { return nil }
+                                return min(0.99, max(0.0, Double(progress.step) / Double(progress.total)))
+                            }()
+                            self.persistCheckpoint(
+                                paths: paths,
+                                stage: .trainBrush,
+                                progress: fraction,
+                                message: "Training heartbeat",
+                                details: .trainBrush(TrainBrushCheckpoint(
+                                    latestExportStep: exportStepBox.latestStep(),
+                                    latestExportPath: self.latestBrushExport(
+                                        in: trainingURL,
+                                        minModificationDate: trainingStartedAt
+                                    )?.file.path,
+                                    progressStep: progress?.step,
+                                    progressTotal: progress?.total ?? brushPlan.totalSteps,
+                                    stepsPerSecond: rateBox.latestRate(),
+                                    resumeSnapshotPath: trainingURL.appendingPathComponent("latest_snapshot.ply").path
+                                ))
+                            )
                         }
                         emitTrainingStatus(now)
                         try? await Task.sleep(nanoseconds: 250_000_000)
@@ -1133,7 +2112,10 @@ public final class PipelineRunner: @unchecked Sendable {
                 defer { monitorTask.cancel() }
 
                 defer {
-                    updateResumeSnapshotFromLatestExport(trainingURL: paths.trainingURL)
+                    updateResumeSnapshotFromLatestExport(
+                        trainingURL: paths.trainingURL,
+                        minModificationDate: trainingStartedAt
+                    )
                 }
 
                 try await self.tooling.brush.runTrain(
@@ -1151,6 +2133,25 @@ public final class PipelineRunner: @unchecked Sendable {
                            progress.step <= progress.total {
                             brushProgress.update(step: progress.step, total: progress.total)
                             emitTrainingStatus(Date())
+                            if checkpointGate.shouldWrite(now: Date(), minInterval: 15.0) {
+                                self.persistCheckpoint(
+                                    paths: paths,
+                                    stage: .trainBrush,
+                                    progress: min(0.99, max(0.0, Double(progress.step) / Double(progress.total))),
+                                    message: "Training step \(progress.step)/\(progress.total)",
+                                    details: .trainBrush(TrainBrushCheckpoint(
+                                        latestExportStep: exportStepBox.latestStep(),
+                                        latestExportPath: self.latestBrushExport(
+                                            in: paths.trainingURL,
+                                            minModificationDate: trainingStartedAt
+                                        )?.file.path,
+                                        progressStep: progress.step,
+                                        progressTotal: progress.total,
+                                        stepsPerSecond: rateBox.latestRate(),
+                                        resumeSnapshotPath: paths.trainingURL.appendingPathComponent("latest_snapshot.ply").path
+                                    ))
+                                )
+                            }
                             if stepLogGate.shouldEmit(step: progress.step) {
                                 let now = Date()
                                 let etaSeconds = etaEstimator.estimateRemainingSeconds(
@@ -1192,26 +2193,55 @@ public final class PipelineRunner: @unchecked Sendable {
                         }
                     }
                 )
+                writeCheckpoint(
+                    stage: .trainBrush,
+                    progress: 1.0,
+                    message: "Brush training completed",
+                    details: .trainBrush(TrainBrushCheckpoint(
+                        latestExportStep: exportStepBox.latestStep(),
+                        latestExportPath: latestBrushExport(
+                            in: paths.trainingURL,
+                            minModificationDate: trainingStartedAt
+                        )?.file.path,
+                        progressStep: brushPlan.totalSteps,
+                        progressTotal: brushPlan.totalSteps,
+                        stepsPerSecond: rateBox.latestRate(),
+                        resumeSnapshotPath: paths.trainingURL.appendingPathComponent("latest_snapshot.ply").path
+                    ))
+                )
                 emit(.stageFinished(stage: .trainBrush))
                 markStageComplete(.trainBrush)
             }
 
             try Task.checkCancellation()
-            if shouldRunStage(.exportSplat) {
+            if try shouldRunStage(.exportSplat) {
                 currentStage = .exportSplat
                 emit(.stageStarted(stage: .exportSplat))
+                writeCheckpoint(stage: .exportSplat, progress: 0, message: "Export started")
                 guard let ply = self.tooling.brush.findLatestPly(in: paths.trainingURL) else {
                     throw PipelineError.outputMissing
                 }
                 try FileManager.default.createDirectory(at: paths.outputURL, withIntermediateDirectories: true)
                 let outputPly = paths.outputURL.appendingPathComponent("splat.ply")
                 try SplatExport.copyIfExists(from: ply, to: outputPly)
+                let sizeBytes = (try? FileManager.default.attributesOfItem(atPath: outputPly.path)[.size] as? NSNumber)?.int64Value ?? 0
+                writeCheckpoint(
+                    stage: .exportSplat,
+                    progress: 1.0,
+                    message: "Exported splat.ply",
+                    details: .exportSplat(ExportSplatCheckpoint(
+                        outputPath: outputPly.path,
+                        sourcePath: ply.path,
+                        sizeBytes: sizeBytes
+                    ))
+                )
                 emit(.stageFinished(stage: .exportSplat))
                 markStageComplete(.exportSplat)
             }
 
             metadata.outputs = OutputSpec(splatPlyPath: "Output/splat.ply", colmapModelPath: "SfM/colmap/sparse/0")
             metadata.state = PipelineState(stage: .done, attempt: metadata.state.attempt, lastError: nil, resumeToken: nil)
+            metadata.lastRunStartedAt = nil
             try ProjectMetadataStore.save(metadata, to: paths.metadataURL)
 
             emit(.stageFinished(stage: .done))
@@ -1493,6 +2523,58 @@ private extension PipelineRunner {
         )
     }
 
+    func tuneFastVggtRefinementColmapOptions(
+        frameCount: Int,
+        extractOptions: ColmapOptions,
+        matchOptions: ColmapOptions
+    ) -> (extract: ColmapOptions, match: ColmapOptions, notes: [String]) {
+        var tunedExtract = extractOptions
+        var tunedMatch = matchOptions
+        var notes: [String] = []
+
+        guard frameCount >= 200 else {
+            return (extract: tunedExtract, match: tunedMatch, notes: notes)
+        }
+
+        let overlapCap = frameCount >= 450 ? 6 : 8
+        if tunedMatch.sequentialOverlap > overlapCap {
+            notes.append("FastVGGT refinement speed profile: reduced sequential overlap \(tunedMatch.sequentialOverlap) -> \(overlapCap) for \(frameCount) frames.")
+            tunedMatch.sequentialOverlap = overlapCap
+        }
+
+        let matchCap = frameCount >= 450 ? 7_000 : 8_000
+        if let currentMatches = tunedMatch.maxNumMatches {
+            if currentMatches > matchCap {
+                notes.append("FastVGGT refinement speed profile: capped max matches \(currentMatches) -> \(matchCap).")
+                tunedMatch.maxNumMatches = matchCap
+            }
+        } else {
+            notes.append("FastVGGT refinement speed profile: set max matches to \(matchCap).")
+            tunedMatch.maxNumMatches = matchCap
+        }
+
+        let featureCap = frameCount >= 450 ? 8_192 : 9_000
+        if let currentFeatures = tunedExtract.maxNumFeatures, currentFeatures > featureCap {
+            notes.append("FastVGGT refinement speed profile: capped max features \(currentFeatures) -> \(featureCap).")
+            tunedExtract.maxNumFeatures = featureCap
+        }
+
+        if frameCount >= 450 {
+            let blockCap = 30
+            if let currentBlock = tunedMatch.exhaustiveBlockSize {
+                if currentBlock < blockCap {
+                    notes.append("FastVGGT refinement speed profile: raised exhaustive block size \(currentBlock) -> \(blockCap).")
+                    tunedMatch.exhaustiveBlockSize = blockCap
+                }
+            } else {
+                notes.append("FastVGGT refinement speed profile: set exhaustive block size to \(blockCap).")
+                tunedMatch.exhaustiveBlockSize = blockCap
+            }
+        }
+
+        return (extract: tunedExtract, match: tunedMatch, notes: notes)
+    }
+
     private func sfmMapperPreference() -> SfmMapperPreference {
         let env = ProcessInfo.processInfo.environment
         if let value = env["EASYSPLAT_SFM_MAPPER"]?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() {
@@ -1502,13 +2584,25 @@ private extension PipelineRunner {
         return .glomap
     }
 
-    func sfmBackendPolicy() -> SfmBackend {
+    func sfmBackendOverride() -> SfmBackend? {
         let env = ProcessInfo.processInfo.environment
         if let value = env["EASYSPLAT_SFM_BACKEND"]?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() {
             if value == "colmap" { return .colmap }
+            if value == "fastvggt" { return .fastvggt }
             if value == "vggt" || value == "vggt-mps" { return .vggt }
         }
-        return .vggt
+        return nil
+    }
+
+    func sfmBackendPolicy() -> SfmBackend {
+        sfmBackendOverride() ?? .fastvggt
+    }
+
+    func sfmBackendFallbackOrder(override: SfmBackend?) -> [SfmBackend] {
+        if let override {
+            return [override]
+        }
+        return [.fastvggt, .colmap]
     }
 
     func vggtDevicePreference() -> String {
@@ -1671,6 +2765,73 @@ private extension PipelineRunner {
         }
     }
 
+    func fastvggtDtypePreference() -> String {
+        let env = ProcessInfo.processInfo.environment
+        if let value = env["EASYSPLAT_FASTVGGT_DTYPE"]?.trimmingCharacters(in: .whitespacesAndNewlines),
+           !value.isEmpty {
+            return value
+        }
+        return "auto"
+    }
+
+    func fastvggtMergingPreference() -> Int {
+        let env = ProcessInfo.processInfo.environment
+        if let raw = env["EASYSPLAT_FASTVGGT_MERGING"]?.trimmingCharacters(in: .whitespacesAndNewlines),
+           let override = Int(raw) {
+            return override
+        }
+        return 0
+    }
+
+    func fastvggtMergeRatioPreference() -> Double {
+        let env = ProcessInfo.processInfo.environment
+        if let raw = env["EASYSPLAT_FASTVGGT_MERGE_RATIO"]?.trimmingCharacters(in: .whitespacesAndNewlines),
+           let override = Double(raw) {
+            return override
+        }
+        return 0.9
+    }
+
+    func fastvggtConfidenceThresholdPreference() -> Double {
+        let env = ProcessInfo.processInfo.environment
+        if let raw = env["EASYSPLAT_FASTVGGT_DEPTH_CONF_THRES"]?.trimmingCharacters(in: .whitespacesAndNewlines),
+           let override = Double(raw),
+           override > 0 {
+            return override
+        }
+        return 3.0
+    }
+
+    func fastvggtUseBundleAdjustmentPreference() -> Bool {
+        boolEnvValue("EASYSPLAT_FASTVGGT_USE_BA", default: true)
+    }
+
+    func fastvggtRequireRefinedModelPreference() -> Bool {
+        boolEnvValue("EASYSPLAT_FASTVGGT_REQUIRE_REFINED_MODEL", default: true)
+    }
+
+    func fastvggtBaMaxIterationsPreference() -> Int {
+        let env = ProcessInfo.processInfo.environment
+        if let raw = env["EASYSPLAT_FASTVGGT_BA_MAX_ITERS"]?.trimmingCharacters(in: .whitespacesAndNewlines),
+           let override = Int(raw),
+           override > 0 {
+            return override
+        }
+        return 50
+    }
+
+    func fastvggtBaRefineFocalPreference() -> Bool {
+        boolEnvValue("EASYSPLAT_FASTVGGT_BA_REFINE_FOCAL", default: true)
+    }
+
+    func fastvggtBaRefinePrincipalPointPreference() -> Bool {
+        boolEnvValue("EASYSPLAT_FASTVGGT_BA_REFINE_PP", default: false)
+    }
+
+    func fastvggtBaRefineExtraParamsPreference() -> Bool {
+        boolEnvValue("EASYSPLAT_FASTVGGT_BA_REFINE_EXTRA", default: false)
+    }
+
     func vggtImageLoadResolutionValue(preset: PresetSpec, autoTune: AutoTuneProfile?) -> Int {
         if !hasEnvValue("EASYSPLAT_VGGT_IMG_LOAD_RESOLUTION"), let autoTune {
             return autoTune.vggtImageLoadResolution
@@ -1820,6 +2981,7 @@ private extension PipelineRunner {
             self.removeIfExists(paths.framesSelectedURL)
             self.removeIfExists(paths.framesSelectedManifestURL)
             self.removeIfExists(paths.colmapDatabaseURL)
+            self.removeIfExists(paths.colmapSeedURL)
             self.removeIfExists(paths.colmapSparseURL)
             self.removeIfExists(paths.trainingURL)
             self.removeIfExists(paths.outputURL)
@@ -1827,11 +2989,13 @@ private extension PipelineRunner {
             self.removeIfExists(paths.framesSelectedURL)
             self.removeIfExists(paths.framesSelectedManifestURL)
             self.removeIfExists(paths.colmapDatabaseURL)
+            self.removeIfExists(paths.colmapSeedURL)
             self.removeIfExists(paths.colmapSparseURL)
             self.removeIfExists(paths.trainingURL)
             self.removeIfExists(paths.outputURL)
         case .sfmFeatures, .sfmMatching:
             self.removeIfExists(paths.colmapDatabaseURL)
+            self.removeIfExists(paths.colmapSeedURL)
             self.removeIfExists(paths.colmapSparseURL)
             self.removeIfExists(paths.trainingURL)
             self.removeIfExists(paths.outputURL)
@@ -2052,49 +3216,238 @@ private extension PipelineRunner {
         return base + (index < remainder ? 1 : 0)
     }
 
-    func isStageComplete(_ stage: PipelineStage, paths: ProjectPaths, metadata: ProjectMetadata) -> Bool {
+    enum StageOutputStatus: Equatable, Sendable {
+        case valid
+        case missing
+        case corrupt(reason: String)
+    }
+
+    func persistCheckpoint(
+        paths: ProjectPaths,
+        stage: PipelineStage,
+        progress: Double? = nil,
+        message: String? = nil,
+        details: PipelineCheckpointDetails? = nil
+    ) {
+        guard var metadata = try? ProjectMetadataStore.load(from: paths.metadataURL) else { return }
+        metadata.checkpoint = PipelineCheckpoint(
+            stage: stage,
+            updatedAt: Date(),
+            progressFraction: progress,
+            message: message,
+            details: details
+        )
+        try? ProjectMetadataStore.save(metadata, to: paths.metadataURL)
+    }
+
+    func validateStageOutput(_ stage: PipelineStage, paths: ProjectPaths, metadata: ProjectMetadata) throws -> StageOutputStatus {
         let fm = FileManager.default
         switch stage {
         case .importInput:
-            var ok = true
+            if metadata.input.videoFiles.isEmpty && metadata.input.photosFolder == nil {
+                return .missing
+            }
             for file in metadata.input.videoFiles {
                 let name = URL(fileURLWithPath: file).lastPathComponent
                 let dest = paths.originalsURL.appendingPathComponent(name)
-                if !fm.fileExists(atPath: dest.path) { ok = false }
+                guard fm.fileExists(atPath: dest.path) else { return .missing }
+                let size = (try? fm.attributesOfItem(atPath: dest.path)[.size] as? NSNumber)?.int64Value ?? 0
+                if size <= 0 {
+                    return .corrupt(reason: "input file \(name) has zero size")
+                }
             }
             if let photosFolder = metadata.input.photosFolder {
                 let name = URL(fileURLWithPath: photosFolder).lastPathComponent
-                let dest = paths.originalsURL.appendingPathComponent(name)
-                if !fm.fileExists(atPath: dest.path) { ok = false }
+                let dest = paths.originalsURL.appendingPathComponent(name, isDirectory: true)
+                guard fm.fileExists(atPath: dest.path) else { return .missing }
+                let photos = try loadPhotos(in: dest)
+                if photos.isEmpty {
+                    return .corrupt(reason: "photos folder \(name) is empty")
+                }
             }
-            return ok && (!metadata.input.videoFiles.isEmpty || metadata.input.photosFolder != nil)
+            return .valid
         case .extractFrames:
-            guard metadata.input.hasVideos else { return true }
+            guard metadata.input.hasVideos else { return .valid }
             for index in metadata.input.videoFiles.indices {
-                let profile = frameExtractionProfile(for: metadata.preset.quality)
-                let perVideoTarget = targetCountForVideo(index: index, total: metadata.input.videoFiles.count, targetCount: profile.targetCount)
-                if perVideoTarget == 0 { continue }
                 let rawDir = rawFramesDirectory(index: index, paths: paths)
-                if !fm.fileExists(atPath: rawDir.path) { return false }
+                guard fm.fileExists(atPath: rawDir.path) else { return .missing }
+                let frames = try loadImages(in: rawDir)
+                if frames.isEmpty {
+                    return .corrupt(reason: "raw frame folder \(rawDir.lastPathComponent) is empty")
+                }
+                // Extraction can legitimately produce far fewer frames than the target
+                // for short clips, low-motion video, or strict quality filtering.
+                // Treat low counts as valid as long as we have at least one usable frame.
+                let readableCount = frames.reduce(into: 0) { partial, frameURL in
+                    let size = (try? fm.attributesOfItem(atPath: frameURL.path)[.size] as? NSNumber)?.int64Value ?? 0
+                    if size > 0 {
+                        partial += 1
+                    }
+                }
+                if readableCount <= 0 {
+                    return .corrupt(reason: "raw frame folder \(rawDir.lastPathComponent) has no readable frames")
+                }
             }
-            return true
+            return .valid
         case .selectFrames:
-            guard fm.fileExists(atPath: paths.framesSelectedURL.path) else { return false }
-            let contents = (try? fm.contentsOfDirectory(at: paths.framesSelectedURL, includingPropertiesForKeys: nil)) ?? []
-            return !contents.isEmpty
+            guard fm.fileExists(atPath: paths.framesSelectedURL.path) else { return .missing }
+            guard fm.fileExists(atPath: paths.framesSelectedManifestURL.path) else {
+                return .corrupt(reason: "selected frame manifest is missing")
+            }
+            let manifest: [SelectedFrameMapping]
+            do {
+                manifest = try loadSelectedFrameManifest(from: paths.framesSelectedManifestURL)
+            } catch {
+                return .corrupt(reason: "selected frame manifest is invalid JSON")
+            }
+            if manifest.isEmpty {
+                return .corrupt(reason: "selected frame manifest is empty")
+            }
+            let files = try loadImages(in: paths.framesSelectedURL)
+            if files.count != manifest.count {
+                return .corrupt(reason: "selected frame file count (\(files.count)) does not match manifest (\(manifest.count))")
+            }
+            let names = Set(files.map(\.lastPathComponent))
+            for entry in manifest where !names.contains(entry.outputFileName) {
+                return .corrupt(reason: "manifest references missing file \(entry.outputFileName)")
+            }
+            return .valid
         case .sfmFeatures:
-            return fm.fileExists(atPath: paths.colmapDatabaseURL.path)
+            let seedZero = paths.colmapSeedModelURL
+            if sparseModelFilesExist(at: seedZero) {
+                return .valid
+            }
+            return validateColmapDatabaseOutput(paths: paths, requireMatches: false)
         case .sfmMatching:
-            return fm.fileExists(atPath: paths.colmapDatabaseURL.path)
+            return validateColmapDatabaseOutput(paths: paths, requireMatches: true)
         case .sfmMapping:
             let sparseZero = paths.colmapSparseURL.appendingPathComponent("0", isDirectory: true)
-            return sparseModelFilesExist(at: sparseZero)
+            guard sparseModelFilesExist(at: sparseZero) else { return .missing }
+            for name in ["cameras.bin", "images.bin", "points3D.bin", "cameras.txt", "images.txt", "points3D.txt"] {
+                let fileURL = sparseZero.appendingPathComponent(name)
+                if !fm.fileExists(atPath: fileURL.path) { continue }
+                let size = (try? fm.attributesOfItem(atPath: fileURL.path)[.size] as? NSNumber)?.int64Value ?? 0
+                if size <= 0 {
+                    return .corrupt(reason: "sparse model file \(name) is empty")
+                }
+            }
+            let imagesTxt = sparseZero.appendingPathComponent("images.txt")
+            if fm.fileExists(atPath: imagesTxt.path) {
+                let text = (try? String(contentsOf: imagesTxt, encoding: .utf8)) ?? ""
+                let imageRows = text.split(separator: "\n").filter { line in
+                    let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
+                    return !trimmed.isEmpty && !trimmed.hasPrefix("#")
+                }
+                if imageRows.isEmpty {
+                    return .corrupt(reason: "images.txt has no registered images")
+                }
+            } else {
+                let imagesBin = sparseZero.appendingPathComponent("images.bin")
+                let size = (try? fm.attributesOfItem(atPath: imagesBin.path)[.size] as? NSNumber)?.int64Value ?? 0
+                if size <= 8 {
+                    return .corrupt(reason: "images.bin appears truncated")
+                }
+            }
+            return .valid
         case .trainBrush:
-            return tooling.brush.findLatestPly(in: paths.trainingURL) != nil
+            guard let latest = tooling.brush.findLatestPly(in: paths.trainingURL) else { return .missing }
+            return validatePlyFile(at: latest)
         case .exportSplat, .done:
             let output = paths.outputURL.appendingPathComponent("splat.ply")
-            return fm.fileExists(atPath: output.path)
+            guard fm.fileExists(atPath: output.path) else { return .missing }
+            return validatePlyFile(at: output)
         }
+    }
+
+    func isStageComplete(_ stage: PipelineStage, paths: ProjectPaths, metadata: ProjectMetadata) -> Bool {
+        (try? validateStageOutput(stage, paths: paths, metadata: metadata)) == .valid
+    }
+
+    func validateColmapDatabaseOutput(paths: ProjectPaths, requireMatches: Bool) -> StageOutputStatus {
+        let fm = FileManager.default
+        guard fm.fileExists(atPath: paths.colmapDatabaseURL.path) else { return .missing }
+
+        let size = (try? fm.attributesOfItem(atPath: paths.colmapDatabaseURL.path)[.size] as? NSNumber)?.int64Value ?? 0
+        if size <= 0 {
+            let sparseZero = paths.colmapSparseURL.appendingPathComponent("0", isDirectory: true)
+            if sparseModelFilesExist(at: sparseZero) {
+                return .valid
+            }
+            return .corrupt(reason: "database.db is empty")
+        }
+
+        var db: OpaquePointer?
+        defer { sqlite3_close(db) }
+        let rc = sqlite3_open_v2(paths.colmapDatabaseURL.path, &db, SQLITE_OPEN_READONLY, nil)
+        guard rc == SQLITE_OK, let db else {
+            return .corrupt(reason: "database.db is unreadable")
+        }
+
+        func queryCount(_ sql: String) -> Int? {
+            var statement: OpaquePointer?
+            defer { sqlite3_finalize(statement) }
+            guard sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK, let statement else {
+                return nil
+            }
+            guard sqlite3_step(statement) == SQLITE_ROW else {
+                return nil
+            }
+            return Int(sqlite3_column_int64(statement, 0))
+        }
+
+        let imageCount = queryCount("SELECT COUNT(*) FROM images;")
+        let keypointCount = queryCount("SELECT COUNT(*) FROM keypoints;")
+        let matchesCount = queryCount("SELECT COUNT(*) FROM two_view_geometries;") ?? queryCount("SELECT COUNT(*) FROM matches;")
+
+        guard let imageCount else {
+            return .corrupt(reason: "database missing images table")
+        }
+        guard imageCount > 0 else {
+            return .missing
+        }
+        guard let keypointCount else {
+            return .corrupt(reason: "database missing keypoints table")
+        }
+        if keypointCount <= 0 {
+            return .missing
+        }
+        if requireMatches {
+            guard let matchesCount else {
+                return .corrupt(reason: "database missing matches/two_view_geometries table")
+            }
+            if matchesCount <= 0 {
+                return .missing
+            }
+        }
+        return .valid
+    }
+
+    func validatePlyFile(at url: URL) -> StageOutputStatus {
+        let size = (try? FileManager.default.attributesOfItem(atPath: url.path)[.size] as? NSNumber)?.int64Value ?? 0
+        if size <= 0 {
+            return .corrupt(reason: "\(url.lastPathComponent) is empty")
+        }
+        guard let data = try? Data(contentsOf: url, options: [.mappedIfSafe]) else {
+            return .corrupt(reason: "failed to read \(url.lastPathComponent)")
+        }
+        guard let text = String(data: data.prefix(4096), encoding: .utf8) else {
+            return .corrupt(reason: "\(url.lastPathComponent) header is not UTF-8")
+        }
+        guard text.hasPrefix("ply") else {
+            return .corrupt(reason: "\(url.lastPathComponent) is not a PLY file")
+        }
+        guard text.contains("end_header") else {
+            return .corrupt(reason: "\(url.lastPathComponent) is missing end_header")
+        }
+        let lines = text.split(separator: "\n").map(String.init)
+        if let vertexLine = lines.first(where: { $0.lowercased().hasPrefix("element vertex ") }) {
+            let comps = vertexLine.split(separator: " ")
+            if let raw = comps.last, let count = Int(raw), count > 0 {
+                return .valid
+            }
+            return .corrupt(reason: "\(url.lastPathComponent) has invalid vertex count")
+        }
+        return .corrupt(reason: "\(url.lastPathComponent) is missing vertex element metadata")
     }
 
     struct FrameExtractionProfile {
@@ -2200,57 +3553,61 @@ private extension PipelineRunner {
         return dataset
     }
 
-    func latestBrushExport(in trainingURL: URL) -> (file: URL, step: Int?)? {
+    func latestBrushExport(in trainingURL: URL, minModificationDate: Date? = nil) -> (file: URL, step: Int?)? {
         let fm = FileManager.default
         let exportsDir = trainingURL.appendingPathComponent("dataset_exports", isDirectory: true)
 
         if fm.fileExists(atPath: exportsDir.path) {
-            if let export = latestBrushExportInDirectory(exportsDir) {
+            if let export = latestBrushExportInDirectory(exportsDir, minModificationDate: minModificationDate) {
                 return export
             }
         }
 
         // Fallback: search recursively in case Brush is configured with a different export path.
         let enumerator = fm.enumerator(at: trainingURL, includingPropertiesForKeys: [.contentModificationDateKey], options: [.skipsHiddenFiles])
-        var latest: (URL, Date)?
+        var latest: (file: URL, date: Date, step: Int?)?
         while let item = enumerator?.nextObject() as? URL {
             guard item.pathExtension.lowercased() == "ply" else { continue }
             let date = (try? item.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate) ?? Date.distantPast
-            if latest == nil || date > latest!.1 {
-                latest = (item, date)
+            if let minModificationDate, date < minModificationDate { continue }
+            let step = brushExportStep(from: item)
+            if let best = latest {
+                if date > best.date || (date == best.date && (step ?? -1) > (best.step ?? -1)) {
+                    latest = (item, date, step)
+                }
+            } else {
+                latest = (item, date, step)
             }
         }
         guard let latest else { return nil }
-        return (file: latest.0, step: brushExportStep(from: latest.0))
+        return (file: latest.file, step: latest.step)
     }
 
-    private func latestBrushExportInDirectory(_ directory: URL) -> (file: URL, step: Int?)? {
+    private func latestBrushExportInDirectory(
+        _ directory: URL,
+        minModificationDate: Date? = nil
+    ) -> (file: URL, step: Int?)? {
         let fm = FileManager.default
         let files = (try? fm.contentsOfDirectory(at: directory, includingPropertiesForKeys: [.contentModificationDateKey], options: [.skipsHiddenFiles])) ?? []
 
-        // Prefer the highest parsed step (export_05000.ply, export_10000.ply, ...).
-        var bestStep: (Int, URL)?
-        var bestDate: (Date, URL)?
+        var newest: (file: URL, date: Date, step: Int?)?
         for file in files where file.pathExtension.lowercased() == "ply" {
-            if let step = brushExportStep(from: file) {
-                if bestStep == nil || step > bestStep!.0 {
-                    bestStep = (step, file)
-                }
+            let date = (try? file.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate) ?? Date.distantPast
+            if let minModificationDate, date < minModificationDate {
                 continue
             }
-            let date = (try? file.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate) ?? Date.distantPast
-            if bestDate == nil || date > bestDate!.0 {
-                bestDate = (date, file)
+            let step = brushExportStep(from: file)
+            if let best = newest {
+                if date > best.date || (date == best.date && (step ?? -1) > (best.step ?? -1)) {
+                    newest = (file, date, step)
+                }
+            } else {
+                newest = (file, date, step)
             }
         }
 
-        if let bestStep {
-            return (file: bestStep.1, step: bestStep.0)
-        }
-        if let bestDate {
-            return (file: bestDate.1, step: nil)
-        }
-        return nil
+        guard let newest else { return nil }
+        return (file: newest.file, step: newest.step)
     }
 
     private func brushExportStep(from url: URL) -> Int? {
@@ -2319,10 +3676,15 @@ private extension PipelineRunner {
     final class BrushTrainingEtaEstimator: @unchecked Sendable {
         private let lock = NSLock()
         private var smoothedRate: Double?
+        private var smoothedEtaSeconds: TimeInterval?
+        private var lastEstimatedStep: Int?
         private var sampleCount: Int = 0
-        private let minSamples = 5
-        private let minStep = 25
+        private let minSamples = 6
+        private let minStep = 50
         private let alpha: Double = 0.2
+        private let etaIncreaseAlpha: Double = 0.2
+        private let etaDecreaseAlpha: Double = 0.35
+        private let maxEtaIncreaseFactor: Double = 1.25
 
         func update(rate: Double) {
             guard rate > 0 else { return }
@@ -2343,8 +3705,27 @@ private extension PipelineRunner {
             guard step >= minStep else { return nil }
             guard total > step else { return nil }
             guard let rate = smoothedRate, rate > 0 else { return nil }
+            if let lastEstimatedStep, step < lastEstimatedStep {
+                smoothedEtaSeconds = nil
+            }
             let remainingSteps = total - step
-            return Double(remainingSteps) / rate
+            let rawEta = Double(remainingSteps) / rate
+            let boundedEta: TimeInterval
+            if let existing = smoothedEtaSeconds {
+                boundedEta = min(rawEta, existing * maxEtaIncreaseFactor)
+            } else {
+                boundedEta = rawEta
+            }
+            let nextEta: TimeInterval
+            if let existing = smoothedEtaSeconds {
+                let alpha = boundedEta > existing ? etaIncreaseAlpha : etaDecreaseAlpha
+                nextEta = alpha * boundedEta + (1.0 - alpha) * existing
+            } else {
+                nextEta = boundedEta
+            }
+            smoothedEtaSeconds = nextEta
+            lastEstimatedStep = step
+            return nextEta
         }
     }
 
@@ -2541,8 +3922,18 @@ private extension PipelineRunner {
         return min(clamped, totalSteps)
     }
 
-    private func updateResumeSnapshotFromLatestExport(trainingURL: URL) {
-        guard let exportURL = latestBrushUncompressedExport(in: trainingURL) else { return }
+    private func clearBrushResumeSnapshot(in trainingURL: URL) {
+        removeIfExists(trainingURL.appendingPathComponent("latest_snapshot.ply"))
+    }
+
+    private func updateResumeSnapshotFromLatestExport(
+        trainingURL: URL,
+        minModificationDate: Date? = nil
+    ) {
+        guard let exportURL = latestBrushUncompressedExport(
+            in: trainingURL,
+            minModificationDate: minModificationDate
+        ) else { return }
         updateBrushResumeSnapshot(from: exportURL, trainingURL: trainingURL)
     }
 
@@ -2556,7 +3947,7 @@ private extension PipelineRunner {
         copyItemReplacing(source: exportURL, destination: destURL)
     }
 
-    private func latestBrushUncompressedExport(in trainingURL: URL) -> URL? {
+    private func latestBrushUncompressedExport(in trainingURL: URL, minModificationDate: Date? = nil) -> URL? {
         let fm = FileManager.default
         let enumerator = fm.enumerator(at: trainingURL, includingPropertiesForKeys: [.contentModificationDateKey], options: [.skipsHiddenFiles])
         var latest: (URL, Date)?
@@ -2564,6 +3955,7 @@ private extension PipelineRunner {
             guard item.pathExtension.lowercased() == "ply" else { continue }
             if item.lastPathComponent.hasSuffix(".compressed.ply") { continue }
             let date = (try? item.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate) ?? Date.distantPast
+            if let minModificationDate, date < minModificationDate { continue }
             if latest == nil || date > latest!.1 {
                 latest = (item, date)
             }
@@ -2576,10 +3968,19 @@ private extension PipelineRunner {
         if source.resolvingSymlinksInPath() == destination.resolvingSymlinksInPath() {
             return
         }
-        if fm.fileExists(atPath: destination.path) {
-            try? fm.removeItem(at: destination)
+        let tempURL = destination.deletingLastPathComponent()
+            .appendingPathComponent(destination.lastPathComponent + ".tmp")
+        try? fm.removeItem(at: tempURL)
+        do {
+            try fm.copyItem(at: source, to: tempURL)
+            if fm.fileExists(atPath: destination.path) {
+                _ = try fm.replaceItemAt(destination, withItemAt: tempURL, backupItemName: nil, options: .usingNewMetadataOnly)
+            } else {
+                try fm.moveItem(at: tempURL, to: destination)
+            }
+        } catch {
+            try? fm.removeItem(at: tempURL)
         }
-        try? fm.copyItem(at: source, to: destination)
     }
 
     private func brushRecentStepRates(from logURL: URL, maxSamples: Int) -> [Double] {
@@ -2696,15 +4097,22 @@ private extension PipelineRunner {
         let trimmed = sanitizeToolLogLine(line).trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return false }
         let lower = trimmed.lowercased()
+        let hasAlertKeyword = lower.contains("warning")
+            || lower.contains("warn")
+            || lower.contains("error")
+            || lower.contains("fatal")
+            || lower.contains("failed")
         if looksLikeProgressBar(trimmed),
-           !(lower.contains("warning")
-             || lower.contains("warn")
-             || lower.contains("error")
-             || lower.contains("fatal")
-             || lower.contains("failed")) {
+           !hasAlertKeyword {
             return false
         }
         if isError {
+            if hasAlertKeyword {
+                return true
+            }
+            if glogSeverity(trimmed) == "I" {
+                return false
+            }
             return true
         }
         if trimmed.hasPrefix("EasySplat:") {
@@ -2717,6 +4125,21 @@ private extension PipelineRunner {
             return true
         }
         return false
+    }
+
+    private static func glogSeverity(_ line: String) -> Character? {
+        let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard trimmed.count >= 5 else { return nil }
+        let chars = Array(trimmed)
+        let severity = chars[0]
+        switch severity {
+        case "I", "W", "E", "F":
+            break
+        default:
+            return nil
+        }
+        guard chars[1...4].allSatisfy(\.isNumber) else { return nil }
+        return severity
     }
 
     private static func sanitizeToolLogLine(_ line: String) -> String {
@@ -3079,6 +4502,12 @@ struct TestBrushTrainingPlan: Sendable {
     let exportEvery: Int?
 }
 
+enum TestStageOutputStatus: Equatable, Sendable {
+    case valid
+    case missing
+    case corrupt
+}
+
 extension PipelineRunner {
     func loadImagesForTesting(in directory: URL) throws -> [URL] {
         try loadImages(in: directory)
@@ -3151,8 +4580,16 @@ extension PipelineRunner {
         brushExportStep(from: url)
     }
 
-    func test_latestBrushExport(in trainingURL: URL) -> (file: URL, step: Int?)? {
-        latestBrushExport(in: trainingURL)
+    func test_latestBrushExport(in trainingURL: URL, minModificationDate: Date? = nil) -> (file: URL, step: Int?)? {
+        latestBrushExport(in: trainingURL, minModificationDate: minModificationDate)
+    }
+
+    func test_updateBrushResumeSnapshot(from exportURL: URL, trainingURL: URL) {
+        updateBrushResumeSnapshot(from: exportURL, trainingURL: trainingURL)
+    }
+
+    func test_clearBrushResumeSnapshot(in trainingURL: URL) {
+        clearBrushResumeSnapshot(in: trainingURL)
     }
 
     func test_brushTrainStepProgress(from line: String) -> TestBrushTrainProgress? {
@@ -3198,6 +4635,22 @@ extension PipelineRunner {
             estimator.update(rate: rate)
         }
         return estimator.estimateRemainingSeconds(step: step, total: total)
+    }
+
+    func test_trainingEtaEstimatesWithSpike(
+        initialRates: [Double],
+        spikeRate: Double,
+        step: Int,
+        total: Int
+    ) -> (baseline: TimeInterval?, damped: TimeInterval?) {
+        let estimator = BrushTrainingEtaEstimator()
+        for rate in initialRates {
+            estimator.update(rate: rate)
+        }
+        let baseline = estimator.estimateRemainingSeconds(step: step, total: total)
+        estimator.update(rate: spikeRate)
+        let damped = estimator.estimateRemainingSeconds(step: step, total: total)
+        return (baseline: baseline, damped: damped)
     }
 
     func test_shouldEmitToolLogLine(_ line: String, isError: Bool) -> Bool {
@@ -3263,6 +4716,62 @@ extension PipelineRunner {
         return vggtBaMaxFramesLimit(autoTune: autoTune)
     }
 
+    func test_sfmBackendPolicy() -> SfmBackend {
+        sfmBackendPolicy()
+    }
+
+    func test_sfmBackendFallbackOrder() -> [SfmBackend] {
+        sfmBackendFallbackOrder(override: sfmBackendOverride())
+    }
+
+    func test_fastvggtMergingPreference() -> Int {
+        fastvggtMergingPreference()
+    }
+
+    func test_fastvggtMergeRatioPreference() -> Double {
+        fastvggtMergeRatioPreference()
+    }
+
+    func test_fastvggtConfidenceThresholdPreference() -> Double {
+        fastvggtConfidenceThresholdPreference()
+    }
+
+    func test_fastvggtUseBundleAdjustmentPreference() -> Bool {
+        fastvggtUseBundleAdjustmentPreference()
+    }
+
+    func test_fastvggtRequireRefinedModelPreference() -> Bool {
+        fastvggtRequireRefinedModelPreference()
+    }
+
+    func test_fastvggtBaMaxIterationsPreference() -> Int {
+        fastvggtBaMaxIterationsPreference()
+    }
+
+    func test_fastvggtBaRefineFocalPreference() -> Bool {
+        fastvggtBaRefineFocalPreference()
+    }
+
+    func test_fastvggtBaRefinePrincipalPointPreference() -> Bool {
+        fastvggtBaRefinePrincipalPointPreference()
+    }
+
+    func test_fastvggtBaRefineExtraParamsPreference() -> Bool {
+        fastvggtBaRefineExtraParamsPreference()
+    }
+
+    func test_tuneFastVggtRefinementColmapOptions(
+        frameCount: Int,
+        extractOptions: ColmapOptions,
+        matchOptions: ColmapOptions
+    ) -> (extract: ColmapOptions, match: ColmapOptions, notes: [String]) {
+        tuneFastVggtRefinementColmapOptions(
+            frameCount: frameCount,
+            extractOptions: extractOptions,
+            matchOptions: matchOptions
+        )
+    }
+
     func test_colmapErrorIndicatesGpuFailure(_ error: ColmapRunnerError) -> Bool {
         colmapErrorIndicatesGpuFailure(error)
     }
@@ -3277,6 +4786,17 @@ extension PipelineRunner {
 
     func test_isStageComplete(_ stage: PipelineStage, paths: ProjectPaths, metadata: ProjectMetadata) -> Bool {
         isStageComplete(stage, paths: paths, metadata: metadata)
+    }
+
+    func test_validateStageOutput(_ stage: PipelineStage, paths: ProjectPaths, metadata: ProjectMetadata) throws -> TestStageOutputStatus {
+        switch try validateStageOutput(stage, paths: paths, metadata: metadata) {
+        case .valid:
+            return .valid
+        case .missing:
+            return .missing
+        case .corrupt:
+            return .corrupt
+        }
     }
 
     func test_cleanForRetry(failedStage: PipelineStage, paths: ProjectPaths) throws {

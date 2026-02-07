@@ -38,6 +38,12 @@ final class BrushRunnerTests: XCTestCase {
     }
 
     func testRunTrainRetriesLegacySubcommand() async throws {
+        let restore = await scopedEnvironment([
+            "EASYSPLAT_BRUSH_TOTAL_STEPS": nil,
+            "EASYSPLAT_BRUSH_EXPORT_EVERY": nil
+        ])
+        defer { restore() }
+
         let root = try TestFileBuilder.makeTempDir()
         defer { try? FileManager.default.removeItem(at: root) }
         let brush = root.appendingPathComponent("brush")
@@ -76,28 +82,32 @@ final class BrushRunnerTests: XCTestCase {
         let dataset = root.appendingPathComponent("dataset", isDirectory: true)
         try FileManager.default.createDirectory(at: dataset, withIntermediateDirectories: true)
 
-        setenv("EASYSPLAT_BRUSH_TOTAL_STEPS", "100", 1)
-        setenv("EASYSPLAT_BRUSH_EXPORT_EVERY", "10", 1)
-        defer {
-            unsetenv("EASYSPLAT_BRUSH_TOTAL_STEPS")
-            unsetenv("EASYSPLAT_BRUSH_EXPORT_EVERY")
-        }
-
         var captured: [String] = []
-        let mock = MockSubprocessRunner(scripts: [
-            .init(path: brush.path, argsPrefix: ["--total-steps", "100", "--export-every", "10", dataset.path], result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""), onRun: { args in
-                captured = args
-            })
-        ])
+        try await withEnvironmentAsync([
+            "EASYSPLAT_BRUSH_TOTAL_STEPS": "100",
+            "EASYSPLAT_BRUSH_EXPORT_EVERY": "10"
+        ]) {
+            let mock = MockSubprocessRunner(scripts: [
+                .init(path: brush.path, argsPrefix: ["--total-steps", "100", "--export-every", "10", dataset.path], result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""), onRun: { args in
+                    captured = args
+                })
+            ])
 
-        let runner = BrushRunner(runner: mock)
-        try await runner.runTrain(brushPath: brush, datasetPath: dataset, onLog: { _, _ in })
+            let runner = BrushRunner(runner: mock)
+            try await runner.runTrain(brushPath: brush, datasetPath: dataset, onLog: { _, _ in })
 
-        XCTAssertTrue(captured.contains("--total-steps"))
-        XCTAssertTrue(captured.contains("--export-every"))
+            XCTAssertTrue(captured.contains("--total-steps"))
+            XCTAssertTrue(captured.contains("--export-every"))
+        }
     }
 
     func testRunTrainUsesExplicitSettingsWhenEnvMissing() async throws {
+        let restore = await scopedEnvironment([
+            "EASYSPLAT_BRUSH_TOTAL_STEPS": nil,
+            "EASYSPLAT_BRUSH_EXPORT_EVERY": nil
+        ])
+        defer { restore() }
+
         let root = try TestFileBuilder.makeTempDir()
         defer { try? FileManager.default.removeItem(at: root) }
         let brush = root.appendingPathComponent("brush")

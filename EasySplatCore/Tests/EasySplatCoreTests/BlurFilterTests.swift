@@ -5,7 +5,8 @@ final class BlurFilterTests: XCTestCase {
     private func makeRunner() -> PipelineRunner {
         let root = URL(fileURLWithPath: "/tmp")
         let vggt = VggtToolchain(root: root, sfmTool: root, python: root, models: root)
-        let toolchain = ToolchainPaths(root: root, colmap: root, glomap: root, brush: root, vggt: vggt)
+        let fastvggt = FastVggtToolchain(root: root, sfmTool: root, python: root, models: root)
+        let toolchain = ToolchainPaths(root: root, colmap: root, glomap: root, brush: root, vggt: vggt, fastvggt: fastvggt)
         let config = PipelineRunner.PipelineConfig(toolchain: toolchain, preset: PresetSpec(mode: .object, quality: .standard))
         return PipelineRunner(projectURL: root, config: config)
     }

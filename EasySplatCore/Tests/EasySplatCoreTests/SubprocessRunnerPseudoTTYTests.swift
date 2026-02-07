@@ -44,6 +44,20 @@ final class SubprocessRunnerPseudoTTYTests: XCTestCase {
         XCTAssertFalse(stderrLines.contains(where: { $0.contains("progress 1/5") }))
     }
 
+    func testLaunchFailureStillAllowsSubsequentRuns() async throws {
+        let root = try TestFileBuilder.makeTempDir()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let scriptURL = try makeProgressScript(in: root)
+        let runner = SubprocessRunner()
+
+        await XCTAssertThrowsErrorAsync {
+            try await runner.runAsync("/path/that/does/not/exist", [])
+        }
+
+        let stderrLines = try await runScript(runner: runner, scriptURL: scriptURL, usePseudoTTY: false)
+        XCTAssertTrue(stderrLines.contains(where: { $0.contains("notty") }))
+    }
+
     private func makeProgressScript(in root: URL) throws -> URL {
         let scriptURL = root.appendingPathComponent("progress.sh")
         let script = """

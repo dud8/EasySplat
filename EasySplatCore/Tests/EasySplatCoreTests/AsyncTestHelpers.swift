@@ -1,11 +1,22 @@
 import XCTest
 
 @MainActor
-func XCTAssertThrowsErrorAsync(_ expression: @escaping () async throws -> Void) async {
+func XCTAssertThrowsErrorAsync<T>(
+    _ expression: @escaping () async throws -> T,
+    _ message: @autoclosure () -> String = "",
+    file: StaticString = #filePath,
+    line: UInt = #line,
+    errorHandler: (Error) -> Void = { _ in }
+) async {
     do {
-        try await expression()
-        XCTFail("Expected error to be thrown")
+        _ = try await expression()
+        let failureMessage = message()
+        if failureMessage.isEmpty {
+            XCTFail("Expected error to be thrown", file: file, line: line)
+        } else {
+            XCTFail(failureMessage, file: file, line: line)
+        }
     } catch {
-        XCTAssertTrue(true)
+        errorHandler(error)
     }
 }

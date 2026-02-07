@@ -12,7 +12,8 @@ final class ToolchainManagerTests: XCTestCase {
             .init(path: root.appendingPathComponent("bin/colmap").path, argsPrefix: ["-h"], result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""), onRun: nil),
             .init(path: root.appendingPathComponent("bin/glomap").path, argsPrefix: ["--help"], result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""), onRun: nil),
             .init(path: root.appendingPathComponent("bin/brush").path, argsPrefix: ["--help"], result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""), onRun: nil),
-            .init(path: "/usr/bin/file", argsPrefix: [root.appendingPathComponent("vggt_mps/python/bin/python3").path], result: .init(exitCode: 0, terminationReason: .exit, stdout: "Mach-O 64-bit executable arm64", stderr: ""), onRun: nil)
+            .init(path: "/usr/bin/file", argsPrefix: [root.appendingPathComponent("vggt_mps/python/bin/python3").path], result: .init(exitCode: 0, terminationReason: .exit, stdout: "Mach-O 64-bit executable arm64", stderr: ""), onRun: nil),
+            .init(path: "/usr/bin/file", argsPrefix: [root.appendingPathComponent("fastvggt_mps/python/bin/python3").path], result: .init(exitCode: 0, terminationReason: .exit, stdout: "Mach-O 64-bit executable arm64", stderr: ""), onRun: nil)
         ])
 
         let manager = ToolchainManager(runner: runner)
@@ -29,7 +30,8 @@ final class ToolchainManagerTests: XCTestCase {
             .init(path: root.appendingPathComponent("bin/colmap").path, argsPrefix: ["-h"], result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""), onRun: nil),
             .init(path: root.appendingPathComponent("bin/glomap").path, argsPrefix: ["--help"], result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""), onRun: nil),
             .init(path: root.appendingPathComponent("bin/brush").path, argsPrefix: ["--help"], result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""), onRun: nil),
-            .init(path: "/usr/bin/file", argsPrefix: [root.appendingPathComponent("vggt_mps/python/bin/python3").path], result: .init(exitCode: 0, terminationReason: .exit, stdout: "Mach-O 64-bit executable arm64", stderr: ""), onRun: nil)
+            .init(path: "/usr/bin/file", argsPrefix: [root.appendingPathComponent("vggt_mps/python/bin/python3").path], result: .init(exitCode: 0, terminationReason: .exit, stdout: "Mach-O 64-bit executable arm64", stderr: ""), onRun: nil),
+            .init(path: "/usr/bin/file", argsPrefix: [root.appendingPathComponent("fastvggt_mps/python/bin/python3").path], result: .init(exitCode: 0, terminationReason: .exit, stdout: "Mach-O 64-bit executable arm64", stderr: ""), onRun: nil)
         ])
 
         let manager = ToolchainManager(runner: runner)
@@ -50,7 +52,8 @@ final class ToolchainManagerTests: XCTestCase {
             .init(path: root.appendingPathComponent("bin/colmap").path, argsPrefix: ["-h"], result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""), onRun: nil),
             .init(path: root.appendingPathComponent("bin/glomap").path, argsPrefix: ["--help"], result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""), onRun: nil),
             .init(path: root.appendingPathComponent("bin/brush").path, argsPrefix: ["--help"], result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""), onRun: nil),
-            .init(path: "/usr/bin/file", argsPrefix: [root.appendingPathComponent("vggt_mps/python/bin/python3").path], result: .init(exitCode: 0, terminationReason: .exit, stdout: "Mach-O 64-bit executable x86_64", stderr: ""), onRun: nil)
+            .init(path: "/usr/bin/file", argsPrefix: [root.appendingPathComponent("vggt_mps/python/bin/python3").path], result: .init(exitCode: 0, terminationReason: .exit, stdout: "Mach-O 64-bit executable x86_64", stderr: ""), onRun: nil),
+            .init(path: "/usr/bin/file", argsPrefix: [root.appendingPathComponent("fastvggt_mps/python/bin/python3").path], result: .init(exitCode: 0, terminationReason: .exit, stdout: "Mach-O 64-bit executable arm64", stderr: ""), onRun: nil)
         ])
 
         let manager = ToolchainManager(runner: runner)
@@ -104,19 +107,19 @@ final class ToolchainManagerTests: XCTestCase {
         defer { try? FileManager.default.removeItem(at: root) }
         _ = try ToolchainFixtureBuilder.createToolchain(at: root)
 
-        setenv("EASYSPLAT_LOCAL_TOOLCHAIN_ROOT", root.path, 1)
-        defer { unsetenv("EASYSPLAT_LOCAL_TOOLCHAIN_ROOT") }
-
         let runner = MockSubprocessRunner(scripts: [
             .init(path: root.appendingPathComponent("bin/colmap").path, argsPrefix: ["-h"], result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""), onRun: nil),
             .init(path: root.appendingPathComponent("bin/glomap").path, argsPrefix: ["--help"], result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""), onRun: nil),
             .init(path: root.appendingPathComponent("bin/brush").path, argsPrefix: ["--help"], result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""), onRun: nil),
-            .init(path: "/usr/bin/file", argsPrefix: [root.appendingPathComponent("vggt_mps/python/bin/python3").path], result: .init(exitCode: 0, terminationReason: .exit, stdout: "Mach-O 64-bit executable arm64", stderr: ""), onRun: nil)
+            .init(path: "/usr/bin/file", argsPrefix: [root.appendingPathComponent("vggt_mps/python/bin/python3").path], result: .init(exitCode: 0, terminationReason: .exit, stdout: "Mach-O 64-bit executable arm64", stderr: ""), onRun: nil),
+            .init(path: "/usr/bin/file", argsPrefix: [root.appendingPathComponent("fastvggt_mps/python/bin/python3").path], result: .init(exitCode: 0, terminationReason: .exit, stdout: "Mach-O 64-bit executable arm64", stderr: ""), onRun: nil)
         ])
 
-        let manager = ToolchainManager(runner: runner)
-        let manifestURL = URL(string: "https://example.com/manifest.json")!
-        let toolchain = try await manager.ensureToolchain(manifestURL: manifestURL, publicKeyBase64: "ignored", targetName: "macos-arm64") { _, _ in }
-        XCTAssertEqual(toolchain.root, root)
+        try await withEnvironmentAsync(["EASYSPLAT_LOCAL_TOOLCHAIN_ROOT": root.path]) {
+            let manager = ToolchainManager(runner: runner)
+            let manifestURL = URL(string: "https://example.com/manifest.json")!
+            let toolchain = try await manager.ensureToolchain(manifestURL: manifestURL, publicKeyBase64: "ignored", targetName: "macos-arm64") { _, _ in }
+            XCTAssertEqual(toolchain.root, root)
+        }
     }
 }

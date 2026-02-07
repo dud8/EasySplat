@@ -13,6 +13,8 @@ public struct ProjectPaths: Sendable {
     public var framesSelectedURL: URL { root.appendingPathComponent("Frames/selected", isDirectory: true) }
     public var framesSelectedManifestURL: URL { root.appendingPathComponent("Frames/selected_manifest.json") }
     public var colmapDatabaseURL: URL { root.appendingPathComponent("SfM/colmap/database.db") }
+    public var colmapSeedURL: URL { root.appendingPathComponent("SfM/colmap/seed", isDirectory: true) }
+    public var colmapSeedModelURL: URL { colmapSeedURL.appendingPathComponent("0", isDirectory: true) }
     public var colmapSparseURL: URL { root.appendingPathComponent("SfM/colmap/sparse", isDirectory: true) }
     public var trainingURL: URL { root.appendingPathComponent("Training", isDirectory: true) }
     public var outputURL: URL { root.appendingPathComponent("Output", isDirectory: true) }
@@ -22,6 +24,7 @@ public struct ProjectPaths: Sendable {
     public var colmapLogURL: URL { logsURL.appendingPathComponent("colmap.log") }
     public var glomapLogURL: URL { logsURL.appendingPathComponent("glomap.log") }
     public var vggtLogURL: URL { logsURL.appendingPathComponent("vggt.log") }
+    public var fastvggtLogURL: URL { logsURL.appendingPathComponent("fastvggt.log") }
     public var brushLogURL: URL { logsURL.appendingPathComponent("brush.log") }
 
     public func ensureDirectories() throws {
@@ -29,6 +32,7 @@ public struct ProjectPaths: Sendable {
         try fm.createDirectory(at: originalsURL, withIntermediateDirectories: true)
         try fm.createDirectory(at: framesRawURL, withIntermediateDirectories: true)
         try fm.createDirectory(at: framesSelectedURL, withIntermediateDirectories: true)
+        try fm.createDirectory(at: colmapSeedURL, withIntermediateDirectories: true)
         try fm.createDirectory(at: colmapSparseURL, withIntermediateDirectories: true)
         try fm.createDirectory(at: trainingURL, withIntermediateDirectories: true)
         try fm.createDirectory(at: outputURL, withIntermediateDirectories: true)

@@ -15,6 +15,12 @@ struct ToolchainFixture {
     let vggtModels: URL
     let vggtModelFile: URL
     let vggtVendorSentinel: URL
+    let fastvggtRoot: URL
+    let fastvggtSfmTool: URL
+    let fastvggtPython: URL
+    let fastvggtModels: URL
+    let fastvggtModelFile: URL
+    let fastvggtVendorSentinel: URL
 }
 
 enum ToolchainFixtureBuilder {
@@ -23,7 +29,9 @@ enum ToolchainFixtureBuilder {
         brushHasShebang: Bool = false,
         includeBrushReal: Bool = true,
         includeVggtModel: Bool = true,
-        includeVendorSentinel: Bool = true
+        includeVendorSentinel: Bool = true,
+        includeFastVggtModel: Bool = true,
+        includeFastVggtVendorSentinel: Bool = true
     ) throws -> ToolchainFixture {
         let fm = FileManager.default
         let bin = root.appendingPathComponent("bin", isDirectory: true)
@@ -80,6 +88,26 @@ enum ToolchainFixtureBuilder {
             fm.createFile(atPath: vggtVendorSentinel.path, contents: Data([0x00]))
         }
 
+        let fastvggtRoot = root.appendingPathComponent("fastvggt_mps", isDirectory: true)
+        let fastvggtSfmTool = fastvggtRoot.appendingPathComponent("bin/easysplat_fastvggt_sfm")
+        let fastvggtPython = fastvggtRoot.appendingPathComponent("python/bin/python3")
+        let fastvggtModels = fastvggtRoot.appendingPathComponent("models", isDirectory: true)
+        let fastvggtModelFile = fastvggtModels.appendingPathComponent("fastvggt_model.pt")
+        let fastvggtVendorSentinel = fastvggtRoot.appendingPathComponent("vendor/fastvggt/vggt/models/vggt.py")
+
+        try fm.createDirectory(at: fastvggtSfmTool.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try fm.createDirectory(at: fastvggtPython.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try fm.createDirectory(at: fastvggtModels, withIntermediateDirectories: true)
+        try fm.createDirectory(at: fastvggtVendorSentinel.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try writeExecutable(fastvggtSfmTool, script: "#!/usr/bin/env bash\nexit 0\n")
+        try writeExecutable(fastvggtPython, script: "#!/usr/bin/env bash\necho python\n")
+        if includeFastVggtModel {
+            fm.createFile(atPath: fastvggtModelFile.path, contents: Data([0x00]))
+        }
+        if includeFastVggtVendorSentinel {
+            fm.createFile(atPath: fastvggtVendorSentinel.path, contents: Data([0x00]))
+        }
+
         return ToolchainFixture(
             root: root,
             colmap: colmap,
@@ -93,7 +121,13 @@ enum ToolchainFixtureBuilder {
             vggtPython: vggtPython,
             vggtModels: vggtModels,
             vggtModelFile: vggtModelFile,
-            vggtVendorSentinel: vggtVendorSentinel
+            vggtVendorSentinel: vggtVendorSentinel,
+            fastvggtRoot: fastvggtRoot,
+            fastvggtSfmTool: fastvggtSfmTool,
+            fastvggtPython: fastvggtPython,
+            fastvggtModels: fastvggtModels,
+            fastvggtModelFile: fastvggtModelFile,
+            fastvggtVendorSentinel: fastvggtVendorSentinel
         )
     }
 
@@ -104,12 +138,19 @@ enum ToolchainFixtureBuilder {
             python: fixture.vggtPython,
             models: fixture.vggtModels
         )
+        let fastvggt = FastVggtToolchain(
+            root: fixture.fastvggtRoot,
+            sfmTool: fixture.fastvggtSfmTool,
+            python: fixture.fastvggtPython,
+            models: fixture.fastvggtModels
+        )
         return ToolchainPaths(
             root: fixture.root,
             colmap: fixture.colmap,
             glomap: fixture.glomap,
             brush: fixture.brush,
-            vggt: vggt
+            vggt: vggt,
+            fastvggt: fastvggt
         )
     }
 }

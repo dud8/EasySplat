@@ -1,5 +1,24 @@
 import Foundation
 
+public struct ColmapBundleAdjustmentOptions: Sendable {
+    public var maxNumIterations: Int
+    public var refineFocalLength: Bool
+    public var refinePrincipalPoint: Bool
+    public var refineExtraParams: Bool
+
+    public init(
+        maxNumIterations: Int = 50,
+        refineFocalLength: Bool = true,
+        refinePrincipalPoint: Bool = false,
+        refineExtraParams: Bool = false
+    ) {
+        self.maxNumIterations = max(1, maxNumIterations)
+        self.refineFocalLength = refineFocalLength
+        self.refinePrincipalPoint = refinePrincipalPoint
+        self.refineExtraParams = refineExtraParams
+    }
+}
+
 public struct ColmapOptions: Sendable {
     public var useGPU: Bool
     public var extractThreads: Int
@@ -74,6 +93,7 @@ public final class ColmapRunner {
         imagePath: URL,
         maxImageSize: Int,
         cameraModel: String,
+        singleCamera: Bool = true,
         options: ColmapOptions,
         onLog: @escaping @Sendable (String, Bool) -> Void
     ) async throws {
@@ -81,7 +101,7 @@ public final class ColmapRunner {
             "feature_extractor",
             "--database_path", database.path,
             "--image_path", imagePath.path,
-            "--ImageReader.single_camera", "1",
+            "--ImageReader.single_camera", singleCamera ? "1" : "0",
             "--ImageReader.camera_model", cameraModel,
             "--SiftExtraction.max_image_size", "\(maxImageSize)",
             "--FeatureExtraction.use_gpu", options.useGPU ? "1" : "0",
@@ -258,6 +278,83 @@ public final class ColmapRunner {
         try checkResult(result, command: "mapper")
     }
 
+    public func runPointTriangulator(
+        colmapPath: URL,
+        database: URL,
+        imagePath: URL,
+        inputPath: URL,
+        outputPath: URL,
+        options: ColmapOptions,
+        onLog: @escaping @Sendable (String, Bool) -> Void
+    ) async throws {
+        let args = [
+            "point_triangulator",
+            "--database_path", database.path,
+            "--image_path", imagePath.path,
+            "--input_path", inputPath.path,
+            "--output_path", outputPath.path
+        ]
+        onLog("EasySplat: colmap argv: \(colmapPath.path) \(args.joined(separator: " "))", false)
+        let result = try await runner.runAsync(
+            colmapPath.path,
+            args,
+            currentDirectory: nil,
+            environment: options.environment,
+            onStdout: { onLog($0, false) },
+            onStderr: { onLog($0, true) }
+        )
+        try checkResult(result, command: "point_triangulator")
+    }
+
+    public func runBundleAdjuster(
+        colmapPath: URL,
+        inputPath: URL,
+        outputPath: URL,
+        options: ColmapOptions,
+        bundleOptions: ColmapBundleAdjustmentOptions,
+        onLog: @escaping @Sendable (String, Bool) -> Void
+    ) async throws {
+        let baseArgs = [
+            "bundle_adjuster",
+            "--input_path", inputPath.path,
+            "--output_path", outputPath.path,
+            "--BundleAdjustment.refine_focal_length", bundleOptions.refineFocalLength ? "1" : "0",
+            "--BundleAdjustment.refine_principal_point", bundleOptions.refinePrincipalPoint ? "1" : "0",
+            "--BundleAdjustment.refine_extra_params", bundleOptions.refineExtraParams ? "1" : "0"
+        ]
+        let maxIterations = "\(max(1, bundleOptions.maxNumIterations))"
+        let ceresArgs = baseArgs + ["--BundleAdjustmentCeres.max_num_iterations", maxIterations]
+
+        onLog("EasySplat: colmap argv: \(colmapPath.path) \(ceresArgs.joined(separator: " "))", false)
+        var result = try await runner.runAsync(
+            colmapPath.path,
+            ceresArgs,
+            currentDirectory: nil,
+            environment: options.environment,
+            onStdout: { onLog($0, false) },
+            onStderr: { onLog($0, true) }
+        )
+
+        if shouldRetryBundleAdjusterWithLegacyIterationFlag(result: result) {
+            let legacyArgs = baseArgs + ["--BundleAdjustment.max_num_iterations", maxIterations]
+            onLog(
+                "EasySplat: bundle_adjuster rejected BundleAdjustmentCeres.max_num_iterations; retrying with BundleAdjustment.max_num_iterations.",
+                true
+            )
+            onLog("EasySplat: colmap argv: \(colmapPath.path) \(legacyArgs.joined(separator: " "))", false)
+            result = try await runner.runAsync(
+                colmapPath.path,
+                legacyArgs,
+                currentDirectory: nil,
+                environment: options.environment,
+                onStdout: { onLog($0, false) },
+                onStderr: { onLog($0, true) }
+            )
+        }
+
+        try checkResult(result, command: "bundle_adjuster")
+    }
+
     public func runModelAnalyzer(
         colmapPath: URL,
         modelPath: URL,
@@ -287,6 +384,16 @@ public final class ColmapRunner {
                 stderrTail: tailLines(result.stderr, limit: 40)
             )
         }
+    }
+
+    private func shouldRetryBundleAdjusterWithLegacyIterationFlag(result: SubprocessResult) -> Bool {
+        guard result.exitCode != 0 else { return false }
+        let text = "\(result.stdout)\n\(result.stderr)".lowercased()
+        if text.contains("bundleadjustmentceres.max_num_iterations"),
+           (text.contains("unrecognised option") || text.contains("unrecognized option")) {
+            return true
+        }
+        return false
     }
 
     private func tailLines(_ text: String, limit: Int) -> String {

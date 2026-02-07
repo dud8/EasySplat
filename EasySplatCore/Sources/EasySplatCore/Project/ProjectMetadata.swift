@@ -9,6 +9,9 @@ public struct ProjectMetadata: Codable, Sendable {
     public var preset: PresetSpec
     public var state: PipelineState
     public var outputs: OutputSpec?
+    public var checkpoint: PipelineCheckpoint?
+    public var recoveryPromptSuppressed: Bool?
+    public var lastRunStartedAt: Date?
 
     public init(
         formatVersion: Int = 1,
@@ -18,7 +21,10 @@ public struct ProjectMetadata: Codable, Sendable {
         input: InputSpec,
         preset: PresetSpec,
         state: PipelineState = PipelineState(stage: .importInput, attempt: 0, lastError: nil, resumeToken: nil),
-        outputs: OutputSpec? = nil
+        outputs: OutputSpec? = nil,
+        checkpoint: PipelineCheckpoint? = nil,
+        recoveryPromptSuppressed: Bool? = nil,
+        lastRunStartedAt: Date? = nil
     ) {
         self.formatVersion = formatVersion
         self.id = id
@@ -28,6 +34,138 @@ public struct ProjectMetadata: Codable, Sendable {
         self.preset = preset
         self.state = state
         self.outputs = outputs
+        self.checkpoint = checkpoint
+        self.recoveryPromptSuppressed = recoveryPromptSuppressed
+        self.lastRunStartedAt = lastRunStartedAt
+    }
+}
+
+public struct PipelineCheckpoint: Codable, Sendable {
+    public var stage: PipelineStage
+    public var updatedAt: Date
+    public var progressFraction: Double?
+    public var message: String?
+    public var details: PipelineCheckpointDetails?
+
+    public init(
+        stage: PipelineStage,
+        updatedAt: Date = Date(),
+        progressFraction: Double? = nil,
+        message: String? = nil,
+        details: PipelineCheckpointDetails? = nil
+    ) {
+        self.stage = stage
+        self.updatedAt = updatedAt
+        self.progressFraction = progressFraction
+        self.message = message
+        self.details = details
+    }
+}
+
+public enum PipelineCheckpointDetails: Codable, Sendable {
+    case extractFrames(ExtractFramesCheckpoint)
+    case selectFrames(SelectFramesCheckpoint)
+    case sfmFeatures(SfmFeaturesCheckpoint)
+    case sfmMatching(SfmMatchingCheckpoint)
+    case sfmMapping(SfmMappingCheckpoint)
+    case trainBrush(TrainBrushCheckpoint)
+    case exportSplat(ExportSplatCheckpoint)
+}
+
+public struct ExtractFramesCheckpoint: Codable, Sendable {
+    public var videoIndex: Int
+    public var videoName: String
+    public var extractedCount: Int
+    public var targetCount: Int
+
+    public init(videoIndex: Int, videoName: String, extractedCount: Int, targetCount: Int) {
+        self.videoIndex = videoIndex
+        self.videoName = videoName
+        self.extractedCount = extractedCount
+        self.targetCount = targetCount
+    }
+}
+
+public struct SelectFramesCheckpoint: Codable, Sendable {
+    public var groupsProcessed: Int
+    public var selectedCount: Int
+    public var manifestPath: String?
+
+    public init(groupsProcessed: Int, selectedCount: Int, manifestPath: String?) {
+        self.groupsProcessed = groupsProcessed
+        self.selectedCount = selectedCount
+        self.manifestPath = manifestPath
+    }
+}
+
+public struct SfmFeaturesCheckpoint: Codable, Sendable {
+    public var databasePath: String
+    public var imageCount: Int
+
+    public init(databasePath: String, imageCount: Int) {
+        self.databasePath = databasePath
+        self.imageCount = imageCount
+    }
+}
+
+public struct SfmMatchingCheckpoint: Codable, Sendable {
+    public var databasePath: String
+    public var expectedPairs: Int?
+    public var processedPairs: Int?
+
+    public init(databasePath: String, expectedPairs: Int?, processedPairs: Int?) {
+        self.databasePath = databasePath
+        self.expectedPairs = expectedPairs
+        self.processedPairs = processedPairs
+    }
+}
+
+public struct SfmMappingCheckpoint: Codable, Sendable {
+    public var mapper: String
+    public var sparsePath: String
+    public var registeredImages: Int?
+
+    public init(mapper: String, sparsePath: String, registeredImages: Int?) {
+        self.mapper = mapper
+        self.sparsePath = sparsePath
+        self.registeredImages = registeredImages
+    }
+}
+
+public struct TrainBrushCheckpoint: Codable, Sendable {
+    public var latestExportStep: Int?
+    public var latestExportPath: String?
+    public var progressStep: Int?
+    public var progressTotal: Int?
+    public var stepsPerSecond: Double?
+    public var resumeSnapshotPath: String?
+
+    public init(
+        latestExportStep: Int?,
+        latestExportPath: String?,
+        progressStep: Int?,
+        progressTotal: Int?,
+        stepsPerSecond: Double?,
+        resumeSnapshotPath: String?
+    ) {
+        self.latestExportStep = latestExportStep
+        self.latestExportPath = latestExportPath
+        self.progressStep = progressStep
+        self.progressTotal = progressTotal
+        self.stepsPerSecond = stepsPerSecond
+        self.resumeSnapshotPath = resumeSnapshotPath
+    }
+}
+
+public struct ExportSplatCheckpoint: Codable, Sendable {
+    public var outputPath: String
+    public var sourcePath: String
+    public var sizeBytes: Int64
+
+    public init(outputPath: String, sourcePath: String, sizeBytes: Int64) {
+        self.outputPath = outputPath
+        self.sourcePath = sourcePath
+        self.sizeBytes = sizeBytes
     }
 }
 

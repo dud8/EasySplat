@@ -8,31 +8,56 @@ public struct ReconstructionScore: Sendable {
 
 public enum ReconstructionScorer {
     public static func parseModelAnalyzerOutput(_ text: String) -> ReconstructionScore {
-        var registered = 0
-        var total = 0
+        var registered: Int?
+        var total: Int?
         var reprojection: Double?
 
-        let lines = text.split(separator: "\n")
+        let lines = text.split(separator: "\n", omittingEmptySubsequences: false)
         for line in lines {
-            if line.lowercased().contains("registered images") {
-                let numbers = line.components(separatedBy: CharacterSet.decimalDigits.inverted).compactMap(Int.init)
-                if numbers.count >= 2 {
-                    let last = numbers[numbers.count - 1]
-                    let prev = numbers[numbers.count - 2]
-                    registered = prev
-                    total = last
-                }
+            let lineText = String(line)
+            if let match = firstMatch(
+                pattern: #"registered images\s*:\s*(\d+)\s*/\s*(\d+)"#,
+                in: lineText,
+                captureCount: 2
+            ) {
+                registered = Int(match[0])
+                total = Int(match[1])
+                continue
             }
-            if line.lowercased().contains("mean reprojection error") {
-                let parts = line.components(separatedBy: CharacterSet(charactersIn: "0123456789.").inverted)
-                let values = parts.compactMap(Double.init)
-                if let value = values.last {
-                    reprojection = value
-                }
+
+            if let match = firstMatch(
+                pattern: #"registered images\s*:\s*(\d+)\b"#,
+                in: lineText,
+                captureCount: 1
+            ) {
+                registered = Int(match[0])
+            }
+
+            if !lineText.lowercased().contains("registered images"),
+               let match = firstMatch(
+                   pattern: #"(?:^|\])\s*images\s*:\s*(\d+)\b"#,
+                   in: lineText,
+                   captureCount: 1
+               ) {
+                total = Int(match[0])
+            }
+
+            if let match = firstMatch(
+                pattern: #"mean reprojection error\s*:\s*([-+]?\d*\.?\d+(?:[eE][-+]?\d+)?)"#,
+                in: lineText,
+                captureCount: 1
+            ) {
+                reprojection = Double(match[0])
             }
         }
 
-        return ReconstructionScore(registeredImages: registered, totalImages: total, meanReprojectionError: reprojection)
+        let resolvedRegistered = registered ?? 0
+        let resolvedTotal = total ?? resolvedRegistered
+        return ReconstructionScore(
+            registeredImages: resolvedRegistered,
+            totalImages: resolvedTotal,
+            meanReprojectionError: reprojection
+        )
     }
 
     public static func isAcceptable(_ score: ReconstructionScore, mode: CaptureMode) -> Bool {
@@ -55,5 +80,26 @@ public enum ReconstructionScorer {
             reprojText = "n/a"
         }
         return "registered \(score.registeredImages)/\(score.totalImages) (\(percentText)%), mean reprojection error \(reprojText)"
+    }
+
+    private static func firstMatch(pattern: String, in text: String, captureCount: Int) -> [String]? {
+        guard let regex = try? NSRegularExpression(pattern: pattern, options: [.caseInsensitive]) else {
+            return nil
+        }
+        let range = NSRange(text.startIndex..<text.endIndex, in: text)
+        guard let match = regex.firstMatch(in: text, options: [], range: range) else {
+            return nil
+        }
+        var captures: [String] = []
+        captures.reserveCapacity(captureCount)
+        for index in 1...captureCount {
+            let captureRange = match.range(at: index)
+            guard captureRange.location != NSNotFound,
+                  let swiftRange = Range(captureRange, in: text) else {
+                return nil
+            }
+            captures.append(String(text[swiftRange]))
+        }
+        return captures
     }
 }

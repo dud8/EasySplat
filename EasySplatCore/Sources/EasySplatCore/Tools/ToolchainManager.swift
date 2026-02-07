@@ -7,23 +7,40 @@ public struct ToolchainPaths: Sendable {
     public var glomap: URL
     public var brush: URL
     public var vggt: VggtToolchain
+    public var fastvggt: FastVggtToolchain
 
     public init(
         root: URL,
         colmap: URL,
         glomap: URL,
         brush: URL,
-        vggt: VggtToolchain
+        vggt: VggtToolchain,
+        fastvggt: FastVggtToolchain
     ) {
         self.root = root
         self.colmap = colmap
         self.glomap = glomap
         self.brush = brush
         self.vggt = vggt
+        self.fastvggt = fastvggt
     }
 }
 
 public struct VggtToolchain: Sendable {
+    public var root: URL
+    public var sfmTool: URL
+    public var python: URL
+    public var models: URL
+
+    public init(root: URL, sfmTool: URL, python: URL, models: URL) {
+        self.root = root
+        self.sfmTool = sfmTool
+        self.python = python
+        self.models = models
+    }
+}
+
+public struct FastVggtToolchain: Sendable {
     public var root: URL
     public var sfmTool: URL
     public var python: URL
@@ -101,9 +118,11 @@ public final class ToolchainManager: @unchecked Sendable, ToolchainManaging {
 
     private let fileManager = FileManager.default
     private let runner: SubprocessRunning
+    private let urlSession: URLSession
 
-    public init(runner: SubprocessRunning = SubprocessRunner()) {
+    public init(runner: SubprocessRunning = SubprocessRunner(), urlSession: URLSession = .shared) {
         self.runner = runner
+        self.urlSession = urlSession
     }
 
     public func toolchainRoot() -> URL {
@@ -283,7 +302,52 @@ public final class ToolchainManager: @unchecked Sendable, ToolchainManaging {
             models: vggtModels
         )
 
-        return ToolchainPaths(root: root, colmap: colmap, glomap: glomap, brush: brush, vggt: vggt)
+        let fastvggtRoot = root.appendingPathComponent("fastvggt_mps", isDirectory: true)
+        let fastvggtSfmTool = fastvggtRoot.appendingPathComponent("bin/easysplat_fastvggt_sfm")
+        let fastvggtPython = fastvggtRoot.appendingPathComponent("python/bin/python3")
+        let fastvggtModels = fastvggtRoot.appendingPathComponent("models", isDirectory: true)
+        let fastvggtModelFile = fastvggtModels.appendingPathComponent("fastvggt_model.pt")
+        let fastvggtVendorSentinel = fastvggtRoot.appendingPathComponent("vendor/fastvggt/vggt/models/vggt.py")
+
+        guard fileManager.fileExists(atPath: fastvggtSfmTool.path) else {
+            throw ToolchainError.missingBinary("fastvggt_mps/bin/easysplat_fastvggt_sfm")
+        }
+        guard fileManager.fileExists(atPath: fastvggtPython.path) else {
+            throw ToolchainError.missingBinary("fastvggt_mps/python/bin/python3")
+        }
+        guard fileManager.fileExists(atPath: fastvggtModels.path) else {
+            throw ToolchainError.missingLibrary("fastvggt_mps/models")
+        }
+        guard fileManager.fileExists(atPath: fastvggtModelFile.path) else {
+            throw ToolchainError.missingLibrary("fastvggt_mps/models/fastvggt_model.pt")
+        }
+        guard fileManager.fileExists(atPath: fastvggtVendorSentinel.path) else {
+            throw ToolchainError.missingLibrary("fastvggt_mps/vendor/fastvggt")
+        }
+
+        ensureExecutable(at: fastvggtSfmTool)
+        ensureExecutable(at: fastvggtPython)
+
+        let fastvggtPythonArch = try? runner.run("/usr/bin/file", [fastvggtPython.path])
+        if let output = fastvggtPythonArch?.stdout.lowercased(), !output.contains("arm64") {
+            throw ToolchainError.invalidToolchain("fastvggt_mps python is not arm64 (Rosetta build detected).")
+        }
+
+        let fastvggt = FastVggtToolchain(
+            root: fastvggtRoot,
+            sfmTool: fastvggtSfmTool,
+            python: fastvggtPython,
+            models: fastvggtModels
+        )
+
+        return ToolchainPaths(
+            root: root,
+            colmap: colmap,
+            glomap: glomap,
+            brush: brush,
+            vggt: vggt,
+            fastvggt: fastvggt
+        )
     }
 
     private func ensureExecutable(at url: URL) {
@@ -409,7 +473,7 @@ public final class ToolchainManager: @unchecked Sendable, ToolchainManaging {
     }
 
     private func downloadManifest(url: URL) async throws -> ToolchainManifest {
-        let (data, response) = try await URLSession.shared.data(from: url)
+        let (data, response) = try await urlSession.data(from: url)
         guard (response as? HTTPURLResponse)?.statusCode == 200 else { throw ToolchainError.downloadFailed }
         let decoder = JSONDecoder()
         decoder.dateDecodingStrategy = .iso8601
@@ -452,7 +516,7 @@ public final class ToolchainManager: @unchecked Sendable, ToolchainManaging {
         if fileManager.fileExists(atPath: destination.path) {
             try? fileManager.removeItem(at: destination)
         }
-        let (data, response) = try await URLSession.shared.data(from: url)
+        let (data, response) = try await urlSession.data(from: url)
         guard (response as? HTTPURLResponse)?.statusCode == 200 else { throw ToolchainError.downloadFailed }
         try data.write(to: destination, options: [.atomic])
         onProgress(1.0, "\(label) downloaded")
@@ -596,20 +660,57 @@ public final class ToolchainManager: @unchecked Sendable, ToolchainManaging {
         guard computedHash.lowercased() == expectedSha else {
             throw ToolchainError.hashMismatch
         }
+        onProgress(-1.0, "Verified download integrity (\(artifactLabel(for: name)))")
 
-        if name.hasSuffix("-core") {
-            onProgress(-1.0, "Unpacking tools (core)")
-        } else if name.hasSuffix("-models") {
-            onProgress(-1.0, "Unpacking tools (models)")
-        } else {
-            onProgress(-1.0, "Unpacking tools")
-        }
+        let unpackMessage = unpackingMessage(for: name)
+        onProgress(-1.0, unpackMessage)
 
         try unzip(zipURL: zipURL, to: root)
         try? fileManager.removeItem(at: zipURL)
+        let contentsCheck = expectedContentsCheck(artifact: artifact, root: root)
+        onProgress(
+            -1.0,
+            "\(unpackMessage): found \(contentsCheck.found)/\(contentsCheck.expected) expected files"
+        )
 
         state.installedArtifacts[name] = artifact.sha256
         try? saveInstallState(state, root: root)
+    }
+
+    private func artifactLabel(for name: String) -> String {
+        if name.hasSuffix("-core") { return "core" }
+        if name.hasSuffix("-models") { return "models" }
+        return name
+    }
+
+    private func unpackingMessage(for name: String) -> String {
+        if name.hasSuffix("-core") { return "Unpacking tools (core)" }
+        if name.hasSuffix("-models") { return "Unpacking tools (models)" }
+        return "Unpacking tools"
+    }
+
+    private func expectedContentsCheck(
+        artifact: ToolchainManifest.Artifact,
+        root: URL
+    ) -> (found: Int, expected: Int) {
+        var expected = 0
+        var found = 0
+        for rawPath in artifact.contents {
+            var normalized = rawPath.trimmingCharacters(in: .whitespacesAndNewlines)
+            while normalized.hasPrefix("/") {
+                normalized.removeFirst()
+            }
+            while normalized.hasSuffix("/") {
+                normalized.removeLast()
+            }
+            guard !normalized.isEmpty else { continue }
+            expected += 1
+            let expectedURL = root.appendingPathComponent(normalized)
+            if fileManager.fileExists(atPath: expectedURL.path) {
+                found += 1
+            }
+        }
+        return (found, expected)
     }
 
     private func artifactLooksInstalled(name: String, root: URL) -> Bool {
@@ -634,6 +735,10 @@ public final class ToolchainManager: @unchecked Sendable, ToolchainManaging {
         let vggtPython = vggt.appendingPathComponent("python/bin/python3")
         // Upstream VGGT uses namespace packages (no __init__.py). Validate via a stable module file.
         let vggtVendorSentinel = vggt.appendingPathComponent("vendor/vggt/vggt/models/vggt.py")
+        let fastvggt = root.appendingPathComponent("fastvggt_mps", isDirectory: true)
+        let fastvggtSfmTool = fastvggt.appendingPathComponent("bin/easysplat_fastvggt_sfm")
+        let fastvggtPython = fastvggt.appendingPathComponent("python/bin/python3")
+        let fastvggtVendorSentinel = fastvggt.appendingPathComponent("vendor/fastvggt/vggt/models/vggt.py")
 
         let brushOK: Bool = {
             guard fileManager.isExecutableFile(atPath: brush.path) else { return false }
@@ -651,12 +756,18 @@ public final class ToolchainManager: @unchecked Sendable, ToolchainManaging {
             && fileManager.fileExists(atPath: vggtSfmTool.path)
             && fileManager.fileExists(atPath: vggtPython.path)
             && fileManager.fileExists(atPath: vggtVendorSentinel.path)
+            && fileManager.fileExists(atPath: fastvggtSfmTool.path)
+            && fileManager.fileExists(atPath: fastvggtPython.path)
+            && fileManager.fileExists(atPath: fastvggtVendorSentinel.path)
     }
 
     private func modelsToolchainLooksInstalled(root: URL) -> Bool {
-        let model = root
+        let vggtModel = root
             .appendingPathComponent("vggt_mps/models/vggt_model.pt")
-        return fileManager.fileExists(atPath: model.path)
+        let fastvggtModel = root
+            .appendingPathComponent("fastvggt_mps/models/fastvggt_model.pt")
+        return fileManager.fileExists(atPath: vggtModel.path)
+            && fileManager.fileExists(atPath: fastvggtModel.path)
     }
 }
 
@@ -680,6 +791,15 @@ extension ToolchainManager {
 
     func test_sha256Hex(url: URL) throws -> String {
         try sha256Hex(url: url)
+    }
+
+    func test_ensureArtifact(
+        _ artifact: ToolchainManifest.Artifact,
+        root: URL,
+        onProgress: @escaping @Sendable (Double, String) -> Void
+    ) async throws {
+        var state = ToolchainInstallState()
+        try await ensureArtifact(artifact, root: root, state: &state, onProgress: onProgress)
     }
 }
 #endif

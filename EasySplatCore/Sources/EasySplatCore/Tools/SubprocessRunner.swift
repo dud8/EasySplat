@@ -122,7 +122,17 @@ public final class SubprocessRunner: @unchecked Sendable, SubprocessRunning, Pse
             stderrLines.append(text).forEach { line in onStderr(line) }
         }
 
-        try process.run()
+        do {
+            try process.run()
+        } catch {
+            stdoutPipe.fileHandleForReading.readabilityHandler = nil
+            stderrPipe.fileHandleForReading.readabilityHandler = nil
+            try? stdoutPipe.fileHandleForReading.close()
+            try? stderrPipe.fileHandleForReading.close()
+            try? stdoutPipe.fileHandleForWriting.close()
+            try? stderrPipe.fileHandleForWriting.close()
+            throw error
+        }
         process.waitUntilExit()
 
         stdoutPipe.fileHandleForReading.readabilityHandler = nil
@@ -143,6 +153,11 @@ public final class SubprocessRunner: @unchecked Sendable, SubprocessRunning, Pse
         if let remaining = stderrLines.flush() {
             onStderr(remaining)
         }
+
+        try? stdoutPipe.fileHandleForReading.close()
+        try? stderrPipe.fileHandleForReading.close()
+        try? stdoutPipe.fileHandleForWriting.close()
+        try? stderrPipe.fileHandleForWriting.close()
 
         return SubprocessResult(
             exitCode: process.terminationStatus,
@@ -200,7 +215,17 @@ public final class SubprocessRunner: @unchecked Sendable, SubprocessRunning, Pse
             stderrLines.append(text).forEach { line in onStderr(line) }
         }
 
-        try process.run()
+        do {
+            try process.run()
+        } catch {
+            stdoutPipe.fileHandleForReading.readabilityHandler = nil
+            stderrPipe.fileHandleForReading.readabilityHandler = nil
+            try? stdoutPipe.fileHandleForReading.close()
+            try? stderrPipe.fileHandleForReading.close()
+            try? stdoutPipe.fileHandleForWriting.close()
+            try? stderrPipe.fileHandleForWriting.close()
+            throw error
+        }
 
         let result = try await withTaskCancellationHandler(operation: {
             try await withCheckedThrowingContinuation { continuation in
@@ -223,6 +248,10 @@ public final class SubprocessRunner: @unchecked Sendable, SubprocessRunning, Pse
                     if let remaining = stderrLines.flush() {
                         onStderr(remaining)
                     }
+                    try? stdoutPipe.fileHandleForReading.close()
+                    try? stderrPipe.fileHandleForReading.close()
+                    try? stdoutPipe.fileHandleForWriting.close()
+                    try? stderrPipe.fileHandleForWriting.close()
                     continuation.resume(returning: SubprocessResult(
                         exitCode: proc.terminationStatus,
                         terminationReason: proc.terminationReason,
@@ -293,7 +322,17 @@ public final class SubprocessRunner: @unchecked Sendable, SubprocessRunning, Pse
             stderrLines.append(text).forEach { line in onStderr(line) }
         }
 
-        try process.run()
+        do {
+            try process.run()
+        } catch {
+            stdoutTTY.masterHandle.readabilityHandler = nil
+            stderrTTY.masterHandle.readabilityHandler = nil
+            stdoutTTY.masterHandle.closeFile()
+            stderrTTY.masterHandle.closeFile()
+            stdoutTTY.slaveHandle.closeFile()
+            stderrTTY.slaveHandle.closeFile()
+            throw error
+        }
         stdoutTTY.slaveHandle.closeFile()
         stderrTTY.slaveHandle.closeFile()
 

@@ -21,7 +21,15 @@ final class PipelineRunnerImageFilteringTests: XCTestCase {
         defer { try? FileManager.default.removeItem(at: projectURL) }
 
         let vggt = try TestToolchains.vggtToolchain(root: projectURL)
-        let toolchain = ToolchainPaths(root: projectURL, colmap: projectURL, glomap: projectURL, brush: projectURL, vggt: vggt)
+        let fastvggt = try TestToolchains.fastVggtToolchain(root: projectURL)
+        let toolchain = ToolchainPaths(
+            root: projectURL,
+            colmap: projectURL,
+            glomap: projectURL,
+            brush: projectURL,
+            vggt: vggt,
+            fastvggt: fastvggt
+        )
         let config = PipelineRunner.PipelineConfig(toolchain: toolchain, preset: PresetSpec(mode: .object, quality: .standard))
         let runner = PipelineRunner(projectURL: projectURL, config: config)
 
@@ -45,7 +53,15 @@ final class PipelineRunnerImageFilteringTests: XCTestCase {
         defer { try? FileManager.default.removeItem(at: projectURL) }
 
         let vggt = try TestToolchains.vggtToolchain(root: projectURL)
-        let toolchain = ToolchainPaths(root: projectURL, colmap: projectURL, glomap: projectURL, brush: projectURL, vggt: vggt)
+        let fastvggt = try TestToolchains.fastVggtToolchain(root: projectURL)
+        let toolchain = ToolchainPaths(
+            root: projectURL,
+            colmap: projectURL,
+            glomap: projectURL,
+            brush: projectURL,
+            vggt: vggt,
+            fastvggt: fastvggt
+        )
         let config = PipelineRunner.PipelineConfig(toolchain: toolchain, preset: PresetSpec(mode: .object, quality: .standard))
         let runner = PipelineRunner(projectURL: projectURL, config: config)
 

@@ -1,10 +1,26 @@
 import Foundation
 
 final class MockURLProtocol: URLProtocol {
-    nonisolated(unsafe) static var requestHandler: ((URLRequest) throws -> (HTTPURLResponse, Data))?
+    typealias Handler = @Sendable (URLRequest) throws -> (HTTPURLResponse, Data)
+
+    private static let tokenQueryItem = "easysplat_test_token"
+    nonisolated(unsafe) private static var handlers: [String: Handler] = [:]
+    private static let lock = NSLock()
+
+    static func register(token: String, handler: @escaping Handler) {
+        lock.lock()
+        handlers[token] = handler
+        lock.unlock()
+    }
+
+    static func unregister(token: String) {
+        lock.lock()
+        handlers.removeValue(forKey: token)
+        lock.unlock()
+    }
 
     override class func canInit(with request: URLRequest) -> Bool {
-        true
+        return token(for: request) != nil
     }
 
     override class func canonicalRequest(for request: URLRequest) -> URLRequest {
@@ -12,7 +28,7 @@ final class MockURLProtocol: URLProtocol {
     }
 
     override func startLoading() {
-        guard let handler = MockURLProtocol.requestHandler else {
+        guard let handler = Self.handler(for: request) else {
             client?.urlProtocol(self, didFailWithError: URLError(.unsupportedURL))
             return
         }
@@ -29,5 +45,23 @@ final class MockURLProtocol: URLProtocol {
     }
 
     override func stopLoading() {
+    }
+
+    private static func handler(for request: URLRequest) -> Handler? {
+        guard let token = token(for: request) else {
+            return nil
+        }
+        lock.lock()
+        let handler = handlers[token]
+        lock.unlock()
+        return handler
+    }
+
+    private static func token(for request: URLRequest) -> String? {
+        guard let url = request.url,
+              let components = URLComponents(url: url, resolvingAgainstBaseURL: false) else {
+            return nil
+        }
+        return components.queryItems?.first(where: { $0.name == tokenQueryItem })?.value
     }
 }
