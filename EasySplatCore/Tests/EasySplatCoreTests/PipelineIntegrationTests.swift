@@ -8,7 +8,7 @@ import SQLite3
 
 final class PipelineIntegrationTests: XCTestCase {
 
-    func testPipelineSuccessWithGlomap() async throws {
+    func testPipelineSuccessWithGlobalMapper() async throws {
         let restore = await scopedEnvironment([
             "EASYSPLAT_SFM_BACKEND": "colmap",
             "EASYSPLAT_SFM_MAPPER": nil,
@@ -40,7 +40,7 @@ final class PipelineIntegrationTests: XCTestCase {
                 runStartProbe.record(observed: loaded?.lastRunStartedAt != nil)
             }),
             .init(path: toolchain.colmap.path, argsPrefix: ["exhaustive_matcher"], result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""), onRun: nil),
-            .init(path: toolchain.glomap.path, argsPrefix: ["mapper"], result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""), onRun: { _ in try? self.writeSparseModel(at: projectURL) }),
+            .init(path: toolchain.colmap.path, argsPrefix: ["global_mapper"], result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""), onRun: { _ in try? self.writeSparseModel(at: projectURL) }),
             .init(path: toolchain.colmap.path, argsPrefix: ["model_analyzer"], result: .init(exitCode: 0, terminationReason: .exit, stdout: "Registered images: 10 / 10\nMean reprojection error: 1.0\n", stderr: ""), onRun: nil),
             .init(path: toolchain.brush.path, argsPrefix: [], result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""), onRun: { args in
                 guard let datasetArg = args.last else { return }
@@ -139,7 +139,7 @@ final class PipelineIntegrationTests: XCTestCase {
         let runner = MockSubprocessRunner(scripts: [
             .init(path: toolchain.colmap.path, argsPrefix: ["feature_extractor"], result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""), onRun: nil),
             .init(path: toolchain.colmap.path, argsPrefix: ["exhaustive_matcher"], result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""), onRun: nil),
-            .init(path: toolchain.glomap.path, argsPrefix: ["mapper"], result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""), onRun: { _ in try? self.writeSparseModel(at: projectURL) }),
+            .init(path: toolchain.colmap.path, argsPrefix: ["global_mapper"], result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""), onRun: { _ in try? self.writeSparseModel(at: projectURL) }),
             .init(path: toolchain.colmap.path, argsPrefix: ["model_analyzer"], result: .init(exitCode: 0, terminationReason: .exit, stdout: "Registered images: 10 / 10\nMean reprojection error: 1.0\n", stderr: ""), onRun: nil),
             .init(path: toolchain.brush.path, argsPrefix: [], result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""), onRun: nil)
         ])
@@ -219,7 +219,7 @@ final class PipelineIntegrationTests: XCTestCase {
 
     func testPipelineCancellationDoesNotFallbackBetweenBackends() async throws {
         let restore = await scopedEnvironment([
-            "EASYSPLAT_SFM_BACKEND": nil,
+            "EASYSPLAT_SFM_BACKEND": "fastvggt",
             "EASYSPLAT_SFM_MAPPER": nil,
             "EASYSPLAT_SKIP_TRAINING": "1"
         ])
@@ -259,17 +259,14 @@ final class PipelineIntegrationTests: XCTestCase {
         XCTAssertEqual(callPaths.filter { $0 == toolchain.fastvggt.sfmTool.path }.count, 1)
         XCTAssertFalse(callPaths.contains(toolchain.vggt.sfmTool.path))
         XCTAssertFalse(callPaths.contains(toolchain.colmap.path))
-        XCTAssertFalse(callPaths.contains(toolchain.glomap.path))
         let interruptedMetadata = try ProjectMetadataStore.load(from: paths.metadataURL)
         XCTAssertNotNil(interruptedMetadata.lastRunStartedAt, "Cancellation should preserve lastRunStartedAt for crash/interruption detection.")
     }
 
-    func testPipelineFallsBackFromFastVggtToColmapByDefault() async throws {
+    func testPipelineDefaultsToColmapGlobalMapperWhenBackendUnset() async throws {
         let restore = await scopedEnvironment([
             "EASYSPLAT_SFM_BACKEND": nil,
             "EASYSPLAT_SFM_MAPPER": nil,
-            "EASYSPLAT_FASTVGGT_FULL_COVERAGE": nil,
-            "EASYSPLAT_FASTVGGT_NO_FALLBACK": nil,
             "EASYSPLAT_SKIP_TRAINING": "1"
         ])
         defer { restore() }
@@ -292,10 +289,9 @@ final class PipelineIntegrationTests: XCTestCase {
         let toolchain = try makeToolchain(root: temp, createVggtFiles: true)
 
         let runner = MockSubprocessRunner(scripts: [
-            .init(path: toolchain.fastvggt.sfmTool.path, argsPrefix: ["--images"], result: .init(exitCode: 1, terminationReason: .exit, stdout: "", stderr: "fastvggt failed"), onRun: nil),
             .init(path: toolchain.colmap.path, argsPrefix: ["feature_extractor"], result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""), onRun: nil),
             .init(path: toolchain.colmap.path, argsPrefix: ["exhaustive_matcher"], result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""), onRun: nil),
-            .init(path: toolchain.glomap.path, argsPrefix: ["mapper"], result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""), onRun: { _ in try? self.writeSparseModel(at: projectURL) }),
+            .init(path: toolchain.colmap.path, argsPrefix: ["global_mapper"], result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""), onRun: { _ in try? self.writeSparseModel(at: projectURL) }),
             .init(path: toolchain.colmap.path, argsPrefix: ["model_analyzer"], result: .init(exitCode: 0, terminationReason: .exit, stdout: "Registered images: 10 / 10\nMean reprojection error: 1.0\n", stderr: ""), onRun: nil)
         ])
 
@@ -308,15 +304,15 @@ final class PipelineIntegrationTests: XCTestCase {
         try await pipeline.run { _ in }
 
         let callPaths = runner.calls.map { $0.0 }
-        XCTAssertTrue(callPaths.contains(toolchain.fastvggt.sfmTool.path))
+        XCTAssertFalse(callPaths.contains(toolchain.fastvggt.sfmTool.path))
         XCTAssertFalse(callPaths.contains(toolchain.vggt.sfmTool.path))
         XCTAssertTrue(callPaths.contains(toolchain.colmap.path))
-        XCTAssertTrue(callPaths.contains(toolchain.glomap.path))
+        XCTAssertTrue(runner.calls.contains(where: { $0.0 == toolchain.colmap.path && $0.1.first == "global_mapper" }))
     }
 
     func testPipelineFastVggtRefinementFallsBackToMapperPath() async throws {
         let restore = await scopedEnvironment([
-            "EASYSPLAT_SFM_BACKEND": nil,
+            "EASYSPLAT_SFM_BACKEND": "fastvggt",
             "EASYSPLAT_SFM_MAPPER": nil,
             "EASYSPLAT_FASTVGGT_FULL_COVERAGE": "0",
             "EASYSPLAT_FASTVGGT_NO_FALLBACK": "0",
@@ -349,7 +345,7 @@ final class PipelineIntegrationTests: XCTestCase {
             .init(path: toolchain.colmap.path, argsPrefix: ["feature_extractor"], result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""), onRun: nil),
             .init(path: toolchain.colmap.path, argsPrefix: ["exhaustive_matcher"], result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""), onRun: nil),
             .init(path: toolchain.colmap.path, argsPrefix: ["point_triangulator"], result: .init(exitCode: 1, terminationReason: .exit, stdout: "", stderr: "triangulator failed"), onRun: nil),
-            .init(path: toolchain.glomap.path, argsPrefix: ["mapper"], result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""), onRun: { _ in try? self.writeSparseModel(at: projectURL) }),
+            .init(path: toolchain.colmap.path, argsPrefix: ["global_mapper"], result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""), onRun: { _ in try? self.writeSparseModel(at: projectURL) }),
             .init(path: toolchain.colmap.path, argsPrefix: ["model_analyzer"], result: .init(exitCode: 0, terminationReason: .exit, stdout: "Registered images: 10 / 10\nMean reprojection error: 1.0\n", stderr: ""), onRun: nil)
         ])
 
@@ -366,15 +362,13 @@ final class PipelineIntegrationTests: XCTestCase {
         XCTAssertFalse(callPaths.contains(toolchain.vggt.sfmTool.path))
         XCTAssertTrue(runner.calls.contains(where: { $0.0 == toolchain.colmap.path && $0.1.first == "point_triangulator" }))
         XCTAssertTrue(callPaths.contains(toolchain.colmap.path))
-        XCTAssertTrue(callPaths.contains(toolchain.glomap.path))
+        XCTAssertTrue(runner.calls.contains(where: { $0.0 == toolchain.colmap.path && $0.1.first == "global_mapper" }))
     }
 
     func testPipelineIgnoresDeprecatedGraceFallbackEnv() async throws {
         let restore = await scopedEnvironment([
             "EASYSPLAT_SFM_BACKEND": nil,
             "EASYSPLAT_SFM_MAPPER": nil,
-            "EASYSPLAT_FASTVGGT_FULL_COVERAGE": "0",
-            "EASYSPLAT_FASTVGGT_NO_FALLBACK": "0",
             "EASYSPLAT_ENABLE_VGGT_GRACE_FALLBACK": "1",
             "EASYSPLAT_SKIP_TRAINING": "1"
         ])
@@ -398,10 +392,9 @@ final class PipelineIntegrationTests: XCTestCase {
         let toolchain = try makeToolchain(root: temp, createVggtFiles: true)
 
         let runner = MockSubprocessRunner(scripts: [
-            .init(path: toolchain.fastvggt.sfmTool.path, argsPrefix: ["--images"], result: .init(exitCode: 1, terminationReason: .exit, stdout: "", stderr: "fastvggt failed"), onRun: nil),
             .init(path: toolchain.colmap.path, argsPrefix: ["feature_extractor"], result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""), onRun: nil),
             .init(path: toolchain.colmap.path, argsPrefix: ["exhaustive_matcher"], result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""), onRun: nil),
-            .init(path: toolchain.glomap.path, argsPrefix: ["mapper"], result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""), onRun: { _ in try? self.writeSparseModel(at: projectURL) }),
+            .init(path: toolchain.colmap.path, argsPrefix: ["global_mapper"], result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""), onRun: { _ in try? self.writeSparseModel(at: projectURL) }),
             .init(path: toolchain.colmap.path, argsPrefix: ["model_analyzer"], result: .init(exitCode: 0, terminationReason: .exit, stdout: "Registered images: 10 / 10\nMean reprojection error: 1.0\n", stderr: ""), onRun: nil)
         ])
 
@@ -414,15 +407,15 @@ final class PipelineIntegrationTests: XCTestCase {
         try await pipeline.run { _ in }
 
         let callPaths = runner.calls.map { $0.0 }
-        XCTAssertTrue(callPaths.contains(toolchain.fastvggt.sfmTool.path))
+        XCTAssertFalse(callPaths.contains(toolchain.fastvggt.sfmTool.path))
         XCTAssertFalse(callPaths.contains(toolchain.vggt.sfmTool.path))
         XCTAssertTrue(callPaths.contains(toolchain.colmap.path))
-        XCTAssertTrue(callPaths.contains(toolchain.glomap.path))
+        XCTAssertTrue(runner.calls.contains(where: { $0.0 == toolchain.colmap.path && $0.1.first == "global_mapper" }))
     }
 
     func testPipelineFastVggtRefinementSuccessRunsTriangulatorAndBA() async throws {
         let restore = await scopedEnvironment([
-            "EASYSPLAT_SFM_BACKEND": nil,
+            "EASYSPLAT_SFM_BACKEND": "fastvggt",
             "EASYSPLAT_SFM_MAPPER": nil,
             "EASYSPLAT_FASTVGGT_FULL_COVERAGE": "0",
             "EASYSPLAT_FASTVGGT_NO_FALLBACK": "0",
@@ -476,7 +469,7 @@ final class PipelineIntegrationTests: XCTestCase {
 
         XCTAssertTrue(runner.calls.contains(where: { $0.0 == toolchain.colmap.path && $0.1.first == "point_triangulator" }))
         XCTAssertTrue(runner.calls.contains(where: { $0.0 == toolchain.colmap.path && $0.1.first == "bundle_adjuster" }))
-        XCTAssertFalse(runner.calls.contains(where: { $0.0 == toolchain.glomap.path && $0.1.first == "mapper" }))
+        XCTAssertFalse(runner.calls.contains(where: { $0.0 == toolchain.colmap.path && $0.1.first == "global_mapper" }))
         XCTAssertFalse(runner.calls.contains(where: { $0.0 == toolchain.colmap.path && $0.1.first == "mapper" }))
         let featureExtractorArgs = runner.calls.first(where: { $0.0 == toolchain.colmap.path && $0.1.first == "feature_extractor" })?.1
         XCTAssertEqual(self.value(for: "--ImageReader.single_camera", in: featureExtractorArgs ?? []), "0")
@@ -485,7 +478,7 @@ final class PipelineIntegrationTests: XCTestCase {
 
     func testPipelineFastVggtMatchingEmitsPairProgressHeartbeat() async throws {
         let restore = await scopedEnvironment([
-            "EASYSPLAT_SFM_BACKEND": nil,
+            "EASYSPLAT_SFM_BACKEND": "fastvggt",
             "EASYSPLAT_SFM_MAPPER": nil,
             "EASYSPLAT_FASTVGGT_FULL_COVERAGE": "0",
             "EASYSPLAT_FASTVGGT_NO_FALLBACK": "0",
@@ -579,7 +572,7 @@ final class PipelineIntegrationTests: XCTestCase {
 
     func testPipelineFastVggtStrictCoverageSkipsExternalMatcherAndMapper() async throws {
         let restore = await scopedEnvironment([
-            "EASYSPLAT_SFM_BACKEND": nil,
+            "EASYSPLAT_SFM_BACKEND": "fastvggt",
             "EASYSPLAT_SFM_MAPPER": nil,
             "EASYSPLAT_FASTVGGT_FULL_COVERAGE": "1",
             "EASYSPLAT_SKIP_TRAINING": "1"
@@ -653,8 +646,8 @@ final class PipelineIntegrationTests: XCTestCase {
         XCTAssertFalse(allCalls.contains(where: { $0.0 == toolchain.colmap.path && $0.1.first == "sequential_matcher" }))
         XCTAssertFalse(allCalls.contains(where: { $0.0 == toolchain.colmap.path && $0.1.first == "point_triangulator" }))
         XCTAssertFalse(allCalls.contains(where: { $0.0 == toolchain.colmap.path && $0.1.first == "bundle_adjuster" }))
+        XCTAssertFalse(allCalls.contains(where: { $0.0 == toolchain.colmap.path && $0.1.first == "global_mapper" }))
         XCTAssertFalse(allCalls.contains(where: { $0.0 == toolchain.colmap.path && $0.1.first == "mapper" }))
-        XCTAssertFalse(allCalls.contains(where: { $0.0 == toolchain.glomap.path && $0.1.first == "mapper" }))
 
         let logs = sink.snapshot().compactMap { event -> String? in
             guard case let .stageLog(_, line, _) = event else { return nil }
@@ -666,7 +659,7 @@ final class PipelineIntegrationTests: XCTestCase {
 
     func testPipelineFastVggtAllowsSeedFallbackWhenRefinementNotRequired() async throws {
         let restore = await scopedEnvironment([
-            "EASYSPLAT_SFM_BACKEND": nil,
+            "EASYSPLAT_SFM_BACKEND": "fastvggt",
             "EASYSPLAT_SFM_MAPPER": nil,
             "EASYSPLAT_FASTVGGT_REQUIRE_REFINED_MODEL": "0",
             "EASYSPLAT_SKIP_TRAINING": "1"
@@ -698,7 +691,7 @@ final class PipelineIntegrationTests: XCTestCase {
             .init(path: toolchain.colmap.path, argsPrefix: ["feature_extractor"], result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""), onRun: nil),
             .init(path: toolchain.colmap.path, argsPrefix: ["exhaustive_matcher"], result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""), onRun: nil),
             .init(path: toolchain.colmap.path, argsPrefix: ["point_triangulator"], result: .init(exitCode: 1, terminationReason: .exit, stdout: "", stderr: "triangulator failed"), onRun: nil),
-            .init(path: toolchain.glomap.path, argsPrefix: ["mapper"], result: .init(exitCode: 1, terminationReason: .exit, stdout: "", stderr: "glomap failed"), onRun: nil),
+            .init(path: toolchain.colmap.path, argsPrefix: ["global_mapper"], result: .init(exitCode: 1, terminationReason: .exit, stdout: "", stderr: "global_mapper failed"), onRun: nil),
             .init(path: toolchain.colmap.path, argsPrefix: ["mapper"], result: .init(exitCode: 1, terminationReason: .exit, stdout: "", stderr: "colmap failed"), onRun: nil)
         ])
 
@@ -871,7 +864,7 @@ final class PipelineIntegrationTests: XCTestCase {
         let runner = MockSubprocessRunner(scripts: [
             .init(path: toolchain.colmap.path, argsPrefix: ["feature_extractor"], result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""), onRun: nil),
             .init(path: toolchain.colmap.path, argsPrefix: ["exhaustive_matcher"], result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""), onRun: nil),
-            .init(path: toolchain.glomap.path, argsPrefix: ["mapper"], result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""), onRun: { _ in try? self.writeSparseModel(at: projectURL) }),
+            .init(path: toolchain.colmap.path, argsPrefix: ["global_mapper"], result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""), onRun: { _ in try? self.writeSparseModel(at: projectURL) }),
             .init(path: toolchain.colmap.path, argsPrefix: ["model_analyzer"], result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: "Registered images: 10 / 10\nMean reprojection error: 1.0\n"), onRun: nil),
             .init(path: toolchain.brush.path, argsPrefix: [], result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""), onRun: { args in
                 guard let datasetArg = args.last else { return }
@@ -894,7 +887,7 @@ final class PipelineIntegrationTests: XCTestCase {
         XCTAssertTrue(FileManager.default.fileExists(atPath: output.path))
     }
 
-    func testPipelineGlomapFallbackToColmap() async throws {
+    func testPipelineGlobalMapperFallbackToColmap() async throws {
         let restore = await scopedEnvironment([
             "EASYSPLAT_SFM_BACKEND": "colmap",
             "EASYSPLAT_SFM_MAPPER": nil,
@@ -921,7 +914,7 @@ final class PipelineIntegrationTests: XCTestCase {
         let runner = MockSubprocessRunner(scripts: [
             .init(path: toolchain.colmap.path, argsPrefix: ["feature_extractor"], result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""), onRun: nil),
             .init(path: toolchain.colmap.path, argsPrefix: ["exhaustive_matcher"], result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""), onRun: nil),
-            .init(path: toolchain.glomap.path, argsPrefix: ["mapper"], result: .init(exitCode: 1, terminationReason: .exit, stdout: "", stderr: "fail"), onRun: nil),
+            .init(path: toolchain.colmap.path, argsPrefix: ["global_mapper"], result: .init(exitCode: 1, terminationReason: .exit, stdout: "", stderr: "fail"), onRun: nil),
             .init(path: toolchain.colmap.path, argsPrefix: ["mapper"], result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""), onRun: { _ in try? self.writeSparseModel(at: projectURL) }),
             .init(path: toolchain.colmap.path, argsPrefix: ["model_analyzer"], result: .init(exitCode: 0, terminationReason: .exit, stdout: "Registered images: 10 / 10\nMean reprojection error: 1.0\n", stderr: ""), onRun: nil),
             .init(path: toolchain.brush.path, argsPrefix: [], result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""), onRun: { args in
@@ -944,7 +937,7 @@ final class PipelineIntegrationTests: XCTestCase {
         XCTAssertTrue(FileManager.default.fileExists(atPath: output.path))
     }
 
-    func testPipelineDisablesGlomapAfterDyldMissingOpenSSL() async throws {
+    func testPipelineDisablesGlobalMapperAfterMissingCommand() async throws {
         let restore = await scopedEnvironment([
             "EASYSPLAT_SFM_BACKEND": "colmap",
             "EASYSPLAT_SFM_MAPPER": nil,
@@ -969,20 +962,17 @@ final class PipelineIntegrationTests: XCTestCase {
 
         let toolchain = try makeToolchain(root: temp)
 
-        let dyldError = """
-        dyld: Library not loaded: @rpath/libcrypto.3.dylib
-          Reason: no LC_RPATH's found
-        """
+        let missingCommandError = "ERROR: command `global_mapper` not recognized. To list all commands, run `colmap help`."
 
         let runner = MockSubprocessRunner(scripts: [
             // Attempt 1
             .init(path: toolchain.colmap.path, argsPrefix: ["feature_extractor"], result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""), onRun: nil),
             .init(path: toolchain.colmap.path, argsPrefix: ["exhaustive_matcher"], result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""), onRun: nil),
-            .init(path: toolchain.glomap.path, argsPrefix: ["mapper"], result: .init(exitCode: 1, terminationReason: .exit, stdout: "", stderr: dyldError), onRun: nil),
+            .init(path: toolchain.colmap.path, argsPrefix: ["global_mapper"], result: .init(exitCode: 1, terminationReason: .exit, stdout: "", stderr: missingCommandError), onRun: nil),
             .init(path: toolchain.colmap.path, argsPrefix: ["mapper"], result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""), onRun: { _ in try? self.writeSparseModel(at: projectURL) }),
             .init(path: toolchain.colmap.path, argsPrefix: ["model_analyzer"], result: .init(exitCode: 0, terminationReason: .exit, stdout: "Registered images: 2 / 10\nMean reprojection error: 3.5\n", stderr: ""), onRun: nil),
 
-            // Attempt 2 (glomap should be skipped)
+            // Attempt 2 (global_mapper should be skipped)
             .init(path: toolchain.colmap.path, argsPrefix: ["feature_extractor"], result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""), onRun: nil),
             .init(path: toolchain.colmap.path, argsPrefix: ["exhaustive_matcher"], result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""), onRun: nil),
             .init(path: toolchain.colmap.path, argsPrefix: ["mapper"], result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""), onRun: { _ in try? self.writeSparseModel(at: projectURL) }),
@@ -1005,8 +995,8 @@ final class PipelineIntegrationTests: XCTestCase {
 
         try await pipeline.run { _ in }
 
-        let glomapRuns = runner.calls.filter { $0.0 == toolchain.glomap.path && $0.1.first == "mapper" }
-        XCTAssertEqual(glomapRuns.count, 1)
+        let globalMapperRuns = runner.calls.filter { $0.0 == toolchain.colmap.path && $0.1.first == "global_mapper" }
+        XCTAssertEqual(globalMapperRuns.count, 1)
 
         let output = projectURL.appendingPathComponent("Output/splat.ply")
         XCTAssertTrue(FileManager.default.fileExists(atPath: output.path))
@@ -1089,13 +1079,13 @@ final class PipelineIntegrationTests: XCTestCase {
         let runner = MockSubprocessRunner(scripts: [
             .init(path: toolchain.colmap.path, argsPrefix: ["feature_extractor"], result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""), onRun: nil),
             .init(path: toolchain.colmap.path, argsPrefix: ["exhaustive_matcher"], result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""), onRun: nil),
-            .init(path: toolchain.glomap.path, argsPrefix: ["mapper"], result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""), onRun: { _ in try? self.writeSparseModel(at: projectURL) }),
+            .init(path: toolchain.colmap.path, argsPrefix: ["global_mapper"], result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""), onRun: { _ in try? self.writeSparseModel(at: projectURL) }),
             .init(path: toolchain.colmap.path, argsPrefix: ["model_analyzer"], result: .init(exitCode: 0, terminationReason: .exit, stdout: "Registered images: 2 / 10\nMean reprojection error: 3.5\n", stderr: ""), onRun: nil),
             .init(path: toolchain.colmap.path, argsPrefix: ["mapper"], result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""), onRun: { _ in try? self.writeSparseModel(at: projectURL) }),
             .init(path: toolchain.colmap.path, argsPrefix: ["model_analyzer"], result: .init(exitCode: 0, terminationReason: .exit, stdout: "Registered images: 2 / 10\nMean reprojection error: 3.5\n", stderr: ""), onRun: nil),
             .init(path: toolchain.colmap.path, argsPrefix: ["feature_extractor"], result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""), onRun: nil),
             .init(path: toolchain.colmap.path, argsPrefix: ["exhaustive_matcher"], result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""), onRun: nil),
-            .init(path: toolchain.glomap.path, argsPrefix: ["mapper"], result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""), onRun: { _ in try? self.writeSparseModel(at: projectURL) }),
+            .init(path: toolchain.colmap.path, argsPrefix: ["global_mapper"], result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""), onRun: { _ in try? self.writeSparseModel(at: projectURL) }),
             .init(path: toolchain.colmap.path, argsPrefix: ["model_analyzer"], result: .init(exitCode: 0, terminationReason: .exit, stdout: "Registered images: 2 / 10\nMean reprojection error: 3.5\n", stderr: ""), onRun: nil),
             .init(path: toolchain.colmap.path, argsPrefix: ["mapper"], result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""), onRun: { _ in try? self.writeSparseModel(at: projectURL) }),
             .init(path: toolchain.colmap.path, argsPrefix: ["model_analyzer"], result: .init(exitCode: 0, terminationReason: .exit, stdout: "Registered images: 2 / 10\nMean reprojection error: 3.5\n", stderr: ""), onRun: nil)
@@ -1181,7 +1171,7 @@ final class PipelineIntegrationTests: XCTestCase {
             .init(path: toolchain.colmap.path, argsPrefix: ["feature_extractor"], result: .init(exitCode: 1, terminationReason: .exit, stdout: "", stderr: "fail"), onRun: nil),
             .init(path: toolchain.colmap.path, argsPrefix: ["feature_extractor"], result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""), onRun: nil),
             .init(path: toolchain.colmap.path, argsPrefix: ["exhaustive_matcher"], result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""), onRun: nil),
-            .init(path: toolchain.glomap.path, argsPrefix: ["mapper"], result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""), onRun: { _ in try? self.writeSparseModel(at: projectURL) }),
+            .init(path: toolchain.colmap.path, argsPrefix: ["global_mapper"], result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""), onRun: { _ in try? self.writeSparseModel(at: projectURL) }),
             .init(path: toolchain.colmap.path, argsPrefix: ["model_analyzer"], result: .init(exitCode: 0, terminationReason: .exit, stdout: "Registered images: 80 / 80\nMean reprojection error: 1.0\n", stderr: ""), onRun: nil),
             .init(path: toolchain.brush.path, argsPrefix: [], result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""), onRun: { args in
                 guard let datasetArg = args.last else { return }
@@ -1240,7 +1230,7 @@ final class PipelineIntegrationTests: XCTestCase {
                 featureRuns.append(args)
             }),
             .init(path: toolchain.colmap.path, argsPrefix: ["exhaustive_matcher"], result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""), onRun: nil),
-            .init(path: toolchain.glomap.path, argsPrefix: ["mapper"], result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""), onRun: { _ in try? self.writeSparseModel(at: projectURL) }),
+            .init(path: toolchain.colmap.path, argsPrefix: ["global_mapper"], result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""), onRun: { _ in try? self.writeSparseModel(at: projectURL) }),
             .init(path: toolchain.colmap.path, argsPrefix: ["model_analyzer"], result: .init(exitCode: 0, terminationReason: .exit, stdout: "Registered images: 10 / 10\nMean reprojection error: 1.0\n", stderr: ""), onRun: nil),
             .init(path: toolchain.brush.path, argsPrefix: [], result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""), onRun: { args in
                 guard let datasetArg = args.last else { return }
@@ -1336,7 +1326,7 @@ final class PipelineIntegrationTests: XCTestCase {
         let runner = MockSubprocessRunner(scripts: [
             .init(path: toolchain.colmap.path, argsPrefix: ["feature_extractor"], result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""), onRun: nil),
             .init(path: toolchain.colmap.path, argsPrefix: ["exhaustive_matcher"], result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""), onRun: nil),
-            .init(path: toolchain.glomap.path, argsPrefix: ["mapper"], result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""), onRun: { _ in try? self.writeSparseModel(at: projectURL) }),
+            .init(path: toolchain.colmap.path, argsPrefix: ["global_mapper"], result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""), onRun: { _ in try? self.writeSparseModel(at: projectURL) }),
             .init(path: toolchain.colmap.path, argsPrefix: ["model_analyzer"], result: .init(exitCode: 0, terminationReason: .exit, stdout: "Registered images: 10 / 10\nMean reprojection error: 1.0\n", stderr: ""), onRun: nil),
             .init(path: toolchain.brush.path, argsPrefix: [], result: .init(exitCode: 1, terminationReason: .exit, stdout: "", stderr: "brush failed"), onRun: nil)
         ])
@@ -1379,7 +1369,7 @@ final class PipelineIntegrationTests: XCTestCase {
         let runner = MockSubprocessRunner(scripts: [
             .init(path: toolchain.colmap.path, argsPrefix: ["feature_extractor"], result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""), onRun: nil),
             .init(path: toolchain.colmap.path, argsPrefix: ["exhaustive_matcher"], result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""), onRun: nil),
-            .init(path: toolchain.glomap.path, argsPrefix: ["mapper"], result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""), onRun: { _ in try? self.writeSparseModel(at: projectURL) }),
+            .init(path: toolchain.colmap.path, argsPrefix: ["global_mapper"], result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""), onRun: { _ in try? self.writeSparseModel(at: projectURL) }),
             .init(path: toolchain.colmap.path, argsPrefix: ["model_analyzer"], result: .init(exitCode: 0, terminationReason: .exit, stdout: "Registered images: 10 / 10\nMean reprojection error: 1.0\n", stderr: ""), onRun: nil),
             .init(path: toolchain.brush.path, argsPrefix: [], result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""), onRun: nil)
         ])
@@ -1662,7 +1652,6 @@ final class PipelineIntegrationTests: XCTestCase {
         }
 
         let colmap = try writeStub("colmap")
-        let glomap = try writeStub("glomap")
         let brush = try writeStub("brush")
 
         let vggt = try TestToolchains.vggtToolchain(root: toolchainRoot, createFiles: createVggtFiles)
@@ -1670,7 +1659,7 @@ final class PipelineIntegrationTests: XCTestCase {
         return ToolchainPaths(
             root: toolchainRoot,
             colmap: colmap,
-            glomap: glomap,
+            glomap: colmap,
             brush: brush,
             vggt: vggt,
             fastvggt: fastvggt

@@ -42,9 +42,6 @@ jobs:
       - name: Build OpenSSL
         run: scripts/toolchain/build_openssl.sh
 
-      - name: Build GLOMAP
-        run: scripts/toolchain/build_glomap.sh
-
       - name: Build Brush
         run: scripts/toolchain/build_brush.sh
 

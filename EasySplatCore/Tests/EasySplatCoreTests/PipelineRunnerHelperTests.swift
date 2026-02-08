@@ -596,8 +596,8 @@ final class PipelineRunnerHelperTests: XCTestCase {
         defer { restore() }
 
         let order = runner.test_sfmBackendFallbackOrder()
-        XCTAssertEqual(order, [.fastvggt, .colmap])
-        XCTAssertEqual(runner.test_sfmBackendPolicy(), .fastvggt)
+        XCTAssertEqual(order, [.colmap])
+        XCTAssertEqual(runner.test_sfmBackendPolicy(), .colmap)
     }
 
     func testSfmBackendFallbackOrderIgnoresDeprecatedGraceEnv() async throws {
@@ -610,7 +610,18 @@ final class PipelineRunnerHelperTests: XCTestCase {
             "EASYSPLAT_ENABLE_VGGT_GRACE_FALLBACK": "1"
         ]) {
             let order = runner.test_sfmBackendFallbackOrder()
-            XCTAssertEqual(order, [.fastvggt, .colmap])
+            XCTAssertEqual(order, [.colmap])
+        }
+    }
+
+    func testSfmBackendGlomapAliasFromEnv() async throws {
+        let root = try TestFileBuilder.makeTempDir()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let runner = makeRunner(projectURL: root)
+
+        await withEnvironmentAsync(["EASYSPLAT_SFM_BACKEND": "glomap"]) {
+            XCTAssertEqual(runner.test_sfmBackendPolicy(), .colmap)
+            XCTAssertEqual(runner.test_sfmBackendFallbackOrder(), [.colmap])
         }
     }
 

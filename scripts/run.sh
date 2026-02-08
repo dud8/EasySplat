@@ -88,6 +88,7 @@ toolchain_inputs_newer() {
 
 core_zip_valid() {
   test -f "$CORE_ZIP" || return 1
+  unzip -l "$CORE_ZIP" | grep -q "bin/colmap" || return 1
   unzip -l "$CORE_ZIP" | grep -q "lib/libcrypto.3.dylib" || return 1
   unzip -l "$CORE_ZIP" | grep -q "vggt_mps/bin/easysplat_vggt_sfm" || return 1
   unzip -l "$CORE_ZIP" | grep -q "vggt_mps/python/bin/python3" || return 1
@@ -99,10 +100,10 @@ core_zip_valid() {
 
   local tmp
   tmp="$(mktemp -d)"
-  unzip -p "$CORE_ZIP" bin/glomap >"$tmp/glomap" 2>/dev/null || { rm -rf "$tmp"; return 1; }
-  chmod +x "$tmp/glomap"
-  otool -l "$tmp/glomap" | grep -q "@executable_path/../lib" || { rm -rf "$tmp"; return 1; }
-  otool -L "$tmp/glomap" | grep -q "@rpath/libcrypto.3.dylib" || { rm -rf "$tmp"; return 1; }
+  unzip -p "$CORE_ZIP" bin/colmap >"$tmp/colmap" 2>/dev/null || { rm -rf "$tmp"; return 1; }
+  chmod +x "$tmp/colmap"
+  otool -l "$tmp/colmap" | grep -q "@executable_path/../lib" || { rm -rf "$tmp"; return 1; }
+  otool -L "$tmp/colmap" | grep -q "@rpath/libcrypto.3.dylib" || { rm -rf "$tmp"; return 1; }
   rm -rf "$tmp"
 }
 
@@ -255,7 +256,6 @@ refresh_installed_fastvggt_app() {
 validate_installed_toolchain() {
   local root="$1"
   test -x "$root/bin/colmap" || return 1
-  test -x "$root/bin/glomap" || return 1
   test -f "$root/lib/libcrypto.3.dylib" || return 1
   test -f "$root/lib/libssl.3.dylib" || return 1
   test -x "$root/vggt_mps/bin/easysplat_vggt_sfm" || return 1
@@ -271,9 +271,7 @@ validate_installed_toolchain() {
   fi
 
   otool -l "$root/bin/colmap" | grep -q "@executable_path/../lib" || return 1
-  otool -l "$root/bin/glomap" | grep -q "@executable_path/../lib" || return 1
   otool -L "$root/bin/colmap" | grep -q "@rpath/libcrypto.3.dylib" || return 1
-  otool -L "$root/bin/glomap" | grep -q "@rpath/libcrypto.3.dylib" || return 1
 }
 
 models_present() {
@@ -332,7 +330,6 @@ fi
 if [ "$NEED_PACKAGE" -eq 1 ]; then
   "$ROOT/scripts/toolchain/build_openssl.sh"
   test -x "$ROOT/Toolchains/build/colmap/install/bin/colmap" || "$ROOT/scripts/toolchain/build_colmap.sh"
-  test -x "$ROOT/Toolchains/build/glomap/install/bin/glomap" || "$ROOT/scripts/toolchain/build_glomap.sh"
   test -x "$ROOT/Toolchains/build/brush/install/bin/brush" || "$ROOT/scripts/toolchain/build_brush.sh"
   ensure_vggt_mps_bundle
   refresh_vggt_mps_app

@@ -61,7 +61,6 @@ struct ManifestTool {
 
                     let coreContents = [
                         "bin/colmap",
-                        "bin/glomap",
                         "bin/brush",
                         "bin/brush.real",
                         "lib/libcrypto.3.dylib",
@@ -93,7 +92,6 @@ struct ManifestTool {
                     let sha = try sha256Hex(url: zipURL)
                     let contents = [
                         "bin/colmap",
-                        "bin/glomap",
                         "bin/brush",
                         "bin/brush.real",
                         "lib/libcrypto.3.dylib",

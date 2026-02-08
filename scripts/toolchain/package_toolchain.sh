@@ -23,7 +23,6 @@ if [ -z "$VERSION" ]; then
 fi
 
 COLMAP_INSTALL="${COLMAP_INSTALL:-$ROOT/Toolchains/build/colmap/install}"
-GLOMAP_INSTALL="${GLOMAP_INSTALL:-$ROOT/Toolchains/build/glomap/install}"
 BRUSH_INSTALL="${BRUSH_INSTALL:-$ROOT/Toolchains/build/brush/install}"
 VGGT_MPS_INSTALL="${VGGT_MPS_INSTALL:-$ROOT/Toolchains/build/vggt_mps/install}"
 FASTVGGT_MPS_INSTALL="${FASTVGGT_MPS_INSTALL:-$ROOT/Toolchains/build/fastvggt_mps/install}"
@@ -38,7 +37,6 @@ rm -rf "$OUT"
 mkdir -p "$BIN" "$LIB"
 
 cp "$COLMAP_INSTALL/bin/colmap" "$BIN/colmap"
-cp "$GLOMAP_INSTALL/bin/glomap" "$BIN/glomap"
 
 # Brush has changed CLI shapes over time (some versions used subcommands like `train`).
 # Package a tiny wrapper so both `brush <dataset>` and `brush train <dataset>` work.
@@ -54,7 +52,7 @@ fi
 exec "$REAL" "$@"
 SCRIPT
 
-chmod +x "$BIN/colmap" "$BIN/glomap" "$BIN/brush" "$BIN/brush.real"
+chmod +x "$BIN/colmap" "$BIN/brush" "$BIN/brush.real"
 
 if [ ! -d "$VGGT_MPS_INSTALL/vggt_mps" ]; then
   echo "vggt_mps bundle not found at $VGGT_MPS_INSTALL/vggt_mps. Build it before packaging." >&2
@@ -133,7 +131,7 @@ fi
 cp -R "$FASTVGGT_MPS_INSTALL/fastvggt_mps" "$OUT/fastvggt_mps"
 
 if ! command -v install_name_tool >/dev/null 2>&1; then
-  echo "install_name_tool not found; cannot package portable GLOMAP dependencies." >&2
+  echo "install_name_tool not found; cannot package portable OpenSSL dependencies." >&2
   exit 1
 fi
 if ! command -v otool >/dev/null 2>&1; then
@@ -166,7 +164,7 @@ fi
 
 for lib in libcrypto.3.dylib libssl.3.dylib; do
   if [ ! -f "$OPENSSL_PREFIX/lib/$lib" ]; then
-    echo "Missing $OPENSSL_PREFIX/lib/$lib (required by glomap)." >&2
+    echo "Missing $OPENSSL_PREFIX/lib/$lib (required by colmap)." >&2
     exit 1
   fi
   cp -L "$OPENSSL_PREFIX/lib/$lib" "$LIB/$lib"
@@ -184,19 +182,7 @@ add_rpath_if_missing() {
   fi
 }
 
-# Ensure GLOMAP can find bundled OpenSSL without Homebrew.
-add_rpath_if_missing "$BIN/glomap" "@executable_path/../lib"
 add_rpath_if_missing "$BIN/colmap" "@executable_path/../lib"
-
-# If GLOMAP was linked against a Homebrew/OpenSSL install name, rewrite to @rpath.
-crypto_dep="$(otool -L "$BIN/glomap" | { grep -m1 'libcrypto\.3\.dylib' || true; } | awk '{print $1}')"
-ssl_dep="$(otool -L "$BIN/glomap" | { grep -m1 'libssl\.3\.dylib' || true; } | awk '{print $1}')"
-if [ -n "$crypto_dep" ] && [ "$crypto_dep" != "@rpath/libcrypto.3.dylib" ]; then
-  install_name_tool -change "$crypto_dep" "@rpath/libcrypto.3.dylib" "$BIN/glomap"
-fi
-if [ -n "$ssl_dep" ] && [ "$ssl_dep" != "@rpath/libssl.3.dylib" ]; then
-  install_name_tool -change "$ssl_dep" "@rpath/libssl.3.dylib" "$BIN/glomap"
-fi
 
 # COLMAP links against OpenSSL too; prefer the bundled dylibs.
 colmap_crypto_dep="$(otool -L "$BIN/colmap" | { grep -m1 -E 'libcrypto\.3\.dylib|libcrypto\.1\.1\.dylib' || true; } | awk '{print $1}')"
@@ -212,12 +198,8 @@ if [ "$colmap_crypto_dep" != "@rpath/libcrypto.3.dylib" ]; then
   install_name_tool -change "$colmap_crypto_dep" "@rpath/libcrypto.3.dylib" "$BIN/colmap"
 fi
 
-# Validate: glomap must have rpath + reference @rpath OpenSSL libs, and we must ship those libs.
-otool -l "$BIN/glomap" | grep -q "@executable_path/../lib" || { echo "glomap missing rpath @executable_path/../lib" >&2; exit 1; }
-otool -L "$BIN/glomap" | grep -q "@rpath/libcrypto.3.dylib" || { echo "glomap missing dependency @rpath/libcrypto.3.dylib" >&2; exit 1; }
-if otool -L "$BIN/glomap" | grep -q "libssl.3.dylib"; then
-  otool -L "$BIN/glomap" | grep -q "@rpath/libssl.3.dylib" || { echo "glomap missing dependency @rpath/libssl.3.dylib" >&2; exit 1; }
-fi
+# Validate: colmap must have rpath + reference @rpath OpenSSL libs, and we must ship those libs.
+otool -l "$BIN/colmap" | grep -q "@executable_path/../lib" || { echo "colmap missing rpath @executable_path/../lib" >&2; exit 1; }
 otool -L "$BIN/colmap" | grep -q "@rpath/libcrypto.3.dylib" || { echo "colmap missing dependency @rpath/libcrypto.3.dylib" >&2; exit 1; }
 test -f "$LIB/libcrypto.3.dylib" || { echo "missing bundled libcrypto.3.dylib" >&2; exit 1; }
 test -f "$LIB/libssl.3.dylib" || { echo "missing bundled libssl.3.dylib" >&2; exit 1; }

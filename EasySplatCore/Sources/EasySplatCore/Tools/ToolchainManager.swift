@@ -224,14 +224,11 @@ public final class ToolchainManager: @unchecked Sendable, ToolchainManaging {
 
     private func validateToolchain(root: URL) throws -> ToolchainPaths {
         let colmap = root.appendingPathComponent("bin/colmap")
-        let glomap = root.appendingPathComponent("bin/glomap")
         let brush = root.appendingPathComponent("bin/brush")
         let brushReal = root.appendingPathComponent("bin/brush.real")
         ensureExecutable(at: colmap)
-        ensureExecutable(at: glomap)
         ensureExecutable(at: brush)
         guard fileManager.isExecutableFile(atPath: colmap.path) else { throw ToolchainError.missingBinary("colmap") }
-        guard fileManager.isExecutableFile(atPath: glomap.path) else { throw ToolchainError.missingBinary("glomap") }
         guard fileManager.isExecutableFile(atPath: brush.path) else { throw ToolchainError.missingBinary("brush") }
         if fileHasShebang(at: brush) {
             ensureExecutable(at: brushReal)
@@ -250,11 +247,14 @@ public final class ToolchainManager: @unchecked Sendable, ToolchainManaging {
             throw ToolchainError.invalidToolchain("COLMAP failed to launch (exit \(colmapCheck.exitCode)).")
         }
 
-        let glomapCheck = try runner.run(glomap.path, ["--help"])
-        if glomapCheck.exitCode != 0 {
-            let text = "\(glomapCheck.stdout)\n\(glomapCheck.stderr)".lowercased()
+        // GLOMAP is integrated in COLMAP via `global_mapper`.
+        // Keep this as a soft capability probe so older cached toolchains can still run
+        // with incremental mapper fallback.
+        if let globalMapperProbe = try? runner.run(colmap.path, ["global_mapper"]),
+           globalMapperProbe.exitCode != 0 {
+            let text = "\(globalMapperProbe.stdout)\n\(globalMapperProbe.stderr)".lowercased()
             if text.contains("library not loaded") || text.contains("no lc_rpath") || text.contains("@rpath/libcrypto.3.dylib") {
-                throw ToolchainError.invalidToolchain("GLOMAP failed to launch (missing dylib/rpath).")
+                throw ToolchainError.invalidToolchain("COLMAP global_mapper failed to launch (missing dylib/rpath).")
             }
         }
 
@@ -339,6 +339,10 @@ public final class ToolchainManager: @unchecked Sendable, ToolchainManaging {
             python: fastvggtPython,
             models: fastvggtModels
         )
+
+        // Deprecated path alias: legacy code may still read `toolchain.glomap`.
+        // Runtime mapping now uses `colmap global_mapper`.
+        let glomap = colmap
 
         return ToolchainPaths(
             root: root,
@@ -725,7 +729,6 @@ public final class ToolchainManager: @unchecked Sendable, ToolchainManaging {
 
     private func coreToolchainLooksInstalled(root: URL) -> Bool {
         let colmap = root.appendingPathComponent("bin/colmap")
-        let glomap = root.appendingPathComponent("bin/glomap")
         let brush = root.appendingPathComponent("bin/brush")
         let brushReal = root.appendingPathComponent("bin/brush.real")
         let libcrypto = root.appendingPathComponent("lib/libcrypto.3.dylib")
@@ -749,7 +752,6 @@ public final class ToolchainManager: @unchecked Sendable, ToolchainManaging {
         }()
 
         return fileManager.isExecutableFile(atPath: colmap.path)
-            && fileManager.isExecutableFile(atPath: glomap.path)
             && brushOK
             && fileManager.fileExists(atPath: libcrypto.path)
             && fileManager.fileExists(atPath: libssl.path)

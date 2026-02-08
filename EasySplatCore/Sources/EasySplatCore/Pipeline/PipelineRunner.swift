@@ -406,6 +406,13 @@ public final class PipelineRunner: @unchecked Sendable {
             try Task.checkCancellation()
             let backendOverride = sfmBackendOverride()
             var backendOrder = sfmBackendFallbackOrder(override: backendOverride)
+            if let backendOverride, backendOverride == .fastvggt || backendOverride == .vggt {
+                emit(.stageLog(
+                    stage: .sfmFeatures,
+                    line: "Deprecated SfM backend override '\(backendOverride.rawValue)' is enabled. Default backend is now GLOMAP (COLMAP global_mapper).",
+                    isError: true
+                ))
+            }
             let deprecatedFastVggtEnvKeys = [
                 "EASYSPLAT_FASTVGGT_TRACK_MODE",
                 "EASYSPLAT_FASTVGGT_REFINEMENT_POLICY",
@@ -454,7 +461,7 @@ public final class PipelineRunner: @unchecked Sendable {
                 case .vggt:
                     return "VGGT"
                 case .colmap:
-                    return "COLMAP + GLOMAP"
+                    return "GLOMAP (COLMAP global_mapper)"
                 }
             }
 
@@ -1038,102 +1045,147 @@ public final class PipelineRunner: @unchecked Sendable {
                             if acceptedModelURL == nil {
                                 emit(.stageLog(
                                     stage: .sfmMapping,
-                                    line: "FastVGGT refinement was not usable; trying mapper fallback.",
+                                    line: "FastVGGT refinement was not usable; trying solver fallback (global_mapper -> mapper).",
                                     isError: true
                                 ))
 
-                                let usesGlomap = mapperPreference == .glomap && !disableGlomapForThisRun
-                                let glomapToolLog: ToolLogWriter? = {
-                                    guard usesGlomap else { return nil }
-                                    let log = ToolLogWriter(fileURL: paths.glomapLogURL, toolName: "glomap")
-                                    log.beginSection(
-                                        title: "mapper_fallback",
-                                        metadata: [
-                                            "database": paths.colmapDatabaseURL.path,
-                                            "images": paths.framesSelectedURL.path,
-                                            "output": paths.colmapSparseURL.path,
-                                            "tool": self.config.toolchain.glomap.path
-                                        ]
-                                    )
-                                    return log
-                                }()
+                                let globalMapperToolLog = ToolLogWriter(
+                                    fileURL: paths.glomapLogURL,
+                                    toolName: "colmap-global_mapper"
+                                )
+                                globalMapperToolLog.beginSection(
+                                    title: "mapper_fallback",
+                                    metadata: [
+                                        "database": paths.colmapDatabaseURL.path,
+                                        "images": paths.framesSelectedURL.path,
+                                        "output": paths.colmapSparseURL.path,
+                                        "tool": self.config.toolchain.colmap.path
+                                    ]
+                                )
+                                emit(.stageLog(stage: .sfmMapping, line: "Global mapper log: \(paths.glomapLogURL.lastPathComponent)", isError: false))
 
-                                let mapperAttempts: [SfmMapperPreference] = {
-                                    switch mapperPreference {
-                                    case .colmap:
-                                        return [.colmap]
-                                    case .glomap:
-                                        if disableGlomapForThisRun {
-                                            return [.colmap]
-                                        }
-                                        return [.glomap, .colmap]
+                                func evaluateFallbackModel(candidate: String) async throws -> Bool {
+                                    guard sparseModelFilesExist(at: sparseZero) else {
+                                        throw PipelineError.outputMissing
                                     }
-                                }()
+                                    let report = try await self.tooling.colmap.runModelAnalyzer(
+                                        colmapPath: self.config.toolchain.colmap,
+                                        modelPath: sparseZero,
+                                        options: fastColmapMatchOptions
+                                    )
+                                    let score = ReconstructionScorer.parseModelAnalyzerOutput(report)
+                                    emit(.stageLog(
+                                        stage: .sfmMapping,
+                                        line: "Mapper fallback score (\(candidate)): \(ReconstructionScorer.summary(score)).",
+                                        isError: false
+                                    ))
+                                    if ReconstructionScorer.isAcceptable(score, mode: metadata.preset.mode) {
+                                        acceptedModelURL = sparseZero
+                                        acceptedMapper = candidate
+                                        return true
+                                    }
+                                    lastMappingError = PipelineError.lowQualityReconstruction(score)
+                                    return false
+                                }
 
-                                for (attemptIndex, mapper) in mapperAttempts.enumerated() {
+                                let threadHint = max(fastColmapExtractOptions.extractThreads, fastColmapMatchOptions.matchThreads)
+                                let baseGlobalMapperOptions = self.globalMapperOptions(threadHint: threadHint)
+                                var shouldTryIncrementalMapper = true
+
+                                if mapperPreference == .glomap && !disableGlomapForThisRun {
+                                    let gpuPreferredOptions = baseGlobalMapperOptions
+                                    let gpuRequested = gpuPreferredOptions.useGpuForGlobalPositioning || gpuPreferredOptions.useGpuForBundleAdjustment
                                     do {
                                         try self.resetDirectory(paths.colmapSparseURL)
-                                        if mapper == .glomap {
-                                            try await self.tooling.glomap.runMapper(
-                                                glomapPath: self.config.toolchain.glomap,
-                                                database: paths.colmapDatabaseURL,
-                                                imagePath: paths.framesSelectedURL,
-                                                outputPath: paths.colmapSparseURL,
-                                                onLog: { line, isErr in
-                                                    glomapToolLog?.append(stream: isErr ? "stderr" : "stdout", line: line)
-                                                    onMappingLog(line, isErr)
-                                                }
-                                            )
-                                        } else {
-                                            try await self.tooling.colmap.runMapper(
-                                                colmapPath: self.config.toolchain.colmap,
-                                                database: paths.colmapDatabaseURL,
-                                                imagePath: paths.framesSelectedURL,
-                                                outputPath: paths.colmapSparseURL,
-                                                options: fastColmapMatchOptions,
-                                                onLog: { line, isErr in
-                                                    colmapToolLog.append(stream: isErr ? "stderr" : "stdout", line: line)
-                                                    onMappingLog(line, isErr)
-                                                }
-                                            )
-                                        }
-
-                                        guard sparseModelFilesExist(at: sparseZero) else {
-                                            throw PipelineError.outputMissing
-                                        }
-                                        let report = try await self.tooling.colmap.runModelAnalyzer(
-                                            colmapPath: self.config.toolchain.colmap,
-                                            modelPath: sparseZero,
-                                            options: fastColmapMatchOptions
-                                        )
-                                        let score = ReconstructionScorer.parseModelAnalyzerOutput(report)
                                         emit(.stageLog(
                                             stage: .sfmMapping,
-                                            line: "Mapper fallback score: \(ReconstructionScorer.summary(score)).",
+                                            line: "Mapper fallback: running COLMAP global_mapper (gp_use_gpu=\(gpuPreferredOptions.useGpuForGlobalPositioning), ba_use_gpu=\(gpuPreferredOptions.useGpuForBundleAdjustment), threads=\(gpuPreferredOptions.numThreads)).",
                                             isError: false
                                         ))
-                                        if ReconstructionScorer.isAcceptable(score, mode: metadata.preset.mode) {
-                                            acceptedModelURL = sparseZero
-                                            acceptedMapper = mapper == .glomap ? "glomap" : "colmap"
-                                            break
+                                        try await self.tooling.colmap.runGlobalMapper(
+                                            colmapPath: self.config.toolchain.colmap,
+                                            database: paths.colmapDatabaseURL,
+                                            imagePath: paths.framesSelectedURL,
+                                            outputPath: paths.colmapSparseURL,
+                                            options: gpuPreferredOptions,
+                                            environment: fastColmapMatchOptions.environment,
+                                            onLog: { line, isErr in
+                                                globalMapperToolLog.append(stream: isErr ? "stderr" : "stdout", line: line)
+                                                onMappingLog(line, isErr)
+                                            }
+                                        )
+                                        if try await evaluateFallbackModel(candidate: gpuRequested ? "global_mapper-gpu" : "global_mapper") {
+                                            shouldTryIncrementalMapper = false
                                         }
-                                        lastMappingError = PipelineError.lowQualityReconstruction(score)
                                     } catch {
-                                        if mapper == .glomap,
-                                           !disableGlomapForThisRun,
-                                           glomapErrorIndicatesMissingOpenSSL(error) {
+                                        lastMappingError = error
+                                        if let colmapError = error as? ColmapRunnerError,
+                                           colmapErrorIndicatesMissingGlobalMapper(colmapError) {
                                             disableGlomapForThisRun = true
                                             emit(.stageLog(
                                                 stage: .sfmMapping,
-                                                line: "GLOMAP failed to launch (missing OpenSSL dylibs / rpath). Falling back to COLMAP mapper.",
+                                                line: "COLMAP global_mapper is unavailable in this toolchain; falling back to COLMAP mapper.",
                                                 isError: true
                                             ))
+                                        } else if let colmapError = error as? ColmapRunnerError,
+                                                  gpuRequested,
+                                                  colmapErrorIndicatesGpuFailure(colmapError) {
+                                            var cpuOptions = gpuPreferredOptions
+                                            cpuOptions.useGpuForGlobalPositioning = false
+                                            cpuOptions.useGpuForBundleAdjustment = false
+                                            emit(.stageLog(
+                                                stage: .sfmMapping,
+                                                line: "global_mapper GPU path failed; retrying global_mapper with GPU disabled.",
+                                                isError: true
+                                            ))
+                                            do {
+                                                try self.resetDirectory(paths.colmapSparseURL)
+                                                try await self.tooling.colmap.runGlobalMapper(
+                                                    colmapPath: self.config.toolchain.colmap,
+                                                    database: paths.colmapDatabaseURL,
+                                                    imagePath: paths.framesSelectedURL,
+                                                    outputPath: paths.colmapSparseURL,
+                                                    options: cpuOptions,
+                                                    environment: fastColmapMatchOptions.environment,
+                                                    onLog: { line, isErr in
+                                                        globalMapperToolLog.append(stream: isErr ? "stderr" : "stdout", line: line)
+                                                        onMappingLog(line, isErr)
+                                                    }
+                                                )
+                                                if try await evaluateFallbackModel(candidate: "global_mapper-cpu") {
+                                                    shouldTryIncrementalMapper = false
+                                                }
+                                            } catch {
+                                                lastMappingError = error
+                                            }
                                         }
-                                        lastMappingError = error
                                     }
+                                } else if mapperPreference == .glomap && disableGlomapForThisRun {
+                                    emit(.stageLog(stage: .sfmMapping, line: "Skipping global_mapper for this run (disabled after previous launch failure).", isError: true))
+                                }
 
-                                    if attemptIndex == 0, mapper == .glomap {
-                                        emit(.stageLog(stage: .sfmMapping, line: "GLOMAP mapping failed; trying COLMAP mapper.", isError: true))
+                                if shouldTryIncrementalMapper {
+                                    emit(.stageLog(
+                                        stage: .sfmMapping,
+                                        line: "Trying COLMAP incremental mapper fallback.",
+                                        isError: true
+                                    ))
+                                    do {
+                                        try self.resetDirectory(paths.colmapSparseURL)
+                                        try await self.tooling.colmap.runMapper(
+                                            colmapPath: self.config.toolchain.colmap,
+                                            database: paths.colmapDatabaseURL,
+                                            imagePath: paths.framesSelectedURL,
+                                            outputPath: paths.colmapSparseURL,
+                                            options: fastColmapMatchOptions,
+                                            onLog: { line, isErr in
+                                                colmapToolLog.append(stream: isErr ? "stderr" : "stdout", line: line)
+                                                onMappingLog(line, isErr)
+                                            }
+                                        )
+                                        _ = try await evaluateFallbackModel(candidate: "colmap")
+                                    } catch {
+                                        lastMappingError = error
                                     }
                                 }
                             }
@@ -1753,146 +1805,188 @@ public final class PipelineRunner: @unchecked Sendable {
                             "tool": self.config.toolchain.colmap.path
                         ]
                     )
-                    let usesGlomap = mapperPreference == .glomap && !disableGlomapForThisRun
-                    let glomapToolLog: ToolLogWriter? = {
-                        guard usesGlomap else { return nil }
-                        let log = ToolLogWriter(fileURL: paths.glomapLogURL, toolName: "glomap")
-                        log.beginSection(
-                            title: "mapper",
-                            metadata: [
-                                "database": paths.colmapDatabaseURL.path,
-                                "images": paths.framesSelectedURL.path,
-                                "output": paths.colmapSparseURL.path,
-                                "tool": self.config.toolchain.glomap.path
-                            ]
-                        )
-                        return log
-                    }()
-                    let toolLogNames = [paths.colmapLogURL.lastPathComponent, glomapToolLog != nil ? paths.glomapLogURL.lastPathComponent : nil]
-                        .compactMap { $0 }
+                    let globalMapperToolLog = ToolLogWriter(fileURL: paths.glomapLogURL, toolName: "colmap-global_mapper")
+                    globalMapperToolLog.beginSection(
+                        title: "global_mapper",
+                        metadata: [
+                            "database": paths.colmapDatabaseURL.path,
+                            "images": paths.framesSelectedURL.path,
+                            "output": paths.colmapSparseURL.path,
+                            "tool": self.config.toolchain.colmap.path
+                        ]
+                    )
+                    let toolLogNames = [paths.colmapLogURL.lastPathComponent, paths.glomapLogURL.lastPathComponent]
                         .joined(separator: ", ")
                     emit(.stageLog(stage: .sfmMapping, line: "Tool logs: \(toolLogNames)", isError: false))
-                        let mappingProgress = ColmapMappingProgressTracker(totalImages: selectedFrames.count)
-                        let onMappingLog: @Sendable (String, Bool) -> Void = { line, isErr in
-                            let sanitized = Self.sanitizeToolLogLine(line)
-                            if Self.shouldEmitToolLogLine(sanitized, isError: isErr) {
-                                emit(.stageLog(stage: .sfmMapping, line: sanitized, isError: isErr))
-                            }
-                            if let update = mappingProgress.ingest(line) {
-                                emit(.stageProgress(stage: .sfmMapping, fraction: update.fraction, message: update.message))
-                            }
+                    let mappingProgress = ColmapMappingProgressTracker(totalImages: selectedFrames.count)
+                    let onMappingLog: @Sendable (String, Bool) -> Void = { line, isErr in
+                        let sanitized = Self.sanitizeToolLogLine(line)
+                        if Self.shouldEmitToolLogLine(sanitized, isError: isErr) {
+                            emit(.stageLog(stage: .sfmMapping, line: sanitized, isError: isErr))
                         }
-                        var mappingSucceeded = false
-                        var lastMappingError: Error?
+                        if let update = mappingProgress.ingest(line) {
+                            emit(.stageProgress(stage: .sfmMapping, fraction: update.fraction, message: update.message))
+                        }
+                    }
+                    var mappingSucceeded = false
+                    var lastMappingError: Error?
+                    var acceptedMappingStrategy = mapperPreference == .glomap ? "global_mapper" : "colmap"
+                    var lastMappingAttempt = "none"
 
-                        let mapperAttempts: [SfmMapperPreference] = {
-                            switch mapperPreference {
-                            case .colmap:
-                                return [.colmap]
-                            case .glomap:
-                                if disableGlomapForThisRun {
-                                    return [.colmap]
-                                }
-                                return [.glomap, .colmap]
-                            }
-                        }()
+                    func evaluateMappingResult(candidate: String) async throws -> Bool {
+                        lastMappingAttempt = candidate
+                        let modelURL = paths.colmapSparseURL.appendingPathComponent("0", isDirectory: true)
+                        guard sparseModelFilesExist(at: modelURL) else {
+                            throw PipelineError.outputMissing
+                        }
 
-                        let mapperLabel: String = {
-                            switch mapperPreference {
-                            case .colmap:
-                                return "COLMAP"
-                            case .glomap:
-                                return disableGlomapForThisRun ? "COLMAP (GLOMAP disabled for this run)" : "GLOMAP"
-                            }
-                        }()
+                        let report = try await self.tooling.colmap.runModelAnalyzer(
+                            colmapPath: self.config.toolchain.colmap,
+                            modelPath: modelURL,
+                            options: colmapMatchOptions
+                        )
+                        for line in report.split(separator: "\n", omittingEmptySubsequences: false) {
+                            colmapToolLog.append(stream: "stdout", line: String(line))
+                        }
+                        let score = ReconstructionScorer.parseModelAnalyzerOutput(report)
+                        writeCheckpoint(
+                            stage: .sfmMapping,
+                            progress: 0.95,
+                            message: "Mapping score: \(ReconstructionScorer.summary(score))",
+                            details: .sfmMapping(SfmMappingCheckpoint(
+                                mapper: candidate,
+                                sparsePath: modelURL.path,
+                                registeredImages: score.registeredImages
+                            ))
+                        )
                         emit(.stageLog(
                             stage: .sfmMapping,
-                            line: "Mapping preference: \(mapperLabel).",
+                            line: "Reconstruction score (\(candidate)): \(ReconstructionScorer.summary(score)).",
                             isError: false
                         ))
+                        if ReconstructionScorer.isAcceptable(score, mode: metadata.preset.mode) {
+                            acceptedMappingStrategy = candidate
+                            return true
+                        } else {
+                            lastMappingError = PipelineError.lowQualityReconstruction(score)
+                            return false
+                        }
+                    }
 
-                        for (index, mapper) in mapperAttempts.enumerated() {
-                            do {
-                                if mapper == .glomap {
-                                    try await self.tooling.glomap.runMapper(
-                                        glomapPath: self.config.toolchain.glomap,
-                                        database: paths.colmapDatabaseURL,
-                                        imagePath: paths.framesSelectedURL,
-                                        outputPath: paths.colmapSparseURL,
-                                        onLog: { line, isErr in
-                                            glomapToolLog?.append(stream: isErr ? "stderr" : "stdout", line: line)
-                                            onMappingLog(line, isErr)
-                                        }
-                                    )
-                                } else {
-                                    try await self.tooling.colmap.runMapper(
+                    let mapperLabel: String = {
+                        switch mapperPreference {
+                        case .colmap:
+                            return "COLMAP mapper only"
+                        case .glomap:
+                            return disableGlomapForThisRun
+                                ? "COLMAP global_mapper disabled for this run; COLMAP mapper fallback only"
+                                : "COLMAP global_mapper preferred with COLMAP mapper fallback"
+                        }
+                    }()
+                    emit(.stageLog(
+                        stage: .sfmMapping,
+                        line: "Mapping preference: \(mapperLabel).",
+                        isError: false
+                    ))
+
+                    if mapperPreference == .glomap && !disableGlomapForThisRun {
+                        let threadHint = max(colmapExtractOptions.extractThreads, colmapMatchOptions.matchThreads)
+                        let baseGlobalMapperOptions = self.globalMapperOptions(threadHint: threadHint)
+                        let gpuRequested = baseGlobalMapperOptions.useGpuForGlobalPositioning || baseGlobalMapperOptions.useGpuForBundleAdjustment
+                        do {
+                            try self.resetDirectory(paths.colmapSparseURL)
+                            emit(.stageLog(
+                                stage: .sfmMapping,
+                                line: "Running COLMAP global_mapper (gp_use_gpu=\(baseGlobalMapperOptions.useGpuForGlobalPositioning), ba_use_gpu=\(baseGlobalMapperOptions.useGpuForBundleAdjustment), threads=\(baseGlobalMapperOptions.numThreads)).",
+                                isError: false
+                            ))
+                            lastMappingAttempt = gpuRequested ? "global_mapper-gpu" : "global_mapper"
+                            try await self.tooling.colmap.runGlobalMapper(
+                                colmapPath: self.config.toolchain.colmap,
+                                database: paths.colmapDatabaseURL,
+                                imagePath: paths.framesSelectedURL,
+                                outputPath: paths.colmapSparseURL,
+                                options: baseGlobalMapperOptions,
+                                environment: colmapMatchOptions.environment,
+                                onLog: { line, isErr in
+                                    globalMapperToolLog.append(stream: isErr ? "stderr" : "stdout", line: line)
+                                    onMappingLog(line, isErr)
+                                }
+                            )
+                            mappingSucceeded = try await evaluateMappingResult(candidate: gpuRequested ? "global_mapper-gpu" : "global_mapper")
+                        } catch {
+                            lastMappingError = error
+                            if let colmapError = error as? ColmapRunnerError,
+                               colmapErrorIndicatesMissingGlobalMapper(colmapError) {
+                                disableGlomapForThisRun = true
+                                emit(.stageLog(
+                                    stage: .sfmMapping,
+                                    line: "COLMAP global_mapper is unavailable in this toolchain; falling back to COLMAP mapper.",
+                                    isError: true
+                                ))
+                            } else if let colmapError = error as? ColmapRunnerError,
+                                      gpuRequested,
+                                      colmapErrorIndicatesGpuFailure(colmapError) {
+                                var cpuGlobalMapperOptions = baseGlobalMapperOptions
+                                cpuGlobalMapperOptions.useGpuForGlobalPositioning = false
+                                cpuGlobalMapperOptions.useGpuForBundleAdjustment = false
+                                emit(.stageLog(
+                                    stage: .sfmMapping,
+                                    line: "global_mapper GPU path failed; retrying global_mapper with GPU disabled.",
+                                    isError: true
+                                ))
+                                do {
+                                    try self.resetDirectory(paths.colmapSparseURL)
+                                    lastMappingAttempt = "global_mapper-cpu"
+                                    try await self.tooling.colmap.runGlobalMapper(
                                         colmapPath: self.config.toolchain.colmap,
                                         database: paths.colmapDatabaseURL,
                                         imagePath: paths.framesSelectedURL,
                                         outputPath: paths.colmapSparseURL,
-                                        options: colmapMatchOptions,
+                                        options: cpuGlobalMapperOptions,
+                                        environment: colmapMatchOptions.environment,
                                         onLog: { line, isErr in
-                                            colmapToolLog.append(stream: isErr ? "stderr" : "stdout", line: line)
+                                            globalMapperToolLog.append(stream: isErr ? "stderr" : "stdout", line: line)
                                             onMappingLog(line, isErr)
                                         }
                                     )
+                                    mappingSucceeded = try await evaluateMappingResult(candidate: "global_mapper-cpu")
+                                } catch {
+                                    lastMappingError = error
                                 }
-
-                                let modelURL = paths.colmapSparseURL.appendingPathComponent("0", isDirectory: true)
-                                guard sparseModelFilesExist(at: modelURL) else {
-                                    throw PipelineError.outputMissing
-                                }
-
-                                let report = try await self.tooling.colmap.runModelAnalyzer(
-                                    colmapPath: self.config.toolchain.colmap,
-                                    modelPath: modelURL,
-                                    options: colmapMatchOptions
-                                )
-                                for line in report.split(separator: "\n", omittingEmptySubsequences: false) {
-                                    colmapToolLog.append(stream: "stdout", line: String(line))
-                                }
-                                let score = ReconstructionScorer.parseModelAnalyzerOutput(report)
-                                writeCheckpoint(
-                                    stage: .sfmMapping,
-                                    progress: 0.95,
-                                    message: "Mapping score: \(ReconstructionScorer.summary(score))",
-                                    details: .sfmMapping(SfmMappingCheckpoint(
-                                        mapper: mapper == .glomap ? "glomap" : "colmap",
-                                        sparsePath: modelURL.path,
-                                        registeredImages: score.registeredImages
-                                    ))
-                                )
-                                emit(.stageLog(
-                                    stage: .sfmMapping,
-                                    line: "Reconstruction score: \(ReconstructionScorer.summary(score)).",
-                                    isError: false
-                                ))
-                                if ReconstructionScorer.isAcceptable(score, mode: metadata.preset.mode) {
-                                    mappingSucceeded = true
-                                    break
-                                } else {
-                                    lastMappingError = PipelineError.lowQualityReconstruction(score)
-                                }
-                            } catch {
-                                if mapper == .glomap,
-                                   !disableGlomapForThisRun,
-                                   glomapErrorIndicatesMissingOpenSSL(error) {
-                                    disableGlomapForThisRun = true
-                                    emit(.stageLog(
-                                        stage: .sfmMapping,
-                                        line: "GLOMAP failed to launch (missing OpenSSL dylibs / rpath). This is a toolchain packaging issue; falling back to COLMAP for the rest of this run.",
-                                        isError: true
-                                    ))
-                                }
-                                lastMappingError = error
-                            }
-                            if !mappingSucceeded,
-                               index == 0,
-                               mapperPreference == .glomap,
-                               mapper == .glomap {
-                                emit(.stageLog(stage: .sfmMapping, line: "GLOMAP mapping failed; trying COLMAP mapper.", isError: true))
                             }
                         }
+                    } else if mapperPreference == .glomap && disableGlomapForThisRun {
+                        emit(.stageLog(
+                            stage: .sfmMapping,
+                            line: "Skipping global_mapper for this run due to previous launch failure.",
+                            isError: true
+                        ))
+                    }
+
+                    if !mappingSucceeded {
+                        if mapperPreference == .glomap {
+                            emit(.stageLog(stage: .sfmMapping, line: "global_mapper mapping failed; trying COLMAP mapper.", isError: true))
+                        }
+                        do {
+                            try self.resetDirectory(paths.colmapSparseURL)
+                            lastMappingAttempt = "colmap"
+                            try await self.tooling.colmap.runMapper(
+                                colmapPath: self.config.toolchain.colmap,
+                                database: paths.colmapDatabaseURL,
+                                imagePath: paths.framesSelectedURL,
+                                outputPath: paths.colmapSparseURL,
+                                options: colmapMatchOptions,
+                                onLog: { line, isErr in
+                                    colmapToolLog.append(stream: isErr ? "stderr" : "stdout", line: line)
+                                    onMappingLog(line, isErr)
+                                }
+                            )
+                            mappingSucceeded = try await evaluateMappingResult(candidate: "colmap")
+                        } catch {
+                            lastMappingError = error
+                        }
+                    }
 
                         if !mappingSucceeded,
                            let pipelineError = lastMappingError as? PipelineError,
@@ -1932,9 +2026,10 @@ public final class PipelineRunner: @unchecked Sendable {
                             } else {
                                 debugMessage = "\(lastMappingError ?? PipelineError.lowQualityReconstruction(.init(registeredImages: 0, totalImages: 0, meanReprojectionError: nil)))"
                             }
+                            let userMessage = "I couldn't get a stable camera solve. Last attempt: \(lastMappingAttempt). Try a slower capture and more light."
                             emitFailure(
                                 stage: .sfmMapping,
-                                userMessage: "I couldn't get a stable camera solve. Try a slower capture and more light.",
+                                userMessage: userMessage,
                                 debugMessage: debugMessage
                             )
                             throw lastMappingError ?? PipelineError.lowQualityReconstruction(.init(registeredImages: 0, totalImages: 0, meanReprojectionError: nil))
@@ -1945,7 +2040,7 @@ public final class PipelineRunner: @unchecked Sendable {
                             progress: 1.0,
                             message: "Camera mapping completed",
                             details: .sfmMapping(SfmMappingCheckpoint(
-                                mapper: mapperPreference.rawValue,
+                                mapper: acceptedMappingStrategy,
                                 sparsePath: finalSparseModel.path,
                                 registeredImages: nil
                             ))
@@ -2689,6 +2784,7 @@ private extension PipelineRunner {
     func sfmBackendOverride() -> SfmBackend? {
         let env = ProcessInfo.processInfo.environment
         if let value = env["EASYSPLAT_SFM_BACKEND"]?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() {
+            if value == "glomap" || value == "global_mapper" { return .colmap }
             if value == "colmap" { return .colmap }
             if value == "fastvggt" { return .fastvggt }
             if value == "vggt" || value == "vggt-mps" { return .vggt }
@@ -2697,14 +2793,14 @@ private extension PipelineRunner {
     }
 
     func sfmBackendPolicy() -> SfmBackend {
-        sfmBackendOverride() ?? .fastvggt
+        sfmBackendOverride() ?? .colmap
     }
 
     func sfmBackendFallbackOrder(override: SfmBackend?) -> [SfmBackend] {
         if let override {
             return [override]
         }
-        return [.fastvggt, .colmap]
+        return [.colmap]
     }
 
     func vggtDevicePreference() -> String {
@@ -3198,6 +3294,42 @@ private extension PipelineRunner {
         return defaultValue
     }
 
+    func intEnvValue(_ key: String) -> Int? {
+        guard let raw = ProcessInfo.processInfo.environment[key]?.trimmingCharacters(in: .whitespacesAndNewlines),
+              let value = Int(raw) else {
+            return nil
+        }
+        return value
+    }
+
+    func stringEnvValue(_ key: String) -> String? {
+        guard let raw = ProcessInfo.processInfo.environment[key]?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !raw.isEmpty else {
+            return nil
+        }
+        return raw
+    }
+
+    func globalMapperOptions(threadHint: Int) -> ColmapGlobalMapperOptions {
+        let preferredThreads = max(1, intEnvValue("EASYSPLAT_GLOBAL_MAPPER_THREADS") ?? threadHint)
+        let gpUseGpu = boolEnvValue("EASYSPLAT_GLOBAL_MAPPER_GP_USE_GPU", default: true)
+        let baUseGpu = boolEnvValue("EASYSPLAT_GLOBAL_MAPPER_BA_USE_GPU", default: true)
+        let gpuIndex = stringEnvValue("EASYSPLAT_GLOBAL_MAPPER_GPU_INDEX") ?? "-1"
+        let gpGpuIndex = stringEnvValue("EASYSPLAT_GLOBAL_MAPPER_GP_GPU_INDEX") ?? gpuIndex
+        let baGpuIndex = stringEnvValue("EASYSPLAT_GLOBAL_MAPPER_BA_GPU_INDEX") ?? gpuIndex
+        let minNumMatches = intEnvValue("EASYSPLAT_GLOBAL_MAPPER_MIN_NUM_MATCHES")
+        let baIterations = intEnvValue("EASYSPLAT_GLOBAL_MAPPER_BA_NUM_ITERATIONS")
+        return ColmapGlobalMapperOptions(
+            useGpuForGlobalPositioning: gpUseGpu,
+            gpuIndexForGlobalPositioning: gpGpuIndex,
+            useGpuForBundleAdjustment: baUseGpu,
+            gpuIndexForBundleAdjustment: baGpuIndex,
+            numThreads: preferredThreads,
+            minNumMatches: minNumMatches,
+            baNumIterations: baIterations
+        )
+    }
+
     func applyAutoTune(
         _ tune: AutoTuneProfile,
         colmapMaxImageSize: inout Int,
@@ -3268,6 +3400,18 @@ private extension PipelineRunner {
         if output.contains("cuda") { return true }
         if output.contains("use_gpu") { return true }
         if output.contains("gpu") { return true }
+        return false
+    }
+
+    func colmapErrorIndicatesMissingGlobalMapper(_ error: ColmapRunnerError) -> Bool {
+        let output: String
+        switch error {
+        case let .failed(_, _, _, stdoutTail, stderrTail):
+            output = (stderrTail + "\n" + stdoutTail).lowercased()
+        }
+        if output.contains("command `global_mapper` not recognized") { return true }
+        if output.contains("global_mapper") && output.contains("not recognized") { return true }
+        if output.contains("unknown option") && output.contains("globalmapper.") { return true }
         return false
     }
 
