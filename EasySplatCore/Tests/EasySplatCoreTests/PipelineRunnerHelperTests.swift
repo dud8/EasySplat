@@ -208,7 +208,15 @@ final class PipelineRunnerHelperTests: XCTestCase {
             "EASYSPLAT_FASTVGGT_BA_MAX_ITERS": "33",
             "EASYSPLAT_FASTVGGT_BA_REFINE_FOCAL": "0",
             "EASYSPLAT_FASTVGGT_BA_REFINE_PP": "1",
-            "EASYSPLAT_FASTVGGT_BA_REFINE_EXTRA": "1"
+            "EASYSPLAT_FASTVGGT_BA_REFINE_EXTRA": "1",
+            "EASYSPLAT_FASTVGGT_FULL_COVERAGE": "1",
+            "EASYSPLAT_FASTVGGT_NO_FALLBACK": "1",
+            "EASYSPLAT_FASTVGGT_GPU_ONLY": "1",
+            "EASYSPLAT_FASTVGGT_POSTPROCESS": "gpu_ba_lite",
+            "EASYSPLAT_FASTVGGT_COVERAGE_PLANNER": "temporal",
+            "EASYSPLAT_FASTVGGT_COVERAGE_WINDOW_TOKENS": "31000",
+            "EASYSPLAT_FASTVGGT_COVERAGE_OVERLAP": "0.4",
+            "EASYSPLAT_FASTVGGT_COVERAGE_MAX_ROUNDS": "6"
         ]) {
             XCTAssertEqual(runner.test_fastvggtMergingPreference(), 2)
             XCTAssertEqual(runner.test_fastvggtMergeRatioPreference(), 0.85, accuracy: 0.0001)
@@ -219,6 +227,14 @@ final class PipelineRunnerHelperTests: XCTestCase {
             XCTAssertFalse(runner.test_fastvggtBaRefineFocalPreference())
             XCTAssertTrue(runner.test_fastvggtBaRefinePrincipalPointPreference())
             XCTAssertTrue(runner.test_fastvggtBaRefineExtraParamsPreference())
+            XCTAssertTrue(runner.test_fastvggtFullCoveragePreference())
+            XCTAssertTrue(runner.test_fastvggtNoFallbackPreference())
+            XCTAssertTrue(runner.test_fastvggtGpuOnlyPreference())
+            XCTAssertEqual(runner.test_fastvggtPostprocessPreference(), "gpu_ba_lite")
+            XCTAssertEqual(runner.test_fastvggtCoveragePlannerPreference(), "temporal")
+            XCTAssertEqual(runner.test_fastvggtCoverageWindowTokensPreference(), 31_000)
+            XCTAssertEqual(runner.test_fastvggtCoverageOverlapPreference(), 0.4, accuracy: 0.0001)
+            XCTAssertEqual(runner.test_fastvggtCoverageMaxRoundsPreference(), 6)
         }
     }
 
@@ -233,7 +249,15 @@ final class PipelineRunnerHelperTests: XCTestCase {
             "EASYSPLAT_FASTVGGT_BA_MAX_ITERS": nil,
             "EASYSPLAT_FASTVGGT_BA_REFINE_FOCAL": nil,
             "EASYSPLAT_FASTVGGT_BA_REFINE_PP": nil,
-            "EASYSPLAT_FASTVGGT_BA_REFINE_EXTRA": nil
+            "EASYSPLAT_FASTVGGT_BA_REFINE_EXTRA": nil,
+            "EASYSPLAT_FASTVGGT_FULL_COVERAGE": nil,
+            "EASYSPLAT_FASTVGGT_NO_FALLBACK": nil,
+            "EASYSPLAT_FASTVGGT_GPU_ONLY": nil,
+            "EASYSPLAT_FASTVGGT_POSTPROCESS": nil,
+            "EASYSPLAT_FASTVGGT_COVERAGE_PLANNER": nil,
+            "EASYSPLAT_FASTVGGT_COVERAGE_WINDOW_TOKENS": nil,
+            "EASYSPLAT_FASTVGGT_COVERAGE_OVERLAP": nil,
+            "EASYSPLAT_FASTVGGT_COVERAGE_MAX_ROUNDS": nil
         ])
         defer { restore() }
 
@@ -243,6 +267,199 @@ final class PipelineRunnerHelperTests: XCTestCase {
         XCTAssertTrue(runner.test_fastvggtBaRefineFocalPreference())
         XCTAssertFalse(runner.test_fastvggtBaRefinePrincipalPointPreference())
         XCTAssertFalse(runner.test_fastvggtBaRefineExtraParamsPreference())
+        XCTAssertFalse(runner.test_fastvggtFullCoveragePreference())
+        XCTAssertFalse(runner.test_fastvggtNoFallbackPreference())
+        XCTAssertFalse(runner.test_fastvggtGpuOnlyPreference())
+        XCTAssertEqual(runner.test_fastvggtPostprocessPreference(), "gpu_ba_lite")
+        XCTAssertEqual(runner.test_fastvggtCoveragePlannerPreference(), "auto")
+        XCTAssertEqual(runner.test_fastvggtCoverageWindowTokensPreference(), 25_000)
+        XCTAssertEqual(runner.test_fastvggtCoverageOverlapPreference(), 0.35, accuracy: 0.0001)
+        XCTAssertEqual(runner.test_fastvggtCoverageMaxRoundsPreference(), 4)
+    }
+
+    func testFastVggtStrictCoverageDefaultsByTier() throws {
+        let root = try TestFileBuilder.makeTempDir()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let runner = makeRunner(projectURL: root)
+
+        let lowVideo = runner.test_fastvggtStrictCoverageDefaults(
+            autoTuneTier: .low,
+            hardwareTier: nil,
+            input: .video(files: ["movie.mp4"]),
+            selectedFrameCount: 1_400
+        )
+        XCTAssertEqual(lowVideo.planner, "temporal")
+        XCTAssertEqual(lowVideo.windowTokens, 14_000)
+        XCTAssertEqual(lowVideo.overlap, 0.55, accuracy: 0.0001)
+        XCTAssertEqual(lowVideo.maxRounds, 8)
+        XCTAssertEqual(lowVideo.postprocess, "none")
+
+        let midPhotos = runner.test_fastvggtStrictCoverageDefaults(
+            autoTuneTier: .mid,
+            hardwareTier: nil,
+            input: .photos(folder: "/tmp/photos"),
+            selectedFrameCount: 600
+        )
+        XCTAssertEqual(midPhotos.planner, "appearance")
+        XCTAssertEqual(midPhotos.windowTokens, 22_000)
+        XCTAssertEqual(midPhotos.overlap, 0.42, accuracy: 0.0001)
+        XCTAssertEqual(midPhotos.maxRounds, 5)
+        XCTAssertEqual(midPhotos.postprocess, "gpu_ba_lite")
+
+        let highPhotos = runner.test_fastvggtStrictCoverageDefaults(
+            autoTuneTier: .high,
+            hardwareTier: nil,
+            input: .photos(folder: "/tmp/photos"),
+            selectedFrameCount: 1_700
+        )
+        XCTAssertEqual(highPhotos.planner, "auto")
+        XCTAssertEqual(highPhotos.windowTokens, 30_000)
+        XCTAssertEqual(highPhotos.overlap, 0.32, accuracy: 0.0001)
+        XCTAssertEqual(highPhotos.maxRounds, 6)
+        XCTAssertEqual(highPhotos.postprocess, "gpu_ba_lite")
+    }
+
+    func testFastVggtCoverageConfigDefaultsToGpuOnlyInStrictMode() async throws {
+        let root = try TestFileBuilder.makeTempDir()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let runner = makeRunner(projectURL: root)
+
+        await withEnvironmentAsync([
+            "EASYSPLAT_FASTVGGT_GPU_ONLY": nil,
+            "EASYSPLAT_FASTVGGT_COVERAGE_PLANNER": nil,
+            "EASYSPLAT_FASTVGGT_COVERAGE_WINDOW_TOKENS": nil,
+            "EASYSPLAT_FASTVGGT_COVERAGE_OVERLAP": nil,
+            "EASYSPLAT_FASTVGGT_COVERAGE_MAX_ROUNDS": nil,
+            "EASYSPLAT_FASTVGGT_POSTPROCESS": nil
+        ]) {
+            let config = runner.test_fastvggtCoverageConfig(
+                strictModeEnabled: true,
+                input: .video(files: ["movie.mp4"]),
+                selectedFrameCount: 240,
+                autoTuneTier: .mid,
+                hardwareTier: nil
+            )
+
+            XCTAssertTrue(config.requireFullCoverage)
+            XCTAssertTrue(config.gpuOnly)
+            XCTAssertEqual(config.postprocessMode, "gpu_ba_lite")
+            XCTAssertEqual(config.coveragePlanner, "temporal")
+        }
+    }
+
+    func testFastVggtCoverageConfigUsesHardwareTierWhenAutotuneUnavailable() async throws {
+        let root = try TestFileBuilder.makeTempDir()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let runner = makeRunner(projectURL: root)
+
+        await withEnvironmentAsync([
+            "EASYSPLAT_FASTVGGT_GPU_ONLY": nil,
+            "EASYSPLAT_FASTVGGT_COVERAGE_PLANNER": nil,
+            "EASYSPLAT_FASTVGGT_COVERAGE_WINDOW_TOKENS": nil,
+            "EASYSPLAT_FASTVGGT_COVERAGE_OVERLAP": nil,
+            "EASYSPLAT_FASTVGGT_COVERAGE_MAX_ROUNDS": nil,
+            "EASYSPLAT_FASTVGGT_POSTPROCESS": nil
+        ]) {
+            let config = runner.test_fastvggtCoverageConfig(
+                strictModeEnabled: true,
+                input: .photos(folder: "/tmp/photos"),
+                selectedFrameCount: 500,
+                autoTuneTier: nil,
+                hardwareTier: .low
+            )
+
+            XCTAssertEqual(config.coveragePlanner, "appearance")
+            XCTAssertEqual(config.coverageWindowTokens, 14_000)
+            XCTAssertEqual(config.coverageOverlap, 0.55, accuracy: 0.0001)
+            XCTAssertEqual(config.coverageMaxRounds, 7)
+        }
+    }
+
+    func testFastVggtStrictCoverageDefaultsTightenForConstrainedHardware() throws {
+        let root = try TestFileBuilder.makeTempDir()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let runner = makeRunner(projectURL: root)
+
+        let constrained = runner.test_fastvggtStrictCoverageDefaults(
+            autoTuneTier: nil,
+            hardwareTier: nil,
+            hardwareMemoryGB: 10,
+            hardwareGpuWorkingSetGB: 4.5,
+            input: .photos(folder: "/tmp/photos"),
+            selectedFrameCount: 1_000
+        )
+
+        XCTAssertEqual(constrained.planner, "appearance")
+        XCTAssertEqual(constrained.windowTokens, 12_000)
+        XCTAssertEqual(constrained.overlap, 0.58, accuracy: 0.0001)
+        XCTAssertEqual(constrained.maxRounds, 9)
+        XCTAssertEqual(constrained.postprocess, "none")
+    }
+
+    func testFastVggtStrictCoverageDefaultsExpandForHighEndHardware() throws {
+        let root = try TestFileBuilder.makeTempDir()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let runner = makeRunner(projectURL: root)
+
+        let highEnd = runner.test_fastvggtStrictCoverageDefaults(
+            autoTuneTier: nil,
+            hardwareTier: nil,
+            hardwareMemoryGB: 64,
+            hardwareGpuWorkingSetGB: 24,
+            input: .photos(folder: "/tmp/photos"),
+            selectedFrameCount: 1_700
+        )
+
+        XCTAssertEqual(highEnd.planner, "auto")
+        XCTAssertEqual(highEnd.windowTokens, 34_000)
+        XCTAssertEqual(highEnd.overlap, 0.27, accuracy: 0.0001)
+        XCTAssertEqual(highEnd.maxRounds, 5)
+        XCTAssertEqual(highEnd.postprocess, "gpu_ba_lite")
+    }
+
+    func testFastVggtStrictCoverageDefaultsDisablePostprocessForHugeSets() throws {
+        let root = try TestFileBuilder.makeTempDir()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let runner = makeRunner(projectURL: root)
+
+        let huge = runner.test_fastvggtStrictCoverageDefaults(
+            autoTuneTier: .high,
+            hardwareTier: nil,
+            input: .photos(folder: "/tmp/photos"),
+            selectedFrameCount: 3_200
+        )
+
+        XCTAssertEqual(huge.postprocess, "none")
+    }
+
+    func testFastVggtCoverageConfigEnvOverridesStrictGpuOnlyDefault() async throws {
+        let root = try TestFileBuilder.makeTempDir()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let runner = makeRunner(projectURL: root)
+
+        await withEnvironmentAsync([
+            "EASYSPLAT_FASTVGGT_GPU_ONLY": "0",
+            "EASYSPLAT_FASTVGGT_COVERAGE_PLANNER": "appearance",
+            "EASYSPLAT_FASTVGGT_COVERAGE_WINDOW_TOKENS": "26000",
+            "EASYSPLAT_FASTVGGT_COVERAGE_OVERLAP": "0.33",
+            "EASYSPLAT_FASTVGGT_COVERAGE_MAX_ROUNDS": "9",
+            "EASYSPLAT_FASTVGGT_POSTPROCESS": "none"
+        ]) {
+            let config = runner.test_fastvggtCoverageConfig(
+                strictModeEnabled: true,
+                input: .video(files: ["movie.mp4"]),
+                selectedFrameCount: 240,
+                autoTuneTier: .mid,
+                hardwareTier: nil
+            )
+
+            XCTAssertFalse(config.gpuOnly)
+            XCTAssertEqual(config.coveragePlanner, "appearance")
+            XCTAssertEqual(config.coverageWindowTokens, 26_000)
+            XCTAssertEqual(config.coverageOverlap, 0.33, accuracy: 0.0001)
+            XCTAssertEqual(config.coverageMaxRounds, 9)
+            XCTAssertEqual(config.postprocessMode, "none")
+        }
     }
 
     func testFastVggtRefinementSpeedTuningAppliesForLargeFrameSets() throws {

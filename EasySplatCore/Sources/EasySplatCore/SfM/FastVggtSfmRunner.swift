@@ -1,5 +1,36 @@
 import Foundation
 
+public struct FastVggtCoverageConfig: Sendable {
+    public var requireFullCoverage: Bool
+    public var coveragePlanner: String
+    public var coverageWindowTokens: Int
+    public var coverageOverlap: Double
+    public var coverageMaxRounds: Int
+    public var coverageManifestPath: URL?
+    public var gpuOnly: Bool
+    public var postprocessMode: String
+
+    public init(
+        requireFullCoverage: Bool = false,
+        coveragePlanner: String = "auto",
+        coverageWindowTokens: Int = 25_000,
+        coverageOverlap: Double = 0.35,
+        coverageMaxRounds: Int = 4,
+        coverageManifestPath: URL? = nil,
+        gpuOnly: Bool = false,
+        postprocessMode: String = "gpu_ba_lite"
+    ) {
+        self.requireFullCoverage = requireFullCoverage
+        self.coveragePlanner = coveragePlanner
+        self.coverageWindowTokens = coverageWindowTokens
+        self.coverageOverlap = coverageOverlap
+        self.coverageMaxRounds = coverageMaxRounds
+        self.coverageManifestPath = coverageManifestPath
+        self.gpuOnly = gpuOnly
+        self.postprocessMode = postprocessMode
+    }
+}
+
 public struct FastVggtSfmConfig: Sendable {
     public var device: String
     public var dtype: String
@@ -10,6 +41,7 @@ public struct FastVggtSfmConfig: Sendable {
     public var mergeRatio: Double
     public var sharedCamera: Bool
     public var cameraType: String
+    public var coverage: FastVggtCoverageConfig?
 
     public init(
         device: String = "mps",
@@ -20,7 +52,8 @@ public struct FastVggtSfmConfig: Sendable {
         merging: Int = 0,
         mergeRatio: Double = 0.9,
         sharedCamera: Bool = false,
-        cameraType: String = "SIMPLE_PINHOLE"
+        cameraType: String = "SIMPLE_PINHOLE",
+        coverage: FastVggtCoverageConfig? = nil
     ) {
         self.device = device
         self.dtype = dtype
@@ -31,6 +64,7 @@ public struct FastVggtSfmConfig: Sendable {
         self.mergeRatio = mergeRatio
         self.sharedCamera = sharedCamera
         self.cameraType = cameraType
+        self.coverage = coverage
     }
 }
 
@@ -89,6 +123,22 @@ public final class FastVggtSfmRunner: @unchecked Sendable, FastVggtSfmRunning {
         var resolvedArgs = args
         if config.sharedCamera {
             resolvedArgs.append("--shared-camera")
+        }
+        if let coverage = config.coverage {
+            if coverage.requireFullCoverage {
+                resolvedArgs.append("--require-full-coverage")
+            }
+            resolvedArgs.append(contentsOf: ["--coverage-planner", coverage.coveragePlanner])
+            resolvedArgs.append(contentsOf: ["--coverage-window-tokens", "\(coverage.coverageWindowTokens)"])
+            resolvedArgs.append(contentsOf: ["--coverage-overlap", "\(coverage.coverageOverlap)"])
+            resolvedArgs.append(contentsOf: ["--coverage-max-rounds", "\(coverage.coverageMaxRounds)"])
+            if let manifestPath = coverage.coverageManifestPath {
+                resolvedArgs.append(contentsOf: ["--coverage-manifest", manifestPath.path])
+            }
+            if coverage.gpuOnly {
+                resolvedArgs.append("--gpu-only")
+            }
+            resolvedArgs.append(contentsOf: ["--postprocess", coverage.postprocessMode])
         }
 
         var environment = ProcessInfo.processInfo.environment

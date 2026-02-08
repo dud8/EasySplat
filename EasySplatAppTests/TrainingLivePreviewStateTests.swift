@@ -33,6 +33,33 @@ final class TrainingLivePreviewStateTests: XCTestCase {
         XCTAssertEqual(state.pollIntervalSeconds, 5.0)
     }
 
+    func testStableExistingSnapshotLoadsImmediatelyOnFirstDetection() {
+        var state = TrainingLivePreviewState()
+        let modifiedAt = Date(timeIntervalSince1970: 1_726_000_000)
+        let now = modifiedAt.addingTimeInterval(10)
+        let fingerprint = SnapshotFingerprint(modifiedAt: modifiedAt, fileSize: 42)
+
+        state.ingestFingerprint(fingerprint, now: now, isLoadable: true)
+
+        XCTAssertTrue(state.hasDetectedSnapshot)
+        XCTAssertEqual(state.reloadToken, 1)
+        XCTAssertTrue(state.isLoading)
+    }
+
+    func testFreshSnapshotStillWaitsForStabilityWindowBeforeFirstLoad() {
+        var state = TrainingLivePreviewState()
+        let modifiedAt = Date(timeIntervalSince1970: 1_726_000_000)
+        let fingerprint = SnapshotFingerprint(modifiedAt: modifiedAt, fileSize: 42)
+
+        state.ingestFingerprint(fingerprint, now: modifiedAt.addingTimeInterval(0.5), isLoadable: true)
+        XCTAssertEqual(state.reloadToken, 0)
+        XCTAssertFalse(state.isLoading)
+
+        state.ingestFingerprint(fingerprint, now: modifiedAt.addingTimeInterval(2.7), isLoadable: true)
+        XCTAssertEqual(state.reloadToken, 1)
+        XCTAssertTrue(state.isLoading)
+    }
+
     func testFailureBeforeFirstRenderClearsOnNewSnapshot() {
         var state = TrainingLivePreviewState()
         let start = Date()
@@ -74,7 +101,7 @@ final class TrainingLivePreviewStateTests: XCTestCase {
 
         XCTAssertTrue(state.hasDetectedSnapshot)
         XCTAssertTrue(state.isLoading)
-        XCTAssertEqual(state.placeholderMessage, "Loading latest preview…")
+        XCTAssertEqual(state.placeholderMessage, "Loading preview…")
     }
 
     func testUnreadySnapshotDoesNotTriggerReload() {
@@ -118,14 +145,13 @@ final class TrainingLivePreviewStateTests: XCTestCase {
         state.recordPoll(at: firstPoll)
         XCTAssertEqual(state.pollCount, 1)
         XCTAssertEqual(state.lastPollAt, firstPoll)
-        XCTAssertTrue(state.pollStatusLine.contains("Last check"))
-        XCTAssertTrue(state.pollStatusLine.contains("1 check"))
+        XCTAssertEqual(state.pollStatusLine, "Refreshes every 5s.")
 
         let secondPoll = firstPoll.addingTimeInterval(1)
         state.recordPoll(at: secondPoll)
         XCTAssertEqual(state.pollCount, 2)
         XCTAssertEqual(state.lastPollAt, secondPoll)
-        XCTAssertTrue(state.pollStatusLine.contains("2 checks"))
+        XCTAssertEqual(state.pollStatusLine, "Refreshes every 5s.")
     }
 
     func testPollCadenceAdaptsAcrossTrainingProgressTiers() {
@@ -142,6 +168,25 @@ final class TrainingLivePreviewStateTests: XCTestCase {
         XCTAssertEqual(state.pollIntervalSeconds, 15.0)
         XCTAssertEqual(state.pollCadenceTier, .late)
         XCTAssertTrue(state.pollStatusLine.contains("every 15s"))
+    }
+
+    func testFirstLoadFailureQueuesRetryForSameSnapshot() {
+        var state = TrainingLivePreviewState()
+        let modifiedAt = Date(timeIntervalSince1970: 1_726_000_000)
+        let now = modifiedAt.addingTimeInterval(10)
+        let fingerprint = SnapshotFingerprint(modifiedAt: modifiedAt, fileSize: 256)
+
+        state.ingestFingerprint(fingerprint, now: now, isLoadable: true)
+        XCTAssertEqual(state.reloadToken, 1)
+        XCTAssertTrue(state.isLoading)
+
+        state.ingestLoadState(.failed("temporary load issue"))
+        XCTAssertFalse(state.isLoading)
+        XCTAssertEqual(state.lastLoadError, "temporary load issue")
+
+        state.ingestFingerprint(fingerprint, now: now.addingTimeInterval(1), isLoadable: true)
+        XCTAssertEqual(state.reloadToken, 2)
+        XCTAssertTrue(state.isLoading)
     }
 
     private func makeTempSnapshot(data: Data) throws -> URL {

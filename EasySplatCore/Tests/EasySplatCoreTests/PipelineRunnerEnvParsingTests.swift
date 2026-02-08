@@ -28,7 +28,10 @@ final class PipelineRunnerEnvParsingTests: XCTestCase {
             "EASYSPLAT_FASTVGGT_REQUIRE_REFINED_MODEL": " 1 ",
             "EASYSPLAT_FASTVGGT_BA_REFINE_FOCAL": " yes ",
             "EASYSPLAT_FASTVGGT_BA_REFINE_PP": " tRuE ",
-            "EASYSPLAT_FASTVGGT_BA_REFINE_EXTRA": " nO "
+            "EASYSPLAT_FASTVGGT_BA_REFINE_EXTRA": " nO ",
+            "EASYSPLAT_FASTVGGT_FULL_COVERAGE": " YES ",
+            "EASYSPLAT_FASTVGGT_NO_FALLBACK": " 1 ",
+            "EASYSPLAT_FASTVGGT_GPU_ONLY": " true "
         ]) {
             XCTAssertTrue(runner.test_vggtUseBundleAdjustmentPreference())
             XCTAssertFalse(runner.test_vggtFineTrackingPreference())
@@ -37,6 +40,46 @@ final class PipelineRunnerEnvParsingTests: XCTestCase {
             XCTAssertTrue(runner.test_fastvggtBaRefineFocalPreference())
             XCTAssertTrue(runner.test_fastvggtBaRefinePrincipalPointPreference())
             XCTAssertFalse(runner.test_fastvggtBaRefineExtraParamsPreference())
+            XCTAssertTrue(runner.test_fastvggtFullCoveragePreference())
+            XCTAssertTrue(runner.test_fastvggtNoFallbackPreference())
+            XCTAssertTrue(runner.test_fastvggtGpuOnlyPreference())
+        }
+    }
+
+    func testFastVggtCoveragePreferenceDefaultsAndValidation() async {
+        let runner = makeRunner()
+        await withEnvironmentAsync([
+            "EASYSPLAT_FASTVGGT_POSTPROCESS": "invalid",
+            "EASYSPLAT_FASTVGGT_COVERAGE_PLANNER": "weird",
+            "EASYSPLAT_FASTVGGT_COVERAGE_WINDOW_TOKENS": "50",
+            "EASYSPLAT_FASTVGGT_COVERAGE_OVERLAP": "1.5",
+            "EASYSPLAT_FASTVGGT_COVERAGE_MAX_ROUNDS": "0",
+            "EASYSPLAT_FASTVGGT_FULL_COVERAGE": nil,
+            "EASYSPLAT_FASTVGGT_NO_FALLBACK": nil,
+            "EASYSPLAT_FASTVGGT_GPU_ONLY": nil
+        ]) {
+            XCTAssertEqual(runner.test_fastvggtPostprocessPreference(), "gpu_ba_lite")
+            XCTAssertEqual(runner.test_fastvggtCoveragePlannerPreference(), "auto")
+            XCTAssertEqual(runner.test_fastvggtCoverageWindowTokensPreference(), 25_000)
+            XCTAssertEqual(runner.test_fastvggtCoverageOverlapPreference(), 0.35, accuracy: 0.0001)
+            XCTAssertEqual(runner.test_fastvggtCoverageMaxRoundsPreference(), 4)
+            XCTAssertFalse(runner.test_fastvggtFullCoveragePreference())
+            XCTAssertFalse(runner.test_fastvggtNoFallbackPreference())
+            XCTAssertFalse(runner.test_fastvggtGpuOnlyPreference())
+        }
+
+        await withEnvironmentAsync([
+            "EASYSPLAT_FASTVGGT_POSTPROCESS": "NoNe",
+            "EASYSPLAT_FASTVGGT_COVERAGE_PLANNER": " appearance ",
+            "EASYSPLAT_FASTVGGT_COVERAGE_WINDOW_TOKENS": "30000",
+            "EASYSPLAT_FASTVGGT_COVERAGE_OVERLAP": "0.6",
+            "EASYSPLAT_FASTVGGT_COVERAGE_MAX_ROUNDS": "7"
+        ]) {
+            XCTAssertEqual(runner.test_fastvggtPostprocessPreference(), "none")
+            XCTAssertEqual(runner.test_fastvggtCoveragePlannerPreference(), "appearance")
+            XCTAssertEqual(runner.test_fastvggtCoverageWindowTokensPreference(), 30_000)
+            XCTAssertEqual(runner.test_fastvggtCoverageOverlapPreference(), 0.6, accuracy: 0.0001)
+            XCTAssertEqual(runner.test_fastvggtCoverageMaxRoundsPreference(), 7)
         }
     }
 

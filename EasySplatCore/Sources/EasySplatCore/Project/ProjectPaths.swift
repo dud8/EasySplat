@@ -25,6 +25,7 @@ public struct ProjectPaths: Sendable {
     public var glomapLogURL: URL { logsURL.appendingPathComponent("glomap.log") }
     public var vggtLogURL: URL { logsURL.appendingPathComponent("vggt.log") }
     public var fastvggtLogURL: URL { logsURL.appendingPathComponent("fastvggt.log") }
+    public var fastvggtCoverageManifestURL: URL { logsURL.appendingPathComponent("fastvggt_coverage_manifest.json") }
     public var brushLogURL: URL { logsURL.appendingPathComponent("brush.log") }
 
     public func ensureDirectories() throws {

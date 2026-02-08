@@ -268,6 +268,8 @@ final class PipelineIntegrationTests: XCTestCase {
         let restore = await scopedEnvironment([
             "EASYSPLAT_SFM_BACKEND": nil,
             "EASYSPLAT_SFM_MAPPER": nil,
+            "EASYSPLAT_FASTVGGT_FULL_COVERAGE": nil,
+            "EASYSPLAT_FASTVGGT_NO_FALLBACK": nil,
             "EASYSPLAT_SKIP_TRAINING": "1"
         ])
         defer { restore() }
@@ -316,6 +318,8 @@ final class PipelineIntegrationTests: XCTestCase {
         let restore = await scopedEnvironment([
             "EASYSPLAT_SFM_BACKEND": nil,
             "EASYSPLAT_SFM_MAPPER": nil,
+            "EASYSPLAT_FASTVGGT_FULL_COVERAGE": "0",
+            "EASYSPLAT_FASTVGGT_NO_FALLBACK": "0",
             "EASYSPLAT_SKIP_TRAINING": "1"
         ])
         defer { restore() }
@@ -369,6 +373,8 @@ final class PipelineIntegrationTests: XCTestCase {
         let restore = await scopedEnvironment([
             "EASYSPLAT_SFM_BACKEND": nil,
             "EASYSPLAT_SFM_MAPPER": nil,
+            "EASYSPLAT_FASTVGGT_FULL_COVERAGE": "0",
+            "EASYSPLAT_FASTVGGT_NO_FALLBACK": "0",
             "EASYSPLAT_ENABLE_VGGT_GRACE_FALLBACK": "1",
             "EASYSPLAT_SKIP_TRAINING": "1"
         ])
@@ -418,6 +424,8 @@ final class PipelineIntegrationTests: XCTestCase {
         let restore = await scopedEnvironment([
             "EASYSPLAT_SFM_BACKEND": nil,
             "EASYSPLAT_SFM_MAPPER": nil,
+            "EASYSPLAT_FASTVGGT_FULL_COVERAGE": "0",
+            "EASYSPLAT_FASTVGGT_NO_FALLBACK": "0",
             "EASYSPLAT_VGGT_CAMERA_TYPE": "PINHOLE",
             "EASYSPLAT_SKIP_TRAINING": "1"
         ])
@@ -479,6 +487,8 @@ final class PipelineIntegrationTests: XCTestCase {
         let restore = await scopedEnvironment([
             "EASYSPLAT_SFM_BACKEND": nil,
             "EASYSPLAT_SFM_MAPPER": nil,
+            "EASYSPLAT_FASTVGGT_FULL_COVERAGE": "0",
+            "EASYSPLAT_FASTVGGT_NO_FALLBACK": "0",
             "EASYSPLAT_SKIP_TRAINING": "1"
         ])
         defer { restore() }
@@ -565,6 +575,93 @@ final class PipelineIntegrationTests: XCTestCase {
         XCTAssertTrue(matchingProgress.contains(where: { $0.1.contains("Matching views: extracting local features") }))
         XCTAssertTrue(matchingProgress.contains(where: { $0.1.contains("pairs ") }))
         XCTAssertGreaterThan(matchingProgress.map(\.0).max() ?? 0, 0.30)
+    }
+
+    func testPipelineFastVggtStrictCoverageSkipsExternalMatcherAndMapper() async throws {
+        let restore = await scopedEnvironment([
+            "EASYSPLAT_SFM_BACKEND": nil,
+            "EASYSPLAT_SFM_MAPPER": nil,
+            "EASYSPLAT_FASTVGGT_FULL_COVERAGE": "1",
+            "EASYSPLAT_SKIP_TRAINING": "1"
+        ])
+        defer { restore() }
+
+        let temp = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        let projectURL = temp.appendingPathComponent("Test.easysplatproj", isDirectory: true)
+        let sourcePhotos = temp.appendingPathComponent("SourcePhotos", isDirectory: true)
+        try FileManager.default.createDirectory(at: sourcePhotos, withIntermediateDirectories: true)
+        for index in 0..<10 {
+            try writeTestImage(url: sourcePhotos.appendingPathComponent("img\(index).jpg"), value: UInt8(index % 255))
+        }
+
+        let metadata = ProjectMetadata(
+            title: "Test",
+            input: .photos(folder: sourcePhotos.path),
+            preset: PresetSpec(mode: .object, quality: .draft)
+        )
+        let paths = ProjectPaths(root: projectURL)
+        try paths.ensureDirectories()
+        try ProjectMetadataStore.save(metadata, to: paths.metadataURL)
+
+        let toolchain = try makeToolchain(root: temp, createVggtFiles: true)
+
+        let runner = MockSubprocessRunner(scripts: [
+            .init(path: toolchain.fastvggt.sfmTool.path, argsPrefix: ["--images"], result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""), onRun: { args in
+                guard let out = self.value(for: "--out-sparse", in: args) else { return }
+                try? self.writeSparseModel(at: URL(fileURLWithPath: out), imageName: "frame_000000.jpg")
+                if let manifest = self.value(for: "--coverage-manifest", in: args) {
+                    try? Data("{\"ok\":true}".utf8).write(to: URL(fileURLWithPath: manifest))
+                }
+            })
+        ])
+
+        final class LockedEvents: @unchecked Sendable {
+            private let lock = NSLock()
+            private var events: [PipelineEvent] = []
+
+            func append(_ event: PipelineEvent) {
+                lock.lock()
+                events.append(event)
+                lock.unlock()
+            }
+
+            func snapshot() -> [PipelineEvent] {
+                lock.lock()
+                let copy = events
+                lock.unlock()
+                return copy
+            }
+        }
+
+        let sink = LockedEvents()
+        let pipeline = PipelineRunner(
+            projectURL: projectURL,
+            config: .init(toolchain: toolchain, preset: metadata.preset),
+            tooling: .init(runner: runner)
+        )
+
+        try await pipeline.run { event in
+            sink.append(event)
+        }
+
+        let allCalls = runner.calls
+        XCTAssertEqual(allCalls.filter { $0.0 == toolchain.fastvggt.sfmTool.path }.count, 1)
+        let fastArgs = allCalls.first(where: { $0.0 == toolchain.fastvggt.sfmTool.path })?.1 ?? []
+        XCTAssertTrue(fastArgs.contains("--gpu-only"))
+        XCTAssertFalse(allCalls.contains(where: { $0.0 == toolchain.colmap.path && $0.1.first == "feature_extractor" }))
+        XCTAssertFalse(allCalls.contains(where: { $0.0 == toolchain.colmap.path && $0.1.first == "exhaustive_matcher" }))
+        XCTAssertFalse(allCalls.contains(where: { $0.0 == toolchain.colmap.path && $0.1.first == "sequential_matcher" }))
+        XCTAssertFalse(allCalls.contains(where: { $0.0 == toolchain.colmap.path && $0.1.first == "point_triangulator" }))
+        XCTAssertFalse(allCalls.contains(where: { $0.0 == toolchain.colmap.path && $0.1.first == "bundle_adjuster" }))
+        XCTAssertFalse(allCalls.contains(where: { $0.0 == toolchain.colmap.path && $0.1.first == "mapper" }))
+        XCTAssertFalse(allCalls.contains(where: { $0.0 == toolchain.glomap.path && $0.1.first == "mapper" }))
+
+        let logs = sink.snapshot().compactMap { event -> String? in
+            guard case let .stageLog(_, line, _) = event else { return nil }
+            return line
+        }
+        XCTAssertTrue(logs.contains(where: { $0.contains("skipping COLMAP matching stage") }))
+        XCTAssertTrue(logs.contains(where: { $0.contains("skipping external mapping/refinement fallback") }))
     }
 
     func testPipelineFastVggtAllowsSeedFallbackWhenRefinementNotRequired() async throws {

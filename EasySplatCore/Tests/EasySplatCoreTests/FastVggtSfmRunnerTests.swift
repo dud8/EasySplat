@@ -119,5 +119,70 @@ final class FastVggtSfmRunnerTests: XCTestCase {
 
         XCTAssertFalse(capturedArgs.contains("--shared-camera"))
     }
+
+    func testRunAddsStrictCoverageArgsWhenConfigured() async throws {
+        let temp = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        let toolchain = try TestToolchains.fastVggtToolchain(root: temp, createFiles: true)
+        let imagesPath = temp.appendingPathComponent("images", isDirectory: true)
+        let outSparse = temp.appendingPathComponent("sparse/0", isDirectory: true)
+        let coverageManifest = temp.appendingPathComponent("coverage_manifest.json")
+
+        try FileManager.default.createDirectory(at: imagesPath, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: outSparse, withIntermediateDirectories: true)
+
+        let config = FastVggtSfmConfig(
+            device: "mps",
+            dtype: "float16",
+            vggtFixedResolution: 518,
+            confidenceThreshold: 3.5,
+            maxPoints: 50_000,
+            merging: 1,
+            mergeRatio: 0.9,
+            sharedCamera: false,
+            cameraType: "SIMPLE_PINHOLE",
+            coverage: FastVggtCoverageConfig(
+                requireFullCoverage: true,
+                coveragePlanner: "appearance",
+                coverageWindowTokens: 30_000,
+                coverageOverlap: 0.5,
+                coverageMaxRounds: 5,
+                coverageManifestPath: coverageManifest,
+                gpuOnly: true,
+                postprocessMode: "gpu_ba_lite"
+            )
+        )
+
+        var capturedArgs: [String] = []
+        let mock = MockSubprocessRunner(scripts: [
+            .init(path: toolchain.sfmTool.path, argsPrefix: ["--images", imagesPath.path], result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""), onRun: { args in
+                capturedArgs = args
+            })
+        ])
+
+        let runner = FastVggtSfmRunner(runner: mock)
+        try await runner.run(
+            toolchain: toolchain,
+            images: imagesPath,
+            outSparse: outSparse,
+            config: config,
+            onLog: { _, _ in }
+        )
+
+        XCTAssertTrue(capturedArgs.contains("--require-full-coverage"))
+        XCTAssertEqual(self.value(after: "--coverage-planner", in: capturedArgs), "appearance")
+        XCTAssertEqual(self.value(after: "--coverage-window-tokens", in: capturedArgs), "30000")
+        XCTAssertEqual(self.value(after: "--coverage-overlap", in: capturedArgs), "0.5")
+        XCTAssertEqual(self.value(after: "--coverage-max-rounds", in: capturedArgs), "5")
+        XCTAssertEqual(self.value(after: "--coverage-manifest", in: capturedArgs), coverageManifest.path)
+        XCTAssertTrue(capturedArgs.contains("--gpu-only"))
+        XCTAssertEqual(self.value(after: "--postprocess", in: capturedArgs), "gpu_ba_lite")
+    }
+
+    private func value(after flag: String, in args: [String]) -> String? {
+        guard let index = args.firstIndex(of: flag), args.indices.contains(index + 1) else {
+            return nil
+        }
+        return args[index + 1]
+    }
 }
 #endif

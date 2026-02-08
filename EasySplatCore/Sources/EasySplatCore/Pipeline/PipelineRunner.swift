@@ -386,10 +386,10 @@ public final class PipelineRunner: @unchecked Sendable {
             }
 
             var autoTuneProfile: AutoTuneProfile? = nil
+            let detectedHardwareProfile = HardwareProfile.detect()
             if shouldAutoTune() {
-                let detected = HardwareProfile.detect()
                 let tune = AutoTuner.make(
-                    profile: detected,
+                    profile: detectedHardwareProfile,
                     preset: metadata.preset,
                     selectedFrameCount: selectedFrames.count
                 )
@@ -400,7 +400,7 @@ public final class PipelineRunner: @unchecked Sendable {
                     colmapExtractOptions: &colmapExtractOptions,
                     colmapMatchOptions: &colmapMatchOptions
                 )
-                emit(.stageLog(stage: .sfmFeatures, line: tune.summary(profile: detected), isError: false))
+                emit(.stageLog(stage: .sfmFeatures, line: tune.summary(profile: detectedHardwareProfile), isError: false))
             }
 
             try Task.checkCancellation()
@@ -422,6 +422,7 @@ public final class PipelineRunner: @unchecked Sendable {
                 ))
             }
 
+            let strictFastVggtRequested = fastvggtFullCoveragePreference() || fastvggtNoFallbackPreference()
             if let autoTuneProfile, !autoTuneProfile.vggtAllowed,
                backendOrder.contains(where: { $0 == .fastvggt || $0 == .vggt }) {
                 let name: String = {
@@ -430,12 +431,20 @@ public final class PipelineRunner: @unchecked Sendable {
                     }
                     return "FastVGGT/VGGT"
                 }()
-                emit(.stageLog(
-                    stage: .sfmFeatures,
-                    line: "Auto-tune disabled \(name) on this hardware tier; falling back to COLMAP + GLOMAP.",
-                    isError: true
-                ))
-                backendOrder = [.colmap]
+                if strictFastVggtRequested {
+                    emit(.stageLog(
+                        stage: .sfmFeatures,
+                        line: "Auto-tune marks \(name) as high risk on this hardware tier, but strict FastVGGT mode is enabled. Continuing with conservative strict settings (no fallback).",
+                        isError: true
+                    ))
+                } else {
+                    emit(.stageLog(
+                        stage: .sfmFeatures,
+                        line: "Auto-tune disabled \(name) on this hardware tier; falling back to COLMAP + GLOMAP.",
+                        isError: true
+                    ))
+                    backendOrder = [.colmap]
+                }
             }
 
             let backendName: (SfmBackend) -> String = { backend in
@@ -455,6 +464,18 @@ public final class PipelineRunner: @unchecked Sendable {
                         let fm = FileManager.default
                         let seedZero = paths.colmapSeedModelURL
                         let sparseZero = paths.colmapSparseURL.appendingPathComponent("0", isDirectory: true)
+                        let strictFullCoverage = fastvggtFullCoveragePreference()
+                        let strictNoFallback = fastvggtNoFallbackPreference()
+                        let strictFastVggtMode = strictFullCoverage || strictNoFallback
+                        let strictCoverage = fastvggtCoverageConfig(
+                            strictModeEnabled: strictFastVggtMode,
+                            input: metadata.input,
+                            selectedFrameCount: selectedFrames.count,
+                            autoTune: autoTuneProfile,
+                            hardwareProfile: detectedHardwareProfile,
+                            manifestPath: strictFastVggtMode ? paths.fastvggtCoverageManifestURL : nil
+                        )
+                        let fastSeedModelURL = strictFastVggtMode ? sparseZero : seedZero
                         let fastRequireRefined = fastvggtRequireRefinedModelPreference()
                         let fastUseBA = fastvggtUseBundleAdjustmentPreference()
                         let fastCameraType = vggtCameraTypePreference()
@@ -479,13 +500,29 @@ public final class PipelineRunner: @unchecked Sendable {
                             writeCheckpoint(
                                 stage: .sfmFeatures,
                                 progress: 0,
-                                message: "FastVGGT seed export started",
+                                message: strictFastVggtMode ? "FastVGGT strict full-coverage run started" : "FastVGGT seed export started",
                                 details: .sfmFeatures(SfmFeaturesCheckpoint(
                                     databasePath: paths.colmapDatabaseURL.path,
                                     imageCount: selectedFrames.count
                                 ))
                             )
                             emit(.stageLog(stage: .sfmFeatures, line: "SfM backend: fastvggt-mps.", isError: false))
+                            if strictFastVggtMode {
+                                emit(.stageLog(
+                                    stage: .sfmFeatures,
+                                    line: "FastVGGT strict mode enabled: GPU-only coverage planner=\(strictCoverage.coveragePlanner), no external mapper fallback.",
+                                    isError: false
+                                ))
+                                emit(.stageLog(
+                                    stage: .sfmFeatures,
+                                    line: fastvggtCoverageSummary(
+                                        config: strictCoverage,
+                                        autoTune: autoTuneProfile,
+                                        hardwareProfile: detectedHardwareProfile
+                                    ),
+                                    isError: false
+                                ))
+                            }
 
                             self.removeIfExists(paths.colmapDatabaseURL)
                             try self.resetDirectory(paths.colmapSeedURL)
@@ -502,7 +539,8 @@ public final class PipelineRunner: @unchecked Sendable {
                                 merging: fastvggtMergingPreference(),
                                 mergeRatio: fastvggtMergeRatioPreference(),
                                 sharedCamera: fastSharedCamera,
-                                cameraType: fastCameraType
+                                cameraType: fastCameraType,
+                                coverage: strictFastVggtMode ? strictCoverage : nil
                             )
 
                             emit(.stageLog(
@@ -517,7 +555,9 @@ public final class PipelineRunner: @unchecked Sendable {
                             ))
                             emit(.stageLog(
                                 stage: .sfmFeatures,
-                                line: "FastVGGT refinement policy: external COLMAP (useBA=\(fastUseBA) requireRefined=\(fastRequireRefined) baMaxIters=\(fastBAOptions.maxNumIterations) refineFocal=\(fastBAOptions.refineFocalLength) refinePP=\(fastBAOptions.refinePrincipalPoint) refineExtra=\(fastBAOptions.refineExtraParams)).",
+                                line: strictFastVggtMode
+                                    ? "FastVGGT refinement policy: strict GPU-only (postprocess=\(strictCoverage.postprocessMode), requireFullCoverage=\(strictCoverage.requireFullCoverage), maxRounds=\(strictCoverage.coverageMaxRounds))."
+                                    : "FastVGGT refinement policy: external COLMAP (useBA=\(fastUseBA) requireRefined=\(fastRequireRefined) baMaxIters=\(fastBAOptions.maxNumIterations) refineFocal=\(fastBAOptions.refineFocalLength) refinePP=\(fastBAOptions.refinePrincipalPoint) refineExtra=\(fastBAOptions.refineExtraParams)).",
                                 isError: false
                             ))
 
@@ -534,7 +574,7 @@ public final class PipelineRunner: @unchecked Sendable {
                                     "merging": "\(fastConfig.merging)",
                                     "mergeRatio": "\(fastConfig.mergeRatio)",
                                     "modelsDir": self.config.toolchain.fastvggt.models.path,
-                                    "outSeedSparse": seedZero.path,
+                                    "outSeedSparse": fastSeedModelURL.path,
                                     "tool": self.config.toolchain.fastvggt.sfmTool.path,
                                     "vggtResolution": "\(fastConfig.vggtFixedResolution)"
                                 ]
@@ -556,15 +596,15 @@ public final class PipelineRunner: @unchecked Sendable {
                             try await self.tooling.fastVggtSfm.run(
                                 toolchain: self.config.toolchain.fastvggt,
                                 images: paths.framesSelectedURL,
-                                outSparse: seedZero,
+                                outSparse: fastSeedModelURL,
                                 config: fastConfig,
                                 onLog: onFastLog
                             )
 
-                            guard sparseModelFilesExist(at: seedZero) else {
+                            guard sparseModelFilesExist(at: fastSeedModelURL) else {
                                 throw PipelineError.outputMissing
                             }
-                            let imagesTxt = seedZero.appendingPathComponent("images.txt")
+                            let imagesTxt = fastSeedModelURL.appendingPathComponent("images.txt")
                             if try ColmapTextModelNormalizer.normalizeImagesTxtIfNeeded(at: imagesTxt) {
                                 emit(.stageLog(
                                     stage: .sfmFeatures,
@@ -580,7 +620,7 @@ public final class PipelineRunner: @unchecked Sendable {
                             writeCheckpoint(
                                 stage: .sfmFeatures,
                                 progress: 1.0,
-                                message: "FastVGGT seed model ready",
+                                message: strictFastVggtMode ? "FastVGGT strict sparse model ready" : "FastVGGT seed model ready",
                                 details: .sfmFeatures(SfmFeaturesCheckpoint(
                                     databasePath: paths.colmapDatabaseURL.path,
                                     imageCount: selectedFrames.count
@@ -588,11 +628,33 @@ public final class PipelineRunner: @unchecked Sendable {
                             )
                             emit(.stageFinished(stage: .sfmFeatures))
                             markStageComplete(.sfmFeatures)
-                        } else if sparseModelFilesExist(at: seedZero) && !fm.fileExists(atPath: paths.colmapDatabaseURL.path) {
+                        } else if sparseModelFilesExist(at: fastSeedModelURL) && !fm.fileExists(atPath: paths.colmapDatabaseURL.path) {
                             fm.createFile(atPath: paths.colmapDatabaseURL.path, contents: Data())
                         }
 
-                        if try shouldRunStage(.sfmMatching) {
+                        if strictFastVggtMode {
+                            if try shouldRunStage(.sfmMatching) {
+                                currentStage = .sfmMatching
+                                emit(.stageStarted(stage: .sfmMatching))
+                                writeCheckpoint(
+                                    stage: .sfmMatching,
+                                    progress: 1.0,
+                                    message: "FastVGGT strict mode skips external matching",
+                                    details: .sfmMatching(SfmMatchingCheckpoint(
+                                        databasePath: paths.colmapDatabaseURL.path,
+                                        expectedPairs: nil,
+                                        processedPairs: nil
+                                    ))
+                                )
+                                emit(.stageLog(
+                                    stage: .sfmMatching,
+                                    line: "FastVGGT strict mode: skipping COLMAP matching stage (no external matcher/fallback).",
+                                    isError: false
+                                ))
+                                emit(.stageFinished(stage: .sfmMatching))
+                                markStageComplete(.sfmMatching)
+                            }
+                        } else if try shouldRunStage(.sfmMatching) {
                             currentStage = .sfmMatching
                             emit(.stageStarted(stage: .sfmMatching))
                             writeCheckpoint(
@@ -820,7 +882,39 @@ public final class PipelineRunner: @unchecked Sendable {
                             markStageComplete(.sfmMatching)
                         }
 
-                        if try shouldRunStage(.sfmMapping) {
+                        if strictFastVggtMode {
+                            if try shouldRunStage(.sfmMapping) {
+                                currentStage = .sfmMapping
+                                emit(.stageStarted(stage: .sfmMapping))
+                                guard sparseModelFilesExist(at: sparseZero) else {
+                                    throw PipelineError.outputMissing
+                                }
+                                writeCheckpoint(
+                                    stage: .sfmMapping,
+                                    progress: 1.0,
+                                    message: "FastVGGT strict sparse model accepted",
+                                    details: .sfmMapping(SfmMappingCheckpoint(
+                                        mapper: "fastvggt-strict",
+                                        sparsePath: sparseZero.path,
+                                        registeredImages: nil
+                                    ))
+                                )
+                                if strictCoverage.coverageManifestPath != nil {
+                                    emit(.stageLog(
+                                        stage: .sfmMapping,
+                                        line: "FastVGGT strict coverage manifest: \(paths.fastvggtCoverageManifestURL.lastPathComponent).",
+                                        isError: false
+                                    ))
+                                }
+                                emit(.stageLog(
+                                    stage: .sfmMapping,
+                                    line: "FastVGGT strict mode: skipping external mapping/refinement fallback.",
+                                    isError: false
+                                ))
+                                emit(.stageFinished(stage: .sfmMapping))
+                                markStageComplete(.sfmMapping)
+                            }
+                        } else if try shouldRunStage(.sfmMapping) {
                             currentStage = .sfmMapping
                             emit(.stageStarted(stage: .sfmMapping))
                             writeCheckpoint(
@@ -1870,6 +1964,14 @@ public final class PipelineRunner: @unchecked Sendable {
                 if Task.isCancelled {
                     throw CancellationError()
                 }
+                if backendPolicy == .fastvggt && fastvggtNoFallbackPreference() {
+                    emit(.stageLog(
+                        stage: .sfmFeatures,
+                        line: "FastVGGT strict no-fallback mode is enabled; aborting without backend fallback.",
+                        isError: true
+                    ))
+                    throw error
+                }
                 let isLast = index == backendOrder.count - 1
                 if isLast {
                     throw error
@@ -2832,6 +2934,218 @@ private extension PipelineRunner {
         boolEnvValue("EASYSPLAT_FASTVGGT_BA_REFINE_EXTRA", default: false)
     }
 
+    func fastvggtFullCoveragePreference() -> Bool {
+        boolEnvValue("EASYSPLAT_FASTVGGT_FULL_COVERAGE", default: false)
+    }
+
+    func fastvggtNoFallbackPreference() -> Bool {
+        boolEnvValue("EASYSPLAT_FASTVGGT_NO_FALLBACK", default: false)
+    }
+
+    struct FastVggtStrictCoverageDefaults: Sendable {
+        var coveragePlanner: String
+        var coverageWindowTokens: Int
+        var coverageOverlap: Double
+        var coverageMaxRounds: Int
+        var postprocessMode: String
+    }
+
+    func fastvggtStrictCoverageDefaults(
+        input: InputSpec,
+        selectedFrameCount: Int,
+        autoTune: AutoTuneProfile?,
+        hardwareProfile: HardwareProfile?
+    ) -> FastVggtStrictCoverageDefaults {
+        let tier = autoTune?.tier ?? hardwareProfile?.tier ?? .mid
+        let prefersTemporalPlanner = input.hasVideos
+
+        var defaults: FastVggtStrictCoverageDefaults
+        switch tier {
+        case .low:
+            defaults = FastVggtStrictCoverageDefaults(
+                coveragePlanner: prefersTemporalPlanner ? "temporal" : "appearance",
+                coverageWindowTokens: 14_000,
+                coverageOverlap: 0.55,
+                coverageMaxRounds: 7,
+                postprocessMode: selectedFrameCount > 1_200 ? "none" : "gpu_ba_lite"
+            )
+        case .mid:
+            defaults = FastVggtStrictCoverageDefaults(
+                coveragePlanner: prefersTemporalPlanner ? "temporal" : "appearance",
+                coverageWindowTokens: 22_000,
+                coverageOverlap: 0.42,
+                coverageMaxRounds: 5,
+                postprocessMode: selectedFrameCount > 1_800 ? "none" : "gpu_ba_lite"
+            )
+        case .high:
+            defaults = FastVggtStrictCoverageDefaults(
+                coveragePlanner: prefersTemporalPlanner ? "temporal" : "auto",
+                coverageWindowTokens: 30_000,
+                coverageOverlap: 0.32,
+                coverageMaxRounds: 4,
+                postprocessMode: "gpu_ba_lite"
+            )
+        }
+
+        if let hardwareProfile {
+            let memoryGB = hardwareProfile.memoryGB
+            let gpuWorkingSetGB = hardwareProfile.gpuWorkingSetGB ?? memoryGB
+            if memoryGB <= 12.0 || gpuWorkingSetGB < 5.0 {
+                defaults.coverageWindowTokens = min(defaults.coverageWindowTokens, 12_000)
+                defaults.coverageOverlap = max(defaults.coverageOverlap, 0.58)
+                defaults.coverageMaxRounds += 1
+                if selectedFrameCount > 900 {
+                    defaults.postprocessMode = "none"
+                }
+            } else if memoryGB >= 64.0 || gpuWorkingSetGB >= 24.0 {
+                defaults.coverageWindowTokens += 4_000
+                defaults.coverageOverlap = max(0.25, defaults.coverageOverlap - 0.05)
+                defaults.coverageMaxRounds = max(3, defaults.coverageMaxRounds - 1)
+            } else if memoryGB >= 32.0 || gpuWorkingSetGB >= 12.0 {
+                defaults.coverageWindowTokens += 2_000
+                defaults.coverageOverlap = max(0.28, defaults.coverageOverlap - 0.03)
+            }
+        }
+
+        if selectedFrameCount >= 900 {
+            defaults.coverageMaxRounds += 1
+        }
+        if selectedFrameCount >= 1_600 {
+            defaults.coverageMaxRounds += 1
+        }
+        if selectedFrameCount <= 180 {
+            defaults.coverageMaxRounds = max(3, defaults.coverageMaxRounds - 1)
+        }
+        if selectedFrameCount >= 2_800 {
+            defaults.postprocessMode = "none"
+        }
+
+        defaults.coverageWindowTokens = min(max(defaults.coverageWindowTokens, 10_000), 40_000)
+        defaults.coverageOverlap = min(max(defaults.coverageOverlap, 0.20), 0.70)
+        defaults.coverageMaxRounds = min(max(defaults.coverageMaxRounds, 3), 10)
+
+        return defaults
+    }
+
+    func fastvggtCoverageConfig(
+        strictModeEnabled: Bool,
+        input: InputSpec,
+        selectedFrameCount: Int,
+        autoTune: AutoTuneProfile?,
+        hardwareProfile: HardwareProfile?,
+        manifestPath: URL?
+    ) -> FastVggtCoverageConfig {
+        let defaults = fastvggtStrictCoverageDefaults(
+            input: input,
+            selectedFrameCount: selectedFrameCount,
+            autoTune: autoTune,
+            hardwareProfile: hardwareProfile
+        )
+
+        let planner = hasEnvValue("EASYSPLAT_FASTVGGT_COVERAGE_PLANNER")
+            ? fastvggtCoveragePlannerPreference()
+            : defaults.coveragePlanner
+        let windowTokens = hasEnvValue("EASYSPLAT_FASTVGGT_COVERAGE_WINDOW_TOKENS")
+            ? fastvggtCoverageWindowTokensPreference()
+            : defaults.coverageWindowTokens
+        let overlap = hasEnvValue("EASYSPLAT_FASTVGGT_COVERAGE_OVERLAP")
+            ? fastvggtCoverageOverlapPreference()
+            : defaults.coverageOverlap
+        let maxRounds = hasEnvValue("EASYSPLAT_FASTVGGT_COVERAGE_MAX_ROUNDS")
+            ? fastvggtCoverageMaxRoundsPreference()
+            : defaults.coverageMaxRounds
+        let gpuOnly = hasEnvValue("EASYSPLAT_FASTVGGT_GPU_ONLY")
+            ? fastvggtGpuOnlyPreference()
+            : strictModeEnabled
+        let postprocess = hasEnvValue("EASYSPLAT_FASTVGGT_POSTPROCESS")
+            ? fastvggtPostprocessPreference()
+            : defaults.postprocessMode
+
+        return FastVggtCoverageConfig(
+            requireFullCoverage: strictModeEnabled,
+            coveragePlanner: planner,
+            coverageWindowTokens: windowTokens,
+            coverageOverlap: overlap,
+            coverageMaxRounds: maxRounds,
+            coverageManifestPath: manifestPath,
+            gpuOnly: gpuOnly,
+            postprocessMode: postprocess
+        )
+    }
+
+    func fastvggtCoverageSummary(
+        config: FastVggtCoverageConfig,
+        autoTune: AutoTuneProfile?,
+        hardwareProfile: HardwareProfile
+    ) -> String {
+        let sourceTier = autoTune?.tier ?? hardwareProfile.tier
+        let memText = String(format: "%.1f", hardwareProfile.memoryGB)
+        let gpuText: String = {
+            guard let gpu = hardwareProfile.gpuWorkingSetGB else { return "n/a" }
+            return String(format: "%.1f", gpu)
+        }()
+        return "FastVGGT strict auto-config: tier=\(sourceTier.rawValue.lowercased()) memGB=\(memText) gpuWSGB=\(gpuText) planner=\(config.coveragePlanner) windowTokens=\(config.coverageWindowTokens) overlap=\(String(format: "%.2f", config.coverageOverlap)) maxRounds=\(config.coverageMaxRounds) gpuOnly=\(config.gpuOnly ? "1" : "0") postprocess=\(config.postprocessMode)."
+    }
+
+    func fastvggtGpuOnlyPreference() -> Bool {
+        boolEnvValue("EASYSPLAT_FASTVGGT_GPU_ONLY", default: false)
+    }
+
+    func fastvggtPostprocessPreference() -> String {
+        let env = ProcessInfo.processInfo.environment
+        if let raw = env["EASYSPLAT_FASTVGGT_POSTPROCESS"]?.trimmingCharacters(in: .whitespacesAndNewlines),
+           !raw.isEmpty {
+            let lowered = raw.lowercased()
+            if lowered == "gpu_ba_lite" || lowered == "none" {
+                return lowered
+            }
+        }
+        return "gpu_ba_lite"
+    }
+
+    func fastvggtCoveragePlannerPreference() -> String {
+        let env = ProcessInfo.processInfo.environment
+        if let raw = env["EASYSPLAT_FASTVGGT_COVERAGE_PLANNER"]?.trimmingCharacters(in: .whitespacesAndNewlines),
+           !raw.isEmpty {
+            let lowered = raw.lowercased()
+            if lowered == "auto" || lowered == "temporal" || lowered == "appearance" {
+                return lowered
+            }
+        }
+        return "auto"
+    }
+
+    func fastvggtCoverageWindowTokensPreference() -> Int {
+        let env = ProcessInfo.processInfo.environment
+        if let raw = env["EASYSPLAT_FASTVGGT_COVERAGE_WINDOW_TOKENS"]?.trimmingCharacters(in: .whitespacesAndNewlines),
+           let override = Int(raw),
+           override >= 1_000 {
+            return override
+        }
+        return 25_000
+    }
+
+    func fastvggtCoverageOverlapPreference() -> Double {
+        let env = ProcessInfo.processInfo.environment
+        if let raw = env["EASYSPLAT_FASTVGGT_COVERAGE_OVERLAP"]?.trimmingCharacters(in: .whitespacesAndNewlines),
+           let override = Double(raw),
+           override > 0,
+           override < 1 {
+            return override
+        }
+        return 0.35
+    }
+
+    func fastvggtCoverageMaxRoundsPreference() -> Int {
+        let env = ProcessInfo.processInfo.environment
+        if let raw = env["EASYSPLAT_FASTVGGT_COVERAGE_MAX_ROUNDS"]?.trimmingCharacters(in: .whitespacesAndNewlines),
+           let override = Int(raw),
+           override > 0 {
+            return override
+        }
+        return 4
+    }
+
     func vggtImageLoadResolutionValue(preset: PresetSpec, autoTune: AutoTuneProfile?) -> Int {
         if !hasEnvValue("EASYSPLAT_VGGT_IMG_LOAD_RESOLUTION"), let autoTune {
             return autoTune.vggtImageLoadResolution
@@ -3142,10 +3456,41 @@ private extension PipelineRunner {
     func loadPhotos(in directory: URL) throws -> [URL] {
         let fm = FileManager.default
         guard fm.fileExists(atPath: directory.path) else { return [] }
-        return try fm.contentsOfDirectory(at: directory, includingPropertiesForKeys: nil)
-            .filter { !$0.hasDirectoryPath }
-            .filter { supportedImageExtensions.contains($0.pathExtension.lowercased()) }
-            .sorted { $0.lastPathComponent < $1.lastPathComponent }
+        let normalizedRoot = directory.standardizedFileURL
+        let looksLikeProjectRoot = fm.fileExists(atPath: directory.appendingPathComponent("project.json").path)
+        let excludedProjectDirectories: Set<String> = looksLikeProjectRoot
+            ? ["Frames", "SfM", "Training", "Output", "Logs"]
+            : []
+        guard let enumerator = fm.enumerator(
+            at: directory,
+            includingPropertiesForKeys: [.isDirectoryKey, .nameKey],
+            options: [.skipsHiddenFiles]
+        ) else {
+            return []
+        }
+
+        var photos: [URL] = []
+        for case let url as URL in enumerator {
+            let values = try? url.resourceValues(forKeys: [.isDirectoryKey, .nameKey])
+            if values?.isDirectory == true {
+                if looksLikeProjectRoot,
+                   url.deletingLastPathComponent().standardizedFileURL == normalizedRoot,
+                   let name = values?.name,
+                   excludedProjectDirectories.contains(name) {
+                    enumerator.skipDescendants()
+                }
+                continue
+            }
+            if supportedImageExtensions.contains(url.pathExtension.lowercased()) {
+                photos.append(url)
+            }
+        }
+
+        return photos.sorted { lhs, rhs in
+            let left = lhs.path.replacingOccurrences(of: directory.path + "/", with: "")
+            let right = rhs.path.replacingOccurrences(of: directory.path + "/", with: "")
+            return left < right
+        }
     }
 
     struct BlurFilterResult: Sendable {
@@ -4758,6 +5103,150 @@ extension PipelineRunner {
 
     func test_fastvggtBaRefineExtraParamsPreference() -> Bool {
         fastvggtBaRefineExtraParamsPreference()
+    }
+
+    func test_fastvggtFullCoveragePreference() -> Bool {
+        fastvggtFullCoveragePreference()
+    }
+
+    func test_fastvggtNoFallbackPreference() -> Bool {
+        fastvggtNoFallbackPreference()
+    }
+
+    func test_fastvggtGpuOnlyPreference() -> Bool {
+        fastvggtGpuOnlyPreference()
+    }
+
+    func test_fastvggtPostprocessPreference() -> String {
+        fastvggtPostprocessPreference()
+    }
+
+    func test_fastvggtCoveragePlannerPreference() -> String {
+        fastvggtCoveragePlannerPreference()
+    }
+
+    func test_fastvggtCoverageWindowTokensPreference() -> Int {
+        fastvggtCoverageWindowTokensPreference()
+    }
+
+    func test_fastvggtCoverageOverlapPreference() -> Double {
+        fastvggtCoverageOverlapPreference()
+    }
+
+    func test_fastvggtCoverageMaxRoundsPreference() -> Int {
+        fastvggtCoverageMaxRoundsPreference()
+    }
+
+    func test_fastvggtStrictCoverageDefaults(
+        autoTuneTier: HardwareProfile.Tier?,
+        hardwareTier: HardwareProfile.Tier?,
+        hardwareMemoryGB: Double? = nil,
+        hardwareGpuWorkingSetGB: Double? = nil,
+        input: InputSpec,
+        selectedFrameCount: Int
+    ) -> (planner: String, windowTokens: Int, overlap: Double, maxRounds: Int, postprocess: String) {
+        let autoTune = autoTuneTier.map { tier in
+            AutoTuneProfile(
+                tier: tier,
+                vggtImageLoadResolution: 0,
+                vggtFixedResolution: 0,
+                vggtMaxPoints: 0,
+                colmapMaxNumFeatures: 0,
+                colmapMaxNumMatches: 0,
+                sequentialOverlap: 0,
+                exhaustiveBlockSize: 0,
+                threadCap: 0,
+                colmapMaxImageSizeCap: nil,
+                vggtAllowed: true
+            )
+        }
+        let hardwareProfile: HardwareProfile? = {
+            if let hardwareMemoryGB {
+                return HardwareProfile(
+                    memoryGB: hardwareMemoryGB,
+                    cpuCount: 8,
+                    gpuWorkingSetGB: hardwareGpuWorkingSetGB
+                )
+            }
+            guard let hardwareTier else { return nil }
+            let memoryGB: Double
+            switch hardwareTier {
+            case .low:
+                memoryGB = 16
+            case .mid:
+                memoryGB = 24
+            case .high:
+                memoryGB = 48
+            }
+            return HardwareProfile(memoryGB: memoryGB, cpuCount: 8, gpuWorkingSetGB: 8)
+        }()
+        let defaults = fastvggtStrictCoverageDefaults(
+            input: input,
+            selectedFrameCount: selectedFrameCount,
+            autoTune: autoTune,
+            hardwareProfile: hardwareProfile
+        )
+        return (
+            planner: defaults.coveragePlanner,
+            windowTokens: defaults.coverageWindowTokens,
+            overlap: defaults.coverageOverlap,
+            maxRounds: defaults.coverageMaxRounds,
+            postprocess: defaults.postprocessMode
+        )
+    }
+
+    func test_fastvggtCoverageConfig(
+        strictModeEnabled: Bool,
+        input: InputSpec,
+        selectedFrameCount: Int,
+        autoTuneTier: HardwareProfile.Tier?,
+        hardwareTier: HardwareProfile.Tier?,
+        hardwareMemoryGB: Double? = nil,
+        hardwareGpuWorkingSetGB: Double? = nil
+    ) -> FastVggtCoverageConfig {
+        let autoTune = autoTuneTier.map { tier in
+            AutoTuneProfile(
+                tier: tier,
+                vggtImageLoadResolution: 0,
+                vggtFixedResolution: 0,
+                vggtMaxPoints: 0,
+                colmapMaxNumFeatures: 0,
+                colmapMaxNumMatches: 0,
+                sequentialOverlap: 0,
+                exhaustiveBlockSize: 0,
+                threadCap: 0,
+                colmapMaxImageSizeCap: nil,
+                vggtAllowed: true
+            )
+        }
+        let hardwareProfile: HardwareProfile? = {
+            if let hardwareMemoryGB {
+                return HardwareProfile(
+                    memoryGB: hardwareMemoryGB,
+                    cpuCount: 8,
+                    gpuWorkingSetGB: hardwareGpuWorkingSetGB
+                )
+            }
+            guard let hardwareTier else { return nil }
+            let memoryGB: Double
+            switch hardwareTier {
+            case .low:
+                memoryGB = 16
+            case .mid:
+                memoryGB = 24
+            case .high:
+                memoryGB = 48
+            }
+            return HardwareProfile(memoryGB: memoryGB, cpuCount: 8, gpuWorkingSetGB: 8)
+        }()
+        return fastvggtCoverageConfig(
+            strictModeEnabled: strictModeEnabled,
+            input: input,
+            selectedFrameCount: selectedFrameCount,
+            autoTune: autoTune,
+            hardwareProfile: hardwareProfile,
+            manifestPath: nil
+        )
     }
 
     func test_tuneFastVggtRefinementColmapOptions(

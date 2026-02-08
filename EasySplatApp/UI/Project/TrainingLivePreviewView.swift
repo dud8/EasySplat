@@ -34,7 +34,7 @@ struct TrainingLivePreviewView: View {
                 .frame(maxWidth: .infinity)
             } else {
                 SnapshotPlaceholderView(
-                    message: "Waiting for first preview…",
+                    message: "Waiting for preview…",
                     detail: state.pollStatusLine
                 )
                     .frame(height: preferredHeight)
@@ -102,16 +102,6 @@ struct TrainingLivePreviewState: Equatable {
             }
         }
 
-        var label: String {
-            switch self {
-            case .early:
-                return "early training"
-            case .mid:
-                return "mid training"
-            case .late:
-                return "late training"
-            }
-        }
     }
 
     var hasDetectedSnapshot = false
@@ -145,13 +135,7 @@ struct TrainingLivePreviewState: Equatable {
 
     var pollStatusLine: String {
         let interval = max(1, Int(pollIntervalSeconds.rounded()))
-        let checkLabel = pollCount == 1 ? "check" : "checks"
-        let cadenceLabel = pollCadenceTier.label
-        guard let lastPollAt else {
-            return "Checking for new preview every \(interval)s (\(cadenceLabel), \(pollCount) \(checkLabel))."
-        }
-        let lastCheckTime = Self.pollTimeFormatter.string(from: lastPollAt)
-        return "Checking for new preview every \(interval)s (\(cadenceLabel)). Last check \(lastCheckTime) (\(pollCount) \(checkLabel))."
+        return "Refreshes every \(interval)s."
     }
 
     var shouldCreateViewerSurface: Bool {
@@ -164,15 +148,12 @@ struct TrainingLivePreviewState: Equatable {
 
     var placeholderMessage: String {
         if lastLoadError != nil {
-            return "Preview unavailable yet; waiting for next update…"
+            return "Preview not ready yet."
         }
         if isLoading {
-            if hasDetectedSnapshot {
-                return "Loading latest preview…"
-            }
             return "Loading preview…"
         }
-        return "Waiting for first preview…"
+        return "Waiting for preview…"
     }
 
     mutating func ingestFingerprint(
@@ -204,20 +185,24 @@ struct TrainingLivePreviewState: Equatable {
 
         if pendingFingerprint != fingerprint {
             pendingFingerprint = fingerprint
-            pendingSince = now
+            if shouldStartFirstLoadImmediately(fingerprint: fingerprint, now: now) {
+                startLoading(fingerprint: fingerprint)
+            } else {
+                pendingSince = now
+            }
             return
         }
 
-        guard let pendingSince, now.timeIntervalSince(pendingSince) >= stabilityWindowSeconds else {
+        guard let pendingSince else {
+            self.pendingSince = now
             return
         }
 
-        loadedFingerprint = fingerprint
-        pendingFingerprint = nil
-        self.pendingSince = nil
-        reloadToken += 1
-        isLoading = true
-        lastLoadError = nil
+        guard now.timeIntervalSince(pendingSince) >= stabilityWindowSeconds else {
+            return
+        }
+
+        startLoading(fingerprint: fingerprint)
     }
 
     mutating func ingestLoadState(_ loadState: SplatViewerLoadState) {
@@ -240,6 +225,12 @@ struct TrainingLivePreviewState: Equatable {
             } else {
                 resolvedMessage = normalized
             }
+            if !hasRenderedPreview, let loadedFingerprint {
+                // Retry the same snapshot on the next poll if first-load failed transiently.
+                pendingFingerprint = loadedFingerprint
+                pendingSince = .distantPast
+                self.loadedFingerprint = nil
+            }
             if !isLoading, lastLoadError == resolvedMessage {
                 return
             }
@@ -261,12 +252,20 @@ struct TrainingLivePreviewState: Equatable {
         trainingProgressFraction = min(max(fraction, 0.0), 1.0)
     }
 
-    private static let pollTimeFormatter: DateFormatter = {
-        let formatter = DateFormatter()
-        formatter.timeStyle = .medium
-        formatter.dateStyle = .none
-        return formatter
-    }()
+    private func shouldStartFirstLoadImmediately(fingerprint: SnapshotFingerprint, now: Date) -> Bool {
+        guard !hasRenderedPreview, loadedFingerprint == nil else { return false }
+        let snapshotAge = now.timeIntervalSince(fingerprint.modifiedAt)
+        return snapshotAge >= stabilityWindowSeconds
+    }
+
+    private mutating func startLoading(fingerprint: SnapshotFingerprint) {
+        loadedFingerprint = fingerprint
+        pendingFingerprint = nil
+        pendingSince = nil
+        reloadToken += 1
+        isLoading = true
+        lastLoadError = nil
+    }
 }
 
 private enum SnapshotPreviewReadiness {
@@ -396,7 +395,7 @@ private struct LivePreviewErrorView: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 4) {
-            Text("Preview unavailable yet; waiting for next update.")
+            Text("Preview not ready yet.")
                 .font(.caption)
                 .foregroundStyle(.secondary)
             Text(message)
