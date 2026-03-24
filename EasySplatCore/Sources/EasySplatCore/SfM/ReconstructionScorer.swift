@@ -4,6 +4,25 @@ public struct ReconstructionScore: Sendable {
     public var registeredImages: Int
     public var totalImages: Int
     public var meanReprojectionError: Double?
+    public var pointCount: Int?
+    public var observationCount: Int?
+    public var meanTrackLength: Double?
+
+    public init(
+        registeredImages: Int,
+        totalImages: Int,
+        meanReprojectionError: Double?,
+        pointCount: Int? = nil,
+        observationCount: Int? = nil,
+        meanTrackLength: Double? = nil
+    ) {
+        self.registeredImages = registeredImages
+        self.totalImages = totalImages
+        self.meanReprojectionError = meanReprojectionError
+        self.pointCount = pointCount
+        self.observationCount = observationCount
+        self.meanTrackLength = meanTrackLength
+    }
 }
 
 public enum ReconstructionScorer {
@@ -11,6 +30,9 @@ public enum ReconstructionScorer {
         var registered: Int?
         var total: Int?
         var reprojection: Double?
+        var points: Int?
+        var observations: Int?
+        var meanTrackLength: Double?
 
         let lines = text.split(separator: "\n", omittingEmptySubsequences: false)
         for line in lines {
@@ -49,6 +71,30 @@ public enum ReconstructionScorer {
             ) {
                 reprojection = Double(match[0])
             }
+
+            if let match = firstMatch(
+                pattern: #"(?:^|\])\s*points\s*:\s*(\d+)\b"#,
+                in: lineText,
+                captureCount: 1
+            ) {
+                points = Int(match[0])
+            }
+
+            if let match = firstMatch(
+                pattern: #"observations\s*:\s*(\d+)\b"#,
+                in: lineText,
+                captureCount: 1
+            ) {
+                observations = Int(match[0])
+            }
+
+            if let match = firstMatch(
+                pattern: #"mean track length\s*:\s*([-+]?\d*\.?\d+(?:[eE][-+]?\d+)?)"#,
+                in: lineText,
+                captureCount: 1
+            ) {
+                meanTrackLength = Double(match[0])
+            }
         }
 
         let resolvedRegistered = registered ?? 0
@@ -56,7 +102,10 @@ public enum ReconstructionScorer {
         return ReconstructionScore(
             registeredImages: resolvedRegistered,
             totalImages: resolvedTotal,
-            meanReprojectionError: reprojection
+            meanReprojectionError: reprojection,
+            pointCount: points,
+            observationCount: observations,
+            meanTrackLength: meanTrackLength
         )
     }
 
@@ -66,6 +115,9 @@ public enum ReconstructionScorer {
         let threshold: Double = (mode == .room) ? 0.55 : 0.65
         if ratio < threshold { return false }
         if let reproj = score.meanReprojectionError, reproj > 2.5 { return false }
+        if let points = score.pointCount, points <= 0 { return false }
+        if let observations = score.observationCount, observations <= 0 { return false }
+        if let meanTrackLength = score.meanTrackLength, meanTrackLength <= 0 { return false }
         return true
     }
 
@@ -79,7 +131,14 @@ public enum ReconstructionScorer {
         } else {
             reprojText = "n/a"
         }
-        return "registered \(score.registeredImages)/\(score.totalImages) (\(percentText)%), mean reprojection error \(reprojText)"
+        var summary = "registered \(score.registeredImages)/\(score.totalImages) (\(percentText)%), mean reprojection error \(reprojText)"
+        if let points = score.pointCount, let observations = score.observationCount {
+            summary += ", points \(points), observations \(observations)"
+        }
+        if let meanTrackLength = score.meanTrackLength {
+            summary += ", mean track length \(String(format: "%.2f", meanTrackLength))"
+        }
+        return summary
     }
 
     private static func firstMatch(pattern: String, in text: String, captureCount: Int) -> [String]? {

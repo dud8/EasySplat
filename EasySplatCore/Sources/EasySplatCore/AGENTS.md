@@ -5,7 +5,7 @@ Core library that orchestrates toolchain management and the end-to-end reconstru
 ## Key layout
 - `Pipeline/`: pipeline stages, progress events, logging, and retry logic (`PipelineRunner`, `PipelineStage`, `PipelineEvent`).
 - `Project/`: project metadata and file layout (`ProjectPaths`, `ProjectMetadataStore`).
-- `SfM/`: wrappers around COLMAP/GLOMAP/VGGT.
+- `SfM/`: wrappers around MapAnything, COLMAP/global_mapper, VGGT, and FastVGGT.
 - `Tools/`: toolchain manifest parsing, downloads, validation, and subprocess utilities (`ToolchainManager`, `SubprocessRunner`).
 - `Video/`: frame extraction and selection heuristics.
 - `Training/`: Brush training runner.

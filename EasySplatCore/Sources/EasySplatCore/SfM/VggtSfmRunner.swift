@@ -123,15 +123,23 @@ public final class VggtSfmRunner: @unchecked Sendable, VggtSfmRunning {
             argsWithBA.append("--no-fine-tracking")
         }
 
-        var environment = [
-            "PYTHONUNBUFFERED": "1",
-            "TORCH_HOME": toolchain.models.path,
-            "EASYSPLAT_VGGT_MODELS_DIR": toolchain.models.path
-        ]
+        var environment = ProcessInfo.processInfo.environment
+        environment["PYTHONUNBUFFERED"] = "1"
+        environment["TORCH_HOME"] = toolchain.models.path
+        environment["EASYSPLAT_VGGT_MODELS_DIR"] = toolchain.models.path
+        environment["HF_HUB_OFFLINE"] = "1"
+        environment["TRANSFORMERS_OFFLINE"] = "1"
+        environment["HF_HUB_DISABLE_TELEMETRY"] = "1"
+        environment["DO_NOT_TRACK"] = "1"
+        environment["KMP_DUPLICATE_LIB_OK"] = "TRUE"
+        environment["TOKENIZERS_PARALLELISM"] = "false"
+        if environment["PYTORCH_ENABLE_MPS_FALLBACK"] == nil {
+            environment["PYTORCH_ENABLE_MPS_FALLBACK"] = "1"
+        }
 
         // Ensure our toolchain python is preferred when the wrapper launches subprocesses.
         let pythonBin = toolchain.python.deletingLastPathComponent().path
-        if let existingPath = ProcessInfo.processInfo.environment["PATH"] {
+        if let existingPath = environment["PATH"] {
             environment["PATH"] = "\(pythonBin):\(existingPath)"
         } else {
             environment["PATH"] = pythonBin

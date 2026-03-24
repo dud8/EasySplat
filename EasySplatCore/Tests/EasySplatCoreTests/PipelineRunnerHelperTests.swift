@@ -22,6 +22,23 @@ final class PipelineRunnerHelperTests: XCTestCase {
         XCTAssertEqual(runner.test_targetCountForVideo(index: 2, total: 3, targetCount: 10), 3)
     }
 
+    func testResolveSparseModelDirectoryHandlesNestedOutputs() throws {
+        let root = try TestFileBuilder.makeTempDir()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let runner = makeRunner(projectURL: root)
+
+        let sparseRoot = root.appendingPathComponent("sparse/0", isDirectory: true)
+        let nested = sparseRoot.appendingPathComponent("0", isDirectory: true)
+        try FileManager.default.createDirectory(at: nested, withIntermediateDirectories: true)
+        for name in ["cameras.bin", "images.bin", "points3D.bin"] {
+            let file = nested.appendingPathComponent(name)
+            XCTAssertTrue(FileManager.default.createFile(atPath: file.path, contents: Data([1, 2, 3])))
+        }
+
+        let resolved = try runner.test_resolveSparseModelDirectory(sparseRoot)
+        XCTAssertEqual(resolved.standardizedFileURL, nested.standardizedFileURL)
+    }
+
     func testFrameExtractionProfileValues() throws {
         let root = try TestFileBuilder.makeTempDir()
         defer { try? FileManager.default.removeItem(at: root) }
@@ -177,6 +194,54 @@ final class PipelineRunnerHelperTests: XCTestCase {
             XCTAssertFalse(runner.test_vggtFineTrackingPreference())
             XCTAssertEqual(runner.test_vggtKeypointExtractorPreference(), "aliked")
             XCTAssertEqual(runner.test_vggtBaMaxFramesLimit(autoTuneTier: nil), 77)
+        }
+    }
+
+    func testMapperDefaultsToGlomapWithGpuEnabled() async throws {
+        let root = try TestFileBuilder.makeTempDir()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let runner = makeRunner(projectURL: root)
+
+        await withEnvironmentAsync([
+            "EASYSPLAT_SFM_MAPPER": nil,
+            "EASYSPLAT_COLMAP_USE_GPU": nil,
+            "EASYSPLAT_GLOBAL_MAPPER_GP_USE_GPU": nil,
+            "EASYSPLAT_GLOBAL_MAPPER_BA_USE_GPU": nil
+        ]) {
+            XCTAssertEqual(runner.test_sfmMapperPreference(), "glomap")
+            let options = runner.test_globalMapperOptions(threadHint: 8)
+            XCTAssertTrue(options.useGpuForGlobalPositioning)
+            XCTAssertTrue(options.useGpuForBundleAdjustment)
+        }
+    }
+
+    func testGlobalMapperDefaultUseGpuFalseDisablesGpuWithoutOverrides() async throws {
+        let root = try TestFileBuilder.makeTempDir()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let runner = makeRunner(projectURL: root)
+
+        await withEnvironmentAsync([
+            "EASYSPLAT_GLOBAL_MAPPER_GP_USE_GPU": nil,
+            "EASYSPLAT_GLOBAL_MAPPER_BA_USE_GPU": nil
+        ]) {
+            let options = runner.test_globalMapperOptions(threadHint: 8, defaultUseGpu: false)
+            XCTAssertFalse(options.useGpuForGlobalPositioning)
+            XCTAssertFalse(options.useGpuForBundleAdjustment)
+        }
+    }
+
+    func testGlobalMapperGpuEnvOverridesTakePrecedence() async throws {
+        let root = try TestFileBuilder.makeTempDir()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let runner = makeRunner(projectURL: root)
+
+        await withEnvironmentAsync([
+            "EASYSPLAT_GLOBAL_MAPPER_GP_USE_GPU": "1",
+            "EASYSPLAT_GLOBAL_MAPPER_BA_USE_GPU": "0"
+        ]) {
+            let options = runner.test_globalMapperOptions(threadHint: 8, defaultUseGpu: false)
+            XCTAssertTrue(options.useGpuForGlobalPositioning)
+            XCTAssertFalse(options.useGpuForBundleAdjustment)
         }
     }
 
@@ -596,8 +661,8 @@ final class PipelineRunnerHelperTests: XCTestCase {
         defer { restore() }
 
         let order = runner.test_sfmBackendFallbackOrder()
-        XCTAssertEqual(order, [.colmap])
-        XCTAssertEqual(runner.test_sfmBackendPolicy(), .colmap)
+        XCTAssertEqual(order, [.mapanything, .colmap])
+        XCTAssertEqual(runner.test_sfmBackendPolicy(), .mapanything)
     }
 
     func testSfmBackendFallbackOrderIgnoresDeprecatedGraceEnv() async throws {
@@ -610,7 +675,7 @@ final class PipelineRunnerHelperTests: XCTestCase {
             "EASYSPLAT_ENABLE_VGGT_GRACE_FALLBACK": "1"
         ]) {
             let order = runner.test_sfmBackendFallbackOrder()
-            XCTAssertEqual(order, [.colmap])
+            XCTAssertEqual(order, [.mapanything, .colmap])
         }
     }
 
@@ -622,6 +687,17 @@ final class PipelineRunnerHelperTests: XCTestCase {
         await withEnvironmentAsync(["EASYSPLAT_SFM_BACKEND": "glomap"]) {
             XCTAssertEqual(runner.test_sfmBackendPolicy(), .colmap)
             XCTAssertEqual(runner.test_sfmBackendFallbackOrder(), [.colmap])
+        }
+    }
+
+    func testSfmBackendMapAnythingFromEnv() async throws {
+        let root = try TestFileBuilder.makeTempDir()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let runner = makeRunner(projectURL: root)
+
+        await withEnvironmentAsync(["EASYSPLAT_SFM_BACKEND": "mapanything"]) {
+            XCTAssertEqual(runner.test_sfmBackendPolicy(), .mapanything)
+            XCTAssertEqual(runner.test_sfmBackendFallbackOrder(), [.mapanything, .colmap])
         }
     }
 
@@ -644,6 +720,298 @@ final class PipelineRunnerHelperTests: XCTestCase {
             let order = runner.test_sfmBackendFallbackOrder()
             XCTAssertEqual(order, [.vggt])
         }
+    }
+
+    func testMapAnythingExecutionPlanDisablesDirectOnLowTier() async throws {
+        let root = try TestFileBuilder.makeTempDir()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let runner = makeRunner(projectURL: root)
+
+        await withEnvironmentAsync([
+            "EASYSPLAT_MAPANYTHING_RESOLUTION": nil,
+            "EASYSPLAT_MAPANYTHING_MEMORY_EFFICIENT": nil,
+            "EASYSPLAT_MAPANYTHING_USE_AMP": nil,
+            "EASYSPLAT_MAPANYTHING_MAX_POINTS": nil,
+            "EASYSPLAT_MAPANYTHING_CAMERA_TYPE": nil,
+            "EASYSPLAT_MAPANYTHING_SHARED_CAMERA": nil,
+            "EASYSPLAT_MAPANYTHING_ANCHOR_MAX_VIEWS": nil,
+            "EASYSPLAT_MAPANYTHING_WINDOW_SIZE": nil,
+            "EASYSPLAT_MAPANYTHING_WINDOW_OVERLAP": nil
+        ]) {
+            let plan = runner.test_mapAnythingExecutionPlan(
+                hardwareTier: .low,
+                selectedFrameCount: 4,
+                preset: PresetSpec(mode: .object, quality: .standard)
+            )
+
+            XCTAssertEqual(plan.mode, "seed_refine")
+            XCTAssertFalse(plan.directAllowed)
+            XCTAssertEqual(plan.directViewLimit, 0)
+            XCTAssertEqual(plan.resolution, 518)
+            XCTAssertTrue(plan.memoryEfficientInference)
+            XCTAssertFalse(plan.useAMP)
+        }
+    }
+
+    func testMapAnythingExecutionPlanUsesDirectWithinMidTierLimit() async throws {
+        let root = try TestFileBuilder.makeTempDir()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let runner = makeRunner(projectURL: root)
+
+        await withEnvironmentAsync([
+            "EASYSPLAT_MAPANYTHING_RESOLUTION": nil,
+            "EASYSPLAT_MAPANYTHING_MEMORY_EFFICIENT": nil,
+            "EASYSPLAT_MAPANYTHING_USE_AMP": nil,
+            "EASYSPLAT_MAPANYTHING_MAX_POINTS": nil,
+            "EASYSPLAT_MAPANYTHING_CAMERA_TYPE": nil,
+            "EASYSPLAT_MAPANYTHING_SHARED_CAMERA": nil,
+            "EASYSPLAT_MAPANYTHING_ANCHOR_MAX_VIEWS": nil,
+            "EASYSPLAT_MAPANYTHING_WINDOW_SIZE": nil,
+            "EASYSPLAT_MAPANYTHING_WINDOW_OVERLAP": nil
+        ]) {
+            let plan = runner.test_mapAnythingExecutionPlan(
+                hardwareTier: .mid,
+                selectedFrameCount: 6,
+                preset: PresetSpec(mode: .object, quality: .standard)
+            )
+
+            XCTAssertEqual(plan.mode, "direct")
+            XCTAssertTrue(plan.directAllowed)
+            XCTAssertEqual(plan.directViewLimit, 6)
+            XCTAssertEqual(plan.windowSize, 6)
+            XCTAssertEqual(plan.windowOverlap, 0)
+            XCTAssertEqual(plan.cameraType, "SIMPLE_RADIAL")
+        }
+    }
+
+    func testMapAnythingExecutionPlanDisablesDirectWhenOnlyOneFrameRemains() async throws {
+        let root = try TestFileBuilder.makeTempDir()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let runner = makeRunner(projectURL: root)
+
+        await withEnvironmentAsync([
+            "EASYSPLAT_MAPANYTHING_RESOLUTION": nil,
+            "EASYSPLAT_MAPANYTHING_MEMORY_EFFICIENT": nil,
+            "EASYSPLAT_MAPANYTHING_USE_AMP": nil,
+            "EASYSPLAT_MAPANYTHING_MAX_POINTS": nil,
+            "EASYSPLAT_MAPANYTHING_CAMERA_TYPE": nil,
+            "EASYSPLAT_MAPANYTHING_SHARED_CAMERA": nil,
+            "EASYSPLAT_MAPANYTHING_ANCHOR_MAX_VIEWS": nil,
+            "EASYSPLAT_MAPANYTHING_WINDOW_SIZE": nil,
+            "EASYSPLAT_MAPANYTHING_WINDOW_OVERLAP": nil
+        ]) {
+            let plan = runner.test_mapAnythingExecutionPlan(
+                hardwareTier: .high,
+                selectedFrameCount: 1,
+                preset: PresetSpec(mode: .object, quality: .standard)
+            )
+
+            XCTAssertEqual(plan.mode, "seed_refine")
+            XCTAssertFalse(plan.directAllowed)
+        }
+    }
+
+    func testMapAnythingExecutionPlanFallsBackToSeedRefineAboveHighTierLimit() async throws {
+        let root = try TestFileBuilder.makeTempDir()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let runner = makeRunner(projectURL: root)
+
+        await withEnvironmentAsync([
+            "EASYSPLAT_MAPANYTHING_RESOLUTION": nil,
+            "EASYSPLAT_MAPANYTHING_MEMORY_EFFICIENT": nil,
+            "EASYSPLAT_MAPANYTHING_USE_AMP": nil,
+            "EASYSPLAT_MAPANYTHING_MAX_POINTS": nil,
+            "EASYSPLAT_MAPANYTHING_CAMERA_TYPE": nil,
+            "EASYSPLAT_MAPANYTHING_SHARED_CAMERA": nil,
+            "EASYSPLAT_MAPANYTHING_ANCHOR_MAX_VIEWS": nil,
+            "EASYSPLAT_MAPANYTHING_WINDOW_SIZE": nil,
+            "EASYSPLAT_MAPANYTHING_WINDOW_OVERLAP": nil
+        ]) {
+            let plan = runner.test_mapAnythingExecutionPlan(
+                hardwareTier: .high,
+                selectedFrameCount: 12,
+                preset: PresetSpec(mode: .room, quality: .ultra)
+            )
+
+            XCTAssertEqual(plan.mode, "seed_refine")
+            XCTAssertFalse(plan.directAllowed)
+            XCTAssertEqual(plan.directViewLimit, 8)
+            XCTAssertEqual(plan.windowSize, 8)
+            XCTAssertEqual(plan.windowOverlap, 2)
+            XCTAssertEqual(plan.cameraType, "OPENCV")
+        }
+    }
+
+    func testMapAnythingExecutionPlanEnvOverridesTakePrecedenceOverAutoTune() async throws {
+        let root = try TestFileBuilder.makeTempDir()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let runner = makeRunner(projectURL: root)
+        let autoTune = makeMapAnythingAutoTuneProfile(
+            tier: .low,
+            anchorMaxViews: 24,
+            windowSize: 4,
+            windowOverlap: 1
+        )
+
+        await withEnvironmentAsync([
+            "EASYSPLAT_MAPANYTHING_ANCHOR_MAX_VIEWS": "19",
+            "EASYSPLAT_MAPANYTHING_WINDOW_SIZE": "11",
+            "EASYSPLAT_MAPANYTHING_WINDOW_OVERLAP": "7"
+        ]) {
+            let plan = runner.test_mapAnythingExecutionPlan(
+                hardwareTier: .low,
+                selectedFrameCount: 30,
+                preset: PresetSpec(mode: .object, quality: .standard),
+                autoTune: autoTune
+            )
+
+            XCTAssertEqual(plan.anchorMaxViews, 19)
+            XCTAssertEqual(plan.windowSize, 11)
+            XCTAssertEqual(plan.windowOverlap, 7)
+        }
+    }
+
+    func testMapAnythingExecutionPlanIgnoresInvalidEnvAndUsesAutoTuneValues() async throws {
+        let root = try TestFileBuilder.makeTempDir()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let runner = makeRunner(projectURL: root)
+        let autoTune = makeMapAnythingAutoTuneProfile(
+            tier: .mid,
+            anchorMaxViews: 15,
+            windowSize: 7,
+            windowOverlap: 3
+        )
+
+        await withEnvironmentAsync([
+            "EASYSPLAT_MAPANYTHING_ANCHOR_MAX_VIEWS": "0",
+            "EASYSPLAT_MAPANYTHING_WINDOW_SIZE": "-5",
+            "EASYSPLAT_MAPANYTHING_WINDOW_OVERLAP": "-1"
+        ]) {
+            let plan = runner.test_mapAnythingExecutionPlan(
+                hardwareTier: .mid,
+                selectedFrameCount: 20,
+                preset: PresetSpec(mode: .object, quality: .standard),
+                autoTune: autoTune
+            )
+
+            XCTAssertEqual(plan.anchorMaxViews, 15)
+            XCTAssertEqual(plan.windowSize, 7)
+            XCTAssertEqual(plan.windowOverlap, 3)
+        }
+    }
+
+    func testMapAnythingExecutionPlanClampsLargeEnvOverridesToSafeBounds() async throws {
+        let root = try TestFileBuilder.makeTempDir()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let runner = makeRunner(projectURL: root)
+
+        await withEnvironmentAsync([
+            "EASYSPLAT_MAPANYTHING_ANCHOR_MAX_VIEWS": "99",
+            "EASYSPLAT_MAPANYTHING_WINDOW_SIZE": "99",
+            "EASYSPLAT_MAPANYTHING_WINDOW_OVERLAP": "99"
+        ]) {
+            let plan = runner.test_mapAnythingExecutionPlan(
+                hardwareTier: .low,
+                selectedFrameCount: 5,
+                preset: PresetSpec(mode: .object, quality: .standard)
+            )
+
+            XCTAssertEqual(plan.anchorMaxViews, 5)
+            XCTAssertEqual(plan.windowSize, 5)
+            XCTAssertEqual(plan.windowOverlap, 4)
+        }
+    }
+
+    func testMapAnythingSharedCameraDefaultsToVideoInputs() throws {
+        let root = try TestFileBuilder.makeTempDir()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let runner = makeRunner(projectURL: root)
+
+        XCTAssertTrue(
+            runner.test_mapAnythingSharedCameraPreference(
+                input: .video(files: ["/tmp/video.mov"])
+            )
+        )
+        XCTAssertFalse(
+            runner.test_mapAnythingSharedCameraPreference(
+                input: .photos(folder: "/tmp/photos")
+            )
+        )
+    }
+
+    func testMapAnythingResolutionPreferenceNormalizesUnsupportedValues() async throws {
+        let root = try TestFileBuilder.makeTempDir()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let runner = makeRunner(projectURL: root)
+
+        await withEnvironmentAsync(["EASYSPLAT_MAPANYTHING_RESOLUTION": "500"]) {
+            XCTAssertEqual(runner.test_mapAnythingResolutionPreference(), 512)
+        }
+        await withEnvironmentAsync(["EASYSPLAT_MAPANYTHING_RESOLUTION": "900"]) {
+            XCTAssertEqual(runner.test_mapAnythingResolutionPreference(), 518)
+        }
+        await withEnvironmentAsync(["EASYSPLAT_MAPANYTHING_RESOLUTION": "518"]) {
+            XCTAssertEqual(runner.test_mapAnythingResolutionPreference(), 518)
+        }
+    }
+
+    func testMapAnythingDirectMinimumTrackLengthDefaultsAndAllowsOverride() async throws {
+        let root = try TestFileBuilder.makeTempDir()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let runner = makeRunner(projectURL: root)
+
+        XCTAssertEqual(runner.test_mapAnythingDirectMinimumMeanTrackLengthPreference(mode: .object), 1.15, accuracy: 0.001)
+        XCTAssertEqual(runner.test_mapAnythingDirectMinimumMeanTrackLengthPreference(mode: .room), 1.20, accuracy: 0.001)
+
+        await withEnvironmentAsync(["EASYSPLAT_MAPANYTHING_DIRECT_MIN_TRACK_LENGTH": "1.33"]) {
+            XCTAssertEqual(runner.test_mapAnythingDirectMinimumMeanTrackLengthPreference(mode: .object), 1.33, accuracy: 0.001)
+            XCTAssertEqual(runner.test_mapAnythingDirectMinimumMeanTrackLengthPreference(mode: .room), 1.33, accuracy: 0.001)
+        }
+    }
+
+    func testMapAnythingDirectQualityFailureReasonRequiresRobustTracks() async throws {
+        let restore = await scopedEnvironment(["EASYSPLAT_MAPANYTHING_DIRECT_MIN_TRACK_LENGTH": nil])
+        defer { restore() }
+
+        let root = try TestFileBuilder.makeTempDir()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let runner = makeRunner(projectURL: root)
+
+        let good = ReconstructionScore(
+            registeredImages: 4,
+            totalImages: 4,
+            meanReprojectionError: 0.8,
+            pointCount: 4_000,
+            observationCount: 5_200,
+            meanTrackLength: 1.30
+        )
+        XCTAssertNil(runner.test_mapAnythingDirectQualityFailureReason(score: good, mode: .object))
+
+        let thinTracks = ReconstructionScore(
+            registeredImages: 4,
+            totalImages: 4,
+            meanReprojectionError: 0.8,
+            pointCount: 4_000,
+            observationCount: 4_080,
+            meanTrackLength: 1.02
+        )
+        XCTAssertTrue(
+            runner.test_mapAnythingDirectQualityFailureReason(score: thinTracks, mode: .object)?
+                .contains("mean track length") == true
+        )
+
+        let missingTrackStats = ReconstructionScore(
+            registeredImages: 4,
+            totalImages: 4,
+            meanReprojectionError: 0.8,
+            pointCount: 4_000,
+            observationCount: 4_500,
+            meanTrackLength: nil
+        )
+        XCTAssertTrue(
+            runner.test_mapAnythingDirectQualityFailureReason(score: missingTrackStats, mode: .object)?
+                .contains("mean track length") == true
+        )
     }
 
     func testBrushExportStepParsing() throws {
@@ -763,6 +1131,7 @@ final class PipelineRunnerHelperTests: XCTestCase {
         let root = try TestFileBuilder.makeTempDir()
         defer { try? FileManager.default.removeItem(at: root) }
         let runner = makeRunner(projectURL: root)
+        let cudaFallbackWarning = "W20260210 22:40:38.521257 0x1f79a2c40 global_positioning.cc:400] Requested to use GPU for bundle adjustment, but COLMAP was compiled without CUDA support. Falling back to CPU-based solvers."
 
         XCTAssertTrue(runner.test_shouldEmitToolLogLine("EasySplat: colmap argv: /bin/colmap", isError: false))
         XCTAssertTrue(runner.test_shouldEmitToolLogLine("warning: low confidence", isError: false))
@@ -770,10 +1139,29 @@ final class PipelineRunnerHelperTests: XCTestCase {
         XCTAssertTrue(runner.test_shouldEmitToolLogLine("something bad", isError: true))
         XCTAssertFalse(runner.test_shouldEmitToolLogLine("I20260207 16:43:09.118649 1624963 model.cc:455] Registered images: 3", isError: true))
         XCTAssertTrue(runner.test_shouldEmitToolLogLine("W20260207 16:43:09.118649 1624963 model.cc:455] Numerical issue encountered", isError: true))
+        XCTAssertFalse(runner.test_shouldEmitToolLogLine("I20260207 16:43:09.118649 1624963 model.cc:455] Registered images: 3", isError: false))
+        XCTAssertTrue(runner.test_shouldEmitToolLogLine("W20260207 16:43:09.118649 1624963 model.cc:455] Numerical issue encountered", isError: false))
+        XCTAssertTrue(runner.test_shouldEmitToolLogLine(cudaFallbackWarning, isError: false))
+        XCTAssertTrue(runner.test_shouldEmitToolLogLine("Traceback (most recent call last):", isError: false))
+        XCTAssertTrue(runner.test_shouldEmitToolLogLine("  File \"run.py\", line 287, in run_pipeline", isError: false))
         XCTAssertFalse(runner.test_shouldEmitToolLogLine("\u{1B}[2K\u{1B}[1B", isError: true))
         XCTAssertFalse(runner.test_shouldEmitToolLogLine("██████ 70/40000 Steps (0.9/s, 12h remaining)", isError: true))
         XCTAssertFalse(runner.test_shouldEmitToolLogLine("normal progress line", isError: false))
         XCTAssertFalse(runner.test_shouldEmitToolLogLine("   ", isError: false))
+    }
+
+    func testToolLogSeverityNormalization() throws {
+        let root = try TestFileBuilder.makeTempDir()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let runner = makeRunner(projectURL: root)
+        let cudaFallbackWarning = "W20260210 22:40:38.521257 0x1f79a2c40 global_positioning.cc:400] Requested to use GPU for bundle adjustment, but COLMAP was compiled without CUDA support. Falling back to CPU-based solvers."
+
+        XCTAssertFalse(runner.test_normalizedToolLogIsError("I20260207 16:43:09.118649 1624963 model.cc:455] Registered images: 3", isError: true))
+        XCTAssertFalse(runner.test_normalizedToolLogIsError("W20260207 16:43:09.118649 1624963 model.cc:455] Numerical issue encountered", isError: true))
+        XCTAssertTrue(runner.test_normalizedToolLogIsError("E20260207 16:43:09.118649 1624963 model.cc:455] Fatal mapping issue", isError: true))
+        XCTAssertTrue(runner.test_normalizedToolLogIsError("TypeError: unexpected keyword argument", isError: true))
+        XCTAssertFalse(runner.test_normalizedToolLogIsError("some stdout line", isError: false))
+        XCTAssertFalse(runner.test_normalizedToolLogIsError(cudaFallbackWarning, isError: true))
     }
 
     func testBrushTrainingPlanForQualityPresets() throws {
@@ -890,4 +1278,31 @@ final class PipelineRunnerHelperTests: XCTestCase {
         let config = PipelineRunner.PipelineConfig(toolchain: toolchain, preset: PresetSpec(mode: .object, quality: .standard))
         return PipelineRunner(projectURL: projectURL, config: config)
     }
+
+    private func makeMapAnythingAutoTuneProfile(
+        tier: HardwareProfile.Tier,
+        anchorMaxViews: Int,
+        windowSize: Int,
+        windowOverlap: Int
+    ) -> AutoTuneProfile {
+        AutoTuneProfile(
+            tier: tier,
+            mapAnythingResolution: 518,
+            mapAnythingDirectViewLimit: 0,
+            mapAnythingAnchorMaxViews: anchorMaxViews,
+            mapAnythingWindowSize: windowSize,
+            mapAnythingWindowOverlap: windowOverlap,
+            vggtImageLoadResolution: 1024,
+            vggtFixedResolution: 518,
+            vggtMaxPoints: 100_000,
+            colmapMaxNumFeatures: 8_192,
+            colmapMaxNumMatches: 8_192,
+            sequentialOverlap: 10,
+            exhaustiveBlockSize: 20,
+            threadCap: 6,
+            colmapMaxImageSizeCap: nil,
+            vggtAllowed: true
+        )
+    }
+
 }

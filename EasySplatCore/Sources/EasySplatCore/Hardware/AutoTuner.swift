@@ -2,6 +2,11 @@ import Foundation
 
 struct AutoTuneProfile: Sendable {
     let tier: HardwareProfile.Tier
+    let mapAnythingResolution: Int
+    let mapAnythingDirectViewLimit: Int
+    let mapAnythingAnchorMaxViews: Int
+    let mapAnythingWindowSize: Int
+    let mapAnythingWindowOverlap: Int
     let vggtImageLoadResolution: Int
     let vggtFixedResolution: Int
     let vggtMaxPoints: Int
@@ -20,7 +25,7 @@ struct AutoTuneProfile: Sendable {
             return String(format: "%.1fGB", gpu)
         }()
         let capText = colmapMaxImageSizeCap.map { "\($0)px" } ?? "none"
-        return "Auto-tune: tier=\(tier.rawValue) mem=\(memText) cpu=\(profile.cpuCount) gpuWS=\(gpuText) vggtAllowed=\(vggtAllowed ? "yes" : "no") vggt{imgLoad=\(vggtImageLoadResolution), vggt=\(vggtFixedResolution), maxPoints=\(vggtMaxPoints)} colmap{features=\(colmapMaxNumFeatures), matches=\(colmapMaxNumMatches), overlap=\(sequentialOverlap), block=\(exhaustiveBlockSize), threads<=\(threadCap)} colmapMaxImageSizeCap=\(capText)"
+        return "Auto-tune: tier=\(tier.rawValue) mem=\(memText) cpu=\(profile.cpuCount) gpuWS=\(gpuText) mapanything{res=\(mapAnythingResolution), direct<=\(mapAnythingDirectViewLimit), anchors=\(mapAnythingAnchorMaxViews), window=\(mapAnythingWindowSize), overlap=\(mapAnythingWindowOverlap)} vggtAllowed=\(vggtAllowed ? "yes" : "no") vggt{imgLoad=\(vggtImageLoadResolution), vggt=\(vggtFixedResolution), maxPoints=\(vggtMaxPoints)} colmap{features=\(colmapMaxNumFeatures), matches=\(colmapMaxNumMatches), overlap=\(sequentialOverlap), block=\(exhaustiveBlockSize), threads<=\(threadCap)} colmapMaxImageSizeCap=\(capText)"
     }
 }
 
@@ -33,6 +38,11 @@ enum AutoTuner {
             let vggtAllowed = profile.memoryGB >= 12.0 && (profile.gpuWorkingSetGB ?? 999.0) >= 4.0
             return AutoTuneProfile(
                 tier: .low,
+                mapAnythingResolution: 518,
+                mapAnythingDirectViewLimit: 0,
+                mapAnythingAnchorMaxViews: 24,
+                mapAnythingWindowSize: 4,
+                mapAnythingWindowOverlap: 1,
                 vggtImageLoadResolution: 768,
                 vggtFixedResolution: 448,
                 vggtMaxPoints: 60_000,
@@ -47,6 +57,11 @@ enum AutoTuner {
         case .mid:
             return AutoTuneProfile(
                 tier: .mid,
+                mapAnythingResolution: 518,
+                mapAnythingDirectViewLimit: 6,
+                mapAnythingAnchorMaxViews: 48,
+                mapAnythingWindowSize: 6,
+                mapAnythingWindowOverlap: 2,
                 vggtImageLoadResolution: 1024,
                 vggtFixedResolution: 518,
                 vggtMaxPoints: 100_000,
@@ -61,6 +76,11 @@ enum AutoTuner {
         case .high:
             return AutoTuneProfile(
                 tier: .high,
+                mapAnythingResolution: 518,
+                mapAnythingDirectViewLimit: 8,
+                mapAnythingAnchorMaxViews: 64,
+                mapAnythingWindowSize: 8,
+                mapAnythingWindowOverlap: 2,
                 vggtImageLoadResolution: 1280,
                 vggtFixedResolution: 518,
                 vggtMaxPoints: 150_000,

@@ -10,17 +10,20 @@ public final class PipelineRunner: @unchecked Sendable {
         public var colmap: ColmapRunner
         public var glomap: GlomapRunner
         public var brush: BrushRunner
+        public var mapAnythingSfm: MapAnythingSfmRunning
         public var vggtSfm: VggtSfmRunning
         public var fastVggtSfm: FastVggtSfmRunning
 
         public init(colmap: ColmapRunner = ColmapRunner(),
                     glomap: GlomapRunner = GlomapRunner(),
                     brush: BrushRunner = BrushRunner(),
+                    mapAnythingSfm: MapAnythingSfmRunning = MapAnythingSfmRunner(),
                     vggtSfm: VggtSfmRunning = VggtSfmRunner(),
                     fastVggtSfm: FastVggtSfmRunning = FastVggtSfmRunner()) {
             self.colmap = colmap
             self.glomap = glomap
             self.brush = brush
+            self.mapAnythingSfm = mapAnythingSfm
             self.vggtSfm = vggtSfm
             self.fastVggtSfm = fastVggtSfm
         }
@@ -29,6 +32,7 @@ public final class PipelineRunner: @unchecked Sendable {
             self.colmap = ColmapRunner(runner: runner)
             self.glomap = GlomapRunner(runner: runner)
             self.brush = BrushRunner(runner: runner)
+            self.mapAnythingSfm = MapAnythingSfmRunner(runner: runner)
             self.vggtSfm = VggtSfmRunner(runner: runner)
             self.fastVggtSfm = FastVggtSfmRunner(runner: runner)
         }
@@ -58,6 +62,27 @@ public final class PipelineRunner: @unchecked Sendable {
         case colmap
     }
 
+    struct MapAnythingExecutionPlan: Sendable {
+        var mode: MapAnythingRunMode
+        var device: String
+        var resolution: Int
+        var memoryEfficientInference: Bool
+        var useAMP: Bool
+        var minibatchSize: Int
+        var maxPoints: Int
+        var cameraType: String
+        var sharedCamera: Bool
+        var anchorMaxViews: Int
+        var windowSize: Int
+        var windowOverlap: Int
+        var directViewLimit: Int
+        var directAllowed: Bool
+
+        var requiresRefinement: Bool {
+            mode == .seedRefine
+        }
+    }
+
     public init(projectURL: URL, config: PipelineConfig, tooling: Tooling = Tooling()) {
         self.projectURL = projectURL
         self.config = config
@@ -84,7 +109,14 @@ public final class PipelineRunner: @unchecked Sendable {
             && metadata.state.stage != .done
             && hasInterruptionEvidence
         let skipTraining: Bool = {
-            guard let raw = ProcessInfo.processInfo.environment["EASYSPLAT_SKIP_TRAINING"]?
+            let env = ProcessInfo.processInfo.environment
+            let stopAfterSfmRaw = env["EASYSPLAT_STOP_AFTER_SFM"]?
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+                .lowercased()
+            if stopAfterSfmRaw == "1" || stopAfterSfmRaw == "true" || stopAfterSfmRaw == "yes" {
+                return true
+            }
+            guard let raw = env["EASYSPLAT_SKIP_TRAINING"]?
                 .trimmingCharacters(in: .whitespacesAndNewlines),
                 !raw.isEmpty else {
                 return false
@@ -384,6 +416,9 @@ public final class PipelineRunner: @unchecked Sendable {
                 selectedFrames = try loadImages(in: paths.framesSelectedURL)
                 selectedFrameManifest = (try? loadSelectedFrameManifest(from: paths.framesSelectedManifestURL)) ?? selectedFrameManifest
             }
+            if selectedFrames.count < 2 {
+                throw PipelineError.insufficientInputImages(selectedFrames.count)
+            }
 
             var autoTuneProfile: AutoTuneProfile? = nil
             let detectedHardwareProfile = HardwareProfile.detect()
@@ -409,7 +444,7 @@ public final class PipelineRunner: @unchecked Sendable {
             if let backendOverride, backendOverride == .fastvggt || backendOverride == .vggt {
                 emit(.stageLog(
                     stage: .sfmFeatures,
-                    line: "Deprecated SfM backend override '\(backendOverride.rawValue)' is enabled. Default backend is now GLOMAP (COLMAP global_mapper).",
+                    line: "Deprecated SfM backend override '\(backendOverride.rawValue)' is enabled. Default backend is now MapAnything-first with COLMAP fallback.",
                     isError: true
                 ))
             }
@@ -456,6 +491,8 @@ public final class PipelineRunner: @unchecked Sendable {
 
             let backendName: (SfmBackend) -> String = { backend in
                 switch backend {
+                case .mapanything:
+                    return "MapAnything"
                 case .fastvggt:
                     return "FastVGGT"
                 case .vggt:
@@ -467,7 +504,864 @@ public final class PipelineRunner: @unchecked Sendable {
 
             for (index, backendPolicy) in backendOrder.enumerated() {
                 do {
-                    if backendPolicy == .fastvggt {
+                    if backendPolicy == .mapanything {
+                        let fm = FileManager.default
+                        let seedZero = paths.colmapSeedModelURL
+                        let sparseZero = paths.colmapSparseURL.appendingPathComponent("0", isDirectory: true)
+                        let mapPlan = mapAnythingExecutionPlan(
+                            hardwareProfile: detectedHardwareProfile,
+                            input: metadata.input,
+                            selectedFrameCount: selectedFrames.count,
+                            preset: metadata.preset,
+                            autoTune: autoTuneProfile
+                        )
+                        let mapCheckpoint = mapAnythingCheckpointPreference()
+                        let mapCoverageManifest = paths.mapanythingCoverageManifestURL
+                        let mapRefinementOptions = tuneMapAnythingRefinementColmapOptions(
+                            frameCount: selectedFrames.count,
+                            extractOptions: colmapExtractOptions,
+                            matchOptions: colmapMatchOptions
+                        )
+                        let mapColmapExtractOptions = mapRefinementOptions.extract
+                        let mapColmapMatchOptions = mapRefinementOptions.match
+                        var preparedMapAnythingMode = inferPreparedMapAnythingMode(paths: paths)
+
+                        func mapAnythingConfig(mode: MapAnythingRunMode) -> MapAnythingSfmConfig {
+                            MapAnythingSfmConfig(
+                                device: mapPlan.device,
+                                mode: mode,
+                                checkpointSubdirectory: mapCheckpoint,
+                                resolution: mapPlan.resolution,
+                                memoryEfficientInference: mapPlan.memoryEfficientInference,
+                                minibatchSize: mapPlan.minibatchSize,
+                                useAMP: mapPlan.useAMP,
+                                maxPoints: mapPlan.maxPoints,
+                                cameraType: mapPlan.cameraType,
+                                sharedCamera: mapPlan.sharedCamera,
+                                anchorMaxViews: mapPlan.anchorMaxViews,
+                                windowSize: mapPlan.windowSize,
+                                windowOverlap: mapPlan.windowOverlap,
+                                coverageManifestPath: mapCoverageManifest
+                            )
+                        }
+
+                        func analyzeMapAnythingModel(
+                            at modelURL: URL,
+                            candidate: String,
+                            toolLog: ToolLogWriter? = nil
+                        ) async throws -> ReconstructionScore {
+                            let report = try await self.tooling.colmap.runModelAnalyzer(
+                                colmapPath: self.config.toolchain.colmap,
+                                modelPath: modelURL,
+                                options: mapColmapMatchOptions
+                            )
+                            for line in report.split(separator: "\n", omittingEmptySubsequences: false) {
+                                toolLog?.append(stream: "stdout", line: String(line))
+                            }
+                            let score = ReconstructionScorer.parseModelAnalyzerOutput(report)
+                            emit(.stageLog(
+                                stage: currentStage,
+                                line: "MapAnything score (\(candidate)): \(ReconstructionScorer.summary(score)).",
+                                isError: false
+                            ))
+                            return score
+                        }
+
+                        func readMapAnythingCoverageManifest(
+                            expectedMode: MapAnythingRunMode,
+                            required: Bool
+                        ) throws -> MapAnythingCoverageManifest? {
+                            guard fm.fileExists(atPath: mapCoverageManifest.path) else {
+                                let line = "MapAnything coverage manifest was missing at \(mapCoverageManifest.lastPathComponent)."
+                                emit(.stageLog(stage: currentStage, line: line, isError: required))
+                                if required {
+                                    throw PipelineError.outputMissing
+                                }
+                                return nil
+                            }
+
+                            let manifest: MapAnythingCoverageManifest
+                            do {
+                                manifest = try MapAnythingCoverageManifest.load(from: mapCoverageManifest)
+                            } catch {
+                                emit(.stageLog(
+                                    stage: currentStage,
+                                    line: "MapAnything coverage manifest could not be decoded (\(error.localizedDescription)).",
+                                    isError: required
+                                ))
+                                if required {
+                                    throw error
+                                }
+                                return nil
+                            }
+
+                            let issues = manifest.validationIssues(
+                                expectedMode: expectedMode,
+                                selectedImageCount: selectedFrames.count
+                            )
+                            if !issues.isEmpty {
+                                emit(.stageLog(
+                                    stage: currentStage,
+                                    line: "MapAnything coverage manifest was inconsistent: \(issues.joined(separator: "; ")).",
+                                    isError: required
+                                ))
+                                if required {
+                                    throw PipelineError.outputMissing
+                                }
+                                return nil
+                            }
+
+                            emit(.stageLog(
+                                stage: currentStage,
+                                line: "MapAnything coverage: \(manifest.summary).",
+                                isError: false
+                            ))
+                            return manifest
+                        }
+
+                        if try shouldRunStage(.sfmFeatures) {
+                            currentStage = .sfmFeatures
+                            emit(.stageStarted(stage: .sfmFeatures))
+                            writeCheckpoint(
+                                stage: .sfmFeatures,
+                                progress: 0,
+                                message: "MapAnything SfM started",
+                                details: .sfmFeatures(SfmFeaturesCheckpoint(
+                                    databasePath: paths.colmapDatabaseURL.path,
+                                    imageCount: selectedFrames.count
+                                ))
+                            )
+                            emit(.stageLog(stage: .sfmFeatures, line: "SfM backend: mapanything-mps.", isError: false))
+                            emit(.stageLog(
+                                stage: .sfmFeatures,
+                                line: "MapAnything policy: tier=\(detectedHardwareProfile.tier.rawValue.lowercased()) directLimit=\(mapPlan.directViewLimit) selected=\(selectedFrames.count) mode=\(mapPlan.mode.rawValue) resolution=\(mapPlan.resolution) memoryEfficient=\(mapPlan.memoryEfficientInference) amp=\(mapPlan.useAMP) sharedCamera=\(mapPlan.sharedCamera) window=\(mapPlan.windowSize) overlap=\(mapPlan.windowOverlap) directMinTrack=\(String(format: "%.2f", mapAnythingDirectMinimumMeanTrackLengthPreference(mode: metadata.preset.mode))).",
+                                isError: false
+                            ))
+                            if !mapRefinementOptions.notes.isEmpty {
+                                for note in mapRefinementOptions.notes {
+                                    emit(.stageLog(stage: .sfmFeatures, line: note, isError: false))
+                                }
+                            }
+
+                            self.removeIfExists(paths.colmapDatabaseURL)
+                            try self.resetDirectory(paths.colmapSeedURL)
+                            try self.resetDirectory(seedZero)
+                            try self.resetDirectory(paths.colmapSparseURL)
+                            try self.resetDirectory(sparseZero)
+                            self.removeIfExists(mapCoverageManifest)
+
+                            let mapToolLog = ToolLogWriter(fileURL: paths.mapanythingLogURL, toolName: "mapanything-mps")
+                            mapToolLog.beginSection(
+                                title: "sfm",
+                                metadata: [
+                                    "device": mapPlan.device,
+                                    "mode": mapPlan.mode.rawValue,
+                                    "images": paths.framesSelectedURL.path,
+                                    "resolution": "\(mapPlan.resolution)",
+                                    "memoryEfficientInference": mapPlan.memoryEfficientInference ? "1" : "0",
+                                    "useAMP": mapPlan.useAMP ? "1" : "0",
+                                    "maxPoints": "\(mapPlan.maxPoints)",
+                                    "sharedCamera": mapPlan.sharedCamera ? "1" : "0",
+                                    "cameraType": mapPlan.cameraType,
+                                    "anchorMaxViews": "\(mapPlan.anchorMaxViews)",
+                                    "windowSize": "\(mapPlan.windowSize)",
+                                    "windowOverlap": "\(mapPlan.windowOverlap)",
+                                    "checkpoint": mapCheckpoint,
+                                    "manifest": mapCoverageManifest.path,
+                                    "tool": self.config.toolchain.mapanything.sfmTool.path,
+                                    "modelsDir": self.config.toolchain.mapanything.models.path
+                                ]
+                            )
+                            emit(.stageLog(stage: .sfmFeatures, line: "MapAnything tool log: \(paths.mapanythingLogURL.lastPathComponent)", isError: false))
+                            emit(.stageLog(stage: .sfmFeatures, line: "MapAnything coverage manifest: \(mapCoverageManifest.lastPathComponent)", isError: false))
+
+                            let onMapAnythingLog: @Sendable (String, Bool) -> Void = { line, isErr in
+                                mapToolLog.append(stream: isErr ? "stderr" : "stdout", line: line)
+                                let sanitized = Self.sanitizeToolLogLine(line)
+                                let effectiveIsErr = Self.normalizedToolLogIsError(sanitized, isError: isErr)
+                                if Self.shouldEmitToolLogLine(sanitized, isError: effectiveIsErr) {
+                                    emit(.stageLog(stage: .sfmFeatures, line: sanitized, isError: effectiveIsErr))
+                                }
+                            }
+
+                            var acceptedDirect = false
+                            if mapPlan.directAllowed {
+                                let directConfig = mapAnythingConfig(mode: .direct)
+                                emit(.stageProgress(stage: .sfmFeatures, fraction: 0.0, message: "Starting MapAnything direct solve (\(selectedFrames.count) images)…"))
+                                do {
+                                    try await self.tooling.mapAnythingSfm.run(
+                                        toolchain: self.config.toolchain.mapanything,
+                                        images: paths.framesSelectedURL,
+                                        outSparse: sparseZero,
+                                        config: directConfig,
+                                        onLog: onMapAnythingLog
+                                    )
+                                    guard sparseModelFilesExist(at: sparseZero) else {
+                                        throw PipelineError.outputMissing
+                                    }
+                                    let imagesTxt = sparseZero.appendingPathComponent("images.txt")
+                                    if try ColmapTextModelNormalizer.normalizeImagesTxtIfNeeded(at: imagesTxt) {
+                                        emit(.stageLog(
+                                            stage: .sfmFeatures,
+                                            line: "Normalized MapAnything direct COLMAP model (added missing POINTS2D lines to images.txt).",
+                                            isError: false
+                                        ))
+                                    }
+                                    let coverageManifest = try readMapAnythingCoverageManifest(
+                                        expectedMode: .direct,
+                                        required: true
+                                    )
+                                    let rawScore = try await analyzeMapAnythingModel(
+                                        at: sparseZero,
+                                        candidate: "direct",
+                                        toolLog: mapToolLog
+                                    )
+                                    let score = mapAnythingScoreApplyingCoverageFallback(
+                                        rawScore,
+                                        coverageManifest: coverageManifest
+                                    )
+                                    if let rejection = mapAnythingDirectQualityFailureReason(
+                                        score: score,
+                                        mode: metadata.preset.mode
+                                    ) {
+                                        emit(.stageLog(
+                                            stage: .sfmFeatures,
+                                            line: "MapAnything direct solve was below the quality bar (\(rejection)); switching to seed_refine.",
+                                            isError: true
+                                        ))
+                                    } else {
+                                        acceptedDirect = true
+                                        preparedMapAnythingMode = .direct
+                                    }
+                                } catch {
+                                    emit(.stageLog(
+                                        stage: .sfmFeatures,
+                                        line: "MapAnything direct solve failed (\(failureMessages(for: error, stage: .sfmFeatures).debugMessage)). Switching to seed_refine.",
+                                        isError: true
+                                    ))
+                                }
+                            } else {
+                                emit(.stageLog(
+                                    stage: .sfmFeatures,
+                                    line: "MapAnything direct solve disabled on this hardware/profile; using seed_refine.",
+                                    isError: false
+                                ))
+                            }
+
+                            if !acceptedDirect {
+                                self.removeIfExists(paths.colmapDatabaseURL)
+                                try self.resetDirectory(paths.colmapSeedURL)
+                                try self.resetDirectory(seedZero)
+                                try self.resetDirectory(paths.colmapSparseURL)
+                                let seedConfig = mapAnythingConfig(mode: .seedRefine)
+                                emit(.stageProgress(stage: .sfmFeatures, fraction: 0.0, message: "Starting MapAnything seed solve (\(selectedFrames.count) images)…"))
+                                try await self.tooling.mapAnythingSfm.run(
+                                    toolchain: self.config.toolchain.mapanything,
+                                    images: paths.framesSelectedURL,
+                                    outSparse: seedZero,
+                                    config: seedConfig,
+                                    onLog: onMapAnythingLog
+                                )
+                                guard sparseModelFilesExist(at: seedZero) else {
+                                    throw PipelineError.outputMissing
+                                }
+                                let imagesTxt = seedZero.appendingPathComponent("images.txt")
+                                if try ColmapTextModelNormalizer.normalizeImagesTxtIfNeeded(at: imagesTxt) {
+                                    emit(.stageLog(
+                                        stage: .sfmFeatures,
+                                        line: "Normalized MapAnything seed COLMAP model (added missing POINTS2D lines to images.txt).",
+                                        isError: false
+                                    ))
+                                }
+                                _ = try readMapAnythingCoverageManifest(
+                                    expectedMode: .seedRefine,
+                                    required: true
+                                )
+                                preparedMapAnythingMode = .seedRefine
+                            }
+
+                            if !fm.fileExists(atPath: paths.colmapDatabaseURL.path) {
+                                fm.createFile(atPath: paths.colmapDatabaseURL.path, contents: Data())
+                            }
+
+                            writeCheckpoint(
+                                stage: .sfmFeatures,
+                                progress: 1.0,
+                                message: preparedMapAnythingMode == .direct ? "MapAnything direct sparse model ready" : "MapAnything seed model ready",
+                                details: .sfmFeatures(SfmFeaturesCheckpoint(
+                                    databasePath: paths.colmapDatabaseURL.path,
+                                    imageCount: selectedFrames.count
+                                ))
+                            )
+                            emit(.stageFinished(stage: .sfmFeatures))
+                            markStageComplete(.sfmFeatures)
+                        } else if let preparedMode = inferPreparedMapAnythingMode(paths: paths) {
+                            preparedMapAnythingMode = preparedMode
+                            if !fm.fileExists(atPath: paths.colmapDatabaseURL.path) {
+                                fm.createFile(atPath: paths.colmapDatabaseURL.path, contents: Data())
+                            }
+                        }
+
+                        let effectiveMapAnythingMode = preparedMapAnythingMode ?? inferPreparedMapAnythingMode(paths: paths)
+                        guard let effectiveMapAnythingMode else {
+                            throw PipelineError.outputMissing
+                        }
+
+                        if effectiveMapAnythingMode == .direct {
+                            if try shouldRunStage(.sfmMatching) {
+                                currentStage = .sfmMatching
+                                emit(.stageStarted(stage: .sfmMatching))
+                                writeCheckpoint(
+                                    stage: .sfmMatching,
+                                    progress: 1.0,
+                                    message: "MapAnything direct path skips matching",
+                                    details: .sfmMatching(SfmMatchingCheckpoint(
+                                        databasePath: paths.colmapDatabaseURL.path,
+                                        expectedPairs: nil,
+                                        processedPairs: nil
+                                    ))
+                                )
+                                emit(.stageLog(stage: .sfmMatching, line: "MapAnything direct solve produced a sparse model directly; skipping matching.", isError: false))
+                                emit(.stageFinished(stage: .sfmMatching))
+                                markStageComplete(.sfmMatching)
+                            }
+
+                            if try shouldRunStage(.sfmMapping) {
+                                currentStage = .sfmMapping
+                                emit(.stageStarted(stage: .sfmMapping))
+                                guard sparseModelFilesExist(at: sparseZero) else {
+                                    throw PipelineError.outputMissing
+                                }
+                                if try ensureTextSparseModelFiles(at: sparseZero) {
+                                    emit(.stageLog(
+                                        stage: .sfmMapping,
+                                        line: "Converted MapAnything sparse model to COLMAP text format for training compatibility.",
+                                        isError: false
+                                    ))
+                                }
+                                let imagesTxt = sparseZero.appendingPathComponent("images.txt")
+                                if try ColmapTextModelNormalizer.normalizeImagesTxtIfNeeded(at: imagesTxt) {
+                                    emit(.stageLog(
+                                        stage: .sfmMapping,
+                                        line: "Normalized MapAnything direct COLMAP model (added missing POINTS2D lines to images.txt).",
+                                        isError: false
+                                    ))
+                                }
+                                writeCheckpoint(
+                                    stage: .sfmMapping,
+                                    progress: 1.0,
+                                    message: "MapAnything direct sparse model accepted",
+                                    details: .sfmMapping(SfmMappingCheckpoint(
+                                        mapper: "mapanything-direct",
+                                        sparsePath: sparseZero.path,
+                                        registeredImages: nil
+                                    ))
+                                )
+                                emit(.stageLog(stage: .sfmMapping, line: "MapAnything direct sparse model accepted as the final SfM output.", isError: false))
+                                emit(.stageFinished(stage: .sfmMapping))
+                                markStageComplete(.sfmMapping)
+                            }
+                        } else {
+                            if try shouldRunStage(.sfmMatching) {
+                                currentStage = .sfmMatching
+                                emit(.stageStarted(stage: .sfmMatching))
+                                writeCheckpoint(
+                                    stage: .sfmMatching,
+                                    progress: 0,
+                                    message: "MapAnything refinement matching started",
+                                    details: .sfmMatching(SfmMatchingCheckpoint(
+                                        databasePath: paths.colmapDatabaseURL.path,
+                                        expectedPairs: nil,
+                                        processedPairs: 0
+                                    ))
+                                )
+
+                                let colmapToolLog = ToolLogWriter(fileURL: paths.colmapLogURL, toolName: "colmap")
+                                colmapToolLog.beginSection(
+                                    title: "mapanything_matching",
+                                    metadata: [
+                                        "database": paths.colmapDatabaseURL.path,
+                                        "images": paths.framesSelectedURL.path,
+                                        "tool": self.config.toolchain.colmap.path
+                                    ]
+                                )
+                                emit(.stageLog(stage: .sfmMatching, line: "COLMAP tool log: \(paths.colmapLogURL.lastPathComponent)", isError: false))
+                                if !mapRefinementOptions.notes.isEmpty {
+                                    for note in mapRefinementOptions.notes {
+                                        emit(.stageLog(stage: .sfmMatching, line: note, isError: false))
+                                    }
+                                }
+                                emit(.stageLog(
+                                    stage: .sfmMatching,
+                                    line: mapColmapExtractOptions.useGPU ? "Using GPU for COLMAP feature extraction." : "Using CPU for COLMAP feature extraction.",
+                                    isError: false
+                                ))
+                                emit(.stageLog(
+                                    stage: .sfmMatching,
+                                    line: "MapAnything refinement matching options: overlap=\(mapColmapMatchOptions.sequentialOverlap), maxMatches=\(mapColmapMatchOptions.maxNumMatches.map(String.init) ?? "default"), threads=\(mapColmapMatchOptions.matchThreads).",
+                                    isError: false
+                                ))
+                                emit(.stageProgress(stage: .sfmMatching, fraction: 0.02, message: "Matching views: extracting local features…"))
+                                let featureProgress = ColmapFeatureProgressTracker()
+                                try await self.tooling.colmap.runFeatureExtractor(
+                                    colmapPath: self.config.toolchain.colmap,
+                                    database: paths.colmapDatabaseURL,
+                                    imagePath: paths.framesSelectedURL,
+                                    maxImageSize: colmapMaxImageSize,
+                                    cameraModel: mapPlan.cameraType,
+                                    singleCamera: mapPlan.sharedCamera,
+                                    options: mapColmapExtractOptions,
+                                    onLog: { line, isErr in
+                                        colmapToolLog.append(stream: isErr ? "stderr" : "stdout", line: line)
+                                        let sanitized = Self.sanitizeToolLogLine(line)
+                                        let effectiveIsErr = Self.normalizedToolLogIsError(sanitized, isError: isErr)
+                                        if Self.shouldEmitToolLogLine(sanitized, isError: effectiveIsErr) {
+                                            emit(.stageLog(stage: .sfmMatching, line: sanitized, isError: effectiveIsErr))
+                                        }
+                                        if let update = featureProgress.ingest(line) {
+                                            let scaledFraction = min(0.30, update.fraction * 0.30)
+                                            let message = update.message.replacingOccurrences(
+                                                of: "Finding features",
+                                                with: "Matching views: extracting local features"
+                                            )
+                                            emit(.stageProgress(stage: .sfmMatching, fraction: scaledFraction, message: message))
+                                        }
+                                    }
+                                )
+                                emit(.stageProgress(stage: .sfmMatching, fraction: 0.30, message: "Matching views: starting pair matching…"))
+
+                                let useSequential = self.shouldUseSequential(
+                                    selectedFrames: selectedFrames,
+                                    input: metadata.input,
+                                    forceExhaustive: forceExhaustiveMatching
+                                )
+                                lastUsedSequentialMatcher = useSequential
+
+                                final class MatchingProgressState: @unchecked Sendable {
+                                    private let lock = NSLock()
+                                    private var latestBlockMessage: String?
+
+                                    func updateBlockMessage(_ message: String) {
+                                        lock.lock()
+                                        latestBlockMessage = message
+                                        lock.unlock()
+                                    }
+
+                                    func blockMessage() -> String? {
+                                        lock.lock()
+                                        defer { lock.unlock() }
+                                        return latestBlockMessage
+                                    }
+                                }
+
+                                func runMatcherWithProgress(
+                                    expectedPairs: Int,
+                                    run: @escaping (@escaping @Sendable (String, Bool) -> Void) async throws -> Void
+                                ) async throws {
+                                    let state = MatchingProgressState()
+                                    let blockProgress = ColmapMatchingProgressTracker()
+                                    let onLog: @Sendable (String, Bool) -> Void = { line, isErr in
+                                        colmapToolLog.append(stream: isErr ? "stderr" : "stdout", line: line)
+                                        let sanitized = Self.sanitizeToolLogLine(line)
+                                        let effectiveIsErr = Self.normalizedToolLogIsError(sanitized, isError: isErr)
+                                        if Self.shouldEmitToolLogLine(sanitized, isError: effectiveIsErr) {
+                                            emit(.stageLog(stage: .sfmMatching, line: sanitized, isError: effectiveIsErr))
+                                        }
+                                        if let update = blockProgress.ingest(line) {
+                                            state.updateBlockMessage(update.message)
+                                        }
+                                    }
+
+                                    let poller = ColmapDatabaseProgressPoller(databasePath: paths.colmapDatabaseURL)
+                                    let pollTask = Task.detached(priority: .utility) { [expectedPairs, poller, state, emit] in
+                                        let denom = max(1, expectedPairs)
+                                        var lastFraction: Double = 0
+                                        var lastProcessed = -1
+                                        var lastEmit = Date.distantPast
+
+                                        while !Task.isCancelled {
+                                            var processed = (try? poller.readProcessedPairCount()) ?? 0
+                                            if lastProcessed >= 0, processed < lastProcessed {
+                                                processed = lastProcessed
+                                            }
+                                            let rawFraction = Double(processed) / Double(denom)
+                                            let clamped = max(0, min(0.99, rawFraction))
+                                            if clamped > lastFraction {
+                                                lastFraction = clamped
+                                            }
+
+                                            let now = Date()
+                                            let shouldEmitZeroHeartbeat = processed == 0 && now.timeIntervalSince(lastEmit) >= 10
+                                            if processed != lastProcessed || shouldEmitZeroHeartbeat {
+                                                lastProcessed = processed
+                                                lastEmit = now
+                                                let base = state.blockMessage()
+                                                let message: String
+                                                if let base {
+                                                    message = "\(base), pairs \(processed)/\(denom)"
+                                                } else {
+                                                    message = "Matching views (pairs \(processed)/\(denom))"
+                                                }
+                                                let scaledFraction = min(0.99, 0.30 + (lastFraction * 0.69))
+                                                emit(.stageProgress(stage: .sfmMatching, fraction: scaledFraction, message: message))
+                                            }
+
+                                            try? await Task.sleep(for: .seconds(1))
+                                        }
+                                    }
+                                    defer { pollTask.cancel() }
+
+                                    try await run(onLog)
+                                }
+
+                                func runSequentialMatcher() async throws {
+                                    let expected = ColmapPairEstimator.expectedSequentialPairs(
+                                        imageCount: selectedFrames.count,
+                                        overlap: mapColmapMatchOptions.sequentialOverlap
+                                    )
+                                    emit(.stageLog(
+                                        stage: .sfmMatching,
+                                        line: "MapAnything refinement matching: sequential matcher (target pairs ≈ \(expected)).",
+                                        isError: false
+                                    ))
+                                    try await runMatcherWithProgress(expectedPairs: expected) { onLog in
+                                        try await self.tooling.colmap.runMatcherSequential(
+                                            colmapPath: self.config.toolchain.colmap,
+                                            database: paths.colmapDatabaseURL,
+                                            options: mapColmapMatchOptions,
+                                            onLog: onLog
+                                        )
+                                    }
+                                }
+
+                                func runExhaustiveMatcher() async throws {
+                                    let expected = ColmapPairEstimator.expectedExhaustivePairs(imageCount: selectedFrames.count)
+                                    emit(.stageLog(
+                                        stage: .sfmMatching,
+                                        line: "MapAnything refinement matching: exhaustive matcher (target pairs ≈ \(expected)).",
+                                        isError: false
+                                    ))
+                                    try await runMatcherWithProgress(expectedPairs: expected) { onLog in
+                                        try await self.tooling.colmap.runMatcherExhaustive(
+                                            colmapPath: self.config.toolchain.colmap,
+                                            database: paths.colmapDatabaseURL,
+                                            options: mapColmapMatchOptions,
+                                            onLog: onLog
+                                        )
+                                    }
+                                }
+
+                                do {
+                                    if useSequential {
+                                        try await runSequentialMatcher()
+                                    } else {
+                                        try await runExhaustiveMatcher()
+                                    }
+                                } catch {
+                                    if useSequential {
+                                        emit(.stageLog(
+                                            stage: .sfmMatching,
+                                            line: "Sequential matcher failed during MapAnything refinement; retrying with exhaustive matching.",
+                                            isError: true
+                                        ))
+                                        lastUsedSequentialMatcher = false
+                                        try await runExhaustiveMatcher()
+                                    } else {
+                                        throw error
+                                    }
+                                }
+
+                                let expectedPairs = lastUsedSequentialMatcher
+                                    ? ColmapPairEstimator.expectedSequentialPairs(
+                                        imageCount: selectedFrames.count,
+                                        overlap: mapColmapMatchOptions.sequentialOverlap
+                                    )
+                                    : ColmapPairEstimator.expectedExhaustivePairs(imageCount: selectedFrames.count)
+                                let processedPairs = (try? ColmapDatabaseProgressPoller(databasePath: paths.colmapDatabaseURL).readProcessedPairCount()) ?? 0
+                                writeCheckpoint(
+                                    stage: .sfmMatching,
+                                    progress: 1.0,
+                                    message: "MapAnything refinement matching completed",
+                                    details: .sfmMatching(SfmMatchingCheckpoint(
+                                        databasePath: paths.colmapDatabaseURL.path,
+                                        expectedPairs: expectedPairs,
+                                        processedPairs: processedPairs
+                                    ))
+                                )
+                                emit(.stageFinished(stage: .sfmMatching))
+                                markStageComplete(.sfmMatching)
+                            }
+
+                            if try shouldRunStage(.sfmMapping) {
+                                currentStage = .sfmMapping
+                                emit(.stageStarted(stage: .sfmMapping))
+                                writeCheckpoint(
+                                    stage: .sfmMapping,
+                                    progress: 0,
+                                    message: "MapAnything refinement mapping started",
+                                    details: .sfmMapping(SfmMappingCheckpoint(
+                                        mapper: "mapanything-refinement",
+                                        sparsePath: sparseZero.path,
+                                        registeredImages: nil
+                                    ))
+                                )
+
+                                let colmapToolLog = ToolLogWriter(fileURL: paths.colmapLogURL, toolName: "colmap")
+                                colmapToolLog.beginSection(
+                                    title: "mapanything_refinement",
+                                    metadata: [
+                                        "database": paths.colmapDatabaseURL.path,
+                                        "images": paths.framesSelectedURL.path,
+                                        "seed": seedZero.path,
+                                        "output": sparseZero.path,
+                                        "tool": self.config.toolchain.colmap.path
+                                    ]
+                                )
+                                let mappingProgress = ColmapMappingProgressTracker(totalImages: selectedFrames.count)
+                                let onMappingLog: @Sendable (String, Bool) -> Void = { line, isErr in
+                                    let sanitized = Self.sanitizeToolLogLine(line)
+                                    let effectiveIsErr = Self.normalizedToolLogIsError(sanitized, isError: isErr)
+                                    if Self.shouldEmitToolLogLine(sanitized, isError: effectiveIsErr) {
+                                        emit(.stageLog(stage: .sfmMapping, line: sanitized, isError: effectiveIsErr))
+                                    }
+                                    if let update = mappingProgress.ingest(line) {
+                                        emit(.stageProgress(stage: .sfmMapping, fraction: update.fraction, message: update.message))
+                                    }
+                                }
+
+                                var acceptedModelURL: URL?
+                                var acceptedMapper = "mapanything-refinement"
+                                var lastMappingError: Error?
+
+                                do {
+                                    guard sparseModelFilesExist(at: seedZero) else {
+                                        throw PipelineError.outputMissing
+                                    }
+                                    if try ColmapTextModelNormalizer.remapSeedModelIDsToDatabase(
+                                        seedModelURL: seedZero,
+                                        databaseURL: paths.colmapDatabaseURL
+                                    ) {
+                                        emit(.stageLog(
+                                            stage: .sfmMapping,
+                                            line: "Aligned MapAnything seed model IDs with COLMAP database IDs.",
+                                            isError: false
+                                        ))
+                                    }
+                                    try self.resetDirectory(paths.colmapSparseURL)
+                                    try self.resetDirectory(sparseZero)
+                                    emit(.stageLog(stage: .sfmMapping, line: "Running refinement: point_triangulator.", isError: false))
+                                    try await self.tooling.colmap.runPointTriangulator(
+                                        colmapPath: self.config.toolchain.colmap,
+                                        database: paths.colmapDatabaseURL,
+                                        imagePath: paths.framesSelectedURL,
+                                        inputPath: seedZero,
+                                        outputPath: sparseZero,
+                                        options: mapColmapMatchOptions,
+                                        onLog: { line, isErr in
+                                            colmapToolLog.append(stream: isErr ? "stderr" : "stdout", line: line)
+                                            onMappingLog(line, isErr)
+                                        }
+                                    )
+
+                                    let baOutput = paths.colmapSparseURL.appendingPathComponent("0_ba", isDirectory: true)
+                                    self.removeIfExists(baOutput)
+                                    try fm.createDirectory(at: baOutput, withIntermediateDirectories: true)
+                                    emit(.stageLog(stage: .sfmMapping, line: "Running refinement: bundle_adjuster.", isError: false))
+                                    try await self.tooling.colmap.runBundleAdjuster(
+                                        colmapPath: self.config.toolchain.colmap,
+                                        inputPath: sparseZero,
+                                        outputPath: baOutput,
+                                        options: mapColmapMatchOptions,
+                                        bundleOptions: ColmapBundleAdjustmentOptions(),
+                                        onLog: { line, isErr in
+                                            colmapToolLog.append(stream: isErr ? "stderr" : "stdout", line: line)
+                                            onMappingLog(line, isErr)
+                                        }
+                                    )
+                                    guard sparseModelFilesExist(at: baOutput) else {
+                                        throw PipelineError.outputMissing
+                                    }
+                                    self.removeIfExists(sparseZero)
+                                    try fm.moveItem(at: baOutput, to: sparseZero)
+
+                                    let score = try await analyzeMapAnythingModel(
+                                        at: sparseZero,
+                                        candidate: "point_triangulator+bundle_adjuster",
+                                        toolLog: colmapToolLog
+                                    )
+                                    if ReconstructionScorer.isAcceptable(score, mode: metadata.preset.mode) {
+                                        acceptedModelURL = sparseZero
+                                        acceptedMapper = "point_triangulator+bundle_adjuster"
+                                    } else {
+                                        lastMappingError = PipelineError.lowQualityReconstruction(score)
+                                    }
+                                } catch {
+                                    lastMappingError = error
+                                }
+
+                                if acceptedModelURL == nil {
+                                    emit(.stageLog(
+                                        stage: .sfmMapping,
+                                        line: "MapAnything refinement was not usable; trying solver fallback (global_mapper -> mapper).",
+                                        isError: true
+                                    ))
+
+                                    let globalMapperToolLog = ToolLogWriter(
+                                        fileURL: paths.glomapLogURL,
+                                        toolName: "colmap-global_mapper"
+                                    )
+                                    globalMapperToolLog.beginSection(
+                                        title: "mapper_fallback",
+                                        metadata: [
+                                            "database": paths.colmapDatabaseURL.path,
+                                            "images": paths.framesSelectedURL.path,
+                                            "output": paths.colmapSparseURL.path,
+                                            "tool": self.config.toolchain.colmap.path
+                                        ]
+                                    )
+                                    emit(.stageLog(stage: .sfmMapping, line: "Global mapper log: \(paths.glomapLogURL.lastPathComponent)", isError: false))
+
+                                    func evaluateFallbackModel(candidate: String) async throws -> Bool {
+                                        guard sparseModelFilesExist(at: sparseZero) else {
+                                            throw PipelineError.outputMissing
+                                        }
+                                        let score = try await analyzeMapAnythingModel(
+                                            at: sparseZero,
+                                            candidate: candidate,
+                                            toolLog: colmapToolLog
+                                        )
+                                        if ReconstructionScorer.isAcceptable(score, mode: metadata.preset.mode) {
+                                            acceptedModelURL = sparseZero
+                                            acceptedMapper = candidate
+                                            return true
+                                        }
+                                        lastMappingError = PipelineError.lowQualityReconstruction(score)
+                                        return false
+                                    }
+
+                                    let threadHint = max(mapColmapExtractOptions.extractThreads, mapColmapMatchOptions.matchThreads)
+                                    let baseGlobalMapperOptions = self.globalMapperOptions(
+                                        threadHint: threadHint,
+                                        defaultUseGpu: mapColmapExtractOptions.useGPU || mapColmapMatchOptions.useGPU
+                                    )
+                                    var shouldTryIncrementalMapper = true
+
+                                    if mapperPreference == .glomap && !disableGlomapForThisRun {
+                                        let gpuPreferredOptions = baseGlobalMapperOptions
+                                        let gpuRequested = gpuPreferredOptions.useGpuForGlobalPositioning || gpuPreferredOptions.useGpuForBundleAdjustment
+                                        do {
+                                            try self.resetDirectory(paths.colmapSparseURL)
+                                            emit(.stageLog(
+                                                stage: .sfmMapping,
+                                                line: "Mapper fallback: running COLMAP global_mapper (gp_use_gpu=\(gpuPreferredOptions.useGpuForGlobalPositioning), ba_use_gpu=\(gpuPreferredOptions.useGpuForBundleAdjustment), threads=\(gpuPreferredOptions.numThreads)).",
+                                                isError: false
+                                            ))
+                                            try await self.tooling.colmap.runGlobalMapper(
+                                                colmapPath: self.config.toolchain.colmap,
+                                                database: paths.colmapDatabaseURL,
+                                                imagePath: paths.framesSelectedURL,
+                                                outputPath: paths.colmapSparseURL,
+                                                options: gpuPreferredOptions,
+                                                environment: mapColmapMatchOptions.environment,
+                                                onLog: { line, isErr in
+                                                    globalMapperToolLog.append(stream: isErr ? "stderr" : "stdout", line: line)
+                                                    onMappingLog(line, isErr)
+                                                }
+                                            )
+                                            if try await evaluateFallbackModel(candidate: gpuRequested ? "global_mapper-gpu" : "global_mapper") {
+                                                shouldTryIncrementalMapper = false
+                                            }
+                                        } catch {
+                                            lastMappingError = error
+                                            if let colmapError = error as? ColmapRunnerError,
+                                               colmapErrorIndicatesMissingGlobalMapper(colmapError) {
+                                                disableGlomapForThisRun = true
+                                                emit(.stageLog(
+                                                    stage: .sfmMapping,
+                                                    line: "COLMAP global_mapper is unavailable in this toolchain; falling back to COLMAP mapper.",
+                                                    isError: true
+                                                ))
+                                            } else if let colmapError = error as? ColmapRunnerError,
+                                                      gpuRequested,
+                                                      colmapErrorIndicatesGpuFailure(colmapError) {
+                                                var cpuOptions = gpuPreferredOptions
+                                                cpuOptions.useGpuForGlobalPositioning = false
+                                                cpuOptions.useGpuForBundleAdjustment = false
+                                                emit(.stageLog(
+                                                    stage: .sfmMapping,
+                                                    line: "global_mapper GPU path failed; retrying global_mapper with GPU disabled.",
+                                                    isError: true
+                                                ))
+                                                do {
+                                                    try self.resetDirectory(paths.colmapSparseURL)
+                                                    try await self.tooling.colmap.runGlobalMapper(
+                                                        colmapPath: self.config.toolchain.colmap,
+                                                        database: paths.colmapDatabaseURL,
+                                                        imagePath: paths.framesSelectedURL,
+                                                        outputPath: paths.colmapSparseURL,
+                                                        options: cpuOptions,
+                                                        environment: mapColmapMatchOptions.environment,
+                                                        onLog: { line, isErr in
+                                                            globalMapperToolLog.append(stream: isErr ? "stderr" : "stdout", line: line)
+                                                            onMappingLog(line, isErr)
+                                                        }
+                                                    )
+                                                    if try await evaluateFallbackModel(candidate: "global_mapper-cpu") {
+                                                        shouldTryIncrementalMapper = false
+                                                    }
+                                                } catch {
+                                                    lastMappingError = error
+                                                }
+                                            }
+                                        }
+                                    } else if mapperPreference == .glomap && disableGlomapForThisRun {
+                                        emit(.stageLog(stage: .sfmMapping, line: "Skipping global_mapper for this run (disabled after previous launch failure).", isError: true))
+                                    }
+
+                                    if shouldTryIncrementalMapper {
+                                        emit(.stageLog(
+                                            stage: .sfmMapping,
+                                            line: "Trying COLMAP incremental mapper fallback.",
+                                            isError: true
+                                        ))
+                                        do {
+                                            try self.resetDirectory(paths.colmapSparseURL)
+                                            try await self.tooling.colmap.runMapper(
+                                                colmapPath: self.config.toolchain.colmap,
+                                                database: paths.colmapDatabaseURL,
+                                                imagePath: paths.framesSelectedURL,
+                                                outputPath: paths.colmapSparseURL,
+                                                options: mapColmapMatchOptions,
+                                                onLog: { line, isErr in
+                                                    colmapToolLog.append(stream: isErr ? "stderr" : "stdout", line: line)
+                                                    onMappingLog(line, isErr)
+                                                }
+                                            )
+                                            _ = try await evaluateFallbackModel(candidate: "colmap")
+                                        } catch {
+                                            lastMappingError = error
+                                        }
+                                    }
+                                }
+
+                                guard let finalSparseModel = acceptedModelURL else {
+                                    throw lastMappingError ?? PipelineError.outputMissing
+                                }
+                                writeCheckpoint(
+                                    stage: .sfmMapping,
+                                    progress: 1.0,
+                                    message: "MapAnything refinement completed",
+                                    details: .sfmMapping(SfmMappingCheckpoint(
+                                        mapper: acceptedMapper,
+                                        sparsePath: finalSparseModel.path,
+                                        registeredImages: nil
+                                    ))
+                                )
+                                emit(.stageFinished(stage: .sfmMapping))
+                                markStageComplete(.sfmMapping)
+                            }
+                        }
+                    } else if backendPolicy == .fastvggt {
                         let fm = FileManager.default
                         let seedZero = paths.colmapSeedModelURL
                         let sparseZero = paths.colmapSparseURL.appendingPathComponent("0", isDirectory: true)
@@ -595,8 +1489,9 @@ public final class PipelineRunner: @unchecked Sendable {
                                     emit(.stageProgress(stage: .sfmFeatures, fraction: update.fraction, message: update.message))
                                 }
                                 let sanitized = Self.sanitizeToolLogLine(line)
-                                if Self.shouldEmitToolLogLine(sanitized, isError: isErr) {
-                                    emit(.stageLog(stage: .sfmFeatures, line: sanitized, isError: isErr))
+                                let effectiveIsErr = Self.normalizedToolLogIsError(sanitized, isError: isErr)
+                                if Self.shouldEmitToolLogLine(sanitized, isError: effectiveIsErr) {
+                                    emit(.stageLog(stage: .sfmFeatures, line: sanitized, isError: effectiveIsErr))
                                 }
                             }
                             emit(.stageProgress(stage: .sfmFeatures, fraction: 0.0, message: "Starting FastVGGT (\(fastImagesCount) images)…"))
@@ -713,8 +1608,9 @@ public final class PipelineRunner: @unchecked Sendable {
                                 onLog: { line, isErr in
                                     colmapToolLog.append(stream: isErr ? "stderr" : "stdout", line: line)
                                     let sanitized = Self.sanitizeToolLogLine(line)
-                                    if Self.shouldEmitToolLogLine(sanitized, isError: isErr) {
-                                        emit(.stageLog(stage: .sfmMatching, line: sanitized, isError: isErr))
+                                    let effectiveIsErr = Self.normalizedToolLogIsError(sanitized, isError: isErr)
+                                    if Self.shouldEmitToolLogLine(sanitized, isError: effectiveIsErr) {
+                                        emit(.stageLog(stage: .sfmMatching, line: sanitized, isError: effectiveIsErr))
                                     }
                                     if let update = featureProgress.ingest(line) {
                                         let scaledFraction = min(0.30, update.fraction * 0.30)
@@ -761,8 +1657,9 @@ public final class PipelineRunner: @unchecked Sendable {
                                 let onLog: @Sendable (String, Bool) -> Void = { line, isErr in
                                     colmapToolLog.append(stream: isErr ? "stderr" : "stdout", line: line)
                                     let sanitized = Self.sanitizeToolLogLine(line)
-                                    if Self.shouldEmitToolLogLine(sanitized, isError: isErr) {
-                                        emit(.stageLog(stage: .sfmMatching, line: sanitized, isError: isErr))
+                                    let effectiveIsErr = Self.normalizedToolLogIsError(sanitized, isError: isErr)
+                                    if Self.shouldEmitToolLogLine(sanitized, isError: effectiveIsErr) {
+                                        emit(.stageLog(stage: .sfmMatching, line: sanitized, isError: effectiveIsErr))
                                     }
                                     if let update = blockProgress.ingest(line) {
                                         state.updateBlockMessage(update.message)
@@ -951,8 +1848,9 @@ public final class PipelineRunner: @unchecked Sendable {
                             let mappingProgress = ColmapMappingProgressTracker(totalImages: selectedFrames.count)
                             let onMappingLog: @Sendable (String, Bool) -> Void = { line, isErr in
                                 let sanitized = Self.sanitizeToolLogLine(line)
-                                if Self.shouldEmitToolLogLine(sanitized, isError: isErr) {
-                                    emit(.stageLog(stage: .sfmMapping, line: sanitized, isError: isErr))
+                                let effectiveIsErr = Self.normalizedToolLogIsError(sanitized, isError: isErr)
+                                if Self.shouldEmitToolLogLine(sanitized, isError: effectiveIsErr) {
+                                    emit(.stageLog(stage: .sfmMapping, line: sanitized, isError: effectiveIsErr))
                                 }
                                 if let update = mappingProgress.ingest(line) {
                                     emit(.stageProgress(stage: .sfmMapping, fraction: update.fraction, message: update.message))
@@ -1089,7 +1987,10 @@ public final class PipelineRunner: @unchecked Sendable {
                                 }
 
                                 let threadHint = max(fastColmapExtractOptions.extractThreads, fastColmapMatchOptions.matchThreads)
-                                let baseGlobalMapperOptions = self.globalMapperOptions(threadHint: threadHint)
+                                let baseGlobalMapperOptions = self.globalMapperOptions(
+                                    threadHint: threadHint,
+                                    defaultUseGpu: fastColmapExtractOptions.useGPU || fastColmapMatchOptions.useGPU
+                                )
                                 var shouldTryIncrementalMapper = true
 
                                 if mapperPreference == .glomap && !disableGlomapForThisRun {
@@ -1322,8 +2223,9 @@ public final class PipelineRunner: @unchecked Sendable {
                             emit(.stageProgress(stage: .sfmFeatures, fraction: update.fraction, message: update.message))
                         }
                         let sanitized = Self.sanitizeToolLogLine(line)
-                        if Self.shouldEmitToolLogLine(sanitized, isError: isErr) {
-                            emit(.stageLog(stage: .sfmFeatures, line: sanitized, isError: isErr))
+                        let effectiveIsErr = Self.normalizedToolLogIsError(sanitized, isError: isErr)
+                        if Self.shouldEmitToolLogLine(sanitized, isError: effectiveIsErr) {
+                            emit(.stageLog(stage: .sfmFeatures, line: sanitized, isError: effectiveIsErr))
                         }
                     }
                     emit(.stageProgress(stage: .sfmFeatures, fraction: 0.0, message: "Starting VGGT (\(vggtImagesCount) images)…"))
@@ -1410,6 +2312,10 @@ public final class PipelineRunner: @unchecked Sendable {
                 guard try (force || shouldRunStage(.sfmFeatures)) else { return }
                 currentStage = .sfmFeatures
                 emit(.stageStarted(stage: .sfmFeatures))
+                let featureMapperLabel = mapperPreference == .glomap
+                    ? "SfM backend: GLOMAP (COLMAP global_mapper), with COLMAP mapper fallback."
+                    : "SfM backend: COLMAP mapper only."
+                emit(.stageLog(stage: .sfmFeatures, line: featureMapperLabel, isError: false))
                 writeCheckpoint(
                     stage: .sfmFeatures,
                     progress: 0,
@@ -1435,8 +2341,9 @@ public final class PipelineRunner: @unchecked Sendable {
                 let onFeaturesLog: @Sendable (String, Bool) -> Void = { line, isErr in
                     colmapToolLog.append(stream: isErr ? "stderr" : "stdout", line: line)
                     let sanitized = Self.sanitizeToolLogLine(line)
-                    if Self.shouldEmitToolLogLine(sanitized, isError: isErr) {
-                        emit(.stageLog(stage: .sfmFeatures, line: sanitized, isError: isErr))
+                    let effectiveIsErr = Self.normalizedToolLogIsError(sanitized, isError: isErr)
+                    if Self.shouldEmitToolLogLine(sanitized, isError: effectiveIsErr) {
+                        emit(.stageLog(stage: .sfmFeatures, line: sanitized, isError: effectiveIsErr))
                     }
                     if let update = featureProgress.ingest(line) {
                         emit(.stageProgress(stage: .sfmFeatures, fraction: update.fraction, message: update.message))
@@ -1536,8 +2443,9 @@ public final class PipelineRunner: @unchecked Sendable {
                     let onLog: @Sendable (String, Bool) -> Void = { line, isErr in
                         colmapToolLog.append(stream: isErr ? "stderr" : "stdout", line: line)
                         let sanitized = Self.sanitizeToolLogLine(line)
-                        if Self.shouldEmitToolLogLine(sanitized, isError: isErr) {
-                            emit(.stageLog(stage: .sfmMatching, line: sanitized, isError: isErr))
+                        let effectiveIsErr = Self.normalizedToolLogIsError(sanitized, isError: isErr)
+                        if Self.shouldEmitToolLogLine(sanitized, isError: effectiveIsErr) {
+                            emit(.stageLog(stage: .sfmMatching, line: sanitized, isError: effectiveIsErr))
                         }
                         if let update = blockProgress.ingest(line) {
                             state.updateBlockMessage(update.message)
@@ -1662,8 +2570,9 @@ public final class PipelineRunner: @unchecked Sendable {
                                     onLog: { line, isErr in
                                         colmapToolLog.append(stream: isErr ? "stderr" : "stdout", line: line)
                                         let sanitized = Self.sanitizeToolLogLine(line)
-                                        if Self.shouldEmitToolLogLine(sanitized, isError: isErr) {
-                                            emit(.stageLog(stage: .sfmMatching, line: sanitized, isError: isErr))
+                                        let effectiveIsErr = Self.normalizedToolLogIsError(sanitized, isError: isErr)
+                                        if Self.shouldEmitToolLogLine(sanitized, isError: effectiveIsErr) {
+                                            emit(.stageLog(stage: .sfmMatching, line: sanitized, isError: effectiveIsErr))
                                         }
                                     }
                                 )
@@ -1821,8 +2730,9 @@ public final class PipelineRunner: @unchecked Sendable {
                     let mappingProgress = ColmapMappingProgressTracker(totalImages: selectedFrames.count)
                     let onMappingLog: @Sendable (String, Bool) -> Void = { line, isErr in
                         let sanitized = Self.sanitizeToolLogLine(line)
-                        if Self.shouldEmitToolLogLine(sanitized, isError: isErr) {
-                            emit(.stageLog(stage: .sfmMapping, line: sanitized, isError: isErr))
+                        let effectiveIsErr = Self.normalizedToolLogIsError(sanitized, isError: isErr)
+                        if Self.shouldEmitToolLogLine(sanitized, isError: effectiveIsErr) {
+                            emit(.stageLog(stage: .sfmMapping, line: sanitized, isError: effectiveIsErr))
                         }
                         if let update = mappingProgress.ingest(line) {
                             emit(.stageProgress(stage: .sfmMapping, fraction: update.fraction, message: update.message))
@@ -1891,7 +2801,10 @@ public final class PipelineRunner: @unchecked Sendable {
 
                     if mapperPreference == .glomap && !disableGlomapForThisRun {
                         let threadHint = max(colmapExtractOptions.extractThreads, colmapMatchOptions.matchThreads)
-                        let baseGlobalMapperOptions = self.globalMapperOptions(threadHint: threadHint)
+                        let baseGlobalMapperOptions = self.globalMapperOptions(
+                            threadHint: threadHint,
+                            defaultUseGpu: colmapExtractOptions.useGPU || colmapMatchOptions.useGPU
+                        )
                         let gpuRequested = baseGlobalMapperOptions.useGpuForGlobalPositioning || baseGlobalMapperOptions.useGpuForBundleAdjustment
                         do {
                             try self.resetDirectory(paths.colmapSparseURL)
@@ -2034,7 +2947,43 @@ public final class PipelineRunner: @unchecked Sendable {
                             )
                             throw lastMappingError ?? PipelineError.lowQualityReconstruction(.init(registeredImages: 0, totalImages: 0, meanReprojectionError: nil))
                         }
-                        let finalSparseModel = paths.colmapSparseURL.appendingPathComponent("0", isDirectory: true)
+                        let canonicalSparseModel = paths.colmapSparseURL.appendingPathComponent("0", isDirectory: true)
+                        let resolvedSparseModel = try resolveSparseModelDirectory(at: canonicalSparseModel)
+                        if resolvedSparseModel.standardizedFileURL != canonicalSparseModel.standardizedFileURL {
+                            try self.resetDirectory(canonicalSparseModel)
+                            let fm = FileManager.default
+                            let files = try fm.contentsOfDirectory(
+                                at: resolvedSparseModel,
+                                includingPropertiesForKeys: [.isRegularFileKey],
+                                options: [.skipsHiddenFiles]
+                            )
+                            for file in files {
+                                let isRegular = (try? file.resourceValues(forKeys: [.isRegularFileKey]).isRegularFile) ?? false
+                                guard isRegular else { continue }
+                                try fm.copyItem(at: file, to: canonicalSparseModel.appendingPathComponent(file.lastPathComponent))
+                            }
+                            emit(.stageLog(
+                                stage: .sfmMapping,
+                                line: "Canonicalized sparse model layout: \(resolvedSparseModel.lastPathComponent) -> 0.",
+                                isError: false
+                            ))
+                        }
+                        if try ensureTextSparseModelFiles(at: canonicalSparseModel) {
+                            emit(.stageLog(
+                                stage: .sfmMapping,
+                                line: "Converted sparse model to COLMAP text format for training compatibility.",
+                                isError: false
+                            ))
+                        }
+                        let normalizedImagesTxt = canonicalSparseModel.appendingPathComponent("images.txt")
+                        if try ColmapTextModelNormalizer.normalizeImagesTxtIfNeeded(at: normalizedImagesTxt) {
+                            emit(.stageLog(
+                                stage: .sfmMapping,
+                                line: "Normalized COLMAP model (added missing POINTS2D lines to images.txt).",
+                                isError: false
+                            ))
+                        }
+                        let finalSparseModel = canonicalSparseModel
                         writeCheckpoint(
                             stage: .sfmMapping,
                             progress: 1.0,
@@ -2089,7 +3038,7 @@ public final class PipelineRunner: @unchecked Sendable {
             if skipTraining {
                 emit(.stageLog(
                     stage: .sfmMapping,
-                    line: "Stopping early after SfM (EASYSPLAT_SKIP_TRAINING=1).",
+                    line: "Stopping early after SfM (EASYSPLAT_SKIP_TRAINING=1 or EASYSPLAT_STOP_AFTER_SFM=1).",
                     isError: false
                 ))
                 metadata.lastRunStartedAt = nil
@@ -2461,6 +3410,7 @@ public final class PipelineRunner: @unchecked Sendable {
 private extension PipelineRunner {
     enum PipelineError: Error {
         case invalidInput
+        case insufficientInputImages(Int)
         case lowQualityReconstruction(ReconstructionScore)
         case imageTranscodeFailed(String)
         case outputMissing
@@ -2680,6 +3630,54 @@ private extension PipelineRunner {
         return txtOK
     }
 
+    func resolveSparseModelDirectory(at candidate: URL) throws -> URL {
+        if sparseModelFilesExist(at: candidate) {
+            return candidate
+        }
+
+        let nested = candidate.appendingPathComponent("0", isDirectory: true)
+        if sparseModelFilesExist(at: nested) {
+            return nested
+        }
+
+        // Some mapper variants can emit files into the parent sparse directory.
+        let parent = candidate.deletingLastPathComponent()
+        if sparseModelFilesExist(at: parent) {
+            return parent
+        }
+
+        throw PipelineError.outputMissing
+    }
+
+    @discardableResult
+    func ensureTextSparseModelFiles(at url: URL) throws -> Bool {
+        let fm = FileManager.default
+        let txtFiles = ["cameras.txt", "images.txt", "points3D.txt"]
+        if txtFiles.allSatisfy({ fm.fileExists(atPath: url.appendingPathComponent($0).path) }) {
+            return false
+        }
+
+        let binFiles = ["cameras.bin", "images.bin", "points3D.bin"]
+        guard binFiles.allSatisfy({ fm.fileExists(atPath: url.appendingPathComponent($0).path) }) else {
+            throw PipelineError.outputMissing
+        }
+
+        let converterOptions = colmapOptionsForMatching()
+        try tooling.colmap.runModelConverter(
+            colmapPath: config.toolchain.colmap,
+            inputPath: url,
+            outputPath: url,
+            outputType: "TXT",
+            environment: converterOptions.environment,
+            onLog: { _, _ in }
+        )
+
+        guard txtFiles.allSatisfy({ fm.fileExists(atPath: url.appendingPathComponent($0).path) }) else {
+            throw PipelineError.outputMissing
+        }
+        return true
+    }
+
     func colmapOptionsForExtraction() -> ColmapOptions {
         let cores = ProcessInfo.processInfo.activeProcessorCount
         let extractThreads = min(8, max(2, cores / 2))
@@ -2772,6 +3770,58 @@ private extension PipelineRunner {
         return (extract: tunedExtract, match: tunedMatch, notes: notes)
     }
 
+    func tuneMapAnythingRefinementColmapOptions(
+        frameCount: Int,
+        extractOptions: ColmapOptions,
+        matchOptions: ColmapOptions
+    ) -> (extract: ColmapOptions, match: ColmapOptions, notes: [String]) {
+        var tunedExtract = extractOptions
+        var tunedMatch = matchOptions
+        var notes: [String] = []
+
+        guard frameCount >= 200 else {
+            return (extract: tunedExtract, match: tunedMatch, notes: notes)
+        }
+
+        let overlapCap = frameCount >= 450 ? 6 : 8
+        if tunedMatch.sequentialOverlap > overlapCap {
+            notes.append("MapAnything refinement speed profile: reduced sequential overlap \(tunedMatch.sequentialOverlap) -> \(overlapCap) for \(frameCount) frames.")
+            tunedMatch.sequentialOverlap = overlapCap
+        }
+
+        let matchCap = frameCount >= 450 ? 7_000 : 8_000
+        if let currentMatches = tunedMatch.maxNumMatches {
+            if currentMatches > matchCap {
+                notes.append("MapAnything refinement speed profile: capped max matches \(currentMatches) -> \(matchCap).")
+                tunedMatch.maxNumMatches = matchCap
+            }
+        } else {
+            notes.append("MapAnything refinement speed profile: set max matches to \(matchCap).")
+            tunedMatch.maxNumMatches = matchCap
+        }
+
+        let featureCap = frameCount >= 450 ? 8_192 : 9_000
+        if let currentFeatures = tunedExtract.maxNumFeatures, currentFeatures > featureCap {
+            notes.append("MapAnything refinement speed profile: capped max features \(currentFeatures) -> \(featureCap).")
+            tunedExtract.maxNumFeatures = featureCap
+        }
+
+        if frameCount >= 450 {
+            let blockCap = 30
+            if let currentBlock = tunedMatch.exhaustiveBlockSize {
+                if currentBlock < blockCap {
+                    notes.append("MapAnything refinement speed profile: raised exhaustive block size \(currentBlock) -> \(blockCap).")
+                    tunedMatch.exhaustiveBlockSize = blockCap
+                }
+            } else {
+                notes.append("MapAnything refinement speed profile: set exhaustive block size to \(blockCap).")
+                tunedMatch.exhaustiveBlockSize = blockCap
+            }
+        }
+
+        return (extract: tunedExtract, match: tunedMatch, notes: notes)
+    }
+
     private func sfmMapperPreference() -> SfmMapperPreference {
         let env = ProcessInfo.processInfo.environment
         if let value = env["EASYSPLAT_SFM_MAPPER"]?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() {
@@ -2784,6 +3834,7 @@ private extension PipelineRunner {
     func sfmBackendOverride() -> SfmBackend? {
         let env = ProcessInfo.processInfo.environment
         if let value = env["EASYSPLAT_SFM_BACKEND"]?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() {
+            if value == "mapanything" { return .mapanything }
             if value == "glomap" || value == "global_mapper" { return .colmap }
             if value == "colmap" { return .colmap }
             if value == "fastvggt" { return .fastvggt }
@@ -2793,14 +3844,250 @@ private extension PipelineRunner {
     }
 
     func sfmBackendPolicy() -> SfmBackend {
-        sfmBackendOverride() ?? .colmap
+        sfmBackendOverride() ?? .mapanything
     }
 
     func sfmBackendFallbackOrder(override: SfmBackend?) -> [SfmBackend] {
         if let override {
+            if override == .mapanything {
+                return [.mapanything, .colmap]
+            }
             return [override]
         }
-        return [.colmap]
+        return [.mapanything, .colmap]
+    }
+
+    func mapAnythingDevicePreference() -> String {
+        stringEnvValue("EASYSPLAT_MAPANYTHING_DEVICE") ?? "mps"
+    }
+
+    func mapAnythingCheckpointPreference() -> String {
+        stringEnvValue("EASYSPLAT_MAPANYTHING_CHECKPOINT") ?? "map-anything-apache"
+    }
+
+    func mapAnythingResolutionPreference(autoTune: AutoTuneProfile? = nil) -> Int {
+        let requested = max(64, intEnvValue("EASYSPLAT_MAPANYTHING_RESOLUTION") ?? autoTune?.mapAnythingResolution ?? 518)
+        let supported = [512, 518]
+        if supported.contains(requested) {
+            return requested
+        }
+        return supported.min(by: { abs($0 - requested) < abs($1 - requested) }) ?? 518
+    }
+
+    func mapAnythingMemoryEfficientInferencePreference() -> Bool {
+        boolEnvValue("EASYSPLAT_MAPANYTHING_MEMORY_EFFICIENT", default: true)
+    }
+
+    func mapAnythingUseAMPPreference() -> Bool {
+        boolEnvValue("EASYSPLAT_MAPANYTHING_USE_AMP", default: false)
+    }
+
+    func mapAnythingMinibatchSizePreference() -> Int {
+        max(1, intEnvValue("EASYSPLAT_MAPANYTHING_MINIBATCH_SIZE") ?? 1)
+    }
+
+    func mapAnythingMaxPointsPreference(preset: PresetSpec) -> Int {
+        if let override = intEnvValue("EASYSPLAT_MAPANYTHING_MAX_POINTS"), override > 0 {
+            return override
+        }
+        switch preset.quality {
+        case .draft:
+            return 60_000
+        case .standard:
+            return 100_000
+        case .ultra:
+            return 150_000
+        }
+    }
+
+    func mapAnythingCameraTypePreference(preset: PresetSpec) -> String {
+        stringEnvValue("EASYSPLAT_MAPANYTHING_CAMERA_TYPE") ?? cameraModel(for: preset)
+    }
+
+    func mapAnythingSharedCameraPreference(input: InputSpec) -> Bool {
+        boolEnvValue("EASYSPLAT_MAPANYTHING_SHARED_CAMERA", default: input.hasVideos)
+    }
+
+    func mapAnythingAnchorMaxViewsPreference(
+        autoTune: AutoTuneProfile? = nil,
+        hardwareTier: HardwareProfile.Tier
+    ) -> Int {
+        if let override = intEnvValue("EASYSPLAT_MAPANYTHING_ANCHOR_MAX_VIEWS"), override > 0 {
+            return override
+        }
+        if let autoTuneValue = autoTune?.mapAnythingAnchorMaxViews, autoTuneValue > 0 {
+            return autoTuneValue
+        }
+        switch hardwareTier {
+        case .low:
+            return 24
+        case .mid:
+            return 48
+        case .high:
+            return 64
+        }
+    }
+
+    func mapAnythingWindowSizePreference(
+        autoTune: AutoTuneProfile? = nil,
+        hardwareTier: HardwareProfile.Tier
+    ) -> Int {
+        if let override = intEnvValue("EASYSPLAT_MAPANYTHING_WINDOW_SIZE"), override > 0 {
+            return override
+        }
+        if let autoTuneValue = autoTune?.mapAnythingWindowSize, autoTuneValue > 0 {
+            return autoTuneValue
+        }
+        switch hardwareTier {
+        case .low:
+            return 4
+        case .mid:
+            return 6
+        case .high:
+            return 8
+        }
+    }
+
+    func mapAnythingWindowOverlapPreference(
+        autoTune: AutoTuneProfile? = nil,
+        hardwareTier: HardwareProfile.Tier
+    ) -> Int {
+        if let override = intEnvValue("EASYSPLAT_MAPANYTHING_WINDOW_OVERLAP"), override >= 0 {
+            return override
+        }
+        if let autoTuneValue = autoTune?.mapAnythingWindowOverlap, autoTuneValue >= 0 {
+            return autoTuneValue
+        }
+        switch hardwareTier {
+        case .low:
+            return 1
+        case .mid:
+            return 2
+        case .high:
+            return 2
+        }
+    }
+
+    func mapAnythingDirectMinimumMeanTrackLengthPreference(mode: CaptureMode) -> Double {
+        if let override = doubleEnvValue("EASYSPLAT_MAPANYTHING_DIRECT_MIN_TRACK_LENGTH"),
+           override.isFinite,
+           override > 0 {
+            return override
+        }
+        switch mode {
+        case .room:
+            return 1.20
+        case .object:
+            return 1.15
+        }
+    }
+
+    func mapAnythingDirectQualityFailureReason(score: ReconstructionScore, mode: CaptureMode) -> String? {
+        guard ReconstructionScorer.isAcceptable(score, mode: mode) else {
+            return "below the general quality bar"
+        }
+        guard let pointCount = score.pointCount, pointCount > 0 else {
+            return "model_analyzer did not report sparse point count"
+        }
+        guard let observationCount = score.observationCount, observationCount > 0 else {
+            return "model_analyzer did not report observations"
+        }
+        guard let meanTrackLength = score.meanTrackLength, meanTrackLength > 0 else {
+            return "model_analyzer did not report a usable mean track length"
+        }
+
+        let minimumTrackLength = mapAnythingDirectMinimumMeanTrackLengthPreference(mode: mode)
+        if meanTrackLength < minimumTrackLength {
+            return String(
+                format: "mean track length %.2f below direct minimum %.2f",
+                meanTrackLength,
+                minimumTrackLength
+            )
+        }
+        if observationCount <= pointCount {
+            return "observations (\(observationCount)) did not exceed sparse points (\(pointCount))"
+        }
+        return nil
+    }
+
+    func mapAnythingScoreApplyingCoverageFallback(
+        _ score: ReconstructionScore,
+        coverageManifest: MapAnythingCoverageManifest?
+    ) -> ReconstructionScore {
+        guard let coverageManifest else {
+            return score
+        }
+        return ReconstructionScore(
+            registeredImages: score.registeredImages,
+            totalImages: score.totalImages,
+            meanReprojectionError: score.meanReprojectionError,
+            pointCount: score.pointCount ?? coverageManifest.fusedSparsePointCount,
+            observationCount: score.observationCount ?? coverageManifest.finalObservationCount,
+            meanTrackLength: score.meanTrackLength ?? coverageManifest.meanTrackLength
+        )
+    }
+
+    func mapAnythingExecutionPlan(
+        hardwareProfile: HardwareProfile,
+        input: InputSpec,
+        selectedFrameCount: Int,
+        preset: PresetSpec,
+        autoTune: AutoTuneProfile? = nil
+    ) -> MapAnythingExecutionPlan {
+        let device = mapAnythingDevicePreference()
+        let resolution = mapAnythingResolutionPreference(autoTune: autoTune)
+        let memoryEfficientInference = mapAnythingMemoryEfficientInferencePreference()
+        let requestedAMP = mapAnythingUseAMPPreference()
+        // The shipped app runs on Apple Silicon; keep AMP disabled on MPS/CPU paths.
+        let safeAMP = requestedAMP && device == "cuda"
+        let minibatchSize = mapAnythingMinibatchSizePreference()
+        let maxPoints = mapAnythingMaxPointsPreference(preset: preset)
+        let cameraType = mapAnythingCameraTypePreference(preset: preset)
+        let sharedCamera = mapAnythingSharedCameraPreference(input: input)
+        let hardwareTier = hardwareProfile.tier
+
+        let directViewLimit = autoTune?.mapAnythingDirectViewLimit ?? {
+            switch hardwareTier {
+            case .low:
+                return 0
+            case .mid:
+                return 6
+            case .high:
+                return 8
+            }
+        }()
+        let anchorMaxViews = mapAnythingAnchorMaxViewsPreference(autoTune: autoTune, hardwareTier: hardwareTier)
+        let seedWindowSize = mapAnythingWindowSizePreference(autoTune: autoTune, hardwareTier: hardwareTier)
+        let windowOverlap = mapAnythingWindowOverlapPreference(autoTune: autoTune, hardwareTier: hardwareTier)
+
+        let directAllowed = directViewLimit > 0 && selectedFrameCount >= 2 && selectedFrameCount <= directViewLimit
+        return MapAnythingExecutionPlan(
+            mode: directAllowed ? .direct : .seedRefine,
+            device: device,
+            resolution: resolution,
+            memoryEfficientInference: memoryEfficientInference,
+            useAMP: safeAMP,
+            minibatchSize: minibatchSize,
+            maxPoints: maxPoints,
+            cameraType: cameraType,
+            sharedCamera: sharedCamera,
+            anchorMaxViews: max(2, min(selectedFrameCount, anchorMaxViews)),
+            windowSize: directAllowed ? max(2, selectedFrameCount) : max(2, min(seedWindowSize, max(2, selectedFrameCount))),
+            windowOverlap: directAllowed ? 0 : min(windowOverlap, max(0, min(seedWindowSize, max(2, selectedFrameCount)) - 1)),
+            directViewLimit: directViewLimit,
+            directAllowed: directAllowed
+        )
+    }
+
+    func inferPreparedMapAnythingMode(paths: ProjectPaths) -> MapAnythingRunMode? {
+        let sparseZero = paths.colmapSparseURL.appendingPathComponent("0", isDirectory: true)
+        if sparseModelFilesExist(at: paths.colmapSeedModelURL) {
+            return .seedRefine
+        }
+        if sparseModelFilesExist(at: sparseZero) {
+            return .direct
+        }
+        return nil
     }
 
     func vggtDevicePreference() -> String {
@@ -3302,6 +4589,15 @@ private extension PipelineRunner {
         return value
     }
 
+    func doubleEnvValue(_ key: String) -> Double? {
+        guard let raw = ProcessInfo.processInfo.environment[key]?.trimmingCharacters(in: .whitespacesAndNewlines),
+              let value = Double(raw),
+              value.isFinite else {
+            return nil
+        }
+        return value
+    }
+
     func stringEnvValue(_ key: String) -> String? {
         guard let raw = ProcessInfo.processInfo.environment[key]?.trimmingCharacters(in: .whitespacesAndNewlines),
               !raw.isEmpty else {
@@ -3310,10 +4606,10 @@ private extension PipelineRunner {
         return raw
     }
 
-    func globalMapperOptions(threadHint: Int) -> ColmapGlobalMapperOptions {
+    func globalMapperOptions(threadHint: Int, defaultUseGpu: Bool = true) -> ColmapGlobalMapperOptions {
         let preferredThreads = max(1, intEnvValue("EASYSPLAT_GLOBAL_MAPPER_THREADS") ?? threadHint)
-        let gpUseGpu = boolEnvValue("EASYSPLAT_GLOBAL_MAPPER_GP_USE_GPU", default: true)
-        let baUseGpu = boolEnvValue("EASYSPLAT_GLOBAL_MAPPER_BA_USE_GPU", default: true)
+        let gpUseGpu = boolEnvValue("EASYSPLAT_GLOBAL_MAPPER_GP_USE_GPU", default: defaultUseGpu)
+        let baUseGpu = boolEnvValue("EASYSPLAT_GLOBAL_MAPPER_BA_USE_GPU", default: defaultUseGpu)
         let gpuIndex = stringEnvValue("EASYSPLAT_GLOBAL_MAPPER_GPU_INDEX") ?? "-1"
         let gpGpuIndex = stringEnvValue("EASYSPLAT_GLOBAL_MAPPER_GP_GPU_INDEX") ?? gpuIndex
         let baGpuIndex = stringEnvValue("EASYSPLAT_GLOBAL_MAPPER_BA_GPU_INDEX") ?? gpuIndex
@@ -3476,6 +4772,8 @@ private extension PipelineRunner {
             switch pipelineError {
             case .invalidInput:
                 return ("No usable photos or video frames were found.", String(reflecting: pipelineError))
+            case let .insufficientInputImages(actual):
+                return ("At least two usable photos or video frames are required.", "Insufficient input images after selection: \(actual).")
             case let .lowQualityReconstruction(score):
                 return ("I couldn't get a stable camera solve. Try a slower capture and more light.", "Low-quality reconstruction. \(ReconstructionScorer.summary(score)).")
             case let .imageTranscodeFailed(message):
@@ -3520,6 +4818,21 @@ private extension PipelineRunner {
             \(stderrTail)
             """
         }
+    }
+
+    private static func compactLogSummary(_ text: String, limit: Int = 260) -> String {
+        let collapsed = text
+            .replacingOccurrences(of: "\r\n", with: "\n")
+            .replacingOccurrences(of: "\r", with: "\n")
+            .split(separator: "\n", omittingEmptySubsequences: true)
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
+            .joined(separator: " | ")
+        guard collapsed.count > limit else {
+            return collapsed
+        }
+        let end = collapsed.index(collapsed.startIndex, offsetBy: max(0, limit - 1))
+        return "\(collapsed[..<end])…"
     }
 
     func importInputs(
@@ -4025,17 +5338,40 @@ private extension PipelineRunner {
             }
         }
 
-        let sourceSparse = paths.colmapSparseURL.appendingPathComponent("0", isDirectory: true)
+        let sourceSparseRoot = paths.colmapSparseURL.appendingPathComponent("0", isDirectory: true)
+        let sourceSparse = try resolveSparseModelDirectory(at: sourceSparseRoot)
         guard sparseModelFilesExist(at: sourceSparse) else { throw PipelineError.outputMissing }
-        let files = try fm.contentsOfDirectory(at: sourceSparse, includingPropertiesForKeys: nil)
+        try _ = ensureTextSparseModelFiles(at: sourceSparse)
+        let files = try fm.contentsOfDirectory(
+            at: sourceSparse,
+            includingPropertiesForKeys: [.isRegularFileKey],
+            options: [.skipsHiddenFiles]
+        )
+        let fileItems = files.filter { url in
+            (try? url.resourceValues(forKeys: [.isRegularFileKey]).isRegularFile) ?? false
+        }
         let sparseProgressScale = 1.0 - imageProgressScale
-        let sparseTotal = max(1, files.count)
-        for (index, file) in files.enumerated() {
+        let sparseTotal = max(1, fileItems.count)
+        for (index, file) in fileItems.enumerated() {
             let dest = sparse.appendingPathComponent(file.lastPathComponent)
             if fm.fileExists(atPath: dest.path) { try fm.removeItem(at: dest) }
             try fm.copyItem(at: file, to: dest)
             let fraction = imageProgressScale + sparseProgressScale * (Double(index + 1) / Double(sparseTotal))
             progress(fraction, "Preparing training dataset (sparse) \(index + 1)/\(sparseTotal)")
+        }
+
+        progress(0.98, "Preparing training dataset (sparse): ensuring text model files.")
+        let converted = try ensureTextSparseModelFiles(at: sparse)
+        if converted {
+            progress(0.99, "Preparing training dataset (sparse): conversion complete.")
+        }
+
+        let requiredTextFiles = ["cameras.txt", "images.txt", "points3D.txt"]
+        for name in requiredTextFiles {
+            let fileURL = sparse.appendingPathComponent(name)
+            guard fm.fileExists(atPath: fileURL.path) else { throw PipelineError.outputMissing }
+            let size = (try? fm.attributesOfItem(atPath: fileURL.path)[.size] as? NSNumber)?.int64Value ?? 0
+            guard size > 0 else { throw PipelineError.outputMissing }
         }
         let imagesTxt = sparse.appendingPathComponent("images.txt")
         try _ = ColmapTextModelNormalizer.normalizeImagesTxtIfNeeded(at: imagesTxt)
@@ -4582,10 +5918,27 @@ private extension PipelineRunner {
         return value
     }
 
+    private static func normalizedToolLogIsError(_ line: String, isError: Bool) -> Bool {
+        guard isError else { return false }
+        let trimmed = sanitizeToolLogLine(line).trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let severity = glogSeverity(trimmed) else {
+            return true
+        }
+        switch severity {
+        case "I", "W":
+            return false
+        case "E", "F":
+            return true
+        default:
+            return true
+        }
+    }
+
     private static func shouldEmitToolLogLine(_ line: String, isError: Bool) -> Bool {
         let trimmed = sanitizeToolLogLine(line).trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return false }
         let lower = trimmed.lowercased()
+        let tracebackContext = looksLikeTracebackContextLine(trimmed)
         let hasAlertKeyword = lower.contains("warning")
             || lower.contains("warn")
             || lower.contains("error")
@@ -4594,6 +5947,9 @@ private extension PipelineRunner {
         if looksLikeProgressBar(trimmed),
            !hasAlertKeyword {
             return false
+        }
+        if tracebackContext {
+            return true
         }
         if isError {
             if hasAlertKeyword {
@@ -4607,10 +5963,35 @@ private extension PipelineRunner {
         if trimmed.hasPrefix("EasySplat:") {
             return true
         }
+        if let severity = glogSeverity(trimmed), severity != "I" {
+            return true
+        }
         if lower.contains("warning") || lower.contains("warn") {
             return true
         }
         if lower.contains("error") || lower.contains("fatal") || lower.contains("failed") {
+            return true
+        }
+        return false
+    }
+
+    private static func looksLikeTracebackContextLine(_ line: String) -> Bool {
+        let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return false }
+        let lower = trimmed.lowercased()
+        if lower.hasPrefix("traceback (most recent call last):") {
+            return true
+        }
+        if lower.hasPrefix("during handling of the above exception") {
+            return true
+        }
+        if trimmed.hasPrefix("File \"") && trimmed.contains(", line ") {
+            return true
+        }
+        if trimmed.hasPrefix("  File \"") && trimmed.contains(", line ") {
+            return true
+        }
+        if trimmed.hasPrefix("^") {
             return true
         }
         return false
@@ -5022,6 +6403,10 @@ extension PipelineRunner {
         targetCountForVideo(index: index, total: total, targetCount: targetCount)
     }
 
+    func test_resolveSparseModelDirectory(_ candidate: URL) throws -> URL {
+        try resolveSparseModelDirectory(at: candidate)
+    }
+
     func test_filterVeryBlurryVideoFrames(
         frames: [URL],
         sharpnessByFrame: [URL: Double],
@@ -5146,6 +6531,10 @@ extension PipelineRunner {
         Self.shouldEmitToolLogLine(line, isError: isError)
     }
 
+    func test_normalizedToolLogIsError(_ line: String, isError: Bool) -> Bool {
+        Self.normalizedToolLogIsError(line, isError: isError)
+    }
+
     func test_colmapGpuOverride() -> Bool? {
         colmapGpuOverride()
     }
@@ -5190,6 +6579,11 @@ extension PipelineRunner {
         let autoTune = autoTuneTier.map { tier in
             AutoTuneProfile(
                 tier: tier,
+                mapAnythingResolution: 518,
+                mapAnythingDirectViewLimit: 0,
+                mapAnythingAnchorMaxViews: 0,
+                mapAnythingWindowSize: 0,
+                mapAnythingWindowOverlap: 0,
                 vggtImageLoadResolution: 0,
                 vggtFixedResolution: 0,
                 vggtMaxPoints: 0,
@@ -5211,6 +6605,84 @@ extension PipelineRunner {
 
     func test_sfmBackendFallbackOrder() -> [SfmBackend] {
         sfmBackendFallbackOrder(override: sfmBackendOverride())
+    }
+
+    func test_mapAnythingExecutionPlan(
+        hardwareTier: HardwareProfile.Tier,
+        selectedFrameCount: Int,
+        preset: PresetSpec,
+        input: InputSpec = .photos(folder: "/tmp"),
+        autoTune: AutoTuneProfile? = nil
+    ) -> (
+        mode: String,
+        directAllowed: Bool,
+        directViewLimit: Int,
+        resolution: Int,
+        memoryEfficientInference: Bool,
+        useAMP: Bool,
+        anchorMaxViews: Int,
+        windowSize: Int,
+        windowOverlap: Int,
+        cameraType: String,
+        sharedCamera: Bool
+    ) {
+        let memoryGB: Double
+        switch hardwareTier {
+        case .low:
+            memoryGB = 16
+        case .mid:
+            memoryGB = 24
+        case .high:
+            memoryGB = 48
+        }
+        let hardwareProfile = HardwareProfile(memoryGB: memoryGB, cpuCount: 8, gpuWorkingSetGB: 8)
+        let plan = mapAnythingExecutionPlan(
+            hardwareProfile: hardwareProfile,
+            input: input,
+            selectedFrameCount: selectedFrameCount,
+            preset: preset,
+            autoTune: autoTune
+        )
+        return (
+            mode: plan.mode.rawValue,
+            directAllowed: plan.directAllowed,
+            directViewLimit: plan.directViewLimit,
+            resolution: plan.resolution,
+            memoryEfficientInference: plan.memoryEfficientInference,
+            useAMP: plan.useAMP,
+            anchorMaxViews: plan.anchorMaxViews,
+            windowSize: plan.windowSize,
+            windowOverlap: plan.windowOverlap,
+            cameraType: plan.cameraType,
+            sharedCamera: plan.sharedCamera
+        )
+    }
+
+    func test_mapAnythingSharedCameraPreference(input: InputSpec) -> Bool {
+        mapAnythingSharedCameraPreference(input: input)
+    }
+
+    func test_mapAnythingResolutionPreference() -> Int {
+        mapAnythingResolutionPreference()
+    }
+
+    func test_mapAnythingDirectMinimumMeanTrackLengthPreference(mode: CaptureMode) -> Double {
+        mapAnythingDirectMinimumMeanTrackLengthPreference(mode: mode)
+    }
+
+    func test_mapAnythingDirectQualityFailureReason(
+        score: ReconstructionScore,
+        mode: CaptureMode
+    ) -> String? {
+        mapAnythingDirectQualityFailureReason(score: score, mode: mode)
+    }
+
+    func test_sfmMapperPreference() -> String {
+        sfmMapperPreference().rawValue
+    }
+
+    func test_globalMapperOptions(threadHint: Int, defaultUseGpu: Bool = true) -> ColmapGlobalMapperOptions {
+        globalMapperOptions(threadHint: threadHint, defaultUseGpu: defaultUseGpu)
     }
 
     func test_fastvggtMergingPreference() -> Int {
@@ -5292,6 +6764,11 @@ extension PipelineRunner {
         let autoTune = autoTuneTier.map { tier in
             AutoTuneProfile(
                 tier: tier,
+                mapAnythingResolution: 518,
+                mapAnythingDirectViewLimit: 0,
+                mapAnythingAnchorMaxViews: 0,
+                mapAnythingWindowSize: 0,
+                mapAnythingWindowOverlap: 0,
                 vggtImageLoadResolution: 0,
                 vggtFixedResolution: 0,
                 vggtMaxPoints: 0,
@@ -5351,6 +6828,11 @@ extension PipelineRunner {
         let autoTune = autoTuneTier.map { tier in
             AutoTuneProfile(
                 tier: tier,
+                mapAnythingResolution: 518,
+                mapAnythingDirectViewLimit: 0,
+                mapAnythingAnchorMaxViews: 0,
+                mapAnythingWindowSize: 0,
+                mapAnythingWindowOverlap: 0,
                 vggtImageLoadResolution: 0,
                 vggtFixedResolution: 0,
                 vggtMaxPoints: 0,

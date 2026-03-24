@@ -11,6 +11,7 @@ final class MockSubprocessRunner: @unchecked Sendable, SubprocessRunning {
 
     private var scripts: [Script]
     private(set) var calls: [(String, [String])] = []
+    private(set) var environments: [[String: String]] = []
 
     init(scripts: [Script]) {
         self.scripts = scripts
@@ -29,6 +30,7 @@ final class MockSubprocessRunner: @unchecked Sendable, SubprocessRunning {
         }
         let script = scripts.remove(at: index)
         calls.append((launchPath, arguments))
+        environments.append(environment)
         script.onRun?(arguments)
         return script.result
     }

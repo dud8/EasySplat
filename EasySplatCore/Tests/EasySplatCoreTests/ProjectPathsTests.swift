@@ -17,5 +17,8 @@ final class ProjectPathsTests: XCTestCase {
         XCTAssertTrue(fm.fileExists(atPath: paths.trainingURL.path))
         XCTAssertTrue(fm.fileExists(atPath: paths.outputURL.path))
         XCTAssertTrue(fm.fileExists(atPath: paths.logsURL.path))
+        XCTAssertTrue(paths.appEventsLogURL.path.hasSuffix("Logs/app_events.jsonl"))
+        XCTAssertTrue(paths.mapanythingLogURL.path.hasSuffix("Logs/mapanything.log"))
+        XCTAssertTrue(paths.mapanythingCoverageManifestURL.path.hasSuffix("Logs/mapanything_coverage_manifest.json"))
     }
 }

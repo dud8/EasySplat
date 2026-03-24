@@ -26,6 +26,7 @@ COLMAP_INSTALL="${COLMAP_INSTALL:-$ROOT/Toolchains/build/colmap/install}"
 BRUSH_INSTALL="${BRUSH_INSTALL:-$ROOT/Toolchains/build/brush/install}"
 VGGT_MPS_INSTALL="${VGGT_MPS_INSTALL:-$ROOT/Toolchains/build/vggt_mps/install}"
 FASTVGGT_MPS_INSTALL="${FASTVGGT_MPS_INSTALL:-$ROOT/Toolchains/build/fastvggt_mps/install}"
+MAPANYTHING_MPS_INSTALL="${MAPANYTHING_MPS_INSTALL:-$ROOT/Toolchains/build/mapanything_mps/install}"
 
 OUT="$ROOT/Toolchains/out"
 BIN="$OUT/bin"
@@ -35,6 +36,45 @@ MODELS_ZIP="$OUT/toolchain-macos-arm64-$VERSION-models.zip"
 
 rm -rf "$OUT"
 mkdir -p "$BIN" "$LIB"
+
+validate_build_info() {
+  local python_bin="$1"
+  local build_info="$2"
+  local tool_name="$3"
+  PYTHONNOUSERSITE=1 "$python_bin" - "$build_info" "$tool_name" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+build_info = Path(sys.argv[1])
+tool_name = sys.argv[2]
+required_keys = {
+    "toolchain_name",
+    "source_path",
+    "python_version",
+    "torch_version",
+    "torchvision_version",
+}
+
+try:
+    payload = json.loads(build_info.read_text(encoding="utf-8"))
+except Exception as exc:  # noqa: BLE001
+    raise SystemExit(f"{tool_name} build_info.json is invalid JSON: {exc}")
+
+if not isinstance(payload, dict):
+    raise SystemExit(f"{tool_name} build_info.json must contain a JSON object.")
+
+missing = sorted(key for key in required_keys if not payload.get(key))
+if missing:
+    raise SystemExit(f"{tool_name} build_info.json is missing required keys: {', '.join(missing)}")
+
+if payload.get("toolchain_name") != tool_name:
+    raise SystemExit(
+        f"{tool_name} build_info.json toolchain_name mismatch: expected {tool_name}, "
+        f"got {payload.get('toolchain_name')!r}"
+    )
+PY
+}
 
 cp "$COLMAP_INSTALL/bin/colmap" "$BIN/colmap"
 
@@ -54,6 +94,61 @@ SCRIPT
 
 chmod +x "$BIN/colmap" "$BIN/brush" "$BIN/brush.real"
 
+if [ ! -d "$MAPANYTHING_MPS_INSTALL/mapanything_mps" ]; then
+  echo "mapanything_mps bundle not found at $MAPANYTHING_MPS_INSTALL/mapanything_mps. Build it before packaging." >&2
+  exit 1
+fi
+if [ ! -x "$MAPANYTHING_MPS_INSTALL/mapanything_mps/bin/easysplat_mapanything_sfm" ]; then
+  echo "mapanything_mps bundle missing bin/easysplat_mapanything_sfm. Rebuild mapanything_mps." >&2
+  exit 1
+fi
+if [ ! -x "$MAPANYTHING_MPS_INSTALL/mapanything_mps/python/bin/python3" ]; then
+  echo "mapanything_mps bundle missing python/bin/python3. Rebuild mapanything_mps." >&2
+  exit 1
+fi
+if [ ! -f "$MAPANYTHING_MPS_INSTALL/mapanything_mps/build_info.json" ]; then
+  echo "mapanything_mps bundle missing build_info.json. Rebuild mapanything_mps." >&2
+  exit 1
+fi
+if [ ! -f "$MAPANYTHING_MPS_INSTALL/mapanything_mps/app/easysplat_mapanything_sfm/run.py" ]; then
+  echo "mapanything_mps bundle missing app/easysplat_mapanything_sfm/run.py. Rebuild mapanything_mps." >&2
+  exit 1
+fi
+MAP_PY_BIN="$MAPANYTHING_MPS_INSTALL/mapanything_mps/python/bin/python3"
+if ! /usr/bin/file "$MAP_PY_BIN" | grep -q "arm64"; then
+  echo "mapanything_mps python is not arm64 (Rosetta build detected). Rebuild mapanything_mps on Apple Silicon." >&2
+  exit 1
+fi
+if [ -L "$MAP_PY_BIN" ]; then
+  target="$(readlink "$MAP_PY_BIN" || true)"
+  if [[ "$target" == /* ]]; then
+    echo "mapanything_mps python3 is an absolute symlink ($target). Rebuild mapanything_mps with bundled CPython." >&2
+    exit 1
+  fi
+fi
+validate_build_info "$MAP_PY_BIN" "$MAPANYTHING_MPS_INSTALL/mapanything_mps/build_info.json" "mapanything_mps"
+if [ ! -d "$MAPANYTHING_MPS_INSTALL/mapanything_mps/models" ]; then
+  echo "mapanything_mps bundle missing models/. Rebuild mapanything_mps." >&2
+  exit 1
+fi
+if [ ! -f "$MAPANYTHING_MPS_INSTALL/mapanything_mps/models/map-anything-apache/model.safetensors" ]; then
+  echo "mapanything_mps bundle missing models/map-anything-apache/model.safetensors. Rebuild mapanything_mps." >&2
+  exit 1
+fi
+if [ ! -f "$MAPANYTHING_MPS_INSTALL/mapanything_mps/models/map-anything-apache/config.json" ]; then
+  echo "mapanything_mps bundle missing models/map-anything-apache/config.json. Rebuild mapanything_mps." >&2
+  exit 1
+fi
+if [ ! -f "$MAPANYTHING_MPS_INSTALL/mapanything_mps/models/dinov2/dinov2_vitg14_pretrain.pth" ]; then
+  echo "mapanything_mps bundle missing models/dinov2/dinov2_vitg14_pretrain.pth. Rebuild mapanything_mps." >&2
+  exit 1
+fi
+if [ ! -f "$MAPANYTHING_MPS_INSTALL/mapanything_mps/vendor/mapanything/mapanything/models/mapanything/model.py" ]; then
+  echo "mapanything_mps bundle missing vendor/mapanything. Rebuild mapanything_mps." >&2
+  exit 1
+fi
+cp -R "$MAPANYTHING_MPS_INSTALL/mapanything_mps" "$OUT/mapanything_mps"
+
 if [ ! -d "$VGGT_MPS_INSTALL/vggt_mps" ]; then
   echo "vggt_mps bundle not found at $VGGT_MPS_INSTALL/vggt_mps. Build it before packaging." >&2
   exit 1
@@ -64,6 +159,14 @@ if [ ! -x "$VGGT_MPS_INSTALL/vggt_mps/bin/easysplat_vggt_sfm" ]; then
 fi
 if [ ! -x "$VGGT_MPS_INSTALL/vggt_mps/python/bin/python3" ]; then
   echo "vggt_mps bundle missing python/bin/python3. Rebuild vggt_mps." >&2
+  exit 1
+fi
+if [ ! -f "$VGGT_MPS_INSTALL/vggt_mps/build_info.json" ]; then
+  echo "vggt_mps bundle missing build_info.json. Rebuild vggt_mps." >&2
+  exit 1
+fi
+if [ ! -f "$VGGT_MPS_INSTALL/vggt_mps/app/easysplat_vggt_sfm/run.py" ]; then
+  echo "vggt_mps bundle missing app/easysplat_vggt_sfm/run.py. Rebuild vggt_mps." >&2
   exit 1
 fi
 PY_BIN="$VGGT_MPS_INSTALL/vggt_mps/python/bin/python3"
@@ -78,6 +181,7 @@ if [ -L "$PY_BIN" ]; then
     exit 1
   fi
 fi
+validate_build_info "$PY_BIN" "$VGGT_MPS_INSTALL/vggt_mps/build_info.json" "vggt_mps"
 if [ ! -d "$VGGT_MPS_INSTALL/vggt_mps/models" ]; then
   echo "vggt_mps bundle missing models/. Rebuild vggt_mps." >&2
   exit 1
@@ -104,6 +208,14 @@ if [ ! -x "$FASTVGGT_MPS_INSTALL/fastvggt_mps/python/bin/python3" ]; then
   echo "fastvggt_mps bundle missing python/bin/python3. Rebuild fastvggt_mps." >&2
   exit 1
 fi
+if [ ! -f "$FASTVGGT_MPS_INSTALL/fastvggt_mps/build_info.json" ]; then
+  echo "fastvggt_mps bundle missing build_info.json. Rebuild fastvggt_mps." >&2
+  exit 1
+fi
+if [ ! -f "$FASTVGGT_MPS_INSTALL/fastvggt_mps/app/easysplat_fastvggt_sfm/run.py" ]; then
+  echo "fastvggt_mps bundle missing app/easysplat_fastvggt_sfm/run.py. Rebuild fastvggt_mps." >&2
+  exit 1
+fi
 FAST_PY_BIN="$FASTVGGT_MPS_INSTALL/fastvggt_mps/python/bin/python3"
 if ! /usr/bin/file "$FAST_PY_BIN" | grep -q "arm64"; then
   echo "fastvggt_mps python is not arm64 (Rosetta build detected). Rebuild fastvggt_mps on Apple Silicon." >&2
@@ -116,6 +228,7 @@ if [ -L "$FAST_PY_BIN" ]; then
     exit 1
   fi
 fi
+validate_build_info "$FAST_PY_BIN" "$FASTVGGT_MPS_INSTALL/fastvggt_mps/build_info.json" "fastvggt_mps"
 if [ ! -d "$FASTVGGT_MPS_INSTALL/fastvggt_mps/models" ]; then
   echo "fastvggt_mps bundle missing models/. Rebuild fastvggt_mps." >&2
   exit 1
@@ -205,8 +318,12 @@ test -f "$LIB/libcrypto.3.dylib" || { echo "missing bundled libcrypto.3.dylib" >
 test -f "$LIB/libssl.3.dylib" || { echo "missing bundled libssl.3.dylib" >&2; exit 1; }
 
 pushd "$OUT" >/dev/null
-zip -r "$CORE_ZIP" bin lib vggt_mps/bin vggt_mps/python vggt_mps/app vggt_mps/vendor fastvggt_mps/bin fastvggt_mps/python fastvggt_mps/app fastvggt_mps/vendor
-zip -r "$MODELS_ZIP" vggt_mps/models fastvggt_mps/models
+zip -r "$CORE_ZIP" \
+  bin lib \
+  mapanything_mps/bin mapanything_mps/python mapanything_mps/app mapanything_mps/vendor mapanything_mps/build_info.json \
+  vggt_mps/bin vggt_mps/python vggt_mps/app vggt_mps/vendor vggt_mps/build_info.json \
+  fastvggt_mps/bin fastvggt_mps/python fastvggt_mps/app fastvggt_mps/vendor fastvggt_mps/build_info.json
+zip -r "$MODELS_ZIP" mapanything_mps/models vggt_mps/models fastvggt_mps/models
 popd >/dev/null
 
 echo "Packaged toolchain (core): $CORE_ZIP"

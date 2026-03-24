@@ -185,6 +185,42 @@ final class ColmapRunnerTests: XCTestCase {
         )
     }
 
+    func testBundleAdjusterCreatesOutputDirectoryWhenMissing() async throws {
+        let temp = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        let inputPath = temp.appendingPathComponent("in", isDirectory: true)
+        let outputPath = temp.appendingPathComponent("missing_out", isDirectory: true)
+        try FileManager.default.createDirectory(at: inputPath, withIntermediateDirectories: true)
+
+        let runner = MockSubprocessRunner(scripts: [
+            .init(
+                path: "/mock/colmap",
+                argsPrefix: ["bundle_adjuster"],
+                result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""),
+                onRun: { _ in
+                    var isDirectory: ObjCBool = false
+                    let exists = FileManager.default.fileExists(atPath: outputPath.path, isDirectory: &isDirectory)
+                    XCTAssertTrue(exists)
+                    XCTAssertTrue(isDirectory.boolValue)
+                }
+            )
+        ])
+
+        let colmap = ColmapRunner(runner: runner)
+        try await colmap.runBundleAdjuster(
+            colmapPath: URL(fileURLWithPath: "/mock/colmap"),
+            inputPath: inputPath,
+            outputPath: outputPath,
+            options: ColmapOptions(useGPU: false, extractThreads: 1, matchThreads: 1, sequentialOverlap: 10),
+            bundleOptions: ColmapBundleAdjustmentOptions(
+                maxNumIterations: 10,
+                refineFocalLength: true,
+                refinePrincipalPoint: false,
+                refineExtraParams: false
+            ),
+            onLog: { _, _ in }
+        )
+    }
+
     func testBundleAdjusterRetriesWithLegacyIterationFlag() async throws {
         let runner = MockSubprocessRunner(scripts: [
             .init(
@@ -224,6 +260,29 @@ final class ColmapRunnerTests: XCTestCase {
                 refinePrincipalPoint: false,
                 refineExtraParams: false
             ),
+            onLog: { _, _ in }
+        )
+    }
+
+    func testModelConverterUsesTxtOutput() throws {
+        let runner = MockSubprocessRunner(scripts: [
+            .init(
+                path: "/mock/colmap",
+                argsPrefix: ["model_converter"],
+                result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""),
+                onRun: { args in
+                    XCTAssertEqual(self.value(for: "--input_path", in: args), "/tmp/in")
+                    XCTAssertEqual(self.value(for: "--output_path", in: args), "/tmp/out")
+                    XCTAssertEqual(self.value(for: "--output_type", in: args), "TXT")
+                }
+            )
+        ])
+
+        let colmap = ColmapRunner(runner: runner)
+        try colmap.runModelConverter(
+            colmapPath: URL(fileURLWithPath: "/mock/colmap"),
+            inputPath: URL(fileURLWithPath: "/tmp/in"),
+            outputPath: URL(fileURLWithPath: "/tmp/out"),
             onLog: { _, _ in }
         )
     }

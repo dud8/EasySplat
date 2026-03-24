@@ -217,6 +217,483 @@ final class PipelineIntegrationTests: XCTestCase {
         XCTAssertTrue(FileManager.default.fileExists(atPath: output.path))
     }
 
+    func testPipelineMapAnythingDirectSuccessSkipsExternalRefinement() async throws {
+        let restore = await scopedEnvironment([
+            "EASYSPLAT_SFM_BACKEND": "mapanything",
+            "EASYSPLAT_SFM_MAPPER": nil,
+            "EASYSPLAT_SKIP_TRAINING": "1"
+        ])
+        defer { restore() }
+
+        let temp = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        let projectURL = temp.appendingPathComponent("MapAnythingDirect.easysplatproj", isDirectory: true)
+        let sourcePhotos = temp.appendingPathComponent("SourcePhotos", isDirectory: true)
+        try FileManager.default.createDirectory(at: sourcePhotos, withIntermediateDirectories: true)
+        for index in 0..<4 {
+            try writeTestImage(url: sourcePhotos.appendingPathComponent("img\(index).jpg"), value: UInt8(index % 255))
+        }
+
+        let metadata = ProjectMetadata(
+            title: "MapAnythingDirect",
+            input: .photos(folder: sourcePhotos.path),
+            preset: PresetSpec(mode: .object, quality: .draft)
+        )
+        let paths = ProjectPaths(root: projectURL)
+        try paths.ensureDirectories()
+        try ProjectMetadataStore.save(metadata, to: paths.metadataURL)
+
+        let toolchain = try makeToolchain(root: temp)
+        let runner = MockSubprocessRunner(scripts: [
+            .init(path: toolchain.mapanything.sfmTool.path, argsPrefix: ["--images"], result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""), onRun: { args in
+                try? self.writeMapAnythingRunArtifacts(for: args)
+            }),
+            .init(path: toolchain.colmap.path, argsPrefix: ["model_analyzer"], result: .init(exitCode: 0, terminationReason: .exit, stdout: "Registered images: 4 / 4\nMean reprojection error: 0.7\n", stderr: ""), onRun: nil)
+        ])
+
+        let pipeline = PipelineRunner(
+            projectURL: projectURL,
+            config: .init(toolchain: toolchain, preset: metadata.preset),
+            tooling: .init(runner: runner)
+        )
+
+        try await pipeline.run { _ in }
+
+        XCTAssertTrue(runner.calls.contains(where: { $0.0 == toolchain.mapanything.sfmTool.path }))
+        XCTAssertFalse(runner.calls.contains(where: { $0.0 == toolchain.colmap.path && $0.1.first == "feature_extractor" }))
+        XCTAssertFalse(runner.calls.contains(where: { $0.0 == toolchain.colmap.path && $0.1.first == "point_triangulator" }))
+        XCTAssertFalse(runner.calls.contains(where: { $0.0 == toolchain.colmap.path && $0.1.first == "global_mapper" }))
+    }
+
+    func testPipelineMapAnythingSeedRefineRunsTriangulatorAndBA() async throws {
+        let restore = await scopedEnvironment([
+            "EASYSPLAT_SFM_BACKEND": "mapanything",
+            "EASYSPLAT_SFM_MAPPER": nil,
+            "EASYSPLAT_SKIP_TRAINING": "1"
+        ])
+        defer { restore() }
+
+        let temp = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        let projectURL = temp.appendingPathComponent("MapAnythingSeed.easysplatproj", isDirectory: true)
+        let sourcePhotos = temp.appendingPathComponent("SourcePhotos", isDirectory: true)
+        try FileManager.default.createDirectory(at: sourcePhotos, withIntermediateDirectories: true)
+        for index in 0..<12 {
+            try writeTestImage(url: sourcePhotos.appendingPathComponent("img\(index).jpg"), value: UInt8(index % 255))
+        }
+
+        let metadata = ProjectMetadata(
+            title: "MapAnythingSeed",
+            input: .photos(folder: sourcePhotos.path),
+            preset: PresetSpec(mode: .object, quality: .draft)
+        )
+        let paths = ProjectPaths(root: projectURL)
+        try paths.ensureDirectories()
+        try ProjectMetadataStore.save(metadata, to: paths.metadataURL)
+
+        let toolchain = try makeToolchain(root: temp)
+        let runner = MockSubprocessRunner(scripts: [
+            .init(path: toolchain.mapanything.sfmTool.path, argsPrefix: ["--images"], result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""), onRun: { args in
+                try? self.writeMapAnythingRunArtifacts(for: args)
+            }),
+            .init(path: toolchain.colmap.path, argsPrefix: ["feature_extractor"], result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""), onRun: nil),
+            .init(path: toolchain.colmap.path, argsPrefix: ["exhaustive_matcher"], result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""), onRun: nil),
+            .init(path: toolchain.colmap.path, argsPrefix: ["point_triangulator"], result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""), onRun: { args in
+                guard let out = self.value(for: "--output_path", in: args) else { return }
+                try? self.writeSparseModel(at: URL(fileURLWithPath: out), imageName: "frame_000000.jpg")
+            }),
+            .init(path: toolchain.colmap.path, argsPrefix: ["bundle_adjuster"], result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""), onRun: { args in
+                guard let out = self.value(for: "--output_path", in: args) else { return }
+                try? self.writeSparseModel(at: URL(fileURLWithPath: out), imageName: "frame_000000.jpg")
+            }),
+            .init(path: toolchain.colmap.path, argsPrefix: ["model_analyzer"], result: .init(exitCode: 0, terminationReason: .exit, stdout: "Registered images: 12 / 12\nMean reprojection error: 1.0\n", stderr: ""), onRun: nil)
+        ])
+
+        let pipeline = PipelineRunner(
+            projectURL: projectURL,
+            config: .init(toolchain: toolchain, preset: metadata.preset),
+            tooling: .init(runner: runner)
+        )
+
+        try await pipeline.run { _ in }
+
+        XCTAssertTrue(runner.calls.contains(where: { $0.0 == toolchain.mapanything.sfmTool.path }))
+        XCTAssertTrue(runner.calls.contains(where: { $0.0 == toolchain.colmap.path && $0.1.first == "feature_extractor" }))
+        XCTAssertTrue(runner.calls.contains(where: { $0.0 == toolchain.colmap.path && $0.1.first == "point_triangulator" }))
+        XCTAssertTrue(runner.calls.contains(where: { $0.0 == toolchain.colmap.path && $0.1.first == "bundle_adjuster" }))
+        XCTAssertFalse(runner.calls.contains(where: { $0.0 == toolchain.colmap.path && $0.1.first == "global_mapper" }))
+    }
+
+    func testPipelineMapAnythingDirectLowQualityFallsBackToSeedRefine() async throws {
+        let restore = await scopedEnvironment([
+            "EASYSPLAT_SFM_BACKEND": "mapanything",
+            "EASYSPLAT_SFM_MAPPER": nil,
+            "EASYSPLAT_SKIP_TRAINING": "1"
+        ])
+        defer { restore() }
+
+        let temp = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        let projectURL = temp.appendingPathComponent("MapAnythingDirectFallback.easysplatproj", isDirectory: true)
+        let sourcePhotos = temp.appendingPathComponent("SourcePhotos", isDirectory: true)
+        try FileManager.default.createDirectory(at: sourcePhotos, withIntermediateDirectories: true)
+        for index in 0..<4 {
+            try writeTestImage(url: sourcePhotos.appendingPathComponent("img\(index).jpg"), value: UInt8(index % 255))
+        }
+
+        let metadata = ProjectMetadata(
+            title: "MapAnythingDirectFallback",
+            input: .photos(folder: sourcePhotos.path),
+            preset: PresetSpec(mode: .object, quality: .draft)
+        )
+        let paths = ProjectPaths(root: projectURL)
+        try paths.ensureDirectories()
+        try ProjectMetadataStore.save(metadata, to: paths.metadataURL)
+
+        let toolchain = try makeToolchain(root: temp)
+        let runner = MockSubprocessRunner(scripts: [
+            .init(path: toolchain.mapanything.sfmTool.path, argsPrefix: ["--images"], result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""), onRun: { args in
+                try? self.writeMapAnythingRunArtifacts(for: args)
+            }),
+            .init(path: toolchain.colmap.path, argsPrefix: ["model_analyzer"], result: .init(exitCode: 0, terminationReason: .exit, stdout: "Registered images: 2 / 4\nMean reprojection error: 3.2\n", stderr: ""), onRun: nil),
+            .init(path: toolchain.mapanything.sfmTool.path, argsPrefix: ["--images"], result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""), onRun: { args in
+                try? self.writeMapAnythingRunArtifacts(for: args)
+            }),
+            .init(path: toolchain.colmap.path, argsPrefix: ["feature_extractor"], result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""), onRun: nil),
+            .init(path: toolchain.colmap.path, argsPrefix: ["exhaustive_matcher"], result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""), onRun: nil),
+            .init(path: toolchain.colmap.path, argsPrefix: ["point_triangulator"], result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""), onRun: { args in
+                guard let out = self.value(for: "--output_path", in: args) else { return }
+                try? self.writeSparseModel(at: URL(fileURLWithPath: out), imageName: "frame_000000.jpg")
+            }),
+            .init(path: toolchain.colmap.path, argsPrefix: ["bundle_adjuster"], result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""), onRun: { args in
+                guard let out = self.value(for: "--output_path", in: args) else { return }
+                try? self.writeSparseModel(at: URL(fileURLWithPath: out), imageName: "frame_000000.jpg")
+            }),
+            .init(path: toolchain.colmap.path, argsPrefix: ["model_analyzer"], result: .init(exitCode: 0, terminationReason: .exit, stdout: "Registered images: 4 / 4\nMean reprojection error: 1.0\n", stderr: ""), onRun: nil)
+        ])
+
+        let pipeline = PipelineRunner(
+            projectURL: projectURL,
+            config: .init(toolchain: toolchain, preset: metadata.preset),
+            tooling: .init(runner: runner)
+        )
+
+        try await pipeline.run { _ in }
+
+        let mapAnythingCalls = runner.calls.filter { $0.0 == toolchain.mapanything.sfmTool.path }
+        XCTAssertEqual(mapAnythingCalls.count, 2)
+        XCTAssertTrue(mapAnythingCalls[0].1.contains("direct"))
+        XCTAssertTrue(mapAnythingCalls[1].1.contains("seed_refine"))
+        XCTAssertTrue(runner.calls.contains(where: { $0.0 == toolchain.colmap.path && $0.1.first == "feature_extractor" }))
+        XCTAssertTrue(runner.calls.contains(where: { $0.0 == toolchain.colmap.path && $0.1.first == "point_triangulator" }))
+        XCTAssertFalse(runner.calls.contains(where: { $0.0 == toolchain.colmap.path && $0.1.first == "global_mapper" }))
+    }
+
+    func testPipelineMapAnythingDirectThinTracksFallsBackToSeedRefine() async throws {
+        let restore = await scopedEnvironment([
+            "EASYSPLAT_SFM_BACKEND": "mapanything",
+            "EASYSPLAT_SFM_MAPPER": nil,
+            "EASYSPLAT_SKIP_TRAINING": "1"
+        ])
+        defer { restore() }
+
+        let temp = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        let projectURL = temp.appendingPathComponent("MapAnythingThinTracks.easysplatproj", isDirectory: true)
+        let sourcePhotos = temp.appendingPathComponent("SourcePhotos", isDirectory: true)
+        try FileManager.default.createDirectory(at: sourcePhotos, withIntermediateDirectories: true)
+        for index in 0..<4 {
+            try writeTestImage(url: sourcePhotos.appendingPathComponent("img\(index).jpg"), value: UInt8(index % 255))
+        }
+
+        let metadata = ProjectMetadata(
+            title: "MapAnythingThinTracks",
+            input: .photos(folder: sourcePhotos.path),
+            preset: PresetSpec(mode: .object, quality: .draft)
+        )
+        let paths = ProjectPaths(root: projectURL)
+        try paths.ensureDirectories()
+        try ProjectMetadataStore.save(metadata, to: paths.metadataURL)
+
+        let toolchain = try makeToolchain(root: temp)
+        let runner = MockSubprocessRunner(scripts: [
+            .init(path: toolchain.mapanything.sfmTool.path, argsPrefix: ["--images"], result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""), onRun: { args in
+                try? self.writeMapAnythingRunArtifacts(for: args)
+            }),
+            .init(path: toolchain.colmap.path, argsPrefix: ["model_analyzer"], result: .init(exitCode: 0, terminationReason: .exit, stdout: "Registered images: 4 / 4\nPoints: 10000\nObservations: 10100\nMean track length: 1.01\nMean reprojection error: 0.9\n", stderr: ""), onRun: nil),
+            .init(path: toolchain.mapanything.sfmTool.path, argsPrefix: ["--images"], result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""), onRun: { args in
+                try? self.writeMapAnythingRunArtifacts(for: args)
+            }),
+            .init(path: toolchain.colmap.path, argsPrefix: ["feature_extractor"], result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""), onRun: nil),
+            .init(path: toolchain.colmap.path, argsPrefix: ["exhaustive_matcher"], result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""), onRun: nil),
+            .init(path: toolchain.colmap.path, argsPrefix: ["point_triangulator"], result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""), onRun: { args in
+                guard let out = self.value(for: "--output_path", in: args) else { return }
+                try? self.writeSparseModel(at: URL(fileURLWithPath: out), imageName: "frame_000000.jpg")
+            }),
+            .init(path: toolchain.colmap.path, argsPrefix: ["bundle_adjuster"], result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""), onRun: { args in
+                guard let out = self.value(for: "--output_path", in: args) else { return }
+                try? self.writeSparseModel(at: URL(fileURLWithPath: out), imageName: "frame_000000.jpg")
+            }),
+            .init(path: toolchain.colmap.path, argsPrefix: ["model_analyzer"], result: .init(exitCode: 0, terminationReason: .exit, stdout: "Registered images: 4 / 4\nPoints: 16000\nObservations: 42000\nMean track length: 2.63\nMean reprojection error: 0.8\n", stderr: ""), onRun: nil)
+        ])
+
+        let pipeline = PipelineRunner(
+            projectURL: projectURL,
+            config: .init(toolchain: toolchain, preset: metadata.preset),
+            tooling: .init(runner: runner)
+        )
+
+        try await pipeline.run { _ in }
+
+        let mapAnythingCalls = runner.calls.filter { $0.0 == toolchain.mapanything.sfmTool.path }
+        XCTAssertEqual(mapAnythingCalls.count, 2)
+        XCTAssertTrue(mapAnythingCalls[0].1.contains("direct"))
+        XCTAssertTrue(mapAnythingCalls[1].1.contains("seed_refine"))
+        XCTAssertTrue(runner.calls.contains(where: { $0.0 == toolchain.colmap.path && $0.1.first == "feature_extractor" }))
+        XCTAssertTrue(runner.calls.contains(where: { $0.0 == toolchain.colmap.path && $0.1.first == "point_triangulator" }))
+    }
+
+    func testPipelineMapAnythingInvalidCoverageManifestFallsBackToSeedRefine() async throws {
+        let restore = await scopedEnvironment([
+            "EASYSPLAT_SFM_BACKEND": "mapanything",
+            "EASYSPLAT_SFM_MAPPER": nil,
+            "EASYSPLAT_SKIP_TRAINING": "1"
+        ])
+        defer { restore() }
+
+        let temp = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        let projectURL = temp.appendingPathComponent("MapAnythingInvalidManifest.easysplatproj", isDirectory: true)
+        let sourcePhotos = temp.appendingPathComponent("SourcePhotos", isDirectory: true)
+        try FileManager.default.createDirectory(at: sourcePhotos, withIntermediateDirectories: true)
+        for index in 0..<4 {
+            try writeTestImage(url: sourcePhotos.appendingPathComponent("img\(index).jpg"), value: UInt8(index % 255))
+        }
+
+        let metadata = ProjectMetadata(
+            title: "MapAnythingInvalidManifest",
+            input: .photos(folder: sourcePhotos.path),
+            preset: PresetSpec(mode: .object, quality: .draft)
+        )
+        let paths = ProjectPaths(root: projectURL)
+        try paths.ensureDirectories()
+        try ProjectMetadataStore.save(metadata, to: paths.metadataURL)
+
+        let toolchain = try makeToolchain(root: temp)
+        let runner = MockSubprocessRunner(scripts: [
+            .init(path: toolchain.mapanything.sfmTool.path, argsPrefix: ["--images"], result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""), onRun: { args in
+                try? self.writeMapAnythingRunArtifacts(for: args, manifestModeOverride: "seed_refine")
+            }),
+            .init(path: toolchain.mapanything.sfmTool.path, argsPrefix: ["--images"], result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""), onRun: { args in
+                try? self.writeMapAnythingRunArtifacts(for: args)
+            }),
+            .init(path: toolchain.colmap.path, argsPrefix: ["feature_extractor"], result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""), onRun: nil),
+            .init(path: toolchain.colmap.path, argsPrefix: ["exhaustive_matcher"], result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""), onRun: nil),
+            .init(path: toolchain.colmap.path, argsPrefix: ["point_triangulator"], result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""), onRun: { args in
+                guard let out = self.value(for: "--output_path", in: args) else { return }
+                try? self.writeSparseModel(at: URL(fileURLWithPath: out), imageName: "frame_000000.jpg")
+            }),
+            .init(path: toolchain.colmap.path, argsPrefix: ["bundle_adjuster"], result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""), onRun: { args in
+                guard let out = self.value(for: "--output_path", in: args) else { return }
+                try? self.writeSparseModel(at: URL(fileURLWithPath: out), imageName: "frame_000000.jpg")
+            }),
+            .init(path: toolchain.colmap.path, argsPrefix: ["model_analyzer"], result: .init(exitCode: 0, terminationReason: .exit, stdout: "Registered images: 4 / 4\nPoints: 15000\nObservations: 32000\nMean track length: 2.13\nMean reprojection error: 0.8\n", stderr: ""), onRun: nil)
+        ])
+
+        let pipeline = PipelineRunner(
+            projectURL: projectURL,
+            config: .init(toolchain: toolchain, preset: metadata.preset),
+            tooling: .init(runner: runner)
+        )
+
+        try await pipeline.run { _ in }
+
+        let mapAnythingCalls = runner.calls.filter { $0.0 == toolchain.mapanything.sfmTool.path }
+        XCTAssertEqual(mapAnythingCalls.count, 2)
+        XCTAssertTrue(mapAnythingCalls[0].1.contains("direct"))
+        XCTAssertTrue(mapAnythingCalls[1].1.contains("seed_refine"))
+        XCTAssertTrue(runner.calls.contains(where: { $0.0 == toolchain.colmap.path && $0.1.first == "point_triangulator" }))
+    }
+
+    func testPipelineMapAnythingFailureFallsBackToColmapDefaultPath() async throws {
+        let restore = await scopedEnvironment([
+            "EASYSPLAT_SFM_BACKEND": nil,
+            "EASYSPLAT_SFM_MAPPER": nil,
+            "EASYSPLAT_SKIP_TRAINING": "1"
+        ])
+        defer { restore() }
+
+        let temp = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        let projectURL = temp.appendingPathComponent("MapAnythingToColmap.easysplatproj", isDirectory: true)
+        let sourcePhotos = temp.appendingPathComponent("SourcePhotos", isDirectory: true)
+        try FileManager.default.createDirectory(at: sourcePhotos, withIntermediateDirectories: true)
+        for index in 0..<10 {
+            try writeTestImage(url: sourcePhotos.appendingPathComponent("img\(index).jpg"), value: UInt8(index % 255))
+        }
+
+        let metadata = ProjectMetadata(
+            title: "MapAnythingToColmap",
+            input: .photos(folder: sourcePhotos.path),
+            preset: PresetSpec(mode: .object, quality: .draft)
+        )
+        let paths = ProjectPaths(root: projectURL)
+        try paths.ensureDirectories()
+        try ProjectMetadataStore.save(metadata, to: paths.metadataURL)
+
+        let toolchain = try makeToolchain(root: temp)
+        let runner = MockSubprocessRunner(scripts: [
+            .init(
+                path: toolchain.mapanything.sfmTool.path,
+                argsPrefix: ["--images"],
+                result: .init(exitCode: 1, terminationReason: .exit, stdout: "", stderr: "mapanything failed"),
+                onRun: nil
+            ),
+            .init(
+                path: toolchain.colmap.path,
+                argsPrefix: ["feature_extractor"],
+                result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""),
+                onRun: nil
+            ),
+            .init(
+                path: toolchain.colmap.path,
+                argsPrefix: ["exhaustive_matcher"],
+                result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""),
+                onRun: nil
+            ),
+            .init(
+                path: toolchain.colmap.path,
+                argsPrefix: ["global_mapper"],
+                result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""),
+                onRun: { _ in try? self.writeSparseModel(at: projectURL) }
+            ),
+            .init(
+                path: toolchain.colmap.path,
+                argsPrefix: ["model_analyzer"],
+                result: .init(exitCode: 0, terminationReason: .exit, stdout: "Registered images: 10 / 10\nMean reprojection error: 1.0\n", stderr: ""),
+                onRun: nil
+            )
+        ])
+
+        let pipeline = PipelineRunner(
+            projectURL: projectURL,
+            config: .init(toolchain: toolchain, preset: metadata.preset),
+            tooling: .init(runner: runner)
+        )
+
+        try await pipeline.run { _ in }
+
+        XCTAssertTrue(runner.calls.contains(where: { $0.0 == toolchain.mapanything.sfmTool.path }))
+        XCTAssertTrue(runner.calls.contains(where: { $0.0 == toolchain.colmap.path && $0.1.first == "feature_extractor" }))
+        XCTAssertTrue(runner.calls.contains(where: { $0.0 == toolchain.colmap.path && $0.1.first == "global_mapper" }))
+    }
+
+    func testPipelineConvertsBinaryOnlySparseModelBeforeTraining() async throws {
+        let restore = await scopedEnvironment([
+            "EASYSPLAT_SFM_BACKEND": "colmap",
+            "EASYSPLAT_SFM_MAPPER": nil,
+            "EASYSPLAT_SKIP_TRAINING": nil
+        ])
+        defer { restore() }
+
+        let temp = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        let projectURL = temp.appendingPathComponent("BinarySparse.easysplatproj", isDirectory: true)
+        let sourcePhotos = temp.appendingPathComponent("SourcePhotos", isDirectory: true)
+        try FileManager.default.createDirectory(at: sourcePhotos, withIntermediateDirectories: true)
+        for index in 0..<12 {
+            try writeTestImage(url: sourcePhotos.appendingPathComponent("img\(index).jpg"), value: UInt8(index % 255))
+        }
+
+        let metadata = ProjectMetadata(
+            title: "BinarySparse",
+            input: .photos(folder: sourcePhotos.path),
+            preset: PresetSpec(mode: .object, quality: .draft)
+        )
+        let paths = ProjectPaths(root: projectURL)
+        try paths.ensureDirectories()
+        try ProjectMetadataStore.save(metadata, to: paths.metadataURL)
+
+        let toolchain = try makeToolchain(root: temp)
+        let runner = MockSubprocessRunner(scripts: [
+            .init(
+                path: toolchain.colmap.path,
+                argsPrefix: ["feature_extractor"],
+                result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""),
+                onRun: nil
+            ),
+            .init(
+                path: toolchain.colmap.path,
+                argsPrefix: ["exhaustive_matcher"],
+                result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""),
+                onRun: nil
+            ),
+            .init(
+                path: toolchain.colmap.path,
+                argsPrefix: ["global_mapper"],
+                result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""),
+                onRun: { _ in
+                    try? self.writeSparseModelBinaryOnlyForProject(at: projectURL)
+                }
+            ),
+            .init(
+                path: toolchain.colmap.path,
+                argsPrefix: ["model_analyzer"],
+                result: .init(
+                    exitCode: 0,
+                    terminationReason: .exit,
+                    stdout: "Registered images: 12 / 12\nMean reprojection error: 1.0\n",
+                    stderr: ""
+                ),
+                onRun: nil
+            ),
+            .init(
+                path: toolchain.colmap.path,
+                argsPrefix: ["model_converter"],
+                result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""),
+                onRun: { args in
+                    guard let outputPath = self.value(for: "--output_path", in: args) else { return }
+                    let out = URL(fileURLWithPath: outputPath, isDirectory: true)
+                    let images = """
+                    # Image list with two lines per image:
+                    1 1 0 0 0 0 0 0 1 frame_000000.jpg
+
+                    """
+                    try? images.write(to: out.appendingPathComponent("images.txt"), atomically: true, encoding: .utf8)
+                    try? "1 SIMPLE_RADIAL 32 32 10 16 16\n".write(
+                        to: out.appendingPathComponent("cameras.txt"),
+                        atomically: true,
+                        encoding: .utf8
+                    )
+                    try? "# empty\n".write(
+                        to: out.appendingPathComponent("points3D.txt"),
+                        atomically: true,
+                        encoding: .utf8
+                    )
+                }
+            ),
+            .init(
+                path: toolchain.brush.path,
+                argsPrefix: [],
+                result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""),
+                onRun: { args in
+                    guard let datasetArg = args.last else { return }
+                    let dataset = URL(fileURLWithPath: datasetArg)
+                    let training = dataset.deletingLastPathComponent()
+                    let ply = training.appendingPathComponent("mock.ply")
+                    try? TestFileBuilder.writeMinimalPly(at: ply)
+                }
+            )
+        ])
+
+        let pipeline = PipelineRunner(
+            projectURL: projectURL,
+            config: .init(toolchain: toolchain, preset: metadata.preset),
+            tooling: .init(runner: runner)
+        )
+
+        try await pipeline.run { _ in }
+
+        XCTAssertTrue(runner.calls.contains(where: { _, args in args.first == "model_converter" }))
+        let convertedImages = projectURL.appendingPathComponent("Training/dataset/sparse/0/images.txt")
+        XCTAssertTrue(FileManager.default.fileExists(atPath: convertedImages.path))
+        let output = projectURL.appendingPathComponent("Output/splat.ply")
+        XCTAssertTrue(FileManager.default.fileExists(atPath: output.path))
+    }
+
     func testPipelineCancellationDoesNotFallbackBetweenBackends() async throws {
         let restore = await scopedEnvironment([
             "EASYSPLAT_SFM_BACKEND": "fastvggt",
@@ -263,7 +740,7 @@ final class PipelineIntegrationTests: XCTestCase {
         XCTAssertNotNil(interruptedMetadata.lastRunStartedAt, "Cancellation should preserve lastRunStartedAt for crash/interruption detection.")
     }
 
-    func testPipelineDefaultsToColmapGlobalMapperWhenBackendUnset() async throws {
+    func testPipelineDefaultsToMapAnythingWhenBackendUnset() async throws {
         let restore = await scopedEnvironment([
             "EASYSPLAT_SFM_BACKEND": nil,
             "EASYSPLAT_SFM_MAPPER": nil,
@@ -289,9 +766,19 @@ final class PipelineIntegrationTests: XCTestCase {
         let toolchain = try makeToolchain(root: temp, createVggtFiles: true)
 
         let runner = MockSubprocessRunner(scripts: [
+            .init(path: toolchain.mapanything.sfmTool.path, argsPrefix: ["--images"], result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""), onRun: { args in
+                try? self.writeMapAnythingRunArtifacts(for: args)
+            }),
             .init(path: toolchain.colmap.path, argsPrefix: ["feature_extractor"], result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""), onRun: nil),
             .init(path: toolchain.colmap.path, argsPrefix: ["exhaustive_matcher"], result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""), onRun: nil),
-            .init(path: toolchain.colmap.path, argsPrefix: ["global_mapper"], result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""), onRun: { _ in try? self.writeSparseModel(at: projectURL) }),
+            .init(path: toolchain.colmap.path, argsPrefix: ["point_triangulator"], result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""), onRun: { args in
+                guard let out = self.value(for: "--output_path", in: args) else { return }
+                try? self.writeSparseModel(at: URL(fileURLWithPath: out), imageName: "frame_000000.jpg")
+            }),
+            .init(path: toolchain.colmap.path, argsPrefix: ["bundle_adjuster"], result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""), onRun: { args in
+                guard let out = self.value(for: "--output_path", in: args) else { return }
+                try? self.writeSparseModel(at: URL(fileURLWithPath: out), imageName: "frame_000000.jpg")
+            }),
             .init(path: toolchain.colmap.path, argsPrefix: ["model_analyzer"], result: .init(exitCode: 0, terminationReason: .exit, stdout: "Registered images: 10 / 10\nMean reprojection error: 1.0\n", stderr: ""), onRun: nil)
         ])
 
@@ -304,10 +791,12 @@ final class PipelineIntegrationTests: XCTestCase {
         try await pipeline.run { _ in }
 
         let callPaths = runner.calls.map { $0.0 }
+        XCTAssertTrue(callPaths.contains(toolchain.mapanything.sfmTool.path))
         XCTAssertFalse(callPaths.contains(toolchain.fastvggt.sfmTool.path))
         XCTAssertFalse(callPaths.contains(toolchain.vggt.sfmTool.path))
         XCTAssertTrue(callPaths.contains(toolchain.colmap.path))
-        XCTAssertTrue(runner.calls.contains(where: { $0.0 == toolchain.colmap.path && $0.1.first == "global_mapper" }))
+        XCTAssertTrue(runner.calls.contains(where: { $0.0 == toolchain.colmap.path && $0.1.first == "point_triangulator" }))
+        XCTAssertFalse(runner.calls.contains(where: { $0.0 == toolchain.colmap.path && $0.1.first == "global_mapper" }))
     }
 
     func testPipelineFastVggtRefinementFallsBackToMapperPath() async throws {
@@ -392,9 +881,19 @@ final class PipelineIntegrationTests: XCTestCase {
         let toolchain = try makeToolchain(root: temp, createVggtFiles: true)
 
         let runner = MockSubprocessRunner(scripts: [
+            .init(path: toolchain.mapanything.sfmTool.path, argsPrefix: ["--images"], result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""), onRun: { args in
+                try? self.writeMapAnythingRunArtifacts(for: args)
+            }),
             .init(path: toolchain.colmap.path, argsPrefix: ["feature_extractor"], result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""), onRun: nil),
             .init(path: toolchain.colmap.path, argsPrefix: ["exhaustive_matcher"], result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""), onRun: nil),
-            .init(path: toolchain.colmap.path, argsPrefix: ["global_mapper"], result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""), onRun: { _ in try? self.writeSparseModel(at: projectURL) }),
+            .init(path: toolchain.colmap.path, argsPrefix: ["point_triangulator"], result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""), onRun: { args in
+                guard let out = self.value(for: "--output_path", in: args) else { return }
+                try? self.writeSparseModel(at: URL(fileURLWithPath: out), imageName: "frame_000000.jpg")
+            }),
+            .init(path: toolchain.colmap.path, argsPrefix: ["bundle_adjuster"], result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""), onRun: { args in
+                guard let out = self.value(for: "--output_path", in: args) else { return }
+                try? self.writeSparseModel(at: URL(fileURLWithPath: out), imageName: "frame_000000.jpg")
+            }),
             .init(path: toolchain.colmap.path, argsPrefix: ["model_analyzer"], result: .init(exitCode: 0, terminationReason: .exit, stdout: "Registered images: 10 / 10\nMean reprojection error: 1.0\n", stderr: ""), onRun: nil)
         ])
 
@@ -407,10 +906,12 @@ final class PipelineIntegrationTests: XCTestCase {
         try await pipeline.run { _ in }
 
         let callPaths = runner.calls.map { $0.0 }
+        XCTAssertTrue(callPaths.contains(toolchain.mapanything.sfmTool.path))
         XCTAssertFalse(callPaths.contains(toolchain.fastvggt.sfmTool.path))
         XCTAssertFalse(callPaths.contains(toolchain.vggt.sfmTool.path))
         XCTAssertTrue(callPaths.contains(toolchain.colmap.path))
-        XCTAssertTrue(runner.calls.contains(where: { $0.0 == toolchain.colmap.path && $0.1.first == "global_mapper" }))
+        XCTAssertTrue(runner.calls.contains(where: { $0.0 == toolchain.colmap.path && $0.1.first == "point_triangulator" }))
+        XCTAssertFalse(runner.calls.contains(where: { $0.0 == toolchain.colmap.path && $0.1.first == "global_mapper" }))
     }
 
     func testPipelineFastVggtRefinementSuccessRunsTriangulatorAndBA() async throws {
@@ -1142,6 +1643,46 @@ final class PipelineIntegrationTests: XCTestCase {
         }
     }
 
+    func testPipelineFailsWhenOnlyOneUsableImageRemains() async throws {
+        let restore = await scopedEnvironment([
+            "EASYSPLAT_SFM_BACKEND": nil,
+            "EASYSPLAT_SFM_MAPPER": nil,
+            "EASYSPLAT_SKIP_TRAINING": "1"
+        ])
+        defer { restore() }
+
+        let temp = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        let projectURL = temp.appendingPathComponent("OneImage.easysplatproj", isDirectory: true)
+        let sourcePhotos = temp.appendingPathComponent("SourcePhotos", isDirectory: true)
+        try FileManager.default.createDirectory(at: sourcePhotos, withIntermediateDirectories: true)
+        try writeTestImage(url: sourcePhotos.appendingPathComponent("img0.jpg"), value: 42)
+
+        let metadata = ProjectMetadata(
+            title: "OneImage",
+            input: .photos(folder: sourcePhotos.path),
+            preset: PresetSpec(mode: .object, quality: .draft)
+        )
+        let paths = ProjectPaths(root: projectURL)
+        try paths.ensureDirectories()
+        try ProjectMetadataStore.save(metadata, to: paths.metadataURL)
+
+        let toolchain = try makeToolchain(root: temp)
+        let runner = MockSubprocessRunner(scripts: [])
+        let pipeline = PipelineRunner(
+            projectURL: projectURL,
+            config: .init(toolchain: toolchain, preset: metadata.preset),
+            tooling: .init(runner: runner)
+        )
+
+        await XCTAssertThrowsErrorAsync {
+            try await pipeline.run { _ in }
+        }
+
+        let saved = try ProjectMetadataStore.load(from: paths.metadataURL)
+        XCTAssertEqual(saved.state.lastError, "At least two usable photos or video frames are required.")
+        XCTAssertTrue(runner.calls.isEmpty)
+    }
+
     func testPipelineRetriesWithReducedFramesOnColmapFailure() async throws {
         let restore = await scopedEnvironment([
             "EASYSPLAT_SFM_BACKEND": "colmap",
@@ -1577,6 +2118,19 @@ final class PipelineIntegrationTests: XCTestCase {
         try writeSparseModel(at: modelURL, imageName: "frame_000000.jpg")
     }
 
+    private func writeSparseModelBinaryOnlyForProject(at projectURL: URL) throws {
+        let modelURL = projectURL.appendingPathComponent("SfM/colmap/sparse/0", isDirectory: true)
+        try writeSparseModelBinaryOnly(at: modelURL)
+    }
+
+    private func writeSparseModelBinaryOnly(at modelURL: URL) throws {
+        try FileManager.default.createDirectory(at: modelURL, withIntermediateDirectories: true)
+        for name in ["cameras.bin", "images.bin", "points3D.bin"] {
+            let url = modelURL.appendingPathComponent(name)
+            FileManager.default.createFile(atPath: url.path, contents: Data([0x00]))
+        }
+    }
+
     private func writeSparseModel(at modelURL: URL, imageName: String) throws {
         try FileManager.default.createDirectory(at: modelURL, withIntermediateDirectories: true)
         for name in ["cameras.bin", "images.bin", "points3D.bin", "cameras.txt", "points3D.txt"] {
@@ -1625,6 +2179,135 @@ final class PipelineIntegrationTests: XCTestCase {
         }
     }
 
+    private func writeMapAnythingRunArtifacts(
+        for args: [String],
+        imageName: String = "frame_000000.jpg",
+        manifestModeOverride: String? = nil,
+        registeredImageCountOverride: Int? = nil
+    ) throws {
+        guard let out = value(for: "--out-sparse", in: args) else { return }
+        try writeSparseModel(at: URL(fileURLWithPath: out), imageName: imageName)
+
+        guard let manifestPath = value(for: "--manifest-out", in: args),
+              let imagesPath = value(for: "--images", in: args),
+              let mode = value(for: "--mode", in: args) else {
+            return
+        }
+
+        let imagesURL = URL(fileURLWithPath: imagesPath, isDirectory: true)
+        let imageNames = try FileManager.default.contentsOfDirectory(
+            at: imagesURL,
+            includingPropertiesForKeys: nil
+        )
+        .filter { ["jpg", "jpeg", "png", "heic"].contains($0.pathExtension.lowercased()) }
+        .map(\.lastPathComponent)
+        .sorted()
+
+        let totalImages = imageNames.count
+        let requestedAnchorMaxViews = Int(value(for: "--anchor-max-views", in: args) ?? "") ?? totalImages
+        let anchorNames = downsampleMapAnythingNamesUniform(
+            imageNames,
+            targetCount: max(2, min(totalImages, requestedAnchorMaxViews))
+        )
+        let requestedWindowSize = Int(value(for: "--window-size", in: args) ?? "") ?? max(2, anchorNames.count)
+        let requestedWindowOverlap = Int(value(for: "--window-overlap", in: args) ?? "") ?? 0
+        let effectiveMode = manifestModeOverride ?? mode
+        let effectiveWindowSize = effectiveMode == "direct" ? max(2, anchorNames.count) : max(2, min(anchorNames.count, requestedWindowSize))
+        let effectiveWindowOverlap = effectiveMode == "direct" ? 0 : max(0, min(requestedWindowOverlap, effectiveWindowSize - 1))
+        let windows = planMapAnythingWindows(
+            imageCount: anchorNames.count,
+            windowSize: effectiveWindowSize,
+            windowOverlap: effectiveWindowOverlap
+        )
+        let fusedSparsePointCount = max(1, min(9_000, totalImages * 2_000))
+        let finalObservationCount = max(fusedSparsePointCount + 1_000, fusedSparsePointCount + totalImages * 400)
+        let registeredImageCount = registeredImageCountOverride ?? (effectiveMode == "direct" ? totalImages : anchorNames.count)
+        let meanTrackLength = Double(finalObservationCount) / Double(fusedSparsePointCount)
+
+        let manifest = MapAnythingCoverageManifest(
+            mode: effectiveMode,
+            requestedDevice: "mps",
+            selectedDevice: "mps",
+            resolution: 518,
+            cameraType: "SIMPLE_RADIAL",
+            sharedCamera: false,
+            seed: 42,
+            maxPoints: 120_000,
+            totalImages: totalImages,
+            anchorImageCount: anchorNames.count,
+            requestedWindowSize: effectiveMode == "direct" ? anchorNames.count : requestedWindowSize,
+            requestedWindowOverlap: effectiveMode == "direct" ? 0 : requestedWindowOverlap,
+            windowSize: effectiveWindowSize,
+            windowOverlap: effectiveWindowOverlap,
+            windowReductionCount: 0,
+            anchors: anchorNames,
+            windows: windows.map { (start, end) in
+                MapAnythingCoverageManifest.Window(
+                    start: start,
+                    end: end,
+                    images: Array(anchorNames[start..<end])
+                )
+            },
+            rawPointSampleCount: fusedSparsePointCount + totalImages * 500,
+            fusedSparsePointCount: fusedSparsePointCount,
+            finalObservationCount: finalObservationCount,
+            meanTrackLength: meanTrackLength,
+            registeredImageCount: registeredImageCount
+        )
+
+        let data = try JSONEncoder().encode(manifest)
+        try data.write(to: URL(fileURLWithPath: manifestPath), options: [.atomic])
+    }
+
+    private func downsampleMapAnythingNamesUniform(_ names: [String], targetCount: Int) -> [String] {
+        guard !names.isEmpty else { return [] }
+        let cappedTarget = max(1, min(names.count, targetCount))
+        if names.count <= cappedTarget {
+            return names
+        }
+        if cappedTarget == 1 {
+            return [names[names.count / 2]]
+        }
+
+        let step = Double(names.count - 1) / Double(cappedTarget - 1)
+        var indices: [Int] = []
+        for index in 0..<cappedTarget {
+            let candidate = max(0, min(names.count - 1, Int(round(Double(index) * step))))
+            if indices.last != candidate {
+                indices.append(candidate)
+            }
+        }
+        if indices.last != names.count - 1 {
+            indices[indices.count - 1] = names.count - 1
+        }
+        return indices.map { names[$0] }
+    }
+
+    private func planMapAnythingWindows(imageCount: Int, windowSize: Int, windowOverlap: Int) -> [(Int, Int)] {
+        guard imageCount > 0 else { return [] }
+        let size = max(2, min(windowSize, imageCount))
+        let overlap = max(0, min(windowOverlap, size - 1))
+        let stride = max(1, size - overlap)
+        if imageCount <= size {
+            return [(0, imageCount)]
+        }
+
+        var windows: [(Int, Int)] = []
+        var start = 0
+        while start < imageCount {
+            let end = min(start + size, imageCount)
+            if windows.last?.1 == end {
+                break
+            }
+            windows.append((start, end))
+            if end == imageCount {
+                break
+            }
+            start += stride
+        }
+        return windows
+    }
+
     private func value(for flag: String, in args: [String]) -> String? {
         guard let index = args.firstIndex(of: flag), index + 1 < args.count else { return nil }
         return args[index + 1]
@@ -1632,6 +2315,7 @@ final class PipelineIntegrationTests: XCTestCase {
 
     private func makeToolchain(
         root: URL,
+        createMapAnythingFiles: Bool = true,
         createVggtFiles: Bool = false
     ) throws -> ToolchainPaths {
         let fm = FileManager.default
@@ -1654,6 +2338,7 @@ final class PipelineIntegrationTests: XCTestCase {
         let colmap = try writeStub("colmap")
         let brush = try writeStub("brush")
 
+        let mapanything = try TestToolchains.mapAnythingToolchain(root: toolchainRoot, createFiles: createMapAnythingFiles)
         let vggt = try TestToolchains.vggtToolchain(root: toolchainRoot, createFiles: createVggtFiles)
         let fastvggt = try TestToolchains.fastVggtToolchain(root: toolchainRoot, createFiles: createVggtFiles)
         return ToolchainPaths(
@@ -1661,6 +2346,7 @@ final class PipelineIntegrationTests: XCTestCase {
             colmap: colmap,
             glomap: colmap,
             brush: brush,
+            mapanything: mapanything,
             vggt: vggt,
             fastvggt: fastvggt
         )

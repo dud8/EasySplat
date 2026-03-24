@@ -12,6 +12,7 @@ public struct ProjectMetadata: Codable, Sendable {
     public var checkpoint: PipelineCheckpoint?
     public var recoveryPromptSuppressed: Bool?
     public var lastRunStartedAt: Date?
+    public var shareMetrics: ShareMetrics?
 
     public init(
         formatVersion: Int = 1,
@@ -24,7 +25,8 @@ public struct ProjectMetadata: Codable, Sendable {
         outputs: OutputSpec? = nil,
         checkpoint: PipelineCheckpoint? = nil,
         recoveryPromptSuppressed: Bool? = nil,
-        lastRunStartedAt: Date? = nil
+        lastRunStartedAt: Date? = nil,
+        shareMetrics: ShareMetrics? = nil
     ) {
         self.formatVersion = formatVersion
         self.id = id
@@ -37,6 +39,26 @@ public struct ProjectMetadata: Codable, Sendable {
         self.checkpoint = checkpoint
         self.recoveryPromptSuppressed = recoveryPromptSuppressed
         self.lastRunStartedAt = lastRunStartedAt
+        self.shareMetrics = shareMetrics
+    }
+}
+
+public struct ShareMetrics: Codable, Sendable, Equatable {
+    public var shareClickedCount: Int
+    public var shareCompletedCount: Int
+    public var lastShareService: String?
+    public var lastSharedAt: Date?
+
+    public init(
+        shareClickedCount: Int = 0,
+        shareCompletedCount: Int = 0,
+        lastShareService: String? = nil,
+        lastSharedAt: Date? = nil
+    ) {
+        self.shareClickedCount = shareClickedCount
+        self.shareCompletedCount = shareCompletedCount
+        self.lastShareService = lastShareService
+        self.lastSharedAt = lastSharedAt
     }
 }
 

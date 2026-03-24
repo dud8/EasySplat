@@ -1,10 +1,10 @@
 # EasySplat
 
-EasySplat is a macOS-only (Apple Silicon) desktop app that turns videos or image folders into 3D Gaussian splats using a bundled toolchain (primarily COLMAP `global_mapper`/GLOMAP + Brush), with a beginner-friendly UI and progress tracking.
+EasySplat is a macOS-only (Apple Silicon) desktop app that turns videos or image folders into 3D Gaussian splats using a bundled toolchain. The default SfM path is now MapAnything-first on Apple Silicon, with COLMAP refinement and mapper fallback when the job or hardware needs a safer path.
 
 FastVGGT/VGGT paths remain in the repo as deprecated, explicit override backends.
 
-The app downloads a signed `manifest.json` that lists toolchain artifacts (typically split into a smaller “core” zip and a large “models” zip).
+The app downloads a signed `manifest.json` that lists toolchain artifacts (typically split into a smaller “core” zip and a large “models” zip). Each packaged Python SfM bundle also carries a `build_info.json` file so releases can be traced back to the exact source snapshot, runtime, and model metadata used to build them.
 
 ## Quick start (recommended)
 
@@ -18,6 +18,7 @@ The app downloads a signed `manifest.json` that lists toolchain artifacts (typic
 - `EasySplatApp/`: SwiftUI app.
 - `EasySplatCore/`: core library (pipeline + toolchain integration).
 - `Tools/ManifestTool/`: Swift CLI to generate keypairs and sign manifests.
+- `Tools/MapAnythingSfm/`: Python package shipped in the toolchain (MapAnything -> COLMAP bridge).
 - `Tools/VggtSfm/`: Python package shipped in the toolchain (VGGT → COLMAP bridge).
 - `Tools/FastVggtSfm/`: Python package shipped in the toolchain (FastVGGT → COLMAP seed export).
 - `ThirdParty/MetalSplatter/`: vendored SwiftPM dependency.
@@ -37,22 +38,37 @@ Common options:
 - `--rebuild`: force a toolchain rebuild (preserves models when possible).
 - `--version <semver>`: select a toolchain version (default `0.1.0`).
 
-Note: VGGT downloads a large (multi-GB) model the first time the toolchain is built.
+Note: MapAnything and VGGT-family bundles download large model files the first time the toolchain is built.
 
 Backward-compatible wrappers are still available (`./scripts/dev_run.sh`, `./scripts/run_fast.sh`), but `./scripts/run.sh` is the recommended entry point.
 
-## SfM Backend Defaults (GLOMAP-First)
+## SfM Backend Defaults (MapAnything-First)
 
 Default SfM path:
-- `sfmFeatures`/`sfmMatching`: COLMAP feature extraction + matching.
-- `sfmMapping`: COLMAP `global_mapper` (GLOMAP) first.
-- Fallback order: `global_mapper (GPU-preferred)` -> `global_mapper (GPU disabled on GPU failure)` -> `mapper`.
-- There is no solver fallback beyond `mapper`.
+- `sfmFeatures`: MapAnything runs first.
+- Small jobs on capable hardware use direct sparse export.
+- Larger jobs and lower-memory machines use MapAnything seed export, then COLMAP feature extraction, matching, triangulation, bundle adjustment, and mapper fallback only if refinement still comes up short.
+- Fallback order for the default path: `mapanything` -> `colmap/global_mapper` -> `colmap/mapper`.
 
 Backend selection:
-- Unset `EASYSPLAT_SFM_BACKEND` now resolves to COLMAP/GLOMAP-first.
-- `EASYSPLAT_SFM_BACKEND=colmap` (or `glomap` / `global_mapper`) runs the default integrated COLMAP path.
+- Unset `EASYSPLAT_SFM_BACKEND` now resolves to MapAnything-first with COLMAP fallback.
+- `EASYSPLAT_SFM_BACKEND=mapanything` runs the default integrated path explicitly.
+- `EASYSPLAT_SFM_BACKEND=colmap` (or `glomap` / `global_mapper`) runs the legacy integrated COLMAP path directly.
 - `EASYSPLAT_SFM_BACKEND=fastvggt` and `EASYSPLAT_SFM_BACKEND=vggt` still work, but are deprecated runtime paths.
+
+MapAnything tuning envs:
+- `EASYSPLAT_MAPANYTHING_DEVICE=mps|cpu`
+- `EASYSPLAT_MAPANYTHING_CHECKPOINT=map-anything-apache`
+- `EASYSPLAT_MAPANYTHING_RESOLUTION=512|518`
+- `EASYSPLAT_MAPANYTHING_MEMORY_EFFICIENT=0|1`
+- `EASYSPLAT_MAPANYTHING_MINIBATCH_SIZE=<n>`
+- `EASYSPLAT_MAPANYTHING_USE_AMP=0|1` for manual CUDA-only runs; the Apple Silicon app path keeps AMP disabled on MPS/CPU
+- `EASYSPLAT_MAPANYTHING_MAX_POINTS=<n>`
+- `EASYSPLAT_MAPANYTHING_CAMERA_TYPE=SIMPLE_RADIAL|SIMPLE_PINHOLE|PINHOLE|OPENCV`
+- `EASYSPLAT_MAPANYTHING_SHARED_CAMERA=0|1`
+- `EASYSPLAT_MAPANYTHING_ANCHOR_MAX_VIEWS=<n>`
+- `EASYSPLAT_MAPANYTHING_WINDOW_SIZE=<n>`
+- `EASYSPLAT_MAPANYTHING_WINDOW_OVERLAP=<n>`
 
 Global mapper tuning envs:
 - `EASYSPLAT_GLOBAL_MAPPER_THREADS=<n>`
@@ -138,7 +154,7 @@ python3 -m http.server 8000
   - `git`, `cmake`, `ninja`
   - COLMAP deps (e.g. Eigen, Ceres, Boost, Glog, Gflags, OpenCV, SQLite3)
   - Rust toolchain (for Brush)
-  - Network access for large downloads (VGGT model + Python wheels)
+  - Network access for large downloads (MapAnything, VGGT-family, and Python wheels)
   - `create-dmg` (for DMG packaging)
 
 ## Release (GitHub Actions)
@@ -159,6 +175,7 @@ If you change toolchain artifact naming/layout (e.g. core/models split), update 
 ./scripts/toolchain/build_openssl.sh
 ./scripts/toolchain/build_colmap.sh
 ./scripts/toolchain/build_brush.sh
+./scripts/toolchain/build_mapanything_mps.sh
 ./scripts/toolchain/build_vggt_mps.sh
 ./scripts/toolchain/build_fastvggt_mps.sh
 ./scripts/toolchain/package_toolchain.sh --version 0.1.0

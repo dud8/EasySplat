@@ -145,7 +145,15 @@ public final class FastVggtSfmRunner: @unchecked Sendable, FastVggtSfmRunning {
         environment["PYTHONUNBUFFERED"] = "1"
         environment["TORCH_HOME"] = toolchain.models.path
         environment["EASYSPLAT_FASTVGGT_MODELS_DIR"] = toolchain.models.path
+        environment["HF_HUB_OFFLINE"] = "1"
+        environment["TRANSFORMERS_OFFLINE"] = "1"
+        environment["HF_HUB_DISABLE_TELEMETRY"] = "1"
+        environment["DO_NOT_TRACK"] = "1"
         environment["KMP_DUPLICATE_LIB_OK"] = "TRUE"
+        environment["TOKENIZERS_PARALLELISM"] = "false"
+        if environment["PYTORCH_ENABLE_MPS_FALLBACK"] == nil {
+            environment["PYTORCH_ENABLE_MPS_FALLBACK"] = "1"
+        }
 
         let pythonBin = toolchain.python.deletingLastPathComponent().path
         if let existingPath = environment["PATH"] {

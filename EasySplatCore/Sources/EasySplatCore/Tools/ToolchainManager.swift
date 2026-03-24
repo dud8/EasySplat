@@ -6,8 +6,27 @@ public struct ToolchainPaths: Sendable {
     public var colmap: URL
     public var glomap: URL
     public var brush: URL
+    public var mapanything: MapAnythingToolchain
     public var vggt: VggtToolchain
     public var fastvggt: FastVggtToolchain
+
+    public init(
+        root: URL,
+        colmap: URL,
+        glomap: URL,
+        brush: URL,
+        mapanything: MapAnythingToolchain,
+        vggt: VggtToolchain,
+        fastvggt: FastVggtToolchain
+    ) {
+        self.root = root
+        self.colmap = colmap
+        self.glomap = glomap
+        self.brush = brush
+        self.mapanything = mapanything
+        self.vggt = vggt
+        self.fastvggt = fastvggt
+    }
 
     public init(
         root: URL,
@@ -17,12 +36,42 @@ public struct ToolchainPaths: Sendable {
         vggt: VggtToolchain,
         fastvggt: FastVggtToolchain
     ) {
+        let mapAnythingRoot = root.appendingPathComponent("mapanything_mps", isDirectory: true)
+        let mapanything = MapAnythingToolchain(
+            root: mapAnythingRoot,
+            sfmTool: mapAnythingRoot.appendingPathComponent("bin/easysplat_mapanything_sfm"),
+            python: mapAnythingRoot.appendingPathComponent("python/bin/python3"),
+            models: mapAnythingRoot.appendingPathComponent("models", isDirectory: true),
+            modelBundle: mapAnythingRoot.appendingPathComponent("models/map-anything-apache", isDirectory: true),
+            dinov2Weights: mapAnythingRoot.appendingPathComponent("models/dinov2/dinov2_vitg14_pretrain.pth")
+        )
+        self.init(
+            root: root,
+            colmap: colmap,
+            glomap: glomap,
+            brush: brush,
+            mapanything: mapanything,
+            vggt: vggt,
+            fastvggt: fastvggt
+        )
+    }
+}
+
+public struct MapAnythingToolchain: Sendable {
+    public var root: URL
+    public var sfmTool: URL
+    public var python: URL
+    public var models: URL
+    public var modelBundle: URL
+    public var dinov2Weights: URL
+
+    public init(root: URL, sfmTool: URL, python: URL, models: URL, modelBundle: URL, dinov2Weights: URL) {
         self.root = root
-        self.colmap = colmap
-        self.glomap = glomap
-        self.brush = brush
-        self.vggt = vggt
-        self.fastvggt = fastvggt
+        self.sfmTool = sfmTool
+        self.python = python
+        self.models = models
+        self.modelBundle = modelBundle
+        self.dinov2Weights = dinov2Weights
     }
 }
 
@@ -151,7 +200,19 @@ public final class ToolchainManager: @unchecked Sendable, ToolchainManaging {
         }
 
         onProgress(-1.0, "Checking installed tools")
-        let manifest = try await downloadManifest(url: manifestURL)
+        let manifest: ToolchainManifest
+        do {
+            manifest = try await downloadManifest(url: manifestURL)
+        } catch {
+            if shouldAttemptOfflineFallback(forManifestError: error) {
+                onProgress(-1.0, "Trying cached tools")
+                if let cached = try? loadBestCachedToolchain() {
+                    onProgress(1.0, "Tools ready (offline cached)")
+                    return cached
+                }
+            }
+            throw error
+        }
         guard manifest.verifying(publicKeyBase64: publicKeyBase64) else {
             throw ToolchainError.signatureFailed
         }
@@ -168,14 +229,9 @@ public final class ToolchainManager: @unchecked Sendable, ToolchainManaging {
 
         // Backward compatible: older manifests shipped a single monolithic artifact ("macos-arm64").
         if let artifact = manifest.artifacts.first(where: { $0.name == targetName }) {
-            do {
-                if fileManager.fileExists(atPath: versionedRoot.path) {
-                    try? fileManager.removeItem(at: versionedRoot)
-                }
-                try fileManager.createDirectory(at: versionedRoot, withIntermediateDirectories: true)
-
+            let toolchain = try await installToolchainAtomically(versionedRoot: versionedRoot, onProgress: onProgress) { stagingRoot in
                 let artifactURL = try validatedArtifactURL(artifact.url)
-                let zipURL = versionedRoot.appendingPathComponent("toolchain.zip")
+                let zipURL = stagingRoot.appendingPathComponent("toolchain.zip")
                 try await downloadFile(url: artifactURL, to: zipURL, label: "Downloading tools", onProgress: onProgress)
 
                 let computedHash = try sha256Hex(url: zipURL)
@@ -183,18 +239,19 @@ public final class ToolchainManager: @unchecked Sendable, ToolchainManaging {
                     throw ToolchainError.hashMismatch
                 }
 
-                onProgress(-1.0, "Unpacking tools")
-                try unzip(zipURL: zipURL, to: versionedRoot)
-                try fileManager.removeItem(at: zipURL)
-
-                onProgress(-1.0, "Validating tools")
-                let toolchain = try validateToolchain(root: versionedRoot)
-                onProgress(1.0, "Tools ready")
-                return toolchain
-            } catch {
-                try? fileManager.removeItem(at: versionedRoot)
-                throw error
+                let unpackMessage = "Unpacking tools"
+                onProgress(-1.0, unpackMessage)
+                try unzip(zipURL: zipURL, to: stagingRoot)
+                try? fileManager.removeItem(at: zipURL)
+                try enforceExpectedContents(
+                    artifact: artifact,
+                    root: stagingRoot,
+                    unpackMessage: unpackMessage,
+                    onProgress: onProgress
+                )
             }
+            onProgress(1.0, "Tools ready")
+            return toolchain
         }
 
         // Split toolchain: keep core binaries/env small-ish, ship model weights separately.
@@ -205,19 +262,190 @@ public final class ToolchainManager: @unchecked Sendable, ToolchainManaging {
             throw ToolchainError.artifactNotFound
         }
 
-        do {
-            try fileManager.createDirectory(at: versionedRoot, withIntermediateDirectories: true)
+        let toolchain = try await installToolchainAtomically(versionedRoot: versionedRoot, onProgress: onProgress) { stagingRoot in
+            var state = loadInstallState(root: stagingRoot)
+            try await ensureArtifact(coreArtifact, root: stagingRoot, state: &state, onProgress: onProgress)
+            try await ensureArtifact(modelsArtifact, root: stagingRoot, state: &state, onProgress: onProgress)
+        }
+        onProgress(1.0, "Tools ready")
+        return toolchain
+    }
 
-            var state = loadInstallState(root: versionedRoot)
-            try await ensureArtifact(coreArtifact, root: versionedRoot, state: &state, onProgress: onProgress)
-            try await ensureArtifact(modelsArtifact, root: versionedRoot, state: &state, onProgress: onProgress)
+    private func shouldAttemptOfflineFallback(forManifestError error: Error) -> Bool {
+        if let toolchainError = error as? ToolchainError {
+            switch toolchainError {
+            case .downloadFailed, .invalidManifest:
+                return true
+            default:
+                return false
+            }
+        }
+        if error is URLError {
+            return true
+        }
+        return false
+    }
+
+    private func loadBestCachedToolchain() throws -> ToolchainPaths? {
+        let root = try toolchainRootURL()
+        guard fileManager.fileExists(atPath: root.path) else {
+            return nil
+        }
+
+        let entries = try fileManager.contentsOfDirectory(
+            at: root,
+            includingPropertiesForKeys: [.isDirectoryKey, .contentModificationDateKey],
+            options: [.skipsHiddenFiles]
+        )
+
+        struct Candidate {
+            var url: URL
+            var semanticVersion: [Int]?
+            var modifiedAt: Date
+        }
+
+        var candidates: [Candidate] = []
+        candidates.reserveCapacity(entries.count)
+        for entry in entries {
+            let values = try? entry.resourceValues(forKeys: [.isDirectoryKey, .contentModificationDateKey])
+            guard values?.isDirectory == true else { continue }
+            let name = entry.lastPathComponent
+            if name.hasPrefix(".") { continue }
+            if name.contains(".staging-") || name.contains(".backup-") { continue }
+            candidates.append(
+                Candidate(
+                    url: entry,
+                    semanticVersion: semanticVersionComponents(from: name),
+                    modifiedAt: values?.contentModificationDate ?? .distantPast
+                )
+            )
+        }
+
+        candidates.sort { lhs, rhs in
+            switch (lhs.semanticVersion, rhs.semanticVersion) {
+            case let (.some(left), .some(right)):
+                let cmp = compareSemanticVersions(left, right)
+                if cmp != .orderedSame {
+                    return cmp == .orderedDescending
+                }
+            case (.some, .none):
+                return true
+            case (.none, .some):
+                return false
+            case (.none, .none):
+                break
+            }
+            if lhs.modifiedAt != rhs.modifiedAt {
+                return lhs.modifiedAt > rhs.modifiedAt
+            }
+            return lhs.url.lastPathComponent > rhs.url.lastPathComponent
+        }
+
+        for candidate in candidates {
+            if let toolchain = try? validateToolchain(root: candidate.url) {
+                return toolchain
+            }
+        }
+        return nil
+    }
+
+    private func semanticVersionComponents(from value: String) -> [Int]? {
+        let core = value.split(separator: "+", maxSplits: 1, omittingEmptySubsequences: false).first ?? Substring(value)
+        let withoutPrerelease = core.split(separator: "-", maxSplits: 1, omittingEmptySubsequences: false).first ?? core
+        let parts = withoutPrerelease.split(separator: ".", omittingEmptySubsequences: false)
+        guard parts.count >= 2 else { return nil }
+
+        var numbers: [Int] = []
+        numbers.reserveCapacity(parts.count)
+        for part in parts {
+            guard !part.isEmpty, let number = Int(part), number >= 0 else {
+                return nil
+            }
+            numbers.append(number)
+        }
+        return numbers
+    }
+
+    private func compareSemanticVersions(_ lhs: [Int], _ rhs: [Int]) -> ComparisonResult {
+        let count = max(lhs.count, rhs.count)
+        for index in 0..<count {
+            let left = index < lhs.count ? lhs[index] : 0
+            let right = index < rhs.count ? rhs[index] : 0
+            if left > right { return .orderedDescending }
+            if left < right { return .orderedAscending }
+        }
+        return .orderedSame
+    }
+
+    private func installToolchainAtomically(
+        versionedRoot: URL,
+        onProgress: @escaping @Sendable (Double, String) -> Void,
+        installInto stagingInstall: (_ stagingRoot: URL) async throws -> Void
+    ) async throws -> ToolchainPaths {
+        let stagingRoot = versionedRoot.deletingLastPathComponent().appendingPathComponent(
+            "\(versionedRoot.lastPathComponent).staging-\(UUID().uuidString)",
+            isDirectory: true
+        )
+        let backupRoot = versionedRoot.deletingLastPathComponent().appendingPathComponent(
+            "\(versionedRoot.lastPathComponent).backup-\(UUID().uuidString)",
+            isDirectory: true
+        )
+        var movedExistingToBackup = false
+
+        if fileManager.fileExists(atPath: stagingRoot.path) {
+            try? fileManager.removeItem(at: stagingRoot)
+        }
+        if fileManager.fileExists(atPath: backupRoot.path) {
+            try? fileManager.removeItem(at: backupRoot)
+        }
+
+        do {
+            try fileManager.createDirectory(at: stagingRoot, withIntermediateDirectories: true)
+            try await stagingInstall(stagingRoot)
+
+            if fileManager.fileExists(atPath: versionedRoot.path) {
+                try fileManager.moveItem(at: versionedRoot, to: backupRoot)
+                movedExistingToBackup = true
+            }
+
+            do {
+                try fileManager.moveItem(at: stagingRoot, to: versionedRoot)
+            } catch {
+                if movedExistingToBackup,
+                   !fileManager.fileExists(atPath: versionedRoot.path),
+                   fileManager.fileExists(atPath: backupRoot.path) {
+                    try? fileManager.moveItem(at: backupRoot, to: versionedRoot)
+                }
+                throw error
+            }
 
             onProgress(-1.0, "Validating tools")
-            let toolchain = try validateToolchain(root: versionedRoot)
-            onProgress(1.0, "Tools ready")
-            return toolchain
+            do {
+                let toolchain = try validateToolchain(root: versionedRoot)
+                if movedExistingToBackup, fileManager.fileExists(atPath: backupRoot.path) {
+                    try? fileManager.removeItem(at: backupRoot)
+                }
+                return toolchain
+            } catch {
+                if fileManager.fileExists(atPath: versionedRoot.path) {
+                    try? fileManager.removeItem(at: versionedRoot)
+                }
+                if movedExistingToBackup,
+                   fileManager.fileExists(atPath: backupRoot.path),
+                   !fileManager.fileExists(atPath: versionedRoot.path) {
+                    try? fileManager.moveItem(at: backupRoot, to: versionedRoot)
+                }
+                throw error
+            }
         } catch {
-            try? fileManager.removeItem(at: versionedRoot)
+            if fileManager.fileExists(atPath: stagingRoot.path) {
+                try? fileManager.removeItem(at: stagingRoot)
+            }
+            if movedExistingToBackup,
+               fileManager.fileExists(atPath: backupRoot.path),
+               !fileManager.fileExists(atPath: versionedRoot.path) {
+                try? fileManager.moveItem(at: backupRoot, to: versionedRoot)
+            }
             throw error
         }
     }
@@ -263,9 +491,73 @@ public final class ToolchainManager: @unchecked Sendable, ToolchainManaging {
             throw ToolchainError.invalidToolchain("Brush failed to launch (exit \(brushCheck.exitCode)).")
         }
 
+        let mapAnythingRoot = root.appendingPathComponent("mapanything_mps", isDirectory: true)
+        let mapAnythingSfmTool = mapAnythingRoot.appendingPathComponent("bin/easysplat_mapanything_sfm")
+        let mapAnythingPython = mapAnythingRoot.appendingPathComponent("python/bin/python3")
+        let mapAnythingBuildInfo = mapAnythingRoot.appendingPathComponent("build_info.json")
+        let mapAnythingModels = mapAnythingRoot.appendingPathComponent("models", isDirectory: true)
+        let mapAnythingModelBundle = mapAnythingModels.appendingPathComponent("map-anything-apache", isDirectory: true)
+        let mapAnythingModelFile = mapAnythingModelBundle.appendingPathComponent("model.safetensors")
+        let mapAnythingConfigFile = mapAnythingModelBundle.appendingPathComponent("config.json")
+        let mapAnythingDinov2Weights = mapAnythingModels.appendingPathComponent("dinov2/dinov2_vitg14_pretrain.pth")
+        let mapAnythingAppSentinel = mapAnythingRoot.appendingPathComponent("app/easysplat_mapanything_sfm/run.py")
+        let mapAnythingVendorSentinel = mapAnythingRoot.appendingPathComponent("vendor/mapanything/mapanything/models/mapanything/model.py")
+
+        guard fileManager.fileExists(atPath: mapAnythingSfmTool.path) else {
+            throw ToolchainError.missingBinary("mapanything_mps/bin/easysplat_mapanything_sfm")
+        }
+        guard fileManager.fileExists(atPath: mapAnythingPython.path) else {
+            throw ToolchainError.missingBinary("mapanything_mps/python/bin/python3")
+        }
+        guard fileManager.fileExists(atPath: mapAnythingBuildInfo.path) else {
+            throw ToolchainError.missingLibrary("mapanything_mps/build_info.json")
+        }
+        guard fileManager.fileExists(atPath: mapAnythingAppSentinel.path) else {
+            throw ToolchainError.missingLibrary("mapanything_mps/app/easysplat_mapanything_sfm/run.py")
+        }
+        guard fileManager.fileExists(atPath: mapAnythingModels.path) else {
+            throw ToolchainError.missingLibrary("mapanything_mps/models")
+        }
+        guard fileManager.fileExists(atPath: mapAnythingModelFile.path) else {
+            throw ToolchainError.missingLibrary("mapanything_mps/models/map-anything-apache/model.safetensors")
+        }
+        guard fileManager.fileExists(atPath: mapAnythingConfigFile.path) else {
+            throw ToolchainError.missingLibrary("mapanything_mps/models/map-anything-apache/config.json")
+        }
+        guard fileManager.fileExists(atPath: mapAnythingDinov2Weights.path) else {
+            throw ToolchainError.missingLibrary("mapanything_mps/models/dinov2/dinov2_vitg14_pretrain.pth")
+        }
+        guard fileManager.fileExists(atPath: mapAnythingVendorSentinel.path) else {
+            throw ToolchainError.missingLibrary("mapanything_mps/vendor/mapanything")
+        }
+
+        ensureExecutable(at: mapAnythingSfmTool)
+        ensureExecutable(at: mapAnythingPython)
+        try validateBuildInfo(at: mapAnythingBuildInfo, expectedToolchainName: "mapanything_mps")
+
+        let mapAnythingPythonArch = try? runner.run("/usr/bin/file", [mapAnythingPython.path])
+        if let output = mapAnythingPythonArch?.stdout.lowercased(), !output.contains("arm64") {
+            throw ToolchainError.invalidToolchain("mapanything_mps python is not arm64 (Rosetta build detected).")
+        }
+        let mapAnythingCheck = try runner.run(mapAnythingSfmTool.path, ["--help"])
+        guard mapAnythingCheck.exitCode == 0 else {
+            throw ToolchainError.invalidToolchain("mapanything_mps failed to launch (exit \(mapAnythingCheck.exitCode)).")
+        }
+
+        let mapanything = MapAnythingToolchain(
+            root: mapAnythingRoot,
+            sfmTool: mapAnythingSfmTool,
+            python: mapAnythingPython,
+            models: mapAnythingModels,
+            modelBundle: mapAnythingModelBundle,
+            dinov2Weights: mapAnythingDinov2Weights
+        )
+
         let vggtRoot = root.appendingPathComponent("vggt_mps", isDirectory: true)
         let vggtSfmTool = vggtRoot.appendingPathComponent("bin/easysplat_vggt_sfm")
         let vggtPython = vggtRoot.appendingPathComponent("python/bin/python3")
+        let vggtBuildInfo = vggtRoot.appendingPathComponent("build_info.json")
+        let vggtAppSentinel = vggtRoot.appendingPathComponent("app/easysplat_vggt_sfm/run.py")
         let vggtModels = vggtRoot.appendingPathComponent("models", isDirectory: true)
         let vggtModelFile = vggtModels.appendingPathComponent("vggt_model.pt")
         // Upstream VGGT uses namespace packages (no __init__.py), so validate via a stable module file.
@@ -276,6 +568,12 @@ public final class ToolchainManager: @unchecked Sendable, ToolchainManaging {
         }
         guard fileManager.fileExists(atPath: vggtPython.path) else {
             throw ToolchainError.missingBinary("vggt_mps/python/bin/python3")
+        }
+        guard fileManager.fileExists(atPath: vggtBuildInfo.path) else {
+            throw ToolchainError.missingLibrary("vggt_mps/build_info.json")
+        }
+        guard fileManager.fileExists(atPath: vggtAppSentinel.path) else {
+            throw ToolchainError.missingLibrary("vggt_mps/app/easysplat_vggt_sfm/run.py")
         }
         guard fileManager.fileExists(atPath: vggtModels.path) else {
             throw ToolchainError.missingLibrary("vggt_mps/models")
@@ -289,10 +587,15 @@ public final class ToolchainManager: @unchecked Sendable, ToolchainManaging {
 
         ensureExecutable(at: vggtSfmTool)
         ensureExecutable(at: vggtPython)
+        try validateBuildInfo(at: vggtBuildInfo, expectedToolchainName: "vggt_mps")
 
         let vggtPythonArch = try? runner.run("/usr/bin/file", [vggtPython.path])
         if let output = vggtPythonArch?.stdout.lowercased(), !output.contains("arm64") {
             throw ToolchainError.invalidToolchain("vggt_mps python is not arm64 (Rosetta build detected).")
+        }
+        let vggtCheck = try runner.run(vggtSfmTool.path, ["--help"])
+        guard vggtCheck.exitCode == 0 else {
+            throw ToolchainError.invalidToolchain("vggt_mps failed to launch (exit \(vggtCheck.exitCode)).")
         }
 
         let vggt = VggtToolchain(
@@ -305,6 +608,8 @@ public final class ToolchainManager: @unchecked Sendable, ToolchainManaging {
         let fastvggtRoot = root.appendingPathComponent("fastvggt_mps", isDirectory: true)
         let fastvggtSfmTool = fastvggtRoot.appendingPathComponent("bin/easysplat_fastvggt_sfm")
         let fastvggtPython = fastvggtRoot.appendingPathComponent("python/bin/python3")
+        let fastvggtBuildInfo = fastvggtRoot.appendingPathComponent("build_info.json")
+        let fastvggtAppSentinel = fastvggtRoot.appendingPathComponent("app/easysplat_fastvggt_sfm/run.py")
         let fastvggtModels = fastvggtRoot.appendingPathComponent("models", isDirectory: true)
         let fastvggtModelFile = fastvggtModels.appendingPathComponent("fastvggt_model.pt")
         let fastvggtVendorSentinel = fastvggtRoot.appendingPathComponent("vendor/fastvggt/vggt/models/vggt.py")
@@ -314,6 +619,12 @@ public final class ToolchainManager: @unchecked Sendable, ToolchainManaging {
         }
         guard fileManager.fileExists(atPath: fastvggtPython.path) else {
             throw ToolchainError.missingBinary("fastvggt_mps/python/bin/python3")
+        }
+        guard fileManager.fileExists(atPath: fastvggtBuildInfo.path) else {
+            throw ToolchainError.missingLibrary("fastvggt_mps/build_info.json")
+        }
+        guard fileManager.fileExists(atPath: fastvggtAppSentinel.path) else {
+            throw ToolchainError.missingLibrary("fastvggt_mps/app/easysplat_fastvggt_sfm/run.py")
         }
         guard fileManager.fileExists(atPath: fastvggtModels.path) else {
             throw ToolchainError.missingLibrary("fastvggt_mps/models")
@@ -327,10 +638,15 @@ public final class ToolchainManager: @unchecked Sendable, ToolchainManaging {
 
         ensureExecutable(at: fastvggtSfmTool)
         ensureExecutable(at: fastvggtPython)
+        try validateBuildInfo(at: fastvggtBuildInfo, expectedToolchainName: "fastvggt_mps")
 
         let fastvggtPythonArch = try? runner.run("/usr/bin/file", [fastvggtPython.path])
         if let output = fastvggtPythonArch?.stdout.lowercased(), !output.contains("arm64") {
             throw ToolchainError.invalidToolchain("fastvggt_mps python is not arm64 (Rosetta build detected).")
+        }
+        let fastvggtCheck = try runner.run(fastvggtSfmTool.path, ["--help"])
+        guard fastvggtCheck.exitCode == 0 else {
+            throw ToolchainError.invalidToolchain("fastvggt_mps failed to launch (exit \(fastvggtCheck.exitCode)).")
         }
 
         let fastvggt = FastVggtToolchain(
@@ -349,6 +665,7 @@ public final class ToolchainManager: @unchecked Sendable, ToolchainManaging {
             colmap: colmap,
             glomap: glomap,
             brush: brush,
+            mapanything: mapanything,
             vggt: vggt,
             fastvggt: fastvggt
         )
@@ -358,6 +675,54 @@ public final class ToolchainManager: @unchecked Sendable, ToolchainManaging {
         guard fileManager.fileExists(atPath: url.path) else { return }
         if fileManager.isExecutableFile(atPath: url.path) { return }
         try? fileManager.setAttributes([.posixPermissions: 0o755], ofItemAtPath: url.path)
+    }
+
+    private func validateBuildInfo(at url: URL, expectedToolchainName: String) throws {
+        let data: Data
+        do {
+            data = try Data(contentsOf: url)
+        } catch {
+            throw ToolchainError.invalidToolchain("\(expectedToolchainName) build_info.json could not be read.")
+        }
+
+        let object: Any
+        do {
+            object = try JSONSerialization.jsonObject(with: data)
+        } catch {
+            throw ToolchainError.invalidToolchain("\(expectedToolchainName) build_info.json is not valid JSON.")
+        }
+
+        guard let payload = object as? [String: Any] else {
+            throw ToolchainError.invalidToolchain("\(expectedToolchainName) build_info.json must contain a JSON object.")
+        }
+
+        let requiredKeys = [
+            "toolchain_name",
+            "source_path",
+            "python_version",
+            "torch_version",
+            "torchvision_version",
+        ]
+        let missingKeys = requiredKeys.filter {
+            guard let value = payload[$0] else { return true }
+            if let text = value as? String {
+                return text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            }
+            return false
+        }
+        if !missingKeys.isEmpty {
+            throw ToolchainError.invalidToolchain(
+                "\(expectedToolchainName) build_info.json is missing required keys: \(missingKeys.joined(separator: ", "))."
+            )
+        }
+
+        let toolchainName = (payload["toolchain_name"] as? String)?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        guard toolchainName == expectedToolchainName else {
+            throw ToolchainError.invalidToolchain(
+                "\(expectedToolchainName) build_info.json toolchain_name mismatch (got \(toolchainName ?? "nil"))."
+            )
+        }
     }
 
     private func fileHasShebang(at url: URL) -> Bool {
@@ -477,14 +842,16 @@ public final class ToolchainManager: @unchecked Sendable, ToolchainManaging {
     }
 
     private func downloadManifest(url: URL) async throws -> ToolchainManifest {
-        let (data, response) = try await urlSession.data(from: url)
-        guard (response as? HTTPURLResponse)?.statusCode == 200 else { throw ToolchainError.downloadFailed }
-        let decoder = JSONDecoder()
-        decoder.dateDecodingStrategy = .iso8601
-        guard let manifest = try? decoder.decode(ToolchainManifest.self, from: data) else {
-            throw ToolchainError.invalidManifest
+        try await withTransientRetries {
+            let (data, response) = try await urlSession.data(from: url)
+            guard (response as? HTTPURLResponse)?.statusCode == 200 else { throw ToolchainError.downloadFailed }
+            let decoder = JSONDecoder()
+            decoder.dateDecodingStrategy = .iso8601
+            guard let manifest = try? decoder.decode(ToolchainManifest.self, from: data) else {
+                throw ToolchainError.invalidManifest
+            }
+            return manifest
         }
-        return manifest
     }
 
     private func downloadFile(
@@ -493,21 +860,106 @@ public final class ToolchainManager: @unchecked Sendable, ToolchainManaging {
         label: String,
         onProgress: @escaping @Sendable (Double, String) -> Void
     ) async throws {
-        do {
-            if shouldUseDataTaskForTests() {
-                try await downloadFileViaDataTask(url: url, to: destination, label: label, onProgress: onProgress)
-                return
+        try await withTransientRetries(onRetry: { nextAttempt, _ in
+            onProgress(-1.0, "Retrying \(label) (\(nextAttempt)/3)")
+        }) {
+            do {
+                if shouldUseDataTaskForTests() {
+                    try await downloadFileViaDataTask(url: url, to: destination, label: label, onProgress: onProgress)
+                    return
+                }
+                try await downloadFileViaDownloadTask(url: url, to: destination, label: label, onProgress: onProgress)
+            } catch is CancellationError {
+                throw CancellationError()
+            } catch let error as ToolchainError {
+                throw error
+            } catch let error as URLError {
+                throw error
+            } catch {
+                throw ToolchainError.fileIOFailed("Failed to write toolchain to disk. \(error.localizedDescription)")
             }
-            try await downloadFileViaDownloadTask(url: url, to: destination, label: label, onProgress: onProgress)
-        } catch is CancellationError {
-            throw CancellationError()
-        } catch let error as ToolchainError {
-            throw error
-        } catch let error as URLError {
-            throw error
-        } catch {
-            throw ToolchainError.fileIOFailed("Failed to write toolchain to disk. \(error.localizedDescription)")
         }
+    }
+
+    private func withTransientRetries<T>(
+        maxAttempts: Int = 3,
+        onRetry: ((Int, Error) -> Void)? = nil,
+        operation: () async throws -> T
+    ) async throws -> T {
+        precondition(maxAttempts >= 1)
+        var attempt = 1
+        var delay = retryInitialDelayNanoseconds()
+
+        while true {
+            do {
+                return try await operation()
+            } catch is CancellationError {
+                throw CancellationError()
+            } catch {
+                if attempt >= maxAttempts || !isTransientRetryable(error) {
+                    throw error
+                }
+                let nextAttempt = attempt + 1
+                onRetry?(nextAttempt, error)
+                if delay > 0 {
+                    try await Task.sleep(nanoseconds: delay)
+                }
+                if delay > 0 {
+                    let doubled: UInt64
+                    if delay > UInt64.max / 2 {
+                        doubled = UInt64.max
+                    } else {
+                        doubled = delay * 2
+                    }
+                    delay = min(doubled, retryMaxDelayNanoseconds())
+                }
+                attempt = nextAttempt
+            }
+        }
+    }
+
+    private func isTransientRetryable(_ error: Error) -> Bool {
+        if let urlError = error as? URLError {
+            return isTransient(urlError)
+        }
+        if let toolchainError = error as? ToolchainError {
+            switch toolchainError {
+            case .downloadFailed, .invalidManifest:
+                return true
+            default:
+                return false
+            }
+        }
+        return false
+    }
+
+    private func isTransient(_ error: URLError) -> Bool {
+        switch error.code {
+        case .timedOut,
+             .cannotFindHost,
+             .cannotConnectToHost,
+             .networkConnectionLost,
+             .dnsLookupFailed,
+             .notConnectedToInternet,
+             .internationalRoamingOff,
+             .callIsActive,
+             .dataNotAllowed,
+             .cannotLoadFromNetwork,
+             .secureConnectionFailed,
+             .resourceUnavailable,
+             .backgroundSessionWasDisconnected:
+            return true
+        default:
+            return false
+        }
+    }
+
+    private func retryInitialDelayNanoseconds() -> UInt64 {
+        shouldUseDataTaskForTests() ? 0 : 250_000_000
+    }
+
+    private func retryMaxDelayNanoseconds() -> UInt64 {
+        shouldUseDataTaskForTests() ? 0 : 2_000_000_000
     }
 
     private func downloadFileViaDataTask(
@@ -671,10 +1123,11 @@ public final class ToolchainManager: @unchecked Sendable, ToolchainManaging {
 
         try unzip(zipURL: zipURL, to: root)
         try? fileManager.removeItem(at: zipURL)
-        let contentsCheck = expectedContentsCheck(artifact: artifact, root: root)
-        onProgress(
-            -1.0,
-            "\(unpackMessage): found \(contentsCheck.found)/\(contentsCheck.expected) expected files"
+        try enforceExpectedContents(
+            artifact: artifact,
+            root: root,
+            unpackMessage: unpackMessage,
+            onProgress: onProgress
         )
 
         state.installedArtifacts[name] = artifact.sha256
@@ -696,9 +1149,10 @@ public final class ToolchainManager: @unchecked Sendable, ToolchainManaging {
     private func expectedContentsCheck(
         artifact: ToolchainManifest.Artifact,
         root: URL
-    ) -> (found: Int, expected: Int) {
+    ) -> (found: Int, expected: Int, missing: [String]) {
         var expected = 0
         var found = 0
+        var missing: [String] = []
         for rawPath in artifact.contents {
             var normalized = rawPath.trimmingCharacters(in: .whitespacesAndNewlines)
             while normalized.hasPrefix("/") {
@@ -712,9 +1166,33 @@ public final class ToolchainManager: @unchecked Sendable, ToolchainManaging {
             let expectedURL = root.appendingPathComponent(normalized)
             if fileManager.fileExists(atPath: expectedURL.path) {
                 found += 1
+            } else {
+                missing.append(normalized)
             }
         }
-        return (found, expected)
+        return (found, expected, missing)
+    }
+
+    private func enforceExpectedContents(
+        artifact: ToolchainManifest.Artifact,
+        root: URL,
+        unpackMessage: String,
+        onProgress: @escaping @Sendable (Double, String) -> Void
+    ) throws {
+        let contentsCheck = expectedContentsCheck(artifact: artifact, root: root)
+        onProgress(
+            -1.0,
+            "\(unpackMessage): found \(contentsCheck.found)/\(contentsCheck.expected) expected files"
+        )
+        guard contentsCheck.expected > 0, !contentsCheck.missing.isEmpty else {
+            return
+        }
+        let missingPreview = contentsCheck.missing.prefix(5).joined(separator: ", ")
+        let remaining = contentsCheck.missing.count - min(5, contentsCheck.missing.count)
+        let suffix = remaining > 0 ? " (+\(remaining) more)" : ""
+        throw ToolchainError.invalidToolchain(
+            "Artifact '\(artifact.name)' is missing expected files: \(missingPreview)\(suffix)."
+        )
     }
 
     private func artifactLooksInstalled(name: String, root: URL) -> Bool {
@@ -736,11 +1214,21 @@ public final class ToolchainManager: @unchecked Sendable, ToolchainManaging {
         let vggt = root.appendingPathComponent("vggt_mps", isDirectory: true)
         let vggtSfmTool = vggt.appendingPathComponent("bin/easysplat_vggt_sfm")
         let vggtPython = vggt.appendingPathComponent("python/bin/python3")
+        let vggtBuildInfo = vggt.appendingPathComponent("build_info.json")
+        let vggtAppSentinel = vggt.appendingPathComponent("app/easysplat_vggt_sfm/run.py")
         // Upstream VGGT uses namespace packages (no __init__.py). Validate via a stable module file.
         let vggtVendorSentinel = vggt.appendingPathComponent("vendor/vggt/vggt/models/vggt.py")
+        let mapanything = root.appendingPathComponent("mapanything_mps", isDirectory: true)
+        let mapAnythingSfmTool = mapanything.appendingPathComponent("bin/easysplat_mapanything_sfm")
+        let mapAnythingPython = mapanything.appendingPathComponent("python/bin/python3")
+        let mapAnythingBuildInfo = mapanything.appendingPathComponent("build_info.json")
+        let mapAnythingAppSentinel = mapanything.appendingPathComponent("app/easysplat_mapanything_sfm/run.py")
+        let mapAnythingVendorSentinel = mapanything.appendingPathComponent("vendor/mapanything/mapanything/models/mapanything/model.py")
         let fastvggt = root.appendingPathComponent("fastvggt_mps", isDirectory: true)
         let fastvggtSfmTool = fastvggt.appendingPathComponent("bin/easysplat_fastvggt_sfm")
         let fastvggtPython = fastvggt.appendingPathComponent("python/bin/python3")
+        let fastvggtBuildInfo = fastvggt.appendingPathComponent("build_info.json")
+        let fastvggtAppSentinel = fastvggt.appendingPathComponent("app/easysplat_fastvggt_sfm/run.py")
         let fastvggtVendorSentinel = fastvggt.appendingPathComponent("vendor/fastvggt/vggt/models/vggt.py")
 
         let brushOK: Bool = {
@@ -755,20 +1243,38 @@ public final class ToolchainManager: @unchecked Sendable, ToolchainManaging {
             && brushOK
             && fileManager.fileExists(atPath: libcrypto.path)
             && fileManager.fileExists(atPath: libssl.path)
+            && fileManager.fileExists(atPath: mapAnythingSfmTool.path)
+            && fileManager.fileExists(atPath: mapAnythingPython.path)
+            && fileManager.fileExists(atPath: mapAnythingBuildInfo.path)
+            && fileManager.fileExists(atPath: mapAnythingAppSentinel.path)
+            && fileManager.fileExists(atPath: mapAnythingVendorSentinel.path)
             && fileManager.fileExists(atPath: vggtSfmTool.path)
             && fileManager.fileExists(atPath: vggtPython.path)
+            && fileManager.fileExists(atPath: vggtBuildInfo.path)
+            && fileManager.fileExists(atPath: vggtAppSentinel.path)
             && fileManager.fileExists(atPath: vggtVendorSentinel.path)
             && fileManager.fileExists(atPath: fastvggtSfmTool.path)
             && fileManager.fileExists(atPath: fastvggtPython.path)
+            && fileManager.fileExists(atPath: fastvggtBuildInfo.path)
+            && fileManager.fileExists(atPath: fastvggtAppSentinel.path)
             && fileManager.fileExists(atPath: fastvggtVendorSentinel.path)
     }
 
     private func modelsToolchainLooksInstalled(root: URL) -> Bool {
+        let mapAnythingModel = root
+            .appendingPathComponent("mapanything_mps/models/map-anything-apache/model.safetensors")
+        let mapAnythingConfig = root
+            .appendingPathComponent("mapanything_mps/models/map-anything-apache/config.json")
+        let mapAnythingDinov2 = root
+            .appendingPathComponent("mapanything_mps/models/dinov2/dinov2_vitg14_pretrain.pth")
         let vggtModel = root
             .appendingPathComponent("vggt_mps/models/vggt_model.pt")
         let fastvggtModel = root
             .appendingPathComponent("fastvggt_mps/models/fastvggt_model.pt")
-        return fileManager.fileExists(atPath: vggtModel.path)
+        return fileManager.fileExists(atPath: mapAnythingModel.path)
+            && fileManager.fileExists(atPath: mapAnythingConfig.path)
+            && fileManager.fileExists(atPath: mapAnythingDinov2.path)
+            && fileManager.fileExists(atPath: vggtModel.path)
             && fileManager.fileExists(atPath: fastvggtModel.path)
     }
 }

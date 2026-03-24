@@ -380,6 +380,17 @@ public final class ColmapRunner {
         bundleOptions: ColmapBundleAdjustmentOptions,
         onLog: @escaping @Sendable (String, Bool) -> Void
     ) async throws {
+        let fm = FileManager.default
+        var isDirectory: ObjCBool = false
+        if fm.fileExists(atPath: outputPath.path, isDirectory: &isDirectory) {
+            if !isDirectory.boolValue {
+                try fm.removeItem(at: outputPath)
+                try fm.createDirectory(at: outputPath, withIntermediateDirectories: true)
+            }
+        } else {
+            try fm.createDirectory(at: outputPath, withIntermediateDirectories: true)
+        }
+
         let baseArgs = [
             "bundle_adjuster",
             "--input_path", inputPath.path,
@@ -438,6 +449,32 @@ public final class ColmapRunner {
         try checkResult(result, command: "model_analyzer")
         // COLMAP tools sometimes print reports to stderr even on success; return combined output.
         return [result.stdout, result.stderr].filter { !$0.isEmpty }.joined(separator: "\n")
+    }
+
+    public func runModelConverter(
+        colmapPath: URL,
+        inputPath: URL,
+        outputPath: URL,
+        outputType: String = "TXT",
+        environment: [String: String] = [:],
+        onLog: @escaping @Sendable (String, Bool) -> Void
+    ) throws {
+        let args = [
+            "model_converter",
+            "--input_path", inputPath.path,
+            "--output_path", outputPath.path,
+            "--output_type", outputType
+        ]
+        onLog("EasySplat: colmap argv: \(colmapPath.path) \(args.joined(separator: " "))", false)
+        let result = try runner.run(
+            colmapPath.path,
+            args,
+            currentDirectory: nil,
+            environment: environment,
+            onStdout: { onLog($0, false) },
+            onStderr: { onLog($0, true) }
+        )
+        try checkResult(result, command: "model_converter")
     }
 
     private func checkResult(_ result: SubprocessResult, command: String) throws {

@@ -21,8 +21,11 @@ public struct ProjectPaths: Sendable {
     public var logsURL: URL { root.appendingPathComponent("Logs", isDirectory: true) }
     public var pipelineLogURL: URL { logsURL.appendingPathComponent("pipeline.log") }
     public var eventsLogURL: URL { logsURL.appendingPathComponent("events.jsonl") }
+    public var appEventsLogURL: URL { logsURL.appendingPathComponent("app_events.jsonl") }
     public var colmapLogURL: URL { logsURL.appendingPathComponent("colmap.log") }
     public var glomapLogURL: URL { logsURL.appendingPathComponent("glomap.log") }
+    public var mapanythingLogURL: URL { logsURL.appendingPathComponent("mapanything.log") }
+    public var mapanythingCoverageManifestURL: URL { logsURL.appendingPathComponent("mapanything_coverage_manifest.json") }
     public var vggtLogURL: URL { logsURL.appendingPathComponent("vggt.log") }
     public var fastvggtLogURL: URL { logsURL.appendingPathComponent("fastvggt.log") }
     public var fastvggtCoverageManifestURL: URL { logsURL.appendingPathComponent("fastvggt_coverage_manifest.json") }

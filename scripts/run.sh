@@ -77,9 +77,59 @@ VGGT_MPS_BUILD="$ROOT/scripts/toolchain/build_vggt_mps.sh"
 FASTVGGT_MPS_INSTALL="${FASTVGGT_MPS_INSTALL:-$ROOT/Toolchains/build/fastvggt_mps/install}"
 FASTVGGT_MPS_BUNDLE="$FASTVGGT_MPS_INSTALL/fastvggt_mps"
 FASTVGGT_MPS_BUILD="$ROOT/scripts/toolchain/build_fastvggt_mps.sh"
+MAPANYTHING_MPS_INSTALL="${MAPANYTHING_MPS_INSTALL:-$ROOT/Toolchains/build/mapanything_mps/install}"
+MAPANYTHING_MPS_BUNDLE="$MAPANYTHING_MPS_INSTALL/mapanything_mps"
+MAPANYTHING_MPS_BUILD="$ROOT/scripts/toolchain/build_mapanything_mps.sh"
+
+validate_bundle_build_info() {
+  local python_bin="$1"
+  local build_info="$2"
+  local tool_name="$3"
+  PYTHONNOUSERSITE=1 "$python_bin" - "$build_info" "$tool_name" <<'PY' >/dev/null
+import json
+import sys
+from pathlib import Path
+
+build_info = Path(sys.argv[1])
+tool_name = sys.argv[2]
+required_keys = {
+    "toolchain_name",
+    "source_path",
+    "python_version",
+    "torch_version",
+    "torchvision_version",
+}
+
+payload = json.loads(build_info.read_text(encoding="utf-8"))
+if not isinstance(payload, dict):
+    raise SystemExit(1)
+missing = sorted(key for key in required_keys if not payload.get(key))
+if missing:
+    raise SystemExit(1)
+if payload.get("toolchain_name") != tool_name:
+    raise SystemExit(1)
+PY
+}
+
+copy_mapanything_app_into() {
+  local bundle_root="$1"
+  local source_root="$ROOT/Tools/MapAnythingSfm/easysplat_mapanything_sfm"
+  local app_root="$bundle_root/app"
+  if [ ! -d "$source_root" ]; then
+    echo "MapAnything app source missing at $source_root" >&2
+    exit 1
+  fi
+
+  rm -rf "$app_root"
+  mkdir -p "$app_root"
+  cp -R "$source_root" "$app_root/"
+  find "$app_root" -type d -name "__pycache__" -prune -exec rm -rf {} +
+  find "$app_root" -type f -name "*.pyc" -delete
+}
 
 toolchain_inputs_newer() {
   test -f "$CORE_ZIP" || return 1
+  find "$ROOT/Tools/MapAnythingSfm" -type f -newer "$CORE_ZIP" -print -quit | grep -q . && return 0
   find "$ROOT/Tools/VggtSfm" -type f -newer "$CORE_ZIP" -print -quit | grep -q . && return 0
   find "$ROOT/Tools/FastVggtSfm" -type f -newer "$CORE_ZIP" -print -quit | grep -q . && return 0
   find "$ROOT/scripts/toolchain" -type f -newer "$CORE_ZIP" -print -quit | grep -q . && return 0
@@ -90,11 +140,20 @@ core_zip_valid() {
   test -f "$CORE_ZIP" || return 1
   unzip -l "$CORE_ZIP" | grep -q "bin/colmap" || return 1
   unzip -l "$CORE_ZIP" | grep -q "lib/libcrypto.3.dylib" || return 1
+  unzip -l "$CORE_ZIP" | grep -q "mapanything_mps/bin/easysplat_mapanything_sfm" || return 1
+  unzip -l "$CORE_ZIP" | grep -q "mapanything_mps/python/bin/python3" || return 1
+  unzip -l "$CORE_ZIP" | grep -q "mapanything_mps/build_info.json" || return 1
+  unzip -l "$CORE_ZIP" | grep -q "mapanything_mps/app/easysplat_mapanything_sfm/run.py" || return 1
+  unzip -l "$CORE_ZIP" | grep -q "mapanything_mps/vendor/mapanything/mapanything/models/mapanything/model.py" || return 1
   unzip -l "$CORE_ZIP" | grep -q "vggt_mps/bin/easysplat_vggt_sfm" || return 1
   unzip -l "$CORE_ZIP" | grep -q "vggt_mps/python/bin/python3" || return 1
+  unzip -l "$CORE_ZIP" | grep -q "vggt_mps/build_info.json" || return 1
+  unzip -l "$CORE_ZIP" | grep -q "vggt_mps/app/easysplat_vggt_sfm/run.py" || return 1
   unzip -l "$CORE_ZIP" | grep -q "vggt_mps/vendor/vggt/vggt/models/vggt.py" || return 1
   unzip -l "$CORE_ZIP" | grep -q "fastvggt_mps/bin/easysplat_fastvggt_sfm" || return 1
   unzip -l "$CORE_ZIP" | grep -q "fastvggt_mps/python/bin/python3" || return 1
+  unzip -l "$CORE_ZIP" | grep -q "fastvggt_mps/build_info.json" || return 1
+  unzip -l "$CORE_ZIP" | grep -q "fastvggt_mps/app/easysplat_fastvggt_sfm/run.py" || return 1
   unzip -l "$CORE_ZIP" | grep -q "fastvggt_mps/vendor/fastvggt/vggt/models/vggt.py" || return 1
   unzip -l "$CORE_ZIP" | grep -q "bin/brush.real" || return 1
 
@@ -109,8 +168,59 @@ core_zip_valid() {
 
 models_zip_valid() {
   test -f "$MODELS_ZIP" || return 1
+  unzip -l "$MODELS_ZIP" | grep -q "mapanything_mps/models/map-anything-apache/config\\.json" || return 1
+  unzip -l "$MODELS_ZIP" | grep -q "mapanything_mps/models/map-anything-apache/model\\.safetensors" || return 1
+  unzip -l "$MODELS_ZIP" | grep -q "mapanything_mps/models/dinov2/dinov2_vitg14_pretrain\\.pth" || return 1
   unzip -l "$MODELS_ZIP" | grep -q "vggt_mps/models/vggt_model\\.pt" || return 1
   unzip -l "$MODELS_ZIP" | grep -q "fastvggt_mps/models/fastvggt_model\\.pt" || return 1
+}
+
+ensure_mapanything_mps_bundle() {
+  local build_log="$ROOT/Toolchains/build/mapanything_mps/build.log"
+  mkdir -p "$(dirname "$build_log")"
+  local ok=0
+  if [ -d "$MAPANYTHING_MPS_BUNDLE" ]; then
+    if [ -x "$MAPANYTHING_MPS_BUNDLE/bin/easysplat_mapanything_sfm" ] && \
+       [ -x "$MAPANYTHING_MPS_BUNDLE/python/bin/python3" ] && \
+       [ -f "$MAPANYTHING_MPS_BUNDLE/build_info.json" ] && \
+       [ -f "$MAPANYTHING_MPS_BUNDLE/app/easysplat_mapanything_sfm/run.py" ] && \
+       [ -f "$MAPANYTHING_MPS_BUNDLE/models/map-anything-apache/model.safetensors" ] && \
+       [ -f "$MAPANYTHING_MPS_BUNDLE/models/map-anything-apache/config.json" ] && \
+       [ -f "$MAPANYTHING_MPS_BUNDLE/models/dinov2/dinov2_vitg14_pretrain.pth" ] && \
+       [ -f "$MAPANYTHING_MPS_BUNDLE/vendor/mapanything/mapanything/models/mapanything/model.py" ] && \
+       validate_bundle_build_info "$MAPANYTHING_MPS_BUNDLE/python/bin/python3" "$MAPANYTHING_MPS_BUNDLE/build_info.json" "mapanything_mps"; then
+      ok=1
+    fi
+  fi
+  if [ "$ok" -eq 0 ]; then
+    if [ -x "$MAPANYTHING_MPS_BUILD" ]; then
+      set +e
+      "$MAPANYTHING_MPS_BUILD" 2>&1 | tee "$build_log"
+      local build_status=${PIPESTATUS[0]}
+      set -e
+      if [ "$build_status" -ne 0 ]; then
+        echo "mapanything_mps build failed. See log: $build_log" >&2
+      fi
+    fi
+  fi
+  if [ ! -x "$MAPANYTHING_MPS_BUNDLE/bin/easysplat_mapanything_sfm" ] || \
+     [ ! -x "$MAPANYTHING_MPS_BUNDLE/python/bin/python3" ] || \
+     [ ! -f "$MAPANYTHING_MPS_BUNDLE/build_info.json" ] || \
+     [ ! -f "$MAPANYTHING_MPS_BUNDLE/app/easysplat_mapanything_sfm/run.py" ] || \
+     [ ! -f "$MAPANYTHING_MPS_BUNDLE/models/map-anything-apache/model.safetensors" ] || \
+     [ ! -f "$MAPANYTHING_MPS_BUNDLE/models/map-anything-apache/config.json" ] || \
+     [ ! -f "$MAPANYTHING_MPS_BUNDLE/models/dinov2/dinov2_vitg14_pretrain.pth" ] || \
+     [ ! -f "$MAPANYTHING_MPS_BUNDLE/vendor/mapanything/mapanything/models/mapanything/model.py" ]; then
+    echo "mapanything_mps bundle incomplete at $MAPANYTHING_MPS_BUNDLE." >&2
+    echo "Required: bin/easysplat_mapanything_sfm, python/bin/python3, build_info.json, app/easysplat_mapanything_sfm/run.py, models/map-anything-apache/{config.json,model.safetensors}, models/dinov2/dinov2_vitg14_pretrain.pth, vendor/mapanything/." >&2
+    if [ -x "$MAPANYTHING_MPS_BUILD" ]; then
+      echo "Tried to run $MAPANYTHING_MPS_BUILD, but the bundle is still incomplete." >&2
+      echo "See build log: $build_log" >&2
+    else
+      echo "Provide it via MAPANYTHING_MPS_INSTALL or add a build script at $MAPANYTHING_MPS_BUILD." >&2
+    fi
+    exit 1
+  fi
 }
 
 ensure_vggt_mps_bundle() {
@@ -120,8 +230,11 @@ ensure_vggt_mps_bundle() {
   if [ -d "$VGGT_MPS_BUNDLE" ]; then
     if [ -x "$VGGT_MPS_BUNDLE/bin/easysplat_vggt_sfm" ] && \
        [ -x "$VGGT_MPS_BUNDLE/python/bin/python3" ] && \
+       [ -f "$VGGT_MPS_BUNDLE/build_info.json" ] && \
+       [ -f "$VGGT_MPS_BUNDLE/app/easysplat_vggt_sfm/run.py" ] && \
        [ -f "$VGGT_MPS_BUNDLE/models/vggt_model.pt" ] && \
-       [ -f "$VGGT_MPS_BUNDLE/vendor/vggt/vggt/models/vggt.py" ]; then
+       [ -f "$VGGT_MPS_BUNDLE/vendor/vggt/vggt/models/vggt.py" ] && \
+       validate_bundle_build_info "$VGGT_MPS_BUNDLE/python/bin/python3" "$VGGT_MPS_BUNDLE/build_info.json" "vggt_mps"; then
       ok=1
     fi
   fi
@@ -138,10 +251,12 @@ ensure_vggt_mps_bundle() {
   fi
   if [ ! -x "$VGGT_MPS_BUNDLE/bin/easysplat_vggt_sfm" ] || \
      [ ! -x "$VGGT_MPS_BUNDLE/python/bin/python3" ] || \
+     [ ! -f "$VGGT_MPS_BUNDLE/build_info.json" ] || \
+     [ ! -f "$VGGT_MPS_BUNDLE/app/easysplat_vggt_sfm/run.py" ] || \
      [ ! -f "$VGGT_MPS_BUNDLE/models/vggt_model.pt" ] || \
      [ ! -f "$VGGT_MPS_BUNDLE/vendor/vggt/vggt/models/vggt.py" ]; then
     echo "vggt_mps bundle incomplete at $VGGT_MPS_BUNDLE." >&2
-    echo "Required: bin/easysplat_vggt_sfm, python/bin/python3, models/vggt_model.pt, vendor/vggt/." >&2
+    echo "Required: bin/easysplat_vggt_sfm, python/bin/python3, build_info.json, app/easysplat_vggt_sfm/run.py, models/vggt_model.pt, vendor/vggt/." >&2
     if [ -x "$VGGT_MPS_BUILD" ]; then
       echo "Tried to run $VGGT_MPS_BUILD, but the bundle is still incomplete." >&2
       echo "See build log: $build_log" >&2
@@ -159,8 +274,11 @@ ensure_fastvggt_mps_bundle() {
   if [ -d "$FASTVGGT_MPS_BUNDLE" ]; then
     if [ -x "$FASTVGGT_MPS_BUNDLE/bin/easysplat_fastvggt_sfm" ] && \
        [ -x "$FASTVGGT_MPS_BUNDLE/python/bin/python3" ] && \
+       [ -f "$FASTVGGT_MPS_BUNDLE/build_info.json" ] && \
+       [ -f "$FASTVGGT_MPS_BUNDLE/app/easysplat_fastvggt_sfm/run.py" ] && \
        [ -f "$FASTVGGT_MPS_BUNDLE/models/fastvggt_model.pt" ] && \
-       [ -f "$FASTVGGT_MPS_BUNDLE/vendor/fastvggt/vggt/models/vggt.py" ]; then
+       [ -f "$FASTVGGT_MPS_BUNDLE/vendor/fastvggt/vggt/models/vggt.py" ] && \
+       validate_bundle_build_info "$FASTVGGT_MPS_BUNDLE/python/bin/python3" "$FASTVGGT_MPS_BUNDLE/build_info.json" "fastvggt_mps"; then
       ok=1
     fi
   fi
@@ -177,10 +295,12 @@ ensure_fastvggt_mps_bundle() {
   fi
   if [ ! -x "$FASTVGGT_MPS_BUNDLE/bin/easysplat_fastvggt_sfm" ] || \
      [ ! -x "$FASTVGGT_MPS_BUNDLE/python/bin/python3" ] || \
+     [ ! -f "$FASTVGGT_MPS_BUNDLE/build_info.json" ] || \
+     [ ! -f "$FASTVGGT_MPS_BUNDLE/app/easysplat_fastvggt_sfm/run.py" ] || \
      [ ! -f "$FASTVGGT_MPS_BUNDLE/models/fastvggt_model.pt" ] || \
      [ ! -f "$FASTVGGT_MPS_BUNDLE/vendor/fastvggt/vggt/models/vggt.py" ]; then
     echo "fastvggt_mps bundle incomplete at $FASTVGGT_MPS_BUNDLE." >&2
-    echo "Required: bin/easysplat_fastvggt_sfm, python/bin/python3, models/fastvggt_model.pt, vendor/fastvggt/." >&2
+    echo "Required: bin/easysplat_fastvggt_sfm, python/bin/python3, build_info.json, app/easysplat_fastvggt_sfm/run.py, models/fastvggt_model.pt, vendor/fastvggt/." >&2
     if [ -x "$FASTVGGT_MPS_BUILD" ]; then
       echo "Tried to run $FASTVGGT_MPS_BUILD, but the bundle is still incomplete." >&2
       echo "See build log: $build_log" >&2
@@ -205,6 +325,12 @@ refresh_fastvggt_mps_app() {
   fi
 }
 
+refresh_mapanything_mps_app() {
+  if [ -d "$MAPANYTHING_MPS_BUNDLE" ]; then
+    copy_mapanything_app_into "$MAPANYTHING_MPS_BUNDLE"
+  fi
+}
+
 installed_app_needs_refresh() {
   local root="$1"
   local app_root="$root/vggt_mps/app"
@@ -226,6 +352,34 @@ refresh_installed_vggt_app() {
   if installed_app_needs_refresh "$root"; then
     rm -rf "$root/vggt_mps/app"
     cp -R "$ROOT/Tools/VggtSfm" "$root/vggt_mps/app"
+  fi
+}
+
+mapanything_app_needs_refresh() {
+  local root="$1"
+  local app_root="$root/mapanything_mps/app"
+  local sentinel="$app_root/easysplat_mapanything_sfm/run.py"
+  if [ ! -d "$ROOT/Tools/MapAnythingSfm" ]; then
+    return 1
+  fi
+  if [ ! -d "$root/mapanything_mps" ]; then
+    return 1
+  fi
+  if [ ! -f "$sentinel" ]; then
+    return 0
+  fi
+  find "$ROOT/Tools/MapAnythingSfm/easysplat_mapanything_sfm" \
+    -type f \
+    ! -name "*.pyc" \
+    ! -path "*/__pycache__/*" \
+    -newer "$sentinel" \
+    -print -quit | grep -q .
+}
+
+refresh_installed_mapanything_app() {
+  local root="$1"
+  if mapanything_app_needs_refresh "$root"; then
+    copy_mapanything_app_into "$root/mapanything_mps"
   fi
 }
 
@@ -258,12 +412,27 @@ validate_installed_toolchain() {
   test -x "$root/bin/colmap" || return 1
   test -f "$root/lib/libcrypto.3.dylib" || return 1
   test -f "$root/lib/libssl.3.dylib" || return 1
+  test -x "$root/mapanything_mps/bin/easysplat_mapanything_sfm" || return 1
+  test -x "$root/mapanything_mps/python/bin/python3" || return 1
+  test -f "$root/mapanything_mps/build_info.json" || return 1
+  validate_bundle_build_info "$root/mapanything_mps/python/bin/python3" "$root/mapanything_mps/build_info.json" "mapanything_mps" || return 1
+  test -f "$root/mapanything_mps/app/easysplat_mapanything_sfm/run.py" || return 1
+  test -f "$root/mapanything_mps/models/map-anything-apache/model.safetensors" || return 1
+  test -f "$root/mapanything_mps/models/map-anything-apache/config.json" || return 1
+  test -f "$root/mapanything_mps/models/dinov2/dinov2_vitg14_pretrain.pth" || return 1
+  test -f "$root/mapanything_mps/vendor/mapanything/mapanything/models/mapanything/model.py" || return 1
   test -x "$root/vggt_mps/bin/easysplat_vggt_sfm" || return 1
   test -x "$root/vggt_mps/python/bin/python3" || return 1
+  test -f "$root/vggt_mps/build_info.json" || return 1
+  validate_bundle_build_info "$root/vggt_mps/python/bin/python3" "$root/vggt_mps/build_info.json" "vggt_mps" || return 1
+  test -f "$root/vggt_mps/app/easysplat_vggt_sfm/run.py" || return 1
   test -f "$root/vggt_mps/models/vggt_model.pt" || return 1
   test -f "$root/vggt_mps/vendor/vggt/vggt/models/vggt.py" || return 1
   test -x "$root/fastvggt_mps/bin/easysplat_fastvggt_sfm" || return 1
   test -x "$root/fastvggt_mps/python/bin/python3" || return 1
+  test -f "$root/fastvggt_mps/build_info.json" || return 1
+  validate_bundle_build_info "$root/fastvggt_mps/python/bin/python3" "$root/fastvggt_mps/build_info.json" "fastvggt_mps" || return 1
+  test -f "$root/fastvggt_mps/app/easysplat_fastvggt_sfm/run.py" || return 1
   test -f "$root/fastvggt_mps/models/fastvggt_model.pt" || return 1
   test -f "$root/fastvggt_mps/vendor/fastvggt/vggt/models/vggt.py" || return 1
   if head -c 2 "$root/bin/brush" 2>/dev/null | grep -q "#!"; then
@@ -276,7 +445,11 @@ validate_installed_toolchain() {
 
 models_present() {
   local root="$1"
-  test -f "$root/vggt_mps/models/vggt_model.pt" && test -f "$root/fastvggt_mps/models/fastvggt_model.pt"
+  test -f "$root/mapanything_mps/models/map-anything-apache/model.safetensors" \
+    && test -f "$root/mapanything_mps/models/map-anything-apache/config.json" \
+    && test -f "$root/mapanything_mps/models/dinov2/dinov2_vitg14_pretrain.pth" \
+    && test -f "$root/vggt_mps/models/vggt_model.pt" \
+    && test -f "$root/fastvggt_mps/models/fastvggt_model.pt"
 }
 
 wipe_installed_core() {
@@ -284,12 +457,19 @@ wipe_installed_core() {
   rm -rf \
     "$root/bin" \
     "$root/lib" \
+    "$root/mapanything_mps/bin" \
+    "$root/mapanything_mps/python" \
+    "$root/mapanything_mps/build_info.json" \
+    "$root/mapanything_mps/vendor" \
+    "$root/mapanything_mps/app" \
     "$root/vggt_mps/bin" \
     "$root/vggt_mps/python" \
+    "$root/vggt_mps/build_info.json" \
     "$root/vggt_mps/vendor" \
     "$root/vggt_mps/app" \
     "$root/fastvggt_mps/bin" \
     "$root/fastvggt_mps/python" \
+    "$root/fastvggt_mps/build_info.json" \
     "$root/fastvggt_mps/vendor" \
     "$root/fastvggt_mps/app"
 }
@@ -305,6 +485,7 @@ if [ "$FAST" -eq 1 ]; then
     echo "Run ./scripts/run.sh --rebuild once to build/install the toolchain, then retry." >&2
     exit 1
   fi
+  refresh_installed_mapanything_app "$TOOLCHAIN_ROOT"
   refresh_installed_vggt_app "$TOOLCHAIN_ROOT"
   refresh_installed_fastvggt_app "$TOOLCHAIN_ROOT"
   export EASYSPLAT_LOCAL_TOOLCHAIN_ROOT="$TOOLCHAIN_ROOT"
@@ -313,6 +494,7 @@ if [ "$FAST" -eq 1 ]; then
 fi
 
 if [ "$REBUILD" -eq 0 ] && [ "$INSTALLED_OK" -eq 1 ]; then
+  refresh_installed_mapanything_app "$TOOLCHAIN_ROOT"
   refresh_installed_vggt_app "$TOOLCHAIN_ROOT"
   refresh_installed_fastvggt_app "$TOOLCHAIN_ROOT"
   export EASYSPLAT_LOCAL_TOOLCHAIN_ROOT="$TOOLCHAIN_ROOT"
@@ -331,6 +513,8 @@ if [ "$NEED_PACKAGE" -eq 1 ]; then
   "$ROOT/scripts/toolchain/build_openssl.sh"
   test -x "$ROOT/Toolchains/build/colmap/install/bin/colmap" || "$ROOT/scripts/toolchain/build_colmap.sh"
   test -x "$ROOT/Toolchains/build/brush/install/bin/brush" || "$ROOT/scripts/toolchain/build_brush.sh"
+  ensure_mapanything_mps_bundle
+  refresh_mapanything_mps_app
   ensure_vggt_mps_bundle
   refresh_vggt_mps_app
   ensure_fastvggt_mps_bundle

@@ -79,6 +79,18 @@ final class VggtSfmRunnerTests: XCTestCase {
         XCTAssertTrue(capturedArgs.contains("aliked+sp"))
         XCTAssertTrue(capturedArgs.contains("--ba-max-frames"))
         XCTAssertTrue(capturedArgs.contains("48"))
+
+        let environment = try XCTUnwrap(mock.environments.first)
+        XCTAssertEqual(environment["PYTHONUNBUFFERED"], "1")
+        XCTAssertEqual(environment["TORCH_HOME"], toolchain.models.path)
+        XCTAssertEqual(environment["EASYSPLAT_VGGT_MODELS_DIR"], toolchain.models.path)
+        XCTAssertEqual(environment["HF_HUB_OFFLINE"], "1")
+        XCTAssertEqual(environment["TRANSFORMERS_OFFLINE"], "1")
+        XCTAssertEqual(environment["HF_HUB_DISABLE_TELEMETRY"], "1")
+        XCTAssertEqual(environment["DO_NOT_TRACK"], "1")
+        XCTAssertEqual(environment["TOKENIZERS_PARALLELISM"], "false")
+        XCTAssertNotNil(environment["PYTORCH_ENABLE_MPS_FALLBACK"])
+        XCTAssertTrue(environment["PATH"]?.contains(toolchain.python.deletingLastPathComponent().path) == true)
     }
 
     func testRunOmitsBundleAdjustmentWhenDisabled() async throws {

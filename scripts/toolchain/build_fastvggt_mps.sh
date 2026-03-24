@@ -24,9 +24,8 @@ FASTVGGT_ENABLE_PYCOLMAP="${FASTVGGT_ENABLE_PYCOLMAP:-0}"
 # Use a self-contained CPython distribution so the packaged toolchain doesn't depend on the
 # developer's local Python install (Homebrew/Conda/etc.). This makes the toolchain portable.
 PYTHON_STANDALONE_TAG="${EASYSPLAT_PYTHON_STANDALONE_TAG:-20260127}"
-# Prefer a Python version with stable torch wheels to avoid
-# fragile source builds on user machines.
-PYTHON_STANDALONE_VERSION="${EASYSPLAT_PYTHON_VERSION:-3.11.9}"
+# Use a pinned release artifact we can consistently fetch.
+PYTHON_STANDALONE_VERSION="${EASYSPLAT_PYTHON_VERSION:-3.13.11}"
 PYTHON_STANDALONE_ASSET="cpython-${PYTHON_STANDALONE_VERSION}+${PYTHON_STANDALONE_TAG}-aarch64-apple-darwin-install_only_stripped.tar.gz"
 PYTHON_STANDALONE_URL="https://github.com/indygreg/python-build-standalone/releases/download/${PYTHON_STANDALONE_TAG}/${PYTHON_STANDALONE_ASSET}"
 PYTHON_STANDALONE_TARBALL="$BUILD_DIR/$PYTHON_STANDALONE_ASSET"
@@ -45,9 +44,25 @@ function ensure_repo() {
     git clone --recursive "$url" "$repo"
   fi
   pushd "$repo" >/dev/null
-  git fetch origin "$ref" || true
-  git checkout "$ref" || true
-  git submodule update --init --recursive || true
+  # Clean first so checkout does not retain/print stale local modifications.
+  git reset --hard
+  git clean -fdx
+  git fetch --tags origin "$ref"
+  git checkout --detach "$ref"
+  git submodule sync --recursive
+  git submodule update --init --recursive
+  local current_head
+  local expected_head
+  expected_head="$(git rev-parse "$ref^{commit}")"
+  # Keep the managed upstream clone deterministic across reruns.
+  git reset --hard "$expected_head"
+  git clean -fdx
+  current_head="$(git rev-parse HEAD)"
+  if [ "$current_head" != "$expected_head" ]; then
+    echo "FastVGGT source checkout mismatch in $repo: expected $expected_head, got $current_head" >&2
+    exit 1
+  fi
+  echo "FastVGGT source pinned at $current_head ($repo)"
   popd >/dev/null
 }
 
@@ -64,26 +79,26 @@ function ensure_python() {
     fi
   fi
 
-  if [ ! -x "$PYTHON_DIR/bin/python3" ]; then
-    if [ ! -f "$PYTHON_STANDALONE_TARBALL" ]; then
-      local existing_tarball
-      existing_tarball="$(
-        find "$ROOT/Toolchains/build" "$ROOT/Toolchains/build/vggt_mps" \
-          -type f \
-          -name 'cpython-*aarch64-apple-darwin-install_only_stripped.tar.gz' \
-          2>/dev/null \
-          | head -n 1
-      )"
-      if [ -n "$existing_tarball" ]; then
-        PYTHON_STANDALONE_TARBALL="$existing_tarball"
-      else
-        download_file "$PYTHON_STANDALONE_URL" "$PYTHON_STANDALONE_TARBALL"
-      fi
+  if [ -x "$PYTHON_DIR/bin/python3" ]; then
+    local current_python_version
+    current_python_version="$("$PYTHON_DIR/bin/python3" - <<'PY'
+import sys
+print(f"{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}")
+PY
+)"
+    if [ "$current_python_version" != "$PYTHON_STANDALONE_VERSION" ]; then
+      echo "fastvggt_mps python version mismatch (found $current_python_version, expected $PYTHON_STANDALONE_VERSION); rebuilding runtime." >&2
+      rm -rf "$PYTHON_DIR"
     fi
+  fi
+
+  if [ ! -x "$PYTHON_DIR/bin/python3" ]; then
+    download_file "$PYTHON_STANDALONE_URL" "$PYTHON_STANDALONE_TARBALL"
     mkdir -p "$INSTALL_DIR"
     /usr/bin/tar -xzf "$PYTHON_STANDALONE_TARBALL" -C "$INSTALL_DIR"
   fi
 
+  echo "fastvggt_mps python version: $("$PYTHON_DIR/bin/python3" -V 2>&1)"
   PYTHONNOUSERSITE=1 "$PYTHON_DIR/bin/python3" -m pip install --no-user --upgrade pip setuptools wheel
 }
 
@@ -136,17 +151,26 @@ mkdir -p "$BUILD_DIR" "$INSTALL_DIR" "$MODELS_DIR" "$BIN_DIR"
 ensure_python
 require_arm64_python
 
+FASTVGGT_SOURCE_REPO="${FASTVGGT_REPO:-local-vendored}"
+FASTVGGT_SOURCE_REF="${FASTVGGT_REF}"
+FASTVGGT_SOURCE_COMMIT="vendored-snapshot"
+
 if [ -d "$FASTVGGT_SOURCE/vggt" ]; then
-  : # vendored source
+  if [ -d "$FASTVGGT_SOURCE/.git" ]; then
+    FASTVGGT_SOURCE_COMMIT="$(git -C "$FASTVGGT_SOURCE" rev-parse HEAD)"
+  fi
 elif [ -n "$FASTVGGT_REPO" ]; then
   FASTVGGT_SOURCE="$BUILD_DIR/fastvggt-upstream"
   ensure_repo "$FASTVGGT_SOURCE" "$FASTVGGT_REPO" "$FASTVGGT_REF"
+  FASTVGGT_SOURCE_COMMIT="$(git -C "$FASTVGGT_SOURCE" rev-parse HEAD)"
 else
   echo "FastVGGT source not found at $FASTVGGT_SOURCE. Ensure ThirdParty/FastVGGT exists or set FASTVGGT_REPO." >&2
   exit 1
 fi
 
 # Install the runtime deps for EasySplat's FastVGGT bridge.
+# We pin the PyTorch pair in Tools/FastVggtSfm/requirements.txt to a matching PyPI release that
+# publishes Apple Silicon wheels for the bundled CPython version.
 pip_install -r "$ROOT/Tools/FastVggtSfm/requirements.txt"
 if [ "$FASTVGGT_ENABLE_PYCOLMAP" = "1" ]; then
   pip_install -r "$ROOT/Tools/FastVggtSfm/requirements-colmap.txt"
@@ -192,6 +216,10 @@ fi
 # Install EasySplat's FastVGGT -> COLMAP bridge app code.
 rm -rf "$APP_DIR"
 cp -R "$ROOT/Tools/FastVggtSfm" "$APP_DIR"
+if [ ! -f "$APP_DIR/easysplat_fastvggt_sfm/run.py" ]; then
+  echo "FastVGGT app bundle missing easysplat_fastvggt_sfm/run.py" >&2
+  exit 1
+fi
 
 # Copy model weights (large).
 if [ -f "$FASTVGGT_MODEL_PATH" ]; then
@@ -202,6 +230,40 @@ else
   echo "FastVGGT model weights not found. Set FASTVGGT_MODEL_PATH or FASTVGGT_MODEL_URL." >&2
   exit 1
 fi
+
+FASTVGGT_MODEL_SOURCE="$FASTVGGT_MODEL_URL"
+if [ -f "$FASTVGGT_MODEL_PATH" ]; then
+  FASTVGGT_MODEL_SOURCE="$FASTVGGT_MODEL_PATH"
+fi
+
+PYTHONNOUSERSITE=1 "$PYTHON_DIR/bin/python3" - <<PY
+import json
+import platform
+from pathlib import Path
+import torch
+import torchvision
+
+Path("${INSTALL_DIR}").mkdir(parents=True, exist_ok=True)
+Path("${INSTALL_DIR}/build_info.json").write_text(
+    json.dumps(
+        {
+            "toolchain_name": "fastvggt_mps",
+            "source_repo": "${FASTVGGT_SOURCE_REPO}",
+            "source_ref": "${FASTVGGT_SOURCE_REF}",
+            "source_commit": "${FASTVGGT_SOURCE_COMMIT}",
+            "source_path": "${FASTVGGT_SOURCE}",
+            "model_source": "${FASTVGGT_MODEL_SOURCE}",
+            "pycolmap_enabled": "${FASTVGGT_ENABLE_PYCOLMAP}",
+            "python_version": platform.python_version(),
+            "torch_version": torch.__version__,
+            "torchvision_version": torchvision.__version__,
+        },
+        indent=2,
+    )
+    + "\n",
+    encoding="utf-8",
+)
+PY
 
 function write_wrapper() {
   cat > "$BIN_DIR/easysplat_fastvggt_sfm" <<'SCRIPT'
@@ -214,6 +276,10 @@ VENDOR_FASTVGGT="$ROOT/vendor/fastvggt"
 export PYTHONNOUSERSITE=1
 export PYTHONPATH="$APP:$VENDOR_FASTVGGT${PYTHONPATH:+:$PYTHONPATH}"
 export TORCH_HOME="$ROOT/models"
+export HF_HUB_OFFLINE=1
+export TRANSFORMERS_OFFLINE=1
+export HF_HUB_DISABLE_TELEMETRY=1
+export DO_NOT_TRACK=1
 export KMP_DUPLICATE_LIB_OK=TRUE
 exec "$PY" -m easysplat_fastvggt_sfm.run "$@"
 SCRIPT
@@ -236,5 +302,7 @@ except Exception as exc:  # noqa: BLE001
     sys.stderr.write(f"fastvggt_mps import sanity check failed: {exc}\n")
     raise SystemExit(1)
 PY
+
+"$BIN_DIR/easysplat_fastvggt_sfm" --help >/dev/null
 
 echo "fastvggt_mps ready at $INSTALL_DIR"

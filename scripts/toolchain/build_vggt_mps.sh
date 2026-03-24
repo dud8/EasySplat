@@ -13,6 +13,7 @@ VGGT_VENDOR="$VENDOR_DIR/vggt"
 
 VGGT_SOURCE="${VGGT_SOURCE:-$ROOT/ThirdParty/VGGT}"
 VGGT_UPSTREAM_REPO="${VGGT_UPSTREAM_REPO:-}"
+VGGT_UPSTREAM_URL="${VGGT_UPSTREAM_URL:-https://github.com/facebookresearch/vggt.git}"
 VGGT_UPSTREAM_REF="${VGGT_UPSTREAM_REF:-main}"
 
 VGGT_MODEL_URL="${VGGT_MODEL_URL:-https://huggingface.co/facebook/VGGT-1B/resolve/main/model.pt}"
@@ -21,9 +22,8 @@ VGGT_MODEL_FILE="$MODELS_DIR/vggt_model.pt"
 # Use a self-contained CPython distribution so the packaged toolchain doesn't depend on the
 # developer's local Python install (Homebrew/Conda/etc.). This makes the toolchain portable.
 PYTHON_STANDALONE_TAG="${EASYSPLAT_PYTHON_STANDALONE_TAG:-20260127}"
-# Prefer a Python version with pycolmap wheels available (3.11.x) to avoid
-# fragile source builds on user machines.
-PYTHON_STANDALONE_VERSION="${EASYSPLAT_PYTHON_VERSION:-3.11.9}"
+# Use a pinned release artifact we can consistently fetch.
+PYTHON_STANDALONE_VERSION="${EASYSPLAT_PYTHON_VERSION:-3.13.11}"
 PYTHON_STANDALONE_ASSET="cpython-${PYTHON_STANDALONE_VERSION}+${PYTHON_STANDALONE_TAG}-aarch64-apple-darwin-install_only_stripped.tar.gz"
 PYTHON_STANDALONE_URL="https://github.com/indygreg/python-build-standalone/releases/download/${PYTHON_STANDALONE_TAG}/${PYTHON_STANDALONE_ASSET}"
 PYTHON_STANDALONE_TARBALL="$BUILD_DIR/$PYTHON_STANDALONE_ASSET"
@@ -42,9 +42,19 @@ function ensure_repo() {
     git clone --recursive "$url" "$repo"
   fi
   pushd "$repo" >/dev/null
-  git fetch origin "$ref" || true
-  git checkout "$ref" || true
-  git submodule update --init --recursive || true
+  git fetch --tags origin "$ref"
+  git checkout --detach "$ref"
+  git submodule sync --recursive
+  git submodule update --init --recursive
+  local current_head
+  local expected_head
+  current_head="$(git rev-parse HEAD)"
+  expected_head="$(git rev-parse "$ref^{commit}")"
+  if [ "$current_head" != "$expected_head" ]; then
+    echo "VGGT source checkout mismatch in $repo: expected $expected_head, got $current_head" >&2
+    exit 1
+  fi
+  echo "VGGT source pinned at $current_head ($repo)"
   popd >/dev/null
 }
 
@@ -61,12 +71,26 @@ function ensure_python() {
     fi
   fi
 
+  if [ -x "$PYTHON_DIR/bin/python3" ]; then
+    local current_python_version
+    current_python_version="$("$PYTHON_DIR/bin/python3" - <<'PY'
+import sys
+print(f"{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}")
+PY
+)"
+    if [ "$current_python_version" != "$PYTHON_STANDALONE_VERSION" ]; then
+      echo "vggt_mps python version mismatch (found $current_python_version, expected $PYTHON_STANDALONE_VERSION); rebuilding runtime." >&2
+      rm -rf "$PYTHON_DIR"
+    fi
+  fi
+
   if [ ! -x "$PYTHON_DIR/bin/python3" ]; then
     download_file "$PYTHON_STANDALONE_URL" "$PYTHON_STANDALONE_TARBALL"
     mkdir -p "$INSTALL_DIR"
     /usr/bin/tar -xzf "$PYTHON_STANDALONE_TARBALL" -C "$INSTALL_DIR"
   fi
 
+  echo "vggt_mps python version: $("$PYTHON_DIR/bin/python3" -V 2>&1)"
   PYTHONNOUSERSITE=1 "$PYTHON_DIR/bin/python3" -m pip install --no-user --upgrade pip setuptools wheel
 }
 
@@ -119,20 +143,35 @@ mkdir -p "$BUILD_DIR" "$INSTALL_DIR" "$MODELS_DIR" "$BIN_DIR"
 ensure_python
 require_arm64_python
 
+VGGT_SOURCE_REPO="${VGGT_UPSTREAM_REPO:-local-vendored}"
+VGGT_SOURCE_REF="${VGGT_UPSTREAM_REF}"
+VGGT_SOURCE_COMMIT="vendored-snapshot"
+
 if [ -d "$VGGT_SOURCE/vggt" ]; then
-  : # vendored source
+  if [ -d "$VGGT_SOURCE/.git" ]; then
+    VGGT_SOURCE_COMMIT="$(git -C "$VGGT_SOURCE" rev-parse HEAD)"
+  fi
 elif [ -n "$VGGT_UPSTREAM_REPO" ]; then
-  VGGT_SOURCE="$VGGT_UPSTREAM_REPO"
-  ensure_repo "$VGGT_UPSTREAM_REPO" "https://github.com/facebookresearch/vggt.git" "$VGGT_UPSTREAM_REF"
+  if [ -d "$VGGT_UPSTREAM_REPO" ]; then
+    VGGT_SOURCE="$VGGT_UPSTREAM_REPO"
+    ensure_repo "$VGGT_SOURCE" "$VGGT_UPSTREAM_URL" "$VGGT_UPSTREAM_REF"
+    VGGT_SOURCE_REPO="$VGGT_UPSTREAM_URL"
+  else
+    VGGT_SOURCE="$BUILD_DIR/vggt-upstream"
+    ensure_repo "$VGGT_SOURCE" "$VGGT_UPSTREAM_REPO" "$VGGT_UPSTREAM_REF"
+    VGGT_SOURCE_REPO="$VGGT_UPSTREAM_REPO"
+  fi
+  VGGT_SOURCE_COMMIT="$(git -C "$VGGT_SOURCE" rev-parse HEAD)"
 else
-  echo "VGGT source not found at $VGGT_SOURCE. Ensure ThirdParty/VGGT exists or set VGGT_UPSTREAM_REPO." >&2
-  exit 1
+  VGGT_SOURCE="$BUILD_DIR/vggt-upstream"
+  ensure_repo "$VGGT_SOURCE" "$VGGT_UPSTREAM_URL" "$VGGT_UPSTREAM_REF"
+  VGGT_SOURCE_REPO="$VGGT_UPSTREAM_URL"
+  VGGT_SOURCE_COMMIT="$(git -C "$VGGT_SOURCE" rev-parse HEAD)"
 fi
 
 # Install the runtime deps for EasySplat's VGGT bridge.
-# Note: upstream vggt/requirements.txt pins torch==2.3.1 which doesn't have wheels for newer
-# Python versions (e.g. 3.13). We intentionally avoid those pins and let pip choose compatible
-# torch/torchvision builds for the current Python.
+# We pin the PyTorch pair in Tools/VggtSfm/requirements.txt to a matching PyPI release that
+# publishes Apple Silicon wheels for the bundled CPython version.
 pip_install -r "$ROOT/Tools/VggtSfm/requirements.txt"
 verify_torch_mps
 
@@ -164,9 +203,41 @@ fi
 # Install EasySplat's VGGT -> COLMAP bridge app code.
 rm -rf "$APP_DIR"
 cp -R "$ROOT/Tools/VggtSfm" "$APP_DIR"
+if [ ! -f "$APP_DIR/easysplat_vggt_sfm/run.py" ]; then
+  echo "VGGT app bundle missing easysplat_vggt_sfm/run.py" >&2
+  exit 1
+fi
 
 # Download model weights (large).
 download_file "$VGGT_MODEL_URL" "$VGGT_MODEL_FILE"
+
+PYTHONNOUSERSITE=1 "$PYTHON_DIR/bin/python3" - <<PY
+import json
+import platform
+from pathlib import Path
+import torch
+import torchvision
+
+Path("${INSTALL_DIR}").mkdir(parents=True, exist_ok=True)
+Path("${INSTALL_DIR}/build_info.json").write_text(
+    json.dumps(
+        {
+            "toolchain_name": "vggt_mps",
+            "source_repo": "${VGGT_SOURCE_REPO}",
+            "source_ref": "${VGGT_SOURCE_REF}",
+            "source_commit": "${VGGT_SOURCE_COMMIT}",
+            "source_path": "${VGGT_SOURCE}",
+            "model_source": "${VGGT_MODEL_URL}",
+            "python_version": platform.python_version(),
+            "torch_version": torch.__version__,
+            "torchvision_version": torchvision.__version__,
+        },
+        indent=2,
+    )
+    + "\n",
+    encoding="utf-8",
+)
+PY
 
 function write_wrapper() {
   cat > "$BIN_DIR/easysplat_vggt_sfm" <<'SCRIPT'
@@ -179,6 +250,10 @@ VENDOR_VGGT="$ROOT/vendor/vggt"
 export PYTHONNOUSERSITE=1
 export PYTHONPATH="$APP:$VENDOR_VGGT${PYTHONPATH:+:$PYTHONPATH}"
 export TORCH_HOME="$ROOT/models"
+export HF_HUB_OFFLINE=1
+export TRANSFORMERS_OFFLINE=1
+export HF_HUB_DISABLE_TELEMETRY=1
+export DO_NOT_TRACK=1
 export KMP_DUPLICATE_LIB_OK=TRUE
 exec "$PY" -m easysplat_vggt_sfm.run "$@"
 SCRIPT
@@ -202,5 +277,7 @@ except Exception as exc:  # noqa: BLE001
     sys.stderr.write(f"vggt_mps import sanity check failed: {exc}\n")
     raise SystemExit(1)
 PY
+
+"$BIN_DIR/easysplat_vggt_sfm" --help >/dev/null
 
 echo "vggt_mps ready at $INSTALL_DIR"
