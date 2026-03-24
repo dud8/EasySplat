@@ -404,10 +404,12 @@ final class AppModelTests: XCTestCase {
         model.statusDetail = "detail"
         model.errorDetails = "error"
         model.logLines = ["a", "b"]
+        model.errorLogLines = ["[err] traceback line"]
 
         let text = model.errorDetailsText ?? ""
         XCTAssertTrue(text.contains("detail"))
         XCTAssertTrue(text.contains("error"))
+        XCTAssertTrue(text.contains("Error Logs:"))
         XCTAssertTrue(text.contains("Logs:"))
     }
 
@@ -439,6 +441,189 @@ final class AppModelTests: XCTestCase {
 
         let duplicateIntegrityLines = model.logLines.filter { $0 == "[Tools] Verified download integrity (core)" }
         XCTAssertEqual(duplicateIntegrityLines.count, 1, "Indeterminate milestones should not be duplicated.")
+    }
+
+    func testShareCurrentSplatRecordsClickedMetricAndEvent() async throws {
+        let tempBase = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(at: tempBase, withIntermediateDirectories: true)
+        let input = tempBase.appendingPathComponent("input.mov")
+        try Data("video".utf8).write(to: input)
+
+        let model = AppModel(toolchainManager: MockToolchainManager(), projectBaseURL: tempBase) { projectURL, config in
+            MockPipelineRunner(projectURL: projectURL, config: config)
+        }
+
+        model.addInputs(urls: [input])
+        model.startFromPendingSelection()
+        try await waitForViewState(model: model, state: .viewer)
+
+        model.shareCurrentSplat()
+
+        guard let projectURL = model.currentProjectURL else {
+            XCTFail("Missing project URL")
+            return
+        }
+        let metadata = try ProjectMetadataStore.load(from: ProjectPaths(root: projectURL).metadataURL)
+        XCTAssertEqual(metadata.shareMetrics?.shareClickedCount, 1)
+        XCTAssertEqual(metadata.shareMetrics?.shareCompletedCount, 0)
+        XCTAssertFalse(model.shareStatusIsError)
+        XCTAssertNotNil(model.shareStatusMessage)
+
+        let events = model.test_shareEventsText(projectURL: projectURL)
+        XCTAssertTrue(events.contains("share_clicked"))
+        XCTAssertTrue(events.contains("share_caption_copied") || events.contains("share_sheet_opened"))
+    }
+
+    func testShareCurrentSplatReportsMissingOutputFile() async throws {
+        let tempBase = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(at: tempBase, withIntermediateDirectories: true)
+        let input = tempBase.appendingPathComponent("input.mov")
+        try Data("video".utf8).write(to: input)
+
+        let model = AppModel(toolchainManager: MockToolchainManager(), projectBaseURL: tempBase) { projectURL, config in
+            MockPipelineRunner(projectURL: projectURL, config: config)
+        }
+
+        model.addInputs(urls: [input])
+        model.startFromPendingSelection()
+        try await waitForViewState(model: model, state: .viewer)
+
+        guard let projectURL = model.currentProjectURL, let output = model.outputPlyURL else {
+            XCTFail("Missing project state")
+            return
+        }
+        try FileManager.default.removeItem(at: output)
+
+        model.shareCurrentSplat()
+
+        XCTAssertTrue(model.shareStatusIsError)
+        XCTAssertTrue((model.shareStatusMessage ?? "").contains("Could not find"))
+        XCTAssertEqual(model.shareMetrics.shareClickedCount, 0)
+
+        let metadata = try ProjectMetadataStore.load(from: ProjectPaths(root: projectURL).metadataURL)
+        XCTAssertNil(metadata.shareMetrics)
+
+        let events = model.test_shareEventsText(projectURL: projectURL)
+        XCTAssertTrue(events.contains("share_unavailable"))
+        XCTAssertTrue(events.contains("missing_output_file"))
+    }
+
+    func testShareCurrentSplatReportsInvalidOutputDirectoryPath() async throws {
+        let tempBase = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(at: tempBase, withIntermediateDirectories: true)
+        let input = tempBase.appendingPathComponent("input.mov")
+        try Data("video".utf8).write(to: input)
+
+        let model = AppModel(toolchainManager: MockToolchainManager(), projectBaseURL: tempBase) { projectURL, config in
+            MockPipelineRunner(projectURL: projectURL, config: config)
+        }
+
+        model.addInputs(urls: [input])
+        model.startFromPendingSelection()
+        try await waitForViewState(model: model, state: .viewer)
+
+        guard let projectURL = model.currentProjectURL, let output = model.outputPlyURL else {
+            XCTFail("Missing project state")
+            return
+        }
+        try FileManager.default.removeItem(at: output)
+        try FileManager.default.createDirectory(at: output, withIntermediateDirectories: true)
+
+        model.shareCurrentSplat()
+
+        XCTAssertTrue(model.shareStatusIsError)
+        XCTAssertEqual(model.shareMetrics.shareClickedCount, 0)
+
+        let events = model.test_shareEventsText(projectURL: projectURL)
+        XCTAssertTrue(events.contains("share_unavailable"))
+        XCTAssertTrue(events.contains("output_is_directory"))
+    }
+
+    func testShareCurrentSplatIgnoredWhileSessionAlreadyActive() async throws {
+        let tempBase = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(at: tempBase, withIntermediateDirectories: true)
+        let input = tempBase.appendingPathComponent("input.mov")
+        try Data("video".utf8).write(to: input)
+
+        let model = AppModel(toolchainManager: MockToolchainManager(), projectBaseURL: tempBase) { projectURL, config in
+            MockPipelineRunner(projectURL: projectURL, config: config)
+        }
+
+        model.addInputs(urls: [input])
+        model.startFromPendingSelection()
+        try await waitForViewState(model: model, state: .viewer)
+
+        guard let projectURL = model.currentProjectURL else {
+            XCTFail("Missing project URL")
+            return
+        }
+        model.test_activateShareSession(projectURL: projectURL)
+
+        model.shareCurrentSplat()
+
+        XCTAssertEqual(model.shareStatusMessage, "Finish the current share first.")
+        XCTAssertFalse(model.shareStatusIsError)
+        XCTAssertTrue(model.isShareSheetActive)
+        XCTAssertEqual(model.shareMetrics.shareClickedCount, 0)
+        let events = model.test_shareEventsText(projectURL: projectURL)
+        XCTAssertTrue(events.contains("share_ignored"))
+        XCTAssertTrue(events.contains("active_session"))
+    }
+
+    func testShareCompletionMetricPersistsToProjectMetadata() throws {
+        let base = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(at: base, withIntermediateDirectories: true)
+        let projectURL = try makeProject(at: base, name: "SharedProject", lastError: nil, withOutput: true)
+
+        let model = AppModel(toolchainManager: MockToolchainManager(), projectBaseURL: base) { _, config in
+            MockPipelineRunner(projectURL: projectURL, config: config)
+        }
+
+        _ = model.test_recordShareClicked(projectURL: projectURL)
+        model.test_recordShareCompleted(projectURL: projectURL, serviceName: "Messages")
+
+        let metadata = try ProjectMetadataStore.load(from: ProjectPaths(root: projectURL).metadataURL)
+        XCTAssertEqual(metadata.shareMetrics?.shareClickedCount, 1)
+        XCTAssertEqual(metadata.shareMetrics?.shareCompletedCount, 1)
+        XCTAssertEqual(metadata.shareMetrics?.lastShareService, "Messages")
+        XCTAssertNotNil(metadata.shareMetrics?.lastSharedAt)
+        XCTAssertEqual(model.shareSummaryText, "Shared once. Last via Messages.")
+
+        let events = model.test_shareEventsText(projectURL: projectURL)
+        XCTAssertTrue(events.contains("share_completed"))
+    }
+
+    func testShareCompletionNormalizesEmptyServiceName() throws {
+        let base = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(at: base, withIntermediateDirectories: true)
+        let projectURL = try makeProject(at: base, name: "SharedProject2", lastError: nil, withOutput: true)
+
+        let model = AppModel(toolchainManager: MockToolchainManager(), projectBaseURL: base) { _, config in
+            MockPipelineRunner(projectURL: projectURL, config: config)
+        }
+
+        _ = model.test_recordShareClicked(projectURL: projectURL)
+        model.test_recordShareCompleted(projectURL: projectURL, serviceName: "   ")
+
+        let metadata = try ProjectMetadataStore.load(from: ProjectPaths(root: projectURL).metadataURL)
+        XCTAssertEqual(metadata.shareMetrics?.lastShareService, "Share Service")
+        XCTAssertEqual(model.shareSummaryText, "Shared once. Last via Share Service.")
+    }
+
+    func testShareCompletionIgnoredForInactiveSession() throws {
+        let base = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(at: base, withIntermediateDirectories: true)
+        let projectURL = try makeProject(at: base, name: "SharedProject3", lastError: nil, withOutput: true)
+
+        let model = AppModel(toolchainManager: MockToolchainManager(), projectBaseURL: base) { _, config in
+            MockPipelineRunner(projectURL: projectURL, config: config)
+        }
+
+        model.test_recordShareCompletedFromInactiveSession(projectURL: projectURL, serviceName: "Messages")
+
+        let metadata = try ProjectMetadataStore.load(from: ProjectPaths(root: projectURL).metadataURL)
+        XCTAssertNil(metadata.shareMetrics)
+        XCTAssertEqual(model.shareMetrics.shareCompletedCount, 0)
     }
 
     func testTrainingConsentRememberedSkipsPrompt() async {
@@ -487,6 +672,40 @@ final class AppModelTests: XCTestCase {
         let allowed = await task.value
         XCTAssertFalse(allowed)
         XCTAssertFalse(model.isShowingTrainingConsent)
+    }
+
+    func testErrorStageLogsBypassThrottle() async throws {
+        let tempBase = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(at: tempBase, withIntermediateDirectories: true)
+        let input = tempBase.appendingPathComponent("input.mov")
+        try Data("video".utf8).write(to: input)
+
+        let model = AppModel(
+            toolchainManager: MockToolchainManager(),
+            projectBaseURL: tempBase
+        ) { _, _ in
+            TracebackSpamPipelineRunner()
+        }
+
+        model.addInputs(urls: [input])
+        model.startFromPendingSelection()
+
+        let deadline = Date().addingTimeInterval(2.0)
+        while Date() < deadline, model.lastError == nil {
+            try await Task.sleep(nanoseconds: 50_000_000)
+        }
+        XCTAssertNotNil(model.lastError)
+        try await Task.sleep(nanoseconds: 150_000_000)
+
+        let tracebackLines = model.logLines.filter {
+            $0.contains("Traceback (most recent call last):")
+                || $0.contains("File \"run.py\"")
+                || $0.contains("RuntimeError: MPS backend out of memory")
+        }
+        XCTAssertGreaterThanOrEqual(tracebackLines.count, 3)
+        XCTAssertGreaterThanOrEqual(model.errorLogLines.count, 3)
+        let details = model.errorDetailsText ?? ""
+        XCTAssertTrue(details.contains("Traceback (most recent call last):"))
     }
 
     private func waitForViewState(model: AppModel, state: AppModel.ViewState, timeout: TimeInterval = 2.0) async throws {
@@ -600,6 +819,17 @@ final class MockPipelineRunner: PipelineRunning {
         metadata.outputs = OutputSpec(splatPlyPath: "Output/splat.ply", colmapModelPath: "SfM/colmap/sparse/0")
         metadata.state = PipelineState(stage: .done, attempt: 0, lastError: nil, resumeToken: nil)
         try ProjectMetadataStore.save(metadata, to: paths.metadataURL)
+    }
+}
+
+final class TracebackSpamPipelineRunner: PipelineRunning {
+    func run(resumeFrom lastCompletedStage: PipelineStage?, events: @escaping @Sendable (PipelineEvent) -> Void) async throws {
+        events(.stageStarted(stage: .sfmFeatures))
+        events(.stageLog(stage: .sfmFeatures, line: "Traceback (most recent call last):", isError: true))
+        events(.stageLog(stage: .sfmFeatures, line: "  File \"run.py\", line 287, in run_pipeline", isError: true))
+        events(.stageLog(stage: .sfmFeatures, line: "RuntimeError: MPS backend out of memory", isError: true))
+        events(.pipelineFailed(stage: .sfmFeatures, userMessage: "Pipeline failed", debugMessage: "traceback"))
+        throw NSError(domain: "AppModelTests", code: 1)
     }
 }
 #endif

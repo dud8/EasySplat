@@ -31,6 +31,7 @@ final class AppModel: ObservableObject {
     @Published var stageStartedAt: Date? = nil
     @Published var lastPipelineEventAt: Date? = nil
     @Published var logLines: [String] = []
+    @Published var errorLogLines: [String] = []
     @Published var lastError: String? = nil
     @Published var errorDetails: String? = nil
     @Published var outputPlyURL: URL? = nil
@@ -47,6 +48,10 @@ final class AppModel: ObservableObject {
     @Published var projectSummaries: [ProjectSummary] = []
     @Published var selectionWarning: String? = nil
     @Published var recoveryPromptProject: ProjectSummary? = nil
+    @Published var shareStatusMessage: String? = nil
+    @Published var shareStatusIsError: Bool = false
+    @Published private(set) var shareMetrics: ShareMetrics = .init()
+    @Published private(set) var isShareSheetActive: Bool = false
 
     private let toolchainManager: ToolchainManaging
     private let pipelineRunnerFactory: (URL, PipelineRunner.PipelineConfig) -> PipelineRunning
@@ -74,6 +79,7 @@ final class AppModel: ObservableObject {
     private var pendingSnapshotRevealURL: URL?
     private var pendingSnapshotRevealRequiresExit: Bool = false
     private var forcedExitTask: Task<Void, Never>?
+    private var activeShareSession: ShareSession?
     private var ignoredRecoveryProjectIDs: Set<UUID> = []
     private static let forcedExitTimeoutNanoseconds: UInt64 = 25_000_000_000
 
@@ -107,12 +113,28 @@ final class AppModel: ObservableObject {
             .appendingPathComponent("latest_snapshot.ply")
     }
 
+    var shareSummaryText: String? {
+        let completed = shareMetrics.shareCompletedCount
+        guard completed > 0 else { return nil }
+        let prefix = completed == 1 ? "Shared once." : "Shared \(completed) times."
+        if let service = shareMetrics.lastShareService, !service.isEmpty {
+            return "\(prefix) Last via \(service)."
+        }
+        return prefix
+    }
+
     var processingDetailsText: String? {
         if lastError != nil {
             if let details = errorDetails, !details.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
                 return details
             }
             return statusDetail
+        }
+        if let liveErrors = liveErrorDetailsText {
+            if let detail = statusDetail, !detail.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                return "\(detail)\n\nRecent Error Output:\n\(liveErrors)"
+            }
+            return "Recent Error Output:\n\(liveErrors)"
         }
         if let detail = statusDetail, !detail.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
             return detail
@@ -128,11 +150,21 @@ final class AppModel: ObservableObject {
         if let errorDetails, !errorDetails.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
             parts.append(errorDetails)
         }
+        if !errorLogLines.isEmpty {
+            parts.append("Error Logs:\n" + errorLogLines.joined(separator: "\n"))
+        }
         if !logLines.isEmpty {
             parts.append("Logs:\n" + logLines.joined(separator: "\n"))
         }
         let combined = parts.joined(separator: "\n\n")
         return combined.isEmpty ? nil : combined
+    }
+
+    private var liveErrorDetailsText: String? {
+        guard !errorLogLines.isEmpty else { return nil }
+        let tail = errorLogLines.suffix(300)
+        let text = tail.joined(separator: "\n").trimmingCharacters(in: .whitespacesAndNewlines)
+        return text.isEmpty ? nil : text
     }
 
     init(
@@ -238,6 +270,150 @@ final class AppModel: ObservableObject {
         }
         try? FileManager.default.removeItem(at: project.url)
         refreshProjectSummaries()
+    }
+
+    func shareCurrentSplat() {
+        guard activeShareSession == nil else {
+            shareStatusMessage = "Finish the current share first."
+            shareStatusIsError = false
+            if let projectURL = currentProjectURL {
+                appendShareEvent(
+                    name: "share_ignored",
+                    projectURL: projectURL,
+                    properties: ["reason": "active_session"]
+                )
+            }
+            return
+        }
+        guard let projectURL = currentProjectURL, let splatURL = outputPlyURL else {
+            shareStatusMessage = "Finish a project first, then share from this screen."
+            shareStatusIsError = true
+            return
+        }
+        var isDirectory = ObjCBool(false)
+        let outputExists = FileManager.default.fileExists(atPath: splatURL.path, isDirectory: &isDirectory)
+        guard outputExists, !isDirectory.boolValue else {
+            let reason = isDirectory.boolValue ? "output_is_directory" : "missing_output_file"
+            shareStatusMessage = "Could not find \(splatURL.lastPathComponent). Rebuild or reopen the project."
+            shareStatusIsError = true
+            appendShareEvent(
+                name: "share_unavailable",
+                projectURL: projectURL,
+                properties: [
+                    "reason": reason,
+                    "output_file": splatURL.lastPathComponent
+                ]
+            )
+            return
+        }
+
+        let metrics = recordShareClicked(projectURL: projectURL)
+        let caption = shareCaptionText(for: splatURL)
+        let items: [Any] = [caption as NSString, splatURL]
+
+        let shareWindow = NSApplication.shared.keyWindow ?? NSApplication.shared.mainWindow
+        guard let contentView = shareWindow?.contentView else {
+            if copyToPasteboard(caption) {
+                shareStatusMessage = "Copied a share caption. Attach \(splatURL.lastPathComponent) to send it."
+                shareStatusIsError = false
+                appendShareEvent(
+                    name: "share_caption_copied",
+                    projectURL: projectURL,
+                    properties: [
+                        "reason": "missing_window",
+                        "share_clicked_count": String(metrics.shareClickedCount)
+                    ]
+                )
+            } else {
+                shareStatusMessage = "Couldn’t open share options right now. Please try again."
+                shareStatusIsError = true
+                appendShareEvent(
+                    name: "share_unavailable",
+                    projectURL: projectURL,
+                    properties: [
+                        "reason": "pasteboard_write_failed",
+                        "share_clicked_count": String(metrics.shareClickedCount)
+                    ]
+                )
+            }
+            return
+        }
+
+        let picker = NSSharingServicePicker(items: items)
+        let session = ShareSession(model: self, projectURL: projectURL)
+        activeShareSession = session
+        isShareSheetActive = true
+        session.present(picker: picker, in: contentView)
+        shareStatusMessage = "Share sheet opened. Send your splat to a friend."
+        shareStatusIsError = false
+        appendShareEvent(
+            name: "share_sheet_opened",
+            projectURL: projectURL,
+            properties: [
+                "share_clicked_count": String(metrics.shareClickedCount)
+            ]
+        )
+    }
+
+    fileprivate func shareServiceSelected(from session: ShareSession, serviceName: String, projectURL: URL) {
+        guard activeShareSession === session else { return }
+        let normalized = normalizedShareServiceName(serviceName)
+        shareStatusMessage = "Sharing via \(normalized)…"
+        shareStatusIsError = false
+        appendShareEvent(
+            name: "share_service_selected",
+            projectURL: projectURL,
+            properties: ["service": normalized]
+        )
+    }
+
+    fileprivate func shareDidComplete(from session: ShareSession, serviceName: String, projectURL: URL) {
+        guard activeShareSession === session else { return }
+        let normalized = normalizedShareServiceName(serviceName)
+        let metrics = mutateShareMetrics(projectURL: projectURL) { metrics in
+            metrics.shareCompletedCount += 1
+            metrics.lastShareService = normalized
+            metrics.lastSharedAt = Date()
+        }
+        shareStatusMessage = "Shared via \(normalized)."
+        shareStatusIsError = false
+        appendShareEvent(
+            name: "share_completed",
+            projectURL: projectURL,
+            properties: [
+                "service": normalized,
+                "share_completed_count": String(metrics.shareCompletedCount)
+            ]
+        )
+    }
+
+    fileprivate func shareDidFail(from session: ShareSession, serviceName: String, projectURL: URL, error: Error) {
+        guard activeShareSession === session else { return }
+        let normalized = normalizedShareServiceName(serviceName)
+        shareStatusMessage = "Share failed for \(normalized). Try another service."
+        shareStatusIsError = true
+        appendShareEvent(
+            name: "share_failed",
+            projectURL: projectURL,
+            properties: [
+                "service": normalized,
+                "error": error.localizedDescription
+            ]
+        )
+    }
+
+    fileprivate func shareDidCancel(from session: ShareSession, projectURL: URL) {
+        guard activeShareSession === session else { return }
+        shareStatusMessage = "Share canceled."
+        shareStatusIsError = false
+        appendShareEvent(name: "share_canceled", projectURL: projectURL)
+    }
+
+    fileprivate func clearShareSession(_ session: ShareSession) {
+        if activeShareSession === session {
+            activeShareSession = nil
+            isShareSheetActive = false
+        }
     }
 
     func cancelCurrentProject(deleteProject: Bool, exitIntent: ExitIntent = .none, window: NSWindow? = nil) {
@@ -499,6 +675,96 @@ final class AppModel: ObservableObject {
         ignoredRecoveryProjectIDs.remove(id)
     }
 
+    private func syncShareMetrics(for projectURL: URL?) {
+        guard let projectURL else {
+            shareMetrics = .init()
+            return
+        }
+        let metadataURL = ProjectPaths(root: projectURL).metadataURL
+        if let metadata = try? ProjectMetadataStore.load(from: metadataURL),
+           let persisted = metadata.shareMetrics {
+            shareMetrics = persisted
+        } else {
+            shareMetrics = .init()
+        }
+    }
+
+    @discardableResult
+    private func mutateShareMetrics(projectURL: URL, mutation: (inout ShareMetrics) -> Void) -> ShareMetrics {
+        if let metadata = mutateProjectMetadata(at: projectURL, mutation: { metadata in
+            var metrics = metadata.shareMetrics ?? ShareMetrics()
+            mutation(&metrics)
+            metadata.shareMetrics = metrics
+        }), let persisted = metadata.shareMetrics {
+            shareMetrics = persisted
+            return persisted
+        }
+
+        var fallback = shareMetrics
+        mutation(&fallback)
+        shareMetrics = fallback
+        return fallback
+    }
+
+    @discardableResult
+    private func recordShareClicked(projectURL: URL) -> ShareMetrics {
+        let metrics = mutateShareMetrics(projectURL: projectURL) { metrics in
+            metrics.shareClickedCount += 1
+        }
+        appendShareEvent(
+            name: "share_clicked",
+            projectURL: projectURL,
+            properties: ["share_clicked_count": String(metrics.shareClickedCount)]
+        )
+        return metrics
+    }
+
+    private func shareCaptionText(for splatURL: URL) -> String {
+        let projectLabel = currentProjectURL?.deletingPathExtension().lastPathComponent ?? "my project"
+        return """
+        I made a 3D memory with EasySplat (\(projectLabel)).
+        File: \(splatURL.lastPathComponent)
+
+        Build your own: https://github.com/dud8/EasySplat
+        """
+    }
+
+    private func normalizedShareServiceName(_ value: String) -> String {
+        let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed.isEmpty ? "Share Service" : trimmed
+    }
+
+    @discardableResult
+    private func copyToPasteboard(_ value: String) -> Bool {
+        let pasteboard = NSPasteboard.general
+        pasteboard.clearContents()
+        return pasteboard.setString(value, forType: .string)
+    }
+
+    private func appendShareEvent(name: String, projectURL: URL, properties: [String: String] = [:]) {
+        let logURL = ProjectPaths(root: projectURL).appEventsLogURL
+        let parent = logURL.deletingLastPathComponent()
+        try? FileManager.default.createDirectory(at: parent, withIntermediateDirectories: true)
+        let event = ShareEventRecord(
+            timestamp: Date(),
+            event: name,
+            properties: properties
+        )
+        let encoder = JSONEncoder()
+        encoder.dateEncodingStrategy = .iso8601
+        guard var payload = try? encoder.encode(event) else { return }
+        payload.append(0x0A)
+        FileManager.default.createFile(atPath: logURL.path, contents: nil)
+        guard let handle = try? FileHandle(forWritingTo: logURL) else { return }
+        defer { try? handle.close() }
+        do {
+            try handle.seekToEnd()
+            try handle.write(contentsOf: payload)
+        } catch {
+            return
+        }
+    }
+
     private func finalizeExitIfNeeded() {
         cancelForcedExitIfNeeded()
         let intent = exitIntent
@@ -557,6 +823,7 @@ final class AppModel: ObservableObject {
             let paths = ProjectPaths(root: projectURL)
             try paths.ensureDirectories()
             try ProjectMetadataStore.save(metadata, to: paths.metadataURL)
+            syncShareMetrics(for: projectURL)
 
             statusTitle = "Downloading tools"
             statusDetail = nil
@@ -583,6 +850,7 @@ final class AppModel: ObservableObject {
             if let output = try? ProjectMetadataStore.load(from: paths.metadataURL).outputs?.splatPlyPath {
                 outputPlyURL = projectURL.appendingPathComponent(output)
             }
+            syncShareMetrics(for: projectURL)
             viewState = .viewer
             refreshProjectSummaries()
         } catch is CancellationError {
@@ -633,7 +901,9 @@ final class AppModel: ObservableObject {
             let paths = ProjectPaths(root: url)
             let metadata = try ProjectMetadataStore.load(from: paths.metadataURL)
             currentProjectURL = url
+            syncShareMetrics(for: url)
             logLines = []
+            errorLogLines = []
             let previousLines = loadPipelineLogTail(projectURL: url)
             if !previousLines.isEmpty {
                 appendLogLine("========== PREVIOUS LOG (from Logs/pipeline.log) ==========")
@@ -648,6 +918,7 @@ final class AppModel: ObservableObject {
                 let outputURL = url.appendingPathComponent(output)
                 if FileManager.default.fileExists(atPath: outputURL.path) {
                     outputPlyURL = outputURL
+                    syncShareMetrics(for: url)
                     viewState = .viewer
                     return
                 }
@@ -679,6 +950,7 @@ final class AppModel: ObservableObject {
             if let output = try? ProjectMetadataStore.load(from: paths.metadataURL).outputs?.splatPlyPath {
                 outputPlyURL = url.appendingPathComponent(output)
             }
+            syncShareMetrics(for: url)
             viewState = .viewer
             refreshProjectSummaries()
         } catch is CancellationError {
@@ -742,6 +1014,7 @@ final class AppModel: ObservableObject {
             let sanitized = sanitizeLogLine(line)
             let trimmed = sanitized.trimmingCharacters(in: .whitespacesAndNewlines)
             guard !trimmed.isEmpty else { return }
+            let bypassThrottle = shouldBypassStageLogThrottle(line: trimmed, isError: isError)
 
             // Backstop against tools that spam redraw/progress output: keep Details useful, not noisy.
             let minInterval: TimeInterval = 0.5
@@ -749,7 +1022,7 @@ final class AppModel: ObservableObject {
                 if trimmed == lastStageLogMessage {
                     return
                 }
-                if now.timeIntervalSince(lastStageLogAt) < minInterval {
+                if !bypassThrottle && now.timeIntervalSince(lastStageLogAt) < minInterval {
                     return
                 }
             }
@@ -760,7 +1033,7 @@ final class AppModel: ObservableObject {
 
             let errPrefix = isError ? "[err] " : ""
             self.lastPipelineEventAt = now
-            appendLogLine("\(errPrefix)[\(stage.displayName)] \(trimmed)")
+            appendLogLine("\(errPrefix)[\(stage.displayName)] \(trimmed)", isError: isError)
         case .stageFinished(let stage):
             self.stage = stage
             self.progress = 1.0
@@ -776,7 +1049,7 @@ final class AppModel: ObservableObject {
             self.progress = nil
             self.lastPipelineEventAt = now
             self.errorDetails = debugMessage
-            appendLogLine("[err] \(userMessage)")
+            appendLogLine("[err] \(userMessage)", isError: true)
         }
     }
 
@@ -877,10 +1150,17 @@ final class AppModel: ObservableObject {
         return max(0, (current / bucketSize) * bucketSize)
     }
 
-    private func appendLogLine(_ line: String) {
+    private func appendLogLine(_ line: String, isError: Bool = false) {
         logLines.append(line)
-        if logLines.count > 500 {
-            logLines.removeFirst(logLines.count - 500)
+        if logLines.count > 2_000 {
+            logLines.removeFirst(logLines.count - 2_000)
+        }
+
+        if isError || isTracebackLine(line) {
+            errorLogLines.append(line)
+            if errorLogLines.count > 4_000 {
+                errorLogLines.removeFirst(errorLogLines.count - 4_000)
+            }
         }
     }
 
@@ -960,6 +1240,38 @@ final class AppModel: ObservableObject {
         return String(String.UnicodeScalarView(output))
     }
 
+    private func shouldBypassStageLogThrottle(line: String, isError: Bool) -> Bool {
+        if isError { return true }
+        let lower = line.lowercased()
+        if lower.hasPrefix("traceback (most recent call last):") {
+            return true
+        }
+        if lower.hasPrefix("during handling of the above exception") {
+            return true
+        }
+        if line.hasPrefix("File \"") && line.contains(", line ") {
+            return true
+        }
+        if line.hasPrefix("  File \"") && line.contains(", line ") {
+            return true
+        }
+        return false
+    }
+
+    private func isTracebackLine(_ line: String) -> Bool {
+        let lower = line.lowercased()
+        if lower.contains("traceback (most recent call last):") {
+            return true
+        }
+        if lower.contains("runtimeerror:") || lower.contains("typeerror:") || lower.contains("valueerror:") {
+            return true
+        }
+        if line.hasPrefix("File \"") || line.hasPrefix("  File \"") {
+            return true
+        }
+        return false
+    }
+
     private func reset() {
         cancelForcedExitIfNeeded()
         stage = nil
@@ -969,6 +1281,7 @@ final class AppModel: ObservableObject {
         stageStartedAt = nil
         lastPipelineEventAt = nil
         logLines = []
+        errorLogLines = []
         lastProgressLogAt = .distantPast
         lastProgressLogMessage = ""
         lastProgressLogStage = nil
@@ -994,6 +1307,11 @@ final class AppModel: ObservableObject {
         pendingSnapshotRevealURL = nil
         pendingSnapshotRevealRequiresExit = false
         recoveryPromptProject = nil
+        shareStatusMessage = nil
+        shareStatusIsError = false
+        shareMetrics = .init()
+        isShareSheetActive = false
+        activeShareSession = nil
     }
 
     private func completeStop() {
@@ -1226,6 +1544,49 @@ private final class ProgressForwarder: @unchecked Sendable {
     }
 }
 
+private struct ShareEventRecord: Codable {
+    let timestamp: Date
+    let event: String
+    let properties: [String: String]
+}
+
+@MainActor
+private final class ShareSession: NSObject, @preconcurrency NSSharingServicePickerDelegate, NSSharingServiceDelegate {
+    private weak var model: AppModel?
+    private let projectURL: URL
+
+    init(model: AppModel, projectURL: URL) {
+        self.model = model
+        self.projectURL = projectURL
+    }
+
+    func present(picker: NSSharingServicePicker, in sourceView: NSView) {
+        picker.delegate = self
+        let anchor = NSRect(x: sourceView.bounds.midX, y: sourceView.bounds.midY, width: 1, height: 1)
+        picker.show(relativeTo: anchor, of: sourceView, preferredEdge: .minY)
+    }
+
+    func sharingServicePicker(_ sharingServicePicker: NSSharingServicePicker, didChoose service: NSSharingService?) {
+        guard let service else {
+            model?.shareDidCancel(from: self, projectURL: projectURL)
+            model?.clearShareSession(self)
+            return
+        }
+        service.delegate = self
+        model?.shareServiceSelected(from: self, serviceName: service.title, projectURL: projectURL)
+    }
+
+    func sharingService(_ sharingService: NSSharingService, didShareItems items: [Any]) {
+        model?.shareDidComplete(from: self, serviceName: sharingService.title, projectURL: projectURL)
+        model?.clearShareSession(self)
+    }
+
+    func sharingService(_ sharingService: NSSharingService, didFailToShareItems items: [Any], error: Error) {
+        model?.shareDidFail(from: self, serviceName: sharingService.title, projectURL: projectURL, error: error)
+        model?.clearShareSession(self)
+    }
+}
+
 protocol PipelineRunning {
     func run(resumeFrom lastCompletedStage: PipelineStage?, events: @escaping @Sendable (PipelineEvent) -> Void) async throws
 }
@@ -1280,6 +1641,39 @@ extension AppModel {
 
     func test_applyToolchainProgress(fraction: Double, message: String) {
         handleToolchainProgress(fraction: fraction, message: message)
+    }
+
+    @discardableResult
+    func test_recordShareClicked(projectURL: URL) -> ShareMetrics {
+        recordShareClicked(projectURL: projectURL)
+    }
+
+    func test_recordShareCompleted(projectURL: URL, serviceName: String) {
+        let session = ShareSession(model: self, projectURL: projectURL)
+        activeShareSession = session
+        isShareSheetActive = true
+        shareDidComplete(from: session, serviceName: serviceName, projectURL: projectURL)
+        clearShareSession(session)
+    }
+
+    func test_recordShareCompletedFromInactiveSession(projectURL: URL, serviceName: String) {
+        let session = ShareSession(model: self, projectURL: projectURL)
+        shareDidComplete(from: session, serviceName: serviceName, projectURL: projectURL)
+    }
+
+    func test_shareEventsText(projectURL: URL) -> String {
+        let url = ProjectPaths(root: projectURL).appEventsLogURL
+        return (try? String(contentsOf: url, encoding: .utf8)) ?? ""
+    }
+
+    func test_activateShareSession(projectURL: URL) {
+        activeShareSession = ShareSession(model: self, projectURL: projectURL)
+        isShareSheetActive = true
+    }
+
+    func test_deactivateShareSession() {
+        activeShareSession = nil
+        isShareSheetActive = false
     }
 }
 #endif
