@@ -133,6 +133,39 @@ final class AppModelTests: XCTestCase {
         XCTAssertEqual(model.outputPlyURL, output)
     }
 
+    func testResumeProjectRunsPipelineWhenOutputPathIsDirectory() async throws {
+        let tempBase = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(at: tempBase, withIntermediateDirectories: true)
+        let projectURL = tempBase.appendingPathComponent("Project.easysplatproj", isDirectory: true)
+        try FileManager.default.createDirectory(at: projectURL, withIntermediateDirectories: true)
+        let paths = ProjectPaths(root: projectURL)
+        try paths.ensureDirectories()
+        let output = paths.outputURL.appendingPathComponent("splat.ply")
+        try FileManager.default.createDirectory(at: output, withIntermediateDirectories: true)
+
+        let metadata = ProjectMetadata(
+            title: "Project",
+            input: .photos(folder: "/tmp/photos"),
+            preset: PresetSpec(mode: .object, quality: .standard),
+            state: PipelineState(stage: .done, attempt: 0, lastError: nil, resumeToken: nil),
+            outputs: OutputSpec(splatPlyPath: "Output/splat.ply", colmapModelPath: "SfM/colmap/sparse/0")
+        )
+        try ProjectMetadataStore.save(metadata, to: paths.metadataURL)
+
+        let runner = DirectoryOutputRepairingPipelineRunner(projectURL: projectURL)
+        let model = AppModel(toolchainManager: MockToolchainManager(), projectBaseURL: tempBase) { _, _ in
+            runner
+        }
+
+        model.resumeProject(at: projectURL)
+        try await waitForViewState(model: model, state: .viewer)
+
+        XCTAssertTrue(runner.didRun)
+        var isDirectory = ObjCBool(false)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: output.path, isDirectory: &isDirectory))
+        XCTAssertFalse(isDirectory.boolValue)
+    }
+
     func testLoadPipelineLogTailWithInvalidUtf8() throws {
         let tempBase = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
         try FileManager.default.createDirectory(at: tempBase, withIntermediateDirectories: true)
@@ -173,6 +206,34 @@ final class AppModelTests: XCTestCase {
         XCTAssertEqual(statusByTitle["Ready"], .ready)
         XCTAssertEqual(statusByTitle["Failed"], .failed)
         XCTAssertEqual(statusByTitle["Progress"], .inProgress)
+    }
+
+    func testRefreshProjectSummariesDoesNotMarkOutputDirectoryReady() throws {
+        let base = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(at: base, withIntermediateDirectories: true)
+        let projectURL = base.appendingPathComponent("DirectoryOutput.easysplatproj", isDirectory: true)
+        try FileManager.default.createDirectory(at: projectURL, withIntermediateDirectories: true)
+        let paths = ProjectPaths(root: projectURL)
+        try paths.ensureDirectories()
+        try FileManager.default.createDirectory(
+            at: paths.outputURL.appendingPathComponent("splat.ply", isDirectory: true),
+            withIntermediateDirectories: true
+        )
+        let metadata = ProjectMetadata(
+            title: "DirectoryOutput",
+            input: .photos(folder: "/tmp/photos"),
+            preset: PresetSpec(mode: .object, quality: .standard),
+            state: PipelineState(stage: .done, attempt: 0, lastError: nil, resumeToken: nil),
+            outputs: OutputSpec(splatPlyPath: "Output/splat.ply", colmapModelPath: "SfM/colmap/sparse/0")
+        )
+        try ProjectMetadataStore.save(metadata, to: paths.metadataURL)
+
+        let model = AppModel(toolchainManager: MockToolchainManager(), projectBaseURL: base) { _, config in
+            MockPipelineRunner(projectURL: base, config: config)
+        }
+        model.refreshProjectSummaries()
+
+        XCTAssertEqual(model.projectSummaries.first?.status, .inProgress)
     }
 
     func testInterruptedProjectPromptDeferredPersistsAcrossRelaunch() throws {
@@ -394,6 +455,86 @@ final class AppModelTests: XCTestCase {
         }
         relaunched.refreshProjectSummaries()
         XCTAssertEqual(relaunched.recoveryPromptProject?.title, "InterruptedResume")
+    }
+
+    func testRefreshProjectSummariesReplacesStaleRecoveryPrompt() throws {
+        let base = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(at: base, withIntermediateDirectories: true)
+        let projectA = try makeProject(
+            at: base,
+            name: "InterruptedA",
+            lastError: nil,
+            withOutput: false,
+            checkpoint: PipelineCheckpoint(
+                stage: .trainBrush,
+                updatedAt: Date(),
+                progressFraction: 0.3,
+                message: "heartbeat",
+                details: nil
+            ),
+            stage: .trainBrush
+        )
+        _ = try makeProject(
+            at: base,
+            name: "InterruptedB",
+            lastError: nil,
+            withOutput: false,
+            checkpoint: PipelineCheckpoint(
+                stage: .sfmMatching,
+                updatedAt: Date(),
+                progressFraction: 0.2,
+                message: "heartbeat",
+                details: nil
+            ),
+            stage: .sfmMatching
+        )
+
+        let model = AppModel(toolchainManager: MockToolchainManager(), projectBaseURL: base) { _, config in
+            MockPipelineRunner(projectURL: projectA, config: config)
+        }
+        model.refreshProjectSummaries()
+        guard let summaryA = model.projectSummaries.first(where: { $0.title == "InterruptedA" }) else {
+            XCTFail("Expected interrupted project A")
+            return
+        }
+        model.recoveryPromptProject = summaryA
+
+        let paths = ProjectPaths(root: projectA)
+        try FileManager.default.createDirectory(at: paths.outputURL, withIntermediateDirectories: true)
+        try Data("ply".utf8).write(to: paths.outputURL.appendingPathComponent("splat.ply"))
+        var metadata = try ProjectMetadataStore.load(from: paths.metadataURL)
+        metadata.outputs = OutputSpec(splatPlyPath: "Output/splat.ply", colmapModelPath: "SfM/colmap/sparse/0")
+        metadata.state = PipelineState(stage: .done, attempt: metadata.state.attempt, lastError: nil, resumeToken: nil)
+        metadata.checkpoint = nil
+        try ProjectMetadataStore.save(metadata, to: paths.metadataURL)
+
+        model.refreshProjectSummaries()
+
+        XCTAssertEqual(model.recoveryPromptProject?.title, "InterruptedB")
+    }
+
+    func testAppConfigLoadsBundledPublicKeyAndHonorsEnvOverrides() async throws {
+        let expectedPublicKey = try String(contentsOf: appResourceURL(named: "public_key_ed25519.txt"), encoding: .utf8)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+
+        await withAppEnvironmentAsync([
+            "EASYSPLAT_PROJECT_HOME_URL": nil,
+            "EASYSPLAT_TOOLCHAIN_MANIFEST_URL": nil,
+            "EASYSPLAT_TOOLCHAIN_PUBLIC_KEY_BASE64": nil,
+        ]) {
+            XCTAssertEqual(AppConfig.toolchainPublicKeyBase64, expectedPublicKey)
+            XCTAssertFalse(AppConfig.toolchainPublicKeyBase64.isEmpty)
+        }
+
+        await withAppEnvironmentAsync([
+            "EASYSPLAT_PROJECT_HOME_URL": "https://example.com/project-home",
+            "EASYSPLAT_TOOLCHAIN_MANIFEST_URL": "https://example.com/toolchain/manifest.json",
+            "EASYSPLAT_TOOLCHAIN_PUBLIC_KEY_BASE64": "OVERRIDE_PUBLIC_KEY_BASE64",
+        ]) {
+            XCTAssertEqual(AppConfig.projectHomeURL.absoluteString, "https://example.com/project-home")
+            XCTAssertEqual(AppConfig.toolchainManifestURL.absoluteString, "https://example.com/toolchain/manifest.json")
+            XCTAssertEqual(AppConfig.toolchainPublicKeyBase64, "OVERRIDE_PUBLIC_KEY_BASE64")
+        }
     }
 
     func testErrorDetailsTextCombinesFields() {
@@ -752,6 +893,91 @@ final class AppModelTests: XCTestCase {
     }
 }
 
+private actor AppTestEnvironmentLock {
+    static let shared = AppTestEnvironmentLock()
+    private var locked = false
+    private var waiters: [CheckedContinuation<Void, Never>] = []
+
+    func lock() async {
+        if !locked {
+            locked = true
+            return
+        }
+        await withCheckedContinuation { continuation in
+            waiters.append(continuation)
+        }
+    }
+
+    func unlock() {
+        if waiters.isEmpty {
+            locked = false
+            return
+        }
+        let next = waiters.removeFirst()
+        next.resume()
+    }
+}
+
+@MainActor
+@discardableResult
+private func withAppEnvironmentAsync<T>(
+    _ changes: [String: String?],
+    _ body: () async throws -> T
+) async rethrows -> T {
+    await AppTestEnvironmentLock.shared.lock()
+    let previous = captureAppEnvironment(changes)
+    applyAppEnvironment(changes)
+    do {
+        let result = try await body()
+        restoreAppEnvironment(previous)
+        await AppTestEnvironmentLock.shared.unlock()
+        return result
+    } catch {
+        restoreAppEnvironment(previous)
+        await AppTestEnvironmentLock.shared.unlock()
+        throw error
+    }
+}
+
+private func appResourceURL(named name: String) -> URL {
+    URL(fileURLWithPath: #filePath)
+        .deletingLastPathComponent()
+        .deletingLastPathComponent()
+        .appendingPathComponent("EasySplatApp/Resources/\(name)")
+}
+
+private func captureAppEnvironment(_ changes: [String: String?]) -> [String: String?] {
+    var previous: [String: String?] = [:]
+    for key in changes.keys {
+        if let value = getenv(key) {
+            previous[key] = String(cString: value)
+        } else {
+            previous[key] = nil
+        }
+    }
+    return previous
+}
+
+private func applyAppEnvironment(_ changes: [String: String?]) {
+    for (key, value) in changes {
+        if let value {
+            setenv(key, value, 1)
+        } else {
+            unsetenv(key)
+        }
+    }
+}
+
+private func restoreAppEnvironment(_ previous: [String: String?]) {
+    for (key, value) in previous {
+        if let value {
+            setenv(key, value, 1)
+        } else {
+            unsetenv(key)
+        }
+    }
+}
+
 final class MockToolchainManager: ToolchainManaging {
     func ensureToolchain(
         manifestURL: URL,
@@ -816,6 +1042,31 @@ final class MockPipelineRunner: PipelineRunning {
         let outputURL = paths.outputURL.appendingPathComponent("splat.ply")
         try FileManager.default.createDirectory(at: paths.outputURL, withIntermediateDirectories: true)
         try Data("ply".utf8).write(to: outputURL)
+        metadata.outputs = OutputSpec(splatPlyPath: "Output/splat.ply", colmapModelPath: "SfM/colmap/sparse/0")
+        metadata.state = PipelineState(stage: .done, attempt: 0, lastError: nil, resumeToken: nil)
+        try ProjectMetadataStore.save(metadata, to: paths.metadataURL)
+    }
+}
+
+final class DirectoryOutputRepairingPipelineRunner: PipelineRunning {
+    private let projectURL: URL
+    private(set) var didRun = false
+
+    init(projectURL: URL) {
+        self.projectURL = projectURL
+    }
+
+    func run(resumeFrom lastCompletedStage: PipelineStage?, events: @escaping @Sendable (PipelineEvent) -> Void) async throws {
+        didRun = true
+        let paths = ProjectPaths(root: projectURL)
+        let outputURL = paths.outputURL.appendingPathComponent("splat.ply")
+        if FileManager.default.fileExists(atPath: outputURL.path) {
+            try FileManager.default.removeItem(at: outputURL)
+        }
+        try FileManager.default.createDirectory(at: paths.outputURL, withIntermediateDirectories: true)
+        try Data("ply".utf8).write(to: outputURL)
+
+        var metadata = try ProjectMetadataStore.load(from: paths.metadataURL)
         metadata.outputs = OutputSpec(splatPlyPath: "Output/splat.ply", colmapModelPath: "SfM/colmap/sparse/0")
         metadata.state = PipelineState(stage: .done, attempt: 0, lastError: nil, resumeToken: nil)
         try ProjectMetadataStore.save(metadata, to: paths.metadataURL)

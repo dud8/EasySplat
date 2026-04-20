@@ -4,7 +4,9 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 MANIFEST_URL=""
 PUBLIC_KEY_PATH=""
+PROJECT_URL=""
 VERSION=""
+XCODEBUILD_BIN="${EASYSPLAT_XCODEBUILD_BIN:-xcodebuild}"
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -14,6 +16,10 @@ while [[ $# -gt 0 ]]; do
       ;;
     --public-key-path)
       PUBLIC_KEY_PATH="$2"
+      shift 2
+      ;;
+    --project-url)
+      PROJECT_URL="$2"
       shift 2
       ;;
     --version)
@@ -28,7 +34,7 @@ while [[ $# -gt 0 ]]; do
 done
 
 if [ -z "$MANIFEST_URL" ] || [ -z "$PUBLIC_KEY_PATH" ] || [ -z "$VERSION" ]; then
-  echo "Usage: build_app.sh --manifest-url <url> --public-key-path <path> --version <semver>" >&2
+  echo "Usage: build_app.sh --manifest-url <url> --public-key-path <path> --version <semver> [--project-url <url>]" >&2
   exit 1
 fi
 
@@ -37,57 +43,39 @@ if [ ! -f "$PUBLIC_KEY_PATH" ]; then
   exit 1
 fi
 
-MANIFEST_RESOURCE="$ROOT/EasySplatApp/Resources/toolchain_manifest_url.txt"
-PUBLIC_KEY_RESOURCE="$ROOT/EasySplatApp/Resources/public_key_ed25519.txt"
-
-ORIG_MANIFEST_TMP=""
-ORIG_MANIFEST_PRESENT=0
-ORIG_PUBLIC_TMP=""
-ORIG_PUBLIC_PRESENT=0
-
-if [ -f "$MANIFEST_RESOURCE" ]; then
-  ORIG_MANIFEST_PRESENT=1
-  ORIG_MANIFEST_TMP="$(mktemp "${TMPDIR:-/tmp}/easysplat_manifest.XXXXXX")"
-  cp "$MANIFEST_RESOURCE" "$ORIG_MANIFEST_TMP"
+if [ "${XCODEBUILD_BIN##*/}" = "xcodebuild" ]; then
+  if ! "$XCODEBUILD_BIN" -license check >/dev/null 2>&1; then
+    echo "Xcode license not accepted. Run: sudo xcodebuild -license accept" >&2
+    exit 1
+  fi
 fi
 
-if [ -f "$PUBLIC_KEY_RESOURCE" ]; then
-  ORIG_PUBLIC_PRESENT=1
-  ORIG_PUBLIC_TMP="$(mktemp "${TMPDIR:-/tmp}/easysplat_public.XXXXXX")"
-  cp "$PUBLIC_KEY_RESOURCE" "$ORIG_PUBLIC_TMP"
+if [ "${EASYSPLAT_SKIP_METAL_TOOLCHAIN_CHECK:-}" != "1" ] && [ "${XCODEBUILD_BIN##*/}" = "xcodebuild" ]; then
+  if ! xcrun -sdk macosx metal -v >/dev/null 2>&1; then
+    echo "Metal Toolchain not installed. Run: xcodebuild -downloadComponent MetalToolchain" >&2
+    exit 1
+  fi
 fi
-
-cleanup() {
-  if [ "$ORIG_MANIFEST_PRESENT" -eq 1 ] && [ -n "$ORIG_MANIFEST_TMP" ]; then
-    cp "$ORIG_MANIFEST_TMP" "$MANIFEST_RESOURCE"
-    rm -f "$ORIG_MANIFEST_TMP"
-  else
-    rm -f "$MANIFEST_RESOURCE"
-  fi
-
-  if [ "$ORIG_PUBLIC_PRESENT" -eq 1 ] && [ -n "$ORIG_PUBLIC_TMP" ]; then
-    cp "$ORIG_PUBLIC_TMP" "$PUBLIC_KEY_RESOURCE"
-    rm -f "$ORIG_PUBLIC_TMP"
-  else
-    rm -f "$PUBLIC_KEY_RESOURCE"
-  fi
-}
-trap cleanup EXIT
-
-printf "%s" "$MANIFEST_URL" > "$MANIFEST_RESOURCE"
-cp "$PUBLIC_KEY_PATH" "$PUBLIC_KEY_RESOURCE"
 
 DERIVED="$ROOT/build/DerivedData"
 OUT="$ROOT/build/Export"
 BIN_PATH="$DERIVED/Build/Products/Release/EasySplatApp"
 APP_BUNDLE="$OUT/EasySplat.app"
 RES_DIR="$APP_BUNDLE/Contents/Resources"
-LIB_DIR="$APP_BUNDLE/Contents/lib"
 MACOS_DIR="$APP_BUNDLE/Contents/MacOS"
+OVERRIDE_RES_DIR="$OUT/AppResourcesOverride"
+
+if [ -z "$PROJECT_URL" ]; then
+  if [[ "$MANIFEST_URL" == *"/releases/"* ]]; then
+    PROJECT_URL="${MANIFEST_URL%/releases/*}"
+  elif [ -f "$ROOT/EasySplatApp/Resources/project_home_url.txt" ]; then
+    PROJECT_URL="$(cat "$ROOT/EasySplatApp/Resources/project_home_url.txt")"
+  fi
+fi
 
 rm -rf "$DERIVED" "$OUT"
 
-xcodebuild \
+"$XCODEBUILD_BIN" \
   -scheme EasySplatApp \
   -configuration Release \
   -destination "platform=macOS" \
@@ -100,7 +88,7 @@ if [ ! -f "$BIN_PATH" ]; then
 fi
 
 rm -rf "$APP_BUNDLE"
-mkdir -p "$MACOS_DIR" "$RES_DIR" "$LIB_DIR"
+mkdir -p "$MACOS_DIR" "$RES_DIR"
 
 cp "$BIN_PATH" "$MACOS_DIR/EasySplatApp"
 chmod +x "$MACOS_DIR/EasySplatApp"
@@ -135,17 +123,22 @@ if [ -d "$ROOT/EasySplatApp/Resources" ]; then
   cp -R "$ROOT/EasySplatApp/Resources/." "$RES_DIR/"
 fi
 
+mkdir -p "$OVERRIDE_RES_DIR"
+printf "%s" "$MANIFEST_URL" > "$OVERRIDE_RES_DIR/toolchain_manifest_url.txt"
+cp "$PUBLIC_KEY_PATH" "$OVERRIDE_RES_DIR/public_key_ed25519.txt"
+printf "%s" "$PROJECT_URL" > "$OVERRIDE_RES_DIR/project_home_url.txt"
+cp -R "$OVERRIDE_RES_DIR/." "$RES_DIR/"
+
 # Copy SwiftPM resource bundles (if present)
 if [ -d "$DERIVED/Build/Products/Release/EasySplat_EasySplatApp.bundle" ]; then
   cp -R "$DERIVED/Build/Products/Release/EasySplat_EasySplatApp.bundle" "$RES_DIR/"
+  cp -R "$OVERRIDE_RES_DIR/." "$RES_DIR/EasySplat_EasySplatApp.bundle/"
+  if [ -d "$RES_DIR/EasySplat_EasySplatApp.bundle/Contents/Resources" ]; then
+    cp -R "$OVERRIDE_RES_DIR/." "$RES_DIR/EasySplat_EasySplatApp.bundle/Contents/Resources/"
+  fi
 fi
 if [ -d "$DERIVED/Build/Products/Release/MetalSplatter_MetalSplatter.bundle" ]; then
   cp -R "$DERIVED/Build/Products/Release/MetalSplatter_MetalSplatter.bundle" "$RES_DIR/"
-fi
-
-# Copy Sparkle framework into rpath @executable_path/../lib
-if [ -d "$DERIVED/Build/Products/Release/Sparkle.framework" ]; then
-  cp -R "$DERIVED/Build/Products/Release/Sparkle.framework" "$LIB_DIR/"
 fi
 
 echo "Built app at: $APP_BUNDLE"

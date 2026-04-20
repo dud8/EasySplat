@@ -81,6 +81,26 @@ def _rotmat_to_quat_wxyz(R: np.ndarray) -> np.ndarray:
     return q
 
 
+def _colmap_camera_params(
+    intrinsics_3x3: np.ndarray,
+    width: int,
+    height: int,
+    vggt_resolution: int,
+    camera_type: str,
+) -> list[float]:
+    max_dim = max(width, height)
+    resize_ratio = float(max_dim) / float(vggt_resolution)
+    fx = float(intrinsics_3x3[0, 0]) * resize_ratio
+    fy = float(intrinsics_3x3[1, 1]) * resize_ratio
+    cx = float(width) / 2.0
+    cy = float(height) / 2.0
+    if camera_type == "PINHOLE":
+        return [fx, fy, cx, cy]
+    if camera_type == "SIMPLE_PINHOLE":
+        return [(fx + fy) / 2.0, cx, cy]
+    raise ValueError(f"Camera type {camera_type} is not supported yet")
+
+
 def _write_colmap_text_model(
     out_dir: Path,
     image_paths: list[Path],
@@ -90,6 +110,8 @@ def _write_colmap_text_model(
     vggt_resolution: int,
     points_xyz: np.ndarray,
     points_rgb: np.ndarray,
+    camera_type: str = "SIMPLE_PINHOLE",
+    shared_camera: bool = False,
 ) -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -97,20 +119,24 @@ def _write_colmap_text_model(
     images_txt = out_dir / "images.txt"
     points_txt = out_dir / "points3D.txt"
 
-    # Cameras: one camera per image (simple + robust).
+    if camera_type not in {"PINHOLE", "SIMPLE_PINHOLE"}:
+        raise ValueError(f"Camera type {camera_type} is not supported yet")
+
+    camera_rows = []
+    for i, (w, h) in enumerate(original_sizes_wh):
+        cam_id = i + 1
+        params = _colmap_camera_params(intrinsics_3x3[i], w, h, vggt_resolution, camera_type)
+        camera_rows.append((cam_id, camera_type, w, h, params))
+        if shared_camera:
+            break
+
     with cameras_txt.open("w", encoding="utf-8") as f:
         f.write("# Camera list with one line per camera:\n")
         f.write("#   CAMERA_ID, MODEL, WIDTH, HEIGHT, PARAMS[]\n")
-        f.write(f"# Number of cameras: {len(image_paths)}\n")
-        for i, (w, h) in enumerate(original_sizes_wh):
-            cam_id = i + 1
-            max_dim = max(w, h)
-            resize_ratio = float(max_dim) / float(vggt_resolution)
-            fx = float(intrinsics_3x3[i, 0, 0]) * resize_ratio
-            fy = float(intrinsics_3x3[i, 1, 1]) * resize_ratio
-            cx = float(w) / 2.0
-            cy = float(h) / 2.0
-            f.write(f"{cam_id} PINHOLE {w} {h} {fx} {fy} {cx} {cy}\n")
+        f.write(f"# Number of cameras: {len(camera_rows)}\n")
+        for cam_id, model, w, h, params in camera_rows:
+            param_text = " ".join(str(float(param)) for param in params)
+            f.write(f"{cam_id} {model} {w} {h} {param_text}\n")
 
     # Images: write only image lines (points lines are optional and often omitted).
     with images_txt.open("w", encoding="utf-8") as f:
@@ -120,7 +146,7 @@ def _write_colmap_text_model(
         f.write(f"# Number of images: {len(image_paths)}, mean observations per image: 0\n")
         for i, path in enumerate(image_paths):
             image_id = i + 1
-            cam_id = i + 1
+            cam_id = 1 if shared_camera else i + 1
             R = extrinsics_w2c[i, :3, :3]
             t = extrinsics_w2c[i, :3, 3]
             q = _rotmat_to_quat_wxyz(R)
@@ -433,6 +459,10 @@ def main(argv: list[str] | None = None) -> int:
     if not image_paths:
         print(f"VGGT: no supported images found in {images_dir}", file=sys.stderr)
         return 2
+    camera_type = str(args.camera_type)
+    if camera_type not in {"PINHOLE", "SIMPLE_PINHOLE"}:
+        print(f"VGGT: unsupported camera type: {camera_type}", file=sys.stderr)
+        return 2
 
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
@@ -534,7 +564,7 @@ def main(argv: list[str] | None = None) -> int:
                     masks=track_mask,
                     max_reproj_error=float(args.max_reproj_error),
                     shared_camera=bool(args.shared_camera),
-                    camera_type=str(args.camera_type),
+                    camera_type=camera_type,
                     points_rgb=points_rgb,
                 )
 
@@ -734,6 +764,8 @@ def main(argv: list[str] | None = None) -> int:
         vggt_resolution=vggt_res,
         points_xyz=points_xyz,
         points_rgb=points_rgb,
+        camera_type=camera_type,
+        shared_camera=bool(args.shared_camera),
     )
 
     print("VGGT: done")

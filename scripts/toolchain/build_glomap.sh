@@ -25,7 +25,7 @@ git -C "$SRC" fetch --depth 1 origin "$GLOMAP_REF"
 git -C "$SRC" checkout -q FETCH_HEAD
 
 if ! grep -q "COLMAP_INCLUDE_DIR" "$SRC/glomap/CMakeLists.txt"; then
-  python - <<'PY'
+  SRC="$SRC" python - <<'PY'
 import os
 from pathlib import Path
 

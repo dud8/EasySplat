@@ -6,6 +6,7 @@ VERSION=""
 MANIFEST_URL=""
 CORE_ARTIFACT_URL=""
 MODELS_ARTIFACT_URL=""
+PROJECT_URL=""
 PORT="${EASYSPLAT_DEV_PORT:-8000}"
 
 while [[ $# -gt 0 ]]; do
@@ -30,6 +31,10 @@ while [[ $# -gt 0 ]]; do
       MODELS_ARTIFACT_URL="$2"
       shift 2
       ;;
+    --project-url)
+      PROJECT_URL="$2"
+      shift 2
+      ;;
     --port)
       PORT="$2"
       shift 2
@@ -42,7 +47,7 @@ while [[ $# -gt 0 ]]; do
 done
 
 if [ -z "$VERSION" ]; then
-  echo "Usage: build_dmg.sh --version <semver> [--manifest-url <url>] [--core-artifact-url <url>] [--models-artifact-url <url>] [--port <port>]" >&2
+  echo "Usage: build_dmg.sh --version <semver> [--manifest-url <url>] [--core-artifact-url <url>] [--models-artifact-url <url>] [--project-url <url>] [--port <port>]" >&2
   exit 1
 fi
 
@@ -50,10 +55,10 @@ if [ -z "$MANIFEST_URL" ]; then
   MANIFEST_URL="http://localhost:$PORT/manifest.json"
 fi
 if [ -z "$CORE_ARTIFACT_URL" ]; then
-  CORE_ARTIFACT_URL="http://localhost:$PORT/toolchain-macos-arm64-$VERSION-core.zip"
+  CORE_ARTIFACT_URL="http://localhost:$PORT/out/toolchain-macos-arm64-$VERSION-core.zip"
 fi
 if [ -z "$MODELS_ARTIFACT_URL" ]; then
-  MODELS_ARTIFACT_URL="http://localhost:$PORT/toolchain-macos-arm64-$VERSION-models.zip"
+  MODELS_ARTIFACT_URL="http://localhost:$PORT/out/toolchain-macos-arm64-$VERSION-models.zip"
 fi
 
 if command -v xcodebuild >/dev/null 2>&1; then
@@ -97,10 +102,16 @@ swift run --package-path "$ROOT/Tools/ManifestTool" ManifestTool \
   --private-key "$(cat "$PRIV")" \
   --manifest-out "$MANIFEST"
 
-"$ROOT/scripts/release/build_app.sh" \
-  --manifest-url "$MANIFEST_URL" \
-  --public-key-path "$PUB" \
+build_app_args=(
+  --manifest-url "$MANIFEST_URL"
+  --public-key-path "$PUB"
   --version "$VERSION"
+)
+if [ -n "$PROJECT_URL" ]; then
+  build_app_args+=(--project-url "$PROJECT_URL")
+fi
+
+"$ROOT/scripts/release/build_app.sh" "${build_app_args[@]}"
 
 APP_PATH="$ROOT/build/Export/EasySplat.app"
 OUT_DIR="$ROOT/release/DMG"

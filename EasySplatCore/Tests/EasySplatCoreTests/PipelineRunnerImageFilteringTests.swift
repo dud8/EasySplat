@@ -105,6 +105,82 @@ final class PipelineRunnerImageFilteringTests: XCTestCase {
         XCTAssertEqual(Set(photos.map(\.lastPathComponent)), Set(["root.jpg", "inner.jpg"]))
     }
 
+    func testLoadPhotosIncludesHeifForTranscode() throws {
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+
+        let heifURL = dir.appendingPathComponent("photo.heif")
+        try Data("heif".utf8).write(to: heifURL)
+
+        let projectURL = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(at: projectURL, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: projectURL) }
+
+        let vggt = try TestToolchains.vggtToolchain(root: projectURL)
+        let fastvggt = try TestToolchains.fastVggtToolchain(root: projectURL)
+        let toolchain = ToolchainPaths(
+            root: projectURL,
+            colmap: projectURL,
+            glomap: projectURL,
+            brush: projectURL,
+            vggt: vggt,
+            fastvggt: fastvggt
+        )
+        let config = PipelineRunner.PipelineConfig(toolchain: toolchain, preset: PresetSpec(mode: .object, quality: .standard))
+        let runner = PipelineRunner(projectURL: projectURL, config: config)
+
+        let photos = try runner.loadPhotosForTesting(in: dir)
+        XCTAssertEqual(photos.map(\.lastPathComponent), ["photo.heif"])
+    }
+
+    func testImportInputsKeepsDuplicateVideoBasenamesSeparate() throws {
+        let sourceRoot = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(at: sourceRoot, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: sourceRoot) }
+
+        let firstDir = sourceRoot.appendingPathComponent("a", isDirectory: true)
+        let secondDir = sourceRoot.appendingPathComponent("b", isDirectory: true)
+        try FileManager.default.createDirectory(at: firstDir, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: secondDir, withIntermediateDirectories: true)
+        let firstVideo = firstDir.appendingPathComponent("clip.mov")
+        let secondVideo = secondDir.appendingPathComponent("clip.mov")
+        try Data("first".utf8).write(to: firstVideo)
+        try Data("second".utf8).write(to: secondVideo)
+
+        let projectURL = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(at: projectURL, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: projectURL) }
+
+        let paths = ProjectPaths(root: projectURL)
+        try paths.ensureDirectories()
+        let vggt = try TestToolchains.vggtToolchain(root: projectURL)
+        let fastvggt = try TestToolchains.fastVggtToolchain(root: projectURL)
+        let toolchain = ToolchainPaths(
+            root: projectURL,
+            colmap: projectURL,
+            glomap: projectURL,
+            brush: projectURL,
+            vggt: vggt,
+            fastvggt: fastvggt
+        )
+        let config = PipelineRunner.PipelineConfig(toolchain: toolchain, preset: PresetSpec(mode: .object, quality: .standard))
+        let runner = PipelineRunner(projectURL: projectURL, config: config)
+        let metadata = ProjectMetadata(
+            title: "Videos",
+            input: .video(files: [firstVideo.path, secondVideo.path]),
+            preset: PresetSpec(mode: .object, quality: .standard)
+        )
+
+        try runner.importInputs(metadata: metadata, paths: paths) { _, _ in }
+
+        let imported = try FileManager.default.contentsOfDirectory(at: paths.originalsURL, includingPropertiesForKeys: nil)
+            .sorted { $0.lastPathComponent < $1.lastPathComponent }
+        XCTAssertEqual(imported.map(\.lastPathComponent), ["clip-2.mov", "clip.mov"])
+        XCTAssertEqual(try String(contentsOf: paths.originalsURL.appendingPathComponent("clip.mov"), encoding: .utf8), "first")
+        XCTAssertEqual(try String(contentsOf: paths.originalsURL.appendingPathComponent("clip-2.mov"), encoding: .utf8), "second")
+    }
+
     func testLoadPhotosSkipsGeneratedProjectDirectoriesAtProjectRoot() throws {
         let dir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
         try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)

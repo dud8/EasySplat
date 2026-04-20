@@ -1,0 +1,512 @@
+import AppKit
+import EasySplatCore
+import Foundation
+
+extension AppModel {
+    func cancelCurrentProject(deleteProject: Bool, exitIntent: ExitIntent = .none, window: NSWindow? = nil) {
+        if exitIntent != .none {
+            self.exitIntent = exitIntent
+            self.pendingCloseWindow = window
+        }
+
+        if !deleteProject,
+           exitIntent != .none,
+           stage == .trainBrush,
+           let projectURL = currentProjectURL {
+            let snapshotURL = ProjectPaths(root: projectURL)
+                .trainingURL
+                .appendingPathComponent("latest_snapshot.ply")
+            pendingSnapshotRevealURL = snapshotURL
+            pendingSnapshotRevealRequiresExit = true
+        }
+
+        guard currentTask != nil else {
+            let projectURL = currentProjectURL
+            if !deleteProject, let projectURL {
+                suppressRecoveryPrompt(for: projectURL, clearLastRunStartedAt: true)
+            }
+            reset()
+            viewState = .home
+            if deleteProject, let projectURL {
+                try? FileManager.default.removeItem(at: projectURL)
+            }
+            refreshProjectSummaries()
+            finalizeExitIfNeeded()
+            return
+        }
+
+        stopAction = deleteProject ? .deleteProject : .keepProject
+        lastError = nil
+        errorDetails = nil
+        if deleteProject {
+            statusTitle = "Stopping and deleting…"
+            statusDetail = "Stopping at the next safe point (up to 15 seconds)…"
+        } else if stage == .trainBrush {
+            statusTitle = "Exporting snapshot…"
+            statusDetail = "Exporting the latest snapshot (training restarts from scratch on resume)."
+        } else {
+            statusTitle = "Saving progress…"
+            statusDetail = "Stopping at the next safe point (up to 15 seconds)…"
+        }
+        progress = nil
+        currentTask?.cancel()
+        scheduleForcedExitIfNeeded()
+    }
+
+    func awaitTrainingConsent() async -> Bool {
+        if UserDefaults.standard.bool(forKey: Self.trainingConsentRememberedKey) {
+            return true
+        }
+        if trainingConsentContinuation != nil || Task.isCancelled {
+            return false
+        }
+        return await withTaskCancellationHandler(operation: {
+            await withCheckedContinuation { continuation in
+                if Task.isCancelled {
+                    continuation.resume(returning: false)
+                    return
+                }
+                trainingConsentContinuation = continuation
+                isShowingTrainingConsent = true
+                if stage == .trainBrush, trainingConsentPauseStartedAt == nil {
+                    trainingConsentPauseStartedAt = Date()
+                }
+            }
+        }, onCancel: { [weak self] in
+            guard let self else { return }
+            Task { @MainActor in
+                self.resolveTrainingConsent(accepted: false, remember: false)
+            }
+        })
+    }
+
+    func resolveTrainingConsent(accepted: Bool, remember: Bool) {
+        guard let continuation = trainingConsentContinuation else { return }
+        trainingConsentContinuation = nil
+        isShowingTrainingConsent = false
+        if let pauseStartedAt = trainingConsentPauseStartedAt {
+            trainingConsentPausedDuration += Date().timeIntervalSince(pauseStartedAt)
+            trainingConsentPauseStartedAt = nil
+        }
+        if remember && accepted {
+            UserDefaults.standard.set(true, forKey: Self.trainingConsentRememberedKey)
+        }
+        continuation.resume(returning: accepted)
+    }
+
+    func elapsedSinceStageStart(now: Date) -> TimeInterval? {
+        guard let startedAt = stageStartedAt else { return nil }
+        var pausedDuration = trainingConsentPausedDuration
+        if let pauseStartedAt = trainingConsentPauseStartedAt {
+            pausedDuration += now.timeIntervalSince(pauseStartedAt)
+        }
+        let elapsed = now.timeIntervalSince(startedAt) - pausedDuration
+        return max(0, elapsed)
+    }
+
+    func presentExitConfirmation(for stage: PipelineStage?) -> ExitDecision {
+        let isTraining = stage == .trainBrush
+        let alert = NSAlert()
+        alert.alertStyle = .warning
+        alert.messageText = isTraining ? "Training in progress" : "Stop this project?"
+        alert.informativeText = isTraining
+            ? "Exporting keeps only a snapshot. If you resume, training starts over from scratch."
+            : "You can save and resume later, or delete the project."
+        alert.addButton(withTitle: isTraining ? "Export Snapshot" : "Save Project")
+        alert.addButton(withTitle: "Delete Project")
+        alert.addButton(withTitle: "Cancel")
+        switch alert.runModal() {
+        case .alertFirstButtonReturn:
+            return .save
+        case .alertSecondButtonReturn:
+            return .delete
+        default:
+            return .cancel
+        }
+    }
+
+    func registerExitIntent(_ intent: ExitIntent, window: NSWindow? = nil) {
+        exitIntent = intent
+        pendingCloseWindow = window
+        if isStopping {
+            scheduleForcedExitIfNeeded()
+        }
+    }
+
+    func consumeWindowCloseBypass(for window: NSWindow) -> Bool {
+        guard allowNextWindowClose, pendingCloseWindow === window else { return false }
+        allowNextWindowClose = false
+        pendingCloseWindow = nil
+        exitIntent = .none
+        return true
+    }
+
+    func makeTrainingGate() -> (@Sendable () async throws -> Void) {
+        let modelBox = WeakAppModelBox(self)
+        return {
+            guard let model = modelBox.value else { return }
+            let allowed = await model.awaitTrainingConsent()
+            if !allowed {
+                await model.cancelCurrentProject(deleteProject: false)
+                throw CancellationError()
+            }
+        }
+    }
+
+    func scheduleForcedExitIfNeeded() {
+        guard exitIntent != .none else { return }
+        forcedExitTask?.cancel()
+        let intent = exitIntent
+        forcedExitTask = Task { [weak self, weak window = pendingCloseWindow] in
+            try? await Task.sleep(nanoseconds: Self.forcedExitTimeoutNanoseconds)
+            await MainActor.run {
+                guard let self else { return }
+                guard self.stopAction != nil else { return }
+                self.forceFinalizeExit(intent: intent, window: window)
+            }
+        }
+    }
+
+    func cancelForcedExitIfNeeded() {
+        forcedExitTask?.cancel()
+        forcedExitTask = nil
+    }
+
+    func forceFinalizeExit(intent: ExitIntent, window: NSWindow?) {
+        switch intent {
+        case .none:
+            return
+        case .quit:
+            exitIntent = .none
+            pendingCloseWindow = nil
+            NSApp.reply(toApplicationShouldTerminate: true)
+            NSApp.terminate(nil)
+        case .closeWindow:
+            exitIntent = .none
+            pendingCloseWindow = nil
+            if let window {
+                allowNextWindowClose = true
+                window.performClose(nil)
+            }
+        }
+    }
+
+    func finalizeExitIfNeeded() {
+        cancelForcedExitIfNeeded()
+        switch exitIntent {
+        case .none:
+            break
+        case .quit:
+            exitIntent = .none
+            pendingCloseWindow = nil
+            NSApp.reply(toApplicationShouldTerminate: true)
+            NSApp.terminate(nil)
+        case .closeWindow:
+            if let window = pendingCloseWindow {
+                allowNextWindowClose = true
+                window.performClose(nil)
+            }
+        }
+    }
+
+    func presentSnapshotRevealIfAvailable(_ snapshotURL: URL) {
+        guard FileManager.default.fileExists(atPath: snapshotURL.path) else { return }
+        let alert = NSAlert()
+        alert.alertStyle = .informational
+        alert.messageText = "Snapshot exported"
+        alert.informativeText = "You can open the snapshot in Finder before exiting."
+        alert.addButton(withTitle: "Open in Finder")
+        alert.addButton(withTitle: "Continue")
+        if alert.runModal() == .alertFirstButtonReturn {
+            NSWorkspace.shared.activateFileViewerSelecting([snapshotURL])
+        }
+    }
+
+    func startProject(input: InputSpec, title: String) async {
+        defer {
+            currentTask = nil
+            if stopAction != nil {
+                completeStop()
+            }
+        }
+        reset()
+        viewState = .processing
+        statusTitle = "Preparing project"
+        statusDetail = nil
+        progress = nil
+
+        do {
+            let projectURL = try createProjectDirectory(title: title)
+            currentProjectURL = projectURL
+            let metadata = ProjectMetadata(
+                title: projectURL.deletingPathExtension().lastPathComponent,
+                input: input,
+                preset: PresetSpec(mode: captureMode, quality: qualityPreset)
+            )
+            let paths = ProjectPaths(root: projectURL)
+            try paths.ensureDirectories()
+            try ProjectMetadataStore.save(metadata, to: paths.metadataURL)
+            syncShareMetrics(for: projectURL)
+
+            statusTitle = "Downloading tools"
+            statusDetail = nil
+            progress = nil
+            let progressForwarder = ProgressForwarder(model: self)
+            let toolchain = try await toolchainManager.ensureToolchain(
+                manifestURL: AppConfig.toolchainManifestURL,
+                publicKeyBase64: AppConfig.toolchainPublicKeyBase64,
+                targetName: "macos-arm64"
+            ) { fraction, message in
+                progressForwarder.update(fraction: fraction, message: message)
+            }
+            toolchainPaths = toolchain
+
+            let runner = pipelineRunnerFactory(
+                projectURL,
+                .init(toolchain: toolchain, preset: metadata.preset, trainingGate: makeTrainingGate())
+            )
+            let forwarder = EventForwarder(model: self)
+            try await runner.run(resumeFrom: Optional<PipelineStage>.none) { event in
+                forwarder.handle(event)
+            }
+
+            if let output = try? ProjectMetadataStore.load(from: paths.metadataURL).outputs?.splatPlyPath {
+                outputPlyURL = projectURL.appendingPathComponent(output)
+            }
+            syncShareMetrics(for: projectURL)
+            viewState = .viewer
+            refreshProjectSummaries()
+        } catch is CancellationError {
+            return
+        } catch {
+            if stopAction != nil {
+                return
+            }
+            if lastError == nil {
+                lastError = error.localizedDescription
+            }
+            let envDetails = """
+            Underlying error: \(String(reflecting: error))
+            Manifest URL: \(AppConfig.toolchainManifestURL.absoluteString)
+            Public key present: \(!AppConfig.toolchainPublicKeyBase64.isEmpty)
+            """
+            if let existing = errorDetails, !existing.isEmpty {
+                errorDetails = existing + "\n\n" + envDetails
+            } else {
+                errorDetails = envDetails
+            }
+            if statusTitle == "Preparing project" || statusTitle == "Downloading tools" || statusTitle == "Something went wrong" {
+                statusTitle = lastError ?? "Something went wrong"
+                statusDetail = nil
+                progress = nil
+            }
+            viewState = .processing
+            refreshProjectSummaries()
+        }
+    }
+
+    func resumeProjectTask(at url: URL) async {
+        defer {
+            currentTask = nil
+            if stopAction != nil {
+                completeStop()
+            }
+        }
+        reset()
+        viewState = .processing
+        statusTitle = "Preparing project"
+        statusDetail = nil
+        progress = nil
+
+        do {
+            let paths = ProjectPaths(root: url)
+            let metadata = try ProjectMetadataStore.load(from: paths.metadataURL)
+            currentProjectURL = url
+            syncShareMetrics(for: url)
+            logLines = []
+            errorLogLines = []
+            let previousLines = loadPipelineLogTail(projectURL: url)
+            if !previousLines.isEmpty {
+                appendLogLine("========== PREVIOUS LOG (from Logs/pipeline.log) ==========")
+                for line in previousLines {
+                    appendLogLine("[previous] \(line)")
+                }
+            }
+            appendLogLine("========== NEW LOG START (current run) ==========")
+            appendLogLine("Resumed project")
+
+            if let output = metadata.outputs?.splatPlyPath {
+                let outputURL = url.appendingPathComponent(output)
+                if regularOutputFileExists(at: outputURL) {
+                    outputPlyURL = outputURL
+                    syncShareMetrics(for: url)
+                    viewState = .viewer
+                    return
+                }
+            }
+
+            statusTitle = "Downloading tools"
+            statusDetail = nil
+            progress = nil
+            let progressForwarder = ProgressForwarder(model: self)
+            let toolchain = try await toolchainManager.ensureToolchain(
+                manifestURL: AppConfig.toolchainManifestURL,
+                publicKeyBase64: AppConfig.toolchainPublicKeyBase64,
+                targetName: "macos-arm64"
+            ) { fraction, message in
+                progressForwarder.update(fraction: fraction, message: message)
+            }
+            toolchainPaths = toolchain
+
+            let runner = pipelineRunnerFactory(
+                url,
+                .init(toolchain: toolchain, preset: metadata.preset, trainingGate: makeTrainingGate())
+            )
+            let forwarder = EventForwarder(model: self)
+            let stageToResume = resumeStage(from: metadata)
+            try await runner.run(resumeFrom: stageToResume) { event in
+                forwarder.handle(event)
+            }
+
+            if let output = try? ProjectMetadataStore.load(from: paths.metadataURL).outputs?.splatPlyPath {
+                outputPlyURL = url.appendingPathComponent(output)
+            }
+            syncShareMetrics(for: url)
+            viewState = .viewer
+            refreshProjectSummaries()
+        } catch is CancellationError {
+            return
+        } catch {
+            if stopAction != nil {
+                return
+            }
+            if lastError == nil {
+                lastError = error.localizedDescription
+            }
+            let envDetails = """
+            Underlying error: \(String(reflecting: error))
+            Manifest URL: \(AppConfig.toolchainManifestURL.absoluteString)
+            Public key present: \(!AppConfig.toolchainPublicKeyBase64.isEmpty)
+            """
+            if let existing = errorDetails, !existing.isEmpty {
+                errorDetails = existing + "\n\n" + envDetails
+            } else {
+                errorDetails = envDetails
+            }
+            if statusTitle == "Preparing project" || statusTitle == "Downloading tools" || statusTitle == "Something went wrong" {
+                statusTitle = lastError ?? "Something went wrong"
+                statusDetail = nil
+                progress = nil
+            }
+            viewState = .processing
+            refreshProjectSummaries()
+        }
+    }
+
+    func reset() {
+        cancelForcedExitIfNeeded()
+        stage = nil
+        progress = nil
+        statusTitle = "Ready"
+        statusDetail = nil
+        stageStartedAt = nil
+        lastPipelineEventAt = nil
+        logLines = []
+        errorLogLines = []
+        lastProgressLogAt = .distantPast
+        lastProgressLogMessage = ""
+        lastProgressLogStage = nil
+        lastTrainingImagesBucket = -1
+        lastTrainingSparseBucket = -1
+        lastTrainingStepsBucket = -1
+        lastStageLogAt = .distantPast
+        lastStageLogMessage = ""
+        lastStageLogStage = nil
+        lastToolchainMilestoneMessage = ""
+        toolchainDownloadBucketByLabel = [:]
+        lastError = nil
+        errorDetails = nil
+        outputPlyURL = nil
+        toolchainPaths = nil
+        currentProjectURL = nil
+        stopAction = nil
+        isShowingTrainingConsent = false
+        isLivePreviewEnabled = false
+        trainingConsentContinuation = nil
+        trainingConsentPauseStartedAt = nil
+        trainingConsentPausedDuration = 0
+        pendingSnapshotRevealURL = nil
+        pendingSnapshotRevealRequiresExit = false
+        recoveryPromptProject = nil
+        shareStatusMessage = nil
+        shareStatusIsError = false
+        shareMetrics = .init()
+        isShareSheetActive = false
+        activeShareSession = nil
+    }
+
+    func completeStop() {
+        let action = stopAction
+        stopAction = nil
+
+        let projectURL = currentProjectURL
+        if action == .keepProject, let projectURL {
+            suppressRecoveryPrompt(for: projectURL, clearLastRunStartedAt: true)
+        }
+        let snapshotURL = pendingSnapshotRevealURL
+        let shouldOfferSnapshot = pendingSnapshotRevealRequiresExit
+        reset()
+        viewState = .home
+        if action == .deleteProject, let projectURL {
+            try? FileManager.default.removeItem(at: projectURL)
+        }
+        refreshProjectSummaries()
+        if shouldOfferSnapshot, let snapshotURL {
+            presentSnapshotRevealIfAvailable(snapshotURL)
+        }
+        finalizeExitIfNeeded()
+    }
+}
+
+private final class WeakAppModelBox: @unchecked Sendable {
+    weak var value: AppModel?
+
+    init(_ value: AppModel) {
+        self.value = value
+    }
+}
+
+private final class EventForwarder: @unchecked Sendable {
+    private weak var model: AppModel?
+
+    init(model: AppModel) {
+        self.model = model
+    }
+
+    func handle(_ event: PipelineEvent) {
+        Task { @MainActor in
+            self.model?.handle(event: event)
+        }
+    }
+}
+
+private final class ProgressForwarder: @unchecked Sendable {
+    private weak var model: AppModel?
+
+    init(model: AppModel) {
+        self.model = model
+    }
+
+    func update(fraction: Double, message: String) {
+        Task { @MainActor in
+            guard let model = self.model else { return }
+            model.handleToolchainProgress(fraction: fraction, message: message)
+        }
+    }
+}
+
+protocol PipelineRunning {
+    func run(resumeFrom lastCompletedStage: PipelineStage?, events: @escaping @Sendable (PipelineEvent) -> Void) async throws
+}
+
+extension PipelineRunner: PipelineRunning {}

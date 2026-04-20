@@ -88,10 +88,7 @@ def _supported_image_exts() -> tuple[str, ...]:
 
 def _list_images(images_dir: Path) -> list[Path]:
     exts = _supported_image_exts()
-    image_paths: list[Path] = []
-    for ext in exts:
-        image_paths.extend(sorted(images_dir.glob(f"*{ext}")))
-    return image_paths
+    return sorted([p for p in images_dir.iterdir() if p.is_file() and p.suffix.lower() in exts])
 
 
 def _env_int(name: str, default: int) -> int:

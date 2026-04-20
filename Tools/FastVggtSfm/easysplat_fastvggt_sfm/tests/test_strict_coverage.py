@@ -26,6 +26,17 @@ class FastVggtStrictCoverageTests(unittest.TestCase):
             self.assertEqual(planner, "temporal")
             self.assertGreaterEqual(confidence, 0.65)
 
+    def test_list_images_preserves_mixed_extension_filename_order(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            for name in ["frame_000000.png", "frame_000001.jpg", "frame_000002.png"]:
+                (root / name).write_bytes(b"image")
+
+            self.assertEqual(
+                [path.name for path in fast_run._list_images(root)],
+                ["frame_000000.png", "frame_000001.jpg", "frame_000002.png"],
+            )
+
     def test_auto_planner_prefers_appearance_for_unordered_names(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
