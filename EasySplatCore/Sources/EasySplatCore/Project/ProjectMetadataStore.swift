@@ -1,5 +1,6 @@
 import Foundation
 
+/// JSON loader/saver for persisted project metadata files.
 public enum ProjectMetadataStore {
     public static func load(from url: URL) throws -> ProjectMetadata {
         let data = try Data(contentsOf: url)

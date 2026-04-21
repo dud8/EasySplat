@@ -186,22 +186,19 @@ def _compute_original_coords(image_path_list: list[Path], target_width: int):
     for image_path in image_path_list:
         img = Image.open(image_path).convert("RGB")
         width, height = img.size
-        max_dim = max(width, height)
+        resized_width = int(target_width)
+        resized_height = round(height * (resized_width / width) / 14) * 14
+        crop_x = 0.0
+        crop_y = 0.0
+        if resized_height > resized_width:
+            crop_y = float((resized_height - resized_width) // 2)
 
-        left = (max_dim - width) // 2
-        top = (max_dim - height) // 2
+        scale_x = float(width) / float(resized_width)
+        scale_y = float(height) / float(resized_height)
 
-        scale = float(target_width) / float(max_dim)
+        original_coords.append(np.array([crop_x, crop_y, scale_x, scale_y, width, height], dtype=np.float32))
 
-        x1 = left * scale
-        y1 = top * scale
-        x2 = (left + width) * scale
-        y2 = (top + height) * scale
-
-        original_coords.append(np.array([x1, y1, x2, y2, width, height], dtype=np.float32))
-
-    original_coords = torch.from_numpy(np.stack(original_coords, axis=0)).float()
-    return original_coords
+    return np.stack(original_coords, axis=0).astype(np.float32)
 
 
 def _build_colmap_intri(fidx, intrinsics, camera_type):
@@ -268,20 +265,27 @@ def _write_colmap_text_model(
     image_points2d = [[] for _ in range(num_frames)]
     point_tracks = [[] for _ in range(len(points3d))]
 
-    resize_ratios = []
-    top_lefts = []
+    scale_factors = []
+    crop_offsets = []
     for fidx in range(num_frames):
         real_image_size = original_coords[fidx, -2:]
-        resize_ratio = float(max(real_image_size) / img_size)
-        resize_ratios.append(resize_ratio)
-        top_lefts.append(original_coords[fidx, :2])
+        scale_factors.append(original_coords[fidx, 2:4])
+        crop_offsets.append(original_coords[fidx, :2])
 
     for point_idx in range(len(points3d)):
         fidx = int(points_xyf[point_idx, 2])
         if fidx < 0 or fidx >= num_frames:
             continue
         xy = points_xyf[point_idx, :2]
-        xy = (xy - top_lefts[fidx]) * resize_ratios[fidx]
+        xy = (xy + crop_offsets[fidx]) * scale_factors[fidx]
+        real_image_size = original_coords[fidx, -2:]
+        xy = np.array(
+            [
+                np.clip(xy[0], 0.0, max(0.0, float(real_image_size[0] - 1))),
+                np.clip(xy[1], 0.0, max(0.0, float(real_image_size[1] - 1))),
+            ],
+            dtype=np.float32,
+        )
         point_id = point_idx + 1
         point2d_idx = len(image_points2d[fidx])
         image_points2d[fidx].append((xy, point_id))
@@ -291,8 +295,12 @@ def _write_colmap_text_model(
     for fidx in range(num_frames):
         colmap_intri = _build_colmap_intri(fidx, intrinsics, camera_type)
         real_image_size = original_coords[fidx, -2:]
-        resize_ratio = resize_ratios[fidx]
-        colmap_intri = colmap_intri * resize_ratio
+        scale_x, scale_y = scale_factors[fidx]
+        if camera_type == "PINHOLE":
+            colmap_intri[0] *= scale_x
+            colmap_intri[1] *= scale_y
+        else:
+            colmap_intri[0] *= (float(scale_x) + float(scale_y)) / 2.0
         real_pp = real_image_size / 2
         colmap_intri[-2:] = real_pp
         cameras.append((fidx + 1, camera_type, int(real_image_size[0]), int(real_image_size[1]), colmap_intri))
@@ -1166,7 +1174,7 @@ def _run_fastvggt_strict_coverage(
         )
         return 1
 
-    original_coords = _compute_original_coords(image_paths, target_width=int(args.vggt_resolution)).detach().cpu().numpy()
+    original_coords = _compute_original_coords(image_paths, target_width=int(args.vggt_resolution))
     (
         export_paths,
         export_extrinsics,
@@ -1375,7 +1383,7 @@ def main():
         extrinsic_np,
         intrinsic_np,
         loaded_paths,
-        original_coords.detach().cpu().numpy(),
+        original_coords,
         img_size=int(grid_w),
         shared_camera=bool(args.shared_camera),
         camera_type=camera_type,

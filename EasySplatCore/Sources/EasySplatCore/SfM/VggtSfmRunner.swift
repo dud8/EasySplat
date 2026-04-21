@@ -1,5 +1,6 @@
 import Foundation
 
+/// Runtime options for invoking the VGGT SfM bridge.
 public struct VggtSfmConfig: Sendable {
     public var device: String
     public var imageLoadResolution: Int
@@ -52,6 +53,7 @@ public struct VggtSfmConfig: Sendable {
     }
 }
 
+/// Interface for running the VGGT SfM bridge.
 public protocol VggtSfmRunning: Sendable {
     func run(
         toolchain: VggtToolchain,
@@ -68,6 +70,7 @@ public enum VggtSfmError: Error {
     case commandFailed(String)
 }
 
+/// Default subprocess-backed runner for the VGGT SfM bridge.
 public final class VggtSfmRunner: @unchecked Sendable, VggtSfmRunning {
     private let runner: SubprocessRunning
 

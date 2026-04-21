@@ -9,6 +9,8 @@ Tools/ManifestTool/.build/
 .DS_Store
 build/
 /release/
+.swiftpm/
+.pytest_cache/
 .research/
 output/
 research_papers/

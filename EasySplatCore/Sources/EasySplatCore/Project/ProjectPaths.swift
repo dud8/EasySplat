@@ -1,5 +1,6 @@
 import Foundation
 
+/// Canonical on-disk layout for a single EasySplat project bundle.
 public struct ProjectPaths: Sendable {
     public let root: URL
 

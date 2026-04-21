@@ -1,5 +1,6 @@
 import Foundation
 
+/// Coverage-planning options for strict FastVGGT runs.
 public struct FastVggtCoverageConfig: Sendable {
     public var requireFullCoverage: Bool
     public var coveragePlanner: String
@@ -31,6 +32,7 @@ public struct FastVggtCoverageConfig: Sendable {
     }
 }
 
+/// Runtime options for invoking the FastVGGT SfM bridge.
 public struct FastVggtSfmConfig: Sendable {
     public var device: String
     public var dtype: String
@@ -68,6 +70,7 @@ public struct FastVggtSfmConfig: Sendable {
     }
 }
 
+/// Interface for running the FastVGGT SfM bridge.
 public protocol FastVggtSfmRunning: Sendable {
     func run(
         toolchain: FastVggtToolchain,
@@ -84,6 +87,7 @@ public enum FastVggtSfmError: Error {
     case commandFailed(String)
 }
 
+/// Default subprocess-backed runner for the FastVGGT SfM bridge.
 public final class FastVggtSfmRunner: @unchecked Sendable, FastVggtSfmRunning {
     private let runner: SubprocessRunning
 

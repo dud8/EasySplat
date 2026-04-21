@@ -1,5 +1,6 @@
 import Foundation
 
+/// Ordered pipeline stages used for status, logging, and resume decisions.
 public enum PipelineStage: String, Codable, Sendable, CaseIterable {
     case importInput
     case extractFrames

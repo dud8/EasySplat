@@ -178,6 +178,79 @@ class FastVggtStrictCoverageTests(unittest.TestCase):
         self.assertEqual(export_points_rgb.shape[0], 2)
         self.assertEqual(export_points_xyf[:, 2].tolist(), [0.0, 2.0])
 
+    def test_colmap_export_keeps_non_square_points_in_bounds(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            image_specs = [
+                ("landscape.jpg", (64, 48)),
+                ("portrait.jpg", (48, 64)),
+                ("square.jpg", (56, 56)),
+            ]
+            image_paths = []
+            for idx, (name, size) in enumerate(image_specs):
+                path = root / name
+                Image.new("RGB", size, color=(idx * 40, idx * 40, idx * 40)).save(path)
+                image_paths.append(path)
+
+            original_coords = fast_run._compute_original_coords(image_paths, target_width=56)
+            extrinsics = np.stack([np.eye(4, dtype=np.float32) for _ in image_paths], axis=0)
+            intrinsics = np.stack([np.eye(3, dtype=np.float32) for _ in image_paths], axis=0)
+            points3d = np.array(
+                [
+                    [0.0, 0.0, 1.0],
+                    [1.0, 0.0, 1.0],
+                    [2.0, 0.0, 1.0],
+                ],
+                dtype=np.float32,
+            )
+            points_xyf = np.array(
+                [
+                    [0.0, 0.0, 0.0],
+                    [0.0, 0.0, 1.0],
+                    [0.0, 0.0, 2.0],
+                ],
+                dtype=np.float32,
+            )
+            points_rgb = np.array(
+                [
+                    [10, 20, 30],
+                    [40, 50, 60],
+                    [70, 80, 90],
+                ],
+                dtype=np.uint8,
+            )
+
+            out_sparse = root / "sparse"
+            fast_run._write_colmap_text_model(
+                out_sparse,
+                points3d,
+                points_xyf,
+                points_rgb,
+                extrinsics,
+                intrinsics,
+                image_paths,
+                original_coords,
+                img_size=56,
+                shared_camera=False,
+                camera_type="SIMPLE_PINHOLE",
+            )
+
+            lines = [
+                line.strip()
+                for line in (out_sparse / "images.txt").read_text(encoding="utf-8").splitlines()
+                if line.strip() and not line.startswith("#")
+            ]
+            point_lines = lines[1::2]
+            self.assertEqual(len(point_lines), len(image_specs))
+            for point_line, (_, (width, height)) in zip(point_lines, image_specs):
+                fields = point_line.split()
+                x = float(fields[0])
+                y = float(fields[1])
+                self.assertGreaterEqual(x, 0.0)
+                self.assertGreaterEqual(y, 0.0)
+                self.assertLessEqual(x, float(width - 1))
+                self.assertLessEqual(y, float(height - 1))
+
 
 if __name__ == "__main__":
     unittest.main()

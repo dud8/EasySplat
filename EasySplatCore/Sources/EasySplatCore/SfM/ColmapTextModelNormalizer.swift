@@ -24,7 +24,7 @@ public enum ColmapTextModelNormalizer {
                 return nil
             }()
 
-            if nextLine == nil || isPoseLine(nextLine!) {
+            if nextLine.map(isPoseLine) ?? true {
                 output.append("")
                 didChange = true
             }

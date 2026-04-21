@@ -76,6 +76,189 @@ if payload.get("toolchain_name") != tool_name:
 PY
 }
 
+is_system_dependency() {
+  case "$1" in
+    /usr/lib/*|/System/Library/*)
+      return 0
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+is_relative_dependency() {
+  case "$1" in
+    @rpath/*|@loader_path/*|@executable_path/*)
+      return 0
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+is_macho_file() {
+  local path="$1"
+  [ -f "$path" ] && /usr/bin/file "$path" | grep -q "Mach-O"
+}
+
+otool_dependency_names() {
+  otool -L "$1" | awk 'NR > 1 { print $1 }'
+}
+
+queued_macho_files=()
+processed_macho_files=()
+queued_macho_file_keys="|"
+processed_macho_file_keys="|"
+
+path_key_present() {
+  local needle="|$1|"
+  local keys="$2"
+  case "$keys" in
+    *"$needle"*)
+      return 0
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+enqueue_macho_file() {
+  local path="$1"
+  if ! is_macho_file "$path"; then
+    return
+  fi
+  if path_key_present "$path" "$queued_macho_file_keys" || path_key_present "$path" "$processed_macho_file_keys"; then
+    return
+  fi
+  queued_macho_files+=("$path")
+  queued_macho_file_keys="${queued_macho_file_keys}${path}|"
+}
+
+copy_dependency_to_lib() {
+  local dependency="$1"
+  local referer="$2"
+  local dependency_name
+  local destination
+
+  if [ ! -f "$dependency" ]; then
+    echo "Missing non-system dependency $dependency referenced by $referer." >&2
+    exit 1
+  fi
+
+  dependency_name="$(basename "$dependency")"
+  destination="$LIB/$dependency_name"
+  if [ ! -f "$destination" ]; then
+    cp -L "$dependency" "$destination"
+    chmod u+w "$destination"
+    if is_macho_file "$destination"; then
+      install_name_tool -id "@rpath/$dependency_name" "$destination" 2>/dev/null || true
+    fi
+  fi
+  enqueue_macho_file "$destination"
+}
+
+rewrite_dependency_reference() {
+  local file="$1"
+  local dependency="$2"
+  local dependency_name
+  local replacement
+
+  dependency_name="$(basename "$dependency")"
+  if [[ "$file" == "$LIB/"* ]]; then
+    replacement="@loader_path/$dependency_name"
+  else
+    replacement="@rpath/$dependency_name"
+  fi
+  install_name_tool -change "$dependency" "$replacement" "$file"
+}
+
+bundle_non_system_dependencies_for() {
+  local file="$1"
+  local dependency
+
+  while IFS= read -r dependency; do
+    [ -n "$dependency" ] || continue
+    if is_system_dependency "$dependency" || is_relative_dependency "$dependency"; then
+      continue
+    fi
+    if [[ "$dependency" != /* ]]; then
+      echo "Unexpected dependency reference $dependency in $file." >&2
+      exit 1
+    fi
+    copy_dependency_to_lib "$dependency" "$file"
+    rewrite_dependency_reference "$file" "$dependency"
+  done < <(otool_dependency_names "$file")
+}
+
+bundle_toolchain_dependency_closure() {
+  local path
+  local index
+  local current
+
+  for path in "$BIN"/* "$LIB"/*; do
+    enqueue_macho_file "$path"
+  done
+
+  index=0
+  while [ "$index" -lt "${#queued_macho_files[@]}" ]; do
+    current="${queued_macho_files[$index]}"
+    index=$((index + 1))
+    if path_key_present "$current" "$processed_macho_file_keys"; then
+      continue
+    fi
+    processed_macho_files+=("$current")
+    processed_macho_file_keys="${processed_macho_file_keys}${current}|"
+    bundle_non_system_dependencies_for "$current"
+  done
+}
+
+validate_portable_dependency_references() {
+  local file
+  local dependency
+  local target
+
+  for file in "$BIN"/* "$LIB"/*; do
+    if ! is_macho_file "$file"; then
+      continue
+    fi
+    while IFS= read -r dependency; do
+      [ -n "$dependency" ] || continue
+      if is_system_dependency "$dependency"; then
+        continue
+      fi
+      case "$dependency" in
+        @rpath/*)
+          target="$LIB/$(basename "$dependency")"
+          if [ ! -f "$target" ]; then
+            echo "$file references $dependency, but $target is not bundled." >&2
+            exit 1
+          fi
+          ;;
+        @loader_path/*)
+          target="$(dirname "$file")/${dependency#@loader_path/}"
+          if [ ! -f "$target" ]; then
+            echo "$file references $dependency, but $target is not bundled." >&2
+            exit 1
+          fi
+          ;;
+        @executable_path/*)
+          ;;
+        /*)
+          echo "$file has unportable absolute dependency: $dependency" >&2
+          exit 1
+          ;;
+        *)
+          echo "$file has unexpected dependency reference: $dependency" >&2
+          exit 1
+          ;;
+      esac
+    done < <(otool_dependency_names "$file")
+  done
+}
+
 cp "$COLMAP_INSTALL/bin/colmap" "$BIN/colmap"
 
 # Brush has changed CLI shapes over time (some versions used subcommands like `train`).
@@ -244,7 +427,7 @@ fi
 cp -R "$FASTVGGT_MPS_INSTALL/fastvggt_mps" "$OUT/fastvggt_mps"
 
 if ! command -v install_name_tool >/dev/null 2>&1; then
-  echo "install_name_tool not found; cannot package portable OpenSSL dependencies." >&2
+  echo "install_name_tool not found; cannot package portable toolchain dependencies." >&2
   exit 1
 fi
 if ! command -v otool >/dev/null 2>&1; then
@@ -295,7 +478,11 @@ add_rpath_if_missing() {
   fi
 }
 
-add_rpath_if_missing "$BIN/colmap" "@executable_path/../lib"
+for executable in "$BIN"/*; do
+  if is_macho_file "$executable"; then
+    add_rpath_if_missing "$executable" "@executable_path/../lib"
+  fi
+done
 
 # COLMAP links against OpenSSL too; prefer the bundled dylibs.
 colmap_crypto_dep="$(otool -L "$BIN/colmap" | { grep -m1 -E 'libcrypto\.3\.dylib|libcrypto\.1\.1\.dylib' || true; } | awk '{print $1}')"
@@ -316,6 +503,9 @@ otool -l "$BIN/colmap" | grep -q "@executable_path/../lib" || { echo "colmap mis
 otool -L "$BIN/colmap" | grep -q "@rpath/libcrypto.3.dylib" || { echo "colmap missing dependency @rpath/libcrypto.3.dylib" >&2; exit 1; }
 test -f "$LIB/libcrypto.3.dylib" || { echo "missing bundled libcrypto.3.dylib" >&2; exit 1; }
 test -f "$LIB/libssl.3.dylib" || { echo "missing bundled libssl.3.dylib" >&2; exit 1; }
+
+bundle_toolchain_dependency_closure
+validate_portable_dependency_references
 
 pushd "$OUT" >/dev/null
 zip -r "$CORE_ZIP" \

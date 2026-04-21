@@ -1,5 +1,6 @@
 import Foundation
 
+/// Bundle-adjustment parameters used when refining a sparse model with COLMAP.
 public struct ColmapBundleAdjustmentOptions: Sendable {
     public var maxNumIterations: Int
     public var refineFocalLength: Bool
@@ -19,6 +20,7 @@ public struct ColmapBundleAdjustmentOptions: Sendable {
     }
 }
 
+/// Shared COLMAP feature extraction and matching options.
 public struct ColmapOptions: Sendable {
     public var useGPU: Bool
     public var extractThreads: Int
@@ -69,6 +71,7 @@ public struct ColmapOptions: Sendable {
     }
 }
 
+/// Options for COLMAP's integrated `global_mapper` pipeline.
 public struct ColmapGlobalMapperOptions: Sendable {
     public var useGpuForGlobalPositioning: Bool
     public var gpuIndexForGlobalPositioning: String
@@ -108,6 +111,7 @@ public enum ColmapRunnerError: Error, LocalizedError {
     }
 }
 
+/// Subprocess-backed wrapper around the COLMAP command-line tools.
 public final class ColmapRunner {
     private let runner: SubprocessRunning
 

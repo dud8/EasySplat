@@ -182,11 +182,12 @@ extension AppModel {
             NSApp.reply(toApplicationShouldTerminate: true)
             NSApp.terminate(nil)
         case .closeWindow:
-            exitIntent = .none
-            pendingCloseWindow = nil
             if let window {
                 allowNextWindowClose = true
                 window.performClose(nil)
+            } else {
+                exitIntent = .none
+                pendingCloseWindow = nil
             }
         }
     }

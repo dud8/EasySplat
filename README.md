@@ -1,76 +1,127 @@
 # EasySplat
 
-EasySplat is a macOS-only (Apple Silicon) desktop app that turns videos or image folders into 3D Gaussian splats using a bundled toolchain. The default SfM path is now MapAnything-first on Apple Silicon, with COLMAP refinement and mapper fallback when the job or hardware needs a safer path.
+EasySplat is a macOS-only Apple Silicon app that turns videos, photo folders, or mixed inputs into 3D Gaussian splats.
 
-FastVGGT/VGGT paths remain in the repo as deprecated, explicit override backends.
+The default reconstruction path is MapAnything-first, with COLMAP refinement and `global_mapper` / mapper fallback when the job or hardware needs a safer route. The heavy lifting lives in a signed downloadable toolchain, not in the app bundle.
 
-The app downloads a signed `manifest.json` that lists toolchain artifacts (typically split into a smaller “core” zip and a large “models” zip). Each packaged Python SfM bundle also carries a `build_info.json` file so releases can be traced back to the exact source snapshot, runtime, and model metadata used to build them.
+This OSS build keeps distribution simple on purpose: the app itself is currently unsigned and not notarized, while the toolchain remains the signed trust boundary.
 
-## Quick start (recommended)
+## Quick start
 
-1) Download the latest `EasySplat-<version>.dmg` from GitHub Releases.
-2) Drag `EasySplat.app` into Applications.
-3) First launch: right‑click → Open (unsigned app).
-4) The app auto-downloads the toolchain on first run (this can be a large download).
+1. Download the latest `EasySplat-<version>.dmg` from GitHub Releases.
+2. Drag `EasySplat.app` into `/Applications`.
+3. First launch: right-click the app and choose `Open` because the app is currently unsigned.
+4. Let the app download the signed toolchain on first run.
 
-## Repo layout (for contributors)
+Each run creates a `.easysplatproj` bundle under `~/Documents/EasySplat Projects/`. The final viewer opens the exported `.ply` from that project bundle's `Output/` folder.
 
-- `EasySplatApp/`: SwiftUI app.
-- `EasySplatCore/`: core library (pipeline + toolchain integration).
-- `Tools/ManifestTool/`: Swift CLI to generate keypairs and sign manifests.
-- `Tools/MapAnythingSfm/`: Python package shipped in the toolchain (MapAnything -> COLMAP bridge).
-- `Tools/VggtSfm/`: Python package shipped in the toolchain (VGGT → COLMAP bridge).
-- `Tools/FastVggtSfm/`: Python package shipped in the toolchain (FastVGGT → COLMAP seed export).
-- `ThirdParty/MetalSplatter/`: vendored SwiftPM dependency.
-- `Toolchains/`: local toolchain build outputs (`build/`, `out/`), plus dev-only keys/manifest (gitignored).
-- `scripts/`: development, testing, and release automation.
+## What each project stores
 
-## Developer one‑liner
+EasySplat treats each run like a durable project bundle:
 
-The unified dev runner chooses the fast path when a valid toolchain is already installed, and only rebuilds when needed:
+- `project.json` stores input choices, preset, pipeline state, checkpoints, recovery flags, and persisted share metrics.
+- `Logs/pipeline.log` stores the human-readable pipeline log.
+- `Logs/events.jsonl` stores structured pipeline events.
+- `Logs/app_events.jsonl` stores app-level events such as sharing activity.
+- interrupted runs keep checkpoint data plus `lastRunStartedAt`, which lets the app offer recovery on relaunch.
 
-```
+## Repository map
+
+- `EasySplatApp/`: SwiftUI app target, app model, viewer shell, and bundled resource defaults.
+- `EasySplatCore/`: pipeline orchestration, project persistence, toolchain management, subprocess helpers, and SfM runners.
+- `EasySplatCore/Tests/EasySplatCoreTests/`: core unit and integration tests.
+- `EasySplatAppTests/`: app-model tests.
+- `EasySplatUITests/`: placeholder SwiftPM UI-test target.
+- `Tools/ManifestTool/`: Swift CLI for Ed25519 key generation and manifest signing.
+- `Tools/MapAnythingSfm/`: MapAnything to COLMAP bridge shipped in the toolchain.
+- `Tools/VggtSfm/`: VGGT to COLMAP bridge shipped in the toolchain.
+- `Tools/FastVggtSfm/`: FastVGGT seed-export bridge shipped in the toolchain.
+- `ThirdParty/MetalSplatter/`: vendored viewer dependency.
+- `Toolchains/`: local toolchain build outputs, manifests, and dev-only signing keys.
+- `scripts/`: dev, test, packaging, benchmarking, and release automation.
+
+## Developer quick start
+
+Preferred local entry point:
+
+```bash
 ./scripts/run.sh
 ```
 
-Common options:
-- `--fast`: force the cached-toolchain path (no rebuild/download).
-- `--rebuild`: force a toolchain rebuild (preserves models when possible).
-- `--version <semver>`: select a toolchain version (default `0.1.0`).
+Useful variants:
 
-Note: MapAnything and VGGT-family bundles download large model files the first time the toolchain is built.
+```bash
+./scripts/run.sh --fast
+./scripts/run.sh --rebuild
+./scripts/run.sh --version 0.1.0
+./scripts/run.sh --toolchain-root /absolute/path/to/toolchain
+./scripts/run.sh --port 8000
+```
 
-Backward-compatible wrappers are still available (`./scripts/dev_run.sh`, `./scripts/run_fast.sh`), but `./scripts/run.sh` is the recommended entry point.
+What `./scripts/run.sh` does:
 
-## SfM Backend Defaults (MapAnything-First)
+- reuses a valid installed toolchain when possible;
+- rebuilds and re-packages toolchain artifacts when inputs changed or `--rebuild` is set;
+- generates a signed local `Toolchains/manifest.json`;
+- serves a temporary public directory containing only the manifest and zip artifacts on `127.0.0.1`;
+- exports `EASYSPLAT_TOOLCHAIN_MANIFEST_URL` and `EASYSPLAT_TOOLCHAIN_PUBLIC_KEY_BASE64` for the app run.
 
-Default SfM path:
-- `sfmFeatures`: MapAnything runs first.
-- Small jobs on capable hardware use direct sparse export.
-- Larger jobs and lower-memory machines use MapAnything seed export, then COLMAP feature extraction, matching, triangulation, bundle adjustment, and mapper fallback only if refinement still comes up short.
-- Fallback order for the default path: `mapanything` -> `colmap/global_mapper` -> `colmap/mapper`.
+Backward-compatible aliases still exist:
 
-Backend selection:
-- Unset `EASYSPLAT_SFM_BACKEND` now resolves to MapAnything-first with COLMAP fallback.
-- `EASYSPLAT_SFM_BACKEND=mapanything` runs the default integrated path explicitly.
-- `EASYSPLAT_SFM_BACKEND=colmap` (or `glomap` / `global_mapper`) runs the legacy integrated COLMAP path directly.
-- `EASYSPLAT_SFM_BACKEND=fastvggt` and `EASYSPLAT_SFM_BACKEND=vggt` still work, but are deprecated runtime paths.
+- `./scripts/dev_run.sh`
+- `./scripts/run_dev.sh`
+- `./scripts/run_fast.sh`
 
-MapAnything tuning envs:
+Other useful commands:
+
+```bash
+./scripts/test.sh
+./scripts/test_python_tools.sh
+swift test --package-path Tools/ManifestTool
+./scripts/benchmark_mapanything.sh --video /absolute/path/to/input.mp4
+```
+
+## Runtime configuration
+
+`AppConfig` resolves app-facing URLs and trust inputs in this order:
+
+- project home URL: `EASYSPLAT_PROJECT_HOME_URL`, then `EasySplatApp/Resources/project_home_url.txt`, then `https://github.com/EasySplat/EasySplat`
+- toolchain manifest URL: `EASYSPLAT_TOOLCHAIN_MANIFEST_URL`, then `EasySplatApp/Resources/toolchain_manifest_url.txt`, then `<projectHomeURL>/releases/latest/download/manifest.json`
+- toolchain public key: `EASYSPLAT_TOOLCHAIN_PUBLIC_KEY_BASE64`, then `EasySplatApp/Resources/public_key_ed25519.txt`
+
+Most useful runtime overrides:
+
+| Variable | Purpose |
+| --- | --- |
+| `EASYSPLAT_PROJECT_HOME_URL` | Override the project homepage used for derived release URLs and share captions. |
+| `EASYSPLAT_TOOLCHAIN_MANIFEST_URL` | Override the manifest URL directly. |
+| `EASYSPLAT_TOOLCHAIN_PUBLIC_KEY_BASE64` | Override the embedded public key. |
+| `EASYSPLAT_LOCAL_TOOLCHAIN_ROOT` | Skip download/install and validate an already-present local toolchain. |
+| `EASYSPLAT_SFM_BACKEND` | Force `mapanything`, `colmap`, `glomap`, `global_mapper`, `vggt`, or `fastvggt`. |
+| `EASYSPLAT_SFM_MAPPER` | Steer mapper fallback inside the integrated path: `glomap` means COLMAP `global_mapper`; `colmap` means classic COLMAP `mapper`. |
+| `EASYSPLAT_STOP_AFTER_SFM` | Stop the pipeline after reconstruction. |
+| `EASYSPLAT_SKIP_TRAINING` | Skip Brush training. |
+| `EASYSPLAT_AUTOTUNE` | Enable or disable hardware-based parameter tuning. |
+| `EASYSPLAT_COLMAP_USE_GPU` | Toggle GPU use in COLMAP where supported. |
+| `EASYSPLAT_COLMAP_FORCE_CPU` / `EASYSPLAT_COLMAP_FORCE_GPU` | Override COLMAP device choice. |
+
+Common MapAnything tuning knobs:
+
 - `EASYSPLAT_MAPANYTHING_DEVICE=mps|cpu`
 - `EASYSPLAT_MAPANYTHING_CHECKPOINT=map-anything-apache`
 - `EASYSPLAT_MAPANYTHING_RESOLUTION=512|518`
 - `EASYSPLAT_MAPANYTHING_MEMORY_EFFICIENT=0|1`
 - `EASYSPLAT_MAPANYTHING_MINIBATCH_SIZE=<n>`
-- `EASYSPLAT_MAPANYTHING_USE_AMP=0|1` for manual CUDA-only runs; the Apple Silicon app path keeps AMP disabled on MPS/CPU
 - `EASYSPLAT_MAPANYTHING_MAX_POINTS=<n>`
 - `EASYSPLAT_MAPANYTHING_CAMERA_TYPE=SIMPLE_RADIAL|SIMPLE_PINHOLE|PINHOLE|OPENCV`
 - `EASYSPLAT_MAPANYTHING_SHARED_CAMERA=0|1`
 - `EASYSPLAT_MAPANYTHING_ANCHOR_MAX_VIEWS=<n>`
 - `EASYSPLAT_MAPANYTHING_WINDOW_SIZE=<n>`
 - `EASYSPLAT_MAPANYTHING_WINDOW_OVERLAP=<n>`
+- `EASYSPLAT_MAPANYTHING_DIRECT_MIN_TRACK_LENGTH=<n>`
 
-Global mapper tuning envs:
+Common global-mapper tuning knobs:
+
 - `EASYSPLAT_GLOBAL_MAPPER_THREADS=<n>`
 - `EASYSPLAT_GLOBAL_MAPPER_GP_USE_GPU=0|1`
 - `EASYSPLAT_GLOBAL_MAPPER_BA_USE_GPU=0|1`
@@ -80,58 +131,120 @@ Global mapper tuning envs:
 - `EASYSPLAT_GLOBAL_MAPPER_MIN_NUM_MATCHES=<n>`
 - `EASYSPLAT_GLOBAL_MAPPER_BA_NUM_ITERATIONS=<n>`
 
-Deprecated/ignored FastVGGT envs:
-- `EASYSPLAT_FASTVGGT_TRACK_MODE`
-- `EASYSPLAT_FASTVGGT_REFINEMENT_POLICY`
-- `EASYSPLAT_FASTVGGT_WATCHDOG_SECONDS`
-- `EASYSPLAT_FASTVGGT_MAX_TRACKS_PROFILE`
-- `EASYSPLAT_FASTVGGT_ALLOW_TRACK_ONLY_DEGRADE`
-- `EASYSPLAT_ENABLE_VGGT_GRACE_FALLBACK`
+Common Brush overrides:
 
-## Build a DMG locally (from scratch)
+- `EASYSPLAT_BRUSH_TOTAL_STEPS=<n>`
+- `EASYSPLAT_BRUSH_EXPORT_EVERY=<n>`
+- `EASYSPLAT_BRUSH_RUST_LOG=<level>`
+- `EASYSPLAT_BRUSH_SNAPSHOT_MIN_STEPS=<n>`
+- `EASYSPLAT_BRUSH_SNAPSHOT_MAX_STEPS=<n>`
+- `EASYSPLAT_BRUSH_SNAPSHOT_MIN_SECONDS=<n>`
+- `EASYSPLAT_BRUSH_SNAPSHOT_MAX_SECONDS=<n>`
+- `EASYSPLAT_BRUSH_SNAPSHOT_DEFAULT_SECONDS=<n>`
 
-1) Install dependencies (once):
+## SfM behavior
 
+Default behavior when `EASYSPLAT_SFM_BACKEND` is unset:
+
+- EasySplat starts with MapAnything.
+- Smaller jobs may export sparse structure directly.
+- Larger or tighter-memory jobs use MapAnything seed export plus COLMAP refinement.
+- If refinement still is not good enough, EasySplat falls back through COLMAP `global_mapper` and then COLMAP `mapper` when needed.
+
+Compatibility notes:
+
+- `EASYSPLAT_SFM_BACKEND=glomap` and `EASYSPLAT_SFM_BACKEND=global_mapper` are compatibility aliases for COLMAP's integrated `global_mapper` flow.
+- `vggt` and `fastvggt` are still available as explicit override paths, but they are no longer the default product story.
+
+## Toolchain model
+
+The app validates a signed `manifest.json` with an embedded Ed25519 public key, then downloads either:
+
+- a split toolchain: `macos-arm64-core` and `macos-arm64-models`
+- or an older monolithic `macos-arm64` artifact
+
+The current split layout keeps binaries and Python runtimes in a smaller core zip while large model weights ship separately. Each packaged Python SfM bundle also includes `build_info.json` so releases can be traced back to the source snapshot, runtime, and model metadata used to build it.
+
+Installed toolchains live under:
+
+```text
+~/Library/Application Support/EasySplat/Toolchains/<version>/
 ```
-brew install create-dmg cmake ninja boost eigen freeimage glog gflags suitesparse ceres-solver qt glew cgal libomp openimageio
-```
-If this is your first Xcode install, accept the license:
 
+Local development scripts usually emit `Toolchains/manifest.json`. The GitHub toolchain release workflow publishes `Toolchains/out/manifest.json` as the release asset named `manifest.json`.
+
+## Development requirements
+
+- macOS 15+ on Apple Silicon
+- Xcode 16+ with the full XCTest toolchain
+- Homebrew
+- Rust toolchain for Brush (`cargo`)
+- network access and enough disk space for large model downloads
+- optional: `ffmpeg` / `ffprobe` if you use `scripts/benchmark_mapanything.sh`
+
+To mirror the current GitHub Actions toolchain runner, install:
+
+```bash
+brew install cmake ninja boost eigen freeimage glog gflags suitesparse ceres-solver qt glew cgal libomp openimageio create-dmg
 ```
+
+If this is a fresh Xcode install:
+
+```bash
 sudo xcodebuild -license accept
+xcodebuild -downloadComponent MetalToolchain
 ```
 
-2) Build toolchain + app + DMG:
+`build_app.sh` and `build_dmg.sh` compile the vendored `MetalSplatter` shaders. If release builds fail with `cannot execute tool 'metal'`, the Metal Toolchain component is missing.
 
+## Release packaging
+
+Build only the app bundle:
+
+```bash
+./scripts/release/build_app.sh \
+  --manifest-url "https://example.com/releases/latest/download/manifest.json" \
+  --public-key-path /absolute/path/to/public_key_ed25519.txt \
+  --project-url "https://github.com/EasySplat/EasySplat" \
+  --version 0.1.0
 ```
+
+`build_app.sh` requires:
+
+- `--manifest-url`: the manifest URL the shipped app should use
+- `--public-key-path`: the public key file copied into the built bundle
+- `--version`: bundle version
+- `--project-url`: optional project homepage override copied into the built bundle
+
+Build the full toolchain, app bundle, and DMG:
+
+```bash
 ./scripts/release/build_dmg.sh --version 0.1.0
 ```
 
-By default the app built into the DMG will be configured to read a manifest URL. If you want the DMG to point at a hosted toolchain, pass URLs explicitly:
+`build_dmg.sh` supports:
 
-```
+- `--version <semver>`
+- `--manifest-url <url>`
+- `--core-artifact-url <url>`
+- `--models-artifact-url <url>`
+- `--project-url <url>`
+- `--port <port>`
+
+Hosted manifest/artifact example:
+
+```bash
 ./scripts/release/build_dmg.sh \
   --version 0.1.0 \
   --manifest-url "https://your-host/manifest.json" \
   --core-artifact-url "https://your-host/toolchain-macos-arm64-0.1.0-core.zip" \
-  --models-artifact-url "https://your-host/toolchain-macos-arm64-0.1.0-models.zip"
+  --models-artifact-url "https://your-host/toolchain-macos-arm64-0.1.0-models.zip" \
+  --project-url "https://github.com/EasySplat/EasySplat"
 ```
 
-The DMG will be created at `release/DMG/EasySplat-0.1.0.dmg`.
-If `create-dmg` fails to unmount with a "Resource busy" error, re-run with (skips Finder layout):
+Dev-only smoke test against a locally served manifest:
 
-```
-EASYSPLAT_DMG_SKIP_JENKINS=1 ./scripts/release/build_dmg.sh --version 0.1.0
-```
-You can also increase retries or force sandbox-safe mode:
-
-```
-EASYSPLAT_DMG_HDIUTIL_RETRIES=40 EASYSPLAT_DMG_SANDBOX_SAFE=1 ./scripts/release/build_dmg.sh --version 0.1.0
-```
-
-If you want a locally-built DMG to use a local toolchain server (handy for testing), start a local server and pass localhost URLs that match `Toolchains/` layout:
-
-```
+```bash
 ./scripts/release/build_dmg.sh \
   --version 0.1.0 \
   --manifest-url "http://localhost:8000/manifest.json" \
@@ -139,39 +252,37 @@ If you want a locally-built DMG to use a local toolchain server (handy for testi
   --models-artifact-url "http://localhost:8000/out/toolchain-macos-arm64-0.1.0-models.zip"
 ```
 
-Then serve `Toolchains/`:
+Then serve only the public manifest and artifact files:
 
+```bash
+mkdir -p Toolchains/public/out
+cp Toolchains/manifest.json Toolchains/public/manifest.json
+ln -sf ../../out/toolchain-macos-arm64-0.1.0-core.zip Toolchains/public/out/
+ln -sf ../../out/toolchain-macos-arm64-0.1.0-models.zip Toolchains/public/out/
+python3 -m http.server --bind 127.0.0.1 8000 --directory Toolchains/public
 ```
-cd Toolchains
-python3 -m http.server 8000
+
+Output paths:
+
+- app bundle: `build/Export/EasySplat.app`
+- DMG: `release/DMG/EasySplat-<version>.dmg`
+
+If `create-dmg` fails to unmount with `Resource busy`, retry with:
+
+```bash
+EASYSPLAT_DMG_SKIP_JENKINS=1 ./scripts/release/build_dmg.sh --version 0.1.0
 ```
 
-## Requirements (development)
+Other DMG knobs:
 
-- macOS 15+ on Apple Silicon
-- Xcode 16+ (Swift 6). (Tests require a full Xcode install; Command Line Tools alone do not include XCTest.)
-- Toolchain build dependencies:
-  - `git`, `cmake`, `ninja`
-  - COLMAP deps (e.g. Eigen, Ceres, Boost, Glog, Gflags, OpenCV, SQLite3)
-  - Rust toolchain (for Brush)
-  - Network access for large downloads (MapAnything, VGGT-family, and Python wheels)
-  - `create-dmg` (for DMG packaging)
+- `EASYSPLAT_DMG_HDIUTIL_RETRIES=<n>`
+- `EASYSPLAT_DMG_SANDBOX_SAFE=1`
 
-## Release (GitHub Actions)
+## Manual toolchain workflow
 
-Release automation lives in `.github/workflows/` and `scripts/release/`.
+Build the local toolchain pieces:
 
-At a high level:
-- A toolchain release publishes a signed `manifest.json` plus the referenced toolchain artifacts.
-- An app release embeds the manifest URL + public key into the app bundle and packages a DMG.
-
-If you change toolchain artifact naming/layout (e.g. core/models split), update both the scripts and the workflows to match.
-
-## Manual dev setup (optional)
-
-1) Build the toolchain:
-
-```
+```bash
 ./scripts/toolchain/build_openssl.sh
 ./scripts/toolchain/build_colmap.sh
 ./scripts/toolchain/build_brush.sh
@@ -181,48 +292,87 @@ If you change toolchain artifact naming/layout (e.g. core/models split), update 
 ./scripts/toolchain/package_toolchain.sh --version 0.1.0
 ```
 
-2) Create a signed manifest:
+`scripts/toolchain/build_glomap.sh` is available for direct `glomap` work, but the packaged app path uses COLMAP's integrated `global_mapper` rather than a separately shipped `glomap` binary.
 
-```
+Generate a dev keypair:
+
+```bash
 swift run --package-path Tools/ManifestTool ManifestTool generate-keypair \
   --public-key-out Toolchains/public_key_ed25519.txt \
   --private-key-out Toolchains/private_key_ed25519.txt
+```
 
+Generate a signed local manifest:
+
+```bash
 swift run --package-path Tools/ManifestTool ManifestTool \
   --core-zip Toolchains/out/toolchain-macos-arm64-0.1.0-core.zip \
   --core-url http://localhost:8000/out/toolchain-macos-arm64-0.1.0-core.zip \
   --models-zip Toolchains/out/toolchain-macos-arm64-0.1.0-models.zip \
   --models-url http://localhost:8000/out/toolchain-macos-arm64-0.1.0-models.zip \
   --version 0.1.0 \
-  --published-at 2026-01-27T00:00:00Z \
+  --published-at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
   --private-key "$(cat Toolchains/private_key_ed25519.txt)" \
   --manifest-out Toolchains/manifest.json
 ```
 
-3) Serve the toolchain files locally:
+Serve only the public manifest and artifact files locally:
 
-```
-cd Toolchains
-python3 -m http.server 8000
+```bash
+mkdir -p Toolchains/public
+cp Toolchains/manifest.json Toolchains/public/manifest.json
+rm -rf Toolchains/public/out
+mkdir -p Toolchains/public/out
+ln -s ../../out/toolchain-macos-arm64-0.1.0-core.zip Toolchains/public/out/
+ln -s ../../out/toolchain-macos-arm64-0.1.0-models.zip Toolchains/public/out/
+python3 -m http.server --bind 127.0.0.1 8000 --directory Toolchains/public
 ```
 
-4) Run the app:
+Run the app against that manifest:
 
-```
+```bash
 EASYSPLAT_TOOLCHAIN_MANIFEST_URL=http://localhost:8000/manifest.json \
 EASYSPLAT_TOOLCHAIN_PUBLIC_KEY_BASE64="$(cat Toolchains/public_key_ed25519.txt)" \
 swift run EasySplatApp
 ```
 
-Alternatively, open `Package.swift` in Xcode and run the `EasySplatApp` scheme.
+Or skip manifest download entirely and validate a local install in place:
+
+```bash
+EASYSPLAT_LOCAL_TOOLCHAIN_ROOT="/absolute/path/to/toolchain" \
+swift run EasySplatApp
+```
 
 ## Tests
 
-Run all tests:
+Run all Swift tests:
 
-```
+```bash
 ./scripts/test.sh
 ```
 
-Note: UI test target is a placeholder in SwiftPM (XCUITest requires an Xcode project).
-Note: `./scripts/test.sh` requires a full Xcode install (Command Line Tools alone do not include XCTest).
+Notes:
+
+- `./scripts/test.sh` uses `xcrun swift test --disable-swift-testing --enable-xctest` when Xcode is available.
+- It caches SwiftPM artifacts under `build/.swiftpm`.
+- `EasySplatUITests/` is only a SwiftPM placeholder; real XCUITest would require an Xcode project.
+
+Run the manifest tool tests:
+
+```bash
+swift test --package-path Tools/ManifestTool
+```
+
+Run the Python bridge tests for MapAnything, FastVGGT, and VGGT:
+
+```bash
+./scripts/test_python_tools.sh
+```
+
+## More docs
+
+- `ONBOARDING.md`: maintainer-level architecture, pipeline, persistence, and release context
+- `CONTRIBUTING.md`: contributor workflow and PR expectations
+- `SECURITY.md`: private disclosure guidance
+- `NOTICE.md`: bundled third-party attribution
+- `CODE_OF_CONDUCT.md`: community standards

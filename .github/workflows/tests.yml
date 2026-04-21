@@ -18,5 +18,33 @@ jobs:
           elif [ -d "/Applications/Xcode_16.0.app" ]; then
             sudo xcode-select -s /Applications/Xcode_16.0.app
           fi
-      - name: Run tests
-        run: xcrun swift test --disable-swift-testing --enable-xctest
+      - name: Run app and core tests
+        run: ./scripts/test.sh
+      - name: Run manifest tool tests
+        run: swift test --package-path Tools/ManifestTool
+
+  repo-health:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Verify public repo collateral
+        run: ./scripts/ci/check_repo_health.sh
+      - name: Lint shell scripts
+        run: find scripts -type f -name '*.sh' -print0 | xargs -0 -n1 bash -n
+      - name: Validate release script behavior
+        run: ./scripts/ci/test_release_scripts.sh
+
+  python-tools:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: 'pip'
+      - name: Install minimal Python test deps
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install numpy pillow torch==2.10.0 torchvision==0.25.0
+      - name: Run Python bridge tests
+        run: ./scripts/test_python_tools.sh

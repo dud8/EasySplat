@@ -3,6 +3,7 @@ import Foundation
 import Darwin
 #endif
 
+/// Abstraction for launching subprocesses and streaming their output.
 public protocol SubprocessRunning: Sendable {
     func run(
         _ launchPath: String,
@@ -23,6 +24,7 @@ public protocol SubprocessRunning: Sendable {
     ) async throws -> SubprocessResult
 }
 
+/// Subprocess runner that can allocate a pseudo-terminal for CLI tools that require one.
 public protocol PseudoTTYCapableSubprocessRunning: SubprocessRunning {
     func runAsyncPseudoTTY(
         _ launchPath: String,
@@ -64,6 +66,7 @@ public extension SubprocessRunning {
     }
 }
 
+/// Captured subprocess termination details and collected output streams.
 public struct SubprocessResult: Sendable {
     public let exitCode: Int32
     public let terminationReason: Process.TerminationReason
@@ -71,6 +74,7 @@ public struct SubprocessResult: Sendable {
     public let stderr: String
 }
 
+/// Default Foundation-based subprocess runner used throughout EasySplatCore.
 public final class SubprocessRunner: @unchecked Sendable, SubprocessRunning, PseudoTTYCapableSubprocessRunning {
     public init() {}
 

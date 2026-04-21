@@ -9,8 +9,7 @@ let package = Package(
         .executable(name: "EasySplatApp", targets: ["EasySplatApp"])
     ],
     dependencies: [
-        .package(path: "ThirdParty/MetalSplatter"),
-        .package(url: "https://github.com/sparkle-project/Sparkle.git", from: "2.7.3")
+        .package(path: "ThirdParty/MetalSplatter")
     ],
     targets: [
         .target(
@@ -24,8 +23,7 @@ let package = Package(
             dependencies: [
                 "EasySplatCore",
                 .product(name: "MetalSplatter", package: "MetalSplatter"),
-                .product(name: "SplatIO", package: "MetalSplatter"),
-                .product(name: "Sparkle", package: "Sparkle")
+                .product(name: "SplatIO", package: "MetalSplatter")
             ],
             path: "EasySplatApp",
             exclude: ["AGENTS.md"],

@@ -1,5 +1,6 @@
 import Foundation
 
+/// Persisted top-level metadata for a single `.easysplatproj` bundle.
 public struct ProjectMetadata: Codable, Sendable {
     public var formatVersion: Int
     public var id: UUID
@@ -43,6 +44,7 @@ public struct ProjectMetadata: Codable, Sendable {
     }
 }
 
+/// Aggregated share interaction counters stored alongside a project.
 public struct ShareMetrics: Codable, Sendable, Equatable {
     public var shareClickedCount: Int
     public var shareCompletedCount: Int
@@ -62,6 +64,7 @@ public struct ShareMetrics: Codable, Sendable, Equatable {
     }
 }
 
+/// Resume and recovery marker captured while a pipeline stage is in flight.
 public struct PipelineCheckpoint: Codable, Sendable {
     public var stage: PipelineStage
     public var updatedAt: Date
@@ -84,6 +87,7 @@ public struct PipelineCheckpoint: Codable, Sendable {
     }
 }
 
+/// Stage-specific payload attached to a pipeline checkpoint.
 public enum PipelineCheckpointDetails: Codable, Sendable {
     case extractFrames(ExtractFramesCheckpoint)
     case selectFrames(SelectFramesCheckpoint)
@@ -94,6 +98,7 @@ public enum PipelineCheckpointDetails: Codable, Sendable {
     case exportSplat(ExportSplatCheckpoint)
 }
 
+/// Checkpoint details for extracted video frames.
 public struct ExtractFramesCheckpoint: Codable, Sendable {
     public var videoIndex: Int
     public var videoName: String
@@ -108,6 +113,7 @@ public struct ExtractFramesCheckpoint: Codable, Sendable {
     }
 }
 
+/// Checkpoint details for selected frame manifests.
 public struct SelectFramesCheckpoint: Codable, Sendable {
     public var groupsProcessed: Int
     public var selectedCount: Int
@@ -120,6 +126,7 @@ public struct SelectFramesCheckpoint: Codable, Sendable {
     }
 }
 
+/// Checkpoint details for feature extraction state.
 public struct SfmFeaturesCheckpoint: Codable, Sendable {
     public var databasePath: String
     public var imageCount: Int
@@ -130,6 +137,7 @@ public struct SfmFeaturesCheckpoint: Codable, Sendable {
     }
 }
 
+/// Checkpoint details for image matching progress.
 public struct SfmMatchingCheckpoint: Codable, Sendable {
     public var databasePath: String
     public var expectedPairs: Int?
@@ -142,6 +150,7 @@ public struct SfmMatchingCheckpoint: Codable, Sendable {
     }
 }
 
+/// Checkpoint details for sparse reconstruction output.
 public struct SfmMappingCheckpoint: Codable, Sendable {
     public var mapper: String
     public var sparsePath: String
@@ -154,6 +163,7 @@ public struct SfmMappingCheckpoint: Codable, Sendable {
     }
 }
 
+/// Checkpoint details for Brush training progress and snapshot state.
 public struct TrainBrushCheckpoint: Codable, Sendable {
     public var latestExportStep: Int?
     public var latestExportPath: String?
@@ -179,6 +189,7 @@ public struct TrainBrushCheckpoint: Codable, Sendable {
     }
 }
 
+/// Checkpoint details for the final exported splat artifact.
 public struct ExportSplatCheckpoint: Codable, Sendable {
     public var outputPath: String
     public var sourcePath: String
@@ -191,6 +202,7 @@ public struct ExportSplatCheckpoint: Codable, Sendable {
     }
 }
 
+/// Normalized user input selection for a project run.
 public enum InputSpec: Codable, Sendable {
     case video(files: [String])
     case photos(folder: String)
@@ -222,17 +234,20 @@ public enum InputSpec: Codable, Sendable {
     public var hasPhotos: Bool { photosFolder != nil }
 }
 
+/// High-level capture intent used to tune SfM defaults.
 public enum CaptureMode: String, Codable, Sendable {
     case object
     case room
 }
 
+/// User-facing quality preset that controls frame and training budgets.
 public enum QualityPreset: String, Codable, Sendable {
     case draft
     case standard
     case ultra
 }
 
+/// Combination of capture mode and quality preset stored with a project.
 public struct PresetSpec: Codable, Sendable {
     public var mode: CaptureMode
     public var quality: QualityPreset
@@ -243,6 +258,7 @@ public struct PresetSpec: Codable, Sendable {
     }
 }
 
+/// Persisted pipeline state used for status, retry, and resume handling.
 public struct PipelineState: Codable, Sendable {
     public var stage: PipelineStage
     public var attempt: Int
@@ -257,6 +273,7 @@ public struct PipelineState: Codable, Sendable {
     }
 }
 
+/// Paths for the final exported artifacts recorded in project metadata.
 public struct OutputSpec: Codable, Sendable {
     public var splatPlyPath: String
     public var colmapModelPath: String

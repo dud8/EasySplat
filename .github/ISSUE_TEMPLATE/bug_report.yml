@@ -1,0 +1,30 @@
+name: Bug report
+description: Report a reproducible problem in the app, toolchain flow, docs, or build/release automation.
+title: "bug: "
+labels:
+  - bug
+body:
+  - type: textarea
+    id: summary
+    attributes:
+      label: Summary
+      description: What happened and what did you expect instead?
+    validations:
+      required: true
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: Reproduction
+      description: Include exact steps, sample inputs, and relevant environment variables.
+    validations:
+      required: true
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment
+      description: macOS version, Apple Silicon model, Xcode version, and how you ran EasySplat.
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs or screenshots
+      description: Paste the smallest relevant log excerpt or attach screenshots.

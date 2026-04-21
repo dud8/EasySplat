@@ -1,4 +1,5 @@
 #if canImport(XCTest)
+import AppKit
 import Foundation
 import XCTest
 @testable import EasySplatApp
@@ -354,6 +355,34 @@ final class AppModelTests: XCTestCase {
         let stoppedSummary = relaunched.projectSummaries.first { $0.title == "InterruptedReturn" }
         XCTAssertNotNil(stoppedSummary, "Stopped project should remain listed.")
         XCTAssertEqual(stoppedSummary?.status, .inProgress)
+    }
+
+    func testForcedWindowCloseKeepsBypassUntilDelegateConsumesIt() {
+        let tempBase = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        let model = AppModel(toolchainManager: MockToolchainManager(), projectBaseURL: tempBase) { _, config in
+            MockPipelineRunner(projectURL: tempBase, config: config)
+        }
+        let window = NSWindow(
+            contentRect: NSRect(x: 0, y: 0, width: 120, height: 80),
+            styleMask: [.titled],
+            backing: .buffered,
+            defer: false
+        )
+        window.isReleasedWhenClosed = false
+
+        model.stopAction = .keepProject
+        model.exitIntent = .closeWindow
+        model.pendingCloseWindow = window
+
+        model.forceFinalizeExit(intent: .closeWindow, window: window)
+
+        XCTAssertTrue(model.allowNextWindowClose)
+        XCTAssertTrue(model.pendingCloseWindow === window)
+        XCTAssertEqual(model.exitIntent, .closeWindow)
+        XCTAssertTrue(model.consumeWindowCloseBypass(for: window))
+        XCTAssertFalse(model.allowNextWindowClose)
+        XCTAssertNil(model.pendingCloseWindow)
+        XCTAssertEqual(model.exitIntent, .none)
     }
 
     func testSuppressingOneInterruptedProjectStillPromptsForAnotherAfterRelaunch() throws {

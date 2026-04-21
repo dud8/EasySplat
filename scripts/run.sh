@@ -8,6 +8,59 @@ TOOLCHAIN_ROOT=""
 FAST=0
 REBUILD=0
 
+log() {
+  printf '[run] %s\n' "$*"
+}
+
+launch_app() {
+  local launch_mode="$1"
+  log "Launching EasySplatApp ($launch_mode)."
+  log "If the window does not come to the front automatically, switch to EasySplatApp in the Dock."
+  swift run --package-path "$ROOT" EasySplatApp
+}
+
+wait_for_local_manifest_server() {
+  local port="$1"
+  local manifest_path="$2"
+  local server_pid="$3"
+  local attempts=50
+
+  while [ "$attempts" -gt 0 ]; do
+    if ! kill -0 "$server_pid" 2>/dev/null; then
+      wait "$server_pid" 2>/dev/null || true
+      echo "Local toolchain server exited before serving the staged manifest on port $port. Is that port already in use?" >&2
+      return 1
+    fi
+
+    if python3 - "$port" "$manifest_path" <<'PY' >/dev/null 2>&1
+import sys
+import urllib.request
+from pathlib import Path
+
+port = int(sys.argv[1])
+manifest_path = Path(sys.argv[2])
+expected_manifest = manifest_path.read_bytes()
+try:
+    with urllib.request.urlopen(f"http://127.0.0.1:{port}/manifest.json", timeout=0.2) as response:
+        actual_manifest = response.read()
+except Exception:
+    raise SystemExit(1)
+
+if actual_manifest != expected_manifest:
+    raise SystemExit(1)
+PY
+    then
+      return 0
+    fi
+
+    attempts=$((attempts - 1))
+    sleep 0.1
+  done
+
+  echo "Timed out waiting for the local toolchain server to serve the staged manifest on port $port." >&2
+  return 1
+}
+
 usage() {
   cat <<'EOF'
 Usage: ./scripts/run.sh [options]
@@ -17,7 +70,7 @@ Options:
   --rebuild              Force a toolchain rebuild (preserve models when possible).
   --version <semver>     Toolchain version (default: 0.1.0).
   --toolchain-root <dir> Override installed toolchain path.
-  --port <port>          Local manifest server port (default: 8000).
+  --port <port>          Local manifest server port on 127.0.0.1 (default: 8000).
   -h, --help             Show this help.
 EOF
 }
@@ -69,6 +122,7 @@ OUT="$TOOLCHAINS/out"
 CORE_ZIP="$OUT/toolchain-macos-arm64-$VERSION-core.zip"
 MODELS_ZIP="$OUT/toolchain-macos-arm64-$VERSION-models.zip"
 MANIFEST="$TOOLCHAINS/manifest.json"
+PUBLIC_SERVE_ROOT=""
 PUB="$TOOLCHAINS/public_key_ed25519.txt"
 PRIV="$TOOLCHAINS/private_key_ed25519.txt"
 VGGT_MPS_INSTALL="${VGGT_MPS_INSTALL:-$ROOT/Toolchains/build/vggt_mps/install}"
@@ -482,14 +536,14 @@ fi
 if [ "$FAST" -eq 1 ]; then
   if [ "$INSTALLED_OK" -ne 1 ]; then
     echo "Local toolchain not found or incomplete at: $TOOLCHAIN_ROOT" >&2
-    echo "Run ./scripts/run.sh --rebuild once to build/install the toolchain, then retry." >&2
+    echo "Run ./scripts/run.sh to auto-build/install it, or use --rebuild to force a fresh toolchain." >&2
     exit 1
   fi
   refresh_installed_mapanything_app "$TOOLCHAIN_ROOT"
   refresh_installed_vggt_app "$TOOLCHAIN_ROOT"
   refresh_installed_fastvggt_app "$TOOLCHAIN_ROOT"
   export EASYSPLAT_LOCAL_TOOLCHAIN_ROOT="$TOOLCHAIN_ROOT"
-  swift run --package-path "$ROOT" EasySplatApp
+  launch_app "installed toolchain at $TOOLCHAIN_ROOT"
   exit 0
 fi
 
@@ -498,7 +552,7 @@ if [ "$REBUILD" -eq 0 ] && [ "$INSTALLED_OK" -eq 1 ]; then
   refresh_installed_vggt_app "$TOOLCHAIN_ROOT"
   refresh_installed_fastvggt_app "$TOOLCHAIN_ROOT"
   export EASYSPLAT_LOCAL_TOOLCHAIN_ROOT="$TOOLCHAIN_ROOT"
-  swift run --package-path "$ROOT" EasySplatApp
+  launch_app "installed toolchain at $TOOLCHAIN_ROOT"
   exit 0
 fi
 
@@ -541,15 +595,27 @@ swift run --package-path "$ROOT/Tools/ManifestTool" ManifestTool \
   --private-key "$(cat "$PRIV")" \
   --manifest-out "$MANIFEST"
 
-pushd "$TOOLCHAINS" >/dev/null
-python3 -m http.server "$PORT" >/dev/null 2>&1 &
+PUBLIC_SERVE_ROOT="$(mktemp -d "${TMPDIR:-/tmp}/easysplat-toolchain-public.XXXXXX")"
+cp "$MANIFEST" "$PUBLIC_SERVE_ROOT/manifest.json"
+mkdir -p "$PUBLIC_SERVE_ROOT/out"
+ln -s "$CORE_ZIP" "$PUBLIC_SERVE_ROOT/out/$(basename "$CORE_ZIP")"
+ln -s "$MODELS_ZIP" "$PUBLIC_SERVE_ROOT/out/$(basename "$MODELS_ZIP")"
+
+pushd "$PUBLIC_SERVE_ROOT" >/dev/null
+python3 -m http.server --bind 127.0.0.1 "$PORT" >/dev/null 2>&1 &
 SERVER_PID=$!
 popd >/dev/null
 
 cleanup() {
   kill "$SERVER_PID" 2>/dev/null || true
+  if [ -n "$PUBLIC_SERVE_ROOT" ]; then
+    rm -rf "$PUBLIC_SERVE_ROOT"
+  fi
 }
 trap cleanup EXIT
+
+wait_for_local_manifest_server "$PORT" "$PUBLIC_SERVE_ROOT/manifest.json" "$SERVER_PID"
+log "Serving local toolchain manifest at http://localhost:$PORT/manifest.json."
 
 export EASYSPLAT_TOOLCHAIN_MANIFEST_URL="http://localhost:$PORT/manifest.json"
 export EASYSPLAT_TOOLCHAIN_PUBLIC_KEY_BASE64="$(cat "$PUB")"
@@ -564,4 +630,4 @@ if [ -d "$TOOLCHAIN_ROOT" ]; then
   fi
 fi
 
-swift run --package-path "$ROOT" EasySplatApp
+launch_app "fresh local manifest at http://localhost:$PORT/manifest.json"

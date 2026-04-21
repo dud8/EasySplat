@@ -1,5 +1,6 @@
 import Foundation
 
+/// Event stream emitted by `PipelineRunner` while processing a project.
 public enum PipelineEvent: Codable, Sendable {
     case stageStarted(stage: PipelineStage)
     case stageProgress(stage: PipelineStage, fraction: Double, message: String)
@@ -8,6 +9,7 @@ public enum PipelineEvent: Codable, Sendable {
     case pipelineFailed(stage: PipelineStage, userMessage: String, debugMessage: String)
 }
 
+/// Snapshot of user-facing progress for a single pipeline stage.
 public struct PipelineProgress: Sendable {
     public var stage: PipelineStage
     public var fraction: Double

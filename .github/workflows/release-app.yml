@@ -28,15 +28,30 @@ jobs:
           fi
 
       - name: Resolve version
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          INPUT_VERSION: ${{ inputs.version }}
+          REF_NAME: ${{ github.ref_name }}
         run: |
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            VERSION="${{ inputs.version }}"
+          semver_re='^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]+)?$'
+          if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
+            VERSION="$INPUT_VERSION"
           else
-            VERSION="${{ github.ref_name }}"
-            VERSION="${VERSION#v}"
+            case "$REF_NAME" in
+              v*) ;;
+              *)
+                echo "Expected release tag to start with v, got: $REF_NAME" >&2
+                exit 1
+                ;;
+            esac
+            VERSION="${REF_NAME#v}"
           fi
-          echo "VERSION=$VERSION" >> $GITHUB_ENV
-          echo "TOOLCHAIN_TAG=toolchain-v$VERSION" >> $GITHUB_ENV
+          if ! [[ "$VERSION" =~ $semver_re ]]; then
+            echo "Invalid semantic version: $VERSION" >&2
+            exit 1
+          fi
+          echo "VERSION=$VERSION" >> "$GITHUB_ENV"
+          echo "TOOLCHAIN_TAG=toolchain-v$VERSION" >> "$GITHUB_ENV"
 
       - name: Write public key
         env:
@@ -49,11 +64,15 @@ jobs:
           echo "$TOOLCHAIN_PUBLIC_KEY_BASE64" > "$RUNNER_TEMP/public_key.txt"
 
       - name: Build app bundle
+        env:
+          REPOSITORY: ${{ github.repository }}
+          TOOLCHAIN_TAG: ${{ env.TOOLCHAIN_TAG }}
         run: |
-          MANIFEST_URL="https://github.com/${{ github.repository }}/releases/download/${{ env.TOOLCHAIN_TAG }}/manifest.json"
+          MANIFEST_URL="https://github.com/$REPOSITORY/releases/download/$TOOLCHAIN_TAG/manifest.json"
           scripts/release/build_app.sh \
             --manifest-url "$MANIFEST_URL" \
             --public-key-path "$RUNNER_TEMP/public_key.txt" \
+            --project-url "https://github.com/$REPOSITORY" \
             --version "$VERSION"
 
       - name: Create DMG

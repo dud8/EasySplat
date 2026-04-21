@@ -1,10 +1,12 @@
 import Foundation
 
+/// Execution mode for the MapAnything bridge.
 public enum MapAnythingRunMode: String, Sendable {
     case direct
     case seedRefine = "seed_refine"
 }
 
+/// Runtime options for invoking the MapAnything SfM bridge.
 public struct MapAnythingSfmConfig: Sendable {
     public var device: String
     public var mode: MapAnythingRunMode
@@ -54,6 +56,7 @@ public struct MapAnythingSfmConfig: Sendable {
     }
 }
 
+/// Interface for running the MapAnything SfM bridge.
 public protocol MapAnythingSfmRunning: Sendable {
     func run(
         toolchain: MapAnythingToolchain,
@@ -70,6 +73,7 @@ public enum MapAnythingSfmError: Error {
     case commandFailed(String)
 }
 
+/// Default subprocess-backed runner for the MapAnything SfM bridge.
 public final class MapAnythingSfmRunner: @unchecked Sendable, MapAnythingSfmRunning {
     private let runner: SubprocessRunning
 

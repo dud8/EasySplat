@@ -1,1 +1,1 @@
-https://github.com/dud8/EasySplat/releases/latest/download/manifest.json
+https://github.com/EasySplat/EasySplat/releases/latest/download/manifest.json
