@@ -57,7 +57,16 @@ extension AppModel {
 
         var summaries: [ProjectSummary] = []
         for url in contents where url.pathExtension == "easysplatproj" {
-            guard let metadata = try? ProjectMetadataStore.load(from: url.appendingPathComponent("project.json")) else {
+            let metadataURL = url.appendingPathComponent("project.json")
+            let metadata: ProjectMetadata
+            do {
+                metadata = try ProjectMetadataStore.load(from: metadataURL)
+            } catch ProjectMetadataStore.LoadError.unsupportedFormatVersion {
+                // Surface future-version projects in the listing with a clear hint instead
+                // of silently dropping them — otherwise the user sees their project disappear.
+                summaries.append(makeNeedsAppUpdateSummary(at: url, metadataURL: metadataURL))
+                continue
+            } catch {
                 continue
             }
             let outputURL = metadata.outputs.map { url.appendingPathComponent($0.splatPlyPath) }
@@ -144,5 +153,33 @@ extension AppModel {
     func regularOutputFileExists(at url: URL) -> Bool {
         let state = outputFileState(at: url)
         return state.exists && !state.isDirectory
+    }
+
+    /// Build a minimal summary for a project whose metadata is unreadable due to a
+    /// formatVersion mismatch. We pull `title` from a raw JSON peek if possible so the
+    /// listing still shows the user's chosen name; otherwise fall back to the directory.
+    private func makeNeedsAppUpdateSummary(at url: URL, metadataURL: URL) -> ProjectSummary {
+        let fallbackTitle = url.deletingPathExtension().lastPathComponent
+        var title = fallbackTitle
+        if let data = try? Data(contentsOf: metadataURL),
+           let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+           let raw = object["title"] as? String,
+           !raw.isEmpty {
+            title = raw
+        }
+        let createdAt = (try? FileManager.default.attributesOfItem(atPath: url.path)[.creationDate] as? Date) ?? Date()
+        return ProjectSummary(
+            id: UUID(),
+            title: title,
+            url: url,
+            createdAt: createdAt,
+            status: .needsAppUpdate,
+            isActive: false,
+            isRetrying: false,
+            isInterrupted: false,
+            checkpointUpdatedAt: nil,
+            lastError: nil,
+            outputPlyURL: nil
+        )
     }
 }

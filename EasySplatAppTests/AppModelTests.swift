@@ -246,6 +246,85 @@ final class AppModelTests: XCTestCase {
         XCTAssertEqual(statusByTitle["Progress"], .inProgress)
     }
 
+    /// A project whose metadata uses a future formatVersion should appear in the listing
+    /// with `.needsAppUpdate` so the user gets a clear prompt to update, instead of the
+    /// project silently disappearing.
+    func testRefreshProjectSummariesSurfacesUnsupportedFormatVersion() throws {
+        let base = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(at: base, withIntermediateDirectories: true)
+
+        let projectURL = base.appendingPathComponent("FromTheFuture.easysplatproj", isDirectory: true)
+        try FileManager.default.createDirectory(at: projectURL, withIntermediateDirectories: true)
+        let metadataURL = projectURL.appendingPathComponent("project.json")
+        let futureVersion = ProjectMetadataStore.supportedFormatVersion + 1
+        let raw = """
+        {
+          "createdAt":"1970-01-01T00:00:00Z",
+          "formatVersion":\(futureVersion),
+          "id":"00000000-0000-0000-0000-000000000003",
+          "input":{"photos":{"folder":"/tmp/photos"}},
+          "preset":{"mode":"object","quality":"standard"},
+          "state":{"attempt":0,"lastError":null,"resumeToken":null,"stage":"importInput"},
+          "title":"User-chosen title"
+        }
+        """
+        try raw.write(to: metadataURL, atomically: true, encoding: .utf8)
+
+        let model = AppModel(toolchainManager: MockToolchainManager(), projectBaseURL: base) { _, config in
+            MockPipelineRunner(projectURL: base, config: config)
+        }
+        model.refreshProjectSummaries()
+
+        // contentsOfDirectory may canonicalize /tmp/... → /private/tmp/... on macOS, so
+        // match by directory name rather than URL identity.
+        let summary = try XCTUnwrap(
+            model.projectSummaries.first {
+                $0.url.lastPathComponent == projectURL.lastPathComponent
+            },
+            "expected a summary for FromTheFuture.easysplatproj; got titles: \(model.projectSummaries.map(\.title))"
+        )
+        XCTAssertEqual(summary.status, .needsAppUpdate)
+        // Title should be preserved from the JSON peek so the user recognizes their project.
+        XCTAssertEqual(summary.title, "User-chosen title")
+    }
+
+    /// A future build may add or rename required fields, so the listing must surface
+    /// `.needsAppUpdate` even when the strict ProjectMetadata decoder cannot make sense
+    /// of the file at all. The formatVersion guard short-circuits before strict decode.
+    func testRefreshProjectSummariesSurfacesUnsupportedFormatVersionWithChangedSchema() throws {
+        let base = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(at: base, withIntermediateDirectories: true)
+
+        let projectURL = base.appendingPathComponent("ChangedSchema.easysplatproj", isDirectory: true)
+        try FileManager.default.createDirectory(at: projectURL, withIntermediateDirectories: true)
+        let metadataURL = projectURL.appendingPathComponent("project.json")
+        let futureVersion = ProjectMetadataStore.supportedFormatVersion + 1
+        // Deliberately omit `state`, `input`, `preset`, `id`, `createdAt`. Today's strict
+        // decoder cannot make sense of this — but the formatVersion bump must still surface.
+        let raw = """
+        {
+          "formatVersion":\(futureVersion),
+          "title":"Renamed-Schema project",
+          "renamedField":42
+        }
+        """
+        try raw.write(to: metadataURL, atomically: true, encoding: .utf8)
+
+        let model = AppModel(toolchainManager: MockToolchainManager(), projectBaseURL: base) { _, config in
+            MockPipelineRunner(projectURL: base, config: config)
+        }
+        model.refreshProjectSummaries()
+
+        let summary = try XCTUnwrap(
+            model.projectSummaries.first {
+                $0.url.lastPathComponent == projectURL.lastPathComponent
+            },
+            "expected ChangedSchema project to surface as needsAppUpdate; got \(model.projectSummaries.map(\.title))"
+        )
+        XCTAssertEqual(summary.status, .needsAppUpdate)
+        XCTAssertEqual(summary.title, "Renamed-Schema project")
+    }
+
     func testRefreshProjectSummariesDoesNotMarkOutputDirectoryReady() throws {
         let base = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
         try FileManager.default.createDirectory(at: base, withIntermediateDirectories: true)

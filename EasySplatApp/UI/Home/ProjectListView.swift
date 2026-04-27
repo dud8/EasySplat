@@ -80,12 +80,18 @@ struct ProjectListView: View {
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
+            if project.status == .needsAppUpdate {
+                Text("This project was created with a newer version of EasySplat. Update the app to open it.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
 
             HStack(spacing: 10) {
                 Button("Open/Resume") {
                     model.resumeProject(at: project.url)
                 }
                 .buttonStyle(SecondaryButtonStyle())
+                .disabled(project.status == .needsAppUpdate)
 
                 Button("Show in Finder") {
                     NSWorkspace.shared.activateFileViewerSelecting([project.url])
@@ -105,6 +111,7 @@ struct ProjectListView: View {
         case .ready: return "Ready"
         case .inProgress: return "In Progress"
         case .failed: return "Failed"
+        case .needsAppUpdate: return "Update EasySplat"
         }
     }
 
@@ -113,6 +120,7 @@ struct ProjectListView: View {
         case .ready: return Theme.success
         case .inProgress: return Theme.accent
         case .failed: return .red
+        case .needsAppUpdate: return Theme.accent
         }
     }
 

@@ -24,7 +24,7 @@ final class ProjectMetadataStoreTests: XCTestCase {
             ))
         )
         let metadata = ProjectMetadata(
-            formatVersion: 2,
+            formatVersion: 1,
             id: UUID(),
             createdAt: Date(timeIntervalSince1970: 123456),
             title: "Test",
@@ -61,6 +61,61 @@ final class ProjectMetadataStoreTests: XCTestCase {
             XCTAssertEqual(details.progressTotal, 40_000)
         } else {
             XCTFail("Expected trainBrush checkpoint details")
+        }
+    }
+
+    func testLoadRejectsFutureFormatVersion() throws {
+        let root = try TestFileBuilder.makeTempDir()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let url = root.appendingPathComponent("project.json")
+
+        let future = """
+        {
+          "createdAt":"1970-01-01T00:00:00Z",
+          "formatVersion":\(ProjectMetadataStore.supportedFormatVersion + 1),
+          "id":"00000000-0000-0000-0000-000000000002",
+          "input":{"photos":{"folder":"/tmp/photos"}},
+          "preset":{"mode":"object","quality":"standard"},
+          "state":{"attempt":0,"lastError":null,"resumeToken":null,"stage":"importInput"},
+          "title":"Future"
+        }
+        """
+        try future.write(to: url, atomically: true, encoding: .utf8)
+
+        XCTAssertThrowsError(try ProjectMetadataStore.load(from: url)) { error in
+            guard case ProjectMetadataStore.LoadError.unsupportedFormatVersion(let v) = error else {
+                XCTFail("Expected unsupportedFormatVersion, got \(error)")
+                return
+            }
+            XCTAssertEqual(v, ProjectMetadataStore.supportedFormatVersion + 1)
+        }
+    }
+
+    /// Regression: a future EasySplat may rename or drop fields that today's strict
+    /// ProjectMetadata decoder requires. The formatVersion check must fire BEFORE the
+    /// strict decode, otherwise such projects throw a generic DecodingError and silently
+    /// disappear from the listing instead of being surfaced as "needs app update".
+    func testLoadRejectsFutureFormatVersionEvenWithMissingRequiredFields() throws {
+        let root = try TestFileBuilder.makeTempDir()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let url = root.appendingPathComponent("project.json")
+
+        // Intentionally omit `state`, `input`, `preset`, `title`, `id`, `createdAt`. Today's
+        // strict decoder rejects this. The version check must still take precedence.
+        let future = """
+        {
+          "formatVersion":\(ProjectMetadataStore.supportedFormatVersion + 1),
+          "newRequiredFieldFromFuture":"hello"
+        }
+        """
+        try future.write(to: url, atomically: true, encoding: .utf8)
+
+        XCTAssertThrowsError(try ProjectMetadataStore.load(from: url)) { error in
+            guard case ProjectMetadataStore.LoadError.unsupportedFormatVersion(let v) = error else {
+                XCTFail("Expected unsupportedFormatVersion even with missing fields, got \(error)")
+                return
+            }
+            XCTAssertEqual(v, ProjectMetadataStore.supportedFormatVersion + 1)
         }
     }
 
