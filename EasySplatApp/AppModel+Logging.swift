@@ -117,9 +117,6 @@ extension AppModel {
         if stage == lastProgressLogStage && trimmed == lastProgressLogMessage && now.timeIntervalSince(lastProgressLogAt) < minInterval {
             return
         }
-        if stage == lastProgressLogStage && now.timeIntervalSince(lastProgressLogAt) < minInterval {
-            return
-        }
 
         lastProgressLogStage = stage
         lastProgressLogMessage = trimmed
@@ -292,7 +289,13 @@ extension AppModel {
         guard readSize > 0 else { return [] }
         do {
             try handle.seek(toOffset: fileSize - readSize)
-            let data = try handle.readToEnd() ?? Data()
+            var data = try handle.readToEnd() ?? Data()
+            // If we didn't read from the start of the file, the seek may have landed mid-line
+            // (and possibly mid-multibyte-UTF-8). Drop everything up to and including the first
+            // newline so the first surviving line is always whole and decodes cleanly.
+            if readSize < fileSize, let firstNewline = data.firstIndex(of: 0x0A) {
+                data = data.subdata(in: data.index(after: firstNewline)..<data.endIndex)
+            }
             let text = String(decoding: data, as: UTF8.self)
             let rawLines = text.split(separator: "\n", omittingEmptySubsequences: false).map(String.init)
             var cleaned: [String] = []

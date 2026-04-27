@@ -181,7 +181,11 @@ public final class BrushRunner {
         while let item = enumerator?.nextObject() as? URL {
             guard item.pathExtension.lowercased() == "ply" else { continue }
             let date = (try? item.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate) ?? Date.distantPast
-            if latest == nil || date > latest!.1 {
+            if let current = latest {
+                if date > current.1 {
+                    latest = (item, date)
+                }
+            } else {
                 latest = (item, date)
             }
         }

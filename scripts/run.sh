@@ -213,11 +213,15 @@ core_zip_valid() {
 
   local tmp
   tmp="$(mktemp -d)"
-  unzip -p "$CORE_ZIP" bin/colmap >"$tmp/colmap" 2>/dev/null || { rm -rf "$tmp"; return 1; }
-  chmod +x "$tmp/colmap"
-  otool -l "$tmp/colmap" | grep -q "@executable_path/../lib" || { rm -rf "$tmp"; return 1; }
-  otool -L "$tmp/colmap" | grep -q "@rpath/libcrypto.3.dylib" || { rm -rf "$tmp"; return 1; }
+  local rc=0
+  {
+    unzip -p "$CORE_ZIP" bin/colmap >"$tmp/colmap" 2>/dev/null \
+      && chmod +x "$tmp/colmap" \
+      && otool -l "$tmp/colmap" | grep -q "@executable_path/../lib" \
+      && otool -L "$tmp/colmap" | grep -q "@rpath/libcrypto.3.dylib"
+  } || rc=1
   rm -rf "$tmp"
+  return "$rc"
 }
 
 models_zip_valid() {
@@ -595,6 +599,17 @@ swift run --package-path "$ROOT/Tools/ManifestTool" ManifestTool \
   --private-key "$(cat "$PRIV")" \
   --manifest-out "$MANIFEST"
 
+SERVER_PID=""
+cleanup() {
+  if [ -n "${SERVER_PID:-}" ]; then
+    kill "$SERVER_PID" 2>/dev/null || true
+  fi
+  if [ -n "${PUBLIC_SERVE_ROOT:-}" ]; then
+    rm -rf "$PUBLIC_SERVE_ROOT"
+  fi
+}
+trap cleanup EXIT
+
 PUBLIC_SERVE_ROOT="$(mktemp -d "${TMPDIR:-/tmp}/easysplat-toolchain-public.XXXXXX")"
 cp "$MANIFEST" "$PUBLIC_SERVE_ROOT/manifest.json"
 mkdir -p "$PUBLIC_SERVE_ROOT/out"
@@ -605,14 +620,6 @@ pushd "$PUBLIC_SERVE_ROOT" >/dev/null
 python3 -m http.server --bind 127.0.0.1 "$PORT" >/dev/null 2>&1 &
 SERVER_PID=$!
 popd >/dev/null
-
-cleanup() {
-  kill "$SERVER_PID" 2>/dev/null || true
-  if [ -n "$PUBLIC_SERVE_ROOT" ]; then
-    rm -rf "$PUBLIC_SERVE_ROOT"
-  fi
-}
-trap cleanup EXIT
 
 wait_for_local_manifest_server "$PORT" "$PUBLIC_SERVE_ROOT/manifest.json" "$SERVER_PID"
 log "Serving local toolchain manifest at http://localhost:$PORT/manifest.json."

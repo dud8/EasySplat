@@ -225,13 +225,23 @@ extension AppModel {
         encoder.dateEncodingStrategy = .iso8601
         guard var payload = try? encoder.encode(event) else { return }
         payload.append(0x0A)
-        FileManager.default.createFile(atPath: logURL.path, contents: nil)
-        guard let handle = try? FileHandle(forWritingTo: logURL) else { return }
+        if !FileManager.default.fileExists(atPath: logURL.path) {
+            FileManager.default.createFile(atPath: logURL.path, contents: nil)
+        }
+        let handle: FileHandle
+        do {
+            handle = try FileHandle(forWritingTo: logURL)
+        } catch {
+            // Surface a single breadcrumb so a user reporting "no share events" can find a clue.
+            FileHandle.standardError.write(Data("AppModel+Sharing: failed to open \(logURL.path): \(error.localizedDescription)\n".utf8))
+            return
+        }
         defer { try? handle.close() }
         do {
             try handle.seekToEnd()
             try handle.write(contentsOf: payload)
         } catch {
+            FileHandle.standardError.write(Data("AppModel+Sharing: failed to append \(name): \(error.localizedDescription)\n".utf8))
             return
         }
     }
@@ -247,6 +257,10 @@ private struct ShareEventRecord: Codable {
 final class ShareSession: NSObject, @preconcurrency NSSharingServicePickerDelegate, NSSharingServiceDelegate {
     private weak var model: AppModel?
     private let projectURL: URL
+    /// Keep the picker alive for the duration of the share. NSSharingServicePicker uses a
+    /// transient system menu that holds the picker while shown, but retaining it on the
+    /// session removes any ambiguity around ARC freeing the local before the user dismisses.
+    private var picker: NSSharingServicePicker?
 
     init(model: AppModel, projectURL: URL) {
         self.model = model
@@ -255,6 +269,7 @@ final class ShareSession: NSObject, @preconcurrency NSSharingServicePickerDelega
 
     func present(picker: NSSharingServicePicker, in sourceView: NSView) {
         picker.delegate = self
+        self.picker = picker
         let anchor = NSRect(x: sourceView.bounds.midX, y: sourceView.bounds.midY, width: 1, height: 1)
         picker.show(relativeTo: anchor, of: sourceView, preferredEdge: .minY)
     }

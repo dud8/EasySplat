@@ -19,6 +19,11 @@ extension ToolchainManager {
         guard fileManager.fileExists(atPath: libcrypto.path) else { throw ToolchainError.missingLibrary("libcrypto.3.dylib") }
         guard fileManager.fileExists(atPath: libssl.path) else { throw ToolchainError.missingLibrary("libssl.3.dylib") }
 
+        try requireArm64Binary(at: colmap, label: "colmap")
+        // brush itself may be a shebang-wrapped launcher; arch-check the real binary in that case.
+        let brushBinary = fileHasShebang(at: brush) ? brushReal : brush
+        try requireArm64Binary(at: brushBinary, label: "brush")
+
         let colmapCheck = try runner.run(colmap.path, ["-h"])
         guard colmapCheck.exitCode == 0 else {
             throw ToolchainError.invalidToolchain("COLMAP failed to launch (exit \(colmapCheck.exitCode)).")
@@ -81,10 +86,7 @@ extension ToolchainManager {
         ensureExecutable(at: mapAnythingPython)
         try validateBuildInfo(at: mapAnythingBuildInfo, expectedToolchainName: "mapanything_mps")
 
-        let mapAnythingPythonArch = try? runner.run("/usr/bin/file", [mapAnythingPython.path])
-        if let output = mapAnythingPythonArch?.stdout.lowercased(), !output.contains("arm64") {
-            throw ToolchainError.invalidToolchain("mapanything_mps python is not arm64 (Rosetta build detected).")
-        }
+        try requireArm64Binary(at: mapAnythingPython, label: "mapanything_mps python")
         let mapAnythingCheck = try runner.run(mapAnythingSfmTool.path, ["--help"])
         guard mapAnythingCheck.exitCode == 0 else {
             throw ToolchainError.invalidToolchain("mapanything_mps failed to launch (exit \(mapAnythingCheck.exitCode)).")
@@ -134,10 +136,7 @@ extension ToolchainManager {
         ensureExecutable(at: vggtPython)
         try validateBuildInfo(at: vggtBuildInfo, expectedToolchainName: "vggt_mps")
 
-        let vggtPythonArch = try? runner.run("/usr/bin/file", [vggtPython.path])
-        if let output = vggtPythonArch?.stdout.lowercased(), !output.contains("arm64") {
-            throw ToolchainError.invalidToolchain("vggt_mps python is not arm64 (Rosetta build detected).")
-        }
+        try requireArm64Binary(at: vggtPython, label: "vggt_mps python")
         let vggtCheck = try runner.run(vggtSfmTool.path, ["--help"])
         guard vggtCheck.exitCode == 0 else {
             throw ToolchainError.invalidToolchain("vggt_mps failed to launch (exit \(vggtCheck.exitCode)).")
@@ -185,10 +184,7 @@ extension ToolchainManager {
         ensureExecutable(at: fastvggtPython)
         try validateBuildInfo(at: fastvggtBuildInfo, expectedToolchainName: "fastvggt_mps")
 
-        let fastvggtPythonArch = try? runner.run("/usr/bin/file", [fastvggtPython.path])
-        if let output = fastvggtPythonArch?.stdout.lowercased(), !output.contains("arm64") {
-            throw ToolchainError.invalidToolchain("fastvggt_mps python is not arm64 (Rosetta build detected).")
-        }
+        try requireArm64Binary(at: fastvggtPython, label: "fastvggt_mps python")
         let fastvggtCheck = try runner.run(fastvggtSfmTool.path, ["--help"])
         guard fastvggtCheck.exitCode == 0 else {
             throw ToolchainError.invalidToolchain("fastvggt_mps failed to launch (exit \(fastvggtCheck.exitCode)).")
@@ -265,6 +261,36 @@ extension ToolchainManager {
             throw ToolchainError.invalidToolchain(
                 "\(expectedToolchainName) build_info.json toolchain_name mismatch (got \(toolchainName ?? "nil"))."
             )
+        }
+    }
+
+    /// Verifies the binary at `url` is a native arm64 Mach-O. Fails closed if `/usr/bin/file`
+    /// cannot be executed at all — we'd rather block startup than silently allow a Rosetta build.
+    /// Uses `-b` to strip the filename from output so paths containing "arm64" (e.g.
+    /// `…/index-build/arm64-apple-macosx/…`) cannot satisfy the substring check on their own.
+    func requireArm64Binary(at url: URL, label: String) throws {
+        let probe: SubprocessResult
+        do {
+            probe = try runner.run("/usr/bin/file", ["-b", url.path])
+        } catch {
+            throw ToolchainError.invalidToolchain(
+                "\(label) architecture check could not run (\(error.localizedDescription))."
+            )
+        }
+        guard probe.exitCode == 0 else {
+            throw ToolchainError.invalidToolchain(
+                "\(label) architecture check failed (file exited \(probe.exitCode))."
+            )
+        }
+        let description = probe.stdout.lowercased()
+        guard description.contains("mach-o") else {
+            throw ToolchainError.invalidToolchain(
+                "\(label) is not a Mach-O binary (file reported: \(probe.stdout.trimmingCharacters(in: .whitespacesAndNewlines)))."
+            )
+        }
+        // Universal binaries report each slice; require at least one arm64 slice.
+        guard description.contains("arm64") else {
+            throw ToolchainError.invalidToolchain("\(label) is not arm64 (Rosetta build detected).")
         }
     }
 

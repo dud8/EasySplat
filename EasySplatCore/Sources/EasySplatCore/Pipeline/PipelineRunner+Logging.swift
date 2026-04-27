@@ -314,10 +314,19 @@ final class PipelineLogger: @unchecked Sendable {
         self.emit = emit
         self.encoder = JSONEncoder()
         encoder.dateEncodingStrategy = .iso8601
-        FileManager.default.createFile(atPath: logURL.path, contents: nil)
-        FileManager.default.createFile(atPath: eventsURL.path, contents: nil)
+        let fm = FileManager.default
+        try? fm.createDirectory(at: logURL.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try? fm.createDirectory(at: eventsURL.deletingLastPathComponent(), withIntermediateDirectories: true)
+        fm.createFile(atPath: logURL.path, contents: nil)
+        fm.createFile(atPath: eventsURL.path, contents: nil)
         self.logHandle = try? FileHandle(forWritingTo: logURL)
         self.eventsHandle = try? FileHandle(forWritingTo: eventsURL)
+        if self.logHandle == nil {
+            FileHandle.standardError.write(Data("PipelineLogger: failed to open pipeline log at \(logURL.path)\n".utf8))
+        }
+        if self.eventsHandle == nil {
+            FileHandle.standardError.write(Data("PipelineLogger: failed to open events log at \(eventsURL.path)\n".utf8))
+        }
     }
 
     deinit {

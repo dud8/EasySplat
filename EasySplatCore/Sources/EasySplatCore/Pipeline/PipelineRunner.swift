@@ -89,7 +89,16 @@ public final class PipelineRunner: @unchecked Sendable {
         let paths = ProjectPaths(root: projectURL)
         try paths.ensureDirectories()
 
+        // Load metadata BEFORE clearing any logs. If project.json is malformed, unreadable,
+        // or from a future build, we want the user to keep the previous run's diagnostic
+        // tool logs (colmap/brush/etc.) for inspection — wiping them on a no-op startup
+        // failure would destroy the only evidence of why the prior attempt died.
         var metadata = try ProjectMetadataStore.load(from: paths.metadataURL)
+
+        // Now we've committed to a new run: reset per-tool logs so users see only the
+        // current attempt. ToolLogWriter is now an appender (so multiple stages within
+        // one run share a file cleanly); the orchestrator owns the cross-run truncation.
+        Self.resetPerRunToolLogs(at: paths)
         let logger = PipelineLogger(eventsURL: paths.eventsLogURL, logURL: paths.pipelineLogURL, emit: events)
         var currentStage: PipelineStage = .importInput
         var didEmitFailure = false
@@ -3400,6 +3409,25 @@ public final class PipelineRunner: @unchecked Sendable {
                 )
             }
             throw error
+        }
+    }
+
+    /// Removes the per-tool log files at the start of a run so each attempt has a clean
+    /// log surface. Within a single run, ToolLogWriter is an appender — multiple stages
+    /// targeting the same file (e.g. consecutive COLMAP stages) accumulate cleanly.
+    /// Across runs, the orchestrator clears them here.
+    static func resetPerRunToolLogs(at paths: ProjectPaths) {
+        let fm = FileManager.default
+        let toolLogs: [URL] = [
+            paths.colmapLogURL,
+            paths.glomapLogURL,
+            paths.mapanythingLogURL,
+            paths.vggtLogURL,
+            paths.fastvggtLogURL,
+            paths.brushLogURL,
+        ]
+        for url in toolLogs where fm.fileExists(atPath: url.path) {
+            try? fm.removeItem(at: url)
         }
     }
 }

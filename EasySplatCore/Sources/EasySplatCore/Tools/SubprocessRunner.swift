@@ -400,26 +400,34 @@ public final class SubprocessRunner: @unchecked Sendable, SubprocessRunning, Pse
 #if canImport(Darwin)
 private extension SubprocessRunner {
     static func requestGracefulTermination(_ process: Process) {
+        guard process.isRunning else { return }
         let pid = process.processIdentifier
         guard pid > 0 else {
             process.terminate()
             return
         }
 
-        func isAlive(_ pid: pid_t) -> Bool {
-            if kill(pid, 0) == 0 { return true }
-            return errno == EPERM
-        }
-
         _ = kill(pid, SIGINT)
 
-        Task.detached {
+        // Resolve the PID against the live Process to avoid signaling a recycled PID
+        // after the original child has exited and been reaped.
+        let escalation = Task.detached { [weak process] in
             try? await Task.sleep(nanoseconds: 12_000_000_000)
-            guard isAlive(pid) else { return }
-            _ = kill(pid, SIGTERM)
+            if Task.isCancelled { return }
+            guard let process, process.isRunning else { return }
+            _ = kill(process.processIdentifier, SIGTERM)
             try? await Task.sleep(nanoseconds: 3_000_000_000)
-            guard isAlive(pid) else { return }
-            _ = kill(pid, SIGKILL)
+            if Task.isCancelled { return }
+            guard process.isRunning else { return }
+            _ = kill(process.processIdentifier, SIGKILL)
+        }
+
+        // Chain into the existing termination handler so the escalation is cancelled
+        // the moment the process actually exits, even if it exits before our timers fire.
+        let previousHandler = process.terminationHandler
+        process.terminationHandler = { proc in
+            escalation.cancel()
+            previousHandler?(proc)
         }
     }
 }

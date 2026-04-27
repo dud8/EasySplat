@@ -36,4 +36,30 @@ final class ToolLogWriterTests: XCTestCase {
         let lines = text.split(separator: "\n").filter { $0.contains("dup") }
         XCTAssertEqual(lines.count, 1)
     }
+
+    /// Multiple stages within one pipeline run instantiate a fresh ToolLogWriter for the
+    /// same file (e.g. several consecutive COLMAP stages each append to colmap.log). The
+    /// second writer must not clobber the first one's content.
+    func testSecondWriterAppendsRatherThanTruncates() throws {
+        let dir = try TestFileBuilder.makeTempDir()
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let logURL = dir.appendingPathComponent("tool.log")
+
+        do {
+            let first = ToolLogWriter(fileURL: logURL, toolName: "tool")
+            first.beginSection(title: "first-stage")
+            first.append(stream: "stdout", line: "from first stage")
+        }
+        do {
+            let second = ToolLogWriter(fileURL: logURL, toolName: "tool")
+            second.beginSection(title: "second-stage")
+            second.append(stream: "stdout", line: "from second stage")
+        }
+
+        let text = try String(contentsOf: logURL, encoding: .utf8)
+        XCTAssertTrue(text.contains("from first stage"), "first stage content was clobbered:\n\(text)")
+        XCTAssertTrue(text.contains("from second stage"))
+        XCTAssertTrue(text.contains("first-stage"))
+        XCTAssertTrue(text.contains("second-stage"))
+    }
 }

@@ -633,6 +633,18 @@ final class ToolchainManagerDownloadTests: XCTestCase {
     private func validationScripts(for fixture: ToolchainFixture) -> [MockSubprocessRunner.Script] {
         [
             .init(
+                path: "/usr/bin/file",
+                argsPrefix: ["-b", fixture.colmap.path],
+                result: .init(exitCode: 0, terminationReason: .exit, stdout: "Mach-O 64-bit executable arm64", stderr: ""),
+                onRun: nil
+            ),
+            .init(
+                path: "/usr/bin/file",
+                argsPrefix: ["-b", fixture.brush.path],
+                result: .init(exitCode: 0, terminationReason: .exit, stdout: "Mach-O 64-bit executable arm64", stderr: ""),
+                onRun: nil
+            ),
+            .init(
                 path: fixture.colmap.path,
                 argsPrefix: ["-h"],
                 result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""),
@@ -646,7 +658,7 @@ final class ToolchainManagerDownloadTests: XCTestCase {
             ),
             .init(
                 path: "/usr/bin/file",
-                argsPrefix: [fixture.mapanythingPython.path],
+                argsPrefix: ["-b", fixture.mapanythingPython.path],
                 result: .init(exitCode: 0, terminationReason: .exit, stdout: "Mach-O 64-bit executable arm64", stderr: ""),
                 onRun: nil
             ),
@@ -658,7 +670,7 @@ final class ToolchainManagerDownloadTests: XCTestCase {
             ),
             .init(
                 path: "/usr/bin/file",
-                argsPrefix: [fixture.vggtPython.path],
+                argsPrefix: ["-b", fixture.vggtPython.path],
                 result: .init(exitCode: 0, terminationReason: .exit, stdout: "Mach-O 64-bit executable arm64", stderr: ""),
                 onRun: nil
             ),
@@ -670,7 +682,7 @@ final class ToolchainManagerDownloadTests: XCTestCase {
             ),
             .init(
                 path: "/usr/bin/file",
-                argsPrefix: [fixture.fastvggtPython.path],
+                argsPrefix: ["-b", fixture.fastvggtPython.path],
                 result: .init(exitCode: 0, terminationReason: .exit, stdout: "Mach-O 64-bit executable arm64", stderr: ""),
                 onRun: nil
             ),

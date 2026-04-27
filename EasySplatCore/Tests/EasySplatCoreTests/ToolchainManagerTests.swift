@@ -8,7 +8,7 @@ final class ToolchainManagerTests: XCTestCase {
         defer { try? FileManager.default.removeItem(at: root) }
         _ = try ToolchainFixtureBuilder.createToolchain(at: root, brushHasShebang: true, includeBrushReal: true)
 
-        let runner = makeValidationRunner(root: root)
+        let runner = makeValidationRunner(root: root, brushArchPath: "bin/brush.real")
 
         let manager = ToolchainManager(runner: runner)
         let toolchain = try manager.test_validateToolchain(root: root)
@@ -43,6 +43,86 @@ final class ToolchainManagerTests: XCTestCase {
             guard case ToolchainManager.ToolchainError.invalidToolchain = error else {
                 return XCTFail("Expected invalidToolchain error")
             }
+        }
+    }
+
+    /// Regression: `/usr/bin/file <path>` echoes the path in stdout, so without `file -b`
+    /// a non-Mach-O file under a path containing "arm64" (e.g. `.build/index-build/arm64-apple-macosx/...`)
+    /// could spoof the substring check and pass validation. With `-b` the path is stripped
+    /// and only the file's actual description is inspected.
+    func testValidateToolchainRejectsNonMachOPython() throws {
+        let root = try TestFileBuilder.makeTempDir()
+        defer { try? FileManager.default.removeItem(at: root) }
+        _ = try ToolchainFixtureBuilder.createToolchain(at: root)
+
+        // file -b output for a non-Mach-O file. No "arm64" anywhere in the description.
+        let runner = makeValidationRunner(root: root, mapAnythingPythonArch: "data")
+
+        let manager = ToolchainManager(runner: runner)
+        XCTAssertThrowsError(try manager.test_validateToolchain(root: root)) { error in
+            guard case ToolchainManager.ToolchainError.invalidToolchain(let message) = error else {
+                return XCTFail("Expected invalidToolchain error")
+            }
+            XCTAssertTrue(message.contains("Mach-O"), "expected Mach-O check to be the failure reason; got \(message)")
+        }
+    }
+
+    /// `/usr/bin/file -b` output for a universal Mach-O lists each slice. As long as one
+    /// slice is arm64, the binary is usable on Apple silicon.
+    func testValidateToolchainAcceptsUniversalArmPython() throws {
+        let root = try TestFileBuilder.makeTempDir()
+        defer { try? FileManager.default.removeItem(at: root) }
+        _ = try ToolchainFixtureBuilder.createToolchain(at: root, brushHasShebang: true, includeBrushReal: true)
+
+        let universal = "Mach-O universal binary with 2 architectures: [x86_64:Mach-O 64-bit executable x86_64] [arm64:Mach-O 64-bit executable arm64]"
+        let runner = makeValidationRunner(
+            root: root,
+            brushArchPath: "bin/brush.real",
+            mapAnythingPythonArch: universal,
+            vggtPythonArch: universal,
+            fastvggtPythonArch: universal
+        )
+
+        let manager = ToolchainManager(runner: runner)
+        XCTAssertNoThrow(try manager.test_validateToolchain(root: root))
+    }
+
+    /// A Rosetta-installed colmap would launch via Rosetta on Apple silicon and pass `-h`,
+    /// but downstream tools depending on its output format / dylibs misbehave. Fail early.
+    func testValidateToolchainRejectsRosettaColmap() throws {
+        let root = try TestFileBuilder.makeTempDir()
+        defer { try? FileManager.default.removeItem(at: root) }
+        _ = try ToolchainFixtureBuilder.createToolchain(at: root)
+
+        let runner = makeValidationRunner(root: root, colmapArch: "Mach-O 64-bit executable x86_64")
+
+        let manager = ToolchainManager(runner: runner)
+        XCTAssertThrowsError(try manager.test_validateToolchain(root: root)) { error in
+            guard case ToolchainManager.ToolchainError.invalidToolchain(let message) = error else {
+                return XCTFail("Expected invalidToolchain error")
+            }
+            XCTAssertTrue(message.lowercased().contains("colmap"), "expected colmap-specific message; got \(message)")
+        }
+    }
+
+    /// When brush is a shebang launcher, the arch check must target brush.real (the actual binary).
+    func testValidateToolchainRejectsRosettaBrushReal() throws {
+        let root = try TestFileBuilder.makeTempDir()
+        defer { try? FileManager.default.removeItem(at: root) }
+        _ = try ToolchainFixtureBuilder.createToolchain(at: root, brushHasShebang: true, includeBrushReal: true)
+
+        let runner = makeValidationRunner(
+            root: root,
+            brushArch: "Mach-O 64-bit executable x86_64",
+            brushArchPath: "bin/brush.real"
+        )
+
+        let manager = ToolchainManager(runner: runner)
+        XCTAssertThrowsError(try manager.test_validateToolchain(root: root)) { error in
+            guard case ToolchainManager.ToolchainError.invalidToolchain(let message) = error else {
+                return XCTFail("Expected invalidToolchain error")
+            }
+            XCTAssertTrue(message.lowercased().contains("brush"), "expected brush-specific message; got \(message)")
         }
     }
 
@@ -196,6 +276,9 @@ final class ToolchainManagerTests: XCTestCase {
 
     private func makeValidationRunner(
         root: URL,
+        colmapArch: String = "Mach-O 64-bit executable arm64",
+        brushArch: String = "Mach-O 64-bit executable arm64",
+        brushArchPath: String = "bin/brush",
         mapAnythingPythonArch: String = "Mach-O 64-bit executable arm64",
         vggtPythonArch: String = "Mach-O 64-bit executable arm64",
         fastvggtPythonArch: String = "Mach-O 64-bit executable arm64",
@@ -204,13 +287,15 @@ final class ToolchainManagerTests: XCTestCase {
         fastvggtHelpExitCode: Int32 = 0
     ) -> MockSubprocessRunner {
         MockSubprocessRunner(scripts: [
+            .init(path: "/usr/bin/file", argsPrefix: ["-b", root.appendingPathComponent("bin/colmap").path], result: .init(exitCode: 0, terminationReason: .exit, stdout: colmapArch, stderr: ""), onRun: nil),
+            .init(path: "/usr/bin/file", argsPrefix: ["-b", root.appendingPathComponent(brushArchPath).path], result: .init(exitCode: 0, terminationReason: .exit, stdout: brushArch, stderr: ""), onRun: nil),
             .init(path: root.appendingPathComponent("bin/colmap").path, argsPrefix: ["-h"], result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""), onRun: nil),
             .init(path: root.appendingPathComponent("bin/brush").path, argsPrefix: ["--help"], result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""), onRun: nil),
-            .init(path: "/usr/bin/file", argsPrefix: [root.appendingPathComponent("mapanything_mps/python/bin/python3").path], result: .init(exitCode: 0, terminationReason: .exit, stdout: mapAnythingPythonArch, stderr: ""), onRun: nil),
+            .init(path: "/usr/bin/file", argsPrefix: ["-b", root.appendingPathComponent("mapanything_mps/python/bin/python3").path], result: .init(exitCode: 0, terminationReason: .exit, stdout: mapAnythingPythonArch, stderr: ""), onRun: nil),
             .init(path: root.appendingPathComponent("mapanything_mps/bin/easysplat_mapanything_sfm").path, argsPrefix: ["--help"], result: .init(exitCode: mapAnythingHelpExitCode, terminationReason: .exit, stdout: "", stderr: ""), onRun: nil),
-            .init(path: "/usr/bin/file", argsPrefix: [root.appendingPathComponent("vggt_mps/python/bin/python3").path], result: .init(exitCode: 0, terminationReason: .exit, stdout: vggtPythonArch, stderr: ""), onRun: nil),
+            .init(path: "/usr/bin/file", argsPrefix: ["-b", root.appendingPathComponent("vggt_mps/python/bin/python3").path], result: .init(exitCode: 0, terminationReason: .exit, stdout: vggtPythonArch, stderr: ""), onRun: nil),
             .init(path: root.appendingPathComponent("vggt_mps/bin/easysplat_vggt_sfm").path, argsPrefix: ["--help"], result: .init(exitCode: vggtHelpExitCode, terminationReason: .exit, stdout: "", stderr: ""), onRun: nil),
-            .init(path: "/usr/bin/file", argsPrefix: [root.appendingPathComponent("fastvggt_mps/python/bin/python3").path], result: .init(exitCode: 0, terminationReason: .exit, stdout: fastvggtPythonArch, stderr: ""), onRun: nil),
+            .init(path: "/usr/bin/file", argsPrefix: ["-b", root.appendingPathComponent("fastvggt_mps/python/bin/python3").path], result: .init(exitCode: 0, terminationReason: .exit, stdout: fastvggtPythonArch, stderr: ""), onRun: nil),
             .init(path: root.appendingPathComponent("fastvggt_mps/bin/easysplat_fastvggt_sfm").path, argsPrefix: ["--help"], result: .init(exitCode: fastvggtHelpExitCode, terminationReason: .exit, stdout: "", stderr: ""), onRun: nil)
         ])
     }

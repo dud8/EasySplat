@@ -187,6 +187,43 @@ final class AppModelTests: XCTestCase {
         XCTAssertTrue(lines.contains { $0.contains("Hello log") })
     }
 
+    /// When the tail seek lands inside a multibyte UTF-8 sequence, we should drop the
+    /// partial leading bytes (and the partial line that contained them) rather than
+    /// emitting replacement characters in the first surviving line.
+    func testLoadPipelineLogTailSkipsPartialFirstLineAtBoundary() throws {
+        let tempBase = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(at: tempBase, withIntermediateDirectories: true)
+        let projectURL = tempBase.appendingPathComponent("Project.easysplatproj", isDirectory: true)
+        try FileManager.default.createDirectory(at: projectURL, withIntermediateDirectories: true)
+        let paths = ProjectPaths(root: projectURL)
+        try paths.ensureDirectories()
+
+        // Pad past the tail window so the seek lands inside this leading line, mid-emoji.
+        // U+1F4A1 (light bulb) is a 4-byte sequence "F0 9F 92 A1" — a great victim for a mid-byte seek.
+        var logData = Data()
+        logData.append(contentsOf: String(repeating: "x", count: 200).utf8)
+        logData.append(contentsOf: "💡 lead-in to be sliced\n".utf8)
+        for index in 0..<10 {
+            logData.append(contentsOf: "[stage] tail entry \(index)\n".utf8)
+        }
+        try logData.write(to: paths.pipelineLogURL, options: [.atomic])
+
+        let model = AppModel(toolchainManager: MockToolchainManager(), projectBaseURL: tempBase) { _, config in
+            MockPipelineRunner(projectURL: projectURL, config: config)
+        }
+
+        // Tail window deliberately smaller than the leading "x"-padding so the seek lands inside.
+        let lines = model.test_loadPipelineLogTail(projectURL: projectURL, maxLines: 100, maxBytes: 150)
+
+        // The partial first line is dropped entirely — no Unicode replacement chars survive.
+        for line in lines {
+            XCTAssertFalse(line.contains("\u{FFFD}"), "tail emitted a replacement char in: \(line)")
+            XCTAssertFalse(line.contains("lead-in to be sliced"), "tail kept a partial leading line: \(line)")
+        }
+        // The whole tail entries that came after the boundary are still present.
+        XCTAssertTrue(lines.contains { $0.contains("tail entry 9") }, "expected last tail line; got \(lines)")
+    }
+
     func testRefreshProjectSummariesStatusMapping() throws {
         let base = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
         try FileManager.default.createDirectory(at: base, withIntermediateDirectories: true)
@@ -640,8 +677,11 @@ final class AppModelTests: XCTestCase {
         XCTAssertNotNil(model.shareStatusMessage)
 
         let events = model.test_shareEventsText(projectURL: projectURL)
-        XCTAssertTrue(events.contains("share_clicked"))
-        XCTAssertTrue(events.contains("share_caption_copied") || events.contains("share_sheet_opened"))
+        XCTAssertTrue(events.contains("\"event\":\"share_clicked\""))
+        XCTAssertTrue(
+            events.contains("\"event\":\"share_caption_copied\"")
+                || events.contains("\"event\":\"share_sheet_opened\"")
+        )
     }
 
     func testShareCurrentSplatReportsMissingOutputFile() async throws {

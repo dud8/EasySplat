@@ -19,8 +19,22 @@ final class ToolLogWriter: @unchecked Sendable {
     init(fileURL: URL, toolName: String) {
         self.fileURL = fileURL
         self.toolName = toolName
-        FileManager.default.createFile(atPath: fileURL.path, contents: nil)
-        self.handle = try? FileHandle(forWritingTo: fileURL)
+        let fm = FileManager.default
+        try? fm.createDirectory(at: fileURL.deletingLastPathComponent(), withIntermediateDirectories: true)
+        // Only create when missing — multiple ToolLogWriter instances for the same file
+        // (e.g. consecutive COLMAP stages within one pipeline run) must append, not clobber
+        // each other. `beginSection` writes a timestamped banner so sections are still
+        // visually separable.
+        if !fm.fileExists(atPath: fileURL.path) {
+            fm.createFile(atPath: fileURL.path, contents: nil)
+        }
+        let opened = try? FileHandle(forWritingTo: fileURL)
+        // Position at end so the first write doesn't overwrite earlier content.
+        _ = try? opened?.seekToEnd()
+        self.handle = opened
+        if self.handle == nil {
+            FileHandle.standardError.write(Data("ToolLogWriter[\(toolName)]: failed to open log at \(fileURL.path)\n".utf8))
+        }
     }
 
     deinit {
