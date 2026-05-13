@@ -3,6 +3,10 @@ import EasySplatCore
 import Foundation
 
 extension AppModel {
+    func isCurrentTaskToken(_ taskToken: UUID?) -> Bool {
+        currentTaskToken == taskToken
+    }
+
     func cancelCurrentProject(deleteProject: Bool, exitIntent: ExitIntent = .none, window: NSWindow? = nil) {
         if exitIntent != .none {
             self.exitIntent = exitIntent
@@ -25,6 +29,7 @@ extension AppModel {
             if !deleteProject, let projectURL {
                 suppressRecoveryPrompt(for: projectURL, clearLastRunStartedAt: true)
             }
+            currentTaskToken = nil
             reset()
             viewState = .home
             if deleteProject, let projectURL {
@@ -223,11 +228,15 @@ extension AppModel {
         }
     }
 
-    func startProject(input: InputSpec, title: String) async {
+    func startProject(input: InputSpec, title: String, taskToken: UUID? = nil) async {
+        guard isCurrentTaskToken(taskToken) else { return }
         defer {
-            currentTask = nil
-            if stopAction != nil {
-                completeStop()
+            if currentTaskToken == taskToken {
+                currentTask = nil
+                currentTaskToken = nil
+                if stopAction != nil {
+                    completeStop()
+                }
             }
         }
         reset()
@@ -252,7 +261,7 @@ extension AppModel {
             statusTitle = "Downloading tools"
             statusDetail = nil
             progress = nil
-            let progressForwarder = ProgressForwarder(model: self)
+            let progressForwarder = ProgressForwarder(model: self, taskToken: taskToken)
             let toolchain = try await toolchainManager.ensureToolchain(
                 manifestURL: AppConfig.toolchainManifestURL,
                 publicKeyBase64: AppConfig.toolchainPublicKeyBase64,
@@ -260,26 +269,31 @@ extension AppModel {
             ) { fraction, message in
                 progressForwarder.update(fraction: fraction, message: message)
             }
+            guard isCurrentTaskToken(taskToken) else { return }
             toolchainPaths = toolchain
 
             let runner = pipelineRunnerFactory(
                 projectURL,
                 .init(toolchain: toolchain, preset: metadata.preset, trainingGate: makeTrainingGate())
             )
-            let forwarder = EventForwarder(model: self)
+            let forwarder = EventForwarder(model: self, taskToken: taskToken)
             try await runner.run(resumeFrom: Optional<PipelineStage>.none) { event in
                 forwarder.handle(event)
             }
+            guard isCurrentTaskToken(taskToken) else { return }
 
-            if let output = try? ProjectMetadataStore.load(from: paths.metadataURL).outputs?.splatPlyPath {
-                outputPlyURL = projectURL.appendingPathComponent(output)
+            guard let outputURL = readyOutputURL(projectURL: projectURL) else {
+                presentOutputMissingFailure(projectURL: projectURL)
+                return
             }
+            outputPlyURL = outputURL
             syncShareMetrics(for: projectURL)
             viewState = .viewer
             refreshProjectSummaries()
         } catch is CancellationError {
             return
         } catch {
+            guard isCurrentTaskToken(taskToken) else { return }
             if stopAction != nil {
                 return
             }
@@ -306,11 +320,15 @@ extension AppModel {
         }
     }
 
-    func resumeProjectTask(at url: URL) async {
+    func resumeProjectTask(at url: URL, taskToken: UUID? = nil) async {
+        guard isCurrentTaskToken(taskToken) else { return }
         defer {
-            currentTask = nil
-            if stopAction != nil {
-                completeStop()
+            if currentTaskToken == taskToken {
+                currentTask = nil
+                currentTaskToken = nil
+                if stopAction != nil {
+                    completeStop()
+                }
             }
         }
         reset()
@@ -336,20 +354,18 @@ extension AppModel {
             appendLogLine("========== NEW LOG START (current run) ==========")
             appendLogLine("Resumed project")
 
-            if let output = metadata.outputs?.splatPlyPath {
-                let outputURL = url.appendingPathComponent(output)
-                if regularOutputFileExists(at: outputURL) {
-                    outputPlyURL = outputURL
-                    syncShareMetrics(for: url)
-                    viewState = .viewer
-                    return
-                }
+            if let outputURL = readyOutputURL(projectURL: url, metadata: metadata) {
+                guard isCurrentTaskToken(taskToken) else { return }
+                outputPlyURL = outputURL
+                syncShareMetrics(for: url)
+                viewState = .viewer
+                return
             }
 
             statusTitle = "Downloading tools"
             statusDetail = nil
             progress = nil
-            let progressForwarder = ProgressForwarder(model: self)
+            let progressForwarder = ProgressForwarder(model: self, taskToken: taskToken)
             let toolchain = try await toolchainManager.ensureToolchain(
                 manifestURL: AppConfig.toolchainManifestURL,
                 publicKeyBase64: AppConfig.toolchainPublicKeyBase64,
@@ -357,27 +373,32 @@ extension AppModel {
             ) { fraction, message in
                 progressForwarder.update(fraction: fraction, message: message)
             }
+            guard isCurrentTaskToken(taskToken) else { return }
             toolchainPaths = toolchain
 
             let runner = pipelineRunnerFactory(
                 url,
                 .init(toolchain: toolchain, preset: metadata.preset, trainingGate: makeTrainingGate())
             )
-            let forwarder = EventForwarder(model: self)
+            let forwarder = EventForwarder(model: self, taskToken: taskToken)
             let stageToResume = resumeStage(from: metadata)
             try await runner.run(resumeFrom: stageToResume) { event in
                 forwarder.handle(event)
             }
+            guard isCurrentTaskToken(taskToken) else { return }
 
-            if let output = try? ProjectMetadataStore.load(from: paths.metadataURL).outputs?.splatPlyPath {
-                outputPlyURL = url.appendingPathComponent(output)
+            guard let outputURL = readyOutputURL(projectURL: url) else {
+                presentOutputMissingFailure(projectURL: url)
+                return
             }
+            outputPlyURL = outputURL
             syncShareMetrics(for: url)
             viewState = .viewer
             refreshProjectSummaries()
         } catch is CancellationError {
             return
         } catch {
+            guard isCurrentTaskToken(taskToken) else { return }
             if stopAction != nil {
                 return
             }
@@ -446,6 +467,29 @@ extension AppModel {
         activeShareSession = nil
     }
 
+    func presentOutputMissingFailure(projectURL: URL) {
+        let message = "Processing failed. Expected outputs were missing."
+        lastError = message
+        statusTitle = message
+        statusDetail = nil
+        progress = nil
+        errorDetails = "The run finished, but EasySplat could not find a valid output PLY file."
+        outputPlyURL = nil
+        mutateProjectMetadata(at: projectURL) { metadata in
+            metadata.state = PipelineState(
+                stage: metadata.state.stage,
+                attempt: metadata.state.attempt,
+                lastError: message,
+                resumeToken: nil
+            )
+            metadata.checkpoint = nil
+            metadata.lastRunStartedAt = nil
+        }
+        appendLogLine("[err] \(message)", isError: true)
+        viewState = .processing
+        refreshProjectSummaries()
+    }
+
     func completeStop() {
         let action = stopAction
         stopAction = nil
@@ -479,28 +523,33 @@ private final class WeakAppModelBox: @unchecked Sendable {
 
 private final class EventForwarder: @unchecked Sendable {
     private weak var model: AppModel?
+    private let taskToken: UUID?
 
-    init(model: AppModel) {
+    init(model: AppModel, taskToken: UUID?) {
         self.model = model
+        self.taskToken = taskToken
     }
 
     func handle(_ event: PipelineEvent) {
         Task { @MainActor in
-            self.model?.handle(event: event)
+            guard let model = self.model, model.isCurrentTaskToken(self.taskToken) else { return }
+            model.handle(event: event)
         }
     }
 }
 
 private final class ProgressForwarder: @unchecked Sendable {
     private weak var model: AppModel?
+    private let taskToken: UUID?
 
-    init(model: AppModel) {
+    init(model: AppModel, taskToken: UUID?) {
         self.model = model
+        self.taskToken = taskToken
     }
 
     func update(fraction: Double, message: String) {
         Task { @MainActor in
-            guard let model = self.model else { return }
+            guard let model = self.model, model.isCurrentTaskToken(self.taskToken) else { return }
             model.handleToolchainProgress(fraction: fraction, message: message)
         }
     }

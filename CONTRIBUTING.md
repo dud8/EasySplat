@@ -15,8 +15,11 @@ Run the first-party checks that match your change:
 ```bash
 ./scripts/test.sh
 ./scripts/test_python_tools.sh
+PYTHON_BIN=/opt/homebrew/bin/python3 ./scripts/test_python_tools.sh
 swift test --package-path Tools/ManifestTool
 ```
+
+Use `PYTHON_BIN` when your default `python3` is not the prepared interpreter for bridge tests.
 
 If you touch public repo collateral, release scripts, or contributor workflow docs, also run:
 

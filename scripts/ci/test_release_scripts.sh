@@ -69,6 +69,16 @@ test "$(cat "$module_resources_dir/public_key_ed25519.txt")" = 'PUBLIC_KEY_TEST_
 
 grep -q 'CORE_ARTIFACT_URL="http://localhost:$PORT/out/toolchain-macos-arm64-$VERSION-core.zip"' "$ROOT/scripts/release/build_dmg.sh"
 grep -q 'MODELS_ARTIFACT_URL="http://localhost:$PORT/out/toolchain-macos-arm64-$VERSION-models.zip"' "$ROOT/scripts/release/build_dmg.sh"
+grep -q -- '--private-key-file "$PRIV"' "$ROOT/scripts/release/build_dmg.sh"
+grep -q 'scripts/toolchain/build_da3_mps.sh' "$ROOT/scripts/release/build_dmg.sh"
+grep -q 'scripts/toolchain/build_mapanything_mps.sh' "$ROOT/scripts/release/build_dmg.sh"
+grep -q 'DA3_SOURCE_DESCRIPTOR="git:${DA3_REPO}@${DA3_SOURCE_COMMIT}"' "$ROOT/scripts/toolchain/build_da3_mps.sh"
+grep -q '^numpy==2\.3\.5$' "$ROOT/Tools/Da3Sfm/requirements.txt"
+grep -q '/usr/bin/file -b "$python_bin"' "$ROOT/scripts/toolchain/package_toolchain.sh"
+grep -q 'require_bundled_arm64_python "da3_mps" "$DA3_PY_BIN"' "$ROOT/scripts/toolchain/package_toolchain.sh"
+grep -q 'require_bundled_arm64_python "mapanything_mps" "$MAP_PY_BIN"' "$ROOT/scripts/toolchain/package_toolchain.sh"
+grep -q 'require_bundled_arm64_python "vggt_mps" "$PY_BIN"' "$ROOT/scripts/toolchain/package_toolchain.sh"
+grep -q 'require_bundled_arm64_python "fastvggt_mps" "$FAST_PY_BIN"' "$ROOT/scripts/toolchain/package_toolchain.sh"
 
 if [ -e "$app_bundle/Contents/lib/Sparkle.framework" ]; then
   echo "Release app unexpectedly bundled Sparkle.framework" >&2

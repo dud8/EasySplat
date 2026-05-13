@@ -2,7 +2,7 @@
 
 EasySplat is a macOS-only Apple Silicon app that turns videos, photo folders, or mixed inputs into 3D Gaussian splats.
 
-The default reconstruction path is MapAnything-first, with COLMAP refinement and `global_mapper` / mapper fallback when the job or hardware needs a safer route. The heavy lifting lives in a signed downloadable toolchain, not in the app bundle.
+The default reconstruction path is Depth Anything 3 first, with MapAnything and COLMAP `global_mapper` / mapper fallback when the job or hardware needs a safer route. The heavy lifting lives in a signed downloadable toolchain, not in the app bundle.
 
 This OSS build keeps distribution simple on purpose: the app itself is currently unsigned and not notarized, while the toolchain remains the signed trust boundary.
 
@@ -33,7 +33,8 @@ EasySplat treats each run like a durable project bundle:
 - `EasySplatAppTests/`: app-model tests.
 - `EasySplatUITests/`: placeholder SwiftPM UI-test target.
 - `Tools/ManifestTool/`: Swift CLI for Ed25519 key generation and manifest signing.
-- `Tools/MapAnythingSfm/`: MapAnything to COLMAP bridge shipped in the toolchain.
+- `Tools/Da3Sfm/`: Depth Anything 3 to COLMAP bridge shipped in the toolchain.
+- `Tools/MapAnythingSfm/`: MapAnything fallback bridge shipped in the toolchain.
 - `Tools/VggtSfm/`: VGGT to COLMAP bridge shipped in the toolchain.
 - `Tools/FastVggtSfm/`: FastVGGT seed-export bridge shipped in the toolchain.
 - `ThirdParty/MetalSplatter/`: vendored viewer dependency.
@@ -78,6 +79,7 @@ Other useful commands:
 ./scripts/test.sh
 ./scripts/test_python_tools.sh
 swift test --package-path Tools/ManifestTool
+./scripts/benchmark_da3.sh --video /absolute/path/to/input.mp4
 ./scripts/benchmark_mapanything.sh --video /absolute/path/to/input.mp4
 ```
 
@@ -97,7 +99,7 @@ Most useful runtime overrides:
 | `EASYSPLAT_TOOLCHAIN_MANIFEST_URL` | Override the manifest URL directly. |
 | `EASYSPLAT_TOOLCHAIN_PUBLIC_KEY_BASE64` | Override the embedded public key. |
 | `EASYSPLAT_LOCAL_TOOLCHAIN_ROOT` | Skip download/install and validate an already-present local toolchain. |
-| `EASYSPLAT_SFM_BACKEND` | Force `mapanything`, `colmap`, `glomap`, `global_mapper`, `vggt`, or `fastvggt`. |
+| `EASYSPLAT_SFM_BACKEND` | Force `da3`, `mapanything`, `colmap`, `glomap`, `global_mapper`, `vggt`, or `fastvggt`. |
 | `EASYSPLAT_SFM_MAPPER` | Steer mapper fallback inside the integrated path: `glomap` means COLMAP `global_mapper`; `colmap` means classic COLMAP `mapper`. |
 | `EASYSPLAT_STOP_AFTER_SFM` | Stop the pipeline after reconstruction. |
 | `EASYSPLAT_SKIP_TRAINING` | Skip Brush training. |
@@ -105,7 +107,22 @@ Most useful runtime overrides:
 | `EASYSPLAT_COLMAP_USE_GPU` | Toggle GPU use in COLMAP where supported. |
 | `EASYSPLAT_COLMAP_FORCE_CPU` / `EASYSPLAT_COLMAP_FORCE_GPU` | Override COLMAP device choice. |
 
-Common MapAnything tuning knobs:
+Common DA3 tuning knobs:
+
+- `EASYSPLAT_DA3_DEVICE=mps|cpu`
+- `EASYSPLAT_DA3_MODEL=DA3-BASE`
+- `EASYSPLAT_DA3_FALLBACK_MODEL=DA3-SMALL`
+- `EASYSPLAT_DA3_PROCESS_RES=<pixels>`
+- `EASYSPLAT_DA3_MAX_POINTS=<n>`
+- `EASYSPLAT_DA3_CAMERA_TYPE=SIMPLE_RADIAL|SIMPLE_PINHOLE|PINHOLE|OPENCV`
+- `EASYSPLAT_DA3_SHARED_CAMERA=0|1`
+- `EASYSPLAT_DA3_WINDOW_SIZE=<n>`
+- `EASYSPLAT_DA3_WINDOW_OVERLAP=<n>`
+- `EASYSPLAT_DA3_DIRECT_MIN_TRACK_LENGTH=<n>`
+
+`DA3-BASE` and `DA3-SMALL` are Apache-2.0 and are bundled in the default signed toolchain. `DA3METRIC-LARGE` is Apache-2.0 but optional for experiments; build it with `EASYSPLAT_DA3_INCLUDE_METRIC_LARGE=1`. Non-commercial DA3 variants are not bundled for the default path.
+
+Common MapAnything fallback tuning knobs:
 
 - `EASYSPLAT_MAPANYTHING_DEVICE=mps|cpu`
 - `EASYSPLAT_MAPANYTHING_CHECKPOINT=map-anything-apache`
@@ -146,14 +163,17 @@ Common Brush overrides:
 
 Default behavior when `EASYSPLAT_SFM_BACKEND` is unset:
 
-- EasySplat starts with MapAnything.
-- Smaller jobs may export sparse structure directly.
-- Larger or tighter-memory jobs use MapAnything seed export plus COLMAP refinement.
-- If refinement still is not good enough, EasySplat falls back through COLMAP `global_mapper` and then COLMAP `mapper` when needed.
+- EasySplat starts with DA3 on MPS using bundled Apache-2.0 weights.
+- DA3 accepts only native COLMAP export; larger selections fall back to MapAnything/COLMAP until DA3 has a safe multi-window export.
+- `DA3-SMALL` is retried automatically if `DA3-BASE` hits MPS memory pressure.
+- DA3 writes the canonical COLMAP text sparse model consumed by training and the viewer.
+- If DA3 fails or produces a low-quality sparse model, EasySplat falls back to MapAnything.
+- If MapAnything refinement still is not good enough, EasySplat falls back through COLMAP `global_mapper` and then COLMAP `mapper` when needed.
 
 Compatibility notes:
 
 - `EASYSPLAT_SFM_BACKEND=glomap` and `EASYSPLAT_SFM_BACKEND=global_mapper` are compatibility aliases for COLMAP's integrated `global_mapper` flow.
+- `mapanything` is still available as an explicit override path and as the first fallback after DA3.
 - `vggt` and `fastvggt` are still available as explicit override paths, but they are no longer the default product story.
 
 ## Toolchain model
@@ -180,7 +200,7 @@ Local development scripts usually emit `Toolchains/manifest.json`. The GitHub to
 - Homebrew
 - Rust toolchain for Brush (`cargo`)
 - network access and enough disk space for large model downloads
-- optional: `ffmpeg` / `ffprobe` if you use `scripts/benchmark_mapanything.sh`
+- optional: `ffmpeg` / `ffprobe` if you use `scripts/benchmark_da3.sh` or `scripts/benchmark_mapanything.sh`
 
 To mirror the current GitHub Actions toolchain runner, install:
 
@@ -286,11 +306,14 @@ Build the local toolchain pieces:
 ./scripts/toolchain/build_openssl.sh
 ./scripts/toolchain/build_colmap.sh
 ./scripts/toolchain/build_brush.sh
+./scripts/toolchain/build_da3_mps.sh
 ./scripts/toolchain/build_mapanything_mps.sh
 ./scripts/toolchain/build_vggt_mps.sh
 ./scripts/toolchain/build_fastvggt_mps.sh
 ./scripts/toolchain/package_toolchain.sh --version 0.1.0
 ```
+
+`build_da3_mps.sh` uses a pinned git checkout by default. A no-git local DA3 source tree is only allowed for development with `EASYSPLAT_ALLOW_UNPINNED_DA3_SOURCE=1`; release scripts and CI reject that override.
 
 `scripts/toolchain/build_glomap.sh` is available for direct `glomap` work, but the packaged app path uses COLMAP's integrated `global_mapper` rather than a separately shipped `glomap` binary.
 
@@ -312,7 +335,7 @@ swift run --package-path Tools/ManifestTool ManifestTool \
   --models-url http://localhost:8000/out/toolchain-macos-arm64-0.1.0-models.zip \
   --version 0.1.0 \
   --published-at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
-  --private-key "$(cat Toolchains/private_key_ed25519.txt)" \
+  --private-key-file Toolchains/private_key_ed25519.txt \
   --manifest-out Toolchains/manifest.json
 ```
 
@@ -363,11 +386,14 @@ Run the manifest tool tests:
 swift test --package-path Tools/ManifestTool
 ```
 
-Run the Python bridge tests for MapAnything, FastVGGT, and VGGT:
+Run the Python bridge tests for DA3, MapAnything, FastVGGT, and VGGT:
 
 ```bash
 ./scripts/test_python_tools.sh
+PYTHON_BIN=/opt/homebrew/bin/python3 ./scripts/test_python_tools.sh
 ```
+
+Use `PYTHON_BIN` when the default `python3` does not already have the bridge test dependencies installed.
 
 ## More docs
 

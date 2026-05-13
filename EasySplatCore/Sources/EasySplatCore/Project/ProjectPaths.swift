@@ -25,6 +25,8 @@ public struct ProjectPaths: Sendable {
     public var appEventsLogURL: URL { logsURL.appendingPathComponent("app_events.jsonl") }
     public var colmapLogURL: URL { logsURL.appendingPathComponent("colmap.log") }
     public var glomapLogURL: URL { logsURL.appendingPathComponent("glomap.log") }
+    public var da3LogURL: URL { logsURL.appendingPathComponent("da3.log") }
+    public var da3CoverageManifestURL: URL { logsURL.appendingPathComponent("da3_coverage_manifest.json") }
     public var mapanythingLogURL: URL { logsURL.appendingPathComponent("mapanything.log") }
     public var mapanythingCoverageManifestURL: URL { logsURL.appendingPathComponent("mapanything_coverage_manifest.json") }
     public var vggtLogURL: URL { logsURL.appendingPathComponent("vggt.log") }
@@ -42,5 +44,56 @@ public struct ProjectPaths: Sendable {
         try fm.createDirectory(at: trainingURL, withIntermediateDirectories: true)
         try fm.createDirectory(at: outputURL, withIntermediateDirectories: true)
         try fm.createDirectory(at: logsURL, withIntermediateDirectories: true)
+    }
+
+    public func resolveProjectRelativePath(_ relativePath: String) throws -> URL {
+        let trimmed = relativePath.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else {
+            throw ProjectPathError.emptyPath
+        }
+        guard !(trimmed as NSString).isAbsolutePath else {
+            throw ProjectPathError.absolutePath(trimmed)
+        }
+
+        let components = trimmed.split(separator: "/", omittingEmptySubsequences: false).map(String.init)
+        guard components.allSatisfy({ !$0.isEmpty && $0 != "." && $0 != ".." }) else {
+            throw ProjectPathError.unsafeComponent(trimmed)
+        }
+
+        let resolved = components.reduce(root) { partial, component in
+            partial.appendingPathComponent(component)
+        }.standardizedFileURL
+        let standardizedRoot = root.standardizedFileURL
+        let rootPath = standardizedRoot.path
+        guard resolved.path == rootPath || resolved.path.hasPrefix(rootPath + "/") else {
+            throw ProjectPathError.escapesProjectRoot(trimmed)
+        }
+        let canonicalRoot = standardizedRoot.resolvingSymlinksInPath()
+        let canonicalResolved = resolved.resolvingSymlinksInPath()
+        let canonicalRootPath = canonicalRoot.path
+        guard canonicalResolved.path == canonicalRootPath || canonicalResolved.path.hasPrefix(canonicalRootPath + "/") else {
+            throw ProjectPathError.escapesProjectRoot(trimmed)
+        }
+        return resolved
+    }
+}
+
+public enum ProjectPathError: Error, LocalizedError, Equatable {
+    case emptyPath
+    case absolutePath(String)
+    case unsafeComponent(String)
+    case escapesProjectRoot(String)
+
+    public var errorDescription: String? {
+        switch self {
+        case .emptyPath:
+            return "Project-relative path is empty"
+        case .absolutePath(let path):
+            return "Project-relative path must not be absolute: \(path)"
+        case .unsafeComponent(let path):
+            return "Project-relative path contains an unsafe component: \(path)"
+        case .escapesProjectRoot(let path):
+            return "Project-relative path escapes the project root: \(path)"
+        }
     }
 }

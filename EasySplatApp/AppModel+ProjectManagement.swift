@@ -7,20 +7,26 @@ extension AppModel {
         let title = projectTitle(for: inputSpec)
         clearPendingInputs()
         currentTask?.cancel()
-        currentTask = Task { await startProject(input: inputSpec, title: title) }
+        let token = UUID()
+        currentTaskToken = token
+        currentTask = Task { await startProject(input: inputSpec, title: title, taskToken: token) }
     }
 
     func resumeProject(at url: URL) {
         clearRecoveryPromptSuppression(for: url)
         currentTask?.cancel()
-        currentTask = Task { await resumeProjectTask(at: url) }
+        let token = UUID()
+        currentTaskToken = token
+        currentTask = Task { await resumeProjectTask(at: url, taskToken: token) }
     }
 
     func resumeInterruptedProject(_ project: ProjectSummary) {
         recoveryPromptProject = nil
         clearRecoveryPromptSuppression(for: project.url)
         currentTask?.cancel()
-        currentTask = Task { await resumeProjectTask(at: project.url) }
+        let token = UUID()
+        currentTaskToken = token
+        currentTask = Task { await resumeProjectTask(at: project.url, taskToken: token) }
     }
 
     func keepInterruptedProjectForLater(_ project: ProjectSummary) {
@@ -31,16 +37,35 @@ extension AppModel {
     }
 
     func deleteInterruptedProject(_ project: ProjectSummary) {
+        if currentProjectURL == project.url {
+            markInterruptedProjectDeleted(project)
+            cancelCurrentProject(deleteProject: true)
+            return
+        }
+        do {
+            try FileManager.default.removeItem(at: project.url)
+            markInterruptedProjectDeleted(project)
+        } catch {
+            if isMissingFileError(error) {
+                markInterruptedProjectDeleted(project)
+            } else {
+                recoveryPromptProject = project
+            }
+        }
+        refreshProjectSummaries()
+    }
+
+    private func markInterruptedProjectDeleted(_ project: ProjectSummary) {
         ignoredRecoveryProjectIDs.insert(project.id)
         if recoveryPromptProject?.id == project.id {
             recoveryPromptProject = nil
         }
-        if currentProjectURL == project.url {
-            cancelCurrentProject(deleteProject: true)
-            return
-        }
-        try? FileManager.default.removeItem(at: project.url)
-        refreshProjectSummaries()
+    }
+
+    private func isMissingFileError(_ error: Error) -> Bool {
+        let nsError = error as NSError
+        return nsError.domain == NSCocoaErrorDomain
+            && nsError.code == CocoaError.Code.fileNoSuchFile.rawValue
     }
 
     func refreshProjectSummaries() {
@@ -69,8 +94,8 @@ extension AppModel {
             } catch {
                 continue
             }
-            let outputURL = metadata.outputs.map { url.appendingPathComponent($0.splatPlyPath) }
-            let outputExists = outputURL.map { regularOutputFileExists(at: $0) } ?? false
+            let outputURL = readyOutputURL(projectURL: url, metadata: metadata)
+            let outputExists = outputURL != nil
             let isActive = currentProjectURL == url && viewState == .processing
             let isRetrying = isActive && metadata.state.lastError != nil
             let hasInterruptionEvidence = metadata.checkpoint != nil || metadata.lastRunStartedAt != nil
@@ -151,8 +176,30 @@ extension AppModel {
     }
 
     func regularOutputFileExists(at url: URL) -> Bool {
-        let state = outputFileState(at: url)
-        return state.exists && !state.isDirectory
+        ProjectArtifactValidator.validatePlyFile(at: url) == .valid
+    }
+
+    func metadataOutputURL(projectURL: URL, metadata: ProjectMetadata? = nil) -> URL? {
+        let loadedMetadata: ProjectMetadata
+        if let metadata {
+            loadedMetadata = metadata
+        } else {
+            guard let metadata = try? ProjectMetadataStore.load(from: ProjectPaths(root: projectURL).metadataURL) else {
+                return nil
+            }
+            loadedMetadata = metadata
+        }
+        guard let relativePath = loadedMetadata.outputs?.splatPlyPath else { return nil }
+        let paths = ProjectPaths(root: projectURL)
+        guard let outputURL = try? paths.resolveProjectRelativePath(relativePath) else { return nil }
+        return outputURL
+    }
+
+    func readyOutputURL(projectURL: URL, metadata: ProjectMetadata? = nil) -> URL? {
+        guard let outputURL = metadataOutputURL(projectURL: projectURL, metadata: metadata) else {
+            return nil
+        }
+        return ProjectArtifactValidator.validatePlyFile(at: outputURL) == .valid ? outputURL : nil
     }
 
     /// Build a minimal summary for a project whose metadata is unreadable due to a

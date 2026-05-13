@@ -17,7 +17,7 @@ struct ManifestTool {
                 let privOut = try parser.require("--private-key-out")
                 let keypair = ManifestBuilder.generateKeypair()
                 try keypair.publicKeyBase64.write(to: URL(fileURLWithPath: pubOut), atomically: true, encoding: .utf8)
-                try keypair.privateKeyBase64.write(to: URL(fileURLWithPath: privOut), atomically: true, encoding: .utf8)
+                try ManifestKeyInput.writePrivateKeyBase64(keypair.privateKeyBase64, to: URL(fileURLWithPath: privOut))
                 exit(ExitCode.ok.rawValue)
             }
 
@@ -25,7 +25,7 @@ struct ManifestTool {
             let version = try parser.require("--version")
             let publishedAtValue = try parser.require("--published-at")
             let manifestOut = try parser.require("--manifest-out")
-            let privateKey = try parser.require("--private-key")
+            let privateKey = try ManifestKeyInput.resolvePrivateKeyBase64(parser: &parser)
             let publishedAt = try parsePublishedAt(publishedAtValue)
 
             let artifactInputs = try buildArtifactInputs(parser: &parser)
@@ -52,13 +52,16 @@ struct ManifestTool {
 
         Generate manifest (single artifact):
           ManifestTool --zip <path> --version <semver> --published-at <iso8601> \\
-            --artifact-url <url> --private-key <base64> --manifest-out <path>
+            --artifact-url <url> --private-key-file <path> --manifest-out <path>
 
         Generate manifest (core + models):
           ManifestTool --core-zip <path> --core-url <url> \\
             --models-zip <path> --models-url <url> \\
             --version <semver> --published-at <iso8601> \\
-            --private-key <base64> --manifest-out <path>
+            --private-key-file <path> --manifest-out <path>
+
+        Private key source:
+          Use exactly one of --private-key-file <path>, --private-key-env <name>, or legacy --private-key <base64>.
         """
         print(text)
     }

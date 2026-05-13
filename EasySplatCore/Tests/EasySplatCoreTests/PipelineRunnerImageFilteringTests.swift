@@ -238,6 +238,86 @@ final class PipelineRunnerImageFilteringTests: XCTestCase {
         XCTAssertEqual(Set(photos.map(\.lastPathComponent)), Set(["root.jpg", "inner.jpg"]))
     }
 
+    func testImportInputsReplacesZeroByteImportedVideo() throws {
+        let root = try TestFileBuilder.makeTempDir()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let projectURL = root.appendingPathComponent("Project.easysplatproj", isDirectory: true)
+        let source = root.appendingPathComponent("clip.mov")
+        try Data("fresh-video".utf8).write(to: source)
+        let paths = ProjectPaths(root: projectURL)
+        try paths.ensureDirectories()
+        TestFileBuilder.createFile(at: paths.originalsURL.appendingPathComponent("clip.mov"))
+        let runner = try makeRunner(projectURL: projectURL)
+        let metadata = ProjectMetadata(
+            title: "Video",
+            input: .video(files: [source.path]),
+            preset: PresetSpec(mode: .object, quality: .draft)
+        )
+
+        try runner.importInputs(metadata: metadata, paths: paths) { _, _ in }
+
+        let imported = paths.originalsURL.appendingPathComponent("clip.mov")
+        XCTAssertEqual(try String(contentsOf: imported, encoding: .utf8), "fresh-video")
+    }
+
+    func testImportInputsReplacesPartialPhotoFolderWhenSourceStillExists() throws {
+        let root = try TestFileBuilder.makeTempDir()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let projectURL = root.appendingPathComponent("Project.easysplatproj", isDirectory: true)
+        let source = root.appendingPathComponent("Photos", isDirectory: true)
+        try FileManager.default.createDirectory(at: source, withIntermediateDirectories: true)
+        try writeImage(url: source.appendingPathComponent("one.jpg"), size: 16, value: 10)
+        try writeImage(url: source.appendingPathComponent("two.jpg"), size: 16, value: 20)
+        let paths = ProjectPaths(root: projectURL)
+        try paths.ensureDirectories()
+        let imported = paths.originalsURL.appendingPathComponent("Photos", isDirectory: true)
+        try FileManager.default.createDirectory(at: imported, withIntermediateDirectories: true)
+        try writeImage(url: imported.appendingPathComponent("one.jpg"), size: 16, value: 10)
+        let runner = try makeRunner(projectURL: projectURL)
+        let metadata = ProjectMetadata(
+            title: "Photos",
+            input: .photos(folder: source.path),
+            preset: PresetSpec(mode: .object, quality: .draft)
+        )
+
+        try runner.importInputs(metadata: metadata, paths: paths) { _, _ in }
+
+        XCTAssertEqual(try runner.loadPhotosForTesting(in: imported).count, 2)
+    }
+
+    func testFrameBudgetAppliesToPhotoOnlyInputs() throws {
+        let root = try TestFileBuilder.makeTempDir()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let runner = try makeRunner(projectURL: root)
+        let frames = (0..<140).map { root.appendingPathComponent(String(format: "photo_%03d.jpg", $0)) }
+        let groups = [
+            PipelineRunner.SelectedFrameGroup(id: "photos", frames: frames, isVideo: false)
+        ]
+
+        let budgeted = runner.test_applyFrameBudget(to: groups, targetCount: 120)
+
+        XCTAssertEqual(budgeted.reduce(0) { $0 + $1.frames.count }, 120)
+        XCTAssertEqual(budgeted.first?.id, "photos")
+    }
+
+    func testFrameBudgetAppliesAcrossMixedInputs() throws {
+        let root = try TestFileBuilder.makeTempDir()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let runner = try makeRunner(projectURL: root)
+        let videoFrames = (0..<80).map { root.appendingPathComponent(String(format: "video_%03d.jpg", $0)) }
+        let photos = (0..<80).map { root.appendingPathComponent(String(format: "photo_%03d.jpg", $0)) }
+        let groups = [
+            PipelineRunner.SelectedFrameGroup(id: "video_000", frames: videoFrames, isVideo: true),
+            PipelineRunner.SelectedFrameGroup(id: "photos", frames: photos, isVideo: false),
+        ]
+
+        let budgeted = runner.test_applyFrameBudget(to: groups, targetCount: 120)
+
+        XCTAssertEqual(budgeted.reduce(0) { $0 + $1.frames.count }, 120)
+        XCTAssertTrue(budgeted.contains { $0.id == "video_000" })
+        XCTAssertTrue(budgeted.contains { $0.id == "photos" })
+    }
+
     private func writeImage(url: URL, size: Int, value: UInt8) throws {
         let width = size
         let height = size
@@ -269,6 +349,24 @@ final class PipelineRunnerImageFilteringTests: XCTestCase {
         }
         CGImageDestinationAddImage(destination, cgImage, nil)
         XCTAssertTrue(CGImageDestinationFinalize(destination))
+    }
+
+    private func makeRunner(projectURL: URL) throws -> PipelineRunner {
+        let vggt = try TestToolchains.vggtToolchain(root: projectURL)
+        let fastvggt = try TestToolchains.fastVggtToolchain(root: projectURL)
+        let toolchain = ToolchainPaths(
+            root: projectURL,
+            colmap: projectURL,
+            glomap: projectURL,
+            brush: projectURL,
+            vggt: vggt,
+            fastvggt: fastvggt
+        )
+        let config = PipelineRunner.PipelineConfig(
+            toolchain: toolchain,
+            preset: PresetSpec(mode: .object, quality: .standard)
+        )
+        return PipelineRunner(projectURL: projectURL, config: config)
     }
 }
 #endif

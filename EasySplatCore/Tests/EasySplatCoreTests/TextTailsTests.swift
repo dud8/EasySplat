@@ -17,4 +17,25 @@ final class TextTailsTests: XCTestCase {
         let tail = TextTails.tailLines(text, limit: 2)
         XCTAssertEqual(tail, "b\n")
     }
+
+    func testTailLinesSplitsCarriageReturnProgress() {
+        let text = "start\rmiddle\rend"
+        let tail = TextTails.tailLines(text, limit: 2)
+        XCTAssertEqual(tail, "middle\nend")
+    }
+
+    func testTailLinesAppliesByteLimit() {
+        let text = String(repeating: "a", count: 200)
+        let tail = TextTails.tailLines(text, limit: 10, byteLimit: 40)
+        XCTAssertLessThanOrEqual(tail.utf8.count, 40)
+        XCTAssertTrue(tail.allSatisfy { $0 == "a" })
+    }
+
+    func testTailLinesByteLimitKeepsLargestValidMultibyteSuffix() {
+        let glyph = "\u{1F600}"
+        let text = glyph + glyph
+        let tail = TextTails.tailLines(text, limit: 1, byteLimit: 5)
+        XCTAssertEqual(tail, glyph)
+        XCTAssertLessThanOrEqual(tail.utf8.count, 5)
+    }
 }

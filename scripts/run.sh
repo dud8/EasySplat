@@ -134,6 +134,9 @@ FASTVGGT_MPS_BUILD="$ROOT/scripts/toolchain/build_fastvggt_mps.sh"
 MAPANYTHING_MPS_INSTALL="${MAPANYTHING_MPS_INSTALL:-$ROOT/Toolchains/build/mapanything_mps/install}"
 MAPANYTHING_MPS_BUNDLE="$MAPANYTHING_MPS_INSTALL/mapanything_mps"
 MAPANYTHING_MPS_BUILD="$ROOT/scripts/toolchain/build_mapanything_mps.sh"
+DA3_MPS_INSTALL="${DA3_MPS_INSTALL:-$ROOT/Toolchains/build/da3_mps/install}"
+DA3_MPS_BUNDLE="$DA3_MPS_INSTALL/da3_mps"
+DA3_MPS_BUILD="$ROOT/scripts/toolchain/build_da3_mps.sh"
 
 validate_bundle_build_info() {
   local python_bin="$1"
@@ -181,8 +184,25 @@ copy_mapanything_app_into() {
   find "$app_root" -type f -name "*.pyc" -delete
 }
 
+copy_da3_app_into() {
+  local bundle_root="$1"
+  local source_root="$ROOT/Tools/Da3Sfm/easysplat_da3_sfm"
+  local app_root="$bundle_root/app"
+  if [ ! -d "$source_root" ]; then
+    echo "DA3 app source missing at $source_root" >&2
+    exit 1
+  fi
+
+  rm -rf "$app_root"
+  mkdir -p "$app_root"
+  cp -R "$source_root" "$app_root/"
+  find "$app_root" -type d -name "__pycache__" -prune -exec rm -rf {} +
+  find "$app_root" -type f -name "*.pyc" -delete
+}
+
 toolchain_inputs_newer() {
   test -f "$CORE_ZIP" || return 1
+  find "$ROOT/Tools/Da3Sfm" -type f -newer "$CORE_ZIP" -print -quit | grep -q . && return 0
   find "$ROOT/Tools/MapAnythingSfm" -type f -newer "$CORE_ZIP" -print -quit | grep -q . && return 0
   find "$ROOT/Tools/VggtSfm" -type f -newer "$CORE_ZIP" -print -quit | grep -q . && return 0
   find "$ROOT/Tools/FastVggtSfm" -type f -newer "$CORE_ZIP" -print -quit | grep -q . && return 0
@@ -194,6 +214,11 @@ core_zip_valid() {
   test -f "$CORE_ZIP" || return 1
   unzip -l "$CORE_ZIP" | grep -q "bin/colmap" || return 1
   unzip -l "$CORE_ZIP" | grep -q "lib/libcrypto.3.dylib" || return 1
+  unzip -l "$CORE_ZIP" | grep -q "da3_mps/bin/easysplat_da3_sfm" || return 1
+  unzip -l "$CORE_ZIP" | grep -q "da3_mps/python/bin/python3" || return 1
+  unzip -l "$CORE_ZIP" | grep -q "da3_mps/build_info.json" || return 1
+  unzip -l "$CORE_ZIP" | grep -q "da3_mps/app/easysplat_da3_sfm/run.py" || return 1
+  unzip -l "$CORE_ZIP" | grep -q "da3_mps/vendor/depth-anything-3/src/depth_anything_3/api.py" || return 1
   unzip -l "$CORE_ZIP" | grep -q "mapanything_mps/bin/easysplat_mapanything_sfm" || return 1
   unzip -l "$CORE_ZIP" | grep -q "mapanything_mps/python/bin/python3" || return 1
   unzip -l "$CORE_ZIP" | grep -q "mapanything_mps/build_info.json" || return 1
@@ -226,11 +251,71 @@ core_zip_valid() {
 
 models_zip_valid() {
   test -f "$MODELS_ZIP" || return 1
+  unzip -l "$MODELS_ZIP" | grep -q "da3_mps/models/DA3-BASE/config\\.json" || return 1
+  unzip -l "$MODELS_ZIP" | grep -q "da3_mps/models/DA3-BASE/model\\.safetensors" || return 1
+  unzip -l "$MODELS_ZIP" | grep -q "da3_mps/models/DA3-BASE/easysplat_model_info\\.json" || return 1
+  unzip -l "$MODELS_ZIP" | grep -q "da3_mps/models/DA3-SMALL/config\\.json" || return 1
+  unzip -l "$MODELS_ZIP" | grep -q "da3_mps/models/DA3-SMALL/model\\.safetensors" || return 1
+  unzip -l "$MODELS_ZIP" | grep -q "da3_mps/models/DA3-SMALL/easysplat_model_info\\.json" || return 1
   unzip -l "$MODELS_ZIP" | grep -q "mapanything_mps/models/map-anything-apache/config\\.json" || return 1
   unzip -l "$MODELS_ZIP" | grep -q "mapanything_mps/models/map-anything-apache/model\\.safetensors" || return 1
   unzip -l "$MODELS_ZIP" | grep -q "mapanything_mps/models/dinov2/dinov2_vitg14_pretrain\\.pth" || return 1
   unzip -l "$MODELS_ZIP" | grep -q "vggt_mps/models/vggt_model\\.pt" || return 1
   unzip -l "$MODELS_ZIP" | grep -q "fastvggt_mps/models/fastvggt_model\\.pt" || return 1
+}
+
+ensure_da3_mps_bundle() {
+  local build_log="$ROOT/Toolchains/build/da3_mps/build.log"
+  mkdir -p "$(dirname "$build_log")"
+  local ok=0
+  if [ -d "$DA3_MPS_BUNDLE" ]; then
+    if [ -x "$DA3_MPS_BUNDLE/bin/easysplat_da3_sfm" ] && \
+       [ -x "$DA3_MPS_BUNDLE/python/bin/python3" ] && \
+       [ -f "$DA3_MPS_BUNDLE/build_info.json" ] && \
+       [ -f "$DA3_MPS_BUNDLE/app/easysplat_da3_sfm/run.py" ] && \
+       [ -f "$DA3_MPS_BUNDLE/models/DA3-BASE/model.safetensors" ] && \
+       [ -f "$DA3_MPS_BUNDLE/models/DA3-BASE/config.json" ] && \
+       [ -f "$DA3_MPS_BUNDLE/models/DA3-BASE/easysplat_model_info.json" ] && \
+       [ -f "$DA3_MPS_BUNDLE/models/DA3-SMALL/model.safetensors" ] && \
+       [ -f "$DA3_MPS_BUNDLE/models/DA3-SMALL/config.json" ] && \
+       [ -f "$DA3_MPS_BUNDLE/models/DA3-SMALL/easysplat_model_info.json" ] && \
+       [ -f "$DA3_MPS_BUNDLE/vendor/depth-anything-3/src/depth_anything_3/api.py" ] && \
+       validate_bundle_build_info "$DA3_MPS_BUNDLE/python/bin/python3" "$DA3_MPS_BUNDLE/build_info.json" "da3_mps"; then
+      ok=1
+    fi
+  fi
+  if [ "$ok" -eq 0 ]; then
+    if [ -x "$DA3_MPS_BUILD" ]; then
+      set +e
+      "$DA3_MPS_BUILD" 2>&1 | tee "$build_log"
+      local build_status=${PIPESTATUS[0]}
+      set -e
+      if [ "$build_status" -ne 0 ]; then
+        echo "da3_mps build failed. See log: $build_log" >&2
+      fi
+    fi
+  fi
+  if [ ! -x "$DA3_MPS_BUNDLE/bin/easysplat_da3_sfm" ] || \
+     [ ! -x "$DA3_MPS_BUNDLE/python/bin/python3" ] || \
+     [ ! -f "$DA3_MPS_BUNDLE/build_info.json" ] || \
+     [ ! -f "$DA3_MPS_BUNDLE/app/easysplat_da3_sfm/run.py" ] || \
+     [ ! -f "$DA3_MPS_BUNDLE/models/DA3-BASE/model.safetensors" ] || \
+     [ ! -f "$DA3_MPS_BUNDLE/models/DA3-BASE/config.json" ] || \
+     [ ! -f "$DA3_MPS_BUNDLE/models/DA3-BASE/easysplat_model_info.json" ] || \
+     [ ! -f "$DA3_MPS_BUNDLE/models/DA3-SMALL/model.safetensors" ] || \
+     [ ! -f "$DA3_MPS_BUNDLE/models/DA3-SMALL/config.json" ] || \
+     [ ! -f "$DA3_MPS_BUNDLE/models/DA3-SMALL/easysplat_model_info.json" ] || \
+     [ ! -f "$DA3_MPS_BUNDLE/vendor/depth-anything-3/src/depth_anything_3/api.py" ]; then
+    echo "da3_mps bundle incomplete at $DA3_MPS_BUNDLE." >&2
+    echo "Required: bin/easysplat_da3_sfm, python/bin/python3, build_info.json, app/easysplat_da3_sfm/run.py, models/DA3-{BASE,SMALL}/{config.json,model.safetensors,easysplat_model_info.json}, vendor/depth-anything-3/src/." >&2
+    if [ -x "$DA3_MPS_BUILD" ]; then
+      echo "Tried to run $DA3_MPS_BUILD, but the bundle is still incomplete." >&2
+      echo "See build log: $build_log" >&2
+    else
+      echo "Provide it via DA3_MPS_INSTALL or add a build script at $DA3_MPS_BUILD." >&2
+    fi
+    exit 1
+  fi
 }
 
 ensure_mapanything_mps_bundle() {
@@ -389,6 +474,12 @@ refresh_mapanything_mps_app() {
   fi
 }
 
+refresh_da3_mps_app() {
+  if [ -d "$DA3_MPS_BUNDLE" ]; then
+    copy_da3_app_into "$DA3_MPS_BUNDLE"
+  fi
+}
+
 installed_app_needs_refresh() {
   local root="$1"
   local app_root="$root/vggt_mps/app"
@@ -441,6 +532,34 @@ refresh_installed_mapanything_app() {
   fi
 }
 
+da3_app_needs_refresh() {
+  local root="$1"
+  local app_root="$root/da3_mps/app"
+  local sentinel="$app_root/easysplat_da3_sfm/run.py"
+  if [ ! -d "$ROOT/Tools/Da3Sfm" ]; then
+    return 1
+  fi
+  if [ ! -d "$root/da3_mps" ]; then
+    return 1
+  fi
+  if [ ! -f "$sentinel" ]; then
+    return 0
+  fi
+  find "$ROOT/Tools/Da3Sfm/easysplat_da3_sfm" \
+    -type f \
+    ! -name "*.pyc" \
+    ! -path "*/__pycache__/*" \
+    -newer "$sentinel" \
+    -print -quit | grep -q .
+}
+
+refresh_installed_da3_app() {
+  local root="$1"
+  if da3_app_needs_refresh "$root"; then
+    copy_da3_app_into "$root/da3_mps"
+  fi
+}
+
 fastvggt_app_needs_refresh() {
   local root="$1"
   local app_root="$root/fastvggt_mps/app"
@@ -470,6 +589,18 @@ validate_installed_toolchain() {
   test -x "$root/bin/colmap" || return 1
   test -f "$root/lib/libcrypto.3.dylib" || return 1
   test -f "$root/lib/libssl.3.dylib" || return 1
+  test -x "$root/da3_mps/bin/easysplat_da3_sfm" || return 1
+  test -x "$root/da3_mps/python/bin/python3" || return 1
+  test -f "$root/da3_mps/build_info.json" || return 1
+  validate_bundle_build_info "$root/da3_mps/python/bin/python3" "$root/da3_mps/build_info.json" "da3_mps" || return 1
+  test -f "$root/da3_mps/app/easysplat_da3_sfm/run.py" || return 1
+  test -f "$root/da3_mps/models/DA3-BASE/model.safetensors" || return 1
+  test -f "$root/da3_mps/models/DA3-BASE/config.json" || return 1
+  test -f "$root/da3_mps/models/DA3-BASE/easysplat_model_info.json" || return 1
+  test -f "$root/da3_mps/models/DA3-SMALL/model.safetensors" || return 1
+  test -f "$root/da3_mps/models/DA3-SMALL/config.json" || return 1
+  test -f "$root/da3_mps/models/DA3-SMALL/easysplat_model_info.json" || return 1
+  test -f "$root/da3_mps/vendor/depth-anything-3/src/depth_anything_3/api.py" || return 1
   test -x "$root/mapanything_mps/bin/easysplat_mapanything_sfm" || return 1
   test -x "$root/mapanything_mps/python/bin/python3" || return 1
   test -f "$root/mapanything_mps/build_info.json" || return 1
@@ -503,7 +634,11 @@ validate_installed_toolchain() {
 
 models_present() {
   local root="$1"
-  test -f "$root/mapanything_mps/models/map-anything-apache/model.safetensors" \
+  test -f "$root/da3_mps/models/DA3-BASE/model.safetensors" \
+    && test -f "$root/da3_mps/models/DA3-BASE/config.json" \
+    && test -f "$root/da3_mps/models/DA3-SMALL/model.safetensors" \
+    && test -f "$root/da3_mps/models/DA3-SMALL/config.json" \
+    && test -f "$root/mapanything_mps/models/map-anything-apache/model.safetensors" \
     && test -f "$root/mapanything_mps/models/map-anything-apache/config.json" \
     && test -f "$root/mapanything_mps/models/dinov2/dinov2_vitg14_pretrain.pth" \
     && test -f "$root/vggt_mps/models/vggt_model.pt" \
@@ -515,6 +650,11 @@ wipe_installed_core() {
   rm -rf \
     "$root/bin" \
     "$root/lib" \
+    "$root/da3_mps/bin" \
+    "$root/da3_mps/python" \
+    "$root/da3_mps/build_info.json" \
+    "$root/da3_mps/vendor" \
+    "$root/da3_mps/app" \
     "$root/mapanything_mps/bin" \
     "$root/mapanything_mps/python" \
     "$root/mapanything_mps/build_info.json" \
@@ -543,6 +683,7 @@ if [ "$FAST" -eq 1 ]; then
     echo "Run ./scripts/run.sh to auto-build/install it, or use --rebuild to force a fresh toolchain." >&2
     exit 1
   fi
+  refresh_installed_da3_app "$TOOLCHAIN_ROOT"
   refresh_installed_mapanything_app "$TOOLCHAIN_ROOT"
   refresh_installed_vggt_app "$TOOLCHAIN_ROOT"
   refresh_installed_fastvggt_app "$TOOLCHAIN_ROOT"
@@ -552,6 +693,7 @@ if [ "$FAST" -eq 1 ]; then
 fi
 
 if [ "$REBUILD" -eq 0 ] && [ "$INSTALLED_OK" -eq 1 ]; then
+  refresh_installed_da3_app "$TOOLCHAIN_ROOT"
   refresh_installed_mapanything_app "$TOOLCHAIN_ROOT"
   refresh_installed_vggt_app "$TOOLCHAIN_ROOT"
   refresh_installed_fastvggt_app "$TOOLCHAIN_ROOT"
@@ -571,6 +713,8 @@ if [ "$NEED_PACKAGE" -eq 1 ]; then
   "$ROOT/scripts/toolchain/build_openssl.sh"
   test -x "$ROOT/Toolchains/build/colmap/install/bin/colmap" || "$ROOT/scripts/toolchain/build_colmap.sh"
   test -x "$ROOT/Toolchains/build/brush/install/bin/brush" || "$ROOT/scripts/toolchain/build_brush.sh"
+  ensure_da3_mps_bundle
+  refresh_da3_mps_app
   ensure_mapanything_mps_bundle
   refresh_mapanything_mps_app
   ensure_vggt_mps_bundle
@@ -586,6 +730,7 @@ if [ ! -f "$PUB" ] || [ ! -f "$PRIV" ]; then
     --public-key-out "$PUB" \
     --private-key-out "$PRIV"
 fi
+chmod 600 "$PRIV"
 
 PUBLISHED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 
@@ -596,7 +741,7 @@ swift run --package-path "$ROOT/Tools/ManifestTool" ManifestTool \
   --core-url "http://localhost:$PORT/out/$(basename "$CORE_ZIP")" \
   --models-zip "$MODELS_ZIP" \
   --models-url "http://localhost:$PORT/out/$(basename "$MODELS_ZIP")" \
-  --private-key "$(cat "$PRIV")" \
+  --private-key-file "$PRIV" \
   --manifest-out "$MANIFEST"
 
 SERVER_PID=""

@@ -78,6 +78,7 @@ final class ToolchainManagerTests: XCTestCase {
         let runner = makeValidationRunner(
             root: root,
             brushArchPath: "bin/brush.real",
+            da3PythonArch: universal,
             mapAnythingPythonArch: universal,
             vggtPythonArch: universal,
             fastvggtPythonArch: universal
@@ -136,6 +137,13 @@ final class ToolchainManagerTests: XCTestCase {
 
         try FileManager.default.removeItem(at: fixture.libcrypto)
         XCTAssertFalse(manager.test_coreToolchainLooksInstalled(root: root))
+
+        let freshRoot = try TestFileBuilder.makeTempDir()
+        defer { try? FileManager.default.removeItem(at: freshRoot) }
+        let freshFixture = try ToolchainFixtureBuilder.createToolchain(at: freshRoot)
+        XCTAssertTrue(manager.test_coreToolchainLooksInstalled(root: freshRoot))
+        try FileManager.default.removeItem(at: freshFixture.da3VendorSentinel)
+        XCTAssertFalse(manager.test_coreToolchainLooksInstalled(root: freshRoot))
     }
 
     func testModelsToolchainLooksInstalled() throws {
@@ -146,8 +154,161 @@ final class ToolchainManagerTests: XCTestCase {
         let manager = ToolchainManager(runner: MockSubprocessRunner(scripts: []))
         XCTAssertTrue(manager.test_modelsToolchainLooksInstalled(root: root))
 
-        try FileManager.default.removeItem(at: fixture.vggtModelFile)
+        try FileManager.default.removeItem(at: fixture.da3ModelFile)
         XCTAssertFalse(manager.test_modelsToolchainLooksInstalled(root: root))
+    }
+
+    func testValidateToolchainFailsWhenDa3AppMissing() async throws {
+        let root = try TestFileBuilder.makeTempDir()
+        defer { try? FileManager.default.removeItem(at: root) }
+        _ = try ToolchainFixtureBuilder.createToolchain(
+            at: root,
+            includeDa3AppSentinel: false
+        )
+
+        let manager = ToolchainManager(runner: makeValidationRunner(root: root))
+        try await withEnvironmentAsync(["EASYSPLAT_SFM_BACKEND": "da3"]) {
+            XCTAssertThrowsError(try manager.test_validateToolchain(root: root)) { error in
+                guard case ToolchainManager.ToolchainError.missingLibrary(let name) = error else {
+                    return XCTFail("Expected missingLibrary error")
+                }
+                XCTAssertEqual(name, "da3_mps/app/easysplat_da3_sfm/run.py")
+            }
+        }
+    }
+
+    func testValidateToolchainFailsWhenDa3ModelMissing() async throws {
+        let root = try TestFileBuilder.makeTempDir()
+        defer { try? FileManager.default.removeItem(at: root) }
+        _ = try ToolchainFixtureBuilder.createToolchain(
+            at: root,
+            includeDa3Model: false
+        )
+
+        let manager = ToolchainManager(runner: makeValidationRunner(root: root))
+        try await withEnvironmentAsync(["EASYSPLAT_SFM_BACKEND": "da3"]) {
+            XCTAssertThrowsError(try manager.test_validateToolchain(root: root)) { error in
+                guard case ToolchainManager.ToolchainError.missingLibrary(let name) = error else {
+                    return XCTFail("Expected missingLibrary error")
+                }
+                XCTAssertEqual(name, "da3_mps/models/DA3-BASE/model.safetensors")
+            }
+        }
+    }
+
+    func testValidateToolchainFailsWhenDa3ConfigMissing() async throws {
+        let root = try TestFileBuilder.makeTempDir()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let fixture = try ToolchainFixtureBuilder.createToolchain(at: root)
+        try FileManager.default.removeItem(at: fixture.da3ConfigFile)
+
+        let manager = ToolchainManager(runner: makeValidationRunner(root: root))
+        try await withEnvironmentAsync(["EASYSPLAT_SFM_BACKEND": "da3"]) {
+            XCTAssertThrowsError(try manager.test_validateToolchain(root: root)) { error in
+                guard case ToolchainManager.ToolchainError.missingLibrary(let name) = error else {
+                    return XCTFail("Expected missingLibrary error")
+                }
+                XCTAssertEqual(name, "da3_mps/models/DA3-BASE/config.json")
+            }
+        }
+    }
+
+    func testValidateToolchainFailsWhenDa3ModelInfoMissing() async throws {
+        let root = try TestFileBuilder.makeTempDir()
+        defer { try? FileManager.default.removeItem(at: root) }
+        _ = try ToolchainFixtureBuilder.createToolchain(at: root)
+        let info = root.appendingPathComponent("da3_mps/models/DA3-BASE/easysplat_model_info.json")
+        try FileManager.default.removeItem(at: info)
+
+        let manager = ToolchainManager(runner: makeValidationRunner(root: root))
+        try await withEnvironmentAsync(["EASYSPLAT_SFM_BACKEND": "da3"]) {
+            XCTAssertThrowsError(try manager.test_validateToolchain(root: root)) { error in
+                guard case ToolchainManager.ToolchainError.missingLibrary(let name) = error else {
+                    return XCTFail("Expected missingLibrary error")
+                }
+                XCTAssertEqual(name, "da3_mps/models/DA3-BASE/easysplat_model_info.json")
+            }
+        }
+    }
+
+    func testValidateToolchainFailsWhenDa3FallbackModelMissing() async throws {
+        let root = try TestFileBuilder.makeTempDir()
+        defer { try? FileManager.default.removeItem(at: root) }
+        _ = try ToolchainFixtureBuilder.createToolchain(
+            at: root,
+            includeDa3FallbackModel: false
+        )
+
+        let manager = ToolchainManager(runner: makeValidationRunner(root: root))
+        try await withEnvironmentAsync(["EASYSPLAT_SFM_BACKEND": "da3"]) {
+            XCTAssertThrowsError(try manager.test_validateToolchain(root: root)) { error in
+                guard case ToolchainManager.ToolchainError.missingLibrary(let name) = error else {
+                    return XCTFail("Expected missingLibrary error")
+                }
+                XCTAssertEqual(name, "da3_mps/models/DA3-SMALL/model.safetensors")
+            }
+        }
+    }
+
+    func testValidateToolchainRejectsNonArmDa3Python() async throws {
+        let root = try TestFileBuilder.makeTempDir()
+        defer { try? FileManager.default.removeItem(at: root) }
+        _ = try ToolchainFixtureBuilder.createToolchain(at: root)
+
+        let manager = ToolchainManager(runner: makeValidationRunner(root: root, da3PythonArch: "Mach-O 64-bit executable x86_64"))
+        try await withEnvironmentAsync(["EASYSPLAT_SFM_BACKEND": "da3"]) {
+            XCTAssertThrowsError(try manager.test_validateToolchain(root: root)) { error in
+                guard case ToolchainManager.ToolchainError.invalidToolchain(let message) = error else {
+                    return XCTFail("Expected invalidToolchain error")
+                }
+                XCTAssertTrue(message.lowercased().contains("da3_mps python"), "expected DA3-specific message; got \(message)")
+            }
+        }
+    }
+
+    func testValidateToolchainFailsWhenDa3HelpFails() async throws {
+        let root = try TestFileBuilder.makeTempDir()
+        defer { try? FileManager.default.removeItem(at: root) }
+        _ = try ToolchainFixtureBuilder.createToolchain(at: root)
+
+        let manager = ToolchainManager(runner: makeValidationRunner(root: root, da3HelpExitCode: 2))
+        try await withEnvironmentAsync(["EASYSPLAT_SFM_BACKEND": "da3"]) {
+            XCTAssertThrowsError(try manager.test_validateToolchain(root: root)) { error in
+                guard case ToolchainManager.ToolchainError.invalidToolchain(let message) = error else {
+                    return XCTFail("Expected invalidToolchain error")
+                }
+                XCTAssertTrue(message.contains("da3_mps failed to launch"), "expected DA3 launch failure; got \(message)")
+            }
+        }
+    }
+
+    func testValidateToolchainFailsWhenDa3BuildInfoMissing() async throws {
+        let root = try TestFileBuilder.makeTempDir()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let fixture = try ToolchainFixtureBuilder.createToolchain(at: root)
+        try FileManager.default.removeItem(at: fixture.da3BuildInfo)
+
+        let manager = ToolchainManager(runner: makeValidationRunner(root: root))
+        try await withEnvironmentAsync(["EASYSPLAT_SFM_BACKEND": "da3"]) {
+            XCTAssertThrowsError(try manager.test_validateToolchain(root: root)) { error in
+                guard case ToolchainManager.ToolchainError.missingLibrary(let name) = error else {
+                    return XCTFail("Expected missingLibrary error")
+                }
+                XCTAssertEqual(name, "da3_mps/build_info.json")
+            }
+        }
+    }
+
+    func testValidateToolchainAllowsExplicitColmapWithoutDa3Bundle() async throws {
+        let root = try TestFileBuilder.makeTempDir()
+        defer { try? FileManager.default.removeItem(at: root) }
+        _ = try ToolchainFixtureBuilder.createToolchain(at: root)
+        try FileManager.default.removeItem(at: root.appendingPathComponent("da3_mps", isDirectory: true))
+
+        let manager = ToolchainManager(runner: makeValidationRunner(root: root))
+        try await withEnvironmentAsync(["EASYSPLAT_SFM_BACKEND": "colmap"]) {
+            XCTAssertNoThrow(try manager.test_validateToolchain(root: root))
+        }
     }
 
     func testValidateToolchainFailsWhenMapAnythingAppMissing() throws {
@@ -279,9 +440,11 @@ final class ToolchainManagerTests: XCTestCase {
         colmapArch: String = "Mach-O 64-bit executable arm64",
         brushArch: String = "Mach-O 64-bit executable arm64",
         brushArchPath: String = "bin/brush",
+        da3PythonArch: String = "Mach-O 64-bit executable arm64",
         mapAnythingPythonArch: String = "Mach-O 64-bit executable arm64",
         vggtPythonArch: String = "Mach-O 64-bit executable arm64",
         fastvggtPythonArch: String = "Mach-O 64-bit executable arm64",
+        da3HelpExitCode: Int32 = 0,
         mapAnythingHelpExitCode: Int32 = 0,
         vggtHelpExitCode: Int32 = 0,
         fastvggtHelpExitCode: Int32 = 0
@@ -291,6 +454,8 @@ final class ToolchainManagerTests: XCTestCase {
             .init(path: "/usr/bin/file", argsPrefix: ["-b", root.appendingPathComponent(brushArchPath).path], result: .init(exitCode: 0, terminationReason: .exit, stdout: brushArch, stderr: ""), onRun: nil),
             .init(path: root.appendingPathComponent("bin/colmap").path, argsPrefix: ["-h"], result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""), onRun: nil),
             .init(path: root.appendingPathComponent("bin/brush").path, argsPrefix: ["--help"], result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""), onRun: nil),
+            .init(path: "/usr/bin/file", argsPrefix: ["-b", root.appendingPathComponent("da3_mps/python/bin/python3").path], result: .init(exitCode: 0, terminationReason: .exit, stdout: da3PythonArch, stderr: ""), onRun: nil),
+            .init(path: root.appendingPathComponent("da3_mps/bin/easysplat_da3_sfm").path, argsPrefix: ["--help"], result: .init(exitCode: da3HelpExitCode, terminationReason: .exit, stdout: "", stderr: ""), onRun: nil),
             .init(path: "/usr/bin/file", argsPrefix: ["-b", root.appendingPathComponent("mapanything_mps/python/bin/python3").path], result: .init(exitCode: 0, terminationReason: .exit, stdout: mapAnythingPythonArch, stderr: ""), onRun: nil),
             .init(path: root.appendingPathComponent("mapanything_mps/bin/easysplat_mapanything_sfm").path, argsPrefix: ["--help"], result: .init(exitCode: mapAnythingHelpExitCode, terminationReason: .exit, stdout: "", stderr: ""), onRun: nil),
             .init(path: "/usr/bin/file", argsPrefix: ["-b", root.appendingPathComponent("vggt_mps/python/bin/python3").path], result: .init(exitCode: 0, terminationReason: .exit, stdout: vggtPythonArch, stderr: ""), onRun: nil),

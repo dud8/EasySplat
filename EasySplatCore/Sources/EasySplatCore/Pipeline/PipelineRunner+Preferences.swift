@@ -13,6 +13,7 @@ extension PipelineRunner {
     func sfmBackendOverride() -> SfmBackend? {
         let env = ProcessInfo.processInfo.environment
         if let value = env["EASYSPLAT_SFM_BACKEND"]?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() {
+            if value == "da3" || value == "depth-anything-3" || value == "depthanything3" { return .da3 }
             if value == "mapanything" { return .mapanything }
             if value == "glomap" || value == "global_mapper" { return .colmap }
             if value == "colmap" { return .colmap }
@@ -23,7 +24,7 @@ extension PipelineRunner {
     }
 
     func sfmBackendPolicy() -> SfmBackend {
-        sfmBackendOverride() ?? .mapanything
+        sfmBackendOverride() ?? .da3
     }
 
     func sfmBackendFallbackOrder(override: SfmBackend?) -> [SfmBackend] {
@@ -33,7 +34,71 @@ extension PipelineRunner {
             }
             return [override]
         }
-        return [.mapanything, .colmap]
+        return [.da3, .mapanything, .colmap]
+    }
+
+    func da3DevicePreference() -> String {
+        stringEnvValue("EASYSPLAT_DA3_DEVICE") ?? "mps"
+    }
+
+    func da3ModelPreference() -> String {
+        stringEnvValue("EASYSPLAT_DA3_MODEL") ?? "DA3-BASE"
+    }
+
+    func da3FallbackModelPreference() -> String {
+        stringEnvValue("EASYSPLAT_DA3_FALLBACK_MODEL") ?? "DA3-SMALL"
+    }
+
+    func da3ProcessResolutionPreference() -> Int {
+        max(64, intEnvValue("EASYSPLAT_DA3_PROCESS_RES") ?? 504)
+    }
+
+    func da3MaxPointsPreference(preset: PresetSpec) -> Int {
+        if let override = intEnvValue("EASYSPLAT_DA3_MAX_POINTS"), override > 0 {
+            return override
+        }
+        switch preset.quality {
+        case .draft:
+            return 60_000
+        case .standard:
+            return 100_000
+        case .ultra:
+            return 150_000
+        }
+    }
+
+    func da3CameraTypePreference(preset: PresetSpec) -> String {
+        stringEnvValue("EASYSPLAT_DA3_CAMERA_TYPE") ?? cameraModel(for: preset)
+    }
+
+    func da3SharedCameraPreference(input: InputSpec) -> Bool {
+        boolEnvValue("EASYSPLAT_DA3_SHARED_CAMERA", default: input.hasVideos)
+    }
+
+    func da3WindowSizePreference(hardwareTier: HardwareProfile.Tier) -> Int {
+        if let override = intEnvValue("EASYSPLAT_DA3_WINDOW_SIZE"), override > 0 {
+            return override
+        }
+        switch hardwareTier {
+        case .low:
+            return 4
+        case .mid:
+            return 6
+        case .high:
+            return 8
+        }
+    }
+
+    func da3WindowOverlapPreference(hardwareTier: HardwareProfile.Tier) -> Int {
+        if let override = intEnvValue("EASYSPLAT_DA3_WINDOW_OVERLAP"), override >= 0 {
+            return override
+        }
+        switch hardwareTier {
+        case .low:
+            return 1
+        case .mid, .high:
+            return 2
+        }
     }
 
     func mapAnythingDevicePreference() -> String {
@@ -161,7 +226,25 @@ extension PipelineRunner {
         }
     }
 
-    func mapAnythingDirectQualityFailureReason(score: ReconstructionScore, mode: CaptureMode) -> String? {
+    func da3DirectMinimumMeanTrackLengthPreference(mode: CaptureMode) -> Double {
+        if let override = doubleEnvValue("EASYSPLAT_DA3_DIRECT_MIN_TRACK_LENGTH"),
+           override.isFinite,
+           override > 0 {
+            return override
+        }
+        switch mode {
+        case .room:
+            return 1.20
+        case .object:
+            return 1.15
+        }
+    }
+
+    func directSparseQualityFailureReason(
+        score: ReconstructionScore,
+        mode: CaptureMode,
+        minimumTrackLength: Double
+    ) -> String? {
         guard ReconstructionScorer.isAcceptable(score, mode: mode) else {
             return "below the general quality bar"
         }
@@ -175,7 +258,6 @@ extension PipelineRunner {
             return "model_analyzer did not report a usable mean track length"
         }
 
-        let minimumTrackLength = mapAnythingDirectMinimumMeanTrackLengthPreference(mode: mode)
         if meanTrackLength < minimumTrackLength {
             return String(
                 format: "mean track length %.2f below direct minimum %.2f",
@@ -189,9 +271,42 @@ extension PipelineRunner {
         return nil
     }
 
+    func da3DirectQualityFailureReason(score: ReconstructionScore, mode: CaptureMode) -> String? {
+        directSparseQualityFailureReason(
+            score: score,
+            mode: mode,
+            minimumTrackLength: da3DirectMinimumMeanTrackLengthPreference(mode: mode)
+        )
+    }
+
+    func mapAnythingDirectQualityFailureReason(score: ReconstructionScore, mode: CaptureMode) -> String? {
+        directSparseQualityFailureReason(
+            score: score,
+            mode: mode,
+            minimumTrackLength: mapAnythingDirectMinimumMeanTrackLengthPreference(mode: mode)
+        )
+    }
+
     func mapAnythingScoreApplyingCoverageFallback(
         _ score: ReconstructionScore,
         coverageManifest: MapAnythingCoverageManifest?
+    ) -> ReconstructionScore {
+        guard let coverageManifest else {
+            return score
+        }
+        return ReconstructionScore(
+            registeredImages: score.registeredImages,
+            totalImages: score.totalImages,
+            meanReprojectionError: score.meanReprojectionError,
+            pointCount: score.pointCount ?? coverageManifest.fusedSparsePointCount,
+            observationCount: score.observationCount ?? coverageManifest.finalObservationCount,
+            meanTrackLength: score.meanTrackLength ?? coverageManifest.meanTrackLength
+        )
+    }
+
+    func da3ScoreApplyingCoverageFallback(
+        _ score: ReconstructionScore,
+        coverageManifest: Da3CoverageManifest?
     ) -> ReconstructionScore {
         guard let coverageManifest else {
             return score

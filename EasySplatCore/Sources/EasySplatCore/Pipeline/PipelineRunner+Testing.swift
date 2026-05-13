@@ -51,6 +51,10 @@ extension PipelineRunner {
         try downsampleSelectedFrames(to: targetCount, paths: paths)
     }
 
+    func test_applyFrameBudget(to groups: [SelectedFrameGroup], targetCount: Int) -> [SelectedFrameGroup] {
+        applyFrameBudget(to: groups, targetCount: targetCount)
+    }
+
     func test_normalizeSelectedImagesForTooling(paths: ProjectPaths) throws -> Int {
         try normalizeSelectedImagesForTooling(paths: paths)
     }
@@ -324,6 +328,17 @@ extension PipelineRunner {
 
     func test_mapAnythingDirectMinimumMeanTrackLengthPreference(mode: CaptureMode) -> Double {
         mapAnythingDirectMinimumMeanTrackLengthPreference(mode: mode)
+    }
+
+    func test_da3DirectMinimumMeanTrackLengthPreference(mode: CaptureMode) -> Double {
+        da3DirectMinimumMeanTrackLengthPreference(mode: mode)
+    }
+
+    func test_da3DirectQualityFailureReason(
+        score: ReconstructionScore,
+        mode: CaptureMode
+    ) -> String? {
+        da3DirectQualityFailureReason(score: score, mode: mode)
     }
 
     func test_mapAnythingDirectQualityFailureReason(

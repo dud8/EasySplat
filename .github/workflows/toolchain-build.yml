@@ -61,6 +61,17 @@ jobs:
       - name: Build Brush
         run: scripts/toolchain/build_brush.sh
 
+      - name: Build DA3-MPS bundle
+        run: |
+          case "${EASYSPLAT_ALLOW_UNPINNED_DA3_SOURCE:-0}" in
+            ""|0|false|FALSE|no|NO|off|OFF) ;;
+            *)
+              echo "Toolchain release workflow refuses EASYSPLAT_ALLOW_UNPINNED_DA3_SOURCE; DA3 source must have pinned git provenance." >&2
+              exit 1
+              ;;
+          esac
+          scripts/toolchain/build_da3_mps.sh
+
       - name: Build MapAnything-MPS bundle
         run: scripts/toolchain/build_mapanything_mps.sh
 
@@ -86,6 +97,10 @@ jobs:
           MODELS_ZIP="Toolchains/out/toolchain-macos-arm64-$VERSION-models.zip"
           CORE_URL="https://github.com/$REPOSITORY/releases/download/$TAG/toolchain-macos-arm64-$VERSION-core.zip"
           MODELS_URL="https://github.com/$REPOSITORY/releases/download/$TAG/toolchain-macos-arm64-$VERSION-models.zip"
+          PRIVATE_KEY_FILE="$(mktemp)"
+          trap 'rm -f "$PRIVATE_KEY_FILE"' EXIT
+          printf '%s' "$TOOLCHAIN_SIGNING_KEY_BASE64" > "$PRIVATE_KEY_FILE"
+          chmod 600 "$PRIVATE_KEY_FILE"
           swift run --package-path Tools/ManifestTool ManifestTool \
             --core-zip "$CORE_ZIP" \
             --core-url "$CORE_URL" \
@@ -93,7 +108,7 @@ jobs:
             --models-url "$MODELS_URL" \
             --version "$VERSION" \
             --published-at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
-            --private-key "$TOOLCHAIN_SIGNING_KEY_BASE64" \
+            --private-key-file "$PRIVATE_KEY_FILE" \
             --manifest-out "Toolchains/out/manifest.json"
 
       - name: Upload release assets

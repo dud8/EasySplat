@@ -7,6 +7,7 @@ extension ToolchainManager {
         private let label: String
         private let onProgress: @Sendable (Double, String) -> Void
         private let fileManager: FileManager
+        private let lock = NSLock()
         private var continuation: CheckedContinuation<Void, Error>?
         private weak var task: URLSessionDownloadTask?
         private var completed = false
@@ -26,18 +27,26 @@ extension ToolchainManager {
         }
 
         func setContinuation(_ continuation: CheckedContinuation<Void, Error>) {
+            lock.lock()
             if completed {
+                lock.unlock()
                 continuation.resume(throwing: CancellationError())
                 return
             }
             self.continuation = continuation
+            lock.unlock()
         }
 
         func attachTask(_ task: URLSessionDownloadTask) {
+            lock.lock()
             self.task = task
+            lock.unlock()
         }
 
         func cancel() {
+            lock.lock()
+            let task = task
+            lock.unlock()
             task?.cancel()
             finish(with: CancellationError())
         }
@@ -49,6 +58,10 @@ extension ToolchainManager {
             totalBytesWritten: Int64,
             totalBytesExpectedToWrite: Int64
         ) {
+            lock.lock()
+            let isCompleted = completed
+            lock.unlock()
+            guard !isCompleted else { return }
             guard totalBytesExpectedToWrite > 0 else { return }
             let now = Date()
             if now.timeIntervalSince(lastUpdate) < 0.2 {
@@ -62,7 +75,10 @@ extension ToolchainManager {
         }
 
         func urlSession(_ session: URLSession, downloadTask: URLSessionDownloadTask, didFinishDownloadingTo location: URL) {
-            guard !completed else { return }
+            lock.lock()
+            let isCompleted = completed
+            lock.unlock()
+            guard !isCompleted else { return }
             guard let http = downloadTask.response as? HTTPURLResponse, http.statusCode == 200 else {
                 finish(with: ToolchainError.downloadFailed)
                 return
@@ -88,7 +104,10 @@ extension ToolchainManager {
         }
 
         func urlSession(_ session: URLSession, task: URLSessionTask, didCompleteWithError error: Error?) {
-            guard !completed else { return }
+            lock.lock()
+            let isCompleted = completed
+            lock.unlock()
+            guard !isCompleted else { return }
             if let error {
                 finish(with: error)
             } else {
@@ -97,8 +116,16 @@ extension ToolchainManager {
         }
 
         private func finish(with error: Error?) {
-            guard !completed else { return }
+            let continuation: CheckedContinuation<Void, Error>?
+            lock.lock()
+            guard !completed else {
+                lock.unlock()
+                return
+            }
             completed = true
+            continuation = self.continuation
+            self.continuation = nil
+            lock.unlock()
             if let error {
                 continuation?.resume(throwing: error)
             } else {

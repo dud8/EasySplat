@@ -51,6 +51,14 @@ if [ -z "$VERSION" ]; then
   exit 1
 fi
 
+case "${EASYSPLAT_ALLOW_UNPINNED_DA3_SOURCE:-0}" in
+  ""|0|false|FALSE|no|NO|off|OFF) ;;
+  *)
+    echo "build_dmg.sh refuses EASYSPLAT_ALLOW_UNPINNED_DA3_SOURCE; release builds require pinned DA3 git provenance." >&2
+    exit 1
+    ;;
+esac
+
 if [ -z "$MANIFEST_URL" ]; then
   MANIFEST_URL="http://localhost:$PORT/manifest.json"
 fi
@@ -79,6 +87,7 @@ PRIV="$TOOLCHAINS/private_key_ed25519.txt"
 "$ROOT/scripts/toolchain/build_colmap.sh"
 "$ROOT/scripts/toolchain/build_openssl.sh"
 "$ROOT/scripts/toolchain/build_brush.sh"
+"$ROOT/scripts/toolchain/build_da3_mps.sh"
 "$ROOT/scripts/toolchain/build_mapanything_mps.sh"
 "$ROOT/scripts/toolchain/build_vggt_mps.sh"
 "$ROOT/scripts/toolchain/build_fastvggt_mps.sh"
@@ -89,6 +98,7 @@ if [ ! -f "$PUB" ] || [ ! -f "$PRIV" ]; then
     --public-key-out "$PUB" \
     --private-key-out "$PRIV"
 fi
+chmod 600 "$PRIV"
 
 PUBLISHED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 
@@ -99,7 +109,7 @@ swift run --package-path "$ROOT/Tools/ManifestTool" ManifestTool \
   --core-url "$CORE_ARTIFACT_URL" \
   --models-zip "$MODELS_ZIP" \
   --models-url "$MODELS_ARTIFACT_URL" \
-  --private-key "$(cat "$PRIV")" \
+  --private-key-file "$PRIV" \
   --manifest-out "$MANIFEST"
 
 build_app_args=(

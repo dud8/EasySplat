@@ -175,20 +175,66 @@ public final class BrushRunner {
     }
 
     public func findLatestPly(in directory: URL) -> URL? {
+        findLatestExportablePly(in: directory) ?? findLatestPlyIncludingSnapshots(in: directory)
+    }
+
+    public func findLatestExportablePly(in directory: URL, minModificationDate: Date? = nil) -> URL? {
+        findLatestPlyIncludingSnapshots(in: directory, minModificationDate: minModificationDate) { url in
+            let name = url.lastPathComponent
+            return name.hasPrefix("export_")
+                && name.hasSuffix(".ply")
+                && !name.hasSuffix(".compressed.ply")
+                && name != "latest_snapshot.ply"
+        }
+    }
+
+    private func findLatestPlyIncludingSnapshots(
+        in directory: URL,
+        minModificationDate: Date? = nil,
+        isCandidate: (URL) -> Bool = { _ in true }
+    ) -> URL? {
         let fm = FileManager.default
         let enumerator = fm.enumerator(at: directory, includingPropertiesForKeys: [.contentModificationDateKey], options: [.skipsHiddenFiles])
-        var latest: (URL, Date)?
+        var latest: (URL, Date, Int?)?
         while let item = enumerator?.nextObject() as? URL {
             guard item.pathExtension.lowercased() == "ply" else { continue }
+            guard isCandidate(item) else { continue }
             let date = (try? item.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate) ?? Date.distantPast
+            if let minModificationDate, date < minModificationDate { continue }
+            let exportStep = parsedExportStep(from: item)
             if let current = latest {
-                if date > current.1 {
-                    latest = (item, date)
+                if isNewerPlyCandidate((item, date, exportStep), than: current) {
+                    latest = (item, date, exportStep)
                 }
             } else {
-                latest = (item, date)
+                latest = (item, date, exportStep)
             }
         }
         return latest?.0
+    }
+
+    private func isNewerPlyCandidate(_ candidate: (URL, Date, Int?), than current: (URL, Date, Int?)) -> Bool {
+        if candidate.1 != current.1 {
+            return candidate.1 > current.1
+        }
+        switch (candidate.2, current.2) {
+        case let (candidateStep?, currentStep?) where candidateStep != currentStep:
+            return candidateStep > currentStep
+        case (_?, nil):
+            return true
+        case (nil, _?):
+            return false
+        default:
+            return candidate.0.path > current.0.path
+        }
+    }
+
+    private func parsedExportStep(from url: URL) -> Int? {
+        let stem = url.deletingPathExtension().lastPathComponent
+        let prefix = "export_"
+        guard stem.hasPrefix(prefix) else { return nil }
+        let rawStep = stem.dropFirst(prefix.count)
+        guard !rawStep.isEmpty, rawStep.allSatisfy(\.isNumber) else { return nil }
+        return Int(rawStep)
     }
 }

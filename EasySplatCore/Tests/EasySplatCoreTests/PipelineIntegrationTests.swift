@@ -16,7 +16,7 @@ final class PipelineIntegrationTests: XCTestCase {
         ])
         defer { restore() }
 
-        let temp = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        let temp = makeTempRoot()
         let projectURL = temp.appendingPathComponent("Test.easysplatproj", isDirectory: true)
         let sourcePhotos = temp.appendingPathComponent("SourcePhotos", isDirectory: true)
         try FileManager.default.createDirectory(at: sourcePhotos, withIntermediateDirectories: true)
@@ -46,7 +46,7 @@ final class PipelineIntegrationTests: XCTestCase {
                 guard let datasetArg = args.last else { return }
                 let dataset = URL(fileURLWithPath: datasetArg)
                 let training = dataset.deletingLastPathComponent()
-                let ply = training.appendingPathComponent("mock.ply")
+                let ply = training.appendingPathComponent("export_00001.ply")
                 try? TestFileBuilder.writeMinimalPly(at: ply)
             })
         ])
@@ -74,7 +74,7 @@ final class PipelineIntegrationTests: XCTestCase {
         ])
         defer { restore() }
 
-        let temp = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        let temp = makeTempRoot()
         let projectURL = temp.appendingPathComponent("TestFail.easysplatproj", isDirectory: true)
         let sourcePhotos = temp.appendingPathComponent("SourcePhotos", isDirectory: true)
         try FileManager.default.createDirectory(at: sourcePhotos, withIntermediateDirectories: true)
@@ -118,11 +118,11 @@ final class PipelineIntegrationTests: XCTestCase {
         ])
         defer { restore() }
 
-        let temp = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        let temp = makeTempRoot()
         let projectURL = temp.appendingPathComponent("Test.easysplatproj", isDirectory: true)
         let sourcePhotos = temp.appendingPathComponent("SourcePhotos", isDirectory: true)
         try FileManager.default.createDirectory(at: sourcePhotos, withIntermediateDirectories: true)
-        for index in 0..<10 {
+        for index in 0..<2 {
             try writeTestImage(url: sourcePhotos.appendingPathComponent("img\(index).jpg"), value: UInt8(index % 255))
         }
 
@@ -177,7 +177,7 @@ final class PipelineIntegrationTests: XCTestCase {
         ])
         defer { restore() }
 
-        let temp = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        let temp = makeTempRoot()
         let projectURL = temp.appendingPathComponent("Test.easysplatproj", isDirectory: true)
         let sourcePhotos = temp.appendingPathComponent("SourcePhotos", isDirectory: true)
         try FileManager.default.createDirectory(at: sourcePhotos, withIntermediateDirectories: true)
@@ -200,7 +200,7 @@ final class PipelineIntegrationTests: XCTestCase {
                 guard let datasetArg = args.last else { return }
                 let dataset = URL(fileURLWithPath: datasetArg)
                 let training = dataset.deletingLastPathComponent()
-                let ply = training.appendingPathComponent("mock.ply")
+                let ply = training.appendingPathComponent("export_00001.ply")
                 try? TestFileBuilder.writeMinimalPly(at: ply)
             })
         ])
@@ -225,7 +225,7 @@ final class PipelineIntegrationTests: XCTestCase {
         ])
         defer { restore() }
 
-        let temp = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        let temp = makeTempRoot()
         let projectURL = temp.appendingPathComponent("MapAnythingDirect.easysplatproj", isDirectory: true)
         let sourcePhotos = temp.appendingPathComponent("SourcePhotos", isDirectory: true)
         try FileManager.default.createDirectory(at: sourcePhotos, withIntermediateDirectories: true)
@@ -272,7 +272,7 @@ final class PipelineIntegrationTests: XCTestCase {
         ])
         defer { restore() }
 
-        let temp = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        let temp = makeTempRoot()
         let projectURL = temp.appendingPathComponent("MapAnythingSeed.easysplatproj", isDirectory: true)
         let sourcePhotos = temp.appendingPathComponent("SourcePhotos", isDirectory: true)
         try FileManager.default.createDirectory(at: sourcePhotos, withIntermediateDirectories: true)
@@ -330,7 +330,7 @@ final class PipelineIntegrationTests: XCTestCase {
         ])
         defer { restore() }
 
-        let temp = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        let temp = makeTempRoot()
         let projectURL = temp.appendingPathComponent("MapAnythingDirectFallback.easysplatproj", isDirectory: true)
         let sourcePhotos = temp.appendingPathComponent("SourcePhotos", isDirectory: true)
         try FileManager.default.createDirectory(at: sourcePhotos, withIntermediateDirectories: true)
@@ -394,7 +394,7 @@ final class PipelineIntegrationTests: XCTestCase {
         ])
         defer { restore() }
 
-        let temp = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        let temp = makeTempRoot()
         let projectURL = temp.appendingPathComponent("MapAnythingThinTracks.easysplatproj", isDirectory: true)
         let sourcePhotos = temp.appendingPathComponent("SourcePhotos", isDirectory: true)
         try FileManager.default.createDirectory(at: sourcePhotos, withIntermediateDirectories: true)
@@ -457,7 +457,7 @@ final class PipelineIntegrationTests: XCTestCase {
         ])
         defer { restore() }
 
-        let temp = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        let temp = makeTempRoot()
         let projectURL = temp.appendingPathComponent("MapAnythingInvalidManifest.easysplatproj", isDirectory: true)
         let sourcePhotos = temp.appendingPathComponent("SourcePhotos", isDirectory: true)
         try FileManager.default.createDirectory(at: sourcePhotos, withIntermediateDirectories: true)
@@ -510,7 +510,7 @@ final class PipelineIntegrationTests: XCTestCase {
         XCTAssertTrue(runner.calls.contains(where: { $0.0 == toolchain.colmap.path && $0.1.first == "point_triangulator" }))
     }
 
-    func testPipelineMapAnythingFailureFallsBackToColmapDefaultPath() async throws {
+    func testPipelineDa3AndMapAnythingFailureFallsBackToColmapDefaultPath() async throws {
         let restore = await scopedEnvironment([
             "EASYSPLAT_SFM_BACKEND": nil,
             "EASYSPLAT_SFM_MAPPER": nil,
@@ -518,16 +518,16 @@ final class PipelineIntegrationTests: XCTestCase {
         ])
         defer { restore() }
 
-        let temp = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        let temp = makeTempRoot()
         let projectURL = temp.appendingPathComponent("MapAnythingToColmap.easysplatproj", isDirectory: true)
         let sourcePhotos = temp.appendingPathComponent("SourcePhotos", isDirectory: true)
         try FileManager.default.createDirectory(at: sourcePhotos, withIntermediateDirectories: true)
-        for index in 0..<10 {
+        for index in 0..<2 {
             try writeTestImage(url: sourcePhotos.appendingPathComponent("img\(index).jpg"), value: UInt8(index % 255))
         }
 
         let metadata = ProjectMetadata(
-            title: "MapAnythingToColmap",
+            title: "Da3MapAnythingToColmap",
             input: .photos(folder: sourcePhotos.path),
             preset: PresetSpec(mode: .object, quality: .draft)
         )
@@ -535,8 +535,14 @@ final class PipelineIntegrationTests: XCTestCase {
         try paths.ensureDirectories()
         try ProjectMetadataStore.save(metadata, to: paths.metadataURL)
 
-        let toolchain = try makeToolchain(root: temp)
+        let toolchain = try makeToolchain(root: temp, createDa3Files: true)
         let runner = MockSubprocessRunner(scripts: [
+            .init(
+                path: toolchain.da3.sfmTool.path,
+                argsPrefix: ["--images"],
+                result: .init(exitCode: 1, terminationReason: .exit, stdout: "", stderr: "da3 failed"),
+                onRun: nil
+            ),
             .init(
                 path: toolchain.mapanything.sfmTool.path,
                 argsPrefix: ["--images"],
@@ -577,9 +583,61 @@ final class PipelineIntegrationTests: XCTestCase {
 
         try await pipeline.run { _ in }
 
+        XCTAssertTrue(runner.calls.contains(where: { $0.0 == toolchain.da3.sfmTool.path }))
         XCTAssertTrue(runner.calls.contains(where: { $0.0 == toolchain.mapanything.sfmTool.path }))
         XCTAssertTrue(runner.calls.contains(where: { $0.0 == toolchain.colmap.path && $0.1.first == "feature_extractor" }))
         XCTAssertTrue(runner.calls.contains(where: { $0.0 == toolchain.colmap.path && $0.1.first == "global_mapper" }))
+    }
+
+    func testPipelineExplicitDa3FailureDoesNotFallbackToOtherBackends() async throws {
+        let restore = await scopedEnvironment([
+            "EASYSPLAT_SFM_BACKEND": "da3",
+            "EASYSPLAT_SFM_MAPPER": nil,
+            "EASYSPLAT_SKIP_TRAINING": "1"
+        ])
+        defer { restore() }
+
+        let temp = makeTempRoot()
+        let projectURL = temp.appendingPathComponent("StrictDa3.easysplatproj", isDirectory: true)
+        let sourcePhotos = temp.appendingPathComponent("SourcePhotos", isDirectory: true)
+        try FileManager.default.createDirectory(at: sourcePhotos, withIntermediateDirectories: true)
+        for index in 0..<2 {
+            try writeTestImage(url: sourcePhotos.appendingPathComponent("img\(index).jpg"), value: UInt8(index % 255))
+        }
+
+        let metadata = ProjectMetadata(
+            title: "StrictDa3",
+            input: .photos(folder: sourcePhotos.path),
+            preset: PresetSpec(mode: .object, quality: .draft)
+        )
+        let paths = ProjectPaths(root: projectURL)
+        try paths.ensureDirectories()
+        try ProjectMetadataStore.save(metadata, to: paths.metadataURL)
+
+        let toolchain = try makeToolchain(root: temp, createDa3Files: true)
+        let runner = MockSubprocessRunner(scripts: [
+            .init(
+                path: toolchain.da3.sfmTool.path,
+                argsPrefix: ["--images"],
+                result: .init(exitCode: 1, terminationReason: .exit, stdout: "", stderr: "da3 native export failed"),
+                onRun: nil
+            )
+        ])
+
+        let pipeline = PipelineRunner(
+            projectURL: projectURL,
+            config: .init(toolchain: toolchain, preset: metadata.preset),
+            tooling: .init(runner: runner)
+        )
+
+        await XCTAssertThrowsErrorAsync({
+            try await pipeline.run { _ in }
+        })
+
+        XCTAssertEqual(runner.calls.count, 1)
+        XCTAssertEqual(runner.calls.first?.0, toolchain.da3.sfmTool.path)
+        XCTAssertFalse(runner.calls.contains(where: { $0.0 == toolchain.mapanything.sfmTool.path }))
+        XCTAssertFalse(runner.calls.contains(where: { $0.0 == toolchain.colmap.path }))
     }
 
     func testPipelineConvertsBinaryOnlySparseModelBeforeTraining() async throws {
@@ -590,7 +648,7 @@ final class PipelineIntegrationTests: XCTestCase {
         ])
         defer { restore() }
 
-        let temp = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        let temp = makeTempRoot()
         let projectURL = temp.appendingPathComponent("BinarySparse.easysplatproj", isDirectory: true)
         let sourcePhotos = temp.appendingPathComponent("SourcePhotos", isDirectory: true)
         try FileManager.default.createDirectory(at: sourcePhotos, withIntermediateDirectories: true)
@@ -673,7 +731,7 @@ final class PipelineIntegrationTests: XCTestCase {
                     guard let datasetArg = args.last else { return }
                     let dataset = URL(fileURLWithPath: datasetArg)
                     let training = dataset.deletingLastPathComponent()
-                    let ply = training.appendingPathComponent("mock.ply")
+                    let ply = training.appendingPathComponent("export_00001.ply")
                     try? TestFileBuilder.writeMinimalPly(at: ply)
                 }
             )
@@ -702,11 +760,11 @@ final class PipelineIntegrationTests: XCTestCase {
         ])
         defer { restore() }
 
-        let temp = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        let temp = makeTempRoot()
         let projectURL = temp.appendingPathComponent("Test.easysplatproj", isDirectory: true)
         let sourcePhotos = temp.appendingPathComponent("SourcePhotos", isDirectory: true)
         try FileManager.default.createDirectory(at: sourcePhotos, withIntermediateDirectories: true)
-        for index in 0..<10 {
+        for index in 0..<2 {
             try writeTestImage(url: sourcePhotos.appendingPathComponent("img\(index).jpg"), value: UInt8(index % 255))
         }
 
@@ -718,7 +776,7 @@ final class PipelineIntegrationTests: XCTestCase {
         try ProjectMetadataStore.save(metadata, to: paths.metadataURL)
 
         let toolchain = try makeToolchain(root: temp, createVggtFiles: true)
-        let runner = CancellationOnFastVggtRunner(cancelPath: toolchain.fastvggt.sfmTool.path)
+        let runner = CancellationOnSfmRunner(cancelPath: toolchain.fastvggt.sfmTool.path)
 
         let pipeline = PipelineRunner(
             projectURL: projectURL,
@@ -740,7 +798,7 @@ final class PipelineIntegrationTests: XCTestCase {
         XCTAssertNotNil(interruptedMetadata.lastRunStartedAt, "Cancellation should preserve lastRunStartedAt for crash/interruption detection.")
     }
 
-    func testPipelineDefaultsToMapAnythingWhenBackendUnset() async throws {
+    func testPipelineDa3CancellationDoesNotFallbackBetweenBackends() async throws {
         let restore = await scopedEnvironment([
             "EASYSPLAT_SFM_BACKEND": nil,
             "EASYSPLAT_SFM_MAPPER": nil,
@@ -748,11 +806,106 @@ final class PipelineIntegrationTests: XCTestCase {
         ])
         defer { restore() }
 
-        let temp = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        let temp = makeTempRoot()
+        let projectURL = temp.appendingPathComponent("Da3Cancel.easysplatproj", isDirectory: true)
+        let sourcePhotos = temp.appendingPathComponent("SourcePhotos", isDirectory: true)
+        try FileManager.default.createDirectory(at: sourcePhotos, withIntermediateDirectories: true)
+        for index in 0..<2 {
+            try writeTestImage(url: sourcePhotos.appendingPathComponent("img\(index).jpg"), value: UInt8(index % 255))
+        }
+
+        let metadata = ProjectMetadata(
+            title: "Da3Cancel",
+            input: .photos(folder: sourcePhotos.path),
+            preset: PresetSpec(mode: .object, quality: .draft)
+        )
+        let paths = ProjectPaths(root: projectURL)
+        try paths.ensureDirectories()
+        try ProjectMetadataStore.save(metadata, to: paths.metadataURL)
+
+        let toolchain = try makeToolchain(root: temp, createDa3Files: true, createVggtFiles: true)
+        let runner = CancellationOnSfmRunner(cancelPath: toolchain.da3.sfmTool.path)
+
+        let pipeline = PipelineRunner(
+            projectURL: projectURL,
+            config: .init(toolchain: toolchain, preset: metadata.preset),
+            tooling: .init(runner: runner)
+        )
+
+        await XCTAssertThrowsErrorAsync({
+            try await pipeline.run { _ in }
+        }, errorHandler: { error in
+            XCTAssertTrue(error is CancellationError)
+        })
+
+        let callPaths = runner.calls.map { $0.0 }
+        XCTAssertEqual(callPaths.filter { $0 == toolchain.da3.sfmTool.path }.count, 1)
+        XCTAssertFalse(callPaths.contains(toolchain.mapanything.sfmTool.path))
+        XCTAssertFalse(callPaths.contains(toolchain.colmap.path))
+        let interruptedMetadata = try ProjectMetadataStore.load(from: paths.metadataURL)
+        XCTAssertNotNil(interruptedMetadata.lastRunStartedAt, "Cancellation should preserve lastRunStartedAt for crash/interruption detection.")
+    }
+
+    func testPipelineMapAnythingDirectCancellationDoesNotStartSeedRefine() async throws {
+        let restore = await scopedEnvironment([
+            "EASYSPLAT_SFM_BACKEND": "mapanything",
+            "EASYSPLAT_SFM_MAPPER": nil,
+            "EASYSPLAT_SKIP_TRAINING": "1"
+        ])
+        defer { restore() }
+
+        let temp = makeTempRoot()
+        let projectURL = temp.appendingPathComponent("MapCancel.easysplatproj", isDirectory: true)
+        let sourcePhotos = temp.appendingPathComponent("SourcePhotos", isDirectory: true)
+        try FileManager.default.createDirectory(at: sourcePhotos, withIntermediateDirectories: true)
+        for index in 0..<2 {
+            try writeTestImage(url: sourcePhotos.appendingPathComponent("img\(index).jpg"), value: UInt8(index % 255))
+        }
+
+        let metadata = ProjectMetadata(
+            title: "MapCancel",
+            input: .photos(folder: sourcePhotos.path),
+            preset: PresetSpec(mode: .object, quality: .draft)
+        )
+        let paths = ProjectPaths(root: projectURL)
+        try paths.ensureDirectories()
+        try ProjectMetadataStore.save(metadata, to: paths.metadataURL)
+
+        let toolchain = try makeToolchain(root: temp, createMapAnythingFiles: true, createVggtFiles: true)
+        let runner = CancellationOnSfmRunner(cancelPath: toolchain.mapanything.sfmTool.path)
+
+        let pipeline = PipelineRunner(
+            projectURL: projectURL,
+            config: .init(toolchain: toolchain, preset: metadata.preset),
+            tooling: .init(runner: runner)
+        )
+
+        await XCTAssertThrowsErrorAsync({
+            try await pipeline.run { _ in }
+        }, errorHandler: { error in
+            XCTAssertTrue(error is CancellationError)
+        })
+
+        let callPaths = runner.calls.map { $0.0 }
+        XCTAssertEqual(callPaths.filter { $0 == toolchain.mapanything.sfmTool.path }.count, 1)
+        XCTAssertFalse(callPaths.contains(toolchain.colmap.path))
+        let interruptedMetadata = try ProjectMetadataStore.load(from: paths.metadataURL)
+        XCTAssertNotNil(interruptedMetadata.lastRunStartedAt, "Cancellation should preserve lastRunStartedAt for crash/interruption detection.")
+    }
+
+    func testPipelineDefaultsToDa3WhenBackendUnset() async throws {
+        let restore = await scopedEnvironment([
+            "EASYSPLAT_SFM_BACKEND": nil,
+            "EASYSPLAT_SFM_MAPPER": nil,
+            "EASYSPLAT_SKIP_TRAINING": "1"
+        ])
+        defer { restore() }
+
+        let temp = makeTempRoot()
         let projectURL = temp.appendingPathComponent("Test.easysplatproj", isDirectory: true)
         let sourcePhotos = temp.appendingPathComponent("SourcePhotos", isDirectory: true)
         try FileManager.default.createDirectory(at: sourcePhotos, withIntermediateDirectories: true)
-        for index in 0..<10 {
+        for index in 0..<2 {
             try writeTestImage(url: sourcePhotos.appendingPathComponent("img\(index).jpg"), value: UInt8(index % 255))
         }
 
@@ -763,9 +916,188 @@ final class PipelineIntegrationTests: XCTestCase {
         try paths.ensureDirectories()
         try ProjectMetadataStore.save(metadata, to: paths.metadataURL)
 
-        let toolchain = try makeToolchain(root: temp, createVggtFiles: true)
+        let toolchain = try makeToolchain(root: temp, createDa3Files: true, createVggtFiles: true)
 
         let runner = MockSubprocessRunner(scripts: [
+            .init(path: toolchain.da3.sfmTool.path, argsPrefix: ["--images"], result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""), onRun: { args in
+                do {
+                    try self.writeDa3RunArtifacts(for: args)
+                } catch {
+                    XCTFail("Failed to write DA3 test artifacts: \(error)")
+                }
+            }),
+            .init(path: toolchain.colmap.path, argsPrefix: ["model_analyzer"], result: .init(exitCode: 0, terminationReason: .exit, stdout: "Registered images: 2 / 2\nPoints: 16000\nObservations: 32000\nMean track length: 2.0\nMean reprojection error: 0.8\n", stderr: ""), onRun: nil)
+        ])
+
+        let pipeline = PipelineRunner(
+            projectURL: projectURL,
+            config: .init(toolchain: toolchain, preset: metadata.preset),
+            tooling: .init(runner: runner)
+        )
+
+        try await pipeline.run { _ in }
+
+        let callPaths = runner.calls.map { $0.0 }
+        XCTAssertTrue(callPaths.contains(toolchain.da3.sfmTool.path))
+        XCTAssertFalse(callPaths.contains(toolchain.mapanything.sfmTool.path))
+        XCTAssertFalse(callPaths.contains(toolchain.fastvggt.sfmTool.path))
+        XCTAssertFalse(callPaths.contains(toolchain.vggt.sfmTool.path))
+        XCTAssertTrue(callPaths.contains(toolchain.colmap.path))
+        XCTAssertTrue(runner.calls.contains(where: { $0.0 == toolchain.colmap.path && $0.1.first == "model_analyzer" }))
+        XCTAssertFalse(runner.calls.contains(where: { $0.0 == toolchain.colmap.path && $0.1.first == "point_triangulator" }))
+        XCTAssertFalse(runner.calls.contains(where: { $0.0 == toolchain.colmap.path && $0.1.first == "global_mapper" }))
+    }
+
+    func testPipelineDefaultDa3ProducesFinalPly() async throws {
+        let restore = await scopedEnvironment([
+            "EASYSPLAT_SFM_BACKEND": nil,
+            "EASYSPLAT_SFM_MAPPER": nil,
+            "EASYSPLAT_SKIP_TRAINING": nil
+        ])
+        defer { restore() }
+
+        let temp = makeTempRoot()
+        let projectURL = temp.appendingPathComponent("Da3Ply.easysplatproj", isDirectory: true)
+        let sourcePhotos = temp.appendingPathComponent("SourcePhotos", isDirectory: true)
+        try FileManager.default.createDirectory(at: sourcePhotos, withIntermediateDirectories: true)
+        for index in 0..<2 {
+            try writeTestImage(url: sourcePhotos.appendingPathComponent("img\(index).jpg"), value: UInt8(index % 255))
+        }
+
+        let metadata = ProjectMetadata(
+            title: "Da3Ply",
+            input: .photos(folder: sourcePhotos.path),
+            preset: PresetSpec(mode: .object, quality: .draft)
+        )
+        let paths = ProjectPaths(root: projectURL)
+        try paths.ensureDirectories()
+        try ProjectMetadataStore.save(metadata, to: paths.metadataURL)
+
+        let toolchain = try makeToolchain(root: temp, createDa3Files: true)
+        let runner = MockSubprocessRunner(scripts: [
+            .init(path: toolchain.da3.sfmTool.path, argsPrefix: ["--images"], result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""), onRun: { args in
+                do {
+                    try self.writeDa3RunArtifacts(for: args)
+                } catch {
+                    XCTFail("Failed to write DA3 test artifacts: \(error)")
+                }
+            }),
+            .init(path: toolchain.colmap.path, argsPrefix: ["model_analyzer"], result: .init(exitCode: 0, terminationReason: .exit, stdout: "Registered images: 2 / 2\nPoints: 16000\nObservations: 32000\nMean track length: 2.0\nMean reprojection error: 0.8\n", stderr: ""), onRun: nil),
+            .init(path: toolchain.brush.path, argsPrefix: [], result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""), onRun: { args in
+                guard let datasetArg = args.last else { return }
+                let dataset = URL(fileURLWithPath: datasetArg)
+                let training = dataset.deletingLastPathComponent()
+                let ply = training.appendingPathComponent("export_00001.ply")
+                try? TestFileBuilder.writeMinimalPly(at: ply)
+            })
+        ])
+
+        let pipeline = PipelineRunner(
+            projectURL: projectURL,
+            config: .init(toolchain: toolchain, preset: metadata.preset),
+            tooling: .init(runner: runner)
+        )
+
+        try await pipeline.run { _ in }
+
+        let output = projectURL.appendingPathComponent("Output/splat.ply")
+        XCTAssertTrue(FileManager.default.fileExists(atPath: output.path))
+        let finalMetadata = try ProjectMetadataStore.load(from: paths.metadataURL)
+        XCTAssertEqual(finalMetadata.outputs?.splatPlyPath, "Output/splat.ply")
+        XCTAssertEqual(finalMetadata.outputs?.colmapModelPath, "SfM/colmap/sparse/0")
+        XCTAssertFalse(runner.calls.contains(where: { $0.0 == toolchain.mapanything.sfmTool.path }))
+    }
+
+    func testPipelineRejectsSymlinkedOutputDirectoryOnExport() async throws {
+        let restore = await scopedEnvironment([
+            "EASYSPLAT_SFM_BACKEND": nil,
+            "EASYSPLAT_SFM_MAPPER": nil,
+            "EASYSPLAT_SKIP_TRAINING": nil
+        ])
+        defer { restore() }
+
+        let temp = makeTempRoot()
+        let projectURL = temp.appendingPathComponent("Da3SymlinkOutput.easysplatproj", isDirectory: true)
+        let sourcePhotos = temp.appendingPathComponent("SourcePhotos", isDirectory: true)
+        try FileManager.default.createDirectory(at: sourcePhotos, withIntermediateDirectories: true)
+        for index in 0..<2 {
+            try writeTestImage(url: sourcePhotos.appendingPathComponent("img\(index).jpg"), value: UInt8(index % 255))
+        }
+
+        let metadata = ProjectMetadata(
+            title: "Da3SymlinkOutput",
+            input: .photos(folder: sourcePhotos.path),
+            preset: PresetSpec(mode: .object, quality: .draft)
+        )
+        let paths = ProjectPaths(root: projectURL)
+        try paths.ensureDirectories()
+        try ProjectMetadataStore.save(metadata, to: paths.metadataURL)
+        let externalOutput = temp.appendingPathComponent("ExternalOutput", isDirectory: true)
+        try FileManager.default.createDirectory(at: externalOutput, withIntermediateDirectories: true)
+        try FileManager.default.removeItem(at: paths.outputURL)
+        try FileManager.default.createSymbolicLink(at: paths.outputURL, withDestinationURL: externalOutput)
+
+        let toolchain = try makeToolchain(root: temp, createDa3Files: true)
+        let runner = MockSubprocessRunner(scripts: [
+            .init(path: toolchain.da3.sfmTool.path, argsPrefix: ["--images"], result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""), onRun: { args in
+                try? self.writeDa3RunArtifacts(for: args)
+            }),
+            .init(path: toolchain.colmap.path, argsPrefix: ["model_analyzer"], result: .init(exitCode: 0, terminationReason: .exit, stdout: "Registered images: 2 / 2\nPoints: 16000\nObservations: 32000\nMean track length: 2.0\nMean reprojection error: 0.8\n", stderr: ""), onRun: nil),
+            .init(path: toolchain.brush.path, argsPrefix: [], result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""), onRun: { args in
+                guard let datasetArg = args.last else { return }
+                let dataset = URL(fileURLWithPath: datasetArg)
+                let training = dataset.deletingLastPathComponent()
+                try? TestFileBuilder.writeMinimalPly(at: training.appendingPathComponent("export_00001.ply"))
+            })
+        ])
+
+        let pipeline = PipelineRunner(
+            projectURL: projectURL,
+            config: .init(toolchain: toolchain, preset: metadata.preset),
+            tooling: .init(runner: runner)
+        )
+
+        await XCTAssertThrowsErrorAsync({
+            try await pipeline.run { _ in }
+        }, errorHandler: { error in
+            guard case ProjectPathError.escapesProjectRoot = error else {
+                return XCTFail("Expected project root escape, got \(error)")
+            }
+        })
+        XCTAssertFalse(FileManager.default.fileExists(atPath: externalOutput.appendingPathComponent("splat.ply").path))
+    }
+
+    func testPipelineLowQualityDa3FallsBackToMapAnything() async throws {
+        let restore = await scopedEnvironment([
+            "EASYSPLAT_SFM_BACKEND": nil,
+            "EASYSPLAT_SFM_MAPPER": nil,
+            "EASYSPLAT_SKIP_TRAINING": "1"
+        ])
+        defer { restore() }
+
+        let temp = makeTempRoot()
+        let projectURL = temp.appendingPathComponent("Da3ThinTracks.easysplatproj", isDirectory: true)
+        let sourcePhotos = temp.appendingPathComponent("SourcePhotos", isDirectory: true)
+        try FileManager.default.createDirectory(at: sourcePhotos, withIntermediateDirectories: true)
+        for index in 0..<10 {
+            try writeTestImage(url: sourcePhotos.appendingPathComponent("img\(index).jpg"), value: UInt8(index % 255))
+        }
+
+        let metadata = ProjectMetadata(
+            title: "Da3ThinTracks",
+            input: .photos(folder: sourcePhotos.path),
+            preset: PresetSpec(mode: .object, quality: .draft)
+        )
+        let paths = ProjectPaths(root: projectURL)
+        try paths.ensureDirectories()
+        try ProjectMetadataStore.save(metadata, to: paths.metadataURL)
+
+        let toolchain = try makeToolchain(root: temp, createDa3Files: true)
+        let runner = MockSubprocessRunner(scripts: [
+            .init(path: toolchain.da3.sfmTool.path, argsPrefix: ["--images"], result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""), onRun: { args in
+                try? self.writeDa3RunArtifacts(for: args)
+            }),
+            .init(path: toolchain.colmap.path, argsPrefix: ["model_analyzer"], result: .init(exitCode: 0, terminationReason: .exit, stdout: "Registered images: 10 / 10\nPoints: 10000\nObservations: 10100\nMean track length: 1.01\nMean reprojection error: 0.9\n", stderr: ""), onRun: nil),
             .init(path: toolchain.mapanything.sfmTool.path, argsPrefix: ["--images"], result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""), onRun: { args in
                 try? self.writeMapAnythingRunArtifacts(for: args)
             }),
@@ -779,7 +1111,7 @@ final class PipelineIntegrationTests: XCTestCase {
                 guard let out = self.value(for: "--output_path", in: args) else { return }
                 try? self.writeSparseModel(at: URL(fileURLWithPath: out), imageName: "frame_000000.jpg")
             }),
-            .init(path: toolchain.colmap.path, argsPrefix: ["model_analyzer"], result: .init(exitCode: 0, terminationReason: .exit, stdout: "Registered images: 10 / 10\nMean reprojection error: 1.0\n", stderr: ""), onRun: nil)
+            .init(path: toolchain.colmap.path, argsPrefix: ["model_analyzer"], result: .init(exitCode: 0, terminationReason: .exit, stdout: "Registered images: 10 / 10\nPoints: 16000\nObservations: 42000\nMean track length: 2.63\nMean reprojection error: 0.8\n", stderr: ""), onRun: nil)
         ])
 
         let pipeline = PipelineRunner(
@@ -790,11 +1122,8 @@ final class PipelineIntegrationTests: XCTestCase {
 
         try await pipeline.run { _ in }
 
-        let callPaths = runner.calls.map { $0.0 }
-        XCTAssertTrue(callPaths.contains(toolchain.mapanything.sfmTool.path))
-        XCTAssertFalse(callPaths.contains(toolchain.fastvggt.sfmTool.path))
-        XCTAssertFalse(callPaths.contains(toolchain.vggt.sfmTool.path))
-        XCTAssertTrue(callPaths.contains(toolchain.colmap.path))
+        XCTAssertEqual(runner.calls.filter { $0.0 == toolchain.da3.sfmTool.path }.count, 1)
+        XCTAssertEqual(runner.calls.filter { $0.0 == toolchain.mapanything.sfmTool.path }.count, 1)
         XCTAssertTrue(runner.calls.contains(where: { $0.0 == toolchain.colmap.path && $0.1.first == "point_triangulator" }))
         XCTAssertFalse(runner.calls.contains(where: { $0.0 == toolchain.colmap.path && $0.1.first == "global_mapper" }))
     }
@@ -809,7 +1138,7 @@ final class PipelineIntegrationTests: XCTestCase {
         ])
         defer { restore() }
 
-        let temp = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        let temp = makeTempRoot()
         let projectURL = temp.appendingPathComponent("Test.easysplatproj", isDirectory: true)
         let sourcePhotos = temp.appendingPathComponent("SourcePhotos", isDirectory: true)
         try FileManager.default.createDirectory(at: sourcePhotos, withIntermediateDirectories: true)
@@ -863,11 +1192,11 @@ final class PipelineIntegrationTests: XCTestCase {
         ])
         defer { restore() }
 
-        let temp = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        let temp = makeTempRoot()
         let projectURL = temp.appendingPathComponent("Test.easysplatproj", isDirectory: true)
         let sourcePhotos = temp.appendingPathComponent("SourcePhotos", isDirectory: true)
         try FileManager.default.createDirectory(at: sourcePhotos, withIntermediateDirectories: true)
-        for index in 0..<10 {
+        for index in 0..<2 {
             try writeTestImage(url: sourcePhotos.appendingPathComponent("img\(index).jpg"), value: UInt8(index % 255))
         }
 
@@ -878,23 +1207,13 @@ final class PipelineIntegrationTests: XCTestCase {
         try paths.ensureDirectories()
         try ProjectMetadataStore.save(metadata, to: paths.metadataURL)
 
-        let toolchain = try makeToolchain(root: temp, createVggtFiles: true)
+        let toolchain = try makeToolchain(root: temp, createDa3Files: true, createVggtFiles: true)
 
         let runner = MockSubprocessRunner(scripts: [
-            .init(path: toolchain.mapanything.sfmTool.path, argsPrefix: ["--images"], result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""), onRun: { args in
-                try? self.writeMapAnythingRunArtifacts(for: args)
+            .init(path: toolchain.da3.sfmTool.path, argsPrefix: ["--images"], result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""), onRun: { args in
+                try? self.writeDa3RunArtifacts(for: args)
             }),
-            .init(path: toolchain.colmap.path, argsPrefix: ["feature_extractor"], result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""), onRun: nil),
-            .init(path: toolchain.colmap.path, argsPrefix: ["exhaustive_matcher"], result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""), onRun: nil),
-            .init(path: toolchain.colmap.path, argsPrefix: ["point_triangulator"], result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""), onRun: { args in
-                guard let out = self.value(for: "--output_path", in: args) else { return }
-                try? self.writeSparseModel(at: URL(fileURLWithPath: out), imageName: "frame_000000.jpg")
-            }),
-            .init(path: toolchain.colmap.path, argsPrefix: ["bundle_adjuster"], result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""), onRun: { args in
-                guard let out = self.value(for: "--output_path", in: args) else { return }
-                try? self.writeSparseModel(at: URL(fileURLWithPath: out), imageName: "frame_000000.jpg")
-            }),
-            .init(path: toolchain.colmap.path, argsPrefix: ["model_analyzer"], result: .init(exitCode: 0, terminationReason: .exit, stdout: "Registered images: 10 / 10\nMean reprojection error: 1.0\n", stderr: ""), onRun: nil)
+            .init(path: toolchain.colmap.path, argsPrefix: ["model_analyzer"], result: .init(exitCode: 0, terminationReason: .exit, stdout: "Registered images: 2 / 2\nPoints: 16000\nObservations: 32000\nMean track length: 2.0\nMean reprojection error: 0.8\n", stderr: ""), onRun: nil)
         ])
 
         let pipeline = PipelineRunner(
@@ -906,11 +1225,13 @@ final class PipelineIntegrationTests: XCTestCase {
         try await pipeline.run { _ in }
 
         let callPaths = runner.calls.map { $0.0 }
-        XCTAssertTrue(callPaths.contains(toolchain.mapanything.sfmTool.path))
+        XCTAssertTrue(callPaths.contains(toolchain.da3.sfmTool.path))
+        XCTAssertFalse(callPaths.contains(toolchain.mapanything.sfmTool.path))
         XCTAssertFalse(callPaths.contains(toolchain.fastvggt.sfmTool.path))
         XCTAssertFalse(callPaths.contains(toolchain.vggt.sfmTool.path))
         XCTAssertTrue(callPaths.contains(toolchain.colmap.path))
-        XCTAssertTrue(runner.calls.contains(where: { $0.0 == toolchain.colmap.path && $0.1.first == "point_triangulator" }))
+        XCTAssertTrue(runner.calls.contains(where: { $0.0 == toolchain.colmap.path && $0.1.first == "model_analyzer" }))
+        XCTAssertFalse(runner.calls.contains(where: { $0.0 == toolchain.colmap.path && $0.1.first == "point_triangulator" }))
         XCTAssertFalse(runner.calls.contains(where: { $0.0 == toolchain.colmap.path && $0.1.first == "global_mapper" }))
     }
 
@@ -925,7 +1246,7 @@ final class PipelineIntegrationTests: XCTestCase {
         ])
         defer { restore() }
 
-        let temp = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        let temp = makeTempRoot()
         let projectURL = temp.appendingPathComponent("Test.easysplatproj", isDirectory: true)
         let sourcePhotos = temp.appendingPathComponent("SourcePhotos", isDirectory: true)
         try FileManager.default.createDirectory(at: sourcePhotos, withIntermediateDirectories: true)
@@ -987,7 +1308,7 @@ final class PipelineIntegrationTests: XCTestCase {
         ])
         defer { restore() }
 
-        let temp = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        let temp = makeTempRoot()
         let projectURL = temp.appendingPathComponent("Test.easysplatproj", isDirectory: true)
         let sourcePhotos = temp.appendingPathComponent("SourcePhotos", isDirectory: true)
         try FileManager.default.createDirectory(at: sourcePhotos, withIntermediateDirectories: true)
@@ -1080,7 +1401,7 @@ final class PipelineIntegrationTests: XCTestCase {
         ])
         defer { restore() }
 
-        let temp = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        let temp = makeTempRoot()
         let projectURL = temp.appendingPathComponent("Test.easysplatproj", isDirectory: true)
         let sourcePhotos = temp.appendingPathComponent("SourcePhotos", isDirectory: true)
         try FileManager.default.createDirectory(at: sourcePhotos, withIntermediateDirectories: true)
@@ -1167,7 +1488,7 @@ final class PipelineIntegrationTests: XCTestCase {
         ])
         defer { restore() }
 
-        let temp = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        let temp = makeTempRoot()
         let projectURL = temp.appendingPathComponent("Test.easysplatproj", isDirectory: true)
         let sourcePhotos = temp.appendingPathComponent("SourcePhotos", isDirectory: true)
         try FileManager.default.createDirectory(at: sourcePhotos, withIntermediateDirectories: true)
@@ -1220,7 +1541,7 @@ final class PipelineIntegrationTests: XCTestCase {
         ])
         defer { restore() }
 
-        let temp = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        let temp = makeTempRoot()
         let projectURL = temp.appendingPathComponent("Test.easysplatproj", isDirectory: true)
         let sourcePhotos = temp.appendingPathComponent("SourcePhotos", isDirectory: true)
         try FileManager.default.createDirectory(at: sourcePhotos, withIntermediateDirectories: true)
@@ -1287,7 +1608,7 @@ final class PipelineIntegrationTests: XCTestCase {
                 guard let datasetArg = args.last else { return }
                 let dataset = URL(fileURLWithPath: datasetArg)
                 let training = dataset.deletingLastPathComponent()
-                let ply = training.appendingPathComponent("mock.ply")
+                let ply = training.appendingPathComponent("export_00001.ply")
                 try? TestFileBuilder.writeMinimalPly(at: ply)
             })
         ])
@@ -1345,7 +1666,7 @@ final class PipelineIntegrationTests: XCTestCase {
         ])
         defer { restore() }
 
-        let temp = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        let temp = makeTempRoot()
         let projectURL = temp.appendingPathComponent("Test.easysplatproj", isDirectory: true)
         let sourcePhotos = temp.appendingPathComponent("SourcePhotos", isDirectory: true)
         try FileManager.default.createDirectory(at: sourcePhotos, withIntermediateDirectories: true)
@@ -1371,7 +1692,7 @@ final class PipelineIntegrationTests: XCTestCase {
                 guard let datasetArg = args.last else { return }
                 let dataset = URL(fileURLWithPath: datasetArg)
                 let training = dataset.deletingLastPathComponent()
-                let ply = training.appendingPathComponent("mock.ply")
+                let ply = training.appendingPathComponent("export_00001.ply")
                 try? TestFileBuilder.writeMinimalPly(at: ply)
             })
         ])
@@ -1396,7 +1717,7 @@ final class PipelineIntegrationTests: XCTestCase {
         ])
         defer { restore() }
 
-        let temp = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        let temp = makeTempRoot()
         let projectURL = temp.appendingPathComponent("Test.easysplatproj", isDirectory: true)
         let sourcePhotos = temp.appendingPathComponent("SourcePhotos", isDirectory: true)
         try FileManager.default.createDirectory(at: sourcePhotos, withIntermediateDirectories: true)
@@ -1422,7 +1743,7 @@ final class PipelineIntegrationTests: XCTestCase {
                 guard let datasetArg = args.last else { return }
                 let dataset = URL(fileURLWithPath: datasetArg)
                 let training = dataset.deletingLastPathComponent()
-                let ply = training.appendingPathComponent("mock.ply")
+                let ply = training.appendingPathComponent("export_00001.ply")
                 try? TestFileBuilder.writeMinimalPly(at: ply)
             })
         ])
@@ -1446,7 +1767,7 @@ final class PipelineIntegrationTests: XCTestCase {
         ])
         defer { restore() }
 
-        let temp = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        let temp = makeTempRoot()
         let projectURL = temp.appendingPathComponent("Test.easysplatproj", isDirectory: true)
         let sourcePhotos = temp.appendingPathComponent("SourcePhotos", isDirectory: true)
         try FileManager.default.createDirectory(at: sourcePhotos, withIntermediateDirectories: true)
@@ -1483,7 +1804,7 @@ final class PipelineIntegrationTests: XCTestCase {
                 guard let datasetArg = args.last else { return }
                 let dataset = URL(fileURLWithPath: datasetArg)
                 let training = dataset.deletingLastPathComponent()
-                let ply = training.appendingPathComponent("mock.ply")
+                let ply = training.appendingPathComponent("export_00001.ply")
                 try? TestFileBuilder.writeMinimalPly(at: ply)
             })
         ])
@@ -1511,7 +1832,7 @@ final class PipelineIntegrationTests: XCTestCase {
         ])
         defer { restore() }
 
-        let temp = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        let temp = makeTempRoot()
         let projectURL = temp.appendingPathComponent("Test.easysplatproj", isDirectory: true)
         let sourcePhotos = temp.appendingPathComponent("SourcePhotos", isDirectory: true)
         try FileManager.default.createDirectory(at: sourcePhotos, withIntermediateDirectories: true)
@@ -1536,7 +1857,7 @@ final class PipelineIntegrationTests: XCTestCase {
                 guard let datasetArg = args.last else { return }
                 let dataset = URL(fileURLWithPath: datasetArg)
                 let training = dataset.deletingLastPathComponent()
-                let ply = training.appendingPathComponent("mock.ply")
+                let ply = training.appendingPathComponent("export_00001.ply")
                 try? TestFileBuilder.writeMinimalPly(at: ply)
             })
         ])
@@ -1561,7 +1882,7 @@ final class PipelineIntegrationTests: XCTestCase {
         ])
         defer { restore() }
 
-        let temp = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        let temp = makeTempRoot()
         let projectURL = temp.appendingPathComponent("Test.easysplatproj", isDirectory: true)
         let sourcePhotos = temp.appendingPathComponent("SourcePhotos", isDirectory: true)
         try FileManager.default.createDirectory(at: sourcePhotos, withIntermediateDirectories: true)
@@ -1614,7 +1935,7 @@ final class PipelineIntegrationTests: XCTestCase {
         ])
         defer { restore() }
 
-        let temp = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        let temp = makeTempRoot()
         let projectURL = temp.appendingPathComponent("Test.easysplatproj", isDirectory: true)
         let sourcePhotos = temp.appendingPathComponent("SourcePhotos", isDirectory: true)
         try FileManager.default.createDirectory(at: sourcePhotos, withIntermediateDirectories: true)
@@ -1651,7 +1972,7 @@ final class PipelineIntegrationTests: XCTestCase {
         ])
         defer { restore() }
 
-        let temp = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        let temp = makeTempRoot()
         let projectURL = temp.appendingPathComponent("OneImage.easysplatproj", isDirectory: true)
         let sourcePhotos = temp.appendingPathComponent("SourcePhotos", isDirectory: true)
         try FileManager.default.createDirectory(at: sourcePhotos, withIntermediateDirectories: true)
@@ -1691,7 +2012,7 @@ final class PipelineIntegrationTests: XCTestCase {
         ])
         defer { restore() }
 
-        let temp = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        let temp = makeTempRoot()
         let projectURL = temp.appendingPathComponent("Test.easysplatproj", isDirectory: true)
         let sourcePhotos = temp.appendingPathComponent("SourcePhotos", isDirectory: true)
         try FileManager.default.createDirectory(at: sourcePhotos, withIntermediateDirectories: true)
@@ -1718,7 +2039,7 @@ final class PipelineIntegrationTests: XCTestCase {
                 guard let datasetArg = args.last else { return }
                 let dataset = URL(fileURLWithPath: datasetArg)
                 let training = dataset.deletingLastPathComponent()
-                let ply = training.appendingPathComponent("mock.ply")
+                let ply = training.appendingPathComponent("export_00001.ply")
                 try? TestFileBuilder.writeMinimalPly(at: ply)
             })
         ])
@@ -1746,7 +2067,7 @@ final class PipelineIntegrationTests: XCTestCase {
         ])
         defer { restore() }
 
-        let temp = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        let temp = makeTempRoot()
         let projectURL = temp.appendingPathComponent("Test.easysplatproj", isDirectory: true)
         let sourcePhotos = temp.appendingPathComponent("SourcePhotos", isDirectory: true)
         try FileManager.default.createDirectory(at: sourcePhotos, withIntermediateDirectories: true)
@@ -1777,7 +2098,7 @@ final class PipelineIntegrationTests: XCTestCase {
                 guard let datasetArg = args.last else { return }
                 let dataset = URL(fileURLWithPath: datasetArg)
                 let training = dataset.deletingLastPathComponent()
-                let ply = training.appendingPathComponent("mock.ply")
+                let ply = training.appendingPathComponent("export_00001.ply")
                 try? TestFileBuilder.writeMinimalPly(at: ply)
             })
         ])
@@ -1806,7 +2127,7 @@ final class PipelineIntegrationTests: XCTestCase {
         ])
         defer { restore() }
 
-        let temp = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        let temp = makeTempRoot()
         let projectURL = temp.appendingPathComponent("Test.easysplatproj", isDirectory: true)
         let sourcePhotos = temp.appendingPathComponent("SourcePhotos", isDirectory: true)
         try FileManager.default.createDirectory(at: sourcePhotos, withIntermediateDirectories: true)
@@ -1848,7 +2169,7 @@ final class PipelineIntegrationTests: XCTestCase {
         ])
         defer { restore() }
 
-        let temp = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        let temp = makeTempRoot()
         let projectURL = temp.appendingPathComponent("Test.easysplatproj", isDirectory: true)
         let sourcePhotos = temp.appendingPathComponent("SourcePhotos", isDirectory: true)
         try FileManager.default.createDirectory(at: sourcePhotos, withIntermediateDirectories: true)
@@ -1891,7 +2212,7 @@ final class PipelineIntegrationTests: XCTestCase {
         ])
         defer { restore() }
 
-        let temp = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        let temp = makeTempRoot()
         let projectURL = temp.appendingPathComponent("Test.easysplatproj", isDirectory: true)
         let sourcePhotos = temp.appendingPathComponent("SourcePhotos", isDirectory: true)
         try FileManager.default.createDirectory(at: sourcePhotos, withIntermediateDirectories: true)
@@ -1935,7 +2256,7 @@ final class PipelineIntegrationTests: XCTestCase {
         ])
         defer { restore() }
 
-        let temp = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        let temp = makeTempRoot()
         let projectURL = temp.appendingPathComponent("Test.easysplatproj", isDirectory: true)
         let sourcePhotos = temp.appendingPathComponent("SourcePhotos", isDirectory: true)
         try FileManager.default.createDirectory(at: sourcePhotos, withIntermediateDirectories: true)
@@ -1979,6 +2300,7 @@ final class PipelineIntegrationTests: XCTestCase {
         """.write(to: sparse.appendingPathComponent("images.txt"), atomically: true, encoding: .utf8)
         try """
         # points
+        1 0 0 1 128 128 128 1.0 1 0
         """.write(to: sparse.appendingPathComponent("points3D.txt"), atomically: true, encoding: .utf8)
 
         let trainingExport = paths.trainingURL.appendingPathComponent("export_00001.ply")
@@ -2007,7 +2329,7 @@ final class PipelineIntegrationTests: XCTestCase {
         ])
         defer { restore() }
 
-        let temp = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        let temp = makeTempRoot()
         let projectURL = temp.appendingPathComponent("Test.easysplatproj", isDirectory: true)
         let sourcePhotos = temp.appendingPathComponent("SourcePhotos", isDirectory: true)
         try FileManager.default.createDirectory(at: sourcePhotos, withIntermediateDirectories: true)
@@ -2062,6 +2384,7 @@ final class PipelineIntegrationTests: XCTestCase {
         """.write(to: sparse.appendingPathComponent("images.txt"), atomically: true, encoding: .utf8)
         try """
         # points
+        1 0 0 1 128 128 128 1.0 1 0
         """.write(to: sparse.appendingPathComponent("points3D.txt"), atomically: true, encoding: .utf8)
 
         let trainingExport = paths.trainingURL.appendingPathComponent("export_00001.ply")
@@ -2259,6 +2582,108 @@ final class PipelineIntegrationTests: XCTestCase {
         try data.write(to: URL(fileURLWithPath: manifestPath), options: [.atomic])
     }
 
+    private func writeDa3RunArtifacts(
+        for args: [String],
+        imageName: String = "frame_000000.jpg"
+    ) throws {
+        guard let manifestPath = value(for: "--manifest-out", in: args),
+              let imagesPath = value(for: "--images", in: args),
+              let mode = value(for: "--mode", in: args),
+              let out = value(for: "--out-sparse", in: args) else {
+            return
+        }
+
+        let imagesURL = URL(fileURLWithPath: imagesPath, isDirectory: true)
+        let imageNames = try FileManager.default.contentsOfDirectory(
+            at: imagesURL,
+            includingPropertiesForKeys: nil
+        )
+        .filter { ["jpg", "jpeg", "png", "heic"].contains($0.pathExtension.lowercased()) }
+        .map(\.lastPathComponent)
+        .sorted()
+
+        let totalImages = imageNames.count
+        let pointCount = max(16_000, totalImages * 500)
+        let observationsPerPoint = max(1, min(2, totalImages))
+        try writeDa3SparseModel(
+            at: URL(fileURLWithPath: out),
+            imageNames: imageNames.isEmpty ? [imageName] : imageNames,
+            pointCount: pointCount
+        )
+        let requestedWindowSize = Int(value(for: "--window-size", in: args) ?? "") ?? max(2, totalImages)
+        let requestedWindowOverlap = Int(value(for: "--window-overlap", in: args) ?? "") ?? 0
+        let effectiveWindowSize = max(2, min(totalImages, requestedWindowSize))
+        let effectiveWindowOverlap = max(0, min(requestedWindowOverlap, effectiveWindowSize - 1))
+        let windows = planMapAnythingWindows(
+            imageCount: totalImages,
+            windowSize: effectiveWindowSize,
+            windowOverlap: effectiveWindowOverlap
+        )
+        let nativeColmapExport = totalImages <= effectiveWindowSize
+
+        let manifest = Da3CoverageManifest(
+            mode: mode,
+            requestedDevice: value(for: "--device", in: args) ?? "mps",
+            selectedDevice: "mps",
+            modelSubdirectory: value(for: "--model-subdir", in: args) ?? "DA3-BASE",
+            fallbackModelSubdirectory: value(for: "--fallback-model-subdir", in: args),
+            processResolution: Int(value(for: "--process-res", in: args) ?? "") ?? 504,
+            cameraType: value(for: "--camera-type", in: args) ?? "PINHOLE",
+            sharedCamera: args.contains("--shared-camera"),
+            maxPoints: Int(value(for: "--max-points", in: args) ?? "") ?? 120_000,
+            totalImages: totalImages,
+            windowSize: effectiveWindowSize,
+            windowOverlap: effectiveWindowOverlap,
+            windows: windows.map { (start, end) in
+                Da3CoverageManifest.Window(
+                    start: start,
+                    end: end,
+                    images: Array(imageNames[start..<end])
+                )
+            },
+            rawPointSampleCount: pointCount,
+            fusedSparsePointCount: pointCount,
+            finalObservationCount: pointCount * observationsPerPoint,
+            meanTrackLength: Double(observationsPerPoint),
+            registeredImageCount: totalImages,
+            nativeColmapExport: nativeColmapExport,
+            exportStrategy: nativeColmapExport ? "native_colmap" : "unsupported_non_native_colmap"
+        )
+
+        let data = try JSONEncoder().encode(manifest)
+        try data.write(to: URL(fileURLWithPath: manifestPath), options: [.atomic])
+    }
+
+    private func writeDa3SparseModel(at modelURL: URL, imageNames: [String], pointCount: Int) throws {
+        try FileManager.default.createDirectory(at: modelURL, withIntermediateDirectories: true)
+        try "1 SIMPLE_PINHOLE 640 480 500 320 240\n"
+            .write(to: modelURL.appendingPathComponent("cameras.txt"), atomically: true, encoding: .utf8)
+
+        var imagesText = "# Image list with two lines per image:\n"
+        for (offset, imageName) in imageNames.enumerated() {
+            let imageID = offset + 1
+            imagesText += "\(imageID) 1 0 0 0 0 0 0 1 \(imageName)\n"
+            if imageID == 1 || imageID == 2 {
+                let observations = (1...pointCount)
+                    .map { pointID in "\(imageID - 1) \(imageID - 1) \(pointID)" }
+                    .joined(separator: " ")
+                imagesText += observations + "\n"
+            } else {
+                imagesText += "\n"
+            }
+        }
+        try imagesText.write(to: modelURL.appendingPathComponent("images.txt"), atomically: true, encoding: .utf8)
+
+        let points = (1...pointCount)
+            .map { pointID in
+                let point2DIndex = pointID - 1
+                let track = imageNames.count >= 2 ? "1 \(point2DIndex) 2 \(point2DIndex)" : "1 \(point2DIndex)"
+                return "\(pointID) 0 0 1 128 128 128 1.0 \(track)"
+            }
+            .joined(separator: "\n")
+        try (points + "\n").write(to: modelURL.appendingPathComponent("points3D.txt"), atomically: true, encoding: .utf8)
+    }
+
     private func downsampleMapAnythingNamesUniform(_ names: [String], targetCount: Int) -> [String] {
         guard !names.isEmpty else { return [] }
         let cappedTarget = max(1, min(names.count, targetCount))
@@ -2315,6 +2740,7 @@ final class PipelineIntegrationTests: XCTestCase {
 
     private func makeToolchain(
         root: URL,
+        createDa3Files: Bool = false,
         createMapAnythingFiles: Bool = true,
         createVggtFiles: Bool = false
     ) throws -> ToolchainPaths {
@@ -2338,6 +2764,7 @@ final class PipelineIntegrationTests: XCTestCase {
         let colmap = try writeStub("colmap")
         let brush = try writeStub("brush")
 
+        let da3 = try TestToolchains.da3Toolchain(root: toolchainRoot, createFiles: createDa3Files)
         let mapanything = try TestToolchains.mapAnythingToolchain(root: toolchainRoot, createFiles: createMapAnythingFiles)
         let vggt = try TestToolchains.vggtToolchain(root: toolchainRoot, createFiles: createVggtFiles)
         let fastvggt = try TestToolchains.fastVggtToolchain(root: toolchainRoot, createFiles: createVggtFiles)
@@ -2346,10 +2773,19 @@ final class PipelineIntegrationTests: XCTestCase {
             colmap: colmap,
             glomap: colmap,
             brush: brush,
+            da3: da3,
             mapanything: mapanything,
             vggt: vggt,
             fastvggt: fastvggt
         )
+    }
+
+    private func makeTempRoot() -> URL {
+        let temp = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        addTeardownBlock {
+            try? FileManager.default.removeItem(at: temp)
+        }
+        return temp
     }
 }
 
@@ -2383,7 +2819,7 @@ private final class RunStartMarkerProbe: @unchecked Sendable {
     }
 }
 
-private final class CancellationOnFastVggtRunner: @unchecked Sendable, SubprocessRunning {
+private final class CancellationOnSfmRunner: @unchecked Sendable, SubprocessRunning {
     private let cancelPath: String
     private let lock = NSLock()
     private var recordedCalls: [(String, [String])] = []

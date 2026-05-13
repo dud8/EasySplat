@@ -16,15 +16,32 @@ extension AppModel {
             }
             return
         }
-        guard let projectURL = currentProjectURL, let splatURL = outputPlyURL else {
+        guard let projectURL = currentProjectURL else {
             shareStatusMessage = "Finish a project first, then share from this screen."
             shareStatusIsError = true
             return
         }
-        let outputState = outputFileState(at: splatURL)
-        guard outputState.exists, !outputState.isDirectory else {
-            let reason = outputState.isDirectory ? "output_is_directory" : "missing_output_file"
-            shareStatusMessage = "Could not find \(splatURL.lastPathComponent). Rebuild or reopen the project."
+        guard let splatURL = metadataOutputURL(projectURL: projectURL) else {
+            shareStatusMessage = "Finish a project first, then share from this screen."
+            shareStatusIsError = true
+            return
+        }
+        let artifactStatus = ProjectArtifactValidator.validatePlyFile(at: splatURL)
+        guard artifactStatus == .valid else {
+            let outputState = outputFileState(at: splatURL)
+            let reason: String
+            if outputState.isDirectory {
+                reason = "output_is_directory"
+            } else if outputState.exists {
+                reason = "invalid_output_file"
+            } else {
+                reason = "missing_output_file"
+            }
+            if reason == "missing_output_file" {
+                shareStatusMessage = "Could not find \(splatURL.lastPathComponent). Rebuild or reopen the project."
+            } else {
+                shareStatusMessage = "Could not open \(splatURL.lastPathComponent). Rebuild or reopen the project."
+            }
             shareStatusIsError = true
             appendShareEvent(
                 name: "share_unavailable",

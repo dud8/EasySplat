@@ -459,6 +459,105 @@ final class ToolchainManagerDownloadTests: XCTestCase {
         }
     }
 
+    func testEnsureToolchainRedownloadsModelsInsteadOfTrustingInstalledState() async throws {
+        try await withEnvironmentAsync(["EASYSPLAT_LOCAL_TOOLCHAIN_ROOT": nil]) {
+            let token = UUID().uuidString
+            let version = "8.8.8-\(UUID().uuidString)"
+            let manifestURL = tokenizedURL("https://example.com/manifest.json", token: token)
+            let coreURL = tokenizedURL("https://example.com/core.zip", token: token)
+            let modelsURL = tokenizedURL("https://example.com/models.zip", token: token)
+            let coreData = Data("core-zip".utf8)
+            let modelsData = Data("models-zip".utf8)
+            let coreHash = SHA256.hash(data: coreData).map { String(format: "%02x", $0) }.joined()
+            let modelsHash = SHA256.hash(data: modelsData).map { String(format: "%02x", $0) }.joined()
+            let coreArtifact = ToolchainManifest.Artifact(
+                name: "macos-arm64-core",
+                url: coreURL.absoluteString,
+                sha256: coreHash,
+                sizeBytes: UInt64(coreData.count),
+                contents: ["bin/colmap"]
+            )
+            let modelsArtifact = ToolchainManifest.Artifact(
+                name: "macos-arm64-models",
+                url: modelsURL.absoluteString,
+                sha256: modelsHash,
+                sizeBytes: UInt64(modelsData.count),
+                contents: [
+                    "da3_mps/models/DA3-BASE/model.safetensors",
+                    "da3_mps/models/DA3-BASE/config.json",
+                    "da3_mps/models/DA3-BASE/easysplat_model_info.json",
+                    "da3_mps/models/DA3-SMALL/model.safetensors",
+                    "da3_mps/models/DA3-SMALL/config.json",
+                    "da3_mps/models/DA3-SMALL/easysplat_model_info.json",
+                    "mapanything_mps/models/map-anything-apache/model.safetensors",
+                    "mapanything_mps/models/map-anything-apache/config.json",
+                    "mapanything_mps/models/dinov2/dinov2_vitg14_pretrain.pth",
+                    "vggt_mps/models/vggt_model.pt",
+                    "fastvggt_mps/models/fastvggt_model.pt"
+                ]
+            )
+            let signed = try signedManifest(version: version, artifacts: [coreArtifact, modelsArtifact])
+
+            let bootstrapManager = ToolchainManager(runner: MockSubprocessRunner(scripts: []), urlSession: makeSession())
+            let versionedRoot = bootstrapManager.toolchainRoot().appendingPathComponent(version, isDirectory: true)
+            try? FileManager.default.removeItem(at: versionedRoot)
+            defer { try? FileManager.default.removeItem(at: versionedRoot) }
+            let fixture = try ToolchainFixtureBuilder.createToolchain(at: versionedRoot)
+            let state = ToolchainManager.ToolchainInstallState(installedArtifacts: [modelsArtifact.name: modelsArtifact.sha256])
+            let stateData = try JSONEncoder().encode(state)
+            try stateData.write(to: versionedRoot.appendingPathComponent(".easysplat_toolchain_state.json"))
+            try "tampered".write(to: fixture.da3ModelFile, atomically: true, encoding: .utf8)
+            try removeInstalledCore(at: versionedRoot)
+
+            let modelRequestCounter = LockedCounter()
+            MockURLProtocol.register(token: token) { request in
+                if request.url == manifestURL {
+                    let response = HTTPURLResponse(url: request.url!, statusCode: 200, httpVersion: nil, headerFields: nil)!
+                    return (response, signed.data)
+                }
+                if request.url == coreURL {
+                    let response = HTTPURLResponse(url: request.url!, statusCode: 200, httpVersion: nil, headerFields: nil)!
+                    return (response, coreData)
+                }
+                if request.url == modelsURL {
+                    _ = modelRequestCounter.increment()
+                    let response = HTTPURLResponse(url: request.url!, statusCode: 200, httpVersion: nil, headerFields: nil)!
+                    return (response, modelsData)
+                }
+                let response = HTTPURLResponse(url: request.url!, statusCode: 404, httpVersion: nil, headerFields: nil)!
+                return (response, Data())
+            }
+            defer { MockURLProtocol.unregister(token: token) }
+
+            let unzipScript = MockSubprocessRunner.Script(
+                path: "/usr/bin/unzip",
+                argsPrefix: ["-o"],
+                result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""),
+                onRun: { args in
+                    guard let destinationFlag = args.firstIndex(of: "-d"),
+                          args.indices.contains(destinationFlag + 1) else { return }
+                    let destination = URL(fileURLWithPath: args[destinationFlag + 1], isDirectory: true)
+                    _ = try? ToolchainFixtureBuilder.createToolchain(at: destination)
+                }
+            )
+            let runner = MockSubprocessRunner(scripts: [
+                unzipScript,
+                unzipScript
+            ] + validationScripts(for: fixture))
+            let manager = ToolchainManager(runner: runner, urlSession: makeSession())
+
+            let toolchain = try await manager.ensureToolchain(
+                manifestURL: manifestURL,
+                publicKeyBase64: signed.publicKey,
+                targetName: "macos-arm64",
+                onProgress: { _, _ in }
+            )
+
+            XCTAssertEqual(toolchain.root.path, versionedRoot.path)
+            XCTAssertEqual(modelRequestCounter.current(), 1)
+        }
+    }
+
     func testEnsureArtifactFailsWhenExpectedContentsMissing() async throws {
         let root = try TestFileBuilder.makeTempDir()
         defer { try? FileManager.default.removeItem(at: root) }
@@ -658,6 +757,18 @@ final class ToolchainManagerDownloadTests: XCTestCase {
             ),
             .init(
                 path: "/usr/bin/file",
+                argsPrefix: ["-b", fixture.da3Python.path],
+                result: .init(exitCode: 0, terminationReason: .exit, stdout: "Mach-O 64-bit executable arm64", stderr: ""),
+                onRun: nil
+            ),
+            .init(
+                path: fixture.da3SfmTool.path,
+                argsPrefix: ["--help"],
+                result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""),
+                onRun: nil
+            ),
+            .init(
+                path: "/usr/bin/file",
                 argsPrefix: ["-b", fixture.mapanythingPython.path],
                 result: .init(exitCode: 0, terminationReason: .exit, stdout: "Mach-O 64-bit executable arm64", stderr: ""),
                 onRun: nil
@@ -693,6 +804,36 @@ final class ToolchainManagerDownloadTests: XCTestCase {
                 onRun: nil
             )
         ]
+    }
+
+    private func removeInstalledCore(at root: URL) throws {
+        let relativePaths = [
+            "bin",
+            "lib",
+            "da3_mps/bin",
+            "da3_mps/python",
+            "da3_mps/build_info.json",
+            "da3_mps/vendor",
+            "da3_mps/app",
+            "mapanything_mps/bin",
+            "mapanything_mps/python",
+            "mapanything_mps/build_info.json",
+            "mapanything_mps/vendor",
+            "mapanything_mps/app",
+            "vggt_mps/bin",
+            "vggt_mps/python",
+            "vggt_mps/build_info.json",
+            "vggt_mps/vendor",
+            "vggt_mps/app",
+            "fastvggt_mps/bin",
+            "fastvggt_mps/python",
+            "fastvggt_mps/build_info.json",
+            "fastvggt_mps/vendor",
+            "fastvggt_mps/app"
+        ]
+        for path in relativePaths {
+            try? FileManager.default.removeItem(at: root.appendingPathComponent(path))
+        }
     }
 
     private func signedManifest(version: String, artifacts: [ToolchainManifest.Artifact]) throws -> (manifest: ToolchainManifest, publicKey: String, data: Data) {

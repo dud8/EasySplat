@@ -164,6 +164,7 @@ extension PipelineRunner {
         var copied = 0
         for group in groups {
             for frame in group.frames {
+                try Task.checkCancellation()
                 let sourceExt = frame.pathExtension.lowercased()
                 let destExt: String = {
                     if sourceExt.isEmpty { return "jpg" }
@@ -246,15 +247,14 @@ extension PipelineRunner {
         paths: ProjectPaths,
         progress: (Double, String) -> Void
     ) throws {
-        let fm = FileManager.default
         var tasks: [(label: String, action: () throws -> Void)] = []
 
         let importedVideos = importedVideoURLs(for: metadata.input.videoFiles, paths: paths)
         for (file, dest) in zip(metadata.input.videoFiles, importedVideos) {
             let source = URL(fileURLWithPath: file)
             tasks.append((label: dest.lastPathComponent, action: {
-                if !fm.fileExists(atPath: dest.path) {
-                    try fm.copyItem(at: source, to: dest)
+                if try self.importedVideoNeedsCopy(dest) {
+                    try self.copyFileAtomically(from: source, to: dest)
                 }
             }))
         }
@@ -263,8 +263,8 @@ extension PipelineRunner {
             let sourceFolder = URL(fileURLWithPath: photosFolder)
             let dest = paths.originalsURL.appendingPathComponent(sourceFolder.lastPathComponent)
             tasks.append((label: "Photos: \(sourceFolder.lastPathComponent)", action: {
-                if !fm.fileExists(atPath: dest.path) {
-                    try fm.copyItem(at: sourceFolder, to: dest)
+                if try self.importedPhotoFolderNeedsCopy(source: sourceFolder, destination: dest) {
+                    try self.copyDirectoryAtomically(from: sourceFolder, to: dest)
                 }
             }))
         }
@@ -272,6 +272,7 @@ extension PipelineRunner {
         guard !tasks.isEmpty else { return }
         let total = tasks.count
         for (index, task) in tasks.enumerated() {
+            try Task.checkCancellation()
             let message = "Copying input \(index + 1)/\(total): \(task.label)"
             let startFraction = Double(index) / Double(total)
             progress(startFraction, message)
@@ -285,6 +286,7 @@ extension PipelineRunner {
         let fm = FileManager.default
         var output: [URL] = []
         for (index, url) in frames.enumerated() {
+            try Task.checkCancellation()
             let sourceExt = url.pathExtension.lowercased()
             let destExt: String = {
                 if sourceExt.isEmpty { return "jpg" }
@@ -301,6 +303,63 @@ extension PipelineRunner {
             output.append(dest)
         }
         return output
+    }
+
+    func importedVideoNeedsCopy(_ destination: URL) throws -> Bool {
+        let fm = FileManager.default
+        guard fm.fileExists(atPath: destination.path) else { return true }
+        let size = (try? fm.attributesOfItem(atPath: destination.path)[.size] as? NSNumber)?.int64Value ?? 0
+        return size <= 0
+    }
+
+    func importedPhotoFolderNeedsCopy(source: URL, destination: URL) throws -> Bool {
+        let fm = FileManager.default
+        guard fm.fileExists(atPath: destination.path) else { return true }
+        let importedPhotos = try loadPhotos(in: destination)
+        guard !importedPhotos.isEmpty else { return true }
+        if fm.fileExists(atPath: source.path) {
+            let sourcePhotos = try loadPhotos(in: source)
+            return importedPhotos.count != sourcePhotos.count
+        }
+        return false
+    }
+
+    func copyFileAtomically(from source: URL, to destination: URL) throws {
+        let fm = FileManager.default
+        try fm.createDirectory(at: destination.deletingLastPathComponent(), withIntermediateDirectories: true)
+        let temp = destination.deletingLastPathComponent()
+            .appendingPathComponent(".\(destination.lastPathComponent).\(UUID().uuidString).tmp")
+        defer {
+            if fm.fileExists(atPath: temp.path) {
+                try? fm.removeItem(at: temp)
+            }
+        }
+
+        try fm.copyItem(at: source, to: temp)
+        if fm.fileExists(atPath: destination.path) {
+            _ = try fm.replaceItemAt(destination, withItemAt: temp, backupItemName: nil, options: [])
+        } else {
+            try fm.moveItem(at: temp, to: destination)
+        }
+    }
+
+    func copyDirectoryAtomically(from source: URL, to destination: URL) throws {
+        let fm = FileManager.default
+        try fm.createDirectory(at: destination.deletingLastPathComponent(), withIntermediateDirectories: true)
+        let temp = destination.deletingLastPathComponent()
+            .appendingPathComponent(".\(destination.lastPathComponent).\(UUID().uuidString).tmp", isDirectory: true)
+        defer {
+            if fm.fileExists(atPath: temp.path) {
+                try? fm.removeItem(at: temp)
+            }
+        }
+
+        try fm.copyItem(at: source, to: temp)
+        if fm.fileExists(atPath: destination.path) {
+            _ = try fm.replaceItemAt(destination, withItemAt: temp, backupItemName: nil, options: [])
+        } else {
+            try fm.moveItem(at: temp, to: destination)
+        }
     }
 
     func rawFramesDirectory(index: Int, paths: ProjectPaths) -> URL {
@@ -364,12 +423,13 @@ extension PipelineRunner {
     func scoreSharpnessForFrames(
         _ frames: [URL],
         progress: (Double, String) -> Void
-    ) -> [URL: Double] {
+    ) throws -> [URL: Double] {
         guard !frames.isEmpty else { return [:] }
         let total = Double(frames.count)
         var results: [URL: Double] = [:]
         results.reserveCapacity(frames.count)
         for (index, url) in frames.enumerated() {
+            try Task.checkCancellation()
             if let score = try? FrameScoring.scoreFrame(at: url) {
                 results[url] = max(score.blurScore, score.laplacianScore)
             }
@@ -379,6 +439,40 @@ extension PipelineRunner {
             }
         }
         return results
+    }
+
+    func applyFrameBudget(to groups: [SelectedFrameGroup], targetCount: Int) -> [SelectedFrameGroup] {
+        guard targetCount > 0 else { return [] }
+        let total = groups.reduce(0) { $0 + $1.frames.count }
+        guard total > targetCount else { return groups }
+
+        struct FrameEntry {
+            let groupIndex: Int
+            let url: URL
+        }
+
+        let flattened = groups.enumerated().flatMap { groupIndex, group in
+            group.frames.map { FrameEntry(groupIndex: groupIndex, url: $0) }
+        }
+        guard targetCount > 1 else {
+            let entry = flattened[flattened.count / 2]
+            let group = groups[entry.groupIndex]
+            return [SelectedFrameGroup(id: group.id, frames: [entry.url], isVideo: group.isVideo)]
+        }
+
+        let step = Double(flattened.count - 1) / Double(targetCount - 1)
+        var selectedByGroup = Array(repeating: [URL](), count: groups.count)
+        for index in 0..<targetCount {
+            let position = Int(round(Double(index) * step))
+            let entry = flattened[position]
+            selectedByGroup[entry.groupIndex].append(entry.url)
+        }
+
+        return groups.enumerated().compactMap { index, group in
+            let frames = selectedByGroup[index]
+            guard !frames.isEmpty else { return nil }
+            return SelectedFrameGroup(id: group.id, frames: frames, isVideo: group.isVideo)
+        }
     }
 
     func filterVeryBlurryVideoFrames(

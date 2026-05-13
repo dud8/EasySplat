@@ -42,6 +42,80 @@ extension ToolchainManager {
             throw ToolchainError.invalidToolchain("Brush failed to launch (exit \(brushCheck.exitCode)).")
         }
 
+        let da3Root = root.appendingPathComponent("da3_mps", isDirectory: true)
+        let da3SfmTool = da3Root.appendingPathComponent("bin/easysplat_da3_sfm")
+        let da3Python = da3Root.appendingPathComponent("python/bin/python3")
+        let da3BuildInfo = da3Root.appendingPathComponent("build_info.json")
+        let da3AppSentinel = da3Root.appendingPathComponent("app/easysplat_da3_sfm/run.py")
+        let da3Models = da3Root.appendingPathComponent("models", isDirectory: true)
+        let da3ModelBundle = da3Models.appendingPathComponent("DA3-BASE", isDirectory: true)
+        let da3FallbackModelBundle = da3Models.appendingPathComponent("DA3-SMALL", isDirectory: true)
+        let da3BaseModelFile = da3ModelBundle.appendingPathComponent("model.safetensors")
+        let da3BaseConfigFile = da3ModelBundle.appendingPathComponent("config.json")
+        let da3BaseModelInfoFile = da3ModelBundle.appendingPathComponent("easysplat_model_info.json")
+        let da3SmallModelFile = da3FallbackModelBundle.appendingPathComponent("model.safetensors")
+        let da3SmallConfigFile = da3FallbackModelBundle.appendingPathComponent("config.json")
+        let da3SmallModelInfoFile = da3FallbackModelBundle.appendingPathComponent("easysplat_model_info.json")
+        let da3VendorSentinel = da3Root.appendingPathComponent("vendor/depth-anything-3/src/depth_anything_3/api.py")
+
+        if shouldRequireDa3ForToolchainValidation() {
+            guard fileManager.fileExists(atPath: da3SfmTool.path) else {
+                throw ToolchainError.missingBinary("da3_mps/bin/easysplat_da3_sfm")
+            }
+            guard fileManager.fileExists(atPath: da3Python.path) else {
+                throw ToolchainError.missingBinary("da3_mps/python/bin/python3")
+            }
+            guard fileManager.fileExists(atPath: da3BuildInfo.path) else {
+                throw ToolchainError.missingLibrary("da3_mps/build_info.json")
+            }
+            guard fileManager.fileExists(atPath: da3AppSentinel.path) else {
+                throw ToolchainError.missingLibrary("da3_mps/app/easysplat_da3_sfm/run.py")
+            }
+            guard fileManager.fileExists(atPath: da3Models.path) else {
+                throw ToolchainError.missingLibrary("da3_mps/models")
+            }
+            guard fileManager.fileExists(atPath: da3BaseModelFile.path) else {
+                throw ToolchainError.missingLibrary("da3_mps/models/DA3-BASE/model.safetensors")
+            }
+            guard fileManager.fileExists(atPath: da3BaseConfigFile.path) else {
+                throw ToolchainError.missingLibrary("da3_mps/models/DA3-BASE/config.json")
+            }
+            guard fileManager.fileExists(atPath: da3BaseModelInfoFile.path) else {
+                throw ToolchainError.missingLibrary("da3_mps/models/DA3-BASE/easysplat_model_info.json")
+            }
+            guard fileManager.fileExists(atPath: da3SmallModelFile.path) else {
+                throw ToolchainError.missingLibrary("da3_mps/models/DA3-SMALL/model.safetensors")
+            }
+            guard fileManager.fileExists(atPath: da3SmallConfigFile.path) else {
+                throw ToolchainError.missingLibrary("da3_mps/models/DA3-SMALL/config.json")
+            }
+            guard fileManager.fileExists(atPath: da3SmallModelInfoFile.path) else {
+                throw ToolchainError.missingLibrary("da3_mps/models/DA3-SMALL/easysplat_model_info.json")
+            }
+            guard fileManager.fileExists(atPath: da3VendorSentinel.path) else {
+                throw ToolchainError.missingLibrary("da3_mps/vendor/depth-anything-3")
+            }
+
+            ensureExecutable(at: da3SfmTool)
+            ensureExecutable(at: da3Python)
+            try validateBuildInfo(at: da3BuildInfo, expectedToolchainName: "da3_mps")
+
+            try requireArm64Binary(at: da3Python, label: "da3_mps python")
+            let da3Check = try runner.run(da3SfmTool.path, ["--help"])
+            guard da3Check.exitCode == 0 else {
+                throw ToolchainError.invalidToolchain("da3_mps failed to launch (exit \(da3Check.exitCode)).")
+            }
+        }
+
+        let da3 = Da3Toolchain(
+            root: da3Root,
+            sfmTool: da3SfmTool,
+            python: da3Python,
+            models: da3Models,
+            modelBundle: da3ModelBundle,
+            fallbackModelBundle: da3FallbackModelBundle
+        )
+
         let mapAnythingRoot = root.appendingPathComponent("mapanything_mps", isDirectory: true)
         let mapAnythingSfmTool = mapAnythingRoot.appendingPathComponent("bin/easysplat_mapanything_sfm")
         let mapAnythingPython = mapAnythingRoot.appendingPathComponent("python/bin/python3")
@@ -204,6 +278,7 @@ extension ToolchainManager {
             colmap: colmap,
             glomap: glomap,
             brush: brush,
+            da3: da3,
             mapanything: mapanything,
             vggt: vggt,
             fastvggt: fastvggt
@@ -214,6 +289,19 @@ extension ToolchainManager {
         guard fileManager.fileExists(atPath: url.path) else { return }
         if fileManager.isExecutableFile(atPath: url.path) { return }
         try? fileManager.setAttributes([.posixPermissions: 0o755], ofItemAtPath: url.path)
+    }
+
+    func shouldRequireDa3ForToolchainValidation() -> Bool {
+        guard let raw = ProcessInfo.processInfo.environment["EASYSPLAT_SFM_BACKEND"]?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased(),
+              !raw.isEmpty else {
+            return true
+        }
+        switch raw {
+        case "mapanything", "colmap", "glomap", "global_mapper", "vggt", "vggt-mps", "fastvggt":
+            return false
+        default:
+            return true
+        }
     }
 
     func validateBuildInfo(at url: URL, expectedToolchainName: String) throws {
@@ -317,6 +405,12 @@ extension ToolchainManager {
         let brushReal = root.appendingPathComponent("bin/brush.real")
         let libcrypto = root.appendingPathComponent("lib/libcrypto.3.dylib")
         let libssl = root.appendingPathComponent("lib/libssl.3.dylib")
+        let da3 = root.appendingPathComponent("da3_mps", isDirectory: true)
+        let da3SfmTool = da3.appendingPathComponent("bin/easysplat_da3_sfm")
+        let da3Python = da3.appendingPathComponent("python/bin/python3")
+        let da3BuildInfo = da3.appendingPathComponent("build_info.json")
+        let da3AppSentinel = da3.appendingPathComponent("app/easysplat_da3_sfm/run.py")
+        let da3VendorSentinel = da3.appendingPathComponent("vendor/depth-anything-3/src/depth_anything_3/api.py")
         let vggt = root.appendingPathComponent("vggt_mps", isDirectory: true)
         let vggtSfmTool = vggt.appendingPathComponent("bin/easysplat_vggt_sfm")
         let vggtPython = vggt.appendingPathComponent("python/bin/python3")
@@ -348,6 +442,11 @@ extension ToolchainManager {
             && brushOK
             && fileManager.fileExists(atPath: libcrypto.path)
             && fileManager.fileExists(atPath: libssl.path)
+            && fileManager.fileExists(atPath: da3SfmTool.path)
+            && fileManager.fileExists(atPath: da3Python.path)
+            && fileManager.fileExists(atPath: da3BuildInfo.path)
+            && fileManager.fileExists(atPath: da3AppSentinel.path)
+            && fileManager.fileExists(atPath: da3VendorSentinel.path)
             && fileManager.fileExists(atPath: mapAnythingSfmTool.path)
             && fileManager.fileExists(atPath: mapAnythingPython.path)
             && fileManager.fileExists(atPath: mapAnythingBuildInfo.path)
@@ -372,6 +471,18 @@ extension ToolchainManager {
             .appendingPathComponent("mapanything_mps/models/map-anything-apache/config.json")
         let mapAnythingDinov2 = root
             .appendingPathComponent("mapanything_mps/models/dinov2/dinov2_vitg14_pretrain.pth")
+        let da3BaseModel = root
+            .appendingPathComponent("da3_mps/models/DA3-BASE/model.safetensors")
+        let da3BaseConfig = root
+            .appendingPathComponent("da3_mps/models/DA3-BASE/config.json")
+        let da3BaseInfo = root
+            .appendingPathComponent("da3_mps/models/DA3-BASE/easysplat_model_info.json")
+        let da3SmallModel = root
+            .appendingPathComponent("da3_mps/models/DA3-SMALL/model.safetensors")
+        let da3SmallConfig = root
+            .appendingPathComponent("da3_mps/models/DA3-SMALL/config.json")
+        let da3SmallInfo = root
+            .appendingPathComponent("da3_mps/models/DA3-SMALL/easysplat_model_info.json")
         let vggtModel = root
             .appendingPathComponent("vggt_mps/models/vggt_model.pt")
         let fastvggtModel = root
@@ -379,6 +490,12 @@ extension ToolchainManager {
         return fileManager.fileExists(atPath: mapAnythingModel.path)
             && fileManager.fileExists(atPath: mapAnythingConfig.path)
             && fileManager.fileExists(atPath: mapAnythingDinov2.path)
+            && fileManager.fileExists(atPath: da3BaseModel.path)
+            && fileManager.fileExists(atPath: da3BaseConfig.path)
+            && fileManager.fileExists(atPath: da3BaseInfo.path)
+            && fileManager.fileExists(atPath: da3SmallModel.path)
+            && fileManager.fileExists(atPath: da3SmallConfig.path)
+            && fileManager.fileExists(atPath: da3SmallInfo.path)
             && fileManager.fileExists(atPath: vggtModel.path)
             && fileManager.fileExists(atPath: fastvggtModel.path)
     }

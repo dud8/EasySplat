@@ -142,6 +142,23 @@ public final class SubprocessRunner: @unchecked Sendable, SubprocessRunning, Pse
         stdoutPipe.fileHandleForReading.readabilityHandler = nil
         stderrPipe.fileHandleForReading.readabilityHandler = nil
 
+        let remainingStdoutData = stdoutPipe.fileHandleForReading.readDataToEndOfFile()
+        if !remainingStdoutData.isEmpty {
+            let text = stdoutDecoder.decode(remainingStdoutData)
+            if !text.isEmpty {
+                collectedOut.append(text)
+                stdoutLines.append(text).forEach { line in onStdout(line) }
+            }
+        }
+        let remainingStderrData = stderrPipe.fileHandleForReading.readDataToEndOfFile()
+        if !remainingStderrData.isEmpty {
+            let text = stderrDecoder.decode(remainingStderrData)
+            if !text.isEmpty {
+                collectedErr.append(text)
+                stderrLines.append(text).forEach { line in onStderr(line) }
+            }
+        }
+
         if let remaining = stdoutDecoder.flush(), !remaining.isEmpty {
             collectedOut.append(remaining)
             stdoutLines.append(remaining).forEach { line in onStdout(line) }
@@ -219,6 +236,55 @@ public final class SubprocessRunner: @unchecked Sendable, SubprocessRunning, Pse
             stderrLines.append(text).forEach { line in onStderr(line) }
         }
 
+        let completion = SubprocessAsyncCompletion()
+        process.terminationHandler = { proc in
+            stdoutPipe.fileHandleForReading.readabilityHandler = nil
+            stderrPipe.fileHandleForReading.readabilityHandler = nil
+            try? stdoutPipe.fileHandleForWriting.close()
+            try? stderrPipe.fileHandleForWriting.close()
+
+            let remainingStdoutData = stdoutPipe.fileHandleForReading.readDataToEndOfFile()
+            if !remainingStdoutData.isEmpty {
+                let text = stdoutDecoder.decode(remainingStdoutData)
+                if !text.isEmpty {
+                    collectedOut.append(text)
+                    stdoutLines.append(text).forEach { line in onStdout(line) }
+                }
+            }
+            let remainingStderrData = stderrPipe.fileHandleForReading.readDataToEndOfFile()
+            if !remainingStderrData.isEmpty {
+                let text = stderrDecoder.decode(remainingStderrData)
+                if !text.isEmpty {
+                    collectedErr.append(text)
+                    stderrLines.append(text).forEach { line in onStderr(line) }
+                }
+            }
+
+            if let remaining = stdoutDecoder.flush(), !remaining.isEmpty {
+                collectedOut.append(remaining)
+                stdoutLines.append(remaining).forEach { line in onStdout(line) }
+            }
+            if let remaining = stderrDecoder.flush(), !remaining.isEmpty {
+                collectedErr.append(remaining)
+                stderrLines.append(remaining).forEach { line in onStderr(line) }
+            }
+
+            if let remaining = stdoutLines.flush() {
+                onStdout(remaining)
+            }
+            if let remaining = stderrLines.flush() {
+                onStderr(remaining)
+            }
+            try? stdoutPipe.fileHandleForReading.close()
+            try? stderrPipe.fileHandleForReading.close()
+            completion.finish(.success(SubprocessResult(
+                exitCode: proc.terminationStatus,
+                terminationReason: proc.terminationReason,
+                stdout: collectedOut.value(),
+                stderr: collectedErr.value()
+            )))
+        }
+
         do {
             try process.run()
         } catch {
@@ -228,42 +294,12 @@ public final class SubprocessRunner: @unchecked Sendable, SubprocessRunning, Pse
             try? stderrPipe.fileHandleForReading.close()
             try? stdoutPipe.fileHandleForWriting.close()
             try? stderrPipe.fileHandleForWriting.close()
+            completion.finish(.failure(error))
             throw error
         }
 
         let result = try await withTaskCancellationHandler(operation: {
-            try await withCheckedThrowingContinuation { continuation in
-                process.terminationHandler = { proc in
-                    stdoutPipe.fileHandleForReading.readabilityHandler = nil
-                    stderrPipe.fileHandleForReading.readabilityHandler = nil
-
-                    if let remaining = stdoutDecoder.flush(), !remaining.isEmpty {
-                        collectedOut.append(remaining)
-                        stdoutLines.append(remaining).forEach { line in onStdout(line) }
-                    }
-                    if let remaining = stderrDecoder.flush(), !remaining.isEmpty {
-                        collectedErr.append(remaining)
-                        stderrLines.append(remaining).forEach { line in onStderr(line) }
-                    }
-
-                    if let remaining = stdoutLines.flush() {
-                        onStdout(remaining)
-                    }
-                    if let remaining = stderrLines.flush() {
-                        onStderr(remaining)
-                    }
-                    try? stdoutPipe.fileHandleForReading.close()
-                    try? stderrPipe.fileHandleForReading.close()
-                    try? stdoutPipe.fileHandleForWriting.close()
-                    try? stderrPipe.fileHandleForWriting.close()
-                    continuation.resume(returning: SubprocessResult(
-                        exitCode: proc.terminationStatus,
-                        terminationReason: proc.terminationReason,
-                        stdout: collectedOut.value(),
-                        stderr: collectedErr.value()
-                    ))
-                }
-            }
+            try await completion.wait()
         }, onCancel: {
             if process.isRunning {
                 Self.requestGracefulTermination(process)
@@ -308,8 +344,7 @@ public final class SubprocessRunner: @unchecked Sendable, SubprocessRunning, Pse
         let stdoutDecoder = Utf8StreamDecoder()
         let stderrDecoder = Utf8StreamDecoder()
 
-        stdoutTTY.masterHandle.readabilityHandler = { handle in
-            let data = handle.availableData
+        @Sendable func appendStdoutData(_ data: Data) {
             guard !data.isEmpty else { return }
             let text = stdoutDecoder.decode(data)
             guard !text.isEmpty else { return }
@@ -317,13 +352,55 @@ public final class SubprocessRunner: @unchecked Sendable, SubprocessRunning, Pse
             stdoutLines.append(text).forEach { line in onStdout(line) }
         }
 
-        stderrTTY.masterHandle.readabilityHandler = { handle in
-            let data = handle.availableData
+        @Sendable func appendStderrData(_ data: Data) {
             guard !data.isEmpty else { return }
             let text = stderrDecoder.decode(data)
             guard !text.isEmpty else { return }
             collectedErr.append(text)
             stderrLines.append(text).forEach { line in onStderr(line) }
+        }
+
+        stdoutTTY.masterHandle.readabilityHandler = { handle in
+            appendStdoutData(handle.availableData)
+        }
+
+        stderrTTY.masterHandle.readabilityHandler = { handle in
+            appendStderrData(handle.availableData)
+        }
+
+        let completion = SubprocessAsyncCompletion()
+        process.terminationHandler = { proc in
+            stdoutTTY.masterHandle.readabilityHandler = nil
+            stderrTTY.masterHandle.readabilityHandler = nil
+
+            appendStdoutData(Self.drainAvailablePseudoTTYData(from: stdoutTTY.masterHandle))
+            appendStderrData(Self.drainAvailablePseudoTTYData(from: stderrTTY.masterHandle))
+
+            if let remaining = stdoutDecoder.flush(), !remaining.isEmpty {
+                collectedOut.append(remaining)
+                stdoutLines.append(remaining).forEach { line in onStdout(line) }
+            }
+            if let remaining = stderrDecoder.flush(), !remaining.isEmpty {
+                collectedErr.append(remaining)
+                stderrLines.append(remaining).forEach { line in onStderr(line) }
+            }
+
+            if let remaining = stdoutLines.flush() {
+                onStdout(remaining)
+            }
+            if let remaining = stderrLines.flush() {
+                onStderr(remaining)
+            }
+
+            stdoutTTY.masterHandle.closeFile()
+            stderrTTY.masterHandle.closeFile()
+
+            completion.finish(.success(SubprocessResult(
+                exitCode: proc.terminationStatus,
+                terminationReason: proc.terminationReason,
+                stdout: collectedOut.value(),
+                stderr: collectedErr.value()
+            )))
         }
 
         do {
@@ -335,44 +412,14 @@ public final class SubprocessRunner: @unchecked Sendable, SubprocessRunning, Pse
             stderrTTY.masterHandle.closeFile()
             stdoutTTY.slaveHandle.closeFile()
             stderrTTY.slaveHandle.closeFile()
+            completion.finish(.failure(error))
             throw error
         }
         stdoutTTY.slaveHandle.closeFile()
         stderrTTY.slaveHandle.closeFile()
 
         let result = try await withTaskCancellationHandler(operation: {
-            try await withCheckedThrowingContinuation { continuation in
-                process.terminationHandler = { proc in
-                    stdoutTTY.masterHandle.readabilityHandler = nil
-                    stderrTTY.masterHandle.readabilityHandler = nil
-
-                    if let remaining = stdoutDecoder.flush(), !remaining.isEmpty {
-                        collectedOut.append(remaining)
-                        stdoutLines.append(remaining).forEach { line in onStdout(line) }
-                    }
-                    if let remaining = stderrDecoder.flush(), !remaining.isEmpty {
-                        collectedErr.append(remaining)
-                        stderrLines.append(remaining).forEach { line in onStderr(line) }
-                    }
-
-                    if let remaining = stdoutLines.flush() {
-                        onStdout(remaining)
-                    }
-                    if let remaining = stderrLines.flush() {
-                        onStderr(remaining)
-                    }
-
-                    stdoutTTY.masterHandle.closeFile()
-                    stderrTTY.masterHandle.closeFile()
-
-                    continuation.resume(returning: SubprocessResult(
-                        exitCode: proc.terminationStatus,
-                        terminationReason: proc.terminationReason,
-                        stdout: collectedOut.value(),
-                        stderr: collectedErr.value()
-                    ))
-                }
-            }
+            try await completion.wait()
         }, onCancel: {
             if process.isRunning {
                 Self.requestGracefulTermination(process)
@@ -399,6 +446,46 @@ public final class SubprocessRunner: @unchecked Sendable, SubprocessRunning, Pse
 
 #if canImport(Darwin)
 private extension SubprocessRunner {
+    static func drainAvailablePseudoTTYData(from handle: FileHandle) -> Data {
+        let fd = handle.fileDescriptor
+        let flags = fcntl(fd, F_GETFL)
+        let didSetNonblocking = flags >= 0 && fcntl(fd, F_SETFL, flags | O_NONBLOCK) == 0
+        defer {
+            if didSetNonblocking {
+                _ = fcntl(fd, F_SETFL, flags)
+            }
+        }
+
+        var output = Data()
+        var buffer = [UInt8](repeating: 0, count: 16 * 1024)
+        let deadline = Date().addingTimeInterval(0.1)
+        while true {
+            let count = buffer.withUnsafeMutableBytes { pointer in
+                read(fd, pointer.baseAddress, pointer.count)
+            }
+            if count > 0 {
+                output.append(contentsOf: buffer.prefix(count))
+                continue
+            }
+            if count == 0 {
+                break
+            }
+            if errno == EINTR {
+                continue
+            }
+            if errno == EAGAIN || errno == EWOULDBLOCK {
+                guard Date() < deadline else { break }
+                usleep(1_000)
+                continue
+            }
+            if errno == EIO {
+                break
+            }
+            break
+        }
+        return output
+    }
+
     static func requestGracefulTermination(_ process: Process) {
         guard process.isRunning else { return }
         let pid = process.processIdentifier
@@ -449,13 +536,53 @@ private struct PseudoTTYPair {
 }
 #endif
 
+private final class SubprocessAsyncCompletion: @unchecked Sendable {
+    private let lock = NSLock()
+    private var continuation: CheckedContinuation<SubprocessResult, Error>?
+    private var result: Result<SubprocessResult, Error>?
+
+    func wait() async throws -> SubprocessResult {
+        try await withCheckedThrowingContinuation { continuation in
+            let completed: Result<SubprocessResult, Error>?
+            lock.lock()
+            if let result {
+                completed = result
+            } else {
+                self.continuation = continuation
+                completed = nil
+            }
+            lock.unlock()
+
+            if let completed {
+                continuation.resume(with: completed)
+            }
+        }
+    }
+
+    func finish(_ result: Result<SubprocessResult, Error>) {
+        let continuation: CheckedContinuation<SubprocessResult, Error>?
+        lock.lock()
+        guard self.result == nil else {
+            lock.unlock()
+            return
+        }
+        self.result = result
+        continuation = self.continuation
+        self.continuation = nil
+        lock.unlock()
+        continuation?.resume(with: result)
+    }
+}
+
 private final class OutputBuffer: @unchecked Sendable {
+    private static let maxBytes = 1_048_576
     private let lock = NSLock()
     private var storage = ""
 
     func append(_ text: String) {
         lock.lock()
         storage += text
+        trimIfNeeded()
         lock.unlock()
     }
 
@@ -463,6 +590,12 @@ private final class OutputBuffer: @unchecked Sendable {
         lock.lock()
         defer { lock.unlock() }
         return storage
+    }
+
+    private func trimIfNeeded() {
+        if storage.utf8.count > Self.maxBytes {
+            storage = TextByteLimiter.validUTF8Suffix(storage, byteLimit: Self.maxBytes)
+        }
     }
 }
 

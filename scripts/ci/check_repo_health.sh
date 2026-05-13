@@ -38,6 +38,11 @@ if rg -n '/Users/|/home/|C:\\\\' "${public_text_files[@]}" >/dev/null; then
   exit 1
 fi
 
+if rg -n -- '(^|[[:space:]])--private-key([[:space:]]|=)' "${public_text_files[@]}" >/dev/null; then
+  echo "Public repo docs/templates pass private keys inline; use --private-key-file or --private-key-env instead." >&2
+  exit 1
+fi
+
 if rg -n 'sparkle-project/Sparkle|Sparkle.framework' \
   "$ROOT/Package.swift" \
   "$ROOT/scripts/release/build_app.sh" >/dev/null; then
@@ -53,7 +58,35 @@ if rg -n 'github.com/dud8/EasySplat|http://localhost:8000' \
   exit 1
 fi
 
+if ! rg -n 'build_da3_mps\.sh' "$ROOT/.github/workflows/toolchain-build.yml" >/dev/null; then
+  echo "Toolchain release workflow no longer builds DA3 before packaging." >&2
+  exit 1
+fi
+
+for path in "$ROOT/scripts/release/build_dmg.sh" "$ROOT/.github/workflows/toolchain-build.yml"; do
+  if ! rg -n 'refuses EASYSPLAT_ALLOW_UNPINNED_DA3_SOURCE' "$path" >/dev/null; then
+    echo "Release path no longer rejects unpinned DA3 source overrides: $path" >&2
+    exit 1
+  fi
+done
+
 if ! rg -n 'build_mapanything_mps\.sh' "$ROOT/.github/workflows/toolchain-build.yml" >/dev/null; then
-  echo "Toolchain release workflow no longer builds MapAnything before packaging." >&2
+  echo "Toolchain release workflow no longer builds MapAnything fallback before packaging." >&2
+  exit 1
+fi
+
+if rg -n '(^|[^A-Za-z0-9_])(xformers|flash[-_]attn|triton|torch[-_]scatter)([^A-Za-z0-9_]|$)' \
+  "$ROOT/Tools/Da3Sfm" \
+  "$ROOT/scripts/toolchain/build_da3_mps.sh" >/dev/null; then
+  echo "DA3 default path references a banned CUDA-oriented dependency." >&2
+  exit 1
+fi
+
+if rg -n 'DA3-(LARGE|GIANT)|DA3-NESTED|DA3NESTED|DA3-GIANT|DA3-LARGE|CC-BY-NC' \
+  "$ROOT/Tools/Da3Sfm" \
+  "$ROOT/scripts/toolchain/build_da3_mps.sh" \
+  "$ROOT/README.md" \
+  "$ROOT/ONBOARDING.md" >/dev/null; then
+  echo "DA3 default path references non-commercial weights." >&2
   exit 1
 fi

@@ -134,4 +134,65 @@ final class BrushRunnerTests: XCTestCase {
         XCTAssertTrue(captured.contains("--total-steps"))
         XCTAssertTrue(captured.contains("--export-every"))
     }
+
+    func testFindLatestExportablePlyIgnoresCompressedAndSnapshotFiles() throws {
+        let root = try TestFileBuilder.makeTempDir()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let exportOld = root.appendingPathComponent("export_00010.ply")
+        let compressedNew = root.appendingPathComponent("export_99999.compressed.ply")
+        let snapshotNew = root.appendingPathComponent("latest_snapshot.ply")
+        try TestFileBuilder.writeMinimalPly(at: exportOld)
+        try TestFileBuilder.writeMinimalPly(at: compressedNew)
+        try TestFileBuilder.writeMinimalPly(at: snapshotNew)
+        let now = Date()
+        try FileManager.default.setAttributes([.modificationDate: now.addingTimeInterval(-100)], ofItemAtPath: exportOld.path)
+        try FileManager.default.setAttributes([.modificationDate: now], ofItemAtPath: compressedNew.path)
+        try FileManager.default.setAttributes([.modificationDate: now.addingTimeInterval(100)], ofItemAtPath: snapshotNew.path)
+
+        let runner = BrushRunner(runner: MockSubprocessRunner(scripts: []))
+
+        XCTAssertEqual(
+            runner.findLatestExportablePly(in: root)?.standardizedFileURL,
+            exportOld.standardizedFileURL
+        )
+    }
+
+    func testFindLatestExportablePlyHonorsCurrentRunCutoff() throws {
+        let root = try TestFileBuilder.makeTempDir()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let historical = root.appendingPathComponent("export_35000.ply")
+        let current = root.appendingPathComponent("export_00010.ply")
+        try TestFileBuilder.writeMinimalPly(at: historical)
+        try TestFileBuilder.writeMinimalPly(at: current)
+        let base = Date().addingTimeInterval(-600)
+        try FileManager.default.setAttributes([.modificationDate: base], ofItemAtPath: historical.path)
+        try FileManager.default.setAttributes([.modificationDate: base.addingTimeInterval(300)], ofItemAtPath: current.path)
+
+        let runner = BrushRunner(runner: MockSubprocessRunner(scripts: []))
+
+        XCTAssertEqual(
+            runner.findLatestExportablePly(in: root, minModificationDate: base.addingTimeInterval(120))?.standardizedFileURL,
+            current.standardizedFileURL
+        )
+        XCTAssertNil(runner.findLatestExportablePly(in: root, minModificationDate: Date()))
+    }
+
+    func testFindLatestExportablePlyBreaksModificationTimeTieByExportStep() throws {
+        let root = try TestFileBuilder.makeTempDir()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let lowerStep = root.appendingPathComponent("export_00010.ply")
+        let higherStep = root.appendingPathComponent("export_00020.ply")
+        try TestFileBuilder.writeMinimalPly(at: lowerStep)
+        try TestFileBuilder.writeMinimalPly(at: higherStep)
+        let tiedDate = Date(timeIntervalSince1970: 1_700_000_000)
+        try FileManager.default.setAttributes([.modificationDate: tiedDate], ofItemAtPath: lowerStep.path)
+        try FileManager.default.setAttributes([.modificationDate: tiedDate], ofItemAtPath: higherStep.path)
+
+        let runner = BrushRunner(runner: MockSubprocessRunner(scripts: []))
+
+        XCTAssertEqual(
+            runner.findLatestExportablePly(in: root)?.standardizedFileURL,
+            higherStep.standardizedFileURL
+        )
+    }
 }

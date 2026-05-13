@@ -55,6 +55,7 @@ final class AppModel: ObservableObject {
     let pipelineRunnerFactory: (URL, PipelineRunner.PipelineConfig) -> PipelineRunning
     let projectBaseURL: URL?
     var currentTask: Task<Void, Never>?
+    var currentTaskToken: UUID?
     var lastProgressLogAt: Date = .distantPast
     var lastProgressLogMessage: String = ""
     var lastProgressLogStage: PipelineStage? = nil

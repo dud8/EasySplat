@@ -6,6 +6,7 @@ public final class PipelineRunner: @unchecked Sendable {
         public var colmap: ColmapRunner
         public var glomap: GlomapRunner
         public var brush: BrushRunner
+        public var da3Sfm: Da3SfmRunning
         public var mapAnythingSfm: MapAnythingSfmRunning
         public var vggtSfm: VggtSfmRunning
         public var fastVggtSfm: FastVggtSfmRunning
@@ -13,12 +14,14 @@ public final class PipelineRunner: @unchecked Sendable {
         public init(colmap: ColmapRunner = ColmapRunner(),
                     glomap: GlomapRunner = GlomapRunner(),
                     brush: BrushRunner = BrushRunner(),
+                    da3Sfm: Da3SfmRunning = Da3SfmRunner(),
                     mapAnythingSfm: MapAnythingSfmRunning = MapAnythingSfmRunner(),
                     vggtSfm: VggtSfmRunning = VggtSfmRunner(),
                     fastVggtSfm: FastVggtSfmRunning = FastVggtSfmRunner()) {
             self.colmap = colmap
             self.glomap = glomap
             self.brush = brush
+            self.da3Sfm = da3Sfm
             self.mapAnythingSfm = mapAnythingSfm
             self.vggtSfm = vggtSfm
             self.fastVggtSfm = fastVggtSfm
@@ -28,6 +31,7 @@ public final class PipelineRunner: @unchecked Sendable {
             self.colmap = ColmapRunner(runner: runner)
             self.glomap = GlomapRunner(runner: runner)
             self.brush = BrushRunner(runner: runner)
+            self.da3Sfm = Da3SfmRunner(runner: runner)
             self.mapAnythingSfm = MapAnythingSfmRunner(runner: runner)
             self.vggtSfm = VggtSfmRunner(runner: runner)
             self.fastVggtSfm = FastVggtSfmRunner(runner: runner)
@@ -94,6 +98,7 @@ public final class PipelineRunner: @unchecked Sendable {
         // tool logs (colmap/brush/etc.) for inspection — wiping them on a no-op startup
         // failure would destroy the only evidence of why the prior attempt died.
         var metadata = try ProjectMetadataStore.load(from: paths.metadataURL)
+        let metadataForResumeValidation = metadata
 
         // Now we've committed to a new run: reset per-tool logs so users see only the
         // current attempt. ToolLogWriter is now an appender (so multiple stages within
@@ -180,7 +185,8 @@ public final class PipelineRunner: @unchecked Sendable {
                 if !resumeValidationMode {
                     return !isStageComplete(stage, paths: paths, metadata: metadata)
                 }
-                switch try validateStageOutput(stage, paths: paths, metadata: metadata) {
+                let validationMetadata = resumeValidationMode ? metadataForResumeValidation : metadata
+                switch try validateStageOutput(stage, paths: paths, metadata: validationMetadata) {
                 case .valid:
                     return false
                 case .missing:
@@ -331,7 +337,7 @@ public final class PipelineRunner: @unchecked Sendable {
                             let rawDir = rawFramesDirectory(index: index, paths: paths)
                             let rawFrames = try loadImages(in: rawDir)
                             guard !rawFrames.isEmpty else { continue }
-                            let sharpnessByFrame = scoreSharpnessForFrames(
+                            let sharpnessByFrame = try scoreSharpnessForFrames(
                                 rawFrames,
                                 progress: { fraction, message in
                                     let scaled = (Double(index) / totalVideos) + (fraction / totalVideos)
@@ -379,8 +385,19 @@ public final class PipelineRunner: @unchecked Sendable {
                         }
                     }
 
+                    let budgetedGroups = applyFrameBudget(to: groups, targetCount: targetFrames)
+                    let selectedCountBeforeBudget = groups.reduce(0) { $0 + $1.frames.count }
+                    let selectedCountAfterBudget = budgetedGroups.reduce(0) { $0 + $1.frames.count }
+                    if selectedCountAfterBudget < selectedCountBeforeBudget {
+                        emit(.stageLog(
+                            stage: .selectFrames,
+                            line: "Applied \(metadata.preset.quality.rawValue) frame budget: \(selectedCountBeforeBudget) -> \(selectedCountAfterBudget).",
+                            isError: false
+                        ))
+                    }
+
                     let selection = try copySelected(
-                        groups: groups,
+                        groups: budgetedGroups,
                         to: paths.framesSelectedURL,
                         manifestURL: paths.framesSelectedManifestURL,
                         progress: { fraction, message in
@@ -393,8 +410,8 @@ public final class PipelineRunner: @unchecked Sendable {
                         stage: .selectFrames,
                         progress: 1.0,
                         message: "Selected \(selection.frames.count) frames",
-                        details: .selectFrames(SelectFramesCheckpoint(
-                            groupsProcessed: groups.count,
+                            details: .selectFrames(SelectFramesCheckpoint(
+                            groupsProcessed: budgetedGroups.count,
                             selectedCount: selection.frames.count,
                             manifestPath: paths.framesSelectedManifestURL.path
                         ))
@@ -450,7 +467,7 @@ public final class PipelineRunner: @unchecked Sendable {
             if let backendOverride, backendOverride == .fastvggt || backendOverride == .vggt {
                 emit(.stageLog(
                     stage: .sfmFeatures,
-                    line: "Deprecated SfM backend override '\(backendOverride.rawValue)' is enabled. Default backend is now MapAnything-first with COLMAP fallback.",
+                    line: "Deprecated SfM backend override '\(backendOverride.rawValue)' is enabled. Default backend is DA3 with MapAnything and COLMAP fallback.",
                     isError: true
                 ))
             }
@@ -497,6 +514,8 @@ public final class PipelineRunner: @unchecked Sendable {
 
             let backendName: (SfmBackend) -> String = { backend in
                 switch backend {
+                case .da3:
+                    return "Depth Anything 3"
                 case .mapanything:
                     return "MapAnything"
                 case .fastvggt:
@@ -510,7 +529,268 @@ public final class PipelineRunner: @unchecked Sendable {
 
             for (index, backendPolicy) in backendOrder.enumerated() {
                 do {
-                    if backendPolicy == .mapanything {
+                    if backendPolicy == .da3 {
+                        let fm = FileManager.default
+                        let sparseZero = paths.colmapSparseURL.appendingPathComponent("0", isDirectory: true)
+                        let da3CoverageManifest = paths.da3CoverageManifestURL
+                        let da3Config = Da3SfmConfig(
+                            device: da3DevicePreference(),
+                            mode: .direct,
+                            modelSubdirectory: da3ModelPreference(),
+                            fallbackModelSubdirectory: da3FallbackModelPreference(),
+                            processResolution: da3ProcessResolutionPreference(),
+                            maxPoints: da3MaxPointsPreference(preset: metadata.preset),
+                            cameraType: da3CameraTypePreference(preset: metadata.preset),
+                            sharedCamera: da3SharedCameraPreference(input: metadata.input),
+                            windowSize: da3WindowSizePreference(hardwareTier: detectedHardwareProfile.tier),
+                            windowOverlap: da3WindowOverlapPreference(hardwareTier: detectedHardwareProfile.tier),
+                            coverageManifestPath: da3CoverageManifest
+                        )
+
+                        func readDa3CoverageManifest(required: Bool) throws -> Da3CoverageManifest? {
+                            guard fm.fileExists(atPath: da3CoverageManifest.path) else {
+                                let line = "DA3 coverage manifest was missing at \(da3CoverageManifest.lastPathComponent)."
+                                emit(.stageLog(stage: currentStage, line: line, isError: required))
+                                if required {
+                                    throw PipelineError.outputMissing
+                                }
+                                return nil
+                            }
+                            let manifest: Da3CoverageManifest
+                            do {
+                                manifest = try Da3CoverageManifest.load(from: da3CoverageManifest)
+                            } catch {
+                                emit(.stageLog(
+                                    stage: currentStage,
+                                    line: "DA3 coverage manifest could not be decoded (\(error.localizedDescription)).",
+                                    isError: required
+                                ))
+                                if required {
+                                    throw error
+                                }
+                                return nil
+                            }
+                            let issues = manifest.validationIssues(expectedMode: .direct, selectedImageCount: selectedFrames.count)
+                            if !issues.isEmpty {
+                                emit(.stageLog(
+                                    stage: currentStage,
+                                    line: "DA3 coverage manifest was inconsistent: \(issues.joined(separator: "; ")).",
+                                    isError: required
+                                ))
+                                if required {
+                                    throw PipelineError.outputMissing
+                                }
+                                return nil
+                            }
+                            emit(.stageLog(stage: currentStage, line: "DA3 coverage: \(manifest.summary).", isError: false))
+                            return manifest
+                        }
+
+                        func analyzeDa3Model(at modelURL: URL, toolLog: ToolLogWriter? = nil) async throws -> ReconstructionScore {
+                            let report = try await self.tooling.colmap.runModelAnalyzer(
+                                colmapPath: self.config.toolchain.colmap,
+                                modelPath: modelURL,
+                                options: colmapMatchOptions
+                            )
+                            for line in report.split(separator: "\n", omittingEmptySubsequences: false) {
+                                toolLog?.append(stream: "stdout", line: String(line))
+                            }
+                            let score = ReconstructionScorer.parseModelAnalyzerOutput(report)
+                            emit(.stageLog(
+                                stage: currentStage,
+                                line: "DA3 score (direct): \(ReconstructionScorer.summary(score)).",
+                                isError: false
+                            ))
+                            return score
+                        }
+
+                        if try shouldRunStage(.sfmFeatures) {
+                            currentStage = .sfmFeatures
+                            emit(.stageStarted(stage: .sfmFeatures))
+                            writeCheckpoint(
+                                stage: .sfmFeatures,
+                                progress: 0,
+                                message: "Depth Anything 3 SfM started",
+                                details: .sfmFeatures(SfmFeaturesCheckpoint(
+                                    databasePath: paths.colmapDatabaseURL.path,
+                                    imageCount: selectedFrames.count
+                                ))
+                            )
+                            emit(.stageLog(stage: .sfmFeatures, line: "SfM backend: da3-mps.", isError: false))
+                            emit(.stageLog(
+                                stage: .sfmFeatures,
+                                line: "DA3 policy: model=\(da3Config.modelSubdirectory) fallback=\(da3Config.fallbackModelSubdirectory) device=\(da3Config.device) processRes=\(da3Config.processResolution) maxPoints=\(da3Config.maxPoints) sharedCamera=\(da3Config.sharedCamera) cameraType=\(da3Config.cameraType) window=\(da3Config.windowSize) overlap=\(da3Config.windowOverlap).",
+                                isError: false
+                            ))
+
+                            self.removeIfExists(paths.colmapDatabaseURL)
+                            try self.resetDirectory(paths.colmapSeedURL)
+                            try self.resetDirectory(paths.colmapSparseURL)
+                            try self.resetDirectory(sparseZero)
+                            self.removeIfExists(da3CoverageManifest)
+                            self.removeIfExists(paths.mapanythingCoverageManifestURL)
+
+                            let da3ToolLog = ToolLogWriter(fileURL: paths.da3LogURL, toolName: "da3-mps")
+                            da3ToolLog.beginSection(
+                                title: "sfm",
+                                metadata: [
+                                    "device": da3Config.device,
+                                    "mode": da3Config.mode.rawValue,
+                                    "images": paths.framesSelectedURL.path,
+                                    "processRes": "\(da3Config.processResolution)",
+                                    "maxPoints": "\(da3Config.maxPoints)",
+                                    "sharedCamera": da3Config.sharedCamera ? "1" : "0",
+                                    "cameraType": da3Config.cameraType,
+                                    "windowSize": "\(da3Config.windowSize)",
+                                    "windowOverlap": "\(da3Config.windowOverlap)",
+                                    "model": da3Config.modelSubdirectory,
+                                    "fallbackModel": da3Config.fallbackModelSubdirectory,
+                                    "manifest": da3CoverageManifest.path,
+                                    "tool": self.config.toolchain.da3.sfmTool.path,
+                                    "modelsDir": self.config.toolchain.da3.models.path
+                                ]
+                            )
+                            emit(.stageLog(stage: .sfmFeatures, line: "DA3 tool log: \(paths.da3LogURL.lastPathComponent)", isError: false))
+                            emit(.stageLog(stage: .sfmFeatures, line: "DA3 coverage manifest: \(da3CoverageManifest.lastPathComponent)", isError: false))
+                            let onDa3Log: @Sendable (String, Bool) -> Void = { line, isErr in
+                                da3ToolLog.append(stream: isErr ? "stderr" : "stdout", line: line)
+                                let sanitized = Self.sanitizeToolLogLine(line)
+                                let effectiveIsErr = Self.normalizedToolLogIsError(sanitized, isError: isErr)
+                                if Self.shouldEmitToolLogLine(sanitized, isError: effectiveIsErr) {
+                                    emit(.stageLog(stage: .sfmFeatures, line: sanitized, isError: effectiveIsErr))
+                                }
+                            }
+
+                            emit(.stageProgress(stage: .sfmFeatures, fraction: 0.0, message: "Starting DA3 direct solve (\(selectedFrames.count) images)…"))
+                            try await self.tooling.da3Sfm.run(
+                                toolchain: self.config.toolchain.da3,
+                                images: paths.framesSelectedURL,
+                                outSparse: sparseZero,
+                                config: da3Config,
+                                onLog: onDa3Log
+                            )
+                            guard sparseModelFilesExist(at: sparseZero) else {
+                                throw PipelineError.outputMissing
+                            }
+                            let imagesTxt = sparseZero.appendingPathComponent("images.txt")
+                            if try ColmapTextModelNormalizer.normalizeImagesTxtIfNeeded(at: imagesTxt) {
+                                emit(.stageLog(
+                                    stage: .sfmFeatures,
+                                    line: "Normalized DA3 direct COLMAP model (added missing POINTS2D lines to images.txt).",
+                                    isError: false
+                                ))
+                            }
+                            let coverageManifest = try readDa3CoverageManifest(required: true)
+                            let da3ValidationIssues = da3DirectSparseValidationIssues(
+                                paths: paths,
+                                textStats: colmapSparseTextStats(at: sparseZero)
+                            )
+                            if !da3ValidationIssues.isEmpty {
+                                emit(.stageLog(
+                                    stage: currentStage,
+                                    line: "DA3 sparse output was inconsistent: \(da3ValidationIssues.joined(separator: "; ")).",
+                                    isError: true
+                                ))
+                                throw PipelineError.outputMissing
+                            }
+                            let rawScore = try await analyzeDa3Model(at: sparseZero, toolLog: da3ToolLog)
+                            let score = da3ScoreApplyingCoverageFallback(
+                                rawScore,
+                                coverageManifest: coverageManifest
+                            )
+                            if let rejection = da3DirectQualityFailureReason(score: score, mode: metadata.preset.mode) {
+                                emit(.stageLog(
+                                    stage: .sfmFeatures,
+                                    line: "DA3 direct solve was below the quality bar (\(rejection)); trying the next SfM backend.",
+                                    isError: true
+                                ))
+                                throw PipelineError.lowQualityReconstruction(score)
+                            }
+                            if !fm.fileExists(atPath: paths.colmapDatabaseURL.path) {
+                                fm.createFile(atPath: paths.colmapDatabaseURL.path, contents: Data())
+                            }
+
+                            writeCheckpoint(
+                                stage: .sfmFeatures,
+                                progress: 1.0,
+                                message: "DA3 direct sparse model ready",
+                                details: .sfmFeatures(SfmFeaturesCheckpoint(
+                                    databasePath: paths.colmapDatabaseURL.path,
+                                    imageCount: selectedFrames.count
+                                ))
+                            )
+                            emit(.stageFinished(stage: .sfmFeatures))
+                            markStageComplete(.sfmFeatures)
+                        } else if sparseModelFilesExist(at: sparseZero) && !fm.fileExists(atPath: paths.colmapDatabaseURL.path) {
+                            fm.createFile(atPath: paths.colmapDatabaseURL.path, contents: Data())
+                        }
+
+                        if try shouldRunStage(.sfmMatching) {
+                            currentStage = .sfmMatching
+                            emit(.stageStarted(stage: .sfmMatching))
+                            writeCheckpoint(
+                                stage: .sfmMatching,
+                                progress: 1.0,
+                                message: "DA3 direct path skips matching",
+                                details: .sfmMatching(SfmMatchingCheckpoint(
+                                    databasePath: paths.colmapDatabaseURL.path,
+                                    expectedPairs: nil,
+                                    processedPairs: nil
+                                ))
+                            )
+                            emit(.stageLog(stage: .sfmMatching, line: "DA3 direct solve produced a sparse model directly; skipping matching.", isError: false))
+                            emit(.stageFinished(stage: .sfmMatching))
+                            markStageComplete(.sfmMatching)
+                        }
+
+                        if try shouldRunStage(.sfmMapping) {
+                            currentStage = .sfmMapping
+                            emit(.stageStarted(stage: .sfmMapping))
+                            guard sparseModelFilesExist(at: sparseZero) else {
+                                throw PipelineError.outputMissing
+                            }
+                            if try ensureTextSparseModelFiles(at: sparseZero) {
+                                emit(.stageLog(
+                                    stage: .sfmMapping,
+                                    line: "Converted DA3 sparse model to COLMAP text format for training compatibility.",
+                                    isError: false
+                                ))
+                            }
+                            let imagesTxt = sparseZero.appendingPathComponent("images.txt")
+                            if try ColmapTextModelNormalizer.normalizeImagesTxtIfNeeded(at: imagesTxt) {
+                                emit(.stageLog(
+                                    stage: .sfmMapping,
+                                    line: "Normalized DA3 direct COLMAP model (added missing POINTS2D lines to images.txt).",
+                                    isError: false
+                                ))
+                            }
+                            let da3ValidationIssues = da3DirectSparseValidationIssues(
+                                paths: paths,
+                                textStats: colmapSparseTextStats(at: sparseZero)
+                            )
+                            if !da3ValidationIssues.isEmpty {
+                                emit(.stageLog(
+                                    stage: currentStage,
+                                    line: "DA3 sparse output was inconsistent: \(da3ValidationIssues.joined(separator: "; ")).",
+                                    isError: true
+                                ))
+                                throw PipelineError.outputMissing
+                            }
+                            writeCheckpoint(
+                                stage: .sfmMapping,
+                                progress: 1.0,
+                                message: "DA3 direct sparse model accepted",
+                                details: .sfmMapping(SfmMappingCheckpoint(
+                                    mapper: "da3-direct",
+                                    sparsePath: sparseZero.path,
+                                    registeredImages: nil
+                                ))
+                            )
+                            emit(.stageLog(stage: .sfmMapping, line: "DA3 direct sparse model accepted as the final SfM output.", isError: false))
+                            emit(.stageFinished(stage: .sfmMapping))
+                            markStageComplete(.sfmMapping)
+                        }
+                    } else if backendPolicy == .mapanything {
                         let fm = FileManager.default
                         let seedZero = paths.colmapSeedModelURL
                         let sparseZero = paths.colmapSparseURL.appendingPathComponent("0", isDirectory: true)
@@ -655,6 +935,7 @@ public final class PipelineRunner: @unchecked Sendable {
                             try self.resetDirectory(paths.colmapSparseURL)
                             try self.resetDirectory(sparseZero)
                             self.removeIfExists(mapCoverageManifest)
+                            self.removeIfExists(paths.da3CoverageManifestURL)
 
                             let mapToolLog = ToolLogWriter(fileURL: paths.mapanythingLogURL, toolName: "mapanything-mps")
                             mapToolLog.beginSection(
@@ -740,6 +1021,8 @@ public final class PipelineRunner: @unchecked Sendable {
                                         preparedMapAnythingMode = .direct
                                     }
                                 } catch {
+                                    if error is CancellationError { throw error }
+                                    try Task.checkCancellation()
                                     emit(.stageLog(
                                         stage: .sfmFeatures,
                                         line: "MapAnything direct solve failed (\(failureMessages(for: error, stage: .sfmFeatures).debugMessage)). Switching to seed_refine.",
@@ -1064,6 +1347,8 @@ public final class PipelineRunner: @unchecked Sendable {
                                         try await runExhaustiveMatcher()
                                     }
                                 } catch {
+                                    if error is CancellationError { throw error }
+                                    try Task.checkCancellation()
                                     if useSequential {
                                         emit(.stageLog(
                                             stage: .sfmMatching,
@@ -1202,6 +1487,8 @@ public final class PipelineRunner: @unchecked Sendable {
                                         lastMappingError = PipelineError.lowQualityReconstruction(score)
                                     }
                                 } catch {
+                                    if error is CancellationError { throw error }
+                                    try Task.checkCancellation()
                                     lastMappingError = error
                                 }
 
@@ -1278,6 +1565,8 @@ public final class PipelineRunner: @unchecked Sendable {
                                                 shouldTryIncrementalMapper = false
                                             }
                                         } catch {
+                                            if error is CancellationError { throw error }
+                                            try Task.checkCancellation()
                                             lastMappingError = error
                                             if let colmapError = error as? ColmapRunnerError,
                                                colmapErrorIndicatesMissingGlobalMapper(colmapError) {
@@ -1316,6 +1605,8 @@ public final class PipelineRunner: @unchecked Sendable {
                                                         shouldTryIncrementalMapper = false
                                                     }
                                                 } catch {
+                                                    if error is CancellationError { throw error }
+                                                    try Task.checkCancellation()
                                                     lastMappingError = error
                                                 }
                                             }
@@ -1345,6 +1636,8 @@ public final class PipelineRunner: @unchecked Sendable {
                                             )
                                             _ = try await evaluateFallbackModel(candidate: "colmap")
                                         } catch {
+                                            if error is CancellationError { throw error }
+                                            try Task.checkCancellation()
                                             lastMappingError = error
                                         }
                                     }
@@ -1758,6 +2051,8 @@ public final class PipelineRunner: @unchecked Sendable {
                                     try await runExhaustiveMatcher()
                                 }
                             } catch {
+                                if error is CancellationError { throw error }
+                                try Task.checkCancellation()
                                 if useSequential {
                                     emit(.stageLog(
                                         stage: .sfmMatching,
@@ -1943,6 +2238,8 @@ public final class PipelineRunner: @unchecked Sendable {
                                     lastMappingError = PipelineError.lowQualityReconstruction(score)
                                 }
                             } catch {
+                                if error is CancellationError { throw error }
+                                try Task.checkCancellation()
                                 lastMappingError = error
                             }
 
@@ -2025,6 +2322,8 @@ public final class PipelineRunner: @unchecked Sendable {
                                             shouldTryIncrementalMapper = false
                                         }
                                     } catch {
+                                        if error is CancellationError { throw error }
+                                        try Task.checkCancellation()
                                         lastMappingError = error
                                         if let colmapError = error as? ColmapRunnerError,
                                            colmapErrorIndicatesMissingGlobalMapper(colmapError) {
@@ -2063,6 +2362,8 @@ public final class PipelineRunner: @unchecked Sendable {
                                                     shouldTryIncrementalMapper = false
                                                 }
                                             } catch {
+                                                if error is CancellationError { throw error }
+                                                try Task.checkCancellation()
                                                 lastMappingError = error
                                             }
                                         }
@@ -2092,6 +2393,8 @@ public final class PipelineRunner: @unchecked Sendable {
                                         )
                                         _ = try await evaluateFallbackModel(candidate: "colmap")
                                     } catch {
+                                        if error is CancellationError { throw error }
+                                        try Task.checkCancellation()
                                         lastMappingError = error
                                     }
                                 }
@@ -2531,6 +2834,8 @@ public final class PipelineRunner: @unchecked Sendable {
                     do {
                         try await runSequential()
                     } catch {
+                        if error is CancellationError { throw error }
+                        try Task.checkCancellation()
                         let previousOverlap = colmapMatchOptions.sequentialOverlap
                         let increasedOverlap = min(30, max(previousOverlap + 5, previousOverlap * 2))
                         if increasedOverlap > previousOverlap {
@@ -2543,6 +2848,8 @@ public final class PipelineRunner: @unchecked Sendable {
                             do {
                                 try await runSequential()
                             } catch {
+                                if error is CancellationError { throw error }
+                                try Task.checkCancellation()
                                 emit(.stageLog(
                                     stage: .sfmMatching,
                                     line: "Sequential matcher failed again. Rebuilding database and retrying with exhaustive matching on fewer frames.",
@@ -2684,6 +2991,8 @@ public final class PipelineRunner: @unchecked Sendable {
                         }
                         break
                     } catch {
+                        if error is CancellationError { throw error }
+                        try Task.checkCancellation()
                         if retryWithCpuIfNeeded(error) {
                             forceSfMRun = true
                             continue
@@ -2834,6 +3143,8 @@ public final class PipelineRunner: @unchecked Sendable {
                             )
                             mappingSucceeded = try await evaluateMappingResult(candidate: gpuRequested ? "global_mapper-gpu" : "global_mapper")
                         } catch {
+                            if error is CancellationError { throw error }
+                            try Task.checkCancellation()
                             lastMappingError = error
                             if let colmapError = error as? ColmapRunnerError,
                                colmapErrorIndicatesMissingGlobalMapper(colmapError) {
@@ -2871,6 +3182,8 @@ public final class PipelineRunner: @unchecked Sendable {
                                     )
                                     mappingSucceeded = try await evaluateMappingResult(candidate: "global_mapper-cpu")
                                 } catch {
+                                    if error is CancellationError { throw error }
+                                    try Task.checkCancellation()
                                     lastMappingError = error
                                 }
                             }
@@ -2903,6 +3216,8 @@ public final class PipelineRunner: @unchecked Sendable {
                             )
                             mappingSucceeded = try await evaluateMappingResult(candidate: "colmap")
                         } catch {
+                            if error is CancellationError { throw error }
+                            try Task.checkCancellation()
                             lastMappingError = error
                         }
                     }
@@ -3051,6 +3366,8 @@ public final class PipelineRunner: @unchecked Sendable {
                 try? ProjectMetadataStore.save(metadata, to: paths.metadataURL)
                 return
             }
+            let trainingCutoffMetadata = resumeValidationMode ? metadataForResumeValidation : metadata
+            var currentTrainingStartedAt = trainingExportMinimumDate(metadata: trainingCutoffMetadata)
             if try shouldRunStage(.trainBrush) {
                 currentStage = .trainBrush
                 emit(.stageStarted(stage: .trainBrush))
@@ -3084,6 +3401,7 @@ public final class PipelineRunner: @unchecked Sendable {
                     emit(.stageProgress(stage: .trainBrush, fraction: -1.0, message: message))
                 })
                 let trainingStartedAt = Date()
+                currentTrainingStartedAt = trainingStartedAt
                 let initialStatus = trainingStatusMessage(
                     elapsed: 0,
                     progress: nil,
@@ -3370,12 +3688,22 @@ public final class PipelineRunner: @unchecked Sendable {
                 currentStage = .exportSplat
                 emit(.stageStarted(stage: .exportSplat))
                 writeCheckpoint(stage: .exportSplat, progress: 0, message: "Export started")
-                guard let ply = self.tooling.brush.findLatestPly(in: paths.trainingURL) else {
+                guard let ply = self.tooling.brush.findLatestExportablePly(
+                    in: paths.trainingURL,
+                    minModificationDate: currentTrainingStartedAt
+                ) else {
                     throw PipelineError.outputMissing
                 }
-                try FileManager.default.createDirectory(at: paths.outputURL, withIntermediateDirectories: true)
-                let outputPly = paths.outputURL.appendingPathComponent("splat.ply")
+                guard ProjectArtifactValidator.validatePlyFile(at: ply) == .valid else {
+                    throw PipelineError.outputMissing
+                }
+                let outputDirectory = try paths.resolveProjectRelativePath("Output")
+                try FileManager.default.createDirectory(at: outputDirectory, withIntermediateDirectories: true)
+                let outputPly = try paths.resolveProjectRelativePath("Output/splat.ply")
                 try SplatExport.copyIfExists(from: ply, to: outputPly)
+                guard ProjectArtifactValidator.validatePlyFile(at: outputPly) == .valid else {
+                    throw PipelineError.outputMissing
+                }
                 let sizeBytes = (try? FileManager.default.attributesOfItem(atPath: outputPly.path)[.size] as? NSNumber)?.int64Value ?? 0
                 writeCheckpoint(
                     stage: .exportSplat,
@@ -3421,6 +3749,7 @@ public final class PipelineRunner: @unchecked Sendable {
         let toolLogs: [URL] = [
             paths.colmapLogURL,
             paths.glomapLogURL,
+            paths.da3LogURL,
             paths.mapanythingLogURL,
             paths.vggtLogURL,
             paths.fastvggtLogURL,

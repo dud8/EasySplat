@@ -16,6 +16,13 @@ extension PipelineRunner {
         case corrupt(reason: String)
     }
 
+    struct ColmapSparseTextStats: Sendable {
+        var registeredImageCount: Int?
+        var pointCount: Int?
+        var observationCount: Int?
+        var meanTrackLength: Double?
+    }
+
     func resetDirectory(_ url: URL) throws {
         let fm = FileManager.default
         if fm.fileExists(atPath: url.path) {
@@ -205,12 +212,22 @@ extension PipelineRunner {
         case .sfmMapping:
             let sparseZero = paths.colmapSparseURL.appendingPathComponent("0", isDirectory: true)
             guard sparseModelFilesExist(at: sparseZero) else { return .missing }
+            let textStats = colmapSparseTextStats(at: sparseZero)
             for name in ["cameras.bin", "images.bin", "points3D.bin", "cameras.txt", "images.txt", "points3D.txt"] {
                 let fileURL = sparseZero.appendingPathComponent(name)
                 if !fm.fileExists(atPath: fileURL.path) { continue }
                 let size = (try? fm.attributesOfItem(atPath: fileURL.path)[.size] as? NSNumber)?.int64Value ?? 0
                 if size <= 0 {
                     return .corrupt(reason: "sparse model file \(name) is empty")
+                }
+            }
+            let pointsTxt = sparseZero.appendingPathComponent("points3D.txt")
+            if fm.fileExists(atPath: pointsTxt.path) {
+                guard (textStats.pointCount ?? 0) > 0 else {
+                    return .corrupt(reason: "points3D.txt has no sparse points")
+                }
+                guard (textStats.observationCount ?? 0) > 0 else {
+                    return .corrupt(reason: "points3D.txt has no observations")
                 }
             }
             let imagesTxt = sparseZero.appendingPathComponent("images.txt")
@@ -230,15 +247,220 @@ extension PipelineRunner {
                     return .corrupt(reason: "images.bin appears truncated")
                 }
             }
+            let da3Issues = da3DirectSparseValidationIssues(paths: paths, textStats: textStats)
+            if !da3Issues.isEmpty {
+                return .corrupt(reason: "DA3 sparse manifest is invalid: \(da3Issues.joined(separator: "; "))")
+            }
             return .valid
         case .trainBrush:
-            guard let latest = tooling.brush.findLatestPly(in: paths.trainingURL) else { return .missing }
+            guard let latest = tooling.brush.findLatestExportablePly(
+                in: paths.trainingURL,
+                minModificationDate: trainingExportMinimumDate(metadata: metadata)
+            ) else { return .missing }
             return validatePlyFile(at: latest)
         case .exportSplat, .done:
-            let output = paths.outputURL.appendingPathComponent("splat.ply")
-            guard fm.fileExists(atPath: output.path) else { return .missing }
+            let output: URL
+            if let persisted = metadata.outputs?.splatPlyPath {
+                do {
+                    output = try paths.resolveProjectRelativePath(persisted)
+                } catch {
+                    return .corrupt(reason: error.localizedDescription)
+                }
+            } else {
+                output = paths.outputURL.appendingPathComponent("splat.ply")
+            }
             return validatePlyFile(at: output)
         }
+    }
+
+    func colmapSparseTextStats(at sparseZero: URL) -> ColmapSparseTextStats {
+        let imagesTxt = sparseZero.appendingPathComponent("images.txt")
+        var registeredImageCount: Int?
+        if let text = try? String(contentsOf: imagesTxt, encoding: .utf8) {
+            registeredImageCount = text
+                .components(separatedBy: .newlines)
+                .filter { isColmapImagePoseRow($0) }
+                .count
+        }
+
+        let pointsTxt = sparseZero.appendingPathComponent("points3D.txt")
+        var pointCount: Int?
+        var observationCount: Int?
+        if let text = try? String(contentsOf: pointsTxt, encoding: .utf8) {
+            var points = 0
+            var observations = 0
+            for line in text.split(separator: "\n") {
+                let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
+                guard !trimmed.isEmpty, !trimmed.hasPrefix("#") else { continue }
+                let parts = trimmed.split(separator: " ")
+                guard parts.count >= 8 else { continue }
+                points += 1
+                observations += max(0, (parts.count - 8) / 2)
+            }
+            pointCount = points
+            observationCount = observations
+        }
+        let meanTrackLength: Double?
+        if let pointCount, let observationCount, pointCount > 0 {
+            meanTrackLength = Double(observationCount) / Double(pointCount)
+        } else {
+            meanTrackLength = nil
+        }
+
+        return ColmapSparseTextStats(
+            registeredImageCount: registeredImageCount,
+            pointCount: pointCount,
+            observationCount: observationCount,
+            meanTrackLength: meanTrackLength
+        )
+    }
+
+    func trainingExportMinimumDate(metadata: ProjectMetadata) -> Date? {
+        if let lastRunStartedAt = metadata.lastRunStartedAt {
+            return lastRunStartedAt
+        }
+        if metadata.checkpoint?.stage == .trainBrush {
+            return metadata.checkpoint?.updatedAt
+        }
+        return nil
+    }
+
+    private func isColmapImagePoseRow(_ line: String) -> Bool {
+        let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty, !trimmed.hasPrefix("#") else { return false }
+        let parts = trimmed.split(maxSplits: 9, whereSeparator: { $0 == " " || $0 == "\t" })
+        guard parts.count >= 10 else { return false }
+        guard Int(parts[0]) != nil else { return false }
+        return parts[1..<9].allSatisfy { Double(String($0)) != nil }
+            && Int(parts[8]) != nil
+            && String(parts[9]).rangeOfCharacter(from: .letters) != nil
+    }
+
+    func da3DirectSparseValidationIssues(
+        paths: ProjectPaths,
+        textStats: ColmapSparseTextStats
+    ) -> [String] {
+        let fm = FileManager.default
+        guard fm.fileExists(atPath: paths.da3CoverageManifestURL.path) else {
+            return []
+        }
+        let da3ManifestDate = (try? fm.attributesOfItem(atPath: paths.da3CoverageManifestURL.path)[.modificationDate] as? Date) ?? .distantPast
+        if let mapAnythingManifestDate = try? fm.attributesOfItem(atPath: paths.mapanythingCoverageManifestURL.path)[.modificationDate] as? Date,
+           mapAnythingManifestDate > da3ManifestDate {
+            return []
+        }
+        let databaseSize = (try? fm.attributesOfItem(atPath: paths.colmapDatabaseURL.path)[.size] as? NSNumber)?.int64Value ?? 0
+        guard databaseSize <= 0 else {
+            return []
+        }
+
+        let selectedImageCount = (try? loadImages(in: paths.framesSelectedURL).count)
+        let manifest: Da3CoverageManifest
+        do {
+            manifest = try Da3CoverageManifest.load(from: paths.da3CoverageManifestURL)
+        } catch {
+            return ["manifest could not be decoded (\(error.localizedDescription))"]
+        }
+
+        var issues = manifest.validationIssues(
+            expectedMode: .direct,
+            selectedImageCount: selectedImageCount ?? manifest.totalImages
+        )
+        if textStats.registeredImageCount == nil {
+            issues.append("images.txt was missing from DA3 direct sparse output")
+        }
+        if textStats.pointCount == nil {
+            issues.append("points3D.txt was missing from DA3 direct sparse output")
+        }
+        if let registeredImageCount = textStats.registeredImageCount,
+           let manifestRegistered = manifest.registeredImageCount,
+           registeredImageCount != manifestRegistered {
+            issues.append("registered_image_count \(manifestRegistered) did not match images.txt \(registeredImageCount)")
+        }
+        if let pointCount = textStats.pointCount,
+           let manifestPoints = manifest.fusedSparsePointCount,
+           pointCount != manifestPoints {
+            issues.append("fused_sparse_point_count \(manifestPoints) did not match points3D.txt \(pointCount)")
+        }
+        if let observationCount = textStats.observationCount,
+           let manifestObservations = manifest.finalObservationCount,
+           observationCount != manifestObservations {
+            issues.append("final_observation_count \(manifestObservations) did not match points3D.txt observations \(observationCount)")
+        }
+        if let meanTrackLength = textStats.meanTrackLength,
+           let manifestMeanTrackLength = manifest.meanTrackLength,
+           abs(meanTrackLength - manifestMeanTrackLength) > 0.01 {
+            issues.append(String(
+                format: "mean_track_length %.2f did not match points3D.txt %.2f",
+                manifestMeanTrackLength,
+                meanTrackLength
+            ))
+        }
+        issues.append(contentsOf: da3SparseTextTrackIssues(paths: paths))
+        return issues
+    }
+
+    private func da3SparseTextTrackIssues(paths: ProjectPaths) -> [String] {
+        let sparseZero = paths.colmapSparseURL.appendingPathComponent("0", isDirectory: true)
+        let imagesTxt = sparseZero.appendingPathComponent("images.txt")
+        let pointsTxt = sparseZero.appendingPathComponent("points3D.txt")
+        guard let imagesText = try? String(contentsOf: imagesTxt, encoding: .utf8),
+              let pointsText = try? String(contentsOf: pointsTxt, encoding: .utf8) else {
+            return []
+        }
+
+        var imageObservationCounts: [Int: Int] = [:]
+        let imageLines = imagesText.components(separatedBy: .newlines)
+        var index = 0
+        while index < imageLines.count {
+            let poseLine = imageLines[index]
+            guard isColmapImagePoseRow(poseLine) else {
+                index += 1
+                continue
+            }
+            let poseParts = poseLine.split(maxSplits: 9, whereSeparator: { $0 == " " || $0 == "\t" })
+            guard let imageID = Int(poseParts[0]) else {
+                index += 1
+                continue
+            }
+            let pointsLine = index + 1 < imageLines.count ? imageLines[index + 1] : ""
+            let pointParts = pointsLine.split(whereSeparator: { $0 == " " || $0 == "\t" })
+            imageObservationCounts[imageID] = pointParts.count / 3
+            index += 2
+        }
+
+        var issues: [String] = []
+        for line in pointsText.components(separatedBy: .newlines) {
+            let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !trimmed.isEmpty, !trimmed.hasPrefix("#") else { continue }
+            let parts = trimmed.split(whereSeparator: { $0 == " " || $0 == "\t" })
+            guard parts.count >= 8 else {
+                issues.append("points3D.txt row had too few columns")
+                continue
+            }
+            guard (parts.count - 8).isMultiple(of: 2) else {
+                issues.append("points3D.txt track row had an incomplete observation pair")
+                continue
+            }
+            var trackIndex = 8
+            while trackIndex + 1 < parts.count {
+                guard let imageID = Int(parts[trackIndex]),
+                      let point2DIndex = Int(parts[trackIndex + 1]) else {
+                    issues.append("points3D.txt track row had a non-numeric observation reference")
+                    break
+                }
+                guard let observationCount = imageObservationCounts[imageID] else {
+                    issues.append("points3D.txt track references missing image id \(imageID)")
+                    break
+                }
+                guard point2DIndex >= 0, point2DIndex < observationCount else {
+                    issues.append("points3D.txt track references image \(imageID) point2D index \(point2DIndex) outside 0..<\(observationCount)")
+                    break
+                }
+                trackIndex += 2
+            }
+        }
+        return issues
     }
 
     func isStageComplete(_ stage: PipelineStage, paths: ProjectPaths, metadata: ProjectMetadata) -> Bool {
@@ -253,6 +475,13 @@ extension PipelineRunner {
         if size <= 0 {
             let sparseZero = paths.colmapSparseURL.appendingPathComponent("0", isDirectory: true)
             if sparseModelFilesExist(at: sparseZero) {
+                let da3Issues = da3DirectSparseValidationIssues(
+                    paths: paths,
+                    textStats: colmapSparseTextStats(at: sparseZero)
+                )
+                if !da3Issues.isEmpty {
+                    return .corrupt(reason: "DA3 sparse manifest is invalid: \(da3Issues.joined(separator: "; "))")
+                }
                 return .valid
             }
             return .corrupt(reason: "database.db is empty")
@@ -305,30 +534,13 @@ extension PipelineRunner {
     }
 
     func validatePlyFile(at url: URL) -> StageOutputStatus {
-        let size = (try? FileManager.default.attributesOfItem(atPath: url.path)[.size] as? NSNumber)?.int64Value ?? 0
-        if size <= 0 {
-            return .corrupt(reason: "\(url.lastPathComponent) is empty")
+        switch ProjectArtifactValidator.validatePlyFile(at: url) {
+        case .valid:
+            return .valid
+        case .missing:
+            return .missing
+        case .corrupt(let reason):
+            return .corrupt(reason: reason)
         }
-        guard let data = try? Data(contentsOf: url, options: [.mappedIfSafe]) else {
-            return .corrupt(reason: "failed to read \(url.lastPathComponent)")
-        }
-        guard let text = String(data: data.prefix(4096), encoding: .utf8) else {
-            return .corrupt(reason: "\(url.lastPathComponent) is not valid UTF-8 near header")
-        }
-        guard text.lowercased().hasPrefix("ply") else {
-            return .corrupt(reason: "\(url.lastPathComponent) is not a PLY file")
-        }
-        guard text.contains("end_header") else {
-            return .corrupt(reason: "\(url.lastPathComponent) is missing end_header")
-        }
-        let lines = text.split(separator: "\n").map(String.init)
-        if let vertexLine = lines.first(where: { $0.lowercased().hasPrefix("element vertex ") }) {
-            let comps = vertexLine.split(separator: " ")
-            if let raw = comps.last, let count = Int(raw), count > 0 {
-                return .valid
-            }
-            return .corrupt(reason: "\(url.lastPathComponent) has invalid vertex count")
-        }
-        return .corrupt(reason: "\(url.lastPathComponent) is missing vertex element metadata")
     }
 }

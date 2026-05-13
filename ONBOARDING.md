@@ -30,7 +30,7 @@ The app is intentionally beginner-friendly. The repository is not. Under the sur
 1. `EasySplatApp` is intentionally thin. `EasySplatCore` does the real work.
 2. The app does not ship the full toolchain in the repo or app bundle by default. It downloads a signed manifest and installs toolchain artifacts into Application Support.
 3. Every run lives inside a `.easysplatproj` directory bundle under `~/Documents/EasySplat Projects/`.
-4. The default reconstruction path is now MapAnything-first on Apple Silicon, with COLMAP refinement and mapper fallback when needed.
+4. The default reconstruction path is DA3-first on Apple Silicon, with MapAnything and COLMAP mapper fallback when needed.
 5. The UI is designed for absolute beginners: sparse layout, one obvious primary action, calm feedback, minimal jargon.
 
 ## At A Glance
@@ -42,8 +42,8 @@ The app is intentionally beginner-friendly. The repository is not. Under the sur
 | App stack | SwiftUI with a small amount of AppKit glue |
 | Core stack | Swift 6, Foundation, CryptoKit, ImageIO, SQLite3, subprocess orchestration |
 | Viewer | `MetalSplatter` + `SplatIO` from `ThirdParty/MetalSplatter` |
-| Default SfM path | MapAnything-first with COLMAP refinement and COLMAP mapper fallback |
-| Legacy / override paths | `colmap`, `glomap` / `global_mapper`, `vggt`, `fastvggt` |
+| Default SfM path | DA3-first with MapAnything and COLMAP mapper fallback |
+| Legacy / override paths | `mapanything`, `colmap`, `glomap` / `global_mapper`, `vggt`, `fastvggt` |
 | Output | A Gaussian splat PLY plus project metadata and logs |
 | Project persistence | `project.json`, stage checkpoints, log files, app events, share metrics, training snapshots, output files inside a `.easysplatproj` bundle |
 | Toolchain trust model | Ed25519-signed manifest, SHA-256 artifact checks, expected-content validation |
@@ -166,7 +166,7 @@ flowchart TD
 
     Runner --> Project["ProjectPaths + ProjectMetadataStore<br/>persistent project contract"]
     Runner --> Video["Video helpers<br/>frame extraction + selection"]
-    Runner --> SFM["SfM runners<br/>MapAnything / COLMAP / VGGT / FastVGGT"]
+    Runner --> SFM["SfM runners<br/>DA3 / MapAnything / COLMAP / VGGT / FastVGGT"]
     Runner --> Train["BrushRunner<br/>train Gaussian splat model"]
     Runner --> Export["SplatExport<br/>copy final PLY into Output"]
 
@@ -313,7 +313,8 @@ This matters. If you add UI and the copy starts sounding like a research paper o
 | `EasySplatUITests/` | Placeholder target under SwiftPM; real XCUITest would require an Xcode project |
 | `ThirdParty/MetalSplatter/` | Vendored viewer dependency package |
 | `Tools/ManifestTool/` | Swift CLI for key generation and manifest signing |
-| `Tools/MapAnythingSfm/` | Python bridge package shipped inside the toolchain |
+| `Tools/Da3Sfm/` | DA3 Python bridge package shipped inside the toolchain |
+| `Tools/MapAnythingSfm/` | MapAnything Python fallback bridge package shipped inside the toolchain |
 | `Tools/VggtSfm/` | Python bridge package shipped inside the toolchain |
 | `Tools/FastVggtSfm/` | Python bridge package shipped inside the toolchain |
 | `Toolchains/` | Local build outputs, signed manifest, and dev-only keys; generally gitignored |
@@ -583,6 +584,7 @@ At minimum, the validated toolchain includes:
 - `bin/colmap`
 - `bin/brush` and `bin/brush.real`
 - OpenSSL libraries
+- `da3_mps/`
 - `mapanything_mps/`
 - `vggt_mps/`
 - `fastvggt_mps/`
@@ -606,14 +608,15 @@ The app and the manifest tool intentionally share the same data model shape so m
 
 ### Default backend behavior
 
-EasySplat is currently MapAnything-first.
+EasySplat is currently DA3-first.
 
 That means:
 
-- if `EASYSPLAT_SFM_BACKEND` is unset, the app prefers MapAnything;
-- small jobs on capable hardware may use a more direct MapAnything path;
-- larger or memory-constrained jobs lean toward a seed-and-refine path;
-- COLMAP refinement and matcher/mapper logic are used to harden the result;
+- if `EASYSPLAT_SFM_BACKEND` is unset, the app prefers DA3;
+- DA3 runs on MPS with bundled Apache-2.0 `DA3-BASE` weights;
+- `DA3-SMALL` is bundled as the low-memory fallback inside the DA3 bridge;
+- DA3 accepts only native COLMAP export; larger selections fall back to MapAnything/COLMAP until DA3 has a safe multi-window export;
+- if DA3 fails or scores poorly, MapAnything takes over as the first fallback;
 - if that still is not good enough, COLMAP mapper fallback can take over.
 
 This is the main architectural direction of the repo right now.
@@ -622,7 +625,8 @@ This is the main architectural direction of the repo right now.
 
 | Backend selector | Meaning |
 | --- | --- |
-| `mapanything` | Current preferred integrated path |
+| `da3` | Current preferred integrated path |
+| `mapanything` | First fallback and explicit override path |
 | `colmap` | Legacy integrated COLMAP path |
 | `glomap` / `global_mapper` | Alias into COLMAP `global_mapper` flow |
 | `vggt` | Explicit override path, still supported |
@@ -647,7 +651,8 @@ From that it derives settings such as:
 
 - MapAnything resolution,
 - direct-view limit,
-- window size and overlap,
+- DA3 direct export limits,
+- MapAnything window size and overlap,
 - VGGT point limits,
 - COLMAP feature and match caps,
 - thread caps,
@@ -716,7 +721,8 @@ Keeping those separate reduces churn and lets the app point at a hosted, signed 
 
 The release model is split across local scripts and GitHub workflows:
 
-- the local end-to-end source of truth is `./scripts/release/build_dmg.sh`, which builds COLMAP, OpenSSL, Brush, MapAnything, VGGT, and FastVGGT inputs before packaging the toolchain and app;
+- the local end-to-end source of truth is `./scripts/release/build_dmg.sh`, which builds COLMAP, OpenSSL, Brush, DA3, MapAnything, VGGT, and FastVGGT inputs before packaging the toolchain and app;
+- DA3 release builds require pinned git provenance; `EASYSPLAT_ALLOW_UNPINNED_DA3_SOURCE=1` is development-only and rejected by release/CI paths;
 - the GitHub toolchain workflow publishes `toolchain-macos-arm64-<version>-core.zip`, `toolchain-macos-arm64-<version>-models.zip`, and `manifest.json`;
 - the manifest is signed and points at those hosted release assets.
 
@@ -777,7 +783,7 @@ What this script does, at a high level:
 - rebuilds only when needed or forced,
 - packages `core` and `models` zips when toolchain inputs changed,
 - signs a local `Toolchains/manifest.json`,
-- serves `Toolchains/` over `python3 -m http.server`,
+- serves a temporary public directory containing only `manifest.json` and toolchain zip links,
 - exports the manifest URL and public key env vars the app expects.
 
 Backward-compatible aliases still exist:
@@ -803,6 +809,7 @@ When you need to work on packaging or backend bundles directly, the toolchain bu
 - `build_openssl.sh`
 - `build_colmap.sh`
 - `build_brush.sh`
+- `build_da3_mps.sh`
 - `build_mapanything_mps.sh`
 - `build_vggt_mps.sh`
 - `build_fastvggt_mps.sh`
@@ -907,6 +914,7 @@ Repo verification also includes:
 
 ```bash
 ./scripts/test_python_tools.sh
+PYTHON_BIN=/opt/homebrew/bin/python3 ./scripts/test_python_tools.sh
 swift test --package-path Tools/ManifestTool
 ```
 
@@ -940,7 +948,13 @@ Force COLMAP GPU policy:
 EASYSPLAT_COLMAP_USE_GPU=0 swift run EasySplatApp
 ```
 
-Benchmark the packaged MapAnything wrapper directly:
+Benchmark the packaged DA3 wrapper directly:
+
+```bash
+./scripts/benchmark_da3.sh --video /absolute/path/to/input.mp4
+```
+
+Benchmark the packaged MapAnything fallback directly:
 
 ```bash
 ./scripts/benchmark_mapanything.sh --video /absolute/path/to/input.mp4
@@ -974,11 +988,21 @@ This is intentionally compact, not exhaustive.
 | `EASYSPLAT_TOOLCHAIN_MANIFEST_URL` | Override manifest URL |
 | `EASYSPLAT_TOOLCHAIN_PUBLIC_KEY_BASE64` | Override embedded public key |
 | `EASYSPLAT_LOCAL_TOOLCHAIN_ROOT` | Bypass download and validate a local toolchain |
-| `EASYSPLAT_SFM_BACKEND` | Force `mapanything`, `colmap`, `glomap`, `global_mapper`, `vggt`, or `fastvggt` |
+| `EASYSPLAT_SFM_BACKEND` | Force `da3`, `mapanything`, `colmap`, `glomap`, `global_mapper`, `vggt`, or `fastvggt` |
 | `EASYSPLAT_SFM_MAPPER` | Influence fallback solver choice inside the SfM flow |
 | `EASYSPLAT_STOP_AFTER_SFM` | Stop the pipeline after reconstruction |
 | `EASYSPLAT_SKIP_TRAINING` | Skip Brush training |
 | `EASYSPLAT_AUTOTUNE` | Control hardware-based parameter tuning |
+| `EASYSPLAT_DA3_DEVICE` | Usually `mps` or `cpu` |
+| `EASYSPLAT_DA3_MODEL` | Primary DA3 model subdirectory |
+| `EASYSPLAT_DA3_FALLBACK_MODEL` | Low-memory DA3 fallback model subdirectory |
+| `EASYSPLAT_DA3_PROCESS_RES` | Override DA3 processing resolution |
+| `EASYSPLAT_DA3_MAX_POINTS` | Override DA3 point cap |
+| `EASYSPLAT_DA3_CAMERA_TYPE` | Override camera model |
+| `EASYSPLAT_DA3_SHARED_CAMERA` | Toggle shared-camera assumption |
+| `EASYSPLAT_DA3_WINDOW_SIZE` | DA3 window size for longer selections |
+| `EASYSPLAT_DA3_WINDOW_OVERLAP` | DA3 window overlap for longer selections |
+| `EASYSPLAT_DA3_DIRECT_MIN_TRACK_LENGTH` | Minimum mean track length for accepting direct DA3 |
 | `EASYSPLAT_MAPANYTHING_DEVICE` | Usually `mps` or `cpu` |
 | `EASYSPLAT_MAPANYTHING_RESOLUTION` | Override MapAnything resolution |
 | `EASYSPLAT_MAPANYTHING_MEMORY_EFFICIENT` | Toggle memory-efficient inference |
@@ -998,7 +1022,7 @@ This is intentionally compact, not exhaustive.
 
 Notes:
 
-- MapAnything variables are the most relevant day to day because MapAnything is the current default.
+- DA3 variables are the most relevant day to day because DA3 is the current default; MapAnything variables still matter for fallback tuning.
 - Many VGGT and FastVGGT variables still exist in the codebase for explicit override flows.
 - Some older FastVGGT-specific environment variables are still documented as deprecated or ignored.
 
@@ -1014,7 +1038,8 @@ Notes:
 | `EasySplatCore/Sources/EasySplatCore/Project/ProjectMetadata.swift` | Understand persisted state and checkpoints |
 | `EasySplatCore/Sources/EasySplatCore/Tools/ToolchainManager.swift` | Understand toolchain download, install, cache, and validation |
 | `EasySplatCore/Sources/EasySplatCore/Tools/ToolchainManifest.swift` | Understand the signed manifest format |
-| `EasySplatCore/Sources/EasySplatCore/SfM/MapAnythingSfmRunner.swift` | Understand the current preferred SfM backend bridge |
+| `EasySplatCore/Sources/EasySplatCore/SfM/Da3SfmRunner.swift` | Understand the current preferred SfM backend bridge |
+| `EasySplatCore/Sources/EasySplatCore/SfM/MapAnythingSfmRunner.swift` | Understand the fallback SfM backend bridge |
 | `EasySplatCore/Sources/EasySplatCore/Training/BrushRunner.swift` | Understand training execution and CLI compatibility handling |
 | `STYLE_GUIDE.md` | Understand the intended UI feel and rules |
 | `README.md` | Quick-start commands and release/setup overview |

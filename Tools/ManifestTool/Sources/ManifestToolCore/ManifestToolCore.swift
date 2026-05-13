@@ -137,6 +137,11 @@ public enum ManifestToolDefaults {
         "bin/brush.real",
         "lib/libcrypto.3.dylib",
         "lib/libssl.3.dylib",
+        "da3_mps/bin/easysplat_da3_sfm",
+        "da3_mps/python/bin/python3",
+        "da3_mps/build_info.json",
+        "da3_mps/app/easysplat_da3_sfm/run.py",
+        "da3_mps/vendor/depth-anything-3/src/depth_anything_3/api.py",
         "mapanything_mps/bin/easysplat_mapanything_sfm",
         "mapanything_mps/python/bin/python3",
         "mapanything_mps/build_info.json",
@@ -155,6 +160,12 @@ public enum ManifestToolDefaults {
     ]
 
     public static let splitModelsContents = [
+        "da3_mps/models/DA3-BASE/config.json",
+        "da3_mps/models/DA3-BASE/model.safetensors",
+        "da3_mps/models/DA3-BASE/easysplat_model_info.json",
+        "da3_mps/models/DA3-SMALL/config.json",
+        "da3_mps/models/DA3-SMALL/model.safetensors",
+        "da3_mps/models/DA3-SMALL/easysplat_model_info.json",
         "mapanything_mps/models/map-anything-apache/config.json",
         "mapanything_mps/models/map-anything-apache/model.safetensors",
         "mapanything_mps/models/dinov2/dinov2_vitg14_pretrain.pth",
@@ -163,6 +174,81 @@ public enum ManifestToolDefaults {
     ]
 
     public static let monolithicContents = splitCoreContents + splitModelsContents
+}
+
+public enum ManifestKeyInput {
+    public static func resolvePrivateKeyBase64(parser: inout ArgParser) throws -> String {
+        let inline = parser.value(for: "--private-key")
+        let filePath = parser.value(for: "--private-key-file")
+        let envName = parser.value(for: "--private-key-env")
+        let sources = [inline, filePath, envName].compactMap { $0 }
+        guard sources.count == 1 else {
+            throw NSError(
+                domain: "ManifestTool",
+                code: 5,
+                userInfo: [NSLocalizedDescriptionKey: "Specify exactly one private key source: --private-key, --private-key-file, or --private-key-env"]
+            )
+        }
+
+        if let inline {
+            return inline.trimmingCharacters(in: .whitespacesAndNewlines)
+        }
+        if let filePath {
+            let url = URL(fileURLWithPath: filePath)
+            return try String(contentsOf: url, encoding: .utf8)
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+        }
+        guard let envName else {
+            throw NSError(
+                domain: "ManifestTool",
+                code: 5,
+                userInfo: [NSLocalizedDescriptionKey: "Specify exactly one private key source"]
+            )
+        }
+        let trimmedName = envName.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmedName.isEmpty,
+              let value = ProcessInfo.processInfo.environment[trimmedName]?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !value.isEmpty else {
+            throw NSError(
+                domain: "ManifestTool",
+                code: 6,
+                userInfo: [NSLocalizedDescriptionKey: "Environment variable \(envName) does not contain a private key"]
+            )
+        }
+        return value
+    }
+
+    public static func writePrivateKeyBase64(_ value: String, to url: URL) throws {
+        let fm = FileManager.default
+        let parent = url.deletingLastPathComponent()
+        try fm.createDirectory(at: parent, withIntermediateDirectories: true)
+        let tempURL = parent.appendingPathComponent(".\(url.lastPathComponent).\(UUID().uuidString).tmp")
+        defer {
+            if fm.fileExists(atPath: tempURL.path) {
+                try? fm.removeItem(at: tempURL)
+            }
+        }
+
+        guard fm.createFile(
+            atPath: tempURL.path,
+            contents: Data(value.utf8),
+            attributes: [.posixPermissions: 0o600]
+        ) else {
+            throw NSError(
+                domain: "ManifestTool",
+                code: 7,
+                userInfo: [NSLocalizedDescriptionKey: "Failed to create private key file at \(url.path)"]
+            )
+        }
+        try fm.setAttributes([.posixPermissions: 0o600], ofItemAtPath: tempURL.path)
+
+        if fm.fileExists(atPath: url.path) {
+            _ = try fm.replaceItemAt(url, withItemAt: tempURL, backupItemName: nil, options: [])
+        } else {
+            try fm.moveItem(at: tempURL, to: url)
+        }
+        try fm.setAttributes([.posixPermissions: 0o600], ofItemAtPath: url.path)
+    }
 }
 
 public enum ExitCode: Int32 {

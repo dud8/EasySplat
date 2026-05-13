@@ -27,6 +27,7 @@ BRUSH_INSTALL="${BRUSH_INSTALL:-$ROOT/Toolchains/build/brush/install}"
 VGGT_MPS_INSTALL="${VGGT_MPS_INSTALL:-$ROOT/Toolchains/build/vggt_mps/install}"
 FASTVGGT_MPS_INSTALL="${FASTVGGT_MPS_INSTALL:-$ROOT/Toolchains/build/fastvggt_mps/install}"
 MAPANYTHING_MPS_INSTALL="${MAPANYTHING_MPS_INSTALL:-$ROOT/Toolchains/build/mapanything_mps/install}"
+DA3_MPS_INSTALL="${DA3_MPS_INSTALL:-$ROOT/Toolchains/build/da3_mps/install}"
 
 OUT="$ROOT/Toolchains/out"
 BIN="$OUT/bin"
@@ -74,6 +75,28 @@ if payload.get("toolchain_name") != tool_name:
         f"got {payload.get('toolchain_name')!r}"
     )
 PY
+}
+
+require_bundled_arm64_python() {
+  local tool_name="$1"
+  local python_bin="$2"
+  local desc
+  desc="$(/usr/bin/file -b "$python_bin")"
+  if [[ "$desc" != *Mach-O* ]]; then
+    echo "$tool_name python is not a Mach-O binary (file reported: $desc)." >&2
+    exit 1
+  fi
+  if [[ "$desc" != *arm64* ]]; then
+    echo "$tool_name python is not arm64 (Rosetta build detected). Rebuild $tool_name on Apple Silicon." >&2
+    exit 1
+  fi
+  if [ -L "$python_bin" ]; then
+    target="$(readlink "$python_bin" || true)"
+    if [[ "$target" == /* ]]; then
+      echo "$tool_name python3 is an absolute symlink ($target). Rebuild $tool_name with bundled CPython." >&2
+      exit 1
+    fi
+  fi
 }
 
 is_system_dependency() {
@@ -277,6 +300,53 @@ SCRIPT
 
 chmod +x "$BIN/colmap" "$BIN/brush" "$BIN/brush.real"
 
+if [ ! -d "$DA3_MPS_INSTALL/da3_mps" ]; then
+  echo "da3_mps bundle not found at $DA3_MPS_INSTALL/da3_mps. Build it before packaging." >&2
+  exit 1
+fi
+if [ ! -x "$DA3_MPS_INSTALL/da3_mps/bin/easysplat_da3_sfm" ]; then
+  echo "da3_mps bundle missing bin/easysplat_da3_sfm. Rebuild da3_mps." >&2
+  exit 1
+fi
+if [ ! -x "$DA3_MPS_INSTALL/da3_mps/python/bin/python3" ]; then
+  echo "da3_mps bundle missing python/bin/python3. Rebuild da3_mps." >&2
+  exit 1
+fi
+if [ ! -f "$DA3_MPS_INSTALL/da3_mps/build_info.json" ]; then
+  echo "da3_mps bundle missing build_info.json. Rebuild da3_mps." >&2
+  exit 1
+fi
+if [ ! -f "$DA3_MPS_INSTALL/da3_mps/app/easysplat_da3_sfm/run.py" ]; then
+  echo "da3_mps bundle missing app/easysplat_da3_sfm/run.py. Rebuild da3_mps." >&2
+  exit 1
+fi
+DA3_PY_BIN="$DA3_MPS_INSTALL/da3_mps/python/bin/python3"
+require_bundled_arm64_python "da3_mps" "$DA3_PY_BIN"
+validate_build_info "$DA3_PY_BIN" "$DA3_MPS_INSTALL/da3_mps/build_info.json" "da3_mps"
+if [ ! -d "$DA3_MPS_INSTALL/da3_mps/models" ]; then
+  echo "da3_mps bundle missing models/. Rebuild da3_mps." >&2
+  exit 1
+fi
+for model in DA3-BASE DA3-SMALL; do
+  if [ ! -f "$DA3_MPS_INSTALL/da3_mps/models/$model/model.safetensors" ]; then
+    echo "da3_mps bundle missing models/$model/model.safetensors. Rebuild da3_mps." >&2
+    exit 1
+  fi
+  if [ ! -f "$DA3_MPS_INSTALL/da3_mps/models/$model/config.json" ]; then
+    echo "da3_mps bundle missing models/$model/config.json. Rebuild da3_mps." >&2
+    exit 1
+  fi
+  if [ ! -f "$DA3_MPS_INSTALL/da3_mps/models/$model/easysplat_model_info.json" ]; then
+    echo "da3_mps bundle missing models/$model/easysplat_model_info.json. Rebuild da3_mps." >&2
+    exit 1
+  fi
+done
+if [ ! -f "$DA3_MPS_INSTALL/da3_mps/vendor/depth-anything-3/src/depth_anything_3/api.py" ]; then
+  echo "da3_mps bundle missing vendor/depth-anything-3. Rebuild da3_mps." >&2
+  exit 1
+fi
+cp -R "$DA3_MPS_INSTALL/da3_mps" "$OUT/da3_mps"
+
 if [ ! -d "$MAPANYTHING_MPS_INSTALL/mapanything_mps" ]; then
   echo "mapanything_mps bundle not found at $MAPANYTHING_MPS_INSTALL/mapanything_mps. Build it before packaging." >&2
   exit 1
@@ -298,17 +368,7 @@ if [ ! -f "$MAPANYTHING_MPS_INSTALL/mapanything_mps/app/easysplat_mapanything_sf
   exit 1
 fi
 MAP_PY_BIN="$MAPANYTHING_MPS_INSTALL/mapanything_mps/python/bin/python3"
-if ! /usr/bin/file "$MAP_PY_BIN" | grep -q "arm64"; then
-  echo "mapanything_mps python is not arm64 (Rosetta build detected). Rebuild mapanything_mps on Apple Silicon." >&2
-  exit 1
-fi
-if [ -L "$MAP_PY_BIN" ]; then
-  target="$(readlink "$MAP_PY_BIN" || true)"
-  if [[ "$target" == /* ]]; then
-    echo "mapanything_mps python3 is an absolute symlink ($target). Rebuild mapanything_mps with bundled CPython." >&2
-    exit 1
-  fi
-fi
+require_bundled_arm64_python "mapanything_mps" "$MAP_PY_BIN"
 validate_build_info "$MAP_PY_BIN" "$MAPANYTHING_MPS_INSTALL/mapanything_mps/build_info.json" "mapanything_mps"
 if [ ! -d "$MAPANYTHING_MPS_INSTALL/mapanything_mps/models" ]; then
   echo "mapanything_mps bundle missing models/. Rebuild mapanything_mps." >&2
@@ -353,17 +413,7 @@ if [ ! -f "$VGGT_MPS_INSTALL/vggt_mps/app/easysplat_vggt_sfm/run.py" ]; then
   exit 1
 fi
 PY_BIN="$VGGT_MPS_INSTALL/vggt_mps/python/bin/python3"
-if ! /usr/bin/file "$PY_BIN" | grep -q "arm64"; then
-  echo "vggt_mps python is not arm64 (Rosetta build detected). Rebuild vggt_mps on Apple Silicon." >&2
-  exit 1
-fi
-if [ -L "$PY_BIN" ]; then
-  target="$(readlink "$PY_BIN" || true)"
-  if [[ "$target" == /* ]]; then
-    echo "vggt_mps python3 is an absolute symlink ($target). Rebuild vggt_mps with bundled CPython (no external Python dependency)." >&2
-    exit 1
-  fi
-fi
+require_bundled_arm64_python "vggt_mps" "$PY_BIN"
 validate_build_info "$PY_BIN" "$VGGT_MPS_INSTALL/vggt_mps/build_info.json" "vggt_mps"
 if [ ! -d "$VGGT_MPS_INSTALL/vggt_mps/models" ]; then
   echo "vggt_mps bundle missing models/. Rebuild vggt_mps." >&2
@@ -400,17 +450,7 @@ if [ ! -f "$FASTVGGT_MPS_INSTALL/fastvggt_mps/app/easysplat_fastvggt_sfm/run.py"
   exit 1
 fi
 FAST_PY_BIN="$FASTVGGT_MPS_INSTALL/fastvggt_mps/python/bin/python3"
-if ! /usr/bin/file "$FAST_PY_BIN" | grep -q "arm64"; then
-  echo "fastvggt_mps python is not arm64 (Rosetta build detected). Rebuild fastvggt_mps on Apple Silicon." >&2
-  exit 1
-fi
-if [ -L "$FAST_PY_BIN" ]; then
-  target="$(readlink "$FAST_PY_BIN" || true)"
-  if [[ "$target" == /* ]]; then
-    echo "fastvggt_mps python3 is an absolute symlink ($target). Rebuild fastvggt_mps with bundled CPython." >&2
-    exit 1
-  fi
-fi
+require_bundled_arm64_python "fastvggt_mps" "$FAST_PY_BIN"
 validate_build_info "$FAST_PY_BIN" "$FASTVGGT_MPS_INSTALL/fastvggt_mps/build_info.json" "fastvggt_mps"
 if [ ! -d "$FASTVGGT_MPS_INSTALL/fastvggt_mps/models" ]; then
   echo "fastvggt_mps bundle missing models/. Rebuild fastvggt_mps." >&2
@@ -510,10 +550,11 @@ validate_portable_dependency_references
 pushd "$OUT" >/dev/null
 zip -r "$CORE_ZIP" \
   bin lib \
+  da3_mps/bin da3_mps/python da3_mps/app da3_mps/vendor da3_mps/build_info.json \
   mapanything_mps/bin mapanything_mps/python mapanything_mps/app mapanything_mps/vendor mapanything_mps/build_info.json \
   vggt_mps/bin vggt_mps/python vggt_mps/app vggt_mps/vendor vggt_mps/build_info.json \
   fastvggt_mps/bin fastvggt_mps/python fastvggt_mps/app fastvggt_mps/vendor fastvggt_mps/build_info.json
-zip -r "$MODELS_ZIP" mapanything_mps/models vggt_mps/models fastvggt_mps/models
+zip -r "$MODELS_ZIP" da3_mps/models mapanything_mps/models vggt_mps/models fastvggt_mps/models
 popd >/dev/null
 
 echo "Packaged toolchain (core): $CORE_ZIP"

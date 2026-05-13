@@ -62,7 +62,7 @@ enum TestFileBuilder {
         return CGImageDestinationFinalize(destination)
     }
 
-    static func writeMinimalPly(at url: URL, vertexCount: Int = 1) throws {
+    static func writeXYZOnlyPly(at url: URL, vertexCount: Int = 1) throws {
         let safeCount = max(1, vertexCount)
         let body = (0..<safeCount).map { _ in "0 0 0" }.joined(separator: "\n")
         let text = """
@@ -72,6 +72,35 @@ enum TestFileBuilder {
         property float x
         property float y
         property float z
+        end_header
+        \(body)
+        """
+        try text.write(to: url, atomically: true, encoding: .utf8)
+    }
+
+    static func writeMinimalPly(at url: URL, vertexCount: Int = 1) throws {
+        let safeCount = max(1, vertexCount)
+        let body = (0..<safeCount).map { _ in
+            "0 0 0 1 1 1 -4 -4 -4 1 1 0 0 0"
+        }.joined(separator: "\n")
+        let text = """
+        ply
+        format ascii 1.0
+        element vertex \(safeCount)
+        property float x
+        property float y
+        property float z
+        property float f_dc_0
+        property float f_dc_1
+        property float f_dc_2
+        property float scale_0
+        property float scale_1
+        property float scale_2
+        property float opacity
+        property float rot_0
+        property float rot_1
+        property float rot_2
+        property float rot_3
         end_header
         \(body)
         """

@@ -661,8 +661,8 @@ final class PipelineRunnerHelperTests: XCTestCase {
         defer { restore() }
 
         let order = runner.test_sfmBackendFallbackOrder()
-        XCTAssertEqual(order, [.mapanything, .colmap])
-        XCTAssertEqual(runner.test_sfmBackendPolicy(), .mapanything)
+        XCTAssertEqual(order, [.da3, .mapanything, .colmap])
+        XCTAssertEqual(runner.test_sfmBackendPolicy(), .da3)
     }
 
     func testSfmBackendFallbackOrderIgnoresDeprecatedGraceEnv() async throws {
@@ -675,7 +675,18 @@ final class PipelineRunnerHelperTests: XCTestCase {
             "EASYSPLAT_ENABLE_VGGT_GRACE_FALLBACK": "1"
         ]) {
             let order = runner.test_sfmBackendFallbackOrder()
-            XCTAssertEqual(order, [.mapanything, .colmap])
+            XCTAssertEqual(order, [.da3, .mapanything, .colmap])
+        }
+    }
+
+    func testSfmBackendDa3FromEnv() async throws {
+        let root = try TestFileBuilder.makeTempDir()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let runner = makeRunner(projectURL: root)
+
+        await withEnvironmentAsync(["EASYSPLAT_SFM_BACKEND": "da3"]) {
+            XCTAssertEqual(runner.test_sfmBackendPolicy(), .da3)
+            XCTAssertEqual(runner.test_sfmBackendFallbackOrder(), [.da3])
         }
     }
 
@@ -960,12 +971,42 @@ final class PipelineRunnerHelperTests: XCTestCase {
         defer { try? FileManager.default.removeItem(at: root) }
         let runner = makeRunner(projectURL: root)
 
-        XCTAssertEqual(runner.test_mapAnythingDirectMinimumMeanTrackLengthPreference(mode: .object), 1.15, accuracy: 0.001)
-        XCTAssertEqual(runner.test_mapAnythingDirectMinimumMeanTrackLengthPreference(mode: .room), 1.20, accuracy: 0.001)
+        await withEnvironmentAsync(["EASYSPLAT_MAPANYTHING_DIRECT_MIN_TRACK_LENGTH": nil]) {
+            XCTAssertEqual(runner.test_mapAnythingDirectMinimumMeanTrackLengthPreference(mode: .object), 1.15, accuracy: 0.001)
+            XCTAssertEqual(runner.test_mapAnythingDirectMinimumMeanTrackLengthPreference(mode: .room), 1.20, accuracy: 0.001)
+        }
 
         await withEnvironmentAsync(["EASYSPLAT_MAPANYTHING_DIRECT_MIN_TRACK_LENGTH": "1.33"]) {
             XCTAssertEqual(runner.test_mapAnythingDirectMinimumMeanTrackLengthPreference(mode: .object), 1.33, accuracy: 0.001)
             XCTAssertEqual(runner.test_mapAnythingDirectMinimumMeanTrackLengthPreference(mode: .room), 1.33, accuracy: 0.001)
+        }
+    }
+
+    func testDa3DirectMinimumTrackLengthUsesDa3EnvOnly() async throws {
+        let root = try TestFileBuilder.makeTempDir()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let runner = makeRunner(projectURL: root)
+
+        await withEnvironmentAsync([
+            "EASYSPLAT_DA3_DIRECT_MIN_TRACK_LENGTH": nil,
+            "EASYSPLAT_MAPANYTHING_DIRECT_MIN_TRACK_LENGTH": nil
+        ]) {
+            XCTAssertEqual(runner.test_da3DirectMinimumMeanTrackLengthPreference(mode: .object), 1.15, accuracy: 0.001)
+            XCTAssertEqual(runner.test_da3DirectMinimumMeanTrackLengthPreference(mode: .room), 1.20, accuracy: 0.001)
+        }
+
+        await withEnvironmentAsync([
+            "EASYSPLAT_DA3_DIRECT_MIN_TRACK_LENGTH": nil,
+            "EASYSPLAT_MAPANYTHING_DIRECT_MIN_TRACK_LENGTH": "1.80"
+        ]) {
+            XCTAssertEqual(runner.test_da3DirectMinimumMeanTrackLengthPreference(mode: .object), 1.15, accuracy: 0.001)
+        }
+        await withEnvironmentAsync([
+            "EASYSPLAT_DA3_DIRECT_MIN_TRACK_LENGTH": "1.33",
+            "EASYSPLAT_MAPANYTHING_DIRECT_MIN_TRACK_LENGTH": nil
+        ]) {
+            XCTAssertEqual(runner.test_da3DirectMinimumMeanTrackLengthPreference(mode: .object), 1.33, accuracy: 0.001)
+            XCTAssertEqual(runner.test_da3DirectMinimumMeanTrackLengthPreference(mode: .room), 1.33, accuracy: 0.001)
         }
     }
 
@@ -1012,6 +1053,54 @@ final class PipelineRunnerHelperTests: XCTestCase {
             runner.test_mapAnythingDirectQualityFailureReason(score: missingTrackStats, mode: .object)?
                 .contains("mean track length") == true
         )
+    }
+
+    func testDa3DirectQualityFailureReasonIgnoresMapAnythingThreshold() async throws {
+        let root = try TestFileBuilder.makeTempDir()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let runner = makeRunner(projectURL: root)
+        let score = ReconstructionScore(
+            registeredImages: 4,
+            totalImages: 4,
+            meanReprojectionError: 0.8,
+            pointCount: 4_000,
+            observationCount: 5_200,
+            meanTrackLength: 1.30
+        )
+
+        await withEnvironmentAsync([
+            "EASYSPLAT_DA3_DIRECT_MIN_TRACK_LENGTH": nil,
+            "EASYSPLAT_MAPANYTHING_DIRECT_MIN_TRACK_LENGTH": "1.80"
+        ]) {
+            XCTAssertNil(runner.test_da3DirectQualityFailureReason(score: score, mode: .object))
+            XCTAssertNotNil(runner.test_mapAnythingDirectQualityFailureReason(score: score, mode: .object))
+        }
+    }
+
+    func testResetPerRunToolLogsRemovesDa3Log() throws {
+        let root = try TestFileBuilder.makeTempDir()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let paths = ProjectPaths(root: root)
+        try paths.ensureDirectories()
+
+        let urls = [
+            paths.colmapLogURL,
+            paths.glomapLogURL,
+            paths.da3LogURL,
+            paths.mapanythingLogURL,
+            paths.vggtLogURL,
+            paths.fastvggtLogURL,
+            paths.brushLogURL
+        ]
+        for url in urls {
+            try "stale\n".write(to: url, atomically: true, encoding: .utf8)
+        }
+
+        PipelineRunner.resetPerRunToolLogs(at: paths)
+
+        for url in urls {
+            XCTAssertFalse(FileManager.default.fileExists(atPath: url.path), "\(url.lastPathComponent) should be reset")
+        }
     }
 
     func testBrushExportStepParsing() throws {

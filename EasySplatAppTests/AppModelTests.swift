@@ -37,6 +37,34 @@ final class AppModelTests: XCTestCase {
         XCTAssertTrue(FileManager.default.fileExists(atPath: metadataURL.path))
     }
 
+    func testStartProjectReportsFailureWhenRunnerFinishesWithoutReadyOutput() async throws {
+        let tempBase = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: tempBase) }
+        try FileManager.default.createDirectory(at: tempBase, withIntermediateDirectories: true)
+        let input = tempBase.appendingPathComponent("input.mov")
+        try Data("video".utf8).write(to: input)
+
+        let model = AppModel(
+            toolchainManager: MockToolchainManager(),
+            projectBaseURL: tempBase
+        ) { projectURL, _ in
+            MissingOutputPipelineRunner(projectURL: projectURL)
+        }
+
+        await model.startProject(input: .video(files: [input.path]), title: "MissingOutput")
+
+        XCTAssertEqual(model.viewState, .processing)
+        XCTAssertNil(model.outputPlyURL)
+        XCTAssertEqual(model.lastError, "Processing failed. Expected outputs were missing.")
+        XCTAssertEqual(model.statusTitle, "Processing failed. Expected outputs were missing.")
+        guard let projectURL = model.currentProjectURL else {
+            XCTFail("Missing project URL")
+            return
+        }
+        let metadata = try ProjectMetadataStore.load(from: ProjectPaths(root: projectURL).metadataURL)
+        XCTAssertEqual(metadata.state.lastError, "Processing failed. Expected outputs were missing.")
+    }
+
     func testLivePreviewToggleResetsPerProjectStart() async throws {
         let tempBase = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
         try FileManager.default.createDirectory(at: tempBase, withIntermediateDirectories: true)
@@ -113,7 +141,7 @@ final class AppModelTests: XCTestCase {
         try paths.ensureDirectories()
         let output = paths.outputURL.appendingPathComponent("splat.ply")
         try FileManager.default.createDirectory(at: paths.outputURL, withIntermediateDirectories: true)
-        try Data("ply".utf8).write(to: output)
+        try writeMinimalPly(at: output)
 
         let metadata = ProjectMetadata(
             title: "Project",
@@ -165,6 +193,182 @@ final class AppModelTests: XCTestCase {
         var isDirectory = ObjCBool(false)
         XCTAssertTrue(FileManager.default.fileExists(atPath: output.path, isDirectory: &isDirectory))
         XCTAssertFalse(isDirectory.boolValue)
+    }
+
+    func testResumeProjectRunsPipelineWhenPersistedOutputIsCorrupt() async throws {
+        let tempBase = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: tempBase) }
+        try FileManager.default.createDirectory(at: tempBase, withIntermediateDirectories: true)
+        let projectURL = tempBase.appendingPathComponent("Project.easysplatproj", isDirectory: true)
+        try FileManager.default.createDirectory(at: projectURL, withIntermediateDirectories: true)
+        let paths = ProjectPaths(root: projectURL)
+        try paths.ensureDirectories()
+        let output = paths.outputURL.appendingPathComponent("splat.ply")
+        try "ply".write(to: output, atomically: true, encoding: .utf8)
+
+        let metadata = ProjectMetadata(
+            title: "Project",
+            input: .photos(folder: "/tmp/photos"),
+            preset: PresetSpec(mode: .object, quality: .standard),
+            state: PipelineState(stage: .done, attempt: 0, lastError: nil, resumeToken: nil),
+            outputs: OutputSpec(splatPlyPath: "Output/splat.ply", colmapModelPath: "SfM/colmap/sparse/0")
+        )
+        try ProjectMetadataStore.save(metadata, to: paths.metadataURL)
+
+        let runner = DirectoryOutputRepairingPipelineRunner(projectURL: projectURL)
+        let model = AppModel(toolchainManager: MockToolchainManager(), projectBaseURL: tempBase) { _, _ in
+            runner
+        }
+
+        model.resumeProject(at: projectURL)
+        try await waitForViewState(model: model, state: .viewer)
+
+        XCTAssertTrue(runner.didRun)
+        XCTAssertEqual(ProjectArtifactValidator.validatePlyFile(at: output), .valid)
+    }
+
+    func testOldCanceledTaskDoesNotClearNewerCurrentTask() async throws {
+        let tempBase = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: tempBase) }
+        try FileManager.default.createDirectory(at: tempBase, withIntermediateDirectories: true)
+        let firstURL = try makeProject(at: tempBase, name: "First", lastError: nil, withOutput: false)
+        let secondURL = try makeProject(at: tempBase, name: "Second", lastError: nil, withOutput: false)
+        var callCount = 0
+        let firstWaiting = expectation(description: "first run waiting for cancellation")
+        let firstCanceled = expectation(description: "first run observed cancellation")
+        let firstFinished = expectation(description: "first run finished after cancellation")
+        let model = AppModel(toolchainManager: MockToolchainManager(), projectBaseURL: tempBase) { _, _ in
+            callCount += 1
+            if callCount == 1 {
+                return DelayedCancellationPipelineRunner(
+                    waitingForCancellation: firstWaiting,
+                    cancellationObserved: firstCanceled,
+                    runFinished: firstFinished
+                )
+            }
+            return BlockingPipelineRunner()
+        }
+
+        model.resumeProject(at: firstURL)
+        try await waitForViewState(model: model, state: .processing)
+        await fulfillment(of: [firstWaiting], timeout: 2.0)
+        model.resumeProject(at: secondURL)
+        await fulfillment(of: [firstCanceled, firstFinished], timeout: 2.0)
+        await Task.yield()
+
+        XCTAssertNotNil(model.currentTask)
+        XCTAssertEqual(model.currentProjectURL, secondURL)
+
+        model.cancelCurrentProject(deleteProject: false)
+        try await waitForViewState(model: model, state: .home, timeout: 4.0)
+    }
+
+    func testOldCanceledTaskDoesNotOverwriteNewerProjectState() async throws {
+        let tempBase = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: tempBase) }
+        try FileManager.default.createDirectory(at: tempBase, withIntermediateDirectories: true)
+        let firstURL = try makeProject(at: tempBase, name: "First", lastError: nil, withOutput: false)
+        let secondURL = try makeProject(at: tempBase, name: "Second", lastError: nil, withOutput: false)
+        let firstStarted = expectation(description: "first run started")
+        let firstFinished = expectation(description: "first run finished late")
+        let lateRunner = LateCompletingPipelineRunner(
+            projectURL: firstURL,
+            started: firstStarted,
+            finished: firstFinished
+        )
+        var callCount = 0
+        let model = AppModel(toolchainManager: MockToolchainManager(), projectBaseURL: tempBase) { _, _ in
+            callCount += 1
+            if callCount == 1 {
+                return lateRunner
+            }
+            return BlockingPipelineRunner()
+        }
+
+        model.resumeProject(at: firstURL)
+        try await waitForViewState(model: model, state: .processing)
+        await fulfillment(of: [firstStarted], timeout: 2.0)
+        model.resumeProject(at: secondURL)
+        try await waitForCurrentProjectURL(model: model, url: secondURL)
+
+        lateRunner.finish()
+        await fulfillment(of: [firstFinished], timeout: 2.0)
+        try await Task.sleep(nanoseconds: 100_000_000)
+
+        XCTAssertEqual(model.currentProjectURL, secondURL)
+        XCTAssertEqual(model.viewState, .processing)
+        XCTAssertNil(model.outputPlyURL)
+        XCTAssertNotEqual(model.statusTitle, "Stale import")
+
+        model.cancelCurrentProject(deleteProject: false)
+        try await waitForViewState(model: model, state: .home, timeout: 4.0)
+    }
+
+    func testOldCanceledTaskDoesNotOverwriteNewerProjectFailureState() async throws {
+        let tempBase = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: tempBase) }
+        try FileManager.default.createDirectory(at: tempBase, withIntermediateDirectories: true)
+        let firstURL = try makeProject(at: tempBase, name: "First", lastError: nil, withOutput: false)
+        let secondURL = try makeProject(at: tempBase, name: "Second", lastError: nil, withOutput: false)
+        let firstStarted = expectation(description: "first failing run started")
+        let firstFinished = expectation(description: "first failing run finished late")
+        let lateRunner = LateFailingPipelineRunner(started: firstStarted, finished: firstFinished)
+        var callCount = 0
+        let model = AppModel(toolchainManager: MockToolchainManager(), projectBaseURL: tempBase) { _, _ in
+            callCount += 1
+            if callCount == 1 {
+                return lateRunner
+            }
+            return BlockingPipelineRunner()
+        }
+
+        model.resumeProject(at: firstURL)
+        try await waitForViewState(model: model, state: .processing)
+        await fulfillment(of: [firstStarted], timeout: 2.0)
+        model.resumeProject(at: secondURL)
+        try await waitForCurrentProjectURL(model: model, url: secondURL)
+
+        lateRunner.finish()
+        await fulfillment(of: [firstFinished], timeout: 2.0)
+        try await Task.sleep(nanoseconds: 100_000_000)
+
+        XCTAssertEqual(model.currentProjectURL, secondURL)
+        XCTAssertEqual(model.viewState, .processing)
+        XCTAssertNil(model.lastError)
+        XCTAssertNil(model.errorDetails)
+        XCTAssertNotEqual(model.statusTitle, "First project failed")
+
+        model.cancelCurrentProject(deleteProject: false)
+        try await waitForViewState(model: model, state: .home, timeout: 4.0)
+    }
+
+    func testOldToolchainProgressDoesNotOverwriteNewerProjectState() async throws {
+        let tempBase = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: tempBase) }
+        try FileManager.default.createDirectory(at: tempBase, withIntermediateDirectories: true)
+        let firstURL = try makeProject(at: tempBase, name: "First", lastError: nil, withOutput: false)
+        let secondURL = try makeProject(at: tempBase, name: "Second", lastError: nil, withOutput: false)
+        let firstToolchainStarted = expectation(description: "first toolchain started")
+        let manager = DelayedProgressToolchainManager(firstStarted: firstToolchainStarted)
+        let model = AppModel(toolchainManager: manager, projectBaseURL: tempBase) { _, _ in
+            BlockingPipelineRunner()
+        }
+
+        model.resumeProject(at: firstURL)
+        await fulfillment(of: [firstToolchainStarted], timeout: 2.0)
+        model.resumeProject(at: secondURL)
+        try await waitForCurrentProjectURL(model: model, url: secondURL)
+
+        manager.emitFirstProgress(fraction: 0.42, message: "Stale toolchain progress")
+        try await Task.sleep(nanoseconds: 100_000_000)
+
+        XCTAssertEqual(model.currentProjectURL, secondURL)
+        XCTAssertNotEqual(model.statusDetail, "Stale toolchain progress")
+        XCTAssertFalse(model.logLines.contains("[Tools] Stale toolchain progress"))
+
+        manager.finishAll()
+        model.cancelCurrentProject(deleteProject: false)
+        try await waitForViewState(model: model, state: .home, timeout: 4.0)
     }
 
     func testLoadPipelineLogTailWithInvalidUtf8() throws {
@@ -353,6 +557,61 @@ final class AppModelTests: XCTestCase {
         XCTAssertEqual(model.projectSummaries.first?.status, .inProgress)
     }
 
+    func testRefreshProjectSummariesDoesNotMarkCorruptOutputReady() throws {
+        let base = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: base) }
+        try FileManager.default.createDirectory(at: base, withIntermediateDirectories: true)
+        let projectURL = base.appendingPathComponent("CorruptOutput.easysplatproj", isDirectory: true)
+        try FileManager.default.createDirectory(at: projectURL, withIntermediateDirectories: true)
+        let paths = ProjectPaths(root: projectURL)
+        try paths.ensureDirectories()
+        try "ply".write(to: paths.outputURL.appendingPathComponent("splat.ply"), atomically: true, encoding: .utf8)
+        let metadata = ProjectMetadata(
+            title: "CorruptOutput",
+            input: .photos(folder: "/tmp/photos"),
+            preset: PresetSpec(mode: .object, quality: .standard),
+            state: PipelineState(stage: .done, attempt: 0, lastError: nil, resumeToken: nil),
+            outputs: OutputSpec(splatPlyPath: "Output/splat.ply", colmapModelPath: "SfM/colmap/sparse/0")
+        )
+        try ProjectMetadataStore.save(metadata, to: paths.metadataURL)
+
+        let model = AppModel(toolchainManager: MockToolchainManager(), projectBaseURL: base) { _, config in
+            MockPipelineRunner(projectURL: base, config: config)
+        }
+        model.refreshProjectSummaries()
+
+        XCTAssertEqual(model.projectSummaries.first?.status, .inProgress)
+        XCTAssertNil(model.projectSummaries.first?.outputPlyURL)
+    }
+
+    func testRefreshProjectSummariesRejectsEscapingOutputPath() throws {
+        let base = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: base) }
+        try FileManager.default.createDirectory(at: base, withIntermediateDirectories: true)
+        let projectURL = base.appendingPathComponent("EscapingOutput.easysplatproj", isDirectory: true)
+        try FileManager.default.createDirectory(at: projectURL, withIntermediateDirectories: true)
+        let paths = ProjectPaths(root: projectURL)
+        try paths.ensureDirectories()
+        let outside = base.appendingPathComponent("outside.ply")
+        try writeMinimalPly(at: outside)
+        let metadata = ProjectMetadata(
+            title: "EscapingOutput",
+            input: .photos(folder: "/tmp/photos"),
+            preset: PresetSpec(mode: .object, quality: .standard),
+            state: PipelineState(stage: .done, attempt: 0, lastError: nil, resumeToken: nil),
+            outputs: OutputSpec(splatPlyPath: "../outside.ply", colmapModelPath: "SfM/colmap/sparse/0")
+        )
+        try ProjectMetadataStore.save(metadata, to: paths.metadataURL)
+
+        let model = AppModel(toolchainManager: MockToolchainManager(), projectBaseURL: base) { _, config in
+            MockPipelineRunner(projectURL: base, config: config)
+        }
+        model.refreshProjectSummaries()
+
+        XCTAssertEqual(model.projectSummaries.first?.status, .inProgress)
+        XCTAssertNil(model.projectSummaries.first?.outputPlyURL)
+    }
+
     func testInterruptedProjectPromptDeferredPersistsAcrossRelaunch() throws {
         let base = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
         try FileManager.default.createDirectory(at: base, withIntermediateDirectories: true)
@@ -429,6 +688,42 @@ final class AppModelTests: XCTestCase {
         relaunched.refreshProjectSummaries()
         XCTAssertNil(relaunched.recoveryPromptProject)
         XCTAssertFalse(relaunched.projectSummaries.contains(where: { $0.url == url }))
+    }
+
+    func testDeleteInterruptedProjectTreatsAlreadyMissingDirectoryAsDeleted() throws {
+        let base = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: base) }
+        try FileManager.default.createDirectory(at: base, withIntermediateDirectories: true)
+        let url = try makeProject(
+            at: base,
+            name: "InterruptedAlreadyMissing",
+            lastError: nil,
+            withOutput: false,
+            checkpoint: PipelineCheckpoint(
+                stage: .sfmMatching,
+                updatedAt: Date(),
+                progressFraction: 0.1,
+                message: "heartbeat",
+                details: nil
+            ),
+            stage: .sfmMatching
+        )
+
+        let model = AppModel(toolchainManager: MockToolchainManager(), projectBaseURL: base) { _, config in
+            MockPipelineRunner(projectURL: base, config: config)
+        }
+        model.refreshProjectSummaries()
+        guard let prompt = model.recoveryPromptProject else {
+            XCTFail("Expected interrupted project prompt")
+            return
+        }
+        try FileManager.default.removeItem(at: url)
+
+        model.deleteInterruptedProject(prompt)
+
+        XCTAssertNil(model.recoveryPromptProject)
+        XCTAssertTrue(model.ignoredRecoveryProjectIDs.contains(prompt.id))
+        XCTAssertFalse(model.projectSummaries.contains(where: { $0.id == prompt.id }))
     }
 
     func testReturningFromResumedInterruptedProjectSuppressesPromptAcrossRelaunch() async throws {
@@ -646,7 +941,7 @@ final class AppModelTests: XCTestCase {
 
         let paths = ProjectPaths(root: projectA)
         try FileManager.default.createDirectory(at: paths.outputURL, withIntermediateDirectories: true)
-        try Data("ply".utf8).write(to: paths.outputURL.appendingPathComponent("splat.ply"))
+        try writeMinimalPly(at: paths.outputURL.appendingPathComponent("splat.ply"))
         var metadata = try ProjectMetadataStore.load(from: paths.metadataURL)
         metadata.outputs = OutputSpec(splatPlyPath: "Output/splat.ply", colmapModelPath: "SfM/colmap/sparse/0")
         metadata.state = PipelineState(stage: .done, attempt: metadata.state.attempt, lastError: nil, resumeToken: nil)
@@ -826,6 +1121,27 @@ final class AppModelTests: XCTestCase {
         let events = model.test_shareEventsText(projectURL: projectURL)
         XCTAssertTrue(events.contains("share_unavailable"))
         XCTAssertTrue(events.contains("output_is_directory"))
+    }
+
+    func testShareCurrentSplatRejectsFallbackOutputFromDifferentProject() throws {
+        let tempBase = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: tempBase) }
+        try FileManager.default.createDirectory(at: tempBase, withIntermediateDirectories: true)
+        let firstURL = try makeProject(at: tempBase, name: "First", lastError: nil, withOutput: true)
+        let secondURL = try makeProject(at: tempBase, name: "Second", lastError: nil, withOutput: false)
+        let firstOutput = ProjectPaths(root: firstURL).outputURL.appendingPathComponent("splat.ply")
+        let model = AppModel(toolchainManager: MockToolchainManager(), projectBaseURL: tempBase) { _, config in
+            MockPipelineRunner(projectURL: secondURL, config: config)
+        }
+        model.currentProjectURL = secondURL
+        model.outputPlyURL = firstOutput
+
+        model.shareCurrentSplat()
+
+        XCTAssertTrue(model.shareStatusIsError)
+        XCTAssertEqual(model.shareMetrics.shareClickedCount, 0)
+        let metadata = try ProjectMetadataStore.load(from: ProjectPaths(root: secondURL).metadataURL)
+        XCTAssertNil(metadata.shareMetrics)
     }
 
     func testShareCurrentSplatIgnoredWhileSessionAlreadyActive() async throws {
@@ -1008,6 +1324,17 @@ final class AppModelTests: XCTestCase {
         XCTFail("Timed out waiting for viewState to become \(state)")
     }
 
+    private func waitForCurrentProjectURL(model: AppModel, url: URL, timeout: TimeInterval = 2.0) async throws {
+        let deadline = Date().addingTimeInterval(timeout)
+        while Date() < deadline {
+            if model.currentProjectURL == url {
+                return
+            }
+            try await Task.sleep(nanoseconds: 50_000_000)
+        }
+        XCTFail("Timed out waiting for currentProjectURL to become \(url)")
+    }
+
     private func makeProject(
         at base: URL,
         name: String,
@@ -1024,7 +1351,7 @@ final class AppModelTests: XCTestCase {
         try paths.ensureDirectories()
         if withOutput {
             try FileManager.default.createDirectory(at: paths.outputURL, withIntermediateDirectories: true)
-            try Data("ply".utf8).write(to: paths.outputURL.appendingPathComponent("splat.ply"))
+            try writeMinimalPly(at: paths.outputURL.appendingPathComponent("splat.ply"))
         }
         let metadata = ProjectMetadata(
             title: name,
@@ -1156,6 +1483,77 @@ final class MockToolchainManager: ToolchainManaging {
     }
 }
 
+final class DelayedProgressToolchainManager: @unchecked Sendable, ToolchainManaging {
+    private let firstStarted: XCTestExpectation
+    private let lock = NSLock()
+    private var continuations: [CheckedContinuation<ToolchainPaths, Error>] = []
+    private var firstProgress: (@Sendable (Double, String) -> Void)?
+    private var callCount = 0
+
+    init(firstStarted: XCTestExpectation) {
+        self.firstStarted = firstStarted
+    }
+
+    func ensureToolchain(
+        manifestURL: URL,
+        publicKeyBase64: String,
+        targetName: String,
+        onProgress: @escaping @Sendable (Double, String) -> Void
+    ) async throws -> ToolchainPaths {
+        try await withCheckedThrowingContinuation { continuation in
+            lock.lock()
+            callCount += 1
+            if callCount == 1 {
+                firstProgress = onProgress
+                firstStarted.fulfill()
+            }
+            continuations.append(continuation)
+            lock.unlock()
+        }
+    }
+
+    func emitFirstProgress(fraction: Double, message: String) {
+        lock.lock()
+        let progress = firstProgress
+        lock.unlock()
+        progress?(fraction, message)
+    }
+
+    func finishAll() {
+        lock.lock()
+        let pending = continuations
+        continuations = []
+        lock.unlock()
+        let toolchain = mockToolchainPaths()
+        for continuation in pending {
+            continuation.resume(returning: toolchain)
+        }
+    }
+
+    private func mockToolchainPaths() -> ToolchainPaths {
+        let vggt = VggtToolchain(
+            root: URL(fileURLWithPath: "/mock/vggt_mps"),
+            sfmTool: URL(fileURLWithPath: "/mock/vggt_mps/bin/easysplat_vggt_sfm"),
+            python: URL(fileURLWithPath: "/mock/vggt_mps/python/bin/python3"),
+            models: URL(fileURLWithPath: "/mock/vggt_mps/models")
+        )
+        let fastvggt = FastVggtToolchain(
+            root: URL(fileURLWithPath: "/mock/fastvggt_mps"),
+            sfmTool: URL(fileURLWithPath: "/mock/fastvggt_mps/bin/easysplat_fastvggt_sfm"),
+            python: URL(fileURLWithPath: "/mock/fastvggt_mps/python/bin/python3"),
+            models: URL(fileURLWithPath: "/mock/fastvggt_mps/models")
+        )
+        return ToolchainPaths(
+            root: URL(fileURLWithPath: "/tmp/toolchain"),
+            colmap: URL(fileURLWithPath: "/mock/colmap"),
+            glomap: URL(fileURLWithPath: "/mock/glomap"),
+            brush: URL(fileURLWithPath: "/mock/brush"),
+            vggt: vggt,
+            fastvggt: fastvggt
+        )
+    }
+}
+
 final class BlockingPipelineRunner: PipelineRunning {
     func run(resumeFrom lastCompletedStage: PipelineStage?, events: @escaping @Sendable (PipelineEvent) -> Void) async throws {
         events(.stageStarted(stage: .trainBrush))
@@ -1169,6 +1567,138 @@ final class BlockingPipelineRunner: PipelineRunning {
 final class ImmediateCancellationPipelineRunner: PipelineRunning {
     func run(resumeFrom lastCompletedStage: PipelineStage?, events: @escaping @Sendable (PipelineEvent) -> Void) async throws {
         throw CancellationError()
+    }
+}
+
+final class DelayedCancellationPipelineRunner: @unchecked Sendable, PipelineRunning {
+    private let waitingForCancellation: XCTestExpectation
+    private let cancellationObserved: XCTestExpectation
+    private let runFinished: XCTestExpectation
+    private let lock = NSLock()
+    private var continuation: CheckedContinuation<Void, Never>?
+    private var didCancel = false
+
+    init(
+        waitingForCancellation: XCTestExpectation,
+        cancellationObserved: XCTestExpectation,
+        runFinished: XCTestExpectation
+    ) {
+        self.waitingForCancellation = waitingForCancellation
+        self.cancellationObserved = cancellationObserved
+        self.runFinished = runFinished
+    }
+
+    func run(resumeFrom lastCompletedStage: PipelineStage?, events: @escaping @Sendable (PipelineEvent) -> Void) async throws {
+        events(.stageStarted(stage: .trainBrush))
+        await withTaskCancellationHandler {
+            await withCheckedContinuation { continuation in
+                let shouldResume: Bool
+                lock.lock()
+                if didCancel {
+                    shouldResume = true
+                } else {
+                    self.continuation = continuation
+                    shouldResume = false
+                }
+                lock.unlock()
+                waitingForCancellation.fulfill()
+                if shouldResume {
+                    continuation.resume()
+                }
+            }
+        } onCancel: {
+            finishCancellation()
+        }
+        runFinished.fulfill()
+        throw CancellationError()
+    }
+
+    private func finishCancellation() {
+        let continuation: CheckedContinuation<Void, Never>?
+        lock.lock()
+        didCancel = true
+        continuation = self.continuation
+        self.continuation = nil
+        lock.unlock()
+        cancellationObserved.fulfill()
+        continuation?.resume()
+    }
+}
+
+final class LateFailingPipelineRunner: @unchecked Sendable, PipelineRunning {
+    private let started: XCTestExpectation
+    private let finished: XCTestExpectation
+    private let lock = NSLock()
+    private var continuation: CheckedContinuation<Void, Never>?
+
+    init(started: XCTestExpectation, finished: XCTestExpectation) {
+        self.started = started
+        self.finished = finished
+    }
+
+    func run(resumeFrom lastCompletedStage: PipelineStage?, events: @escaping @Sendable (PipelineEvent) -> Void) async throws {
+        events(.stageStarted(stage: .importInput))
+        started.fulfill()
+        await withCheckedContinuation { continuation in
+            lock.lock()
+            self.continuation = continuation
+            lock.unlock()
+        }
+        events(.pipelineFailed(stage: .importInput, userMessage: "First project failed", debugMessage: "late failure"))
+        finished.fulfill()
+        throw NSError(domain: "LateFailingPipelineRunner", code: 1, userInfo: [
+            NSLocalizedDescriptionKey: "First project failed"
+        ])
+    }
+
+    func finish() {
+        lock.lock()
+        let continuation = self.continuation
+        self.continuation = nil
+        lock.unlock()
+        continuation?.resume()
+    }
+}
+
+final class LateCompletingPipelineRunner: @unchecked Sendable, PipelineRunning {
+    private let projectURL: URL
+    private let started: XCTestExpectation
+    private let finished: XCTestExpectation
+    private let lock = NSLock()
+    private var continuation: CheckedContinuation<Void, Never>?
+
+    init(projectURL: URL, started: XCTestExpectation, finished: XCTestExpectation) {
+        self.projectURL = projectURL
+        self.started = started
+        self.finished = finished
+    }
+
+    func run(resumeFrom lastCompletedStage: PipelineStage?, events: @escaping @Sendable (PipelineEvent) -> Void) async throws {
+        events(.stageStarted(stage: .importInput))
+        started.fulfill()
+        await withCheckedContinuation { continuation in
+            lock.lock()
+            self.continuation = continuation
+            lock.unlock()
+        }
+        events(.stageProgress(stage: .importInput, fraction: 1.0, message: "Stale import"))
+        let paths = ProjectPaths(root: projectURL)
+        let outputURL = paths.outputURL.appendingPathComponent("splat.ply")
+        try FileManager.default.createDirectory(at: paths.outputURL, withIntermediateDirectories: true)
+        try writeMinimalPly(at: outputURL)
+        var metadata = try ProjectMetadataStore.load(from: paths.metadataURL)
+        metadata.outputs = OutputSpec(splatPlyPath: "Output/splat.ply", colmapModelPath: "SfM/colmap/sparse/0")
+        metadata.state = PipelineState(stage: .done, attempt: 0, lastError: nil, resumeToken: nil)
+        try ProjectMetadataStore.save(metadata, to: paths.metadataURL)
+        finished.fulfill()
+    }
+
+    func finish() {
+        lock.lock()
+        let continuation = self.continuation
+        self.continuation = nil
+        lock.unlock()
+        continuation?.resume()
     }
 }
 
@@ -1189,8 +1719,24 @@ final class MockPipelineRunner: PipelineRunning {
         var metadata = try ProjectMetadataStore.load(from: paths.metadataURL)
         let outputURL = paths.outputURL.appendingPathComponent("splat.ply")
         try FileManager.default.createDirectory(at: paths.outputURL, withIntermediateDirectories: true)
-        try Data("ply".utf8).write(to: outputURL)
+        try writeMinimalPly(at: outputURL)
         metadata.outputs = OutputSpec(splatPlyPath: "Output/splat.ply", colmapModelPath: "SfM/colmap/sparse/0")
+        metadata.state = PipelineState(stage: .done, attempt: 0, lastError: nil, resumeToken: nil)
+        try ProjectMetadataStore.save(metadata, to: paths.metadataURL)
+    }
+}
+
+final class MissingOutputPipelineRunner: PipelineRunning {
+    private let projectURL: URL
+
+    init(projectURL: URL) {
+        self.projectURL = projectURL
+    }
+
+    func run(resumeFrom lastCompletedStage: PipelineStage?, events: @escaping @Sendable (PipelineEvent) -> Void) async throws {
+        let paths = ProjectPaths(root: projectURL)
+        var metadata = try ProjectMetadataStore.load(from: paths.metadataURL)
+        metadata.outputs = OutputSpec(splatPlyPath: "Output/missing.ply", colmapModelPath: "SfM/colmap/sparse/0")
         metadata.state = PipelineState(stage: .done, attempt: 0, lastError: nil, resumeToken: nil)
         try ProjectMetadataStore.save(metadata, to: paths.metadataURL)
     }
@@ -1212,7 +1758,7 @@ final class DirectoryOutputRepairingPipelineRunner: PipelineRunning {
             try FileManager.default.removeItem(at: outputURL)
         }
         try FileManager.default.createDirectory(at: paths.outputURL, withIntermediateDirectories: true)
-        try Data("ply".utf8).write(to: outputURL)
+        try writeMinimalPly(at: outputURL)
 
         var metadata = try ProjectMetadataStore.load(from: paths.metadataURL)
         metadata.outputs = OutputSpec(splatPlyPath: "Output/splat.ply", colmapModelPath: "SfM/colmap/sparse/0")
@@ -1230,5 +1776,34 @@ final class TracebackSpamPipelineRunner: PipelineRunning {
         events(.pipelineFailed(stage: .sfmFeatures, userMessage: "Pipeline failed", debugMessage: "traceback"))
         throw NSError(domain: "AppModelTests", code: 1)
     }
+}
+
+private func writeMinimalPly(at url: URL, vertexCount: Int = 1) throws {
+    let safeCount = max(1, vertexCount)
+    let body = (0..<safeCount).map { _ in
+        "0 0 0 1 1 1 -4 -4 -4 1 1 0 0 0"
+    }.joined(separator: "\n")
+    let text = """
+    ply
+    format ascii 1.0
+    element vertex \(safeCount)
+    property float x
+    property float y
+    property float z
+    property float f_dc_0
+    property float f_dc_1
+    property float f_dc_2
+    property float scale_0
+    property float scale_1
+    property float scale_2
+    property float opacity
+    property float rot_0
+    property float rot_1
+    property float rot_2
+    property float rot_3
+    end_header
+    \(body)
+    """
+    try text.write(to: url, atomically: true, encoding: .utf8)
 }
 #endif
