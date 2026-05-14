@@ -12,6 +12,9 @@ extension AppModel {
             statusDetail = nil
             stageStartedAt = now
             lastPipelineEventAt = now
+            if stage != .trainBrush {
+                activeTrainingBackend = nil
+            }
             appendLogLine("[\(stage.displayName)] started")
         case .stageProgress(let stage, let fraction, let message):
             let previousStage = self.stage
@@ -54,7 +57,13 @@ extension AppModel {
             self.stage = stage
             progress = 1.0
             lastPipelineEventAt = now
+            if stage == .trainBrush {
+                activeTrainingBackend = nil
+            }
             appendLogLine("[\(stage.displayName)] finished")
+        case .trainingBackendSelected(let backend):
+            activeTrainingBackend = backend
+            lastPipelineEventAt = now
         case .pipelineFailed(_, let userMessage, let debugMessage):
             if stopAction != nil {
                 return

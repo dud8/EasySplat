@@ -38,9 +38,10 @@ final class AppModel: ObservableObject {
     @Published var stopAction: StopAction? = nil
     @Published var isShowingTrainingConsent: Bool = false
     @Published var isLivePreviewEnabled: Bool = false
+    @Published var activeTrainingBackend: TrainingBackend? = nil
 
     @Published var captureMode: CaptureMode = .object
-    @Published var qualityPreset: QualityPreset = .standard
+    @Published var qualityPreset: QualityPreset = .draft
     @Published var pendingVideoURLs: [URL] = []
     @Published var pendingPhotosFolderURL: URL? = nil
     @Published var projectSummaries: [ProjectSummary] = []
@@ -103,6 +104,14 @@ final class AppModel: ObservableObject {
 
     var isStopping: Bool {
         stopAction != nil
+    }
+
+    var isTrainingStageActive: Bool {
+        stage == .trainBrush
+    }
+
+    var isBrushSnapshotTrainingActive: Bool {
+        isTrainingStageActive && activeTrainingBackend == .brush
     }
 
     var trainingSnapshotURL: URL? {

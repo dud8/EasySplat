@@ -70,7 +70,8 @@ enum ToolchainFixtureBuilder {
         includeFastVggtModel: Bool = true,
         includeFastVggtBuildInfo: Bool = true,
         includeFastVggtAppSentinel: Bool = true,
-        includeFastVggtVendorSentinel: Bool = true
+        includeFastVggtVendorSentinel: Bool = true,
+        includeMsplat: Bool = true
     ) throws -> ToolchainFixture {
         let fm = FileManager.default
         let bin = root.appendingPathComponent("bin", isDirectory: true)
@@ -106,6 +107,34 @@ enum ToolchainFixtureBuilder {
         let libssl = lib.appendingPathComponent("libssl.3.dylib")
         fm.createFile(atPath: libcrypto.path, contents: Data())
         fm.createFile(atPath: libssl.path, contents: Data())
+
+        if includeMsplat {
+            let msplat = bin.appendingPathComponent("msplat-train")
+            let msplatRoot = root.appendingPathComponent("msplat", isDirectory: true)
+            let msplatBundledTrain = msplatRoot.appendingPathComponent("bin/msplat-train")
+            let msplatPython = msplatRoot.appendingPathComponent("python/bin/python3")
+            let msplatBuildInfo = msplatRoot.appendingPathComponent("build_info.json")
+            let msplatCoreRelativePath = "python/lib/python3.12/site-packages/msplat/_core.cpython-312-darwin.so"
+            let msplatCoreExtension = msplatRoot.appendingPathComponent(msplatCoreRelativePath)
+            let msplatCoreSentinel = msplatRoot.appendingPathComponent("core_extension_path.txt")
+
+            try fm.createDirectory(at: msplatBundledTrain.deletingLastPathComponent(), withIntermediateDirectories: true)
+            try fm.createDirectory(at: msplatPython.deletingLastPathComponent(), withIntermediateDirectories: true)
+            try fm.createDirectory(at: msplatCoreExtension.deletingLastPathComponent(), withIntermediateDirectories: true)
+            try writeExecutable(msplat, script: "#!/usr/bin/env bash\nexit 0\n")
+            try writeExecutable(msplatBundledTrain, script: "#!/usr/bin/env bash\nexit 0\n")
+            try writeExecutable(msplatPython, script: "#!/usr/bin/env bash\necho python\n")
+            try """
+            {
+              "toolchain_name": "msplat",
+              "source_path": "fixture",
+              "python_version": "3.12.12",
+              "package_version": "1.1.3"
+            }
+            """.write(to: msplatBuildInfo, atomically: true, encoding: .utf8)
+            fm.createFile(atPath: msplatCoreExtension.path, contents: Data([0x00]))
+            try "\(msplatCoreRelativePath)\n".write(to: msplatCoreSentinel, atomically: true, encoding: .utf8)
+        }
 
         let da3Root = root.appendingPathComponent("da3_mps", isDirectory: true)
         let da3SfmTool = da3Root.appendingPathComponent("bin/easysplat_da3_sfm")

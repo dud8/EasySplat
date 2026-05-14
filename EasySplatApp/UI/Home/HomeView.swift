@@ -209,12 +209,12 @@ struct HomeView: View {
 
     private var qualityPicker: some View {
         VStack(alignment: .leading, spacing: 6) {
-            Text("Quality")
+            Text("Profile")
                 .font(.caption)
                 .foregroundStyle(.secondary)
-            Picker("Quality", selection: $model.qualityPreset) {
-                Text("Draft").tag(QualityPreset.draft)
-                Text("Standard").tag(QualityPreset.standard)
+            Picker("Profile", selection: $model.qualityPreset) {
+                Text("Fast").tag(QualityPreset.draft)
+                Text("Balanced").tag(QualityPreset.standard)
                 Text("Ultra").tag(QualityPreset.ultra)
             }
             .pickerStyle(.segmented)

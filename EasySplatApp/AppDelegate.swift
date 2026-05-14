@@ -16,7 +16,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             return .terminateNow
         }
 
-        let decision = model.presentExitConfirmation(for: model.stage)
+        let decision = model.presentExitConfirmation()
         switch decision {
         case .save:
             model.cancelCurrentProject(deleteProject: false, exitIntent: .quit)

@@ -253,8 +253,9 @@ extension PipelineRunner {
             }
             return .valid
         case .trainBrush:
-            guard let latest = tooling.brush.findLatestExportablePly(
+            guard let latest = latestTrainingExport(
                 in: paths.trainingURL,
+                backend: .brush,
                 minModificationDate: trainingExportMinimumDate(metadata: metadata)
             ) else { return .missing }
             return validatePlyFile(at: latest)

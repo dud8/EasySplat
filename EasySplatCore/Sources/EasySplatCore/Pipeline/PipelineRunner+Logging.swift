@@ -345,6 +345,8 @@ final class PipelineLogger: @unchecked Sendable {
             appendProgressLine(stage: stage, fraction: fraction, message: message)
         case let .stageLog(stage, line, isError):
             appendLogLine(stage: stage, line: line, isError: isError)
+        case let .trainingBackendSelected(backend):
+            appendLogLine(stage: .trainBrush, line: "Training backend: \(backend.rawValue)", isError: false)
         case let .stageFinished(stage):
             appendLogLine(stage: stage, line: "Stage finished", isError: false)
         case let .pipelineFailed(stage, userMessage, _):

@@ -7,9 +7,24 @@ import UniformTypeIdentifiers
 import SQLite3
 
 final class PipelineIntegrationTests: XCTestCase {
+    private static let clearedTrainingEnvironment: [String: String?] = [
+            "EASYSPLAT_TRAINER": nil,
+            "EASYSPLAT_MSPLAT_BIN": nil,
+            "EASYSPLAT_MSPLAT_ITERS": nil,
+            "EASYSPLAT_MSPLAT_NUM_DOWNSCALES": nil,
+            "EASYSPLAT_MSPLAT_DOWNSCALE_FACTOR": nil
+    ]
+
+    private func scopedPipelineEnvironment(_ changes: [String: String?]) async -> @Sendable () -> Void {
+        var merged = Self.clearedTrainingEnvironment
+        for (key, value) in changes {
+            merged[key] = value
+        }
+        return await scopedEnvironment(merged)
+    }
 
     func testPipelineSuccessWithGlobalMapper() async throws {
-        let restore = await scopedEnvironment([
+        let restore = await scopedPipelineEnvironment([
             "EASYSPLAT_SFM_BACKEND": "colmap",
             "EASYSPLAT_SFM_MAPPER": nil,
             "EASYSPLAT_SKIP_TRAINING": nil
@@ -41,7 +56,7 @@ final class PipelineIntegrationTests: XCTestCase {
             }),
             .init(path: toolchain.colmap.path, argsPrefix: ["exhaustive_matcher"], result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""), onRun: nil),
             .init(path: toolchain.colmap.path, argsPrefix: ["global_mapper"], result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""), onRun: { _ in try? self.writeSparseModel(at: projectURL) }),
-            .init(path: toolchain.colmap.path, argsPrefix: ["model_analyzer"], result: .init(exitCode: 0, terminationReason: .exit, stdout: "Registered images: 10 / 10\nMean reprojection error: 1.0\n", stderr: ""), onRun: nil),
+            .init(path: toolchain.colmap.path, argsPrefix: ["model_analyzer"], result: .init(exitCode: 0, terminationReason: .exit, stdout: "Registered images: 100 / 100\nMean reprojection error: 1.0\n", stderr: ""), onRun: nil),
             .init(path: toolchain.brush.path, argsPrefix: [], result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""), onRun: { args in
                 guard let datasetArg = args.last else { return }
                 let dataset = URL(fileURLWithPath: datasetArg)
@@ -67,7 +82,7 @@ final class PipelineIntegrationTests: XCTestCase {
     }
 
     func testPipelineFailureClearsRunStartMarker() async throws {
-        let restore = await scopedEnvironment([
+        let restore = await scopedPipelineEnvironment([
             "EASYSPLAT_SFM_BACKEND": "colmap",
             "EASYSPLAT_SFM_MAPPER": nil,
             "EASYSPLAT_SKIP_TRAINING": nil
@@ -111,7 +126,7 @@ final class PipelineIntegrationTests: XCTestCase {
     }
 
     func testTrainingGateInvokedBeforeTraining() async throws {
-        let restore = await scopedEnvironment([
+        let restore = await scopedPipelineEnvironment([
             "EASYSPLAT_SFM_BACKEND": "colmap",
             "EASYSPLAT_SFM_MAPPER": nil,
             "EASYSPLAT_SKIP_TRAINING": nil
@@ -140,7 +155,7 @@ final class PipelineIntegrationTests: XCTestCase {
             .init(path: toolchain.colmap.path, argsPrefix: ["feature_extractor"], result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""), onRun: nil),
             .init(path: toolchain.colmap.path, argsPrefix: ["exhaustive_matcher"], result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""), onRun: nil),
             .init(path: toolchain.colmap.path, argsPrefix: ["global_mapper"], result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""), onRun: { _ in try? self.writeSparseModel(at: projectURL) }),
-            .init(path: toolchain.colmap.path, argsPrefix: ["model_analyzer"], result: .init(exitCode: 0, terminationReason: .exit, stdout: "Registered images: 10 / 10\nMean reprojection error: 1.0\n", stderr: ""), onRun: nil),
+            .init(path: toolchain.colmap.path, argsPrefix: ["model_analyzer"], result: .init(exitCode: 0, terminationReason: .exit, stdout: "Registered images: 2 / 2\nMean reprojection error: 1.0\n", stderr: ""), onRun: nil),
             .init(path: toolchain.brush.path, argsPrefix: [], result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""), onRun: nil)
         ])
 
@@ -170,7 +185,7 @@ final class PipelineIntegrationTests: XCTestCase {
     }
 
     func testPipelineSuccessWithVggt() async throws {
-        let restore = await scopedEnvironment([
+        let restore = await scopedPipelineEnvironment([
             "EASYSPLAT_SFM_BACKEND": "vggt",
             "EASYSPLAT_SFM_MAPPER": nil,
             "EASYSPLAT_SKIP_TRAINING": nil
@@ -218,7 +233,7 @@ final class PipelineIntegrationTests: XCTestCase {
     }
 
     func testPipelineMapAnythingDirectSuccessSkipsExternalRefinement() async throws {
-        let restore = await scopedEnvironment([
+        let restore = await scopedPipelineEnvironment([
             "EASYSPLAT_SFM_BACKEND": "mapanything",
             "EASYSPLAT_SFM_MAPPER": nil,
             "EASYSPLAT_SKIP_TRAINING": "1"
@@ -265,7 +280,7 @@ final class PipelineIntegrationTests: XCTestCase {
     }
 
     func testPipelineMapAnythingSeedRefineRunsTriangulatorAndBA() async throws {
-        let restore = await scopedEnvironment([
+        let restore = await scopedPipelineEnvironment([
             "EASYSPLAT_SFM_BACKEND": "mapanything",
             "EASYSPLAT_SFM_MAPPER": nil,
             "EASYSPLAT_SKIP_TRAINING": "1"
@@ -323,7 +338,7 @@ final class PipelineIntegrationTests: XCTestCase {
     }
 
     func testPipelineMapAnythingDirectLowQualityFallsBackToSeedRefine() async throws {
-        let restore = await scopedEnvironment([
+        let restore = await scopedPipelineEnvironment([
             "EASYSPLAT_SFM_BACKEND": "mapanything",
             "EASYSPLAT_SFM_MAPPER": nil,
             "EASYSPLAT_SKIP_TRAINING": "1"
@@ -387,7 +402,7 @@ final class PipelineIntegrationTests: XCTestCase {
     }
 
     func testPipelineMapAnythingDirectThinTracksFallsBackToSeedRefine() async throws {
-        let restore = await scopedEnvironment([
+        let restore = await scopedPipelineEnvironment([
             "EASYSPLAT_SFM_BACKEND": "mapanything",
             "EASYSPLAT_SFM_MAPPER": nil,
             "EASYSPLAT_SKIP_TRAINING": "1"
@@ -450,7 +465,7 @@ final class PipelineIntegrationTests: XCTestCase {
     }
 
     func testPipelineMapAnythingInvalidCoverageManifestFallsBackToSeedRefine() async throws {
-        let restore = await scopedEnvironment([
+        let restore = await scopedPipelineEnvironment([
             "EASYSPLAT_SFM_BACKEND": "mapanything",
             "EASYSPLAT_SFM_MAPPER": nil,
             "EASYSPLAT_SKIP_TRAINING": "1"
@@ -511,7 +526,7 @@ final class PipelineIntegrationTests: XCTestCase {
     }
 
     func testPipelineDa3AndMapAnythingFailureFallsBackToColmapDefaultPath() async throws {
-        let restore = await scopedEnvironment([
+        let restore = await scopedPipelineEnvironment([
             "EASYSPLAT_SFM_BACKEND": nil,
             "EASYSPLAT_SFM_MAPPER": nil,
             "EASYSPLAT_SKIP_TRAINING": "1"
@@ -590,7 +605,7 @@ final class PipelineIntegrationTests: XCTestCase {
     }
 
     func testPipelineExplicitDa3FailureDoesNotFallbackToOtherBackends() async throws {
-        let restore = await scopedEnvironment([
+        let restore = await scopedPipelineEnvironment([
             "EASYSPLAT_SFM_BACKEND": "da3",
             "EASYSPLAT_SFM_MAPPER": nil,
             "EASYSPLAT_SKIP_TRAINING": "1"
@@ -641,9 +656,10 @@ final class PipelineIntegrationTests: XCTestCase {
     }
 
     func testPipelineConvertsBinaryOnlySparseModelBeforeTraining() async throws {
-        let restore = await scopedEnvironment([
+        let restore = await scopedPipelineEnvironment([
             "EASYSPLAT_SFM_BACKEND": "colmap",
             "EASYSPLAT_SFM_MAPPER": nil,
+            "EASYSPLAT_TRAINER": nil,
             "EASYSPLAT_SKIP_TRAINING": nil
         ])
         defer { restore() }
@@ -752,8 +768,119 @@ final class PipelineIntegrationTests: XCTestCase {
         XCTAssertTrue(FileManager.default.fileExists(atPath: output.path))
     }
 
+    func testPipelineCanTrainWithMsplatOverride() async throws {
+        let temp = makeTempRoot()
+        let externalMsplat = temp.appendingPathComponent("External/msplat-train")
+        try TestFileBuilder.createExecutable(at: externalMsplat)
+
+        let restore = await scopedPipelineEnvironment([
+            "EASYSPLAT_SFM_BACKEND": "colmap",
+            "EASYSPLAT_SFM_MAPPER": nil,
+            "EASYSPLAT_TRAINER": "msplat",
+            "EASYSPLAT_MSPLAT_BIN": externalMsplat.path,
+            "EASYSPLAT_SKIP_TRAINING": nil,
+            "EASYSPLAT_MSPLAT_ITERS": "1200"
+        ])
+        defer { restore() }
+
+        let projectURL = temp.appendingPathComponent("Msplat.easysplatproj", isDirectory: true)
+        let sourcePhotos = temp.appendingPathComponent("SourcePhotos", isDirectory: true)
+        try FileManager.default.createDirectory(at: sourcePhotos, withIntermediateDirectories: true)
+        for index in 0..<12 {
+            try writeTestImage(url: sourcePhotos.appendingPathComponent("img\(index).jpg"), value: UInt8(index % 255))
+        }
+
+        let metadata = ProjectMetadata(
+            title: "Msplat",
+            input: .photos(folder: sourcePhotos.path),
+            preset: PresetSpec(mode: .object, quality: .draft)
+        )
+        let paths = ProjectPaths(root: projectURL)
+        try paths.ensureDirectories()
+        try ProjectMetadataStore.save(metadata, to: paths.metadataURL)
+
+        let toolchain = try makeToolchain(root: temp)
+        var msplatDatasetPath: String?
+        let runner = MockSubprocessRunner(scripts: [
+            .init(
+                path: toolchain.colmap.path,
+                argsPrefix: ["feature_extractor"],
+                result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""),
+                onRun: nil
+            ),
+            .init(
+                path: toolchain.colmap.path,
+                argsPrefix: ["exhaustive_matcher"],
+                result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""),
+                onRun: nil
+            ),
+            .init(
+                path: toolchain.colmap.path,
+                argsPrefix: ["global_mapper"],
+                result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""),
+                onRun: { _ in
+                    try? self.writeSparseModel(at: projectURL)
+                }
+            ),
+            .init(
+                path: toolchain.colmap.path,
+                argsPrefix: ["model_analyzer"],
+                result: .init(
+                    exitCode: 0,
+                    terminationReason: .exit,
+                    stdout: "Registered images: 12 / 12\nMean reprojection error: 1.0\n",
+                    stderr: ""
+                ),
+                onRun: nil
+            ),
+            .init(
+                path: toolchain.colmap.path,
+                argsPrefix: ["model_converter"],
+                result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""),
+                onRun: { args in
+                    guard let outputPath = self.value(for: "--output_path", in: args) else { return }
+                    let out = URL(fileURLWithPath: outputPath, isDirectory: true)
+                    FileManager.default.createFile(atPath: out.appendingPathComponent("cameras.bin").path, contents: Data([0x01]))
+                    FileManager.default.createFile(atPath: out.appendingPathComponent("images.bin").path, contents: Data([0x01]))
+                    FileManager.default.createFile(atPath: out.appendingPathComponent("points3D.bin").path, contents: Data([0x01]))
+                }
+            ),
+            .init(
+                path: externalMsplat.path,
+                argsPrefix: ["--input"],
+                result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""),
+                onRun: { args in
+                    guard let datasetArg = args.dropFirst().first,
+                          let outputArg = self.value(for: "--output", in: args) else { return }
+                    msplatDatasetPath = datasetArg
+                    let dataset = URL(fileURLWithPath: datasetArg, isDirectory: true)
+                    XCTAssertTrue(FileManager.default.fileExists(atPath: dataset.appendingPathComponent("sparse/0/cameras.bin").path))
+                    XCTAssertTrue(args.contains("1200"))
+                    try? TestFileBuilder.writeMinimalPly(at: URL(fileURLWithPath: outputArg))
+                }
+            )
+        ])
+
+        let pipeline = PipelineRunner(
+            projectURL: projectURL,
+            config: .init(
+                toolchain: toolchain,
+                preset: metadata.preset
+            ),
+            tooling: .init(runner: runner)
+        )
+
+        try await pipeline.run { _ in }
+
+        XCTAssertFalse(runner.calls.contains(where: { $0.0 == toolchain.brush.path }))
+        XCTAssertTrue(runner.calls.contains(where: { $0.0 == externalMsplat.path }))
+        XCTAssertNotNil(msplatDatasetPath)
+        let output = projectURL.appendingPathComponent("Output/splat.ply")
+        XCTAssertTrue(FileManager.default.fileExists(atPath: output.path))
+    }
+
     func testPipelineCancellationDoesNotFallbackBetweenBackends() async throws {
-        let restore = await scopedEnvironment([
+        let restore = await scopedPipelineEnvironment([
             "EASYSPLAT_SFM_BACKEND": "fastvggt",
             "EASYSPLAT_SFM_MAPPER": nil,
             "EASYSPLAT_SKIP_TRAINING": "1"
@@ -799,7 +926,7 @@ final class PipelineIntegrationTests: XCTestCase {
     }
 
     func testPipelineDa3CancellationDoesNotFallbackBetweenBackends() async throws {
-        let restore = await scopedEnvironment([
+        let restore = await scopedPipelineEnvironment([
             "EASYSPLAT_SFM_BACKEND": nil,
             "EASYSPLAT_SFM_MAPPER": nil,
             "EASYSPLAT_SKIP_TRAINING": "1"
@@ -847,7 +974,7 @@ final class PipelineIntegrationTests: XCTestCase {
     }
 
     func testPipelineMapAnythingDirectCancellationDoesNotStartSeedRefine() async throws {
-        let restore = await scopedEnvironment([
+        let restore = await scopedPipelineEnvironment([
             "EASYSPLAT_SFM_BACKEND": "mapanything",
             "EASYSPLAT_SFM_MAPPER": nil,
             "EASYSPLAT_SKIP_TRAINING": "1"
@@ -894,7 +1021,7 @@ final class PipelineIntegrationTests: XCTestCase {
     }
 
     func testPipelineDefaultsToDa3WhenBackendUnset() async throws {
-        let restore = await scopedEnvironment([
+        let restore = await scopedPipelineEnvironment([
             "EASYSPLAT_SFM_BACKEND": nil,
             "EASYSPLAT_SFM_MAPPER": nil,
             "EASYSPLAT_SKIP_TRAINING": "1"
@@ -949,7 +1076,7 @@ final class PipelineIntegrationTests: XCTestCase {
     }
 
     func testPipelineDefaultDa3ProducesFinalPly() async throws {
-        let restore = await scopedEnvironment([
+        let restore = await scopedPipelineEnvironment([
             "EASYSPLAT_SFM_BACKEND": nil,
             "EASYSPLAT_SFM_MAPPER": nil,
             "EASYSPLAT_SKIP_TRAINING": nil
@@ -1009,7 +1136,7 @@ final class PipelineIntegrationTests: XCTestCase {
     }
 
     func testPipelineRejectsSymlinkedOutputDirectoryOnExport() async throws {
-        let restore = await scopedEnvironment([
+        let restore = await scopedPipelineEnvironment([
             "EASYSPLAT_SFM_BACKEND": nil,
             "EASYSPLAT_SFM_MAPPER": nil,
             "EASYSPLAT_SKIP_TRAINING": nil
@@ -1068,9 +1195,10 @@ final class PipelineIntegrationTests: XCTestCase {
     }
 
     func testPipelineLowQualityDa3FallsBackToMapAnything() async throws {
-        let restore = await scopedEnvironment([
+        let restore = await scopedPipelineEnvironment([
             "EASYSPLAT_SFM_BACKEND": nil,
             "EASYSPLAT_SFM_MAPPER": nil,
+            "EASYSPLAT_DA3_WINDOW_SIZE": "500",
             "EASYSPLAT_SKIP_TRAINING": "1"
         ])
         defer { restore() }
@@ -1129,7 +1257,7 @@ final class PipelineIntegrationTests: XCTestCase {
     }
 
     func testPipelineFastVggtRefinementFallsBackToMapperPath() async throws {
-        let restore = await scopedEnvironment([
+        let restore = await scopedPipelineEnvironment([
             "EASYSPLAT_SFM_BACKEND": "fastvggt",
             "EASYSPLAT_SFM_MAPPER": nil,
             "EASYSPLAT_FASTVGGT_FULL_COVERAGE": "0",
@@ -1184,7 +1312,7 @@ final class PipelineIntegrationTests: XCTestCase {
     }
 
     func testPipelineIgnoresDeprecatedGraceFallbackEnv() async throws {
-        let restore = await scopedEnvironment([
+        let restore = await scopedPipelineEnvironment([
             "EASYSPLAT_SFM_BACKEND": nil,
             "EASYSPLAT_SFM_MAPPER": nil,
             "EASYSPLAT_ENABLE_VGGT_GRACE_FALLBACK": "1",
@@ -1236,7 +1364,7 @@ final class PipelineIntegrationTests: XCTestCase {
     }
 
     func testPipelineFastVggtRefinementSuccessRunsTriangulatorAndBA() async throws {
-        let restore = await scopedEnvironment([
+        let restore = await scopedPipelineEnvironment([
             "EASYSPLAT_SFM_BACKEND": "fastvggt",
             "EASYSPLAT_SFM_MAPPER": nil,
             "EASYSPLAT_FASTVGGT_FULL_COVERAGE": "0",
@@ -1299,7 +1427,7 @@ final class PipelineIntegrationTests: XCTestCase {
     }
 
     func testPipelineFastVggtMatchingEmitsPairProgressHeartbeat() async throws {
-        let restore = await scopedEnvironment([
+        let restore = await scopedPipelineEnvironment([
             "EASYSPLAT_SFM_BACKEND": "fastvggt",
             "EASYSPLAT_SFM_MAPPER": nil,
             "EASYSPLAT_FASTVGGT_FULL_COVERAGE": "0",
@@ -1393,7 +1521,7 @@ final class PipelineIntegrationTests: XCTestCase {
     }
 
     func testPipelineFastVggtStrictCoverageSkipsExternalMatcherAndMapper() async throws {
-        let restore = await scopedEnvironment([
+        let restore = await scopedPipelineEnvironment([
             "EASYSPLAT_SFM_BACKEND": "fastvggt",
             "EASYSPLAT_SFM_MAPPER": nil,
             "EASYSPLAT_FASTVGGT_FULL_COVERAGE": "1",
@@ -1480,7 +1608,7 @@ final class PipelineIntegrationTests: XCTestCase {
     }
 
     func testPipelineFastVggtAllowsSeedFallbackWhenRefinementNotRequired() async throws {
-        let restore = await scopedEnvironment([
+        let restore = await scopedPipelineEnvironment([
             "EASYSPLAT_SFM_BACKEND": "fastvggt",
             "EASYSPLAT_SFM_MAPPER": nil,
             "EASYSPLAT_FASTVGGT_REQUIRE_REFINED_MODEL": "0",
@@ -1534,7 +1662,7 @@ final class PipelineIntegrationTests: XCTestCase {
 
 
     func testPipelineVggtEmitsProgressWhileRunning() async throws {
-        let restore = await scopedEnvironment([
+        let restore = await scopedPipelineEnvironment([
             "EASYSPLAT_SFM_BACKEND": "vggt",
             "EASYSPLAT_SFM_MAPPER": nil,
             "EASYSPLAT_SKIP_TRAINING": nil
@@ -1659,7 +1787,7 @@ final class PipelineIntegrationTests: XCTestCase {
     }
 
     func testPipelineAcceptsModelAnalyzerOutputInStderr() async throws {
-        let restore = await scopedEnvironment([
+        let restore = await scopedPipelineEnvironment([
             "EASYSPLAT_SFM_BACKEND": "colmap",
             "EASYSPLAT_SFM_MAPPER": nil,
             "EASYSPLAT_SKIP_TRAINING": nil
@@ -1687,7 +1815,7 @@ final class PipelineIntegrationTests: XCTestCase {
             .init(path: toolchain.colmap.path, argsPrefix: ["feature_extractor"], result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""), onRun: nil),
             .init(path: toolchain.colmap.path, argsPrefix: ["exhaustive_matcher"], result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""), onRun: nil),
             .init(path: toolchain.colmap.path, argsPrefix: ["global_mapper"], result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""), onRun: { _ in try? self.writeSparseModel(at: projectURL) }),
-            .init(path: toolchain.colmap.path, argsPrefix: ["model_analyzer"], result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: "Registered images: 10 / 10\nMean reprojection error: 1.0\n"), onRun: nil),
+            .init(path: toolchain.colmap.path, argsPrefix: ["model_analyzer"], result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: "Registered images: 20 / 20\nMean reprojection error: 1.0\n"), onRun: nil),
             .init(path: toolchain.brush.path, argsPrefix: [], result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""), onRun: { args in
                 guard let datasetArg = args.last else { return }
                 let dataset = URL(fileURLWithPath: datasetArg)
@@ -1710,7 +1838,7 @@ final class PipelineIntegrationTests: XCTestCase {
     }
 
     func testPipelineGlobalMapperFallbackToColmap() async throws {
-        let restore = await scopedEnvironment([
+        let restore = await scopedPipelineEnvironment([
             "EASYSPLAT_SFM_BACKEND": "colmap",
             "EASYSPLAT_SFM_MAPPER": nil,
             "EASYSPLAT_SKIP_TRAINING": nil
@@ -1738,7 +1866,7 @@ final class PipelineIntegrationTests: XCTestCase {
             .init(path: toolchain.colmap.path, argsPrefix: ["exhaustive_matcher"], result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""), onRun: nil),
             .init(path: toolchain.colmap.path, argsPrefix: ["global_mapper"], result: .init(exitCode: 1, terminationReason: .exit, stdout: "", stderr: "fail"), onRun: nil),
             .init(path: toolchain.colmap.path, argsPrefix: ["mapper"], result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""), onRun: { _ in try? self.writeSparseModel(at: projectURL) }),
-            .init(path: toolchain.colmap.path, argsPrefix: ["model_analyzer"], result: .init(exitCode: 0, terminationReason: .exit, stdout: "Registered images: 10 / 10\nMean reprojection error: 1.0\n", stderr: ""), onRun: nil),
+            .init(path: toolchain.colmap.path, argsPrefix: ["model_analyzer"], result: .init(exitCode: 0, terminationReason: .exit, stdout: "Registered images: 2 / 2\nMean reprojection error: 1.0\n", stderr: ""), onRun: nil),
             .init(path: toolchain.brush.path, argsPrefix: [], result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""), onRun: { args in
                 guard let datasetArg = args.last else { return }
                 let dataset = URL(fileURLWithPath: datasetArg)
@@ -1760,7 +1888,7 @@ final class PipelineIntegrationTests: XCTestCase {
     }
 
     func testPipelineDisablesGlobalMapperAfterMissingCommand() async throws {
-        let restore = await scopedEnvironment([
+        let restore = await scopedPipelineEnvironment([
             "EASYSPLAT_SFM_BACKEND": "colmap",
             "EASYSPLAT_SFM_MAPPER": nil,
             "EASYSPLAT_SKIP_TRAINING": nil
@@ -1798,7 +1926,7 @@ final class PipelineIntegrationTests: XCTestCase {
             .init(path: toolchain.colmap.path, argsPrefix: ["feature_extractor"], result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""), onRun: nil),
             .init(path: toolchain.colmap.path, argsPrefix: ["exhaustive_matcher"], result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""), onRun: nil),
             .init(path: toolchain.colmap.path, argsPrefix: ["mapper"], result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""), onRun: { _ in try? self.writeSparseModel(at: projectURL) }),
-            .init(path: toolchain.colmap.path, argsPrefix: ["model_analyzer"], result: .init(exitCode: 0, terminationReason: .exit, stdout: "Registered images: 10 / 10\nMean reprojection error: 1.0\n", stderr: ""), onRun: nil),
+            .init(path: toolchain.colmap.path, argsPrefix: ["model_analyzer"], result: .init(exitCode: 0, terminationReason: .exit, stdout: "Registered images: 60 / 60\nMean reprojection error: 1.0\n", stderr: ""), onRun: nil),
 
             .init(path: toolchain.brush.path, argsPrefix: [], result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""), onRun: { args in
                 guard let datasetArg = args.last else { return }
@@ -1825,7 +1953,7 @@ final class PipelineIntegrationTests: XCTestCase {
     }
 
     func testPipelineRespectsColmapMapperPreference() async throws {
-        let restore = await scopedEnvironment([
+        let restore = await scopedPipelineEnvironment([
             "EASYSPLAT_SFM_BACKEND": "colmap",
             "EASYSPLAT_SFM_MAPPER": "colmap",
             "EASYSPLAT_SKIP_TRAINING": nil
@@ -1875,7 +2003,7 @@ final class PipelineIntegrationTests: XCTestCase {
     }
 
     func testPipelineFailsOnLowQuality() async throws {
-        let restore = await scopedEnvironment([
+        let restore = await scopedPipelineEnvironment([
             "EASYSPLAT_SFM_BACKEND": "colmap",
             "EASYSPLAT_SFM_MAPPER": nil,
             "EASYSPLAT_SKIP_TRAINING": nil
@@ -1928,7 +2056,7 @@ final class PipelineIntegrationTests: XCTestCase {
     }
 
     func testPipelineFailsOnMissingImages() async throws {
-        let restore = await scopedEnvironment([
+        let restore = await scopedPipelineEnvironment([
             "EASYSPLAT_SFM_BACKEND": "colmap",
             "EASYSPLAT_SFM_MAPPER": nil,
             "EASYSPLAT_SKIP_TRAINING": nil
@@ -1965,7 +2093,7 @@ final class PipelineIntegrationTests: XCTestCase {
     }
 
     func testPipelineFailsWhenOnlyOneUsableImageRemains() async throws {
-        let restore = await scopedEnvironment([
+        let restore = await scopedPipelineEnvironment([
             "EASYSPLAT_SFM_BACKEND": nil,
             "EASYSPLAT_SFM_MAPPER": nil,
             "EASYSPLAT_SKIP_TRAINING": "1"
@@ -2005,7 +2133,7 @@ final class PipelineIntegrationTests: XCTestCase {
     }
 
     func testPipelineRetriesWithReducedFramesOnColmapFailure() async throws {
-        let restore = await scopedEnvironment([
+        let restore = await scopedPipelineEnvironment([
             "EASYSPLAT_SFM_BACKEND": "colmap",
             "EASYSPLAT_SFM_MAPPER": nil,
             "EASYSPLAT_SKIP_TRAINING": nil
@@ -2057,7 +2185,7 @@ final class PipelineIntegrationTests: XCTestCase {
     }
 
     func testPipelineRetriesWithCpuWhenGpuUnsupported() async throws {
-        let restore = await scopedEnvironment([
+        let restore = await scopedPipelineEnvironment([
             "EASYSPLAT_SFM_BACKEND": "colmap",
             "EASYSPLAT_SFM_MAPPER": nil,
             "EASYSPLAT_SKIP_TRAINING": nil,
@@ -2120,7 +2248,7 @@ final class PipelineIntegrationTests: XCTestCase {
     }
 
     func testPipelineFailsOnMatcherError() async throws {
-        let restore = await scopedEnvironment([
+        let restore = await scopedPipelineEnvironment([
             "EASYSPLAT_SFM_BACKEND": "colmap",
             "EASYSPLAT_SFM_MAPPER": nil,
             "EASYSPLAT_SKIP_TRAINING": nil
@@ -2162,7 +2290,7 @@ final class PipelineIntegrationTests: XCTestCase {
     }
 
     func testPipelineFailsOnBrushError() async throws {
-        let restore = await scopedEnvironment([
+        let restore = await scopedPipelineEnvironment([
             "EASYSPLAT_SFM_BACKEND": "colmap",
             "EASYSPLAT_SFM_MAPPER": nil,
             "EASYSPLAT_SKIP_TRAINING": nil
@@ -2205,7 +2333,7 @@ final class PipelineIntegrationTests: XCTestCase {
     }
 
     func testPipelineFailsWhenOutputMissing() async throws {
-        let restore = await scopedEnvironment([
+        let restore = await scopedPipelineEnvironment([
             "EASYSPLAT_SFM_BACKEND": "colmap",
             "EASYSPLAT_SFM_MAPPER": nil,
             "EASYSPLAT_SKIP_TRAINING": nil
@@ -2248,7 +2376,7 @@ final class PipelineIntegrationTests: XCTestCase {
     }
 
     func testPipelineResumeSkipsCompletedStages() async throws {
-        let restore = await scopedEnvironment([
+        let restore = await scopedPipelineEnvironment([
             "EASYSPLAT_SFM_BACKEND": "colmap",
             "EASYSPLAT_SFM_MAPPER": nil,
             "EASYSPLAT_SKIP_TRAINING": nil,
@@ -2324,7 +2452,7 @@ final class PipelineIntegrationTests: XCTestCase {
     }
 
     func testPipelineResumeRepairsCorruptExportAfterInterruptedRun() async throws {
-        let restore = await scopedEnvironment([
+        let restore = await scopedPipelineEnvironment([
             "EASYSPLAT_SKIP_TRAINING": nil
         ])
         defer { restore() }
@@ -2742,7 +2870,8 @@ final class PipelineIntegrationTests: XCTestCase {
         root: URL,
         createDa3Files: Bool = false,
         createMapAnythingFiles: Bool = true,
-        createVggtFiles: Bool = false
+        createVggtFiles: Bool = false,
+        createMsplatFile: Bool = false
     ) throws -> ToolchainPaths {
         let fm = FileManager.default
         let toolchainRoot = root.appendingPathComponent("Toolchain", isDirectory: true)
@@ -2763,6 +2892,7 @@ final class PipelineIntegrationTests: XCTestCase {
 
         let colmap = try writeStub("colmap")
         let brush = try writeStub("brush")
+        let msplat = createMsplatFile ? try writeStub("msplat-train") : bin.appendingPathComponent("msplat-train")
 
         let da3 = try TestToolchains.da3Toolchain(root: toolchainRoot, createFiles: createDa3Files)
         let mapanything = try TestToolchains.mapAnythingToolchain(root: toolchainRoot, createFiles: createMapAnythingFiles)
@@ -2773,6 +2903,7 @@ final class PipelineIntegrationTests: XCTestCase {
             colmap: colmap,
             glomap: colmap,
             brush: brush,
+            msplat: msplat,
             da3: da3,
             mapanything: mapanything,
             vggt: vggt,

@@ -15,6 +15,145 @@ final class ToolchainManagerTests: XCTestCase {
         XCTAssertEqual(toolchain.root, root)
     }
 
+    func testValidateToolchainAcceptsPackagedMsplat() throws {
+        let root = try TestFileBuilder.makeTempDir()
+        defer { try? FileManager.default.removeItem(at: root) }
+        _ = try ToolchainFixtureBuilder.createToolchain(at: root)
+        let msplat = root.appendingPathComponent("bin/msplat-train")
+
+        let runner = makeValidationRunner(root: root)
+
+        let manager = ToolchainManager(runner: runner)
+        let toolchain = try manager.test_validateToolchain(root: root)
+        XCTAssertEqual(toolchain.msplat, msplat)
+    }
+
+    func testValidateToolchainAcceptsBrushOnlyToolchainWhenMsplatMissing() throws {
+        let root = try TestFileBuilder.makeTempDir()
+        defer { try? FileManager.default.removeItem(at: root) }
+        _ = try ToolchainFixtureBuilder.createToolchain(at: root, includeMsplat: false)
+
+        let runner = makeValidationRunner(root: root)
+
+        let manager = ToolchainManager(runner: runner)
+        let toolchain = try manager.test_validateToolchain(root: root)
+        XCTAssertEqual(toolchain.msplat, root.appendingPathComponent("bin/msplat-train"))
+    }
+
+    func testValidateToolchainNormalizesPackagedMsplatExecutableBit() throws {
+        let root = try TestFileBuilder.makeTempDir()
+        defer { try? FileManager.default.removeItem(at: root) }
+        _ = try ToolchainFixtureBuilder.createToolchain(at: root)
+        let msplat = root.appendingPathComponent("bin/msplat-train")
+        try FileManager.default.setAttributes([.posixPermissions: 0o644], ofItemAtPath: msplat.path)
+
+        let runner = makeValidationRunner(root: root)
+
+        let manager = ToolchainManager(runner: runner)
+        let toolchain = try manager.test_validateToolchain(root: root)
+        XCTAssertEqual(toolchain.msplat, msplat)
+        XCTAssertTrue(FileManager.default.isExecutableFile(atPath: msplat.path))
+    }
+
+    func testValidateToolchainRejectsBrokenPackagedMsplat() throws {
+        let root = try TestFileBuilder.makeTempDir()
+        defer { try? FileManager.default.removeItem(at: root) }
+        _ = try ToolchainFixtureBuilder.createToolchain(at: root)
+
+        let runner = makeValidationRunner(root: root, msplatHelpExitCode: 2)
+
+        let manager = ToolchainManager(runner: runner)
+        XCTAssertThrowsError(try manager.test_validateToolchain(root: root)) { error in
+            guard case ToolchainManager.ToolchainError.invalidToolchain(let message) = error else {
+                return XCTFail("Expected invalidToolchain error")
+            }
+            XCTAssertTrue(message.contains("msplat-train failed to launch"), "expected msplat launch failure; got \(message)")
+        }
+    }
+
+    func testValidateToolchainFailsWhenPackagedMsplatRequiredFilesAreMissing() throws {
+        let cases: [(String, String)] = [
+            ("msplat/bin/msplat-train", "msplat/bin/msplat-train"),
+            ("msplat/python/bin/python3", "msplat/python/bin/python3"),
+            ("msplat/build_info.json", "msplat/build_info.json"),
+            ("msplat/core_extension_path.txt", "msplat/core_extension_path.txt")
+        ]
+
+        for (relativePath, expectedName) in cases {
+            let root = try TestFileBuilder.makeTempDir()
+            defer { try? FileManager.default.removeItem(at: root) }
+            _ = try ToolchainFixtureBuilder.createToolchain(at: root)
+            try FileManager.default.removeItem(at: root.appendingPathComponent(relativePath))
+
+            let manager = ToolchainManager(runner: makeValidationRunner(root: root))
+            XCTAssertThrowsError(try manager.test_validateToolchain(root: root), "Expected missing error for \(relativePath)") { error in
+                switch error {
+                case ToolchainManager.ToolchainError.missingBinary(let name),
+                     ToolchainManager.ToolchainError.missingLibrary(let name):
+                    XCTAssertEqual(name, expectedName)
+                default:
+                    XCTFail("Expected missing file error for \(relativePath), got \(error)")
+                }
+            }
+        }
+    }
+
+    func testValidateToolchainRejectsInvalidPackagedMsplatMetadata() throws {
+        let root = try TestFileBuilder.makeTempDir()
+        defer { try? FileManager.default.removeItem(at: root) }
+        _ = try ToolchainFixtureBuilder.createToolchain(at: root)
+        try "{}\n".write(to: root.appendingPathComponent("msplat/build_info.json"), atomically: true, encoding: .utf8)
+
+        let manager = ToolchainManager(runner: makeValidationRunner(root: root))
+        XCTAssertThrowsError(try manager.test_validateToolchain(root: root)) { error in
+            guard case ToolchainManager.ToolchainError.invalidToolchain(let message) = error else {
+                return XCTFail("Expected invalidToolchain error")
+            }
+            XCTAssertTrue(message.contains("msplat build_info.json"), "expected msplat metadata failure; got \(message)")
+        }
+    }
+
+    func testValidateToolchainRejectsInvalidPackagedMsplatCoreSentinel() throws {
+        let root = try TestFileBuilder.makeTempDir()
+        defer { try? FileManager.default.removeItem(at: root) }
+        _ = try ToolchainFixtureBuilder.createToolchain(at: root)
+        try "python/bin/python3\n".write(
+            to: root.appendingPathComponent("msplat/core_extension_path.txt"),
+            atomically: true,
+            encoding: .utf8
+        )
+
+        let manager = ToolchainManager(runner: makeValidationRunner(root: root))
+        XCTAssertThrowsError(try manager.test_validateToolchain(root: root)) { error in
+            guard case ToolchainManager.ToolchainError.invalidToolchain(let message) = error else {
+                return XCTFail("Expected invalidToolchain error")
+            }
+            XCTAssertTrue(message.contains("core_extension_path.txt"), "expected msplat core sentinel failure; got \(message)")
+        }
+    }
+
+    func testValidateToolchainRejectsNonArmPackagedMsplatBinaries() throws {
+        let root = try TestFileBuilder.makeTempDir()
+        defer { try? FileManager.default.removeItem(at: root) }
+        _ = try ToolchainFixtureBuilder.createToolchain(at: root)
+
+        var manager = ToolchainManager(runner: makeValidationRunner(root: root, msplatPythonArch: "Mach-O 64-bit executable x86_64"))
+        XCTAssertThrowsError(try manager.test_validateToolchain(root: root)) { error in
+            guard case ToolchainManager.ToolchainError.invalidToolchain(let message) = error else {
+                return XCTFail("Expected invalidToolchain error")
+            }
+            XCTAssertTrue(message.lowercased().contains("msplat python"), "expected msplat python arch failure; got \(message)")
+        }
+
+        manager = ToolchainManager(runner: makeValidationRunner(root: root, msplatCoreArch: "Mach-O 64-bit bundle x86_64"))
+        XCTAssertThrowsError(try manager.test_validateToolchain(root: root)) { error in
+            guard case ToolchainManager.ToolchainError.invalidToolchain(let message) = error else {
+                return XCTFail("Expected invalidToolchain error")
+            }
+            XCTAssertTrue(message.lowercased().contains("msplat core"), "expected msplat core arch failure; got \(message)")
+        }
+    }
+
     func testValidateToolchainFailsWhenBrushRealMissing() throws {
         let root = try TestFileBuilder.makeTempDir()
         defer { try? FileManager.default.removeItem(at: root) }
@@ -81,7 +220,9 @@ final class ToolchainManagerTests: XCTestCase {
             da3PythonArch: universal,
             mapAnythingPythonArch: universal,
             vggtPythonArch: universal,
-            fastvggtPythonArch: universal
+            fastvggtPythonArch: universal,
+            msplatPythonArch: universal,
+            msplatCoreArch: universal
         )
 
         let manager = ToolchainManager(runner: runner)
@@ -144,6 +285,20 @@ final class ToolchainManagerTests: XCTestCase {
         XCTAssertTrue(manager.test_coreToolchainLooksInstalled(root: freshRoot))
         try FileManager.default.removeItem(at: freshFixture.da3VendorSentinel)
         XCTAssertFalse(manager.test_coreToolchainLooksInstalled(root: freshRoot))
+
+        let missingMsplatRoot = try TestFileBuilder.makeTempDir()
+        defer { try? FileManager.default.removeItem(at: missingMsplatRoot) }
+        _ = try ToolchainFixtureBuilder.createToolchain(at: missingMsplatRoot, includeMsplat: false)
+        XCTAssertTrue(manager.test_coreToolchainLooksInstalled(root: missingMsplatRoot))
+
+        let partialMsplatRoot = try TestFileBuilder.makeTempDir()
+        defer { try? FileManager.default.removeItem(at: partialMsplatRoot) }
+        _ = try ToolchainFixtureBuilder.createToolchain(at: partialMsplatRoot)
+        XCTAssertTrue(manager.test_coreToolchainLooksInstalled(root: partialMsplatRoot))
+        try FileManager.default.removeItem(
+            at: partialMsplatRoot.appendingPathComponent("msplat/core_extension_path.txt")
+        )
+        XCTAssertFalse(manager.test_coreToolchainLooksInstalled(root: partialMsplatRoot))
     }
 
     func testModelsToolchainLooksInstalled() throws {
@@ -444,10 +599,13 @@ final class ToolchainManagerTests: XCTestCase {
         mapAnythingPythonArch: String = "Mach-O 64-bit executable arm64",
         vggtPythonArch: String = "Mach-O 64-bit executable arm64",
         fastvggtPythonArch: String = "Mach-O 64-bit executable arm64",
+        msplatPythonArch: String = "Mach-O 64-bit executable arm64",
+        msplatCoreArch: String = "Mach-O 64-bit bundle arm64",
         da3HelpExitCode: Int32 = 0,
         mapAnythingHelpExitCode: Int32 = 0,
         vggtHelpExitCode: Int32 = 0,
-        fastvggtHelpExitCode: Int32 = 0
+        fastvggtHelpExitCode: Int32 = 0,
+        msplatHelpExitCode: Int32 = 0
     ) -> MockSubprocessRunner {
         MockSubprocessRunner(scripts: [
             .init(path: "/usr/bin/file", argsPrefix: ["-b", root.appendingPathComponent("bin/colmap").path], result: .init(exitCode: 0, terminationReason: .exit, stdout: colmapArch, stderr: ""), onRun: nil),
@@ -461,7 +619,10 @@ final class ToolchainManagerTests: XCTestCase {
             .init(path: "/usr/bin/file", argsPrefix: ["-b", root.appendingPathComponent("vggt_mps/python/bin/python3").path], result: .init(exitCode: 0, terminationReason: .exit, stdout: vggtPythonArch, stderr: ""), onRun: nil),
             .init(path: root.appendingPathComponent("vggt_mps/bin/easysplat_vggt_sfm").path, argsPrefix: ["--help"], result: .init(exitCode: vggtHelpExitCode, terminationReason: .exit, stdout: "", stderr: ""), onRun: nil),
             .init(path: "/usr/bin/file", argsPrefix: ["-b", root.appendingPathComponent("fastvggt_mps/python/bin/python3").path], result: .init(exitCode: 0, terminationReason: .exit, stdout: fastvggtPythonArch, stderr: ""), onRun: nil),
-            .init(path: root.appendingPathComponent("fastvggt_mps/bin/easysplat_fastvggt_sfm").path, argsPrefix: ["--help"], result: .init(exitCode: fastvggtHelpExitCode, terminationReason: .exit, stdout: "", stderr: ""), onRun: nil)
+            .init(path: root.appendingPathComponent("fastvggt_mps/bin/easysplat_fastvggt_sfm").path, argsPrefix: ["--help"], result: .init(exitCode: fastvggtHelpExitCode, terminationReason: .exit, stdout: "", stderr: ""), onRun: nil),
+            .init(path: "/usr/bin/file", argsPrefix: ["-b", root.appendingPathComponent("msplat/python/bin/python3").path], result: .init(exitCode: 0, terminationReason: .exit, stdout: msplatPythonArch, stderr: ""), onRun: nil),
+            .init(path: "/usr/bin/file", argsPrefix: ["-b", root.appendingPathComponent("msplat/python/lib/python3.12/site-packages/msplat/_core.cpython-312-darwin.so").path], result: .init(exitCode: 0, terminationReason: .exit, stdout: msplatCoreArch, stderr: ""), onRun: nil),
+            .init(path: root.appendingPathComponent("bin/msplat-train").path, argsPrefix: ["--help"], result: .init(exitCode: msplatHelpExitCode, terminationReason: .exit, stdout: "", stderr: ""), onRun: nil)
         ])
     }
 }

@@ -271,13 +271,51 @@ extension ToolchainManager {
             models: fastvggtModels
         )
 
-        let glomap = colmap
+        let msplat = root.appendingPathComponent("bin/msplat-train")
+        let msplatRoot = root.appendingPathComponent("msplat", isDirectory: true)
+        let msplatBundledTrain = msplatRoot.appendingPathComponent("bin/msplat-train")
+        let msplatPython = msplatRoot.appendingPathComponent("python/bin/python3")
+        let msplatBuildInfo = msplatRoot.appendingPathComponent("build_info.json")
+        let msplatCoreSentinel = msplatRoot.appendingPathComponent("core_extension_path.txt")
+        let msplatEntries = [msplat, msplatBundledTrain, msplatPython, msplatBuildInfo, msplatCoreSentinel]
+        let hasMsplatBundle = msplatEntries.contains { fileManager.fileExists(atPath: $0.path) }
+        if hasMsplatBundle {
+            guard fileManager.fileExists(atPath: msplat.path) else {
+                throw ToolchainError.missingBinary("bin/msplat-train")
+            }
+            guard fileManager.fileExists(atPath: msplatBundledTrain.path) else {
+                throw ToolchainError.missingBinary("msplat/bin/msplat-train")
+            }
+            guard fileManager.fileExists(atPath: msplatPython.path) else {
+                throw ToolchainError.missingBinary("msplat/python/bin/python3")
+            }
+            guard fileManager.fileExists(atPath: msplatBuildInfo.path) else {
+                throw ToolchainError.missingLibrary("msplat/build_info.json")
+            }
+            guard fileManager.fileExists(atPath: msplatCoreSentinel.path) else {
+                throw ToolchainError.missingLibrary("msplat/core_extension_path.txt")
+            }
+            let msplatCoreExtension = try msplatCoreExtensionURL(root: msplatRoot, sentinel: msplatCoreSentinel)
+
+            ensureExecutable(at: msplat)
+            ensureExecutable(at: msplatBundledTrain)
+            ensureExecutable(at: msplatPython)
+            try validateMsplatBuildInfo(at: msplatBuildInfo)
+
+            try requireArm64Binary(at: msplatPython, label: "msplat python")
+            try requireArm64Binary(at: msplatCoreExtension, label: "msplat core extension")
+            let msplatCheck = try runner.run(msplat.path, ["--help"])
+            guard msplatCheck.exitCode == 0 else {
+                throw ToolchainError.invalidToolchain("msplat-train failed to launch (exit \(msplatCheck.exitCode)).")
+            }
+        }
 
         return ToolchainPaths(
             root: root,
             colmap: colmap,
-            glomap: glomap,
+            glomap: colmap,
             brush: brush,
+            msplat: msplat,
             da3: da3,
             mapanything: mapanything,
             vggt: vggt,
@@ -352,6 +390,95 @@ extension ToolchainManager {
         }
     }
 
+    func validateMsplatBuildInfo(at url: URL) throws {
+        let data: Data
+        do {
+            data = try Data(contentsOf: url)
+        } catch {
+            throw ToolchainError.invalidToolchain("msplat build_info.json could not be read.")
+        }
+
+        let object: Any
+        do {
+            object = try JSONSerialization.jsonObject(with: data)
+        } catch {
+            throw ToolchainError.invalidToolchain("msplat build_info.json is not valid JSON.")
+        }
+
+        guard let payload = object as? [String: Any] else {
+            throw ToolchainError.invalidToolchain("msplat build_info.json must contain a JSON object.")
+        }
+
+        let requiredKeys = [
+            "toolchain_name",
+            "source_path",
+            "python_version",
+            "package_version",
+        ]
+        let missingKeys = requiredKeys.filter {
+            guard let value = payload[$0] else { return true }
+            if let text = value as? String {
+                return text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            }
+            return false
+        }
+        if !missingKeys.isEmpty {
+            throw ToolchainError.invalidToolchain(
+                "msplat build_info.json is missing required keys: \(missingKeys.joined(separator: ", "))."
+            )
+        }
+
+        let toolchainName = (payload["toolchain_name"] as? String)?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        guard toolchainName == "msplat" else {
+            throw ToolchainError.invalidToolchain(
+                "msplat build_info.json toolchain_name mismatch (got \(toolchainName ?? "nil"))."
+            )
+        }
+    }
+
+    func msplatCoreExtensionURL(root: URL, sentinel: URL) throws -> URL {
+        let relativePath: String
+        do {
+            relativePath = try String(contentsOf: sentinel, encoding: .utf8)
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+        } catch {
+            throw ToolchainError.invalidToolchain("msplat core_extension_path.txt could not be read.")
+        }
+
+        guard !relativePath.isEmpty,
+              !relativePath.hasPrefix("/"),
+              relativePath.rangeOfCharacter(from: .newlines) == nil else {
+            throw ToolchainError.invalidToolchain("msplat core_extension_path.txt contains an invalid relative path.")
+        }
+
+        let components = relativePath.split(separator: "/", omittingEmptySubsequences: false)
+        guard !components.isEmpty,
+              components.allSatisfy({ !$0.isEmpty && $0 != "." && $0 != ".." }) else {
+            throw ToolchainError.invalidToolchain("msplat core_extension_path.txt contains an invalid relative path.")
+        }
+        let componentStrings = components.map(String.init)
+        guard componentStrings.count >= 6,
+              componentStrings[0] == "python",
+              componentStrings[1] == "lib",
+              componentStrings.contains("site-packages"),
+              componentStrings.dropLast().last == "msplat",
+              let fileName = componentStrings.last,
+              fileName.hasPrefix("_core"),
+              fileName.hasSuffix(".so") else {
+            throw ToolchainError.invalidToolchain("msplat core_extension_path.txt must point at msplat/_core*.so in site-packages.")
+        }
+
+        var coreExtension = root
+        for component in components {
+            coreExtension = coreExtension.appendingPathComponent(String(component))
+        }
+        guard fileManager.fileExists(atPath: coreExtension.path) else {
+            throw ToolchainError.missingLibrary("msplat/\(relativePath)")
+        }
+        return coreExtension
+    }
+
     /// Verifies the binary at `url` is a native arm64 Mach-O. Fails closed if `/usr/bin/file`
     /// cannot be executed at all — we'd rather block startup than silently allow a Rosetta build.
     /// Uses `-b` to strip the filename from output so paths containing "arm64" (e.g.
@@ -405,6 +532,12 @@ extension ToolchainManager {
         let brushReal = root.appendingPathComponent("bin/brush.real")
         let libcrypto = root.appendingPathComponent("lib/libcrypto.3.dylib")
         let libssl = root.appendingPathComponent("lib/libssl.3.dylib")
+        let msplat = root.appendingPathComponent("msplat", isDirectory: true)
+        let msplatTrain = root.appendingPathComponent("bin/msplat-train")
+        let msplatBundledTrain = msplat.appendingPathComponent("bin/msplat-train")
+        let msplatPython = msplat.appendingPathComponent("python/bin/python3")
+        let msplatBuildInfo = msplat.appendingPathComponent("build_info.json")
+        let msplatCoreSentinel = msplat.appendingPathComponent("core_extension_path.txt")
         let da3 = root.appendingPathComponent("da3_mps", isDirectory: true)
         let da3SfmTool = da3.appendingPathComponent("bin/easysplat_da3_sfm")
         let da3Python = da3.appendingPathComponent("python/bin/python3")
@@ -437,9 +570,20 @@ extension ToolchainManager {
             }
             return true
         }()
+        let msplatEntries = [msplatTrain, msplatBundledTrain, msplatPython, msplatBuildInfo, msplatCoreSentinel]
+        let msplatPresent = msplatEntries.contains { fileManager.fileExists(atPath: $0.path) }
+        let msplatOK = !msplatPresent
+            || (
+                fileManager.isExecutableFile(atPath: msplatTrain.path)
+                    && fileManager.isExecutableFile(atPath: msplatBundledTrain.path)
+                    && fileManager.isExecutableFile(atPath: msplatPython.path)
+                    && fileManager.fileExists(atPath: msplatBuildInfo.path)
+                    && (try? msplatCoreExtensionURL(root: msplat, sentinel: msplatCoreSentinel)) != nil
+            )
 
         return fileManager.isExecutableFile(atPath: colmap.path)
             && brushOK
+            && msplatOK
             && fileManager.fileExists(atPath: libcrypto.path)
             && fileManager.fileExists(atPath: libssl.path)
             && fileManager.fileExists(atPath: da3SfmTool.path)

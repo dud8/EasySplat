@@ -86,5 +86,25 @@ final class ReconstructionScorerTests: XCTestCase {
         )
         XCTAssertFalse(ReconstructionScorer.isAcceptable(score, mode: .object))
     }
+
+    func testExpectedTotalImagesKeepsPartialSparseModelsFromPassing() {
+        let sparseOnlyScore = ReconstructionScore(
+            registeredImages: 5,
+            totalImages: 5,
+            meanReprojectionError: 0.8,
+            pointCount: 12,
+            observationCount: 36,
+            meanTrackLength: 3.0
+        )
+
+        let adjusted = ReconstructionScorer.applyingExpectedTotalImages(
+            sparseOnlyScore,
+            expectedTotalImages: 60
+        )
+
+        XCTAssertEqual(adjusted.registeredImages, 5)
+        XCTAssertEqual(adjusted.totalImages, 60)
+        XCTAssertFalse(ReconstructionScorer.isAcceptable(adjusted, mode: .object))
+    }
 }
 #endif

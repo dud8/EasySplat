@@ -37,6 +37,53 @@ final class AppModelTests: XCTestCase {
         XCTAssertTrue(FileManager.default.fileExists(atPath: metadataURL.path))
     }
 
+    func testStartProjectUsesFastProfileByDefault() async throws {
+        let tempBase = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: tempBase) }
+        try FileManager.default.createDirectory(at: tempBase, withIntermediateDirectories: true)
+        let input = tempBase.appendingPathComponent("input.mov")
+        try Data("video".utf8).write(to: input)
+        var capturedSpeedProfile: PipelineRunner.SpeedProfile?
+
+        let model = AppModel(
+            toolchainManager: MockToolchainManager(),
+            projectBaseURL: tempBase
+        ) { projectURL, config in
+            capturedSpeedProfile = config.speedProfile
+            return MockPipelineRunner(projectURL: projectURL, config: config)
+        }
+
+        XCTAssertEqual(model.qualityPreset, .draft)
+        await model.startProject(input: .video(files: [input.path]), title: "FastDefault")
+
+        XCTAssertEqual(capturedSpeedProfile, .fast)
+        let projectURL = try XCTUnwrap(model.currentProjectURL)
+        let metadata = try ProjectMetadataStore.load(from: ProjectPaths(root: projectURL).metadataURL)
+        XCTAssertEqual(metadata.preset.quality, .draft)
+    }
+
+    func testStartProjectUsesStandardSpeedProfileForBalancedQuality() async throws {
+        let tempBase = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: tempBase) }
+        try FileManager.default.createDirectory(at: tempBase, withIntermediateDirectories: true)
+        let input = tempBase.appendingPathComponent("input.mov")
+        try Data("video".utf8).write(to: input)
+        var capturedSpeedProfile: PipelineRunner.SpeedProfile?
+
+        let model = AppModel(
+            toolchainManager: MockToolchainManager(),
+            projectBaseURL: tempBase
+        ) { projectURL, config in
+            capturedSpeedProfile = config.speedProfile
+            return MockPipelineRunner(projectURL: projectURL, config: config)
+        }
+
+        model.qualityPreset = .standard
+        await model.startProject(input: .video(files: [input.path]), title: "Balanced")
+
+        XCTAssertEqual(capturedSpeedProfile, .standard)
+    }
+
     func testStartProjectReportsFailureWhenRunnerFinishesWithoutReadyOutput() async throws {
         let tempBase = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
         defer { try? FileManager.default.removeItem(at: tempBase) }
@@ -86,6 +133,52 @@ final class AppModelTests: XCTestCase {
         try await waitForViewState(model: model, state: .viewer)
 
         XCTAssertFalse(model.isLivePreviewEnabled)
+    }
+
+    func testMsplatTrainingProgressWarnsThatTrainingRestarts() {
+        let tempBase = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        let model = AppModel(toolchainManager: MockToolchainManager(), projectBaseURL: tempBase) { _, config in
+            MockPipelineRunner(projectURL: tempBase, config: config)
+        }
+        model.currentTask = Task {
+            while !Task.isCancelled {
+                try? await Task.sleep(nanoseconds: 50_000_000)
+            }
+        }
+        defer {
+            model.currentTask?.cancel()
+            model.currentTask = nil
+        }
+
+        model.handle(event: .stageStarted(stage: .trainBrush))
+        model.handle(event: .trainingBackendSelected(backend: .msplat))
+        model.cancelCurrentProject(deleteProject: false)
+
+        XCTAssertEqual(model.statusTitle, "Saving project…")
+        XCTAssertEqual(model.statusDetail, "Stopping training at the next safe point (resume starts training over).")
+    }
+
+    func testBrushTrainingProgressUsesSnapshotStopCopy() {
+        let tempBase = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        let model = AppModel(toolchainManager: MockToolchainManager(), projectBaseURL: tempBase) { _, config in
+            MockPipelineRunner(projectURL: tempBase, config: config)
+        }
+        model.currentTask = Task {
+            while !Task.isCancelled {
+                try? await Task.sleep(nanoseconds: 50_000_000)
+            }
+        }
+        defer {
+            model.currentTask?.cancel()
+            model.currentTask = nil
+        }
+
+        model.handle(event: .stageStarted(stage: .trainBrush))
+        model.handle(event: .trainingBackendSelected(backend: .brush))
+        model.cancelCurrentProject(deleteProject: false)
+
+        XCTAssertEqual(model.statusTitle, "Exporting snapshot…")
+        XCTAssertEqual(model.statusDetail, "Exporting the latest snapshot (training restarts from scratch on resume).")
     }
 
     func testAddInputsIgnoresNonVideoAndClearsWarning() {

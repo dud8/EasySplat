@@ -36,6 +36,7 @@ public struct FrameExtractionOptions: Sendable {
     public var sharpnessFloor: Double
     public var sharpnessRatio: Double
     public var outputFormat: FrameOutputFormat
+    public var maxExtractedFrames: Int?
 
     public init(
         targetCount: Int,
@@ -44,7 +45,8 @@ public struct FrameExtractionOptions: Sendable {
         minDistanceRatio: Double = 0.20,
         sharpnessFloor: Double = 40.0,
         sharpnessRatio: Double = 0.6,
-        outputFormat: FrameOutputFormat = .jpeg
+        outputFormat: FrameOutputFormat = .jpeg,
+        maxExtractedFrames: Int? = nil
     ) {
         self.targetCount = targetCount
         self.maxDimension = maxDimension
@@ -53,6 +55,7 @@ public struct FrameExtractionOptions: Sendable {
         self.sharpnessFloor = sharpnessFloor
         self.sharpnessRatio = sharpnessRatio
         self.outputFormat = outputFormat
+        self.maxExtractedFrames = maxExtractedFrames.flatMap { $0 > 0 ? $0 : nil }
     }
 }
 
@@ -81,6 +84,7 @@ public final class FrameExtractor {
 
         let nominalFPS = Double(try await track.load(.nominalFrameRate))
         let videoFPS = nominalFPS > 0 ? nominalFPS : 30.0
+
         let preferredTransform = try await track.load(.preferredTransform)
         let targetFPS = Self.effectiveTargetFPS(options: options, duration: durationSeconds, videoFPS: videoFPS)
         // Batch is roughly one second of video frames so progress updates feel steady without being spammy.
@@ -119,15 +123,26 @@ public final class FrameExtractor {
         var batchCount = 0
         var lastProgressFrameIndex = 0
 
+        func reachedExtractionLimit() -> Bool {
+            guard let maxExtractedFrames = options.maxExtractedFrames else { return false }
+            return savedCount >= maxExtractedFrames
+        }
+
         func flushBatch() {
             guard !bufferScores.isEmpty else { return }
+            if reachedExtractionLimit() {
+                bufferScores.removeAll(keepingCapacity: true)
+                bufferFrames.removeAll(keepingCapacity: true)
+                return
+            }
             let result = SmartFrameSelection.selectBatch(
                 scores: bufferScores,
                 config: selectionConfig,
                 fps: videoFPS,
                 lastSelectedIndex: &lastSelectedIndex
             )
-            for index in result.selectedIndices {
+            let remaining = options.maxExtractedFrames.map { max(0, $0 - savedCount) } ?? Int.max
+            for index in result.selectedIndices.prefix(remaining) {
                 guard let image = bufferFrames[index] else { continue }
                 let fileURL = outputDir.appendingPathComponent(
                     String(format: "frame_%06d.%@", savedCount, options.outputFormat.fileExtension)
@@ -174,10 +189,13 @@ public final class FrameExtractor {
             if batchCount >= batchSize {
                 flushBatch()
                 batchCount = 0
+                if reachedExtractionLimit() {
+                    break
+                }
             }
         }
 
-        if batchCount > 0 {
+        if batchCount > 0, !reachedExtractionLimit() {
             flushBatch()
         }
 
@@ -280,5 +298,6 @@ extension FrameExtractor {
     static func test_effectiveTargetFPS(options: FrameExtractionOptions, duration: Double, videoFPS: Double) -> Int {
         effectiveTargetFPS(options: options, duration: duration, videoFPS: videoFPS)
     }
+
 }
 #endif

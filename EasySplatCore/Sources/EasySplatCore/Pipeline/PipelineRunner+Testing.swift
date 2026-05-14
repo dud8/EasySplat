@@ -16,6 +16,7 @@ struct TestFrameExtractionProfile: Sendable {
     let sharpnessFloor: Double
     let sharpnessRatio: Double
     let outputFormat: FrameOutputFormat
+    let maxExtractedFrames: Int?
 }
 
 struct TestBrushTrainProgress: Sendable {
@@ -26,6 +27,14 @@ struct TestBrushTrainProgress: Sendable {
 struct TestBrushTrainingPlan: Sendable {
     let totalSteps: Int?
     let exportEvery: Int?
+}
+
+struct TestColmapSpeedProfile: Sendable {
+    let maxImageSize: Int
+    let extractSequentialOverlap: Int
+    let matchSequentialOverlap: Int
+    let maxNumFeatures: Int?
+    let maxNumMatches: Int?
 }
 
 enum TestStageOutputStatus: Equatable, Sendable {
@@ -81,7 +90,8 @@ extension PipelineRunner {
             minDistanceRatio: 0,
             sharpnessFloor: sharpnessFloor,
             sharpnessRatio: 0,
-            outputFormat: .jpeg
+            outputFormat: .jpeg,
+            maxExtractedFrames: nil
         )
         let result = filterVeryBlurryVideoFrames(
             frames: frames,
@@ -102,8 +112,41 @@ extension PipelineRunner {
             minDistanceRatio: profile.minDistanceRatio,
             sharpnessFloor: profile.sharpnessFloor,
             sharpnessRatio: profile.sharpnessRatio,
-            outputFormat: profile.outputFormat
+            outputFormat: profile.outputFormat,
+            maxExtractedFrames: profile.maxExtractedFrames
         )
+    }
+
+    func test_applySpeedProfileToColmap(
+        maxImageSize: Int,
+        extractSequentialOverlap: Int,
+        matchSequentialOverlap: Int
+    ) -> TestColmapSpeedProfile {
+        var imageSize = maxImageSize
+        var extract = colmapOptionsForExtraction()
+        var match = colmapOptionsForMatching()
+        extract.sequentialOverlap = extractSequentialOverlap
+        match.sequentialOverlap = matchSequentialOverlap
+        applySpeedProfileIfNeeded(
+            colmapMaxImageSize: &imageSize,
+            colmapExtractOptions: &extract,
+            colmapMatchOptions: &match
+        )
+        return TestColmapSpeedProfile(
+            maxImageSize: imageSize,
+            extractSequentialOverlap: extract.sequentialOverlap,
+            matchSequentialOverlap: match.sequentialOverlap,
+            maxNumFeatures: extract.maxNumFeatures,
+            maxNumMatches: match.maxNumMatches
+        )
+    }
+
+    func test_msplatDefaultIterations() -> Int? {
+        msplatDefaultIterations()
+    }
+
+    func test_shouldUseBrushInsteadOfAutomaticMsplat(for score: ReconstructionScore?) -> Bool {
+        shouldUseBrushInsteadOfAutomaticMsplat(for: score)
     }
 
     func test_shouldUseSequential(selectedFrames: [URL], input: InputSpec, forceExhaustive: Bool) -> Bool {
@@ -116,6 +159,14 @@ extension PipelineRunner {
 
     func test_latestBrushExport(in trainingURL: URL, minModificationDate: Date? = nil) -> (file: URL, step: Int?)? {
         latestBrushExport(in: trainingURL, minModificationDate: minModificationDate)
+    }
+
+    func test_latestTrainingExport(
+        in trainingURL: URL,
+        backend: TrainingBackend,
+        minModificationDate: Date? = nil
+    ) -> URL? {
+        latestTrainingExport(in: trainingURL, backend: backend, minModificationDate: minModificationDate)
     }
 
     func test_updateBrushResumeSnapshot(from exportURL: URL, trainingURL: URL) {
@@ -138,6 +189,10 @@ extension PipelineRunner {
     func test_brushTrainingPlan(for preset: PresetSpec) -> TestBrushTrainingPlan {
         let plan = brushTrainingPlan(for: preset)
         return TestBrushTrainingPlan(totalSteps: plan.totalSteps, exportEvery: plan.exportEvery)
+    }
+
+    func test_trainingBackendPreference() -> String {
+        trainingBackendPreference().rawValue
     }
 
     func test_trainingStatusMessage(
@@ -197,6 +252,10 @@ extension PipelineRunner {
 
     func test_colmapGpuOverride() -> Bool? {
         colmapGpuOverride()
+    }
+
+    func test_colmapSequentialOverlapOverride() -> Int? {
+        colmapSequentialOverlapOverride()
     }
 
     func test_vggtUseBundleAdjustmentPreference() -> Bool {

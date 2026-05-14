@@ -53,7 +53,7 @@ struct WindowAccessor: NSViewRepresentable {
 
             guard model.viewState == .processing else { return true }
 
-            let decision = model.presentExitConfirmation(for: model.stage)
+            let decision = model.presentExitConfirmation()
             switch decision {
             case .save:
                 model.cancelCurrentProject(deleteProject: false, exitIntent: .closeWindow, window: sender)

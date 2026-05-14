@@ -110,6 +110,85 @@ final class PipelineRunnerEnvParsingTests: XCTestCase {
         }
     }
 
+    func testColmapSequentialOverlapOverrideClamps() async {
+        let runner = makeRunner()
+
+        await withEnvironmentAsync(["EASYSPLAT_COLMAP_SEQUENTIAL_OVERLAP": nil]) {
+            XCTAssertNil(runner.test_colmapSequentialOverlapOverride())
+        }
+
+        await withEnvironmentAsync(["EASYSPLAT_COLMAP_SEQUENTIAL_OVERLAP": "2"]) {
+            XCTAssertEqual(runner.test_colmapSequentialOverlapOverride(), 2)
+        }
+
+        await withEnvironmentAsync(["EASYSPLAT_COLMAP_SEQUENTIAL_OVERLAP": "0"]) {
+            XCTAssertEqual(runner.test_colmapSequentialOverlapOverride(), 1)
+        }
+
+        await withEnvironmentAsync(["EASYSPLAT_COLMAP_SEQUENTIAL_OVERLAP": "99"]) {
+            XCTAssertEqual(runner.test_colmapSequentialOverlapOverride(), 30)
+        }
+
+        await withEnvironmentAsync(["EASYSPLAT_COLMAP_SEQUENTIAL_OVERLAP": "nope"]) {
+            XCTAssertNil(runner.test_colmapSequentialOverlapOverride())
+        }
+    }
+
+    func testTrainingBackendPreferenceDefaultsAndParsesMsplat() async {
+        let runner = makeRunner()
+
+        await withEnvironmentAsync([
+            "EASYSPLAT_TRAINER": nil,
+            "EASYSPLAT_SPEED_PROFILE": nil,
+            "EASYSPLAT_MSPLAT_BIN": nil
+        ]) {
+            XCTAssertEqual(runner.test_trainingBackendPreference(), "brush")
+        }
+
+        await withEnvironmentAsync([
+            "EASYSPLAT_TRAINER": " msplat ",
+            "EASYSPLAT_SPEED_PROFILE": nil,
+            "EASYSPLAT_MSPLAT_BIN": nil
+        ]) {
+            XCTAssertEqual(runner.test_trainingBackendPreference(), "msplat")
+        }
+
+        await withEnvironmentAsync([
+            "EASYSPLAT_TRAINER": "unknown",
+            "EASYSPLAT_SPEED_PROFILE": nil,
+            "EASYSPLAT_MSPLAT_BIN": nil
+        ]) {
+            XCTAssertEqual(runner.test_trainingBackendPreference(), "brush")
+        }
+    }
+
+    func testFastSpeedProfileUsesMsplatWhenExecutableIsAvailable() async throws {
+        let msplat = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try TestFileBuilder.createExecutable(at: msplat)
+        defer { try? FileManager.default.removeItem(at: msplat) }
+        let runner = makeRunner()
+
+        await withEnvironmentAsync([
+            "EASYSPLAT_TRAINER": nil,
+            "EASYSPLAT_SPEED_PROFILE": "fast",
+            "EASYSPLAT_MSPLAT_BIN": msplat.path
+        ]) {
+            XCTAssertEqual(runner.test_trainingBackendPreference(), "msplat")
+        }
+    }
+
+    func testFastSpeedProfileKeepsBrushWhenMsplatIsMissing() async {
+        let runner = makeRunner()
+
+        await withEnvironmentAsync([
+            "EASYSPLAT_TRAINER": nil,
+            "EASYSPLAT_SPEED_PROFILE": "fast",
+            "EASYSPLAT_MSPLAT_BIN": "/tmp/easysplat-missing-msplat-\(UUID().uuidString)"
+        ]) {
+            XCTAssertEqual(runner.test_trainingBackendPreference(), "brush")
+        }
+    }
+
     private func makeRunner() -> PipelineRunner {
         let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
         let vggt = VggtToolchain(root: root, sfmTool: root, python: root, models: root)

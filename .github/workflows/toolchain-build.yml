@@ -61,6 +61,9 @@ jobs:
       - name: Build Brush
         run: scripts/toolchain/build_brush.sh
 
+      - name: Build msplat
+        run: scripts/toolchain/build_msplat.sh
+
       - name: Build DA3-MPS bundle
         run: |
           case "${EASYSPLAT_ALLOW_UNPINNED_DA3_SOURCE:-0}" in

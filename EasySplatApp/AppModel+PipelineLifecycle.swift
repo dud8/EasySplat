@@ -15,7 +15,7 @@ extension AppModel {
 
         if !deleteProject,
            exitIntent != .none,
-           stage == .trainBrush,
+           isBrushSnapshotTrainingActive,
            let projectURL = currentProjectURL {
             let snapshotURL = ProjectPaths(root: projectURL)
                 .trainingURL
@@ -46,9 +46,12 @@ extension AppModel {
         if deleteProject {
             statusTitle = "Stopping and deleting…"
             statusDetail = "Stopping at the next safe point (up to 15 seconds)…"
-        } else if stage == .trainBrush {
+        } else if isBrushSnapshotTrainingActive {
             statusTitle = "Exporting snapshot…"
             statusDetail = "Exporting the latest snapshot (training restarts from scratch on resume)."
+        } else if isTrainingStageActive {
+            statusTitle = "Saving project…"
+            statusDetail = "Stopping training at the next safe point (resume starts training over)."
         } else {
             statusTitle = "Saving progress…"
             statusDetail = "Stopping at the next safe point (up to 15 seconds)…"
@@ -109,15 +112,20 @@ extension AppModel {
         return max(0, elapsed)
     }
 
-    func presentExitConfirmation(for stage: PipelineStage?) -> ExitDecision {
-        let isTraining = stage == .trainBrush
+    func presentExitConfirmation() -> ExitDecision {
+        let isTraining = isTrainingStageActive
+        let canExportSnapshot = isBrushSnapshotTrainingActive
         let alert = NSAlert()
         alert.alertStyle = .warning
         alert.messageText = isTraining ? "Training in progress" : "Stop this project?"
-        alert.informativeText = isTraining
-            ? "Exporting keeps only a snapshot. If you resume, training starts over from scratch."
-            : "You can save and resume later, or delete the project."
-        alert.addButton(withTitle: isTraining ? "Export Snapshot" : "Save Project")
+        if canExportSnapshot {
+            alert.informativeText = "Exporting keeps only a snapshot. If you resume, training starts over from scratch."
+        } else if isTraining {
+            alert.informativeText = "You can save progress, but training starts over if you resume later."
+        } else {
+            alert.informativeText = "You can save and resume later, or delete the project."
+        }
+        alert.addButton(withTitle: canExportSnapshot ? "Export Snapshot" : "Save Project")
         alert.addButton(withTitle: "Delete Project")
         alert.addButton(withTitle: "Cancel")
         switch alert.runModal() {
@@ -274,7 +282,7 @@ extension AppModel {
 
             let runner = pipelineRunnerFactory(
                 projectURL,
-                .init(toolchain: toolchain, preset: metadata.preset, trainingGate: makeTrainingGate())
+                pipelineConfig(toolchain: toolchain, preset: metadata.preset)
             )
             let forwarder = EventForwarder(model: self, taskToken: taskToken)
             try await runner.run(resumeFrom: Optional<PipelineStage>.none) { event in
@@ -378,7 +386,7 @@ extension AppModel {
 
             let runner = pipelineRunnerFactory(
                 url,
-                .init(toolchain: toolchain, preset: metadata.preset, trainingGate: makeTrainingGate())
+                pipelineConfig(toolchain: toolchain, preset: metadata.preset)
             )
             let forwarder = EventForwarder(model: self, taskToken: taskToken)
             let stageToResume = resumeStage(from: metadata)
@@ -454,6 +462,7 @@ extension AppModel {
         stopAction = nil
         isShowingTrainingConsent = false
         isLivePreviewEnabled = false
+        activeTrainingBackend = nil
         trainingConsentContinuation = nil
         trainingConsentPauseStartedAt = nil
         trainingConsentPausedDuration = 0
@@ -488,6 +497,19 @@ extension AppModel {
         appendLogLine("[err] \(message)", isError: true)
         viewState = .processing
         refreshProjectSummaries()
+    }
+
+    func pipelineConfig(toolchain: ToolchainPaths, preset: PresetSpec) -> PipelineRunner.PipelineConfig {
+        PipelineRunner.PipelineConfig(
+            toolchain: toolchain,
+            preset: preset,
+            speedProfile: speedProfile(for: preset),
+            trainingGate: makeTrainingGate()
+        )
+    }
+
+    func speedProfile(for preset: PresetSpec) -> PipelineRunner.SpeedProfile {
+        preset.quality == .draft ? .fast : .standard
     }
 
     func completeStop() {

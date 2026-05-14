@@ -5,8 +5,52 @@ extension PipelineRunner {
         paths: ProjectPaths,
         progress: (Double, String) -> Void
     ) throws -> URL {
+        try prepareTrainingDataset(
+            paths: paths,
+            datasetName: "dataset",
+            progressName: "training",
+            sparseEnsureMessage: "ensuring text model files",
+            requiredSparseFiles: ["cameras.txt", "images.txt", "points3D.txt"],
+            prepareSourceSparse: { _ = try ensureTextSparseModelFiles(at: $0) },
+            ensureCopiedSparse: { try ensureTextSparseModelFiles(at: $0) },
+            finalizeCopiedSparse: { sparse in
+                let imagesTxt = sparse.appendingPathComponent("images.txt")
+                _ = try ColmapTextModelNormalizer.normalizeImagesTxtIfNeeded(at: imagesTxt)
+            },
+            progress: progress
+        )
+    }
+
+    func prepareMsplatDataset(
+        paths: ProjectPaths,
+        progress: (Double, String) -> Void
+    ) throws -> URL {
+        try prepareTrainingDataset(
+            paths: paths,
+            datasetName: "msplat_dataset",
+            progressName: "msplat",
+            sparseEnsureMessage: "ensuring binary model files",
+            requiredSparseFiles: ["cameras.bin", "images.bin", "points3D.bin"],
+            prepareSourceSparse: { _ in },
+            ensureCopiedSparse: { try ensureBinarySparseModelFiles(at: $0) },
+            finalizeCopiedSparse: { _ in },
+            progress: progress
+        )
+    }
+
+    private func prepareTrainingDataset(
+        paths: ProjectPaths,
+        datasetName: String,
+        progressName: String,
+        sparseEnsureMessage: String,
+        requiredSparseFiles: [String],
+        prepareSourceSparse: (URL) throws -> Void,
+        ensureCopiedSparse: (URL) throws -> Bool,
+        finalizeCopiedSparse: (URL) throws -> Void,
+        progress: (Double, String) -> Void
+    ) throws -> URL {
         let fm = FileManager.default
-        let dataset = paths.trainingURL.appendingPathComponent("dataset", isDirectory: true)
+        let dataset = paths.trainingURL.appendingPathComponent(datasetName, isDirectory: true)
         let images = dataset.appendingPathComponent("images", isDirectory: true)
         let sparse = dataset.appendingPathComponent("sparse/0", isDirectory: true)
         try resetDirectory(images)
@@ -23,14 +67,14 @@ extension PipelineRunner {
             try fm.copyItem(at: url, to: dest)
             if index % 5 == 0 || index + 1 == imageFiles.count {
                 let fraction = imageProgressScale * (Double(index + 1) / Double(imageTotal))
-                progress(fraction, "Preparing training dataset (images) \(index + 1)/\(imageTotal)")
+                progress(fraction, "Preparing \(progressName) dataset (images) \(index + 1)/\(imageTotal)")
             }
         }
 
         let sourceSparseRoot = paths.colmapSparseURL.appendingPathComponent("0", isDirectory: true)
         let sourceSparse = try resolveSparseModelDirectory(at: sourceSparseRoot)
         guard sparseModelFilesExist(at: sourceSparse) else { throw PipelineError.outputMissing }
-        try _ = ensureTextSparseModelFiles(at: sourceSparse)
+        try prepareSourceSparse(sourceSparse)
         let files = try fm.contentsOfDirectory(
             at: sourceSparse,
             includingPropertiesForKeys: [.isRegularFileKey],
@@ -46,25 +90,137 @@ extension PipelineRunner {
             if fm.fileExists(atPath: dest.path) { try fm.removeItem(at: dest) }
             try fm.copyItem(at: file, to: dest)
             let fraction = imageProgressScale + sparseProgressScale * (Double(index + 1) / Double(sparseTotal))
-            progress(fraction, "Preparing training dataset (sparse) \(index + 1)/\(sparseTotal)")
+            progress(fraction, "Preparing \(progressName) dataset (sparse) \(index + 1)/\(sparseTotal)")
         }
 
-        progress(0.98, "Preparing training dataset (sparse): ensuring text model files.")
-        let converted = try ensureTextSparseModelFiles(at: sparse)
+        progress(0.98, "Preparing \(progressName) dataset (sparse): \(sparseEnsureMessage).")
+        let converted = try ensureCopiedSparse(sparse)
         if converted {
-            progress(0.99, "Preparing training dataset (sparse): conversion complete.")
+            progress(0.99, "Preparing \(progressName) dataset (sparse): conversion complete.")
         }
 
-        let requiredTextFiles = ["cameras.txt", "images.txt", "points3D.txt"]
-        for name in requiredTextFiles {
+        for name in requiredSparseFiles {
             let fileURL = sparse.appendingPathComponent(name)
             guard fm.fileExists(atPath: fileURL.path) else { throw PipelineError.outputMissing }
             let size = (try? fm.attributesOfItem(atPath: fileURL.path)[.size] as? NSNumber)?.int64Value ?? 0
             guard size > 0 else { throw PipelineError.outputMissing }
         }
-        let imagesTxt = sparse.appendingPathComponent("images.txt")
-        try _ = ColmapTextModelNormalizer.normalizeImagesTxtIfNeeded(at: imagesTxt)
+        try finalizeCopiedSparse(sparse)
         return dataset
+    }
+
+    @discardableResult
+    func ensureBinarySparseModelFiles(at url: URL) throws -> Bool {
+        let fm = FileManager.default
+        let binFiles = ["cameras.bin", "images.bin", "points3D.bin"]
+        if binFiles.allSatisfy({ fm.fileExists(atPath: url.appendingPathComponent($0).path) }) {
+            return false
+        }
+
+        let txtFiles = ["cameras.txt", "images.txt", "points3D.txt"]
+        guard txtFiles.allSatisfy({ fm.fileExists(atPath: url.appendingPathComponent($0).path) }) else {
+            throw PipelineError.outputMissing
+        }
+
+        let converterOptions = colmapOptionsForMatching()
+        try tooling.colmap.runModelConverter(
+            colmapPath: config.toolchain.colmap,
+            inputPath: url,
+            outputPath: url,
+            outputType: "BIN",
+            environment: converterOptions.environment,
+            onLog: { _, _ in }
+        )
+
+        guard binFiles.allSatisfy({ fm.fileExists(atPath: url.appendingPathComponent($0).path) }) else {
+            throw PipelineError.outputMissing
+        }
+        return true
+    }
+
+    func trainingBackendPreference() -> TrainingBackend {
+        guard let raw = ProcessInfo.processInfo.environment["EASYSPLAT_TRAINER"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased(),
+              !raw.isEmpty else {
+            if isFastSpeedProfile() && isMsplatToolAvailable() {
+                return .msplat
+            }
+            return .brush
+        }
+        switch raw {
+        case "msplat":
+            return .msplat
+        default:
+            return .brush
+        }
+    }
+
+    func checkpointTrainingBackend(metadata: ProjectMetadata) -> TrainingBackend? {
+        guard case .trainBrush(let checkpoint)? = metadata.checkpoint?.details else { return nil }
+        return checkpoint.trainingBackend
+    }
+
+    func isMsplatToolAvailable() -> Bool {
+        FileManager.default.isExecutableFile(atPath: msplatToolPath().path)
+    }
+
+    func msplatToolPath() -> URL {
+        if let raw = ProcessInfo.processInfo.environment["EASYSPLAT_MSPLAT_BIN"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines),
+           !raw.isEmpty {
+            return URL(fileURLWithPath: (raw as NSString).expandingTildeInPath)
+        }
+        return config.toolchain.msplat
+    }
+
+    func msplatDefaultIterations() -> Int? {
+        isFastSpeedProfile() ? 1_800 : nil
+    }
+
+    func shouldUseBrushInsteadOfAutomaticMsplat(for score: ReconstructionScore?) -> Bool {
+        guard isFastSpeedProfile() else { return false }
+        guard !hasExplicitTrainingBackendPreference() else { return false }
+        guard let pointCount = score?.pointCount else { return false }
+        return pointCount < automaticMsplatMinimumSparsePoints()
+    }
+
+    func automaticMsplatMinimumSparsePoints() -> Int {
+        1_500
+    }
+
+    func hasExplicitTrainingBackendPreference() -> Bool {
+        guard let raw = ProcessInfo.processInfo.environment["EASYSPLAT_TRAINER"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines) else {
+            return false
+        }
+        return !raw.isEmpty
+    }
+
+    func latestTrainingExport(
+        in trainingURL: URL,
+        backend: TrainingBackend,
+        minModificationDate: Date? = nil
+    ) -> URL? {
+        switch backend {
+        case .brush:
+            if let brushExport = latestBrushExport(in: trainingURL, minModificationDate: minModificationDate)?.file {
+                return brushExport
+            }
+            return latestTrainingExport(in: trainingURL, backend: .msplat, minModificationDate: minModificationDate)
+        case .msplat:
+            let candidate = trainingURL.appendingPathComponent("msplat/splat.ply")
+            guard FileManager.default.fileExists(atPath: candidate.path) else {
+                return latestBrushExport(in: trainingURL, minModificationDate: minModificationDate)?.file
+            }
+            if let minModificationDate {
+                let date = (try? candidate.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate) ?? Date.distantPast
+                guard date >= minModificationDate else {
+                    return latestBrushExport(in: trainingURL, minModificationDate: minModificationDate)?.file
+                }
+            }
+            return candidate
+        }
     }
 
     func latestBrushExport(in trainingURL: URL, minModificationDate: Date? = nil) -> (file: URL, step: Int?)? {
@@ -81,7 +237,7 @@ extension PipelineRunner {
         let enumerator = fm.enumerator(at: trainingURL, includingPropertiesForKeys: [.contentModificationDateKey], options: [.skipsHiddenFiles])
         var latest: (file: URL, date: Date, step: Int?)?
         while let item = enumerator?.nextObject() as? URL {
-            guard item.pathExtension.lowercased() == "ply" else { continue }
+            guard isBrushExportablePly(item) else { continue }
             let date = (try? item.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate) ?? Date.distantPast
             if let minModificationDate, date < minModificationDate { continue }
             let step = brushExportStep(from: item)
@@ -105,7 +261,7 @@ extension PipelineRunner {
         let files = (try? fm.contentsOfDirectory(at: directory, includingPropertiesForKeys: [.contentModificationDateKey], options: [.skipsHiddenFiles])) ?? []
 
         var newest: (file: URL, date: Date, step: Int?)?
-        for file in files where file.pathExtension.lowercased() == "ply" {
+        for file in files where isBrushExportablePly(file) {
             let date = (try? file.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate) ?? Date.distantPast
             if let minModificationDate, date < minModificationDate {
                 continue
@@ -122,6 +278,14 @@ extension PipelineRunner {
 
         guard let newest else { return nil }
         return (file: newest.file, step: newest.step)
+    }
+
+    func isBrushExportablePly(_ url: URL) -> Bool {
+        let name = url.lastPathComponent
+        return name.hasPrefix("export_")
+            && name.hasSuffix(".ply")
+            && !name.hasSuffix(".compressed.ply")
+            && name != "latest_snapshot.ply"
     }
 
     func brushExportStep(from url: URL) -> Int? {
@@ -358,6 +522,9 @@ extension PipelineRunner {
     }
 
     func brushTrainingPlan(for preset: PresetSpec) -> BrushTrainingPlan {
+        if isFastSpeedProfile() {
+            return BrushTrainingPlan(totalSteps: 2_000, exportEvery: 2_000)
+        }
         switch preset.quality {
         case .draft:
             return BrushTrainingPlan(totalSteps: 20_000, exportEvery: 5_000)
@@ -466,8 +633,7 @@ extension PipelineRunner {
         let enumerator = fm.enumerator(at: trainingURL, includingPropertiesForKeys: [.contentModificationDateKey], options: [.skipsHiddenFiles])
         var latest: (URL, Date)?
         while let item = enumerator?.nextObject() as? URL {
-            guard item.pathExtension.lowercased() == "ply" else { continue }
-            if item.lastPathComponent.hasSuffix(".compressed.ply") { continue }
+            guard isBrushExportablePly(item) else { continue }
             let date = (try? item.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate) ?? Date.distantPast
             if let minModificationDate, date < minModificationDate { continue }
             if let best = latest {

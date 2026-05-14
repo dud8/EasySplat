@@ -34,13 +34,15 @@ struct ProcessingView: View {
                                         .foregroundStyle(.secondary)
                                 }
                             }
-                            if model.stage == .trainBrush {
-                                Text("Training in progress. Closing now exports a snapshot only; resuming restarts from scratch.")
+                            if model.isTrainingStageActive {
+                                Text(model.isBrushSnapshotTrainingActive
+                                     ? "Training in progress. Closing now exports a snapshot only; resuming restarts from scratch."
+                                     : "Training in progress. Resuming later starts training over.")
                                     .font(.caption)
                                     .foregroundStyle(.secondary)
                             }
                             ShimmeringProgressView(progress: model.progress)
-                            if model.stage == .trainBrush {
+                            if model.isBrushSnapshotTrainingActive {
                                 VStack(alignment: .leading, spacing: 8) {
                                     Toggle("Show live preview", isOn: $model.isLivePreviewEnabled)
                                         .toggleStyle(.checkbox)
@@ -177,21 +179,24 @@ struct ProcessingView: View {
     }
 
     private func summaryDetail(_ detail: String) -> String {
-        guard model.stage == .trainBrush else { return detail }
+        guard model.isBrushSnapshotTrainingActive else { return detail }
         guard let range = detail.range(of: " (running ") else { return detail }
         return String(detail[..<range.lowerBound])
     }
 
     private var returnPrimaryActionLabel: String {
-        model.stage == .trainBrush ? "Export Snapshot" : "Save Project"
+        model.isBrushSnapshotTrainingActive ? "Export Snapshot" : "Save Project"
     }
 
     private var stoppingStatusText: String {
         if model.stopAction == .deleteProject {
             return "Stopping and deleting… (up to 15 seconds)"
         }
-        if model.stage == .trainBrush {
+        if model.isBrushSnapshotTrainingActive {
             return "Exporting snapshot… (up to 15 seconds)"
+        }
+        if model.isTrainingStageActive {
+            return "Saving project… (up to 15 seconds)"
         }
         return "Saving progress… (up to 15 seconds)"
     }
@@ -200,8 +205,11 @@ struct ProcessingView: View {
         if model.stopAction == .deleteProject {
             return "Stopping and deleting…"
         }
-        if model.stage == .trainBrush {
+        if model.isBrushSnapshotTrainingActive {
             return "Exporting snapshot…"
+        }
+        if model.isTrainingStageActive {
+            return "Saving project…"
         }
         return "Saving progress…"
     }
@@ -210,15 +218,21 @@ struct ProcessingView: View {
         if model.stopAction == .deleteProject {
             return "Stopping at the next safe point (up to 15 seconds)."
         }
-        if model.stage == .trainBrush {
+        if model.isBrushSnapshotTrainingActive {
             return "Exporting the latest snapshot (training restarts from scratch on resume)."
+        }
+        if model.isTrainingStageActive {
+            return "Stopping training at the next safe point. Resume starts training over."
         }
         return "Stopping at the next safe point (up to 15 seconds)."
     }
 
     private var returnDialogMessage: String {
-        if model.stage == .trainBrush {
+        if model.isBrushSnapshotTrainingActive {
             return "Exporting keeps only a snapshot. If you resume, training starts over from scratch. Delete removes all project data."
+        }
+        if model.isTrainingStageActive {
+            return "You can save progress, but training starts over if you resume later. Delete removes all project data."
         }
         return "You can save and resume later, or delete the project."
     }
@@ -232,7 +246,7 @@ private struct TrainingConsentSheet: View {
         VStack(alignment: .leading, spacing: 16) {
             Text("Training will start")
                 .font(.headline)
-            Text("Training can only export snapshots. If you quit during training, resuming starts over from scratch.")
+            Text("If you quit during training, resuming starts training over.")
                 .font(.subheadline)
                 .foregroundStyle(.secondary)
             Toggle("Remember my choice", isOn: $rememberChoice)

@@ -121,6 +121,21 @@ public enum ReconstructionScorer {
         return true
     }
 
+    public static func applyingExpectedTotalImages(
+        _ score: ReconstructionScore,
+        expectedTotalImages: Int
+    ) -> ReconstructionScore {
+        guard expectedTotalImages > 0 else { return score }
+        return ReconstructionScore(
+            registeredImages: score.registeredImages,
+            totalImages: max(score.totalImages, expectedTotalImages),
+            meanReprojectionError: score.meanReprojectionError,
+            pointCount: score.pointCount,
+            observationCount: score.observationCount,
+            meanTrackLength: score.meanTrackLength
+        )
+    }
+
     public static func summary(_ score: ReconstructionScore) -> String {
         let ratio = score.totalImages > 0 ? Double(score.registeredImages) / Double(score.totalImages) : 0.0
         let percent = ratio * 100.0

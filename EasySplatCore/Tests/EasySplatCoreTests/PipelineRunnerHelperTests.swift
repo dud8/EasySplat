@@ -39,18 +39,270 @@ final class PipelineRunnerHelperTests: XCTestCase {
         XCTAssertEqual(resolved.standardizedFileURL, nested.standardizedFileURL)
     }
 
-    func testFrameExtractionProfileValues() throws {
+    func testFrameExtractionProfileValues() async throws {
         let root = try TestFileBuilder.makeTempDir()
         defer { try? FileManager.default.removeItem(at: root) }
         let runner = makeRunner(projectURL: root)
 
-        let draft = runner.test_frameExtractionProfile(for: .draft)
-        XCTAssertEqual(draft.targetCount, 120)
-        XCTAssertEqual(draft.outputFormat, .jpeg)
+        await withEnvironmentAsync([
+            "EASYSPLAT_SPEED_PROFILE": nil,
+            "EASYSPLAT_FRAME_TARGET_COUNT": nil,
+            "EASYSPLAT_FRAME_MAX_DIMENSION": nil,
+            "EASYSPLAT_FRAME_TARGET_FPS": nil
+        ]) {
+            let draft = runner.test_frameExtractionProfile(for: .draft)
+            XCTAssertEqual(draft.targetCount, 120)
+            XCTAssertNil(draft.maxExtractedFrames)
+            XCTAssertEqual(draft.outputFormat, .jpeg)
 
-        let ultra = runner.test_frameExtractionProfile(for: .ultra)
-        XCTAssertEqual(ultra.outputFormat, .png)
-        XCTAssertEqual(ultra.targetCount, 500)
+            let ultra = runner.test_frameExtractionProfile(for: .ultra)
+            XCTAssertEqual(ultra.outputFormat, .png)
+            XCTAssertEqual(ultra.targetCount, 500)
+            XCTAssertNil(ultra.maxExtractedFrames)
+        }
+    }
+
+    func testFrameExtractionProfileHonorsRuntimeOverrides() async throws {
+        let root = try TestFileBuilder.makeTempDir()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let runner = makeRunner(projectURL: root)
+
+        await withEnvironmentAsync([
+            "EASYSPLAT_SPEED_PROFILE": nil,
+            "EASYSPLAT_FRAME_TARGET_COUNT": "60",
+            "EASYSPLAT_FRAME_MAX_DIMENSION": "960",
+            "EASYSPLAT_FRAME_TARGET_FPS": "3"
+        ]) {
+            let profile = runner.test_frameExtractionProfile(for: .standard)
+            XCTAssertEqual(profile.targetCount, 60)
+            XCTAssertEqual(profile.maxDimension, 960)
+            XCTAssertEqual(profile.targetFPS, 3)
+            XCTAssertNil(profile.maxExtractedFrames)
+            XCTAssertEqual(profile.outputFormat, .jpeg)
+        }
+    }
+
+    func testFrameExtractionProfileFastSpeedProfileUsesMeasuredBudget() async throws {
+        let root = try TestFileBuilder.makeTempDir()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let runner = makeRunner(projectURL: root)
+
+        await withEnvironmentAsync([
+            "EASYSPLAT_SPEED_PROFILE": "fast",
+            "EASYSPLAT_FRAME_TARGET_COUNT": nil,
+            "EASYSPLAT_FRAME_MAX_DIMENSION": nil,
+            "EASYSPLAT_FRAME_TARGET_FPS": nil
+        ]) {
+            let profile = runner.test_frameExtractionProfile(for: .standard)
+            XCTAssertEqual(profile.targetCount, 30)
+            XCTAssertEqual(profile.maxDimension, 960)
+            XCTAssertEqual(profile.targetFPS, 3)
+            XCTAssertEqual(profile.maxExtractedFrames, 40)
+            XCTAssertEqual(profile.outputFormat, .jpeg)
+        }
+    }
+
+    func testFrameExtractionProfileConfiguredFastProfileUsesMeasuredBudget() async throws {
+        let root = try TestFileBuilder.makeTempDir()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let runner = makeRunner(projectURL: root, speedProfile: .fast)
+
+        await withEnvironmentAsync([
+            "EASYSPLAT_SPEED_PROFILE": nil,
+            "EASYSPLAT_FRAME_TARGET_COUNT": nil,
+            "EASYSPLAT_FRAME_MAX_DIMENSION": nil,
+            "EASYSPLAT_FRAME_TARGET_FPS": nil
+        ]) {
+            let profile = runner.test_frameExtractionProfile(for: .standard)
+            XCTAssertEqual(profile.targetCount, 30)
+            XCTAssertEqual(profile.maxDimension, 960)
+            XCTAssertEqual(profile.targetFPS, 3)
+            XCTAssertEqual(profile.maxExtractedFrames, 40)
+            XCTAssertEqual(profile.outputFormat, .jpeg)
+        }
+    }
+
+    func testFrameExtractionProfileFastSpeedProfileCapsExplicitTargetCount() async throws {
+        let root = try TestFileBuilder.makeTempDir()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let runner = makeRunner(projectURL: root)
+
+        await withEnvironmentAsync([
+            "EASYSPLAT_SPEED_PROFILE": "fast",
+            "EASYSPLAT_FRAME_TARGET_COUNT": "90",
+            "EASYSPLAT_FRAME_MAX_DIMENSION": nil,
+            "EASYSPLAT_FRAME_TARGET_FPS": nil
+        ]) {
+            let profile = runner.test_frameExtractionProfile(for: .standard)
+            XCTAssertEqual(profile.targetCount, 90)
+            XCTAssertEqual(profile.maxExtractedFrames, 120)
+        }
+    }
+
+    func testSpeedProfileFastCapsColmapImageSizeAndOverlap() async throws {
+        let root = try TestFileBuilder.makeTempDir()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let runner = makeRunner(projectURL: root)
+
+        await withEnvironmentAsync([
+            "EASYSPLAT_SPEED_PROFILE": "fast",
+            "EASYSPLAT_FRAME_MAX_DIMENSION": nil,
+            "EASYSPLAT_COLMAP_MAX_IMAGE_SIZE": nil
+        ]) {
+            let options = runner.test_applySpeedProfileToColmap(
+                maxImageSize: 1600,
+                extractSequentialOverlap: 12,
+                matchSequentialOverlap: 12
+            )
+            XCTAssertEqual(options.maxImageSize, 512)
+            XCTAssertEqual(options.extractSequentialOverlap, 2)
+            XCTAssertEqual(options.matchSequentialOverlap, 2)
+            XCTAssertEqual(options.maxNumFeatures, 4_000)
+            XCTAssertEqual(options.maxNumMatches, 4_000)
+        }
+    }
+
+    func testInvalidFrameMaxDimensionDoesNotDisableFastSpeedProfileCap() async throws {
+        let root = try TestFileBuilder.makeTempDir()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let runner = makeRunner(projectURL: root)
+
+        await withEnvironmentAsync([
+            "EASYSPLAT_SPEED_PROFILE": "fast",
+            "EASYSPLAT_FRAME_MAX_DIMENSION": "nope",
+            "EASYSPLAT_COLMAP_MAX_IMAGE_SIZE": nil
+        ]) {
+            let options = runner.test_applySpeedProfileToColmap(
+                maxImageSize: 1600,
+                extractSequentialOverlap: 12,
+                matchSequentialOverlap: 12
+            )
+            XCTAssertEqual(options.maxImageSize, 512)
+            XCTAssertEqual(options.extractSequentialOverlap, 2)
+            XCTAssertEqual(options.matchSequentialOverlap, 2)
+            XCTAssertEqual(options.maxNumFeatures, 4_000)
+            XCTAssertEqual(options.maxNumMatches, 4_000)
+        }
+    }
+
+    func testFastSpeedProfileUsesMsplatIterationBudget() async throws {
+        let root = try TestFileBuilder.makeTempDir()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let runner = makeRunner(projectURL: root)
+
+        await withEnvironmentAsync(["EASYSPLAT_SPEED_PROFILE": "fast"]) {
+            XCTAssertEqual(runner.test_msplatDefaultIterations(), 1_800)
+        }
+
+        await withEnvironmentAsync(["EASYSPLAT_SPEED_PROFILE": nil]) {
+            XCTAssertNil(runner.test_msplatDefaultIterations())
+        }
+    }
+
+    func testFastSpeedProfileAvoidsAutomaticMsplatWhenSparsePointCountIsLow() async throws {
+        let root = try TestFileBuilder.makeTempDir()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let runner = makeRunner(projectURL: root)
+        let lowScore = ReconstructionScore(
+            registeredImages: 60,
+            totalImages: 60,
+            meanReprojectionError: 0.001,
+            pointCount: 1_499
+        )
+        let enoughScore = ReconstructionScore(
+            registeredImages: 60,
+            totalImages: 60,
+            meanReprojectionError: 0.001,
+            pointCount: 1_500
+        )
+
+        await withEnvironmentAsync([
+            "EASYSPLAT_SPEED_PROFILE": "fast",
+            "EASYSPLAT_TRAINER": nil
+        ]) {
+            XCTAssertTrue(runner.test_shouldUseBrushInsteadOfAutomaticMsplat(for: lowScore))
+            XCTAssertFalse(runner.test_shouldUseBrushInsteadOfAutomaticMsplat(for: enoughScore))
+            XCTAssertFalse(runner.test_shouldUseBrushInsteadOfAutomaticMsplat(for: nil))
+        }
+    }
+
+    func testExplicitMsplatOverrideKeepsMsplatForLowSparsePointCount() async throws {
+        let root = try TestFileBuilder.makeTempDir()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let runner = makeRunner(projectURL: root)
+        let lowScore = ReconstructionScore(
+            registeredImages: 60,
+            totalImages: 60,
+            meanReprojectionError: 0.001,
+            pointCount: 500
+        )
+
+        await withEnvironmentAsync([
+            "EASYSPLAT_SPEED_PROFILE": "fast",
+            "EASYSPLAT_TRAINER": "msplat"
+        ]) {
+            XCTAssertFalse(runner.test_shouldUseBrushInsteadOfAutomaticMsplat(for: lowScore))
+        }
+    }
+
+    func testExplicitFrameMaxDimensionDoesNotDisableFastColmapCap() async throws {
+        let root = try TestFileBuilder.makeTempDir()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let runner = makeRunner(projectURL: root)
+
+        await withEnvironmentAsync([
+            "EASYSPLAT_SPEED_PROFILE": "fast",
+            "EASYSPLAT_FRAME_MAX_DIMENSION": "1200",
+            "EASYSPLAT_COLMAP_MAX_IMAGE_SIZE": nil
+        ]) {
+            let options = runner.test_applySpeedProfileToColmap(
+                maxImageSize: 1200,
+                extractSequentialOverlap: 12,
+                matchSequentialOverlap: 12
+            )
+            XCTAssertEqual(options.maxImageSize, 512)
+            XCTAssertEqual(options.extractSequentialOverlap, 2)
+            XCTAssertEqual(options.matchSequentialOverlap, 2)
+        }
+    }
+
+    func testExplicitColmapMaxImageSizeBeatsFastSpeedProfileForColmap() async throws {
+        let root = try TestFileBuilder.makeTempDir()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let runner = makeRunner(projectURL: root)
+
+        await withEnvironmentAsync([
+            "EASYSPLAT_SPEED_PROFILE": "fast",
+            "EASYSPLAT_FRAME_MAX_DIMENSION": "960",
+            "EASYSPLAT_COLMAP_MAX_IMAGE_SIZE": "1200"
+        ]) {
+            let options = runner.test_applySpeedProfileToColmap(
+                maxImageSize: 1200,
+                extractSequentialOverlap: 12,
+                matchSequentialOverlap: 12
+            )
+            XCTAssertEqual(options.maxImageSize, 1200)
+            XCTAssertEqual(options.extractSequentialOverlap, 2)
+            XCTAssertEqual(options.matchSequentialOverlap, 2)
+        }
+    }
+
+    func testFrameExtractionProfileIgnoresInvalidRuntimeOverrides() async throws {
+        let root = try TestFileBuilder.makeTempDir()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let runner = makeRunner(projectURL: root)
+
+        await withEnvironmentAsync([
+            "EASYSPLAT_SPEED_PROFILE": nil,
+            "EASYSPLAT_FRAME_TARGET_COUNT": "0",
+            "EASYSPLAT_FRAME_MAX_DIMENSION": "-1",
+            "EASYSPLAT_FRAME_TARGET_FPS": "nope"
+        ]) {
+            let profile = runner.test_frameExtractionProfile(for: .draft)
+            XCTAssertEqual(profile.targetCount, 120)
+            XCTAssertEqual(profile.maxDimension, 1024)
+            XCTAssertEqual(profile.targetFPS, 2)
+        }
     }
 
     func testShouldUseSequentialConditions() throws {
@@ -656,7 +908,8 @@ final class PipelineRunnerHelperTests: XCTestCase {
         let runner = makeRunner(projectURL: root)
 
         let restore = await scopedEnvironment([
-            "EASYSPLAT_SFM_BACKEND": nil
+            "EASYSPLAT_SFM_BACKEND": nil,
+            "EASYSPLAT_SPEED_PROFILE": nil
         ])
         defer { restore() }
 
@@ -672,10 +925,39 @@ final class PipelineRunnerHelperTests: XCTestCase {
 
         await withEnvironmentAsync([
             "EASYSPLAT_SFM_BACKEND": nil,
+            "EASYSPLAT_SPEED_PROFILE": nil,
             "EASYSPLAT_ENABLE_VGGT_GRACE_FALLBACK": "1"
         ]) {
             let order = runner.test_sfmBackendFallbackOrder()
             XCTAssertEqual(order, [.da3, .mapanything, .colmap])
+        }
+    }
+
+    func testFastSpeedProfileDefaultsToColmap() async throws {
+        let root = try TestFileBuilder.makeTempDir()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let runner = makeRunner(projectURL: root)
+
+        await withEnvironmentAsync([
+            "EASYSPLAT_SFM_BACKEND": nil,
+            "EASYSPLAT_SPEED_PROFILE": "fast"
+        ]) {
+            XCTAssertEqual(runner.test_sfmBackendPolicy(), .colmap)
+            XCTAssertEqual(runner.test_sfmBackendFallbackOrder(), [.colmap])
+        }
+    }
+
+    func testConfiguredFastSpeedProfileDefaultsToColmap() async throws {
+        let root = try TestFileBuilder.makeTempDir()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let runner = makeRunner(projectURL: root, speedProfile: .fast)
+
+        await withEnvironmentAsync([
+            "EASYSPLAT_SFM_BACKEND": nil,
+            "EASYSPLAT_SPEED_PROFILE": nil
+        ]) {
+            XCTAssertEqual(runner.test_sfmBackendPolicy(), .colmap)
+            XCTAssertEqual(runner.test_sfmBackendFallbackOrder(), [.colmap])
         }
     }
 
@@ -1090,7 +1372,8 @@ final class PipelineRunnerHelperTests: XCTestCase {
             paths.mapanythingLogURL,
             paths.vggtLogURL,
             paths.fastvggtLogURL,
-            paths.brushLogURL
+            paths.brushLogURL,
+            paths.msplatLogURL
         ]
         for url in urls {
             try "stale\n".write(to: url, atomically: true, encoding: .utf8)
@@ -1150,6 +1433,53 @@ final class PipelineRunnerHelperTests: XCTestCase {
         let runner = makeRunner(projectURL: root)
         let latest = runner.test_latestBrushExport(in: training, minModificationDate: Date().addingTimeInterval(-30))
         XCTAssertNil(latest)
+    }
+
+    func testLatestTrainingExportFallsBackFromStaleMsplatToFreshBrushExport() throws {
+        let root = try TestFileBuilder.makeTempDir()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let training = root.appendingPathComponent("Training", isDirectory: true)
+        let exports = training.appendingPathComponent("dataset_exports", isDirectory: true)
+        let msplat = training.appendingPathComponent("msplat", isDirectory: true)
+        try FileManager.default.createDirectory(at: exports, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: msplat, withIntermediateDirectories: true)
+
+        let staleMsplat = msplat.appendingPathComponent("splat.ply")
+        let freshBrush = exports.appendingPathComponent("export_00020.ply")
+        try TestFileBuilder.writeMinimalPly(at: staleMsplat)
+        try TestFileBuilder.writeMinimalPly(at: freshBrush)
+
+        let cutoff = Date()
+        try FileManager.default.setAttributes([.modificationDate: cutoff.addingTimeInterval(-60)], ofItemAtPath: staleMsplat.path)
+        try FileManager.default.setAttributes([.modificationDate: cutoff.addingTimeInterval(5)], ofItemAtPath: freshBrush.path)
+
+        let runner = makeRunner(projectURL: root)
+        let latest = runner.test_latestTrainingExport(in: training, backend: .msplat, minModificationDate: cutoff)
+        XCTAssertEqual(latest?.standardizedFileURL, freshBrush.standardizedFileURL)
+    }
+
+    func testLatestBrushExportRecursiveFallbackIgnoresSnapshotsAndCompressedFiles() throws {
+        let root = try TestFileBuilder.makeTempDir()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let training = root.appendingPathComponent("Training", isDirectory: true)
+        let nested = training.appendingPathComponent("custom_exports", isDirectory: true)
+        try FileManager.default.createDirectory(at: nested, withIntermediateDirectories: true)
+
+        let exportOld = nested.appendingPathComponent("export_00010.ply")
+        let compressedNew = nested.appendingPathComponent("export_99999.compressed.ply")
+        let snapshotNew = training.appendingPathComponent("latest_snapshot.ply")
+        try TestFileBuilder.writeMinimalPly(at: exportOld)
+        try TestFileBuilder.writeMinimalPly(at: compressedNew)
+        try TestFileBuilder.writeMinimalPly(at: snapshotNew)
+        let now = Date()
+        try FileManager.default.setAttributes([.modificationDate: now.addingTimeInterval(-100)], ofItemAtPath: exportOld.path)
+        try FileManager.default.setAttributes([.modificationDate: now], ofItemAtPath: compressedNew.path)
+        try FileManager.default.setAttributes([.modificationDate: now.addingTimeInterval(100)], ofItemAtPath: snapshotNew.path)
+
+        let runner = makeRunner(projectURL: root)
+        let latest = runner.test_latestBrushExport(in: training)
+        XCTAssertEqual(latest?.file.standardizedFileURL, exportOld.standardizedFileURL)
+        XCTAssertEqual(latest?.step, 10)
     }
 
     func testUpdateBrushResumeSnapshotReplacesFile() throws {
@@ -1253,22 +1583,36 @@ final class PipelineRunnerHelperTests: XCTestCase {
         XCTAssertFalse(runner.test_normalizedToolLogIsError(cudaFallbackWarning, isError: true))
     }
 
-    func testBrushTrainingPlanForQualityPresets() throws {
+    func testBrushTrainingPlanForQualityPresets() async throws {
         let root = try TestFileBuilder.makeTempDir()
         defer { try? FileManager.default.removeItem(at: root) }
         let runner = makeRunner(projectURL: root)
 
-        let draft = runner.test_brushTrainingPlan(for: PresetSpec(mode: .object, quality: .draft))
-        XCTAssertEqual(draft.totalSteps, 20_000)
-        XCTAssertEqual(draft.exportEvery, 5_000)
+        await withEnvironmentAsync(["EASYSPLAT_SPEED_PROFILE": nil]) {
+            let draft = runner.test_brushTrainingPlan(for: PresetSpec(mode: .object, quality: .draft))
+            XCTAssertEqual(draft.totalSteps, 20_000)
+            XCTAssertEqual(draft.exportEvery, 5_000)
 
-        let standard = runner.test_brushTrainingPlan(for: PresetSpec(mode: .object, quality: .standard))
-        XCTAssertEqual(standard.totalSteps, 40_000)
-        XCTAssertEqual(standard.exportEvery, 5_000)
+            let standard = runner.test_brushTrainingPlan(for: PresetSpec(mode: .object, quality: .standard))
+            XCTAssertEqual(standard.totalSteps, 40_000)
+            XCTAssertEqual(standard.exportEvery, 5_000)
 
-        let ultra = runner.test_brushTrainingPlan(for: PresetSpec(mode: .room, quality: .ultra))
-        XCTAssertEqual(ultra.totalSteps, 80_000)
-        XCTAssertEqual(ultra.exportEvery, 10_000)
+            let ultra = runner.test_brushTrainingPlan(for: PresetSpec(mode: .room, quality: .ultra))
+            XCTAssertEqual(ultra.totalSteps, 80_000)
+            XCTAssertEqual(ultra.exportEvery, 10_000)
+        }
+    }
+
+    func testBrushTrainingPlanFastSpeedProfileUsesShortBudget() async throws {
+        let root = try TestFileBuilder.makeTempDir()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let runner = makeRunner(projectURL: root)
+
+        await withEnvironmentAsync(["EASYSPLAT_SPEED_PROFILE": "fast"]) {
+            let plan = runner.test_brushTrainingPlan(for: PresetSpec(mode: .object, quality: .standard))
+            XCTAssertEqual(plan.totalSteps, 2_000)
+            XCTAssertEqual(plan.exportEvery, 2_000)
+        }
     }
 
     func testTrainingStatusMessageFormatting() throws {
@@ -1353,7 +1697,10 @@ final class PipelineRunnerHelperTests: XCTestCase {
         XCTAssertGreaterThan(damped, 45)
     }
 
-    private func makeRunner(projectURL: URL) -> PipelineRunner {
+    private func makeRunner(
+        projectURL: URL,
+        speedProfile: PipelineRunner.SpeedProfile = .standard
+    ) -> PipelineRunner {
         let vggt = VggtToolchain(root: projectURL, sfmTool: projectURL, python: projectURL, models: projectURL)
         let fastvggt = FastVggtToolchain(root: projectURL, sfmTool: projectURL, python: projectURL, models: projectURL)
         let toolchain = ToolchainPaths(
@@ -1364,7 +1711,11 @@ final class PipelineRunnerHelperTests: XCTestCase {
             vggt: vggt,
             fastvggt: fastvggt
         )
-        let config = PipelineRunner.PipelineConfig(toolchain: toolchain, preset: PresetSpec(mode: .object, quality: .standard))
+        let config = PipelineRunner.PipelineConfig(
+            toolchain: toolchain,
+            preset: PresetSpec(mode: .object, quality: .standard),
+            speedProfile: speedProfile
+        )
         return PipelineRunner(projectURL: projectURL, config: config)
     }
 

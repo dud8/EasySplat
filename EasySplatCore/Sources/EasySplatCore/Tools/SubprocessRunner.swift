@@ -78,6 +78,10 @@ public struct SubprocessResult: Sendable {
 public final class SubprocessRunner: @unchecked Sendable, SubprocessRunning, PseudoTTYCapableSubprocessRunning {
     public init() {}
 
+    private static func mergedEnvironment(with overrides: [String: String]) -> [String: String] {
+        ProcessInfo.processInfo.environment.merging(overrides) { _, new in new }
+    }
+
     public func run(
         _ launchPath: String,
         _ arguments: [String],
@@ -93,7 +97,7 @@ public final class SubprocessRunner: @unchecked Sendable, SubprocessRunning, Pse
             process.currentDirectoryURL = currentDirectory
         }
         if !environment.isEmpty {
-            process.environment = process.environment?.merging(environment) { _, new in new } ?? environment
+            process.environment = Self.mergedEnvironment(with: environment)
         }
 
         let stdoutPipe = Pipe()
@@ -101,29 +105,15 @@ public final class SubprocessRunner: @unchecked Sendable, SubprocessRunning, Pse
         process.standardOutput = stdoutPipe
         process.standardError = stderrPipe
 
-        let collectedOut = OutputBuffer()
-        let collectedErr = OutputBuffer()
-        let stdoutLines = SubprocessLineBuffer()
-        let stderrLines = SubprocessLineBuffer()
-        let stdoutDecoder = Utf8StreamDecoder()
-        let stderrDecoder = Utf8StreamDecoder()
+        let stdoutCollector = SubprocessStreamCollector(onLine: onStdout)
+        let stderrCollector = SubprocessStreamCollector(onLine: onStderr)
 
         stdoutPipe.fileHandleForReading.readabilityHandler = { handle in
-            let data = handle.availableData
-            guard !data.isEmpty else { return }
-            let text = stdoutDecoder.decode(data)
-            guard !text.isEmpty else { return }
-            collectedOut.append(text)
-            stdoutLines.append(text).forEach { line in onStdout(line) }
+            stdoutCollector.appendAvailableData(from: handle)
         }
 
         stderrPipe.fileHandleForReading.readabilityHandler = { handle in
-            let data = handle.availableData
-            guard !data.isEmpty else { return }
-            let text = stderrDecoder.decode(data)
-            guard !text.isEmpty else { return }
-            collectedErr.append(text)
-            stderrLines.append(text).forEach { line in onStderr(line) }
+            stderrCollector.appendAvailableData(from: handle)
         }
 
         do {
@@ -142,37 +132,11 @@ public final class SubprocessRunner: @unchecked Sendable, SubprocessRunning, Pse
         stdoutPipe.fileHandleForReading.readabilityHandler = nil
         stderrPipe.fileHandleForReading.readabilityHandler = nil
 
-        let remainingStdoutData = stdoutPipe.fileHandleForReading.readDataToEndOfFile()
-        if !remainingStdoutData.isEmpty {
-            let text = stdoutDecoder.decode(remainingStdoutData)
-            if !text.isEmpty {
-                collectedOut.append(text)
-                stdoutLines.append(text).forEach { line in onStdout(line) }
-            }
+        stdoutCollector.drainAndFinish {
+            stdoutPipe.fileHandleForReading.readDataToEndOfFile()
         }
-        let remainingStderrData = stderrPipe.fileHandleForReading.readDataToEndOfFile()
-        if !remainingStderrData.isEmpty {
-            let text = stderrDecoder.decode(remainingStderrData)
-            if !text.isEmpty {
-                collectedErr.append(text)
-                stderrLines.append(text).forEach { line in onStderr(line) }
-            }
-        }
-
-        if let remaining = stdoutDecoder.flush(), !remaining.isEmpty {
-            collectedOut.append(remaining)
-            stdoutLines.append(remaining).forEach { line in onStdout(line) }
-        }
-        if let remaining = stderrDecoder.flush(), !remaining.isEmpty {
-            collectedErr.append(remaining)
-            stderrLines.append(remaining).forEach { line in onStderr(line) }
-        }
-
-        if let remaining = stdoutLines.flush() {
-            onStdout(remaining)
-        }
-        if let remaining = stderrLines.flush() {
-            onStderr(remaining)
+        stderrCollector.drainAndFinish {
+            stderrPipe.fileHandleForReading.readDataToEndOfFile()
         }
 
         try? stdoutPipe.fileHandleForReading.close()
@@ -183,8 +147,8 @@ public final class SubprocessRunner: @unchecked Sendable, SubprocessRunning, Pse
         return SubprocessResult(
             exitCode: process.terminationStatus,
             terminationReason: process.terminationReason,
-            stdout: collectedOut.value(),
-            stderr: collectedErr.value()
+            stdout: stdoutCollector.value(),
+            stderr: stderrCollector.value()
         )
     }
 
@@ -203,7 +167,7 @@ public final class SubprocessRunner: @unchecked Sendable, SubprocessRunning, Pse
             process.currentDirectoryURL = currentDirectory
         }
         if !environment.isEmpty {
-            process.environment = process.environment?.merging(environment) { _, new in new } ?? environment
+            process.environment = Self.mergedEnvironment(with: environment)
         }
 
         let stdoutPipe = Pipe()
@@ -211,29 +175,15 @@ public final class SubprocessRunner: @unchecked Sendable, SubprocessRunning, Pse
         process.standardOutput = stdoutPipe
         process.standardError = stderrPipe
 
-        let collectedOut = OutputBuffer()
-        let collectedErr = OutputBuffer()
-        let stdoutLines = SubprocessLineBuffer()
-        let stderrLines = SubprocessLineBuffer()
-        let stdoutDecoder = Utf8StreamDecoder()
-        let stderrDecoder = Utf8StreamDecoder()
+        let stdoutCollector = SubprocessStreamCollector(onLine: onStdout)
+        let stderrCollector = SubprocessStreamCollector(onLine: onStderr)
 
         stdoutPipe.fileHandleForReading.readabilityHandler = { handle in
-            let data = handle.availableData
-            guard !data.isEmpty else { return }
-            let text = stdoutDecoder.decode(data)
-            guard !text.isEmpty else { return }
-            collectedOut.append(text)
-            stdoutLines.append(text).forEach { line in onStdout(line) }
+            stdoutCollector.appendAvailableData(from: handle)
         }
 
         stderrPipe.fileHandleForReading.readabilityHandler = { handle in
-            let data = handle.availableData
-            guard !data.isEmpty else { return }
-            let text = stderrDecoder.decode(data)
-            guard !text.isEmpty else { return }
-            collectedErr.append(text)
-            stderrLines.append(text).forEach { line in onStderr(line) }
+            stderrCollector.appendAvailableData(from: handle)
         }
 
         let completion = SubprocessAsyncCompletion()
@@ -243,45 +193,19 @@ public final class SubprocessRunner: @unchecked Sendable, SubprocessRunning, Pse
             try? stdoutPipe.fileHandleForWriting.close()
             try? stderrPipe.fileHandleForWriting.close()
 
-            let remainingStdoutData = stdoutPipe.fileHandleForReading.readDataToEndOfFile()
-            if !remainingStdoutData.isEmpty {
-                let text = stdoutDecoder.decode(remainingStdoutData)
-                if !text.isEmpty {
-                    collectedOut.append(text)
-                    stdoutLines.append(text).forEach { line in onStdout(line) }
-                }
+            stdoutCollector.drainAndFinish {
+                stdoutPipe.fileHandleForReading.readDataToEndOfFile()
             }
-            let remainingStderrData = stderrPipe.fileHandleForReading.readDataToEndOfFile()
-            if !remainingStderrData.isEmpty {
-                let text = stderrDecoder.decode(remainingStderrData)
-                if !text.isEmpty {
-                    collectedErr.append(text)
-                    stderrLines.append(text).forEach { line in onStderr(line) }
-                }
-            }
-
-            if let remaining = stdoutDecoder.flush(), !remaining.isEmpty {
-                collectedOut.append(remaining)
-                stdoutLines.append(remaining).forEach { line in onStdout(line) }
-            }
-            if let remaining = stderrDecoder.flush(), !remaining.isEmpty {
-                collectedErr.append(remaining)
-                stderrLines.append(remaining).forEach { line in onStderr(line) }
-            }
-
-            if let remaining = stdoutLines.flush() {
-                onStdout(remaining)
-            }
-            if let remaining = stderrLines.flush() {
-                onStderr(remaining)
+            stderrCollector.drainAndFinish {
+                stderrPipe.fileHandleForReading.readDataToEndOfFile()
             }
             try? stdoutPipe.fileHandleForReading.close()
             try? stderrPipe.fileHandleForReading.close()
             completion.finish(.success(SubprocessResult(
                 exitCode: proc.terminationStatus,
                 terminationReason: proc.terminationReason,
-                stdout: collectedOut.value(),
-                stderr: collectedErr.value()
+                stdout: stdoutCollector.value(),
+                stderr: stderrCollector.value()
             )))
         }
 
@@ -329,7 +253,7 @@ public final class SubprocessRunner: @unchecked Sendable, SubprocessRunning, Pse
             process.currentDirectoryURL = currentDirectory
         }
         if !environment.isEmpty {
-            process.environment = process.environment?.merging(environment) { _, new in new } ?? environment
+            process.environment = Self.mergedEnvironment(with: environment)
         }
 
         let stdoutTTY = try PseudoTTYPair.open()
@@ -337,35 +261,15 @@ public final class SubprocessRunner: @unchecked Sendable, SubprocessRunning, Pse
         process.standardOutput = stdoutTTY.slaveHandle
         process.standardError = stderrTTY.slaveHandle
 
-        let collectedOut = OutputBuffer()
-        let collectedErr = OutputBuffer()
-        let stdoutLines = SubprocessLineBuffer()
-        let stderrLines = SubprocessLineBuffer()
-        let stdoutDecoder = Utf8StreamDecoder()
-        let stderrDecoder = Utf8StreamDecoder()
-
-        @Sendable func appendStdoutData(_ data: Data) {
-            guard !data.isEmpty else { return }
-            let text = stdoutDecoder.decode(data)
-            guard !text.isEmpty else { return }
-            collectedOut.append(text)
-            stdoutLines.append(text).forEach { line in onStdout(line) }
-        }
-
-        @Sendable func appendStderrData(_ data: Data) {
-            guard !data.isEmpty else { return }
-            let text = stderrDecoder.decode(data)
-            guard !text.isEmpty else { return }
-            collectedErr.append(text)
-            stderrLines.append(text).forEach { line in onStderr(line) }
-        }
+        let stdoutCollector = SubprocessStreamCollector(onLine: onStdout)
+        let stderrCollector = SubprocessStreamCollector(onLine: onStderr)
 
         stdoutTTY.masterHandle.readabilityHandler = { handle in
-            appendStdoutData(handle.availableData)
+            stdoutCollector.appendAvailableData(from: handle)
         }
 
         stderrTTY.masterHandle.readabilityHandler = { handle in
-            appendStderrData(handle.availableData)
+            stderrCollector.appendAvailableData(from: handle)
         }
 
         let completion = SubprocessAsyncCompletion()
@@ -373,23 +277,11 @@ public final class SubprocessRunner: @unchecked Sendable, SubprocessRunning, Pse
             stdoutTTY.masterHandle.readabilityHandler = nil
             stderrTTY.masterHandle.readabilityHandler = nil
 
-            appendStdoutData(Self.drainAvailablePseudoTTYData(from: stdoutTTY.masterHandle))
-            appendStderrData(Self.drainAvailablePseudoTTYData(from: stderrTTY.masterHandle))
-
-            if let remaining = stdoutDecoder.flush(), !remaining.isEmpty {
-                collectedOut.append(remaining)
-                stdoutLines.append(remaining).forEach { line in onStdout(line) }
+            stdoutCollector.drainAndFinish {
+                Self.drainAvailablePseudoTTYData(from: stdoutTTY.masterHandle)
             }
-            if let remaining = stderrDecoder.flush(), !remaining.isEmpty {
-                collectedErr.append(remaining)
-                stderrLines.append(remaining).forEach { line in onStderr(line) }
-            }
-
-            if let remaining = stdoutLines.flush() {
-                onStdout(remaining)
-            }
-            if let remaining = stderrLines.flush() {
-                onStderr(remaining)
+            stderrCollector.drainAndFinish {
+                Self.drainAvailablePseudoTTYData(from: stderrTTY.masterHandle)
             }
 
             stdoutTTY.masterHandle.closeFile()
@@ -398,8 +290,8 @@ public final class SubprocessRunner: @unchecked Sendable, SubprocessRunning, Pse
             completion.finish(.success(SubprocessResult(
                 exitCode: proc.terminationStatus,
                 terminationReason: proc.terminationReason,
-                stdout: collectedOut.value(),
-                stderr: collectedErr.value()
+                stdout: stdoutCollector.value(),
+                stderr: stderrCollector.value()
             )))
         }
 
@@ -571,6 +463,64 @@ private final class SubprocessAsyncCompletion: @unchecked Sendable {
         self.continuation = nil
         lock.unlock()
         continuation?.resume(with: result)
+    }
+}
+
+private final class SubprocessStreamCollector: @unchecked Sendable {
+    private let lock = NSLock()
+    private let output = OutputBuffer()
+    private let lineBuffer = SubprocessLineBuffer()
+    private let decoder = Utf8StreamDecoder()
+    private let onLine: @Sendable (String) -> Void
+
+    init(onLine: @escaping @Sendable (String) -> Void) {
+        self.onLine = onLine
+    }
+
+    func appendAvailableData(from handle: FileHandle) {
+        let lines = lockedAppend {
+            handle.availableData
+        }
+        emit(lines)
+    }
+
+    func drainAndFinish(readRemaining: () -> Data) {
+        let lines = lockedAppend(readRemaining, flush: true)
+        emit(lines)
+    }
+
+    func value() -> String {
+        output.value()
+    }
+
+    private func lockedAppend(_ readRemaining: () -> Data, flush: Bool = false) -> [String] {
+        lock.lock()
+        var lines = appendLocked(readRemaining())
+        if flush {
+            if let remaining = decoder.flush(), !remaining.isEmpty {
+                output.append(remaining)
+                lines.append(contentsOf: lineBuffer.append(remaining))
+            }
+            if let remaining = lineBuffer.flush() {
+                lines.append(remaining)
+            }
+        }
+        lock.unlock()
+        return lines
+    }
+
+    private func appendLocked(_ data: Data) -> [String] {
+        guard !data.isEmpty else { return [] }
+        let text = decoder.decode(data)
+        guard !text.isEmpty else { return [] }
+        output.append(text)
+        return lineBuffer.append(text)
+    }
+
+    private func emit(_ lines: [String]) {
+        for line in lines {
+            onLine(line)
+        }
     }
 }
 

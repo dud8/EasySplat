@@ -45,6 +45,52 @@ final class SubprocessRunnerAsyncTests: XCTestCase {
         XCTAssertEqual(result.stdout, "done")
     }
 
+    func testRunMergesEnvironmentOverridesWithInheritedEnvironment() async throws {
+        let sentinelKey = makeSentinelKey()
+        setenv(sentinelKey, "parent", 1)
+        defer { unsetenv(sentinelKey) }
+        let root = try TestFileBuilder.makeTempDir()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let scriptURL = try makeEnvironmentScript(in: root, name: "env-sync.sh", sentinelKey: sentinelKey)
+        let runner = SubprocessRunner()
+
+        let result = try runner.run(
+            scriptURL.path,
+            [],
+            currentDirectory: nil,
+            environment: ["EASYSPLAT_SUBPROCESS_CUSTOM": "child"],
+            onStdout: { _ in },
+            onStderr: { _ in }
+        )
+
+        XCTAssertEqual(result.exitCode, 0)
+        XCTAssertTrue(result.stdout.contains("sentinel=parent"))
+        XCTAssertTrue(result.stdout.contains("custom=child"))
+    }
+
+    func testRunAsyncMergesEnvironmentOverridesWithInheritedEnvironment() async throws {
+        let sentinelKey = makeSentinelKey()
+        setenv(sentinelKey, "parent", 1)
+        defer { unsetenv(sentinelKey) }
+        let root = try TestFileBuilder.makeTempDir()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let scriptURL = try makeEnvironmentScript(in: root, name: "env-async.sh", sentinelKey: sentinelKey)
+        let runner = SubprocessRunner()
+
+        let result = try await runner.runAsync(
+            scriptURL.path,
+            [],
+            currentDirectory: nil,
+            environment: ["EASYSPLAT_SUBPROCESS_CUSTOM": "child"],
+            onStdout: { _ in },
+            onStderr: { _ in }
+        )
+
+        XCTAssertEqual(result.exitCode, 0)
+        XCTAssertTrue(result.stdout.contains("sentinel=parent"))
+        XCTAssertTrue(result.stdout.contains("custom=child"))
+    }
+
     func testRunAsyncPseudoTTYHandlesInstantExit() async throws {
         let root = try TestFileBuilder.makeTempDir()
         defer { try? FileManager.default.removeItem(at: root) }
@@ -105,5 +151,22 @@ final class SubprocessRunnerAsyncTests: XCTestCase {
         XCTAssertEqual(result.exitCode, 0)
         XCTAssertEqual(result.stdout, String(repeating: "\u{1F600}", count: 262144))
         XCTAssertLessThanOrEqual(result.stdout.utf8.count, 1_048_576)
+    }
+
+    private func makeSentinelKey() -> String {
+        "EASYSPLAT_SUBPROCESS_SENTINEL_\(UUID().uuidString.replacingOccurrences(of: "-", with: "_"))"
+    }
+
+    private func makeEnvironmentScript(in root: URL, name: String, sentinelKey: String) throws -> URL {
+        let scriptURL = root.appendingPathComponent(name)
+        try TestFileBuilder.createExecutable(
+            at: scriptURL,
+            script: """
+            #!/bin/sh
+            printf 'sentinel=%s\\n' "$\(sentinelKey)"
+            printf 'custom=%s\\n' "$EASYSPLAT_SUBPROCESS_CUSTOM"
+            """
+        )
+        return scriptURL
     }
 }

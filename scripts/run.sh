@@ -125,6 +125,9 @@ MANIFEST="$TOOLCHAINS/manifest.json"
 PUBLIC_SERVE_ROOT=""
 PUB="$TOOLCHAINS/public_key_ed25519.txt"
 PRIV="$TOOLCHAINS/private_key_ed25519.txt"
+MSPLAT_INSTALL="${MSPLAT_INSTALL:-$ROOT/Toolchains/build/msplat/install}"
+MSPLAT_BUNDLE="$MSPLAT_INSTALL/msplat"
+MSPLAT_BUILD="$ROOT/scripts/toolchain/build_msplat.sh"
 VGGT_MPS_INSTALL="${VGGT_MPS_INSTALL:-$ROOT/Toolchains/build/vggt_mps/install}"
 VGGT_MPS_BUNDLE="$VGGT_MPS_INSTALL/vggt_mps"
 VGGT_MPS_BUILD="$ROOT/scripts/toolchain/build_vggt_mps.sh"
@@ -164,6 +167,33 @@ missing = sorted(key for key in required_keys if not payload.get(key))
 if missing:
     raise SystemExit(1)
 if payload.get("toolchain_name") != tool_name:
+    raise SystemExit(1)
+PY
+}
+
+validate_msplat_build_info() {
+  local python_bin="$1"
+  local build_info="$2"
+  PYTHONNOUSERSITE=1 "$python_bin" - "$build_info" <<'PY' >/dev/null
+import json
+import sys
+from pathlib import Path
+
+build_info = Path(sys.argv[1])
+required_keys = {
+    "toolchain_name",
+    "source_path",
+    "python_version",
+    "package_version",
+}
+
+payload = json.loads(build_info.read_text(encoding="utf-8"))
+if not isinstance(payload, dict):
+    raise SystemExit(1)
+missing = sorted(key for key in required_keys if not payload.get(key))
+if missing:
+    raise SystemExit(1)
+if payload.get("toolchain_name") != "msplat":
     raise SystemExit(1)
 PY
 }
@@ -213,7 +243,13 @@ toolchain_inputs_newer() {
 core_zip_valid() {
   test -f "$CORE_ZIP" || return 1
   unzip -l "$CORE_ZIP" | grep -q "bin/colmap" || return 1
+  unzip -l "$CORE_ZIP" | grep -q "bin/msplat-train" || return 1
   unzip -l "$CORE_ZIP" | grep -q "lib/libcrypto.3.dylib" || return 1
+  unzip -l "$CORE_ZIP" | grep -q "msplat/bin/msplat-train" || return 1
+  unzip -l "$CORE_ZIP" | grep -q "msplat/python/bin/python3" || return 1
+  unzip -l "$CORE_ZIP" | grep -q "msplat/build_info.json" || return 1
+  unzip -l "$CORE_ZIP" | grep -q "msplat/core_extension_path.txt" || return 1
+  unzip -l "$CORE_ZIP" | grep -q "site-packages/msplat/_core.*\\.so" || return 1
   unzip -l "$CORE_ZIP" | grep -q "da3_mps/bin/easysplat_da3_sfm" || return 1
   unzip -l "$CORE_ZIP" | grep -q "da3_mps/python/bin/python3" || return 1
   unzip -l "$CORE_ZIP" | grep -q "da3_mps/build_info.json" || return 1
@@ -247,6 +283,46 @@ core_zip_valid() {
   } || rc=1
   rm -rf "$tmp"
   return "$rc"
+}
+
+ensure_msplat_bundle() {
+  local build_log="$ROOT/Toolchains/build/msplat/build.log"
+  mkdir -p "$(dirname "$build_log")"
+  local ok=0
+  if [ -d "$MSPLAT_BUNDLE" ]; then
+    if [ -x "$MSPLAT_BUNDLE/bin/msplat-train" ] && \
+       [ -x "$MSPLAT_BUNDLE/python/bin/python3" ] && \
+       [ -f "$MSPLAT_BUNDLE/build_info.json" ] && \
+       find "$MSPLAT_BUNDLE/python/lib" -path "*/site-packages/msplat/_core*.so" -type f -print -quit | grep -q . && \
+       validate_msplat_build_info "$MSPLAT_BUNDLE/python/bin/python3" "$MSPLAT_BUNDLE/build_info.json"; then
+      ok=1
+    fi
+  fi
+  if [ "$ok" -eq 0 ]; then
+    if [ -x "$MSPLAT_BUILD" ]; then
+      set +e
+      "$MSPLAT_BUILD" 2>&1 | tee "$build_log"
+      local build_status=${PIPESTATUS[0]}
+      set -e
+      if [ "$build_status" -ne 0 ]; then
+        echo "msplat build failed. See log: $build_log" >&2
+      fi
+    fi
+  fi
+  if [ ! -x "$MSPLAT_BUNDLE/bin/msplat-train" ] || \
+     [ ! -x "$MSPLAT_BUNDLE/python/bin/python3" ] || \
+     [ ! -f "$MSPLAT_BUNDLE/build_info.json" ] || \
+     ! find "$MSPLAT_BUNDLE/python/lib" -path "*/site-packages/msplat/_core*.so" -type f -print -quit | grep -q .; then
+    echo "msplat bundle incomplete at $MSPLAT_BUNDLE." >&2
+    echo "Required: bin/msplat-train, python/bin/python3, build_info.json, and site-packages/msplat/_core*.so." >&2
+    if [ -x "$MSPLAT_BUILD" ]; then
+      echo "Tried to run $MSPLAT_BUILD, but the bundle is still incomplete." >&2
+      echo "See build log: $build_log" >&2
+    else
+      echo "Provide it via MSPLAT_INSTALL or add a build script at $MSPLAT_BUILD." >&2
+    fi
+    exit 1
+  fi
 }
 
 models_zip_valid() {
@@ -587,8 +663,15 @@ refresh_installed_fastvggt_app() {
 validate_installed_toolchain() {
   local root="$1"
   test -x "$root/bin/colmap" || return 1
+  test -x "$root/bin/msplat-train" || return 1
   test -f "$root/lib/libcrypto.3.dylib" || return 1
   test -f "$root/lib/libssl.3.dylib" || return 1
+  test -x "$root/msplat/bin/msplat-train" || return 1
+  test -x "$root/msplat/python/bin/python3" || return 1
+  test -f "$root/msplat/build_info.json" || return 1
+  test -f "$root/msplat/core_extension_path.txt" || return 1
+  find "$root/msplat/python/lib" -path "*/site-packages/msplat/_core*.so" -type f -print -quit | grep -q . || return 1
+  validate_msplat_build_info "$root/msplat/python/bin/python3" "$root/msplat/build_info.json" || return 1
   test -x "$root/da3_mps/bin/easysplat_da3_sfm" || return 1
   test -x "$root/da3_mps/python/bin/python3" || return 1
   test -f "$root/da3_mps/build_info.json" || return 1
@@ -650,6 +733,7 @@ wipe_installed_core() {
   rm -rf \
     "$root/bin" \
     "$root/lib" \
+    "$root/msplat" \
     "$root/da3_mps/bin" \
     "$root/da3_mps/python" \
     "$root/da3_mps/build_info.json" \
@@ -713,6 +797,7 @@ if [ "$NEED_PACKAGE" -eq 1 ]; then
   "$ROOT/scripts/toolchain/build_openssl.sh"
   test -x "$ROOT/Toolchains/build/colmap/install/bin/colmap" || "$ROOT/scripts/toolchain/build_colmap.sh"
   test -x "$ROOT/Toolchains/build/brush/install/bin/brush" || "$ROOT/scripts/toolchain/build_brush.sh"
+  ensure_msplat_bundle
   ensure_da3_mps_bundle
   refresh_da3_mps_app
   ensure_mapanything_mps_bundle

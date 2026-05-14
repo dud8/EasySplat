@@ -394,6 +394,31 @@ final class PipelineRunnerRetryTests: XCTestCase {
         XCTAssertEqual(try runner.test_validateStageOutput(.trainBrush, paths: paths, metadata: metadata), .missing)
     }
 
+    func testValidateStageOutputAcceptsMsplatTrainingExport() throws {
+        let root = try TestFileBuilder.makeTempDir()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let paths = ProjectPaths(root: root)
+        try paths.ensureDirectories()
+        let msplatDirectory = paths.trainingURL.appendingPathComponent("msplat", isDirectory: true)
+        try FileManager.default.createDirectory(at: msplatDirectory, withIntermediateDirectories: true)
+        let msplatExport = msplatDirectory.appendingPathComponent("splat.ply")
+        try TestFileBuilder.writeMinimalPly(at: msplatExport)
+        let runStartedAt = Date()
+        try FileManager.default.setAttributes(
+            [.modificationDate: runStartedAt.addingTimeInterval(5)],
+            ofItemAtPath: msplatExport.path
+        )
+
+        let metadata = ProjectMetadata(
+            title: "Test",
+            input: .photos(folder: "/tmp/Photos"),
+            preset: PresetSpec(mode: .object, quality: .draft),
+            lastRunStartedAt: runStartedAt
+        )
+        let runner = makeRunner(projectURL: root)
+        XCTAssertEqual(try runner.test_validateStageOutput(.trainBrush, paths: paths, metadata: metadata), .valid)
+    }
+
     func testValidateStageOutputDetectsCorruptDatabase() throws {
         let root = try TestFileBuilder.makeTempDir()
         defer { try? FileManager.default.removeItem(at: root) }

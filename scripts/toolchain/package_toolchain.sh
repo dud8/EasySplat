@@ -24,6 +24,7 @@ fi
 
 COLMAP_INSTALL="${COLMAP_INSTALL:-$ROOT/Toolchains/build/colmap/install}"
 BRUSH_INSTALL="${BRUSH_INSTALL:-$ROOT/Toolchains/build/brush/install}"
+MSPLAT_INSTALL="${MSPLAT_INSTALL:-$ROOT/Toolchains/build/msplat/install}"
 VGGT_MPS_INSTALL="${VGGT_MPS_INSTALL:-$ROOT/Toolchains/build/vggt_mps/install}"
 FASTVGGT_MPS_INSTALL="${FASTVGGT_MPS_INSTALL:-$ROOT/Toolchains/build/fastvggt_mps/install}"
 MAPANYTHING_MPS_INSTALL="${MAPANYTHING_MPS_INSTALL:-$ROOT/Toolchains/build/mapanything_mps/install}"
@@ -73,6 +74,42 @@ if payload.get("toolchain_name") != tool_name:
     raise SystemExit(
         f"{tool_name} build_info.json toolchain_name mismatch: expected {tool_name}, "
         f"got {payload.get('toolchain_name')!r}"
+    )
+PY
+}
+
+validate_msplat_build_info() {
+  local python_bin="$1"
+  local build_info="$2"
+  PYTHONNOUSERSITE=1 "$python_bin" - "$build_info" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+build_info = Path(sys.argv[1])
+required_keys = {
+    "toolchain_name",
+    "source_path",
+    "python_version",
+    "package_version",
+}
+
+try:
+    payload = json.loads(build_info.read_text(encoding="utf-8"))
+except Exception as exc:  # noqa: BLE001
+    raise SystemExit(f"msplat build_info.json is invalid JSON: {exc}")
+
+if not isinstance(payload, dict):
+    raise SystemExit("msplat build_info.json must contain a JSON object.")
+
+missing = sorted(key for key in required_keys if not payload.get(key))
+if missing:
+    raise SystemExit(f"msplat build_info.json is missing required keys: {', '.join(missing)}")
+
+if payload.get("toolchain_name") != "msplat":
+    raise SystemExit(
+        "msplat build_info.json toolchain_name mismatch: "
+        f"expected msplat, got {payload.get('toolchain_name')!r}"
     )
 PY
 }
@@ -128,6 +165,52 @@ is_macho_file() {
 
 otool_dependency_names() {
   otool -L "$1" | awk 'NR > 1 { print $1 }'
+}
+
+otool_rpath_entries() {
+  otool -l "$1" | awk '
+    $1 == "cmd" && $2 == "LC_RPATH" { in_rpath = 1; next }
+    in_rpath && $1 == "path" { print $2; in_rpath = 0 }
+  '
+}
+
+resolve_macho_path_token() {
+  local file="$1"
+  local value="$2"
+  case "$value" in
+    @loader_path/*)
+      printf '%s/%s\n' "$(dirname "$file")" "${value#@loader_path/}"
+      ;;
+    @executable_path/*)
+      printf '%s/%s\n' "$(dirname "$file")" "${value#@executable_path/}"
+      ;;
+    /*)
+      printf '%s\n' "$value"
+      ;;
+    *)
+      printf '%s/%s\n' "$(dirname "$file")" "$value"
+      ;;
+  esac
+}
+
+resolve_rpath_dependency_for() {
+  local file="$1"
+  local dependency="$2"
+  local name="${dependency#@rpath/}"
+  local rpath
+  local resolved
+
+  if [ -f "$LIB/$name" ]; then
+    return 0
+  fi
+  while IFS= read -r rpath; do
+    [ -n "$rpath" ] || continue
+    resolved="$(resolve_macho_path_token "$file" "$rpath")"
+    if [ -f "$resolved/$name" ]; then
+      return 0
+    fi
+  done < <(otool_rpath_entries "$file")
+  return 1
 }
 
 queued_macho_files=()
@@ -224,6 +307,9 @@ bundle_toolchain_dependency_closure() {
   for path in "$BIN"/* "$LIB"/*; do
     enqueue_macho_file "$path"
   done
+  while IFS= read -r -d '' path; do
+    enqueue_macho_file "$path"
+  done < <(find "$OUT/msplat" -type f -print0)
 
   index=0
   while [ "$index" -lt "${#queued_macho_files[@]}" ]; do
@@ -238,48 +324,98 @@ bundle_toolchain_dependency_closure() {
   done
 }
 
-validate_portable_dependency_references() {
+validate_portable_dependency_references_for() {
   local file
+  file="$1"
+  if ! is_macho_file "$file"; then
+    return
+  fi
   local dependency
   local target
 
-  for file in "$BIN"/* "$LIB"/*; do
-    if ! is_macho_file "$file"; then
+  while IFS= read -r dependency; do
+    [ -n "$dependency" ] || continue
+    if is_system_dependency "$dependency"; then
       continue
     fi
-    while IFS= read -r dependency; do
-      [ -n "$dependency" ] || continue
-      if is_system_dependency "$dependency"; then
-        continue
-      fi
-      case "$dependency" in
-        @rpath/*)
+    case "$dependency" in
+      @rpath/*)
+        if ! resolve_rpath_dependency_for "$file" "$dependency"; then
           target="$LIB/$(basename "$dependency")"
-          if [ ! -f "$target" ]; then
-            echo "$file references $dependency, but $target is not bundled." >&2
-            exit 1
-          fi
-          ;;
-        @loader_path/*)
-          target="$(dirname "$file")/${dependency#@loader_path/}"
-          if [ ! -f "$target" ]; then
-            echo "$file references $dependency, but $target is not bundled." >&2
-            exit 1
-          fi
-          ;;
-        @executable_path/*)
-          ;;
-        /*)
-          echo "$file has unportable absolute dependency: $dependency" >&2
+          echo "$file references $dependency, but it is not bundled in $target or reachable through that file's LC_RPATH entries." >&2
           exit 1
-          ;;
-        *)
-          echo "$file has unexpected dependency reference: $dependency" >&2
+        fi
+        ;;
+      @loader_path/*)
+        target="$(dirname "$file")/${dependency#@loader_path/}"
+        if [ ! -f "$target" ]; then
+          echo "$file references $dependency, but $target is not bundled." >&2
           exit 1
-          ;;
-      esac
-    done < <(otool_dependency_names "$file")
+        fi
+        ;;
+      @executable_path/*)
+        ;;
+      /*)
+        echo "$file has unportable absolute dependency: $dependency" >&2
+        exit 1
+        ;;
+      *)
+        echo "$file has unexpected dependency reference: $dependency" >&2
+        exit 1
+        ;;
+    esac
+  done < <(otool_dependency_names "$file")
+}
+
+validate_portable_dependency_references() {
+  local file
+  local dependency
+
+  for file in "$BIN"/* "$LIB"/*; do
+    validate_portable_dependency_references_for "$file"
   done
+  while IFS= read -r -d '' file; do
+    validate_portable_dependency_references_for "$file"
+  done < <(find "$OUT/msplat" -type f -print0)
+}
+
+relative_lib_rpath_for() {
+  python3 - "$1" "$LIB" <<'PY'
+import os
+import sys
+from pathlib import Path
+
+source_dir = Path(sys.argv[1]).parent
+lib_dir = Path(sys.argv[2])
+relative = os.path.relpath(lib_dir, source_dir)
+print("@loader_path/" + relative)
+PY
+}
+
+add_bundle_lib_rpath_if_needed() {
+  local file="$1"
+  local rpath
+  if ! is_macho_file "$file" || [[ "$file" == "$LIB/"* ]]; then
+    return
+  fi
+  if [[ "$file" == "$BIN/"* ]]; then
+    rpath="@executable_path/../lib"
+  else
+    rpath="$(relative_lib_rpath_for "$file")"
+  fi
+  if ! otool -l "$file" | grep -q "$rpath"; then
+    install_name_tool -add_rpath "$rpath" "$file"
+  fi
+}
+
+add_bundle_lib_rpaths() {
+  local file
+  for file in "$BIN"/*; do
+    add_bundle_lib_rpath_if_needed "$file"
+  done
+  while IFS= read -r -d '' file; do
+    add_bundle_lib_rpath_if_needed "$file"
+  done < <(find "$OUT/msplat" -type f -print0)
 }
 
 cp "$COLMAP_INSTALL/bin/colmap" "$BIN/colmap"
@@ -298,7 +434,55 @@ fi
 exec "$REAL" "$@"
 SCRIPT
 
-chmod +x "$BIN/colmap" "$BIN/brush" "$BIN/brush.real"
+if [ ! -d "$MSPLAT_INSTALL/msplat" ]; then
+  echo "msplat bundle not found at $MSPLAT_INSTALL/msplat. Build it before packaging." >&2
+  exit 1
+fi
+if [ ! -x "$MSPLAT_INSTALL/msplat/bin/msplat-train" ]; then
+  echo "msplat bundle missing bin/msplat-train. Rebuild msplat." >&2
+  exit 1
+fi
+if [ ! -x "$MSPLAT_INSTALL/msplat/python/bin/python3" ]; then
+  echo "msplat bundle missing python/bin/python3. Rebuild msplat." >&2
+  exit 1
+fi
+if [ ! -f "$MSPLAT_INSTALL/msplat/build_info.json" ]; then
+  echo "msplat bundle missing build_info.json. Rebuild msplat." >&2
+  exit 1
+fi
+MSPLAT_CORE_EXTENSION="$(find "$MSPLAT_INSTALL/msplat/python/lib" -path "*/site-packages/msplat/_core*.so" -type f -print -quit)"
+if [ -z "$MSPLAT_CORE_EXTENSION" ]; then
+  echo "msplat bundle missing msplat/_core extension. Rebuild msplat." >&2
+  exit 1
+fi
+MSPLAT_PY_BIN="$MSPLAT_INSTALL/msplat/python/bin/python3"
+require_bundled_arm64_python "msplat" "$MSPLAT_PY_BIN"
+validate_msplat_build_info "$MSPLAT_PY_BIN" "$MSPLAT_INSTALL/msplat/build_info.json"
+if ! /usr/bin/file -b "$MSPLAT_CORE_EXTENSION" | grep -q "arm64"; then
+  echo "msplat core extension is not arm64: $MSPLAT_CORE_EXTENSION" >&2
+  exit 1
+fi
+if ! "$MSPLAT_INSTALL/msplat/bin/msplat-train" --help >/dev/null; then
+  echo "msplat-train failed to launch. Rebuild msplat." >&2
+  exit 1
+fi
+cp -R "$MSPLAT_INSTALL/msplat" "$OUT/msplat"
+MSPLAT_CORE_REL="${MSPLAT_CORE_EXTENSION#"$MSPLAT_INSTALL/msplat/"}"
+case "$MSPLAT_CORE_REL" in
+  ""|/*|../*|*/../*|*/..|*//*)
+    echo "msplat core extension path is not a safe bundle-relative path: $MSPLAT_CORE_EXTENSION" >&2
+    exit 1
+    ;;
+esac
+printf '%s\n' "$MSPLAT_CORE_REL" >"$OUT/msplat/core_extension_path.txt"
+cat >"$BIN/msplat-train" <<'SCRIPT'
+#!/usr/bin/env bash
+set -euo pipefail
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+exec "$ROOT/msplat/bin/msplat-train" "$@"
+SCRIPT
+
+chmod +x "$BIN/colmap" "$BIN/brush" "$BIN/brush.real" "$BIN/msplat-train"
 
 if [ ! -d "$DA3_MPS_INSTALL/da3_mps" ]; then
   echo "da3_mps bundle not found at $DA3_MPS_INSTALL/da3_mps. Build it before packaging." >&2
@@ -518,11 +702,7 @@ add_rpath_if_missing() {
   fi
 }
 
-for executable in "$BIN"/*; do
-  if is_macho_file "$executable"; then
-    add_rpath_if_missing "$executable" "@executable_path/../lib"
-  fi
-done
+add_bundle_lib_rpaths
 
 # COLMAP links against OpenSSL too; prefer the bundled dylibs.
 colmap_crypto_dep="$(otool -L "$BIN/colmap" | { grep -m1 -E 'libcrypto\.3\.dylib|libcrypto\.1\.1\.dylib' || true; } | awk '{print $1}')"
@@ -550,6 +730,7 @@ validate_portable_dependency_references
 pushd "$OUT" >/dev/null
 zip -r "$CORE_ZIP" \
   bin lib \
+  msplat/bin msplat/python msplat/build_info.json msplat/core_extension_path.txt \
   da3_mps/bin da3_mps/python da3_mps/app da3_mps/vendor da3_mps/build_info.json \
   mapanything_mps/bin mapanything_mps/python mapanything_mps/app mapanything_mps/vendor mapanything_mps/build_info.json \
   vggt_mps/bin vggt_mps/python vggt_mps/app vggt_mps/vendor vggt_mps/build_info.json \

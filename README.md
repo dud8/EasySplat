@@ -2,7 +2,7 @@
 
 EasySplat is a macOS-only Apple Silicon app that turns videos, photo folders, or mixed inputs into 3D Gaussian splats.
 
-The default reconstruction path is Depth Anything 3 first, with MapAnything and COLMAP `global_mapper` / mapper fallback when the job or hardware needs a safer route. The heavy lifting lives in a signed downloadable toolchain, not in the app bundle.
+The default Fast app profile uses COLMAP `global_mapper` for the measured Apple Silicon quick path. Balanced and Ultra runs start with Depth Anything 3, then fall back to MapAnything and COLMAP when needed. The heavy lifting lives in a signed downloadable toolchain, not in the app bundle.
 
 This OSS build keeps distribution simple on purpose: the app itself is currently unsigned and not notarized, while the toolchain remains the signed trust boundary.
 
@@ -83,6 +83,10 @@ swift test --package-path Tools/ManifestTool
 ./scripts/benchmark_mapanything.sh --video /absolute/path/to/input.mp4
 ```
 
+Use `EASYSPLAT_MSPLAT_BIN=/path/to/msplat-train` only when comparing a local msplat build outside the signed toolchain.
+
+The app's default Fast profile uses the measured Apple Silicon path.
+
 ## Runtime configuration
 
 `AppConfig` resolves app-facing URLs and trust inputs in this order:
@@ -101,11 +105,19 @@ Most useful runtime overrides:
 | `EASYSPLAT_LOCAL_TOOLCHAIN_ROOT` | Skip download/install and validate an already-present local toolchain. |
 | `EASYSPLAT_SFM_BACKEND` | Force `da3`, `mapanything`, `colmap`, `glomap`, `global_mapper`, `vggt`, or `fastvggt`. |
 | `EASYSPLAT_SFM_MAPPER` | Steer mapper fallback inside the integrated path: `glomap` means COLMAP `global_mapper`; `colmap` means classic COLMAP `mapper`. |
+| `EASYSPLAT_SPEED_PROFILE` | Set `fast` for the measured Apple Silicon quick path: select about 30 frames with blur-filter headroom, use COLMAP `global_mapper` by default, keep 960px training frames, solve COLMAP at 512px with low overlap, and run msplat for accepted sparse solves with a 1,800-iteration budget. |
+| `EASYSPLAT_TRAINER` | Override trainer selection with `brush` or `msplat`; the fast profile auto-selects packaged msplat unless sparse quality is too low. |
+| `EASYSPLAT_MSPLAT_BIN` | Point at a local `msplat-train` binary for comparison testing instead of the packaged binary. |
+| `EASYSPLAT_FRAME_TARGET_COUNT` | Override the selected frame budget for speed-profile runs. |
+| `EASYSPLAT_FRAME_MAX_DIMENSION` | Override extracted frame size before SfM. |
+| `EASYSPLAT_COLMAP_MAX_IMAGE_SIZE` | Override COLMAP feature-extraction image size independently from extracted frame size. |
+| `EASYSPLAT_FRAME_TARGET_FPS` | Override video sampling FPS before the frame budget is applied. |
 | `EASYSPLAT_STOP_AFTER_SFM` | Stop the pipeline after reconstruction. |
-| `EASYSPLAT_SKIP_TRAINING` | Skip Brush training. |
+| `EASYSPLAT_SKIP_TRAINING` | Skip splat training. |
 | `EASYSPLAT_AUTOTUNE` | Enable or disable hardware-based parameter tuning. |
 | `EASYSPLAT_COLMAP_USE_GPU` | Toggle GPU use in COLMAP where supported. |
 | `EASYSPLAT_COLMAP_FORCE_CPU` / `EASYSPLAT_COLMAP_FORCE_GPU` | Override COLMAP device choice. |
+| `EASYSPLAT_COLMAP_SEQUENTIAL_OVERLAP` | Override COLMAP sequential matching overlap. |
 
 Common DA3 tuning knobs:
 
@@ -159,12 +171,22 @@ Common Brush overrides:
 - `EASYSPLAT_BRUSH_SNAPSHOT_MAX_SECONDS=<n>`
 - `EASYSPLAT_BRUSH_SNAPSHOT_DEFAULT_SECONDS=<n>`
 
+Common msplat overrides:
+
+- `EASYSPLAT_MSPLAT_BIN=/path/to/msplat-train`
+- `EASYSPLAT_MSPLAT_ITERS=<n>`
+- `EASYSPLAT_MSPLAT_NUM_DOWNSCALES=<n>`
+- `EASYSPLAT_MSPLAT_DOWNSCALE_FACTOR=<n>`
+
+The automatic fast profile uses a 2,000-step Brush run instead of msplat when the sparse solve has fewer than 1,500 points. Set `EASYSPLAT_TRAINER=msplat` to force msplat anyway.
+
 ## SfM behavior
 
 Default behavior when `EASYSPLAT_SFM_BACKEND` is unset:
 
-- EasySplat starts with DA3 on MPS using bundled Apache-2.0 weights.
-- DA3 accepts only native COLMAP export; larger selections fall back to MapAnything/COLMAP until DA3 has a safe multi-window export.
+- The Fast profile starts with COLMAP `global_mapper` because that is the measured Apple Silicon quick path.
+- Other profiles start with DA3 on MPS using bundled Apache-2.0 weights.
+- DA3 sparse output is scored against the full selected image count before the pipeline accepts it.
 - `DA3-SMALL` is retried automatically if `DA3-BASE` hits MPS memory pressure.
 - DA3 writes the canonical COLMAP text sparse model consumed by training and the viewer.
 - If DA3 fails or produces a low-quality sparse model, EasySplat falls back to MapAnything.
@@ -200,7 +222,7 @@ Local development scripts usually emit `Toolchains/manifest.json`. The GitHub to
 - Homebrew
 - Rust toolchain for Brush (`cargo`)
 - network access and enough disk space for large model downloads
-- optional: `ffmpeg` / `ffprobe` if you use `scripts/benchmark_da3.sh` or `scripts/benchmark_mapanything.sh`
+- optional: `ffmpeg` / `ffprobe` if you use the benchmark scripts
 
 To mirror the current GitHub Actions toolchain runner, install:
 
@@ -306,6 +328,7 @@ Build the local toolchain pieces:
 ./scripts/toolchain/build_openssl.sh
 ./scripts/toolchain/build_colmap.sh
 ./scripts/toolchain/build_brush.sh
+./scripts/toolchain/build_msplat.sh
 ./scripts/toolchain/build_da3_mps.sh
 ./scripts/toolchain/build_mapanything_mps.sh
 ./scripts/toolchain/build_vggt_mps.sh
@@ -314,6 +337,8 @@ Build the local toolchain pieces:
 ```
 
 `build_da3_mps.sh` uses a pinned git checkout by default. A no-git local DA3 source tree is only allowed for development with `EASYSPLAT_ALLOW_UNPINNED_DA3_SOURCE=1`; release scripts and CI reject that override.
+
+`build_msplat.sh` packages a version-pinned `msplat[cli]` package into the core toolchain so the fast Apple Silicon profile can use the Metal trainer without a local virtual environment.
 
 `scripts/toolchain/build_glomap.sh` is available for direct `glomap` work, but the packaged app path uses COLMAP's integrated `global_mapper` rather than a separately shipped `glomap` binary.
 

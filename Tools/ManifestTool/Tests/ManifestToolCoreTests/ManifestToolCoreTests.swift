@@ -38,6 +38,11 @@ final class ManifestToolCoreTests: XCTestCase {
         XCTAssertTrue(ManifestBuilder.verifySignature(for: manifest, publicKeyBase64: keypair.publicKeyBase64))
         XCTAssertEqual(manifest.artifacts[0].contents, ManifestToolDefaults.splitCoreContents)
         XCTAssertEqual(manifest.artifacts[1].contents, ManifestToolDefaults.splitModelsContents)
+        XCTAssertTrue(ManifestToolDefaults.splitCoreContents.contains("bin/msplat-train"))
+        XCTAssertTrue(ManifestToolDefaults.splitCoreContents.contains("msplat/bin/msplat-train"))
+        XCTAssertTrue(ManifestToolDefaults.splitCoreContents.contains("msplat/python/bin/python3"))
+        XCTAssertTrue(ManifestToolDefaults.splitCoreContents.contains("msplat/build_info.json"))
+        XCTAssertTrue(ManifestToolDefaults.splitCoreContents.contains("msplat/core_extension_path.txt"))
     }
 
     func testBuildMonolithicManifestUsesMonolithicContents() throws {

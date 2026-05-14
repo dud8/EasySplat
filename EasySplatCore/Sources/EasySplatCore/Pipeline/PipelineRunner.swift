@@ -6,6 +6,7 @@ public final class PipelineRunner: @unchecked Sendable {
         public var colmap: ColmapRunner
         public var glomap: GlomapRunner
         public var brush: BrushRunner
+        public var msplat: MsplatRunner
         public var da3Sfm: Da3SfmRunning
         public var mapAnythingSfm: MapAnythingSfmRunning
         public var vggtSfm: VggtSfmRunning
@@ -14,6 +15,7 @@ public final class PipelineRunner: @unchecked Sendable {
         public init(colmap: ColmapRunner = ColmapRunner(),
                     glomap: GlomapRunner = GlomapRunner(),
                     brush: BrushRunner = BrushRunner(),
+                    msplat: MsplatRunner = MsplatRunner(),
                     da3Sfm: Da3SfmRunning = Da3SfmRunner(),
                     mapAnythingSfm: MapAnythingSfmRunning = MapAnythingSfmRunner(),
                     vggtSfm: VggtSfmRunning = VggtSfmRunner(),
@@ -21,6 +23,7 @@ public final class PipelineRunner: @unchecked Sendable {
             self.colmap = colmap
             self.glomap = glomap
             self.brush = brush
+            self.msplat = msplat
             self.da3Sfm = da3Sfm
             self.mapAnythingSfm = mapAnythingSfm
             self.vggtSfm = vggtSfm
@@ -31,24 +34,34 @@ public final class PipelineRunner: @unchecked Sendable {
             self.colmap = ColmapRunner(runner: runner)
             self.glomap = GlomapRunner(runner: runner)
             self.brush = BrushRunner(runner: runner)
+            self.msplat = MsplatRunner(runner: runner)
             self.da3Sfm = Da3SfmRunner(runner: runner)
             self.mapAnythingSfm = MapAnythingSfmRunner(runner: runner)
             self.vggtSfm = VggtSfmRunner(runner: runner)
             self.fastVggtSfm = FastVggtSfmRunner(runner: runner)
         }
     }
+
+    public enum SpeedProfile: Sendable, Equatable {
+        case standard
+        case fast
+    }
+
     public struct PipelineConfig: Sendable {
         public var toolchain: ToolchainPaths
         public var preset: PresetSpec
+        public var speedProfile: SpeedProfile
         public var trainingGate: (@Sendable () async throws -> Void)?
 
         public init(
             toolchain: ToolchainPaths,
             preset: PresetSpec,
+            speedProfile: SpeedProfile = .standard,
             trainingGate: (@Sendable () async throws -> Void)? = nil
         ) {
             self.toolchain = toolchain
             self.preset = preset
+            self.speedProfile = speedProfile
             self.trainingGate = trainingGate
         }
     }
@@ -243,7 +256,7 @@ public final class PipelineRunner: @unchecked Sendable {
             let frameProfile = frameExtractionProfile(for: metadata.preset.quality)
             let targetFrames = frameProfile.targetCount
             let maxDim = frameProfile.maxDimension
-            var colmapMaxImageSize = Int(maxDim)
+            var colmapMaxImageSize = colmapMaxImageSizeOverride() ?? Int(maxDim)
             var colmapExtractOptions = colmapOptionsForExtraction()
             var colmapMatchOptions = colmapOptionsForMatching()
             let preferColmapGpu = shouldUseColmapGpu(colmapPath: config.toolchain.colmap)
@@ -274,9 +287,12 @@ public final class PipelineRunner: @unchecked Sendable {
                         if perVideoTarget == 0 {
                             continue
                         }
+                        let perVideoExtractionCap = frameProfile.maxExtractedFrames.map {
+                            targetCountForVideo(index: index, total: videos.count, targetCount: $0)
+                        }
                         emit(.stageLog(
                             stage: .extractFrames,
-                            line: "Extracting frames from \(sourceName) (target=\(perVideoTarget), maxDim=\(Int(maxDim))px).",
+                            line: "Extracting frames from \(sourceName) (target=\(perVideoTarget), maxDim=\(Int(maxDim))px, rawCap=\(perVideoExtractionCap.map(String.init) ?? "none")).",
                             isError: false
                         ))
                         let rawDir = rawFramesDirectory(index: index, paths: paths)
@@ -291,7 +307,8 @@ public final class PipelineRunner: @unchecked Sendable {
                                 minDistanceRatio: frameProfile.minDistanceRatio,
                                 sharpnessFloor: frameProfile.sharpnessFloor,
                                 sharpnessRatio: frameProfile.sharpnessRatio,
-                                outputFormat: frameProfile.outputFormat
+                                outputFormat: frameProfile.outputFormat,
+                                maxExtractedFrames: perVideoExtractionCap
                             ),
                             progress: { fraction, message in
                                 let scaled = (Double(index) / totalVideos) + (fraction / totalVideos)
@@ -458,16 +475,37 @@ public final class PipelineRunner: @unchecked Sendable {
                     colmapExtractOptions: &colmapExtractOptions,
                     colmapMatchOptions: &colmapMatchOptions
                 )
+                if let explicitColmapMaxImageSize = colmapMaxImageSizeOverride() {
+                    colmapMaxImageSize = explicitColmapMaxImageSize
+                }
                 emit(.stageLog(stage: .sfmFeatures, line: tune.summary(profile: detectedHardwareProfile), isError: false))
+            }
+            if applySpeedProfileIfNeeded(
+                colmapMaxImageSize: &colmapMaxImageSize,
+                colmapExtractOptions: &colmapExtractOptions,
+                colmapMatchOptions: &colmapMatchOptions
+            ) {
+                let colmapSizeText = colmapMaxImageSizeOverride().map { "\($0)px (explicit)" } ?? "<=512px"
+                emit(.stageLog(
+                    stage: .sfmFeatures,
+                    line: "Speed profile fast: frame budget=\(fastSpeedProfileFrameBudget()), extraction cap=\(fastSpeedProfileFrameExtractionCap(targetCount: fastSpeedProfileFrameBudget())), COLMAP max image size \(colmapSizeText), features<=4000, sequential overlap<=2.",
+                    isError: false
+                ))
+            }
+            if let sequentialOverlap = colmapSequentialOverlapOverride() {
+                colmapExtractOptions.sequentialOverlap = sequentialOverlap
+                colmapMatchOptions.sequentialOverlap = sequentialOverlap
+                emit(.stageLog(stage: .sfmFeatures, line: "COLMAP sequential overlap override: \(sequentialOverlap).", isError: false))
             }
 
             try Task.checkCancellation()
             let backendOverride = sfmBackendOverride()
+            let da3WindowSize = da3WindowSizePreference(hardwareTier: detectedHardwareProfile.tier)
             var backendOrder = sfmBackendFallbackOrder(override: backendOverride)
             if let backendOverride, backendOverride == .fastvggt || backendOverride == .vggt {
                 emit(.stageLog(
                     stage: .sfmFeatures,
-                    line: "Deprecated SfM backend override '\(backendOverride.rawValue)' is enabled. Default backend is DA3 with MapAnything and COLMAP fallback.",
+                    line: "Deprecated SfM backend override '\(backendOverride.rawValue)' is enabled. Fast defaults to COLMAP; other profiles use DA3 with MapAnything and COLMAP fallback.",
                     isError: true
                 ))
             }
@@ -527,6 +565,7 @@ public final class PipelineRunner: @unchecked Sendable {
                 }
             }
 
+            var acceptedReconstructionScore: ReconstructionScore?
             for (index, backendPolicy) in backendOrder.enumerated() {
                 do {
                     if backendPolicy == .da3 {
@@ -542,7 +581,7 @@ public final class PipelineRunner: @unchecked Sendable {
                             maxPoints: da3MaxPointsPreference(preset: metadata.preset),
                             cameraType: da3CameraTypePreference(preset: metadata.preset),
                             sharedCamera: da3SharedCameraPreference(input: metadata.input),
-                            windowSize: da3WindowSizePreference(hardwareTier: detectedHardwareProfile.tier),
+                            windowSize: da3WindowSize,
                             windowOverlap: da3WindowOverlapPreference(hardwareTier: detectedHardwareProfile.tier),
                             coverageManifestPath: da3CoverageManifest
                         )
@@ -595,7 +634,10 @@ public final class PipelineRunner: @unchecked Sendable {
                             for line in report.split(separator: "\n", omittingEmptySubsequences: false) {
                                 toolLog?.append(stream: "stdout", line: String(line))
                             }
-                            let score = ReconstructionScorer.parseModelAnalyzerOutput(report)
+                            let score = ReconstructionScorer.applyingExpectedTotalImages(
+                                ReconstructionScorer.parseModelAnalyzerOutput(report),
+                                expectedTotalImages: selectedFrames.count
+                            )
                             emit(.stageLog(
                                 stage: currentStage,
                                 line: "DA3 score (direct): \(ReconstructionScorer.summary(score)).",
@@ -844,7 +886,10 @@ public final class PipelineRunner: @unchecked Sendable {
                             for line in report.split(separator: "\n", omittingEmptySubsequences: false) {
                                 toolLog?.append(stream: "stdout", line: String(line))
                             }
-                            let score = ReconstructionScorer.parseModelAnalyzerOutput(report)
+                            let score = ReconstructionScorer.applyingExpectedTotalImages(
+                                ReconstructionScorer.parseModelAnalyzerOutput(report),
+                                expectedTotalImages: selectedFrames.count
+                            )
                             emit(.stageLog(
                                 stage: currentStage,
                                 line: "MapAnything score (\(candidate)): \(ReconstructionScorer.summary(score)).",
@@ -2225,7 +2270,10 @@ public final class PipelineRunner: @unchecked Sendable {
                                 for line in report.split(separator: "\n", omittingEmptySubsequences: false) {
                                     colmapToolLog.append(stream: "stdout", line: String(line))
                                 }
-                                let score = ReconstructionScorer.parseModelAnalyzerOutput(report)
+                                let score = ReconstructionScorer.applyingExpectedTotalImages(
+                                    ReconstructionScorer.parseModelAnalyzerOutput(report),
+                                    expectedTotalImages: selectedFrames.count
+                                )
                                 emit(.stageLog(
                                     stage: .sfmMapping,
                                     line: "FastVGGT refinement score: \(ReconstructionScorer.summary(score)).",
@@ -2274,7 +2322,10 @@ public final class PipelineRunner: @unchecked Sendable {
                                         modelPath: sparseZero,
                                         options: fastColmapMatchOptions
                                     )
-                                    let score = ReconstructionScorer.parseModelAnalyzerOutput(report)
+                                    let score = ReconstructionScorer.applyingExpectedTotalImages(
+                                        ReconstructionScorer.parseModelAnalyzerOutput(report),
+                                        expectedTotalImages: selectedFrames.count
+                                    )
                                     emit(.stageLog(
                                         stage: .sfmMapping,
                                         line: "Mapper fallback score (\(candidate)): \(ReconstructionScorer.summary(score)).",
@@ -3073,7 +3124,10 @@ public final class PipelineRunner: @unchecked Sendable {
                         for line in report.split(separator: "\n", omittingEmptySubsequences: false) {
                             colmapToolLog.append(stream: "stdout", line: String(line))
                         }
-                        let score = ReconstructionScorer.parseModelAnalyzerOutput(report)
+                        let score = ReconstructionScorer.applyingExpectedTotalImages(
+                            ReconstructionScorer.parseModelAnalyzerOutput(report),
+                            expectedTotalImages: selectedFrames.count
+                        )
                         writeCheckpoint(
                             stage: .sfmMapping,
                             progress: 0.95,
@@ -3091,6 +3145,7 @@ public final class PipelineRunner: @unchecked Sendable {
                         ))
                         if ReconstructionScorer.isAcceptable(score, mode: metadata.preset.mode) {
                             acceptedMappingStrategy = candidate
+                            acceptedReconstructionScore = score
                             return true
                         } else {
                             lastMappingError = PipelineError.lowQualityReconstruction(score)
@@ -3368,59 +3423,134 @@ public final class PipelineRunner: @unchecked Sendable {
             }
             let trainingCutoffMetadata = resumeValidationMode ? metadataForResumeValidation : metadata
             var currentTrainingStartedAt = trainingExportMinimumDate(metadata: trainingCutoffMetadata)
+            let preferredTrainingBackend = checkpointTrainingBackend(metadata: trainingCutoffMetadata)
+                ?? trainingBackendPreference()
+            let trainingBackend: TrainingBackend
+            if preferredTrainingBackend == .msplat,
+               shouldUseBrushInsteadOfAutomaticMsplat(for: acceptedReconstructionScore) {
+                let pointCount = acceptedReconstructionScore?.pointCount ?? 0
+                let minimumPointCount = automaticMsplatMinimumSparsePoints()
+                emit(.stageLog(
+                    stage: .sfmMapping,
+                    line: "Fast msplat auto-selection skipped because sparse reconstruction has \(pointCount) points (< \(minimumPointCount)); using Brush for predictable training.",
+                    isError: false
+                ))
+                trainingBackend = .brush
+            } else {
+                trainingBackend = preferredTrainingBackend
+            }
             if try shouldRunStage(.trainBrush) {
                 currentStage = .trainBrush
                 emit(.stageStarted(stage: .trainBrush))
+                emit(.trainingBackendSelected(backend: trainingBackend))
+                let checkpointTotalSteps = trainingBackend == .brush
+                    ? brushTrainingPlan(for: metadata.preset).totalSteps
+                    : nil
                 writeCheckpoint(
                     stage: .trainBrush,
                     progress: 0,
-                    message: "Brush training started",
+                    message: "\(trainingBackend.rawValue) training started",
                     details: .trainBrush(TrainBrushCheckpoint(
                         latestExportStep: nil,
                         latestExportPath: nil,
                         progressStep: nil,
-                        progressTotal: brushTrainingPlan(for: metadata.preset).totalSteps,
+                        progressTotal: checkpointTotalSteps,
                         stepsPerSecond: nil,
-                        resumeSnapshotPath: paths.trainingURL.appendingPathComponent("latest_snapshot.ply").path
+                        resumeSnapshotPath: trainingBackend == .brush
+                            ? paths.trainingURL.appendingPathComponent("latest_snapshot.ply").path
+                            : nil,
+                        trainingBackend: trainingBackend
                     ))
                 )
                 if let trainingGate = config.trainingGate {
                     try await trainingGate()
                 }
-                clearBrushResumeSnapshot(in: paths.trainingURL)
-                let brushPlan = brushTrainingPlan(for: metadata.preset)
-                let overrideExportEvery = brushExportEveryOverride()
-                let adaptiveExportEvery = overrideExportEvery ?? brushAdaptiveExportEvery(
-                    plan: brushPlan,
-                    logURL: paths.brushLogURL
-                )
-                let effectiveExportEvery = adaptiveExportEvery ?? brushPlan.exportEvery
-                // Suppress non-step training logs; details should only update on the configured step cadence.
-                let datasetURL = try prepareBrushDataset(paths: paths, progress: { _, message in
-                    // Dataset prep progress is noisy; keep the bar indeterminate until training begins.
-                    emit(.stageProgress(stage: .trainBrush, fraction: -1.0, message: message))
-                })
-                let trainingStartedAt = Date()
-                currentTrainingStartedAt = trainingStartedAt
-                let initialStatus = trainingStatusMessage(
-                    elapsed: 0,
-                    progress: nil,
-                    latestExportStep: nil,
-                    totalSteps: brushPlan.totalSteps,
-                    etaSeconds: nil
-                )
-                emit(.stageProgress(stage: .trainBrush, fraction: -1.0, message: initialStatus))
-                // Suppress non-step training logs; details should only update on the configured step cadence.
+                if trainingBackend == .msplat {
+                    let datasetURL = try prepareMsplatDataset(paths: paths, progress: { _, message in
+                        emit(.stageProgress(stage: .trainBrush, fraction: -1.0, message: message))
+                    })
+                    let trainingStartedAt = Date()
+                    currentTrainingStartedAt = trainingStartedAt
+                    let outputURL = paths.trainingURL.appendingPathComponent("msplat/splat.ply")
+                    emit(.stageProgress(stage: .trainBrush, fraction: -1.0, message: "Training model with msplat"))
 
-                let brushToolLog = ToolLogWriter(fileURL: paths.brushLogURL, toolName: "brush")
-                brushToolLog.beginSection(
-                    title: "train",
-                    metadata: [
-                        "dataset": datasetURL.path,
-                        "tool": self.config.toolchain.brush.path
-                    ]
-                )
-                // Suppress non-step training logs; details should only update on the configured step cadence.
+                    let msplatToolLog = ToolLogWriter(fileURL: paths.msplatLogURL, toolName: "msplat")
+                    let msplatPath = msplatToolPath()
+                    msplatToolLog.beginSection(
+                        title: "train",
+                        metadata: [
+                            "dataset": datasetURL.path,
+                            "output": outputURL.path,
+                            "tool": msplatPath.path
+                        ]
+                    )
+                    try await self.tooling.msplat.runTrain(
+                        msplatPath: msplatPath,
+                        datasetPath: datasetURL,
+                        outputPath: outputURL,
+                        iterations: msplatDefaultIterations(),
+                        onLog: { line, isErr in
+                            msplatToolLog.append(stream: isErr ? "stderr" : "stdout", line: line)
+                            let cleaned = Self.stripAnsiCodes(line)
+                            let trimmed = Self.sanitizeToolLogLine(cleaned)
+                                .trimmingCharacters(in: .whitespacesAndNewlines)
+                            guard !trimmed.isEmpty else { return }
+                            if Self.shouldEmitToolLogLine(trimmed, isError: isErr) {
+                                emit(.stageLog(stage: .trainBrush, line: trimmed, isError: isErr))
+                            }
+                        }
+                    )
+                    writeCheckpoint(
+                        stage: .trainBrush,
+                        progress: 1.0,
+                        message: "msplat training completed",
+                        details: .trainBrush(TrainBrushCheckpoint(
+                            latestExportStep: nil,
+                            latestExportPath: outputURL.path,
+                            progressStep: nil,
+                            progressTotal: nil,
+                            stepsPerSecond: nil,
+                            resumeSnapshotPath: nil,
+                            trainingBackend: .msplat
+                        ))
+                    )
+                    emit(.stageFinished(stage: .trainBrush))
+                    markStageComplete(.trainBrush)
+                } else {
+                    clearBrushResumeSnapshot(in: paths.trainingURL)
+                    let brushPlan = brushTrainingPlan(for: metadata.preset)
+                    let overrideExportEvery = brushExportEveryOverride()
+                    let adaptiveExportEvery = overrideExportEvery ?? brushAdaptiveExportEvery(
+                        plan: brushPlan,
+                        logURL: paths.brushLogURL
+                    )
+                    let effectiveExportEvery = adaptiveExportEvery ?? brushPlan.exportEvery
+                    // Suppress non-step training logs; details should only update on the configured step cadence.
+                    let datasetURL = try prepareBrushDataset(paths: paths, progress: { _, message in
+                        // Dataset prep progress is noisy; keep the bar indeterminate until training begins.
+                        emit(.stageProgress(stage: .trainBrush, fraction: -1.0, message: message))
+                    })
+                    let trainingStartedAt = Date()
+                    currentTrainingStartedAt = trainingStartedAt
+                    let initialStatus = trainingStatusMessage(
+                        elapsed: 0,
+                        progress: nil,
+                        latestExportStep: nil,
+                        totalSteps: brushPlan.totalSteps,
+                        etaSeconds: nil
+                    )
+                    emit(.stageProgress(stage: .trainBrush, fraction: -1.0, message: initialStatus))
+                    // Suppress non-step training logs; details should only update on the configured step cadence.
+
+                    let brushToolLog = ToolLogWriter(fileURL: paths.brushLogURL, toolName: "brush")
+                    brushToolLog.beginSection(
+                        title: "train",
+                        metadata: [
+                            "dataset": datasetURL.path,
+                            "tool": self.config.toolchain.brush.path
+                        ]
+                    )
+                    // Suppress non-step training logs; details should only update on the configured step cadence.
 
                 // Brush can take a long time and may not emit newline-delimited logs frequently.
                 // Poll for exported .ply files so the user sees forward progress.
@@ -3542,7 +3672,8 @@ public final class PipelineRunner: @unchecked Sendable {
                                                 progressStep: brushProgress.latestProgress()?.step,
                                                 progressTotal: brushProgress.latestProgress()?.total ?? brushPlan.totalSteps,
                                                 stepsPerSecond: rateBox.latestRate(),
-                                                resumeSnapshotPath: trainingURL.appendingPathComponent("latest_snapshot.ply").path
+                                                resumeSnapshotPath: trainingURL.appendingPathComponent("latest_snapshot.ply").path,
+                                                trainingBackend: .brush
                                             ))
                                         )
                                     } else {
@@ -3571,7 +3702,8 @@ public final class PipelineRunner: @unchecked Sendable {
                                     progressStep: progress?.step,
                                     progressTotal: progress?.total ?? brushPlan.totalSteps,
                                     stepsPerSecond: rateBox.latestRate(),
-                                    resumeSnapshotPath: trainingURL.appendingPathComponent("latest_snapshot.ply").path
+                                    resumeSnapshotPath: trainingURL.appendingPathComponent("latest_snapshot.ply").path,
+                                    trainingBackend: .brush
                                 ))
                             )
                         }
@@ -3618,7 +3750,8 @@ public final class PipelineRunner: @unchecked Sendable {
                                         progressStep: progress.step,
                                         progressTotal: progress.total,
                                         stepsPerSecond: rateBox.latestRate(),
-                                        resumeSnapshotPath: paths.trainingURL.appendingPathComponent("latest_snapshot.ply").path
+                                        resumeSnapshotPath: paths.trainingURL.appendingPathComponent("latest_snapshot.ply").path,
+                                        trainingBackend: .brush
                                     ))
                                 )
                             }
@@ -3676,11 +3809,13 @@ public final class PipelineRunner: @unchecked Sendable {
                         progressStep: brushPlan.totalSteps,
                         progressTotal: brushPlan.totalSteps,
                         stepsPerSecond: rateBox.latestRate(),
-                        resumeSnapshotPath: paths.trainingURL.appendingPathComponent("latest_snapshot.ply").path
+                        resumeSnapshotPath: paths.trainingURL.appendingPathComponent("latest_snapshot.ply").path,
+                        trainingBackend: .brush
                     ))
                 )
                 emit(.stageFinished(stage: .trainBrush))
                 markStageComplete(.trainBrush)
+                }
             }
 
             try Task.checkCancellation()
@@ -3688,8 +3823,9 @@ public final class PipelineRunner: @unchecked Sendable {
                 currentStage = .exportSplat
                 emit(.stageStarted(stage: .exportSplat))
                 writeCheckpoint(stage: .exportSplat, progress: 0, message: "Export started")
-                guard let ply = self.tooling.brush.findLatestExportablePly(
+                guard let ply = latestTrainingExport(
                     in: paths.trainingURL,
+                    backend: trainingBackend,
                     minModificationDate: currentTrainingStartedAt
                 ) else {
                     throw PipelineError.outputMissing
@@ -3754,6 +3890,7 @@ public final class PipelineRunner: @unchecked Sendable {
             paths.vggtLogURL,
             paths.fastvggtLogURL,
             paths.brushLogURL,
+            paths.msplatLogURL,
         ]
         for url in toolLogs where fm.fileExists(atPath: url.path) {
             try? fm.removeItem(at: url)

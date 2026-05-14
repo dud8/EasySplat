@@ -6,6 +6,7 @@ public struct ToolchainPaths: Sendable {
     public var colmap: URL
     public var glomap: URL
     public var brush: URL
+    public var msplat: URL
     public var da3: Da3Toolchain
     public var mapanything: MapAnythingToolchain
     public var vggt: VggtToolchain
@@ -16,6 +17,7 @@ public struct ToolchainPaths: Sendable {
         colmap: URL,
         glomap: URL,
         brush: URL,
+        msplat: URL,
         da3: Da3Toolchain,
         mapanything: MapAnythingToolchain,
         vggt: VggtToolchain,
@@ -25,6 +27,7 @@ public struct ToolchainPaths: Sendable {
         self.colmap = colmap
         self.glomap = glomap
         self.brush = brush
+        self.msplat = msplat
         self.da3 = da3
         self.mapanything = mapanything
         self.vggt = vggt
@@ -36,6 +39,30 @@ public struct ToolchainPaths: Sendable {
         colmap: URL,
         glomap: URL,
         brush: URL,
+        da3: Da3Toolchain,
+        mapanything: MapAnythingToolchain,
+        vggt: VggtToolchain,
+        fastvggt: FastVggtToolchain
+    ) {
+        self.init(
+            root: root,
+            colmap: colmap,
+            glomap: glomap,
+            brush: brush,
+            msplat: root.appendingPathComponent("bin/msplat-train"),
+            da3: da3,
+            mapanything: mapanything,
+            vggt: vggt,
+            fastvggt: fastvggt
+        )
+    }
+
+    public init(
+        root: URL,
+        colmap: URL,
+        glomap: URL,
+        brush: URL,
+        msplat: URL,
         vggt: VggtToolchain,
         fastvggt: FastVggtToolchain
     ) {
@@ -62,8 +89,28 @@ public struct ToolchainPaths: Sendable {
             colmap: colmap,
             glomap: glomap,
             brush: brush,
+            msplat: msplat,
             da3: da3,
             mapanything: mapanything,
+            vggt: vggt,
+            fastvggt: fastvggt
+        )
+    }
+
+    public init(
+        root: URL,
+        colmap: URL,
+        glomap: URL,
+        brush: URL,
+        vggt: VggtToolchain,
+        fastvggt: FastVggtToolchain
+    ) {
+        self.init(
+            root: root,
+            colmap: colmap,
+            glomap: glomap,
+            brush: brush,
+            msplat: root.appendingPathComponent("bin/msplat-train"),
             vggt: vggt,
             fastvggt: fastvggt
         )

@@ -24,7 +24,10 @@ extension PipelineRunner {
     }
 
     func sfmBackendPolicy() -> SfmBackend {
-        sfmBackendOverride() ?? .da3
+        if let override = sfmBackendOverride() {
+            return override
+        }
+        return isFastSpeedProfile() ? .colmap : .da3
     }
 
     func sfmBackendFallbackOrder(override: SfmBackend?) -> [SfmBackend] {
@@ -33,6 +36,9 @@ extension PipelineRunner {
                 return [.mapanything, .colmap]
             }
             return [override]
+        }
+        if isFastSpeedProfile() {
+            return [.colmap]
         }
         return [.da3, .mapanything, .colmap]
     }
@@ -899,6 +905,25 @@ extension PipelineRunner {
         return raw
     }
 
+    func isFastSpeedProfile() -> Bool {
+        if config.speedProfile == .fast { return true }
+        guard let raw = stringEnvValue("EASYSPLAT_SPEED_PROFILE")?.lowercased() else { return false }
+        return ["fast", "apple-silicon-fast"].contains(raw)
+    }
+
+    func fastSpeedProfileFrameBudget() -> Int {
+        30
+    }
+
+    func fastSpeedProfileFrameExtractionCap(targetCount: Int) -> Int {
+        max(targetCount, Int(ceil(Double(targetCount) / 0.75)))
+    }
+
+    func colmapMaxImageSizeOverride() -> Int? {
+        intEnvValue("EASYSPLAT_COLMAP_MAX_IMAGE_SIZE")
+            .flatMap { $0 > 0 ? max(64, $0) : nil }
+    }
+
     func globalMapperOptions(threadHint: Int, defaultUseGpu: Bool = true) -> ColmapGlobalMapperOptions {
         let preferredThreads = max(1, intEnvValue("EASYSPLAT_GLOBAL_MAPPER_THREADS") ?? threadHint)
         let gpUseGpu = boolEnvValue("EASYSPLAT_GLOBAL_MAPPER_GP_USE_GPU", default: defaultUseGpu)
@@ -944,11 +969,38 @@ extension PipelineRunner {
         }
     }
 
+    @discardableResult
+    func applySpeedProfileIfNeeded(
+        colmapMaxImageSize: inout Int,
+        colmapExtractOptions: inout ColmapOptions,
+        colmapMatchOptions: inout ColmapOptions
+    ) -> Bool {
+        guard isFastSpeedProfile() else { return false }
+
+        if colmapMaxImageSizeOverride() == nil {
+            colmapMaxImageSize = min(colmapMaxImageSize, 512)
+        }
+        colmapExtractOptions.sequentialOverlap = min(colmapExtractOptions.sequentialOverlap, 2)
+        colmapMatchOptions.sequentialOverlap = min(colmapMatchOptions.sequentialOverlap, 2)
+        colmapExtractOptions.maxNumFeatures = colmapExtractOptions.maxNumFeatures.map { min($0, 4_000) } ?? 4_000
+        colmapMatchOptions.maxNumFeatures = colmapMatchOptions.maxNumFeatures.map { min($0, 4_000) } ?? 4_000
+        colmapMatchOptions.maxNumMatches = colmapMatchOptions.maxNumMatches.map { min($0, 4_000) } ?? 4_000
+        colmapMatchOptions.exhaustiveBlockSize = colmapMatchOptions.exhaustiveBlockSize.map { min($0, 25) } ?? 25
+        return true
+    }
+
     func updateThreadEnvironment(_ options: inout ColmapOptions, threadCount: Int) {
         if options.environment.isEmpty { return }
         options.environment["OMP_NUM_THREADS"] = "\(threadCount)"
         options.environment["OPENBLAS_NUM_THREADS"] = "\(threadCount)"
         options.environment["MKL_NUM_THREADS"] = "\(threadCount)"
+    }
+
+    func colmapSequentialOverlapOverride() -> Int? {
+        guard let value = intEnvValue("EASYSPLAT_COLMAP_SEQUENTIAL_OVERLAP") else {
+            return nil
+        }
+        return min(30, max(1, value))
     }
 
     func colmapGpuOverride() -> Bool? {

@@ -544,41 +544,80 @@ extension PipelineRunner {
         let sharpnessFloor: Double
         let sharpnessRatio: Double
         let outputFormat: FrameOutputFormat
+        let maxExtractedFrames: Int?
     }
 
     func frameExtractionProfile(for quality: QualityPreset) -> FrameExtractionProfile {
-        switch quality {
+        let base: FrameExtractionProfile = switch quality {
         case .draft:
-            return FrameExtractionProfile(
+            FrameExtractionProfile(
                 targetCount: 120,
                 maxDimension: 1024,
                 targetFPS: 2,
                 minDistanceRatio: 0.20,
                 sharpnessFloor: 30.0,
                 sharpnessRatio: 0.5,
-                outputFormat: .jpeg
+                outputFormat: .jpeg,
+                maxExtractedFrames: nil
             )
         case .standard:
-            return FrameExtractionProfile(
+            FrameExtractionProfile(
                 targetCount: 250,
                 maxDimension: 1600,
                 targetFPS: 3,
                 minDistanceRatio: 0.20,
                 sharpnessFloor: 40.0,
                 sharpnessRatio: 0.6,
-                outputFormat: .jpeg
+                outputFormat: .jpeg,
+                maxExtractedFrames: nil
             )
         case .ultra:
-            return FrameExtractionProfile(
+            FrameExtractionProfile(
                 targetCount: 500,
                 maxDimension: 2048,
                 targetFPS: 4,
                 minDistanceRatio: 0.20,
                 sharpnessFloor: 50.0,
                 sharpnessRatio: 0.65,
-                outputFormat: .png
+                outputFormat: .png,
+                maxExtractedFrames: nil
             )
         }
+        let profiled = isFastSpeedProfile()
+            ? FrameExtractionProfile(
+                targetCount: fastSpeedProfileFrameBudget(),
+                maxDimension: 960,
+                targetFPS: 3,
+                minDistanceRatio: base.minDistanceRatio,
+                sharpnessFloor: base.sharpnessFloor,
+                sharpnessRatio: base.sharpnessRatio,
+                outputFormat: .jpeg,
+                maxExtractedFrames: fastSpeedProfileFrameExtractionCap(targetCount: fastSpeedProfileFrameBudget())
+            )
+            : base
+        let targetCountOverride = intEnvValue("EASYSPLAT_FRAME_TARGET_COUNT")
+            .flatMap { $0 > 0 ? $0 : nil }
+        let targetCount = targetCountOverride ?? profiled.targetCount
+        let maxDimension = intEnvValue("EASYSPLAT_FRAME_MAX_DIMENSION")
+            .flatMap { $0 > 0 ? max(256, $0) : nil } ?? Int(profiled.maxDimension)
+        let targetFPS = intEnvValue("EASYSPLAT_FRAME_TARGET_FPS")
+            .flatMap { $0 > 0 ? $0 : nil } ?? profiled.targetFPS
+        let maxExtractedFrames: Int?
+        if isFastSpeedProfile() {
+            maxExtractedFrames = fastSpeedProfileFrameExtractionCap(targetCount: targetCount)
+        } else {
+            maxExtractedFrames = profiled.maxExtractedFrames
+        }
+        return FrameExtractionProfile(
+            targetCount: targetCount,
+            maxDimension: CGFloat(maxDimension),
+            targetFPS: targetFPS,
+            minDistanceRatio: profiled.minDistanceRatio,
+            sharpnessFloor: profiled.sharpnessFloor,
+            sharpnessRatio: profiled.sharpnessRatio,
+            outputFormat: profiled.outputFormat,
+            maxExtractedFrames: maxExtractedFrames
+        )
     }
 
     func cameraModel(for preset: PresetSpec) -> String {

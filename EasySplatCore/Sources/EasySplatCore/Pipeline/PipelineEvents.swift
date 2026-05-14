@@ -5,8 +5,14 @@ public enum PipelineEvent: Codable, Sendable {
     case stageStarted(stage: PipelineStage)
     case stageProgress(stage: PipelineStage, fraction: Double, message: String)
     case stageLog(stage: PipelineStage, line: String, isError: Bool)
+    case trainingBackendSelected(backend: TrainingBackend)
     case stageFinished(stage: PipelineStage)
     case pipelineFailed(stage: PipelineStage, userMessage: String, debugMessage: String)
+}
+
+public enum TrainingBackend: String, Codable, Sendable {
+    case brush
+    case msplat
 }
 
 /// Snapshot of user-facing progress for a single pipeline stage.

@@ -171,6 +171,7 @@ public struct TrainBrushCheckpoint: Codable, Sendable {
     public var progressTotal: Int?
     public var stepsPerSecond: Double?
     public var resumeSnapshotPath: String?
+    public var trainingBackend: TrainingBackend?
 
     public init(
         latestExportStep: Int?,
@@ -178,7 +179,8 @@ public struct TrainBrushCheckpoint: Codable, Sendable {
         progressStep: Int?,
         progressTotal: Int?,
         stepsPerSecond: Double?,
-        resumeSnapshotPath: String?
+        resumeSnapshotPath: String?,
+        trainingBackend: TrainingBackend? = nil
     ) {
         self.latestExportStep = latestExportStep
         self.latestExportPath = latestExportPath
@@ -186,6 +188,7 @@ public struct TrainBrushCheckpoint: Codable, Sendable {
         self.progressTotal = progressTotal
         self.stepsPerSecond = stepsPerSecond
         self.resumeSnapshotPath = resumeSnapshotPath
+        self.trainingBackend = trainingBackend
     }
 }
 
