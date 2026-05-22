@@ -93,7 +93,7 @@ public final class VggtSfmRunner: @unchecked Sendable, VggtSfmRunning {
             throw VggtSfmError.missingModels
         }
 
-        let args: [String] = [
+        let legacyArgs: [String] = [
             "--images", images.path,
             "--out-sparse", outSparse.path,
             "--device", config.device,
@@ -101,7 +101,9 @@ public final class VggtSfmRunner: @unchecked Sendable, VggtSfmRunning {
             "--vggt-resolution", "\(config.vggtFixedResolution)",
             "--conf-thres", "\(config.confidenceThreshold)",
             "--max-points", "\(config.maxPoints)",
-            "--models-dir", toolchain.models.path,
+            "--models-dir", toolchain.models.path
+        ]
+        let args: [String] = legacyArgs + [
             "--max-reproj-error", "\(config.maxReprojectionError)",
             "--camera-type", config.cameraType,
             "--vis-thresh", "\(config.visibilityThreshold)",
@@ -149,18 +151,47 @@ public final class VggtSfmRunner: @unchecked Sendable, VggtSfmRunning {
         }
 
         onLog("EasySplat: running vggt-mps (cwd=\(toolchain.root.path))", false)
-        onLog("EasySplat: vggt argv: \(toolchain.sfmTool.path) \(argsWithBA.joined(separator: " "))", false)
 
-        let result = try await runner.runAsync(
+        let result = try await runBridge(
+            toolchain: toolchain,
+            args: argsWithBA,
+            environment: environment,
+            onLog: onLog
+        )
+        guard result.exitCode == 0 else {
+            let output = result.stderr.isEmpty ? result.stdout : result.stderr
+            guard result.exitCode == 2,
+                  output.localizedCaseInsensitiveContains("unrecognized arguments") else {
+                throw VggtSfmError.commandFailed(output)
+            }
+            onLog("VGGT bridge rejected advanced options; retrying with legacy-compatible arguments.", true)
+            let legacyResult = try await runBridge(
+                toolchain: toolchain,
+                args: legacyArgs,
+                environment: environment,
+                onLog: onLog
+            )
+            guard legacyResult.exitCode == 0 else {
+                throw VggtSfmError.commandFailed(legacyResult.stderr.isEmpty ? legacyResult.stdout : legacyResult.stderr)
+            }
+            return
+        }
+    }
+
+    private func runBridge(
+        toolchain: VggtToolchain,
+        args: [String],
+        environment: [String: String],
+        onLog: @escaping @Sendable (String, Bool) -> Void
+    ) async throws -> SubprocessResult {
+        onLog("EasySplat: vggt argv: \(toolchain.sfmTool.path) \(args.joined(separator: " "))", false)
+        return try await runner.runAsync(
             toolchain.sfmTool.path,
-            argsWithBA,
+            args,
             currentDirectory: toolchain.root,
             environment: environment,
             onStdout: { onLog($0, false) },
             onStderr: { onLog($0, true) }
         )
-        guard result.exitCode == 0 else {
-            throw VggtSfmError.commandFailed(result.stderr.isEmpty ? result.stdout : result.stderr)
-        }
     }
 }

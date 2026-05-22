@@ -5,7 +5,8 @@ import XCTest
 
 final class VggtSfmRunnerTests: XCTestCase {
     func testRunBuildsExpectedArgs() async throws {
-        let temp = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        let temp = try TestFileBuilder.makeTempDir()
+        defer { try? FileManager.default.removeItem(at: temp) }
         let toolchain = try TestToolchains.vggtToolchain(root: temp, createFiles: true)
         let imagesPath = temp.appendingPathComponent("images", isDirectory: true)
         let outSparse = temp.appendingPathComponent("sparse/0", isDirectory: true)
@@ -47,38 +48,24 @@ final class VggtSfmRunnerTests: XCTestCase {
             onLog: { _, _ in }
         )
 
-        XCTAssertEqual(capturedArgs.first, "--images")
-        XCTAssertTrue(capturedArgs.contains("--out-sparse"))
-        XCTAssertTrue(capturedArgs.contains(outSparse.path))
-        XCTAssertTrue(capturedArgs.contains("--device"))
-        XCTAssertTrue(capturedArgs.contains("mps"))
-        XCTAssertTrue(capturedArgs.contains("--img-load-resolution"))
-        XCTAssertTrue(capturedArgs.contains("1024"))
-        XCTAssertTrue(capturedArgs.contains("--vggt-resolution"))
-        XCTAssertTrue(capturedArgs.contains("518"))
-        XCTAssertTrue(capturedArgs.contains("--conf-thres"))
-        XCTAssertTrue(capturedArgs.contains("5.0"))
-        XCTAssertTrue(capturedArgs.contains("--max-points"))
-        XCTAssertTrue(capturedArgs.contains("123456"))
-        XCTAssertTrue(capturedArgs.contains("--models-dir"))
-        XCTAssertTrue(capturedArgs.contains(toolchain.models.path))
+        XCTAssertEqual(value(after: "--images", in: capturedArgs), imagesPath.path)
+        XCTAssertEqual(value(after: "--out-sparse", in: capturedArgs), outSparse.path)
+        XCTAssertEqual(value(after: "--device", in: capturedArgs), "mps")
+        XCTAssertEqual(value(after: "--img-load-resolution", in: capturedArgs), "1024")
+        XCTAssertEqual(value(after: "--vggt-resolution", in: capturedArgs), "518")
+        XCTAssertEqual(value(after: "--conf-thres", in: capturedArgs), "5.0")
+        XCTAssertEqual(value(after: "--max-points", in: capturedArgs), "123456")
+        XCTAssertEqual(value(after: "--models-dir", in: capturedArgs), toolchain.models.path)
+        XCTAssertEqual(value(after: "--max-reproj-error", in: capturedArgs), "7.5")
+        XCTAssertEqual(value(after: "--camera-type", in: capturedArgs), "SIMPLE_PINHOLE")
+        XCTAssertEqual(value(after: "--vis-thresh", in: capturedArgs), "0.25")
+        XCTAssertEqual(value(after: "--query-frame-num", in: capturedArgs), "10")
+        XCTAssertEqual(value(after: "--max-query-pts", in: capturedArgs), "2048")
+        XCTAssertEqual(value(after: "--keypoint-extractor", in: capturedArgs), "aliked+sp")
+        XCTAssertEqual(value(after: "--ba-max-frames", in: capturedArgs), "48")
         XCTAssertTrue(capturedArgs.contains("--use-ba"))
-        XCTAssertTrue(capturedArgs.contains("--max-reproj-error"))
-        XCTAssertTrue(capturedArgs.contains("7.5"))
         XCTAssertTrue(capturedArgs.contains("--shared-camera"))
-        XCTAssertTrue(capturedArgs.contains("--camera-type"))
-        XCTAssertTrue(capturedArgs.contains("SIMPLE_PINHOLE"))
-        XCTAssertTrue(capturedArgs.contains("--vis-thresh"))
-        XCTAssertTrue(capturedArgs.contains("0.25"))
-        XCTAssertTrue(capturedArgs.contains("--query-frame-num"))
-        XCTAssertTrue(capturedArgs.contains("10"))
-        XCTAssertTrue(capturedArgs.contains("--max-query-pts"))
-        XCTAssertTrue(capturedArgs.contains("2048"))
         XCTAssertTrue(capturedArgs.contains("--fine-tracking"))
-        XCTAssertTrue(capturedArgs.contains("--keypoint-extractor"))
-        XCTAssertTrue(capturedArgs.contains("aliked+sp"))
-        XCTAssertTrue(capturedArgs.contains("--ba-max-frames"))
-        XCTAssertTrue(capturedArgs.contains("48"))
 
         let environment = try XCTUnwrap(mock.environments.first)
         XCTAssertEqual(environment["PYTHONUNBUFFERED"], "1")
@@ -94,7 +81,8 @@ final class VggtSfmRunnerTests: XCTestCase {
     }
 
     func testRunOmitsBundleAdjustmentWhenDisabled() async throws {
-        let temp = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        let temp = try TestFileBuilder.makeTempDir()
+        defer { try? FileManager.default.removeItem(at: temp) }
         let toolchain = try TestToolchains.vggtToolchain(root: temp, createFiles: true)
         let imagesPath = temp.appendingPathComponent("images", isDirectory: true)
         let outSparse = temp.appendingPathComponent("sparse/0", isDirectory: true)
@@ -130,6 +118,68 @@ final class VggtSfmRunnerTests: XCTestCase {
 
         XCTAssertFalse(capturedArgs.contains("--use-ba"))
         XCTAssertTrue(capturedArgs.contains("--no-fine-tracking"))
+    }
+
+    func testRunRetriesLegacyArgsWhenBridgeRejectsAdvancedOptions() async throws {
+        let temp = try TestFileBuilder.makeTempDir()
+        defer { try? FileManager.default.removeItem(at: temp) }
+        let toolchain = try TestToolchains.vggtToolchain(root: temp, createFiles: true)
+        let imagesPath = temp.appendingPathComponent("images", isDirectory: true)
+        let outSparse = temp.appendingPathComponent("sparse/0", isDirectory: true)
+
+        try FileManager.default.createDirectory(at: imagesPath, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: outSparse, withIntermediateDirectories: true)
+
+        let mock = MockSubprocessRunner(scripts: [
+            .init(
+                path: toolchain.sfmTool.path,
+                argsPrefix: ["--images", imagesPath.path],
+                result: .init(
+                    exitCode: 2,
+                    terminationReason: .exit,
+                    stdout: "",
+                    stderr: "run.py: error: unrecognized arguments: --max-reproj-error 8.0 --use-ba"
+                ),
+                onRun: nil
+            ),
+            .init(
+                path: toolchain.sfmTool.path,
+                argsPrefix: ["--images", imagesPath.path],
+                result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""),
+                onRun: nil
+            )
+        ])
+
+        let runner = VggtSfmRunner(runner: mock)
+        try await runner.run(
+            toolchain: toolchain,
+            images: imagesPath,
+            outSparse: outSparse,
+            config: VggtSfmConfig(useBundleAdjustment: true),
+            onLog: { _, _ in }
+        )
+
+        XCTAssertEqual(mock.calls.count, 2)
+        XCTAssertTrue(mock.calls[0].1.contains("--max-reproj-error"))
+        XCTAssertTrue(mock.calls[0].1.contains("--use-ba"))
+        let retryArgs = mock.calls[1].1
+        XCTAssertEqual(value(after: "--images", in: retryArgs), imagesPath.path)
+        XCTAssertEqual(value(after: "--out-sparse", in: retryArgs), outSparse.path)
+        XCTAssertEqual(value(after: "--device", in: retryArgs), "mps")
+        XCTAssertEqual(value(after: "--img-load-resolution", in: retryArgs), "1024")
+        XCTAssertEqual(value(after: "--vggt-resolution", in: retryArgs), "518")
+        XCTAssertEqual(value(after: "--conf-thres", in: retryArgs), "5.0")
+        XCTAssertEqual(value(after: "--max-points", in: retryArgs), "100000")
+        XCTAssertEqual(value(after: "--models-dir", in: retryArgs), toolchain.models.path)
+        XCTAssertFalse(retryArgs.contains("--max-reproj-error"))
+        XCTAssertFalse(retryArgs.contains("--use-ba"))
+    }
+
+    private func value(after flag: String, in args: [String]) -> String? {
+        guard let index = args.firstIndex(of: flag), args.indices.contains(index + 1) else {
+            return nil
+        }
+        return args[index + 1]
     }
 }
 #endif

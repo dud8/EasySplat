@@ -26,6 +26,90 @@ public struct ReconstructionScore: Sendable {
 }
 
 public enum ReconstructionScorer {
+    static func parseSparseTextModel(at sparseModelURL: URL, expectedTotalImages: Int? = nil) -> ReconstructionScore? {
+        let imagesTxt = sparseModelURL.appendingPathComponent("images.txt")
+        let pointsTxt = sparseModelURL.appendingPathComponent("points3D.txt")
+
+        var registeredImages: Int?
+        if let text = try? String(contentsOf: imagesTxt, encoding: .utf8) {
+            registeredImages = text
+                .components(separatedBy: .newlines)
+                .filter { isColmapImagePoseRow($0) }
+                .count
+        }
+
+        var pointCount: Int?
+        var observationCount = 0
+        if let text = try? String(contentsOf: pointsTxt, encoding: .utf8) {
+            var points = 0
+            var observations = 0
+            for line in text.components(separatedBy: .newlines) {
+                let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
+                guard !trimmed.isEmpty, !trimmed.hasPrefix("#") else { continue }
+                let parts = trimmed.split(whereSeparator: \.isWhitespace)
+                guard parts.count >= 8 else { continue }
+                points += 1
+                observations += max(0, (parts.count - 8) / 2)
+            }
+            pointCount = points
+            observationCount = observations
+        }
+
+        let resolvedRegisteredImages = registeredImages ?? 0
+        guard resolvedRegisteredImages > 0 || pointCount != nil else {
+            return nil
+        }
+
+        let resolvedTotalImages = max(expectedTotalImages ?? resolvedRegisteredImages, resolvedRegisteredImages)
+        let meanTrackLength: Double?
+        let resolvedObservationCount: Int?
+        if let pointCount, pointCount > 0, observationCount > 0 {
+            resolvedObservationCount = observationCount
+            meanTrackLength = Double(observationCount) / Double(pointCount)
+        } else {
+            resolvedObservationCount = nil
+            meanTrackLength = nil
+        }
+
+        return ReconstructionScore(
+            registeredImages: resolvedRegisteredImages,
+            totalImages: resolvedTotalImages,
+            meanReprojectionError: nil,
+            pointCount: pointCount,
+            observationCount: resolvedObservationCount,
+            meanTrackLength: meanTrackLength
+        )
+    }
+
+    private static let registeredImagesPairRegex = try! NSRegularExpression(
+        pattern: #"registered images\s*:\s*(\d+)\s*/\s*(\d+)"#,
+        options: [.caseInsensitive]
+    )
+    private static let registeredImagesSingleRegex = try! NSRegularExpression(
+        pattern: #"registered images\s*:\s*(\d+)\b"#,
+        options: [.caseInsensitive]
+    )
+    private static let imagesTotalRegex = try! NSRegularExpression(
+        pattern: #"(?:^|\])\s*images\s*:\s*(\d+)\b"#,
+        options: [.caseInsensitive]
+    )
+    private static let reprojectionRegex = try! NSRegularExpression(
+        pattern: #"mean reprojection error\s*:\s*([-+]?\d*\.?\d+(?:[eE][-+]?\d+)?)"#,
+        options: [.caseInsensitive]
+    )
+    private static let pointsRegex = try! NSRegularExpression(
+        pattern: #"(?:^|\])\s*points\s*:\s*(\d+)\b"#,
+        options: [.caseInsensitive]
+    )
+    private static let observationsRegex = try! NSRegularExpression(
+        pattern: #"observations\s*:\s*(\d+)\b"#,
+        options: [.caseInsensitive]
+    )
+    private static let trackLengthRegex = try! NSRegularExpression(
+        pattern: #"mean track length\s*:\s*([-+]?\d*\.?\d+(?:[eE][-+]?\d+)?)"#,
+        options: [.caseInsensitive]
+    )
+
     public static func parseModelAnalyzerOutput(_ text: String) -> ReconstructionScore {
         var registered: Int?
         var total: Int?
@@ -37,62 +121,34 @@ public enum ReconstructionScorer {
         let lines = text.split(separator: "\n", omittingEmptySubsequences: false)
         for line in lines {
             let lineText = String(line)
-            if let match = firstMatch(
-                pattern: #"registered images\s*:\s*(\d+)\s*/\s*(\d+)"#,
-                in: lineText,
-                captureCount: 2
-            ) {
+            if let match = firstMatch(regex: registeredImagesPairRegex, in: lineText, captureCount: 2) {
                 registered = Int(match[0])
                 total = Int(match[1])
                 continue
             }
 
-            if let match = firstMatch(
-                pattern: #"registered images\s*:\s*(\d+)\b"#,
-                in: lineText,
-                captureCount: 1
-            ) {
+            if let match = firstMatch(regex: registeredImagesSingleRegex, in: lineText, captureCount: 1) {
                 registered = Int(match[0])
             }
 
             if !lineText.lowercased().contains("registered images"),
-               let match = firstMatch(
-                   pattern: #"(?:^|\])\s*images\s*:\s*(\d+)\b"#,
-                   in: lineText,
-                   captureCount: 1
-               ) {
+               let match = firstMatch(regex: imagesTotalRegex, in: lineText, captureCount: 1) {
                 total = Int(match[0])
             }
 
-            if let match = firstMatch(
-                pattern: #"mean reprojection error\s*:\s*([-+]?\d*\.?\d+(?:[eE][-+]?\d+)?)"#,
-                in: lineText,
-                captureCount: 1
-            ) {
+            if let match = firstMatch(regex: reprojectionRegex, in: lineText, captureCount: 1) {
                 reprojection = Double(match[0])
             }
 
-            if let match = firstMatch(
-                pattern: #"(?:^|\])\s*points\s*:\s*(\d+)\b"#,
-                in: lineText,
-                captureCount: 1
-            ) {
+            if let match = firstMatch(regex: pointsRegex, in: lineText, captureCount: 1) {
                 points = Int(match[0])
             }
 
-            if let match = firstMatch(
-                pattern: #"observations\s*:\s*(\d+)\b"#,
-                in: lineText,
-                captureCount: 1
-            ) {
+            if let match = firstMatch(regex: observationsRegex, in: lineText, captureCount: 1) {
                 observations = Int(match[0])
             }
 
-            if let match = firstMatch(
-                pattern: #"mean track length\s*:\s*([-+]?\d*\.?\d+(?:[eE][-+]?\d+)?)"#,
-                in: lineText,
-                captureCount: 1
-            ) {
+            if let match = firstMatch(regex: trackLengthRegex, in: lineText, captureCount: 1) {
                 meanTrackLength = Double(match[0])
             }
         }
@@ -147,8 +203,11 @@ public enum ReconstructionScorer {
             reprojText = "n/a"
         }
         var summary = "registered \(score.registeredImages)/\(score.totalImages) (\(percentText)%), mean reprojection error \(reprojText)"
-        if let points = score.pointCount, let observations = score.observationCount {
-            summary += ", points \(points), observations \(observations)"
+        if let points = score.pointCount {
+            summary += ", points \(points)"
+            if let observations = score.observationCount {
+                summary += ", observations \(observations)"
+            }
         }
         if let meanTrackLength = score.meanTrackLength {
             summary += ", mean track length \(String(format: "%.2f", meanTrackLength))"
@@ -156,10 +215,7 @@ public enum ReconstructionScorer {
         return summary
     }
 
-    private static func firstMatch(pattern: String, in text: String, captureCount: Int) -> [String]? {
-        guard let regex = try? NSRegularExpression(pattern: pattern, options: [.caseInsensitive]) else {
-            return nil
-        }
+    private static func firstMatch(regex: NSRegularExpression, in text: String, captureCount: Int) -> [String]? {
         let range = NSRange(text.startIndex..<text.endIndex, in: text)
         guard let match = regex.firstMatch(in: text, options: [], range: range) else {
             return nil
@@ -175,5 +231,16 @@ public enum ReconstructionScorer {
             captures.append(String(text[swiftRange]))
         }
         return captures
+    }
+
+    private static func isColmapImagePoseRow(_ line: String) -> Bool {
+        let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty, !trimmed.hasPrefix("#") else { return false }
+        let parts = trimmed.split(maxSplits: 9, whereSeparator: \.isWhitespace)
+        guard parts.count >= 10 else { return false }
+        guard Int(parts[0]) != nil else { return false }
+        guard parts[1..<9].allSatisfy({ Double(String($0)) != nil }) else { return false }
+        guard Int(parts[8]) != nil else { return false }
+        return String(parts[9]).rangeOfCharacter(from: .letters) != nil
     }
 }

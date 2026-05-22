@@ -106,5 +106,43 @@ final class ReconstructionScorerTests: XCTestCase {
         XCTAssertEqual(adjusted.totalImages, 60)
         XCTAssertFalse(ReconstructionScorer.isAcceptable(adjusted, mode: .object))
     }
+
+    func testParseSparseTextModelCountsFeedForwardOutputWithoutTracks() throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        try """
+        # Camera list
+        1 SIMPLE_PINHOLE 640 480 500 320 240
+        """.write(to: root.appendingPathComponent("cameras.txt"), atomically: true, encoding: .utf8)
+
+        try """
+        # Image list with two lines per image:
+        1 1 0 0 0 0 0 0 1 frame_000001.jpg
+
+        2 1 0 0 0 1 0 0 1 frame_000002.jpg
+
+        """.write(to: root.appendingPathComponent("images.txt"), atomically: true, encoding: .utf8)
+
+        try """
+        # Point list
+        1 0 0 0 128 128 128 1.0
+        2 1 0 0 128 128 128 1.0
+        """.write(to: root.appendingPathComponent("points3D.txt"), atomically: true, encoding: .utf8)
+
+        let score = try XCTUnwrap(ReconstructionScorer.parseSparseTextModel(
+            at: root,
+            expectedTotalImages: 2
+        ))
+
+        XCTAssertEqual(score.registeredImages, 2)
+        XCTAssertEqual(score.totalImages, 2)
+        XCTAssertEqual(score.pointCount, 2)
+        XCTAssertNil(score.observationCount)
+        XCTAssertNil(score.meanTrackLength)
+        XCTAssertTrue(ReconstructionScorer.summary(score).contains("points 2"))
+    }
 }
 #endif

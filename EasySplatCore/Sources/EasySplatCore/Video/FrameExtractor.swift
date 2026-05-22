@@ -59,6 +59,11 @@ public struct FrameExtractionOptions: Sendable {
     }
 }
 
+struct CappedExtractionSlot: Sendable {
+    let preferredTime: Double
+    let candidateTimes: [Double]
+}
+
 public final class FrameExtractor {
     public enum ExtractionError: Error {
         case invalidVideo
@@ -93,6 +98,21 @@ public final class FrameExtractor {
 
         progress(0.0, "Extracting frames (analyzing video)")
 
+        if Self.shouldUseCappedRandomAccessExtraction(
+            options: options,
+            duration: durationSeconds,
+            videoFPS: videoFPS
+        ) {
+            return try await extractCappedFrames(
+                from: asset,
+                duration: durationSeconds,
+                videoFPS: videoFPS,
+                to: outputDir,
+                options: options,
+                progress: progress
+            )
+        }
+
         let reader = try AVAssetReader(asset: asset)
         let outputSettings: [String: Any] = [
             kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA
@@ -115,7 +135,8 @@ public final class FrameExtractor {
         let errorState = WriteErrorState()
 
         var bufferFrames: [Int: CGImage] = [:]
-        var bufferScores: [(index: Int, sharpness: Double)] = []
+        var bufferCandidates: [SmartFrameCandidate] = []
+        var recentHashes: [UInt64] = []
         var lastSelectedIndex = -999
         var savedCount = 0
         var outputURLs: [URL] = []
@@ -129,17 +150,18 @@ public final class FrameExtractor {
         }
 
         func flushBatch() {
-            guard !bufferScores.isEmpty else { return }
+            guard !bufferCandidates.isEmpty else { return }
             if reachedExtractionLimit() {
-                bufferScores.removeAll(keepingCapacity: true)
+                bufferCandidates.removeAll(keepingCapacity: true)
                 bufferFrames.removeAll(keepingCapacity: true)
                 return
             }
             let result = SmartFrameSelection.selectBatch(
-                scores: bufferScores,
+                candidates: bufferCandidates,
                 config: selectionConfig,
                 fps: videoFPS,
-                lastSelectedIndex: &lastSelectedIndex
+                lastSelectedIndex: &lastSelectedIndex,
+                recentHashes: &recentHashes
             )
             let remaining = options.maxExtractedFrames.map { max(0, $0 - savedCount) } ?? Int.max
             for index in result.selectedIndices.prefix(remaining) {
@@ -158,7 +180,7 @@ public final class FrameExtractor {
                 }
                 savedCount += 1
             }
-            bufferScores.removeAll(keepingCapacity: true)
+            bufferCandidates.removeAll(keepingCapacity: true)
             bufferFrames.removeAll(keepingCapacity: true)
         }
 
@@ -170,7 +192,15 @@ public final class FrameExtractor {
                     let score = FrameScoring.scoreFrame(cgImage: cgImage)
                     let sharpness = max(score.blurScore, score.laplacianScore)
                     bufferFrames[frameIndex] = cgImage
-                    bufferScores.append((index: frameIndex, sharpness: sharpness))
+                    bufferCandidates.append(
+                        SmartFrameCandidate(
+                            index: frameIndex,
+                            sharpness: sharpness,
+                            brightness: score.brightness,
+                            clippedFraction: score.clippedFraction,
+                            dHash: score.dHash
+                        )
+                    )
                 }
             }
 
@@ -221,6 +251,137 @@ public final class FrameExtractor {
         return outputURLs
     }
 
+    private func extractCappedFrames(
+        from asset: AVAsset,
+        duration: Double,
+        videoFPS: Double,
+        to outputDir: URL,
+        options: FrameExtractionOptions,
+        progress: @escaping @Sendable (Double, String) -> Void
+    ) async throws -> [URL] {
+        let slots = Self.cappedExtractionSlots(options: options, duration: duration, videoFPS: videoFPS)
+        guard !slots.isEmpty else { throw ExtractionError.extractionFailed }
+
+        let generator = AVAssetImageGenerator(asset: asset)
+        generator.appliesPreferredTrackTransform = true
+        if options.maxDimension > 0 {
+            generator.maximumSize = CGSize(width: options.maxDimension, height: options.maxDimension)
+        }
+        let tolerance = CMTime(seconds: max(1.0 / max(videoFPS, 1.0), 0.05), preferredTimescale: 600)
+        generator.requestedTimeToleranceBefore = tolerance
+        generator.requestedTimeToleranceAfter = tolerance
+
+        var outputURLs: [URL] = []
+        outputURLs.reserveCapacity(slots.count)
+        var recentHashes: [UInt64] = []
+        var lastSelectedFrameIndex = Int.min / 2
+        let minimumFrameDistance = Self.cappedMinimumFrameDistance(options: options, videoFPS: videoFPS)
+        let selectionConfig = SmartFrameSelectionConfig(
+            targetFPS: options.targetFPS,
+            minDistanceRatio: options.minDistanceRatio,
+            sharpnessFloor: options.sharpnessFloor,
+            sharpnessRatio: options.sharpnessRatio
+        )
+        let fitnessScale = max(1, Int(round(videoFPS)))
+        var lastError: Error?
+
+        for (slotIndex, slot) in slots.enumerated() {
+            try Task.checkCancellation()
+            var slotCandidates: [(image: CGImage, candidate: SmartFrameCandidate)] = []
+            slotCandidates.reserveCapacity(slot.candidateTimes.count)
+
+            for seconds in slot.candidateTimes {
+                do {
+                    let time = CMTime(seconds: seconds, preferredTimescale: 600)
+                    let generated = try await Self.generateCGImage(generator: generator, at: time)
+                    let score = FrameScoring.scoreFrame(cgImage: generated.image)
+                    let sharpness = max(score.blurScore, score.laplacianScore)
+                    let actualSeconds = CMTimeGetSeconds(generated.actualTime)
+                    let frameSeconds = actualSeconds.isFinite ? actualSeconds : seconds
+                    let candidate = SmartFrameCandidate(
+                        index: Self.cappedCandidateFrameIndex(seconds: frameSeconds, videoFPS: videoFPS),
+                        sharpness: sharpness,
+                        brightness: score.brightness,
+                        clippedFraction: score.clippedFraction,
+                        dHash: score.dHash
+                    )
+                    slotCandidates.append((image: generated.image, candidate: candidate))
+                } catch {
+                    lastError = error
+                }
+            }
+
+            let eligibleIndices = Set(
+                SmartFrameSelection.qualityFilteredCandidates(
+                    slotCandidates.map(\.candidate),
+                    config: selectionConfig
+                ).map(\.index)
+            )
+            let pool = slotCandidates.filter {
+                eligibleIndices.contains($0.candidate.index)
+                    && $0.candidate.index - lastSelectedFrameIndex >= minimumFrameDistance
+            }
+            let preferredIndex = Self.cappedCandidateFrameIndex(seconds: slot.preferredTime, videoFPS: videoFPS)
+            let best = pool.max { lhs, rhs in
+                SmartFrameSelection.candidateFitness(
+                    lhs.candidate,
+                    targetIndex: preferredIndex,
+                    orderedCount: fitnessScale,
+                    recentHashes: recentHashes
+                ) < SmartFrameSelection.candidateFitness(
+                    rhs.candidate,
+                    targetIndex: preferredIndex,
+                    orderedCount: fitnessScale,
+                    recentHashes: recentHashes
+                )
+            }
+
+            guard let best else {
+                continue
+            }
+            lastSelectedFrameIndex = best.candidate.index
+            SmartFrameSelection.appendHash(best.candidate.dHash, to: &recentHashes)
+
+            let fileURL = outputDir.appendingPathComponent(
+                String(format: "frame_%06d.%@", outputURLs.count, options.outputFormat.fileExtension)
+            )
+            try Self.writeImage(cgImage: best.image, to: fileURL, format: options.outputFormat)
+            outputURLs.append(fileURL)
+
+            let completed = slotIndex + 1
+            if completed == slots.count || completed % 5 == 0 {
+                let fraction = Double(completed) / Double(slots.count)
+                progress(fraction, "Extracting frames (sampled \(completed)/\(slots.count), selected \(outputURLs.count))")
+            }
+        }
+
+        if outputURLs.isEmpty {
+            if let lastError {
+                throw lastError
+            }
+            throw ExtractionError.extractionFailed
+        }
+
+        progress(1.0, "Extracted \(outputURLs.count) frame(s)")
+        return outputURLs
+    }
+
+    private static func generateCGImage(generator: AVAssetImageGenerator, at time: CMTime) async throws -> (image: CGImage, actualTime: CMTime) {
+        try await withCheckedThrowingContinuation { continuation in
+            generator.generateCGImageAsynchronously(for: time) { image, actualTime, error in
+                if let error {
+                    continuation.resume(throwing: error)
+                    return
+                }
+                guard let image else {
+                    continuation.resume(throwing: ExtractionError.extractionFailed)
+                    return
+                }
+                continuation.resume(returning: (image, actualTime))
+            }
+        }
+    }
+
     private static func effectiveTargetFPS(options: FrameExtractionOptions, duration: Double, videoFPS: Double) -> Int {
         let baseFPS = max(1, options.targetFPS)
         guard duration > 0 else { return baseFPS }
@@ -228,6 +389,51 @@ public final class FrameExtractor {
         let desired = max(Double(baseFPS), fpsForTarget)
         let clamped = min(desired, max(videoFPS, 1.0))
         return max(1, Int(round(clamped)))
+    }
+
+    private static func cappedCandidateFrameIndex(seconds: Double, videoFPS: Double) -> Int {
+        max(0, Int((seconds * max(videoFPS, 1.0)).rounded(.down)))
+    }
+
+    private static func cappedMinimumFrameDistance(options: FrameExtractionOptions, videoFPS: Double) -> Int {
+        max(0, Int((max(videoFPS, 1.0) * options.minDistanceRatio).rounded(.up)))
+    }
+
+    private static func shouldUseCappedRandomAccessExtraction(
+        options: FrameExtractionOptions,
+        duration: Double,
+        videoFPS: Double
+    ) -> Bool {
+        guard let cap = options.maxExtractedFrames, cap > 0, duration > 0 else { return false }
+        let totalFramesEstimate = max(1, Int(round(duration * max(videoFPS, 1.0))))
+        return cap < totalFramesEstimate
+    }
+
+    private static func cappedExtractionSlots(
+        options: FrameExtractionOptions,
+        duration: Double,
+        videoFPS: Double
+    ) -> [CappedExtractionSlot] {
+        guard let cap = options.maxExtractedFrames, cap > 0, duration > 0 else { return [] }
+        let totalFramesEstimate = max(1, Int(round(duration * max(videoFPS, 1.0))))
+        let slotCount = max(1, min(cap, totalFramesEstimate))
+        let binDuration = duration / Double(slotCount)
+        let frameInterval = 1.0 / max(videoFPS, 1.0)
+        let neighborhood = max(frameInterval, min(0.5, binDuration * 0.20))
+        let maxCandidateTime = max(0, duration - frameInterval)
+
+        return (0..<slotCount).map { index in
+            let preferred = duration * (Double(index) + 0.5) / Double(slotCount)
+            let rawTimes = [preferred - neighborhood, preferred, preferred + neighborhood]
+            var seen = Set<Int>()
+            let candidates = rawTimes.compactMap { value -> Double? in
+                let clamped = min(max(0, value), maxCandidateTime)
+                let bucket = Int((clamped * 600).rounded())
+                guard seen.insert(bucket).inserted else { return nil }
+                return clamped
+            }
+            return CappedExtractionSlot(preferredTime: preferred, candidateTimes: candidates)
+        }
     }
 
     private static func makeCGImage(
@@ -297,6 +503,14 @@ private final class WriteErrorState: @unchecked Sendable {
 extension FrameExtractor {
     static func test_effectiveTargetFPS(options: FrameExtractionOptions, duration: Double, videoFPS: Double) -> Int {
         effectiveTargetFPS(options: options, duration: duration, videoFPS: videoFPS)
+    }
+
+    static func test_cappedExtractionSlots(options: FrameExtractionOptions, duration: Double, videoFPS: Double) -> [CappedExtractionSlot] {
+        cappedExtractionSlots(options: options, duration: duration, videoFPS: videoFPS)
+    }
+
+    static func test_cappedCandidateFrameIndices(for slot: CappedExtractionSlot, videoFPS: Double) -> [Int] {
+        slot.candidateTimes.map { cappedCandidateFrameIndex(seconds: $0, videoFPS: videoFPS) }
     }
 
 }

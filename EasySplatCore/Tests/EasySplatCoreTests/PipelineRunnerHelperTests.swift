@@ -1015,6 +1015,29 @@ final class PipelineRunnerHelperTests: XCTestCase {
         }
     }
 
+    func testVggtDirectMinimumSparsePointsClampsToMaxPoints() async throws {
+        let root = try TestFileBuilder.makeTempDir()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let runner = makeRunner(projectURL: root)
+        let score = ReconstructionScore(
+            registeredImages: 500,
+            totalImages: 500,
+            meanReprojectionError: nil,
+            pointCount: 150_000,
+            observationCount: 300_000,
+            meanTrackLength: 2.0
+        )
+
+        let reason = runner.test_vggtDirectQualityFailureReason(
+            score: score,
+            selectedFrameCount: 500,
+            mode: .object,
+            maxPoints: 150_000
+        )
+
+        XCTAssertNil(reason)
+    }
+
     func testMapAnythingExecutionPlanDisablesDirectOnLowTier() async throws {
         let root = try TestFileBuilder.makeTempDir()
         defer { try? FileManager.default.removeItem(at: root) }
