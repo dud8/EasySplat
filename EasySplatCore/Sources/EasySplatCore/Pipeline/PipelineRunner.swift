@@ -4,7 +4,6 @@ public final class PipelineRunner: @unchecked Sendable {
 
     public struct Tooling {
         public var colmap: ColmapRunner
-        public var glomap: GlomapRunner
         public var brush: BrushRunner
         public var msplat: MsplatRunner
         public var da3Sfm: Da3SfmRunning
@@ -13,7 +12,6 @@ public final class PipelineRunner: @unchecked Sendable {
         public var fastVggtSfm: FastVggtSfmRunning
 
         public init(colmap: ColmapRunner = ColmapRunner(),
-                    glomap: GlomapRunner = GlomapRunner(),
                     brush: BrushRunner = BrushRunner(),
                     msplat: MsplatRunner = MsplatRunner(),
                     da3Sfm: Da3SfmRunning = Da3SfmRunner(),
@@ -21,7 +19,6 @@ public final class PipelineRunner: @unchecked Sendable {
                     vggtSfm: VggtSfmRunning = VggtSfmRunner(),
                     fastVggtSfm: FastVggtSfmRunning = FastVggtSfmRunner()) {
             self.colmap = colmap
-            self.glomap = glomap
             self.brush = brush
             self.msplat = msplat
             self.da3Sfm = da3Sfm
@@ -32,7 +29,6 @@ public final class PipelineRunner: @unchecked Sendable {
 
         public init(runner: SubprocessRunning) {
             self.colmap = ColmapRunner(runner: runner)
-            self.glomap = GlomapRunner(runner: runner)
             self.brush = BrushRunner(runner: runner)
             self.msplat = MsplatRunner(runner: runner)
             self.da3Sfm = Da3SfmRunner(runner: runner)
@@ -219,6 +215,10 @@ public final class PipelineRunner: @unchecked Sendable {
         }
 
         func markStageComplete(_ stage: PipelineStage) {
+            if stage == .sfmMapping,
+               case let .sfmMapping(checkpoint)? = metadata.checkpoint?.details {
+                metadata.completedSfmMapping = checkpoint
+            }
             metadata.state = PipelineState(stage: stage, attempt: metadata.state.attempt, lastError: nil, resumeToken: nil)
             metadata.checkpoint = nil
             try? ProjectMetadataStore.save(metadata, to: paths.metadataURL)
@@ -502,7 +502,7 @@ public final class PipelineRunner: @unchecked Sendable {
             let backendOverride = sfmBackendOverride()
             let da3WindowSize = da3WindowSizePreference(hardwareTier: detectedHardwareProfile.tier)
             var backendOrder = sfmBackendFallbackOrder(override: backendOverride)
-            if let backendOverride, backendOverride == .fastvggt || backendOverride == .vggt {
+            if let backendOverride, backendOverride == .fastvggt {
                 emit(.stageLog(
                     stage: .sfmFeatures,
                     line: "Deprecated SfM backend override '\(backendOverride.rawValue)' is enabled. Fast defaults to COLMAP; other profiles use DA3 with MapAnything and COLMAP fallback.",
@@ -1271,83 +1271,6 @@ public final class PipelineRunner: @unchecked Sendable {
                                 )
                                 lastUsedSequentialMatcher = useSequential
 
-                                final class MatchingProgressState: @unchecked Sendable {
-                                    private let lock = NSLock()
-                                    private var latestBlockMessage: String?
-
-                                    func updateBlockMessage(_ message: String) {
-                                        lock.lock()
-                                        latestBlockMessage = message
-                                        lock.unlock()
-                                    }
-
-                                    func blockMessage() -> String? {
-                                        lock.lock()
-                                        defer { lock.unlock() }
-                                        return latestBlockMessage
-                                    }
-                                }
-
-                                func runMatcherWithProgress(
-                                    expectedPairs: Int,
-                                    run: @escaping (@escaping @Sendable (String, Bool) -> Void) async throws -> Void
-                                ) async throws {
-                                    let state = MatchingProgressState()
-                                    let blockProgress = ColmapMatchingProgressTracker()
-                                    let onLog: @Sendable (String, Bool) -> Void = { line, isErr in
-                                        colmapToolLog.append(stream: isErr ? "stderr" : "stdout", line: line)
-                                        let sanitized = Self.sanitizeToolLogLine(line)
-                                        let effectiveIsErr = Self.normalizedToolLogIsError(sanitized, isError: isErr)
-                                        if Self.shouldEmitToolLogLine(sanitized, isError: effectiveIsErr) {
-                                            emit(.stageLog(stage: .sfmMatching, line: sanitized, isError: effectiveIsErr))
-                                        }
-                                        if let update = blockProgress.ingest(line) {
-                                            state.updateBlockMessage(update.message)
-                                        }
-                                    }
-
-                                    let poller = ColmapDatabaseProgressPoller(databasePath: paths.colmapDatabaseURL)
-                                    let pollTask = Task.detached(priority: .utility) { [expectedPairs, poller, state, emit] in
-                                        let denom = max(1, expectedPairs)
-                                        var lastFraction: Double = 0
-                                        var lastProcessed = -1
-                                        var lastEmit = Date.distantPast
-
-                                        while !Task.isCancelled {
-                                            var processed = (try? poller.readProcessedPairCount()) ?? 0
-                                            if lastProcessed >= 0, processed < lastProcessed {
-                                                processed = lastProcessed
-                                            }
-                                            let rawFraction = Double(processed) / Double(denom)
-                                            let clamped = max(0, min(0.99, rawFraction))
-                                            if clamped > lastFraction {
-                                                lastFraction = clamped
-                                            }
-
-                                            let now = Date()
-                                            let shouldEmitZeroHeartbeat = processed == 0 && now.timeIntervalSince(lastEmit) >= 10
-                                            if processed != lastProcessed || shouldEmitZeroHeartbeat {
-                                                lastProcessed = processed
-                                                lastEmit = now
-                                                let base = state.blockMessage()
-                                                let message: String
-                                                if let base {
-                                                    message = "\(base), pairs \(processed)/\(denom)"
-                                                } else {
-                                                    message = "Matching views (pairs \(processed)/\(denom))"
-                                                }
-                                                let scaledFraction = min(0.99, 0.30 + (lastFraction * 0.69))
-                                                emit(.stageProgress(stage: .sfmMatching, fraction: scaledFraction, message: message))
-                                            }
-
-                                            try? await Task.sleep(for: .seconds(1))
-                                        }
-                                    }
-                                    defer { pollTask.cancel() }
-
-                                    try await run(onLog)
-                                }
-
                                 func runSequentialMatcher() async throws {
                                     let expected = ColmapPairEstimator.expectedSequentialPairs(
                                         imageCount: selectedFrames.count,
@@ -1358,14 +1281,24 @@ public final class PipelineRunner: @unchecked Sendable {
                                         line: "MapAnything refinement matching: sequential matcher (target pairs ≈ \(expected)).",
                                         isError: false
                                     ))
-                                    try await runMatcherWithProgress(expectedPairs: expected) { onLog in
-                                        try await self.tooling.colmap.runMatcherSequential(
-                                            colmapPath: self.config.toolchain.colmap,
-                                            database: paths.colmapDatabaseURL,
-                                            options: mapColmapMatchOptions,
-                                            onLog: onLog
-                                        )
-                                    }
+                                    try await self.runColmapMatcherAttempt(
+                                        stage: .sfmMatching,
+                                        paths: paths,
+                                        colmapToolLog: colmapToolLog,
+                                        expectedPairs: expected,
+                                        progressStart: 0.30,
+                                        progressSpan: 0.69,
+                                        blockMessageFallback: "Matching views",
+                                        invokeMatcher: { onLog in
+                                            try await self.tooling.colmap.runMatcherSequential(
+                                                colmapPath: self.config.toolchain.colmap,
+                                                database: paths.colmapDatabaseURL,
+                                                options: mapColmapMatchOptions,
+                                                onLog: onLog
+                                            )
+                                        },
+                                        emit: emit
+                                    )
                                 }
 
                                 func runExhaustiveMatcher() async throws {
@@ -1375,14 +1308,24 @@ public final class PipelineRunner: @unchecked Sendable {
                                         line: "MapAnything refinement matching: exhaustive matcher (target pairs ≈ \(expected)).",
                                         isError: false
                                     ))
-                                    try await runMatcherWithProgress(expectedPairs: expected) { onLog in
-                                        try await self.tooling.colmap.runMatcherExhaustive(
-                                            colmapPath: self.config.toolchain.colmap,
-                                            database: paths.colmapDatabaseURL,
-                                            options: mapColmapMatchOptions,
-                                            onLog: onLog
-                                        )
-                                    }
+                                    try await self.runColmapMatcherAttempt(
+                                        stage: .sfmMatching,
+                                        paths: paths,
+                                        colmapToolLog: colmapToolLog,
+                                        expectedPairs: expected,
+                                        progressStart: 0.30,
+                                        progressSpan: 0.69,
+                                        blockMessageFallback: "Matching views",
+                                        invokeMatcher: { onLog in
+                                            try await self.tooling.colmap.runMatcherExhaustive(
+                                                colmapPath: self.config.toolchain.colmap,
+                                                database: paths.colmapDatabaseURL,
+                                                options: mapColmapMatchOptions,
+                                                onLog: onLog
+                                            )
+                                        },
+                                        emit: emit
+                                    )
                                 }
 
                                 do {
@@ -1975,83 +1918,6 @@ public final class PipelineRunner: @unchecked Sendable {
                             )
                             lastUsedSequentialMatcher = useSequential
 
-                            final class MatchingProgressState: @unchecked Sendable {
-                                private let lock = NSLock()
-                                private var latestBlockMessage: String?
-
-                                func updateBlockMessage(_ message: String) {
-                                    lock.lock()
-                                    latestBlockMessage = message
-                                    lock.unlock()
-                                }
-
-                                func blockMessage() -> String? {
-                                    lock.lock()
-                                    defer { lock.unlock() }
-                                    return latestBlockMessage
-                                }
-                            }
-
-                            func runMatcherWithProgress(
-                                expectedPairs: Int,
-                                run: @escaping (@escaping @Sendable (String, Bool) -> Void) async throws -> Void
-                            ) async throws {
-                                let state = MatchingProgressState()
-                                let blockProgress = ColmapMatchingProgressTracker()
-                                let onLog: @Sendable (String, Bool) -> Void = { line, isErr in
-                                    colmapToolLog.append(stream: isErr ? "stderr" : "stdout", line: line)
-                                    let sanitized = Self.sanitizeToolLogLine(line)
-                                    let effectiveIsErr = Self.normalizedToolLogIsError(sanitized, isError: isErr)
-                                    if Self.shouldEmitToolLogLine(sanitized, isError: effectiveIsErr) {
-                                        emit(.stageLog(stage: .sfmMatching, line: sanitized, isError: effectiveIsErr))
-                                    }
-                                    if let update = blockProgress.ingest(line) {
-                                        state.updateBlockMessage(update.message)
-                                    }
-                                }
-
-                                let poller = ColmapDatabaseProgressPoller(databasePath: paths.colmapDatabaseURL)
-                                let pollTask = Task.detached(priority: .utility) { [expectedPairs, poller, state, emit] in
-                                    let denom = max(1, expectedPairs)
-                                    var lastFraction: Double = 0
-                                    var lastProcessed = -1
-                                    var lastEmit = Date.distantPast
-
-                                    while !Task.isCancelled {
-                                        var processed = (try? poller.readProcessedPairCount()) ?? 0
-                                        if lastProcessed >= 0, processed < lastProcessed {
-                                            processed = lastProcessed
-                                        }
-                                        let rawFraction = Double(processed) / Double(denom)
-                                        let clamped = max(0, min(0.99, rawFraction))
-                                        if clamped > lastFraction {
-                                            lastFraction = clamped
-                                        }
-
-                                        let now = Date()
-                                        let shouldEmitZeroHeartbeat = processed == 0 && now.timeIntervalSince(lastEmit) >= 10
-                                        if processed != lastProcessed || shouldEmitZeroHeartbeat {
-                                            lastProcessed = processed
-                                            lastEmit = now
-                                            let base = state.blockMessage()
-                                            let message: String
-                                            if let base {
-                                                message = "\(base), pairs \(processed)/\(denom)"
-                                            } else {
-                                                message = "Matching views (pairs \(processed)/\(denom))"
-                                            }
-                                            let scaledFraction = min(0.99, 0.30 + (lastFraction * 0.69))
-                                            emit(.stageProgress(stage: .sfmMatching, fraction: scaledFraction, message: message))
-                                        }
-
-                                        try? await Task.sleep(for: .seconds(1))
-                                    }
-                                }
-                                defer { pollTask.cancel() }
-
-                                try await run(onLog)
-                            }
-
                             func runSequentialMatcher() async throws {
                                 let expected = ColmapPairEstimator.expectedSequentialPairs(
                                     imageCount: selectedFrames.count,
@@ -2062,14 +1928,24 @@ public final class PipelineRunner: @unchecked Sendable {
                                     line: "FastVGGT refinement matching: sequential matcher (target pairs ≈ \(expected)).",
                                     isError: false
                                 ))
-                                try await runMatcherWithProgress(expectedPairs: expected) { onLog in
-                                    try await self.tooling.colmap.runMatcherSequential(
-                                        colmapPath: self.config.toolchain.colmap,
-                                        database: paths.colmapDatabaseURL,
-                                        options: fastColmapMatchOptions,
-                                        onLog: onLog
-                                    )
-                                }
+                                try await self.runColmapMatcherAttempt(
+                                    stage: .sfmMatching,
+                                    paths: paths,
+                                    colmapToolLog: colmapToolLog,
+                                    expectedPairs: expected,
+                                    progressStart: 0.30,
+                                    progressSpan: 0.69,
+                                    blockMessageFallback: "Matching views",
+                                    invokeMatcher: { onLog in
+                                        try await self.tooling.colmap.runMatcherSequential(
+                                            colmapPath: self.config.toolchain.colmap,
+                                            database: paths.colmapDatabaseURL,
+                                            options: fastColmapMatchOptions,
+                                            onLog: onLog
+                                        )
+                                    },
+                                    emit: emit
+                                )
                             }
 
                             func runExhaustiveMatcher() async throws {
@@ -2079,14 +1955,24 @@ public final class PipelineRunner: @unchecked Sendable {
                                     line: "FastVGGT refinement matching: exhaustive matcher (target pairs ≈ \(expected)).",
                                     isError: false
                                 ))
-                                try await runMatcherWithProgress(expectedPairs: expected) { onLog in
-                                    try await self.tooling.colmap.runMatcherExhaustive(
-                                        colmapPath: self.config.toolchain.colmap,
-                                        database: paths.colmapDatabaseURL,
-                                        options: fastColmapMatchOptions,
-                                        onLog: onLog
-                                    )
-                                }
+                                try await self.runColmapMatcherAttempt(
+                                    stage: .sfmMatching,
+                                    paths: paths,
+                                    colmapToolLog: colmapToolLog,
+                                    expectedPairs: expected,
+                                    progressStart: 0.30,
+                                    progressSpan: 0.69,
+                                    blockMessageFallback: "Matching views",
+                                    invokeMatcher: { onLog in
+                                        try await self.tooling.colmap.runMatcherExhaustive(
+                                            colmapPath: self.config.toolchain.colmap,
+                                            database: paths.colmapDatabaseURL,
+                                            options: fastColmapMatchOptions,
+                                            onLog: onLog
+                                        )
+                                    },
+                                    emit: emit
+                                )
                             }
 
                             do {
@@ -2486,6 +2372,7 @@ public final class PipelineRunner: @unchecked Sendable {
                     } else if backendPolicy == .vggt {
                 let fm = FileManager.default
                 let sparseZero = paths.colmapSparseURL.appendingPathComponent("0", isDirectory: true)
+                let vggtMaxPoints = vggtMaxPointsValue(preset: metadata.preset, autoTune: autoTuneProfile)
 
                 // VGGT produces a COLMAP-format sparse model directly (no database/matching/mapping).
                 if try shouldRunStage(.sfmFeatures) {
@@ -2526,7 +2413,7 @@ public final class PipelineRunner: @unchecked Sendable {
                         ),
                         vggtFixedResolution: vggtFixedResolutionValue(autoTune: autoTuneProfile),
                         confidenceThreshold: vggtConfidenceThresholdPreference(),
-                        maxPoints: vggtMaxPointsValue(preset: metadata.preset, autoTune: autoTuneProfile),
+                        maxPoints: vggtMaxPoints,
                         useBundleAdjustment: useBA,
                         maxReprojectionError: vggtMaxReprojectionErrorPreference(),
                         sharedCamera: vggtSharedCameraPreference(),
@@ -2653,6 +2540,31 @@ public final class PipelineRunner: @unchecked Sendable {
                     guard sparseModelFilesExist(at: sparseZero) else {
                         throw PipelineError.outputMissing
                     }
+                    guard let score = ReconstructionScorer.parseSparseTextModel(
+                        at: sparseZero,
+                        expectedTotalImages: selectedFrames.count
+                    ) else {
+                        throw PipelineError.outputMissing
+                    }
+                    emit(.stageLog(
+                        stage: .sfmMapping,
+                        line: "VGGT sparse score: \(ReconstructionScorer.summary(score)).",
+                        isError: false
+                    ))
+                    if let failureReason = vggtDirectQualityFailureReason(
+                        score: score,
+                        selectedFrameCount: selectedFrames.count,
+                        mode: metadata.preset.mode,
+                        maxPoints: vggtMaxPoints
+                    ) {
+                        emit(.stageLog(
+                            stage: .sfmMapping,
+                            line: "VGGT sparse model rejected: \(failureReason).",
+                            isError: true
+                        ))
+                        throw PipelineError.lowQualityReconstruction(score)
+                    }
+                    acceptedReconstructionScore = score
                     writeCheckpoint(
                         stage: .sfmMapping,
                         progress: 1.0,
@@ -2660,7 +2572,7 @@ public final class PipelineRunner: @unchecked Sendable {
                         details: .sfmMapping(SfmMappingCheckpoint(
                             mapper: "vggt",
                             sparsePath: sparseZero.path,
-                            registeredImages: nil
+                            registeredImages: score.registeredImages
                         ))
                     )
                     emit(.stageLog(stage: .sfmMapping, line: "VGGT produced sparse model; skipping mapping.", isError: false))
@@ -2774,111 +2686,54 @@ public final class PipelineRunner: @unchecked Sendable {
                     forceExhaustive: forceExhaustiveMatching
                 )
 
-                final class MatchingProgressState: @unchecked Sendable {
-                    private let lock = NSLock()
-                    private var latestBlockMessage: String?
-
-                    func updateBlockMessage(_ message: String) {
-                        lock.lock()
-                        latestBlockMessage = message
-                        lock.unlock()
-                    }
-
-                    func blockMessage() -> String? {
-                        lock.lock()
-                        defer { lock.unlock() }
-                        return latestBlockMessage
-                    }
-                }
-
                 let exhaustiveFallbackMaxFrames = 60
                 lastUsedSequentialMatcher = useSequential
-
-                func runMatcherWithProgress(
-                    expectedPairs: Int,
-                    run: @escaping (@escaping @Sendable (String, Bool) -> Void) async throws -> Void
-                ) async throws {
-                    let state = MatchingProgressState()
-                    let blockProgress = ColmapMatchingProgressTracker()
-                    let onLog: @Sendable (String, Bool) -> Void = { line, isErr in
-                        colmapToolLog.append(stream: isErr ? "stderr" : "stdout", line: line)
-                        let sanitized = Self.sanitizeToolLogLine(line)
-                        let effectiveIsErr = Self.normalizedToolLogIsError(sanitized, isError: isErr)
-                        if Self.shouldEmitToolLogLine(sanitized, isError: effectiveIsErr) {
-                            emit(.stageLog(stage: .sfmMatching, line: sanitized, isError: effectiveIsErr))
-                        }
-                        if let update = blockProgress.ingest(line) {
-                            state.updateBlockMessage(update.message)
-                        }
-                    }
-
-                    let poller = ColmapDatabaseProgressPoller(databasePath: paths.colmapDatabaseURL)
-                    let pollTask = Task.detached(priority: .utility) { [expectedPairs, poller, state, emit] in
-                        let denom = max(1, expectedPairs)
-                        var lastFraction: Double = 0
-                        var lastProcessed = -1
-                        var lastEmit = Date.distantPast
-
-                        while !Task.isCancelled {
-                            var processed = (try? poller.readProcessedPairCount()) ?? 0
-                            if lastProcessed >= 0, processed < lastProcessed {
-                                processed = lastProcessed
-                            }
-                            let rawFraction = Double(processed) / Double(denom)
-                            let clamped = max(0, min(0.99, rawFraction))
-                            if clamped > lastFraction {
-                                lastFraction = clamped
-                            }
-
-                            // Emit when we see new pairs, or periodically so the UI can show it's alive.
-                            let now = Date()
-                            let shouldEmitZeroHeartbeat = processed == 0 && now.timeIntervalSince(lastEmit) >= 10
-                            if processed != lastProcessed || shouldEmitZeroHeartbeat {
-                                lastProcessed = processed
-                                lastEmit = now
-                                let base = state.blockMessage()
-                                let message: String
-                                if let base {
-                                    message = "\(base), pairs \(processed)/\(denom)"
-                                } else {
-                                    message = "Matching views (pairs \(processed)/\(denom))"
-                                }
-                                emit(.stageProgress(stage: .sfmMatching, fraction: lastFraction, message: message))
-                            }
-
-                            try? await Task.sleep(for: .seconds(1))
-                        }
-                    }
-                    defer { pollTask.cancel() }
-
-                    try await run(onLog)
-                }
 
                 func runSequential() async throws {
                     let expected = ColmapPairEstimator.expectedSequentialPairs(
                         imageCount: selectedFrames.count,
                         overlap: colmapMatchOptions.sequentialOverlap
                     )
-                    try await runMatcherWithProgress(expectedPairs: expected) { onLog in
-                        try await self.tooling.colmap.runMatcherSequential(
-                            colmapPath: self.config.toolchain.colmap,
-                            database: paths.colmapDatabaseURL,
-                            options: colmapMatchOptions,
-                            onLog: onLog
-                        )
-                    }
+                    try await self.runColmapMatcherAttempt(
+                        stage: .sfmMatching,
+                        paths: paths,
+                        colmapToolLog: colmapToolLog,
+                        expectedPairs: expected,
+                        progressStart: 0.0,
+                        progressSpan: 1.0,
+                        blockMessageFallback: "Matching views",
+                        invokeMatcher: { onLog in
+                            try await self.tooling.colmap.runMatcherSequential(
+                                colmapPath: self.config.toolchain.colmap,
+                                database: paths.colmapDatabaseURL,
+                                options: colmapMatchOptions,
+                                onLog: onLog
+                            )
+                        },
+                        emit: emit
+                    )
                 }
 
                 func runExhaustive() async throws {
                     let expected = ColmapPairEstimator.expectedExhaustivePairs(imageCount: selectedFrames.count)
-                    try await runMatcherWithProgress(expectedPairs: expected) { onLog in
-                        try await self.tooling.colmap.runMatcherExhaustive(
-                            colmapPath: self.config.toolchain.colmap,
-                            database: paths.colmapDatabaseURL,
-                            options: colmapMatchOptions,
-                            onLog: onLog
-                        )
-                    }
+                    try await self.runColmapMatcherAttempt(
+                        stage: .sfmMatching,
+                        paths: paths,
+                        colmapToolLog: colmapToolLog,
+                        expectedPairs: expected,
+                        progressStart: 0.0,
+                        progressSpan: 1.0,
+                        blockMessageFallback: "Matching views",
+                        invokeMatcher: { onLog in
+                            try await self.tooling.colmap.runMatcherExhaustive(
+                                colmapPath: self.config.toolchain.colmap,
+                                database: paths.colmapDatabaseURL,
+                                options: colmapMatchOptions,
+                                onLog: onLog
+                            )
+                        },
+                        emit: emit
+                    )
                 }
 
                 if useSequential {

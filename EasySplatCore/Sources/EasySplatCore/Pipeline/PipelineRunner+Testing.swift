@@ -407,6 +407,20 @@ extension PipelineRunner {
         mapAnythingDirectQualityFailureReason(score: score, mode: mode)
     }
 
+    func test_vggtDirectQualityFailureReason(
+        score: ReconstructionScore,
+        selectedFrameCount: Int,
+        mode: CaptureMode,
+        maxPoints: Int? = nil
+    ) -> String? {
+        vggtDirectQualityFailureReason(
+            score: score,
+            selectedFrameCount: selectedFrameCount,
+            mode: mode,
+            maxPoints: maxPoints
+        )
+    }
+
     func test_sfmMapperPreference() -> String {
         sfmMapperPreference().rawValue
     }

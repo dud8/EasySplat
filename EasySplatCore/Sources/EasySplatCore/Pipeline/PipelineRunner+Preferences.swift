@@ -246,6 +246,15 @@ extension PipelineRunner {
         }
     }
 
+    func vggtDirectMinimumMeanTrackLengthPreference(mode: CaptureMode) -> Double {
+        switch mode {
+        case .room:
+            return 1.20
+        case .object:
+            return 1.15
+        }
+    }
+
     func directSparseQualityFailureReason(
         score: ReconstructionScore,
         mode: CaptureMode,
@@ -423,6 +432,50 @@ extension PipelineRunner {
             return override
         }
         return 518
+    }
+
+    func vggtDirectMinimumSparsePointsPreference(
+        selectedFrameCount: Int,
+        mode: CaptureMode,
+        maxPoints: Int? = nil
+    ) -> Int {
+        let perFrame = mode == .room ? 300 : 500
+        let floor = mode == .room ? 4_000 : 6_000
+        let minimumPointCount = max(floor, max(1, selectedFrameCount) * perFrame)
+        guard let maxPoints, maxPoints > 0 else {
+            return minimumPointCount
+        }
+        return min(minimumPointCount, maxPoints)
+    }
+
+    func vggtDirectQualityFailureReason(
+        score: ReconstructionScore,
+        selectedFrameCount: Int,
+        mode: CaptureMode,
+        maxPoints: Int? = nil
+    ) -> String? {
+        guard ReconstructionScorer.isAcceptable(score, mode: mode) else {
+            return "below the general quality bar"
+        }
+        guard let pointCount = score.pointCount else { return "sparse model did not report sparse point count" }
+        let minimumPointCount = vggtDirectMinimumSparsePointsPreference(
+            selectedFrameCount: selectedFrameCount,
+            mode: mode,
+            maxPoints: maxPoints
+        )
+        if pointCount < minimumPointCount {
+            return "sparse point count \(pointCount) below direct minimum \(minimumPointCount)"
+        }
+        let hasTrackMetrics = score.observationCount != nil || score.meanTrackLength != nil
+        if hasTrackMetrics,
+           let failureReason = directSparseQualityFailureReason(
+               score: score,
+               mode: mode,
+               minimumTrackLength: vggtDirectMinimumMeanTrackLengthPreference(mode: mode)
+           ) {
+            return failureReason
+        }
+        return nil
     }
 
     func vggtConfidenceThresholdPreference() -> Double {

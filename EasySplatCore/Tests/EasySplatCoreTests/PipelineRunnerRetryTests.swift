@@ -330,6 +330,116 @@ final class PipelineRunnerRetryTests: XCTestCase {
         XCTAssertEqual(try runner.test_validateStageOutput(.sfmMapping, paths: paths, metadata: metadata), .corrupt)
     }
 
+    func testValidateStageOutputAcceptsTracklessVggtSparseModel() throws {
+        let root = try TestFileBuilder.makeTempDir()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let paths = ProjectPaths(root: root)
+        try paths.ensureDirectories()
+        let sparse = paths.colmapSparseURL.appendingPathComponent("0", isDirectory: true)
+        try writeTracklessVggtSparseFixture(at: sparse, imageNames: ["frame_000000.jpg", "frame_000001.jpg"], pointCount: 256)
+
+        let metadata = ProjectMetadata(
+            title: "Test",
+            input: .photos(folder: "/tmp/Photos"),
+            preset: PresetSpec(mode: .object, quality: .draft),
+            checkpoint: PipelineCheckpoint(
+                stage: .sfmMapping,
+                details: .sfmMapping(SfmMappingCheckpoint(
+                    mapper: "vggt",
+                    sparsePath: sparse.path,
+                    registeredImages: 2
+                ))
+            )
+        )
+        let runner = makeRunner(projectURL: root)
+        XCTAssertEqual(try runner.test_validateStageOutput(.sfmMapping, paths: paths, metadata: metadata), .valid)
+    }
+
+    func testValidateStageOutputAcceptsCompletedTracklessVggtSparseModel() throws {
+        let root = try TestFileBuilder.makeTempDir()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let paths = ProjectPaths(root: root)
+        try paths.ensureDirectories()
+        let sparse = paths.colmapSparseURL.appendingPathComponent("0", isDirectory: true)
+        try writeTracklessVggtSparseFixture(at: sparse, imageNames: ["frame_000000.jpg", "frame_000001.jpg"], pointCount: 256)
+
+        let metadata = ProjectMetadata(
+            title: "Test",
+            input: .photos(folder: "/tmp/Photos"),
+            preset: PresetSpec(mode: .object, quality: .draft),
+            state: PipelineState(stage: .sfmMapping, attempt: 0, lastError: nil, resumeToken: nil),
+            completedSfmMapping: SfmMappingCheckpoint(
+                mapper: "vggt",
+                sparsePath: sparse.path,
+                registeredImages: 2
+            )
+        )
+        let runner = makeRunner(projectURL: root)
+        XCTAssertEqual(try runner.test_validateStageOutput(.sfmMapping, paths: paths, metadata: metadata), .valid)
+    }
+
+    func testValidateStageOutputRejectsTracklessSparseModelWithoutVggtCheckpoint() throws {
+        let root = try TestFileBuilder.makeTempDir()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let paths = ProjectPaths(root: root)
+        try paths.ensureDirectories()
+        let sparse = paths.colmapSparseURL.appendingPathComponent("0", isDirectory: true)
+        try writeTracklessVggtSparseFixture(at: sparse, imageNames: ["frame_000000.jpg"], pointCount: 1)
+
+        let metadata = ProjectMetadata(
+            title: "Test",
+            input: .photos(folder: "/tmp/Photos"),
+            preset: PresetSpec(mode: .object, quality: .draft)
+        )
+        let runner = makeRunner(projectURL: root)
+        XCTAssertEqual(try runner.test_validateStageOutput(.sfmMapping, paths: paths, metadata: metadata), .corrupt)
+    }
+
+    func testValidateStageOutputRejectsTracklessSparseModelWhenActiveMapperIsNotVggt() throws {
+        let root = try TestFileBuilder.makeTempDir()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let paths = ProjectPaths(root: root)
+        try paths.ensureDirectories()
+        let sparse = paths.colmapSparseURL.appendingPathComponent("0", isDirectory: true)
+        try writeTracklessVggtSparseFixture(at: sparse, imageNames: ["frame_000000.jpg"], pointCount: 1)
+
+        let metadata = ProjectMetadata(
+            title: "Test",
+            input: .photos(folder: "/tmp/Photos"),
+            preset: PresetSpec(mode: .object, quality: .draft),
+            checkpoint: PipelineCheckpoint(
+                stage: .sfmMapping,
+                details: .sfmMapping(SfmMappingCheckpoint(
+                    mapper: "colmap",
+                    sparsePath: sparse.path,
+                    registeredImages: 1
+                ))
+            ),
+            completedSfmMapping: SfmMappingCheckpoint(
+                mapper: "vggt",
+                sparsePath: sparse.path,
+                registeredImages: 1
+            )
+        )
+        let runner = makeRunner(projectURL: root)
+        XCTAssertEqual(try runner.test_validateStageOutput(.sfmMapping, paths: paths, metadata: metadata), .corrupt)
+    }
+
+    private func writeTracklessVggtSparseFixture(at sparse: URL, imageNames: [String], pointCount: Int) throws {
+        try FileManager.default.createDirectory(at: sparse, withIntermediateDirectories: true)
+        try "1 SIMPLE_PINHOLE 640 480 500 320 240\n"
+            .write(to: sparse.appendingPathComponent("cameras.txt"), atomically: true, encoding: .utf8)
+        let imagesText = imageNames.enumerated()
+            .map { offset, name in "\(offset + 1) 1 0 0 0 0 0 0 1 \(name)\n" }
+            .joined(separator: "\n")
+        try imagesText.write(to: sparse.appendingPathComponent("images.txt"), atomically: true, encoding: .utf8)
+        let pointsText = (1...max(1, pointCount))
+            .map { "\($0) 0 0 1 128 128 128 1.0" }
+            .joined(separator: "\n")
+        try (pointsText + "\n")
+            .write(to: sparse.appendingPathComponent("points3D.txt"), atomically: true, encoding: .utf8)
+    }
+
     func testIsStageCompleteTrainBrush() throws {
         let root = try TestFileBuilder.makeTempDir()
         defer { try? FileManager.default.removeItem(at: root) }

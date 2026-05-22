@@ -3,11 +3,17 @@ import Foundation
 /// Minimal, append-only tool log file writer used to persist external tool stdout/stderr to disk.
 /// We keep this separate from `pipeline.log` so users can inspect raw-ish tool output when needed.
 final class ToolLogWriter: @unchecked Sendable {
+    private static let timestampLock = NSLock()
+    private nonisolated(unsafe) static let timestampFormatter: ISO8601DateFormatter = {
+        let f = ISO8601DateFormatter()
+        f.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        return f
+    }()
+
     private static func timestamp() -> String {
-        // Avoid static shared formatter state (not concurrency-safe).
-        let formatter = ISO8601DateFormatter()
-        formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-        return formatter.string(from: Date())
+        timestampLock.lock()
+        defer { timestampLock.unlock() }
+        return timestampFormatter.string(from: Date())
     }
 
     private let fileURL: URL

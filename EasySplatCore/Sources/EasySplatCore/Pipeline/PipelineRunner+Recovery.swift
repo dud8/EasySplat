@@ -213,6 +213,21 @@ extension PipelineRunner {
             let sparseZero = paths.colmapSparseURL.appendingPathComponent("0", isDirectory: true)
             guard sparseModelFilesExist(at: sparseZero) else { return .missing }
             let textStats = colmapSparseTextStats(at: sparseZero)
+            // VGGT-direct writes points3D.txt with empty track entries when BA is disabled
+            // (Tools/VggtSfm/easysplat_vggt_sfm/run.py); the matching quality gate in
+            // vggtDirectQualityFailureReason accepts this shape, so recovery must too.
+            let allowsTracklessSparse: Bool = {
+                if case let .sfmMapping(checkpoint)? = metadata.checkpoint?.details {
+                    return checkpoint.mapper == "vggt"
+                }
+                if metadata.checkpoint?.stage == .sfmMapping {
+                    return false
+                }
+                if let completed = metadata.completedSfmMapping {
+                    return completed.mapper == "vggt"
+                }
+                return false
+            }()
             for name in ["cameras.bin", "images.bin", "points3D.bin", "cameras.txt", "images.txt", "points3D.txt"] {
                 let fileURL = sparseZero.appendingPathComponent(name)
                 if !fm.fileExists(atPath: fileURL.path) { continue }
@@ -226,8 +241,10 @@ extension PipelineRunner {
                 guard (textStats.pointCount ?? 0) > 0 else {
                     return .corrupt(reason: "points3D.txt has no sparse points")
                 }
-                guard (textStats.observationCount ?? 0) > 0 else {
-                    return .corrupt(reason: "points3D.txt has no observations")
+                if !allowsTracklessSparse {
+                    guard (textStats.observationCount ?? 0) > 0 else {
+                        return .corrupt(reason: "points3D.txt has no observations")
+                    }
                 }
             }
             let imagesTxt = sparseZero.appendingPathComponent("images.txt")

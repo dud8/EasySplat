@@ -23,6 +23,11 @@ final class ProjectMetadataStoreTests: XCTestCase {
                 resumeSnapshotPath: "/tmp/latest_snapshot.ply"
             ))
         )
+        let completedSfmMapping = SfmMappingCheckpoint(
+            mapper: "vggt",
+            sparsePath: "SfM/colmap/sparse/0",
+            registeredImages: 12
+        )
         let metadata = ProjectMetadata(
             formatVersion: 1,
             id: UUID(),
@@ -33,6 +38,7 @@ final class ProjectMetadataStoreTests: XCTestCase {
             state: state,
             outputs: output,
             checkpoint: checkpoint,
+            completedSfmMapping: completedSfmMapping,
             recoveryPromptSuppressed: true,
             lastRunStartedAt: Date(timeIntervalSince1970: 123499)
         )
@@ -54,6 +60,9 @@ final class ProjectMetadataStoreTests: XCTestCase {
         XCTAssertEqual(loaded.outputs?.colmapModelPath, metadata.outputs?.colmapModelPath)
         XCTAssertEqual(loaded.checkpoint?.stage, metadata.checkpoint?.stage)
         XCTAssertEqual(loaded.checkpoint?.message, metadata.checkpoint?.message)
+        XCTAssertEqual(loaded.completedSfmMapping?.mapper, completedSfmMapping.mapper)
+        XCTAssertEqual(loaded.completedSfmMapping?.sparsePath, completedSfmMapping.sparsePath)
+        XCTAssertEqual(loaded.completedSfmMapping?.registeredImages, completedSfmMapping.registeredImages)
         XCTAssertEqual(loaded.recoveryPromptSuppressed, true)
         XCTAssertEqual(loaded.lastRunStartedAt, Date(timeIntervalSince1970: 123499))
         if case let .trainBrush(details)? = loaded.checkpoint?.details {
@@ -138,6 +147,7 @@ final class ProjectMetadataStoreTests: XCTestCase {
         try legacy.write(to: url, atomically: true, encoding: .utf8)
         let loaded = try ProjectMetadataStore.load(from: url)
         XCTAssertNil(loaded.checkpoint)
+        XCTAssertNil(loaded.completedSfmMapping)
         XCTAssertNil(loaded.recoveryPromptSuppressed)
         XCTAssertNil(loaded.lastRunStartedAt)
     }

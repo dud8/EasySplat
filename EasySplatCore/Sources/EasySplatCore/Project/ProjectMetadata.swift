@@ -11,6 +11,7 @@ public struct ProjectMetadata: Codable, Sendable {
     public var state: PipelineState
     public var outputs: OutputSpec?
     public var checkpoint: PipelineCheckpoint?
+    public var completedSfmMapping: SfmMappingCheckpoint?
     public var recoveryPromptSuppressed: Bool?
     public var lastRunStartedAt: Date?
     public var shareMetrics: ShareMetrics?
@@ -25,6 +26,7 @@ public struct ProjectMetadata: Codable, Sendable {
         state: PipelineState = PipelineState(stage: .importInput, attempt: 0, lastError: nil, resumeToken: nil),
         outputs: OutputSpec? = nil,
         checkpoint: PipelineCheckpoint? = nil,
+        completedSfmMapping: SfmMappingCheckpoint? = nil,
         recoveryPromptSuppressed: Bool? = nil,
         lastRunStartedAt: Date? = nil,
         shareMetrics: ShareMetrics? = nil
@@ -38,6 +40,7 @@ public struct ProjectMetadata: Codable, Sendable {
         self.state = state
         self.outputs = outputs
         self.checkpoint = checkpoint
+        self.completedSfmMapping = completedSfmMapping
         self.recoveryPromptSuppressed = recoveryPromptSuppressed
         self.lastRunStartedAt = lastRunStartedAt
         self.shareMetrics = shareMetrics

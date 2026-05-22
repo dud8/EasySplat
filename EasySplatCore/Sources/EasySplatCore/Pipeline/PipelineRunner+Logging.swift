@@ -96,20 +96,36 @@ extension PipelineRunner {
     }
 
     static func sanitizeToolLogLine(_ line: String) -> String {
-        let stripped = stripAnsiCodes(line)
-        var scalars: [UnicodeScalar] = []
-        scalars.reserveCapacity(stripped.unicodeScalars.count)
-        for scalar in stripped.unicodeScalars {
+        let sourceScalars = Array(line.unicodeScalars)
+        var output: [UnicodeScalar] = []
+        output.reserveCapacity(sourceScalars.count)
+        var index = 0
+        while index < sourceScalars.count {
+            let scalar = sourceScalars[index]
+            if scalar.value == 0x1B {
+                if index + 1 < sourceScalars.count, sourceScalars[index + 1].value == 0x5B {
+                    index += 2
+                    while index < sourceScalars.count {
+                        let value = sourceScalars[index].value
+                        if value >= 0x40 && value <= 0x7E {
+                            index += 1
+                            break
+                        }
+                        index += 1
+                    }
+                    continue
+                }
+                index += 1
+                continue
+            }
             if scalar.value == 9 {
-                scalars.append(scalar)
-                continue
+                output.append(scalar)
+            } else if scalar.value >= 32 && scalar.value != 127 {
+                output.append(scalar)
             }
-            if scalar.value < 32 || scalar.value == 127 {
-                continue
-            }
-            scalars.append(scalar)
+            index += 1
         }
-        return String(String.UnicodeScalarView(scalars))
+        return String(String.UnicodeScalarView(output))
     }
 
     static func stripAnsiCodes(_ line: String) -> String {

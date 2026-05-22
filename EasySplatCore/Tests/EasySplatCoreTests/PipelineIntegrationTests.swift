@@ -188,6 +188,7 @@ final class PipelineIntegrationTests: XCTestCase {
         let restore = await scopedPipelineEnvironment([
             "EASYSPLAT_SFM_BACKEND": "vggt",
             "EASYSPLAT_SFM_MAPPER": nil,
+            "EASYSPLAT_VGGT_MAX_POINTS": "256",
             "EASYSPLAT_SKIP_TRAINING": nil
         ])
         defer { restore() }
@@ -196,8 +197,9 @@ final class PipelineIntegrationTests: XCTestCase {
         let projectURL = temp.appendingPathComponent("Test.easysplatproj", isDirectory: true)
         let sourcePhotos = temp.appendingPathComponent("SourcePhotos", isDirectory: true)
         try FileManager.default.createDirectory(at: sourcePhotos, withIntermediateDirectories: true)
-        for index in 0..<20 {
-            try writeTestImage(url: sourcePhotos.appendingPathComponent("img\(index).jpg"), value: UInt8(index % 255))
+        let imageNames = (0..<20).map { "img\($0).jpg" }
+        for (index, imageName) in imageNames.enumerated() {
+            try writeTestImage(url: sourcePhotos.appendingPathComponent(imageName), value: UInt8(index % 255))
         }
 
         let metadata = ProjectMetadata(title: "Test",
@@ -210,7 +212,10 @@ final class PipelineIntegrationTests: XCTestCase {
         let toolchain = try makeToolchain(root: temp, createVggtFiles: true)
 
         let runner = MockSubprocessRunner(scripts: [
-            .init(path: toolchain.vggt.sfmTool.path, argsPrefix: ["--images"], result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""), onRun: { _ in try? self.writeSparseModel(at: projectURL) }),
+            .init(path: toolchain.vggt.sfmTool.path, argsPrefix: ["--images"], result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""), onRun: { _ in
+                let modelURL = projectURL.appendingPathComponent("SfM/colmap/sparse/0", isDirectory: true)
+                try? self.writeTracklessVggtSparseModel(at: modelURL, imageNames: imageNames, pointCount: 256)
+            }),
             .init(path: toolchain.brush.path, argsPrefix: [], result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""), onRun: { args in
                 guard let datasetArg = args.last else { return }
                 let dataset = URL(fileURLWithPath: datasetArg)
@@ -230,6 +235,113 @@ final class PipelineIntegrationTests: XCTestCase {
 
         let output = projectURL.appendingPathComponent("Output/splat.ply")
         XCTAssertTrue(FileManager.default.fileExists(atPath: output.path))
+    }
+
+    func testPipelineRejectsLowCoverageVggtSparseModel() async throws {
+        let restore = await scopedPipelineEnvironment([
+            "EASYSPLAT_SFM_BACKEND": "vggt",
+            "EASYSPLAT_SFM_MAPPER": nil,
+            "EASYSPLAT_SKIP_TRAINING": "1"
+        ])
+        defer { restore() }
+
+        let temp = makeTempRoot()
+        let projectURL = temp.appendingPathComponent("Test.easysplatproj", isDirectory: true)
+        let sourcePhotos = temp.appendingPathComponent("SourcePhotos", isDirectory: true)
+        try FileManager.default.createDirectory(at: sourcePhotos, withIntermediateDirectories: true)
+        let imageNames = (0..<20).map { "img\($0).jpg" }
+        for (index, imageName) in imageNames.enumerated() {
+            try writeTestImage(url: sourcePhotos.appendingPathComponent(imageName), value: UInt8(index % 255))
+        }
+
+        let metadata = ProjectMetadata(title: "Test",
+                                       input: .photos(folder: sourcePhotos.path),
+                                       preset: PresetSpec(mode: .object, quality: .draft))
+        let paths = ProjectPaths(root: projectURL)
+        try paths.ensureDirectories()
+        try ProjectMetadataStore.save(metadata, to: paths.metadataURL)
+
+        let toolchain = try makeToolchain(root: temp, createVggtFiles: true)
+
+        let runner = MockSubprocessRunner(scripts: [
+            .init(path: toolchain.vggt.sfmTool.path, argsPrefix: ["--images"], result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""), onRun: { _ in
+                let modelURL = projectURL.appendingPathComponent("SfM/colmap/sparse/0", isDirectory: true)
+                try? self.writeTracklessVggtSparseModel(at: modelURL, imageNames: [imageNames[0]], pointCount: 500)
+            })
+        ])
+
+        let pipeline = PipelineRunner(
+            projectURL: projectURL,
+            config: .init(toolchain: toolchain, preset: metadata.preset),
+            tooling: .init(runner: runner)
+        )
+
+        do {
+            try await pipeline.run { _ in }
+            XCTFail("Expected low-quality VGGT reconstruction")
+        } catch let error as PipelineRunner.PipelineError {
+            guard case let .lowQualityReconstruction(score) = error else {
+                XCTFail("Expected low-quality reconstruction, got \(error)")
+                return
+            }
+            XCTAssertEqual(score.registeredImages, 1)
+            XCTAssertEqual(score.totalImages, 20)
+        }
+    }
+
+    func testPipelineRejectsThinVggtSparseModel() async throws {
+        let restore = await scopedPipelineEnvironment([
+            "EASYSPLAT_SFM_BACKEND": "vggt",
+            "EASYSPLAT_SFM_MAPPER": nil,
+            "EASYSPLAT_SKIP_TRAINING": "1"
+        ])
+        defer { restore() }
+
+        let temp = makeTempRoot()
+        let projectURL = temp.appendingPathComponent("Test.easysplatproj", isDirectory: true)
+        let sourcePhotos = temp.appendingPathComponent("SourcePhotos", isDirectory: true)
+        try FileManager.default.createDirectory(at: sourcePhotos, withIntermediateDirectories: true)
+        let imageNames = (0..<20).map { "img\($0).jpg" }
+        for (index, imageName) in imageNames.enumerated() {
+            try writeTestImage(url: sourcePhotos.appendingPathComponent(imageName), value: UInt8(index % 255))
+        }
+
+        let metadata = ProjectMetadata(
+            title: "Test",
+            input: .photos(folder: sourcePhotos.path),
+            preset: PresetSpec(mode: .object, quality: .draft)
+        )
+        let paths = ProjectPaths(root: projectURL)
+        try paths.ensureDirectories()
+        try ProjectMetadataStore.save(metadata, to: paths.metadataURL)
+
+        let toolchain = try makeToolchain(root: temp, createVggtFiles: true)
+
+        let runner = MockSubprocessRunner(scripts: [
+            .init(path: toolchain.vggt.sfmTool.path, argsPrefix: ["--images"], result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""), onRun: { _ in
+                let modelURL = projectURL.appendingPathComponent("SfM/colmap/sparse/0", isDirectory: true)
+                try? self.writeTracklessVggtSparseModel(at: modelURL, imageNames: imageNames, pointCount: 500)
+            })
+        ])
+
+        let pipeline = PipelineRunner(
+            projectURL: projectURL,
+            config: .init(toolchain: toolchain, preset: metadata.preset),
+            tooling: .init(runner: runner)
+        )
+
+        do {
+            try await pipeline.run { _ in }
+            XCTFail("Expected thin VGGT reconstruction")
+        } catch let error as PipelineRunner.PipelineError {
+            guard case let .lowQualityReconstruction(score) = error else {
+                XCTFail("Expected low-quality reconstruction, got \(error)")
+                return
+            }
+            XCTAssertEqual(score.registeredImages, 20)
+            XCTAssertEqual(score.totalImages, 20)
+            XCTAssertEqual(score.pointCount, 500)
+        }
     }
 
     func testPipelineMapAnythingDirectSuccessSkipsExternalRefinement() async throws {
@@ -1665,6 +1777,7 @@ final class PipelineIntegrationTests: XCTestCase {
         let restore = await scopedPipelineEnvironment([
             "EASYSPLAT_SFM_BACKEND": "vggt",
             "EASYSPLAT_SFM_MAPPER": nil,
+            "EASYSPLAT_VGGT_MAX_POINTS": "256",
             "EASYSPLAT_SKIP_TRAINING": nil
         ])
         defer { restore() }
@@ -1673,8 +1786,9 @@ final class PipelineIntegrationTests: XCTestCase {
         let projectURL = temp.appendingPathComponent("Test.easysplatproj", isDirectory: true)
         let sourcePhotos = temp.appendingPathComponent("SourcePhotos", isDirectory: true)
         try FileManager.default.createDirectory(at: sourcePhotos, withIntermediateDirectories: true)
-        for index in 0..<20 {
-            try writeTestImage(url: sourcePhotos.appendingPathComponent("img\(index).jpg"), value: UInt8(index % 255))
+        let imageNames = (0..<20).map { "img\($0).jpg" }
+        for (index, imageName) in imageNames.enumerated() {
+            try writeTestImage(url: sourcePhotos.appendingPathComponent(imageName), value: UInt8(index % 255))
         }
 
         let metadata = ProjectMetadata(title: "Test",
@@ -1688,9 +1802,11 @@ final class PipelineIntegrationTests: XCTestCase {
 
         final class SlowVggt: @unchecked Sendable, VggtSfmRunning {
             private let delayNanoseconds: UInt64
+            private let imageNames: [String]
 
-            init(delayNanoseconds: UInt64) {
+            init(delayNanoseconds: UInt64, imageNames: [String]) {
                 self.delayNanoseconds = delayNanoseconds
+                self.imageNames = imageNames
             }
 
             func run(
@@ -1714,19 +1830,26 @@ final class PipelineIntegrationTests: XCTestCase {
                     try await Task.sleep(nanoseconds: delayNanoseconds)
                 }
 
-                onLog("VGGT: writing COLMAP model to \(outSparse.path) (points=1234)", false)
+                onLog("VGGT: writing COLMAP model to \(outSparse.path) (points=256)", false)
                 try FileManager.default.createDirectory(at: outSparse, withIntermediateDirectories: true)
-                for name in ["cameras.bin", "images.bin", "points3D.bin", "cameras.txt", "points3D.txt"] {
+                for name in ["cameras.bin", "images.bin", "points3D.bin"] {
                     let url = outSparse.appendingPathComponent(name)
                     FileManager.default.createFile(atPath: url.path, contents: Data([0x00]))
                 }
-                let imagesTxt = outSparse.appendingPathComponent("images.txt")
-                let text = """
-                # Image list with two lines per image:
-                #   IMAGE_ID, QW, QX, QY, QZ, TX, TY, TZ, CAMERA_ID, NAME
-                1 1 0 0 0 0 0 0 1 frame_000000.jpg
-                """
-                try text.write(to: imagesTxt, atomically: true, encoding: .utf8)
+                try "1 SIMPLE_PINHOLE 640 480 500 320 240\n"
+                    .write(to: outSparse.appendingPathComponent("cameras.txt"), atomically: true, encoding: .utf8)
+                var imagesText = "# Image list with two lines per image:\n"
+                for (offset, imageName) in imageNames.enumerated() {
+                    imagesText += "\(offset + 1) 1 0 0 0 0 0 0 1 \(imageName)\n\n"
+                }
+                try imagesText.write(to: outSparse.appendingPathComponent("images.txt"), atomically: true, encoding: .utf8)
+                let points = (1...256)
+                    .map { pointID in
+                        let point2DIndex = pointID - 1
+                        return "\(pointID) 0 0 1 128 128 128 1.0 1 \(point2DIndex) 2 \(point2DIndex)"
+                    }
+                    .joined(separator: "\n")
+                try (points + "\n").write(to: outSparse.appendingPathComponent("points3D.txt"), atomically: true, encoding: .utf8)
                 onLog("VGGT: done", false)
             }
         }
@@ -1742,7 +1865,7 @@ final class PipelineIntegrationTests: XCTestCase {
         ])
 
         var tooling = PipelineRunner.Tooling(runner: runner)
-        tooling.vggtSfm = SlowVggt(delayNanoseconds: 300_000_000)
+        tooling.vggtSfm = SlowVggt(delayNanoseconds: 300_000_000, imageNames: imageNames)
 
         final class LockedEvents: @unchecked Sendable {
             private let lock = NSLock()
@@ -2808,6 +2931,22 @@ final class PipelineIntegrationTests: XCTestCase {
                 let track = imageNames.count >= 2 ? "1 \(point2DIndex) 2 \(point2DIndex)" : "1 \(point2DIndex)"
                 return "\(pointID) 0 0 1 128 128 128 1.0 \(track)"
             }
+            .joined(separator: "\n")
+        try (points + "\n").write(to: modelURL.appendingPathComponent("points3D.txt"), atomically: true, encoding: .utf8)
+    }
+
+    private func writeTracklessVggtSparseModel(at modelURL: URL, imageNames: [String], pointCount: Int) throws {
+        try FileManager.default.createDirectory(at: modelURL, withIntermediateDirectories: true)
+        try "1 SIMPLE_PINHOLE 640 480 500 320 240\n"
+            .write(to: modelURL.appendingPathComponent("cameras.txt"), atomically: true, encoding: .utf8)
+
+        let imagesText = imageNames.enumerated()
+            .map { offset, imageName in "\(offset + 1) 1 0 0 0 0 0 0 1 \(imageName)\n" }
+            .joined(separator: "\n")
+        try imagesText.write(to: modelURL.appendingPathComponent("images.txt"), atomically: true, encoding: .utf8)
+
+        let points = (1...pointCount)
+            .map { "\($0) 0 0 1 128 128 128 1.0" }
             .joined(separator: "\n")
         try (points + "\n").write(to: modelURL.appendingPathComponent("points3D.txt"), atomically: true, encoding: .utf8)
     }
