@@ -96,6 +96,36 @@ final class ProjectArtifactValidatorTests: XCTestCase {
         XCTAssertEqual(ProjectArtifactValidator.validatePlyFile(at: large), .valid)
     }
 
+    func testValidatePlyIgnoresEndHeaderMentionInsideComment() throws {
+        let root = try TestFileBuilder.makeTempDir()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let output = root.appendingPathComponent("comment-marker.ply")
+        try """
+        ply
+        format ascii 1.0
+        comment this note says end_header but is still part of the header
+        element vertex 1
+        property float x
+        property float y
+        property float z
+        property float f_dc_0
+        property float f_dc_1
+        property float f_dc_2
+        property float scale_0
+        property float scale_1
+        property float scale_2
+        property float opacity
+        property float rot_0
+        property float rot_1
+        property float rot_2
+        property float rot_3
+        end_header
+        0 0 0 1 1 1 -4 -4 -4 1 1 0 0 0
+        """.write(to: output, atomically: true, encoding: .utf8)
+
+        XCTAssertEqual(ProjectArtifactValidator.validatePlyFile(at: output), .valid)
+    }
+
     func testValidatePlyRejectsBinaryBodyShortage() throws {
         let root = try TestFileBuilder.makeTempDir()
         defer { try? FileManager.default.removeItem(at: root) }
@@ -120,13 +150,14 @@ final class ProjectArtifactValidatorTests: XCTestCase {
         property float rot_3
         end_header
         """.utf8)
+        data.append(0x0a)
         data.append(Data(repeating: 0, count: 43))
         try data.write(to: truncated, options: [.atomic])
 
         guard case .corrupt(let reason) = ProjectArtifactValidator.validatePlyFile(at: truncated) else {
             return XCTFail("Expected truncated binary PLY to be corrupt")
         }
-        XCTAssertTrue(reason.contains("expected at least"))
+        XCTAssertTrue(reason.contains("expected at least"), reason)
     }
 
     func testValidatePlyRejectsBinaryVertexByteOverflow() throws {
@@ -153,13 +184,14 @@ final class ProjectArtifactValidatorTests: XCTestCase {
         property float rot_3
         end_header
         """.utf8)
+        data.append(0x0a)
         data.append(0)
         try data.write(to: oversized, options: [.atomic])
 
         guard case .corrupt(let reason) = ProjectArtifactValidator.validatePlyFile(at: oversized) else {
             return XCTFail("Expected oversized binary PLY to be corrupt")
         }
-        XCTAssertTrue(reason.contains("vertex byte count is too large"))
+        XCTAssertTrue(reason.contains("vertex byte count is too large"), reason)
     }
 
     func testValidatePlyRejectsNonNumericAsciiVertexRows() throws {

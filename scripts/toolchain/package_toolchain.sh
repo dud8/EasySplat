@@ -75,6 +75,12 @@ if payload.get("toolchain_name") != tool_name:
         f"{tool_name} build_info.json toolchain_name mismatch: expected {tool_name}, "
         f"got {payload.get('toolchain_name')!r}"
     )
+
+if tool_name == "da3_mps" and payload.get("source_provenance") != "pinned-git":
+    raise SystemExit(
+        "da3_mps build_info.json must record pinned-git source_provenance; "
+        f"got {payload.get('source_provenance')!r}"
+    )
 PY
 }
 

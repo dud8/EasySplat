@@ -94,7 +94,8 @@ extension AppModel {
             } catch {
                 continue
             }
-            let outputURL = readyOutputURL(projectURL: url, metadata: metadata)
+            // Project list refresh runs on the main actor; avoid scanning large ASCII PLY bodies here.
+            let outputURL = readyOutputURL(projectURL: url, metadata: metadata, validationDepth: .quick)
             let outputExists = outputURL != nil
             let isActive = currentProjectURL == url && viewState == .processing
             let isRetrying = isActive && metadata.state.lastError != nil
@@ -195,11 +196,15 @@ extension AppModel {
         return outputURL
     }
 
-    func readyOutputURL(projectURL: URL, metadata: ProjectMetadata? = nil) -> URL? {
+    func readyOutputURL(
+        projectURL: URL,
+        metadata: ProjectMetadata? = nil,
+        validationDepth: ProjectArtifactValidationDepth = .full
+    ) -> URL? {
         guard let outputURL = metadataOutputURL(projectURL: projectURL, metadata: metadata) else {
             return nil
         }
-        return ProjectArtifactValidator.validatePlyFile(at: outputURL) == .valid ? outputURL : nil
+        return ProjectArtifactValidator.validatePlyFile(at: outputURL, depth: validationDepth) == .valid ? outputURL : nil
     }
 
     /// Build a minimal summary for a project whose metadata is unreadable due to a

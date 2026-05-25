@@ -359,7 +359,12 @@ extension PipelineRunner {
         textStats: ColmapSparseTextStats
     ) -> [String] {
         let fm = FileManager.default
+        let databaseExists = fm.fileExists(atPath: paths.colmapDatabaseURL.path)
+        let databaseSize = (try? fm.attributesOfItem(atPath: paths.colmapDatabaseURL.path)[.size] as? NSNumber)?.int64Value ?? 0
         guard fm.fileExists(atPath: paths.da3CoverageManifestURL.path) else {
+            if databaseExists, databaseSize <= 0 {
+                return ["DA3 coverage manifest was missing for zero-byte direct sparse database marker"]
+            }
             return []
         }
         let da3ManifestDate = (try? fm.attributesOfItem(atPath: paths.da3CoverageManifestURL.path)[.modificationDate] as? Date) ?? .distantPast
@@ -367,7 +372,6 @@ extension PipelineRunner {
            mapAnythingManifestDate > da3ManifestDate {
             return []
         }
-        let databaseSize = (try? fm.attributesOfItem(atPath: paths.colmapDatabaseURL.path)[.size] as? NSNumber)?.int64Value ?? 0
         guard databaseSize <= 0 else {
             return []
         }

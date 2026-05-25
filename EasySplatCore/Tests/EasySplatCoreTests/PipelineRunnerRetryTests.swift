@@ -542,6 +542,32 @@ final class PipelineRunnerRetryTests: XCTestCase {
         XCTAssertEqual(status, .corrupt)
     }
 
+    func testValidateStageOutputRejectsEmptyDatabaseSparseTextWithoutDa3Manifest() throws {
+        let root = try TestFileBuilder.makeTempDir()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let paths = ProjectPaths(root: root)
+        try paths.ensureDirectories()
+        FileManager.default.createFile(atPath: paths.colmapDatabaseURL.path, contents: Data())
+        let sparse = paths.colmapSparseURL.appendingPathComponent("0", isDirectory: true)
+        try FileManager.default.createDirectory(at: sparse, withIntermediateDirectories: true)
+        try "1 SIMPLE_PINHOLE 640 480 500 320 240\n"
+            .write(to: sparse.appendingPathComponent("cameras.txt"), atomically: true, encoding: .utf8)
+        try """
+        # images
+        1 1 0 0 0 0 0 0 1 frame_000000.jpg
+        0 0 1
+        """.write(to: sparse.appendingPathComponent("images.txt"), atomically: true, encoding: .utf8)
+        try """
+        # points
+        1 0 0 1 128 128 128 1.0 1 0
+        """.write(to: sparse.appendingPathComponent("points3D.txt"), atomically: true, encoding: .utf8)
+
+        let metadata = ProjectMetadata(title: "Test", input: .photos(folder: "/tmp/Photos"), preset: PresetSpec(mode: .object, quality: .draft))
+        let runner = makeRunner(projectURL: root)
+        let status = try runner.test_validateStageOutput(.sfmFeatures, paths: paths, metadata: metadata)
+        XCTAssertEqual(status, .corrupt)
+    }
+
     func testValidateStageOutputExtractFramesAllowsLowFrameCount() throws {
         let root = try TestFileBuilder.makeTempDir()
         defer { try? FileManager.default.removeItem(at: root) }

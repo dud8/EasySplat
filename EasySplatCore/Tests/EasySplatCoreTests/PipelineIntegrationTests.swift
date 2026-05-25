@@ -2536,7 +2536,7 @@ final class PipelineIntegrationTests: XCTestCase {
         ]
         let selectedManifestData = try JSONEncoder().encode(selectedManifest)
         try selectedManifestData.write(to: paths.framesSelectedManifestURL, options: [.atomic])
-        FileManager.default.createFile(atPath: paths.colmapDatabaseURL.path, contents: Data())
+        try writeCompletedColmapDatabase(at: paths.colmapDatabaseURL)
 
         let sparse = paths.colmapSparseURL.appendingPathComponent("0", isDirectory: true)
         try FileManager.default.createDirectory(at: sparse, withIntermediateDirectories: true)
@@ -2620,7 +2620,7 @@ final class PipelineIntegrationTests: XCTestCase {
         ]
         let selectedManifestData = try JSONEncoder().encode(selectedManifest)
         try selectedManifestData.write(to: paths.framesSelectedManifestURL, options: [.atomic])
-        FileManager.default.createFile(atPath: paths.colmapDatabaseURL.path, contents: Data())
+        try writeCompletedColmapDatabase(at: paths.colmapDatabaseURL)
 
         let sparse = paths.colmapSparseURL.appendingPathComponent("0", isDirectory: true)
         try FileManager.default.createDirectory(at: sparse, withIntermediateDirectories: true)
@@ -2750,6 +2750,38 @@ final class PipelineIntegrationTests: XCTestCase {
         guard sqlite3_exec(db, "COMMIT;", nil, nil, nil) == SQLITE_OK else {
             XCTFail("Unable to commit sqlite transaction")
             return
+        }
+    }
+
+    private func writeCompletedColmapDatabase(at databaseURL: URL) throws {
+        try FileManager.default.createDirectory(at: databaseURL.deletingLastPathComponent(), withIntermediateDirectories: true)
+        var db: OpaquePointer?
+        defer { sqlite3_close(db) }
+        guard sqlite3_open(databaseURL.path, &db) == SQLITE_OK, let db else {
+            throw NSError(
+                domain: "PipelineIntegrationTests",
+                code: 1,
+                userInfo: [NSLocalizedDescriptionKey: "Unable to open sqlite database at \(databaseURL.path)"]
+            )
+        }
+
+        let sql = """
+        CREATE TABLE images(image_id INTEGER PRIMARY KEY);
+        CREATE TABLE keypoints(image_id INTEGER PRIMARY KEY, rows INTEGER);
+        CREATE TABLE two_view_geometries(pair_id INTEGER PRIMARY KEY);
+        INSERT INTO images(image_id) VALUES (1), (2);
+        INSERT INTO keypoints(image_id, rows) VALUES (1, 1), (2, 1);
+        INSERT INTO two_view_geometries(pair_id) VALUES (1);
+        """
+        var errorMessage: UnsafeMutablePointer<Int8>?
+        if sqlite3_exec(db, sql, nil, nil, &errorMessage) != SQLITE_OK {
+            let message = errorMessage.map { String(cString: $0) } ?? "sqlite error \(sqlite3_errcode(db))"
+            sqlite3_free(errorMessage)
+            throw NSError(
+                domain: "PipelineIntegrationTests",
+                code: Int(sqlite3_errcode(db)),
+                userInfo: [NSLocalizedDescriptionKey: message]
+            )
         }
     }
 

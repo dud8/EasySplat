@@ -200,6 +200,7 @@ download_model() {
   local local_name="$2"
   local revision="$3"
   local target="$MODELS_DIR/$local_name"
+  rm -rf "$target"
   mkdir -p "$target"
   echo "Downloading ${repo_id}@${revision} into $target"
   HF_HUB_DISABLE_TELEMETRY=1 DO_NOT_TRACK=1 PYTHONNOUSERSITE=1 "$PYTHON_DIR/bin/python3" - <<PY

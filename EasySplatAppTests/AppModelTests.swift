@@ -677,6 +677,53 @@ final class AppModelTests: XCTestCase {
         XCTAssertNil(model.projectSummaries.first?.outputPlyURL)
     }
 
+    func testRefreshProjectSummariesDoesNotDeepScanLargeAsciiOutput() throws {
+        let base = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: base) }
+        try FileManager.default.createDirectory(at: base, withIntermediateDirectories: true)
+        let projectURL = base.appendingPathComponent("LargeAsciiOutput.easysplatproj", isDirectory: true)
+        try FileManager.default.createDirectory(at: projectURL, withIntermediateDirectories: true)
+        let paths = ProjectPaths(root: projectURL)
+        try paths.ensureDirectories()
+        try """
+        ply
+        format ascii 1.0
+        element vertex 1000000
+        property float x
+        property float y
+        property float z
+        property float f_dc_0
+        property float f_dc_1
+        property float f_dc_2
+        property float scale_0
+        property float scale_1
+        property float scale_2
+        property float opacity
+        property float rot_0
+        property float rot_1
+        property float rot_2
+        property float rot_3
+        end_header
+        0 0 0 1 1 1 -4 -4 -4 1 1 0 0 0
+        """.write(to: paths.outputURL.appendingPathComponent("splat.ply"), atomically: true, encoding: .utf8)
+        let metadata = ProjectMetadata(
+            title: "LargeAsciiOutput",
+            input: .photos(folder: "/tmp/photos"),
+            preset: PresetSpec(mode: .object, quality: .standard),
+            state: PipelineState(stage: .done, attempt: 0, lastError: nil, resumeToken: nil),
+            outputs: OutputSpec(splatPlyPath: "Output/splat.ply", colmapModelPath: "SfM/colmap/sparse/0")
+        )
+        try ProjectMetadataStore.save(metadata, to: paths.metadataURL)
+
+        let model = AppModel(toolchainManager: MockToolchainManager(), projectBaseURL: base) { _, config in
+            MockPipelineRunner(projectURL: base, config: config)
+        }
+        model.refreshProjectSummaries()
+
+        XCTAssertEqual(model.projectSummaries.first?.status, .ready)
+        XCTAssertEqual(model.projectSummaries.first?.outputPlyURL?.lastPathComponent, "splat.ply")
+    }
+
     func testRefreshProjectSummariesRejectsEscapingOutputPath() throws {
         let base = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
         defer { try? FileManager.default.removeItem(at: base) }

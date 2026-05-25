@@ -6,6 +6,11 @@ public enum ProjectArtifactStatus: Equatable, Sendable {
     case corrupt(reason: String)
 }
 
+public enum ProjectArtifactValidationDepth: Sendable {
+    case quick
+    case full
+}
+
 public enum ProjectArtifactValidator {
     private static let maxHeaderBytes = 64 * 1024
 
@@ -17,7 +22,10 @@ public enum ProjectArtifactValidator {
         return url
     }
 
-    public static func validatePlyFile(at url: URL) -> ProjectArtifactStatus {
+    public static func validatePlyFile(
+        at url: URL,
+        depth: ProjectArtifactValidationDepth = .full
+    ) -> ProjectArtifactStatus {
         let fm = FileManager.default
         var isDirectory = ObjCBool(false)
         guard fm.fileExists(atPath: url.path, isDirectory: &isDirectory) else {
@@ -38,26 +46,15 @@ public enum ProjectArtifactValidator {
         guard !data.isEmpty else {
             return .corrupt(reason: "failed to read \(url.lastPathComponent)")
         }
-        guard let endHeaderRange = data.range(of: Data("end_header".utf8)) else {
+        guard let headerBounds = plyHeaderBounds(in: data) else {
             guard let prefix = String(data: data.prefix(4096), encoding: .utf8),
                   prefix.lowercased().hasPrefix("ply") else {
                 return .corrupt(reason: "\(url.lastPathComponent) is not a PLY file")
             }
             return .corrupt(reason: "\(url.lastPathComponent) is missing end_header")
         }
-        var bodyStart = endHeaderRange.upperBound
-        if bodyStart < data.count {
-            if data[bodyStart] == 13 {
-                bodyStart += 1
-                if bodyStart < data.count, data[bodyStart] == 10 {
-                    bodyStart += 1
-                }
-            } else if data[bodyStart] == 10 {
-                bodyStart += 1
-            }
-        }
-        let headerEnd = endHeaderRange.upperBound
-        let headerData = data.prefix(headerEnd)
+        let bodyStart = headerBounds.bodyStart
+        let headerData = data.prefix(headerBounds.headerEnd)
         guard let header = String(data: headerData, encoding: .utf8) else {
             return .corrupt(reason: "\(url.lastPathComponent) is not valid UTF-8 near header")
         }
@@ -113,6 +110,9 @@ public enum ProjectArtifactValidator {
         }
         switch format {
         case "ascii":
+            if depth == .quick {
+                return .valid
+            }
             if let corrupt = validateAsciiVertexBody(
                 at: url,
                 bodyStart: bodyStart,
@@ -163,6 +163,46 @@ public enum ProjectArtifactValidator {
             return .corrupt(reason: "\(url.lastPathComponent) has unsupported PLY format \(format)")
         }
         return .valid
+    }
+
+    private static func plyHeaderBounds(in data: Data) -> (headerEnd: Int, bodyStart: Int)? {
+        var lineStart = data.startIndex
+
+        while lineStart < data.endIndex {
+            var lineEnd = lineStart
+            while lineEnd < data.endIndex, data[lineEnd] != 10, data[lineEnd] != 13 {
+                lineEnd += 1
+            }
+
+            let line = String(decoding: data[lineStart..<lineEnd], as: UTF8.self)
+            if line.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() == "end_header" {
+                var bodyStart = lineEnd
+                if bodyStart < data.endIndex {
+                    if data[bodyStart] == 13 {
+                        bodyStart += 1
+                        if bodyStart < data.endIndex, data[bodyStart] == 10 {
+                            bodyStart += 1
+                        }
+                    } else if data[bodyStart] == 10 {
+                        bodyStart += 1
+                    }
+                }
+                return (headerEnd: lineEnd, bodyStart: bodyStart)
+            }
+
+            guard lineEnd < data.endIndex else { break }
+            lineStart = lineEnd
+            if data[lineStart] == 13 {
+                lineStart += 1
+                if lineStart < data.endIndex, data[lineStart] == 10 {
+                    lineStart += 1
+                }
+            } else if data[lineStart] == 10 {
+                lineStart += 1
+            }
+        }
+
+        return nil
     }
 
     private static func validateAsciiVertexBody(

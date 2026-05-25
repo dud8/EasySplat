@@ -459,7 +459,7 @@ final class ToolchainManagerDownloadTests: XCTestCase {
         }
     }
 
-    func testEnsureToolchainRedownloadsModelsInsteadOfTrustingInstalledState() async throws {
+    func testEnsureToolchainRedownloadsSplitArtifactsWhenCoreInstallIsMissing() async throws {
         try await withEnvironmentAsync(["EASYSPLAT_LOCAL_TOOLCHAIN_ROOT": nil]) {
             let token = UUID().uuidString
             let version = "8.8.8-\(UUID().uuidString)"
@@ -503,12 +503,15 @@ final class ToolchainManagerDownloadTests: XCTestCase {
             try? FileManager.default.removeItem(at: versionedRoot)
             defer { try? FileManager.default.removeItem(at: versionedRoot) }
             let fixture = try ToolchainFixtureBuilder.createToolchain(at: versionedRoot)
-            let state = ToolchainManager.ToolchainInstallState(installedArtifacts: [modelsArtifact.name: modelsArtifact.sha256])
+            let state = ToolchainManager.ToolchainInstallState(installedArtifacts: [
+                coreArtifact.name: coreArtifact.sha256,
+                modelsArtifact.name: modelsArtifact.sha256
+            ])
             let stateData = try JSONEncoder().encode(state)
             try stateData.write(to: versionedRoot.appendingPathComponent(".easysplat_toolchain_state.json"))
-            try "tampered".write(to: fixture.da3ModelFile, atomically: true, encoding: .utf8)
             try removeInstalledCore(at: versionedRoot)
 
+            let coreRequestCounter = LockedCounter()
             let modelRequestCounter = LockedCounter()
             MockURLProtocol.register(token: token) { request in
                 if request.url == manifestURL {
@@ -516,6 +519,7 @@ final class ToolchainManagerDownloadTests: XCTestCase {
                     return (response, signed.data)
                 }
                 if request.url == coreURL {
+                    _ = coreRequestCounter.increment()
                     let response = HTTPURLResponse(url: request.url!, statusCode: 200, httpVersion: nil, headerFields: nil)!
                     return (response, coreData)
                 }
@@ -554,6 +558,7 @@ final class ToolchainManagerDownloadTests: XCTestCase {
             )
 
             XCTAssertEqual(toolchain.root.path, versionedRoot.path)
+            XCTAssertEqual(coreRequestCounter.current(), 1)
             XCTAssertEqual(modelRequestCounter.current(), 1)
         }
     }
