@@ -82,6 +82,18 @@ final class ColmapDatabaseProgressPollerTests: XCTestCase {
         XCTAssertNil(ColmapDatabaseProgressPoller(databasePath: dbURL).readKeypointStats())
     }
 
+    func testReadKeypointStatsReturnsNilWhenKeypointsTableAbsent() throws {
+        // images present but no keypoints table yet: report nothing rather than fake zeros.
+        let dbURL = try makeTempDatabaseURL()
+        try createDatabase(at: dbURL) { db in
+            try exec(db: db, sql: "CREATE TABLE images(image_id INTEGER PRIMARY KEY);")
+            try exec(db: db, sql: "INSERT INTO images(image_id) VALUES (1), (2);")
+        }
+
+        XCTAssertNil(ColmapDatabaseProgressPoller(databasePath: dbURL).readKeypointStats(),
+                     "A missing keypoints table must not report fake zero-keypoint stats.")
+    }
+
     func testReadKeypointStatsReturnsNilForMissingDatabase() {
         let url = URL(fileURLWithPath: NSTemporaryDirectory(), isDirectory: true)
             .appendingPathComponent("\(UUID().uuidString).sqlite")

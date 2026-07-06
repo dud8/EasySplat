@@ -937,7 +937,7 @@ public final class PipelineRunner: @unchecked Sendable {
                             )
                             emit(.stageLog(
                                 stage: currentStage,
-                                line: "MapAnything score (\(candidate)): \(ReconstructionScorer.summary(score)).",
+                                line: "MapAnything score (\(candidate)): \(ReconstructionScorer.summary(score, mapper: "mapanything-direct")).",
                                 isError: false
                             ))
                             return score
@@ -2289,7 +2289,7 @@ public final class PipelineRunner: @unchecked Sendable {
                                     )
                                     emit(.stageLog(
                                         stage: .sfmMapping,
-                                        line: "Mapper fallback score (\(candidate)): \(ReconstructionScorer.summary(score)).",
+                                        line: "Mapper fallback score (\(candidate)): \(ReconstructionScorer.summary(score, mapper: candidate)).",
                                         isError: false
                                     ))
                                     if ReconstructionScorer.isAcceptable(score, mode: metadata.preset.mode) {

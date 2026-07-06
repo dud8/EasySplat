@@ -68,7 +68,12 @@ struct ColmapDatabaseProgressPoller: Sendable {
         guard let imageCount = queryCount(db: db, sql: "SELECT COUNT(*) FROM images;"), imageCount > 0 else {
             return nil
         }
-        let total = queryCount(db: db, sql: "SELECT COALESCE(SUM(rows), 0) FROM keypoints;") ?? 0
+        // If the keypoints table is absent or unreadable the query returns nil — report nothing
+        // rather than a fake "0 keypoints across N images" that would falsely trip the low-count
+        // warning. An existing-but-empty keypoints table legitimately yields 0 via COALESCE.
+        guard let total = queryCount(db: db, sql: "SELECT COALESCE(SUM(rows), 0) FROM keypoints;") else {
+            return nil
+        }
         let minRows = queryCount(
             db: db,
             sql: "SELECT MIN(COALESCE(k.rows, 0)) FROM images i LEFT JOIN keypoints k ON i.image_id = k.image_id;"
