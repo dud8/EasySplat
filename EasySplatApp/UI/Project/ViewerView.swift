@@ -140,12 +140,10 @@ struct ViewerView: View {
         return StageTimingDisplay.formatDuration(seconds: total)
     }
 
-    /// Predictor median for the current project's preset, excluding the
-    /// project being viewed (the predictor consumes the full project list
-    /// directly via lastActivityAt; the project itself contributes
-    /// stage timings so the median can include it without skewing — and
-    /// taking the median is itself a robust estimator). Returns nil
-    /// when the predictor doesn't have enough samples.
+    /// Predictor median total duration for the current project's preset, excluding the
+    /// project being viewed so the comparison badge never benchmarks a run against itself
+    /// (post-completion the current project appears in `projectSummaries` with its own
+    /// ready timings). Returns nil when there are not enough other samples.
     private func medianTotalSecondsForCurrentPreset() -> TimeInterval? {
         guard let preset = model.currentPreset else { return nil }
         // Exclude the project being viewed so the comparison badge never
