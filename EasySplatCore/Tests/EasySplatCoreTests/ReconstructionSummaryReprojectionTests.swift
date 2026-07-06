@@ -15,11 +15,20 @@ final class ReconstructionSummaryReprojectionTests: XCTestCase {
         )
     }
 
-    func testGlobalMapperReprojectionIsDroppedFromSummary() {
-        for mapper in ["global_mapper", "global_mapper-gpu", "global_mapper-cpu"] {
-            let summary = ReconstructionSummary(score: makeScore(reproj: 0.0003), mapper: mapper, capturedAt: Date())
+    private let unreliableMappers = [
+        "global_mapper", "global_mapper-gpu", "global_mapper-cpu",
+        "da3-direct", "mapanything-direct", "fastvggt-seed"
+    ]
+
+    private let reliableMappers = [
+        "colmap", "point_triangulator", "point_triangulator+bundle_adjuster", "mapanything-refinement"
+    ]
+
+    func testUnreliableMapperReprojectionIsDroppedFromSummary() {
+        for mapper in unreliableMappers {
+            let summary = ReconstructionSummary(score: makeScore(reproj: 1.0), mapper: mapper, capturedAt: Date())
             XCTAssertNil(summary.meanReprojectionError,
-                         "\(mapper): GLOMAP's non-pixel reprojection error must not be persisted.")
+                         "\(mapper): a placeholder point-error must not be persisted as a pixel reproj.")
             // Every other real metric is preserved.
             XCTAssertEqual(summary.registeredImages, 30)
             XCTAssertEqual(summary.pointCount, 14_000)
@@ -28,22 +37,40 @@ final class ReconstructionSummaryReprojectionTests: XCTestCase {
         }
     }
 
-    func testColmapAndNeuralMappersKeepReprojection() {
-        for mapper in ["colmap", "point_triangulator+bundle_adjuster", "point_triangulator", "mapanything-refinement"] {
+    func testReliableMapperReprojectionIsPreserved() {
+        for mapper in reliableMappers {
             let summary = ReconstructionSummary(score: makeScore(reproj: 1.5), mapper: mapper, capturedAt: Date())
             XCTAssertEqual(summary.meanReprojectionError, 1.5,
-                           "\(mapper): a real pixel reprojection error must be preserved.")
+                           "\(mapper): a re-triangulated pixel reproj must be preserved.")
+            XCTAssertEqual(summary.resolvedReprojectionError, 1.5)
         }
     }
 
-    func testGlobalMapperSummaryMapperDiscriminatorIsExact() {
-        XCTAssertTrue(ReconstructionSummary.isGlobalMapperSummaryMapper("global_mapper"))
-        XCTAssertTrue(ReconstructionSummary.isGlobalMapperSummaryMapper("global_mapper-gpu"))
-        XCTAssertTrue(ReconstructionSummary.isGlobalMapperSummaryMapper("global_mapper-cpu"))
-        // Must not catch the plain COLMAP mapper or unrelated labels.
-        XCTAssertFalse(ReconstructionSummary.isGlobalMapperSummaryMapper("colmap"))
-        XCTAssertFalse(ReconstructionSummary.isGlobalMapperSummaryMapper("global_mapper-experimental"))
-        XCTAssertFalse(ReconstructionSummary.isGlobalMapperSummaryMapper("vggt"))
+    func testResolvedReprojectionMasksLegacyPersistedValue() {
+        // Old project.json could carry a placeholder reproj on an unreliable mapper (built via
+        // the memberwise init, which does not sanitize). resolvedReprojectionError masks it.
+        for mapper in unreliableMappers {
+            let legacy = ReconstructionSummary(
+                mapper: mapper,
+                capturedAt: Date(),
+                registeredImages: 30,
+                totalImages: 30,
+                meanReprojectionError: 0.0003,
+                pointCount: 14_000,
+                observationCount: 56_000,
+                meanTrackLength: 4.0
+            )
+            XCTAssertNil(legacy.resolvedReprojectionError, "\(mapper): legacy placeholder reproj must be masked on read.")
+        }
+    }
+
+    func testReprojectionErrorIsUnreliableDiscriminatorIsExact() {
+        for mapper in unreliableMappers {
+            XCTAssertTrue(ReconstructionSummary.reprojectionErrorIsUnreliable(forMapper: mapper), mapper)
+        }
+        for mapper in reliableMappers + ["vggt", "global_mapper-experimental"] {
+            XCTAssertFalse(ReconstructionSummary.reprojectionErrorIsUnreliable(forMapper: mapper), mapper)
+        }
     }
 }
 #endif

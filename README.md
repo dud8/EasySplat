@@ -19,7 +19,7 @@ Each run creates a `.easysplatproj` bundle under `~/Documents/EasySplat Projects
 
 EasySplat treats each run like a durable project bundle:
 
-- `project.json` stores input choices, preset, pipeline state, checkpoints, recovery flags, persisted share metrics, the accepted reconstruction summary (registered frames, points, observations, mean track length, mean reprojection error, mapper), per-stage wall-clock timings, the AutoTuner snapshot used for the run, and a free-text notes field.
+- `project.json` stores input choices, preset, pipeline state, checkpoints, recovery flags, persisted share metrics, the accepted reconstruction summary (registered frames, points, observations, mean track length, mean reprojection error where the mapper measures one, mapper), per-stage wall-clock timings, the AutoTuner snapshot used for the run, and a free-text notes field.
 - `last_opened.json` stores the last-opened timestamp outside `project.json` so home-screen activity updates cannot clobber concurrent pipeline writes.
 - `Logs/pipeline.log` stores the human-readable pipeline log.
 - `Logs/events.jsonl` stores structured pipeline events.

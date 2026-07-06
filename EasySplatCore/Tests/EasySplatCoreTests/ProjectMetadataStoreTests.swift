@@ -379,9 +379,9 @@ final class ReconstructionSummaryTests: XCTestCase {
             meanTrackLength: 5.0
         )
         let captured = Date(timeIntervalSince1970: 1_700_000_000)
-        let summary = ReconstructionSummary(score: score, mapper: "mapanything-direct", capturedAt: captured)
+        let summary = ReconstructionSummary(score: score, mapper: "colmap", capturedAt: captured)
 
-        XCTAssertEqual(summary.mapper, "mapanything-direct")
+        XCTAssertEqual(summary.mapper, "colmap")
         XCTAssertEqual(summary.capturedAt, captured)
         XCTAssertEqual(summary.registeredImages, 18)
         XCTAssertEqual(summary.totalImages, 20)

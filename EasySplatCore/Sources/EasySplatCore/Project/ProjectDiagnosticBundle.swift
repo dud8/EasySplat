@@ -128,8 +128,10 @@ public enum ProjectDiagnosticBundle {
         lines.append("Mapper: \(reconstruction.mapper)")
         lines.append("Captured: \(iso8601(reconstruction.capturedAt))")
         lines.append("Registered: \(reconstruction.registeredImages) / \(reconstruction.totalImages)")
-        if let reproj = reconstruction.meanReprojectionError {
+        if let reproj = reconstruction.resolvedReprojectionError {
             lines.append("Mean reprojection error: \(String(format: "%.3f px", reproj))")
+        } else if ReconstructionSummary.reprojectionErrorIsUnreliable(forMapper: reconstruction.mapper) {
+            lines.append("Mean reprojection error: not measured (this mapper does not produce pixel residuals)")
         }
         if let points = reconstruction.pointCount {
             lines.append("Points: \(points)")

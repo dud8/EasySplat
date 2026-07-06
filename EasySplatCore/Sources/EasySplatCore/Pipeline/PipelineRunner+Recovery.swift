@@ -169,17 +169,17 @@ extension PipelineRunner {
     /// extraction and logs them. This build's COLMAP silently ignores the requested feature
     /// cap, so the count is content-driven; surfacing the real totals (and flagging frames
     /// that extracted almost nothing) turns an otherwise opaque stage into an honest signal.
-    func logKeypointStats(database: URL, emit: (PipelineEvent) -> Void) {
+    func logKeypointStats(database: URL, stage: PipelineStage = .sfmFeatures, emit: (PipelineEvent) -> Void) {
         guard let stats = ColmapDatabaseProgressPoller(databasePath: database).readKeypointStats() else { return }
         emit(.stageLog(
-            stage: .sfmFeatures,
+            stage: stage,
             line: "Extracted \(stats.totalKeypoints) keypoints across \(stats.imageCount) images (avg \(stats.averageKeypoints)/image, min \(stats.minKeypoints)).",
             isError: false
         ))
         if stats.minKeypoints < Self.lowKeypointWarningThreshold {
             emit(.stageLog(
-                stage: .sfmFeatures,
-                line: "At least one frame extracted only \(stats.minKeypoints) keypoints; low-texture or degenerate frames can weaken or fragment the reconstruction.",
+                stage: stage,
+                line: "At least one of \(stats.imageCount) frames extracted only \(stats.minKeypoints) keypoints (below \(Self.lowKeypointWarningThreshold)); low-texture or degenerate frames can weaken or fragment the reconstruction.",
                 isError: true
             ))
         }

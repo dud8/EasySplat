@@ -540,7 +540,7 @@ The exact contents vary by backend and success/failure path, but that is the sta
 - recovery prompt suppression,
 - last run start time,
 - share metrics,
-- the accepted reconstruction summary (registered frames, points, observations, mean track length, mean reprojection error, mapper, captured-at),
+- the accepted reconstruction summary (registered frames, points, observations, mean track length, mean reprojection error where the mapper measures one, mapper, captured-at),
 - per-stage wall-clock timings,
 - the AutoTuner snapshot (hardware tier + knobs picked for the run),
 - a free-text notes field.

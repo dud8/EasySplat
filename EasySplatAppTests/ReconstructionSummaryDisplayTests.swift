@@ -70,7 +70,7 @@ final class ReconstructionSummaryDisplayTests: XCTestCase {
 
     func testCompactSummaryIncludesPointsAndReprojWhenPresent() {
         let summary = ReconstructionSummary(
-            mapper: "mapanything-direct",
+            mapper: "colmap",
             capturedAt: Date(timeIntervalSince1970: 0),
             registeredImages: 27,
             totalImages: 30,
@@ -80,13 +80,26 @@ final class ReconstructionSummaryDisplayTests: XCTestCase {
         XCTAssertEqual(summary.compactSummary, "27/30 frames · 14.2k pts · 0.85 px")
     }
 
+    func testCompactSummaryOmitsPlaceholderReprojForUnreliableMapper() {
+        let summary = ReconstructionSummary(
+            mapper: "global_mapper",
+            capturedAt: Date(timeIntervalSince1970: 0),
+            registeredImages: 27,
+            totalImages: 30,
+            meanReprojectionError: 0.0003,
+            pointCount: 14_231
+        )
+        XCTAssertEqual(summary.compactSummary, "27/30 frames · 14.2k pts")
+    }
+
     func testDisplayMapperFriendlyLabels() {
         let labels: [(String, String)] = [
             ("da3-direct", "Depth Anything 3"),
             ("mapanything-direct", "MapAnything (direct)"),
             ("vggt", "VGGT"),
             ("point_triangulator+bundle_adjuster", "Point triangulator + BA"),
-            ("global_mapper", "GLOMAP (global mapper, GPU)"),
+            ("global_mapper", "GLOMAP (global mapper)"),
+            ("global_mapper-gpu", "GLOMAP (global mapper, GPU)"),
             ("global_mapper-cpu", "GLOMAP (global mapper, CPU)"),
             ("colmap", "COLMAP (mapper)")
         ]

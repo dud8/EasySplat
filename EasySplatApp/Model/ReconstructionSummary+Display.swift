@@ -19,14 +19,14 @@ extension ReconstructionSummary {
         // track length, or point count blocks the rating because we cannot vouch for
         // quality we did not measure.
         if fraction >= 0.9,
-           let reproj = meanReprojectionError, reproj <= 1.2,
+           let reproj = resolvedReprojectionError, reproj <= 1.2,
            let tracks = meanTrackLength, tracks >= 4.0,
            let points = pointCount, points > 0 {
             return .strong
         }
 
         // "fair" tolerates missing metrics as long as the metrics we do have are not bad.
-        let reprojWithinFair = meanReprojectionError.map { $0 <= 2.5 } ?? true
+        let reprojWithinFair = resolvedReprojectionError.map { $0 <= 2.5 } ?? true
         let tracksWithinFair = meanTrackLength.map { $0 >= 2.5 } ?? true
         let pointsWithinFair = pointCount.map { $0 > 0 } ?? true
         if fraction >= 0.65, reprojWithinFair, tracksWithinFair, pointsWithinFair {
@@ -39,7 +39,7 @@ extension ReconstructionSummary {
     /// this to add a "metrics unavailable" hint instead of letting a green dot imply
     /// quality we did not measure.
     var hasOnlyCoverage: Bool {
-        return meanReprojectionError == nil
+        return resolvedReprojectionError == nil
             && pointCount == nil
             && observationCount == nil
             && meanTrackLength == nil
@@ -65,7 +65,9 @@ extension ReconstructionSummary {
             return "FastVGGT (seed only)"
         case "vggt":
             return "VGGT"
-        case "global_mapper", "global_mapper-gpu":
+        case "global_mapper":
+            return "GLOMAP (global mapper)"
+        case "global_mapper-gpu":
             return "GLOMAP (global mapper, GPU)"
         case "global_mapper-cpu":
             return "GLOMAP (global mapper, CPU)"
@@ -84,7 +86,7 @@ extension ReconstructionSummary {
         if let pointCount {
             parts.append("\(Self.compactCount(pointCount)) pts")
         }
-        if let reproj = meanReprojectionError {
+        if let reproj = resolvedReprojectionError {
             parts.append(String(format: "%.2f px", reproj))
         }
         return parts.joined(separator: " · ")
@@ -115,8 +117,8 @@ extension ReconstructionSummary {
     }
 
     var meanReprojectionErrorText: String? {
-        guard let meanReprojectionError else { return nil }
-        return String(format: "%.2f px", meanReprojectionError)
+        guard let reproj = resolvedReprojectionError else { return nil }
+        return String(format: "%.2f px", reproj)
     }
 
     private static func compactCount(_ value: Int) -> String {

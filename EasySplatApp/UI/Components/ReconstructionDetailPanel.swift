@@ -68,6 +68,8 @@ struct ReconstructionDetailPanel: View {
             }
             if let reproj = summary.meanReprojectionErrorText {
                 metricRow(label: "Mean reprojection error", value: reproj)
+            } else if ReconstructionSummary.reprojectionErrorIsUnreliable(forMapper: summary.mapper) {
+                metricRow(label: "Mean reprojection error", value: "not measured for this mapper")
             }
         }
     }

@@ -162,8 +162,9 @@ extension Array where Element == StageTimingRecord {
 }
 
 /// Persisted summary of the accepted sparse reconstruction. Lets the app surface
-/// quality metrics (frame coverage, point density, reprojection error) without
-/// re-parsing the COLMAP model after the run finishes.
+/// quality metrics (frame coverage, point density, and — for mappers that produce real
+/// pixel residuals — reprojection error) without re-parsing the COLMAP model after the
+/// run finishes. See `resolvedReprojectionError` for the honest, display-safe value.
 public struct ReconstructionSummary: Codable, Sendable, Equatable {
     public var mapper: String
     public var capturedAt: Date
@@ -203,28 +204,39 @@ public struct ReconstructionSummary: Codable, Sendable, Equatable {
 }
 
 extension ReconstructionSummary {
-    /// The GLOMAP solver labels whose `model_analyzer` reprojection error is not a real
-    /// pixel residual. The `global_mapper` path is not re-triangulated before analysis
-    /// (unlike the neural refinement paths, which run `point_triangulator` first), so
-    /// `model_analyzer` reports GLOMAP's own stored per-point error — an implausibly small
-    /// figure (~0.0003) in normalized rather than pixel units. Comparing it against the
-    /// pixel-based acceptance threshold and "strong" cutoff is meaningless and inflates the
-    /// rating, so we treat these mappers as having no measured reprojection error.
-    static func isGlobalMapperSummaryMapper(_ mapper: String) -> Bool {
+    /// Mappers whose `model_analyzer` "mean reprojection error" is not a real pixel residual.
+    /// GLOMAP (`global_mapper*`) and the feed-forward neural-direct paths (DA3, MapAnything,
+    /// FastVGGT seed) hand COLMAP a model that is analyzed WITHOUT a `point_triangulator`
+    /// re-triangulation pass (unlike the neural *refinement* paths, which do re-triangulate),
+    /// so `model_analyzer` just averages the bridge's stored per-point error — a placeholder:
+    /// DA3/MapAnything write `1.0`, FastVGGT writes `0.0`, GLOMAP stores a normalized-coordinate
+    /// value (~0.0003). Comparing any of these to the pixel-based acceptance threshold and the
+    /// sub-1.2px "strong" cutoff is meaningless (and inflates the rating), so we treat them as
+    /// having no measured reprojection error.
+    public static func reprojectionErrorIsUnreliable(forMapper mapper: String) -> Bool {
         switch mapper {
-        case "global_mapper", "global_mapper-gpu", "global_mapper-cpu":
+        case "global_mapper", "global_mapper-gpu", "global_mapper-cpu",
+             "da3-direct", "mapanything-direct", "fastvggt-seed":
             return true
         default:
             return false
         }
     }
 
+    /// The reprojection error to display and consume. Returns nil for mappers whose stored
+    /// value is a placeholder (see `reprojectionErrorIsUnreliable`). New summaries already
+    /// persist nil for those mappers; this also masks older `project.json` files written
+    /// before that value was dropped at persist time.
+    public var resolvedReprojectionError: Double? {
+        Self.reprojectionErrorIsUnreliable(forMapper: mapper) ? nil : meanReprojectionError
+    }
+
     /// Bridges the per-run `ReconstructionScore` (lives in SfM) onto the persisted summary.
     /// Acceptance has already been decided on the raw `score`; this only shapes what gets
-    /// persisted and shown, so it is the right place to drop GLOMAP's non-pixel reprojection
-    /// error (see `isGlobalMapperSummaryMapper`) without touching the acceptance gate.
+    /// persisted and shown, so it is the right place to drop the non-pixel reprojection error
+    /// (see `reprojectionErrorIsUnreliable`) without touching the acceptance gate.
     public init(score: ReconstructionScore, mapper: String, capturedAt: Date) {
-        let reproj = Self.isGlobalMapperSummaryMapper(mapper) ? nil : score.meanReprojectionError
+        let reproj = Self.reprojectionErrorIsUnreliable(forMapper: mapper) ? nil : score.meanReprojectionError
         self.init(
             mapper: mapper,
             capturedAt: capturedAt,

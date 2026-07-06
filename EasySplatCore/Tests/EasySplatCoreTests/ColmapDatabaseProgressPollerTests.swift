@@ -36,10 +36,16 @@ final class ColmapDatabaseProgressPollerTests: XCTestCase {
         XCTAssertEqual(try poller.readProcessedPairCount(), 0)
     }
 
+    private func createColmapSchema(_ db: OpaquePointer) throws {
+        try exec(db: db, sql: "CREATE TABLE images(image_id INTEGER PRIMARY KEY);")
+        try exec(db: db, sql: "CREATE TABLE keypoints(image_id INTEGER PRIMARY KEY, rows INTEGER);")
+    }
+
     func testReadKeypointStatsAggregatesTotalsAndMinimum() throws {
         let dbURL = try makeTempDatabaseURL()
         try createDatabase(at: dbURL) { db in
-            try exec(db: db, sql: "CREATE TABLE keypoints(image_id INTEGER PRIMARY KEY, rows INTEGER);")
+            try createColmapSchema(db)
+            try exec(db: db, sql: "INSERT INTO images(image_id) VALUES (1), (2), (3);")
             try exec(db: db, sql: "INSERT INTO keypoints(image_id, rows) VALUES (1, 5000), (2, 8000), (3, 200);")
         }
 
@@ -50,10 +56,27 @@ final class ColmapDatabaseProgressPollerTests: XCTestCase {
         XCTAssertEqual(stats.averageKeypoints, 4_400)
     }
 
-    func testReadKeypointStatsReturnsNilForEmptyKeypointsTable() throws {
+    func testReadKeypointStatsCountsImagesWithNoKeypointRowAsZero() throws {
+        // Image 3 extracted nothing and has no keypoints row: it must still count as a
+        // 0-keypoint frame in the minimum and the per-image average.
         let dbURL = try makeTempDatabaseURL()
         try createDatabase(at: dbURL) { db in
-            try exec(db: db, sql: "CREATE TABLE keypoints(image_id INTEGER PRIMARY KEY, rows INTEGER);")
+            try createColmapSchema(db)
+            try exec(db: db, sql: "INSERT INTO images(image_id) VALUES (1), (2), (3);")
+            try exec(db: db, sql: "INSERT INTO keypoints(image_id, rows) VALUES (1, 5000), (2, 8000);")
+        }
+
+        let stats = try XCTUnwrap(ColmapDatabaseProgressPoller(databasePath: dbURL).readKeypointStats())
+        XCTAssertEqual(stats.imageCount, 3)
+        XCTAssertEqual(stats.totalKeypoints, 13_000)
+        XCTAssertEqual(stats.minKeypoints, 0, "The image with no keypoints row must count as zero.")
+        XCTAssertEqual(stats.averageKeypoints, 13_000 / 3)
+    }
+
+    func testReadKeypointStatsReturnsNilForEmptyImages() throws {
+        let dbURL = try makeTempDatabaseURL()
+        try createDatabase(at: dbURL) { db in
+            try createColmapSchema(db)
         }
 
         XCTAssertNil(ColmapDatabaseProgressPoller(databasePath: dbURL).readKeypointStats())

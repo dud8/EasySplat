@@ -90,10 +90,10 @@ final class PipelineIntegrationTests: XCTestCase {
         XCTAssertTrue(reconstruction.mapper.hasPrefix("global_mapper") || reconstruction.mapper == "colmap",
                       "Unexpected mapper label: \(reconstruction.mapper)")
         // GLOMAP's model_analyzer reprojection error is not a real pixel residual, so the
-        // persisted summary drops it (see ReconstructionSummary.isGlobalMapperSummaryMapper).
-        if reconstruction.mapper.hasPrefix("global_mapper") {
+        // persisted summary drops it (see ReconstructionSummary.reprojectionErrorIsUnreliable).
+        if ReconstructionSummary.reprojectionErrorIsUnreliable(forMapper: reconstruction.mapper) {
             XCTAssertNil(reconstruction.meanReprojectionError,
-                         "GLOMAP reprojection error must not be persisted as a pixel metric.")
+                         "An unreliable mapper's reprojection error must not be persisted as a pixel metric.")
         } else {
             XCTAssertEqual(reconstruction.meanReprojectionError, 1.0)
         }
@@ -423,7 +423,9 @@ final class PipelineIntegrationTests: XCTestCase {
         XCTAssertEqual(reconstruction.mapper, "mapanything-direct")
         XCTAssertEqual(reconstruction.registeredImages, 4)
         XCTAssertEqual(reconstruction.totalImages, 4)
-        XCTAssertEqual(reconstruction.meanReprojectionError, 0.7)
+        // mapanything-direct writes a placeholder point-error, so it is not persisted as a
+        // pixel reprojection (see ReconstructionSummary.reprojectionErrorIsUnreliable).
+        XCTAssertNil(reconstruction.meanReprojectionError)
         let timings = finalMetadata.stageTimings ?? []
         XCTAssertFalse(timings.isEmpty, "Stage timings must be persisted for completed runs.")
         XCTAssertTrue(timings.contains(where: { $0.stage == .sfmFeatures }))

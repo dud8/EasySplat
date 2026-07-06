@@ -679,7 +679,7 @@ public final class PipelineRunner: @unchecked Sendable {
                             )
                             emit(.stageLog(
                                 stage: currentStage,
-                                line: "DA3 score (direct): \(ReconstructionScorer.summary(score)).",
+                                line: "DA3 score (direct): \(ReconstructionScorer.summary(score, mapper: "da3-direct")).",
                                 isError: false
                             ))
                             return score
@@ -1313,6 +1313,7 @@ public final class PipelineRunner: @unchecked Sendable {
                                         }
                                     }
                                 )
+                                self.logKeypointStats(database: paths.colmapDatabaseURL, stage: .sfmMatching, emit: emit)
                                 emit(.stageProgress(stage: .sfmMatching, fraction: 0.30, message: "Matching views: starting pair matching…"))
 
                                 let useSequential = self.shouldUseSequential(
@@ -1973,6 +1974,7 @@ public final class PipelineRunner: @unchecked Sendable {
                                     }
                                 }
                             )
+                            self.logKeypointStats(database: paths.colmapDatabaseURL, stage: .sfmMatching, emit: emit)
                             emit(.stageProgress(stage: .sfmMatching, fraction: 0.30, message: "Matching views: starting pair matching…"))
 
                             let useSequential = self.shouldUseSequential(
@@ -2901,6 +2903,7 @@ public final class PipelineRunner: @unchecked Sendable {
                                         }
                                     }
                                 )
+                                self.logKeypointStats(database: paths.colmapDatabaseURL, stage: .sfmMatching, emit: emit)
                                 try await runExhaustive()
                             }
                         } else {
@@ -3092,7 +3095,7 @@ public final class PipelineRunner: @unchecked Sendable {
                         writeCheckpoint(
                             stage: .sfmMapping,
                             progress: 0.95,
-                            message: "Mapping score: \(ReconstructionScorer.summary(score))",
+                            message: "Mapping score: \(ReconstructionScorer.summary(score, mapper: candidate))",
                             details: .sfmMapping(SfmMappingCheckpoint(
                                 mapper: candidate,
                                 sparsePath: modelURL.path,
@@ -3101,7 +3104,7 @@ public final class PipelineRunner: @unchecked Sendable {
                         )
                         emit(.stageLog(
                             stage: .sfmMapping,
-                            line: "Reconstruction score (\(candidate)): \(ReconstructionScorer.summary(score)).",
+                            line: "Reconstruction score (\(candidate)): \(ReconstructionScorer.summary(score, mapper: candidate)).",
                             isError: false
                         ))
                         if ReconstructionScorer.isAcceptable(score, mode: metadata.preset.mode) {

@@ -62,11 +62,17 @@ struct ColmapDatabaseProgressPoller: Sendable {
         }
         sqlite3_busy_timeout(db, 250)
 
-        guard let imageCount = queryCount(db: db, sql: "SELECT COUNT(*) FROM keypoints;"), imageCount > 0 else {
+        // Count from `images`, not `keypoints`: an image that extracted zero features may have
+        // no keypoints row at all, and it must still count as a 0-keypoint (degenerate) frame
+        // rather than silently vanish from the average and minimum.
+        guard let imageCount = queryCount(db: db, sql: "SELECT COUNT(*) FROM images;"), imageCount > 0 else {
             return nil
         }
-        let total = queryCount(db: db, sql: "SELECT SUM(rows) FROM keypoints;") ?? 0
-        let minRows = queryCount(db: db, sql: "SELECT MIN(rows) FROM keypoints;") ?? 0
+        let total = queryCount(db: db, sql: "SELECT COALESCE(SUM(rows), 0) FROM keypoints;") ?? 0
+        let minRows = queryCount(
+            db: db,
+            sql: "SELECT MIN(COALESCE(k.rows, 0)) FROM images i LEFT JOIN keypoints k ON i.image_id = k.image_id;"
+        ) ?? 0
         return KeypointStats(imageCount: imageCount, totalKeypoints: total, minKeypoints: minRows)
     }
 
