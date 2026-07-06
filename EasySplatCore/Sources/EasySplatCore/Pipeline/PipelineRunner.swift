@@ -65,6 +65,7 @@ public final class PipelineRunner: @unchecked Sendable {
     private let projectURL: URL
     let config: PipelineConfig
     let tooling: Tooling
+    let powerAssertion: PowerAssertionManaging
 
     enum SfmMapperPreference: String {
         case glomap
@@ -92,13 +93,25 @@ public final class PipelineRunner: @unchecked Sendable {
         }
     }
 
-    public init(projectURL: URL, config: PipelineConfig, tooling: Tooling = Tooling()) {
+    public init(
+        projectURL: URL,
+        config: PipelineConfig,
+        tooling: Tooling = Tooling(),
+        powerAssertion: PowerAssertionManaging = SystemPowerAssertion()
+    ) {
         self.projectURL = projectURL
         self.config = config
         self.tooling = tooling
+        self.powerAssertion = powerAssertion
     }
 
     public func run(resumeFrom lastCompletedStage: PipelineStage? = nil, events: @escaping @Sendable (PipelineEvent) -> Void) async throws {
+        // Keep the Mac awake for the entire run. Runs are multi-hour and training has no
+        // resumable checkpoint, so a system idle-sleep partway through loses the session.
+        // Released on every exit — success, throw, or cancellation.
+        let idleSleepAssertion = powerAssertion.beginPreventingIdleSleep(reason: "EasySplat is processing a project")
+        defer { idleSleepAssertion.release() }
+
         let paths = ProjectPaths(root: projectURL)
         try paths.ensureDirectories()
 

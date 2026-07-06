@@ -66,13 +66,18 @@ final class PipelineIntegrationTests: XCTestCase {
             })
         ])
 
+        let powerAssertion = RecordingPowerAssertion()
         let pipeline = PipelineRunner(
             projectURL: projectURL,
             config: .init(toolchain: toolchain, preset: metadata.preset),
-            tooling: .init(runner: runner)
+            tooling: .init(runner: runner),
+            powerAssertion: powerAssertion
         )
 
         try await pipeline.run { _ in }
+
+        XCTAssertEqual(powerAssertion.begun, 1, "A successful run holds exactly one idle-sleep assertion.")
+        XCTAssertEqual(powerAssertion.released, 1, "A successful run must release the idle-sleep assertion.")
 
         let output = projectURL.appendingPathComponent("Output/splat.ply")
         XCTAssertTrue(FileManager.default.fileExists(atPath: output.path))
@@ -116,15 +121,20 @@ final class PipelineIntegrationTests: XCTestCase {
         let runner = MockSubprocessRunner(scripts: [
             .init(path: toolchain.colmap.path, argsPrefix: ["feature_extractor"], result: .init(exitCode: 1, terminationReason: .exit, stdout: "", stderr: "feature extraction failed"), onRun: nil)
         ])
+        let powerAssertion = RecordingPowerAssertion()
         let pipeline = PipelineRunner(
             projectURL: projectURL,
             config: .init(toolchain: toolchain, preset: metadata.preset),
-            tooling: .init(runner: runner)
+            tooling: .init(runner: runner),
+            powerAssertion: powerAssertion
         )
 
         await XCTAssertThrowsErrorAsync({
             try await pipeline.run { _ in }
         }, errorHandler: { _ in })
+
+        XCTAssertEqual(powerAssertion.begun, 1, "A failed run still holds exactly one idle-sleep assertion.")
+        XCTAssertEqual(powerAssertion.released, 1, "A failed run must release the idle-sleep assertion on the throw path.")
 
         let failedMetadata = try ProjectMetadataStore.load(from: paths.metadataURL)
         XCTAssertNil(failedMetadata.lastRunStartedAt, "Failed runs should clear lastRunStartedAt.")
