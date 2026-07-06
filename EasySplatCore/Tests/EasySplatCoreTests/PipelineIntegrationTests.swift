@@ -87,9 +87,16 @@ final class PipelineIntegrationTests: XCTestCase {
         let reconstruction = try XCTUnwrap(finalMetadata.reconstruction, "Successful runs must persist a reconstruction summary.")
         XCTAssertEqual(reconstruction.registeredImages, 100)
         XCTAssertEqual(reconstruction.totalImages, 100)
-        XCTAssertEqual(reconstruction.meanReprojectionError, 1.0)
         XCTAssertTrue(reconstruction.mapper.hasPrefix("global_mapper") || reconstruction.mapper == "colmap",
                       "Unexpected mapper label: \(reconstruction.mapper)")
+        // GLOMAP's model_analyzer reprojection error is not a real pixel residual, so the
+        // persisted summary drops it (see ReconstructionSummary.isGlobalMapperSummaryMapper).
+        if reconstruction.mapper.hasPrefix("global_mapper") {
+            XCTAssertNil(reconstruction.meanReprojectionError,
+                         "GLOMAP reprojection error must not be persisted as a pixel metric.")
+        } else {
+            XCTAssertEqual(reconstruction.meanReprojectionError, 1.0)
+        }
     }
 
     func testPipelineFailureClearsRunStartMarker() async throws {

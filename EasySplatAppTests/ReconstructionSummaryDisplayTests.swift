@@ -17,7 +17,7 @@ final class ReconstructionSummaryDisplayTests: XCTestCase {
 
     func testQualityStrongRequiresGoodMetricsAcrossTheBoard() {
         let strong = ReconstructionSummary(
-            mapper: "global_mapper",
+            mapper: "colmap",
             capturedAt: Date(timeIntervalSince1970: 0),
             registeredImages: 30,
             totalImages: 30,
@@ -46,7 +46,7 @@ final class ReconstructionSummaryDisplayTests: XCTestCase {
 
     func testQualityDowngradesToLowOnBadReprojectionEvenWithHighCoverage() {
         let summary = ReconstructionSummary(
-            mapper: "global_mapper",
+            mapper: "colmap",
             capturedAt: Date(timeIntervalSince1970: 0),
             registeredImages: 30,
             totalImages: 30,

@@ -203,14 +203,34 @@ public struct ReconstructionSummary: Codable, Sendable, Equatable {
 }
 
 extension ReconstructionSummary {
+    /// The GLOMAP solver labels whose `model_analyzer` reprojection error is not a real
+    /// pixel residual. The `global_mapper` path is not re-triangulated before analysis
+    /// (unlike the neural refinement paths, which run `point_triangulator` first), so
+    /// `model_analyzer` reports GLOMAP's own stored per-point error — an implausibly small
+    /// figure (~0.0003) in normalized rather than pixel units. Comparing it against the
+    /// pixel-based acceptance threshold and "strong" cutoff is meaningless and inflates the
+    /// rating, so we treat these mappers as having no measured reprojection error.
+    static func isGlobalMapperSummaryMapper(_ mapper: String) -> Bool {
+        switch mapper {
+        case "global_mapper", "global_mapper-gpu", "global_mapper-cpu":
+            return true
+        default:
+            return false
+        }
+    }
+
     /// Bridges the per-run `ReconstructionScore` (lives in SfM) onto the persisted summary.
+    /// Acceptance has already been decided on the raw `score`; this only shapes what gets
+    /// persisted and shown, so it is the right place to drop GLOMAP's non-pixel reprojection
+    /// error (see `isGlobalMapperSummaryMapper`) without touching the acceptance gate.
     public init(score: ReconstructionScore, mapper: String, capturedAt: Date) {
+        let reproj = Self.isGlobalMapperSummaryMapper(mapper) ? nil : score.meanReprojectionError
         self.init(
             mapper: mapper,
             capturedAt: capturedAt,
             registeredImages: score.registeredImages,
             totalImages: score.totalImages,
-            meanReprojectionError: score.meanReprojectionError,
+            meanReprojectionError: reproj,
             pointCount: score.pointCount,
             observationCount: score.observationCount,
             meanTrackLength: score.meanTrackLength
