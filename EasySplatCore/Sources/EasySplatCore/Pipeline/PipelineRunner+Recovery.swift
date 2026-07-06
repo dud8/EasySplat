@@ -147,6 +147,44 @@ extension PipelineRunner {
         }
     }
 
+    /// Surfaces a failed matcher attempt's real error (exit code, termination reason, stderr
+    /// tail) at a retry boundary. Without this, a transient matcher crash — e.g. a SIGSEGV
+    /// that emits little or no stderr — shows the user only "failed, retrying" and the actual
+    /// cause stays invisible unless a terminal failure follows, which it may not if the retry
+    /// succeeds. Non-COLMAP errors carry their own context and are left to the terminal path.
+    func emitMatcherRetryDiagnostics(_ error: Error, stage: PipelineStage, emit: (PipelineEvent) -> Void) {
+        guard let colmapError = error as? ColmapRunnerError else { return }
+        emit(.stageLog(
+            stage: stage,
+            line: "Previous matcher attempt failed before retry:\n\(debugDescription(for: colmapError))",
+            isError: true
+        ))
+    }
+
+    /// Warn once a frame extracted fewer keypoints than this. A well-textured image yields
+    /// thousands; a handful signals a flat/low-texture/degenerate frame that can fragment SfM.
+    static let lowKeypointWarningThreshold = 100
+
+    /// Reads the true per-image keypoint counts back from the COLMAP database after feature
+    /// extraction and logs them. This build's COLMAP silently ignores the requested feature
+    /// cap, so the count is content-driven; surfacing the real totals (and flagging frames
+    /// that extracted almost nothing) turns an otherwise opaque stage into an honest signal.
+    func logKeypointStats(database: URL, emit: (PipelineEvent) -> Void) {
+        guard let stats = ColmapDatabaseProgressPoller(databasePath: database).readKeypointStats() else { return }
+        emit(.stageLog(
+            stage: .sfmFeatures,
+            line: "Extracted \(stats.totalKeypoints) keypoints across \(stats.imageCount) images (avg \(stats.averageKeypoints)/image, min \(stats.minKeypoints)).",
+            isError: false
+        ))
+        if stats.minKeypoints < Self.lowKeypointWarningThreshold {
+            emit(.stageLog(
+                stage: .sfmFeatures,
+                line: "At least one frame extracted only \(stats.minKeypoints) keypoints; low-texture or degenerate frames can weaken or fragment the reconstruction.",
+                isError: true
+            ))
+        }
+    }
+
     func validateStageOutput(_ stage: PipelineStage, paths: ProjectPaths, metadata: ProjectMetadata) throws -> StageOutputStatus {
         let fm = FileManager.default
         switch stage {

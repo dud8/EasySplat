@@ -37,6 +37,39 @@ struct ColmapDatabaseProgressPoller: Sendable {
         return 0
     }
 
+    /// Actual per-image keypoint counts read back from the database after feature extraction.
+    /// This build's COLMAP silently ignores `--SiftExtraction.max_num_features`, so the count
+    /// is content-driven, not the requested cap — reading it back gives the true figure for the
+    /// log and lets us flag frames that extracted almost nothing (flat/low-texture/degenerate).
+    struct KeypointStats: Sendable, Equatable {
+        var imageCount: Int
+        var totalKeypoints: Int
+        var minKeypoints: Int
+
+        var averageKeypoints: Int {
+            imageCount > 0 ? totalKeypoints / imageCount : 0
+        }
+    }
+
+    /// Reads keypoint totals from the `keypoints` table (`rows` is the per-image keypoint
+    /// count). Returns nil if the table is missing or empty so callers can simply skip logging.
+    func readKeypointStats() -> KeypointStats? {
+        var db: OpaquePointer?
+        defer { sqlite3_close(db) }
+
+        guard sqlite3_open_v2(databasePath.path, &db, SQLITE_OPEN_READONLY, nil) == SQLITE_OK, let db else {
+            return nil
+        }
+        sqlite3_busy_timeout(db, 250)
+
+        guard let imageCount = queryCount(db: db, sql: "SELECT COUNT(*) FROM keypoints;"), imageCount > 0 else {
+            return nil
+        }
+        let total = queryCount(db: db, sql: "SELECT SUM(rows) FROM keypoints;") ?? 0
+        let minRows = queryCount(db: db, sql: "SELECT MIN(rows) FROM keypoints;") ?? 0
+        return KeypointStats(imageCount: imageCount, totalKeypoints: total, minKeypoints: minRows)
+    }
+
     private func queryCount(db: OpaquePointer, sql: String) -> Int? {
         var statement: OpaquePointer?
         defer { sqlite3_finalize(statement) }

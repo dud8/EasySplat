@@ -36,6 +36,35 @@ final class ColmapDatabaseProgressPollerTests: XCTestCase {
         XCTAssertEqual(try poller.readProcessedPairCount(), 0)
     }
 
+    func testReadKeypointStatsAggregatesTotalsAndMinimum() throws {
+        let dbURL = try makeTempDatabaseURL()
+        try createDatabase(at: dbURL) { db in
+            try exec(db: db, sql: "CREATE TABLE keypoints(image_id INTEGER PRIMARY KEY, rows INTEGER);")
+            try exec(db: db, sql: "INSERT INTO keypoints(image_id, rows) VALUES (1, 5000), (2, 8000), (3, 200);")
+        }
+
+        let stats = try XCTUnwrap(ColmapDatabaseProgressPoller(databasePath: dbURL).readKeypointStats())
+        XCTAssertEqual(stats.imageCount, 3)
+        XCTAssertEqual(stats.totalKeypoints, 13_200)
+        XCTAssertEqual(stats.minKeypoints, 200)
+        XCTAssertEqual(stats.averageKeypoints, 4_400)
+    }
+
+    func testReadKeypointStatsReturnsNilForEmptyKeypointsTable() throws {
+        let dbURL = try makeTempDatabaseURL()
+        try createDatabase(at: dbURL) { db in
+            try exec(db: db, sql: "CREATE TABLE keypoints(image_id INTEGER PRIMARY KEY, rows INTEGER);")
+        }
+
+        XCTAssertNil(ColmapDatabaseProgressPoller(databasePath: dbURL).readKeypointStats())
+    }
+
+    func testReadKeypointStatsReturnsNilForMissingDatabase() {
+        let url = URL(fileURLWithPath: NSTemporaryDirectory(), isDirectory: true)
+            .appendingPathComponent("\(UUID().uuidString).sqlite")
+        XCTAssertNil(ColmapDatabaseProgressPoller(databasePath: url).readKeypointStats())
+    }
+
     private func makeTempDatabaseURL() throws -> URL {
         let dir = URL(fileURLWithPath: NSTemporaryDirectory(), isDirectory: true)
             .appendingPathComponent(UUID().uuidString, isDirectory: true)

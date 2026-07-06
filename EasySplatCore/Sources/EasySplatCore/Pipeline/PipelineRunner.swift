@@ -1394,6 +1394,7 @@ public final class PipelineRunner: @unchecked Sendable {
                                             line: "Sequential matcher failed during MapAnything refinement; retrying with exhaustive matching.",
                                             isError: true
                                         ))
+                                        self.emitMatcherRetryDiagnostics(error, stage: .sfmMatching, emit: emit)
                                         lastUsedSequentialMatcher = false
                                         try await runExhaustiveMatcher()
                                     } else {
@@ -2053,6 +2054,7 @@ public final class PipelineRunner: @unchecked Sendable {
                                         line: "Sequential matcher failed during FastVGGT refinement; retrying with exhaustive matching.",
                                         isError: true
                                     ))
+                                    self.emitMatcherRetryDiagnostics(error, stage: .sfmMatching, emit: emit)
                                     lastUsedSequentialMatcher = false
                                     try await runExhaustiveMatcher()
                                 } else {
@@ -2738,6 +2740,7 @@ public final class PipelineRunner: @unchecked Sendable {
                     options: colmapExtractOptions,
                     onLog: onFeaturesLog
                 )
+                self.logKeypointStats(database: paths.colmapDatabaseURL, emit: emit)
                 writeCheckpoint(
                     stage: .sfmFeatures,
                     progress: 1.0,
@@ -2851,6 +2854,7 @@ public final class PipelineRunner: @unchecked Sendable {
                                 line: "Sequential matcher failed. Retrying sequential matching with higher overlap (\(previousOverlap) -> \(increasedOverlap)).",
                                 isError: true
                             ))
+                            self.emitMatcherRetryDiagnostics(error, stage: .sfmMatching, emit: emit)
                             colmapMatchOptions.sequentialOverlap = increasedOverlap
                             do {
                                 try await runSequential()
@@ -2862,6 +2866,7 @@ public final class PipelineRunner: @unchecked Sendable {
                                     line: "Sequential matcher failed again. Rebuilding database and retrying with exhaustive matching on fewer frames.",
                                     isError: true
                                 ))
+                                self.emitMatcherRetryDiagnostics(error, stage: .sfmMatching, emit: emit)
                                 let previousCount = selectedFrames.count
                                 let reduced = try self.downsampleSelectedFrames(to: exhaustiveFallbackMaxFrames, paths: paths)
                                 if let reduced {

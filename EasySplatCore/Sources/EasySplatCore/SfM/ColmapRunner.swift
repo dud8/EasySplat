@@ -206,6 +206,12 @@ public final class ColmapRunner {
         if let maxNumMatches = options.maxNumMatches {
             finalArgs.append(contentsOf: ["--FeatureMatching.max_num_matches", "\(maxNumMatches)"])
         }
+        // matches_importer runs SIFT matching per listed pair, so on this toolchain's
+        // FLANN-segfaulting COLMAP build it needs the brute-force flag just like the
+        // sequential/exhaustive matchers, or it would crash the same way.
+        if options.useBruteForceMatcher {
+            finalArgs.append(contentsOf: ["--SiftMatching.cpu_brute_force_matcher", "1"])
+        }
         onLog("EasySplat: colmap argv: \(colmapPath.path) \(finalArgs.joined(separator: " "))", false)
         let result = try await runner.runAsync(
             colmapPath.path,
