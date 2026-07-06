@@ -1395,7 +1395,7 @@ public final class PipelineRunner: @unchecked Sendable {
                                             line: "Sequential matcher failed during MapAnything refinement; retrying with exhaustive matching.",
                                             isError: true
                                         ))
-                                        self.emitMatcherRetryDiagnostics(error, stage: .sfmMatching, emit: emit)
+                                        self.emitColmapRetryDiagnostics(error, stage: .sfmMatching, emit: emit)
                                         lastUsedSequentialMatcher = false
                                         try await runExhaustiveMatcher()
                                     } else {
@@ -1640,6 +1640,7 @@ public final class PipelineRunner: @unchecked Sendable {
                                                     line: "global_mapper GPU path failed; retrying global_mapper with GPU disabled.",
                                                     isError: true
                                                 ))
+                                                self.emitColmapRetryDiagnostics(colmapError, stage: .sfmMapping, emit: emit)
                                                 do {
                                                     try self.resetDirectory(paths.colmapSparseURL)
                                                     try await self.tooling.colmap.runGlobalMapper(
@@ -2056,7 +2057,7 @@ public final class PipelineRunner: @unchecked Sendable {
                                         line: "Sequential matcher failed during FastVGGT refinement; retrying with exhaustive matching.",
                                         isError: true
                                     ))
-                                    self.emitMatcherRetryDiagnostics(error, stage: .sfmMatching, emit: emit)
+                                    self.emitColmapRetryDiagnostics(error, stage: .sfmMatching, emit: emit)
                                     lastUsedSequentialMatcher = false
                                     try await runExhaustiveMatcher()
                                 } else {
@@ -2361,6 +2362,7 @@ public final class PipelineRunner: @unchecked Sendable {
                                                 line: "global_mapper GPU path failed; retrying global_mapper with GPU disabled.",
                                                 isError: true
                                             ))
+                                            self.emitColmapRetryDiagnostics(colmapError, stage: .sfmMapping, emit: emit)
                                             do {
                                                 try self.resetDirectory(paths.colmapSparseURL)
                                                 try await self.tooling.colmap.runGlobalMapper(
@@ -2795,6 +2797,14 @@ public final class PipelineRunner: @unchecked Sendable {
                 let exhaustiveFallbackMaxFrames = 60
                 lastUsedSequentialMatcher = useSequential
 
+                if !useSequential, metadata.input.videoFiles.count > 1 {
+                    emit(.stageLog(
+                        stage: .sfmMatching,
+                        line: "Multiple video clips detected (\(metadata.input.videoFiles.count)); using exhaustive matching so frames from different clips can link. Sequential matching would only connect frames adjacent within one clip.",
+                        isError: false
+                    ))
+                }
+
                 func runSequential() async throws {
                     let expected = ColmapPairEstimator.expectedSequentialPairs(
                         imageCount: selectedFrames.count,
@@ -2856,7 +2866,7 @@ public final class PipelineRunner: @unchecked Sendable {
                                 line: "Sequential matcher failed. Retrying sequential matching with higher overlap (\(previousOverlap) -> \(increasedOverlap)).",
                                 isError: true
                             ))
-                            self.emitMatcherRetryDiagnostics(error, stage: .sfmMatching, emit: emit)
+                            self.emitColmapRetryDiagnostics(error, stage: .sfmMatching, emit: emit)
                             colmapMatchOptions.sequentialOverlap = increasedOverlap
                             do {
                                 try await runSequential()
@@ -2868,7 +2878,7 @@ public final class PipelineRunner: @unchecked Sendable {
                                     line: "Sequential matcher failed again. Rebuilding database and retrying with exhaustive matching on fewer frames.",
                                     isError: true
                                 ))
-                                self.emitMatcherRetryDiagnostics(error, stage: .sfmMatching, emit: emit)
+                                self.emitColmapRetryDiagnostics(error, stage: .sfmMatching, emit: emit)
                                 let previousCount = selectedFrames.count
                                 let reduced = try self.downsampleSelectedFrames(to: exhaustiveFallbackMaxFrames, paths: paths)
                                 if let reduced {
@@ -3110,6 +3120,7 @@ public final class PipelineRunner: @unchecked Sendable {
                         if ReconstructionScorer.isAcceptable(score, mode: metadata.preset.mode) {
                             acceptedMappingStrategy = candidate
                             acceptedReconstructionScore = score
+                            self.warnIfWeakAcceptedSolve(score: score, mapper: candidate, emit: emit)
                             acceptedReconstructionSummary = ReconstructionSummary(
                                 score: score,
                                 mapper: candidate,
@@ -3189,6 +3200,7 @@ public final class PipelineRunner: @unchecked Sendable {
                                     line: "global_mapper GPU path failed; retrying global_mapper with GPU disabled.",
                                     isError: true
                                 ))
+                                self.emitColmapRetryDiagnostics(colmapError, stage: .sfmMapping, emit: emit)
                                 do {
                                     try self.resetDirectory(paths.colmapSparseURL)
                                     lastMappingAttempt = "global_mapper-cpu"

@@ -157,6 +157,36 @@ final class ColmapRunnerTests: XCTestCase {
         )
     }
 
+    func testMatchesImporterOmitsBruteForceFlagWhenDisabled() async throws {
+        let runner = MockSubprocessRunner(scripts: [
+            .init(
+                path: "/mock/colmap",
+                argsPrefix: ["matches_importer"],
+                result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""),
+                onRun: { args in
+                    XCTAssertFalse(args.contains("--SiftMatching.cpu_brute_force_matcher"),
+                                   "The brute-force flag must be absent when it is not requested.")
+                }
+            )
+        ])
+
+        let colmap = ColmapRunner(runner: runner)
+        try await colmap.runMatchesImporter(
+            colmapPath: URL(fileURLWithPath: "/mock/colmap"),
+            database: URL(fileURLWithPath: "/tmp/db"),
+            matchListPath: URL(fileURLWithPath: "/tmp/pairs.txt"),
+            matchType: "pairs",
+            options: ColmapOptions(
+                useGPU: false,
+                extractThreads: 1,
+                matchThreads: 1,
+                sequentialOverlap: 5,
+                useBruteForceMatcher: false
+            ),
+            onLog: { _, _ in }
+        )
+    }
+
     func testPointTriangulatorUsesSeedAndOutputPaths() async throws {
         let runner = MockSubprocessRunner(scripts: [
             .init(

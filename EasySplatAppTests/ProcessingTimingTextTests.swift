@@ -39,9 +39,9 @@ final class ProcessingTimingTextTests: XCTestCase {
     }
 
     func testTimingTextIncludesPredictionWhenPresent() {
-        let text = ProcessingView.timingText(elapsed: 65, silenceSeconds: nil, stagePrediction: 130)
-        let unwrapped = try? XCTUnwrap(text)
-        XCTAssertEqual(unwrapped?.hasPrefix("Elapsed 1m 05s"), true)
-        XCTAssertEqual(unwrapped?.contains("Typical"), true)
+        XCTAssertEqual(
+            ProcessingView.timingText(elapsed: 65, silenceSeconds: nil, stagePrediction: 130),
+            "Elapsed 1m 05s • Typical 2m 10s"
+        )
     }
 }

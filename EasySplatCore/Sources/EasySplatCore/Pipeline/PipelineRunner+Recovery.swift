@@ -147,16 +147,39 @@ extension PipelineRunner {
         }
     }
 
-    /// Surfaces a failed matcher attempt's real error (exit code, termination reason, stderr
-    /// tail) at a retry boundary. Without this, a transient matcher crash — e.g. a SIGSEGV
-    /// that emits little or no stderr — shows the user only "failed, retrying" and the actual
-    /// cause stays invisible unless a terminal failure follows, which it may not if the retry
-    /// succeeds. Non-COLMAP errors carry their own context and are left to the terminal path.
-    func emitMatcherRetryDiagnostics(_ error: Error, stage: PipelineStage, emit: (PipelineEvent) -> Void) {
-        guard let colmapError = error as? ColmapRunnerError else { return }
+    /// Surfaces a failed COLMAP attempt's cause at a retry boundary (matching OR mapping) as
+    /// one prefixed log line: command, exit code, termination reason, and the last stderr line.
+    /// Without this, a transient crash — e.g. a SIGSEGV that emits little or no stderr — shows
+    /// only "failed, retrying" and the cause stays invisible unless a terminal failure follows,
+    /// which it may not if the retry succeeds. The full stdout/stderr tails remain in the COLMAP
+    /// tool log; non-COLMAP errors are left to the terminal path, which renders them in full.
+    func emitColmapRetryDiagnostics(_ error: Error, stage: PipelineStage, emit: (PipelineEvent) -> Void) {
+        guard case let ColmapRunnerError.failed(command, exitCode, reason, _, stderrTail) = error else { return }
+        let lastStderrLine = stderrTail
+            .split(separator: "\n", omittingEmptySubsequences: true)
+            .last
+            .map { String($0).trimmingCharacters(in: .whitespaces) }
+        var detail = "Previous \(command) attempt failed: exit \(exitCode), \(reason)"
+        if let lastStderrLine, !lastStderrLine.isEmpty {
+            detail += " — \(lastStderrLine)"
+        }
+        emit(.stageLog(stage: stage, line: detail, isError: true))
+    }
+
+    /// Warn once an accepted COLMAP/GLOMAP solve's mean track length is below this. A healthy
+    /// solve threads each point through several views (~3-6); a shorter average means a thin,
+    /// fragmented reconstruction.
+    static let weakTrackLengthThreshold = 3.0
+
+    /// Advisory only. The COLMAP/GLOMAP acceptance gate checks registration ratio plus that
+    /// metrics are non-empty, so a thin solve can pass where the neural-direct backends enforce
+    /// real floors. This logs a heads-up for the COLMAP path without changing accept/reject, so
+    /// a weak-but-accepted solve is not silent.
+    func warnIfWeakAcceptedSolve(score: ReconstructionScore, mapper: String, emit: (PipelineEvent) -> Void) {
+        guard let tracks = score.meanTrackLength, tracks < Self.weakTrackLengthThreshold else { return }
         emit(.stageLog(
-            stage: stage,
-            line: "Previous matcher attempt failed before retry:\n\(debugDescription(for: colmapError))",
+            stage: .sfmMapping,
+            line: "Accepted \(mapper) solve has a short mean track length (\(String(format: "%.1f", tracks)) < \(Self.weakTrackLengthThreshold)); it met the coverage bar but the geometry is thin, so the splat may be sparse or fragmented.",
             isError: true
         ))
     }
