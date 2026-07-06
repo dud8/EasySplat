@@ -96,6 +96,23 @@ final class ProjectArtifactValidatorTests: XCTestCase {
         XCTAssertEqual(ProjectArtifactValidator.validatePlyFile(at: large), .valid)
     }
 
+    func testReadPlyHeaderReturnsVertexCountAndFormat() throws {
+        let root = try TestFileBuilder.makeTempDir()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let output = root.appendingPathComponent("good.ply")
+        try TestFileBuilder.writeMinimalPly(at: output, vertexCount: 12_345)
+        let info = try XCTUnwrap(ProjectArtifactValidator.readPlyHeader(at: output))
+        XCTAssertEqual(info.vertexCount, 12_345)
+        XCTAssertEqual(info.format, "ascii")
+    }
+
+    func testReadPlyHeaderReturnsNilForMissingFile() {
+        let info = ProjectArtifactValidator.readPlyHeader(
+            at: URL(fileURLWithPath: "/tmp/does-not-exist-\(UUID().uuidString).ply")
+        )
+        XCTAssertNil(info)
+    }
+
     func testValidatePlyIgnoresEndHeaderMentionInsideComment() throws {
         let root = try TestFileBuilder.makeTempDir()
         defer { try? FileManager.default.removeItem(at: root) }

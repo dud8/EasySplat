@@ -2,6 +2,7 @@ import SwiftUI
 import AppKit
 import Foundation
 import Combine
+import EasySplatCore
 
 struct ProcessingView: View {
     @EnvironmentObject private var model: AppModel
@@ -9,8 +10,18 @@ struct ProcessingView: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 20) {
-            Text("Building your 3D memory")
-                .font(.title2.weight(.semibold))
+            HStack(alignment: .firstTextBaseline, spacing: 10) {
+                Text("Building your 3D memory")
+                    .font(.title2.weight(.semibold))
+                    .layoutPriority(2)
+                    .accessibilityAddTraits(.isHeader)
+                if let preset = model.currentPreset, let input = model.currentInput {
+                    RunConfigSummaryView(preset: preset, input: input)
+                        .controlSize(.small)
+                        .frame(maxWidth: 380, alignment: .leading)
+                }
+                Spacer(minLength: 0)
+            }
 
             GeometryReader { geometry in
                 let availableHeight = geometry.size.height
@@ -69,9 +80,18 @@ struct ProcessingView: View {
                                 }
                             }
                             if let error = model.lastError {
-                                Text(error)
-                                    .foregroundStyle(.red)
-                                    .font(.subheadline)
+                                let category = ProjectFailureCategory.classify(message: error)
+                                VStack(alignment: .leading, spacing: 4) {
+                                    Label(error, systemImage: category.systemImageName)
+                                        .labelStyle(.titleAndIcon)
+                                        .foregroundStyle(.red)
+                                        .font(.subheadline)
+                                    if let hint = category.hint {
+                                        Text(hint)
+                                            .font(.caption)
+                                            .foregroundStyle(.secondary)
+                                    }
+                                }
                             }
                             LogDrawerView(
                                 lines: model.logLines,
@@ -97,6 +117,15 @@ struct ProcessingView: View {
                     }
                     .buttonStyle(SecondaryButtonStyle())
                     .disabled(model.isStopping)
+                }
+
+                if let projectURL = model.currentProjectURL, model.lastError != nil {
+                    Button("Copy Diagnostics") {
+                        model.copyDiagnosticBundle(forProjectURL: projectURL)
+                    }
+                    .buttonStyle(SecondaryButtonStyle())
+                    .disabled(model.isStopping)
+                    .help("Copy a paste-ready diagnostic summary (metadata + log tails) for bug reports.")
                 }
 
                 Button("Return") {
@@ -143,6 +172,7 @@ struct ProcessingView: View {
             Button(returnPrimaryActionLabel) {
                 model.cancelCurrentProject(deleteProject: false)
             }
+            .keyboardShortcut(.defaultAction)
             Button("Delete Project", role: .destructive) {
                 model.cancelCurrentProject(deleteProject: true)
             }
@@ -173,6 +203,17 @@ struct ProcessingView: View {
                 parts.append("Last update \(formatElapsed(silence)) ago")
             } else {
                 parts.append("Last update now")
+            }
+        }
+        if let stage = model.stage {
+            let preset = model.currentPreset ?? PresetSpec(mode: model.captureMode, quality: model.qualityPreset)
+            if let prediction = RunDurationPredictor.predictStage(
+                stage,
+                mode: preset.mode,
+                quality: preset.quality,
+                from: model.projectSummaries
+            ) {
+                parts.append("Typical \(StageTimingDisplay.formatDuration(seconds: prediction.seconds))")
             }
         }
         return parts.joined(separator: " • ")
@@ -257,12 +298,14 @@ private struct TrainingConsentSheet: View {
                     model.resolveTrainingConsent(accepted: false, remember: false)
                 }
                 .buttonStyle(SecondaryButtonStyle())
+                .keyboardShortcut(.cancelAction)
 
                 Button("Continue Training") {
                     let remember = rememberChoice
                     model.resolveTrainingConsent(accepted: true, remember: remember)
                 }
                 .buttonStyle(PrimaryButtonStyle())
+                .keyboardShortcut(.defaultAction)
             }
         }
         .padding(24)

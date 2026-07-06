@@ -2,6 +2,21 @@ import Foundation
 import SQLite3
 
 extension PipelineRunner {
+    /// Rebuild a transient `ReconstructionScore` from the persisted summary so
+    /// resume-from-SfM runs do not lose the per-run quality data the trainer
+    /// selection guard relies on. The persisted summary is the same data the
+    /// runner originally stored when SfM accepted a model.
+    static func reconstructionScore(fromPersistedSummary summary: ReconstructionSummary) -> ReconstructionScore {
+        return ReconstructionScore(
+            registeredImages: summary.registeredImages,
+            totalImages: summary.totalImages,
+            meanReprojectionError: summary.meanReprojectionError,
+            pointCount: summary.pointCount,
+            observationCount: summary.observationCount,
+            meanTrackLength: summary.meanTrackLength
+        )
+    }
+
     enum PipelineError: Error {
         case invalidInput
         case insufficientInputImages(Int)

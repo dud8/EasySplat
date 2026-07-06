@@ -516,10 +516,12 @@ Typical project bundle layout:
     app_events.jsonl
     colmap.log
     glomap.log
+    da3.log
     mapanything.log
     vggt.log
     fastvggt.log
     brush.log
+    msplat.log
 ```
 
 The exact contents vary by backend and success/failure path, but that is the stable conceptual shape.
@@ -537,7 +539,13 @@ The exact contents vary by backend and success/failure path, but that is the sta
 - checkpoint information,
 - recovery prompt suppression,
 - last run start time,
-- share metrics.
+- share metrics,
+- the accepted reconstruction summary (registered frames, points, observations, mean track length, mean reprojection error, mapper, captured-at),
+- per-stage wall-clock timings,
+- the AutoTuner snapshot (hardware tier + knobs picked for the run),
+- a free-text notes field.
+
+A sibling `last_opened.json` sidecar holds the user's last-opened timestamp. It lives outside `project.json` so the home-screen open stamp cannot clobber concurrent pipeline writes.
 
 This is why EasySplat can behave like a document-style app even though it is not using AppKit document architecture.
 
@@ -1040,7 +1048,7 @@ This is intentionally compact, not exhaustive.
 
 Notes:
 
-- DA3 variables are the most relevant day to day because DA3 is the current default; MapAnything variables still matter for fallback tuning.
+- DA3 variables matter for Balanced and Ultra runs; the Fast profile defaults to COLMAP `global_mapper`, and MapAnything variables still matter for fallback tuning.
 - Many VGGT and FastVGGT variables still exist in the codebase for explicit override flows.
 - Some older FastVGGT-specific environment variables are still documented as deprecated or ignored.
 

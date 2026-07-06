@@ -42,6 +42,49 @@ extension AppModel {
         } else {
             selectionWarning = "Ignored \(ignoredFiles.count) file(s). Supported: video files and a photo folder."
         }
+
+        if let folder = newFolder, let count = AppModel.countImageFiles(in: folder), count < AppModel.minimumRecommendedPhotos {
+            let message = "\"\(folder.lastPathComponent)\" has \(count) image file\(count == 1 ? "" : "s"). \(AppModel.minimumRecommendedPhotos)+ images is the recommended floor for a high-coverage solve, but EasySplat will still attempt the run."
+            selectionWarning = selectionWarning.map { "\($0)\n\(message)" } ?? message
+        }
+    }
+
+    /// Recommended floor used by the pre-flight check. Phrased as a quality
+    /// recommendation rather than a hard minimum because the pipeline only
+    /// fails outright below 2 selected frames.
+    static let minimumRecommendedPhotos: Int = 12
+
+    /// Count non-hidden image files in a folder. Recurses into subdirectories
+    /// to match the pipeline's photo discovery, but caps the walk to a
+    /// reasonable depth so dropping a giant unrelated folder (e.g., ~/Pictures)
+    /// does not stall the UI. Returns nil when the folder cannot be enumerated.
+    static func countImageFiles(in folder: URL) -> Int? {
+        let allowedExtensions: Set<String> = ["jpg", "jpeg", "png", "heic", "heif"]
+        let fm = FileManager.default
+        var isDirectory: ObjCBool = false
+        guard fm.fileExists(atPath: folder.path, isDirectory: &isDirectory), isDirectory.boolValue else {
+            return nil
+        }
+        guard let enumerator = fm.enumerator(
+            at: folder,
+            includingPropertiesForKeys: [.isDirectoryKey],
+            options: [.skipsHiddenFiles, .skipsPackageDescendants],
+            errorHandler: { _, _ in true }
+        ) else {
+            return nil
+        }
+        let maxDepth = 3
+        var count = 0
+        for case let url as URL in enumerator {
+            if enumerator.level > maxDepth {
+                enumerator.skipDescendants()
+                continue
+            }
+            if allowedExtensions.contains(url.pathExtension.lowercased()) {
+                count += 1
+            }
+        }
+        return count
     }
 
     func removeVideo(at offsets: IndexSet) {

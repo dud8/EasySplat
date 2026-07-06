@@ -15,6 +15,12 @@ public struct ProjectMetadata: Codable, Sendable {
     public var recoveryPromptSuppressed: Bool?
     public var lastRunStartedAt: Date?
     public var shareMetrics: ShareMetrics?
+    public var reconstruction: ReconstructionSummary?
+    public var stageTimings: [StageTimingRecord]?
+    public var autoTune: AutoTuneSnapshot?
+    public var notes: String?
+    public var lastOpenedAt: Date?
+    public var lastFailureAt: Date?
 
     public init(
         formatVersion: Int = 1,
@@ -29,7 +35,13 @@ public struct ProjectMetadata: Codable, Sendable {
         completedSfmMapping: SfmMappingCheckpoint? = nil,
         recoveryPromptSuppressed: Bool? = nil,
         lastRunStartedAt: Date? = nil,
-        shareMetrics: ShareMetrics? = nil
+        shareMetrics: ShareMetrics? = nil,
+        reconstruction: ReconstructionSummary? = nil,
+        stageTimings: [StageTimingRecord]? = nil,
+        autoTune: AutoTuneSnapshot? = nil,
+        notes: String? = nil,
+        lastOpenedAt: Date? = nil,
+        lastFailureAt: Date? = nil
     ) {
         self.formatVersion = formatVersion
         self.id = id
@@ -44,6 +56,165 @@ public struct ProjectMetadata: Codable, Sendable {
         self.recoveryPromptSuppressed = recoveryPromptSuppressed
         self.lastRunStartedAt = lastRunStartedAt
         self.shareMetrics = shareMetrics
+        self.reconstruction = reconstruction
+        self.stageTimings = stageTimings
+        self.autoTune = autoTune
+        self.notes = notes
+        self.lastOpenedAt = lastOpenedAt
+        self.lastFailureAt = lastFailureAt
+    }
+}
+
+/// Persisted snapshot of the AutoTuner's decisions for a run, plus the host
+/// hardware profile the tuner derived them from. Lets the viewer / diagnostic
+/// bundle surface "this run targeted 8 anchors, 100k VGGT points, 6 threads,
+/// COLMAP image cap 1200px" so users and bug reports can see exactly what the
+/// app picked for them.
+public struct AutoTuneSnapshot: Codable, Sendable, Equatable {
+    public var tier: String
+    public var memoryGB: Double
+    public var cpuCount: Int
+    public var gpuWorkingSetGB: Double?
+    public var mapAnythingResolution: Int
+    public var mapAnythingDirectViewLimit: Int
+    public var mapAnythingAnchorMaxViews: Int
+    public var mapAnythingWindowSize: Int
+    public var mapAnythingWindowOverlap: Int
+    public var vggtImageLoadResolution: Int
+    public var vggtFixedResolution: Int
+    public var vggtMaxPoints: Int
+    public var vggtAllowed: Bool
+    public var colmapMaxNumFeatures: Int
+    public var colmapMaxNumMatches: Int
+    public var colmapSequentialOverlap: Int
+    public var colmapExhaustiveBlockSize: Int
+    public var threadCap: Int
+    public var colmapMaxImageSizeCap: Int?
+    public var capturedAt: Date
+
+    public init(
+        tier: String,
+        memoryGB: Double,
+        cpuCount: Int,
+        gpuWorkingSetGB: Double?,
+        mapAnythingResolution: Int,
+        mapAnythingDirectViewLimit: Int,
+        mapAnythingAnchorMaxViews: Int,
+        mapAnythingWindowSize: Int,
+        mapAnythingWindowOverlap: Int,
+        vggtImageLoadResolution: Int,
+        vggtFixedResolution: Int,
+        vggtMaxPoints: Int,
+        vggtAllowed: Bool,
+        colmapMaxNumFeatures: Int,
+        colmapMaxNumMatches: Int,
+        colmapSequentialOverlap: Int,
+        colmapExhaustiveBlockSize: Int,
+        threadCap: Int,
+        colmapMaxImageSizeCap: Int?,
+        capturedAt: Date
+    ) {
+        self.tier = tier
+        self.memoryGB = memoryGB
+        self.cpuCount = cpuCount
+        self.gpuWorkingSetGB = gpuWorkingSetGB
+        self.mapAnythingResolution = mapAnythingResolution
+        self.mapAnythingDirectViewLimit = mapAnythingDirectViewLimit
+        self.mapAnythingAnchorMaxViews = mapAnythingAnchorMaxViews
+        self.mapAnythingWindowSize = mapAnythingWindowSize
+        self.mapAnythingWindowOverlap = mapAnythingWindowOverlap
+        self.vggtImageLoadResolution = vggtImageLoadResolution
+        self.vggtFixedResolution = vggtFixedResolution
+        self.vggtMaxPoints = vggtMaxPoints
+        self.vggtAllowed = vggtAllowed
+        self.colmapMaxNumFeatures = colmapMaxNumFeatures
+        self.colmapMaxNumMatches = colmapMaxNumMatches
+        self.colmapSequentialOverlap = colmapSequentialOverlap
+        self.colmapExhaustiveBlockSize = colmapExhaustiveBlockSize
+        self.threadCap = threadCap
+        self.colmapMaxImageSizeCap = colmapMaxImageSizeCap
+        self.capturedAt = capturedAt
+    }
+}
+
+/// Persisted timing measurement for a single completed pipeline stage. Surfaced
+/// in the UI so users can see which stage dominated wall-clock time without
+/// digging into the run logs. Failed-and-retried stages overwrite the previous
+/// entry so the recorded duration reflects the run that actually succeeded.
+public struct StageTimingRecord: Codable, Sendable, Equatable {
+    public var stage: PipelineStage
+    public var startedAt: Date
+    public var durationSeconds: Double
+
+    public init(stage: PipelineStage, startedAt: Date, durationSeconds: Double) {
+        self.stage = stage
+        self.startedAt = startedAt
+        self.durationSeconds = max(0, durationSeconds)
+    }
+}
+
+extension Array where Element == StageTimingRecord {
+    /// Total wall-clock time across all recorded stages. `nil` when no timings exist.
+    public var totalDurationSeconds: Double? {
+        guard !isEmpty else { return nil }
+        return reduce(0) { $0 + $1.durationSeconds }
+    }
+}
+
+/// Persisted summary of the accepted sparse reconstruction. Lets the app surface
+/// quality metrics (frame coverage, point density, reprojection error) without
+/// re-parsing the COLMAP model after the run finishes.
+public struct ReconstructionSummary: Codable, Sendable, Equatable {
+    public var mapper: String
+    public var capturedAt: Date
+    public var registeredImages: Int
+    public var totalImages: Int
+    public var meanReprojectionError: Double?
+    public var pointCount: Int?
+    public var observationCount: Int?
+    public var meanTrackLength: Double?
+
+    public init(
+        mapper: String,
+        capturedAt: Date,
+        registeredImages: Int,
+        totalImages: Int,
+        meanReprojectionError: Double? = nil,
+        pointCount: Int? = nil,
+        observationCount: Int? = nil,
+        meanTrackLength: Double? = nil
+    ) {
+        self.mapper = mapper
+        self.capturedAt = capturedAt
+        self.registeredImages = registeredImages
+        self.totalImages = totalImages
+        self.meanReprojectionError = meanReprojectionError
+        self.pointCount = pointCount
+        self.observationCount = observationCount
+        self.meanTrackLength = meanTrackLength
+    }
+
+    /// Fraction of the requested frames that the mapper actually registered.
+    /// Returns 0 when `totalImages` is non-positive so callers do not need to guard.
+    public var registeredFraction: Double {
+        guard totalImages > 0 else { return 0 }
+        return Double(registeredImages) / Double(totalImages)
+    }
+}
+
+extension ReconstructionSummary {
+    /// Bridges the per-run `ReconstructionScore` (lives in SfM) onto the persisted summary.
+    public init(score: ReconstructionScore, mapper: String, capturedAt: Date) {
+        self.init(
+            mapper: mapper,
+            capturedAt: capturedAt,
+            registeredImages: score.registeredImages,
+            totalImages: score.totalImages,
+            meanReprojectionError: score.meanReprojectionError,
+            pointCount: score.pointCount,
+            observationCount: score.observationCount,
+            meanTrackLength: score.meanTrackLength
+        )
     }
 }
 

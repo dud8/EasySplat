@@ -11,6 +11,17 @@ struct DropZoneView: View {
     @State private var isHovered = false
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
+    nonisolated static let releaseInProgressTitle = "Release to import"
+    nonisolated static let releaseInProgressSubtitle = "EasySplat will pick up everything you drop here."
+
+    nonisolated static func displayTitle(restingTitle: String, isTargeted: Bool) -> String {
+        isTargeted ? releaseInProgressTitle : restingTitle
+    }
+
+    nonisolated static func displaySubtitle(restingSubtitle: String, isTargeted: Bool) -> String {
+        isTargeted ? releaseInProgressSubtitle : restingSubtitle
+    }
+
     var body: some View {
         ZStack {
             RoundedRectangle(cornerRadius: Theme.Radius.dropZone, style: .continuous)
@@ -25,11 +36,15 @@ struct DropZoneView: View {
                 )
                 .shadow(color: shadowColor, radius: shadowRadius, x: 0, y: shadowOffset)
             VStack(spacing: 8) {
-                Text(title)
+                Text(Self.displayTitle(restingTitle: title, isTargeted: isTargeted))
                     .font(.title2.weight(.semibold))
-                Text(subtitle)
+                    .foregroundStyle(isTargeted ? Theme.accent : Color.primary)
+                    .contentTransition(reduceMotion ? .identity : .opacity)
+                Text(Self.displaySubtitle(restingSubtitle: subtitle, isTargeted: isTargeted))
                     .font(.subheadline)
                     .foregroundStyle(.secondary)
+                    .multilineTextAlignment(.center)
+                    .contentTransition(reduceMotion ? .identity : .opacity)
             }
             .padding(28)
         }
@@ -38,6 +53,9 @@ struct DropZoneView: View {
         }
         .animation(reduceMotion ? nil : Theme.Motion.hover, value: isHovered)
         .animation(reduceMotion ? nil : Theme.Motion.hover, value: isTargeted)
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel("Drop zone: \(title). \(subtitle).")
+        .accessibilityAddTraits(.isButton)
         .onDrop(of: [.fileURL], isTargeted: $isTargeted) { providers in
             let group = DispatchGroup()
             let collector = URLCollector()

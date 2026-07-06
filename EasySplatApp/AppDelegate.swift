@@ -7,6 +7,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
         guard let model else { return .terminateNow }
 
+        // Flush any pending notes-save before we hand control to the
+        // termination flow so the user's last edit isn't dropped by the
+        // debounce timer being cancelled mid-write.
+        model.flushPendingNotesSave()
+
         if model.isStopping {
             model.registerExitIntent(.quit)
             return .terminateLater

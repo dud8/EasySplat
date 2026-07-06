@@ -79,6 +79,12 @@ final class PipelineIntegrationTests: XCTestCase {
         XCTAssertTrue(runStartProbe.wasObserved, "Expected lastRunStartedAt to be set before subprocess work starts.")
         let finalMetadata = try ProjectMetadataStore.load(from: paths.metadataURL)
         XCTAssertNil(finalMetadata.lastRunStartedAt, "Successful runs should clear lastRunStartedAt.")
+        let reconstruction = try XCTUnwrap(finalMetadata.reconstruction, "Successful runs must persist a reconstruction summary.")
+        XCTAssertEqual(reconstruction.registeredImages, 100)
+        XCTAssertEqual(reconstruction.totalImages, 100)
+        XCTAssertEqual(reconstruction.meanReprojectionError, 1.0)
+        XCTAssertTrue(reconstruction.mapper.hasPrefix("global_mapper") || reconstruction.mapper == "colmap",
+                      "Unexpected mapper label: \(reconstruction.mapper)")
     }
 
     func testPipelineFailureClearsRunStartMarker() async throws {
@@ -123,6 +129,10 @@ final class PipelineIntegrationTests: XCTestCase {
         let failedMetadata = try ProjectMetadataStore.load(from: paths.metadataURL)
         XCTAssertNil(failedMetadata.lastRunStartedAt, "Failed runs should clear lastRunStartedAt.")
         XCTAssertNotNil(failedMetadata.state.lastError)
+        XCTAssertNotNil(
+            failedMetadata.lastFailureAt,
+            "PipelineRunner.emitFailure must stamp lastFailureAt so the home Last failure card reflects the real failure time."
+        )
     }
 
     func testTrainingGateInvokedBeforeTraining() async throws {
@@ -389,6 +399,17 @@ final class PipelineIntegrationTests: XCTestCase {
         XCTAssertFalse(runner.calls.contains(where: { $0.0 == toolchain.colmap.path && $0.1.first == "feature_extractor" }))
         XCTAssertFalse(runner.calls.contains(where: { $0.0 == toolchain.colmap.path && $0.1.first == "point_triangulator" }))
         XCTAssertFalse(runner.calls.contains(where: { $0.0 == toolchain.colmap.path && $0.1.first == "global_mapper" }))
+
+        let finalMetadata = try ProjectMetadataStore.load(from: paths.metadataURL)
+        let reconstruction = try XCTUnwrap(finalMetadata.reconstruction,
+                                           "MapAnything direct success must persist a reconstruction summary even with SKIP_TRAINING=1.")
+        XCTAssertEqual(reconstruction.mapper, "mapanything-direct")
+        XCTAssertEqual(reconstruction.registeredImages, 4)
+        XCTAssertEqual(reconstruction.totalImages, 4)
+        XCTAssertEqual(reconstruction.meanReprojectionError, 0.7)
+        let timings = finalMetadata.stageTimings ?? []
+        XCTAssertFalse(timings.isEmpty, "Stage timings must be persisted for completed runs.")
+        XCTAssertTrue(timings.contains(where: { $0.stage == .sfmFeatures }))
     }
 
     func testPipelineMapAnythingSeedRefineRunsTriangulatorAndBA() async throws {
@@ -447,6 +468,13 @@ final class PipelineIntegrationTests: XCTestCase {
         XCTAssertTrue(runner.calls.contains(where: { $0.0 == toolchain.colmap.path && $0.1.first == "point_triangulator" }))
         XCTAssertTrue(runner.calls.contains(where: { $0.0 == toolchain.colmap.path && $0.1.first == "bundle_adjuster" }))
         XCTAssertFalse(runner.calls.contains(where: { $0.0 == toolchain.colmap.path && $0.1.first == "global_mapper" }))
+
+        let finalMetadata = try ProjectMetadataStore.load(from: paths.metadataURL)
+        let reconstruction = try XCTUnwrap(finalMetadata.reconstruction,
+                                           "MapAnything seed-refine success must persist the refined reconstruction summary, not nil.")
+        XCTAssertEqual(reconstruction.mapper, "point_triangulator+bundle_adjuster")
+        XCTAssertEqual(reconstruction.registeredImages, 12)
+        XCTAssertEqual(reconstruction.totalImages, 12)
     }
 
     func testPipelineMapAnythingDirectLowQualityFallsBackToSeedRefine() async throws {

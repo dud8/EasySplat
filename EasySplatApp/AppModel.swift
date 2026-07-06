@@ -33,6 +33,13 @@ final class AppModel: ObservableObject {
     @Published var lastError: String? = nil
     @Published var errorDetails: String? = nil
     @Published var outputPlyURL: URL? = nil
+    @Published var currentReconstruction: ReconstructionSummary? = nil
+    @Published var currentStageTimings: [StageTimingRecord] = []
+    @Published var currentOutputPlyInfo: OutputPlyInfo? = nil
+    @Published var currentAutoTune: AutoTuneSnapshot? = nil
+    @Published var currentPreset: PresetSpec? = nil
+    @Published var currentInput: InputSpec? = nil
+    @Published var currentProjectNotes: String = ""
     @Published var currentProjectURL: URL? = nil
     @Published var toolchainPaths: ToolchainPaths? = nil
     @Published var stopAction: StopAction? = nil
@@ -40,8 +47,13 @@ final class AppModel: ObservableObject {
     @Published var isLivePreviewEnabled: Bool = false
     @Published var activeTrainingBackend: TrainingBackend? = nil
 
-    @Published var captureMode: CaptureMode = .object
-    @Published var qualityPreset: QualityPreset = .draft
+    @Published var cachedFreeDiskBytes: Int64? = nil
+    @Published var captureMode: CaptureMode = AppModel.persistedCaptureMode() {
+        didSet { UserDefaults.standard.set(captureMode.rawValue, forKey: AppModel.captureModeUserDefaultsKey) }
+    }
+    @Published var qualityPreset: QualityPreset = AppModel.persistedQualityPreset() {
+        didSet { UserDefaults.standard.set(qualityPreset.rawValue, forKey: AppModel.qualityPresetUserDefaultsKey) }
+    }
     @Published var pendingVideoURLs: [URL] = []
     @Published var pendingPhotosFolderURL: URL? = nil
     @Published var projectSummaries: [ProjectSummary] = []
@@ -70,6 +82,13 @@ final class AppModel: ObservableObject {
     var toolchainDownloadBucketByLabel: [String: Int] = [:]
     let trainingStepLogInterval = 120
     let trainingProgressLogMinInterval: TimeInterval = 3.0
+    var notesSaveTask: Task<Void, Never>?
+    var pendingNotesSave: (url: URL, text: String)?
+    /// In-memory cache for recent pipeline error counts. Keyed by log URL,
+    /// invalidated when the log's mtime OR size changes between refreshes
+    /// (mtime alone has only second-level precision on some filesystems,
+    /// so two writes inside the same second would falsely cache-hit).
+    var pipelineErrorCountCache: [URL: (mtime: Date, size: Int64, count: Int)] = [:]
     var trainingConsentContinuation: CheckedContinuation<Bool, Never>?
     var trainingConsentPauseStartedAt: Date?
     var trainingConsentPausedDuration: TimeInterval = 0
@@ -83,7 +102,19 @@ final class AppModel: ObservableObject {
     var ignoredRecoveryProjectIDs: Set<UUID> = []
     static let forcedExitTimeoutNanoseconds: UInt64 = 25_000_000_000
 
-    static let trainingConsentRememberedKey = "EasySplatTrainingConsentRemembered"
+    nonisolated static let trainingConsentRememberedKey = "EasySplatTrainingConsentRemembered"
+    nonisolated static let captureModeUserDefaultsKey = "EasySplatCaptureMode"
+    nonisolated static let qualityPresetUserDefaultsKey = "EasySplatQualityPreset"
+
+    static func persistedCaptureMode() -> CaptureMode {
+        let raw = UserDefaults.standard.string(forKey: captureModeUserDefaultsKey) ?? ""
+        return CaptureMode(rawValue: raw) ?? .object
+    }
+
+    static func persistedQualityPreset() -> QualityPreset {
+        let raw = UserDefaults.standard.string(forKey: qualityPresetUserDefaultsKey) ?? ""
+        return QualityPreset(rawValue: raw) ?? .draft
+    }
 
     enum StopAction {
         case keepProject

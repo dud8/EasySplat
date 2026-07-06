@@ -542,6 +542,54 @@ final class PipelineRunnerRetryTests: XCTestCase {
         XCTAssertEqual(status, .corrupt)
     }
 
+    func testReconstructionScoreRehydratedFromPersistedSummaryCarriesPointCount() {
+        let summary = ReconstructionSummary(
+            mapper: "da3-direct",
+            capturedAt: Date(timeIntervalSince1970: 0),
+            registeredImages: 12,
+            totalImages: 12,
+            meanReprojectionError: 0.9,
+            pointCount: 250,
+            observationCount: 800,
+            meanTrackLength: 3.2
+        )
+        let score = PipelineRunner.test_reconstructionScore(fromPersistedSummary: summary)
+        XCTAssertEqual(score.registeredImages, 12)
+        XCTAssertEqual(score.totalImages, 12)
+        XCTAssertEqual(score.meanReprojectionError, 0.9)
+        XCTAssertEqual(score.pointCount, 250)
+        XCTAssertEqual(score.observationCount, 800)
+        XCTAssertEqual(score.meanTrackLength, 3.2)
+    }
+
+    @MainActor
+    func testRehydratedLowPointSummaryTriggersBrushFallbackUnderFastProfile() async throws {
+        // The msplat-auto guard must say "use Brush" when the rehydrated score
+        // has fewer points than the automatic msplat threshold. This is the
+        // resume-from-SfM path Codex flagged: if we forget to rehydrate, the
+        // guard sees nil and lets fast-profile msplat run on a thin solve.
+        let restore = await scopedEnvironment([
+            "EASYSPLAT_SPEED_PROFILE": "fast",
+            "EASYSPLAT_TRAINER": nil
+        ])
+        defer { restore() }
+
+        let summary = ReconstructionSummary(
+            mapper: "da3-direct",
+            capturedAt: Date(timeIntervalSince1970: 0),
+            registeredImages: 5,
+            totalImages: 30,
+            meanReprojectionError: 1.2,
+            pointCount: 10,
+            observationCount: 30,
+            meanTrackLength: 3.0
+        )
+        let rehydrated = PipelineRunner.test_reconstructionScore(fromPersistedSummary: summary)
+        let runner = makeRunner(projectURL: URL(fileURLWithPath: NSTemporaryDirectory()))
+        XCTAssertTrue(runner.test_shouldUseBrushInsteadOfAutomaticMsplat(for: rehydrated),
+                      "Rehydrated low-point score must still force Brush on resume under fast profile.")
+    }
+
     func testValidateStageOutputRejectsEmptyDatabaseSparseTextWithoutDa3Manifest() throws {
         let root = try TestFileBuilder.makeTempDir()
         defer { try? FileManager.default.removeItem(at: root) }

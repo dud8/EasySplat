@@ -51,4 +51,12 @@ public enum ProjectMetadataStore {
         let data = try encoder.encode(metadata)
         try data.write(to: url, options: [.atomic])
     }
+
+    public static func savePreservingUserEditableFields(_ metadata: ProjectMetadata, to url: URL) throws {
+        var merged = metadata
+        if let current = try? load(from: url) {
+            merged.notes = current.notes
+        }
+        try save(merged, to: url)
+    }
 }

@@ -23,6 +23,7 @@ private struct SecondaryButtonBody: View {
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     @State private var isHovering = false
+    @FocusState private var isFocused: Bool
 
     var body: some View {
         let padding = paddingForControlSize(controlSize)
@@ -51,12 +52,19 @@ private struct SecondaryButtonBody: View {
                     .shadow(color: shadow.color, radius: shadow.radius, x: 0, y: shadow.y)
             )
             .contentShape(RoundedRectangle(cornerRadius: Theme.Radius.button, style: .continuous))
+            .overlay(
+                RoundedRectangle(cornerRadius: Theme.Radius.button + 2, style: .continuous)
+                    .stroke(accentColor.opacity(isFocused ? 0.75 : 0), lineWidth: 2)
+                    .padding(-2)
+            )
             .scaleEffect(scale)
+            .focused($isFocused)
             .onHover { hovering in
                 isHovering = hovering
             }
             .animation(reduceMotion ? nil : Theme.Motion.hover, value: isHovering)
             .animation(reduceMotion ? nil : Theme.Motion.press, value: configuration.isPressed)
+            .animation(reduceMotion ? nil : Theme.Motion.hover, value: isFocused)
     }
 
     private var baseTintOverlayColor: Color {

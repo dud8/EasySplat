@@ -7,6 +7,14 @@ import XCTest
 
 @MainActor
 final class AppModelTests: XCTestCase {
+    override func setUp() {
+        super.setUp()
+        // Capture-mode and quality-preset persistence is per-user in production but
+        // bleeds across XCTest cases otherwise — strip the keys so each test starts
+        // from the documented defaults instead of the previous case's tail state.
+        UserDefaults.standard.removeObject(forKey: AppModel.captureModeUserDefaultsKey)
+        UserDefaults.standard.removeObject(forKey: AppModel.qualityPresetUserDefaultsKey)
+    }
     func testStartProjectTransitionsToViewer() async throws {
         let tempBase = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
         try FileManager.default.createDirectory(at: tempBase, withIntermediateDirectories: true)
@@ -35,6 +43,300 @@ final class AppModelTests: XCTestCase {
         }
         let metadataURL = projectURL.appendingPathComponent("project.json")
         XCTAssertTrue(FileManager.default.fileExists(atPath: metadataURL.path))
+    }
+
+    func testCountRecentPipelineErrorsTailsBoundedAndCountsErrLines() throws {
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        let logURL = dir.appendingPathComponent("pipeline.log")
+        var data = Data()
+        // 200 KB of mixed lines, last ~16 KB exercised by the tail.
+        for index in 0..<2_000 {
+            let line = "[\(index)] some routine progress\n"
+            data.append(line.data(using: .utf8)!)
+        }
+        // Append a known burst of error-level lines at the tail.
+        for _ in 0..<7 {
+            data.append("[err] Failed thing happened\n".data(using: .utf8)!)
+        }
+        try data.write(to: logURL)
+
+        let count = AppModel.countRecentPipelineErrors(at: logURL)
+        XCTAssertEqual(count, 7)
+    }
+
+    func testCountRecentPipelineErrorsReturnsNilForMissingLog() {
+        let logURL = FileManager.default.temporaryDirectory.appendingPathComponent("missing-\(UUID().uuidString).log")
+        XCTAssertNil(AppModel.countRecentPipelineErrors(at: logURL))
+    }
+
+    func testCountImageFilesIgnoresUnsupportedAndHidden() throws {
+        let folder = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: folder) }
+        try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        for ext in ["jpg", "JPEG", "png", "heic", "HEIF"] {
+            try Data("img".utf8).write(to: folder.appendingPathComponent("photo.\(ext)"))
+        }
+        try Data("notes".utf8).write(to: folder.appendingPathComponent("README.txt"))
+        try Data("hidden".utf8).write(to: folder.appendingPathComponent(".hidden.png"))
+        let count = AppModel.countImageFiles(in: folder)
+        XCTAssertEqual(count, 5)
+    }
+
+    func testCountImageFilesRecursesIntoSubfolders() throws {
+        let folder = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: folder) }
+        try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        let sub = folder.appendingPathComponent("burst", isDirectory: true)
+        try FileManager.default.createDirectory(at: sub, withIntermediateDirectories: true)
+        for index in 0..<4 {
+            try Data("img".utf8).write(to: sub.appendingPathComponent("burst\(index).jpg"))
+        }
+        try Data("img".utf8).write(to: folder.appendingPathComponent("hero.jpg"))
+        let count = AppModel.countImageFiles(in: folder)
+        XCTAssertEqual(count, 5, "Recursive count should include images in subfolders.")
+    }
+
+    func testCountImageFilesReturnsNilForMissingFolder() {
+        let folder = FileManager.default.temporaryDirectory.appendingPathComponent("missing-\(UUID().uuidString)")
+        XCTAssertNil(AppModel.countImageFiles(in: folder))
+    }
+
+    func testAddInputsWarnsForThinPhotoFolder() throws {
+        let base = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: base) }
+        try FileManager.default.createDirectory(at: base, withIntermediateDirectories: true)
+        let folder = base.appendingPathComponent("Thin", isDirectory: true)
+        try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        for index in 0..<3 {
+            try Data("img".utf8).write(to: folder.appendingPathComponent("img\(index).jpg"))
+        }
+        let model = AppModel(toolchainManager: MockToolchainManager(), projectBaseURL: base) { url, config in
+            MockPipelineRunner(projectURL: url, config: config)
+        }
+        model.addInputs(urls: [folder])
+        let warning = try XCTUnwrap(model.selectionWarning)
+        XCTAssertTrue(warning.contains("Thin"), "Warning should name the folder, got: \(warning)")
+        XCTAssertTrue(warning.contains("3 image"), "Warning should mention the actual count, got: \(warning)")
+    }
+
+    func testMarkProjectOpenedWritesSidecarAndDoesNotTouchMainMetadata() throws {
+        let base = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: base) }
+        try FileManager.default.createDirectory(at: base, withIntermediateDirectories: true)
+        let projectURL = base.appendingPathComponent("OpenStamp.easysplatproj", isDirectory: true)
+        try FileManager.default.createDirectory(at: projectURL, withIntermediateDirectories: true)
+        let originalMetadata = ProjectMetadata(
+            title: "OpenStamp",
+            input: .photos(folder: "/tmp/photos"),
+            preset: PresetSpec(mode: .object, quality: .standard)
+        )
+        let paths = ProjectPaths(root: projectURL)
+        try ProjectMetadataStore.save(originalMetadata, to: paths.metadataURL)
+        // Capture the metadata file's bytes so we can prove markProjectOpened
+        // did NOT rewrite project.json (and so cannot race a pipeline writer).
+        let metadataBytesBefore = try Data(contentsOf: paths.metadataURL)
+
+        let model = AppModel(toolchainManager: MockToolchainManager(), projectBaseURL: base) { url, config in
+            MockPipelineRunner(projectURL: url, config: config)
+        }
+        let stamp = Date(timeIntervalSince1970: 1_800_000_000)
+        model.markProjectOpened(at: projectURL, at: stamp)
+
+        let sidecarMoment = LastOpenedSidecar.load(from: paths.lastOpenedSidecarURL)
+        XCTAssertEqual(sidecarMoment, stamp, "Sidecar must hold the persisted timestamp.")
+
+        let metadataBytesAfter = try Data(contentsOf: paths.metadataURL)
+        XCTAssertEqual(metadataBytesAfter, metadataBytesBefore,
+                       "markProjectOpened must not rewrite project.json — that's the race-fix guarantee.")
+    }
+
+    func testFlushPendingNotesSaveLandsLastEdit() throws {
+        let base = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: base) }
+        try FileManager.default.createDirectory(at: base, withIntermediateDirectories: true)
+        let projectURL = base.appendingPathComponent("FlushTest.easysplatproj", isDirectory: true)
+        try FileManager.default.createDirectory(at: projectURL, withIntermediateDirectories: true)
+        try ProjectMetadataStore.save(
+            ProjectMetadata(
+                title: "FlushTest",
+                input: .photos(folder: "/tmp/photos"),
+                preset: PresetSpec(mode: .object, quality: .standard)
+            ),
+            to: ProjectPaths(root: projectURL).metadataURL
+        )
+
+        let model = AppModel(toolchainManager: MockToolchainManager(), projectBaseURL: base) { url, config in
+            MockPipelineRunner(projectURL: url, config: config)
+        }
+        model.currentProjectURL = projectURL
+        // Schedule a save — the debounce timer has not fired yet.
+        model.scheduleNotesSave(at: projectURL, to: "last edit")
+        // Flush bypasses the debounce, so the value should land synchronously.
+        model.flushPendingNotesSave()
+        let reloaded = try ProjectMetadataStore.load(from: ProjectPaths(root: projectURL).metadataURL)
+        XCTAssertEqual(reloaded.notes, "last edit",
+                       "flushPendingNotesSave must persist the pending value, not lose it.")
+    }
+
+    func testUpdateProjectNotesDoesNotAlterCurrentProjectNotesProperty() throws {
+        // Regression: a previous version of updateProjectNotes reassigned
+        // currentProjectNotes to the trimmed persisted value, which fired
+        // through the SwiftUI binding and erased trailing whitespace the
+        // user was still typing.
+        let base = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: base) }
+        try FileManager.default.createDirectory(at: base, withIntermediateDirectories: true)
+        let projectURL = base.appendingPathComponent("NotesRace.easysplatproj", isDirectory: true)
+        try FileManager.default.createDirectory(at: projectURL, withIntermediateDirectories: true)
+        try ProjectMetadataStore.save(
+            ProjectMetadata(
+                title: "NotesRace",
+                input: .photos(folder: "/tmp/photos"),
+                preset: PresetSpec(mode: .object, quality: .standard)
+            ),
+            to: ProjectPaths(root: projectURL).metadataURL
+        )
+
+        let model = AppModel(toolchainManager: MockToolchainManager(), projectBaseURL: base) { url, config in
+            MockPipelineRunner(projectURL: url, config: config)
+        }
+        model.currentProjectURL = projectURL
+        model.currentProjectNotes = "Captured  " // trailing whitespace mid-typing
+
+        XCTAssertTrue(model.updateProjectNotes(at: projectURL, to: "Captured  "))
+        XCTAssertEqual(model.currentProjectNotes, "Captured  ",
+                       "Saving must not rewrite the in-memory binding value with the trimmed text.")
+    }
+
+    func testFreshProcessingRunExposesActivePresetAndInput() async throws {
+        let tempBase = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: tempBase) }
+        try FileManager.default.createDirectory(at: tempBase, withIntermediateDirectories: true)
+        let input = tempBase.appendingPathComponent("clip.mov")
+        try Data("video".utf8).write(to: input)
+
+        let model = AppModel(toolchainManager: MockToolchainManager(), projectBaseURL: tempBase) { _, _ in
+            BlockingPipelineRunner()
+        }
+        model.captureMode = .room
+        model.qualityPreset = .ultra
+        model.addInputs(urls: [input])
+        model.startFromPendingSelection()
+
+        try await waitForViewState(model: model, state: .processing)
+
+        XCTAssertEqual(model.currentPreset?.mode, .room)
+        XCTAssertEqual(model.currentPreset?.quality, .ultra)
+        if case .video(let files) = model.currentInput {
+            XCTAssertEqual(files, [input.path])
+        } else {
+            XCTFail("Expected active video input while processing.")
+        }
+
+        model.cancelCurrentProject(deleteProject: false)
+        try await waitForViewState(model: model, state: .home, timeout: 4.0)
+    }
+
+    func testResumedProcessingRunExposesPersistedPresetAndInput() async throws {
+        let tempBase = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: tempBase) }
+        try FileManager.default.createDirectory(at: tempBase, withIntermediateDirectories: true)
+        let url = try makeProject(at: tempBase, name: "ResumeConfig", lastError: nil, withOutput: false, stage: .sfmFeatures)
+
+        let model = AppModel(toolchainManager: MockToolchainManager(), projectBaseURL: tempBase) { _, _ in
+            BlockingPipelineRunner()
+        }
+        model.resumeProject(at: url)
+
+        try await waitForViewState(model: model, state: .processing)
+
+        XCTAssertEqual(model.currentPreset?.mode, .object)
+        XCTAssertEqual(model.currentPreset?.quality, .standard)
+        if case .photos(let folder) = model.currentInput {
+            XCTAssertEqual(folder, "/tmp/photos")
+        } else {
+            XCTFail("Expected resumed photo-folder input while processing.")
+        }
+
+        model.cancelCurrentProject(deleteProject: false)
+        try await waitForViewState(model: model, state: .home, timeout: 4.0)
+    }
+
+    func testUpdateProjectNotesPersistsAndClearsWhenEmpty() throws {
+        let base = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: base) }
+        try FileManager.default.createDirectory(at: base, withIntermediateDirectories: true)
+        let projectURL = base.appendingPathComponent("NoteTest.easysplatproj", isDirectory: true)
+        try FileManager.default.createDirectory(at: projectURL, withIntermediateDirectories: true)
+        try ProjectMetadataStore.save(
+            ProjectMetadata(
+                title: "NoteTest",
+                input: .photos(folder: "/tmp/photos"),
+                preset: PresetSpec(mode: .object, quality: .standard)
+            ),
+            to: ProjectPaths(root: projectURL).metadataURL
+        )
+
+        let model = AppModel(toolchainManager: MockToolchainManager(), projectBaseURL: base) { url, config in
+            MockPipelineRunner(projectURL: url, config: config)
+        }
+
+        XCTAssertTrue(model.updateProjectNotes(at: projectURL, to: "  captured at noon "))
+        var reloaded = try ProjectMetadataStore.load(from: ProjectPaths(root: projectURL).metadataURL)
+        XCTAssertEqual(reloaded.notes, "captured at noon")
+
+        // Identical text returns false (no-op) and does not rewrite.
+        XCTAssertFalse(model.updateProjectNotes(at: projectURL, to: "captured at noon"))
+
+        XCTAssertTrue(model.updateProjectNotes(at: projectURL, to: "   "))
+        reloaded = try ProjectMetadataStore.load(from: ProjectPaths(root: projectURL).metadataURL)
+        XCTAssertNil(reloaded.notes)
+    }
+
+    func testRenameProjectUpdatesPersistedTitle() throws {
+        let base = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: base) }
+        try FileManager.default.createDirectory(at: base, withIntermediateDirectories: true)
+        let projectURL = base.appendingPathComponent("Original.easysplatproj", isDirectory: true)
+        try FileManager.default.createDirectory(at: projectURL, withIntermediateDirectories: true)
+        let metadata = ProjectMetadata(
+            title: "Original",
+            input: .photos(folder: "/tmp/photos"),
+            preset: PresetSpec(mode: .object, quality: .standard)
+        )
+        try ProjectMetadataStore.save(metadata, to: ProjectPaths(root: projectURL).metadataURL)
+
+        let model = AppModel(toolchainManager: MockToolchainManager(), projectBaseURL: base) { url, config in
+            MockPipelineRunner(projectURL: url, config: config)
+        }
+
+        XCTAssertTrue(model.renameProject(at: projectURL, to: "  New Title  "))
+        let reloaded = try ProjectMetadataStore.load(from: ProjectPaths(root: projectURL).metadataURL)
+        XCTAssertEqual(reloaded.title, "New Title")
+    }
+
+    func testRenameProjectRejectsEmptyOrUnchangedTitles() throws {
+        let base = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: base) }
+        try FileManager.default.createDirectory(at: base, withIntermediateDirectories: true)
+        let projectURL = base.appendingPathComponent("Same.easysplatproj", isDirectory: true)
+        try FileManager.default.createDirectory(at: projectURL, withIntermediateDirectories: true)
+        let metadata = ProjectMetadata(
+            title: "Same",
+            input: .photos(folder: "/tmp/photos"),
+            preset: PresetSpec(mode: .object, quality: .standard)
+        )
+        try ProjectMetadataStore.save(metadata, to: ProjectPaths(root: projectURL).metadataURL)
+
+        let model = AppModel(toolchainManager: MockToolchainManager(), projectBaseURL: base) { url, config in
+            MockPipelineRunner(projectURL: url, config: config)
+        }
+
+        XCTAssertFalse(model.renameProject(at: projectURL, to: ""))
+        XCTAssertFalse(model.renameProject(at: projectURL, to: "   "))
+        XCTAssertFalse(model.renameProject(at: projectURL, to: "Same"))
     }
 
     func testStartProjectUsesFastProfileByDefault() async throws {
@@ -110,6 +412,34 @@ final class AppModelTests: XCTestCase {
         }
         let metadata = try ProjectMetadataStore.load(from: ProjectPaths(root: projectURL).metadataURL)
         XCTAssertEqual(metadata.state.lastError, "Processing failed. Expected outputs were missing.")
+    }
+
+    func testStartProjectPersistsToolchainFailureAsFailedSummary() async throws {
+        let tempBase = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: tempBase) }
+        try FileManager.default.createDirectory(at: tempBase, withIntermediateDirectories: true)
+        let input = tempBase.appendingPathComponent("input.mov")
+        try Data("video".utf8).write(to: input)
+
+        let model = AppModel(toolchainManager: FailingToolchainManager(message: "manifest unreachable"), projectBaseURL: tempBase) { _, _ in
+            XCTFail("Pipeline runner should not start when toolchain setup fails.")
+            return BlockingPipelineRunner()
+        }
+        model.addInputs(urls: [input])
+        model.startFromPendingSelection()
+
+        try await waitForLastError(model: model, timeout: 4.0)
+        model.refreshProjectSummaries()
+
+        let summary = try XCTUnwrap(model.projectSummaries.first)
+        XCTAssertEqual(summary.status, .failed)
+        XCTAssertEqual(summary.lastError, "manifest unreachable")
+        XCTAssertNotNil(summary.lastFailureAt)
+        let metadata = try ProjectMetadataStore.load(from: ProjectPaths(root: summary.url).metadataURL)
+        XCTAssertEqual(metadata.state.lastError, "manifest unreachable")
+        XCTAssertNotNil(metadata.lastFailureAt)
+        XCTAssertNil(metadata.checkpoint)
+        XCTAssertNil(metadata.lastRunStartedAt)
     }
 
     func testLivePreviewToggleResetsPerProjectStart() async throws {
@@ -1475,6 +1805,17 @@ final class AppModelTests: XCTestCase {
         XCTFail("Timed out waiting for currentProjectURL to become \(url)")
     }
 
+    private func waitForLastError(model: AppModel, timeout: TimeInterval = 2.0) async throws {
+        let deadline = Date().addingTimeInterval(timeout)
+        while Date() < deadline {
+            if model.lastError != nil {
+                return
+            }
+            try await Task.sleep(nanoseconds: 50_000_000)
+        }
+        XCTFail("Timed out waiting for lastError")
+    }
+
     private func makeProject(
         at base: URL,
         name: String,
@@ -1620,6 +1961,19 @@ final class MockToolchainManager: ToolchainManaging {
             vggt: vggt,
             fastvggt: fastvggt
         )
+    }
+}
+
+struct FailingToolchainManager: ToolchainManaging {
+    var message: String
+
+    func ensureToolchain(
+        manifestURL: URL,
+        publicKeyBase64: String,
+        targetName: String,
+        onProgress: @escaping @Sendable (Double, String) -> Void
+    ) async throws -> ToolchainPaths {
+        throw NSError(domain: "FailingToolchainManager", code: 1, userInfo: [NSLocalizedDescriptionKey: message])
     }
 }
 

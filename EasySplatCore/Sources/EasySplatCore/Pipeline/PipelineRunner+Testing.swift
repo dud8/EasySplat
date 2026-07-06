@@ -149,6 +149,10 @@ extension PipelineRunner {
         shouldUseBrushInsteadOfAutomaticMsplat(for: score)
     }
 
+    static func test_reconstructionScore(fromPersistedSummary summary: ReconstructionSummary) -> ReconstructionScore {
+        return reconstructionScore(fromPersistedSummary: summary)
+    }
+
     func test_shouldUseSequential(selectedFrames: [URL], input: InputSpec, forceExhaustive: Bool) -> Bool {
         shouldUseSequential(selectedFrames: selectedFrames, input: input, forceExhaustive: forceExhaustive)
     }

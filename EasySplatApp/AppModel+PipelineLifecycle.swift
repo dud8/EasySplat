@@ -125,9 +125,12 @@ extension AppModel {
         } else {
             alert.informativeText = "You can save and resume later, or delete the project."
         }
-        alert.addButton(withTitle: canExportSnapshot ? "Export Snapshot" : "Save Project")
-        alert.addButton(withTitle: "Delete Project")
-        alert.addButton(withTitle: "Cancel")
+        let saveButton = alert.addButton(withTitle: canExportSnapshot ? "Export Snapshot" : "Save Project")
+        saveButton.keyEquivalent = "\r"
+        let deleteButton = alert.addButton(withTitle: "Delete Project")
+        deleteButton.hasDestructiveAction = true
+        let cancelButton = alert.addButton(withTitle: "Cancel")
+        cancelButton.keyEquivalent = "\u{1b}"
         switch alert.runModal() {
         case .alertFirstButtonReturn:
             return .save
@@ -264,6 +267,8 @@ extension AppModel {
             let paths = ProjectPaths(root: projectURL)
             try paths.ensureDirectories()
             try ProjectMetadataStore.save(metadata, to: paths.metadataURL)
+            currentPreset = metadata.preset
+            currentInput = input
             syncShareMetrics(for: projectURL)
 
             statusTitle = "Downloading tools"
@@ -295,9 +300,23 @@ extension AppModel {
                 return
             }
             outputPlyURL = outputURL
+            currentReconstruction = loadReconstructionSummary(projectURL: projectURL)
+            currentStageTimings = loadStageTimings(projectURL: projectURL)
+            currentOutputPlyInfo = OutputPlyInfo.load(from: outputURL)
+            currentAutoTune = loadAutoTuneSnapshot(projectURL: projectURL)
+            if let config = loadProjectConfig(projectURL: projectURL) {
+                currentPreset = config.preset
+                currentInput = config.input
+            } else {
+                currentPreset = nil
+                currentInput = nil
+            }
+            currentProjectNotes = loadProjectNotes(projectURL: projectURL)
+            markProjectOpened(at: projectURL)
             syncShareMetrics(for: projectURL)
             viewState = .viewer
             refreshProjectSummaries()
+            refreshFreeDiskSpace()
         } catch is CancellationError {
             return
         } catch {
@@ -305,9 +324,11 @@ extension AppModel {
             if stopAction != nil {
                 return
             }
+            let failureMessage = lastError ?? error.localizedDescription
             if lastError == nil {
-                lastError = error.localizedDescription
+                lastError = failureMessage
             }
+            persistProjectFailure(failureMessage, at: currentProjectURL)
             let envDetails = """
             Underlying error: \(String(reflecting: error))
             Manifest URL: \(AppConfig.toolchainManifestURL.absoluteString)
@@ -349,6 +370,8 @@ extension AppModel {
             let paths = ProjectPaths(root: url)
             let metadata = try ProjectMetadataStore.load(from: paths.metadataURL)
             currentProjectURL = url
+            currentPreset = metadata.preset
+            currentInput = metadata.input
             syncShareMetrics(for: url)
             logLines = []
             errorLogLines = []
@@ -365,6 +388,14 @@ extension AppModel {
             if let outputURL = readyOutputURL(projectURL: url, metadata: metadata) {
                 guard isCurrentTaskToken(taskToken) else { return }
                 outputPlyURL = outputURL
+                currentReconstruction = metadata.reconstruction
+                currentStageTimings = metadata.stageTimings ?? []
+                currentOutputPlyInfo = OutputPlyInfo.load(from: outputURL)
+                currentAutoTune = metadata.autoTune
+                currentPreset = metadata.preset
+                currentInput = metadata.input
+                currentProjectNotes = metadata.notes ?? ""
+                markProjectOpened(at: url)
                 syncShareMetrics(for: url)
                 viewState = .viewer
                 return
@@ -400,7 +431,21 @@ extension AppModel {
                 return
             }
             outputPlyURL = outputURL
+            currentReconstruction = loadReconstructionSummary(projectURL: url)
+            currentStageTimings = loadStageTimings(projectURL: url)
+            currentOutputPlyInfo = OutputPlyInfo.load(from: outputURL)
+            currentAutoTune = loadAutoTuneSnapshot(projectURL: url)
+            if let config = loadProjectConfig(projectURL: url) {
+                currentPreset = config.preset
+                currentInput = config.input
+            } else {
+                currentPreset = nil
+                currentInput = nil
+            }
+            currentProjectNotes = loadProjectNotes(projectURL: url)
+            markProjectOpened(at: url)
             syncShareMetrics(for: url)
+            refreshFreeDiskSpace()
             viewState = .viewer
             refreshProjectSummaries()
         } catch is CancellationError {
@@ -410,9 +455,11 @@ extension AppModel {
             if stopAction != nil {
                 return
             }
+            let failureMessage = lastError ?? error.localizedDescription
             if lastError == nil {
-                lastError = error.localizedDescription
+                lastError = failureMessage
             }
+            persistProjectFailure(failureMessage, at: currentProjectURL)
             let envDetails = """
             Underlying error: \(String(reflecting: error))
             Manifest URL: \(AppConfig.toolchainManifestURL.absoluteString)
@@ -456,7 +503,18 @@ extension AppModel {
         toolchainDownloadBucketByLabel = [:]
         lastError = nil
         errorDetails = nil
+        // Flush any pending notes save before tearing down so the user's last
+        // edit isn't lost when they start or resume a different project (or
+        // when reset() runs as part of app teardown).
+        flushPendingNotesSave()
         outputPlyURL = nil
+        currentReconstruction = nil
+        currentStageTimings = []
+        currentOutputPlyInfo = nil
+        currentAutoTune = nil
+        currentPreset = nil
+        currentInput = nil
+        currentProjectNotes = ""
         toolchainPaths = nil
         currentProjectURL = nil
         stopAction = nil
@@ -484,6 +542,19 @@ extension AppModel {
         progress = nil
         errorDetails = "The run finished, but EasySplat could not find a valid output PLY file."
         outputPlyURL = nil
+        currentReconstruction = nil
+        currentOutputPlyInfo = nil
+        currentAutoTune = nil
+        currentPreset = nil
+        currentInput = nil
+        persistProjectFailure(message, at: projectURL)
+        appendLogLine("[err] \(message)", isError: true)
+        viewState = .processing
+        refreshProjectSummaries()
+    }
+
+    private func persistProjectFailure(_ message: String, at projectURL: URL?) {
+        guard let projectURL else { return }
         mutateProjectMetadata(at: projectURL) { metadata in
             metadata.state = PipelineState(
                 stage: metadata.state.stage,
@@ -493,10 +564,8 @@ extension AppModel {
             )
             metadata.checkpoint = nil
             metadata.lastRunStartedAt = nil
+            metadata.lastFailureAt = Date()
         }
-        appendLogLine("[err] \(message)", isError: true)
-        viewState = .processing
-        refreshProjectSummaries()
     }
 
     func pipelineConfig(toolchain: ToolchainPaths, preset: PresetSpec) -> PipelineRunner.PipelineConfig {

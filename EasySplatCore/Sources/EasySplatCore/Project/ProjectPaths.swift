@@ -9,6 +9,10 @@ public struct ProjectPaths: Sendable {
     }
 
     public var metadataURL: URL { root.appendingPathComponent("project.json") }
+    /// Sidecar file holding the user's last-opened timestamp. Lives outside
+    /// project.json so the home-list stamp cannot clobber concurrent pipeline
+    /// metadata writes. Format is a small ISO-8601 JSON envelope.
+    public var lastOpenedSidecarURL: URL { root.appendingPathComponent("last_opened.json") }
     public var originalsURL: URL { root.appendingPathComponent("Originals", isDirectory: true) }
     public var framesRawURL: URL { root.appendingPathComponent("Frames/raw", isDirectory: true) }
     public var framesSelectedURL: URL { root.appendingPathComponent("Frames/selected", isDirectory: true) }

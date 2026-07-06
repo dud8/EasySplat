@@ -41,6 +41,7 @@ find scripts -type f -name '*.sh' -print0 | xargs -0 -n1 bash -n
 - Treat vendored code under `ThirdParty/` as frozen upstream unless a blocking security, license, or release issue requires a patch.
 - Prefer targeted tests for bug fixes and structural refactors.
 - Keep docs aligned when you add or change scripts, env vars, packaging behavior, or project-bundle semantics.
+- `ProjectDiagnosticBundle.build` defaults to `includeNotes: false`, and the clipboard / save panel flow honors that default. Diagnostic bundles can still include project titles and sanitized log tails, so public destinations should keep notes opt-in and should not promise that every line is private.
 
 ## Pull requests
 

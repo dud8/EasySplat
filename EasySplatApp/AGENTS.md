@@ -14,6 +14,9 @@ SwiftUI front-end for EasySplat. `AppModel` is the single source of truth for UI
 - Update UI state on the main actor (`@MainActor` / `Task { @MainActor in ... }`).
 - Use `AppConfig` for manifest/public key overrides; do not hardcode toolchain URLs elsewhere.
 - Avoid shelling out or direct toolchain access here; use `ToolchainManager` and `PipelineRunner` from EasySplatCore.
+- Use `UI/Theme/Theme.swift` tokens for colors, spacing, radii, and motion instead of hand-rolling local style constants.
+- Custom controls should keep keyboard focus visible and respect `@Environment(\.accessibilityReduceMotion)`.
+- Keep reusable component state local to the component when hover/focus state would otherwise cause parent view churn.
 
 ## Tests
 - App-level tests live in `EasySplatAppTests/` at repo root.

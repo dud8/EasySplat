@@ -276,28 +276,44 @@ extension PipelineRunner {
 final class StageTimingTracker: @unchecked Sendable {
     private let lock = NSLock()
     private let clock = ContinuousClock()
-    private var starts: [PipelineStage: ContinuousClock.Instant] = [:]
+    private var starts: [PipelineStage: (instant: ContinuousClock.Instant, wallClock: Date)] = [:]
+    private var pendingRecords: [PipelineStage: (startedAt: Date, durationSeconds: TimeInterval)] = [:]
 
     func start(_ stage: PipelineStage) {
         lock.lock()
-        starts[stage] = clock.now
+        starts[stage] = (instant: clock.now, wallClock: Date())
         lock.unlock()
     }
 
     func finish(_ stage: PipelineStage) -> String? {
         lock.lock()
-        guard let start = starts[stage] else {
+        guard let entry = starts[stage] else {
             lock.unlock()
             return nil
         }
         starts[stage] = nil
-        let duration = clock.now - start
+        let duration = clock.now - entry.instant
+        let seconds = Self.durationInSeconds(duration)
+        pendingRecords[stage] = (startedAt: entry.wallClock, durationSeconds: seconds)
         lock.unlock()
-        return Self.format(duration)
+        return Self.format(seconds: seconds)
     }
 
-    private static func format(_ duration: Duration) -> String {
-        let seconds = max(0, Double(duration.components.seconds) + Double(duration.components.attoseconds) / 1e18)
+    /// Pop the most recent completed timing for a stage. Used by the runner to
+    /// persist a `StageTimingRecord` into project metadata at stage completion.
+    func consumeRecord(_ stage: PipelineStage) -> (startedAt: Date, durationSeconds: TimeInterval)? {
+        lock.lock()
+        defer { lock.unlock() }
+        guard let record = pendingRecords[stage] else { return nil }
+        pendingRecords[stage] = nil
+        return record
+    }
+
+    private static func durationInSeconds(_ duration: Duration) -> TimeInterval {
+        return max(0, TimeInterval(duration.components.seconds) + TimeInterval(duration.components.attoseconds) / 1e18)
+    }
+
+    private static func format(seconds: TimeInterval) -> String {
         let totalSeconds = Int(seconds.rounded(.down))
 
         if totalSeconds < 60 {

@@ -6,6 +6,7 @@ struct HomeView: View {
     @EnvironmentObject private var model: AppModel
     @State private var showVideoImporter = false
     @State private var showFolderImporter = false
+    @State private var showLowDiskWarning = false
 
     var body: some View {
         ScrollView {
@@ -27,6 +28,9 @@ struct HomeView: View {
                 HStack(spacing: 12) {
                     Button("Choose Video…") { showVideoImporter = true }
                         .buttonStyle(PrimaryButtonStyle())
+                        .keyboardShortcut("o", modifiers: .command)
+                        .help("Pick one or more video files (⌘O).")
+                        .accessibilityIdentifier("home.chooseVideo")
                         .fileImporter(
                             isPresented: $showVideoImporter,
                             allowedContentTypes: [UTType.movie, UTType.video, UTType.mpeg4Movie, UTType.quickTimeMovie],
@@ -38,6 +42,9 @@ struct HomeView: View {
                         }
                     Button("Choose Photos Folder…") { showFolderImporter = true }
                         .buttonStyle(SecondaryButtonStyle())
+                        .keyboardShortcut("o", modifiers: [.command, .shift])
+                        .help("Pick a folder of images (⇧⌘O).")
+                        .accessibilityIdentifier("home.choosePhotosFolder")
                         .fileImporter(
                             isPresented: $showFolderImporter,
                             allowedContentTypes: [UTType.folder],
@@ -52,6 +59,11 @@ struct HomeView: View {
                 selectedInputsPanel
 
                 settingsPanel
+
+                ProjectFleetStatsView(
+                    stats: ProjectFleetStats.aggregate(model.projectSummaries),
+                    freeDiskBytes: model.cachedFreeDiskBytes
+                )
 
                 ProjectListView(projects: model.projectSummaries)
             }
@@ -89,6 +101,23 @@ struct HomeView: View {
                 Text("Found unfinished progress for \"\(project.title)\".")
             }
         }
+        .alert("Low disk space", isPresented: $showLowDiskWarning) {
+            Button("Start Anyway") {
+                model.startFromPendingSelection()
+            }
+            Button("Cancel", role: .cancel) { }
+        } message: {
+            Text(lowDiskWarningMessage)
+        }
+    }
+
+    private var lowDiskWarningMessage: String {
+        let formatter = ByteCountFormatter()
+        formatter.allowedUnits = [.useGB, .useMB]
+        formatter.countStyle = .file
+        let recommended = formatter.string(fromByteCount: AppModel.recommendedFreeSpaceBytes)
+        let freeText = model.cachedFreeDiskBytes.map { formatter.string(fromByteCount: $0) } ?? "unknown"
+        return "Only \(freeText) free on the EasySplat Projects volume. A run typically needs \(recommended) of working space for frames, COLMAP intermediates, and the trained splat. You can continue, but the run may fail partway."
     }
 
     private var selectedInputsPanel: some View {
@@ -148,11 +177,32 @@ struct HomeView: View {
             }
 
             HStack {
+                if let prediction = RunDurationPredictor.predict(
+                    mode: model.captureMode,
+                    quality: model.qualityPreset,
+                    from: model.projectSummaries
+                ) {
+                    Label(prediction.displayText, systemImage: "clock.arrow.circlepath")
+                        .labelStyle(.titleAndIcon)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
                 Spacer()
                 Button("Start") {
-                    model.startFromPendingSelection()
+                    // Re-probe right before Start so the warning reflects the
+                    // current free-space state instead of a stale cached value.
+                    let freshFree = model.freeDiskSpaceBytes()
+                    model.cachedFreeDiskBytes = freshFree
+                    if let free = freshFree, free < AppModel.recommendedFreeSpaceBytes {
+                        showLowDiskWarning = true
+                    } else {
+                        model.startFromPendingSelection()
+                    }
                 }
                 .buttonStyle(PrimaryButtonStyle())
+                .keyboardShortcut(.return, modifiers: .command)
+                .help("Start the pipeline with the selected input and preset (⌘↩).")
+                .accessibilityIdentifier("home.start")
                 .disabled(model.pendingVideoURLs.isEmpty && model.pendingPhotosFolderURL == nil)
             }
         }
@@ -172,7 +222,6 @@ struct HomeView: View {
             settingsPanelHorizontal
             settingsPanelVertical
         }
-        .padding(.top, 8)
     }
 
     private var settingsPanelHorizontal: some View {

@@ -29,6 +29,37 @@ struct AutoTuneProfile: Sendable {
     }
 }
 
+extension AutoTuneProfile {
+    /// Build a public, persistable snapshot of the auto-tune decisions plus the
+    /// hardware profile they were derived from. The snapshot lives in project
+    /// metadata so the viewer and diagnostic bundle can show what knobs the
+    /// pipeline chose.
+    func snapshot(profile: HardwareProfile, capturedAt: Date = Date()) -> AutoTuneSnapshot {
+        return AutoTuneSnapshot(
+            tier: tier.rawValue,
+            memoryGB: profile.memoryGB,
+            cpuCount: profile.cpuCount,
+            gpuWorkingSetGB: profile.gpuWorkingSetGB,
+            mapAnythingResolution: mapAnythingResolution,
+            mapAnythingDirectViewLimit: mapAnythingDirectViewLimit,
+            mapAnythingAnchorMaxViews: mapAnythingAnchorMaxViews,
+            mapAnythingWindowSize: mapAnythingWindowSize,
+            mapAnythingWindowOverlap: mapAnythingWindowOverlap,
+            vggtImageLoadResolution: vggtImageLoadResolution,
+            vggtFixedResolution: vggtFixedResolution,
+            vggtMaxPoints: vggtMaxPoints,
+            vggtAllowed: vggtAllowed,
+            colmapMaxNumFeatures: colmapMaxNumFeatures,
+            colmapMaxNumMatches: colmapMaxNumMatches,
+            colmapSequentialOverlap: sequentialOverlap,
+            colmapExhaustiveBlockSize: exhaustiveBlockSize,
+            threadCap: threadCap,
+            colmapMaxImageSizeCap: colmapMaxImageSizeCap,
+            capturedAt: capturedAt
+        )
+    }
+}
+
 enum AutoTuner {
     static func make(profile: HardwareProfile, preset: PresetSpec, selectedFrameCount: Int) -> AutoTuneProfile {
         _ = preset

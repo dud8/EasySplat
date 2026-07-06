@@ -145,7 +145,7 @@ public final class PipelineRunner: @unchecked Sendable {
 
         metadata.recoveryPromptSuppressed = false
         metadata.lastRunStartedAt = Date()
-        try? ProjectMetadataStore.save(metadata, to: paths.metadataURL)
+        try? ProjectMetadataStore.savePreservingUserEditableFields(metadata, to: paths.metadataURL)
 
         if metadata.state.lastError != nil {
             try? cleanForRetry(failedStage: metadata.state.stage, paths: paths)
@@ -185,7 +185,7 @@ public final class PipelineRunner: @unchecked Sendable {
                 message: message,
                 details: details
             )
-            try? ProjectMetadataStore.save(metadata, to: paths.metadataURL)
+            try? ProjectMetadataStore.savePreservingUserEditableFields(metadata, to: paths.metadataURL)
         }
 
         func shouldRunStage(_ stage: PipelineStage) throws -> Bool {
@@ -219,9 +219,19 @@ public final class PipelineRunner: @unchecked Sendable {
                case let .sfmMapping(checkpoint)? = metadata.checkpoint?.details {
                 metadata.completedSfmMapping = checkpoint
             }
+            if let timing = stageTiming.consumeRecord(stage) {
+                var timings = metadata.stageTimings ?? []
+                timings.removeAll { $0.stage == stage }
+                timings.append(StageTimingRecord(
+                    stage: stage,
+                    startedAt: timing.startedAt,
+                    durationSeconds: timing.durationSeconds
+                ))
+                metadata.stageTimings = timings
+            }
             metadata.state = PipelineState(stage: stage, attempt: metadata.state.attempt, lastError: nil, resumeToken: nil)
             metadata.checkpoint = nil
-            try? ProjectMetadataStore.save(metadata, to: paths.metadataURL)
+            try? ProjectMetadataStore.savePreservingUserEditableFields(metadata, to: paths.metadataURL)
         }
 
         func emitFailure(stage: PipelineStage, userMessage: String, debugMessage: String) {
@@ -229,7 +239,12 @@ public final class PipelineRunner: @unchecked Sendable {
             metadata.state = PipelineState(stage: stage, attempt: metadata.state.attempt, lastError: userMessage, resumeToken: nil)
             metadata.checkpoint = nil
             metadata.lastRunStartedAt = nil
-            try? ProjectMetadataStore.save(metadata, to: paths.metadataURL)
+            // Record the actual failure moment alongside the lastError so the
+            // home stats "Last failure" card and any other consumer doesn't
+            // have to infer the failure time from later-unrelated events
+            // (e.g., the user opening the project afterwards).
+            metadata.lastFailureAt = Date()
+            try? ProjectMetadataStore.savePreservingUserEditableFields(metadata, to: paths.metadataURL)
             emit(.pipelineFailed(stage: stage, userMessage: userMessage, debugMessage: debugMessage))
         }
 
@@ -479,6 +494,11 @@ public final class PipelineRunner: @unchecked Sendable {
                     colmapMaxImageSize = explicitColmapMaxImageSize
                 }
                 emit(.stageLog(stage: .sfmFeatures, line: tune.summary(profile: detectedHardwareProfile), isError: false))
+                let snapshot = tune.snapshot(profile: detectedHardwareProfile)
+                if metadata.autoTune != snapshot {
+                    metadata.autoTune = snapshot
+                    try? ProjectMetadataStore.savePreservingUserEditableFields(metadata, to: paths.metadataURL)
+                }
             }
             if applySpeedProfileIfNeeded(
                 colmapMaxImageSize: &colmapMaxImageSize,
@@ -566,7 +586,13 @@ public final class PipelineRunner: @unchecked Sendable {
             }
 
             var acceptedReconstructionScore: ReconstructionScore?
+            var acceptedReconstructionSummary: ReconstructionSummary?
             for (index, backendPolicy) in backendOrder.enumerated() {
+                // Reset accepted-quality state at the start of every backend attempt so a
+                // partial failure from the previous backend cannot leak its score/summary
+                // into a later backend's successful run.
+                acceptedReconstructionScore = nil
+                acceptedReconstructionSummary = nil
                 do {
                     if backendPolicy == .da3 {
                         let fm = FileManager.default
@@ -748,6 +774,12 @@ public final class PipelineRunner: @unchecked Sendable {
                                 ))
                                 throw PipelineError.lowQualityReconstruction(score)
                             }
+                            acceptedReconstructionScore = score
+                            acceptedReconstructionSummary = ReconstructionSummary(
+                                score: score,
+                                mapper: "da3-direct",
+                                capturedAt: Date()
+                            )
                             if !fm.fileExists(atPath: paths.colmapDatabaseURL.path) {
                                 fm.createFile(atPath: paths.colmapDatabaseURL.path, contents: Data())
                             }
@@ -1064,6 +1096,12 @@ public final class PipelineRunner: @unchecked Sendable {
                                     } else {
                                         acceptedDirect = true
                                         preparedMapAnythingMode = .direct
+                                        acceptedReconstructionScore = score
+                                        acceptedReconstructionSummary = ReconstructionSummary(
+                                            score: score,
+                                            mapper: "mapanything-direct",
+                                            capturedAt: Date()
+                                        )
                                     }
                                 } catch {
                                     if error is CancellationError { throw error }
@@ -1471,6 +1509,12 @@ public final class PipelineRunner: @unchecked Sendable {
                                     if ReconstructionScorer.isAcceptable(score, mode: metadata.preset.mode) {
                                         acceptedModelURL = sparseZero
                                         acceptedMapper = "point_triangulator+bundle_adjuster"
+                                        acceptedReconstructionScore = score
+                                        acceptedReconstructionSummary = ReconstructionSummary(
+                                            score: score,
+                                            mapper: "point_triangulator+bundle_adjuster",
+                                            capturedAt: Date()
+                                        )
                                     } else {
                                         lastMappingError = PipelineError.lowQualityReconstruction(score)
                                     }
@@ -1514,6 +1558,12 @@ public final class PipelineRunner: @unchecked Sendable {
                                         if ReconstructionScorer.isAcceptable(score, mode: metadata.preset.mode) {
                                             acceptedModelURL = sparseZero
                                             acceptedMapper = candidate
+                                            acceptedReconstructionScore = score
+                                            acceptedReconstructionSummary = ReconstructionSummary(
+                                                score: score,
+                                                mapper: candidate,
+                                                capturedAt: Date()
+                                            )
                                             return true
                                         }
                                         lastMappingError = PipelineError.lowQualityReconstruction(score)
@@ -2167,7 +2217,14 @@ public final class PipelineRunner: @unchecked Sendable {
                                 ))
                                 if ReconstructionScorer.isAcceptable(score, mode: metadata.preset.mode) {
                                     acceptedModelURL = refinedModelURL
-                                    acceptedMapper = fastUseBA ? "point_triangulator+bundle_adjuster" : "point_triangulator"
+                                    let mapperLabel = fastUseBA ? "point_triangulator+bundle_adjuster" : "point_triangulator"
+                                    acceptedMapper = mapperLabel
+                                    acceptedReconstructionScore = score
+                                    acceptedReconstructionSummary = ReconstructionSummary(
+                                        score: score,
+                                        mapper: mapperLabel,
+                                        capturedAt: Date()
+                                    )
                                 } else {
                                     lastMappingError = PipelineError.lowQualityReconstruction(score)
                                 }
@@ -2220,6 +2277,12 @@ public final class PipelineRunner: @unchecked Sendable {
                                     if ReconstructionScorer.isAcceptable(score, mode: metadata.preset.mode) {
                                         acceptedModelURL = sparseZero
                                         acceptedMapper = candidate
+                                        acceptedReconstructionScore = score
+                                        acceptedReconstructionSummary = ReconstructionSummary(
+                                            score: score,
+                                            mapper: candidate,
+                                            capturedAt: Date()
+                                        )
                                         return true
                                     }
                                     lastMappingError = PipelineError.lowQualityReconstruction(score)
@@ -2351,6 +2414,26 @@ public final class PipelineRunner: @unchecked Sendable {
                                 }
                                 acceptedModelURL = sparseZero
                                 acceptedMapper = "fastvggt-seed"
+                                // Score the seed model so the viewer's reconstruction panel
+                                // still has data even on this opt-in fallback path.
+                                // Failures are non-fatal: a missing summary just means the
+                                // panel renders without a quality badge.
+                                if let report = try? await self.tooling.colmap.runModelAnalyzer(
+                                    colmapPath: self.config.toolchain.colmap,
+                                    modelPath: sparseZero,
+                                    options: fastColmapMatchOptions
+                                ) {
+                                    let seedScore = ReconstructionScorer.applyingExpectedTotalImages(
+                                        ReconstructionScorer.parseModelAnalyzerOutput(report),
+                                        expectedTotalImages: selectedFrames.count
+                                    )
+                                    acceptedReconstructionScore = seedScore
+                                    acceptedReconstructionSummary = ReconstructionSummary(
+                                        score: seedScore,
+                                        mapper: "fastvggt-seed",
+                                        capturedAt: Date()
+                                    )
+                                }
                             }
 
                             guard let finalSparseModel = acceptedModelURL else {
@@ -2565,6 +2648,11 @@ public final class PipelineRunner: @unchecked Sendable {
                         throw PipelineError.lowQualityReconstruction(score)
                     }
                     acceptedReconstructionScore = score
+                    acceptedReconstructionSummary = ReconstructionSummary(
+                        score: score,
+                        mapper: "vggt",
+                        capturedAt: Date()
+                    )
                     writeCheckpoint(
                         stage: .sfmMapping,
                         progress: 1.0,
@@ -3001,6 +3089,11 @@ public final class PipelineRunner: @unchecked Sendable {
                         if ReconstructionScorer.isAcceptable(score, mode: metadata.preset.mode) {
                             acceptedMappingStrategy = candidate
                             acceptedReconstructionScore = score
+                            acceptedReconstructionSummary = ReconstructionSummary(
+                                score: score,
+                                mapper: candidate,
+                                capturedAt: Date()
+                            )
                             return true
                         } else {
                             lastMappingError = PipelineError.lowQualityReconstruction(score)
@@ -3266,6 +3359,10 @@ public final class PipelineRunner: @unchecked Sendable {
         }
 
             try Task.checkCancellation()
+            if let summary = acceptedReconstructionSummary, metadata.reconstruction != summary {
+                metadata.reconstruction = summary
+                try? ProjectMetadataStore.savePreservingUserEditableFields(metadata, to: paths.metadataURL)
+            }
             if skipTraining {
                 emit(.stageLog(
                     stage: .sfmMapping,
@@ -3273,17 +3370,23 @@ public final class PipelineRunner: @unchecked Sendable {
                     isError: false
                 ))
                 metadata.lastRunStartedAt = nil
-                try? ProjectMetadataStore.save(metadata, to: paths.metadataURL)
+                try? ProjectMetadataStore.savePreservingUserEditableFields(metadata, to: paths.metadataURL)
                 return
             }
             let trainingCutoffMetadata = resumeValidationMode ? metadataForResumeValidation : metadata
             var currentTrainingStartedAt = trainingExportMinimumDate(metadata: trainingCutoffMetadata)
+            // When the run resumes from .sfmMapping or later, the SfM stages are skipped and
+            // `acceptedReconstructionScore` stays nil even though the persisted reconstruction
+            // summary describes a valid solve. Rehydrate from metadata so the automatic
+            // Brush-vs-msplat guard sees the same point count the uninterrupted run would have.
+            let effectiveReconstructionScore: ReconstructionScore? = acceptedReconstructionScore
+                ?? metadata.reconstruction.map(Self.reconstructionScore(fromPersistedSummary:))
             let preferredTrainingBackend = checkpointTrainingBackend(metadata: trainingCutoffMetadata)
                 ?? trainingBackendPreference()
             let trainingBackend: TrainingBackend
             if preferredTrainingBackend == .msplat,
-               shouldUseBrushInsteadOfAutomaticMsplat(for: acceptedReconstructionScore) {
-                let pointCount = acceptedReconstructionScore?.pointCount ?? 0
+               shouldUseBrushInsteadOfAutomaticMsplat(for: effectiveReconstructionScore) {
+                let pointCount = effectiveReconstructionScore?.pointCount ?? 0
                 let minimumPointCount = automaticMsplatMinimumSparsePoints()
                 emit(.stageLog(
                     stage: .sfmMapping,
@@ -3713,7 +3816,7 @@ public final class PipelineRunner: @unchecked Sendable {
             metadata.outputs = OutputSpec(splatPlyPath: "Output/splat.ply", colmapModelPath: "SfM/colmap/sparse/0")
             metadata.state = PipelineState(stage: .done, attempt: metadata.state.attempt, lastError: nil, resumeToken: nil)
             metadata.lastRunStartedAt = nil
-            try ProjectMetadataStore.save(metadata, to: paths.metadataURL)
+            try ProjectMetadataStore.savePreservingUserEditableFields(metadata, to: paths.metadataURL)
 
             emit(.stageFinished(stage: .done))
         } catch is CancellationError {

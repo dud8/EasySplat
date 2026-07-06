@@ -11,8 +11,48 @@ public enum ProjectArtifactValidationDepth: Sendable {
     case full
 }
 
+public struct PlyHeaderInfo: Sendable, Equatable {
+    public var vertexCount: Int
+    public var format: String
+
+    public init(vertexCount: Int, format: String) {
+        self.vertexCount = vertexCount
+        self.format = format
+    }
+}
+
 public enum ProjectArtifactValidator {
     private static let maxHeaderBytes = 64 * 1024
+
+    /// Read only the PLY header for a known-good output file and return the
+    /// vertex count + format. Returns nil when the file is unreadable, missing,
+    /// or not a valid PLY header. Cheap (single bounded read of the header).
+    public static func readPlyHeader(at url: URL) -> PlyHeaderInfo? {
+        let fm = FileManager.default
+        var isDirectory = ObjCBool(false)
+        guard fm.fileExists(atPath: url.path, isDirectory: &isDirectory), !isDirectory.boolValue else {
+            return nil
+        }
+        guard let handle = try? FileHandle(forReadingFrom: url) else { return nil }
+        defer { try? handle.close() }
+        let data = (try? handle.read(upToCount: maxHeaderBytes)) ?? Data()
+        guard !data.isEmpty, let bounds = plyHeaderBounds(in: data) else { return nil }
+        guard let header = String(data: data.prefix(bounds.headerEnd), encoding: .utf8) else { return nil }
+        let lines = header.split(whereSeparator: { $0 == "\n" || $0 == "\r" }).map(String.init)
+        guard let vertexLine = lines.first(where: { $0.lowercased().hasPrefix("element vertex ") }),
+              let raw = vertexLine.split(separator: " ").last,
+              let vertexCount = Int(raw), vertexCount > 0 else {
+            return nil
+        }
+        let format = lines
+            .first(where: { $0.lowercased().hasPrefix("format ") })?
+            .split(separator: " ")
+            .dropFirst()
+            .first
+            .map(String.init)?
+            .lowercased() ?? ""
+        return PlyHeaderInfo(vertexCount: vertexCount, format: format)
+    }
 
     public static func resolveValidatedOutputPly(paths: ProjectPaths, relativePath: String) throws -> URL {
         let url = try paths.resolveProjectRelativePath(relativePath)
