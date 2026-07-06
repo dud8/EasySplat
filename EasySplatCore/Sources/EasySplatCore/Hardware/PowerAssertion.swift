@@ -15,9 +15,11 @@ public protocol PowerAssertionManaging: Sendable {
     func beginPreventingIdleSleep(reason: String) -> PowerAssertionHandle
 }
 
-/// A held power assertion. Releasing is idempotent and also happens automatically on
-/// dealloc, so a leaked handle cannot pin the machine awake indefinitely.
+/// A held power assertion. `release()` must be idempotent. The system implementation also
+/// releases on dealloc as a backstop, so a leaked handle cannot pin the machine awake
+/// indefinitely; other conformers are not required to provide that backstop.
 public protocol PowerAssertionHandle: Sendable {
+    /// Releases the assertion. Must be safe to call more than once.
     func release()
 }
 
