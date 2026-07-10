@@ -25,10 +25,10 @@ private actor EnvironmentLock {
     }
 }
 
-@MainActor
 @discardableResult
-func withEnvironmentAsync<T: Sendable>(
+func withEnvironmentAsync<T>(
     _ changes: [String: String?],
+    isolation: isolated (any Actor)? = #isolation,
     _ body: () async throws -> T
 ) async rethrows -> T {
     await EnvironmentLock.shared.lock()
@@ -46,9 +46,11 @@ func withEnvironmentAsync<T: Sendable>(
     }
 }
 
-@MainActor
 @discardableResult
-func scopedEnvironment(_ changes: [String: String?]) async -> @Sendable () -> Void {
+func scopedEnvironment(
+    _ changes: [String: String?],
+    isolation: isolated (any Actor)? = #isolation
+) async -> @Sendable () -> Void {
     await EnvironmentLock.shared.lock()
     let previous = captureEnvironment(changes)
     applyEnvironment(changes)
