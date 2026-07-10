@@ -4,6 +4,7 @@ import XCTest
 /// Covers the pure timing-caption logic extracted from ProcessingView. These assert real
 /// formatting behavior (clamping, rounding, sub-second silence, absent prediction) rather
 /// than pinning presentation copy.
+@MainActor
 final class ProcessingTimingTextTests: XCTestCase {
     func testFormatElapsedClampsRoundsAndFormats() {
         XCTAssertEqual(ProcessingView.formatElapsed(0), "0m 00s")

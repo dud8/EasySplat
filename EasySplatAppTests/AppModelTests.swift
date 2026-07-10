@@ -1878,7 +1878,7 @@ private actor AppTestEnvironmentLock {
 @discardableResult
 private func withAppEnvironmentAsync<T>(
     _ changes: [String: String?],
-    _ body: () async throws -> T
+    _ body: @MainActor () async throws -> T
 ) async rethrows -> T {
     await AppTestEnvironmentLock.shared.lock()
     let previous = captureAppEnvironment(changes)
