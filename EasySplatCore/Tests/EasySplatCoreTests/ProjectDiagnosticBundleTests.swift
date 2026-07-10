@@ -337,6 +337,64 @@ final class ProjectDiagnosticBundleTests: XCTestCase {
         )
     }
 
+    func testMachineReadableJsonMasksLegacyUnreliableReprojectionWithoutMutatingProject() throws {
+        let root = try TestFileBuilder.makeTempDir()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let paths = ProjectPaths(root: root)
+        try paths.ensureDirectories()
+        let legacyReconstruction = ReconstructionSummary(
+            mapper: "global_mapper",
+            capturedAt: Date(timeIntervalSince1970: 1_700_000_000),
+            registeredImages: 18,
+            totalImages: 20,
+            meanReprojectionError: 0.0003
+        )
+        try ProjectMetadataStore.save(
+            ProjectMetadata(
+                title: "LegacyGlobalMapper",
+                input: .photos(folder: "/tmp/photos"),
+                preset: PresetSpec(mode: .object, quality: .standard),
+                reconstruction: legacyReconstruction
+            ),
+            to: paths.metadataURL
+        )
+
+        let bundle = try XCTUnwrap(ProjectDiagnosticBundle.build(projectURL: root))
+        let parsed = try machineReadablePayload(from: bundle)
+        let reconstruction = try XCTUnwrap(parsed["reconstruction"] as? [String: Any])
+        XCTAssertNil(reconstruction["meanReprojectionError"])
+
+        let persisted = try ProjectMetadataStore.load(from: paths.metadataURL)
+        XCTAssertEqual(persisted.reconstruction?.meanReprojectionError, 0.0003)
+    }
+
+    func testMachineReadableJsonKeepsReliableReprojection() throws {
+        let root = try TestFileBuilder.makeTempDir()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let paths = ProjectPaths(root: root)
+        try paths.ensureDirectories()
+        try ProjectMetadataStore.save(
+            ProjectMetadata(
+                title: "ReliableColmap",
+                input: .photos(folder: "/tmp/photos"),
+                preset: PresetSpec(mode: .object, quality: .standard),
+                reconstruction: ReconstructionSummary(
+                    mapper: "colmap",
+                    capturedAt: Date(timeIntervalSince1970: 1_700_000_000),
+                    registeredImages: 18,
+                    totalImages: 20,
+                    meanReprojectionError: 0.85
+                )
+            ),
+            to: paths.metadataURL
+        )
+
+        let bundle = try XCTUnwrap(ProjectDiagnosticBundle.build(projectURL: root))
+        let parsed = try machineReadablePayload(from: bundle)
+        let reconstruction = try XCTUnwrap(parsed["reconstruction"] as? [String: Any])
+        XCTAssertEqual(reconstruction["meanReprojectionError"] as? Double, 0.85)
+    }
+
     func testNotesAreIncludedOnlyWhenOptedIn() throws {
         let root = try TestFileBuilder.makeTempDir()
         defer { try? FileManager.default.removeItem(at: root) }
@@ -358,5 +416,14 @@ final class ProjectDiagnosticBundleTests: XCTestCase {
         let sanitizer = HomePathSanitizer(homePath: "/Users/example")
         XCTAssertEqual(sanitizer.sanitize("/Users/example/Documents/foo"), "~/Documents/foo")
         XCTAssertEqual(sanitizer.sanitize("/var/tmp/x"), "/var/tmp/x")
+    }
+
+    private func machineReadablePayload(from bundle: String) throws -> [String: Any] {
+        let start = try XCTUnwrap(bundle.range(of: "```json\n"))
+        let end = try XCTUnwrap(bundle.range(of: "\n```", range: start.upperBound..<bundle.endIndex))
+        let json = String(bundle[start.upperBound..<end.lowerBound])
+        return try XCTUnwrap(
+            JSONSerialization.jsonObject(with: Data(json.utf8), options: []) as? [String: Any]
+        )
     }
 }

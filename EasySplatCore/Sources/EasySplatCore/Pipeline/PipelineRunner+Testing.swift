@@ -670,8 +670,8 @@ extension PipelineRunner {
         PipelineError.invalidInput
     }
 
-    func test_makePipelineErrorLowQuality(_ score: ReconstructionScore) -> Error {
-        PipelineError.lowQualityReconstruction(score)
+    func test_makePipelineErrorLowQuality(_ score: ReconstructionScore, mapper: String? = nil) -> Error {
+        return PipelineError.lowQualityReconstruction(score, mapper: mapper)
     }
 
     func test_makePipelineErrorImageTranscodeFailed(_ message: String) -> Error {

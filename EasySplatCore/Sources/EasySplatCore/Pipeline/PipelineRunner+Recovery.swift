@@ -20,7 +20,7 @@ extension PipelineRunner {
     enum PipelineError: Error {
         case invalidInput
         case insufficientInputImages(Int)
-        case lowQualityReconstruction(ReconstructionScore)
+        case lowQualityReconstruction(ReconstructionScore, mapper: String?)
         case imageTranscodeFailed(String)
         case outputMissing
     }
@@ -101,8 +101,10 @@ extension PipelineRunner {
                 return ("No usable photos or video frames were found.", String(reflecting: pipelineError))
             case let .insufficientInputImages(actual):
                 return ("At least two usable photos or video frames are required.", "Insufficient input images after selection: \(actual).")
-            case let .lowQualityReconstruction(score):
-                return ("I couldn't get a stable camera solve. Try a slower capture and more light.", "Low-quality reconstruction. \(ReconstructionScorer.summary(score)).")
+            case let .lowQualityReconstruction(score, mapper):
+                let summary = mapper.map { ReconstructionScorer.summary(score, mapper: $0) }
+                    ?? ReconstructionScorer.summary(score)
+                return ("I couldn't get a stable camera solve. Try a slower capture and more light.", "Low-quality reconstruction. \(summary).")
             case let .imageTranscodeFailed(message):
                 return ("Failed to convert photos for processing. Try exporting as JPEG/PNG.", message)
             case .outputMissing:

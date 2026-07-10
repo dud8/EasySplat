@@ -785,7 +785,7 @@ public final class PipelineRunner: @unchecked Sendable {
                                     line: "DA3 direct solve was below the quality bar (\(rejection)); trying the next SfM backend.",
                                     isError: true
                                 ))
-                                throw PipelineError.lowQualityReconstruction(score)
+                                throw PipelineError.lowQualityReconstruction(score, mapper: "da3-direct")
                             }
                             acceptedReconstructionScore = score
                             acceptedReconstructionSummary = ReconstructionSummary(
@@ -921,6 +921,7 @@ public final class PipelineRunner: @unchecked Sendable {
                         func analyzeMapAnythingModel(
                             at modelURL: URL,
                             candidate: String,
+                            mapper: String,
                             toolLog: ToolLogWriter? = nil
                         ) async throws -> ReconstructionScore {
                             let report = try await self.tooling.colmap.runModelAnalyzer(
@@ -937,7 +938,7 @@ public final class PipelineRunner: @unchecked Sendable {
                             )
                             emit(.stageLog(
                                 stage: currentStage,
-                                line: "MapAnything score (\(candidate)): \(ReconstructionScorer.summary(score, mapper: "mapanything-direct")).",
+                                line: "MapAnything score (\(candidate)): \(ReconstructionScorer.summary(score, mapper: mapper)).",
                                 isError: false
                             ))
                             return score
@@ -1091,6 +1092,7 @@ public final class PipelineRunner: @unchecked Sendable {
                                     let rawScore = try await analyzeMapAnythingModel(
                                         at: sparseZero,
                                         candidate: "direct",
+                                        mapper: "mapanything-direct",
                                         toolLog: mapToolLog
                                     )
                                     let score = mapAnythingScoreApplyingCoverageFallback(
@@ -1519,6 +1521,7 @@ public final class PipelineRunner: @unchecked Sendable {
                                     let score = try await analyzeMapAnythingModel(
                                         at: sparseZero,
                                         candidate: "point_triangulator+bundle_adjuster",
+                                        mapper: "point_triangulator+bundle_adjuster",
                                         toolLog: colmapToolLog
                                     )
                                     if ReconstructionScorer.isAcceptable(score, mode: metadata.preset.mode) {
@@ -1531,7 +1534,10 @@ public final class PipelineRunner: @unchecked Sendable {
                                             capturedAt: Date()
                                         )
                                     } else {
-                                        lastMappingError = PipelineError.lowQualityReconstruction(score)
+                                        lastMappingError = PipelineError.lowQualityReconstruction(
+                                            score,
+                                            mapper: "point_triangulator+bundle_adjuster"
+                                        )
                                     }
                                 } catch {
                                     if error is CancellationError { throw error }
@@ -1568,12 +1574,14 @@ public final class PipelineRunner: @unchecked Sendable {
                                         let score = try await analyzeMapAnythingModel(
                                             at: sparseZero,
                                             candidate: candidate,
+                                            mapper: candidate,
                                             toolLog: colmapToolLog
                                         )
                                         if ReconstructionScorer.isAcceptable(score, mode: metadata.preset.mode) {
                                             acceptedModelURL = sparseZero
                                             acceptedMapper = candidate
                                             acceptedReconstructionScore = score
+                                            self.warnIfWeakAcceptedSolve(score: score, mapper: candidate, emit: emit)
                                             acceptedReconstructionSummary = ReconstructionSummary(
                                                 score: score,
                                                 mapper: candidate,
@@ -1581,7 +1589,7 @@ public final class PipelineRunner: @unchecked Sendable {
                                             )
                                             return true
                                         }
-                                        lastMappingError = PipelineError.lowQualityReconstruction(score)
+                                        lastMappingError = PipelineError.lowQualityReconstruction(score, mapper: candidate)
                                         return false
                                     }
 
@@ -2228,14 +2236,14 @@ public final class PipelineRunner: @unchecked Sendable {
                                     ReconstructionScorer.parseModelAnalyzerOutput(report),
                                     expectedTotalImages: selectedFrames.count
                                 )
+                                let mapperLabel = fastUseBA ? "point_triangulator+bundle_adjuster" : "point_triangulator"
                                 emit(.stageLog(
                                     stage: .sfmMapping,
-                                    line: "FastVGGT refinement score: \(ReconstructionScorer.summary(score)).",
+                                    line: "FastVGGT refinement score: \(ReconstructionScorer.summary(score, mapper: mapperLabel)).",
                                     isError: false
                                 ))
                                 if ReconstructionScorer.isAcceptable(score, mode: metadata.preset.mode) {
                                     acceptedModelURL = refinedModelURL
-                                    let mapperLabel = fastUseBA ? "point_triangulator+bundle_adjuster" : "point_triangulator"
                                     acceptedMapper = mapperLabel
                                     acceptedReconstructionScore = score
                                     acceptedReconstructionSummary = ReconstructionSummary(
@@ -2244,7 +2252,7 @@ public final class PipelineRunner: @unchecked Sendable {
                                         capturedAt: Date()
                                     )
                                 } else {
-                                    lastMappingError = PipelineError.lowQualityReconstruction(score)
+                                    lastMappingError = PipelineError.lowQualityReconstruction(score, mapper: mapperLabel)
                                 }
                             } catch {
                                 if error is CancellationError { throw error }
@@ -2296,6 +2304,7 @@ public final class PipelineRunner: @unchecked Sendable {
                                         acceptedModelURL = sparseZero
                                         acceptedMapper = candidate
                                         acceptedReconstructionScore = score
+                                        self.warnIfWeakAcceptedSolve(score: score, mapper: candidate, emit: emit)
                                         acceptedReconstructionSummary = ReconstructionSummary(
                                             score: score,
                                             mapper: candidate,
@@ -2303,7 +2312,7 @@ public final class PipelineRunner: @unchecked Sendable {
                                         )
                                         return true
                                     }
-                                    lastMappingError = PipelineError.lowQualityReconstruction(score)
+                                    lastMappingError = PipelineError.lowQualityReconstruction(score, mapper: candidate)
                                     return false
                                 }
 
@@ -2664,7 +2673,7 @@ public final class PipelineRunner: @unchecked Sendable {
                             line: "VGGT sparse model rejected: \(failureReason).",
                             isError: true
                         ))
-                        throw PipelineError.lowQualityReconstruction(score)
+                        throw PipelineError.lowQualityReconstruction(score, mapper: "vggt")
                     }
                     acceptedReconstructionScore = score
                     acceptedReconstructionSummary = ReconstructionSummary(
@@ -3128,7 +3137,7 @@ public final class PipelineRunner: @unchecked Sendable {
                             )
                             return true
                         } else {
-                            lastMappingError = PipelineError.lowQualityReconstruction(score)
+                            lastMappingError = PipelineError.lowQualityReconstruction(score, mapper: candidate)
                             return false
                         }
                     }
@@ -3289,12 +3298,14 @@ public final class PipelineRunner: @unchecked Sendable {
                         guard mappingSucceeded else {
                             let debugMessage: String
                             if let pipelineError = lastMappingError as? PipelineError,
-                               case let .lowQualityReconstruction(score) = pipelineError {
-                                debugMessage = "Low-quality reconstruction. \(ReconstructionScorer.summary(score))."
+                               case let .lowQualityReconstruction(score, mapper) = pipelineError {
+                                let summary = mapper.map { ReconstructionScorer.summary(score, mapper: $0) }
+                                    ?? ReconstructionScorer.summary(score)
+                                debugMessage = "Low-quality reconstruction. \(summary)."
                             } else if let colmapError = lastMappingError as? ColmapRunnerError {
                                 debugMessage = debugDescription(for: colmapError)
                             } else {
-                                debugMessage = "\(lastMappingError ?? PipelineError.lowQualityReconstruction(.init(registeredImages: 0, totalImages: 0, meanReprojectionError: nil)))"
+                                debugMessage = "\(lastMappingError ?? PipelineError.lowQualityReconstruction(.init(registeredImages: 0, totalImages: 0, meanReprojectionError: nil), mapper: nil))"
                             }
                             let userMessage = "I couldn't get a stable camera solve. Last attempt: \(lastMappingAttempt). Try a slower capture and more light."
                             emitFailure(
@@ -3302,7 +3313,7 @@ public final class PipelineRunner: @unchecked Sendable {
                                 userMessage: userMessage,
                                 debugMessage: debugMessage
                             )
-                            throw lastMappingError ?? PipelineError.lowQualityReconstruction(.init(registeredImages: 0, totalImages: 0, meanReprojectionError: nil))
+                            throw lastMappingError ?? PipelineError.lowQualityReconstruction(.init(registeredImages: 0, totalImages: 0, meanReprojectionError: nil), mapper: nil)
                         }
                         let canonicalSparseModel = paths.colmapSparseURL.appendingPathComponent("0", isDirectory: true)
                         let resolvedSparseModel = try resolveSparseModelDirectory(at: canonicalSparseModel)

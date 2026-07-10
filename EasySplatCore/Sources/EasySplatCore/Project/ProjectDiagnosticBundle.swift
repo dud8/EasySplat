@@ -219,11 +219,16 @@ public enum ProjectDiagnosticBundle {
             var autoTune: AutoTuneSnapshot?
             var lastFailureAt: Date?
         }
+        let diagnosticReconstruction = metadata.reconstruction.map { reconstruction in
+            var copy = reconstruction
+            copy.meanReprojectionError = reconstruction.resolvedReprojectionError
+            return copy
+        }
         let payload = Payload(
             schemaVersion: ProjectDiagnosticBundle.machineReadableSchemaVersion,
             projectId: metadata.id.uuidString,
             preset: metadata.preset,
-            reconstruction: metadata.reconstruction,
+            reconstruction: diagnosticReconstruction,
             stageTimings: metadata.stageTimings,
             autoTune: metadata.autoTune,
             lastFailureAt: metadata.lastFailureAt

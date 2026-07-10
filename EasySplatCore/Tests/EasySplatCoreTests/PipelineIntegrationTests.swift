@@ -27,6 +27,8 @@ final class PipelineIntegrationTests: XCTestCase {
         let restore = await scopedPipelineEnvironment([
             "EASYSPLAT_SFM_BACKEND": "colmap",
             "EASYSPLAT_SFM_MAPPER": nil,
+            "EASYSPLAT_GLOBAL_MAPPER_GP_USE_GPU": "1",
+            "EASYSPLAT_GLOBAL_MAPPER_BA_USE_GPU": "1",
             "EASYSPLAT_SKIP_TRAINING": nil
         ])
         defer { restore() }
@@ -48,11 +50,13 @@ final class PipelineIntegrationTests: XCTestCase {
 
         let toolchain = try makeToolchain(root: temp)
         let runStartProbe = RunStartMarkerProbe()
+        let powerAssertion = RecordingPowerAssertion()
 
         let runner = MockSubprocessRunner(scripts: [
             .init(path: toolchain.colmap.path, argsPrefix: ["feature_extractor"], result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""), onRun: { _ in
                 let loaded = try? ProjectMetadataStore.load(from: paths.metadataURL)
                 runStartProbe.record(observed: loaded?.lastRunStartedAt != nil)
+                XCTAssertEqual(powerAssertion.active, 1, "The assertion must still be active while subprocess work is running.")
             }),
             .init(path: toolchain.colmap.path, argsPrefix: ["exhaustive_matcher"], result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""), onRun: nil),
             .init(path: toolchain.colmap.path, argsPrefix: ["global_mapper"], result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""), onRun: { _ in try? self.writeSparseModel(at: projectURL) }),
@@ -66,7 +70,6 @@ final class PipelineIntegrationTests: XCTestCase {
             })
         ])
 
-        let powerAssertion = RecordingPowerAssertion()
         let pipeline = PipelineRunner(
             projectURL: projectURL,
             config: .init(toolchain: toolchain, preset: metadata.preset),
@@ -78,6 +81,7 @@ final class PipelineIntegrationTests: XCTestCase {
 
         XCTAssertEqual(powerAssertion.begun, 1, "A successful run holds exactly one idle-sleep assertion.")
         XCTAssertEqual(powerAssertion.released, 1, "A successful run must release the idle-sleep assertion.")
+        XCTAssertEqual(powerAssertion.active, 0)
 
         let output = projectURL.appendingPathComponent("Output/splat.ply")
         XCTAssertTrue(FileManager.default.fileExists(atPath: output.path))
@@ -87,8 +91,7 @@ final class PipelineIntegrationTests: XCTestCase {
         let reconstruction = try XCTUnwrap(finalMetadata.reconstruction, "Successful runs must persist a reconstruction summary.")
         XCTAssertEqual(reconstruction.registeredImages, 100)
         XCTAssertEqual(reconstruction.totalImages, 100)
-        XCTAssertTrue(reconstruction.mapper.hasPrefix("global_mapper") || reconstruction.mapper == "colmap",
-                      "Unexpected mapper label: \(reconstruction.mapper)")
+        XCTAssertEqual(reconstruction.mapper, "global_mapper-gpu")
         // GLOMAP's model_analyzer reprojection error is not a real pixel residual, so the
         // persisted summary drops it (see ReconstructionSummary.reprojectionErrorIsUnreliable).
         if ReconstructionSummary.reprojectionErrorIsUnreliable(forMapper: reconstruction.mapper) {
@@ -125,10 +128,12 @@ final class PipelineIntegrationTests: XCTestCase {
         try ProjectMetadataStore.save(metadata, to: paths.metadataURL)
 
         let toolchain = try makeToolchain(root: temp)
-        let runner = MockSubprocessRunner(scripts: [
-            .init(path: toolchain.colmap.path, argsPrefix: ["feature_extractor"], result: .init(exitCode: 1, terminationReason: .exit, stdout: "", stderr: "feature extraction failed"), onRun: nil)
-        ])
         let powerAssertion = RecordingPowerAssertion()
+        let runner = MockSubprocessRunner(scripts: [
+            .init(path: toolchain.colmap.path, argsPrefix: ["feature_extractor"], result: .init(exitCode: 1, terminationReason: .exit, stdout: "", stderr: "feature extraction failed"), onRun: { _ in
+                XCTAssertEqual(powerAssertion.active, 1, "The assertion must remain active through a failing subprocess.")
+            })
+        ])
         let pipeline = PipelineRunner(
             projectURL: projectURL,
             config: .init(toolchain: toolchain, preset: metadata.preset),
@@ -142,6 +147,7 @@ final class PipelineIntegrationTests: XCTestCase {
 
         XCTAssertEqual(powerAssertion.begun, 1, "A failed run still holds exactly one idle-sleep assertion.")
         XCTAssertEqual(powerAssertion.released, 1, "A failed run must release the idle-sleep assertion on the throw path.")
+        XCTAssertEqual(powerAssertion.active, 0)
 
         let failedMetadata = try ProjectMetadataStore.load(from: paths.metadataURL)
         XCTAssertNil(failedMetadata.lastRunStartedAt, "Failed runs should clear lastRunStartedAt.")
@@ -307,10 +313,11 @@ final class PipelineIntegrationTests: XCTestCase {
             try await pipeline.run { _ in }
             XCTFail("Expected low-quality VGGT reconstruction")
         } catch let error as PipelineRunner.PipelineError {
-            guard case let .lowQualityReconstruction(score) = error else {
+            guard case let .lowQualityReconstruction(score, mapper) = error else {
                 XCTFail("Expected low-quality reconstruction, got \(error)")
                 return
             }
+            XCTAssertEqual(mapper, "vggt")
             XCTAssertEqual(score.registeredImages, 1)
             XCTAssertEqual(score.totalImages, 20)
         }
@@ -361,10 +368,11 @@ final class PipelineIntegrationTests: XCTestCase {
             try await pipeline.run { _ in }
             XCTFail("Expected thin VGGT reconstruction")
         } catch let error as PipelineRunner.PipelineError {
-            guard case let .lowQualityReconstruction(score) = error else {
+            guard case let .lowQualityReconstruction(score, mapper) = error else {
                 XCTFail("Expected low-quality reconstruction, got \(error)")
                 return
             }
+            XCTAssertEqual(mapper, "vggt")
             XCTAssertEqual(score.registeredImages, 20)
             XCTAssertEqual(score.totalImages, 20)
             XCTAssertEqual(score.pointCount, 500)
@@ -410,7 +418,8 @@ final class PipelineIntegrationTests: XCTestCase {
             tooling: .init(runner: runner)
         )
 
-        try await pipeline.run { _ in }
+        let events = PipelineEventSink()
+        try await pipeline.run { events.append($0) }
 
         XCTAssertTrue(runner.calls.contains(where: { $0.0 == toolchain.mapanything.sfmTool.path }))
         XCTAssertFalse(runner.calls.contains(where: { $0.0 == toolchain.colmap.path && $0.1.first == "feature_extractor" }))
@@ -426,6 +435,9 @@ final class PipelineIntegrationTests: XCTestCase {
         // mapanything-direct writes a placeholder point-error, so it is not persisted as a
         // pixel reprojection (see ReconstructionSummary.reprojectionErrorIsUnreliable).
         XCTAssertNil(reconstruction.meanReprojectionError)
+        let directScoreLog = try XCTUnwrap(events.stageLog(containing: "MapAnything score (direct):"))
+        XCTAssertTrue(directScoreLog.contains("mean reprojection error n/a"))
+        XCTAssertFalse(directScoreLog.contains("0.70"))
         let timings = finalMetadata.stageTimings ?? []
         XCTAssertFalse(timings.isEmpty, "Stage timings must be persisted for completed runs.")
         XCTAssertTrue(timings.contains(where: { $0.stage == .sfmFeatures }))
@@ -480,7 +492,8 @@ final class PipelineIntegrationTests: XCTestCase {
             tooling: .init(runner: runner)
         )
 
-        try await pipeline.run { _ in }
+        let events = PipelineEventSink()
+        try await pipeline.run { events.append($0) }
 
         XCTAssertTrue(runner.calls.contains(where: { $0.0 == toolchain.mapanything.sfmTool.path }))
         XCTAssertTrue(runner.calls.contains(where: { $0.0 == toolchain.colmap.path && $0.1.first == "feature_extractor" }))
@@ -494,12 +507,16 @@ final class PipelineIntegrationTests: XCTestCase {
         XCTAssertEqual(reconstruction.mapper, "point_triangulator+bundle_adjuster")
         XCTAssertEqual(reconstruction.registeredImages, 12)
         XCTAssertEqual(reconstruction.totalImages, 12)
+        let refinedScoreLog = try XCTUnwrap(events.stageLog(containing: "MapAnything score (point_triangulator+bundle_adjuster):"))
+        XCTAssertTrue(refinedScoreLog.contains("mean reprojection error 1.00"))
     }
 
-    func testPipelineMapAnythingDirectLowQualityFallsBackToSeedRefine() async throws {
+    func testPipelineMapAnythingWeakGlobalMapperFallbackLogsHonestScoreAndWarning() async throws {
         let restore = await scopedPipelineEnvironment([
             "EASYSPLAT_SFM_BACKEND": "mapanything",
             "EASYSPLAT_SFM_MAPPER": nil,
+            "EASYSPLAT_GLOBAL_MAPPER_GP_USE_GPU": "0",
+            "EASYSPLAT_GLOBAL_MAPPER_BA_USE_GPU": "0",
             "EASYSPLAT_SKIP_TRAINING": "1"
         ])
         defer { restore() }
@@ -532,15 +549,11 @@ final class PipelineIntegrationTests: XCTestCase {
             }),
             .init(path: toolchain.colmap.path, argsPrefix: ["feature_extractor"], result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""), onRun: nil),
             .init(path: toolchain.colmap.path, argsPrefix: ["exhaustive_matcher"], result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""), onRun: nil),
-            .init(path: toolchain.colmap.path, argsPrefix: ["point_triangulator"], result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""), onRun: { args in
-                guard let out = self.value(for: "--output_path", in: args) else { return }
-                try? self.writeSparseModel(at: URL(fileURLWithPath: out), imageName: "frame_000000.jpg")
+            .init(path: toolchain.colmap.path, argsPrefix: ["point_triangulator"], result: .init(exitCode: 1, terminationReason: .exit, stdout: "", stderr: "triangulation failed"), onRun: nil),
+            .init(path: toolchain.colmap.path, argsPrefix: ["global_mapper"], result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""), onRun: { _ in
+                try? self.writeSparseModel(at: projectURL)
             }),
-            .init(path: toolchain.colmap.path, argsPrefix: ["bundle_adjuster"], result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""), onRun: { args in
-                guard let out = self.value(for: "--output_path", in: args) else { return }
-                try? self.writeSparseModel(at: URL(fileURLWithPath: out), imageName: "frame_000000.jpg")
-            }),
-            .init(path: toolchain.colmap.path, argsPrefix: ["model_analyzer"], result: .init(exitCode: 0, terminationReason: .exit, stdout: "Registered images: 4 / 4\nMean reprojection error: 1.0\n", stderr: ""), onRun: nil)
+            .init(path: toolchain.colmap.path, argsPrefix: ["model_analyzer"], result: .init(exitCode: 0, terminationReason: .exit, stdout: "Registered images: 4 / 4\nPoints: 16000\nObservations: 40000\nMean track length: 2.5\nMean reprojection error: 0.0003\n", stderr: ""), onRun: nil)
         ])
 
         let pipeline = PipelineRunner(
@@ -549,7 +562,8 @@ final class PipelineIntegrationTests: XCTestCase {
             tooling: .init(runner: runner)
         )
 
-        try await pipeline.run { _ in }
+        let events = PipelineEventSink()
+        try await pipeline.run { events.append($0) }
 
         let mapAnythingCalls = runner.calls.filter { $0.0 == toolchain.mapanything.sfmTool.path }
         XCTAssertEqual(mapAnythingCalls.count, 2)
@@ -557,7 +571,11 @@ final class PipelineIntegrationTests: XCTestCase {
         XCTAssertTrue(mapAnythingCalls[1].1.contains("seed_refine"))
         XCTAssertTrue(runner.calls.contains(where: { $0.0 == toolchain.colmap.path && $0.1.first == "feature_extractor" }))
         XCTAssertTrue(runner.calls.contains(where: { $0.0 == toolchain.colmap.path && $0.1.first == "point_triangulator" }))
-        XCTAssertFalse(runner.calls.contains(where: { $0.0 == toolchain.colmap.path && $0.1.first == "global_mapper" }))
+        XCTAssertTrue(runner.calls.contains(where: { $0.0 == toolchain.colmap.path && $0.1.first == "global_mapper" }))
+        let fallbackScore = try XCTUnwrap(events.stageLog(containing: "MapAnything score (global_mapper):"))
+        XCTAssertTrue(fallbackScore.contains("mean reprojection error n/a"))
+        XCTAssertFalse(fallbackScore.contains("0.0003"))
+        XCTAssertNotNil(events.stageLog(containing: "Accepted global_mapper solve has a short mean track length"))
     }
 
     func testPipelineMapAnythingDirectThinTracksFallsBackToSeedRefine() async throws {
@@ -1159,11 +1177,13 @@ final class PipelineIntegrationTests: XCTestCase {
 
         let toolchain = try makeToolchain(root: temp, createMapAnythingFiles: true, createVggtFiles: true)
         let runner = CancellationOnSfmRunner(cancelPath: toolchain.mapanything.sfmTool.path)
+        let powerAssertion = RecordingPowerAssertion()
 
         let pipeline = PipelineRunner(
             projectURL: projectURL,
             config: .init(toolchain: toolchain, preset: metadata.preset),
-            tooling: .init(runner: runner)
+            tooling: .init(runner: runner),
+            powerAssertion: powerAssertion
         )
 
         await XCTAssertThrowsErrorAsync({
@@ -1175,6 +1195,9 @@ final class PipelineIntegrationTests: XCTestCase {
         let callPaths = runner.calls.map { $0.0 }
         XCTAssertEqual(callPaths.filter { $0 == toolchain.mapanything.sfmTool.path }.count, 1)
         XCTAssertFalse(callPaths.contains(toolchain.colmap.path))
+        XCTAssertEqual(powerAssertion.begun, 1)
+        XCTAssertEqual(powerAssertion.released, 1)
+        XCTAssertEqual(powerAssertion.active, 0, "Cancellation must release the active assertion.")
         let interruptedMetadata = try ProjectMetadataStore.load(from: paths.metadataURL)
         XCTAssertNotNil(interruptedMetadata.lastRunStartedAt, "Cancellation should preserve lastRunStartedAt for crash/interruption detection.")
     }
@@ -1451,7 +1474,7 @@ final class PipelineIntegrationTests: XCTestCase {
             .init(path: toolchain.colmap.path, argsPrefix: ["exhaustive_matcher"], result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""), onRun: nil),
             .init(path: toolchain.colmap.path, argsPrefix: ["point_triangulator"], result: .init(exitCode: 1, terminationReason: .exit, stdout: "", stderr: "triangulator failed"), onRun: nil),
             .init(path: toolchain.colmap.path, argsPrefix: ["global_mapper"], result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""), onRun: { _ in try? self.writeSparseModel(at: projectURL) }),
-            .init(path: toolchain.colmap.path, argsPrefix: ["model_analyzer"], result: .init(exitCode: 0, terminationReason: .exit, stdout: "Registered images: 10 / 10\nMean reprojection error: 1.0\n", stderr: ""), onRun: nil)
+            .init(path: toolchain.colmap.path, argsPrefix: ["model_analyzer"], result: .init(exitCode: 0, terminationReason: .exit, stdout: "Registered images: 10 / 10\nPoints: 16000\nObservations: 40000\nMean track length: 2.5\nMean reprojection error: 1.0\n", stderr: ""), onRun: nil)
         ])
 
         let pipeline = PipelineRunner(
@@ -1460,7 +1483,8 @@ final class PipelineIntegrationTests: XCTestCase {
             tooling: .init(runner: runner)
         )
 
-        try await pipeline.run { _ in }
+        let events = PipelineEventSink()
+        try await pipeline.run { events.append($0) }
 
         let callPaths = runner.calls.map { $0.0 }
         XCTAssertTrue(callPaths.contains(toolchain.fastvggt.sfmTool.path))
@@ -1468,6 +1492,7 @@ final class PipelineIntegrationTests: XCTestCase {
         XCTAssertTrue(runner.calls.contains(where: { $0.0 == toolchain.colmap.path && $0.1.first == "point_triangulator" }))
         XCTAssertTrue(callPaths.contains(toolchain.colmap.path))
         XCTAssertTrue(runner.calls.contains(where: { $0.0 == toolchain.colmap.path && $0.1.first == "global_mapper" }))
+        XCTAssertNotNil(events.stageLog(containing: "Accepted global_mapper"))
     }
 
     func testPipelineIgnoresDeprecatedGraceFallbackEnv() async throws {
@@ -3215,6 +3240,26 @@ private final class CancellationOnSfmRunner: @unchecked Sendable, SubprocessRunn
         }
 
         return SubprocessResult(exitCode: 0, terminationReason: .exit, stdout: "", stderr: "")
+    }
+}
+
+private final class PipelineEventSink: @unchecked Sendable {
+    private let lock = NSLock()
+    private var events: [PipelineEvent] = []
+
+    func append(_ event: PipelineEvent) {
+        lock.lock()
+        events.append(event)
+        lock.unlock()
+    }
+
+    func stageLog(containing fragment: String) -> String? {
+        lock.lock()
+        defer { lock.unlock() }
+        return events.compactMap { event -> String? in
+            guard case let .stageLog(_, line, _) = event, line.contains(fragment) else { return nil }
+            return line
+        }.first
     }
 }
 
