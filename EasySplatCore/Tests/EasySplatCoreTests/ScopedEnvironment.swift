@@ -27,9 +27,9 @@ private actor EnvironmentLock {
 
 @MainActor
 @discardableResult
-func withEnvironmentAsync<T>(
+func withEnvironmentAsync<T: Sendable>(
     _ changes: [String: String?],
-    _ body: @MainActor () async throws -> T
+    _ body: () async throws -> T
 ) async rethrows -> T {
     await EnvironmentLock.shared.lock()
     let previous = captureEnvironment(changes)
