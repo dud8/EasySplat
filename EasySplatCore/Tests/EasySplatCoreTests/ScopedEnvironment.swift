@@ -29,7 +29,7 @@ private actor EnvironmentLock {
 @discardableResult
 func withEnvironmentAsync<T>(
     _ changes: [String: String?],
-    _ body: () async throws -> T
+    _ body: @MainActor () async throws -> T
 ) async rethrows -> T {
     await EnvironmentLock.shared.lock()
     let previous = captureEnvironment(changes)

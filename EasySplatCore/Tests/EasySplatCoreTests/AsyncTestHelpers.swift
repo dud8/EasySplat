@@ -2,7 +2,7 @@ import XCTest
 
 @MainActor
 func XCTAssertThrowsErrorAsync<T>(
-    _ expression: @escaping () async throws -> T,
+    _ expression: @escaping @MainActor () async throws -> T,
     _ message: @autoclosure () -> String = "",
     file: StaticString = #filePath,
     line: UInt = #line,

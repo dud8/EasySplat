@@ -27,6 +27,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - name: Install repo health dependencies
+        run: sudo apt-get update && sudo apt-get install -y ripgrep
       - name: Verify public repo collateral
         run: ./scripts/ci/check_repo_health.sh
       - name: Lint shell scripts
