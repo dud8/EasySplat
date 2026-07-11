@@ -66,6 +66,7 @@ public final class PipelineRunner: @unchecked Sendable {
     let config: PipelineConfig
     let tooling: Tooling
     let powerAssertion: PowerAssertionManaging
+    private let initialEnvironment: [String: String]
     private let capturedEnvironment: [String: String]?
 
     enum SfmMapperPreference: String {
@@ -104,6 +105,7 @@ public final class PipelineRunner: @unchecked Sendable {
         self.config = config
         self.tooling = tooling
         self.powerAssertion = powerAssertion
+        self.initialEnvironment = RuntimeEnvironment.current
         self.capturedEnvironment = nil
     }
 
@@ -112,7 +114,7 @@ public final class PipelineRunner: @unchecked Sendable {
     }
 
     public func run(resumeFrom lastCompletedStage: PipelineStage? = nil, events: @escaping @Sendable (PipelineEvent) -> Void) async throws {
-        let environment = RuntimeEnvironment.current
+        let environment = initialEnvironment
         let scopedRunner = PipelineRunner(
             projectURL: projectURL,
             config: config,
@@ -138,6 +140,7 @@ public final class PipelineRunner: @unchecked Sendable {
         self.config = config
         self.tooling = tooling
         self.powerAssertion = powerAssertion
+        self.initialEnvironment = capturedEnvironment
         self.capturedEnvironment = capturedEnvironment
     }
 
