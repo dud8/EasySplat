@@ -1088,16 +1088,26 @@ final class PipelineIntegrationTests: XCTestCase {
             tooling: .init(runner: runner)
         )
 
+        XCTAssertEqual(
+            RuntimeEnvironment.value(forKey: "EASYSPLAT_SFM_BACKEND"),
+            "fastvggt",
+            "The scoped backend override must remain live until the pipeline finishes."
+        )
+
         await XCTAssertThrowsErrorAsync({
             try await pipeline.run { _ in }
         }, errorHandler: { error in
-            XCTAssertTrue(error is CancellationError)
+            XCTAssertTrue(error is CancellationError, "Expected CancellationError, got \(String(reflecting: error))")
         })
 
         let callPaths = runner.calls.map { $0.0 }
-        XCTAssertEqual(callPaths.filter { $0 == toolchain.fastvggt.sfmTool.path }.count, 1)
-        XCTAssertFalse(callPaths.contains(toolchain.vggt.sfmTool.path))
-        XCTAssertFalse(callPaths.contains(toolchain.colmap.path))
+        XCTAssertEqual(
+            callPaths.filter { $0 == toolchain.fastvggt.sfmTool.path }.count,
+            1,
+            "Unexpected subprocess calls: \(callPaths)"
+        )
+        XCTAssertFalse(callPaths.contains(toolchain.vggt.sfmTool.path), "Unexpected subprocess calls: \(callPaths)")
+        XCTAssertFalse(callPaths.contains(toolchain.colmap.path), "Unexpected subprocess calls: \(callPaths)")
         let interruptedMetadata = try ProjectMetadataStore.load(from: paths.metadataURL)
         XCTAssertNotNil(interruptedMetadata.lastRunStartedAt, "Cancellation should preserve lastRunStartedAt for crash/interruption detection.")
     }
