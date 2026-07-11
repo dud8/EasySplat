@@ -1,9 +1,22 @@
 {
   "schema_version": 1,
+  "profile": "smoke",
+  "scene_id": "harness-smoke",
+  "input_digest": "sha256:9a5bcf92d9a3c45e5613c93f2cf4eab0503d225f4857a7e22d2f79f29bed39f3",
+  "corpus_digest": "sha256:bc06328905058e15b6234a0e34fc7f0dd4d4fdeb50b8c394d7aeecb6e21dd06b",
+  "thresholds_digest": "sha256:c29456801478b061114e97428d9732fcc5a7bd8cc7b61e8d16df338f57eef6eb",
+  "git_commit": "fixture",
+  "app_version": "0.2.0-beta.1",
+  "toolchain_identity": "fixture:smoke",
   "scale_results": {
     "30": {
+      "scale": 30,
+      "route": "fixture-route",
+      "detail_profile": "balanced",
       "actual": {
         "exit_code": 0,
+        "termination_reason": "exit",
+        "cancelled": false,
         "failure_type": null,
         "corrupt_ply": false
       },

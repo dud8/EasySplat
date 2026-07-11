@@ -16,6 +16,8 @@
     "scene_results",
     "aggregates",
     "machine",
+    "app_version",
+    "toolchain_identity",
     "thresholds_digest",
     "corpus_digest",
     "git",
@@ -42,6 +44,14 @@
       ]
     },
     "machine": {"$ref": "#/$defs/machine"},
+    "app_version": {"const": "0.2.0-beta.1"},
+    "toolchain_identity": {
+      "oneOf": [
+        {"type": "null"},
+        {"const": "fixture:smoke"},
+        {"$ref": "#/$defs/sha256"}
+      ]
+    },
     "thresholds_digest": {"$ref": "#/$defs/sha256"},
     "corpus_digest": {"$ref": "#/$defs/sha256"},
     "git": {"$ref": "#/$defs/git"},
@@ -57,7 +67,16 @@
       "type": "array",
       "items": {"type": "string", "minLength": 1}
     },
-    "metricValue": {
+    "notAvailableMetric": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["availability"],
+      "properties": {
+        "availability": {"const": "not_available"},
+        "reason": {"type": "string", "minLength": 1}
+      }
+    },
+    "nonnegativeNumberMetric": {
       "oneOf": [
         {
           "type": "object",
@@ -65,63 +84,113 @@
           "required": ["availability", "value"],
           "properties": {
             "availability": {"const": "measured"},
-            "value": {"type": ["number", "integer", "string", "boolean"]}
+            "value": {"type": "number", "minimum": 0}
           }
         },
+        {"$ref": "#/$defs/notAvailableMetric"}
+      ]
+    },
+    "nonnegativeIntegerMetric": {
+      "oneOf": [
         {
           "type": "object",
           "additionalProperties": false,
-          "required": ["availability"],
+          "required": ["availability", "value"],
           "properties": {
-            "availability": {"const": "not_available"},
-            "reason": {"type": "string", "minLength": 1}
+            "availability": {"const": "measured"},
+            "value": {"type": "integer", "minimum": 0}
           }
-        }
+        },
+        {"$ref": "#/$defs/notAvailableMetric"}
+      ]
+    },
+    "booleanMetric": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["availability", "value"],
+          "properties": {
+            "availability": {"const": "measured"},
+            "value": {"type": "boolean"}
+          }
+        },
+        {"$ref": "#/$defs/notAvailableMetric"}
+      ]
+    },
+    "residualProvenanceMetric": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["availability", "value"],
+          "properties": {
+            "availability": {"const": "measured"},
+            "value": {"const": "track_reprojection"}
+          }
+        },
+        {"$ref": "#/$defs/notAvailableMetric"}
+      ]
+    },
+    "memoryLaneMetric": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["availability", "value"],
+          "properties": {
+            "availability": {"const": "measured"},
+            "value": {"enum": ["eight_gb_fast", "constrained", "larger"]}
+          }
+        },
+        {"$ref": "#/$defs/notAvailableMetric"}
       ]
     },
     "metrics": {
       "type": "object",
       "additionalProperties": false,
       "properties": {
-        "registered_views": {"$ref": "#/$defs/metricValue"},
-        "total_views": {"$ref": "#/$defs/metricValue"},
-        "colmap_registered_views": {"$ref": "#/$defs/metricValue"},
-        "points": {"$ref": "#/$defs/metricValue"},
-        "observations": {"$ref": "#/$defs/metricValue"},
-        "residual_provenance": {"$ref": "#/$defs/metricValue"},
-        "residual_median_pixels": {"$ref": "#/$defs/metricValue"},
-        "residual_p90_pixels": {"$ref": "#/$defs/metricValue"},
-        "ate_colmap_ratio": {"$ref": "#/$defs/metricValue"},
-        "rotation_rpe_delta_degrees": {"$ref": "#/$defs/metricValue"},
-        "translation_rpe_delta_percentage_points": {"$ref": "#/$defs/metricValue"},
-        "balanced_median_psnr_loss_db": {"$ref": "#/$defs/metricValue"},
-        "balanced_median_ssim_loss": {"$ref": "#/$defs/metricValue"},
-        "balanced_median_lpips_increase": {"$ref": "#/$defs/metricValue"},
-        "balanced_scene_psnr_loss_db": {"$ref": "#/$defs/metricValue"},
-        "balanced_scene_ssim_loss": {"$ref": "#/$defs/metricValue"},
-        "balanced_scene_lpips_increase": {"$ref": "#/$defs/metricValue"},
-        "fast_scene_psnr_loss_db": {"$ref": "#/$defs/metricValue"},
-        "fast_scene_ssim_loss": {"$ref": "#/$defs/metricValue"},
-        "fast_scene_lpips_increase": {"$ref": "#/$defs/metricValue"},
-        "fast_end_to_end_speedup": {"$ref": "#/$defs/metricValue"},
-        "m4_max_p50_seconds": {"$ref": "#/$defs/metricValue"},
-        "balanced_geometry_speedup": {"$ref": "#/$defs/metricValue"},
-        "constrained_fast_p50_seconds": {"$ref": "#/$defs/metricValue"},
-        "streaming_inference_fps": {"$ref": "#/$defs/metricValue"},
-        "streaming_sustained_frames": {"$ref": "#/$defs/metricValue"},
-        "peak_memory_bytes": {"$ref": "#/$defs/metricValue"},
-        "machine_memory_bytes": {"$ref": "#/$defs/metricValue"},
-        "memory_lane": {"$ref": "#/$defs/metricValue"},
-        "repeat_runs": {"$ref": "#/$defs/metricValue"},
-        "crashes": {"$ref": "#/$defs/metricValue"},
-        "corrupt_outputs": {"$ref": "#/$defs/metricValue"},
-        "normal_photo_toolchain_bytes": {"$ref": "#/$defs/metricValue"},
-        "streaming_toolchain_bytes": {"$ref": "#/$defs/metricValue"},
-        "finished_v1_opens": {"$ref": "#/$defs/metricValue"},
-        "valid_v1_geometry_retrains": {"$ref": "#/$defs/metricValue"},
-        "deterministic_restart": {"$ref": "#/$defs/metricValue"},
-        "wall_time_seconds": {"$ref": "#/$defs/metricValue"},
-        "max_resident_set_size_bytes": {"$ref": "#/$defs/metricValue"}
+        "registered_views": {"$ref": "#/$defs/nonnegativeIntegerMetric"},
+        "total_views": {"$ref": "#/$defs/nonnegativeIntegerMetric"},
+        "colmap_registered_views": {"$ref": "#/$defs/nonnegativeIntegerMetric"},
+        "points": {"$ref": "#/$defs/nonnegativeIntegerMetric"},
+        "observations": {"$ref": "#/$defs/nonnegativeIntegerMetric"},
+        "residual_provenance": {"$ref": "#/$defs/residualProvenanceMetric"},
+        "residual_median_pixels": {"$ref": "#/$defs/nonnegativeNumberMetric"},
+        "residual_p90_pixels": {"$ref": "#/$defs/nonnegativeNumberMetric"},
+        "ate_colmap_ratio": {"$ref": "#/$defs/nonnegativeNumberMetric"},
+        "rotation_rpe_delta_degrees": {"$ref": "#/$defs/nonnegativeNumberMetric"},
+        "translation_rpe_delta_percentage_points": {"$ref": "#/$defs/nonnegativeNumberMetric"},
+        "balanced_median_psnr_loss_db": {"$ref": "#/$defs/nonnegativeNumberMetric"},
+        "balanced_median_ssim_loss": {"$ref": "#/$defs/nonnegativeNumberMetric"},
+        "balanced_median_lpips_increase": {"$ref": "#/$defs/nonnegativeNumberMetric"},
+        "balanced_scene_psnr_loss_db": {"$ref": "#/$defs/nonnegativeNumberMetric"},
+        "balanced_scene_ssim_loss": {"$ref": "#/$defs/nonnegativeNumberMetric"},
+        "balanced_scene_lpips_increase": {"$ref": "#/$defs/nonnegativeNumberMetric"},
+        "fast_scene_psnr_loss_db": {"$ref": "#/$defs/nonnegativeNumberMetric"},
+        "fast_scene_ssim_loss": {"$ref": "#/$defs/nonnegativeNumberMetric"},
+        "fast_scene_lpips_increase": {"$ref": "#/$defs/nonnegativeNumberMetric"},
+        "fast_end_to_end_speedup": {"$ref": "#/$defs/nonnegativeNumberMetric"},
+        "m4_max_p50_seconds": {"$ref": "#/$defs/nonnegativeNumberMetric"},
+        "balanced_geometry_speedup": {"$ref": "#/$defs/nonnegativeNumberMetric"},
+        "constrained_fast_p50_seconds": {"$ref": "#/$defs/nonnegativeNumberMetric"},
+        "streaming_inference_fps": {"$ref": "#/$defs/nonnegativeNumberMetric"},
+        "streaming_sustained_frames": {"$ref": "#/$defs/nonnegativeIntegerMetric"},
+        "peak_memory_bytes": {"$ref": "#/$defs/nonnegativeIntegerMetric"},
+        "machine_memory_bytes": {"$ref": "#/$defs/nonnegativeIntegerMetric"},
+        "memory_lane": {"$ref": "#/$defs/memoryLaneMetric"},
+        "repeat_runs": {"$ref": "#/$defs/nonnegativeIntegerMetric"},
+        "crashes": {"$ref": "#/$defs/nonnegativeIntegerMetric"},
+        "corrupt_outputs": {"$ref": "#/$defs/nonnegativeIntegerMetric"},
+        "normal_photo_toolchain_bytes": {"$ref": "#/$defs/nonnegativeIntegerMetric"},
+        "streaming_toolchain_bytes": {"$ref": "#/$defs/nonnegativeIntegerMetric"},
+        "finished_v1_opens": {"$ref": "#/$defs/booleanMetric"},
+        "valid_v1_geometry_retrains": {"$ref": "#/$defs/booleanMetric"},
+        "deterministic_restart": {"$ref": "#/$defs/booleanMetric"},
+        "wall_time_seconds": {"$ref": "#/$defs/nonnegativeNumberMetric"},
+        "geometry_seconds": {"$ref": "#/$defs/nonnegativeNumberMetric"},
+        "training_seconds": {"$ref": "#/$defs/nonnegativeNumberMetric"},
+        "max_resident_set_size_bytes": {"$ref": "#/$defs/nonnegativeIntegerMetric"}
       }
     },
     "sceneResult": {
@@ -170,15 +239,15 @@
             }
           ]
         },
-        "route": {"type": "string", "minLength": 1},
-        "detail_profile": {"type": "string", "minLength": 1},
+        "route": {"type": "string", "pattern": "^[a-z0-9][a-z0-9_.-]{0,63}$"},
+        "detail_profile": {"type": "string", "pattern": "^[a-z0-9][a-z0-9_.-]{0,63}$"},
         "exit": {
           "type": "object",
           "additionalProperties": false,
           "required": ["code", "reason", "cancelled"],
           "properties": {
             "code": {"type": ["integer", "null"]},
-            "reason": {"type": "string", "minLength": 1},
+            "reason": {"enum": ["exit", "signal", "cancelled", "not_available"]},
             "cancelled": {"type": "boolean"}
           }
         },
@@ -204,7 +273,7 @@
         "passed": {"type": "integer", "minimum": 0},
         "failed": {"type": "integer", "minimum": 0},
         "blocked": {"type": "integer", "minimum": 0},
-        "wall_time_geometric_mean_seconds": {"$ref": "#/$defs/metricValue"}
+        "wall_time_geometric_mean_seconds": {"$ref": "#/$defs/nonnegativeNumberMetric"}
       }
     },
     "machine": {

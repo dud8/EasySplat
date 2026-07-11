@@ -39,9 +39,9 @@
         ]
       },
       "reference": {
-        "ground_truth_poses": true,
-        "accurate_colmap": true,
-        "rendering_reference": true
+        "ground_truth_poses": false,
+        "accurate_colmap": false,
+        "rendering_reference": false
       },
       "expected_outcome": {
         "kind": "valid"
@@ -86,9 +86,9 @@
         ]
       },
       "reference": {
-        "ground_truth_poses": true,
-        "accurate_colmap": true,
-        "rendering_reference": true
+        "ground_truth_poses": false,
+        "accurate_colmap": false,
+        "rendering_reference": false
       },
       "expected_outcome": {
         "kind": "valid"
@@ -132,9 +132,9 @@
         ]
       },
       "reference": {
-        "ground_truth_poses": true,
-        "accurate_colmap": true,
-        "rendering_reference": true
+        "ground_truth_poses": false,
+        "accurate_colmap": false,
+        "rendering_reference": false
       },
       "expected_outcome": {
         "kind": "valid"
@@ -178,9 +178,9 @@
         ]
       },
       "reference": {
-        "ground_truth_poses": true,
-        "accurate_colmap": true,
-        "rendering_reference": true
+        "ground_truth_poses": false,
+        "accurate_colmap": false,
+        "rendering_reference": false
       },
       "expected_outcome": {
         "kind": "valid"
@@ -225,9 +225,9 @@
         ]
       },
       "reference": {
-        "ground_truth_poses": true,
-        "accurate_colmap": true,
-        "rendering_reference": true
+        "ground_truth_poses": false,
+        "accurate_colmap": false,
+        "rendering_reference": false
       },
       "expected_outcome": {
         "kind": "valid"
@@ -271,9 +271,9 @@
         ]
       },
       "reference": {
-        "ground_truth_poses": true,
-        "accurate_colmap": true,
-        "rendering_reference": true
+        "ground_truth_poses": false,
+        "accurate_colmap": false,
+        "rendering_reference": false
       },
       "expected_outcome": {
         "kind": "valid"
@@ -319,9 +319,9 @@
         ]
       },
       "reference": {
-        "ground_truth_poses": true,
-        "accurate_colmap": true,
-        "rendering_reference": true
+        "ground_truth_poses": false,
+        "accurate_colmap": false,
+        "rendering_reference": false
       },
       "expected_outcome": {
         "kind": "valid"
@@ -365,9 +365,9 @@
         ]
       },
       "reference": {
-        "ground_truth_poses": true,
-        "accurate_colmap": true,
-        "rendering_reference": true
+        "ground_truth_poses": false,
+        "accurate_colmap": false,
+        "rendering_reference": false
       },
       "expected_outcome": {
         "kind": "valid"
@@ -411,9 +411,9 @@
         ]
       },
       "reference": {
-        "ground_truth_poses": true,
-        "accurate_colmap": true,
-        "rendering_reference": true
+        "ground_truth_poses": false,
+        "accurate_colmap": false,
+        "rendering_reference": false
       },
       "expected_outcome": {
         "kind": "valid"
@@ -457,9 +457,9 @@
         ]
       },
       "reference": {
-        "ground_truth_poses": true,
-        "accurate_colmap": true,
-        "rendering_reference": true
+        "ground_truth_poses": false,
+        "accurate_colmap": false,
+        "rendering_reference": false
       },
       "expected_outcome": {
         "kind": "valid"
@@ -503,9 +503,9 @@
         ]
       },
       "reference": {
-        "ground_truth_poses": true,
-        "accurate_colmap": true,
-        "rendering_reference": true
+        "ground_truth_poses": false,
+        "accurate_colmap": false,
+        "rendering_reference": false
       },
       "expected_outcome": {
         "kind": "valid"
@@ -550,9 +550,9 @@
         ]
       },
       "reference": {
-        "ground_truth_poses": true,
-        "accurate_colmap": true,
-        "rendering_reference": true
+        "ground_truth_poses": false,
+        "accurate_colmap": false,
+        "rendering_reference": false
       },
       "expected_outcome": {
         "kind": "valid"
@@ -597,9 +597,9 @@
         ]
       },
       "reference": {
-        "ground_truth_poses": true,
-        "accurate_colmap": true,
-        "rendering_reference": true
+        "ground_truth_poses": false,
+        "accurate_colmap": false,
+        "rendering_reference": false
       },
       "expected_outcome": {
         "kind": "valid"
@@ -644,9 +644,9 @@
         ]
       },
       "reference": {
-        "ground_truth_poses": true,
-        "accurate_colmap": true,
-        "rendering_reference": true
+        "ground_truth_poses": false,
+        "accurate_colmap": false,
+        "rendering_reference": false
       },
       "expected_outcome": {
         "kind": "valid"
@@ -691,9 +691,9 @@
         ]
       },
       "reference": {
-        "ground_truth_poses": true,
-        "accurate_colmap": true,
-        "rendering_reference": true
+        "ground_truth_poses": false,
+        "accurate_colmap": false,
+        "rendering_reference": false
       },
       "expected_outcome": {
         "kind": "valid"
@@ -740,9 +740,9 @@
         ]
       },
       "reference": {
-        "ground_truth_poses": true,
-        "accurate_colmap": true,
-        "rendering_reference": true
+        "ground_truth_poses": false,
+        "accurate_colmap": false,
+        "rendering_reference": false
       },
       "expected_outcome": {
         "kind": "valid"
@@ -789,8 +789,8 @@
       },
       "reference": {
         "ground_truth_poses": false,
-        "accurate_colmap": true,
-        "rendering_reference": true
+        "accurate_colmap": false,
+        "rendering_reference": false
       },
       "expected_outcome": {
         "kind": "valid"
@@ -835,8 +835,8 @@
       },
       "reference": {
         "ground_truth_poses": false,
-        "accurate_colmap": true,
-        "rendering_reference": true
+        "accurate_colmap": false,
+        "rendering_reference": false
       },
       "expected_outcome": {
         "kind": "valid"
@@ -881,8 +881,8 @@
       },
       "reference": {
         "ground_truth_poses": false,
-        "accurate_colmap": true,
-        "rendering_reference": true
+        "accurate_colmap": false,
+        "rendering_reference": false
       },
       "expected_outcome": {
         "kind": "valid"
@@ -930,8 +930,8 @@
       },
       "reference": {
         "ground_truth_poses": false,
-        "accurate_colmap": true,
-        "rendering_reference": true
+        "accurate_colmap": false,
+        "rendering_reference": false
       },
       "expected_outcome": {
         "kind": "valid"
@@ -977,8 +977,8 @@
       },
       "reference": {
         "ground_truth_poses": false,
-        "accurate_colmap": true,
-        "rendering_reference": true
+        "accurate_colmap": false,
+        "rendering_reference": false
       },
       "expected_outcome": {
         "kind": "valid"
@@ -1023,8 +1023,8 @@
       },
       "reference": {
         "ground_truth_poses": false,
-        "accurate_colmap": true,
-        "rendering_reference": true
+        "accurate_colmap": false,
+        "rendering_reference": false
       },
       "expected_outcome": {
         "kind": "valid"
@@ -1069,8 +1069,8 @@
       },
       "reference": {
         "ground_truth_poses": false,
-        "accurate_colmap": true,
-        "rendering_reference": true
+        "accurate_colmap": false,
+        "rendering_reference": false
       },
       "expected_outcome": {
         "kind": "valid"

@@ -53,7 +53,7 @@ def valid_scene(
         "split": {"train": [0, 2, 4], "holdout": [1, 3]},
         "reference": {
             "ground_truth_poses": False,
-            "accurate_colmap": True,
+            "accurate_colmap": False,
             "rendering_reference": False,
         },
         "expected_outcome": {"kind": "valid"},
@@ -191,6 +191,49 @@ def passing_metrics() -> dict[str, object]:
     }
 
 
+def successful_actual() -> dict[str, object]:
+    return {
+        "exit_code": 0,
+        "termination_reason": "exit",
+        "cancelled": False,
+        "failure_type": None,
+        "corrupt_ply": False,
+    }
+
+
+def external_envelope(
+    scene: dict[str, object],
+    scale: int,
+    input_digest: str,
+    identity: object,
+    *,
+    actual: dict[str, object] | None = None,
+    metrics: dict[str, object] | None = None,
+    route: str = "fixture-route",
+) -> dict[str, object]:
+    return {
+        "schema_version": 1,
+        "profile": identity.profile,
+        "scene_id": scene["id"],
+        "input_digest": input_digest,
+        "corpus_digest": identity.corpus_digest,
+        "thresholds_digest": identity.thresholds_digest,
+        "git_commit": identity.git_commit,
+        "app_version": identity.app_version,
+        "toolchain_identity": identity.toolchain_identity,
+        "scale_results": {
+            str(scale): {
+                "scale": scale,
+                "route": route,
+                "detail_profile": "balanced",
+                "actual": actual or successful_actual(),
+                "metrics": metrics or passing_metrics(),
+                "artifacts": {},
+            }
+        },
+    }
+
+
 class ConfigurationValidationTests(unittest.TestCase):
     def test_tracked_release_contract_is_valid_and_complete(self) -> None:
         corpus = json.loads((ROOT / "scripts/benchmark/corpus.json").read_text(encoding="utf-8"))
@@ -199,6 +242,10 @@ class ConfigurationValidationTests(unittest.TestCase):
         benchmark.validate_reference_config(config)
         self.assertEqual(len(corpus["scenes"]), 26)
         self.assertTrue(all(scene["input"]["supplied"] is False for scene in corpus["scenes"]))
+        self.assertTrue(
+            all(not any(scene["reference"].values()) for scene in corpus["scenes"]),
+            "unsupplied release slots must not claim reference availability",
+        )
 
     def test_result_schema_closes_top_level_and_scene_contracts(self) -> None:
         schema = json.loads((ROOT / "scripts/benchmark/result.schema.json").read_text(encoding="utf-8"))
@@ -258,6 +305,12 @@ class ConfigurationValidationTests(unittest.TestCase):
         config["thresholds"]["coverage"]["absolute_min"] = 1.01
         with self.assertRaisesRegex(benchmark.ConfigError, "coverage.absolute_min"):
             benchmark.validate_reference_config(config)
+
+    def test_unsupplied_scene_cannot_claim_reference_availability(self) -> None:
+        corpus = valid_corpus()
+        corpus["scenes"][0]["reference"]["ground_truth_poses"] = True
+        with self.assertRaisesRegex(benchmark.ConfigError, "unsupplied.*reference"):
+            benchmark.validate_corpus(corpus, expected_profile="smoke")
 
 
 class TimeParserTests(unittest.TestCase):
@@ -358,30 +411,75 @@ class GateEvaluationTests(unittest.TestCase):
         evaluation = benchmark.evaluate_gates(metrics, self.thresholds)
         self.assertEqual(evaluation["status"], "failed")
 
+    def test_negative_nonfinite_and_cross_field_metrics_fail(self) -> None:
+        cases = {
+            "negative residual": {"residual_median_pixels": measured(-0.1)},
+            "negative crashes": {"crashes": measured(-1)},
+            "nonfinite": {"ate_colmap_ratio": measured(float("nan"))},
+            "registered exceeds total": {
+                "registered_views": measured(101),
+                "total_views": measured(100),
+            },
+            "p90 below median": {
+                "residual_median_pixels": measured(1.0),
+                "residual_p90_pixels": measured(0.5),
+            },
+        }
+        for label, replacements in cases.items():
+            with self.subTest(case=label):
+                metrics = passing_metrics()
+                metrics.update(replacements)
+                self.assertEqual(benchmark.evaluate_gates(metrics, self.thresholds)["status"], "failed")
+
 
 class InvalidSceneTests(unittest.TestCase):
     def test_declared_failure_without_corrupt_ply_passes(self) -> None:
         expected = {"kind": "invalid", "failure_type": "disconnected_input"}
-        actual = {"exit_code": 2, "failure_type": "disconnected_input", "corrupt_ply": False}
+        actual = {
+            "exit_code": 2,
+            "termination_reason": "exit",
+            "cancelled": False,
+            "failure_type": "disconnected_input",
+            "corrupt_ply": False,
+        }
         self.assertEqual(benchmark.evaluate_invalid_scene(expected, actual)["status"], "passed")
 
     def test_wrong_failure_or_corrupt_ply_fails(self) -> None:
         expected = {"kind": "invalid", "failure_type": "disconnected_input"}
         for actual in (
-            {"exit_code": 0, "failure_type": None, "corrupt_ply": False},
-            {"exit_code": 2, "failure_type": "other", "corrupt_ply": False},
-            {"exit_code": 2, "failure_type": "disconnected_input", "corrupt_ply": True},
+            {**successful_actual(), "failure_type": None},
+            {**successful_actual(), "exit_code": 2, "failure_type": "other"},
+            {**successful_actual(), "exit_code": 2, "failure_type": "disconnected_input", "corrupt_ply": True},
+            {**successful_actual(), "exit_code": 2, "failure_type": "disconnected_input", "cancelled": True},
         ):
             with self.subTest(actual=actual):
                 self.assertEqual(benchmark.evaluate_invalid_scene(expected, actual)["status"], "failed")
 
     def test_missing_failure_type_blocks(self) -> None:
         expected = {"kind": "invalid", "failure_type": "disconnected_input"}
-        actual = {"exit_code": 2, "corrupt_ply": False}
+        actual = {**successful_actual(), "exit_code": 2, "failure_type": None}
         self.assertEqual(benchmark.evaluate_invalid_scene(expected, actual)["status"], "blocked")
+
+    def test_missing_or_noninteger_exit_blocks(self) -> None:
+        expected = {"kind": "invalid", "failure_type": "disconnected_input"}
+        for exit_code in (None, "2", True):
+            actual = {**successful_actual(), "exit_code": exit_code, "failure_type": "disconnected_input"}
+            with self.subTest(exit_code=exit_code):
+                self.assertEqual(benchmark.evaluate_invalid_scene(expected, actual)["status"], "blocked")
 
 
 class MetadataAndPersistenceTests(unittest.TestCase):
+    def test_canonical_json_rejects_nonfinite_numbers(self) -> None:
+        with self.assertRaises(ValueError):
+            benchmark.canonical_json_bytes({"metric": float("nan")})
+
+    def test_json_loader_rejects_nonstandard_nan(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "bad.json"
+            path.write_text('{"metric":NaN}\n', encoding="utf-8")
+            with self.assertRaisesRegex(benchmark.ConfigError, "non-finite"):
+                benchmark._load_json(path, "fixture")
+
     def test_machine_metadata_does_not_include_machine_identity(self) -> None:
         with mock.patch.dict(os.environ, {"USER": "private-user", "HOME": "/Users/private-user"}):
             metadata = benchmark.collect_machine_metadata(
@@ -415,6 +513,84 @@ class MetadataAndPersistenceTests(unittest.TestCase):
 
 
 class OrchestrationTests(unittest.TestCase):
+    def test_external_result_is_bound_to_scene_input_build_and_toolchain(self) -> None:
+        scene = valid_scene()
+        scene["input"]["supplied"] = True
+        identity = benchmark.RunIdentity(
+            profile="smoke",
+            corpus_digest="sha256:" + "1" * 64,
+            thresholds_digest="sha256:" + "2" * 64,
+            git_commit="fixture",
+            app_version="0.2.0-beta.1",
+            toolchain_identity="fixture:smoke",
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            media = root / scene["input"]["media_path"]
+            media.parent.mkdir(parents=True)
+            media.write_bytes(b"scene-a")
+            input_digest = benchmark.digest_input(media)
+            result_path = root / scene["adapter"]["result_path"]
+            result_path.parent.mkdir(parents=True, exist_ok=True)
+            payload = external_envelope(scene, 30, input_digest, identity)
+            result_path.write_bytes(benchmark.canonical_json_bytes(payload) + b"\n")
+            self.assertEqual(
+                benchmark._copy_external_result(scene, 30, root, identity)["status"],
+                "passed",
+            )
+            mismatches = {
+                "scene_id": "different-scene",
+                "input_digest": "sha256:" + "9" * 64,
+                "corpus_digest": "sha256:" + "8" * 64,
+                "thresholds_digest": "sha256:" + "7" * 64,
+                "git_commit": "0" * 40,
+                "app_version": "0.1.0",
+                "toolchain_identity": "sha256:" + "6" * 64,
+            }
+            for key, mismatch in mismatches.items():
+                with self.subTest(identity_field=key):
+                    changed = dict(payload)
+                    changed[key] = mismatch
+                    result_path.write_bytes(benchmark.canonical_json_bytes(changed) + b"\n")
+                    with self.assertRaisesRegex(benchmark.ConfigError, key):
+                        benchmark._copy_external_result(scene, 30, root, identity)
+
+    def test_failed_cancelled_or_identity_bearing_external_result_cannot_pass(self) -> None:
+        scene = valid_scene()
+        scene["input"]["supplied"] = True
+        identity = benchmark.RunIdentity(
+            profile="smoke",
+            corpus_digest="sha256:" + "1" * 64,
+            thresholds_digest="sha256:" + "2" * 64,
+            git_commit="fixture",
+            app_version="0.2.0-beta.1",
+            toolchain_identity="fixture:smoke",
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            media = root / scene["input"]["media_path"]
+            media.parent.mkdir(parents=True)
+            media.write_bytes(b"scene-a")
+            input_digest = benchmark.digest_input(media)
+            result_path = root / scene["adapter"]["result_path"]
+            result_path.parent.mkdir(parents=True, exist_ok=True)
+            cases = (
+                ({**successful_actual(), "exit_code": 9}, "failed"),
+                ({**successful_actual(), "cancelled": True}, "failed"),
+            )
+            for actual, expected_status in cases:
+                with self.subTest(actual=actual):
+                    payload = external_envelope(scene, 30, input_digest, identity, actual=actual)
+                    result_path.write_bytes(benchmark.canonical_json_bytes(payload) + b"\n")
+                    self.assertEqual(
+                        benchmark._copy_external_result(scene, 30, root, identity)["status"],
+                        expected_status,
+                    )
+            payload = external_envelope(scene, 30, input_digest, identity, route="/Users/private/model")
+            result_path.write_bytes(benchmark.canonical_json_bytes(payload) + b"\n")
+            with self.assertRaisesRegex(benchmark.ConfigError, "route"):
+                benchmark._copy_external_result(scene, 30, root, identity)
+
     def test_tracked_smoke_fixture_runs_without_a_toolchain(self) -> None:
         config_path = ROOT / "scripts/benchmark/reference-config.json"
         corpus_path = ROOT / "scripts/benchmark/fixtures/smoke-corpus.json"
@@ -468,6 +644,32 @@ class OrchestrationTests(unittest.TestCase):
         self.assertTrue(result["blocking_reasons"])
         self.assertTrue(result["missing_requirements"]["media"])
         self.assertIn("toolchain", result["missing_requirements"])
+
+    def test_final_suite_validation_rejects_unknown_metrics_and_private_paths(self) -> None:
+        config_path = ROOT / "scripts/benchmark/reference-config.json"
+        corpus_path = ROOT / "scripts/benchmark/fixtures/smoke-corpus.json"
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "output"
+            self.assertEqual(
+                benchmark.run_suite(
+                    profile="smoke",
+                    corpus_path=corpus_path,
+                    reference_config_path=config_path,
+                    toolchain_root=Path(directory) / "toolchain",
+                    output_directory=output,
+                    dry_run=False,
+                    stdout=io.StringIO(),
+                ),
+                0,
+            )
+            result = json.loads((output / "suite.json").read_text(encoding="utf-8"))
+        result["scene_results"][0]["metrics"]["unknown_metric"] = measured(1)
+        with self.assertRaisesRegex(benchmark.ConfigError, "unknown metrics"):
+            benchmark.validate_suite_result(result)
+        del result["scene_results"][0]["metrics"]["unknown_metric"]
+        result["scene_results"][0]["route"] = "/Users/private/route"
+        with self.assertRaisesRegex(benchmark.ConfigError, "route"):
+            benchmark.validate_suite_result(result)
 
 
 if __name__ == "__main__":
