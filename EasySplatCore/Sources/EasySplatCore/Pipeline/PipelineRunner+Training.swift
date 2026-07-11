@@ -413,6 +413,9 @@ extension PipelineRunner {
         private let minSteps: Int
         private let maxSteps: Int
         private let totalSteps: Int?
+        private let minSeconds: TimeInterval
+        private let maxSeconds: TimeInterval
+        private let defaultSeconds: TimeInterval
         private var lastKeptStep: Int?
         private var lastKeptFile: URL?
 
@@ -420,12 +423,18 @@ extension PipelineRunner {
             defaultExportEvery: Int?,
             minSteps: Int,
             maxSteps: Int,
-            totalSteps: Int?
+            totalSteps: Int?,
+            minSeconds: TimeInterval = 20,
+            maxSeconds: TimeInterval = 300,
+            defaultSeconds: TimeInterval = 120
         ) {
             self.defaultExportEvery = defaultExportEvery
             self.minSteps = minSteps
             self.maxSteps = maxSteps
             self.totalSteps = totalSteps
+            self.minSeconds = minSeconds
+            self.maxSeconds = maxSeconds
+            self.defaultSeconds = defaultSeconds
         }
 
         func handleSnapshot(file: URL, step: Int, stepsPerSecond: Double?) -> BrushSnapshotDecision {
@@ -469,7 +478,12 @@ extension PipelineRunner {
                 guard let totalSteps else { return nil }
                 return Double(totalSteps) / rate
             }()
-            let targetSeconds = PipelineRunner.brushSnapshotTargetSeconds(estimatedTotalSeconds: estimatedTotalSeconds)
+            let targetSeconds = PipelineRunner.brushSnapshotTargetSeconds(
+                estimatedTotalSeconds: estimatedTotalSeconds,
+                minSeconds: minSeconds,
+                maxSeconds: maxSeconds,
+                defaultSeconds: defaultSeconds
+            )
             let rawSteps = Int((rate * targetSeconds).rounded())
             return clampStepCount(rawSteps)
         }
@@ -585,7 +599,7 @@ extension PipelineRunner {
     }
 
     func brushExportEveryOverride() -> Int? {
-        Self.envInt("EASYSPLAT_BRUSH_EXPORT_EVERY")
+        envInt("EASYSPLAT_BRUSH_EXPORT_EVERY")
     }
 
     func brushAdaptiveExportEvery(plan: BrushTrainingPlan, logURL: URL) -> Int? {
@@ -596,9 +610,9 @@ extension PipelineRunner {
         let median = sorted[sorted.count / 2]
         guard median > 0 else { return nil }
         let estimatedTotalSeconds = Double(totalSteps) / median
-        let targetSeconds = Self.brushSnapshotTargetSeconds(estimatedTotalSeconds: estimatedTotalSeconds)
+        let targetSeconds = brushSnapshotTargetSeconds(estimatedTotalSeconds: estimatedTotalSeconds)
         let rawSteps = Int((median * targetSeconds).rounded())
-        let clamped = Self.clampStepCount(rawSteps, min: Self.brushSnapshotMinSteps(), max: Self.brushSnapshotMaxSteps())
+        let clamped = Self.clampStepCount(rawSteps, min: brushSnapshotMinSteps(), max: brushSnapshotMaxSteps())
         if clamped <= 0 { return nil }
         return min(clamped, totalSteps)
     }
@@ -701,12 +715,23 @@ extension PipelineRunner {
         }
     }
 
-    private static func brushSnapshotTargetSeconds(estimatedTotalSeconds: TimeInterval?) -> TimeInterval {
-        let minSeconds = brushSnapshotMinSeconds()
-        let maxSeconds = brushSnapshotMaxSeconds()
-        let defaultSeconds = brushSnapshotDefaultSeconds()
+    private func brushSnapshotTargetSeconds(estimatedTotalSeconds: TimeInterval?) -> TimeInterval {
+        Self.brushSnapshotTargetSeconds(
+            estimatedTotalSeconds: estimatedTotalSeconds,
+            minSeconds: brushSnapshotMinSeconds(),
+            maxSeconds: brushSnapshotMaxSeconds(),
+            defaultSeconds: brushSnapshotDefaultSeconds()
+        )
+    }
+
+    private static func brushSnapshotTargetSeconds(
+        estimatedTotalSeconds: TimeInterval?,
+        minSeconds: TimeInterval,
+        maxSeconds: TimeInterval,
+        defaultSeconds: TimeInterval
+    ) -> TimeInterval {
         guard let estimatedTotalSeconds else {
-            return clampSeconds(defaultSeconds, min: minSeconds, max: maxSeconds)
+            return Self.clampSeconds(defaultSeconds, min: minSeconds, max: maxSeconds)
         }
 
         let target: TimeInterval
@@ -722,27 +747,27 @@ extension PipelineRunner {
         default:
             target = max(minSeconds, 300)
         }
-        return clampSeconds(target, min: minSeconds, max: maxSeconds)
+        return Self.clampSeconds(target, min: minSeconds, max: maxSeconds)
     }
 
-    static func brushSnapshotMinSteps() -> Int {
-        Self.envInt("EASYSPLAT_BRUSH_SNAPSHOT_MIN_STEPS") ?? 5
+    func brushSnapshotMinSteps() -> Int {
+        envInt("EASYSPLAT_BRUSH_SNAPSHOT_MIN_STEPS") ?? 5
     }
 
-    static func brushSnapshotMaxSteps() -> Int {
-        Self.envInt("EASYSPLAT_BRUSH_SNAPSHOT_MAX_STEPS") ?? 5_000
+    func brushSnapshotMaxSteps() -> Int {
+        envInt("EASYSPLAT_BRUSH_SNAPSHOT_MAX_STEPS") ?? 5_000
     }
 
-    private static func brushSnapshotMinSeconds() -> TimeInterval {
-        Self.envDouble("EASYSPLAT_BRUSH_SNAPSHOT_MIN_SECONDS") ?? 20
+    func brushSnapshotMinSeconds() -> TimeInterval {
+        envDouble("EASYSPLAT_BRUSH_SNAPSHOT_MIN_SECONDS") ?? 20
     }
 
-    private static func brushSnapshotMaxSeconds() -> TimeInterval {
-        Self.envDouble("EASYSPLAT_BRUSH_SNAPSHOT_MAX_SECONDS") ?? 300
+    func brushSnapshotMaxSeconds() -> TimeInterval {
+        envDouble("EASYSPLAT_BRUSH_SNAPSHOT_MAX_SECONDS") ?? 300
     }
 
-    private static func brushSnapshotDefaultSeconds() -> TimeInterval {
-        Self.envDouble("EASYSPLAT_BRUSH_SNAPSHOT_DEFAULT_SECONDS") ?? 120
+    func brushSnapshotDefaultSeconds() -> TimeInterval {
+        envDouble("EASYSPLAT_BRUSH_SNAPSHOT_DEFAULT_SECONDS") ?? 120
     }
 
     private static func clampSeconds(_ value: TimeInterval, min minValue: TimeInterval, max maxValue: TimeInterval) -> TimeInterval {
@@ -761,16 +786,16 @@ extension PipelineRunner {
         return value
     }
 
-    private static func envInt(_ key: String) -> Int? {
-        guard let raw = Self.activeRuntimeEnvironment[key]?.trimmingCharacters(in: .whitespacesAndNewlines),
+    private func envInt(_ key: String) -> Int? {
+        guard let raw = runtimeEnvironment[key]?.trimmingCharacters(in: .whitespacesAndNewlines),
               !raw.isEmpty,
               let value = Int(raw),
               value > 0 else { return nil }
         return value
     }
 
-    private static func envDouble(_ key: String) -> Double? {
-        guard let raw = Self.activeRuntimeEnvironment[key]?.trimmingCharacters(in: .whitespacesAndNewlines),
+    private func envDouble(_ key: String) -> Double? {
+        guard let raw = runtimeEnvironment[key]?.trimmingCharacters(in: .whitespacesAndNewlines),
               !raw.isEmpty,
               let value = Double(raw),
               value > 0 else { return nil }

@@ -1,7 +1,6 @@
 import Foundation
 import Dispatch
 public final class PipelineRunner: @unchecked Sendable {
-    @TaskLocal static var capturedEnvironment: [String: String]?
 
     public struct Tooling {
         public var colmap: ColmapRunner
@@ -67,6 +66,7 @@ public final class PipelineRunner: @unchecked Sendable {
     let config: PipelineConfig
     let tooling: Tooling
     let powerAssertion: PowerAssertionManaging
+    private let capturedEnvironment: [String: String]?
 
     enum SfmMapperPreference: String {
         case glomap
@@ -104,21 +104,36 @@ public final class PipelineRunner: @unchecked Sendable {
         self.config = config
         self.tooling = tooling
         self.powerAssertion = powerAssertion
-    }
-
-    static var activeRuntimeEnvironment: [String: String] {
-        Self.capturedEnvironment ?? RuntimeEnvironment.current
+        self.capturedEnvironment = nil
     }
 
     var runtimeEnvironment: [String: String] {
-        Self.activeRuntimeEnvironment
+        capturedEnvironment ?? RuntimeEnvironment.current
     }
 
     public func run(resumeFrom lastCompletedStage: PipelineStage? = nil, events: @escaping @Sendable (PipelineEvent) -> Void) async throws {
-        let environment = RuntimeEnvironment.current
-        try await Self.$capturedEnvironment.withValue(environment) {
-            try await runWithCapturedEnvironment(resumeFrom: lastCompletedStage, events: events)
-        }
+        let scopedRunner = PipelineRunner(
+            projectURL: projectURL,
+            config: config,
+            tooling: tooling,
+            powerAssertion: powerAssertion,
+            capturedEnvironment: RuntimeEnvironment.current
+        )
+        try await scopedRunner.runWithCapturedEnvironment(resumeFrom: lastCompletedStage, events: events)
+    }
+
+    private init(
+        projectURL: URL,
+        config: PipelineConfig,
+        tooling: Tooling,
+        powerAssertion: PowerAssertionManaging,
+        capturedEnvironment: [String: String]
+    ) {
+        self.projectURL = projectURL
+        self.config = config
+        self.tooling = tooling
+        self.powerAssertion = powerAssertion
+        self.capturedEnvironment = capturedEnvironment
     }
 
     private func runWithCapturedEnvironment(
@@ -3619,9 +3634,12 @@ public final class PipelineRunner: @unchecked Sendable {
                 let checkpointGate = CheckpointPulseGate()
                 let snapshotManager = BrushSnapshotManager(
                     defaultExportEvery: effectiveExportEvery,
-                    minSteps: Self.brushSnapshotMinSteps(),
-                    maxSteps: Self.brushSnapshotMaxSteps(),
-                    totalSteps: brushPlan.totalSteps
+                    minSteps: brushSnapshotMinSteps(),
+                    maxSteps: brushSnapshotMaxSteps(),
+                    totalSteps: brushPlan.totalSteps,
+                    minSeconds: brushSnapshotMinSeconds(),
+                    maxSeconds: brushSnapshotMaxSeconds(),
+                    defaultSeconds: brushSnapshotDefaultSeconds()
                 )
 
                 let emitTrainingStatus: @Sendable (Date) -> Void = { [self] now in
