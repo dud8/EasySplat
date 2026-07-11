@@ -735,11 +735,7 @@ final class ToolchainManagerDownloadTests: XCTestCase {
     }
 
     private func validationScripts(for fixture: ToolchainFixture) -> [MockSubprocessRunner.Script] {
-        let msplat = fixture.root.appendingPathComponent("bin/msplat-train")
-        let msplatPython = fixture.root.appendingPathComponent("msplat/python/bin/python3")
-        let msplatCoreExtension = fixture.root.appendingPathComponent(
-            "msplat/python/lib/python3.12/site-packages/msplat/_core.cpython-312-darwin.so"
-        )
+        let msplat = fixture.root.appendingPathComponent("bin/easysplat-train")
         return [
             .init(
                 path: "/usr/bin/file",
@@ -815,20 +811,19 @@ final class ToolchainManagerDownloadTests: XCTestCase {
             ),
             .init(
                 path: "/usr/bin/file",
-                argsPrefix: ["-b", msplatPython.path],
+                argsPrefix: ["-b", msplat.path],
                 result: .init(exitCode: 0, terminationReason: .exit, stdout: "Mach-O 64-bit executable arm64", stderr: ""),
                 onRun: nil
             ),
             .init(
-                path: "/usr/bin/file",
-                argsPrefix: ["-b", msplatCoreExtension.path],
-                result: .init(exitCode: 0, terminationReason: .exit, stdout: "Mach-O 64-bit bundle arm64", stderr: ""),
-                onRun: nil
-            ),
-            .init(
                 path: msplat.path,
-                argsPrefix: ["--help"],
-                result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""),
+                argsPrefix: ["--self-check", "--events-jsonl"],
+                result: .init(
+                    exitCode: 0,
+                    terminationReason: .exit,
+                    stdout: "{\"event\":\"self_check\",\"schema_version\":1,\"sequence\":1,\"status\":\"ok\",\"version\":\"1.1.3 (git 106499b)\"}\n",
+                    stderr: ""
+                ),
                 onRun: nil
             )
         ]

@@ -25,7 +25,7 @@ public final class MsplatRunner {
                 exitCode: -1,
                 terminationReason: .exit,
                 stdoutTail: "",
-                stderrTail: "msplat-train binary is not executable: \(msplatPath.path)"
+                stderrTail: "easysplat-train is not executable: \(msplatPath.path)"
             )
         }
         guard fm.fileExists(atPath: datasetPath.path) else {
@@ -92,7 +92,7 @@ public final class MsplatRunner {
                 exitCode: -1,
                 terminationReason: .exit,
                 stdoutTail: "",
-                stderrTail: "Failed to launch msplat-train: \(error)"
+                stderrTail: "Failed to launch easysplat-train: \(error)"
             )
         }
 

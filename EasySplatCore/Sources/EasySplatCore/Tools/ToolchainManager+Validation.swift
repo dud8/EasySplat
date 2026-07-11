@@ -271,43 +271,38 @@ extension ToolchainManager {
             models: fastvggtModels
         )
 
-        let msplat = root.appendingPathComponent("bin/msplat-train")
+        let msplat = root.appendingPathComponent("bin/easysplat-train")
+        let msplatMetallib = root.appendingPathComponent("bin/default.metallib")
         let msplatRoot = root.appendingPathComponent("msplat", isDirectory: true)
-        let msplatBundledTrain = msplatRoot.appendingPathComponent("bin/msplat-train")
-        let msplatPython = msplatRoot.appendingPathComponent("python/bin/python3")
         let msplatBuildInfo = msplatRoot.appendingPathComponent("build_info.json")
-        let msplatCoreSentinel = msplatRoot.appendingPathComponent("core_extension_path.txt")
-        let msplatEntries = [msplat, msplatBundledTrain, msplatPython, msplatBuildInfo, msplatCoreSentinel]
-        let hasMsplatBundle = msplatEntries.contains { fileManager.fileExists(atPath: $0.path) }
+        let msplatLicense = msplatRoot.appendingPathComponent("LICENSE")
+        try rejectLegacyMsplatFootprint(root: root)
+        let msplatEntries = [msplat, msplatMetallib, msplatRoot, msplatBuildInfo, msplatLicense]
+        let hasMsplatBundle = msplatEntries.contains { pathExistsIncludingSymlink($0) }
         if hasMsplatBundle {
-            guard fileManager.fileExists(atPath: msplat.path) else {
-                throw ToolchainError.missingBinary("bin/msplat-train")
+            guard pathExistsIncludingSymlink(msplat) else {
+                throw ToolchainError.missingBinary("bin/easysplat-train")
             }
-            guard fileManager.fileExists(atPath: msplatBundledTrain.path) else {
-                throw ToolchainError.missingBinary("msplat/bin/msplat-train")
+            guard pathExistsIncludingSymlink(msplatMetallib) else {
+                throw ToolchainError.missingLibrary("bin/default.metallib")
             }
-            guard fileManager.fileExists(atPath: msplatPython.path) else {
-                throw ToolchainError.missingBinary("msplat/python/bin/python3")
-            }
-            guard fileManager.fileExists(atPath: msplatBuildInfo.path) else {
+            guard pathExistsIncludingSymlink(msplatBuildInfo) else {
                 throw ToolchainError.missingLibrary("msplat/build_info.json")
             }
-            guard fileManager.fileExists(atPath: msplatCoreSentinel.path) else {
-                throw ToolchainError.missingLibrary("msplat/core_extension_path.txt")
+            guard pathExistsIncludingSymlink(msplatLicense) else {
+                throw ToolchainError.missingLibrary("msplat/LICENSE")
             }
-            let msplatCoreExtension = try msplatCoreExtensionURL(root: msplatRoot, sentinel: msplatCoreSentinel)
 
+            let runtimeVersion = try validateNativeMsplatClosure(
+                root: root,
+                executable: msplat,
+                metallib: msplatMetallib,
+                buildInfo: msplatBuildInfo,
+                license: msplatLicense
+            )
             ensureExecutable(at: msplat)
-            ensureExecutable(at: msplatBundledTrain)
-            ensureExecutable(at: msplatPython)
-            try validateMsplatBuildInfo(at: msplatBuildInfo)
-
-            try requireArm64Binary(at: msplatPython, label: "msplat python")
-            try requireArm64Binary(at: msplatCoreExtension, label: "msplat core extension")
-            let msplatCheck = try runner.run(msplat.path, ["--help"])
-            guard msplatCheck.exitCode == 0 else {
-                throw ToolchainError.invalidToolchain("msplat-train failed to launch (exit \(msplatCheck.exitCode)).")
-            }
+            try requireArm64Binary(at: msplat, label: "easysplat-train")
+            try validateMsplatSelfCheck(executable: msplat, runtimeVersion: runtimeVersion)
         }
 
         return ToolchainPaths(
@@ -390,7 +385,67 @@ extension ToolchainManager {
         }
     }
 
-    func validateMsplatBuildInfo(at url: URL) throws {
+    func validateNativeMsplatClosure(
+        root: URL,
+        executable: URL,
+        metallib: URL,
+        buildInfo: URL,
+        license: URL
+    ) throws -> String {
+        let msplatRoot = root.appendingPathComponent("msplat", isDirectory: true)
+        let expectedFiles = Set(["LICENSE", "build_info.json"])
+
+        for url in [executable, metallib, msplatRoot, buildInfo, license] where isSymbolicLink(url) {
+            throw ToolchainError.invalidToolchain(
+                "Native msplat closure contains a symbolic link: \(projectRelativePath(url, root: root))."
+            )
+        }
+
+        var isDirectory: ObjCBool = false
+        guard fileManager.fileExists(atPath: msplatRoot.path, isDirectory: &isDirectory), isDirectory.boolValue else {
+            throw ToolchainError.missingLibrary("msplat")
+        }
+        let entries: [URL]
+        do {
+            entries = try fileManager.contentsOfDirectory(
+                at: msplatRoot,
+                includingPropertiesForKeys: [.isDirectoryKey, .isRegularFileKey, .isSymbolicLinkKey],
+                options: []
+            )
+        } catch {
+            throw ToolchainError.invalidToolchain("Native msplat closure could not be enumerated.")
+        }
+        let names = Set(entries.map(\.lastPathComponent))
+        guard names == expectedFiles else {
+            let unexpected = names.subtracting(expectedFiles).sorted()
+            let missing = expectedFiles.subtracting(names).sorted()
+            var details: [String] = []
+            if !unexpected.isEmpty { details.append("unexpected files: \(unexpected.joined(separator: ", "))") }
+            if !missing.isEmpty { details.append("missing files: \(missing.joined(separator: ", "))") }
+            throw ToolchainError.invalidToolchain("Native msplat closure has \(details.joined(separator: "; ")).")
+        }
+
+        for url in [executable, metallib, buildInfo, license] {
+            var entryIsDirectory: ObjCBool = false
+            guard fileManager.fileExists(atPath: url.path, isDirectory: &entryIsDirectory), !entryIsDirectory.boolValue else {
+                throw ToolchainError.invalidToolchain(
+                    "Native msplat closure entry is not a regular file: \(projectRelativePath(url, root: root))."
+                )
+            }
+        }
+        guard let metallibSize = try? metallib.resourceValues(forKeys: [.fileSizeKey]).fileSize,
+              metallibSize > 0 else {
+            throw ToolchainError.invalidToolchain("bin/default.metallib is empty.")
+        }
+        guard let licenseSize = try? license.resourceValues(forKeys: [.fileSizeKey]).fileSize,
+              licenseSize > 0 else {
+            throw ToolchainError.invalidToolchain("msplat/LICENSE is empty.")
+        }
+
+        return try validateMsplatBuildInfo(at: buildInfo, executable: executable, metallib: metallib)
+    }
+
+    func validateMsplatBuildInfo(at url: URL, executable: URL, metallib: URL) throws -> String {
         let data: Data
         do {
             data = try Data(contentsOf: url)
@@ -409,74 +464,187 @@ extension ToolchainManager {
             throw ToolchainError.invalidToolchain("msplat build_info.json must contain a JSON object.")
         }
 
-        let requiredKeys = [
+        let requiredKeys = Set([
             "toolchain_name",
-            "source_path",
-            "python_version",
-            "package_version",
-        ]
-        let missingKeys = requiredKeys.filter {
-            guard let value = payload[$0] else { return true }
-            if let text = value as? String {
-                return text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-            }
-            return false
-        }
+            "source_url",
+            "source_commit",
+            "source_version",
+            "source_tree_sha256",
+            "overlay_sha256",
+            "patch_sha256",
+            "dependencies",
+            "executable_sha256",
+            "metallib_sha256",
+            "compiler",
+            "cmake",
+            "ninja",
+            "deployment_target",
+            "build_configuration",
+            "cmake_arguments",
+            "build_timestamp",
+        ])
+        let presentKeys = Set(payload.keys)
+        let missingKeys = requiredKeys.subtracting(presentKeys).sorted()
         if !missingKeys.isEmpty {
             throw ToolchainError.invalidToolchain(
                 "msplat build_info.json is missing required keys: \(missingKeys.joined(separator: ", "))."
             )
         }
-
-        let toolchainName = (payload["toolchain_name"] as? String)?
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-        guard toolchainName == "msplat" else {
+        let unexpectedKeys = presentKeys.subtracting(requiredKeys).sorted()
+        if !unexpectedKeys.isEmpty {
             throw ToolchainError.invalidToolchain(
-                "msplat build_info.json toolchain_name mismatch (got \(toolchainName ?? "nil"))."
+                "msplat build_info.json contains unexpected keys: \(unexpectedKeys.joined(separator: ", "))."
+            )
+        }
+
+        func requiredString(_ key: String) throws -> String {
+            guard let value = payload[key] as? String,
+                  !value.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+                throw ToolchainError.invalidToolchain("msplat build_info.json key \(key) must be a non-empty string.")
+            }
+            return value
+        }
+
+        let expectedValues = [
+            "toolchain_name": "msplat",
+            "source_url": "https://github.com/rayanht/msplat.git",
+            "source_commit": "106499b0a53f82b0c92d013b0861fbebd341b17e",
+            "source_version": "1.1.3",
+            "deployment_target": "macOS 15.0",
+            "build_configuration": "Release",
+        ]
+        for (key, expected) in expectedValues {
+            let actual = try requiredString(key)
+            guard actual == expected else {
+                throw ToolchainError.invalidToolchain(
+                    "msplat build_info.json \(key) mismatch (expected \(expected), got \(actual))."
+                )
+            }
+        }
+
+        let hashKeys = [
+            "source_tree_sha256",
+            "overlay_sha256",
+            "patch_sha256",
+            "executable_sha256",
+            "metallib_sha256",
+        ]
+        for key in hashKeys {
+            let value = try requiredString(key)
+            guard isLowercaseSHA256(value) else {
+                throw ToolchainError.invalidToolchain("msplat build_info.json \(key) must be a lowercase SHA-256 hash.")
+            }
+        }
+
+        let expectedDependencies = [
+            "nlohmann_json_v3.11.3_sha256": "04022b05d806eb5ff73023c280b68697d12b93e1b7267a0b22a1a39ec7578069",
+            "nanoflann_v1.5.5_sha256": "57496cb27e1310a77a367e5a902c8f1c700496d91ac54ccc87fbe9ccc28bc6cc",
+            "cli11_v2.4.2_sha256": "43e650d5e1a3acaaf419d1e61a81f77b408d0696f472be0599ddf877d40984b0",
+        ]
+        guard let dependencies = payload["dependencies"] as? [String: String],
+              dependencies == expectedDependencies else {
+            throw ToolchainError.invalidToolchain("msplat build_info.json dependencies do not match the pinned native closure.")
+        }
+
+        for key in ["compiler", "cmake", "ninja"] {
+            _ = try requiredString(key)
+        }
+        let expectedArguments = [
+            "-G Ninja",
+            "-DCMAKE_BUILD_TYPE=Release",
+            "-DCMAKE_OSX_ARCHITECTURES=arm64",
+            "-DCMAKE_OSX_DEPLOYMENT_TARGET=15.0",
+            "-DMSPLAT_BUILD_PYTHON=OFF",
+            "-DFETCHCONTENT_FULLY_DISCONNECTED=ON",
+            "FETCHCONTENT_SOURCE_DIR_NLOHMANN_JSON=verified-v3.11.3",
+            "FETCHCONTENT_SOURCE_DIR_NANOFLANN=verified-v1.5.5",
+            "FETCHCONTENT_SOURCE_DIR_CLI11=verified-v2.4.2",
+        ]
+        guard let arguments = payload["cmake_arguments"] as? [String], arguments == expectedArguments else {
+            throw ToolchainError.invalidToolchain("msplat build_info.json cmake_arguments do not match the pinned native build.")
+        }
+        let timestamp = try requiredString("build_timestamp")
+        guard ISO8601DateFormatter().date(from: timestamp) != nil else {
+            throw ToolchainError.invalidToolchain("msplat build_info.json build_timestamp is not ISO 8601.")
+        }
+
+        let executableHash = try sha256Hex(url: executable)
+        guard executableHash == payload["executable_sha256"] as? String else {
+            throw ToolchainError.invalidToolchain(
+                "msplat build_info.json executable_sha256 mismatch."
+            )
+        }
+        let metallibHash = try sha256Hex(url: metallib)
+        guard metallibHash == payload["metallib_sha256"] as? String else {
+            throw ToolchainError.invalidToolchain("msplat build_info.json metallib_sha256 mismatch.")
+        }
+        let sourceVersion = try requiredString("source_version")
+        let sourceCommit = try requiredString("source_commit")
+        return "\(sourceVersion) (git \(sourceCommit.prefix(7)))"
+    }
+
+    func validateMsplatSelfCheck(executable: URL, runtimeVersion: String) throws {
+        let result: SubprocessResult
+        do {
+            result = try runner.run(executable.path, ["--self-check", "--events-jsonl"])
+        } catch {
+            throw ToolchainError.invalidToolchain("easysplat-train self-check could not run (\(error.localizedDescription)).")
+        }
+        guard result.exitCode == 0, result.terminationReason == .exit else {
+            throw ToolchainError.invalidToolchain("easysplat-train self-check failed (exit \(result.exitCode)).")
+        }
+        let line = result.stdout.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !line.isEmpty, !line.contains("\n"), !line.contains("\r"),
+              let data = line.data(using: .utf8),
+              let event = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            throw ToolchainError.invalidToolchain("easysplat-train self-check did not emit exactly one JSONL event.")
+        }
+        let expectedKeys = Set(["event", "schema_version", "sequence", "status", "version"])
+        guard Set(event.keys) == expectedKeys,
+              event["event"] as? String == "self_check",
+              event["schema_version"] as? Int == 1,
+              event["sequence"] as? Int == 1,
+              event["status"] as? String == "ok",
+              event["version"] as? String == runtimeVersion else {
+            throw ToolchainError.invalidToolchain("easysplat-train self-check event is invalid.")
+        }
+    }
+
+    func rejectLegacyMsplatFootprint(root: URL) throws {
+        let legacyPaths = [
+            root.appendingPathComponent("bin/msplat-train"),
+            root.appendingPathComponent("msplat/bin"),
+            root.appendingPathComponent("msplat/python"),
+            root.appendingPathComponent("msplat/core_extension_path.txt"),
+        ]
+        if let legacy = legacyPaths.first(where: { pathExistsIncludingSymlink($0) }) {
+            throw ToolchainError.invalidToolchain(
+                "Remove the legacy msplat footprint at \(projectRelativePath(legacy, root: root))."
             )
         }
     }
 
-    func msplatCoreExtensionURL(root: URL, sentinel: URL) throws -> URL {
-        let relativePath: String
-        do {
-            relativePath = try String(contentsOf: sentinel, encoding: .utf8)
-                .trimmingCharacters(in: .whitespacesAndNewlines)
-        } catch {
-            throw ToolchainError.invalidToolchain("msplat core_extension_path.txt could not be read.")
-        }
+    func pathExistsIncludingSymlink(_ url: URL) -> Bool {
+        fileManager.fileExists(atPath: url.path) || isSymbolicLink(url)
+    }
 
-        guard !relativePath.isEmpty,
-              !relativePath.hasPrefix("/"),
-              relativePath.rangeOfCharacter(from: .newlines) == nil else {
-            throw ToolchainError.invalidToolchain("msplat core_extension_path.txt contains an invalid relative path.")
-        }
+    func isSymbolicLink(_ url: URL) -> Bool {
+        guard let attributes = try? fileManager.attributesOfItem(atPath: url.path) else { return false }
+        return attributes[.type] as? FileAttributeType == .typeSymbolicLink
+    }
 
-        let components = relativePath.split(separator: "/", omittingEmptySubsequences: false)
-        guard !components.isEmpty,
-              components.allSatisfy({ !$0.isEmpty && $0 != "." && $0 != ".." }) else {
-            throw ToolchainError.invalidToolchain("msplat core_extension_path.txt contains an invalid relative path.")
-        }
-        let componentStrings = components.map(String.init)
-        guard componentStrings.count >= 6,
-              componentStrings[0] == "python",
-              componentStrings[1] == "lib",
-              componentStrings.contains("site-packages"),
-              componentStrings.dropLast().last == "msplat",
-              let fileName = componentStrings.last,
-              fileName.hasPrefix("_core"),
-              fileName.hasSuffix(".so") else {
-            throw ToolchainError.invalidToolchain("msplat core_extension_path.txt must point at msplat/_core*.so in site-packages.")
-        }
+    func projectRelativePath(_ url: URL, root: URL) -> String {
+        let rootPath = root.standardizedFileURL.path
+        let path = url.standardizedFileURL.path
+        guard path.hasPrefix(rootPath + "/") else { return url.lastPathComponent }
+        return String(path.dropFirst(rootPath.count + 1))
+    }
 
-        var coreExtension = root
-        for component in components {
-            coreExtension = coreExtension.appendingPathComponent(String(component))
+    func isLowercaseSHA256(_ value: String) -> Bool {
+        guard value.count == 64 else { return false }
+        return value.unicodeScalars.allSatisfy {
+            ("0"..."9").contains(Character(String($0))) || ("a"..."f").contains(Character(String($0)))
         }
-        guard fileManager.fileExists(atPath: coreExtension.path) else {
-            throw ToolchainError.missingLibrary("msplat/\(relativePath)")
-        }
-        return coreExtension
     }
 
     /// Verifies the binary at `url` is a native arm64 Mach-O. Fails closed if `/usr/bin/file`
@@ -533,11 +701,10 @@ extension ToolchainManager {
         let libcrypto = root.appendingPathComponent("lib/libcrypto.3.dylib")
         let libssl = root.appendingPathComponent("lib/libssl.3.dylib")
         let msplat = root.appendingPathComponent("msplat", isDirectory: true)
-        let msplatTrain = root.appendingPathComponent("bin/msplat-train")
-        let msplatBundledTrain = msplat.appendingPathComponent("bin/msplat-train")
-        let msplatPython = msplat.appendingPathComponent("python/bin/python3")
+        let msplatTrain = root.appendingPathComponent("bin/easysplat-train")
+        let msplatMetallib = root.appendingPathComponent("bin/default.metallib")
         let msplatBuildInfo = msplat.appendingPathComponent("build_info.json")
-        let msplatCoreSentinel = msplat.appendingPathComponent("core_extension_path.txt")
+        let msplatLicense = msplat.appendingPathComponent("LICENSE")
         let da3 = root.appendingPathComponent("da3_mps", isDirectory: true)
         let da3SfmTool = da3.appendingPathComponent("bin/easysplat_da3_sfm")
         let da3Python = da3.appendingPathComponent("python/bin/python3")
@@ -570,15 +737,28 @@ extension ToolchainManager {
             }
             return true
         }()
-        let msplatEntries = [msplatTrain, msplatBundledTrain, msplatPython, msplatBuildInfo, msplatCoreSentinel]
-        let msplatPresent = msplatEntries.contains { fileManager.fileExists(atPath: $0.path) }
-        let msplatOK = !msplatPresent
-            || (
-                fileManager.isExecutableFile(atPath: msplatTrain.path)
-                    && fileManager.isExecutableFile(atPath: msplatBundledTrain.path)
-                    && fileManager.isExecutableFile(atPath: msplatPython.path)
-                    && fileManager.fileExists(atPath: msplatBuildInfo.path)
-                    && (try? msplatCoreExtensionURL(root: msplat, sentinel: msplatCoreSentinel)) != nil
+        let msplatEntries = [msplatTrain, msplatMetallib, msplat, msplatBuildInfo, msplatLicense]
+        let msplatPresent = msplatEntries.contains { pathExistsIncludingSymlink($0) }
+        let legacyMsplatPresent = [
+            root.appendingPathComponent("bin/msplat-train"),
+            root.appendingPathComponent("msplat/bin"),
+            root.appendingPathComponent("msplat/python"),
+            root.appendingPathComponent("msplat/core_extension_path.txt"),
+        ].contains { pathExistsIncludingSymlink($0) }
+        let msplatOK = !legacyMsplatPresent
+            && (
+                !msplatPresent
+                    || (
+                    !isSymbolicLink(msplatTrain)
+                    && fileManager.isExecutableFile(atPath: msplatTrain.path)
+                    && (try? validateNativeMsplatClosure(
+                        root: root,
+                        executable: msplatTrain,
+                        metallib: msplatMetallib,
+                        buildInfo: msplatBuildInfo,
+                        license: msplatLicense
+                    )) != nil
+                    )
             )
 
         return fileManager.isExecutableFile(atPath: colmap.path)

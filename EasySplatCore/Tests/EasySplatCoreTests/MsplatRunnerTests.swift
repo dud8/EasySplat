@@ -5,7 +5,7 @@ final class MsplatRunnerTests: XCTestCase {
     func testRunTrainFailsWhenMsplatNotExecutable() async throws {
         let root = try TestFileBuilder.makeTempDir()
         defer { try? FileManager.default.removeItem(at: root) }
-        let msplat = root.appendingPathComponent("msplat-train")
+        let msplat = root.appendingPathComponent("easysplat-train")
         TestFileBuilder.createFile(at: msplat, data: Data([0x00]))
         let dataset = root.appendingPathComponent("dataset", isDirectory: true)
         try FileManager.default.createDirectory(at: dataset, withIntermediateDirectories: true)
@@ -25,7 +25,7 @@ final class MsplatRunnerTests: XCTestCase {
     func testRunTrainFailsWhenDatasetMissing() async throws {
         let root = try TestFileBuilder.makeTempDir()
         defer { try? FileManager.default.removeItem(at: root) }
-        let msplat = root.appendingPathComponent("msplat-train")
+        let msplat = root.appendingPathComponent("easysplat-train")
         try TestFileBuilder.createExecutable(at: msplat)
         let output = root.appendingPathComponent("out/splat.ply")
 
@@ -55,7 +55,7 @@ final class MsplatRunnerTests: XCTestCase {
 
         let root = try TestFileBuilder.makeTempDir()
         defer { try? FileManager.default.removeItem(at: root) }
-        let msplat = root.appendingPathComponent("msplat-train")
+        let msplat = root.appendingPathComponent("easysplat-train")
         try TestFileBuilder.createExecutable(at: msplat)
         let dataset = root.appendingPathComponent("dataset", isDirectory: true)
         try FileManager.default.createDirectory(at: dataset, withIntermediateDirectories: true)
@@ -93,7 +93,7 @@ final class MsplatRunnerTests: XCTestCase {
     func testRunTrainHonorsEnvOverrides() async throws {
         let root = try TestFileBuilder.makeTempDir()
         defer { try? FileManager.default.removeItem(at: root) }
-        let msplat = root.appendingPathComponent("msplat-train")
+        let msplat = root.appendingPathComponent("easysplat-train")
         try TestFileBuilder.createExecutable(at: msplat)
         let dataset = root.appendingPathComponent("dataset", isDirectory: true)
         try FileManager.default.createDirectory(at: dataset, withIntermediateDirectories: true)
@@ -127,7 +127,7 @@ final class MsplatRunnerTests: XCTestCase {
     func testRunTrainThrowsSubprocessFailureOnNonZeroExit() async throws {
         let root = try TestFileBuilder.makeTempDir()
         defer { try? FileManager.default.removeItem(at: root) }
-        let msplat = root.appendingPathComponent("msplat-train")
+        let msplat = root.appendingPathComponent("easysplat-train")
         try TestFileBuilder.createExecutable(at: msplat)
         let dataset = root.appendingPathComponent("dataset", isDirectory: true)
         try FileManager.default.createDirectory(at: dataset, withIntermediateDirectories: true)

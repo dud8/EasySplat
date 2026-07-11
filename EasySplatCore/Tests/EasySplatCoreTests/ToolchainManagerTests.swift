@@ -15,11 +15,11 @@ final class ToolchainManagerTests: XCTestCase {
         XCTAssertEqual(toolchain.root, root)
     }
 
-    func testValidateToolchainAcceptsPackagedMsplat() throws {
+    func testValidateToolchainAcceptsNativeMsplatClosure() throws {
         let root = try TestFileBuilder.makeTempDir()
         defer { try? FileManager.default.removeItem(at: root) }
         _ = try ToolchainFixtureBuilder.createToolchain(at: root)
-        let msplat = root.appendingPathComponent("bin/msplat-train")
+        let msplat = root.appendingPathComponent("bin/easysplat-train")
 
         let runner = makeValidationRunner(root: root)
 
@@ -37,14 +37,14 @@ final class ToolchainManagerTests: XCTestCase {
 
         let manager = ToolchainManager(runner: runner)
         let toolchain = try manager.test_validateToolchain(root: root)
-        XCTAssertEqual(toolchain.msplat, root.appendingPathComponent("bin/msplat-train"))
+        XCTAssertEqual(toolchain.msplat, root.appendingPathComponent("bin/easysplat-train"))
     }
 
     func testValidateToolchainNormalizesPackagedMsplatExecutableBit() throws {
         let root = try TestFileBuilder.makeTempDir()
         defer { try? FileManager.default.removeItem(at: root) }
         _ = try ToolchainFixtureBuilder.createToolchain(at: root)
-        let msplat = root.appendingPathComponent("bin/msplat-train")
+        let msplat = root.appendingPathComponent("bin/easysplat-train")
         try FileManager.default.setAttributes([.posixPermissions: 0o644], ofItemAtPath: msplat.path)
 
         let runner = makeValidationRunner(root: root)
@@ -60,23 +60,23 @@ final class ToolchainManagerTests: XCTestCase {
         defer { try? FileManager.default.removeItem(at: root) }
         _ = try ToolchainFixtureBuilder.createToolchain(at: root)
 
-        let runner = makeValidationRunner(root: root, msplatHelpExitCode: 2)
+        let runner = makeValidationRunner(root: root, msplatSelfCheckExitCode: 2)
 
         let manager = ToolchainManager(runner: runner)
         XCTAssertThrowsError(try manager.test_validateToolchain(root: root)) { error in
             guard case ToolchainManager.ToolchainError.invalidToolchain(let message) = error else {
                 return XCTFail("Expected invalidToolchain error")
             }
-            XCTAssertTrue(message.contains("msplat-train failed to launch"), "expected msplat launch failure; got \(message)")
+            XCTAssertTrue(message.contains("easysplat-train self-check failed"), "expected msplat launch failure; got \(message)")
         }
     }
 
     func testValidateToolchainFailsWhenPackagedMsplatRequiredFilesAreMissing() throws {
         let cases: [(String, String)] = [
-            ("msplat/bin/msplat-train", "msplat/bin/msplat-train"),
-            ("msplat/python/bin/python3", "msplat/python/bin/python3"),
+            ("bin/easysplat-train", "bin/easysplat-train"),
+            ("bin/default.metallib", "bin/default.metallib"),
             ("msplat/build_info.json", "msplat/build_info.json"),
-            ("msplat/core_extension_path.txt", "msplat/core_extension_path.txt")
+            ("msplat/LICENSE", "msplat/LICENSE")
         ]
 
         for (relativePath, expectedName) in cases {
@@ -113,44 +113,152 @@ final class ToolchainManagerTests: XCTestCase {
         }
     }
 
-    func testValidateToolchainRejectsInvalidPackagedMsplatCoreSentinel() throws {
+    func testValidateToolchainRejectsUnexpectedMsplatMetadataKeys() throws {
         let root = try TestFileBuilder.makeTempDir()
         defer { try? FileManager.default.removeItem(at: root) }
         _ = try ToolchainFixtureBuilder.createToolchain(at: root)
-        try "python/bin/python3\n".write(
-            to: root.appendingPathComponent("msplat/core_extension_path.txt"),
-            atomically: true,
-            encoding: .utf8
+        let buildInfo = root.appendingPathComponent("msplat/build_info.json")
+        var payload = try XCTUnwrap(
+            try JSONSerialization.jsonObject(with: Data(contentsOf: buildInfo)) as? [String: Any]
         )
+        payload["source_path"] = "/Users/example/private-checkout"
+        try JSONSerialization.data(withJSONObject: payload).write(to: buildInfo, options: .atomic)
 
         let manager = ToolchainManager(runner: makeValidationRunner(root: root))
         XCTAssertThrowsError(try manager.test_validateToolchain(root: root)) { error in
             guard case ToolchainManager.ToolchainError.invalidToolchain(let message) = error else {
                 return XCTFail("Expected invalidToolchain error")
             }
-            XCTAssertTrue(message.contains("core_extension_path.txt"), "expected msplat core sentinel failure; got \(message)")
+            XCTAssertTrue(message.contains("unexpected keys"), "expected strict metadata failure; got \(message)")
         }
     }
 
-    func testValidateToolchainRejectsNonArmPackagedMsplatBinaries() throws {
+    func testValidateToolchainRejectsMsplatPayloadHashMismatch() throws {
+        let root = try TestFileBuilder.makeTempDir()
+        defer { try? FileManager.default.removeItem(at: root) }
+        _ = try ToolchainFixtureBuilder.createToolchain(at: root)
+        let binary = root.appendingPathComponent("bin/easysplat-train")
+        try Data("tampered binary\n".utf8).write(to: binary)
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: binary.path)
+
+        let manager = ToolchainManager(runner: makeValidationRunner(root: root))
+        XCTAssertThrowsError(try manager.test_validateToolchain(root: root)) { error in
+            guard case ToolchainManager.ToolchainError.invalidToolchain(let message) = error else {
+                return XCTFail("Expected invalidToolchain error")
+            }
+            XCTAssertTrue(message.contains("executable_sha256 mismatch"), "expected native payload hash failure; got \(message)")
+        }
+    }
+
+    func testValidateToolchainRejectsMalformedMsplatSelfCheckEvents() throws {
+        let invalidOutputs = [
+            "not json\n",
+            "{\"event\":\"self_check\",\"schema_version\":1,\"sequence\":1,\"status\":\"ok\",\"version\":\"1.1.3 (git 106499b)\"}\n{\"event\":\"self_check\"}\n",
+            "{\"event\":\"self_check\",\"schema_version\":1,\"sequence\":2,\"status\":\"ok\",\"version\":\"1.1.3 (git 106499b)\"}\n",
+            "{\"event\":\"self_check\",\"schema_version\":1,\"sequence\":1,\"status\":\"ok\",\"version\":\"1.1.3\"}\n",
+            "{\"event\":\"self_check\",\"schema_version\":1,\"sequence\":1,\"status\":\"ok\",\"version\":\"9.9.9\"}\n",
+        ]
+        for output in invalidOutputs {
+            let root = try TestFileBuilder.makeTempDir()
+            defer { try? FileManager.default.removeItem(at: root) }
+            _ = try ToolchainFixtureBuilder.createToolchain(at: root)
+            let manager = ToolchainManager(runner: makeValidationRunner(root: root, msplatSelfCheckStdout: output))
+            XCTAssertThrowsError(try manager.test_validateToolchain(root: root), "expected rejection for \(output)") { error in
+                guard case ToolchainManager.ToolchainError.invalidToolchain(let message) = error else {
+                    return XCTFail("Expected invalidToolchain error")
+                }
+                XCTAssertTrue(message.contains("self-check"), "expected self-check failure; got \(message)")
+            }
+        }
+    }
+
+    func testValidateToolchainRejectsLegacyMsplatFootprints() throws {
+        let legacyPaths = [
+            "bin/msplat-train",
+            "msplat/bin/msplat-train",
+            "msplat/python/bin/python3",
+            "msplat/core_extension_path.txt",
+            "msplat/python/lib/python3.12/site-packages/msplat/_core.so",
+        ]
+        for relativePath in legacyPaths {
+            let root = try TestFileBuilder.makeTempDir()
+            defer { try? FileManager.default.removeItem(at: root) }
+            _ = try ToolchainFixtureBuilder.createToolchain(at: root, includeMsplat: false)
+            let legacy = root.appendingPathComponent(relativePath)
+            try FileManager.default.createDirectory(at: legacy.deletingLastPathComponent(), withIntermediateDirectories: true)
+            FileManager.default.createFile(atPath: legacy.path, contents: Data("legacy".utf8))
+
+            let manager = ToolchainManager(runner: makeValidationRunner(root: root))
+            XCTAssertThrowsError(try manager.test_validateToolchain(root: root), "expected legacy rejection for \(relativePath)") { error in
+                guard case ToolchainManager.ToolchainError.invalidToolchain(let message) = error else {
+                    return XCTFail("Expected invalidToolchain error, got \(error)")
+                }
+                XCTAssertTrue(message.contains("legacy msplat"), "expected legacy footprint failure; got \(message)")
+            }
+        }
+    }
+
+    func testValidateToolchainRejectsUnexpectedOrSymlinkedMsplatFiles() throws {
+        let root = try TestFileBuilder.makeTempDir()
+        defer { try? FileManager.default.removeItem(at: root) }
+        _ = try ToolchainFixtureBuilder.createToolchain(at: root)
+        FileManager.default.createFile(
+            atPath: root.appendingPathComponent("msplat/unexpected.txt").path,
+            contents: Data("unexpected".utf8)
+        )
+        var manager = ToolchainManager(runner: makeValidationRunner(root: root))
+        XCTAssertThrowsError(try manager.test_validateToolchain(root: root)) { error in
+            guard case ToolchainManager.ToolchainError.invalidToolchain(let message) = error else {
+                return XCTFail("Expected invalidToolchain error")
+            }
+            XCTAssertTrue(message.contains("unexpected files"), "expected exact closure failure; got \(message)")
+        }
+
+        try FileManager.default.removeItem(at: root.appendingPathComponent("msplat/unexpected.txt"))
+        let license = root.appendingPathComponent("msplat/LICENSE")
+        let target = root.appendingPathComponent("license-target")
+        try "Apache License 2.0\n".write(to: target, atomically: true, encoding: .utf8)
+        try FileManager.default.removeItem(at: license)
+        try FileManager.default.createSymbolicLink(at: license, withDestinationURL: target)
+        manager = ToolchainManager(runner: makeValidationRunner(root: root))
+        XCTAssertThrowsError(try manager.test_validateToolchain(root: root)) { error in
+            guard case ToolchainManager.ToolchainError.invalidToolchain(let message) = error else {
+                return XCTFail("Expected invalidToolchain error")
+            }
+            XCTAssertTrue(message.contains("symbolic link"), "expected symlink rejection; got \(message)")
+        }
+    }
+
+    func testValidateToolchainRejectsMsplatExecutableSymlinkWithoutChangingTargetMode() throws {
+        let root = try TestFileBuilder.makeTempDir()
+        defer { try? FileManager.default.removeItem(at: root) }
+        _ = try ToolchainFixtureBuilder.createToolchain(at: root)
+        let executable = root.appendingPathComponent("bin/easysplat-train")
+        let target = root.appendingPathComponent("outside-native-binary")
+        try Data("fixture native msplat executable\n".utf8).write(to: target)
+        try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: target.path)
+        try FileManager.default.removeItem(at: executable)
+        try FileManager.default.createSymbolicLink(at: executable, withDestinationURL: target)
+
+        let manager = ToolchainManager(runner: makeValidationRunner(root: root))
+        XCTAssertThrowsError(try manager.test_validateToolchain(root: root))
+        let permissions = try XCTUnwrap(
+            try FileManager.default.attributesOfItem(atPath: target.path)[.posixPermissions] as? NSNumber
+        )
+        XCTAssertEqual(permissions.intValue & 0o777, 0o600)
+    }
+
+    func testValidateToolchainRejectsNonArmNativeMsplat() throws {
         let root = try TestFileBuilder.makeTempDir()
         defer { try? FileManager.default.removeItem(at: root) }
         _ = try ToolchainFixtureBuilder.createToolchain(at: root)
 
-        var manager = ToolchainManager(runner: makeValidationRunner(root: root, msplatPythonArch: "Mach-O 64-bit executable x86_64"))
+        let manager = ToolchainManager(runner: makeValidationRunner(root: root, msplatArch: "Mach-O 64-bit executable x86_64"))
         XCTAssertThrowsError(try manager.test_validateToolchain(root: root)) { error in
             guard case ToolchainManager.ToolchainError.invalidToolchain(let message) = error else {
                 return XCTFail("Expected invalidToolchain error")
             }
-            XCTAssertTrue(message.lowercased().contains("msplat python"), "expected msplat python arch failure; got \(message)")
-        }
-
-        manager = ToolchainManager(runner: makeValidationRunner(root: root, msplatCoreArch: "Mach-O 64-bit bundle x86_64"))
-        XCTAssertThrowsError(try manager.test_validateToolchain(root: root)) { error in
-            guard case ToolchainManager.ToolchainError.invalidToolchain(let message) = error else {
-                return XCTFail("Expected invalidToolchain error")
-            }
-            XCTAssertTrue(message.lowercased().contains("msplat core"), "expected msplat core arch failure; got \(message)")
+            XCTAssertTrue(message.lowercased().contains("easysplat-train"), "expected native msplat arch failure; got \(message)")
         }
     }
 
@@ -221,8 +329,7 @@ final class ToolchainManagerTests: XCTestCase {
             mapAnythingPythonArch: universal,
             vggtPythonArch: universal,
             fastvggtPythonArch: universal,
-            msplatPythonArch: universal,
-            msplatCoreArch: universal
+            msplatArch: universal
         )
 
         let manager = ToolchainManager(runner: runner)
@@ -296,9 +403,26 @@ final class ToolchainManagerTests: XCTestCase {
         _ = try ToolchainFixtureBuilder.createToolchain(at: partialMsplatRoot)
         XCTAssertTrue(manager.test_coreToolchainLooksInstalled(root: partialMsplatRoot))
         try FileManager.default.removeItem(
-            at: partialMsplatRoot.appendingPathComponent("msplat/core_extension_path.txt")
+            at: partialMsplatRoot.appendingPathComponent("bin/default.metallib")
         )
         XCTAssertFalse(manager.test_coreToolchainLooksInstalled(root: partialMsplatRoot))
+
+        let tamperedMsplatRoot = try TestFileBuilder.makeTempDir()
+        defer { try? FileManager.default.removeItem(at: tamperedMsplatRoot) }
+        _ = try ToolchainFixtureBuilder.createToolchain(at: tamperedMsplatRoot)
+        try Data("tampered metallib\n".utf8).write(
+            to: tamperedMsplatRoot.appendingPathComponent("bin/default.metallib")
+        )
+        XCTAssertFalse(manager.test_coreToolchainLooksInstalled(root: tamperedMsplatRoot))
+
+        let legacyMsplatRoot = try TestFileBuilder.makeTempDir()
+        defer { try? FileManager.default.removeItem(at: legacyMsplatRoot) }
+        _ = try ToolchainFixtureBuilder.createToolchain(at: legacyMsplatRoot, includeMsplat: false)
+        FileManager.default.createFile(
+            atPath: legacyMsplatRoot.appendingPathComponent("bin/msplat-train").path,
+            contents: Data("legacy".utf8)
+        )
+        XCTAssertFalse(manager.test_coreToolchainLooksInstalled(root: legacyMsplatRoot))
     }
 
     func testModelsToolchainLooksInstalled() throws {
@@ -599,13 +723,13 @@ final class ToolchainManagerTests: XCTestCase {
         mapAnythingPythonArch: String = "Mach-O 64-bit executable arm64",
         vggtPythonArch: String = "Mach-O 64-bit executable arm64",
         fastvggtPythonArch: String = "Mach-O 64-bit executable arm64",
-        msplatPythonArch: String = "Mach-O 64-bit executable arm64",
-        msplatCoreArch: String = "Mach-O 64-bit bundle arm64",
+        msplatArch: String = "Mach-O 64-bit executable arm64",
         da3HelpExitCode: Int32 = 0,
         mapAnythingHelpExitCode: Int32 = 0,
         vggtHelpExitCode: Int32 = 0,
         fastvggtHelpExitCode: Int32 = 0,
-        msplatHelpExitCode: Int32 = 0
+        msplatSelfCheckExitCode: Int32 = 0,
+        msplatSelfCheckStdout: String = "{\"event\":\"self_check\",\"schema_version\":1,\"sequence\":1,\"status\":\"ok\",\"version\":\"1.1.3 (git 106499b)\"}\n"
     ) -> MockSubprocessRunner {
         MockSubprocessRunner(scripts: [
             .init(path: "/usr/bin/file", argsPrefix: ["-b", root.appendingPathComponent("bin/colmap").path], result: .init(exitCode: 0, terminationReason: .exit, stdout: colmapArch, stderr: ""), onRun: nil),
@@ -620,9 +744,18 @@ final class ToolchainManagerTests: XCTestCase {
             .init(path: root.appendingPathComponent("vggt_mps/bin/easysplat_vggt_sfm").path, argsPrefix: ["--help"], result: .init(exitCode: vggtHelpExitCode, terminationReason: .exit, stdout: "", stderr: ""), onRun: nil),
             .init(path: "/usr/bin/file", argsPrefix: ["-b", root.appendingPathComponent("fastvggt_mps/python/bin/python3").path], result: .init(exitCode: 0, terminationReason: .exit, stdout: fastvggtPythonArch, stderr: ""), onRun: nil),
             .init(path: root.appendingPathComponent("fastvggt_mps/bin/easysplat_fastvggt_sfm").path, argsPrefix: ["--help"], result: .init(exitCode: fastvggtHelpExitCode, terminationReason: .exit, stdout: "", stderr: ""), onRun: nil),
-            .init(path: "/usr/bin/file", argsPrefix: ["-b", root.appendingPathComponent("msplat/python/bin/python3").path], result: .init(exitCode: 0, terminationReason: .exit, stdout: msplatPythonArch, stderr: ""), onRun: nil),
-            .init(path: "/usr/bin/file", argsPrefix: ["-b", root.appendingPathComponent("msplat/python/lib/python3.12/site-packages/msplat/_core.cpython-312-darwin.so").path], result: .init(exitCode: 0, terminationReason: .exit, stdout: msplatCoreArch, stderr: ""), onRun: nil),
-            .init(path: root.appendingPathComponent("bin/msplat-train").path, argsPrefix: ["--help"], result: .init(exitCode: msplatHelpExitCode, terminationReason: .exit, stdout: "", stderr: ""), onRun: nil)
+            .init(path: "/usr/bin/file", argsPrefix: ["-b", root.appendingPathComponent("bin/easysplat-train").path], result: .init(exitCode: 0, terminationReason: .exit, stdout: msplatArch, stderr: ""), onRun: nil),
+            .init(
+                path: root.appendingPathComponent("bin/easysplat-train").path,
+                argsPrefix: ["--self-check", "--events-jsonl"],
+                result: .init(
+                    exitCode: msplatSelfCheckExitCode,
+                    terminationReason: .exit,
+                    stdout: msplatSelfCheckStdout,
+                    stderr: ""
+                ),
+                onRun: nil
+            )
         ])
     }
 }

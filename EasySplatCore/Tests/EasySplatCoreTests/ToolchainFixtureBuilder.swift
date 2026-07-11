@@ -1,3 +1,4 @@
+import CryptoKit
 import Foundation
 @testable import EasySplatCore
 
@@ -109,31 +110,58 @@ enum ToolchainFixtureBuilder {
         fm.createFile(atPath: libssl.path, contents: Data())
 
         if includeMsplat {
-            let msplat = bin.appendingPathComponent("msplat-train")
+            let msplat = bin.appendingPathComponent("easysplat-train")
+            let metallib = bin.appendingPathComponent("default.metallib")
             let msplatRoot = root.appendingPathComponent("msplat", isDirectory: true)
-            let msplatBundledTrain = msplatRoot.appendingPathComponent("bin/msplat-train")
-            let msplatPython = msplatRoot.appendingPathComponent("python/bin/python3")
             let msplatBuildInfo = msplatRoot.appendingPathComponent("build_info.json")
-            let msplatCoreRelativePath = "python/lib/python3.12/site-packages/msplat/_core.cpython-312-darwin.so"
-            let msplatCoreExtension = msplatRoot.appendingPathComponent(msplatCoreRelativePath)
-            let msplatCoreSentinel = msplatRoot.appendingPathComponent("core_extension_path.txt")
+            let msplatLicense = msplatRoot.appendingPathComponent("LICENSE")
+            try fm.createDirectory(at: msplatRoot, withIntermediateDirectories: true)
 
-            try fm.createDirectory(at: msplatBundledTrain.deletingLastPathComponent(), withIntermediateDirectories: true)
-            try fm.createDirectory(at: msplatPython.deletingLastPathComponent(), withIntermediateDirectories: true)
-            try fm.createDirectory(at: msplatCoreExtension.deletingLastPathComponent(), withIntermediateDirectories: true)
-            try writeExecutable(msplat, script: "#!/usr/bin/env bash\nexit 0\n")
-            try writeExecutable(msplatBundledTrain, script: "#!/usr/bin/env bash\nexit 0\n")
-            try writeExecutable(msplatPython, script: "#!/usr/bin/env bash\necho python\n")
-            try """
-            {
-              "toolchain_name": "msplat",
-              "source_path": "fixture",
-              "python_version": "3.12.12",
-              "package_version": "1.1.3"
+            let executableData = Data("fixture native msplat executable\n".utf8)
+            let metallibData = Data("fixture Metal library\n".utf8)
+            fm.createFile(atPath: msplat.path, contents: executableData)
+            try fm.setAttributes([.posixPermissions: 0o755], ofItemAtPath: msplat.path)
+            fm.createFile(atPath: metallib.path, contents: metallibData)
+            try "Apache License 2.0\n".write(to: msplatLicense, atomically: true, encoding: .utf8)
+
+            let hex: (Data) -> String = { data in
+                SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
             }
-            """.write(to: msplatBuildInfo, atomically: true, encoding: .utf8)
-            fm.createFile(atPath: msplatCoreExtension.path, contents: Data([0x00]))
-            try "\(msplatCoreRelativePath)\n".write(to: msplatCoreSentinel, atomically: true, encoding: .utf8)
+            let payload: [String: Any] = [
+                "toolchain_name": "msplat",
+                "source_url": "https://github.com/rayanht/msplat.git",
+                "source_commit": "106499b0a53f82b0c92d013b0861fbebd341b17e",
+                "source_version": "1.1.3",
+                "source_tree_sha256": String(repeating: "a", count: 64),
+                "overlay_sha256": String(repeating: "b", count: 64),
+                "patch_sha256": String(repeating: "c", count: 64),
+                "dependencies": [
+                    "nlohmann_json_v3.11.3_sha256": "04022b05d806eb5ff73023c280b68697d12b93e1b7267a0b22a1a39ec7578069",
+                    "nanoflann_v1.5.5_sha256": "57496cb27e1310a77a367e5a902c8f1c700496d91ac54ccc87fbe9ccc28bc6cc",
+                    "cli11_v2.4.2_sha256": "43e650d5e1a3acaaf419d1e61a81f77b408d0696f472be0599ddf877d40984b0",
+                ],
+                "executable_sha256": hex(executableData),
+                "metallib_sha256": hex(metallibData),
+                "compiler": "Apple clang fixture",
+                "cmake": "cmake version fixture",
+                "ninja": "fixture",
+                "deployment_target": "macOS 15.0",
+                "build_configuration": "Release",
+                "cmake_arguments": [
+                    "-G Ninja",
+                    "-DCMAKE_BUILD_TYPE=Release",
+                    "-DCMAKE_OSX_ARCHITECTURES=arm64",
+                    "-DCMAKE_OSX_DEPLOYMENT_TARGET=15.0",
+                    "-DMSPLAT_BUILD_PYTHON=OFF",
+                    "-DFETCHCONTENT_FULLY_DISCONNECTED=ON",
+                    "FETCHCONTENT_SOURCE_DIR_NLOHMANN_JSON=verified-v3.11.3",
+                    "FETCHCONTENT_SOURCE_DIR_NANOFLANN=verified-v1.5.5",
+                    "FETCHCONTENT_SOURCE_DIR_CLI11=verified-v2.4.2",
+                ],
+                "build_timestamp": "2026-07-11T00:00:00Z",
+            ]
+            let buildInfoData = try JSONSerialization.data(withJSONObject: payload, options: [.prettyPrinted, .sortedKeys])
+            try buildInfoData.write(to: msplatBuildInfo, options: .atomic)
         }
 
         let da3Root = root.appendingPathComponent("da3_mps", isDirectory: true)

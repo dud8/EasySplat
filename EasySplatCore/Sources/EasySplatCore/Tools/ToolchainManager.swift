@@ -49,7 +49,7 @@ public struct ToolchainPaths: Sendable {
             colmap: colmap,
             glomap: glomap,
             brush: brush,
-            msplat: root.appendingPathComponent("bin/msplat-train"),
+            msplat: root.appendingPathComponent("bin/easysplat-train"),
             da3: da3,
             mapanything: mapanything,
             vggt: vggt,
@@ -110,7 +110,7 @@ public struct ToolchainPaths: Sendable {
             colmap: colmap,
             glomap: glomap,
             brush: brush,
-            msplat: root.appendingPathComponent("bin/msplat-train"),
+            msplat: root.appendingPathComponent("bin/easysplat-train"),
             vggt: vggt,
             fastvggt: fastvggt
         )
