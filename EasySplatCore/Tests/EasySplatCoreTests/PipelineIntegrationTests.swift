@@ -1081,17 +1081,11 @@ final class PipelineIntegrationTests: XCTestCase {
 
         let toolchain = try makeToolchain(root: temp, createVggtFiles: true)
         let runner = CancellationOnSfmRunner(cancelPath: toolchain.fastvggt.sfmTool.path)
-        let powerAssertion = RecordingPowerAssertion {
-            // Simulate unrelated process-global environment activity after run entry.
-            // Pipeline configuration must remain fixed for the lifetime of the run.
-            RuntimeEnvironment.setValue("colmap", forKey: "EASYSPLAT_SFM_BACKEND")
-        }
 
         let pipeline = PipelineRunner(
             projectURL: projectURL,
             config: .init(toolchain: toolchain, preset: metadata.preset),
-            tooling: .init(runner: runner),
-            powerAssertion: powerAssertion
+            tooling: .init(runner: runner)
         )
 
         XCTAssertEqual(
@@ -1103,6 +1097,12 @@ final class PipelineIntegrationTests: XCTestCase {
             RuntimeEnvironment.current["EASYSPLAT_SFM_BACKEND"],
             "fastvggt",
             "The full environment snapshot must agree with its authoritative keyed lookup."
+        )
+        RuntimeEnvironment.setValue("colmap", forKey: "EASYSPLAT_SFM_BACKEND")
+        XCTAssertEqual(
+            RuntimeEnvironment.value(forKey: "EASYSPLAT_SFM_BACKEND"),
+            "colmap",
+            "The regression requires the process environment to change after runner construction."
         )
 
         await XCTAssertThrowsErrorAsync({
