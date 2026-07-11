@@ -128,8 +128,10 @@ public enum ProjectDiagnosticBundle {
         lines.append("Mapper: \(reconstruction.mapper)")
         lines.append("Captured: \(iso8601(reconstruction.capturedAt))")
         lines.append("Registered: \(reconstruction.registeredImages) / \(reconstruction.totalImages)")
-        if let reproj = reconstruction.meanReprojectionError {
+        if let reproj = reconstruction.resolvedReprojectionError {
             lines.append("Mean reprojection error: \(String(format: "%.3f px", reproj))")
+        } else if ReconstructionSummary.reprojectionErrorIsUnreliable(forMapper: reconstruction.mapper) {
+            lines.append("Mean reprojection error: not measured (this mapper does not produce pixel residuals)")
         }
         if let points = reconstruction.pointCount {
             lines.append("Points: \(points)")
@@ -217,11 +219,16 @@ public enum ProjectDiagnosticBundle {
             var autoTune: AutoTuneSnapshot?
             var lastFailureAt: Date?
         }
+        let diagnosticReconstruction = metadata.reconstruction.map { reconstruction in
+            var copy = reconstruction
+            copy.meanReprojectionError = reconstruction.resolvedReprojectionError
+            return copy
+        }
         let payload = Payload(
             schemaVersion: ProjectDiagnosticBundle.machineReadableSchemaVersion,
             projectId: metadata.id.uuidString,
             preset: metadata.preset,
-            reconstruction: metadata.reconstruction,
+            reconstruction: diagnosticReconstruction,
             stageTimings: metadata.stageTimings,
             autoTune: metadata.autoTune,
             lastFailureAt: metadata.lastFailureAt

@@ -65,6 +65,9 @@ public final class PipelineRunner: @unchecked Sendable {
     private let projectURL: URL
     let config: PipelineConfig
     let tooling: Tooling
+    let powerAssertion: PowerAssertionManaging
+    let initialEnvironment: [String: String]
+    private let capturedEnvironment: [String: String]?
 
     enum SfmMapperPreference: String {
         case glomap
@@ -92,13 +95,66 @@ public final class PipelineRunner: @unchecked Sendable {
         }
     }
 
-    public init(projectURL: URL, config: PipelineConfig, tooling: Tooling = Tooling()) {
+    public init(
+        projectURL: URL,
+        config: PipelineConfig,
+        tooling: Tooling = Tooling(),
+        powerAssertion: PowerAssertionManaging = SystemPowerAssertion()
+    ) {
         self.projectURL = projectURL
         self.config = config
         self.tooling = tooling
+        self.powerAssertion = powerAssertion
+        self.initialEnvironment = RuntimeEnvironment.current
+        self.capturedEnvironment = nil
+    }
+
+    var runtimeEnvironment: [String: String] {
+        capturedEnvironment ?? RuntimeEnvironment.current
     }
 
     public func run(resumeFrom lastCompletedStage: PipelineStage? = nil, events: @escaping @Sendable (PipelineEvent) -> Void) async throws {
+        let environment = initialEnvironment
+        let scopedRunner = PipelineRunner(
+            projectURL: projectURL,
+            config: config,
+            tooling: tooling,
+            powerAssertion: powerAssertion,
+            capturedEnvironment: environment
+        )
+        try await scopedRunner.runWithCapturedEnvironment(
+            resumeFrom: lastCompletedStage,
+            environment: environment,
+            events: events
+        )
+    }
+
+    private init(
+        projectURL: URL,
+        config: PipelineConfig,
+        tooling: Tooling,
+        powerAssertion: PowerAssertionManaging,
+        capturedEnvironment: [String: String]
+    ) {
+        self.projectURL = projectURL
+        self.config = config
+        self.tooling = tooling
+        self.powerAssertion = powerAssertion
+        self.initialEnvironment = capturedEnvironment
+        self.capturedEnvironment = capturedEnvironment
+    }
+
+    private func runWithCapturedEnvironment(
+        resumeFrom lastCompletedStage: PipelineStage?,
+        environment: [String: String],
+        events: @escaping @Sendable (PipelineEvent) -> Void
+    ) async throws {
+        // Keep the Mac awake for the entire run. Runs are multi-hour and training has no
+        // resumable checkpoint, so a system idle-sleep partway through loses the session.
+        // Released on every exit — success, throw, or cancellation.
+        let idleSleepAssertion = powerAssertion.beginPreventingIdleSleep(reason: "EasySplat is processing a project")
+        defer { idleSleepAssertion.release() }
+
         let paths = ProjectPaths(root: projectURL)
         try paths.ensureDirectories()
 
@@ -128,7 +184,7 @@ public final class PipelineRunner: @unchecked Sendable {
             && metadata.state.stage != .done
             && hasInterruptionEvidence
         let skipTraining: Bool = {
-            let env = ProcessInfo.processInfo.environment
+            let env = runtimeEnvironment
             let stopAfterSfmRaw = env["EASYSPLAT_STOP_AFTER_SFM"]?
                 .trimmingCharacters(in: .whitespacesAndNewlines)
                 .lowercased()
@@ -519,7 +575,7 @@ public final class PipelineRunner: @unchecked Sendable {
             }
 
             try Task.checkCancellation()
-            let backendOverride = sfmBackendOverride()
+            let backendOverride = sfmBackendOverride(environment: environment)
             let da3WindowSize = da3WindowSizePreference(hardwareTier: detectedHardwareProfile.tier)
             var backendOrder = sfmBackendFallbackOrder(override: backendOverride)
             if let backendOverride, backendOverride == .fastvggt {
@@ -558,6 +614,12 @@ public final class PipelineRunner: @unchecked Sendable {
                     emit(.stageLog(
                         stage: .sfmFeatures,
                         line: "Auto-tune marks \(name) as high risk on this hardware tier, but strict FastVGGT mode is enabled. Continuing with conservative strict settings (no fallback).",
+                        isError: true
+                    ))
+                } else if backendOverride != nil {
+                    emit(.stageLog(
+                        stage: .sfmFeatures,
+                        line: "Auto-tune marks \(name) as high risk on this hardware tier, but it was explicitly requested. Continuing without changing the backend.",
                         isError: true
                     ))
                 } else {
@@ -666,7 +728,7 @@ public final class PipelineRunner: @unchecked Sendable {
                             )
                             emit(.stageLog(
                                 stage: currentStage,
-                                line: "DA3 score (direct): \(ReconstructionScorer.summary(score)).",
+                                line: "DA3 score (direct): \(ReconstructionScorer.summary(score, mapper: "da3-direct")).",
                                 isError: false
                             ))
                             return score
@@ -772,7 +834,7 @@ public final class PipelineRunner: @unchecked Sendable {
                                     line: "DA3 direct solve was below the quality bar (\(rejection)); trying the next SfM backend.",
                                     isError: true
                                 ))
-                                throw PipelineError.lowQualityReconstruction(score)
+                                throw PipelineError.lowQualityReconstruction(score, mapper: "da3-direct")
                             }
                             acceptedReconstructionScore = score
                             acceptedReconstructionSummary = ReconstructionSummary(
@@ -873,7 +935,8 @@ public final class PipelineRunner: @unchecked Sendable {
                             input: metadata.input,
                             selectedFrameCount: selectedFrames.count,
                             preset: metadata.preset,
-                            autoTune: autoTuneProfile
+                            autoTune: autoTuneProfile,
+                            explicitlyRequested: backendOverride == .mapanything
                         )
                         let mapCheckpoint = mapAnythingCheckpointPreference()
                         let mapCoverageManifest = paths.mapanythingCoverageManifestURL
@@ -908,6 +971,7 @@ public final class PipelineRunner: @unchecked Sendable {
                         func analyzeMapAnythingModel(
                             at modelURL: URL,
                             candidate: String,
+                            mapper: String,
                             toolLog: ToolLogWriter? = nil
                         ) async throws -> ReconstructionScore {
                             let report = try await self.tooling.colmap.runModelAnalyzer(
@@ -924,7 +988,7 @@ public final class PipelineRunner: @unchecked Sendable {
                             )
                             emit(.stageLog(
                                 stage: currentStage,
-                                line: "MapAnything score (\(candidate)): \(ReconstructionScorer.summary(score)).",
+                                line: "MapAnything score (\(candidate)): \(ReconstructionScorer.summary(score, mapper: mapper)).",
                                 isError: false
                             ))
                             return score
@@ -1078,6 +1142,7 @@ public final class PipelineRunner: @unchecked Sendable {
                                     let rawScore = try await analyzeMapAnythingModel(
                                         at: sparseZero,
                                         candidate: "direct",
+                                        mapper: "mapanything-direct",
                                         toolLog: mapToolLog
                                     )
                                     let score = mapAnythingScoreApplyingCoverageFallback(
@@ -1300,6 +1365,7 @@ public final class PipelineRunner: @unchecked Sendable {
                                         }
                                     }
                                 )
+                                self.logKeypointStats(database: paths.colmapDatabaseURL, stage: .sfmMatching, emit: emit)
                                 emit(.stageProgress(stage: .sfmMatching, fraction: 0.30, message: "Matching views: starting pair matching…"))
 
                                 let useSequential = self.shouldUseSequential(
@@ -1381,6 +1447,7 @@ public final class PipelineRunner: @unchecked Sendable {
                                             line: "Sequential matcher failed during MapAnything refinement; retrying with exhaustive matching.",
                                             isError: true
                                         ))
+                                        self.emitColmapRetryDiagnostics(error, stage: .sfmMatching, emit: emit)
                                         lastUsedSequentialMatcher = false
                                         try await runExhaustiveMatcher()
                                     } else {
@@ -1504,6 +1571,7 @@ public final class PipelineRunner: @unchecked Sendable {
                                     let score = try await analyzeMapAnythingModel(
                                         at: sparseZero,
                                         candidate: "point_triangulator+bundle_adjuster",
+                                        mapper: "point_triangulator+bundle_adjuster",
                                         toolLog: colmapToolLog
                                     )
                                     if ReconstructionScorer.isAcceptable(score, mode: metadata.preset.mode) {
@@ -1516,7 +1584,10 @@ public final class PipelineRunner: @unchecked Sendable {
                                             capturedAt: Date()
                                         )
                                     } else {
-                                        lastMappingError = PipelineError.lowQualityReconstruction(score)
+                                        lastMappingError = PipelineError.lowQualityReconstruction(
+                                            score,
+                                            mapper: "point_triangulator+bundle_adjuster"
+                                        )
                                     }
                                 } catch {
                                     if error is CancellationError { throw error }
@@ -1553,12 +1624,14 @@ public final class PipelineRunner: @unchecked Sendable {
                                         let score = try await analyzeMapAnythingModel(
                                             at: sparseZero,
                                             candidate: candidate,
+                                            mapper: candidate,
                                             toolLog: colmapToolLog
                                         )
                                         if ReconstructionScorer.isAcceptable(score, mode: metadata.preset.mode) {
                                             acceptedModelURL = sparseZero
                                             acceptedMapper = candidate
                                             acceptedReconstructionScore = score
+                                            self.warnIfWeakAcceptedSolve(score: score, mapper: candidate, emit: emit)
                                             acceptedReconstructionSummary = ReconstructionSummary(
                                                 score: score,
                                                 mapper: candidate,
@@ -1566,7 +1639,7 @@ public final class PipelineRunner: @unchecked Sendable {
                                             )
                                             return true
                                         }
-                                        lastMappingError = PipelineError.lowQualityReconstruction(score)
+                                        lastMappingError = PipelineError.lowQualityReconstruction(score, mapper: candidate)
                                         return false
                                     }
 
@@ -1625,6 +1698,7 @@ public final class PipelineRunner: @unchecked Sendable {
                                                     line: "global_mapper GPU path failed; retrying global_mapper with GPU disabled.",
                                                     isError: true
                                                 ))
+                                                self.emitColmapRetryDiagnostics(colmapError, stage: .sfmMapping, emit: emit)
                                                 do {
                                                     try self.resetDirectory(paths.colmapSparseURL)
                                                     try await self.tooling.colmap.runGlobalMapper(
@@ -1959,6 +2033,7 @@ public final class PipelineRunner: @unchecked Sendable {
                                     }
                                 }
                             )
+                            self.logKeypointStats(database: paths.colmapDatabaseURL, stage: .sfmMatching, emit: emit)
                             emit(.stageProgress(stage: .sfmMatching, fraction: 0.30, message: "Matching views: starting pair matching…"))
 
                             let useSequential = self.shouldUseSequential(
@@ -2040,6 +2115,7 @@ public final class PipelineRunner: @unchecked Sendable {
                                         line: "Sequential matcher failed during FastVGGT refinement; retrying with exhaustive matching.",
                                         isError: true
                                     ))
+                                    self.emitColmapRetryDiagnostics(error, stage: .sfmMatching, emit: emit)
                                     lastUsedSequentialMatcher = false
                                     try await runExhaustiveMatcher()
                                 } else {
@@ -2210,14 +2286,14 @@ public final class PipelineRunner: @unchecked Sendable {
                                     ReconstructionScorer.parseModelAnalyzerOutput(report),
                                     expectedTotalImages: selectedFrames.count
                                 )
+                                let mapperLabel = fastUseBA ? "point_triangulator+bundle_adjuster" : "point_triangulator"
                                 emit(.stageLog(
                                     stage: .sfmMapping,
-                                    line: "FastVGGT refinement score: \(ReconstructionScorer.summary(score)).",
+                                    line: "FastVGGT refinement score: \(ReconstructionScorer.summary(score, mapper: mapperLabel)).",
                                     isError: false
                                 ))
                                 if ReconstructionScorer.isAcceptable(score, mode: metadata.preset.mode) {
                                     acceptedModelURL = refinedModelURL
-                                    let mapperLabel = fastUseBA ? "point_triangulator+bundle_adjuster" : "point_triangulator"
                                     acceptedMapper = mapperLabel
                                     acceptedReconstructionScore = score
                                     acceptedReconstructionSummary = ReconstructionSummary(
@@ -2226,7 +2302,7 @@ public final class PipelineRunner: @unchecked Sendable {
                                         capturedAt: Date()
                                     )
                                 } else {
-                                    lastMappingError = PipelineError.lowQualityReconstruction(score)
+                                    lastMappingError = PipelineError.lowQualityReconstruction(score, mapper: mapperLabel)
                                 }
                             } catch {
                                 if error is CancellationError { throw error }
@@ -2271,13 +2347,14 @@ public final class PipelineRunner: @unchecked Sendable {
                                     )
                                     emit(.stageLog(
                                         stage: .sfmMapping,
-                                        line: "Mapper fallback score (\(candidate)): \(ReconstructionScorer.summary(score)).",
+                                        line: "Mapper fallback score (\(candidate)): \(ReconstructionScorer.summary(score, mapper: candidate)).",
                                         isError: false
                                     ))
                                     if ReconstructionScorer.isAcceptable(score, mode: metadata.preset.mode) {
                                         acceptedModelURL = sparseZero
                                         acceptedMapper = candidate
                                         acceptedReconstructionScore = score
+                                        self.warnIfWeakAcceptedSolve(score: score, mapper: candidate, emit: emit)
                                         acceptedReconstructionSummary = ReconstructionSummary(
                                             score: score,
                                             mapper: candidate,
@@ -2285,7 +2362,7 @@ public final class PipelineRunner: @unchecked Sendable {
                                         )
                                         return true
                                     }
-                                    lastMappingError = PipelineError.lowQualityReconstruction(score)
+                                    lastMappingError = PipelineError.lowQualityReconstruction(score, mapper: candidate)
                                     return false
                                 }
 
@@ -2344,6 +2421,7 @@ public final class PipelineRunner: @unchecked Sendable {
                                                 line: "global_mapper GPU path failed; retrying global_mapper with GPU disabled.",
                                                 isError: true
                                             ))
+                                            self.emitColmapRetryDiagnostics(colmapError, stage: .sfmMapping, emit: emit)
                                             do {
                                                 try self.resetDirectory(paths.colmapSparseURL)
                                                 try await self.tooling.colmap.runGlobalMapper(
@@ -2645,7 +2723,7 @@ public final class PipelineRunner: @unchecked Sendable {
                             line: "VGGT sparse model rejected: \(failureReason).",
                             isError: true
                         ))
-                        throw PipelineError.lowQualityReconstruction(score)
+                        throw PipelineError.lowQualityReconstruction(score, mapper: "vggt")
                     }
                     acceptedReconstructionScore = score
                     acceptedReconstructionSummary = ReconstructionSummary(
@@ -2725,6 +2803,7 @@ public final class PipelineRunner: @unchecked Sendable {
                     options: colmapExtractOptions,
                     onLog: onFeaturesLog
                 )
+                self.logKeypointStats(database: paths.colmapDatabaseURL, emit: emit)
                 writeCheckpoint(
                     stage: .sfmFeatures,
                     progress: 1.0,
@@ -2776,6 +2855,14 @@ public final class PipelineRunner: @unchecked Sendable {
 
                 let exhaustiveFallbackMaxFrames = 60
                 lastUsedSequentialMatcher = useSequential
+
+                if !useSequential, metadata.input.videoFiles.count > 1 {
+                    emit(.stageLog(
+                        stage: .sfmMatching,
+                        line: "Multiple video clips detected (\(metadata.input.videoFiles.count)); using exhaustive matching so frames from different clips can link. Sequential matching would only connect frames adjacent within one clip.",
+                        isError: false
+                    ))
+                }
 
                 func runSequential() async throws {
                     let expected = ColmapPairEstimator.expectedSequentialPairs(
@@ -2838,6 +2925,7 @@ public final class PipelineRunner: @unchecked Sendable {
                                 line: "Sequential matcher failed. Retrying sequential matching with higher overlap (\(previousOverlap) -> \(increasedOverlap)).",
                                 isError: true
                             ))
+                            self.emitColmapRetryDiagnostics(error, stage: .sfmMatching, emit: emit)
                             colmapMatchOptions.sequentialOverlap = increasedOverlap
                             do {
                                 try await runSequential()
@@ -2849,6 +2937,7 @@ public final class PipelineRunner: @unchecked Sendable {
                                     line: "Sequential matcher failed again. Rebuilding database and retrying with exhaustive matching on fewer frames.",
                                     isError: true
                                 ))
+                                self.emitColmapRetryDiagnostics(error, stage: .sfmMatching, emit: emit)
                                 let previousCount = selectedFrames.count
                                 let reduced = try self.downsampleSelectedFrames(to: exhaustiveFallbackMaxFrames, paths: paths)
                                 if let reduced {
@@ -2883,6 +2972,7 @@ public final class PipelineRunner: @unchecked Sendable {
                                         }
                                     }
                                 )
+                                self.logKeypointStats(database: paths.colmapDatabaseURL, stage: .sfmMatching, emit: emit)
                                 try await runExhaustive()
                             }
                         } else {
@@ -3074,7 +3164,7 @@ public final class PipelineRunner: @unchecked Sendable {
                         writeCheckpoint(
                             stage: .sfmMapping,
                             progress: 0.95,
-                            message: "Mapping score: \(ReconstructionScorer.summary(score))",
+                            message: "Mapping score: \(ReconstructionScorer.summary(score, mapper: candidate))",
                             details: .sfmMapping(SfmMappingCheckpoint(
                                 mapper: candidate,
                                 sparsePath: modelURL.path,
@@ -3083,12 +3173,13 @@ public final class PipelineRunner: @unchecked Sendable {
                         )
                         emit(.stageLog(
                             stage: .sfmMapping,
-                            line: "Reconstruction score (\(candidate)): \(ReconstructionScorer.summary(score)).",
+                            line: "Reconstruction score (\(candidate)): \(ReconstructionScorer.summary(score, mapper: candidate)).",
                             isError: false
                         ))
                         if ReconstructionScorer.isAcceptable(score, mode: metadata.preset.mode) {
                             acceptedMappingStrategy = candidate
                             acceptedReconstructionScore = score
+                            self.warnIfWeakAcceptedSolve(score: score, mapper: candidate, emit: emit)
                             acceptedReconstructionSummary = ReconstructionSummary(
                                 score: score,
                                 mapper: candidate,
@@ -3096,7 +3187,7 @@ public final class PipelineRunner: @unchecked Sendable {
                             )
                             return true
                         } else {
-                            lastMappingError = PipelineError.lowQualityReconstruction(score)
+                            lastMappingError = PipelineError.lowQualityReconstruction(score, mapper: candidate)
                             return false
                         }
                     }
@@ -3168,6 +3259,7 @@ public final class PipelineRunner: @unchecked Sendable {
                                     line: "global_mapper GPU path failed; retrying global_mapper with GPU disabled.",
                                     isError: true
                                 ))
+                                self.emitColmapRetryDiagnostics(colmapError, stage: .sfmMapping, emit: emit)
                                 do {
                                     try self.resetDirectory(paths.colmapSparseURL)
                                     lastMappingAttempt = "global_mapper-cpu"
@@ -3256,12 +3348,14 @@ public final class PipelineRunner: @unchecked Sendable {
                         guard mappingSucceeded else {
                             let debugMessage: String
                             if let pipelineError = lastMappingError as? PipelineError,
-                               case let .lowQualityReconstruction(score) = pipelineError {
-                                debugMessage = "Low-quality reconstruction. \(ReconstructionScorer.summary(score))."
+                               case let .lowQualityReconstruction(score, mapper) = pipelineError {
+                                let summary = mapper.map { ReconstructionScorer.summary(score, mapper: $0) }
+                                    ?? ReconstructionScorer.summary(score)
+                                debugMessage = "Low-quality reconstruction. \(summary)."
                             } else if let colmapError = lastMappingError as? ColmapRunnerError {
                                 debugMessage = debugDescription(for: colmapError)
                             } else {
-                                debugMessage = "\(lastMappingError ?? PipelineError.lowQualityReconstruction(.init(registeredImages: 0, totalImages: 0, meanReprojectionError: nil)))"
+                                debugMessage = "\(lastMappingError ?? PipelineError.lowQualityReconstruction(.init(registeredImages: 0, totalImages: 0, meanReprojectionError: nil), mapper: nil))"
                             }
                             let userMessage = "I couldn't get a stable camera solve. Last attempt: \(lastMappingAttempt). Try a slower capture and more light."
                             emitFailure(
@@ -3269,7 +3363,7 @@ public final class PipelineRunner: @unchecked Sendable {
                                 userMessage: userMessage,
                                 debugMessage: debugMessage
                             )
-                            throw lastMappingError ?? PipelineError.lowQualityReconstruction(.init(registeredImages: 0, totalImages: 0, meanReprojectionError: nil))
+                            throw lastMappingError ?? PipelineError.lowQualityReconstruction(.init(registeredImages: 0, totalImages: 0, meanReprojectionError: nil), mapper: nil)
                         }
                         let canonicalSparseModel = paths.colmapSparseURL.appendingPathComponent("0", isDirectory: true)
                         let resolvedSparseModel = try resolveSparseModelDirectory(at: canonicalSparseModel)
@@ -3556,9 +3650,12 @@ public final class PipelineRunner: @unchecked Sendable {
                 let checkpointGate = CheckpointPulseGate()
                 let snapshotManager = BrushSnapshotManager(
                     defaultExportEvery: effectiveExportEvery,
-                    minSteps: Self.brushSnapshotMinSteps(),
-                    maxSteps: Self.brushSnapshotMaxSteps(),
-                    totalSteps: brushPlan.totalSteps
+                    minSteps: brushSnapshotMinSteps(),
+                    maxSteps: brushSnapshotMaxSteps(),
+                    totalSteps: brushPlan.totalSteps,
+                    minSeconds: brushSnapshotMinSeconds(),
+                    maxSeconds: brushSnapshotMaxSeconds(),
+                    defaultSeconds: brushSnapshotDefaultSeconds()
                 )
 
                 let emitTrainingStatus: @Sendable (Date) -> Void = { [self] now in

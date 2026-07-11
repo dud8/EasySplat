@@ -113,7 +113,7 @@ public final class Da3SfmRunner: @unchecked Sendable, Da3SfmRunning {
             args.append(contentsOf: ["--manifest-out", coverageManifestPath.path])
         }
 
-        var environment = ProcessInfo.processInfo.environment
+        var environment = RuntimeEnvironment.current
         environment["PYTHONUNBUFFERED"] = "1"
         environment["EASYSPLAT_DA3_MODELS_DIR"] = toolchain.models.path
         environment["TORCH_HOME"] = toolchain.models.path

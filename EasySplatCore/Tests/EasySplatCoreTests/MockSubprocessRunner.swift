@@ -9,9 +9,18 @@ final class MockSubprocessRunner: @unchecked Sendable, SubprocessRunning {
         let onRun: (([String]) -> Void)?
     }
 
+    private let lock = NSLock()
     private var scripts: [Script]
-    private(set) var calls: [(String, [String])] = []
-    private(set) var environments: [[String: String]] = []
+    private var recordedCalls: [(String, [String])] = []
+    private var recordedEnvironments: [[String: String]] = []
+
+    var calls: [(String, [String])] {
+        lock.withLock { recordedCalls }
+    }
+
+    var environments: [[String: String]] {
+        lock.withLock { recordedEnvironments }
+    }
 
     init(scripts: [Script]) {
         self.scripts = scripts
@@ -25,12 +34,15 @@ final class MockSubprocessRunner: @unchecked Sendable, SubprocessRunning {
         onStdout: @escaping @Sendable (String) -> Void,
         onStderr: @escaping @Sendable (String) -> Void
     ) throws -> SubprocessResult {
-        guard let index = scripts.firstIndex(where: { $0.path == launchPath && arguments.starts(with: $0.argsPrefix) }) else {
-            throw NSError(domain: "MockSubprocessRunner", code: 1, userInfo: [NSLocalizedDescriptionKey: "Unexpected command: \(launchPath) \(arguments)"])
+        let script: Script = try lock.withLock {
+            guard let index = scripts.firstIndex(where: { $0.path == launchPath && arguments.starts(with: $0.argsPrefix) }) else {
+                throw NSError(domain: "MockSubprocessRunner", code: 1, userInfo: [NSLocalizedDescriptionKey: "Unexpected command: \(launchPath) \(arguments)"])
+            }
+            let script = scripts.remove(at: index)
+            recordedCalls.append((launchPath, arguments))
+            recordedEnvironments.append(environment)
+            return script
         }
-        let script = scripts.remove(at: index)
-        calls.append((launchPath, arguments))
-        environments.append(environment)
         script.onRun?(arguments)
         return script.result
     }

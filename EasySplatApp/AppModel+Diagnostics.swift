@@ -11,24 +11,24 @@ extension AppModel {
         shareStatusMessage = "Preparing diagnostic info…"
         shareStatusIsError = false
         let hardwareLine = AppModel.hardwareSummaryLine()
-        Task.detached(priority: .userInitiated) { [weak self] in
-            let text = ProjectDiagnosticBundle.build(
-                projectURL: projectURL,
-                hardwareLine: hardwareLine
-            )
-            await MainActor.run {
-                guard let self else { return }
-                guard let text else {
-                    self.shareStatusMessage = "Could not build diagnostic bundle for this project."
-                    self.shareStatusIsError = true
-                    return
-                }
-                let pasteboard = NSPasteboard.general
-                pasteboard.clearContents()
-                pasteboard.setString(text, forType: .string)
-                self.shareStatusMessage = "Diagnostic info copied to clipboard."
-                self.shareStatusIsError = false
+        Task { @MainActor [weak self] in
+            let text = await Task.detached(priority: .userInitiated) { [projectURL, hardwareLine] in
+                ProjectDiagnosticBundle.build(
+                    projectURL: projectURL,
+                    hardwareLine: hardwareLine
+                )
+            }.value
+            guard let self else { return }
+            guard let text else {
+                self.shareStatusMessage = "Could not build diagnostic bundle for this project."
+                self.shareStatusIsError = true
+                return
             }
+            let pasteboard = NSPasteboard.general
+            pasteboard.clearContents()
+            pasteboard.setString(text, forType: .string)
+            self.shareStatusMessage = "Diagnostic info copied to clipboard."
+            self.shareStatusIsError = false
         }
     }
 
@@ -43,57 +43,59 @@ extension AppModel {
         shareStatusMessage = "Preparing diagnostic file…"
         shareStatusIsError = false
         let hardwareLine = AppModel.hardwareSummaryLine()
-        Task.detached(priority: .userInitiated) { [weak self] in
-            let text = ProjectDiagnosticBundle.build(
-                projectURL: projectURL,
-                hardwareLine: hardwareLine,
-                includeNotes: includeNotes
-            )
-            await MainActor.run {
-                guard let self else { return }
-                guard let text else {
-                    self.shareStatusMessage = "Could not build diagnostic bundle for this project."
-                    self.shareStatusIsError = true
-                    return
-                }
-                let panel = NSSavePanel()
-                panel.allowedContentTypes = [.plainText]
-                panel.nameFieldStringValue = AppModel.diagnosticBundleFileName(for: projectURL)
-                panel.canCreateDirectories = true
+        Task { @MainActor [weak self] in
+            let text = await Task.detached(priority: .userInitiated) { [projectURL, hardwareLine, includeNotes] in
+                ProjectDiagnosticBundle.build(
+                    projectURL: projectURL,
+                    hardwareLine: hardwareLine,
+                    includeNotes: includeNotes
+                )
+            }.value
+            guard let self else { return }
+            guard let text else {
+                self.shareStatusMessage = "Could not build diagnostic bundle for this project."
+                self.shareStatusIsError = true
+                return
+            }
+            let panel = NSSavePanel()
+            panel.allowedContentTypes = [.plainText]
+            panel.nameFieldStringValue = AppModel.diagnosticBundleFileName(for: projectURL)
+            panel.canCreateDirectories = true
 
-                let includeNotesCheckbox = NSButton(checkboxWithTitle: "Include private notes (off by default)", target: nil, action: nil)
-                includeNotesCheckbox.state = includeNotes ? .on : .off
-                let accessory = NSStackView(views: [includeNotesCheckbox])
-                accessory.orientation = .horizontal
-                accessory.edgeInsets = NSEdgeInsets(top: 8, left: 12, bottom: 8, right: 12)
-                accessory.translatesAutoresizingMaskIntoConstraints = false
-                panel.accessoryView = accessory
+            let includeNotesCheckbox = NSButton(checkboxWithTitle: "Include private notes (off by default)", target: nil, action: nil)
+            includeNotesCheckbox.state = includeNotes ? .on : .off
+            let accessory = NSStackView(views: [includeNotesCheckbox])
+            accessory.orientation = .horizontal
+            accessory.edgeInsets = NSEdgeInsets(top: 8, left: 12, bottom: 8, right: 12)
+            accessory.translatesAutoresizingMaskIntoConstraints = false
+            panel.accessoryView = accessory
 
-                let response = panel.runModal()
-                guard response == .OK, let destination = panel.url else {
-                    self.shareStatusMessage = "Diagnostic save canceled."
-                    self.shareStatusIsError = false
-                    return
-                }
-                let finalText: String = {
-                    if includeNotesCheckbox.state == .on, !includeNotes {
-                        // User opted in via the accessory; rebuild with notes.
-                        return ProjectDiagnosticBundle.build(
-                            projectURL: projectURL,
-                            hardwareLine: hardwareLine,
-                            includeNotes: true
-                        ) ?? text
-                    }
-                    return text
-                }()
-                do {
-                    try finalText.data(using: .utf8)?.write(to: destination, options: [.atomic])
-                    self.shareStatusMessage = "Diagnostics saved to \(destination.lastPathComponent)."
-                    self.shareStatusIsError = false
-                } catch {
-                    self.shareStatusMessage = "Failed to save diagnostics: \(error.localizedDescription)"
-                    self.shareStatusIsError = true
-                }
+            let response = panel.runModal()
+            guard response == .OK, let destination = panel.url else {
+                self.shareStatusMessage = "Diagnostic save canceled."
+                self.shareStatusIsError = false
+                return
+            }
+            let finalText: String
+            if includeNotesCheckbox.state == .on, !includeNotes {
+                // User opted in via the accessory; rebuild with notes off the main actor.
+                finalText = await Task.detached(priority: .userInitiated) { [projectURL, hardwareLine] in
+                    ProjectDiagnosticBundle.build(
+                        projectURL: projectURL,
+                        hardwareLine: hardwareLine,
+                        includeNotes: true
+                    )
+                }.value ?? text
+            } else {
+                finalText = text
+            }
+            do {
+                try finalText.data(using: .utf8)?.write(to: destination, options: [.atomic])
+                self.shareStatusMessage = "Diagnostics saved to \(destination.lastPathComponent)."
+                self.shareStatusIsError = false
+            } catch {
+                self.shareStatusMessage = "Failed to save diagnostics: \(error.localizedDescription)"
+                self.shareStatusIsError = true
             }
         }
     }

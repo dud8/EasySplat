@@ -537,7 +537,7 @@ final class ToolchainManagerDownloadTests: XCTestCase {
                 path: "/usr/bin/unzip",
                 argsPrefix: ["-o"],
                 result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""),
-                onRun: { args in
+                onRun: { @Sendable args in
                     guard let destinationFlag = args.firstIndex(of: "-d"),
                           args.indices.contains(destinationFlag + 1) else { return }
                     let destination = URL(fileURLWithPath: args[destinationFlag + 1], isDirectory: true)
@@ -598,7 +598,7 @@ final class ToolchainManagerDownloadTests: XCTestCase {
                 path: "/usr/bin/unzip",
                 argsPrefix: ["-o"],
                 result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""),
-                onRun: { _ in
+                onRun: { @Sendable _ in
                     let existingFile = root.appendingPathComponent("vggt_mps/models/vggt_model.pt")
                     try? FileManager.default.createDirectory(
                         at: existingFile.deletingLastPathComponent(),
@@ -660,7 +660,7 @@ final class ToolchainManagerDownloadTests: XCTestCase {
                 path: "/usr/bin/unzip",
                 argsPrefix: ["-o"],
                 result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""),
-                onRun: { _ in
+                onRun: { @Sendable _ in
                     let expectedFile = root.appendingPathComponent("vggt_mps/models/vggt_model.pt")
                     try? FileManager.default.createDirectory(
                         at: expectedFile.deletingLastPathComponent(),
@@ -718,7 +718,7 @@ final class ToolchainManagerDownloadTests: XCTestCase {
                 path: "/usr/bin/unzip",
                 argsPrefix: ["-o"],
                 result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""),
-                onRun: { _ in
+                onRun: { @Sendable _ in
                     let expectedFile = root.appendingPathComponent("vggt_mps/models/vggt_model.pt")
                     try? FileManager.default.createDirectory(
                         at: expectedFile.deletingLastPathComponent(),

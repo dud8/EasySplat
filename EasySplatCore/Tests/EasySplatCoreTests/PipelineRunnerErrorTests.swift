@@ -1,4 +1,5 @@
 import XCTest
+import SQLite3
 @testable import EasySplatCore
 
 final class PipelineRunnerErrorTests: XCTestCase {
@@ -22,6 +23,37 @@ final class PipelineRunnerErrorTests: XCTestCase {
         let outputMissing = runner.test_makePipelineErrorOutputMissing()
         let outputMessage = runner.test_failureMessages(for: outputMissing, stage: .exportSplat)
         XCTAssertEqual(outputMessage.userMessage, "Processing failed. Expected outputs were missing.")
+    }
+
+    func testLowQualityFailureMessageMasksPlaceholderReprojectionForKnownMapper() {
+        let runner = makeRunner()
+        let score = ReconstructionScore(
+            registeredImages: 3,
+            totalImages: 10,
+            meanReprojectionError: 0.0003,
+            pointCount: 120
+        )
+
+        let error = runner.test_makePipelineErrorLowQuality(score, mapper: "global_mapper")
+        let message = runner.test_failureMessages(for: error, stage: .sfmMapping)
+
+        XCTAssertTrue(message.debugMessage.contains("mean reprojection error n/a"))
+        XCTAssertFalse(message.debugMessage.contains("0.00"))
+    }
+
+    func testLowQualityFailureMessageKeepsReliableMapperReprojection() {
+        let runner = makeRunner()
+        let score = ReconstructionScore(
+            registeredImages: 3,
+            totalImages: 10,
+            meanReprojectionError: 1.25,
+            pointCount: 120
+        )
+
+        let error = runner.test_makePipelineErrorLowQuality(score, mapper: "colmap")
+        let message = runner.test_failureMessages(for: error, stage: .sfmMapping)
+
+        XCTAssertTrue(message.debugMessage.contains("mean reprojection error 1.25"))
     }
 
     func testFailureMessagesForSubprocessFailure() throws {
@@ -51,6 +83,62 @@ final class PipelineRunnerErrorTests: XCTestCase {
         let message = runner.test_failureMessages(for: error, stage: .sfmMatching)
         XCTAssertEqual(message.userMessage, "COLMAP crashed while matching images. Try fewer frames or a lower quality preset.")
         XCTAssertTrue(message.debugMessage.contains("Exit code: 10"))
+    }
+
+    func testRetryDiagnosticEventIncludesCommandTerminationAndLastStderrLine() {
+        let runner = makeRunner()
+        let error = ColmapRunnerError.failed(
+            command: "sequential_matcher",
+            exitCode: 10,
+            terminationReason: .uncaughtSignal,
+            stdoutTail: "ignored stdout",
+            stderrTail: "first detail\nsegmentation fault\n"
+        )
+        var events: [PipelineEvent] = []
+
+        runner.emitColmapRetryDiagnostics(error, stage: .sfmMatching) { events.append($0) }
+
+        guard case let .stageLog(stage, line, isError) = events.first else {
+            return XCTFail("Expected one retry diagnostic stage log event.")
+        }
+        XCTAssertEqual(events.count, 1)
+        XCTAssertEqual(stage, .sfmMatching)
+        XCTAssertTrue(isError)
+        XCTAssertEqual(
+            line,
+            "Previous sequential_matcher attempt failed: exit 10, \(Process.TerminationReason.uncaughtSignal) — segmentation fault"
+        )
+    }
+
+    func testKeypointStatsEmitMeasurementAndLowTextureWarningEvents() throws {
+        let runner = makeRunner()
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let database = root.appendingPathComponent("database.db")
+        var db: OpaquePointer?
+        XCTAssertEqual(sqlite3_open(database.path, &db), SQLITE_OK)
+        defer { sqlite3_close(db) }
+        XCTAssertEqual(sqlite3_exec(db, "CREATE TABLE images(image_id INTEGER PRIMARY KEY);", nil, nil, nil), SQLITE_OK)
+        XCTAssertEqual(sqlite3_exec(db, "CREATE TABLE keypoints(image_id INTEGER PRIMARY KEY, rows INTEGER);", nil, nil, nil), SQLITE_OK)
+        XCTAssertEqual(sqlite3_exec(db, "INSERT INTO images(image_id) VALUES (1), (2);", nil, nil, nil), SQLITE_OK)
+        XCTAssertEqual(sqlite3_exec(db, "INSERT INTO keypoints(image_id, rows) VALUES (1, 5000), (2, 50);", nil, nil, nil), SQLITE_OK)
+        sqlite3_close(db)
+        db = nil
+        var events: [PipelineEvent] = []
+
+        runner.logKeypointStats(database: database) { events.append($0) }
+
+        let lines = events.compactMap { event -> (String, Bool)? in
+            guard case let .stageLog(stage, line, isError) = event else { return nil }
+            XCTAssertEqual(stage, .sfmFeatures)
+            return (line, isError)
+        }
+        XCTAssertEqual(lines.count, 2)
+        XCTAssertEqual(lines[0].0, "Extracted 5050 keypoints across 2 images (avg 2525/image, min 50).")
+        XCTAssertFalse(lines[0].1)
+        XCTAssertTrue(lines[1].0.contains("only 50 keypoints (below 100)"))
+        XCTAssertTrue(lines[1].1)
     }
 
     func testColmapErrorIndicatesGpuFailure() throws {

@@ -1,11 +1,11 @@
 import XCTest
 
-@MainActor
-func XCTAssertThrowsErrorAsync<T>(
+func XCTAssertThrowsErrorAsync<T: Sendable>(
     _ expression: @escaping () async throws -> T,
     _ message: @autoclosure () -> String = "",
     file: StaticString = #filePath,
     line: UInt = #line,
+    isolation: isolated (any Actor)? = #isolation,
     errorHandler: (Error) -> Void = { _ in }
 ) async {
     do {

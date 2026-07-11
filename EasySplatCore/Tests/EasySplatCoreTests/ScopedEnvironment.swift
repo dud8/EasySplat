@@ -1,4 +1,5 @@
 import Foundation
+@testable import EasySplatCore
 
 private actor EnvironmentLock {
     static let shared = EnvironmentLock()
@@ -25,10 +26,10 @@ private actor EnvironmentLock {
     }
 }
 
-@MainActor
 @discardableResult
-func withEnvironmentAsync<T>(
+func withEnvironmentAsync<T: Sendable>(
     _ changes: [String: String?],
+    isolation: isolated (any Actor)? = #isolation,
     _ body: () async throws -> T
 ) async rethrows -> T {
     await EnvironmentLock.shared.lock()
@@ -46,9 +47,11 @@ func withEnvironmentAsync<T>(
     }
 }
 
-@MainActor
 @discardableResult
-func scopedEnvironment(_ changes: [String: String?]) async -> @Sendable () -> Void {
+func scopedEnvironment(
+    _ changes: [String: String?],
+    isolation: isolated (any Actor)? = #isolation
+) async -> @Sendable () -> Void {
     await EnvironmentLock.shared.lock()
     let previous = captureEnvironment(changes)
     applyEnvironment(changes)
@@ -61,31 +64,19 @@ func scopedEnvironment(_ changes: [String: String?]) async -> @Sendable () -> Vo
 private func captureEnvironment(_ changes: [String: String?]) -> [String: String?] {
     var previous: [String: String?] = [:]
     for key in changes.keys {
-        if let value = getenv(key) {
-            previous[key] = String(cString: value)
-        } else {
-            previous[key] = nil
-        }
+        previous[key] = RuntimeEnvironment.value(forKey: key)
     }
     return previous
 }
 
 private func applyEnvironment(_ changes: [String: String?]) {
     for (key, value) in changes {
-        if let value {
-            setenv(key, value, 1)
-        } else {
-            unsetenv(key)
-        }
+        RuntimeEnvironment.setValue(value, forKey: key)
     }
 }
 
 private func restoreEnvironment(_ previous: [String: String?]) {
     for (key, value) in previous {
-        if let value {
-            setenv(key, value, 1)
-        } else {
-            unsetenv(key)
-        }
+        RuntimeEnvironment.setValue(value, forKey: key)
     }
 }

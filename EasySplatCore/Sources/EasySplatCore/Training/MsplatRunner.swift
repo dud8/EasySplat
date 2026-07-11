@@ -66,7 +66,7 @@ public final class MsplatRunner {
         }
 
         var environment: [String: String] = [:]
-        if ProcessInfo.processInfo.environment["TERM"] == nil {
+        if RuntimeEnvironment.current["TERM"] == nil {
             environment["TERM"] = "xterm-256color"
         }
 
@@ -130,7 +130,7 @@ public final class MsplatRunner {
     }
 
     private func envValue(_ key: String) -> String? {
-        guard let raw = ProcessInfo.processInfo.environment[key]?.trimmingCharacters(in: .whitespacesAndNewlines),
+        guard let raw = RuntimeEnvironment.current[key]?.trimmingCharacters(in: .whitespacesAndNewlines),
               !raw.isEmpty else {
             return nil
         }

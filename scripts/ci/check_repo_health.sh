@@ -3,6 +3,11 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 
+if ! command -v rg >/dev/null 2>&1; then
+  echo "Repo health requires ripgrep (rg); install it and rerun this check." >&2
+  exit 1
+fi
+
 required_files=(
   "$ROOT/LICENSE"
   "$ROOT/CONTRIBUTING.md"

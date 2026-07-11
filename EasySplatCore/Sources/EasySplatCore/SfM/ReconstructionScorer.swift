@@ -192,6 +192,19 @@ public enum ReconstructionScorer {
         )
     }
 
+    /// Same as `summary(_:)`, but reports "n/a" for the reprojection error when the mapper's
+    /// model_analyzer value is a placeholder rather than a real pixel residual (see
+    /// `ReconstructionSummary.reprojectionErrorIsUnreliable`), so diagnostic logs and
+    /// checkpoints match the honest, persisted summary instead of the raw tool output.
+    public static func summary(_ score: ReconstructionScore, mapper: String) -> String {
+        guard ReconstructionSummary.reprojectionErrorIsUnreliable(forMapper: mapper) else {
+            return summary(score)
+        }
+        var masked = score
+        masked.meanReprojectionError = nil
+        return summary(masked)
+    }
+
     public static func summary(_ score: ReconstructionScore) -> String {
         let ratio = score.totalImages > 0 ? Double(score.registeredImages) / Double(score.totalImages) : 0.0
         let percent = ratio * 100.0

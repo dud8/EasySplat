@@ -335,7 +335,8 @@ extension PipelineRunner {
         selectedFrameCount: Int,
         preset: PresetSpec,
         input: InputSpec = .photos(folder: "/tmp"),
-        autoTune: AutoTuneProfile? = nil
+        autoTune: AutoTuneProfile? = nil,
+        explicitlyRequested: Bool = false
     ) -> (
         mode: String,
         directAllowed: Bool,
@@ -364,7 +365,8 @@ extension PipelineRunner {
             input: input,
             selectedFrameCount: selectedFrameCount,
             preset: preset,
-            autoTune: autoTune
+            autoTune: autoTune,
+            explicitlyRequested: explicitlyRequested
         )
         return (
             mode: plan.mode.rawValue,
@@ -670,8 +672,8 @@ extension PipelineRunner {
         PipelineError.invalidInput
     }
 
-    func test_makePipelineErrorLowQuality(_ score: ReconstructionScore) -> Error {
-        PipelineError.lowQualityReconstruction(score)
+    func test_makePipelineErrorLowQuality(_ score: ReconstructionScore, mapper: String? = nil) -> Error {
+        return PipelineError.lowQualityReconstruction(score, mapper: mapper)
     }
 
     func test_makePipelineErrorImageTranscodeFailed(_ message: String) -> Error {

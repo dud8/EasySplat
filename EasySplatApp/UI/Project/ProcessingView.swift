@@ -182,7 +182,44 @@ struct ProcessingView: View {
         }
     }
 
-    private func formatElapsed(_ elapsed: TimeInterval) -> String {
+    private func timingText(now: Date) -> String? {
+        let stagePrediction: TimeInterval? = {
+            guard let stage = model.stage else { return nil }
+            let preset = model.currentPreset ?? PresetSpec(mode: model.captureMode, quality: model.qualityPreset)
+            return RunDurationPredictor.predictStage(
+                stage,
+                mode: preset.mode,
+                quality: preset.quality,
+                from: model.projectSummaries
+            )?.seconds
+        }()
+        return Self.timingText(
+            elapsed: model.elapsedSinceStageStart(now: now),
+            silenceSeconds: model.lastPipelineEventAt.map { now.timeIntervalSince($0) },
+            stagePrediction: stagePrediction
+        )
+    }
+
+    /// Pure composition of the processing "Elapsed … • Last update … • Typical …" caption.
+    /// Split out from the view so its formatting edge cases (nil elapsed, sub-second silence,
+    /// absent prediction) are unit-testable without a live AppModel.
+    static func timingText(elapsed: TimeInterval?, silenceSeconds: TimeInterval?, stagePrediction: TimeInterval?) -> String? {
+        guard let elapsed else { return nil }
+        var parts = ["Elapsed \(formatElapsed(elapsed))"]
+        if let silenceSeconds {
+            if silenceSeconds >= 1 {
+                parts.append("Last update \(formatElapsed(silenceSeconds)) ago")
+            } else {
+                parts.append("Last update now")
+            }
+        }
+        if let stagePrediction {
+            parts.append("Typical \(StageTimingDisplay.formatDuration(seconds: stagePrediction))")
+        }
+        return parts.joined(separator: " • ")
+    }
+
+    static func formatElapsed(_ elapsed: TimeInterval) -> String {
         let total = max(0, Int(elapsed.rounded()))
         let hours = total / 3600
         let minutes = (total % 3600) / 60
@@ -191,32 +228,6 @@ struct ProcessingView: View {
             return String(format: "%dh %02dm %02ds", hours, minutes, seconds)
         }
         return String(format: "%dm %02ds", minutes, seconds)
-    }
-
-    private func timingText(now: Date) -> String? {
-        guard let elapsed = model.elapsedSinceStageStart(now: now) else { return nil }
-
-        var parts = ["Elapsed \(formatElapsed(elapsed))"]
-        if let lastUpdateAt = model.lastPipelineEventAt {
-            let silence = now.timeIntervalSince(lastUpdateAt)
-            if silence >= 1 {
-                parts.append("Last update \(formatElapsed(silence)) ago")
-            } else {
-                parts.append("Last update now")
-            }
-        }
-        if let stage = model.stage {
-            let preset = model.currentPreset ?? PresetSpec(mode: model.captureMode, quality: model.qualityPreset)
-            if let prediction = RunDurationPredictor.predictStage(
-                stage,
-                mode: preset.mode,
-                quality: preset.quality,
-                from: model.projectSummaries
-            ) {
-                parts.append("Typical \(StageTimingDisplay.formatDuration(seconds: prediction.seconds))")
-            }
-        }
-        return parts.joined(separator: " • ")
     }
 
     private func summaryDetail(_ detail: String) -> String {

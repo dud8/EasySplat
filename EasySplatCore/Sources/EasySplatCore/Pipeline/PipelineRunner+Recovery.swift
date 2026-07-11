@@ -20,7 +20,7 @@ extension PipelineRunner {
     enum PipelineError: Error {
         case invalidInput
         case insufficientInputImages(Int)
-        case lowQualityReconstruction(ReconstructionScore)
+        case lowQualityReconstruction(ReconstructionScore, mapper: String?)
         case imageTranscodeFailed(String)
         case outputMissing
     }
@@ -101,8 +101,10 @@ extension PipelineRunner {
                 return ("No usable photos or video frames were found.", String(reflecting: pipelineError))
             case let .insufficientInputImages(actual):
                 return ("At least two usable photos or video frames are required.", "Insufficient input images after selection: \(actual).")
-            case let .lowQualityReconstruction(score):
-                return ("I couldn't get a stable camera solve. Try a slower capture and more light.", "Low-quality reconstruction. \(ReconstructionScorer.summary(score)).")
+            case let .lowQualityReconstruction(score, mapper):
+                let summary = mapper.map { ReconstructionScorer.summary(score, mapper: $0) }
+                    ?? ReconstructionScorer.summary(score)
+                return ("I couldn't get a stable camera solve. Try a slower capture and more light.", "Low-quality reconstruction. \(summary).")
             case let .imageTranscodeFailed(message):
                 return ("Failed to convert photos for processing. Try exporting as JPEG/PNG.", message)
             case .outputMissing:
@@ -144,6 +146,67 @@ extension PipelineRunner {
             Stderr tail:
             \(stderrTail)
             """
+        }
+    }
+
+    /// Surfaces a failed COLMAP attempt's cause at a retry boundary (matching OR mapping) as
+    /// one prefixed log line: command, exit code, termination reason, and the last stderr line.
+    /// Without this, a transient crash — e.g. a SIGSEGV that emits little or no stderr — shows
+    /// only "failed, retrying" and the cause stays invisible unless a terminal failure follows,
+    /// which it may not if the retry succeeds. The full stdout/stderr tails remain in the COLMAP
+    /// tool log; non-COLMAP errors are left to the terminal path, which renders them in full.
+    func emitColmapRetryDiagnostics(_ error: Error, stage: PipelineStage, emit: (PipelineEvent) -> Void) {
+        guard case let ColmapRunnerError.failed(command, exitCode, reason, _, stderrTail) = error else { return }
+        let lastStderrLine = stderrTail
+            .split(separator: "\n", omittingEmptySubsequences: true)
+            .last
+            .map { String($0).trimmingCharacters(in: .whitespaces) }
+        var detail = "Previous \(command) attempt failed: exit \(exitCode), \(reason)"
+        if let lastStderrLine, !lastStderrLine.isEmpty {
+            detail += " — \(lastStderrLine)"
+        }
+        emit(.stageLog(stage: stage, line: detail, isError: true))
+    }
+
+    /// Warn once an accepted COLMAP/GLOMAP solve's mean track length is below this. A healthy
+    /// solve threads each point through several views (~3-6); a shorter average means a thin,
+    /// fragmented reconstruction.
+    static let weakTrackLengthThreshold = 3.0
+
+    /// Advisory only. The COLMAP/GLOMAP acceptance gate checks registration ratio plus that
+    /// metrics are non-empty, so a thin solve can pass where the neural-direct backends enforce
+    /// real floors. This logs a heads-up for the COLMAP path without changing accept/reject, so
+    /// a weak-but-accepted solve is not silent.
+    func warnIfWeakAcceptedSolve(score: ReconstructionScore, mapper: String, emit: (PipelineEvent) -> Void) {
+        guard let tracks = score.meanTrackLength, tracks < Self.weakTrackLengthThreshold else { return }
+        emit(.stageLog(
+            stage: .sfmMapping,
+            line: "Accepted \(mapper) solve has a short mean track length (\(String(format: "%.1f", tracks)) < \(Self.weakTrackLengthThreshold)); it met the coverage bar but the geometry is thin, so the splat may be sparse or fragmented.",
+            isError: true
+        ))
+    }
+
+    /// Warn once a frame extracted fewer keypoints than this. A well-textured image yields
+    /// thousands; a handful signals a flat/low-texture/degenerate frame that can fragment SfM.
+    static let lowKeypointWarningThreshold = 100
+
+    /// Reads the true per-image keypoint counts back from the COLMAP database after feature
+    /// extraction and logs them. This build's COLMAP silently ignores the requested feature
+    /// cap, so the count is content-driven; surfacing the real totals (and flagging frames
+    /// that extracted almost nothing) turns an otherwise opaque stage into an honest signal.
+    func logKeypointStats(database: URL, stage: PipelineStage = .sfmFeatures, emit: (PipelineEvent) -> Void) {
+        guard let stats = ColmapDatabaseProgressPoller(databasePath: database).readKeypointStats() else { return }
+        emit(.stageLog(
+            stage: stage,
+            line: "Extracted \(stats.totalKeypoints) keypoints across \(stats.imageCount) images (avg \(stats.averageKeypoints)/image, min \(stats.minKeypoints)).",
+            isError: false
+        ))
+        if stats.minKeypoints < Self.lowKeypointWarningThreshold {
+            emit(.stageLog(
+                stage: stage,
+                line: "At least one of \(stats.imageCount) frames extracted only \(stats.minKeypoints) keypoints (below \(Self.lowKeypointWarningThreshold)); low-texture or degenerate frames can weaken or fragment the reconstruction.",
+                isError: true
+            ))
         }
     }
 

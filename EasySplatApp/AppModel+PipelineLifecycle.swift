@@ -271,6 +271,11 @@ extension AppModel {
             currentInput = input
             syncShareMetrics(for: projectURL)
 
+            // Keep the Mac awake for the whole flow, including the first-run toolchain
+            // download, which happens before the runner (and its own assertion) exists.
+            let idleSleepAssertion = powerAssertion.beginPreventingIdleSleep(reason: "EasySplat is preparing and processing a project")
+            defer { idleSleepAssertion.release() }
+
             statusTitle = "Downloading tools"
             statusDetail = nil
             progress = nil
@@ -400,6 +405,12 @@ extension AppModel {
                 viewState = .viewer
                 return
             }
+
+            // A resume that must re-run holds the awake assertion across the toolchain
+            // download and the run; a resume that just opens a ready project (returned
+            // above) never reaches here, so it does not hold one.
+            let idleSleepAssertion = powerAssertion.beginPreventingIdleSleep(reason: "EasySplat is preparing and resuming a project")
+            defer { idleSleepAssertion.release() }
 
             statusTitle = "Downloading tools"
             statusDetail = nil

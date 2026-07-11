@@ -1878,7 +1878,7 @@ private actor AppTestEnvironmentLock {
 @discardableResult
 private func withAppEnvironmentAsync<T>(
     _ changes: [String: String?],
-    _ body: () async throws -> T
+    _ body: @MainActor () async throws -> T
 ) async rethrows -> T {
     await AppTestEnvironmentLock.shared.lock()
     let previous = captureAppEnvironment(changes)
@@ -1905,32 +1905,20 @@ private func appResourceURL(named name: String) -> URL {
 private func captureAppEnvironment(_ changes: [String: String?]) -> [String: String?] {
     var previous: [String: String?] = [:]
     for key in changes.keys {
-        if let value = getenv(key) {
-            previous[key] = String(cString: value)
-        } else {
-            previous[key] = nil
-        }
+        previous[key] = RuntimeEnvironment.value(forKey: key)
     }
     return previous
 }
 
 private func applyAppEnvironment(_ changes: [String: String?]) {
     for (key, value) in changes {
-        if let value {
-            setenv(key, value, 1)
-        } else {
-            unsetenv(key)
-        }
+        RuntimeEnvironment.setValue(value, forKey: key)
     }
 }
 
 private func restoreAppEnvironment(_ previous: [String: String?]) {
     for (key, value) in previous {
-        if let value {
-            setenv(key, value, 1)
-        } else {
-            unsetenv(key)
-        }
+        RuntimeEnvironment.setValue(value, forKey: key)
     }
 }
 

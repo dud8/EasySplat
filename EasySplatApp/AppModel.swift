@@ -66,6 +66,7 @@ final class AppModel: ObservableObject {
 
     let toolchainManager: ToolchainManaging
     let pipelineRunnerFactory: (URL, PipelineRunner.PipelineConfig) -> PipelineRunning
+    let powerAssertion: PowerAssertionManaging
     let projectBaseURL: URL?
     var currentTask: Task<Void, Never>?
     var currentTaskToken: UUID?
@@ -211,11 +212,13 @@ final class AppModel: ObservableObject {
         projectBaseURL: URL? = nil,
         pipelineRunnerFactory: @escaping (URL, PipelineRunner.PipelineConfig) -> PipelineRunning = { projectURL, config in
             PipelineRunner(projectURL: projectURL, config: config)
-        }
+        },
+        powerAssertion: PowerAssertionManaging = SystemPowerAssertion()
     ) {
         self.toolchainManager = toolchainManager
         self.projectBaseURL = projectBaseURL
         self.pipelineRunnerFactory = pipelineRunnerFactory
+        self.powerAssertion = powerAssertion
         refreshProjectSummaries()
     }
 }

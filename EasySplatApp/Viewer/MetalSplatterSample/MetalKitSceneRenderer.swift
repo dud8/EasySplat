@@ -7,6 +7,10 @@ import os
 import simd
 import SwiftUI
 
+private struct SendableMetalDevice: @unchecked Sendable {
+    let value: any MTLDevice
+}
+
 @MainActor
 class MetalKitSceneRenderer: NSObject, MTKViewDelegate {
     private static let log =
@@ -76,7 +80,7 @@ class MetalKitSceneRenderer: NSObject, MTKViewDelegate {
     }
 
     private func loadSplatRenderer(from url: URL) async throws -> SplatRenderer {
-        let device = self.device
+        let device = SendableMetalDevice(value: self.device)
         let colorFormat = metalKitView.colorPixelFormat
         let depthFormat = metalKitView.depthStencilPixelFormat
         let sampleCount = metalKitView.sampleCount
@@ -85,7 +89,7 @@ class MetalKitSceneRenderer: NSObject, MTKViewDelegate {
             Self.modelLoadQueue.async {
                 do {
                     let splat = try SplatRenderer(
-                        device: device,
+                        device: device.value,
                         colorFormat: colorFormat,
                         depthFormat: depthFormat,
                         stencilFormat: depthFormat,

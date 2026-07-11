@@ -1069,6 +1069,36 @@ final class PipelineRunnerHelperTests: XCTestCase {
         }
     }
 
+    func testMapAnythingExecutionPlanAllowsExplicitDirectOnLowTier() async throws {
+        let root = try TestFileBuilder.makeTempDir()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let runner = makeRunner(projectURL: root)
+
+        await withEnvironmentAsync([
+            "EASYSPLAT_MAPANYTHING_RESOLUTION": nil,
+            "EASYSPLAT_MAPANYTHING_MEMORY_EFFICIENT": nil,
+            "EASYSPLAT_MAPANYTHING_USE_AMP": nil,
+            "EASYSPLAT_MAPANYTHING_MAX_POINTS": nil,
+            "EASYSPLAT_MAPANYTHING_CAMERA_TYPE": nil,
+            "EASYSPLAT_MAPANYTHING_SHARED_CAMERA": nil,
+            "EASYSPLAT_MAPANYTHING_ANCHOR_MAX_VIEWS": nil,
+            "EASYSPLAT_MAPANYTHING_WINDOW_SIZE": nil,
+            "EASYSPLAT_MAPANYTHING_WINDOW_OVERLAP": nil
+        ]) {
+            let plan = runner.test_mapAnythingExecutionPlan(
+                hardwareTier: .low,
+                selectedFrameCount: 4,
+                preset: PresetSpec(mode: .object, quality: .standard),
+                explicitlyRequested: true
+            )
+
+            XCTAssertEqual(plan.mode, "direct")
+            XCTAssertTrue(plan.directAllowed)
+            XCTAssertEqual(plan.directViewLimit, 8)
+            XCTAssertTrue(plan.memoryEfficientInference)
+        }
+    }
+
     func testMapAnythingExecutionPlanUsesDirectWithinMidTierLimit() async throws {
         let root = try TestFileBuilder.makeTempDir()
         defer { try? FileManager.default.removeItem(at: root) }

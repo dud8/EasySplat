@@ -38,11 +38,11 @@ public final class BrushRunner {
 
         let workingDirectory = datasetPath.deletingLastPathComponent()
         var environment = ["RUST_BACKTRACE": "1"]
-        if let override = ProcessInfo.processInfo.environment["EASYSPLAT_BRUSH_RUST_LOG"],
+        if let override = RuntimeEnvironment.current["EASYSPLAT_BRUSH_RUST_LOG"],
            !override.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
             environment["RUST_LOG"] = override
         }
-        if ProcessInfo.processInfo.environment["TERM"] == nil {
+        if RuntimeEnvironment.current["TERM"] == nil {
             environment["TERM"] = "xterm-256color"
         }
 
@@ -85,7 +85,7 @@ public final class BrushRunner {
         }
 
         func intEnv(_ key: String) -> Int? {
-            guard let raw = ProcessInfo.processInfo.environment[key]?.trimmingCharacters(in: .whitespacesAndNewlines),
+            guard let raw = RuntimeEnvironment.current[key]?.trimmingCharacters(in: .whitespacesAndNewlines),
                   !raw.isEmpty,
                   let value = Int(raw),
                   value > 0 else { return nil }

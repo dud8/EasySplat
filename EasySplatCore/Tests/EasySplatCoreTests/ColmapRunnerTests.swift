@@ -125,6 +125,68 @@ final class ColmapRunnerTests: XCTestCase {
         )
     }
 
+    func testMatchesImporterPassesBruteForceFlag() async throws {
+        let runner = MockSubprocessRunner(scripts: [
+            .init(
+                path: "/mock/colmap",
+                argsPrefix: ["matches_importer"],
+                result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""),
+                onRun: { args in
+                    // matches_importer runs SIFT matching per pair; on the FLANN-segfaulting
+                    // build it must carry the brute-force flag like the other matchers.
+                    XCTAssertEqual(self.value(for: "--SiftMatching.cpu_brute_force_matcher", in: args), "1")
+                    XCTAssertEqual(self.value(for: "--match_type", in: args), "pairs")
+                }
+            )
+        ])
+
+        let colmap = ColmapRunner(runner: runner)
+        try await colmap.runMatchesImporter(
+            colmapPath: URL(fileURLWithPath: "/mock/colmap"),
+            database: URL(fileURLWithPath: "/tmp/db"),
+            matchListPath: URL(fileURLWithPath: "/tmp/pairs.txt"),
+            matchType: "pairs",
+            options: ColmapOptions(
+                useGPU: false,
+                extractThreads: 1,
+                matchThreads: 1,
+                sequentialOverlap: 5,
+                useBruteForceMatcher: true
+            ),
+            onLog: { _, _ in }
+        )
+    }
+
+    func testMatchesImporterOmitsBruteForceFlagWhenDisabled() async throws {
+        let runner = MockSubprocessRunner(scripts: [
+            .init(
+                path: "/mock/colmap",
+                argsPrefix: ["matches_importer"],
+                result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""),
+                onRun: { args in
+                    XCTAssertFalse(args.contains("--SiftMatching.cpu_brute_force_matcher"),
+                                   "The brute-force flag must be absent when it is not requested.")
+                }
+            )
+        ])
+
+        let colmap = ColmapRunner(runner: runner)
+        try await colmap.runMatchesImporter(
+            colmapPath: URL(fileURLWithPath: "/mock/colmap"),
+            database: URL(fileURLWithPath: "/tmp/db"),
+            matchListPath: URL(fileURLWithPath: "/tmp/pairs.txt"),
+            matchType: "pairs",
+            options: ColmapOptions(
+                useGPU: false,
+                extractThreads: 1,
+                matchThreads: 1,
+                sequentialOverlap: 5,
+                useBruteForceMatcher: false
+            ),
+            onLog: { _, _ in }
+        )
+    }
+
     func testPointTriangulatorUsesSeedAndOutputPaths() async throws {
         let runner = MockSubprocessRunner(scripts: [
             .init(
