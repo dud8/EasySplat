@@ -1,41 +1,78 @@
+diff --git a/core/metal/msplat_metal.metal b/core/metal/msplat_metal.metal
+index 40965ae..47b29e4 100644
+--- a/core/metal/msplat_metal.metal
++++ b/core/metal/msplat_metal.metal
+@@ -1002,2 +1002,2 @@ kernel void rasterize_backward_kernel(
+-            float3 b_conic, b_xy_opac, b_rgb;
+-            int32_t b_id;
++            float3 b_conic = float3(0.0f), b_xy_opac = float3(0.0f), b_rgb = float3(0.0f);
++            int32_t b_id = 0;
+@@ -2950,2 +2950,2 @@ kernel void rasterize_backward_chunked_kernel(
+-            float3 b_conic, b_xy_opac, b_rgb;
+-            int32_t b_id;
++            float3 b_conic = float3(0.0f), b_xy_opac = float3(0.0f), b_rgb = float3(0.0f);
++            int32_t b_id = 0;
 diff --git a/core/metal/msplat_metal.mm b/core/metal/msplat_metal.mm
+index 791e124..2477337 100644
 --- a/core/metal/msplat_metal.mm
 +++ b/core/metal/msplat_metal.mm
-@@ -12,4 +12,5 @@
- #import <functional>
- #import <array>
- #import <mutex>
+@@ -14,0 +15 @@
 +#include <stdexcept>
- #import <mach/mach_time.h>
-@@ -284,5 +285,8 @@ MetalContext* get_global_context() {
-     if (ctx == NULL) {
-         ctx = init_msplat_metal_context();
-     }
+@@ -174 +175 @@ MetalContext* init_msplat_metal_context() {
+-    MetalContext* ctx = (MetalContext*)malloc(sizeof(MetalContext));
++    MetalContext* ctx = new MetalContext{};
+@@ -176,0 +178,6 @@ MetalContext* init_msplat_metal_context() {
++    if (!device) {
++        fprintf(stderr, "msplat: no Metal device is available\n");
++        delete ctx;
++        return NULL;
++    }
++
+@@ -179,0 +187,5 @@ MetalContext* init_msplat_metal_context() {
++    if (!ctx->queue) {
++        fprintf(stderr, "msplat: failed to create the Metal command queue\n");
++        delete ctx;
++        return NULL;
++    }
+@@ -215 +227 @@ MetalContext* init_msplat_metal_context() {
+-        free(ctx);
++        delete ctx;
+@@ -218,0 +231 @@ MetalContext* init_msplat_metal_context() {
++    bool pipelineLoadFailed = false;
+@@ -222,0 +236 @@ MetalContext* init_msplat_metal_context() {
++            pipelineLoadFailed = true;
+@@ -225 +239,3 @@ MetalContext* init_msplat_metal_context() {
+-        id<MTLComputePipelineState> pso = [ctx->device newComputePipelineStateWithFunction:fn error:&error];
++        NSError *pipelineError = nil;
++        id<MTLComputePipelineState> pso =
++            [ctx->device newComputePipelineStateWithFunction:fn error:&pipelineError];
+@@ -227 +243 @@ MetalContext* init_msplat_metal_context() {
+-        if (error) {
++        if (!pso) {
+@@ -229 +245,3 @@ MetalContext* init_msplat_metal_context() {
+-                    [name UTF8String], [[error description] UTF8String]);
++                    [name UTF8String],
++                    pipelineError ? [[pipelineError description] UTF8String] : "unknown Metal error");
++            pipelineLoadFailed = true;
+@@ -267,0 +286,5 @@ MetalContext* init_msplat_metal_context() {
++    if (pipelineLoadFailed) {
++        fprintf(stderr, "msplat: metallib is missing required Metal pipelines\n");
++        delete ctx;
++        return NULL;
++    }
+@@ -286,0 +310,3 @@ MetalContext* get_global_context() {
 +    if (ctx == NULL) {
 +        throw std::runtime_error("msplat: Metal context initialization failed");
 +    }
-     return ctx;
- }
-diff --git a/core/metal/msplat_metal.metal b/core/metal/msplat_metal.metal
---- a/core/metal/msplat_metal.metal
-+++ b/core/metal/msplat_metal.metal
-@@ -999,8 +999,8 @@
-             // Broadcast batch data from lane 0 → all lanes in SIMD group.
-             // All threads read the same index t, so one threadgroup read +
-             // simd_broadcast replaces 32 redundant threadgroup reads.
--            float3 b_conic, b_xy_opac, b_rgb;
--            int32_t b_id;
-+            float3 b_conic = float3(0.0f), b_xy_opac = float3(0.0f), b_rgb = float3(0.0f);
-+            int32_t b_id = 0;
-             if (wr == 0) {
-                 b_conic = conic_batch[t];
-                 b_xy_opac = xy_opacity_batch[t];
-@@ -2949,6 +2949,6 @@
-         for (int t = max(0, batch_end - warp_bin_final); t < batch_size; ++t) {
--            float3 b_conic, b_xy_opac, b_rgb;
--            int32_t b_id;
-+            float3 b_conic = float3(0.0f), b_xy_opac = float3(0.0f), b_rgb = float3(0.0f);
-+            int32_t b_id = 0;
-             if (wr == 0) {
-                 b_conic = conic_batch[t];
-                 b_xy_opac = xy_opacity_batch[t];
+diff --git a/core/src/loaders/save_gaussians.cpp b/core/src/loaders/save_gaussians.cpp
+index 1111349..1ab144d 100644
+--- a/core/src/loaders/save_gaussians.cpp
++++ b/core/src/loaders/save_gaussians.cpp
+@@ -13 +13,3 @@ void saveGaussianPly(const std::string &path, GaussianParams &p, int step) {
+-    std::ofstream o(path, std::ios::binary);
++    std::ofstream o;
++    o.exceptions(std::ios::failbit | std::ios::badbit);
++    o.open(path, std::ios::binary);
+@@ -53,0 +56,2 @@ void saveGaussianPly(const std::string &path, GaussianParams &p, int step) {
++    o.flush();
++    o.close();

@@ -62,7 +62,7 @@ for forbidden in 'pip install' 'python-build-standalone' 'site-packages' '_core.
   require_absent "$forbidden" "$BUILD_SCRIPT"
 done
 
-for flag in --input --output --num-iters --num-downscales --downscale-factor --seed --eval --events-jsonl --self-check --version --help; do
+for flag in --input --output --num-iters --num-downscales --downscale-factor --seed --eval --events-jsonl --self-check --validate-ply --version --help; do
   require_contains "$flag" "$OVERLAY"
 done
 for event in started progress completed cancellation_requested cancelled self_check; do
@@ -81,8 +81,12 @@ fi
 
 require_contains 'get_global_context' "$UPSTREAM_PATCH"
 require_contains 'runtime_error' "$UPSTREAM_PATCH"
+require_contains 'pipelineLoadFailed' "$UPSTREAM_PATCH"
+require_contains 'std::ios::failbit' "$UPSTREAM_PATCH"
 require_contains 'float3 b_conic = float3(0.0f)' "$UPSTREAM_PATCH"
 require_contains 'int32_t b_id = 0' "$UPSTREAM_PATCH"
+require_contains 'validateBinaryPly' "$OVERLAY"
+require_contains 'cancelIfRequested(events, step)' "$OVERLAY"
 
 if [ "${1:-}" = "--source-only" ]; then
   echo "native msplat source contracts passed"
@@ -113,7 +117,7 @@ expected_files=$'./LICENSE\n./bin/default.metallib\n./bin/easysplat-train\n./bui
 done
 "$BIN" --version | grep -Fq '1.1.3' || fail "CLI version does not report 1.1.3"
 help="$($BIN --help)"
-for flag in --input --output --num-iters --num-downscales --downscale-factor --seed --eval --events-jsonl --self-check --version --help; do
+for flag in --input --output --num-iters --num-downscales --downscale-factor --seed --eval --events-jsonl --self-check --validate-ply --version --help; do
   grep -Fq -- "$flag" <<<"$help" || fail "CLI help is missing $flag"
 done
 
@@ -147,6 +151,65 @@ set -e
 [ "$corrupt_status" -lt 128 ] || fail "corrupt metallib self-check crashed with status $corrupt_status"
 [ ! -s "$negative_dir/corrupt.stdout" ] || fail "corrupt metallib emitted a false success event"
 grep -qi 'metallib' "$negative_dir/corrupt.stderr" || fail "corrupt metallib diagnostic is not useful"
+
+cat >"$negative_dir/incomplete.metal" <<'METAL'
+#include <metal_stdlib>
+using namespace metal;
+kernel void unrelated_kernel(device uint *output [[buffer(0)]], uint index [[thread_position_in_grid]]) {
+  output[index] = index;
+}
+METAL
+xcrun -sdk macosx metal -c "$negative_dir/incomplete.metal" -o "$negative_dir/incomplete.air"
+xcrun -sdk macosx metallib "$negative_dir/incomplete.air" -o "$negative_dir/default.metallib"
+set +e
+"$negative_dir/easysplat-train" --self-check --events-jsonl >"$negative_dir/incomplete.stdout" 2>"$negative_dir/incomplete.stderr"
+incomplete_status=$?
+set -e
+[ "$incomplete_status" -ne 0 ] || fail "incomplete metallib self-check falsely succeeded"
+[ "$incomplete_status" -lt 128 ] || fail "incomplete metallib self-check crashed with status $incomplete_status"
+[ ! -s "$negative_dir/incomplete.stdout" ] || fail "incomplete metallib emitted a false success event"
+grep -Eqi 'kernel|pipeline' "$negative_dir/incomplete.stderr" || fail "incomplete metallib diagnostic is not useful"
+
+valid_ply="$negative_dir/valid.ply"
+{
+  printf '%s\n' \
+    'ply' \
+    'format binary_little_endian 1.0' \
+    'element vertex 1' \
+    'property float x' \
+    'property float y' \
+    'property float z' \
+    'property float nx' \
+    'property float ny' \
+    'property float nz' \
+    'property float f_dc_0' \
+    'property float f_dc_1' \
+    'property float f_dc_2' \
+    'property float opacity' \
+    'property float scale_0' \
+    'property float scale_1' \
+    'property float scale_2' \
+    'property float rot_0' \
+    'property float rot_1' \
+    'property float rot_2' \
+    'property float rot_3' \
+    'end_header'
+  dd if=/dev/zero bs=68 count=1 2>/dev/null
+} >"$valid_ply"
+"$BIN" --validate-ply "$valid_ply" --events-jsonl >"$negative_dir/valid-ply.stdout" 2>"$negative_dir/valid-ply.stderr"
+require_contains '"event":"output_validation"' "$negative_dir/valid-ply.stdout"
+require_contains '"status":"ok"' "$negative_dir/valid-ply.stdout"
+
+truncated_ply="$negative_dir/truncated.ply"
+cp "$valid_ply" "$truncated_ply"
+truncate -s -4 "$truncated_ply"
+set +e
+"$BIN" --validate-ply "$truncated_ply" --events-jsonl >"$negative_dir/truncated-ply.stdout" 2>"$negative_dir/truncated-ply.stderr"
+truncated_status=$?
+set -e
+[ "$truncated_status" -ne 0 ] || fail "truncated PLY validation falsely succeeded"
+[ ! -s "$negative_dir/truncated-ply.stdout" ] || fail "truncated PLY emitted a false success event"
+grep -qi 'payload' "$negative_dir/truncated-ply.stderr" || fail "truncated PLY diagnostic is not useful"
 
 for key in source_commit source_version source_url source_tree_sha256 overlay_sha256 patch_sha256 executable_sha256 metallib_sha256 compiler deployment_target cmake_arguments build_timestamp; do
   require_contains "\"$key\"" "$BUILD_INFO"

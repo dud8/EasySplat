@@ -10,10 +10,14 @@
 #include <cstring>
 #include <filesystem>
 #include <fcntl.h>
+#include <fstream>
 #include <iostream>
+#include <limits>
 #include <numeric>
+#include <optional>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <unistd.h>
 #include <vector>
 
@@ -90,7 +94,78 @@ void syncDirectory(const fs::path &path) {
     if (::close(descriptor) != 0) throwSystemError("cannot close directory", path);
 }
 
-void savePlyAtomically(Model &model, const fs::path &output, int step) {
+struct PlyValidation {
+    std::uint64_t vertices;
+    std::uint64_t properties;
+    std::uintmax_t bytes;
+};
+
+PlyValidation validateBinaryPly(const fs::path &path) {
+    std::ifstream input(path, std::ios::binary);
+    if (!input.is_open()) throw std::runtime_error("cannot open PLY for validation");
+
+    std::string line;
+    if (!std::getline(input, line) || line != "ply") {
+        throw std::runtime_error("PLY header is missing the magic line");
+    }
+    if (!std::getline(input, line) || line != "format binary_little_endian 1.0") {
+        throw std::runtime_error("PLY must use binary_little_endian 1.0");
+    }
+
+    std::uint64_t vertices = 0;
+    std::uint64_t properties = 0;
+    bool sawVertexElement = false;
+    bool sawEndHeader = false;
+    for (int headerLine = 0; headerLine < 512 && std::getline(input, line); ++headerLine) {
+        constexpr std::string_view vertexPrefix = "element vertex ";
+        if (line.rfind(vertexPrefix, 0) == 0) {
+            if (sawVertexElement) throw std::runtime_error("PLY has duplicate vertex elements");
+            const std::string count = line.substr(vertexPrefix.size());
+            std::size_t parsed = 0;
+            try {
+                vertices = std::stoull(count, &parsed);
+            } catch (const std::exception &) {
+                throw std::runtime_error("PLY vertex count is invalid");
+            }
+            if (parsed != count.size() || vertices == 0) {
+                throw std::runtime_error("PLY vertex count is invalid");
+            }
+            sawVertexElement = true;
+        } else if (sawVertexElement && line.rfind("property float ", 0) == 0) {
+            ++properties;
+        } else if (line == "end_header") {
+            sawEndHeader = true;
+            break;
+        }
+        const auto position = input.tellg();
+        if (position < 0 || position > 65536) {
+            throw std::runtime_error("PLY header is unreasonably large");
+        }
+    }
+
+    if (!sawEndHeader || !sawVertexElement || properties < 17) {
+        throw std::runtime_error("PLY vertex layout is incomplete");
+    }
+    const auto payloadOffsetPosition = input.tellg();
+    if (payloadOffsetPosition < 0) throw std::runtime_error("PLY payload offset is invalid");
+    const auto payloadOffset = static_cast<std::uintmax_t>(payloadOffsetPosition);
+    constexpr std::uintmax_t floatBytes = sizeof(float);
+    if (properties > std::numeric_limits<std::uintmax_t>::max() / floatBytes) {
+        throw std::runtime_error("PLY payload size overflows");
+    }
+    const std::uintmax_t rowBytes = properties * floatBytes;
+    if (vertices > (std::numeric_limits<std::uintmax_t>::max() - payloadOffset) / rowBytes) {
+        throw std::runtime_error("PLY payload size overflows");
+    }
+    const std::uintmax_t expectedBytes = payloadOffset + vertices * rowBytes;
+    const std::uintmax_t actualBytes = fs::file_size(path);
+    if (actualBytes != expectedBytes) {
+        throw std::runtime_error("PLY payload length does not match its header");
+    }
+    return {vertices, properties, actualBytes};
+}
+
+bool savePlyAtomically(Model &model, const fs::path &output, int step, EventWriter &events) {
     fs::path parent = output.parent_path();
     if (parent.empty()) parent = fs::current_path();
     fs::create_directories(parent);
@@ -105,11 +180,17 @@ void savePlyAtomically(Model &model, const fs::path &output, int step) {
         if (!fs::is_regular_file(temporary) || fs::file_size(temporary) == 0) {
             throw std::runtime_error("msplat produced an empty PLY");
         }
+        validateBinaryPly(temporary);
         syncFile(temporary);
+        if (cancelIfRequested(events, step)) {
+            fs::remove(temporary, ignored);
+            return false;
+        }
         if (::rename(temporary.c_str(), output.c_str()) != 0) {
             throwSystemError("cannot atomically replace", output);
         }
         syncDirectory(parent);
+        return true;
     } catch (...) {
         fs::remove(temporary, ignored);
         throw;
@@ -123,10 +204,16 @@ struct EvaluationMetrics {
     int views = 0;
 };
 
-EvaluationMetrics evaluate(Model &model, std::vector<Camera> &cameras, int step) {
+std::optional<EvaluationMetrics> evaluate(
+    Model &model,
+    std::vector<Camera> &cameras,
+    int step,
+    EventWriter &events
+) {
     EvaluationMetrics metrics;
     metrics.views = static_cast<int>(cameras.size());
     for (Camera &camera : cameras) {
+        if (cancelIfRequested(events, step)) return std::nullopt;
         MTensor rendered = model.render(camera, step);
         msplat_gpu_sync();
         MTensor renderedCpu = rendered.cpu();
@@ -134,6 +221,7 @@ EvaluationMetrics evaluate(Model &model, std::vector<Camera> &cameras, int step)
         metrics.psnr += psnr(renderedCpu, targetCpu);
         metrics.ssim += ssim_eval(renderedCpu, targetCpu);
         metrics.l1 += l1_loss(renderedCpu, targetCpu);
+        if (cancelIfRequested(events, step)) return std::nullopt;
     }
     if (metrics.views > 0) {
         metrics.psnr /= metrics.views;
@@ -159,6 +247,7 @@ int main(int argc, char *argv[]) {
     bool evalMode = false;
     bool eventsJsonl = false;
     bool selfCheck = false;
+    std::string plyToValidate;
 
     app.add_option("--input", inputPath, "COLMAP dataset directory");
     app.add_option("--output", outputPath, "Final PLY output path");
@@ -172,6 +261,8 @@ int main(int argc, char *argv[]) {
     app.add_flag("--eval", evalMode, "Hold out every eighth camera for evaluation");
     app.add_flag("--events-jsonl", eventsJsonl, "Reserve stdout for schema-v1 JSONL events");
     app.add_flag("--self-check", selfCheck, "Initialize Metal and load the adjacent metallib");
+    app.add_option("--validate-ply", plyToValidate, "Validate a binary Gaussian PLY")
+        ->check(CLI::ExistingFile);
 
     CLI11_PARSE(app, argc, argv);
 
@@ -181,6 +272,14 @@ int main(int argc, char *argv[]) {
     EventWriter events(eventsJsonl, jsonOutput);
 
     try {
+        if (!plyToValidate.empty()) {
+            const PlyValidation validation = validateBinaryPly(plyToValidate);
+            events.emit("output_validation", {{"output_bytes", validation.bytes},
+                                               {"status", "ok"},
+                                               {"vertex_count", validation.vertices}});
+            if (!eventsJsonl) std::cout << "PLY validation passed\n";
+            return 0;
+        }
         if (selfCheck) {
             if (msplat_device() == nullptr) {
                 throw std::runtime_error("Metal device initialization returned null");
@@ -275,10 +374,16 @@ int main(int argc, char *argv[]) {
             }
         }
 
+        if (cancelIfRequested(events, numIterations)) return 130;
         EvaluationMetrics metrics;
-        if (evalMode) metrics = evaluate(model, testCameras, numIterations);
+        if (evalMode) {
+            const auto evaluation = evaluate(model, testCameras, numIterations, events);
+            if (!evaluation) return 130;
+            metrics = *evaluation;
+        }
+        if (cancelIfRequested(events, numIterations)) return 130;
 
-        savePlyAtomically(model, outputPath, numIterations);
+        if (!savePlyAtomically(model, outputPath, numIterations, events)) return 130;
         const std::uintmax_t outputBytes = fs::file_size(outputPath);
         const double elapsed = std::chrono::duration<double>(
             std::chrono::steady_clock::now() - startedAt).count();

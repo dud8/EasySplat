@@ -137,8 +137,8 @@ prepare_source() {
 
   SOURCE_TREE_SHA256="$(git -C "$SOURCE_DIR" ls-tree -r --full-tree "$MSPLAT_COMMIT" | shasum -a 256 | awk '{print $1}')"
   cp "$OVERLAY" "$SOURCE_DIR/cli/msplat.cpp"
-  git -C "$SOURCE_DIR" apply --check "$UPSTREAM_PATCH"
-  git -C "$SOURCE_DIR" apply "$UPSTREAM_PATCH"
+  git -C "$SOURCE_DIR" apply --unidiff-zero --check "$UPSTREAM_PATCH"
+  git -C "$SOURCE_DIR" apply --unidiff-zero "$UPSTREAM_PATCH"
 }
 
 configure_and_build() {
