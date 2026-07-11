@@ -1099,6 +1099,11 @@ final class PipelineIntegrationTests: XCTestCase {
             "fastvggt",
             "The scoped backend override must remain live until the pipeline finishes."
         )
+        XCTAssertEqual(
+            RuntimeEnvironment.current["EASYSPLAT_SFM_BACKEND"],
+            "fastvggt",
+            "The full environment snapshot must agree with its authoritative keyed lookup."
+        )
 
         await XCTAssertThrowsErrorAsync({
             try await pipeline.run { _ in }
