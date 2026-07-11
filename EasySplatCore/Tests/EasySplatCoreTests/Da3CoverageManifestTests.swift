@@ -143,5 +143,94 @@ final class Da3CoverageManifestTests: XCTestCase {
         let issues = manifest.validationIssues(expectedMode: .direct, selectedImageCount: 5)
         XCTAssertTrue(issues.contains(where: { $0.contains("native_colmap_export") }))
     }
+
+    func testValidationAcceptsCompleteAlignedPoseSeedWithoutPointClaims() throws {
+        let root = try TestFileBuilder.makeTempDir()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let manifestURL = root.appendingPathComponent("da3_coverage_manifest.json")
+        try """
+        {
+          "mode": "seed_refine",
+          "requested_device": "mps",
+          "selected_device": "mps",
+          "model_subdir": "DA3-BASE",
+          "fallback_model_subdir": "DA3-SMALL",
+          "process_res": 504,
+          "camera_type": "PINHOLE",
+          "shared_camera": false,
+          "max_points": 120000,
+          "total_images": 7,
+          "window_size": 4,
+          "window_overlap": 3,
+          "input_ordering": "continuous",
+          "windows": [
+            { "start": 0, "end": 4, "images": ["a.jpg", "b.jpg", "c.jpg", "d.jpg"], "indices": [0, 1, 2, 3] },
+            { "start": 1, "end": 5, "images": ["b.jpg", "c.jpg", "d.jpg", "e.jpg"], "indices": [1, 2, 3, 4] },
+            { "start": 2, "end": 6, "images": ["c.jpg", "d.jpg", "e.jpg", "f.jpg"], "indices": [2, 3, 4, 5] },
+            { "start": 3, "end": 7, "images": ["d.jpg", "e.jpg", "f.jpg", "g.jpg"], "indices": [3, 4, 5, 6] }
+          ],
+          "registered_image_count": 7,
+          "native_colmap_export": false,
+          "export_strategy": "aligned_pose_seed",
+          "anchor_image_names": ["a.jpg", "b.jpg", "c.jpg"],
+          "alignment_edge_count": 3,
+          "max_alignment_rmse": 0.018,
+          "alignment_complete": true
+        }
+        """.write(to: manifestURL, atomically: true, encoding: .utf8)
+
+        let manifest = try Da3CoverageManifest.load(from: manifestURL)
+        XCTAssertEqual(manifest.inputOrdering, "continuous")
+        XCTAssertEqual(manifest.alignmentEdgeCount, 3)
+        XCTAssertEqual(manifest.maxAlignmentRMSE, 0.018)
+        XCTAssertEqual(manifest.alignmentComplete, true)
+        XCTAssertTrue(manifest.validationIssues(expectedMode: .seedRefine, selectedImageCount: 7).isEmpty)
+        let pairs = manifest.boundedMatchPairs
+        XCTAssertEqual(pairs.count, 15)
+        XCTAssertTrue(pairs.contains("a.jpg d.jpg"))
+        XCTAssertFalse(pairs.contains("a.jpg g.jpg"))
+    }
+
+    func testValidationRejectsIncompleteAlignedSeedAndFakePointCounts() throws {
+        let root = try TestFileBuilder.makeTempDir()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let manifestURL = root.appendingPathComponent("da3_coverage_manifest.json")
+        try """
+        {
+          "mode": "seed_refine",
+          "requested_device": "mps",
+          "selected_device": "mps",
+          "model_subdir": "DA3-BASE",
+          "process_res": 504,
+          "camera_type": "PINHOLE",
+          "shared_camera": false,
+          "max_points": 120000,
+          "total_images": 5,
+          "window_size": 4,
+          "window_overlap": 3,
+          "input_ordering": "unordered",
+          "windows": [
+            { "start": 0, "end": 4, "images": ["a.jpg", "b.jpg", "c.jpg", "d.jpg"], "indices": [0, 1, 2, 3] }
+          ],
+          "registered_image_count": 4,
+          "native_colmap_export": false,
+          "export_strategy": "aligned_pose_seed",
+          "anchor_image_names": [],
+          "alignment_edge_count": 0,
+          "max_alignment_rmse": 0.0,
+          "alignment_complete": false,
+          "raw_point_sample_count": 10,
+          "fused_sparse_point_count": 10,
+          "final_observation_count": 20
+        }
+        """.write(to: manifestURL, atomically: true, encoding: .utf8)
+
+        let manifest = try Da3CoverageManifest.load(from: manifestURL)
+        let issues = manifest.validationIssues(expectedMode: .seedRefine, selectedImageCount: 5)
+        XCTAssertTrue(issues.contains(where: { $0.contains("complete image coverage") }))
+        XCTAssertTrue(issues.contains(where: { $0.contains("alignment_complete") }))
+        XCTAssertTrue(issues.contains(where: { $0.contains("anchor_image_names") }))
+        XCTAssertTrue(issues.contains(where: { $0.contains("must not claim sparse points") }))
+    }
 }
 #endif

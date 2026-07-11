@@ -84,6 +84,18 @@ extension PipelineRunner {
         boolEnvValue("EASYSPLAT_DA3_SHARED_CAMERA", default: input.hasVideos)
     }
 
+    func da3ResolvedInputOrdering(requested: InputOrdering, input: InputSpec) -> InputOrdering {
+        if requested != .automatic {
+            return requested
+        }
+        switch input {
+        case .video:
+            return .continuous
+        case .photos, .mixed:
+            return .unordered
+        }
+    }
+
     func da3WindowSizePreference(hardwareTier: HardwareProfile.Tier) -> Int {
         if let override = intEnvValue("EASYSPLAT_DA3_WINDOW_SIZE"), override > 0 {
             return override

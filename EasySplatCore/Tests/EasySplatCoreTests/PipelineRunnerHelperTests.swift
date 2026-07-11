@@ -2,6 +2,35 @@ import XCTest
 @testable import EasySplatCore
 
 final class PipelineRunnerHelperTests: XCTestCase {
+    func testDa3AutomaticInputOrderingUsesCaptureTopology() throws {
+        let root = try TestFileBuilder.makeTempDir()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let runner = makeRunner(projectURL: root)
+
+        XCTAssertEqual(
+            runner.test_da3ResolvedInputOrdering(requested: .automatic, input: .video(files: ["clip.mov"])),
+            .continuous
+        )
+        XCTAssertEqual(
+            runner.test_da3ResolvedInputOrdering(requested: .automatic, input: .photos(folder: "/photos")),
+            .unordered
+        )
+        XCTAssertEqual(
+            runner.test_da3ResolvedInputOrdering(
+                requested: .automatic,
+                input: .mixed(videos: ["clip.mov"], photosFolder: "/photos")
+            ),
+            .unordered
+        )
+        XCTAssertEqual(
+            runner.test_da3ResolvedInputOrdering(
+                requested: .continuous,
+                input: .mixed(videos: ["clip.mov"], photosFolder: "/photos")
+            ),
+            .continuous
+        )
+    }
+
     func testDownsampleFramesEdgeCases() throws {
         let root = try TestFileBuilder.makeTempDir()
         defer { try? FileManager.default.removeItem(at: root) }

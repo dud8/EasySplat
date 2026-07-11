@@ -387,6 +387,10 @@ extension PipelineRunner {
         mapAnythingSharedCameraPreference(input: input)
     }
 
+    func test_da3ResolvedInputOrdering(requested: InputOrdering, input: InputSpec) -> InputOrdering {
+        da3ResolvedInputOrdering(requested: requested, input: input)
+    }
+
     func test_mapAnythingResolutionPreference() -> Int {
         mapAnythingResolutionPreference()
     }

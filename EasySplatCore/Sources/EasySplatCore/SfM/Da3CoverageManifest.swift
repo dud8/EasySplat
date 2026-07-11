@@ -5,6 +5,7 @@ struct Da3CoverageManifest: Codable, Sendable {
         var start: Int
         var end: Int
         var images: [String]
+        var indices: [Int]? = nil
     }
 
     var mode: String
@@ -27,6 +28,11 @@ struct Da3CoverageManifest: Codable, Sendable {
     var registeredImageCount: Int?
     var nativeColmapExport: Bool?
     var exportStrategy: String?
+    var inputOrdering: String? = nil
+    var anchorImageNames: [String]? = nil
+    var alignmentEdgeCount: Int? = nil
+    var maxAlignmentRMSE: Double? = nil
+    var alignmentComplete: Bool? = nil
 
     enum CodingKeys: String, CodingKey {
         case mode
@@ -49,6 +55,11 @@ struct Da3CoverageManifest: Codable, Sendable {
         case registeredImageCount = "registered_image_count"
         case nativeColmapExport = "native_colmap_export"
         case exportStrategy = "export_strategy"
+        case inputOrdering = "input_ordering"
+        case anchorImageNames = "anchor_image_names"
+        case alignmentEdgeCount = "alignment_edge_count"
+        case maxAlignmentRMSE = "max_alignment_rmse"
+        case alignmentComplete = "alignment_complete"
     }
 
     static func load(from url: URL) throws -> Da3CoverageManifest {
@@ -74,7 +85,17 @@ struct Da3CoverageManifest: Codable, Sendable {
             if window.end > selectedImageCount {
                 issues.append("window[\(index)] end \(window.end) exceeded selected frames \(selectedImageCount)")
             }
-            if window.images.count != max(0, window.end - window.start) {
+            if let indices = window.indices {
+                if indices.count != window.images.count {
+                    issues.append("window[\(index)] indices count \(indices.count) did not match images count \(window.images.count)")
+                }
+                if Set(indices).count != indices.count {
+                    issues.append("window[\(index)] contained duplicate image indices")
+                }
+                if indices.contains(where: { $0 < 0 || $0 >= selectedImageCount }) {
+                    issues.append("window[\(index)] contained an out-of-range image index")
+                }
+            } else if window.images.count != max(0, window.end - window.start) {
                 issues.append("window[\(index)] images count \(window.images.count) did not match range length \(max(0, window.end - window.start))")
             }
         }
@@ -89,6 +110,48 @@ struct Da3CoverageManifest: Codable, Sendable {
            let exportStrategy,
            exportStrategy != "native_colmap" {
             issues.append("direct mode requires export_strategy=native_colmap")
+        }
+        if expectedMode == .seedRefine {
+            if nativeColmapExport != false {
+                issues.append("seed_refine requires native_colmap_export=false")
+            }
+            if exportStrategy != "aligned_pose_seed" {
+                issues.append("seed_refine requires export_strategy=aligned_pose_seed")
+            }
+            if registeredImageCount != selectedImageCount {
+                issues.append("seed_refine requires complete image coverage: registered_image_count must equal \(selectedImageCount)")
+            }
+            let coveredImages = Set(windows.flatMap(\.images))
+            if coveredImages.count != selectedImageCount {
+                issues.append("seed_refine requires complete image coverage across windows")
+            }
+            let anchors = anchorImageNames ?? []
+            if anchors.count < 3 || Set(anchors).count != anchors.count {
+                issues.append("seed_refine requires at least three distinct anchor_image_names")
+            } else if !Set(anchors).isSubset(of: coveredImages) {
+                issues.append("seed_refine anchor_image_names must belong to covered images")
+            }
+            if inputOrdering != InputOrdering.continuous.rawValue,
+               inputOrdering != InputOrdering.unordered.rawValue {
+                issues.append("seed_refine input_ordering must resolve to continuous or unordered")
+            }
+            if alignmentComplete != true {
+                issues.append("seed_refine requires alignment_complete=true")
+            }
+            let requiredEdges = max(0, windows.count - 1)
+            if alignmentEdgeCount != requiredEdges {
+                issues.append("seed_refine alignment_edge_count must equal \(requiredEdges)")
+            }
+            if let maxAlignmentRMSE {
+                if !maxAlignmentRMSE.isFinite || maxAlignmentRMSE < 0 || maxAlignmentRMSE > 0.05 {
+                    issues.append("seed_refine max_alignment_rmse must be finite and no greater than 0.05")
+                }
+            } else {
+                issues.append("seed_refine requires max_alignment_rmse")
+            }
+            if rawPointSampleCount != nil || fusedSparsePointCount != nil || finalObservationCount != nil || meanTrackLength != nil {
+                issues.append("aligned pose seed must not claim sparse points, observations, or track length")
+            }
         }
         if let rawPointSampleCount, rawPointSampleCount <= 0 {
             issues.append("raw_point_sample_count must be > 0")
@@ -129,6 +192,26 @@ struct Da3CoverageManifest: Codable, Sendable {
         if let meanTrackLength {
             parts.append("mean track length \(String(format: "%.2f", meanTrackLength))")
         }
+        if let maxAlignmentRMSE {
+            parts.append("alignment RMSE \(String(format: "%.4f", maxAlignmentRMSE))")
+        }
         return parts.joined(separator: ", ")
+    }
+
+    var boundedMatchPairs: [String] {
+        var pairs = Set<String>()
+        for window in windows {
+            guard window.images.count >= 2 else { continue }
+            for firstIndex in 0..<(window.images.count - 1) {
+                for secondIndex in (firstIndex + 1)..<window.images.count {
+                    let first = window.images[firstIndex]
+                    let second = window.images[secondIndex]
+                    guard first != second else { continue }
+                    let ordered = first < second ? "\(first) \(second)" : "\(second) \(first)"
+                    pairs.insert(ordered)
+                }
+            }
+        }
+        return pairs.sorted()
     }
 }

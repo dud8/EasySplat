@@ -1132,6 +1132,8 @@ final class PipelineIntegrationTests: XCTestCase {
         let restore = await scopedPipelineEnvironment([
             "EASYSPLAT_SFM_BACKEND": nil,
             "EASYSPLAT_SFM_MAPPER": nil,
+            "EASYSPLAT_DA3_WINDOW_SIZE": "4",
+            "EASYSPLAT_DA3_WINDOW_OVERLAP": "3",
             "EASYSPLAT_SKIP_TRAINING": "1"
         ])
         defer { restore() }
@@ -1140,7 +1142,7 @@ final class PipelineIntegrationTests: XCTestCase {
         let projectURL = temp.appendingPathComponent("Da3Cancel.easysplatproj", isDirectory: true)
         let sourcePhotos = temp.appendingPathComponent("SourcePhotos", isDirectory: true)
         try FileManager.default.createDirectory(at: sourcePhotos, withIntermediateDirectories: true)
-        for index in 0..<2 {
+        for index in 0..<10 {
             try writeTestImage(url: sourcePhotos.appendingPathComponent("img\(index).jpg"), value: UInt8(index % 255))
         }
 
@@ -1170,6 +1172,8 @@ final class PipelineIntegrationTests: XCTestCase {
 
         let callPaths = runner.calls.map { $0.0 }
         XCTAssertEqual(callPaths.filter { $0 == toolchain.da3.sfmTool.path }.count, 1)
+        let da3Args = runner.calls.first(where: { $0.0 == toolchain.da3.sfmTool.path })?.1 ?? []
+        XCTAssertEqual(value(for: "--mode", in: da3Args), "seed_refine")
         XCTAssertFalse(callPaths.contains(toolchain.mapanything.sfmTool.path))
         XCTAssertFalse(callPaths.contains(toolchain.colmap.path))
         let interruptedMetadata = try ProjectMetadataStore.load(from: paths.metadataURL)
@@ -1281,6 +1285,82 @@ final class PipelineIntegrationTests: XCTestCase {
         XCTAssertTrue(runner.calls.contains(where: { $0.0 == toolchain.colmap.path && $0.1.first == "model_analyzer" }))
         XCTAssertFalse(runner.calls.contains(where: { $0.0 == toolchain.colmap.path && $0.1.first == "point_triangulator" }))
         XCTAssertFalse(runner.calls.contains(where: { $0.0 == toolchain.colmap.path && $0.1.first == "global_mapper" }))
+    }
+
+    func testPipelineOversizedDa3SeedRunsBoundedRefinementBeforeAcceptance() async throws {
+        let restore = await scopedPipelineEnvironment([
+            "EASYSPLAT_SFM_BACKEND": nil,
+            "EASYSPLAT_SFM_MAPPER": nil,
+            "EASYSPLAT_DA3_WINDOW_SIZE": "4",
+            "EASYSPLAT_DA3_WINDOW_OVERLAP": "3",
+            "EASYSPLAT_SKIP_TRAINING": "1"
+        ])
+        defer { restore() }
+
+        let temp = makeTempRoot()
+        let projectURL = temp.appendingPathComponent("Da3AlignedSeed.easysplatproj", isDirectory: true)
+        let sourcePhotos = temp.appendingPathComponent("SourcePhotos", isDirectory: true)
+        try FileManager.default.createDirectory(at: sourcePhotos, withIntermediateDirectories: true)
+        for index in 0..<10 {
+            try writeTestImage(url: sourcePhotos.appendingPathComponent("img\(index).jpg"), value: UInt8(index))
+        }
+
+        let metadata = ProjectMetadata(
+            title: "Da3AlignedSeed",
+            input: .photos(folder: sourcePhotos.path),
+            preset: PresetSpec(mode: .object, quality: .draft),
+            requestedRunOptions: RequestedRunOptions(inputOrdering: .automatic)
+        )
+        let paths = ProjectPaths(root: projectURL)
+        try paths.ensureDirectories()
+        try ProjectMetadataStore.save(metadata, to: paths.metadataURL)
+
+        let toolchain = try makeToolchain(root: temp, createDa3Files: true)
+        let runner = MockSubprocessRunner(scripts: [
+            .init(path: toolchain.da3.sfmTool.path, argsPrefix: ["--images"], result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""), onRun: { args in
+                try? self.writeDa3RunArtifacts(for: args)
+            }),
+            .init(path: toolchain.colmap.path, argsPrefix: ["feature_extractor"], result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""), onRun: nil),
+            .init(path: toolchain.colmap.path, argsPrefix: ["matches_importer"], result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""), onRun: nil),
+            .init(path: toolchain.colmap.path, argsPrefix: ["point_triangulator"], result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""), onRun: { args in
+                guard let output = self.value(for: "--output_path", in: args) else { return }
+                try? self.writeSparseModel(at: URL(fileURLWithPath: output), imageName: "img0.jpg")
+            }),
+            .init(path: toolchain.colmap.path, argsPrefix: ["bundle_adjuster"], result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""), onRun: { args in
+                guard let output = self.value(for: "--output_path", in: args) else { return }
+                try? self.writeSparseModel(at: URL(fileURLWithPath: output), imageName: "img0.jpg")
+            }),
+            .init(
+                path: toolchain.colmap.path,
+                argsPrefix: ["model_analyzer"],
+                result: .init(
+                    exitCode: 0,
+                    terminationReason: .exit,
+                    stdout: "Registered images: 10 / 10\nPoints: 16000\nObservations: 32000\nMean track length: 2.0\nMean reprojection error: 0.8\n",
+                    stderr: ""
+                ),
+                onRun: nil
+            )
+        ])
+
+        let pipeline = PipelineRunner(
+            projectURL: projectURL,
+            config: .init(toolchain: toolchain, preset: metadata.preset),
+            tooling: .init(runner: runner)
+        )
+        try await pipeline.run { _ in }
+
+        let da3Args = try XCTUnwrap(runner.calls.first(where: { $0.0 == toolchain.da3.sfmTool.path })?.1)
+        XCTAssertEqual(value(for: "--mode", in: da3Args), "seed_refine")
+        XCTAssertEqual(value(for: "--input-ordering", in: da3Args), "unordered")
+        let commands = runner.calls.filter { $0.0 == toolchain.colmap.path }.compactMap { $0.1.first }
+        XCTAssertEqual(commands, ["feature_extractor", "matches_importer", "point_triangulator", "bundle_adjuster", "model_analyzer"])
+        XCTAssertFalse(commands.contains("global_mapper"))
+        XCTAssertFalse(commands.contains("mapper"))
+
+        let finished = try ProjectMetadataStore.load(from: paths.metadataURL)
+        XCTAssertEqual(finished.reconstruction?.mapper, "da3-refined")
+        XCTAssertEqual(finished.reconstruction?.meanReprojectionError, 0.8)
     }
 
     func testPipelineDefaultDa3ProducesFinalPly() async throws {
@@ -2986,21 +3066,40 @@ final class PipelineIntegrationTests: XCTestCase {
         let totalImages = imageNames.count
         let pointCount = max(16_000, totalImages * 500)
         let observationsPerPoint = max(1, min(2, totalImages))
-        try writeDa3SparseModel(
-            at: URL(fileURLWithPath: out),
-            imageNames: imageNames.isEmpty ? [imageName] : imageNames,
-            pointCount: pointCount
-        )
         let requestedWindowSize = Int(value(for: "--window-size", in: args) ?? "") ?? max(2, totalImages)
         let requestedWindowOverlap = Int(value(for: "--window-overlap", in: args) ?? "") ?? 0
         let effectiveWindowSize = max(2, min(totalImages, requestedWindowSize))
         let effectiveWindowOverlap = max(0, min(requestedWindowOverlap, effectiveWindowSize - 1))
-        let windows = planMapAnythingWindows(
-            imageCount: totalImages,
-            windowSize: effectiveWindowSize,
-            windowOverlap: effectiveWindowOverlap
-        )
-        let nativeColmapExport = totalImages <= effectiveWindowSize
+        let inputOrdering = value(for: "--input-ordering", in: args) ?? "automatic"
+        let nativeColmapExport = mode == "direct"
+        let windowIndices: [[Int]]
+        if mode == "seed_refine", inputOrdering == "unordered", totalImages > effectiveWindowSize {
+            let anchors = [0, 1, 2]
+            windowIndices = [Array(0..<effectiveWindowSize)] + stride(
+                from: effectiveWindowSize,
+                to: totalImages,
+                by: max(1, effectiveWindowSize - anchors.count)
+            ).map { start in anchors + Array(start..<min(totalImages, start + effectiveWindowSize - anchors.count)) }
+        } else {
+            windowIndices = planMapAnythingWindows(
+                imageCount: totalImages,
+                windowSize: effectiveWindowSize,
+                windowOverlap: effectiveWindowOverlap
+            ).map { Array($0.0..<$0.1) }
+        }
+
+        if mode == "seed_refine" {
+            try writeDa3PoseSeed(
+                at: URL(fileURLWithPath: out),
+                imageNames: imageNames.isEmpty ? [imageName] : imageNames
+            )
+        } else {
+            try writeDa3SparseModel(
+                at: URL(fileURLWithPath: out),
+                imageNames: imageNames.isEmpty ? [imageName] : imageNames,
+                pointCount: pointCount
+            )
+        }
 
         let manifest = Da3CoverageManifest(
             mode: mode,
@@ -3015,24 +3114,49 @@ final class PipelineIntegrationTests: XCTestCase {
             totalImages: totalImages,
             windowSize: effectiveWindowSize,
             windowOverlap: effectiveWindowOverlap,
-            windows: windows.map { (start, end) in
+            windows: windowIndices.map { indices in
                 Da3CoverageManifest.Window(
-                    start: start,
-                    end: end,
-                    images: Array(imageNames[start..<end])
+                    start: indices.min() ?? 0,
+                    end: (indices.max() ?? -1) + 1,
+                    images: indices.map { imageNames[$0] },
+                    indices: indices
                 )
             },
-            rawPointSampleCount: pointCount,
-            fusedSparsePointCount: pointCount,
-            finalObservationCount: pointCount * observationsPerPoint,
-            meanTrackLength: Double(observationsPerPoint),
+            rawPointSampleCount: mode == "direct" ? pointCount : nil,
+            fusedSparsePointCount: mode == "direct" ? pointCount : nil,
+            finalObservationCount: mode == "direct" ? pointCount * observationsPerPoint : nil,
+            meanTrackLength: mode == "direct" ? Double(observationsPerPoint) : nil,
             registeredImageCount: totalImages,
             nativeColmapExport: nativeColmapExport,
-            exportStrategy: nativeColmapExport ? "native_colmap" : "unsupported_non_native_colmap"
+            exportStrategy: nativeColmapExport ? "native_colmap" : "aligned_pose_seed",
+            inputOrdering: mode == "direct" ? inputOrdering : (inputOrdering == "automatic" ? "unordered" : inputOrdering),
+            anchorImageNames: mode == "seed_refine" ? Array(imageNames.prefix(3)) : nil,
+            alignmentEdgeCount: mode == "seed_refine" ? max(0, windowIndices.count - 1) : nil,
+            maxAlignmentRMSE: mode == "seed_refine" ? 0.01 : nil,
+            alignmentComplete: mode == "seed_refine" ? true : nil
         )
 
         let data = try JSONEncoder().encode(manifest)
         try data.write(to: URL(fileURLWithPath: manifestPath), options: [.atomic])
+    }
+
+    private func writeDa3PoseSeed(at modelURL: URL, imageNames: [String]) throws {
+        try FileManager.default.createDirectory(at: modelURL, withIntermediateDirectories: true)
+        try "1 SIMPLE_PINHOLE 640 480 500 320 240\n"
+            .write(to: modelURL.appendingPathComponent("cameras.txt"), atomically: true, encoding: .utf8)
+        let imagesText = imageNames.enumerated()
+            .map { offset, name in "\(offset + 1) 1 0 0 0 0 0 0 1 \(name)\n" }
+            .joined(separator: "\n")
+        try (imagesText + "\n").write(
+            to: modelURL.appendingPathComponent("images.txt"),
+            atomically: true,
+            encoding: .utf8
+        )
+        try "# Number of points: 0\n".write(
+            to: modelURL.appendingPathComponent("points3D.txt"),
+            atomically: true,
+            encoding: .utf8
+        )
     }
 
     private func writeDa3SparseModel(at modelURL: URL, imageNames: [String], pointCount: Int) throws {

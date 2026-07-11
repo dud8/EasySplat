@@ -24,6 +24,7 @@ final class Da3SfmRunnerTests: XCTestCase {
             maxPoints: 123_456,
             cameraType: "PINHOLE",
             sharedCamera: true,
+            inputOrdering: .continuous,
             windowSize: 6,
             windowOverlap: 2,
             coverageManifestPath: coverageManifest
@@ -57,6 +58,7 @@ final class Da3SfmRunnerTests: XCTestCase {
         XCTAssertEqual(value(after: "--process-res", in: capturedArgs), "504")
         XCTAssertEqual(value(after: "--max-points", in: capturedArgs), "123456")
         XCTAssertEqual(value(after: "--camera-type", in: capturedArgs), "PINHOLE")
+        XCTAssertEqual(value(after: "--input-ordering", in: capturedArgs), "continuous")
         XCTAssertTrue(capturedArgs.contains("--shared-camera"))
         XCTAssertEqual(value(after: "--manifest-out", in: capturedArgs), coverageManifest.path)
 
@@ -74,7 +76,7 @@ final class Da3SfmRunnerTests: XCTestCase {
         XCTAssertTrue(environment["PATH"]?.contains(toolchain.python.deletingLastPathComponent().path) == true)
     }
 
-    func testRunRejectsSeedRefineUntilSupported() async throws {
+    func testRunAcceptsSeedRefineAndPassesUnorderedInput() async throws {
         let temp = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
         defer { try? FileManager.default.removeItem(at: temp) }
         let toolchain = try TestToolchains.da3Toolchain(root: temp, createFiles: true)
@@ -93,29 +95,32 @@ final class Da3SfmRunnerTests: XCTestCase {
             maxPoints: 123_456,
             cameraType: "PINHOLE",
             sharedCamera: true,
+            inputOrdering: .unordered,
             windowSize: 6,
             windowOverlap: 2,
             coverageManifestPath: coverageManifest
         )
 
-        let mock = MockSubprocessRunner(scripts: [])
-        let runner = Da3SfmRunner(runner: mock)
-
-        do {
-            try await runner.run(
-                toolchain: toolchain,
-                images: imagesPath,
-                outSparse: outSparse,
-                config: config,
-                onLog: { _, _ in }
+        let mock = MockSubprocessRunner(scripts: [
+            .init(
+                path: toolchain.sfmTool.path,
+                argsPrefix: ["--images", imagesPath.path],
+                result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""),
+                onRun: nil
             )
-            XCTFail("Expected unsupported mode")
-        } catch Da3SfmError.unsupportedMode(let mode) {
-            XCTAssertEqual(mode, "seed_refine")
-            XCTAssertTrue(mock.calls.isEmpty)
-        } catch {
-            XCTFail("Unexpected error: \(error)")
-        }
+        ])
+        let runner = Da3SfmRunner(runner: mock)
+        try await runner.run(
+            toolchain: toolchain,
+            images: imagesPath,
+            outSparse: outSparse,
+            config: config,
+            onLog: { _, _ in }
+        )
+
+        let capturedArgs = try XCTUnwrap(mock.calls.first?.1)
+        XCTAssertEqual(value(after: "--mode", in: capturedArgs), "seed_refine")
+        XCTAssertEqual(value(after: "--input-ordering", in: capturedArgs), "unordered")
     }
 
     private func value(after flag: String, in args: [String]) -> String? {

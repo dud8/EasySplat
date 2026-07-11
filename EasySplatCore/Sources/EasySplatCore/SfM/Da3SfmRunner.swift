@@ -16,6 +16,7 @@ public struct Da3SfmConfig: Sendable {
     public var maxPoints: Int
     public var cameraType: String
     public var sharedCamera: Bool
+    public var inputOrdering: InputOrdering
     public var windowSize: Int
     public var windowOverlap: Int
     public var coverageManifestPath: URL?
@@ -29,6 +30,7 @@ public struct Da3SfmConfig: Sendable {
         maxPoints: Int = 120_000,
         cameraType: String = "PINHOLE",
         sharedCamera: Bool = false,
+        inputOrdering: InputOrdering = .automatic,
         windowSize: Int = 6,
         windowOverlap: Int = 2,
         coverageManifestPath: URL? = nil
@@ -41,6 +43,7 @@ public struct Da3SfmConfig: Sendable {
         self.maxPoints = maxPoints
         self.cameraType = cameraType
         self.sharedCamera = sharedCamera
+        self.inputOrdering = inputOrdering
         self.windowSize = windowSize
         self.windowOverlap = windowOverlap
         self.coverageManifestPath = coverageManifestPath
@@ -61,7 +64,6 @@ public protocol Da3SfmRunning: Sendable {
 public enum Da3SfmError: Error {
     case missingTool
     case missingModels
-    case unsupportedMode(String)
     case commandFailed(String)
 }
 
@@ -87,10 +89,6 @@ public final class Da3SfmRunner: @unchecked Sendable, Da3SfmRunning {
         guard fm.fileExists(atPath: toolchain.models.path) else {
             throw Da3SfmError.missingModels
         }
-        guard config.mode == .direct else {
-            throw Da3SfmError.unsupportedMode(config.mode.rawValue)
-        }
-
         var args: [String] = [
             "--images", images.path,
             "--out-sparse", outSparse.path,
@@ -102,6 +100,7 @@ public final class Da3SfmRunner: @unchecked Sendable, Da3SfmRunning {
             "--process-res", "\(config.processResolution)",
             "--max-points", "\(config.maxPoints)",
             "--camera-type", config.cameraType,
+            "--input-ordering", config.inputOrdering.rawValue,
             "--window-size", "\(config.windowSize)",
             "--window-overlap", "\(config.windowOverlap)"
         ]

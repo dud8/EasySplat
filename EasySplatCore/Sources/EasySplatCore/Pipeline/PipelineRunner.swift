@@ -658,19 +658,36 @@ public final class PipelineRunner: @unchecked Sendable {
                 do {
                     if backendPolicy == .da3 {
                         let fm = FileManager.default
+                        let seedZero = paths.colmapSeedModelURL
                         let sparseZero = paths.colmapSparseURL.appendingPathComponent("0", isDirectory: true)
                         let da3CoverageManifest = paths.da3CoverageManifestURL
+                        let da3Mode: Da3RunMode = selectedFrames.count <= max(4, da3WindowSize) ? .direct : .seedRefine
+                        let requestedOrdering = metadata.requestedRunOptions?.inputOrdering ?? .automatic
+                        let da3InputOrdering = da3ResolvedInputOrdering(
+                            requested: requestedOrdering,
+                            input: metadata.input
+                        )
+                        let da3RefinementOptions = tuneMapAnythingRefinementColmapOptions(
+                            frameCount: selectedFrames.count,
+                            extractOptions: colmapExtractOptions,
+                            matchOptions: colmapMatchOptions
+                        )
+                        let da3ColmapExtractOptions = da3RefinementOptions.extract
+                        let da3ColmapMatchOptions = da3RefinementOptions.match
                         let da3Config = Da3SfmConfig(
                             device: da3DevicePreference(),
-                            mode: .direct,
+                            mode: da3Mode,
                             modelSubdirectory: da3ModelPreference(),
                             fallbackModelSubdirectory: da3FallbackModelPreference(),
                             processResolution: da3ProcessResolutionPreference(),
                             maxPoints: da3MaxPointsPreference(preset: metadata.preset),
                             cameraType: da3CameraTypePreference(preset: metadata.preset),
                             sharedCamera: da3SharedCameraPreference(input: metadata.input),
-                            windowSize: da3WindowSize,
-                            windowOverlap: da3WindowOverlapPreference(hardwareTier: detectedHardwareProfile.tier),
+                            inputOrdering: da3InputOrdering,
+                            windowSize: max(4, da3WindowSize),
+                            windowOverlap: da3Mode == .seedRefine
+                                ? max(3, da3WindowOverlapPreference(hardwareTier: detectedHardwareProfile.tier))
+                                : da3WindowOverlapPreference(hardwareTier: detectedHardwareProfile.tier),
                             coverageManifestPath: da3CoverageManifest
                         )
 
@@ -697,7 +714,7 @@ public final class PipelineRunner: @unchecked Sendable {
                                 }
                                 return nil
                             }
-                            let issues = manifest.validationIssues(expectedMode: .direct, selectedImageCount: selectedFrames.count)
+                            let issues = manifest.validationIssues(expectedMode: da3Mode, selectedImageCount: selectedFrames.count)
                             if !issues.isEmpty {
                                 emit(.stageLog(
                                     stage: currentStage,
@@ -713,7 +730,11 @@ public final class PipelineRunner: @unchecked Sendable {
                             return manifest
                         }
 
-                        func analyzeDa3Model(at modelURL: URL, toolLog: ToolLogWriter? = nil) async throws -> ReconstructionScore {
+                        func analyzeDa3Model(
+                            at modelURL: URL,
+                            mapper: String,
+                            toolLog: ToolLogWriter? = nil
+                        ) async throws -> ReconstructionScore {
                             let report = try await self.tooling.colmap.runModelAnalyzer(
                                 colmapPath: self.config.toolchain.colmap,
                                 modelPath: modelURL,
@@ -728,11 +749,13 @@ public final class PipelineRunner: @unchecked Sendable {
                             )
                             emit(.stageLog(
                                 stage: currentStage,
-                                line: "DA3 score (direct): \(ReconstructionScorer.summary(score, mapper: "da3-direct")).",
+                                line: "DA3 score: \(ReconstructionScorer.summary(score, mapper: mapper)).",
                                 isError: false
                             ))
                             return score
                         }
+
+                        let preparedDa3Model = da3Mode == .direct ? sparseZero : seedZero
 
                         if try shouldRunStage(.sfmFeatures) {
                             currentStage = .sfmFeatures
@@ -749,7 +772,7 @@ public final class PipelineRunner: @unchecked Sendable {
                             emit(.stageLog(stage: .sfmFeatures, line: "SfM backend: da3-mps.", isError: false))
                             emit(.stageLog(
                                 stage: .sfmFeatures,
-                                line: "DA3 policy: model=\(da3Config.modelSubdirectory) fallback=\(da3Config.fallbackModelSubdirectory) device=\(da3Config.device) processRes=\(da3Config.processResolution) maxPoints=\(da3Config.maxPoints) sharedCamera=\(da3Config.sharedCamera) cameraType=\(da3Config.cameraType) window=\(da3Config.windowSize) overlap=\(da3Config.windowOverlap).",
+                                line: "DA3 policy: mode=\(da3Config.mode.rawValue) ordering=\(da3Config.inputOrdering.rawValue) model=\(da3Config.modelSubdirectory) fallback=\(da3Config.fallbackModelSubdirectory) device=\(da3Config.device) processRes=\(da3Config.processResolution) maxPoints=\(da3Config.maxPoints) sharedCamera=\(da3Config.sharedCamera) cameraType=\(da3Config.cameraType) window=\(da3Config.windowSize) overlap=\(da3Config.windowOverlap).",
                                 isError: false
                             ))
 
@@ -771,6 +794,7 @@ public final class PipelineRunner: @unchecked Sendable {
                                     "maxPoints": "\(da3Config.maxPoints)",
                                     "sharedCamera": da3Config.sharedCamera ? "1" : "0",
                                     "cameraType": da3Config.cameraType,
+                                    "inputOrdering": da3Config.inputOrdering.rawValue,
                                     "windowSize": "\(da3Config.windowSize)",
                                     "windowOverlap": "\(da3Config.windowOverlap)",
                                     "model": da3Config.modelSubdirectory,
@@ -791,57 +815,64 @@ public final class PipelineRunner: @unchecked Sendable {
                                 }
                             }
 
-                            emit(.stageProgress(stage: .sfmFeatures, fraction: 0.0, message: "Starting DA3 direct solve (\(selectedFrames.count) images)…"))
+                            let solveLabel = da3Mode == .direct ? "direct" : "aligned seed"
+                            emit(.stageProgress(stage: .sfmFeatures, fraction: 0.0, message: "Starting DA3 \(solveLabel) solve (\(selectedFrames.count) images)…"))
                             try await self.tooling.da3Sfm.run(
                                 toolchain: self.config.toolchain.da3,
                                 images: paths.framesSelectedURL,
-                                outSparse: sparseZero,
+                                outSparse: preparedDa3Model,
                                 config: da3Config,
                                 onLog: onDa3Log
                             )
-                            guard sparseModelFilesExist(at: sparseZero) else {
+                            guard sparseModelFilesExist(at: preparedDa3Model) else {
                                 throw PipelineError.outputMissing
                             }
-                            let imagesTxt = sparseZero.appendingPathComponent("images.txt")
+                            let imagesTxt = preparedDa3Model.appendingPathComponent("images.txt")
                             if try ColmapTextModelNormalizer.normalizeImagesTxtIfNeeded(at: imagesTxt) {
                                 emit(.stageLog(
                                     stage: .sfmFeatures,
-                                    line: "Normalized DA3 direct COLMAP model (added missing POINTS2D lines to images.txt).",
+                                    line: "Normalized DA3 \(solveLabel) COLMAP model (added missing POINTS2D lines to images.txt).",
                                     isError: false
                                 ))
                             }
                             let coverageManifest = try readDa3CoverageManifest(required: true)
-                            let da3ValidationIssues = da3DirectSparseValidationIssues(
-                                paths: paths,
-                                textStats: colmapSparseTextStats(at: sparseZero)
-                            )
-                            if !da3ValidationIssues.isEmpty {
-                                emit(.stageLog(
-                                    stage: currentStage,
-                                    line: "DA3 sparse output was inconsistent: \(da3ValidationIssues.joined(separator: "; ")).",
-                                    isError: true
-                                ))
-                                throw PipelineError.outputMissing
+                            if da3Mode == .direct {
+                                let da3ValidationIssues = da3DirectSparseValidationIssues(
+                                    paths: paths,
+                                    textStats: colmapSparseTextStats(at: sparseZero)
+                                )
+                                if !da3ValidationIssues.isEmpty {
+                                    emit(.stageLog(
+                                        stage: currentStage,
+                                        line: "DA3 sparse output was inconsistent: \(da3ValidationIssues.joined(separator: "; ")).",
+                                        isError: true
+                                    ))
+                                    throw PipelineError.outputMissing
+                                }
+                                let rawScore = try await analyzeDa3Model(
+                                    at: sparseZero,
+                                    mapper: "da3-direct",
+                                    toolLog: da3ToolLog
+                                )
+                                let score = da3ScoreApplyingCoverageFallback(
+                                    rawScore,
+                                    coverageManifest: coverageManifest
+                                )
+                                if let rejection = da3DirectQualityFailureReason(score: score, mode: metadata.preset.mode) {
+                                    emit(.stageLog(
+                                        stage: .sfmFeatures,
+                                        line: "DA3 direct solve was below the quality bar (\(rejection)); trying the next SfM backend.",
+                                        isError: true
+                                    ))
+                                    throw PipelineError.lowQualityReconstruction(score, mapper: "da3-direct")
+                                }
+                                acceptedReconstructionScore = score
+                                acceptedReconstructionSummary = ReconstructionSummary(
+                                    score: score,
+                                    mapper: "da3-direct",
+                                    capturedAt: Date()
+                                )
                             }
-                            let rawScore = try await analyzeDa3Model(at: sparseZero, toolLog: da3ToolLog)
-                            let score = da3ScoreApplyingCoverageFallback(
-                                rawScore,
-                                coverageManifest: coverageManifest
-                            )
-                            if let rejection = da3DirectQualityFailureReason(score: score, mode: metadata.preset.mode) {
-                                emit(.stageLog(
-                                    stage: .sfmFeatures,
-                                    line: "DA3 direct solve was below the quality bar (\(rejection)); trying the next SfM backend.",
-                                    isError: true
-                                ))
-                                throw PipelineError.lowQualityReconstruction(score, mapper: "da3-direct")
-                            }
-                            acceptedReconstructionScore = score
-                            acceptedReconstructionSummary = ReconstructionSummary(
-                                score: score,
-                                mapper: "da3-direct",
-                                capturedAt: Date()
-                            )
                             if !fm.fileExists(atPath: paths.colmapDatabaseURL.path) {
                                 fm.createFile(atPath: paths.colmapDatabaseURL.path, contents: Data())
                             }
@@ -849,7 +880,7 @@ public final class PipelineRunner: @unchecked Sendable {
                             writeCheckpoint(
                                 stage: .sfmFeatures,
                                 progress: 1.0,
-                                message: "DA3 direct sparse model ready",
+                                message: da3Mode == .direct ? "DA3 direct sparse model ready" : "DA3 aligned pose seed ready",
                                 details: .sfmFeatures(SfmFeaturesCheckpoint(
                                     databasePath: paths.colmapDatabaseURL.path,
                                     imageCount: selectedFrames.count
@@ -857,24 +888,98 @@ public final class PipelineRunner: @unchecked Sendable {
                             )
                             emit(.stageFinished(stage: .sfmFeatures))
                             markStageComplete(.sfmFeatures)
-                        } else if sparseModelFilesExist(at: sparseZero) && !fm.fileExists(atPath: paths.colmapDatabaseURL.path) {
+                        } else if sparseModelFilesExist(at: preparedDa3Model) && !fm.fileExists(atPath: paths.colmapDatabaseURL.path) {
                             fm.createFile(atPath: paths.colmapDatabaseURL.path, contents: Data())
                         }
 
                         if try shouldRunStage(.sfmMatching) {
                             currentStage = .sfmMatching
                             emit(.stageStarted(stage: .sfmMatching))
-                            writeCheckpoint(
-                                stage: .sfmMatching,
-                                progress: 1.0,
-                                message: "DA3 direct path skips matching",
-                                details: .sfmMatching(SfmMatchingCheckpoint(
-                                    databasePath: paths.colmapDatabaseURL.path,
-                                    expectedPairs: nil,
-                                    processedPairs: nil
-                                ))
-                            )
-                            emit(.stageLog(stage: .sfmMatching, line: "DA3 direct solve produced a sparse model directly; skipping matching.", isError: false))
+                            if da3Mode == .direct {
+                                writeCheckpoint(
+                                    stage: .sfmMatching,
+                                    progress: 1.0,
+                                    message: "DA3 direct path skips matching",
+                                    details: .sfmMatching(SfmMatchingCheckpoint(
+                                        databasePath: paths.colmapDatabaseURL.path,
+                                        expectedPairs: nil,
+                                        processedPairs: nil
+                                    ))
+                                )
+                                emit(.stageLog(stage: .sfmMatching, line: "DA3 direct solve produced a sparse model directly; skipping matching.", isError: false))
+                            } else {
+                                writeCheckpoint(
+                                    stage: .sfmMatching,
+                                    progress: 0,
+                                    message: "DA3 refinement matching started",
+                                    details: .sfmMatching(SfmMatchingCheckpoint(
+                                        databasePath: paths.colmapDatabaseURL.path,
+                                        expectedPairs: nil,
+                                        processedPairs: 0
+                                    ))
+                                )
+                                let colmapToolLog = ToolLogWriter(fileURL: paths.colmapLogURL, toolName: "colmap")
+                                colmapToolLog.beginSection(
+                                    title: "da3_refinement_matching",
+                                    metadata: [
+                                        "database": paths.colmapDatabaseURL.path,
+                                        "images": paths.framesSelectedURL.path,
+                                        "tool": self.config.toolchain.colmap.path
+                                    ]
+                                )
+                                emit(.stageProgress(stage: .sfmMatching, fraction: 0.02, message: "Extracting local features…"))
+                                try await self.tooling.colmap.runFeatureExtractor(
+                                    colmapPath: self.config.toolchain.colmap,
+                                    database: paths.colmapDatabaseURL,
+                                    imagePath: paths.framesSelectedURL,
+                                    maxImageSize: colmapMaxImageSize,
+                                    cameraModel: da3Config.cameraType,
+                                    singleCamera: da3Config.sharedCamera,
+                                    options: da3ColmapExtractOptions,
+                                    onLog: { line, isErr in
+                                        colmapToolLog.append(stream: isErr ? "stderr" : "stdout", line: line)
+                                    }
+                                )
+                                self.logKeypointStats(database: paths.colmapDatabaseURL, stage: .sfmMatching, emit: emit)
+
+                                let seedManifest = try readDa3CoverageManifest(required: true)
+                                let matchPairs = seedManifest?.boundedMatchPairs ?? []
+                                guard !matchPairs.isEmpty else {
+                                    throw PipelineError.outputMissing
+                                }
+                                let matchListURL = paths.colmapSeedURL.appendingPathComponent("match_pairs.txt")
+                                try (matchPairs.joined(separator: "\n") + "\n").write(
+                                    to: matchListURL,
+                                    atomically: true,
+                                    encoding: .utf8
+                                )
+                                let matcherLog: @Sendable (String, Bool) -> Void = { line, isErr in
+                                    colmapToolLog.append(stream: isErr ? "stderr" : "stdout", line: line)
+                                }
+                                try await self.tooling.colmap.runMatchesImporter(
+                                    colmapPath: self.config.toolchain.colmap,
+                                    database: paths.colmapDatabaseURL,
+                                    matchListPath: matchListURL,
+                                    matchType: "pairs",
+                                    options: da3ColmapMatchOptions,
+                                    onLog: matcherLog
+                                )
+                                lastUsedSequentialMatcher = false
+                                let expectedPairs = matchPairs.count
+                                let processedPairs = (try? ColmapDatabaseProgressPoller(
+                                    databasePath: paths.colmapDatabaseURL
+                                ).readProcessedPairCount()) ?? 0
+                                writeCheckpoint(
+                                    stage: .sfmMatching,
+                                    progress: 1.0,
+                                    message: "DA3 refinement matching completed",
+                                    details: .sfmMatching(SfmMatchingCheckpoint(
+                                        databasePath: paths.colmapDatabaseURL.path,
+                                        expectedPairs: expectedPairs,
+                                        processedPairs: processedPairs
+                                    ))
+                                )
+                            }
                             emit(.stageFinished(stage: .sfmMatching))
                             markStageComplete(.sfmMatching)
                         }
@@ -882,6 +987,7 @@ public final class PipelineRunner: @unchecked Sendable {
                         if try shouldRunStage(.sfmMapping) {
                             currentStage = .sfmMapping
                             emit(.stageStarted(stage: .sfmMapping))
+                            if da3Mode == .direct {
                             guard sparseModelFilesExist(at: sparseZero) else {
                                 throw PipelineError.outputMissing
                             }
@@ -923,6 +1029,98 @@ public final class PipelineRunner: @unchecked Sendable {
                                 ))
                             )
                             emit(.stageLog(stage: .sfmMapping, line: "DA3 direct sparse model accepted as the final SfM output.", isError: false))
+                            } else {
+                                guard sparseModelFilesExist(at: seedZero) else {
+                                    throw PipelineError.outputMissing
+                                }
+                                if try ColmapTextModelNormalizer.remapSeedModelIDsToDatabase(
+                                    seedModelURL: seedZero,
+                                    databaseURL: paths.colmapDatabaseURL
+                                ) {
+                                    emit(.stageLog(
+                                        stage: .sfmMapping,
+                                        line: "Aligned DA3 seed IDs with the COLMAP feature database.",
+                                        isError: false
+                                    ))
+                                }
+                                try self.resetDirectory(paths.colmapSparseURL)
+                                try self.resetDirectory(sparseZero)
+                                let colmapToolLog = ToolLogWriter(fileURL: paths.colmapLogURL, toolName: "colmap")
+                                colmapToolLog.beginSection(
+                                    title: "da3_refinement",
+                                    metadata: [
+                                        "database": paths.colmapDatabaseURL.path,
+                                        "images": paths.framesSelectedURL.path,
+                                        "seed": seedZero.path,
+                                        "output": sparseZero.path,
+                                        "tool": self.config.toolchain.colmap.path
+                                    ]
+                                )
+                                emit(.stageLog(stage: .sfmMapping, line: "Running DA3 refinement: point_triangulator.", isError: false))
+                                try await self.tooling.colmap.runPointTriangulator(
+                                    colmapPath: self.config.toolchain.colmap,
+                                    database: paths.colmapDatabaseURL,
+                                    imagePath: paths.framesSelectedURL,
+                                    inputPath: seedZero,
+                                    outputPath: sparseZero,
+                                    options: da3ColmapMatchOptions,
+                                    onLog: { line, isErr in
+                                        colmapToolLog.append(stream: isErr ? "stderr" : "stdout", line: line)
+                                    }
+                                )
+
+                                let baOutput = paths.colmapSparseURL.appendingPathComponent("0_ba", isDirectory: true)
+                                self.removeIfExists(baOutput)
+                                try fm.createDirectory(at: baOutput, withIntermediateDirectories: true)
+                                emit(.stageLog(stage: .sfmMapping, line: "Running DA3 refinement: bundle_adjuster.", isError: false))
+                                try await self.tooling.colmap.runBundleAdjuster(
+                                    colmapPath: self.config.toolchain.colmap,
+                                    inputPath: sparseZero,
+                                    outputPath: baOutput,
+                                    options: da3ColmapMatchOptions,
+                                    bundleOptions: ColmapBundleAdjustmentOptions(),
+                                    onLog: { line, isErr in
+                                        colmapToolLog.append(stream: isErr ? "stderr" : "stdout", line: line)
+                                    }
+                                )
+                                guard sparseModelFilesExist(at: baOutput) else {
+                                    throw PipelineError.outputMissing
+                                }
+                                self.removeIfExists(sparseZero)
+                                try fm.moveItem(at: baOutput, to: sparseZero)
+
+                                let score = try await analyzeDa3Model(
+                                    at: sparseZero,
+                                    mapper: "da3-refined",
+                                    toolLog: colmapToolLog
+                                )
+                                guard ReconstructionScorer.isAcceptable(score, mode: metadata.preset.mode),
+                                      let residual = score.meanReprojectionError,
+                                      residual.isFinite else {
+                                    throw PipelineError.lowQualityReconstruction(score, mapper: "da3-refined")
+                                }
+                                acceptedReconstructionScore = score
+                                acceptedReconstructionSummary = ReconstructionSummary(
+                                    score: score,
+                                    mapper: "da3-refined",
+                                    capturedAt: Date()
+                                )
+                                writeCheckpoint(
+                                    stage: .sfmMapping,
+                                    progress: 1.0,
+                                    message: "DA3 refinement completed",
+                                    details: .sfmMapping(SfmMappingCheckpoint(
+                                        mapper: "da3-refined",
+                                        sparsePath: sparseZero.path,
+                                        registeredImages: score.registeredImages
+                                    ))
+                                )
+                                emit(.stageLog(
+                                    stage: .sfmMapping,
+                                    line: "DA3 aligned seed accepted after triangulation and bounded bundle adjustment.",
+                                    isError: false
+                                ))
+                            }
                             emit(.stageFinished(stage: .sfmMapping))
                             markStageComplete(.sfmMapping)
                         }
