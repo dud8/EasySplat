@@ -69,7 +69,13 @@ struct Da3CoverageManifest: Codable, Sendable {
         return try JSONDecoder().decode(Da3CoverageManifest.self, from: data)
     }
 
-    func validationIssues(expectedMode: Da3RunMode, selectedImageNames: [String]) -> [String] {
+    func validationIssues(
+        expectedMode: Da3RunMode,
+        selectedImageNames: [String],
+        expectedWindowSize: Int? = nil,
+        expectedWindowOverlap: Int? = nil,
+        expectedInputOrdering: InputOrdering? = nil
+    ) -> [String] {
         var issues: [String] = []
         let selectedImageCount = selectedImageNames.count
         if mode != expectedMode.rawValue {
@@ -146,6 +152,32 @@ struct Da3CoverageManifest: Codable, Sendable {
             issues.append("direct mode requires export_strategy=native_colmap")
         }
         if expectedMode == .seedRefine {
+            let trustedPairLimit: Int?
+            if let expectedWindowSize,
+               let expectedWindowOverlap,
+               let expectedInputOrdering {
+                if windowSize != expectedWindowSize {
+                    issues.append("seed_refine window_size=\(windowSize) did not match expected \(expectedWindowSize)")
+                }
+                if windowOverlap != expectedWindowOverlap {
+                    issues.append("seed_refine window_overlap=\(windowOverlap) did not match expected \(expectedWindowOverlap)")
+                }
+                if inputOrdering != expectedInputOrdering.rawValue {
+                    issues.append("seed_refine input_ordering=\(inputOrdering ?? "missing") did not match expected \(expectedInputOrdering.rawValue)")
+                }
+                trustedPairLimit = Self.trustedMatchPairLimit(
+                    selectedImageCount: selectedImageCount,
+                    windowSize: expectedWindowSize,
+                    windowOverlap: expectedWindowOverlap,
+                    inputOrdering: expectedInputOrdering
+                )
+                if trustedPairLimit == nil {
+                    issues.append("seed_refine trusted run plan could not produce a valid match pair limit")
+                }
+            } else {
+                trustedPairLimit = nil
+                issues.append("seed_refine validation requires a trusted window size, overlap, and input ordering")
+            }
             if nativeColmapExport != false {
                 issues.append("seed_refine requires native_colmap_export=false")
             }
@@ -218,6 +250,11 @@ struct Da3CoverageManifest: Codable, Sendable {
             if rawPointSampleCount != nil || fusedSparsePointCount != nil || finalObservationCount != nil || meanTrackLength != nil {
                 issues.append("aligned pose seed must not claim sparse points, observations, or track length")
             }
+            if let pairs = boundedMatchPairs,
+               let trustedPairLimit,
+               pairs.count > trustedPairLimit {
+                issues.append("seed_refine match pair count \(pairs.count) exceeded trusted match pair limit \(trustedPairLimit)")
+            }
             if boundedMatchPairs == nil {
                 issues.append("seed_refine match pair count exceeded the hard limit \(Self.hardMatchPairLimit)")
             }
@@ -285,5 +322,43 @@ struct Da3CoverageManifest: Codable, Sendable {
             }
         }
         return pairs.sorted()
+    }
+
+    static func trustedMatchPairLimit(
+        selectedImageCount: Int,
+        windowSize: Int,
+        windowOverlap: Int,
+        inputOrdering: InputOrdering
+    ) -> Int? {
+        guard selectedImageCount > 0, windowSize >= 4 else { return nil }
+        let effectiveWindowSize = min(selectedImageCount, windowSize)
+        let pairsPerWindow = effectiveWindowSize.multipliedReportingOverflow(
+            by: effectiveWindowSize - 1
+        )
+        guard !pairsPerWindow.overflow else { return nil }
+        let pairCapacity = pairsPerWindow.partialValue / 2
+        guard selectedImageCount > effectiveWindowSize else {
+            return min(pairCapacity, hardMatchPairLimit)
+        }
+
+        let newImagesPerWindow: Int
+        switch inputOrdering {
+        case .continuous:
+            let effectiveOverlap = max(3, windowOverlap)
+            guard effectiveOverlap < effectiveWindowSize else { return nil }
+            newImagesPerWindow = effectiveWindowSize - effectiveOverlap
+        case .unordered:
+            newImagesPerWindow = effectiveWindowSize - 3
+        case .automatic:
+            return nil
+        }
+        guard newImagesPerWindow > 0 else { return nil }
+
+        let remaining = selectedImageCount - effectiveWindowSize
+        let additionalWindows = (remaining + newImagesPerWindow - 1) / newImagesPerWindow
+        let windowCount = additionalWindows + 1
+        let total = pairCapacity.multipliedReportingOverflow(by: windowCount)
+        guard !total.overflow else { return nil }
+        return min(total.partialValue, hardMatchPairLimit)
     }
 }

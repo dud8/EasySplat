@@ -194,7 +194,13 @@ final class Da3CoverageManifestTests: XCTestCase {
         XCTAssertEqual(manifest.maxAlignmentRMSE, 0.018)
         XCTAssertEqual(manifest.alignmentComplete, true)
         let selectedNames = ["a.jpg", "b.jpg", "c.jpg", "d.jpg", "e.jpg", "f.jpg", "g.jpg"]
-        XCTAssertTrue(manifest.validationIssues(expectedMode: .seedRefine, selectedImageNames: selectedNames).isEmpty)
+        XCTAssertTrue(manifest.validationIssues(
+            expectedMode: .seedRefine,
+            selectedImageNames: selectedNames,
+            expectedWindowSize: 4,
+            expectedWindowOverlap: 3,
+            expectedInputOrdering: .continuous
+        ).isEmpty)
         let pairs = try XCTUnwrap(manifest.boundedMatchPairs)
         XCTAssertEqual(pairs.count, 15)
         XCTAssertTrue(pairs.contains("a.jpg d.jpg"))
@@ -238,7 +244,10 @@ final class Da3CoverageManifestTests: XCTestCase {
         let manifest = try Da3CoverageManifest.load(from: manifestURL)
         let issues = manifest.validationIssues(
             expectedMode: .seedRefine,
-            selectedImageNames: ["a.jpg", "b.jpg", "c.jpg", "d.jpg", "e.jpg"]
+            selectedImageNames: ["a.jpg", "b.jpg", "c.jpg", "d.jpg", "e.jpg"],
+            expectedWindowSize: 4,
+            expectedWindowOverlap: 3,
+            expectedInputOrdering: .unordered
         )
         XCTAssertTrue(issues.contains(where: { $0.contains("complete image coverage") }))
         XCTAssertTrue(issues.contains(where: { $0.contains("alignment_complete") }))
@@ -258,7 +267,13 @@ final class Da3CoverageManifestTests: XCTestCase {
         manifest.windowSize = 4
         manifest.windows[0].images = ["b.jpg", "a.jpg", "c.jpg", "d.jpg", "e.jpg"]
 
-        let issues = manifest.validationIssues(expectedMode: .seedRefine, selectedImageNames: selected)
+        let issues = manifest.validationIssues(
+            expectedMode: .seedRefine,
+            selectedImageNames: selected,
+            expectedWindowSize: 4,
+            expectedWindowOverlap: 3,
+            expectedInputOrdering: .continuous
+        )
         XCTAssertTrue(issues.contains(where: { $0.contains("exceeded window_size") }))
         XCTAssertTrue(issues.contains(where: { $0.contains("name/index mapping") }))
     }
@@ -278,7 +293,13 @@ final class Da3CoverageManifestTests: XCTestCase {
             ]
         )
 
-        let issues = manifest.validationIssues(expectedMode: .seedRefine, selectedImageNames: selected)
+        let issues = manifest.validationIssues(
+            expectedMode: .seedRefine,
+            selectedImageNames: selected,
+            expectedWindowSize: 4,
+            expectedWindowOverlap: 3,
+            expectedInputOrdering: .continuous
+        )
         XCTAssertTrue(issues.contains(where: { $0.contains("range did not bound indices") }))
     }
 
@@ -293,7 +314,13 @@ final class Da3CoverageManifestTests: XCTestCase {
             ]
         )
 
-        let issues = manifest.validationIssues(expectedMode: .seedRefine, selectedImageNames: selected)
+        let issues = manifest.validationIssues(
+            expectedMode: .seedRefine,
+            selectedImageNames: selected,
+            expectedWindowSize: 4,
+            expectedWindowOverlap: 3,
+            expectedInputOrdering: .continuous
+        )
         XCTAssertTrue(issues.contains(where: { $0.contains("continuous overlap") }))
     }
 
@@ -309,7 +336,13 @@ final class Da3CoverageManifestTests: XCTestCase {
         )
         manifest.anchorImageNames = [selected[0], selected[1], selected[2]]
 
-        let issues = manifest.validationIssues(expectedMode: .seedRefine, selectedImageNames: selected)
+        let issues = manifest.validationIssues(
+            expectedMode: .seedRefine,
+            selectedImageNames: selected,
+            expectedWindowSize: 4,
+            expectedWindowOverlap: 3,
+            expectedInputOrdering: .unordered
+        )
         XCTAssertTrue(issues.contains(where: { $0.contains("declared anchors") }))
     }
 
@@ -324,8 +357,44 @@ final class Da3CoverageManifestTests: XCTestCase {
         )
         manifest.windowSize = selected.count
 
-        let issues = manifest.validationIssues(expectedMode: .seedRefine, selectedImageNames: selected)
+        let issues = manifest.validationIssues(
+            expectedMode: .seedRefine,
+            selectedImageNames: selected,
+            expectedWindowSize: selected.count,
+            expectedWindowOverlap: 3,
+            expectedInputOrdering: .continuous
+        )
         XCTAssertTrue(issues.contains(where: { $0.contains("hard limit") }))
+    }
+
+    func testSeedValidationBindsManifestToTrustedRunPlan() {
+        let selected = (0..<250).map { "img\($0).jpg" }
+        var manifest = makeSeedManifest(
+            selectedNames: selected,
+            ordering: .continuous,
+            windows: [
+                .init(
+                    start: 0,
+                    end: selected.count,
+                    images: selected,
+                    indices: Array(selected.indices)
+                )
+            ]
+        )
+        manifest.windowSize = selected.count
+        manifest.windowOverlap = selected.count - 1
+
+        let issues = manifest.validationIssues(
+            expectedMode: .seedRefine,
+            selectedImageNames: selected,
+            expectedWindowSize: 4,
+            expectedWindowOverlap: 3,
+            expectedInputOrdering: .continuous
+        )
+
+        XCTAssertTrue(issues.contains(where: { $0.contains("window_size") && $0.contains("expected 4") }))
+        XCTAssertTrue(issues.contains(where: { $0.contains("window_overlap") && $0.contains("expected 3") }))
+        XCTAssertTrue(issues.contains(where: { $0.contains("trusted match pair limit") }))
     }
 
     private func makeSeedManifest(

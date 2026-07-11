@@ -716,7 +716,10 @@ public final class PipelineRunner: @unchecked Sendable {
                             }
                             let issues = manifest.validationIssues(
                                 expectedMode: da3Mode,
-                                selectedImageNames: selectedFrames.map(\.lastPathComponent)
+                                selectedImageNames: selectedFrames.map(\.lastPathComponent),
+                                expectedWindowSize: da3Config.windowSize,
+                                expectedWindowOverlap: da3Config.windowOverlap,
+                                expectedInputOrdering: da3Config.inputOrdering
                             )
                             if !issues.isEmpty {
                                 emit(.stageLog(
@@ -946,9 +949,16 @@ public final class PipelineRunner: @unchecked Sendable {
                                 self.logKeypointStats(database: paths.colmapDatabaseURL, stage: .sfmMatching, emit: emit)
 
                                 let seedManifest = try readDa3CoverageManifest(required: true)
+                                let trustedPairLimit = Da3CoverageManifest.trustedMatchPairLimit(
+                                    selectedImageCount: selectedFrames.count,
+                                    windowSize: da3Config.windowSize,
+                                    windowOverlap: da3Config.windowOverlap,
+                                    inputOrdering: da3Config.inputOrdering
+                                )
                                 guard let matchPairs = seedManifest?.boundedMatchPairs,
+                                      let trustedPairLimit,
                                       !matchPairs.isEmpty,
-                                      matchPairs.count <= Da3CoverageManifest.hardMatchPairLimit else {
+                                      matchPairs.count <= trustedPairLimit else {
                                     throw PipelineError.outputMissing
                                 }
                                 let matchListURL = paths.colmapSeedURL.appendingPathComponent("match_pairs.txt")
