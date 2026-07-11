@@ -8,6 +8,10 @@ public struct ProjectMetadata: Codable, Sendable {
     public var title: String
     public var input: InputSpec
     public var preset: PresetSpec
+    public var requestedRunOptions: RequestedRunOptions?
+    public var resolvedRunPlan: ResolvedRunPlan?
+    public var geometryArtifact: GeometryArtifact?
+    public var trainingArtifact: TrainingArtifact?
     public var state: PipelineState
     public var outputs: OutputSpec?
     public var checkpoint: PipelineCheckpoint?
@@ -23,12 +27,16 @@ public struct ProjectMetadata: Codable, Sendable {
     public var lastFailureAt: Date?
 
     public init(
-        formatVersion: Int = 1,
+        formatVersion: Int = 2,
         id: UUID = UUID(),
         createdAt: Date = Date(),
         title: String,
         input: InputSpec,
         preset: PresetSpec,
+        requestedRunOptions: RequestedRunOptions? = RequestedRunOptions(),
+        resolvedRunPlan: ResolvedRunPlan? = nil,
+        geometryArtifact: GeometryArtifact? = nil,
+        trainingArtifact: TrainingArtifact? = nil,
         state: PipelineState = PipelineState(stage: .importInput, attempt: 0, lastError: nil, resumeToken: nil),
         outputs: OutputSpec? = nil,
         checkpoint: PipelineCheckpoint? = nil,
@@ -49,6 +57,10 @@ public struct ProjectMetadata: Codable, Sendable {
         self.title = title
         self.input = input
         self.preset = preset
+        self.requestedRunOptions = requestedRunOptions
+        self.resolvedRunPlan = resolvedRunPlan
+        self.geometryArtifact = geometryArtifact
+        self.trainingArtifact = trainingArtifact
         self.state = state
         self.outputs = outputs
         self.checkpoint = checkpoint

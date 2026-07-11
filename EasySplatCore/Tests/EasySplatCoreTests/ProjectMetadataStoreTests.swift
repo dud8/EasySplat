@@ -29,7 +29,7 @@ final class ProjectMetadataStoreTests: XCTestCase {
             registeredImages: 12
         )
         let metadata = ProjectMetadata(
-            formatVersion: 1,
+            formatVersion: ProjectMetadataStore.supportedFormatVersion,
             id: UUID(),
             createdAt: Date(timeIntervalSince1970: 123456),
             title: "Test",
@@ -277,7 +277,7 @@ final class ProjectMetadataFullSchemaRoundTripTests: XCTestCase {
             capturedAt: Date(timeIntervalSince1970: 1_700_000_000)
         )
         let metadata = ProjectMetadata(
-            formatVersion: 1,
+            formatVersion: ProjectMetadataStore.supportedFormatVersion,
             id: UUID(uuidString: "33333333-3333-3333-3333-333333333333")!,
             createdAt: Date(timeIntervalSince1970: 1_699_999_000),
             title: "Full schema",
