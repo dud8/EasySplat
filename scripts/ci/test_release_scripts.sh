@@ -75,8 +75,20 @@ grep -q 'scripts/toolchain/build_da3_mps.sh' "$ROOT/scripts/release/build_dmg.sh
 grep -q 'scripts/toolchain/build_mapanything_mps.sh' "$ROOT/scripts/release/build_dmg.sh"
 grep -q 'scripts/toolchain/build_msplat.sh' "$ROOT/.github/workflows/toolchain-build.yml"
 grep -q 'DA3_SOURCE_DESCRIPTOR="git:${DA3_REPO}@${DA3_SOURCE_COMMIT}"' "$ROOT/scripts/toolchain/build_da3_mps.sh"
-grep -q 'MSPLAT_VERSION="${MSPLAT_VERSION:-1\.1\.3}"' "$ROOT/scripts/toolchain/build_msplat.sh"
-grep -q 'MSPLAT_PIP_SPEC="msplat\[cli\]==$MSPLAT_VERSION"' "$ROOT/scripts/toolchain/build_msplat.sh"
+grep -q 'MSPLAT_COMMIT="106499b0a53f82b0c92d013b0861fbebd341b17e"' "$ROOT/scripts/toolchain/build_msplat.sh"
+grep -q 'MSPLAT_VERSION="1\.1\.3"' "$ROOT/scripts/toolchain/build_msplat.sh"
+grep -q 'NLOHMANN_JSON_SHA256="04022b05d806eb5ff73023c280b68697d12b93e1b7267a0b22a1a39ec7578069"' "$ROOT/scripts/toolchain/build_msplat.sh"
+grep -q 'NANOFLANN_SHA256="57496cb27e1310a77a367e5a902c8f1c700496d91ac54ccc87fbe9ccc28bc6cc"' "$ROOT/scripts/toolchain/build_msplat.sh"
+grep -q 'CLI11_SHA256="43e650d5e1a3acaaf419d1e61a81f77b408d0696f472be0599ddf877d40984b0"' "$ROOT/scripts/toolchain/build_msplat.sh"
+grep -q 'FETCHCONTENT_SOURCE_DIR_NLOHMANN_JSON' "$ROOT/scripts/toolchain/build_msplat.sh"
+grep -q 'FETCHCONTENT_SOURCE_DIR_NANOFLANN' "$ROOT/scripts/toolchain/build_msplat.sh"
+grep -q 'FETCHCONTENT_SOURCE_DIR_CLI11' "$ROOT/scripts/toolchain/build_msplat.sh"
+grep -q 'promote_install' "$ROOT/scripts/toolchain/build_msplat.sh"
+grep -q 'easysplat-train' "$ROOT/scripts/toolchain/build_msplat.sh"
+if grep -Eqi 'pip install|python-build-standalone|site-packages|_core\.so|core_extension_path\.txt|(^|[^[:alnum:]])msplat-train' "$ROOT/scripts/toolchain/build_msplat.sh"; then
+  echo "Native msplat builder still contains packaged-Python or legacy CLI remnants" >&2
+  exit 1
+fi
 grep -q '^numpy==2\.3\.5$' "$ROOT/Tools/Da3Sfm/requirements.txt"
 grep -q 'rm -rf "$target"' "$ROOT/scripts/toolchain/build_da3_mps.sh"
 grep -q '/usr/bin/file -b "$python_bin"' "$ROOT/scripts/toolchain/package_toolchain.sh"

@@ -1,0 +1,41 @@
+diff --git a/core/metal/msplat_metal.mm b/core/metal/msplat_metal.mm
+--- a/core/metal/msplat_metal.mm
++++ b/core/metal/msplat_metal.mm
+@@ -12,4 +12,5 @@
+ #import <functional>
+ #import <array>
+ #import <mutex>
++#include <stdexcept>
+ #import <mach/mach_time.h>
+@@ -284,5 +285,8 @@ MetalContext* get_global_context() {
+     if (ctx == NULL) {
+         ctx = init_msplat_metal_context();
+     }
++    if (ctx == NULL) {
++        throw std::runtime_error("msplat: Metal context initialization failed");
++    }
+     return ctx;
+ }
+diff --git a/core/metal/msplat_metal.metal b/core/metal/msplat_metal.metal
+--- a/core/metal/msplat_metal.metal
++++ b/core/metal/msplat_metal.metal
+@@ -999,8 +999,8 @@
+             // Broadcast batch data from lane 0 → all lanes in SIMD group.
+             // All threads read the same index t, so one threadgroup read +
+             // simd_broadcast replaces 32 redundant threadgroup reads.
+-            float3 b_conic, b_xy_opac, b_rgb;
+-            int32_t b_id;
++            float3 b_conic = float3(0.0f), b_xy_opac = float3(0.0f), b_rgb = float3(0.0f);
++            int32_t b_id = 0;
+             if (wr == 0) {
+                 b_conic = conic_batch[t];
+                 b_xy_opac = xy_opacity_batch[t];
+@@ -2949,6 +2949,6 @@
+         for (int t = max(0, batch_end - warp_bin_final); t < batch_size; ++t) {
+-            float3 b_conic, b_xy_opac, b_rgb;
+-            int32_t b_id;
++            float3 b_conic = float3(0.0f), b_xy_opac = float3(0.0f), b_rgb = float3(0.0f);
++            int32_t b_id = 0;
+             if (wr == 0) {
+                 b_conic = conic_batch[t];
+                 b_xy_opac = xy_opacity_batch[t];
