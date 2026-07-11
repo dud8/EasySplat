@@ -43,7 +43,7 @@ final class Da3CoverageManifestTests: XCTestCase {
         XCTAssertEqual(manifest.nativeColmapExport, true)
         XCTAssertEqual(manifest.exportStrategy, "native_colmap")
         XCTAssertTrue(manifest.sharedCamera)
-        XCTAssertTrue(manifest.validationIssues(expectedMode: .direct, selectedImageCount: 2).isEmpty)
+        XCTAssertTrue(manifest.validationIssues(expectedMode: .direct, selectedImageNames: ["a.jpg", "b.jpg"]).isEmpty)
     }
 
     func testValidationAcceptsConsistentDirectManifest() {
@@ -72,7 +72,10 @@ final class Da3CoverageManifestTests: XCTestCase {
             exportStrategy: "native_colmap"
         )
 
-        XCTAssertTrue(manifest.validationIssues(expectedMode: .direct, selectedImageCount: 4).isEmpty)
+        XCTAssertTrue(manifest.validationIssues(
+            expectedMode: .direct,
+            selectedImageNames: ["a.jpg", "b.jpg", "c.jpg", "d.jpg"]
+        ).isEmpty)
         XCTAssertTrue(manifest.summary.contains("model DA3-BASE"))
         XCTAssertTrue(manifest.summary.contains("mean track length 2.00"))
     }
@@ -103,7 +106,10 @@ final class Da3CoverageManifestTests: XCTestCase {
             exportStrategy: nil
         )
 
-        let issues = manifest.validationIssues(expectedMode: .direct, selectedImageCount: 4)
+        let issues = manifest.validationIssues(
+            expectedMode: .direct,
+            selectedImageNames: ["a.jpg", "b.jpg", "c.jpg", "d.jpg"]
+        )
         XCTAssertTrue(issues.contains(where: { $0.contains("registered_image_count") }))
         XCTAssertTrue(issues.contains(where: { $0.contains("raw_point_sample_count") }))
         XCTAssertTrue(issues.contains(where: { $0.contains("final_observation_count") }))
@@ -140,7 +146,10 @@ final class Da3CoverageManifestTests: XCTestCase {
             exportStrategy: "windowed_direct_colmap"
         )
 
-        let issues = manifest.validationIssues(expectedMode: .direct, selectedImageCount: 5)
+        let issues = manifest.validationIssues(
+            expectedMode: .direct,
+            selectedImageNames: ["a.jpg", "b.jpg", "c.jpg", "d.jpg", "e.jpg"]
+        )
         XCTAssertTrue(issues.contains(where: { $0.contains("native_colmap_export") }))
     }
 
@@ -184,8 +193,9 @@ final class Da3CoverageManifestTests: XCTestCase {
         XCTAssertEqual(manifest.alignmentEdgeCount, 3)
         XCTAssertEqual(manifest.maxAlignmentRMSE, 0.018)
         XCTAssertEqual(manifest.alignmentComplete, true)
-        XCTAssertTrue(manifest.validationIssues(expectedMode: .seedRefine, selectedImageCount: 7).isEmpty)
-        let pairs = manifest.boundedMatchPairs
+        let selectedNames = ["a.jpg", "b.jpg", "c.jpg", "d.jpg", "e.jpg", "f.jpg", "g.jpg"]
+        XCTAssertTrue(manifest.validationIssues(expectedMode: .seedRefine, selectedImageNames: selectedNames).isEmpty)
+        let pairs = try XCTUnwrap(manifest.boundedMatchPairs)
         XCTAssertEqual(pairs.count, 15)
         XCTAssertTrue(pairs.contains("a.jpg d.jpg"))
         XCTAssertFalse(pairs.contains("a.jpg g.jpg"))
@@ -226,11 +236,130 @@ final class Da3CoverageManifestTests: XCTestCase {
         """.write(to: manifestURL, atomically: true, encoding: .utf8)
 
         let manifest = try Da3CoverageManifest.load(from: manifestURL)
-        let issues = manifest.validationIssues(expectedMode: .seedRefine, selectedImageCount: 5)
+        let issues = manifest.validationIssues(
+            expectedMode: .seedRefine,
+            selectedImageNames: ["a.jpg", "b.jpg", "c.jpg", "d.jpg", "e.jpg"]
+        )
         XCTAssertTrue(issues.contains(where: { $0.contains("complete image coverage") }))
         XCTAssertTrue(issues.contains(where: { $0.contains("alignment_complete") }))
         XCTAssertTrue(issues.contains(where: { $0.contains("anchor_image_names") }))
         XCTAssertTrue(issues.contains(where: { $0.contains("must not claim sparse points") }))
+    }
+
+    func testSeedValidationRejectsOversizedWindowAndNameIndexMismatch() {
+        let selected = ["a.jpg", "b.jpg", "c.jpg", "d.jpg", "e.jpg"]
+        var manifest = makeSeedManifest(
+            selectedNames: selected,
+            ordering: .continuous,
+            windows: [
+                .init(start: 0, end: 5, images: selected, indices: [0, 1, 2, 3, 4])
+            ]
+        )
+        manifest.windowSize = 4
+        manifest.windows[0].images = ["b.jpg", "a.jpg", "c.jpg", "d.jpg", "e.jpg"]
+
+        let issues = manifest.validationIssues(expectedMode: .seedRefine, selectedImageNames: selected)
+        XCTAssertTrue(issues.contains(where: { $0.contains("exceeded window_size") }))
+        XCTAssertTrue(issues.contains(where: { $0.contains("name/index mapping") }))
+    }
+
+    func testSeedValidationRejectsCorruptExplicitIndexRange() {
+        let selected = ["a.jpg", "b.jpg", "c.jpg", "d.jpg", "e.jpg"]
+        let manifest = makeSeedManifest(
+            selectedNames: selected,
+            ordering: .continuous,
+            windows: [
+                .init(
+                    start: 0,
+                    end: 4,
+                    images: [selected[0], selected[1], selected[2], selected[4]],
+                    indices: [0, 1, 2, 4]
+                )
+            ]
+        )
+
+        let issues = manifest.validationIssues(expectedMode: .seedRefine, selectedImageNames: selected)
+        XCTAssertTrue(issues.contains(where: { $0.contains("range did not bound indices") }))
+    }
+
+    func testSeedValidationRejectsDisconnectedContinuousWindows() {
+        let selected = (0..<8).map { "img\($0).jpg" }
+        let manifest = makeSeedManifest(
+            selectedNames: selected,
+            ordering: .continuous,
+            windows: [
+                .init(start: 0, end: 4, images: Array(selected[0..<4]), indices: [0, 1, 2, 3]),
+                .init(start: 4, end: 8, images: Array(selected[4..<8]), indices: [4, 5, 6, 7])
+            ]
+        )
+
+        let issues = manifest.validationIssues(expectedMode: .seedRefine, selectedImageNames: selected)
+        XCTAssertTrue(issues.contains(where: { $0.contains("continuous overlap") }))
+    }
+
+    func testSeedValidationRejectsUnorderedWindowMissingDeclaredAnchor() {
+        let selected = (0..<6).map { "img\($0).jpg" }
+        var manifest = makeSeedManifest(
+            selectedNames: selected,
+            ordering: .unordered,
+            windows: [
+                .init(start: 0, end: 4, images: Array(selected[0..<4]), indices: [0, 1, 2, 3]),
+                .init(start: 0, end: 6, images: [selected[0], selected[1], selected[4], selected[5]], indices: [0, 1, 4, 5])
+            ]
+        )
+        manifest.anchorImageNames = [selected[0], selected[1], selected[2]]
+
+        let issues = manifest.validationIssues(expectedMode: .seedRefine, selectedImageNames: selected)
+        XCTAssertTrue(issues.contains(where: { $0.contains("declared anchors") }))
+    }
+
+    func testSeedValidationEnforcesHardMatchPairLimit() {
+        let selected = (0..<500).map { "img\($0).jpg" }
+        var manifest = makeSeedManifest(
+            selectedNames: selected,
+            ordering: .continuous,
+            windows: [
+                .init(start: 0, end: selected.count, images: selected, indices: Array(selected.indices))
+            ]
+        )
+        manifest.windowSize = selected.count
+
+        let issues = manifest.validationIssues(expectedMode: .seedRefine, selectedImageNames: selected)
+        XCTAssertTrue(issues.contains(where: { $0.contains("hard limit") }))
+    }
+
+    private func makeSeedManifest(
+        selectedNames: [String],
+        ordering: InputOrdering,
+        windows: [Da3CoverageManifest.Window]
+    ) -> Da3CoverageManifest {
+        Da3CoverageManifest(
+            mode: "seed_refine",
+            requestedDevice: "mps",
+            selectedDevice: "mps",
+            modelSubdirectory: "DA3-BASE",
+            fallbackModelSubdirectory: "DA3-SMALL",
+            processResolution: 504,
+            cameraType: "PINHOLE",
+            sharedCamera: false,
+            maxPoints: 120_000,
+            totalImages: selectedNames.count,
+            windowSize: 4,
+            windowOverlap: 3,
+            windows: windows,
+            rawPointSampleCount: nil,
+            fusedSparsePointCount: nil,
+            finalObservationCount: nil,
+            meanTrackLength: nil,
+            registeredImageCount: selectedNames.count,
+            nativeColmapExport: false,
+            exportStrategy: "aligned_pose_seed",
+            inputOrdering: ordering.rawValue,
+            anchorImageNames: Array(selectedNames.prefix(3)),
+            alignmentEdgeCount: max(0, windows.count - 1),
+            maxAlignmentRMSE: 0.01,
+            alignmentComplete: true
+        )
     }
 }
 #endif

@@ -9,6 +9,7 @@ MIN_WINDOW_SIZE = 4
 MIN_SIM3_SCALE = 0.05
 MAX_SIM3_SCALE = 20.0
 MAX_NORMALIZED_ALIGNMENT_RMSE = 0.05
+MAX_COMMON_ROTATION_ERROR_DEGREES = 15.0
 
 
 def plan_continuous_batches(image_count: int, window_size: int, overlap: int) -> list[list[int]]:
@@ -174,6 +175,41 @@ def align_w2c_poses(
         aligned[index, :3, :3] = global_w2c_rotation
         aligned[index, :3, 3] = -global_w2c_rotation @ center
     return aligned
+
+
+def validate_common_view_rotations(
+    aligned_w2c: np.ndarray,
+    accepted_global_w2c: np.ndarray,
+    *,
+    maximum_error_degrees: float = MAX_COMMON_ROTATION_ERROR_DEGREES,
+) -> float:
+    """Reject center-only Sim(3) solutions with inconsistent camera chirality.
+
+    Three centers only span a plane after centering, so a mirrored triangle can
+    admit a proper 3D rotation. Camera orientations remove that ambiguity. The
+    geodesic threshold allows modest learned-pose disagreement while rejecting
+    the 180-degree null-axis flip produced by a mirrored batch.
+    """
+
+    aligned = _validated_w2c(aligned_w2c)
+    accepted = _validated_w2c(accepted_global_w2c)
+    if aligned.shape != accepted.shape or aligned.shape[0] < MIN_ALIGNMENT_ANCHORS:
+        raise ValueError("common-view camera orientation validation requires matching anchor poses")
+    if not np.isfinite(maximum_error_degrees) or maximum_error_degrees <= 0.0:
+        raise ValueError("camera orientation threshold must be positive and finite")
+
+    maximum_error = 0.0
+    for aligned_pose, accepted_pose in zip(aligned, accepted):
+        relative = aligned_pose[:3, :3] @ accepted_pose[:3, :3].T
+        cosine = float(np.clip((np.trace(relative) - 1.0) * 0.5, -1.0, 1.0))
+        error_degrees = float(np.degrees(np.arccos(cosine)))
+        maximum_error = max(maximum_error, error_degrees)
+    if maximum_error > maximum_error_degrees:
+        raise ValueError(
+            f"common-view camera orientation error {maximum_error:.3f} degrees exceeded "
+            f"{maximum_error_degrees:.3f} degrees"
+        )
+    return maximum_error
 
 
 def _validated_w2c(values: np.ndarray) -> np.ndarray:

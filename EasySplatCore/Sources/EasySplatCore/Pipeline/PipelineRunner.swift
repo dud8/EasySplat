@@ -714,7 +714,10 @@ public final class PipelineRunner: @unchecked Sendable {
                                 }
                                 return nil
                             }
-                            let issues = manifest.validationIssues(expectedMode: da3Mode, selectedImageCount: selectedFrames.count)
+                            let issues = manifest.validationIssues(
+                                expectedMode: da3Mode,
+                                selectedImageNames: selectedFrames.map(\.lastPathComponent)
+                            )
                             if !issues.isEmpty {
                                 emit(.stageLog(
                                     stage: currentStage,
@@ -943,8 +946,9 @@ public final class PipelineRunner: @unchecked Sendable {
                                 self.logKeypointStats(database: paths.colmapDatabaseURL, stage: .sfmMatching, emit: emit)
 
                                 let seedManifest = try readDa3CoverageManifest(required: true)
-                                let matchPairs = seedManifest?.boundedMatchPairs ?? []
-                                guard !matchPairs.isEmpty else {
+                                guard let matchPairs = seedManifest?.boundedMatchPairs,
+                                      !matchPairs.isEmpty,
+                                      matchPairs.count <= Da3CoverageManifest.hardMatchPairLimit else {
                                     throw PipelineError.outputMissing
                                 }
                                 let matchListURL = paths.colmapSeedURL.appendingPathComponent("match_pairs.txt")

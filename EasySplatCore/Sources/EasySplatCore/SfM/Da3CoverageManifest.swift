@@ -1,6 +1,8 @@
 import Foundation
 
 struct Da3CoverageManifest: Codable, Sendable {
+    static let hardMatchPairLimit = 100_000
+
     struct Window: Codable, Sendable {
         var start: Int
         var end: Int
@@ -67,8 +69,9 @@ struct Da3CoverageManifest: Codable, Sendable {
         return try JSONDecoder().decode(Da3CoverageManifest.self, from: data)
     }
 
-    func validationIssues(expectedMode: Da3RunMode, selectedImageCount: Int) -> [String] {
+    func validationIssues(expectedMode: Da3RunMode, selectedImageNames: [String]) -> [String] {
         var issues: [String] = []
+        let selectedImageCount = selectedImageNames.count
         if mode != expectedMode.rawValue {
             issues.append("mode=\(mode) did not match expected \(expectedMode.rawValue)")
         }
@@ -78,12 +81,22 @@ struct Da3CoverageManifest: Codable, Sendable {
         if windows.isEmpty {
             issues.append("windows list was empty")
         }
+        if windowSize <= 0 {
+            issues.append("window_size must be positive")
+        }
+        if Set(selectedImageNames).count != selectedImageNames.count {
+            issues.append("selected image names were not unique")
+        }
+        var resolvedWindowIndices: [[Int]] = []
         for (index, window) in windows.enumerated() {
             if window.start < 0 || window.end <= window.start {
                 issues.append("window[\(index)] had invalid range \(window.start)..<\(window.end)")
             }
             if window.end > selectedImageCount {
                 issues.append("window[\(index)] end \(window.end) exceeded selected frames \(selectedImageCount)")
+            }
+            if window.images.count > windowSize {
+                issues.append("window[\(index)] image count \(window.images.count) exceeded window_size \(windowSize)")
             }
             if let indices = window.indices {
                 if indices.count != window.images.count {
@@ -95,8 +108,29 @@ struct Da3CoverageManifest: Codable, Sendable {
                 if indices.contains(where: { $0 < 0 || $0 >= selectedImageCount }) {
                     issues.append("window[\(index)] contained an out-of-range image index")
                 }
+                if let minimumIndex = indices.min(),
+                   let maximumIndex = indices.max(),
+                   (window.start != minimumIndex || window.end != maximumIndex + 1) {
+                    issues.append("window[\(index)] range did not bound indices")
+                }
+                resolvedWindowIndices.append(indices)
             } else if window.images.count != max(0, window.end - window.start) {
                 issues.append("window[\(index)] images count \(window.images.count) did not match range length \(max(0, window.end - window.start))")
+                resolvedWindowIndices.append([])
+            } else {
+                let rangeIndices = window.start >= 0 && window.end <= selectedImageCount && window.end >= window.start
+                    ? Array(window.start..<window.end)
+                    : []
+                resolvedWindowIndices.append(rangeIndices)
+            }
+            let mappedIndices = resolvedWindowIndices.last ?? []
+            if mappedIndices.count == window.images.count {
+                for (position, imageIndex) in mappedIndices.enumerated() where selectedImageNames.indices.contains(imageIndex) {
+                    if selectedImageNames[imageIndex] != window.images[position] {
+                        issues.append("window[\(index)] name/index mapping did not match selected image order")
+                        break
+                    }
+                }
             }
         }
         if expectedMode == .direct, let registeredImageCount, registeredImageCount != selectedImageCount {
@@ -121,10 +155,13 @@ struct Da3CoverageManifest: Codable, Sendable {
             if registeredImageCount != selectedImageCount {
                 issues.append("seed_refine requires complete image coverage: registered_image_count must equal \(selectedImageCount)")
             }
-            let coveredImages = Set(windows.flatMap(\.images))
-            if coveredImages.count != selectedImageCount {
+            let coveredIndices = resolvedWindowIndices.reduce(into: Set<Int>()) { partial, indices in
+                partial.formUnion(indices)
+            }
+            if coveredIndices != Set(selectedImageNames.indices) {
                 issues.append("seed_refine requires complete image coverage across windows")
             }
+            let coveredImages = Set(windows.flatMap(\.images))
             let anchors = anchorImageNames ?? []
             if anchors.count < 3 || Set(anchors).count != anchors.count {
                 issues.append("seed_refine requires at least three distinct anchor_image_names")
@@ -134,6 +171,35 @@ struct Da3CoverageManifest: Codable, Sendable {
             if inputOrdering != InputOrdering.continuous.rawValue,
                inputOrdering != InputOrdering.unordered.rawValue {
                 issues.append("seed_refine input_ordering must resolve to continuous or unordered")
+            }
+            if inputOrdering == InputOrdering.continuous.rawValue {
+                var seen = Set<Int>()
+                for (index, indices) in resolvedWindowIndices.enumerated() {
+                    let current = Set(indices)
+                    if index > 0 {
+                        let previous = Set(resolvedWindowIndices[index - 1])
+                        if previous.intersection(current).count < 3 {
+                            issues.append("window[\(index)] continuous overlap had fewer than three images")
+                        }
+                        if current.subtracting(seen).isEmpty {
+                            issues.append("window[\(index)] did not advance the continuous alignment graph")
+                        }
+                    }
+                    seen.formUnion(current)
+                }
+            } else if inputOrdering == InputOrdering.unordered.rawValue {
+                let anchorIndices = Set(anchors.compactMap { selectedImageNames.firstIndex(of: $0) })
+                var seen = Set<Int>()
+                for (index, indices) in resolvedWindowIndices.enumerated() {
+                    let current = Set(indices)
+                    if !anchorIndices.isSubset(of: current) {
+                        issues.append("window[\(index)] did not contain all declared anchors")
+                    }
+                    if index > 0, current.subtracting(seen).isEmpty {
+                        issues.append("window[\(index)] did not add an unseen image")
+                    }
+                    seen.formUnion(current)
+                }
             }
             if alignmentComplete != true {
                 issues.append("seed_refine requires alignment_complete=true")
@@ -151,6 +217,9 @@ struct Da3CoverageManifest: Codable, Sendable {
             }
             if rawPointSampleCount != nil || fusedSparsePointCount != nil || finalObservationCount != nil || meanTrackLength != nil {
                 issues.append("aligned pose seed must not claim sparse points, observations, or track length")
+            }
+            if boundedMatchPairs == nil {
+                issues.append("seed_refine match pair count exceeded the hard limit \(Self.hardMatchPairLimit)")
             }
         }
         if let rawPointSampleCount, rawPointSampleCount <= 0 {
@@ -198,7 +267,7 @@ struct Da3CoverageManifest: Codable, Sendable {
         return parts.joined(separator: ", ")
     }
 
-    var boundedMatchPairs: [String] {
+    var boundedMatchPairs: [String]? {
         var pairs = Set<String>()
         for window in windows {
             guard window.images.count >= 2 else { continue }
@@ -209,6 +278,9 @@ struct Da3CoverageManifest: Codable, Sendable {
                     guard first != second else { continue }
                     let ordered = first < second ? "\(first) \(second)" : "\(second) \(first)"
                     pairs.insert(ordered)
+                    if pairs.count > Self.hardMatchPairLimit {
+                        return nil
+                    }
                 }
             }
         }

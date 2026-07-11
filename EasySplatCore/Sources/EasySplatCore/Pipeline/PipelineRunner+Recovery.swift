@@ -454,7 +454,12 @@ extension PipelineRunner {
             return []
         }
 
-        let selectedImageCount = (try? loadImages(in: paths.framesSelectedURL).count)
+        let selectedImageNames: [String]
+        do {
+            selectedImageNames = try loadImages(in: paths.framesSelectedURL).map(\.lastPathComponent)
+        } catch {
+            return ["selected images could not be loaded for DA3 manifest validation (\(error.localizedDescription))"]
+        }
         let manifest: Da3CoverageManifest
         do {
             manifest = try Da3CoverageManifest.load(from: paths.da3CoverageManifestURL)
@@ -464,7 +469,7 @@ extension PipelineRunner {
 
         var issues = manifest.validationIssues(
             expectedMode: .direct,
-            selectedImageCount: selectedImageCount ?? manifest.totalImages
+            selectedImageNames: selectedImageNames
         )
         if textStats.registeredImageCount == nil {
             issues.append("images.txt was missing from DA3 direct sparse output")

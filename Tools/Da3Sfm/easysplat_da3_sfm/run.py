@@ -22,6 +22,7 @@ from .alignment import (
     plan_continuous_batches as _plan_continuous_batches,
     plan_unordered_batches as _plan_unordered_batches,
     select_anchor_indices as _select_anchor_indices,
+    validate_common_view_rotations as _validate_common_view_rotations,
 )
 
 SUPPORTED_CAMERA_TYPES = ("SIMPLE_RADIAL", "SIMPLE_PINHOLE", "PINHOLE", "OPENCV")
@@ -143,29 +144,54 @@ def _rotmat_to_quat_wxyz(rot: np.ndarray) -> np.ndarray:
     return quat
 
 
+def _validate_pinhole_intrinsics(intrinsics: np.ndarray) -> np.ndarray:
+    matrix = np.asarray(intrinsics, dtype=np.float64)
+    if matrix.shape != (3, 3) or not np.all(np.isfinite(matrix)):
+        raise ValueError("DA3 intrinsics must be a finite 3x3 pinhole matrix")
+    if matrix[0, 0] <= 0.0 or matrix[1, 1] <= 0.0:
+        raise ValueError("DA3 intrinsics focal lengths must be positive")
+    if (
+        abs(float(matrix[0, 1])) > 1e-6
+        or abs(float(matrix[1, 0])) > 1e-6
+        or not np.allclose(matrix[2, :], np.array([0.0, 0.0, 1.0]), atol=1e-6, rtol=0.0)
+    ):
+        raise ValueError("DA3 intrinsics must use canonical zero-skew pinhole form")
+    return matrix
+
+
 def _camera_params(
     intrinsics: np.ndarray,
     size: tuple[int, int],
     camera_type: str,
     source_size: tuple[int, int] | None = None,
 ) -> list[float]:
+    intrinsics = _validate_pinhole_intrinsics(intrinsics)
     width, height = size
     source_width, source_height = source_size or size
     scale_x = width / max(1.0, float(source_width))
     scale_y = height / max(1.0, float(source_height))
-    fx = float(intrinsics[0, 0]) * scale_x
-    fy = float(intrinsics[1, 1]) * scale_y
-    cx = (float(intrinsics[0, 2]) * scale_x) if intrinsics.shape[1] > 2 else width / 2.0
-    cy = (float(intrinsics[1, 2]) * scale_y) if intrinsics.shape[1] > 2 else height / 2.0
+    with np.errstate(over="ignore", invalid="ignore"):
+        fx = float(intrinsics[0, 0]) * scale_x
+        fy = float(intrinsics[1, 1]) * scale_y
+        cx = float(intrinsics[0, 2]) * scale_x
+        cy = float(intrinsics[1, 2]) * scale_y
     if camera_type == "PINHOLE":
-        return [fx, fy, cx, cy]
-    if camera_type == "SIMPLE_PINHOLE":
-        return [(fx + fy) / 2.0, cx, cy]
-    if camera_type == "SIMPLE_RADIAL":
-        return [(fx + fy) / 2.0, cx, cy, 0.0]
-    if camera_type == "OPENCV":
-        return [fx, fy, cx, cy, 0.0, 0.0, 0.0, 0.0]
-    raise ValueError(f"Unsupported camera type: {camera_type}")
+        params = [fx, fy, cx, cy]
+        focal_values = params[:2]
+    elif camera_type == "SIMPLE_PINHOLE":
+        params = [(fx + fy) / 2.0, cx, cy]
+        focal_values = params[:1]
+    elif camera_type == "SIMPLE_RADIAL":
+        params = [(fx + fy) / 2.0, cx, cy, 0.0]
+        focal_values = params[:1]
+    elif camera_type == "OPENCV":
+        params = [fx, fy, cx, cy, 0.0, 0.0, 0.0, 0.0]
+        focal_values = params[:2]
+    else:
+        raise ValueError(f"Unsupported camera type: {camera_type}")
+    if not np.all(np.isfinite(params)) or any(value <= 0.0 for value in focal_values):
+        raise ValueError("DA3 scaled camera parameters must be finite with positive focal length")
+    return params
 
 
 def _prediction_value(prediction: dict[str, Any], *names: str) -> Any | None:
@@ -236,10 +262,9 @@ def _exact_prediction_geometry(prediction: Any, count: int) -> tuple[np.ndarray,
     if intrinsics.ndim != 3 or intrinsics.shape[1:] != (3, 3):
         raise ValueError("DA3 seed prediction intrinsics must have shape Nx3x3")
     intrinsics = _require_view_axis(intrinsics, count, "intrinsics")
-    if not np.all(np.isfinite(extrinsics)) or not np.all(np.isfinite(intrinsics)):
-        raise ValueError("DA3 seed prediction poses and intrinsics must be finite")
-    if np.any(intrinsics[:, 0, 0] <= 0.0) or np.any(intrinsics[:, 1, 1] <= 0.0):
-        raise ValueError("DA3 seed prediction focal lengths must be positive")
+    intrinsics = np.stack([_validate_pinhole_intrinsics(matrix) for matrix in intrinsics])
+    if not np.all(np.isfinite(extrinsics)):
+        raise ValueError("DA3 seed prediction poses must be finite")
     rotations = extrinsics[:, :3, :3]
     determinants = np.linalg.det(rotations)
     gram_matrices = rotations @ np.transpose(rotations, (0, 2, 1))
@@ -647,23 +672,33 @@ def _run_da3_export(
 
     from depth_anything_3.api import DepthAnything3
 
+    model: Any | None = None
     try:
-        model = DepthAnything3.from_pretrained(str(model_dir), local_files_only=True)
-    except TypeError:
-        model = DepthAnything3.from_pretrained(str(model_dir))
-    if hasattr(model, "to"):
-        model = model.to(selected_device)
+        try:
+            model = DepthAnything3.from_pretrained(str(model_dir), local_files_only=True)
+        except TypeError:
+            model = DepthAnything3.from_pretrained(str(model_dir))
+        if hasattr(model, "to"):
+            model = model.to(selected_device)
 
-    if args.mode == "seed_refine":
-        return _run_da3_seed_refine(args, model, image_paths, selected_device, out_sparse)
+        if args.mode == "seed_refine":
+            return _run_da3_seed_refine(args, model, image_paths, selected_device, out_sparse)
 
-    with tempfile.TemporaryDirectory(prefix="easysplat-da3-") as tmp:
-        export_dir = Path(tmp) / "export"
-        _call_da3_inference(args, model, image_paths, export_dir, selected_device)
-        if _copy_colmap_export(export_dir, out_sparse):
-            registered_count, point_count, observation_count, mean_track_length = _colmap_text_stats(out_sparse)
-            return point_count, observation_count, mean_track_length, registered_count, None
-    raise RuntimeError("DA3 did not produce a native COLMAP export")
+        with tempfile.TemporaryDirectory(prefix="easysplat-da3-") as tmp:
+            export_dir = Path(tmp) / "export"
+            _call_da3_inference(
+                args,
+                model,
+                image_paths,
+                selected_device,
+                export_dir=export_dir,
+            )
+            if _copy_colmap_export(export_dir, out_sparse):
+                registered_count, point_count, observation_count, mean_track_length = _colmap_text_stats(out_sparse)
+                return point_count, observation_count, mean_track_length, registered_count, None
+        raise RuntimeError("DA3 did not produce a native COLMAP export")
+    finally:
+        model = None
 
 
 def _run_da3_seed_refine(
@@ -694,14 +729,12 @@ def _run_da3_seed_refine(
         if len(batch) != len(set(batch)):
             raise ValueError(f"DA3 alignment batch {batch_number} contained duplicate image indices")
         paths = [image_paths[index] for index in batch]
-        with tempfile.TemporaryDirectory(prefix=f"easysplat-da3-seed-{batch_number:04d}-") as tmp:
-            prediction = _call_da3_inference(
-                args,
-                model,
-                paths,
-                Path(tmp) / "export",
-                selected_device,
-            )
+        prediction = _call_da3_inference(
+            args,
+            model,
+            paths,
+            selected_device,
+        )
         return _exact_prediction_geometry(prediction, len(paths))
 
     first_poses, first_intrinsics, first_processed_sizes = infer_batch(initial_batch, 0)
@@ -738,6 +771,10 @@ def _run_da3_seed_refine(
         ])
         scale, rotation, translation, normalized_rmse = _estimate_sim3(source_centers, target_centers)
         aligned_poses = _align_w2c_poses(local_poses, scale, rotation, translation)
+        _validate_common_view_rotations(
+            np.stack([aligned_poses[local_positions[index]] for index in common]),
+            np.stack([global_poses[index] for index in common]),
+        )
         alignment_errors.append(normalized_rmse)
         edge_anchor_indices.update(common)
 
@@ -788,16 +825,17 @@ def _call_da3_inference(
     args: argparse.Namespace,
     model: Any,
     image_paths: list[Path],
-    export_dir: Path,
     selected_device: str,
+    export_dir: Path | None = None,
 ) -> Any:
     kwargs = {
         "image": [str(path) for path in image_paths],
-        "export_dir": str(export_dir),
-        "export_format": "colmap",
         "process_res": args.process_res,
         "device": selected_device,
     }
+    if export_dir is not None:
+        kwargs["export_dir"] = str(export_dir)
+        kwargs["export_format"] = "colmap"
     try:
         return model.inference(**kwargs)
     except TypeError as exc:
@@ -838,6 +876,27 @@ def _release_accelerator_memory() -> None:
         pass
 
 
+def _run_da3_attempt(
+    args: argparse.Namespace,
+    image_paths: list[Path],
+    model_dir: Path,
+    selected_device: str,
+    out_sparse: Path,
+) -> tuple[tuple[int, int | None, float | None, int | None, dict[str, Any] | None] | None, str | None]:
+    try:
+        return _run_da3_export(args, image_paths, model_dir, selected_device, out_sparse), None
+    except Exception as exc:  # noqa: BLE001
+        if not _is_memory_error(exc):
+            raise
+        message = str(exc)
+        # A traceback retains every inference frame, including the model. Clear
+        # it before returning so SMALL loads outside the failed BASE lifetime.
+        exc.__traceback__ = None
+        del exc
+        _release_accelerator_memory()
+        return None, message
+
+
 def main(argv: list[str] | None = None) -> int:
     args = build_arg_parser().parse_args(argv)
     models_dir = args.models_dir or _default_models_dir()
@@ -869,30 +928,34 @@ def main(argv: list[str] | None = None) -> int:
     _remove_path(args.out_sparse)
     if args.manifest_out:
         _remove_path(args.manifest_out)
-    try:
-        point_count, observation_count, mean_track_length, registered_count, alignment_evidence = _run_da3_export(
-            args,
-            image_paths,
-            primary_model,
-            selected_device,
-            args.out_sparse,
-        )
+    primary_result, primary_memory_failure = _run_da3_attempt(
+        args,
+        image_paths,
+        primary_model,
+        selected_device,
+        args.out_sparse,
+    )
+    if primary_result is not None:
+        point_count, observation_count, mean_track_length, registered_count, alignment_evidence = primary_result
         model_subdir = args.model_subdir
-    except Exception as exc:  # noqa: BLE001
-        if not _is_memory_error(exc):
-            raise
+    else:
+        assert primary_memory_failure is not None
         print(f"DA3: {args.model_subdir} ran out of memory; retrying with {args.fallback_model_subdir}", file=sys.stderr)
         _remove_path(args.out_sparse)
         if args.manifest_out:
             _remove_path(args.manifest_out)
-        _release_accelerator_memory()
-        point_count, observation_count, mean_track_length, registered_count, alignment_evidence = _run_da3_export(
+        fallback_result, fallback_memory_failure = _run_da3_attempt(
             args,
             image_paths,
             fallback_model,
             selected_device,
             args.out_sparse,
         )
+        if fallback_result is None:
+            raise RuntimeError(
+                f"DA3 {args.fallback_model_subdir} also ran out of memory: {fallback_memory_failure}"
+            )
+        point_count, observation_count, mean_track_length, registered_count, alignment_evidence = fallback_result
         model_subdir = args.fallback_model_subdir
 
     if args.manifest_out:

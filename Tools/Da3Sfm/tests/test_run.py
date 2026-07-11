@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import gc
 import json
 import os
 import sys
 import tempfile
 import types
 import unittest
+import weakref
 from pathlib import Path
 from unittest import mock
 
@@ -14,6 +16,7 @@ from PIL import Image
 
 from easysplat_da3_sfm.run import (
     _align_w2c_poses,
+    _camera_params,
     _colmap_text_stats,
     _default_models_dir,
     _estimate_sim3,
@@ -27,6 +30,7 @@ from easysplat_da3_sfm.run import (
     _run_da3_export,
     _select_anchor_indices,
     _select_device,
+    _validate_common_view_rotations,
     _write_seed_colmap,
     _write_colmap_from_prediction,
     _write_manifest,
@@ -200,6 +204,25 @@ class Da3RunTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "RMSE"):
             _estimate_sim3(source, noisy)
 
+    def test_three_anchor_mirror_is_rejected_by_camera_orientation(self) -> None:
+        source_centers = np.array([
+            [0.0, 0.0, 0.0],
+            [1.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0],
+        ])
+        target_centers = source_centers.copy()
+        target_centers[:, 0] *= -1.0
+        scale, rotation, translation, _ = _estimate_sim3(source_centers, target_centers)
+
+        local_w2c = np.repeat(np.eye(4)[None, ...], 3, axis=0)
+        local_w2c[:, :3, 3] = -source_centers
+        accepted_global_w2c = np.repeat(np.eye(4)[None, ...], 3, axis=0)
+        accepted_global_w2c[:, :3, 3] = -target_centers
+        aligned = _align_w2c_poses(local_w2c, scale, rotation, translation)
+
+        with self.assertRaisesRegex(ValueError, "camera orientation"):
+            _validate_common_view_rotations(aligned, accepted_global_w2c)
+
     def test_seed_export_has_stable_ids_and_no_points_or_observations(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
@@ -260,6 +283,40 @@ class Da3RunTests(unittest.TestCase):
                     "intrinsics": np.eye(3)[None, ...],
                 },
                 1,
+            )
+
+    def test_seed_geometry_requires_canonical_pinhole_intrinsics(self) -> None:
+        malformed = {
+            "skew": np.array([[2.0, 0.2, 1.0], [0.0, 2.0, 1.0], [0.0, 0.0, 1.0]]),
+            "lower_off_diagonal": np.array([[2.0, 0.0, 1.0], [0.2, 2.0, 1.0], [0.0, 0.0, 1.0]]),
+            "bottom_row": np.array([[2.0, 0.0, 1.0], [0.0, 2.0, 1.0], [0.1, 0.0, 1.0]]),
+            "non_unit_homogeneous": np.array([[2.0, 0.0, 1.0], [0.0, 2.0, 1.0], [0.0, 0.0, 2.0]]),
+            "negative_focal": np.array([[-2.0, 0.0, 1.0], [0.0, 2.0, 1.0], [0.0, 0.0, 1.0]]),
+            "nonfinite_principal_point": np.array([[2.0, 0.0, np.nan], [0.0, 2.0, 1.0], [0.0, 0.0, 1.0]]),
+        }
+        for label, intrinsics in malformed.items():
+            with self.subTest(label=label):
+                with self.assertRaisesRegex(ValueError, "intrinsics"):
+                    _exact_prediction_geometry(
+                        {
+                            "extrinsics": np.eye(4)[None, ...],
+                            "intrinsics": intrinsics[None, ...],
+                        },
+                        1,
+                    )
+
+    def test_camera_params_rejects_nonfinite_scaled_values(self) -> None:
+        intrinsics = np.array([
+            [1e308, 0.0, 1.0],
+            [0.0, 1e308, 1.0],
+            [0.0, 0.0, 1.0],
+        ])
+        with self.assertRaisesRegex(ValueError, "scaled camera parameters"):
+            _camera_params(
+                intrinsics,
+                (16, 12),
+                "PINHOLE",
+                source_size=(1, 1),
             )
 
     def test_rotmat_to_quat_handles_negative_trace_rotation(self) -> None:
@@ -614,6 +671,7 @@ class Da3RunTests(unittest.TestCase):
 
             calls: dict[str, list[list[str]]] = {"DA3-BASE": [], "DA3-SMALL": []}
             loads: list[str] = []
+            base_model_ref: weakref.ReferenceType[object] | None = None
 
             class FakeModel:
                 def __init__(self, name: str):
@@ -642,9 +700,17 @@ class Da3RunTests(unittest.TestCase):
             class FakeDepthAnything3:
                 @staticmethod
                 def from_pretrained(path, local_files_only=False):
+                    nonlocal base_model_ref
                     name = Path(path).name
                     loads.append(name)
-                    return FakeModel(name)
+                    if name == "DA3-SMALL":
+                        gc.collect()
+                        if base_model_ref is not None and base_model_ref() is not None:
+                            raise AssertionError("BASE model remained live when SMALL started loading")
+                    model = FakeModel(name)
+                    if name == "DA3-BASE":
+                        base_model_ref = weakref.ref(model)
+                    return model
 
             depth_anything_module = types.ModuleType("depth_anything_3")
             api_module = types.ModuleType("depth_anything_3.api")
@@ -857,6 +923,83 @@ class Da3RunTests(unittest.TestCase):
             ]
             self.assertEqual(len(image_lines), 7)
 
+    def test_seed_refine_avoids_mutating_colmap_export_and_scales_intrinsics_once(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            images = []
+            for index in range(4):
+                path = root / f"img{index}.jpg"
+                Image.new("RGB", (8, 8)).save(path)
+                images.append(path)
+            model_dir = root / "models" / "DA3-BASE"
+            model_dir.mkdir(parents=True)
+            (model_dir / "config.json").write_text("{}", encoding="utf-8")
+            (model_dir / "model.safetensors").write_bytes(b"0")
+            captured_kwargs: list[dict[str, object]] = []
+
+            class FakeModel:
+                def inference(self, **kwargs):
+                    captured_kwargs.append(dict(kwargs))
+                    count = len(kwargs["image"])
+                    centers = np.array([
+                        [0.0, 0.0, 0.0],
+                        [1.0, 0.0, 0.0],
+                        [0.0, 1.0, 0.0],
+                        [1.0, 1.0, 0.0],
+                    ])
+                    poses = np.repeat(np.eye(4)[None, ...], count, axis=0)
+                    poses[:, :3, 3] = -centers[:count]
+                    intrinsics = np.repeat(
+                        np.array([[2.0, 0.0, 1.0], [0.0, 2.0, 1.0], [0.0, 0.0, 1.0]])[None, ...],
+                        count,
+                        axis=0,
+                    )
+                    if "export_dir" in kwargs:
+                        # The pinned COLMAP exporter performs this original-size
+                        # conversion in place before returning Prediction.
+                        intrinsics[:, :2, :] *= 4.0
+                    return {
+                        "extrinsics": poses,
+                        "intrinsics": intrinsics,
+                        "depth": np.ones((count, 2, 2)),
+                    }
+
+            class FakeDepthAnything3:
+                @staticmethod
+                def from_pretrained(path, local_files_only=False):
+                    return FakeModel()
+
+            depth_anything_module = types.ModuleType("depth_anything_3")
+            api_module = types.ModuleType("depth_anything_3.api")
+            api_module.DepthAnything3 = FakeDepthAnything3
+            args = build_arg_parser().parse_args([
+                "--images", str(root),
+                "--out-sparse", str(root / "seed" / "0"),
+                "--models-dir", str(model_dir.parent),
+                "--mode", "seed_refine",
+                "--input-ordering", "continuous",
+                "--window-size", "4",
+                "--window-overlap", "3",
+            ])
+            with mock.patch.dict(sys.modules, {
+                "depth_anything_3": depth_anything_module,
+                "depth_anything_3.api": api_module,
+            }):
+                result = _run_da3_export(args, images, model_dir, "cpu", root / "seed" / "0")
+
+            self.assertEqual(len(captured_kwargs), 1)
+            self.assertNotIn("export_dir", captured_kwargs[0])
+            self.assertNotIn("export_format", captured_kwargs[0])
+            alignment_evidence = result[-1]
+            self.assertIsNotNone(alignment_evidence)
+            self.assertEqual(len(alignment_evidence["anchor_indices"]), 3)
+            camera_row = next(
+                line
+                for line in (root / "seed" / "0" / "cameras.txt").read_text(encoding="utf-8").splitlines()
+                if line and not line.startswith("#")
+            )
+            self.assertEqual([float(value) for value in camera_row.split()[4:]], [8.0, 8.0, 4.0, 4.0])
+
     def test_seed_refine_rejects_missing_prediction_view(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
@@ -967,6 +1110,8 @@ class Da3RunTests(unittest.TestCase):
 
             class FakeModel:
                 def inference(self, **kwargs):
+                    if kwargs.get("export_format") != "colmap" or "export_dir" not in kwargs:
+                        raise AssertionError("direct mode must request native COLMAP export")
                     sparse = Path(kwargs["export_dir"])
                     sparse.mkdir(parents=True)
                     (sparse / "cameras.txt").write_text("1 PINHOLE 8 8 1 1 4 4\n", encoding="utf-8")
