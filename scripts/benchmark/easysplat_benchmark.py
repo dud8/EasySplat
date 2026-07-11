@@ -42,6 +42,14 @@ ALLOWED_ADAPTERS = {"da3", "external-result"}
 APP_VERSION = "0.2.0-beta.1"
 SHA256_PATTERN = re.compile(r"^sha256:[0-9a-f]{64}$")
 SAFE_TOKEN_PATTERN = re.compile(r"^[a-z0-9][a-z0-9_.-]{0,63}$")
+ARTIFACT_NAME_PATTERN = re.compile(r"^[a-z][a-z0-9_]*$")
+UNAVAILABLE_REASON_CODES = {
+    "adapter_incomplete",
+    "not_measured",
+    "reference_unavailable",
+    "tool_unavailable",
+    "unsupported",
+}
 PRIVATE_TEXT_PATTERNS = (
     re.compile(r"/Users/", re.IGNORECASE),
     re.compile(r"/home/", re.IGNORECASE),
@@ -398,6 +406,8 @@ def measured(value: Any) -> dict[str, Any]:
 def unavailable(reason: str | None = None) -> dict[str, Any]:
     value: dict[str, Any] = {"availability": "not_available"}
     if reason:
+        if reason not in UNAVAILABLE_REASON_CODES:
+            raise ValueError(f"unsupported metric-unavailability reason: {reason}")
         value["reason"] = reason
     return value
 
@@ -420,11 +430,8 @@ def metric_validation_failures(metrics: Any) -> list[str]:
             if set(raw) - {"availability", "reason"}:
                 failures.append(f"{name} not_available has unknown fields")
             reason = raw.get("reason")
-            if reason is not None:
-                try:
-                    _require_public_text(reason, f"{name}.reason")
-                except ConfigError as error:
-                    failures.append(str(error))
+            if reason is not None and reason not in UNAVAILABLE_REASON_CODES:
+                failures.append(f"{name}.reason must be a controlled reason code")
             continue
         if availability != "measured" or set(raw) != {"availability", "value"}:
             failures.append(f"{name} must be measured with one value or explicitly not_available")
@@ -608,6 +615,10 @@ def evaluate_invalid_scene(expected: Mapping[str, Any], actual: Mapping[str, Any
     required = {"exit_code", "termination_reason", "cancelled", "failure_type", "corrupt_ply"}
     if not isinstance(actual, Mapping) or set(actual) != required:
         return {"status": "blocked", "blocking_reasons": ["complete invalid-scene evidence is unavailable"], "failures": []}
+    try:
+        _validate_actual_evidence(actual, "invalid-scene evidence")
+    except ConfigError:
+        return {"status": "blocked", "blocking_reasons": ["invalid-scene termination evidence is contradictory"], "failures": []}
     exit_code = actual["exit_code"]
     if type(exit_code) is not int:
         return {"status": "blocked", "blocking_reasons": ["integer exit evidence is unavailable"], "failures": []}
@@ -775,14 +786,6 @@ def _load_json(path: Path, label: str) -> Any:
         raise ConfigError(f"{label} is not valid JSON: {path}: {error}") from error
 
 
-def _sha256_file(path: Path) -> str:
-    hasher = hashlib.sha256()
-    with path.open("rb") as handle:
-        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
-            hasher.update(chunk)
-    return "sha256:" + hasher.hexdigest()
-
-
 def _hash_length_prefixed(hasher: Any, value: bytes) -> None:
     hasher.update(len(value).to_bytes(8, "big"))
     hasher.update(value)
@@ -832,11 +835,54 @@ def digest_input(path: Path) -> str:
 def resolved_toolchain_identity(toolchain_root: Path, profile: str) -> str | None:
     if profile == "smoke":
         return "fixture:smoke"
-    for name in ("signed_receipt.json", "toolchain_receipt.json", "manifest.json"):
-        candidate = toolchain_root / name
-        if candidate.is_file() and not candidate.is_symlink():
-            return _sha256_file(candidate)
-    return None
+    identity_files = [
+        toolchain_root / name
+        for name in ("signed_receipt.json", "toolchain_receipt.json", "manifest.json")
+    ]
+    if not any(path.is_file() and not path.is_symlink() for path in identity_files):
+        return None
+    if not toolchain_root.is_dir() or toolchain_root.is_symlink():
+        raise ConfigError("toolchain root must be a real directory")
+
+    canonical_root = toolchain_root.resolve()
+    hasher = hashlib.sha256()
+    _hash_length_prefixed(hasher, b"easysplat-benchmark-toolchain-v1")
+    entries = sorted(toolchain_root.rglob("*"), key=lambda path: path.relative_to(toolchain_root).as_posix())
+    for entry in entries:
+        relative = entry.relative_to(toolchain_root).as_posix()
+        if entry.is_symlink():
+            target = os.readlink(entry)
+            resolved = entry.resolve(strict=True)
+            if resolved != canonical_root and canonical_root not in resolved.parents:
+                raise ConfigError(f"toolchain symlink escapes its root: {relative}")
+            _hash_length_prefixed(hasher, b"symlink")
+            _hash_length_prefixed(hasher, relative.encode("utf-8"))
+            _hash_length_prefixed(hasher, target.encode("utf-8"))
+            continue
+        if entry.is_dir():
+            continue
+        if not entry.is_file():
+            raise ConfigError(f"toolchain contains unsupported filesystem entry: {relative}")
+        _hash_length_prefixed(hasher, b"file")
+        _hash_length_prefixed(hasher, relative.encode("utf-8"))
+        with entry.open("rb") as handle:
+            before = os.fstat(handle.fileno())
+            hasher.update((before.st_mode & 0o777).to_bytes(4, "big"))
+            hasher.update(before.st_size.to_bytes(8, "big"))
+            bytes_read = 0
+            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                hasher.update(chunk)
+                bytes_read += len(chunk)
+            after = os.fstat(handle.fileno())
+        if (
+            bytes_read != before.st_size
+            or before.st_size != after.st_size
+            or before.st_mtime_ns != after.st_mtime_ns
+            or before.st_ino != after.st_ino
+            or before.st_mode != after.st_mode
+        ):
+            raise ConfigError(f"toolchain changed while it was being hashed: {relative}")
+    return "sha256:" + hasher.hexdigest()
 
 
 def make_run_identity(
@@ -844,8 +890,10 @@ def make_run_identity(
     corpus: Mapping[str, Any],
     config: Mapping[str, Any],
     toolchain_root: Path,
+    toolchain_identity: str | None = None,
 ) -> RunIdentity:
-    toolchain_identity = resolved_toolchain_identity(toolchain_root, profile)
+    if toolchain_identity is None:
+        toolchain_identity = resolved_toolchain_identity(toolchain_root, profile)
     if toolchain_identity is None:
         raise ConfigError("resolved toolchain identity is unavailable")
     if profile == "smoke":
@@ -869,6 +917,7 @@ def _requirements(
     corpus_directory: Path,
     toolchain_root: Path,
     profile: str,
+    toolchain_identity: str | None,
 ) -> dict[str, Any]:
     missing_media = []
     missing_results = []
@@ -891,7 +940,7 @@ def _requirements(
             toolchain_root / "da3_mps/models",
         ]
         missing_toolchain.extend(path.relative_to(toolchain_root).as_posix() for path in required if not path.exists())
-    if profile == "release" and resolved_toolchain_identity(toolchain_root, profile) is None:
+    if profile == "release" and toolchain_identity is None:
         missing_toolchain.append("signed receipt or manifest identity")
     toolchain = (
         {"label": "toolchain://resolved", "missing": sorted(set(missing_toolchain))}
@@ -1145,13 +1194,32 @@ def _validate_actual_evidence(actual: Any, label: str) -> Mapping[str, Any]:
         _require_safe_token(value["failure_type"], f"{label}.failure_type")
     if value["corrupt_ply"] is not None and not isinstance(value["corrupt_ply"], bool):
         raise ConfigError(f"{label}.corrupt_ply must be boolean or null")
+    exit_code = value["exit_code"]
+    reason = value["termination_reason"]
+    cancelled = value["cancelled"]
+    if exit_code is None:
+        if reason != "not_available" or cancelled:
+            raise ConfigError(f"{label} termination evidence is contradictory")
+    elif exit_code == 0:
+        if reason != "exit" or cancelled:
+            raise ConfigError(f"{label} successful termination evidence is contradictory")
+    elif cancelled:
+        if reason != "cancelled" or exit_code != 130:
+            raise ConfigError(f"{label} cancellation evidence is contradictory")
+    elif reason == "cancelled" or reason == "not_available":
+        raise ConfigError(f"{label} termination evidence is contradictory")
+    elif reason == "signal" and exit_code >= 0:
+        raise ConfigError(f"{label} signal termination requires a negative exit code")
+    elif reason == "exit" and exit_code < 0:
+        raise ConfigError(f"{label} normal exit cannot use a negative exit code")
     return value
 
 
 def _validate_artifacts(artifacts: Any, label: str) -> Mapping[str, str]:
     value = _require_mapping(artifacts, label)
     for name, digest in value.items():
-        _require_safe_token(name, f"{label} key")
+        if not isinstance(name, str) or not ARTIFACT_NAME_PATTERN.fullmatch(name):
+            raise ConfigError(f"{label} key must contain only lowercase letters, digits, and underscores")
         if not isinstance(digest, str) or not SHA256_PATTERN.fullmatch(digest):
             raise ConfigError(f"{label}.{name} must be a SHA-256 digest")
     return value
@@ -1462,8 +1530,15 @@ def run_suite(
     raw_directory = output_directory / "raw"
     raw_directory.mkdir(parents=True, exist_ok=True)
     result = _result_shell(profile, corpus, config, output_directory, started_at)
-    result["toolchain_identity"] = resolved_toolchain_identity(toolchain_root, profile)
-    requirements = _requirements(corpus, corpus_path.parent, toolchain_root, profile)
+    toolchain_identity = resolved_toolchain_identity(toolchain_root, profile)
+    result["toolchain_identity"] = toolchain_identity
+    requirements = _requirements(
+        corpus,
+        corpus_path.parent,
+        toolchain_root,
+        profile,
+        toolchain_identity,
+    )
     result["missing_requirements"] = requirements
     missing_labels = []
     if requirements["media"]:
@@ -1482,7 +1557,13 @@ def run_suite(
         return 2
 
     scene_results = []
-    identity = make_run_identity(profile, corpus, config, toolchain_root)
+    identity = make_run_identity(
+        profile,
+        corpus,
+        config,
+        toolchain_root,
+        toolchain_identity,
+    )
     result["toolchain_identity"] = identity.toolchain_identity
     input_digests: dict[str, str] = {}
     for scene in corpus["scenes"]:

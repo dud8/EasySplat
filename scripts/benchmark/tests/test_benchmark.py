@@ -431,6 +431,16 @@ class GateEvaluationTests(unittest.TestCase):
                 metrics.update(replacements)
                 self.assertEqual(benchmark.evaluate_gates(metrics, self.thresholds)["status"], "failed")
 
+    def test_unavailable_metric_reason_is_a_controlled_code(self) -> None:
+        metrics = passing_metrics()
+        metrics["residual_median_pixels"] = {
+            "availability": "not_available",
+            "reason": "alice-macbook-pro.local",
+        }
+        evaluation = benchmark.evaluate_gates(metrics, self.thresholds)
+        self.assertEqual(evaluation["status"], "failed")
+        self.assertTrue(any("reason" in failure for failure in evaluation["failures"]))
+
 
 class InvalidSceneTests(unittest.TestCase):
     def test_declared_failure_without_corrupt_ply_passes(self) -> None:
@@ -450,7 +460,13 @@ class InvalidSceneTests(unittest.TestCase):
             {**successful_actual(), "failure_type": None},
             {**successful_actual(), "exit_code": 2, "failure_type": "other"},
             {**successful_actual(), "exit_code": 2, "failure_type": "disconnected_input", "corrupt_ply": True},
-            {**successful_actual(), "exit_code": 2, "failure_type": "disconnected_input", "cancelled": True},
+            {
+                **successful_actual(),
+                "exit_code": 130,
+                "termination_reason": "cancelled",
+                "failure_type": "disconnected_input",
+                "cancelled": True,
+            },
         ):
             with self.subTest(actual=actual):
                 self.assertEqual(benchmark.evaluate_invalid_scene(expected, actual)["status"], "failed")
@@ -466,6 +482,17 @@ class InvalidSceneTests(unittest.TestCase):
             actual = {**successful_actual(), "exit_code": exit_code, "failure_type": "disconnected_input"}
             with self.subTest(exit_code=exit_code):
                 self.assertEqual(benchmark.evaluate_invalid_scene(expected, actual)["status"], "blocked")
+
+    def test_contradictory_termination_evidence_blocks(self) -> None:
+        expected = {"kind": "invalid", "failure_type": "disconnected_input"}
+        actual = {
+            **successful_actual(),
+            "exit_code": 2,
+            "termination_reason": "cancelled",
+            "cancelled": False,
+            "failure_type": "disconnected_input",
+        }
+        self.assertEqual(benchmark.evaluate_invalid_scene(expected, actual)["status"], "blocked")
 
 
 class MetadataAndPersistenceTests(unittest.TestCase):
@@ -576,7 +603,15 @@ class OrchestrationTests(unittest.TestCase):
             result_path.parent.mkdir(parents=True, exist_ok=True)
             cases = (
                 ({**successful_actual(), "exit_code": 9}, "failed"),
-                ({**successful_actual(), "cancelled": True}, "failed"),
+                (
+                    {
+                        **successful_actual(),
+                        "exit_code": 130,
+                        "termination_reason": "cancelled",
+                        "cancelled": True,
+                    },
+                    "failed",
+                ),
             )
             for actual, expected_status in cases:
                 with self.subTest(actual=actual):
@@ -590,6 +625,38 @@ class OrchestrationTests(unittest.TestCase):
             result_path.write_bytes(benchmark.canonical_json_bytes(payload) + b"\n")
             with self.assertRaisesRegex(benchmark.ConfigError, "route"):
                 benchmark._copy_external_result(scene, 30, root, identity)
+
+            contradictory = {
+                **successful_actual(),
+                "termination_reason": "cancelled",
+                "cancelled": False,
+            }
+            payload = external_envelope(scene, 30, input_digest, identity, actual=contradictory)
+            result_path.write_bytes(benchmark.canonical_json_bytes(payload) + b"\n")
+            with self.assertRaisesRegex(benchmark.ConfigError, "termination"):
+                benchmark._copy_external_result(scene, 30, root, identity)
+
+            payload = external_envelope(scene, 30, input_digest, identity)
+            payload["scale_results"]["30"]["artifacts"] = {
+                "mesh.ply": "sha256:" + "a" * 64,
+            }
+            result_path.write_bytes(benchmark.canonical_json_bytes(payload) + b"\n")
+            with self.assertRaisesRegex(benchmark.ConfigError, "artifacts"):
+                benchmark._copy_external_result(scene, 30, root, identity)
+
+    def test_toolchain_identity_changes_with_installed_content(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "manifest.json").write_text('{"schema":2}\n', encoding="utf-8")
+            binary = root / "bin/colmap"
+            binary.parent.mkdir(parents=True)
+            binary.write_bytes(b"first")
+            first = benchmark.resolved_toolchain_identity(root, "release")
+            binary.write_bytes(b"second")
+            second = benchmark.resolved_toolchain_identity(root, "release")
+        self.assertIsNotNone(first)
+        self.assertIsNotNone(second)
+        self.assertNotEqual(first, second)
 
     def test_tracked_smoke_fixture_runs_without_a_toolchain(self) -> None:
         config_path = ROOT / "scripts/benchmark/reference-config.json"

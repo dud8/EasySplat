@@ -73,7 +73,15 @@
       "required": ["availability"],
       "properties": {
         "availability": {"const": "not_available"},
-        "reason": {"type": "string", "minLength": 1}
+        "reason": {
+          "enum": [
+            "adapter_incomplete",
+            "not_measured",
+            "reference_unavailable",
+            "tool_unavailable",
+            "unsupported"
+          ]
+        }
       }
     },
     "nonnegativeNumberMetric": {
@@ -249,7 +257,33 @@
             "code": {"type": ["integer", "null"]},
             "reason": {"enum": ["exit", "signal", "cancelled", "not_available"]},
             "cancelled": {"type": "boolean"}
-          }
+          },
+          "allOf": [
+            {
+              "if": {"properties": {"code": {"const": 0}}, "required": ["code"]},
+              "then": {"properties": {"reason": {"const": "exit"}, "cancelled": {"const": false}}}
+            },
+            {
+              "if": {"properties": {"code": {"type": "null"}}, "required": ["code"]},
+              "then": {"properties": {"reason": {"const": "not_available"}, "cancelled": {"const": false}}}
+            },
+            {
+              "if": {"properties": {"reason": {"const": "cancelled"}}, "required": ["reason"]},
+              "then": {"properties": {"code": {"const": 130}, "cancelled": {"const": true}}}
+            },
+            {
+              "if": {"properties": {"reason": {"const": "signal"}}, "required": ["reason"]},
+              "then": {"properties": {"code": {"type": "integer", "maximum": -1}, "cancelled": {"const": false}}}
+            },
+            {
+              "if": {"properties": {"reason": {"const": "exit"}}, "required": ["reason"]},
+              "then": {"properties": {"code": {"type": "integer", "minimum": 0}, "cancelled": {"const": false}}}
+            },
+            {
+              "if": {"properties": {"cancelled": {"const": true}}, "required": ["cancelled"]},
+              "then": {"properties": {"code": {"const": 130}, "reason": {"const": "cancelled"}}}
+            }
+          ]
         },
         "command": {
           "type": "array",
