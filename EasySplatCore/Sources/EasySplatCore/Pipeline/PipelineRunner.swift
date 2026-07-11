@@ -66,7 +66,7 @@ public final class PipelineRunner: @unchecked Sendable {
     let config: PipelineConfig
     let tooling: Tooling
     let powerAssertion: PowerAssertionManaging
-    private let initialEnvironment: [String: String]
+    let initialEnvironment: [String: String]
     private let capturedEnvironment: [String: String]?
 
     enum SfmMapperPreference: String {

@@ -1098,6 +1098,11 @@ final class PipelineIntegrationTests: XCTestCase {
             "fastvggt",
             "The full environment snapshot must agree with its authoritative keyed lookup."
         )
+        XCTAssertEqual(
+            pipeline.initialEnvironment["EASYSPLAT_SFM_BACKEND"],
+            "fastvggt",
+            "The runner must capture the backend override when it is constructed."
+        )
         RuntimeEnvironment.setValue("colmap", forKey: "EASYSPLAT_SFM_BACKEND")
         XCTAssertEqual(
             RuntimeEnvironment.value(forKey: "EASYSPLAT_SFM_BACKEND"),
