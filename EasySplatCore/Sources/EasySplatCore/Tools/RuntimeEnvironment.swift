@@ -1,10 +1,16 @@
 @preconcurrency import Darwin
 import Foundation
 
+@_silgen_name("_NSGetEnviron")
+private func currentEnvironmentPointer() -> UnsafeMutablePointer<UnsafeMutablePointer<UnsafeMutablePointer<CChar>?>?>
+
 enum RuntimeEnvironment {
     static var current: [String: String] {
         access.withLock {
-            var entry = environ
+            // `setenv` may reallocate the environment table. The imported `environ`
+            // binding can retain the old pointer on older Darwin runtimes, while
+            // `_NSGetEnviron` always returns the process's current table.
+            guard var entry = currentEnvironmentPointer().pointee else { return [:] }
             var environment: [String: String] = [:]
 
             while let item = entry.pointee {
