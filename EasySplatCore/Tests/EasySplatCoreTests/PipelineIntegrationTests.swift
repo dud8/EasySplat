@@ -1081,11 +1081,17 @@ final class PipelineIntegrationTests: XCTestCase {
 
         let toolchain = try makeToolchain(root: temp, createVggtFiles: true)
         let runner = CancellationOnSfmRunner(cancelPath: toolchain.fastvggt.sfmTool.path)
+        let powerAssertion = RecordingPowerAssertion {
+            // Simulate unrelated process-global environment activity after run entry.
+            // Pipeline configuration must remain fixed for the lifetime of the run.
+            RuntimeEnvironment.setValue("colmap", forKey: "EASYSPLAT_SFM_BACKEND")
+        }
 
         let pipeline = PipelineRunner(
             projectURL: projectURL,
             config: .init(toolchain: toolchain, preset: metadata.preset),
-            tooling: .init(runner: runner)
+            tooling: .init(runner: runner),
+            powerAssertion: powerAssertion
         )
 
         XCTAssertEqual(

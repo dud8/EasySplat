@@ -139,7 +139,7 @@ extension PipelineRunner {
     }
 
     func trainingBackendPreference() -> TrainingBackend {
-        guard let raw = RuntimeEnvironment.current["EASYSPLAT_TRAINER"]?
+        guard let raw = runtimeEnvironment["EASYSPLAT_TRAINER"]?
             .trimmingCharacters(in: .whitespacesAndNewlines)
             .lowercased(),
               !raw.isEmpty else {
@@ -166,7 +166,7 @@ extension PipelineRunner {
     }
 
     func msplatToolPath() -> URL {
-        if let raw = RuntimeEnvironment.current["EASYSPLAT_MSPLAT_BIN"]?
+        if let raw = runtimeEnvironment["EASYSPLAT_MSPLAT_BIN"]?
             .trimmingCharacters(in: .whitespacesAndNewlines),
            !raw.isEmpty {
             return URL(fileURLWithPath: (raw as NSString).expandingTildeInPath)
@@ -190,7 +190,7 @@ extension PipelineRunner {
     }
 
     func hasExplicitTrainingBackendPreference() -> Bool {
-        guard let raw = RuntimeEnvironment.current["EASYSPLAT_TRAINER"]?
+        guard let raw = runtimeEnvironment["EASYSPLAT_TRAINER"]?
             .trimmingCharacters(in: .whitespacesAndNewlines) else {
             return false
         }
@@ -762,7 +762,7 @@ extension PipelineRunner {
     }
 
     private static func envInt(_ key: String) -> Int? {
-        guard let raw = RuntimeEnvironment.current[key]?.trimmingCharacters(in: .whitespacesAndNewlines),
+        guard let raw = Self.activeRuntimeEnvironment[key]?.trimmingCharacters(in: .whitespacesAndNewlines),
               !raw.isEmpty,
               let value = Int(raw),
               value > 0 else { return nil }
@@ -770,7 +770,7 @@ extension PipelineRunner {
     }
 
     private static func envDouble(_ key: String) -> Double? {
-        guard let raw = RuntimeEnvironment.current[key]?.trimmingCharacters(in: .whitespacesAndNewlines),
+        guard let raw = Self.activeRuntimeEnvironment[key]?.trimmingCharacters(in: .whitespacesAndNewlines),
               !raw.isEmpty,
               let value = Double(raw),
               value > 0 else { return nil }

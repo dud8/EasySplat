@@ -8,6 +8,7 @@ import XCTest
 /// across the integration tests via internal visibility.
 final class RecordingPowerAssertion: PowerAssertionManaging, @unchecked Sendable {
     private let lock = NSLock()
+    private let onBegin: @Sendable () -> Void
     private var _begun = 0
     private var _released = 0
     private var _active = 0
@@ -16,8 +17,13 @@ final class RecordingPowerAssertion: PowerAssertionManaging, @unchecked Sendable
     var released: Int { lock.lock(); defer { lock.unlock() }; return _released }
     var active: Int { lock.lock(); defer { lock.unlock() }; return _active }
 
+    init(onBegin: @escaping @Sendable () -> Void = {}) {
+        self.onBegin = onBegin
+    }
+
     func beginPreventingIdleSleep(reason: String) -> PowerAssertionHandle {
         lock.lock(); _begun += 1; _active += 1; lock.unlock()
+        onBegin()
         return Handle { [weak self] in self?.recordRelease() }
     }
 

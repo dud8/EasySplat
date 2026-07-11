@@ -2,7 +2,7 @@ import Foundation
 
 extension PipelineRunner {
     func sfmMapperPreference() -> SfmMapperPreference {
-        let env = RuntimeEnvironment.current
+        let env = runtimeEnvironment
         if let value = env["EASYSPLAT_SFM_MAPPER"]?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() {
             if value == "colmap" { return .colmap }
             if value == "glomap" { return .glomap }
@@ -11,7 +11,7 @@ extension PipelineRunner {
     }
 
     func sfmBackendOverride() -> SfmBackend? {
-        let env = RuntimeEnvironment.current
+        let env = runtimeEnvironment
         if let value = env["EASYSPLAT_SFM_BACKEND"]?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() {
             if value == "da3" || value == "depth-anything-3" || value == "depthanything3" { return .da3 }
             if value == "mapanything" { return .mapanything }
@@ -399,7 +399,7 @@ extension PipelineRunner {
     }
 
     func vggtDevicePreference() -> String {
-        let env = RuntimeEnvironment.current
+        let env = runtimeEnvironment
         if let value = env["EASYSPLAT_VGGT_DEVICE"]?.trimmingCharacters(in: .whitespacesAndNewlines),
            !value.isEmpty {
             return value
@@ -408,7 +408,7 @@ extension PipelineRunner {
     }
 
     func vggtImageLoadResolutionPreference(preset: PresetSpec) -> Int {
-        let env = RuntimeEnvironment.current
+        let env = runtimeEnvironment
         if let raw = env["EASYSPLAT_VGGT_IMG_LOAD_RESOLUTION"]?.trimmingCharacters(in: .whitespacesAndNewlines),
            let override = Int(raw),
            override > 0 {
@@ -425,7 +425,7 @@ extension PipelineRunner {
     }
 
     func vggtFixedResolutionPreference() -> Int {
-        let env = RuntimeEnvironment.current
+        let env = runtimeEnvironment
         if let raw = env["EASYSPLAT_VGGT_RESOLUTION"]?.trimmingCharacters(in: .whitespacesAndNewlines),
            let override = Int(raw),
            override > 0 {
@@ -479,7 +479,7 @@ extension PipelineRunner {
     }
 
     func vggtConfidenceThresholdPreference() -> Double {
-        let env = RuntimeEnvironment.current
+        let env = runtimeEnvironment
         if let raw = env["EASYSPLAT_VGGT_CONF_THRES"]?.trimmingCharacters(in: .whitespacesAndNewlines),
            let override = Double(raw),
            override > 0 {
@@ -489,7 +489,7 @@ extension PipelineRunner {
     }
 
     func vggtMaxPointsPreference(preset: PresetSpec) -> Int {
-        let env = RuntimeEnvironment.current
+        let env = runtimeEnvironment
         if let raw = env["EASYSPLAT_VGGT_MAX_POINTS"]?.trimmingCharacters(in: .whitespacesAndNewlines),
            let override = Int(raw),
            override > 0 {
@@ -510,7 +510,7 @@ extension PipelineRunner {
     }
 
     func vggtMaxReprojectionErrorPreference() -> Double {
-        let env = RuntimeEnvironment.current
+        let env = runtimeEnvironment
         if let raw = env["EASYSPLAT_VGGT_MAX_REPROJ_ERROR"]?.trimmingCharacters(in: .whitespacesAndNewlines),
            let override = Double(raw),
            override > 0 {
@@ -524,7 +524,7 @@ extension PipelineRunner {
     }
 
     func vggtCameraTypePreference() -> String {
-        let env = RuntimeEnvironment.current
+        let env = runtimeEnvironment
         if let value = env["EASYSPLAT_VGGT_CAMERA_TYPE"]?.trimmingCharacters(in: .whitespacesAndNewlines),
            !value.isEmpty {
             return value
@@ -533,7 +533,7 @@ extension PipelineRunner {
     }
 
     func vggtVisibilityThresholdPreference() -> Double {
-        let env = RuntimeEnvironment.current
+        let env = runtimeEnvironment
         if let raw = env["EASYSPLAT_VGGT_VIS_THRESH"]?.trimmingCharacters(in: .whitespacesAndNewlines),
            let override = Double(raw),
            override > 0 {
@@ -543,7 +543,7 @@ extension PipelineRunner {
     }
 
     func vggtQueryFrameCountPreference() -> Int {
-        let env = RuntimeEnvironment.current
+        let env = runtimeEnvironment
         if let raw = env["EASYSPLAT_VGGT_QUERY_FRAMES"]?.trimmingCharacters(in: .whitespacesAndNewlines),
            let override = Int(raw),
            override > 0 {
@@ -553,7 +553,7 @@ extension PipelineRunner {
     }
 
     func vggtMaxQueryPointsPreference() -> Int {
-        let env = RuntimeEnvironment.current
+        let env = runtimeEnvironment
         if let raw = env["EASYSPLAT_VGGT_MAX_QUERY_PTS"]?.trimmingCharacters(in: .whitespacesAndNewlines),
            let override = Int(raw),
            override > 0 {
@@ -567,7 +567,7 @@ extension PipelineRunner {
     }
 
     func vggtKeypointExtractorPreference() -> String {
-        let env = RuntimeEnvironment.current
+        let env = runtimeEnvironment
         if let value = env["EASYSPLAT_VGGT_KEYPOINT_EXTRACTOR"]?.trimmingCharacters(in: .whitespacesAndNewlines),
            !value.isEmpty {
             return value
@@ -576,7 +576,7 @@ extension PipelineRunner {
     }
 
     func vggtBaMaxFramesPreference() -> Int? {
-        let env = RuntimeEnvironment.current
+        let env = runtimeEnvironment
         if let raw = env["EASYSPLAT_VGGT_BA_MAX_FRAMES"]?.trimmingCharacters(in: .whitespacesAndNewlines),
            let override = Int(raw),
            override > 0 {
@@ -603,7 +603,7 @@ extension PipelineRunner {
     }
 
     func fastvggtDtypePreference() -> String {
-        let env = RuntimeEnvironment.current
+        let env = runtimeEnvironment
         if let value = env["EASYSPLAT_FASTVGGT_DTYPE"]?.trimmingCharacters(in: .whitespacesAndNewlines),
            !value.isEmpty {
             return value
@@ -612,7 +612,7 @@ extension PipelineRunner {
     }
 
     func fastvggtMergingPreference() -> Int {
-        let env = RuntimeEnvironment.current
+        let env = runtimeEnvironment
         if let raw = env["EASYSPLAT_FASTVGGT_MERGING"]?.trimmingCharacters(in: .whitespacesAndNewlines),
            let override = Int(raw) {
             return override
@@ -621,7 +621,7 @@ extension PipelineRunner {
     }
 
     func fastvggtMergeRatioPreference() -> Double {
-        let env = RuntimeEnvironment.current
+        let env = runtimeEnvironment
         if let raw = env["EASYSPLAT_FASTVGGT_MERGE_RATIO"]?.trimmingCharacters(in: .whitespacesAndNewlines),
            let override = Double(raw) {
             return override
@@ -630,7 +630,7 @@ extension PipelineRunner {
     }
 
     func fastvggtConfidenceThresholdPreference() -> Double {
-        let env = RuntimeEnvironment.current
+        let env = runtimeEnvironment
         if let raw = env["EASYSPLAT_FASTVGGT_DEPTH_CONF_THRES"]?.trimmingCharacters(in: .whitespacesAndNewlines),
            let override = Double(raw),
            override > 0 {
@@ -648,7 +648,7 @@ extension PipelineRunner {
     }
 
     func fastvggtBaMaxIterationsPreference() -> Int {
-        let env = RuntimeEnvironment.current
+        let env = runtimeEnvironment
         if let raw = env["EASYSPLAT_FASTVGGT_BA_MAX_ITERS"]?.trimmingCharacters(in: .whitespacesAndNewlines),
            let override = Int(raw),
            override > 0 {
@@ -827,7 +827,7 @@ extension PipelineRunner {
     }
 
     func fastvggtPostprocessPreference() -> String {
-        let env = RuntimeEnvironment.current
+        let env = runtimeEnvironment
         if let raw = env["EASYSPLAT_FASTVGGT_POSTPROCESS"]?.trimmingCharacters(in: .whitespacesAndNewlines),
            !raw.isEmpty {
             let lowered = raw.lowercased()
@@ -839,7 +839,7 @@ extension PipelineRunner {
     }
 
     func fastvggtCoveragePlannerPreference() -> String {
-        let env = RuntimeEnvironment.current
+        let env = runtimeEnvironment
         if let raw = env["EASYSPLAT_FASTVGGT_COVERAGE_PLANNER"]?.trimmingCharacters(in: .whitespacesAndNewlines),
            !raw.isEmpty {
             let lowered = raw.lowercased()
@@ -851,7 +851,7 @@ extension PipelineRunner {
     }
 
     func fastvggtCoverageWindowTokensPreference() -> Int {
-        let env = RuntimeEnvironment.current
+        let env = runtimeEnvironment
         if let raw = env["EASYSPLAT_FASTVGGT_COVERAGE_WINDOW_TOKENS"]?.trimmingCharacters(in: .whitespacesAndNewlines),
            let override = Int(raw),
            override >= 1_000 {
@@ -861,7 +861,7 @@ extension PipelineRunner {
     }
 
     func fastvggtCoverageOverlapPreference() -> Double {
-        let env = RuntimeEnvironment.current
+        let env = runtimeEnvironment
         if let raw = env["EASYSPLAT_FASTVGGT_COVERAGE_OVERLAP"]?.trimmingCharacters(in: .whitespacesAndNewlines),
            let override = Double(raw),
            override > 0,
@@ -872,7 +872,7 @@ extension PipelineRunner {
     }
 
     func fastvggtCoverageMaxRoundsPreference() -> Int {
-        let env = RuntimeEnvironment.current
+        let env = runtimeEnvironment
         if let raw = env["EASYSPLAT_FASTVGGT_COVERAGE_MAX_ROUNDS"]?.trimmingCharacters(in: .whitespacesAndNewlines),
            let override = Int(raw),
            override > 0 {
@@ -910,7 +910,7 @@ extension PipelineRunner {
     }
 
     func shouldAutoTune() -> Bool {
-        if let value = RuntimeEnvironment.current["EASYSPLAT_AUTOTUNE"]?
+        if let value = runtimeEnvironment["EASYSPLAT_AUTOTUNE"]?
             .trimmingCharacters(in: .whitespacesAndNewlines)
             .lowercased() {
             if ["0", "false", "no"].contains(value) { return false }
@@ -919,14 +919,14 @@ extension PipelineRunner {
     }
 
     func hasEnvValue(_ key: String) -> Bool {
-        if let value = RuntimeEnvironment.current[key]?.trimmingCharacters(in: .whitespacesAndNewlines) {
+        if let value = runtimeEnvironment[key]?.trimmingCharacters(in: .whitespacesAndNewlines) {
             return !value.isEmpty
         }
         return false
     }
 
     func boolEnvValue(_ key: String, default defaultValue: Bool) -> Bool {
-        if let value = RuntimeEnvironment.current[key]?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() {
+        if let value = runtimeEnvironment[key]?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() {
             if ["1", "true", "yes"].contains(value) { return true }
             if ["0", "false", "no"].contains(value) { return false }
         }
@@ -934,7 +934,7 @@ extension PipelineRunner {
     }
 
     func intEnvValue(_ key: String) -> Int? {
-        guard let raw = RuntimeEnvironment.current[key]?.trimmingCharacters(in: .whitespacesAndNewlines),
+        guard let raw = runtimeEnvironment[key]?.trimmingCharacters(in: .whitespacesAndNewlines),
               let value = Int(raw) else {
             return nil
         }
@@ -942,7 +942,7 @@ extension PipelineRunner {
     }
 
     func doubleEnvValue(_ key: String) -> Double? {
-        guard let raw = RuntimeEnvironment.current[key]?.trimmingCharacters(in: .whitespacesAndNewlines),
+        guard let raw = runtimeEnvironment[key]?.trimmingCharacters(in: .whitespacesAndNewlines),
               let value = Double(raw),
               value.isFinite else {
             return nil
@@ -951,7 +951,7 @@ extension PipelineRunner {
     }
 
     func stringEnvValue(_ key: String) -> String? {
-        guard let raw = RuntimeEnvironment.current[key]?.trimmingCharacters(in: .whitespacesAndNewlines),
+        guard let raw = runtimeEnvironment[key]?.trimmingCharacters(in: .whitespacesAndNewlines),
               !raw.isEmpty else {
             return nil
         }
@@ -1057,7 +1057,7 @@ extension PipelineRunner {
     }
 
     func colmapGpuOverride() -> Bool? {
-        let env = RuntimeEnvironment.current
+        let env = runtimeEnvironment
         if let value = env["EASYSPLAT_COLMAP_FORCE_CPU"], value == "1" {
             return false
         }

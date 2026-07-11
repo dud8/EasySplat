@@ -1,6 +1,7 @@
 import Foundation
 import Dispatch
 public final class PipelineRunner: @unchecked Sendable {
+    @TaskLocal static var capturedEnvironment: [String: String]?
 
     public struct Tooling {
         public var colmap: ColmapRunner
@@ -105,7 +106,25 @@ public final class PipelineRunner: @unchecked Sendable {
         self.powerAssertion = powerAssertion
     }
 
+    static var activeRuntimeEnvironment: [String: String] {
+        Self.capturedEnvironment ?? RuntimeEnvironment.current
+    }
+
+    var runtimeEnvironment: [String: String] {
+        Self.activeRuntimeEnvironment
+    }
+
     public func run(resumeFrom lastCompletedStage: PipelineStage? = nil, events: @escaping @Sendable (PipelineEvent) -> Void) async throws {
+        let environment = RuntimeEnvironment.current
+        try await Self.$capturedEnvironment.withValue(environment) {
+            try await runWithCapturedEnvironment(resumeFrom: lastCompletedStage, events: events)
+        }
+    }
+
+    private func runWithCapturedEnvironment(
+        resumeFrom lastCompletedStage: PipelineStage?,
+        events: @escaping @Sendable (PipelineEvent) -> Void
+    ) async throws {
         // Keep the Mac awake for the entire run. Runs are multi-hour and training has no
         // resumable checkpoint, so a system idle-sleep partway through loses the session.
         // Released on every exit — success, throw, or cancellation.
@@ -141,7 +160,7 @@ public final class PipelineRunner: @unchecked Sendable {
             && metadata.state.stage != .done
             && hasInterruptionEvidence
         let skipTraining: Bool = {
-            let env = RuntimeEnvironment.current
+            let env = runtimeEnvironment
             let stopAfterSfmRaw = env["EASYSPLAT_STOP_AFTER_SFM"]?
                 .trimmingCharacters(in: .whitespacesAndNewlines)
                 .lowercased()
