@@ -18,6 +18,21 @@ jobs:
       - name: Run manifest tool tests
         run: swift test --package-path Tools/ManifestTool
 
+  native-msplat:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Select supported Xcode 16
+        run: sudo xcode-select -s /Applications/Xcode_16.4.app
+      - name: Install native build tools
+        run: brew install cmake ninja
+      - name: Build pinned native trainer
+        run: ./scripts/toolchain/build_msplat.sh
+      - name: Validate native trainer and release integration
+        run: |
+          ./scripts/ci/test_msplat_native_build.sh
+          ./scripts/ci/test_release_scripts.sh
+
   repo-health:
     runs-on: ubuntu-latest
     steps:

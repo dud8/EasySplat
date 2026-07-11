@@ -223,6 +223,24 @@ PY
     exit 1
   fi
 
+  overlay_fixture="$TMP_DIR/native-msplat-overlay-tampered"
+  cp -R "$packaged_fixture" "$overlay_fixture"
+  python3 - "$overlay_fixture/msplat/build_info.json" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+path = Path(sys.argv[1])
+payload = json.loads(path.read_text(encoding="utf-8"))
+payload["overlay_sha256"] = "d" * 64
+payload["patch_sha256"] = "e" * 64
+path.write_text(json.dumps(payload), encoding="utf-8")
+PY
+  if "$msplat_validator" --packaged "$overlay_fixture" >/dev/null 2>&1; then
+    echo "Native msplat validator accepted unpinned overlay provenance" >&2
+    exit 1
+  fi
+
   partial_archive="$TMP_DIR/native-msplat-partial.zip"
   (cd "$packaged_fixture" && zip -q "$partial_archive" \
     bin/easysplat-train msplat/build_info.json msplat/LICENSE)
@@ -230,6 +248,38 @@ PY
     echo "Native msplat validator accepted a partial cached archive" >&2
     exit 1
   fi
+
+  oversized_fixture="$TMP_DIR/native-msplat-oversized"
+  cp -R "$packaged_fixture" "$oversized_fixture"
+  dd if=/dev/zero of="$oversized_fixture/bin/default.metallib" bs=1048576 count=17 2>/dev/null
+  oversized_archive="$TMP_DIR/native-msplat-oversized.zip"
+  (cd "$oversized_fixture" && zip -q "$oversized_archive" \
+    bin/easysplat-train bin/default.metallib msplat/build_info.json msplat/LICENSE)
+  oversized_error="$TMP_DIR/native-msplat-oversized.stderr"
+  if "$msplat_validator" --archive "$oversized_archive" >/dev/null 2>"$oversized_error"; then
+    echo "Native msplat validator accepted an oversized required entry" >&2
+    exit 1
+  fi
+  grep -qi 'size limit' "$oversized_error" || {
+    echo "Oversized archive was not rejected before extraction and hashing" >&2
+    exit 1
+  }
+
+  compressed_fixture="$TMP_DIR/native-msplat-compressed"
+  cp -R "$packaged_fixture" "$compressed_fixture"
+  dd if=/dev/zero of="$compressed_fixture/bin/default.metallib" bs=1048576 count=2 2>/dev/null
+  compressed_archive="$TMP_DIR/native-msplat-compressed.zip"
+  (cd "$compressed_fixture" && zip -q "$compressed_archive" \
+    bin/easysplat-train bin/default.metallib msplat/build_info.json msplat/LICENSE)
+  compressed_error="$TMP_DIR/native-msplat-compressed.stderr"
+  if "$msplat_validator" --archive "$compressed_archive" >/dev/null 2>"$compressed_error"; then
+    echo "Native msplat validator accepted a high-ratio compressed entry" >&2
+    exit 1
+  fi
+  grep -qi 'compression ratio' "$compressed_error" || {
+    echo "Compressed archive was not rejected before extraction and hashing" >&2
+    exit 1
+  }
 fi
 
 if [ -e "$app_bundle/Contents/lib/Sparkle.framework" ]; then

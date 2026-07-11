@@ -101,6 +101,8 @@ exact_values = {
     "source_commit": "106499b0a53f82b0c92d013b0861fbebd341b17e",
     "source_version": "1.1.3",
     "source_tree_sha256": "866fd6d051b5cf98ca08ae1552236473f504d8f13756cbda68201e48532c3e6a",
+    "overlay_sha256": "4c0443117b9d9f4a464311d78bf54f0028598a20d0226a770cf35011364b0920",
+    "patch_sha256": "ff5dac620fd2327fda800fc16ccb721f1c91e99a7b3afd9dc5100138abd95c80",
     "deployment_target": "macOS 15.0",
     "build_configuration": "Release",
 }
@@ -327,6 +329,23 @@ required = {
     "msplat/build_info.json",
     "msplat/LICENSE",
 }
+entry_size_limits = {
+    "bin/easysplat-train": 16 * 1024 * 1024,
+    "bin/default.metallib": 16 * 1024 * 1024,
+    "msplat/build_info.json": 64 * 1024,
+    "msplat/LICENSE": 128 * 1024,
+}
+maximum_archive_bytes = 2 * 1024 * 1024 * 1024
+maximum_entries = 100_000
+maximum_name_bytes = 16 * 1024 * 1024
+maximum_compression_ratio = 100
+
+try:
+    archive_size = archive.stat().st_size
+except OSError as exc:
+    raise SystemExit(f"native msplat validation failed: core archive stat failed: {exc}")
+if archive_size <= 0 or archive_size > maximum_archive_bytes:
+    raise SystemExit("native msplat validation failed: core archive exceeds the size limit")
 
 try:
     handle = zipfile.ZipFile(archive)
@@ -335,6 +354,10 @@ except Exception as exc:
 
 with handle:
     infos = handle.infolist()
+    if len(infos) > maximum_entries:
+        raise SystemExit("native msplat validation failed: core archive exceeds the entry-count limit")
+    if sum(len(info.filename.encode("utf-8")) for info in infos) > maximum_name_bytes:
+        raise SystemExit("native msplat validation failed: core archive filenames exceed the size limit")
     names = [info.filename for info in infos]
     if len(names) != len(set(names)):
         raise SystemExit("native msplat validation failed: core archive contains duplicate entries")
@@ -386,10 +409,43 @@ with handle:
             f"{unexpected_bin}"
         )
 
+    info_by_name = {info.filename: info for info in infos}
+    required_total = 0
+    for name, limit in entry_size_limits.items():
+        info = info_by_name[name]
+        if info.file_size <= 0 or info.file_size > limit:
+            raise SystemExit(
+                f"native msplat validation failed: {name} exceeds its size limit"
+            )
+        if info.compress_size <= 0 or info.file_size > info.compress_size * maximum_compression_ratio:
+            raise SystemExit(
+                f"native msplat validation failed: {name} exceeds the compression ratio limit"
+            )
+        required_total += info.file_size
+    if required_total > sum(entry_size_limits.values()):
+        raise SystemExit("native msplat validation failed: required entries exceed the aggregate size limit")
+
     for name in sorted(required):
+        info = info_by_name[name]
+        limit = entry_size_limits[name]
         target = destination / name
         target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_bytes(handle.read(name))
+        copied = 0
+        with handle.open(info) as source, target.open("xb") as output:
+            while True:
+                chunk = source.read(min(1024 * 1024, limit - copied + 1))
+                if not chunk:
+                    break
+                copied += len(chunk)
+                if copied > limit or copied > info.file_size:
+                    raise SystemExit(
+                        f"native msplat validation failed: {name} exceeded its declared size"
+                    )
+                output.write(chunk)
+        if copied != info.file_size:
+            raise SystemExit(
+                f"native msplat validation failed: {name} did not match its declared size"
+            )
     os.chmod(destination / "bin/easysplat-train", 0o755)
 PY
   then
