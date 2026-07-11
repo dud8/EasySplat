@@ -1,6 +1,6 @@
 import XCTest
 
-func XCTAssertThrowsErrorAsync<T>(
+func XCTAssertThrowsErrorAsync<T: Sendable>(
     _ expression: @escaping () async throws -> T,
     _ message: @autoclosure () -> String = "",
     file: StaticString = #filePath,

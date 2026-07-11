@@ -26,7 +26,7 @@ private actor EnvironmentLock {
 }
 
 @discardableResult
-func withEnvironmentAsync<T>(
+func withEnvironmentAsync<T: Sendable>(
     _ changes: [String: String?],
     isolation: isolated (any Actor)? = #isolation,
     _ body: () async throws -> T
