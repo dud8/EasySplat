@@ -335,7 +335,8 @@ extension PipelineRunner {
         selectedFrameCount: Int,
         preset: PresetSpec,
         input: InputSpec = .photos(folder: "/tmp"),
-        autoTune: AutoTuneProfile? = nil
+        autoTune: AutoTuneProfile? = nil,
+        explicitlyRequested: Bool = false
     ) -> (
         mode: String,
         directAllowed: Bool,
@@ -364,7 +365,8 @@ extension PipelineRunner {
             input: input,
             selectedFrameCount: selectedFrameCount,
             preset: preset,
-            autoTune: autoTune
+            autoTune: autoTune,
+            explicitlyRequested: explicitlyRequested
         )
         return (
             mode: plan.mode.rawValue,

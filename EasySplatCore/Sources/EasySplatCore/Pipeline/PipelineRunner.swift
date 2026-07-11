@@ -935,7 +935,8 @@ public final class PipelineRunner: @unchecked Sendable {
                             input: metadata.input,
                             selectedFrameCount: selectedFrames.count,
                             preset: metadata.preset,
-                            autoTune: autoTuneProfile
+                            autoTune: autoTuneProfile,
+                            explicitlyRequested: backendOverride == .mapanything
                         )
                         let mapCheckpoint = mapAnythingCheckpointPreference()
                         let mapCoverageManifest = paths.mapanythingCoverageManifestURL

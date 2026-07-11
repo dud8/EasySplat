@@ -344,7 +344,8 @@ extension PipelineRunner {
         input: InputSpec,
         selectedFrameCount: Int,
         preset: PresetSpec,
-        autoTune: AutoTuneProfile? = nil
+        autoTune: AutoTuneProfile? = nil,
+        explicitlyRequested: Bool = false
     ) -> MapAnythingExecutionPlan {
         let device = mapAnythingDevicePreference()
         let resolution = mapAnythingResolutionPreference(autoTune: autoTune)
@@ -357,7 +358,7 @@ extension PipelineRunner {
         let sharedCamera = mapAnythingSharedCameraPreference(input: input)
         let hardwareTier = hardwareProfile.tier
 
-        let directViewLimit = autoTune?.mapAnythingDirectViewLimit ?? {
+        let tunedDirectViewLimit = autoTune?.mapAnythingDirectViewLimit ?? {
             switch hardwareTier {
             case .low:
                 return 0
@@ -367,6 +368,11 @@ extension PipelineRunner {
                 return 8
             }
         }()
+        // An explicit MapAnything override is a request to use MapAnything's
+        // native output when the input is within the established safe direct
+        // solve ceiling. Auto-tuning may retain conservative memory settings,
+        // but must not silently turn that request into a COLMAP refinement.
+        let directViewLimit = explicitlyRequested ? max(tunedDirectViewLimit, 8) : tunedDirectViewLimit
         let anchorMaxViews = mapAnythingAnchorMaxViewsPreference(autoTune: autoTune, hardwareTier: hardwareTier)
         let seedWindowSize = mapAnythingWindowSizePreference(autoTune: autoTune, hardwareTier: hardwareTier)
         let windowOverlap = mapAnythingWindowOverlapPreference(autoTune: autoTune, hardwareTier: hardwareTier)
