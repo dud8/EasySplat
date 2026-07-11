@@ -123,7 +123,7 @@ public final class MapAnythingSfmRunner: @unchecked Sendable, MapAnythingSfmRunn
             args.append(contentsOf: ["--manifest-out", coverageManifestPath.path])
         }
 
-        var environment = ProcessInfo.processInfo.environment
+        var environment = RuntimeEnvironment.current
         environment["PYTHONUNBUFFERED"] = "1"
         environment["EASYSPLAT_MAPANYTHING_MODELS_DIR"] = toolchain.models.path
         environment["TORCH_HOME"] = toolchain.models.path

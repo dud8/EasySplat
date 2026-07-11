@@ -47,8 +47,8 @@ final class SubprocessRunnerAsyncTests: XCTestCase {
 
     func testRunMergesEnvironmentOverridesWithInheritedEnvironment() async throws {
         let sentinelKey = makeSentinelKey()
-        setenv(sentinelKey, "parent", 1)
-        defer { unsetenv(sentinelKey) }
+        RuntimeEnvironment.setValue("parent", forKey: sentinelKey)
+        defer { RuntimeEnvironment.setValue(nil, forKey: sentinelKey) }
         let root = try TestFileBuilder.makeTempDir()
         defer { try? FileManager.default.removeItem(at: root) }
         let scriptURL = try makeEnvironmentScript(in: root, name: "env-sync.sh", sentinelKey: sentinelKey)
@@ -70,8 +70,8 @@ final class SubprocessRunnerAsyncTests: XCTestCase {
 
     func testRunAsyncMergesEnvironmentOverridesWithInheritedEnvironment() async throws {
         let sentinelKey = makeSentinelKey()
-        setenv(sentinelKey, "parent", 1)
-        defer { unsetenv(sentinelKey) }
+        RuntimeEnvironment.setValue("parent", forKey: sentinelKey)
+        defer { RuntimeEnvironment.setValue(nil, forKey: sentinelKey) }
         let root = try TestFileBuilder.makeTempDir()
         defer { try? FileManager.default.removeItem(at: root) }
         let scriptURL = try makeEnvironmentScript(in: root, name: "env-async.sh", sentinelKey: sentinelKey)

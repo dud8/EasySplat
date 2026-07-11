@@ -79,7 +79,7 @@ public final class SubprocessRunner: @unchecked Sendable, SubprocessRunning, Pse
     public init() {}
 
     private static func mergedEnvironment(with overrides: [String: String]) -> [String: String] {
-        ProcessInfo.processInfo.environment.merging(overrides) { _, new in new }
+        RuntimeEnvironment.current.merging(overrides) { _, new in new }
     }
 
     public func run(

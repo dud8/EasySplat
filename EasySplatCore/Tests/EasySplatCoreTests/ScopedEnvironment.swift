@@ -1,4 +1,5 @@
 import Foundation
+@testable import EasySplatCore
 
 private actor EnvironmentLock {
     static let shared = EnvironmentLock()
@@ -63,31 +64,19 @@ func scopedEnvironment(
 private func captureEnvironment(_ changes: [String: String?]) -> [String: String?] {
     var previous: [String: String?] = [:]
     for key in changes.keys {
-        if let value = getenv(key) {
-            previous[key] = String(cString: value)
-        } else {
-            previous[key] = nil
-        }
+        previous[key] = RuntimeEnvironment.value(forKey: key)
     }
     return previous
 }
 
 private func applyEnvironment(_ changes: [String: String?]) {
     for (key, value) in changes {
-        if let value {
-            setenv(key, value, 1)
-        } else {
-            unsetenv(key)
-        }
+        RuntimeEnvironment.setValue(value, forKey: key)
     }
 }
 
 private func restoreEnvironment(_ previous: [String: String?]) {
     for (key, value) in previous {
-        if let value {
-            setenv(key, value, 1)
-        } else {
-            unsetenv(key)
-        }
+        RuntimeEnvironment.setValue(value, forKey: key)
     }
 }

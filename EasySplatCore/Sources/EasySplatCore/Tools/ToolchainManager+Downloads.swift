@@ -276,7 +276,7 @@ extension ToolchainManager {
     }
 
     func shouldUseDataTaskForTests() -> Bool {
-        if ProcessInfo.processInfo.environment["XCTestConfigurationFilePath"] != nil {
+        if RuntimeEnvironment.current["XCTestConfigurationFilePath"] != nil {
             return true
         }
         return NSClassFromString("XCTestCase") != nil
@@ -344,7 +344,7 @@ extension ToolchainManager {
     }
 
     func localToolchainOverrideURL() -> URL? {
-        guard let value = ProcessInfo.processInfo.environment["EASYSPLAT_LOCAL_TOOLCHAIN_ROOT"]?
+        guard let value = RuntimeEnvironment.current["EASYSPLAT_LOCAL_TOOLCHAIN_ROOT"]?
             .trimmingCharacters(in: .whitespacesAndNewlines),
             !value.isEmpty else {
             return nil

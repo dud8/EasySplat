@@ -145,7 +145,7 @@ public final class FastVggtSfmRunner: @unchecked Sendable, FastVggtSfmRunning {
             resolvedArgs.append(contentsOf: ["--postprocess", coverage.postprocessMode])
         }
 
-        var environment = ProcessInfo.processInfo.environment
+        var environment = RuntimeEnvironment.current
         environment["PYTHONUNBUFFERED"] = "1"
         environment["TORCH_HOME"] = toolchain.models.path
         environment["EASYSPLAT_FASTVGGT_MODELS_DIR"] = toolchain.models.path

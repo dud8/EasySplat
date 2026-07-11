@@ -141,7 +141,7 @@ public final class PipelineRunner: @unchecked Sendable {
             && metadata.state.stage != .done
             && hasInterruptionEvidence
         let skipTraining: Bool = {
-            let env = ProcessInfo.processInfo.environment
+            let env = RuntimeEnvironment.current
             let stopAfterSfmRaw = env["EASYSPLAT_STOP_AFTER_SFM"]?
                 .trimmingCharacters(in: .whitespacesAndNewlines)
                 .lowercased()

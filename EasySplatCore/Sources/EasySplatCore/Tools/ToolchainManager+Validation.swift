@@ -330,7 +330,7 @@ extension ToolchainManager {
     }
 
     func shouldRequireDa3ForToolchainValidation() -> Bool {
-        guard let raw = ProcessInfo.processInfo.environment["EASYSPLAT_SFM_BACKEND"]?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased(),
+        guard let raw = RuntimeEnvironment.current["EASYSPLAT_SFM_BACKEND"]?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased(),
               !raw.isEmpty else {
             return true
         }

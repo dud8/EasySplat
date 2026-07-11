@@ -128,7 +128,7 @@ public final class VggtSfmRunner: @unchecked Sendable, VggtSfmRunning {
             argsWithBA.append("--no-fine-tracking")
         }
 
-        var environment = ProcessInfo.processInfo.environment
+        var environment = RuntimeEnvironment.current
         environment["PYTHONUNBUFFERED"] = "1"
         environment["TORCH_HOME"] = toolchain.models.path
         environment["EASYSPLAT_VGGT_MODELS_DIR"] = toolchain.models.path
