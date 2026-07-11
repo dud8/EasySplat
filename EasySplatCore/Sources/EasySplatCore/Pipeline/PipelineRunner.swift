@@ -616,6 +616,12 @@ public final class PipelineRunner: @unchecked Sendable {
                         line: "Auto-tune marks \(name) as high risk on this hardware tier, but strict FastVGGT mode is enabled. Continuing with conservative strict settings (no fallback).",
                         isError: true
                     ))
+                } else if backendOverride != nil {
+                    emit(.stageLog(
+                        stage: .sfmFeatures,
+                        line: "Auto-tune marks \(name) as high risk on this hardware tier, but it was explicitly requested. Continuing without changing the backend.",
+                        isError: true
+                    ))
                 } else {
                     emit(.stageLog(
                         stage: .sfmFeatures,
