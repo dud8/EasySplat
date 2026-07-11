@@ -17,6 +17,12 @@ required_files=(
   "$ROOT/.github/pull_request_template.md"
   "$ROOT/.github/ISSUE_TEMPLATE/bug_report.yml"
   "$ROOT/.github/ISSUE_TEMPLATE/feature_request.yml"
+  "$ROOT/scripts/benchmark/run_suite.sh"
+  "$ROOT/scripts/benchmark/easysplat_benchmark.py"
+  "$ROOT/scripts/benchmark/result.schema.json"
+  "$ROOT/scripts/benchmark/corpus.json"
+  "$ROOT/scripts/benchmark/reference-config.json"
+  "$ROOT/scripts/benchmark/tests/test_benchmark.py"
 )
 
 for path in "${required_files[@]}"; do
@@ -95,3 +101,11 @@ if rg -n 'DA3-(LARGE|GIANT)|DA3-NESTED|DA3NESTED|DA3-GIANT|DA3-LARGE|CC-BY-NC' \
   echo "DA3 default path references non-commercial weights." >&2
   exit 1
 fi
+
+if git -C "$ROOT" ls-files scripts/benchmark | rg '(^|/)suite\.json$|(^|/)raw/|\.(mov|mp4|m4v|heic|jpe?g|png|tiff?)$' >/dev/null; then
+  echo "Generated benchmark results or corpus media are tracked in Git." >&2
+  exit 1
+fi
+
+python3 -m unittest discover -s "$ROOT/scripts/benchmark/tests" -p 'test_*.py' >/dev/null
+"$ROOT/scripts/benchmark/run_suite.sh" --profile release --dry-run >/dev/null

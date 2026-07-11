@@ -1,0 +1,70 @@
+{
+  "schema_version": 1,
+  "references": {
+    "accurate_colmap": {
+      "mapper": "mapper",
+      "bundle_adjustment": "full"
+    },
+    "rendering": {
+      "iterations": 30000,
+      "pose_source": "accurate_colmap"
+    }
+  },
+  "thresholds": {
+    "coverage": {
+      "absolute_min": 0.9,
+      "colmap_relative_min": 0.95
+    },
+    "residual_pixels": {
+      "median_max": 1.5,
+      "p90_max": 3.0
+    },
+    "pose": {
+      "ate_colmap_ratio_max": 1.1,
+      "rotation_rpe_delta_degrees_max": 0.2,
+      "translation_rpe_delta_percentage_points_max": 2.0
+    },
+    "balanced_rendering": {
+      "median_psnr_loss_db_max": 0.5,
+      "median_ssim_loss_max": 0.01,
+      "median_lpips_increase_max": 0.02,
+      "scene_psnr_loss_db_max": 1.0,
+      "scene_ssim_loss_max": 0.02,
+      "scene_lpips_increase_max": 0.03
+    },
+    "fast_rendering": {
+      "scene_psnr_loss_db_max": 1.0,
+      "scene_ssim_loss_max": 0.02,
+      "scene_lpips_increase_max": 0.03,
+      "end_to_end_speedup_min": 2.0
+    },
+    "speed": {
+      "m4_max_p50_seconds_max": 120.0,
+      "balanced_speedup_min": 2.0,
+      "constrained_fast_p50_seconds_max": 300.0
+    },
+    "streaming": {
+      "inference_fps_min": 5.0,
+      "sustained_frames_min": 3000
+    },
+    "memory": {
+      "eight_gb_fast_bytes_max": 6500000000,
+      "constrained_bytes_max": 12000000000,
+      "larger_fraction_max": 0.75
+    },
+    "stability": {
+      "repeat_runs_min": 50,
+      "crashes_max": 0,
+      "corrupt_outputs_max": 0
+    },
+    "toolchain": {
+      "normal_photo_bytes_max": 2500000000,
+      "streaming_bytes_max": 6000000000
+    },
+    "compatibility": {
+      "finished_v1_opens_required": true,
+      "valid_v1_geometry_retrains_required": true,
+      "deterministic_restart_required": true
+    }
+  }
+}

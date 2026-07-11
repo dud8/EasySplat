@@ -1,0 +1,50 @@
+{
+  "schema_version": 1,
+  "scale_results": {
+    "30": {
+      "actual": {
+        "exit_code": 0,
+        "failure_type": null,
+        "corrupt_ply": false
+      },
+      "metrics": {
+        "registered_views": {"availability": "measured", "value": 30},
+        "total_views": {"availability": "measured", "value": 30},
+        "colmap_registered_views": {"availability": "measured", "value": 30},
+        "residual_provenance": {"availability": "measured", "value": "track_reprojection"},
+        "residual_median_pixels": {"availability": "measured", "value": 1.0},
+        "residual_p90_pixels": {"availability": "measured", "value": 2.0},
+        "ate_colmap_ratio": {"availability": "measured", "value": 1.0},
+        "rotation_rpe_delta_degrees": {"availability": "measured", "value": 0.1},
+        "translation_rpe_delta_percentage_points": {"availability": "measured", "value": 1.0},
+        "balanced_median_psnr_loss_db": {"availability": "measured", "value": 0.1},
+        "balanced_median_ssim_loss": {"availability": "measured", "value": 0.001},
+        "balanced_median_lpips_increase": {"availability": "measured", "value": 0.002},
+        "balanced_scene_psnr_loss_db": {"availability": "measured", "value": 0.2},
+        "balanced_scene_ssim_loss": {"availability": "measured", "value": 0.002},
+        "balanced_scene_lpips_increase": {"availability": "measured", "value": 0.004},
+        "fast_scene_psnr_loss_db": {"availability": "measured", "value": 0.5},
+        "fast_scene_ssim_loss": {"availability": "measured", "value": 0.01},
+        "fast_scene_lpips_increase": {"availability": "measured", "value": 0.01},
+        "fast_end_to_end_speedup": {"availability": "measured", "value": 2.5},
+        "m4_max_p50_seconds": {"availability": "measured", "value": 100.0},
+        "balanced_geometry_speedup": {"availability": "measured", "value": 2.1},
+        "constrained_fast_p50_seconds": {"availability": "measured", "value": 250.0},
+        "streaming_inference_fps": {"availability": "measured", "value": 6.0},
+        "streaming_sustained_frames": {"availability": "measured", "value": 3000},
+        "peak_memory_bytes": {"availability": "measured", "value": 6000000000},
+        "machine_memory_bytes": {"availability": "measured", "value": 8000000000},
+        "memory_lane": {"availability": "measured", "value": "eight_gb_fast"},
+        "repeat_runs": {"availability": "measured", "value": 50},
+        "crashes": {"availability": "measured", "value": 0},
+        "corrupt_outputs": {"availability": "measured", "value": 0},
+        "normal_photo_toolchain_bytes": {"availability": "measured", "value": 2000000000},
+        "streaming_toolchain_bytes": {"availability": "measured", "value": 5000000000},
+        "finished_v1_opens": {"availability": "measured", "value": true},
+        "valid_v1_geometry_retrains": {"availability": "measured", "value": true},
+        "deterministic_restart": {"availability": "measured", "value": true}
+      },
+      "artifacts": {}
+    }
+  }
+}

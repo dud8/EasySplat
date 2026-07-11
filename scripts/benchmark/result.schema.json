@@ -1,0 +1,280 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/dud8/EasySplat/blob/main/scripts/benchmark/result.schema.json",
+  "title": "EasySplat Apple Silicon benchmark suite result",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "run_id",
+    "started_at_utc",
+    "ended_at_utc",
+    "profile",
+    "status",
+    "blocking_reasons",
+    "failures",
+    "scene_results",
+    "aggregates",
+    "machine",
+    "thresholds_digest",
+    "corpus_digest",
+    "git",
+    "raw_artifact_directory",
+    "missing_requirements"
+  ],
+  "properties": {
+    "schema_version": {"const": 1},
+    "run_id": {"type": "string", "format": "uuid"},
+    "started_at_utc": {"type": "string", "format": "date-time"},
+    "ended_at_utc": {"type": ["string", "null"], "format": "date-time"},
+    "profile": {"enum": ["smoke", "release"]},
+    "status": {"enum": ["passed", "failed", "blocked"]},
+    "blocking_reasons": {"$ref": "#/$defs/stringArray"},
+    "failures": {"$ref": "#/$defs/stringArray"},
+    "scene_results": {
+      "type": "array",
+      "items": {"$ref": "#/$defs/sceneResult"}
+    },
+    "aggregates": {
+      "oneOf": [
+        {"type": "object", "maxProperties": 0},
+        {"$ref": "#/$defs/aggregates"}
+      ]
+    },
+    "machine": {"$ref": "#/$defs/machine"},
+    "thresholds_digest": {"$ref": "#/$defs/sha256"},
+    "corpus_digest": {"$ref": "#/$defs/sha256"},
+    "git": {"$ref": "#/$defs/git"},
+    "raw_artifact_directory": {"const": "raw"},
+    "missing_requirements": {"$ref": "#/$defs/missingRequirements"}
+  },
+  "$defs": {
+    "sha256": {
+      "type": "string",
+      "pattern": "^sha256:[0-9a-f]{64}$"
+    },
+    "stringArray": {
+      "type": "array",
+      "items": {"type": "string", "minLength": 1}
+    },
+    "metricValue": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["availability", "value"],
+          "properties": {
+            "availability": {"const": "measured"},
+            "value": {"type": ["number", "integer", "string", "boolean"]}
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["availability"],
+          "properties": {
+            "availability": {"const": "not_available"},
+            "reason": {"type": "string", "minLength": 1}
+          }
+        }
+      ]
+    },
+    "metrics": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "registered_views": {"$ref": "#/$defs/metricValue"},
+        "total_views": {"$ref": "#/$defs/metricValue"},
+        "colmap_registered_views": {"$ref": "#/$defs/metricValue"},
+        "points": {"$ref": "#/$defs/metricValue"},
+        "observations": {"$ref": "#/$defs/metricValue"},
+        "residual_provenance": {"$ref": "#/$defs/metricValue"},
+        "residual_median_pixels": {"$ref": "#/$defs/metricValue"},
+        "residual_p90_pixels": {"$ref": "#/$defs/metricValue"},
+        "ate_colmap_ratio": {"$ref": "#/$defs/metricValue"},
+        "rotation_rpe_delta_degrees": {"$ref": "#/$defs/metricValue"},
+        "translation_rpe_delta_percentage_points": {"$ref": "#/$defs/metricValue"},
+        "balanced_median_psnr_loss_db": {"$ref": "#/$defs/metricValue"},
+        "balanced_median_ssim_loss": {"$ref": "#/$defs/metricValue"},
+        "balanced_median_lpips_increase": {"$ref": "#/$defs/metricValue"},
+        "balanced_scene_psnr_loss_db": {"$ref": "#/$defs/metricValue"},
+        "balanced_scene_ssim_loss": {"$ref": "#/$defs/metricValue"},
+        "balanced_scene_lpips_increase": {"$ref": "#/$defs/metricValue"},
+        "fast_scene_psnr_loss_db": {"$ref": "#/$defs/metricValue"},
+        "fast_scene_ssim_loss": {"$ref": "#/$defs/metricValue"},
+        "fast_scene_lpips_increase": {"$ref": "#/$defs/metricValue"},
+        "fast_end_to_end_speedup": {"$ref": "#/$defs/metricValue"},
+        "m4_max_p50_seconds": {"$ref": "#/$defs/metricValue"},
+        "balanced_geometry_speedup": {"$ref": "#/$defs/metricValue"},
+        "constrained_fast_p50_seconds": {"$ref": "#/$defs/metricValue"},
+        "streaming_inference_fps": {"$ref": "#/$defs/metricValue"},
+        "streaming_sustained_frames": {"$ref": "#/$defs/metricValue"},
+        "peak_memory_bytes": {"$ref": "#/$defs/metricValue"},
+        "machine_memory_bytes": {"$ref": "#/$defs/metricValue"},
+        "memory_lane": {"$ref": "#/$defs/metricValue"},
+        "repeat_runs": {"$ref": "#/$defs/metricValue"},
+        "crashes": {"$ref": "#/$defs/metricValue"},
+        "corrupt_outputs": {"$ref": "#/$defs/metricValue"},
+        "normal_photo_toolchain_bytes": {"$ref": "#/$defs/metricValue"},
+        "streaming_toolchain_bytes": {"$ref": "#/$defs/metricValue"},
+        "finished_v1_opens": {"$ref": "#/$defs/metricValue"},
+        "valid_v1_geometry_retrains": {"$ref": "#/$defs/metricValue"},
+        "deterministic_restart": {"$ref": "#/$defs/metricValue"},
+        "wall_time_seconds": {"$ref": "#/$defs/metricValue"},
+        "max_resident_set_size_bytes": {"$ref": "#/$defs/metricValue"}
+      }
+    },
+    "sceneResult": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "scene_id",
+        "scale",
+        "adapter",
+        "status",
+        "blocking_reasons",
+        "failures",
+        "input_kind",
+        "expected_outcome",
+        "route",
+        "detail_profile",
+        "exit",
+        "command",
+        "metrics",
+        "artifacts"
+      ],
+      "properties": {
+        "scene_id": {"type": "string", "minLength": 1},
+        "scale": {"enum": [30, 120, 250, 500, 3000]},
+        "adapter": {"enum": ["da3", "external-result"]},
+        "status": {"enum": ["passed", "failed", "blocked"]},
+        "blocking_reasons": {"$ref": "#/$defs/stringArray"},
+        "failures": {"$ref": "#/$defs/stringArray"},
+        "input_kind": {"enum": ["video", "photos", "mixed"]},
+        "expected_outcome": {
+          "oneOf": [
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["kind"],
+              "properties": {"kind": {"const": "valid"}}
+            },
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["kind", "failure_type"],
+              "properties": {
+                "kind": {"const": "invalid"},
+                "failure_type": {"type": "string", "minLength": 1}
+              }
+            }
+          ]
+        },
+        "route": {"type": "string", "minLength": 1},
+        "detail_profile": {"type": "string", "minLength": 1},
+        "exit": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["code", "reason", "cancelled"],
+          "properties": {
+            "code": {"type": ["integer", "null"]},
+            "reason": {"type": "string", "minLength": 1},
+            "cancelled": {"type": "boolean"}
+          }
+        },
+        "command": {
+          "type": "array",
+          "items": {"type": "string"},
+          "minItems": 1
+        },
+        "metrics": {"$ref": "#/$defs/metrics"},
+        "artifacts": {
+          "type": "object",
+          "propertyNames": {"pattern": "^[a-z][a-z0-9_]*$"},
+          "additionalProperties": {"$ref": "#/$defs/sha256"}
+        }
+      }
+    },
+    "aggregates": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["scene_scale_runs", "passed", "failed", "blocked", "wall_time_geometric_mean_seconds"],
+      "properties": {
+        "scene_scale_runs": {"type": "integer", "minimum": 0},
+        "passed": {"type": "integer", "minimum": 0},
+        "failed": {"type": "integer", "minimum": 0},
+        "blocked": {"type": "integer", "minimum": 0},
+        "wall_time_geometric_mean_seconds": {"$ref": "#/$defs/metricValue"}
+      }
+    },
+    "machine": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "architecture",
+        "chip",
+        "hardware_model",
+        "logical_cpus",
+        "macos_build",
+        "macos_version",
+        "physical_cpus",
+        "physical_memory_bytes",
+        "swift_version",
+        "xcode_version"
+      ],
+      "properties": {
+        "architecture": {"type": "string"},
+        "chip": {"type": ["string", "null"]},
+        "hardware_model": {"type": ["string", "null"]},
+        "logical_cpus": {"type": ["integer", "null"]},
+        "macos_build": {"type": ["string", "null"]},
+        "macos_version": {"type": ["string", "null"]},
+        "physical_cpus": {"type": ["integer", "null"]},
+        "physical_memory_bytes": {"type": ["integer", "null"]},
+        "swift_version": {"type": "string"},
+        "xcode_version": {"type": "string"}
+      }
+    },
+    "git": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["commit", "dirty"],
+      "properties": {
+        "commit": {"type": "string", "pattern": "^(not_available|[0-9a-f]{40})$"},
+        "dirty": {"type": "boolean"}
+      }
+    },
+    "missingRequirement": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["scene_id", "path"],
+      "properties": {
+        "scene_id": {"type": "string", "minLength": 1},
+        "path": {"type": "string", "minLength": 1}
+      }
+    },
+    "missingRequirements": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["media", "external_results", "toolchain"],
+      "properties": {
+        "media": {"type": "array", "items": {"$ref": "#/$defs/missingRequirement"}},
+        "external_results": {"type": "array", "items": {"$ref": "#/$defs/missingRequirement"}},
+        "toolchain": {
+          "oneOf": [
+            {"type": "null"},
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["label", "missing"],
+              "properties": {
+                "label": {"const": "toolchain://resolved"},
+                "missing": {"$ref": "#/$defs/stringArray"}
+              }
+            }
+          ]
+        }
+      }
+    }
+  }
+}

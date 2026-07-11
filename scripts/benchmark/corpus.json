@@ -1,0 +1,1227 @@
+{
+  "schema_version": 1,
+  "manifest_profile": "release",
+  "scenes": [
+    {
+      "id": "orbit-01",
+      "category": "object_orbit",
+      "license": {
+        "name": "Pending written consent or redistributable source",
+        "url": "https://github.com/dud8/EasySplat",
+        "redistributable": false
+      },
+      "provenance": {
+        "source": "External benchmark slot orbit-01",
+        "consent": "Not supplied; the release gate remains blocked."
+      },
+      "input": {
+        "kind": "video",
+        "media_path": "external/orbit-01/capture.mov",
+        "supplied": false
+      },
+      "scale_lanes": [
+        30,
+        120,
+        250
+      ],
+      "split": {
+        "train": [
+          0,
+          2,
+          4,
+          6
+        ],
+        "holdout": [
+          1,
+          3,
+          5,
+          7
+        ]
+      },
+      "reference": {
+        "ground_truth_poses": true,
+        "accurate_colmap": true,
+        "rendering_reference": true
+      },
+      "expected_outcome": {
+        "kind": "valid"
+      },
+      "adapter": {
+        "type": "da3"
+      }
+    },
+    {
+      "id": "orbit-02",
+      "category": "object_orbit",
+      "license": {
+        "name": "Pending written consent or redistributable source",
+        "url": "https://github.com/dud8/EasySplat",
+        "redistributable": false
+      },
+      "provenance": {
+        "source": "External benchmark slot orbit-02",
+        "consent": "Not supplied; the release gate remains blocked."
+      },
+      "input": {
+        "kind": "video",
+        "media_path": "external/orbit-02/capture.mov",
+        "supplied": false
+      },
+      "scale_lanes": [
+        30,
+        120
+      ],
+      "split": {
+        "train": [
+          0,
+          2,
+          4,
+          6
+        ],
+        "holdout": [
+          1,
+          3,
+          5,
+          7
+        ]
+      },
+      "reference": {
+        "ground_truth_poses": true,
+        "accurate_colmap": true,
+        "rendering_reference": true
+      },
+      "expected_outcome": {
+        "kind": "valid"
+      },
+      "adapter": {
+        "type": "da3"
+      }
+    },
+    {
+      "id": "orbit-03",
+      "category": "object_orbit",
+      "license": {
+        "name": "Pending written consent or redistributable source",
+        "url": "https://github.com/dud8/EasySplat",
+        "redistributable": false
+      },
+      "provenance": {
+        "source": "External benchmark slot orbit-03",
+        "consent": "Not supplied; the release gate remains blocked."
+      },
+      "input": {
+        "kind": "video",
+        "media_path": "external/orbit-03/capture.mov",
+        "supplied": false
+      },
+      "scale_lanes": [
+        250
+      ],
+      "split": {
+        "train": [
+          0,
+          2,
+          4,
+          6
+        ],
+        "holdout": [
+          1,
+          3,
+          5,
+          7
+        ]
+      },
+      "reference": {
+        "ground_truth_poses": true,
+        "accurate_colmap": true,
+        "rendering_reference": true
+      },
+      "expected_outcome": {
+        "kind": "valid"
+      },
+      "adapter": {
+        "type": "da3"
+      }
+    },
+    {
+      "id": "orbit-04",
+      "category": "object_orbit",
+      "license": {
+        "name": "Pending written consent or redistributable source",
+        "url": "https://github.com/dud8/EasySplat",
+        "redistributable": false
+      },
+      "provenance": {
+        "source": "External benchmark slot orbit-04",
+        "consent": "Not supplied; the release gate remains blocked."
+      },
+      "input": {
+        "kind": "video",
+        "media_path": "external/orbit-04/capture.mov",
+        "supplied": false
+      },
+      "scale_lanes": [
+        500
+      ],
+      "split": {
+        "train": [
+          0,
+          2,
+          4,
+          6
+        ],
+        "holdout": [
+          1,
+          3,
+          5,
+          7
+        ]
+      },
+      "reference": {
+        "ground_truth_poses": true,
+        "accurate_colmap": true,
+        "rendering_reference": true
+      },
+      "expected_outcome": {
+        "kind": "valid"
+      },
+      "adapter": {
+        "type": "da3"
+      }
+    },
+    {
+      "id": "orbit-05",
+      "category": "object_orbit",
+      "license": {
+        "name": "Pending written consent or redistributable source",
+        "url": "https://github.com/dud8/EasySplat",
+        "redistributable": false
+      },
+      "provenance": {
+        "source": "External benchmark slot orbit-05",
+        "consent": "Not supplied; the release gate remains blocked."
+      },
+      "input": {
+        "kind": "video",
+        "media_path": "external/orbit-05/capture.mov",
+        "supplied": false
+      },
+      "scale_lanes": [
+        30,
+        500
+      ],
+      "split": {
+        "train": [
+          0,
+          2,
+          4,
+          6
+        ],
+        "holdout": [
+          1,
+          3,
+          5,
+          7
+        ]
+      },
+      "reference": {
+        "ground_truth_poses": true,
+        "accurate_colmap": true,
+        "rendering_reference": true
+      },
+      "expected_outcome": {
+        "kind": "valid"
+      },
+      "adapter": {
+        "type": "da3"
+      }
+    },
+    {
+      "id": "orbit-06",
+      "category": "object_orbit",
+      "license": {
+        "name": "Pending written consent or redistributable source",
+        "url": "https://github.com/dud8/EasySplat",
+        "redistributable": false
+      },
+      "provenance": {
+        "source": "External benchmark slot orbit-06",
+        "consent": "Not supplied; the release gate remains blocked."
+      },
+      "input": {
+        "kind": "video",
+        "media_path": "external/orbit-06/capture.mov",
+        "supplied": false
+      },
+      "scale_lanes": [
+        3000
+      ],
+      "split": {
+        "train": [
+          0,
+          2,
+          4,
+          6
+        ],
+        "holdout": [
+          1,
+          3,
+          5,
+          7
+        ]
+      },
+      "reference": {
+        "ground_truth_poses": true,
+        "accurate_colmap": true,
+        "rendering_reference": true
+      },
+      "expected_outcome": {
+        "kind": "valid"
+      },
+      "adapter": {
+        "type": "da3"
+      }
+    },
+    {
+      "id": "interior-01",
+      "category": "interior_walkthrough",
+      "license": {
+        "name": "Pending written consent or redistributable source",
+        "url": "https://github.com/dud8/EasySplat",
+        "redistributable": false
+      },
+      "provenance": {
+        "source": "External benchmark slot interior-01",
+        "consent": "Not supplied; the release gate remains blocked."
+      },
+      "input": {
+        "kind": "video",
+        "media_path": "external/interior-01/capture.mov",
+        "supplied": false
+      },
+      "scale_lanes": [
+        30,
+        120,
+        250
+      ],
+      "split": {
+        "train": [
+          0,
+          2,
+          4,
+          6
+        ],
+        "holdout": [
+          1,
+          3,
+          5,
+          7
+        ]
+      },
+      "reference": {
+        "ground_truth_poses": true,
+        "accurate_colmap": true,
+        "rendering_reference": true
+      },
+      "expected_outcome": {
+        "kind": "valid"
+      },
+      "adapter": {
+        "type": "da3"
+      }
+    },
+    {
+      "id": "interior-02",
+      "category": "interior_walkthrough",
+      "license": {
+        "name": "Pending written consent or redistributable source",
+        "url": "https://github.com/dud8/EasySplat",
+        "redistributable": false
+      },
+      "provenance": {
+        "source": "External benchmark slot interior-02",
+        "consent": "Not supplied; the release gate remains blocked."
+      },
+      "input": {
+        "kind": "video",
+        "media_path": "external/interior-02/capture.mov",
+        "supplied": false
+      },
+      "scale_lanes": [
+        120
+      ],
+      "split": {
+        "train": [
+          0,
+          2,
+          4,
+          6
+        ],
+        "holdout": [
+          1,
+          3,
+          5,
+          7
+        ]
+      },
+      "reference": {
+        "ground_truth_poses": true,
+        "accurate_colmap": true,
+        "rendering_reference": true
+      },
+      "expected_outcome": {
+        "kind": "valid"
+      },
+      "adapter": {
+        "type": "da3"
+      }
+    },
+    {
+      "id": "interior-03",
+      "category": "interior_walkthrough",
+      "license": {
+        "name": "Pending written consent or redistributable source",
+        "url": "https://github.com/dud8/EasySplat",
+        "redistributable": false
+      },
+      "provenance": {
+        "source": "External benchmark slot interior-03",
+        "consent": "Not supplied; the release gate remains blocked."
+      },
+      "input": {
+        "kind": "video",
+        "media_path": "external/interior-03/capture.mov",
+        "supplied": false
+      },
+      "scale_lanes": [
+        250
+      ],
+      "split": {
+        "train": [
+          0,
+          2,
+          4,
+          6
+        ],
+        "holdout": [
+          1,
+          3,
+          5,
+          7
+        ]
+      },
+      "reference": {
+        "ground_truth_poses": true,
+        "accurate_colmap": true,
+        "rendering_reference": true
+      },
+      "expected_outcome": {
+        "kind": "valid"
+      },
+      "adapter": {
+        "type": "da3"
+      }
+    },
+    {
+      "id": "interior-04",
+      "category": "interior_walkthrough",
+      "license": {
+        "name": "Pending written consent or redistributable source",
+        "url": "https://github.com/dud8/EasySplat",
+        "redistributable": false
+      },
+      "provenance": {
+        "source": "External benchmark slot interior-04",
+        "consent": "Not supplied; the release gate remains blocked."
+      },
+      "input": {
+        "kind": "video",
+        "media_path": "external/interior-04/capture.mov",
+        "supplied": false
+      },
+      "scale_lanes": [
+        500
+      ],
+      "split": {
+        "train": [
+          0,
+          2,
+          4,
+          6
+        ],
+        "holdout": [
+          1,
+          3,
+          5,
+          7
+        ]
+      },
+      "reference": {
+        "ground_truth_poses": true,
+        "accurate_colmap": true,
+        "rendering_reference": true
+      },
+      "expected_outcome": {
+        "kind": "valid"
+      },
+      "adapter": {
+        "type": "da3"
+      }
+    },
+    {
+      "id": "interior-05",
+      "category": "interior_walkthrough",
+      "license": {
+        "name": "Pending written consent or redistributable source",
+        "url": "https://github.com/dud8/EasySplat",
+        "redistributable": false
+      },
+      "provenance": {
+        "source": "External benchmark slot interior-05",
+        "consent": "Not supplied; the release gate remains blocked."
+      },
+      "input": {
+        "kind": "video",
+        "media_path": "external/interior-05/capture.mov",
+        "supplied": false
+      },
+      "scale_lanes": [
+        3000
+      ],
+      "split": {
+        "train": [
+          0,
+          2,
+          4,
+          6
+        ],
+        "holdout": [
+          1,
+          3,
+          5,
+          7
+        ]
+      },
+      "reference": {
+        "ground_truth_poses": true,
+        "accurate_colmap": true,
+        "rendering_reference": true
+      },
+      "expected_outcome": {
+        "kind": "valid"
+      },
+      "adapter": {
+        "type": "da3"
+      }
+    },
+    {
+      "id": "interior-06",
+      "category": "interior_walkthrough",
+      "license": {
+        "name": "Pending written consent or redistributable source",
+        "url": "https://github.com/dud8/EasySplat",
+        "redistributable": false
+      },
+      "provenance": {
+        "source": "External benchmark slot interior-06",
+        "consent": "Not supplied; the release gate remains blocked."
+      },
+      "input": {
+        "kind": "video",
+        "media_path": "external/interior-06/capture.mov",
+        "supplied": false
+      },
+      "scale_lanes": [
+        30,
+        500
+      ],
+      "split": {
+        "train": [
+          0,
+          2,
+          4,
+          6
+        ],
+        "holdout": [
+          1,
+          3,
+          5,
+          7
+        ]
+      },
+      "reference": {
+        "ground_truth_poses": true,
+        "accurate_colmap": true,
+        "rendering_reference": true
+      },
+      "expected_outcome": {
+        "kind": "valid"
+      },
+      "adapter": {
+        "type": "da3"
+      }
+    },
+    {
+      "id": "photos-01",
+      "category": "professional_photos",
+      "license": {
+        "name": "Pending written consent or redistributable source",
+        "url": "https://github.com/dud8/EasySplat",
+        "redistributable": false
+      },
+      "provenance": {
+        "source": "External benchmark slot photos-01",
+        "consent": "Not supplied; the release gate remains blocked."
+      },
+      "input": {
+        "kind": "photos",
+        "media_path": "external/photos-01/photos",
+        "supplied": false
+      },
+      "scale_lanes": [
+        30,
+        120
+      ],
+      "split": {
+        "train": [
+          0,
+          2,
+          4,
+          6
+        ],
+        "holdout": [
+          1,
+          3,
+          5,
+          7
+        ]
+      },
+      "reference": {
+        "ground_truth_poses": true,
+        "accurate_colmap": true,
+        "rendering_reference": true
+      },
+      "expected_outcome": {
+        "kind": "valid"
+      },
+      "adapter": {
+        "type": "external-result",
+        "result_path": "external/photos-01/reference-result.json"
+      }
+    },
+    {
+      "id": "photos-02",
+      "category": "professional_photos",
+      "license": {
+        "name": "Pending written consent or redistributable source",
+        "url": "https://github.com/dud8/EasySplat",
+        "redistributable": false
+      },
+      "provenance": {
+        "source": "External benchmark slot photos-02",
+        "consent": "Not supplied; the release gate remains blocked."
+      },
+      "input": {
+        "kind": "photos",
+        "media_path": "external/photos-02/photos",
+        "supplied": false
+      },
+      "scale_lanes": [
+        250
+      ],
+      "split": {
+        "train": [
+          0,
+          2,
+          4,
+          6
+        ],
+        "holdout": [
+          1,
+          3,
+          5,
+          7
+        ]
+      },
+      "reference": {
+        "ground_truth_poses": true,
+        "accurate_colmap": true,
+        "rendering_reference": true
+      },
+      "expected_outcome": {
+        "kind": "valid"
+      },
+      "adapter": {
+        "type": "external-result",
+        "result_path": "external/photos-02/reference-result.json"
+      }
+    },
+    {
+      "id": "photos-03",
+      "category": "professional_photos",
+      "license": {
+        "name": "Pending written consent or redistributable source",
+        "url": "https://github.com/dud8/EasySplat",
+        "redistributable": false
+      },
+      "provenance": {
+        "source": "External benchmark slot photos-03",
+        "consent": "Not supplied; the release gate remains blocked."
+      },
+      "input": {
+        "kind": "photos",
+        "media_path": "external/photos-03/photos",
+        "supplied": false
+      },
+      "scale_lanes": [
+        500
+      ],
+      "split": {
+        "train": [
+          0,
+          2,
+          4,
+          6
+        ],
+        "holdout": [
+          1,
+          3,
+          5,
+          7
+        ]
+      },
+      "reference": {
+        "ground_truth_poses": true,
+        "accurate_colmap": true,
+        "rendering_reference": true
+      },
+      "expected_outcome": {
+        "kind": "valid"
+      },
+      "adapter": {
+        "type": "external-result",
+        "result_path": "external/photos-03/reference-result.json"
+      }
+    },
+    {
+      "id": "photos-04",
+      "category": "professional_photos",
+      "license": {
+        "name": "Pending written consent or redistributable source",
+        "url": "https://github.com/dud8/EasySplat",
+        "redistributable": false
+      },
+      "provenance": {
+        "source": "External benchmark slot photos-04",
+        "consent": "Not supplied; the release gate remains blocked."
+      },
+      "input": {
+        "kind": "photos",
+        "media_path": "external/photos-04/photos",
+        "supplied": false
+      },
+      "scale_lanes": [
+        30,
+        120,
+        250
+      ],
+      "split": {
+        "train": [
+          0,
+          2,
+          4,
+          6
+        ],
+        "holdout": [
+          1,
+          3,
+          5,
+          7
+        ]
+      },
+      "reference": {
+        "ground_truth_poses": true,
+        "accurate_colmap": true,
+        "rendering_reference": true
+      },
+      "expected_outcome": {
+        "kind": "valid"
+      },
+      "adapter": {
+        "type": "external-result",
+        "result_path": "external/photos-04/reference-result.json"
+      }
+    },
+    {
+      "id": "exterior-01",
+      "category": "exterior_drone",
+      "license": {
+        "name": "Pending written consent or redistributable source",
+        "url": "https://github.com/dud8/EasySplat",
+        "redistributable": false
+      },
+      "provenance": {
+        "source": "External benchmark slot exterior-01",
+        "consent": "Not supplied; the release gate remains blocked."
+      },
+      "input": {
+        "kind": "video",
+        "media_path": "external/exterior-01/capture.mov",
+        "supplied": false
+      },
+      "scale_lanes": [
+        120,
+        250
+      ],
+      "split": {
+        "train": [
+          0,
+          2,
+          4,
+          6
+        ],
+        "holdout": [
+          1,
+          3,
+          5,
+          7
+        ]
+      },
+      "reference": {
+        "ground_truth_poses": false,
+        "accurate_colmap": true,
+        "rendering_reference": true
+      },
+      "expected_outcome": {
+        "kind": "valid"
+      },
+      "adapter": {
+        "type": "da3"
+      }
+    },
+    {
+      "id": "exterior-02",
+      "category": "exterior_drone",
+      "license": {
+        "name": "Pending written consent or redistributable source",
+        "url": "https://github.com/dud8/EasySplat",
+        "redistributable": false
+      },
+      "provenance": {
+        "source": "External benchmark slot exterior-02",
+        "consent": "Not supplied; the release gate remains blocked."
+      },
+      "input": {
+        "kind": "video",
+        "media_path": "external/exterior-02/capture.mov",
+        "supplied": false
+      },
+      "scale_lanes": [
+        500
+      ],
+      "split": {
+        "train": [
+          0,
+          2,
+          4,
+          6
+        ],
+        "holdout": [
+          1,
+          3,
+          5,
+          7
+        ]
+      },
+      "reference": {
+        "ground_truth_poses": false,
+        "accurate_colmap": true,
+        "rendering_reference": true
+      },
+      "expected_outcome": {
+        "kind": "valid"
+      },
+      "adapter": {
+        "type": "da3"
+      }
+    },
+    {
+      "id": "exterior-03",
+      "category": "exterior_drone",
+      "license": {
+        "name": "Pending written consent or redistributable source",
+        "url": "https://github.com/dud8/EasySplat",
+        "redistributable": false
+      },
+      "provenance": {
+        "source": "External benchmark slot exterior-03",
+        "consent": "Not supplied; the release gate remains blocked."
+      },
+      "input": {
+        "kind": "video",
+        "media_path": "external/exterior-03/capture.mov",
+        "supplied": false
+      },
+      "scale_lanes": [
+        3000
+      ],
+      "split": {
+        "train": [
+          0,
+          2,
+          4,
+          6
+        ],
+        "holdout": [
+          1,
+          3,
+          5,
+          7
+        ]
+      },
+      "reference": {
+        "ground_truth_poses": false,
+        "accurate_colmap": true,
+        "rendering_reference": true
+      },
+      "expected_outcome": {
+        "kind": "valid"
+      },
+      "adapter": {
+        "type": "da3"
+      }
+    },
+    {
+      "id": "exterior-04",
+      "category": "exterior_drone",
+      "license": {
+        "name": "Pending written consent or redistributable source",
+        "url": "https://github.com/dud8/EasySplat",
+        "redistributable": false
+      },
+      "provenance": {
+        "source": "External benchmark slot exterior-04",
+        "consent": "Not supplied; the release gate remains blocked."
+      },
+      "input": {
+        "kind": "video",
+        "media_path": "external/exterior-04/capture.mov",
+        "supplied": false
+      },
+      "scale_lanes": [
+        30,
+        120,
+        250,
+        500
+      ],
+      "split": {
+        "train": [
+          0,
+          2,
+          4,
+          6
+        ],
+        "holdout": [
+          1,
+          3,
+          5,
+          7
+        ]
+      },
+      "reference": {
+        "ground_truth_poses": false,
+        "accurate_colmap": true,
+        "rendering_reference": true
+      },
+      "expected_outcome": {
+        "kind": "valid"
+      },
+      "adapter": {
+        "type": "da3"
+      }
+    },
+    {
+      "id": "low-light-01",
+      "category": "low_light",
+      "license": {
+        "name": "Pending written consent or redistributable source",
+        "url": "https://github.com/dud8/EasySplat",
+        "redistributable": false
+      },
+      "provenance": {
+        "source": "External benchmark slot low-light-01",
+        "consent": "Not supplied; the release gate remains blocked."
+      },
+      "input": {
+        "kind": "video",
+        "media_path": "external/low-light-01/capture.mov",
+        "supplied": false
+      },
+      "scale_lanes": [
+        30,
+        120
+      ],
+      "split": {
+        "train": [
+          0,
+          2,
+          4,
+          6
+        ],
+        "holdout": [
+          1,
+          3,
+          5,
+          7
+        ]
+      },
+      "reference": {
+        "ground_truth_poses": false,
+        "accurate_colmap": true,
+        "rendering_reference": true
+      },
+      "expected_outcome": {
+        "kind": "valid"
+      },
+      "adapter": {
+        "type": "da3"
+      }
+    },
+    {
+      "id": "low-light-02",
+      "category": "low_light",
+      "license": {
+        "name": "Pending written consent or redistributable source",
+        "url": "https://github.com/dud8/EasySplat",
+        "redistributable": false
+      },
+      "provenance": {
+        "source": "External benchmark slot low-light-02",
+        "consent": "Not supplied; the release gate remains blocked."
+      },
+      "input": {
+        "kind": "video",
+        "media_path": "external/low-light-02/capture.mov",
+        "supplied": false
+      },
+      "scale_lanes": [
+        250
+      ],
+      "split": {
+        "train": [
+          0,
+          2,
+          4,
+          6
+        ],
+        "holdout": [
+          1,
+          3,
+          5,
+          7
+        ]
+      },
+      "reference": {
+        "ground_truth_poses": false,
+        "accurate_colmap": true,
+        "rendering_reference": true
+      },
+      "expected_outcome": {
+        "kind": "valid"
+      },
+      "adapter": {
+        "type": "da3"
+      }
+    },
+    {
+      "id": "low-light-03",
+      "category": "low_light",
+      "license": {
+        "name": "Pending written consent or redistributable source",
+        "url": "https://github.com/dud8/EasySplat",
+        "redistributable": false
+      },
+      "provenance": {
+        "source": "External benchmark slot low-light-03",
+        "consent": "Not supplied; the release gate remains blocked."
+      },
+      "input": {
+        "kind": "video",
+        "media_path": "external/low-light-03/capture.mov",
+        "supplied": false
+      },
+      "scale_lanes": [
+        500
+      ],
+      "split": {
+        "train": [
+          0,
+          2,
+          4,
+          6
+        ],
+        "holdout": [
+          1,
+          3,
+          5,
+          7
+        ]
+      },
+      "reference": {
+        "ground_truth_poses": false,
+        "accurate_colmap": true,
+        "rendering_reference": true
+      },
+      "expected_outcome": {
+        "kind": "valid"
+      },
+      "adapter": {
+        "type": "da3"
+      }
+    },
+    {
+      "id": "invalid-01",
+      "category": "invalid",
+      "license": {
+        "name": "Pending written consent or redistributable source",
+        "url": "https://github.com/dud8/EasySplat",
+        "redistributable": false
+      },
+      "provenance": {
+        "source": "External benchmark slot invalid-01",
+        "consent": "Not supplied; the release gate remains blocked."
+      },
+      "input": {
+        "kind": "mixed",
+        "media_path": "external/invalid-01/inputs",
+        "supplied": false
+      },
+      "scale_lanes": [
+        30
+      ],
+      "split": {
+        "train": [
+          0,
+          2,
+          4,
+          6
+        ],
+        "holdout": [
+          1,
+          3,
+          5,
+          7
+        ]
+      },
+      "reference": {
+        "ground_truth_poses": false,
+        "accurate_colmap": false,
+        "rendering_reference": false
+      },
+      "expected_outcome": {
+        "kind": "invalid",
+        "failure_type": "disconnected_input"
+      },
+      "adapter": {
+        "type": "external-result",
+        "result_path": "external/invalid-01/reference-result.json"
+      }
+    },
+    {
+      "id": "invalid-02",
+      "category": "invalid",
+      "license": {
+        "name": "Pending written consent or redistributable source",
+        "url": "https://github.com/dud8/EasySplat",
+        "redistributable": false
+      },
+      "provenance": {
+        "source": "External benchmark slot invalid-02",
+        "consent": "Not supplied; the release gate remains blocked."
+      },
+      "input": {
+        "kind": "mixed",
+        "media_path": "external/invalid-02/inputs",
+        "supplied": false
+      },
+      "scale_lanes": [
+        120
+      ],
+      "split": {
+        "train": [
+          0,
+          2,
+          4,
+          6
+        ],
+        "holdout": [
+          1,
+          3,
+          5,
+          7
+        ]
+      },
+      "reference": {
+        "ground_truth_poses": false,
+        "accurate_colmap": false,
+        "rendering_reference": false
+      },
+      "expected_outcome": {
+        "kind": "invalid",
+        "failure_type": "multiple_scenes"
+      },
+      "adapter": {
+        "type": "external-result",
+        "result_path": "external/invalid-02/reference-result.json"
+      }
+    },
+    {
+      "id": "invalid-03",
+      "category": "invalid",
+      "license": {
+        "name": "Pending written consent or redistributable source",
+        "url": "https://github.com/dud8/EasySplat",
+        "redistributable": false
+      },
+      "provenance": {
+        "source": "External benchmark slot invalid-03",
+        "consent": "Not supplied; the release gate remains blocked."
+      },
+      "input": {
+        "kind": "mixed",
+        "media_path": "external/invalid-03/inputs",
+        "supplied": false
+      },
+      "scale_lanes": [
+        250
+      ],
+      "split": {
+        "train": [
+          0,
+          2,
+          4,
+          6
+        ],
+        "holdout": [
+          1,
+          3,
+          5,
+          7
+        ]
+      },
+      "reference": {
+        "ground_truth_poses": false,
+        "accurate_colmap": false,
+        "rendering_reference": false
+      },
+      "expected_outcome": {
+        "kind": "invalid",
+        "failure_type": "insufficient_overlap"
+      },
+      "adapter": {
+        "type": "external-result",
+        "result_path": "external/invalid-03/reference-result.json"
+      }
+    }
+  ]
+}
