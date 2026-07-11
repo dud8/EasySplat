@@ -1203,6 +1203,9 @@ def _validate_actual_evidence(actual: Any, label: str) -> Mapping[str, Any]:
     elif exit_code == 0:
         if reason != "exit" or cancelled:
             raise ConfigError(f"{label} successful termination evidence is contradictory")
+    elif exit_code == 130:
+        if reason != "cancelled" or not cancelled:
+            raise ConfigError(f"{label} cancellation evidence is contradictory")
     elif cancelled:
         if reason != "cancelled" or exit_code != 130:
             raise ConfigError(f"{label} cancellation evidence is contradictory")

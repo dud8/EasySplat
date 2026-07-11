@@ -253,6 +253,17 @@ class ConfigurationValidationTests(unittest.TestCase):
         self.assertIs(schema["$defs"]["sceneResult"]["additionalProperties"], False)
         self.assertIs(schema["$defs"]["metrics"]["additionalProperties"], False)
 
+    def test_result_schema_reserves_exit_code_130_for_cancellation(self) -> None:
+        schema = json.loads((ROOT / "scripts/benchmark/result.schema.json").read_text(encoding="utf-8"))
+        exit_rules = schema["$defs"]["sceneResult"]["properties"]["exit"]["allOf"]
+        self.assertIn(
+            {
+                "if": {"properties": {"code": {"const": 130}}, "required": ["code"]},
+                "then": {"properties": {"reason": {"const": "cancelled"}, "cancelled": {"const": True}}},
+            },
+            exit_rules,
+        )
+
     def test_valid_smoke_manifest_and_config_round_trip(self) -> None:
         corpus = valid_corpus()
         config = valid_reference_config()
@@ -485,14 +496,25 @@ class InvalidSceneTests(unittest.TestCase):
 
     def test_contradictory_termination_evidence_blocks(self) -> None:
         expected = {"kind": "invalid", "failure_type": "disconnected_input"}
-        actual = {
-            **successful_actual(),
-            "exit_code": 2,
-            "termination_reason": "cancelled",
-            "cancelled": False,
-            "failure_type": "disconnected_input",
-        }
-        self.assertEqual(benchmark.evaluate_invalid_scene(expected, actual)["status"], "blocked")
+        contradictory_cases = (
+            {
+                **successful_actual(),
+                "exit_code": 2,
+                "termination_reason": "cancelled",
+                "cancelled": False,
+                "failure_type": "disconnected_input",
+            },
+            {
+                **successful_actual(),
+                "exit_code": 130,
+                "termination_reason": "exit",
+                "cancelled": False,
+                "failure_type": "disconnected_input",
+            },
+        )
+        for actual in contradictory_cases:
+            with self.subTest(actual=actual):
+                self.assertEqual(benchmark.evaluate_invalid_scene(expected, actual)["status"], "blocked")
 
 
 class MetadataAndPersistenceTests(unittest.TestCase):

@@ -272,6 +272,10 @@
               "then": {"properties": {"code": {"const": 130}, "cancelled": {"const": true}}}
             },
             {
+              "if": {"properties": {"code": {"const": 130}}, "required": ["code"]},
+              "then": {"properties": {"reason": {"const": "cancelled"}, "cancelled": {"const": true}}}
+            },
+            {
               "if": {"properties": {"reason": {"const": "signal"}}, "required": ["reason"]},
               "then": {"properties": {"code": {"type": "integer", "maximum": -1}, "cancelled": {"const": false}}}
             },
