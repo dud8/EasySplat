@@ -94,12 +94,143 @@ grep -q 'rm -rf "$target"' "$ROOT/scripts/toolchain/build_da3_mps.sh"
 grep -q '/usr/bin/file -b "$python_bin"' "$ROOT/scripts/toolchain/package_toolchain.sh"
 grep -q 'source_provenance' "$ROOT/scripts/toolchain/package_toolchain.sh"
 grep -q 'pinned-git' "$ROOT/scripts/toolchain/package_toolchain.sh"
-grep -q 'require_bundled_arm64_python "msplat" "$MSPLAT_PY_BIN"' "$ROOT/scripts/toolchain/package_toolchain.sh"
 grep -q 'resolve_rpath_dependency_for' "$ROOT/scripts/toolchain/package_toolchain.sh"
 grep -q 'require_bundled_arm64_python "da3_mps" "$DA3_PY_BIN"' "$ROOT/scripts/toolchain/package_toolchain.sh"
 grep -q 'require_bundled_arm64_python "mapanything_mps" "$MAP_PY_BIN"' "$ROOT/scripts/toolchain/package_toolchain.sh"
 grep -q 'require_bundled_arm64_python "vggt_mps" "$PY_BIN"' "$ROOT/scripts/toolchain/package_toolchain.sh"
 grep -q 'require_bundled_arm64_python "fastvggt_mps" "$FAST_PY_BIN"' "$ROOT/scripts/toolchain/package_toolchain.sh"
+
+msplat_validator="$ROOT/scripts/toolchain/validate_native_msplat.sh"
+[ -x "$msplat_validator" ] || {
+  echo "Missing executable native msplat validator: $msplat_validator" >&2
+  exit 1
+}
+
+grep -Fq '"$MSPLAT_VALIDATOR" --source "$MSPLAT_INSTALL/msplat"' "$ROOT/scripts/toolchain/package_toolchain.sh"
+grep -Fq '"$MSPLAT_VALIDATOR" --packaged "$OUT"' "$ROOT/scripts/toolchain/package_toolchain.sh"
+grep -Fq '[ "$file" = "$BIN/easysplat-train" ]' "$ROOT/scripts/toolchain/package_toolchain.sh"
+grep -Fq 'msplat/build_info.json msplat/LICENSE' "$ROOT/scripts/toolchain/package_toolchain.sh"
+grep -Fq 'find "$ROOT/Tools/MsplatNative" -type f -newer "$CORE_ZIP"' "$ROOT/scripts/run.sh"
+grep -Fq 'find "$ROOT/Tools/MsplatNative" -type f -newer "$MSPLAT_BUNDLE/build_info.json"' "$ROOT/scripts/run.sh"
+grep -Fq '[ "$MSPLAT_BUILD" -nt "$MSPLAT_BUNDLE/build_info.json" ]' "$ROOT/scripts/run.sh"
+grep -Fq '"$MSPLAT_VALIDATOR" --archive "$CORE_ZIP"' "$ROOT/scripts/run.sh"
+grep -Fq '"$MSPLAT_VALIDATOR" --source "$MSPLAT_BUNDLE"' "$ROOT/scripts/run.sh"
+grep -Fq '"$MSPLAT_VALIDATOR" --packaged "$root"' "$ROOT/scripts/run.sh"
+
+for script in "$ROOT/scripts/toolchain/package_toolchain.sh" "$ROOT/scripts/run.sh"; do
+  if grep -Eqi 'site-packages/msplat|_core\.so|core_extension_path\.txt|msplat/python|(^|[^[:alnum:]-])msplat-train([^[:alnum:]-]|$)' "$script"; then
+    echo "$script still contains packaged-Python or legacy msplat layout assumptions" >&2
+    exit 1
+  fi
+done
+
+if grep -E '^[A-Z0-9_]+_URL="http://' "$ROOT/scripts/toolchain/build_msplat.sh"; then
+  echo "Native msplat dependency URLs must use HTTPS" >&2
+  exit 1
+fi
+
+msplat_source="$ROOT/Toolchains/build/msplat/install/msplat"
+if [ -d "$msplat_source" ]; then
+  "$msplat_validator" --source "$msplat_source"
+
+  packaged_fixture="$TMP_DIR/native-msplat-packaged"
+  mkdir -p "$packaged_fixture/bin" "$packaged_fixture/msplat"
+  cp "$msplat_source/bin/easysplat-train" "$packaged_fixture/bin/easysplat-train"
+  cp "$msplat_source/bin/default.metallib" "$packaged_fixture/bin/default.metallib"
+  cp "$msplat_source/build_info.json" "$packaged_fixture/msplat/build_info.json"
+  cp "$msplat_source/LICENSE" "$packaged_fixture/msplat/LICENSE"
+  chmod +x "$packaged_fixture/bin/easysplat-train"
+  "$msplat_validator" --packaged "$packaged_fixture"
+
+  archive_fixture="$TMP_DIR/native-msplat.zip"
+  (cd "$packaged_fixture" && zip -q "$archive_fixture" \
+    bin/easysplat-train bin/default.metallib msplat/build_info.json msplat/LICENSE)
+  "$msplat_validator" --archive "$archive_fixture"
+
+  tampered_fixture="$TMP_DIR/native-msplat-tampered"
+  cp -R "$packaged_fixture" "$tampered_fixture"
+  printf 'tamper\n' >>"$tampered_fixture/bin/default.metallib"
+  if "$msplat_validator" --packaged "$tampered_fixture" >/dev/null 2>&1; then
+    echo "Native msplat validator accepted a tampered metallib" >&2
+    exit 1
+  fi
+
+  license_fixture="$TMP_DIR/native-msplat-license-tampered"
+  cp -R "$packaged_fixture" "$license_fixture"
+  printf 'tamper\n' >>"$license_fixture/msplat/LICENSE"
+  if "$msplat_validator" --packaged "$license_fixture" >/dev/null 2>&1; then
+    echo "Native msplat validator accepted a tampered upstream license" >&2
+    exit 1
+  fi
+
+  tampered_archive="$TMP_DIR/native-msplat-tampered.zip"
+  (cd "$tampered_fixture" && zip -q "$tampered_archive" \
+    bin/easysplat-train bin/default.metallib msplat/build_info.json msplat/LICENSE)
+  if "$msplat_validator" --archive "$tampered_archive" >/dev/null 2>&1; then
+    echo "Native msplat validator accepted a tampered cached archive" >&2
+    exit 1
+  fi
+
+  extra_fixture="$TMP_DIR/native-msplat-extra"
+  cp -R "$packaged_fixture" "$extra_fixture"
+  : >"$extra_fixture/msplat/unexpected.txt"
+  if "$msplat_validator" --packaged "$extra_fixture" >/dev/null 2>&1; then
+    echo "Native msplat validator accepted an unexpected file" >&2
+    exit 1
+  fi
+
+  symlink_fixture="$TMP_DIR/native-msplat-symlink"
+  cp -R "$packaged_fixture" "$symlink_fixture"
+  rm "$symlink_fixture/msplat/LICENSE"
+  ln -s "$msplat_source/LICENSE" "$symlink_fixture/msplat/LICENSE"
+  if "$msplat_validator" --packaged "$symlink_fixture" >/dev/null 2>&1; then
+    echo "Native msplat validator accepted a symlink" >&2
+    exit 1
+  fi
+
+  legacy_fixture="$TMP_DIR/native-msplat-legacy"
+  cp -R "$packaged_fixture" "$legacy_fixture"
+  mkdir -p "$legacy_fixture/msplat/python/bin"
+  : >"$legacy_fixture/msplat/python/bin/python3"
+  if "$msplat_validator" --packaged "$legacy_fixture" >/dev/null 2>&1; then
+    echo "Native msplat validator accepted the legacy Python layout" >&2
+    exit 1
+  fi
+
+  legacy_archive="$TMP_DIR/native-msplat-legacy.zip"
+  (cd "$legacy_fixture" && zip -q "$legacy_archive" \
+    bin/easysplat-train bin/default.metallib msplat/build_info.json msplat/LICENSE \
+    msplat/python/bin/python3)
+  if "$msplat_validator" --archive "$legacy_archive" >/dev/null 2>&1; then
+    echo "Native msplat validator accepted a legacy cached archive" >&2
+    exit 1
+  fi
+
+  provenance_fixture="$TMP_DIR/native-msplat-unexpected-provenance"
+  cp -R "$packaged_fixture" "$provenance_fixture"
+  python3 - "$provenance_fixture/msplat/build_info.json" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+path = Path(sys.argv[1])
+payload = json.loads(path.read_text(encoding="utf-8"))
+payload["unexpected"] = "not allowed"
+path.write_text(json.dumps(payload), encoding="utf-8")
+PY
+  if "$msplat_validator" --packaged "$provenance_fixture" >/dev/null 2>&1; then
+    echo "Native msplat validator accepted unexpected provenance keys" >&2
+    exit 1
+  fi
+
+  partial_archive="$TMP_DIR/native-msplat-partial.zip"
+  (cd "$packaged_fixture" && zip -q "$partial_archive" \
+    bin/easysplat-train msplat/build_info.json msplat/LICENSE)
+  if "$msplat_validator" --archive "$partial_archive" >/dev/null 2>&1; then
+    echo "Native msplat validator accepted a partial cached archive" >&2
+    exit 1
+  fi
+fi
 
 if [ -e "$app_bundle/Contents/lib/Sparkle.framework" ]; then
   echo "Release app unexpectedly bundled Sparkle.framework" >&2

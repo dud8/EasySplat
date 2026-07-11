@@ -29,6 +29,7 @@ VGGT_MPS_INSTALL="${VGGT_MPS_INSTALL:-$ROOT/Toolchains/build/vggt_mps/install}"
 FASTVGGT_MPS_INSTALL="${FASTVGGT_MPS_INSTALL:-$ROOT/Toolchains/build/fastvggt_mps/install}"
 MAPANYTHING_MPS_INSTALL="${MAPANYTHING_MPS_INSTALL:-$ROOT/Toolchains/build/mapanything_mps/install}"
 DA3_MPS_INSTALL="${DA3_MPS_INSTALL:-$ROOT/Toolchains/build/da3_mps/install}"
+MSPLAT_VALIDATOR="$ROOT/scripts/toolchain/validate_native_msplat.sh"
 
 OUT="$ROOT/Toolchains/out"
 BIN="$OUT/bin"
@@ -80,42 +81,6 @@ if tool_name == "da3_mps" and payload.get("source_provenance") != "pinned-git":
     raise SystemExit(
         "da3_mps build_info.json must record pinned-git source_provenance; "
         f"got {payload.get('source_provenance')!r}"
-    )
-PY
-}
-
-validate_msplat_build_info() {
-  local python_bin="$1"
-  local build_info="$2"
-  PYTHONNOUSERSITE=1 "$python_bin" - "$build_info" <<'PY'
-import json
-import sys
-from pathlib import Path
-
-build_info = Path(sys.argv[1])
-required_keys = {
-    "toolchain_name",
-    "source_path",
-    "python_version",
-    "package_version",
-}
-
-try:
-    payload = json.loads(build_info.read_text(encoding="utf-8"))
-except Exception as exc:  # noqa: BLE001
-    raise SystemExit(f"msplat build_info.json is invalid JSON: {exc}")
-
-if not isinstance(payload, dict):
-    raise SystemExit("msplat build_info.json must contain a JSON object.")
-
-missing = sorted(key for key in required_keys if not payload.get(key))
-if missing:
-    raise SystemExit(f"msplat build_info.json is missing required keys: {', '.join(missing)}")
-
-if payload.get("toolchain_name") != "msplat":
-    raise SystemExit(
-        "msplat build_info.json toolchain_name mismatch: "
-        f"expected msplat, got {payload.get('toolchain_name')!r}"
     )
 PY
 }
@@ -311,11 +276,9 @@ bundle_toolchain_dependency_closure() {
   local current
 
   for path in "$BIN"/* "$LIB"/*; do
+    [ "$path" = "$BIN/easysplat-train" ] && continue
     enqueue_macho_file "$path"
   done
-  while IFS= read -r -d '' path; do
-    enqueue_macho_file "$path"
-  done < <(find "$OUT/msplat" -type f -print0)
 
   index=0
   while [ "$index" -lt "${#queued_macho_files[@]}" ]; do
@@ -380,9 +343,6 @@ validate_portable_dependency_references() {
   for file in "$BIN"/* "$LIB"/*; do
     validate_portable_dependency_references_for "$file"
   done
-  while IFS= read -r -d '' file; do
-    validate_portable_dependency_references_for "$file"
-  done < <(find "$OUT/msplat" -type f -print0)
 }
 
 relative_lib_rpath_for() {
@@ -417,11 +377,9 @@ add_bundle_lib_rpath_if_needed() {
 add_bundle_lib_rpaths() {
   local file
   for file in "$BIN"/*; do
+    [ "$file" = "$BIN/easysplat-train" ] && continue
     add_bundle_lib_rpath_if_needed "$file"
   done
-  while IFS= read -r -d '' file; do
-    add_bundle_lib_rpath_if_needed "$file"
-  done < <(find "$OUT/msplat" -type f -print0)
 }
 
 cp "$COLMAP_INSTALL/bin/colmap" "$BIN/colmap"
@@ -440,55 +398,14 @@ fi
 exec "$REAL" "$@"
 SCRIPT
 
-if [ ! -d "$MSPLAT_INSTALL/msplat" ]; then
-  echo "msplat bundle not found at $MSPLAT_INSTALL/msplat. Build it before packaging." >&2
-  exit 1
-fi
-if [ ! -x "$MSPLAT_INSTALL/msplat/bin/msplat-train" ]; then
-  echo "msplat bundle missing bin/msplat-train. Rebuild msplat." >&2
-  exit 1
-fi
-if [ ! -x "$MSPLAT_INSTALL/msplat/python/bin/python3" ]; then
-  echo "msplat bundle missing python/bin/python3. Rebuild msplat." >&2
-  exit 1
-fi
-if [ ! -f "$MSPLAT_INSTALL/msplat/build_info.json" ]; then
-  echo "msplat bundle missing build_info.json. Rebuild msplat." >&2
-  exit 1
-fi
-MSPLAT_CORE_EXTENSION="$(find "$MSPLAT_INSTALL/msplat/python/lib" -path "*/site-packages/msplat/_core*.so" -type f -print -quit)"
-if [ -z "$MSPLAT_CORE_EXTENSION" ]; then
-  echo "msplat bundle missing msplat/_core extension. Rebuild msplat." >&2
-  exit 1
-fi
-MSPLAT_PY_BIN="$MSPLAT_INSTALL/msplat/python/bin/python3"
-require_bundled_arm64_python "msplat" "$MSPLAT_PY_BIN"
-validate_msplat_build_info "$MSPLAT_PY_BIN" "$MSPLAT_INSTALL/msplat/build_info.json"
-if ! /usr/bin/file -b "$MSPLAT_CORE_EXTENSION" | grep -q "arm64"; then
-  echo "msplat core extension is not arm64: $MSPLAT_CORE_EXTENSION" >&2
-  exit 1
-fi
-if ! "$MSPLAT_INSTALL/msplat/bin/msplat-train" --help >/dev/null; then
-  echo "msplat-train failed to launch. Rebuild msplat." >&2
-  exit 1
-fi
-cp -R "$MSPLAT_INSTALL/msplat" "$OUT/msplat"
-MSPLAT_CORE_REL="${MSPLAT_CORE_EXTENSION#"$MSPLAT_INSTALL/msplat/"}"
-case "$MSPLAT_CORE_REL" in
-  ""|/*|../*|*/../*|*/..|*//*)
-    echo "msplat core extension path is not a safe bundle-relative path: $MSPLAT_CORE_EXTENSION" >&2
-    exit 1
-    ;;
-esac
-printf '%s\n' "$MSPLAT_CORE_REL" >"$OUT/msplat/core_extension_path.txt"
-cat >"$BIN/msplat-train" <<'SCRIPT'
-#!/usr/bin/env bash
-set -euo pipefail
-ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-exec "$ROOT/msplat/bin/msplat-train" "$@"
-SCRIPT
+"$MSPLAT_VALIDATOR" --source "$MSPLAT_INSTALL/msplat"
+mkdir -p "$OUT/msplat"
+cp "$MSPLAT_INSTALL/msplat/bin/easysplat-train" "$BIN/easysplat-train"
+cp "$MSPLAT_INSTALL/msplat/bin/default.metallib" "$BIN/default.metallib"
+cp "$MSPLAT_INSTALL/msplat/build_info.json" "$OUT/msplat/build_info.json"
+cp "$MSPLAT_INSTALL/msplat/LICENSE" "$OUT/msplat/LICENSE"
 
-chmod +x "$BIN/colmap" "$BIN/brush" "$BIN/brush.real" "$BIN/msplat-train"
+chmod +x "$BIN/colmap" "$BIN/brush" "$BIN/brush.real" "$BIN/easysplat-train"
 
 if [ ! -d "$DA3_MPS_INSTALL/da3_mps" ]; then
   echo "da3_mps bundle not found at $DA3_MPS_INSTALL/da3_mps. Build it before packaging." >&2
@@ -732,11 +649,12 @@ test -f "$LIB/libssl.3.dylib" || { echo "missing bundled libssl.3.dylib" >&2; ex
 
 bundle_toolchain_dependency_closure
 validate_portable_dependency_references
+"$MSPLAT_VALIDATOR" --packaged "$OUT"
 
 pushd "$OUT" >/dev/null
 zip -r "$CORE_ZIP" \
   bin lib \
-  msplat/bin msplat/python msplat/build_info.json msplat/core_extension_path.txt \
+  msplat/build_info.json msplat/LICENSE \
   da3_mps/bin da3_mps/python da3_mps/app da3_mps/vendor da3_mps/build_info.json \
   mapanything_mps/bin mapanything_mps/python mapanything_mps/app mapanything_mps/vendor mapanything_mps/build_info.json \
   vggt_mps/bin vggt_mps/python vggt_mps/app vggt_mps/vendor vggt_mps/build_info.json \
