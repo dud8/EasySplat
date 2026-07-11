@@ -11,7 +11,10 @@ extension PipelineRunner {
     }
 
     func sfmBackendOverride() -> SfmBackend? {
-        let env = runtimeEnvironment
+        sfmBackendOverride(environment: runtimeEnvironment)
+    }
+
+    func sfmBackendOverride(environment env: [String: String]) -> SfmBackend? {
         if let value = env["EASYSPLAT_SFM_BACKEND"]?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() {
             if value == "da3" || value == "depth-anything-3" || value == "depthanything3" { return .da3 }
             if value == "mapanything" { return .mapanything }

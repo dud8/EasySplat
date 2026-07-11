@@ -112,14 +112,19 @@ public final class PipelineRunner: @unchecked Sendable {
     }
 
     public func run(resumeFrom lastCompletedStage: PipelineStage? = nil, events: @escaping @Sendable (PipelineEvent) -> Void) async throws {
+        let environment = RuntimeEnvironment.current
         let scopedRunner = PipelineRunner(
             projectURL: projectURL,
             config: config,
             tooling: tooling,
             powerAssertion: powerAssertion,
-            capturedEnvironment: RuntimeEnvironment.current
+            capturedEnvironment: environment
         )
-        try await scopedRunner.runWithCapturedEnvironment(resumeFrom: lastCompletedStage, events: events)
+        try await scopedRunner.runWithCapturedEnvironment(
+            resumeFrom: lastCompletedStage,
+            environment: environment,
+            events: events
+        )
     }
 
     private init(
@@ -138,6 +143,7 @@ public final class PipelineRunner: @unchecked Sendable {
 
     private func runWithCapturedEnvironment(
         resumeFrom lastCompletedStage: PipelineStage?,
+        environment: [String: String],
         events: @escaping @Sendable (PipelineEvent) -> Void
     ) async throws {
         // Keep the Mac awake for the entire run. Runs are multi-hour and training has no
@@ -566,7 +572,7 @@ public final class PipelineRunner: @unchecked Sendable {
             }
 
             try Task.checkCancellation()
-            let backendOverride = sfmBackendOverride()
+            let backendOverride = sfmBackendOverride(environment: environment)
             let da3WindowSize = da3WindowSizePreference(hardwareTier: detectedHardwareProfile.tier)
             var backendOrder = sfmBackendFallbackOrder(override: backendOverride)
             if let backendOverride, backendOverride == .fastvggt {
