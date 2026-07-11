@@ -239,6 +239,27 @@ final class AppModelTests: XCTestCase {
         try await waitForViewState(model: model, state: .home, timeout: 4.0)
     }
 
+    func testStartProjectPersistsRequestedOptionsMatchingLegacyControls() async throws {
+        let tempBase = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: tempBase) }
+        try FileManager.default.createDirectory(at: tempBase, withIntermediateDirectories: true)
+        let input = tempBase.appendingPathComponent("clip.mov")
+        try Data("video".utf8).write(to: input)
+
+        let model = AppModel(toolchainManager: MockToolchainManager(), projectBaseURL: tempBase) { projectURL, config in
+            MockPipelineRunner(projectURL: projectURL, config: config)
+        }
+        model.captureMode = .room
+        model.qualityPreset = .ultra
+
+        await model.startProject(input: .video(files: [input.path]), title: "Walkthrough")
+
+        let projectURL = try XCTUnwrap(model.currentProjectURL)
+        let metadata = try ProjectMetadataStore.load(from: ProjectPaths(root: projectURL).metadataURL)
+        XCTAssertEqual(metadata.requestedRunOptions?.capturePath, .walkthrough)
+        XCTAssertEqual(metadata.requestedRunOptions?.detailProfile, .highDetail)
+    }
+
     func testResumedProcessingRunExposesPersistedPresetAndInput() async throws {
         let tempBase = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
         defer { try? FileManager.default.removeItem(at: tempBase) }

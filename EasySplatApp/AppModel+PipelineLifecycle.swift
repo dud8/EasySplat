@@ -259,10 +259,21 @@ extension AppModel {
         do {
             let projectURL = try createProjectDirectory(title: title)
             currentProjectURL = projectURL
+            let requestedOptions = RequestedRunOptions(
+                capturePath: captureMode == .object ? .orbit : .walkthrough,
+                detailProfile: {
+                    switch qualityPreset {
+                    case .draft: return .fast
+                    case .standard: return .balanced
+                    case .ultra: return .highDetail
+                    }
+                }()
+            )
             let metadata = ProjectMetadata(
                 title: projectURL.deletingPathExtension().lastPathComponent,
                 input: input,
-                preset: PresetSpec(mode: captureMode, quality: qualityPreset)
+                preset: PresetSpec(mode: captureMode, quality: qualityPreset),
+                requestedRunOptions: requestedOptions
             )
             let paths = ProjectPaths(root: projectURL)
             try paths.ensureDirectories()
