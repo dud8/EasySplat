@@ -1,3 +1,4 @@
+import Darwin
 import XCTest
 @testable import EasySplatCore
 
@@ -246,6 +247,84 @@ final class ToolchainManagerTests: XCTestCase {
             try FileManager.default.attributesOfItem(atPath: target.path)[.posixPermissions] as? NSNumber
         )
         XCTAssertEqual(permissions.intValue & 0o777, 0o600)
+    }
+
+    func testValidateToolchainRejectsSymlinkedMsplatAncestorWithoutChangingTargetMode() throws {
+        let root = try TestFileBuilder.makeTempDir()
+        let externalBin = root.deletingLastPathComponent()
+            .appendingPathComponent("external-bin-(UUID().uuidString)", isDirectory: true)
+        defer {
+            try? FileManager.default.removeItem(at: root)
+            try? FileManager.default.removeItem(at: externalBin)
+        }
+        _ = try ToolchainFixtureBuilder.createToolchain(at: root)
+        let bin = root.appendingPathComponent("bin", isDirectory: true)
+        try FileManager.default.moveItem(at: bin, to: externalBin)
+        try FileManager.default.createSymbolicLink(at: bin, withDestinationURL: externalBin)
+        let target = externalBin.appendingPathComponent("easysplat-train")
+        try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: target.path)
+
+        let manager = ToolchainManager(runner: makeValidationRunner(root: root))
+        XCTAssertThrowsError(try manager.test_validateToolchain(root: root)) { error in
+            guard case ToolchainManager.ToolchainError.invalidToolchain(let message) = error else {
+                return XCTFail("Expected invalidToolchain error")
+            }
+            XCTAssertTrue(message.contains("symbolic link"), "expected ancestor symlink rejection; got (message)")
+        }
+        let permissions = try XCTUnwrap(
+            try FileManager.default.attributesOfItem(atPath: target.path)[.posixPermissions] as? NSNumber
+        )
+        XCTAssertEqual(permissions.intValue & 0o777, 0o600)
+    }
+
+    func testValidateToolchainRejectsMultiplyLinkedMsplatExecutable() throws {
+        let root = try TestFileBuilder.makeTempDir()
+        defer { try? FileManager.default.removeItem(at: root) }
+        _ = try ToolchainFixtureBuilder.createToolchain(at: root)
+        let executable = root.appendingPathComponent("bin/easysplat-train")
+        let externalLink = root.appendingPathComponent("external-native-binary")
+        try FileManager.default.linkItem(at: executable, to: externalLink)
+
+        let manager = ToolchainManager(runner: makeValidationRunner(root: root))
+        XCTAssertThrowsError(try manager.test_validateToolchain(root: root)) { error in
+            guard case ToolchainManager.ToolchainError.invalidToolchain(let message) = error else {
+                return XCTFail("Expected invalidToolchain error")
+            }
+            XCTAssertTrue(message.contains("hard link"), "expected hard-link rejection; got (message)")
+        }
+    }
+
+    func testValidateToolchainRejectsFifoBuildInfoBeforeReading() throws {
+        let root = try TestFileBuilder.makeTempDir()
+        defer { try? FileManager.default.removeItem(at: root) }
+        _ = try ToolchainFixtureBuilder.createToolchain(at: root)
+        let buildInfo = root.appendingPathComponent("msplat/build_info.json")
+        try FileManager.default.removeItem(at: buildInfo)
+        XCTAssertEqual(Darwin.mkfifo(buildInfo.path, 0o600), 0)
+
+        let manager = ToolchainManager(runner: makeValidationRunner(root: root))
+        XCTAssertThrowsError(try manager.test_validateToolchain(root: root)) { error in
+            guard case ToolchainManager.ToolchainError.invalidToolchain(let message) = error else {
+                return XCTFail("Expected invalidToolchain error")
+            }
+            XCTAssertTrue(message.contains("regular file"), "expected FIFO rejection; got (message)")
+        }
+    }
+
+    func testValidateToolchainRejectsOversizedMsplatBuildInfoBeforeParsing() throws {
+        let root = try TestFileBuilder.makeTempDir()
+        defer { try? FileManager.default.removeItem(at: root) }
+        _ = try ToolchainFixtureBuilder.createToolchain(at: root)
+        let buildInfo = root.appendingPathComponent("msplat/build_info.json")
+        try Data(repeating: 0x20, count: 65 * 1_024).write(to: buildInfo, options: .atomic)
+
+        let manager = ToolchainManager(runner: makeValidationRunner(root: root))
+        XCTAssertThrowsError(try manager.test_validateToolchain(root: root)) { error in
+            guard case ToolchainManager.ToolchainError.invalidToolchain(let message) = error else {
+                return XCTFail("Expected invalidToolchain error")
+            }
+            XCTAssertTrue(message.contains("size"), "expected metadata size rejection; got (message)")
+        }
     }
 
     func testValidateToolchainRejectsNonArmNativeMsplat() throws {

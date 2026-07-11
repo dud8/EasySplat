@@ -395,10 +395,12 @@ extension ToolchainManager {
         let msplatRoot = root.appendingPathComponent("msplat", isDirectory: true)
         let expectedFiles = Set(["LICENSE", "build_info.json"])
 
-        for url in [executable, metallib, msplatRoot, buildInfo, license] where isSymbolicLink(url) {
-            throw ToolchainError.invalidToolchain(
-                "Native msplat closure contains a symbolic link: \(projectRelativePath(url, root: root))."
-            )
+        for url in [executable, metallib, msplatRoot, buildInfo, license] {
+            if let symlink = firstSymbolicLinkComponent(from: root, through: url) {
+                throw ToolchainError.invalidToolchain(
+                    "Native msplat closure contains a symbolic link: \(projectRelativePath(symlink, root: root))."
+                )
+            }
         }
 
         var isDirectory: ObjCBool = false
@@ -425,21 +427,39 @@ extension ToolchainManager {
             throw ToolchainError.invalidToolchain("Native msplat closure has \(details.joined(separator: "; ")).")
         }
 
-        for url in [executable, metallib, buildInfo, license] {
-            var entryIsDirectory: ObjCBool = false
-            guard fileManager.fileExists(atPath: url.path, isDirectory: &entryIsDirectory), !entryIsDirectory.boolValue else {
+        let fileRequirements: [(url: URL, label: String, maximumBytes: Int64)] = [
+            (executable, "bin/easysplat-train", 128 * 1_024 * 1_024),
+            (metallib, "bin/default.metallib", 512 * 1_024 * 1_024),
+            (buildInfo, "msplat/build_info.json", 64 * 1_024),
+            (license, "msplat/LICENSE", 4 * 1_024 * 1_024),
+        ]
+        for requirement in fileRequirements {
+            let attributes: [FileAttributeKey: Any]
+            do {
+                attributes = try fileManager.attributesOfItem(atPath: requirement.url.path)
+            } catch {
                 throw ToolchainError.invalidToolchain(
-                    "Native msplat closure entry is not a regular file: \(projectRelativePath(url, root: root))."
+                    "Native msplat closure entry could not be inspected: \(requirement.label)."
                 )
             }
-        }
-        guard let metallibSize = try? metallib.resourceValues(forKeys: [.fileSizeKey]).fileSize,
-              metallibSize > 0 else {
-            throw ToolchainError.invalidToolchain("bin/default.metallib is empty.")
-        }
-        guard let licenseSize = try? license.resourceValues(forKeys: [.fileSizeKey]).fileSize,
-              licenseSize > 0 else {
-            throw ToolchainError.invalidToolchain("msplat/LICENSE is empty.")
+            guard attributes[.type] as? FileAttributeType == .typeRegular else {
+                throw ToolchainError.invalidToolchain(
+                    "Native msplat closure entry is not a regular file: \(requirement.label)."
+                )
+            }
+            if let references = attributes[.referenceCount] as? NSNumber,
+               references.intValue != 1 {
+                throw ToolchainError.invalidToolchain(
+                    "Native msplat closure entry is a multiply linked hard link: \(requirement.label)."
+                )
+            }
+            guard let size = attributes[.size] as? NSNumber,
+                  size.int64Value > 0,
+                  size.int64Value <= requirement.maximumBytes else {
+                throw ToolchainError.invalidToolchain(
+                    "Native msplat closure entry has an invalid size: \(requirement.label)."
+                )
+            }
         }
 
         return try validateMsplatBuildInfo(at: buildInfo, executable: executable, metallib: metallib)
@@ -631,6 +651,25 @@ extension ToolchainManager {
     func isSymbolicLink(_ url: URL) -> Bool {
         guard let attributes = try? fileManager.attributesOfItem(atPath: url.path) else { return false }
         return attributes[.type] as? FileAttributeType == .typeSymbolicLink
+    }
+
+    func firstSymbolicLinkComponent(from root: URL, through candidate: URL) -> URL? {
+        let root = root.standardizedFileURL
+        var current = candidate.standardizedFileURL
+        guard current.path == root.path || current.path.hasPrefix(root.path + "/") else {
+            return current
+        }
+        while true {
+            if isSymbolicLink(current) {
+                return current
+            }
+            if current.path == root.path {
+                return nil
+            }
+            let parent = current.deletingLastPathComponent()
+            guard parent.path != current.path else { return current }
+            current = parent
+        }
     }
 
     func projectRelativePath(_ url: URL, root: URL) -> String {
