@@ -280,6 +280,24 @@ PY
     echo "Compressed archive was not rejected before extraction and hashing" >&2
     exit 1
   }
+
+  unrelated_bomb_fixture="$TMP_DIR/native-msplat-unrelated-bomb"
+  cp -R "$packaged_fixture" "$unrelated_bomb_fixture"
+  mkdir -p "$unrelated_bomb_fixture/da3_mps/vendor"
+  dd if=/dev/zero of="$unrelated_bomb_fixture/da3_mps/vendor/bomb.bin" \
+    bs=1048576 count=32 2>/dev/null
+  unrelated_bomb_archive="$TMP_DIR/native-msplat-unrelated-bomb.zip"
+  (cd "$unrelated_bomb_fixture" && zip -qr "$unrelated_bomb_archive" .)
+  unrelated_bomb_error="$TMP_DIR/native-msplat-unrelated-bomb.stderr"
+  if "$msplat_validator" --archive "$unrelated_bomb_archive" \
+    >/dev/null 2>"$unrelated_bomb_error"; then
+    echo "Native msplat validator accepted a compressed bomb outside its own payload" >&2
+    exit 1
+  fi
+  grep -qi 'compression ratio' "$unrelated_bomb_error" || {
+    echo "Unrelated compressed bomb was not rejected during whole-archive preflight" >&2
+    exit 1
+  }
 fi
 
 if [ -e "$app_bundle/Contents/lib/Sparkle.framework" ]; then

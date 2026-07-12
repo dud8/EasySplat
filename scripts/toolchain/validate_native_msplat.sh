@@ -338,6 +338,8 @@ entry_size_limits = {
 maximum_archive_bytes = 2 * 1024 * 1024 * 1024
 maximum_entries = 100_000
 maximum_name_bytes = 16 * 1024 * 1024
+maximum_entry_bytes = 1024 * 1024 * 1024
+maximum_uncompressed_bytes = 8 * 1024 * 1024 * 1024
 maximum_compression_ratio = 100
 
 try:
@@ -361,6 +363,7 @@ with handle:
     names = [info.filename for info in infos]
     if len(names) != len(set(names)):
         raise SystemExit("native msplat validation failed: core archive contains duplicate entries")
+    total_uncompressed_bytes = 0
     for info in infos:
         name = info.filename
         path = PurePosixPath(name)
@@ -377,6 +380,35 @@ with handle:
         mode = info.external_attr >> 16
         if stat.S_ISLNK(mode):
             raise SystemExit(f"native msplat validation failed: archive symlink is forbidden: {name}")
+        if info.flag_bits & 0x1:
+            raise SystemExit(f"native msplat validation failed: encrypted archive entry is forbidden: {name}")
+        if name.endswith("/"):
+            if info.file_size != 0:
+                raise SystemExit(
+                    f"native msplat validation failed: archive directory has a payload: {name}"
+                )
+            continue
+        if mode and not stat.S_ISREG(mode):
+            raise SystemExit(
+                f"native msplat validation failed: archive entry is not a regular file: {name}"
+            )
+        entry_limit = entry_size_limits.get(name, maximum_entry_bytes)
+        if info.file_size > entry_limit:
+            raise SystemExit(
+                f"native msplat validation failed: archive entry exceeds the size limit: {name}"
+            )
+        if info.file_size > 0 and (
+            info.compress_size <= 0
+            or info.file_size > info.compress_size * maximum_compression_ratio
+        ):
+            raise SystemExit(
+                f"native msplat validation failed: archive entry exceeds the compression ratio limit: {name}"
+            )
+        total_uncompressed_bytes += info.file_size
+        if total_uncompressed_bytes > maximum_uncompressed_bytes:
+            raise SystemExit(
+                "native msplat validation failed: core archive exceeds the uncompressed size limit"
+            )
 
     files = {name.rstrip("/") for name in names if not name.endswith("/")}
     missing = sorted(required - files)
