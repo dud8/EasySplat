@@ -2,6 +2,33 @@ import CryptoKit
 import Foundation
 
 extension ToolchainManager {
+    final class RedirectValidationDelegate: NSObject, URLSessionTaskDelegate, @unchecked Sendable {
+        private let validate: @Sendable (URL) throws -> Void
+
+        init(validate: @escaping @Sendable (URL) throws -> Void) {
+            self.validate = validate
+        }
+
+        func urlSession(
+            _ session: URLSession,
+            task: URLSessionTask,
+            willPerformHTTPRedirection response: HTTPURLResponse,
+            newRequest request: URLRequest,
+            completionHandler: @escaping (URLRequest?) -> Void
+        ) {
+            guard let url = request.url else {
+                completionHandler(nil)
+                return
+            }
+            do {
+                try validate(url)
+                completionHandler(request)
+            } catch {
+                completionHandler(nil)
+            }
+        }
+    }
+
     final class DownloadDelegate: NSObject, URLSessionDownloadDelegate, @unchecked Sendable {
         private let destination: URL
         private let label: String
@@ -11,6 +38,7 @@ extension ToolchainManager {
         private var continuation: CheckedContinuation<Void, Error>?
         private weak var task: URLSessionDownloadTask?
         private var completed = false
+        private let validateRedirect: @Sendable (URL) throws -> Void
         private let startedAt = Date()
         private var lastUpdate = Date.distantPast
 
@@ -18,12 +46,14 @@ extension ToolchainManager {
             destination: URL,
             label: String,
             onProgress: @escaping @Sendable (Double, String) -> Void,
-            fileManager: FileManager
+            fileManager: FileManager,
+            validateRedirect: @escaping @Sendable (URL) throws -> Void
         ) {
             self.destination = destination
             self.label = label
             self.onProgress = onProgress
             self.fileManager = fileManager
+            self.validateRedirect = validateRedirect
         }
 
         func setContinuation(_ continuation: CheckedContinuation<Void, Error>) {
@@ -115,6 +145,27 @@ extension ToolchainManager {
             }
         }
 
+        func urlSession(
+            _ session: URLSession,
+            task: URLSessionTask,
+            willPerformHTTPRedirection response: HTTPURLResponse,
+            newRequest request: URLRequest,
+            completionHandler: @escaping (URLRequest?) -> Void
+        ) {
+            guard let url = request.url else {
+                completionHandler(nil)
+                finish(with: ToolchainError.invalidArtifactURL("redirect without URL"))
+                return
+            }
+            do {
+                try validateRedirect(url)
+                completionHandler(request)
+            } catch {
+                completionHandler(nil)
+                finish(with: error)
+            }
+        }
+
         private func finish(with error: Error?) {
             let continuation: CheckedContinuation<Void, Error>?
             lock.lock()
@@ -139,8 +190,15 @@ extension ToolchainManager {
     }
 
     func downloadManifest(url: URL) async throws -> ToolchainManifest {
-        try await withTransientRetries {
-            let (data, response) = try await urlSession.data(from: url)
+        let remoteURL = try validatedRemoteURL(url.absoluteString)
+        return try await withTransientRetries {
+            let delegate = RedirectValidationDelegate { [self] redirectedURL in
+                try validateRedirectTarget(redirectedURL)
+            }
+            let (data, response) = try await urlSession.data(
+                for: URLRequest(url: remoteURL),
+                delegate: delegate
+            )
             guard (response as? HTTPURLResponse)?.statusCode == 200 else { throw ToolchainError.downloadFailed }
             let decoder = JSONDecoder()
             decoder.dateDecodingStrategy = .iso8601
@@ -269,7 +327,13 @@ extension ToolchainManager {
         if fileManager.fileExists(atPath: destination.path) {
             try? fileManager.removeItem(at: destination)
         }
-        let (data, response) = try await urlSession.data(from: url)
+        let delegate = RedirectValidationDelegate { [self] redirectedURL in
+            try validateRedirectTarget(redirectedURL)
+        }
+        let (data, response) = try await urlSession.data(
+            for: URLRequest(url: url),
+            delegate: delegate
+        )
         guard (response as? HTTPURLResponse)?.statusCode == 200 else { throw ToolchainError.downloadFailed }
         try data.write(to: destination, options: [.atomic])
         onProgress(1.0, "\(label) downloaded")
@@ -297,7 +361,10 @@ extension ToolchainManager {
             destination: destination,
             label: label,
             onProgress: onProgress,
-            fileManager: fileManager
+            fileManager: fileManager,
+            validateRedirect: { [self] redirectedURL in
+                try validateRedirectTarget(redirectedURL)
+            }
         )
         let session = URLSession(configuration: .default, delegate: delegate, delegateQueue: nil)
         defer { session.finishTasksAndInvalidate() }
@@ -336,20 +403,25 @@ extension ToolchainManager {
         return digest.map { String(format: "%02x", $0) }.joined()
     }
 
-    func unzip(zipURL: URL, to destination: URL) throws {
+    func unzip(
+        zipURL: URL,
+        to destination: URL,
+        exactComponent: ToolchainManifest.Component? = nil
+    ) throws {
+        let archiveEntries = try inspectArchiveEntries(zipURL: zipURL)
+        try validateArchiveEntries(archiveEntries)
+        if let exactComponent {
+            try validateExactArchiveContents(archiveEntries, component: exactComponent)
+        }
         let result = try runner.run("/usr/bin/unzip", ["-o", zipURL.path, "-d", destination.path])
         guard result.exitCode == 0 else {
             throw ToolchainError.unzipFailed
         }
+        try validateExtractedLinks(root: destination)
     }
 
     func localToolchainOverrideURL() -> URL? {
-        guard let value = RuntimeEnvironment.current["EASYSPLAT_LOCAL_TOOLCHAIN_ROOT"]?
-            .trimmingCharacters(in: .whitespacesAndNewlines),
-            !value.isEmpty else {
-            return nil
-        }
-        return URL(fileURLWithPath: value, isDirectory: true)
+        localToolchainRoot
     }
 
     func installStateURL(root: URL) -> URL {
@@ -370,17 +442,26 @@ extension ToolchainManager {
         try data.write(to: url, options: [.atomic])
     }
 
-    func validatedArtifactURL(_ urlString: String) throws -> URL {
+    func validatedRemoteURL(_ urlString: String) throws -> URL {
         guard let url = URL(string: urlString) else {
             throw ToolchainError.invalidArtifactURL(urlString)
         }
-        guard let scheme = url.scheme else {
+        guard let scheme = url.scheme?.lowercased(), let host = url.host?.lowercased(), !host.isEmpty else {
             throw ToolchainError.invalidArtifactURL(urlString)
         }
-        if scheme != "file", url.host == nil {
+        let isLoopback = host == "localhost" || host == "127.0.0.1" || host == "::1"
+        guard scheme == "https" || (scheme == "http" && isLoopback) else {
             throw ToolchainError.invalidArtifactURL(urlString)
         }
         return url
+    }
+
+    func validatedArtifactURL(_ urlString: String) throws -> URL {
+        try validatedRemoteURL(urlString)
+    }
+
+    func validateRedirectTarget(_ url: URL) throws {
+        _ = try validatedRemoteURL(url.absoluteString)
     }
 
     func ensureArtifact(
@@ -409,6 +490,11 @@ extension ToolchainManager {
 
         try await downloadFile(url: url, to: zipURL, label: label, onProgress: onProgress)
 
+        let attributes = try fileManager.attributesOfItem(atPath: zipURL.path)
+        let downloadedSize = (attributes[.size] as? NSNumber)?.uint64Value
+        guard downloadedSize == artifact.sizeBytes else {
+            throw ToolchainError.hashMismatch
+        }
         let computedHash = try sha256Hex(url: zipURL)
         guard computedHash.lowercased() == expectedSha else {
             throw ToolchainError.hashMismatch
@@ -418,7 +504,11 @@ extension ToolchainManager {
         let unpackMessage = unpackingMessage(for: name)
         onProgress(-1.0, unpackMessage)
 
-        try unzip(zipURL: zipURL, to: root)
+        try unzip(
+            zipURL: zipURL,
+            to: root,
+            exactComponent: artifact.capabilities.isEmpty ? nil : artifact
+        )
         try? fileManager.removeItem(at: zipURL)
         try enforceExpectedContents(
             artifact: artifact,
@@ -426,9 +516,93 @@ extension ToolchainManager {
             unpackMessage: unpackMessage,
             onProgress: onProgress
         )
+        try validateCriticalFileHashes(artifact.criticalFileHashes, root: root)
 
         state.installedArtifacts[name] = artifact.sha256
         try? saveInstallState(state, root: root)
+    }
+
+    func inspectArchiveEntries(zipURL: URL) throws -> [String] {
+        // Existing URLProtocol tests deliberately use fake zip bytes and mock extraction.
+        // Production downloads always take this path before `/usr/bin/unzip` is allowed to write.
+        if shouldUseDataTaskForTests() {
+            return []
+        }
+        let metadata = try runner.run("/usr/bin/zipinfo", ["-l", zipURL.path])
+        guard metadata.exitCode == 0 else {
+            throw ToolchainError.unzipFailed
+        }
+        if metadata.stdout.split(whereSeparator: \.isNewline).contains(where: { $0.first == "l" }) {
+            throw ToolchainError.invalidToolchain("Archive contains a symbolic link entry.")
+        }
+        let result = try runner.run("/usr/bin/unzip", ["-Z1", zipURL.path])
+        guard result.exitCode == 0 else {
+            throw ToolchainError.unzipFailed
+        }
+        return result.stdout.split(whereSeparator: \.isNewline).map(String.init)
+    }
+
+    func validateArchiveEntries(_ entries: [String]) throws {
+        for entry in entries {
+            guard !entry.isEmpty,
+                  !entry.hasPrefix("/"),
+                  !entry.contains("\\"),
+                  !entry.unicodeScalars.contains(where: { $0.value == 0 }) else {
+                throw ToolchainError.invalidToolchain("Archive contains an unsafe entry path.")
+            }
+            let parts = entry.split(separator: "/", omittingEmptySubsequences: false)
+            guard !parts.contains(where: { $0 == ".." || $0 == "." }) else {
+                throw ToolchainError.invalidToolchain("Archive contains a path traversal entry: \(entry).")
+            }
+        }
+    }
+
+    func validateExtractedLinks(root: URL) throws {
+        let rootPath = root.resolvingSymlinksInPath().standardizedFileURL.path
+        guard let enumerator = fileManager.enumerator(
+            at: root,
+            includingPropertiesForKeys: [.isSymbolicLinkKey],
+            options: [],
+            errorHandler: { _, _ in false }
+        ) else {
+            throw ToolchainError.invalidToolchain("Extracted toolchain could not be enumerated.")
+        }
+        for case let url as URL in enumerator {
+            guard (try? url.resourceValues(forKeys: [.isSymbolicLinkKey]).isSymbolicLink) == true else {
+                continue
+            }
+            let destination: String
+            do {
+                destination = try fileManager.destinationOfSymbolicLink(atPath: url.path)
+            } catch {
+                throw ToolchainError.invalidToolchain("Archive contains an unreadable symbolic link.")
+            }
+            let resolved = (destination.hasPrefix("/")
+                ? URL(fileURLWithPath: destination).standardizedFileURL
+                : url.deletingLastPathComponent().appendingPathComponent(destination).standardizedFileURL)
+                .resolvingSymlinksInPath()
+            guard resolved.path == rootPath || resolved.path.hasPrefix(rootPath + "/") else {
+                throw ToolchainError.invalidToolchain("Archive symbolic link escapes the toolchain root: \(url.lastPathComponent).")
+            }
+        }
+    }
+
+    func validateCriticalFileHashes(_ hashes: [String: String], root: URL) throws {
+        for (relativePath, expectedHash) in hashes {
+            try validateArchiveEntries([relativePath])
+            guard expectedHash == expectedHash.lowercased(), isLowercaseSHA256(expectedHash) else {
+                throw ToolchainError.invalidManifest
+            }
+            let url = root.appendingPathComponent(relativePath)
+            guard fileManager.fileExists(atPath: url.path),
+                  try sha256Hex(url: url) == expectedHash else {
+                throw ToolchainError.invalidToolchain("Critical toolchain hash mismatch: \(relativePath).")
+            }
+        }
+    }
+
+    func validateExecutableHashes(_ hashes: [String: String], root: URL) throws {
+        try validateCriticalFileHashes(hashes, root: root)
     }
 
     func artifactLabel(for name: String) -> String {

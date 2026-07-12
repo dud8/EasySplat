@@ -1,7 +1,10 @@
 import Foundation
 
 extension ToolchainManager {
-    func validateToolchain(root: URL) throws -> ToolchainPaths {
+    func validateToolchain(
+        root: URL,
+        requiredCapabilities: Set<ToolchainCapability> = ToolchainCapabilityRequest.default.capabilities
+    ) throws -> ToolchainPaths {
         let colmap = root.appendingPathComponent("bin/colmap")
         ensureExecutable(at: colmap)
         guard fileManager.isExecutableFile(atPath: colmap.path) else { throw ToolchainError.missingBinary("colmap") }
@@ -63,26 +66,34 @@ extension ToolchainManager {
         guard fileManager.fileExists(atPath: da3AppSentinel.path) else {
             throw ToolchainError.missingLibrary("da3_mps/app/easysplat_da3_sfm/run.py")
         }
-        guard fileManager.fileExists(atPath: da3Models.path) else {
-            throw ToolchainError.missingLibrary("da3_mps/models")
+        let needsBase = requiredCapabilities.contains(.da3Base)
+        let needsSmall = requiredCapabilities.contains(.da3Small)
+        if needsBase || needsSmall {
+            guard fileManager.fileExists(atPath: da3Models.path) else {
+                throw ToolchainError.missingLibrary("da3_mps/models")
+            }
         }
-        guard fileManager.fileExists(atPath: da3BaseModelFile.path) else {
-            throw ToolchainError.missingLibrary("da3_mps/models/DA3-BASE/model.safetensors")
+        if needsBase {
+            guard fileManager.fileExists(atPath: da3BaseModelFile.path) else {
+                throw ToolchainError.missingLibrary("da3_mps/models/DA3-BASE/model.safetensors")
+            }
+            guard fileManager.fileExists(atPath: da3BaseConfigFile.path) else {
+                throw ToolchainError.missingLibrary("da3_mps/models/DA3-BASE/config.json")
+            }
+            guard fileManager.fileExists(atPath: da3BaseModelInfoFile.path) else {
+                throw ToolchainError.missingLibrary("da3_mps/models/DA3-BASE/easysplat_model_info.json")
+            }
         }
-        guard fileManager.fileExists(atPath: da3BaseConfigFile.path) else {
-            throw ToolchainError.missingLibrary("da3_mps/models/DA3-BASE/config.json")
-        }
-        guard fileManager.fileExists(atPath: da3BaseModelInfoFile.path) else {
-            throw ToolchainError.missingLibrary("da3_mps/models/DA3-BASE/easysplat_model_info.json")
-        }
-        guard fileManager.fileExists(atPath: da3SmallModelFile.path) else {
-            throw ToolchainError.missingLibrary("da3_mps/models/DA3-SMALL/model.safetensors")
-        }
-        guard fileManager.fileExists(atPath: da3SmallConfigFile.path) else {
-            throw ToolchainError.missingLibrary("da3_mps/models/DA3-SMALL/config.json")
-        }
-        guard fileManager.fileExists(atPath: da3SmallModelInfoFile.path) else {
-            throw ToolchainError.missingLibrary("da3_mps/models/DA3-SMALL/easysplat_model_info.json")
+        if needsSmall {
+            guard fileManager.fileExists(atPath: da3SmallModelFile.path) else {
+                throw ToolchainError.missingLibrary("da3_mps/models/DA3-SMALL/model.safetensors")
+            }
+            guard fileManager.fileExists(atPath: da3SmallConfigFile.path) else {
+                throw ToolchainError.missingLibrary("da3_mps/models/DA3-SMALL/config.json")
+            }
+            guard fileManager.fileExists(atPath: da3SmallModelInfoFile.path) else {
+                throw ToolchainError.missingLibrary("da3_mps/models/DA3-SMALL/easysplat_model_info.json")
+            }
         }
         guard fileManager.fileExists(atPath: da3VendorSentinel.path) else {
             throw ToolchainError.missingLibrary("da3_mps/vendor/depth-anything-3")
@@ -536,6 +547,12 @@ extension ToolchainManager {
     }
 
     func artifactLooksInstalled(name: String, root: URL) -> Bool {
+        if name == "geometry-da3-base" {
+            return da3ModelLooksInstalled(named: "DA3-BASE", root: root)
+        }
+        if name == "geometry-da3-small" {
+            return da3ModelLooksInstalled(named: "DA3-SMALL", root: root)
+        }
         if name.hasSuffix("-core") {
             return coreToolchainLooksInstalled(root: root)
         }
@@ -543,6 +560,13 @@ extension ToolchainManager {
             return modelsToolchainLooksInstalled(root: root)
         }
         return false
+    }
+
+    func da3ModelLooksInstalled(named modelName: String, root: URL) -> Bool {
+        let bundle = root.appendingPathComponent("da3_mps/models/\(modelName)", isDirectory: true)
+        return fileManager.fileExists(atPath: bundle.appendingPathComponent("model.safetensors").path)
+            && fileManager.fileExists(atPath: bundle.appendingPathComponent("config.json").path)
+            && fileManager.fileExists(atPath: bundle.appendingPathComponent("easysplat_model_info.json").path)
     }
 
     func coreToolchainLooksInstalled(root: URL) -> Bool {
