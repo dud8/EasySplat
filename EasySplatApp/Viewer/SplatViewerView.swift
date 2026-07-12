@@ -34,7 +34,7 @@ struct SplatViewerView: View {
                 controller: controller,
                 onLoadStateChanged: onLoadStateChanged
             )
-                .clipShape(RoundedRectangle(cornerRadius: Theme.Radius.canvas, style: .continuous))
+                .clipShape(RoundedRectangle(cornerRadius: Theme.Radius.standard, style: .continuous))
 
             HStack(spacing: toolbarSpacing) {
                 Button("Fit") { controller.fitToView() }
@@ -44,7 +44,7 @@ struct SplatViewerView: View {
             .buttonStyle(.bordered)
             .padding(toolbarPadding)
             .background(.ultraThinMaterial)
-            .clipShape(RoundedRectangle(cornerRadius: Theme.Radius.button, style: .continuous))
+            .clipShape(RoundedRectangle(cornerRadius: Theme.Radius.standard, style: .continuous))
             .popover(isPresented: $showHelp) {
                 VStack(alignment: .leading, spacing: 8) {
                     Text("Controls").font(.headline)
@@ -63,7 +63,7 @@ struct SplatViewerView: View {
                 ProgressView("Loading splat…")
                     .padding(10)
                     .background(.ultraThinMaterial)
-                    .clipShape(RoundedRectangle(cornerRadius: Theme.Radius.button, style: .continuous))
+                    .clipShape(RoundedRectangle(cornerRadius: Theme.Radius.standard, style: .continuous))
                     .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .center)
             }
 
@@ -75,7 +75,7 @@ struct SplatViewerView: View {
                     .padding(.vertical, 6)
                     .background(
                         .ultraThinMaterial,
-                        in: RoundedRectangle(cornerRadius: Theme.Radius.button, style: .continuous)
+                        in: RoundedRectangle(cornerRadius: Theme.Radius.standard, style: .continuous)
                     )
                     .padding(12)
                     .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topTrailing)
@@ -91,7 +91,7 @@ struct SplatViewerView: View {
                 }
                 .padding(12)
                 .background(.ultraThinMaterial)
-                .clipShape(RoundedRectangle(cornerRadius: Theme.Radius.button, style: .continuous))
+                .clipShape(RoundedRectangle(cornerRadius: Theme.Radius.standard, style: .continuous))
                 .padding(12)
                 .frame(maxWidth: .infinity, alignment: .topTrailing)
             }

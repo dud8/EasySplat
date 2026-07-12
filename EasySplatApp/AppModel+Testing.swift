@@ -10,8 +10,8 @@ extension AppModel {
         handleToolchainProgress(fraction: fraction, message: message)
     }
 
-    func test_validatedShareItems() -> [Any]? {
-        validatedShareItems()
+    func test_validatedShareItems() async throws -> [Any]? {
+        try await validatedShareItems()
     }
 
     func test_activateShareSession() {

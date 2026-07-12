@@ -37,6 +37,8 @@ enum ProcessingPhase: Int, Equatable {
 }
 
 struct ProcessingView: View {
+    let onBackToProjects: () -> Void
+
     @EnvironmentObject private var model: AppModel
     @State private var isTechnicalDetailsExpanded = false
     @State private var showStopConfirmation = false
@@ -67,8 +69,8 @@ struct ProcessingView: View {
         }
         .toolbar {
             ToolbarItem(placement: .primaryAction) {
-                if model.lastError == nil {
-                    Button("Stop…") {
+                if model.isRunActive {
+                    Button(Self.stopToolbarTitle(projectExists: model.currentProjectURL != nil)) {
                         showStopConfirmation = true
                     }
                     .disabled(model.isStopping)
@@ -77,11 +79,14 @@ struct ProcessingView: View {
             }
         }
         .confirmationDialog(
-            model.isTrainingStageActive ? "Stop training?" : "Stop this project?",
+            Self.stopDialogTitle(
+                projectExists: model.currentProjectURL != nil,
+                isTraining: model.isTrainingStageActive
+            ),
             isPresented: $showStopConfirmation,
             titleVisibility: .visible
         ) {
-            Button("Stop and Keep Project") {
+            Button(Self.stopActionTitle(projectExists: model.currentProjectURL != nil)) {
                 model.cancelCurrentProject(deleteProject: false)
             }
             .keyboardShortcut(.defaultAction)
@@ -93,14 +98,16 @@ struct ProcessingView: View {
 
     private var progressContent: some View {
         VStack(alignment: .leading, spacing: 12) {
-            if let progress = model.progress {
+            if let progress = Self.phaseProgress(stage: model.stage, progress: model.progress) {
                 let clampedProgress = min(max(progress, 0), 1)
                 ProgressView(value: clampedProgress)
-                    .accessibilityLabel("Progress")
+                    .accessibilityLabel("Phase progress")
                     .accessibilityValue("\(Int((clampedProgress * 100).rounded())) percent")
+                    .accessibilityIdentifier("processing.progress")
             } else {
                 ProgressView()
                     .accessibilityLabel("In progress")
+                    .accessibilityIdentifier("processing.progress")
             }
 
             TimelineView(.periodic(from: .now, by: 1)) { context in
@@ -108,6 +115,7 @@ struct ProcessingView: View {
                     Text(timingText)
                         .font(.caption)
                         .foregroundStyle(.secondary)
+                        .accessibilityIdentifier("processing.timing")
                 }
             }
 
@@ -125,31 +133,25 @@ struct ProcessingView: View {
                 Label("Couldn’t finish this splat", systemImage: "exclamationmark.triangle")
                     .font(.headline)
                     .foregroundStyle(.red)
-                Text("Open Technical Details for the exact error and logs.")
+                Text(Self.failureMessage(model.lastError))
                     .font(.subheadline)
                     .foregroundStyle(.secondary)
             }
             .accessibilityElement(children: .combine)
 
             HStack(spacing: 12) {
-                Button("Try Again") {
-                    if let projectURL = model.currentProjectURL {
-                        model.resumeProject(at: projectURL)
-                    } else {
-                        model.startFromPendingSelection()
-                    }
+                Button(Self.failureActionTitle(recovery: model.validationRecovery)) {
+                    model.retryAfterFailure()
                 }
                 .buttonStyle(.borderedProminent)
                 .keyboardShortcut(.defaultAction)
-                .disabled(!canTryAgain || model.isStopping)
+                .disabled(!canTryAgain || model.isStopping || model.isRunActive)
                 .accessibilityIdentifier("processing.tryAgain")
 
                 Button("Back to Projects") {
-                    model.reset()
-                    model.viewState = .home
-                    model.refreshProjectSummaries()
+                    onBackToProjects()
                 }
-                .disabled(model.isStopping)
+                .disabled(model.isStopping || model.isRunActive)
                 .accessibilityIdentifier("processing.backToProjects")
 
                 if let projectURL = model.currentProjectURL {
@@ -166,7 +168,7 @@ struct ProcessingView: View {
                     } label: {
                         Label("More", systemImage: "ellipsis.circle")
                     }
-                    .disabled(model.isStopping)
+                    .disabled(model.isStopping || model.isRunActive)
                     .accessibilityIdentifier("processing.failureMore")
                 }
             }
@@ -197,8 +199,7 @@ struct ProcessingView: View {
                 HStack {
                     Spacer()
                     Button("Copy Details") {
-                        NSPasteboard.general.clearContents()
-                        NSPasteboard.general.setString(technicalText, forType: .string)
+                        model.copyTechnicalDetails(technicalText)
                     }
                     .controlSize(.small)
                 }
@@ -222,6 +223,31 @@ struct ProcessingView: View {
         projectExists || pendingInputExists
     }
 
+    nonisolated static func failureActionTitle(recovery: RunValidationRecovery?) -> String {
+        switch recovery {
+        case .useUnordered: return "Use Unordered"
+        case .useFast: return "Use Fast"
+        case .useBalanced: return "Use Balanced"
+        case .useAutomaticPhotoSelection: return "Use Automatic Selection"
+        case nil: return "Try Again"
+        }
+    }
+
+    nonisolated static func failureMessage(_ message: String?) -> String {
+        let trimmed = message?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        return trimmed.isEmpty ? "No error details were reported." : trimmed
+    }
+
+    nonisolated static func phaseProgress(stage: PipelineStage?, progress: Double?) -> Double? {
+        guard let progress, let stage else { return nil }
+        switch stage {
+        case .trainSplat, .exportSplat, .done:
+            return progress
+        case .importInput, .extractFrames, .selectFrames, .sfmFeatures, .sfmMatching, .sfmMapping:
+            return nil
+        }
+    }
+
     private var technicalText: String {
         let text = model.errorDetailsText ?? model.processingDetailsText
         let trimmed = text?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
@@ -230,7 +256,7 @@ struct ProcessingView: View {
 
     private func timingText(now: Date) -> String? {
         Self.timingText(
-            elapsed: model.elapsedSinceStageStart(now: now),
+            elapsed: model.elapsedSincePhaseStart(now: now),
             silenceSeconds: model.lastPipelineEventAt.map { now.timeIntervalSince($0) }
         )
     }
@@ -260,6 +286,9 @@ struct ProcessingView: View {
     }
 
     private var stoppingStatusText: String {
+        if model.currentProjectURL == nil {
+            return "Stopping setup…"
+        }
         if model.stopAction == .deleteProject {
             return "Stopping and moving project to Trash…"
         }
@@ -270,7 +299,30 @@ struct ProcessingView: View {
     }
 
     private var stopDialogMessage: String {
-        if model.isTrainingStageActive {
+        Self.stopDialogMessage(
+            projectExists: model.currentProjectURL != nil,
+            isTraining: model.isTrainingStageActive
+        )
+    }
+
+    nonisolated static func stopToolbarTitle(projectExists: Bool) -> String {
+        projectExists ? "Stop…" : "Stop Setup…"
+    }
+
+    nonisolated static func stopDialogTitle(projectExists: Bool, isTraining: Bool) -> String {
+        guard projectExists else { return "Stop setup?" }
+        return isTraining ? "Stop training?" : "Stop this project?"
+    }
+
+    nonisolated static func stopActionTitle(projectExists: Bool) -> String {
+        projectExists ? "Stop and Keep Project" : "Stop Setup"
+    }
+
+    nonisolated static func stopDialogMessage(projectExists: Bool, isTraining: Bool) -> String {
+        guard projectExists else {
+            return "EasySplat will stop preparing tools. No project has been created."
+        }
+        if isTraining {
             return "EasySplat will stop at a safe point. It will resume from a validated optimizer checkpoint when one is available; otherwise training restarts from the reconstructed scene."
         }
         return "EasySplat will stop at a safe point and keep the last completed stage. You can resume this project later."

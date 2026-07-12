@@ -89,6 +89,7 @@ struct HomeView: View {
                 }
             }
             .frame(maxWidth: 720, alignment: .leading)
+            .focusSection()
             .padding(Theme.Spacing.extraLarge)
             .frame(maxWidth: .infinity, alignment: .top)
         }
@@ -134,7 +135,7 @@ struct HomeView: View {
 
             if let folder = model.pendingPhotosFolderURL {
                 inputRow(name: folder.lastPathComponent, systemImage: "folder") {
-                    model.pendingPhotosFolderURL = nil
+                    model.removePhotoFolder()
                 }
             }
 
@@ -179,9 +180,19 @@ struct HomeView: View {
             optionRow("Detail") {
                 Picker("Detail", selection: $model.requestedRunOptions.detailProfile) {
                     Text("Fast").tag(DetailProfile.fast)
-                    Text("Balanced").tag(DetailProfile.balanced)
-                    Text("High Detail").tag(DetailProfile.highDetail)
+                    Text("Balanced")
+                        .tag(DetailProfile.balanced)
+                        .disabled(!RunPlanResolver.supports(detail: .balanced, memoryGB: memoryGB))
+                    Text("High Detail")
+                        .tag(DetailProfile.highDetail)
+                        .disabled(!RunPlanResolver.supports(detail: .highDetail, memoryGB: memoryGB))
                 }
+            }
+            if let explanation = Self.detailAvailabilityHelp(memoryGB: memoryGB) {
+                Text(explanation)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .frame(maxWidth: .infinity, alignment: .trailing)
             }
 
             optionRow("Camera Source") {
@@ -203,7 +214,10 @@ struct HomeView: View {
             optionRow("Input Order") {
                 Picker("Input Order", selection: $model.requestedRunOptions.inputOrdering) {
                     Text("Automatic").tag(InputOrdering.automatic)
-                    Text("Continuous sequence").tag(InputOrdering.continuous)
+                    Text("Continuous sequence")
+                        .tag(InputOrdering.continuous)
+                        .disabled(!continuousOrderingIsAvailable)
+                        .help(continuousOrderingHelp)
                     Text("Unordered").tag(InputOrdering.unordered)
                 }
             }
@@ -212,7 +226,13 @@ struct HomeView: View {
                 Picker("Resource Use", selection: $model.requestedRunOptions.resourcePolicy) {
                     Text("Automatic").tag(ResourcePolicy.automatic)
                     Text("Conserve Memory").tag(ResourcePolicy.conserveMemory)
-                    Text("Maximum Performance").tag(ResourcePolicy.maximumPerformance)
+                    Text("Maximum Performance")
+                        .tag(ResourcePolicy.maximumPerformance)
+                        .disabled(!Self.maximumPerformanceIsAvailable(memoryGB: memoryGB))
+                        .help(
+                            Self.resourceUseHelp(memoryGB: memoryGB)
+                                ?? "Use more of this Mac for the fastest run."
+                        )
                 }
             }
 
@@ -226,6 +246,40 @@ struct HomeView: View {
             }
         }
         .font(.body)
+    }
+
+    private var memoryGB: Double {
+        model.hardwareProfile.memoryGB
+    }
+
+    private var continuousOrderingIsAvailable: Bool {
+        guard let input = model.buildInputSpec() else { return true }
+        return RunPlanResolver.supports(inputOrdering: .continuous, input: input)
+    }
+
+    private var continuousOrderingHelp: String {
+        continuousOrderingIsAvailable
+            ? "Treat the input as one ordered capture."
+            : "Continuous sequence requires one video or an ordered photo folder."
+    }
+
+    nonisolated static func maximumPerformanceIsAvailable(memoryGB: Double) -> Bool {
+        RunPlanResolver.supports(resourcePolicy: .maximumPerformance, memoryGB: memoryGB)
+    }
+
+    nonisolated static func resourceUseHelp(memoryGB: Double) -> String? {
+        guard !maximumPerformanceIsAvailable(memoryGB: memoryGB) else { return nil }
+        return "Maximum Performance is unavailable on Macs with 16 GB of unified memory or less."
+    }
+
+    nonisolated static func detailAvailabilityHelp(memoryGB: Double) -> String? {
+        if memoryGB <= 8.5 {
+            return "Balanced and High Detail need more than 8 GB of unified memory."
+        }
+        if memoryGB <= 16.5 {
+            return "High Detail needs at least 24 GB of unified memory."
+        }
+        return nil
     }
 
     private func optionRow<Content: View>(

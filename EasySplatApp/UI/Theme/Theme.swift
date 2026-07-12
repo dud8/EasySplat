@@ -5,13 +5,8 @@ enum Theme {
     static let surface = Color(nsColor: .controlBackgroundColor)
     static let border = Color(nsColor: .separatorColor)
     static let accent = Color.blue
-    static let success = Color.green
-    static let subtle = Color.secondary
 
     enum Motion {
-        static let hover = Animation.easeOut(duration: 0.12)
-        static let press = Animation.easeOut(duration: 0.08)
-        static let reveal = Animation.easeInOut(duration: 0.16)
         static let workspace = Animation.easeInOut(duration: 0.16)
     }
 
@@ -23,9 +18,6 @@ enum Theme {
     }
 
     enum Radius {
-        static let button: CGFloat = 12
-        static let card: CGFloat = 12
-        static let input: CGFloat = 12
-        static let canvas: CGFloat = 12
+        static let standard: CGFloat = 12
     }
 }

@@ -1,7 +1,7 @@
 import Foundation
 
 enum AppConfig {
-    private static let defaultProjectHomeURLString = "https://github.com/EasySplat/EasySplat"
+    private static let defaultProjectHomeURLString = "https://github.com/dud8/EasySplat"
 
     static var projectHomeURL: URL {
         if let url = urlFromEnv("EASYSPLAT_PROJECT_HOME_URL") {
@@ -36,6 +36,49 @@ enum AppConfig {
             return ""
         }
         return text.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    static var allowInsecureLoopbackToolchainHTTP: Bool {
+#if DEBUG
+        guard toolchainManifestURL.scheme?.lowercased() == "http" else { return false }
+        let host = toolchainManifestURL.host?.lowercased()
+        return host == "localhost" || host == "127.0.0.1" || host == "::1"
+#else
+        return false
+#endif
+    }
+
+    static var uiVerificationProcessingProjectURL: URL? {
+        uiVerificationProcessingProjectURL(
+            environment: ProcessInfo.processInfo.environment,
+            arguments: ProcessInfo.processInfo.arguments
+        )
+    }
+
+    static func uiVerificationProcessingProjectURL(
+        environment: [String: String],
+        arguments: [String]
+    ) -> URL? {
+        guard environment["EASYSPLAT_ISOLATED_UI_RUNNER"] == "1",
+              arguments.contains("--easysplat-ui-verifier-processing-fixture"),
+              let homePath = environment["HOME"],
+              (homePath as NSString).isAbsolutePath,
+              let projectPath = environment["EASYSPLAT_UI_VERIFIER_PROCESSING_PROJECT"],
+              (projectPath as NSString).isAbsolutePath else {
+            return nil
+        }
+
+        let projectRoot = URL(fileURLWithPath: homePath, isDirectory: true)
+            .appendingPathComponent("Documents", isDirectory: true)
+            .appendingPathComponent("EasySplat Projects", isDirectory: true)
+            .standardizedFileURL
+        let projectURL = URL(fileURLWithPath: projectPath, isDirectory: true)
+            .standardizedFileURL
+        guard projectURL.pathExtension == "easysplatproj",
+              projectURL.deletingLastPathComponent() == projectRoot else {
+            return nil
+        }
+        return projectURL
     }
 
     private static func urlFromEnv(_ name: String) -> URL? {

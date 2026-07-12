@@ -1,6 +1,9 @@
 import SwiftUI
 
 struct WorkspaceView: View {
+    let onNewSplat: () -> Void
+    let onBackToProjects: () -> Void
+
     @EnvironmentObject private var model: AppModel
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
@@ -11,10 +14,10 @@ struct WorkspaceView: View {
                 HomeView()
                     .transition(.opacity)
             case .processing:
-                ProcessingView()
+                ProcessingView(onBackToProjects: onBackToProjects)
                     .transition(.opacity)
             case .viewer:
-                ViewerView()
+                ViewerView(onNewSplat: onNewSplat)
                     .transition(.opacity)
             }
         }

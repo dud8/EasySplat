@@ -3,16 +3,44 @@ import EasySplatCore
 import Foundation
 
 extension AppModel {
-    func shareCurrentSplat() {
+    func shareCurrentSplat() async {
         guard activeShareSession == nil else {
             shareStatusMessage = "Share is already open."
             shareStatusIsError = false
             return
         }
-        guard let items = validatedShareItems() else { return }
+        guard !isShareSheetActive, let projectURL = currentProjectURL else { return }
+
+        let validationToken = UUID()
+        shareValidationToken = validationToken
+        isShareSheetActive = true
+        shareStatusMessage = "Checking splat…"
+        shareStatusIsError = false
+        let items: [Any]?
+        do {
+            items = try await validatedShareItems(for: projectURL)
+        } catch is CancellationError {
+            clearShareValidation(validationToken)
+            return
+        } catch {
+            clearShareValidation(validationToken)
+            shareStatusMessage = "Couldn’t check the splat. Try again."
+            shareStatusIsError = true
+            return
+        }
+        guard shareValidationToken == validationToken else { return }
+        guard let items else {
+            clearShareValidation(validationToken, preserveStatus: true)
+            return
+        }
+        guard ProjectSummary.hasSameLocation(currentProjectURL, projectURL) else {
+            clearShareValidation(validationToken)
+            return
+        }
 
         let shareWindow = NSApplication.shared.keyWindow ?? NSApplication.shared.mainWindow
         guard let contentView = shareWindow?.contentView else {
+            clearShareValidation(validationToken, preserveStatus: true)
             shareStatusMessage = "Couldn’t open share options right now. Try again."
             shareStatusIsError = true
             return
@@ -20,15 +48,15 @@ extension AppModel {
 
         let picker = NSSharingServicePicker(items: items)
         let session = ShareSession(model: self)
+        shareValidationToken = nil
         activeShareSession = session
-        isShareSheetActive = true
         shareStatusMessage = nil
         shareStatusIsError = false
         session.present(picker: picker, in: contentView)
     }
 
-    func validatedShareItems() -> [Any]? {
-        guard let projectURL = currentProjectURL else {
+    func validatedShareItems(for projectURL: URL? = nil) async throws -> [Any]? {
+        guard let projectURL = projectURL ?? currentProjectURL else {
             shareStatusMessage = "Finish a project before sharing."
             shareStatusIsError = true
             return nil
@@ -38,7 +66,7 @@ extension AppModel {
             shareStatusIsError = true
             return nil
         }
-        guard let validatedURL = readyOutputURL(projectURL: projectURL) else {
+        guard let validatedURL = try await validatedFinishedOutputURL(projectURL: projectURL) else {
             let outputState = outputFileState(at: expectedURL)
             if outputState.exists {
                 shareStatusMessage = "Could not open \(expectedURL.lastPathComponent). Rebuild or reopen the project."
@@ -79,6 +107,16 @@ extension AppModel {
         guard activeShareSession === session else { return }
         activeShareSession = nil
         isShareSheetActive = false
+    }
+
+    private func clearShareValidation(_ token: UUID, preserveStatus: Bool = false) {
+        guard shareValidationToken == token else { return }
+        shareValidationToken = nil
+        isShareSheetActive = false
+        if !preserveStatus {
+            shareStatusMessage = nil
+            shareStatusIsError = false
+        }
     }
 }
 

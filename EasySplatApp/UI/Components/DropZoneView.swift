@@ -9,6 +9,7 @@ struct DropZoneView: View {
     let onDropURLs: ([URL]) -> Void
 
     @State private var isTargeted = false
+    @FocusState private var isKeyboardFocused: Bool
 
     nonisolated static let releaseInProgressTitle = "Release to add"
     nonisolated static let releaseInProgressSubtitle = "Video or photos folder"
@@ -35,16 +36,30 @@ struct DropZoneView: View {
             .frame(maxWidth: .infinity, maxHeight: .infinity)
             .padding(Theme.Spacing.large)
             .background(
-                RoundedRectangle(cornerRadius: Theme.Radius.input, style: .continuous)
+                RoundedRectangle(cornerRadius: Theme.Radius.standard, style: .continuous)
                     .fill(Theme.surface)
             )
             .overlay(
-                RoundedRectangle(cornerRadius: Theme.Radius.input, style: .continuous)
+                RoundedRectangle(cornerRadius: Theme.Radius.standard, style: .continuous)
                     .strokeBorder(isTargeted ? Theme.accent : Theme.border, lineWidth: isTargeted ? 2 : 1)
             )
-            .contentShape(RoundedRectangle(cornerRadius: Theme.Radius.input, style: .continuous))
+            .contentShape(RoundedRectangle(cornerRadius: Theme.Radius.standard, style: .continuous))
         }
         .buttonStyle(.plain)
+        .focusable()
+        .focused($isKeyboardFocused)
+        .defaultFocus($isKeyboardFocused, true)
+        .onAppear {
+            Task { @MainActor in
+                await Task.yield()
+                isKeyboardFocused = true
+            }
+        }
+        .onKeyPress(.return) {
+            guard isKeyboardFocused else { return .ignored }
+            onChoose()
+            return .handled
+        }
         .accessibilityLabel(title)
         .accessibilityHint(subtitle)
         .onDrop(of: [.fileURL], isTargeted: $isTargeted) { providers in

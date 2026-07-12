@@ -26,20 +26,14 @@ final class RunDurationPredictorTests: XCTestCase {
             createdAt: Date(timeIntervalSince1970: 0),
             status: status,
             isActive: false,
-            isRetrying: false,
             isInterrupted: false,
             checkpointUpdatedAt: nil,
-            lastError: nil,
-            outputPlyURL: nil,
-            outputPlySizeBytes: nil,
-            reconstruction: nil,
             stageTimings: timings,
-            preset: PresetSpec(mode: .object, quality: .standard),
             input: input,
             requestedRunOptions: requestedOptions,
             lastOpenedAt: nil,
-            lastFailureAt: nil,
-            recentErrorCount: nil
+            lastRunStartedAt: nil,
+            lastFailureAt: nil
         )
     }
 

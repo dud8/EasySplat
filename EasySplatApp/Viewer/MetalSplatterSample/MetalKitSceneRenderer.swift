@@ -30,7 +30,7 @@ class MetalKitSceneRenderer: NSObject, MTKViewDelegate {
     private var yaw: Float = 0
     private var pitch: Float = 0
     private var distance: Float = Constants.defaultDistance
-    private var pan: SIMD2<Float> = .zero
+    private(set) var pan: SIMD2<Float> = .zero
     private var center: SIMD3<Float> = .zero
     private let defaultYaw: Float = 0
     private let defaultPitch: Float = 0
@@ -67,6 +67,11 @@ class MetalKitSceneRenderer: NSObject, MTKViewDelegate {
             switch model {
             case .gaussianSplat(let url):
                 let splat = try await loadSplatRenderer(from: url)
+                splat.onSortComplete = { [weak self] _ in
+                    Task { @MainActor [weak self] in
+                        self?.requestDraw()
+                    }
+                }
                 modelRenderer = splat
                 requestDraw()
             case .none:
@@ -197,6 +202,7 @@ class MetalKitSceneRenderer: NSObject, MTKViewDelegate {
 
     func applyBounds(center: SIMD3<Float>, radius: Float) {
         self.center = center
+        pan = .zero
         let fov = Float(Constants.fovy.radians)
         let paddedRadius = max(radius, 0.01) * 1.2
         let targetDistance = paddedRadius / tanf(fov * 0.5)

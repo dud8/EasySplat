@@ -2,23 +2,35 @@ import Foundation
 import SwiftUI
 import EasySplatCore
 
+enum RunValidationRecovery: Equatable {
+    case useUnordered
+    case useFast
+    case useBalanced
+    case useAutomaticPhotoSelection
+
+    func apply(to options: inout RequestedRunOptions) {
+        switch self {
+        case .useUnordered:
+            options.inputOrdering = .unordered
+        case .useFast:
+            options.detailProfile = .fast
+            options.resourcePolicy = .conserveMemory
+        case .useBalanced:
+            options.detailProfile = .balanced
+        case .useAutomaticPhotoSelection:
+            options.photoSelection = .automatic
+        }
+    }
+}
+
 @MainActor
 final class AppModel: ObservableObject {
-    enum ViewState {
+    typealias FinishedOutputValidator = @Sendable (URL) -> URL?
+
+    enum ViewState: Equatable {
         case home
         case processing
         case viewer
-    }
-
-    enum AppModelError: LocalizedError {
-        case noDocumentsDirectory
-
-        var errorDescription: String? {
-            switch self {
-            case .noDocumentsDirectory:
-                return "Unable to locate the Documents folder."
-            }
-        }
     }
 
     @Published var viewState: ViewState = .home
@@ -27,21 +39,25 @@ final class AppModel: ObservableObject {
     @Published var statusTitle: String = "Ready to start"
     @Published var statusDetail: String? = nil
     @Published var stageStartedAt: Date? = nil
+    @Published var phaseStartedAt: Date? = nil
     @Published var lastPipelineEventAt: Date? = nil
     @Published var logLines: [String] = []
     @Published var errorLogLines: [String] = []
     @Published var lastError: String? = nil
     @Published var errorDetails: String? = nil
+    @Published var validationRecovery: RunValidationRecovery? = nil
     @Published var outputPlyURL: URL? = nil
     @Published var currentReconstruction: ReconstructionSummary? = nil
     @Published var currentStageTimings: [StageTimingRecord] = []
     @Published var currentOutputPlyInfo: OutputPlyInfo? = nil
-    @Published var currentAutoTune: AutoTuneSnapshot? = nil
-    @Published var currentPreset: PresetSpec? = nil
+    @Published var currentRunOptions: RequestedRunOptions? = nil
     @Published var currentInput: InputSpec? = nil
     @Published var currentProjectNotes: String = ""
+    @Published var notesSaveState: NotesSaveState = .idle
     @Published var currentProjectURL: URL? = nil
     @Published var stopAction: StopAction? = nil
+    @Published var isRunActive = false
+    @Published var actionFailure: ActionFailurePresentation?
 
     @Published var cachedFreeDiskBytes: Int64? = nil
     @Published var requestedRunOptions = RequestedRunOptions()
@@ -49,15 +65,17 @@ final class AppModel: ObservableObject {
     @Published var pendingPhotosFolderURL: URL? = nil
     @Published var projectSummaries: [ProjectSummary] = []
     @Published var selectionWarning: String? = nil
-    @Published var recoveryPromptProject: ProjectSummary? = nil
     @Published var shareStatusMessage: String? = nil
     @Published var shareStatusIsError: Bool = false
     @Published var isShareSheetActive: Bool = false
 
     let toolchainManager: ToolchainManaging
+    let hardwareProfile: HardwareProfile
     let pipelineRunnerFactory: (URL, PipelineRunner.PipelineConfig) -> PipelineRunning
     let powerAssertion: PowerAssertionManaging
+    let finishedOutputValidator: FinishedOutputValidator
     let projectBaseURL: URL?
+    let projectTrashHandler: (URL) throws -> Void
     var currentTask: Task<Void, Never>?
     var currentTaskToken: UUID?
     var lastProgressLogAt: Date = .distantPast
@@ -75,11 +93,7 @@ final class AppModel: ObservableObject {
     let trainingProgressLogMinInterval: TimeInterval = 3.0
     var notesSaveTask: Task<Void, Never>?
     var pendingNotesSave: (url: URL, text: String)?
-    /// In-memory cache for recent pipeline error counts. Keyed by log URL,
-    /// invalidated when the log's mtime OR size changes between refreshes
-    /// (mtime alone has only second-level precision on some filesystems,
-    /// so two writes inside the same second would falsely cache-hit).
-    var pipelineErrorCountCache: [URL: (mtime: Date, size: Int64, count: Int)] = [:]
+    var photoFolderCountTask: Task<Void, Never>?
     var exitIntent: ExitIntent = .none
     weak var pendingCloseWindow: NSWindow?
     var allowNextWindowClose = false
@@ -88,23 +102,8 @@ final class AppModel: ObservableObject {
     }
     var forcedExitTask: Task<Void, Never>?
     var activeShareSession: ShareSession?
-    var ignoredRecoveryProjectIDs: Set<UUID> = []
+    var shareValidationToken: UUID?
     static let forcedExitTimeoutNanoseconds: UInt64 = 25_000_000_000
-
-    /// Project metadata v1 requires a two-value preset. Runtime policy must use
-    /// `RequestedRunOptions` and `ResolvedRunPlan`, never this lossy projection.
-    static func compatibilityPreset(for options: RequestedRunOptions) -> PresetSpec {
-        let mode: CaptureMode = switch options.capturePath {
-        case .automatic, .orbit: .object
-        case .walkthrough, .largeArea: .room
-        }
-        let quality: QualityPreset = switch options.detailProfile {
-        case .fast: .draft
-        case .balanced: .standard
-        case .highDetail: .ultra
-        }
-        return PresetSpec(mode: mode, quality: quality)
-    }
 
     enum StopAction {
         case keepProject
@@ -114,6 +113,25 @@ final class AppModel: ObservableObject {
     struct StopFailurePresentation: Equatable {
         let title: String
         let detail: String
+    }
+
+    struct ActionFailurePresentation: Equatable {
+        let title: String
+        let message: String
+    }
+
+    enum NotesSaveState: Equatable {
+        case idle
+        case saving
+        case saved
+        case failed(String)
+    }
+
+    struct ExitConfirmationPresentation: Equatable {
+        let title: String
+        let message: String
+        let primaryActionTitle: String
+        let destructiveActionTitle: String?
     }
 
     enum ExitIntent {
@@ -137,10 +155,16 @@ final class AppModel: ObservableObject {
     }
 
     func stopFailurePresentation(for action: StopAction) -> StopFailurePresentation {
+        if currentProjectURL == nil {
+            return StopFailurePresentation(
+                title: "Couldn’t stop setup",
+                detail: "EasySplat could not stop safely. Review the details and try again."
+            )
+        }
         if action == .deleteProject {
             return StopFailurePresentation(
-                title: "Couldn’t delete the project",
-                detail: "The project was not deleted because EasySplat could not stop safely. Review the details and try again."
+                title: "Couldn’t move project to Trash",
+                detail: "The project stayed in place because EasySplat could not stop safely. Review the details and try again."
             )
         }
         if isTrainingStageActive {
@@ -200,17 +224,55 @@ final class AppModel: ObservableObject {
     }
 
     init(
-        toolchainManager: ToolchainManaging = ToolchainManager(),
+        toolchainManager: ToolchainManaging = ToolchainManager(
+            appVersion: EasySplatReleaseIdentity.version(),
+            allowInsecureLoopbackHTTP: AppConfig.allowInsecureLoopbackToolchainHTTP
+        ),
         projectBaseURL: URL? = nil,
+        hardwareProfile: HardwareProfile? = nil,
         pipelineRunnerFactory: @escaping (URL, PipelineRunner.PipelineConfig) -> PipelineRunning = { projectURL, config in
             PipelineRunner(projectURL: projectURL, config: config)
         },
-        powerAssertion: PowerAssertionManaging = SystemPowerAssertion()
+        powerAssertion: PowerAssertionManaging = SystemPowerAssertion(),
+        projectTrashHandler: @escaping (URL) throws -> Void = { url in
+            var resultingURL: NSURL?
+            try FileManager.default.trashItem(at: url, resultingItemURL: &resultingURL)
+        },
+        finishedOutputValidator: @escaping FinishedOutputValidator = { projectURL in
+            AppModel.readyOutputURLOnDisk(
+                projectURL: projectURL,
+                validationDepth: .full
+            )
+        }
     ) {
         self.toolchainManager = toolchainManager
         self.projectBaseURL = projectBaseURL
+        self.hardwareProfile = hardwareProfile ?? .detect()
+        self.finishedOutputValidator = finishedOutputValidator
+        self.projectTrashHandler = projectTrashHandler
         self.pipelineRunnerFactory = pipelineRunnerFactory
         self.powerAssertion = powerAssertion
+        if self.hardwareProfile.memoryGB <= 8.5 {
+            requestedRunOptions.detailProfile = .fast
+            requestedRunOptions.resourcePolicy = .conserveMemory
+        }
         refreshProjectSummaries()
+    }
+
+    func applyUIVerificationProcessingFixture(
+        projectURL: URL,
+        now: Date = Date()
+    ) {
+        reset()
+        currentProjectURL = projectURL.standardizedFileURL
+        viewState = .processing
+        stage = .sfmMapping
+        progress = nil
+        statusTitle = "Refining camera poses"
+        statusDetail = "Fusing selected camera estimates.\nRefinement pass 2 of 3."
+        stageStartedAt = now.addingTimeInterval(-95)
+        phaseStartedAt = now.addingTimeInterval(-12 * 60)
+        lastPipelineEventAt = now.addingTimeInterval(-8)
+        isRunActive = true
     }
 }

@@ -3,68 +3,90 @@ import Foundation
 
 extension AppModel {
     func startFromPendingSelection() {
+        guard !isRunActive else { return }
         guard let inputSpec = buildInputSpec() else { return }
+        photoFolderCountTask?.cancel()
+        photoFolderCountTask = nil
         let title = projectTitle(for: inputSpec)
-        currentTask?.cancel()
         let token = UUID()
         currentTaskToken = token
+        isRunActive = true
         currentTask = Task { await startProject(input: inputSpec, title: title, taskToken: token) }
     }
 
-    func resumeProject(at url: URL) {
-        clearRecoveryPromptSuppression(for: url)
-        currentTask?.cancel()
+    @discardableResult
+    func resumeProject(at url: URL) -> Bool {
+        guard !isRunActive else { return false }
+        guard flushPendingNotesSave() else { return false }
         let token = UUID()
         currentTaskToken = token
+        isRunActive = true
         currentTask = Task { await resumeProjectTask(at: url, taskToken: token) }
+        return true
     }
 
-    func resumeInterruptedProject(_ project: ProjectSummary) {
-        recoveryPromptProject = nil
-        clearRecoveryPromptSuppression(for: project.url)
-        currentTask?.cancel()
-        let token = UUID()
-        currentTaskToken = token
-        currentTask = Task { await resumeProjectTask(at: project.url, taskToken: token) }
-    }
-
-    func keepInterruptedProjectForLater(_ project: ProjectSummary) {
-        suppressRecoveryPrompt(for: project.url)
-        if recoveryPromptProject?.id == project.id {
-            recoveryPromptProject = nil
+    static func validationRecovery(for error: RunPlanResolver.ValidationError) -> RunValidationRecovery? {
+        switch error {
+        case .continuousMultipleClipsUnsupported:
+            return .useUnordered
+        case .fastDetailRequired:
+            return .useFast
+        case .highDetailRequiresMoreMemory:
+            return .useBalanced
+        case .noValidPhotos:
+            return nil
+        case .photoSelectionExceedsSafeLimit:
+            return .useAutomaticPhotoSelection
         }
     }
 
-    func deleteInterruptedProject(_ project: ProjectSummary) {
-        if currentProjectURL == project.url {
-            markInterruptedProjectDeleted(project)
-            cancelCurrentProject(deleteProject: true)
-            return
-        }
-        do {
-            try FileManager.default.removeItem(at: project.url)
-            markInterruptedProjectDeleted(project)
-        } catch {
-            if isMissingFileError(error) {
-                markInterruptedProjectDeleted(project)
-            } else {
-                recoveryPromptProject = project
+    @discardableResult
+    func applyValidationRecovery(
+        _ recovery: RunValidationRecovery,
+        projectURL: URL?
+    ) -> Bool {
+        if let projectURL {
+            let updated = mutateProjectMetadata(at: projectURL) { metadata in
+                var options = metadata.requestedRunOptions
+                recovery.apply(to: &options)
+                if !RunPlanResolver.supports(
+                    resourcePolicy: options.resourcePolicy,
+                    memoryGB: hardwareProfile.memoryGB
+                ) {
+                    options.resourcePolicy = .automatic
+                }
+                metadata.requestedRunOptions = options
             }
+            guard updated != nil else {
+                statusTitle = "Couldn’t update project options"
+                statusDetail = "The project was not changed. Check folder permissions and try again."
+                lastError = statusTitle
+                return false
+            }
+            return true
         }
-        refreshProjectSummaries()
+
+        recovery.apply(to: &requestedRunOptions)
+        if !RunPlanResolver.supports(
+            resourcePolicy: requestedRunOptions.resourcePolicy,
+            memoryGB: hardwareProfile.memoryGB
+        ) {
+            requestedRunOptions.resourcePolicy = .automatic
+        }
+        return true
     }
 
-    private func markInterruptedProjectDeleted(_ project: ProjectSummary) {
-        ignoredRecoveryProjectIDs.insert(project.id)
-        if recoveryPromptProject?.id == project.id {
-            recoveryPromptProject = nil
+    func retryAfterFailure() {
+        let projectURL = currentProjectURL
+        if let recovery = validationRecovery {
+            guard applyValidationRecovery(recovery, projectURL: projectURL) else { return }
+            validationRecovery = nil
         }
-    }
-
-    private func isMissingFileError(_ error: Error) -> Bool {
-        let nsError = error as NSError
-        return nsError.domain == NSCocoaErrorDomain
-            && nsError.code == CocoaError.Code.fileNoSuchFile.rawValue
+        if let projectURL {
+            resumeProject(at: projectURL)
+        } else {
+            startFromPendingSelection()
+        }
     }
 
     func refreshProjectSummaries() {
@@ -90,9 +112,8 @@ extension AppModel {
             let metadata: ProjectMetadata
             do {
                 metadata = try ProjectMetadataStore.load(from: metadataURL)
-            } catch ProjectMetadataStore.LoadError.unsupportedFormatVersion {
-                // Surface future-version projects in the listing with a clear hint instead
-                // of silently dropping them — otherwise the user sees their project disappear.
+            } catch ProjectMetadataStore.LoadError.requiresNewerApp {
+                // Keep projects from newer app versions visible with an explicit update state.
                 summaries.append(makeNeedsAppUpdateSummary(at: url, metadataURL: metadataURL))
                 continue
             } catch {
@@ -101,15 +122,14 @@ extension AppModel {
             // Project list refresh runs on the main actor; avoid scanning large ASCII PLY bodies here.
             let outputURL = readyOutputURL(projectURL: url, metadata: metadata, validationDepth: .quick)
             let outputExists = outputURL != nil
-            let isActive = currentProjectURL == url && viewState == .processing
-            let isRetrying = isActive && metadata.state.lastError != nil
+            let isActive = ProjectSummary.hasSameLocation(currentProjectURL, url)
+                && isRunActive
             let hasInterruptionEvidence = metadata.checkpoint != nil || metadata.lastRunStartedAt != nil
             let isInterrupted = !isActive
                 && !outputExists
                 && metadata.state.lastError == nil
                 && metadata.state.stage != .done
                 && hasInterruptionEvidence
-                && metadata.recoveryPromptSuppressed != true
             let status: ProjectStatus
             if isActive {
                 status = .inProgress
@@ -117,16 +137,11 @@ extension AppModel {
                 status = .ready
             } else if metadata.state.lastError != nil {
                 status = .failed
+            } else if metadata.state.stage == .done {
+                status = .failed
             } else {
                 status = .inProgress
             }
-            let outputSize: Int64? = outputURL.flatMap { url in
-                (try? FileManager.default.attributesOfItem(atPath: url.path)[.size] as? NSNumber)?.int64Value
-            }
-            let errorCount = cachedRecentPipelineErrorCount(at: ProjectPaths(root: url).pipelineLogURL)
-            // Prefer the sidecar value (cannot be clobbered by pipeline writes)
-            // and fall back to the legacy metadata.lastOpenedAt field for projects
-            // that were stamped before the sidecar split.
             let sidecarOpened = LastOpenedSidecar.load(from: ProjectPaths(root: url).lastOpenedSidecarURL)
             summaries.append(ProjectSummary(
                 id: metadata.id,
@@ -135,25 +150,18 @@ extension AppModel {
                 createdAt: metadata.createdAt,
                 status: status,
                 isActive: isActive,
-                isRetrying: isRetrying,
                 isInterrupted: isInterrupted,
                 checkpointUpdatedAt: metadata.checkpoint?.updatedAt,
-                lastError: metadata.state.lastError,
-                outputPlyURL: outputURL,
-                outputPlySizeBytes: outputSize,
-                reconstruction: metadata.reconstruction,
                 stageTimings: metadata.stageTimings ?? [],
-                preset: metadata.preset,
                 input: metadata.input,
                 requestedRunOptions: metadata.requestedRunOptions,
-                lastOpenedAt: sidecarOpened ?? metadata.lastOpenedAt,
-                lastFailureAt: metadata.lastFailureAt,
-                recentErrorCount: errorCount
+                lastOpenedAt: sidecarOpened,
+                lastRunStartedAt: metadata.lastRunStartedAt,
+                lastFailureAt: metadata.lastFailureAt
             ))
         }
 
         projectSummaries = summaries.sorted { $0.createdAt > $1.createdAt }
-        maybePresentInterruptedProjectPrompt()
     }
 
     func createProjectDirectory(title: String) throws -> URL {
@@ -197,10 +205,6 @@ extension AppModel {
         return (exists, isDirectory.boolValue)
     }
 
-    func regularOutputFileExists(at url: URL) -> Bool {
-        ProjectArtifactValidator.validatePlyFile(at: url) == .valid
-    }
-
     func metadataOutputURL(projectURL: URL, metadata: ProjectMetadata? = nil) -> URL? {
         let loadedMetadata: ProjectMetadata
         if let metadata {
@@ -220,7 +224,19 @@ extension AppModel {
     func readyOutputURL(
         projectURL: URL,
         metadata: ProjectMetadata? = nil,
-        validationDepth: ProjectArtifactValidationDepth = .full
+        validationDepth: ProjectArtifactValidationDepth
+    ) -> URL? {
+        Self.readyOutputURLOnDisk(
+            projectURL: projectURL,
+            metadata: metadata,
+            validationDepth: validationDepth
+        )
+    }
+
+    nonisolated static func readyOutputURLOnDisk(
+        projectURL: URL,
+        metadata: ProjectMetadata? = nil,
+        validationDepth: ProjectArtifactValidationDepth
     ) -> URL? {
         let persistedMetadata: ProjectMetadata
         if let metadata {
@@ -233,13 +249,45 @@ extension AppModel {
         }
         guard persistedMetadata.state.stage == .done,
               persistedMetadata.state.lastError == nil,
-              let outputURL = metadataOutputURL(
-                projectURL: projectURL,
-                metadata: persistedMetadata
-              ) else {
+              let relativePath = persistedMetadata.outputs?.splatPlyPath,
+              let outputURL = try? ProjectPaths(root: projectURL)
+                .resolveProjectRelativePath(relativePath) else {
             return nil
         }
-        return ProjectArtifactValidator.validatePlyFile(at: outputURL, depth: validationDepth) == .valid ? outputURL : nil
+        switch validationDepth {
+        case .quick:
+            guard ProjectArtifactValidator.validatePlyFile(at: outputURL, depth: .quick) == .valid else {
+                return nil
+            }
+        case .full:
+            if let trainingArtifact = persistedMetadata.trainingArtifact {
+                do {
+                    try TrainingArtifactStore.validateCompletedOutput(
+                        trainingArtifact,
+                        at: outputURL
+                    )
+                } catch {
+                    return nil
+                }
+            } else if ProjectArtifactValidator.validatePlyFile(at: outputURL) != .valid {
+                return nil
+            }
+        }
+        return outputURL
+    }
+
+    func validatedFinishedOutputURL(projectURL: URL) async throws -> URL? {
+        let validator = finishedOutputValidator
+        let validationTask = Task.detached(priority: .userInitiated) {
+            validator(projectURL)
+        }
+        return try await withTaskCancellationHandler {
+            let outputURL = await validationTask.value
+            try Task.checkCancellation()
+            return outputURL
+        } onCancel: {
+            validationTask.cancel()
+        }
     }
 
     /// Reload the persisted reconstruction summary for a project from disk. The pipeline
@@ -257,19 +305,10 @@ extension AppModel {
         return (try? ProjectMetadataStore.load(from: metadataURL))?.stageTimings ?? []
     }
 
-    /// Reload the persisted AutoTune snapshot. Returns nil for runs that
-    /// pre-date the snapshot feature or that disabled AutoTune.
-    func loadAutoTuneSnapshot(projectURL: URL) -> AutoTuneSnapshot? {
-        let metadataURL = ProjectPaths(root: projectURL).metadataURL
-        return (try? ProjectMetadataStore.load(from: metadataURL))?.autoTune
-    }
-
-    /// Reload the persisted preset + input pair for a project. Used by the
-    /// viewer to render a "Run configuration" badge alongside the result.
-    func loadProjectConfig(projectURL: URL) -> (preset: PresetSpec, input: InputSpec)? {
+    func loadProjectConfig(projectURL: URL) -> (options: RequestedRunOptions, input: InputSpec)? {
         let metadataURL = ProjectPaths(root: projectURL).metadataURL
         guard let metadata = try? ProjectMetadataStore.load(from: metadataURL) else { return nil }
-        return (metadata.preset, metadata.input)
+        return (metadata.requestedRunOptions, metadata.input)
     }
 
     /// Free disk space on the volume that hosts the project base directory.
@@ -308,15 +347,9 @@ extension AppModel {
         }
     }
 
-    /// Recommended minimum free space for a single run. The pipeline produces
-    /// frame extracts, COLMAP intermediate database, sparse model, and the
-    /// trained PLY; on a 30-frame Fast run this stays under 1 GB but Ultra
-    /// runs with longer videos can blow past 5 GB. 8 GB is a conservative
-    /// cushion that catches "almost full" situations without false alarms.
+    /// Leaves room for selected frames, canonical geometry, checkpoints, and output.
     static let recommendedFreeSpaceBytes: Int64 = 8 * 1024 * 1024 * 1024
 
-    /// Debounce window for notes auto-save. Tuned so a typing pause of half
-    /// a second commits without thrashing disk on every keystroke.
     static let notesAutoSaveDelay: TimeInterval = 0.5
 
     /// Schedule a debounced save of the project's notes. Cancels any prior
@@ -326,6 +359,7 @@ extension AppModel {
     func scheduleNotesSave(at url: URL, to text: String) {
         notesSaveTask?.cancel()
         pendingNotesSave = (url: url, text: text)
+        notesSaveState = .saving
         let token = url
         let value = text
         notesSaveTask = Task { [weak self] in
@@ -337,10 +371,20 @@ extension AppModel {
             guard !Task.isCancelled else { return }
             await MainActor.run {
                 guard let self else { return }
-                self.pendingNotesSave = nil
+                guard ProjectSummary.hasSameLocation(self.currentProjectURL, token) else { return }
+                guard let pending = self.pendingNotesSave,
+                      ProjectSummary.hasSameLocation(pending.url, token),
+                      pending.text == value else {
+                    return
+                }
                 self.notesSaveTask = nil
-                guard self.currentProjectURL == token else { return }
-                self.updateProjectNotes(at: token, to: value)
+                do {
+                    _ = try self.persistProjectNotes(at: token, text: value)
+                    self.pendingNotesSave = nil
+                    self.notesSaveState = .saved
+                } catch {
+                    self.presentNotesSaveFailure(projectURL: token)
+                }
             }
         }
     }
@@ -349,77 +393,19 @@ extension AppModel {
     /// debounce timer. Safe to call when no save is pending. Use before
     /// reset(), project switch, or app termination so a half-typed note
     /// doesn't silently disappear.
-    func flushPendingNotesSave() {
+    @discardableResult
+    func flushPendingNotesSave() -> Bool {
         notesSaveTask?.cancel()
         notesSaveTask = nil
-        guard let pending = pendingNotesSave else { return }
-        pendingNotesSave = nil
-        updateProjectNotes(at: pending.url, to: pending.text)
-    }
-
-    /// mtime+size-keyed cache wrapper around `countRecentPipelineErrors`.
-    /// With 50+ projects the unconditional disk read on every refresh adds
-    /// up; log files rarely change between refreshes, so a stat + compare
-    /// hits the fast path most of the time. Size is included alongside
-    /// mtime because some filesystems only report second-level mtime
-    /// resolution; two writes inside the same second would otherwise be
-    /// mistaken for a cache hit.
-    func cachedRecentPipelineErrorCount(at url: URL) -> Int? {
-        guard let attributes = try? FileManager.default.attributesOfItem(atPath: url.path),
-              let mtime = attributes[.modificationDate] as? Date,
-              let size = (attributes[.size] as? NSNumber)?.int64Value else {
-            // Log absent — drop any stale cache entry and return nil.
-            pipelineErrorCountCache[url] = nil
-            return nil
-        }
-        if let cached = pipelineErrorCountCache[url], cached.mtime == mtime, cached.size == size {
-            return cached.count
-        }
-        guard let fresh = AppModel.countRecentPipelineErrors(at: url) else {
-            pipelineErrorCountCache[url] = nil
-            return nil
-        }
-        pipelineErrorCountCache[url] = (mtime: mtime, size: size, count: fresh)
-        return fresh
-    }
-
-    /// Count `[err]` prefixed lines in the tail of a pipeline.log. Uses a
-    /// bounded read (default 16 KB) so a multi-megabyte log doesn't stall
-    /// the main-actor refresh loop. Returns nil when the log doesn't exist.
-    static func countRecentPipelineErrors(at url: URL, byteLimit: Int = 16 * 1024) -> Int? {
-        let fm = FileManager.default
-        guard let attributes = try? fm.attributesOfItem(atPath: url.path),
-              let size = (attributes[.size] as? NSNumber)?.int64Value, size > 0 else {
-            return nil
-        }
-        guard let handle = try? FileHandle(forReadingFrom: url) else { return nil }
-        defer { try? handle.close() }
-        let readLength = Int(min(Int64(byteLimit), size))
-        let offset = UInt64(size) - UInt64(readLength)
+        guard let pending = pendingNotesSave else { return true }
         do {
-            try handle.seek(toOffset: offset)
+            _ = try persistProjectNotes(at: pending.url, text: pending.text)
+            pendingNotesSave = nil
+            notesSaveState = .saved
+            return true
         } catch {
-            return nil
-        }
-        guard let data = try? handle.read(upToCount: readLength), !data.isEmpty else { return nil }
-        // If the seek landed mid-UTF-8 codepoint, drop bytes until we're at a
-        // valid leading byte; otherwise decoding fails and we drop the count.
-        var trimmed = data
-        if offset > 0 {
-            while let first = trimmed.first, first & 0b1100_0000 == 0b1000_0000 {
-                trimmed.removeFirst()
-            }
-        }
-        guard let text = String(data: trimmed, encoding: .utf8) else { return nil }
-        // Also drop the first partial line, since we likely sliced into the
-        // middle of one when seeking; otherwise an unrelated "[err]"-containing
-        // payload upstream of the cut could double-count.
-        var lines = text.split(whereSeparator: { $0 == "\n" || $0 == "\r" })
-        if offset > 0, !lines.isEmpty {
-            lines.removeFirst()
-        }
-        return lines.reduce(into: 0) { partial, line in
-            if line.hasPrefix("[err]") { partial += 1 }
+            presentNotesSaveFailure(projectURL: pending.url)
+            return false
         }
     }
 
@@ -438,6 +424,19 @@ extension AppModel {
     /// can't be loaded or when the new note matches the existing one.
     @discardableResult
     func updateProjectNotes(at url: URL, to text: String) -> Bool {
+        do {
+            let didChange = try persistProjectNotes(at: url, text: text)
+            if ProjectSummary.hasSameLocation(currentProjectURL, url) {
+                notesSaveState = .saved
+            }
+            return didChange
+        } catch {
+            presentNotesSaveFailure(projectURL: url)
+            return false
+        }
+    }
+
+    private func persistProjectNotes(at url: URL, text: String) throws -> Bool {
         let metadataURL = ProjectPaths(root: url).metadataURL
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
         let newNotes: String? = trimmed.isEmpty ? nil : trimmed
@@ -445,24 +444,26 @@ extension AppModel {
         // owner (notes editor) drives that property; reassigning the trimmed
         // value back into the binding mid-typing would yank cursor position
         // and drop in-progress whitespace from the user.
-        do {
-            var didChange = false
-            _ = try ProjectMetadataStore.update(at: metadataURL) { metadata in
-                guard metadata.notes != newNotes else { return }
-                metadata.notes = newNotes
-                didChange = true
-            }
-            return didChange
-        } catch {
-            // Surface the failure as a non-fatal status so the user knows
-            // their typed note didn't make it to disk (typical cause: the
-            // project volume filled up mid-run).
-            if currentProjectURL == url {
-                shareStatusMessage = "Could not save notes: \(error.localizedDescription)"
-                shareStatusIsError = true
-            }
-            return false
+        var didChange = false
+        _ = try ProjectMetadataStore.update(at: metadataURL) { metadata in
+            guard metadata.notes != newNotes else { return }
+            metadata.notes = newNotes
+            didChange = true
         }
+        return didChange
+    }
+
+    private func presentNotesSaveFailure(projectURL: URL) {
+        guard ProjectSummary.hasSameLocation(currentProjectURL, projectURL)
+                || pendingNotesSave.map({ ProjectSummary.hasSameLocation($0.url, projectURL) }) == true else {
+            return
+        }
+        let message = "The last edit is still waiting to be saved. Check free space and folder permissions, then try again."
+        notesSaveState = .failed(message)
+        actionFailure = ActionFailurePresentation(
+            title: "Couldn’t save notes",
+            message: message
+        )
     }
 
     func loadProjectNotes(projectURL: URL) -> String {
@@ -479,6 +480,7 @@ extension AppModel {
     func renameProject(at url: URL, to newTitle: String) -> Bool {
         let trimmed = newTitle.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return false }
+        actionFailure = nil
         let metadataURL = ProjectPaths(root: url).metadataURL
         do {
             var didChange = false
@@ -491,6 +493,10 @@ extension AppModel {
             refreshProjectSummaries()
             return true
         } catch {
+            actionFailure = ActionFailurePresentation(
+                title: "Couldn’t rename project",
+                message: "The project name wasn’t changed. Check folder permissions and try again."
+            )
             return false
         }
     }
@@ -515,20 +521,14 @@ extension AppModel {
             createdAt: createdAt,
             status: .needsAppUpdate,
             isActive: false,
-            isRetrying: false,
             isInterrupted: false,
             checkpointUpdatedAt: nil,
-            lastError: nil,
-            outputPlyURL: nil,
-            outputPlySizeBytes: nil,
-            reconstruction: nil,
             stageTimings: [],
-            preset: nil,
             input: nil,
             requestedRunOptions: nil,
             lastOpenedAt: nil,
-            lastFailureAt: nil,
-            recentErrorCount: nil
+            lastRunStartedAt: nil,
+            lastFailureAt: nil
         )
     }
 }

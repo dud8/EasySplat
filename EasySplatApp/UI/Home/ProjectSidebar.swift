@@ -1,9 +1,10 @@
 import AppKit
+import CryptoKit
 import EasySplatCore
 import SwiftUI
 
 struct ProjectSidebar: View {
-    @Binding var selection: UUID?
+    @Binding var selection: URL?
     let isRunActive: Bool
     let onNewSplat: () -> Void
 
@@ -32,17 +33,10 @@ struct ProjectSidebar: View {
         )
     }
 
-    private var listSelection: Binding<UUID?> {
+    private var listSelection: Binding<URL?> {
         Binding(
-            get: {
-                if model.viewState != .home,
-                   let currentURL = model.currentProjectURL,
-                   let current = model.projectSummaries.first(where: { $0.url == currentURL }) {
-                    return current.id
-                }
-                return selection
-            },
-            set: { selection = $0 }
+            get: { selection },
+            set: { updateSelection($0) }
         )
     }
 
@@ -76,9 +70,10 @@ struct ProjectSidebar: View {
                             .font(.caption)
                             .foregroundStyle(.secondary)
                     } else {
-                        ForEach(visibleProjects) { project in
+                        ForEach(visibleProjects, id: \.url) { project in
                             projectRow(project)
-                                .tag(project.id)
+                                .tag(Self.selectionID(for: project))
+                                .accessibilityIdentifier(Self.rowAccessibilityIdentifier(for: project.url))
                                 .contextMenu { projectMenu(project) }
                         }
                     }
@@ -86,9 +81,6 @@ struct ProjectSidebar: View {
             }
             .listStyle(.sidebar)
             .searchable(text: $searchText, placement: .sidebar, prompt: "Search Projects")
-            .onChange(of: selection) { _, projectID in
-                openSelectedProject(projectID)
-            }
         }
         .onAppear {
             model.refreshProjectSummaries()
@@ -178,25 +170,40 @@ struct ProjectSidebar: View {
     }
 
     private func projectRow(_ project: ProjectSummary) -> some View {
-        VStack(alignment: .leading, spacing: 3) {
-            Text(project.title)
-                .font(.body)
-                .lineLimit(1)
-                .truncationMode(.middle)
+        HStack(spacing: Theme.Spacing.small) {
+            VStack(alignment: .leading, spacing: 3) {
+                Text(project.title)
+                    .font(.body)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+                    .help(project.title)
 
-            HStack(spacing: Theme.Spacing.small) {
-                Text(statusText(for: project))
-                Spacer(minLength: Theme.Spacing.small)
-                Text(project.lastActivityAt.formatted(date: .abbreviated, time: .omitted))
+                HStack(spacing: Theme.Spacing.small) {
+                    Text(statusText(for: project))
+                    Spacer(minLength: Theme.Spacing.small)
+                    Text(project.lastActivityAt.formatted(date: .abbreviated, time: .omitted))
+                }
+                .font(.caption)
+                .foregroundStyle(.secondary)
             }
-            .font(.caption)
-            .foregroundStyle(.secondary)
+            .accessibilityElement(children: .combine)
+            .accessibilityLabel(
+                "\(project.title), \(statusText(for: project)), \(project.lastActivityAt.formatted(date: .long, time: .omitted))"
+            )
+
+            if let actionTitle = Self.rowActionTitle(status: project.status) {
+                Button(actionTitle) {
+                    open(project)
+                }
+                .buttonStyle(.borderless)
+                .controlSize(.small)
+                .fixedSize()
+                .disabled(isRunActive)
+                .accessibilityLabel("\(actionTitle) \(project.title)")
+                .accessibilityIdentifier(Self.actionAccessibilityIdentifier(for: project.url))
+            }
         }
         .padding(.vertical, 2)
-        .accessibilityElement(children: .combine)
-        .accessibilityLabel(
-            "\(project.title), \(statusText(for: project)), \(project.lastActivityAt.formatted(date: .long, time: .omitted))"
-        )
     }
 
     @ViewBuilder
@@ -232,34 +239,30 @@ struct ProjectSidebar: View {
         .disabled(isLocked(project))
     }
 
-    private func openSelectedProject(_ projectID: UUID?) {
-        guard let projectID,
-              let project = model.projectSummaries.first(where: { $0.id == projectID }) else {
-            return
-        }
-        guard !isRunActive else {
-            selection = model.projectSummaries.first(where: { $0.url == model.currentProjectURL })?.id
-            return
-        }
-        guard project.status != .needsAppUpdate else {
-            selection = nil
-            return
-        }
-        open(project)
+    private func updateSelection(_ requestedSelection: URL?) {
+        guard !isRunActive else { return }
+        selection = Self.selectionAfterOpening(
+            requestedSelection,
+            current: selection,
+            projects: model.projectSummaries,
+            open: beginOpening
+        )
     }
 
-    private func open(_ project: ProjectSummary) {
-        guard !isRunActive else { return }
-        selection = project.id
-        if project.isInterrupted {
-            model.resumeInterruptedProject(project)
-        } else {
-            model.resumeProject(at: project.url)
-        }
+    @discardableResult
+    private func open(_ project: ProjectSummary) -> Bool {
+        guard beginOpening(project) else { return false }
+        selection = Self.selectionID(for: project)
+        return true
+    }
+
+    private func beginOpening(_ project: ProjectSummary) -> Bool {
+        guard !isRunActive else { return false }
+        return model.resumeProject(at: project.url)
     }
 
     private func isLocked(_ project: ProjectSummary) -> Bool {
-        isRunActive && project.url == model.currentProjectURL
+        isRunActive && ProjectSummary.hasSameLocation(model.currentProjectURL, project.url)
     }
 
     private func statusText(for project: ProjectSummary) -> String {
@@ -283,9 +286,84 @@ struct ProjectSidebar: View {
         }
     }
 
+    nonisolated static func opensOnSelection(status: ProjectStatus) -> Bool {
+        status == .ready
+    }
+
+    nonisolated static func rowActionTitle(status: ProjectStatus) -> String? {
+        switch status {
+        case .inProgress: return "Resume"
+        case .failed: return "Try Again"
+        case .ready, .needsAppUpdate: return nil
+        }
+    }
+
     nonisolated static func renameDraftIsInvalid(draft: String, currentTitle: String) -> Bool {
         let trimmed = draft.trimmingCharacters(in: .whitespacesAndNewlines)
         return trimmed.isEmpty || trimmed == currentTitle
+    }
+
+    nonisolated static func selectionID(for project: ProjectSummary) -> URL {
+        selectionID(for: project.url)
+    }
+
+    nonisolated static func selectionID(for projectURL: URL) -> URL {
+        ProjectSummary.canonicalURL(for: projectURL)
+    }
+
+    nonisolated static func project(
+        forSelectionID selectionID: URL,
+        in projects: [ProjectSummary]
+    ) -> ProjectSummary? {
+        projects.first { Self.selectionID(for: $0) == selectionID }
+    }
+
+    nonisolated static func acceptedUserSelection(
+        _ requestedSelection: URL?,
+        current: URL?,
+        projects: [ProjectSummary]
+    ) -> URL? {
+        guard let requestedSelection,
+              let project = project(forSelectionID: requestedSelection, in: projects),
+              opensOnSelection(status: project.status) else {
+            return current
+        }
+        return selectionID(for: project)
+    }
+
+    @MainActor
+    static func selectionAfterOpening(
+        _ requestedSelection: URL?,
+        current: URL?,
+        projects: [ProjectSummary],
+        open: (ProjectSummary) -> Bool
+    ) -> URL? {
+        let accepted = acceptedUserSelection(
+            requestedSelection,
+            current: current,
+            projects: projects
+        )
+        guard accepted != current,
+              let accepted,
+              let project = project(forSelectionID: accepted, in: projects) else {
+            return current
+        }
+        return open(project) ? accepted : current
+    }
+
+    nonisolated static func rowAccessibilityIdentifier(for projectURL: URL) -> String {
+        accessibilityIdentifier(prefix: "project.row", projectURL: projectURL)
+    }
+
+    nonisolated static func actionAccessibilityIdentifier(for projectURL: URL) -> String {
+        accessibilityIdentifier(prefix: "project.action", projectURL: projectURL)
+    }
+
+    private nonisolated static func accessibilityIdentifier(prefix: String, projectURL: URL) -> String {
+        let canonicalPath = ProjectSummary.canonicalURL(for: projectURL).path
+        let digest = SHA256.hash(data: Data(canonicalPath.utf8))
+        let shortDigest = digest.prefix(8).map { String(format: "%02x", $0) }.joined()
+        return "\(prefix).\(shortDigest)"
     }
 
     nonisolated static func visibleProjects(
@@ -303,20 +381,13 @@ struct ProjectSidebar: View {
     }
 
     private func moveToTrash(_ project: ProjectSummary) {
-        if model.currentProjectURL == project.url, model.viewState == .processing {
+        if ProjectSummary.hasSameLocation(model.currentProjectURL, project.url), isRunActive {
             model.cancelCurrentProject(deleteProject: true)
             projectToTrash = nil
             return
         }
-        if model.currentProjectURL == project.url {
-            model.flushPendingNotesSave()
-            model.viewState = .home
+        if model.moveProjectToTrash(at: project.url), selection == Self.selectionID(for: project) {
             selection = nil
-        }
-        NSWorkspace.shared.recycle([project.url]) { _, _ in
-            DispatchQueue.main.async {
-                model.refreshProjectSummaries()
-            }
         }
         projectToTrash = nil
     }

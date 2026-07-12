@@ -4,6 +4,8 @@ import SwiftUI
 import UniformTypeIdentifiers
 
 struct ViewerView: View {
+    let onNewSplat: () -> Void
+
     @EnvironmentObject private var model: AppModel
     @State private var isInspectorPresented = true
     @State private var isTechnicalExpanded = false
@@ -65,12 +67,16 @@ struct ViewerView: View {
             }
             .disabled(model.outputPlyURL == nil || isExporting)
             .help("Save a copy of the validated PLY")
+            .accessibilityIdentifier("result.export")
 
-            Button(action: model.shareCurrentSplat) {
+            Button {
+                Task { await model.shareCurrentSplat() }
+            } label: {
                 Label("Share", systemImage: "square.and.arrow.up")
             }
             .disabled(model.outputPlyURL == nil || model.isShareSheetActive)
             .help("Share the validated PLY")
+            .accessibilityIdentifier("result.share")
 
             Button {
                 isInspectorPresented.toggle()
@@ -78,6 +84,7 @@ struct ViewerView: View {
                 Label("Inspector", systemImage: "sidebar.right")
             }
             .help(isInspectorPresented ? "Hide Inspector" : "Show Inspector")
+            .accessibilityIdentifier("result.inspector")
 
             Menu {
                 Button("Show in Finder", systemImage: "folder") {
@@ -91,17 +98,17 @@ struct ViewerView: View {
                 .disabled(model.outputPlyURL == nil)
 
                 Button("Check for Updates…", systemImage: "arrow.triangle.2.circlepath") {
-                    let latestRelease = AppConfig.projectHomeURL
+                    let releases = AppConfig.projectHomeURL
                         .appendingPathComponent("releases", isDirectory: true)
-                        .appendingPathComponent("latest", isDirectory: false)
-                    NSWorkspace.shared.open(latestRelease)
+                    NSWorkspace.shared.open(releases)
                 }
 
                 Divider()
 
                 Button("New Splat", systemImage: "plus") {
-                    beginNewSplat()
+                    onNewSplat()
                 }
+                .accessibilityIdentifier("result.newSplat")
             } label: {
                 Label("More", systemImage: "ellipsis.circle")
             }
@@ -132,6 +139,7 @@ struct ViewerView: View {
         VStack(alignment: .leading, spacing: Theme.Spacing.small) {
             Text("Output")
                 .font(.headline)
+                .accessibilityAddTraits(.isHeader)
             if let outputURL = model.outputPlyURL {
                 LabeledContent("File") {
                     Text(outputURL.lastPathComponent)
@@ -162,6 +170,7 @@ struct ViewerView: View {
         VStack(alignment: .leading, spacing: Theme.Spacing.small) {
             Text("Capture")
                 .font(.headline)
+                .accessibilityAddTraits(.isHeader)
             if let input = model.currentInput {
                 LabeledContent("Input", value: inputDescription(input))
             }
@@ -180,7 +189,7 @@ struct ViewerView: View {
             if options.resourcePolicy != .automatic {
                 LabeledContent("Resources", value: resourceLabel(options.resourcePolicy))
             }
-            if options.photoSelection == .useAllValidPhotos {
+            if Self.inputContainsPhotos(model.currentInput), options.photoSelection == .useAllValidPhotos {
                 LabeledContent("Photos", value: "All valid photos")
             }
         }
@@ -191,7 +200,23 @@ struct ViewerView: View {
         VStack(alignment: .leading, spacing: Theme.Spacing.small) {
             Text("Reconstruction")
                 .font(.headline)
-            if let summary = model.currentReconstruction {
+                .accessibilityAddTraits(.isHeader)
+            if let geometry = metadata?.geometryArtifact {
+                LabeledContent(
+                    "Registered",
+                    value: "\(geometry.registeredViewCount) of \(geometry.totalViewCount)"
+                )
+                LabeledContent("Points", value: geometry.pointCount.formatted())
+                LabeledContent("Observations", value: geometry.trackCount.formatted())
+                LabeledContent(
+                    "Median residual",
+                    value: geometry.medianPixelResidual.formatted(.number.precision(.fractionLength(2))) + " px"
+                )
+                LabeledContent(
+                    "P90 residual",
+                    value: geometry.p90PixelResidual.formatted(.number.precision(.fractionLength(2))) + " px"
+                )
+            } else if let summary = model.currentReconstruction {
                 LabeledContent(
                     "Registered",
                     value: "\(summary.registeredImages) of \(summary.totalImages)"
@@ -208,21 +233,6 @@ struct ViewerView: View {
                 if let residual = summary.meanReprojectionErrorText {
                     LabeledContent("Mean residual", value: residual)
                 }
-            } else if let geometry = metadata?.geometryArtifact {
-                LabeledContent(
-                    "Registered",
-                    value: "\(geometry.registeredViewCount) of \(geometry.totalViewCount)"
-                )
-                LabeledContent("Points", value: geometry.pointCount.formatted())
-                LabeledContent("Tracks", value: geometry.trackCount.formatted())
-                LabeledContent(
-                    "Median residual",
-                    value: geometry.medianPixelResidual.formatted(.number.precision(.fractionLength(2))) + " px"
-                )
-                LabeledContent(
-                    "P90 residual",
-                    value: geometry.p90PixelResidual.formatted(.number.precision(.fractionLength(2))) + " px"
-                )
             } else {
                 Text("No reconstruction measurements were recorded.")
                     .font(.caption)
@@ -235,6 +245,7 @@ struct ViewerView: View {
         VStack(alignment: .leading, spacing: Theme.Spacing.small) {
             Text("Timing")
                 .font(.headline)
+                .accessibilityAddTraits(.isHeader)
             if let total = model.currentStageTimings.totalDurationSeconds {
                 LabeledContent("Total", value: StageTimingDisplay.formatDuration(seconds: total))
             }
@@ -254,6 +265,7 @@ struct ViewerView: View {
         VStack(alignment: .leading, spacing: Theme.Spacing.small) {
             Text("Notes")
                 .font(.headline)
+                .accessibilityAddTraits(.isHeader)
             TextEditor(text: Binding(
                 get: { model.currentProjectNotes },
                 set: { newValue in
@@ -268,12 +280,36 @@ struct ViewerView: View {
             .frame(minHeight: 90)
             .padding(Theme.Spacing.small)
             .background(Theme.surface)
-            .clipShape(RoundedRectangle(cornerRadius: Theme.Radius.button, style: .continuous))
+            .clipShape(RoundedRectangle(cornerRadius: Theme.Radius.standard, style: .continuous))
             .overlay {
-                RoundedRectangle(cornerRadius: Theme.Radius.button, style: .continuous)
+                RoundedRectangle(cornerRadius: Theme.Radius.standard, style: .continuous)
                     .stroke(Theme.border)
             }
             .accessibilityLabel("Project notes")
+            notesSaveStatus
+        }
+    }
+
+    @ViewBuilder
+    private var notesSaveStatus: some View {
+        switch model.notesSaveState {
+        case .idle:
+            EmptyView()
+        case .saving:
+            Text("Saving…")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .accessibilityLabel("Notes status: Saving")
+        case .saved:
+            Text("Saved")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .accessibilityLabel("Notes status: Saved")
+        case let .failed(message):
+            Text(message)
+                .font(.caption)
+                .foregroundStyle(.red)
+                .accessibilityLabel("Notes status: \(message)")
         }
     }
 
@@ -308,6 +344,7 @@ struct ViewerView: View {
         } label: {
             Text("Technical")
                 .font(.headline)
+                .accessibilityAddTraits(.isHeader)
         }
     }
 
@@ -325,22 +362,18 @@ struct ViewerView: View {
     }
 
     private var displayedRunOptions: RequestedRunOptions {
-        if let options = metadata?.requestedRunOptions {
-            return options
-        }
-        guard let preset = model.currentPreset else { return RequestedRunOptions() }
-        let detail: DetailProfile = switch preset.quality {
-        case .draft: .fast
-        case .standard: .balanced
-        case .ultra: .highDetail
-        }
-        return RequestedRunOptions(
-            capturePath: preset.mode == .object ? .orbit : .walkthrough,
-            detailProfile: detail
-        )
+        metadata?.requestedRunOptions
+            ?? model.currentRunOptions
+            ?? RequestedRunOptions()
     }
 
     private var projectTitle: String {
+        if let projectURL = model.currentProjectURL,
+           let summary = model.projectSummaries.first(where: {
+               ProjectSummary.hasSameLocation($0.url, projectURL)
+           }) {
+            return summary.title
+        }
         if let title = metadata?.title, !title.isEmpty { return title }
         guard let projectURL = model.currentProjectURL else { return "Result" }
         return projectURL.deletingPathExtension().lastPathComponent
@@ -355,51 +388,59 @@ struct ViewerView: View {
     }
 
     private func presentExportPanel() {
-        let source: URL
-        do {
-            source = try model.validatedCurrentSplatForExport()
-        } catch {
-            exportAlert = ExportAlert(message: error.localizedDescription)
-            return
-        }
-        guard let plyType = UTType(filenameExtension: "ply") else {
-            exportAlert = ExportAlert(message: "PLY export is unavailable on this Mac.")
-            return
-        }
+        guard !isExporting else { return }
+        isExporting = true
+        Task { @MainActor in
+            let source: URL
+            do {
+                source = try await model.validatedCurrentSplatForExport()
+            } catch is CancellationError {
+                isExporting = false
+                return
+            } catch {
+                isExporting = false
+                exportAlert = ExportAlert(message: error.localizedDescription)
+                return
+            }
 
-        let panel = NSSavePanel()
-        panel.title = "Export Splat"
-        panel.prompt = "Export"
-        panel.nameFieldStringValue = source.lastPathComponent
-        panel.canCreateDirectories = true
-        panel.isExtensionHidden = false
-        panel.allowsOtherFileTypes = false
-        panel.allowedContentTypes = [plyType]
-        panel.begin { response in
-            guard response == .OK, let destination = panel.url else { return }
-            Task { @MainActor in
-                isExporting = true
-                defer { isExporting = false }
-                do {
-                    try await Task.detached(priority: .userInitiated) {
-                        try AppModel.exportValidatedSplat(from: source, to: destination)
-                    }.value
-                } catch {
-                    exportAlert = ExportAlert(message: error.localizedDescription)
+            guard let plyType = UTType(filenameExtension: "ply") else {
+                isExporting = false
+                exportAlert = ExportAlert(message: "PLY export is unavailable on this Mac.")
+                return
+            }
+
+            let panel = NSSavePanel()
+            panel.title = "Export Splat"
+            panel.prompt = "Export"
+            panel.nameFieldStringValue = source.lastPathComponent
+            panel.canCreateDirectories = true
+            panel.isExtensionHidden = false
+            panel.allowsOtherFileTypes = false
+            panel.allowedContentTypes = [plyType]
+            panel.begin { response in
+                guard response == .OK, let destination = panel.url else {
+                    isExporting = false
+                    return
+                }
+                Task { @MainActor in
+                    defer { isExporting = false }
+                    do {
+                        try await Task.detached(priority: .userInitiated) {
+                            try AppModel.exportValidatedSplat(from: source, to: destination)
+                        }.value
+                    } catch {
+                        exportAlert = ExportAlert(message: error.localizedDescription)
+                    }
                 }
             }
         }
     }
 
     private func revealOutputInFinder() {
-        guard let output = try? model.validatedCurrentSplatForExport() else { return }
-        NSWorkspace.shared.activateFileViewerSelecting([output])
-    }
-
-    private func beginNewSplat() {
-        model.flushPendingNotesSave()
-        model.clearPendingInputs()
-        model.viewState = .home
+        Task { @MainActor in
+            guard let output = try? await model.validatedCurrentSplatForExport() else { return }
+            NSWorkspace.shared.activateFileViewerSelecting([output])
+        }
     }
 
     private func inputDescription(_ input: InputSpec) -> String {
@@ -410,6 +451,15 @@ struct ViewerView: View {
             return "Photo folder"
         case .mixed(let videos, _):
             return "\(videos.count) video\(videos.count == 1 ? "" : "s") and photos"
+        }
+    }
+
+    nonisolated static func inputContainsPhotos(_ input: InputSpec?) -> Bool {
+        switch input {
+        case .photos, .mixed:
+            return true
+        case .video, nil:
+            return false
         }
     }
 

@@ -8,59 +8,39 @@ struct ProjectSummary: Identifiable {
     let createdAt: Date
     let status: ProjectStatus
     let isActive: Bool
-    let isRetrying: Bool
     let isInterrupted: Bool
     let checkpointUpdatedAt: Date?
-    let lastError: String?
-    let outputPlyURL: URL?
-    let outputPlySizeBytes: Int64?
-    let reconstruction: ReconstructionSummary?
     let stageTimings: [StageTimingRecord]
-    let preset: PresetSpec?
     let input: InputSpec?
     let requestedRunOptions: RequestedRunOptions?
     let lastOpenedAt: Date?
+    let lastRunStartedAt: Date?
     let lastFailureAt: Date?
-    let recentErrorCount: Int?
 }
 
 extension ProjectSummary {
-    var outputSizeText: String? {
-        guard let bytes = outputPlySizeBytes, bytes > 0 else { return nil }
-        // ByteCountFormatter cannot be cached safely in a Swift 6 nonisolated
-        // global; the per-call cost is sub-microsecond, so build one each time.
-        let formatter = ByteCountFormatter()
-        formatter.allowedUnits = [.useKB, .useMB, .useGB]
-        formatter.countStyle = .file
-        formatter.includesUnit = true
-        return formatter.string(fromByteCount: bytes)
+    static func canonicalURL(for url: URL) -> URL {
+        let resolved = url.standardizedFileURL.resolvingSymlinksInPath()
+        return URL(filePath: resolved.path, directoryHint: .notDirectory)
     }
 
-    /// Total wall-clock time recorded across the run's stages, if any timings exist.
-    var totalRunDurationText: String? {
-        guard let total = stageTimings.totalDurationSeconds, total > 0 else { return nil }
-        return StageTimingDisplay.formatDuration(seconds: total)
+    static func hasSameLocation(_ first: URL?, _ second: URL) -> Bool {
+        guard let first else { return false }
+        return canonicalURL(for: first) == canonicalURL(for: second)
     }
 
-    /// Approximate timestamp used for sorting by recent activity. Prefers
-    /// the explicit user signal (last opened in the viewer), then the most
-    /// recent stage completion, then checkpoint updatedAt, then creation
-    /// time so projects without any signals still sort sensibly.
+    /// Latest durable user or pipeline activity used by the Recent sort.
     var lastActivityAt: Date {
-        if let lastOpenedAt {
-            return lastOpenedAt
-        }
-        return lastRunCompletedAt
+        [lastOpenedAt, lastRunStartedAt, lastFailureAt, lastRunCompletedAt]
+            .compactMap { $0 }
+            .max() ?? createdAt
     }
 
     var lastRunCompletedAt: Date {
-        if let lastTiming = stageTimings.max(by: { $0.startedAt < $1.startedAt }) {
-            return lastTiming.startedAt.addingTimeInterval(lastTiming.durationSeconds)
+        let stageEnds = stageTimings.map {
+            $0.startedAt.addingTimeInterval($0.durationSeconds)
         }
-        if let checkpointUpdatedAt {
-            return checkpointUpdatedAt
-        }
-        return createdAt
+        return (stageEnds + [checkpointUpdatedAt, createdAt].compactMap { $0 }).max() ?? createdAt
     }
 }
 

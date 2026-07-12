@@ -9,29 +9,26 @@ final class ProjectListFilterSortTests: XCTestCase {
         createdAt: Date = Date(timeIntervalSince1970: 0),
         status: ProjectStatus = .ready,
         stageTimings: [StageTimingRecord] = [],
-        lastOpenedAt: Date? = nil
+        lastOpenedAt: Date? = nil,
+        lastRunStartedAt: Date? = nil,
+        lastFailureAt: Date? = nil,
+        url: URL? = nil
     ) -> ProjectSummary {
         return ProjectSummary(
             id: id,
             title: title,
-            url: URL(fileURLWithPath: "/tmp/\(id.uuidString).easysplatproj"),
+            url: url ?? URL(fileURLWithPath: "/tmp/\(id.uuidString).easysplatproj"),
             createdAt: createdAt,
             status: status,
             isActive: false,
-            isRetrying: false,
             isInterrupted: false,
             checkpointUpdatedAt: nil,
-            lastError: nil,
-            outputPlyURL: nil,
-            outputPlySizeBytes: nil,
-            reconstruction: nil,
             stageTimings: stageTimings,
-            preset: PresetSpec(mode: .object, quality: .standard),
             input: nil,
             requestedRunOptions: nil,
             lastOpenedAt: lastOpenedAt,
-            lastFailureAt: nil,
-            recentErrorCount: nil
+            lastRunStartedAt: lastRunStartedAt,
+            lastFailureAt: lastFailureAt
         )
     }
 
@@ -105,6 +102,134 @@ final class ProjectListFilterSortTests: XCTestCase {
         XCTAssertFalse(ProjectSidebar.renameDraftIsInvalid(draft: " ProjectB ", currentTitle: "ProjectA"))
     }
 
+    func testSidebarSelectionIdentityUsesBundleLocationInsteadOfDuplicatedMetadataUUID() {
+        let duplicatedProjectID = UUID()
+        let first = makeSummary(
+            id: duplicatedProjectID,
+            title: "Original",
+            url: URL(fileURLWithPath: "/tmp/Original.easysplatproj")
+        )
+        let copy = makeSummary(
+            id: duplicatedProjectID,
+            title: "Copy",
+            url: URL(fileURLWithPath: "/tmp/Copy.easysplatproj")
+        )
+
+        XCTAssertNotEqual(
+            ProjectSidebar.selectionID(for: first),
+            ProjectSidebar.selectionID(for: copy)
+        )
+        XCTAssertEqual(
+            ProjectSidebar.project(forSelectionID: ProjectSidebar.selectionID(for: copy), in: [first, copy])?.url,
+            copy.url
+        )
+    }
+
+    func testSidebarSelectionIdentityIgnoresDirectoryURLSpelling() {
+        let directoryURL = URL(fileURLWithPath: "/tmp/Project.easysplatproj", isDirectory: true)
+        let fileURL = URL(fileURLWithPath: directoryURL.path)
+
+        XCTAssertEqual(
+            ProjectSidebar.selectionID(for: directoryURL),
+            ProjectSidebar.selectionID(for: fileURL)
+        )
+    }
+
+    func testProjectRowAccessibilityIdentifierIsStableAndDoesNotExposeThePath() {
+        let directoryURL = URL(fileURLWithPath: "/Users/example/Client Work/House.easysplatproj", isDirectory: true)
+        let fileURL = URL(fileURLWithPath: directoryURL.path)
+
+        let identifier = ProjectSidebar.rowAccessibilityIdentifier(for: directoryURL)
+
+        XCTAssertEqual(identifier, ProjectSidebar.rowAccessibilityIdentifier(for: fileURL))
+        XCTAssertTrue(identifier.hasPrefix("project.row."))
+        XCTAssertEqual(identifier.count, "project.row.".count + 16)
+        XCTAssertFalse(identifier.contains("example"))
+        XCTAssertFalse(identifier.contains("House"))
+        XCTAssertFalse(identifier.contains("Client"))
+    }
+
+    func testProjectActionAccessibilityIdentifierIsStableAndDistinctFromRow() {
+        let directoryURL = URL(fileURLWithPath: "/Users/example/Client Work/House.easysplatproj", isDirectory: true)
+        let fileURL = URL(fileURLWithPath: directoryURL.path)
+
+        let identifier = ProjectSidebar.actionAccessibilityIdentifier(for: directoryURL)
+
+        XCTAssertEqual(identifier, ProjectSidebar.actionAccessibilityIdentifier(for: fileURL))
+        XCTAssertTrue(identifier.hasPrefix("project.action."))
+        XCTAssertEqual(identifier.count, "project.action.".count + 16)
+        XCTAssertNotEqual(identifier, ProjectSidebar.rowAccessibilityIdentifier(for: directoryURL))
+        XCTAssertFalse(identifier.contains("example"))
+        XCTAssertFalse(identifier.contains("House"))
+    }
+
+    func testSidebarUserSelectionRejectsProjectsThatRequireExplicitAction() {
+        let ready = makeSummary(title: "Ready", status: .ready)
+        let failed = makeSummary(title: "Failed", status: .failed)
+        let unfinished = makeSummary(title: "Unfinished", status: .inProgress)
+        let readySelection = ProjectSidebar.selectionID(for: ready)
+
+        XCTAssertEqual(
+            ProjectSidebar.acceptedUserSelection(
+                ProjectSidebar.selectionID(for: failed),
+                current: readySelection,
+                projects: [ready, failed, unfinished]
+            ),
+            readySelection
+        )
+        XCTAssertNil(ProjectSidebar.acceptedUserSelection(
+            ProjectSidebar.selectionID(for: unfinished),
+            current: nil,
+            projects: [ready, failed, unfinished]
+        ))
+        XCTAssertEqual(
+            ProjectSidebar.acceptedUserSelection(
+                nil,
+                current: readySelection,
+                projects: [ready, failed, unfinished]
+            ),
+            readySelection
+        )
+        XCTAssertEqual(
+            ProjectSidebar.acceptedUserSelection(
+                readySelection,
+                current: nil,
+                projects: [ready, failed, unfinished]
+            ),
+            readySelection
+        )
+    }
+
+    @MainActor
+    func testSidebarKeepsCurrentSelectionWhenPendingNotesPreventOpeningAnotherProject() {
+        let base = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: base) }
+        let currentURL = base.appendingPathComponent("Current.easysplatproj", isDirectory: true)
+        let nextURL = base.appendingPathComponent("Next.easysplatproj", isDirectory: true)
+        let current = makeSummary(title: "Current", url: currentURL)
+        let next = makeSummary(title: "Next", url: nextURL)
+        let currentSelection = ProjectSidebar.selectionID(for: current)
+        let model = AppModel(
+            toolchainManager: SidebarTestToolchainManager(),
+            projectBaseURL: base
+        )
+        model.currentProjectURL = currentURL
+        model.viewState = .viewer
+        model.scheduleNotesSave(at: currentURL, to: "final keystroke")
+
+        let selection = ProjectSidebar.selectionAfterOpening(
+            ProjectSidebar.selectionID(for: next),
+            current: currentSelection,
+            projects: [current, next],
+            open: { model.resumeProject(at: $0.url) }
+        )
+
+        XCTAssertEqual(selection, currentSelection)
+        XCTAssertEqual(model.currentProjectURL, currentURL)
+        XCTAssertEqual(model.actionFailure?.title, "Couldn’t save notes")
+    }
+
     func testSortByLastActivityPrefersLastOpenedAtOverStageTimings() {
         let openedYesterday = makeSummary(
             title: "OpenedYesterday",
@@ -131,6 +256,43 @@ final class ProjectListFilterSortTests: XCTestCase {
         XCTAssertEqual(sorted.map(\.title), ["StageOnly", "OpenedToday", "OpenedYesterday"])
     }
 
+    func testLastActivityUsesWorkCompletedAfterProjectWasOpened() {
+        let project = makeSummary(
+            createdAt: Date(timeIntervalSince1970: 100),
+            stageTimings: [
+                .init(
+                    stage: .trainSplat,
+                    startedAt: Date(timeIntervalSince1970: 400),
+                    durationSeconds: 50
+                )
+            ],
+            lastOpenedAt: Date(timeIntervalSince1970: 300)
+        )
+
+        XCTAssertEqual(project.lastActivityAt, Date(timeIntervalSince1970: 450))
+    }
+
+    func testLastActivityIncludesRunStartAndFailure() {
+        let started = makeSummary(
+            createdAt: Date(timeIntervalSince1970: 100),
+            lastOpenedAt: Date(timeIntervalSince1970: 200),
+            lastRunStartedAt: Date(timeIntervalSince1970: 300)
+        )
+        let failed = makeSummary(
+            createdAt: Date(timeIntervalSince1970: 100),
+            lastOpenedAt: Date(timeIntervalSince1970: 200),
+            lastRunStartedAt: Date(timeIntervalSince1970: 300),
+            lastFailureAt: Date(timeIntervalSince1970: 400)
+        )
+
+        XCTAssertEqual(started.lastActivityAt, Date(timeIntervalSince1970: 300))
+        XCTAssertEqual(failed.lastActivityAt, Date(timeIntervalSince1970: 400))
+        XCTAssertEqual(
+            ProjectListSort.lastActivityNewest.apply(to: [started, failed]).map(\.id),
+            [failed.id, started.id]
+        )
+    }
+
     func testSortByTitleAlphabeticalIsCaseInsensitive() {
         let zebra = makeSummary(title: "zebra")
         let apple = makeSummary(title: "Apple")
@@ -139,12 +301,15 @@ final class ProjectListFilterSortTests: XCTestCase {
         XCTAssertEqual(sorted.map(\.title), ["Apple", "monkey", "zebra"])
     }
 
-    func testTotalRunDurationTextOmitsZero() {
-        let withoutTimings = makeSummary()
-        XCTAssertNil(withoutTimings.totalRunDurationText)
-        let withTimings = makeSummary(stageTimings: [
-            .init(stage: .sfmFeatures, startedAt: Date(timeIntervalSince1970: 0), durationSeconds: 90)
-        ])
-        XCTAssertEqual(withTimings.totalRunDurationText, "1m 30s")
+}
+
+private struct SidebarTestToolchainManager: ToolchainManaging {
+    func ensureToolchain(
+        manifestURL: URL,
+        publicKeyBase64: String,
+        request: ToolchainCapabilityRequest,
+        onProgress: @escaping @Sendable (Double, String) -> Void
+    ) async throws -> ToolchainPaths {
+        fatalError("Sidebar tests do not install a toolchain")
     }
 }

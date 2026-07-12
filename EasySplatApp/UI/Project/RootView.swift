@@ -2,41 +2,78 @@ import SwiftUI
 
 struct RootView: View {
     @EnvironmentObject private var model: AppModel
-    @State private var selectedProjectID: UUID?
+    @State private var selectedProjectURL: URL?
 
     private var isRunActive: Bool {
-        Self.newSplatIsDisabled(
-            isProcessing: model.viewState == .processing,
-            hasError: model.lastError != nil
+        model.isRunActive
+    }
+
+    private var actionFailureIsPresented: Binding<Bool> {
+        Binding(
+            get: { model.actionFailure != nil },
+            set: { if !$0 { model.actionFailure = nil } }
         )
     }
 
     var body: some View {
         NavigationSplitView {
             ProjectSidebar(
-                selection: $selectedProjectID,
+                selection: $selectedProjectURL,
                 isRunActive: isRunActive,
                 onNewSplat: beginNewSplat
             )
             .navigationSplitViewColumnWidth(min: 220, ideal: 280, max: 340)
         } detail: {
-            WorkspaceView()
-                .frame(minWidth: 680, minHeight: 640)
+            WorkspaceView(
+                onNewSplat: beginNewSplat,
+                onBackToProjects: showProjects
+            )
         }
         .navigationSplitViewStyle(.balanced)
         .tint(Theme.accent)
         .background(WindowAccessor())
+        .onChange(of: model.currentProjectURL) { _, projectURL in
+            selectedProjectURL = projectURL.map(ProjectSidebar.selectionID(for:))
+        }
+        .alert(
+            model.actionFailure?.title ?? "Action failed",
+            isPresented: actionFailureIsPresented
+        ) {
+            Button("OK") {
+                model.actionFailure = nil
+            }
+        } message: {
+            if let message = model.actionFailure?.message {
+                Text(message)
+            }
+        }
     }
 
     private func beginNewSplat() {
         guard !isRunActive else { return }
-        model.flushPendingNotesSave()
-        model.clearPendingInputs()
-        selectedProjectID = nil
-        model.viewState = .home
+        Self.prepareNewSplat(model: model, selectedProjectURL: &selectedProjectURL)
     }
 
-    nonisolated static func newSplatIsDisabled(isProcessing: Bool, hasError: Bool) -> Bool {
-        isProcessing && !hasError
+    private func showProjects() {
+        guard !isRunActive else { return }
+        Self.prepareProjectList(model: model, selectedProjectURL: &selectedProjectURL)
+    }
+
+    @MainActor
+    static func prepareNewSplat(model: AppModel, selectedProjectURL: inout URL?) {
+        guard model.flushPendingNotesSave() else { return }
+        model.reset()
+        model.clearPendingInputs()
+        model.viewState = .home
+        selectedProjectURL = nil
+    }
+
+    @MainActor
+    static func prepareProjectList(model: AppModel, selectedProjectURL: inout URL?) {
+        guard model.flushPendingNotesSave() else { return }
+        model.reset()
+        model.viewState = .home
+        model.refreshProjectSummaries()
+        selectedProjectURL = nil
     }
 }

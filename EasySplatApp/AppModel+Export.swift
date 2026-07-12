@@ -13,17 +13,23 @@ enum CurrentSplatExportError: LocalizedError {
 }
 
 extension AppModel {
-    func validatedCurrentSplatForExport() throws -> URL {
+    func validatedCurrentSplatForExport() async throws -> URL {
         guard let projectURL = currentProjectURL,
-              let source = readyOutputURL(projectURL: projectURL) else {
+              let source = try await validatedFinishedOutputURL(projectURL: projectURL) else {
             throw CurrentSplatExportError.noFinishedOutput
+        }
+        try Task.checkCancellation()
+        guard ProjectSummary.hasSameLocation(currentProjectURL, projectURL) else {
+            throw CancellationError()
         }
         return source
     }
 
-    func exportCurrentSplat(to destination: URL) throws {
-        let source = try validatedCurrentSplatForExport()
-        try Self.exportValidatedSplat(from: source, to: destination)
+    func exportCurrentSplat(to destination: URL) async throws {
+        let source = try await validatedCurrentSplatForExport()
+        try await Task.detached(priority: .userInitiated) {
+            try Self.exportValidatedSplat(from: source, to: destination)
+        }.value
     }
 
     nonisolated static func exportValidatedSplat(from source: URL, to destination: URL) throws {

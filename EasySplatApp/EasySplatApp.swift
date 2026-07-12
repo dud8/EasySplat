@@ -1,3 +1,4 @@
+import EasySplatCore
 import SwiftUI
 
 @main
@@ -7,15 +8,16 @@ struct EasySplatApp: App {
     @Environment(\.scenePhase) private var scenePhase
 
     var body: some Scene {
-        WindowGroup {
+        Window("EasySplat", id: "main") {
             RootView()
                 .environmentObject(model)
-                .frame(minWidth: 920, minHeight: 640)
                 .onAppear {
                     appDelegate.model = model
                     model.refreshFreeDiskSpace()
+                    if let projectURL = AppConfig.uiVerificationProcessingProjectURL {
+                        model.applyUIVerificationProcessingFixture(projectURL: projectURL)
+                    }
                 }
-                .frame(idealWidth: 1100, idealHeight: 760)
                 .onChange(of: scenePhase) { _, newPhase in
                     // Refresh project summaries when the window regains focus so
                     // external changes (Finder deletes, files added by Finder copy,
@@ -34,7 +36,7 @@ struct EasySplatApp: App {
                     }
                 }
         }
-        .windowResizability(.contentMinSize)
+        .defaultSize(width: 1100, height: 760)
         .commands {
             CommandGroup(replacing: .help) {
                 // No keyboard shortcut: Cmd+Opt+D is reserved by macOS for
@@ -54,11 +56,10 @@ struct EasySplatApp: App {
                     var lines: [String] = [
                         "macOS-only Apple Silicon app for turning videos, photos, or mixed inputs into 3D Gaussian splats."
                     ]
-                    if let version = Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String {
-                        let build = Bundle.main.infoDictionary?["CFBundleVersion"] as? String ?? ""
-                        let suffix = build.isEmpty ? "" : " (build \(build))"
-                        lines.append("Version \(version)\(suffix).")
-                    }
+                    let version = EasySplatReleaseIdentity.version()
+                    let build = Bundle.main.infoDictionary?["CFBundleVersion"] as? String ?? ""
+                    let suffix = build.isEmpty ? "" : " (build \(build))"
+                    lines.append("Version \(version)\(suffix).")
                     lines.append("Hardware: \(AppModel.hardwareSummaryLine())")
                     panel.informativeText = lines.joined(separator: "\n\n")
                     panel.addButton(withTitle: "OK")

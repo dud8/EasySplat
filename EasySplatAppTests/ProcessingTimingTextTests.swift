@@ -30,10 +30,42 @@ final class ProcessingTimingTextTests: XCTestCase {
         XCTAssertEqual(ProcessingPhase.finish.heading, "Step 4 of 4 · Finishing")
     }
 
+    func testVisibleProgressNeverPresentsInternalStageFractionsAsPhaseProgress() {
+        XCTAssertNil(ProcessingView.phaseProgress(stage: .importInput, progress: 0.8))
+        XCTAssertNil(ProcessingView.phaseProgress(stage: .extractFrames, progress: 0.2))
+        XCTAssertNil(ProcessingView.phaseProgress(stage: .sfmFeatures, progress: 0.9))
+        XCTAssertNil(ProcessingView.phaseProgress(stage: .sfmMapping, progress: 0.1))
+        XCTAssertEqual(ProcessingView.phaseProgress(stage: .trainSplat, progress: 0.4), 0.4)
+        XCTAssertEqual(ProcessingView.phaseProgress(stage: .exportSplat, progress: 0.7), 0.7)
+        XCTAssertEqual(ProcessingView.phaseProgress(stage: .done, progress: 1), 1)
+    }
+
     func testTryAgainSupportsDurableProjectsAndPreProjectSetupFailures() {
         XCTAssertTrue(ProcessingView.canTryAgain(projectExists: true, pendingInputExists: false))
         XCTAssertTrue(ProcessingView.canTryAgain(projectExists: false, pendingInputExists: true))
         XCTAssertFalse(ProcessingView.canTryAgain(projectExists: false, pendingInputExists: false))
+    }
+
+    func testValidationFailuresPresentSpecificRecoveryActions() {
+        XCTAssertEqual(ProcessingView.failureActionTitle(recovery: .useUnordered), "Use Unordered")
+        XCTAssertEqual(ProcessingView.failureActionTitle(recovery: .useFast), "Use Fast")
+        XCTAssertEqual(ProcessingView.failureActionTitle(recovery: .useBalanced), "Use Balanced")
+        XCTAssertEqual(ProcessingView.failureActionTitle(recovery: nil), "Try Again")
+    }
+
+    func testFailureMessageShowsOnlyTheTrimmedUserFacingError() {
+        XCTAssertEqual(
+            ProcessingView.failureMessage("  The capture could not be connected. Try again with more overlap.\n"),
+            "The capture could not be connected. Try again with more overlap."
+        )
+        XCTAssertEqual(
+            ProcessingView.failureMessage("   "),
+            "No error details were reported."
+        )
+        XCTAssertEqual(
+            ProcessingView.failureMessage(nil),
+            "No error details were reported."
+        )
     }
 
     func testFormatElapsedClampsRoundsAndFormats() {

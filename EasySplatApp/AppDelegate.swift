@@ -10,14 +10,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // Flush any pending notes-save before we hand control to the
         // termination flow so the user's last edit isn't dropped by the
         // debounce timer being cancelled mid-write.
-        model.flushPendingNotesSave()
+        guard model.flushPendingNotesSave() else {
+            return .terminateCancel
+        }
 
         if model.isStopping {
             model.registerExitIntent(.quit)
             return .terminateLater
         }
 
-        guard model.viewState == .processing else {
+        guard model.currentTask != nil else {
             return .terminateNow
         }
 

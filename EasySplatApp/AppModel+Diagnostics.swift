@@ -3,11 +3,26 @@ import EasySplatCore
 import Foundation
 
 extension AppModel {
+    func copyTechnicalDetails(
+        _ text: String,
+        pasteboard: NSPasteboard = .general,
+        confirmation: @MainActor (String) -> Bool = AppModel.confirmTechnicalDetailsCopy
+    ) {
+        let sanitized = ProjectDiagnosticBundle.sanitizeForSharing(
+            text,
+            projectURL: currentProjectURL
+        )
+        guard confirmation(sanitized) else { return }
+        pasteboard.clearContents()
+        pasteboard.setString(sanitized, forType: .string)
+    }
+
     /// Build a paste-ready diagnostic summary for the named project and copy it
     /// to the system clipboard. The bundle build (which reads multiple log
     /// files) is dispatched off the main actor so large logs cannot freeze the
     /// UI; the pasteboard write happens back on the main actor.
     func copyDiagnosticBundle(forProjectURL projectURL: URL) {
+        actionFailure = nil
         shareStatusMessage = "Preparing diagnostic info…"
         shareStatusIsError = false
         let hardwareLine = AppModel.hardwareSummaryLine()
@@ -22,6 +37,14 @@ extension AppModel {
             guard let text else {
                 self.shareStatusMessage = "Could not build diagnostic bundle for this project."
                 self.shareStatusIsError = true
+                self.actionFailure = ActionFailurePresentation(
+                    title: "Couldn’t prepare diagnostics",
+                    message: "Check the project files and try again."
+                )
+                return
+            }
+            guard AppModel.confirmDiagnosticCopy(text) else {
+                self.shareStatusMessage = nil
                 return
             }
             let pasteboard = NSPasteboard.general
@@ -40,6 +63,7 @@ extension AppModel {
     /// user can opt in for a trusted destination without needing a separate
     /// menu item.
     func saveDiagnosticBundle(forProjectURL projectURL: URL, includeNotes: Bool = false) {
+        actionFailure = nil
         shareStatusMessage = "Preparing diagnostic file…"
         shareStatusIsError = false
         let hardwareLine = AppModel.hardwareSummaryLine()
@@ -55,6 +79,10 @@ extension AppModel {
             guard let text else {
                 self.shareStatusMessage = "Could not build diagnostic bundle for this project."
                 self.shareStatusIsError = true
+                self.actionFailure = ActionFailurePresentation(
+                    title: "Couldn’t prepare diagnostics",
+                    message: "Check the project files and try again."
+                )
                 return
             }
             let panel = NSSavePanel()
@@ -89,6 +117,10 @@ extension AppModel {
             } else {
                 finalText = text
             }
+            guard AppModel.confirmDiagnosticSave(finalText) else {
+                self.shareStatusMessage = nil
+                return
+            }
             do {
                 try finalText.data(using: .utf8)?.write(to: destination, options: [.atomic])
                 self.shareStatusMessage = "Diagnostics saved to \(destination.lastPathComponent)."
@@ -96,17 +128,73 @@ extension AppModel {
             } catch {
                 self.shareStatusMessage = "Failed to save diagnostics: \(error.localizedDescription)"
                 self.shareStatusIsError = true
+                self.actionFailure = ActionFailurePresentation(
+                    title: "Couldn’t save diagnostics",
+                    message: error.localizedDescription
+                )
             }
         }
     }
 
     /// Deterministic default filename used in the Save Diagnostics panel.
     static func diagnosticBundleFileName(for projectURL: URL) -> String {
-        let safeTitle = projectURL.deletingPathExtension().lastPathComponent
-            .replacingOccurrences(of: "/", with: "-")
         let formatter = DateFormatter()
         formatter.dateFormat = "yyyyMMdd-HHmm"
-        return "easysplat-diagnostic-\(safeTitle)-\(formatter.string(from: Date())).md"
+        return "easysplat-diagnostic-\(formatter.string(from: Date())).md"
+    }
+
+    static func confirmDiagnosticCopy(_ text: String) -> Bool {
+        confirmDiagnosticPayload(
+            text,
+            message: "Review Diagnostics",
+            actionTitle: "Copy"
+        )
+    }
+
+    static func confirmDiagnosticSave(_ text: String) -> Bool {
+        confirmDiagnosticPayload(
+            text,
+            message: "Review Diagnostics",
+            actionTitle: "Save"
+        )
+    }
+
+    static func confirmTechnicalDetailsCopy(_ text: String) -> Bool {
+        confirmDiagnosticPayload(
+            text,
+            message: "Review Details",
+            actionTitle: "Copy",
+            informativeText: "Local identity, removable-volume names, and URL credentials have been removed."
+        )
+    }
+
+    private static func confirmDiagnosticPayload(
+        _ text: String,
+        message: String,
+        actionTitle: String,
+        informativeText: String = "Check the details before continuing. Notes are excluded unless you add them explicitly."
+    ) -> Bool {
+        let alert = NSAlert()
+        alert.alertStyle = .informational
+        alert.messageText = message
+        alert.informativeText = informativeText
+        alert.addButton(withTitle: actionTitle)
+        alert.addButton(withTitle: "Cancel")
+
+        let textView = NSTextView(frame: NSRect(x: 0, y: 0, width: 600, height: 280))
+        textView.string = text
+        textView.isEditable = false
+        textView.isSelectable = true
+        textView.font = NSFont.monospacedSystemFont(ofSize: 11, weight: .regular)
+        textView.setAccessibilityLabel("Diagnostic preview")
+
+        let scrollView = NSScrollView(frame: textView.frame)
+        scrollView.documentView = textView
+        scrollView.hasVerticalScroller = true
+        scrollView.borderType = .bezelBorder
+        alert.accessoryView = scrollView
+
+        return alert.runModal() == .alertFirstButtonReturn
     }
 
     /// One-line hardware description suitable for embedding in diagnostic dumps.

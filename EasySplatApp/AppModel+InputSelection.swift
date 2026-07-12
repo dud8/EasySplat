@@ -15,11 +15,15 @@ extension AppModel {
 
     func addInputs(urls: [URL]) {
         var newVideos: [URL] = []
-        var newFolder: URL?
+        var newFolders: [URL] = []
+        var seenFolderPaths: Set<String> = []
         var ignoredFiles: [URL] = []
         for url in urls {
             if url.hasDirectoryPath {
-                newFolder = url
+                let path = url.standardizedFileURL.path
+                if seenFolderPaths.insert(path).inserted {
+                    newFolders.append(url)
+                }
             } else if let type = UTType(filenameExtension: url.pathExtension),
                       type.conforms(to: .movie) || type.conforms(to: .video) {
                 newVideos.append(url)
@@ -33,32 +37,48 @@ extension AppModel {
             let merged = pendingVideoURLs + newVideos.filter { !existing.contains($0.path) }
             pendingVideoURLs = merged
         }
+        let newFolder = newFolders.first
         if let newFolder {
             pendingPhotosFolderURL = newFolder
         }
 
-        if ignoredFiles.isEmpty {
-            selectionWarning = nil
-        } else {
-            selectionWarning = "Ignored \(ignoredFiles.count) file(s). Supported: video files and a photo folder."
+        var warnings: [String] = []
+        if !ignoredFiles.isEmpty {
+            warnings.append("Ignored \(ignoredFiles.count) file(s). Supported: video files and a photo folder.")
+        }
+        let additionalFolderCount = max(0, newFolders.count - 1)
+        if additionalFolderCount > 0 {
+            let noun = additionalFolderCount == 1 ? "folder" : "folders"
+            warnings.append(
+                "Ignored \(additionalFolderCount) additional photo \(noun). EasySplat uses one photo folder per splat."
+            )
         }
 
-        if let folder = newFolder, let count = AppModel.countImageFiles(in: folder), count < AppModel.minimumRecommendedPhotos {
-            let message = "\"\(folder.lastPathComponent)\" has \(count) image file\(count == 1 ? "" : "s"). \(AppModel.minimumRecommendedPhotos)+ images is the recommended floor for a high-coverage solve, but EasySplat will still attempt the run."
-            selectionWarning = selectionWarning.map { "\($0)\n\(message)" } ?? message
+        if requestedRunOptions.inputOrdering == .continuous,
+           let input = buildInputSpec(),
+           !RunPlanResolver.supports(inputOrdering: .continuous, input: input) {
+            requestedRunOptions.inputOrdering = .automatic
+            warnings.append("Continuous sequence works with one video. Input Order was reset to Automatic.")
+        }
+        selectionWarning = warnings.isEmpty ? nil : warnings.joined(separator: "\n")
+        if let newFolder {
+            schedulePhotoFolderCount(for: newFolder)
         }
     }
 
     /// Recommended floor used by the pre-flight check. Phrased as a quality
     /// recommendation rather than a hard minimum because the pipeline only
     /// fails outright below 2 selected frames.
-    static let minimumRecommendedPhotos: Int = 12
+    nonisolated static let minimumRecommendedPhotos: Int = 12
 
     /// Count non-hidden image files in a folder. Recurses into subdirectories
-    /// to match the pipeline's photo discovery, but caps the walk to a
-    /// reasonable depth so dropping a giant unrelated folder (e.g., ~/Pictures)
-    /// does not stall the UI. Returns nil when the folder cannot be enumerated.
-    static func countImageFiles(in folder: URL) -> Int? {
+    /// to match the pipeline's photo discovery, but stops as soon as the UI's
+    /// recommendation threshold is met. Returns nil when the folder cannot be enumerated.
+    nonisolated static func countImageFiles(
+        in folder: URL,
+        maximumVisitedEntries: Int = 4_096
+    ) -> Int? {
+        guard maximumVisitedEntries > 0, !Task.isCancelled else { return nil }
         let allowedExtensions: Set<String> = ["jpg", "jpeg", "png", "heic", "heif"]
         let fm = FileManager.default
         var isDirectory: ObjCBool = false
@@ -74,14 +94,22 @@ extension AppModel {
             return nil
         }
         let maxDepth = 3
+        var visitedEntries = 0
         var count = 0
         for case let url as URL in enumerator {
+            guard !Task.isCancelled, visitedEntries < maximumVisitedEntries else {
+                return nil
+            }
+            visitedEntries += 1
             if enumerator.level > maxDepth {
                 enumerator.skipDescendants()
                 continue
             }
             if allowedExtensions.contains(url.pathExtension.lowercased()) {
                 count += 1
+                if count >= minimumRecommendedPhotos {
+                    return count
+                }
             }
         }
         return count
@@ -92,7 +120,16 @@ extension AppModel {
     }
 
     func clearPendingInputs() {
+        photoFolderCountTask?.cancel()
+        photoFolderCountTask = nil
         pendingVideoURLs = []
+        pendingPhotosFolderURL = nil
+        selectionWarning = nil
+    }
+
+    func removePhotoFolder() {
+        photoFolderCountTask?.cancel()
+        photoFolderCountTask = nil
         pendingPhotosFolderURL = nil
         selectionWarning = nil
     }
@@ -119,5 +156,33 @@ extension AppModel {
             return URL(fileURLWithPath: photosFolder).lastPathComponent
         }
         return "Project"
+    }
+
+    private func schedulePhotoFolderCount(for folder: URL) {
+        photoFolderCountTask?.cancel()
+        let folderIdentity = folder.standardizedFileURL
+        let scan = Task.detached(priority: .utility) {
+            Self.countImageFiles(in: folder)
+        }
+        photoFolderCountTask = Task { [weak self] in
+            let count = await withTaskCancellationHandler {
+                await scan.value
+            } onCancel: {
+                scan.cancel()
+            }
+            guard !Task.isCancelled, let self else { return }
+            self.photoFolderCountTask = nil
+            guard self.pendingPhotosFolderURL?.standardizedFileURL == folderIdentity,
+                  let count,
+                  count < Self.minimumRecommendedPhotos else {
+                return
+            }
+            let message = "\"\(folder.lastPathComponent)\" has \(count) image file\(count == 1 ? "" : "s"). \(Self.minimumRecommendedPhotos)+ images is the recommended floor for a high-coverage solve, but EasySplat will still attempt the run."
+            if let warning = self.selectionWarning, !warning.isEmpty {
+                self.selectionWarning = warning + "\n" + message
+            } else {
+                self.selectionWarning = message
+            }
+        }
     }
 }

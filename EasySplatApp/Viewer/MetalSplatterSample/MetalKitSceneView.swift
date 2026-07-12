@@ -78,12 +78,31 @@ struct PreviewReloadPlanner {
 
 @MainActor
 final class SplatViewerController: ObservableObject {
+    typealias Bounds = (center: SIMD3<Float>, radius: Float)
+    typealias BoundsLoader = @Sendable (URL) async throws -> Bounds?
+
     @Published var errorMessage: String? = nil
     @Published var isLoading: Bool = false
     @Published var isUpdating: Bool = false
     @Published var hasRenderedPreview: Bool = false
-    private(set) var currentBounds: (center: SIMD3<Float>, radius: Float)?
+    private(set) var currentBounds: Bounds?
     fileprivate var renderer: MetalKitSceneRenderer?
+    private let boundsLoader: BoundsLoader
+    private var boundsTask: Task<Void, Never>?
+    private var boundsRequest: PreviewLoadRequest?
+    private var boundsGeneration: UInt64 = 0
+
+    init(boundsLoader: @escaping BoundsLoader = { url in
+        try await Task.detached {
+            try BoundsCalculator.computeBounds(for: url)
+        }.value
+    }) {
+        self.boundsLoader = boundsLoader
+    }
+
+    deinit {
+        boundsTask?.cancel()
+    }
 
     func resetCamera() {
         renderer?.resetCamera()
@@ -97,11 +116,40 @@ final class SplatViewerController: ObservableObject {
         }
     }
 
-    func computeBounds(for url: URL) async throws {
-        let bounds = try await Task.detached {
-            try BoundsCalculator.computeBounds(for: url)
-        }.value
-        currentBounds = bounds
+    func prepareBounds(for request: PreviewLoadRequest) {
+        boundsTask?.cancel()
+        boundsTask = nil
+        boundsGeneration &+= 1
+        boundsRequest = request
+        currentBounds = nil
+    }
+
+    func startBoundsLoad(for request: PreviewLoadRequest) {
+        guard let url = request.url, boundsRequest == request else { return }
+        let generation = boundsGeneration
+        let loader = boundsLoader
+        boundsTask = Task { [weak self] in
+            do {
+                let bounds = try await loader(url)
+                guard !Task.isCancelled,
+                      let self,
+                      self.boundsGeneration == generation,
+                      self.boundsRequest == request else {
+                    return
+                }
+                self.currentBounds = bounds
+            } catch {
+                // Bounds are optional for rendering; keep the preview interactive.
+            }
+        }
+    }
+
+    func cancelBoundsLoad() {
+        boundsTask?.cancel()
+        boundsTask = nil
+        boundsGeneration &+= 1
+        boundsRequest = nil
+        currentBounds = nil
     }
 }
 
@@ -173,6 +221,7 @@ struct MetalKitSceneView: NSViewRepresentable {
             renderer: MetalKitSceneRenderer,
             controller: SplatViewerController
         ) {
+            controller.prepareBounds(for: request)
             if controller.hasRenderedPreview {
                 controller.isLoading = false
                 controller.isUpdating = true
@@ -194,26 +243,20 @@ struct MetalKitSceneView: NSViewRepresentable {
                         request.url.map { ModelIdentifier.gaussianSplat($0) },
                         forceReload: forceReload
                     )
-                guard !Task.isCancelled else { return }
+                    guard !Task.isCancelled else { return }
                     controller.errorMessage = nil
                     controller.isLoading = false
                     controller.isUpdating = false
                     controller.hasRenderedPreview = request.url != nil
-                self.onLoadStateChanged?(.ready)
-                    if let url = request.url {
-                        Task {
-                            do {
-                                try await controller.computeBounds(for: url)
-                            } catch {
-                                // Bounds are optional for rendering; keep the preview interactive.
-                            }
-                        }
+                    self.onLoadStateChanged?(.ready)
+                    if request.url != nil {
+                        controller.startBoundsLoad(for: request)
                     }
-            } catch {
-                guard !Task.isCancelled else { return }
-                controller.isLoading = false
-                controller.isUpdating = false
-                controller.errorMessage = error.localizedDescription
+                } catch {
+                    guard !Task.isCancelled else { return }
+                    controller.isLoading = false
+                    controller.isUpdating = false
+                    controller.errorMessage = error.localizedDescription
                     self.onLoadStateChanged?(.failed(error.localizedDescription))
                     print("Error loading model: \(error.localizedDescription)")
                 }
@@ -223,6 +266,18 @@ struct MetalKitSceneView: NSViewRepresentable {
 
     func makeCoordinator() -> Coordinator {
         Coordinator()
+    }
+
+    static func dismantleNSView(_ nsView: MTKView, coordinator: Coordinator) {
+        coordinator.controller?.cancelBoundsLoad()
+        coordinator.loadTask?.cancel()
+        coordinator.deferredLoadTask?.cancel()
+        if coordinator.controller?.renderer === coordinator.renderer {
+            coordinator.controller?.renderer = nil
+        }
+        nsView.delegate = nil
+        coordinator.renderer = nil
+        coordinator.controller = nil
     }
 
     func makeNSView(context: NSViewRepresentableContext<MetalKitSceneView>) -> MTKView {
