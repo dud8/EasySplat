@@ -240,7 +240,7 @@ final class PipelineRunnerImageFilteringTests: XCTestCase {
             PipelineRunner.SelectedFrameGroup(id: "photos", frames: frames, isVideo: false)
         ]
 
-        let budgeted = runner.test_applyFrameBudget(to: groups, targetCount: 120)
+        let budgeted = try runner.test_applyFrameBudget(to: groups, targetCount: 120)
 
         XCTAssertEqual(budgeted.reduce(0) { $0 + $1.frames.count }, 120)
         XCTAssertEqual(budgeted.first?.id, "photos")
@@ -257,11 +257,72 @@ final class PipelineRunnerImageFilteringTests: XCTestCase {
             PipelineRunner.SelectedFrameGroup(id: "photos", frames: photos, isVideo: false),
         ]
 
-        let budgeted = runner.test_applyFrameBudget(to: groups, targetCount: 120)
+        let budgeted = try runner.test_applyFrameBudget(to: groups, targetCount: 120)
 
         XCTAssertEqual(budgeted.reduce(0) { $0 + $1.frames.count }, 120)
         XCTAssertTrue(budgeted.contains { $0.id == "video_000" })
         XCTAssertTrue(budgeted.contains { $0.id == "photos" })
+    }
+
+    func testUseAllValidPhotosRejectsCorruptDuplicatesAndUnsafeCounts() throws {
+        let root = try TestFileBuilder.makeTempDir()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let runner = try makeRunner(projectURL: root)
+        let first = root.appendingPathComponent("first.jpg")
+        let duplicate = root.appendingPathComponent("duplicate.jpg")
+        let second = root.appendingPathComponent("second.jpg")
+        let corrupt = root.appendingPathComponent("corrupt.jpg")
+        try writeImage(url: first, size: 16, value: 40)
+        try FileManager.default.copyItem(at: first, to: duplicate)
+        try writeImage(url: second, size: 16, value: 180)
+        try Data("not an image".utf8).write(to: corrupt)
+
+        let filtered = runner.test_filterValidUniquePhotos([first, duplicate, second, corrupt])
+
+        XCTAssertEqual(filtered.frames.map(\.lastPathComponent), ["first.jpg", "second.jpg"])
+        XCTAssertEqual(filtered.unreadableCount, 1)
+        XCTAssertEqual(filtered.duplicateCount, 1)
+
+        let repeatedValidPhotos = (0..<140).map { index in
+            root.appendingPathComponent(String(format: "valid_%03d.jpg", index))
+        }
+        let groups = [
+            PipelineRunner.SelectedFrameGroup(id: "photos", frames: repeatedValidPhotos, isVideo: false)
+        ]
+        XCTAssertThrowsError(
+            try runner.test_applyFrameBudget(
+                to: groups,
+                targetCount: 120,
+                photoSelection: .useAllValidPhotos
+            )
+        ) { error in
+            guard case let .photoSelectionExceedsBudget(selected, maximum)? = error as? PipelineRunner.PipelineError else {
+                return XCTFail("Unexpected error: \(error)")
+            }
+            XCTAssertEqual(selected, 140)
+            XCTAssertEqual(maximum, 120)
+        }
+    }
+
+    func testUseAllValidPhotosPreservesPhotosAndFitsVideosIntoRemainingBudget() throws {
+        let root = try TestFileBuilder.makeTempDir()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let runner = try makeRunner(projectURL: root)
+        let videos = (0..<80).map { root.appendingPathComponent("video_\($0).jpg") }
+        let photos = (0..<80).map { root.appendingPathComponent("photo_\($0).jpg") }
+
+        let selected = try runner.test_applyFrameBudget(
+            to: [
+                .init(id: "video_000", frames: videos, isVideo: true),
+                .init(id: "photos", frames: photos, isVideo: false),
+            ],
+            targetCount: 120,
+            photoSelection: .useAllValidPhotos
+        )
+
+        XCTAssertEqual(selected.first(where: { !$0.isVideo })?.frames.count, 80)
+        XCTAssertEqual(selected.first(where: { $0.isVideo })?.frames.count, 40)
+        XCTAssertEqual(selected.reduce(0) { $0 + $1.frames.count }, 120)
     }
 
     private func writeImage(url: URL, size: Int, value: UInt8) throws {

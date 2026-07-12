@@ -11,8 +11,8 @@ extension PipelineRunner {
             progressName: "msplat",
             sparseEnsureMessage: "ensuring binary model files",
             requiredSparseFiles: ["cameras.bin", "images.bin", "points3D.bin"],
-            prepareSourceSparse: { _ = try ensureBinarySparseModelFiles(at: $0) },
-            ensureCopiedSparse: { try ensureBinarySparseModelFiles(at: $0) },
+            prepareSourceSparse: { _ = try regenerateBinarySparseModelFiles(at: $0) },
+            ensureCopiedSparse: { try requireBinarySparseModelFiles(at: $0); return false },
             finalizeCopiedSparse: { _ in },
             progress: progress
         )
@@ -28,6 +28,20 @@ extension PipelineRunner {
         }
         let sparseRoot = paths.colmapSparseURL.appendingPathComponent("0", isDirectory: true)
         let sparse = try resolveSparseModelDirectory(at: sparseRoot)
+        return try MsplatDatasetIdentity.compute(
+            imageFiles: imageFiles,
+            sparseDirectory: sparse
+        )
+    }
+
+    func msplatDatasetIdentity(at datasetURL: URL) throws -> MsplatDatasetIdentity {
+        let images = datasetURL.appendingPathComponent("images", isDirectory: true)
+        let sparse = datasetURL.appendingPathComponent("sparse/0", isDirectory: true)
+        let imageFiles = try FileManager.default.contentsOfDirectory(
+            at: images,
+            includingPropertiesForKeys: [.isRegularFileKey],
+            options: [.skipsHiddenFiles]
+        ).filter { supportedImageExtensions.contains($0.pathExtension.lowercased()) }
         return try MsplatDatasetIdentity.compute(
             imageFiles: imageFiles,
             sparseDirectory: sparse
@@ -105,31 +119,74 @@ extension PipelineRunner {
         return dataset
     }
 
-    @discardableResult
-    func ensureBinarySparseModelFiles(at url: URL) throws -> Bool {
+    func requireTextSparseModelFiles(at url: URL) throws {
         let fm = FileManager.default
-        let binFiles = ["cameras.bin", "images.bin", "points3D.bin"]
-        if binFiles.allSatisfy({ fm.fileExists(atPath: url.appendingPathComponent($0).path) }) {
-            return false
-        }
-
         let txtFiles = ["cameras.txt", "images.txt", "points3D.txt"]
         guard txtFiles.allSatisfy({ fm.fileExists(atPath: url.appendingPathComponent($0).path) }) else {
             throw PipelineError.outputMissing
         }
+    }
+
+    func requireBinarySparseModelFiles(at url: URL) throws {
+        let fm = FileManager.default
+        for name in ["cameras.bin", "images.bin", "points3D.bin"] {
+            let file = url.appendingPathComponent(name)
+            let values = try file.resourceValues(forKeys: [
+                .isRegularFileKey,
+                .isSymbolicLinkKey,
+                .fileSizeKey,
+            ])
+            guard fm.fileExists(atPath: file.path),
+                  values.isRegularFile == true,
+                  values.isSymbolicLink != true,
+                  (values.fileSize ?? 0) > 0 else {
+                throw PipelineError.outputMissing
+            }
+        }
+    }
+
+    /// The geometry manifest authenticates the canonical text model. Always derive the
+    /// trainer's binary model from that verified source so stale binaries from an older
+    /// training attempt can never bypass the geometry gate.
+    func regenerateBinarySparseModelFiles(at url: URL) throws -> Bool {
+        try requireTextSparseModelFiles(at: url)
+        let fm = FileManager.default
+        let binFiles = ["cameras.bin", "images.bin", "points3D.bin"]
+        let staging = url.deletingLastPathComponent().appendingPathComponent(
+            ".binary-model-\(UUID().uuidString)",
+            isDirectory: true
+        )
+        try fm.createDirectory(at: staging, withIntermediateDirectories: false)
+        defer { try? fm.removeItem(at: staging) }
 
         let converterOptions = colmapOptionsForMatching()
         try tooling.colmap.runModelConverter(
             colmapPath: config.toolchain.colmap,
             inputPath: url,
-            outputPath: url,
+            outputPath: staging,
             outputType: "BIN",
             environment: converterOptions.environment,
             onLog: { _, _ in }
         )
 
-        guard binFiles.allSatisfy({ fm.fileExists(atPath: url.appendingPathComponent($0).path) }) else {
-            throw PipelineError.outputMissing
+        for name in binFiles {
+            let source = staging.appendingPathComponent(name)
+            let values = try source.resourceValues(forKeys: [
+                .isRegularFileKey,
+                .isSymbolicLinkKey,
+                .fileSizeKey,
+            ])
+            guard values.isRegularFile == true,
+                  values.isSymbolicLink != true,
+                  (values.fileSize ?? 0) > 0 else {
+                throw PipelineError.outputMissing
+            }
+            let destination = url.appendingPathComponent(name)
+            if fm.fileExists(atPath: destination.path) {
+                _ = try fm.replaceItemAt(destination, withItemAt: source)
+            } else {
+                try fm.moveItem(at: source, to: destination)
+            }
         }
         return true
     }
@@ -138,33 +195,28 @@ extension PipelineRunner {
         config.toolchain.msplat
     }
 
-    func msplatBudget(for profile: DetailProfile) -> (iterationLimit: Int, plateauWindow: Int) {
-        switch profile {
-        case .fast: return (3_000, 400)
-        case .balanced: return (7_000, 800)
-        case .highDetail: return (15_000, 1_500)
-        }
-    }
-
     func msplatResumeURL(
         metadata: ProjectMetadata,
         paths: ProjectPaths,
         profile: DetailProfile,
-        seed: UInt64
+        seed: UInt64,
+        resolvedPlan: ResolvedRunPlan,
+        datasetIdentity: MsplatDatasetIdentity
     ) throws -> URL? {
         guard let artifact = metadata.trainingArtifact else { return nil }
         guard artifact.completionStatus == .checkpointed,
               artifact.detailProfile == profile,
+              artifact.iterationLimit == resolvedPlan.trainerIterationLimit,
+              artifact.plateauWindow == resolvedPlan.plateauWindow,
               artifact.deterministicSeed == seed,
               artifact.checkpointPath == "Training/checkpoints/msplat" else {
             throw MsplatCheckpointValidationError(
-                "saved training state does not match the requested profile or seed"
+                "saved training state does not match the resolved training plan"
             )
         }
         do {
-            let identity = try currentMsplatDatasetIdentity(paths: paths)
-            guard artifact.inputDigest == identity.inputDigest,
-                  artifact.geometryDigest == identity.geometryDigest else {
+            guard artifact.inputDigest == datasetIdentity.inputDigest,
+                  artifact.geometryDigest == datasetIdentity.geometryDigest else {
                 throw MsplatCheckpointValidationError(
                     "saved training state does not match the current input or geometry"
                 )
@@ -188,9 +240,16 @@ extension PipelineRunner {
         _ receipt: MsplatCheckpointReceipt,
         profile: DetailProfile,
         seed: UInt64,
+        resolvedPlan: ResolvedRunPlan,
+        datasetIdentity: MsplatDatasetIdentity,
         paths: ProjectPaths
     ) throws -> TrainingArtifact {
-        let budget = msplatBudget(for: profile)
+        guard receipt.inputDigest == datasetIdentity.inputDigest,
+              receipt.geometryDigest == datasetIdentity.geometryDigest else {
+            throw MsplatCheckpointValidationError(
+                "native checkpoint identity does not match the prepared dataset"
+            )
+        }
         let artifact = TrainingArtifact(
             trainerVersion: "1.1.3 (git 106499b)",
             runtimeVersion: "native-metal-cli-v1",
@@ -198,8 +257,8 @@ extension PipelineRunner {
             inputDigest: receipt.inputDigest,
             geometryDigest: receipt.geometryDigest,
             detailProfile: profile,
-            iterationLimit: budget.iterationLimit,
-            plateauWindow: budget.plateauWindow,
+            iterationLimit: resolvedPlan.trainerIterationLimit,
+            plateauWindow: resolvedPlan.plateauWindow,
             deterministicSeed: seed,
             completedIteration: receipt.iteration,
             checkpointPath: "Training/checkpoints/msplat",
@@ -220,6 +279,7 @@ extension PipelineRunner {
         _ result: MsplatTrainingResult,
         profile: DetailProfile,
         seed: UInt64,
+        resolvedPlan: ResolvedRunPlan,
         paths: ProjectPaths
     ) throws -> TrainingArtifact {
         let artifact = TrainingArtifact(

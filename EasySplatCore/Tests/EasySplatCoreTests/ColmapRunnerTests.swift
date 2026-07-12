@@ -4,6 +4,37 @@ import XCTest
 @testable import EasySplatCore
 
 final class ColmapRunnerTests: XCTestCase {
+    func testMapperReceivesBoundedGlobalBundleAdjustmentLimit() async throws {
+        let runner = MockSubprocessRunner(scripts: [
+            .init(
+                path: "/mock/colmap",
+                argsPrefix: ["mapper"],
+                result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""),
+                onRun: { args in
+                    XCTAssertEqual(
+                        self.value(for: "--Mapper.ba_global_max_num_iterations", in: args),
+                        "75"
+                    )
+                }
+            )
+        ])
+
+        try await ColmapRunner(runner: runner).runMapper(
+            colmapPath: URL(fileURLWithPath: "/mock/colmap"),
+            database: URL(fileURLWithPath: "/tmp/database.db"),
+            imagePath: URL(fileURLWithPath: "/tmp/images"),
+            outputPath: URL(fileURLWithPath: "/tmp/sparse"),
+            options: ColmapOptions(
+                useGPU: false,
+                extractThreads: 1,
+                matchThreads: 1,
+                sequentialOverlap: 10
+            ),
+            bundleAdjustmentIterationLimit: 75,
+            onLog: { _, _ in }
+        )
+    }
+
     func testFeatureExtractorPassesMaxNumFeatures() async throws {
         let runner = MockSubprocessRunner(scripts: [
             .init(

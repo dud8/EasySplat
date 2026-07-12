@@ -134,7 +134,7 @@ public final class FrameExtractor {
         writeQueue.maxConcurrentOperationCount = 4
         let errorState = WriteErrorState()
 
-        var bufferFrames: [Int: CGImage] = [:]
+        var bufferFrames: [Int: (image: CGImage, timestampSeconds: Double)] = [:]
         var bufferCandidates: [SmartFrameCandidate] = []
         var recentHashes: [UInt64] = []
         var lastSelectedIndex = -999
@@ -165,15 +165,19 @@ public final class FrameExtractor {
             )
             let remaining = options.maxExtractedFrames.map { max(0, $0 - savedCount) } ?? Int.max
             for index in result.selectedIndices.prefix(remaining) {
-                guard let image = bufferFrames[index] else { continue }
+                guard let frame = bufferFrames[index] else { continue }
                 let fileURL = outputDir.appendingPathComponent(
-                    String(format: "frame_%06d.%@", savedCount, options.outputFormat.fileExtension)
+                    Self.timestampedFilename(
+                        index: savedCount,
+                        seconds: frame.timestampSeconds,
+                        format: options.outputFormat
+                    )
                 )
                 outputURLs.append(fileURL)
                 let format = options.outputFormat
                 writeQueue.addOperation {
                     do {
-                        try Self.writeImage(cgImage: image, to: fileURL, format: format)
+                        try Self.writeImage(cgImage: frame.image, to: fileURL, format: format)
                     } catch {
                         errorState.record(error)
                     }
@@ -186,12 +190,16 @@ public final class FrameExtractor {
 
         while reader.status == .reading {
             guard let sampleBuffer = output.copyNextSampleBuffer() else { break }
+            let presentationSeconds = CMTimeGetSeconds(CMSampleBufferGetPresentationTimeStamp(sampleBuffer))
+            let timestampSeconds = presentationSeconds.isFinite
+                ? presentationSeconds
+                : Double(frameIndex) / videoFPS
             autoreleasepool {
                 if let imageBuffer = CMSampleBufferGetImageBuffer(sampleBuffer),
                    let cgImage = Self.makeCGImage(from: imageBuffer, context: context, maxDimension: options.maxDimension, transform: preferredTransform) {
                     let score = FrameScoring.scoreFrame(cgImage: cgImage)
                     let sharpness = max(score.blurScore, score.laplacianScore)
-                    bufferFrames[frameIndex] = cgImage
+                    bufferFrames[frameIndex] = (cgImage, timestampSeconds)
                     bufferCandidates.append(
                         SmartFrameCandidate(
                             index: frameIndex,
@@ -287,7 +295,7 @@ public final class FrameExtractor {
 
         for (slotIndex, slot) in slots.enumerated() {
             try Task.checkCancellation()
-            var slotCandidates: [(image: CGImage, candidate: SmartFrameCandidate)] = []
+            var slotCandidates: [(image: CGImage, candidate: SmartFrameCandidate, timestampSeconds: Double)] = []
             slotCandidates.reserveCapacity(slot.candidateTimes.count)
 
             for seconds in slot.candidateTimes {
@@ -305,7 +313,7 @@ public final class FrameExtractor {
                         clippedFraction: score.clippedFraction,
                         dHash: score.dHash
                     )
-                    slotCandidates.append((image: generated.image, candidate: candidate))
+                    slotCandidates.append((image: generated.image, candidate: candidate, timestampSeconds: frameSeconds))
                 } catch {
                     lastError = error
                 }
@@ -343,7 +351,11 @@ public final class FrameExtractor {
             SmartFrameSelection.appendHash(best.candidate.dHash, to: &recentHashes)
 
             let fileURL = outputDir.appendingPathComponent(
-                String(format: "frame_%06d.%@", outputURLs.count, options.outputFormat.fileExtension)
+                Self.timestampedFilename(
+                    index: outputURLs.count,
+                    seconds: best.timestampSeconds,
+                    format: options.outputFormat
+                )
             )
             try Self.writeImage(cgImage: best.image, to: fileURL, format: options.outputFormat)
             outputURLs.append(fileURL)
@@ -397,6 +409,29 @@ public final class FrameExtractor {
 
     private static func cappedMinimumFrameDistance(options: FrameExtractionOptions, videoFPS: Double) -> Int {
         max(0, Int((max(videoFPS, 1.0) * options.minDistanceRatio).rounded(.up)))
+    }
+
+    static func timestampedFilename(index: Int, seconds: Double, format: FrameOutputFormat) -> String {
+        let safeSeconds = seconds.isFinite ? max(0, seconds) : 0
+        let microseconds = Int64((safeSeconds * 1_000_000).rounded())
+        return String(
+            format: "frame_%06d_t%012lld.%@",
+            index,
+            microseconds,
+            format.fileExtension
+        )
+    }
+
+    static func timestampSeconds(from filename: String) -> Double? {
+        let stem = URL(fileURLWithPath: filename).deletingPathExtension().lastPathComponent
+        guard let marker = stem.range(of: "_t", options: .backwards) else { return nil }
+        let digits = stem[marker.upperBound...]
+        guard !digits.isEmpty,
+              digits.allSatisfy(\.isNumber),
+              let microseconds = Int64(digits) else {
+            return nil
+        }
+        return Double(microseconds) / 1_000_000
     }
 
     private static func shouldUseCappedRandomAccessExtraction(
@@ -511,6 +546,14 @@ extension FrameExtractor {
 
     static func test_cappedCandidateFrameIndices(for slot: CappedExtractionSlot, videoFPS: Double) -> [Int] {
         slot.candidateTimes.map { cappedCandidateFrameIndex(seconds: $0, videoFPS: videoFPS) }
+    }
+
+    static func test_timestampedFilename(index: Int, seconds: Double, format: FrameOutputFormat) -> String {
+        timestampedFilename(index: index, seconds: seconds, format: format)
+    }
+
+    static func test_timestampSeconds(from filename: String) -> Double? {
+        timestampSeconds(from: filename)
     }
 
 }

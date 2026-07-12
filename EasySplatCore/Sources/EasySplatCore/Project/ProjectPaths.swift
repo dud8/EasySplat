@@ -21,6 +21,7 @@ public struct ProjectPaths: Sendable {
     public var colmapSeedURL: URL { root.appendingPathComponent("SfM/colmap/seed", isDirectory: true) }
     public var colmapSeedModelURL: URL { colmapSeedURL.appendingPathComponent("0", isDirectory: true) }
     public var colmapSparseURL: URL { root.appendingPathComponent("SfM/colmap/sparse", isDirectory: true) }
+    public var geometryManifestURL: URL { root.appendingPathComponent("SfM/geometry_manifest.json") }
     public var trainingURL: URL { root.appendingPathComponent("Training", isDirectory: true) }
     public var trainingManifestURL: URL { trainingURL.appendingPathComponent("training_manifest.json") }
     public var msplatCheckpointURL: URL {

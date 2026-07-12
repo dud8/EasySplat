@@ -25,7 +25,7 @@ from .alignment import (
     validate_common_view_rotations as _validate_common_view_rotations,
 )
 
-SUPPORTED_CAMERA_TYPES = ("SIMPLE_RADIAL", "SIMPLE_PINHOLE", "PINHOLE", "OPENCV")
+SUPPORTED_CAMERA_TYPES = ("SIMPLE_RADIAL", "SIMPLE_PINHOLE", "PINHOLE", "OPENCV", "OPENCV_FISHEYE")
 IMAGE_EXTENSIONS = (".jpg", ".jpeg", ".png")
 OOM_MARKERS = ("out of memory", "mps backend out of memory", "allocation failed")
 
@@ -184,7 +184,7 @@ def _camera_params(
     elif camera_type == "SIMPLE_RADIAL":
         params = [(fx + fy) / 2.0, cx, cy, 0.0]
         focal_values = params[:1]
-    elif camera_type == "OPENCV":
+    elif camera_type in ("OPENCV", "OPENCV_FISHEYE"):
         params = [fx, fy, cx, cy, 0.0, 0.0, 0.0, 0.0]
         focal_values = params[:2]
     else:

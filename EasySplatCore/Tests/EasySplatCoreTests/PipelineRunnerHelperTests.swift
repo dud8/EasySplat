@@ -31,6 +31,21 @@ final class PipelineRunnerHelperTests: XCTestCase {
         )
     }
 
+    func testDa3AutomaticCaptureUsesNeutralDirectTrackThreshold() throws {
+        let root = try TestFileBuilder.makeTempDir()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let runner = makeRunner(projectURL: root)
+
+        XCTAssertEqual(
+            runner.test_da3DirectMinimumMeanTrackLengthPreference(capturePath: .automatic),
+            1.20
+        )
+        XCTAssertEqual(
+            runner.test_da3DirectMinimumMeanTrackLengthPreference(capturePath: .orbit),
+            1.15
+        )
+    }
+
     func testDownsampleFramesEdgeCases() throws {
         let root = try TestFileBuilder.makeTempDir()
         defer { try? FileManager.default.removeItem(at: root) }
@@ -179,6 +194,25 @@ final class PipelineRunnerHelperTests: XCTestCase {
         XCTAssertEqual(updated.first?.outputFileName, "frame_000000.jpg")
     }
 
+    func testCopySelectedCarriesVideoTimestampIntoManifest() throws {
+        let root = try TestFileBuilder.makeTempDir()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let source = root.appendingPathComponent("frame_000007_t000012345678.jpg")
+        XCTAssertTrue(try TestFileBuilder.writeGrayscaleImage(url: source, size: 16, value: 10, utType: .jpeg))
+        let selected = root.appendingPathComponent("selected", isDirectory: true)
+        try FileManager.default.createDirectory(at: selected, withIntermediateDirectories: true)
+        let manifestURL = root.appendingPathComponent("selected_frames.json")
+        let runner = makeRunner(projectURL: root)
+
+        let manifest = try runner.test_copySelected(
+            groups: [.init(id: "video_000", frames: [source], isVideo: true)],
+            to: selected,
+            manifestURL: manifestURL
+        )
+
+        XCTAssertEqual(manifest.first?.timestampSeconds ?? -1, 12.345678, accuracy: 0.000001)
+    }
+
     func testNormalizeSelectedImagesForToolingHeic() throws {
         let root = try TestFileBuilder.makeTempDir()
         defer { try? FileManager.default.removeItem(at: root) }
@@ -241,13 +275,13 @@ final class PipelineRunnerHelperTests: XCTestCase {
         XCTAssertEqual(runner.test_sfmBackendPolicy(), .da3)
     }
 
-    func testConfiguredFastSpeedProfileDefaultsToColmap() async throws {
+    func testLegacyFastSpeedProfileDoesNotBypassLearnedGeometryDefault() async throws {
         let root = try TestFileBuilder.makeTempDir()
         defer { try? FileManager.default.removeItem(at: root) }
         let runner = makeRunner(projectURL: root, speedProfile: .fast)
 
-        XCTAssertEqual(runner.test_sfmBackendPolicy(), .colmap)
-        XCTAssertEqual(runner.test_sfmBackendFallbackOrder(), [.colmap])
+        XCTAssertEqual(runner.test_sfmBackendPolicy(), .da3)
+        XCTAssertEqual(runner.test_sfmBackendFallbackOrder(), [.da3, .colmap])
     }
 
     func testDa3DirectMinimumTrackLengthPreference() async throws {
@@ -255,8 +289,8 @@ final class PipelineRunnerHelperTests: XCTestCase {
         defer { try? FileManager.default.removeItem(at: root) }
         let runner = makeRunner(projectURL: root)
 
-        XCTAssertEqual(runner.test_da3DirectMinimumMeanTrackLengthPreference(mode: .object), 1.15, accuracy: 0.001)
-        XCTAssertEqual(runner.test_da3DirectMinimumMeanTrackLengthPreference(mode: .room), 1.20, accuracy: 0.001)
+        XCTAssertEqual(runner.test_da3DirectMinimumMeanTrackLengthPreference(capturePath: .orbit), 1.15, accuracy: 0.001)
+        XCTAssertEqual(runner.test_da3DirectMinimumMeanTrackLengthPreference(capturePath: .walkthrough), 1.20, accuracy: 0.001)
     }
 
     func testResetPerRunToolLogsRemovesDa3Log() throws {

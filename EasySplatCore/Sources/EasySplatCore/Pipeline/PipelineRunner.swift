@@ -34,17 +34,20 @@ public final class PipelineRunner: @unchecked Sendable {
         public var preset: PresetSpec
         public var speedProfile: SpeedProfile
         public var developmentOverrides: DevelopmentOverrides
+        public var resolvedRunPlan: ResolvedRunPlan?
 
         public init(
             toolchain: ToolchainPaths,
             preset: PresetSpec,
             speedProfile: SpeedProfile = .standard,
-            developmentOverrides: DevelopmentOverrides = .none
+            developmentOverrides: DevelopmentOverrides = .none,
+            resolvedRunPlan: ResolvedRunPlan? = nil
         ) {
             self.toolchain = toolchain
             self.preset = preset
             self.speedProfile = speedProfile
             self.developmentOverrides = developmentOverrides
+            self.resolvedRunPlan = resolvedRunPlan
         }
     }
 
@@ -89,6 +92,24 @@ public final class PipelineRunner: @unchecked Sendable {
         // tool logs for inspection — wiping them on a no-op startup
         // failure would destroy the only evidence of why the prior attempt died.
         var metadata = try ProjectMetadataStore.load(from: paths.metadataURL)
+        let detectedHardwareProfile = HardwareProfile.detect()
+        let requestedOptions = metadata.requestedRunOptions ?? RequestedRunOptions(
+            capturePath: metadata.preset.mode == .object ? .orbit : .walkthrough,
+            detailProfile: metadata.effectiveDetailProfile
+        )
+        try RunPlanResolver.validate(requestedOptions: requestedOptions, input: metadata.input)
+        let resolvedRunPlan = config.resolvedRunPlan
+            ?? metadata.resolvedRunPlan
+            ?? RunPlanResolver.resolve(
+                requestedOptions: requestedOptions,
+                input: metadata.input,
+                hardware: detectedHardwareProfile,
+                developmentOverrides: config.developmentOverrides
+            )
+        if metadata.resolvedRunPlan != resolvedRunPlan {
+            metadata.resolvedRunPlan = resolvedRunPlan
+            try ProjectMetadataStore.savePreservingUserEditableFields(metadata, to: paths.metadataURL)
+        }
         var trainingManifestWarning: String?
         do {
             _ = try TrainingArtifactStore.reconcile(metadata: &metadata, paths: paths)
@@ -304,7 +325,10 @@ public final class PipelineRunner: @unchecked Sendable {
                 try stopIfRequested(after: .importInput)
             }
 
-            let frameProfile = frameExtractionProfile(for: metadata.preset.quality)
+            let frameProfile = frameExtractionProfile(
+                for: resolvedRunPlan,
+                detail: requestedOptions.detailProfile
+            )
             let targetFrames = frameProfile.targetCount
             let maxDim = frameProfile.maxDimension
             var colmapMaxImageSize = Int(maxDim)
@@ -442,18 +466,30 @@ public final class PipelineRunner: @unchecked Sendable {
 
                     if let photosFolder = metadata.input.photosFolder {
                         let sourceFolder = paths.originalsURL.appendingPathComponent(URL(fileURLWithPath: photosFolder).lastPathComponent, isDirectory: true)
-                        let photos = try loadPhotos(in: sourceFolder)
-                        if !photos.isEmpty {
-                            groups.append(.init(id: "photos", frames: photos, isVideo: false))
+                        let discoveredPhotos = try loadPhotos(in: sourceFolder)
+                        let photoFilter = filterValidUniquePhotos(discoveredPhotos)
+                        if !photoFilter.frames.isEmpty {
+                            groups.append(.init(id: "photos", frames: photoFilter.frames, isVideo: false))
                             emit(.stageLog(
                                 stage: .selectFrames,
-                                line: "Using \(photos.count) photos from \(sourceFolder.lastPathComponent).",
+                                line: "Using \(photoFilter.frames.count) valid, unique photos from \(sourceFolder.lastPathComponent).",
+                                isError: false
+                            ))
+                        }
+                        if photoFilter.unreadableCount > 0 || photoFilter.duplicateCount > 0 {
+                            emit(.stageLog(
+                                stage: .selectFrames,
+                                line: "Skipped \(photoFilter.unreadableCount) unreadable and \(photoFilter.duplicateCount) duplicate photo(s).",
                                 isError: false
                             ))
                         }
                     }
 
-                    let budgetedGroups = applyFrameBudget(to: groups, targetCount: targetFrames)
+                    let budgetedGroups = try applyFrameBudget(
+                        to: groups,
+                        targetCount: targetFrames,
+                        photoSelection: resolvedRunPlan.photoSelection
+                    )
                     let selectedCountBeforeBudget = groups.reduce(0) { $0 + $1.frames.count }
                     let selectedCountAfterBudget = budgetedGroups.reduce(0) { $0 + $1.frames.count }
                     if selectedCountAfterBudget < selectedCountBeforeBudget {
@@ -512,7 +548,6 @@ public final class PipelineRunner: @unchecked Sendable {
                 throw PipelineError.insufficientInputImages(selectedFrames.count)
             }
 
-            let detectedHardwareProfile = HardwareProfile.detect()
             if shouldAutoTune() {
                 let tune = AutoTuner.make(
                     profile: detectedHardwareProfile,
@@ -527,22 +562,14 @@ public final class PipelineRunner: @unchecked Sendable {
                 )
                 emit(.stageLog(stage: .sfmFeatures, line: tune.summary(profile: detectedHardwareProfile), isError: false))
             }
-            if applySpeedProfileIfNeeded(
-                colmapMaxImageSize: &colmapMaxImageSize,
-                colmapExtractOptions: &colmapExtractOptions,
-                colmapMatchOptions: &colmapMatchOptions
-            ) {
-                emit(.stageLog(
-                    stage: .sfmFeatures,
-                    line: "Fast plan: frame budget=\(fastSpeedProfileFrameBudget()), extraction cap=\(fastSpeedProfileFrameExtractionCap(targetCount: fastSpeedProfileFrameBudget())), COLMAP max image size <=512px, features<=4000, sequential overlap<=2.",
-                    isError: false
-                ))
+            if resolvedRunPlan.sequentialOverlap > 0 {
+                colmapExtractOptions.sequentialOverlap = resolvedRunPlan.sequentialOverlap
+                colmapMatchOptions.sequentialOverlap = resolvedRunPlan.sequentialOverlap
             }
 
             try Task.checkCancellation()
-            let backendOverride = sfmBackendOverride()
-            let da3WindowSize = da3WindowSizePreference(hardwareTier: detectedHardwareProfile.tier)
-            let backendOrder = sfmBackendFallbackOrder(override: backendOverride)
+            let da3WindowSize = resolvedRunPlan.chunkSize
+            let backendOrder = try sfmBackendFallbackOrder(resolvedPlan: resolvedRunPlan)
 
             let backendName: (SfmBackend) -> String = { backend in
                 switch backend {
@@ -559,6 +586,7 @@ public final class PipelineRunner: @unchecked Sendable {
                 // partial failure from the previous backend cannot leak its score/summary
                 // into a later backend's successful run.
                 acceptedReconstructionSummary = nil
+                var completedMappingThisAttempt = false
                 do {
                     if backendPolicy == .da3 {
                         let fm = FileManager.default
@@ -566,11 +594,7 @@ public final class PipelineRunner: @unchecked Sendable {
                         let sparseZero = paths.colmapSparseURL.appendingPathComponent("0", isDirectory: true)
                         let da3CoverageManifest = paths.da3CoverageManifestURL
                         let da3Mode: Da3RunMode = selectedFrames.count <= max(4, da3WindowSize) ? .direct : .seedRefine
-                        let requestedOrdering = metadata.requestedRunOptions?.inputOrdering ?? .automatic
-                        let da3InputOrdering = da3ResolvedInputOrdering(
-                            requested: requestedOrdering,
-                            input: metadata.input
-                        )
+                        let da3InputOrdering = resolvedRunPlan.inputOrdering
                         let da3RefinementOptions = tuneSeededRefinementColmapOptions(
                             frameCount: selectedFrames.count,
                             extractOptions: colmapExtractOptions,
@@ -581,17 +605,19 @@ public final class PipelineRunner: @unchecked Sendable {
                         let da3Config = Da3SfmConfig(
                             device: da3DevicePreference(),
                             mode: da3Mode,
-                            modelSubdirectory: da3ModelPreference(),
-                            fallbackModelSubdirectory: da3FallbackModelPreference(),
+                            modelSubdirectory: resolvedRunPlan.modelIdentifier,
+                            fallbackModelSubdirectory: resolvedRunPlan.modelIdentifier == "DA3-BASE"
+                                ? da3FallbackModelPreference()
+                                : resolvedRunPlan.modelIdentifier,
                             processResolution: da3ProcessResolutionPreference(),
                             maxPoints: da3MaxPointsPreference(preset: metadata.preset),
                             cameraType: da3CameraTypePreference(
                                 preset: metadata.preset,
-                                lensProjection: metadata.requestedRunOptions?.lensProjection ?? .automatic
+                                lensProjection: resolvedRunPlan.lensProjection
                             ),
                             sharedCamera: da3SharedCameraPreference(
                                 input: metadata.input,
-                                cameraGrouping: metadata.requestedRunOptions?.cameraGrouping ?? .automatic
+                                cameraGrouping: resolvedRunPlan.cameraGrouping
                             ),
                             inputOrdering: da3InputOrdering,
                             windowSize: max(4, da3WindowSize),
@@ -773,7 +799,10 @@ public final class PipelineRunner: @unchecked Sendable {
                                     rawScore,
                                     coverageManifest: coverageManifest
                                 )
-                                if let rejection = da3DirectQualityFailureReason(score: score, mode: metadata.preset.mode) {
+                                if let rejection = da3DirectQualityFailureReason(
+                                    score: score,
+                                    capturePath: resolvedRunPlan.capturePath
+                                ) {
                                     emit(.stageLog(
                                         stage: .sfmFeatures,
                                         line: "DA3 direct solve was below the quality bar (\(rejection)); trying the next SfM backend.",
@@ -909,6 +938,7 @@ public final class PipelineRunner: @unchecked Sendable {
                         }
 
                         if try shouldRunStage(.sfmMapping) {
+                            completedMappingThisAttempt = true
                             currentStage = .sfmMapping
                             emit(.stageStarted(stage: .sfmMapping))
                             if da3Mode == .direct {
@@ -1002,7 +1032,9 @@ public final class PipelineRunner: @unchecked Sendable {
                                     inputPath: sparseZero,
                                     outputPath: baOutput,
                                     options: da3ColmapMatchOptions,
-                                    bundleOptions: ColmapBundleAdjustmentOptions(),
+                                    bundleOptions: ColmapBundleAdjustmentOptions(
+                                        maxNumIterations: resolvedRunPlan.refinementIterationLimit
+                                    ),
                                     onLog: { line, isErr in
                                         colmapToolLog.append(stream: isErr ? "stderr" : "stdout", line: line)
                                     }
@@ -1018,7 +1050,10 @@ public final class PipelineRunner: @unchecked Sendable {
                                     mapper: "da3-refined",
                                     toolLog: colmapToolLog
                                 )
-                                guard ReconstructionScorer.isAcceptable(score, mode: metadata.preset.mode),
+                                guard ReconstructionScorer.isAcceptable(
+                                    score,
+                                    capturePath: resolvedRunPlan.capturePath
+                                ),
                                       let residual = score.meanReprojectionError,
                                       residual.isFinite else {
                                     throw PipelineError.lowQualityReconstruction(score, mapper: "da3-refined")
@@ -1044,9 +1079,6 @@ public final class PipelineRunner: @unchecked Sendable {
                                     isError: false
                                 ))
                             }
-                            emit(.stageFinished(stage: .sfmMapping))
-                            markStageComplete(.sfmMapping)
-                            try stopIfRequested(after: .sfmMapping)
                         }
                     } else {
             let runFeatures: (Bool) async throws -> Void = { force in
@@ -1105,7 +1137,11 @@ public final class PipelineRunner: @unchecked Sendable {
                     maxImageSize: colmapMaxImageSize,
                     cameraModel: self.cameraModel(
                         for: metadata.preset,
-                        lensProjection: metadata.requestedRunOptions?.lensProjection ?? .automatic
+                        lensProjection: resolvedRunPlan.lensProjection
+                    ),
+                    singleCamera: self.da3SharedCameraPreference(
+                        input: metadata.input,
+                        cameraGrouping: resolvedRunPlan.cameraGrouping
                     ),
                     options: colmapExtractOptions,
                     onLog: onFeaturesLog
@@ -1158,7 +1194,8 @@ public final class PipelineRunner: @unchecked Sendable {
                 let useSequential = self.shouldUseSequential(
                     selectedFrames: selectedFrames,
                     input: metadata.input,
-                    forceExhaustive: forceExhaustiveMatching
+                    forceExhaustive: forceExhaustiveMatching,
+                    pairingPolicy: resolvedRunPlan.pairingPolicy
                 )
 
                 let exhaustiveFallbackMaxFrames = 60
@@ -1271,7 +1308,11 @@ public final class PipelineRunner: @unchecked Sendable {
                                     maxImageSize: colmapMaxImageSize,
                                     cameraModel: self.cameraModel(
                                         for: metadata.preset,
-                                        lensProjection: metadata.requestedRunOptions?.lensProjection ?? .automatic
+                                        lensProjection: resolvedRunPlan.lensProjection
+                                    ),
+                                    singleCamera: self.da3SharedCameraPreference(
+                                        input: metadata.input,
+                                        cameraGrouping: resolvedRunPlan.cameraGrouping
                                     ),
                                     options: colmapExtractOptions,
                                     onLog: { line, isErr in
@@ -1403,6 +1444,7 @@ public final class PipelineRunner: @unchecked Sendable {
 
                 try Task.checkCancellation()
                 if try shouldRunStage(.sfmMapping) {
+                    completedMappingThisAttempt = true
                     currentStage = .sfmMapping
                     emit(.stageStarted(stage: .sfmMapping))
                     writeCheckpoint(
@@ -1488,7 +1530,10 @@ public final class PipelineRunner: @unchecked Sendable {
                             line: "Reconstruction score (\(candidate)): \(ReconstructionScorer.summary(score, mapper: candidate)).",
                             isError: false
                         ))
-                        if ReconstructionScorer.isAcceptable(score, mode: metadata.preset.mode) {
+                        if ReconstructionScorer.isAcceptable(
+                            score,
+                            capturePath: resolvedRunPlan.capturePath
+                        ) {
                             acceptedMappingStrategy = candidate
                             self.warnIfWeakAcceptedSolve(score: score, mapper: candidate, emit: emit)
                             acceptedReconstructionSummary = ReconstructionSummary(
@@ -1514,10 +1559,11 @@ public final class PipelineRunner: @unchecked Sendable {
 
                     if !disableGlobalMapperForThisRun {
                         let threadHint = max(colmapExtractOptions.extractThreads, colmapMatchOptions.matchThreads)
-                        let baseGlobalMapperOptions = self.globalMapperOptions(
+                        var baseGlobalMapperOptions = self.globalMapperOptions(
                             threadHint: threadHint,
                             defaultUseGpu: colmapExtractOptions.useGPU || colmapMatchOptions.useGPU
                         )
+                        baseGlobalMapperOptions.baNumIterations = resolvedRunPlan.refinementIterationLimit
                         let gpuRequested = baseGlobalMapperOptions.useGpuForGlobalPositioning || baseGlobalMapperOptions.useGpuForBundleAdjustment
                         do {
                             try self.resetDirectory(paths.colmapSparseURL)
@@ -1606,6 +1652,7 @@ public final class PipelineRunner: @unchecked Sendable {
                                 imagePath: paths.framesSelectedURL,
                                 outputPath: paths.colmapSparseURL,
                                 options: colmapMatchOptions,
+                                bundleAdjustmentIterationLimit: resolvedRunPlan.refinementIterationLimit,
                                 onLog: { line, isErr in
                                     colmapToolLog.append(stream: isErr ? "stderr" : "stdout", line: line)
                                     onMappingLog(line, isErr)
@@ -1714,13 +1761,49 @@ public final class PipelineRunner: @unchecked Sendable {
                                 registeredImages: nil
                             ))
                         )
-                        emit(.stageFinished(stage: .sfmMapping))
-                        markStageComplete(.sfmMapping)
-                        try stopIfRequested(after: .sfmMapping)
                 }
 
-                break
+                    break
+                }
             }
+
+            try Task.checkCancellation()
+            // Geometry reconciliation is part of the durable mapping boundary even
+            // when resume validation skipped the mapper subprocess itself.
+            currentStage = .sfmMapping
+            if let summary = acceptedReconstructionSummary, metadata.reconstruction != summary {
+                metadata.reconstruction = summary
+            }
+            if acceptedReconstructionSummary != nil
+                || metadata.geometryArtifact == nil
+                || !FileManager.default.fileExists(atPath: paths.geometryManifestURL.path) {
+                let mapper = (acceptedReconstructionSummary ?? metadata.reconstruction)?.mapper
+                    ?? metadata.completedSfmMapping?.mapper
+                    ?? "legacy-canonical"
+                let currentSelectedFrameManifest = (try? loadSelectedFrameManifest(
+                    from: paths.framesSelectedManifestURL
+                )) ?? selectedFrameManifest
+                try persistMeasuredGeometryArtifact(
+                    metadata: &metadata,
+                    paths: paths,
+                    resolvedPlan: resolvedRunPlan,
+                    mapper: mapper,
+                    selectedFrames: selectedFrames,
+                    selectedFrameManifest: currentSelectedFrameManifest
+                )
+            } else {
+                let artifact = try GeometryArtifactStore.load(
+                    from: paths.geometryManifestURL,
+                    projectPaths: paths
+                )
+                if metadata.geometryArtifact != artifact {
+                    metadata.geometryArtifact = artifact
+                    try ProjectMetadataStore.savePreservingUserEditableFields(metadata, to: paths.metadataURL)
+                }
+            }
+            if completedMappingThisAttempt {
+                emit(.stageFinished(stage: .sfmMapping))
+                markStageComplete(.sfmMapping)
             }
             } catch {
                 if error is DevelopmentStop {
@@ -1749,11 +1832,7 @@ public final class PipelineRunner: @unchecked Sendable {
             break
         }
 
-            try Task.checkCancellation()
-            if let summary = acceptedReconstructionSummary, metadata.reconstruction != summary {
-                metadata.reconstruction = summary
-                try? ProjectMetadataStore.savePreservingUserEditableFields(metadata, to: paths.metadataURL)
-            }
+            try stopIfRequested(after: .sfmMapping)
             if skipTraining {
                 emit(.stageLog(
                     stage: .sfmMapping,
@@ -1768,7 +1847,10 @@ public final class PipelineRunner: @unchecked Sendable {
                 currentStage = .trainSplat
                 emit(.stageStarted(stage: .trainSplat))
                 let detailProfile = metadata.effectiveDetailProfile
-                let trainingBudget = msplatBudget(for: detailProfile)
+                let trainingBudget = (
+                    iterationLimit: resolvedRunPlan.trainerIterationLimit,
+                    plateauWindow: resolvedRunPlan.plateauWindow
+                )
                 writeCheckpoint(
                     stage: .trainSplat,
                     progress: 0,
@@ -1781,6 +1863,7 @@ public final class PipelineRunner: @unchecked Sendable {
                     let datasetURL = try prepareMsplatDataset(paths: paths, progress: { _, message in
                         emit(.stageProgress(stage: .trainSplat, fraction: -1.0, message: message))
                     })
+                    let datasetIdentity = try msplatDatasetIdentity(at: datasetURL)
                     let outputURL = paths.msplatOutputURL
                     emit(.stageProgress(stage: .trainSplat, fraction: -1.0, message: "Training model with msplat"))
 
@@ -1794,14 +1877,16 @@ public final class PipelineRunner: @unchecked Sendable {
                             "tool": msplatPath.path
                         ]
                     )
-                    let seed = UInt64(max(0, config.developmentOverrides.benchmarkSeed ?? 42))
+                    let seed = resolvedRunPlan.deterministicSeed
                     let resumeURL: URL?
                     do {
                         resumeURL = try msplatResumeURL(
                             metadata: metadata,
                             paths: paths,
                             profile: detailProfile,
-                            seed: seed
+                            seed: seed,
+                            resolvedPlan: resolvedRunPlan,
+                            datasetIdentity: datasetIdentity
                         )
                     } catch let validationError as MsplatCheckpointValidationError {
                         emit(.stageLog(
@@ -1829,6 +1914,8 @@ public final class PipelineRunner: @unchecked Sendable {
                                 resumeFrom: activeResumeURL,
                                 profile: detailProfile,
                                 seed: seed,
+                                iterationLimit: resolvedRunPlan.trainerIterationLimit,
+                                plateauWindow: resolvedRunPlan.plateauWindow,
                                 onProgress: { progress in
                                     let fraction = Double(progress.iteration) / Double(progress.iterationLimit)
                                     emit(.stageProgress(
@@ -1843,6 +1930,8 @@ public final class PipelineRunner: @unchecked Sendable {
                                             receipt,
                                             profile: detailProfile,
                                             seed: seed,
+                                            resolvedPlan: resolvedRunPlan,
+                                            datasetIdentity: datasetIdentity,
                                             paths: paths
                                         )
                                     } catch {
@@ -1887,6 +1976,8 @@ public final class PipelineRunner: @unchecked Sendable {
                                 interruption.checkpoint,
                                 profile: detailProfile,
                                 seed: seed,
+                                resolvedPlan: resolvedRunPlan,
+                                datasetIdentity: datasetIdentity,
                                 paths: paths
                             )
                             metadata = try ProjectMetadataStore.load(from: paths.metadataURL)
@@ -1903,6 +1994,7 @@ public final class PipelineRunner: @unchecked Sendable {
                         trainingResult,
                         profile: detailProfile,
                         seed: seed,
+                        resolvedPlan: resolvedRunPlan,
                         paths: paths
                     )
                     metadata = try ProjectMetadataStore.load(from: paths.metadataURL)

@@ -296,14 +296,21 @@ public final class ColmapRunner {
         imagePath: URL,
         outputPath: URL,
         options: ColmapOptions,
+        bundleAdjustmentIterationLimit: Int? = nil,
         onLog: @escaping @Sendable (String, Bool) -> Void
     ) async throws {
-        let args = [
+        var args = [
             "mapper",
             "--database_path", database.path,
             "--image_path", imagePath.path,
             "--output_path", outputPath.path
         ]
+        if let bundleAdjustmentIterationLimit {
+            args.append(contentsOf: [
+                "--Mapper.ba_global_max_num_iterations",
+                "\(max(1, bundleAdjustmentIterationLimit))",
+            ])
+        }
         onLog("EasySplat: colmap argv: \(colmapPath.path) \(args.joined(separator: " "))", false)
         let result = try await runner.runAsync(
             colmapPath.path,

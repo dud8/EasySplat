@@ -75,6 +75,22 @@ final class ReconstructionScorerTests: XCTestCase {
         XCTAssertFalse(ReconstructionScorer.isAcceptable(low, mode: .object))
     }
 
+    func testCapturePathThresholdsDoNotTreatAutomaticAsAnObjectOrbit() {
+        let score = ReconstructionScore(
+            registeredImages: 60,
+            totalImages: 100,
+            meanReprojectionError: 1.0,
+            pointCount: 10_000,
+            observationCount: 30_000,
+            meanTrackLength: 3.0
+        )
+
+        XCTAssertTrue(ReconstructionScorer.isAcceptable(score, capturePath: .automatic))
+        XCTAssertTrue(ReconstructionScorer.isAcceptable(score, capturePath: .walkthrough))
+        XCTAssertTrue(ReconstructionScorer.isAcceptable(score, capturePath: .largeArea))
+        XCTAssertFalse(ReconstructionScorer.isAcceptable(score, capturePath: .orbit))
+    }
+
     func testAcceptableRejectsTracklessSparseModel() {
         let score = ReconstructionScore(
             registeredImages: 70,

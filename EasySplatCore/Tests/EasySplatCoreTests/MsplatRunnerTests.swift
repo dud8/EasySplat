@@ -90,6 +90,43 @@ final class MsplatRunnerTests: XCTestCase {
         }
     }
 
+    func testRunTrainValidatesEventsAgainstResolvedBudget() async throws {
+        let context = try makeContext()
+        defer { context.cleanup() }
+        let mock = MockSubprocessRunner(scripts: [
+            .init(
+                path: context.executable.path,
+                argsPrefix: ["--dataset", context.dataset.path],
+                result: .init(
+                    exitCode: 0,
+                    terminationReason: .exit,
+                    stdout: validEvents(
+                        profile: "balanced",
+                        limit: 123,
+                        plateau: 50,
+                        seed: 7
+                    ),
+                    stderr: ""
+                ),
+                onRun: { _ in TestFileBuilder.createFile(at: context.output, data: fixtureOutputData) }
+            )
+        ])
+
+        let result = try await MsplatRunner(runner: mock).runTrain(
+            msplatPath: context.executable,
+            datasetPath: context.dataset,
+            outputPath: context.output,
+            profile: .balanced,
+            seed: 7,
+            iterationLimit: 123,
+            plateauWindow: 50,
+            onLog: { _, _ in }
+        )
+
+        XCTAssertEqual(result.iterationLimit, 123)
+        XCTAssertEqual(result.plateauWindow, 50)
+    }
+
     func testRunTrainIgnoresRemovedEnvironmentOverrides() async throws {
         let context = try makeContext()
         defer { context.cleanup() }

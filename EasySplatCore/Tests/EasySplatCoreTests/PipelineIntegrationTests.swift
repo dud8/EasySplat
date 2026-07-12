@@ -139,6 +139,14 @@ final class PipelineIntegrationTests: XCTestCase {
         } else {
             XCTAssertEqual(reconstruction.meanReprojectionError, 1.0)
         }
+        let geometry = try GeometryArtifactStore.load(
+            from: paths.geometryManifestURL,
+            projectPaths: paths
+        )
+        XCTAssertEqual(geometry.residualProvenance, "colmap-text-tracks-v1")
+        XCTAssertEqual(geometry.medianPixelResidual, 0, accuracy: 0.000_001)
+        XCTAssertEqual(geometry.p90PixelResidual, 0, accuracy: 0.000_001)
+        XCTAssertEqual(finalMetadata.geometryArtifact, geometry)
     }
 
     func testPipelineFailureClearsRunStartMarker() async throws {
@@ -354,9 +362,14 @@ final class PipelineIntegrationTests: XCTestCase {
         let output = projectURL.appendingPathComponent("Output/splat.ply")
         XCTAssertTrue(FileManager.default.fileExists(atPath: output.path))
         let completedMetadata = try ProjectMetadataStore.load(from: paths.metadataURL)
-        XCTAssertEqual(completedMetadata.trainingArtifact?.completionStatus, .completed)
-        XCTAssertEqual(completedMetadata.trainingArtifact?.trainerBuildDigest, trainerDigest)
-        XCTAssertEqual(completedMetadata.trainingArtifact?.outputPath, "Training/msplat/splat.ply")
+        let plan = try XCTUnwrap(completedMetadata.resolvedRunPlan)
+        let trainingArtifact = try XCTUnwrap(completedMetadata.trainingArtifact)
+        XCTAssertEqual(trainingArtifact.completionStatus, .completed)
+        XCTAssertEqual(trainingArtifact.trainerBuildDigest, trainerDigest)
+        XCTAssertEqual(trainingArtifact.outputPath, "Training/msplat/splat.ply")
+        XCTAssertEqual(trainingArtifact.iterationLimit, plan.trainerIterationLimit)
+        XCTAssertEqual(trainingArtifact.plateauWindow, plan.plateauWindow)
+        XCTAssertEqual(trainingArtifact.deterministicSeed, plan.deterministicSeed)
         XCTAssertFalse(FileManager.default.fileExists(atPath: paths.msplatCheckpointURL.path))
         XCTAssertEqual(
             try TrainingArtifactStore.load(
@@ -422,9 +435,9 @@ final class PipelineIntegrationTests: XCTestCase {
         )
         try """
         1 1 0 0 0 0 0 0 1 frame_000000.jpg
-        0 0 1
+        320 240 1
         2 1 0 0 0 0 0 0 1 frame_000001.jpg
-        0 0 1
+        320 240 1
         """.write(
             to: sparse.appendingPathComponent("images.txt"),
             atomically: true,
@@ -602,9 +615,9 @@ final class PipelineIntegrationTests: XCTestCase {
         )
         try """
         1 1 0 0 0 0 0 0 1 frame_000000.jpg
-        0 0 1
+        320 240 1
         2 1 0 0 0 0 0 0 1 frame_000001.jpg
-        0 0 1
+        320 240 1
         """.write(
             to: sparse.appendingPathComponent("images.txt"),
             atomically: true,
@@ -836,6 +849,97 @@ final class PipelineIntegrationTests: XCTestCase {
         XCTAssertFalse(runner.calls.contains(where: { $0.0 == toolchain.colmap.path && $0.1.first == "global_mapper" }))
     }
 
+    func testMeasuredDa3ResidualFailureFallsBackToClassicalSolve() async throws {
+        let temp = makeTempRoot()
+        let projectURL = temp.appendingPathComponent("ResidualFallback.easysplatproj", isDirectory: true)
+        let sourcePhotos = temp.appendingPathComponent("SourcePhotos", isDirectory: true)
+        try FileManager.default.createDirectory(at: sourcePhotos, withIntermediateDirectories: true)
+        for index in 0..<2 {
+            try writeTestImage(
+                url: sourcePhotos.appendingPathComponent("img\(index).jpg"),
+                value: UInt8(index)
+            )
+        }
+
+        let metadata = ProjectMetadata(
+            title: "Residual fallback",
+            input: .photos(folder: sourcePhotos.path),
+            preset: PresetSpec(mode: .object, quality: .draft)
+        )
+        let paths = ProjectPaths(root: projectURL)
+        try paths.ensureDirectories()
+        try ProjectMetadataStore.save(metadata, to: paths.metadataURL)
+        let toolchain = try makeToolchain(root: temp, createDa3Files: true)
+        let acceptedReport = "Registered images: 2 / 2\nPoints: 16000\nObservations: 32000\nMean track length: 2.0\nMean reprojection error: 0.8\n"
+        let runner = MockSubprocessRunner(scripts: [
+            .init(
+                path: toolchain.da3.sfmTool.path,
+                argsPrefix: ["--images"],
+                result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""),
+                onRun: { args in
+                    do {
+                        try self.writeDa3RunArtifacts(for: args)
+                        guard let output = self.value(for: "--out-sparse", in: args) else { return }
+                        let imagesURL = URL(fileURLWithPath: output).appendingPathComponent("images.txt")
+                        let text = try String(contentsOf: imagesURL, encoding: .utf8)
+                            .replacingOccurrences(of: "320 240 ", with: "400 240 ")
+                        try text.write(to: imagesURL, atomically: true, encoding: .utf8)
+                    } catch {
+                        XCTFail("Failed to prepare high-residual DA3 output: \(error)")
+                    }
+                }
+            ),
+            .init(
+                path: toolchain.colmap.path,
+                argsPrefix: ["model_analyzer"],
+                result: .init(exitCode: 0, terminationReason: .exit, stdout: acceptedReport, stderr: ""),
+                onRun: nil
+            ),
+            .init(path: toolchain.colmap.path, argsPrefix: ["feature_extractor"], result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""), onRun: nil),
+            .init(path: toolchain.colmap.path, argsPrefix: ["exhaustive_matcher"], result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""), onRun: nil),
+            .init(
+                path: toolchain.colmap.path,
+                argsPrefix: ["global_mapper"],
+                result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""),
+                onRun: { args in
+                    guard let output = self.value(for: "--output_path", in: args) else { return }
+                    try? self.writeDa3SparseModel(
+                        at: URL(fileURLWithPath: output).appendingPathComponent("0", isDirectory: true),
+                        imageNames: ["frame_000000.jpg", "frame_000001.jpg"],
+                        pointCount: 4
+                    )
+                }
+            ),
+            .init(
+                path: toolchain.colmap.path,
+                argsPrefix: ["model_analyzer"],
+                result: .init(exitCode: 0, terminationReason: .exit, stdout: acceptedReport, stderr: ""),
+                onRun: nil
+            ),
+        ])
+        let pipeline = PipelineRunner(
+            projectURL: projectURL,
+            config: makePipelineConfig(
+                toolchain: toolchain,
+                preset: metadata.preset,
+                skipTraining: true
+            ),
+            tooling: .init(runner: runner)
+        )
+        let events = PipelineEventSink()
+
+        try await pipeline.run { event in
+            events.append(event)
+        }
+
+        XCTAssertTrue(runner.calls.contains { $0.1.first == "global_mapper" })
+        XCTAssertNotNil(events.stageLog(containing: "Falling back to COLMAP"))
+        let finished = try ProjectMetadataStore.load(from: paths.metadataURL)
+        XCTAssertEqual(finished.reconstruction?.mapper, "global_mapper")
+        XCTAssertEqual(finished.geometryArtifact?.fallbackReason, "learned geometry did not pass; used classical compatibility solve")
+        XCTAssertEqual(finished.geometryArtifact?.medianPixelResidual, 0)
+    }
+
     func testPipelineOversizedDa3SeedRunsBoundedRefinementBeforeAcceptance() async throws {
         let temp = makeTempRoot()
         let projectURL = temp.appendingPathComponent("Da3AlignedSeed.easysplatproj", isDirectory: true)
@@ -864,11 +968,17 @@ final class PipelineIntegrationTests: XCTestCase {
             .init(path: toolchain.colmap.path, argsPrefix: ["matches_importer"], result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""), onRun: nil),
             .init(path: toolchain.colmap.path, argsPrefix: ["point_triangulator"], result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""), onRun: { args in
                 guard let output = self.value(for: "--output_path", in: args) else { return }
-                try? self.writeSparseModel(at: URL(fileURLWithPath: output), imageName: "img0.jpg")
+                try? self.writeSparseModel(
+                    at: URL(fileURLWithPath: output),
+                    imageNames: self.selectedImageNames(in: paths)
+                )
             }),
             .init(path: toolchain.colmap.path, argsPrefix: ["bundle_adjuster"], result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""), onRun: { args in
                 guard let output = self.value(for: "--output_path", in: args) else { return }
-                try? self.writeSparseModel(at: URL(fileURLWithPath: output), imageName: "img0.jpg")
+                try? self.writeSparseModel(
+                    at: URL(fileURLWithPath: output),
+                    imageNames: self.selectedImageNames(in: paths)
+                )
             }),
             .init(
                 path: toolchain.colmap.path,
@@ -1077,7 +1187,10 @@ final class PipelineIntegrationTests: XCTestCase {
 
     private func writeSparseModel(at projectURL: URL) throws {
         let modelURL = projectURL.appendingPathComponent("SfM/colmap/sparse/0", isDirectory: true)
-        try writeSparseModel(at: modelURL, imageName: "frame_000000.jpg")
+        try writeSparseModel(
+            at: modelURL,
+            imageNames: selectedImageNames(in: ProjectPaths(root: projectURL))
+        )
     }
 
     private func writeSparseModelBinaryOnlyForProject(at projectURL: URL) throws {
@@ -1094,18 +1207,32 @@ final class PipelineIntegrationTests: XCTestCase {
     }
 
     private func writeSparseModel(at modelURL: URL, imageName: String) throws {
+        try writeSparseModel(at: modelURL, imageNames: [imageName])
+    }
+
+    private func writeSparseModel(at modelURL: URL, imageNames: [String]) throws {
+        let safeImageNames = imageNames.isEmpty ? ["frame_000000.jpg"] : imageNames
+        try writeDa3SparseModel(
+            at: modelURL,
+            imageNames: safeImageNames,
+            pointCount: 1
+        )
         try FileManager.default.createDirectory(at: modelURL, withIntermediateDirectories: true)
-        for name in ["cameras.bin", "images.bin", "points3D.bin", "cameras.txt", "points3D.txt"] {
+        for name in ["cameras.bin", "images.bin", "points3D.bin"] {
             let url = modelURL.appendingPathComponent(name)
             FileManager.default.createFile(atPath: url.path, contents: Data([0x00]))
         }
-        let imagesTxt = modelURL.appendingPathComponent("images.txt")
-        let text = """
-        # Image list with two lines per image:
-        #   IMAGE_ID, QW, QX, QY, QZ, TX, TY, TZ, CAMERA_ID, NAME
-        1 1 0 0 0 0 0 0 1 \(imageName)
-        """
-        try text.write(to: imagesTxt, atomically: true, encoding: .utf8)
+    }
+
+    private func selectedImageNames(in paths: ProjectPaths) -> [String] {
+        ((try? FileManager.default.contentsOfDirectory(
+            at: paths.framesSelectedURL,
+            includingPropertiesForKeys: [.isRegularFileKey],
+            options: [.skipsHiddenFiles]
+        )) ?? [])
+            .filter { ["jpg", "jpeg", "png", "heic"].contains($0.pathExtension.lowercased()) }
+            .map(\.lastPathComponent)
+            .sorted()
     }
 
     private func writeProcessedPairCount(into databaseURL: URL, pairCount: Int) throws {
@@ -1298,21 +1425,19 @@ final class PipelineIntegrationTests: XCTestCase {
         for (offset, imageName) in imageNames.enumerated() {
             let imageID = offset + 1
             imagesText += "\(imageID) 1 0 0 0 0 0 0 1 \(imageName)\n"
-            if imageID == 1 || imageID == 2 {
-                let observations = (1...pointCount)
-                    .map { pointID in "\(imageID - 1) \(imageID - 1) \(pointID)" }
-                    .joined(separator: " ")
-                imagesText += observations + "\n"
-            } else {
-                imagesText += "\n"
-            }
+            let observations = (1...pointCount)
+                .map { pointID in "320 240 \(pointID)" }
+                .joined(separator: " ")
+            imagesText += observations + "\n"
         }
         try imagesText.write(to: modelURL.appendingPathComponent("images.txt"), atomically: true, encoding: .utf8)
 
         let points = (1...pointCount)
             .map { pointID in
                 let point2DIndex = pointID - 1
-                let track = imageNames.count >= 2 ? "1 \(point2DIndex) 2 \(point2DIndex)" : "1 \(point2DIndex)"
+                let track = imageNames.enumerated()
+                    .map { offset, _ in "\(offset + 1) \(point2DIndex)" }
+                    .joined(separator: " ")
                 return "\(pointID) 0 0 1 128 128 128 1.0 \(track)"
             }
             .joined(separator: "\n")

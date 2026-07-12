@@ -1,4 +1,5 @@
 import CoreGraphics
+import CryptoKit
 import Foundation
 import ImageIO
 import UniformTypeIdentifiers
@@ -15,6 +16,21 @@ extension PipelineRunner {
         let groupId: String
         let isVideo: Bool
         let sourcePath: String
+        let timestampSeconds: Double?
+
+        init(
+            outputFileName: String,
+            groupId: String,
+            isVideo: Bool,
+            sourcePath: String,
+            timestampSeconds: Double? = nil
+        ) {
+            self.outputFileName = outputFileName
+            self.groupId = groupId
+            self.isVideo = isVideo
+            self.sourcePath = sourcePath
+            self.timestampSeconds = timestampSeconds
+        }
     }
 
     var supportedImageExtensions: Set<String> {
@@ -59,8 +75,8 @@ extension PipelineRunner {
         }
     }
 
-    // Legacy support: earlier versions copied HEIC photos into Selected/ directly, but downstream tools
-    // The geometry tools expect JPEG/PNG. Transcode in-place so resumed projects still work.
+    // Earlier versions copied HEIC photos into Selected/ directly. Geometry tools expect
+    // JPEG or PNG, so resumed projects transcode those files in place.
     func normalizeSelectedImagesForTooling(paths: ProjectPaths) throws -> Int {
         let fm = FileManager.default
         guard fm.fileExists(atPath: paths.framesSelectedURL.path) else { return 0 }
@@ -92,7 +108,8 @@ extension PipelineRunner {
                     outputFileName: newName,
                     groupId: entry.groupId,
                     isVideo: entry.isVideo,
-                    sourcePath: entry.sourcePath
+                    sourcePath: entry.sourcePath,
+                    timestampSeconds: entry.timestampSeconds
                 )
             }
             try saveSelectedFrameManifest(updated, to: paths.framesSelectedManifestURL)
@@ -142,7 +159,8 @@ extension PipelineRunner {
                     outputFileName: newName,
                     groupId: entry.groupId,
                     isVideo: entry.isVideo,
-                    sourcePath: entry.sourcePath
+                    sourcePath: entry.sourcePath,
+                    timestampSeconds: entry.timestampSeconds
                 ))
             }
             try? saveSelectedFrameManifest(updated, to: paths.framesSelectedManifestURL)
@@ -183,7 +201,10 @@ extension PipelineRunner {
                     outputFileName: dest.lastPathComponent,
                     groupId: group.id,
                     isVideo: group.isVideo,
-                    sourcePath: frame.path
+                    sourcePath: frame.path,
+                    timestampSeconds: group.isVideo
+                        ? FrameExtractor.timestampSeconds(from: frame.lastPathComponent)
+                        : nil
                 ))
                 index += 1
                 copied += 1
@@ -415,6 +436,76 @@ extension PipelineRunner {
         }
     }
 
+    struct ValidPhotoFilterResult: Sendable {
+        let frames: [URL]
+        let unreadableCount: Int
+        let duplicateCount: Int
+    }
+
+    /// Rejects files that merely have an image extension and exact byte-for-byte duplicates.
+    /// Selection policy runs only after this validity boundary, including "Use all valid photos."
+    func filterValidUniquePhotos(_ photos: [URL]) -> ValidPhotoFilterResult {
+        var frames: [URL] = []
+        var seenDigests = Set<String>()
+        var unreadableCount = 0
+        var duplicateCount = 0
+        frames.reserveCapacity(photos.count)
+
+        for photo in photos {
+            guard isReadableImage(photo), let digest = sha256Digest(of: photo) else {
+                unreadableCount += 1
+                continue
+            }
+            guard seenDigests.insert(digest).inserted else {
+                duplicateCount += 1
+                continue
+            }
+            frames.append(photo)
+        }
+
+        return ValidPhotoFilterResult(
+            frames: frames,
+            unreadableCount: unreadableCount,
+            duplicateCount: duplicateCount
+        )
+    }
+
+    private func isReadableImage(_ url: URL) -> Bool {
+        guard let source = CGImageSourceCreateWithURL(url as CFURL, nil),
+              CGImageSourceGetCount(source) > 0,
+              let properties = CGImageSourceCopyPropertiesAtIndex(source, 0, nil) as? [CFString: Any],
+              let width = properties[kCGImagePropertyPixelWidth] as? NSNumber,
+              let height = properties[kCGImagePropertyPixelHeight] as? NSNumber,
+              width.intValue > 0,
+              height.intValue > 0 else {
+            return false
+        }
+        return CGImageSourceCreateThumbnailAtIndex(
+            source,
+            0,
+            [
+                kCGImageSourceCreateThumbnailFromImageAlways: true,
+                kCGImageSourceCreateThumbnailWithTransform: true,
+                kCGImageSourceThumbnailMaxPixelSize: 16,
+                kCGImageSourceShouldCache: false,
+            ] as CFDictionary
+        ) != nil
+    }
+
+    private func sha256Digest(of url: URL) -> String? {
+        guard let handle = try? FileHandle(forReadingFrom: url) else { return nil }
+        defer { try? handle.close() }
+        var hasher = SHA256()
+        do {
+            while let chunk = try handle.read(upToCount: 1_048_576), !chunk.isEmpty {
+                hasher.update(data: chunk)
+            }
+        } catch {
+            return nil
+        }
+        return hasher.finalize().map { String(format: "%02x", $0) }.joined()
+    }
+
     struct BlurFilterResult: Sendable {
         let frames: [URL]
         let dropped: Int
@@ -441,7 +532,38 @@ extension PipelineRunner {
         return results
     }
 
-    func applyFrameBudget(to groups: [SelectedFrameGroup], targetCount: Int) -> [SelectedFrameGroup] {
+    func applyFrameBudget(
+        to groups: [SelectedFrameGroup],
+        targetCount: Int,
+        photoSelection: PhotoSelection = .automatic
+    ) throws -> [SelectedFrameGroup] {
+        guard photoSelection == .useAllValidPhotos else {
+            return applyFrameBudgetNormally(to: groups, targetCount: targetCount)
+        }
+
+        let photoCount = groups.filter { !$0.isVideo }.reduce(0) { $0 + $1.frames.count }
+        guard photoCount <= targetCount else {
+            throw PipelineError.photoSelectionExceedsBudget(selected: photoCount, maximum: targetCount)
+        }
+        let videoGroups = groups.filter(\.isVideo)
+        let budgetedVideos = applyFrameBudgetNormally(
+            to: videoGroups,
+            targetCount: max(0, targetCount - photoCount)
+        )
+        let videoByID = Dictionary(
+            budgetedVideos.map { ($0.id, $0) },
+            uniquingKeysWith: { first, _ in first }
+        )
+        return groups.compactMap { group in
+            if !group.isVideo { return group }
+            return videoByID[group.id]
+        }
+    }
+
+    private func applyFrameBudgetNormally(
+        to groups: [SelectedFrameGroup],
+        targetCount: Int
+    ) -> [SelectedFrameGroup] {
         guard targetCount > 0 else { return [] }
         let total = groups.reduce(0) { $0 + $1.frames.count }
         guard total > targetCount else { return groups }
@@ -618,6 +740,34 @@ extension PipelineRunner {
         )
     }
 
+    func frameExtractionProfile(for plan: ResolvedRunPlan, detail: DetailProfile) -> FrameExtractionProfile {
+        let targetFPS: Int = switch (detail, plan.capturePath) {
+        case (.fast, _): 2
+        case (_, .largeArea): 4
+        default: 3
+        }
+        let minDistanceRatio: Double = switch plan.capturePath {
+        case .orbit: 0.12
+        case .automatic, .walkthrough: 0.20
+        case .largeArea: 0.30
+        }
+        let sharpness: (floor: Double, ratio: Double) = switch detail {
+        case .fast: (30, 0.50)
+        case .balanced: (40, 0.60)
+        case .highDetail: (50, 0.65)
+        }
+        return FrameExtractionProfile(
+            targetCount: plan.keyframeBudget,
+            maxDimension: CGFloat(plan.maximumImageDimension),
+            targetFPS: targetFPS,
+            minDistanceRatio: minDistanceRatio,
+            sharpnessFloor: sharpness.floor,
+            sharpnessRatio: sharpness.ratio,
+            outputFormat: detail == .highDetail ? .png : .jpeg,
+            maxExtractedFrames: fastSpeedProfileFrameExtractionCap(targetCount: plan.keyframeBudget)
+        )
+    }
+
     func cameraModel(for preset: PresetSpec, lensProjection: LensProjection = .automatic) -> String {
         switch lensProjection {
         case .fisheye:
@@ -633,8 +783,17 @@ extension PipelineRunner {
         return "SIMPLE_RADIAL"
     }
 
-    func shouldUseSequential(selectedFrames: [URL], input: InputSpec, forceExhaustive: Bool) -> Bool {
+    func shouldUseSequential(
+        selectedFrames: [URL],
+        input: InputSpec,
+        forceExhaustive: Bool,
+        pairingPolicy: ResolvedPairingPolicy? = nil
+    ) -> Bool {
         if forceExhaustive { return false }
+        if let pairingPolicy {
+            guard pairingPolicy != .unorderedRetrieval else { return false }
+            return selectedFrames.count >= 30
+        }
         guard input.hasVideos, !input.hasPhotos else { return false }
         guard input.videoFiles.count == 1 else { return false }
         if selectedFrames.count < 30 { return false }

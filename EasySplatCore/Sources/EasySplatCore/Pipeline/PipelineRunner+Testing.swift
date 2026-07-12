@@ -6,6 +6,21 @@ struct TestSelectedFrameMapping: Codable, Sendable {
     let groupId: String
     let isVideo: Bool
     let sourcePath: String
+    let timestampSeconds: Double?
+
+    init(
+        outputFileName: String,
+        groupId: String,
+        isVideo: Bool,
+        sourcePath: String,
+        timestampSeconds: Double? = nil
+    ) {
+        self.outputFileName = outputFileName
+        self.groupId = groupId
+        self.isVideo = isVideo
+        self.sourcePath = sourcePath
+        self.timestampSeconds = timestampSeconds
+    }
 }
 
 struct TestFrameExtractionProfile: Sendable {
@@ -50,8 +65,44 @@ extension PipelineRunner {
         try downsampleSelectedFrames(to: targetCount, paths: paths)
     }
 
-    func test_applyFrameBudget(to groups: [SelectedFrameGroup], targetCount: Int) -> [SelectedFrameGroup] {
-        applyFrameBudget(to: groups, targetCount: targetCount)
+    func test_applyFrameBudget(to groups: [SelectedFrameGroup], targetCount: Int) throws -> [SelectedFrameGroup] {
+        try applyFrameBudget(to: groups, targetCount: targetCount)
+    }
+
+    func test_applyFrameBudget(
+        to groups: [SelectedFrameGroup],
+        targetCount: Int,
+        photoSelection: PhotoSelection
+    ) throws -> [SelectedFrameGroup] {
+        try applyFrameBudget(
+            to: groups,
+            targetCount: targetCount,
+            photoSelection: photoSelection
+        )
+    }
+
+    func test_copySelected(
+        groups: [SelectedFrameGroup],
+        to directory: URL,
+        manifestURL: URL
+    ) throws -> [TestSelectedFrameMapping] {
+        let result = try copySelected(groups: groups, to: directory, manifestURL: manifestURL)
+        return result.manifest.map {
+            TestSelectedFrameMapping(
+                outputFileName: $0.outputFileName,
+                groupId: $0.groupId,
+                isVideo: $0.isVideo,
+                sourcePath: $0.sourcePath,
+                timestampSeconds: $0.timestampSeconds
+            )
+        }
+    }
+
+    func test_filterValidUniquePhotos(
+        _ photos: [URL]
+    ) -> (frames: [URL], unreadableCount: Int, duplicateCount: Int) {
+        let result = filterValidUniquePhotos(photos)
+        return (result.frames, result.unreadableCount, result.duplicateCount)
     }
 
     func test_normalizeSelectedImagesForTooling(paths: ProjectPaths) throws -> Int {
@@ -155,15 +206,15 @@ extension PipelineRunner {
         da3ResolvedInputOrdering(requested: requested, input: input)
     }
 
-    func test_da3DirectMinimumMeanTrackLengthPreference(mode: CaptureMode) -> Double {
-        da3DirectMinimumMeanTrackLengthPreference(mode: mode)
+    func test_da3DirectMinimumMeanTrackLengthPreference(capturePath: CapturePath) -> Double {
+        da3DirectMinimumMeanTrackLengthPreference(capturePath: capturePath)
     }
 
     func test_da3DirectQualityFailureReason(
         score: ReconstructionScore,
-        mode: CaptureMode
+        capturePath: CapturePath
     ) -> String? {
-        da3DirectQualityFailureReason(score: score, mode: mode)
+        da3DirectQualityFailureReason(score: score, capturePath: capturePath)
     }
 
     func test_globalMapperOptions(threadHint: Int, defaultUseGpu: Bool = true) -> ColmapGlobalMapperOptions {

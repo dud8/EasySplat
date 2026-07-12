@@ -319,6 +319,28 @@ class Da3RunTests(unittest.TestCase):
                 source_size=(1, 1),
             )
 
+    def test_camera_params_supports_colmap_fisheye_schema(self) -> None:
+        intrinsics = np.array([
+            [500.0, 0.0, 320.0],
+            [0.0, 490.0, 240.0],
+            [0.0, 0.0, 1.0],
+        ])
+
+        self.assertEqual(
+            _camera_params(intrinsics, (640, 480), "OPENCV_FISHEYE"),
+            [500.0, 490.0, 320.0, 240.0, 0.0, 0.0, 0.0, 0.0],
+        )
+        self.assertEqual(
+            build_arg_parser().parse_args(
+                [
+                    "--images", "/tmp/images",
+                    "--out-sparse", "/tmp/sparse",
+                    "--camera-type", "OPENCV_FISHEYE",
+                ]
+            ).camera_type,
+            "OPENCV_FISHEYE",
+        )
+
     def test_rotmat_to_quat_handles_negative_trace_rotation(self) -> None:
         quat = _rotmat_to_quat_wxyz(np.array([
             [1.0, 0.0, 0.0],

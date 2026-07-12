@@ -9,17 +9,18 @@ extension PipelineRunner {
         if let override = sfmBackendOverride() {
             return override
         }
-        return isFastSpeedProfile() ? .colmap : .da3
+        return .da3
     }
 
     func sfmBackendFallbackOrder(override: SfmBackend?) -> [SfmBackend] {
         if let override {
             return [override]
         }
-        if isFastSpeedProfile() {
-            return [.colmap]
-        }
         return [.da3, .colmap]
+    }
+
+    func sfmBackendFallbackOrder(resolvedPlan: ResolvedRunPlan) throws -> [SfmBackend] {
+        try resolvedPlan.validatedBackendOrder()
     }
 
     func da3DevicePreference() -> String {
@@ -96,21 +97,21 @@ extension PipelineRunner {
         }
     }
 
-    func da3DirectMinimumMeanTrackLengthPreference(mode: CaptureMode) -> Double {
-        switch mode {
-        case .room:
-            return 1.20
-        case .object:
+    func da3DirectMinimumMeanTrackLengthPreference(capturePath: CapturePath) -> Double {
+        switch capturePath {
+        case .orbit:
             return 1.15
+        case .automatic, .walkthrough, .largeArea:
+            return 1.20
         }
     }
 
     func directSparseQualityFailureReason(
         score: ReconstructionScore,
-        mode: CaptureMode,
+        capturePath: CapturePath,
         minimumTrackLength: Double
     ) -> String? {
-        guard ReconstructionScorer.isAcceptable(score, mode: mode) else {
+        guard ReconstructionScorer.isAcceptable(score, capturePath: capturePath) else {
             return "below the general quality bar"
         }
         guard let pointCount = score.pointCount, pointCount > 0 else {
@@ -136,11 +137,11 @@ extension PipelineRunner {
         return nil
     }
 
-    func da3DirectQualityFailureReason(score: ReconstructionScore, mode: CaptureMode) -> String? {
+    func da3DirectQualityFailureReason(score: ReconstructionScore, capturePath: CapturePath) -> String? {
         directSparseQualityFailureReason(
             score: score,
-            mode: mode,
-            minimumTrackLength: da3DirectMinimumMeanTrackLengthPreference(mode: mode)
+            capturePath: capturePath,
+            minimumTrackLength: da3DirectMinimumMeanTrackLengthPreference(capturePath: capturePath)
         )
     }
 

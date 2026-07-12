@@ -6,6 +6,12 @@ extension PipelineRunner {
         case invalidInput
         case insufficientInputImages(Int)
         case lowQualityReconstruction(ReconstructionScore, mapper: String?)
+        case geometryCoverageTooLow(registered: Int, total: Int)
+        case geometryResidualCoverageTooLow(measured: Int, total: Int)
+        case geometryRegisteredImagesMismatch
+        case geometryResidualsUnavailable(String)
+        case geometryResidualsTooHigh(median: Double, p90: Double)
+        case photoSelectionExceedsBudget(selected: Int, maximum: Int)
         case imageTranscodeFailed(String)
         case outputMissing
     }
@@ -85,6 +91,36 @@ extension PipelineRunner {
                 let summary = mapper.map { ReconstructionScorer.summary(score, mapper: $0) }
                     ?? ReconstructionScorer.summary(score)
                 return ("I couldn't get a stable camera solve. Try a slower capture and more light.", "Low-quality reconstruction. \(summary).")
+            case let .geometryCoverageTooLow(registered, total):
+                return (
+                    "I couldn't connect enough of the capture. Try again with more overlap.",
+                    "Canonical model registered \(registered) of \(total) selected views; at least 90% is required."
+                )
+            case let .geometryResidualCoverageTooLow(measured, total):
+                return (
+                    "I couldn't verify enough of the capture. Try again with more overlap.",
+                    "Only \(measured) of \(total) selected views contributed measurable tracks; at least 90% is required."
+                )
+            case .geometryRegisteredImagesMismatch:
+                return (
+                    "The camera solve did not match this capture. Try again.",
+                    "Canonical model registered image names outside the selected-frame set."
+                )
+            case let .geometryResidualsUnavailable(reason):
+                return (
+                    "I couldn't verify the camera solve. Try a slower capture with more overlap.",
+                    "Real pixel residuals were unavailable: \(reason)"
+                )
+            case let .geometryResidualsTooHigh(median, p90):
+                return (
+                    "The camera solve was not stable enough. Try a slower capture with more overlap.",
+                    String(format: "Measured pixel residuals exceeded the gate: median %.3f px, p90 %.3f px.", median, p90)
+                )
+            case let .photoSelectionExceedsBudget(selected, maximum):
+                return (
+                    "Use all valid photos exceeds this Mac's safe plan. Choose Automatic selection or Conserve Memory.",
+                    "Use all valid photos requested \(selected) photos; the resolved safe limit is \(maximum)."
+                )
             case let .imageTranscodeFailed(message):
                 return ("Failed to convert photos for processing. Try exporting as JPEG/PNG.", message)
             case .outputMissing:

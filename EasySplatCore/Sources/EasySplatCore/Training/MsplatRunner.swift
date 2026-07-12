@@ -65,6 +65,8 @@ public final class MsplatRunner: Sendable {
         resumeFrom: URL? = nil,
         profile: DetailProfile,
         seed: UInt64,
+        iterationLimit: Int? = nil,
+        plateauWindow: Int? = nil,
         onProgress: @escaping @Sendable (MsplatTrainingProgress) -> Void = { _ in },
         onCheckpoint: @escaping @Sendable (MsplatCheckpointReceipt) -> Void = { _ in },
         onLog: @escaping @Sendable (String, Bool) -> Void
@@ -109,7 +111,11 @@ public final class MsplatRunner: Sendable {
             }
         }
 
-        let contract = MsplatProfileContract(profile: profile)
+        let contract = try MsplatProfileContract(
+            profile: profile,
+            iterationLimit: iterationLimit,
+            plateauWindow: plateauWindow
+        )
         var arguments = [
             "--dataset", datasetPath.path,
             "--output", outputPath.path,
@@ -205,21 +211,28 @@ private struct MsplatProfileContract: Sendable {
     let iterationLimit: Int
     let plateauWindow: Int
 
-    init(profile: DetailProfile) {
+    init(
+        profile: DetailProfile,
+        iterationLimit requestedIterationLimit: Int? = nil,
+        plateauWindow requestedPlateauWindow: Int? = nil
+    ) throws {
         self.profile = profile
+        let defaults: (argument: String, iterationLimit: Int, plateauWindow: Int)
         switch profile {
         case .fast:
-            argument = "fast"
-            iterationLimit = 3_000
-            plateauWindow = 400
+            defaults = ("fast", 3_000, 400)
         case .balanced:
-            argument = "balanced"
-            iterationLimit = 7_000
-            plateauWindow = 800
+            defaults = ("balanced", 7_000, 800)
         case .highDetail:
-            argument = "high-detail"
-            iterationLimit = 15_000
-            plateauWindow = 1_500
+            defaults = ("high-detail", 15_000, 1_500)
+        }
+        argument = defaults.argument
+        iterationLimit = requestedIterationLimit ?? defaults.iterationLimit
+        plateauWindow = requestedPlateauWindow ?? defaults.plateauWindow
+        guard iterationLimit > 0,
+              plateauWindow > 0,
+              plateauWindow <= iterationLimit else {
+            throw MsplatEventProtocolError("training budget is invalid")
         }
     }
 }

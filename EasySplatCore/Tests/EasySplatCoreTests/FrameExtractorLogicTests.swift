@@ -27,6 +27,22 @@ final class FrameExtractorLogicTests: XCTestCase {
         XCTAssertEqual(FrameOutputFormat.png.utType, .png)
     }
 
+    func testTimestampedFrameNamesRoundTripExactVideoTime() {
+        let name = FrameExtractor.test_timestampedFilename(
+            index: 7,
+            seconds: 12.345678,
+            format: .jpeg
+        )
+
+        XCTAssertEqual(name, "frame_000007_t000012345678.jpg")
+        XCTAssertEqual(
+            FrameExtractor.test_timestampSeconds(from: name) ?? -1,
+            12.345678,
+            accuracy: 0.000001
+        )
+        XCTAssertNil(FrameExtractor.test_timestampSeconds(from: "frame_000007.jpg"))
+    }
+
     func testCappedExtractionSlotsCoverFullVideoDuration() {
         let options = FrameExtractionOptions(
             targetCount: 30,
