@@ -256,6 +256,30 @@ struct MetalKitSceneView: NSViewRepresentable {
         metalKitView.onPan = { deltaX, deltaY in
             renderer.pan(deltaX: Float(deltaX), deltaY: Float(deltaY))
         }
+        metalKitView.onKeyboardCommand = { [weak renderer, weak controller] command in
+            let orbitStep: Float = 16
+            let panStep: Float = 12
+            switch command {
+            case .orbit(let horizontal, let vertical):
+                renderer?.orbit(
+                    deltaX: Float(horizontal) * orbitStep,
+                    deltaY: Float(vertical) * orbitStep
+                )
+            case .pan(let horizontal, let vertical):
+                renderer?.pan(
+                    deltaX: Float(horizontal) * panStep,
+                    deltaY: Float(vertical) * panStep
+                )
+            case .zoomIn:
+                renderer?.zoom(delta: -12)
+            case .zoomOut:
+                renderer?.zoom(delta: 12)
+            case .fit:
+                controller?.fitToView()
+            case .reset:
+                controller?.resetCamera()
+            }
+        }
         metalKitView.onInteractionActivity = { [weak coordinator = context.coordinator] in
             coordinator?.recordInteraction()
         }
@@ -323,12 +347,22 @@ final class InteractiveMTKView: MTKView {
     var onOrbit: ((CGFloat, CGFloat) -> Void)?
     var onZoom: ((CGFloat) -> Void)?
     var onPan: ((CGFloat, CGFloat) -> Void)?
+    var onKeyboardCommand: ((ViewerKeyboardCommand) -> Void)?
     var onInteractionActivity: (() -> Void)?
 
     private var lastLocation: NSPoint?
     private var isPanning = false
 
+    override var acceptsFirstResponder: Bool { true }
+    override var canBecomeKeyView: Bool { true }
+
+    override func becomeFirstResponder() -> Bool {
+        focusRingType = .exterior
+        return super.becomeFirstResponder()
+    }
+
     override func mouseDown(with event: NSEvent) {
+        window?.makeFirstResponder(self)
         onInteractionActivity?()
         lastLocation = event.locationInWindow
         isPanning = event.modifierFlags.contains(.option)
@@ -357,5 +391,18 @@ final class InteractiveMTKView: MTKView {
     override func mouseUp(with event: NSEvent) {
         onInteractionActivity?()
         super.mouseUp(with: event)
+    }
+
+    override func keyDown(with event: NSEvent) {
+        guard let command = ViewerKeyboardCommand.resolve(
+            keyCode: event.keyCode,
+            characters: event.charactersIgnoringModifiers,
+            modifiers: ViewerKeyboardModifiers(event.modifierFlags)
+        ) else {
+            super.keyDown(with: event)
+            return
+        }
+        onInteractionActivity?()
+        onKeyboardCommand?(command)
     }
 }

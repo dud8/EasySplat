@@ -1,148 +1,469 @@
-import SwiftUI
 import AppKit
 import EasySplatCore
+import SwiftUI
+import UniformTypeIdentifiers
 
 struct ViewerView: View {
     @EnvironmentObject private var model: AppModel
+    @State private var isInspectorPresented = true
+    @State private var isTechnicalExpanded = false
+    @State private var resetCameraToken = 0
+    @State private var metadata: ProjectMetadata?
+    @State private var exportAlert: ExportAlert?
+    @State private var isExporting = false
 
     var body: some View {
-        VStack(spacing: 16) {
-            HStack(spacing: 10) {
-                Text("Your splat is ready")
-                    .font(.title2.weight(.semibold))
-                if let duration = totalRunDurationText {
-                    Text(duration)
-                        .font(.caption.weight(.semibold).monospacedDigit())
-                        .foregroundStyle(Theme.success)
-                        .padding(.vertical, 3)
-                        .padding(.horizontal, 9)
-                        .background(
-                            Capsule(style: .continuous)
-                                .fill(Theme.success.opacity(0.13))
-                        )
-                        .overlay(
-                            Capsule(style: .continuous)
-                                .stroke(Theme.success.opacity(0.35), lineWidth: 0.5)
-                        )
-                        .help("Total wall-clock time across all pipeline stages.")
-                        .accessibilityLabel("Completed in \(duration)")
+        Group {
+            if let plyURL = model.outputPlyURL {
+                SplatViewerView(
+                    splatURL: plyURL,
+                    resetCameraToken: resetCameraToken,
+                    overlayDensity: .compact
+                )
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                .padding(Theme.Spacing.large)
+                .accessibilityElement(children: .contain)
+                .accessibilityLabel("Interactive 3D splat viewer")
+                .accessibilityHint("Click the viewer, then use arrow keys to orbit. Option with arrow keys pans.")
+            } else {
+                ContentUnavailableView(
+                    "Splat unavailable",
+                    systemImage: "exclamationmark.triangle",
+                    description: Text("The finished output could not be opened.")
+                )
+            }
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .navigationTitle(projectTitle)
+        .toolbar { resultToolbar }
+        .inspector(isPresented: $isInspectorPresented) {
+            resultInspector
+                .inspectorColumnWidth(min: 260, ideal: 300, max: 380)
+        }
+        .alert(item: $exportAlert) { alert in
+            Alert(
+                title: Text("Couldn’t export splat"),
+                message: Text(alert.message),
+                dismissButton: .default(Text("OK"))
+            )
+        }
+        .onAppear(perform: loadMetadata)
+        .onChange(of: model.currentProjectURL) { _, _ in loadMetadata() }
+    }
+
+    @ToolbarContentBuilder
+    private var resultToolbar: some ToolbarContent {
+        ToolbarItemGroup(placement: .primaryAction) {
+            Button(action: presentExportPanel) {
+                if isExporting {
+                    ProgressView()
+                        .controlSize(.small)
+                        .accessibilityLabel("Exporting splat")
+                } else {
+                    Label("Export…", systemImage: "square.and.arrow.down")
                 }
             }
+            .disabled(model.outputPlyURL == nil || isExporting)
+            .help("Save a copy of the validated PLY")
 
-            if let plyURL = model.outputPlyURL {
-                VStack(spacing: 4) {
-                    Text(plyURL.lastPathComponent)
-                        .font(.subheadline)
-                        .foregroundStyle(.secondary)
-                    if let info = model.currentOutputPlyInfo {
-                        HStack(spacing: 8) {
-                            Text(info.splatCountText)
-                                .font(.caption.monospacedDigit())
-                            if let size = info.sizeText {
-                                Text("·").font(.caption)
-                                Text(size).font(.caption.monospacedDigit())
-                            }
-                            if let format = info.formatLabel {
-                                Text("·").font(.caption)
-                                Text(format).font(.caption)
-                            }
-                        }
-                        .foregroundStyle(.secondary)
-                    }
-                }
-                SplatViewerView(splatURL: plyURL)
-                    .frame(height: 360)
-                    .frame(maxWidth: .infinity)
-                if let preset = model.currentPreset, let input = model.currentInput {
-                    RunConfigSummaryView(preset: preset, input: input)
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                }
-                if let reconstruction = model.currentReconstruction {
-                    ReconstructionDetailPanel(
-                        summary: reconstruction,
-                        fleetMedianFraction: ProjectFleetStats.medianCoverage(
-                            excluding: model.currentProjectURL,
-                            from: model.projectSummaries
-                        )
-                    )
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                }
-                if !model.currentStageTimings.isEmpty {
-                    StageTimingPanel(
-                        timings: model.currentStageTimings,
-                        comparisonMedianSeconds: medianTotalSecondsForCurrentPreset()
-                    )
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                }
-                if let autoTune = model.currentAutoTune {
-                    AutoTunePanel(snapshot: autoTune)
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                }
-                if model.currentProjectURL != nil {
-                    ProjectNotesEditor()
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                }
-                HStack(spacing: 12) {
-                    Button("Share…") {
-                        model.shareCurrentSplat()
-                    }
-                    .buttonStyle(PrimaryButtonStyle())
-                    .disabled(model.isShareSheetActive)
+            Button(action: model.shareCurrentSplat) {
+                Label("Share", systemImage: "square.and.arrow.up")
+            }
+            .disabled(model.outputPlyURL == nil || model.isShareSheetActive)
+            .help("Share the validated PLY")
 
-                    Button("Show in Finder") {
-                        NSWorkspace.shared.activateFileViewerSelecting([plyURL])
-                    }
-                    .buttonStyle(SecondaryButtonStyle())
+            Button {
+                isInspectorPresented.toggle()
+            } label: {
+                Label("Inspector", systemImage: "sidebar.right")
+            }
+            .help(isInspectorPresented ? "Hide Inspector" : "Show Inspector")
+
+            Menu {
+                Button("Show in Finder", systemImage: "folder") {
+                    revealOutputInFinder()
+                }
+                .disabled(model.outputPlyURL == nil)
+
+                Button("Reset View", systemImage: "arrow.counterclockwise") {
+                    resetCameraToken &+= 1
+                }
+                .disabled(model.outputPlyURL == nil)
+
+                Button("Check for Updates…", systemImage: "arrow.triangle.2.circlepath") {
+                    let latestRelease = AppConfig.projectHomeURL
+                        .appendingPathComponent("releases", isDirectory: true)
+                        .appendingPathComponent("latest", isDirectory: false)
+                    NSWorkspace.shared.open(latestRelease)
                 }
 
-                if let shareStatus = model.shareStatusMessage {
-                    Text(shareStatus)
-                        .font(.caption)
-                        .foregroundStyle(model.shareStatusIsError ? Color.red : Color.secondary)
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                        .accessibilityLabel("Share status")
-                        .accessibilityValue(shareStatus)
+                Divider()
+
+                Button("New Splat", systemImage: "plus") {
+                    beginNewSplat()
                 }
+            } label: {
+                Label("More", systemImage: "ellipsis.circle")
+            }
+            .help("More result actions")
+        }
+    }
+
+    private var resultInspector: some View {
+        ScrollView {
+            VStack(alignment: .leading, spacing: Theme.Spacing.large) {
+                outputSection
+                Divider()
+                captureSection
+                Divider()
+                reconstructionSection
+                Divider()
+                timingSection
+                Divider()
+                notesSection
+                Divider()
+                technicalSection
+            }
+            .padding(Theme.Spacing.large)
+        }
+    }
+
+    private var outputSection: some View {
+        VStack(alignment: .leading, spacing: Theme.Spacing.small) {
+            Text("Output")
+                .font(.headline)
+            if let outputURL = model.outputPlyURL {
+                LabeledContent("File") {
+                    Text(outputURL.lastPathComponent)
+                        .lineLimit(2)
+                        .truncationMode(.middle)
+                        .help(outputURL.lastPathComponent)
+                }
+            }
+            if let info = model.currentOutputPlyInfo {
+                LabeledContent(
+                    "Contents",
+                    value: info.vertexCount == 1 ? "1 splat" : info.splatCountText
+                )
+                if let size = info.sizeText {
+                    LabeledContent("Size", value: size)
+                }
+            }
+            if let status = model.shareStatusMessage {
+                Text(status)
+                    .font(.caption)
+                    .foregroundStyle(model.shareStatusIsError ? Color.red : Color.secondary)
+                    .accessibilityLabel("Share status: \(status)")
+            }
+        }
+    }
+
+    private var captureSection: some View {
+        VStack(alignment: .leading, spacing: Theme.Spacing.small) {
+            Text("Capture")
+                .font(.headline)
+            if let input = model.currentInput {
+                LabeledContent("Input", value: inputDescription(input))
+            }
+            let options = displayedRunOptions
+            LabeledContent("Path", value: capturePathLabel(options.capturePath))
+            LabeledContent("Detail", value: detailLabel(options.detailProfile))
+            if options.cameraGrouping != .automatic {
+                LabeledContent("Camera", value: cameraLabel(options.cameraGrouping))
+            }
+            if options.lensProjection != .automatic {
+                LabeledContent("Lens", value: lensLabel(options.lensProjection))
+            }
+            if options.inputOrdering != .automatic {
+                LabeledContent("Order", value: orderLabel(options.inputOrdering))
+            }
+            if options.resourcePolicy != .automatic {
+                LabeledContent("Resources", value: resourceLabel(options.resourcePolicy))
+            }
+            if options.photoSelection == .useAllValidPhotos {
+                LabeledContent("Photos", value: "All valid photos")
+            }
+        }
+    }
+
+    @ViewBuilder
+    private var reconstructionSection: some View {
+        VStack(alignment: .leading, spacing: Theme.Spacing.small) {
+            Text("Reconstruction")
+                .font(.headline)
+            if let summary = model.currentReconstruction {
+                LabeledContent(
+                    "Registered",
+                    value: "\(summary.registeredImages) of \(summary.totalImages)"
+                )
+                if let points = summary.pointCountText {
+                    LabeledContent("Points", value: points)
+                }
+                if let observations = summary.observationCountText {
+                    LabeledContent("Observations", value: observations)
+                }
+                if let trackLength = summary.meanTrackLengthText {
+                    LabeledContent("Track length", value: trackLength)
+                }
+                if let residual = summary.meanReprojectionErrorText {
+                    LabeledContent("Mean residual", value: residual)
+                }
+            } else if let geometry = metadata?.geometryArtifact {
+                LabeledContent(
+                    "Registered",
+                    value: "\(geometry.registeredViewCount) of \(geometry.totalViewCount)"
+                )
+                LabeledContent("Points", value: geometry.pointCount.formatted())
+                LabeledContent("Tracks", value: geometry.trackCount.formatted())
+                LabeledContent(
+                    "Median residual",
+                    value: geometry.medianPixelResidual.formatted(.number.precision(.fractionLength(2))) + " px"
+                )
+                LabeledContent(
+                    "P90 residual",
+                    value: geometry.p90PixelResidual.formatted(.number.precision(.fractionLength(2))) + " px"
+                )
             } else {
-                Text("No output found yet.")
+                Text("No reconstruction measurements were recorded.")
+                    .font(.caption)
                     .foregroundStyle(.secondary)
             }
-
-            Button("Start Another") {
-                // Flush any in-flight notes save so leaving the viewer
-                // doesn't drop a half-typed annotation; harmless if nothing
-                // is pending.
-                model.flushPendingNotesSave()
-                model.viewState = .home
-            }
-            .buttonStyle(SecondaryButtonStyle())
-            .keyboardShortcut(.cancelAction)
-            .help("Return to the home screen to pick a new input (Esc).")
         }
-        .padding(32)
     }
 
-    private var totalRunDurationText: String? {
-        guard let total = model.currentStageTimings.totalDurationSeconds, total > 0 else { return nil }
-        return StageTimingDisplay.formatDuration(seconds: total)
+    private var timingSection: some View {
+        VStack(alignment: .leading, spacing: Theme.Spacing.small) {
+            Text("Timing")
+                .font(.headline)
+            if let total = model.currentStageTimings.totalDurationSeconds {
+                LabeledContent("Total", value: StageTimingDisplay.formatDuration(seconds: total))
+            }
+            timingRow("Prepare", stages: [.importInput, .extractFrames, .selectFrames])
+            timingRow("Reconstruct", stages: [.sfmFeatures, .sfmMatching, .sfmMapping])
+            timingRow("Train", stages: [.trainSplat])
+            timingRow("Finish", stages: [.exportSplat, .done])
+            if model.currentStageTimings.isEmpty {
+                Text("No timing measurements were recorded.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+        }
     }
 
-    /// Predictor median total duration for the current project's preset, excluding the
-    /// project being viewed so the comparison badge never benchmarks a run against itself
-    /// (post-completion the current project appears in `projectSummaries` with its own
-    /// ready timings). Returns nil when there are not enough other samples.
-    private func medianTotalSecondsForCurrentPreset() -> TimeInterval? {
-        guard let preset = model.currentPreset else { return nil }
-        // Exclude the project being viewed so the comparison badge never
-        // benchmarks a run against itself (post-completion the current
-        // project shows up in projectSummaries with its own ready timings).
-        let prediction = RunDurationPredictor.predict(
-            mode: preset.mode,
-            quality: preset.quality,
-            from: model.projectSummaries,
-            excluding: model.currentProjectURL
+    private var notesSection: some View {
+        VStack(alignment: .leading, spacing: Theme.Spacing.small) {
+            Text("Notes")
+                .font(.headline)
+            TextEditor(text: Binding(
+                get: { model.currentProjectNotes },
+                set: { newValue in
+                    model.currentProjectNotes = newValue
+                    if let projectURL = model.currentProjectURL {
+                        model.scheduleNotesSave(at: projectURL, to: newValue)
+                    }
+                }
+            ))
+            .font(.body)
+            .textEditorStyle(.plain)
+            .frame(minHeight: 90)
+            .padding(Theme.Spacing.small)
+            .background(Theme.surface)
+            .clipShape(RoundedRectangle(cornerRadius: Theme.Radius.button, style: .continuous))
+            .overlay {
+                RoundedRectangle(cornerRadius: Theme.Radius.button, style: .continuous)
+                    .stroke(Theme.border)
+            }
+            .accessibilityLabel("Project notes")
+        }
+    }
+
+    private var technicalSection: some View {
+        DisclosureGroup(isExpanded: $isTechnicalExpanded) {
+            VStack(alignment: .leading, spacing: Theme.Spacing.small) {
+                if let geometry = metadata?.geometryArtifact {
+                    LabeledContent("Solver", value: geometry.solverVersion)
+                    LabeledContent("Model", value: geometry.modelVersion)
+                    LabeledContent("Camera", value: geometry.cameraModel)
+                    LabeledContent("Residuals", value: geometry.residualProvenance)
+                } else if let reconstruction = model.currentReconstruction {
+                    LabeledContent("Solver", value: reconstruction.displayMapper)
+                }
+                if let trainer = metadata?.trainingArtifact {
+                    LabeledContent("Trainer", value: trainer.trainerVersion)
+                    LabeledContent("Iterations", value: trainer.completedIteration.formatted())
+                }
+                if let format = model.currentOutputPlyInfo?.formatLabel {
+                    LabeledContent("Format", value: format)
+                }
+                if let relativePath = metadata?.outputs?.splatPlyPath {
+                    LabeledContent("Project path") {
+                        Text(relativePath)
+                            .lineLimit(2)
+                            .truncationMode(.middle)
+                            .help(relativePath)
+                    }
+                }
+            }
+            .padding(.top, Theme.Spacing.small)
+        } label: {
+            Text("Technical")
+                .font(.headline)
+        }
+    }
+
+    @ViewBuilder
+    private func timingRow(_ label: String, stages: [PipelineStage]) -> some View {
+        if let duration = duration(for: stages) {
+            LabeledContent(label, value: StageTimingDisplay.formatDuration(seconds: duration))
+        }
+    }
+
+    private func duration(for stages: [PipelineStage]) -> TimeInterval? {
+        let matching = model.currentStageTimings.filter { stages.contains($0.stage) }
+        guard !matching.isEmpty else { return nil }
+        return matching.reduce(0) { $0 + $1.durationSeconds }
+    }
+
+    private var displayedRunOptions: RequestedRunOptions {
+        if let options = metadata?.requestedRunOptions {
+            return options
+        }
+        guard let preset = model.currentPreset else { return RequestedRunOptions() }
+        let detail: DetailProfile = switch preset.quality {
+        case .draft: .fast
+        case .standard: .balanced
+        case .ultra: .highDetail
+        }
+        return RequestedRunOptions(
+            capturePath: preset.mode == .object ? .orbit : .walkthrough,
+            detailProfile: detail
         )
-        return prediction?.seconds
     }
 
+    private var projectTitle: String {
+        if let title = metadata?.title, !title.isEmpty { return title }
+        guard let projectURL = model.currentProjectURL else { return "Result" }
+        return projectURL.deletingPathExtension().lastPathComponent
+    }
+
+    private func loadMetadata() {
+        guard let projectURL = model.currentProjectURL else {
+            metadata = nil
+            return
+        }
+        metadata = try? ProjectMetadataStore.load(from: ProjectPaths(root: projectURL).metadataURL)
+    }
+
+    private func presentExportPanel() {
+        let source: URL
+        do {
+            source = try model.validatedCurrentSplatForExport()
+        } catch {
+            exportAlert = ExportAlert(message: error.localizedDescription)
+            return
+        }
+        guard let plyType = UTType(filenameExtension: "ply") else {
+            exportAlert = ExportAlert(message: "PLY export is unavailable on this Mac.")
+            return
+        }
+
+        let panel = NSSavePanel()
+        panel.title = "Export Splat"
+        panel.prompt = "Export"
+        panel.nameFieldStringValue = source.lastPathComponent
+        panel.canCreateDirectories = true
+        panel.isExtensionHidden = false
+        panel.allowsOtherFileTypes = false
+        panel.allowedContentTypes = [plyType]
+        panel.begin { response in
+            guard response == .OK, let destination = panel.url else { return }
+            Task { @MainActor in
+                isExporting = true
+                defer { isExporting = false }
+                do {
+                    try await Task.detached(priority: .userInitiated) {
+                        try AppModel.exportValidatedSplat(from: source, to: destination)
+                    }.value
+                } catch {
+                    exportAlert = ExportAlert(message: error.localizedDescription)
+                }
+            }
+        }
+    }
+
+    private func revealOutputInFinder() {
+        guard let output = try? model.validatedCurrentSplatForExport() else { return }
+        NSWorkspace.shared.activateFileViewerSelecting([output])
+    }
+
+    private func beginNewSplat() {
+        model.flushPendingNotesSave()
+        model.clearPendingInputs()
+        model.viewState = .home
+    }
+
+    private func inputDescription(_ input: InputSpec) -> String {
+        switch input {
+        case .video(let files):
+            return files.count == 1 ? "1 video" : "\(files.count) videos"
+        case .photos:
+            return "Photo folder"
+        case .mixed(let videos, _):
+            return "\(videos.count) video\(videos.count == 1 ? "" : "s") and photos"
+        }
+    }
+
+    private func capturePathLabel(_ path: CapturePath) -> String {
+        switch path {
+        case .automatic: "Automatic"
+        case .orbit: "Around a subject"
+        case .walkthrough: "Through a space"
+        case .largeArea: "Across a large area"
+        }
+    }
+
+    private func detailLabel(_ detail: DetailProfile) -> String {
+        switch detail {
+        case .fast: "Fast"
+        case .balanced: "Balanced"
+        case .highDetail: "High Detail"
+        }
+    }
+
+    private func cameraLabel(_ camera: CameraGrouping) -> String {
+        switch camera {
+        case .automatic: "Automatic"
+        case .sameCameraAndLens: "Same camera and lens"
+        case .mixedCamerasOrLenses: "Mixed cameras or lenses"
+        }
+    }
+
+    private func lensLabel(_ lens: LensProjection) -> String {
+        switch lens {
+        case .automatic: "Automatic"
+        case .perspective: "Perspective"
+        case .fisheye: "Fisheye"
+        }
+    }
+
+    private func orderLabel(_ order: InputOrdering) -> String {
+        switch order {
+        case .automatic: "Automatic"
+        case .continuous: "Continuous sequence"
+        case .unordered: "Unordered"
+        }
+    }
+
+    private func resourceLabel(_ resource: ResourcePolicy) -> String {
+        switch resource {
+        case .automatic: "Automatic"
+        case .conserveMemory: "Conserve Memory"
+        case .maximumPerformance: "Maximum Performance"
+        }
+    }
+}
+
+private struct ExportAlert: Identifiable {
+    let id = UUID()
+    let message: String
 }
