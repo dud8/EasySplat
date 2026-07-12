@@ -33,12 +33,6 @@ final class RecordingPowerAssertion: PowerAssertionManaging, @unchecked Sendable
 
 @MainActor
 final class AppModelPowerAssertionTests: XCTestCase {
-    override func setUp() {
-        super.setUp()
-        UserDefaults.standard.removeObject(forKey: AppModel.captureModeUserDefaultsKey)
-        UserDefaults.standard.removeObject(forKey: AppModel.qualityPresetUserDefaultsKey)
-    }
-
     func testStartProjectHoldsAndReleasesAssertionAcrossToolchainAndRun() async throws {
         let tempBase = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
         try FileManager.default.createDirectory(at: tempBase, withIntermediateDirectories: true)

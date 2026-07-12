@@ -180,51 +180,66 @@ extension AppModel {
         progress = nil
 
         do {
-            let projectURL = try createProjectDirectory(title: title)
-            currentProjectURL = projectURL
-            let requestedOptions = RequestedRunOptions(
-                capturePath: captureMode == .object ? .orbit : .walkthrough,
-                detailProfile: {
-                    switch qualityPreset {
-                    case .draft: return .fast
-                    case .standard: return .balanced
-                    case .ultra: return .highDetail
-                    }
-                }()
-            )
-            let metadata = ProjectMetadata(
-                title: projectURL.deletingPathExtension().lastPathComponent,
+            let requestedOptions = requestedRunOptions
+            try RunPlanResolver.validate(requestedOptions: requestedOptions, input: input)
+            let preset = Self.compatibilityPreset(for: requestedOptions)
+            let developmentOverrides = DevelopmentOverrides.fromProcessEnvironment()
+            let resolvedRunPlan = RunPlanResolver.resolveForCurrentHardware(
+                requestedOptions: requestedOptions,
                 input: input,
-                preset: PresetSpec(mode: captureMode, quality: qualityPreset),
-                requestedRunOptions: requestedOptions
+                developmentOverrides: developmentOverrides
             )
-            let paths = ProjectPaths(root: projectURL)
-            try paths.ensureDirectories()
-            try ProjectMetadataStore.save(metadata, to: paths.metadataURL)
-            currentPreset = metadata.preset
-            currentInput = input
+            let capabilityRequest = try resolvedRunPlan.toolchainCapabilityRequest()
 
             // Keep the Mac awake for the whole flow, including the first-run toolchain
             // download, which happens before the runner (and its own assertion) exists.
             let idleSleepAssertion = powerAssertion.beginPreventingIdleSleep(reason: "EasySplat is preparing and processing a project")
             defer { idleSleepAssertion.release() }
 
-            statusTitle = "Downloading tools"
+            statusTitle = "Preparing tools"
             statusDetail = nil
             progress = nil
             let progressForwarder = ProgressForwarder(model: self, taskToken: taskToken)
             let toolchain = try await toolchainManager.ensureToolchain(
                 manifestURL: AppConfig.toolchainManifestURL,
                 publicKeyBase64: AppConfig.toolchainPublicKeyBase64,
-                targetName: "macos-arm64"
+                targetName: "macos-arm64",
+                request: capabilityRequest
             ) { fraction, message in
                 progressForwarder.update(fraction: fraction, message: message)
             }
             guard isCurrentTaskToken(taskToken) else { return }
 
+            try Task.checkCancellation()
+            let projectURL = try createProjectDirectory(title: title)
+            let metadata = ProjectMetadata(
+                title: projectURL.deletingPathExtension().lastPathComponent,
+                input: input,
+                preset: preset,
+                requestedRunOptions: requestedOptions,
+                resolvedRunPlan: resolvedRunPlan
+            )
+            let paths = ProjectPaths(root: projectURL)
+            do {
+                try paths.ensureDirectories()
+                try ProjectMetadataStore.save(metadata, to: paths.metadataURL)
+            } catch {
+                try? FileManager.default.removeItem(at: projectURL)
+                throw error
+            }
+            currentProjectURL = projectURL
+            currentPreset = preset
+            currentInput = input
+            clearPendingInputs()
+
             let runner = pipelineRunnerFactory(
                 projectURL,
-                pipelineConfig(toolchain: toolchain, preset: metadata.preset)
+                pipelineConfig(
+                    toolchain: toolchain,
+                    preset: preset,
+                    resolvedRunPlan: resolvedRunPlan,
+                    developmentOverrides: developmentOverrides
+                )
             )
             let forwarder = EventForwarder(model: self, taskToken: taskToken)
             try await runner.run(resumeFrom: Optional<PipelineStage>.none) { event in
@@ -283,7 +298,7 @@ extension AppModel {
                 statusTitle = stopFailureCopy.title
                 statusDetail = stopFailureCopy.detail
                 progress = nil
-            } else if statusTitle == "Preparing project" || statusTitle == "Downloading tools" || statusTitle == "Something went wrong" {
+            } else if statusTitle == "Preparing project" || statusTitle == "Preparing tools" || statusTitle == "Something went wrong" {
                 statusTitle = lastError ?? "Something went wrong"
                 statusDetail = nil
                 progress = nil
@@ -313,6 +328,23 @@ extension AppModel {
         do {
             let paths = ProjectPaths(root: url)
             let metadata = try ProjectMetadataStore.load(from: paths.metadataURL)
+            let developmentOverrides = DevelopmentOverrides.fromProcessEnvironment()
+            let legacyDetailProfile: DetailProfile = switch metadata.preset.quality {
+            case .draft: .fast
+            case .standard: .balanced
+            case .ultra: .highDetail
+            }
+            let requestedOptions = metadata.requestedRunOptions ?? RequestedRunOptions(
+                capturePath: metadata.preset.mode == .object ? .orbit : .walkthrough,
+                detailProfile: legacyDetailProfile
+            )
+            let resolvedRunPlan = metadata.resolvedRunPlan
+                ?? RunPlanResolver.resolveForCurrentHardware(
+                    requestedOptions: requestedOptions,
+                    input: metadata.input,
+                    developmentOverrides: developmentOverrides
+                )
+            let capabilityRequest = try resolvedRunPlan.toolchainCapabilityRequest()
             currentProjectURL = url
             currentPreset = metadata.preset
             currentInput = metadata.input
@@ -349,14 +381,15 @@ extension AppModel {
             let idleSleepAssertion = powerAssertion.beginPreventingIdleSleep(reason: "EasySplat is preparing and resuming a project")
             defer { idleSleepAssertion.release() }
 
-            statusTitle = "Downloading tools"
+            statusTitle = "Preparing tools"
             statusDetail = nil
             progress = nil
             let progressForwarder = ProgressForwarder(model: self, taskToken: taskToken)
             let toolchain = try await toolchainManager.ensureToolchain(
                 manifestURL: AppConfig.toolchainManifestURL,
                 publicKeyBase64: AppConfig.toolchainPublicKeyBase64,
-                targetName: "macos-arm64"
+                targetName: "macos-arm64",
+                request: capabilityRequest
             ) { fraction, message in
                 progressForwarder.update(fraction: fraction, message: message)
             }
@@ -364,7 +397,12 @@ extension AppModel {
 
             let runner = pipelineRunnerFactory(
                 url,
-                pipelineConfig(toolchain: toolchain, preset: metadata.preset)
+                pipelineConfig(
+                    toolchain: toolchain,
+                    preset: metadata.preset,
+                    resolvedRunPlan: resolvedRunPlan,
+                    developmentOverrides: developmentOverrides
+                )
             )
             let forwarder = EventForwarder(model: self, taskToken: taskToken)
             let stageToResume = resumeStage(from: metadata)
@@ -424,7 +462,7 @@ extension AppModel {
                 statusTitle = stopFailureCopy.title
                 statusDetail = stopFailureCopy.detail
                 progress = nil
-            } else if statusTitle == "Preparing project" || statusTitle == "Downloading tools" || statusTitle == "Something went wrong" {
+            } else if statusTitle == "Preparing project" || statusTitle == "Preparing tools" || statusTitle == "Something went wrong" {
                 statusTitle = lastError ?? "Something went wrong"
                 statusDetail = nil
                 progress = nil
@@ -512,11 +550,18 @@ extension AppModel {
         }
     }
 
-    func pipelineConfig(toolchain: ToolchainPaths, preset: PresetSpec) -> PipelineRunner.PipelineConfig {
+    func pipelineConfig(
+        toolchain: ToolchainPaths,
+        preset: PresetSpec,
+        resolvedRunPlan: ResolvedRunPlan? = nil,
+        developmentOverrides: DevelopmentOverrides = .fromProcessEnvironment()
+    ) -> PipelineRunner.PipelineConfig {
         PipelineRunner.PipelineConfig(
             toolchain: toolchain,
             preset: preset,
-            speedProfile: speedProfile(for: preset)
+            speedProfile: speedProfile(for: preset),
+            developmentOverrides: developmentOverrides,
+            resolvedRunPlan: resolvedRunPlan
         )
     }
 

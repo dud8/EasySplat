@@ -71,7 +71,7 @@ extension AppModel {
 
     func handleToolchainProgress(fraction: Double, message: String) {
         progress = fraction < 0 ? nil : fraction
-        statusTitle = "Downloading tools"
+        statusTitle = "Preparing tools"
         statusDetail = message
         maybeAppendToolchainProgressLog(fraction: fraction, message: message)
     }

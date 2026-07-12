@@ -45,8 +45,26 @@ public protocol ToolchainManaging: Sendable {
         manifestURL: URL,
         publicKeyBase64: String,
         targetName: String,
+        request: ToolchainCapabilityRequest,
         onProgress: @escaping @Sendable (Double, String) -> Void
     ) async throws -> ToolchainPaths
+}
+
+public extension ToolchainManaging {
+    func ensureToolchain(
+        manifestURL: URL,
+        publicKeyBase64: String,
+        targetName: String,
+        onProgress: @escaping @Sendable (Double, String) -> Void
+    ) async throws -> ToolchainPaths {
+        try await ensureToolchain(
+            manifestURL: manifestURL,
+            publicKeyBase64: publicKeyBase64,
+            targetName: targetName,
+            request: .default,
+            onProgress: onProgress
+        )
+    }
 }
 
 public enum ToolchainCapability: String, Sendable, CaseIterable {

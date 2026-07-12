@@ -5,7 +5,6 @@ extension AppModel {
     func startFromPendingSelection() {
         guard let inputSpec = buildInputSpec() else { return }
         let title = projectTitle(for: inputSpec)
-        clearPendingInputs()
         currentTask?.cancel()
         let token = UUID()
         currentTaskToken = token
@@ -145,6 +144,8 @@ extension AppModel {
                 reconstruction: metadata.reconstruction,
                 stageTimings: metadata.stageTimings ?? [],
                 preset: metadata.preset,
+                input: metadata.input,
+                requestedRunOptions: metadata.requestedRunOptions,
                 lastOpenedAt: sidecarOpened ?? metadata.lastOpenedAt,
                 lastFailureAt: metadata.lastFailureAt,
                 recentErrorCount: errorCount
@@ -523,6 +524,8 @@ extension AppModel {
             reconstruction: nil,
             stageTimings: [],
             preset: nil,
+            input: nil,
+            requestedRunOptions: nil,
             lastOpenedAt: nil,
             lastFailureAt: nil,
             recentErrorCount: nil

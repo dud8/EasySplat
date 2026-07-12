@@ -1,66 +1,91 @@
 import EasySplatCore
 import Foundation
 
-/// Predicts the expected wall-clock duration of the next run by looking at
-/// successful past runs that match the currently-selected mode and quality.
+/// Predicts the expected wall-clock duration of the next run from genuinely
+/// comparable successful runs.
 /// Uses the median (robust against outliers like cold-start cache misses) and
 /// requires a minimum sample to avoid extrapolating from a single fluke run.
 enum RunDurationPredictor {
     /// Minimum number of comparable past runs before the prediction surfaces.
-    /// Lower than typical statistical wisdom because user-facing UI benefits
-    /// from any signal at all once a couple of runs exist.
-    static let minimumSamples = 2
+    static let minimumSamples = 3
 
     struct Prediction: Equatable {
         var seconds: TimeInterval
+        var minimumSeconds: TimeInterval
+        var maximumSeconds: TimeInterval
         var sampleCount: Int
+
+        init(
+            seconds: TimeInterval,
+            minimumSeconds: TimeInterval,
+            maximumSeconds: TimeInterval,
+            sampleCount: Int
+        ) {
+            self.seconds = seconds
+            self.minimumSeconds = minimumSeconds
+            self.maximumSeconds = maximumSeconds
+            self.sampleCount = sampleCount
+        }
     }
 
     static func predict(
-        mode: CaptureMode,
-        quality: QualityPreset,
+        options: RequestedRunOptions,
+        input: InputSpec,
         from projects: [ProjectSummary],
         excluding excludingURL: URL? = nil
     ) -> Prediction? {
-        // Only consider successful past runs that match BOTH the current mode
-        // and the current quality preset. Mixing draft/standard/ultra would
-        // smear the median across very different time budgets. The caller
-        // can opt to exclude one project (typically the one being viewed)
-        // so the comparison badge never benchmarks a run against itself.
-        let durations = projects
+        let inputShape = InputShape(input)
+        return prediction(from: projects
             .filter { $0.status == .ready && $0.url != excludingURL }
-            .filter { matchesPreset(summary: $0, mode: mode, quality: quality) }
-            .compactMap { $0.stageTimings.totalDurationSeconds }
-            .filter { $0 > 0 }
-        guard durations.count >= minimumSamples else { return nil }
-        return Prediction(seconds: median(of: durations), sampleCount: durations.count)
-    }
-
-    private static func matchesPreset(summary: ProjectSummary, mode: CaptureMode, quality: QualityPreset) -> Bool {
-        guard let preset = summary.preset else { return false }
-        return preset.mode == mode && preset.quality == quality
-    }
-
-    /// Median duration of a single stage across successful past runs that
-    /// match the current preset. Returns nil if we have fewer than
-    /// `minimumSamples` observations.
-    static func predictStage(
-        _ stage: PipelineStage,
-        mode: CaptureMode?,
-        quality: QualityPreset?,
-        from projects: [ProjectSummary]
-    ) -> Prediction? {
-        let durations = projects
-            .filter { $0.status == .ready }
-            .filter { project in
-                guard let mode, let quality else { return true }
-                return matchesPreset(summary: project, mode: mode, quality: quality)
+            .filter { $0.requestedRunOptions == options }
+            .filter { summary in
+                summary.input.map(InputShape.init) == inputShape
             }
-            .flatMap { $0.stageTimings }
-            .filter { $0.stage == stage && $0.durationSeconds > 0 }
-            .map { $0.durationSeconds }
+            .compactMap { $0.stageTimings.totalDurationSeconds }
+            .filter { $0 > 0 })
+    }
+
+    private enum InputShape: Equatable {
+        case videos(ClipCount)
+        case photos
+        case mixed(ClipCount)
+
+        init(_ input: InputSpec) {
+            switch input {
+            case .video(let files):
+                self = .videos(ClipCount(files.count))
+            case .photos:
+                self = .photos
+            case .mixed(let videos, _):
+                self = .mixed(ClipCount(videos.count))
+            }
+        }
+    }
+
+    private enum ClipCount: Equatable {
+        case one
+        case few
+        case many
+
+        init(_ count: Int) {
+            if count <= 1 {
+                self = .one
+            } else if count <= 3 {
+                self = .few
+            } else {
+                self = .many
+            }
+        }
+    }
+
+    private static func prediction(from durations: [TimeInterval]) -> Prediction? {
         guard durations.count >= minimumSamples else { return nil }
-        return Prediction(seconds: median(of: durations), sampleCount: durations.count)
+        return Prediction(
+            seconds: median(of: durations),
+            minimumSeconds: durations.min() ?? 0,
+            maximumSeconds: durations.max() ?? 0,
+            sampleCount: durations.count
+        )
     }
 
     static func medianForTesting(_ values: [TimeInterval]) -> TimeInterval {
@@ -80,8 +105,9 @@ enum RunDurationPredictor {
 
 extension RunDurationPredictor.Prediction {
     var displayText: String {
-        let durationText = StageTimingDisplay.formatDuration(seconds: seconds)
-        let sampleText = sampleCount == 1 ? "1 past run" : "\(sampleCount) past runs"
-        return "Estimated ~\(durationText) based on \(sampleText)"
+        let minimum = StageTimingDisplay.formatDuration(seconds: minimumSeconds)
+        let maximum = StageTimingDisplay.formatDuration(seconds: maximumSeconds)
+        let range = minimum == maximum ? minimum : "\(minimum)–\(maximum)"
+        return "Usually \(range) · \(sampleCount) similar runs"
     }
 }

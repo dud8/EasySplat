@@ -159,6 +159,7 @@ private struct ResultTestToolchainManager: ToolchainManaging {
         manifestURL: URL,
         publicKeyBase64: String,
         targetName: String,
+        request: ToolchainCapabilityRequest,
         onProgress: @escaping @Sendable (Double, String) -> Void
     ) async throws -> ToolchainPaths {
         fatalError("Result workspace tests do not install a toolchain")

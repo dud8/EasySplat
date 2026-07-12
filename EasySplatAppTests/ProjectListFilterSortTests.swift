@@ -27,6 +27,8 @@ final class ProjectListFilterSortTests: XCTestCase {
             reconstruction: nil,
             stageTimings: stageTimings,
             preset: PresetSpec(mode: .object, quality: .standard),
+            input: nil,
+            requestedRunOptions: nil,
             lastOpenedAt: lastOpenedAt,
             lastFailureAt: nil,
             recentErrorCount: nil

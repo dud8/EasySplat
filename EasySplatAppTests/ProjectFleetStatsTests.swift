@@ -27,6 +27,8 @@ final class ProjectFleetStatsTests: XCTestCase {
             reconstruction: reconstruction,
             stageTimings: stageTimings,
             preset: PresetSpec(mode: .object, quality: .standard),
+            input: nil,
+            requestedRunOptions: nil,
             lastOpenedAt: lastOpenedAt,
             lastFailureAt: lastFailureAt,
             recentErrorCount: nil

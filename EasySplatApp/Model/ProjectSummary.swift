@@ -17,6 +17,8 @@ struct ProjectSummary: Identifiable {
     let reconstruction: ReconstructionSummary?
     let stageTimings: [StageTimingRecord]
     let preset: PresetSpec?
+    let input: InputSpec?
+    let requestedRunOptions: RequestedRunOptions?
     let lastOpenedAt: Date?
     let lastFailureAt: Date?
     let recentErrorCount: Int?

@@ -7,14 +7,18 @@ import XCTest
 
 @MainActor
 final class AppModelTests: XCTestCase {
-    override func setUp() {
-        super.setUp()
-        // Capture-mode and quality-preset persistence is per-user in production but
-        // bleeds across XCTest cases otherwise — strip the keys so each test starts
-        // from the documented defaults instead of the previous case's tail state.
-        UserDefaults.standard.removeObject(forKey: AppModel.captureModeUserDefaultsKey)
-        UserDefaults.standard.removeObject(forKey: AppModel.qualityPresetUserDefaultsKey)
+    func testRequestedRunOptionsUseProfessionalDefaults() {
+        let base = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        let model = AppModel(toolchainManager: MockToolchainManager(), projectBaseURL: base) { url, config in
+            MockPipelineRunner(projectURL: url, config: config)
+        }
+
+        XCTAssertEqual(model.requestedRunOptions, RequestedRunOptions())
+        XCTAssertEqual(model.requestedRunOptions.capturePath, .automatic)
+        XCTAssertEqual(model.requestedRunOptions.detailProfile, .balanced)
     }
+
     func testStartProjectTransitionsToViewer() async throws {
         let tempBase = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
         try FileManager.default.createDirectory(at: tempBase, withIntermediateDirectories: true)
@@ -37,6 +41,8 @@ final class AppModelTests: XCTestCase {
         XCTAssertEqual(model.viewState, .viewer)
         XCTAssertNotNil(model.currentProjectURL)
         XCTAssertNotNil(model.outputPlyURL)
+        XCTAssertTrue(model.pendingVideoURLs.isEmpty)
+        XCTAssertNil(model.pendingPhotosFolderURL)
         guard let projectURL = model.currentProjectURL else {
             XCTFail("Missing project URL")
             return
@@ -220,8 +226,8 @@ final class AppModelTests: XCTestCase {
         let model = AppModel(toolchainManager: MockToolchainManager(), projectBaseURL: tempBase) { _, _ in
             BlockingPipelineRunner()
         }
-        model.captureMode = .room
-        model.qualityPreset = .ultra
+        model.requestedRunOptions.capturePath = .walkthrough
+        model.requestedRunOptions.detailProfile = .highDetail
         model.addInputs(urls: [input])
         model.startFromPendingSelection()
 
@@ -239,25 +245,65 @@ final class AppModelTests: XCTestCase {
         try await waitForViewState(model: model, state: .home, timeout: 4.0)
     }
 
-    func testStartProjectPersistsRequestedOptionsMatchingLegacyControls() async throws {
+    func testStartProjectPersistsEveryRequestedOptionAndMapsLegacyPreset() async throws {
         let tempBase = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
         defer { try? FileManager.default.removeItem(at: tempBase) }
         try FileManager.default.createDirectory(at: tempBase, withIntermediateDirectories: true)
         let input = tempBase.appendingPathComponent("clip.mov")
         try Data("video".utf8).write(to: input)
 
-        let model = AppModel(toolchainManager: MockToolchainManager(), projectBaseURL: tempBase) { projectURL, config in
-            MockPipelineRunner(projectURL: projectURL, config: config)
+        let toolchainManager = CapabilityRecordingToolchainManager()
+        var runnerPreset: PresetSpec?
+        var runnerPlan: ResolvedRunPlan?
+        let model = AppModel(toolchainManager: toolchainManager, projectBaseURL: tempBase) { projectURL, config in
+            runnerPreset = config.preset
+            runnerPlan = config.resolvedRunPlan
+            return MockPipelineRunner(projectURL: projectURL, config: config)
         }
-        model.captureMode = .room
-        model.qualityPreset = .ultra
+        let options = RequestedRunOptions(
+            capturePath: .largeArea,
+            detailProfile: .highDetail,
+            cameraGrouping: .mixedCamerasOrLenses,
+            lensProjection: .fisheye,
+            inputOrdering: .continuous,
+            resourcePolicy: .maximumPerformance,
+            photoSelection: .useAllValidPhotos
+        )
+        model.requestedRunOptions = options
 
         await model.startProject(input: .video(files: [input.path]), title: "Walkthrough")
 
         let projectURL = try XCTUnwrap(model.currentProjectURL)
         let metadata = try ProjectMetadataStore.load(from: ProjectPaths(root: projectURL).metadataURL)
-        XCTAssertEqual(metadata.requestedRunOptions?.capturePath, .walkthrough)
-        XCTAssertEqual(metadata.requestedRunOptions?.detailProfile, .highDetail)
+        XCTAssertEqual(metadata.requestedRunOptions, options)
+        let persistedPlan = try XCTUnwrap(metadata.resolvedRunPlan)
+        XCTAssertEqual(runnerPlan, persistedPlan)
+        XCTAssertEqual(
+            toolchainManager.lastRequest,
+            try persistedPlan.toolchainCapabilityRequest()
+        )
+        XCTAssertEqual(metadata.preset.mode, .room)
+        XCTAssertEqual(metadata.preset.quality, .ultra)
+        XCTAssertEqual(runnerPreset?.mode, .room)
+        XCTAssertEqual(runnerPreset?.quality, .ultra)
+    }
+
+    func testChangingPrimaryRunOptionsPreservesProfessionalChoices() {
+        let base = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        let model = AppModel(toolchainManager: MockToolchainManager(), projectBaseURL: base) { url, config in
+            MockPipelineRunner(projectURL: url, config: config)
+        }
+        model.requestedRunOptions.cameraGrouping = .sameCameraAndLens
+        model.requestedRunOptions.lensProjection = .fisheye
+
+        model.requestedRunOptions.capturePath = .walkthrough
+        model.requestedRunOptions.detailProfile = .fast
+
+        XCTAssertEqual(model.requestedRunOptions.capturePath, .walkthrough)
+        XCTAssertEqual(model.requestedRunOptions.detailProfile, .fast)
+        XCTAssertEqual(model.requestedRunOptions.cameraGrouping, .sameCameraAndLens)
+        XCTAssertEqual(model.requestedRunOptions.lensProjection, .fisheye)
     }
 
     func testResumedProcessingRunExposesPersistedPresetAndInput() async throws {
@@ -283,6 +329,46 @@ final class AppModelTests: XCTestCase {
 
         model.cancelCurrentProject(deleteProject: false)
         try await waitForViewState(model: model, state: .home, timeout: 4.0)
+    }
+
+    func testResumeUsesPersistedRunPlanForToolchainAndRunner() async throws {
+        let tempBase = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: tempBase) }
+        try FileManager.default.createDirectory(at: tempBase, withIntermediateDirectories: true)
+        let url = try makeProject(
+            at: tempBase,
+            name: "ResumePlan",
+            lastError: nil,
+            withOutput: false,
+            stage: .sfmFeatures
+        )
+        let paths = ProjectPaths(root: url)
+        var metadata = try ProjectMetadataStore.load(from: paths.metadataURL)
+        let options = RequestedRunOptions(detailProfile: .fast, resourcePolicy: .conserveMemory)
+        let persistedPlan = RunPlanResolver.resolveForCurrentHardware(
+            requestedOptions: options,
+            input: metadata.input
+        )
+        metadata.requestedRunOptions = options
+        metadata.resolvedRunPlan = persistedPlan
+        try ProjectMetadataStore.save(metadata, to: paths.metadataURL)
+
+        let toolchainManager = CapabilityRecordingToolchainManager()
+        var runnerPlan: ResolvedRunPlan?
+        let model = AppModel(toolchainManager: toolchainManager, projectBaseURL: tempBase) { projectURL, config in
+            runnerPlan = config.resolvedRunPlan
+            return MockPipelineRunner(projectURL: projectURL, config: config)
+        }
+
+        await model.resumeProjectTask(at: url)
+
+        XCTAssertEqual(model.viewState, .viewer)
+        XCTAssertEqual(runnerPlan, persistedPlan)
+        XCTAssertEqual(
+            toolchainManager.lastRequest,
+            try persistedPlan.toolchainCapabilityRequest()
+        )
     }
 
     func testUpdateProjectNotesPersistsAndClearsWhenEmpty() throws {
@@ -360,7 +446,7 @@ final class AppModelTests: XCTestCase {
         XCTAssertFalse(model.renameProject(at: projectURL, to: "Same"))
     }
 
-    func testStartProjectUsesFastProfileByDefault() async throws {
+    func testStartProjectUsesBalancedProfileByDefault() async throws {
         let tempBase = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
         defer { try? FileManager.default.removeItem(at: tempBase) }
         try FileManager.default.createDirectory(at: tempBase, withIntermediateDirectories: true)
@@ -376,35 +462,40 @@ final class AppModelTests: XCTestCase {
             return MockPipelineRunner(projectURL: projectURL, config: config)
         }
 
-        XCTAssertEqual(model.qualityPreset, .draft)
-        await model.startProject(input: .video(files: [input.path]), title: "FastDefault")
+        XCTAssertEqual(model.requestedRunOptions.detailProfile, .balanced)
+        await model.startProject(input: .video(files: [input.path]), title: "BalancedDefault")
+
+        XCTAssertEqual(capturedSpeedProfile, .standard)
+        let projectURL = try XCTUnwrap(model.currentProjectURL)
+        let metadata = try ProjectMetadataStore.load(from: ProjectPaths(root: projectURL).metadataURL)
+        XCTAssertEqual(metadata.requestedRunOptions?.detailProfile, .balanced)
+        XCTAssertEqual(metadata.preset.quality, .standard)
+    }
+
+    func testStartProjectUsesFastSpeedProfileForExplicitFastDetail() async throws {
+        let tempBase = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: tempBase) }
+        try FileManager.default.createDirectory(at: tempBase, withIntermediateDirectories: true)
+        let input = tempBase.appendingPathComponent("input.mov")
+        try Data("video".utf8).write(to: input)
+        var capturedSpeedProfile: PipelineRunner.SpeedProfile?
+
+        let model = AppModel(
+            toolchainManager: MockToolchainManager(),
+            projectBaseURL: tempBase
+        ) { projectURL, config in
+            capturedSpeedProfile = config.speedProfile
+            return MockPipelineRunner(projectURL: projectURL, config: config)
+        }
+
+        model.requestedRunOptions.detailProfile = .fast
+        await model.startProject(input: .video(files: [input.path]), title: "Fast")
 
         XCTAssertEqual(capturedSpeedProfile, .fast)
         let projectURL = try XCTUnwrap(model.currentProjectURL)
         let metadata = try ProjectMetadataStore.load(from: ProjectPaths(root: projectURL).metadataURL)
+        XCTAssertEqual(metadata.requestedRunOptions?.detailProfile, .fast)
         XCTAssertEqual(metadata.preset.quality, .draft)
-    }
-
-    func testStartProjectUsesStandardSpeedProfileForBalancedQuality() async throws {
-        let tempBase = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
-        defer { try? FileManager.default.removeItem(at: tempBase) }
-        try FileManager.default.createDirectory(at: tempBase, withIntermediateDirectories: true)
-        let input = tempBase.appendingPathComponent("input.mov")
-        try Data("video".utf8).write(to: input)
-        var capturedSpeedProfile: PipelineRunner.SpeedProfile?
-
-        let model = AppModel(
-            toolchainManager: MockToolchainManager(),
-            projectBaseURL: tempBase
-        ) { projectURL, config in
-            capturedSpeedProfile = config.speedProfile
-            return MockPipelineRunner(projectURL: projectURL, config: config)
-        }
-
-        model.qualityPreset = .standard
-        await model.startProject(input: .video(files: [input.path]), title: "Balanced")
-
-        XCTAssertEqual(capturedSpeedProfile, .standard)
     }
 
     func testStartProjectReportsFailureWhenRunnerFinishesWithoutReadyOutput() async throws {
@@ -435,7 +526,7 @@ final class AppModelTests: XCTestCase {
         XCTAssertEqual(metadata.state.lastError, "Processing failed. Expected outputs were missing.")
     }
 
-    func testStartProjectPersistsToolchainFailureAsFailedSummary() async throws {
+    func testStartProjectToolchainFailureCreatesNoDurableProject() async throws {
         let tempBase = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
         defer { try? FileManager.default.removeItem(at: tempBase) }
         try FileManager.default.createDirectory(at: tempBase, withIntermediateDirectories: true)
@@ -452,15 +543,50 @@ final class AppModelTests: XCTestCase {
         try await waitForLastError(model: model, timeout: 4.0)
         model.refreshProjectSummaries()
 
-        let summary = try XCTUnwrap(model.projectSummaries.first)
-        XCTAssertEqual(summary.status, .failed)
-        XCTAssertEqual(summary.lastError, "manifest unreachable")
-        XCTAssertNotNil(summary.lastFailureAt)
-        let metadata = try ProjectMetadataStore.load(from: ProjectPaths(root: summary.url).metadataURL)
-        XCTAssertEqual(metadata.state.lastError, "manifest unreachable")
-        XCTAssertNotNil(metadata.lastFailureAt)
-        XCTAssertNil(metadata.checkpoint)
-        XCTAssertNil(metadata.lastRunStartedAt)
+        XCTAssertEqual(model.lastError, "manifest unreachable")
+        XCTAssertNil(model.currentProjectURL)
+        XCTAssertNil(model.currentPreset)
+        XCTAssertNil(model.currentInput)
+        XCTAssertEqual(model.pendingVideoURLs, [input])
+        XCTAssertNil(model.pendingPhotosFolderURL)
+        XCTAssertTrue(model.projectSummaries.isEmpty)
+        let projectBundles = try FileManager.default.contentsOfDirectory(
+            at: tempBase,
+            includingPropertiesForKeys: nil
+        ).filter { $0.pathExtension == "easysplatproj" }
+        XCTAssertTrue(projectBundles.isEmpty)
+    }
+
+    func testContinuousMultipleClipsFailsBeforeToolchainOrProjectCreation() async throws {
+        let tempBase = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: tempBase) }
+        try FileManager.default.createDirectory(at: tempBase, withIntermediateDirectories: true)
+        let first = tempBase.appendingPathComponent("first.mov")
+        let second = tempBase.appendingPathComponent("second.mov")
+        try Data("first".utf8).write(to: first)
+        try Data("second".utf8).write(to: second)
+        let toolchain = CapabilityRecordingToolchainManager()
+        let model = AppModel(toolchainManager: toolchain, projectBaseURL: tempBase) { _, _ in
+            XCTFail("Pipeline runner should not start for an unverified continuous multi-clip input.")
+            return BlockingPipelineRunner()
+        }
+        model.addInputs(urls: [first, second])
+        model.requestedRunOptions.inputOrdering = .continuous
+
+        model.startFromPendingSelection()
+        try await waitForLastError(model: model, timeout: 4.0)
+
+        XCTAssertEqual(
+            model.lastError,
+            "Continuous sequence currently supports one video clip. Use Automatic or Unordered for separate clips."
+        )
+        XCTAssertNil(toolchain.lastRequest)
+        XCTAssertNil(model.currentProjectURL)
+        let projectBundles = try FileManager.default.contentsOfDirectory(
+            at: tempBase,
+            includingPropertiesForKeys: nil
+        ).filter { $0.pathExtension == "easysplatproj" }
+        XCTAssertTrue(projectBundles.isEmpty)
     }
 
     func testTrainingStopCopyPromisesValidationNotAutomaticResume() {
@@ -1997,9 +2123,30 @@ final class MockToolchainManager: ToolchainManaging {
         manifestURL: URL,
         publicKeyBase64: String,
         targetName: String,
+        request: ToolchainCapabilityRequest,
         onProgress: @escaping @Sendable (Double, String) -> Void
     ) async throws -> ToolchainPaths {
         makeMockToolchainPaths()
+    }
+}
+
+final class CapabilityRecordingToolchainManager: @unchecked Sendable, ToolchainManaging {
+    private let queue = DispatchQueue(label: "CapabilityRecordingToolchainManager")
+    private var requests: [ToolchainCapabilityRequest] = []
+
+    var lastRequest: ToolchainCapabilityRequest? {
+        queue.sync { requests.last }
+    }
+
+    func ensureToolchain(
+        manifestURL: URL,
+        publicKeyBase64: String,
+        targetName: String,
+        request: ToolchainCapabilityRequest,
+        onProgress: @escaping @Sendable (Double, String) -> Void
+    ) async throws -> ToolchainPaths {
+        queue.sync { requests.append(request) }
+        return makeMockToolchainPaths()
     }
 }
 
@@ -2010,6 +2157,7 @@ struct FailingToolchainManager: ToolchainManaging {
         manifestURL: URL,
         publicKeyBase64: String,
         targetName: String,
+        request: ToolchainCapabilityRequest,
         onProgress: @escaping @Sendable (Double, String) -> Void
     ) async throws -> ToolchainPaths {
         throw NSError(domain: "FailingToolchainManager", code: 1, userInfo: [NSLocalizedDescriptionKey: message])
@@ -2031,6 +2179,7 @@ final class DelayedProgressToolchainManager: @unchecked Sendable, ToolchainManag
         manifestURL: URL,
         publicKeyBase64: String,
         targetName: String,
+        request: ToolchainCapabilityRequest,
         onProgress: @escaping @Sendable (Double, String) -> Void
     ) async throws -> ToolchainPaths {
         try await withCheckedThrowingContinuation { continuation in

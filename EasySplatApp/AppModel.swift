@@ -44,12 +44,7 @@ final class AppModel: ObservableObject {
     @Published var stopAction: StopAction? = nil
 
     @Published var cachedFreeDiskBytes: Int64? = nil
-    @Published var captureMode: CaptureMode = AppModel.persistedCaptureMode() {
-        didSet { UserDefaults.standard.set(captureMode.rawValue, forKey: AppModel.captureModeUserDefaultsKey) }
-    }
-    @Published var qualityPreset: QualityPreset = AppModel.persistedQualityPreset() {
-        didSet { UserDefaults.standard.set(qualityPreset.rawValue, forKey: AppModel.qualityPresetUserDefaultsKey) }
-    }
+    @Published var requestedRunOptions = RequestedRunOptions()
     @Published var pendingVideoURLs: [URL] = []
     @Published var pendingPhotosFolderURL: URL? = nil
     @Published var projectSummaries: [ProjectSummary] = []
@@ -96,17 +91,19 @@ final class AppModel: ObservableObject {
     var ignoredRecoveryProjectIDs: Set<UUID> = []
     static let forcedExitTimeoutNanoseconds: UInt64 = 25_000_000_000
 
-    nonisolated static let captureModeUserDefaultsKey = "EasySplatCaptureMode"
-    nonisolated static let qualityPresetUserDefaultsKey = "EasySplatQualityPreset"
-
-    static func persistedCaptureMode() -> CaptureMode {
-        let raw = UserDefaults.standard.string(forKey: captureModeUserDefaultsKey) ?? ""
-        return CaptureMode(rawValue: raw) ?? .object
-    }
-
-    static func persistedQualityPreset() -> QualityPreset {
-        let raw = UserDefaults.standard.string(forKey: qualityPresetUserDefaultsKey) ?? ""
-        return QualityPreset(rawValue: raw) ?? .draft
+    /// Project metadata v1 requires a two-value preset. Runtime policy must use
+    /// `RequestedRunOptions` and `ResolvedRunPlan`, never this lossy projection.
+    static func compatibilityPreset(for options: RequestedRunOptions) -> PresetSpec {
+        let mode: CaptureMode = switch options.capturePath {
+        case .automatic, .orbit: .object
+        case .walkthrough, .largeArea: .room
+        }
+        let quality: QualityPreset = switch options.detailProfile {
+        case .fast: .draft
+        case .balanced: .standard
+        case .highDetail: .ultra
+        }
+        return PresetSpec(mode: mode, quality: quality)
     }
 
     enum StopAction {
