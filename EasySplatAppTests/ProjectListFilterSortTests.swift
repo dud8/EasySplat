@@ -8,7 +8,6 @@ final class ProjectListFilterSortTests: XCTestCase {
         title: String = "Project",
         createdAt: Date = Date(timeIntervalSince1970: 0),
         status: ProjectStatus = .ready,
-        reconstruction: ReconstructionSummary? = nil,
         stageTimings: [StageTimingRecord] = [],
         lastOpenedAt: Date? = nil
     ) -> ProjectSummary {
@@ -25,7 +24,7 @@ final class ProjectListFilterSortTests: XCTestCase {
             lastError: nil,
             outputPlyURL: nil,
             outputPlySizeBytes: nil,
-            reconstruction: reconstruction,
+            reconstruction: nil,
             stageTimings: stageTimings,
             preset: PresetSpec(mode: .object, quality: .standard),
             lastOpenedAt: lastOpenedAt,
@@ -62,67 +61,46 @@ final class ProjectListFilterSortTests: XCTestCase {
         XCTAssertEqual(sorted.map(\.title), ["New", "Old"])
     }
 
-    func testSortByDurationLongestUsesStageTimings() {
-        let short = makeSummary(
-            title: "Short",
-            stageTimings: [
-                .init(stage: .sfmFeatures, startedAt: Date(timeIntervalSince1970: 0), durationSeconds: 30)
-            ]
+    func testSortMenuContainsOnlyRecentCreatedAndName() {
+        XCTAssertEqual(
+            ProjectListSort.allCases.map(\.displayName),
+            ["Created", "Recent", "Name"]
         )
-        let long = makeSummary(
-            title: "Long",
-            stageTimings: [
-                .init(stage: .sfmFeatures, startedAt: Date(timeIntervalSince1970: 0), durationSeconds: 60),
-                .init(stage: .trainSplat, startedAt: Date(timeIntervalSince1970: 100), durationSeconds: 300)
-            ]
-        )
-        let untimed = makeSummary(title: "Untimed")
-        let sorted = ProjectListSort.durationLongest.apply(to: [untimed, short, long])
-        XCTAssertEqual(sorted.map(\.title), ["Long", "Short", "Untimed"])
     }
 
-    func testSortByCoverageHighestRanksRegisteredFractionDesc() {
-        let highCoverage = makeSummary(
-            title: "High",
-            reconstruction: ReconstructionSummary(
-                mapper: "vggt",
-                capturedAt: Date(timeIntervalSince1970: 0),
-                registeredImages: 30,
-                totalImages: 30
-            )
+    func testSidebarAppliesStatusSearchAndSortTogether() {
+        let readyKitchen = makeSummary(
+            title: "Kitchen",
+            createdAt: Date(timeIntervalSince1970: 100),
+            status: .ready
         )
-        let lowCoverage = makeSummary(
-            title: "Low",
-            reconstruction: ReconstructionSummary(
-                mapper: "vggt",
-                capturedAt: Date(timeIntervalSince1970: 0),
-                registeredImages: 5,
-                totalImages: 30
-            )
+        let failedKitchen = makeSummary(
+            title: "Kitchen Retry",
+            createdAt: Date(timeIntervalSince1970: 300),
+            status: .failed
         )
-        let noReconstruction = makeSummary(title: "None")
-        let sorted = ProjectListSort.coverageHighest.apply(to: [noReconstruction, lowCoverage, highCoverage])
-        XCTAssertEqual(sorted.map(\.title), ["High", "Low", "None"])
-    }
+        let readyOffice = makeSummary(
+            title: "Office",
+            createdAt: Date(timeIntervalSince1970: 200),
+            status: .ready
+        )
 
-    func testTrashCandidateURLsKeepsOnlyFailedAndExcludesActive() {
-        let failedActive = makeSummary(title: "Active", status: .failed)
-        let failedIdle = makeSummary(title: "Idle", status: .failed)
-        let ready = makeSummary(title: "Ready", status: .ready)
-        let inProgress = makeSummary(title: "Working", status: .inProgress)
-        let candidates = ProjectListView.trashCandidateURLs(
-            in: [failedActive, failedIdle, ready, inProgress],
-            excludingActive: failedActive.url
+        let visible = ProjectSidebar.visibleProjects(
+            [readyOffice, failedKitchen, readyKitchen],
+            filter: .ready,
+            sort: .createdNewest,
+            searchText: "kitchen"
         )
-        XCTAssertEqual(candidates, [failedIdle.url])
+
+        XCTAssertEqual(visible.map(\.title), ["Kitchen"])
     }
 
     func testRenameDraftValidityRejectsEmptyAndUnchangedTitles() {
-        XCTAssertTrue(ProjectListView.renameDraftIsInvalid(draft: "", currentTitle: "ProjectA"))
-        XCTAssertTrue(ProjectListView.renameDraftIsInvalid(draft: "   ", currentTitle: "ProjectA"))
-        XCTAssertTrue(ProjectListView.renameDraftIsInvalid(draft: " ProjectA ", currentTitle: "ProjectA"))
-        XCTAssertFalse(ProjectListView.renameDraftIsInvalid(draft: "ProjectB", currentTitle: "ProjectA"))
-        XCTAssertFalse(ProjectListView.renameDraftIsInvalid(draft: " ProjectB ", currentTitle: "ProjectA"))
+        XCTAssertTrue(ProjectSidebar.renameDraftIsInvalid(draft: "", currentTitle: "ProjectA"))
+        XCTAssertTrue(ProjectSidebar.renameDraftIsInvalid(draft: "   ", currentTitle: "ProjectA"))
+        XCTAssertTrue(ProjectSidebar.renameDraftIsInvalid(draft: " ProjectA ", currentTitle: "ProjectA"))
+        XCTAssertFalse(ProjectSidebar.renameDraftIsInvalid(draft: "ProjectB", currentTitle: "ProjectA"))
+        XCTAssertFalse(ProjectSidebar.renameDraftIsInvalid(draft: " ProjectB ", currentTitle: "ProjectA"))
     }
 
     func testSortByLastActivityPrefersLastOpenedAtOverStageTimings() {

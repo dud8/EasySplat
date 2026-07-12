@@ -1,6 +1,6 @@
 import SwiftUI
 
-struct RootView: View {
+struct WorkspaceView: View {
     @EnvironmentObject private var model: AppModel
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
@@ -18,9 +18,8 @@ struct RootView: View {
                     .transition(.opacity)
             }
         }
-        .animation(reduceMotion ? nil : Theme.Motion.reveal, value: model.viewState)
-        .tint(Theme.accent)
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .animation(reduceMotion ? nil : Theme.Motion.workspace, value: model.viewState)
         .background(Theme.background)
-        .background(WindowAccessor())
     }
 }

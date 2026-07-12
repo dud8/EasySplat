@@ -93,18 +93,14 @@ enum ProjectListSort: String, CaseIterable, Identifiable {
     case createdNewest
     case lastActivityNewest
     case titleAlphabetical
-    case durationLongest
-    case coverageHighest
 
     var id: String { rawValue }
 
     var displayName: String {
         switch self {
-        case .createdNewest: return "Newest first"
-        case .lastActivityNewest: return "Recent activity"
-        case .titleAlphabetical: return "Title (A–Z)"
-        case .durationLongest: return "Longest run"
-        case .coverageHighest: return "Highest coverage"
+        case .createdNewest: return "Created"
+        case .lastActivityNewest: return "Recent"
+        case .titleAlphabetical: return "Name"
         }
     }
 
@@ -116,24 +112,6 @@ enum ProjectListSort: String, CaseIterable, Identifiable {
             return projects.sorted { $0.lastActivityAt > $1.lastActivityAt }
         case .titleAlphabetical:
             return projects.sorted { $0.title.localizedCaseInsensitiveCompare($1.title) == .orderedAscending }
-        case .durationLongest:
-            return projects.sorted {
-                let lhs = $0.stageTimings.totalDurationSeconds ?? -1
-                let rhs = $1.stageTimings.totalDurationSeconds ?? -1
-                if lhs == rhs {
-                    return $0.createdAt > $1.createdAt
-                }
-                return lhs > rhs
-            }
-        case .coverageHighest:
-            return projects.sorted {
-                let lhs = $0.reconstruction?.registeredFraction ?? -1
-                let rhs = $1.reconstruction?.registeredFraction ?? -1
-                if lhs == rhs {
-                    return $0.createdAt > $1.createdAt
-                }
-                return lhs > rhs
-            }
         }
     }
 }

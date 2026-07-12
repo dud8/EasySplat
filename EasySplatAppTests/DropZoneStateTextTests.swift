@@ -14,11 +14,11 @@ final class DropZoneStateTextTests: XCTestCase {
         )
         XCTAssertEqual(
             DropZoneView.displayTitle(restingTitle: "Drop input", isTargeted: true),
-            "Release to import"
+            "Release to add"
         )
         XCTAssertEqual(
             DropZoneView.displaySubtitle(restingSubtitle: "Videos or photos", isTargeted: true),
-            "EasySplat will pick up everything you drop here."
+            "Video or photos folder"
         )
     }
 }
