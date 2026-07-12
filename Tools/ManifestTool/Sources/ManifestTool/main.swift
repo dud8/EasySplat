@@ -27,12 +27,15 @@ struct ManifestTool {
             let manifestOut = try parser.require("--manifest-out")
             let privateKey = try ManifestKeyInput.resolvePrivateKeyBase64(parser: &parser)
             let publishedAt = try parsePublishedAt(publishedAtValue)
+            let minimumAppVersion = try parser.require("--app-version-minimum")
+            let maximumAppVersion = try parser.require("--app-version-maximum-exclusive")
 
-            let artifactInputs = try buildArtifactInputs(parser: &parser)
+            let componentInputs = try buildComponentInputs(parser: &parser)
             let manifest = try ManifestBuilder.build(
                 version: version,
                 publishedAt: publishedAt,
-                artifacts: artifactInputs,
+                appVersionRange: .init(minimum: minimumAppVersion, maximumExclusive: maximumAppVersion),
+                components: componentInputs,
                 privateKeyBase64: privateKey
             )
             try ManifestBuilder.writeManifest(manifest, to: URL(fileURLWithPath: manifestOut))
@@ -50,18 +53,16 @@ struct ManifestTool {
         Generate keypair:
           ManifestTool generate-keypair --public-key-out <path> --private-key-out <path>
 
-        Generate manifest (single artifact):
-          ManifestTool --zip <path> --version <semver> --published-at <iso8601> \\
-            --artifact-url <url> --private-key-file <path> --manifest-out <path>
-
-        Generate manifest (core + models):
+        Generate schema-2 component manifest:
           ManifestTool --core-zip <path> --core-url <url> \\
-            --models-zip <path> --models-url <url> \\
+            --da3-base-zip <path> --da3-base-url <url> \\
+            --da3-small-zip <path> --da3-small-url <url> \\
             --version <semver> --published-at <iso8601> \\
+            --app-version-minimum <semver> --app-version-maximum-exclusive <semver> \\
             --private-key-file <path> --manifest-out <path>
 
         Private key source:
-          Use exactly one of --private-key-file <path>, --private-key-env <name>, or legacy --private-key <base64>.
+          Use exactly one of --private-key-file <path> or --private-key-env <name>.
         """
         print(text)
     }
@@ -78,36 +79,41 @@ struct ManifestTool {
         return date
     }
 
-    private static func buildArtifactInputs(parser: inout ArgParser) throws -> [ManifestArtifactInput] {
-        if let coreZipPath = parser.value(for: "--core-zip") {
-            let coreURL = try parser.require("--core-url")
-            let modelsZipPath = try parser.require("--models-zip")
-            let modelsURL = try parser.require("--models-url")
-            return [
-                ManifestArtifactInput(
-                    name: "macos-arm64-core",
-                    artifactURL: coreURL,
-                    zipURL: URL(fileURLWithPath: coreZipPath),
-                    contents: ManifestToolDefaults.splitCoreContents
-                ),
-                ManifestArtifactInput(
-                    name: "macos-arm64-models",
-                    artifactURL: modelsURL,
-                    zipURL: URL(fileURLWithPath: modelsZipPath),
-                    contents: ManifestToolDefaults.splitModelsContents
-                ),
-            ]
-        }
-
-        let zipPath = try parser.require("--zip")
-        let artifactURL = try parser.require("--artifact-url")
+    private static func buildComponentInputs(parser: inout ArgParser) throws -> [ManifestArtifactInput] {
+        let coreZipPath = try parser.require("--core-zip")
+        let coreURL = try parser.require("--core-url")
+        let baseZipPath = try parser.require("--da3-base-zip")
+        let baseURL = try parser.require("--da3-base-url")
+        let smallZipPath = try parser.require("--da3-small-zip")
+        let smallURL = try parser.require("--da3-small-url")
         return [
             ManifestArtifactInput(
-                name: "macos-arm64",
-                artifactURL: artifactURL,
-                zipURL: URL(fileURLWithPath: zipPath),
-                contents: ManifestToolDefaults.monolithicContents
-            )
+                name: "macos-arm64-core",
+                artifactURL: coreURL,
+                zipURL: URL(fileURLWithPath: coreZipPath),
+                capabilities: ManifestToolDefaults.coreCapabilities,
+                dependencies: [],
+                requirement: .required,
+                criticalFilePaths: ManifestToolDefaults.criticalCoreFiles
+            ),
+            ManifestArtifactInput(
+                name: "geometry-da3-base",
+                artifactURL: baseURL,
+                zipURL: URL(fileURLWithPath: baseZipPath),
+                capabilities: ["geometry.da3.base"],
+                dependencies: ["macos-arm64-core"],
+                requirement: .required,
+                criticalFilePaths: ManifestToolDefaults.da3BaseContents
+            ),
+            ManifestArtifactInput(
+                name: "geometry-da3-small",
+                artifactURL: smallURL,
+                zipURL: URL(fileURLWithPath: smallZipPath),
+                capabilities: ["geometry.da3.small"],
+                dependencies: ["macos-arm64-core"],
+                requirement: .optional,
+                criticalFilePaths: ManifestToolDefaults.da3SmallContents
+            ),
         ]
     }
 }

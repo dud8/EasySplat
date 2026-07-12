@@ -31,7 +31,19 @@ OUT="$ROOT/Toolchains/out"
 BIN="$OUT/bin"
 LIB="$OUT/lib"
 CORE_ZIP="$OUT/toolchain-macos-arm64-$VERSION-core.zip"
-MODELS_ZIP="$OUT/toolchain-macos-arm64-$VERSION-models.zip"
+DA3_BASE_ZIP="$OUT/toolchain-geometry-da3-base-$VERSION.zip"
+DA3_SMALL_ZIP="$OUT/toolchain-geometry-da3-small-$VERSION.zip"
+MAX_RELEASE_ASSET_BYTES=2147483648
+
+assert_release_asset_size() {
+  local archive="$1"
+  local size
+  size="$(stat -f '%z' "$archive")"
+  if (( size >= MAX_RELEASE_ASSET_BYTES )); then
+    echo "Release component must be smaller than 2 GiB: $archive ($size bytes)" >&2
+    exit 1
+  fi
+}
 
 rm -rf "$OUT"
 mkdir -p "$BIN" "$LIB"
@@ -520,8 +532,14 @@ zip -r "$CORE_ZIP" \
   bin lib \
   msplat/build_info.json msplat/LICENSE \
   da3_mps/bin da3_mps/python da3_mps/app da3_mps/vendor da3_mps/build_info.json
-zip -r "$MODELS_ZIP" da3_mps/models
+zip -r "$DA3_BASE_ZIP" da3_mps/models/DA3-BASE
+zip -r "$DA3_SMALL_ZIP" da3_mps/models/DA3-SMALL
 popd >/dev/null
 
+assert_release_asset_size "$CORE_ZIP"
+assert_release_asset_size "$DA3_BASE_ZIP"
+assert_release_asset_size "$DA3_SMALL_ZIP"
+
 echo "Packaged toolchain (core): $CORE_ZIP"
-echo "Packaged toolchain (models): $MODELS_ZIP"
+echo "Packaged component (DA3-BASE): $DA3_BASE_ZIP"
+echo "Packaged component (DA3-SMALL): $DA3_SMALL_ZIP"

@@ -2,17 +2,23 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
-VERSION=""
+APP_VERSION=""
+TOOLCHAIN_VERSION=""
 MANIFEST_URL=""
 CORE_ARTIFACT_URL=""
-MODELS_ARTIFACT_URL=""
+DA3_BASE_ARTIFACT_URL=""
+DA3_SMALL_ARTIFACT_URL=""
 PROJECT_URL=""
 PORT="${EASYSPLAT_DEV_PORT:-8000}"
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --version)
-      VERSION="$2"
+    --app-version)
+      APP_VERSION="$2"
+      shift 2
+      ;;
+    --toolchain-version)
+      TOOLCHAIN_VERSION="$2"
       shift 2
       ;;
     --manifest-url)
@@ -27,8 +33,12 @@ while [[ $# -gt 0 ]]; do
       CORE_ARTIFACT_URL="$2"
       shift 2
       ;;
-    --models-artifact-url)
-      MODELS_ARTIFACT_URL="$2"
+    --da3-base-artifact-url)
+      DA3_BASE_ARTIFACT_URL="$2"
+      shift 2
+      ;;
+    --da3-small-artifact-url)
+      DA3_SMALL_ARTIFACT_URL="$2"
       shift 2
       ;;
     --project-url)
@@ -46,8 +56,18 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-if [ -z "$VERSION" ]; then
-  echo "Usage: build_dmg.sh --version <semver> [--manifest-url <url>] [--core-artifact-url <url>] [--models-artifact-url <url>] [--project-url <url>] [--port <port>]" >&2
+if [ -z "$APP_VERSION" ] || [ -z "$TOOLCHAIN_VERSION" ]; then
+  echo "Usage: build_dmg.sh --app-version <semver> --toolchain-version <semver> [--manifest-url <url>] [--core-artifact-url <url>] [--da3-base-artifact-url <url>] [--da3-small-artifact-url <url>] [--project-url <url>] [--port <port>]" >&2
+  exit 1
+fi
+
+SEMVER_RE='^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]+)?$'
+if ! [[ "$APP_VERSION" =~ $SEMVER_RE ]]; then
+  echo "Invalid app semantic version: $APP_VERSION" >&2
+  exit 1
+fi
+if ! [[ "$TOOLCHAIN_VERSION" =~ $SEMVER_RE ]]; then
+  echo "Invalid toolchain semantic version: $TOOLCHAIN_VERSION" >&2
   exit 1
 fi
 
@@ -63,11 +83,20 @@ if [ -z "$MANIFEST_URL" ]; then
   MANIFEST_URL="http://localhost:$PORT/manifest.json"
 fi
 if [ -z "$CORE_ARTIFACT_URL" ]; then
-  CORE_ARTIFACT_URL="http://localhost:$PORT/out/toolchain-macos-arm64-$VERSION-core.zip"
+  CORE_ARTIFACT_URL="http://localhost:$PORT/out/toolchain-macos-arm64-$TOOLCHAIN_VERSION-core.zip"
 fi
-if [ -z "$MODELS_ARTIFACT_URL" ]; then
-  MODELS_ARTIFACT_URL="http://localhost:$PORT/out/toolchain-macos-arm64-$VERSION-models.zip"
+if [ -z "$DA3_BASE_ARTIFACT_URL" ]; then
+  DA3_BASE_ARTIFACT_URL="http://localhost:$PORT/out/toolchain-geometry-da3-base-$TOOLCHAIN_VERSION.zip"
 fi
+if [ -z "$DA3_SMALL_ARTIFACT_URL" ]; then
+  DA3_SMALL_ARTIFACT_URL="http://localhost:$PORT/out/toolchain-geometry-da3-small-$TOOLCHAIN_VERSION.zip"
+fi
+
+APP_VERSION_MINIMUM="$APP_VERSION"
+APP_RELEASE_VERSION="${APP_VERSION%%+*}"
+APP_RELEASE_VERSION="${APP_RELEASE_VERSION%%-*}"
+IFS='.' read -r APP_VERSION_MAJOR APP_VERSION_MINOR _ <<< "$APP_RELEASE_VERSION"
+APP_VERSION_MAX_EXCLUSIVE="$APP_VERSION_MAJOR.$((10#$APP_VERSION_MINOR + 1)).0"
 
 if command -v xcodebuild >/dev/null 2>&1; then
   if ! xcodebuild -license check >/dev/null 2>&1; then
@@ -78,8 +107,9 @@ fi
 
 TOOLCHAINS="$ROOT/Toolchains"
 OUT="$TOOLCHAINS/out"
-CORE_ZIP="$OUT/toolchain-macos-arm64-$VERSION-core.zip"
-MODELS_ZIP="$OUT/toolchain-macos-arm64-$VERSION-models.zip"
+CORE_ZIP="$OUT/toolchain-macos-arm64-$TOOLCHAIN_VERSION-core.zip"
+DA3_BASE_ZIP="$OUT/toolchain-geometry-da3-base-$TOOLCHAIN_VERSION.zip"
+DA3_SMALL_ZIP="$OUT/toolchain-geometry-da3-small-$TOOLCHAIN_VERSION.zip"
 MANIFEST="$TOOLCHAINS/manifest.json"
 PUB="$TOOLCHAINS/public_key_ed25519.txt"
 PRIV="$TOOLCHAINS/private_key_ed25519.txt"
@@ -88,7 +118,7 @@ PRIV="$TOOLCHAINS/private_key_ed25519.txt"
 "$ROOT/scripts/toolchain/build_colmap.sh"
 "$ROOT/scripts/toolchain/build_msplat.sh"
 "$ROOT/scripts/toolchain/build_da3_mps.sh"
-"$ROOT/scripts/toolchain/package_toolchain.sh" --version "$VERSION"
+"$ROOT/scripts/toolchain/package_toolchain.sh" --version "$TOOLCHAIN_VERSION"
 
 if [ ! -f "$PUB" ] || [ ! -f "$PRIV" ]; then
   swift run --package-path "$ROOT/Tools/ManifestTool" ManifestTool generate-keypair \
@@ -100,19 +130,23 @@ chmod 600 "$PRIV"
 PUBLISHED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 
 swift run --package-path "$ROOT/Tools/ManifestTool" ManifestTool \
-  --version "$VERSION" \
+  --version "$TOOLCHAIN_VERSION" \
   --published-at "$PUBLISHED_AT" \
   --core-zip "$CORE_ZIP" \
   --core-url "$CORE_ARTIFACT_URL" \
-  --models-zip "$MODELS_ZIP" \
-  --models-url "$MODELS_ARTIFACT_URL" \
+  --da3-base-zip "$DA3_BASE_ZIP" \
+  --da3-base-url "$DA3_BASE_ARTIFACT_URL" \
+  --da3-small-zip "$DA3_SMALL_ZIP" \
+  --da3-small-url "$DA3_SMALL_ARTIFACT_URL" \
+  --app-version-minimum "$APP_VERSION_MINIMUM" \
+  --app-version-maximum-exclusive "$APP_VERSION_MAX_EXCLUSIVE" \
   --private-key-file "$PRIV" \
   --manifest-out "$MANIFEST"
 
 build_app_args=(
   --manifest-url "$MANIFEST_URL"
   --public-key-path "$PUB"
-  --version "$VERSION"
+  --version "$APP_VERSION"
 )
 if [ -n "$PROJECT_URL" ]; then
   build_app_args+=(--project-url "$PROJECT_URL")
@@ -122,7 +156,7 @@ fi
 
 APP_PATH="$ROOT/build/Export/EasySplat.app"
 OUT_DIR="$ROOT/release/DMG"
-DMG_PATH="$OUT_DIR/EasySplat-$VERSION.dmg"
+DMG_PATH="$OUT_DIR/EasySplat-$APP_VERSION.dmg"
 
 mkdir -p "$OUT_DIR"
 

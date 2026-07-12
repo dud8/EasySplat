@@ -5,6 +5,28 @@ import XCTest
 import CryptoKit
 
 final class ToolchainManifestTests: XCTestCase {
+    func testCriticalCoreFileDiscoveryCoversEveryRuntimeCodeClass() {
+        let discovered = ToolchainManager.criticalCoreFiles(in: [
+            "lib/libceres.2.dylib",
+            "da3_mps/vendor/depth_anything_3/api.py",
+            "da3_mps/vendor/depth_anything_3/configs/da3-base.yaml",
+            "da3_mps/python/bin/torchrun",
+            "da3_mps/python/lib/python3.11/site-packages/torch/bin/protoc",
+            "da3_mps/python/lib/python3.11/site-packages/native_extension.so",
+            "bin/auxiliary-tool",
+            "share/LICENSE",
+        ])
+
+        XCTAssertTrue(discovered.contains("lib/libceres.2.dylib"))
+        XCTAssertTrue(discovered.contains("da3_mps/vendor/depth_anything_3/api.py"))
+        XCTAssertTrue(discovered.contains("da3_mps/vendor/depth_anything_3/configs/da3-base.yaml"))
+        XCTAssertTrue(discovered.contains("da3_mps/python/bin/torchrun"))
+        XCTAssertTrue(discovered.contains("da3_mps/python/lib/python3.11/site-packages/torch/bin/protoc"))
+        XCTAssertTrue(discovered.contains("da3_mps/python/lib/python3.11/site-packages/native_extension.so"))
+        XCTAssertTrue(discovered.contains("bin/auxiliary-tool"))
+        XCTAssertFalse(discovered.contains("share/LICENSE"))
+    }
+
     func testSchemaV2CriticalFileHashesDecodeLegacyExecutableHashesWithoutBreakingSignature() throws {
         let key = Curve25519.Signing.PrivateKey()
         let publicKey = key.publicKey.rawRepresentation.base64EncodedString()
@@ -170,6 +192,14 @@ final class ToolchainManifestTests: XCTestCase {
 
         XCTAssertNoThrow(try manager.test_validateSchema2Manifest(manifest, publicKeyBase64: publicKey))
 
+        var executableSuperset = manifest
+        let nativeHelper = "da3_mps/python/lib/python3.11/site-packages/foo/native_helper"
+        executableSuperset.components[0].contents.append(nativeHelper)
+        executableSuperset.components[0].criticalFileHashes[nativeHelper] = String(repeating: "b", count: 64)
+        XCTAssertNoThrow(
+            try manager.test_validateSchema2Manifest(executableSuperset, publicKeyBase64: publicKey)
+        )
+
         var missingModelHash = manifest
         missingModelHash.components[1].criticalFileHashes.removeValue(
             forKey: "da3_mps/models/DA3-BASE/config.json"
@@ -242,12 +272,21 @@ final class ToolchainManifestTests: XCTestCase {
 
     private func validSchema2Manifest(publicKey: String) -> ToolchainManifest {
         let hash = String(repeating: "a", count: 64)
-        let executables = [
-            "bin/colmap": hash,
-            "bin/easysplat-train": hash,
-            "da3_mps/bin/easysplat_da3_sfm": hash,
-            "da3_mps/python/bin/python3": hash,
+        let coreContents = [
+            "bin/colmap",
+            "bin/easysplat-train",
+            "bin/default.metallib",
+            "da3_mps/bin/easysplat_da3_sfm",
+            "da3_mps/python/bin/python3",
+            "da3_mps/app/easysplat_da3_sfm/run.py",
+            "da3_mps/build_info.json",
+            "msplat/build_info.json",
+            "lib/libceres.2.dylib",
+            "da3_mps/vendor/depth_anything_3/api.py",
+            "msplat/LICENSE",
         ]
+        let coreCriticalFiles = ToolchainManager.criticalCoreFiles(in: coreContents)
+        let coreHashes = Dictionary(uniqueKeysWithValues: coreCriticalFiles.map { ($0, hash) })
         let baseFiles = [
             "da3_mps/models/DA3-BASE/config.json",
             "da3_mps/models/DA3-BASE/easysplat_model_info.json",
@@ -266,7 +305,7 @@ final class ToolchainManifestTests: XCTestCase {
             publishedAt: Date(),
             appVersionRange: .init(minimum: "1.0.0", maximumExclusive: "3.0.0"),
             components: [
-                .init(name: "macos-arm64-core", capabilities: ["runtime.core", "geometry.colmap", "geometry.da3.runtime", "training.msplat"], url: "https://example.com/core.zip", sha256: hash, sizeBytes: 1, contents: Array(executables.keys), executableHashes: executables, dependencies: [], requirement: .required),
+                .init(name: "macos-arm64-core", capabilities: ["runtime.core", "geometry.colmap", "geometry.da3.runtime", "training.msplat"], url: "https://example.com/core.zip", sha256: hash, sizeBytes: 1, contents: coreContents, criticalFileHashes: coreHashes, dependencies: [], requirement: .required),
                 .init(name: "geometry-da3-base", capabilities: ["geometry.da3.base"], url: "https://example.com/base.zip", sha256: hash, sizeBytes: 1, contents: baseFiles, criticalFileHashes: Dictionary(uniqueKeysWithValues: baseFiles.map { ($0, hash) }), dependencies: ["macos-arm64-core"], requirement: .required),
                 .init(name: "geometry-da3-small", capabilities: ["geometry.da3.small"], url: "https://example.com/small.zip", sha256: hash, sizeBytes: 1, contents: smallFiles, criticalFileHashes: Dictionary(uniqueKeysWithValues: smallFiles.map { ($0, hash) }), dependencies: ["macos-arm64-core"], requirement: .optional),
             ],

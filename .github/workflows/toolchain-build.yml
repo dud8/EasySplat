@@ -7,46 +7,66 @@ on:
         description: "Toolchain version (semver)"
         required: true
         type: string
-  push:
-    tags:
-      - "toolchain-v*"
-
+      app_version_minimum:
+        description: "Minimum compatible EasySplat app version"
+        required: true
+        default: "0.2.0-beta.1"
+        type: string
+      app_version_maximum_exclusive:
+        description: "Exclusive maximum compatible EasySplat app version"
+        required: true
+        default: "0.3.0"
+        type: string
 permissions:
   contents: write
 
 jobs:
   build:
-    runs-on: macos-14
+    if: github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
+    runs-on: [self-hosted, macOS, ARM64, easysplat-release]
+    environment: toolchain-release
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          fetch-depth: 0
+
+      - name: Verify release source
+        env:
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: |
+          git fetch --no-tags origin "refs/heads/$DEFAULT_BRANCH:refs/remotes/origin/$DEFAULT_BRANCH"
+          if ! git merge-base --is-ancestor "$GITHUB_SHA" "origin/$DEFAULT_BRANCH"; then
+            echo "Toolchain releases must come from protected $DEFAULT_BRANCH." >&2
+            exit 1
+          fi
 
       - name: Resolve version
         env:
-          EVENT_NAME: ${{ github.event_name }}
           INPUT_VERSION: ${{ inputs.version }}
-          REF_NAME: ${{ github.ref_name }}
+          INPUT_APP_VERSION_MINIMUM: ${{ inputs.app_version_minimum }}
+          INPUT_APP_VERSION_MAXIMUM_EXCLUSIVE: ${{ inputs.app_version_maximum_exclusive }}
         run: |
           semver_re='^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]+)?$'
-          if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
-            VERSION="$INPUT_VERSION"
-            TAG="toolchain-v${VERSION}"
-          else
-            case "$REF_NAME" in
-              toolchain-v*) ;;
-              *)
-                echo "Expected toolchain tag to start with toolchain-v, got: $REF_NAME" >&2
-                exit 1
-                ;;
-            esac
-            TAG="$REF_NAME"
-            VERSION="${TAG#toolchain-v}"
-          fi
+          VERSION="$INPUT_VERSION"
+          TAG="toolchain-v${VERSION}"
           if ! [[ "$VERSION" =~ $semver_re ]]; then
             echo "Invalid semantic version: $VERSION" >&2
             exit 1
           fi
+          APP_VERSION_MINIMUM="${INPUT_APP_VERSION_MINIMUM:-0.2.0-beta.1}"
+          APP_VERSION_MAXIMUM_EXCLUSIVE="${INPUT_APP_VERSION_MAXIMUM_EXCLUSIVE:-0.3.0}"
+          if ! [[ "$APP_VERSION_MINIMUM" =~ $semver_re ]]; then
+            echo "Invalid minimum app semantic version: $APP_VERSION_MINIMUM" >&2
+            exit 1
+          fi
+          if ! [[ "$APP_VERSION_MAXIMUM_EXCLUSIVE" =~ $semver_re ]]; then
+            echo "Invalid maximum app semantic version: $APP_VERSION_MAXIMUM_EXCLUSIVE" >&2
+            exit 1
+          fi
           echo "VERSION=$VERSION" >> "$GITHUB_ENV"
           echo "TAG=$TAG" >> "$GITHUB_ENV"
+          echo "APP_VERSION_MINIMUM=$APP_VERSION_MINIMUM" >> "$GITHUB_ENV"
+          echo "APP_VERSION_MAXIMUM_EXCLUSIVE=$APP_VERSION_MAXIMUM_EXCLUSIVE" >> "$GITHUB_ENV"
 
       - name: Install dependencies
         run: |
@@ -85,9 +105,11 @@ jobs:
             exit 1
           fi
           CORE_ZIP="Toolchains/out/toolchain-macos-arm64-$VERSION-core.zip"
-          MODELS_ZIP="Toolchains/out/toolchain-macos-arm64-$VERSION-models.zip"
+          DA3_BASE_ZIP="Toolchains/out/toolchain-geometry-da3-base-$VERSION.zip"
+          DA3_SMALL_ZIP="Toolchains/out/toolchain-geometry-da3-small-$VERSION.zip"
           CORE_URL="https://github.com/$REPOSITORY/releases/download/$TAG/toolchain-macos-arm64-$VERSION-core.zip"
-          MODELS_URL="https://github.com/$REPOSITORY/releases/download/$TAG/toolchain-macos-arm64-$VERSION-models.zip"
+          DA3_BASE_URL="https://github.com/$REPOSITORY/releases/download/$TAG/toolchain-geometry-da3-base-$VERSION.zip"
+          DA3_SMALL_URL="https://github.com/$REPOSITORY/releases/download/$TAG/toolchain-geometry-da3-small-$VERSION.zip"
           PRIVATE_KEY_FILE="$(mktemp)"
           trap 'rm -f "$PRIVATE_KEY_FILE"' EXIT
           printf '%s' "$TOOLCHAIN_SIGNING_KEY_BASE64" > "$PRIVATE_KEY_FILE"
@@ -95,19 +117,24 @@ jobs:
           swift run --package-path Tools/ManifestTool ManifestTool \
             --core-zip "$CORE_ZIP" \
             --core-url "$CORE_URL" \
-            --models-zip "$MODELS_ZIP" \
-            --models-url "$MODELS_URL" \
+            --da3-base-zip "$DA3_BASE_ZIP" \
+            --da3-base-url "$DA3_BASE_URL" \
+            --da3-small-zip "$DA3_SMALL_ZIP" \
+            --da3-small-url "$DA3_SMALL_URL" \
             --version "$VERSION" \
             --published-at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            --app-version-minimum "$APP_VERSION_MINIMUM" \
+            --app-version-maximum-exclusive "$APP_VERSION_MAXIMUM_EXCLUSIVE" \
             --private-key-file "$PRIVATE_KEY_FILE" \
             --manifest-out "Toolchains/out/manifest.json"
 
       - name: Upload release assets
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
         with:
           tag_name: ${{ env.TAG }}
           target_commitish: ${{ github.sha }}
           files: |
             Toolchains/out/toolchain-macos-arm64-${{ env.VERSION }}-core.zip
-            Toolchains/out/toolchain-macos-arm64-${{ env.VERSION }}-models.zip
+            Toolchains/out/toolchain-geometry-da3-base-${{ env.VERSION }}.zip
+            Toolchains/out/toolchain-geometry-da3-small-${{ env.VERSION }}.zip
             Toolchains/out/manifest.json

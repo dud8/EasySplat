@@ -14,12 +14,53 @@ extension ToolchainManager {
         ToolchainCapability.msplat.rawValue,
     ])
 
-    static let criticalCoreExecutables = Set([
+    static let criticalCoreAnchors = Set([
         "bin/colmap",
         "bin/easysplat-train",
+        "bin/default.metallib",
         "da3_mps/bin/easysplat_da3_sfm",
         "da3_mps/python/bin/python3",
+        "da3_mps/app/easysplat_da3_sfm/run.py",
+        "da3_mps/build_info.json",
+        "msplat/build_info.json",
     ])
+
+    static func criticalCoreFiles(in contents: [String]) -> Set<String> {
+        var required = criticalCoreAnchors
+        for path in contents {
+            let lowercased = path.lowercased()
+            let pathExtension = URL(fileURLWithPath: lowercased).pathExtension
+            let isPythonCode = ["py", "pyc", "pth"].contains(pathExtension)
+                && (
+                    lowercased.hasPrefix("da3_mps/app/")
+                        || lowercased.hasPrefix("da3_mps/vendor/")
+                        || lowercased.hasPrefix("da3_mps/python/")
+                )
+            let isRuntimeConfiguration = ["yaml", "yml", "json", "toml"].contains(pathExtension)
+                && (
+                    lowercased.hasPrefix("da3_mps/app/")
+                        || lowercased.hasPrefix("da3_mps/vendor/")
+                        || lowercased.hasPrefix("da3_mps/python/")
+                )
+            let isLoadedLibrary = ["dylib", "so"].contains(pathExtension)
+                && (
+                    lowercased.hasPrefix("lib/")
+                        || lowercased.hasPrefix("da3_mps/")
+                )
+            let isMetalLibrary = pathExtension == "metallib"
+            let pathComponents = lowercased.split(separator: "/")
+            let isNestedExecutablePayload = lowercased.hasPrefix("da3_mps/")
+                && pathComponents.dropLast().contains(where: { $0 == "bin" || $0 == "libexec" })
+            let isExecutablePayload = lowercased.hasPrefix("bin/")
+                || lowercased.hasPrefix("da3_mps/bin/")
+                || lowercased.hasPrefix("da3_mps/python/bin/")
+                || isNestedExecutablePayload
+            if isPythonCode || isRuntimeConfiguration || isLoadedLibrary || isMetalLibrary || isExecutablePayload {
+                required.insert(path)
+            }
+        }
+        return required
+    }
 
     static let criticalBaseModelFiles = Set([
         "da3_mps/models/DA3-BASE/config.json",
@@ -54,12 +95,17 @@ extension ToolchainManager {
             requirement: ToolchainManifest.ComponentRequirement,
             criticalFiles: Set<String>
         )] = [
-            "macos-arm64-core": (Self.coreCapabilities, [], .required, Self.criticalCoreExecutables),
+            "macos-arm64-core": (Self.coreCapabilities, [], .required, []),
             "geometry-da3-base": ([ToolchainCapability.da3Base.rawValue], ["macos-arm64-core"], .required, Self.criticalBaseModelFiles),
             "geometry-da3-small": ([ToolchainCapability.da3Small.rawValue], ["macos-arm64-core"], .optional, Self.criticalSmallModelFiles),
         ]
 
         for component in manifest.components {
+            let requiredCriticalFiles = component.name == "macos-arm64-core"
+                ? Self.criticalCoreFiles(in: component.contents)
+                : expected[component.name]?.criticalFiles ?? []
+            let declaredCriticalFiles = Set(component.criticalFileHashes.keys)
+            let declaredContents = Set(component.contents)
             guard let contract = expected[component.name],
                   Set(component.capabilities) == contract.capabilities,
                   component.capabilities.count == contract.capabilities.count,
@@ -71,8 +117,9 @@ extension ToolchainManager {
                   isLowercaseSHA256(component.sha256),
                   !component.contents.isEmpty,
                   Set(component.contents).count == component.contents.count,
-                  Set(component.criticalFileHashes.keys) == contract.criticalFiles,
-                  contract.criticalFiles.isSubset(of: Set(component.contents)) else {
+                  requiredCriticalFiles.isSubset(of: declaredCriticalFiles),
+                  declaredCriticalFiles.isSubset(of: declaredContents),
+                  requiredCriticalFiles.isSubset(of: declaredContents) else {
                 throw ToolchainError.invalidManifest
             }
             try validateArchiveEntries(component.contents)

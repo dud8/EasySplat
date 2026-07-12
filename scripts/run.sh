@@ -120,7 +120,8 @@ fi
 TOOLCHAINS="$ROOT/Toolchains"
 OUT="$TOOLCHAINS/out"
 CORE_ZIP="$OUT/toolchain-macos-arm64-$VERSION-core.zip"
-MODELS_ZIP="$OUT/toolchain-macos-arm64-$VERSION-models.zip"
+DA3_BASE_ZIP="$OUT/toolchain-geometry-da3-base-$VERSION.zip"
+DA3_SMALL_ZIP="$OUT/toolchain-geometry-da3-small-$VERSION.zip"
 MANIFEST="$TOOLCHAINS/manifest.json"
 PUBLIC_SERVE_ROOT=""
 PUB="$TOOLCHAINS/public_key_ed25519.txt"
@@ -252,14 +253,13 @@ ensure_msplat_bundle() {
   fi
 }
 
-models_zip_valid() {
-  test -f "$MODELS_ZIP" || return 1
-  unzip -l "$MODELS_ZIP" | grep -q "da3_mps/models/DA3-BASE/config\\.json" || return 1
-  unzip -l "$MODELS_ZIP" | grep -q "da3_mps/models/DA3-BASE/model\\.safetensors" || return 1
-  unzip -l "$MODELS_ZIP" | grep -q "da3_mps/models/DA3-BASE/easysplat_model_info\\.json" || return 1
-  unzip -l "$MODELS_ZIP" | grep -q "da3_mps/models/DA3-SMALL/config\\.json" || return 1
-  unzip -l "$MODELS_ZIP" | grep -q "da3_mps/models/DA3-SMALL/model\\.safetensors" || return 1
-  unzip -l "$MODELS_ZIP" | grep -q "da3_mps/models/DA3-SMALL/easysplat_model_info\\.json" || return 1
+da3_model_zip_valid() {
+  local zip_path="$1"
+  local model="$2"
+  test -f "$zip_path" || return 1
+  unzip -l "$zip_path" | grep -q "da3_mps/models/$model/config\\.json" || return 1
+  unzip -l "$zip_path" | grep -q "da3_mps/models/$model/model\\.safetensors" || return 1
+  unzip -l "$zip_path" | grep -q "da3_mps/models/$model/easysplat_model_info\\.json" || return 1
 }
 
 ensure_da3_mps_bundle() {
@@ -421,7 +421,9 @@ if [ "$REBUILD" -eq 0 ] && [ "$INSTALLED_OK" -eq 1 ]; then
 fi
 
 NEED_PACKAGE=0
-if [ "$REBUILD" -eq 1 ] || ! core_zip_valid || ! models_zip_valid; then
+if [ "$REBUILD" -eq 1 ] || ! core_zip_valid \
+  || ! da3_model_zip_valid "$DA3_BASE_ZIP" "DA3-BASE" \
+  || ! da3_model_zip_valid "$DA3_SMALL_ZIP" "DA3-SMALL"; then
   NEED_PACKAGE=1
 elif [ "$INSTALLED_OK" -eq 0 ] && toolchain_inputs_newer; then
   NEED_PACKAGE=1
@@ -433,7 +435,7 @@ if [ "$NEED_PACKAGE" -eq 1 ]; then
   ensure_msplat_bundle
   ensure_da3_mps_bundle
   refresh_da3_mps_app
-  rm -f "$CORE_ZIP" "$MODELS_ZIP"
+  rm -f "$CORE_ZIP" "$DA3_BASE_ZIP" "$DA3_SMALL_ZIP"
   "$ROOT/scripts/toolchain/package_toolchain.sh" --version "$VERSION"
 fi
 
@@ -451,8 +453,12 @@ swift run --package-path "$ROOT/Tools/ManifestTool" ManifestTool \
   --published-at "$PUBLISHED_AT" \
   --core-zip "$CORE_ZIP" \
   --core-url "http://localhost:$PORT/out/$(basename "$CORE_ZIP")" \
-  --models-zip "$MODELS_ZIP" \
-  --models-url "http://localhost:$PORT/out/$(basename "$MODELS_ZIP")" \
+  --da3-base-zip "$DA3_BASE_ZIP" \
+  --da3-base-url "http://localhost:$PORT/out/$(basename "$DA3_BASE_ZIP")" \
+  --da3-small-zip "$DA3_SMALL_ZIP" \
+  --da3-small-url "http://localhost:$PORT/out/$(basename "$DA3_SMALL_ZIP")" \
+  --app-version-minimum "0.0.0" \
+  --app-version-maximum-exclusive "9999.0.0" \
   --private-key-file "$PRIV" \
   --manifest-out "$MANIFEST"
 
@@ -471,7 +477,8 @@ PUBLIC_SERVE_ROOT="$(mktemp -d "${TMPDIR:-/tmp}/easysplat-toolchain-public.XXXXX
 cp "$MANIFEST" "$PUBLIC_SERVE_ROOT/manifest.json"
 mkdir -p "$PUBLIC_SERVE_ROOT/out"
 ln -s "$CORE_ZIP" "$PUBLIC_SERVE_ROOT/out/$(basename "$CORE_ZIP")"
-ln -s "$MODELS_ZIP" "$PUBLIC_SERVE_ROOT/out/$(basename "$MODELS_ZIP")"
+ln -s "$DA3_BASE_ZIP" "$PUBLIC_SERVE_ROOT/out/$(basename "$DA3_BASE_ZIP")"
+ln -s "$DA3_SMALL_ZIP" "$PUBLIC_SERVE_ROOT/out/$(basename "$DA3_SMALL_ZIP")"
 
 pushd "$PUBLIC_SERVE_ROOT" >/dev/null
 python3 -m http.server --bind 127.0.0.1 "$PORT" >/dev/null 2>&1 &

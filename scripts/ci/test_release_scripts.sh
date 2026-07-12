@@ -67,8 +67,22 @@ test "$(cat "$module_resources_dir/toolchain_manifest_url.txt")" = "$manifest_ur
 test "$(cat "$module_resources_dir/project_home_url.txt")" = "$project_url"
 test "$(cat "$module_resources_dir/public_key_ed25519.txt")" = 'PUBLIC_KEY_TEST_VALUE'
 
-grep -q 'CORE_ARTIFACT_URL="http://localhost:$PORT/out/toolchain-macos-arm64-$VERSION-core.zip"' "$ROOT/scripts/release/build_dmg.sh"
-grep -q 'MODELS_ARTIFACT_URL="http://localhost:$PORT/out/toolchain-macos-arm64-$VERSION-models.zip"' "$ROOT/scripts/release/build_dmg.sh"
+grep -Fq -- '--app-version)' "$ROOT/scripts/release/build_dmg.sh"
+grep -Fq -- '--toolchain-version)' "$ROOT/scripts/release/build_dmg.sh"
+if grep -Fq -- '    --version)' "$ROOT/scripts/release/build_dmg.sh"; then
+  echo "build_dmg.sh still accepts the ambiguous legacy --version option" >&2
+  exit 1
+fi
+grep -q 'CORE_ARTIFACT_URL="http://localhost:$PORT/out/toolchain-macos-arm64-$TOOLCHAIN_VERSION-core.zip"' "$ROOT/scripts/release/build_dmg.sh"
+grep -q 'DA3_BASE_ARTIFACT_URL="http://localhost:$PORT/out/toolchain-geometry-da3-base-$TOOLCHAIN_VERSION.zip"' "$ROOT/scripts/release/build_dmg.sh"
+grep -q 'DA3_SMALL_ARTIFACT_URL="http://localhost:$PORT/out/toolchain-geometry-da3-small-$TOOLCHAIN_VERSION.zip"' "$ROOT/scripts/release/build_dmg.sh"
+grep -Fq '"$ROOT/scripts/toolchain/package_toolchain.sh" --version "$TOOLCHAIN_VERSION"' "$ROOT/scripts/release/build_dmg.sh"
+grep -Fq -- '--version "$TOOLCHAIN_VERSION"' "$ROOT/scripts/release/build_dmg.sh"
+grep -Fq -- '--app-version-minimum "$APP_VERSION_MINIMUM"' "$ROOT/scripts/release/build_dmg.sh"
+grep -Fq 'APP_VERSION_MINIMUM="$APP_VERSION"' "$ROOT/scripts/release/build_dmg.sh"
+grep -Fq 'APP_VERSION_MAX_EXCLUSIVE="$APP_VERSION_MAJOR.$((10#$APP_VERSION_MINOR + 1)).0"' "$ROOT/scripts/release/build_dmg.sh"
+grep -Fq -- '--version "$APP_VERSION"' "$ROOT/scripts/release/build_dmg.sh"
+grep -Fq 'DMG_PATH="$OUT_DIR/EasySplat-$APP_VERSION.dmg"' "$ROOT/scripts/release/build_dmg.sh"
 grep -q -- '--private-key-file "$PRIV"' "$ROOT/scripts/release/build_dmg.sh"
 grep -q 'scripts/toolchain/build_colmap.sh' "$ROOT/scripts/release/build_dmg.sh"
 grep -q 'scripts/toolchain/build_openssl.sh' "$ROOT/scripts/release/build_dmg.sh"
@@ -106,10 +120,48 @@ grep -q 'source_provenance' "$ROOT/scripts/toolchain/package_toolchain.sh"
 grep -q 'pinned-git' "$ROOT/scripts/toolchain/package_toolchain.sh"
 grep -q 'resolve_rpath_dependency_for' "$ROOT/scripts/toolchain/package_toolchain.sh"
 grep -q 'require_bundled_arm64_python "da3_mps" "$DA3_PY_BIN"' "$ROOT/scripts/toolchain/package_toolchain.sh"
-grep -Fq 'zip -r "$MODELS_ZIP" da3_mps/models' "$ROOT/scripts/toolchain/package_toolchain.sh"
+grep -Fq 'zip -r "$DA3_BASE_ZIP" da3_mps/models/DA3-BASE' "$ROOT/scripts/toolchain/package_toolchain.sh"
+grep -Fq 'zip -r "$DA3_SMALL_ZIP" da3_mps/models/DA3-SMALL' "$ROOT/scripts/toolchain/package_toolchain.sh"
+grep -Fq 'MAX_RELEASE_ASSET_BYTES=2147483648' "$ROOT/scripts/toolchain/package_toolchain.sh"
+grep -Fq 'assert_release_asset_size "$CORE_ZIP"' "$ROOT/scripts/toolchain/package_toolchain.sh"
+grep -Fq 'assert_release_asset_size "$DA3_BASE_ZIP"' "$ROOT/scripts/toolchain/package_toolchain.sh"
+grep -Fq 'assert_release_asset_size "$DA3_SMALL_ZIP"' "$ROOT/scripts/toolchain/package_toolchain.sh"
+grep -Fq -- '--da3-base-zip "$DA3_BASE_ZIP"' "$ROOT/scripts/run.sh"
+grep -Fq -- '--da3-small-zip "$DA3_SMALL_ZIP"' "$ROOT/scripts/run.sh"
 grep -Fq 'test -x "$ROOT/Toolchains/build/colmap/install/bin/colmap" || "$ROOT/scripts/toolchain/build_colmap.sh"' "$ROOT/scripts/run.sh"
 grep -Fq 'ensure_msplat_bundle' "$ROOT/scripts/run.sh"
 grep -Fq 'ensure_da3_mps_bundle' "$ROOT/scripts/run.sh"
+
+workflow="$ROOT/.github/workflows/toolchain-build.yml"
+grep -Fq 'runs-on: [self-hosted, macOS, ARM64, easysplat-release]' "$workflow"
+grep -Fq 'environment: toolchain-release' "$workflow"
+grep -Fq 'if: github.ref == format(' "$workflow"
+grep -Fq 'fetch-depth: 0' "$workflow"
+grep -Fq 'git merge-base --is-ancestor "$GITHUB_SHA" "origin/$DEFAULT_BRANCH"' "$workflow"
+grep -Fq 'uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5' "$workflow"
+grep -Fq 'uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65' "$workflow"
+grep -Fq -- '--da3-base-zip "$DA3_BASE_ZIP"' "$workflow"
+grep -Fq -- '--da3-small-zip "$DA3_SMALL_ZIP"' "$workflow"
+grep -Fq -- '--app-version-minimum "$APP_VERSION_MINIMUM"' "$workflow"
+grep -Fq -- '--app-version-maximum-exclusive "$APP_VERSION_MAXIMUM_EXCLUSIVE"' "$workflow"
+grep -Fq 'Toolchains/out/toolchain-geometry-da3-base-${{ env.VERSION }}.zip' "$workflow"
+grep -Fq 'Toolchains/out/toolchain-geometry-da3-small-${{ env.VERSION }}.zip' "$workflow"
+if rg -n -- '--models-(zip|url)|MODELS_(ZIP|URL)|toolchain-macos-arm64-.*-models\.zip' \
+  "$ROOT/scripts/release/build_dmg.sh" \
+  "$ROOT/scripts/run.sh" \
+  "$ROOT/scripts/toolchain/package_toolchain.sh" \
+  "$workflow" >/dev/null; then
+  echo "Release paths still reference the removed combined models component" >&2
+  exit 1
+fi
+if rg -n 'uses: [^ ]+@(v[0-9]+|main|master)$' "$workflow" >/dev/null; then
+  echo "Toolchain workflow actions must be pinned to full commit SHAs" >&2
+  exit 1
+fi
+if rg -n '^  push:|toolchain-v\*' "$workflow" >/dev/null; then
+  echo "Toolchain release workflow must run manually from protected main, not writable tags" >&2
+  exit 1
+fi
 
 legacy_runtime_pattern='brush|mapanything|fastvggt|vggt|glomap'
 for path in \

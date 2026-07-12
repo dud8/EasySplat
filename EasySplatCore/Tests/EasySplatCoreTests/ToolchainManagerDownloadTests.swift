@@ -5,6 +5,21 @@ import XCTest
 
 @MainActor
 final class ToolchainManagerDownloadTests: XCTestCase {
+    private static let coreFixtureContents = [
+        "bin/colmap",
+        "bin/easysplat-train",
+        "bin/default.metallib",
+        "lib/libcrypto.3.dylib",
+        "lib/libssl.3.dylib",
+        "da3_mps/bin/easysplat_da3_sfm",
+        "da3_mps/python/bin/python3",
+        "da3_mps/app/easysplat_da3_sfm/run.py",
+        "da3_mps/vendor/depth-anything-3/src/depth_anything_3/api.py",
+        "da3_mps/build_info.json",
+        "msplat/build_info.json",
+        "msplat/LICENSE",
+    ]
+
     private final class LockedMessages: @unchecked Sendable {
         private let lock = NSLock()
         private var storage: [String] = []
@@ -157,7 +172,7 @@ final class ToolchainManagerDownloadTests: XCTestCase {
             appVersion: "0.2.0-beta.1"
         )
 
-        let corePaths = Array(ToolchainManager.criticalCoreExecutables).sorted()
+        let corePaths = Array(ToolchainManager.criticalCoreFiles(in: Self.coreFixtureContents)).sorted()
         let basePaths = [
             "da3_mps/models/DA3-BASE/config.json",
             "da3_mps/models/DA3-BASE/easysplat_model_info.json",
@@ -231,7 +246,7 @@ final class ToolchainManagerDownloadTests: XCTestCase {
             appVersion: "0.2.0-beta.1"
         )
 
-        let corePaths = Array(ToolchainManager.criticalCoreExecutables).sorted()
+        let corePaths = Array(ToolchainManager.criticalCoreFiles(in: Self.coreFixtureContents)).sorted()
         let basePaths = [
             "da3_mps/models/DA3-BASE/config.json",
             "da3_mps/models/DA3-BASE/easysplat_model_info.json",
@@ -861,12 +876,8 @@ final class ToolchainManagerDownloadTests: XCTestCase {
             let versionedRoot = bootstrap.toolchainRoot().appendingPathComponent(version, isDirectory: true)
             try? FileManager.default.removeItem(at: versionedRoot)
             let seedFixture = try ToolchainFixtureBuilder.createToolchain(at: versionedRoot)
-            let executableHashes = try Dictionary(uniqueKeysWithValues: [
-                "bin/colmap",
-                "bin/easysplat-train",
-                "da3_mps/bin/easysplat_da3_sfm",
-                "da3_mps/python/bin/python3",
-            ].map { path in
+            let criticalCorePaths = ToolchainManager.criticalCoreFiles(in: Self.coreFixtureContents).sorted()
+            let criticalCoreHashes = try Dictionary(uniqueKeysWithValues: criticalCorePaths.map { path in
                 (path, try bootstrap.test_sha256Hex(url: versionedRoot.appendingPathComponent(path)))
             })
             try FileManager.default.removeItem(at: versionedRoot)
@@ -899,7 +910,7 @@ final class ToolchainManagerDownloadTests: XCTestCase {
                 publishedAt: Date(),
                 appVersionRange: .init(minimum: "1.0.0", maximumExclusive: "3.0.0"),
                 components: [
-                    .init(name: "macos-arm64-core", capabilities: ["runtime.core", "geometry.colmap", "geometry.da3.runtime", "training.msplat"], url: coreURL.absoluteString, sha256: componentHash(coreData), sizeBytes: UInt64(coreData.count), contents: Array(executableHashes.keys), criticalFileHashes: executableHashes, dependencies: [], requirement: .required),
+                    .init(name: "macos-arm64-core", capabilities: ["runtime.core", "geometry.colmap", "geometry.da3.runtime", "training.msplat"], url: coreURL.absoluteString, sha256: componentHash(coreData), sizeBytes: UInt64(coreData.count), contents: Self.coreFixtureContents, criticalFileHashes: criticalCoreHashes, dependencies: [], requirement: .required),
                     .init(name: "geometry-da3-base", capabilities: ["geometry.da3.base"], url: baseURL.absoluteString, sha256: componentHash(baseData), sizeBytes: UInt64(baseData.count), contents: baseContents, criticalFileHashes: baseCriticalHashes, dependencies: ["macos-arm64-core"], requirement: .required),
                     .init(name: "geometry-da3-small", capabilities: ["geometry.da3.small"], url: smallURL.absoluteString, sha256: componentHash(smallData), sizeBytes: UInt64(smallData.count), contents: smallContents, criticalFileHashes: smallCriticalHashes, dependencies: ["macos-arm64-core"], requirement: .optional),
                 ],
