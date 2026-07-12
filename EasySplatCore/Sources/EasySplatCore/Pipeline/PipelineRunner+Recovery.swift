@@ -2,21 +2,6 @@ import Foundation
 import SQLite3
 
 extension PipelineRunner {
-    /// Rebuild a transient `ReconstructionScore` from the persisted summary so
-    /// resume-from-SfM runs do not lose the per-run quality data the trainer
-    /// selection guard relies on. The persisted summary is the same data the
-    /// runner originally stored when SfM accepted a model.
-    static func reconstructionScore(fromPersistedSummary summary: ReconstructionSummary) -> ReconstructionScore {
-        return ReconstructionScore(
-            registeredImages: summary.registeredImages,
-            totalImages: summary.totalImages,
-            meanReprojectionError: summary.meanReprojectionError,
-            pointCount: summary.pointCount,
-            observationCount: summary.observationCount,
-            meanTrackLength: summary.meanTrackLength
-        )
-    }
-
     enum PipelineError: Error {
         case invalidInput
         case insufficientInputImages(Int)
@@ -80,7 +65,7 @@ extension PipelineRunner {
         case .sfmMapping:
             self.removeIfExists(paths.colmapSparseURL)
             self.removeIfExists(paths.trainingURL)
-        case .trainBrush:
+        case .trainSplat:
             return
         case .exportSplat:
             return
@@ -121,14 +106,6 @@ extension PipelineRunner {
         return ("Processing failed. Check details for more info.", String(reflecting: error))
     }
 
-    func glomapErrorIndicatesMissingOpenSSL(_ error: Error) -> Bool {
-        guard let failure = error as? SubprocessFailure else { return false }
-        let text = "\(failure.stdoutTail)\n\(failure.stderrTail)".lowercased()
-        if text.contains("library not loaded: @rpath/libcrypto.3.dylib") { return true }
-        if text.contains("no lc_rpath") { return true }
-        return false
-    }
-
     func debugDescription(for error: ColmapRunnerError) -> String {
         switch error {
         case let .failed(command, exitCode, reason, stdoutTail, stderrTail):
@@ -163,12 +140,12 @@ extension PipelineRunner {
         emit(.stageLog(stage: stage, line: detail, isError: true))
     }
 
-    /// Warn once an accepted COLMAP/GLOMAP solve's mean track length is below this. A healthy
+    /// Warn once an accepted COLMAP solve's mean track length is below this. A healthy
     /// solve threads each point through several views (~3-6); a shorter average means a thin,
     /// fragmented reconstruction.
     static let weakTrackLengthThreshold = 3.0
 
-    /// Advisory only. The COLMAP/GLOMAP acceptance gate checks registration ratio plus that
+    /// Advisory only. The COLMAP acceptance gate checks registration ratio plus that
     /// metrics are non-empty, so a thin solve can pass where the neural-direct backends enforce
     /// real floors. This logs a heads-up for the COLMAP path without changing accept/reject, so
     /// a weak-but-accepted solve is not silent.
@@ -286,21 +263,12 @@ extension PipelineRunner {
             let sparseZero = paths.colmapSparseURL.appendingPathComponent("0", isDirectory: true)
             guard sparseModelFilesExist(at: sparseZero) else { return .missing }
             let textStats = colmapSparseTextStats(at: sparseZero)
-            // VGGT-direct writes points3D.txt with empty track entries when BA is disabled
-            // (Tools/VggtSfm/easysplat_vggt_sfm/run.py); the matching quality gate in
-            // vggtDirectQualityFailureReason accepts this shape, so recovery must too.
-            let allowsTracklessSparse: Bool = {
-                if case let .sfmMapping(checkpoint)? = metadata.checkpoint?.details {
-                    return checkpoint.mapper == "vggt"
-                }
-                if metadata.checkpoint?.stage == .sfmMapping {
-                    return false
-                }
-                if let completed = metadata.completedSfmMapping {
-                    return completed.mapper == "vggt"
-                }
-                return false
-            }()
+            // Old VGGT projects could finish geometry with points but no text tracks.
+            // Reuse that model only when geometry was durably completed and interruption
+            // happened in a later stage. An sfmMapping checkpoint must run new geometry.
+            let legacyCompletedTracklessModel = metadata.completedSfmMapping?.mapper.lowercased() == "vggt"
+                && metadata.state.stage != .sfmMapping
+                && metadata.checkpoint?.stage != .sfmMapping
             for name in ["cameras.bin", "images.bin", "points3D.bin", "cameras.txt", "images.txt", "points3D.txt"] {
                 let fileURL = sparseZero.appendingPathComponent(name)
                 if !fm.fileExists(atPath: fileURL.path) { continue }
@@ -314,7 +282,7 @@ extension PipelineRunner {
                 guard (textStats.pointCount ?? 0) > 0 else {
                     return .corrupt(reason: "points3D.txt has no sparse points")
                 }
-                if !allowsTracklessSparse {
+                if !legacyCompletedTracklessModel {
                     guard (textStats.observationCount ?? 0) > 0 else {
                         return .corrupt(reason: "points3D.txt has no observations")
                     }
@@ -342,7 +310,7 @@ extension PipelineRunner {
                 return .corrupt(reason: "DA3 sparse manifest is invalid: \(da3Issues.joined(separator: "; "))")
             }
             return .valid
-        case .trainBrush:
+        case .trainSplat:
             if let artifact = metadata.trainingArtifact {
                 switch artifact.completionStatus {
                 case .checkpointed:
@@ -381,11 +349,7 @@ extension PipelineRunner {
                     return .valid
                 }
             }
-            guard let latest = latestBrushExport(
-                in: paths.trainingURL,
-                minModificationDate: trainingExportMinimumDate(metadata: metadata)
-            )?.file else { return .missing }
-            return validatePlyFile(at: latest)
+            return .missing
         case .exportSplat, .done:
             let output: URL
             if let persisted = metadata.outputs?.splatPlyPath {
@@ -443,16 +407,6 @@ extension PipelineRunner {
         )
     }
 
-    func trainingExportMinimumDate(metadata: ProjectMetadata) -> Date? {
-        if let lastRunStartedAt = metadata.lastRunStartedAt {
-            return lastRunStartedAt
-        }
-        if metadata.checkpoint?.stage == .trainBrush {
-            return metadata.checkpoint?.updatedAt
-        }
-        return nil
-    }
-
     private func isColmapImagePoseRow(_ line: String) -> Bool {
         let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty, !trimmed.hasPrefix("#") else { return false }
@@ -475,11 +429,6 @@ extension PipelineRunner {
             if databaseExists, databaseSize <= 0 {
                 return ["DA3 coverage manifest was missing for zero-byte direct sparse database marker"]
             }
-            return []
-        }
-        let da3ManifestDate = (try? fm.attributesOfItem(atPath: paths.da3CoverageManifestURL.path)[.modificationDate] as? Date) ?? .distantPast
-        if let mapAnythingManifestDate = try? fm.attributesOfItem(atPath: paths.mapanythingCoverageManifestURL.path)[.modificationDate] as? Date,
-           mapAnythingManifestDate > da3ManifestDate {
             return []
         }
         guard databaseSize <= 0 else {

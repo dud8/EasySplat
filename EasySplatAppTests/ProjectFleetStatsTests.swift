@@ -44,7 +44,7 @@ final class ProjectFleetStatsTests: XCTestCase {
             ]),
             makeSummary(status: .ready, stageTimings: [
                 .init(stage: .sfmFeatures, startedAt: Date(timeIntervalSince1970: 0), durationSeconds: 30),
-                .init(stage: .trainBrush, startedAt: Date(timeIntervalSince1970: 60), durationSeconds: 90)
+                .init(stage: .trainSplat, startedAt: Date(timeIntervalSince1970: 60), durationSeconds: 90)
             ]),
             makeSummary(status: .failed),
             makeSummary(status: .inProgress),

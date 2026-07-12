@@ -31,17 +31,10 @@ public struct ProjectPaths: Sendable {
     public var logsURL: URL { root.appendingPathComponent("Logs", isDirectory: true) }
     public var pipelineLogURL: URL { logsURL.appendingPathComponent("pipeline.log") }
     public var eventsLogURL: URL { logsURL.appendingPathComponent("events.jsonl") }
-    public var appEventsLogURL: URL { logsURL.appendingPathComponent("app_events.jsonl") }
     public var colmapLogURL: URL { logsURL.appendingPathComponent("colmap.log") }
-    public var glomapLogURL: URL { logsURL.appendingPathComponent("glomap.log") }
+    public var globalMapperLogURL: URL { logsURL.appendingPathComponent("global_mapper.log") }
     public var da3LogURL: URL { logsURL.appendingPathComponent("da3.log") }
     public var da3CoverageManifestURL: URL { logsURL.appendingPathComponent("da3_coverage_manifest.json") }
-    public var mapanythingLogURL: URL { logsURL.appendingPathComponent("mapanything.log") }
-    public var mapanythingCoverageManifestURL: URL { logsURL.appendingPathComponent("mapanything_coverage_manifest.json") }
-    public var vggtLogURL: URL { logsURL.appendingPathComponent("vggt.log") }
-    public var fastvggtLogURL: URL { logsURL.appendingPathComponent("fastvggt.log") }
-    public var fastvggtCoverageManifestURL: URL { logsURL.appendingPathComponent("fastvggt_coverage_manifest.json") }
-    public var brushLogURL: URL { logsURL.appendingPathComponent("brush.log") }
     public var msplatLogURL: URL { logsURL.appendingPathComponent("msplat.log") }
 
     public func ensureDirectories() throws {

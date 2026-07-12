@@ -151,7 +151,7 @@ private struct SplatTrainerStub: SplatTraining {
     let result: TrainingArtifact
 
     func train(_ request: TrainingRequest) async throws -> TrainingArtifact {
-        request.events(.stageStarted(stage: .trainBrush))
+        request.events(.stageStarted(stage: .trainSplat))
         return result
     }
 }

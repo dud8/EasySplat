@@ -13,7 +13,7 @@ EasySplat is a macOS desktop app for Apple Silicon Macs. Its job is simple to de
 1. Take a video, a folder of photos, or both.
 2. Reconstruct camera poses and sparse geometry.
 3. Train a Gaussian splat representation.
-4. Export a `.ply` file that the app can preview, share, or hand off to Brush.
+4. Export a conventional `.ply` file that the app can preview, share, or save elsewhere.
 
 The app is intentionally beginner-friendly. The repository is not. Under the surface, it is a production-oriented wrapper around a downloaded toolchain of native binaries, Python environments, large model bundles, and a resumable project format.
 
@@ -30,7 +30,7 @@ The app is intentionally beginner-friendly. The repository is not. Under the sur
 1. `EasySplatApp` is intentionally thin. `EasySplatCore` does the real work.
 2. The app does not ship the full toolchain in the repo or app bundle by default. It downloads a signed manifest and installs toolchain artifacts into Application Support.
 3. Every run lives inside a `.easysplatproj` directory bundle under `~/Documents/EasySplat Projects/`.
-4. The default Fast app profile uses COLMAP `global_mapper`; Balanced and Ultra runs start with DA3 and fall back when needed.
+4. Fast starts with COLMAP `global_mapper`; Balanced and High Detail start with DA3 and use bounded COLMAP refinement or fallback when needed.
 5. The UI is designed for absolute beginners: sparse layout, one obvious primary action, calm feedback, minimal jargon.
 
 ## At A Glance
@@ -42,10 +42,10 @@ The app is intentionally beginner-friendly. The repository is not. Under the sur
 | App stack | SwiftUI with a small amount of AppKit glue |
 | Core stack | Swift 6, Foundation, CryptoKit, ImageIO, SQLite3, subprocess orchestration |
 | Viewer | `MetalSplatter` + `SplatIO` from `ThirdParty/MetalSplatter` |
-| Default SfM path | Fast uses COLMAP `global_mapper`; Balanced and Ultra start DA3-first with MapAnything/COLMAP fallback |
-| Legacy / override paths | `mapanything`, `colmap`, `glomap` / `global_mapper`, `vggt`, `fastvggt` |
+| Geometry path | Fast uses COLMAP `global_mapper`; Balanced and High Detail use DA3 Base or Small with bounded COLMAP refinement and recovery |
+| Trainer | Native C++/Metal `easysplat-train` with mandatory atomic optimizer checkpoints |
 | Output | A Gaussian splat PLY plus project metadata and logs |
-| Project persistence | `project.json`, stage checkpoints, log files, app events, share metrics, training snapshots, output files inside a `.easysplatproj` bundle |
+| Project persistence | `project.json`, stage checkpoints, log files, app events, share metrics, atomic training checkpoints, output files inside a `.easysplatproj` bundle |
 | Toolchain trust model | Ed25519-signed manifest, SHA-256 artifact checks, expected-content validation |
 | Test focus | Heavy coverage in `EasySplatCoreTests`; light app tests; SwiftPM UI tests are placeholder-only |
 
@@ -56,8 +56,8 @@ EasySplat is not styled like a research demo. It is styled like a calm macOS uti
 The user-facing product has three main screens:
 
 - **Home**: choose input, choose capture mode and speed/quality profile, see prior projects.
-- **Processing**: watch stage progress, inspect details and logs, optionally see a live training preview.
-- **Viewer**: preview the final splat, share it, reveal it in Finder, or open it in Brush.
+- **Processing**: watch stage progress and inspect technical details and logs.
+- **Viewer**: preview the final splat, export or share it, or reveal it in Finder.
 
 The core UX promise is: simple surface, rich feedback. The app hides most technical complexity until the user needs it.
 
@@ -122,7 +122,7 @@ For local development, the process can be overridden by environment variables or
 4. Find features
 5. Match views
 6. Solve cameras
-7. Train Brush
+7. Train the splat with native msplat
 8. Export splat
 9. Mark done
 
@@ -134,10 +134,9 @@ Once the exported PLY exists, the app switches to the Viewer screen:
 
 - preview with MetalSplatter,
 - share via `NSSharingServicePicker`,
-- reveal in Finder,
-- optionally open in Brush.
+- reveal in Finder.
 
-The project bundle remains on disk so the result can be reopened later. Share attempts append structured records to `Logs/app_events.jsonl`, and aggregate share metrics are stored back into `project.json`.
+The project bundle remains on disk so the result can be reopened later. Share passes only the validated PLY to the macOS share picker and does not record activity.
 
 ### 6. Recovery behavior
 
@@ -145,12 +144,7 @@ If the app is interrupted during most stages, it can usually resume from checkpo
 
 On relaunch, the Home screen can surface an interrupted-project prompt for work that has checkpoint evidence but no final output. The user can resume, dismiss the prompt for later, or delete the interrupted bundle; the suppression state is persisted in project metadata.
 
-Important exception:
-
-- during Brush training, stopping exports a snapshot only;
-- resuming later restarts training from scratch rather than continuing true incremental training.
-
-That caveat is surfaced directly in the UI and matters a lot when you are debugging or changing stop/resume behavior.
+Training recovery uses native msplat checkpoints. A checkpoint is resumable only after its model arrays, optimizer moments, iteration and schedule, seed, trainer version, and geometry digest have been written atomically and validated. The UI must not promise resume when no valid checkpoint exists.
 
 ## Architecture Diagram
 
@@ -166,12 +160,12 @@ flowchart TD
 
     Runner --> Project["ProjectPaths + ProjectMetadataStore<br/>persistent project contract"]
     Runner --> Video["Video helpers<br/>frame extraction + selection"]
-    Runner --> SFM["SfM runners<br/>DA3 / MapAnything / COLMAP / VGGT / FastVGGT"]
-    Runner --> Train["Training runners<br/>msplat / Brush"]
+    Runner --> SFM["Geometry runners<br/>DA3 / COLMAP"]
+    Runner --> Train["Native msplat trainer"]
     Runner --> Export["SplatExport<br/>copy final PLY into Output"]
 
-    Export --> Viewer["ViewerView + SplatViewerView<br/>preview, share, open in Brush"]
-    Toolchain --> External["Downloaded native + Python tools<br/>COLMAP, Brush, msplat, model bundles"]
+    Export --> Viewer["ViewerView + SplatViewerView<br/>preview, export, share"]
+    Toolchain --> External["Downloaded tools<br/>COLMAP, native msplat, DA3 Base / Small"]
     SFM --> External
     Train --> External
 ```
@@ -189,11 +183,11 @@ flowchart LR
     Select --> Chosen["Frames/selected/ + selected_manifest.json"]
     Chosen --> SFM["sfmFeatures -> sfmMatching -> sfmMapping"]
     SFM --> Sparse["SfM/colmap/seed or sparse outputs"]
-    Sparse --> Train["trainBrush"]
-    Train --> Training["Training/ snapshots + intermediate exports"]
+    Sparse --> Train["trainSplat"]
+    Train --> Training["Training/ atomic checkpoints + temporary output"]
     Training --> Export["exportSplat"]
     Export --> Output["Output/<final>.ply"]
-    Output --> Viewer["Viewer / Share / Open in Brush"]
+    Output --> Viewer["Viewer / Export / Share"]
 
     Import -. updates .-> Metadata["project.json checkpoint/state"]
     Select -. updates .-> Metadata
@@ -201,7 +195,7 @@ flowchart LR
     Train -. updates .-> Metadata
     Export -. updates .-> Metadata
 
-    Import -. logs .-> Logs["Logs/*.log + events.jsonl + app_events.jsonl"]
+    Import -. logs .-> Logs["Logs/*.log + events.jsonl"]
     SFM -. logs .-> Logs
     Train -. logs .-> Logs
     Export -. logs .-> Logs
@@ -281,12 +275,12 @@ Current radius tokens:
 - Right column is a stage stepper that stays visible.
 - Errors are short and direct.
 - The log drawer stays secondary and collapsed by default.
-- During training, live preview is optional because it can slow the job down.
+- Training stays in the same processing flow; there is no second consent step or preview mode.
 
 #### Viewer screen
 
 - The splat preview is the focal point.
-- Actions stay simple: Share, Show in Finder, Open in Brush, Start Another.
+- Actions stay simple: Export, Share, Show in Finder, Start Another.
 - Viewer controls are intentionally subtle.
 
 ### Copy style
@@ -314,9 +308,7 @@ This matters. If you add UI and the copy starts sounding like a research paper o
 | `ThirdParty/MetalSplatter/` | Vendored viewer dependency package |
 | `Tools/ManifestTool/` | Swift CLI for key generation and manifest signing |
 | `Tools/Da3Sfm/` | DA3 Python bridge package shipped inside the toolchain |
-| `Tools/MapAnythingSfm/` | MapAnything Python fallback bridge package shipped inside the toolchain |
-| `Tools/VggtSfm/` | Python bridge package shipped inside the toolchain |
-| `Tools/FastVggtSfm/` | Python bridge package shipped inside the toolchain |
+| `Tools/MsplatNative/` | Native C++/Metal trainer and checkpoint implementation |
 | `Toolchains/` | Local build outputs, signed manifest, and dev-only keys; generally gitignored |
 | `scripts/` | Dev, test, toolchain-build, release, and benchmark scripts |
 | `.github/workflows/` | CI and release automation |
@@ -386,7 +378,6 @@ It owns:
 - log lines and error lines,
 - toolchain availability,
 - current project location,
-- training consent flow,
 - sharing state and share metrics,
 - input selection,
 - project summaries and recovery prompts,
@@ -483,8 +474,7 @@ These two types define the persistent project contract.
 - `Output/`
 - `Logs/pipeline.log`
 - `Logs/events.jsonl`
-- `Logs/app_events.jsonl`
-- tool-specific logs like `colmap.log`, `mapanything.log`, `brush.log`
+- tool-specific logs like `colmap.log`, `da3.log`, and `msplat.log`
 
 `ProjectMetadataStore` owns JSON load/save behavior for `ProjectMetadata`, including ISO-8601 dates and sorted pretty-printed output.
 
@@ -513,14 +503,8 @@ Typical project bundle layout:
   Logs/
     pipeline.log
     events.jsonl
-    app_events.jsonl
     colmap.log
-    glomap.log
     da3.log
-    mapanything.log
-    vggt.log
-    fastvggt.log
-    brush.log
     msplat.log
 ```
 
@@ -557,10 +541,10 @@ The toolchain system exists because the heavy dependencies are too large and too
 
 The repo depends on:
 
-- native binaries like COLMAP and Brush,
-- Python runtimes,
-- model weights,
-- research code packaged into self-contained tool bundles.
+- a stripped COLMAP/Ceres runtime,
+- the native C++/Metal msplat trainer,
+- the DA3 bridge runtime,
+- DA3 Base and Small weights.
 
 Those assets are large, platform-specific, and more operationally sensitive than the Swift app itself.
 
@@ -590,15 +574,11 @@ Those assets are large, platform-specific, and more operationally sensitive than
 At minimum, the validated toolchain includes:
 
 - `bin/colmap`
-- `bin/brush` and `bin/brush.real`
 - `bin/easysplat-train`, `bin/default.metallib`, and native msplat provenance and license files
 - OpenSSL libraries
 - `da3_mps/`
-- `mapanything_mps/`
-- `vggt_mps/`
-- `fastvggt_mps/`
 
-One subtle but useful detail: the packaged `brush` wrapper normalizes CLI differences across Brush versions so both `brush <dataset>` and `brush train <dataset>` style invocations can be handled.
+The product model payload contains only DA3 Base and Small. Native training is mandatory; the toolchain does not carry a second trainer runtime.
 
 ### `ManifestTool`
 
@@ -615,36 +595,16 @@ The app and the manifest tool intentionally share the same data model shape so m
 
 ## SfM Backends And Pipeline Behavior
 
-### Default backend behavior
+### Default geometry behavior
 
-EasySplat has two default lanes.
+EasySplat has two retained geometry lanes:
 
-That means:
+- Fast starts with the stripped COLMAP binary's `global_mapper` command.
+- Balanced and High Detail start with DA3 Base on MPS. DA3 Small is selected for constrained hardware and retried after memory pressure.
 
-- the default Fast app profile uses COLMAP `global_mapper`;
-- Balanced and Ultra runs start with DA3 on MPS using bundled Apache-2.0 `DA3-BASE` weights;
-- `DA3-SMALL` is bundled as the low-memory fallback inside the DA3 bridge;
-- DA3 sparse output is scored against the full selected image count before the pipeline accepts it;
-- if DA3 fails or scores poorly, MapAnything takes over as the first fallback;
-- if that still is not good enough, COLMAP mapper fallback can take over.
+DA3 output is accepted only after coverage and real pixel-residual checks. Accepted learned geometry is converted to the canonical COLMAP model and receives bounded triangulation and bundle adjustment. If learned geometry fails, `global_mapper` provides the compatibility solve and classic `mapper` is the final recovery path.
 
-Explicit `EASYSPLAT_SFM_BACKEND` values still override these defaults.
-
-### Backend overview
-
-| Backend selector | Meaning |
-| --- | --- |
-| `da3` | Default non-fast integrated path |
-| `mapanything` | First fallback and explicit override path |
-| `colmap` | Legacy integrated COLMAP path |
-| `glomap` / `global_mapper` | Alias into COLMAP `global_mapper` flow |
-| `vggt` | Explicit override path, still supported |
-| `fastvggt` | Explicit override path, still supported |
-
-Two details matter here:
-
-1. `glomap` is effectively a compatibility alias. The toolchain maps `toolchain.glomap` to the COLMAP binary and uses `colmap global_mapper`.
-2. VGGT and FastVGGT still exist and are tested, but they are not the default product story anymore.
+`EASYSPLAT_SFM_BACKEND` is a development-only override with two values: `da3` and `colmap`. `EASYSPLAT_SFM_MAPPER` chooses `global_mapper` or classic `mapper` inside the retained COLMAP route. There is no standalone global-mapping binary.
 
 ### Hardware tuning
 
@@ -658,14 +618,10 @@ The repo currently buckets machines into:
 
 From that it derives settings such as:
 
-- MapAnything resolution,
 - direct-view limit,
 - DA3 direct export limits,
-- MapAnything window size and overlap,
-- VGGT point limits,
 - COLMAP feature and match caps,
-- thread caps,
-- whether VGGT is even allowed on the detected machine.
+- thread caps.
 
 This is why pipeline behavior can differ across machines even when the UI looks identical.
 
@@ -682,14 +638,9 @@ The code tries to keep enough coverage for reconstruction without overwhelming l
 
 ### Training and export
 
-After camera solving, EasySplat trains the model with msplat or Brush and exports the latest or final PLY into the project `Output/` folder.
+After camera solving, the native `easysplat-train` executable trains the model on Metal and writes a temporary PLY. The pipeline validates that output before replacing `Output/splat.ply`.
 
-Brush-specific notes:
-
-- training prefers a pseudo-TTY subprocess when available;
-- environment variables can override total steps and export frequency;
-- training snapshot behavior is important for stop/resume UX;
-- the viewer ultimately consumes the exported PLY, not a private internal format.
+Training budgets come from the Fast, Balanced, and High Detail profiles. Progress and checkpoint completion arrive as structured JSONL events. Each atomic checkpoint carries the model arrays, Adam moments, iteration and schedule, deterministic seed, trainer version, and input/geometry identity; resume is refused when those identities do not match.
 
 ## External Tool Execution Pattern
 
@@ -712,7 +663,6 @@ Long-running external tools are noisy, flaky, and inconsistent. EasySplat alread
 - line buffering,
 - ANSI stripping,
 - duplicate line suppression,
-- pseudo-TTY support where useful,
 - concise error tails for surfaced failures.
 
 Use those patterns. Do not introduce one-off `Process()` handling in random places unless there is a very strong reason.
@@ -730,7 +680,7 @@ Keeping those separate reduces churn and lets the app point at a hosted, signed 
 
 The release model is split across local scripts and GitHub workflows:
 
-- the local end-to-end source of truth is `./scripts/release/build_dmg.sh`, which builds COLMAP, OpenSSL, Brush, msplat, DA3, MapAnything, VGGT, and FastVGGT inputs before packaging the toolchain and app;
+- the local end-to-end source of truth is `./scripts/release/build_dmg.sh`, which builds COLMAP, OpenSSL, native msplat, and DA3 inputs before packaging the toolchain and app;
 - DA3 release builds require pinned git provenance; `EASYSPLAT_ALLOW_UNPINNED_DA3_SOURCE=1` is development-only and rejected by release/CI paths;
 - the GitHub toolchain workflow publishes `toolchain-macos-arm64-<version>-core.zip`, `toolchain-macos-arm64-<version>-models.zip`, and `manifest.json`;
 - the manifest is signed and points at those hosted release assets.
@@ -817,20 +767,14 @@ When you need to work on packaging or backend bundles directly, the toolchain bu
 
 - `build_openssl.sh`
 - `build_colmap.sh`
-- `build_brush.sh`
 - `build_msplat.sh`
 - `build_da3_mps.sh`
-- `build_mapanything_mps.sh`
-- `build_vggt_mps.sh`
-- `build_fastvggt_mps.sh`
-- `build_glomap.sh`
 - `package_toolchain.sh`
 
 Two practical notes:
 
-- `build_msplat.sh` packages the version-pinned Apple Silicon Metal trainer into the core toolchain without relying on a developer-local virtual environment.
-- `build_glomap.sh` exists for direct GLOMAP work, but the packaged app path uses COLMAP's integrated `global_mapper` command rather than a separately shipped `glomap` binary.
-- `scripts/benchmark_mapanything.sh` is the quickest way to compare direct versus `seed_refine` MapAnything runs against the currently packaged wrapper.
+- `build_msplat.sh` builds the version-pinned native C++/Metal trainer; the packaged trainer does not need a Python runtime.
+- `build_da3_mps.sh` packages only the commercially redistributable Base and Small product weights.
 
 ## Testing Strategy
 
@@ -965,16 +909,6 @@ Benchmark the packaged DA3 wrapper directly:
 ./scripts/benchmark_da3.sh --video /absolute/path/to/input.mp4
 ```
 
-Use `EASYSPLAT_MSPLAT_BIN=/path/to/easysplat-train` only when comparing a local native trainer outside the signed toolchain.
-
-The app's default Fast profile uses the measured Apple Silicon path. The automatic fast profile falls back to a 2,000-step Brush run when the accepted sparse solve has fewer than 1,500 points. Set `EASYSPLAT_TRAINER=msplat` for explicit msplat testing.
-
-Benchmark the packaged MapAnything fallback directly:
-
-```bash
-./scripts/benchmark_mapanything.sh --video /absolute/path/to/input.mp4
-```
-
 These are not the only knobs, but they are the ones most likely to matter during local debugging.
 
 ## Reference Tables
@@ -989,7 +923,7 @@ These are not the only knobs, but they are the ones most likely to matter during
 | `sfmFeatures` | Finding Features | Backend-specific feature work begins |
 | `sfmMatching` | Matching Views | Match images / views for reconstruction |
 | `sfmMapping` | Solving Cameras | Produce sparse model / camera solution |
-| `trainBrush` | Training Model | Train the Gaussian splat representation |
+| `trainSplat` | Training Model | Train the Gaussian splat representation with native msplat |
 | `exportSplat` | Exporting | Move or copy final output into the project output location |
 | `done` | Done | Terminal success state |
 
@@ -1003,11 +937,9 @@ This is intentionally compact, not exhaustive.
 | `EASYSPLAT_TOOLCHAIN_MANIFEST_URL` | Override manifest URL |
 | `EASYSPLAT_TOOLCHAIN_PUBLIC_KEY_BASE64` | Override embedded public key |
 | `EASYSPLAT_LOCAL_TOOLCHAIN_ROOT` | Bypass download and validate a local toolchain |
-| `EASYSPLAT_SFM_BACKEND` | Force `da3`, `mapanything`, `colmap`, `glomap`, `global_mapper`, `vggt`, or `fastvggt` |
-| `EASYSPLAT_SFM_MAPPER` | Influence fallback solver choice inside the SfM flow |
+| `EASYSPLAT_SFM_BACKEND` | Development override for `da3` or `colmap` |
+| `EASYSPLAT_SFM_MAPPER` | Choose `global_mapper` or classic `mapper` inside the COLMAP route |
 | `EASYSPLAT_SPEED_PROFILE` | Set `fast` for the measured Apple Silicon quick path; selects about 30 frames with blur-filter headroom, uses COLMAP `global_mapper` by default, solves COLMAP at 512px, and uses the 3,000-iteration Fast training profile |
-| `EASYSPLAT_TRAINER` | Override trainer selection with `brush` or `msplat`; the fast profile auto-selects packaged msplat unless sparse quality is too low |
-| `EASYSPLAT_MSPLAT_BIN` | Point at a local `easysplat-train` binary for comparison testing instead of the packaged binary |
 | `EASYSPLAT_FRAME_TARGET_COUNT` | Override selected frame budget |
 | `EASYSPLAT_FRAME_MAX_DIMENSION` | Override extracted frame size before SfM |
 | `EASYSPLAT_COLMAP_MAX_IMAGE_SIZE` | Override COLMAP feature-extraction image size independently from extracted frame size |
@@ -1025,29 +957,13 @@ This is intentionally compact, not exhaustive.
 | `EASYSPLAT_DA3_WINDOW_SIZE` | DA3 window size for longer selections |
 | `EASYSPLAT_DA3_WINDOW_OVERLAP` | DA3 window overlap for longer selections |
 | `EASYSPLAT_DA3_DIRECT_MIN_TRACK_LENGTH` | Minimum mean track length for accepting direct DA3 |
-| `EASYSPLAT_MAPANYTHING_DEVICE` | Usually `mps` or `cpu` |
-| `EASYSPLAT_MAPANYTHING_RESOLUTION` | Override MapAnything resolution |
-| `EASYSPLAT_MAPANYTHING_MEMORY_EFFICIENT` | Toggle memory-efficient inference |
-| `EASYSPLAT_MAPANYTHING_MINIBATCH_SIZE` | Override MapAnything minibatch size |
-| `EASYSPLAT_MAPANYTHING_MAX_POINTS` | Override MapAnything point cap |
-| `EASYSPLAT_MAPANYTHING_CAMERA_TYPE` | Override camera model |
-| `EASYSPLAT_MAPANYTHING_SHARED_CAMERA` | Toggle shared-camera assumption |
-| `EASYSPLAT_MAPANYTHING_ANCHOR_MAX_VIEWS` | Limit anchor views |
-| `EASYSPLAT_MAPANYTHING_WINDOW_SIZE` | Control sliding window size |
-| `EASYSPLAT_MAPANYTHING_WINDOW_OVERLAP` | Control window overlap |
 | `EASYSPLAT_GLOBAL_MAPPER_THREADS` | Tune COLMAP global mapper threading |
 | `EASYSPLAT_GLOBAL_MAPPER_GP_USE_GPU` | Toggle GPU use for global positioning |
 | `EASYSPLAT_GLOBAL_MAPPER_BA_USE_GPU` | Toggle GPU use for bundle adjustment |
 | `EASYSPLAT_COLMAP_FORCE_CPU` / `EASYSPLAT_COLMAP_FORCE_GPU` | Override COLMAP device choice |
 | `EASYSPLAT_COLMAP_SEQUENTIAL_OVERLAP` | Override COLMAP sequential matching overlap |
-| `EASYSPLAT_BRUSH_TOTAL_STEPS` | Override Brush training length |
-| `EASYSPLAT_BRUSH_EXPORT_EVERY` | Override Brush export cadence |
 
-Notes:
-
-- DA3 variables matter for Balanced and Ultra runs; the Fast profile defaults to COLMAP `global_mapper`, and MapAnything variables still matter for fallback tuning.
-- Many VGGT and FastVGGT variables still exist in the codebase for explicit override flows.
-- Some older FastVGGT-specific environment variables are still documented as deprecated or ignored.
+DA3 variables matter for Balanced and High Detail runs. Fast defaults to COLMAP `global_mapper`. Native msplat training is not selectable or replaceable through a runtime environment variable.
 
 ### Start here files and types
 
@@ -1062,8 +978,9 @@ Notes:
 | `EasySplatCore/Sources/EasySplatCore/Tools/ToolchainManager.swift` | Understand toolchain download, install, cache, and validation |
 | `EasySplatCore/Sources/EasySplatCore/Tools/ToolchainManifest.swift` | Understand the signed manifest format |
 | `EasySplatCore/Sources/EasySplatCore/SfM/Da3SfmRunner.swift` | Understand the current preferred SfM backend bridge |
-| `EasySplatCore/Sources/EasySplatCore/SfM/MapAnythingSfmRunner.swift` | Understand the fallback SfM backend bridge |
-| `EasySplatCore/Sources/EasySplatCore/Training/BrushRunner.swift` | Understand training execution and CLI compatibility handling |
+| `EasySplatCore/Sources/EasySplatCore/SfM/ColmapRunner.swift` | Understand bounded refinement and compatibility recovery |
+| `EasySplatCore/Sources/EasySplatCore/Training/MsplatRunner.swift` | Understand native training execution and event handling |
+| `EasySplatCore/Sources/EasySplatCore/Training/MsplatCheckpoint.swift` | Understand checkpoint validation and resume safety |
 | `STYLE_GUIDE.md` | Understand the intended UI feel and rules |
 | `README.md` | Quick-start commands and release/setup overview |
 

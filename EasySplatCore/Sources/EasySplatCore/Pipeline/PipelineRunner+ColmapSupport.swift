@@ -99,7 +99,7 @@ extension PipelineRunner {
         )
     }
 
-    func tuneFastVggtRefinementColmapOptions(
+    func tuneSeededRefinementColmapOptions(
         frameCount: Int,
         extractOptions: ColmapOptions,
         matchOptions: ColmapOptions
@@ -114,24 +114,24 @@ extension PipelineRunner {
 
         let overlapCap = frameCount >= 450 ? 6 : 8
         if tunedMatch.sequentialOverlap > overlapCap {
-            notes.append("FastVGGT refinement speed profile: reduced sequential overlap \(tunedMatch.sequentialOverlap) -> \(overlapCap) for \(frameCount) frames.")
+            notes.append("Seeded refinement speed profile: reduced sequential overlap \(tunedMatch.sequentialOverlap) -> \(overlapCap) for \(frameCount) frames.")
             tunedMatch.sequentialOverlap = overlapCap
         }
 
         let matchCap = frameCount >= 450 ? 7_000 : 8_000
         if let currentMatches = tunedMatch.maxNumMatches {
             if currentMatches > matchCap {
-                notes.append("FastVGGT refinement speed profile: capped max matches \(currentMatches) -> \(matchCap).")
+                notes.append("Seeded refinement speed profile: capped max matches \(currentMatches) -> \(matchCap).")
                 tunedMatch.maxNumMatches = matchCap
             }
         } else {
-            notes.append("FastVGGT refinement speed profile: set max matches to \(matchCap).")
+            notes.append("Seeded refinement speed profile: set max matches to \(matchCap).")
             tunedMatch.maxNumMatches = matchCap
         }
 
         let featureCap = frameCount >= 450 ? 8_192 : 9_000
         if let currentFeatures = tunedExtract.maxNumFeatures, currentFeatures > featureCap {
-            notes.append("FastVGGT refinement speed profile: capped max features \(currentFeatures) -> \(featureCap).")
+            notes.append("Seeded refinement speed profile: capped max features \(currentFeatures) -> \(featureCap).")
             tunedExtract.maxNumFeatures = featureCap
         }
 
@@ -139,63 +139,11 @@ extension PipelineRunner {
             let blockCap = 30
             if let currentBlock = tunedMatch.exhaustiveBlockSize {
                 if currentBlock < blockCap {
-                    notes.append("FastVGGT refinement speed profile: raised exhaustive block size \(currentBlock) -> \(blockCap).")
+                    notes.append("Seeded refinement speed profile: raised exhaustive block size \(currentBlock) -> \(blockCap).")
                     tunedMatch.exhaustiveBlockSize = blockCap
                 }
             } else {
-                notes.append("FastVGGT refinement speed profile: set exhaustive block size to \(blockCap).")
-                tunedMatch.exhaustiveBlockSize = blockCap
-            }
-        }
-
-        return (extract: tunedExtract, match: tunedMatch, notes: notes)
-    }
-
-    func tuneMapAnythingRefinementColmapOptions(
-        frameCount: Int,
-        extractOptions: ColmapOptions,
-        matchOptions: ColmapOptions
-    ) -> (extract: ColmapOptions, match: ColmapOptions, notes: [String]) {
-        var tunedExtract = extractOptions
-        var tunedMatch = matchOptions
-        var notes: [String] = []
-
-        guard frameCount >= 200 else {
-            return (extract: tunedExtract, match: tunedMatch, notes: notes)
-        }
-
-        let overlapCap = frameCount >= 450 ? 6 : 8
-        if tunedMatch.sequentialOverlap > overlapCap {
-            notes.append("MapAnything refinement speed profile: reduced sequential overlap \(tunedMatch.sequentialOverlap) -> \(overlapCap) for \(frameCount) frames.")
-            tunedMatch.sequentialOverlap = overlapCap
-        }
-
-        let matchCap = frameCount >= 450 ? 7_000 : 8_000
-        if let currentMatches = tunedMatch.maxNumMatches {
-            if currentMatches > matchCap {
-                notes.append("MapAnything refinement speed profile: capped max matches \(currentMatches) -> \(matchCap).")
-                tunedMatch.maxNumMatches = matchCap
-            }
-        } else {
-            notes.append("MapAnything refinement speed profile: set max matches to \(matchCap).")
-            tunedMatch.maxNumMatches = matchCap
-        }
-
-        let featureCap = frameCount >= 450 ? 8_192 : 9_000
-        if let currentFeatures = tunedExtract.maxNumFeatures, currentFeatures > featureCap {
-            notes.append("MapAnything refinement speed profile: capped max features \(currentFeatures) -> \(featureCap).")
-            tunedExtract.maxNumFeatures = featureCap
-        }
-
-        if frameCount >= 450 {
-            let blockCap = 30
-            if let currentBlock = tunedMatch.exhaustiveBlockSize {
-                if currentBlock < blockCap {
-                    notes.append("MapAnything refinement speed profile: raised exhaustive block size \(currentBlock) -> \(blockCap).")
-                    tunedMatch.exhaustiveBlockSize = blockCap
-                }
-            } else {
-                notes.append("MapAnything refinement speed profile: set exhaustive block size to \(blockCap).")
+                notes.append("Seeded refinement speed profile: set exhaustive block size to \(blockCap).")
                 tunedMatch.exhaustiveBlockSize = blockCap
             }
         }

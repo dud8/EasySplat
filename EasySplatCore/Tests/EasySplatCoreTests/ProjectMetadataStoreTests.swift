@@ -10,11 +10,11 @@ final class ProjectMetadataStoreTests: XCTestCase {
         let state = PipelineState(stage: .sfmMatching, attempt: 2, lastError: "boom", resumeToken: "token")
         let output = OutputSpec(splatPlyPath: "Output/splat.ply", colmapModelPath: "SfM/colmap/sparse/0")
         let checkpoint = PipelineCheckpoint(
-            stage: .trainBrush,
+            stage: .trainSplat,
             updatedAt: Date(timeIntervalSince1970: 123460),
             progressFraction: 0.5,
             message: "heartbeat",
-            details: .trainBrush(TrainBrushCheckpoint(
+            details: .trainSplat(TrainSplatCheckpoint(
                 latestExportStep: 1000,
                 latestExportPath: "/tmp/export_01000.ply",
                 progressStep: 1200,
@@ -65,11 +65,12 @@ final class ProjectMetadataStoreTests: XCTestCase {
         XCTAssertEqual(loaded.completedSfmMapping?.registeredImages, completedSfmMapping.registeredImages)
         XCTAssertEqual(loaded.recoveryPromptSuppressed, true)
         XCTAssertEqual(loaded.lastRunStartedAt, Date(timeIntervalSince1970: 123499))
-        if case let .trainBrush(details)? = loaded.checkpoint?.details {
-            XCTAssertEqual(details.latestExportStep, 1000)
+        if case let .trainSplat(details)? = loaded.checkpoint?.details {
+            XCTAssertEqual(details.progressStep, 1_200)
             XCTAssertEqual(details.progressTotal, 40_000)
+            XCTAssertNil(details.latestExportStep)
         } else {
-            XCTFail("Expected trainBrush checkpoint details")
+            XCTFail("Expected trainSplat checkpoint details")
         }
     }
 
@@ -483,11 +484,9 @@ private final class LockedErrors: @unchecked Sendable {
 }
 
 final class ProjectMetadataFullSchemaRoundTripTests: XCTestCase {
-    /// Regression guard: any future build that ships an additional optional
-    /// metadata field must still round-trip the full set without losing the
-    /// older ones. This test exercises every field added since the original
-    /// schema so a refactor that accidentally drops a Codable key fails fast.
-    func testRoundTripPreservesEveryPersistedField() throws {
+    /// Regression guard for the current write contract. Legacy analytics and
+    /// activity fields still decode, but a normal save must not write them back.
+    func testRoundTripPreservesCurrentFieldsAndOmitsDecodeOnlyLegacyFields() throws {
         let root = try TestFileBuilder.makeTempDir()
         defer { try? FileManager.default.removeItem(at: root) }
         let url = root.appendingPathComponent("project.json")
@@ -505,7 +504,7 @@ final class ProjectMetadataFullSchemaRoundTripTests: XCTestCase {
         let stageTimings: [StageTimingRecord] = [
             .init(stage: .sfmFeatures, startedAt: Date(timeIntervalSince1970: 1_700_000_100), durationSeconds: 45),
             .init(stage: .sfmMapping, startedAt: Date(timeIntervalSince1970: 1_700_000_200), durationSeconds: 120),
-            .init(stage: .trainBrush, startedAt: Date(timeIntervalSince1970: 1_700_000_400), durationSeconds: 600)
+            .init(stage: .trainSplat, startedAt: Date(timeIntervalSince1970: 1_700_000_400), durationSeconds: 600)
         ]
         let autoTune = AutoTuneSnapshot(
             tier: "High",
@@ -552,12 +551,17 @@ final class ProjectMetadataFullSchemaRoundTripTests: XCTestCase {
         )
 
         try ProjectMetadataStore.save(metadata, to: url)
+        let saved = try Data(contentsOf: url)
+        let object = try XCTUnwrap(JSONSerialization.jsonObject(with: saved) as? [String: Any])
+        XCTAssertNil(object["autoTune"])
+        XCTAssertNil(object["shareMetrics"])
+        XCTAssertNil(object["lastOpenedAt"])
         let loaded = try ProjectMetadataStore.load(from: url)
 
         XCTAssertEqual(loaded.reconstruction, reconstruction)
         XCTAssertEqual(loaded.stageTimings, stageTimings)
-        XCTAssertEqual(loaded.autoTune, autoTune)
-        XCTAssertEqual(loaded.shareMetrics, metadata.shareMetrics)
+        XCTAssertNil(loaded.autoTune)
+        XCTAssertNil(loaded.shareMetrics)
         XCTAssertEqual(loaded.completedSfmMapping?.mapper, "global_mapper-gpu")
         XCTAssertEqual(loaded.recoveryPromptSuppressed, false)
         XCTAssertEqual(loaded.state.stage, .done)
@@ -566,48 +570,8 @@ final class ProjectMetadataFullSchemaRoundTripTests: XCTestCase {
         XCTAssertEqual(loaded.input.videoFiles, ["/tmp/a.mov"])
         XCTAssertEqual(loaded.input.photosFolder, "/tmp/photos")
         XCTAssertEqual(loaded.notes, "captured under window light")
-        XCTAssertEqual(loaded.lastOpenedAt, Date(timeIntervalSince1970: 1_700_001_000))
+        XCTAssertNil(loaded.lastOpenedAt)
         XCTAssertEqual(loaded.lastFailureAt, Date(timeIntervalSince1970: 1_699_999_500))
-    }
-}
-
-final class AutoTuneSnapshotPersistenceTests: XCTestCase {
-    func testRoundTripPreservesAutoTuneSnapshot() throws {
-        let root = try TestFileBuilder.makeTempDir()
-        defer { try? FileManager.default.removeItem(at: root) }
-        let url = root.appendingPathComponent("project.json")
-
-        let snapshot = AutoTuneSnapshot(
-            tier: "Mid",
-            memoryGB: 24.0,
-            cpuCount: 10,
-            gpuWorkingSetGB: 16.0,
-            mapAnythingResolution: 518,
-            mapAnythingDirectViewLimit: 6,
-            mapAnythingAnchorMaxViews: 48,
-            mapAnythingWindowSize: 6,
-            mapAnythingWindowOverlap: 2,
-            vggtImageLoadResolution: 1024,
-            vggtFixedResolution: 518,
-            vggtMaxPoints: 100_000,
-            vggtAllowed: true,
-            colmapMaxNumFeatures: 8_192,
-            colmapMaxNumMatches: 8_192,
-            colmapSequentialOverlap: 10,
-            colmapExhaustiveBlockSize: 20,
-            threadCap: 6,
-            colmapMaxImageSizeCap: nil,
-            capturedAt: Date(timeIntervalSince1970: 1_700_000_000)
-        )
-        let metadata = ProjectMetadata(
-            title: "With Auto-tune",
-            input: .photos(folder: "/tmp/photos"),
-            preset: PresetSpec(mode: .object, quality: .standard),
-            autoTune: snapshot
-        )
-        try ProjectMetadataStore.save(metadata, to: url)
-        let loaded = try ProjectMetadataStore.load(from: url)
-        XCTAssertEqual(loaded.autoTune, snapshot)
     }
 }
 

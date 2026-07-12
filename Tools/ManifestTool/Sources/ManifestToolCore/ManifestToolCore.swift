@@ -133,8 +133,6 @@ public enum ManifestBuilder {
 public enum ManifestToolDefaults {
     public static let splitCoreContents = [
         "bin/colmap",
-        "bin/brush",
-        "bin/brush.real",
         "bin/easysplat-train",
         "bin/default.metallib",
         "lib/libcrypto.3.dylib",
@@ -146,21 +144,6 @@ public enum ManifestToolDefaults {
         "da3_mps/build_info.json",
         "da3_mps/app/easysplat_da3_sfm/run.py",
         "da3_mps/vendor/depth-anything-3/src/depth_anything_3/api.py",
-        "mapanything_mps/bin/easysplat_mapanything_sfm",
-        "mapanything_mps/python/bin/python3",
-        "mapanything_mps/build_info.json",
-        "mapanything_mps/app/easysplat_mapanything_sfm/run.py",
-        "mapanything_mps/vendor/mapanything/mapanything/models/mapanything/model.py",
-        "vggt_mps/bin/easysplat_vggt_sfm",
-        "vggt_mps/python/bin/python3",
-        "vggt_mps/build_info.json",
-        "vggt_mps/app/easysplat_vggt_sfm/run.py",
-        "vggt_mps/vendor/vggt/vggt/models/vggt.py",
-        "fastvggt_mps/bin/easysplat_fastvggt_sfm",
-        "fastvggt_mps/python/bin/python3",
-        "fastvggt_mps/build_info.json",
-        "fastvggt_mps/app/easysplat_fastvggt_sfm/run.py",
-        "fastvggt_mps/vendor/fastvggt/vggt/models/vggt.py",
     ]
 
     public static let splitModelsContents = [
@@ -170,11 +153,6 @@ public enum ManifestToolDefaults {
         "da3_mps/models/DA3-SMALL/config.json",
         "da3_mps/models/DA3-SMALL/model.safetensors",
         "da3_mps/models/DA3-SMALL/easysplat_model_info.json",
-        "mapanything_mps/models/map-anything-apache/config.json",
-        "mapanything_mps/models/map-anything-apache/model.safetensors",
-        "mapanything_mps/models/dinov2/dinov2_vitg14_pretrain.pth",
-        "vggt_mps/models/vggt_model.pt",
-        "fastvggt_mps/models/fastvggt_model.pt",
     ]
 
     public static let monolithicContents = splitCoreContents + splitModelsContents

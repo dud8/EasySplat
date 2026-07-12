@@ -103,11 +103,11 @@ final class RunDurationPredictorTests: XCTestCase {
         let projects: [ProjectSummary] = [
             makeSummaryWithStageTimings([
                 .init(stage: .sfmFeatures, startedAt: Date(timeIntervalSince1970: 0), durationSeconds: 30),
-                .init(stage: .trainBrush, startedAt: Date(timeIntervalSince1970: 30), durationSeconds: 200)
+                .init(stage: .trainSplat, startedAt: Date(timeIntervalSince1970: 30), durationSeconds: 200)
             ]),
             makeSummaryWithStageTimings([
                 .init(stage: .sfmFeatures, startedAt: Date(timeIntervalSince1970: 0), durationSeconds: 60),
-                .init(stage: .trainBrush, startedAt: Date(timeIntervalSince1970: 60), durationSeconds: 220)
+                .init(stage: .trainSplat, startedAt: Date(timeIntervalSince1970: 60), durationSeconds: 220)
             ]),
             makeSummaryWithStageTimings([
                 .init(stage: .sfmFeatures, startedAt: Date(timeIntervalSince1970: 0), durationSeconds: 90)
@@ -116,7 +116,7 @@ final class RunDurationPredictorTests: XCTestCase {
         let features = RunDurationPredictor.predictStage(.sfmFeatures, mode: nil, quality: nil, from: projects)
         XCTAssertEqual(features?.seconds, 60)
         XCTAssertEqual(features?.sampleCount, 3)
-        let train = RunDurationPredictor.predictStage(.trainBrush, mode: nil, quality: nil, from: projects)
+        let train = RunDurationPredictor.predictStage(.trainSplat, mode: nil, quality: nil, from: projects)
         XCTAssertEqual(train?.seconds, 210)
         XCTAssertEqual(train?.sampleCount, 2)
     }

@@ -52,14 +52,11 @@ jobs:
         run: |
           brew install cmake ninja boost eigen freeimage glog gflags suitesparse ceres-solver qt glew cgal libomp openimageio
 
-      - name: Build COLMAP
-        run: scripts/toolchain/build_colmap.sh
-
       - name: Build OpenSSL
         run: scripts/toolchain/build_openssl.sh
 
-      - name: Build Brush
-        run: scripts/toolchain/build_brush.sh
+      - name: Build COLMAP
+        run: scripts/toolchain/build_colmap.sh
 
       - name: Build msplat
         run: scripts/toolchain/build_msplat.sh
@@ -74,15 +71,6 @@ jobs:
               ;;
           esac
           scripts/toolchain/build_da3_mps.sh
-
-      - name: Build MapAnything-MPS bundle
-        run: scripts/toolchain/build_mapanything_mps.sh
-
-      - name: Build VGGT-MPS bundle
-        run: scripts/toolchain/build_vggt_mps.sh
-
-      - name: Build FastVGGT-MPS bundle
-        run: scripts/toolchain/build_fastvggt_mps.sh
 
       - name: Package toolchain
         run: scripts/toolchain/package_toolchain.sh --version "$VERSION"

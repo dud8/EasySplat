@@ -153,31 +153,16 @@ final class PipelineRunnerErrorTests: XCTestCase {
         XCTAssertTrue(runner.test_colmapErrorIndicatesGpuFailure(error))
     }
 
-    func testGlomapErrorIndicatesMissingOpenSSL() throws {
-        let runner = makeRunner()
-        let failure = SubprocessFailure(
-            tool: "glomap",
-            command: "mapper",
-            exitCode: 1,
-            terminationReason: .exit,
-            stdoutTail: "",
-            stderrTail: "Library not loaded: @rpath/libcrypto.3.dylib"
-        )
-        XCTAssertTrue(runner.test_glomapErrorIndicatesMissingOpenSSL(failure))
-    }
-
     private func makeRunner() -> PipelineRunner {
         let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
-        let vggt = VggtToolchain(root: root, sfmTool: root, python: root, models: root)
-        let fastvggt = FastVggtToolchain(root: root, sfmTool: root, python: root, models: root)
-        let toolchain = ToolchainPaths(root: root, colmap: root, glomap: root, brush: root, vggt: vggt, fastvggt: fastvggt)
+        let toolchain = TestToolchains.toolchainPaths(root: root)
         let config = PipelineRunner.PipelineConfig(toolchain: toolchain, preset: PresetSpec(mode: .object, quality: .standard))
         return PipelineRunner(projectURL: root, config: config)
     }
 
     /// Regression: a malformed or future-versioned project.json causes ProjectMetadataStore.load
     /// to throw at the very top of run(). The previous run's tool log files (e.g. colmap.log,
-    /// brush.log) are exactly what the user needs to diagnose the failed/interrupted state —
+    /// msplat.log) are exactly what the user needs to diagnose the failed/interrupted state —
     /// the log reset MUST happen only after metadata loads successfully.
     func testRunPreservesPreviousToolLogsWhenMetadataLoadFails() async throws {
         let projectURL = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
@@ -190,15 +175,13 @@ final class PipelineRunnerErrorTests: XCTestCase {
         // Plant evidence from a hypothetical prior run.
         let priorColmap = "[2026-04-26T19:30:00.000Z] colmap CRITICAL evidence from previous run\n"
         try priorColmap.write(to: paths.colmapLogURL, atomically: true, encoding: .utf8)
-        let priorBrush = "[2026-04-26T19:35:00.000Z] brush trace from previous run\n"
-        try priorBrush.write(to: paths.brushLogURL, atomically: true, encoding: .utf8)
+        let priorTraining = "[2026-04-26T19:35:00.000Z] trainer trace from previous run\n"
+        try priorTraining.write(to: paths.msplatLogURL, atomically: true, encoding: .utf8)
 
         // Write a malformed project.json so ProjectMetadataStore.load throws.
         try "{ this is not json".write(to: paths.metadataURL, atomically: true, encoding: .utf8)
 
-        let vggt = VggtToolchain(root: projectURL, sfmTool: projectURL, python: projectURL, models: projectURL)
-        let fastvggt = FastVggtToolchain(root: projectURL, sfmTool: projectURL, python: projectURL, models: projectURL)
-        let toolchain = ToolchainPaths(root: projectURL, colmap: projectURL, glomap: projectURL, brush: projectURL, vggt: vggt, fastvggt: fastvggt)
+        let toolchain = TestToolchains.toolchainPaths(root: projectURL)
         let config = PipelineRunner.PipelineConfig(toolchain: toolchain, preset: PresetSpec(mode: .object, quality: .standard))
         let runner = PipelineRunner(projectURL: projectURL, config: config)
 
@@ -213,8 +196,8 @@ final class PipelineRunnerErrorTests: XCTestCase {
         let colmapText = try String(contentsOf: paths.colmapLogURL, encoding: .utf8)
         XCTAssertTrue(colmapText.contains("CRITICAL evidence from previous run"),
                       "colmap log was wiped by failed run; got:\n\(colmapText)")
-        let brushText = try String(contentsOf: paths.brushLogURL, encoding: .utf8)
-        XCTAssertTrue(brushText.contains("trace from previous run"),
-                      "brush log was wiped by failed run; got:\n\(brushText)")
+        let trainerText = try String(contentsOf: paths.msplatLogURL, encoding: .utf8)
+        XCTAssertTrue(trainerText.contains("trace from previous run"),
+                      "trainer log was wiped by failed run; got:\n\(trainerText)")
     }
 }

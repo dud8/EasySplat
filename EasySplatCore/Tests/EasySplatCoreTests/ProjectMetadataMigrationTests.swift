@@ -15,10 +15,10 @@ final class ProjectMetadataMigrationTests: XCTestCase {
         XCTAssertEqual(loaded.input.photosFolder, "/tmp/photos")
         XCTAssertEqual(loaded.preset.mode, .object)
         XCTAssertEqual(loaded.preset.quality, .draft)
-        XCTAssertEqual(loaded.state.stage, .trainBrush)
+        XCTAssertEqual(loaded.state.stage, .trainSplat)
         XCTAssertEqual(loaded.outputs?.splatPlyPath, "Output/legacy.ply")
         XCTAssertEqual(loaded.outputs?.colmapModelPath, "SfM/colmap/sparse/0")
-        XCTAssertEqual(loaded.checkpoint?.stage, .trainBrush)
+        XCTAssertEqual(loaded.checkpoint?.stage, .trainSplat)
         XCTAssertEqual(loaded.checkpoint?.message, "training")
         XCTAssertEqual(loaded.completedSfmMapping?.mapper, "colmap")
         XCTAssertEqual(loaded.completedSfmMapping?.sparsePath, "SfM/colmap/sparse/0")
@@ -57,6 +57,23 @@ final class ProjectMetadataMigrationTests: XCTestCase {
         )
     }
 
+    func testLegacyBrushCheckpointDetailsDecodeAsSplatAndEncodeWithoutBrushName() throws {
+        let legacy = Data(#"{"trainBrush":{"_0":{"latestExportStep":5000,"latestExportPath":"Training/export_05000.ply","progressStep":5200,"progressTotal":40000,"stepsPerSecond":3.5,"resumeSnapshotPath":"Training/latest_snapshot.ply","trainingBackend":"brush"}}}"#.utf8)
+
+        let decoded = try JSONDecoder().decode(PipelineCheckpointDetails.self, from: legacy)
+
+        guard case .trainSplat(let details) = decoded else {
+            return XCTFail("Expected legacy Brush details to migrate to trainSplat")
+        }
+        XCTAssertEqual(details.progressStep, 5_200)
+        XCTAssertEqual(details.progressTotal, 40_000)
+        XCTAssertEqual(details.trainingBackend, .brush)
+        let encoded = try JSONEncoder().encode(decoded)
+        let text = String(decoding: encoded, as: UTF8.self)
+        XCTAssertTrue(text.contains("trainSplat"))
+        XCTAssertFalse(text.contains("trainBrush"))
+    }
+
     func testLoadingV1DoesNotRewriteBytesUntilNormalSave() throws {
         let original = Data(Self.objectDraftFixture.utf8)
         let fixture = try writeFixture(Self.objectDraftFixture)
@@ -79,6 +96,26 @@ final class ProjectMetadataMigrationTests: XCTestCase {
         XCTAssertEqual(options["inputOrdering"] as? String, "automatic")
         XCTAssertEqual(options["resourcePolicy"] as? String, "automatic")
         XCTAssertEqual(options["photoSelection"] as? String, "automatic")
+        let state = try XCTUnwrap(object["state"] as? [String: Any])
+        XCTAssertEqual(state["stage"] as? String, "trainSplat")
+        let checkpoint = try XCTUnwrap(object["checkpoint"] as? [String: Any])
+        XCTAssertEqual(checkpoint["stage"] as? String, "trainSplat")
+        let outputs = try XCTUnwrap(object["outputs"] as? [String: Any])
+        XCTAssertEqual(outputs["splatPlyPath"] as? String, "Output/legacy.ply")
+        XCTAssertEqual(outputs["colmapModelPath"] as? String, "SfM/colmap/sparse/0")
+        XCTAssertEqual(object["notes"] as? String, "Keep this note")
+        XCTAssertNil(object["shareMetrics"])
+        XCTAssertNil(object["autoTune"])
+        XCTAssertNil(object["lastOpenedAt"])
+        XCTAssertFalse(String(decoding: saved, as: UTF8.self).contains("trainBrush"))
+
+        let reloaded = try ProjectMetadataStore.load(from: fixture.url)
+        XCTAssertEqual(reloaded.outputs?.splatPlyPath, "Output/legacy.ply")
+        XCTAssertEqual(reloaded.outputs?.colmapModelPath, "SfM/colmap/sparse/0")
+        XCTAssertEqual(reloaded.notes, "Keep this note")
+        XCTAssertNil(reloaded.shareMetrics)
+        XCTAssertNil(reloaded.autoTune)
+        XCTAssertNil(reloaded.lastOpenedAt)
     }
 
     func testLoadRejectsAbsoluteGeometryArtifactPathWithSpecificError() throws {

@@ -72,7 +72,7 @@ struct ProjectFleetStats: Equatable {
                 switch record.stage {
                 case .sfmFeatures, .sfmMatching, .sfmMapping:
                     stats.totalSfmSeconds += record.durationSeconds
-                case .trainBrush:
+                case .trainSplat:
                     stats.totalTrainingSeconds += record.durationSeconds
                 default:
                     break

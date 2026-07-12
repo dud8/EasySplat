@@ -123,10 +123,16 @@ public enum ProjectMetadataStore {
     private static func saveWithoutLock(_ metadata: ProjectMetadata, to url: URL) throws {
         try ProjectPaths(root: url.deletingLastPathComponent()).validateRootDirectory()
         try validateArtifactPaths(in: metadata, metadataURL: url)
+        var persisted = metadata
+        // These v1 fields remain decodable for compatibility, but current activity lives
+        // outside project.json and new saves must not recreate retired analytics data.
+        persisted.shareMetrics = nil
+        persisted.autoTune = nil
+        persisted.lastOpenedAt = nil
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.prettyPrinted, .sortedKeys, .withoutEscapingSlashes]
         encoder.dateEncodingStrategy = .iso8601
-        let data = try encoder.encode(metadata)
+        let data = try encoder.encode(persisted)
         guard data.count <= maximumMetadataBytes else {
             throw SaveError.metadataTooLarge(maximumBytes: maximumMetadataBytes)
         }

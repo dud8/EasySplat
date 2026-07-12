@@ -23,11 +23,7 @@ if [ -z "$VERSION" ]; then
 fi
 
 COLMAP_INSTALL="${COLMAP_INSTALL:-$ROOT/Toolchains/build/colmap/install}"
-BRUSH_INSTALL="${BRUSH_INSTALL:-$ROOT/Toolchains/build/brush/install}"
 MSPLAT_INSTALL="${MSPLAT_INSTALL:-$ROOT/Toolchains/build/msplat/install}"
-VGGT_MPS_INSTALL="${VGGT_MPS_INSTALL:-$ROOT/Toolchains/build/vggt_mps/install}"
-FASTVGGT_MPS_INSTALL="${FASTVGGT_MPS_INSTALL:-$ROOT/Toolchains/build/fastvggt_mps/install}"
-MAPANYTHING_MPS_INSTALL="${MAPANYTHING_MPS_INSTALL:-$ROOT/Toolchains/build/mapanything_mps/install}"
 DA3_MPS_INSTALL="${DA3_MPS_INSTALL:-$ROOT/Toolchains/build/da3_mps/install}"
 MSPLAT_VALIDATOR="$ROOT/scripts/toolchain/validate_native_msplat.sh"
 
@@ -384,20 +380,6 @@ add_bundle_lib_rpaths() {
 
 cp "$COLMAP_INSTALL/bin/colmap" "$BIN/colmap"
 
-# Brush has changed CLI shapes over time (some versions used subcommands like `train`).
-# Package a tiny wrapper so both `brush <dataset>` and `brush train <dataset>` work.
-cp "$BRUSH_INSTALL/bin/brush" "$BIN/brush.real"
-cat >"$BIN/brush" <<'SCRIPT'
-#!/usr/bin/env bash
-set -euo pipefail
-DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-REAL="$DIR/brush.real"
-if [ "${1:-}" = "train" ]; then
-  shift
-fi
-exec "$REAL" "$@"
-SCRIPT
-
 "$MSPLAT_VALIDATOR" --source "$MSPLAT_INSTALL/msplat"
 mkdir -p "$OUT/msplat"
 cp "$MSPLAT_INSTALL/msplat/bin/easysplat-train" "$BIN/easysplat-train"
@@ -405,7 +387,7 @@ cp "$MSPLAT_INSTALL/msplat/bin/default.metallib" "$BIN/default.metallib"
 cp "$MSPLAT_INSTALL/msplat/build_info.json" "$OUT/msplat/build_info.json"
 cp "$MSPLAT_INSTALL/msplat/LICENSE" "$OUT/msplat/LICENSE"
 
-chmod +x "$BIN/colmap" "$BIN/brush" "$BIN/brush.real" "$BIN/easysplat-train"
+chmod +x "$BIN/colmap" "$BIN/easysplat-train"
 
 if [ ! -d "$DA3_MPS_INSTALL/da3_mps" ]; then
   echo "da3_mps bundle not found at $DA3_MPS_INSTALL/da3_mps. Build it before packaging." >&2
@@ -453,125 +435,6 @@ if [ ! -f "$DA3_MPS_INSTALL/da3_mps/vendor/depth-anything-3/src/depth_anything_3
   exit 1
 fi
 cp -R "$DA3_MPS_INSTALL/da3_mps" "$OUT/da3_mps"
-
-if [ ! -d "$MAPANYTHING_MPS_INSTALL/mapanything_mps" ]; then
-  echo "mapanything_mps bundle not found at $MAPANYTHING_MPS_INSTALL/mapanything_mps. Build it before packaging." >&2
-  exit 1
-fi
-if [ ! -x "$MAPANYTHING_MPS_INSTALL/mapanything_mps/bin/easysplat_mapanything_sfm" ]; then
-  echo "mapanything_mps bundle missing bin/easysplat_mapanything_sfm. Rebuild mapanything_mps." >&2
-  exit 1
-fi
-if [ ! -x "$MAPANYTHING_MPS_INSTALL/mapanything_mps/python/bin/python3" ]; then
-  echo "mapanything_mps bundle missing python/bin/python3. Rebuild mapanything_mps." >&2
-  exit 1
-fi
-if [ ! -f "$MAPANYTHING_MPS_INSTALL/mapanything_mps/build_info.json" ]; then
-  echo "mapanything_mps bundle missing build_info.json. Rebuild mapanything_mps." >&2
-  exit 1
-fi
-if [ ! -f "$MAPANYTHING_MPS_INSTALL/mapanything_mps/app/easysplat_mapanything_sfm/run.py" ]; then
-  echo "mapanything_mps bundle missing app/easysplat_mapanything_sfm/run.py. Rebuild mapanything_mps." >&2
-  exit 1
-fi
-MAP_PY_BIN="$MAPANYTHING_MPS_INSTALL/mapanything_mps/python/bin/python3"
-require_bundled_arm64_python "mapanything_mps" "$MAP_PY_BIN"
-validate_build_info "$MAP_PY_BIN" "$MAPANYTHING_MPS_INSTALL/mapanything_mps/build_info.json" "mapanything_mps"
-if [ ! -d "$MAPANYTHING_MPS_INSTALL/mapanything_mps/models" ]; then
-  echo "mapanything_mps bundle missing models/. Rebuild mapanything_mps." >&2
-  exit 1
-fi
-if [ ! -f "$MAPANYTHING_MPS_INSTALL/mapanything_mps/models/map-anything-apache/model.safetensors" ]; then
-  echo "mapanything_mps bundle missing models/map-anything-apache/model.safetensors. Rebuild mapanything_mps." >&2
-  exit 1
-fi
-if [ ! -f "$MAPANYTHING_MPS_INSTALL/mapanything_mps/models/map-anything-apache/config.json" ]; then
-  echo "mapanything_mps bundle missing models/map-anything-apache/config.json. Rebuild mapanything_mps." >&2
-  exit 1
-fi
-if [ ! -f "$MAPANYTHING_MPS_INSTALL/mapanything_mps/models/dinov2/dinov2_vitg14_pretrain.pth" ]; then
-  echo "mapanything_mps bundle missing models/dinov2/dinov2_vitg14_pretrain.pth. Rebuild mapanything_mps." >&2
-  exit 1
-fi
-if [ ! -f "$MAPANYTHING_MPS_INSTALL/mapanything_mps/vendor/mapanything/mapanything/models/mapanything/model.py" ]; then
-  echo "mapanything_mps bundle missing vendor/mapanything. Rebuild mapanything_mps." >&2
-  exit 1
-fi
-cp -R "$MAPANYTHING_MPS_INSTALL/mapanything_mps" "$OUT/mapanything_mps"
-
-if [ ! -d "$VGGT_MPS_INSTALL/vggt_mps" ]; then
-  echo "vggt_mps bundle not found at $VGGT_MPS_INSTALL/vggt_mps. Build it before packaging." >&2
-  exit 1
-fi
-if [ ! -x "$VGGT_MPS_INSTALL/vggt_mps/bin/easysplat_vggt_sfm" ]; then
-  echo "vggt_mps bundle missing bin/easysplat_vggt_sfm. Rebuild vggt_mps." >&2
-  exit 1
-fi
-if [ ! -x "$VGGT_MPS_INSTALL/vggt_mps/python/bin/python3" ]; then
-  echo "vggt_mps bundle missing python/bin/python3. Rebuild vggt_mps." >&2
-  exit 1
-fi
-if [ ! -f "$VGGT_MPS_INSTALL/vggt_mps/build_info.json" ]; then
-  echo "vggt_mps bundle missing build_info.json. Rebuild vggt_mps." >&2
-  exit 1
-fi
-if [ ! -f "$VGGT_MPS_INSTALL/vggt_mps/app/easysplat_vggt_sfm/run.py" ]; then
-  echo "vggt_mps bundle missing app/easysplat_vggt_sfm/run.py. Rebuild vggt_mps." >&2
-  exit 1
-fi
-PY_BIN="$VGGT_MPS_INSTALL/vggt_mps/python/bin/python3"
-require_bundled_arm64_python "vggt_mps" "$PY_BIN"
-validate_build_info "$PY_BIN" "$VGGT_MPS_INSTALL/vggt_mps/build_info.json" "vggt_mps"
-if [ ! -d "$VGGT_MPS_INSTALL/vggt_mps/models" ]; then
-  echo "vggt_mps bundle missing models/. Rebuild vggt_mps." >&2
-  exit 1
-fi
-if [ ! -f "$VGGT_MPS_INSTALL/vggt_mps/models/vggt_model.pt" ]; then
-  echo "vggt_mps bundle missing models/vggt_model.pt. Rebuild vggt_mps." >&2
-  exit 1
-fi
-if [ ! -f "$VGGT_MPS_INSTALL/vggt_mps/vendor/vggt/vggt/models/vggt.py" ]; then
-  echo "vggt_mps bundle missing vendor/vggt. Rebuild vggt_mps." >&2
-  exit 1
-fi
-cp -R "$VGGT_MPS_INSTALL/vggt_mps" "$OUT/vggt_mps"
-
-if [ ! -d "$FASTVGGT_MPS_INSTALL/fastvggt_mps" ]; then
-  echo "fastvggt_mps bundle not found at $FASTVGGT_MPS_INSTALL/fastvggt_mps. Build it before packaging." >&2
-  exit 1
-fi
-if [ ! -x "$FASTVGGT_MPS_INSTALL/fastvggt_mps/bin/easysplat_fastvggt_sfm" ]; then
-  echo "fastvggt_mps bundle missing bin/easysplat_fastvggt_sfm. Rebuild fastvggt_mps." >&2
-  exit 1
-fi
-if [ ! -x "$FASTVGGT_MPS_INSTALL/fastvggt_mps/python/bin/python3" ]; then
-  echo "fastvggt_mps bundle missing python/bin/python3. Rebuild fastvggt_mps." >&2
-  exit 1
-fi
-if [ ! -f "$FASTVGGT_MPS_INSTALL/fastvggt_mps/build_info.json" ]; then
-  echo "fastvggt_mps bundle missing build_info.json. Rebuild fastvggt_mps." >&2
-  exit 1
-fi
-if [ ! -f "$FASTVGGT_MPS_INSTALL/fastvggt_mps/app/easysplat_fastvggt_sfm/run.py" ]; then
-  echo "fastvggt_mps bundle missing app/easysplat_fastvggt_sfm/run.py. Rebuild fastvggt_mps." >&2
-  exit 1
-fi
-FAST_PY_BIN="$FASTVGGT_MPS_INSTALL/fastvggt_mps/python/bin/python3"
-require_bundled_arm64_python "fastvggt_mps" "$FAST_PY_BIN"
-validate_build_info "$FAST_PY_BIN" "$FASTVGGT_MPS_INSTALL/fastvggt_mps/build_info.json" "fastvggt_mps"
-if [ ! -d "$FASTVGGT_MPS_INSTALL/fastvggt_mps/models" ]; then
-  echo "fastvggt_mps bundle missing models/. Rebuild fastvggt_mps." >&2
-  exit 1
-fi
-if [ ! -f "$FASTVGGT_MPS_INSTALL/fastvggt_mps/models/fastvggt_model.pt" ]; then
-  echo "fastvggt_mps bundle missing models/fastvggt_model.pt. Rebuild fastvggt_mps." >&2
-  exit 1
-fi
-if [ ! -f "$FASTVGGT_MPS_INSTALL/fastvggt_mps/vendor/fastvggt/vggt/models/vggt.py" ]; then
-  echo "fastvggt_mps bundle missing vendor/fastvggt. Rebuild fastvggt_mps." >&2
-  exit 1
-fi
-cp -R "$FASTVGGT_MPS_INSTALL/fastvggt_mps" "$OUT/fastvggt_mps"
 
 if ! command -v install_name_tool >/dev/null 2>&1; then
   echo "install_name_tool not found; cannot package portable toolchain dependencies." >&2
@@ -646,6 +509,7 @@ otool -l "$BIN/colmap" | grep -q "@executable_path/../lib" || { echo "colmap mis
 otool -L "$BIN/colmap" | grep -q "@rpath/libcrypto.3.dylib" || { echo "colmap missing dependency @rpath/libcrypto.3.dylib" >&2; exit 1; }
 test -f "$LIB/libcrypto.3.dylib" || { echo "missing bundled libcrypto.3.dylib" >&2; exit 1; }
 test -f "$LIB/libssl.3.dylib" || { echo "missing bundled libssl.3.dylib" >&2; exit 1; }
+"$BIN/colmap" global_mapper -h >/dev/null 2>&1 || { echo "colmap missing working global_mapper command" >&2; exit 1; }
 
 bundle_toolchain_dependency_closure
 validate_portable_dependency_references
@@ -655,11 +519,8 @@ pushd "$OUT" >/dev/null
 zip -r "$CORE_ZIP" \
   bin lib \
   msplat/build_info.json msplat/LICENSE \
-  da3_mps/bin da3_mps/python da3_mps/app da3_mps/vendor da3_mps/build_info.json \
-  mapanything_mps/bin mapanything_mps/python mapanything_mps/app mapanything_mps/vendor mapanything_mps/build_info.json \
-  vggt_mps/bin vggt_mps/python vggt_mps/app vggt_mps/vendor vggt_mps/build_info.json \
-  fastvggt_mps/bin fastvggt_mps/python fastvggt_mps/app fastvggt_mps/vendor fastvggt_mps/build_info.json
-zip -r "$MODELS_ZIP" da3_mps/models mapanything_mps/models vggt_mps/models fastvggt_mps/models
+  da3_mps/bin da3_mps/python da3_mps/app da3_mps/vendor da3_mps/build_info.json
+zip -r "$MODELS_ZIP" da3_mps/models
 popd >/dev/null
 
 echo "Packaged toolchain (core): $CORE_ZIP"

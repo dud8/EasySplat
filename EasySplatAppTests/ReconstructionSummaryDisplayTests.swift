@@ -165,9 +165,9 @@ final class ReconstructionSummaryDisplayTests: XCTestCase {
         let timings: [StageTimingRecord] = [
             .init(stage: .importInput, startedAt: Date(timeIntervalSince1970: 0), durationSeconds: 1),
             .init(stage: .sfmFeatures, startedAt: Date(timeIntervalSince1970: 10), durationSeconds: 60),
-            .init(stage: .trainBrush, startedAt: Date(timeIntervalSince1970: 100), durationSeconds: 120)
+            .init(stage: .trainSplat, startedAt: Date(timeIntervalSince1970: 100), durationSeconds: 120)
         ]
         let surfaced = StageTimingDisplay.surfaceableStages(from: timings)
-        XCTAssertEqual(surfaced.map { $0.stage }, [.sfmFeatures, .trainBrush])
+        XCTAssertEqual(surfaced.map { $0.stage }, [.sfmFeatures, .trainSplat])
     }
 }

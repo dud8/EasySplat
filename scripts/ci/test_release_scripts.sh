@@ -70,10 +70,19 @@ test "$(cat "$module_resources_dir/public_key_ed25519.txt")" = 'PUBLIC_KEY_TEST_
 grep -q 'CORE_ARTIFACT_URL="http://localhost:$PORT/out/toolchain-macos-arm64-$VERSION-core.zip"' "$ROOT/scripts/release/build_dmg.sh"
 grep -q 'MODELS_ARTIFACT_URL="http://localhost:$PORT/out/toolchain-macos-arm64-$VERSION-models.zip"' "$ROOT/scripts/release/build_dmg.sh"
 grep -q -- '--private-key-file "$PRIV"' "$ROOT/scripts/release/build_dmg.sh"
+grep -q 'scripts/toolchain/build_colmap.sh' "$ROOT/scripts/release/build_dmg.sh"
+grep -q 'scripts/toolchain/build_openssl.sh' "$ROOT/scripts/release/build_dmg.sh"
 grep -q 'scripts/toolchain/build_msplat.sh' "$ROOT/scripts/release/build_dmg.sh"
 grep -q 'scripts/toolchain/build_da3_mps.sh' "$ROOT/scripts/release/build_dmg.sh"
-grep -q 'scripts/toolchain/build_mapanything_mps.sh' "$ROOT/scripts/release/build_dmg.sh"
+grep -q 'scripts/toolchain/build_colmap.sh' "$ROOT/.github/workflows/toolchain-build.yml"
+grep -q 'scripts/toolchain/build_openssl.sh' "$ROOT/.github/workflows/toolchain-build.yml"
 grep -q 'scripts/toolchain/build_msplat.sh' "$ROOT/.github/workflows/toolchain-build.yml"
+grep -q 'scripts/toolchain/build_da3_mps.sh' "$ROOT/.github/workflows/toolchain-build.yml"
+test "$(grep -n -m1 'scripts/toolchain/build_openssl.sh' "$ROOT/scripts/release/build_dmg.sh" | cut -d: -f1)" -lt \
+  "$(grep -n -m1 'scripts/toolchain/build_colmap.sh' "$ROOT/scripts/release/build_dmg.sh" | cut -d: -f1)"
+test "$(grep -n -m1 'run: scripts/toolchain/build_openssl.sh' "$ROOT/.github/workflows/toolchain-build.yml" | cut -d: -f1)" -lt \
+  "$(grep -n -m1 'run: scripts/toolchain/build_colmap.sh' "$ROOT/.github/workflows/toolchain-build.yml" | cut -d: -f1)"
+grep -q 'colmap" global_mapper -h' "$ROOT/scripts/toolchain/package_toolchain.sh"
 grep -q 'DA3_SOURCE_DESCRIPTOR="git:${DA3_REPO}@${DA3_SOURCE_COMMIT}"' "$ROOT/scripts/toolchain/build_da3_mps.sh"
 grep -q 'MSPLAT_COMMIT="106499b0a53f82b0c92d013b0861fbebd341b17e"' "$ROOT/scripts/toolchain/build_msplat.sh"
 grep -q 'MSPLAT_VERSION="1\.1\.3"' "$ROOT/scripts/toolchain/build_msplat.sh"
@@ -97,9 +106,22 @@ grep -q 'source_provenance' "$ROOT/scripts/toolchain/package_toolchain.sh"
 grep -q 'pinned-git' "$ROOT/scripts/toolchain/package_toolchain.sh"
 grep -q 'resolve_rpath_dependency_for' "$ROOT/scripts/toolchain/package_toolchain.sh"
 grep -q 'require_bundled_arm64_python "da3_mps" "$DA3_PY_BIN"' "$ROOT/scripts/toolchain/package_toolchain.sh"
-grep -q 'require_bundled_arm64_python "mapanything_mps" "$MAP_PY_BIN"' "$ROOT/scripts/toolchain/package_toolchain.sh"
-grep -q 'require_bundled_arm64_python "vggt_mps" "$PY_BIN"' "$ROOT/scripts/toolchain/package_toolchain.sh"
-grep -q 'require_bundled_arm64_python "fastvggt_mps" "$FAST_PY_BIN"' "$ROOT/scripts/toolchain/package_toolchain.sh"
+grep -Fq 'zip -r "$MODELS_ZIP" da3_mps/models' "$ROOT/scripts/toolchain/package_toolchain.sh"
+grep -Fq 'test -x "$ROOT/Toolchains/build/colmap/install/bin/colmap" || "$ROOT/scripts/toolchain/build_colmap.sh"' "$ROOT/scripts/run.sh"
+grep -Fq 'ensure_msplat_bundle' "$ROOT/scripts/run.sh"
+grep -Fq 'ensure_da3_mps_bundle' "$ROOT/scripts/run.sh"
+
+legacy_runtime_pattern='brush|mapanything|fastvggt|vggt|glomap'
+for path in \
+  "$ROOT/scripts/toolchain/package_toolchain.sh" \
+  "$ROOT/scripts/run.sh" \
+  "$ROOT/scripts/release/build_dmg.sh" \
+  "$ROOT/.github/workflows/toolchain-build.yml"; do
+  if rg -n -i "$legacy_runtime_pattern" "$path" >/dev/null; then
+    echo "Release path still references a removed runtime: $path" >&2
+    exit 1
+  fi
+done
 
 msplat_validator="$ROOT/scripts/toolchain/validate_native_msplat.sh"
 [ -x "$msplat_validator" ] || {

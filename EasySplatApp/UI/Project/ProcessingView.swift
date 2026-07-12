@@ -25,7 +25,6 @@ struct ProcessingView: View {
 
             GeometryReader { geometry in
                 let availableHeight = geometry.size.height
-                let previewHeight = min(420, max(260, availableHeight * 0.38))
                 let detailsHeight = min(320, max(180, availableHeight * 0.26))
 
                 HStack(alignment: .top, spacing: 24) {
@@ -34,7 +33,7 @@ struct ProcessingView: View {
                             Text(model.statusTitle)
                                 .font(.headline)
                             if let detail = model.statusDetail, !detail.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                                Text(summaryDetail(detail))
+                                Text(detail)
                                     .font(.subheadline)
                                     .foregroundStyle(.secondary)
                             }
@@ -51,23 +50,6 @@ struct ProcessingView: View {
                                     .foregroundStyle(.secondary)
                             }
                             ShimmeringProgressView(progress: model.progress)
-                            if model.isBrushSnapshotTrainingActive {
-                                VStack(alignment: .leading, spacing: 8) {
-                                    Toggle("Show live preview", isOn: $model.isLivePreviewEnabled)
-                                        .toggleStyle(.checkbox)
-                                        .disabled(model.isStopping)
-                                    Text("May slow training. Updates every few minutes.")
-                                        .font(.caption)
-                                        .foregroundStyle(.secondary)
-                                    if model.isLivePreviewEnabled, let snapshotURL = model.trainingSnapshotURL {
-                                        TrainingLivePreviewView(
-                                            snapshotURL: snapshotURL,
-                                            preferredHeight: previewHeight,
-                                            trainingProgressFraction: model.progress
-                                        )
-                                    }
-                                }
-                            }
                             if model.isStopping {
                                 HStack(spacing: 10) {
                                     ProgressView()
@@ -135,10 +117,6 @@ struct ProcessingView: View {
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
         .padding(32)
-        .sheet(isPresented: $model.isShowingTrainingConsent) {
-            TrainingConsentSheet()
-                .environmentObject(model)
-        }
         .overlay {
             if model.isStopping {
                 ZStack {
@@ -167,7 +145,7 @@ struct ProcessingView: View {
             }
         }
         .confirmationDialog("Stop this project?", isPresented: $showReturnConfirm, titleVisibility: .visible) {
-            Button(returnPrimaryActionLabel) {
+            Button("Save Project") {
                 model.cancelCurrentProject(deleteProject: false)
             }
             .keyboardShortcut(.defaultAction)
@@ -228,27 +206,11 @@ struct ProcessingView: View {
         return String(format: "%dm %02ds", minutes, seconds)
     }
 
-    private func summaryDetail(_ detail: String) -> String {
-        guard model.isBrushSnapshotTrainingActive else { return detail }
-        guard let range = detail.range(of: " (running ") else { return detail }
-        return String(detail[..<range.lowerBound])
-    }
-
-    private var returnPrimaryActionLabel: String {
-        model.isBrushSnapshotTrainingActive ? "Export Snapshot" : "Save Project"
-    }
-
     private var stoppingStatusText: String {
         if model.stopAction == .deleteProject {
             return "Stopping and deleting… (up to 15 seconds)"
         }
-        if model.isBrushSnapshotTrainingActive {
-            return "Exporting snapshot… (up to 15 seconds)"
-        }
-        if model.isMsplatTrainingActive {
-            return "Saving training checkpoint… (up to 15 seconds)"
-        }
-        if model.isTrainingStageActive { return "Saving project… (up to 15 seconds)" }
+        if model.isTrainingStageActive { return "Saving training checkpoint… (up to 15 seconds)" }
         return "Saving progress… (up to 15 seconds)"
     }
 
@@ -256,13 +218,7 @@ struct ProcessingView: View {
         if model.stopAction == .deleteProject {
             return "Stopping and deleting…"
         }
-        if model.isBrushSnapshotTrainingActive {
-            return "Exporting snapshot…"
-        }
-        if model.isMsplatTrainingActive {
-            return "Saving training checkpoint…"
-        }
-        if model.isTrainingStageActive { return "Saving project…" }
+        if model.isTrainingStageActive { return "Saving training checkpoint…" }
         return "Saving progress…"
     }
 
@@ -270,86 +226,20 @@ struct ProcessingView: View {
         if model.stopAction == .deleteProject {
             return "Stopping at the next safe point (up to 15 seconds)."
         }
-        if model.isBrushSnapshotTrainingActive {
-            return "Exporting the latest snapshot (training restarts from scratch on resume)."
-        }
-        if model.isMsplatTrainingActive {
-            return "Saving and validating the latest training checkpoint. Recent iterations may repeat on resume."
-        }
         if model.isTrainingStageActive {
-            return "Stopping training at the next safe point. Resume behavior depends on the saved training state."
+            return "Saving and validating the latest training checkpoint. Recent iterations may repeat on resume."
         }
         return "Stopping at the next safe point (up to 15 seconds)."
     }
 
     private var returnDialogMessage: String {
-        if model.isBrushSnapshotTrainingActive {
-            return "Exporting keeps only a snapshot. If you resume, training starts over from scratch. Delete removes all project data."
-        }
-        if model.isMsplatTrainingActive {
-            return "EasySplat will save and validate a training checkpoint. Recent iterations may repeat when you resume. Delete removes all project data."
-        }
         if model.isTrainingStageActive {
-            return "EasySplat will stop training safely and save the project. Resume behavior depends on the saved training state. Delete removes all project data."
+            return "EasySplat will save and validate a training checkpoint. Recent iterations may repeat when you resume. Delete removes all project data."
         }
         return "You can save and resume later, or delete the project."
     }
 
     private var trainingStatusMessage: String {
-        if model.isBrushSnapshotTrainingActive {
-            return "Training in progress. Closing now exports a snapshot only; resuming restarts from scratch."
-        }
-        if model.isMsplatTrainingActive {
-            return "Training in progress. Stopping keeps the latest validated checkpoint when available."
-        }
-        return "Training in progress. Resume behavior depends on the saved training state."
-    }
-}
-
-private struct TrainingConsentSheet: View {
-    @EnvironmentObject private var model: AppModel
-    @State private var rememberChoice = false
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 16) {
-            Text("Training will start")
-                .font(.headline)
-            Text(trainingConsentMessage)
-                .font(.subheadline)
-                .foregroundStyle(.secondary)
-            Toggle("Remember my choice", isOn: $rememberChoice)
-                .toggleStyle(.checkbox)
-            HStack {
-                Spacer()
-                Button("Cancel") {
-                    model.resolveTrainingConsent(accepted: false, remember: false)
-                }
-                .buttonStyle(SecondaryButtonStyle())
-                .keyboardShortcut(.cancelAction)
-
-                Button("Continue Training") {
-                    let remember = rememberChoice
-                    model.resolveTrainingConsent(accepted: true, remember: remember)
-                }
-                .buttonStyle(PrimaryButtonStyle())
-                .keyboardShortcut(.defaultAction)
-            }
-        }
-        .padding(24)
-        .frame(width: 420)
-        .interactiveDismissDisabled(true)
-        .onAppear {
-            rememberChoice = false
-        }
-    }
-
-    private var trainingConsentMessage: String {
-        if model.isBrushSnapshotTrainingActive {
-            return "If you quit during training, resuming starts training over."
-        }
-        if model.isMsplatTrainingActive {
-            return "Stopping saves and validates the latest training checkpoint when possible."
-        }
-        return "Resume behavior depends on the saved training state."
+        "Training in progress. Stopping keeps the latest validated checkpoint when available."
     }
 }

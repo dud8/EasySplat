@@ -61,7 +61,7 @@ final class ProjectDiagnosticBundleTests: XCTestCase {
         XCTAssertTrue(bundle.contains("Last error: boom"))
     }
 
-    func testIncludesAutoTuneSectionWhenPresent() throws {
+    func testNewSavesOmitLegacyAutoTuneDiagnostics() throws {
         let root = try TestFileBuilder.makeTempDir()
         defer { try? FileManager.default.removeItem(at: root) }
         let paths = ProjectPaths(root: root)
@@ -97,9 +97,8 @@ final class ProjectDiagnosticBundleTests: XCTestCase {
         try ProjectMetadataStore.save(metadata, to: paths.metadataURL)
 
         let bundle = try XCTUnwrap(ProjectDiagnosticBundle.build(projectURL: root))
-        XCTAssertTrue(bundle.contains("## Auto-tune"))
-        XCTAssertTrue(bundle.contains("Tier: High"))
-        XCTAssertTrue(bundle.contains("maxPoints=150000"))
+        XCTAssertFalse(bundle.contains("## Auto-tune"))
+        XCTAssertFalse(bundle.contains("Tier: High"))
     }
 
     func testEmbedsLogTailsWhenPresent() throws {
@@ -133,10 +132,10 @@ final class ProjectDiagnosticBundleTests: XCTestCase {
             ),
             to: paths.metadataURL
         )
-        try "global mapper failed here".write(to: paths.glomapLogURL, atomically: true, encoding: .utf8)
+        try "global mapper failed here".write(to: paths.globalMapperLogURL, atomically: true, encoding: .utf8)
 
         let bundle = try XCTUnwrap(ProjectDiagnosticBundle.build(projectURL: root))
-        XCTAssertTrue(bundle.contains("## glomap.log (tail)"))
+        XCTAssertTrue(bundle.contains("## global_mapper.log (tail)"))
         XCTAssertTrue(bundle.contains("global mapper failed here"))
     }
 
@@ -410,6 +409,30 @@ final class ProjectDiagnosticBundleTests: XCTestCase {
         let bundle = try XCTUnwrap(ProjectDiagnosticBundle.build(projectURL: root, includeNotes: true))
         XCTAssertTrue(bundle.contains("## Notes"))
         XCTAssertTrue(bundle.contains("sunset capture"))
+    }
+
+    func testExcludesLegacyAppEventsLog() throws {
+        let root = try TestFileBuilder.makeTempDir()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let paths = ProjectPaths(root: root)
+        try paths.ensureDirectories()
+        try ProjectMetadataStore.save(
+            ProjectMetadata(
+                title: "LegacyAppEvents",
+                input: .photos(folder: "/tmp/photos"),
+                preset: PresetSpec(mode: .object, quality: .standard)
+            ),
+            to: paths.metadataURL
+        )
+        try "private-share-service-marker".write(
+            to: paths.logsURL.appendingPathComponent("app_events.jsonl"),
+            atomically: true,
+            encoding: .utf8
+        )
+
+        let bundle = try XCTUnwrap(ProjectDiagnosticBundle.build(projectURL: root))
+        XCTAssertFalse(bundle.contains("private-share-service-marker"))
+        XCTAssertFalse(bundle.contains("app_events.jsonl"))
     }
 
     func testHomePathSanitizerReplacesHome() {

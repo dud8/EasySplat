@@ -255,31 +255,6 @@ final class PipelineRunnerRetryTests: XCTestCase {
         XCTAssertEqual(try runner.test_validateStageOutput(.sfmMapping, paths: paths, metadata: metadata), .corrupt)
     }
 
-    func testValidateStageOutputRejectsDa3TrackEvenWithStaleMapAnythingManifest() throws {
-        let root = try TestFileBuilder.makeTempDir()
-        defer { try? FileManager.default.removeItem(at: root) }
-        let paths = ProjectPaths(root: root)
-        try paths.ensureDirectories()
-        try writeDa3SparseFixture(
-            paths: paths,
-            imageCount: 1,
-            pointRows: ["1 0 0 1 128 128 128 1.0 99 0"],
-            pointCount: 1,
-            observationCount: 1,
-            meanTrackLength: 1.0
-        )
-        try "{}\n".write(to: paths.mapanythingCoverageManifestURL, atomically: true, encoding: .utf8)
-        let staleDate = Date().addingTimeInterval(-60)
-        try FileManager.default.setAttributes(
-            [.modificationDate: staleDate],
-            ofItemAtPath: paths.mapanythingCoverageManifestURL.path
-        )
-
-        let metadata = ProjectMetadata(title: "Test", input: .photos(folder: "/tmp/Photos"), preset: PresetSpec(mode: .object, quality: .draft))
-        let runner = makeRunner(projectURL: root)
-        XCTAssertEqual(try runner.test_validateStageOutput(.sfmMapping, paths: paths, metadata: metadata), .corrupt)
-    }
-
     func testValidateStageOutputRejectsDa3ResumeFromFeaturesWithInvalidManifest() throws {
         let root = try TestFileBuilder.makeTempDir()
         defer { try? FileManager.default.removeItem(at: root) }
@@ -330,117 +305,72 @@ final class PipelineRunnerRetryTests: XCTestCase {
         XCTAssertEqual(try runner.test_validateStageOutput(.sfmMapping, paths: paths, metadata: metadata), .corrupt)
     }
 
-    func testValidateStageOutputAcceptsTracklessVggtSparseModel() throws {
+    func testCompletedLegacyVggtGeometryCanStartNativeTraining() throws {
         let root = try TestFileBuilder.makeTempDir()
         defer { try? FileManager.default.removeItem(at: root) }
         let paths = ProjectPaths(root: root)
         try paths.ensureDirectories()
         let sparse = paths.colmapSparseURL.appendingPathComponent("0", isDirectory: true)
-        try writeTracklessVggtSparseFixture(at: sparse, imageNames: ["frame_000000.jpg", "frame_000001.jpg"], pointCount: 256)
+        try writeLegacyTracklessSparseFixture(at: sparse)
 
         let metadata = ProjectMetadata(
-            title: "Test",
+            title: "Legacy training",
             input: .photos(folder: "/tmp/Photos"),
             preset: PresetSpec(mode: .object, quality: .draft),
-            checkpoint: PipelineCheckpoint(
-                stage: .sfmMapping,
-                details: .sfmMapping(SfmMappingCheckpoint(
-                    mapper: "vggt",
-                    sparsePath: sparse.path,
-                    registeredImages: 2
-                ))
-            )
-        )
-        let runner = makeRunner(projectURL: root)
-        XCTAssertEqual(try runner.test_validateStageOutput(.sfmMapping, paths: paths, metadata: metadata), .valid)
-    }
-
-    func testValidateStageOutputAcceptsCompletedTracklessVggtSparseModel() throws {
-        let root = try TestFileBuilder.makeTempDir()
-        defer { try? FileManager.default.removeItem(at: root) }
-        let paths = ProjectPaths(root: root)
-        try paths.ensureDirectories()
-        let sparse = paths.colmapSparseURL.appendingPathComponent("0", isDirectory: true)
-        try writeTracklessVggtSparseFixture(at: sparse, imageNames: ["frame_000000.jpg", "frame_000001.jpg"], pointCount: 256)
-
-        let metadata = ProjectMetadata(
-            title: "Test",
-            input: .photos(folder: "/tmp/Photos"),
-            preset: PresetSpec(mode: .object, quality: .draft),
-            state: PipelineState(stage: .sfmMapping, attempt: 0, lastError: nil, resumeToken: nil),
+            state: PipelineState(stage: .trainSplat, attempt: 0, lastError: nil, resumeToken: nil),
+            checkpoint: PipelineCheckpoint(stage: .trainSplat),
             completedSfmMapping: SfmMappingCheckpoint(
                 mapper: "vggt",
-                sparsePath: sparse.path,
+                sparsePath: "SfM/colmap/sparse/0",
                 registeredImages: 2
             )
         )
+
         let runner = makeRunner(projectURL: root)
         XCTAssertEqual(try runner.test_validateStageOutput(.sfmMapping, paths: paths, metadata: metadata), .valid)
     }
 
-    func testValidateStageOutputRejectsTracklessSparseModelWithoutVggtCheckpoint() throws {
+    func testInterruptedLegacyVggtGeometryRestartsGeometry() throws {
         let root = try TestFileBuilder.makeTempDir()
         defer { try? FileManager.default.removeItem(at: root) }
         let paths = ProjectPaths(root: root)
         try paths.ensureDirectories()
         let sparse = paths.colmapSparseURL.appendingPathComponent("0", isDirectory: true)
-        try writeTracklessVggtSparseFixture(at: sparse, imageNames: ["frame_000000.jpg"], pointCount: 1)
+        try writeLegacyTracklessSparseFixture(at: sparse)
 
-        let metadata = ProjectMetadata(
-            title: "Test",
-            input: .photos(folder: "/tmp/Photos"),
-            preset: PresetSpec(mode: .object, quality: .draft)
+        let mapping = SfmMappingCheckpoint(
+            mapper: "vggt",
+            sparsePath: "SfM/colmap/sparse/0",
+            registeredImages: 2
         )
-        let runner = makeRunner(projectURL: root)
-        XCTAssertEqual(try runner.test_validateStageOutput(.sfmMapping, paths: paths, metadata: metadata), .corrupt)
-    }
-
-    func testValidateStageOutputRejectsTracklessSparseModelWhenActiveMapperIsNotVggt() throws {
-        let root = try TestFileBuilder.makeTempDir()
-        defer { try? FileManager.default.removeItem(at: root) }
-        let paths = ProjectPaths(root: root)
-        try paths.ensureDirectories()
-        let sparse = paths.colmapSparseURL.appendingPathComponent("0", isDirectory: true)
-        try writeTracklessVggtSparseFixture(at: sparse, imageNames: ["frame_000000.jpg"], pointCount: 1)
-
         let metadata = ProjectMetadata(
-            title: "Test",
+            title: "Legacy geometry",
             input: .photos(folder: "/tmp/Photos"),
             preset: PresetSpec(mode: .object, quality: .draft),
-            checkpoint: PipelineCheckpoint(
-                stage: .sfmMapping,
-                details: .sfmMapping(SfmMappingCheckpoint(
-                    mapper: "colmap",
-                    sparsePath: sparse.path,
-                    registeredImages: 1
-                ))
-            ),
-            completedSfmMapping: SfmMappingCheckpoint(
-                mapper: "vggt",
-                sparsePath: sparse.path,
-                registeredImages: 1
-            )
+            state: PipelineState(stage: .sfmMapping, attempt: 0, lastError: nil, resumeToken: nil),
+            checkpoint: PipelineCheckpoint(stage: .sfmMapping, details: .sfmMapping(mapping)),
+            completedSfmMapping: mapping
         )
+
         let runner = makeRunner(projectURL: root)
         XCTAssertEqual(try runner.test_validateStageOutput(.sfmMapping, paths: paths, metadata: metadata), .corrupt)
     }
 
-    private func writeTracklessVggtSparseFixture(at sparse: URL, imageNames: [String], pointCount: Int) throws {
+    private func writeLegacyTracklessSparseFixture(at sparse: URL) throws {
         try FileManager.default.createDirectory(at: sparse, withIntermediateDirectories: true)
         try "1 SIMPLE_PINHOLE 640 480 500 320 240\n"
             .write(to: sparse.appendingPathComponent("cameras.txt"), atomically: true, encoding: .utf8)
-        let imagesText = imageNames.enumerated()
-            .map { offset, name in "\(offset + 1) 1 0 0 0 0 0 0 1 \(name)\n" }
-            .joined(separator: "\n")
-        try imagesText.write(to: sparse.appendingPathComponent("images.txt"), atomically: true, encoding: .utf8)
-        let pointsText = (1...max(1, pointCount))
-            .map { "\($0) 0 0 1 128 128 128 1.0" }
-            .joined(separator: "\n")
-        try (pointsText + "\n")
+        try """
+        1 1 0 0 0 0 0 0 1 frame_000000.jpg
+
+        2 1 0 0 0 0 0 0 1 frame_000001.jpg
+
+        """.write(to: sparse.appendingPathComponent("images.txt"), atomically: true, encoding: .utf8)
+        try "1 0 0 1 128 128 128 1.0\n"
             .write(to: sparse.appendingPathComponent("points3D.txt"), atomically: true, encoding: .utf8)
     }
 
-    func testIsStageCompleteTrainBrush() throws {
+    func testLegacyBrushExportDoesNotCompleteNativeTraining() throws {
         let root = try TestFileBuilder.makeTempDir()
         defer { try? FileManager.default.removeItem(at: root) }
         let paths = ProjectPaths(root: root)
@@ -451,57 +381,7 @@ final class PipelineRunnerRetryTests: XCTestCase {
 
         let metadata = ProjectMetadata(title: "Test", input: .photos(folder: "/tmp/Photos"), preset: PresetSpec(mode: .object, quality: .draft))
         let runner = makeRunner(projectURL: root)
-        XCTAssertTrue(runner.test_isStageComplete(.trainBrush, paths: paths, metadata: metadata))
-    }
-
-    func testValidateStageOutputIgnoresTrainBrushExportOlderThanCurrentRun() throws {
-        let root = try TestFileBuilder.makeTempDir()
-        defer { try? FileManager.default.removeItem(at: root) }
-        let paths = ProjectPaths(root: root)
-        try paths.ensureDirectories()
-        let training = paths.trainingURL
-        try FileManager.default.createDirectory(at: training, withIntermediateDirectories: true)
-        let staleExport = training.appendingPathComponent("export_00001.ply")
-        try TestFileBuilder.writeMinimalPly(at: staleExport)
-        let runStartedAt = Date()
-        try FileManager.default.setAttributes(
-            [.modificationDate: runStartedAt.addingTimeInterval(-60)],
-            ofItemAtPath: staleExport.path
-        )
-
-        let metadata = ProjectMetadata(
-            title: "Test",
-            input: .photos(folder: "/tmp/Photos"),
-            preset: PresetSpec(mode: .object, quality: .draft),
-            lastRunStartedAt: runStartedAt
-        )
-        let runner = makeRunner(projectURL: root)
-        XCTAssertEqual(try runner.test_validateStageOutput(.trainBrush, paths: paths, metadata: metadata), .missing)
-    }
-
-    func testValidateStageOutputIgnoresTrainBrushExportOlderThanCheckpoint() throws {
-        let root = try TestFileBuilder.makeTempDir()
-        defer { try? FileManager.default.removeItem(at: root) }
-        let paths = ProjectPaths(root: root)
-        try paths.ensureDirectories()
-        let training = paths.trainingURL
-        try FileManager.default.createDirectory(at: training, withIntermediateDirectories: true)
-        let staleExport = training.appendingPathComponent("export_00001.ply")
-        try TestFileBuilder.writeMinimalPly(at: staleExport)
-        let checkpointDate = Date()
-        try FileManager.default.setAttributes(
-            [.modificationDate: checkpointDate.addingTimeInterval(-60)],
-            ofItemAtPath: staleExport.path
-        )
-
-        let metadata = ProjectMetadata(
-            title: "Test",
-            input: .photos(folder: "/tmp/Photos"),
-            preset: PresetSpec(mode: .object, quality: .draft),
-            checkpoint: PipelineCheckpoint(stage: .trainBrush, updatedAt: checkpointDate)
-        )
-        let runner = makeRunner(projectURL: root)
-        XCTAssertEqual(try runner.test_validateStageOutput(.trainBrush, paths: paths, metadata: metadata), .missing)
+        XCTAssertFalse(runner.test_isStageComplete(.trainSplat, paths: paths, metadata: metadata))
     }
 
     func testValidateStageOutputRejectsUnboundMsplatTrainingExport() throws {
@@ -526,7 +406,7 @@ final class PipelineRunnerRetryTests: XCTestCase {
             lastRunStartedAt: runStartedAt
         )
         let runner = makeRunner(projectURL: root)
-        XCTAssertEqual(try runner.test_validateStageOutput(.trainBrush, paths: paths, metadata: metadata), .missing)
+        XCTAssertEqual(try runner.test_validateStageOutput(.trainSplat, paths: paths, metadata: metadata), .missing)
     }
 
     func testCompletedTrainingArtifactMustMatchRequestedDetailProfile() throws {
@@ -548,7 +428,7 @@ final class PipelineRunnerRetryTests: XCTestCase {
 
         XCTAssertEqual(
             try makeRunner(projectURL: root).test_validateStageOutput(
-                .trainBrush,
+                .trainSplat,
                 paths: paths,
                 metadata: metadata
             ),
@@ -579,7 +459,7 @@ final class PipelineRunnerRetryTests: XCTestCase {
 
         XCTAssertEqual(
             try makeRunner(projectURL: root).test_validateStageOutput(
-                .trainBrush,
+                .trainSplat,
                 paths: paths,
                 metadata: metadata
             ),
@@ -607,7 +487,7 @@ final class PipelineRunnerRetryTests: XCTestCase {
 
         XCTAssertEqual(
             try makeRunner(projectURL: root).test_validateStageOutput(
-                .trainBrush,
+                .trainSplat,
                 paths: paths,
                 metadata: metadata
             ),
@@ -645,7 +525,7 @@ final class PipelineRunnerRetryTests: XCTestCase {
 
         XCTAssertEqual(
             try makeRunner(projectURL: root).test_validateStageOutput(
-                .trainBrush,
+                .trainSplat,
                 paths: paths,
                 metadata: metadata
             ),
@@ -664,54 +544,6 @@ final class PipelineRunnerRetryTests: XCTestCase {
         let runner = makeRunner(projectURL: root)
         let status = try runner.test_validateStageOutput(.sfmFeatures, paths: paths, metadata: metadata)
         XCTAssertEqual(status, .corrupt)
-    }
-
-    func testReconstructionScoreRehydratedFromPersistedSummaryCarriesPointCount() {
-        let summary = ReconstructionSummary(
-            mapper: "da3-direct",
-            capturedAt: Date(timeIntervalSince1970: 0),
-            registeredImages: 12,
-            totalImages: 12,
-            meanReprojectionError: 0.9,
-            pointCount: 250,
-            observationCount: 800,
-            meanTrackLength: 3.2
-        )
-        let score = PipelineRunner.test_reconstructionScore(fromPersistedSummary: summary)
-        XCTAssertEqual(score.registeredImages, 12)
-        XCTAssertEqual(score.totalImages, 12)
-        XCTAssertEqual(score.meanReprojectionError, 0.9)
-        XCTAssertEqual(score.pointCount, 250)
-        XCTAssertEqual(score.observationCount, 800)
-        XCTAssertEqual(score.meanTrackLength, 3.2)
-    }
-
-    @MainActor
-    func testRehydratedLowPointSummaryTriggersBrushFallbackUnderFastProfile() async throws {
-        // The msplat-auto guard must say "use Brush" when the rehydrated score
-        // has fewer points than the automatic msplat threshold. This is the
-        // resume-from-SfM path Codex flagged: if we forget to rehydrate, the
-        // guard sees nil and lets fast-profile msplat run on a thin solve.
-        let restore = await scopedEnvironment([
-            "EASYSPLAT_SPEED_PROFILE": "fast",
-            "EASYSPLAT_TRAINER": nil
-        ])
-        defer { restore() }
-
-        let summary = ReconstructionSummary(
-            mapper: "da3-direct",
-            capturedAt: Date(timeIntervalSince1970: 0),
-            registeredImages: 5,
-            totalImages: 30,
-            meanReprojectionError: 1.2,
-            pointCount: 10,
-            observationCount: 30,
-            meanTrackLength: 3.0
-        )
-        let rehydrated = PipelineRunner.test_reconstructionScore(fromPersistedSummary: summary)
-        let runner = makeRunner(projectURL: URL(fileURLWithPath: NSTemporaryDirectory()))
-        XCTAssertTrue(runner.test_shouldUseBrushInsteadOfAutomaticMsplat(for: rehydrated),
-                      "Rehydrated low-point score must still force Brush on resume under fast profile.")
     }
 
     func testValidateStageOutputRejectsEmptyDatabaseSparseTextWithoutDa3Manifest() throws {
@@ -812,7 +644,7 @@ final class PipelineRunnerRetryTests: XCTestCase {
         try TestFileBuilder.writeMinimalPly(at: output)
 
         try makeRunner(projectURL: root).test_cleanForRetry(
-            failedStage: .trainBrush,
+            failedStage: .trainSplat,
             paths: paths
         )
 
@@ -840,16 +672,7 @@ final class PipelineRunnerRetryTests: XCTestCase {
     }
 
     private func makeRunner(projectURL: URL) -> PipelineRunner {
-        let vggt = VggtToolchain(root: projectURL, sfmTool: projectURL, python: projectURL, models: projectURL)
-        let fastvggt = FastVggtToolchain(root: projectURL, sfmTool: projectURL, python: projectURL, models: projectURL)
-        let toolchain = ToolchainPaths(
-            root: projectURL,
-            colmap: projectURL,
-            glomap: projectURL,
-            brush: projectURL,
-            vggt: vggt,
-            fastvggt: fastvggt
-        )
+        let toolchain = TestToolchains.toolchainPaths(root: projectURL)
         let config = PipelineRunner.PipelineConfig(toolchain: toolchain, preset: PresetSpec(mode: .object, quality: .standard))
         return PipelineRunner(projectURL: projectURL, config: config)
     }

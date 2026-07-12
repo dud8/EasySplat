@@ -69,7 +69,7 @@ extension PipelineStage {
         case .sfmFeatures: return .blue
         case .sfmMatching: return .indigo
         case .sfmMapping: return .purple
-        case .trainBrush: return .orange
+        case .trainSplat: return .orange
         case .exportSplat: return Theme.success
         case .done: return Theme.success
         }

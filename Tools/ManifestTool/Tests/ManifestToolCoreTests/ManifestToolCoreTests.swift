@@ -38,12 +38,28 @@ final class ManifestToolCoreTests: XCTestCase {
         XCTAssertTrue(ManifestBuilder.verifySignature(for: manifest, publicKeyBase64: keypair.publicKeyBase64))
         XCTAssertEqual(manifest.artifacts[0].contents, ManifestToolDefaults.splitCoreContents)
         XCTAssertEqual(manifest.artifacts[1].contents, ManifestToolDefaults.splitModelsContents)
-        XCTAssertTrue(ManifestToolDefaults.splitCoreContents.contains("bin/easysplat-train"))
-        XCTAssertTrue(ManifestToolDefaults.splitCoreContents.contains("bin/default.metallib"))
-        XCTAssertTrue(ManifestToolDefaults.splitCoreContents.contains("msplat/build_info.json"))
-        XCTAssertTrue(ManifestToolDefaults.splitCoreContents.contains("msplat/LICENSE"))
-        XCTAssertFalse(ManifestToolDefaults.splitCoreContents.contains("bin/msplat-train"))
-        XCTAssertFalse(ManifestToolDefaults.splitCoreContents.contains("msplat/python/bin/python3"))
+        XCTAssertEqual(ManifestToolDefaults.splitCoreContents, [
+            "bin/colmap",
+            "bin/easysplat-train",
+            "bin/default.metallib",
+            "lib/libcrypto.3.dylib",
+            "lib/libssl.3.dylib",
+            "msplat/build_info.json",
+            "msplat/LICENSE",
+            "da3_mps/bin/easysplat_da3_sfm",
+            "da3_mps/python/bin/python3",
+            "da3_mps/build_info.json",
+            "da3_mps/app/easysplat_da3_sfm/run.py",
+            "da3_mps/vendor/depth-anything-3/src/depth_anything_3/api.py",
+        ])
+        XCTAssertEqual(ManifestToolDefaults.splitModelsContents, [
+            "da3_mps/models/DA3-BASE/config.json",
+            "da3_mps/models/DA3-BASE/model.safetensors",
+            "da3_mps/models/DA3-BASE/easysplat_model_info.json",
+            "da3_mps/models/DA3-SMALL/config.json",
+            "da3_mps/models/DA3-SMALL/model.safetensors",
+            "da3_mps/models/DA3-SMALL/easysplat_model_info.json",
+        ])
     }
 
     func testBuildMonolithicManifestUsesMonolithicContents() throws {

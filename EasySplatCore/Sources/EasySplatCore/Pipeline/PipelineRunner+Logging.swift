@@ -189,88 +189,6 @@ extension PipelineRunner {
         return false
     }
 
-    static func looksLikeBrushSpinnerLine(_ line: String) -> Bool {
-        let lower = line.lowercased()
-        guard lower.contains("training") else { return false }
-        if line.contains("🖌") || line.contains("·") || line.contains("•") {
-            return true
-        }
-        if line.contains("░") || line.contains("▓") || line.contains("█") || line.contains("▉") || line.contains("▊") {
-            return true
-        }
-        return false
-    }
-
-    private static let brushStepRateRegex = try? NSRegularExpression(
-        pattern: #"([0-9]+(?:\.[0-9]+)?)\s*(?:it)?/s"#,
-        options: [.caseInsensitive]
-    )
-
-    func brushTrainStepProgress(from line: String) -> BrushTrainProgress? {
-        let s = line
-        var index = s.startIndex
-
-        func isDigit(_ c: Character) -> Bool {
-            c >= "0" && c <= "9"
-        }
-
-        while index < s.endIndex {
-            while index < s.endIndex, !isDigit(s[index]) {
-                index = s.index(after: index)
-            }
-            if index >= s.endIndex { break }
-
-            let aStart = index
-            var aEnd = index
-            while aEnd < s.endIndex, isDigit(s[aEnd]) {
-                aEnd = s.index(after: aEnd)
-            }
-            let aStr = String(s[aStart..<aEnd])
-            let a = Int(aStr) ?? -1
-
-            var slash = aEnd
-            while slash < s.endIndex, s[slash] == " " {
-                slash = s.index(after: slash)
-            }
-            guard slash < s.endIndex, s[slash] == "/" else {
-                index = aEnd
-                continue
-            }
-
-            var bStart = s.index(after: slash)
-            while bStart < s.endIndex, s[bStart] == " " {
-                bStart = s.index(after: bStart)
-            }
-            var bEnd = bStart
-            while bEnd < s.endIndex, isDigit(s[bEnd]) {
-                bEnd = s.index(after: bEnd)
-            }
-            guard bEnd > bStart else {
-                index = aEnd
-                continue
-            }
-
-            let bStr = String(s[bStart..<bEnd])
-            let b = Int(bStr) ?? -1
-            guard a >= 0, b > 0 else {
-                index = aEnd
-                continue
-            }
-            return BrushTrainProgress(step: a, total: b)
-        }
-
-        return nil
-    }
-
-    func brushTrainStepRate(from line: String) -> Double? {
-        guard let regex = Self.brushStepRateRegex else { return nil }
-        let range = NSRange(line.startIndex..<line.endIndex, in: line)
-        guard let match = regex.firstMatch(in: line, range: range) else { return nil }
-        guard match.numberOfRanges > 1, let rateRange = Range(match.range(at: 1), in: line) else { return nil }
-        let value = Double(line[rateRange])
-        guard let value, value > 0 else { return nil }
-        return value
-    }
 }
 
 final class StageTimingTracker: @unchecked Sendable {
@@ -377,8 +295,6 @@ final class PipelineLogger: @unchecked Sendable {
             appendProgressLine(stage: stage, fraction: fraction, message: message)
         case let .stageLog(stage, line, isError):
             appendLogLine(stage: stage, line: line, isError: isError)
-        case let .trainingBackendSelected(backend):
-            appendLogLine(stage: .trainBrush, line: "Training backend: \(backend.rawValue)", isError: false)
         case let .stageFinished(stage):
             appendLogLine(stage: stage, line: "Stage finished", isError: false)
         case let .pipelineFailed(stage, userMessage, _):

@@ -93,28 +93,15 @@ struct ViewerView: View {
                         NSWorkspace.shared.activateFileViewerSelecting([plyURL])
                     }
                     .buttonStyle(SecondaryButtonStyle())
-
-                    if let brush = model.toolchainPaths?.brush {
-                        Button("Open in Brush") {
-                            openInBrush(brushPath: brush, splatURL: plyURL)
-                        }
-                        .buttonStyle(SecondaryButtonStyle())
-                    }
                 }
 
                 if let shareStatus = model.shareStatusMessage {
-                    Label(shareStatus, systemImage: shareStatusSymbol(for: shareStatus))
+                    Text(shareStatus)
                         .font(.caption)
-                        .foregroundStyle(shareStatusColor(for: shareStatus))
+                        .foregroundStyle(model.shareStatusIsError ? Color.red : Color.secondary)
                         .frame(maxWidth: .infinity, alignment: .leading)
                         .accessibilityLabel("Share status")
                         .accessibilityValue(shareStatus)
-                }
-                if let shareSummary = model.shareSummaryText {
-                    Text(shareSummary)
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                        .frame(maxWidth: .infinity, alignment: .leading)
                 }
             } else {
                 Text("No output found yet.")
@@ -158,35 +145,4 @@ struct ViewerView: View {
         return prediction?.seconds
     }
 
-    private func openInBrush(brushPath: URL, splatURL: URL) {
-        let process = Process()
-        process.executableURL = brushPath
-        process.arguments = ["--with-viewer", splatURL.path]
-        try? process.run()
-    }
-
-    private func shareStatusSymbol(for status: String) -> String {
-        if model.shareStatusIsError {
-            return "exclamationmark.triangle.fill"
-        }
-        let lower = status.lowercased()
-        if lower.contains("sharing") || lower.contains("opened") {
-            return "square.and.arrow.up.fill"
-        }
-        if lower.contains("canceled") {
-            return "minus.circle.fill"
-        }
-        return "checkmark.circle.fill"
-    }
-
-    private func shareStatusColor(for status: String) -> Color {
-        if model.shareStatusIsError {
-            return .red
-        }
-        let lower = status.lowercased()
-        if lower.hasPrefix("shared via") {
-            return Theme.success
-        }
-        return Theme.subtle
-    }
 }

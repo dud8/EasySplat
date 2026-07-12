@@ -7,13 +7,56 @@ final class ToolchainManagerTests: XCTestCase {
     func testValidateToolchainSucceeds() throws {
         let root = try TestFileBuilder.makeTempDir()
         defer { try? FileManager.default.removeItem(at: root) }
-        _ = try ToolchainFixtureBuilder.createToolchain(at: root, brushHasShebang: true, includeBrushReal: true)
+        _ = try ToolchainFixtureBuilder.createToolchain(at: root)
 
-        let runner = makeValidationRunner(root: root, brushArchPath: "bin/brush.real")
+        let runner = makeValidationRunner(root: root)
 
         let manager = ToolchainManager(runner: runner)
         let toolchain = try manager.test_validateToolchain(root: root)
         XCTAssertEqual(toolchain.root, root)
+        XCTAssertEqual(toolchain.colmap, root.appendingPathComponent("bin/colmap"))
+        XCTAssertEqual(toolchain.msplat, root.appendingPathComponent("bin/easysplat-train"))
+        XCTAssertEqual(toolchain.da3.root, root.appendingPathComponent("da3_mps", isDirectory: true))
+    }
+
+    func testValidateToolchainRejectsBrokenIntegratedGlobalMapperLinkage() throws {
+        let root = try TestFileBuilder.makeTempDir()
+        defer { try? FileManager.default.removeItem(at: root) }
+        _ = try ToolchainFixtureBuilder.createToolchain(at: root)
+
+        let runner = makeValidationRunner(
+            root: root,
+            globalMapperExitCode: 1,
+            globalMapperStderr: "Library not loaded: @rpath/libcrypto.3.dylib"
+        )
+
+        let manager = ToolchainManager(runner: runner)
+        XCTAssertThrowsError(try manager.test_validateToolchain(root: root)) { error in
+            guard case ToolchainManager.ToolchainError.invalidToolchain(let message) = error else {
+                return XCTFail("Expected invalidToolchain error, got \(error)")
+            }
+            XCTAssertTrue(message.contains("global_mapper"))
+        }
+    }
+
+    func testValidateToolchainRejectsMissingIntegratedGlobalMapperCommand() throws {
+        let root = try TestFileBuilder.makeTempDir()
+        defer { try? FileManager.default.removeItem(at: root) }
+        _ = try ToolchainFixtureBuilder.createToolchain(at: root)
+
+        let runner = makeValidationRunner(
+            root: root,
+            globalMapperExitCode: 1,
+            globalMapperStderr: "ERROR: command `global_mapper` not recognized"
+        )
+
+        let manager = ToolchainManager(runner: runner)
+        XCTAssertThrowsError(try manager.test_validateToolchain(root: root)) { error in
+            guard case ToolchainManager.ToolchainError.invalidToolchain(let message) = error else {
+                return XCTFail("Expected invalidToolchain error, got \(error)")
+            }
+            XCTAssertTrue(message.contains("required global_mapper"))
+        }
     }
 
     func testValidateToolchainAcceptsNativeMsplatClosure() throws {
@@ -29,7 +72,7 @@ final class ToolchainManagerTests: XCTestCase {
         XCTAssertEqual(toolchain.msplat, msplat)
     }
 
-    func testValidateToolchainAcceptsBrushOnlyToolchainWhenMsplatMissing() throws {
+    func testValidateToolchainRejectsToolchainWhenNativeTrainerIsMissing() throws {
         let root = try TestFileBuilder.makeTempDir()
         defer { try? FileManager.default.removeItem(at: root) }
         _ = try ToolchainFixtureBuilder.createToolchain(at: root, includeMsplat: false)
@@ -37,8 +80,12 @@ final class ToolchainManagerTests: XCTestCase {
         let runner = makeValidationRunner(root: root)
 
         let manager = ToolchainManager(runner: runner)
-        let toolchain = try manager.test_validateToolchain(root: root)
-        XCTAssertEqual(toolchain.msplat, root.appendingPathComponent("bin/easysplat-train"))
+        XCTAssertThrowsError(try manager.test_validateToolchain(root: root)) { error in
+            guard case ToolchainManager.ToolchainError.missingBinary(let name) = error else {
+                return XCTFail("Expected missingBinary error, got \(error)")
+            }
+            XCTAssertEqual(name, "bin/easysplat-train")
+        }
     }
 
     func testValidateToolchainNormalizesPackagedMsplatExecutableBit() throws {
@@ -373,37 +420,6 @@ final class ToolchainManagerTests: XCTestCase {
         }
     }
 
-    func testValidateToolchainFailsWhenBrushRealMissing() throws {
-        let root = try TestFileBuilder.makeTempDir()
-        defer { try? FileManager.default.removeItem(at: root) }
-        _ = try ToolchainFixtureBuilder.createToolchain(at: root, brushHasShebang: true, includeBrushReal: false)
-
-        let runner = makeValidationRunner(root: root)
-
-        let manager = ToolchainManager(runner: runner)
-        XCTAssertThrowsError(try manager.test_validateToolchain(root: root)) { error in
-            guard case ToolchainManager.ToolchainError.missingBinary(let name) = error else {
-                return XCTFail("Expected missingBinary error")
-            }
-            XCTAssertEqual(name, "brush.real")
-        }
-    }
-
-    func testValidateToolchainRejectsNonArmPython() throws {
-        let root = try TestFileBuilder.makeTempDir()
-        defer { try? FileManager.default.removeItem(at: root) }
-        _ = try ToolchainFixtureBuilder.createToolchain(at: root)
-
-        let runner = makeValidationRunner(root: root, vggtPythonArch: "Mach-O 64-bit executable x86_64")
-
-        let manager = ToolchainManager(runner: runner)
-        XCTAssertThrowsError(try manager.test_validateToolchain(root: root)) { error in
-            guard case ToolchainManager.ToolchainError.invalidToolchain = error else {
-                return XCTFail("Expected invalidToolchain error")
-            }
-        }
-    }
-
     /// Regression: `/usr/bin/file <path>` echoes the path in stdout, so without `file -b`
     /// a non-Mach-O file under a path containing "arm64" (e.g. `.build/index-build/arm64-apple-macosx/...`)
     /// could spoof the substring check and pass validation. With `-b` the path is stripped
@@ -414,7 +430,7 @@ final class ToolchainManagerTests: XCTestCase {
         _ = try ToolchainFixtureBuilder.createToolchain(at: root)
 
         // file -b output for a non-Mach-O file. No "arm64" anywhere in the description.
-        let runner = makeValidationRunner(root: root, mapAnythingPythonArch: "data")
+        let runner = makeValidationRunner(root: root, da3PythonArch: "data")
 
         let manager = ToolchainManager(runner: runner)
         XCTAssertThrowsError(try manager.test_validateToolchain(root: root)) { error in
@@ -430,16 +446,12 @@ final class ToolchainManagerTests: XCTestCase {
     func testValidateToolchainAcceptsUniversalArmPython() throws {
         let root = try TestFileBuilder.makeTempDir()
         defer { try? FileManager.default.removeItem(at: root) }
-        _ = try ToolchainFixtureBuilder.createToolchain(at: root, brushHasShebang: true, includeBrushReal: true)
+        _ = try ToolchainFixtureBuilder.createToolchain(at: root)
 
         let universal = "Mach-O universal binary with 2 architectures: [x86_64:Mach-O 64-bit executable x86_64] [arm64:Mach-O 64-bit executable arm64]"
         let runner = makeValidationRunner(
             root: root,
-            brushArchPath: "bin/brush.real",
             da3PythonArch: universal,
-            mapAnythingPythonArch: universal,
-            vggtPythonArch: universal,
-            fastvggtPythonArch: universal,
             msplatArch: universal
         )
 
@@ -465,27 +477,6 @@ final class ToolchainManagerTests: XCTestCase {
         }
     }
 
-    /// When brush is a shebang launcher, the arch check must target brush.real (the actual binary).
-    func testValidateToolchainRejectsRosettaBrushReal() throws {
-        let root = try TestFileBuilder.makeTempDir()
-        defer { try? FileManager.default.removeItem(at: root) }
-        _ = try ToolchainFixtureBuilder.createToolchain(at: root, brushHasShebang: true, includeBrushReal: true)
-
-        let runner = makeValidationRunner(
-            root: root,
-            brushArch: "Mach-O 64-bit executable x86_64",
-            brushArchPath: "bin/brush.real"
-        )
-
-        let manager = ToolchainManager(runner: runner)
-        XCTAssertThrowsError(try manager.test_validateToolchain(root: root)) { error in
-            guard case ToolchainManager.ToolchainError.invalidToolchain(let message) = error else {
-                return XCTFail("Expected invalidToolchain error")
-            }
-            XCTAssertTrue(message.lowercased().contains("brush"), "expected brush-specific message; got \(message)")
-        }
-    }
-
     func testCoreToolchainLooksInstalled() throws {
         let root = try TestFileBuilder.makeTempDir()
         defer { try? FileManager.default.removeItem(at: root) }
@@ -507,7 +498,7 @@ final class ToolchainManagerTests: XCTestCase {
         let missingMsplatRoot = try TestFileBuilder.makeTempDir()
         defer { try? FileManager.default.removeItem(at: missingMsplatRoot) }
         _ = try ToolchainFixtureBuilder.createToolchain(at: missingMsplatRoot, includeMsplat: false)
-        XCTAssertTrue(manager.test_coreToolchainLooksInstalled(root: missingMsplatRoot))
+        XCTAssertFalse(manager.test_coreToolchainLooksInstalled(root: missingMsplatRoot))
 
         let partialMsplatRoot = try TestFileBuilder.makeTempDir()
         defer { try? FileManager.default.removeItem(at: partialMsplatRoot) }
@@ -689,7 +680,7 @@ final class ToolchainManagerTests: XCTestCase {
         }
     }
 
-    func testValidateToolchainAllowsExplicitColmapWithoutDa3Bundle() async throws {
+    func testValidateToolchainRequiresDa3BundleEvenForExplicitColmap() async throws {
         let root = try TestFileBuilder.makeTempDir()
         defer { try? FileManager.default.removeItem(at: root) }
         _ = try ToolchainFixtureBuilder.createToolchain(at: root)
@@ -697,87 +688,12 @@ final class ToolchainManagerTests: XCTestCase {
 
         let manager = ToolchainManager(runner: makeValidationRunner(root: root))
         try await withEnvironmentAsync(["EASYSPLAT_SFM_BACKEND": "colmap"]) {
-            XCTAssertNoThrow(try manager.test_validateToolchain(root: root))
-        }
-    }
-
-    func testValidateToolchainFailsWhenMapAnythingAppMissing() throws {
-        let root = try TestFileBuilder.makeTempDir()
-        defer { try? FileManager.default.removeItem(at: root) }
-        _ = try ToolchainFixtureBuilder.createToolchain(
-            at: root,
-            includeMapAnythingAppSentinel: false
-        )
-
-        let runner = makeValidationRunner(root: root)
-
-        let manager = ToolchainManager(runner: runner)
-        XCTAssertThrowsError(try manager.test_validateToolchain(root: root)) { error in
-            guard case ToolchainManager.ToolchainError.missingLibrary(let name) = error else {
-                return XCTFail("Expected missingLibrary error")
+            XCTAssertThrowsError(try manager.test_validateToolchain(root: root)) { error in
+                guard case ToolchainManager.ToolchainError.missingBinary(let name) = error else {
+                    return XCTFail("Expected missingBinary error, got \(error)")
+                }
+                XCTAssertEqual(name, "da3_mps/bin/easysplat_da3_sfm")
             }
-            XCTAssertEqual(name, "mapanything_mps/app/easysplat_mapanything_sfm/run.py")
-        }
-    }
-
-    func testValidateToolchainFailsWhenMapAnythingBuildInfoMissing() throws {
-        let root = try TestFileBuilder.makeTempDir()
-        defer { try? FileManager.default.removeItem(at: root) }
-        let fixture = try ToolchainFixtureBuilder.createToolchain(at: root)
-        try FileManager.default.removeItem(at: fixture.mapanythingBuildInfo)
-
-        let runner = makeValidationRunner(root: root)
-
-        let manager = ToolchainManager(runner: runner)
-        XCTAssertThrowsError(try manager.test_validateToolchain(root: root)) { error in
-            guard case ToolchainManager.ToolchainError.missingLibrary(let name) = error else {
-                return XCTFail("Expected missingLibrary error")
-            }
-            XCTAssertEqual(name, "mapanything_mps/build_info.json")
-        }
-    }
-
-    func testFileHasShebang() throws {
-        let dir = try TestFileBuilder.makeTempDir()
-        defer { try? FileManager.default.removeItem(at: dir) }
-        let script = dir.appendingPathComponent("script")
-        let data = Data([0x23, 0x21, 0x2f, 0x62])
-        TestFileBuilder.createFile(at: script, data: data)
-        let plain = dir.appendingPathComponent("plain")
-        TestFileBuilder.createFile(at: plain, data: Data([0x00, 0x01]))
-
-        let manager = ToolchainManager(runner: MockSubprocessRunner(scripts: []))
-        XCTAssertTrue(manager.test_fileHasShebang(at: script))
-        XCTAssertFalse(manager.test_fileHasShebang(at: plain))
-    }
-
-    func testValidateToolchainFailsWhenVggtBuildInfoMissing() throws {
-        let root = try TestFileBuilder.makeTempDir()
-        defer { try? FileManager.default.removeItem(at: root) }
-        let fixture = try ToolchainFixtureBuilder.createToolchain(at: root)
-        try FileManager.default.removeItem(at: fixture.vggtBuildInfo)
-
-        let manager = ToolchainManager(runner: makeValidationRunner(root: root))
-        XCTAssertThrowsError(try manager.test_validateToolchain(root: root)) { error in
-            guard case ToolchainManager.ToolchainError.missingLibrary(let name) = error else {
-                return XCTFail("Expected missingLibrary error")
-            }
-            XCTAssertEqual(name, "vggt_mps/build_info.json")
-        }
-    }
-
-    func testValidateToolchainFailsWhenFastVggtBuildInfoMissing() throws {
-        let root = try TestFileBuilder.makeTempDir()
-        defer { try? FileManager.default.removeItem(at: root) }
-        let fixture = try ToolchainFixtureBuilder.createToolchain(at: root)
-        try FileManager.default.removeItem(at: fixture.fastvggtBuildInfo)
-
-        let manager = ToolchainManager(runner: makeValidationRunner(root: root))
-        XCTAssertThrowsError(try manager.test_validateToolchain(root: root)) { error in
-            guard case ToolchainManager.ToolchainError.missingLibrary(let name) = error else {
-                return XCTFail("Expected missingLibrary error")
-            }
-            XCTAssertEqual(name, "fastvggt_mps/build_info.json")
         }
     }
 
@@ -785,28 +701,14 @@ final class ToolchainManagerTests: XCTestCase {
         let root = try TestFileBuilder.makeTempDir()
         defer { try? FileManager.default.removeItem(at: root) }
         let fixture = try ToolchainFixtureBuilder.createToolchain(at: root)
-        try "[]\n".write(to: fixture.mapanythingBuildInfo, atomically: true, encoding: .utf8)
+        try "[]\n".write(to: fixture.da3BuildInfo, atomically: true, encoding: .utf8)
 
         let manager = ToolchainManager(runner: makeValidationRunner(root: root))
         XCTAssertThrowsError(try manager.test_validateToolchain(root: root)) { error in
             guard case ToolchainManager.ToolchainError.invalidToolchain(let message) = error else {
                 return XCTFail("Expected invalidToolchain error")
             }
-            XCTAssertTrue(message.contains("mapanything_mps build_info.json"))
-        }
-    }
-
-    func testValidateToolchainRejectsBrokenPythonWrapper() throws {
-        let root = try TestFileBuilder.makeTempDir()
-        defer { try? FileManager.default.removeItem(at: root) }
-        _ = try ToolchainFixtureBuilder.createToolchain(at: root)
-
-        let manager = ToolchainManager(runner: makeValidationRunner(root: root, mapAnythingHelpExitCode: 1))
-        XCTAssertThrowsError(try manager.test_validateToolchain(root: root)) { error in
-            guard case ToolchainManager.ToolchainError.invalidToolchain(let message) = error else {
-                return XCTFail("Expected invalidToolchain error")
-            }
-            XCTAssertTrue(message.contains("mapanything_mps failed to launch"))
+            XCTAssertTrue(message.contains("da3_mps build_info.json"))
         }
     }
 
@@ -828,33 +730,20 @@ final class ToolchainManagerTests: XCTestCase {
     private func makeValidationRunner(
         root: URL,
         colmapArch: String = "Mach-O 64-bit executable arm64",
-        brushArch: String = "Mach-O 64-bit executable arm64",
-        brushArchPath: String = "bin/brush",
         da3PythonArch: String = "Mach-O 64-bit executable arm64",
-        mapAnythingPythonArch: String = "Mach-O 64-bit executable arm64",
-        vggtPythonArch: String = "Mach-O 64-bit executable arm64",
-        fastvggtPythonArch: String = "Mach-O 64-bit executable arm64",
         msplatArch: String = "Mach-O 64-bit executable arm64",
+        globalMapperExitCode: Int32 = 0,
+        globalMapperStderr: String = "",
         da3HelpExitCode: Int32 = 0,
-        mapAnythingHelpExitCode: Int32 = 0,
-        vggtHelpExitCode: Int32 = 0,
-        fastvggtHelpExitCode: Int32 = 0,
         msplatSelfCheckExitCode: Int32 = 0,
         msplatSelfCheckStdout: String = "{\"event\":\"self_check\",\"schema_version\":1,\"sequence\":1,\"status\":\"ok\",\"version\":\"1.1.3 (git 106499b)\"}\n"
     ) -> MockSubprocessRunner {
         MockSubprocessRunner(scripts: [
             .init(path: "/usr/bin/file", argsPrefix: ["-b", root.appendingPathComponent("bin/colmap").path], result: .init(exitCode: 0, terminationReason: .exit, stdout: colmapArch, stderr: ""), onRun: nil),
-            .init(path: "/usr/bin/file", argsPrefix: ["-b", root.appendingPathComponent(brushArchPath).path], result: .init(exitCode: 0, terminationReason: .exit, stdout: brushArch, stderr: ""), onRun: nil),
             .init(path: root.appendingPathComponent("bin/colmap").path, argsPrefix: ["-h"], result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""), onRun: nil),
-            .init(path: root.appendingPathComponent("bin/brush").path, argsPrefix: ["--help"], result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""), onRun: nil),
+            .init(path: root.appendingPathComponent("bin/colmap").path, argsPrefix: ["global_mapper"], result: .init(exitCode: globalMapperExitCode, terminationReason: .exit, stdout: "", stderr: globalMapperStderr), onRun: nil),
             .init(path: "/usr/bin/file", argsPrefix: ["-b", root.appendingPathComponent("da3_mps/python/bin/python3").path], result: .init(exitCode: 0, terminationReason: .exit, stdout: da3PythonArch, stderr: ""), onRun: nil),
             .init(path: root.appendingPathComponent("da3_mps/bin/easysplat_da3_sfm").path, argsPrefix: ["--help"], result: .init(exitCode: da3HelpExitCode, terminationReason: .exit, stdout: "", stderr: ""), onRun: nil),
-            .init(path: "/usr/bin/file", argsPrefix: ["-b", root.appendingPathComponent("mapanything_mps/python/bin/python3").path], result: .init(exitCode: 0, terminationReason: .exit, stdout: mapAnythingPythonArch, stderr: ""), onRun: nil),
-            .init(path: root.appendingPathComponent("mapanything_mps/bin/easysplat_mapanything_sfm").path, argsPrefix: ["--help"], result: .init(exitCode: mapAnythingHelpExitCode, terminationReason: .exit, stdout: "", stderr: ""), onRun: nil),
-            .init(path: "/usr/bin/file", argsPrefix: ["-b", root.appendingPathComponent("vggt_mps/python/bin/python3").path], result: .init(exitCode: 0, terminationReason: .exit, stdout: vggtPythonArch, stderr: ""), onRun: nil),
-            .init(path: root.appendingPathComponent("vggt_mps/bin/easysplat_vggt_sfm").path, argsPrefix: ["--help"], result: .init(exitCode: vggtHelpExitCode, terminationReason: .exit, stdout: "", stderr: ""), onRun: nil),
-            .init(path: "/usr/bin/file", argsPrefix: ["-b", root.appendingPathComponent("fastvggt_mps/python/bin/python3").path], result: .init(exitCode: 0, terminationReason: .exit, stdout: fastvggtPythonArch, stderr: ""), onRun: nil),
-            .init(path: root.appendingPathComponent("fastvggt_mps/bin/easysplat_fastvggt_sfm").path, argsPrefix: ["--help"], result: .init(exitCode: fastvggtHelpExitCode, terminationReason: .exit, stdout: "", stderr: ""), onRun: nil),
             .init(path: "/usr/bin/file", argsPrefix: ["-b", root.appendingPathComponent("bin/easysplat-train").path], result: .init(exitCode: 0, terminationReason: .exit, stdout: msplatArch, stderr: ""), onRun: nil),
             .init(
                 path: root.appendingPathComponent("bin/easysplat-train").path,

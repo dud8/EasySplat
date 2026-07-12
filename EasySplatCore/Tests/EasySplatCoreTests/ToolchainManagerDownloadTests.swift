@@ -488,12 +488,7 @@ final class ToolchainManagerDownloadTests: XCTestCase {
                     "da3_mps/models/DA3-BASE/easysplat_model_info.json",
                     "da3_mps/models/DA3-SMALL/model.safetensors",
                     "da3_mps/models/DA3-SMALL/config.json",
-                    "da3_mps/models/DA3-SMALL/easysplat_model_info.json",
-                    "mapanything_mps/models/map-anything-apache/model.safetensors",
-                    "mapanything_mps/models/map-anything-apache/config.json",
-                    "mapanything_mps/models/dinov2/dinov2_vitg14_pretrain.pth",
-                    "vggt_mps/models/vggt_model.pt",
-                    "fastvggt_mps/models/fastvggt_model.pt"
+                    "da3_mps/models/DA3-SMALL/easysplat_model_info.json"
                 ]
             )
             let signed = try signedManifest(version: version, artifacts: [coreArtifact, modelsArtifact])
@@ -578,8 +573,8 @@ final class ToolchainManagerDownloadTests: XCTestCase {
             sha256: zipHash,
             sizeBytes: UInt64(zipData.count),
             contents: [
-                "vggt_mps/models/vggt_model.pt",
-                "fastvggt_mps/models/fastvggt_model.pt"
+                "da3_mps/models/DA3-BASE/model.safetensors",
+                "da3_mps/models/DA3-SMALL/model.safetensors"
             ]
         )
 
@@ -599,7 +594,7 @@ final class ToolchainManagerDownloadTests: XCTestCase {
                 argsPrefix: ["-o"],
                 result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""),
                 onRun: { @Sendable _ in
-                    let existingFile = root.appendingPathComponent("vggt_mps/models/vggt_model.pt")
+                    let existingFile = root.appendingPathComponent("da3_mps/models/DA3-BASE/model.safetensors")
                     try? FileManager.default.createDirectory(
                         at: existingFile.deletingLastPathComponent(),
                         withIntermediateDirectories: true
@@ -642,7 +637,7 @@ final class ToolchainManagerDownloadTests: XCTestCase {
             url: artifactURL.absoluteString,
             sha256: zipHash,
             sizeBytes: UInt64(zipData.count),
-            contents: ["vggt_mps/models/vggt_model.pt"]
+            contents: ["da3_mps/models/DA3-BASE/model.safetensors"]
         )
 
         MockURLProtocol.register(token: token) { request in
@@ -661,7 +656,7 @@ final class ToolchainManagerDownloadTests: XCTestCase {
                 argsPrefix: ["-o"],
                 result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""),
                 onRun: { @Sendable _ in
-                    let expectedFile = root.appendingPathComponent("vggt_mps/models/vggt_model.pt")
+                    let expectedFile = root.appendingPathComponent("da3_mps/models/DA3-BASE/model.safetensors")
                     try? FileManager.default.createDirectory(
                         at: expectedFile.deletingLastPathComponent(),
                         withIntermediateDirectories: true
@@ -697,7 +692,7 @@ final class ToolchainManagerDownloadTests: XCTestCase {
             url: artifactURL.absoluteString,
             sha256: zipHash,
             sizeBytes: UInt64(zipData.count),
-            contents: ["vggt_mps/models/vggt_model.pt"]
+            contents: ["da3_mps/models/DA3-BASE/model.safetensors"]
         )
 
         MockURLProtocol.register(token: token) { request in
@@ -719,7 +714,7 @@ final class ToolchainManagerDownloadTests: XCTestCase {
                 argsPrefix: ["-o"],
                 result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""),
                 onRun: { @Sendable _ in
-                    let expectedFile = root.appendingPathComponent("vggt_mps/models/vggt_model.pt")
+                    let expectedFile = root.appendingPathComponent("da3_mps/models/DA3-BASE/model.safetensors")
                     try? FileManager.default.createDirectory(
                         at: expectedFile.deletingLastPathComponent(),
                         withIntermediateDirectories: true
@@ -744,20 +739,14 @@ final class ToolchainManagerDownloadTests: XCTestCase {
                 onRun: nil
             ),
             .init(
-                path: "/usr/bin/file",
-                argsPrefix: ["-b", fixture.brush.path],
-                result: .init(exitCode: 0, terminationReason: .exit, stdout: "Mach-O 64-bit executable arm64", stderr: ""),
-                onRun: nil
-            ),
-            .init(
                 path: fixture.colmap.path,
                 argsPrefix: ["-h"],
                 result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""),
                 onRun: nil
             ),
             .init(
-                path: fixture.brush.path,
-                argsPrefix: ["--help"],
+                path: fixture.colmap.path,
+                argsPrefix: ["global_mapper"],
                 result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""),
                 onRun: nil
             ),
@@ -769,42 +758,6 @@ final class ToolchainManagerDownloadTests: XCTestCase {
             ),
             .init(
                 path: fixture.da3SfmTool.path,
-                argsPrefix: ["--help"],
-                result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""),
-                onRun: nil
-            ),
-            .init(
-                path: "/usr/bin/file",
-                argsPrefix: ["-b", fixture.mapanythingPython.path],
-                result: .init(exitCode: 0, terminationReason: .exit, stdout: "Mach-O 64-bit executable arm64", stderr: ""),
-                onRun: nil
-            ),
-            .init(
-                path: fixture.mapanythingSfmTool.path,
-                argsPrefix: ["--help"],
-                result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""),
-                onRun: nil
-            ),
-            .init(
-                path: "/usr/bin/file",
-                argsPrefix: ["-b", fixture.vggtPython.path],
-                result: .init(exitCode: 0, terminationReason: .exit, stdout: "Mach-O 64-bit executable arm64", stderr: ""),
-                onRun: nil
-            ),
-            .init(
-                path: fixture.vggtSfmTool.path,
-                argsPrefix: ["--help"],
-                result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""),
-                onRun: nil
-            ),
-            .init(
-                path: "/usr/bin/file",
-                argsPrefix: ["-b", fixture.fastvggtPython.path],
-                result: .init(exitCode: 0, terminationReason: .exit, stdout: "Mach-O 64-bit executable arm64", stderr: ""),
-                onRun: nil
-            ),
-            .init(
-                path: fixture.fastvggtSfmTool.path,
                 argsPrefix: ["--help"],
                 result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""),
                 onRun: nil
@@ -837,22 +790,7 @@ final class ToolchainManagerDownloadTests: XCTestCase {
             "da3_mps/python",
             "da3_mps/build_info.json",
             "da3_mps/vendor",
-            "da3_mps/app",
-            "mapanything_mps/bin",
-            "mapanything_mps/python",
-            "mapanything_mps/build_info.json",
-            "mapanything_mps/vendor",
-            "mapanything_mps/app",
-            "vggt_mps/bin",
-            "vggt_mps/python",
-            "vggt_mps/build_info.json",
-            "vggt_mps/vendor",
-            "vggt_mps/app",
-            "fastvggt_mps/bin",
-            "fastvggt_mps/python",
-            "fastvggt_mps/build_info.json",
-            "fastvggt_mps/vendor",
-            "fastvggt_mps/app"
+            "da3_mps/app"
         ]
         for path in relativePaths {
             try? FileManager.default.removeItem(at: root.appendingPathComponent(path))

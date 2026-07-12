@@ -69,10 +69,26 @@ if rg -n 'github.com/dud8/EasySplat|http://localhost:8000' \
   exit 1
 fi
 
-if ! rg -n 'build_da3_mps\.sh' "$ROOT/.github/workflows/toolchain-build.yml" >/dev/null; then
-  echo "Toolchain release workflow no longer builds DA3 before packaging." >&2
-  exit 1
-fi
+for path in "$ROOT/scripts/release/build_dmg.sh" "$ROOT/.github/workflows/toolchain-build.yml"; do
+  for builder in build_colmap.sh build_openssl.sh build_msplat.sh build_da3_mps.sh; do
+    if ! rg -n "scripts/toolchain/$builder" "$path" >/dev/null; then
+      echo "Release path no longer runs required toolchain builder $builder: $path" >&2
+      exit 1
+    fi
+  done
+done
+
+legacy_runtime_pattern='brush|mapanything|fastvggt|vggt|glomap'
+for path in \
+  "$ROOT/scripts/toolchain/package_toolchain.sh" \
+  "$ROOT/scripts/run.sh" \
+  "$ROOT/scripts/release/build_dmg.sh" \
+  "$ROOT/.github/workflows/toolchain-build.yml"; do
+  if rg -n -i "$legacy_runtime_pattern" "$path" >/dev/null; then
+    echo "Release path still references a removed runtime: $path" >&2
+    exit 1
+  fi
+done
 
 for path in "$ROOT/scripts/release/build_dmg.sh" "$ROOT/.github/workflows/toolchain-build.yml"; do
   if ! rg -n 'refuses EASYSPLAT_ALLOW_UNPINNED_DA3_SOURCE' "$path" >/dev/null; then
@@ -80,11 +96,6 @@ for path in "$ROOT/scripts/release/build_dmg.sh" "$ROOT/.github/workflows/toolch
     exit 1
   fi
 done
-
-if ! rg -n 'build_mapanything_mps\.sh' "$ROOT/.github/workflows/toolchain-build.yml" >/dev/null; then
-  echo "Toolchain release workflow no longer builds MapAnything fallback before packaging." >&2
-  exit 1
-fi
 
 if rg -n '(^|[^A-Za-z0-9_])(xformers|flash[-_]attn|triton|torch[-_]scatter)([^A-Za-z0-9_]|$)' \
   "$ROOT/Tools/Da3Sfm" \

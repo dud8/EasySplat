@@ -12,9 +12,6 @@ extension AppModel {
             statusDetail = nil
             stageStartedAt = now
             lastPipelineEventAt = now
-            if stage != .trainBrush {
-                activeTrainingBackend = nil
-            }
             appendLogLine("[\(stage.displayName)] started")
         case .stageProgress(let stage, let fraction, let message):
             let previousStage = self.stage
@@ -57,13 +54,7 @@ extension AppModel {
             self.stage = stage
             progress = 1.0
             lastPipelineEventAt = now
-            if stage == .trainBrush {
-                activeTrainingBackend = nil
-            }
             appendLogLine("[\(stage.displayName)] finished")
-        case .trainingBackendSelected(let backend):
-            activeTrainingBackend = backend
-            lastPipelineEventAt = now
         case .pipelineFailed(_, let userMessage, let debugMessage):
             if stopAction != nil {
                 return
@@ -89,7 +80,7 @@ extension AppModel {
         let trimmed = message.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return }
 
-        if stage == .trainBrush {
+        if stage == .trainSplat {
             if trimmed.hasPrefix("Preparing training dataset (images)") {
                 if let ratio = parseProgressRatio(trimmed) {
                     let bucket = bucketedPercent(current: ratio.current, total: ratio.total)
@@ -120,7 +111,7 @@ extension AppModel {
         }
 
         let now = Date()
-        let minInterval: TimeInterval = stage == .trainBrush && trimmed.hasPrefix("Training model")
+        let minInterval: TimeInterval = stage == .trainSplat && trimmed.hasPrefix("Training model")
             ? trainingProgressLogMinInterval
             : 1.5
         if stage == lastProgressLogStage && trimmed == lastProgressLogMessage && now.timeIntervalSince(lastProgressLogAt) < minInterval {

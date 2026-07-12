@@ -12,7 +12,7 @@ struct StepperProgressView: View {
         .sfmFeatures,
         .sfmMatching,
         .sfmMapping,
-        .trainBrush,
+        .trainSplat,
         .exportSplat,
         .done
     ]

@@ -4,116 +4,19 @@ import Foundation
 public struct ToolchainPaths: Sendable {
     public var root: URL
     public var colmap: URL
-    public var glomap: URL
-    public var brush: URL
     public var msplat: URL
     public var da3: Da3Toolchain
-    public var mapanything: MapAnythingToolchain
-    public var vggt: VggtToolchain
-    public var fastvggt: FastVggtToolchain
 
     public init(
         root: URL,
         colmap: URL,
-        glomap: URL,
-        brush: URL,
         msplat: URL,
-        da3: Da3Toolchain,
-        mapanything: MapAnythingToolchain,
-        vggt: VggtToolchain,
-        fastvggt: FastVggtToolchain
+        da3: Da3Toolchain
     ) {
         self.root = root
         self.colmap = colmap
-        self.glomap = glomap
-        self.brush = brush
         self.msplat = msplat
         self.da3 = da3
-        self.mapanything = mapanything
-        self.vggt = vggt
-        self.fastvggt = fastvggt
-    }
-
-    public init(
-        root: URL,
-        colmap: URL,
-        glomap: URL,
-        brush: URL,
-        da3: Da3Toolchain,
-        mapanything: MapAnythingToolchain,
-        vggt: VggtToolchain,
-        fastvggt: FastVggtToolchain
-    ) {
-        self.init(
-            root: root,
-            colmap: colmap,
-            glomap: glomap,
-            brush: brush,
-            msplat: root.appendingPathComponent("bin/easysplat-train"),
-            da3: da3,
-            mapanything: mapanything,
-            vggt: vggt,
-            fastvggt: fastvggt
-        )
-    }
-
-    public init(
-        root: URL,
-        colmap: URL,
-        glomap: URL,
-        brush: URL,
-        msplat: URL,
-        vggt: VggtToolchain,
-        fastvggt: FastVggtToolchain
-    ) {
-        let da3Root = root.appendingPathComponent("da3_mps", isDirectory: true)
-        let da3 = Da3Toolchain(
-            root: da3Root,
-            sfmTool: da3Root.appendingPathComponent("bin/easysplat_da3_sfm"),
-            python: da3Root.appendingPathComponent("python/bin/python3"),
-            models: da3Root.appendingPathComponent("models", isDirectory: true),
-            modelBundle: da3Root.appendingPathComponent("models/DA3-BASE", isDirectory: true),
-            fallbackModelBundle: da3Root.appendingPathComponent("models/DA3-SMALL", isDirectory: true)
-        )
-        let mapAnythingRoot = root.appendingPathComponent("mapanything_mps", isDirectory: true)
-        let mapanything = MapAnythingToolchain(
-            root: mapAnythingRoot,
-            sfmTool: mapAnythingRoot.appendingPathComponent("bin/easysplat_mapanything_sfm"),
-            python: mapAnythingRoot.appendingPathComponent("python/bin/python3"),
-            models: mapAnythingRoot.appendingPathComponent("models", isDirectory: true),
-            modelBundle: mapAnythingRoot.appendingPathComponent("models/map-anything-apache", isDirectory: true),
-            dinov2Weights: mapAnythingRoot.appendingPathComponent("models/dinov2/dinov2_vitg14_pretrain.pth")
-        )
-        self.init(
-            root: root,
-            colmap: colmap,
-            glomap: glomap,
-            brush: brush,
-            msplat: msplat,
-            da3: da3,
-            mapanything: mapanything,
-            vggt: vggt,
-            fastvggt: fastvggt
-        )
-    }
-
-    public init(
-        root: URL,
-        colmap: URL,
-        glomap: URL,
-        brush: URL,
-        vggt: VggtToolchain,
-        fastvggt: FastVggtToolchain
-    ) {
-        self.init(
-            root: root,
-            colmap: colmap,
-            glomap: glomap,
-            brush: brush,
-            msplat: root.appendingPathComponent("bin/easysplat-train"),
-            vggt: vggt,
-            fastvggt: fastvggt
-        )
     }
 }
 
@@ -133,55 +36,6 @@ public struct Da3Toolchain: Sendable {
         self.models = models
         self.modelBundle = modelBundle
         self.fallbackModelBundle = fallbackModelBundle
-    }
-}
-
-/// Paths for the bundled MapAnything runtime inside a toolchain install.
-public struct MapAnythingToolchain: Sendable {
-    public var root: URL
-    public var sfmTool: URL
-    public var python: URL
-    public var models: URL
-    public var modelBundle: URL
-    public var dinov2Weights: URL
-
-    public init(root: URL, sfmTool: URL, python: URL, models: URL, modelBundle: URL, dinov2Weights: URL) {
-        self.root = root
-        self.sfmTool = sfmTool
-        self.python = python
-        self.models = models
-        self.modelBundle = modelBundle
-        self.dinov2Weights = dinov2Weights
-    }
-}
-
-/// Paths for the bundled VGGT runtime inside a toolchain install.
-public struct VggtToolchain: Sendable {
-    public var root: URL
-    public var sfmTool: URL
-    public var python: URL
-    public var models: URL
-
-    public init(root: URL, sfmTool: URL, python: URL, models: URL) {
-        self.root = root
-        self.sfmTool = sfmTool
-        self.python = python
-        self.models = models
-    }
-}
-
-/// Paths for the bundled FastVGGT runtime inside a toolchain install.
-public struct FastVggtToolchain: Sendable {
-    public var root: URL
-    public var sfmTool: URL
-    public var python: URL
-    public var models: URL
-
-    public init(root: URL, sfmTool: URL, python: URL, models: URL) {
-        self.root = root
-        self.sfmTool = sfmTool
-        self.python = python
-        self.models = models
     }
 }
 

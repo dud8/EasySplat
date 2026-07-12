@@ -2,7 +2,7 @@
 
 EasySplat is a macOS-only Apple Silicon app that turns videos, photo folders, or mixed inputs into 3D Gaussian splats.
 
-The default Fast app profile uses COLMAP `global_mapper` for the measured Apple Silicon quick path. Balanced and Ultra runs start with Depth Anything 3, then fall back to MapAnything and COLMAP when needed. The heavy lifting lives in a signed downloadable toolchain, not in the app bundle.
+Fast starts with COLMAP `global_mapper`. Balanced and High Detail start with Depth Anything 3, then use a bounded COLMAP refinement or fallback when needed. Native msplat trains every accepted reconstruction on Metal. The heavy lifting lives in a signed downloadable toolchain, not in the app bundle.
 
 This OSS build keeps distribution simple on purpose: the app itself is currently unsigned and not notarized, while the toolchain remains the signed trust boundary.
 
@@ -19,13 +19,12 @@ Each run creates a `.easysplatproj` bundle under `~/Documents/EasySplat Projects
 
 EasySplat treats each run like a durable project bundle:
 
-- `project.json` stores input choices, preset, pipeline state, checkpoints, recovery flags, persisted share metrics, the accepted reconstruction summary (registered frames, points, observations, mean track length, mean reprojection error where the mapper measures one, mapper), per-stage wall-clock timings, the AutoTuner snapshot used for the run, and a free-text notes field.
+- `project.json` stores requested run options, pipeline state, checkpoints, the accepted reconstruction summary, measured stage timings, and notes.
 - `last_opened.json` stores the last-opened timestamp outside `project.json` so home-screen activity updates cannot clobber concurrent pipeline writes.
 - `Logs/pipeline.log` stores the human-readable pipeline log.
 - `Logs/events.jsonl` stores structured pipeline events.
-- `Logs/app_events.jsonl` stores app-level events such as sharing activity.
 - interrupted runs keep checkpoint data plus `lastRunStartedAt`, which lets the app offer recovery on relaunch.
-- The viewer surfaces reconstruction quality (with a fleet-median comparison badge), the pipeline timing breakdown as a stacked bar, the AutoTuner decisions, and the originating capture preset for each finished run. The home screen shows fleet stats and a predicted run duration based on past successful runs at the same preset.
+- The result workspace surfaces measured reconstruction facts, timing, notes, and the validated PLY.
 
 ## Repository map
 
@@ -36,9 +35,7 @@ EasySplat treats each run like a durable project bundle:
 - `EasySplatUITests/`: placeholder SwiftPM UI-test target.
 - `Tools/ManifestTool/`: Swift CLI for Ed25519 key generation and manifest signing.
 - `Tools/Da3Sfm/`: Depth Anything 3 to COLMAP bridge shipped in the toolchain.
-- `Tools/MapAnythingSfm/`: MapAnything fallback bridge shipped in the toolchain.
-- `Tools/VggtSfm/`: VGGT to COLMAP bridge shipped in the toolchain.
-- `Tools/FastVggtSfm/`: FastVGGT seed-export bridge shipped in the toolchain.
+- `Tools/MsplatNative/`: native C++/Metal trainer and checkpoint implementation.
 - `ThirdParty/MetalSplatter/`: vendored viewer dependency.
 - `Toolchains/`: local toolchain build outputs, manifests, and dev-only signing keys.
 - `scripts/`: dev, test, packaging, benchmarking, and release automation.
@@ -82,10 +79,7 @@ Other useful commands:
 ./scripts/test_python_tools.sh
 swift test --package-path Tools/ManifestTool
 ./scripts/benchmark_da3.sh --video /absolute/path/to/input.mp4
-./scripts/benchmark_mapanything.sh --video /absolute/path/to/input.mp4
 ```
-
-Use `EASYSPLAT_MSPLAT_BIN=/path/to/easysplat-train` only when comparing a local native trainer outside the signed toolchain.
 
 The app's default Fast profile uses the measured Apple Silicon path.
 
@@ -105,11 +99,9 @@ Most useful runtime overrides:
 | `EASYSPLAT_TOOLCHAIN_MANIFEST_URL` | Override the manifest URL directly. |
 | `EASYSPLAT_TOOLCHAIN_PUBLIC_KEY_BASE64` | Override the embedded public key. |
 | `EASYSPLAT_LOCAL_TOOLCHAIN_ROOT` | Skip download/install and validate an already-present local toolchain. |
-| `EASYSPLAT_SFM_BACKEND` | Force `da3`, `mapanything`, `colmap`, `glomap`, `global_mapper`, `vggt`, or `fastvggt`. |
-| `EASYSPLAT_SFM_MAPPER` | Steer mapper fallback inside the integrated path: `glomap` means COLMAP `global_mapper`; `colmap` means classic COLMAP `mapper`. |
+| `EASYSPLAT_SFM_BACKEND` | Development override for `da3` or `colmap`. |
+| `EASYSPLAT_SFM_MAPPER` | Steer the retained COLMAP route: `global_mapper` or classic `mapper`. |
 | `EASYSPLAT_SPEED_PROFILE` | Set `fast` for the measured Apple Silicon quick path: select about 30 frames with blur-filter headroom, use COLMAP `global_mapper` by default, keep 960px training frames, solve COLMAP at 512px with low overlap, and use the 3,000-iteration Fast training profile. |
-| `EASYSPLAT_TRAINER` | Override trainer selection with `brush` or `msplat`; the fast profile auto-selects packaged msplat unless sparse quality is too low. |
-| `EASYSPLAT_MSPLAT_BIN` | Point at a local `easysplat-train` binary for comparison testing instead of the packaged binary. |
 | `EASYSPLAT_FRAME_TARGET_COUNT` | Override the selected frame budget for speed-profile runs. |
 | `EASYSPLAT_FRAME_MAX_DIMENSION` | Override extracted frame size before SfM. |
 | `EASYSPLAT_COLMAP_MAX_IMAGE_SIZE` | Override COLMAP feature-extraction image size independently from extracted frame size. |
@@ -134,22 +126,7 @@ Common DA3 tuning knobs:
 - `EASYSPLAT_DA3_WINDOW_OVERLAP=<n>`
 - `EASYSPLAT_DA3_DIRECT_MIN_TRACK_LENGTH=<n>`
 
-`DA3-BASE` and `DA3-SMALL` are Apache-2.0 and are bundled in the default signed toolchain. `DA3METRIC-LARGE` is Apache-2.0 but optional for experiments; build it with `EASYSPLAT_DA3_INCLUDE_METRIC_LARGE=1`. Non-commercial DA3 variants are not bundled for the default path.
-
-Common MapAnything fallback tuning knobs:
-
-- `EASYSPLAT_MAPANYTHING_DEVICE=mps|cpu`
-- `EASYSPLAT_MAPANYTHING_CHECKPOINT=map-anything-apache`
-- `EASYSPLAT_MAPANYTHING_RESOLUTION=512|518`
-- `EASYSPLAT_MAPANYTHING_MEMORY_EFFICIENT=0|1`
-- `EASYSPLAT_MAPANYTHING_MINIBATCH_SIZE=<n>`
-- `EASYSPLAT_MAPANYTHING_MAX_POINTS=<n>`
-- `EASYSPLAT_MAPANYTHING_CAMERA_TYPE=SIMPLE_RADIAL|SIMPLE_PINHOLE|PINHOLE|OPENCV`
-- `EASYSPLAT_MAPANYTHING_SHARED_CAMERA=0|1`
-- `EASYSPLAT_MAPANYTHING_ANCHOR_MAX_VIEWS=<n>`
-- `EASYSPLAT_MAPANYTHING_WINDOW_SIZE=<n>`
-- `EASYSPLAT_MAPANYTHING_WINDOW_OVERLAP=<n>`
-- `EASYSPLAT_MAPANYTHING_DIRECT_MIN_TRACK_LENGTH=<n>`
+`DA3-BASE` and `DA3-SMALL` are Apache-2.0 and are the only DA3 weights in the product toolchain. Base is the normal initializer; Small is selected proactively for constrained hardware and retried after memory pressure.
 
 Common global-mapper tuning knobs:
 
@@ -162,24 +139,9 @@ Common global-mapper tuning knobs:
 - `EASYSPLAT_GLOBAL_MAPPER_MIN_NUM_MATCHES=<n>`
 - `EASYSPLAT_GLOBAL_MAPPER_BA_NUM_ITERATIONS=<n>`
 
-Common Brush overrides:
-
-- `EASYSPLAT_BRUSH_TOTAL_STEPS=<n>`
-- `EASYSPLAT_BRUSH_EXPORT_EVERY=<n>`
-- `EASYSPLAT_BRUSH_RUST_LOG=<level>`
-- `EASYSPLAT_BRUSH_SNAPSHOT_MIN_STEPS=<n>`
-- `EASYSPLAT_BRUSH_SNAPSHOT_MAX_STEPS=<n>`
-- `EASYSPLAT_BRUSH_SNAPSHOT_MIN_SECONDS=<n>`
-- `EASYSPLAT_BRUSH_SNAPSHOT_MAX_SECONDS=<n>`
-- `EASYSPLAT_BRUSH_SNAPSHOT_DEFAULT_SECONDS=<n>`
-
-Native trainer override:
-
-- `EASYSPLAT_MSPLAT_BIN=/path/to/easysplat-train`
-
 Training budgets are fixed by the Fast, Balanced, and High Detail profiles. Raw iteration and resolution controls are not runtime settings.
 
-The automatic fast profile uses a 2,000-step Brush run instead of msplat when the sparse solve has fewer than 1,500 points. Set `EASYSPLAT_TRAINER=msplat` to force msplat anyway.
+The packaged `easysplat-train` executable is the sole trainer. It emits structured events and writes atomic optimizer checkpoints containing the model state, optimizer moments, schedule, seed, trainer version, and geometry identity. Stop and relaunch resume only from a validated checkpoint.
 
 ## SfM behavior
 
@@ -190,14 +152,13 @@ Default behavior when `EASYSPLAT_SFM_BACKEND` is unset:
 - DA3 sparse output is scored against the full selected image count before the pipeline accepts it.
 - `DA3-SMALL` is retried automatically if `DA3-BASE` hits MPS memory pressure.
 - DA3 writes the canonical COLMAP text sparse model consumed by training and the viewer.
-- If DA3 fails or produces a low-quality sparse model, EasySplat falls back to MapAnything.
-- If MapAnything refinement still is not good enough, EasySplat falls back through COLMAP `global_mapper` and then COLMAP `mapper` when needed.
+- Accepted learned geometry receives bounded COLMAP triangulation and bundle adjustment.
+- If learned geometry fails its checks, COLMAP `global_mapper` is the compatibility solve and classic `mapper` is the final recovery path.
 
 Compatibility notes:
 
-- `EASYSPLAT_SFM_BACKEND=glomap` and `EASYSPLAT_SFM_BACKEND=global_mapper` are compatibility aliases for COLMAP's integrated `global_mapper` flow.
-- `mapanything` is still available as an explicit override path and as the first fallback after DA3.
-- `vggt` and `fastvggt` are still available as explicit override paths, but they are no longer the default product story.
+- The toolchain ships one stripped COLMAP binary. It retains `global_mapper`, classic `mapper`, `point_triangulator`, and `bundle_adjuster`; there is no separate global-mapping package.
+- Every accepted route produces the canonical `SfM/colmap/sparse/0` model before native training starts.
 
 ## Toolchain model
 
@@ -221,7 +182,6 @@ Local development scripts usually emit `Toolchains/manifest.json`. The GitHub to
 - macOS 15+ on Apple Silicon
 - Xcode 16+ with the full XCTest toolchain
 - Homebrew
-- Rust toolchain for Brush (`cargo`)
 - network access and enough disk space for large model downloads
 - optional: `ffmpeg` / `ffprobe` if you use the benchmark scripts
 
@@ -328,20 +288,14 @@ Build the local toolchain pieces:
 ```bash
 ./scripts/toolchain/build_openssl.sh
 ./scripts/toolchain/build_colmap.sh
-./scripts/toolchain/build_brush.sh
 ./scripts/toolchain/build_msplat.sh
 ./scripts/toolchain/build_da3_mps.sh
-./scripts/toolchain/build_mapanything_mps.sh
-./scripts/toolchain/build_vggt_mps.sh
-./scripts/toolchain/build_fastvggt_mps.sh
 ./scripts/toolchain/package_toolchain.sh --version 0.1.0
 ```
 
 `build_da3_mps.sh` uses a pinned git checkout by default. A no-git local DA3 source tree is only allowed for development with `EASYSPLAT_ALLOW_UNPINNED_DA3_SOURCE=1`; release scripts and CI reject that override.
 
-`build_msplat.sh` packages a version-pinned `msplat[cli]` package into the core toolchain so the fast Apple Silicon profile can use the Metal trainer without a local virtual environment.
-
-`scripts/toolchain/build_glomap.sh` is available for direct `glomap` work, but the packaged app path uses COLMAP's integrated `global_mapper` rather than a separately shipped `glomap` binary.
+`build_msplat.sh` builds the pinned native C++/Metal `easysplat-train` executable. The packaged trainer does not require a Python runtime.
 
 Generate a dev keypair:
 
@@ -412,7 +366,7 @@ Run the manifest tool tests:
 swift test --package-path Tools/ManifestTool
 ```
 
-Run the Python bridge tests for DA3, MapAnything, FastVGGT, and VGGT:
+Run the retained DA3 bridge tests:
 
 ```bash
 ./scripts/test_python_tools.sh

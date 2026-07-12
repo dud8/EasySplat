@@ -463,30 +463,7 @@ final class AppModelTests: XCTestCase {
         XCTAssertNil(metadata.lastRunStartedAt)
     }
 
-    func testLivePreviewToggleResetsPerProjectStart() async throws {
-        let tempBase = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
-        try FileManager.default.createDirectory(at: tempBase, withIntermediateDirectories: true)
-        let input = tempBase.appendingPathComponent("input.mov")
-        try Data("video".utf8).write(to: input)
-
-        let mockToolchain = MockToolchainManager()
-        let model = AppModel(
-            toolchainManager: mockToolchain,
-            projectBaseURL: tempBase
-        ) { projectURL, config in
-            MockPipelineRunner(projectURL: projectURL, config: config)
-        }
-
-        model.isLivePreviewEnabled = true
-        model.addInputs(urls: [input])
-        model.startFromPendingSelection()
-
-        try await waitForViewState(model: model, state: .viewer)
-
-        XCTAssertFalse(model.isLivePreviewEnabled)
-    }
-
-    func testMsplatTrainingStopCopyPromisesValidationNotAutomaticResume() {
+    func testTrainingStopCopyPromisesValidationNotAutomaticResume() {
         let tempBase = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
         let model = AppModel(toolchainManager: MockToolchainManager(), projectBaseURL: tempBase) { _, config in
             MockPipelineRunner(projectURL: tempBase, config: config)
@@ -501,8 +478,7 @@ final class AppModelTests: XCTestCase {
             model.currentTask = nil
         }
 
-        model.handle(event: .stageStarted(stage: .trainBrush))
-        model.handle(event: .trainingBackendSelected(backend: .msplat))
+        model.handle(event: .stageStarted(stage: .trainSplat))
         model.cancelCurrentProject(deleteProject: false)
 
         XCTAssertEqual(model.statusTitle, "Saving training checkpoint…")
@@ -512,7 +488,7 @@ final class AppModelTests: XCTestCase {
         )
     }
 
-    func testUnknownTrainingBackendUsesGenericStopCopy() {
+    func testNonTrainingStopUsesGenericSaveCopy() {
         let tempBase = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
         let model = AppModel(toolchainManager: MockToolchainManager(), projectBaseURL: tempBase) { _, config in
             MockPipelineRunner(projectURL: tempBase, config: config)
@@ -527,13 +503,13 @@ final class AppModelTests: XCTestCase {
             model.currentTask = nil
         }
 
-        model.handle(event: .stageStarted(stage: .trainBrush))
+        model.handle(event: .stageStarted(stage: .sfmMapping))
         model.cancelCurrentProject(deleteProject: false)
 
-        XCTAssertEqual(model.statusTitle, "Saving project…")
+        XCTAssertEqual(model.statusTitle, "Saving progress…")
         XCTAssertEqual(
             model.statusDetail,
-            "Stopping training at the next safe point. Resume behavior depends on the saved training state."
+            "Stopping at the next safe point (up to 15 seconds)…"
         )
     }
 
@@ -549,7 +525,7 @@ final class AppModelTests: XCTestCase {
             toolchainManager: MockToolchainManager(),
             projectBaseURL: tempBase
         ) { _, _ in
-            StopFailingPipelineRunner(started: started, stage: .trainBrush, backend: .msplat)
+            StopFailingPipelineRunner(started: started, stage: .trainSplat)
         }
         var terminationReplies: [Bool] = []
         model.replyToTerminationRequest = { shouldTerminate in
@@ -558,7 +534,7 @@ final class AppModelTests: XCTestCase {
         model.addInputs(urls: [input])
         model.startFromPendingSelection()
         await fulfillment(of: [started], timeout: 2.0)
-        try await waitForPipelineState(model: model, stage: .trainBrush, backend: .msplat)
+        try await waitForPipelineState(model: model, stage: .trainSplat)
 
         model.cancelCurrentProject(deleteProject: false, exitIntent: .quit)
         try await waitForLastError(model: model, timeout: 2.0)
@@ -577,28 +553,31 @@ final class AppModelTests: XCTestCase {
         XCTAssertTrue((model.lastError ?? "").contains("checkpoint persistence failed"))
     }
 
-    func testStopFailurePresentationCoversBrushGenericAndDeleteFailures() {
+    func testStopFailurePresentationCoversCheckpointGenericAndDeleteFailures() {
         let tempBase = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
         let model = AppModel(toolchainManager: MockToolchainManager(), projectBaseURL: tempBase) { _, config in
             MockPipelineRunner(projectURL: tempBase, config: config)
         }
 
+        model.stage = .trainSplat
         XCTAssertEqual(
-            model.stopFailurePresentation(for: .keepProject, backend: .brush),
+            model.stopFailurePresentation(for: .keepProject),
             AppModel.StopFailurePresentation(
-                title: "Couldn’t export the snapshot",
-                detail: "The latest training snapshot was not exported. Review the details and try again."
+                title: "Couldn’t save the project",
+                detail: "The training checkpoint was not saved. Review the details and try again."
             )
         )
+
+        model.stage = .sfmMapping
         XCTAssertEqual(
-            model.stopFailurePresentation(for: .keepProject, backend: nil),
+            model.stopFailurePresentation(for: .keepProject),
             AppModel.StopFailurePresentation(
                 title: "Couldn’t save the project",
                 detail: "The project was not saved. Review the details and try again."
             )
         )
         XCTAssertEqual(
-            model.stopFailurePresentation(for: .deleteProject, backend: .msplat),
+            model.stopFailurePresentation(for: .deleteProject),
             AppModel.StopFailurePresentation(
                 title: "Couldn’t delete the project",
                 detail: "The project was not deleted because EasySplat could not stop safely. Review the details and try again."
@@ -616,14 +595,14 @@ final class AppModelTests: XCTestCase {
             name: "ResumeCheckpointFailure",
             lastError: nil,
             withOutput: false,
-            stage: .trainBrush
+            stage: .trainSplat
         )
         let started = expectation(description: "resumed training started")
         let model = AppModel(
             toolchainManager: MockToolchainManager(),
             projectBaseURL: tempBase
         ) { _, _ in
-            StopFailingPipelineRunner(started: started, stage: .trainBrush, backend: .msplat)
+            StopFailingPipelineRunner(started: started, stage: .trainSplat)
         }
         let window = NSWindow(
             contentRect: NSRect(x: 0, y: 0, width: 120, height: 80),
@@ -635,7 +614,7 @@ final class AppModelTests: XCTestCase {
 
         model.resumeProject(at: projectURL)
         await fulfillment(of: [started], timeout: 2.0)
-        try await waitForPipelineState(model: model, stage: .trainBrush, backend: .msplat)
+        try await waitForPipelineState(model: model, stage: .trainSplat)
 
         model.cancelCurrentProject(
             deleteProject: false,
@@ -655,29 +634,6 @@ final class AppModelTests: XCTestCase {
         XCTAssertNil(model.pendingCloseWindow)
         XCTAssertFalse(model.allowNextWindowClose)
         XCTAssertEqual(model.currentProjectURL, projectURL)
-    }
-
-    func testBrushTrainingProgressUsesSnapshotStopCopy() {
-        let tempBase = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
-        let model = AppModel(toolchainManager: MockToolchainManager(), projectBaseURL: tempBase) { _, config in
-            MockPipelineRunner(projectURL: tempBase, config: config)
-        }
-        model.currentTask = Task {
-            while !Task.isCancelled {
-                try? await Task.sleep(nanoseconds: 50_000_000)
-            }
-        }
-        defer {
-            model.currentTask?.cancel()
-            model.currentTask = nil
-        }
-
-        model.handle(event: .stageStarted(stage: .trainBrush))
-        model.handle(event: .trainingBackendSelected(backend: .brush))
-        model.cancelCurrentProject(deleteProject: false)
-
-        XCTAssertEqual(model.statusTitle, "Exporting snapshot…")
-        XCTAssertEqual(model.statusDetail, "Exporting the latest snapshot (training restarts from scratch on resume).")
     }
 
     func testAddInputsIgnoresNonVideoAndClearsWarning() {
@@ -1297,13 +1253,13 @@ final class AppModelTests: XCTestCase {
             lastError: nil,
             withOutput: false,
             checkpoint: PipelineCheckpoint(
-                stage: .trainBrush,
+                stage: .trainSplat,
                 updatedAt: Date(),
                 progressFraction: 0.4,
                 message: "heartbeat",
                 details: nil
             ),
-            stage: .trainBrush
+            stage: .trainSplat
         )
 
         let model = AppModel(toolchainManager: MockToolchainManager(), projectBaseURL: base) { _, config in
@@ -1411,13 +1367,13 @@ final class AppModelTests: XCTestCase {
             lastError: nil,
             withOutput: false,
             checkpoint: PipelineCheckpoint(
-                stage: .trainBrush,
+                stage: .trainSplat,
                 updatedAt: Date(),
                 progressFraction: 0.5,
                 message: "heartbeat",
                 details: nil
             ),
-            stage: .trainBrush
+            stage: .trainSplat
         )
 
         let model = AppModel(toolchainManager: MockToolchainManager(), projectBaseURL: base) { _, _ in
@@ -1482,13 +1438,13 @@ final class AppModelTests: XCTestCase {
             lastError: nil,
             withOutput: false,
             checkpoint: PipelineCheckpoint(
-                stage: .trainBrush,
+                stage: .trainSplat,
                 updatedAt: Date(),
                 progressFraction: 0.3,
                 message: "heartbeat",
                 details: nil
             ),
-            stage: .trainBrush
+            stage: .trainSplat
         )
         _ = try makeProject(
             at: base,
@@ -1531,13 +1487,13 @@ final class AppModelTests: XCTestCase {
             lastError: nil,
             withOutput: false,
             checkpoint: PipelineCheckpoint(
-                stage: .trainBrush,
+                stage: .trainSplat,
                 updatedAt: Date(),
                 progressFraction: 0.25,
                 message: "heartbeat",
                 details: nil
             ),
-            stage: .trainBrush,
+            stage: .trainSplat,
             recoveryPromptSuppressed: true
         )
 
@@ -1554,9 +1510,9 @@ final class AppModelTests: XCTestCase {
         var metadata = try ProjectMetadataStore.load(from: metadataURL)
         XCTAssertEqual(metadata.recoveryPromptSuppressed, false)
 
-        metadata.state = PipelineState(stage: .trainBrush, attempt: metadata.state.attempt, lastError: nil, resumeToken: nil)
+        metadata.state = PipelineState(stage: .trainSplat, attempt: metadata.state.attempt, lastError: nil, resumeToken: nil)
         metadata.checkpoint = PipelineCheckpoint(
-            stage: .trainBrush,
+            stage: .trainSplat,
             updatedAt: Date(),
             progressFraction: 0.4,
             message: "heartbeat",
@@ -1582,13 +1538,13 @@ final class AppModelTests: XCTestCase {
             lastError: nil,
             withOutput: false,
             checkpoint: PipelineCheckpoint(
-                stage: .trainBrush,
+                stage: .trainSplat,
                 updatedAt: Date(),
                 progressFraction: 0.3,
                 message: "heartbeat",
                 details: nil
             ),
-            stage: .trainBrush
+            stage: .trainSplat
         )
         _ = try makeProject(
             at: base,
@@ -1700,8 +1656,9 @@ final class AppModelTests: XCTestCase {
         XCTAssertEqual(duplicateIntegrityLines.count, 1, "Indeterminate milestones should not be duplicated.")
     }
 
-    func testShareCurrentSplatRecordsClickedMetricAndEvent() async throws {
+    func testShareUsesOnlyValidatedCurrentProjectPlyAndWritesNoAppEvents() async throws {
         let tempBase = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: tempBase) }
         try FileManager.default.createDirectory(at: tempBase, withIntermediateDirectories: true)
         let input = tempBase.appendingPathComponent("input.mov")
         try Data("video".utf8).write(to: input)
@@ -1714,28 +1671,23 @@ final class AppModelTests: XCTestCase {
         model.startFromPendingSelection()
         try await waitForViewState(model: model, state: .viewer)
 
+        let projectURL = try XCTUnwrap(model.currentProjectURL)
+        let outputURL = try XCTUnwrap(model.outputPlyURL)
+        let items = try XCTUnwrap(model.test_validatedShareItems())
+        XCTAssertEqual(items.count, 1)
+        XCTAssertEqual(try XCTUnwrap(items.first as? URL).standardizedFileURL, outputURL.standardizedFileURL)
+
         model.shareCurrentSplat()
 
-        guard let projectURL = model.currentProjectURL else {
-            XCTFail("Missing project URL")
-            return
-        }
+        let appEventsURL = projectURL.appendingPathComponent("Logs/app_events.jsonl")
+        XCTAssertFalse(FileManager.default.fileExists(atPath: appEventsURL.path))
         let metadata = try ProjectMetadataStore.load(from: ProjectPaths(root: projectURL).metadataURL)
-        XCTAssertEqual(metadata.shareMetrics?.shareClickedCount, 1)
-        XCTAssertEqual(metadata.shareMetrics?.shareCompletedCount, 0)
-        XCTAssertFalse(model.shareStatusIsError)
-        XCTAssertNotNil(model.shareStatusMessage)
-
-        let events = model.test_shareEventsText(projectURL: projectURL)
-        XCTAssertTrue(events.contains("\"event\":\"share_clicked\""))
-        XCTAssertTrue(
-            events.contains("\"event\":\"share_caption_copied\"")
-                || events.contains("\"event\":\"share_sheet_opened\"")
-        )
+        XCTAssertNil(metadata.shareMetrics)
     }
 
     func testShareCurrentSplatReportsMissingOutputFile() async throws {
         let tempBase = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: tempBase) }
         try FileManager.default.createDirectory(at: tempBase, withIntermediateDirectories: true)
         let input = tempBase.appendingPathComponent("input.mov")
         try Data("video".utf8).write(to: input)
@@ -1758,18 +1710,16 @@ final class AppModelTests: XCTestCase {
 
         XCTAssertTrue(model.shareStatusIsError)
         XCTAssertTrue((model.shareStatusMessage ?? "").contains("Could not find"))
-        XCTAssertEqual(model.shareMetrics.shareClickedCount, 0)
-
-        let metadata = try ProjectMetadataStore.load(from: ProjectPaths(root: projectURL).metadataURL)
-        XCTAssertNil(metadata.shareMetrics)
-
-        let events = model.test_shareEventsText(projectURL: projectURL)
-        XCTAssertTrue(events.contains("share_unavailable"))
-        XCTAssertTrue(events.contains("missing_output_file"))
+        XCTAssertFalse(
+            FileManager.default.fileExists(
+                atPath: projectURL.appendingPathComponent("Logs/app_events.jsonl").path
+            )
+        )
     }
 
     func testShareCurrentSplatReportsInvalidOutputDirectoryPath() async throws {
         let tempBase = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: tempBase) }
         try FileManager.default.createDirectory(at: tempBase, withIntermediateDirectories: true)
         let input = tempBase.appendingPathComponent("input.mov")
         try Data("video".utf8).write(to: input)
@@ -1782,7 +1732,7 @@ final class AppModelTests: XCTestCase {
         model.startFromPendingSelection()
         try await waitForViewState(model: model, state: .viewer)
 
-        guard let projectURL = model.currentProjectURL, let output = model.outputPlyURL else {
+        guard let output = model.outputPlyURL else {
             XCTFail("Missing project state")
             return
         }
@@ -1792,11 +1742,6 @@ final class AppModelTests: XCTestCase {
         model.shareCurrentSplat()
 
         XCTAssertTrue(model.shareStatusIsError)
-        XCTAssertEqual(model.shareMetrics.shareClickedCount, 0)
-
-        let events = model.test_shareEventsText(projectURL: projectURL)
-        XCTAssertTrue(events.contains("share_unavailable"))
-        XCTAssertTrue(events.contains("output_is_directory"))
     }
 
     func testShareCurrentSplatRejectsFallbackOutputFromDifferentProject() throws {
@@ -1815,13 +1760,12 @@ final class AppModelTests: XCTestCase {
         model.shareCurrentSplat()
 
         XCTAssertTrue(model.shareStatusIsError)
-        XCTAssertEqual(model.shareMetrics.shareClickedCount, 0)
-        let metadata = try ProjectMetadataStore.load(from: ProjectPaths(root: secondURL).metadataURL)
-        XCTAssertNil(metadata.shareMetrics)
+        XCTAssertNil(model.test_validatedShareItems())
     }
 
     func testShareCurrentSplatIgnoredWhileSessionAlreadyActive() async throws {
         let tempBase = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: tempBase) }
         try FileManager.default.createDirectory(at: tempBase, withIntermediateDirectories: true)
         let input = tempBase.appendingPathComponent("input.mov")
         try Data("video".utf8).write(to: input)
@@ -1834,125 +1778,13 @@ final class AppModelTests: XCTestCase {
         model.startFromPendingSelection()
         try await waitForViewState(model: model, state: .viewer)
 
-        guard let projectURL = model.currentProjectURL else {
-            XCTFail("Missing project URL")
-            return
-        }
-        model.test_activateShareSession(projectURL: projectURL)
+        model.test_activateShareSession()
 
         model.shareCurrentSplat()
 
-        XCTAssertEqual(model.shareStatusMessage, "Finish the current share first.")
+        XCTAssertEqual(model.shareStatusMessage, "Share is already open.")
         XCTAssertFalse(model.shareStatusIsError)
         XCTAssertTrue(model.isShareSheetActive)
-        XCTAssertEqual(model.shareMetrics.shareClickedCount, 0)
-        let events = model.test_shareEventsText(projectURL: projectURL)
-        XCTAssertTrue(events.contains("share_ignored"))
-        XCTAssertTrue(events.contains("active_session"))
-    }
-
-    func testShareCompletionMetricPersistsToProjectMetadata() throws {
-        let base = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
-        try FileManager.default.createDirectory(at: base, withIntermediateDirectories: true)
-        let projectURL = try makeProject(at: base, name: "SharedProject", lastError: nil, withOutput: true)
-
-        let model = AppModel(toolchainManager: MockToolchainManager(), projectBaseURL: base) { _, config in
-            MockPipelineRunner(projectURL: projectURL, config: config)
-        }
-
-        _ = model.test_recordShareClicked(projectURL: projectURL)
-        model.test_recordShareCompleted(projectURL: projectURL, serviceName: "Messages")
-
-        let metadata = try ProjectMetadataStore.load(from: ProjectPaths(root: projectURL).metadataURL)
-        XCTAssertEqual(metadata.shareMetrics?.shareClickedCount, 1)
-        XCTAssertEqual(metadata.shareMetrics?.shareCompletedCount, 1)
-        XCTAssertEqual(metadata.shareMetrics?.lastShareService, "Messages")
-        XCTAssertNotNil(metadata.shareMetrics?.lastSharedAt)
-        XCTAssertEqual(model.shareSummaryText, "Shared once. Last via Messages.")
-
-        let events = model.test_shareEventsText(projectURL: projectURL)
-        XCTAssertTrue(events.contains("share_completed"))
-    }
-
-    func testShareCompletionNormalizesEmptyServiceName() throws {
-        let base = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
-        try FileManager.default.createDirectory(at: base, withIntermediateDirectories: true)
-        let projectURL = try makeProject(at: base, name: "SharedProject2", lastError: nil, withOutput: true)
-
-        let model = AppModel(toolchainManager: MockToolchainManager(), projectBaseURL: base) { _, config in
-            MockPipelineRunner(projectURL: projectURL, config: config)
-        }
-
-        _ = model.test_recordShareClicked(projectURL: projectURL)
-        model.test_recordShareCompleted(projectURL: projectURL, serviceName: "   ")
-
-        let metadata = try ProjectMetadataStore.load(from: ProjectPaths(root: projectURL).metadataURL)
-        XCTAssertEqual(metadata.shareMetrics?.lastShareService, "Share Service")
-        XCTAssertEqual(model.shareSummaryText, "Shared once. Last via Share Service.")
-    }
-
-    func testShareCompletionIgnoredForInactiveSession() throws {
-        let base = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
-        try FileManager.default.createDirectory(at: base, withIntermediateDirectories: true)
-        let projectURL = try makeProject(at: base, name: "SharedProject3", lastError: nil, withOutput: true)
-
-        let model = AppModel(toolchainManager: MockToolchainManager(), projectBaseURL: base) { _, config in
-            MockPipelineRunner(projectURL: projectURL, config: config)
-        }
-
-        model.test_recordShareCompletedFromInactiveSession(projectURL: projectURL, serviceName: "Messages")
-
-        let metadata = try ProjectMetadataStore.load(from: ProjectPaths(root: projectURL).metadataURL)
-        XCTAssertNil(metadata.shareMetrics)
-        XCTAssertEqual(model.shareMetrics.shareCompletedCount, 0)
-    }
-
-    func testTrainingConsentRememberedSkipsPrompt() async {
-        let tempBase = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
-        let model = AppModel(toolchainManager: MockToolchainManager(), projectBaseURL: tempBase) { _, config in
-            MockPipelineRunner(projectURL: tempBase, config: config)
-        }
-        UserDefaults.standard.set(true, forKey: AppModel.trainingConsentRememberedKey)
-        defer { UserDefaults.standard.removeObject(forKey: AppModel.trainingConsentRememberedKey) }
-
-        let allowed = await model.awaitTrainingConsent()
-        XCTAssertTrue(allowed)
-        XCTAssertFalse(model.isShowingTrainingConsent)
-    }
-
-    func testTrainingConsentShowsAndResolves() async {
-        let tempBase = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
-        let model = AppModel(toolchainManager: MockToolchainManager(), projectBaseURL: tempBase) { _, config in
-            MockPipelineRunner(projectURL: tempBase, config: config)
-        }
-        UserDefaults.standard.removeObject(forKey: AppModel.trainingConsentRememberedKey)
-
-        let task = Task { await model.awaitTrainingConsent() }
-        await Task.yield()
-
-        XCTAssertTrue(model.isShowingTrainingConsent)
-        model.resolveTrainingConsent(accepted: true, remember: false)
-        let allowed = await task.value
-        XCTAssertTrue(allowed)
-    }
-
-    func testTrainingConsentCancellationReturnsFalse() async {
-        let tempBase = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
-        let model = AppModel(toolchainManager: MockToolchainManager(), projectBaseURL: tempBase) { _, config in
-            MockPipelineRunner(projectURL: tempBase, config: config)
-        }
-        UserDefaults.standard.removeObject(forKey: AppModel.trainingConsentRememberedKey)
-
-        let task = Task { await model.awaitTrainingConsent() }
-        await Task.yield()
-
-        XCTAssertTrue(model.isShowingTrainingConsent)
-        task.cancel()
-        await Task.yield()
-
-        let allowed = await task.value
-        XCTAssertFalse(allowed)
-        XCTAssertFalse(model.isShowingTrainingConsent)
     }
 
     func testErrorStageLogsBypassThrottle() async throws {
@@ -2025,17 +1857,16 @@ final class AppModelTests: XCTestCase {
     private func waitForPipelineState(
         model: AppModel,
         stage: PipelineStage,
-        backend: TrainingBackend?,
         timeout: TimeInterval = 2.0
     ) async throws {
         let deadline = Date().addingTimeInterval(timeout)
         while Date() < deadline {
-            if model.stage == stage, model.activeTrainingBackend == backend {
+            if model.stage == stage {
                 return
             }
             try await Task.sleep(nanoseconds: 50_000_000)
         }
-        XCTFail("Timed out waiting for stage \(stage) and backend \(String(describing: backend))")
+        XCTFail("Timed out waiting for stage \(stage)")
     }
 
     private func makeProject(
@@ -2144,6 +1975,23 @@ private func restoreAppEnvironment(_ previous: [String: String?]) {
     }
 }
 
+private func makeMockToolchainPaths() -> ToolchainPaths {
+    let da3Root = URL(fileURLWithPath: "/mock/da3")
+    return ToolchainPaths(
+        root: URL(fileURLWithPath: "/tmp/toolchain"),
+        colmap: URL(fileURLWithPath: "/mock/colmap"),
+        msplat: URL(fileURLWithPath: "/mock/easysplat-train"),
+        da3: Da3Toolchain(
+            root: da3Root,
+            sfmTool: da3Root.appendingPathComponent("bin/easysplat_da3_sfm"),
+            python: da3Root.appendingPathComponent("python/bin/python3"),
+            models: da3Root.appendingPathComponent("models"),
+            modelBundle: da3Root.appendingPathComponent("models/da3-base.safetensors"),
+            fallbackModelBundle: da3Root.appendingPathComponent("models/da3-small.safetensors")
+        )
+    )
+}
+
 final class MockToolchainManager: ToolchainManaging {
     func ensureToolchain(
         manifestURL: URL,
@@ -2151,26 +1999,7 @@ final class MockToolchainManager: ToolchainManaging {
         targetName: String,
         onProgress: @escaping @Sendable (Double, String) -> Void
     ) async throws -> ToolchainPaths {
-        let vggt = VggtToolchain(
-            root: URL(fileURLWithPath: "/mock/vggt_mps"),
-            sfmTool: URL(fileURLWithPath: "/mock/vggt_mps/bin/easysplat_vggt_sfm"),
-            python: URL(fileURLWithPath: "/mock/vggt_mps/python/bin/python3"),
-            models: URL(fileURLWithPath: "/mock/vggt_mps/models")
-        )
-        let fastvggt = FastVggtToolchain(
-            root: URL(fileURLWithPath: "/mock/fastvggt_mps"),
-            sfmTool: URL(fileURLWithPath: "/mock/fastvggt_mps/bin/easysplat_fastvggt_sfm"),
-            python: URL(fileURLWithPath: "/mock/fastvggt_mps/python/bin/python3"),
-            models: URL(fileURLWithPath: "/mock/fastvggt_mps/models")
-        )
-        return ToolchainPaths(
-            root: URL(fileURLWithPath: "/tmp/toolchain"),
-            colmap: URL(fileURLWithPath: "/mock/colmap"),
-            glomap: URL(fileURLWithPath: "/mock/glomap"),
-            brush: URL(fileURLWithPath: "/mock/brush"),
-            vggt: vggt,
-            fastvggt: fastvggt
-        )
+        makeMockToolchainPaths()
     }
 }
 
@@ -2228,39 +2057,16 @@ final class DelayedProgressToolchainManager: @unchecked Sendable, ToolchainManag
         let pending = continuations
         continuations = []
         lock.unlock()
-        let toolchain = mockToolchainPaths()
+        let toolchain = makeMockToolchainPaths()
         for continuation in pending {
             continuation.resume(returning: toolchain)
         }
-    }
-
-    private func mockToolchainPaths() -> ToolchainPaths {
-        let vggt = VggtToolchain(
-            root: URL(fileURLWithPath: "/mock/vggt_mps"),
-            sfmTool: URL(fileURLWithPath: "/mock/vggt_mps/bin/easysplat_vggt_sfm"),
-            python: URL(fileURLWithPath: "/mock/vggt_mps/python/bin/python3"),
-            models: URL(fileURLWithPath: "/mock/vggt_mps/models")
-        )
-        let fastvggt = FastVggtToolchain(
-            root: URL(fileURLWithPath: "/mock/fastvggt_mps"),
-            sfmTool: URL(fileURLWithPath: "/mock/fastvggt_mps/bin/easysplat_fastvggt_sfm"),
-            python: URL(fileURLWithPath: "/mock/fastvggt_mps/python/bin/python3"),
-            models: URL(fileURLWithPath: "/mock/fastvggt_mps/models")
-        )
-        return ToolchainPaths(
-            root: URL(fileURLWithPath: "/tmp/toolchain"),
-            colmap: URL(fileURLWithPath: "/mock/colmap"),
-            glomap: URL(fileURLWithPath: "/mock/glomap"),
-            brush: URL(fileURLWithPath: "/mock/brush"),
-            vggt: vggt,
-            fastvggt: fastvggt
-        )
     }
 }
 
 final class BlockingPipelineRunner: PipelineRunning {
     func run(resumeFrom lastCompletedStage: PipelineStage?, events: @escaping @Sendable (PipelineEvent) -> Void) async throws {
-        events(.stageStarted(stage: .trainBrush))
+        events(.stageStarted(stage: .trainSplat))
         while true {
             try Task.checkCancellation()
             try await Task.sleep(nanoseconds: 50_000_000)
@@ -2271,12 +2077,10 @@ final class BlockingPipelineRunner: PipelineRunning {
 final class StopFailingPipelineRunner: PipelineRunning {
     private let started: XCTestExpectation
     private let stage: PipelineStage
-    private let backend: TrainingBackend?
 
-    init(started: XCTestExpectation, stage: PipelineStage, backend: TrainingBackend?) {
+    init(started: XCTestExpectation, stage: PipelineStage) {
         self.started = started
         self.stage = stage
-        self.backend = backend
     }
 
     func run(
@@ -2284,9 +2088,6 @@ final class StopFailingPipelineRunner: PipelineRunning {
         events: @escaping @Sendable (PipelineEvent) -> Void
     ) async throws {
         events(.stageStarted(stage: stage))
-        if let backend {
-            events(.trainingBackendSelected(backend: backend))
-        }
         started.fulfill()
         do {
             try await Task.sleep(nanoseconds: 60_000_000_000)
@@ -2325,7 +2126,7 @@ final class DelayedCancellationPipelineRunner: @unchecked Sendable, PipelineRunn
     }
 
     func run(resumeFrom lastCompletedStage: PipelineStage?, events: @escaping @Sendable (PipelineEvent) -> Void) async throws {
-        events(.stageStarted(stage: .trainBrush))
+        events(.stageStarted(stage: .trainSplat))
         await withTaskCancellationHandler {
             await withCheckedContinuation { continuation in
                 let shouldResume: Bool

@@ -40,7 +40,7 @@ final class ToolchainManifestTests: XCTestCase {
             publishedAt: Date(),
             artifacts: [
                 .init(name: "macos-arm64-core", url: "https://example.com/core.zip", sha256: "abc", sizeBytes: 123, contents: ["bin/colmap"]),
-                .init(name: "macos-arm64-models", url: "https://example.com/models.zip", sha256: "def", sizeBytes: 456, contents: ["vggt_mps/models/vggt_model.pt"]),
+                .init(name: "macos-arm64-models", url: "https://example.com/models.zip", sha256: "def", sizeBytes: 456, contents: ["da3_mps/models/DA3-BASE/model.safetensors"]),
             ],
             signatureEd25519: ""
         )

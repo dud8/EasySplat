@@ -73,7 +73,7 @@ final class ProjectListFilterSortTests: XCTestCase {
             title: "Long",
             stageTimings: [
                 .init(stage: .sfmFeatures, startedAt: Date(timeIntervalSince1970: 0), durationSeconds: 60),
-                .init(stage: .trainBrush, startedAt: Date(timeIntervalSince1970: 100), durationSeconds: 300)
+                .init(stage: .trainSplat, startedAt: Date(timeIntervalSince1970: 100), durationSeconds: 300)
             ]
         )
         let untimed = makeSummary(title: "Untimed")

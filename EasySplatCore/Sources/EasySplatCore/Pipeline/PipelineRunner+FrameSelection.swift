@@ -60,7 +60,7 @@ extension PipelineRunner {
     }
 
     // Legacy support: earlier versions copied HEIC photos into Selected/ directly, but downstream tools
-    // (COLMAP/VGGT) expect JPEG/PNG. Transcode in-place so resumed projects still work.
+    // The geometry tools expect JPEG/PNG. Transcode in-place so resumed projects still work.
     func normalizeSelectedImagesForTooling(paths: ProjectPaths) throws -> Int {
         let fm = FileManager.default
         guard fm.fileExists(atPath: paths.framesSelectedURL.path) else { return 0 }

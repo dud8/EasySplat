@@ -90,11 +90,7 @@ extension ProjectMetadata {
     }
 }
 
-/// Persisted snapshot of the AutoTuner's decisions for a run, plus the host
-/// hardware profile the tuner derived them from. Lets the viewer / diagnostic
-/// bundle surface "this run targeted 8 anchors, 100k VGGT points, 6 threads,
-/// COLMAP image cap 1200px" so users and bug reports can see exactly what the
-/// app picked for them.
+/// Legacy AutoTuner snapshot retained only to decode older project metadata.
 public struct AutoTuneSnapshot: Codable, Sendable, Equatable {
     public var tier: String
     public var memoryGB: Double
@@ -275,7 +271,7 @@ extension ReconstructionSummary {
     }
 }
 
-/// Aggregated share interaction counters stored alongside a project.
+/// Legacy share counters retained only to decode older project metadata.
 public struct ShareMetrics: Codable, Sendable, Equatable {
     public var shareClickedCount: Int
     public var shareCompletedCount: Int
@@ -325,8 +321,83 @@ public enum PipelineCheckpointDetails: Codable, Sendable {
     case sfmFeatures(SfmFeaturesCheckpoint)
     case sfmMatching(SfmMatchingCheckpoint)
     case sfmMapping(SfmMappingCheckpoint)
-    case trainBrush(TrainBrushCheckpoint)
+    case trainSplat(TrainSplatCheckpoint)
     case exportSplat(ExportSplatCheckpoint)
+
+    private enum CaseKey: String, CodingKey {
+        case extractFrames
+        case selectFrames
+        case sfmFeatures
+        case sfmMatching
+        case sfmMapping
+        case trainSplat
+        case trainBrush
+        case exportSplat
+    }
+
+    private enum ValueKey: String, CodingKey {
+        case value = "_0"
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CaseKey.self)
+        guard container.allKeys.count == 1, let key = container.allKeys.first else {
+            throw DecodingError.dataCorrupted(.init(
+                codingPath: decoder.codingPath,
+                debugDescription: "Pipeline checkpoint details must contain exactly one known stage."
+            ))
+        }
+
+        func decode<Value: Decodable>(_ type: Value.Type, for key: CaseKey) throws -> Value {
+            let value = try container.nestedContainer(keyedBy: ValueKey.self, forKey: key)
+            return try value.decode(Value.self, forKey: .value)
+        }
+
+        switch key {
+        case .extractFrames:
+            self = .extractFrames(try decode(ExtractFramesCheckpoint.self, for: key))
+        case .selectFrames:
+            self = .selectFrames(try decode(SelectFramesCheckpoint.self, for: key))
+        case .sfmFeatures:
+            self = .sfmFeatures(try decode(SfmFeaturesCheckpoint.self, for: key))
+        case .sfmMatching:
+            self = .sfmMatching(try decode(SfmMatchingCheckpoint.self, for: key))
+        case .sfmMapping:
+            self = .sfmMapping(try decode(SfmMappingCheckpoint.self, for: key))
+        case .trainSplat, .trainBrush:
+            self = .trainSplat(try decode(TrainSplatCheckpoint.self, for: key))
+        case .exportSplat:
+            self = .exportSplat(try decode(ExportSplatCheckpoint.self, for: key))
+        }
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CaseKey.self)
+
+        switch self {
+        case .extractFrames(let details):
+            var value = container.nestedContainer(keyedBy: ValueKey.self, forKey: .extractFrames)
+            try value.encode(details, forKey: .value)
+        case .selectFrames(let details):
+            var value = container.nestedContainer(keyedBy: ValueKey.self, forKey: .selectFrames)
+            try value.encode(details, forKey: .value)
+        case .sfmFeatures(let details):
+            var value = container.nestedContainer(keyedBy: ValueKey.self, forKey: .sfmFeatures)
+            try value.encode(details, forKey: .value)
+        case .sfmMatching(let details):
+            var value = container.nestedContainer(keyedBy: ValueKey.self, forKey: .sfmMatching)
+            try value.encode(details, forKey: .value)
+        case .sfmMapping(let details):
+            var value = container.nestedContainer(keyedBy: ValueKey.self, forKey: .sfmMapping)
+            try value.encode(details, forKey: .value)
+        case .trainSplat(let details):
+            var value = container.nestedContainer(keyedBy: ValueKey.self, forKey: .trainSplat)
+            try value.encode(details, forKey: .value)
+        case .exportSplat(let details):
+            var value = container.nestedContainer(keyedBy: ValueKey.self, forKey: .exportSplat)
+            try value.encode(details, forKey: .value)
+        }
+    }
 }
 
 /// Checkpoint details for extracted video frames.
@@ -394,8 +465,8 @@ public struct SfmMappingCheckpoint: Codable, Sendable {
     }
 }
 
-/// Checkpoint details for Brush training progress and snapshot state.
-public struct TrainBrushCheckpoint: Codable, Sendable {
+/// Checkpoint details for training progress. Legacy Brush fields remain decode-compatible.
+public struct TrainSplatCheckpoint: Codable, Sendable {
     public var latestExportStep: Int?
     public var latestExportPath: String?
     public var progressStep: Int?
@@ -403,6 +474,16 @@ public struct TrainBrushCheckpoint: Codable, Sendable {
     public var stepsPerSecond: Double?
     public var resumeSnapshotPath: String?
     public var trainingBackend: TrainingBackend?
+
+    private enum CodingKeys: String, CodingKey {
+        case latestExportStep
+        case latestExportPath
+        case progressStep
+        case progressTotal
+        case stepsPerSecond
+        case resumeSnapshotPath
+        case trainingBackend
+    }
 
     public init(
         latestExportStep: Int?,
@@ -420,6 +501,33 @@ public struct TrainBrushCheckpoint: Codable, Sendable {
         self.stepsPerSecond = stepsPerSecond
         self.resumeSnapshotPath = resumeSnapshotPath
         self.trainingBackend = trainingBackend
+    }
+
+    public init(progressStep: Int? = nil, progressTotal: Int? = nil) {
+        latestExportStep = nil
+        latestExportPath = nil
+        self.progressStep = progressStep
+        self.progressTotal = progressTotal
+        stepsPerSecond = nil
+        resumeSnapshotPath = nil
+        trainingBackend = nil
+    }
+
+    public init(from decoder: Decoder) throws {
+        let values = try decoder.container(keyedBy: CodingKeys.self)
+        latestExportStep = try values.decodeIfPresent(Int.self, forKey: .latestExportStep)
+        latestExportPath = try values.decodeIfPresent(String.self, forKey: .latestExportPath)
+        progressStep = try values.decodeIfPresent(Int.self, forKey: .progressStep)
+        progressTotal = try values.decodeIfPresent(Int.self, forKey: .progressTotal)
+        stepsPerSecond = try values.decodeIfPresent(Double.self, forKey: .stepsPerSecond)
+        resumeSnapshotPath = try values.decodeIfPresent(String.self, forKey: .resumeSnapshotPath)
+        trainingBackend = try values.decodeIfPresent(TrainingBackend.self, forKey: .trainingBackend)
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        var values = encoder.container(keyedBy: CodingKeys.self)
+        try values.encodeIfPresent(progressStep, forKey: .progressStep)
+        try values.encodeIfPresent(progressTotal, forKey: .progressTotal)
     }
 }
 

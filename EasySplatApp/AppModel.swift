@@ -41,11 +41,7 @@ final class AppModel: ObservableObject {
     @Published var currentInput: InputSpec? = nil
     @Published var currentProjectNotes: String = ""
     @Published var currentProjectURL: URL? = nil
-    @Published var toolchainPaths: ToolchainPaths? = nil
     @Published var stopAction: StopAction? = nil
-    @Published var isShowingTrainingConsent: Bool = false
-    @Published var isLivePreviewEnabled: Bool = false
-    @Published var activeTrainingBackend: TrainingBackend? = nil
 
     @Published var cachedFreeDiskBytes: Int64? = nil
     @Published var captureMode: CaptureMode = AppModel.persistedCaptureMode() {
@@ -61,7 +57,6 @@ final class AppModel: ObservableObject {
     @Published var recoveryPromptProject: ProjectSummary? = nil
     @Published var shareStatusMessage: String? = nil
     @Published var shareStatusIsError: Bool = false
-    @Published var shareMetrics: ShareMetrics = .init()
     @Published var isShareSheetActive: Bool = false
 
     let toolchainManager: ToolchainManaging
@@ -90,23 +85,17 @@ final class AppModel: ObservableObject {
     /// (mtime alone has only second-level precision on some filesystems,
     /// so two writes inside the same second would falsely cache-hit).
     var pipelineErrorCountCache: [URL: (mtime: Date, size: Int64, count: Int)] = [:]
-    var trainingConsentContinuation: CheckedContinuation<Bool, Never>?
-    var trainingConsentPauseStartedAt: Date?
-    var trainingConsentPausedDuration: TimeInterval = 0
     var exitIntent: ExitIntent = .none
     weak var pendingCloseWindow: NSWindow?
     var allowNextWindowClose = false
     var replyToTerminationRequest: (Bool) -> Void = { shouldTerminate in
         NSApp.reply(toApplicationShouldTerminate: shouldTerminate)
     }
-    var pendingSnapshotRevealURL: URL?
-    var pendingSnapshotRevealRequiresExit: Bool = false
     var forcedExitTask: Task<Void, Never>?
     var activeShareSession: ShareSession?
     var ignoredRecoveryProjectIDs: Set<UUID> = []
     static let forcedExitTimeoutNanoseconds: UInt64 = 25_000_000_000
 
-    nonisolated static let trainingConsentRememberedKey = "EasySplatTrainingConsentRemembered"
     nonisolated static let captureModeUserDefaultsKey = "EasySplatCaptureMode"
     nonisolated static let qualityPresetUserDefaultsKey = "EasySplatQualityPreset"
 
@@ -147,61 +136,26 @@ final class AppModel: ObservableObject {
     }
 
     var isTrainingStageActive: Bool {
-        stage == .trainBrush
+        stage == .trainSplat
     }
 
-    var isBrushSnapshotTrainingActive: Bool {
-        isTrainingStageActive && activeTrainingBackend == .brush
-    }
-
-    var isMsplatTrainingActive: Bool {
-        isTrainingStageActive && activeTrainingBackend == .msplat
-    }
-
-    func stopFailurePresentation(
-        for action: StopAction,
-        backend: TrainingBackend?
-    ) -> StopFailurePresentation {
+    func stopFailurePresentation(for action: StopAction) -> StopFailurePresentation {
         if action == .deleteProject {
             return StopFailurePresentation(
                 title: "Couldn’t delete the project",
                 detail: "The project was not deleted because EasySplat could not stop safely. Review the details and try again."
             )
         }
-        switch backend {
-        case .brush:
-            return StopFailurePresentation(
-                title: "Couldn’t export the snapshot",
-                detail: "The latest training snapshot was not exported. Review the details and try again."
-            )
-        case .msplat:
+        if isTrainingStageActive {
             return StopFailurePresentation(
                 title: "Couldn’t save the project",
                 detail: "The training checkpoint was not saved. Review the details and try again."
             )
-        case nil:
-            return StopFailurePresentation(
-                title: "Couldn’t save the project",
-                detail: "The project was not saved. Review the details and try again."
-            )
         }
-    }
-
-    var trainingSnapshotURL: URL? {
-        guard let currentProjectURL else { return nil }
-        return ProjectPaths(root: currentProjectURL)
-            .trainingURL
-            .appendingPathComponent("latest_snapshot.ply")
-    }
-
-    var shareSummaryText: String? {
-        let completed = shareMetrics.shareCompletedCount
-        guard completed > 0 else { return nil }
-        let prefix = completed == 1 ? "Shared once." : "Shared \(completed) times."
-        if let service = shareMetrics.lastShareService, !service.isEmpty {
-            return "\(prefix) Last via \(service)."
-        }
-        return prefix
+        return StopFailurePresentation(
+            title: "Couldn’t save the project",
+            detail: "The project was not saved. Review the details and try again."
+        )
     }
 
     var processingDetailsText: String? {

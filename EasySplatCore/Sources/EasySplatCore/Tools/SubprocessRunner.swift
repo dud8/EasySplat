@@ -24,28 +24,6 @@ public protocol SubprocessRunning: Sendable {
     ) async throws -> SubprocessResult
 }
 
-/// Subprocess runner that can allocate a pseudo-terminal for CLI tools that require one.
-public protocol PseudoTTYCapableSubprocessRunning: SubprocessRunning {
-    func runAsyncPseudoTTY(
-        _ launchPath: String,
-        _ arguments: [String],
-        currentDirectory: URL?,
-        environment: [String: String],
-        onStdout: @escaping @Sendable (String) -> Void,
-        onStderr: @escaping @Sendable (String) -> Void
-    ) async throws -> SubprocessResult
-}
-
-struct PseudoTTYFailure: Error, LocalizedError, Sendable {
-    let function: String
-    let errnoCode: Int32
-
-    var errorDescription: String? {
-        let message = String(cString: strerror(errnoCode))
-        return "Pseudo-tty setup failed in \(function): \(message) (\(errnoCode))"
-    }
-}
-
 public extension SubprocessRunning {
     func run(
         _ launchPath: String,
@@ -75,7 +53,7 @@ public struct SubprocessResult: Sendable {
 }
 
 /// Default Foundation-based subprocess runner used throughout EasySplatCore.
-public final class SubprocessRunner: @unchecked Sendable, SubprocessRunning, PseudoTTYCapableSubprocessRunning {
+public final class SubprocessRunner: @unchecked Sendable, SubprocessRunning {
     public init() {}
 
     private static func mergedEnvironment(with overrides: [String: String]) -> [String: String] {
@@ -236,148 +214,10 @@ public final class SubprocessRunner: @unchecked Sendable, SubprocessRunning, Pse
 
         return result
     }
-
-    public func runAsyncPseudoTTY(
-        _ launchPath: String,
-        _ arguments: [String],
-        currentDirectory: URL? = nil,
-        environment: [String: String] = [:],
-        onStdout: @escaping @Sendable (String) -> Void = { _ in },
-        onStderr: @escaping @Sendable (String) -> Void = { _ in }
-    ) async throws -> SubprocessResult {
-        #if canImport(Darwin)
-        let process = Process()
-        process.executableURL = URL(fileURLWithPath: launchPath)
-        process.arguments = arguments
-        if let currentDirectory {
-            process.currentDirectoryURL = currentDirectory
-        }
-        if !environment.isEmpty {
-            process.environment = Self.mergedEnvironment(with: environment)
-        }
-
-        let stdoutTTY = try PseudoTTYPair.open()
-        let stderrTTY = try PseudoTTYPair.open()
-        process.standardOutput = stdoutTTY.slaveHandle
-        process.standardError = stderrTTY.slaveHandle
-
-        let stdoutCollector = SubprocessStreamCollector(onLine: onStdout)
-        let stderrCollector = SubprocessStreamCollector(onLine: onStderr)
-
-        stdoutTTY.masterHandle.readabilityHandler = { handle in
-            stdoutCollector.appendAvailableData(from: handle)
-        }
-
-        stderrTTY.masterHandle.readabilityHandler = { handle in
-            stderrCollector.appendAvailableData(from: handle)
-        }
-
-        let completion = SubprocessAsyncCompletion()
-        process.terminationHandler = { proc in
-            stdoutTTY.masterHandle.readabilityHandler = nil
-            stderrTTY.masterHandle.readabilityHandler = nil
-
-            stdoutCollector.drainAndFinish {
-                Self.drainAvailablePseudoTTYData(from: stdoutTTY.masterHandle)
-            }
-            stderrCollector.drainAndFinish {
-                Self.drainAvailablePseudoTTYData(from: stderrTTY.masterHandle)
-            }
-
-            stdoutTTY.masterHandle.closeFile()
-            stderrTTY.masterHandle.closeFile()
-
-            completion.finish(.success(SubprocessResult(
-                exitCode: proc.terminationStatus,
-                terminationReason: proc.terminationReason,
-                stdout: stdoutCollector.value(),
-                stderr: stderrCollector.value()
-            )))
-        }
-
-        do {
-            try process.run()
-        } catch {
-            stdoutTTY.masterHandle.readabilityHandler = nil
-            stderrTTY.masterHandle.readabilityHandler = nil
-            stdoutTTY.masterHandle.closeFile()
-            stderrTTY.masterHandle.closeFile()
-            stdoutTTY.slaveHandle.closeFile()
-            stderrTTY.slaveHandle.closeFile()
-            completion.finish(.failure(error))
-            throw error
-        }
-        stdoutTTY.slaveHandle.closeFile()
-        stderrTTY.slaveHandle.closeFile()
-
-        let result = try await withTaskCancellationHandler(operation: {
-            try await completion.wait()
-        }, onCancel: {
-            if process.isRunning {
-                Self.requestGracefulTermination(process)
-            }
-        })
-
-        if Task.isCancelled {
-            throw CancellationError()
-        }
-
-        return result
-        #else
-        return try await runAsync(
-            launchPath,
-            arguments,
-            currentDirectory: currentDirectory,
-            environment: environment,
-            onStdout: onStdout,
-            onStderr: onStderr
-        )
-        #endif
-    }
 }
 
 #if canImport(Darwin)
 private extension SubprocessRunner {
-    static func drainAvailablePseudoTTYData(from handle: FileHandle) -> Data {
-        let fd = handle.fileDescriptor
-        let flags = fcntl(fd, F_GETFL)
-        let didSetNonblocking = flags >= 0 && fcntl(fd, F_SETFL, flags | O_NONBLOCK) == 0
-        defer {
-            if didSetNonblocking {
-                _ = fcntl(fd, F_SETFL, flags)
-            }
-        }
-
-        var output = Data()
-        var buffer = [UInt8](repeating: 0, count: 16 * 1024)
-        let deadline = Date().addingTimeInterval(0.1)
-        while true {
-            let count = buffer.withUnsafeMutableBytes { pointer in
-                read(fd, pointer.baseAddress, pointer.count)
-            }
-            if count > 0 {
-                output.append(contentsOf: buffer.prefix(count))
-                continue
-            }
-            if count == 0 {
-                break
-            }
-            if errno == EINTR {
-                continue
-            }
-            if errno == EAGAIN || errno == EWOULDBLOCK {
-                guard Date() < deadline else { break }
-                usleep(1_000)
-                continue
-            }
-            if errno == EIO {
-                break
-            }
-            break
-        }
-        return output
-    }
-
     static func requestGracefulTermination(_ process: Process) {
         guard process.isRunning else { return }
         let pid = process.processIdentifier
@@ -408,22 +248,6 @@ private extension SubprocessRunner {
             escalation.cancel()
             previousHandler?(proc)
         }
-    }
-}
-
-private struct PseudoTTYPair {
-    let masterHandle: FileHandle
-    let slaveHandle: FileHandle
-
-    static func open() throws -> PseudoTTYPair {
-        var master: Int32 = -1
-        var slave: Int32 = -1
-        if openpty(&master, &slave, nil, nil, nil) != 0 {
-            throw PseudoTTYFailure(function: "openpty", errnoCode: errno)
-        }
-        let masterHandle = FileHandle(fileDescriptor: master, closeOnDealloc: true)
-        let slaveHandle = FileHandle(fileDescriptor: slave, closeOnDealloc: true)
-        return PseudoTTYPair(masterHandle: masterHandle, slaveHandle: slaveHandle)
     }
 }
 #endif

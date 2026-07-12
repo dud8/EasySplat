@@ -156,23 +156,6 @@ final class SubprocessRunnerAsyncTests: XCTestCase {
         XCTAssertTrue(result.stdout.contains("custom=child"))
     }
 
-    func testRunAsyncPseudoTTYHandlesInstantExit() async throws {
-        let root = try TestFileBuilder.makeTempDir()
-        defer { try? FileManager.default.removeItem(at: root) }
-        let scriptURL = root.appendingPathComponent("instant-pty.sh")
-        try TestFileBuilder.createExecutable(
-            at: scriptURL,
-            script: "#!/usr/bin/env bash\nprintf pty-stdout\nprintf pty-stderr >&2\n"
-        )
-        let runner = SubprocessRunner()
-
-        let result = try await runner.runAsyncPseudoTTY(scriptURL.path, [])
-
-        XCTAssertEqual(result.exitCode, 0)
-        XCTAssertEqual(result.stdout, "pty-stdout")
-        XCTAssertEqual(result.stderr, "pty-stderr")
-    }
-
     func testRunAsyncBoundsCapturedOutputButStreamsAllLines() async throws {
         let root = try TestFileBuilder.makeTempDir()
         defer { try? FileManager.default.removeItem(at: root) }

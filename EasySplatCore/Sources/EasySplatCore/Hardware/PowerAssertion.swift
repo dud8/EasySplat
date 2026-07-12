@@ -2,7 +2,7 @@ import Foundation
 
 /// Prevents the Mac from going to sleep during a long operation.
 ///
-/// EasySplat runs are routinely multi-hour (SfM matching plus Brush training), and a
+/// EasySplat runs can be lengthy (geometry plus native splat training), and a
 /// foreground SwiftUI app does not by itself keep the system awake. Without an assertion,
 /// macOS idle sleep can kill a run partway through — training in particular has no
 /// resumable optimizer checkpoint, so a sleep-kill loses the whole session.

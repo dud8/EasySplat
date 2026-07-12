@@ -13,17 +13,6 @@ extension AppModel {
             self.pendingCloseWindow = window
         }
 
-        if !deleteProject,
-           exitIntent != .none,
-           isBrushSnapshotTrainingActive,
-           let projectURL = currentProjectURL {
-            let snapshotURL = ProjectPaths(root: projectURL)
-                .trainingURL
-                .appendingPathComponent("latest_snapshot.ply")
-            pendingSnapshotRevealURL = snapshotURL
-            pendingSnapshotRevealRequiresExit = true
-        }
-
         guard currentTask != nil else {
             let projectURL = currentProjectURL
             if !deleteProject, let projectURL {
@@ -46,15 +35,9 @@ extension AppModel {
         if deleteProject {
             statusTitle = "Stopping and deleting…"
             statusDetail = "Stopping at the next safe point (up to 15 seconds)…"
-        } else if isBrushSnapshotTrainingActive {
-            statusTitle = "Exporting snapshot…"
-            statusDetail = "Exporting the latest snapshot (training restarts from scratch on resume)."
-        } else if isMsplatTrainingActive {
+        } else if isTrainingStageActive {
             statusTitle = "Saving training checkpoint…"
             statusDetail = "Saving and validating the latest training checkpoint. Recent iterations may repeat on resume."
-        } else if isTrainingStageActive {
-            statusTitle = "Saving project…"
-            statusDetail = "Stopping training at the next safe point. Resume behavior depends on the saved training state."
         } else {
             statusTitle = "Saving progress…"
             statusDetail = "Stopping at the next safe point (up to 15 seconds)…"
@@ -64,73 +47,22 @@ extension AppModel {
         scheduleForcedExitIfNeeded()
     }
 
-    func awaitTrainingConsent() async -> Bool {
-        if UserDefaults.standard.bool(forKey: Self.trainingConsentRememberedKey) {
-            return true
-        }
-        if trainingConsentContinuation != nil || Task.isCancelled {
-            return false
-        }
-        return await withTaskCancellationHandler(operation: {
-            await withCheckedContinuation { continuation in
-                if Task.isCancelled {
-                    continuation.resume(returning: false)
-                    return
-                }
-                trainingConsentContinuation = continuation
-                isShowingTrainingConsent = true
-                if stage == .trainBrush, trainingConsentPauseStartedAt == nil {
-                    trainingConsentPauseStartedAt = Date()
-                }
-            }
-        }, onCancel: { [weak self] in
-            guard let self else { return }
-            Task { @MainActor in
-                self.resolveTrainingConsent(accepted: false, remember: false)
-            }
-        })
-    }
-
-    func resolveTrainingConsent(accepted: Bool, remember: Bool) {
-        guard let continuation = trainingConsentContinuation else { return }
-        trainingConsentContinuation = nil
-        isShowingTrainingConsent = false
-        if let pauseStartedAt = trainingConsentPauseStartedAt {
-            trainingConsentPausedDuration += Date().timeIntervalSince(pauseStartedAt)
-            trainingConsentPauseStartedAt = nil
-        }
-        if remember && accepted {
-            UserDefaults.standard.set(true, forKey: Self.trainingConsentRememberedKey)
-        }
-        continuation.resume(returning: accepted)
-    }
-
     func elapsedSinceStageStart(now: Date) -> TimeInterval? {
         guard let startedAt = stageStartedAt else { return nil }
-        var pausedDuration = trainingConsentPausedDuration
-        if let pauseStartedAt = trainingConsentPauseStartedAt {
-            pausedDuration += now.timeIntervalSince(pauseStartedAt)
-        }
-        let elapsed = now.timeIntervalSince(startedAt) - pausedDuration
-        return max(0, elapsed)
+        return max(0, now.timeIntervalSince(startedAt))
     }
 
     func presentExitConfirmation() -> ExitDecision {
         let isTraining = isTrainingStageActive
-        let canExportSnapshot = isBrushSnapshotTrainingActive
         let alert = NSAlert()
         alert.alertStyle = .warning
         alert.messageText = isTraining ? "Training in progress" : "Stop this project?"
-        if canExportSnapshot {
-            alert.informativeText = "Exporting keeps only a snapshot. If you resume, training starts over from scratch."
-        } else if isMsplatTrainingActive {
+        if isTraining {
             alert.informativeText = "EasySplat will save and validate a training checkpoint. Recent iterations may repeat when you resume."
-        } else if isTraining {
-            alert.informativeText = "EasySplat will stop training safely and save the project. Resume behavior depends on the saved training state."
         } else {
             alert.informativeText = "You can save and resume later, or delete the project."
         }
-        let saveButton = alert.addButton(withTitle: canExportSnapshot ? "Export Snapshot" : "Save Project")
+        let saveButton = alert.addButton(withTitle: "Save Project")
         saveButton.keyEquivalent = "\r"
         let deleteButton = alert.addButton(withTitle: "Delete Project")
         deleteButton.hasDestructiveAction = true
@@ -160,18 +92,6 @@ extension AppModel {
         pendingCloseWindow = nil
         exitIntent = .none
         return true
-    }
-
-    func makeTrainingGate() -> (@Sendable () async throws -> Void) {
-        let modelBox = WeakAppModelBox(self)
-        return {
-            guard let model = modelBox.value else { return }
-            let allowed = await model.awaitTrainingConsent()
-            if !allowed {
-                await model.cancelCurrentProject(deleteProject: false)
-                throw CancellationError()
-            }
-        }
     }
 
     func scheduleForcedExitIfNeeded() {
@@ -242,19 +162,6 @@ extension AppModel {
         }
     }
 
-    func presentSnapshotRevealIfAvailable(_ snapshotURL: URL) {
-        guard FileManager.default.fileExists(atPath: snapshotURL.path) else { return }
-        let alert = NSAlert()
-        alert.alertStyle = .informational
-        alert.messageText = "Snapshot exported"
-        alert.informativeText = "You can open the snapshot in Finder before exiting."
-        alert.addButton(withTitle: "Open in Finder")
-        alert.addButton(withTitle: "Continue")
-        if alert.runModal() == .alertFirstButtonReturn {
-            NSWorkspace.shared.activateFileViewerSelecting([snapshotURL])
-        }
-    }
-
     func startProject(input: InputSpec, title: String, taskToken: UUID? = nil) async {
         guard isCurrentTaskToken(taskToken) else { return }
         defer {
@@ -296,7 +203,6 @@ extension AppModel {
             try ProjectMetadataStore.save(metadata, to: paths.metadataURL)
             currentPreset = metadata.preset
             currentInput = input
-            syncShareMetrics(for: projectURL)
 
             // Keep the Mac awake for the whole flow, including the first-run toolchain
             // download, which happens before the runner (and its own assertion) exists.
@@ -315,7 +221,6 @@ extension AppModel {
                 progressForwarder.update(fraction: fraction, message: message)
             }
             guard isCurrentTaskToken(taskToken) else { return }
-            toolchainPaths = toolchain
 
             let runner = pipelineRunnerFactory(
                 projectURL,
@@ -345,7 +250,6 @@ extension AppModel {
             }
             currentProjectNotes = loadProjectNotes(projectURL: projectURL)
             markProjectOpened(at: projectURL)
-            syncShareMetrics(for: projectURL)
             viewState = .viewer
             refreshProjectSummaries()
             refreshFreeDiskSpace()
@@ -354,7 +258,7 @@ extension AppModel {
         } catch {
             guard isCurrentTaskToken(taskToken) else { return }
             let stopFailureCopy = stopAction.map {
-                stopFailurePresentation(for: $0, backend: activeTrainingBackend)
+                stopFailurePresentation(for: $0)
             }
             if stopFailureCopy != nil {
                 stopAction = nil
@@ -412,7 +316,6 @@ extension AppModel {
             currentProjectURL = url
             currentPreset = metadata.preset
             currentInput = metadata.input
-            syncShareMetrics(for: url)
             logLines = []
             errorLogLines = []
             let previousLines = loadPipelineLogTail(projectURL: url)
@@ -436,7 +339,6 @@ extension AppModel {
                 currentInput = metadata.input
                 currentProjectNotes = metadata.notes ?? ""
                 markProjectOpened(at: url)
-                syncShareMetrics(for: url)
                 viewState = .viewer
                 return
             }
@@ -459,7 +361,6 @@ extension AppModel {
                 progressForwarder.update(fraction: fraction, message: message)
             }
             guard isCurrentTaskToken(taskToken) else { return }
-            toolchainPaths = toolchain
 
             let runner = pipelineRunnerFactory(
                 url,
@@ -490,7 +391,6 @@ extension AppModel {
             }
             currentProjectNotes = loadProjectNotes(projectURL: url)
             markProjectOpened(at: url)
-            syncShareMetrics(for: url)
             refreshFreeDiskSpace()
             viewState = .viewer
             refreshProjectSummaries()
@@ -499,7 +399,7 @@ extension AppModel {
         } catch {
             guard isCurrentTaskToken(taskToken) else { return }
             let stopFailureCopy = stopAction.map {
-                stopFailurePresentation(for: $0, backend: activeTrainingBackend)
+                stopFailurePresentation(for: $0)
             }
             if stopFailureCopy != nil {
                 stopAction = nil
@@ -569,21 +469,11 @@ extension AppModel {
         currentPreset = nil
         currentInput = nil
         currentProjectNotes = ""
-        toolchainPaths = nil
         currentProjectURL = nil
         stopAction = nil
-        isShowingTrainingConsent = false
-        isLivePreviewEnabled = false
-        activeTrainingBackend = nil
-        trainingConsentContinuation = nil
-        trainingConsentPauseStartedAt = nil
-        trainingConsentPausedDuration = 0
-        pendingSnapshotRevealURL = nil
-        pendingSnapshotRevealRequiresExit = false
         recoveryPromptProject = nil
         shareStatusMessage = nil
         shareStatusIsError = false
-        shareMetrics = .init()
         isShareSheetActive = false
         activeShareSession = nil
     }
@@ -626,8 +516,7 @@ extension AppModel {
         PipelineRunner.PipelineConfig(
             toolchain: toolchain,
             preset: preset,
-            speedProfile: speedProfile(for: preset),
-            trainingGate: makeTrainingGate()
+            speedProfile: speedProfile(for: preset)
         )
     }
 
@@ -643,26 +532,13 @@ extension AppModel {
         if action == .keepProject, let projectURL {
             suppressRecoveryPrompt(for: projectURL, clearLastRunStartedAt: true)
         }
-        let snapshotURL = pendingSnapshotRevealURL
-        let shouldOfferSnapshot = pendingSnapshotRevealRequiresExit
         reset()
         viewState = .home
         if action == .deleteProject, let projectURL {
             try? FileManager.default.removeItem(at: projectURL)
         }
         refreshProjectSummaries()
-        if shouldOfferSnapshot, let snapshotURL {
-            presentSnapshotRevealIfAvailable(snapshotURL)
-        }
         finalizeExitIfNeeded()
-    }
-}
-
-private final class WeakAppModelBox: @unchecked Sendable {
-    weak var value: AppModel?
-
-    init(_ value: AppModel) {
-        self.value = value
     }
 }
 

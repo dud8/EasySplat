@@ -14,10 +14,6 @@ extension ToolchainManager {
         modelsToolchainLooksInstalled(root: root)
     }
 
-    func test_fileHasShebang(at url: URL) -> Bool {
-        fileHasShebang(at: url)
-    }
-
     func test_sha256Hex(url: URL) throws -> String {
         try sha256Hex(url: url)
     }

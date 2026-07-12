@@ -74,12 +74,9 @@ public enum ProjectDiagnosticBundle {
         let logSources: [(label: String, url: URL)] = [
             ("pipeline.log", paths.pipelineLogURL),
             ("colmap.log", paths.colmapLogURL),
-            ("glomap.log", paths.glomapLogURL),
+            ("global_mapper.log", paths.globalMapperLogURL),
+            ("glomap.log (legacy)", paths.logsURL.appendingPathComponent("glomap.log")),
             ("da3.log", paths.da3LogURL),
-            ("mapanything.log", paths.mapanythingLogURL),
-            ("vggt.log", paths.vggtLogURL),
-            ("fastvggt.log", paths.fastvggtLogURL),
-            ("brush.log", paths.brushLogURL),
             ("msplat.log", paths.msplatLogURL)
         ]
         for source in logSources {
@@ -154,8 +151,6 @@ public enum ProjectDiagnosticBundle {
                             snapshot.cpuCount,
                             snapshot.gpuWorkingSetGB.map { String(format: "%.1f GB", $0) } ?? "n/a"))
         lines.append("Thread cap: \(snapshot.threadCap)")
-        lines.append("MapAnything: res=\(snapshot.mapAnythingResolution) directLimit=\(snapshot.mapAnythingDirectViewLimit) anchors=\(snapshot.mapAnythingAnchorMaxViews) window=\(snapshot.mapAnythingWindowSize)/\(snapshot.mapAnythingWindowOverlap)")
-        lines.append("VGGT: allowed=\(snapshot.vggtAllowed ? "yes" : "no") imgLoad=\(snapshot.vggtImageLoadResolution) fixed=\(snapshot.vggtFixedResolution) maxPoints=\(snapshot.vggtMaxPoints)")
         lines.append("COLMAP: features=\(snapshot.colmapMaxNumFeatures) matches=\(snapshot.colmapMaxNumMatches) seqOverlap=\(snapshot.colmapSequentialOverlap) exhaustiveBlock=\(snapshot.colmapExhaustiveBlockSize) imageCap=\(snapshot.colmapMaxImageSizeCap.map { "\($0)px" } ?? "none")")
         return lines.joined(separator: "\n")
     }

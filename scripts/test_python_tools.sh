@@ -46,6 +46,3 @@ run_suite() {
 }
 
 run_suite "Tools/Da3Sfm" "Tools/Da3Sfm/tests/test_run.py"
-run_suite "Tools/MapAnythingSfm" "Tools/MapAnythingSfm/tests/test_run.py"
-run_suite "Tools/FastVggtSfm" "Tools/FastVggtSfm/easysplat_fastvggt_sfm/tests/test_strict_coverage.py"
-run_suite "Tools/VggtSfm" "Tools/VggtSfm/tests/test_run.py"
