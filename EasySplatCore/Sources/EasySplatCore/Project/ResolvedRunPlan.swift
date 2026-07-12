@@ -37,6 +37,10 @@ public struct ResolvedRunPlan: Codable, Sendable, Equatable {
     public var refinementIterationLimit: Int
     public var trainerIterationLimit: Int
     public var plateauWindow: Int
+    public var colmapMaximumFeatureCount: Int
+    public var colmapMaximumMatchCount: Int
+    public var colmapExhaustiveBlockSize: Int
+    public var colmapThreadLimit: Int
     public var requiredToolchainCapabilities: [String]
     public var fallbackRouteIdentifiers: [String]
     public var capturePath: CapturePath
@@ -58,6 +62,10 @@ public struct ResolvedRunPlan: Codable, Sendable, Equatable {
         refinementIterationLimit: Int,
         trainerIterationLimit: Int,
         plateauWindow: Int,
+        colmapMaximumFeatureCount: Int = 8_192,
+        colmapMaximumMatchCount: Int = 8_192,
+        colmapExhaustiveBlockSize: Int = 20,
+        colmapThreadLimit: Int = 6,
         requiredToolchainCapabilities: [String],
         fallbackRouteIdentifiers: [String],
         capturePath: CapturePath = .automatic,
@@ -78,6 +86,10 @@ public struct ResolvedRunPlan: Codable, Sendable, Equatable {
         self.refinementIterationLimit = refinementIterationLimit
         self.trainerIterationLimit = trainerIterationLimit
         self.plateauWindow = plateauWindow
+        self.colmapMaximumFeatureCount = colmapMaximumFeatureCount
+        self.colmapMaximumMatchCount = colmapMaximumMatchCount
+        self.colmapExhaustiveBlockSize = colmapExhaustiveBlockSize
+        self.colmapThreadLimit = colmapThreadLimit
         self.requiredToolchainCapabilities = requiredToolchainCapabilities
         self.fallbackRouteIdentifiers = fallbackRouteIdentifiers
         self.capturePath = capturePath
@@ -86,52 +98,6 @@ public struct ResolvedRunPlan: Codable, Sendable, Equatable {
         self.pairingPolicy = pairingPolicy
         self.sequentialOverlap = sequentialOverlap
         self.deterministicSeed = deterministicSeed
-    }
-
-    private enum CodingKeys: String, CodingKey {
-        case routeIdentifier
-        case modelIdentifier
-        case memoryTier
-        case chunkSize
-        case keyframeBudget
-        case maximumImageDimension
-        case cameraGrouping
-        case lensProjection
-        case refinementIterationLimit
-        case trainerIterationLimit
-        case plateauWindow
-        case requiredToolchainCapabilities
-        case fallbackRouteIdentifiers
-        case capturePath
-        case inputOrdering
-        case photoSelection
-        case pairingPolicy
-        case sequentialOverlap
-        case deterministicSeed
-    }
-
-    public init(from decoder: Decoder) throws {
-        let values = try decoder.container(keyedBy: CodingKeys.self)
-        routeIdentifier = try values.decode(String.self, forKey: .routeIdentifier)
-        modelIdentifier = try values.decode(String.self, forKey: .modelIdentifier)
-        memoryTier = try values.decode(String.self, forKey: .memoryTier)
-        chunkSize = try values.decode(Int.self, forKey: .chunkSize)
-        keyframeBudget = try values.decode(Int.self, forKey: .keyframeBudget)
-        maximumImageDimension = try values.decode(Int.self, forKey: .maximumImageDimension)
-        cameraGrouping = try values.decode(CameraGrouping.self, forKey: .cameraGrouping)
-        lensProjection = try values.decode(LensProjection.self, forKey: .lensProjection)
-        refinementIterationLimit = try values.decode(Int.self, forKey: .refinementIterationLimit)
-        trainerIterationLimit = try values.decode(Int.self, forKey: .trainerIterationLimit)
-        plateauWindow = try values.decode(Int.self, forKey: .plateauWindow)
-        requiredToolchainCapabilities = try values.decode([String].self, forKey: .requiredToolchainCapabilities)
-        fallbackRouteIdentifiers = try values.decode([String].self, forKey: .fallbackRouteIdentifiers)
-        capturePath = try values.decodeIfPresent(CapturePath.self, forKey: .capturePath) ?? .automatic
-        inputOrdering = try values.decodeIfPresent(InputOrdering.self, forKey: .inputOrdering) ?? .automatic
-        photoSelection = try values.decodeIfPresent(PhotoSelection.self, forKey: .photoSelection) ?? .automatic
-        pairingPolicy = try values.decodeIfPresent(ResolvedPairingPolicy.self, forKey: .pairingPolicy)
-            ?? .unorderedRetrieval
-        sequentialOverlap = try values.decodeIfPresent(Int.self, forKey: .sequentialOverlap) ?? 10
-        deterministicSeed = try values.decodeIfPresent(UInt64.self, forKey: .deterministicSeed) ?? 42
     }
 
     public func toolchainCapabilityRequest() throws -> ToolchainCapabilityRequest {

@@ -7,26 +7,14 @@ final class ProjectMetadataStoreTests: XCTestCase {
         defer { try? FileManager.default.removeItem(at: root) }
         let url = root.appendingPathComponent("project.json")
 
-        let state = PipelineState(stage: .sfmMatching, attempt: 2, lastError: "boom", resumeToken: "token")
+        let state = PipelineState(stage: .sfmMatching, lastError: "boom")
         let output = OutputSpec(splatPlyPath: "Output/splat.ply", colmapModelPath: "SfM/colmap/sparse/0")
         let checkpoint = PipelineCheckpoint(
             stage: .trainSplat,
             updatedAt: Date(timeIntervalSince1970: 123460),
             progressFraction: 0.5,
             message: "heartbeat",
-            details: .trainSplat(TrainSplatCheckpoint(
-                latestExportStep: 1000,
-                latestExportPath: "/tmp/export_01000.ply",
-                progressStep: 1200,
-                progressTotal: 40000,
-                stepsPerSecond: 1.2,
-                resumeSnapshotPath: "/tmp/latest_snapshot.ply"
-            ))
-        )
-        let completedSfmMapping = SfmMappingCheckpoint(
-            mapper: "vggt",
-            sparsePath: "SfM/colmap/sparse/0",
-            registeredImages: 12
+            details: .trainSplat(TrainSplatCheckpoint(progressStep: 1_200, progressTotal: 40_000))
         )
         let metadata = ProjectMetadata(
             formatVersion: ProjectMetadataStore.supportedFormatVersion,
@@ -34,12 +22,10 @@ final class ProjectMetadataStoreTests: XCTestCase {
             createdAt: Date(timeIntervalSince1970: 123456),
             title: "Test",
             input: .mixed(videos: ["/tmp/a.mov"], photosFolder: "/tmp/photos"),
-            preset: PresetSpec(mode: .room, quality: .ultra),
+            requestedRunOptions: RequestedRunOptions(capturePath: .walkthrough, detailProfile: .highDetail),
             state: state,
             outputs: output,
             checkpoint: checkpoint,
-            completedSfmMapping: completedSfmMapping,
-            recoveryPromptSuppressed: true,
             lastRunStartedAt: Date(timeIntervalSince1970: 123499)
         )
 
@@ -50,25 +36,17 @@ final class ProjectMetadataStoreTests: XCTestCase {
         XCTAssertEqual(loaded.id, metadata.id)
         XCTAssertEqual(loaded.createdAt, metadata.createdAt)
         XCTAssertEqual(loaded.title, metadata.title)
-        XCTAssertEqual(loaded.preset.mode, metadata.preset.mode)
-        XCTAssertEqual(loaded.preset.quality, metadata.preset.quality)
+        XCTAssertEqual(loaded.requestedRunOptions, metadata.requestedRunOptions)
         XCTAssertEqual(loaded.state.stage, metadata.state.stage)
-        XCTAssertEqual(loaded.state.attempt, metadata.state.attempt)
         XCTAssertEqual(loaded.state.lastError, metadata.state.lastError)
-        XCTAssertEqual(loaded.state.resumeToken, metadata.state.resumeToken)
         XCTAssertEqual(loaded.outputs?.splatPlyPath, metadata.outputs?.splatPlyPath)
         XCTAssertEqual(loaded.outputs?.colmapModelPath, metadata.outputs?.colmapModelPath)
         XCTAssertEqual(loaded.checkpoint?.stage, metadata.checkpoint?.stage)
         XCTAssertEqual(loaded.checkpoint?.message, metadata.checkpoint?.message)
-        XCTAssertEqual(loaded.completedSfmMapping?.mapper, completedSfmMapping.mapper)
-        XCTAssertEqual(loaded.completedSfmMapping?.sparsePath, completedSfmMapping.sparsePath)
-        XCTAssertEqual(loaded.completedSfmMapping?.registeredImages, completedSfmMapping.registeredImages)
-        XCTAssertEqual(loaded.recoveryPromptSuppressed, true)
         XCTAssertEqual(loaded.lastRunStartedAt, Date(timeIntervalSince1970: 123499))
         if case let .trainSplat(details)? = loaded.checkpoint?.details {
             XCTAssertEqual(details.progressStep, 1_200)
             XCTAssertEqual(details.progressTotal, 40_000)
-            XCTAssertNil(details.latestExportStep)
         } else {
             XCTFail("Expected trainSplat checkpoint details")
         }
@@ -85,19 +63,20 @@ final class ProjectMetadataStoreTests: XCTestCase {
           "formatVersion":\(ProjectMetadataStore.supportedFormatVersion + 1),
           "id":"00000000-0000-0000-0000-000000000002",
           "input":{"photos":{"folder":"/tmp/photos"}},
-          "preset":{"mode":"object","quality":"standard"},
-          "state":{"attempt":0,"lastError":null,"resumeToken":null,"stage":"importInput"},
+          "requestedRunOptions":{"capturePath":"automatic","detailProfile":"balanced"},
+          "state":{"lastError":null,"stage":"importInput"},
           "title":"Future"
         }
         """
         try future.write(to: url, atomically: true, encoding: .utf8)
 
         XCTAssertThrowsError(try ProjectMetadataStore.load(from: url)) { error in
-            guard case ProjectMetadataStore.LoadError.unsupportedFormatVersion(let v) = error else {
-                XCTFail("Expected unsupportedFormatVersion, got \(error)")
+            guard case ProjectMetadataStore.LoadError.requiresNewerApp(let v) = error else {
+                XCTFail("Expected requiresNewerApp, got \(error)")
                 return
             }
             XCTAssertEqual(v, ProjectMetadataStore.supportedFormatVersion + 1)
+            XCTAssertTrue(error.localizedDescription.contains("Update EasySplat"))
         }
     }
 
@@ -121,77 +100,134 @@ final class ProjectMetadataStoreTests: XCTestCase {
         try future.write(to: url, atomically: true, encoding: .utf8)
 
         XCTAssertThrowsError(try ProjectMetadataStore.load(from: url)) { error in
-            guard case ProjectMetadataStore.LoadError.unsupportedFormatVersion(let v) = error else {
-                XCTFail("Expected unsupportedFormatVersion even with missing fields, got \(error)")
+            guard case ProjectMetadataStore.LoadError.requiresNewerApp(let v) = error else {
+                XCTFail("Expected requiresNewerApp even with missing fields, got \(error)")
                 return
             }
             XCTAssertEqual(v, ProjectMetadataStore.supportedFormatVersion + 1)
         }
     }
 
-    func testLoadLegacyMetadataWithoutCheckpoint() throws {
+    func testSaveRejectsNonCurrentFormatVersion() throws {
         let root = try TestFileBuilder.makeTempDir()
         defer { try? FileManager.default.removeItem(at: root) }
         let url = root.appendingPathComponent("project.json")
+        let metadata = ProjectMetadata(
+            formatVersion: ProjectMetadataStore.supportedFormatVersion - 1,
+            title: "Wrong schema",
+            input: .photos(folder: "/tmp/photos"),
+            requestedRunOptions: RequestedRunOptions(capturePath: .orbit, detailProfile: .balanced)
+        )
 
-        let legacy = """
-        {
-          "createdAt":"1970-01-01T00:00:00Z",
-          "formatVersion":1,
-          "id":"00000000-0000-0000-0000-000000000001",
-          "input":{"photos":{"folder":"/tmp/photos"}},
-          "preset":{"mode":"object","quality":"standard"},
-          "state":{"attempt":0,"lastError":null,"resumeToken":null,"stage":"importInput"},
-          "title":"Legacy"
+        XCTAssertThrowsError(try ProjectMetadataStore.save(metadata, to: url)) { error in
+            guard case ProjectMetadataStore.SaveError.invalidFormatVersion(let version) = error else {
+                return XCTFail("Expected invalidFormatVersion, got \(error)")
+            }
+            XCTAssertEqual(version, ProjectMetadataStore.supportedFormatVersion - 1)
         }
-        """
-        try legacy.write(to: url, atomically: true, encoding: .utf8)
-        let loaded = try ProjectMetadataStore.load(from: url)
-        XCTAssertNil(loaded.checkpoint)
-        XCTAssertNil(loaded.completedSfmMapping)
-        XCTAssertNil(loaded.recoveryPromptSuppressed)
-        XCTAssertNil(loaded.lastRunStartedAt)
-        XCTAssertNil(loaded.reconstruction)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: url.path))
     }
 
-    func testLoadDropsPreCheckpointVersionTwoTrainingArtifactWithoutLosingOutput() throws {
+    func testLoadRejectsTrainingArtifactMissingCurrentResumeBinding() throws {
         let root = try TestFileBuilder.makeTempDir()
         defer { try? FileManager.default.removeItem(at: root) }
         let url = root.appendingPathComponent("project.json")
-        let legacyVersionTwo = """
+        let incompleteVersionTwo = """
         {
           "createdAt":"1970-01-01T00:00:00Z",
           "formatVersion":2,
           "id":"00000000-0000-0000-0000-000000000003",
           "input":{"photos":{"folder":"/tmp/photos"}},
           "outputs":{"colmapModelPath":"SfM/colmap/sparse/0","splatPlyPath":"Output/splat.ply"},
-          "preset":{"mode":"object","quality":"standard"},
-          "state":{"attempt":0,"lastError":null,"resumeToken":null,"stage":"done"},
-          "title":"Early v2",
+          "requestedRunOptions":{
+            "cameraGrouping":"automatic",
+            "capturePath":"orbit",
+            "detailProfile":"balanced",
+            "inputOrdering":"automatic",
+            "lensProjection":"automatic",
+            "photoSelection":"automatic",
+            "resourcePolicy":"automatic"
+          },
+          "state":{"lastError":null,"stage":"done"},
+          "title":"Incomplete v2",
           "trainingArtifact":{
             "completionStatus":"completed",
+            "completedIteration":7000,
             "detailProfile":"balanced",
             "deterministicSeed":42,
             "elapsedSeconds":12.5,
             "gaussianCount":1250,
             "geometryDigest":"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
             "iterationLimit":7000,
+            "inputDigest":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
             "outputPath":"Training/msplat/splat.ply",
             "peakMemoryBytes":2147483648,
             "plateauWindow":800,
             "runtimeVersion":"native-metal-cli-v1",
+            "schemaVersion":1,
             "trainerVersion":"1.1.3 (git 106499b)"
           }
         }
         """
-        try legacyVersionTwo.write(to: url, atomically: true, encoding: .utf8)
+        try incompleteVersionTwo.write(to: url, atomically: true, encoding: .utf8)
 
-        let loaded = try ProjectMetadataStore.load(from: url)
+        XCTAssertThrowsError(try ProjectMetadataStore.load(from: url)) { error in
+            guard case DecodingError.keyNotFound(let key, _) = error else {
+                return XCTFail("Expected keyNotFound, got \(error)")
+            }
+            XCTAssertEqual(key.stringValue, "trainerBuildDigest")
+        }
+    }
 
-        XCTAssertNil(loaded.trainingArtifact)
-        XCTAssertEqual(loaded.outputs?.splatPlyPath, "Output/splat.ply")
-        XCTAssertEqual(loaded.outputs?.colmapModelPath, "SfM/colmap/sparse/0")
-        XCTAssertEqual(loaded.state.stage, .done)
+    func testMetadataReadsAndNoteUpdatesDoNotOpenCompletedTrainingOutput() throws {
+        let root = try TestFileBuilder.makeTempDir()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let paths = ProjectPaths(root: root)
+        try paths.ensureDirectories()
+        let missingOutput = "Training/msplat/splat.ply"
+        let artifact = TrainingArtifact(
+            trainerVersion: "1.1.3",
+            runtimeVersion: "native-metal-cli-v1",
+            trainerBuildDigest: String(repeating: "a", count: 64),
+            inputDigest: String(repeating: "b", count: 64),
+            geometryDigest: String(repeating: "c", count: 64),
+            detailProfile: .balanced,
+            iterationLimit: 7_000,
+            plateauWindow: 800,
+            deterministicSeed: 42,
+            completedIteration: 7_000,
+            checkpointPath: nil,
+            checkpointDigest: nil,
+            outputPath: missingOutput,
+            outputSHA256: String(repeating: "d", count: 64),
+            outputBytes: 1_024,
+            gaussianCount: 100,
+            elapsedSeconds: 10,
+            peakMemoryBytes: 1_024,
+            completionStatus: .completed
+        )
+        let metadata = ProjectMetadata(
+            title: "Missing output",
+            input: .photos(folder: "/tmp/photos"),
+            requestedRunOptions: RequestedRunOptions(detailProfile: .balanced),
+            trainingArtifact: artifact,
+            state: PipelineState(stage: .done, lastError: nil),
+            outputs: OutputSpec(
+                splatPlyPath: "Output/splat.ply",
+                colmapModelPath: "SfM/colmap/sparse/0"
+            )
+        )
+
+        try ProjectMetadataStore.save(metadata, to: paths.metadataURL)
+        XCTAssertEqual(try ProjectMetadataStore.load(from: paths.metadataURL).trainingArtifact, artifact)
+        let updated = try ProjectMetadataStore.update(at: paths.metadataURL) { metadata in
+            metadata.notes = "Keep this project visible"
+        }
+
+        XCTAssertEqual(updated.notes, "Keep this project visible")
+        XCTAssertFalse(FileManager.default.fileExists(
+            atPath: try paths.resolveProjectRelativePath(missingOutput).path
+        ))
     }
 
     func testRoundTripPreservesNotes() throws {
@@ -201,7 +237,7 @@ final class ProjectMetadataStoreTests: XCTestCase {
         let metadata = ProjectMetadata(
             title: "With Notes",
             input: .photos(folder: "/tmp/photos"),
-            preset: PresetSpec(mode: .object, quality: .standard),
+            requestedRunOptions: RequestedRunOptions(capturePath: .orbit, detailProfile: .balanced),
             notes: "First test in afternoon light"
         )
         try ProjectMetadataStore.save(metadata, to: url)
@@ -216,22 +252,22 @@ final class ProjectMetadataStoreTests: XCTestCase {
         let pipelineSnapshot = ProjectMetadata(
             title: "Race",
             input: .photos(folder: "/tmp/photos"),
-            preset: PresetSpec(mode: .object, quality: .standard),
-            state: PipelineState(stage: .importInput, attempt: 0, lastError: nil, resumeToken: nil),
+            requestedRunOptions: RequestedRunOptions(capturePath: .orbit, detailProfile: .balanced),
+            state: PipelineState(stage: .importInput, lastError: nil),
             notes: nil
         )
         try ProjectMetadataStore.save(
             ProjectMetadata(
                 title: "Client-facing name",
                 input: .photos(folder: "/tmp/photos"),
-                preset: PresetSpec(mode: .object, quality: .standard),
+                requestedRunOptions: RequestedRunOptions(capturePath: .orbit, detailProfile: .balanced),
                 notes: "newer note from user"
             ),
             to: url
         )
 
         var stalePipelineWrite = pipelineSnapshot
-        stalePipelineWrite.state = PipelineState(stage: .sfmFeatures, attempt: 0, lastError: nil, resumeToken: nil)
+        stalePipelineWrite.state = PipelineState(stage: .sfmFeatures, lastError: nil)
         try ProjectMetadataStore.savePreservingUserEditableFields(stalePipelineWrite, to: url)
 
         let loaded = try ProjectMetadataStore.load(from: url)
@@ -247,7 +283,7 @@ final class ProjectMetadataStoreTests: XCTestCase {
         let stalePipelineMetadata = ProjectMetadata(
             title: "Stale pipeline title",
             input: .photos(folder: "/tmp/photos"),
-            preset: PresetSpec(mode: .object, quality: .standard)
+            requestedRunOptions: RequestedRunOptions(capturePath: .orbit, detailProfile: .balanced)
         )
         let futureData = Data("""
         {
@@ -273,7 +309,7 @@ final class ProjectMetadataStoreTests: XCTestCase {
         let metadata = ProjectMetadata(
             title: "First write",
             input: .photos(folder: "/tmp/photos"),
-            preset: PresetSpec(mode: .object, quality: .standard)
+            requestedRunOptions: RequestedRunOptions(capturePath: .orbit, detailProfile: .balanced)
         )
 
         try ProjectMetadataStore.savePreservingUserEditableFields(metadata, to: url)
@@ -291,7 +327,7 @@ final class ProjectMetadataStoreTests: XCTestCase {
             ProjectMetadata(
                 title: "Outside",
                 input: .photos(folder: "/tmp/photos"),
-                preset: PresetSpec(mode: .object, quality: .standard)
+                requestedRunOptions: RequestedRunOptions(capturePath: .orbit, detailProfile: .balanced)
             ),
             to: outsideMetadataURL
         )
@@ -312,7 +348,7 @@ final class ProjectMetadataStoreTests: XCTestCase {
                 ProjectMetadata(
                     title: "Should not land outside",
                     input: .photos(folder: "/tmp/photos"),
-                    preset: PresetSpec(mode: .object, quality: .standard)
+                    requestedRunOptions: RequestedRunOptions(capturePath: .orbit, detailProfile: .balanced)
                 ),
                 to: linkedMetadataURL
             )
@@ -327,8 +363,8 @@ final class ProjectMetadataStoreTests: XCTestCase {
         let initial = ProjectMetadata(
             title: "Original",
             input: .photos(folder: "/tmp/photos"),
-            preset: PresetSpec(mode: .object, quality: .standard),
-            state: PipelineState(stage: .importInput, attempt: 0, lastError: nil, resumeToken: nil),
+            requestedRunOptions: RequestedRunOptions(capturePath: .orbit, detailProfile: .balanced),
+            state: PipelineState(stage: .importInput, lastError: nil),
             notes: "old note"
         )
         try ProjectMetadataStore.save(initial, to: url)
@@ -358,9 +394,7 @@ final class ProjectMetadataStoreTests: XCTestCase {
         var stalePipelineWrite = initial
         stalePipelineWrite.state = PipelineState(
             stage: .sfmFeatures,
-            attempt: 0,
-            lastError: nil,
-            resumeToken: nil
+            lastError: nil
         )
         let pipelineWrite = stalePipelineWrite
         DispatchQueue.global().async {
@@ -399,7 +433,7 @@ final class ProjectMetadataStoreTests: XCTestCase {
         let initial = ProjectMetadata(
             title: "Readable",
             input: .photos(folder: "/tmp/photos"),
-            preset: PresetSpec(mode: .object, quality: .standard),
+            requestedRunOptions: RequestedRunOptions(capturePath: .orbit, detailProfile: .balanced),
             notes: "keep me"
         )
         try ProjectMetadataStore.save(initial, to: url)
@@ -427,7 +461,7 @@ final class ProjectMetadataStoreTests: XCTestCase {
             ProjectMetadata(
                 title: "Outside",
                 input: .photos(folder: "/tmp/photos"),
-                preset: PresetSpec(mode: .object, quality: .standard)
+                requestedRunOptions: RequestedRunOptions(capturePath: .orbit, detailProfile: .balanced)
             ),
             to: outside
         )
@@ -446,7 +480,7 @@ final class ProjectMetadataStoreTests: XCTestCase {
 
         let captured = Date(timeIntervalSince1970: 1_700_000_000)
         let summary = ReconstructionSummary(
-            mapper: "da3-direct",
+            mapper: "da3-refined",
             capturedAt: captured,
             registeredImages: 27,
             totalImages: 30,
@@ -458,7 +492,7 @@ final class ProjectMetadataStoreTests: XCTestCase {
         let metadata = ProjectMetadata(
             title: "With Summary",
             input: .photos(folder: "/tmp/photos"),
-            preset: PresetSpec(mode: .object, quality: .standard),
+            requestedRunOptions: RequestedRunOptions(capturePath: .orbit, detailProfile: .balanced),
             reconstruction: summary
         )
 
@@ -484,15 +518,13 @@ private final class LockedErrors: @unchecked Sendable {
 }
 
 final class ProjectMetadataFullSchemaRoundTripTests: XCTestCase {
-    /// Regression guard for the current write contract. Legacy analytics and
-    /// activity fields still decode, but a normal save must not write them back.
-    func testRoundTripPreservesCurrentFieldsAndOmitsDecodeOnlyLegacyFields() throws {
+    func testRoundTripPreservesCurrentFieldsAndOmitsRetiredKeys() throws {
         let root = try TestFileBuilder.makeTempDir()
         defer { try? FileManager.default.removeItem(at: root) }
         let url = root.appendingPathComponent("project.json")
 
         let reconstruction = ReconstructionSummary(
-            mapper: "global_mapper-gpu",
+            mapper: "point_triangulator+bundle_adjuster",
             capturedAt: Date(timeIntervalSince1970: 1_700_000_500),
             registeredImages: 28,
             totalImages: 30,
@@ -506,71 +538,34 @@ final class ProjectMetadataFullSchemaRoundTripTests: XCTestCase {
             .init(stage: .sfmMapping, startedAt: Date(timeIntervalSince1970: 1_700_000_200), durationSeconds: 120),
             .init(stage: .trainSplat, startedAt: Date(timeIntervalSince1970: 1_700_000_400), durationSeconds: 600)
         ]
-        let autoTune = AutoTuneSnapshot(
-            tier: "High",
-            memoryGB: 48,
-            cpuCount: 16,
-            gpuWorkingSetGB: 32,
-            mapAnythingResolution: 518,
-            mapAnythingDirectViewLimit: 8,
-            mapAnythingAnchorMaxViews: 64,
-            mapAnythingWindowSize: 8,
-            mapAnythingWindowOverlap: 2,
-            vggtImageLoadResolution: 1280,
-            vggtFixedResolution: 518,
-            vggtMaxPoints: 150_000,
-            vggtAllowed: true,
-            colmapMaxNumFeatures: 10_000,
-            colmapMaxNumMatches: 10_000,
-            colmapSequentialOverlap: 12,
-            colmapExhaustiveBlockSize: 25,
-            threadCap: 8,
-            colmapMaxImageSizeCap: nil,
-            capturedAt: Date(timeIntervalSince1970: 1_700_000_000)
-        )
         let metadata = ProjectMetadata(
             formatVersion: ProjectMetadataStore.supportedFormatVersion,
             id: UUID(uuidString: "33333333-3333-3333-3333-333333333333")!,
             createdAt: Date(timeIntervalSince1970: 1_699_999_000),
             title: "Full schema",
             input: .mixed(videos: ["/tmp/a.mov"], photosFolder: "/tmp/photos"),
-            preset: PresetSpec(mode: .room, quality: .ultra),
-            state: PipelineState(stage: .done, attempt: 1, lastError: nil, resumeToken: nil),
+            requestedRunOptions: RequestedRunOptions(capturePath: .walkthrough, detailProfile: .highDetail),
+            state: PipelineState(stage: .done, lastError: nil),
             outputs: OutputSpec(splatPlyPath: "Output/splat.ply", colmapModelPath: "SfM/colmap/sparse/0"),
             checkpoint: nil,
-            completedSfmMapping: SfmMappingCheckpoint(mapper: "global_mapper-gpu", sparsePath: "SfM/colmap/sparse/0", registeredImages: 28),
-            recoveryPromptSuppressed: false,
             lastRunStartedAt: nil,
-            shareMetrics: ShareMetrics(shareClickedCount: 2, shareCompletedCount: 1, lastShareService: "AirDrop", lastSharedAt: Date(timeIntervalSince1970: 1_700_000_900)),
             reconstruction: reconstruction,
             stageTimings: stageTimings,
-            autoTune: autoTune,
             notes: "captured under window light",
-            lastOpenedAt: Date(timeIntervalSince1970: 1_700_001_000),
             lastFailureAt: Date(timeIntervalSince1970: 1_699_999_500)
         )
 
         try ProjectMetadataStore.save(metadata, to: url)
-        let saved = try Data(contentsOf: url)
-        let object = try XCTUnwrap(JSONSerialization.jsonObject(with: saved) as? [String: Any])
-        XCTAssertNil(object["autoTune"])
-        XCTAssertNil(object["shareMetrics"])
-        XCTAssertNil(object["lastOpenedAt"])
         let loaded = try ProjectMetadataStore.load(from: url)
 
         XCTAssertEqual(loaded.reconstruction, reconstruction)
         XCTAssertEqual(loaded.stageTimings, stageTimings)
-        XCTAssertNil(loaded.autoTune)
-        XCTAssertNil(loaded.shareMetrics)
-        XCTAssertEqual(loaded.completedSfmMapping?.mapper, "global_mapper-gpu")
-        XCTAssertEqual(loaded.recoveryPromptSuppressed, false)
         XCTAssertEqual(loaded.state.stage, .done)
-        XCTAssertEqual(loaded.preset.mode, .room)
-        XCTAssertEqual(loaded.preset.quality, .ultra)
+        XCTAssertEqual(loaded.requestedRunOptions.capturePath, .walkthrough)
+        XCTAssertEqual(loaded.requestedRunOptions.detailProfile, .highDetail)
         XCTAssertEqual(loaded.input.videoFiles, ["/tmp/a.mov"])
         XCTAssertEqual(loaded.input.photosFolder, "/tmp/photos")
         XCTAssertEqual(loaded.notes, "captured under window light")
-        XCTAssertNil(loaded.lastOpenedAt)
         XCTAssertEqual(loaded.lastFailureAt, Date(timeIntervalSince1970: 1_699_999_500))
     }
 }
@@ -578,7 +573,7 @@ final class ProjectMetadataFullSchemaRoundTripTests: XCTestCase {
 final class ReconstructionSummaryTests: XCTestCase {
     func testRegisteredFractionGuardsAgainstZeroTotal() {
         let summary = ReconstructionSummary(
-            mapper: "vggt",
+            mapper: "colmap",
             capturedAt: Date(timeIntervalSince1970: 0),
             registeredImages: 10,
             totalImages: 0

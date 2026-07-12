@@ -4,6 +4,17 @@ import XCTest
 
 @MainActor
 final class ToolchainManagerTests: XCTestCase {
+    func testUsesExplicitInstallationRoot() {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        let manager = ToolchainManager(
+            runner: MockSubprocessRunner(scripts: []),
+            installationRoot: root
+        )
+
+        XCTAssertEqual(manager.toolchainRoot().standardizedFileURL, root.standardizedFileURL)
+    }
+
     func testValidateToolchainSucceeds() throws {
         let root = try TestFileBuilder.makeTempDir()
         defer { try? FileManager.default.removeItem(at: root) }
@@ -12,7 +23,7 @@ final class ToolchainManagerTests: XCTestCase {
         let runner = makeValidationRunner(root: root)
 
         let manager = ToolchainManager(runner: runner)
-        let toolchain = try manager.test_validateToolchain(root: root)
+        let toolchain = try manager.test_validateToolchain(root: root, requiredCapabilities: [.da3Base, .da3Small])
         XCTAssertEqual(toolchain.root, root)
         XCTAssertEqual(toolchain.colmap, root.appendingPathComponent("bin/colmap"))
         XCTAssertEqual(toolchain.msplat, root.appendingPathComponent("bin/easysplat-train"))
@@ -27,11 +38,11 @@ final class ToolchainManagerTests: XCTestCase {
         let runner = makeValidationRunner(
             root: root,
             globalMapperExitCode: 1,
-            globalMapperStderr: "Library not loaded: @rpath/libcrypto.3.dylib"
+            globalMapperStderr: "Library not loaded: @rpath/libceres.4.dylib"
         )
 
         let manager = ToolchainManager(runner: runner)
-        XCTAssertThrowsError(try manager.test_validateToolchain(root: root)) { error in
+        XCTAssertThrowsError(try manager.test_validateToolchain(root: root, requiredCapabilities: [.da3Base, .da3Small])) { error in
             guard case ToolchainManager.ToolchainError.invalidToolchain(let message) = error else {
                 return XCTFail("Expected invalidToolchain error, got \(error)")
             }
@@ -51,7 +62,7 @@ final class ToolchainManagerTests: XCTestCase {
         )
 
         let manager = ToolchainManager(runner: runner)
-        XCTAssertThrowsError(try manager.test_validateToolchain(root: root)) { error in
+        XCTAssertThrowsError(try manager.test_validateToolchain(root: root, requiredCapabilities: [.da3Base, .da3Small])) { error in
             guard case ToolchainManager.ToolchainError.invalidToolchain(let message) = error else {
                 return XCTFail("Expected invalidToolchain error, got \(error)")
             }
@@ -68,7 +79,7 @@ final class ToolchainManagerTests: XCTestCase {
         let runner = makeValidationRunner(root: root)
 
         let manager = ToolchainManager(runner: runner)
-        let toolchain = try manager.test_validateToolchain(root: root)
+        let toolchain = try manager.test_validateToolchain(root: root, requiredCapabilities: [.da3Base, .da3Small])
         XCTAssertEqual(toolchain.msplat, msplat)
     }
 
@@ -80,7 +91,7 @@ final class ToolchainManagerTests: XCTestCase {
         let runner = makeValidationRunner(root: root)
 
         let manager = ToolchainManager(runner: runner)
-        XCTAssertThrowsError(try manager.test_validateToolchain(root: root)) { error in
+        XCTAssertThrowsError(try manager.test_validateToolchain(root: root, requiredCapabilities: [.da3Base, .da3Small])) { error in
             guard case ToolchainManager.ToolchainError.missingBinary(let name) = error else {
                 return XCTFail("Expected missingBinary error, got \(error)")
             }
@@ -98,7 +109,7 @@ final class ToolchainManagerTests: XCTestCase {
         let runner = makeValidationRunner(root: root)
 
         let manager = ToolchainManager(runner: runner)
-        let toolchain = try manager.test_validateToolchain(root: root)
+        let toolchain = try manager.test_validateToolchain(root: root, requiredCapabilities: [.da3Base, .da3Small])
         XCTAssertEqual(toolchain.msplat, msplat)
         XCTAssertTrue(FileManager.default.isExecutableFile(atPath: msplat.path))
     }
@@ -111,7 +122,7 @@ final class ToolchainManagerTests: XCTestCase {
         let runner = makeValidationRunner(root: root, msplatSelfCheckExitCode: 2)
 
         let manager = ToolchainManager(runner: runner)
-        XCTAssertThrowsError(try manager.test_validateToolchain(root: root)) { error in
+        XCTAssertThrowsError(try manager.test_validateToolchain(root: root, requiredCapabilities: [.da3Base, .da3Small])) { error in
             guard case ToolchainManager.ToolchainError.invalidToolchain(let message) = error else {
                 return XCTFail("Expected invalidToolchain error")
             }
@@ -134,7 +145,7 @@ final class ToolchainManagerTests: XCTestCase {
             try FileManager.default.removeItem(at: root.appendingPathComponent(relativePath))
 
             let manager = ToolchainManager(runner: makeValidationRunner(root: root))
-            XCTAssertThrowsError(try manager.test_validateToolchain(root: root), "Expected missing error for \(relativePath)") { error in
+            XCTAssertThrowsError(try manager.test_validateToolchain(root: root, requiredCapabilities: [.da3Base, .da3Small]), "Expected missing error for \(relativePath)") { error in
                 switch error {
                 case ToolchainManager.ToolchainError.missingBinary(let name),
                      ToolchainManager.ToolchainError.missingLibrary(let name):
@@ -153,7 +164,7 @@ final class ToolchainManagerTests: XCTestCase {
         try "{}\n".write(to: root.appendingPathComponent("msplat/build_info.json"), atomically: true, encoding: .utf8)
 
         let manager = ToolchainManager(runner: makeValidationRunner(root: root))
-        XCTAssertThrowsError(try manager.test_validateToolchain(root: root)) { error in
+        XCTAssertThrowsError(try manager.test_validateToolchain(root: root, requiredCapabilities: [.da3Base, .da3Small])) { error in
             guard case ToolchainManager.ToolchainError.invalidToolchain(let message) = error else {
                 return XCTFail("Expected invalidToolchain error")
             }
@@ -173,7 +184,7 @@ final class ToolchainManagerTests: XCTestCase {
         try JSONSerialization.data(withJSONObject: payload).write(to: buildInfo, options: .atomic)
 
         let manager = ToolchainManager(runner: makeValidationRunner(root: root))
-        XCTAssertThrowsError(try manager.test_validateToolchain(root: root)) { error in
+        XCTAssertThrowsError(try manager.test_validateToolchain(root: root, requiredCapabilities: [.da3Base, .da3Small])) { error in
             guard case ToolchainManager.ToolchainError.invalidToolchain(let message) = error else {
                 return XCTFail("Expected invalidToolchain error")
             }
@@ -201,7 +212,7 @@ final class ToolchainManagerTests: XCTestCase {
             )
 
             let manager = ToolchainManager(runner: makeValidationRunner(root: root))
-            XCTAssertThrowsError(try manager.test_validateToolchain(root: root)) { error in
+            XCTAssertThrowsError(try manager.test_validateToolchain(root: root, requiredCapabilities: [.da3Base, .da3Small])) { error in
                 guard case ToolchainManager.ToolchainError.invalidToolchain(let message) = error else {
                     return XCTFail("Expected invalidToolchain error")
                 }
@@ -222,7 +233,7 @@ final class ToolchainManagerTests: XCTestCase {
         try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: binary.path)
 
         let manager = ToolchainManager(runner: makeValidationRunner(root: root))
-        XCTAssertThrowsError(try manager.test_validateToolchain(root: root)) { error in
+        XCTAssertThrowsError(try manager.test_validateToolchain(root: root, requiredCapabilities: [.da3Base, .da3Small])) { error in
             guard case ToolchainManager.ToolchainError.invalidToolchain(let message) = error else {
                 return XCTFail("Expected invalidToolchain error")
             }
@@ -243,7 +254,7 @@ final class ToolchainManagerTests: XCTestCase {
             defer { try? FileManager.default.removeItem(at: root) }
             _ = try ToolchainFixtureBuilder.createToolchain(at: root)
             let manager = ToolchainManager(runner: makeValidationRunner(root: root, msplatSelfCheckStdout: output))
-            XCTAssertThrowsError(try manager.test_validateToolchain(root: root), "expected rejection for \(output)") { error in
+            XCTAssertThrowsError(try manager.test_validateToolchain(root: root, requiredCapabilities: [.da3Base, .da3Small]), "expected rejection for \(output)") { error in
                 guard case ToolchainManager.ToolchainError.invalidToolchain(let message) = error else {
                     return XCTFail("Expected invalidToolchain error")
                 }
@@ -269,7 +280,7 @@ final class ToolchainManagerTests: XCTestCase {
             FileManager.default.createFile(atPath: legacy.path, contents: Data("legacy".utf8))
 
             let manager = ToolchainManager(runner: makeValidationRunner(root: root))
-            XCTAssertThrowsError(try manager.test_validateToolchain(root: root), "expected legacy rejection for \(relativePath)") { error in
+            XCTAssertThrowsError(try manager.test_validateToolchain(root: root, requiredCapabilities: [.da3Base, .da3Small]), "expected legacy rejection for \(relativePath)") { error in
                 guard case ToolchainManager.ToolchainError.invalidToolchain(let message) = error else {
                     return XCTFail("Expected invalidToolchain error, got \(error)")
                 }
@@ -287,7 +298,7 @@ final class ToolchainManagerTests: XCTestCase {
             contents: Data("unexpected".utf8)
         )
         var manager = ToolchainManager(runner: makeValidationRunner(root: root))
-        XCTAssertThrowsError(try manager.test_validateToolchain(root: root)) { error in
+        XCTAssertThrowsError(try manager.test_validateToolchain(root: root, requiredCapabilities: [.da3Base, .da3Small])) { error in
             guard case ToolchainManager.ToolchainError.invalidToolchain(let message) = error else {
                 return XCTFail("Expected invalidToolchain error")
             }
@@ -301,7 +312,7 @@ final class ToolchainManagerTests: XCTestCase {
         try FileManager.default.removeItem(at: license)
         try FileManager.default.createSymbolicLink(at: license, withDestinationURL: target)
         manager = ToolchainManager(runner: makeValidationRunner(root: root))
-        XCTAssertThrowsError(try manager.test_validateToolchain(root: root)) { error in
+        XCTAssertThrowsError(try manager.test_validateToolchain(root: root, requiredCapabilities: [.da3Base, .da3Small])) { error in
             guard case ToolchainManager.ToolchainError.invalidToolchain(let message) = error else {
                 return XCTFail("Expected invalidToolchain error")
             }
@@ -321,7 +332,7 @@ final class ToolchainManagerTests: XCTestCase {
         try FileManager.default.createSymbolicLink(at: executable, withDestinationURL: target)
 
         let manager = ToolchainManager(runner: makeValidationRunner(root: root))
-        XCTAssertThrowsError(try manager.test_validateToolchain(root: root))
+        XCTAssertThrowsError(try manager.test_validateToolchain(root: root, requiredCapabilities: [.da3Base, .da3Small]))
         let permissions = try XCTUnwrap(
             try FileManager.default.attributesOfItem(atPath: target.path)[.posixPermissions] as? NSNumber
         )
@@ -344,7 +355,7 @@ final class ToolchainManagerTests: XCTestCase {
         try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: target.path)
 
         let manager = ToolchainManager(runner: makeValidationRunner(root: root))
-        XCTAssertThrowsError(try manager.test_validateToolchain(root: root)) { error in
+        XCTAssertThrowsError(try manager.test_validateToolchain(root: root, requiredCapabilities: [.da3Base, .da3Small])) { error in
             guard case ToolchainManager.ToolchainError.invalidToolchain(let message) = error else {
                 return XCTFail("Expected invalidToolchain error")
             }
@@ -365,7 +376,7 @@ final class ToolchainManagerTests: XCTestCase {
         try FileManager.default.linkItem(at: executable, to: externalLink)
 
         let manager = ToolchainManager(runner: makeValidationRunner(root: root))
-        XCTAssertThrowsError(try manager.test_validateToolchain(root: root)) { error in
+        XCTAssertThrowsError(try manager.test_validateToolchain(root: root, requiredCapabilities: [.da3Base, .da3Small])) { error in
             guard case ToolchainManager.ToolchainError.invalidToolchain(let message) = error else {
                 return XCTFail("Expected invalidToolchain error")
             }
@@ -382,7 +393,7 @@ final class ToolchainManagerTests: XCTestCase {
         XCTAssertEqual(Darwin.mkfifo(buildInfo.path, 0o600), 0)
 
         let manager = ToolchainManager(runner: makeValidationRunner(root: root))
-        XCTAssertThrowsError(try manager.test_validateToolchain(root: root)) { error in
+        XCTAssertThrowsError(try manager.test_validateToolchain(root: root, requiredCapabilities: [.da3Base, .da3Small])) { error in
             guard case ToolchainManager.ToolchainError.invalidToolchain(let message) = error else {
                 return XCTFail("Expected invalidToolchain error")
             }
@@ -398,7 +409,7 @@ final class ToolchainManagerTests: XCTestCase {
         try Data(repeating: 0x20, count: 65 * 1_024).write(to: buildInfo, options: .atomic)
 
         let manager = ToolchainManager(runner: makeValidationRunner(root: root))
-        XCTAssertThrowsError(try manager.test_validateToolchain(root: root)) { error in
+        XCTAssertThrowsError(try manager.test_validateToolchain(root: root, requiredCapabilities: [.da3Base, .da3Small])) { error in
             guard case ToolchainManager.ToolchainError.invalidToolchain(let message) = error else {
                 return XCTFail("Expected invalidToolchain error")
             }
@@ -412,7 +423,7 @@ final class ToolchainManagerTests: XCTestCase {
         _ = try ToolchainFixtureBuilder.createToolchain(at: root)
 
         let manager = ToolchainManager(runner: makeValidationRunner(root: root, msplatArch: "Mach-O 64-bit executable x86_64"))
-        XCTAssertThrowsError(try manager.test_validateToolchain(root: root)) { error in
+        XCTAssertThrowsError(try manager.test_validateToolchain(root: root, requiredCapabilities: [.da3Base, .da3Small])) { error in
             guard case ToolchainManager.ToolchainError.invalidToolchain(let message) = error else {
                 return XCTFail("Expected invalidToolchain error")
             }
@@ -433,7 +444,7 @@ final class ToolchainManagerTests: XCTestCase {
         let runner = makeValidationRunner(root: root, da3PythonArch: "data")
 
         let manager = ToolchainManager(runner: runner)
-        XCTAssertThrowsError(try manager.test_validateToolchain(root: root)) { error in
+        XCTAssertThrowsError(try manager.test_validateToolchain(root: root, requiredCapabilities: [.da3Base, .da3Small])) { error in
             guard case ToolchainManager.ToolchainError.invalidToolchain(let message) = error else {
                 return XCTFail("Expected invalidToolchain error")
             }
@@ -456,7 +467,7 @@ final class ToolchainManagerTests: XCTestCase {
         )
 
         let manager = ToolchainManager(runner: runner)
-        XCTAssertNoThrow(try manager.test_validateToolchain(root: root))
+        XCTAssertNoThrow(try manager.test_validateToolchain(root: root, requiredCapabilities: [.da3Base, .da3Small]))
     }
 
     /// A Rosetta-installed colmap would launch via Rosetta on Apple silicon and pass `-h`,
@@ -469,7 +480,7 @@ final class ToolchainManagerTests: XCTestCase {
         let runner = makeValidationRunner(root: root, colmapArch: "Mach-O 64-bit executable x86_64")
 
         let manager = ToolchainManager(runner: runner)
-        XCTAssertThrowsError(try manager.test_validateToolchain(root: root)) { error in
+        XCTAssertThrowsError(try manager.test_validateToolchain(root: root, requiredCapabilities: [.da3Base, .da3Small])) { error in
             guard case ToolchainManager.ToolchainError.invalidToolchain(let message) = error else {
                 return XCTFail("Expected invalidToolchain error")
             }
@@ -485,7 +496,7 @@ final class ToolchainManagerTests: XCTestCase {
         let manager = ToolchainManager(runner: MockSubprocessRunner(scripts: []))
         XCTAssertTrue(manager.test_coreToolchainLooksInstalled(root: root))
 
-        try FileManager.default.removeItem(at: fixture.libcrypto)
+        try FileManager.default.removeItem(at: fixture.colmap)
         XCTAssertFalse(manager.test_coreToolchainLooksInstalled(root: root))
 
         let freshRoot = try TestFileBuilder.makeTempDir()
@@ -621,25 +632,6 @@ final class ToolchainManagerTests: XCTestCase {
         }
     }
 
-    func testLegacyBackendEnvironmentDoesNotChangeExplicitCapabilityValidation() async throws {
-        let root = try TestFileBuilder.makeTempDir()
-        defer { try? FileManager.default.removeItem(at: root) }
-        _ = try ToolchainFixtureBuilder.createToolchain(at: root, includeDa3FallbackModel: false)
-
-        try await withEnvironmentAsync(["EASYSPLAT_SFM_BACKEND": "da3"]) {
-            let manager = ToolchainManager(
-                runner: makeValidationRunner(root: root),
-                localToolchainRoot: nil
-            )
-            XCTAssertNoThrow(
-                try manager.test_validateToolchain(
-                    root: root,
-                    requiredCapabilities: [.da3Base]
-                )
-            )
-        }
-    }
-
     func testValidateToolchainRejectsNonArmDa3Python() throws {
         let root = try TestFileBuilder.makeTempDir()
         defer { try? FileManager.default.removeItem(at: root) }
@@ -705,7 +697,7 @@ final class ToolchainManagerTests: XCTestCase {
         try "[]\n".write(to: fixture.da3BuildInfo, atomically: true, encoding: .utf8)
 
         let manager = ToolchainManager(runner: makeValidationRunner(root: root))
-        XCTAssertThrowsError(try manager.test_validateToolchain(root: root)) { error in
+        XCTAssertThrowsError(try manager.test_validateToolchain(root: root, requiredCapabilities: [.da3Base, .da3Small])) { error in
             guard case ToolchainManager.ToolchainError.invalidToolchain(let message) = error else {
                 return XCTFail("Expected invalidToolchain error")
             }
@@ -722,7 +714,12 @@ final class ToolchainManagerTests: XCTestCase {
 
         let manager = ToolchainManager(runner: runner, localToolchainRoot: root)
         let manifestURL = URL(string: "https://example.com/manifest.json")!
-        let toolchain = try await manager.ensureToolchain(manifestURL: manifestURL, publicKeyBase64: "ignored", targetName: "macos-arm64") { _, _ in }
+        let toolchain = try await manager.ensureToolchain(
+            manifestURL: manifestURL,
+            publicKeyBase64: "ignored",
+            request: ToolchainCapabilityRequest(capabilities: [.da3Base, .da3Small]),
+            onProgress: { _, _ in }
+        )
         XCTAssertEqual(toolchain.root, root)
     }
 

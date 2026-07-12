@@ -34,7 +34,7 @@ final class TrainingArtifactStoreTests: XCTestCase {
     func testCompletedArtifactRequiresOutputWithoutCheckpointFields() throws {
         let context = try makeContext()
         defer { context.cleanup() }
-        let completed = makeCompletedArtifact()
+        let completed = try makeCompletedArtifact(in: context)
 
         try TrainingArtifactStore.save(
             completed,
@@ -61,6 +61,51 @@ final class TrainingArtifactStoreTests: XCTestCase {
         )
     }
 
+    func testSaveRequiresMeasuredPeakMemoryForNewArtifacts() throws {
+        let context = try makeContext()
+        defer { context.cleanup() }
+
+        for prototype in [makeCheckpointedArtifact(), try makeCompletedArtifact(in: context)] {
+            var artifact = prototype
+            artifact.peakMemoryBytes = 0
+            XCTAssertThrowsError(
+                try TrainingArtifactStore.save(
+                    artifact,
+                    to: context.paths.trainingManifestURL,
+                    projectPaths: context.paths
+                )
+            )
+            var metadata = context.metadata
+            XCTAssertThrowsError(
+                try TrainingArtifactStore.persist(
+                    artifact,
+                    metadata: &metadata,
+                    paths: context.paths
+                )
+            )
+        }
+    }
+
+    func testLoadRejectsArtifactWithoutPeakMemory() throws {
+        let context = try makeContext()
+        defer { context.cleanup() }
+        let encoder = JSONEncoder()
+        var object = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: encoder.encode(makeCheckpointedArtifact()))
+                as? [String: Any]
+        )
+        object.removeValue(forKey: "peakMemoryBytes")
+        try JSONSerialization.data(withJSONObject: object)
+            .write(to: context.paths.trainingManifestURL)
+
+        XCTAssertThrowsError(
+            try TrainingArtifactStore.load(
+                from: context.paths.trainingManifestURL,
+                projectPaths: context.paths
+            )
+        )
+    }
+
     func testProjectMetadataRejectsInvalidEmbeddedTrainingArtifact() throws {
         let context = try makeContext()
         defer { context.cleanup() }
@@ -80,6 +125,47 @@ final class TrainingArtifactStoreTests: XCTestCase {
         metadata.trainingArtifact = mismatchedProfile
         XCTAssertThrowsError(
             try ProjectMetadataStore.save(metadata, to: context.paths.metadataURL)
+        )
+    }
+
+    func testCompletedArtifactBindsPromotedPublicPlyBytes() throws {
+        let context = try makeContext()
+        defer { context.cleanup() }
+        let artifact = try makeCompletedArtifact(in: context)
+        var metadata = context.metadata
+        try TrainingArtifactStore.persist(artifact, metadata: &metadata, paths: context.paths)
+
+        let publicOutput = context.paths.outputURL.appendingPathComponent("splat.ply")
+        try FileManager.default.copyItem(at: context.paths.msplatOutputURL, to: publicOutput)
+        var promotedArtifact = artifact
+        promotedArtifact.outputPath = "Output/splat.ply"
+        try TrainingArtifactStore.persist(
+            promotedArtifact,
+            metadata: &metadata,
+            paths: context.paths
+        )
+        metadata.outputs = OutputSpec(
+            splatPlyPath: "Output/splat.ply",
+            colmapModelPath: "SfM/colmap/sparse/0"
+        )
+        try ProjectMetadataStore.save(metadata, to: context.paths.metadataURL)
+
+        let original = try String(contentsOf: publicOutput, encoding: .utf8)
+        let replaced = original.replacingOccurrences(
+            of: "0 0 0 1 1 1",
+            with: "1 0 0 1 1 1"
+        )
+        XCTAssertEqual(replaced.utf8.count, original.utf8.count)
+        try replaced.write(to: publicOutput, atomically: true, encoding: .utf8)
+        XCTAssertEqual(ProjectArtifactValidator.validatePlyFile(at: publicOutput), .valid)
+
+        let loaded = try ProjectMetadataStore.load(from: context.paths.metadataURL)
+        let loadedArtifact = try XCTUnwrap(loaded.trainingArtifact)
+        XCTAssertThrowsError(
+            try TrainingArtifactStore.validateCompletedOutput(
+                loadedArtifact,
+                at: publicOutput
+            )
         )
     }
 
@@ -175,6 +261,9 @@ final class TrainingArtifactStoreTests: XCTestCase {
             metadata: &metadata,
             paths: context.paths
         )
+        // Simulate a project being tampered with after its secured directory layout
+        // was created. The production setup now creates this checkpoint directory.
+        try FileManager.default.removeItem(at: context.paths.msplatCheckpointURL)
         try FileManager.default.createSymbolicLink(
             at: context.paths.msplatCheckpointURL,
             withDestinationURL: outside
@@ -232,7 +321,7 @@ final class TrainingArtifactStoreTests: XCTestCase {
         defer { context.cleanup() }
         var metadata = context.metadata
         try TrainingArtifactStore.persist(
-            makeCompletedArtifact(),
+            try makeCompletedArtifact(in: context),
             metadata: &metadata,
             paths: context.paths
         )
@@ -276,7 +365,7 @@ final class TrainingArtifactStoreTests: XCTestCase {
         let metadata = ProjectMetadata(
             title: "Artifact",
             input: .photos(folder: "/tmp/photos"),
-            preset: PresetSpec(mode: .object, quality: .standard)
+            requestedRunOptions: RequestedRunOptions(capturePath: .orbit, detailProfile: .balanced)
         )
         try ProjectMetadataStore.save(metadata, to: paths.metadataURL)
         return ArtifactStoreTestContext(root: root, paths: paths, metadata: metadata)
@@ -304,12 +393,22 @@ final class TrainingArtifactStoreTests: XCTestCase {
         )
     }
 
-    private func makeCompletedArtifact() -> TrainingArtifact {
+    private func makeCompletedArtifact(in context: ArtifactStoreTestContext) throws -> TrainingArtifact {
+        try TestFileBuilder.writeMinimalPly(at: context.paths.msplatOutputURL)
         var artifact = makeCheckpointedArtifact()
         artifact.completedIteration = artifact.iterationLimit
         artifact.checkpointPath = nil
         artifact.checkpointDigest = nil
         artifact.outputPath = "Training/msplat/splat.ply"
+        artifact.outputSHA256 = try GeometryArtifactStore.sha256(
+            of: context.paths.msplatOutputURL
+        )
+        artifact.outputBytes = Int64(
+            try XCTUnwrap(
+                context.paths.msplatOutputURL.resourceValues(forKeys: [.fileSizeKey]).fileSize
+            )
+        )
+        artifact.gaussianCount = 1
         artifact.completionStatus = .completed
         return artifact
     }

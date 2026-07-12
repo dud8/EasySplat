@@ -65,16 +65,19 @@ final class RequestedRunOptionsTests: XCTestCase {
 }
 
 final class ProjectMetadataVersionTwoTests: XCTestCase {
-    func testNewMetadataDefaultsToVersionTwoAndRequestedOptions() {
+    func testNewMetadataUsesVersionTwoAndSuppliedRequestedOptions() {
         let metadata = ProjectMetadata(
             title: "New project",
             input: .photos(folder: "/tmp/photos"),
-            preset: PresetSpec(mode: .object, quality: .standard)
+            requestedRunOptions: RequestedRunOptions(capturePath: .orbit, detailProfile: .balanced)
         )
 
         XCTAssertEqual(ProjectMetadataStore.supportedFormatVersion, 2)
         XCTAssertEqual(metadata.formatVersion, 2)
-        XCTAssertEqual(metadata.requestedRunOptions, RequestedRunOptions())
+        XCTAssertEqual(
+            metadata.requestedRunOptions,
+            RequestedRunOptions(capturePath: .orbit, detailProfile: .balanced)
+        )
         XCTAssertNil(metadata.resolvedRunPlan)
         XCTAssertNil(metadata.geometryArtifact)
         XCTAssertNil(metadata.trainingArtifact)
@@ -178,7 +181,7 @@ func makeGeometryArtifact(
     canonicalModelPath: String = "SfM/canonical/model"
 ) -> GeometryArtifact {
     GeometryArtifact(
-        schemaVersion: 1,
+        schemaVersion: GeometryArtifact.currentSchemaVersion,
         solverVersion: "solver-1.2.3",
         runtimeVersion: "runtime-3.12",
         modelVersion: "model-2026-07",
@@ -203,7 +206,18 @@ func makeGeometryArtifact(
         timings: ["solve": 3.25, "refine": 1.75],
         peakMemoryBytes: 2_147_483_648,
         modelHashes: ["geometry-model-v1": "sha256:model"],
-        fallbackReason: nil
+        fallbackReason: nil,
+        provenance: GeometryProvenance(
+            toolchainVersion: "2.0.0",
+            solver: GeometryComponentProvenance(
+                identifier: "colmap",
+                version: "3.13.0",
+                revision: "fa7280fee27f97aff31ae7f98bab7f583fac7d08",
+                payloadSHA256: String(repeating: "a", count: 64)
+            ),
+            runtime: nil,
+            model: nil
+        )
     )
 }
 
@@ -226,6 +240,8 @@ func makeTrainingArtifact(
         checkpointPath: checkpointPath,
         checkpointDigest: checkpointPath == nil ? nil : String(repeating: "d", count: 64),
         outputPath: outputPath,
+        outputSHA256: outputPath == nil ? nil : String(repeating: "e", count: 64),
+        outputBytes: outputPath == nil ? nil : 1_024,
         gaussianCount: 245_000,
         elapsedSeconds: 812.5,
         peakMemoryBytes: 4_294_967_296,

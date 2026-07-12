@@ -44,27 +44,9 @@ public protocol ToolchainManaging: Sendable {
     func ensureToolchain(
         manifestURL: URL,
         publicKeyBase64: String,
-        targetName: String,
         request: ToolchainCapabilityRequest,
         onProgress: @escaping @Sendable (Double, String) -> Void
     ) async throws -> ToolchainPaths
-}
-
-public extension ToolchainManaging {
-    func ensureToolchain(
-        manifestURL: URL,
-        publicKeyBase64: String,
-        targetName: String,
-        onProgress: @escaping @Sendable (Double, String) -> Void
-    ) async throws -> ToolchainPaths {
-        try await ensureToolchain(
-            manifestURL: manifestURL,
-            publicKeyBase64: publicKeyBase64,
-            targetName: targetName,
-            request: .default,
-            onProgress: onProgress
-        )
-    }
 }
 
 public enum ToolchainCapability: String, Sendable, CaseIterable {
@@ -88,8 +70,6 @@ public struct ToolchainCapabilityRequest: Sendable, Equatable {
         Set(capabilities.map(\.rawValue))
     }
 
-    /// Preserves the pre-component installer behavior for existing protocol callers.
-    public static let `default` = ToolchainCapabilityRequest(capabilities: [.da3Base, .da3Small])
 }
 
 /// Downloads, verifies, installs, and validates toolchains for the app.
@@ -101,7 +81,7 @@ public final class ToolchainManager: @unchecked Sendable, ToolchainManaging {
         var signedManifest: ToolchainManifest?
 
         init(
-            schemaVersion: Int = 1,
+            schemaVersion: Int = ToolchainManifest.currentSchemaVersion,
             installedArtifacts: [String: String] = [:],
             installedCapabilities: [String] = [],
             signedManifest: ToolchainManifest? = nil
@@ -134,6 +114,7 @@ public final class ToolchainManager: @unchecked Sendable, ToolchainManaging {
         case signatureFailed
         case artifactNotFound
         case downloadFailed
+        case manifestTooLarge(maximumBytes: Int)
         case hashMismatch
         case unzipFailed
         case missingBinary(String)
@@ -154,6 +135,8 @@ public final class ToolchainManager: @unchecked Sendable, ToolchainManaging {
                 return "Toolchain artifact not found for this Mac."
             case .downloadFailed:
                 return "Failed to download the toolchain."
+            case .manifestTooLarge(let maximumBytes):
+                return "Toolchain manifest exceeds the \(maximumBytes)-byte download limit."
             case .hashMismatch:
                 return "Downloaded toolchain did not match the expected checksum."
             case .unzipFailed:
@@ -181,17 +164,23 @@ public final class ToolchainManager: @unchecked Sendable, ToolchainManaging {
     let urlSession: URLSession
     let appVersion: String
     let localToolchainRoot: URL?
+    let installationRoot: URL?
+    let allowInsecureLoopbackHTTP: Bool
 
     public init(
         runner: SubprocessRunning = SubprocessRunner(),
         urlSession: URLSession = .shared,
-        appVersion: String = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "0.0.0",
-        localToolchainRoot: URL? = DevelopmentOverrides.fromProcessEnvironment().localToolchainRoot
+        appVersion: String = EasySplatReleaseIdentity.version(),
+        localToolchainRoot: URL? = DevelopmentOverrides.fromProcessEnvironment().localToolchainRoot,
+        installationRoot: URL? = nil,
+        allowInsecureLoopbackHTTP: Bool = false
     ) {
         self.runner = runner
         self.urlSession = urlSession
         self.appVersion = appVersion
         self.localToolchainRoot = localToolchainRoot
+        self.installationRoot = installationRoot
+        self.allowInsecureLoopbackHTTP = allowInsecureLoopbackHTTP
     }
 
     public func toolchainRoot() -> URL {
@@ -199,32 +188,19 @@ public final class ToolchainManager: @unchecked Sendable, ToolchainManaging {
     }
 
     func toolchainRootURL() throws -> URL {
+        if let installationRoot {
+            return installationRoot
+        }
         guard let base = fileManager.urls(for: .applicationSupportDirectory, in: .userDomainMask).first else {
             throw ToolchainError.noApplicationSupportDirectory
         }
         return base.appendingPathComponent("EasySplat/Toolchains", isDirectory: true)
     }
 
-    public func ensureToolchain(
-        manifestURL: URL,
-        publicKeyBase64: String,
-        targetName: String = "macos-arm64",
-        onProgress: @escaping @Sendable (Double, String) -> Void
-    ) async throws -> ToolchainPaths {
-        try await ensureToolchain(
-            manifestURL: manifestURL,
-            publicKeyBase64: publicKeyBase64,
-            targetName: targetName,
-            request: .default,
-            onProgress: onProgress
-        )
-    }
-
     /// Installs only components providing the requested capabilities and their dependencies.
     public func ensureToolchain(
         manifestURL: URL,
         publicKeyBase64: String,
-        targetName: String = "macos-arm64",
         request: ToolchainCapabilityRequest,
         onProgress: @escaping @Sendable (Double, String) -> Void
     ) async throws -> ToolchainPaths {
@@ -262,132 +238,81 @@ public final class ToolchainManager: @unchecked Sendable, ToolchainManaging {
         guard manifest.verifying(publicKeyBase64: publicKeyBase64) else {
             throw ToolchainError.signatureFailed
         }
-
-        if manifest.schemaVersion >= ToolchainManifest.currentSchemaVersion {
-            try validateSchema2Manifest(manifest, publicKeyBase64: publicKeyBase64)
-            let components: [ToolchainManifest.Component]
-            do {
-                components = try manifest.resolvedComponents(requesting: request.manifestCapabilities)
-            } catch {
-                throw ToolchainError.invalidManifest
-            }
-            guard !components.isEmpty else { throw ToolchainError.artifactNotFound }
-
-            let versionedRoot = try toolchainRootURL().appendingPathComponent(manifest.version, isDirectory: true)
-            try recoverInterruptedInstalls(
-                at: versionedRoot.deletingLastPathComponent(),
-                publicKeyBase64: publicKeyBase64
-            )
-            if fileManager.fileExists(atPath: versionedRoot.path) {
-                onProgress(-1.0, "Validating tools")
-                if let receipt = try? validateSignedReceipt(
-                    root: versionedRoot,
-                    publicKeyBase64: publicKeyBase64,
-                    request: request
-                ),
-                   receipt.signatureEd25519 == manifest.signatureEd25519,
-                   let toolchain = try? validateToolchain(
-                    root: versionedRoot,
-                    requiredCapabilities: request.capabilities
-                   ) {
-                    onProgress(1.0, "Tools ready (cached)")
-                    return toolchain
-                }
-            }
-
-            let reusableState = try? validatedReusableInstallState(
-                root: versionedRoot,
-                publicKeyBase64: publicKeyBase64,
-                matching: manifest
-            )
-            let reusableNames = Set(reusableState.map { Array($0.installedArtifacts.keys) } ?? [])
-            let requestedNames = Set(components.map(\.name))
-            let retainedNames = reusableNames.union(requestedNames)
-            let retainedComponents = manifest.components.filter { retainedNames.contains($0.name) }
-            let missingComponents = retainedComponents.filter { !reusableNames.contains($0.name) }
-            let retainedCapabilities = Set(retainedComponents.flatMap(\.capabilities))
-            let validationCapabilities = Set(retainedCapabilities.compactMap(ToolchainCapability.init(rawValue:)))
-
-            try preflightDiskSpace(for: missingComponents, at: versionedRoot)
-            let toolchain = try await installToolchainAtomically(
-                versionedRoot: versionedRoot,
-                requiredCapabilities: validationCapabilities,
-                seedFromExistingRoot: reusableState == nil ? nil : versionedRoot,
-                onProgress: onProgress
-            ) { stagingRoot in
-                var state = reusableState ?? ToolchainInstallState()
-                state.schemaVersion = ToolchainManifest.currentSchemaVersion
-                state.installedCapabilities = retainedCapabilities.sorted()
-                state.signedManifest = manifest
-                for component in retainedComponents {
-                    try await ensureArtifact(
-                        component,
-                        root: stagingRoot,
-                        state: &state,
-                        onProgress: onProgress
-                    )
-                }
-                try saveInstallState(state, root: stagingRoot)
-            }
-            pruneSchema2Toolchains(keeping: manifest.version, publicKeyBase64: publicKeyBase64)
-            onProgress(1.0, "Tools ready")
-            return toolchain
+        guard semanticVersionComponents(from: manifest.version) != nil else {
+            throw ToolchainError.invalidManifest
         }
 
-        let versionedRoot = try toolchainRootURL().appendingPathComponent(manifest.version, isDirectory: true)
+        try validateSchema2Manifest(manifest, publicKeyBase64: publicKeyBase64)
+        let components: [ToolchainManifest.Component]
+        do {
+            components = try manifest.resolvedComponents(requesting: request.manifestCapabilities)
+        } catch {
+            throw ToolchainError.invalidManifest
+        }
+        guard !components.isEmpty else { throw ToolchainError.artifactNotFound }
 
+        let versionedRoot = try versionedToolchainRoot(for: manifest.version)
+        try recoverInterruptedInstalls(
+            at: versionedRoot.deletingLastPathComponent(),
+            publicKeyBase64: publicKeyBase64
+        )
         if fileManager.fileExists(atPath: versionedRoot.path) {
             onProgress(-1.0, "Validating tools")
-            if let toolchain = try? validateToolchain(root: versionedRoot) {
+            if let receipt = try? validateSignedReceipt(
+                root: versionedRoot,
+                publicKeyBase64: publicKeyBase64,
+                request: request
+            ),
+               receipt.signatureEd25519 == manifest.signatureEd25519,
+               let toolchain = try? validateToolchain(
+                root: versionedRoot,
+                requiredCapabilities: request.capabilities
+               ) {
                 onProgress(1.0, "Tools ready (cached)")
                 return toolchain
             }
         }
 
-        // Backward compatible: older manifests shipped a single monolithic artifact ("macos-arm64").
-        if let artifact = manifest.artifacts.first(where: { $0.name == targetName }) {
-            let toolchain = try await installToolchainAtomically(versionedRoot: versionedRoot, onProgress: onProgress) { stagingRoot in
-                let artifactURL = try validatedArtifactURL(artifact.url)
-                let zipURL = stagingRoot.appendingPathComponent("toolchain.zip")
-                try await downloadFile(url: artifactURL, to: zipURL, label: "Downloading tools", onProgress: onProgress)
+        let reusableState = try? validatedReusableInstallState(
+            root: versionedRoot,
+            publicKeyBase64: publicKeyBase64,
+            matching: manifest
+        )
+        let reusableNames = Set(reusableState.map { Array($0.installedArtifacts.keys) } ?? [])
+        let requestedNames = Set(components.map(\.name))
+        let retainedNames = reusableNames.union(requestedNames)
+        let retainedComponents = manifest.components.filter { retainedNames.contains($0.name) }
+        let missingComponents = retainedComponents.filter { !reusableNames.contains($0.name) }
+        let retainedCapabilities = Set(retainedComponents.flatMap(\.capabilities))
+        let validationCapabilities = Set(retainedCapabilities.compactMap(ToolchainCapability.init(rawValue:)))
 
-                let downloadedSize = try fileManager.attributesOfItem(atPath: zipURL.path)[.size] as? NSNumber
-                guard downloadedSize?.uint64Value == artifact.sizeBytes else {
-                    throw ToolchainError.hashMismatch
-                }
-                let computedHash = try sha256Hex(url: zipURL)
-                guard computedHash.lowercased() == artifact.sha256.lowercased() else {
-                    throw ToolchainError.hashMismatch
-                }
-
-                let unpackMessage = "Unpacking tools"
-                onProgress(-1.0, unpackMessage)
-                try unzip(zipURL: zipURL, to: stagingRoot)
-                try? fileManager.removeItem(at: zipURL)
-                try enforceExpectedContents(
-                    artifact: artifact,
+        let seedFromExistingRoot = reusableState == nil ? nil : versionedRoot
+        try preflightDiskSpace(
+            for: missingComponents,
+            at: versionedRoot,
+            seedFromExistingRoot: seedFromExistingRoot
+        )
+        let toolchain = try await installToolchainAtomically(
+            versionedRoot: versionedRoot,
+            requiredCapabilities: validationCapabilities,
+            seedFromExistingRoot: seedFromExistingRoot,
+            onProgress: onProgress
+        ) { stagingRoot in
+            var state = reusableState ?? ToolchainInstallState()
+            state.schemaVersion = ToolchainManifest.currentSchemaVersion
+            state.installedCapabilities = retainedCapabilities.sorted()
+            state.signedManifest = manifest
+            for component in retainedComponents {
+                try await ensureArtifact(
+                    component,
                     root: stagingRoot,
-                    unpackMessage: unpackMessage,
+                    state: &state,
                     onProgress: onProgress
                 )
             }
-            onProgress(1.0, "Tools ready")
-            return toolchain
+            try saveInstallState(state, root: stagingRoot)
         }
-
-        // Split toolchain: keep core binaries/env small-ish, ship model weights separately.
-        let coreName = "\(targetName)-core"
-        let modelsName = "\(targetName)-models"
-        guard let coreArtifact = manifest.artifacts.first(where: { $0.name == coreName }),
-              let modelsArtifact = manifest.artifacts.first(where: { $0.name == modelsName }) else {
-            throw ToolchainError.artifactNotFound
-        }
-
-        let toolchain = try await installToolchainAtomically(versionedRoot: versionedRoot, onProgress: onProgress) { stagingRoot in
-            var state = loadInstallState(root: stagingRoot)
-            try await ensureArtifact(coreArtifact, root: stagingRoot, state: &state, onProgress: onProgress)
-            try await ensureArtifact(modelsArtifact, root: stagingRoot, state: &state, onProgress: onProgress)
-        }
+        pruneSchema2Toolchains(keeping: manifest.version, publicKeyBase64: publicKeyBase64)
         onProgress(1.0, "Tools ready")
         return toolchain
     }

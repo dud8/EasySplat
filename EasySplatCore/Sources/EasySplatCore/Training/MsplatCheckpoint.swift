@@ -8,6 +8,7 @@ public struct MsplatCheckpointReceipt: Sendable, Equatable {
     public let payloadSHA256: String
     public let payloadBytes: Int64
     public let gaussianCount: Int
+    public let peakMemoryBytes: Int64
     public let inputDigest: String
     public let geometryDigest: String
     public let trainerBuildDigest: String
@@ -18,6 +19,7 @@ public struct MsplatCheckpointReceipt: Sendable, Equatable {
         payloadSHA256: String,
         payloadBytes: Int64,
         gaussianCount: Int,
+        peakMemoryBytes: Int64,
         inputDigest: String,
         geometryDigest: String,
         trainerBuildDigest: String
@@ -27,6 +29,7 @@ public struct MsplatCheckpointReceipt: Sendable, Equatable {
         self.payloadSHA256 = payloadSHA256
         self.payloadBytes = payloadBytes
         self.gaussianCount = gaussianCount
+        self.peakMemoryBytes = peakMemoryBytes
         self.inputDigest = inputDigest
         self.geometryDigest = geometryDigest
         self.trainerBuildDigest = trainerBuildDigest
@@ -83,7 +86,8 @@ enum MsplatCheckpointValidator {
               receipt.iteration >= 0,
               receipt.payloadBytes > 0,
               receipt.payloadBytes <= maximumPayloadBytes,
-              receipt.gaussianCount > 0 else {
+              receipt.gaussianCount > 0,
+              receipt.peakMemoryBytes > 0 else {
             throw MsplatCheckpointValidationError("checkpoint receipt is invalid")
         }
 
@@ -194,9 +198,11 @@ enum MsplatCheckpointValidator {
                   isSHA256(recordedPayloadDigest),
                   artifact.completedIteration >= 0,
                   artifact.completedIteration < artifact.iterationLimit,
-                  artifact.gaussianCount > 0 else {
+                  artifact.gaussianCount > 0,
+                  artifact.peakMemoryBytes > 0 else {
                 throw MsplatCheckpointValidationError("training manifest has no compatible resume record")
             }
+            let peakMemoryBytes = artifact.peakMemoryBytes
 
             let root = checkpointURL.standardizedFileURL
             try requireDirectory(root, name: "checkpoint root")
@@ -231,6 +237,7 @@ enum MsplatCheckpointValidator {
                 payloadSHA256: manifest.payloadSHA256,
                 payloadBytes: manifest.payloadBytes,
                 gaussianCount: manifest.gaussianCount,
+                peakMemoryBytes: peakMemoryBytes,
                 inputDigest: manifest.inputDigest,
                 geometryDigest: manifest.geometryDigest,
                 trainerBuildDigest: manifest.trainerBuildDigest

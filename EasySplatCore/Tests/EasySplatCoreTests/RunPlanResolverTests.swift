@@ -3,7 +3,7 @@ import XCTest
 @testable import EasySplatCore
 
 final class RunPlanResolverTests: XCTestCase {
-    func testPlanWrittenBeforeTopologyFieldsRemainsDecodable() throws {
+    func testIncompleteRunPlanIsRejected() throws {
         let json = """
         {
           "routeIdentifier": "da3",
@@ -22,14 +22,9 @@ final class RunPlanResolverTests: XCTestCase {
         }
         """
 
-        let plan = try JSONDecoder().decode(ResolvedRunPlan.self, from: Data(json.utf8))
-
-        XCTAssertEqual(plan.capturePath, .automatic)
-        XCTAssertEqual(plan.inputOrdering, .automatic)
-        XCTAssertEqual(plan.photoSelection, .automatic)
-        XCTAssertEqual(plan.pairingPolicy, .unorderedRetrieval)
-        XCTAssertEqual(plan.sequentialOverlap, 10)
-        XCTAssertEqual(plan.deterministicSeed, 42)
+        XCTAssertThrowsError(
+            try JSONDecoder().decode(ResolvedRunPlan.self, from: Data(json.utf8))
+        )
     }
 
     func testDefaultBalancedPhotoPlanUsesAnchoredBaseThenColmapFallback() {
@@ -53,6 +48,10 @@ final class RunPlanResolverTests: XCTestCase {
         XCTAssertEqual(plan.lensProjection, .automatic)
         XCTAssertEqual(plan.trainerIterationLimit, 7_000)
         XCTAssertEqual(plan.plateauWindow, 800)
+        XCTAssertEqual(plan.colmapMaximumFeatureCount, 10_000)
+        XCTAssertEqual(plan.colmapMaximumMatchCount, 10_000)
+        XCTAssertEqual(plan.colmapExhaustiveBlockSize, 25)
+        XCTAssertEqual(plan.colmapThreadLimit, 8)
         XCTAssertEqual(plan.deterministicSeed, 42)
         XCTAssertEqual(
             plan.requiredToolchainCapabilities,
@@ -97,6 +96,10 @@ final class RunPlanResolverTests: XCTestCase {
             XCTAssertEqual(plan.chunkSize, 4)
             XCTAssertLessThan(plan.keyframeBudget, automatic48GB.keyframeBudget)
             XCTAssertLessThan(plan.maximumImageDimension, automatic48GB.maximumImageDimension)
+            XCTAssertEqual(plan.colmapMaximumFeatureCount, 4_096)
+            XCTAssertEqual(plan.colmapMaximumMatchCount, 4_096)
+            XCTAssertEqual(plan.colmapExhaustiveBlockSize, 10)
+            XCTAssertEqual(plan.colmapThreadLimit, 4)
         }
     }
 
@@ -143,6 +146,76 @@ final class RunPlanResolverTests: XCTestCase {
         XCTAssertEqual(performance.chunkSize, 10)
         XCTAssertGreaterThan(performance.keyframeBudget, constrained.keyframeBudget)
         XCTAssertGreaterThan(performance.maximumImageDimension, constrained.maximumImageDimension)
+        XCTAssertEqual(performance.colmapMaximumFeatureCount, 12_000)
+        XCTAssertEqual(performance.colmapMaximumMatchCount, 12_000)
+        XCTAssertEqual(performance.colmapExhaustiveBlockSize, 32)
+        XCTAssertEqual(performance.colmapThreadLimit, 10)
+    }
+
+    func testMaximumPerformanceIsUnavailableThroughTheConstrainedMemoryBoundary() {
+        XCTAssertFalse(RunPlanResolver.supports(resourcePolicy: .maximumPerformance, memoryGB: 8))
+        XCTAssertFalse(RunPlanResolver.supports(resourcePolicy: .maximumPerformance, memoryGB: 16))
+        XCTAssertFalse(RunPlanResolver.supports(resourcePolicy: .maximumPerformance, memoryGB: 16.5))
+        XCTAssertTrue(RunPlanResolver.supports(resourcePolicy: .maximumPerformance, memoryGB: 24))
+
+        XCTAssertTrue(RunPlanResolver.supports(resourcePolicy: .automatic, memoryGB: 8))
+        XCTAssertTrue(RunPlanResolver.supports(resourcePolicy: .conserveMemory, memoryGB: 8))
+
+        let hardware = HardwareProfile(memoryGB: 16.5, cpuCount: 10, gpuWorkingSetGB: 12)
+        let automatic = RunPlanResolver.resolve(
+            requestedOptions: RequestedRunOptions(resourcePolicy: .automatic),
+            input: .video(files: ["/tmp/one.mov"]),
+            hardware: hardware,
+            developmentOverrides: .none
+        )
+        let maximum = RunPlanResolver.resolve(
+            requestedOptions: RequestedRunOptions(resourcePolicy: .maximumPerformance),
+            input: .video(files: ["/tmp/one.mov"]),
+            hardware: hardware,
+            developmentOverrides: .none
+        )
+        XCTAssertEqual(maximum, automatic)
+    }
+
+    func testContinuousOrderingIsUnavailableForSeparateClipsAndMixedInput() {
+        XCTAssertTrue(RunPlanResolver.supports(
+            inputOrdering: .continuous,
+            input: .video(files: ["/tmp/one.mov"])
+        ))
+        XCTAssertTrue(RunPlanResolver.supports(
+            inputOrdering: .continuous,
+            input: .photos(folder: "/tmp/photos")
+        ))
+        XCTAssertFalse(RunPlanResolver.supports(
+            inputOrdering: .continuous,
+            input: .video(files: ["/tmp/one.mov", "/tmp/two.mov"])
+        ))
+        XCTAssertFalse(RunPlanResolver.supports(
+            inputOrdering: .continuous,
+            input: .mixed(videos: ["/tmp/one.mov"], photosFolder: "/tmp/photos")
+        ))
+    }
+
+    func testHardwareValidationRejectsUnsafeDetailProfilesBeforeProjectCreation() {
+        XCTAssertThrowsError(try RunPlanResolver.validate(
+            requestedOptions: RequestedRunOptions(detailProfile: .balanced),
+            input: .video(files: ["/tmp/clip.mov"]),
+            hardware: HardwareProfile(memoryGB: 8, cpuCount: 8, gpuWorkingSetGB: 6)
+        )) { error in
+            XCTAssertEqual(error as? RunPlanResolver.ValidationError, .fastDetailRequired)
+        }
+        XCTAssertThrowsError(try RunPlanResolver.validate(
+            requestedOptions: RequestedRunOptions(detailProfile: .highDetail),
+            input: .video(files: ["/tmp/clip.mov"]),
+            hardware: HardwareProfile(memoryGB: 16, cpuCount: 10, gpuWorkingSetGB: 12)
+        )) { error in
+            XCTAssertEqual(error as? RunPlanResolver.ValidationError, .highDetailRequiresMoreMemory)
+        }
+        XCTAssertNoThrow(try RunPlanResolver.validate(
+            requestedOptions: RequestedRunOptions(detailProfile: .highDetail),
+            input: .video(files: ["/tmp/clip.mov"]),
+            hardware: HardwareProfile(memoryGB: 24, cpuCount: 12, gpuWorkingSetGB: 18)
+        ))
     }
 
     func testCapturePathChangesOrderedPairingAndKeyframePolicy() {
@@ -293,7 +366,6 @@ final class RunPlanResolverTests: XCTestCase {
         let metadata = ProjectMetadata(
             title: "Plan",
             input: .photos(folder: source.path),
-            preset: PresetSpec(mode: .room, quality: .draft),
             requestedRunOptions: options
         )
         try ProjectMetadataStore.save(metadata, to: paths.metadataURL)
@@ -302,7 +374,6 @@ final class RunPlanResolverTests: XCTestCase {
             projectURL: projectURL,
             config: .init(
                 toolchain: toolchain,
-                preset: metadata.preset,
                 developmentOverrides: .init(stopAfterStage: .importInput, benchmarkSeed: 7)
             )
         )
@@ -318,5 +389,204 @@ final class RunPlanResolverTests: XCTestCase {
         XCTAssertEqual(plan.deterministicSeed, 7)
         XCTAssertEqual(saved.state.stage, .importInput)
         XCTAssertNil(saved.lastRunStartedAt)
+    }
+
+    func testUseAllValidPhotosExposesItsSafeLimitBeforeSetup() throws {
+        let input = InputSpec.photos(folder: "/tmp/photos")
+        let plan = RunPlanResolver.resolve(
+            requestedOptions: RequestedRunOptions(
+                detailProfile: .fast,
+                resourcePolicy: .conserveMemory,
+                photoSelection: .useAllValidPhotos
+            ),
+            input: input,
+            hardware: HardwareProfile(memoryGB: 16, cpuCount: 10, gpuWorkingSetGB: 12),
+            developmentOverrides: .none
+        )
+
+        XCTAssertEqual(RunPlanResolver.maximumValidPhotoCount(for: plan), plan.keyframeBudget)
+        XCTAssertNoThrow(
+            try RunPlanResolver.validatePhotoSelection(
+                validPhotoCount: plan.keyframeBudget,
+                resolvedPlan: plan
+            )
+        )
+        XCTAssertThrowsError(
+            try RunPlanResolver.validatePhotoSelection(
+                validPhotoCount: plan.keyframeBudget + 1,
+                resolvedPlan: plan
+            )
+        ) { error in
+            XCTAssertEqual(
+                error as? RunPlanResolver.ValidationError,
+                .photoSelectionExceedsSafeLimit(
+                    selected: plan.keyframeBudget + 1,
+                    maximum: plan.keyframeBudget
+                )
+            )
+        }
+    }
+
+    func testMixedUseAllPhotoLimitReservesOneQuarterOfPlanForVideo() throws {
+        let input = InputSpec.mixed(
+            videos: ["/tmp/walkthrough.mov"],
+            photosFolder: "/tmp/photos"
+        )
+        let plan = RunPlanResolver.resolve(
+            requestedOptions: RequestedRunOptions(
+                detailProfile: .fast,
+                resourcePolicy: .conserveMemory,
+                photoSelection: .useAllValidPhotos
+            ),
+            input: input,
+            hardware: HardwareProfile(memoryGB: 16, cpuCount: 10, gpuWorkingSetGB: 12),
+            developmentOverrides: .none
+        )
+        let maximum = try XCTUnwrap(
+            RunPlanResolver.maximumValidPhotoCount(for: plan, input: input)
+        )
+
+        XCTAssertEqual(maximum, plan.keyframeBudget - max(2, plan.keyframeBudget / 4))
+        XCTAssertNoThrow(try RunPlanResolver.validatePhotoSelection(
+            validPhotoCount: maximum,
+            resolvedPlan: plan,
+            input: input
+        ))
+        XCTAssertThrowsError(try RunPlanResolver.validatePhotoSelection(
+            validPhotoCount: maximum + 1,
+            resolvedPlan: plan,
+            input: input
+        )) { error in
+            XCTAssertEqual(
+                error as? RunPlanResolver.ValidationError,
+                .photoSelectionExceedsSafeLimit(selected: maximum + 1, maximum: maximum)
+            )
+        }
+    }
+
+    func testPhotoPreflightRejectsNoValidPhotos() {
+        XCTAssertThrowsError(try RunPlanResolver.validatePhotoSelection(
+            validPhotoCount: 0,
+            resolvedPlan: RunPlanResolver.resolve(
+                requestedOptions: RequestedRunOptions(),
+                input: .photos(folder: "/tmp/photos"),
+                hardware: HardwareProfile(memoryGB: 24, cpuCount: 12, gpuWorkingSetGB: 18),
+                developmentOverrides: .none
+            ),
+            input: .photos(folder: "/tmp/photos")
+        )) { error in
+            XCTAssertEqual(error as? RunPlanResolver.ValidationError, .noValidPhotos)
+        }
+    }
+
+    func testAutomaticPhotoSelectionHasNoPreflightPhotoLimit() throws {
+        let plan = RunPlanResolver.resolve(
+            requestedOptions: RequestedRunOptions(photoSelection: .automatic),
+            input: .photos(folder: "/tmp/photos"),
+            hardware: HardwareProfile(memoryGB: 8, cpuCount: 8, gpuWorkingSetGB: 6),
+            developmentOverrides: .none
+        )
+
+        XCTAssertNil(RunPlanResolver.maximumValidPhotoCount(for: plan))
+        XCTAssertNoThrow(
+            try RunPlanResolver.validatePhotoSelection(
+                validPhotoCount: 50_000,
+                resolvedPlan: plan
+            )
+        )
+    }
+
+    func testChangedRunPlanRestartsAtTheSafeFrameBoundary() {
+        let options = RequestedRunOptions(detailProfile: .balanced)
+        let video = InputSpec.video(files: ["/tmp/clip.mov"])
+        let photos = InputSpec.photos(folder: "/tmp/photos")
+        let oldPlan = RunPlanResolver.resolve(
+            requestedOptions: options,
+            input: video,
+            hardware: HardwareProfile(memoryGB: 48, cpuCount: 16, gpuWorkingSetGB: 36),
+            developmentOverrides: .none
+        )
+        let currentVideoPlan = RunPlanResolver.resolve(
+            requestedOptions: options,
+            input: video,
+            hardware: HardwareProfile(memoryGB: 16, cpuCount: 10, gpuWorkingSetGB: 12),
+            developmentOverrides: .none
+        )
+        let currentPhotoPlan = RunPlanResolver.resolve(
+            requestedOptions: options,
+            input: photos,
+            hardware: HardwareProfile(memoryGB: 16, cpuCount: 10, gpuWorkingSetGB: 12),
+            developmentOverrides: .none
+        )
+
+        XCTAssertEqual(
+            RunPlanResolver.safeResumeStage(
+                .trainSplat,
+                input: video,
+                previousPlan: oldPlan,
+                currentPlan: currentVideoPlan
+            ),
+            .importInput
+        )
+        XCTAssertEqual(
+            RunPlanResolver.safeResumeStage(
+                .trainSplat,
+                input: photos,
+                previousPlan: oldPlan,
+                currentPlan: currentPhotoPlan
+            ),
+            .extractFrames
+        )
+        XCTAssertEqual(
+            RunPlanResolver.safeResumeStage(
+                .importInput,
+                input: photos,
+                previousPlan: oldPlan,
+                currentPlan: currentPhotoPlan
+            ),
+            .importInput
+        )
+        XCTAssertEqual(
+            RunPlanResolver.safeResumeStage(
+                .trainSplat,
+                input: video,
+                previousPlan: currentVideoPlan,
+                currentPlan: currentVideoPlan
+            ),
+            .trainSplat
+        )
+        XCTAssertEqual(
+            RunPlanResolver.safeResumeStage(
+                .trainSplat,
+                input: video,
+                previousPlan: nil,
+                currentPlan: currentVideoPlan
+            ),
+            .trainSplat
+        )
+
+        var geometryPlan = currentVideoPlan
+        geometryPlan.colmapMaximumFeatureCount += 1
+        XCTAssertEqual(
+            RunPlanResolver.safeResumeStage(
+                .trainSplat,
+                input: video,
+                previousPlan: currentVideoPlan,
+                currentPlan: geometryPlan
+            ),
+            .selectFrames
+        )
+
+        var trainingPlan = currentVideoPlan
+        trainingPlan.trainerIterationLimit += 1
+        XCTAssertEqual(
+            RunPlanResolver.safeResumeStage(
+                .exportSplat,
+                input: video,
+                previousPlan: currentVideoPlan,
+                currentPlan: trainingPlan
+            ),
+            .sfmMapping
+        )
     }
 }

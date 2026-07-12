@@ -49,6 +49,18 @@ final class LastOpenedSidecarTests: XCTestCase {
         XCTAssertNil(LastOpenedSidecar.load(from: linked))
     }
 
+    func testLoadRejectsMultiplyLinkedFile() throws {
+        let root = try TestFileBuilder.makeTempDir()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let outside = root.appendingPathComponent("outside.json")
+        let stamp = Date(timeIntervalSince1970: 1_800_000_000)
+        try LastOpenedSidecar.save(stamp, to: outside)
+        let linked = root.appendingPathComponent("last_opened.json")
+        try FileManager.default.linkItem(at: outside, to: linked)
+
+        XCTAssertNil(LastOpenedSidecar.load(from: linked))
+    }
+
     func testSaveCreatesParentDirectoryIfNeeded() throws {
         let root = try TestFileBuilder.makeTempDir()
         defer { try? FileManager.default.removeItem(at: root) }

@@ -2,10 +2,6 @@ import Foundation
 
 #if DEBUG
 extension ToolchainManager {
-    func test_validateToolchain(root: URL) throws -> ToolchainPaths {
-        try validateToolchain(root: root)
-    }
-
     func test_validateToolchain(root: URL, requiredCapabilities: Set<ToolchainCapability>) throws -> ToolchainPaths {
         try validateToolchain(root: root, requiredCapabilities: requiredCapabilities)
     }
@@ -34,15 +30,15 @@ extension ToolchainManager {
         try validateArchiveEntries(entries)
     }
 
-    func test_validateExecutableHashes(_ hashes: [String: String], root: URL) throws {
-        try validateExecutableHashes(hashes, root: root)
+    func test_validateCriticalFileHashes(_ hashes: [String: String], root: URL) throws {
+        try validateCriticalFileHashes(hashes, root: root)
     }
 
     func test_validateSignedReceipt(
         root: URL,
         publicKeyBase64: String,
         request: ToolchainCapabilityRequest
-    ) throws -> ToolchainManifest? {
+    ) throws -> ToolchainManifest {
         try validateSignedReceipt(
             root: root,
             publicKeyBase64: publicKeyBase64,
@@ -58,8 +54,12 @@ extension ToolchainManager {
         try validateSchema2Manifest(manifest, publicKeyBase64: publicKeyBase64)
     }
 
+    func test_versionedToolchainRoot(for version: String) throws -> URL {
+        try versionedToolchainRoot(for: version)
+    }
+
     func test_ensureArtifact(
-        _ artifact: ToolchainManifest.Artifact,
+        _ artifact: ToolchainManifest.Component,
         root: URL,
         onProgress: @escaping @Sendable (Double, String) -> Void
     ) async throws {

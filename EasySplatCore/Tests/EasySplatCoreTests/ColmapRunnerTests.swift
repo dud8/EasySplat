@@ -380,6 +380,34 @@ final class ColmapRunnerTests: XCTestCase {
         )
     }
 
+    func testImageUndistorterProducesBoundedColmapWorkspace() async throws {
+        let runner = MockSubprocessRunner(scripts: [
+            .init(
+                path: "/mock/colmap",
+                argsPrefix: ["image_undistorter"],
+                result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""),
+                onRun: { args in
+                    XCTAssertEqual(self.value(for: "--image_path", in: args), "/tmp/images")
+                    XCTAssertEqual(self.value(for: "--input_path", in: args), "/tmp/sparse")
+                    XCTAssertEqual(self.value(for: "--output_path", in: args), "/tmp/undistorted")
+                    XCTAssertEqual(self.value(for: "--output_type", in: args), "COLMAP")
+                    XCTAssertEqual(self.value(for: "--copy_policy", in: args), "COPY")
+                    XCTAssertEqual(self.value(for: "--max_image_size", in: args), "2048")
+                }
+            )
+        ])
+
+        try await ColmapRunner(runner: runner).runImageUndistorter(
+            colmapPath: URL(fileURLWithPath: "/mock/colmap"),
+            imagePath: URL(fileURLWithPath: "/tmp/images"),
+            inputPath: URL(fileURLWithPath: "/tmp/sparse"),
+            outputPath: URL(fileURLWithPath: "/tmp/undistorted"),
+            maxImageSize: 2_048,
+            environment: [:],
+            onLog: { _, _ in }
+        )
+    }
+
     private func value(for flag: String, in args: [String]) -> String? {
         guard let index = args.firstIndex(of: flag), index + 1 < args.count else { return nil }
         return args[index + 1]

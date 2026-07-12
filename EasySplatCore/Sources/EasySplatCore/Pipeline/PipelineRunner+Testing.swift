@@ -5,41 +5,22 @@ struct TestSelectedFrameMapping: Codable, Sendable {
     let outputFileName: String
     let groupId: String
     let isVideo: Bool
-    let sourcePath: String
     let timestampSeconds: Double?
+    let lowLightExposureEV: Double?
 
     init(
         outputFileName: String,
         groupId: String,
         isVideo: Bool,
-        sourcePath: String,
-        timestampSeconds: Double? = nil
+        timestampSeconds: Double? = nil,
+        lowLightExposureEV: Double? = nil
     ) {
         self.outputFileName = outputFileName
         self.groupId = groupId
         self.isVideo = isVideo
-        self.sourcePath = sourcePath
         self.timestampSeconds = timestampSeconds
+        self.lowLightExposureEV = lowLightExposureEV
     }
-}
-
-struct TestFrameExtractionProfile: Sendable {
-    let targetCount: Int
-    let maxDimension: CGFloat
-    let targetFPS: Int
-    let minDistanceRatio: Double
-    let sharpnessFloor: Double
-    let sharpnessRatio: Double
-    let outputFormat: FrameOutputFormat
-    let maxExtractedFrames: Int?
-}
-
-struct TestColmapSpeedProfile: Sendable {
-    let maxImageSize: Int
-    let extractSequentialOverlap: Int
-    let matchSequentialOverlap: Int
-    let maxNumFeatures: Int?
-    let maxNumMatches: Int?
 }
 
 enum TestStageOutputStatus: Equatable, Sendable {
@@ -84,24 +65,30 @@ extension PipelineRunner {
     func test_copySelected(
         groups: [SelectedFrameGroup],
         to directory: URL,
-        manifestURL: URL
+        manifestURL: URL,
+        maxDimension: CGFloat = .greatestFiniteMagnitude
     ) throws -> [TestSelectedFrameMapping] {
-        let result = try copySelected(groups: groups, to: directory, manifestURL: manifestURL)
+        let result = try copySelected(
+            groups: groups,
+            to: directory,
+            manifestURL: manifestURL,
+            maxDimension: maxDimension
+        )
         return result.manifest.map {
             TestSelectedFrameMapping(
                 outputFileName: $0.outputFileName,
                 groupId: $0.groupId,
                 isVideo: $0.isVideo,
-                sourcePath: $0.sourcePath,
-                timestampSeconds: $0.timestampSeconds
+                timestampSeconds: $0.timestampSeconds,
+                lowLightExposureEV: $0.lowLightExposureEV
             )
         }
     }
 
     func test_filterValidUniquePhotos(
         _ photos: [URL]
-    ) -> (frames: [URL], unreadableCount: Int, duplicateCount: Int) {
-        let result = filterValidUniquePhotos(photos)
+    ) throws -> (frames: [URL], unreadableCount: Int, duplicateCount: Int) {
+        let result = try filterValidUniquePhotos(photos)
         return (result.frames, result.unreadableCount, result.duplicateCount)
     }
 
@@ -144,44 +131,6 @@ extension PipelineRunner {
         return (result.frames, result.dropped)
     }
 
-    func test_frameExtractionProfile(for quality: QualityPreset) -> TestFrameExtractionProfile {
-        let profile = frameExtractionProfile(for: quality)
-        return TestFrameExtractionProfile(
-            targetCount: profile.targetCount,
-            maxDimension: profile.maxDimension,
-            targetFPS: profile.targetFPS,
-            minDistanceRatio: profile.minDistanceRatio,
-            sharpnessFloor: profile.sharpnessFloor,
-            sharpnessRatio: profile.sharpnessRatio,
-            outputFormat: profile.outputFormat,
-            maxExtractedFrames: profile.maxExtractedFrames
-        )
-    }
-
-    func test_applySpeedProfileToColmap(
-        maxImageSize: Int,
-        extractSequentialOverlap: Int,
-        matchSequentialOverlap: Int
-    ) -> TestColmapSpeedProfile {
-        var imageSize = maxImageSize
-        var extract = colmapOptionsForExtraction()
-        var match = colmapOptionsForMatching()
-        extract.sequentialOverlap = extractSequentialOverlap
-        match.sequentialOverlap = matchSequentialOverlap
-        applySpeedProfileIfNeeded(
-            colmapMaxImageSize: &imageSize,
-            colmapExtractOptions: &extract,
-            colmapMatchOptions: &match
-        )
-        return TestColmapSpeedProfile(
-            maxImageSize: imageSize,
-            extractSequentialOverlap: extract.sequentialOverlap,
-            matchSequentialOverlap: match.sequentialOverlap,
-            maxNumFeatures: extract.maxNumFeatures,
-            maxNumMatches: match.maxNumMatches
-        )
-    }
-
     func test_shouldUseSequential(selectedFrames: [URL], input: InputSpec, forceExhaustive: Bool) -> Bool {
         shouldUseSequential(selectedFrames: selectedFrames, input: input, forceExhaustive: forceExhaustive)
     }
@@ -194,27 +143,8 @@ extension PipelineRunner {
         Self.normalizedToolLogIsError(line, isError: isError)
     }
 
-    func test_sfmBackendPolicy() -> SfmBackend {
-        sfmBackendPolicy()
-    }
-
-    func test_sfmBackendFallbackOrder() -> [SfmBackend] {
-        sfmBackendFallbackOrder(override: sfmBackendOverride())
-    }
-
-    func test_da3ResolvedInputOrdering(requested: InputOrdering, input: InputSpec) -> InputOrdering {
-        da3ResolvedInputOrdering(requested: requested, input: input)
-    }
-
-    func test_da3DirectMinimumMeanTrackLengthPreference(capturePath: CapturePath) -> Double {
-        da3DirectMinimumMeanTrackLengthPreference(capturePath: capturePath)
-    }
-
-    func test_da3DirectQualityFailureReason(
-        score: ReconstructionScore,
-        capturePath: CapturePath
-    ) -> String? {
-        da3DirectQualityFailureReason(score: score, capturePath: capturePath)
+    func test_da3SeedWindowOverlap(windowSize: Int, hardwareTier: HardwareProfile.Tier) -> Int {
+        da3SeedWindowOverlap(windowSize: windowSize, hardwareTier: hardwareTier)
     }
 
     func test_globalMapperOptions(threadHint: Int, defaultUseGpu: Bool = true) -> ColmapGlobalMapperOptions {
@@ -258,6 +188,10 @@ extension PipelineRunner {
 
     func test_makePipelineErrorImageTranscodeFailed(_ message: String) -> Error {
         PipelineError.imageTranscodeFailed(message)
+    }
+
+    func test_makePipelineErrorPhotoSelectionExceedsBudget(selected: Int, maximum: Int) -> Error {
+        PipelineError.photoSelectionExceedsBudget(selected: selected, maximum: maximum)
     }
 
     func test_makePipelineErrorOutputMissing() -> Error {

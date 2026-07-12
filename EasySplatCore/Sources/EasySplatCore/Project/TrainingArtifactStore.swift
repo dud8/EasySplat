@@ -110,7 +110,23 @@ public enum TrainingArtifactStore {
         try ProjectMetadataStore.savePreservingUserEditableFields(metadata, to: paths.metadataURL)
     }
 
-    static func validateArtifact(_ artifact: TrainingArtifact, projectPaths: ProjectPaths) throws {
+    static func validateArtifact(
+        _ artifact: TrainingArtifact,
+        projectPaths: ProjectPaths
+    ) throws {
+        try validateManifest(artifact, projectPaths: projectPaths)
+        if artifact.completionStatus == .completed, let path = artifact.outputPath {
+            try validateOutputBinding(
+                artifact,
+                outputURL: projectPaths.resolveProjectRelativePath(path)
+            )
+        }
+    }
+
+    static func validateManifest(
+        _ artifact: TrainingArtifact,
+        projectPaths: ProjectPaths
+    ) throws {
         let expectedBudget: (iterationLimit: Int, plateauWindow: Int) = switch artifact.detailProfile {
         case .fast: (3_000, 400)
         case .balanced: (7_000, 800)
@@ -128,7 +144,7 @@ public enum TrainingArtifactStore {
               artifact.completedIteration <= artifact.iterationLimit,
               artifact.gaussianCount > 0,
               artifact.elapsedSeconds.map({ $0.isFinite && $0 >= 0 }) ?? true,
-              artifact.peakMemoryBytes.map({ $0 >= 0 }) ?? true else {
+              artifact.peakMemoryBytes > 0 else {
             throw TrainingArtifactStoreError.invalidManifest
         }
 
@@ -139,13 +155,19 @@ public enum TrainingArtifactStore {
                   let digest = artifact.checkpointDigest,
                   isSHA256(digest),
                   artifact.completedIteration < artifact.iterationLimit,
-                  artifact.outputPath == nil else {
+                  artifact.outputPath == nil,
+                  artifact.outputSHA256 == nil,
+                  artifact.outputBytes == nil else {
                 throw TrainingArtifactStoreError.invalidManifest
             }
             _ = try projectPaths.resolveProjectRelativePath(path)
         case .completed:
             guard let path = artifact.outputPath,
                   path == "Training/msplat/splat.ply" || path == "Output/splat.ply",
+                  let outputSHA256 = artifact.outputSHA256,
+                  isSHA256(outputSHA256),
+                  let outputBytes = artifact.outputBytes,
+                  outputBytes > 0,
                   artifact.completedIteration > 0,
                   artifact.checkpointPath == nil,
                   artifact.checkpointDigest == nil else {
@@ -153,6 +175,31 @@ public enum TrainingArtifactStore {
             }
             _ = try projectPaths.resolveProjectRelativePath(path)
         }
+    }
+
+    static func validateOutputBinding(
+        _ artifact: TrainingArtifact,
+        outputURL: URL
+    ) throws {
+        guard artifact.completionStatus == .completed,
+              let expectedDigest = artifact.outputSHA256,
+              let expectedBytes = artifact.outputBytes,
+              ProjectArtifactValidator.validatePlyFile(at: outputURL) == .valid,
+              let header = ProjectArtifactValidator.readPlyHeader(at: outputURL),
+              header.vertexCount == artifact.gaussianCount,
+              let size = try? outputURL.resourceValues(forKeys: [.fileSizeKey]).fileSize,
+              Int64(size) == expectedBytes,
+              let digest = try? GeometryArtifactStore.sha256(of: outputURL),
+              digest == expectedDigest else {
+            throw TrainingArtifactStoreError.invalidManifest
+        }
+    }
+
+    public static func validateCompletedOutput(
+        _ artifact: TrainingArtifact,
+        at outputURL: URL
+    ) throws {
+        try validateOutputBinding(artifact, outputURL: outputURL)
     }
 
     private static func validateManifestLocation(_ url: URL, projectPaths: ProjectPaths) throws {

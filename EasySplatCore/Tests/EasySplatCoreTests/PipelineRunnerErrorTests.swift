@@ -13,7 +13,7 @@ final class PipelineRunnerErrorTests: XCTestCase {
         let score = ReconstructionScore(registeredImages: 1, totalImages: 10, meanReprojectionError: 5.0)
         let lowQuality = runner.test_makePipelineErrorLowQuality(score)
         let lowQualityMessage = runner.test_failureMessages(for: lowQuality, stage: .sfmMapping)
-        XCTAssertEqual(lowQualityMessage.userMessage, "I couldn't get a stable camera solve. Try a slower capture and more light.")
+        XCTAssertEqual(lowQualityMessage.userMessage, "The camera solve was unstable. Try a slower capture with more light.")
         XCTAssertTrue(lowQualityMessage.debugMessage.contains("Low-quality reconstruction"))
 
         let transcode = runner.test_makePipelineErrorImageTranscodeFailed("bad")
@@ -25,20 +25,17 @@ final class PipelineRunnerErrorTests: XCTestCase {
         XCTAssertEqual(outputMessage.userMessage, "Processing failed. Expected outputs were missing.")
     }
 
-    func testLowQualityFailureMessageMasksPlaceholderReprojectionForKnownMapper() {
+    func testPhotoBudgetFailureDoesNotRecommendAResourcePolicyThatLowersTheLimit() {
         let runner = makeRunner()
-        let score = ReconstructionScore(
-            registeredImages: 3,
-            totalImages: 10,
-            meanReprojectionError: 0.0003,
-            pointCount: 120
+        let error = runner.test_makePipelineErrorPhotoSelectionExceedsBudget(
+            selected: 300,
+            maximum: 250
         )
 
-        let error = runner.test_makePipelineErrorLowQuality(score, mapper: "global_mapper")
-        let message = runner.test_failureMessages(for: error, stage: .sfmMapping)
+        let message = runner.test_failureMessages(for: error, stage: .selectFrames)
 
-        XCTAssertTrue(message.debugMessage.contains("mean reprojection error n/a"))
-        XCTAssertFalse(message.debugMessage.contains("0.00"))
+        XCTAssertTrue(message.userMessage.contains("Automatic selection"))
+        XCTAssertFalse(message.userMessage.contains("Conserve Memory"))
     }
 
     func testLowQualityFailureMessageKeepsReliableMapperReprojection() {
@@ -59,7 +56,7 @@ final class PipelineRunnerErrorTests: XCTestCase {
     func testFailureMessagesForSubprocessFailure() throws {
         let runner = makeRunner()
         let failure = SubprocessFailure(
-            tool: "glomap",
+            tool: "geometry-helper",
             command: "mapper",
             exitCode: 1,
             terminationReason: .exit,
@@ -68,7 +65,7 @@ final class PipelineRunnerErrorTests: XCTestCase {
         )
         let message = runner.test_failureMessages(for: failure, stage: .sfmMapping)
         XCTAssertEqual(message.userMessage, "Processing failed. Check details for more info.")
-        XCTAssertTrue(message.debugMessage.contains("Tool: glomap"))
+        XCTAssertTrue(message.debugMessage.contains("Tool: geometry-helper"))
     }
 
     func testFailureMessagesForColmapCrash() throws {
@@ -81,8 +78,24 @@ final class PipelineRunnerErrorTests: XCTestCase {
             stderrTail: "crash"
         )
         let message = runner.test_failureMessages(for: error, stage: .sfmMatching)
-        XCTAssertEqual(message.userMessage, "COLMAP crashed while matching images. Try fewer frames or a lower quality preset.")
+        XCTAssertEqual(message.userMessage, "Image matching stopped. Try fewer frames or Fast detail.")
+        XCTAssertFalse(message.userMessage.lowercased().contains("colmap"))
         XCTAssertTrue(message.debugMessage.contains("Exit code: 10"))
+    }
+
+    func testDisconnectedRetrievalGraphOffersCaptureGuidance() {
+        let runner = makeRunner()
+
+        let message = runner.test_failureMessages(
+            for: ColmapPairPlanningError.disconnectedGraph,
+            stage: .sfmMatching
+        )
+
+        XCTAssertEqual(
+            message.userMessage,
+            "The capture did not have enough connected overlap. Try again with more overlap."
+        )
+        XCTAssertTrue(message.debugMessage.contains("retrieval graph was disconnected"))
     }
 
     func testRetryDiagnosticEventIncludesCommandTerminationAndLastStderrLine() {
@@ -156,7 +169,7 @@ final class PipelineRunnerErrorTests: XCTestCase {
     private func makeRunner() -> PipelineRunner {
         let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
         let toolchain = TestToolchains.toolchainPaths(root: root)
-        let config = PipelineRunner.PipelineConfig(toolchain: toolchain, preset: PresetSpec(mode: .object, quality: .standard))
+        let config = PipelineRunner.PipelineConfig(toolchain: toolchain)
         return PipelineRunner(projectURL: root, config: config)
     }
 
@@ -182,7 +195,7 @@ final class PipelineRunnerErrorTests: XCTestCase {
         try "{ this is not json".write(to: paths.metadataURL, atomically: true, encoding: .utf8)
 
         let toolchain = TestToolchains.toolchainPaths(root: projectURL)
-        let config = PipelineRunner.PipelineConfig(toolchain: toolchain, preset: PresetSpec(mode: .object, quality: .standard))
+        let config = PipelineRunner.PipelineConfig(toolchain: toolchain)
         let runner = PipelineRunner(projectURL: projectURL, config: config)
 
         // run() must throw without ever wiping the tool logs.

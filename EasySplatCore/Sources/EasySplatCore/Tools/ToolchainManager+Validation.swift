@@ -3,16 +3,11 @@ import Foundation
 extension ToolchainManager {
     func validateToolchain(
         root: URL,
-        requiredCapabilities: Set<ToolchainCapability> = ToolchainCapabilityRequest.default.capabilities
+        requiredCapabilities: Set<ToolchainCapability>
     ) throws -> ToolchainPaths {
         let colmap = root.appendingPathComponent("bin/colmap")
         ensureExecutable(at: colmap)
         guard fileManager.isExecutableFile(atPath: colmap.path) else { throw ToolchainError.missingBinary("colmap") }
-
-        let libcrypto = root.appendingPathComponent("lib/libcrypto.3.dylib")
-        let libssl = root.appendingPathComponent("lib/libssl.3.dylib")
-        guard fileManager.fileExists(atPath: libcrypto.path) else { throw ToolchainError.missingLibrary("libcrypto.3.dylib") }
-        guard fileManager.fileExists(atPath: libssl.path) else { throw ToolchainError.missingLibrary("libssl.3.dylib") }
 
         try requireArm64Binary(at: colmap, label: "colmap")
 
@@ -29,7 +24,7 @@ extension ToolchainManager {
         }
         guard globalMapperProbe.exitCode == 0 else {
             let text = "\(globalMapperProbe.stdout)\n\(globalMapperProbe.stderr)".lowercased()
-            if text.contains("library not loaded") || text.contains("no lc_rpath") || text.contains("@rpath/libcrypto.3.dylib") {
+            if text.contains("library not loaded") || text.contains("no lc_rpath") {
                 throw ToolchainError.invalidToolchain("COLMAP global_mapper failed to launch (missing dylib/rpath).")
             }
             if text.contains("not recognized") || text.contains("unknown command") || text.contains("unrecognized command") {
@@ -571,8 +566,6 @@ extension ToolchainManager {
 
     func coreToolchainLooksInstalled(root: URL) -> Bool {
         let colmap = root.appendingPathComponent("bin/colmap")
-        let libcrypto = root.appendingPathComponent("lib/libcrypto.3.dylib")
-        let libssl = root.appendingPathComponent("lib/libssl.3.dylib")
         let msplat = root.appendingPathComponent("msplat", isDirectory: true)
         let msplatTrain = root.appendingPathComponent("bin/easysplat-train")
         let msplatMetallib = root.appendingPathComponent("bin/default.metallib")
@@ -603,8 +596,6 @@ extension ToolchainManager {
 
         return fileManager.isExecutableFile(atPath: colmap.path)
             && msplatOK
-            && fileManager.fileExists(atPath: libcrypto.path)
-            && fileManager.fileExists(atPath: libssl.path)
             && fileManager.fileExists(atPath: da3SfmTool.path)
             && fileManager.fileExists(atPath: da3Python.path)
             && fileManager.fileExists(atPath: da3BuildInfo.path)

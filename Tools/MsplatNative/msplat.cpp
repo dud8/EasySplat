@@ -23,10 +23,12 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <unordered_map>
 #include <utility>
 #include <unistd.h>
 #include <vector>
 #include <mach-o/dyld.h>
+#include <sys/resource.h>
 #include <sys/stat.h>
 #include <sys/stdio.h>
 
@@ -45,6 +47,30 @@ volatile std::sig_atomic_t cancellationSignal = 0;
 
 void observeCancellation(int signal) {
     cancellationSignal = signal;
+}
+
+std::int64_t peakResidentMemoryBytes() {
+    struct rusage usage {};
+    if (::getrusage(RUSAGE_SELF, &usage) != 0) {
+        throw std::runtime_error(
+            "cannot measure peak resident memory: " + std::string(std::strerror(errno))
+        );
+    }
+    if (usage.ru_maxrss <= 0) {
+        throw std::runtime_error("peak resident memory is unavailable");
+    }
+    const auto bytes = static_cast<std::uint64_t>(usage.ru_maxrss);
+    if (bytes > static_cast<std::uint64_t>(std::numeric_limits<std::int64_t>::max())) {
+        throw std::runtime_error("peak resident memory exceeds the event schema limit");
+    }
+    // Darwin reports ru_maxrss in bytes. Other platforms use different units.
+    return static_cast<std::int64_t>(bytes);
+}
+
+void releaseCameraResources(Camera &camera) {
+    camera.image = Image {};
+    std::unordered_map<int, Image> {}.swap(camera.imagePyramids);
+    std::unordered_map<int, MTensor> {}.swap(camera.mtensorImageCache);
 }
 
 class EventWriter {
@@ -1089,11 +1115,8 @@ int main(int argc, char *argv[]) {
         const std::string trainerBuildDigest = computeTrainerBuildDigest();
 
         InputData inputData = inputDataFromX(datasetPath);
-        for (Camera &camera : inputData.cameras) camera.loadImage(1.0f);
 
-        std::vector<Camera> cameras;
-        Camera *unusedValidationCamera = nullptr;
-        std::tie(cameras, unusedValidationCamera) = inputData.getCameras(false);
+        std::vector<Camera> &cameras = inputData.cameras;
         if (cameras.empty()) throw std::runtime_error("input dataset contains no training cameras");
 
         constexpr int resolutionSchedule = 3000;
@@ -1108,7 +1131,8 @@ int main(int argc, char *argv[]) {
         constexpr int stopScreenSizeAt = 4000;
         constexpr float splitScreenSize = 0.05f;
         constexpr float ssimWeight = 0.2f;
-        constexpr float background[3] = {0.6130f, 0.0101f, 0.3984f};
+        constexpr float background[3] = {0.0f, 0.0f, 0.0f};
+        constexpr int cameraReuseCount = 2;
 
         Model model(inputData, static_cast<int>(cameras.size()), profile.numDownscales,
                     resolutionSchedule, shDegree, shDegreeInterval, refineEvery,
@@ -1175,7 +1199,7 @@ int main(int argc, char *argv[]) {
             latestLossIteration = checkpoint.trainerState.latestLossIteration;
             priorElapsedSeconds = checkpoint.trainerState.elapsedSeconds;
             lastCheckpoint = checkpoint.receipt;
-            for (int draw = 0; draw < completedIteration; ++draw) {
+            for (int draw = 0; draw < completedIteration / cameraReuseCount; ++draw) {
                 (void)camsIter.next();
             }
         } else {
@@ -1204,6 +1228,7 @@ int main(int argc, char *argv[]) {
                 {"geometry_digest", identity.geometryDigest},
                 {"input_digest", identity.inputDigest},
                 {"iteration", receipt.iteration},
+                {"peak_memory_bytes", peakResidentMemoryBytes()},
                 {"profile", profile.name},
                 {"seed", seed},
                 {"trainer_build_digest", trainerBuildDigest},
@@ -1251,11 +1276,32 @@ int main(int argc, char *argv[]) {
 
         if (handleCancellation()) return 130;
         std::string stopReason = "iteration_limit";
+        std::size_t residentCameraIndex = std::numeric_limits<std::size_t>::max();
+        int residentUsesRemaining = 0;
+        const int partialCameraGroup = completedIteration % cameraReuseCount;
+        if (partialCameraGroup != 0) {
+            residentCameraIndex = camsIter.next();
+            residentUsesRemaining = cameraReuseCount - partialCameraGroup;
+        }
         for (int step = completedIteration + 1; step <= profile.iterationLimit; ++step) {
             if (handleCancellation()) return 130;
 
-            const std::size_t cameraIndex = camsIter.next();
+            if (residentUsesRemaining == 0) {
+                if (residentCameraIndex != std::numeric_limits<std::size_t>::max()) {
+                    releaseCameraResources(cameras[residentCameraIndex]);
+                }
+                residentCameraIndex = camsIter.next();
+                residentUsesRemaining = cameraReuseCount;
+            }
+            const std::size_t cameraIndex = residentCameraIndex;
             Camera &camera = cameras[cameraIndex];
+            if (camera.image.empty()) {
+                camera.loadImage(1.0f);
+                if (camera.image.empty()) {
+                    throw std::runtime_error("cannot decode training image: " + camera.filePath);
+                }
+            }
+            --residentUsesRemaining;
             MTensor target = camera.getGPUImage(model.getDownscaleFactor(step));
             model.fullIteration(camera, step, target, ssimWeight);
             model.schedulersStep(step);
@@ -1380,6 +1426,7 @@ int main(int argc, char *argv[]) {
                           {"iteration", completedIteration},
                           {"iteration_limit", profile.iterationLimit},
                           {"output_bytes", outputBytes},
+                          {"peak_memory_bytes", peakResidentMemoryBytes()},
                           {"plateau_window", profile.plateauWindow},
                           {"profile", profile.name},
                           {"seed", seed},

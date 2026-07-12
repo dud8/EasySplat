@@ -9,19 +9,19 @@ import SQLite3
 final class PipelineIntegrationTests: XCTestCase {
     private func makePipelineConfig(
         toolchain: ToolchainPaths,
-        preset: PresetSpec,
         candidateRoute: SfmBackend? = nil,
         skipTraining: Bool = false,
-        stopAfterStage: PipelineStage? = nil
+        stopAfterStage: PipelineStage? = nil,
+        hardwareProfile: HardwareProfile? = nil
     ) -> PipelineRunner.PipelineConfig {
         PipelineRunner.PipelineConfig(
             toolchain: toolchain,
-            preset: preset,
             developmentOverrides: DevelopmentOverrides(
                 candidateRoute: candidateRoute,
                 stopAfterStage: stopAfterStage,
                 skipTraining: skipTraining
-            )
+            ),
+            hardwareProfile: hardwareProfile
         )
     }
 
@@ -40,7 +40,7 @@ final class PipelineIntegrationTests: XCTestCase {
         let metadata = ProjectMetadata(
             title: "Stop after features",
             input: .photos(folder: sourcePhotos.path),
-            preset: PresetSpec(mode: .object, quality: .draft)
+            requestedRunOptions: RequestedRunOptions(capturePath: .orbit, detailProfile: .fast)
         )
         let paths = ProjectPaths(root: projectURL)
         try paths.ensureDirectories()
@@ -59,7 +59,6 @@ final class PipelineIntegrationTests: XCTestCase {
             projectURL: projectURL,
             config: makePipelineConfig(
                 toolchain: toolchain,
-                preset: metadata.preset,
                 candidateRoute: .colmap,
                 stopAfterStage: .sfmFeatures
             ),
@@ -87,7 +86,7 @@ final class PipelineIntegrationTests: XCTestCase {
 
         let metadata = ProjectMetadata(title: "Test",
                                        input: .photos(folder: sourcePhotos.path),
-                                       preset: PresetSpec(mode: .object, quality: .draft))
+                                       requestedRunOptions: RequestedRunOptions(capturePath: .orbit, detailProfile: .fast))
         let paths = ProjectPaths(root: projectURL)
         try paths.ensureDirectories()
         try ProjectMetadataStore.save(metadata, to: paths.metadataURL)
@@ -109,7 +108,7 @@ final class PipelineIntegrationTests: XCTestCase {
 
         let pipeline = PipelineRunner(
             projectURL: projectURL,
-            config: makePipelineConfig(toolchain: toolchain, preset: metadata.preset, candidateRoute: .colmap, skipTraining: true),
+            config: makePipelineConfig(toolchain: toolchain, candidateRoute: .colmap, skipTraining: true),
             tooling: .init(runner: runner),
             powerAssertion: powerAssertion
         )
@@ -124,21 +123,19 @@ final class PipelineIntegrationTests: XCTestCase {
         let finalMetadata = try ProjectMetadataStore.load(from: paths.metadataURL)
         XCTAssertNil(finalMetadata.lastRunStartedAt, "Successful runs should clear lastRunStartedAt.")
         let reconstruction = try XCTUnwrap(finalMetadata.reconstruction, "Successful runs must persist a reconstruction summary.")
-        XCTAssertEqual(reconstruction.registeredImages, 100)
-        XCTAssertEqual(reconstruction.totalImages, 100)
+        let selectedCount = selectedImageNames(in: paths).count
+        XCTAssertEqual(reconstruction.registeredImages, selectedCount)
+        XCTAssertEqual(reconstruction.totalImages, selectedCount)
         XCTAssertEqual(
             reconstruction.mapper,
             "global_mapper",
             "The synthetic test toolchain does not advertise GPU support."
         )
-        // global_mapper's model_analyzer reprojection error is not a real pixel residual, so the
-        // persisted summary drops it (see ReconstructionSummary.reprojectionErrorIsUnreliable).
-        if ReconstructionSummary.reprojectionErrorIsUnreliable(forMapper: reconstruction.mapper) {
-            XCTAssertNil(reconstruction.meanReprojectionError,
-                         "An unreliable mapper's reprojection error must not be persisted as a pixel metric.")
-        } else {
-            XCTAssertEqual(reconstruction.meanReprojectionError, 1.0)
-        }
+        XCTAssertEqual(
+            reconstruction.meanReprojectionError,
+            0,
+            "Persisted reconstruction facts must use residuals recomputed from COLMAP tracks."
+        )
         let geometry = try GeometryArtifactStore.load(
             from: paths.geometryManifestURL,
             projectPaths: paths
@@ -146,7 +143,194 @@ final class PipelineIntegrationTests: XCTestCase {
         XCTAssertEqual(geometry.residualProvenance, "colmap-text-tracks-v1")
         XCTAssertEqual(geometry.medianPixelResidual, 0, accuracy: 0.000_001)
         XCTAssertEqual(geometry.p90PixelResidual, 0, accuracy: 0.000_001)
+        XCTAssertGreaterThan(try XCTUnwrap(geometry.timings[PipelineStage.sfmMapping.rawValue]), 0)
+        XCTAssertEqual(geometry.schemaVersion, 2)
+        XCTAssertEqual(geometry.modelVersion, "none")
+        XCTAssertEqual(geometry.provenance.toolchainVersion, "Toolchain")
+        XCTAssertEqual(geometry.provenance.solver.identifier, "colmap")
+        XCTAssertNil(geometry.provenance.runtime)
+        XCTAssertNil(geometry.provenance.model)
         XCTAssertEqual(finalMetadata.geometryArtifact, geometry)
+        let selectedManifest = try String(contentsOf: paths.framesSelectedManifestURL, encoding: .utf8)
+        XCTAssertFalse(selectedManifest.contains("sourcePath"))
+    }
+
+    func testOrderedColmapMatchingAddsVerifiedLoopPairs() async throws {
+        let temp = makeTempRoot()
+        let projectURL = temp.appendingPathComponent("OrderedLoops.easysplatproj", isDirectory: true)
+        let sourcePhotos = temp.appendingPathComponent("SourcePhotos", isDirectory: true)
+        try FileManager.default.createDirectory(at: sourcePhotos, withIntermediateDirectories: true)
+        for index in 0..<30 {
+            try writeRetrievalTestImage(
+                url: sourcePhotos.appendingPathComponent(String(format: "img_%03d.jpg", index)),
+                index: index
+            )
+        }
+
+        let metadata = ProjectMetadata(
+            title: "Ordered loops",
+            input: .photos(folder: sourcePhotos.path),
+            requestedRunOptions: RequestedRunOptions(
+                capturePath: .orbit,
+                detailProfile: .fast,
+                inputOrdering: .continuous,
+                photoSelection: .useAllValidPhotos
+            )
+        )
+        let paths = ProjectPaths(root: projectURL)
+        try paths.ensureDirectories()
+        try ProjectMetadataStore.save(metadata, to: paths.metadataURL)
+        let toolchain = try makeToolchain(root: temp)
+        let runner = MockSubprocessRunner(scripts: [
+            .init(path: toolchain.colmap.path, argsPrefix: ["feature_extractor"], result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""), onRun: nil),
+            .init(path: toolchain.colmap.path, argsPrefix: ["sequential_matcher"], result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""), onRun: nil),
+            .init(path: toolchain.colmap.path, argsPrefix: ["matches_importer"], result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""), onRun: { args in
+                guard let path = self.value(for: "--match_list_path", in: args),
+                      let pairs = try? String(contentsOfFile: path, encoding: .utf8) else {
+                    return XCTFail("Loop pair list was not readable")
+                }
+                XCTAssertTrue(pairs.contains("frame_000000.jpg frame_000029.jpg"))
+            }),
+            .init(path: toolchain.colmap.path, argsPrefix: ["global_mapper"], result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""), onRun: { _ in
+                try? self.writeSparseModel(at: projectURL)
+            }),
+            .init(path: toolchain.colmap.path, argsPrefix: ["model_analyzer"], result: .init(exitCode: 0, terminationReason: .exit, stdout: "Registered images: 30 / 30\nPoints: 1\nObservations: 30\nMean track length: 30.0\n", stderr: ""), onRun: nil),
+        ])
+
+        let pipeline = PipelineRunner(
+            projectURL: projectURL,
+            config: makePipelineConfig(
+                toolchain: toolchain,
+                candidateRoute: .colmap,
+                skipTraining: true
+            ),
+            tooling: .init(runner: runner)
+        )
+        try await pipeline.run { _ in }
+
+        let commands = runner.calls.compactMap { $0.1.first }
+        XCTAssertTrue(commands.contains("sequential_matcher"))
+        XCTAssertTrue(commands.contains("matches_importer"))
+        XCTAssertFalse(commands.contains("exhaustive_matcher"))
+    }
+
+    func testLargeUnorderedColmapMatchingUsesBoundedRetrievalPairs() async throws {
+        let temp = makeTempRoot()
+        let projectURL = temp.appendingPathComponent("UnorderedRetrieval.easysplatproj", isDirectory: true)
+        let sourcePhotos = temp.appendingPathComponent("SourcePhotos", isDirectory: true)
+        try FileManager.default.createDirectory(at: sourcePhotos, withIntermediateDirectories: true)
+        for index in 0..<120 {
+            try writeRetrievalTestImage(
+                url: sourcePhotos.appendingPathComponent(String(format: "img_%03d.jpg", index)),
+                index: index
+            )
+        }
+        let metadata = ProjectMetadata(
+            title: "Unordered retrieval",
+            input: .photos(folder: sourcePhotos.path),
+            requestedRunOptions: RequestedRunOptions(
+                detailProfile: .highDetail,
+                inputOrdering: .unordered,
+                photoSelection: .useAllValidPhotos
+            )
+        )
+        let paths = ProjectPaths(root: projectURL)
+        try paths.ensureDirectories()
+        try ProjectMetadataStore.save(metadata, to: paths.metadataURL)
+        let toolchain = try makeToolchain(root: temp)
+        let runner = MockSubprocessRunner(scripts: [
+            .init(path: toolchain.colmap.path, argsPrefix: ["feature_extractor"], result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""), onRun: nil),
+            .init(path: toolchain.colmap.path, argsPrefix: ["matches_importer"], result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""), onRun: { args in
+                guard let path = self.value(for: "--match_list_path", in: args),
+                      let text = try? String(contentsOfFile: path, encoding: .utf8) else {
+                    return XCTFail("Retrieval pair list was not readable")
+                }
+                let pairs = text.split(separator: "\n")
+                XCTAssertLessThanOrEqual(pairs.count, 960)
+                XCTAssertGreaterThanOrEqual(pairs.count, 119)
+            }),
+            .init(path: toolchain.colmap.path, argsPrefix: ["global_mapper"], result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""), onRun: { _ in
+                try? self.writeSparseModel(at: projectURL)
+            }),
+            .init(path: toolchain.colmap.path, argsPrefix: ["model_analyzer"], result: .init(exitCode: 0, terminationReason: .exit, stdout: "Registered images: 120 / 120\nPoints: 1\nObservations: 120\nMean track length: 120.0\n", stderr: ""), onRun: nil),
+        ])
+
+        let pipeline = PipelineRunner(
+            projectURL: projectURL,
+            config: makePipelineConfig(
+                toolchain: toolchain,
+                candidateRoute: .colmap,
+                skipTraining: true
+            ),
+            tooling: .init(runner: runner)
+        )
+        try await pipeline.run { _ in }
+
+        let commands = runner.calls.compactMap { $0.1.first }
+        XCTAssertTrue(commands.contains("matches_importer"))
+        XCTAssertFalse(commands.contains("exhaustive_matcher"))
+    }
+
+    func testDisconnectedThumbnailRetrievalFallsBackToExhaustiveMatching() async throws {
+        let temp = makeTempRoot()
+        let projectURL = temp.appendingPathComponent("RetrievalFallback.easysplatproj", isDirectory: true)
+        let sourcePhotos = temp.appendingPathComponent("SourcePhotos", isDirectory: true)
+        try FileManager.default.createDirectory(at: sourcePhotos, withIntermediateDirectories: true)
+        var sourceURLs: [URL] = []
+        for index in 0..<120 {
+            let url = sourcePhotos.appendingPathComponent(String(format: "img_%03d.png", index))
+            try writeDisconnectedRetrievalTestImage(url: url, index: index)
+            sourceURLs.append(url)
+        }
+        let descriptors = try ColmapPairEstimator.imageDescriptors(for: sourceURLs)
+        XCTAssertThrowsError(try ColmapPairEstimator.boundedRetrievalPairs(
+            imageNames: sourceURLs.map(\.lastPathComponent),
+            descriptors: descriptors,
+            maxNeighbors: 8
+        )) { error in
+            XCTAssertEqual(error as? ColmapPairPlanningError, .disconnectedGraph)
+        }
+
+        let metadata = ProjectMetadata(
+            title: "Retrieval fallback",
+            input: .photos(folder: sourcePhotos.path),
+            requestedRunOptions: RequestedRunOptions(
+                detailProfile: .highDetail,
+                inputOrdering: .unordered,
+                photoSelection: .useAllValidPhotos
+            )
+        )
+        let paths = ProjectPaths(root: projectURL)
+        try paths.ensureDirectories()
+        try ProjectMetadataStore.save(metadata, to: paths.metadataURL)
+        let toolchain = try makeToolchain(root: temp)
+        let runner = MockSubprocessRunner(scripts: [
+            .init(path: toolchain.colmap.path, argsPrefix: ["feature_extractor"], result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""), onRun: nil),
+            .init(path: toolchain.colmap.path, argsPrefix: ["feature_extractor"], result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""), onRun: nil),
+            .init(path: toolchain.colmap.path, argsPrefix: ["exhaustive_matcher"], result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""), onRun: nil),
+            .init(path: toolchain.colmap.path, argsPrefix: ["global_mapper"], result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""), onRun: { _ in
+                try? self.writeSparseModel(at: projectURL)
+            }),
+            .init(path: toolchain.colmap.path, argsPrefix: ["model_analyzer"], result: .init(exitCode: 0, terminationReason: .exit, stdout: "Registered images: 120 / 120\nPoints: 1\nObservations: 120\nMean track length: 120.0\n", stderr: ""), onRun: nil),
+        ])
+        let events = PipelineEventSink()
+        let pipeline = PipelineRunner(
+            projectURL: projectURL,
+            config: makePipelineConfig(
+                toolchain: toolchain,
+                candidateRoute: .colmap,
+                skipTraining: true
+            ),
+            tooling: .init(runner: runner)
+        )
+
+        try await pipeline.run { events.append($0) }
+
+        let commands = runner.calls.compactMap { $0.1.first }
+        XCTAssertEqual(commands.filter { $0 == "feature_extractor" }.count, 2)
+        XCTAssertTrue(commands.contains("exhaustive_matcher"))
+        XCTAssertFalse(commands.contains("matches_importer"))
+        XCTAssertNotNil(events.stageLog(containing: "retrying with fewer frames and exhaustive matching"))
     }
 
     func testPipelineFailureClearsRunStartMarker() async throws {
@@ -161,7 +345,7 @@ final class PipelineIntegrationTests: XCTestCase {
         let metadata = ProjectMetadata(
             title: "TestFail",
             input: .photos(folder: sourcePhotos.path),
-            preset: PresetSpec(mode: .object, quality: .draft)
+            requestedRunOptions: RequestedRunOptions(capturePath: .orbit, detailProfile: .fast)
         )
         let paths = ProjectPaths(root: projectURL)
         try paths.ensureDirectories()
@@ -176,7 +360,7 @@ final class PipelineIntegrationTests: XCTestCase {
         ])
         let pipeline = PipelineRunner(
             projectURL: projectURL,
-            config: makePipelineConfig(toolchain: toolchain, preset: metadata.preset, candidateRoute: .colmap),
+            config: makePipelineConfig(toolchain: toolchain, candidateRoute: .colmap),
             tooling: .init(runner: runner),
             powerAssertion: powerAssertion
         )
@@ -194,7 +378,7 @@ final class PipelineIntegrationTests: XCTestCase {
         XCTAssertNotNil(failedMetadata.state.lastError)
         XCTAssertNotNil(
             failedMetadata.lastFailureAt,
-            "PipelineRunner.emitFailure must stamp lastFailureAt so the home Last failure card reflects the real failure time."
+            "PipelineRunner.emitFailure must preserve the real failure time for diagnostics."
         )
     }
 
@@ -210,7 +394,7 @@ final class PipelineIntegrationTests: XCTestCase {
         let metadata = ProjectMetadata(
             title: "StrictDa3",
             input: .photos(folder: sourcePhotos.path),
-            preset: PresetSpec(mode: .object, quality: .draft)
+            requestedRunOptions: RequestedRunOptions(capturePath: .orbit, detailProfile: .fast)
         )
         let paths = ProjectPaths(root: projectURL)
         try paths.ensureDirectories()
@@ -228,7 +412,7 @@ final class PipelineIntegrationTests: XCTestCase {
 
         let pipeline = PipelineRunner(
             projectURL: projectURL,
-            config: makePipelineConfig(toolchain: toolchain, preset: metadata.preset, candidateRoute: .da3, skipTraining: true),
+            config: makePipelineConfig(toolchain: toolchain, candidateRoute: .da3, skipTraining: true),
             tooling: .init(runner: runner)
         )
 
@@ -254,7 +438,6 @@ final class PipelineIntegrationTests: XCTestCase {
         let metadata = ProjectMetadata(
             title: "Msplat",
             input: .photos(folder: sourcePhotos.path),
-            preset: PresetSpec(mode: .object, quality: .draft),
             requestedRunOptions: RequestedRunOptions(detailProfile: .fast)
         )
         let paths = ProjectPaths(root: projectURL)
@@ -263,7 +446,7 @@ final class PipelineIntegrationTests: XCTestCase {
 
         let toolchain = try makeToolchain(root: temp, createMsplatFile: true)
         let plySizeProbe = temp.appendingPathComponent("msplat-size-probe.ply")
-        try TestFileBuilder.writeMinimalPly(at: plySizeProbe)
+        try TestFileBuilder.writeMinimalPly(at: plySizeProbe, vertexCount: 1_800)
         let msplatOutputBytes = try XCTUnwrap(
             (try FileManager.default.attributesOfItem(atPath: plySizeProbe.path)[.size] as? NSNumber)?.int64Value
         )
@@ -275,8 +458,8 @@ final class PipelineIntegrationTests: XCTestCase {
         let generation = "00000000-" + String(repeating: "5", count: 64)
         let msplatEvents = """
         {"camera_count":12,"checkpoint_schema":1,"event":"started","geometry_digest":"\(geometryDigest)","initial_gaussian_count":1500,"input_digest":"\(inputDigest)","iteration":0,"iteration_limit":3000,"payload_schema":2,"plateau_window":400,"profile":"fast","resumed":false,"schema_version":1,"seed":42,"sequence":1,"trainer_build_digest":"\(trainerDigest)","version":"1.1.3 (git 106499b)"}
-        {"checkpoint_generation":"\(generation)","checkpoint_payload_bytes":128,"checkpoint_payload_sha256":"\(payloadDigest)","event":"checkpoint_completed","gaussian_count":1500,"geometry_digest":"\(geometryDigest)","input_digest":"\(inputDigest)","iteration":0,"profile":"fast","schema_version":1,"seed":42,"sequence":2,"trainer_build_digest":"\(trainerDigest)","version":"1.1.3 (git 106499b)"}
-        {"elapsed_seconds":2,"event":"completed","gaussian_count":1800,"geometry_digest":"\(geometryDigest)","input_digest":"\(inputDigest)","iteration":3000,"iteration_limit":3000,"output_bytes":\(msplatOutputBytes),"plateau_window":400,"profile":"fast","schema_version":1,"seed":42,"sequence":3,"stop_reason":"iteration_limit","trainer_build_digest":"\(trainerDigest)","version":"1.1.3 (git 106499b)"}
+        {"checkpoint_generation":"\(generation)","checkpoint_payload_bytes":128,"checkpoint_payload_sha256":"\(payloadDigest)","event":"checkpoint_completed","gaussian_count":1500,"geometry_digest":"\(geometryDigest)","input_digest":"\(inputDigest)","iteration":0,"peak_memory_bytes":268435456,"profile":"fast","schema_version":1,"seed":42,"sequence":2,"trainer_build_digest":"\(trainerDigest)","version":"1.1.3 (git 106499b)"}
+        {"elapsed_seconds":2,"event":"completed","gaussian_count":1800,"geometry_digest":"\(geometryDigest)","input_digest":"\(inputDigest)","iteration":3000,"iteration_limit":3000,"output_bytes":\(msplatOutputBytes),"peak_memory_bytes":536870912,"plateau_window":400,"profile":"fast","schema_version":1,"seed":42,"sequence":3,"stop_reason":"iteration_limit","trainer_build_digest":"\(trainerDigest)","version":"1.1.3 (git 106499b)"}
         """ + "\n"
         var msplatDatasetPath: String?
         let runner = MockSubprocessRunner(scripts: [
@@ -336,7 +519,10 @@ final class PipelineIntegrationTests: XCTestCase {
                     XCTAssertTrue(FileManager.default.fileExists(atPath: dataset.appendingPathComponent("sparse/0/cameras.bin").path))
                     XCTAssertTrue(args.contains("fast"))
                     XCTAssertFalse(args.contains("--num-iters"))
-                    try? TestFileBuilder.writeMinimalPly(at: URL(fileURLWithPath: outputArg))
+                    try? TestFileBuilder.writeMinimalPly(
+                        at: URL(fileURLWithPath: outputArg),
+                        vertexCount: 1_800
+                    )
                     try? FileManager.default.createDirectory(
                         at: URL(fileURLWithPath: checkpointArg, isDirectory: true),
                         withIntermediateDirectories: true
@@ -349,7 +535,6 @@ final class PipelineIntegrationTests: XCTestCase {
             projectURL: projectURL,
             config: makePipelineConfig(
                 toolchain: toolchain,
-                preset: metadata.preset,
                 candidateRoute: .colmap
             ),
             tooling: .init(runner: runner)
@@ -366,11 +551,18 @@ final class PipelineIntegrationTests: XCTestCase {
         let trainingArtifact = try XCTUnwrap(completedMetadata.trainingArtifact)
         XCTAssertEqual(trainingArtifact.completionStatus, .completed)
         XCTAssertEqual(trainingArtifact.trainerBuildDigest, trainerDigest)
-        XCTAssertEqual(trainingArtifact.outputPath, "Training/msplat/splat.ply")
+        XCTAssertEqual(trainingArtifact.outputPath, "Output/splat.ply")
         XCTAssertEqual(trainingArtifact.iterationLimit, plan.trainerIterationLimit)
         XCTAssertEqual(trainingArtifact.plateauWindow, plan.plateauWindow)
         XCTAssertEqual(trainingArtifact.deterministicSeed, plan.deterministicSeed)
+        XCTAssertEqual(trainingArtifact.peakMemoryBytes, 536_870_912)
         XCTAssertFalse(FileManager.default.fileExists(atPath: paths.msplatCheckpointURL.path))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: paths.msplatOutputURL.path))
+        XCTAssertFalse(
+            FileManager.default.fileExists(
+                atPath: paths.trainingURL.appendingPathComponent("msplat_dataset").path
+            )
+        )
         XCTAssertEqual(
             try TrainingArtifactStore.load(
                 from: paths.trainingManifestURL,
@@ -378,6 +570,43 @@ final class PipelineIntegrationTests: XCTestCase {
             ),
             completedMetadata.trainingArtifact
         )
+    }
+
+    func testCompletedTrainingCleanupRejectsSymlinkedTrainingParent() throws {
+        let temp = makeTempRoot()
+        let projectURL = temp.appendingPathComponent("CleanupSymlink.easysplatproj", isDirectory: true)
+        let paths = ProjectPaths(root: projectURL)
+        try paths.ensureDirectories()
+
+        let externalTraining = temp.appendingPathComponent("ExternalTraining", isDirectory: true)
+        let externalDataset = externalTraining.appendingPathComponent("msplat_dataset", isDirectory: true)
+        let externalOutput = externalTraining.appendingPathComponent("msplat/splat.ply")
+        try FileManager.default.createDirectory(at: externalDataset, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(
+            at: externalOutput.deletingLastPathComponent(),
+            withIntermediateDirectories: true
+        )
+        let marker = externalDataset.appendingPathComponent("keep.txt")
+        try Data("outside project".utf8).write(to: marker)
+        try TestFileBuilder.writeMinimalPly(at: externalOutput)
+
+        try FileManager.default.removeItem(at: paths.trainingURL)
+        try FileManager.default.createSymbolicLink(
+            at: paths.trainingURL,
+            withDestinationURL: externalTraining
+        )
+
+        let toolchain = try makeToolchain(root: temp)
+        let pipeline = PipelineRunner(
+            projectURL: projectURL,
+            config: makePipelineConfig(toolchain: toolchain)
+        )
+
+        XCTAssertThrowsError(
+            try pipeline.removeDisposableCompletedTrainingPayload(paths: paths)
+        )
+        XCTAssertTrue(FileManager.default.fileExists(atPath: marker.path))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: externalOutput.path))
     }
 
     func testPipelineCancellationRestartsFreshWhenNativeRejectsCheckpoint() async throws {
@@ -391,21 +620,23 @@ final class PipelineIntegrationTests: XCTestCase {
                 value: UInt8(index)
             )
         }
-        let metadata = ProjectMetadata(
+        var metadata = ProjectMetadata(
             title: "Resume msplat",
             input: .photos(folder: sourcePhotos.path),
-            preset: PresetSpec(mode: .object, quality: .draft),
-            requestedRunOptions: RequestedRunOptions(detailProfile: .fast)
+            requestedRunOptions: RequestedRunOptions(detailProfile: .fast),
+            reconstruction: ReconstructionSummary(
+                mapper: "colmap",
+                capturedAt: Date(timeIntervalSince1970: 1),
+                registeredImages: 2,
+                totalImages: 2
+            )
         )
         let paths = ProjectPaths(root: projectURL)
         try paths.ensureDirectories()
         try ProjectMetadataStore.save(metadata, to: paths.metadataURL)
         try FileManager.default.copyItem(
             at: sourcePhotos,
-            to: paths.originalsURL.appendingPathComponent(
-                sourcePhotos.lastPathComponent,
-                isDirectory: true
-            )
+            to: paths.importedPhotosURL
         )
         var selectedMappings: [TestSelectedFrameMapping] = []
         for index in 0..<2 {
@@ -417,8 +648,7 @@ final class PipelineIntegrationTests: XCTestCase {
             selectedMappings.append(TestSelectedFrameMapping(
                 outputFileName: name,
                 groupId: "photos",
-                isVideo: false,
-                sourcePath: sourcePhotos.appendingPathComponent("img\(index).jpg").path
+                isVideo: false
             ))
         }
         try JSONEncoder().encode(selectedMappings).write(
@@ -451,6 +681,7 @@ final class PipelineIntegrationTests: XCTestCase {
         for name in ["cameras.bin", "images.bin", "points3D.bin"] {
             try Data([1]).write(to: sparse.appendingPathComponent(name))
         }
+        try persistGeometryArtifactFixture(metadata: &metadata, paths: paths)
         let datasetIdentity = try MsplatDatasetIdentity.compute(
             imageFiles: try FileManager.default.contentsOfDirectory(
                 at: paths.framesSelectedURL,
@@ -470,9 +701,9 @@ final class PipelineIntegrationTests: XCTestCase {
         let initialGeneration = "00000000-" + String(repeating: "5", count: 64)
         let interruptedEvents = """
         {"camera_count":8,"checkpoint_schema":1,"event":"started","geometry_digest":"\(receipt.geometryDigest)","initial_gaussian_count":750,"input_digest":"\(receipt.inputDigest)","iteration":0,"iteration_limit":3000,"payload_schema":2,"plateau_window":400,"profile":"fast","resumed":false,"schema_version":1,"seed":42,"sequence":1,"trainer_build_digest":"\(receipt.trainerBuildDigest)","version":"1.1.3 (git 106499b)"}
-        {"checkpoint_generation":"\(initialGeneration)","checkpoint_payload_bytes":128,"checkpoint_payload_sha256":"\(String(repeating: "4", count: 64))","event":"checkpoint_completed","gaussian_count":750,"geometry_digest":"\(receipt.geometryDigest)","input_digest":"\(receipt.inputDigest)","iteration":0,"profile":"fast","schema_version":1,"seed":42,"sequence":2,"trainer_build_digest":"\(receipt.trainerBuildDigest)","version":"1.1.3 (git 106499b)"}
+        {"checkpoint_generation":"\(initialGeneration)","checkpoint_payload_bytes":128,"checkpoint_payload_sha256":"\(String(repeating: "4", count: 64))","event":"checkpoint_completed","gaussian_count":750,"geometry_digest":"\(receipt.geometryDigest)","input_digest":"\(receipt.inputDigest)","iteration":0,"peak_memory_bytes":\(receipt.peakMemoryBytes),"profile":"fast","schema_version":1,"seed":42,"sequence":2,"trainer_build_digest":"\(receipt.trainerBuildDigest)","version":"1.1.3 (git 106499b)"}
         {"elapsed_seconds":2,"eta_seconds":20,"event":"progress","gaussian_count":750,"iteration":500,"iteration_limit":3000,"iterations_per_second":250,"schema_version":1,"sequence":3}
-        {"checkpoint_generation":"\(receipt.generation)","checkpoint_payload_bytes":\(receipt.payloadBytes),"checkpoint_payload_sha256":"\(receipt.payloadSHA256)","event":"checkpoint_completed","gaussian_count":\(receipt.gaussianCount),"geometry_digest":"\(receipt.geometryDigest)","input_digest":"\(receipt.inputDigest)","iteration":\(receipt.iteration),"profile":"fast","schema_version":1,"seed":42,"sequence":4,"trainer_build_digest":"\(receipt.trainerBuildDigest)","version":"1.1.3 (git 106499b)"}
+        {"checkpoint_generation":"\(receipt.generation)","checkpoint_payload_bytes":\(receipt.payloadBytes),"checkpoint_payload_sha256":"\(receipt.payloadSHA256)","event":"checkpoint_completed","gaussian_count":\(receipt.gaussianCount),"geometry_digest":"\(receipt.geometryDigest)","input_digest":"\(receipt.inputDigest)","iteration":\(receipt.iteration),"peak_memory_bytes":\(receipt.peakMemoryBytes),"profile":"fast","schema_version":1,"seed":42,"sequence":4,"trainer_build_digest":"\(receipt.trainerBuildDigest)","version":"1.1.3 (git 106499b)"}
         {"event":"cancellation_requested","iteration":575,"schema_version":1,"sequence":5,"signal":2}
         {"checkpoint_generation":"\(receipt.generation)","checkpoint_iteration":\(receipt.iteration),"checkpoint_payload_sha256":"\(receipt.payloadSHA256)","event":"cancelled","geometry_digest":"\(receipt.geometryDigest)","input_digest":"\(receipt.inputDigest)","iteration":575,"schema_version":1,"sequence":6}
         """ + "\n"
@@ -494,7 +725,7 @@ final class PipelineIntegrationTests: XCTestCase {
         )
         let firstPipeline = PipelineRunner(
             projectURL: projectURL,
-            config: makePipelineConfig(toolchain: toolchain, preset: metadata.preset, candidateRoute: .colmap),
+            config: makePipelineConfig(toolchain: toolchain, candidateRoute: .colmap),
             tooling: .init(runner: cancellingRunner)
         )
 
@@ -507,18 +738,19 @@ final class PipelineIntegrationTests: XCTestCase {
         XCTAssertEqual(interruptedMetadata.trainingArtifact?.completionStatus, .checkpointed)
         XCTAssertEqual(interruptedMetadata.trainingArtifact?.completedIteration, 500)
         XCTAssertEqual(interruptedMetadata.trainingArtifact?.checkpointDigest, receipt.payloadSHA256)
+        XCTAssertEqual(interruptedMetadata.trainingArtifact?.peakMemoryBytes, receipt.peakMemoryBytes)
 
         let outputProbe = temp.appendingPathComponent("resume-output-probe.ply")
-        try TestFileBuilder.writeMinimalPly(at: outputProbe)
+        try TestFileBuilder.writeMinimalPly(at: outputProbe, vertexCount: 1_400)
         let outputBytes = try XCTUnwrap(
             (try FileManager.default.attributesOfItem(atPath: outputProbe.path)[.size] as? NSNumber)?.int64Value
         )
         try FileManager.default.removeItem(at: outputProbe)
         let freshEvents = """
         {"camera_count":8,"checkpoint_schema":1,"event":"started","geometry_digest":"\(receipt.geometryDigest)","initial_gaussian_count":\(receipt.gaussianCount),"input_digest":"\(receipt.inputDigest)","iteration":0,"iteration_limit":3000,"payload_schema":2,"plateau_window":400,"profile":"fast","resumed":false,"schema_version":1,"seed":42,"sequence":1,"trainer_build_digest":"\(receipt.trainerBuildDigest)","version":"1.1.3 (git 106499b)"}
-        {"checkpoint_generation":"\(initialGeneration)","checkpoint_payload_bytes":128,"checkpoint_payload_sha256":"\(String(repeating: "4", count: 64))","event":"checkpoint_completed","gaussian_count":\(receipt.gaussianCount),"geometry_digest":"\(receipt.geometryDigest)","input_digest":"\(receipt.inputDigest)","iteration":0,"profile":"fast","schema_version":1,"seed":42,"sequence":2,"trainer_build_digest":"\(receipt.trainerBuildDigest)","version":"1.1.3 (git 106499b)"}
+        {"checkpoint_generation":"\(initialGeneration)","checkpoint_payload_bytes":128,"checkpoint_payload_sha256":"\(String(repeating: "4", count: 64))","event":"checkpoint_completed","gaussian_count":\(receipt.gaussianCount),"geometry_digest":"\(receipt.geometryDigest)","input_digest":"\(receipt.inputDigest)","iteration":0,"peak_memory_bytes":\(receipt.peakMemoryBytes),"profile":"fast","schema_version":1,"seed":42,"sequence":2,"trainer_build_digest":"\(receipt.trainerBuildDigest)","version":"1.1.3 (git 106499b)"}
         {"elapsed_seconds":4,"eta_seconds":0,"event":"progress","gaussian_count":1400,"iteration":3000,"iteration_limit":3000,"iterations_per_second":1600,"schema_version":1,"sequence":3}
-        {"elapsed_seconds":4,"event":"completed","gaussian_count":1400,"geometry_digest":"\(receipt.geometryDigest)","input_digest":"\(receipt.inputDigest)","iteration":3000,"iteration_limit":3000,"output_bytes":\(outputBytes),"plateau_window":400,"profile":"fast","schema_version":1,"seed":42,"sequence":4,"stop_reason":"iteration_limit","trainer_build_digest":"\(receipt.trainerBuildDigest)","version":"1.1.3 (git 106499b)"}
+        {"elapsed_seconds":4,"event":"completed","gaussian_count":1400,"geometry_digest":"\(receipt.geometryDigest)","input_digest":"\(receipt.inputDigest)","iteration":3000,"iteration_limit":3000,"output_bytes":\(outputBytes),"peak_memory_bytes":536870912,"plateau_window":400,"profile":"fast","schema_version":1,"seed":42,"sequence":4,"stop_reason":"iteration_limit","trainer_build_digest":"\(receipt.trainerBuildDigest)","version":"1.1.3 (git 106499b)"}
         """ + "\n"
         let secondRunner = MockSubprocessRunner(scripts: [
             .init(path: toolchain.colmap.path, argsPrefix: ["model_converter"], result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""), onRun: { args in
@@ -541,12 +773,15 @@ final class PipelineIntegrationTests: XCTestCase {
             ),
             .init(path: toolchain.msplat.path, argsPrefix: ["--dataset"], result: .init(exitCode: 0, terminationReason: .exit, stdout: freshEvents, stderr: ""), onRun: { args in
                 guard let outputPath = self.value(for: "--output", in: args) else { return }
-                try? TestFileBuilder.writeMinimalPly(at: URL(fileURLWithPath: outputPath))
+                try? TestFileBuilder.writeMinimalPly(
+                    at: URL(fileURLWithPath: outputPath),
+                    vertexCount: 1_400
+                )
             }),
         ])
         let secondPipeline = PipelineRunner(
             projectURL: projectURL,
-            config: makePipelineConfig(toolchain: toolchain, preset: metadata.preset, candidateRoute: .colmap),
+            config: makePipelineConfig(toolchain: toolchain, candidateRoute: .colmap),
             tooling: .init(runner: secondRunner)
         )
 
@@ -559,6 +794,7 @@ final class PipelineIntegrationTests: XCTestCase {
         let completedMetadata = try ProjectMetadataStore.load(from: paths.metadataURL)
         XCTAssertEqual(completedMetadata.trainingArtifact?.completionStatus, .completed)
         XCTAssertEqual(completedMetadata.trainingArtifact?.completedIteration, 3_000)
+        XCTAssertEqual(completedMetadata.trainingArtifact?.peakMemoryBytes, 536_870_912)
         XCTAssertEqual(
             ProjectArtifactValidator.validatePlyFile(
                 at: paths.outputURL.appendingPathComponent("splat.ply")
@@ -582,10 +818,7 @@ final class PipelineIntegrationTests: XCTestCase {
         }
         try FileManager.default.copyItem(
             at: sourcePhotos,
-            to: paths.originalsURL.appendingPathComponent(
-                sourcePhotos.lastPathComponent,
-                isDirectory: true
-            )
+            to: paths.importedPhotosURL
         )
 
         let selectedMappings = try (0..<2).map { index in
@@ -597,8 +830,7 @@ final class PipelineIntegrationTests: XCTestCase {
             return TestSelectedFrameMapping(
                 outputFileName: name,
                 groupId: "photos",
-                isVideo: false,
-                sourcePath: sourcePhotos.appendingPathComponent("img\(index).jpg").path
+                isVideo: false
             )
         }
         try JSONEncoder().encode(selectedMappings).write(
@@ -662,25 +894,30 @@ final class PipelineIntegrationTests: XCTestCase {
             outputPath: nil,
             gaussianCount: receipt.gaussianCount,
             elapsedSeconds: nil,
-            peakMemoryBytes: nil,
+            peakMemoryBytes: receipt.peakMemoryBytes,
             completionStatus: .checkpointed
         )
         var metadata = ProjectMetadata(
             title: "Balanced retry",
             input: .photos(folder: sourcePhotos.path),
-            preset: PresetSpec(mode: .object, quality: .standard),
             requestedRunOptions: RequestedRunOptions(detailProfile: .balanced),
             trainingArtifact: artifact,
-            state: PipelineState(stage: .sfmMapping, attempt: 0, lastError: nil, resumeToken: nil),
+            state: PipelineState(stage: .sfmMapping, lastError: nil),
             checkpoint: PipelineCheckpoint(
                 stage: .trainSplat,
                 details: .trainSplat(TrainSplatCheckpoint(
                     progressStep: receipt.iteration,
                     progressTotal: 7_000
                 ))
+            ),
+            reconstruction: ReconstructionSummary(
+                mapper: "colmap",
+                capturedAt: Date(timeIntervalSince1970: 1),
+                registeredImages: 2,
+                totalImages: 2
             )
         )
-        try ProjectMetadataStore.save(metadata, to: paths.metadataURL)
+        try persistGeometryArtifactFixture(metadata: &metadata, paths: paths)
         try TrainingArtifactStore.persist(artifact, metadata: &metadata, paths: paths)
 
         let toolchain = try makeToolchain(root: temp, createMsplatFile: true)
@@ -714,7 +951,7 @@ final class PipelineIntegrationTests: XCTestCase {
         ])
         let failedPipeline = PipelineRunner(
             projectURL: projectURL,
-            config: makePipelineConfig(toolchain: toolchain, preset: metadata.preset),
+            config: makePipelineConfig(toolchain: toolchain),
             tooling: .init(runner: failedRunner)
         )
         await XCTAssertThrowsErrorAsync {
@@ -727,16 +964,16 @@ final class PipelineIntegrationTests: XCTestCase {
         XCTAssertEqual(failedMetadata.trainingArtifact?.completionStatus, .checkpointed)
 
         let outputProbe = temp.appendingPathComponent("balanced-retry-output-probe.ply")
-        try TestFileBuilder.writeMinimalPly(at: outputProbe)
+        try TestFileBuilder.writeMinimalPly(at: outputProbe, vertexCount: 1_400)
         let outputBytes = try XCTUnwrap(
             (try FileManager.default.attributesOfItem(atPath: outputProbe.path)[.size] as? NSNumber)?.int64Value
         )
         try FileManager.default.removeItem(at: outputProbe)
         let resumedEvents = """
         {"camera_count":8,"checkpoint_schema":1,"event":"started","geometry_digest":"\(receipt.geometryDigest)","initial_gaussian_count":\(receipt.gaussianCount),"input_digest":"\(receipt.inputDigest)","iteration":500,"iteration_limit":7000,"payload_schema":2,"plateau_window":800,"profile":"balanced","resumed":true,"schema_version":1,"seed":42,"sequence":1,"trainer_build_digest":"\(receipt.trainerBuildDigest)","version":"1.1.3 (git 106499b)"}
-        {"checkpoint_generation":"\(receipt.generation)","checkpoint_payload_bytes":\(receipt.payloadBytes),"checkpoint_payload_sha256":"\(receipt.payloadSHA256)","event":"checkpoint_loaded","gaussian_count":\(receipt.gaussianCount),"geometry_digest":"\(receipt.geometryDigest)","input_digest":"\(receipt.inputDigest)","iteration":500,"profile":"balanced","schema_version":1,"seed":42,"sequence":2,"trainer_build_digest":"\(receipt.trainerBuildDigest)","version":"1.1.3 (git 106499b)"}
+        {"checkpoint_generation":"\(receipt.generation)","checkpoint_payload_bytes":\(receipt.payloadBytes),"checkpoint_payload_sha256":"\(receipt.payloadSHA256)","event":"checkpoint_loaded","gaussian_count":\(receipt.gaussianCount),"geometry_digest":"\(receipt.geometryDigest)","input_digest":"\(receipt.inputDigest)","iteration":500,"peak_memory_bytes":\(receipt.peakMemoryBytes),"profile":"balanced","schema_version":1,"seed":42,"sequence":2,"trainer_build_digest":"\(receipt.trainerBuildDigest)","version":"1.1.3 (git 106499b)"}
         {"elapsed_seconds":4,"eta_seconds":0,"event":"progress","gaussian_count":1400,"iteration":7000,"iteration_limit":7000,"iterations_per_second":1600,"schema_version":1,"sequence":3}
-        {"elapsed_seconds":4,"event":"completed","gaussian_count":1400,"geometry_digest":"\(receipt.geometryDigest)","input_digest":"\(receipt.inputDigest)","iteration":7000,"iteration_limit":7000,"output_bytes":\(outputBytes),"plateau_window":800,"profile":"balanced","schema_version":1,"seed":42,"sequence":4,"stop_reason":"iteration_limit","trainer_build_digest":"\(receipt.trainerBuildDigest)","version":"1.1.3 (git 106499b)"}
+        {"elapsed_seconds":4,"event":"completed","gaussian_count":1400,"geometry_digest":"\(receipt.geometryDigest)","input_digest":"\(receipt.inputDigest)","iteration":7000,"iteration_limit":7000,"output_bytes":\(outputBytes),"peak_memory_bytes":805306368,"plateau_window":800,"profile":"balanced","schema_version":1,"seed":42,"sequence":4,"stop_reason":"iteration_limit","trainer_build_digest":"\(receipt.trainerBuildDigest)","version":"1.1.3 (git 106499b)"}
         """ + "\n"
         let retryRunner = MockSubprocessRunner(scripts: [
             converterScript(),
@@ -746,13 +983,16 @@ final class PipelineIntegrationTests: XCTestCase {
                 result: .init(exitCode: 0, terminationReason: .exit, stdout: resumedEvents, stderr: ""),
                 onRun: { args in
                     guard let outputPath = self.value(for: "--output", in: args) else { return }
-                    try? TestFileBuilder.writeMinimalPly(at: URL(fileURLWithPath: outputPath))
+                    try? TestFileBuilder.writeMinimalPly(
+                        at: URL(fileURLWithPath: outputPath),
+                        vertexCount: 1_400
+                    )
                 }
             )
         ])
         let retryPipeline = PipelineRunner(
             projectURL: projectURL,
-            config: makePipelineConfig(toolchain: toolchain, preset: metadata.preset),
+            config: makePipelineConfig(toolchain: toolchain),
             tooling: .init(runner: retryRunner)
         )
 
@@ -760,6 +1000,11 @@ final class PipelineIntegrationTests: XCTestCase {
 
         let retryCall = try XCTUnwrap(retryRunner.calls.first(where: { $0.0 == toolchain.msplat.path }))
         XCTAssertEqual(value(for: "--resume", in: retryCall.1), paths.msplatCheckpointURL.path)
+        XCTAssertEqual(
+            try ProjectMetadataStore.load(from: paths.metadataURL)
+                .trainingArtifact?.peakMemoryBytes,
+            805_306_368
+        )
     }
 
     func testPipelineDa3CancellationDoesNotFallbackBetweenBackends() async throws {
@@ -774,7 +1019,7 @@ final class PipelineIntegrationTests: XCTestCase {
         let metadata = ProjectMetadata(
             title: "Da3Cancel",
             input: .photos(folder: sourcePhotos.path),
-            preset: PresetSpec(mode: .object, quality: .draft)
+            requestedRunOptions: RequestedRunOptions(capturePath: .orbit, detailProfile: .fast)
         )
         let paths = ProjectPaths(root: projectURL)
         try paths.ensureDirectories()
@@ -785,7 +1030,7 @@ final class PipelineIntegrationTests: XCTestCase {
 
         let pipeline = PipelineRunner(
             projectURL: projectURL,
-            config: makePipelineConfig(toolchain: toolchain, preset: metadata.preset, candidateRoute: .da3, skipTraining: true),
+            config: makePipelineConfig(toolchain: toolchain, candidateRoute: .da3, skipTraining: true),
             tooling: .init(runner: runner)
         )
 
@@ -798,13 +1043,13 @@ final class PipelineIntegrationTests: XCTestCase {
         let callPaths = runner.calls.map { $0.0 }
         XCTAssertEqual(callPaths.filter { $0 == toolchain.da3.sfmTool.path }.count, 1)
         let da3Args = runner.calls.first(where: { $0.0 == toolchain.da3.sfmTool.path })?.1 ?? []
-        XCTAssertEqual(value(for: "--mode", in: da3Args), "seed_refine")
+        XCTAssertFalse(da3Args.contains("--mode"))
         XCTAssertFalse(callPaths.contains(toolchain.colmap.path))
         let interruptedMetadata = try ProjectMetadataStore.load(from: paths.metadataURL)
         XCTAssertNotNil(interruptedMetadata.lastRunStartedAt, "Cancellation should preserve lastRunStartedAt for crash/interruption detection.")
     }
 
-    func testPipelineDefaultsToDa3WhenBackendUnset() async throws {
+    func testPipelineDefaultsToDa3AndRecordsAcceptedSmallFallback() async throws {
         let temp = makeTempRoot()
         let projectURL = temp.appendingPathComponent("Test.easysplatproj", isDirectory: true)
         let sourcePhotos = temp.appendingPathComponent("SourcePhotos", isDirectory: true)
@@ -815,7 +1060,7 @@ final class PipelineIntegrationTests: XCTestCase {
 
         let metadata = ProjectMetadata(title: "Test",
                                        input: .photos(folder: sourcePhotos.path),
-                                       preset: PresetSpec(mode: .object, quality: .draft))
+                                       requestedRunOptions: RequestedRunOptions(capturePath: .orbit, detailProfile: .balanced))
         let paths = ProjectPaths(root: projectURL)
         try paths.ensureDirectories()
         try ProjectMetadataStore.save(metadata, to: paths.metadataURL)
@@ -825,17 +1070,48 @@ final class PipelineIntegrationTests: XCTestCase {
         let runner = MockSubprocessRunner(scripts: [
             .init(path: toolchain.da3.sfmTool.path, argsPrefix: ["--images"], result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""), onRun: { args in
                 do {
-                    try self.writeDa3RunArtifacts(for: args)
+                    try self.writeDa3RunArtifacts(
+                        for: args,
+                        selectedModelSubdirectory: "DA3-SMALL"
+                    )
                 } catch {
                     XCTFail("Failed to write DA3 test artifacts: \(error)")
                 }
+            }),
+            .init(path: toolchain.colmap.path, argsPrefix: ["feature_extractor"], result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""), onRun: { args in
+                XCTAssertEqual(self.value(for: "--ImageReader.single_camera", in: args), "0")
+                XCTAssertEqual(self.value(for: "--ImageReader.camera_model", in: args), "SIMPLE_RADIAL")
+            }),
+            .init(path: toolchain.colmap.path, argsPrefix: ["matches_importer"], result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""), onRun: nil),
+            .init(path: toolchain.colmap.path, argsPrefix: ["exhaustive_matcher"], result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""), onRun: nil),
+            .init(path: toolchain.colmap.path, argsPrefix: ["point_triangulator"], result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""), onRun: { args in
+                guard let output = self.value(for: "--output_path", in: args) else { return }
+                try? self.writeSparseModel(
+                    at: URL(fileURLWithPath: output),
+                    imageNames: self.selectedImageNames(in: paths)
+                )
+            }),
+            .init(path: toolchain.colmap.path, argsPrefix: ["bundle_adjuster"], result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""), onRun: { args in
+                guard let output = self.value(for: "--output_path", in: args) else { return }
+                try? self.writeSparseModel(
+                    at: URL(fileURLWithPath: output),
+                    imageNames: self.selectedImageNames(in: paths)
+                )
             }),
             .init(path: toolchain.colmap.path, argsPrefix: ["model_analyzer"], result: .init(exitCode: 0, terminationReason: .exit, stdout: "Registered images: 2 / 2\nPoints: 16000\nObservations: 32000\nMean track length: 2.0\nMean reprojection error: 0.8\n", stderr: ""), onRun: nil)
         ])
 
         let pipeline = PipelineRunner(
             projectURL: projectURL,
-            config: makePipelineConfig(toolchain: toolchain, preset: metadata.preset, skipTraining: true),
+            config: makePipelineConfig(
+                toolchain: toolchain,
+                skipTraining: true,
+                hardwareProfile: HardwareProfile(
+                    memoryGB: 48,
+                    cpuCount: 16,
+                    gpuWorkingSetGB: 36
+                )
+            ),
             tooling: .init(runner: runner)
         )
 
@@ -844,9 +1120,27 @@ final class PipelineIntegrationTests: XCTestCase {
         let callPaths = runner.calls.map { $0.0 }
         XCTAssertTrue(callPaths.contains(toolchain.da3.sfmTool.path))
         XCTAssertTrue(callPaths.contains(toolchain.colmap.path))
+        let da3Args = try XCTUnwrap(runner.calls.first(where: { $0.0 == toolchain.da3.sfmTool.path })?.1)
+        XCTAssertFalse(da3Args.contains("--mode"))
+        XCTAssertEqual(value(for: "--model-subdir", in: da3Args), "DA3-BASE")
+        XCTAssertEqual(value(for: "--fallback-model-subdir", in: da3Args), "DA3-SMALL")
         XCTAssertTrue(runner.calls.contains(where: { $0.0 == toolchain.colmap.path && $0.1.first == "model_analyzer" }))
-        XCTAssertFalse(runner.calls.contains(where: { $0.0 == toolchain.colmap.path && $0.1.first == "point_triangulator" }))
+        XCTAssertTrue(runner.calls.contains(where: { $0.0 == toolchain.colmap.path && $0.1.first == "point_triangulator" }))
         XCTAssertFalse(runner.calls.contains(where: { $0.0 == toolchain.colmap.path && $0.1.first == "global_mapper" }))
+        let finished = try ProjectMetadataStore.load(from: paths.metadataURL)
+        let geometry = try XCTUnwrap(finished.geometryArtifact)
+        XCTAssertEqual(
+            geometry.modelVersion,
+            "DA3-SMALL@89abcdef0123456789abcdef0123456789abcdef"
+        )
+        XCTAssertEqual(geometry.provenance.runtime?.identifier, "da3_mps")
+        XCTAssertEqual(geometry.provenance.model?.identifier, "DA3-SMALL")
+        XCTAssertEqual(
+            geometry.provenance.model?.payloadSHA256,
+            try GeometryArtifactStore.sha256(
+                of: toolchain.da3.fallbackModelBundle.appendingPathComponent("model.safetensors")
+            )
+        )
     }
 
     func testMeasuredDa3ResidualFailureFallsBackToClassicalSolve() async throws {
@@ -864,7 +1158,7 @@ final class PipelineIntegrationTests: XCTestCase {
         let metadata = ProjectMetadata(
             title: "Residual fallback",
             input: .photos(folder: sourcePhotos.path),
-            preset: PresetSpec(mode: .object, quality: .draft)
+            requestedRunOptions: RequestedRunOptions(capturePath: .orbit, detailProfile: .fast)
         )
         let paths = ProjectPaths(root: projectURL)
         try paths.ensureDirectories()
@@ -879,16 +1173,41 @@ final class PipelineIntegrationTests: XCTestCase {
                 onRun: { args in
                     do {
                         try self.writeDa3RunArtifacts(for: args)
-                        guard let output = self.value(for: "--out-sparse", in: args) else { return }
-                        let imagesURL = URL(fileURLWithPath: output).appendingPathComponent("images.txt")
-                        let text = try String(contentsOf: imagesURL, encoding: .utf8)
-                            .replacingOccurrences(of: "320 240 ", with: "400 240 ")
-                        try text.write(to: imagesURL, atomically: true, encoding: .utf8)
                     } catch {
-                        XCTFail("Failed to prepare high-residual DA3 output: \(error)")
+                        XCTFail("Failed to prepare DA3 seed artifacts: \(error)")
                     }
                 }
             ),
+            .init(path: toolchain.colmap.path, argsPrefix: ["feature_extractor"], result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""), onRun: nil),
+            .init(path: toolchain.colmap.path, argsPrefix: ["matches_importer"], result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""), onRun: nil),
+            .init(path: toolchain.colmap.path, argsPrefix: ["point_triangulator"], result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""), onRun: { args in
+                guard let output = self.value(for: "--output_path", in: args) else { return }
+                do {
+                    let modelURL = URL(fileURLWithPath: output)
+                    try self.writeDa3SparseModel(
+                        at: modelURL,
+                        imageNames: self.selectedImageNames(in: paths),
+                        pointCount: 4
+                    )
+                    try self.makeSparseModelHighResidual(at: modelURL)
+                } catch {
+                    XCTFail("Failed to prepare high-residual triangulated model: \(error)")
+                }
+            }),
+            .init(path: toolchain.colmap.path, argsPrefix: ["bundle_adjuster"], result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""), onRun: { args in
+                guard let output = self.value(for: "--output_path", in: args) else { return }
+                do {
+                    let modelURL = URL(fileURLWithPath: output)
+                    try self.writeDa3SparseModel(
+                        at: modelURL,
+                        imageNames: self.selectedImageNames(in: paths),
+                        pointCount: 4
+                    )
+                    try self.makeSparseModelHighResidual(at: modelURL)
+                } catch {
+                    XCTFail("Failed to prepare high-residual adjusted model: \(error)")
+                }
+            }),
             .init(
                 path: toolchain.colmap.path,
                 argsPrefix: ["model_analyzer"],
@@ -921,7 +1240,6 @@ final class PipelineIntegrationTests: XCTestCase {
             projectURL: projectURL,
             config: makePipelineConfig(
                 toolchain: toolchain,
-                preset: metadata.preset,
                 skipTraining: true
             ),
             tooling: .init(runner: runner)
@@ -938,6 +1256,94 @@ final class PipelineIntegrationTests: XCTestCase {
         XCTAssertEqual(finished.reconstruction?.mapper, "global_mapper")
         XCTAssertEqual(finished.geometryArtifact?.fallbackReason, "learned geometry did not pass; used classical compatibility solve")
         XCTAssertEqual(finished.geometryArtifact?.medianPixelResidual, 0)
+        XCTAssertEqual(finished.geometryArtifact?.modelVersion, "none")
+        XCTAssertNil(finished.geometryArtifact?.provenance.runtime)
+        XCTAssertNil(finished.geometryArtifact?.provenance.model)
+    }
+
+    func testRejectedDa3SummaryIsNotPersistedWhenClassicalFallbackFails() async throws {
+        let temp = makeTempRoot()
+        let projectURL = temp.appendingPathComponent("RejectedResidualFallback.easysplatproj", isDirectory: true)
+        let sourcePhotos = temp.appendingPathComponent("SourcePhotos", isDirectory: true)
+        try FileManager.default.createDirectory(at: sourcePhotos, withIntermediateDirectories: true)
+        for index in 0..<2 {
+            try writeTestImage(
+                url: sourcePhotos.appendingPathComponent("img\(index).jpg"),
+                value: UInt8(index)
+            )
+        }
+
+        let metadata = ProjectMetadata(
+            title: "Rejected residual fallback",
+            input: .photos(folder: sourcePhotos.path),
+            requestedRunOptions: RequestedRunOptions(capturePath: .orbit, detailProfile: .fast)
+        )
+        let paths = ProjectPaths(root: projectURL)
+        try paths.ensureDirectories()
+        try ProjectMetadataStore.save(metadata, to: paths.metadataURL)
+        let toolchain = try makeToolchain(root: temp, createDa3Files: true)
+        let acceptedReport = "Registered images: 2 / 2\nPoints: 16000\nObservations: 32000\nMean track length: 2.0\nMean reprojection error: 0.8\n"
+        let runner = MockSubprocessRunner(scripts: [
+            .init(
+                path: toolchain.da3.sfmTool.path,
+                argsPrefix: ["--images"],
+                result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""),
+                onRun: { args in
+                    try? self.writeDa3RunArtifacts(for: args)
+                }
+            ),
+            .init(path: toolchain.colmap.path, argsPrefix: ["feature_extractor"], result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""), onRun: nil),
+            .init(path: toolchain.colmap.path, argsPrefix: ["matches_importer"], result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""), onRun: nil),
+            .init(path: toolchain.colmap.path, argsPrefix: ["point_triangulator"], result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""), onRun: { args in
+                guard let output = self.value(for: "--output_path", in: args) else { return }
+                let modelURL = URL(fileURLWithPath: output)
+                try? self.writeDa3SparseModel(
+                    at: modelURL,
+                    imageNames: self.selectedImageNames(in: paths),
+                    pointCount: 4
+                )
+                try? self.makeSparseModelHighResidual(at: modelURL)
+            }),
+            .init(path: toolchain.colmap.path, argsPrefix: ["bundle_adjuster"], result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""), onRun: { args in
+                guard let output = self.value(for: "--output_path", in: args) else { return }
+                let modelURL = URL(fileURLWithPath: output)
+                try? self.writeDa3SparseModel(
+                    at: modelURL,
+                    imageNames: self.selectedImageNames(in: paths),
+                    pointCount: 4
+                )
+                try? self.makeSparseModelHighResidual(at: modelURL)
+            }),
+            .init(
+                path: toolchain.colmap.path,
+                argsPrefix: ["model_analyzer"],
+                result: .init(exitCode: 0, terminationReason: .exit, stdout: acceptedReport, stderr: ""),
+                onRun: nil
+            ),
+            .init(path: toolchain.colmap.path, argsPrefix: ["feature_extractor"], result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""), onRun: nil),
+            .init(path: toolchain.colmap.path, argsPrefix: ["exhaustive_matcher"], result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""), onRun: nil),
+            .init(path: toolchain.colmap.path, argsPrefix: ["global_mapper"], result: .init(exitCode: 1, terminationReason: .exit, stdout: "", stderr: "global mapper failed"), onRun: nil),
+            .init(path: toolchain.colmap.path, argsPrefix: ["mapper"], result: .init(exitCode: 1, terminationReason: .exit, stdout: "", stderr: "mapper failed"), onRun: nil),
+        ])
+        let pipeline = PipelineRunner(
+            projectURL: projectURL,
+            config: makePipelineConfig(
+                toolchain: toolchain,
+                skipTraining: true
+            ),
+            tooling: .init(runner: runner)
+        )
+
+        await XCTAssertThrowsErrorAsync {
+            try await pipeline.run { _ in }
+        }
+
+        XCTAssertTrue(runner.calls.contains { $0.1.first == "global_mapper" })
+        XCTAssertTrue(runner.calls.contains { $0.1.first == "mapper" })
+        let failed = try ProjectMetadataStore.load(from: paths.metadataURL)
+        XCTAssertNil(failed.reconstruction)
+        XCTAssertNil(failed.geometryArtifact)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: paths.geometryManifestURL.path))
     }
 
     func testPipelineOversizedDa3SeedRunsBoundedRefinementBeforeAcceptance() async throws {
@@ -945,15 +1351,22 @@ final class PipelineIntegrationTests: XCTestCase {
         let projectURL = temp.appendingPathComponent("Da3AlignedSeed.easysplatproj", isDirectory: true)
         let sourcePhotos = temp.appendingPathComponent("SourcePhotos", isDirectory: true)
         try FileManager.default.createDirectory(at: sourcePhotos, withIntermediateDirectories: true)
-        for index in 0..<10 {
-            try writeTestImage(url: sourcePhotos.appendingPathComponent("img\(index).jpg"), value: UInt8(index))
+        for index in 0..<30 {
+            try writeRetrievalTestImage(
+                url: sourcePhotos.appendingPathComponent(String(format: "img_%03d.jpg", index)),
+                index: index
+            )
         }
 
         let metadata = ProjectMetadata(
             title: "Da3AlignedSeed",
             input: .photos(folder: sourcePhotos.path),
-            preset: PresetSpec(mode: .object, quality: .draft),
-            requestedRunOptions: RequestedRunOptions(inputOrdering: .automatic)
+            requestedRunOptions: RequestedRunOptions(
+                capturePath: .orbit,
+                detailProfile: .fast,
+                inputOrdering: .continuous,
+                photoSelection: .useAllValidPhotos
+            )
         )
         let paths = ProjectPaths(root: projectURL)
         try paths.ensureDirectories()
@@ -965,7 +1378,13 @@ final class PipelineIntegrationTests: XCTestCase {
                 try? self.writeDa3RunArtifacts(for: args)
             }),
             .init(path: toolchain.colmap.path, argsPrefix: ["feature_extractor"], result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""), onRun: nil),
-            .init(path: toolchain.colmap.path, argsPrefix: ["matches_importer"], result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""), onRun: nil),
+            .init(path: toolchain.colmap.path, argsPrefix: ["matches_importer"], result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""), onRun: { args in
+                guard let path = self.value(for: "--match_list_path", in: args),
+                      let pairs = try? String(contentsOfFile: path, encoding: .utf8) else {
+                    return XCTFail("DA3 refinement pair list was not readable")
+                }
+                XCTAssertTrue(pairs.contains("frame_000000.jpg frame_000029.jpg"))
+            }),
             .init(path: toolchain.colmap.path, argsPrefix: ["point_triangulator"], result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""), onRun: { args in
                 guard let output = self.value(for: "--output_path", in: args) else { return }
                 try? self.writeSparseModel(
@@ -986,7 +1405,7 @@ final class PipelineIntegrationTests: XCTestCase {
                 result: .init(
                     exitCode: 0,
                     terminationReason: .exit,
-                    stdout: "Registered images: 10 / 10\nPoints: 16000\nObservations: 32000\nMean track length: 2.0\nMean reprojection error: 0.8\n",
+                    stdout: "Registered images: 30 / 30\nPoints: 16000\nObservations: 32000\nMean track length: 2.0\nMean reprojection error: 0.8\n",
                     stderr: ""
                 ),
                 onRun: nil
@@ -995,22 +1414,28 @@ final class PipelineIntegrationTests: XCTestCase {
 
         let pipeline = PipelineRunner(
             projectURL: projectURL,
-            config: makePipelineConfig(toolchain: toolchain, preset: metadata.preset, candidateRoute: .da3, skipTraining: true),
+            config: makePipelineConfig(toolchain: toolchain, candidateRoute: .da3, skipTraining: true),
             tooling: .init(runner: runner)
         )
-        try await pipeline.run { _ in }
+        let events = PipelineEventSink()
+        try await pipeline.run { events.append($0) }
 
         let da3Args = try XCTUnwrap(runner.calls.first(where: { $0.0 == toolchain.da3.sfmTool.path })?.1)
-        XCTAssertEqual(value(for: "--mode", in: da3Args), "seed_refine")
-        XCTAssertEqual(value(for: "--input-ordering", in: da3Args), "unordered")
+        XCTAssertFalse(da3Args.contains("--mode"))
+        XCTAssertEqual(value(for: "--input-ordering", in: da3Args), "continuous")
         let commands = runner.calls.filter { $0.0 == toolchain.colmap.path }.compactMap { $0.1.first }
         XCTAssertEqual(commands, ["feature_extractor", "matches_importer", "point_triangulator", "bundle_adjuster", "model_analyzer"])
         XCTAssertFalse(commands.contains("global_mapper"))
         XCTAssertFalse(commands.contains("mapper"))
+        XCTAssertNotNil(events.stageLog(containing: "DA3 refinement pair plan"))
 
         let finished = try ProjectMetadataStore.load(from: paths.metadataURL)
         XCTAssertEqual(finished.reconstruction?.mapper, "da3-refined")
-        XCTAssertEqual(finished.reconstruction?.meanReprojectionError, 0.8)
+        XCTAssertEqual(
+            finished.reconstruction?.meanReprojectionError,
+            0,
+            "Persisted reconstruction facts must use residuals recomputed from COLMAP tracks."
+        )
     }
 
     func testPipelineFailsOnLowQuality() async throws {
@@ -1023,7 +1448,7 @@ final class PipelineIntegrationTests: XCTestCase {
 
         let metadata = ProjectMetadata(title: "Test",
                                        input: .photos(folder: sourcePhotos.path),
-                                       preset: PresetSpec(mode: .object, quality: .draft))
+                                       requestedRunOptions: RequestedRunOptions(capturePath: .orbit, detailProfile: .fast))
         let paths = ProjectPaths(root: projectURL)
         try paths.ensureDirectories()
         try ProjectMetadataStore.save(metadata, to: paths.metadataURL)
@@ -1047,7 +1472,7 @@ final class PipelineIntegrationTests: XCTestCase {
 
         let pipeline = PipelineRunner(
             projectURL: projectURL,
-            config: makePipelineConfig(toolchain: toolchain, preset: metadata.preset, candidateRoute: .colmap),
+            config: makePipelineConfig(toolchain: toolchain, candidateRoute: .colmap),
             tooling: .init(runner: runner)
         )
 
@@ -1067,7 +1492,7 @@ final class PipelineIntegrationTests: XCTestCase {
 
         let metadata = ProjectMetadata(title: "Test",
                                        input: .photos(folder: sourcePhotos.path),
-                                       preset: PresetSpec(mode: .object, quality: .draft))
+                                       requestedRunOptions: RequestedRunOptions(capturePath: .orbit, detailProfile: .fast))
         let paths = ProjectPaths(root: projectURL)
         try paths.ensureDirectories()
         try ProjectMetadataStore.save(metadata, to: paths.metadataURL)
@@ -1080,7 +1505,7 @@ final class PipelineIntegrationTests: XCTestCase {
 
         let pipeline = PipelineRunner(
             projectURL: projectURL,
-            config: makePipelineConfig(toolchain: toolchain, preset: metadata.preset, candidateRoute: .colmap),
+            config: makePipelineConfig(toolchain: toolchain, candidateRoute: .colmap),
             tooling: .init(runner: runner)
         )
 
@@ -1099,7 +1524,7 @@ final class PipelineIntegrationTests: XCTestCase {
         let metadata = ProjectMetadata(
             title: "OneImage",
             input: .photos(folder: sourcePhotos.path),
-            preset: PresetSpec(mode: .object, quality: .draft)
+            requestedRunOptions: RequestedRunOptions(capturePath: .orbit, detailProfile: .fast)
         )
         let paths = ProjectPaths(root: projectURL)
         try paths.ensureDirectories()
@@ -1109,7 +1534,7 @@ final class PipelineIntegrationTests: XCTestCase {
         let runner = MockSubprocessRunner(scripts: [])
         let pipeline = PipelineRunner(
             projectURL: projectURL,
-            config: makePipelineConfig(toolchain: toolchain, preset: metadata.preset, skipTraining: true),
+            config: makePipelineConfig(toolchain: toolchain, skipTraining: true),
             tooling: .init(runner: runner)
         )
 
@@ -1132,7 +1557,7 @@ final class PipelineIntegrationTests: XCTestCase {
 
         let metadata = ProjectMetadata(title: "Test",
                                        input: .photos(folder: sourcePhotos.path),
-                                       preset: PresetSpec(mode: .object, quality: .draft))
+                                       requestedRunOptions: RequestedRunOptions(capturePath: .orbit, detailProfile: .fast))
         let paths = ProjectPaths(root: projectURL)
         try paths.ensureDirectories()
         try ProjectMetadataStore.save(metadata, to: paths.metadataURL)
@@ -1148,7 +1573,7 @@ final class PipelineIntegrationTests: XCTestCase {
 
         let pipeline = PipelineRunner(
             projectURL: projectURL,
-            config: makePipelineConfig(toolchain: toolchain, preset: metadata.preset, candidateRoute: .colmap),
+            config: makePipelineConfig(toolchain: toolchain, candidateRoute: .colmap),
             tooling: .init(runner: runner)
         )
 
@@ -1183,6 +1608,88 @@ final class PipelineIntegrationTests: XCTestCase {
         }
         CGImageDestinationAddImage(destination, cgImage, nil)
         _ = CGImageDestinationFinalize(destination)
+    }
+
+    private func writeRetrievalTestImage(url: URL, index: Int) throws {
+        let size = 32
+        var pixels = [UInt8](repeating: 96, count: size * size)
+        let markerX = (index * 7) % (size - 3)
+        let markerY = (index * 11) % (size - 3)
+        for y in markerY..<(markerY + 3) {
+            for x in markerX..<(markerX + 3) {
+                pixels[y * size + x] = UInt8(128 + index % 96)
+            }
+        }
+        let data = Data(pixels)
+        let colorSpace = CGColorSpaceCreateDeviceGray()
+        guard let provider = CGDataProvider(data: data as CFData),
+              let image = CGImage(
+                width: size,
+                height: size,
+                bitsPerComponent: 8,
+                bitsPerPixel: 8,
+                bytesPerRow: size,
+                space: colorSpace,
+                bitmapInfo: CGBitmapInfo(rawValue: CGImageAlphaInfo.none.rawValue),
+                provider: provider,
+                decode: nil,
+                shouldInterpolate: false,
+                intent: .defaultIntent
+              ),
+              let destination = CGImageDestinationCreateWithURL(
+                url as CFURL,
+                UTType.jpeg.identifier as CFString,
+                1,
+                nil
+              ) else {
+            throw CocoaError(.fileWriteUnknown)
+        }
+        CGImageDestinationAddImage(destination, image, nil)
+        guard CGImageDestinationFinalize(destination) else {
+            throw CocoaError(.fileWriteUnknown)
+        }
+    }
+
+    private func writeDisconnectedRetrievalTestImage(url: URL, index: Int) throws {
+        let size = 32
+        let verticalCluster = index < 60
+        var pixels = [UInt8](repeating: 0, count: size * size)
+        for y in 0..<size {
+            for x in 0..<size {
+                let high = verticalCluster ? x >= size / 2 : y >= size / 2
+                pixels[y * size + x] = high ? 232 : 24
+            }
+        }
+        let marker = (index * 13) % pixels.count
+        pixels[marker] = UInt8(80 + index % 120)
+        let data = Data(pixels)
+        let colorSpace = CGColorSpaceCreateDeviceGray()
+        guard let provider = CGDataProvider(data: data as CFData),
+              let image = CGImage(
+                width: size,
+                height: size,
+                bitsPerComponent: 8,
+                bitsPerPixel: 8,
+                bytesPerRow: size,
+                space: colorSpace,
+                bitmapInfo: CGBitmapInfo(rawValue: CGImageAlphaInfo.none.rawValue),
+                provider: provider,
+                decode: nil,
+                shouldInterpolate: false,
+                intent: .defaultIntent
+              ),
+              let destination = CGImageDestinationCreateWithURL(
+                url as CFURL,
+                UTType.png.identifier as CFString,
+                1,
+                nil
+              ) else {
+            throw CocoaError(.fileWriteUnknown)
+        }
+        CGImageDestinationAddImage(destination, image, nil)
+        guard CGImageDestinationFinalize(destination) else {
+            throw CocoaError(.fileWriteUnknown)
+        }
     }
 
     private func writeSparseModel(at projectURL: URL) throws {
@@ -1268,6 +1775,70 @@ final class PipelineIntegrationTests: XCTestCase {
         }
     }
 
+    private func persistGeometryArtifactFixture(
+        metadata: inout ProjectMetadata,
+        paths: ProjectPaths
+    ) throws {
+        let modelURL = paths.colmapSparseURL.appendingPathComponent("0", isDirectory: true)
+        let residuals = try ColmapResidualAnalyzer.analyze(modelDirectory: modelURL)
+        let imageNames = residuals.registeredImageNames.sorted()
+        let modelHashes = try Dictionary(uniqueKeysWithValues: [
+            "cameras.txt",
+            "images.txt",
+            "points3D.txt",
+        ].map { name in
+            (name, try GeometryArtifactStore.sha256(of: modelURL.appendingPathComponent(name)))
+        })
+        let artifact = GeometryArtifact(
+            schemaVersion: GeometryArtifact.currentSchemaVersion,
+            solverVersion: "colmap-test-fixture",
+            runtimeVersion: "toolchain-test-fixture",
+            modelVersion: "none",
+            inputDigest: try GeometryArtifactStore.inputDigest(projectPaths: paths),
+            selectedFramesDigest: try GeometryArtifactStore.selectedFramesDigest(
+                orderedImageNames: imageNames,
+                projectPaths: paths
+            ),
+            orderedImageNames: imageNames,
+            orderedImageTimestamps: Array(repeating: nil, count: imageNames.count),
+            canonicalModelPath: "SfM/colmap/sparse/0",
+            poseConvention: "world-to-camera",
+            quaternionOrder: "wxyz",
+            handedness: "right-handed",
+            scaleType: "arbitrary-sim3",
+            cameraModel: "SIMPLE_PINHOLE",
+            cameraGrouping: .automatic,
+            registeredViewCount: residuals.registeredViewCount,
+            totalViewCount: imageNames.count,
+            trackCount: residuals.observationCount,
+            pointCount: residuals.pointCount,
+            residualProvenance: residuals.provenance,
+            medianPixelResidual: residuals.medianPixelResidual,
+            p90PixelResidual: residuals.p90PixelResidual,
+            timings: [PipelineStage.sfmMapping.rawValue: 1],
+            peakMemoryBytes: 1,
+            modelHashes: modelHashes,
+            fallbackReason: nil,
+            provenance: GeometryProvenance(
+                toolchainVersion: "test-toolchain",
+                solver: GeometryComponentProvenance(
+                    identifier: "colmap",
+                    version: "test",
+                    revision: "test",
+                    payloadSHA256: String(repeating: "a", count: 64)
+                ),
+                runtime: nil,
+                model: nil
+            )
+        )
+        try GeometryArtifactStore.persist(
+            artifact,
+            metadata: &metadata,
+            paths: paths,
+            measuredResiduals: residuals
+        )
+    }
+
     private func writeCompletedColmapDatabase(at databaseURL: URL) throws {
         try FileManager.default.createDirectory(at: databaseURL.deletingLastPathComponent(), withIntermediateDirectories: true)
         var db: OpaquePointer?
@@ -1302,11 +1873,11 @@ final class PipelineIntegrationTests: XCTestCase {
 
     private func writeDa3RunArtifacts(
         for args: [String],
-        imageName: String = "frame_000000.jpg"
+        imageName: String = "frame_000000.jpg",
+        selectedModelSubdirectory: String? = nil
     ) throws {
         guard let manifestPath = value(for: "--manifest-out", in: args),
               let imagesPath = value(for: "--images", in: args),
-              let mode = value(for: "--mode", in: args),
               let out = value(for: "--out-sparse", in: args) else {
             return
         }
@@ -1321,16 +1892,13 @@ final class PipelineIntegrationTests: XCTestCase {
         .sorted()
 
         let totalImages = imageNames.count
-        let pointCount = max(16_000, totalImages * 500)
-        let observationsPerPoint = max(1, min(2, totalImages))
         let requestedWindowSize = Int(value(for: "--window-size", in: args) ?? "") ?? max(2, totalImages)
         let requestedWindowOverlap = Int(value(for: "--window-overlap", in: args) ?? "") ?? 0
         let effectiveWindowSize = max(2, min(totalImages, requestedWindowSize))
         let effectiveWindowOverlap = max(0, min(requestedWindowOverlap, effectiveWindowSize - 1))
         let inputOrdering = value(for: "--input-ordering", in: args) ?? "automatic"
-        let nativeColmapExport = mode == "direct"
         let windowIndices: [[Int]]
-        if mode == "seed_refine", inputOrdering == "unordered", totalImages > effectiveWindowSize {
+        if inputOrdering == "unordered", totalImages > effectiveWindowSize {
             let anchors = [0, 1, 2]
             windowIndices = [Array(0..<effectiveWindowSize)] + stride(
                 from: effectiveWindowSize,
@@ -1345,24 +1913,18 @@ final class PipelineIntegrationTests: XCTestCase {
             ).map { Array($0.0..<$0.1) }
         }
 
-        if mode == "seed_refine" {
-            try writeDa3PoseSeed(
-                at: URL(fileURLWithPath: out),
-                imageNames: imageNames.isEmpty ? [imageName] : imageNames
-            )
-        } else {
-            try writeDa3SparseModel(
-                at: URL(fileURLWithPath: out),
-                imageNames: imageNames.isEmpty ? [imageName] : imageNames,
-                pointCount: pointCount
-            )
-        }
+        try writeDa3PoseSeed(
+            at: URL(fileURLWithPath: out),
+            imageNames: imageNames.isEmpty ? [imageName] : imageNames
+        )
 
         let manifest = Da3CoverageManifest(
-            mode: mode,
+            mode: "seed_refine",
             requestedDevice: value(for: "--device", in: args) ?? "mps",
             selectedDevice: "mps",
-            modelSubdirectory: value(for: "--model-subdir", in: args) ?? "DA3-BASE",
+            modelSubdirectory: selectedModelSubdirectory
+                ?? value(for: "--model-subdir", in: args)
+                ?? "DA3-BASE",
             fallbackModelSubdirectory: value(for: "--fallback-model-subdir", in: args),
             processResolution: Int(value(for: "--process-res", in: args) ?? "") ?? 504,
             cameraType: value(for: "--camera-type", in: args) ?? "PINHOLE",
@@ -1379,18 +1941,18 @@ final class PipelineIntegrationTests: XCTestCase {
                     indices: indices
                 )
             },
-            rawPointSampleCount: mode == "direct" ? pointCount : nil,
-            fusedSparsePointCount: mode == "direct" ? pointCount : nil,
-            finalObservationCount: mode == "direct" ? pointCount * observationsPerPoint : nil,
-            meanTrackLength: mode == "direct" ? Double(observationsPerPoint) : nil,
+            rawPointSampleCount: 8,
+            fusedSparsePointCount: 4,
+            finalObservationCount: nil,
+            meanTrackLength: nil,
             registeredImageCount: totalImages,
-            nativeColmapExport: nativeColmapExport,
-            exportStrategy: nativeColmapExport ? "native_colmap" : "aligned_pose_seed",
-            inputOrdering: mode == "direct" ? inputOrdering : (inputOrdering == "automatic" ? "unordered" : inputOrdering),
-            anchorImageNames: mode == "seed_refine" ? Array(imageNames.prefix(3)) : nil,
-            alignmentEdgeCount: mode == "seed_refine" ? max(0, windowIndices.count - 1) : nil,
-            maxAlignmentRMSE: mode == "seed_refine" ? 0.01 : nil,
-            alignmentComplete: mode == "seed_refine" ? true : nil
+            nativeColmapExport: false,
+            exportStrategy: "aligned_pose_depth_seed",
+            inputOrdering: inputOrdering == "automatic" ? "unordered" : inputOrdering,
+            anchorImageNames: Array(imageNames.prefix(3)),
+            alignmentEdgeCount: max(0, windowIndices.count - 1),
+            maxAlignmentRMSE: 0.01,
+            alignmentComplete: true
         )
 
         let data = try JSONEncoder().encode(manifest)
@@ -1414,6 +1976,25 @@ final class PipelineIntegrationTests: XCTestCase {
             atomically: true,
             encoding: .utf8
         )
+        try """
+        # learned points
+        1 0 0 1 255 0 0 -1.0
+        2 1 0 1 0 255 0 -1.0
+        3 0 1 1 0 0 255 -1.0
+        4 1 1 1 255 255 255 -1.0
+
+        """.write(
+            to: modelURL.appendingPathComponent("learned_points3D.txt"),
+            atomically: true,
+            encoding: .utf8
+        )
+    }
+
+    private func makeSparseModelHighResidual(at modelURL: URL) throws {
+        let imagesURL = modelURL.appendingPathComponent("images.txt")
+        let text = try String(contentsOf: imagesURL, encoding: .utf8)
+            .replacingOccurrences(of: "320 240 ", with: "400 240 ")
+        try text.write(to: imagesURL, atomically: true, encoding: .utf8)
     }
 
     private func writeDa3SparseModel(at modelURL: URL, imageNames: [String], pointCount: Int) throws {
@@ -1497,6 +2078,20 @@ final class PipelineIntegrationTests: XCTestCase {
         }
 
         let colmap = try writeStub("colmap")
+        let colmapProvenance = toolchainRoot.appendingPathComponent("provenance/colmap.json")
+        try fm.createDirectory(
+            at: colmapProvenance.deletingLastPathComponent(),
+            withIntermediateDirectories: true
+        )
+        let colmapExecutableSHA256 = try GeometryArtifactStore.sha256(of: colmap)
+        try """
+        {
+          "toolchain_name": "colmap",
+          "source_version": "3.13.0",
+          "source_commit": "fa7280fee27f97aff31ae7f98bab7f583fac7d08",
+          "executable_sha256": "\(colmapExecutableSHA256)"
+        }
+        """.write(to: colmapProvenance, atomically: true, encoding: .utf8)
         let msplat = createMsplatFile ? try writeStub("easysplat-train") : bin.appendingPathComponent("easysplat-train")
 
         let da3 = try TestToolchains.da3Toolchain(root: toolchainRoot, createFiles: createDa3Files)

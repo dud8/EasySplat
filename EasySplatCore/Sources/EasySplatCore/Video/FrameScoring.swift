@@ -6,7 +6,9 @@ public struct FrameScore: Sendable {
     public var blurScore: Double
     public var laplacianScore: Double
     public var brightness: Double
+    public var maximumColorComponent: Double
     public var clippedFraction: Double
+    public var lowLightExposureEV: Double
     public var dHash: UInt64
 }
 
@@ -22,9 +24,21 @@ public enum FrameScoring {
         let grayscale = grayscalePixels(cgImage: cgImage, width: 64, height: 64)
         let blur = blurScore(pixels: grayscale, width: 64, height: 64)
         let laplacian = laplacianVariance(pixels: grayscale, width: 64, height: 64)
-        let (brightness, clipped) = exposureScore(pixels: grayscale)
+        let exposure = exposureScore(pixels: grayscale)
+        let maximumColorComponent = maximumColorComponent(cgImage: cgImage, width: 64, height: 64)
         let hash = dHash(pixels: grayscale, width: 64, height: 64)
-        return FrameScore(blurScore: blur, laplacianScore: laplacian, brightness: brightness, clippedFraction: clipped, dHash: hash)
+        return FrameScore(
+            blurScore: blur,
+            laplacianScore: laplacian,
+            brightness: exposure.brightness,
+            maximumColorComponent: maximumColorComponent,
+            clippedFraction: exposure.clippedFraction,
+            lowLightExposureEV: lowLightExposureEV(
+                brightness: exposure.brightness,
+                maximumColorComponent: maximumColorComponent
+            ),
+            dHash: hash
+        )
     }
 
     private static func loadCGImage(url: URL) -> CGImage? {
@@ -109,7 +123,9 @@ public enum FrameScoring {
         return variance
     }
 
-    private static func exposureScore(pixels: [UInt8]) -> (Double, Double) {
+    private static func exposureScore(
+        pixels: [UInt8]
+    ) -> (brightness: Double, clippedFraction: Double) {
         var sum: Int64 = 0
         var clipped: Int64 = 0
         for p in pixels {
@@ -119,6 +135,51 @@ public enum FrameScoring {
         let brightness = Double(sum) / Double(pixels.count) / 255.0
         let clippedFraction = Double(clipped) / Double(pixels.count)
         return (brightness, clippedFraction)
+    }
+
+    private static func maximumColorComponent(
+        cgImage: CGImage,
+        width: Int,
+        height: Int
+    ) -> Double {
+        let colorSpace = CGColorSpaceCreateDeviceRGB()
+        var pixels = [UInt8](repeating: 0, count: width * height * 4)
+        pixels.withUnsafeMutableBytes { raw in
+            if let context = CGContext(
+                data: raw.baseAddress,
+                width: width,
+                height: height,
+                bitsPerComponent: 8,
+                bytesPerRow: width * 4,
+                space: colorSpace,
+                bitmapInfo: CGBitmapInfo.byteOrder32Big.rawValue
+                    | CGImageAlphaInfo.noneSkipLast.rawValue
+            ) {
+                context.interpolationQuality = .high
+                context.draw(cgImage, in: CGRect(x: 0, y: 0, width: width, height: height))
+            }
+        }
+        var maximum: UInt8 = 0
+        for offset in stride(from: 0, to: pixels.count, by: 4) {
+            maximum = max(maximum, pixels[offset], pixels[offset + 1], pixels[offset + 2])
+        }
+        return Double(maximum) / 255.0
+    }
+
+    private static func lowLightExposureEV(
+        brightness: Double,
+        maximumColorComponent: Double
+    ) -> Double {
+        guard brightness >= 0.02,
+              brightness < 0.18,
+              maximumColorComponent > 0,
+              maximumColorComponent < 0.98 else {
+            return 0
+        }
+        let desiredEV = log2(0.24 / brightness)
+        let clippingSafeEV = log2(0.98 / maximumColorComponent)
+        let exposureEV = min(1.0, desiredEV, clippingSafeEV)
+        return exposureEV >= 0.15 ? exposureEV : 0
     }
 
     private static func dHash(pixels: [UInt8], width: Int, height: Int) -> UInt64 {

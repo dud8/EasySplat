@@ -4,19 +4,21 @@ import Foundation
 public enum ProjectMetadataStore {
     private static let maximumMetadataBytes = 8 * 1_024 * 1_024
     private static let fileLocks = ProjectMetadataFileLocks()
-    /// Highest `formatVersion` this build can read. Bump when introducing
-    /// breaking schema changes that older builds would silently corrupt.
+    /// The one project format this beta reads and writes.
     public static let supportedFormatVersion: Int = 2
 
     public enum LoadError: Error, LocalizedError {
         case unsupportedFormatVersion(Int)
+        case requiresNewerApp(Int)
         case invalidArtifactPath(field: String, path: String)
         case invalidArtifactNamespace(field: String, path: String)
 
         public var errorDescription: String? {
             switch self {
             case .unsupportedFormatVersion(let version):
-                return "Project metadata uses formatVersion \(version), but this build supports up to \(ProjectMetadataStore.supportedFormatVersion). Update EasySplat to open this project."
+                return "Project format \(version) is not supported. This version of EasySplat opens format \(ProjectMetadataStore.supportedFormatVersion) projects only."
+            case .requiresNewerApp(let version):
+                return "Project format \(version) requires a newer version of EasySplat. Update EasySplat to open this project."
             case .invalidArtifactPath(let field, let path):
                 return "Project metadata contains an invalid project-relative artifact path for \(field): \(path)"
             case .invalidArtifactNamespace(let field, let path):
@@ -26,10 +28,13 @@ public enum ProjectMetadataStore {
     }
 
     public enum SaveError: Error, LocalizedError {
+        case invalidFormatVersion(Int)
         case metadataTooLarge(maximumBytes: Int)
 
         public var errorDescription: String? {
             switch self {
+            case .invalidFormatVersion(let version):
+                return "Cannot save project format \(version)."
             case .metadataTooLarge(let maximumBytes):
                 return "Project metadata exceeds the \(maximumBytes)-byte save limit."
             }
@@ -52,7 +57,7 @@ public enum ProjectMetadataStore {
         try fileLocks.withLock(for: url) {
             var merged = metadata
             do {
-                let current = try loadWithoutLock(from: url)
+                let current = try decodeWithoutArtifactValidation(from: url)
                 merged.title = current.title
                 merged.notes = current.notes
             } catch {
@@ -78,38 +83,31 @@ public enum ProjectMetadataStore {
     }
 
     private static func loadWithoutLock(from url: URL) throws -> ProjectMetadata {
+        let metadata = try decodeWithoutArtifactValidation(from: url)
+        try validateArtifactPaths(in: metadata, metadataURL: url)
+        return metadata
+    }
+
+    private static func decodeWithoutArtifactValidation(from url: URL) throws -> ProjectMetadata {
         try ProjectPaths(root: url.deletingLastPathComponent()).validateRootDirectory()
         let data = try BoundedFileReader.readRegularFile(
             at: url,
             maximumBytes: maximumMetadataBytes
         )
-        // Peek at formatVersion via a permissive envelope decode first. A future build can
-        // rename or drop fields that the strict ProjectMetadata decoder requires; we want
-        // such projects to surface as "needs app update" rather than as opaque DecodingErrors.
-        if let envelope = try? JSONDecoder().decode(FormatVersionEnvelope.self, from: data),
-           envelope.formatVersion > supportedFormatVersion {
+        // Read the schema envelope before the strict payload so unsupported projects fail
+        // clearly without partially interpreting another format.
+        let envelope = try JSONDecoder().decode(FormatVersionEnvelope.self, from: data)
+        guard envelope.formatVersion == supportedFormatVersion else {
+            if envelope.formatVersion > supportedFormatVersion {
+                throw LoadError.requiresNewerApp(envelope.formatVersion)
+            }
             throw LoadError.unsupportedFormatVersion(envelope.formatVersion)
         }
         let decoder = JSONDecoder()
         decoder.dateDecodingStrategy = .iso8601
-        var metadata = try decoder.decode(ProjectMetadata.self, from: data)
-        // Defensive: catch the case where the envelope decode failed but the strict one
-        // somehow succeeded with a future formatVersion (shouldn't happen today, but
-        // belt-and-braces — the contract is we never hand back a future version).
-        guard metadata.formatVersion <= supportedFormatVersion else {
-            throw LoadError.unsupportedFormatVersion(metadata.formatVersion)
-        }
-        if metadata.formatVersion == 1 {
-            metadata = migrateVersionOne(metadata)
-        }
-        do {
-            try validateArtifactPaths(in: metadata, metadataURL: url)
-        } catch TrainingArtifactStoreError.invalidManifest where metadata.trainingArtifact != nil {
-            // Early format-v2 builds wrote training receipts without the input/build
-            // binding required for safe resume. Keep the project and public output
-            // viewable, but discard that untrusted restart hint.
-            metadata.trainingArtifact = nil
-            try validateArtifactPaths(in: metadata, metadataURL: url)
+        let metadata = try decoder.decode(ProjectMetadata.self, from: data)
+        guard metadata.formatVersion == supportedFormatVersion else {
+            throw SaveError.invalidFormatVersion(metadata.formatVersion)
         }
         return metadata
     }
@@ -122,40 +120,18 @@ public enum ProjectMetadataStore {
 
     private static func saveWithoutLock(_ metadata: ProjectMetadata, to url: URL) throws {
         try ProjectPaths(root: url.deletingLastPathComponent()).validateRootDirectory()
+        guard metadata.formatVersion == supportedFormatVersion else {
+            throw SaveError.invalidFormatVersion(metadata.formatVersion)
+        }
         try validateArtifactPaths(in: metadata, metadataURL: url)
-        var persisted = metadata
-        // These v1 fields remain decodable for compatibility, but current activity lives
-        // outside project.json and new saves must not recreate retired analytics data.
-        persisted.shareMetrics = nil
-        persisted.autoTune = nil
-        persisted.lastOpenedAt = nil
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.prettyPrinted, .sortedKeys, .withoutEscapingSlashes]
         encoder.dateEncodingStrategy = .iso8601
-        let data = try encoder.encode(persisted)
+        let data = try encoder.encode(metadata)
         guard data.count <= maximumMetadataBytes else {
             throw SaveError.metadataTooLarge(maximumBytes: maximumMetadataBytes)
         }
         try data.write(to: url, options: [.atomic])
-    }
-
-    private static func migrateVersionOne(_ legacy: ProjectMetadata) -> ProjectMetadata {
-        var migrated = legacy
-        migrated.formatVersion = supportedFormatVersion
-        migrated.requestedRunOptions = RequestedRunOptions(
-            capturePath: legacy.preset.mode == .object ? .orbit : .walkthrough,
-            detailProfile: {
-                switch legacy.preset.quality {
-                case .draft: return .fast
-                case .standard: return .balanced
-                case .ultra: return .highDetail
-                }
-            }()
-        )
-        migrated.resolvedRunPlan = nil
-        migrated.geometryArtifact = nil
-        migrated.trainingArtifact = nil
-        return migrated
     }
 
     private static func validateArtifactPaths(
@@ -172,6 +148,31 @@ public enum ProjectMetadataStore {
         }
         if let path = metadata.trainingArtifact?.outputPath {
             artifactPaths.append(("trainingArtifact.outputPath", path))
+        }
+        if let outputs = metadata.outputs {
+            artifactPaths.append(("outputs.splatPlyPath", outputs.splatPlyPath))
+            artifactPaths.append(("outputs.colmapModelPath", outputs.colmapModelPath))
+        }
+        if let details = metadata.checkpoint?.details {
+            switch details {
+            case .extractFrames:
+                break
+            case .selectFrames(let checkpoint):
+                if let path = checkpoint.manifestPath {
+                    artifactPaths.append(("checkpoint.selectFrames.manifestPath", path))
+                }
+            case .sfmFeatures(let checkpoint):
+                artifactPaths.append(("checkpoint.sfmFeatures.databasePath", checkpoint.databasePath))
+            case .sfmMatching(let checkpoint):
+                artifactPaths.append(("checkpoint.sfmMatching.databasePath", checkpoint.databasePath))
+            case .sfmMapping(let checkpoint):
+                artifactPaths.append(("checkpoint.sfmMapping.sparsePath", checkpoint.sparsePath))
+            case .trainSplat:
+                break
+            case .exportSplat(let checkpoint):
+                artifactPaths.append(("checkpoint.exportSplat.outputPath", checkpoint.outputPath))
+                artifactPaths.append(("checkpoint.exportSplat.sourcePath", checkpoint.sourcePath))
+            }
         }
 
         for artifactPath in artifactPaths {
@@ -195,7 +196,7 @@ public enum ProjectMetadataStore {
         }
 
         if let trainingArtifact = metadata.trainingArtifact {
-            try TrainingArtifactStore.validateArtifact(
+            try TrainingArtifactStore.validateManifest(
                 trainingArtifact,
                 projectPaths: paths
             )
@@ -214,6 +215,16 @@ public enum ProjectMetadataStore {
                 || path.hasPrefix("Training/checkpoints/msplat/")
         case "trainingArtifact.outputPath":
             return path == "Output/splat.ply" || path.hasPrefix("Training/")
+        case "outputs.splatPlyPath", "checkpoint.exportSplat.outputPath":
+            return path.hasPrefix("Output/")
+        case "outputs.colmapModelPath", "checkpoint.sfmMapping.sparsePath":
+            return path.hasPrefix("SfM/")
+        case "checkpoint.selectFrames.manifestPath":
+            return path.hasPrefix("Frames/")
+        case "checkpoint.sfmFeatures.databasePath", "checkpoint.sfmMatching.databasePath":
+            return path == "SfM/colmap/database.db"
+        case "checkpoint.exportSplat.sourcePath":
+            return path.hasPrefix("Training/")
         default:
             return false
         }

@@ -17,7 +17,6 @@ final class Da3SfmRunnerTests: XCTestCase {
 
         let config = Da3SfmConfig(
             device: "mps",
-            mode: .direct,
             modelSubdirectory: "DA3-BASE",
             fallbackModelSubdirectory: "DA3-SMALL",
             processResolution: 504,
@@ -40,19 +39,27 @@ final class Da3SfmRunnerTests: XCTestCase {
         ])
 
         let runner = Da3SfmRunner(runner: mock)
-        try await runner.run(
-            toolchain: toolchain,
-            images: imagesPath,
-            outSparse: outSparse,
-            config: config,
-            onLog: { _, _ in }
-        )
+        try await withEnvironmentAsync([
+            "PYTHONPATH": "/tmp/untrusted-modules",
+            "PYTHONHOME": "/tmp/untrusted-home",
+            "PYTHONUSERBASE": "/tmp/untrusted-user-base",
+            "PYTHONSTARTUP": "/tmp/untrusted-startup.py",
+            "PYTORCH_ENABLE_MPS_FALLBACK": "0",
+        ]) {
+            try await runner.run(
+                toolchain: toolchain,
+                images: imagesPath,
+                outSparse: outSparse,
+                config: config,
+                onLog: { _, _ in }
+            )
+        }
 
         let capturedArgs = try XCTUnwrap(mock.calls.first?.1)
         XCTAssertEqual(capturedArgs.first, "--images")
         XCTAssertEqual(value(after: "--out-sparse", in: capturedArgs), outSparse.path)
         XCTAssertEqual(value(after: "--models-dir", in: capturedArgs), toolchain.models.path)
-        XCTAssertEqual(value(after: "--mode", in: capturedArgs), "direct")
+        XCTAssertFalse(capturedArgs.contains("--mode"))
         XCTAssertEqual(value(after: "--model-subdir", in: capturedArgs), "DA3-BASE")
         XCTAssertEqual(value(after: "--fallback-model-subdir", in: capturedArgs), "DA3-SMALL")
         XCTAssertEqual(value(after: "--process-res", in: capturedArgs), "504")
@@ -72,11 +79,17 @@ final class Da3SfmRunnerTests: XCTestCase {
         XCTAssertEqual(environment["HF_HUB_DISABLE_TELEMETRY"], "1")
         XCTAssertEqual(environment["DO_NOT_TRACK"], "1")
         XCTAssertEqual(environment["TOKENIZERS_PARALLELISM"], "false")
-        XCTAssertNotNil(environment["PYTORCH_ENABLE_MPS_FALLBACK"])
+        XCTAssertEqual(environment["PYTORCH_ENABLE_MPS_FALLBACK"], "1")
+        XCTAssertEqual(environment["PYTHONNOUSERSITE"], "1")
+        XCTAssertEqual(environment["PYTHONSAFEPATH"], "1")
+        XCTAssertNil(environment["PYTHONPATH"])
+        XCTAssertNil(environment["PYTHONHOME"])
+        XCTAssertNil(environment["PYTHONUSERBASE"])
+        XCTAssertNil(environment["PYTHONSTARTUP"])
         XCTAssertTrue(environment["PATH"]?.contains(toolchain.python.deletingLastPathComponent().path) == true)
     }
 
-    func testRunAcceptsSeedRefineAndPassesUnorderedInput() async throws {
+    func testRunPassesUnorderedInput() async throws {
         let temp = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
         defer { try? FileManager.default.removeItem(at: temp) }
         let toolchain = try TestToolchains.da3Toolchain(root: temp, createFiles: true)
@@ -88,7 +101,6 @@ final class Da3SfmRunnerTests: XCTestCase {
 
         let config = Da3SfmConfig(
             device: "mps",
-            mode: .seedRefine,
             modelSubdirectory: "DA3-BASE",
             fallbackModelSubdirectory: "DA3-SMALL",
             processResolution: 504,
@@ -119,7 +131,7 @@ final class Da3SfmRunnerTests: XCTestCase {
         )
 
         let capturedArgs = try XCTUnwrap(mock.calls.first?.1)
-        XCTAssertEqual(value(after: "--mode", in: capturedArgs), "seed_refine")
+        XCTAssertFalse(capturedArgs.contains("--mode"))
         XCTAssertEqual(value(after: "--input-ordering", in: capturedArgs), "unordered")
     }
 

@@ -62,4 +62,38 @@ final class ToolLogWriterTests: XCTestCase {
         XCTAssertTrue(text.contains("first-stage"))
         XCTAssertTrue(text.contains("second-stage"))
     }
+
+    func testSymlinkedLogIsRejectedWithoutOverwritingExternalFile() throws {
+        let parent = try TestFileBuilder.makeTempDir()
+        defer { try? FileManager.default.removeItem(at: parent) }
+        let logs = parent.appendingPathComponent("Logs", isDirectory: true)
+        try FileManager.default.createDirectory(at: logs, withIntermediateDirectories: true)
+        let outside = parent.appendingPathComponent("outside.log")
+        let sentinel = Data("keep\n".utf8)
+        try sentinel.write(to: outside)
+        let logURL = logs.appendingPathComponent("tool.log")
+        try FileManager.default.createSymbolicLink(at: logURL, withDestinationURL: outside)
+
+        let writer = ToolLogWriter(fileURL: logURL, toolName: "tool")
+        writer.append(stream: "stdout", line: "must not escape")
+
+        XCTAssertEqual(try Data(contentsOf: outside), sentinel)
+    }
+
+    func testHardLinkedLogIsRejectedWithoutOverwritingExternalFile() throws {
+        let parent = try TestFileBuilder.makeTempDir()
+        defer { try? FileManager.default.removeItem(at: parent) }
+        let logs = parent.appendingPathComponent("Logs", isDirectory: true)
+        try FileManager.default.createDirectory(at: logs, withIntermediateDirectories: true)
+        let outside = parent.appendingPathComponent("outside.log")
+        let sentinel = Data("keep\n".utf8)
+        try sentinel.write(to: outside)
+        let logURL = logs.appendingPathComponent("tool.log")
+        try FileManager.default.linkItem(at: outside, to: logURL)
+
+        let writer = ToolLogWriter(fileURL: logURL, toolName: "tool")
+        writer.append(stream: "stdout", line: "must not escape")
+
+        XCTAssertEqual(try Data(contentsOf: outside), sentinel)
+    }
 }

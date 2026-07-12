@@ -2,6 +2,10 @@ import Foundation
 
 struct Da3CoverageManifest: Codable, Sendable {
     static let hardMatchPairLimit = 100_000
+    // A 3,000-frame solve with ten-view windows advancing two views has at most
+    // 15,000 serialized image entries. Eight MiB leaves over 500 bytes per entry;
+    // the 100,000-pair budget is derived from those windows, not serialized here.
+    private static let maximumFileBytes = 8 * 1_024 * 1_024
 
     struct Window: Codable, Sendable {
         var start: Int
@@ -65,24 +69,64 @@ struct Da3CoverageManifest: Codable, Sendable {
     }
 
     static func load(from url: URL) throws -> Da3CoverageManifest {
-        let data = try Data(contentsOf: url)
+        let data = try BoundedFileReader.readRegularFile(
+            at: url,
+            maximumBytes: maximumFileBytes
+        )
         return try JSONDecoder().decode(Da3CoverageManifest.self, from: data)
     }
 
     func validationIssues(
-        expectedMode: Da3RunMode,
         selectedImageNames: [String],
         expectedWindowSize: Int? = nil,
         expectedWindowOverlap: Int? = nil,
-        expectedInputOrdering: InputOrdering? = nil
+        expectedInputOrdering: InputOrdering? = nil,
+        expectedProcessResolution: Int? = nil,
+        expectedMaxPoints: Int? = nil,
+        expectedCameraType: String? = nil,
+        expectedSharedCamera: Bool? = nil,
+        expectedPrimaryModelSubdirectory: String? = nil,
+        expectedFallbackModelSubdirectory: String? = nil
     ) -> [String] {
         var issues: [String] = []
         let selectedImageCount = selectedImageNames.count
-        if mode != expectedMode.rawValue {
-            issues.append("mode=\(mode) did not match expected \(expectedMode.rawValue)")
+        if mode != "seed_refine" {
+            issues.append("mode=\(mode) did not match required seed_refine")
         }
         if totalImages != selectedImageCount {
             issues.append("total_images=\(totalImages) did not match selected frames \(selectedImageCount)")
+        }
+        if let expectedProcessResolution, processResolution != expectedProcessResolution {
+            issues.append("process_res=\(processResolution) did not match expected \(expectedProcessResolution)")
+        }
+        if maxPoints <= 0 {
+            issues.append("max_points must be positive")
+        }
+        if let expectedMaxPoints, maxPoints != expectedMaxPoints {
+            issues.append("max_points=\(maxPoints) did not match expected \(expectedMaxPoints)")
+        }
+        if let expectedCameraType, cameraType != expectedCameraType {
+            issues.append("camera_type=\(cameraType) did not match expected \(expectedCameraType)")
+        }
+        if let expectedSharedCamera, sharedCamera != expectedSharedCamera {
+            issues.append("shared_camera=\(sharedCamera) did not match expected \(expectedSharedCamera)")
+        }
+        if let expectedPrimaryModelSubdirectory {
+            let allowedModels = Set([
+                expectedPrimaryModelSubdirectory,
+                expectedFallbackModelSubdirectory ?? expectedPrimaryModelSubdirectory,
+            ])
+            if !allowedModels.contains(modelSubdirectory) {
+                issues.append(
+                    "model_subdir=\(modelSubdirectory) was not the configured primary or fallback model"
+                )
+            }
+        }
+        if let expectedFallbackModelSubdirectory,
+           fallbackModelSubdirectory != expectedFallbackModelSubdirectory {
+            issues.append(
+                "fallback_model_subdir=\(fallbackModelSubdirectory ?? "missing") did not match expected \(expectedFallbackModelSubdirectory)"
+            )
         }
         if windows.isEmpty {
             issues.append("windows list was empty")
@@ -139,143 +183,155 @@ struct Da3CoverageManifest: Codable, Sendable {
                 }
             }
         }
-        if expectedMode == .direct, let registeredImageCount, registeredImageCount != selectedImageCount {
-            issues.append("direct mode expected registered_image_count=\(selectedImageCount), got \(registeredImageCount)")
+        let trustedPairLimit: Int?
+        if let expectedWindowSize,
+           let expectedWindowOverlap,
+           let expectedInputOrdering {
+            let effectiveExpectedWindowSize = max(
+                2,
+                min(expectedWindowSize, selectedImageCount)
+            )
+            let effectiveExpectedWindowOverlap = max(
+                0,
+                min(expectedWindowOverlap, effectiveExpectedWindowSize - 1)
+            )
+            if windowSize != effectiveExpectedWindowSize {
+                issues.append("seed_refine window_size=\(windowSize) did not match expected \(effectiveExpectedWindowSize)")
+            }
+            if windowOverlap != effectiveExpectedWindowOverlap {
+                issues.append("seed_refine window_overlap=\(windowOverlap) did not match expected \(effectiveExpectedWindowOverlap)")
+            }
+            if inputOrdering != expectedInputOrdering.rawValue {
+                issues.append("seed_refine input_ordering=\(inputOrdering ?? "missing") did not match expected \(expectedInputOrdering.rawValue)")
+            }
+            trustedPairLimit = Self.trustedMatchPairLimit(
+                selectedImageCount: selectedImageCount,
+                windowSize: expectedWindowSize,
+                windowOverlap: expectedWindowOverlap,
+                inputOrdering: expectedInputOrdering
+            )
+            if trustedPairLimit == nil {
+                issues.append("seed_refine trusted run plan could not produce a valid match pair limit")
+            }
+        } else {
+            trustedPairLimit = nil
+            issues.append("seed_refine validation requires a trusted window size, overlap, and input ordering")
         }
-        if expectedMode == .direct,
-           nativeColmapExport != true {
-            issues.append("direct mode requires native_colmap_export=true")
+        if nativeColmapExport != false {
+            issues.append("seed_refine requires native_colmap_export=false")
         }
-        if expectedMode == .direct,
-           let exportStrategy,
-           exportStrategy != "native_colmap" {
-            issues.append("direct mode requires export_strategy=native_colmap")
+        if exportStrategy != "aligned_pose_depth_seed" {
+            issues.append("seed_refine requires export_strategy=aligned_pose_depth_seed")
         }
-        if expectedMode == .seedRefine {
-            let trustedPairLimit: Int?
-            if let expectedWindowSize,
-               let expectedWindowOverlap,
-               let expectedInputOrdering {
-                if windowSize != expectedWindowSize {
-                    issues.append("seed_refine window_size=\(windowSize) did not match expected \(expectedWindowSize)")
-                }
-                if windowOverlap != expectedWindowOverlap {
-                    issues.append("seed_refine window_overlap=\(windowOverlap) did not match expected \(expectedWindowOverlap)")
-                }
-                if inputOrdering != expectedInputOrdering.rawValue {
-                    issues.append("seed_refine input_ordering=\(inputOrdering ?? "missing") did not match expected \(expectedInputOrdering.rawValue)")
-                }
-                trustedPairLimit = Self.trustedMatchPairLimit(
-                    selectedImageCount: selectedImageCount,
-                    windowSize: expectedWindowSize,
-                    windowOverlap: expectedWindowOverlap,
-                    inputOrdering: expectedInputOrdering
-                )
-                if trustedPairLimit == nil {
-                    issues.append("seed_refine trusted run plan could not produce a valid match pair limit")
-                }
-            } else {
-                trustedPairLimit = nil
-                issues.append("seed_refine validation requires a trusted window size, overlap, and input ordering")
-            }
-            if nativeColmapExport != false {
-                issues.append("seed_refine requires native_colmap_export=false")
-            }
-            if exportStrategy != "aligned_pose_seed" {
-                issues.append("seed_refine requires export_strategy=aligned_pose_seed")
-            }
-            if registeredImageCount != selectedImageCount {
-                issues.append("seed_refine requires complete image coverage: registered_image_count must equal \(selectedImageCount)")
-            }
-            let coveredIndices = resolvedWindowIndices.reduce(into: Set<Int>()) { partial, indices in
-                partial.formUnion(indices)
-            }
-            if coveredIndices != Set(selectedImageNames.indices) {
-                issues.append("seed_refine requires complete image coverage across windows")
-            }
-            let coveredImages = Set(windows.flatMap(\.images))
-            let anchors = anchorImageNames ?? []
-            if anchors.count < 3 || Set(anchors).count != anchors.count {
-                issues.append("seed_refine requires at least three distinct anchor_image_names")
-            } else if !Set(anchors).isSubset(of: coveredImages) {
-                issues.append("seed_refine anchor_image_names must belong to covered images")
-            }
-            if inputOrdering != InputOrdering.continuous.rawValue,
-               inputOrdering != InputOrdering.unordered.rawValue {
-                issues.append("seed_refine input_ordering must resolve to continuous or unordered")
-            }
-            if inputOrdering == InputOrdering.continuous.rawValue {
-                var seen = Set<Int>()
-                for (index, indices) in resolvedWindowIndices.enumerated() {
-                    let current = Set(indices)
-                    if index > 0 {
-                        let previous = Set(resolvedWindowIndices[index - 1])
-                        if previous.intersection(current).count < 3 {
-                            issues.append("window[\(index)] continuous overlap had fewer than three images")
-                        }
-                        if current.subtracting(seen).isEmpty {
-                            issues.append("window[\(index)] did not advance the continuous alignment graph")
-                        }
+        if registeredImageCount != selectedImageCount {
+            issues.append("seed_refine requires complete image coverage: registered_image_count must equal \(selectedImageCount)")
+        }
+        let coveredIndices = resolvedWindowIndices.reduce(into: Set<Int>()) { partial, indices in
+            partial.formUnion(indices)
+        }
+        if coveredIndices != Set(selectedImageNames.indices) {
+            issues.append("seed_refine requires complete image coverage across windows")
+        }
+        let coveredImages = Set(windows.flatMap(\.images))
+        let anchors = anchorImageNames ?? []
+        let requiredAnchorCount = min(3, selectedImageCount)
+        if anchors.count < requiredAnchorCount || Set(anchors).count != anchors.count {
+            issues.append("seed_refine requires at least \(requiredAnchorCount) distinct anchor_image_names")
+        } else if !Set(anchors).isSubset(of: coveredImages) {
+            issues.append("seed_refine anchor_image_names must belong to covered images")
+        }
+        if inputOrdering != InputOrdering.continuous.rawValue,
+           inputOrdering != InputOrdering.unordered.rawValue {
+            issues.append("seed_refine input_ordering must resolve to continuous or unordered")
+        }
+        if inputOrdering == InputOrdering.continuous.rawValue {
+            let requiredOverlap = Self.minimumAlignmentOverlap(
+                windowSize: windowSize,
+                requestedOverlap: windowOverlap
+            )
+            var seen = Set<Int>()
+            for (index, indices) in resolvedWindowIndices.enumerated() {
+                let current = Set(indices)
+                if index > 0 {
+                    let previous = Set(resolvedWindowIndices[index - 1])
+                    if previous.intersection(current).count < requiredOverlap {
+                        issues.append("window[\(index)] continuous overlap had fewer than \(requiredOverlap) images")
                     }
-                    seen.formUnion(current)
-                }
-            } else if inputOrdering == InputOrdering.unordered.rawValue {
-                let anchorIndices = Set(anchors.compactMap { selectedImageNames.firstIndex(of: $0) })
-                var seen = Set<Int>()
-                for (index, indices) in resolvedWindowIndices.enumerated() {
-                    let current = Set(indices)
-                    if !anchorIndices.isSubset(of: current) {
-                        issues.append("window[\(index)] did not contain all declared anchors")
+                    if current.subtracting(seen).isEmpty {
+                        issues.append("window[\(index)] did not advance the continuous alignment graph")
                     }
-                    if index > 0, current.subtracting(seen).isEmpty {
-                        issues.append("window[\(index)] did not add an unseen image")
-                    }
-                    seen.formUnion(current)
                 }
+                seen.formUnion(current)
             }
-            if alignmentComplete != true {
-                issues.append("seed_refine requires alignment_complete=true")
-            }
-            let requiredEdges = max(0, windows.count - 1)
-            if alignmentEdgeCount != requiredEdges {
-                issues.append("seed_refine alignment_edge_count must equal \(requiredEdges)")
-            }
-            if let maxAlignmentRMSE {
-                if !maxAlignmentRMSE.isFinite || maxAlignmentRMSE < 0 || maxAlignmentRMSE > 0.05 {
-                    issues.append("seed_refine max_alignment_rmse must be finite and no greater than 0.05")
+        } else if inputOrdering == InputOrdering.unordered.rawValue {
+            let requiredOverlap = Self.minimumAlignmentOverlap(
+                windowSize: windowSize,
+                requestedOverlap: windowOverlap
+            )
+            var seen = Set<Int>()
+            for (index, indices) in resolvedWindowIndices.enumerated() {
+                let current = Set(indices)
+                if index > 0, current.intersection(seen).count < requiredOverlap {
+                    issues.append("window[\(index)] unordered overlap had fewer than \(requiredOverlap) accepted images")
                 }
-            } else {
-                issues.append("seed_refine requires max_alignment_rmse")
-            }
-            if rawPointSampleCount != nil || fusedSparsePointCount != nil || finalObservationCount != nil || meanTrackLength != nil {
-                issues.append("aligned pose seed must not claim sparse points, observations, or track length")
-            }
-            if let pairs = boundedMatchPairs,
-               let trustedPairLimit,
-               pairs.count > trustedPairLimit {
-                issues.append("seed_refine match pair count \(pairs.count) exceeded trusted match pair limit \(trustedPairLimit)")
-            }
-            if boundedMatchPairs == nil {
-                issues.append("seed_refine match pair count exceeded the hard limit \(Self.hardMatchPairLimit)")
+                if index > 0, current.subtracting(seen).isEmpty {
+                    issues.append("window[\(index)] did not add an unseen image")
+                }
+                seen.formUnion(current)
             }
         }
-        if let rawPointSampleCount, rawPointSampleCount <= 0 {
-            issues.append("raw_point_sample_count must be > 0")
+        if alignmentComplete != true {
+            issues.append("seed_refine requires alignment_complete=true")
         }
-        if let fusedSparsePointCount, fusedSparsePointCount <= 0 {
-            issues.append("fused_sparse_point_count must be > 0")
+        let requiredEdges = max(0, windows.count - 1)
+        if alignmentEdgeCount != requiredEdges {
+            issues.append("seed_refine alignment_edge_count must equal \(requiredEdges)")
         }
-        if let finalObservationCount, finalObservationCount <= 0 {
-            issues.append("final_observation_count must be > 0")
+        if let maxAlignmentRMSE {
+            if !maxAlignmentRMSE.isFinite || maxAlignmentRMSE < 0 || maxAlignmentRMSE > 0.05 {
+                issues.append("seed_refine max_alignment_rmse must be finite and no greater than 0.05")
+            }
+        } else {
+            issues.append("seed_refine requires max_alignment_rmse")
         }
-        if let rawPointSampleCount, let fusedSparsePointCount, rawPointSampleCount < fusedSparsePointCount {
-            issues.append("raw_point_sample_count \(rawPointSampleCount) was smaller than fused_sparse_point_count \(fusedSparsePointCount)")
+        if let rawPointSampleCount, let fusedSparsePointCount {
+            if rawPointSampleCount <= 0 {
+                issues.append("raw_point_sample_count must be positive")
+            }
+            if fusedSparsePointCount <= 0 {
+                issues.append("fused_sparse_point_count must be positive")
+            }
+            if fusedSparsePointCount > rawPointSampleCount {
+                issues.append("fused_sparse_point_count cannot exceed raw_point_sample_count")
+            }
+            if maxPoints > 0, fusedSparsePointCount > maxPoints {
+                issues.append("fused_sparse_point_count exceeded max_points")
+            }
+            let multiplied = maxPoints.multipliedReportingOverflow(by: 4)
+            let selectedAllowance = selectedImageCount.multipliedReportingOverflow(by: 128)
+            let added = selectedAllowance.overflow
+                ? (partialValue: Int.max, overflow: true)
+                : maxPoints.addingReportingOverflow(selectedAllowance.partialValue)
+            let rawLimit = min(
+                multiplied.overflow ? Int.max : multiplied.partialValue,
+                added.overflow ? Int.max : added.partialValue
+            )
+            if rawPointSampleCount > rawLimit {
+                issues.append("raw_point_sample_count exceeded the trusted sampling limit")
+            }
+        } else {
+            issues.append("seed_refine requires learned point sample and fusion counts")
         }
-        if let fusedSparsePointCount, let finalObservationCount, finalObservationCount < fusedSparsePointCount {
-            issues.append("final_observation_count \(finalObservationCount) was smaller than fused_sparse_point_count \(fusedSparsePointCount)")
+        if finalObservationCount != nil || meanTrackLength != nil {
+            issues.append("learned initializer must not claim measured observations or track length")
         }
-        if let meanTrackLength, !meanTrackLength.isFinite || meanTrackLength <= 0 {
-            issues.append("mean_track_length must be a positive finite number")
+        if let pairs = boundedMatchPairs,
+           let trustedPairLimit,
+           pairs.count > trustedPairLimit {
+            issues.append("seed_refine match pair count \(pairs.count) exceeded trusted match pair limit \(trustedPairLimit)")
+        }
+        if boundedMatchPairs == nil {
+            issues.append("seed_refine match pair count exceeded the hard limit \(Self.hardMatchPairLimit)")
         }
         return issues
     }
@@ -289,17 +345,11 @@ struct Da3CoverageManifest: Codable, Sendable {
         if let registeredImageCount {
             parts.append("registered \(registeredImageCount)/\(totalImages)")
         }
-        if let fusedSparsePointCount {
-            parts.append("points \(fusedSparsePointCount)")
-        }
-        if let finalObservationCount {
-            parts.append("observations \(finalObservationCount)")
-        }
-        if let meanTrackLength {
-            parts.append("mean track length \(String(format: "%.2f", meanTrackLength))")
-        }
         if let maxAlignmentRMSE {
             parts.append("alignment RMSE \(String(format: "%.4f", maxAlignmentRMSE))")
+        }
+        if let fusedSparsePointCount {
+            parts.append("learned points \(fusedSparsePointCount)")
         }
         return parts.joined(separator: ", ")
     }
@@ -344,11 +394,18 @@ struct Da3CoverageManifest: Codable, Sendable {
         let newImagesPerWindow: Int
         switch inputOrdering {
         case .continuous:
-            let effectiveOverlap = max(3, windowOverlap)
+            let effectiveOverlap = minimumAlignmentOverlap(
+                windowSize: effectiveWindowSize,
+                requestedOverlap: windowOverlap
+            )
             guard effectiveOverlap < effectiveWindowSize else { return nil }
             newImagesPerWindow = effectiveWindowSize - effectiveOverlap
         case .unordered:
-            newImagesPerWindow = effectiveWindowSize - 3
+            let effectiveOverlap = minimumAlignmentOverlap(
+                windowSize: effectiveWindowSize,
+                requestedOverlap: windowOverlap
+            )
+            newImagesPerWindow = effectiveWindowSize - effectiveOverlap
         case .automatic:
             return nil
         }
@@ -360,5 +417,33 @@ struct Da3CoverageManifest: Codable, Sendable {
         let total = pairCapacity.multipliedReportingOverflow(by: windowCount)
         guard !total.overflow else { return nil }
         return min(total.partialValue, hardMatchPairLimit)
+    }
+
+    static func trustedRefinementMatchPairLimit(
+        selectedImageCount: Int,
+        windowSize: Int,
+        windowOverlap: Int,
+        inputOrdering: InputOrdering,
+        includesLoopClosures: Bool
+    ) -> Int? {
+        guard let localLimit = trustedMatchPairLimit(
+            selectedImageCount: selectedImageCount,
+            windowSize: windowSize,
+            windowOverlap: windowOverlap,
+            inputOrdering: inputOrdering
+        ) else {
+            return nil
+        }
+        guard includesLoopClosures else { return localLimit }
+        let loopBudget = selectedImageCount.multipliedReportingOverflow(by: 2)
+        guard !loopBudget.overflow else { return nil }
+        let combined = localLimit.addingReportingOverflow(loopBudget.partialValue)
+        guard !combined.overflow else { return nil }
+        return min(combined.partialValue, hardMatchPairLimit)
+    }
+
+    private static func minimumAlignmentOverlap(windowSize: Int, requestedOverlap: Int) -> Int {
+        let geometryMinimum = windowSize == 4 ? 2 : 3
+        return min(max(geometryMinimum, requestedOverlap), max(2, windowSize - 2))
     }
 }

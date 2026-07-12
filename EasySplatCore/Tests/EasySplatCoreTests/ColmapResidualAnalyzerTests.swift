@@ -23,6 +23,7 @@ final class ColmapResidualAnalyzerTests: XCTestCase {
         XCTAssertEqual(result.measuredImageNames, ["frame_000001.jpg"])
         XCTAssertEqual(result.pointCount, 2)
         XCTAssertEqual(result.observationCount, 2)
+        XCTAssertEqual(result.meanPixelResidual, 0.5, accuracy: 0.000_001)
         XCTAssertEqual(result.medianPixelResidual, 0.5, accuracy: 0.000_001)
         XCTAssertEqual(result.p90PixelResidual, 1, accuracy: 0.000_001)
         XCTAssertEqual(result.provenance, "colmap-text-tracks-v1")
@@ -40,6 +41,7 @@ final class ColmapResidualAnalyzerTests: XCTestCase {
 
         let result = try ColmapResidualAnalyzer.analyze(modelDirectory: model)
 
+        XCTAssertEqual(result.meanPixelResidual, 0, accuracy: 0.000_001)
         XCTAssertEqual(result.medianPixelResidual, 0, accuracy: 0.000_001)
         XCTAssertEqual(result.p90PixelResidual, 0, accuracy: 0.000_001)
     }
@@ -78,6 +80,35 @@ final class ColmapResidualAnalyzerTests: XCTestCase {
                 .unprojectableObservation(pointID: 2, imageLine: 1)
             )
         }
+    }
+
+    func testRejectsNonReciprocalAndDuplicateTrackAssignments() throws {
+        let nonReciprocal = try makeModel(
+            cameras: "1 SIMPLE_PINHOLE 640 480 100 320 240\n",
+            images: """
+            1 1 0 0 0 0 0 0 1 frame.jpg
+            320 240 1
+            """,
+            points: "1 0 0 10 255 255 255 0 1 1\n"
+        )
+        XCTAssertThrowsError(
+            try ColmapResidualAnalyzer.analyze(modelDirectory: nonReciprocal)
+        )
+
+        let duplicate = try makeModel(
+            cameras: "1 SIMPLE_PINHOLE 640 480 100 320 240\n",
+            images: """
+            1 1 0 0 0 0 0 0 1 frame.jpg
+            320 240 1 330 240 2
+            """,
+            points: """
+            1 0 0 10 255 255 255 0 1 0
+            2 1 0 10 255 255 255 0 1 0
+            """
+        )
+        XCTAssertThrowsError(
+            try ColmapResidualAnalyzer.analyze(modelDirectory: duplicate)
+        )
     }
 
     func testRejectsUnsupportedCameraModels() throws {

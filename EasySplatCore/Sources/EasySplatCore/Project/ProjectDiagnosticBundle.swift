@@ -15,7 +15,27 @@ public enum ProjectDiagnosticBundle {
     /// Schema version embedded in the machine-readable JSON block. Bump
     /// when adding/removing/renaming top-level keys so downstream tools can
     /// detect a format change.
-    public static let machineReadableSchemaVersion = 2
+    public static let machineReadableSchemaVersion = 4
+
+    /// Scrub a user-visible technical payload before it reaches a clipboard,
+    /// save panel, or share surface. Project identity is included when the
+    /// project metadata is readable; path and URL scrubbing always applies.
+    public static func sanitizeForSharing(
+        _ text: String,
+        projectURL: URL? = nil
+    ) -> String {
+        var sensitiveValues: [String] = []
+        if let projectURL {
+            sensitiveValues.append(projectURL.lastPathComponent)
+            if let metadata = try? ProjectMetadataStore.load(
+                from: ProjectPaths(root: projectURL).metadataURL
+            ) {
+                sensitiveValues.append(metadata.title)
+                sensitiveValues.append(metadata.id.uuidString)
+            }
+        }
+        return HomePathSanitizer(sensitiveValues: sensitiveValues).sanitize(text)
+    }
 
     /// Compose the diagnostic text for the project rooted at `projectURL`.
     /// `hardwareLine` lets the caller inject a one-line hardware summary that
@@ -39,10 +59,12 @@ public enum ProjectDiagnosticBundle {
         guard let metadata = try? ProjectMetadataStore.load(from: paths.metadataURL) else {
             return nil
         }
-        let pathSanitizer = HomePathSanitizer()
+        let pathSanitizer = HomePathSanitizer(
+            sensitiveValues: [metadata.title, metadata.id.uuidString, projectURL.lastPathComponent]
+        )
 
         var sections: [String] = []
-        sections.append(buildHeader(metadata: metadata, projectURL: projectURL, now: now, hardwareLine: hardwareLine, sanitizer: pathSanitizer, includeNotes: includeNotes))
+        sections.append(buildHeader(metadata: metadata, now: now, hardwareLine: hardwareLine, includeNotes: includeNotes))
 
         if includeNotes,
            let notes = metadata.notes?.trimmingCharacters(in: .whitespacesAndNewlines),
@@ -58,16 +80,13 @@ public enum ProjectDiagnosticBundle {
         if let reconstructionSection = reconstructionSection(metadata: metadata) {
             sections.append(reconstructionSection)
         }
-        if let autoTuneSection = autoTuneSection(metadata: metadata) {
-            sections.append(autoTuneSection)
-        }
         if let timingSection = stageTimingSection(metadata: metadata) {
             sections.append(timingSection)
         }
         if let stateSection = stateSection(metadata: metadata, sanitizer: pathSanitizer) {
             sections.append(stateSection)
         }
-        if let machineSection = machineReadableSection(metadata: metadata) {
+        if let machineSection = machineReadableSection(metadata: metadata, sanitizer: pathSanitizer) {
             sections.append(machineSection)
         }
 
@@ -75,11 +94,11 @@ public enum ProjectDiagnosticBundle {
             ("pipeline.log", paths.pipelineLogURL),
             ("colmap.log", paths.colmapLogURL),
             ("global_mapper.log", paths.globalMapperLogURL),
-            ("glomap.log (legacy)", paths.logsURL.appendingPathComponent("glomap.log")),
             ("da3.log", paths.da3LogURL),
             ("msplat.log", paths.msplatLogURL)
         ]
         for source in logSources {
+            guard (try? paths.projectRelativePath(for: source.url)) != nil else { continue }
             if let tail = logTailSection(label: source.label, url: source.url, sanitizer: pathSanitizer, tailLineLimit: tailLineLimit, tailByteLimit: tailByteLimit) {
                 sections.append(tail)
             }
@@ -90,21 +109,17 @@ public enum ProjectDiagnosticBundle {
 
     private static func buildHeader(
         metadata: ProjectMetadata,
-        projectURL: URL,
         now: Date,
         hardwareLine: String?,
-        sanitizer: HomePathSanitizer,
         includeNotes: Bool
     ) -> String {
         var lines: [String] = []
         lines.append("# EasySplat Diagnostic Bundle")
         lines.append("Generated: \(iso8601(now))")
         lines.append("Privacy: \(includeNotes ? "notes opted in" : "notes excluded by default")")
-        lines.append("Project title: \(metadata.title)")
-        lines.append("Project path: \(sanitizer.sanitize(projectURL.path))")
-        lines.append("Project id: \(metadata.id.uuidString)")
         lines.append("Created: \(iso8601(metadata.createdAt))")
-        lines.append("Preset: mode=\(metadata.preset.mode.rawValue) quality=\(metadata.preset.quality.rawValue)")
+        let options = metadata.requestedRunOptions
+        lines.append("Options: capture=\(options.capturePath.rawValue) detail=\(options.detailProfile.rawValue)")
         switch metadata.input {
         case .video(let files):
             lines.append("Input: \(files.count) video(s)")
@@ -125,10 +140,8 @@ public enum ProjectDiagnosticBundle {
         lines.append("Mapper: \(reconstruction.mapper)")
         lines.append("Captured: \(iso8601(reconstruction.capturedAt))")
         lines.append("Registered: \(reconstruction.registeredImages) / \(reconstruction.totalImages)")
-        if let reproj = reconstruction.resolvedReprojectionError {
+        if let reproj = reconstruction.meanReprojectionError {
             lines.append("Mean reprojection error: \(String(format: "%.3f px", reproj))")
-        } else if ReconstructionSummary.reprojectionErrorIsUnreliable(forMapper: reconstruction.mapper) {
-            lines.append("Mean reprojection error: not measured (this mapper does not produce pixel residuals)")
         }
         if let points = reconstruction.pointCount {
             lines.append("Points: \(points)")
@@ -139,19 +152,6 @@ public enum ProjectDiagnosticBundle {
         if let track = reconstruction.meanTrackLength {
             lines.append("Mean track length: \(String(format: "%.2f", track))")
         }
-        return lines.joined(separator: "\n")
-    }
-
-    private static func autoTuneSection(metadata: ProjectMetadata) -> String? {
-        guard let snapshot = metadata.autoTune else { return nil }
-        var lines: [String] = ["## Auto-tune"]
-        lines.append("Tier: \(snapshot.tier)")
-        lines.append(String(format: "Hardware: %.1f GB RAM · %d cores · GPU working set %@",
-                            snapshot.memoryGB,
-                            snapshot.cpuCount,
-                            snapshot.gpuWorkingSetGB.map { String(format: "%.1f GB", $0) } ?? "n/a"))
-        lines.append("Thread cap: \(snapshot.threadCap)")
-        lines.append("COLMAP: features=\(snapshot.colmapMaxNumFeatures) matches=\(snapshot.colmapMaxNumMatches) seqOverlap=\(snapshot.colmapSequentialOverlap) exhaustiveBlock=\(snapshot.colmapExhaustiveBlockSize) imageCap=\(snapshot.colmapMaxImageSizeCap.map { "\($0)px" } ?? "none")")
         return lines.joined(separator: "\n")
     }
 
@@ -171,15 +171,11 @@ public enum ProjectDiagnosticBundle {
     private static func stateSection(metadata: ProjectMetadata, sanitizer: HomePathSanitizer) -> String? {
         var lines: [String] = ["## Pipeline State"]
         lines.append("Current stage: \(metadata.state.stage.rawValue)")
-        lines.append("Attempt: \(metadata.state.attempt)")
         if let lastFailureAt = metadata.lastFailureAt {
             lines.append("Last failure: \(iso8601(lastFailureAt))")
         }
         if let lastError = metadata.state.lastError, !lastError.isEmpty {
             lines.append("Last error: \(sanitizer.sanitize(lastError))")
-        }
-        if let resumeToken = metadata.state.resumeToken, !resumeToken.isEmpty {
-            lines.append("Resume token: \(sanitizer.sanitize(resumeToken))")
         }
         if let checkpoint = metadata.checkpoint {
             lines.append("Checkpoint stage: \(checkpoint.stage.rawValue)")
@@ -196,36 +192,29 @@ public enum ProjectDiagnosticBundle {
 
     /// Emit a JSON-fenced block carrying the run's structured metrics so
     /// downstream analysis tools (or future EasySplat builds) can ingest a
-    /// diagnostic bundle without parsing markdown. Excludes notes regardless
-    /// of `includeNotes` — that block is purely numerics + identifiers.
-    private static func machineReadableSection(metadata: ProjectMetadata) -> String? {
+    /// diagnostic bundle without parsing markdown. Excludes notes and project
+    /// identifiers regardless of `includeNotes`.
+    private static func machineReadableSection(
+        metadata: ProjectMetadata,
+        sanitizer: HomePathSanitizer
+    ) -> String? {
         guard metadata.reconstruction != nil
             || (metadata.stageTimings?.isEmpty == false)
-            || metadata.autoTune != nil
             || metadata.lastFailureAt != nil else {
             return nil
         }
         struct Payload: Encodable {
             var schemaVersion: Int
-            var projectId: String
-            var preset: PresetSpec
+            var requestedRunOptions: RequestedRunOptions
             var reconstruction: ReconstructionSummary?
             var stageTimings: [StageTimingRecord]?
-            var autoTune: AutoTuneSnapshot?
             var lastFailureAt: Date?
-        }
-        let diagnosticReconstruction = metadata.reconstruction.map { reconstruction in
-            var copy = reconstruction
-            copy.meanReprojectionError = reconstruction.resolvedReprojectionError
-            return copy
         }
         let payload = Payload(
             schemaVersion: ProjectDiagnosticBundle.machineReadableSchemaVersion,
-            projectId: metadata.id.uuidString,
-            preset: metadata.preset,
-            reconstruction: diagnosticReconstruction,
+            requestedRunOptions: metadata.requestedRunOptions,
+            reconstruction: metadata.reconstruction,
             stageTimings: metadata.stageTimings,
-            autoTune: metadata.autoTune,
             lastFailureAt: metadata.lastFailureAt
         )
         let encoder = JSONEncoder()
@@ -235,7 +224,7 @@ public enum ProjectDiagnosticBundle {
               let json = String(data: data, encoding: .utf8) else {
             return nil
         }
-        return "## Metrics (machine readable)\n```json\n\(json)\n```"
+        return "## Metrics (machine readable)\n```json\n\(sanitizer.sanitize(json))\n```"
     }
 
     private static func logTailSection(
@@ -256,23 +245,13 @@ public enum ProjectDiagnosticBundle {
     /// partial leading byte if seeking landed mid-codepoint.
     private static func boundedTail(of url: URL, byteLimit: Int) -> String? {
         guard byteLimit > 0 else { return nil }
-        guard let attributes = try? FileManager.default.attributesOfItem(atPath: url.path),
-              let size = (attributes[.size] as? NSNumber)?.int64Value, size > 0 else {
-            return nil
-        }
-        guard let handle = try? FileHandle(forReadingFrom: url) else { return nil }
-        defer { try? handle.close() }
-        let readLength = Int(min(Int64(byteLimit), size))
-        let offset = UInt64(size) - UInt64(readLength)
-        do {
-            try handle.seek(toOffset: offset)
-        } catch {
-            return nil
-        }
-        guard let data = try? handle.read(upToCount: readLength), !data.isEmpty else { return nil }
+        guard let tail = try? BoundedFileReader.readRegularFileTail(
+            at: url,
+            maximumBytes: byteLimit
+        ), !tail.data.isEmpty else { return nil }
         // If we started mid-UTF8-codepoint, drop bytes until we hit a valid leading byte.
-        var trimmed = data
-        if offset > 0 {
+        var trimmed = tail.data
+        if !tail.startsAtFileBeginning {
             while let first = trimmed.first, first & 0b1100_0000 == 0b1000_0000 {
                 trimmed.removeFirst()
             }
@@ -287,21 +266,56 @@ public enum ProjectDiagnosticBundle {
     }
 }
 
-/// Replaces the user's home-directory path with `~` so diagnostic dumps shared
-/// in bug reports don't leak a real username.
+/// Removes local identity from paths and URLs before diagnostics leave the app.
 struct HomePathSanitizer {
     let homePath: String
+    let sensitiveValues: [String]
 
-    init() {
+    init(sensitiveValues: [String] = []) {
         self.homePath = NSHomeDirectory()
+        self.sensitiveValues = sensitiveValues
     }
 
-    init(homePath: String) {
+    init(homePath: String, sensitiveValues: [String] = []) {
         self.homePath = homePath
+        self.sensitiveValues = sensitiveValues
     }
 
     func sanitize(_ text: String) -> String {
-        guard !homePath.isEmpty else { return text }
-        return text.replacingOccurrences(of: homePath, with: "~")
+        var sanitized = text
+        for value in sensitiveValues
+            .filter({ !$0.isEmpty })
+            .sorted(by: { $0.count > $1.count }) {
+            let escaped = NSRegularExpression.escapedPattern(for: value)
+            sanitized = replacingMatches(
+                in: sanitized,
+                pattern: "(?<![A-Za-z0-9])\(escaped)(?![A-Za-z0-9])",
+                template: "<redacted>"
+            )
+        }
+        if !homePath.isEmpty {
+            sanitized = sanitized.replacingOccurrences(of: homePath, with: "~")
+        }
+        sanitized = replacingMatches(
+            in: sanitized,
+            pattern: #"/Volumes/[^/\r\n]+(?=/)"#,
+            template: "/Volumes/<redacted>"
+        )
+        sanitized = replacingMatches(
+            in: sanitized,
+            pattern: #"/Volumes/[^/\r\n\"']+(?=[\"']|$)"#,
+            template: "/Volumes/<redacted>"
+        )
+        return replacingMatches(
+            in: sanitized,
+            pattern: #"(?i)([a-z][a-z0-9+.-]*://)[^/@\s]+@"#,
+            template: "$1"
+        )
+    }
+
+    private func replacingMatches(in text: String, pattern: String, template: String) -> String {
+        guard let expression = try? NSRegularExpression(pattern: pattern) else { return text }
+        let range = NSRange(text.startIndex..<text.endIndex, in: text)
+        return expression.stringByReplacingMatches(in: text, range: range, withTemplate: template)
     }
 }

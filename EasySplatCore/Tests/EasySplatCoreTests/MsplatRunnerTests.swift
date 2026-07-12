@@ -86,6 +86,11 @@ final class MsplatRunnerTests: XCTestCase {
             XCTAssertEqual(result.completedIteration, limit)
             XCTAssertEqual(result.stopReason, .iterationLimit)
             XCTAssertEqual(result.gaussianCount, 1_250)
+            XCTAssertEqual(result.peakMemoryBytes, testCompletionPeakMemoryBytes)
+            XCTAssertEqual(
+                result.latestCheckpoint?.peakMemoryBytes,
+                testCheckpointPeakMemoryBytes
+            )
             XCTAssertTrue(FileManager.default.fileExists(atPath: context.output.deletingLastPathComponent().path))
         }
     }
@@ -125,50 +130,6 @@ final class MsplatRunnerTests: XCTestCase {
 
         XCTAssertEqual(result.iterationLimit, 123)
         XCTAssertEqual(result.plateauWindow, 50)
-    }
-
-    func testRunTrainIgnoresRemovedEnvironmentOverrides() async throws {
-        let context = try makeContext()
-        defer { context.cleanup() }
-        let mock = MockSubprocessRunner(scripts: [
-            .init(
-                path: context.executable.path,
-                argsPrefix: [
-                    "--dataset", context.dataset.path,
-                    "--output", context.output.path,
-                    "--profile", "fast",
-                    "--checkpoint", context.checkpoint.path,
-                    "--seed", "42",
-                    "--events-fd", "1",
-                ],
-                result: .init(
-                    exitCode: 0,
-                    terminationReason: .exit,
-                    stdout: validEvents(profile: "fast", limit: 3_000, plateau: 400, seed: 42),
-                    stderr: ""
-                ),
-                onRun: { _ in TestFileBuilder.createFile(at: context.output, data: fixtureOutputData) }
-            ),
-        ])
-
-        try await withEnvironmentAsync([
-            "EASYSPLAT_MSPLAT_ITERS": "1",
-            "EASYSPLAT_MSPLAT_NUM_DOWNSCALES": "9",
-            "EASYSPLAT_MSPLAT_DOWNSCALE_FACTOR": "32",
-        ]) {
-            _ = try await MsplatRunner(runner: mock).runTrain(
-                msplatPath: context.executable,
-                datasetPath: context.dataset,
-                outputPath: context.output,
-                profile: .fast,
-                seed: 42,
-                onLog: { _, _ in }
-            )
-        }
-
-        XCTAssertFalse(mock.calls[0].1.contains("--num-iters"))
-        XCTAssertFalse(mock.calls[0].1.contains("--num-downscales"))
-        XCTAssertFalse(mock.calls[0].1.contains("--downscale-factor"))
     }
 
     func testRunTrainReportsTypedProgress() async throws {
@@ -233,6 +194,13 @@ final class MsplatRunnerTests: XCTestCase {
             ("wrong version", validEvents().replacingOccurrences(of: "1.1.3 (git 106499b)", with: "1.1.4 (git deadbee)")),
             ("profile mismatch", validEvents().replacingOccurrences(of: "\"profile\":\"balanced\"", with: "\"profile\":\"fast\"")),
             ("plateau without early stop", validEvents().replacingOccurrences(of: "\"stop_reason\":\"iteration_limit\"", with: "\"stop_reason\":\"plateau\"")),
+            (
+                "peak memory overflow",
+                validEvents().replacingOccurrences(
+                    of: "\"peak_memory_bytes\":\(testCheckpointPeakMemoryBytes)",
+                    with: "\"peak_memory_bytes\":9223372036854775808"
+                )
+            ),
             ("missing completion", validEvents().split(separator: "\n").dropLast().joined(separator: "\n") + "\n"),
         ]
 
@@ -260,6 +228,56 @@ final class MsplatRunnerTests: XCTestCase {
                 XCTFail("Expected protocol failure for \(name)")
             } catch {
                 XCTAssertTrue(error.localizedDescription.lowercased().contains("event"), "\(name): \(error)")
+            }
+        }
+    }
+
+    func testRunTrainRejectsInvalidPeakMemoryEvidence() async throws {
+        let cases: [(String, Int64?, Int64?)] = [
+            ("missing checkpoint", nil, testCompletionPeakMemoryBytes),
+            ("zero checkpoint", 0, testCompletionPeakMemoryBytes),
+            ("missing completion", testCheckpointPeakMemoryBytes, nil),
+            ("zero completion", testCheckpointPeakMemoryBytes, 0),
+            ("decreasing completion", testCheckpointPeakMemoryBytes, 1),
+        ]
+
+        for (name, checkpointPeakMemoryBytes, completionPeakMemoryBytes) in cases {
+            let context = try makeContext()
+            defer { context.cleanup() }
+            let mock = MockSubprocessRunner(scripts: [
+                .init(
+                    path: context.executable.path,
+                    argsPrefix: ["--dataset", context.dataset.path],
+                    result: .init(
+                        exitCode: 0,
+                        terminationReason: .exit,
+                        stdout: validEvents(
+                            checkpointPeakMemoryBytes: checkpointPeakMemoryBytes,
+                            completionPeakMemoryBytes: completionPeakMemoryBytes
+                        ),
+                        stderr: ""
+                    ),
+                    onRun: { _ in
+                        TestFileBuilder.createFile(at: context.output, data: fixtureOutputData)
+                    }
+                ),
+            ])
+
+            do {
+                _ = try await MsplatRunner(runner: mock).runTrain(
+                    msplatPath: context.executable,
+                    datasetPath: context.dataset,
+                    outputPath: context.output,
+                    profile: .balanced,
+                    seed: 42,
+                    onLog: { _, _ in }
+                )
+                XCTFail("Expected peak-memory protocol failure for \(name)")
+            } catch {
+                XCTAssertTrue(
+                    error.localizedDescription.lowercased().contains("event"),
+                    "\(name): \(error)"
+                )
             }
         }
     }
@@ -615,6 +633,21 @@ final class MsplatRunnerTests: XCTestCase {
         )
     }
 
+    func testResumePreflightRejectsCheckpointWithoutMeasuredPeakMemory() throws {
+        let context = try makeContext()
+        defer { context.cleanup() }
+        let receipt = try makeMsplatCheckpointFixture(at: context.checkpoint, iteration: 500)
+        var artifact = checkpointedArtifact(for: receipt)
+        artifact.peakMemoryBytes = 0
+
+        XCTAssertThrowsError(
+            try MsplatCheckpointValidator.validateResume(
+                checkpointURL: context.checkpoint,
+                artifact: artifact
+            )
+        )
+    }
+
     func testResumePreflightRejectsSymlinkedGenerationsDirectory() throws {
         let context = try makeContext()
         defer { context.cleanup() }
@@ -685,7 +718,9 @@ private func validEvents(
     includeProgressLoss: Bool = true,
     startIteration: Int = 0,
     resumed: Bool = false,
-    checkpoint: MsplatCheckpointReceipt? = nil
+    checkpoint: MsplatCheckpointReceipt? = nil,
+    checkpointPeakMemoryBytes: Int64? = testCheckpointPeakMemoryBytes,
+    completionPeakMemoryBytes: Int64? = testCompletionPeakMemoryBytes
 ) -> String {
     let checkpoint = checkpoint ?? MsplatCheckpointReceipt(
         iteration: 0,
@@ -693,6 +728,7 @@ private func validEvents(
         payloadSHA256: testPayloadDigest,
         payloadBytes: 128,
         gaussianCount: 750,
+        peakMemoryBytes: testCheckpointPeakMemoryBytes,
         inputDigest: testInputDigest,
         geometryDigest: testGeometryDigest,
         trainerBuildDigest: testTrainerDigest
@@ -702,11 +738,17 @@ private func validEvents(
         ? ",\"loss\":0.12,\"loss_iteration\":\(progressIteration)"
         : ""
     let checkpointEvent = resumed ? "checkpoint_loaded" : "checkpoint_completed"
+    let checkpointMemoryField = checkpointPeakMemoryBytes.map {
+        ",\"peak_memory_bytes\":\($0)"
+    } ?? ""
+    let completionMemoryField = completionPeakMemoryBytes.map {
+        ",\"peak_memory_bytes\":\($0)"
+    } ?? ""
     return """
     {"camera_count":8,"checkpoint_schema":1,"event":"started","geometry_digest":"\(checkpoint.geometryDigest)","initial_gaussian_count":750,"input_digest":"\(checkpoint.inputDigest)","iteration":\(startIteration),"iteration_limit":\(limit),"payload_schema":2,"plateau_window":\(plateau),"profile":"\(profile)","resumed":\(resumed),"schema_version":1,"seed":\(seed),"sequence":1,"trainer_build_digest":"\(checkpoint.trainerBuildDigest)","version":"1.1.3 (git 106499b)"}
-    {"checkpoint_generation":"\(checkpoint.generation)","checkpoint_payload_bytes":\(checkpoint.payloadBytes),"checkpoint_payload_sha256":"\(checkpoint.payloadSHA256)","event":"\(checkpointEvent)","gaussian_count":\(checkpoint.gaussianCount),"geometry_digest":"\(checkpoint.geometryDigest)","input_digest":"\(checkpoint.inputDigest)","iteration":\(checkpoint.iteration),"profile":"\(profile)","schema_version":1,"seed":\(seed),"sequence":2,"trainer_build_digest":"\(checkpoint.trainerBuildDigest)","version":"1.1.3 (git 106499b)"}
+    {"checkpoint_generation":"\(checkpoint.generation)","checkpoint_payload_bytes":\(checkpoint.payloadBytes),"checkpoint_payload_sha256":"\(checkpoint.payloadSHA256)","event":"\(checkpointEvent)","gaussian_count":\(checkpoint.gaussianCount),"geometry_digest":"\(checkpoint.geometryDigest)","input_digest":"\(checkpoint.inputDigest)","iteration":\(checkpoint.iteration)\(checkpointMemoryField),"profile":"\(profile)","schema_version":1,"seed":\(seed),"sequence":2,"trainer_build_digest":"\(checkpoint.trainerBuildDigest)","version":"1.1.3 (git 106499b)"}
     {"elapsed_seconds":2.5,"eta_seconds":2.5,"event":"progress","gaussian_count":1000,"iteration":\(progressIteration),"iteration_limit":\(limit),"iterations_per_second":1400\(lossFields),"schema_version":1,"sequence":3}
-    {"elapsed_seconds":5,"event":"completed","gaussian_count":1250,"geometry_digest":"\(checkpoint.geometryDigest)","input_digest":"\(checkpoint.inputDigest)","iteration":\(limit),"iteration_limit":\(limit),"output_bytes":4096,"plateau_window":\(plateau),"profile":"\(profile)","schema_version":1,"seed":\(seed),"sequence":4,"stop_reason":"iteration_limit","trainer_build_digest":"\(checkpoint.trainerBuildDigest)","version":"1.1.3 (git 106499b)"}
+    {"elapsed_seconds":5,"event":"completed","gaussian_count":1250,"geometry_digest":"\(checkpoint.geometryDigest)","input_digest":"\(checkpoint.inputDigest)","iteration":\(limit),"iteration_limit":\(limit),"output_bytes":4096\(completionMemoryField),"plateau_window":\(plateau),"profile":"\(profile)","schema_version":1,"seed":\(seed),"sequence":4,"stop_reason":"iteration_limit","trainer_build_digest":"\(checkpoint.trainerBuildDigest)","version":"1.1.3 (git 106499b)"}
     """ + "\n"
 }
 
@@ -716,6 +758,8 @@ private let testGeometryDigest = String(repeating: "2", count: 64)
 private let testTrainerDigest = String(repeating: "3", count: 64)
 private let testPayloadDigest = String(repeating: "4", count: 64)
 private let testGenerationDigest = String(repeating: "5", count: 64)
+private let testCheckpointPeakMemoryBytes: Int64 = 268_435_456
+private let testCompletionPeakMemoryBytes: Int64 = 536_870_912
 
 private func checkpointedArtifact(for receipt: MsplatCheckpointReceipt) -> TrainingArtifact {
     TrainingArtifact(
@@ -734,7 +778,7 @@ private func checkpointedArtifact(for receipt: MsplatCheckpointReceipt) -> Train
         outputPath: nil,
         gaussianCount: receipt.gaussianCount,
         elapsedSeconds: nil,
-        peakMemoryBytes: nil,
+        peakMemoryBytes: receipt.peakMemoryBytes,
         completionStatus: .checkpointed
     )
 }
@@ -795,6 +839,7 @@ func makeMsplatCheckpointFixture(
         payloadSHA256: payloadDigest,
         payloadBytes: Int64(payload.count),
         gaussianCount: 750,
+        peakMemoryBytes: testCheckpointPeakMemoryBytes,
         inputDigest: inputDigest,
         geometryDigest: geometryDigest,
         trainerBuildDigest: testTrainerDigest
@@ -807,7 +852,7 @@ private func interruptedEvents(
 ) -> String {
     """
     {"camera_count":8,"checkpoint_schema":1,"event":"started","geometry_digest":"\(checkpoint.geometryDigest)","initial_gaussian_count":750,"input_digest":"\(checkpoint.inputDigest)","iteration":\(checkpoint.iteration),"iteration_limit":7000,"payload_schema":2,"plateau_window":800,"profile":"balanced","resumed":true,"schema_version":1,"seed":42,"sequence":1,"trainer_build_digest":"\(checkpoint.trainerBuildDigest)","version":"1.1.3 (git 106499b)"}
-    {"checkpoint_generation":"\(checkpoint.generation)","checkpoint_payload_bytes":\(checkpoint.payloadBytes),"checkpoint_payload_sha256":"\(checkpoint.payloadSHA256)","event":"checkpoint_loaded","gaussian_count":\(checkpoint.gaussianCount),"geometry_digest":"\(checkpoint.geometryDigest)","input_digest":"\(checkpoint.inputDigest)","iteration":\(checkpoint.iteration),"profile":"balanced","schema_version":1,"seed":42,"sequence":2,"trainer_build_digest":"\(checkpoint.trainerBuildDigest)","version":"1.1.3 (git 106499b)"}
+    {"checkpoint_generation":"\(checkpoint.generation)","checkpoint_payload_bytes":\(checkpoint.payloadBytes),"checkpoint_payload_sha256":"\(checkpoint.payloadSHA256)","event":"checkpoint_loaded","gaussian_count":\(checkpoint.gaussianCount),"geometry_digest":"\(checkpoint.geometryDigest)","input_digest":"\(checkpoint.inputDigest)","iteration":\(checkpoint.iteration),"peak_memory_bytes":\(checkpoint.peakMemoryBytes),"profile":"balanced","schema_version":1,"seed":42,"sequence":2,"trainer_build_digest":"\(checkpoint.trainerBuildDigest)","version":"1.1.3 (git 106499b)"}
     {"event":"cancellation_requested","iteration":\(currentIteration),"schema_version":1,"sequence":3,"signal":2}
     {"checkpoint_generation":"\(checkpoint.generation)","checkpoint_iteration":\(checkpoint.iteration),"checkpoint_payload_sha256":"\(checkpoint.payloadSHA256)","event":"cancelled","geometry_digest":"\(checkpoint.geometryDigest)","input_digest":"\(checkpoint.inputDigest)","iteration":\(currentIteration),"schema_version":1,"sequence":4}
     """ + "\n"

@@ -21,7 +21,7 @@ final class PipelineRunnerImageFilteringTests: XCTestCase {
         defer { try? FileManager.default.removeItem(at: projectURL) }
 
         let toolchain = TestToolchains.toolchainPaths(root: projectURL)
-        let config = PipelineRunner.PipelineConfig(toolchain: toolchain, preset: PresetSpec(mode: .object, quality: .standard))
+        let config = PipelineRunner.PipelineConfig(toolchain: toolchain)
         let runner = PipelineRunner(projectURL: projectURL, config: config)
 
         let images = try runner.loadImagesForTesting(in: dir)
@@ -44,7 +44,7 @@ final class PipelineRunnerImageFilteringTests: XCTestCase {
         defer { try? FileManager.default.removeItem(at: projectURL) }
 
         let toolchain = TestToolchains.toolchainPaths(root: projectURL)
-        let config = PipelineRunner.PipelineConfig(toolchain: toolchain, preset: PresetSpec(mode: .object, quality: .standard))
+        let config = PipelineRunner.PipelineConfig(toolchain: toolchain)
         let runner = PipelineRunner(projectURL: projectURL, config: config)
 
         let photos = try runner.loadPhotosForTesting(in: dir)
@@ -70,7 +70,7 @@ final class PipelineRunnerImageFilteringTests: XCTestCase {
         defer { try? FileManager.default.removeItem(at: projectURL) }
 
         let toolchain = TestToolchains.toolchainPaths(root: projectURL)
-        let config = PipelineRunner.PipelineConfig(toolchain: toolchain, preset: PresetSpec(mode: .object, quality: .standard))
+        let config = PipelineRunner.PipelineConfig(toolchain: toolchain)
         let runner = PipelineRunner(projectURL: projectURL, config: config)
 
         let photos = try runner.loadPhotosForTesting(in: dir)
@@ -91,7 +91,7 @@ final class PipelineRunnerImageFilteringTests: XCTestCase {
         defer { try? FileManager.default.removeItem(at: projectURL) }
 
         let toolchain = TestToolchains.toolchainPaths(root: projectURL)
-        let config = PipelineRunner.PipelineConfig(toolchain: toolchain, preset: PresetSpec(mode: .object, quality: .standard))
+        let config = PipelineRunner.PipelineConfig(toolchain: toolchain)
         let runner = PipelineRunner(projectURL: projectURL, config: config)
 
         let photos = try runner.loadPhotosForTesting(in: dir)
@@ -119,12 +119,12 @@ final class PipelineRunnerImageFilteringTests: XCTestCase {
         let paths = ProjectPaths(root: projectURL)
         try paths.ensureDirectories()
         let toolchain = TestToolchains.toolchainPaths(root: projectURL)
-        let config = PipelineRunner.PipelineConfig(toolchain: toolchain, preset: PresetSpec(mode: .object, quality: .standard))
+        let config = PipelineRunner.PipelineConfig(toolchain: toolchain)
         let runner = PipelineRunner(projectURL: projectURL, config: config)
         let metadata = ProjectMetadata(
             title: "Videos",
             input: .video(files: [firstVideo.path, secondVideo.path]),
-            preset: PresetSpec(mode: .object, quality: .standard)
+            requestedRunOptions: RequestedRunOptions(capturePath: .orbit, detailProfile: .balanced)
         )
 
         try runner.importInputs(metadata: metadata, paths: paths) { _, _ in }
@@ -176,7 +176,7 @@ final class PipelineRunnerImageFilteringTests: XCTestCase {
         defer { try? FileManager.default.removeItem(at: projectURL) }
 
         let toolchain = TestToolchains.toolchainPaths(root: projectURL)
-        let config = PipelineRunner.PipelineConfig(toolchain: toolchain, preset: PresetSpec(mode: .object, quality: .standard))
+        let config = PipelineRunner.PipelineConfig(toolchain: toolchain)
         let runner = PipelineRunner(projectURL: projectURL, config: config)
 
         let photos = try runner.loadPhotosForTesting(in: dir)
@@ -197,7 +197,7 @@ final class PipelineRunnerImageFilteringTests: XCTestCase {
         let metadata = ProjectMetadata(
             title: "Video",
             input: .video(files: [source.path]),
-            preset: PresetSpec(mode: .object, quality: .draft)
+            requestedRunOptions: RequestedRunOptions(capturePath: .orbit, detailProfile: .fast)
         )
 
         try runner.importInputs(metadata: metadata, paths: paths) { _, _ in }
@@ -223,12 +223,93 @@ final class PipelineRunnerImageFilteringTests: XCTestCase {
         let metadata = ProjectMetadata(
             title: "Photos",
             input: .photos(folder: source.path),
-            preset: PresetSpec(mode: .object, quality: .draft)
+            requestedRunOptions: RequestedRunOptions(capturePath: .orbit, detailProfile: .fast)
         )
 
         try runner.importInputs(metadata: metadata, paths: paths) { _, _ in }
 
         XCTAssertEqual(try runner.loadPhotosForTesting(in: imported).count, 2)
+    }
+
+    func testImportInputsCopiesOnlyValidUniquePhotosWithStableCollisionNames() throws {
+        let root = try TestFileBuilder.makeTempDir()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let projectURL = root.appendingPathComponent("Project.easysplatproj", isDirectory: true)
+        let source = root.appendingPathComponent("Photos", isDirectory: true)
+        let nested = source.appendingPathComponent("Nested", isDirectory: true)
+        try FileManager.default.createDirectory(at: nested, withIntermediateDirectories: true)
+
+        let first = source.appendingPathComponent("capture.jpg")
+        let sameBasename = nested.appendingPathComponent("capture.jpg")
+        let duplicate = source.appendingPathComponent("duplicate.jpg")
+        try writeImage(url: first, size: 16, value: 20)
+        try writeImage(url: sameBasename, size: 16, value: 180)
+        try FileManager.default.copyItem(at: first, to: duplicate)
+        try Data("not an image".utf8).write(to: source.appendingPathComponent("corrupt.png"))
+        try Data("client notes".utf8).write(to: source.appendingPathComponent("notes.txt"))
+
+        let paths = ProjectPaths(root: projectURL)
+        try paths.ensureDirectories()
+        let runner = try makeRunner(projectURL: projectURL)
+        let metadata = ProjectMetadata(
+            title: "Photos",
+            input: .photos(folder: source.path),
+            requestedRunOptions: RequestedRunOptions(detailProfile: .fast)
+        )
+
+        try runner.importInputs(metadata: metadata, paths: paths) { _, _ in }
+
+        let imported = paths.originalsURL.appendingPathComponent("Photos", isDirectory: true)
+        let contents = try FileManager.default.contentsOfDirectory(
+            at: imported,
+            includingPropertiesForKeys: nil
+        ).sorted { $0.lastPathComponent < $1.lastPathComponent }
+        XCTAssertEqual(contents.map(\.lastPathComponent), ["capture-2.jpg", "capture.jpg"])
+        XCTAssertFalse(contents.contains { $0.lastPathComponent == "notes.txt" })
+        XCTAssertFalse(contents.contains { $0.lastPathComponent == "corrupt.png" })
+        XCTAssertFalse(contents.contains { $0.lastPathComponent == "duplicate.jpg" })
+    }
+
+    func testCancelledAtomicVideoCopyLeavesExistingDestinationUntouched() async throws {
+        let root = try TestFileBuilder.makeTempDir()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let source = root.appendingPathComponent("source.mov")
+        let destination = root.appendingPathComponent("destination.mov")
+        try Data(repeating: 7, count: 2 * 1_024 * 1_024).write(to: source)
+        try Data("existing".utf8).write(to: destination)
+        let runner = try makeRunner(projectURL: root)
+
+        let task = Task<Void, Error> {
+            withUnsafeCurrentTask { $0?.cancel() }
+            try runner.copyFileAtomically(from: source, to: destination)
+        }
+
+        do {
+            try await task.value
+            XCTFail("A cancelled import copy must stop.")
+        } catch is CancellationError {
+            // Expected.
+        }
+        XCTAssertEqual(try Data(contentsOf: destination), Data("existing".utf8))
+        let leftovers = try FileManager.default.contentsOfDirectory(
+            at: root,
+            includingPropertiesForKeys: nil
+        ).filter { $0.lastPathComponent.contains(".tmp") }
+        XCTAssertTrue(leftovers.isEmpty)
+    }
+
+    func testAtomicInputCopyRejectsSymlinkSource() throws {
+        let root = try TestFileBuilder.makeTempDir()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let realSource = root.appendingPathComponent("real.mov")
+        let linkedSource = root.appendingPathComponent("linked.mov")
+        let destination = root.appendingPathComponent("destination.mov")
+        try Data("video".utf8).write(to: realSource)
+        try FileManager.default.createSymbolicLink(at: linkedSource, withDestinationURL: realSource)
+        let runner = try makeRunner(projectURL: root)
+
+        XCTAssertThrowsError(try runner.copyFileAtomically(from: linkedSource, to: destination))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: destination.path))
     }
 
     func testFrameBudgetAppliesToPhotoOnlyInputs() throws {
@@ -277,7 +358,7 @@ final class PipelineRunnerImageFilteringTests: XCTestCase {
         try writeImage(url: second, size: 16, value: 180)
         try Data("not an image".utf8).write(to: corrupt)
 
-        let filtered = runner.test_filterValidUniquePhotos([first, duplicate, second, corrupt])
+        let filtered = try runner.test_filterValidUniquePhotos([first, duplicate, second, corrupt])
 
         XCTAssertEqual(filtered.frames.map(\.lastPathComponent), ["first.jpg", "second.jpg"])
         XCTAssertEqual(filtered.unreadableCount, 1)
@@ -325,6 +406,30 @@ final class PipelineRunnerImageFilteringTests: XCTestCase {
         XCTAssertEqual(selected.reduce(0) { $0 + $1.frames.count }, 120)
     }
 
+    func testUseAllValidPhotosCannotConsumeTheEntireMixedInputBudget() throws {
+        let root = try TestFileBuilder.makeTempDir()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let runner = try makeRunner(projectURL: root)
+        let videos = (0..<80).map { root.appendingPathComponent("video_\($0).jpg") }
+        let photos = (0..<120).map { root.appendingPathComponent("photo_\($0).jpg") }
+
+        XCTAssertThrowsError(try runner.test_applyFrameBudget(
+            to: [
+                .init(id: "video_000", frames: videos, isVideo: true),
+                .init(id: "photos", frames: photos, isVideo: false),
+            ],
+            targetCount: 120,
+            photoSelection: .useAllValidPhotos
+        )) { error in
+            guard case let .photoSelectionExceedsBudget(selected, maximum)? =
+                    error as? PipelineRunner.PipelineError else {
+                return XCTFail("Unexpected error: \(error)")
+            }
+            XCTAssertEqual(selected, 120)
+            XCTAssertEqual(maximum, 90)
+        }
+    }
+
     private func writeImage(url: URL, size: Int, value: UInt8) throws {
         let width = size
         let height = size
@@ -360,10 +465,7 @@ final class PipelineRunnerImageFilteringTests: XCTestCase {
 
     private func makeRunner(projectURL: URL) throws -> PipelineRunner {
         let toolchain = TestToolchains.toolchainPaths(root: projectURL)
-        let config = PipelineRunner.PipelineConfig(
-            toolchain: toolchain,
-            preset: PresetSpec(mode: .object, quality: .standard)
-        )
+        let config = PipelineRunner.PipelineConfig(toolchain: toolchain)
         return PipelineRunner(projectURL: projectURL, config: config)
     }
 }

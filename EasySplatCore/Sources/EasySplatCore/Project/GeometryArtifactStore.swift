@@ -2,6 +2,7 @@ import CryptoKit
 import Foundation
 
 enum GeometryArtifactStore {
+    private static let maximumManifestBytes = 1_048_576
     static let maximumMedianPixelResidual = 1.5
     static let maximumP90PixelResidual = 3.0
     static let minimumRegisteredViewFraction = 0.90
@@ -12,9 +13,13 @@ enum GeometryArtifactStore {
         case invalidDigest(String)
         case invalidResiduals
         case invalidPeakMemory
+        case invalidProvenance
         case artifactDigestMismatch(String)
         case modelHashMismatch(String)
         case measuredResidualMismatch
+        case manifestTooLarge
+        case invalidLearnedInitializer
+        case learnedInitializerDigestMismatch
 
         var errorDescription: String? {
             switch self {
@@ -28,18 +33,30 @@ enum GeometryArtifactStore {
                 return "Geometry artifact does not contain measured pixel residuals."
             case .invalidPeakMemory:
                 return "Geometry artifact does not contain a measured peak-memory value."
+            case .invalidProvenance:
+                return "Geometry artifact provenance is incomplete or inconsistent."
             case .artifactDigestMismatch(let field):
                 return "Geometry artifact no longer matches its \(field)."
             case .modelHashMismatch(let name):
                 return "Geometry artifact model file does not match its digest: \(name)."
             case .measuredResidualMismatch:
                 return "Geometry artifact measurements do not match its canonical model."
+            case .manifestTooLarge:
+                return "Geometry artifact exceeds the supported size."
+            case .invalidLearnedInitializer:
+                return "Geometry artifact has an invalid learned point initializer."
+            case .learnedInitializerDigestMismatch:
+                return "Learned point initialization no longer matches accepted geometry."
             }
         }
     }
 
     static func load(from url: URL, projectPaths: ProjectPaths) throws -> GeometryArtifact {
-        let artifact = try JSONDecoder().decode(GeometryArtifact.self, from: Data(contentsOf: url))
+        let data = try BoundedFileReader.readRegularFile(
+            at: url,
+            maximumBytes: maximumManifestBytes
+        )
+        let artifact = try JSONDecoder().decode(GeometryArtifact.self, from: data)
         try validate(artifact, projectPaths: projectPaths)
         return artifact
     }
@@ -58,7 +75,16 @@ enum GeometryArtifactStore {
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
         let data = try encoder.encode(artifact)
-        let previousManifest = try? Data(contentsOf: paths.geometryManifestURL)
+        guard data.count <= maximumManifestBytes else { throw Error.manifestTooLarge }
+        let previousManifest: Data?
+        do {
+            previousManifest = try BoundedFileReader.readRegularFile(
+                at: paths.geometryManifestURL,
+                maximumBytes: maximumManifestBytes
+            )
+        } catch where BoundedFileReader.isMissingFileError(error) {
+            previousManifest = nil
+        }
         try data.write(to: paths.geometryManifestURL, options: [.atomic])
 
         let previousArtifact = metadata.geometryArtifact
@@ -81,8 +107,54 @@ enum GeometryArtifactStore {
         projectPaths: ProjectPaths,
         measuredResiduals: ColmapResidualAnalyzer.Result? = nil
     ) throws {
-        guard artifact.schemaVersion == 1 else { throw Error.invalidSchema(artifact.schemaVersion) }
-        guard (try? projectPaths.resolveProjectRelativePath(artifact.canonicalModelPath)) != nil else {
+        guard artifact.schemaVersion == GeometryArtifact.currentSchemaVersion else {
+            throw Error.invalidSchema(artifact.schemaVersion)
+        }
+        let provenance = artifact.provenance
+        guard !artifact.solverVersion.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+              !artifact.runtimeVersion.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+              !artifact.modelVersion.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+              !provenance.toolchainVersion.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+              provenance.solver.identifier == "colmap",
+              validComponent(provenance.solver),
+              (provenance.runtime == nil) == (provenance.model == nil) else {
+            throw Error.invalidProvenance
+        }
+        if let runtime = provenance.runtime, let model = provenance.model {
+            guard runtime.identifier == "da3_mps",
+                  validComponent(runtime),
+                  validComponent(model),
+                  artifact.modelVersion == "\(model.identifier)@\(model.revision)" else {
+                throw Error.invalidProvenance
+            }
+        } else if artifact.modelVersion != "none" {
+            throw Error.invalidProvenance
+        }
+        if provenance.model != nil {
+            guard let initializer = artifact.learnedPointInitializer,
+                  initializer.path == "SfM/colmap/seed/0/learned_points3D.txt",
+                  initializer.pointCount > 0,
+                  isSHA256(initializer.sha256),
+                  let initializerURL = try? projectPaths.resolveProjectRelativePath(initializer.path) else {
+                throw Error.invalidLearnedInitializer
+            }
+            do {
+                _ = try Da3LearnedPointInitializer.inspect(
+                    learnedPointsURL: initializerURL,
+                    expectedPointCount: initializer.pointCount,
+                    maximumPointCount: initializer.pointCount,
+                    expectedSHA256: initializer.sha256
+                )
+            } catch Da3LearnedPointInitializer.Error.digestMismatch {
+                throw Error.learnedInitializerDigestMismatch
+            } catch {
+                throw Error.invalidLearnedInitializer
+            }
+        } else if artifact.learnedPointInitializer != nil {
+            throw Error.invalidLearnedInitializer
+        }
+        guard artifact.canonicalModelPath == "SfM/colmap/sparse/0",
+              (try? projectPaths.resolveProjectRelativePath(artifact.canonicalModelPath)) != nil else {
             throw Error.invalidCanonicalPath
         }
         guard isSHA256(artifact.inputDigest) else { throw Error.invalidDigest("input") }
@@ -153,6 +225,13 @@ enum GeometryArtifactStore {
         value.count == 64 && value.unicodeScalars.allSatisfy {
             ($0.value >= 48 && $0.value <= 57) || ($0.value >= 97 && $0.value <= 102)
         }
+    }
+
+    private static func validComponent(_ component: GeometryComponentProvenance) -> Bool {
+        !component.identifier.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            && !component.version.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            && !component.revision.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            && isSHA256(component.payloadSHA256)
     }
 
     static func inputDigest(projectPaths: ProjectPaths) throws -> String {

@@ -1,3 +1,4 @@
+import Darwin
 import XCTest
 @testable import EasySplatCore
 
@@ -20,10 +21,10 @@ final class ProjectDiagnosticBundleTests: XCTestCase {
             createdAt: Date(timeIntervalSince1970: 1_700_000_000),
             title: "DiagnosticProject",
             input: .photos(folder: "/tmp/photos"),
-            preset: PresetSpec(mode: .object, quality: .standard),
-            state: PipelineState(stage: .sfmMapping, attempt: 2, lastError: "boom", resumeToken: nil),
+            requestedRunOptions: RequestedRunOptions(capturePath: .orbit, detailProfile: .balanced),
+            state: PipelineState(stage: .sfmMapping, lastError: "boom"),
             reconstruction: ReconstructionSummary(
-                mapper: "vggt",
+                mapper: "point_triangulator+bundle_adjuster",
                 capturedAt: Date(timeIntervalSince1970: 1_700_000_100),
                 registeredImages: 18,
                 totalImages: 20,
@@ -46,11 +47,11 @@ final class ProjectDiagnosticBundleTests: XCTestCase {
         ))
 
         XCTAssertTrue(bundle.contains("# EasySplat Diagnostic Bundle"))
-        XCTAssertTrue(bundle.contains("Project title: DiagnosticProject"))
-        XCTAssertTrue(bundle.contains("Project id: 11111111-1111-1111-1111-111111111111"))
+        XCTAssertFalse(bundle.contains("DiagnosticProject"))
+        XCTAssertFalse(bundle.contains("11111111-1111-1111-1111-111111111111"))
         XCTAssertTrue(bundle.contains("Hardware: Mac mini M4 Max, 48 GB"))
         XCTAssertTrue(bundle.contains("## Reconstruction"))
-        XCTAssertTrue(bundle.contains("Mapper: vggt"))
+        XCTAssertTrue(bundle.contains("Mapper: point_triangulator+bundle_adjuster"))
         XCTAssertTrue(bundle.contains("Registered: 18 / 20"))
         XCTAssertTrue(bundle.contains("Points: 14000"))
         XCTAssertTrue(bundle.contains("## Stage Timings"))
@@ -61,46 +62,6 @@ final class ProjectDiagnosticBundleTests: XCTestCase {
         XCTAssertTrue(bundle.contains("Last error: boom"))
     }
 
-    func testNewSavesOmitLegacyAutoTuneDiagnostics() throws {
-        let root = try TestFileBuilder.makeTempDir()
-        defer { try? FileManager.default.removeItem(at: root) }
-        let paths = ProjectPaths(root: root)
-        try paths.ensureDirectories()
-        let snapshot = AutoTuneSnapshot(
-            tier: "High",
-            memoryGB: 48.0,
-            cpuCount: 16,
-            gpuWorkingSetGB: 32.0,
-            mapAnythingResolution: 518,
-            mapAnythingDirectViewLimit: 8,
-            mapAnythingAnchorMaxViews: 64,
-            mapAnythingWindowSize: 8,
-            mapAnythingWindowOverlap: 2,
-            vggtImageLoadResolution: 1280,
-            vggtFixedResolution: 518,
-            vggtMaxPoints: 150_000,
-            vggtAllowed: true,
-            colmapMaxNumFeatures: 10_000,
-            colmapMaxNumMatches: 10_000,
-            colmapSequentialOverlap: 12,
-            colmapExhaustiveBlockSize: 25,
-            threadCap: 8,
-            colmapMaxImageSizeCap: nil,
-            capturedAt: Date(timeIntervalSince1970: 1_700_000_000)
-        )
-        let metadata = ProjectMetadata(
-            title: "TunedProject",
-            input: .photos(folder: "/tmp/photos"),
-            preset: PresetSpec(mode: .object, quality: .standard),
-            autoTune: snapshot
-        )
-        try ProjectMetadataStore.save(metadata, to: paths.metadataURL)
-
-        let bundle = try XCTUnwrap(ProjectDiagnosticBundle.build(projectURL: root))
-        XCTAssertFalse(bundle.contains("## Auto-tune"))
-        XCTAssertFalse(bundle.contains("Tier: High"))
-    }
-
     func testEmbedsLogTailsWhenPresent() throws {
         let root = try TestFileBuilder.makeTempDir()
         defer { try? FileManager.default.removeItem(at: root) }
@@ -109,7 +70,7 @@ final class ProjectDiagnosticBundleTests: XCTestCase {
         let metadata = ProjectMetadata(
             title: "WithLogs",
             input: .photos(folder: "/tmp/photos"),
-            preset: PresetSpec(mode: .object, quality: .standard)
+            requestedRunOptions: RequestedRunOptions(capturePath: .orbit, detailProfile: .balanced)
         )
         try ProjectMetadataStore.save(metadata, to: paths.metadataURL)
         try "first line\nsecond line\nthird line".write(to: paths.pipelineLogURL, atomically: true, encoding: .utf8)
@@ -117,6 +78,113 @@ final class ProjectDiagnosticBundleTests: XCTestCase {
         let bundle = try XCTUnwrap(ProjectDiagnosticBundle.build(projectURL: root))
         XCTAssertTrue(bundle.contains("## pipeline.log (tail)"))
         XCTAssertTrue(bundle.contains("third line"))
+    }
+
+    func testSkipsSymlinkedLogTailWithoutReadingExternalContents() throws {
+        let parent = try TestFileBuilder.makeTempDir()
+        defer { try? FileManager.default.removeItem(at: parent) }
+        let root = parent.appendingPathComponent("Project.easysplatproj", isDirectory: true)
+        let paths = ProjectPaths(root: root)
+        try paths.ensureDirectories()
+        try ProjectMetadataStore.save(
+            ProjectMetadata(
+                title: "SymlinkedLog",
+                input: .photos(folder: "/tmp/photos"),
+                requestedRunOptions: RequestedRunOptions(capturePath: .orbit, detailProfile: .balanced)
+            ),
+            to: paths.metadataURL
+        )
+        let marker = "external-symlink-log-secret"
+        let outsideLog = parent.appendingPathComponent("outside.log")
+        try marker.write(to: outsideLog, atomically: true, encoding: .utf8)
+        try FileManager.default.createSymbolicLink(at: paths.pipelineLogURL, withDestinationURL: outsideLog)
+
+        let bundle = try XCTUnwrap(ProjectDiagnosticBundle.build(projectURL: root))
+
+        XCTAssertFalse(bundle.contains(marker))
+        XCTAssertFalse(bundle.contains("## pipeline.log (tail)"))
+        XCTAssertEqual(try String(contentsOf: outsideLog, encoding: .utf8), marker)
+    }
+
+    func testSkipsLogTailInsideSymlinkedLogsDirectory() throws {
+        let parent = try TestFileBuilder.makeTempDir()
+        defer { try? FileManager.default.removeItem(at: parent) }
+        let root = parent.appendingPathComponent("Project.easysplatproj", isDirectory: true)
+        let paths = ProjectPaths(root: root)
+        try paths.ensureDirectories()
+        try ProjectMetadataStore.save(
+            ProjectMetadata(
+                title: "SymlinkedLogsDirectory",
+                input: .photos(folder: "/tmp/photos"),
+                requestedRunOptions: RequestedRunOptions(capturePath: .orbit, detailProfile: .balanced)
+            ),
+            to: paths.metadataURL
+        )
+        try FileManager.default.removeItem(at: paths.logsURL)
+        let outsideLogs = parent.appendingPathComponent("OutsideLogs", isDirectory: true)
+        try FileManager.default.createDirectory(at: outsideLogs, withIntermediateDirectories: true)
+        let marker = "external-parent-symlink-log-secret"
+        try marker.write(
+            to: outsideLogs.appendingPathComponent("pipeline.log"),
+            atomically: true,
+            encoding: .utf8
+        )
+        try FileManager.default.createSymbolicLink(
+            at: paths.logsURL,
+            withDestinationURL: outsideLogs
+        )
+
+        let bundle = try XCTUnwrap(ProjectDiagnosticBundle.build(projectURL: root))
+
+        XCTAssertFalse(bundle.contains(marker))
+        XCTAssertFalse(bundle.contains("## pipeline.log (tail)"))
+    }
+
+    func testSkipsMultiplyLinkedLogTailWithoutReadingExternalContents() throws {
+        let parent = try TestFileBuilder.makeTempDir()
+        defer { try? FileManager.default.removeItem(at: parent) }
+        let root = parent.appendingPathComponent("Project.easysplatproj", isDirectory: true)
+        let paths = ProjectPaths(root: root)
+        try paths.ensureDirectories()
+        try ProjectMetadataStore.save(
+            ProjectMetadata(
+                title: "HardLinkedLog",
+                input: .photos(folder: "/tmp/photos"),
+                requestedRunOptions: RequestedRunOptions(capturePath: .orbit, detailProfile: .balanced)
+            ),
+            to: paths.metadataURL
+        )
+        let marker = "external-hardlink-log-secret"
+        let outsideLog = parent.appendingPathComponent("outside.log")
+        try marker.write(to: outsideLog, atomically: true, encoding: .utf8)
+        try FileManager.default.linkItem(at: outsideLog, to: paths.pipelineLogURL)
+
+        let bundle = try XCTUnwrap(ProjectDiagnosticBundle.build(projectURL: root))
+
+        XCTAssertFalse(bundle.contains(marker))
+        XCTAssertFalse(bundle.contains("## pipeline.log (tail)"))
+        XCTAssertEqual(try String(contentsOf: outsideLog, encoding: .utf8), marker)
+    }
+
+    func testSkipsFIFOLogTail() throws {
+        let parent = try TestFileBuilder.makeTempDir()
+        defer { try? FileManager.default.removeItem(at: parent) }
+        let root = parent.appendingPathComponent("Project.easysplatproj", isDirectory: true)
+        let paths = ProjectPaths(root: root)
+        try paths.ensureDirectories()
+        try ProjectMetadataStore.save(
+            ProjectMetadata(
+                title: "FIFOLog",
+                input: .photos(folder: "/tmp/photos"),
+                requestedRunOptions: RequestedRunOptions(capturePath: .orbit, detailProfile: .balanced)
+            ),
+            to: paths.metadataURL
+        )
+        XCTAssertEqual(Darwin.mkfifo(paths.pipelineLogURL.path, mode_t(S_IRUSR | S_IWUSR)), 0)
+
+        let bundle = try XCTUnwrap(ProjectDiagnosticBundle.build(projectURL: root))
+
+        XCTAssertFalse(bundle.contains("## pipeline.log (tail)"))
     }
 
     func testEmbedsGlobalMapperLogTailWhenPresent() throws {
@@ -128,7 +196,7 @@ final class ProjectDiagnosticBundleTests: XCTestCase {
             ProjectMetadata(
                 title: "WithGlobalMapperLog",
                 input: .photos(folder: "/tmp/photos"),
-                preset: PresetSpec(mode: .object, quality: .draft)
+                requestedRunOptions: RequestedRunOptions(capturePath: .orbit, detailProfile: .fast)
             ),
             to: paths.metadataURL
         )
@@ -147,7 +215,7 @@ final class ProjectDiagnosticBundleTests: XCTestCase {
         let metadata = ProjectMetadata(
             title: "EmptyLogs",
             input: .photos(folder: "/tmp/photos"),
-            preset: PresetSpec(mode: .object, quality: .standard)
+            requestedRunOptions: RequestedRunOptions(capturePath: .orbit, detailProfile: .balanced)
         )
         try ProjectMetadataStore.save(metadata, to: paths.metadataURL)
         try "".write(to: paths.pipelineLogURL, atomically: true, encoding: .utf8)
@@ -164,7 +232,7 @@ final class ProjectDiagnosticBundleTests: XCTestCase {
         let metadata = ProjectMetadata(
             title: "BigLog",
             input: .photos(folder: "/tmp/photos"),
-            preset: PresetSpec(mode: .object, quality: .standard)
+            requestedRunOptions: RequestedRunOptions(capturePath: .orbit, detailProfile: .balanced)
         )
         try ProjectMetadataStore.save(metadata, to: paths.metadataURL)
 
@@ -197,7 +265,7 @@ final class ProjectDiagnosticBundleTests: XCTestCase {
             ProjectMetadata(
                 title: "Privacy",
                 input: .photos(folder: "/tmp/photos"),
-                preset: PresetSpec(mode: .object, quality: .standard),
+                requestedRunOptions: RequestedRunOptions(capturePath: .orbit, detailProfile: .balanced),
                 notes: "private"
             ),
             to: paths.metadataURL
@@ -216,7 +284,7 @@ final class ProjectDiagnosticBundleTests: XCTestCase {
         let metadata = ProjectMetadata(
             title: "PrivateNotes",
             input: .photos(folder: "/tmp/photos"),
-            preset: PresetSpec(mode: .object, quality: .standard),
+            requestedRunOptions: RequestedRunOptions(capturePath: .orbit, detailProfile: .balanced),
             notes: "secret location: 47.6,-122.3"
         )
         try ProjectMetadataStore.save(metadata, to: paths.metadataURL)
@@ -225,7 +293,7 @@ final class ProjectDiagnosticBundleTests: XCTestCase {
         XCTAssertFalse(bundle.contains("## Notes"))
     }
 
-    func testMachineReadableJsonContainsPresetAndStageTimings() throws {
+    func testMachineReadableJsonContainsRequestedOptionsAndStageTimings() throws {
         let root = try TestFileBuilder.makeTempDir()
         defer { try? FileManager.default.removeItem(at: root) }
         let paths = ProjectPaths(root: root)
@@ -233,9 +301,9 @@ final class ProjectDiagnosticBundleTests: XCTestCase {
         let metadata = ProjectMetadata(
             title: "MachineDetailed",
             input: .photos(folder: "/tmp/photos"),
-            preset: PresetSpec(mode: .room, quality: .ultra),
+            requestedRunOptions: RequestedRunOptions(capturePath: .walkthrough, detailProfile: .highDetail),
             reconstruction: ReconstructionSummary(
-                mapper: "vggt",
+                mapper: "colmap",
                 capturedAt: Date(timeIntervalSince1970: 1_700_000_000),
                 registeredImages: 1,
                 totalImages: 1
@@ -252,9 +320,9 @@ final class ProjectDiagnosticBundleTests: XCTestCase {
         }
         let json = String(bundle[start.upperBound..<end.lowerBound])
         let parsed = try JSONSerialization.jsonObject(with: Data(json.utf8), options: []) as? [String: Any]
-        let preset = parsed?["preset"] as? [String: Any]
-        XCTAssertEqual(preset?["mode"] as? String, "room")
-        XCTAssertEqual(preset?["quality"] as? String, "ultra")
+        let options = parsed?["requestedRunOptions"] as? [String: Any]
+        XCTAssertEqual(options?["capturePath"] as? String, "walkthrough")
+        XCTAssertEqual(options?["detailProfile"] as? String, "highDetail")
         let timings = parsed?["stageTimings"] as? [[String: Any]]
         XCTAssertEqual(timings?.count, 1)
         XCTAssertEqual(timings?.first?["stage"] as? String, "sfmFeatures")
@@ -269,8 +337,8 @@ final class ProjectDiagnosticBundleTests: XCTestCase {
         let metadata = ProjectMetadata(
             title: "FailureTimestamp",
             input: .photos(folder: "/tmp/photos"),
-            preset: PresetSpec(mode: .object, quality: .standard),
-            state: PipelineState(stage: .sfmMapping, attempt: 1, lastError: "mapper exploded", resumeToken: nil),
+            requestedRunOptions: RequestedRunOptions(capturePath: .orbit, detailProfile: .balanced),
+            state: PipelineState(stage: .sfmMapping, lastError: "mapper exploded"),
             reconstruction: ReconstructionSummary(
                 mapper: "global_mapper",
                 capturedAt: Date(timeIntervalSince1970: 1_700_000_000),
@@ -300,7 +368,7 @@ final class ProjectDiagnosticBundleTests: XCTestCase {
         let paths = ProjectPaths(root: root)
         try paths.ensureDirectories()
         let reconstruction = ReconstructionSummary(
-            mapper: "vggt",
+            mapper: "colmap",
             capturedAt: Date(timeIntervalSince1970: 1_700_000_000),
             registeredImages: 18,
             totalImages: 20,
@@ -311,7 +379,7 @@ final class ProjectDiagnosticBundleTests: XCTestCase {
             ProjectMetadata(
                 title: "Machine",
                 input: .photos(folder: "/tmp/photos"),
-                preset: PresetSpec(mode: .object, quality: .standard),
+                requestedRunOptions: RequestedRunOptions(capturePath: .orbit, detailProfile: .balanced),
                 reconstruction: reconstruction
             ),
             to: paths.metadataURL
@@ -327,44 +395,13 @@ final class ProjectDiagnosticBundleTests: XCTestCase {
         }
         let json = String(bundle[start.upperBound..<end.lowerBound])
         let parsed = try JSONSerialization.jsonObject(with: Data(json.utf8), options: []) as? [String: Any]
-        XCTAssertNotNil(parsed?["projectId"])
+        XCTAssertNil(parsed?["projectId"])
         XCTAssertNotNil(parsed?["reconstruction"])
         XCTAssertEqual(
             parsed?["schemaVersion"] as? Int,
             ProjectDiagnosticBundle.machineReadableSchemaVersion,
             "JSON payload must carry the current schema version so downstream consumers can detect format changes."
         )
-    }
-
-    func testMachineReadableJsonMasksLegacyUnreliableReprojectionWithoutMutatingProject() throws {
-        let root = try TestFileBuilder.makeTempDir()
-        defer { try? FileManager.default.removeItem(at: root) }
-        let paths = ProjectPaths(root: root)
-        try paths.ensureDirectories()
-        let legacyReconstruction = ReconstructionSummary(
-            mapper: "global_mapper",
-            capturedAt: Date(timeIntervalSince1970: 1_700_000_000),
-            registeredImages: 18,
-            totalImages: 20,
-            meanReprojectionError: 0.0003
-        )
-        try ProjectMetadataStore.save(
-            ProjectMetadata(
-                title: "LegacyGlobalMapper",
-                input: .photos(folder: "/tmp/photos"),
-                preset: PresetSpec(mode: .object, quality: .standard),
-                reconstruction: legacyReconstruction
-            ),
-            to: paths.metadataURL
-        )
-
-        let bundle = try XCTUnwrap(ProjectDiagnosticBundle.build(projectURL: root))
-        let parsed = try machineReadablePayload(from: bundle)
-        let reconstruction = try XCTUnwrap(parsed["reconstruction"] as? [String: Any])
-        XCTAssertNil(reconstruction["meanReprojectionError"])
-
-        let persisted = try ProjectMetadataStore.load(from: paths.metadataURL)
-        XCTAssertEqual(persisted.reconstruction?.meanReprojectionError, 0.0003)
     }
 
     func testMachineReadableJsonKeepsReliableReprojection() throws {
@@ -376,7 +413,7 @@ final class ProjectDiagnosticBundleTests: XCTestCase {
             ProjectMetadata(
                 title: "ReliableColmap",
                 input: .photos(folder: "/tmp/photos"),
-                preset: PresetSpec(mode: .object, quality: .standard),
+                requestedRunOptions: RequestedRunOptions(capturePath: .orbit, detailProfile: .balanced),
                 reconstruction: ReconstructionSummary(
                     mapper: "colmap",
                     capturedAt: Date(timeIntervalSince1970: 1_700_000_000),
@@ -402,7 +439,7 @@ final class ProjectDiagnosticBundleTests: XCTestCase {
         let metadata = ProjectMetadata(
             title: "WithNotes",
             input: .photos(folder: "/tmp/photos"),
-            preset: PresetSpec(mode: .object, quality: .standard),
+            requestedRunOptions: RequestedRunOptions(capturePath: .orbit, detailProfile: .balanced),
             notes: "sunset capture"
         )
         try ProjectMetadataStore.save(metadata, to: paths.metadataURL)
@@ -411,34 +448,116 @@ final class ProjectDiagnosticBundleTests: XCTestCase {
         XCTAssertTrue(bundle.contains("sunset capture"))
     }
 
-    func testExcludesLegacyAppEventsLog() throws {
+    func testExcludesUnlistedPrivateLog() throws {
         let root = try TestFileBuilder.makeTempDir()
         defer { try? FileManager.default.removeItem(at: root) }
         let paths = ProjectPaths(root: root)
         try paths.ensureDirectories()
         try ProjectMetadataStore.save(
             ProjectMetadata(
-                title: "LegacyAppEvents",
+                title: "PrivateLog",
                 input: .photos(folder: "/tmp/photos"),
-                preset: PresetSpec(mode: .object, quality: .standard)
+                requestedRunOptions: RequestedRunOptions(capturePath: .orbit, detailProfile: .balanced)
             ),
             to: paths.metadataURL
         )
         try "private-share-service-marker".write(
-            to: paths.logsURL.appendingPathComponent("app_events.jsonl"),
+            to: paths.logsURL.appendingPathComponent("private_debug.jsonl"),
             atomically: true,
             encoding: .utf8
         )
 
         let bundle = try XCTUnwrap(ProjectDiagnosticBundle.build(projectURL: root))
         XCTAssertFalse(bundle.contains("private-share-service-marker"))
-        XCTAssertFalse(bundle.contains("app_events.jsonl"))
+        XCTAssertFalse(bundle.contains("private_debug.jsonl"))
     }
 
     func testHomePathSanitizerReplacesHome() {
         let sanitizer = HomePathSanitizer(homePath: "/Users/example")
         XCTAssertEqual(sanitizer.sanitize("/Users/example/Documents/foo"), "~/Documents/foo")
         XCTAssertEqual(sanitizer.sanitize("/var/tmp/x"), "/var/tmp/x")
+    }
+
+    func testSanitizerRedactsRemovableVolumeNamesAndURLCredentials() {
+        let sanitizer = HomePathSanitizer(homePath: "/Users/example")
+        let input = "source=/Volumes/Client Drive/House/input.mov url=https://alice:secret@example.com/file"
+        let sanitized = sanitizer.sanitize(input)
+
+        XCTAssertFalse(sanitized.contains("Client Drive"))
+        XCTAssertFalse(sanitized.contains("alice"))
+        XCTAssertFalse(sanitized.contains("secret"))
+        XCTAssertTrue(sanitized.contains("/Volumes/<redacted>/House/input.mov"))
+        XCTAssertTrue(sanitized.contains("https://example.com/file"))
+        XCTAssertEqual(sanitizer.sanitize("/Volumes/Client Drive"), "/Volumes/<redacted>")
+    }
+
+    func testDiagnosticsRedactProjectIdentityFromErrorsAndLogs() throws {
+        let root = try TestFileBuilder.makeTempDir().appendingPathComponent("123 Main St.easysplatproj")
+        defer { try? FileManager.default.removeItem(at: root.deletingLastPathComponent()) }
+        let paths = ProjectPaths(root: root)
+        try paths.ensureDirectories()
+        let identifier = UUID(uuidString: "22222222-2222-2222-2222-222222222222")!
+        try ProjectMetadataStore.save(
+            ProjectMetadata(
+                id: identifier,
+                title: "123 Main St",
+                input: .photos(folder: "/tmp/photos"),
+                requestedRunOptions: RequestedRunOptions(capturePath: .walkthrough, detailProfile: .balanced),
+                state: PipelineState(
+                    stage: .sfmMapping,
+                    lastError: "Failed 123 Main St / \(identifier.uuidString)"
+                )
+            ),
+            to: paths.metadataURL
+        )
+        try "project=123 Main St id=\(identifier.uuidString)".write(
+            to: paths.pipelineLogURL,
+            atomically: true,
+            encoding: .utf8
+        )
+
+        let bundle = try XCTUnwrap(ProjectDiagnosticBundle.build(projectURL: root))
+        XCTAssertFalse(bundle.contains("123 Main St"))
+        XCTAssertFalse(bundle.contains(identifier.uuidString))
+    }
+
+    func testSharingSanitizerRedactsProjectIdentityPathsAndCredentials() throws {
+        let root = try TestFileBuilder.makeTempDir()
+            .appendingPathComponent("Client House.easysplatproj", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root.deletingLastPathComponent()) }
+        let paths = ProjectPaths(root: root)
+        try paths.ensureDirectories()
+        let identifier = UUID(uuidString: "33333333-3333-3333-3333-333333333333")!
+        try ProjectMetadataStore.save(
+            ProjectMetadata(
+                id: identifier,
+                title: "Client House",
+                input: .photos(folder: "/tmp/photos"),
+                requestedRunOptions: RequestedRunOptions(capturePath: .walkthrough, detailProfile: .balanced)
+            ),
+            to: paths.metadataURL
+        )
+        let raw = """
+        project=Client House id=\(identifier.uuidString)
+        home=\(NSHomeDirectory())/Documents/input.mov
+        media=/Volumes/Client Drive/House/input.mov
+        url=https://alice:secret@example.com/file
+        """
+
+        let sanitized = ProjectDiagnosticBundle.sanitizeForSharing(
+            raw,
+            projectURL: root
+        )
+
+        XCTAssertFalse(sanitized.contains("Client House"))
+        XCTAssertFalse(sanitized.contains(identifier.uuidString))
+        XCTAssertFalse(sanitized.contains(NSHomeDirectory()))
+        XCTAssertFalse(sanitized.contains("Client Drive"))
+        XCTAssertFalse(sanitized.contains("alice"))
+        XCTAssertFalse(sanitized.contains("secret"))
+        XCTAssertTrue(sanitized.contains("~/Documents/input.mov"))
+        XCTAssertTrue(sanitized.contains("/Volumes/<redacted>/House/input.mov"))
+        XCTAssertTrue(sanitized.contains("https://example.com/file"))
     }
 
     private func machineReadablePayload(from bundle: String) throws -> [String: Any] {

@@ -1,6 +1,58 @@
 import Foundation
 
+public struct GeometryComponentProvenance: Codable, Sendable, Equatable {
+    public var identifier: String
+    public var version: String
+    public var revision: String
+    public var payloadSHA256: String
+
+    public init(
+        identifier: String,
+        version: String,
+        revision: String,
+        payloadSHA256: String
+    ) {
+        self.identifier = identifier
+        self.version = version
+        self.revision = revision
+        self.payloadSHA256 = payloadSHA256
+    }
+}
+
+public struct GeometryProvenance: Codable, Sendable, Equatable {
+    public var toolchainVersion: String
+    public var solver: GeometryComponentProvenance
+    public var runtime: GeometryComponentProvenance?
+    public var model: GeometryComponentProvenance?
+
+    public init(
+        toolchainVersion: String,
+        solver: GeometryComponentProvenance,
+        runtime: GeometryComponentProvenance?,
+        model: GeometryComponentProvenance?
+    ) {
+        self.toolchainVersion = toolchainVersion
+        self.solver = solver
+        self.runtime = runtime
+        self.model = model
+    }
+}
+
+public struct LearnedPointInitializerArtifact: Codable, Sendable, Equatable {
+    public var path: String
+    public var sha256: String
+    public var pointCount: Int
+
+    public init(path: String, sha256: String, pointCount: Int) {
+        self.path = path
+        self.sha256 = sha256
+        self.pointCount = pointCount
+    }
+}
+
 public struct GeometryArtifact: Codable, Sendable, Equatable {
+    public static let currentSchemaVersion = 2
+
     public var schemaVersion: Int
     public var solverVersion: String
     public var runtimeVersion: String
@@ -29,6 +81,8 @@ public struct GeometryArtifact: Codable, Sendable, Equatable {
     public var peakMemoryBytes: Int64
     public var modelHashes: [String: String]
     public var fallbackReason: String?
+    public var provenance: GeometryProvenance
+    public var learnedPointInitializer: LearnedPointInitializerArtifact?
 
     public init(
         schemaVersion: Int,
@@ -56,7 +110,9 @@ public struct GeometryArtifact: Codable, Sendable, Equatable {
         timings: [String: Double],
         peakMemoryBytes: Int64,
         modelHashes: [String: String],
-        fallbackReason: String?
+        fallbackReason: String?,
+        provenance: GeometryProvenance,
+        learnedPointInitializer: LearnedPointInitializerArtifact? = nil
     ) {
         self.schemaVersion = schemaVersion
         self.solverVersion = solverVersion
@@ -84,5 +140,7 @@ public struct GeometryArtifact: Codable, Sendable, Equatable {
         self.peakMemoryBytes = peakMemoryBytes
         self.modelHashes = modelHashes
         self.fallbackReason = fallbackReason
+        self.provenance = provenance
+        self.learnedPointInitializer = learnedPointInitializer
     }
 }

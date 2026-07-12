@@ -20,9 +20,11 @@ public struct TrainingArtifact: Codable, Sendable, Equatable {
     public var checkpointPath: String?
     public var checkpointDigest: String?
     public var outputPath: String?
+    public var outputSHA256: String?
+    public var outputBytes: Int64?
     public var gaussianCount: Int
     public var elapsedSeconds: Double?
-    public var peakMemoryBytes: Int64?
+    public var peakMemoryBytes: Int64
     public var completionStatus: TrainingCompletionStatus
 
     public init(
@@ -40,9 +42,11 @@ public struct TrainingArtifact: Codable, Sendable, Equatable {
         checkpointPath: String?,
         checkpointDigest: String?,
         outputPath: String?,
+        outputSHA256: String? = nil,
+        outputBytes: Int64? = nil,
         gaussianCount: Int,
         elapsedSeconds: Double?,
-        peakMemoryBytes: Int64?,
+        peakMemoryBytes: Int64,
         completionStatus: TrainingCompletionStatus
     ) {
         self.schemaVersion = schemaVersion
@@ -59,38 +63,12 @@ public struct TrainingArtifact: Codable, Sendable, Equatable {
         self.checkpointPath = checkpointPath
         self.checkpointDigest = checkpointDigest
         self.outputPath = outputPath
+        self.outputSHA256 = outputSHA256
+        self.outputBytes = outputBytes
         self.gaussianCount = gaussianCount
         self.elapsedSeconds = elapsedSeconds
         self.peakMemoryBytes = peakMemoryBytes
         self.completionStatus = completionStatus
     }
 
-    public init(from decoder: Decoder) throws {
-        let values = try decoder.container(keyedBy: CodingKeys.self)
-        schemaVersion = try values.decodeIfPresent(Int.self, forKey: .schemaVersion) ?? 1
-        trainerVersion = try values.decode(String.self, forKey: .trainerVersion)
-        runtimeVersion = try values.decode(String.self, forKey: .runtimeVersion)
-        trainerBuildDigest = try values.decodeIfPresent(String.self, forKey: .trainerBuildDigest)
-            ?? (Self.looksLikeSHA256(runtimeVersion) ? runtimeVersion : "")
-        inputDigest = try values.decodeIfPresent(String.self, forKey: .inputDigest) ?? ""
-        geometryDigest = try values.decode(String.self, forKey: .geometryDigest)
-        detailProfile = try values.decode(DetailProfile.self, forKey: .detailProfile)
-        iterationLimit = try values.decode(Int.self, forKey: .iterationLimit)
-        plateauWindow = try values.decode(Int.self, forKey: .plateauWindow)
-        deterministicSeed = try values.decode(UInt64.self, forKey: .deterministicSeed)
-        completedIteration = try values.decodeIfPresent(Int.self, forKey: .completedIteration) ?? 0
-        checkpointPath = try values.decodeIfPresent(String.self, forKey: .checkpointPath)
-        checkpointDigest = try values.decodeIfPresent(String.self, forKey: .checkpointDigest)
-        outputPath = try values.decodeIfPresent(String.self, forKey: .outputPath)
-        gaussianCount = try values.decode(Int.self, forKey: .gaussianCount)
-        elapsedSeconds = try values.decodeIfPresent(Double.self, forKey: .elapsedSeconds)
-        peakMemoryBytes = try values.decodeIfPresent(Int64.self, forKey: .peakMemoryBytes)
-        completionStatus = try values.decode(TrainingCompletionStatus.self, forKey: .completionStatus)
-    }
-
-    private static func looksLikeSHA256(_ value: String) -> Bool {
-        value.count == 64 && value.utf8.allSatisfy { byte in
-            (48...57).contains(byte) || (97...102).contains(byte)
-        }
-    }
 }

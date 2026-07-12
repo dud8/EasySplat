@@ -16,23 +16,26 @@ from PIL import Image
 
 from easysplat_da3_sfm.run import (
     _align_w2c_poses,
+    _build_retrieval_graph,
+    _compute_image_descriptors,
     _camera_params,
-    _colmap_text_stats,
     _default_models_dir,
     _estimate_sim3,
+    _estimate_oriented_sim3,
     _exact_prediction_geometry,
+    _fuse_depth_points,
     _list_images,
     _model_path,
     _plan_continuous_batches,
     _plan_unordered_batches,
-    _plan_windows,
     _rotmat_to_quat_wxyz,
-    _run_da3_export,
+    _run_da3_model,
+    _run_da3_seed_refine,
+    _sample_depth_points,
     _select_anchor_indices,
     _select_device,
     _validate_common_view_rotations,
     _write_seed_colmap,
-    _write_colmap_from_prediction,
     _write_manifest,
     build_arg_parser,
     main,
@@ -76,7 +79,6 @@ class Da3RunTests(unittest.TestCase):
             "--out-sparse", "sparse/0",
             "--models-dir", "models",
             "--device", "mps",
-            "--mode", "direct",
             "--model-subdir", "DA3-BASE",
             "--fallback-model-subdir", "DA3-SMALL",
             "--process-res", "504",
@@ -91,30 +93,29 @@ class Da3RunTests(unittest.TestCase):
         self.assertEqual(args.fallback_model_subdir, "DA3-SMALL")
         self.assertTrue(args.shared_camera)
 
-    def test_parser_accepts_seed_refine_and_input_ordering(self) -> None:
+    def test_parser_accepts_input_ordering(self) -> None:
         parser = build_arg_parser()
         args = parser.parse_args([
             "--images", "images",
             "--out-sparse", "sparse/0",
             "--models-dir", "models",
-            "--mode", "seed_refine",
             "--input-ordering", "continuous",
         ])
-        self.assertEqual(args.mode, "seed_refine")
         self.assertEqual(args.input_ordering, "continuous")
 
     def test_requirements_pin_runtime_sensitive_dependencies(self) -> None:
-        requirements = (Path(__file__).resolve().parents[1] / "requirements.txt").read_text(encoding="utf-8")
+        root = Path(__file__).resolve().parents[1]
+        requirements = (root / "requirements.in").read_text(encoding="utf-8")
         lines = {
             line.strip()
             for line in requirements.splitlines()
             if line.strip() and not line.strip().startswith("#")
         }
-        self.assertIn("torch==2.10.0", lines)
-        self.assertIn("torchvision==0.25.0", lines)
+        self.assertIn("torch==2.12.1", lines)
+        self.assertIn("torchvision==0.27.1", lines)
         self.assertIn("numpy==2.3.5", lines)
         self.assertIn("opencv-python-headless==4.10.0.84", lines)
-        self.assertIn("pillow==12.1.0", lines)
+        self.assertIn("pillow==12.2.0", lines)
         self.assertIn("safetensors==0.7.0", lines)
         self.assertIn("huggingface_hub==1.14.0", lines)
         self.assertIn("transformers==5.8.1", lines)
@@ -122,10 +123,14 @@ class Da3RunTests(unittest.TestCase):
         self.assertIn("omegaconf==2.3.0", lines)
         self.assertIn("pycolmap==3.13.0", lines)
 
-    def test_plan_windows_keeps_memory_bounded_overlap(self) -> None:
-        self.assertEqual(_plan_windows(1, 6, 2), [(0, 1)])
-        self.assertEqual(_plan_windows(6, 6, 2), [(0, 6)])
-        self.assertEqual(_plan_windows(10, 4, 1), [(0, 4), (3, 7), (6, 10)])
+        lock = (root / "requirements.txt").read_text(encoding="utf-8")
+        for requirement in lines:
+            name, version = requirement.split("==", maxsplit=1)
+            normalized = name.replace("_", "-")
+            self.assertIn(f"{normalized}=={version} \\", lock)
+        self.assertIn("antlr4-python3-runtime==4.9.3 \\", lock)
+        self.assertNotIn("==unknown", lock)
+        self.assertGreaterEqual(lock.count("--hash=sha256:"), len(lines) + 1)
 
     def test_continuous_planner_covers_large_inputs_exactly(self) -> None:
         for image_count in (30, 120, 250):
@@ -136,16 +141,185 @@ class Da3RunTests(unittest.TestCase):
             for previous, current in zip(batches, batches[1:]):
                 self.assertGreaterEqual(len(set(previous) & set(current)), 3)
 
-    def test_unordered_planner_covers_large_inputs_exactly(self) -> None:
-        anchors = [0, 2, 5]
+    def test_constrained_continuous_planner_advances_two_views_per_full_batch(self) -> None:
+        batches = _plan_continuous_batches(250, window_size=4, overlap=3)
+
+        self.assertLessEqual(len(batches), 124)
+        self.assertTrue(all(len(batch) <= 4 for batch in batches))
+        for previous, current in zip(batches, batches[1:-1]):
+            self.assertEqual(len(set(current) - set(previous)), 2)
+            self.assertEqual(len(set(previous) & set(current)), 2)
+
+    def test_constrained_continuous_seed_keeps_three_reference_anchors(self) -> None:
+        centers = np.array([
+            [0.0, 0.0, 0.0],
+            [1.0, 1.0, 0.1],
+            [2.0, 0.0, 0.1],
+            [3.0, 1.0, 0.0],
+        ])
+
+        class FakeModel:
+            def inference(self, **kwargs):
+                names = [Path(value).name for value in kwargs["image"]]
+                poses = np.repeat(np.eye(4)[None, ...], len(names), axis=0)
+                for local_index, name in enumerate(names):
+                    image_index = int(name.removeprefix("img").removesuffix(".jpg"))
+                    center = np.array([
+                        float(image_index),
+                        float(image_index % 2),
+                        float((image_index * image_index) % 3) * 0.1,
+                    ])
+                    poses[local_index, :3, 3] = -center
+                return {
+                    "extrinsics": poses,
+                    "intrinsics": np.repeat(np.eye(3)[None, ...], len(names), axis=0),
+                    "depth": np.ones((len(names), 2, 2)),
+                    "conf": np.ones((len(names), 2, 2)),
+                }
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            args = build_arg_parser().parse_args([
+                "--images", str(root),
+                "--out-sparse", str(root / "unused"),
+                "--input-ordering", "continuous",
+                "--window-size", "4",
+                "--window-overlap", "3",
+                "--max-points", "32",
+            ])
+            for image_count in (5, 6, 7):
+                images: list[Path] = []
+                for index in range(image_count):
+                    image = root / f"img{index}.jpg"
+                    Image.new("RGB", (8, 8), color=(index * 10, 0, 0)).save(image)
+                    images.append(image)
+
+                _, evidence = _run_da3_seed_refine(
+                    args,
+                    FakeModel(),
+                    images,
+                    "cpu",
+                    root / f"seed-{image_count}" / "0",
+                )
+
+                anchors = evidence["anchor_indices"]
+                first_batch = evidence["batches"][0]
+                expected_local = _select_anchor_indices(centers)
+                expected_global = [first_batch[index] for index in expected_local]
+                self.assertEqual(len(anchors), 3)
+                self.assertEqual(len(set(anchors)), 3)
+                self.assertTrue(set(anchors).issubset(first_batch))
+                self.assertEqual(anchors, expected_global)
+
+    def test_seed_rejects_collinear_reference_anchors(self) -> None:
+        class FakeModel:
+            def inference(self, **kwargs):
+                count = len(kwargs["image"])
+                poses = np.repeat(np.eye(4)[None, ...], count, axis=0)
+                poses[:, 0, 3] = -np.arange(count, dtype=np.float64)
+                return {
+                    "extrinsics": poses,
+                    "intrinsics": np.repeat(np.eye(3)[None, ...], count, axis=0),
+                    "depth": np.ones((count, 2, 2)),
+                    "conf": np.ones((count, 2, 2)),
+                }
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            images = []
+            for index in range(5):
+                image = root / f"img{index}.jpg"
+                Image.new("RGB", (8, 8)).save(image)
+                images.append(image)
+            args = build_arg_parser().parse_args([
+                "--images", str(root),
+                "--out-sparse", str(root / "unused"),
+                "--input-ordering", "continuous",
+                "--window-size", "4",
+                "--window-overlap", "3",
+                "--max-points", "32",
+            ])
+
+            with self.assertRaisesRegex(ValueError, "non-collinear"):
+                _run_da3_seed_refine(args, FakeModel(), images, "cpu", root / "seed" / "0")
+
+    def test_unordered_planner_follows_chain_without_first_window_anchors(self) -> None:
+        graph = {
+            index: [neighbor for neighbor in (index - 1, index + 1) if 0 <= neighbor < 12]
+            for index in range(12)
+        }
+        batches = _plan_unordered_batches(12, window_size=4, neighbor_graph=graph, overlap=2)
+
+        self.assertEqual(batches[0], [0, 1, 2, 3])
+        self.assertEqual(batches[1], [2, 3, 4, 5])
+        self.assertEqual(batches[2], [4, 5, 6, 7])
+        self.assertTrue(set(batches[0]).isdisjoint(batches[2]))
+        self.assertEqual({index for batch in batches for index in batch}, set(range(12)))
+
+    def test_unordered_planner_covers_large_inputs_with_bounded_calls(self) -> None:
         for image_count in (30, 120, 250):
-            batches = _plan_unordered_batches(image_count, window_size=8, anchor_indices=anchors)
+            graph = {
+                index: [neighbor for neighbor in (index - 1, index + 1) if 0 <= neighbor < image_count]
+                for index in range(image_count)
+            }
+            batches = _plan_unordered_batches(
+                image_count,
+                window_size=4,
+                neighbor_graph=graph,
+                overlap=2,
+            )
             flattened = {index for batch in batches for index in batch}
             self.assertEqual(flattened, set(range(image_count)))
-            self.assertEqual(batches[0], list(range(8)))
-            self.assertTrue(all(len(batch) <= 8 for batch in batches))
-            for batch in batches[1:]:
-                self.assertEqual(batch[:3], anchors)
+            self.assertTrue(all(len(batch) <= 4 for batch in batches))
+            self.assertLessEqual(len(batches), 1 + (image_count - 4 + 1) // 2)
+            for previous, current in zip(batches, batches[1:]):
+                self.assertGreaterEqual(len(set(previous) & set(current)), 2)
+
+    def test_unordered_planner_rejects_disconnected_retrieval_graph(self) -> None:
+        graph = {
+            0: [1],
+            1: [0, 2],
+            2: [1],
+            3: [4],
+            4: [3, 5],
+            5: [4],
+        }
+
+        with self.assertRaisesRegex(ValueError, "retrieval graph was disconnected"):
+            _plan_unordered_batches(6, window_size=4, neighbor_graph=graph, overlap=2)
+
+    def test_retrieval_graph_is_deterministic_and_rejects_unrelated_components(self) -> None:
+        chain = np.array([
+            [1.0, 0.00, 0.0],
+            [0.98, 0.20, 0.0],
+            [0.92, 0.39, 0.0],
+            [0.83, 0.56, 0.0],
+        ])
+        first = _build_retrieval_graph(chain, max_neighbors=2, minimum_similarity=0.92)
+        second = _build_retrieval_graph(chain, max_neighbors=2, minimum_similarity=0.92)
+        self.assertEqual(first, second)
+
+        disconnected = np.concatenate([
+            chain[:3],
+            np.array([[0.0, 0.0, 1.0], [0.0, 0.2, 0.98], [0.0, 0.39, 0.92]]),
+        ])
+        graph = _build_retrieval_graph(disconnected, max_neighbors=2, minimum_similarity=0.92)
+        with self.assertRaisesRegex(ValueError, "retrieval graph was disconnected"):
+            _plan_unordered_batches(6, window_size=4, neighbor_graph=graph, overlap=2)
+
+    def test_image_descriptors_are_deterministic(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            paths = []
+            for index, color in enumerate(((240, 10, 10), (220, 20, 20), (10, 10, 240))):
+                path = root / f"img{index}.png"
+                Image.new("RGB", (32, 24), color=color).save(path)
+                paths.append(path)
+
+            first = _compute_image_descriptors(paths)
+            second = _compute_image_descriptors(paths)
+            np.testing.assert_allclose(first, second, atol=0.0, rtol=0.0)
+            self.assertEqual(first.shape[0], 3)
 
     def test_unordered_anchor_selection_rejects_collinear_centers(self) -> None:
         centers = np.array([[float(index), 0.0, 0.0] for index in range(8)])
@@ -181,6 +355,52 @@ class Da3RunTests(unittest.TestCase):
         aligned_centers = np.stack([-pose[:3, :3].T @ pose[:3, 3] for pose in aligned])
         np.testing.assert_allclose(aligned_centers, target, atol=1e-8)
         np.testing.assert_allclose(aligned[:, :3, :3], np.repeat(rotation.T[None, ...], 4, axis=0), atol=1e-8)
+
+    def test_oriented_sim3_recovers_transform_from_two_views(self) -> None:
+        angle = np.deg2rad(20.0)
+        rotation = np.array([
+            [np.cos(angle), -np.sin(angle), 0.0],
+            [np.sin(angle), np.cos(angle), 0.0],
+            [0.0, 0.0, 1.0],
+        ])
+        scale = 1.8
+        translation = np.array([2.0, -1.0, 0.5])
+        local_centers = np.array([[0.0, 0.0, 0.0], [2.0, 0.5, 0.0]])
+        global_centers = (scale * (rotation @ local_centers.T)).T + translation
+        local = np.repeat(np.eye(4)[None, ...], 2, axis=0)
+        local[:, :3, 3] = -local_centers
+        global_poses = np.repeat(np.eye(4)[None, ...], 2, axis=0)
+        global_poses[:, :3, :3] = rotation.T
+        global_poses[:, :3, 3] = np.stack([-rotation.T @ center for center in global_centers])
+
+        solved_scale, solved_rotation, solved_translation, rmse = _estimate_oriented_sim3(local, global_poses)
+
+        self.assertAlmostEqual(solved_scale, scale, places=8)
+        np.testing.assert_allclose(solved_rotation, rotation, atol=1e-8)
+        np.testing.assert_allclose(solved_translation, translation, atol=1e-8)
+        self.assertLess(rmse, 1e-10)
+
+    def test_oriented_sim3_uses_camera_baseline_when_rotations_are_noisy(self) -> None:
+        local_centers = np.array([[0.0, 0.0, 0.0], [2.0, 0.0, 0.0]])
+        target_centers = local_centers + np.array([3.0, -2.0, 1.0])
+        angle = np.deg2rad(8.0)
+        noisy_rotation = np.array([
+            [np.cos(angle), -np.sin(angle), 0.0],
+            [np.sin(angle), np.cos(angle), 0.0],
+            [0.0, 0.0, 1.0],
+        ])
+        local = np.repeat(np.eye(4)[None, ...], 2, axis=0)
+        local[:, :3, :3] = noisy_rotation
+        local[:, :3, 3] = np.stack([-noisy_rotation @ center for center in local_centers])
+        target = np.repeat(np.eye(4)[None, ...], 2, axis=0)
+        target[:, :3, 3] = -target_centers
+
+        scale, rotation, translation, rmse = _estimate_oriented_sim3(local, target)
+
+        self.assertAlmostEqual(scale, 1.0, places=8)
+        np.testing.assert_allclose(rotation, np.eye(3), atol=1e-8)
+        np.testing.assert_allclose(translation, [3.0, -2.0, 1.0], atol=1e-8)
+        self.assertLess(rmse, 1e-10)
 
     def test_umeyama_rejects_reflection_degenerate_nonfinite_and_high_rmse(self) -> None:
         source = np.array([
@@ -254,6 +474,76 @@ class Da3RunTests(unittest.TestCase):
                 line and not line.startswith("#")
                 for line in (sparse / "points3D.txt").read_text(encoding="utf-8").splitlines()
             ))
+
+    def test_seed_export_writes_learned_points_as_untracked_sidecar(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            image = root / "img.jpg"
+            Image.new("RGB", (4, 4), color=(12, 34, 56)).save(image)
+            sparse = root / "sparse" / "0"
+            _write_seed_colmap(
+                np.eye(4)[None, ...],
+                np.array([[[2.0, 0.0, 2.0], [0.0, 2.0, 2.0], [0.0, 0.0, 1.0]]]),
+                [image],
+                sparse,
+                "PINHOLE",
+                shared_camera=False,
+                learned_points=(
+                    np.array([[1.0, 2.0, 3.0], [-1.0, 0.5, 2.0]]),
+                    np.array([[12, 34, 56], [100, 110, 120]], dtype=np.uint8),
+                ),
+            )
+
+            learned_rows = [
+                line for line in (sparse / "learned_points3D.txt").read_text(encoding="utf-8").splitlines()
+                if line and not line.startswith("#")
+            ]
+            self.assertEqual(len(learned_rows), 2)
+            self.assertEqual(learned_rows[0].split()[:8], ["1", "1.0", "2.0", "3.0", "12", "34", "56", "-1.0"])
+            self.assertFalse(any(
+                line and not line.startswith("#")
+                for line in (sparse / "points3D.txt").read_text(encoding="utf-8").splitlines()
+            ))
+
+    def test_depth_samples_use_confidence_and_world_pose(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            image = Path(temp_dir) / "image.png"
+            pixels = np.zeros((2, 2, 3), dtype=np.uint8)
+            pixels[0, 0] = [255, 0, 0]
+            pixels[0, 1] = [0, 255, 0]
+            pixels[1, 0] = [0, 0, 255]
+            pixels[1, 1] = [255, 255, 255]
+            Image.fromarray(pixels).save(image)
+            w2c = np.eye(4)
+            w2c[0, 3] = -10.0
+            points, colors, confidence = _sample_depth_points(
+                image,
+                np.full((2, 2), 2.0),
+                np.array([[10.0, 1.0], [9.0, 8.0]]),
+                np.array([[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]]),
+                w2c,
+                maximum_samples=4,
+                confidence_percentile=40.0,
+            )
+
+            self.assertEqual(points.shape, (2, 3))
+            self.assertTrue(np.all(points[:, 0] >= 10.0))
+            self.assertFalse(any(np.array_equal(color, [0, 255, 0]) for color in colors))
+            self.assertTrue(np.all(confidence >= 9.0))
+
+    def test_depth_fusion_merges_duplicate_voxels_and_respects_cap(self) -> None:
+        points, colors = _fuse_depth_points(
+            np.array([[0.01, 0.01, 0.01], [0.02, 0.02, 0.02], [1.0, 1.0, 1.0]]),
+            np.array([[255, 0, 0], [0, 0, 255], [0, 255, 0]], dtype=np.uint8),
+            np.array([1.0, 3.0, 2.0]),
+            maximum_points=2,
+            voxel_size=0.1,
+        )
+
+        self.assertEqual(points.shape, (2, 3))
+        merged_index = int(np.argmin(np.linalg.norm(points, axis=1)))
+        np.testing.assert_allclose(points[merged_index], [0.0175, 0.0175, 0.0175])
+        np.testing.assert_array_equal(colors[merged_index], [64, 0, 191])
 
     def test_seed_export_rejects_missing_prediction_view_instead_of_padding(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -349,131 +639,7 @@ class Da3RunTests(unittest.TestCase):
         ]))
         np.testing.assert_allclose(np.abs(quat), np.array([0.0, 1.0, 0.0, 0.0]))
 
-    def test_write_colmap_from_prediction_emits_text_schema(self) -> None:
-        with tempfile.TemporaryDirectory() as temp_dir:
-            root = Path(temp_dir)
-            images = []
-            for index in range(2):
-                path = root / f"img{index}.jpg"
-                Image.new("RGB", (16, 12), color=(index * 10, 0, 0)).save(path)
-                images.append(path)
-            prediction = {
-                "extrinsics": np.repeat(np.eye(4)[None, ...], repeats=2, axis=0),
-                "intrinsics": np.repeat(
-                    np.array([[4.0, 0.0, 2.0], [0.0, 3.0, 1.5], [0.0, 0.0, 1.0]])[None, ...],
-                    repeats=2,
-                    axis=0,
-                ),
-                "depth": np.ones((2, 4, 4), dtype=np.float32),
-                "conf": np.ones((2, 4, 4), dtype=np.float32),
-            }
-            out = root / "sparse" / "0"
-            point_count, observation_count, mean_track_length = _write_colmap_from_prediction(
-                prediction,
-                images,
-                out,
-                camera_type="PINHOLE",
-                shared_camera=True,
-                max_points=8,
-            )
-            self.assertTrue((out / "cameras.txt").exists())
-            self.assertTrue((out / "images.txt").exists())
-            self.assertTrue((out / "points3D.txt").exists())
-            cameras_txt = (out / "cameras.txt").read_text(encoding="utf-8")
-            images_txt = (out / "images.txt").read_text(encoding="utf-8")
-            points_txt = (out / "points3D.txt").read_text(encoding="utf-8")
-            self.assertIn("img0.jpg", images_txt)
-            self.assertIn("1 PINHOLE 16 12 16.0 9.0 8.0 4.5", cameras_txt)
-            self.assertEqual(point_count, 8)
-            self.assertEqual(observation_count, 16)
-            self.assertEqual(mean_track_length, 2.0)
-            self.assertIn("mean track length: 2.00", points_txt)
-            first_point = next(line for line in points_txt.splitlines() if line and not line.startswith("#"))
-            self.assertGreaterEqual(len(first_point.split()), 12)
-
-    def test_write_colmap_from_prediction_accepts_prediction_object_and_3x4_pose(self) -> None:
-        with tempfile.TemporaryDirectory() as temp_dir:
-            root = Path(temp_dir)
-            images = []
-            for index in range(2):
-                path = root / f"img{index}.jpg"
-                Image.new("RGB", (8, 8), color=(index * 10, 0, 0)).save(path)
-                images.append(path)
-            pose = np.repeat(np.eye(4, dtype=np.float32)[None, :3, :], repeats=2, axis=0)
-            pose[1, 0, 3] = 1.25
-            prediction = types.SimpleNamespace(
-                extrinsics=pose,
-                intrinsics=np.repeat(np.eye(3, dtype=np.float32)[None, ...], 2, axis=0),
-                depth=np.ones((2, 2, 2), dtype=np.float32),
-                conf=np.ones((2, 2, 2), dtype=np.float32),
-            )
-            out = root / "sparse" / "0"
-            _write_colmap_from_prediction(
-                prediction,
-                images,
-                out,
-                camera_type="PINHOLE",
-                shared_camera=False,
-                max_points=4,
-            )
-            images_txt = (out / "images.txt").read_text(encoding="utf-8")
-            self.assertIn("1.25", images_txt)
-
-    def test_write_colmap_from_prediction_rejects_short_depth_axis(self) -> None:
-        with tempfile.TemporaryDirectory() as temp_dir:
-            root = Path(temp_dir)
-            images = []
-            for index in range(2):
-                path = root / f"img{index}.jpg"
-                Image.new("RGB", (8, 8), color=(index * 10, 0, 0)).save(path)
-                images.append(path)
-            prediction = {
-                "intrinsics": np.repeat(np.eye(3, dtype=np.float32)[None, ...], 2, axis=0),
-                "depth": np.ones((1, 2, 2), dtype=np.float32),
-            }
-            with self.assertRaisesRegex(ValueError, "depth count 1 did not match image count 2"):
-                _write_colmap_from_prediction(
-                    prediction,
-                    images,
-                    root / "sparse" / "0",
-                    camera_type="PINHOLE",
-                    shared_camera=False,
-                    max_points=4,
-                )
-
-    def test_write_colmap_from_prediction_reuses_single_camera_prediction(self) -> None:
-        with tempfile.TemporaryDirectory() as temp_dir:
-            root = Path(temp_dir)
-            images = []
-            for index in range(2):
-                path = root / f"img{index}.jpg"
-                Image.new("RGB", (20, 10), color=(index * 10, 0, 0)).save(path)
-                images.append(path)
-            prediction = {
-                "extrinsics": np.eye(4, dtype=np.float32)[None, ...],
-                "intrinsics": np.array([[[5.0, 0.0, 2.5], [0.0, 2.5, 1.25], [0.0, 0.0, 1.0]]], dtype=np.float32),
-                "depth": np.ones((2, 5, 5), dtype=np.float32),
-            }
-            out = root / "sparse" / "0"
-            _write_colmap_from_prediction(
-                prediction,
-                images,
-                out,
-                camera_type="PINHOLE",
-                shared_camera=False,
-                max_points=4,
-            )
-
-            cameras = [
-                line
-                for line in (out / "cameras.txt").read_text(encoding="utf-8").splitlines()
-                if line and not line.startswith("#")
-            ]
-            self.assertEqual(len(cameras), 2)
-            self.assertTrue(cameras[0].startswith("1 PINHOLE 20 10 "))
-            self.assertTrue(cameras[1].startswith("2 PINHOLE 20 10 "))
-
-    def test_write_manifest_records_da3_shape(self) -> None:
+    def test_seed_manifest_records_complete_alignment_and_learned_points(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
             manifest = root / "da3_coverage_manifest.json"
@@ -481,39 +647,6 @@ class Da3RunTests(unittest.TestCase):
                 "--images", str(root),
                 "--out-sparse", str(root / "sparse" / "0"),
                 "--models-dir", str(root / "models"),
-                "--manifest-out", str(manifest),
-            ])
-            _write_manifest(
-                manifest,
-                args=args,
-                image_paths=[Path("a.jpg"), Path("b.jpg"), Path("c.jpg")],
-                selected_device="mps",
-                model_subdir="DA3-BASE",
-                native_colmap_export=True,
-                raw_point_count=12,
-                final_observation_count=24,
-                mean_track_length=2.0,
-            )
-            payload = json.loads(manifest.read_text(encoding="utf-8"))
-            self.assertEqual(payload["mode"], "direct")
-            self.assertEqual(payload["model_subdir"], "DA3-BASE")
-            self.assertEqual(payload["fallback_model_subdir"], "DA3-SMALL")
-            self.assertTrue(payload["native_colmap_export"])
-            self.assertEqual(payload["export_strategy"], "native_colmap")
-            self.assertEqual(payload["raw_point_sample_count"], 12)
-            self.assertEqual(payload["final_observation_count"], 24)
-            self.assertEqual(payload["mean_track_length"], 2.0)
-            self.assertEqual(payload["windows"][0]["images"], ["a.jpg", "b.jpg", "c.jpg"])
-
-    def test_seed_manifest_records_complete_alignment_without_fake_points(self) -> None:
-        with tempfile.TemporaryDirectory() as temp_dir:
-            root = Path(temp_dir)
-            manifest = root / "da3_coverage_manifest.json"
-            args = build_arg_parser().parse_args([
-                "--images", str(root),
-                "--out-sparse", str(root / "sparse" / "0"),
-                "--models-dir", str(root / "models"),
-                "--mode", "seed_refine",
                 "--input-ordering", "unordered",
                 "--window-size", "6",
                 "--window-overlap", "3",
@@ -526,8 +659,6 @@ class Da3RunTests(unittest.TestCase):
                 image_paths=image_paths,
                 selected_device="mps",
                 model_subdir="DA3-BASE",
-                native_colmap_export=False,
-                export_strategy="aligned_pose_seed",
                 registered_image_count=10,
                 alignment_evidence={
                     "batches": batches,
@@ -535,37 +666,20 @@ class Da3RunTests(unittest.TestCase):
                     "alignment_edge_count": 2,
                     "max_alignment_rmse": 0.012,
                     "alignment_complete": True,
+                    "raw_point_sample_count": 20_000,
+                    "fused_sparse_point_count": 12_000,
                 },
             )
             payload = json.loads(manifest.read_text(encoding="utf-8"))
-            self.assertEqual(payload["export_strategy"], "aligned_pose_seed")
+            self.assertEqual(payload["export_strategy"], "aligned_pose_depth_seed")
             self.assertFalse(payload["native_colmap_export"])
             self.assertEqual(payload["input_ordering"], "unordered")
             self.assertEqual(payload["anchor_image_names"], ["img0.jpg", "img2.jpg", "img5.jpg"])
             self.assertEqual(payload["alignment_edge_count"], 2)
             self.assertTrue(payload["alignment_complete"])
-            self.assertNotIn("raw_point_sample_count", payload)
-            self.assertNotIn("fused_sparse_point_count", payload)
+            self.assertEqual(payload["raw_point_sample_count"], 20_000)
+            self.assertEqual(payload["fused_sparse_point_count"], 12_000)
             self.assertNotIn("final_observation_count", payload)
-
-    def test_colmap_text_stats_reads_registered_images_and_tracks(self) -> None:
-        with tempfile.TemporaryDirectory() as temp_dir:
-            sparse = Path(temp_dir)
-            (sparse / "images.txt").write_text(
-                "# Image list\n"
-                "1 1 0 0 0 0 0 0 1 a.jpg\n"
-                "1 2 3\n"
-                "2 1 0 0 0 0 0 0 1 b.jpg\n"
-                "\n",
-                encoding="utf-8",
-            )
-            (sparse / "points3D.txt").write_text(
-                "# Points\n"
-                "1 0 0 1 128 128 128 1.0 1 0 2 0\n"
-                "2 0 0 2 128 128 128 1.0 1 1\n",
-                encoding="utf-8",
-            )
-            self.assertEqual(_colmap_text_stats(sparse), (2, 2, 3, 1.5))
 
     def test_main_forces_offline_env_and_retries_small_on_oom(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -575,7 +689,7 @@ class Da3RunTests(unittest.TestCase):
             out_sparse = root / "sparse" / "0"
             manifest = root / "da3_coverage_manifest.json"
             images.mkdir()
-            for index in range(2):
+            for index in range(4):
                 Image.new("RGB", (8, 8), color=(index * 10, 0, 0)).save(images / f"img{index}.jpg")
             for model_name in ["DA3-BASE", "DA3-SMALL"]:
                 model = models / model_name
@@ -588,13 +702,22 @@ class Da3RunTests(unittest.TestCase):
             def fake_run(args, image_paths, model_dir, selected_device, sparse_path):
                 calls.append(model_dir)
                 self.assertEqual(selected_device, "cpu")
-                self.assertEqual(len(image_paths), 2)
+                self.assertEqual(len(image_paths), 4)
                 self.assertEqual(sparse_path, out_sparse)
                 if model_dir.name == "DA3-BASE":
                     raise RuntimeError("MPS backend out of memory")
-                return 7, 14, 2.0, 2, None
+                return 4, {
+                    "batches": [list(range(4))],
+                    "anchor_indices": [0, 1, 2],
+                    "alignment_edge_count": 0,
+                    "max_alignment_rmse": 0.0,
+                    "alignment_complete": True,
+                    "input_ordering": "continuous",
+                    "raw_point_sample_count": 16,
+                    "fused_sparse_point_count": 8,
+                }
 
-            with mock.patch("easysplat_da3_sfm.run._run_da3_export", side_effect=fake_run):
+            with mock.patch("easysplat_da3_sfm.run._run_da3_model", side_effect=fake_run):
                 with mock.patch.dict(os.environ, {}, clear=True):
                     exit_code = main([
                         "--images", str(images),
@@ -609,9 +732,8 @@ class Da3RunTests(unittest.TestCase):
             payload = json.loads(manifest.read_text(encoding="utf-8"))
             self.assertEqual(payload["selected_device"], "cpu")
             self.assertEqual(payload["model_subdir"], "DA3-SMALL")
-            self.assertEqual(payload["raw_point_sample_count"], 7)
-            self.assertEqual(payload["final_observation_count"], 14)
-            self.assertEqual(payload["mean_track_length"], 2.0)
+            self.assertEqual(payload["registered_image_count"], 4)
+            self.assertEqual(payload["raw_point_sample_count"], 16)
             self.assertEqual(os.environ["HF_HUB_OFFLINE"], "1")
             self.assertEqual(os.environ["TRANSFORMERS_OFFLINE"], "1")
             self.assertEqual(os.environ["HF_HUB_DISABLE_TELEMETRY"], "1")
@@ -648,21 +770,22 @@ class Da3RunTests(unittest.TestCase):
                 sparse_path.mkdir(parents=True)
                 for name in ("cameras.txt", "images.txt", "points3D.txt"):
                     (sparse_path / name).write_text("# empty\n", encoding="utf-8")
-                return 0, 0, None, len(image_paths), {
+                return len(image_paths), {
                     "batches": [list(range(4)), [0, 1, 2, 4, 5, 6]],
                     "anchor_indices": [0, 1, 2],
                     "alignment_edge_count": 1,
                     "max_alignment_rmse": 0.0,
                     "alignment_complete": True,
+                    "raw_point_sample_count": 28,
+                    "fused_sparse_point_count": 14,
                 }
 
-            with mock.patch("easysplat_da3_sfm.run._run_da3_export", side_effect=fake_run):
+            with mock.patch("easysplat_da3_sfm.run._run_da3_model", side_effect=fake_run):
                 exit_code = main([
                     "--images", str(images),
                     "--out-sparse", str(out_sparse),
                     "--models-dir", str(models),
                     "--device", "cpu",
-                    "--mode", "seed_refine",
                     "--input-ordering", "continuous",
                     "--window-size", "4",
                     "--window-overlap", "3",
@@ -673,7 +796,7 @@ class Da3RunTests(unittest.TestCase):
             self.assertEqual(attempts, ["DA3-BASE", "DA3-SMALL"])
             payload = json.loads(manifest.read_text(encoding="utf-8"))
             self.assertEqual(payload["model_subdir"], "DA3-SMALL")
-            self.assertEqual(payload["export_strategy"], "aligned_pose_seed")
+            self.assertEqual(payload["export_strategy"], "aligned_pose_depth_seed")
 
     def test_seed_oom_restarts_every_batch_with_small_model(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -717,6 +840,7 @@ class Da3RunTests(unittest.TestCase):
                         "extrinsics": poses,
                         "intrinsics": np.repeat(np.eye(3)[None, ...], len(names), axis=0),
                         "depth": np.ones((len(names), 2, 2)),
+                        "conf": np.ones((len(names), 2, 2)),
                     }
 
             class FakeDepthAnything3:
@@ -746,7 +870,6 @@ class Da3RunTests(unittest.TestCase):
                     "--out-sparse", str(out_sparse),
                     "--models-dir", str(models),
                     "--device", "cpu",
-                    "--mode", "seed_refine",
                     "--input-ordering", "continuous",
                     "--window-size", "4",
                     "--window-overlap", "3",
@@ -757,10 +880,10 @@ class Da3RunTests(unittest.TestCase):
             self.assertEqual(loads, ["DA3-BASE", "DA3-SMALL"])
             self.assertEqual(calls["DA3-BASE"], [
                 ["img0.jpg", "img1.jpg", "img2.jpg", "img3.jpg"],
-                ["img1.jpg", "img2.jpg", "img3.jpg", "img4.jpg"],
+                ["img2.jpg", "img3.jpg", "img4.jpg", "img5.jpg"],
             ])
             self.assertEqual(calls["DA3-SMALL"][0], ["img0.jpg", "img1.jpg", "img2.jpg", "img3.jpg"])
-            self.assertEqual(len(calls["DA3-SMALL"]), 4)
+            self.assertEqual(len(calls["DA3-SMALL"]), 3)
             payload = json.loads(manifest.read_text(encoding="utf-8"))
             self.assertEqual(payload["model_subdir"], "DA3-SMALL")
             self.assertEqual(payload["registered_image_count"], 7)
@@ -771,7 +894,7 @@ class Da3RunTests(unittest.TestCase):
             images = root / "images"
             models = root / "models"
             images.mkdir()
-            for index in range(2):
+            for index in range(4):
                 Image.new("RGB", (8, 8), color=(index * 10, 0, 0)).save(images / f"img{index}.jpg")
             for model_name in ["DA3-BASE", "DA3-SMALL"]:
                 model = models / model_name
@@ -779,7 +902,7 @@ class Da3RunTests(unittest.TestCase):
                 (model / "config.json").write_text("{}", encoding="utf-8")
                 (model / "model.safetensors").write_bytes(b"0")
 
-            with mock.patch("easysplat_da3_sfm.run._run_da3_export", side_effect=RuntimeError("bad geometry")) as run_mock:
+            with mock.patch("easysplat_da3_sfm.run._run_da3_model", side_effect=RuntimeError("bad geometry")) as run_mock:
                 with self.assertRaisesRegex(RuntimeError, "bad geometry"):
                     main([
                         "--images", str(images),
@@ -789,66 +912,6 @@ class Da3RunTests(unittest.TestCase):
                     ])
 
             self.assertEqual(run_mock.call_count, 1)
-
-    def test_run_da3_export_rejects_inputs_that_need_unsafe_windowed_colmap_output(self) -> None:
-        with tempfile.TemporaryDirectory() as temp_dir:
-            root = Path(temp_dir)
-            images = []
-            for index in range(5):
-                path = root / f"img{index}.jpg"
-                Image.new("RGB", (8, 8), color=(index * 10, 0, 0)).save(path)
-                images.append(path)
-            model_dir = root / "models" / "DA3-BASE"
-            model_dir.mkdir(parents=True)
-            (model_dir / "config.json").write_text("{}", encoding="utf-8")
-            (model_dir / "model.safetensors").write_bytes(b"0")
-
-            calls: list[list[str]] = []
-
-            class FakeModel:
-                def inference(self, **kwargs):
-                    calls.append([Path(path).name for path in kwargs["image"]])
-                    count = len(kwargs["image"])
-                    return {
-                        "extrinsics": np.repeat(np.eye(4, dtype=np.float32)[None, ...], count, axis=0),
-                        "intrinsics": np.repeat(np.eye(3, dtype=np.float32)[None, ...], count, axis=0),
-                        "depth": np.ones((count, 2, 2), dtype=np.float32),
-                        "conf": np.ones((count, 2, 2), dtype=np.float32),
-                    }
-
-            class FakeDepthAnything3:
-                @staticmethod
-                def from_pretrained(path, local_files_only=False):
-                    self.assertEqual(Path(path), model_dir)
-                    self.assertTrue(local_files_only)
-                    return FakeModel()
-
-            depth_anything_module = types.ModuleType("depth_anything_3")
-            api_module = types.ModuleType("depth_anything_3.api")
-            api_module.DepthAnything3 = FakeDepthAnything3
-            args = build_arg_parser().parse_args([
-                "--images", str(root),
-                "--out-sparse", str(root / "sparse" / "0"),
-                "--models-dir", str(model_dir.parent),
-                "--window-size", "2",
-                "--window-overlap", "1",
-                "--max-points", "10",
-            ])
-
-            with mock.patch.dict(sys.modules, {
-                "depth_anything_3": depth_anything_module,
-                "depth_anything_3.api": api_module,
-            }):
-                with self.assertRaisesRegex(RuntimeError, "native COLMAP export"):
-                    _run_da3_export(
-                        args,
-                        images,
-                        model_dir,
-                        "cpu",
-                        root / "sparse" / "0",
-                    )
-
-            self.assertEqual(calls, [])
 
     def test_seed_refine_loads_one_model_and_aligns_every_selected_view(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -899,6 +962,7 @@ class Da3RunTests(unittest.TestCase):
                         "extrinsics": np.stack(poses),
                         "intrinsics": np.repeat(np.eye(3)[None, ...], len(names), axis=0),
                         "depth": np.ones((len(names), 2, 2)),
+                        "conf": np.ones((len(names), 2, 2)),
                     }
 
             class FakeDepthAnything3:
@@ -915,7 +979,6 @@ class Da3RunTests(unittest.TestCase):
                 "--images", str(root),
                 "--out-sparse", str(root / "seed" / "0"),
                 "--models-dir", str(model_dir.parent),
-                "--mode", "seed_refine",
                 "--input-ordering", "continuous",
                 "--window-size", "4",
                 "--window-overlap", "3",
@@ -925,7 +988,7 @@ class Da3RunTests(unittest.TestCase):
                 "depth_anything_3": depth_anything_module,
                 "depth_anything_3.api": api_module,
             }):
-                point_count, observations, mean_track, registered, evidence = _run_da3_export(
+                registered, evidence = _run_da3_model(
                     args,
                     images,
                     model_dir,
@@ -934,9 +997,9 @@ class Da3RunTests(unittest.TestCase):
                 )
 
             self.assertEqual(load_count, 1)
-            self.assertEqual(len(inference_calls), 4)
-            self.assertEqual((point_count, observations, mean_track, registered), (0, 0, None, 7))
-            self.assertEqual(evidence["alignment_edge_count"], 3)
+            self.assertEqual(len(inference_calls), 3)
+            self.assertEqual(registered, 7)
+            self.assertEqual(evidence["alignment_edge_count"], 2)
             self.assertTrue(evidence["alignment_complete"])
             self.assertLess(evidence["max_alignment_rmse"], 1e-8)
             image_lines = [
@@ -984,6 +1047,7 @@ class Da3RunTests(unittest.TestCase):
                         "extrinsics": poses,
                         "intrinsics": intrinsics,
                         "depth": np.ones((count, 2, 2)),
+                        "conf": np.ones((count, 2, 2)),
                     }
 
             class FakeDepthAnything3:
@@ -998,7 +1062,6 @@ class Da3RunTests(unittest.TestCase):
                 "--images", str(root),
                 "--out-sparse", str(root / "seed" / "0"),
                 "--models-dir", str(model_dir.parent),
-                "--mode", "seed_refine",
                 "--input-ordering", "continuous",
                 "--window-size", "4",
                 "--window-overlap", "3",
@@ -1007,7 +1070,7 @@ class Da3RunTests(unittest.TestCase):
                 "depth_anything_3": depth_anything_module,
                 "depth_anything_3.api": api_module,
             }):
-                result = _run_da3_export(args, images, model_dir, "cpu", root / "seed" / "0")
+                result = _run_da3_model(args, images, model_dir, "cpu", root / "seed" / "0")
 
             self.assertEqual(len(captured_kwargs), 1)
             self.assertNotIn("export_dir", captured_kwargs[0])
@@ -1055,7 +1118,6 @@ class Da3RunTests(unittest.TestCase):
                 "--images", str(root),
                 "--out-sparse", str(root / "seed" / "0"),
                 "--models-dir", str(model_dir.parent),
-                "--mode", "seed_refine",
                 "--input-ordering", "continuous",
                 "--window-size", "4",
                 "--window-overlap", "3",
@@ -1065,13 +1127,13 @@ class Da3RunTests(unittest.TestCase):
                 "depth_anything_3.api": api_module,
             }):
                 with self.assertRaisesRegex(ValueError, "pose count 3 did not match image count 4"):
-                    _run_da3_export(args, images, model_dir, "cpu", root / "seed" / "0")
+                    _run_da3_model(args, images, model_dir, "cpu", root / "seed" / "0")
 
-    def test_run_da3_export_moves_model_to_selected_device(self) -> None:
+    def test_run_da3_model_moves_model_to_selected_device(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
             images = []
-            for index in range(2):
+            for index in range(4):
                 path = root / f"img{index}.jpg"
                 Image.new("RGB", (8, 8), color=(index * 10, 0, 0)).save(path)
                 images.append(path)
@@ -1087,11 +1149,18 @@ class Da3RunTests(unittest.TestCase):
                     return self
 
                 def inference(self, **kwargs):
+                    poses = np.repeat(np.eye(4, dtype=np.float32)[None, ...], 4, axis=0)
+                    poses[:, :3, 3] = -np.array([
+                        [0.0, 0.0, 0.0],
+                        [1.0, 0.0, 0.0],
+                        [0.0, 1.0, 0.0],
+                        [1.0, 1.0, 0.0],
+                    ])
                     return types.SimpleNamespace(
-                        extrinsics=np.repeat(np.eye(4, dtype=np.float32)[None, ...], 2, axis=0),
-                        intrinsics=np.repeat(np.eye(3, dtype=np.float32)[None, ...], 2, axis=0),
-                        depth=np.ones((2, 2, 2), dtype=np.float32),
-                        conf=np.ones((2, 2, 2), dtype=np.float32),
+                        extrinsics=poses,
+                        intrinsics=np.repeat(np.eye(3, dtype=np.float32)[None, ...], 4, axis=0),
+                        depth=np.ones((4, 2, 2), dtype=np.float32),
+                        conf=np.ones((4, 2, 2), dtype=np.float32),
                     )
 
             class FakeDepthAnything3:
@@ -1112,101 +1181,10 @@ class Da3RunTests(unittest.TestCase):
                 "depth_anything_3": depth_anything_module,
                 "depth_anything_3.api": api_module,
             }):
-                with self.assertRaisesRegex(RuntimeError, "native COLMAP export"):
-                    _run_da3_export(args, images, model_dir, "mps", root / "sparse" / "0")
+                registered, _ = _run_da3_model(args, images, model_dir, "mps", root / "sparse" / "0")
 
             self.assertEqual(devices, ["mps"])
-
-    def test_run_da3_export_uses_native_colmap_stats(self) -> None:
-        with tempfile.TemporaryDirectory() as temp_dir:
-            root = Path(temp_dir)
-            images = []
-            for index in range(2):
-                path = root / f"img{index}.jpg"
-                Image.new("RGB", (8, 8), color=(index * 10, 0, 0)).save(path)
-                images.append(path)
-            model_dir = root / "models" / "DA3-BASE"
-            model_dir.mkdir(parents=True)
-            (model_dir / "config.json").write_text("{}", encoding="utf-8")
-            (model_dir / "model.safetensors").write_bytes(b"0")
-
-            class FakeModel:
-                def inference(self, **kwargs):
-                    if kwargs.get("export_format") != "colmap" or "export_dir" not in kwargs:
-                        raise AssertionError("direct mode must request native COLMAP export")
-                    sparse = Path(kwargs["export_dir"])
-                    sparse.mkdir(parents=True)
-                    (sparse / "cameras.txt").write_text("1 PINHOLE 8 8 1 1 4 4\n", encoding="utf-8")
-                    (sparse / "images.txt").write_text(
-                        "1 1 0 0 0 0 0 0 1 img0.jpg\n\n",
-                        encoding="utf-8",
-                    )
-                    (sparse / "points3D.txt").write_text(
-                        "1 0 0 1 128 128 128 1.0 1 0\n",
-                        encoding="utf-8",
-                    )
-                    return types.SimpleNamespace()
-
-            class FakeDepthAnything3:
-                @staticmethod
-                def from_pretrained(path, local_files_only=False):
-                    return FakeModel()
-
-            depth_anything_module = types.ModuleType("depth_anything_3")
-            api_module = types.ModuleType("depth_anything_3.api")
-            api_module.DepthAnything3 = FakeDepthAnything3
-            args = build_arg_parser().parse_args([
-                "--images", str(root),
-                "--out-sparse", str(root / "sparse" / "0"),
-                "--models-dir", str(model_dir.parent),
-            ])
-
-            with mock.patch.dict(sys.modules, {
-                "depth_anything_3": depth_anything_module,
-                "depth_anything_3.api": api_module,
-            }):
-                point_count, observation_count, mean_track_length, registered_count, evidence = _run_da3_export(
-                    args,
-                    images,
-                    model_dir,
-                    "cpu",
-                    root / "sparse" / "0",
-                )
-
-            self.assertEqual(point_count, 1)
-            self.assertEqual(observation_count, 1)
-            self.assertEqual(mean_track_length, 1.0)
-            self.assertEqual(registered_count, 1)
-            self.assertIsNone(evidence)
-
-    def test_write_manifest_keeps_counts_in_sync_with_sparse_output(self) -> None:
-        with tempfile.TemporaryDirectory() as temp_dir:
-            root = Path(temp_dir)
-            manifest = root / "da3_coverage_manifest.json"
-            args = build_arg_parser().parse_args([
-                "--images", str(root),
-                "--out-sparse", str(root / "sparse" / "0"),
-                "--models-dir", str(root / "models"),
-                "--max-points", "2",
-                "--manifest-out", str(manifest),
-            ])
-            _write_manifest(
-                manifest,
-                args=args,
-                image_paths=[Path("a.jpg"), Path("b.jpg")],
-                selected_device="mps",
-                model_subdir="DA3-BASE",
-                native_colmap_export=True,
-                raw_point_count=5,
-                final_observation_count=9,
-                mean_track_length=1.8,
-            )
-
-            payload = json.loads(manifest.read_text(encoding="utf-8"))
-            self.assertEqual(payload["raw_point_sample_count"], 5)
-            self.assertEqual(payload["fused_sparse_point_count"], 5)
-            self.assertEqual(payload["final_observation_count"], 9)
-
+            self.assertEqual(registered, 4)
 
 if __name__ == "__main__":
     unittest.main()

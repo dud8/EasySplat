@@ -4,26 +4,26 @@ import Foundation
 import Metal
 #endif
 
-struct HardwareProfile: Sendable {
-    enum Tier: String, Sendable {
+public struct HardwareProfile: Sendable {
+    public enum Tier: String, Sendable {
         case low = "Low"
         case mid = "Mid"
         case high = "High"
     }
 
-    let memoryGB: Double
-    let cpuCount: Int
-    let gpuWorkingSetGB: Double?
-    let tier: Tier
+    public let memoryGB: Double
+    public let cpuCount: Int
+    public let gpuWorkingSetGB: Double?
+    public let tier: Tier
 
-    init(memoryGB: Double, cpuCount: Int, gpuWorkingSetGB: Double?) {
+    public init(memoryGB: Double, cpuCount: Int, gpuWorkingSetGB: Double?) {
         self.memoryGB = memoryGB
         self.cpuCount = cpuCount
         self.gpuWorkingSetGB = gpuWorkingSetGB
         self.tier = HardwareProfile.tier(for: memoryGB)
     }
 
-    static func detect() -> HardwareProfile {
+    public static func detect() -> HardwareProfile {
         let memoryBytes = ProcessInfo.processInfo.physicalMemory
         let memoryGB = Double(memoryBytes) / 1_073_741_824.0
         let cpuCount = ProcessInfo.processInfo.activeProcessorCount

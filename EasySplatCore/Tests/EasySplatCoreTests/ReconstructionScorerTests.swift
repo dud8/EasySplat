@@ -63,7 +63,7 @@ final class ReconstructionScorerTests: XCTestCase {
             observationCount: 30_000,
             meanTrackLength: 3.0
         )
-        XCTAssertTrue(ReconstructionScorer.isAcceptable(score, mode: .object))
+        XCTAssertTrue(ReconstructionScorer.isAcceptable(score, capturePath: .orbit))
         let low = ReconstructionScore(
             registeredImages: 40,
             totalImages: 100,
@@ -72,7 +72,7 @@ final class ReconstructionScorerTests: XCTestCase {
             observationCount: 30_000,
             meanTrackLength: 3.0
         )
-        XCTAssertFalse(ReconstructionScorer.isAcceptable(low, mode: .object))
+        XCTAssertFalse(ReconstructionScorer.isAcceptable(low, capturePath: .orbit))
     }
 
     func testCapturePathThresholdsDoNotTreatAutomaticAsAnObjectOrbit() {
@@ -100,7 +100,7 @@ final class ReconstructionScorerTests: XCTestCase {
             observationCount: 0,
             meanTrackLength: 0.0
         )
-        XCTAssertFalse(ReconstructionScorer.isAcceptable(score, mode: .object))
+        XCTAssertFalse(ReconstructionScorer.isAcceptable(score, capturePath: .orbit))
     }
 
     func testExpectedTotalImagesKeepsPartialSparseModelsFromPassing() {
@@ -120,7 +120,7 @@ final class ReconstructionScorerTests: XCTestCase {
 
         XCTAssertEqual(adjusted.registeredImages, 5)
         XCTAssertEqual(adjusted.totalImages, 60)
-        XCTAssertFalse(ReconstructionScorer.isAcceptable(adjusted, mode: .object))
+        XCTAssertFalse(ReconstructionScorer.isAcceptable(adjusted, capturePath: .orbit))
     }
 
     func testParseSparseTextModelCountsFeedForwardOutputWithoutTracks() throws {

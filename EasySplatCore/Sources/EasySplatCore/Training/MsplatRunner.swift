@@ -43,6 +43,7 @@ public struct MsplatTrainingResult: Sendable, Equatable {
     public let stopReason: MsplatStopReason
     public let gaussianCount: Int
     public let elapsedSeconds: Double
+    public let peakMemoryBytes: Int64
     public let outputBytes: Int64
     public let inputDigest: String
     public let geometryDigest: String
@@ -253,6 +254,7 @@ private struct MsplatNativeEvent: Decodable {
     let cameraCount: Int?
     let initialGaussianCount: Int?
     let gaussianCount: Int?
+    let peakMemoryBytes: Int64?
     let elapsedSeconds: Double?
     let iterationsPerSecond: Double?
     let etaSeconds: Double?
@@ -286,6 +288,7 @@ private struct MsplatNativeEvent: Decodable {
         case cameraCount = "camera_count"
         case initialGaussianCount = "initial_gaussian_count"
         case gaussianCount = "gaussian_count"
+        case peakMemoryBytes = "peak_memory_bytes"
         case elapsedSeconds = "elapsed_seconds"
         case iterationsPerSecond = "iterations_per_second"
         case etaSeconds = "eta_seconds"
@@ -325,6 +328,7 @@ private final class MsplatEventStream: @unchecked Sendable {
     private var inputDigest = ""
     private var geometryDigest = ""
     private var trainerBuildDigest = ""
+    private var lastPeakMemoryBytes: Int64 = 0
     private var latestCheckpoint: MsplatCheckpointReceipt?
     private var lineCount = 0
     private var failure: Error?
@@ -514,6 +518,10 @@ private final class MsplatEventStream: @unchecked Sendable {
                     throw MsplatEventProtocolError("checkpoint iterations are not strictly increasing")
                 }
             }
+            guard receipt.peakMemoryBytes >= lastPeakMemoryBytes else {
+                throw MsplatEventProtocolError("checkpoint peak memory decreased")
+            }
+            lastPeakMemoryBytes = receipt.peakMemoryBytes
             latestCheckpoint = receipt
             return AcceptedEffect(checkpoint: receipt)
         case "progress":
@@ -600,6 +608,7 @@ private final class MsplatEventStream: @unchecked Sendable {
                   let iteration = event.iteration,
                   let gaussianCount = event.gaussianCount,
                   let elapsed = event.elapsedSeconds,
+                  let peakMemoryBytes = event.peakMemoryBytes,
                   let outputBytes = event.outputBytes,
                   let rawStopReason = event.stopReason,
                   let stopReason = MsplatStopReason(rawValue: rawStopReason),
@@ -608,6 +617,8 @@ private final class MsplatEventStream: @unchecked Sendable {
                   iteration <= contract.iterationLimit,
                   gaussianCount > 0,
                   finiteNonNegative(elapsed),
+                  peakMemoryBytes > 0,
+                  peakMemoryBytes >= lastPeakMemoryBytes,
                   outputBytes > 0 else {
                 throw MsplatEventProtocolError("event completed record is invalid")
             }
@@ -631,6 +642,7 @@ private final class MsplatEventStream: @unchecked Sendable {
                 stopReason: stopReason,
                 gaussianCount: gaussianCount,
                 elapsedSeconds: elapsed,
+                peakMemoryBytes: peakMemoryBytes,
                 outputBytes: outputBytes,
                 inputDigest: inputDigest,
                 geometryDigest: geometryDigest,
@@ -655,6 +667,8 @@ private final class MsplatEventStream: @unchecked Sendable {
               payloadBytes > 0,
               let gaussianCount = event.gaussianCount,
               gaussianCount > 0,
+              let peakMemoryBytes = event.peakMemoryBytes,
+              peakMemoryBytes > 0,
               event.version == "1.1.3 (git 106499b)",
               event.profile == contract.argument,
               event.seed == seed,
@@ -669,6 +683,7 @@ private final class MsplatEventStream: @unchecked Sendable {
             payloadSHA256: payloadSHA256,
             payloadBytes: payloadBytes,
             gaussianCount: gaussianCount,
+            peakMemoryBytes: peakMemoryBytes,
             inputDigest: inputDigest,
             geometryDigest: geometryDigest,
             trainerBuildDigest: trainerBuildDigest

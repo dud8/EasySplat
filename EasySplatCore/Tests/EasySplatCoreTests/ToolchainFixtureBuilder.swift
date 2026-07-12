@@ -5,8 +5,6 @@ import Foundation
 struct ToolchainFixture {
     let root: URL
     let colmap: URL
-    let libcrypto: URL
-    let libssl: URL
     let da3Root: URL
     let da3SfmTool: URL
     let da3Python: URL
@@ -36,6 +34,9 @@ enum ToolchainFixtureBuilder {
         let lib = root.appendingPathComponent("lib", isDirectory: true)
         try fm.createDirectory(at: bin, withIntermediateDirectories: true)
         try fm.createDirectory(at: lib, withIntermediateDirectories: true)
+        let supplyChain = root.appendingPathComponent("supply-chain", isDirectory: true)
+        try fm.createDirectory(at: supplyChain, withIntermediateDirectories: true)
+        try Data("{}".utf8).write(to: supplyChain.appendingPathComponent("components.json"))
 
         func writeExecutable(_ url: URL, script: String?) throws {
             if let script {
@@ -48,11 +49,23 @@ enum ToolchainFixtureBuilder {
 
         let colmap = bin.appendingPathComponent("colmap")
         try writeExecutable(colmap, script: "#!/usr/bin/env bash\nexit 0\n")
+        let colmapProvenance = root.appendingPathComponent("provenance/colmap.json")
+        try fm.createDirectory(
+            at: colmapProvenance.deletingLastPathComponent(),
+            withIntermediateDirectories: true
+        )
+        let colmapExecutableSHA256 = SHA256.hash(data: try Data(contentsOf: colmap))
+            .map { String(format: "%02x", $0) }
+            .joined()
+        try """
+        {
+          "toolchain_name": "colmap",
+          "source_version": "3.13.0",
+          "source_commit": "fa7280fee27f97aff31ae7f98bab7f583fac7d08",
+          "executable_sha256": "\(colmapExecutableSHA256)"
+        }
+        """.write(to: colmapProvenance, atomically: true, encoding: .utf8)
 
-        let libcrypto = lib.appendingPathComponent("libcrypto.3.dylib")
-        let libssl = lib.appendingPathComponent("libssl.3.dylib")
-        fm.createFile(atPath: libcrypto.path, contents: Data())
-        fm.createFile(atPath: libssl.path, contents: Data())
 
         if includeMsplat {
             let msplat = bin.appendingPathComponent("easysplat-train")
@@ -137,7 +150,12 @@ enum ToolchainFixtureBuilder {
         try """
         {
           "toolchain_name": "da3_mps",
+          "source_repo": "https://github.com/ByteDance-Seed/Depth-Anything-3.git",
+          "source_ref": "test-fixture",
+          "source_commit": "a0b8a92e3d1532361c2f7feb63babc5c18d00ef2",
           "source_path": "fixture",
+          "base_checkpoint_commit": "0123456789abcdef0123456789abcdef01234567",
+          "small_checkpoint_commit": "89abcdef0123456789abcdef0123456789abcdef",
           "python_version": "3.13.11",
           "torch_version": "2.10.0",
           "torchvision_version": "0.25.0"
@@ -149,12 +167,12 @@ enum ToolchainFixtureBuilder {
         if includeDa3Model {
             fm.createFile(atPath: da3ModelFile.path, contents: Data([0x00]))
             try "{}\n".write(to: da3ConfigFile, atomically: true, encoding: .utf8)
-            try #"{"repo_id":"depth-anything/DA3-BASE","resolved_sha":"fixture","license":"apache-2.0"}"#.write(to: da3ModelInfoFile, atomically: true, encoding: .utf8)
+            try #"{"repo_id":"depth-anything/DA3-BASE","requested_revision":"fixture-revision","resolved_sha":"0123456789abcdef0123456789abcdef01234567","license":"apache-2.0"}"#.write(to: da3ModelInfoFile, atomically: true, encoding: .utf8)
         }
         if includeDa3FallbackModel {
             fm.createFile(atPath: da3FallbackModelFile.path, contents: Data([0x00]))
             try "{}\n".write(to: da3FallbackConfigFile, atomically: true, encoding: .utf8)
-            try #"{"repo_id":"depth-anything/DA3-SMALL","resolved_sha":"fixture","license":"apache-2.0"}"#.write(to: da3FallbackModelInfoFile, atomically: true, encoding: .utf8)
+            try #"{"repo_id":"depth-anything/DA3-SMALL","requested_revision":"fixture-revision","resolved_sha":"89abcdef0123456789abcdef0123456789abcdef","license":"apache-2.0"}"#.write(to: da3FallbackModelInfoFile, atomically: true, encoding: .utf8)
         }
         if includeDa3VendorSentinel {
             fm.createFile(atPath: da3VendorSentinel.path, contents: Data([0x00]))
@@ -163,8 +181,6 @@ enum ToolchainFixtureBuilder {
         return ToolchainFixture(
             root: root,
             colmap: colmap,
-            libcrypto: libcrypto,
-            libssl: libssl,
             da3Root: da3Root,
             da3SfmTool: da3SfmTool,
             da3Python: da3Python,

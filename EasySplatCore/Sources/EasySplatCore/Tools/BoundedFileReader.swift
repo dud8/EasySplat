@@ -1,7 +1,7 @@
 import Darwin
 import Foundation
 
-enum BoundedFileReader {
+public enum BoundedFileReader {
     static func isMissingFileError(_ error: Error) -> Bool {
         guard let error = error as? BoundedFileReadError,
               case .cannotOpen(_, let code) = error else {
@@ -21,6 +21,7 @@ enum BoundedFileReader {
         var metadata = stat()
         guard fstat(descriptor, &metadata) == 0,
               (metadata.st_mode & S_IFMT) == S_IFREG,
+              metadata.st_nlink == 1,
               metadata.st_size >= 0,
               metadata.st_size <= off_t(maximumBytes) else {
             throw BoundedFileReadError.notBoundedRegularFile(url.lastPathComponent)
@@ -48,11 +49,69 @@ enum BoundedFileReader {
 
         var finalMetadata = stat()
         guard fstat(descriptor, &finalMetadata) == 0,
+              (finalMetadata.st_mode & S_IFMT) == S_IFREG,
+              finalMetadata.st_nlink == 1,
               finalMetadata.st_size == initialSize,
               data.count == Int(initialSize) else {
             throw BoundedFileReadError.changedDuringRead(url.lastPathComponent)
         }
         return data
+    }
+
+    public static func readRegularFileTail(
+        at url: URL,
+        maximumBytes: Int
+    ) throws -> (data: Data, startsAtFileBeginning: Bool) {
+        guard maximumBytes >= 0 else { throw BoundedFileReadError.invalidLimit }
+        let descriptor = Darwin.open(
+            url.path,
+            O_RDONLY | O_NONBLOCK | O_NOFOLLOW | O_CLOEXEC
+        )
+        guard descriptor >= 0 else {
+            throw BoundedFileReadError.cannotOpen(url.lastPathComponent, errno)
+        }
+        defer { Darwin.close(descriptor) }
+
+        var metadata = stat()
+        guard fstat(descriptor, &metadata) == 0,
+              (metadata.st_mode & S_IFMT) == S_IFREG,
+              metadata.st_nlink == 1,
+              metadata.st_size >= 0 else {
+            throw BoundedFileReadError.notBoundedRegularFile(url.lastPathComponent)
+        }
+
+        let initialSize = metadata.st_size
+        let readLength = min(initialSize, off_t(maximumBytes))
+        let offset = initialSize - readLength
+        var data = Data(count: Int(readLength))
+        var bytesRead = 0
+        while bytesRead < data.count {
+            let count = data.withUnsafeMutableBytes { bytes in
+                Darwin.pread(
+                    descriptor,
+                    bytes.baseAddress?.advanced(by: bytesRead),
+                    bytes.count - bytesRead,
+                    offset + off_t(bytesRead)
+                )
+            }
+            if count < 0 && errno == EINTR { continue }
+            guard count > 0 else {
+                if count < 0 {
+                    throw BoundedFileReadError.cannotRead(url.lastPathComponent, errno)
+                }
+                throw BoundedFileReadError.changedDuringRead(url.lastPathComponent)
+            }
+            bytesRead += count
+        }
+
+        var finalMetadata = stat()
+        guard fstat(descriptor, &finalMetadata) == 0,
+              (finalMetadata.st_mode & S_IFMT) == S_IFREG,
+              finalMetadata.st_nlink == 1,
+              finalMetadata.st_size == initialSize else {
+            throw BoundedFileReadError.changedDuringRead(url.lastPathComponent)
+        }
+        return (data, offset == 0)
     }
 }
 

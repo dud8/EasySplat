@@ -11,6 +11,7 @@ extension PipelineRunner {
         case geometryRegisteredImagesMismatch
         case geometryResidualsUnavailable(String)
         case geometryResidualsTooHigh(median: Double, p90: Double)
+        case geometryProvenanceUnavailable(String)
         case photoSelectionExceedsBudget(selected: Int, maximum: Int)
         case imageTranscodeFailed(String)
         case outputMissing
@@ -39,7 +40,8 @@ extension PipelineRunner {
 
     func removeIfExists(_ url: URL) {
         let fm = FileManager.default
-        if fm.fileExists(atPath: url.path) {
+        let isSymlink = (try? fm.destinationOfSymbolicLink(atPath: url.path)) != nil
+        if fm.fileExists(atPath: url.path) || isSymlink {
             try? fm.removeItem(at: url)
         }
     }
@@ -87,18 +89,17 @@ extension PipelineRunner {
                 return ("No usable photos or video frames were found.", String(reflecting: pipelineError))
             case let .insufficientInputImages(actual):
                 return ("At least two usable photos or video frames are required.", "Insufficient input images after selection: \(actual).")
-            case let .lowQualityReconstruction(score, mapper):
-                let summary = mapper.map { ReconstructionScorer.summary(score, mapper: $0) }
-                    ?? ReconstructionScorer.summary(score)
-                return ("I couldn't get a stable camera solve. Try a slower capture and more light.", "Low-quality reconstruction. \(summary).")
+            case let .lowQualityReconstruction(score, _):
+                let summary = ReconstructionScorer.summary(score)
+                return ("The camera solve was unstable. Try a slower capture with more light.", "Low-quality reconstruction. \(summary).")
             case let .geometryCoverageTooLow(registered, total):
                 return (
-                    "I couldn't connect enough of the capture. Try again with more overlap.",
+                    "The capture did not have enough connected overlap. Try again with more overlap.",
                     "Canonical model registered \(registered) of \(total) selected views; at least 90% is required."
                 )
             case let .geometryResidualCoverageTooLow(measured, total):
                 return (
-                    "I couldn't verify enough of the capture. Try again with more overlap.",
+                    "Not enough of the capture could be verified. Try again with more overlap.",
                     "Only \(measured) of \(total) selected views contributed measurable tracks; at least 90% is required."
                 )
             case .geometryRegisteredImagesMismatch:
@@ -108,7 +109,7 @@ extension PipelineRunner {
                 )
             case let .geometryResidualsUnavailable(reason):
                 return (
-                    "I couldn't verify the camera solve. Try a slower capture with more overlap.",
+                    "The camera solve could not be verified. Try a slower capture with more overlap.",
                     "Real pixel residuals were unavailable: \(reason)"
                 )
             case let .geometryResidualsTooHigh(median, p90):
@@ -116,9 +117,14 @@ extension PipelineRunner {
                     "The camera solve was not stable enough. Try a slower capture with more overlap.",
                     String(format: "Measured pixel residuals exceeded the gate: median %.3f px, p90 %.3f px.", median, p90)
                 )
+            case let .geometryProvenanceUnavailable(reason):
+                return (
+                    "The installed reconstruction tools could not be verified. Reinstall the required tools.",
+                    "Geometry provenance was unavailable: \(reason)"
+                )
             case let .photoSelectionExceedsBudget(selected, maximum):
                 return (
-                    "Use all valid photos exceeds this Mac's safe plan. Choose Automatic selection or Conserve Memory.",
+                    "Use all valid photos exceeds this Mac's safe plan. Choose Automatic selection.",
                     "Use all valid photos requested \(selected) photos; the resolved safe limit is \(maximum)."
                 )
             case let .imageTranscodeFailed(message):
@@ -127,6 +133,12 @@ extension PipelineRunner {
                 return ("Processing failed. Expected outputs were missing.", String(reflecting: pipelineError))
             }
         }
+        if case ColmapPairPlanningError.disconnectedGraph = error {
+            return (
+                "The capture did not have enough connected overlap. Try again with more overlap.",
+                "The bounded image-retrieval graph was disconnected before COLMAP matching."
+            )
+        }
         if let subprocessFailure = error as? SubprocessFailure {
             return ("Processing failed. Check details for more info.", subprocessFailure.debugDescription)
         }
@@ -134,7 +146,7 @@ extension PipelineRunner {
             let debug = debugDescription(for: colmapError)
             switch colmapError {
             case let .failed(_, exitCode, reason, _, _) where reason == .uncaughtSignal && exitCode == 10:
-                return ("COLMAP crashed while matching images. Try fewer frames or a lower quality preset.", debug)
+                return ("Image matching stopped. Try fewer frames or Fast detail.", debug)
             default:
                 return ("Processing failed. Check details for more info.", debug)
             }
@@ -236,7 +248,7 @@ extension PipelineRunner {
             }
             if let photosFolder = metadata.input.photosFolder {
                 let name = URL(fileURLWithPath: photosFolder).lastPathComponent
-                let dest = paths.originalsURL.appendingPathComponent(name, isDirectory: true)
+                let dest = paths.importedPhotosURL
                 guard fm.fileExists(atPath: dest.path) else { return .missing }
                 let photos = try loadPhotos(in: dest)
                 if photos.isEmpty {
@@ -299,12 +311,6 @@ extension PipelineRunner {
             let sparseZero = paths.colmapSparseURL.appendingPathComponent("0", isDirectory: true)
             guard sparseModelFilesExist(at: sparseZero) else { return .missing }
             let textStats = colmapSparseTextStats(at: sparseZero)
-            // Old VGGT projects could finish geometry with points but no text tracks.
-            // Reuse that model only when geometry was durably completed and interruption
-            // happened in a later stage. An sfmMapping checkpoint must run new geometry.
-            let legacyCompletedTracklessModel = metadata.completedSfmMapping?.mapper.lowercased() == "vggt"
-                && metadata.state.stage != .sfmMapping
-                && metadata.checkpoint?.stage != .sfmMapping
             for name in ["cameras.bin", "images.bin", "points3D.bin", "cameras.txt", "images.txt", "points3D.txt"] {
                 let fileURL = sparseZero.appendingPathComponent(name)
                 if !fm.fileExists(atPath: fileURL.path) { continue }
@@ -318,10 +324,8 @@ extension PipelineRunner {
                 guard (textStats.pointCount ?? 0) > 0 else {
                     return .corrupt(reason: "points3D.txt has no sparse points")
                 }
-                if !legacyCompletedTracklessModel {
-                    guard (textStats.observationCount ?? 0) > 0 else {
-                        return .corrupt(reason: "points3D.txt has no observations")
-                    }
+                guard (textStats.observationCount ?? 0) > 0 else {
+                    return .corrupt(reason: "points3D.txt has no observations")
                 }
             }
             let imagesTxt = sparseZero.appendingPathComponent("images.txt")
@@ -341,9 +345,19 @@ extension PipelineRunner {
                     return .corrupt(reason: "images.bin appears truncated")
                 }
             }
-            let da3Issues = da3DirectSparseValidationIssues(paths: paths, textStats: textStats)
-            if !da3Issues.isEmpty {
-                return .corrupt(reason: "DA3 sparse manifest is invalid: \(da3Issues.joined(separator: "; "))")
+            guard let metadataArtifact = metadata.geometryArtifact else {
+                return .missing
+            }
+            do {
+                let storedArtifact = try GeometryArtifactStore.load(
+                    from: paths.geometryManifestURL,
+                    projectPaths: paths
+                )
+                guard storedArtifact == metadataArtifact else {
+                    return .corrupt(reason: "geometry manifest does not match project metadata")
+                }
+            } catch {
+                return .corrupt(reason: error.localizedDescription)
             }
             return .valid
         case .trainSplat:
@@ -352,6 +366,14 @@ extension PipelineRunner {
                 case .checkpointed:
                     return .missing
                 case .completed:
+                    do {
+                        try TrainingArtifactStore.validateArtifact(
+                            artifact,
+                            projectPaths: paths
+                        )
+                    } catch {
+                        return .corrupt(reason: error.localizedDescription)
+                    }
                     guard artifact.detailProfile == metadata.effectiveDetailProfile else {
                         return .corrupt(
                             reason: "completed training profile does not match the requested detail"
@@ -454,137 +476,6 @@ extension PipelineRunner {
             && String(parts[9]).rangeOfCharacter(from: .letters) != nil
     }
 
-    func da3DirectSparseValidationIssues(
-        paths: ProjectPaths,
-        textStats: ColmapSparseTextStats
-    ) -> [String] {
-        let fm = FileManager.default
-        let databaseExists = fm.fileExists(atPath: paths.colmapDatabaseURL.path)
-        let databaseSize = (try? fm.attributesOfItem(atPath: paths.colmapDatabaseURL.path)[.size] as? NSNumber)?.int64Value ?? 0
-        guard fm.fileExists(atPath: paths.da3CoverageManifestURL.path) else {
-            if databaseExists, databaseSize <= 0 {
-                return ["DA3 coverage manifest was missing for zero-byte direct sparse database marker"]
-            }
-            return []
-        }
-        guard databaseSize <= 0 else {
-            return []
-        }
-
-        let selectedImageNames: [String]
-        do {
-            selectedImageNames = try loadImages(in: paths.framesSelectedURL).map(\.lastPathComponent)
-        } catch {
-            return ["selected images could not be loaded for DA3 manifest validation (\(error.localizedDescription))"]
-        }
-        let manifest: Da3CoverageManifest
-        do {
-            manifest = try Da3CoverageManifest.load(from: paths.da3CoverageManifestURL)
-        } catch {
-            return ["manifest could not be decoded (\(error.localizedDescription))"]
-        }
-
-        var issues = manifest.validationIssues(
-            expectedMode: .direct,
-            selectedImageNames: selectedImageNames
-        )
-        if textStats.registeredImageCount == nil {
-            issues.append("images.txt was missing from DA3 direct sparse output")
-        }
-        if textStats.pointCount == nil {
-            issues.append("points3D.txt was missing from DA3 direct sparse output")
-        }
-        if let registeredImageCount = textStats.registeredImageCount,
-           let manifestRegistered = manifest.registeredImageCount,
-           registeredImageCount != manifestRegistered {
-            issues.append("registered_image_count \(manifestRegistered) did not match images.txt \(registeredImageCount)")
-        }
-        if let pointCount = textStats.pointCount,
-           let manifestPoints = manifest.fusedSparsePointCount,
-           pointCount != manifestPoints {
-            issues.append("fused_sparse_point_count \(manifestPoints) did not match points3D.txt \(pointCount)")
-        }
-        if let observationCount = textStats.observationCount,
-           let manifestObservations = manifest.finalObservationCount,
-           observationCount != manifestObservations {
-            issues.append("final_observation_count \(manifestObservations) did not match points3D.txt observations \(observationCount)")
-        }
-        if let meanTrackLength = textStats.meanTrackLength,
-           let manifestMeanTrackLength = manifest.meanTrackLength,
-           abs(meanTrackLength - manifestMeanTrackLength) > 0.01 {
-            issues.append(String(
-                format: "mean_track_length %.2f did not match points3D.txt %.2f",
-                manifestMeanTrackLength,
-                meanTrackLength
-            ))
-        }
-        issues.append(contentsOf: da3SparseTextTrackIssues(paths: paths))
-        return issues
-    }
-
-    private func da3SparseTextTrackIssues(paths: ProjectPaths) -> [String] {
-        let sparseZero = paths.colmapSparseURL.appendingPathComponent("0", isDirectory: true)
-        let imagesTxt = sparseZero.appendingPathComponent("images.txt")
-        let pointsTxt = sparseZero.appendingPathComponent("points3D.txt")
-        guard let imagesText = try? String(contentsOf: imagesTxt, encoding: .utf8),
-              let pointsText = try? String(contentsOf: pointsTxt, encoding: .utf8) else {
-            return []
-        }
-
-        var imageObservationCounts: [Int: Int] = [:]
-        let imageLines = imagesText.components(separatedBy: .newlines)
-        var index = 0
-        while index < imageLines.count {
-            let poseLine = imageLines[index]
-            guard isColmapImagePoseRow(poseLine) else {
-                index += 1
-                continue
-            }
-            let poseParts = poseLine.split(maxSplits: 9, whereSeparator: { $0 == " " || $0 == "\t" })
-            guard let imageID = Int(poseParts[0]) else {
-                index += 1
-                continue
-            }
-            let pointsLine = index + 1 < imageLines.count ? imageLines[index + 1] : ""
-            let pointParts = pointsLine.split(whereSeparator: { $0 == " " || $0 == "\t" })
-            imageObservationCounts[imageID] = pointParts.count / 3
-            index += 2
-        }
-
-        var issues: [String] = []
-        for line in pointsText.components(separatedBy: .newlines) {
-            let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
-            guard !trimmed.isEmpty, !trimmed.hasPrefix("#") else { continue }
-            let parts = trimmed.split(whereSeparator: { $0 == " " || $0 == "\t" })
-            guard parts.count >= 8 else {
-                issues.append("points3D.txt row had too few columns")
-                continue
-            }
-            guard (parts.count - 8).isMultiple(of: 2) else {
-                issues.append("points3D.txt track row had an incomplete observation pair")
-                continue
-            }
-            var trackIndex = 8
-            while trackIndex + 1 < parts.count {
-                guard let imageID = Int(parts[trackIndex]),
-                      let point2DIndex = Int(parts[trackIndex + 1]) else {
-                    issues.append("points3D.txt track row had a non-numeric observation reference")
-                    break
-                }
-                guard let observationCount = imageObservationCounts[imageID] else {
-                    issues.append("points3D.txt track references missing image id \(imageID)")
-                    break
-                }
-                guard point2DIndex >= 0, point2DIndex < observationCount else {
-                    issues.append("points3D.txt track references image \(imageID) point2D index \(point2DIndex) outside 0..<\(observationCount)")
-                    break
-                }
-                trackIndex += 2
-            }
-        }
-        return issues
-    }
-
     func isStageComplete(_ stage: PipelineStage, paths: ProjectPaths, metadata: ProjectMetadata) -> Bool {
         (try? validateStageOutput(stage, paths: paths, metadata: metadata)) == .valid
     }
@@ -595,17 +486,6 @@ extension PipelineRunner {
 
         let size = (try? fm.attributesOfItem(atPath: paths.colmapDatabaseURL.path)[.size] as? NSNumber)?.int64Value ?? 0
         if size <= 0 {
-            let sparseZero = paths.colmapSparseURL.appendingPathComponent("0", isDirectory: true)
-            if sparseModelFilesExist(at: sparseZero) {
-                let da3Issues = da3DirectSparseValidationIssues(
-                    paths: paths,
-                    textStats: colmapSparseTextStats(at: sparseZero)
-                )
-                if !da3Issues.isEmpty {
-                    return .corrupt(reason: "DA3 sparse manifest is invalid: \(da3Issues.joined(separator: "; "))")
-                }
-                return .valid
-            }
             return .corrupt(reason: "database.db is empty")
         }
 

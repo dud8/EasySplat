@@ -4,7 +4,7 @@ extension ToolchainManager {
     func shouldAttemptOfflineFallback(forManifestError error: Error) -> Bool {
         if let toolchainError = error as? ToolchainError {
             switch toolchainError {
-            case .downloadFailed, .invalidManifest:
+            case .downloadFailed:
                 return true
             default:
                 return false
@@ -166,7 +166,7 @@ extension ToolchainManager {
 
     private func semanticCoreNumber(_ value: Substring) -> String? {
         guard !value.isEmpty,
-              value.allSatisfy(\.isNumber),
+              value.unicodeScalars.allSatisfy({ ("0"..."9").contains(Character(String($0))) }),
               value == "0" || value.first != "0" else {
             return nil
         }
@@ -206,11 +206,12 @@ extension ToolchainManager {
 
     func installToolchainAtomically(
         versionedRoot: URL,
-        requiredCapabilities: Set<ToolchainCapability> = ToolchainCapabilityRequest.default.capabilities,
+        requiredCapabilities: Set<ToolchainCapability>,
         seedFromExistingRoot: URL? = nil,
         onProgress: @escaping @Sendable (Double, String) -> Void,
         installInto stagingInstall: (_ stagingRoot: URL) async throws -> Void
     ) async throws -> ToolchainPaths {
+        try validateVersionedToolchainRoot(versionedRoot)
         let stagingRoot = versionedRoot.deletingLastPathComponent().appendingPathComponent(
             "\(versionedRoot.lastPathComponent).staging-\(UUID().uuidString)",
             isDirectory: true
@@ -296,6 +297,7 @@ extension ToolchainManager {
     }
 
     func recoverInterruptedInstalls(at root: URL, publicKeyBase64: String) throws {
+        try validateToolchainContainerRoot(root)
         guard fileManager.fileExists(atPath: root.path) else { return }
         let entries = try fileManager.contentsOfDirectory(
             at: root,
@@ -393,17 +395,49 @@ extension ToolchainManager {
     private func interruptedInstallVersion(from name: String) -> String? {
         for marker in [".backup-", ".staging-"] {
             if let range = name.range(of: marker, options: .backwards), range.lowerBound != name.startIndex {
-                return String(name[..<range.lowerBound])
+                let version = String(name[..<range.lowerBound])
+                return semanticVersionComponents(from: version) == nil ? nil : version
             }
         }
         return nil
+    }
+
+    func versionedToolchainRoot(for version: String) throws -> URL {
+        guard semanticVersionComponents(from: version) != nil else {
+            throw ToolchainError.invalidManifest
+        }
+        let container = try toolchainRootURL().standardizedFileURL
+        let candidate = container
+            .appendingPathComponent(version, isDirectory: true)
+            .standardizedFileURL
+        guard candidate.lastPathComponent == version,
+              candidate.deletingLastPathComponent().standardizedFileURL.path == container.path else {
+            throw ToolchainError.invalidManifest
+        }
+        return candidate
+    }
+
+    private func validateToolchainContainerRoot(_ root: URL) throws {
+        let expected = try toolchainRootURL().standardizedFileURL
+        guard root.standardizedFileURL.path == expected.path else {
+            throw ToolchainError.invalidManifest
+        }
+    }
+
+    private func validateVersionedToolchainRoot(_ root: URL) throws {
+        let version = root.lastPathComponent
+        let expected = try versionedToolchainRoot(for: version)
+        guard root.standardizedFileURL.path == expected.path else {
+            throw ToolchainError.invalidManifest
+        }
     }
 
     func pruneSchema2Toolchains(
         keeping currentVersion: String,
         publicKeyBase64: String
     ) {
-        guard let root = try? toolchainRootURL(),
+        guard semanticVersionComponents(from: currentVersion) != nil,
+              let root = try? toolchainRootURL(),
               let entries = try? fileManager.contentsOfDirectory(
                 at: root,
                 includingPropertiesForKeys: [.isDirectoryKey],
@@ -416,9 +450,11 @@ extension ToolchainManager {
                   !entry.lastPathComponent.contains(".staging-"),
                   !entry.lastPathComponent.contains(".backup-") else { continue }
             let state = loadInstallState(root: entry)
-            guard let receipt = state.signedManifest,
+            guard state.schemaVersion == ToolchainManifest.currentSchemaVersion,
+                  let receipt = state.signedManifest,
                   receipt.verifying(publicKeyBase64: publicKeyBase64),
                   receipt.hasMatchingKeyID(publicKeyBase64: publicKeyBase64),
+                  receipt.schemaVersion == ToolchainManifest.currentSchemaVersion,
                   receipt.toolchainAPI == ToolchainManifest.currentToolchainAPI,
                   isAppVersionCompatible(with: receipt),
                   let version = semanticVersionComponents(from: receipt.version) else { continue }

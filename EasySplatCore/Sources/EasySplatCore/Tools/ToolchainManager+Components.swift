@@ -1,6 +1,9 @@
 import Foundation
 
 extension ToolchainManager {
+    static let maximumReleaseComponentDownloadBytes: UInt64 = 2_147_483_648
+    static let maximumNormalPhotoToolchainDownloadBytes: UInt64 = 2_500_000_000
+
     static let schema2ComponentNames = Set([
         "macos-arm64-core",
         "geometry-da3-base",
@@ -78,7 +81,7 @@ extension ToolchainManager {
         guard manifest.schemaVersion == ToolchainManifest.currentSchemaVersion,
               manifest.toolchainAPI == ToolchainManifest.currentToolchainAPI,
               manifest.hasMatchingKeyID(publicKeyBase64: publicKeyBase64),
-              !manifest.version.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+              semanticVersionComponents(from: manifest.version) != nil,
               Set(manifest.components.map(\.name)) == Self.schema2ComponentNames,
               manifest.components.count == Self.schema2ComponentNames.count else {
             throw ToolchainError.invalidManifest
@@ -113,6 +116,9 @@ extension ToolchainManager {
                   component.dependencies.count == contract.dependencies.count,
                   component.requirement == contract.requirement,
                   component.sizeBytes > 0,
+                  component.sizeBytes < Self.maximumReleaseComponentDownloadBytes,
+                  component.expandedSizeBytes > 0,
+                  component.expandedSizeBytes <= 16 * 1_024 * 1_024 * 1_024,
                   component.sha256 == component.sha256.lowercased(),
                   isLowercaseSHA256(component.sha256),
                   !component.contents.isEmpty,
@@ -133,6 +139,15 @@ extension ToolchainManager {
         }
 
         guard manifest.components.allSatisfy({ !$0.criticalFileHashes.isEmpty }) else {
+            throw ToolchainError.invalidManifest
+        }
+        var totalDownloadBytes: UInt64 = 0
+        for component in manifest.components {
+            let sum = totalDownloadBytes.addingReportingOverflow(component.sizeBytes)
+            guard !sum.overflow else { throw ToolchainError.invalidManifest }
+            totalDownloadBytes = sum.partialValue
+        }
+        guard totalDownloadBytes <= Self.maximumNormalPhotoToolchainDownloadBytes else {
             throw ToolchainError.invalidManifest
         }
     }
@@ -156,13 +171,7 @@ extension ToolchainManager {
         root: URL,
         publicKeyBase64: String,
         request: ToolchainCapabilityRequest
-    ) throws -> ToolchainManifest? {
-        let persistedState = loadInstallState(root: root)
-        guard persistedState.signedManifest != nil else {
-            // Schema-1 installs had no receipt. They remain usable for the default compatibility path.
-            guard request == .default else { throw ToolchainError.invalidToolchain("Cached toolchain has no signed component receipt.") }
-            return nil
-        }
+    ) throws -> ToolchainManifest {
         let state = try validatedReusableInstallState(
             root: root,
             publicKeyBase64: publicKeyBase64,
@@ -185,6 +194,9 @@ extension ToolchainManager {
         matching expectedManifest: ToolchainManifest?
     ) throws -> ToolchainInstallState {
         var state = loadInstallState(root: root)
+        guard state.schemaVersion == ToolchainManifest.currentSchemaVersion else {
+            throw ToolchainError.invalidToolchain("Cached toolchain receipt uses an unsupported schema.")
+        }
         guard let receipt = state.signedManifest else {
             throw ToolchainError.invalidToolchain("Cached toolchain has no signed component receipt.")
         }
@@ -221,16 +233,55 @@ extension ToolchainManager {
         return state
     }
 
-    func preflightDiskSpace(for components: [ToolchainManifest.Component], at root: URL) throws {
-        let archiveBytes = components.reduce(UInt64(0)) { partial, component in
-            let (sum, overflow) = partial.addingReportingOverflow(component.sizeBytes)
-            return overflow ? UInt64.max : sum
-        }
-        let doubled = archiveBytes.multipliedReportingOverflow(by: 2)
-        let extractionBytes = doubled.overflow ? UInt64.max : doubled.partialValue
+    func requiredDiskBytes(
+        for components: [ToolchainManifest.Component],
+        at root: URL,
+        seedFromExistingRoot: URL? = nil
+    ) throws -> UInt64 {
         let headroom: UInt64 = 64 * 1_024 * 1_024
-        let sum = extractionBytes.addingReportingOverflow(headroom)
-        let required = sum.overflow ? UInt64.max : sum.partialValue
+        var required = headroom
+        if let seedFromExistingRoot {
+            let seedBytes = try installTreeSize(at: seedFromExistingRoot)
+            let sum = required.addingReportingOverflow(seedBytes)
+            required = sum.overflow ? UInt64.max : sum.partialValue
+        }
+        for component in components {
+            let url = try validatedArtifactURL(component.url)
+            let partialURL = try preparePartialDownload(
+                artifact: component,
+                url: url,
+                installationRoot: root
+            )
+            let partialSize = try fileSize(at: partialURL)
+            let reusableBytes: UInt64
+            if partialSize == component.sizeBytes {
+                reusableBytes = try reusablePartial(
+                    partialURL,
+                    expectedSize: component.sizeBytes,
+                    expectedSHA256: component.sha256
+                ) ? component.sizeBytes : 0
+            } else {
+                reusableBytes = min(partialSize, component.sizeBytes)
+            }
+            let remainingDownload = component.sizeBytes - reusableBytes
+            for amount in [component.expandedSizeBytes, remainingDownload] {
+                let sum = required.addingReportingOverflow(amount)
+                required = sum.overflow ? UInt64.max : sum.partialValue
+            }
+        }
+        return required
+    }
+
+    func preflightDiskSpace(
+        for components: [ToolchainManifest.Component],
+        at root: URL,
+        seedFromExistingRoot: URL? = nil
+    ) throws {
+        let required = try requiredDiskBytes(
+            for: components,
+            at: root,
+            seedFromExistingRoot: seedFromExistingRoot
+        )
 
         var probe = root.deletingLastPathComponent()
         while !fileManager.fileExists(atPath: probe.path), probe.path != "/" {
@@ -251,6 +302,34 @@ extension ToolchainManager {
         guard available >= required else {
             throw ToolchainError.insufficientDiskSpace(required: required, available: available)
         }
+    }
+
+    func installTreeSize(at root: URL) throws -> UInt64 {
+        guard fileManager.fileExists(atPath: root.path) else { return 0 }
+        guard let enumerator = fileManager.enumerator(
+            at: root,
+            includingPropertiesForKeys: [.isRegularFileKey, .isSymbolicLinkKey, .fileSizeKey],
+            options: [],
+            errorHandler: { _, _ in false }
+        ) else {
+            throw ToolchainError.fileIOFailed("Could not inspect the existing toolchain size.")
+        }
+        var total: UInt64 = 0
+        for case let file as URL in enumerator {
+            let values = try file.resourceValues(forKeys: [
+                .isRegularFileKey,
+                .isSymbolicLinkKey,
+                .fileSizeKey,
+            ])
+            if values.isSymbolicLink == true {
+                throw ToolchainError.invalidToolchain("Cached toolchain contains a symbolic link.")
+            }
+            guard values.isRegularFile == true else { continue }
+            let size = UInt64(max(0, values.fileSize ?? 0))
+            let sum = total.addingReportingOverflow(size)
+            total = sum.overflow ? UInt64.max : sum.partialValue
+        }
+        return total
     }
 
     func validateExactArchiveContents(_ entries: [String], component: ToolchainManifest.Component) throws {

@@ -267,10 +267,8 @@ final class PipelineLogger: @unchecked Sendable {
         let fm = FileManager.default
         try? fm.createDirectory(at: logURL.deletingLastPathComponent(), withIntermediateDirectories: true)
         try? fm.createDirectory(at: eventsURL.deletingLastPathComponent(), withIntermediateDirectories: true)
-        fm.createFile(atPath: logURL.path, contents: nil)
-        fm.createFile(atPath: eventsURL.path, contents: nil)
-        self.logHandle = try? FileHandle(forWritingTo: logURL)
-        self.eventsHandle = try? FileHandle(forWritingTo: eventsURL)
+        self.logHandle = try? SecureLogFileHandle.openForReplacing(at: logURL)
+        self.eventsHandle = try? SecureLogFileHandle.openForReplacing(at: eventsURL)
         if self.logHandle == nil {
             FileHandle.standardError.write(Data("PipelineLogger: failed to open pipeline log at \(logURL.path)\n".utf8))
         }

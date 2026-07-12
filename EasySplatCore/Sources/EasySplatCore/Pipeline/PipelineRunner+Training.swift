@@ -3,9 +3,23 @@ import Foundation
 extension PipelineRunner {
     func prepareMsplatDataset(
         paths: ProjectPaths,
+        maxImageSize: Int,
+        learnedPointInitializer: LearnedPointInitializerArtifact?,
         progress: (Double, String) -> Void
-    ) throws -> URL {
-        try prepareTrainingDataset(
+    ) async throws -> URL {
+        let sourceSparseRoot = paths.colmapSparseURL.appendingPathComponent("0", isDirectory: true)
+        let sourceSparse = try resolveSparseModelDirectory(at: sourceSparseRoot)
+        if try MsplatCameraCompatibility.requiresUndistortion(modelDirectory: sourceSparse) {
+            return try await prepareUndistortedMsplatDataset(
+                paths: paths,
+                sourceSparse: sourceSparse,
+                maxImageSize: maxImageSize,
+                learnedPointInitializer: learnedPointInitializer,
+                progress: progress
+            )
+        }
+
+        return try prepareTrainingDataset(
             paths: paths,
             datasetName: "msplat_dataset",
             progressName: "msplat",
@@ -13,24 +27,123 @@ extension PipelineRunner {
             requiredSparseFiles: ["cameras.bin", "images.bin", "points3D.bin"],
             prepareSourceSparse: { _ = try regenerateBinarySparseModelFiles(at: $0) },
             ensureCopiedSparse: { try requireBinarySparseModelFiles(at: $0); return false },
-            finalizeCopiedSparse: { _ in },
+            finalizeCopiedSparse: { sparse in
+                guard let learnedPointInitializer else { return }
+                try mergeLearnedPointInitializer(
+                    learnedPointInitializer,
+                    paths: paths,
+                    into: sparse.appendingPathComponent("points3D.txt")
+                )
+                _ = try regenerateBinarySparseModelFiles(at: sparse)
+            },
             progress: progress
         )
     }
 
-    func currentMsplatDatasetIdentity(paths: ProjectPaths) throws -> MsplatDatasetIdentity {
-        let selected = try FileManager.default.contentsOfDirectory(
-            at: paths.framesSelectedURL,
-            includingPropertiesForKeys: nil
+    private func prepareUndistortedMsplatDataset(
+        paths: ProjectPaths,
+        sourceSparse: URL,
+        maxImageSize: Int,
+        learnedPointInitializer: LearnedPointInitializerArtifact?,
+        progress: (Double, String) -> Void
+    ) async throws -> URL {
+        let fm = FileManager.default
+        try requireTextSparseModelFiles(at: sourceSparse)
+
+        let stagingRoot = paths.trainingURL.appendingPathComponent(
+            ".msplat-undistort-\(UUID().uuidString)",
+            isDirectory: true
         )
-        let imageFiles = selected.filter {
-            supportedImageExtensions.contains($0.pathExtension.lowercased())
+        let workspace = stagingRoot.appendingPathComponent("workspace", isDirectory: true)
+        let candidate = stagingRoot.appendingPathComponent("candidate", isDirectory: true)
+        try fm.createDirectory(at: workspace, withIntermediateDirectories: true)
+        defer { try? fm.removeItem(at: stagingRoot) }
+
+        progress(0.05, "Preparing corrected lens images")
+        try await tooling.colmap.runImageUndistorter(
+            colmapPath: config.toolchain.colmap,
+            imagePath: paths.framesSelectedURL,
+            inputPath: sourceSparse,
+            outputPath: workspace,
+            maxImageSize: maxImageSize,
+            environment: colmapOptionsForMatching().environment,
+            onLog: { _, _ in }
+        )
+        try Task.checkCancellation()
+
+        let workspaceImages = workspace.appendingPathComponent("images", isDirectory: true)
+        let workspaceSparse = workspace.appendingPathComponent("sparse", isDirectory: true)
+        try requireBinarySparseModelFiles(at: workspaceSparse)
+        let correctedImages = try fm.contentsOfDirectory(
+            at: workspaceImages,
+            includingPropertiesForKeys: [.isRegularFileKey],
+            options: [.skipsHiddenFiles]
+        ).filter { supportedImageExtensions.contains($0.pathExtension.lowercased()) }
+        guard !correctedImages.isEmpty else { throw PipelineError.outputMissing }
+
+        let candidateSparseRoot = candidate.appendingPathComponent("sparse", isDirectory: true)
+        let candidateSparse = candidateSparseRoot.appendingPathComponent("0", isDirectory: true)
+        try fm.createDirectory(at: candidateSparse, withIntermediateDirectories: true)
+        try fm.moveItem(
+            at: workspaceImages,
+            to: candidate.appendingPathComponent("images", isDirectory: true)
+        )
+        for file in try fm.contentsOfDirectory(
+            at: workspaceSparse,
+            includingPropertiesForKeys: [.isRegularFileKey],
+            options: [.skipsHiddenFiles]
+        ) {
+            try Task.checkCancellation()
+            let values = try file.resourceValues(forKeys: [.isRegularFileKey, .isSymbolicLinkKey])
+            guard values.isRegularFile == true, values.isSymbolicLink != true else { continue }
+            try fm.moveItem(at: file, to: candidateSparse.appendingPathComponent(file.lastPathComponent))
         }
-        let sparseRoot = paths.colmapSparseURL.appendingPathComponent("0", isDirectory: true)
-        let sparse = try resolveSparseModelDirectory(at: sparseRoot)
-        return try MsplatDatasetIdentity.compute(
-            imageFiles: imageFiles,
-            sparseDirectory: sparse
+        try requireBinarySparseModelFiles(at: candidateSparse)
+        if let learnedPointInitializer {
+            _ = try ensureTextSparseModelFiles(at: candidateSparse)
+            try mergeLearnedPointInitializer(
+                learnedPointInitializer,
+                paths: paths,
+                into: candidateSparse.appendingPathComponent("points3D.txt")
+            )
+            _ = try regenerateBinarySparseModelFiles(at: candidateSparse)
+        }
+        _ = try msplatDatasetIdentity(at: candidate)
+
+        let dataset = paths.trainingURL.appendingPathComponent("msplat_dataset", isDirectory: true)
+        let backup = paths.trainingURL.appendingPathComponent(".msplat-dataset-backup", isDirectory: true)
+        if fm.fileExists(atPath: backup.path) { try fm.removeItem(at: backup) }
+        if fm.fileExists(atPath: dataset.path) { try fm.moveItem(at: dataset, to: backup) }
+        do {
+            try fm.moveItem(at: candidate, to: dataset)
+            if fm.fileExists(atPath: backup.path) { try fm.removeItem(at: backup) }
+        } catch {
+            if fm.fileExists(atPath: dataset.path) { try? fm.removeItem(at: dataset) }
+            if fm.fileExists(atPath: backup.path) { try? fm.moveItem(at: backup, to: dataset) }
+            throw error
+        }
+        progress(1.0, "Corrected lens images are ready")
+        return dataset
+    }
+
+    private func mergeLearnedPointInitializer(
+        _ initializer: LearnedPointInitializerArtifact,
+        paths: ProjectPaths,
+        into canonicalPointsURL: URL
+    ) throws {
+        let initializerURL = try paths.resolveProjectRelativePath(initializer.path)
+        try Da3LearnedPointInitializer.merge(
+            learnedPointsURL: initializerURL,
+            into: canonicalPointsURL,
+            expectedPointCount: initializer.pointCount,
+            maximumPointCount: initializer.pointCount,
+            expectedSHA256: initializer.sha256
+        )
+    }
+
+    func currentMsplatDatasetIdentity(paths: ProjectPaths) throws -> MsplatDatasetIdentity {
+        try msplatDatasetIdentity(
+            at: paths.trainingURL.appendingPathComponent("msplat_dataset", isDirectory: true)
         )
     }
 
@@ -152,25 +265,34 @@ extension PipelineRunner {
         try requireTextSparseModelFiles(at: url)
         let fm = FileManager.default
         let binFiles = ["cameras.bin", "images.bin", "points3D.bin"]
-        let staging = url.deletingLastPathComponent().appendingPathComponent(
+        let stagingRoot = url.deletingLastPathComponent().appendingPathComponent(
             ".binary-model-\(UUID().uuidString)",
             isDirectory: true
         )
-        try fm.createDirectory(at: staging, withIntermediateDirectories: false)
-        defer { try? fm.removeItem(at: staging) }
+        let textInput = stagingRoot.appendingPathComponent("text", isDirectory: true)
+        let binaryOutput = stagingRoot.appendingPathComponent("binary", isDirectory: true)
+        try fm.createDirectory(at: textInput, withIntermediateDirectories: true)
+        try fm.createDirectory(at: binaryOutput, withIntermediateDirectories: true)
+        defer { try? fm.removeItem(at: stagingRoot) }
+        for name in ["cameras.txt", "images.txt", "points3D.txt"] {
+            try fm.copyItem(
+                at: url.appendingPathComponent(name),
+                to: textInput.appendingPathComponent(name)
+            )
+        }
 
         let converterOptions = colmapOptionsForMatching()
         try tooling.colmap.runModelConverter(
             colmapPath: config.toolchain.colmap,
-            inputPath: url,
-            outputPath: staging,
+            inputPath: textInput,
+            outputPath: binaryOutput,
             outputType: "BIN",
             environment: converterOptions.environment,
             onLog: { _, _ in }
         )
 
         for name in binFiles {
-            let source = staging.appendingPathComponent(name)
+            let source = binaryOutput.appendingPathComponent(name)
             let values = try source.resourceValues(forKeys: [
                 .isRegularFileKey,
                 .isSymbolicLinkKey,
@@ -266,7 +388,7 @@ extension PipelineRunner {
             outputPath: nil,
             gaussianCount: receipt.gaussianCount,
             elapsedSeconds: nil,
-            peakMemoryBytes: nil,
+            peakMemoryBytes: receipt.peakMemoryBytes,
             completionStatus: .checkpointed
         )
         var currentMetadata = try ProjectMetadataStore.load(from: paths.metadataURL)
@@ -282,6 +404,13 @@ extension PipelineRunner {
         resolvedPlan: ResolvedRunPlan,
         paths: ProjectPaths
     ) throws -> TrainingArtifact {
+        let outputURL = paths.msplatOutputURL
+        guard ProjectArtifactValidator.validatePlyFile(at: outputURL) == .valid,
+              let header = ProjectArtifactValidator.readPlyHeader(at: outputURL),
+              header.vertexCount == result.gaussianCount,
+              let size = try? outputURL.resourceValues(forKeys: [.fileSizeKey]).fileSize else {
+            throw PipelineError.outputMissing
+        }
         let artifact = TrainingArtifact(
             trainerVersion: "1.1.3 (git 106499b)",
             runtimeVersion: "native-metal-cli-v1",
@@ -296,13 +425,55 @@ extension PipelineRunner {
             checkpointPath: nil,
             checkpointDigest: nil,
             outputPath: "Training/msplat/splat.ply",
+            outputSHA256: try GeometryArtifactStore.sha256(of: outputURL),
+            outputBytes: Int64(size),
             gaussianCount: result.gaussianCount,
             elapsedSeconds: result.elapsedSeconds,
-            peakMemoryBytes: nil,
+            peakMemoryBytes: result.peakMemoryBytes,
             completionStatus: .completed
         )
         var currentMetadata = try ProjectMetadataStore.load(from: paths.metadataURL)
         try TrainingArtifactStore.persist(artifact, metadata: &currentMetadata, paths: paths)
         return artifact
+    }
+
+    /// Rebinds a completed training receipt to the validated public PLY. The trainer's
+    /// private output remains available until the run is durably marked done, so a
+    /// crash during export can still resume without retraining.
+    func promoteMsplatCompletionToPublicOutput(paths: ProjectPaths) throws -> TrainingArtifact {
+        var metadata = try ProjectMetadataStore.load(from: paths.metadataURL)
+        guard var artifact = metadata.trainingArtifact,
+              artifact.completionStatus == .completed else {
+            throw PipelineError.outputMissing
+        }
+        if artifact.outputPath == "Output/splat.ply" {
+            try TrainingArtifactStore.validateCompletedOutput(
+                artifact,
+                at: paths.outputURL.appendingPathComponent("splat.ply")
+            )
+            return artifact
+        }
+        guard artifact.outputPath == "Training/msplat/splat.ply" else {
+            throw PipelineError.outputMissing
+        }
+
+        artifact.outputPath = "Output/splat.ply"
+        try TrainingArtifactStore.persist(artifact, metadata: &metadata, paths: paths)
+        return artifact
+    }
+
+    /// Finished projects retain canonical geometry, the training manifest, and one
+    /// authenticated public PLY. The copied image dataset and trainer-private PLY are
+    /// rebuildable payloads, not user artifacts.
+    func removeDisposableCompletedTrainingPayload(paths: ProjectPaths) throws {
+        let fileManager = FileManager.default
+        let disposableURLs = [
+            try paths.resolveProjectRelativePath("Training/msplat_dataset"),
+            try paths.resolveProjectRelativePath("Training/msplat/splat.ply"),
+        ]
+        for url in disposableURLs where fileManager.fileExists(atPath: url.path)
+            || (try? fileManager.destinationOfSymbolicLink(atPath: url.path)) != nil {
+            try fileManager.removeItem(at: url)
+        }
     }
 }

@@ -1,15 +1,8 @@
 import Foundation
 
-/// Execution mode for the Depth Anything 3 bridge.
-public enum Da3RunMode: String, Sendable {
-    case direct
-    case seedRefine = "seed_refine"
-}
-
 /// Runtime options for invoking the Depth Anything 3 SfM bridge.
 public struct Da3SfmConfig: Sendable {
     public var device: String
-    public var mode: Da3RunMode
     public var modelSubdirectory: String
     public var fallbackModelSubdirectory: String
     public var processResolution: Int
@@ -23,7 +16,6 @@ public struct Da3SfmConfig: Sendable {
 
     public init(
         device: String = "mps",
-        mode: Da3RunMode = .direct,
         modelSubdirectory: String = "DA3-BASE",
         fallbackModelSubdirectory: String = "DA3-SMALL",
         processResolution: Int = 504,
@@ -36,7 +28,6 @@ public struct Da3SfmConfig: Sendable {
         coverageManifestPath: URL? = nil
     ) {
         self.device = device
-        self.mode = mode
         self.modelSubdirectory = modelSubdirectory
         self.fallbackModelSubdirectory = fallbackModelSubdirectory
         self.processResolution = processResolution
@@ -94,7 +85,6 @@ public final class Da3SfmRunner: @unchecked Sendable, Da3SfmRunning {
             "--out-sparse", outSparse.path,
             "--models-dir", toolchain.models.path,
             "--device", config.device,
-            "--mode", config.mode.rawValue,
             "--model-subdir", config.modelSubdirectory,
             "--fallback-model-subdir", config.fallbackModelSubdirectory,
             "--process-res", "\(config.processResolution)",
@@ -113,6 +103,11 @@ public final class Da3SfmRunner: @unchecked Sendable, Da3SfmRunning {
         }
 
         var environment = RuntimeEnvironment.current
+        for key in ["PYTHONPATH", "PYTHONHOME", "PYTHONUSERBASE", "PYTHONSTARTUP", "PYTHONINSPECT"] {
+            environment.removeValue(forKey: key)
+        }
+        environment["PYTHONNOUSERSITE"] = "1"
+        environment["PYTHONSAFEPATH"] = "1"
         environment["PYTHONUNBUFFERED"] = "1"
         environment["EASYSPLAT_DA3_MODELS_DIR"] = toolchain.models.path
         environment["TORCH_HOME"] = toolchain.models.path
@@ -123,9 +118,7 @@ public final class Da3SfmRunner: @unchecked Sendable, Da3SfmRunning {
         environment["DO_NOT_TRACK"] = "1"
         environment["KMP_DUPLICATE_LIB_OK"] = "TRUE"
         environment["TOKENIZERS_PARALLELISM"] = "false"
-        if environment["PYTORCH_ENABLE_MPS_FALLBACK"] == nil {
-            environment["PYTORCH_ENABLE_MPS_FALLBACK"] = "1"
-        }
+        environment["PYTORCH_ENABLE_MPS_FALLBACK"] = "1"
 
         let pythonBin = toolchain.python.deletingLastPathComponent().path
         if let existingPath = environment["PATH"] {

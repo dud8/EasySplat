@@ -22,19 +22,23 @@ class MetalBuffer<T> {
     }
 
     let device: MTLDevice
+    private let capacityLimit: Int
 
     var capacity: Int = 0
     var count: Int = 0
     var buffer: MTLBuffer
     var values: UnsafeMutablePointer<T>
 
-    init(device: MTLDevice, capacity: Int = 1) throws {
+    init(device: MTLDevice, capacity: Int = 1, maximumCapacity: Int? = nil) throws {
         let capacity = max(capacity, 1)
-        guard capacity <= Self.maxCapacity(for: device) else {
-            throw Error.capacityGreatedThanMaxCapacity(requested: capacity, max: Self.maxCapacity(for: device))
+        let deviceCapacity = Self.maxCapacity(for: device)
+        let capacityLimit = min(maximumCapacity ?? deviceCapacity, deviceCapacity)
+        guard capacity <= capacityLimit else {
+            throw Error.capacityGreatedThanMaxCapacity(requested: capacity, max: capacityLimit)
         }
 
         self.device = device
+        self.capacityLimit = capacityLimit
 
         self.capacity = capacity
         self.count = 0
@@ -51,14 +55,14 @@ class MetalBuffer<T> {
     }
 
     var maxCapacity: Int {
-        device.maxBufferLength / MemoryLayout<T>.stride
+        capacityLimit
     }
 
     func setCapacity(_ newCapacity: Int) throws {
         let newCapacity = max(newCapacity, 1)
         guard newCapacity != capacity else { return }
-        guard capacity <= maxCapacity else {
-            throw Error.capacityGreatedThanMaxCapacity(requested: capacity, max: maxCapacity)
+        guard newCapacity <= maxCapacity else {
+            throw Error.capacityGreatedThanMaxCapacity(requested: newCapacity, max: maxCapacity)
         }
 
         log.info("Allocating a new buffer of size \(MemoryLayout<T>.stride) * \(newCapacity) = \(Float(MemoryLayout<T>.stride * newCapacity) / (1024.0 * 1024.0))mb")

@@ -7,23 +7,17 @@ public struct ProjectMetadata: Codable, Sendable {
     public var createdAt: Date
     public var title: String
     public var input: InputSpec
-    public var preset: PresetSpec
-    public var requestedRunOptions: RequestedRunOptions?
+    public var requestedRunOptions: RequestedRunOptions
     public var resolvedRunPlan: ResolvedRunPlan?
     public var geometryArtifact: GeometryArtifact?
     public var trainingArtifact: TrainingArtifact?
     public var state: PipelineState
     public var outputs: OutputSpec?
     public var checkpoint: PipelineCheckpoint?
-    public var completedSfmMapping: SfmMappingCheckpoint?
-    public var recoveryPromptSuppressed: Bool?
     public var lastRunStartedAt: Date?
-    public var shareMetrics: ShareMetrics?
     public var reconstruction: ReconstructionSummary?
     public var stageTimings: [StageTimingRecord]?
-    public var autoTune: AutoTuneSnapshot?
     public var notes: String?
-    public var lastOpenedAt: Date?
     public var lastFailureAt: Date?
 
     public init(
@@ -32,23 +26,17 @@ public struct ProjectMetadata: Codable, Sendable {
         createdAt: Date = Date(),
         title: String,
         input: InputSpec,
-        preset: PresetSpec,
-        requestedRunOptions: RequestedRunOptions? = RequestedRunOptions(),
+        requestedRunOptions: RequestedRunOptions = RequestedRunOptions(),
         resolvedRunPlan: ResolvedRunPlan? = nil,
         geometryArtifact: GeometryArtifact? = nil,
         trainingArtifact: TrainingArtifact? = nil,
-        state: PipelineState = PipelineState(stage: .importInput, attempt: 0, lastError: nil, resumeToken: nil),
+        state: PipelineState = PipelineState(stage: .importInput, lastError: nil),
         outputs: OutputSpec? = nil,
         checkpoint: PipelineCheckpoint? = nil,
-        completedSfmMapping: SfmMappingCheckpoint? = nil,
-        recoveryPromptSuppressed: Bool? = nil,
         lastRunStartedAt: Date? = nil,
-        shareMetrics: ShareMetrics? = nil,
         reconstruction: ReconstructionSummary? = nil,
         stageTimings: [StageTimingRecord]? = nil,
-        autoTune: AutoTuneSnapshot? = nil,
         notes: String? = nil,
-        lastOpenedAt: Date? = nil,
         lastFailureAt: Date? = nil
     ) {
         self.formatVersion = formatVersion
@@ -56,7 +44,6 @@ public struct ProjectMetadata: Codable, Sendable {
         self.createdAt = createdAt
         self.title = title
         self.input = input
-        self.preset = preset
         self.requestedRunOptions = requestedRunOptions
         self.resolvedRunPlan = resolvedRunPlan
         self.geometryArtifact = geometryArtifact
@@ -64,97 +51,17 @@ public struct ProjectMetadata: Codable, Sendable {
         self.state = state
         self.outputs = outputs
         self.checkpoint = checkpoint
-        self.completedSfmMapping = completedSfmMapping
-        self.recoveryPromptSuppressed = recoveryPromptSuppressed
         self.lastRunStartedAt = lastRunStartedAt
-        self.shareMetrics = shareMetrics
         self.reconstruction = reconstruction
         self.stageTimings = stageTimings
-        self.autoTune = autoTune
         self.notes = notes
-        self.lastOpenedAt = lastOpenedAt
         self.lastFailureAt = lastFailureAt
     }
 }
 
 extension ProjectMetadata {
     var effectiveDetailProfile: DetailProfile {
-        if let requestedRunOptions {
-            return requestedRunOptions.detailProfile
-        }
-        switch preset.quality {
-        case .draft: return .fast
-        case .standard: return .balanced
-        case .ultra: return .highDetail
-        }
-    }
-}
-
-/// Legacy AutoTuner snapshot retained only to decode older project metadata.
-public struct AutoTuneSnapshot: Codable, Sendable, Equatable {
-    public var tier: String
-    public var memoryGB: Double
-    public var cpuCount: Int
-    public var gpuWorkingSetGB: Double?
-    public var mapAnythingResolution: Int
-    public var mapAnythingDirectViewLimit: Int
-    public var mapAnythingAnchorMaxViews: Int
-    public var mapAnythingWindowSize: Int
-    public var mapAnythingWindowOverlap: Int
-    public var vggtImageLoadResolution: Int
-    public var vggtFixedResolution: Int
-    public var vggtMaxPoints: Int
-    public var vggtAllowed: Bool
-    public var colmapMaxNumFeatures: Int
-    public var colmapMaxNumMatches: Int
-    public var colmapSequentialOverlap: Int
-    public var colmapExhaustiveBlockSize: Int
-    public var threadCap: Int
-    public var colmapMaxImageSizeCap: Int?
-    public var capturedAt: Date
-
-    public init(
-        tier: String,
-        memoryGB: Double,
-        cpuCount: Int,
-        gpuWorkingSetGB: Double?,
-        mapAnythingResolution: Int,
-        mapAnythingDirectViewLimit: Int,
-        mapAnythingAnchorMaxViews: Int,
-        mapAnythingWindowSize: Int,
-        mapAnythingWindowOverlap: Int,
-        vggtImageLoadResolution: Int,
-        vggtFixedResolution: Int,
-        vggtMaxPoints: Int,
-        vggtAllowed: Bool,
-        colmapMaxNumFeatures: Int,
-        colmapMaxNumMatches: Int,
-        colmapSequentialOverlap: Int,
-        colmapExhaustiveBlockSize: Int,
-        threadCap: Int,
-        colmapMaxImageSizeCap: Int?,
-        capturedAt: Date
-    ) {
-        self.tier = tier
-        self.memoryGB = memoryGB
-        self.cpuCount = cpuCount
-        self.gpuWorkingSetGB = gpuWorkingSetGB
-        self.mapAnythingResolution = mapAnythingResolution
-        self.mapAnythingDirectViewLimit = mapAnythingDirectViewLimit
-        self.mapAnythingAnchorMaxViews = mapAnythingAnchorMaxViews
-        self.mapAnythingWindowSize = mapAnythingWindowSize
-        self.mapAnythingWindowOverlap = mapAnythingWindowOverlap
-        self.vggtImageLoadResolution = vggtImageLoadResolution
-        self.vggtFixedResolution = vggtFixedResolution
-        self.vggtMaxPoints = vggtMaxPoints
-        self.vggtAllowed = vggtAllowed
-        self.colmapMaxNumFeatures = colmapMaxNumFeatures
-        self.colmapMaxNumMatches = colmapMaxNumMatches
-        self.colmapSequentialOverlap = colmapSequentialOverlap
-        self.colmapExhaustiveBlockSize = colmapExhaustiveBlockSize
-        self.threadCap = threadCap
-        self.colmapMaxImageSizeCap = colmapMaxImageSizeCap
-        self.capturedAt = capturedAt
+        requestedRunOptions.detailProfile
     }
 }
 
@@ -182,10 +89,7 @@ extension Array where Element == StageTimingRecord {
     }
 }
 
-/// Persisted summary of the accepted sparse reconstruction. Lets the app surface
-/// quality metrics (frame coverage, point density, and — for mappers that produce real
-/// pixel residuals — reprojection error) without re-parsing the COLMAP model after the
-/// run finishes. See `resolvedReprojectionError` for the honest, display-safe value.
+/// Persisted measurements from the accepted sparse reconstruction.
 public struct ReconstructionSummary: Codable, Sendable, Equatable {
     public var mapper: String
     public var capturedAt: Date
@@ -225,69 +129,18 @@ public struct ReconstructionSummary: Codable, Sendable, Equatable {
 }
 
 extension ReconstructionSummary {
-    /// Mappers whose `model_analyzer` "mean reprojection error" is not a real pixel residual.
-    /// GLOMAP (`global_mapper*`) and the feed-forward neural-direct paths (DA3, MapAnything,
-    /// FastVGGT seed) hand COLMAP a model that is analyzed WITHOUT a `point_triangulator`
-    /// re-triangulation pass (unlike the neural *refinement* paths, which do re-triangulate),
-    /// so `model_analyzer` just averages the bridge's stored per-point error — a placeholder:
-    /// DA3/MapAnything write `1.0`, FastVGGT writes `0.0`, GLOMAP stores a normalized-coordinate
-    /// value (~0.0003). Comparing any of these to the pixel-based acceptance threshold and the
-    /// sub-1.2px "strong" cutoff is meaningless (and inflates the rating), so we treat them as
-    /// having no measured reprojection error.
-    public static func reprojectionErrorIsUnreliable(forMapper mapper: String) -> Bool {
-        switch mapper {
-        case "global_mapper", "global_mapper-gpu", "global_mapper-cpu",
-             "da3-direct", "mapanything-direct", "fastvggt-seed":
-            return true
-        default:
-            return false
-        }
-    }
-
-    /// The reprojection error to display and consume. Returns nil for mappers whose stored
-    /// value is a placeholder (see `reprojectionErrorIsUnreliable`). New summaries already
-    /// persist nil for those mappers; this also masks older `project.json` files written
-    /// before that value was dropped at persist time.
-    public var resolvedReprojectionError: Double? {
-        Self.reprojectionErrorIsUnreliable(forMapper: mapper) ? nil : meanReprojectionError
-    }
-
-    /// Bridges the per-run `ReconstructionScore` (lives in SfM) onto the persisted summary.
-    /// Acceptance has already been decided on the raw `score`; this only shapes what gets
-    /// persisted and shown, so it is the right place to drop the non-pixel reprojection error
-    /// (see `reprojectionErrorIsUnreliable`) without touching the acceptance gate.
+    /// Bridges the measured per-run score onto the persisted summary.
     public init(score: ReconstructionScore, mapper: String, capturedAt: Date) {
-        let reproj = Self.reprojectionErrorIsUnreliable(forMapper: mapper) ? nil : score.meanReprojectionError
         self.init(
             mapper: mapper,
             capturedAt: capturedAt,
             registeredImages: score.registeredImages,
             totalImages: score.totalImages,
-            meanReprojectionError: reproj,
+            meanReprojectionError: score.meanReprojectionError,
             pointCount: score.pointCount,
             observationCount: score.observationCount,
             meanTrackLength: score.meanTrackLength
         )
-    }
-}
-
-/// Legacy share counters retained only to decode older project metadata.
-public struct ShareMetrics: Codable, Sendable, Equatable {
-    public var shareClickedCount: Int
-    public var shareCompletedCount: Int
-    public var lastShareService: String?
-    public var lastSharedAt: Date?
-
-    public init(
-        shareClickedCount: Int = 0,
-        shareCompletedCount: Int = 0,
-        lastShareService: String? = nil,
-        lastSharedAt: Date? = nil
-    ) {
-        self.shareClickedCount = shareClickedCount
-        self.shareCompletedCount = shareCompletedCount
-        self.lastShareService = lastShareService
-        self.lastSharedAt = lastSharedAt
     }
 }
 
@@ -331,7 +184,6 @@ public enum PipelineCheckpointDetails: Codable, Sendable {
         case sfmMatching
         case sfmMapping
         case trainSplat
-        case trainBrush
         case exportSplat
     }
 
@@ -364,7 +216,7 @@ public enum PipelineCheckpointDetails: Codable, Sendable {
             self = .sfmMatching(try decode(SfmMatchingCheckpoint.self, for: key))
         case .sfmMapping:
             self = .sfmMapping(try decode(SfmMappingCheckpoint.self, for: key))
-        case .trainSplat, .trainBrush:
+        case .trainSplat:
             self = .trainSplat(try decode(TrainSplatCheckpoint.self, for: key))
         case .exportSplat:
             self = .exportSplat(try decode(ExportSplatCheckpoint.self, for: key))
@@ -465,69 +317,14 @@ public struct SfmMappingCheckpoint: Codable, Sendable {
     }
 }
 
-/// Checkpoint details for training progress. Legacy Brush fields remain decode-compatible.
+/// Checkpoint details for native training progress.
 public struct TrainSplatCheckpoint: Codable, Sendable {
-    public var latestExportStep: Int?
-    public var latestExportPath: String?
     public var progressStep: Int?
     public var progressTotal: Int?
-    public var stepsPerSecond: Double?
-    public var resumeSnapshotPath: String?
-    public var trainingBackend: TrainingBackend?
-
-    private enum CodingKeys: String, CodingKey {
-        case latestExportStep
-        case latestExportPath
-        case progressStep
-        case progressTotal
-        case stepsPerSecond
-        case resumeSnapshotPath
-        case trainingBackend
-    }
-
-    public init(
-        latestExportStep: Int?,
-        latestExportPath: String?,
-        progressStep: Int?,
-        progressTotal: Int?,
-        stepsPerSecond: Double?,
-        resumeSnapshotPath: String?,
-        trainingBackend: TrainingBackend? = nil
-    ) {
-        self.latestExportStep = latestExportStep
-        self.latestExportPath = latestExportPath
-        self.progressStep = progressStep
-        self.progressTotal = progressTotal
-        self.stepsPerSecond = stepsPerSecond
-        self.resumeSnapshotPath = resumeSnapshotPath
-        self.trainingBackend = trainingBackend
-    }
 
     public init(progressStep: Int? = nil, progressTotal: Int? = nil) {
-        latestExportStep = nil
-        latestExportPath = nil
         self.progressStep = progressStep
         self.progressTotal = progressTotal
-        stepsPerSecond = nil
-        resumeSnapshotPath = nil
-        trainingBackend = nil
-    }
-
-    public init(from decoder: Decoder) throws {
-        let values = try decoder.container(keyedBy: CodingKeys.self)
-        latestExportStep = try values.decodeIfPresent(Int.self, forKey: .latestExportStep)
-        latestExportPath = try values.decodeIfPresent(String.self, forKey: .latestExportPath)
-        progressStep = try values.decodeIfPresent(Int.self, forKey: .progressStep)
-        progressTotal = try values.decodeIfPresent(Int.self, forKey: .progressTotal)
-        stepsPerSecond = try values.decodeIfPresent(Double.self, forKey: .stepsPerSecond)
-        resumeSnapshotPath = try values.decodeIfPresent(String.self, forKey: .resumeSnapshotPath)
-        trainingBackend = try values.decodeIfPresent(TrainingBackend.self, forKey: .trainingBackend)
-    }
-
-    public func encode(to encoder: Encoder) throws {
-        var values = encoder.container(keyedBy: CodingKeys.self)
-        try values.encodeIfPresent(progressStep, forKey: .progressStep)
-        try values.encodeIfPresent(progressTotal, forKey: .progressTotal)
     }
 }
 
@@ -576,42 +373,14 @@ public enum InputSpec: Codable, Sendable {
     public var hasPhotos: Bool { photosFolder != nil }
 }
 
-/// High-level capture intent used to tune SfM defaults.
-public enum CaptureMode: String, Codable, Sendable {
-    case object
-    case room
-}
-
-/// User-facing quality preset that controls frame and training budgets.
-public enum QualityPreset: String, Codable, Sendable {
-    case draft
-    case standard
-    case ultra
-}
-
-/// Combination of capture mode and quality preset stored with a project.
-public struct PresetSpec: Codable, Sendable {
-    public var mode: CaptureMode
-    public var quality: QualityPreset
-
-    public init(mode: CaptureMode, quality: QualityPreset) {
-        self.mode = mode
-        self.quality = quality
-    }
-}
-
 /// Persisted pipeline state used for status, retry, and resume handling.
 public struct PipelineState: Codable, Sendable {
     public var stage: PipelineStage
-    public var attempt: Int
     public var lastError: String?
-    public var resumeToken: String?
 
-    public init(stage: PipelineStage, attempt: Int, lastError: String?, resumeToken: String?) {
+    public init(stage: PipelineStage, lastError: String?) {
         self.stage = stage
-        self.attempt = attempt
         self.lastError = lastError
-        self.resumeToken = resumeToken
     }
 }
 

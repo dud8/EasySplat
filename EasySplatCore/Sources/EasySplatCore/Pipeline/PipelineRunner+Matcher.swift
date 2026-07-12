@@ -18,6 +18,16 @@ private final class ColmapMatchingProgressState: @unchecked Sendable {
 }
 
 extension PipelineRunner {
+    func writeColmapPairList(_ pairs: [String], fileName: String, paths: ProjectPaths) throws -> URL {
+        let url = paths.colmapSeedURL.appendingPathComponent(fileName)
+        try (pairs.joined(separator: "\n") + "\n").write(
+            to: url,
+            atomically: true,
+            encoding: .utf8
+        )
+        return url
+    }
+
     /// Runs one COLMAP matcher attempt with database-polling progress.
     func runColmapMatcherAttempt(
         stage: PipelineStage,

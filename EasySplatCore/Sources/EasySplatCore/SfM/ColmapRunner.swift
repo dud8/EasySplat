@@ -468,6 +468,36 @@ public final class ColmapRunner {
         return [result.stdout, result.stderr].filter { !$0.isEmpty }.joined(separator: "\n")
     }
 
+    public func runImageUndistorter(
+        colmapPath: URL,
+        imagePath: URL,
+        inputPath: URL,
+        outputPath: URL,
+        maxImageSize: Int,
+        environment: [String: String] = [:],
+        onLog: @escaping @Sendable (String, Bool) -> Void
+    ) async throws {
+        let args = [
+            "image_undistorter",
+            "--image_path", imagePath.path,
+            "--input_path", inputPath.path,
+            "--output_path", outputPath.path,
+            "--output_type", "COLMAP",
+            "--copy_policy", "COPY",
+            "--max_image_size", "\(max(1, maxImageSize))",
+        ]
+        onLog("EasySplat: colmap argv: \(colmapPath.path) \(args.joined(separator: " "))", false)
+        let result = try await runner.runAsync(
+            colmapPath.path,
+            args,
+            currentDirectory: nil,
+            environment: environment,
+            onStdout: { onLog($0, false) },
+            onStderr: { onLog($0, true) }
+        )
+        try checkResult(result, command: "image_undistorter")
+    }
+
     public func runModelConverter(
         colmapPath: URL,
         inputPath: URL,

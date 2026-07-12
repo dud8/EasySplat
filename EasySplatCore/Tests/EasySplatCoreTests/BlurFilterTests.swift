@@ -5,7 +5,7 @@ final class BlurFilterTests: XCTestCase {
     private func makeRunner() -> PipelineRunner {
         let root = URL(fileURLWithPath: "/tmp")
         let toolchain = TestToolchains.toolchainPaths(root: root)
-        let config = PipelineRunner.PipelineConfig(toolchain: toolchain, preset: PresetSpec(mode: .object, quality: .standard))
+        let config = PipelineRunner.PipelineConfig(toolchain: toolchain)
         return PipelineRunner(projectURL: root, config: config)
     }
 

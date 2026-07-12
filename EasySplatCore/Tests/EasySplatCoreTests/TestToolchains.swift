@@ -49,16 +49,26 @@ enum TestToolchains {
             try """
             {
               "toolchain_name": "da3_mps",
+              "source_repo": "https://github.com/ByteDance-Seed/Depth-Anything-3.git",
+              "source_ref": "test-fixture",
+              "source_commit": "a0b8a92e3d1532361c2f7feb63babc5c18d00ef2",
               "source_path": "test-fixture",
+              "base_checkpoint_commit": "0123456789abcdef0123456789abcdef01234567",
+              "small_checkpoint_commit": "89abcdef0123456789abcdef0123456789abcdef",
               "python_version": "3.13.11",
               "torch_version": "2.10.0",
               "torchvision_version": "0.25.0"
             }
             """.write(to: buildInfo, atomically: true, encoding: .utf8)
-            for modelDir in [modelBundle, fallbackModelBundle] {
+            for (modelName, modelDir) in [("DA3-BASE", modelBundle), ("DA3-SMALL", fallbackModelBundle)] {
                 try "{}\n".write(to: modelDir.appendingPathComponent("config.json"), atomically: true, encoding: .utf8)
                 fm.createFile(atPath: modelDir.appendingPathComponent("model.safetensors").path, contents: Data([0x00]))
-                try #"{"repo_id":"fixture","resolved_sha":"fixture","license":"apache-2.0"}"#.write(
+                let resolvedSHA = modelName == "DA3-BASE"
+                    ? "0123456789abcdef0123456789abcdef01234567"
+                    : "89abcdef0123456789abcdef0123456789abcdef"
+                try """
+                {"repo_id":"depth-anything/\(modelName)","requested_revision":"fixture-revision","resolved_sha":"\(resolvedSHA)","license":"apache-2.0"}
+                """.write(
                     to: modelDir.appendingPathComponent("easysplat_model_info.json"),
                     atomically: true,
                     encoding: .utf8

@@ -13,7 +13,7 @@ final class GeometryArtifactStoreTests: XCTestCase {
         var metadata = ProjectMetadata(
             title: "Measured",
             input: .photos(folder: "/tmp/photos"),
-            preset: PresetSpec(mode: .object, quality: .standard)
+            requestedRunOptions: RequestedRunOptions(capturePath: .orbit, detailProfile: .balanced)
         )
         try ProjectMetadataStore.save(metadata, to: paths.metadataURL)
         let artifact = makeArtifact(fixture: fixture)
@@ -27,6 +27,132 @@ final class GeometryArtifactStoreTests: XCTestCase {
         XCTAssertEqual(try ProjectMetadataStore.load(from: paths.metadataURL).geometryArtifact, artifact)
     }
 
+    func testLoadRejectsSymlinkedGeometryManifest() throws {
+        let parent = try TestFileBuilder.makeTempDir()
+        defer { try? FileManager.default.removeItem(at: parent) }
+        let paths = ProjectPaths(
+            root: parent.appendingPathComponent("Project.easysplatproj", isDirectory: true)
+        )
+        try paths.ensureDirectories()
+        let fixture = try writeCanonicalModel(at: paths)
+        let outside = parent.appendingPathComponent("outside-geometry.json")
+        try JSONEncoder().encode(makeArtifact(fixture: fixture)).write(to: outside)
+        try FileManager.default.createSymbolicLink(
+            at: paths.geometryManifestURL,
+            withDestinationURL: outside
+        )
+
+        XCTAssertThrowsError(
+            try GeometryArtifactStore.load(
+                from: paths.geometryManifestURL,
+                projectPaths: paths
+            )
+        )
+    }
+
+    func testLoadRejectsOversizedOtherwiseDecodableGeometryManifest() throws {
+        let root = try TestFileBuilder.makeTempDir()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let paths = ProjectPaths(root: root)
+        try paths.ensureDirectories()
+        let fixture = try writeCanonicalModel(at: paths)
+        var object = try XCTUnwrap(
+            JSONSerialization.jsonObject(
+                with: JSONEncoder().encode(makeArtifact(fixture: fixture))
+            ) as? [String: Any]
+        )
+        object["ignoredPadding"] = String(repeating: "x", count: 1_048_576)
+        let oversized = try JSONSerialization.data(withJSONObject: object)
+        XCTAssertGreaterThan(oversized.count, 1_048_576)
+        try oversized.write(to: paths.geometryManifestURL)
+
+        XCTAssertThrowsError(
+            try GeometryArtifactStore.load(
+                from: paths.geometryManifestURL,
+                projectPaths: paths
+            )
+        )
+    }
+
+    func testLoadRejectsNonRegularGeometryManifest() throws {
+        let root = try TestFileBuilder.makeTempDir()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let paths = ProjectPaths(root: root)
+        try paths.ensureDirectories()
+        try FileManager.default.createDirectory(
+            at: paths.geometryManifestURL,
+            withIntermediateDirectories: false
+        )
+
+        XCTAssertThrowsError(
+            try GeometryArtifactStore.load(
+                from: paths.geometryManifestURL,
+                projectPaths: paths
+            )
+        )
+    }
+
+    func testPersistRejectsSymlinkedPreviousManifestWithoutTouchingTarget() throws {
+        let parent = try TestFileBuilder.makeTempDir()
+        defer { try? FileManager.default.removeItem(at: parent) }
+        let paths = ProjectPaths(
+            root: parent.appendingPathComponent("Project.easysplatproj", isDirectory: true)
+        )
+        try paths.ensureDirectories()
+        let fixture = try writeCanonicalModel(at: paths)
+        var metadata = ProjectMetadata(
+            title: "Measured",
+            input: .photos(folder: "/tmp/photos"),
+            requestedRunOptions: RequestedRunOptions(capturePath: .orbit, detailProfile: .balanced)
+        )
+        try ProjectMetadataStore.save(metadata, to: paths.metadataURL)
+        let outside = parent.appendingPathComponent("outside-geometry.json")
+        let sentinel = Data("do not replace".utf8)
+        try sentinel.write(to: outside)
+        try FileManager.default.createSymbolicLink(
+            at: paths.geometryManifestURL,
+            withDestinationURL: outside
+        )
+
+        XCTAssertThrowsError(
+            try GeometryArtifactStore.persist(
+                makeArtifact(fixture: fixture),
+                metadata: &metadata,
+                paths: paths
+            )
+        )
+        XCTAssertEqual(try Data(contentsOf: outside), sentinel)
+        XCTAssertNil(metadata.geometryArtifact)
+    }
+
+    func testPersistRestoresPreviousManifestWhenMetadataSaveFails() throws {
+        let root = try TestFileBuilder.makeTempDir()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let paths = ProjectPaths(root: root)
+        try paths.ensureDirectories()
+        let fixture = try writeCanonicalModel(at: paths)
+        var metadata = ProjectMetadata(
+            title: "Measured",
+            input: .photos(folder: "/tmp/photos"),
+            requestedRunOptions: RequestedRunOptions(capturePath: .orbit, detailProfile: .balanced)
+        )
+        try ProjectMetadataStore.save(metadata, to: paths.metadataURL)
+        let previousManifest = Data("previous manifest bytes".utf8)
+        try previousManifest.write(to: paths.geometryManifestURL)
+        metadata.input = .photos(folder: String(repeating: "x", count: 8 * 1_024 * 1_024))
+
+        XCTAssertThrowsError(
+            try GeometryArtifactStore.persist(
+                makeArtifact(fixture: fixture),
+                metadata: &metadata,
+                paths: paths
+            )
+        )
+
+        XCTAssertEqual(try Data(contentsOf: paths.geometryManifestURL), previousManifest)
+        XCTAssertNil(metadata.geometryArtifact)
+    }
+
     func testRejectsEscapingCanonicalPathAndPlaceholderResidualProvenance() throws {
         let root = try TestFileBuilder.makeTempDir()
         defer { try? FileManager.default.removeItem(at: root) }
@@ -37,6 +163,19 @@ final class GeometryArtifactStoreTests: XCTestCase {
         var escaping = makeArtifact(fixture: fixture)
         escaping.canonicalModelPath = "../outside"
         XCTAssertThrowsError(try GeometryArtifactStore.validate(escaping, projectPaths: paths)) { error in
+            XCTAssertEqual(error as? GeometryArtifactStore.Error, .invalidCanonicalPath)
+        }
+
+        let alternate = try paths.resolveProjectRelativePath("SfM/alternate")
+        try FileManager.default.copyItem(
+            at: paths.colmapSparseURL.appendingPathComponent("0", isDirectory: true),
+            to: alternate
+        )
+        var inBundleButNotCanonical = makeArtifact(fixture: fixture)
+        inBundleButNotCanonical.canonicalModelPath = "SfM/alternate"
+        XCTAssertThrowsError(
+            try GeometryArtifactStore.validate(inBundleButNotCanonical, projectPaths: paths)
+        ) { error in
             XCTAssertEqual(error as? GeometryArtifactStore.Error, .invalidCanonicalPath)
         }
 
@@ -75,6 +214,58 @@ final class GeometryArtifactStoreTests: XCTestCase {
         }
     }
 
+    func testRejectsLearnedInitializerChangedAfterGeometryAcceptance() throws {
+        let root = try TestFileBuilder.makeTempDir()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let paths = ProjectPaths(root: root)
+        try paths.ensureDirectories()
+        let fixture = try writeCanonicalModel(at: paths)
+        try FileManager.default.createDirectory(
+            at: paths.colmapSeedModelURL,
+            withIntermediateDirectories: true
+        )
+        let learnedURL = paths.colmapSeedModelURL.appendingPathComponent("learned_points3D.txt")
+        try "1 1 2 3 10 20 30 -1\n".write(
+            to: learnedURL,
+            atomically: true,
+            encoding: .utf8
+        )
+        let digest = try GeometryArtifactStore.sha256(of: learnedURL)
+        var artifact = makeArtifact(fixture: fixture)
+        artifact.modelVersion = "DA3-SMALL@89abcdef0123456789abcdef0123456789abcdef"
+        artifact.provenance.runtime = GeometryComponentProvenance(
+            identifier: "da3_mps",
+            version: "main",
+            revision: "a0b8a92e3d1532361c2f7feb63babc5c18d00ef2",
+            payloadSHA256: String(repeating: "b", count: 64)
+        )
+        artifact.provenance.model = GeometryComponentProvenance(
+            identifier: "DA3-SMALL",
+            version: "apache-2.0-release",
+            revision: "89abcdef0123456789abcdef0123456789abcdef",
+            payloadSHA256: String(repeating: "c", count: 64)
+        )
+        artifact.learnedPointInitializer = LearnedPointInitializerArtifact(
+            path: "SfM/colmap/seed/0/learned_points3D.txt",
+            sha256: digest,
+            pointCount: 1
+        )
+        XCTAssertNoThrow(try GeometryArtifactStore.validate(artifact, projectPaths: paths))
+
+        try "1 9 8 7 10 20 30 -1\n".write(
+            to: learnedURL,
+            atomically: true,
+            encoding: .utf8
+        )
+
+        XCTAssertThrowsError(try GeometryArtifactStore.validate(artifact, projectPaths: paths)) { error in
+            XCTAssertEqual(
+                error as? GeometryArtifactStore.Error,
+                .learnedInitializerDigestMismatch
+            )
+        }
+    }
+
     func testRejectsResidualsAndFrameDigestsThatDoNotMatchHashedArtifacts() throws {
         let root = try TestFileBuilder.makeTempDir()
         defer { try? FileManager.default.removeItem(at: root) }
@@ -103,6 +294,76 @@ final class GeometryArtifactStoreTests: XCTestCase {
         }
     }
 
+    func testSchemaTwoRequiresCompleteToolchainProvenance() throws {
+        let root = try TestFileBuilder.makeTempDir()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let paths = ProjectPaths(root: root)
+        try paths.ensureDirectories()
+        let fixture = try writeCanonicalModel(at: paths)
+
+        var artifact = makeArtifact(fixture: fixture)
+        artifact.provenance.solver.identifier = ""
+        XCTAssertThrowsError(try GeometryArtifactStore.validate(artifact, projectPaths: paths)) { error in
+            XCTAssertEqual(error as? GeometryArtifactStore.Error, .invalidProvenance)
+        }
+
+        artifact = makeArtifact(fixture: fixture)
+        let modelRevision = "89abcdef0123456789abcdef0123456789abcdef"
+        artifact.modelVersion = "DA3-SMALL@\(modelRevision)"
+        artifact.provenance = GeometryProvenance(
+            toolchainVersion: "2.0.0",
+            solver: GeometryComponentProvenance(
+                identifier: "colmap",
+                version: "3.13.0",
+                revision: "fa7280fee27f97aff31ae7f98bab7f583fac7d08",
+                payloadSHA256: String(repeating: "a", count: 64)
+            ),
+            runtime: GeometryComponentProvenance(
+                identifier: "da3_mps",
+                version: "main",
+                revision: "a0b8a92e3d1532361c2f7feb63babc5c18d00ef2",
+                payloadSHA256: String(repeating: "b", count: 64)
+            ),
+            model: GeometryComponentProvenance(
+                identifier: "DA3-SMALL",
+                version: "apache-2.0-release",
+                revision: modelRevision,
+                payloadSHA256: String(repeating: "c", count: 64)
+            )
+        )
+        try FileManager.default.createDirectory(
+            at: paths.colmapSeedModelURL,
+            withIntermediateDirectories: true
+        )
+        let learnedURL = paths.colmapSeedModelURL.appendingPathComponent("learned_points3D.txt")
+        try "1 1 2 3 10 20 30 -1\n".write(
+            to: learnedURL,
+            atomically: true,
+            encoding: .utf8
+        )
+        artifact.learnedPointInitializer = LearnedPointInitializerArtifact(
+            path: "SfM/colmap/seed/0/learned_points3D.txt",
+            sha256: try GeometryArtifactStore.sha256(of: learnedURL),
+            pointCount: 1
+        )
+
+        XCTAssertNoThrow(try GeometryArtifactStore.validate(artifact, projectPaths: paths))
+    }
+
+    func testRejectsRetiredGeometrySchema() throws {
+        let root = try TestFileBuilder.makeTempDir()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let paths = ProjectPaths(root: root)
+        try paths.ensureDirectories()
+        let fixture = try writeCanonicalModel(at: paths)
+        var artifact = makeArtifact(fixture: fixture)
+        artifact.schemaVersion = 1
+
+        XCTAssertThrowsError(try GeometryArtifactStore.validate(artifact, projectPaths: paths)) { error in
+            XCTAssertEqual(error as? GeometryArtifactStore.Error, .invalidSchema(1))
+        }
+    }
+
     private typealias Fixture = (
         modelHashes: [String: String],
         inputDigest: String,
@@ -111,10 +372,10 @@ final class GeometryArtifactStoreTests: XCTestCase {
 
     private func makeArtifact(fixture: Fixture) -> GeometryArtifact {
         GeometryArtifact(
-            schemaVersion: 1,
-            solverVersion: "da3-aligned",
+            schemaVersion: GeometryArtifact.currentSchemaVersion,
+            solverVersion: "colmap; COLMAP 3.13.0",
             runtimeVersion: "easysplat-core-v2",
-            modelVersion: "DA3-BASE",
+            modelVersion: "none",
             inputDigest: fixture.inputDigest,
             selectedFramesDigest: fixture.selectedFramesDigest,
             orderedImageNames: ["frame_000001.jpg"],
@@ -136,7 +397,18 @@ final class GeometryArtifactStoreTests: XCTestCase {
             timings: ["sfmMapping": 1.5],
             peakMemoryBytes: 1_024,
             modelHashes: fixture.modelHashes,
-            fallbackReason: nil
+            fallbackReason: nil,
+            provenance: GeometryProvenance(
+                toolchainVersion: "2.0.0",
+                solver: GeometryComponentProvenance(
+                    identifier: "colmap",
+                    version: "3.13.0",
+                    revision: "fa7280fee27f97aff31ae7f98bab7f583fac7d08",
+                    payloadSHA256: String(repeating: "a", count: 64)
+                ),
+                runtime: nil,
+                model: nil
+            )
         )
     }
 

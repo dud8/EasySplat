@@ -8,8 +8,11 @@ enum ColmapResidualAnalyzer {
         case malformedRecord(file: String, line: Int)
         case unsupportedCameraModel(String)
         case missingPoint(Int64)
+        case duplicatePoint(Int64)
         case duplicateImage(Int)
         case duplicateImageName(String)
+        case duplicateTrack(imageID: Int, point2DIndex: Int)
+        case inconsistentTrack(pointID: Int64, imageID: Int, point2DIndex: Int)
         case unprojectableObservation(pointID: Int64, imageLine: Int)
         case noTrackedObservations
 
@@ -23,10 +26,16 @@ enum ColmapResidualAnalyzer {
                 return "COLMAP camera model \(model) is not supported for residual measurement."
             case .missingPoint(let id):
                 return "COLMAP observation references missing point \(id)."
+            case .duplicatePoint(let id):
+                return "COLMAP model contains duplicate point ID \(id)."
             case .duplicateImage(let id):
                 return "COLMAP model contains duplicate image ID \(id)."
             case .duplicateImageName(let name):
                 return "COLMAP model contains duplicate image name \(name)."
+            case .duplicateTrack(let imageID, let point2DIndex):
+                return "COLMAP track assigns image \(imageID) observation \(point2DIndex) more than once."
+            case .inconsistentTrack(let pointID, let imageID, let point2DIndex):
+                return "COLMAP point \(pointID) and image \(imageID) observation \(point2DIndex) do not reference each other."
             case .unprojectableObservation(let pointID, let imageLine):
                 return "COLMAP observation for point \(pointID) at images.txt line \(imageLine) cannot be projected."
             case .noTrackedObservations:
@@ -41,6 +50,7 @@ enum ColmapResidualAnalyzer {
         let measuredImageNames: [String]
         let pointCount: Int
         let observationCount: Int
+        let meanPixelResidual: Double
         let medianPixelResidual: Double
         let p90PixelResidual: Double
         let provenance: String
@@ -50,6 +60,16 @@ enum ColmapResidualAnalyzer {
         let x: Double
         let y: Double
         let z: Double
+    }
+
+    private struct ObservationKey: Hashable {
+        let imageID: Int
+        let point2DIndex: Int
+    }
+
+    private struct PointRecord {
+        let position: Point3
+        let track: Set<ObservationKey>
     }
 
     private struct Pose {
@@ -165,6 +185,7 @@ enum ColmapResidualAnalyzer {
         var registeredImageIDs = Set<Int>()
         var registeredImageNames = Set<String>()
         var measuredImageNames = Set<String>()
+        var verifiedObservations: [ObservationKey: Int64] = [:]
         var index = 0
 
         while index < lines.count {
@@ -214,10 +235,25 @@ enum ColmapResidualAnalyzer {
                     throw Error.malformedRecord(file: "images.txt", line: observationLineNumber)
                 }
                 if pointID < 0 { continue }
-                guard let worldPoint = points[pointID] else { throw Error.missingPoint(pointID) }
+                let point2DIndex = offset / 3
+                let observationKey = ObservationKey(
+                    imageID: imageID,
+                    point2DIndex: point2DIndex
+                )
+                guard let point = points[pointID] else { throw Error.missingPoint(pointID) }
+                guard point.track.contains(observationKey) else {
+                    throw Error.inconsistentTrack(
+                        pointID: pointID,
+                        imageID: imageID,
+                        point2DIndex: point2DIndex
+                    )
+                }
+                guard verifiedObservations.updateValue(pointID, forKey: observationKey) == nil else {
+                    throw Error.duplicateTrack(imageID: imageID, point2DIndex: point2DIndex)
+                }
                 guard observedX.isFinite,
                       observedY.isFinite,
-                      let cameraPoint = pose.cameraPoint(worldPoint),
+                      let cameraPoint = pose.cameraPoint(point.position),
                       let projected = camera.project(cameraPoint) else {
                     throw Error.unprojectableObservation(
                         pointID: pointID,
@@ -237,7 +273,21 @@ enum ColmapResidualAnalyzer {
             if imageHasMeasuredObservation { measuredImageNames.insert(imageName) }
         }
 
+
+        for (pointID, point) in points {
+            for observation in point.track {
+                guard verifiedObservations[observation] == pointID else {
+                    throw Error.inconsistentTrack(
+                        pointID: pointID,
+                        imageID: observation.imageID,
+                        point2DIndex: observation.point2DIndex
+                    )
+                }
+            }
+        }
+
         guard !residuals.isEmpty else { throw Error.noTrackedObservations }
+        let mean = residuals.reduce(0, +) / Double(residuals.count)
         residuals.sort()
         let middle = residuals.count / 2
         let median = residuals.count.isMultiple(of: 2)
@@ -250,6 +300,7 @@ enum ColmapResidualAnalyzer {
             measuredImageNames: measuredImageNames.sorted(),
             pointCount: points.count,
             observationCount: residuals.count,
+            meanPixelResidual: mean,
             medianPixelResidual: median,
             p90PixelResidual: residuals[p90Index],
             provenance: "colmap-text-tracks-v1"
@@ -304,18 +355,49 @@ enum ColmapResidualAnalyzer {
         }
     }
 
-    private static func parsePoints(at url: URL) throws -> [Int64: Point3] {
+    private static func parsePoints(at url: URL) throws -> [Int64: PointRecord] {
         let text = try String(contentsOf: url, encoding: .utf8)
-        var points: [Int64: Point3] = [:]
+        var points: [Int64: PointRecord] = [:]
+        var trackOwners: [ObservationKey: Int64] = [:]
         for (index, rawLine) in text.components(separatedBy: .newlines).enumerated() {
             let line = rawLine.trimmingCharacters(in: .whitespacesAndNewlines)
             if line.isEmpty || line.hasPrefix("#") { continue }
             let fields = line.split(whereSeparator: \.isWhitespace)
-            guard fields.count >= 4, let id = Int64(fields[0]),
-                  let x = Double(fields[1]), let y = Double(fields[2]), let z = Double(fields[3]) else {
+            guard fields.count >= 10,
+                  fields.count.isMultiple(of: 2),
+                  let id = Int64(fields[0]), id > 0,
+                  let x = Double(fields[1]), x.isFinite,
+                  let y = Double(fields[2]), y.isFinite,
+                  let z = Double(fields[3]), z.isFinite,
+                  let red = Int(fields[4]), (0...255).contains(red),
+                  let green = Int(fields[5]), (0...255).contains(green),
+                  let blue = Int(fields[6]), (0...255).contains(blue),
+                  let error = Double(fields[7]), error.isFinite, error >= 0 else {
                 throw Error.malformedRecord(file: "points3D.txt", line: index + 1)
             }
-            points[id] = Point3(x: x, y: y, z: z)
+            guard points[id] == nil else { throw Error.duplicatePoint(id) }
+
+            var track = Set<ObservationKey>()
+            var trackedImages = Set<Int>()
+            for offset in stride(from: 8, to: fields.count, by: 2) {
+                guard let imageID = Int(fields[offset]), imageID > 0,
+                      let point2DIndex = Int(fields[offset + 1]), point2DIndex >= 0 else {
+                    throw Error.malformedRecord(file: "points3D.txt", line: index + 1)
+                }
+                let key = ObservationKey(imageID: imageID, point2DIndex: point2DIndex)
+                guard track.insert(key).inserted,
+                      trackedImages.insert(imageID).inserted,
+                      trackOwners.updateValue(id, forKey: key) == nil else {
+                    throw Error.duplicateTrack(imageID: imageID, point2DIndex: point2DIndex)
+                }
+            }
+            guard !track.isEmpty else {
+                throw Error.malformedRecord(file: "points3D.txt", line: index + 1)
+            }
+            points[id] = PointRecord(
+                position: Point3(x: x, y: y, z: z),
+                track: track
+            )
         }
         return points
     }

@@ -4,20 +4,134 @@ import Foundation
 public enum RunPlanResolver {
     public enum ValidationError: Error, LocalizedError, Equatable {
         case continuousMultipleClipsUnsupported
+        case fastDetailRequired
+        case highDetailRequiresMoreMemory
+        case noValidPhotos
+        case photoSelectionExceedsSafeLimit(selected: Int, maximum: Int)
 
         public var errorDescription: String? {
             switch self {
             case .continuousMultipleClipsUnsupported:
                 return "Continuous sequence currently supports one video clip. Use Automatic or Unordered for separate clips."
+            case .fastDetailRequired:
+                return "This Mac supports the Fast detail profile. Choose Fast to stay within its memory limit."
+            case .highDetailRequiresMoreMemory:
+                return "High Detail requires a Mac with at least 24 GB of unified memory. Choose Balanced or Fast."
+            case .noValidPhotos:
+                return "This folder has no readable photos. Choose a folder with JPEG, PNG, HEIC, or HEIF images."
+            case let .photoSelectionExceedsSafeLimit(selected, maximum):
+                return "This folder has \(selected) valid photos. This run can safely use up to \(maximum). Choose Automatic selection or a smaller folder."
             }
         }
     }
 
-    public static func validate(requestedOptions: RequestedRunOptions, input: InputSpec) throws {
-        guard requestedOptions.inputOrdering == .continuous else { return }
-        if input.videoFiles.count > 1 || (input.hasVideos && input.hasPhotos) {
+    public static func validate(
+        requestedOptions: RequestedRunOptions,
+        input: InputSpec
+    ) throws {
+        try validate(
+            requestedOptions: requestedOptions,
+            input: input,
+            hardware: .detect()
+        )
+    }
+
+    public static func validate(
+        requestedOptions: RequestedRunOptions,
+        input: InputSpec,
+        hardware: HardwareProfile
+    ) throws {
+        if hardware.memoryGB <= 8.5, requestedOptions.detailProfile != .fast {
+            throw ValidationError.fastDetailRequired
+        }
+        if hardware.memoryGB <= 16.5, requestedOptions.detailProfile == .highDetail {
+            throw ValidationError.highDetailRequiresMoreMemory
+        }
+        if !supports(inputOrdering: requestedOptions.inputOrdering, input: input) {
             throw ValidationError.continuousMultipleClipsUnsupported
         }
+    }
+
+    public static func supports(detail: DetailProfile, memoryGB: Double) -> Bool {
+        if memoryGB <= 8.5 {
+            return detail == .fast
+        }
+        if memoryGB <= 16.5 {
+            return detail != .highDetail
+        }
+        return true
+    }
+
+    public static func supports(resourcePolicy: ResourcePolicy, memoryGB: Double) -> Bool {
+        resourcePolicy != .maximumPerformance || memoryGB > 16.5
+    }
+
+    public static func supports(inputOrdering: InputOrdering, input: InputSpec) -> Bool {
+        guard inputOrdering == .continuous else { return true }
+        return input.videoFiles.count <= 1 && !(input.hasVideos && input.hasPhotos)
+    }
+
+    public static func maximumValidPhotoCount(for resolvedPlan: ResolvedRunPlan) -> Int? {
+        resolvedPlan.photoSelection == .useAllValidPhotos
+            ? resolvedPlan.keyframeBudget
+            : nil
+    }
+
+    public static func maximumValidPhotoCount(
+        for resolvedPlan: ResolvedRunPlan,
+        input: InputSpec
+    ) -> Int? {
+        guard resolvedPlan.photoSelection == .useAllValidPhotos else { return nil }
+        return max(
+            0,
+            resolvedPlan.keyframeBudget - minimumReservedVideoFrameCount(
+                keyframeBudget: resolvedPlan.keyframeBudget,
+                videoCount: input.hasPhotos ? input.videoFiles.count : 0
+            )
+        )
+    }
+
+    public static func minimumReservedVideoFrameCount(
+        keyframeBudget: Int,
+        videoCount: Int
+    ) -> Int {
+        guard keyframeBudget > 0, videoCount > 0 else { return 0 }
+        return min(keyframeBudget, max(videoCount * 2, keyframeBudget / 4))
+    }
+
+    public static func validatePhotoSelection(
+        validPhotoCount: Int,
+        resolvedPlan: ResolvedRunPlan
+    ) throws {
+        try validatePhotoSelection(
+            validPhotoCount: validPhotoCount,
+            maximum: maximumValidPhotoCount(for: resolvedPlan)
+        )
+    }
+
+    public static func validatePhotoSelection(
+        validPhotoCount: Int,
+        resolvedPlan: ResolvedRunPlan,
+        input: InputSpec
+    ) throws {
+        try validatePhotoSelection(
+            validPhotoCount: validPhotoCount,
+            maximum: maximumValidPhotoCount(for: resolvedPlan, input: input)
+        )
+    }
+
+    private static func validatePhotoSelection(
+        validPhotoCount: Int,
+        maximum: Int?
+    ) throws {
+        guard validPhotoCount > 0 else {
+            throw ValidationError.noValidPhotos
+        }
+        guard let maximum, validPhotoCount > maximum else { return }
+        throw ValidationError.photoSelectionExceedsSafeLimit(
+            selected: validPhotoCount,
+            maximum: maximum
+        )
     }
 
     public static func resolveForCurrentHardware(
@@ -33,7 +147,52 @@ public enum RunPlanResolver {
         )
     }
 
-    static func resolve(
+    public static func safeResumeStage(
+        _ lastCompletedStage: PipelineStage?,
+        input: InputSpec,
+        previousPlan: ResolvedRunPlan?,
+        currentPlan: ResolvedRunPlan
+    ) -> PipelineStage? {
+        guard let lastCompletedStage,
+              let previousPlan,
+              previousPlan != currentPlan else {
+            return lastCompletedStage
+        }
+        let framePreparationChanged = previousPlan.keyframeBudget != currentPlan.keyframeBudget
+            || previousPlan.maximumImageDimension != currentPlan.maximumImageDimension
+            || previousPlan.photoSelection != currentPlan.photoSelection
+        let geometryChanged = previousPlan.routeIdentifier != currentPlan.routeIdentifier
+            || previousPlan.modelIdentifier != currentPlan.modelIdentifier
+            || previousPlan.memoryTier != currentPlan.memoryTier
+            || previousPlan.chunkSize != currentPlan.chunkSize
+            || previousPlan.cameraGrouping != currentPlan.cameraGrouping
+            || previousPlan.lensProjection != currentPlan.lensProjection
+            || previousPlan.refinementIterationLimit != currentPlan.refinementIterationLimit
+            || previousPlan.colmapMaximumFeatureCount != currentPlan.colmapMaximumFeatureCount
+            || previousPlan.colmapMaximumMatchCount != currentPlan.colmapMaximumMatchCount
+            || previousPlan.colmapExhaustiveBlockSize != currentPlan.colmapExhaustiveBlockSize
+            || previousPlan.colmapThreadLimit != currentPlan.colmapThreadLimit
+            || previousPlan.requiredToolchainCapabilities != currentPlan.requiredToolchainCapabilities
+            || previousPlan.fallbackRouteIdentifiers != currentPlan.fallbackRouteIdentifiers
+            || previousPlan.capturePath != currentPlan.capturePath
+            || previousPlan.inputOrdering != currentPlan.inputOrdering
+            || previousPlan.pairingPolicy != currentPlan.pairingPolicy
+            || previousPlan.sequentialOverlap != currentPlan.sequentialOverlap
+        let safeBoundary: PipelineStage
+        if framePreparationChanged {
+            safeBoundary = input.hasVideos ? .importInput : .extractFrames
+        } else if geometryChanged {
+            safeBoundary = .selectFrames
+        } else {
+            safeBoundary = .sfmMapping
+        }
+        let stages = PipelineStage.allCases
+        let completedIndex = stages.firstIndex(of: lastCompletedStage) ?? 0
+        let boundaryIndex = stages.firstIndex(of: safeBoundary) ?? 0
+        return completedIndex < boundaryIndex ? lastCompletedStage : safeBoundary
+    }
+
+    public static func resolve(
         requestedOptions options: RequestedRunOptions,
         input: InputSpec,
         hardware: HardwareProfile,
@@ -70,6 +229,11 @@ public enum RunPlanResolver {
         let trainerBudget = trainerBudget(for: options.detailProfile)
         let cameraGrouping = resolvedCameraGrouping(options.cameraGrouping, input: input)
         let lensProjection = options.lensProjection
+        let colmapBudget = resolvedColmapBudget(
+            memoryTier: memoryTier,
+            resourcePolicy: options.resourcePolicy,
+            cpuCount: hardware.cpuCount
+        )
 
         return ResolvedRunPlan(
             routeIdentifier: route.rawValue,
@@ -90,6 +254,10 @@ public enum RunPlanResolver {
             ),
             trainerIterationLimit: trainerBudget.iterations,
             plateauWindow: trainerBudget.plateau,
+            colmapMaximumFeatureCount: colmapBudget.features,
+            colmapMaximumMatchCount: colmapBudget.matches,
+            colmapExhaustiveBlockSize: colmapBudget.blockSize,
+            colmapThreadLimit: colmapBudget.threads,
             requiredToolchainCapabilities: requiredCapabilities(route: route, model: model),
             fallbackRouteIdentifiers: developmentOverrides.candidateRoute == nil
                 ? [SfmBackend.colmap.rawValue]
@@ -150,7 +318,7 @@ public enum RunPlanResolver {
         resourcePolicy: ResourcePolicy,
         memoryGB: Double
     ) -> MemoryTier {
-        if memoryGB <= 16 { return .constrained }
+        if memoryGB <= 16.5 { return .constrained }
         switch resourcePolicy {
         case .conserveMemory:
             return .constrained
@@ -168,7 +336,7 @@ public enum RunPlanResolver {
         memoryGB: Double
     ) -> String {
         guard route == .da3 else { return "none" }
-        if detail == .fast || resourcePolicy == .conserveMemory || memoryGB <= 16 {
+        if detail == .fast || resourcePolicy == .conserveMemory || memoryGB <= 16.5 {
             return "DA3-SMALL"
         }
         return "DA3-BASE"
@@ -258,6 +426,30 @@ public enum RunPlanResolver {
         case .balanced: return (7_000, 800)
         case .highDetail: return (15_000, 1_500)
         }
+    }
+
+    private static func resolvedColmapBudget(
+        memoryTier: MemoryTier,
+        resourcePolicy: ResourcePolicy,
+        cpuCount: Int
+    ) -> (features: Int, matches: Int, blockSize: Int, threads: Int) {
+        let values: (features: Int, matches: Int, blockSize: Int, threadCap: Int)
+        switch memoryTier {
+        case .constrained:
+            values = (4_096, 4_096, 10, 4)
+        case .standard:
+            values = (8_192, 8_192, 20, 6)
+        case .performance where resourcePolicy == .maximumPerformance:
+            values = (12_000, 12_000, 32, 10)
+        case .performance:
+            values = (10_000, 10_000, 25, 8)
+        }
+        return (
+            values.features,
+            values.matches,
+            values.blockSize,
+            min(max(1, cpuCount), values.threadCap)
+        )
     }
 
     private static func requiredCapabilities(route: SfmBackend, model: String) -> [String] {

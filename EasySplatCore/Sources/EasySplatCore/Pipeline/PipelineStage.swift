@@ -15,10 +15,6 @@ public enum PipelineStage: String, Codable, Sendable, CaseIterable {
     public init(from decoder: Decoder) throws {
         let container = try decoder.singleValueContainer()
         let value = try container.decode(String.self)
-        if value == "trainBrush" {
-            self = .trainSplat
-            return
-        }
         guard let stage = Self(rawValue: value) else {
             throw DecodingError.dataCorruptedError(
                 in: container,
