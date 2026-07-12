@@ -96,7 +96,7 @@ struct HomeView: View {
             }
         } message: { project in
             if let updatedAt = project.checkpointUpdatedAt {
-                Text("Found unfinished progress for \"\(project.title)\" (last checkpoint: \(updatedAt.formatted(date: .abbreviated, time: .shortened))).")
+                Text("Found unfinished progress for \"\(project.title)\" (last saved project state: \(updatedAt.formatted(date: .abbreviated, time: .shortened))).")
             } else {
                 Text("Found unfinished progress for \"\(project.title)\".")
             }

@@ -65,7 +65,6 @@ extension PipelineRunner {
             self.removeIfExists(paths.colmapSeedURL)
             self.removeIfExists(paths.colmapSparseURL)
             self.removeIfExists(paths.trainingURL)
-            self.removeIfExists(paths.outputURL)
         case .selectFrames:
             self.removeIfExists(paths.framesSelectedURL)
             self.removeIfExists(paths.framesSelectedManifestURL)
@@ -73,22 +72,18 @@ extension PipelineRunner {
             self.removeIfExists(paths.colmapSeedURL)
             self.removeIfExists(paths.colmapSparseURL)
             self.removeIfExists(paths.trainingURL)
-            self.removeIfExists(paths.outputURL)
         case .sfmFeatures, .sfmMatching:
             self.removeIfExists(paths.colmapDatabaseURL)
             self.removeIfExists(paths.colmapSeedURL)
             self.removeIfExists(paths.colmapSparseURL)
             self.removeIfExists(paths.trainingURL)
-            self.removeIfExists(paths.outputURL)
         case .sfmMapping:
             self.removeIfExists(paths.colmapSparseURL)
             self.removeIfExists(paths.trainingURL)
-            self.removeIfExists(paths.outputURL)
         case .trainBrush:
-            self.removeIfExists(paths.trainingURL)
-            self.removeIfExists(paths.outputURL)
+            return
         case .exportSplat:
-            self.removeIfExists(paths.outputURL)
+            return
         case .done:
             return
         }
@@ -348,11 +343,48 @@ extension PipelineRunner {
             }
             return .valid
         case .trainBrush:
-            guard let latest = latestTrainingExport(
+            if let artifact = metadata.trainingArtifact {
+                switch artifact.completionStatus {
+                case .checkpointed:
+                    return .missing
+                case .completed:
+                    guard artifact.detailProfile == metadata.effectiveDetailProfile else {
+                        return .corrupt(
+                            reason: "completed training profile does not match the requested detail"
+                        )
+                    }
+                    guard let outputPath = artifact.outputPath else {
+                        return .corrupt(reason: "completed training manifest has no output path")
+                    }
+                    let outputStatus: StageOutputStatus
+                    do {
+                        outputStatus = validatePlyFile(
+                            at: try paths.resolveProjectRelativePath(outputPath)
+                        )
+                    } catch {
+                        return .corrupt(reason: error.localizedDescription)
+                    }
+                    guard outputStatus == .valid else { return outputStatus }
+                    do {
+                        let identity = try currentMsplatDatasetIdentity(paths: paths)
+                        guard artifact.inputDigest == identity.inputDigest,
+                              artifact.geometryDigest == identity.geometryDigest else {
+                            return .corrupt(
+                                reason: "completed training manifest does not match current input or geometry"
+                            )
+                        }
+                    } catch {
+                        return .corrupt(
+                            reason: "completed training identity could not be verified: \(error.localizedDescription)"
+                        )
+                    }
+                    return .valid
+                }
+            }
+            guard let latest = latestBrushExport(
                 in: paths.trainingURL,
-                backend: .brush,
                 minModificationDate: trainingExportMinimumDate(metadata: metadata)
-            ) else { return .missing }
+            )?.file else { return .missing }
             return validatePlyFile(at: latest)
         case .exportSplat, .done:
             let output: URL

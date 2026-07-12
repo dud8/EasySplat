@@ -478,22 +478,20 @@ private final class SubprocessStreamCollector: @unchecked Sendable {
     }
 
     func appendAvailableData(from handle: FileHandle) {
-        let lines = lockedAppend {
+        lockedAppendAndEmit {
             handle.availableData
         }
-        emit(lines)
     }
 
     func drainAndFinish(readRemaining: () -> Data) {
-        let lines = lockedAppend(readRemaining, flush: true)
-        emit(lines)
+        lockedAppendAndEmit(readRemaining, flush: true)
     }
 
     func value() -> String {
         output.value()
     }
 
-    private func lockedAppend(_ readRemaining: () -> Data, flush: Bool = false) -> [String] {
+    private func lockedAppendAndEmit(_ readRemaining: () -> Data, flush: Bool = false) {
         lock.lock()
         var lines = appendLocked(readRemaining())
         if flush {
@@ -505,8 +503,10 @@ private final class SubprocessStreamCollector: @unchecked Sendable {
                 lines.append(remaining)
             }
         }
+        for line in lines {
+            onLine(line)
+        }
         lock.unlock()
-        return lines
     }
 
     private func appendLocked(_ data: Data) -> [String] {
@@ -517,11 +517,6 @@ private final class SubprocessStreamCollector: @unchecked Sendable {
         return lineBuffer.append(text)
     }
 
-    private func emit(_ lines: [String]) {
-        for line in lines {
-            onLine(line)
-        }
-    }
 }
 
 private final class OutputBuffer: @unchecked Sendable {

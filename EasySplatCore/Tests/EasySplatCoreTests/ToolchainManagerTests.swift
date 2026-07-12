@@ -134,6 +134,38 @@ final class ToolchainManagerTests: XCTestCase {
         }
     }
 
+    func testValidateToolchainRequiresCheckpointPatchProvenance() throws {
+        for mutation in ["missing", "malformed"] {
+            let root = try TestFileBuilder.makeTempDir()
+            defer { try? FileManager.default.removeItem(at: root) }
+            _ = try ToolchainFixtureBuilder.createToolchain(at: root)
+            let buildInfo = root.appendingPathComponent("msplat/build_info.json")
+            var payload = try XCTUnwrap(
+                try JSONSerialization.jsonObject(with: Data(contentsOf: buildInfo)) as? [String: Any]
+            )
+            if mutation == "missing" {
+                payload.removeValue(forKey: "checkpoint_patch_sha256")
+            } else {
+                payload["checkpoint_patch_sha256"] = "not-a-hash"
+            }
+            try JSONSerialization.data(withJSONObject: payload).write(
+                to: buildInfo,
+                options: .atomic
+            )
+
+            let manager = ToolchainManager(runner: makeValidationRunner(root: root))
+            XCTAssertThrowsError(try manager.test_validateToolchain(root: root)) { error in
+                guard case ToolchainManager.ToolchainError.invalidToolchain(let message) = error else {
+                    return XCTFail("Expected invalidToolchain error")
+                }
+                XCTAssertTrue(
+                    message.contains("checkpoint_patch_sha256"),
+                    "Expected checkpoint-patch provenance failure for \(mutation), got \(message)"
+                )
+            }
+        }
+    }
+
     func testValidateToolchainRejectsMsplatPayloadHashMismatch() throws {
         let root = try TestFileBuilder.makeTempDir()
         defer { try? FileManager.default.removeItem(at: root) }

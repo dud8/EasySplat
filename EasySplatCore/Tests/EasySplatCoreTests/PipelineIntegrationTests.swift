@@ -980,9 +980,15 @@ final class PipelineIntegrationTests: XCTestCase {
             (try FileManager.default.attributesOfItem(atPath: plySizeProbe.path)[.size] as? NSNumber)?.int64Value
         )
         try FileManager.default.removeItem(at: plySizeProbe)
+        let inputDigest = String(repeating: "1", count: 64)
+        let geometryDigest = String(repeating: "2", count: 64)
+        let trainerDigest = String(repeating: "3", count: 64)
+        let payloadDigest = String(repeating: "4", count: 64)
+        let generation = "00000000-" + String(repeating: "5", count: 64)
         let msplatEvents = """
-        {"camera_count":12,"event":"started","initial_gaussian_count":1500,"iteration":0,"iteration_limit":3000,"plateau_window":400,"profile":"fast","schema_version":1,"seed":42,"sequence":1,"version":"1.1.3 (git 106499b)"}
-        {"elapsed_seconds":2,"event":"completed","gaussian_count":1800,"iteration":3000,"iteration_limit":3000,"output_bytes":\(msplatOutputBytes),"plateau_window":400,"profile":"fast","schema_version":1,"seed":42,"sequence":2,"stop_reason":"iteration_limit"}
+        {"camera_count":12,"checkpoint_schema":1,"event":"started","geometry_digest":"\(geometryDigest)","initial_gaussian_count":1500,"input_digest":"\(inputDigest)","iteration":0,"iteration_limit":3000,"payload_schema":2,"plateau_window":400,"profile":"fast","resumed":false,"schema_version":1,"seed":42,"sequence":1,"trainer_build_digest":"\(trainerDigest)","version":"1.1.3 (git 106499b)"}
+        {"checkpoint_generation":"\(generation)","checkpoint_payload_bytes":128,"checkpoint_payload_sha256":"\(payloadDigest)","event":"checkpoint_completed","gaussian_count":1500,"geometry_digest":"\(geometryDigest)","input_digest":"\(inputDigest)","iteration":0,"profile":"fast","schema_version":1,"seed":42,"sequence":2,"trainer_build_digest":"\(trainerDigest)","version":"1.1.3 (git 106499b)"}
+        {"elapsed_seconds":2,"event":"completed","gaussian_count":1800,"geometry_digest":"\(geometryDigest)","input_digest":"\(inputDigest)","iteration":3000,"iteration_limit":3000,"output_bytes":\(msplatOutputBytes),"plateau_window":400,"profile":"fast","schema_version":1,"seed":42,"sequence":3,"stop_reason":"iteration_limit","trainer_build_digest":"\(trainerDigest)","version":"1.1.3 (git 106499b)"}
         """ + "\n"
         var msplatDatasetPath: String?
         let runner = MockSubprocessRunner(scripts: [
@@ -1035,13 +1041,18 @@ final class PipelineIntegrationTests: XCTestCase {
                 result: .init(exitCode: 0, terminationReason: .exit, stdout: msplatEvents, stderr: ""),
                 onRun: { args in
                     guard let datasetArg = args.dropFirst().first,
-                          let outputArg = self.value(for: "--output", in: args) else { return }
+                          let outputArg = self.value(for: "--output", in: args),
+                          let checkpointArg = self.value(for: "--checkpoint", in: args) else { return }
                     msplatDatasetPath = datasetArg
                     let dataset = URL(fileURLWithPath: datasetArg, isDirectory: true)
                     XCTAssertTrue(FileManager.default.fileExists(atPath: dataset.appendingPathComponent("sparse/0/cameras.bin").path))
                     XCTAssertTrue(args.contains("fast"))
                     XCTAssertFalse(args.contains("--num-iters"))
                     try? TestFileBuilder.writeMinimalPly(at: URL(fileURLWithPath: outputArg))
+                    try? FileManager.default.createDirectory(
+                        at: URL(fileURLWithPath: checkpointArg, isDirectory: true),
+                        withIntermediateDirectories: true
+                    )
                 }
             )
         ])
@@ -1062,6 +1073,437 @@ final class PipelineIntegrationTests: XCTestCase {
         XCTAssertNotNil(msplatDatasetPath)
         let output = projectURL.appendingPathComponent("Output/splat.ply")
         XCTAssertTrue(FileManager.default.fileExists(atPath: output.path))
+        let completedMetadata = try ProjectMetadataStore.load(from: paths.metadataURL)
+        XCTAssertEqual(completedMetadata.trainingArtifact?.completionStatus, .completed)
+        XCTAssertEqual(completedMetadata.trainingArtifact?.trainerBuildDigest, trainerDigest)
+        XCTAssertEqual(completedMetadata.trainingArtifact?.outputPath, "Training/msplat/splat.ply")
+        XCTAssertFalse(FileManager.default.fileExists(atPath: paths.msplatCheckpointURL.path))
+        XCTAssertEqual(
+            try TrainingArtifactStore.load(
+                from: paths.trainingManifestURL,
+                projectPaths: paths
+            ),
+            completedMetadata.trainingArtifact
+        )
+    }
+
+    func testPipelineCancellationRestartsFreshWhenNativeRejectsCheckpoint() async throws {
+        let temp = makeTempRoot()
+        let externalMsplat = temp.appendingPathComponent("External/easysplat-train")
+        try TestFileBuilder.createExecutable(at: externalMsplat)
+        let restore = await scopedPipelineEnvironment([
+            "EASYSPLAT_SFM_BACKEND": "colmap",
+            "EASYSPLAT_SFM_MAPPER": nil,
+            "EASYSPLAT_TRAINER": "msplat",
+            "EASYSPLAT_MSPLAT_BIN": externalMsplat.path,
+            "EASYSPLAT_SKIP_TRAINING": nil,
+        ])
+        defer { restore() }
+
+        let projectURL = temp.appendingPathComponent("ResumeMsplat.easysplatproj", isDirectory: true)
+        let sourcePhotos = temp.appendingPathComponent("SourcePhotos", isDirectory: true)
+        try FileManager.default.createDirectory(at: sourcePhotos, withIntermediateDirectories: true)
+        for index in 0..<12 {
+            try writeTestImage(
+                url: sourcePhotos.appendingPathComponent("img\(index).jpg"),
+                value: UInt8(index)
+            )
+        }
+        let metadata = ProjectMetadata(
+            title: "Resume msplat",
+            input: .photos(folder: sourcePhotos.path),
+            preset: PresetSpec(mode: .object, quality: .draft),
+            requestedRunOptions: RequestedRunOptions(detailProfile: .fast)
+        )
+        let paths = ProjectPaths(root: projectURL)
+        try paths.ensureDirectories()
+        try ProjectMetadataStore.save(metadata, to: paths.metadataURL)
+        try FileManager.default.copyItem(
+            at: sourcePhotos,
+            to: paths.originalsURL.appendingPathComponent(
+                sourcePhotos.lastPathComponent,
+                isDirectory: true
+            )
+        )
+        var selectedMappings: [TestSelectedFrameMapping] = []
+        for index in 0..<2 {
+            let name = String(format: "frame_%06d.jpg", index)
+            try writeTestImage(
+                url: paths.framesSelectedURL.appendingPathComponent(name),
+                value: UInt8(index)
+            )
+            selectedMappings.append(TestSelectedFrameMapping(
+                outputFileName: name,
+                groupId: "photos",
+                isVideo: false,
+                sourcePath: sourcePhotos.appendingPathComponent("img\(index).jpg").path
+            ))
+        }
+        try JSONEncoder().encode(selectedMappings).write(
+            to: paths.framesSelectedManifestURL,
+            options: [.atomic]
+        )
+        try writeCompletedColmapDatabase(at: paths.colmapDatabaseURL)
+        let sparse = paths.colmapSparseURL.appendingPathComponent("0", isDirectory: true)
+        try FileManager.default.createDirectory(at: sparse, withIntermediateDirectories: true)
+        try "1 SIMPLE_PINHOLE 640 480 500 320 240\n".write(
+            to: sparse.appendingPathComponent("cameras.txt"),
+            atomically: true,
+            encoding: .utf8
+        )
+        try """
+        1 1 0 0 0 0 0 0 1 frame_000000.jpg
+        0 0 1
+        2 1 0 0 0 0 0 0 1 frame_000001.jpg
+        0 0 1
+        """.write(
+            to: sparse.appendingPathComponent("images.txt"),
+            atomically: true,
+            encoding: .utf8
+        )
+        try "1 0 0 1 128 128 128 0.5 1 0 2 0\n".write(
+            to: sparse.appendingPathComponent("points3D.txt"),
+            atomically: true,
+            encoding: .utf8
+        )
+        for name in ["cameras.bin", "images.bin", "points3D.bin"] {
+            try Data([1]).write(to: sparse.appendingPathComponent(name))
+        }
+        let datasetIdentity = try MsplatDatasetIdentity.compute(
+            imageFiles: try FileManager.default.contentsOfDirectory(
+                at: paths.framesSelectedURL,
+                includingPropertiesForKeys: nil
+            ),
+            sparseDirectory: sparse
+        )
+        let receipt = try makeMsplatCheckpointFixture(
+            at: paths.msplatCheckpointURL,
+            iteration: 500,
+            profile: "fast",
+            iterationLimit: 3_000,
+            plateauWindow: 400,
+            inputDigest: datasetIdentity.inputDigest,
+            geometryDigest: datasetIdentity.geometryDigest
+        )
+        let initialGeneration = "00000000-" + String(repeating: "5", count: 64)
+        let interruptedEvents = """
+        {"camera_count":8,"checkpoint_schema":1,"event":"started","geometry_digest":"\(receipt.geometryDigest)","initial_gaussian_count":750,"input_digest":"\(receipt.inputDigest)","iteration":0,"iteration_limit":3000,"payload_schema":2,"plateau_window":400,"profile":"fast","resumed":false,"schema_version":1,"seed":42,"sequence":1,"trainer_build_digest":"\(receipt.trainerBuildDigest)","version":"1.1.3 (git 106499b)"}
+        {"checkpoint_generation":"\(initialGeneration)","checkpoint_payload_bytes":128,"checkpoint_payload_sha256":"\(String(repeating: "4", count: 64))","event":"checkpoint_completed","gaussian_count":750,"geometry_digest":"\(receipt.geometryDigest)","input_digest":"\(receipt.inputDigest)","iteration":0,"profile":"fast","schema_version":1,"seed":42,"sequence":2,"trainer_build_digest":"\(receipt.trainerBuildDigest)","version":"1.1.3 (git 106499b)"}
+        {"elapsed_seconds":2,"eta_seconds":20,"event":"progress","gaussian_count":750,"iteration":500,"iteration_limit":3000,"iterations_per_second":250,"schema_version":1,"sequence":3}
+        {"checkpoint_generation":"\(receipt.generation)","checkpoint_payload_bytes":\(receipt.payloadBytes),"checkpoint_payload_sha256":"\(receipt.payloadSHA256)","event":"checkpoint_completed","gaussian_count":\(receipt.gaussianCount),"geometry_digest":"\(receipt.geometryDigest)","input_digest":"\(receipt.inputDigest)","iteration":\(receipt.iteration),"profile":"fast","schema_version":1,"seed":42,"sequence":4,"trainer_build_digest":"\(receipt.trainerBuildDigest)","version":"1.1.3 (git 106499b)"}
+        {"event":"cancellation_requested","iteration":575,"schema_version":1,"sequence":5,"signal":2}
+        {"checkpoint_generation":"\(receipt.generation)","checkpoint_iteration":\(receipt.iteration),"checkpoint_payload_sha256":"\(receipt.payloadSHA256)","event":"cancelled","geometry_digest":"\(receipt.geometryDigest)","input_digest":"\(receipt.inputDigest)","iteration":575,"schema_version":1,"sequence":6}
+        """ + "\n"
+
+        let toolchain = try makeToolchain(root: temp)
+        let firstBacking = MockSubprocessRunner(scripts: [
+            .init(path: toolchain.colmap.path, argsPrefix: ["model_converter"], result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""), onRun: { args in
+                guard let outputPath = self.value(for: "--output_path", in: args) else { return }
+                let output = URL(fileURLWithPath: outputPath, isDirectory: true)
+                FileManager.default.createFile(atPath: output.appendingPathComponent("cameras.bin").path, contents: Data([1]))
+                FileManager.default.createFile(atPath: output.appendingPathComponent("images.bin").path, contents: Data([1]))
+                FileManager.default.createFile(atPath: output.appendingPathComponent("points3D.bin").path, contents: Data([1]))
+            }),
+        ])
+        let cancellingRunner = CheckpointCancellingSubprocessRunner(
+            backing: firstBacking,
+            launchPath: externalMsplat.path,
+            events: interruptedEvents
+        )
+        let firstPipeline = PipelineRunner(
+            projectURL: projectURL,
+            config: .init(toolchain: toolchain, preset: metadata.preset),
+            tooling: .init(runner: cancellingRunner)
+        )
+
+        do {
+            try await firstPipeline.run(resumeFrom: .sfmMapping) { _ in }
+            XCTFail("Expected cancellation")
+        } catch is CancellationError {
+        }
+        let interruptedMetadata = try ProjectMetadataStore.load(from: paths.metadataURL)
+        XCTAssertEqual(interruptedMetadata.trainingArtifact?.completionStatus, .checkpointed)
+        XCTAssertEqual(interruptedMetadata.trainingArtifact?.completedIteration, 500)
+        XCTAssertEqual(interruptedMetadata.trainingArtifact?.checkpointDigest, receipt.payloadSHA256)
+
+        let outputProbe = temp.appendingPathComponent("resume-output-probe.ply")
+        try TestFileBuilder.writeMinimalPly(at: outputProbe)
+        let outputBytes = try XCTUnwrap(
+            (try FileManager.default.attributesOfItem(atPath: outputProbe.path)[.size] as? NSNumber)?.int64Value
+        )
+        try FileManager.default.removeItem(at: outputProbe)
+        let freshEvents = """
+        {"camera_count":8,"checkpoint_schema":1,"event":"started","geometry_digest":"\(receipt.geometryDigest)","initial_gaussian_count":\(receipt.gaussianCount),"input_digest":"\(receipt.inputDigest)","iteration":0,"iteration_limit":3000,"payload_schema":2,"plateau_window":400,"profile":"fast","resumed":false,"schema_version":1,"seed":42,"sequence":1,"trainer_build_digest":"\(receipt.trainerBuildDigest)","version":"1.1.3 (git 106499b)"}
+        {"checkpoint_generation":"\(initialGeneration)","checkpoint_payload_bytes":128,"checkpoint_payload_sha256":"\(String(repeating: "4", count: 64))","event":"checkpoint_completed","gaussian_count":\(receipt.gaussianCount),"geometry_digest":"\(receipt.geometryDigest)","input_digest":"\(receipt.inputDigest)","iteration":0,"profile":"fast","schema_version":1,"seed":42,"sequence":2,"trainer_build_digest":"\(receipt.trainerBuildDigest)","version":"1.1.3 (git 106499b)"}
+        {"elapsed_seconds":4,"eta_seconds":0,"event":"progress","gaussian_count":1400,"iteration":3000,"iteration_limit":3000,"iterations_per_second":1600,"schema_version":1,"sequence":3}
+        {"elapsed_seconds":4,"event":"completed","gaussian_count":1400,"geometry_digest":"\(receipt.geometryDigest)","input_digest":"\(receipt.inputDigest)","iteration":3000,"iteration_limit":3000,"output_bytes":\(outputBytes),"plateau_window":400,"profile":"fast","schema_version":1,"seed":42,"sequence":4,"stop_reason":"iteration_limit","trainer_build_digest":"\(receipt.trainerBuildDigest)","version":"1.1.3 (git 106499b)"}
+        """ + "\n"
+        let secondRunner = MockSubprocessRunner(scripts: [
+            .init(path: toolchain.colmap.path, argsPrefix: ["model_converter"], result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""), onRun: { args in
+                guard let outputPath = self.value(for: "--output_path", in: args) else { return }
+                let output = URL(fileURLWithPath: outputPath, isDirectory: true)
+                FileManager.default.createFile(atPath: output.appendingPathComponent("cameras.bin").path, contents: Data([1]))
+                FileManager.default.createFile(atPath: output.appendingPathComponent("images.bin").path, contents: Data([1]))
+                FileManager.default.createFile(atPath: output.appendingPathComponent("points3D.bin").path, contents: Data([1]))
+            }),
+            .init(
+                path: externalMsplat.path,
+                argsPrefix: ["--dataset"],
+                result: .init(
+                    exitCode: 78,
+                    terminationReason: .exit,
+                    stdout: "{\"event\":\"resume_rejected\",\"reason\":\"geometry_changed\",\"schema_version\":1,\"sequence\":1}\n",
+                    stderr: "checkpoint geometry no longer matches"
+                ),
+                onRun: nil
+            ),
+            .init(path: externalMsplat.path, argsPrefix: ["--dataset"], result: .init(exitCode: 0, terminationReason: .exit, stdout: freshEvents, stderr: ""), onRun: { args in
+                guard let outputPath = self.value(for: "--output", in: args) else { return }
+                try? TestFileBuilder.writeMinimalPly(at: URL(fileURLWithPath: outputPath))
+            }),
+        ])
+        let secondPipeline = PipelineRunner(
+            projectURL: projectURL,
+            config: .init(toolchain: toolchain, preset: metadata.preset),
+            tooling: .init(runner: secondRunner)
+        )
+
+        try await secondPipeline.run(resumeFrom: .sfmMapping) { _ in }
+
+        let trainingCalls = secondRunner.calls.filter { $0.0 == externalMsplat.path }
+        XCTAssertEqual(trainingCalls.count, 2)
+        XCTAssertEqual(value(for: "--resume", in: trainingCalls[0].1), paths.msplatCheckpointURL.path)
+        XCTAssertNil(value(for: "--resume", in: trainingCalls[1].1))
+        let completedMetadata = try ProjectMetadataStore.load(from: paths.metadataURL)
+        XCTAssertEqual(completedMetadata.trainingArtifact?.completionStatus, .completed)
+        XCTAssertEqual(completedMetadata.trainingArtifact?.completedIteration, 3_000)
+        XCTAssertEqual(
+            ProjectArtifactValidator.validatePlyFile(
+                at: paths.outputURL.appendingPathComponent("splat.ply")
+            ),
+            .valid
+        )
+    }
+
+    func testBalancedRetryPinsNativeTrainerFromCheckpointArtifactAfterFailure() async throws {
+        let temp = makeTempRoot()
+        let restore = await scopedPipelineEnvironment([
+            "EASYSPLAT_TRAINER": nil,
+            "EASYSPLAT_MSPLAT_BIN": nil,
+            "EASYSPLAT_SPEED_PROFILE": nil,
+            "EASYSPLAT_SKIP_TRAINING": nil,
+        ])
+        defer { restore() }
+
+        let projectURL = temp.appendingPathComponent("BalancedRetry.easysplatproj", isDirectory: true)
+        let paths = ProjectPaths(root: projectURL)
+        try paths.ensureDirectories()
+        let sourcePhotos = temp.appendingPathComponent("SourcePhotos", isDirectory: true)
+        try FileManager.default.createDirectory(at: sourcePhotos, withIntermediateDirectories: true)
+        for index in 0..<2 {
+            try writeTestImage(
+                url: sourcePhotos.appendingPathComponent("img\(index).jpg"),
+                value: UInt8(index * 40)
+            )
+        }
+        try FileManager.default.copyItem(
+            at: sourcePhotos,
+            to: paths.originalsURL.appendingPathComponent(
+                sourcePhotos.lastPathComponent,
+                isDirectory: true
+            )
+        )
+
+        let selectedMappings = try (0..<2).map { index in
+            let name = String(format: "frame_%06d.jpg", index)
+            try writeTestImage(
+                url: paths.framesSelectedURL.appendingPathComponent(name),
+                value: UInt8(index * 40)
+            )
+            return TestSelectedFrameMapping(
+                outputFileName: name,
+                groupId: "photos",
+                isVideo: false,
+                sourcePath: sourcePhotos.appendingPathComponent("img\(index).jpg").path
+            )
+        }
+        try JSONEncoder().encode(selectedMappings).write(
+            to: paths.framesSelectedManifestURL,
+            options: [.atomic]
+        )
+        try writeCompletedColmapDatabase(at: paths.colmapDatabaseURL)
+        let sparse = paths.colmapSparseURL.appendingPathComponent("0", isDirectory: true)
+        try FileManager.default.createDirectory(at: sparse, withIntermediateDirectories: true)
+        try "1 SIMPLE_PINHOLE 640 480 500 320 240\n".write(
+            to: sparse.appendingPathComponent("cameras.txt"),
+            atomically: true,
+            encoding: .utf8
+        )
+        try """
+        1 1 0 0 0 0 0 0 1 frame_000000.jpg
+        0 0 1
+        2 1 0 0 0 0 0 0 1 frame_000001.jpg
+        0 0 1
+        """.write(
+            to: sparse.appendingPathComponent("images.txt"),
+            atomically: true,
+            encoding: .utf8
+        )
+        try "1 0 0 1 128 128 128 0.5 1 0 2 0\n".write(
+            to: sparse.appendingPathComponent("points3D.txt"),
+            atomically: true,
+            encoding: .utf8
+        )
+
+        for name in ["cameras.bin", "images.bin", "points3D.bin"] {
+            try Data([1]).write(to: sparse.appendingPathComponent(name))
+        }
+        let datasetIdentity = try MsplatDatasetIdentity.compute(
+            imageFiles: try FileManager.default.contentsOfDirectory(
+                at: paths.framesSelectedURL,
+                includingPropertiesForKeys: nil
+            ),
+            sparseDirectory: sparse
+        )
+
+        let receipt = try makeMsplatCheckpointFixture(
+            at: paths.msplatCheckpointURL,
+            iteration: 500,
+            inputDigest: datasetIdentity.inputDigest,
+            geometryDigest: datasetIdentity.geometryDigest
+        )
+        let artifact = TrainingArtifact(
+            trainerVersion: "1.1.3 (git 106499b)",
+            runtimeVersion: "native-metal-cli-v1",
+            trainerBuildDigest: receipt.trainerBuildDigest,
+            inputDigest: receipt.inputDigest,
+            geometryDigest: receipt.geometryDigest,
+            detailProfile: .balanced,
+            iterationLimit: 7_000,
+            plateauWindow: 800,
+            deterministicSeed: 42,
+            completedIteration: receipt.iteration,
+            checkpointPath: "Training/checkpoints/msplat",
+            checkpointDigest: receipt.payloadSHA256,
+            outputPath: nil,
+            gaussianCount: receipt.gaussianCount,
+            elapsedSeconds: nil,
+            peakMemoryBytes: nil,
+            completionStatus: .checkpointed
+        )
+        var metadata = ProjectMetadata(
+            title: "Balanced retry",
+            input: .photos(folder: sourcePhotos.path),
+            preset: PresetSpec(mode: .object, quality: .standard),
+            requestedRunOptions: RequestedRunOptions(detailProfile: .balanced),
+            trainingArtifact: artifact,
+            state: PipelineState(stage: .sfmMapping, attempt: 0, lastError: nil, resumeToken: nil),
+            checkpoint: PipelineCheckpoint(
+                stage: .trainBrush,
+                details: .trainBrush(TrainBrushCheckpoint(
+                    latestExportStep: nil,
+                    latestExportPath: nil,
+                    progressStep: receipt.iteration,
+                    progressTotal: 7_000,
+                    stepsPerSecond: nil,
+                    resumeSnapshotPath: nil,
+                    trainingBackend: .msplat
+                ))
+            )
+        )
+        try ProjectMetadataStore.save(metadata, to: paths.metadataURL)
+        try TrainingArtifactStore.persist(artifact, metadata: &metadata, paths: paths)
+
+        let toolchain = try makeToolchain(root: temp, createMsplatFile: true)
+        let converterScript: () -> MockSubprocessRunner.Script = {
+            .init(
+                path: toolchain.colmap.path,
+                argsPrefix: ["model_converter"],
+                result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""),
+                onRun: { args in
+                    guard let outputPath = self.value(for: "--output_path", in: args) else { return }
+                    let output = URL(fileURLWithPath: outputPath, isDirectory: true)
+                    FileManager.default.createFile(atPath: output.appendingPathComponent("cameras.bin").path, contents: Data([1]))
+                    FileManager.default.createFile(atPath: output.appendingPathComponent("images.bin").path, contents: Data([1]))
+                    FileManager.default.createFile(atPath: output.appendingPathComponent("points3D.bin").path, contents: Data([1]))
+                }
+            )
+        }
+        let failedRunner = MockSubprocessRunner(scripts: [
+            converterScript(),
+            .init(
+                path: toolchain.msplat.path,
+                argsPrefix: ["--dataset"],
+                result: .init(
+                    exitCode: 1,
+                    terminationReason: .exit,
+                    stdout: "",
+                    stderr: "simulated Metal failure"
+                ),
+                onRun: nil
+            ),
+        ])
+        let failedPipeline = PipelineRunner(
+            projectURL: projectURL,
+            config: .init(toolchain: toolchain, preset: metadata.preset),
+            tooling: .init(runner: failedRunner)
+        )
+        await XCTAssertThrowsErrorAsync {
+            try await failedPipeline.run(resumeFrom: .sfmMapping) { _ in }
+        }
+
+        let failedMetadata = try ProjectMetadataStore.load(from: paths.metadataURL)
+        XCTAssertNotNil(failedMetadata.state.lastError)
+        XCTAssertNil(failedMetadata.checkpoint)
+        XCTAssertEqual(failedMetadata.trainingArtifact?.completionStatus, .checkpointed)
+
+        let outputProbe = temp.appendingPathComponent("balanced-retry-output-probe.ply")
+        try TestFileBuilder.writeMinimalPly(at: outputProbe)
+        let outputBytes = try XCTUnwrap(
+            (try FileManager.default.attributesOfItem(atPath: outputProbe.path)[.size] as? NSNumber)?.int64Value
+        )
+        try FileManager.default.removeItem(at: outputProbe)
+        let resumedEvents = """
+        {"camera_count":8,"checkpoint_schema":1,"event":"started","geometry_digest":"\(receipt.geometryDigest)","initial_gaussian_count":\(receipt.gaussianCount),"input_digest":"\(receipt.inputDigest)","iteration":500,"iteration_limit":7000,"payload_schema":2,"plateau_window":800,"profile":"balanced","resumed":true,"schema_version":1,"seed":42,"sequence":1,"trainer_build_digest":"\(receipt.trainerBuildDigest)","version":"1.1.3 (git 106499b)"}
+        {"checkpoint_generation":"\(receipt.generation)","checkpoint_payload_bytes":\(receipt.payloadBytes),"checkpoint_payload_sha256":"\(receipt.payloadSHA256)","event":"checkpoint_loaded","gaussian_count":\(receipt.gaussianCount),"geometry_digest":"\(receipt.geometryDigest)","input_digest":"\(receipt.inputDigest)","iteration":500,"profile":"balanced","schema_version":1,"seed":42,"sequence":2,"trainer_build_digest":"\(receipt.trainerBuildDigest)","version":"1.1.3 (git 106499b)"}
+        {"elapsed_seconds":4,"eta_seconds":0,"event":"progress","gaussian_count":1400,"iteration":7000,"iteration_limit":7000,"iterations_per_second":1600,"schema_version":1,"sequence":3}
+        {"elapsed_seconds":4,"event":"completed","gaussian_count":1400,"geometry_digest":"\(receipt.geometryDigest)","input_digest":"\(receipt.inputDigest)","iteration":7000,"iteration_limit":7000,"output_bytes":\(outputBytes),"plateau_window":800,"profile":"balanced","schema_version":1,"seed":42,"sequence":4,"stop_reason":"iteration_limit","trainer_build_digest":"\(receipt.trainerBuildDigest)","version":"1.1.3 (git 106499b)"}
+        """ + "\n"
+        let retryRunner = MockSubprocessRunner(scripts: [
+            converterScript(),
+            .init(
+                path: toolchain.msplat.path,
+                argsPrefix: ["--dataset"],
+                result: .init(exitCode: 0, terminationReason: .exit, stdout: resumedEvents, stderr: ""),
+                onRun: { args in
+                    guard let outputPath = self.value(for: "--output", in: args) else { return }
+                    try? TestFileBuilder.writeMinimalPly(at: URL(fileURLWithPath: outputPath))
+                }
+            ),
+            .init(
+                path: toolchain.brush.path,
+                argsPrefix: [],
+                result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""),
+                onRun: { args in
+                    guard let datasetPath = args.last else { return }
+                    let training = URL(fileURLWithPath: datasetPath).deletingLastPathComponent()
+                    try? TestFileBuilder.writeMinimalPly(
+                        at: training.appendingPathComponent("export_00001.ply")
+                    )
+                }
+            ),
+        ])
+        let retryPipeline = PipelineRunner(
+            projectURL: projectURL,
+            config: .init(toolchain: toolchain, preset: metadata.preset),
+            tooling: .init(runner: retryRunner)
+        )
+
+        try await retryPipeline.run(resumeFrom: .sfmMapping) { _ in }
+
+        XCTAssertFalse(retryRunner.calls.contains(where: { $0.0 == toolchain.brush.path }))
+        let retryCall = try XCTUnwrap(retryRunner.calls.first(where: { $0.0 == toolchain.msplat.path }))
+        XCTAssertEqual(value(for: "--resume", in: retryCall.1), paths.msplatCheckpointURL.path)
     }
 
     func testPipelineCancellationDoesNotFallbackBetweenBackends() async throws {
@@ -1483,8 +1925,8 @@ final class PipelineIntegrationTests: XCTestCase {
         await XCTAssertThrowsErrorAsync({
             try await pipeline.run { _ in }
         }, errorHandler: { error in
-            guard case ProjectPathError.escapesProjectRoot = error else {
-                return XCTFail("Expected project root escape, got \(error)")
+            guard case ProjectPathError.unsafeDirectory("Output") = error else {
+                return XCTFail("Expected unsafe Output directory, got \(error)")
             }
         })
         XCTAssertFalse(FileManager.default.fileExists(atPath: externalOutput.appendingPathComponent("splat.ply").path))
@@ -2684,7 +3126,7 @@ final class PipelineIntegrationTests: XCTestCase {
         }
     }
 
-    func testPipelineResumeSkipsCompletedStages() async throws {
+    func testPipelineResumeUsesCompletedTrainingArtifactAfterCrashBeforeStageCommit() async throws {
         let restore = await scopedPipelineEnvironment([
             "EASYSPLAT_SFM_BACKEND": "colmap",
             "EASYSPLAT_SFM_MAPPER": nil,
@@ -2700,9 +3142,26 @@ final class PipelineIntegrationTests: XCTestCase {
         try writeTestImage(url: sourcePhotos.appendingPathComponent("img1.jpg"), value: 20)
         try writeTestImage(url: sourcePhotos.appendingPathComponent("img2.jpg"), value: 40)
 
-        let metadata = ProjectMetadata(title: "Test",
-                                       input: .photos(folder: sourcePhotos.path),
-                                       preset: PresetSpec(mode: .object, quality: .draft))
+        var completedTrainingArtifact = makeTrainingArtifact(
+            outputPath: "Training/msplat/splat.ply"
+        )
+        completedTrainingArtifact.detailProfile = .fast
+        completedTrainingArtifact.iterationLimit = 3_000
+        completedTrainingArtifact.plateauWindow = 400
+        completedTrainingArtifact.completedIteration = 3_000
+        let metadata = ProjectMetadata(
+            title: "Test",
+            input: .photos(folder: sourcePhotos.path),
+            preset: PresetSpec(mode: .object, quality: .draft),
+            requestedRunOptions: RequestedRunOptions(detailProfile: .fast),
+            trainingArtifact: completedTrainingArtifact,
+            state: PipelineState(
+                stage: .sfmMapping,
+                attempt: 0,
+                lastError: nil,
+                resumeToken: nil
+            )
+        )
         let paths = ProjectPaths(root: projectURL)
         try paths.ensureDirectories()
         try ProjectMetadataStore.save(metadata, to: paths.metadataURL)
@@ -2739,14 +3198,30 @@ final class PipelineIntegrationTests: XCTestCase {
         # points
         1 0 0 1 128 128 128 1.0 1 0
         """.write(to: sparse.appendingPathComponent("points3D.txt"), atomically: true, encoding: .utf8)
+        try Data("camera-binary".utf8).write(to: sparse.appendingPathComponent("cameras.bin"))
+        try Data("image-binary".utf8).write(to: sparse.appendingPathComponent("images.bin"))
+        try Data("points-binary".utf8).write(to: sparse.appendingPathComponent("points3D.bin"))
 
-        let trainingExport = paths.trainingURL.appendingPathComponent("export_00001.ply")
-        try FileManager.default.createDirectory(at: paths.trainingURL, withIntermediateDirectories: true)
+        let identity = try MsplatDatasetIdentity.compute(
+            imageFiles: try FileManager.default.contentsOfDirectory(
+                at: paths.framesSelectedURL,
+                includingPropertiesForKeys: nil
+            ),
+            sparseDirectory: sparse
+        )
+        var boundMetadata = try ProjectMetadataStore.load(from: paths.metadataURL)
+        boundMetadata.trainingArtifact?.inputDigest = identity.inputDigest
+        boundMetadata.trainingArtifact?.geometryDigest = identity.geometryDigest
+        try ProjectMetadataStore.save(boundMetadata, to: paths.metadataURL)
+
+        let trainingExport = paths.msplatOutputURL
+        try FileManager.default.createDirectory(
+            at: trainingExport.deletingLastPathComponent(),
+            withIntermediateDirectories: true
+        )
         try TestFileBuilder.writeMinimalPly(at: trainingExport)
 
         let output = paths.outputURL.appendingPathComponent("splat.ply")
-        try FileManager.default.createDirectory(at: paths.outputURL, withIntermediateDirectories: true)
-        try TestFileBuilder.writeMinimalPly(at: output)
 
         let toolchain = try makeToolchain(root: temp)
         let runner = MockSubprocessRunner(scripts: [])
@@ -2756,8 +3231,117 @@ final class PipelineIntegrationTests: XCTestCase {
             tooling: .init(runner: runner)
         )
 
-        try await pipeline.run(resumeFrom: .done) { _ in }
+        try await pipeline.run(resumeFrom: PipelineStage.sfmMapping) { _ in }
+        XCTAssertTrue(runner.calls.isEmpty)
         XCTAssertTrue(FileManager.default.fileExists(atPath: output.path))
+
+        try Data("corrupt training output".utf8).write(to: trainingExport)
+        var invalidTrainingMetadata = try ProjectMetadataStore.load(from: paths.metadataURL)
+        invalidTrainingMetadata.state = PipelineState(
+            stage: .sfmMapping,
+            attempt: 0,
+            lastError: nil,
+            resumeToken: nil
+        )
+        try ProjectMetadataStore.save(invalidTrainingMetadata, to: paths.metadataURL)
+        let brushRunner = MockSubprocessRunner(scripts: [
+            .init(
+                path: toolchain.brush.path,
+                argsPrefix: [],
+                result: .init(
+                    exitCode: 0,
+                    terminationReason: .exit,
+                    stdout: "",
+                    stderr: ""
+                ),
+                onRun: { args in
+                    guard let datasetPath = args.last else { return }
+                    let training = URL(fileURLWithPath: datasetPath).deletingLastPathComponent()
+                    try? TestFileBuilder.writeMinimalPly(
+                        at: training.appendingPathComponent("export_00001.ply")
+                    )
+                }
+            ),
+        ])
+        let trainingRepair = PipelineRunner(
+            projectURL: projectURL,
+            config: .init(toolchain: toolchain, preset: metadata.preset),
+            tooling: .init(runner: brushRunner)
+        )
+
+        try await trainingRepair.run(resumeFrom: .sfmMapping) { _ in }
+        let repaired = try ProjectMetadataStore.load(from: paths.metadataURL)
+        XCTAssertNil(repaired.trainingArtifact)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: paths.trainingManifestURL.path))
+        XCTAssertTrue(brushRunner.calls.contains(where: { $0.0 == toolchain.brush.path }))
+
+        try FileManager.default.createDirectory(
+            at: trainingExport.deletingLastPathComponent(),
+            withIntermediateDirectories: true
+        )
+        try TestFileBuilder.writeMinimalPly(at: trainingExport)
+        let completedArtifact = try XCTUnwrap(boundMetadata.trainingArtifact)
+        var restoredMetadata = try ProjectMetadataStore.load(from: paths.metadataURL)
+        restoredMetadata.state = PipelineState(
+            stage: .sfmMapping,
+            attempt: 0,
+            lastError: nil,
+            resumeToken: nil
+        )
+        try TrainingArtifactStore.persist(
+            completedArtifact,
+            metadata: &restoredMetadata,
+            paths: paths
+        )
+
+        try FileManager.default.removeItem(at: paths.colmapSparseURL)
+        var interruptedMetadata = try ProjectMetadataStore.load(from: paths.metadataURL)
+        interruptedMetadata.state = PipelineState(
+            stage: .sfmMapping,
+            attempt: 0,
+            lastError: nil,
+            resumeToken: nil
+        )
+        interruptedMetadata.checkpoint = nil
+        try ProjectMetadataStore.save(interruptedMetadata, to: paths.metadataURL)
+        let failingRunner = MockSubprocessRunner(scripts: [
+            .init(
+                path: toolchain.colmap.path,
+                argsPrefix: ["global_mapper"],
+                result: .init(
+                    exitCode: 1,
+                    terminationReason: .exit,
+                    stdout: "",
+                    stderr: "mapping failed"
+                ),
+                onRun: nil
+            ),
+            .init(
+                path: toolchain.colmap.path,
+                argsPrefix: ["mapper"],
+                result: .init(
+                    exitCode: 1,
+                    terminationReason: .exit,
+                    stdout: "",
+                    stderr: "fallback mapping failed"
+                ),
+                onRun: nil
+            ),
+        ])
+        let retry = PipelineRunner(
+            projectURL: projectURL,
+            config: .init(toolchain: toolchain, preset: metadata.preset),
+            tooling: .init(runner: failingRunner)
+        )
+
+        await XCTAssertThrowsErrorAsync {
+            try await retry.run(resumeFrom: .sfmMapping) { _ in }
+        }
+
+        let invalidated = try ProjectMetadataStore.load(from: paths.metadataURL)
+        XCTAssertNil(invalidated.trainingArtifact)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: trainingExport.path))
+        XCTAssertEqual(ProjectArtifactValidator.validatePlyFile(at: output), .valid)
     }
 
     func testPipelineResumeRepairsCorruptExportAfterInterruptedRun() async throws {

@@ -31,10 +31,26 @@ extension PipelineRunner {
             progressName: "msplat",
             sparseEnsureMessage: "ensuring binary model files",
             requiredSparseFiles: ["cameras.bin", "images.bin", "points3D.bin"],
-            prepareSourceSparse: { _ in },
+            prepareSourceSparse: { _ = try ensureBinarySparseModelFiles(at: $0) },
             ensureCopiedSparse: { try ensureBinarySparseModelFiles(at: $0) },
             finalizeCopiedSparse: { _ in },
             progress: progress
+        )
+    }
+
+    func currentMsplatDatasetIdentity(paths: ProjectPaths) throws -> MsplatDatasetIdentity {
+        let selected = try FileManager.default.contentsOfDirectory(
+            at: paths.framesSelectedURL,
+            includingPropertiesForKeys: nil
+        )
+        let imageFiles = selected.filter {
+            supportedImageExtensions.contains($0.pathExtension.lowercased())
+        }
+        let sparseRoot = paths.colmapSparseURL.appendingPathComponent("0", isDirectory: true)
+        let sparse = try resolveSparseModelDirectory(at: sparseRoot)
+        return try MsplatDatasetIdentity.compute(
+            imageFiles: imageFiles,
+            sparseDirectory: sparse
         )
     }
 
@@ -158,6 +174,11 @@ extension PipelineRunner {
 
     func checkpointTrainingBackend(metadata: ProjectMetadata) -> TrainingBackend? {
         guard case .trainBrush(let checkpoint)? = metadata.checkpoint?.details else { return nil }
+        if checkpoint.trainingBackend == .brush, isMsplatToolAvailable() {
+            // A Brush snapshot is export evidence, not resumable optimizer state. Legacy
+            // interruptions restart native training from the canonical cameras instead.
+            return .msplat
+        }
         return checkpoint.trainingBackend
     }
 
@@ -796,5 +817,113 @@ extension PipelineRunner {
               let value = Double(raw),
               value > 0 else { return nil }
         return value
+    }
+
+    func msplatBudget(for profile: DetailProfile) -> (iterationLimit: Int, plateauWindow: Int) {
+        switch profile {
+        case .fast: return (3_000, 400)
+        case .balanced: return (7_000, 800)
+        case .highDetail: return (15_000, 1_500)
+        }
+    }
+
+    func msplatResumeURL(
+        metadata: ProjectMetadata,
+        paths: ProjectPaths,
+        profile: DetailProfile,
+        seed: UInt64
+    ) throws -> URL? {
+        guard let artifact = metadata.trainingArtifact else { return nil }
+        guard artifact.completionStatus == .checkpointed,
+              artifact.detailProfile == profile,
+              artifact.deterministicSeed == seed,
+              artifact.checkpointPath == "Training/checkpoints/msplat" else {
+            throw MsplatCheckpointValidationError(
+                "saved training state does not match the requested profile or seed"
+            )
+        }
+        do {
+            let identity = try currentMsplatDatasetIdentity(paths: paths)
+            guard artifact.inputDigest == identity.inputDigest,
+                  artifact.geometryDigest == identity.geometryDigest else {
+                throw MsplatCheckpointValidationError(
+                    "saved training state does not match the current input or geometry"
+                )
+            }
+            let checkpointParent = try paths.resolveProjectRelativePath("Training/checkpoints")
+            let checkpointURL = checkpointParent.appendingPathComponent("msplat", isDirectory: true)
+            _ = try MsplatCheckpointValidator.validateResume(
+                checkpointURL: checkpointURL,
+                artifact: artifact
+            )
+            return checkpointURL
+        } catch let error as MsplatCheckpointValidationError {
+            throw error
+        } catch {
+            throw MsplatCheckpointValidationError(error.localizedDescription)
+        }
+    }
+
+    @discardableResult
+    func persistMsplatCheckpoint(
+        _ receipt: MsplatCheckpointReceipt,
+        profile: DetailProfile,
+        seed: UInt64,
+        paths: ProjectPaths
+    ) throws -> TrainingArtifact {
+        let budget = msplatBudget(for: profile)
+        let artifact = TrainingArtifact(
+            trainerVersion: "1.1.3 (git 106499b)",
+            runtimeVersion: "native-metal-cli-v1",
+            trainerBuildDigest: receipt.trainerBuildDigest,
+            inputDigest: receipt.inputDigest,
+            geometryDigest: receipt.geometryDigest,
+            detailProfile: profile,
+            iterationLimit: budget.iterationLimit,
+            plateauWindow: budget.plateauWindow,
+            deterministicSeed: seed,
+            completedIteration: receipt.iteration,
+            checkpointPath: "Training/checkpoints/msplat",
+            checkpointDigest: receipt.payloadSHA256,
+            outputPath: nil,
+            gaussianCount: receipt.gaussianCount,
+            elapsedSeconds: nil,
+            peakMemoryBytes: nil,
+            completionStatus: .checkpointed
+        )
+        var currentMetadata = try ProjectMetadataStore.load(from: paths.metadataURL)
+        try TrainingArtifactStore.persist(artifact, metadata: &currentMetadata, paths: paths)
+        return artifact
+    }
+
+    @discardableResult
+    func persistMsplatCompletion(
+        _ result: MsplatTrainingResult,
+        profile: DetailProfile,
+        seed: UInt64,
+        paths: ProjectPaths
+    ) throws -> TrainingArtifact {
+        let artifact = TrainingArtifact(
+            trainerVersion: "1.1.3 (git 106499b)",
+            runtimeVersion: "native-metal-cli-v1",
+            trainerBuildDigest: result.trainerBuildDigest,
+            inputDigest: result.inputDigest,
+            geometryDigest: result.geometryDigest,
+            detailProfile: profile,
+            iterationLimit: result.iterationLimit,
+            plateauWindow: result.plateauWindow,
+            deterministicSeed: seed,
+            completedIteration: result.completedIteration,
+            checkpointPath: nil,
+            checkpointDigest: nil,
+            outputPath: "Training/msplat/splat.ply",
+            gaussianCount: result.gaussianCount,
+            elapsedSeconds: result.elapsedSeconds,
+            peakMemoryBytes: nil,
+            completionStatus: .completed
+        )
+        var currentMetadata = try ProjectMetadataStore.load(from: paths.metadataURL)
+        try TrainingArtifactStore.persist(artifact, metadata: &currentMetadata, paths: paths)
+        return artifact
     }
 }

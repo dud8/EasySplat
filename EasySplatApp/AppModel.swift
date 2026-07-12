@@ -96,6 +96,9 @@ final class AppModel: ObservableObject {
     var exitIntent: ExitIntent = .none
     weak var pendingCloseWindow: NSWindow?
     var allowNextWindowClose = false
+    var replyToTerminationRequest: (Bool) -> Void = { shouldTerminate in
+        NSApp.reply(toApplicationShouldTerminate: shouldTerminate)
+    }
     var pendingSnapshotRevealURL: URL?
     var pendingSnapshotRevealRequiresExit: Bool = false
     var forcedExitTask: Task<Void, Never>?
@@ -122,6 +125,11 @@ final class AppModel: ObservableObject {
         case deleteProject
     }
 
+    struct StopFailurePresentation: Equatable {
+        let title: String
+        let detail: String
+    }
+
     enum ExitIntent {
         case none
         case quit
@@ -144,6 +152,39 @@ final class AppModel: ObservableObject {
 
     var isBrushSnapshotTrainingActive: Bool {
         isTrainingStageActive && activeTrainingBackend == .brush
+    }
+
+    var isMsplatTrainingActive: Bool {
+        isTrainingStageActive && activeTrainingBackend == .msplat
+    }
+
+    func stopFailurePresentation(
+        for action: StopAction,
+        backend: TrainingBackend?
+    ) -> StopFailurePresentation {
+        if action == .deleteProject {
+            return StopFailurePresentation(
+                title: "Couldn’t delete the project",
+                detail: "The project was not deleted because EasySplat could not stop safely. Review the details and try again."
+            )
+        }
+        switch backend {
+        case .brush:
+            return StopFailurePresentation(
+                title: "Couldn’t export the snapshot",
+                detail: "The latest training snapshot was not exported. Review the details and try again."
+            )
+        case .msplat:
+            return StopFailurePresentation(
+                title: "Couldn’t save the project",
+                detail: "The training checkpoint was not saved. Review the details and try again."
+            )
+        case nil:
+            return StopFailurePresentation(
+                title: "Couldn’t save the project",
+                detail: "The project was not saved. Review the details and try again."
+            )
+        }
     }
 
     var trainingSnapshotURL: URL? {

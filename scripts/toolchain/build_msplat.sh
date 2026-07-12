@@ -14,6 +14,7 @@ BACKUP_DIR="$INSTALL_PARENT/msplat.previous.$$"
 
 OVERLAY="$ROOT/Tools/MsplatNative/msplat.cpp"
 UPSTREAM_PATCH="$ROOT/Tools/MsplatNative/msplat-1.1.3-easysplat.patch"
+CHECKPOINT_PATCH="$ROOT/Tools/MsplatNative/msplat-1.1.3-checkpoint.patch"
 
 MSPLAT_REPO="https://github.com/rayanht/msplat.git"
 MSPLAT_COMMIT="106499b0a53f82b0c92d013b0861fbebd341b17e"
@@ -67,6 +68,7 @@ preflight() {
   fi
   [ -f "$OVERLAY" ] || die "missing CLI overlay: $OVERLAY"
   [ -f "$UPSTREAM_PATCH" ] || die "missing upstream patch: $UPSTREAM_PATCH"
+  [ -f "$CHECKPOINT_PATCH" ] || die "missing checkpoint patch: $CHECKPOINT_PATCH"
 }
 
 download_verified() {
@@ -139,6 +141,8 @@ prepare_source() {
   cp "$OVERLAY" "$SOURCE_DIR/cli/msplat.cpp"
   git -C "$SOURCE_DIR" apply --unidiff-zero --check "$UPSTREAM_PATCH"
   git -C "$SOURCE_DIR" apply --unidiff-zero "$UPSTREAM_PATCH"
+  git -C "$SOURCE_DIR" apply --check "$CHECKPOINT_PATCH"
+  git -C "$SOURCE_DIR" apply "$CHECKPOINT_PATCH"
 }
 
 configure_and_build() {
@@ -158,13 +162,14 @@ configure_and_build() {
 write_build_info() {
   local executable_sha256="$1"
   local metallib_sha256="$2"
-  local compiler cmake_version ninja_version timestamp overlay_sha256 patch_sha256
+  local compiler cmake_version ninja_version timestamp overlay_sha256 patch_sha256 checkpoint_patch_sha256
   compiler="$(xcrun clang++ --version | head -n 1)"
   cmake_version="$(cmake --version | head -n 1)"
   ninja_version="$(ninja --version)"
   timestamp="$(date -u +'%Y-%m-%dT%H:%M:%SZ')"
   overlay_sha256="$(sha256 "$OVERLAY")"
   patch_sha256="$(sha256 "$UPSTREAM_PATCH")"
+  checkpoint_patch_sha256="$(sha256 "$CHECKPOINT_PATCH")"
 
   cat >"$STAGE_DIR/build_info.json" <<JSON
 {
@@ -175,6 +180,7 @@ write_build_info() {
   "source_tree_sha256": "$SOURCE_TREE_SHA256",
   "overlay_sha256": "$overlay_sha256",
   "patch_sha256": "$patch_sha256",
+  "checkpoint_patch_sha256": "$checkpoint_patch_sha256",
   "dependencies": {
     "nlohmann_json_v3.11.3_sha256": "$NLOHMANN_JSON_SHA256",
     "nanoflann_v1.5.5_sha256": "$NANOFLANN_SHA256",

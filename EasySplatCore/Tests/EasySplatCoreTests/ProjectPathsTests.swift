@@ -43,4 +43,41 @@ final class ProjectPathsTests: XCTestCase {
             XCTAssertThrowsError(try paths.resolveProjectRelativePath(value), "Expected rejection for \(value)")
         }
     }
+
+    func testEnsureDirectoriesRejectsEscapingTrainingSymlinkBeforeWritingOutside() throws {
+        let parent = try TestFileBuilder.makeTempDir()
+        defer { try? FileManager.default.removeItem(at: parent) }
+        let root = parent.appendingPathComponent("Project.easysplatproj", isDirectory: true)
+        let outside = parent.appendingPathComponent("Outside", isDirectory: true)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: outside, withIntermediateDirectories: true)
+        try FileManager.default.createSymbolicLink(
+            at: root.appendingPathComponent("Training", isDirectory: true),
+            withDestinationURL: outside
+        )
+
+        XCTAssertThrowsError(try ProjectPaths(root: root).ensureDirectories())
+        XCTAssertFalse(
+            FileManager.default.fileExists(
+                atPath: outside.appendingPathComponent("checkpoints").path
+            )
+        )
+    }
+
+    func testEnsureDirectoriesRejectsEscapingCheckpointParentSymlink() throws {
+        let parent = try TestFileBuilder.makeTempDir()
+        defer { try? FileManager.default.removeItem(at: parent) }
+        let root = parent.appendingPathComponent("Project.easysplatproj", isDirectory: true)
+        let training = root.appendingPathComponent("Training", isDirectory: true)
+        let outside = parent.appendingPathComponent("Outside", isDirectory: true)
+        try FileManager.default.createDirectory(at: training, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: outside, withIntermediateDirectories: true)
+        try FileManager.default.createSymbolicLink(
+            at: training.appendingPathComponent("checkpoints", isDirectory: true),
+            withDestinationURL: outside
+        )
+
+        XCTAssertThrowsError(try ProjectPaths(root: root).ensureDirectories())
+        XCTAssertTrue((try FileManager.default.contentsOfDirectory(atPath: outside.path)).isEmpty)
+    }
 }

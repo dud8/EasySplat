@@ -189,6 +189,38 @@ final class PipelineRunnerEnvParsingTests: XCTestCase {
         }
     }
 
+    func testLegacyBrushCheckpointRestartsWithNativeTrainerWhenAvailable() async throws {
+        let msplat = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try TestFileBuilder.createExecutable(at: msplat)
+        defer { try? FileManager.default.removeItem(at: msplat) }
+        let metadata = ProjectMetadata(
+            title: "Legacy Brush",
+            input: .photos(folder: "/tmp/photos"),
+            preset: PresetSpec(mode: .object, quality: .standard),
+            checkpoint: PipelineCheckpoint(
+                stage: .trainBrush,
+                updatedAt: Date(),
+                details: .trainBrush(TrainBrushCheckpoint(
+                    latestExportStep: 5_000,
+                    latestExportPath: "Training/export_05000.ply",
+                    progressStep: 5_000,
+                    progressTotal: 40_000,
+                    stepsPerSecond: 25,
+                    resumeSnapshotPath: "Training/latest_snapshot.ply",
+                    trainingBackend: .brush
+                ))
+            )
+        )
+        let runner = makeRunner()
+
+        await withEnvironmentAsync(["EASYSPLAT_MSPLAT_BIN": msplat.path]) {
+            XCTAssertEqual(
+                runner.test_checkpointTrainingBackend(metadata: metadata),
+                "msplat"
+            )
+        }
+    }
+
     private func makeRunner() -> PipelineRunner {
         let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
         let vggt = VggtToolchain(root: root, sfmTool: root, python: root, models: root)

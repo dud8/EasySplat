@@ -340,7 +340,10 @@ extension ToolchainManager {
     func validateBuildInfo(at url: URL, expectedToolchainName: String) throws {
         let data: Data
         do {
-            data = try Data(contentsOf: url)
+            data = try BoundedFileReader.readRegularFile(
+                at: url,
+                maximumBytes: 1_048_576
+            )
         } catch {
             throw ToolchainError.invalidToolchain("\(expectedToolchainName) build_info.json could not be read.")
         }
@@ -492,6 +495,7 @@ extension ToolchainManager {
             "source_tree_sha256",
             "overlay_sha256",
             "patch_sha256",
+            "checkpoint_patch_sha256",
             "dependencies",
             "executable_sha256",
             "metallib_sha256",
@@ -546,6 +550,7 @@ extension ToolchainManager {
             "source_tree_sha256",
             "overlay_sha256",
             "patch_sha256",
+            "checkpoint_patch_sha256",
             "executable_sha256",
             "metallib_sha256",
         ]

@@ -19,6 +19,14 @@ final class SubprocessRunnerAsyncTests: XCTestCase {
         }
     }
 
+    private final class LockedFlag: @unchecked Sendable {
+        private let lock = NSLock()
+        private var storage = false
+
+        var value: Bool { lock.withLock { storage } }
+        func set() { lock.withLock { storage = true } }
+    }
+
     func testRunHandlesInstantExit() throws {
         let root = try TestFileBuilder.makeTempDir()
         defer { try? FileManager.default.removeItem(at: root) }
@@ -43,6 +51,63 @@ final class SubprocessRunnerAsyncTests: XCTestCase {
 
         XCTAssertEqual(result.exitCode, 0)
         XCTAssertEqual(result.stdout, "done")
+    }
+
+    func testRunAsyncWaitsForOrderedStreamingCallbacksBeforeReturning() async throws {
+        let root = try TestFileBuilder.makeTempDir()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let scriptURL = root.appendingPathComponent("ordered-callbacks.sh")
+        try TestFileBuilder.createExecutable(
+            at: scriptURL,
+            script: """
+            #!/bin/sh
+            printf 'first\\n'
+            /bin/sleep 0.05
+            printf 'second\\n'
+            """
+        )
+        let entered = DispatchSemaphore(value: 0)
+        let release = DispatchSemaphore(value: 0)
+        let lines = LockedLines()
+        let finished = LockedFlag()
+        let runner = SubprocessRunner()
+
+        let task = Task {
+            let result = try await runner.runAsync(
+                scriptURL.path,
+                [],
+                onStdout: { line in
+                    if line == "first" {
+                        entered.signal()
+                        release.wait()
+                    }
+                    lines.append(line)
+                }
+            )
+            finished.set()
+            return result
+        }
+
+        let didEnter = await withCheckedContinuation { continuation in
+            DispatchQueue.global().async {
+                continuation.resume(
+                    returning: entered.wait(timeout: .now() + 2) == .success
+                )
+            }
+        }
+        guard didEnter else {
+            release.signal()
+            _ = try? await task.value
+            return XCTFail("First streaming callback did not arrive")
+        }
+        try await Task.sleep(nanoseconds: 100_000_000)
+        XCTAssertFalse(finished.value)
+        release.signal()
+
+        let result = try await task.value
+        XCTAssertEqual(result.exitCode, 0)
+        XCTAssertEqual(lines.value(), ["first", "second"])
+        XCTAssertTrue(finished.value)
     }
 
     func testRunMergesEnvironmentOverridesWithInheritedEnvironment() async throws {

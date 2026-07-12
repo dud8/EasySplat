@@ -73,7 +73,7 @@ extension AppModel {
         try? FileManager.default.createDirectory(at: base, withIntermediateDirectories: true)
         guard let contents = try? FileManager.default.contentsOfDirectory(
             at: base,
-            includingPropertiesForKeys: [.isDirectoryKey],
+            includingPropertiesForKeys: [.isDirectoryKey, .isSymbolicLinkKey],
             options: [.skipsHiddenFiles]
         ) else {
             projectSummaries = []
@@ -82,6 +82,11 @@ extension AppModel {
 
         var summaries: [ProjectSummary] = []
         for url in contents where url.pathExtension == "easysplatproj" {
+            guard let values = try? url.resourceValues(
+                forKeys: [.isDirectoryKey, .isSymbolicLinkKey]
+            ), values.isDirectory == true, values.isSymbolicLink != true else {
+                continue
+            }
             let metadataURL = url.appendingPathComponent("project.json")
             let metadata: ProjectMetadata
             do {
@@ -216,7 +221,21 @@ extension AppModel {
         metadata: ProjectMetadata? = nil,
         validationDepth: ProjectArtifactValidationDepth = .full
     ) -> URL? {
-        guard let outputURL = metadataOutputURL(projectURL: projectURL, metadata: metadata) else {
+        let persistedMetadata: ProjectMetadata
+        if let metadata {
+            persistedMetadata = metadata
+        } else {
+            guard let loaded = try? ProjectMetadataStore.load(
+                from: ProjectPaths(root: projectURL).metadataURL
+            ) else { return nil }
+            persistedMetadata = loaded
+        }
+        guard persistedMetadata.state.stage == .done,
+              persistedMetadata.state.lastError == nil,
+              let outputURL = metadataOutputURL(
+                projectURL: projectURL,
+                metadata: persistedMetadata
+              ) else {
             return nil
         }
         return ProjectArtifactValidator.validatePlyFile(at: outputURL, depth: validationDepth) == .valid ? outputURL : nil
@@ -419,18 +438,20 @@ extension AppModel {
     @discardableResult
     func updateProjectNotes(at url: URL, to text: String) -> Bool {
         let metadataURL = ProjectPaths(root: url).metadataURL
-        guard var metadata = try? ProjectMetadataStore.load(from: metadataURL) else { return false }
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
         let newNotes: String? = trimmed.isEmpty ? nil : trimmed
-        guard metadata.notes != newNotes else { return false }
-        metadata.notes = newNotes
         // Deliberately do not assign `currentProjectNotes` here. The binding
         // owner (notes editor) drives that property; reassigning the trimmed
         // value back into the binding mid-typing would yank cursor position
         // and drop in-progress whitespace from the user.
         do {
-            try ProjectMetadataStore.save(metadata, to: metadataURL)
-            return true
+            var didChange = false
+            _ = try ProjectMetadataStore.update(at: metadataURL) { metadata in
+                guard metadata.notes != newNotes else { return }
+                metadata.notes = newNotes
+                didChange = true
+            }
+            return didChange
         } catch {
             // Surface the failure as a non-fatal status so the user knows
             // their typed note didn't make it to disk (typical cause: the
@@ -458,11 +479,14 @@ extension AppModel {
         let trimmed = newTitle.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return false }
         let metadataURL = ProjectPaths(root: url).metadataURL
-        guard var metadata = try? ProjectMetadataStore.load(from: metadataURL) else { return false }
-        guard metadata.title != trimmed else { return false }
-        metadata.title = trimmed
         do {
-            try ProjectMetadataStore.save(metadata, to: metadataURL)
+            var didChange = false
+            _ = try ProjectMetadataStore.update(at: metadataURL) { metadata in
+                guard metadata.title != trimmed else { return }
+                metadata.title = trimmed
+                didChange = true
+            }
+            guard didChange else { return false }
             refreshProjectSummaries()
             return true
         } catch {

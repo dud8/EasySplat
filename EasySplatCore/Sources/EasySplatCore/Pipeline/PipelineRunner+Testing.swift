@@ -195,6 +195,10 @@ extension PipelineRunner {
         trainingBackendPreference().rawValue
     }
 
+    func test_checkpointTrainingBackend(metadata: ProjectMetadata) -> String? {
+        checkpointTrainingBackend(metadata: metadata)?.rawValue
+    }
+
     func test_trainingStatusMessage(
         elapsed: TimeInterval,
         step: Int?,

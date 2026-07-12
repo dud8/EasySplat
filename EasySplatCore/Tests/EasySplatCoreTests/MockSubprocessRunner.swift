@@ -65,3 +65,57 @@ final class MockSubprocessRunner: @unchecked Sendable, SubprocessRunning {
         )
     }
 }
+
+final class CheckpointCancellingSubprocessRunner: @unchecked Sendable, SubprocessRunning {
+    private let backing: MockSubprocessRunner
+    private let launchPath: String
+    private let events: String
+
+    init(backing: MockSubprocessRunner, launchPath: String, events: String) {
+        self.backing = backing
+        self.launchPath = launchPath
+        self.events = events
+    }
+
+    func run(
+        _ launchPath: String,
+        _ arguments: [String],
+        currentDirectory: URL?,
+        environment: [String: String],
+        onStdout: @escaping @Sendable (String) -> Void,
+        onStderr: @escaping @Sendable (String) -> Void
+    ) throws -> SubprocessResult {
+        try backing.run(
+            launchPath,
+            arguments,
+            currentDirectory: currentDirectory,
+            environment: environment,
+            onStdout: onStdout,
+            onStderr: onStderr
+        )
+    }
+
+    func runAsync(
+        _ launchPath: String,
+        _ arguments: [String],
+        currentDirectory: URL?,
+        environment: [String: String],
+        onStdout: @escaping @Sendable (String) -> Void,
+        onStderr: @escaping @Sendable (String) -> Void
+    ) async throws -> SubprocessResult {
+        guard launchPath == self.launchPath else {
+            return try await backing.runAsync(
+                launchPath,
+                arguments,
+                currentDirectory: currentDirectory,
+                environment: environment,
+                onStdout: onStdout,
+                onStderr: onStderr
+            )
+        }
+        for line in events.split(whereSeparator: \.isNewline) {
+            onStdout(String(line))
+        }
+        throw CancellationError()
+    }
+}

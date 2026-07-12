@@ -72,6 +72,7 @@ expected_keys = {
     "build_timestamp",
     "cmake",
     "cmake_arguments",
+    "checkpoint_patch_sha256",
     "compiler",
     "dependencies",
     "deployment_target",
@@ -101,8 +102,9 @@ exact_values = {
     "source_commit": "106499b0a53f82b0c92d013b0861fbebd341b17e",
     "source_version": "1.1.3",
     "source_tree_sha256": "866fd6d051b5cf98ca08ae1552236473f504d8f13756cbda68201e48532c3e6a",
-    "overlay_sha256": "bbb38851e0b7f80c9568fa6b551482ac9abdfb95fe5ce8de01aaafb7de87259a",
+    "overlay_sha256": "154b3226fd0a8bde5620ee843bd9b8826e8b91165a620ef835e816b31e4c469f",
     "patch_sha256": "ee2dde253eb2a53df56811a59a8c490208e3c7bad19cef38ae96f81a7d5be2a1",
+    "checkpoint_patch_sha256": "cd6f97088a21114fbb1fefac6d37a9f24eedf16daaee7405a00260f22aeb9b6d",
     "deployment_target": "macOS 15.0",
     "build_configuration": "Release",
 }
@@ -140,6 +142,7 @@ for key in (
     "source_tree_sha256",
     "overlay_sha256",
     "patch_sha256",
+    "checkpoint_patch_sha256",
     "executable_sha256",
     "metallib_sha256",
 ):

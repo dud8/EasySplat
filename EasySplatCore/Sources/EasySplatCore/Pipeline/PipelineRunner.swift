@@ -163,6 +163,12 @@ public final class PipelineRunner: @unchecked Sendable {
         // tool logs (colmap/brush/etc.) for inspection — wiping them on a no-op startup
         // failure would destroy the only evidence of why the prior attempt died.
         var metadata = try ProjectMetadataStore.load(from: paths.metadataURL)
+        var trainingManifestWarning: String?
+        do {
+            _ = try TrainingArtifactStore.reconcile(metadata: &metadata, paths: paths)
+        } catch {
+            trainingManifestWarning = error.localizedDescription
+        }
         let metadataForResumeValidation = metadata
 
         // Now we've committed to a new run: reset per-tool logs so users see only the
@@ -223,9 +229,33 @@ public final class PipelineRunner: @unchecked Sendable {
                 logger.emit(event)
             }
         }
+        if let trainingManifestWarning {
+            emit(.stageLog(
+                stage: .trainBrush,
+                line: "Ignored an invalid training resume record: \(trainingManifestWarning)",
+                isError: true
+            ))
+        }
 
         func stageIndex(_ stage: PipelineStage) -> Int {
             PipelineStage.allCases.firstIndex(of: stage) ?? 0
+        }
+
+        var reranStageBeforeTraining = false
+
+        func markStageForRerun(_ stage: PipelineStage) throws -> Bool {
+            guard stageIndex(stage) < stageIndex(.trainBrush) else { return true }
+            guard !reranStageBeforeTraining else { return true }
+            reranStageBeforeTraining = true
+            removeIfExists(paths.trainingURL)
+            if metadata.trainingArtifact != nil {
+                metadata.trainingArtifact = nil
+                try ProjectMetadataStore.savePreservingUserEditableFields(
+                    metadata,
+                    to: paths.metadataURL
+                )
+            }
+            return true
         }
 
         func writeCheckpoint(
@@ -246,16 +276,45 @@ public final class PipelineRunner: @unchecked Sendable {
 
         func shouldRunStage(_ stage: PipelineStage) throws -> Bool {
             guard let lastCompletedStage else { return true }
-            if stageIndex(stage) <= stageIndex(lastCompletedStage) {
-                if !resumeValidationMode {
-                    return !isStageComplete(stage, paths: paths, metadata: metadata)
-                }
-                let validationMetadata = resumeValidationMode ? metadataForResumeValidation : metadata
+            let validationMetadata = resumeValidationMode ? metadataForResumeValidation : metadata
+            if stage == .trainBrush,
+               !reranStageBeforeTraining,
+               validationMetadata.trainingArtifact?.completionStatus == .completed {
                 switch try validateStageOutput(stage, paths: paths, metadata: validationMetadata) {
                 case .valid:
                     return false
                 case .missing:
-                    return true
+                    emit(.stageLog(
+                        stage: stage,
+                        line: "The completed training result is missing. Training will restart.",
+                        isError: true
+                    ))
+                case .corrupt(let reason):
+                    emit(.stageLog(
+                        stage: stage,
+                        line: "The completed training result is invalid (\(reason)). Training will restart.",
+                        isError: true
+                    ))
+                }
+                try TrainingArtifactStore.discardCompletedArtifact(
+                    metadata: &metadata,
+                    paths: paths
+                )
+                try paths.ensureDirectories()
+                return true
+            }
+            if stage == .trainBrush, reranStageBeforeTraining {
+                return true
+            }
+            if stageIndex(stage) <= stageIndex(lastCompletedStage) {
+                if !resumeValidationMode {
+                    return !isStageComplete(stage, paths: paths, metadata: metadata)
+                }
+                switch try validateStageOutput(stage, paths: paths, metadata: validationMetadata) {
+                case .valid:
+                    return false
+                case .missing:
+                    return try markStageForRerun(stage)
                 case .corrupt(let reason):
                     emit(.stageLog(
                         stage: stage,
@@ -264,10 +323,10 @@ public final class PipelineRunner: @unchecked Sendable {
                     ))
                     try? cleanForRetry(failedStage: stage, paths: paths)
                     try? paths.ensureDirectories()
-                    return true
+                    return try markStageForRerun(stage)
                 }
             }
-            return true
+            return try markStageForRerun(stage)
         }
 
         func markStageComplete(_ stage: PipelineStage) {
@@ -3687,10 +3746,14 @@ public final class PipelineRunner: @unchecked Sendable {
             // Brush-vs-msplat guard sees the same point count the uninterrupted run would have.
             let effectiveReconstructionScore: ReconstructionScore? = acceptedReconstructionScore
                 ?? metadata.reconstruction.map(Self.reconstructionScore(fromPersistedSummary:))
-            let preferredTrainingBackend = checkpointTrainingBackend(metadata: trainingCutoffMetadata)
-                ?? trainingBackendPreference()
+            let checkpointTrainingBackend: TrainingBackend? =
+                trainingCutoffMetadata.trainingArtifact?.completionStatus == .checkpointed
+                ? .msplat
+                : checkpointTrainingBackend(metadata: trainingCutoffMetadata)
+            let preferredTrainingBackend = checkpointTrainingBackend ?? trainingBackendPreference()
             let trainingBackend: TrainingBackend
             if preferredTrainingBackend == .msplat,
+               checkpointTrainingBackend == nil,
                shouldUseBrushInsteadOfAutomaticMsplat(for: effectiveReconstructionScore) {
                 let pointCount = effectiveReconstructionScore?.pointCount ?? 0
                 let minimumPointCount = automaticMsplatMinimumSparsePoints()
@@ -3735,7 +3798,7 @@ public final class PipelineRunner: @unchecked Sendable {
                     })
                     let trainingStartedAt = Date()
                     currentTrainingStartedAt = trainingStartedAt
-                    let outputURL = paths.trainingURL.appendingPathComponent("msplat/splat.ply")
+                    let outputURL = paths.msplatOutputURL
                     emit(.stageProgress(stage: .trainBrush, fraction: -1.0, message: "Training model with msplat"))
 
                     let msplatToolLog = ToolLogWriter(fileURL: paths.msplatLogURL, toolName: "msplat")
@@ -3748,43 +3811,130 @@ public final class PipelineRunner: @unchecked Sendable {
                             "tool": msplatPath.path
                         ]
                     )
-                    let detailProfile = metadata.requestedRunOptions?.detailProfile ?? {
-                        switch metadata.preset.quality {
-                        case .draft: return .fast
-                        case .standard: return .balanced
-                        case .ultra: return .highDetail
-                        }
-                    }()
-                    let trainingResult = try await self.tooling.msplat.runTrain(
-                        msplatPath: msplatPath,
-                        datasetPath: datasetURL,
-                        outputPath: outputURL,
-                        profile: detailProfile,
-                        seed: 42,
-                        onProgress: { progress in
-                            let fraction = Double(progress.iteration) / Double(progress.iterationLimit)
-                            emit(.stageProgress(
+                    let detailProfile = metadata.effectiveDetailProfile
+                    let seed: UInt64 = 42
+                    let resumeURL: URL?
+                    do {
+                        resumeURL = try msplatResumeURL(
+                            metadata: metadata,
+                            paths: paths,
+                            profile: detailProfile,
+                            seed: seed
+                        )
+                    } catch let validationError as MsplatCheckpointValidationError {
+                        emit(.stageLog(
+                            stage: .trainBrush,
+                            line: "Saved training state could not be validated; restarting from reconstructed cameras. \(validationError.localizedDescription)",
+                            isError: true
+                        ))
+                        var persistedMetadata = try ProjectMetadataStore.load(from: paths.metadataURL)
+                        try TrainingArtifactStore.discardCheckpointedArtifact(
+                            metadata: &persistedMetadata,
+                            paths: paths
+                        )
+                        metadata = persistedMetadata
+                        resumeURL = nil
+                    }
+                    var completedTrainingResult: MsplatTrainingResult?
+                    var activeResumeURL = resumeURL
+                    while completedTrainingResult == nil {
+                        do {
+                            completedTrainingResult = try await self.tooling.msplat.runTrain(
+                                msplatPath: msplatPath,
+                                datasetPath: datasetURL,
+                                outputPath: outputURL,
+                                checkpointPath: paths.msplatCheckpointURL,
+                                resumeFrom: activeResumeURL,
+                                profile: detailProfile,
+                                seed: seed,
+                                onProgress: { progress in
+                                    let fraction = Double(progress.iteration) / Double(progress.iterationLimit)
+                                    emit(.stageProgress(
+                                        stage: .trainBrush,
+                                        fraction: fraction,
+                                        message: "Training splat · \(progress.iteration.formatted()) of \(progress.iterationLimit.formatted())"
+                                    ))
+                                },
+                                onCheckpoint: { receipt in
+                                    do {
+                                        try self.persistMsplatCheckpoint(
+                                            receipt,
+                                            profile: detailProfile,
+                                            seed: seed,
+                                            paths: paths
+                                        )
+                                    } catch {
+                                        emit(.stageLog(
+                                            stage: .trainBrush,
+                                            line: "Could not record an intermediate training checkpoint: \(error.localizedDescription)",
+                                            isError: true
+                                        ))
+                                    }
+                                },
+                                onLog: { line, isErr in
+                                    msplatToolLog.append(stream: isErr ? "stderr" : "stdout", line: line)
+                                    let cleaned = Self.stripAnsiCodes(line)
+                                    let trimmed = Self.sanitizeToolLogLine(cleaned)
+                                        .trimmingCharacters(in: .whitespacesAndNewlines)
+                                    guard !trimmed.isEmpty else { return }
+                                    let effectiveIsError = isErr && Self.looksLikeErrorishLine(trimmed.lowercased())
+                                    if Self.shouldEmitToolLogLine(trimmed, isError: effectiveIsError) {
+                                        emit(.stageLog(
+                                            stage: .trainBrush,
+                                            line: trimmed,
+                                            isError: effectiveIsError
+                                        ))
+                                    }
+                                }
+                            )
+                        } catch let rejection as MsplatResumeRejected where activeResumeURL != nil {
+                            emit(.stageLog(
                                 stage: .trainBrush,
-                                fraction: fraction,
-                                message: "Training splat · \(progress.iteration.formatted()) of \(progress.iterationLimit.formatted())"
+                                line: "Saved training state no longer matches this run; restarting from reconstructed cameras. \(rejection.localizedDescription)",
+                                isError: true
                             ))
-                        },
-                        onLog: { line, isErr in
-                            msplatToolLog.append(stream: isErr ? "stderr" : "stdout", line: line)
-                            let cleaned = Self.stripAnsiCodes(line)
-                            let trimmed = Self.sanitizeToolLogLine(cleaned)
-                                .trimmingCharacters(in: .whitespacesAndNewlines)
-                            guard !trimmed.isEmpty else { return }
-                            let effectiveIsError = isErr && Self.looksLikeErrorishLine(trimmed.lowercased())
-                            if Self.shouldEmitToolLogLine(trimmed, isError: effectiveIsError) {
-                                emit(.stageLog(
-                                    stage: .trainBrush,
-                                    line: trimmed,
-                                    isError: effectiveIsError
-                                ))
-                            }
+                            var persistedMetadata = try ProjectMetadataStore.load(from: paths.metadataURL)
+                            try TrainingArtifactStore.discardCheckpointedArtifact(
+                                metadata: &persistedMetadata,
+                                paths: paths
+                            )
+                            metadata = persistedMetadata
+                            activeResumeURL = nil
+                        } catch let interruption as MsplatTrainingInterrupted {
+                            try persistMsplatCheckpoint(
+                                interruption.checkpoint,
+                                profile: detailProfile,
+                                seed: seed,
+                                paths: paths
+                            )
+                            metadata = try ProjectMetadataStore.load(from: paths.metadataURL)
+                            throw CancellationError()
                         }
+                    }
+                    guard let trainingResult = completedTrainingResult else {
+                        throw PipelineError.outputMissing
+                    }
+                    guard ProjectArtifactValidator.validatePlyFile(at: outputURL) == .valid else {
+                        throw PipelineError.outputMissing
+                    }
+                    try persistMsplatCompletion(
+                        trainingResult,
+                        profile: detailProfile,
+                        seed: seed,
+                        paths: paths
                     )
+                    metadata = try ProjectMetadataStore.load(from: paths.metadataURL)
+                    if FileManager.default.fileExists(atPath: paths.msplatCheckpointURL.path) {
+                        do {
+                            try FileManager.default.removeItem(at: paths.msplatCheckpointURL)
+                        } catch {
+                            emit(.stageLog(
+                                stage: .trainBrush,
+                                line: "Could not remove completed training checkpoints: \(error.localizedDescription)",
+                                isError: true
+                            ))
+                        }
+                    }
                     writeCheckpoint(
                         stage: .trainBrush,
                         progress: 1.0,

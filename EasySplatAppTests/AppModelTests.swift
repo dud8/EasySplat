@@ -486,7 +486,7 @@ final class AppModelTests: XCTestCase {
         XCTAssertFalse(model.isLivePreviewEnabled)
     }
 
-    func testMsplatTrainingProgressWarnsThatTrainingRestarts() {
+    func testMsplatTrainingStopCopyPromisesValidationNotAutomaticResume() {
         let tempBase = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
         let model = AppModel(toolchainManager: MockToolchainManager(), projectBaseURL: tempBase) { _, config in
             MockPipelineRunner(projectURL: tempBase, config: config)
@@ -505,8 +505,156 @@ final class AppModelTests: XCTestCase {
         model.handle(event: .trainingBackendSelected(backend: .msplat))
         model.cancelCurrentProject(deleteProject: false)
 
+        XCTAssertEqual(model.statusTitle, "Saving training checkpoint…")
+        XCTAssertEqual(
+            model.statusDetail,
+            "Saving and validating the latest training checkpoint. Recent iterations may repeat on resume."
+        )
+    }
+
+    func testUnknownTrainingBackendUsesGenericStopCopy() {
+        let tempBase = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        let model = AppModel(toolchainManager: MockToolchainManager(), projectBaseURL: tempBase) { _, config in
+            MockPipelineRunner(projectURL: tempBase, config: config)
+        }
+        model.currentTask = Task {
+            while !Task.isCancelled {
+                try? await Task.sleep(nanoseconds: 50_000_000)
+            }
+        }
+        defer {
+            model.currentTask?.cancel()
+            model.currentTask = nil
+        }
+
+        model.handle(event: .stageStarted(stage: .trainBrush))
+        model.cancelCurrentProject(deleteProject: false)
+
         XCTAssertEqual(model.statusTitle, "Saving project…")
-        XCTAssertEqual(model.statusDetail, "Stopping training at the next safe point (resume starts training over).")
+        XCTAssertEqual(
+            model.statusDetail,
+            "Stopping training at the next safe point. Resume behavior depends on the saved training state."
+        )
+    }
+
+    func testMsplatCheckpointPersistenceFailureDoesNotSilentlyCompleteStop() async throws {
+        let tempBase = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(at: tempBase, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: tempBase) }
+        let input = tempBase.appendingPathComponent("input.mov")
+        try Data("video".utf8).write(to: input)
+        let started = expectation(description: "training started")
+        let model = AppModel(
+            toolchainManager: MockToolchainManager(),
+            projectBaseURL: tempBase
+        ) { _, _ in
+            StopFailingPipelineRunner(started: started, stage: .trainBrush, backend: .msplat)
+        }
+        var terminationReplies: [Bool] = []
+        model.replyToTerminationRequest = { shouldTerminate in
+            terminationReplies.append(shouldTerminate)
+        }
+        model.addInputs(urls: [input])
+        model.startFromPendingSelection()
+        await fulfillment(of: [started], timeout: 2.0)
+        try await waitForPipelineState(model: model, stage: .trainBrush, backend: .msplat)
+
+        model.cancelCurrentProject(deleteProject: false, exitIntent: .quit)
+        try await waitForLastError(model: model, timeout: 2.0)
+
+        XCTAssertEqual(model.viewState, .processing)
+        XCTAssertEqual(model.statusTitle, "Couldn’t save the project")
+        XCTAssertEqual(
+            model.statusDetail,
+            "The training checkpoint was not saved. Review the details and try again."
+        )
+        XCTAssertFalse(model.isStopping)
+        XCTAssertEqual(model.exitIntent, .none)
+        XCTAssertNil(model.pendingCloseWindow)
+        XCTAssertEqual(terminationReplies, [false])
+        XCTAssertNotNil(model.currentProjectURL)
+        XCTAssertTrue((model.lastError ?? "").contains("checkpoint persistence failed"))
+    }
+
+    func testStopFailurePresentationCoversBrushGenericAndDeleteFailures() {
+        let tempBase = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        let model = AppModel(toolchainManager: MockToolchainManager(), projectBaseURL: tempBase) { _, config in
+            MockPipelineRunner(projectURL: tempBase, config: config)
+        }
+
+        XCTAssertEqual(
+            model.stopFailurePresentation(for: .keepProject, backend: .brush),
+            AppModel.StopFailurePresentation(
+                title: "Couldn’t export the snapshot",
+                detail: "The latest training snapshot was not exported. Review the details and try again."
+            )
+        )
+        XCTAssertEqual(
+            model.stopFailurePresentation(for: .keepProject, backend: nil),
+            AppModel.StopFailurePresentation(
+                title: "Couldn’t save the project",
+                detail: "The project was not saved. Review the details and try again."
+            )
+        )
+        XCTAssertEqual(
+            model.stopFailurePresentation(for: .deleteProject, backend: .msplat),
+            AppModel.StopFailurePresentation(
+                title: "Couldn’t delete the project",
+                detail: "The project was not deleted because EasySplat could not stop safely. Review the details and try again."
+            )
+        )
+    }
+
+    func testResumedMsplatCheckpointFailureUsesCheckpointFailureCopy() async throws {
+        let tempBase = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(at: tempBase, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: tempBase) }
+        let projectURL = try makeProject(
+            at: tempBase,
+            name: "ResumeCheckpointFailure",
+            lastError: nil,
+            withOutput: false,
+            stage: .trainBrush
+        )
+        let started = expectation(description: "resumed training started")
+        let model = AppModel(
+            toolchainManager: MockToolchainManager(),
+            projectBaseURL: tempBase
+        ) { _, _ in
+            StopFailingPipelineRunner(started: started, stage: .trainBrush, backend: .msplat)
+        }
+        let window = NSWindow(
+            contentRect: NSRect(x: 0, y: 0, width: 120, height: 80),
+            styleMask: [.titled],
+            backing: .buffered,
+            defer: false
+        )
+        window.isReleasedWhenClosed = false
+
+        model.resumeProject(at: projectURL)
+        await fulfillment(of: [started], timeout: 2.0)
+        try await waitForPipelineState(model: model, stage: .trainBrush, backend: .msplat)
+
+        model.cancelCurrentProject(
+            deleteProject: false,
+            exitIntent: .closeWindow,
+            window: window
+        )
+        try await waitForLastError(model: model, timeout: 2.0)
+
+        XCTAssertEqual(model.viewState, .processing)
+        XCTAssertEqual(model.statusTitle, "Couldn’t save the project")
+        XCTAssertEqual(
+            model.statusDetail,
+            "The training checkpoint was not saved. Review the details and try again."
+        )
+        XCTAssertFalse(model.isStopping)
+        XCTAssertEqual(model.exitIntent, .none)
+        XCTAssertNil(model.pendingCloseWindow)
+        XCTAssertFalse(model.allowNextWindowClose)
+        XCTAssertEqual(model.currentProjectURL, projectURL)
     }
 
     func testBrushTrainingProgressUsesSnapshotStopCopy() {
@@ -892,6 +1040,43 @@ final class AppModelTests: XCTestCase {
         XCTAssertEqual(statusByTitle["Ready"], .ready)
         XCTAssertEqual(statusByTitle["Failed"], .failed)
         XCTAssertEqual(statusByTitle["Progress"], .inProgress)
+    }
+
+    func testRefreshProjectSummariesAndProjectActionsRejectSymlinkedBundle() throws {
+        let parent = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: parent) }
+        let base = parent.appendingPathComponent("Projects", isDirectory: true)
+        let outsideProject = parent.appendingPathComponent("Outside.easysplatproj", isDirectory: true)
+        try FileManager.default.createDirectory(at: base, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: outsideProject, withIntermediateDirectories: true)
+        let outsidePaths = ProjectPaths(root: outsideProject)
+        try ProjectMetadataStore.save(
+            ProjectMetadata(
+                title: "Outside",
+                input: .photos(folder: "/tmp/photos"),
+                preset: PresetSpec(mode: .object, quality: .standard)
+            ),
+            to: outsidePaths.metadataURL
+        )
+        let originalMetadataBytes = try Data(contentsOf: outsidePaths.metadataURL)
+        let linkedProject = base.appendingPathComponent("Linked.easysplatproj", isDirectory: true)
+        try FileManager.default.createSymbolicLink(
+            at: linkedProject,
+            withDestinationURL: outsideProject
+        )
+
+        let model = AppModel(toolchainManager: MockToolchainManager(), projectBaseURL: base) { _, config in
+            MockPipelineRunner(projectURL: linkedProject, config: config)
+        }
+        model.refreshProjectSummaries()
+        XCTAssertTrue(model.projectSummaries.isEmpty)
+        XCTAssertFalse(model.updateProjectNotes(at: linkedProject, to: "must stay local"))
+        XCTAssertFalse(model.renameProject(at: linkedProject, to: "Must stay local"))
+        model.markProjectOpened(at: linkedProject)
+
+        XCTAssertEqual(try Data(contentsOf: outsidePaths.metadataURL), originalMetadataBytes)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: outsidePaths.lastOpenedSidecarURL.path))
     }
 
     /// A project whose metadata uses a future formatVersion should appear in the listing
@@ -1837,6 +2022,22 @@ final class AppModelTests: XCTestCase {
         XCTFail("Timed out waiting for lastError")
     }
 
+    private func waitForPipelineState(
+        model: AppModel,
+        stage: PipelineStage,
+        backend: TrainingBackend?,
+        timeout: TimeInterval = 2.0
+    ) async throws {
+        let deadline = Date().addingTimeInterval(timeout)
+        while Date() < deadline {
+            if model.stage == stage, model.activeTrainingBackend == backend {
+                return
+            }
+            try await Task.sleep(nanoseconds: 50_000_000)
+        }
+        XCTFail("Timed out waiting for stage \(stage) and backend \(String(describing: backend))")
+    }
+
     private func makeProject(
         at base: URL,
         name: String,
@@ -2063,6 +2264,38 @@ final class BlockingPipelineRunner: PipelineRunning {
         while true {
             try Task.checkCancellation()
             try await Task.sleep(nanoseconds: 50_000_000)
+        }
+    }
+}
+
+final class StopFailingPipelineRunner: PipelineRunning {
+    private let started: XCTestExpectation
+    private let stage: PipelineStage
+    private let backend: TrainingBackend?
+
+    init(started: XCTestExpectation, stage: PipelineStage, backend: TrainingBackend?) {
+        self.started = started
+        self.stage = stage
+        self.backend = backend
+    }
+
+    func run(
+        resumeFrom lastCompletedStage: PipelineStage?,
+        events: @escaping @Sendable (PipelineEvent) -> Void
+    ) async throws {
+        events(.stageStarted(stage: stage))
+        if let backend {
+            events(.trainingBackendSelected(backend: backend))
+        }
+        started.fulfill()
+        do {
+            try await Task.sleep(nanoseconds: 60_000_000_000)
+        } catch {
+            throw NSError(
+                domain: "CheckpointSaveFailingPipelineRunner",
+                code: 1,
+                userInfo: [NSLocalizedDescriptionKey: "checkpoint persistence failed"]
+            )
         }
     }
 }

@@ -49,9 +49,12 @@ extension AppModel {
         } else if isBrushSnapshotTrainingActive {
             statusTitle = "Exporting snapshot…"
             statusDetail = "Exporting the latest snapshot (training restarts from scratch on resume)."
+        } else if isMsplatTrainingActive {
+            statusTitle = "Saving training checkpoint…"
+            statusDetail = "Saving and validating the latest training checkpoint. Recent iterations may repeat on resume."
         } else if isTrainingStageActive {
             statusTitle = "Saving project…"
-            statusDetail = "Stopping training at the next safe point (resume starts training over)."
+            statusDetail = "Stopping training at the next safe point. Resume behavior depends on the saved training state."
         } else {
             statusTitle = "Saving progress…"
             statusDetail = "Stopping at the next safe point (up to 15 seconds)…"
@@ -120,8 +123,10 @@ extension AppModel {
         alert.messageText = isTraining ? "Training in progress" : "Stop this project?"
         if canExportSnapshot {
             alert.informativeText = "Exporting keeps only a snapshot. If you resume, training starts over from scratch."
+        } else if isMsplatTrainingActive {
+            alert.informativeText = "EasySplat will save and validate a training checkpoint. Recent iterations may repeat when you resume."
         } else if isTraining {
-            alert.informativeText = "You can save progress, but training starts over if you resume later."
+            alert.informativeText = "EasySplat will stop training safely and save the project. Resume behavior depends on the saved training state."
         } else {
             alert.informativeText = "You can save and resume later, or delete the project."
         }
@@ -188,6 +193,17 @@ extension AppModel {
         forcedExitTask = nil
     }
 
+    func abortPendingExitAfterStopFailure() {
+        cancelForcedExitIfNeeded()
+        let rejectedQuit = exitIntent == .quit
+        exitIntent = .none
+        pendingCloseWindow = nil
+        allowNextWindowClose = false
+        if rejectedQuit {
+            replyToTerminationRequest(false)
+        }
+    }
+
     func forceFinalizeExit(intent: ExitIntent, window: NSWindow?) {
         switch intent {
         case .none:
@@ -195,7 +211,7 @@ extension AppModel {
         case .quit:
             exitIntent = .none
             pendingCloseWindow = nil
-            NSApp.reply(toApplicationShouldTerminate: true)
+            replyToTerminationRequest(true)
             NSApp.terminate(nil)
         case .closeWindow:
             if let window {
@@ -216,7 +232,7 @@ extension AppModel {
         case .quit:
             exitIntent = .none
             pendingCloseWindow = nil
-            NSApp.reply(toApplicationShouldTerminate: true)
+            replyToTerminationRequest(true)
             NSApp.terminate(nil)
         case .closeWindow:
             if let window = pendingCloseWindow {
@@ -337,8 +353,12 @@ extension AppModel {
             return
         } catch {
             guard isCurrentTaskToken(taskToken) else { return }
-            if stopAction != nil {
-                return
+            let stopFailureCopy = stopAction.map {
+                stopFailurePresentation(for: $0, backend: activeTrainingBackend)
+            }
+            if stopFailureCopy != nil {
+                stopAction = nil
+                abortPendingExitAfterStopFailure()
             }
             let failureMessage = lastError ?? error.localizedDescription
             if lastError == nil {
@@ -355,7 +375,11 @@ extension AppModel {
             } else {
                 errorDetails = envDetails
             }
-            if statusTitle == "Preparing project" || statusTitle == "Downloading tools" || statusTitle == "Something went wrong" {
+            if let stopFailureCopy {
+                statusTitle = stopFailureCopy.title
+                statusDetail = stopFailureCopy.detail
+                progress = nil
+            } else if statusTitle == "Preparing project" || statusTitle == "Downloading tools" || statusTitle == "Something went wrong" {
                 statusTitle = lastError ?? "Something went wrong"
                 statusDetail = nil
                 progress = nil
@@ -474,8 +498,12 @@ extension AppModel {
             return
         } catch {
             guard isCurrentTaskToken(taskToken) else { return }
-            if stopAction != nil {
-                return
+            let stopFailureCopy = stopAction.map {
+                stopFailurePresentation(for: $0, backend: activeTrainingBackend)
+            }
+            if stopFailureCopy != nil {
+                stopAction = nil
+                abortPendingExitAfterStopFailure()
             }
             let failureMessage = lastError ?? error.localizedDescription
             if lastError == nil {
@@ -492,7 +520,11 @@ extension AppModel {
             } else {
                 errorDetails = envDetails
             }
-            if statusTitle == "Preparing project" || statusTitle == "Downloading tools" || statusTitle == "Something went wrong" {
+            if let stopFailureCopy {
+                statusTitle = stopFailureCopy.title
+                statusDetail = stopFailureCopy.detail
+                progress = nil
+            } else if statusTitle == "Preparing project" || statusTitle == "Downloading tools" || statusTitle == "Something went wrong" {
                 statusTitle = lastError ?? "Something went wrong"
                 statusDetail = nil
                 progress = nil

@@ -208,22 +208,27 @@ func makeGeometryArtifact(
 }
 
 func makeTrainingArtifact(
-    checkpointPath: String? = "Training/checkpoints/final.ckpt",
-    outputPath: String? = "Output/splat.ply"
+    checkpointPath: String? = nil,
+    outputPath: String? = "Output/splat.ply",
+    completionStatus: TrainingCompletionStatus = .completed
 ) -> TrainingArtifact {
     TrainingArtifact(
         trainerVersion: "trainer-1.4.0",
-        runtimeVersion: "runtime-3.12",
-        geometryDigest: "sha256:geometry",
+        runtimeVersion: "native-metal-cli-v1",
+        trainerBuildDigest: String(repeating: "a", count: 64),
+        inputDigest: String(repeating: "b", count: 64),
+        geometryDigest: String(repeating: "c", count: 64),
         detailProfile: .highDetail,
         iterationLimit: 15_000,
         plateauWindow: 1_500,
         deterministicSeed: 42,
+        completedIteration: 15_000,
         checkpointPath: checkpointPath,
+        checkpointDigest: checkpointPath == nil ? nil : String(repeating: "d", count: 64),
         outputPath: outputPath,
         gaussianCount: 245_000,
         elapsedSeconds: 812.5,
         peakMemoryBytes: 4_294_967_296,
-        completionStatus: "completed"
+        completionStatus: completionStatus
     )
 }

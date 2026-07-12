@@ -5,6 +5,7 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 BUILD_SCRIPT="$ROOT/scripts/toolchain/build_msplat.sh"
 OVERLAY="$ROOT/Tools/MsplatNative/msplat.cpp"
 UPSTREAM_PATCH="$ROOT/Tools/MsplatNative/msplat-1.1.3-easysplat.patch"
+CHECKPOINT_PATCH="$ROOT/Tools/MsplatNative/msplat-1.1.3-checkpoint.patch"
 FIXTURE_GENERATOR="$ROOT/scripts/ci/generate_msplat_sparse_fixtures.py"
 INSTALL_DIR="${EASYSPLAT_MSPLAT_INSTALL_DIR:-$ROOT/Toolchains/build/msplat/install/msplat}"
 
@@ -34,6 +35,7 @@ require_file() {
 require_file "$BUILD_SCRIPT"
 require_file "$OVERLAY"
 require_file "$UPSTREAM_PATCH"
+require_file "$CHECKPOINT_PATCH"
 require_file "$FIXTURE_GENERATOR"
 
 require_contains 'MSPLAT_REPO="https://github.com/rayanht/msplat.git"' "$BUILD_SCRIPT"
@@ -57,6 +59,7 @@ require_contains 'build_info.json' "$BUILD_SCRIPT"
 require_contains 'default.metallib' "$BUILD_SCRIPT"
 require_contains 'easysplat-train' "$BUILD_SCRIPT"
 require_contains 'msplat-1.1.3-easysplat.patch' "$BUILD_SCRIPT"
+require_contains 'msplat-1.1.3-checkpoint.patch' "$BUILD_SCRIPT"
 require_contains '/usr/bin/plutil -p' "$BUILD_SCRIPT"
 require_contains '/usr/bin/otool -L' "$BUILD_SCRIPT"
 
@@ -64,7 +67,7 @@ for forbidden in 'pip install' 'python-build-standalone' 'site-packages' '_core.
   require_absent "$forbidden" "$BUILD_SCRIPT"
 done
 
-for flag in --dataset --output --profile --seed --events-fd --self-check --validate-ply --version --help; do
+for flag in --dataset --output --profile --checkpoint --resume --seed --events-fd --self-check --validate-ply --version --help; do
   require_contains "$flag" "$OVERLAY"
 done
 for flag in --input --num-iters --num-downscales --downscale-factor --eval --events-jsonl; do
@@ -73,8 +76,11 @@ done
 for budget in 'fast", 3000, 400' 'balanced", 7000, 800' 'high-detail", 15000, 1500'; do
   require_contains "$budget" "$OVERLAY"
 done
-for event in started progress early_stop completed cancellation_requested cancelled self_check; do
+for event in started checkpoint_completed checkpoint_loaded resume_rejected progress early_stop completed cancellation_requested cancelled self_check; do
   require_contains "\"$event\"" "$OVERLAY"
+done
+for reason in trainer_changed input_changed geometry_changed run_contract_changed; do
+  require_contains "\"$reason\"" "$OVERLAY"
 done
 require_contains 'InfiniteRandomIterator<size_t> camsIter(camIndices, seed)' "$OVERLAY"
 require_contains 'msplat_record_last_loss' "$OVERLAY"
@@ -85,6 +91,9 @@ require_contains 'lossSyncBatch = refineEvery' "$OVERLAY"
 require_contains 'plateauSampleCount == lossSyncBatch' "$OVERLAY"
 require_contains 'bestCameraLosses' "$OVERLAY"
 require_contains 'lastImprovementIteration' "$OVERLAY"
+require_contains 'checkpoint CURRENT' "$OVERLAY"
+require_contains 'RENAME_NOFOLLOW_ANY' "$OVERLAY"
+require_contains 'computeTrainingIdentity' "$OVERLAY"
 require_contains 'write(' "$OVERLAY"
 require_contains 'msplat_gpu_sync()' "$OVERLAY"
 require_contains 'SIGINT' "$OVERLAY"
@@ -92,7 +101,7 @@ require_contains 'SIGTERM' "$OVERLAY"
 require_contains 'return 130' "$OVERLAY"
 require_contains 'rename(' "$OVERLAY"
 require_contains 'fsync(' "$OVERLAY"
-if [ "$(grep -Fc 'cancelIfRequested(' "$OVERLAY")" -lt 3 ]; then
+if [ "$(grep -Fc 'handleCancellation()' "$OVERLAY")" -lt 4 ]; then
   fail "$OVERLAY must observe cancellation both before and after each iteration"
 fi
 
@@ -105,8 +114,11 @@ require_contains 'int32_t b_id = 0' "$UPSTREAM_PATCH"
 require_contains 'void msplat_record_last_loss' "$UPSTREAM_PATCH"
 require_contains 'void msplat_sync_loss_window' "$UPSTREAM_PATCH"
 require_contains 'syncCB()' "$UPSTREAM_PATCH"
+require_contains 'CKPT_VERSION = 2' "$CHECKPOINT_PATCH"
+require_contains 'Checkpoint tensor shape mismatch' "$CHECKPOINT_PATCH"
+require_contains 'Metal command buffer failed' "$CHECKPOINT_PATCH"
 require_contains 'validateBinaryPly' "$OVERLAY"
-require_contains 'cancelIfRequested(events, step)' "$OVERLAY"
+require_contains 'if (handleCancellation()) return 130' "$OVERLAY"
 
 if [ "${1:-}" = "--source-only" ]; then
   echo "native msplat source contracts passed"
@@ -137,7 +149,7 @@ expected_files=$'./LICENSE\n./bin/default.metallib\n./bin/easysplat-train\n./bui
 done
 "$BIN" --version | grep -Fq '1.1.3' || fail "CLI version does not report 1.1.3"
 help="$($BIN --help)"
-for flag in --dataset --output --profile --seed --events-fd --self-check --validate-ply --version --help; do
+for flag in --dataset --output --profile --checkpoint --resume --seed --events-fd --self-check --validate-ply --version --help; do
   grep -Fq -- "$flag" <<<"$help" || fail "CLI help is missing $flag"
 done
 for flag in --input --num-iters --num-downscales --downscale-factor --eval --events-jsonl; do
@@ -171,7 +183,7 @@ set +e
   2>"$negative_dir/closed-fd.stderr"
 closed_fd_status=$?
 "$BIN" --dataset "$negative_dir" --output "$negative_dir/invalid.ply" \
-  --profile extravagant --seed 42 --events-fd 1 \
+  --profile extravagant --checkpoint "$negative_dir/invalid-checkpoint" --seed 42 --events-fd 1 \
   >"$negative_dir/invalid-profile.stdout" \
   2>"$negative_dir/invalid-profile.stderr"
 invalid_profile_status=$?
@@ -282,7 +294,7 @@ set -e
 [ ! -s "$negative_dir/truncated-ply.stdout" ] || fail "truncated PLY emitted a false success event"
 grep -qi 'payload' "$negative_dir/truncated-ply.stderr" || fail "truncated PLY diagnostic is not useful"
 
-for key in source_commit source_version source_url source_tree_sha256 overlay_sha256 patch_sha256 executable_sha256 metallib_sha256 compiler deployment_target cmake_arguments build_timestamp; do
+for key in source_commit source_version source_url source_tree_sha256 overlay_sha256 patch_sha256 checkpoint_patch_sha256 executable_sha256 metallib_sha256 compiler deployment_target cmake_arguments build_timestamp; do
   require_contains "\"$key\"" "$BUILD_INFO"
 done
 /usr/bin/plutil -p "$BUILD_INFO" >/dev/null || fail "build provenance is not valid JSON"
@@ -384,10 +396,11 @@ while IFS=$'\t' read -r fixture_name expected_points; do
   training_fixture="$fixture_root/$fixture_name"
   training_dir="$negative_dir/training-$fixture_name"
   mkdir -p "$training_dir"
-  "$BIN" \
+"$BIN" \
     --dataset "$training_fixture" \
     --output "$training_dir/splat.ply" \
     --profile fast \
+    --checkpoint "$training_dir/checkpoint" \
     --seed 42 \
     --events-fd 1 \
     >"$training_dir/events.jsonl" 2>"$training_dir/stderr.log"
@@ -423,6 +436,7 @@ run_cancelled_profile() {
     --dataset "$fixture_root/12-clusters-1500" \
     --output "$cancellation_dir/splat.ply" \
     --profile "$profile" \
+    --checkpoint "$cancellation_dir/checkpoint" \
     --seed 42 \
     --events-fd 1 \
     >"$cancellation_dir/events.jsonl" 2>"$cancellation_dir/stderr.log" &
@@ -470,9 +484,188 @@ PY
     fail "cancelled $profile training emitted completed"
   fi
   [ ! -e "$cancellation_dir/splat.ply" ] || fail "cancelled $profile training published a final PLY"
+  python3 - "$cancellation_dir" <<'PY'
+import hashlib
+import json
+import sys
+from pathlib import Path
+
+root = Path(sys.argv[1])
+records = [json.loads(line) for line in (root / "events.jsonl").read_text().splitlines()]
+checkpoints = [record for record in records if record.get("event") == "checkpoint_completed"]
+cancelled = records[-1]
+if not checkpoints or cancelled.get("event") != "cancelled":
+    raise SystemExit("cancellation stream is missing durable checkpoint evidence")
+current = (root / "checkpoint" / "CURRENT").read_text().strip()
+latest = checkpoints[-1]
+if current != cancelled.get("checkpoint_generation") or current != latest.get("checkpoint_generation"):
+    raise SystemExit("cancelled event does not reference CURRENT")
+generation = root / "checkpoint" / "generations" / current
+manifest = json.loads((generation / "manifest.json").read_text())
+payload = generation / "state.msplat"
+digest = hashlib.sha256(payload.read_bytes()).hexdigest()
+if digest != manifest.get("payload_sha256") or digest != latest.get("checkpoint_payload_sha256"):
+    raise SystemExit("cancelled checkpoint payload digest mismatch")
+if manifest.get("iteration") != cancelled.get("checkpoint_iteration"):
+    raise SystemExit("cancelled checkpoint iteration mismatch")
+PY
 }
 
 run_cancelled_profile balanced 7000 800
 run_cancelled_profile high-detail 15000 1500
+
+resume_dir="$negative_dir/resume-fast"
+mkdir -p "$resume_dir"
+"$BIN" \
+  --dataset "$fixture_root/12-clusters-1500" \
+  --output "$resume_dir/splat.ply" \
+  --profile fast \
+  --checkpoint "$resume_dir/checkpoint" \
+  --seed 42 \
+  --events-fd 1 \
+  >"$resume_dir/first.jsonl" 2>"$resume_dir/first.stderr" &
+resume_pid=$!
+checkpoint_ready=0
+for _ in $(seq 1 2000); do
+  if grep -Eq '"event":"checkpoint_completed".*"iteration":500' "$resume_dir/first.jsonl" 2>/dev/null; then
+    checkpoint_ready=1
+    break
+  fi
+  sleep 0.01
+done
+[ "$checkpoint_ready" = "1" ] || {
+  kill -KILL "$resume_pid" 2>/dev/null || true
+  wait "$resume_pid" 2>/dev/null || true
+  fail "Fast training did not publish iteration-500 checkpoint"
+}
+kill -TERM "$resume_pid"
+set +e
+wait "$resume_pid"
+resume_cancel_status=$?
+set -e
+[ "$resume_cancel_status" = "130" ] || fail "Fast checkpoint cancellation exited $resume_cancel_status"
+cp -R "$resume_dir/checkpoint" "$resume_dir/tampered-checkpoint"
+
+make_incompatible_checkpoint() {
+  local destination="$1"
+  local field="$2"
+  local value="$3"
+  cp -R "$resume_dir/checkpoint" "$destination"
+  python3 - "$destination" "$field" "$value" <<'PY'
+import hashlib
+import json
+import sys
+from pathlib import Path
+
+root = Path(sys.argv[1])
+field = sys.argv[2]
+value = sys.argv[3]
+current = (root / "CURRENT").read_text(encoding="utf-8").strip()
+generation = root / "generations" / current
+manifest_path = generation / "manifest.json"
+manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+if field == "camera_count":
+    manifest[field] = int(value)
+    manifest["best_camera_losses"] = [None] * int(value)
+else:
+    manifest[field] = value
+encoded = (json.dumps(manifest, indent=2, sort_keys=True) + "\n").encode("utf-8")
+new_name = f"{manifest['iteration']:08d}-{hashlib.sha256(encoded).hexdigest()}"
+new_generation = generation.with_name(new_name)
+generation.rename(new_generation)
+(new_generation / "manifest.json").write_bytes(encoded)
+(root / "CURRENT").write_text(new_name + "\n", encoding="utf-8")
+PY
+}
+
+assert_resume_rejected() {
+  local checkpoint="$1"
+  local reason="$2"
+  local output="$resume_dir/rejected-$reason.ply"
+  local events="$resume_dir/rejected-$reason.jsonl"
+  local stderr="$resume_dir/rejected-$reason.stderr"
+  set +e
+  "$BIN" \
+    --dataset "$fixture_root/12-clusters-1500" \
+    --output "$output" \
+    --profile fast \
+    --checkpoint "$checkpoint" \
+    --resume "$checkpoint" \
+    --seed 42 \
+    --events-fd 1 \
+    >"$events" 2>"$stderr"
+  local status=$?
+  set -e
+  [ "$status" = "78" ] || fail "$reason resume rejection exited $status instead of 78"
+  [ "$(wc -l <"$events" | tr -d ' ')" = "1" ] || fail "$reason rejection emitted extra events"
+  validate_jsonl "$events"
+  require_contains '"event":"resume_rejected"' "$events"
+  require_contains "\"reason\":\"$reason\"" "$events"
+  [ ! -e "$output" ] || fail "$reason resume rejection published output"
+  grep -qi 'checkpoint' "$stderr" || fail "$reason rejection diagnostic is not useful"
+}
+
+make_incompatible_checkpoint \
+  "$resume_dir/geometry-mismatch-checkpoint" \
+  geometry_digest \
+  "$(printf 'a%.0s' {1..64})"
+assert_resume_rejected "$resume_dir/geometry-mismatch-checkpoint" geometry_changed
+
+make_incompatible_checkpoint \
+  "$resume_dir/input-mismatch-checkpoint" \
+  camera_count \
+  13
+assert_resume_rejected "$resume_dir/input-mismatch-checkpoint" input_changed
+
+make_incompatible_checkpoint \
+  "$resume_dir/trainer-mismatch-checkpoint" \
+  trainer_build_digest \
+  "$(printf 'b%.0s' {1..64})"
+assert_resume_rejected "$resume_dir/trainer-mismatch-checkpoint" trainer_changed
+
+"$BIN" \
+  --dataset "$fixture_root/12-clusters-1500" \
+  --output "$resume_dir/splat.ply" \
+  --profile fast \
+  --checkpoint "$resume_dir/checkpoint" \
+  --resume "$resume_dir/checkpoint" \
+  --seed 42 \
+  --events-fd 1 \
+  >"$resume_dir/resumed.jsonl" 2>"$resume_dir/resumed.stderr"
+validate_jsonl "$resume_dir/resumed.jsonl"
+require_contains '"event":"checkpoint_loaded"' "$resume_dir/resumed.jsonl"
+require_contains '"resumed":true' "$resume_dir/resumed.jsonl"
+require_contains '"event":"completed"' "$resume_dir/resumed.jsonl"
+[ -s "$resume_dir/splat.ply" ] || fail "resumed Fast training did not publish PLY"
+"$BIN" --validate-ply "$resume_dir/splat.ply" --events-fd 1 \
+  >"$resume_dir/validation.jsonl" 2>"$resume_dir/validation.stderr"
+
+python3 - "$resume_dir/tampered-checkpoint" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+root = Path(sys.argv[1])
+generation = (root / "CURRENT").read_text().strip()
+payload = root / "generations" / generation / "state.msplat"
+with payload.open("ab") as stream:
+    stream.write(b"tamper")
+PY
+set +e
+"$BIN" \
+  --dataset "$fixture_root/12-clusters-1500" \
+  --output "$resume_dir/tampered.ply" \
+  --profile fast \
+  --checkpoint "$resume_dir/tampered-checkpoint" \
+  --resume "$resume_dir/tampered-checkpoint" \
+  --seed 42 \
+  --events-fd 1 \
+  >"$resume_dir/tampered.jsonl" 2>"$resume_dir/tampered.stderr"
+tampered_status=$?
+set -e
+[ "$tampered_status" -ne 0 ] || fail "tampered optimizer checkpoint was accepted"
+[ ! -e "$resume_dir/tampered.ply" ] || fail "tampered resume published output"
+grep -Eqi 'hash|size|payload' "$resume_dir/tampered.stderr" \
+  || fail "tampered checkpoint diagnostic is not useful"
 
 echo "native msplat build and CLI contracts passed"

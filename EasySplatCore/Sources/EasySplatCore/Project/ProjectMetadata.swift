@@ -77,6 +77,19 @@ public struct ProjectMetadata: Codable, Sendable {
     }
 }
 
+extension ProjectMetadata {
+    var effectiveDetailProfile: DetailProfile {
+        if let requestedRunOptions {
+            return requestedRunOptions.detailProfile
+        }
+        switch preset.quality {
+        case .draft: return .fast
+        case .standard: return .balanced
+        case .ultra: return .highDetail
+        }
+    }
+}
+
 /// Persisted snapshot of the AutoTuner's decisions for a run, plus the host
 /// hardware profile the tuner derived them from. Lets the viewer / diagnostic
 /// bundle surface "this run targeted 8 anchors, 100k VGGT points, 6 threads,

@@ -504,7 +504,7 @@ final class PipelineRunnerRetryTests: XCTestCase {
         XCTAssertEqual(try runner.test_validateStageOutput(.trainBrush, paths: paths, metadata: metadata), .missing)
     }
 
-    func testValidateStageOutputAcceptsMsplatTrainingExport() throws {
+    func testValidateStageOutputRejectsUnboundMsplatTrainingExport() throws {
         let root = try TestFileBuilder.makeTempDir()
         defer { try? FileManager.default.removeItem(at: root) }
         let paths = ProjectPaths(root: root)
@@ -526,7 +526,131 @@ final class PipelineRunnerRetryTests: XCTestCase {
             lastRunStartedAt: runStartedAt
         )
         let runner = makeRunner(projectURL: root)
-        XCTAssertEqual(try runner.test_validateStageOutput(.trainBrush, paths: paths, metadata: metadata), .valid)
+        XCTAssertEqual(try runner.test_validateStageOutput(.trainBrush, paths: paths, metadata: metadata), .missing)
+    }
+
+    func testCompletedTrainingArtifactMustMatchRequestedDetailProfile() throws {
+        let root = try TestFileBuilder.makeTempDir()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let paths = ProjectPaths(root: root)
+        try paths.ensureDirectories()
+        var artifact = makeTrainingArtifact(outputPath: "Training/msplat/splat.ply")
+        artifact.detailProfile = .highDetail
+        artifact.iterationLimit = 15_000
+        artifact.plateauWindow = 1_500
+        let metadata = ProjectMetadata(
+            title: "Wrong detail",
+            input: .photos(folder: "/tmp/Photos"),
+            preset: PresetSpec(mode: .object, quality: .standard),
+            requestedRunOptions: RequestedRunOptions(detailProfile: .balanced),
+            trainingArtifact: artifact
+        )
+
+        XCTAssertEqual(
+            try makeRunner(projectURL: root).test_validateStageOutput(
+                .trainBrush,
+                paths: paths,
+                metadata: metadata
+            ),
+            .corrupt
+        )
+    }
+
+    func testCheckpointedTrainingArtifactCannotBeMaskedByStalePly() throws {
+        let root = try TestFileBuilder.makeTempDir()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let paths = ProjectPaths(root: root)
+        try paths.ensureDirectories()
+        try TestFileBuilder.writeMinimalPly(
+            at: paths.trainingURL.appendingPathComponent("export_99999.ply")
+        )
+        var checkpointed = makeTrainingArtifact(
+            checkpointPath: "Training/checkpoints/msplat",
+            outputPath: nil,
+            completionStatus: .checkpointed
+        )
+        checkpointed.completedIteration = 500
+        let metadata = ProjectMetadata(
+            title: "Checkpointed",
+            input: .photos(folder: "/tmp/Photos"),
+            preset: PresetSpec(mode: .object, quality: .standard),
+            trainingArtifact: checkpointed
+        )
+
+        XCTAssertEqual(
+            try makeRunner(projectURL: root).test_validateStageOutput(
+                .trainBrush,
+                paths: paths,
+                metadata: metadata
+            ),
+            .missing
+        )
+    }
+
+    func testCompletedTrainingArtifactCannotBeMaskedByUnrelatedBrushExport() throws {
+        let root = try TestFileBuilder.makeTempDir()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let paths = ProjectPaths(root: root)
+        try paths.ensureDirectories()
+        try TestFileBuilder.writeMinimalPly(
+            at: paths.trainingURL.appendingPathComponent("export_99999.ply")
+        )
+        let metadata = ProjectMetadata(
+            title: "Completed",
+            input: .photos(folder: "/tmp/Photos"),
+            preset: PresetSpec(mode: .object, quality: .standard),
+            requestedRunOptions: RequestedRunOptions(detailProfile: .highDetail),
+            trainingArtifact: makeTrainingArtifact(
+                outputPath: "Training/msplat/splat.ply"
+            )
+        )
+
+        XCTAssertEqual(
+            try makeRunner(projectURL: root).test_validateStageOutput(
+                .trainBrush,
+                paths: paths,
+                metadata: metadata
+            ),
+            .missing
+        )
+    }
+
+    func testCompletedTrainingArtifactMustMatchCurrentInputAndGeometry() throws {
+        let root = try TestFileBuilder.makeTempDir()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let paths = ProjectPaths(root: root)
+        try paths.ensureDirectories()
+        try Data("selected".utf8).write(
+            to: paths.framesSelectedURL.appendingPathComponent("frame_000001.jpg")
+        )
+        let sparse = paths.colmapSparseURL.appendingPathComponent("0", isDirectory: true)
+        try FileManager.default.createDirectory(at: sparse, withIntermediateDirectories: true)
+        for name in ["cameras.bin", "images.bin", "points3D.bin"] {
+            try Data(name.utf8).write(to: sparse.appendingPathComponent(name))
+        }
+        try FileManager.default.createDirectory(
+            at: paths.msplatOutputURL.deletingLastPathComponent(),
+            withIntermediateDirectories: true
+        )
+        try TestFileBuilder.writeMinimalPly(at: paths.msplatOutputURL)
+        let metadata = ProjectMetadata(
+            title: "Stale training",
+            input: .photos(folder: "/tmp/Photos"),
+            preset: PresetSpec(mode: .object, quality: .standard),
+            requestedRunOptions: RequestedRunOptions(detailProfile: .highDetail),
+            trainingArtifact: makeTrainingArtifact(
+                outputPath: "Training/msplat/splat.ply"
+            )
+        )
+
+        XCTAssertEqual(
+            try makeRunner(projectURL: root).test_validateStageOutput(
+                .trainBrush,
+                paths: paths,
+                metadata: metadata
+            ),
+            .corrupt
+        )
     }
 
     func testValidateStageOutputDetectsCorruptDatabase() throws {
@@ -671,6 +795,48 @@ final class PipelineRunnerRetryTests: XCTestCase {
 
         XCTAssertFalse(FileManager.default.fileExists(atPath: paths.framesSelectedManifestURL.path))
         XCTAssertFalse(FileManager.default.fileExists(atPath: paths.colmapDatabaseURL.path))
+    }
+
+    func testCleanForRetryTrainingPreservesCheckpointAndPublishedOutput() throws {
+        let root = try TestFileBuilder.makeTempDir()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let paths = ProjectPaths(root: root)
+        try paths.ensureDirectories()
+        try FileManager.default.createDirectory(
+            at: paths.msplatCheckpointURL,
+            withIntermediateDirectories: true
+        )
+        let checkpointSentinel = paths.msplatCheckpointURL.appendingPathComponent("CURRENT")
+        try Data("checkpoint\n".utf8).write(to: checkpointSentinel)
+        let output = paths.outputURL.appendingPathComponent("splat.ply")
+        try TestFileBuilder.writeMinimalPly(at: output)
+
+        try makeRunner(projectURL: root).test_cleanForRetry(
+            failedStage: .trainBrush,
+            paths: paths
+        )
+
+        XCTAssertTrue(FileManager.default.fileExists(atPath: checkpointSentinel.path))
+        XCTAssertEqual(ProjectArtifactValidator.validatePlyFile(at: output), .valid)
+    }
+
+    func testCleanForRetryUpstreamInvalidatesTrainingButPreservesPublishedOutput() throws {
+        let root = try TestFileBuilder.makeTempDir()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let paths = ProjectPaths(root: root)
+        try paths.ensureDirectories()
+        let trainingSentinel = paths.trainingURL.appendingPathComponent("stale.txt")
+        try Data("stale".utf8).write(to: trainingSentinel)
+        let output = paths.outputURL.appendingPathComponent("splat.ply")
+        try TestFileBuilder.writeMinimalPly(at: output)
+
+        try makeRunner(projectURL: root).test_cleanForRetry(
+            failedStage: .sfmMapping,
+            paths: paths
+        )
+
+        XCTAssertFalse(FileManager.default.fileExists(atPath: trainingSentinel.path))
+        XCTAssertEqual(ProjectArtifactValidator.validatePlyFile(at: output), .valid)
     }
 
     private func makeRunner(projectURL: URL) -> PipelineRunner {

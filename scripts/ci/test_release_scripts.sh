@@ -85,6 +85,7 @@ grep -q 'FETCHCONTENT_SOURCE_DIR_NANOFLANN' "$ROOT/scripts/toolchain/build_mspla
 grep -q 'FETCHCONTENT_SOURCE_DIR_CLI11' "$ROOT/scripts/toolchain/build_msplat.sh"
 grep -q 'promote_install' "$ROOT/scripts/toolchain/build_msplat.sh"
 grep -q 'easysplat-train' "$ROOT/scripts/toolchain/build_msplat.sh"
+grep -q 'msplat-1.1.3-checkpoint.patch' "$ROOT/scripts/toolchain/build_msplat.sh"
 if grep -Eqi 'pip install|python-build-standalone|site-packages|_core\.so|core_extension_path\.txt|(^|[^[:alnum:]])msplat-train' "$ROOT/scripts/toolchain/build_msplat.sh"; then
   echo "Native msplat builder still contains packaged-Python or legacy CLI remnants" >&2
   exit 1
