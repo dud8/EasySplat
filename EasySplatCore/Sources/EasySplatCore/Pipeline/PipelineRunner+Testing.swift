@@ -143,14 +143,6 @@ extension PipelineRunner {
         Self.normalizedToolLogIsError(line, isError: isError)
     }
 
-    func test_colmapGpuOverride() -> Bool? {
-        colmapGpuOverride()
-    }
-
-    func test_colmapSequentialOverlapOverride() -> Int? {
-        colmapSequentialOverlapOverride()
-    }
-
     func test_sfmBackendPolicy() -> SfmBackend {
         sfmBackendPolicy()
     }
@@ -172,10 +164,6 @@ extension PipelineRunner {
         mode: CaptureMode
     ) -> String? {
         da3DirectQualityFailureReason(score: score, mode: mode)
-    }
-
-    func test_sfmMapperPreference() -> String {
-        sfmMapperPreference().rawValue
     }
 
     func test_globalMapperOptions(threadHint: Int, defaultUseGpu: Bool = true) -> ColmapGlobalMapperOptions {

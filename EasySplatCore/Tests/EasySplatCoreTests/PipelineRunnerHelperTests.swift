@@ -73,62 +73,15 @@ final class PipelineRunnerHelperTests: XCTestCase {
         defer { try? FileManager.default.removeItem(at: root) }
         let runner = makeRunner(projectURL: root)
 
-        await withEnvironmentAsync([
-            "EASYSPLAT_SPEED_PROFILE": nil,
-            "EASYSPLAT_FRAME_TARGET_COUNT": nil,
-            "EASYSPLAT_FRAME_MAX_DIMENSION": nil,
-            "EASYSPLAT_FRAME_TARGET_FPS": nil
-        ]) {
-            let draft = runner.test_frameExtractionProfile(for: .draft)
-            XCTAssertEqual(draft.targetCount, 120)
-            XCTAssertNil(draft.maxExtractedFrames)
-            XCTAssertEqual(draft.outputFormat, .jpeg)
+        let draft = runner.test_frameExtractionProfile(for: .draft)
+        XCTAssertEqual(draft.targetCount, 120)
+        XCTAssertNil(draft.maxExtractedFrames)
+        XCTAssertEqual(draft.outputFormat, .jpeg)
 
-            let ultra = runner.test_frameExtractionProfile(for: .ultra)
-            XCTAssertEqual(ultra.outputFormat, .png)
-            XCTAssertEqual(ultra.targetCount, 500)
-            XCTAssertNil(ultra.maxExtractedFrames)
-        }
-    }
-
-    func testFrameExtractionProfileHonorsRuntimeOverrides() async throws {
-        let root = try TestFileBuilder.makeTempDir()
-        defer { try? FileManager.default.removeItem(at: root) }
-        let runner = makeRunner(projectURL: root)
-
-        await withEnvironmentAsync([
-            "EASYSPLAT_SPEED_PROFILE": nil,
-            "EASYSPLAT_FRAME_TARGET_COUNT": "60",
-            "EASYSPLAT_FRAME_MAX_DIMENSION": "960",
-            "EASYSPLAT_FRAME_TARGET_FPS": "3"
-        ]) {
-            let profile = runner.test_frameExtractionProfile(for: .standard)
-            XCTAssertEqual(profile.targetCount, 60)
-            XCTAssertEqual(profile.maxDimension, 960)
-            XCTAssertEqual(profile.targetFPS, 3)
-            XCTAssertNil(profile.maxExtractedFrames)
-            XCTAssertEqual(profile.outputFormat, .jpeg)
-        }
-    }
-
-    func testFrameExtractionProfileFastSpeedProfileUsesMeasuredBudget() async throws {
-        let root = try TestFileBuilder.makeTempDir()
-        defer { try? FileManager.default.removeItem(at: root) }
-        let runner = makeRunner(projectURL: root)
-
-        await withEnvironmentAsync([
-            "EASYSPLAT_SPEED_PROFILE": "fast",
-            "EASYSPLAT_FRAME_TARGET_COUNT": nil,
-            "EASYSPLAT_FRAME_MAX_DIMENSION": nil,
-            "EASYSPLAT_FRAME_TARGET_FPS": nil
-        ]) {
-            let profile = runner.test_frameExtractionProfile(for: .standard)
-            XCTAssertEqual(profile.targetCount, 30)
-            XCTAssertEqual(profile.maxDimension, 960)
-            XCTAssertEqual(profile.targetFPS, 3)
-            XCTAssertEqual(profile.maxExtractedFrames, 40)
-            XCTAssertEqual(profile.outputFormat, .jpeg)
-        }
+        let ultra = runner.test_frameExtractionProfile(for: .ultra)
+        XCTAssertEqual(ultra.outputFormat, .png)
+        XCTAssertEqual(ultra.targetCount, 500)
+        XCTAssertNil(ultra.maxExtractedFrames)
     }
 
     func testFrameExtractionProfileConfiguredFastProfileUsesMeasuredBudget() async throws {
@@ -136,142 +89,12 @@ final class PipelineRunnerHelperTests: XCTestCase {
         defer { try? FileManager.default.removeItem(at: root) }
         let runner = makeRunner(projectURL: root, speedProfile: .fast)
 
-        await withEnvironmentAsync([
-            "EASYSPLAT_SPEED_PROFILE": nil,
-            "EASYSPLAT_FRAME_TARGET_COUNT": nil,
-            "EASYSPLAT_FRAME_MAX_DIMENSION": nil,
-            "EASYSPLAT_FRAME_TARGET_FPS": nil
-        ]) {
-            let profile = runner.test_frameExtractionProfile(for: .standard)
-            XCTAssertEqual(profile.targetCount, 30)
-            XCTAssertEqual(profile.maxDimension, 960)
-            XCTAssertEqual(profile.targetFPS, 3)
-            XCTAssertEqual(profile.maxExtractedFrames, 40)
-            XCTAssertEqual(profile.outputFormat, .jpeg)
-        }
-    }
-
-    func testFrameExtractionProfileFastSpeedProfileCapsExplicitTargetCount() async throws {
-        let root = try TestFileBuilder.makeTempDir()
-        defer { try? FileManager.default.removeItem(at: root) }
-        let runner = makeRunner(projectURL: root)
-
-        await withEnvironmentAsync([
-            "EASYSPLAT_SPEED_PROFILE": "fast",
-            "EASYSPLAT_FRAME_TARGET_COUNT": "90",
-            "EASYSPLAT_FRAME_MAX_DIMENSION": nil,
-            "EASYSPLAT_FRAME_TARGET_FPS": nil
-        ]) {
-            let profile = runner.test_frameExtractionProfile(for: .standard)
-            XCTAssertEqual(profile.targetCount, 90)
-            XCTAssertEqual(profile.maxExtractedFrames, 120)
-        }
-    }
-
-    func testSpeedProfileFastCapsColmapImageSizeAndOverlap() async throws {
-        let root = try TestFileBuilder.makeTempDir()
-        defer { try? FileManager.default.removeItem(at: root) }
-        let runner = makeRunner(projectURL: root)
-
-        await withEnvironmentAsync([
-            "EASYSPLAT_SPEED_PROFILE": "fast",
-            "EASYSPLAT_FRAME_MAX_DIMENSION": nil,
-            "EASYSPLAT_COLMAP_MAX_IMAGE_SIZE": nil
-        ]) {
-            let options = runner.test_applySpeedProfileToColmap(
-                maxImageSize: 1600,
-                extractSequentialOverlap: 12,
-                matchSequentialOverlap: 12
-            )
-            XCTAssertEqual(options.maxImageSize, 512)
-            XCTAssertEqual(options.extractSequentialOverlap, 2)
-            XCTAssertEqual(options.matchSequentialOverlap, 2)
-            XCTAssertEqual(options.maxNumFeatures, 4_000)
-            XCTAssertEqual(options.maxNumMatches, 4_000)
-        }
-    }
-
-    func testInvalidFrameMaxDimensionDoesNotDisableFastSpeedProfileCap() async throws {
-        let root = try TestFileBuilder.makeTempDir()
-        defer { try? FileManager.default.removeItem(at: root) }
-        let runner = makeRunner(projectURL: root)
-
-        await withEnvironmentAsync([
-            "EASYSPLAT_SPEED_PROFILE": "fast",
-            "EASYSPLAT_FRAME_MAX_DIMENSION": "nope",
-            "EASYSPLAT_COLMAP_MAX_IMAGE_SIZE": nil
-        ]) {
-            let options = runner.test_applySpeedProfileToColmap(
-                maxImageSize: 1600,
-                extractSequentialOverlap: 12,
-                matchSequentialOverlap: 12
-            )
-            XCTAssertEqual(options.maxImageSize, 512)
-            XCTAssertEqual(options.extractSequentialOverlap, 2)
-            XCTAssertEqual(options.matchSequentialOverlap, 2)
-            XCTAssertEqual(options.maxNumFeatures, 4_000)
-            XCTAssertEqual(options.maxNumMatches, 4_000)
-        }
-    }
-
-    func testExplicitFrameMaxDimensionDoesNotDisableFastColmapCap() async throws {
-        let root = try TestFileBuilder.makeTempDir()
-        defer { try? FileManager.default.removeItem(at: root) }
-        let runner = makeRunner(projectURL: root)
-
-        await withEnvironmentAsync([
-            "EASYSPLAT_SPEED_PROFILE": "fast",
-            "EASYSPLAT_FRAME_MAX_DIMENSION": "1200",
-            "EASYSPLAT_COLMAP_MAX_IMAGE_SIZE": nil
-        ]) {
-            let options = runner.test_applySpeedProfileToColmap(
-                maxImageSize: 1200,
-                extractSequentialOverlap: 12,
-                matchSequentialOverlap: 12
-            )
-            XCTAssertEqual(options.maxImageSize, 512)
-            XCTAssertEqual(options.extractSequentialOverlap, 2)
-            XCTAssertEqual(options.matchSequentialOverlap, 2)
-        }
-    }
-
-    func testExplicitColmapMaxImageSizeBeatsFastSpeedProfileForColmap() async throws {
-        let root = try TestFileBuilder.makeTempDir()
-        defer { try? FileManager.default.removeItem(at: root) }
-        let runner = makeRunner(projectURL: root)
-
-        await withEnvironmentAsync([
-            "EASYSPLAT_SPEED_PROFILE": "fast",
-            "EASYSPLAT_FRAME_MAX_DIMENSION": "960",
-            "EASYSPLAT_COLMAP_MAX_IMAGE_SIZE": "1200"
-        ]) {
-            let options = runner.test_applySpeedProfileToColmap(
-                maxImageSize: 1200,
-                extractSequentialOverlap: 12,
-                matchSequentialOverlap: 12
-            )
-            XCTAssertEqual(options.maxImageSize, 1200)
-            XCTAssertEqual(options.extractSequentialOverlap, 2)
-            XCTAssertEqual(options.matchSequentialOverlap, 2)
-        }
-    }
-
-    func testFrameExtractionProfileIgnoresInvalidRuntimeOverrides() async throws {
-        let root = try TestFileBuilder.makeTempDir()
-        defer { try? FileManager.default.removeItem(at: root) }
-        let runner = makeRunner(projectURL: root)
-
-        await withEnvironmentAsync([
-            "EASYSPLAT_SPEED_PROFILE": nil,
-            "EASYSPLAT_FRAME_TARGET_COUNT": "0",
-            "EASYSPLAT_FRAME_MAX_DIMENSION": "-1",
-            "EASYSPLAT_FRAME_TARGET_FPS": "nope"
-        ]) {
-            let profile = runner.test_frameExtractionProfile(for: .draft)
-            XCTAssertEqual(profile.targetCount, 120)
-            XCTAssertEqual(profile.maxDimension, 1024)
-            XCTAssertEqual(profile.targetFPS, 2)
-        }
+        let profile = runner.test_frameExtractionProfile(for: .standard)
+        XCTAssertEqual(profile.targetCount, 30)
+        XCTAssertEqual(profile.maxDimension, 960)
+        XCTAssertEqual(profile.targetFPS, 3)
+        XCTAssertEqual(profile.maxExtractedFrames, 40)
+        XCTAssertEqual(profile.outputFormat, .jpeg)
     }
 
     func testShouldUseSequentialConditions() throws {
@@ -393,17 +216,9 @@ final class PipelineRunnerHelperTests: XCTestCase {
         defer { try? FileManager.default.removeItem(at: root) }
         let runner = makeRunner(projectURL: root)
 
-        await withEnvironmentAsync([
-            "EASYSPLAT_SFM_MAPPER": nil,
-            "EASYSPLAT_COLMAP_USE_GPU": nil,
-            "EASYSPLAT_GLOBAL_MAPPER_GP_USE_GPU": nil,
-            "EASYSPLAT_GLOBAL_MAPPER_BA_USE_GPU": nil
-        ]) {
-            XCTAssertEqual(runner.test_sfmMapperPreference(), "globalMapper")
-            let options = runner.test_globalMapperOptions(threadHint: 8)
-            XCTAssertTrue(options.useGpuForGlobalPositioning)
-            XCTAssertTrue(options.useGpuForBundleAdjustment)
-        }
+        let options = runner.test_globalMapperOptions(threadHint: 8)
+        XCTAssertTrue(options.useGpuForGlobalPositioning)
+        XCTAssertTrue(options.useGpuForBundleAdjustment)
     }
 
     func testGlobalMapperDefaultUseGpuFalseDisablesGpuWithoutOverrides() async throws {
@@ -411,29 +226,9 @@ final class PipelineRunnerHelperTests: XCTestCase {
         defer { try? FileManager.default.removeItem(at: root) }
         let runner = makeRunner(projectURL: root)
 
-        await withEnvironmentAsync([
-            "EASYSPLAT_GLOBAL_MAPPER_GP_USE_GPU": nil,
-            "EASYSPLAT_GLOBAL_MAPPER_BA_USE_GPU": nil
-        ]) {
-            let options = runner.test_globalMapperOptions(threadHint: 8, defaultUseGpu: false)
-            XCTAssertFalse(options.useGpuForGlobalPositioning)
-            XCTAssertFalse(options.useGpuForBundleAdjustment)
-        }
-    }
-
-    func testGlobalMapperGpuEnvOverridesTakePrecedence() async throws {
-        let root = try TestFileBuilder.makeTempDir()
-        defer { try? FileManager.default.removeItem(at: root) }
-        let runner = makeRunner(projectURL: root)
-
-        await withEnvironmentAsync([
-            "EASYSPLAT_GLOBAL_MAPPER_GP_USE_GPU": "1",
-            "EASYSPLAT_GLOBAL_MAPPER_BA_USE_GPU": "0"
-        ]) {
-            let options = runner.test_globalMapperOptions(threadHint: 8, defaultUseGpu: false)
-            XCTAssertTrue(options.useGpuForGlobalPositioning)
-            XCTAssertFalse(options.useGpuForBundleAdjustment)
-        }
+        let options = runner.test_globalMapperOptions(threadHint: 8, defaultUseGpu: false)
+        XCTAssertFalse(options.useGpuForGlobalPositioning)
+        XCTAssertFalse(options.useGpuForBundleAdjustment)
     }
 
     func testSfmBackendDefaultFallbackOrder() async throws {
@@ -441,29 +236,9 @@ final class PipelineRunnerHelperTests: XCTestCase {
         defer { try? FileManager.default.removeItem(at: root) }
         let runner = makeRunner(projectURL: root)
 
-        let restore = await scopedEnvironment([
-            "EASYSPLAT_SFM_BACKEND": nil,
-            "EASYSPLAT_SPEED_PROFILE": nil
-        ])
-        defer { restore() }
-
         let order = runner.test_sfmBackendFallbackOrder()
         XCTAssertEqual(order, [.da3, .colmap])
         XCTAssertEqual(runner.test_sfmBackendPolicy(), .da3)
-    }
-
-    func testFastSpeedProfileDefaultsToColmap() async throws {
-        let root = try TestFileBuilder.makeTempDir()
-        defer { try? FileManager.default.removeItem(at: root) }
-        let runner = makeRunner(projectURL: root)
-
-        await withEnvironmentAsync([
-            "EASYSPLAT_SFM_BACKEND": nil,
-            "EASYSPLAT_SPEED_PROFILE": "fast"
-        ]) {
-            XCTAssertEqual(runner.test_sfmBackendPolicy(), .colmap)
-            XCTAssertEqual(runner.test_sfmBackendFallbackOrder(), [.colmap])
-        }
     }
 
     func testConfiguredFastSpeedProfileDefaultsToColmap() async throws {
@@ -471,24 +246,8 @@ final class PipelineRunnerHelperTests: XCTestCase {
         defer { try? FileManager.default.removeItem(at: root) }
         let runner = makeRunner(projectURL: root, speedProfile: .fast)
 
-        await withEnvironmentAsync([
-            "EASYSPLAT_SFM_BACKEND": nil,
-            "EASYSPLAT_SPEED_PROFILE": nil
-        ]) {
-            XCTAssertEqual(runner.test_sfmBackendPolicy(), .colmap)
-            XCTAssertEqual(runner.test_sfmBackendFallbackOrder(), [.colmap])
-        }
-    }
-
-    func testSfmBackendDa3FromEnv() async throws {
-        let root = try TestFileBuilder.makeTempDir()
-        defer { try? FileManager.default.removeItem(at: root) }
-        let runner = makeRunner(projectURL: root)
-
-        await withEnvironmentAsync(["EASYSPLAT_SFM_BACKEND": "da3"]) {
-            XCTAssertEqual(runner.test_sfmBackendPolicy(), .da3)
-            XCTAssertEqual(runner.test_sfmBackendFallbackOrder(), [.da3])
-        }
+        XCTAssertEqual(runner.test_sfmBackendPolicy(), .colmap)
+        XCTAssertEqual(runner.test_sfmBackendFallbackOrder(), [.colmap])
     }
 
     func testDa3DirectMinimumTrackLengthPreference() async throws {
@@ -496,15 +255,8 @@ final class PipelineRunnerHelperTests: XCTestCase {
         defer { try? FileManager.default.removeItem(at: root) }
         let runner = makeRunner(projectURL: root)
 
-        await withEnvironmentAsync(["EASYSPLAT_DA3_DIRECT_MIN_TRACK_LENGTH": nil]) {
-            XCTAssertEqual(runner.test_da3DirectMinimumMeanTrackLengthPreference(mode: .object), 1.15, accuracy: 0.001)
-            XCTAssertEqual(runner.test_da3DirectMinimumMeanTrackLengthPreference(mode: .room), 1.20, accuracy: 0.001)
-        }
-
-        await withEnvironmentAsync(["EASYSPLAT_DA3_DIRECT_MIN_TRACK_LENGTH": "1.33"]) {
-            XCTAssertEqual(runner.test_da3DirectMinimumMeanTrackLengthPreference(mode: .object), 1.33, accuracy: 0.001)
-            XCTAssertEqual(runner.test_da3DirectMinimumMeanTrackLengthPreference(mode: .room), 1.33, accuracy: 0.001)
-        }
+        XCTAssertEqual(runner.test_da3DirectMinimumMeanTrackLengthPreference(mode: .object), 1.15, accuracy: 0.001)
+        XCTAssertEqual(runner.test_da3DirectMinimumMeanTrackLengthPreference(mode: .room), 1.20, accuracy: 0.001)
     }
 
     func testResetPerRunToolLogsRemovesDa3Log() throws {

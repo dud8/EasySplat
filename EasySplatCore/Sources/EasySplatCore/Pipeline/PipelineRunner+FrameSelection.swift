@@ -597,13 +597,9 @@ extension PipelineRunner {
                 maxExtractedFrames: fastSpeedProfileFrameExtractionCap(targetCount: fastSpeedProfileFrameBudget())
             )
             : base
-        let targetCountOverride = intEnvValue("EASYSPLAT_FRAME_TARGET_COUNT")
-            .flatMap { $0 > 0 ? $0 : nil }
-        let targetCount = targetCountOverride ?? profiled.targetCount
-        let maxDimension = intEnvValue("EASYSPLAT_FRAME_MAX_DIMENSION")
-            .flatMap { $0 > 0 ? max(256, $0) : nil } ?? Int(profiled.maxDimension)
-        let targetFPS = intEnvValue("EASYSPLAT_FRAME_TARGET_FPS")
-            .flatMap { $0 > 0 ? $0 : nil } ?? profiled.targetFPS
+        let targetCount = profiled.targetCount
+        let maxDimension = Int(profiled.maxDimension)
+        let targetFPS = profiled.targetFPS
         let maxExtractedFrames: Int?
         if isFastSpeedProfile() {
             maxExtractedFrames = fastSpeedProfileFrameExtractionCap(targetCount: targetCount)
@@ -622,7 +618,15 @@ extension PipelineRunner {
         )
     }
 
-    func cameraModel(for preset: PresetSpec) -> String {
+    func cameraModel(for preset: PresetSpec, lensProjection: LensProjection = .automatic) -> String {
+        switch lensProjection {
+        case .fisheye:
+            return "OPENCV_FISHEYE"
+        case .perspective:
+            return preset.quality == .ultra ? "OPENCV" : "SIMPLE_RADIAL"
+        case .automatic:
+            break
+        }
         if preset.mode == .room && preset.quality == .ultra {
             return "OPENCV"
         }

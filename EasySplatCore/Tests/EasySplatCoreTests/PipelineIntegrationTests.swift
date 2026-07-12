@@ -7,20 +7,76 @@ import UniformTypeIdentifiers
 import SQLite3
 
 final class PipelineIntegrationTests: XCTestCase {
-    private func scopedPipelineEnvironment(_ changes: [String: String?]) async -> @Sendable () -> Void {
-        await scopedEnvironment(changes)
+    private func makePipelineConfig(
+        toolchain: ToolchainPaths,
+        preset: PresetSpec,
+        candidateRoute: SfmBackend? = nil,
+        skipTraining: Bool = false,
+        stopAfterStage: PipelineStage? = nil
+    ) -> PipelineRunner.PipelineConfig {
+        PipelineRunner.PipelineConfig(
+            toolchain: toolchain,
+            preset: preset,
+            developmentOverrides: DevelopmentOverrides(
+                candidateRoute: candidateRoute,
+                stopAfterStage: stopAfterStage,
+                skipTraining: skipTraining
+            )
+        )
+    }
+
+    func testDevelopmentStopAfterFeatureExtractionEndsWithoutStartingMatching() async throws {
+        let temp = makeTempRoot()
+        let projectURL = temp.appendingPathComponent("StopAfterFeatures.easysplatproj", isDirectory: true)
+        let sourcePhotos = temp.appendingPathComponent("SourcePhotos", isDirectory: true)
+        try FileManager.default.createDirectory(at: sourcePhotos, withIntermediateDirectories: true)
+        for index in 0..<8 {
+            try writeTestImage(
+                url: sourcePhotos.appendingPathComponent("img\(index).jpg"),
+                value: UInt8(index)
+            )
+        }
+
+        let metadata = ProjectMetadata(
+            title: "Stop after features",
+            input: .photos(folder: sourcePhotos.path),
+            preset: PresetSpec(mode: .object, quality: .draft)
+        )
+        let paths = ProjectPaths(root: projectURL)
+        try paths.ensureDirectories()
+        try ProjectMetadataStore.save(metadata, to: paths.metadataURL)
+
+        let toolchain = try makeToolchain(root: temp)
+        let subprocess = MockSubprocessRunner(scripts: [
+            .init(
+                path: toolchain.colmap.path,
+                argsPrefix: ["feature_extractor"],
+                result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""),
+                onRun: nil
+            )
+        ])
+        let pipeline = PipelineRunner(
+            projectURL: projectURL,
+            config: makePipelineConfig(
+                toolchain: toolchain,
+                preset: metadata.preset,
+                candidateRoute: .colmap,
+                stopAfterStage: .sfmFeatures
+            ),
+            tooling: .init(runner: subprocess)
+        )
+
+        try await pipeline.run { _ in }
+
+        XCTAssertEqual(subprocess.calls.map { $0.1.first }, ["feature_extractor"])
+        let stoppedMetadata = try ProjectMetadataStore.load(from: paths.metadataURL)
+        XCTAssertEqual(stoppedMetadata.state.stage, .sfmFeatures)
+        XCTAssertNil(stoppedMetadata.state.lastError)
+        XCTAssertNil(stoppedMetadata.lastRunStartedAt)
+        XCTAssertNil(stoppedMetadata.checkpoint)
     }
 
     func testPipelineSuccessWithGlobalMapper() async throws {
-        let restore = await scopedPipelineEnvironment([
-            "EASYSPLAT_SFM_BACKEND": "colmap",
-            "EASYSPLAT_SFM_MAPPER": nil,
-            "EASYSPLAT_GLOBAL_MAPPER_GP_USE_GPU": "1",
-            "EASYSPLAT_GLOBAL_MAPPER_BA_USE_GPU": "1",
-            "EASYSPLAT_SKIP_TRAINING": "1"
-        ])
-        defer { restore() }
-
         let temp = makeTempRoot()
         let projectURL = temp.appendingPathComponent("Test.easysplatproj", isDirectory: true)
         let sourcePhotos = temp.appendingPathComponent("SourcePhotos", isDirectory: true)
@@ -53,7 +109,7 @@ final class PipelineIntegrationTests: XCTestCase {
 
         let pipeline = PipelineRunner(
             projectURL: projectURL,
-            config: .init(toolchain: toolchain, preset: metadata.preset),
+            config: makePipelineConfig(toolchain: toolchain, preset: metadata.preset, candidateRoute: .colmap, skipTraining: true),
             tooling: .init(runner: runner),
             powerAssertion: powerAssertion
         )
@@ -70,7 +126,11 @@ final class PipelineIntegrationTests: XCTestCase {
         let reconstruction = try XCTUnwrap(finalMetadata.reconstruction, "Successful runs must persist a reconstruction summary.")
         XCTAssertEqual(reconstruction.registeredImages, 100)
         XCTAssertEqual(reconstruction.totalImages, 100)
-        XCTAssertEqual(reconstruction.mapper, "global_mapper-gpu")
+        XCTAssertEqual(
+            reconstruction.mapper,
+            "global_mapper",
+            "The synthetic test toolchain does not advertise GPU support."
+        )
         // global_mapper's model_analyzer reprojection error is not a real pixel residual, so the
         // persisted summary drops it (see ReconstructionSummary.reprojectionErrorIsUnreliable).
         if ReconstructionSummary.reprojectionErrorIsUnreliable(forMapper: reconstruction.mapper) {
@@ -82,13 +142,6 @@ final class PipelineIntegrationTests: XCTestCase {
     }
 
     func testPipelineFailureClearsRunStartMarker() async throws {
-        let restore = await scopedPipelineEnvironment([
-            "EASYSPLAT_SFM_BACKEND": "colmap",
-            "EASYSPLAT_SFM_MAPPER": nil,
-            "EASYSPLAT_SKIP_TRAINING": nil
-        ])
-        defer { restore() }
-
         let temp = makeTempRoot()
         let projectURL = temp.appendingPathComponent("TestFail.easysplatproj", isDirectory: true)
         let sourcePhotos = temp.appendingPathComponent("SourcePhotos", isDirectory: true)
@@ -115,7 +168,7 @@ final class PipelineIntegrationTests: XCTestCase {
         ])
         let pipeline = PipelineRunner(
             projectURL: projectURL,
-            config: .init(toolchain: toolchain, preset: metadata.preset),
+            config: makePipelineConfig(toolchain: toolchain, preset: metadata.preset, candidateRoute: .colmap),
             tooling: .init(runner: runner),
             powerAssertion: powerAssertion
         )
@@ -138,13 +191,6 @@ final class PipelineIntegrationTests: XCTestCase {
     }
 
     func testPipelineExplicitDa3FailureDoesNotFallbackToOtherBackends() async throws {
-        let restore = await scopedPipelineEnvironment([
-            "EASYSPLAT_SFM_BACKEND": "da3",
-            "EASYSPLAT_SFM_MAPPER": nil,
-            "EASYSPLAT_SKIP_TRAINING": "1"
-        ])
-        defer { restore() }
-
         let temp = makeTempRoot()
         let projectURL = temp.appendingPathComponent("StrictDa3.easysplatproj", isDirectory: true)
         let sourcePhotos = temp.appendingPathComponent("SourcePhotos", isDirectory: true)
@@ -174,7 +220,7 @@ final class PipelineIntegrationTests: XCTestCase {
 
         let pipeline = PipelineRunner(
             projectURL: projectURL,
-            config: .init(toolchain: toolchain, preset: metadata.preset),
+            config: makePipelineConfig(toolchain: toolchain, preset: metadata.preset, candidateRoute: .da3, skipTraining: true),
             tooling: .init(runner: runner)
         )
 
@@ -189,13 +235,6 @@ final class PipelineIntegrationTests: XCTestCase {
 
     func testPipelineCanTrainWithNativeMsplat() async throws {
         let temp = makeTempRoot()
-
-        let restore = await scopedPipelineEnvironment([
-            "EASYSPLAT_SFM_BACKEND": "colmap",
-            "EASYSPLAT_SFM_MAPPER": nil,
-            "EASYSPLAT_SKIP_TRAINING": nil
-        ])
-        defer { restore() }
 
         let projectURL = temp.appendingPathComponent("Msplat.easysplatproj", isDirectory: true)
         let sourcePhotos = temp.appendingPathComponent("SourcePhotos", isDirectory: true)
@@ -300,9 +339,10 @@ final class PipelineIntegrationTests: XCTestCase {
 
         let pipeline = PipelineRunner(
             projectURL: projectURL,
-            config: .init(
+            config: makePipelineConfig(
                 toolchain: toolchain,
-                preset: metadata.preset
+                preset: metadata.preset,
+                candidateRoute: .colmap
             ),
             tooling: .init(runner: runner)
         )
@@ -329,13 +369,6 @@ final class PipelineIntegrationTests: XCTestCase {
 
     func testPipelineCancellationRestartsFreshWhenNativeRejectsCheckpoint() async throws {
         let temp = makeTempRoot()
-        let restore = await scopedPipelineEnvironment([
-            "EASYSPLAT_SFM_BACKEND": "colmap",
-            "EASYSPLAT_SFM_MAPPER": nil,
-            "EASYSPLAT_SKIP_TRAINING": nil,
-        ])
-        defer { restore() }
-
         let projectURL = temp.appendingPathComponent("ResumeMsplat.easysplatproj", isDirectory: true)
         let sourcePhotos = temp.appendingPathComponent("SourcePhotos", isDirectory: true)
         try FileManager.default.createDirectory(at: sourcePhotos, withIntermediateDirectories: true)
@@ -448,7 +481,7 @@ final class PipelineIntegrationTests: XCTestCase {
         )
         let firstPipeline = PipelineRunner(
             projectURL: projectURL,
-            config: .init(toolchain: toolchain, preset: metadata.preset),
+            config: makePipelineConfig(toolchain: toolchain, preset: metadata.preset, candidateRoute: .colmap),
             tooling: .init(runner: cancellingRunner)
         )
 
@@ -500,7 +533,7 @@ final class PipelineIntegrationTests: XCTestCase {
         ])
         let secondPipeline = PipelineRunner(
             projectURL: projectURL,
-            config: .init(toolchain: toolchain, preset: metadata.preset),
+            config: makePipelineConfig(toolchain: toolchain, preset: metadata.preset, candidateRoute: .colmap),
             tooling: .init(runner: secondRunner)
         )
 
@@ -523,14 +556,6 @@ final class PipelineIntegrationTests: XCTestCase {
 
     func testBalancedRetryPinsNativeTrainerFromCheckpointArtifactAfterFailure() async throws {
         let temp = makeTempRoot()
-        let restore = await scopedPipelineEnvironment([
-            "EASYSPLAT_TRAINER": nil,
-            "EASYSPLAT_MSPLAT_BIN": nil,
-            "EASYSPLAT_SPEED_PROFILE": nil,
-            "EASYSPLAT_SKIP_TRAINING": nil,
-        ])
-        defer { restore() }
-
         let projectURL = temp.appendingPathComponent("BalancedRetry.easysplatproj", isDirectory: true)
         let paths = ProjectPaths(root: projectURL)
         try paths.ensureDirectories()
@@ -676,7 +701,7 @@ final class PipelineIntegrationTests: XCTestCase {
         ])
         let failedPipeline = PipelineRunner(
             projectURL: projectURL,
-            config: .init(toolchain: toolchain, preset: metadata.preset),
+            config: makePipelineConfig(toolchain: toolchain, preset: metadata.preset),
             tooling: .init(runner: failedRunner)
         )
         await XCTAssertThrowsErrorAsync {
@@ -714,7 +739,7 @@ final class PipelineIntegrationTests: XCTestCase {
         ])
         let retryPipeline = PipelineRunner(
             projectURL: projectURL,
-            config: .init(toolchain: toolchain, preset: metadata.preset),
+            config: makePipelineConfig(toolchain: toolchain, preset: metadata.preset),
             tooling: .init(runner: retryRunner)
         )
 
@@ -725,15 +750,6 @@ final class PipelineIntegrationTests: XCTestCase {
     }
 
     func testPipelineDa3CancellationDoesNotFallbackBetweenBackends() async throws {
-        let restore = await scopedPipelineEnvironment([
-            "EASYSPLAT_SFM_BACKEND": nil,
-            "EASYSPLAT_SFM_MAPPER": nil,
-            "EASYSPLAT_DA3_WINDOW_SIZE": "4",
-            "EASYSPLAT_DA3_WINDOW_OVERLAP": "3",
-            "EASYSPLAT_SKIP_TRAINING": "1"
-        ])
-        defer { restore() }
-
         let temp = makeTempRoot()
         let projectURL = temp.appendingPathComponent("Da3Cancel.easysplatproj", isDirectory: true)
         let sourcePhotos = temp.appendingPathComponent("SourcePhotos", isDirectory: true)
@@ -756,7 +772,7 @@ final class PipelineIntegrationTests: XCTestCase {
 
         let pipeline = PipelineRunner(
             projectURL: projectURL,
-            config: .init(toolchain: toolchain, preset: metadata.preset),
+            config: makePipelineConfig(toolchain: toolchain, preset: metadata.preset, candidateRoute: .da3, skipTraining: true),
             tooling: .init(runner: runner)
         )
 
@@ -776,13 +792,6 @@ final class PipelineIntegrationTests: XCTestCase {
     }
 
     func testPipelineDefaultsToDa3WhenBackendUnset() async throws {
-        let restore = await scopedPipelineEnvironment([
-            "EASYSPLAT_SFM_BACKEND": nil,
-            "EASYSPLAT_SFM_MAPPER": nil,
-            "EASYSPLAT_SKIP_TRAINING": "1"
-        ])
-        defer { restore() }
-
         let temp = makeTempRoot()
         let projectURL = temp.appendingPathComponent("Test.easysplatproj", isDirectory: true)
         let sourcePhotos = temp.appendingPathComponent("SourcePhotos", isDirectory: true)
@@ -813,7 +822,7 @@ final class PipelineIntegrationTests: XCTestCase {
 
         let pipeline = PipelineRunner(
             projectURL: projectURL,
-            config: .init(toolchain: toolchain, preset: metadata.preset),
+            config: makePipelineConfig(toolchain: toolchain, preset: metadata.preset, skipTraining: true),
             tooling: .init(runner: runner)
         )
 
@@ -828,15 +837,6 @@ final class PipelineIntegrationTests: XCTestCase {
     }
 
     func testPipelineOversizedDa3SeedRunsBoundedRefinementBeforeAcceptance() async throws {
-        let restore = await scopedPipelineEnvironment([
-            "EASYSPLAT_SFM_BACKEND": nil,
-            "EASYSPLAT_SFM_MAPPER": nil,
-            "EASYSPLAT_DA3_WINDOW_SIZE": "4",
-            "EASYSPLAT_DA3_WINDOW_OVERLAP": "3",
-            "EASYSPLAT_SKIP_TRAINING": "1"
-        ])
-        defer { restore() }
-
         let temp = makeTempRoot()
         let projectURL = temp.appendingPathComponent("Da3AlignedSeed.easysplatproj", isDirectory: true)
         let sourcePhotos = temp.appendingPathComponent("SourcePhotos", isDirectory: true)
@@ -885,7 +885,7 @@ final class PipelineIntegrationTests: XCTestCase {
 
         let pipeline = PipelineRunner(
             projectURL: projectURL,
-            config: .init(toolchain: toolchain, preset: metadata.preset),
+            config: makePipelineConfig(toolchain: toolchain, preset: metadata.preset, candidateRoute: .da3, skipTraining: true),
             tooling: .init(runner: runner)
         )
         try await pipeline.run { _ in }
@@ -904,13 +904,6 @@ final class PipelineIntegrationTests: XCTestCase {
     }
 
     func testPipelineFailsOnLowQuality() async throws {
-        let restore = await scopedPipelineEnvironment([
-            "EASYSPLAT_SFM_BACKEND": "colmap",
-            "EASYSPLAT_SFM_MAPPER": nil,
-            "EASYSPLAT_SKIP_TRAINING": nil
-        ])
-        defer { restore() }
-
         let temp = makeTempRoot()
         let projectURL = temp.appendingPathComponent("Test.easysplatproj", isDirectory: true)
         let sourcePhotos = temp.appendingPathComponent("SourcePhotos", isDirectory: true)
@@ -944,7 +937,7 @@ final class PipelineIntegrationTests: XCTestCase {
 
         let pipeline = PipelineRunner(
             projectURL: projectURL,
-            config: .init(toolchain: toolchain, preset: metadata.preset),
+            config: makePipelineConfig(toolchain: toolchain, preset: metadata.preset, candidateRoute: .colmap),
             tooling: .init(runner: runner)
         )
 
@@ -957,13 +950,6 @@ final class PipelineIntegrationTests: XCTestCase {
     }
 
     func testPipelineFailsOnMissingImages() async throws {
-        let restore = await scopedPipelineEnvironment([
-            "EASYSPLAT_SFM_BACKEND": "colmap",
-            "EASYSPLAT_SFM_MAPPER": nil,
-            "EASYSPLAT_SKIP_TRAINING": nil
-        ])
-        defer { restore() }
-
         let temp = makeTempRoot()
         let projectURL = temp.appendingPathComponent("Test.easysplatproj", isDirectory: true)
         let sourcePhotos = temp.appendingPathComponent("SourcePhotos", isDirectory: true)
@@ -984,7 +970,7 @@ final class PipelineIntegrationTests: XCTestCase {
 
         let pipeline = PipelineRunner(
             projectURL: projectURL,
-            config: .init(toolchain: toolchain, preset: metadata.preset),
+            config: makePipelineConfig(toolchain: toolchain, preset: metadata.preset, candidateRoute: .colmap),
             tooling: .init(runner: runner)
         )
 
@@ -994,13 +980,6 @@ final class PipelineIntegrationTests: XCTestCase {
     }
 
     func testPipelineFailsWhenOnlyOneUsableImageRemains() async throws {
-        let restore = await scopedPipelineEnvironment([
-            "EASYSPLAT_SFM_BACKEND": nil,
-            "EASYSPLAT_SFM_MAPPER": nil,
-            "EASYSPLAT_SKIP_TRAINING": "1"
-        ])
-        defer { restore() }
-
         let temp = makeTempRoot()
         let projectURL = temp.appendingPathComponent("OneImage.easysplatproj", isDirectory: true)
         let sourcePhotos = temp.appendingPathComponent("SourcePhotos", isDirectory: true)
@@ -1020,7 +999,7 @@ final class PipelineIntegrationTests: XCTestCase {
         let runner = MockSubprocessRunner(scripts: [])
         let pipeline = PipelineRunner(
             projectURL: projectURL,
-            config: .init(toolchain: toolchain, preset: metadata.preset),
+            config: makePipelineConfig(toolchain: toolchain, preset: metadata.preset, skipTraining: true),
             tooling: .init(runner: runner)
         )
 
@@ -1034,13 +1013,6 @@ final class PipelineIntegrationTests: XCTestCase {
     }
 
     func testPipelineFailsOnMatcherError() async throws {
-        let restore = await scopedPipelineEnvironment([
-            "EASYSPLAT_SFM_BACKEND": "colmap",
-            "EASYSPLAT_SFM_MAPPER": nil,
-            "EASYSPLAT_SKIP_TRAINING": nil
-        ])
-        defer { restore() }
-
         let temp = makeTempRoot()
         let projectURL = temp.appendingPathComponent("Test.easysplatproj", isDirectory: true)
         let sourcePhotos = temp.appendingPathComponent("SourcePhotos", isDirectory: true)
@@ -1066,7 +1038,7 @@ final class PipelineIntegrationTests: XCTestCase {
 
         let pipeline = PipelineRunner(
             projectURL: projectURL,
-            config: .init(toolchain: toolchain, preset: metadata.preset),
+            config: makePipelineConfig(toolchain: toolchain, preset: metadata.preset, candidateRoute: .colmap),
             tooling: .init(runner: runner)
         )
 

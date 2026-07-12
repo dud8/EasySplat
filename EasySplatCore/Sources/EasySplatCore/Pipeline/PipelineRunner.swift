@@ -2,6 +2,8 @@ import Foundation
 import Dispatch
 public final class PipelineRunner: @unchecked Sendable {
 
+    private struct DevelopmentStop: Error {}
+
     public struct Tooling {
         public var colmap: ColmapRunner
         public var msplat: MsplatRunner
@@ -31,15 +33,18 @@ public final class PipelineRunner: @unchecked Sendable {
         public var toolchain: ToolchainPaths
         public var preset: PresetSpec
         public var speedProfile: SpeedProfile
+        public var developmentOverrides: DevelopmentOverrides
 
         public init(
             toolchain: ToolchainPaths,
             preset: PresetSpec,
-            speedProfile: SpeedProfile = .standard
+            speedProfile: SpeedProfile = .standard,
+            developmentOverrides: DevelopmentOverrides = .none
         ) {
             self.toolchain = toolchain
             self.preset = preset
             self.speedProfile = speedProfile
+            self.developmentOverrides = developmentOverrides
         }
     }
 
@@ -47,13 +52,6 @@ public final class PipelineRunner: @unchecked Sendable {
     let config: PipelineConfig
     let tooling: Tooling
     let powerAssertion: PowerAssertionManaging
-    let initialEnvironment: [String: String]
-    private let capturedEnvironment: [String: String]?
-
-    enum SfmMapperPreference: String {
-        case globalMapper
-        case colmap
-    }
 
     public init(
         projectURL: URL,
@@ -65,53 +63,21 @@ public final class PipelineRunner: @unchecked Sendable {
         self.config = config
         self.tooling = tooling
         self.powerAssertion = powerAssertion
-        self.initialEnvironment = RuntimeEnvironment.current
-        self.capturedEnvironment = nil
-    }
-
-    var runtimeEnvironment: [String: String] {
-        capturedEnvironment ?? RuntimeEnvironment.current
     }
 
     public func run(resumeFrom lastCompletedStage: PipelineStage? = nil, events: @escaping @Sendable (PipelineEvent) -> Void) async throws {
-        let environment = initialEnvironment
-        let scopedRunner = PipelineRunner(
-            projectURL: projectURL,
-            config: config,
-            tooling: tooling,
-            powerAssertion: powerAssertion,
-            capturedEnvironment: environment
-        )
-        try await scopedRunner.runWithCapturedEnvironment(
+        try await runPipeline(
             resumeFrom: lastCompletedStage,
-            environment: environment,
             events: events
         )
     }
 
-    private init(
-        projectURL: URL,
-        config: PipelineConfig,
-        tooling: Tooling,
-        powerAssertion: PowerAssertionManaging,
-        capturedEnvironment: [String: String]
-    ) {
-        self.projectURL = projectURL
-        self.config = config
-        self.tooling = tooling
-        self.powerAssertion = powerAssertion
-        self.initialEnvironment = capturedEnvironment
-        self.capturedEnvironment = capturedEnvironment
-    }
-
-    private func runWithCapturedEnvironment(
+    private func runPipeline(
         resumeFrom lastCompletedStage: PipelineStage?,
-        environment: [String: String],
         events: @escaping @Sendable (PipelineEvent) -> Void
     ) async throws {
-        // Keep the Mac awake for the entire run. Runs are multi-hour and training has no
-        // resumable checkpoint, so a system idle-sleep partway through loses the session.
-        // Released on every exit — success, throw, or cancellation.
+        // Keep the Mac awake while work is active. Display sleep remains available, and
+        // the assertion is released on every exit — success, failure, stop, or cancellation.
         let idleSleepAssertion = powerAssertion.beginPreventingIdleSleep(reason: "EasySplat is processing a project")
         defer { idleSleepAssertion.release() }
 
@@ -149,21 +115,7 @@ public final class PipelineRunner: @unchecked Sendable {
         let wasInterrupted = metadata.state.lastError == nil
             && metadata.state.stage != .done
             && hasInterruptionEvidence
-        let skipTraining: Bool = {
-            let env = runtimeEnvironment
-            let stopAfterSfmRaw = env["EASYSPLAT_STOP_AFTER_SFM"]?
-                .trimmingCharacters(in: .whitespacesAndNewlines)
-                .lowercased()
-            if stopAfterSfmRaw == "1" || stopAfterSfmRaw == "true" || stopAfterSfmRaw == "yes" {
-                return true
-            }
-            guard let raw = env["EASYSPLAT_SKIP_TRAINING"]?
-                .trimmingCharacters(in: .whitespacesAndNewlines),
-                !raw.isEmpty else {
-                return false
-            }
-            return raw == "1" || raw.lowercased() == "true" || raw.lowercased() == "yes"
-        }()
+        let skipTraining = config.developmentOverrides.skipTraining
 
         metadata.recoveryPromptSuppressed = false
         metadata.lastRunStartedAt = Date()
@@ -309,6 +261,14 @@ public final class PipelineRunner: @unchecked Sendable {
             try? ProjectMetadataStore.savePreservingUserEditableFields(metadata, to: paths.metadataURL)
         }
 
+        func stopIfRequested(after stage: PipelineStage) throws {
+            guard config.developmentOverrides.stopAfterStage == stage else { return }
+            emit(.stageLog(stage: stage, line: "Stopped after \(stage.displayName) by development override.", isError: false))
+            metadata.lastRunStartedAt = nil
+            try? ProjectMetadataStore.savePreservingUserEditableFields(metadata, to: paths.metadataURL)
+            throw DevelopmentStop()
+        }
+
         func emitFailure(stage: PipelineStage, userMessage: String, debugMessage: String) {
             didEmitFailure = true
             metadata.state = PipelineState(stage: stage, attempt: metadata.state.attempt, lastError: userMessage, resumeToken: nil)
@@ -341,16 +301,16 @@ public final class PipelineRunner: @unchecked Sendable {
                 })
                 emit(.stageFinished(stage: .importInput))
                 markStageComplete(.importInput)
+                try stopIfRequested(after: .importInput)
             }
 
             let frameProfile = frameExtractionProfile(for: metadata.preset.quality)
             let targetFrames = frameProfile.targetCount
             let maxDim = frameProfile.maxDimension
-            var colmapMaxImageSize = colmapMaxImageSizeOverride() ?? Int(maxDim)
+            var colmapMaxImageSize = Int(maxDim)
             var colmapExtractOptions = colmapOptionsForExtraction()
             var colmapMatchOptions = colmapOptionsForMatching()
             let preferColmapGpu = shouldUseColmapGpu(colmapPath: config.toolchain.colmap)
-            let mapperPreference = sfmMapperPreference()
             colmapExtractOptions.useGPU = preferColmapGpu
             colmapMatchOptions.useGPU = preferColmapGpu
             var selectedFrames: [URL] = []
@@ -424,6 +384,7 @@ public final class PipelineRunner: @unchecked Sendable {
                     }
                     emit(.stageFinished(stage: .extractFrames))
                     markStageComplete(.extractFrames)
+                    try stopIfRequested(after: .extractFrames)
                 }
             }
 
@@ -525,6 +486,7 @@ public final class PipelineRunner: @unchecked Sendable {
                     )
                     emit(.stageFinished(stage: .selectFrames))
                     markStageComplete(.selectFrames)
+                    try stopIfRequested(after: .selectFrames)
                 }
             }
 
@@ -563,9 +525,6 @@ public final class PipelineRunner: @unchecked Sendable {
                     colmapExtractOptions: &colmapExtractOptions,
                     colmapMatchOptions: &colmapMatchOptions
                 )
-                if let explicitColmapMaxImageSize = colmapMaxImageSizeOverride() {
-                    colmapMaxImageSize = explicitColmapMaxImageSize
-                }
                 emit(.stageLog(stage: .sfmFeatures, line: tune.summary(profile: detectedHardwareProfile), isError: false))
             }
             if applySpeedProfileIfNeeded(
@@ -573,21 +532,15 @@ public final class PipelineRunner: @unchecked Sendable {
                 colmapExtractOptions: &colmapExtractOptions,
                 colmapMatchOptions: &colmapMatchOptions
             ) {
-                let colmapSizeText = colmapMaxImageSizeOverride().map { "\($0)px (explicit)" } ?? "<=512px"
                 emit(.stageLog(
                     stage: .sfmFeatures,
-                    line: "Speed profile fast: frame budget=\(fastSpeedProfileFrameBudget()), extraction cap=\(fastSpeedProfileFrameExtractionCap(targetCount: fastSpeedProfileFrameBudget())), COLMAP max image size \(colmapSizeText), features<=4000, sequential overlap<=2.",
+                    line: "Fast plan: frame budget=\(fastSpeedProfileFrameBudget()), extraction cap=\(fastSpeedProfileFrameExtractionCap(targetCount: fastSpeedProfileFrameBudget())), COLMAP max image size <=512px, features<=4000, sequential overlap<=2.",
                     isError: false
                 ))
             }
-            if let sequentialOverlap = colmapSequentialOverlapOverride() {
-                colmapExtractOptions.sequentialOverlap = sequentialOverlap
-                colmapMatchOptions.sequentialOverlap = sequentialOverlap
-                emit(.stageLog(stage: .sfmFeatures, line: "COLMAP sequential overlap override: \(sequentialOverlap).", isError: false))
-            }
 
             try Task.checkCancellation()
-            let backendOverride = sfmBackendOverride(environment: environment)
+            let backendOverride = sfmBackendOverride()
             let da3WindowSize = da3WindowSizePreference(hardwareTier: detectedHardwareProfile.tier)
             let backendOrder = sfmBackendFallbackOrder(override: backendOverride)
 
@@ -632,8 +585,14 @@ public final class PipelineRunner: @unchecked Sendable {
                             fallbackModelSubdirectory: da3FallbackModelPreference(),
                             processResolution: da3ProcessResolutionPreference(),
                             maxPoints: da3MaxPointsPreference(preset: metadata.preset),
-                            cameraType: da3CameraTypePreference(preset: metadata.preset),
-                            sharedCamera: da3SharedCameraPreference(input: metadata.input),
+                            cameraType: da3CameraTypePreference(
+                                preset: metadata.preset,
+                                lensProjection: metadata.requestedRunOptions?.lensProjection ?? .automatic
+                            ),
+                            sharedCamera: da3SharedCameraPreference(
+                                input: metadata.input,
+                                cameraGrouping: metadata.requestedRunOptions?.cameraGrouping ?? .automatic
+                            ),
                             inputOrdering: da3InputOrdering,
                             windowSize: max(4, da3WindowSize),
                             windowOverlap: da3Mode == .seedRefine
@@ -843,6 +802,7 @@ public final class PipelineRunner: @unchecked Sendable {
                             )
                             emit(.stageFinished(stage: .sfmFeatures))
                             markStageComplete(.sfmFeatures)
+                            try stopIfRequested(after: .sfmFeatures)
                         } else if sparseModelFilesExist(at: preparedDa3Model) && !fm.fileExists(atPath: paths.colmapDatabaseURL.path) {
                             fm.createFile(atPath: paths.colmapDatabaseURL.path, contents: Data())
                         }
@@ -945,6 +905,7 @@ public final class PipelineRunner: @unchecked Sendable {
                             }
                             emit(.stageFinished(stage: .sfmMatching))
                             markStageComplete(.sfmMatching)
+                            try stopIfRequested(after: .sfmMatching)
                         }
 
                         if try shouldRunStage(.sfmMapping) {
@@ -1085,16 +1046,18 @@ public final class PipelineRunner: @unchecked Sendable {
                             }
                             emit(.stageFinished(stage: .sfmMapping))
                             markStageComplete(.sfmMapping)
+                            try stopIfRequested(after: .sfmMapping)
                         }
                     } else {
             let runFeatures: (Bool) async throws -> Void = { force in
                 guard try (force || shouldRunStage(.sfmFeatures)) else { return }
                 currentStage = .sfmFeatures
                 emit(.stageStarted(stage: .sfmFeatures))
-                let featureMapperLabel = mapperPreference == .globalMapper
-                    ? "SfM backend: COLMAP global mapper, with COLMAP mapper fallback."
-                    : "SfM backend: COLMAP mapper only."
-                emit(.stageLog(stage: .sfmFeatures, line: featureMapperLabel, isError: false))
+                emit(.stageLog(
+                    stage: .sfmFeatures,
+                    line: "SfM backend: COLMAP global mapper, with COLMAP mapper fallback.",
+                    isError: false
+                ))
                 writeCheckpoint(
                     stage: .sfmFeatures,
                     progress: 0,
@@ -1140,7 +1103,10 @@ public final class PipelineRunner: @unchecked Sendable {
                     database: paths.colmapDatabaseURL,
                     imagePath: paths.framesSelectedURL,
                     maxImageSize: colmapMaxImageSize,
-                    cameraModel: self.cameraModel(for: metadata.preset),
+                    cameraModel: self.cameraModel(
+                        for: metadata.preset,
+                        lensProjection: metadata.requestedRunOptions?.lensProjection ?? .automatic
+                    ),
                     options: colmapExtractOptions,
                     onLog: onFeaturesLog
                 )
@@ -1156,6 +1122,7 @@ public final class PipelineRunner: @unchecked Sendable {
                 )
                 emit(.stageFinished(stage: .sfmFeatures))
                 markStageComplete(.sfmFeatures)
+                try stopIfRequested(after: .sfmFeatures)
             }
 
             let runMatching: (Bool) async throws -> Void = { force in
@@ -1302,7 +1269,10 @@ public final class PipelineRunner: @unchecked Sendable {
                                     database: paths.colmapDatabaseURL,
                                     imagePath: paths.framesSelectedURL,
                                     maxImageSize: colmapMaxImageSize,
-                                    cameraModel: self.cameraModel(for: metadata.preset),
+                                    cameraModel: self.cameraModel(
+                                        for: metadata.preset,
+                                        lensProjection: metadata.requestedRunOptions?.lensProjection ?? .automatic
+                                    ),
                                     options: colmapExtractOptions,
                                     onLog: { line, isErr in
                                         colmapToolLog.append(stream: isErr ? "stderr" : "stdout", line: line)
@@ -1343,6 +1313,7 @@ public final class PipelineRunner: @unchecked Sendable {
                 )
                 emit(.stageFinished(stage: .sfmMatching))
                 markStageComplete(.sfmMatching)
+                try stopIfRequested(after: .sfmMatching)
             }
 
             let retryWithCpuIfNeeded: (Error) -> Bool = { error in
@@ -1439,7 +1410,7 @@ public final class PipelineRunner: @unchecked Sendable {
                         progress: 0,
                         message: "Camera mapping started",
                         details: .sfmMapping(SfmMappingCheckpoint(
-                            mapper: mapperPreference.rawValue,
+                            mapper: "global_mapper",
                             sparsePath: paths.colmapSparseURL.appendingPathComponent("0", isDirectory: true).path,
                             registeredImages: nil
                         ))
@@ -1480,7 +1451,7 @@ public final class PipelineRunner: @unchecked Sendable {
                     }
                     var mappingSucceeded = false
                     var lastMappingError: Error?
-                    var acceptedMappingStrategy = mapperPreference == .globalMapper ? "global_mapper" : "colmap"
+                    var acceptedMappingStrategy = "global_mapper"
                     var lastMappingAttempt = "none"
 
                     func evaluateMappingResult(candidate: String) async throws -> Bool {
@@ -1532,23 +1503,16 @@ public final class PipelineRunner: @unchecked Sendable {
                         }
                     }
 
-                    let mapperLabel: String = {
-                        switch mapperPreference {
-                        case .colmap:
-                            return "COLMAP mapper only"
-                        case .globalMapper:
-                            return disableGlobalMapperForThisRun
-                                ? "COLMAP global_mapper disabled for this run; COLMAP mapper fallback only"
-                                : "COLMAP global_mapper preferred with COLMAP mapper fallback"
-                        }
-                    }()
+                    let mapperLabel = disableGlobalMapperForThisRun
+                        ? "COLMAP global_mapper disabled for this run; COLMAP mapper fallback only"
+                        : "COLMAP global_mapper preferred with COLMAP mapper fallback"
                     emit(.stageLog(
                         stage: .sfmMapping,
                         line: "Mapping preference: \(mapperLabel).",
                         isError: false
                     ))
 
-                    if mapperPreference == .globalMapper && !disableGlobalMapperForThisRun {
+                    if !disableGlobalMapperForThisRun {
                         let threadHint = max(colmapExtractOptions.extractThreads, colmapMatchOptions.matchThreads)
                         let baseGlobalMapperOptions = self.globalMapperOptions(
                             threadHint: threadHint,
@@ -1623,7 +1587,7 @@ public final class PipelineRunner: @unchecked Sendable {
                                 }
                             }
                         }
-                    } else if mapperPreference == .globalMapper && disableGlobalMapperForThisRun {
+                    } else {
                         emit(.stageLog(
                             stage: .sfmMapping,
                             line: "Skipping global_mapper for this run due to previous launch failure.",
@@ -1632,9 +1596,7 @@ public final class PipelineRunner: @unchecked Sendable {
                     }
 
                     if !mappingSucceeded {
-                        if mapperPreference == .globalMapper {
-                            emit(.stageLog(stage: .sfmMapping, line: "global_mapper mapping failed; trying COLMAP mapper.", isError: true))
-                        }
+                        emit(.stageLog(stage: .sfmMapping, line: "global_mapper mapping failed; trying COLMAP mapper.", isError: true))
                         do {
                             try self.resetDirectory(paths.colmapSparseURL)
                             lastMappingAttempt = "colmap"
@@ -1754,12 +1716,16 @@ public final class PipelineRunner: @unchecked Sendable {
                         )
                         emit(.stageFinished(stage: .sfmMapping))
                         markStageComplete(.sfmMapping)
+                        try stopIfRequested(after: .sfmMapping)
                 }
 
                 break
             }
             }
             } catch {
+                if error is DevelopmentStop {
+                    throw error
+                }
                 if error is CancellationError {
                     throw error
                 }
@@ -1791,7 +1757,7 @@ public final class PipelineRunner: @unchecked Sendable {
             if skipTraining {
                 emit(.stageLog(
                     stage: .sfmMapping,
-                    line: "Stopping early after SfM (EASYSPLAT_SKIP_TRAINING=1 or EASYSPLAT_STOP_AFTER_SFM=1).",
+                    line: "Stopping after geometry by development override.",
                     isError: false
                 ))
                 metadata.lastRunStartedAt = nil
@@ -1828,7 +1794,7 @@ public final class PipelineRunner: @unchecked Sendable {
                             "tool": msplatPath.path
                         ]
                     )
-                    let seed: UInt64 = 42
+                    let seed = UInt64(max(0, config.developmentOverrides.benchmarkSeed ?? 42))
                     let resumeURL: URL?
                     do {
                         resumeURL = try msplatResumeURL(
@@ -1962,6 +1928,7 @@ public final class PipelineRunner: @unchecked Sendable {
                     )
                     emit(.stageFinished(stage: .trainSplat))
                     markStageComplete(.trainSplat)
+                    try stopIfRequested(after: .trainSplat)
             }
 
             try Task.checkCancellation()
@@ -1993,6 +1960,7 @@ public final class PipelineRunner: @unchecked Sendable {
                 )
                 emit(.stageFinished(stage: .exportSplat))
                 markStageComplete(.exportSplat)
+                try stopIfRequested(after: .exportSplat)
             }
 
             metadata.outputs = OutputSpec(splatPlyPath: "Output/splat.ply", colmapModelPath: "SfM/colmap/sparse/0")
@@ -2001,6 +1969,8 @@ public final class PipelineRunner: @unchecked Sendable {
             try ProjectMetadataStore.savePreservingUserEditableFields(metadata, to: paths.metadataURL)
 
             emit(.stageFinished(stage: .done))
+        } catch is DevelopmentStop {
+            return
         } catch is CancellationError {
             throw CancellationError()
         } catch {

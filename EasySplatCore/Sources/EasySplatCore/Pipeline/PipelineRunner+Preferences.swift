@@ -1,24 +1,8 @@
 import Foundation
 
 extension PipelineRunner {
-    func sfmMapperPreference() -> SfmMapperPreference {
-        let env = runtimeEnvironment
-        if let value = env["EASYSPLAT_SFM_MAPPER"]?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() {
-            if value == "colmap" { return .colmap }
-        }
-        return .globalMapper
-    }
-
     func sfmBackendOverride() -> SfmBackend? {
-        sfmBackendOverride(environment: runtimeEnvironment)
-    }
-
-    func sfmBackendOverride(environment env: [String: String]) -> SfmBackend? {
-        if let value = env["EASYSPLAT_SFM_BACKEND"]?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() {
-            if value == "da3" || value == "depth-anything-3" || value == "depthanything3" { return .da3 }
-            if value == "colmap" { return .colmap }
-        }
-        return nil
+        config.developmentOverrides.candidateRoute
     }
 
     func sfmBackendPolicy() -> SfmBackend {
@@ -39,25 +23,22 @@ extension PipelineRunner {
     }
 
     func da3DevicePreference() -> String {
-        stringEnvValue("EASYSPLAT_DA3_DEVICE") ?? "mps"
+        "mps"
     }
 
     func da3ModelPreference() -> String {
-        stringEnvValue("EASYSPLAT_DA3_MODEL") ?? "DA3-BASE"
+        "DA3-BASE"
     }
 
     func da3FallbackModelPreference() -> String {
-        stringEnvValue("EASYSPLAT_DA3_FALLBACK_MODEL") ?? "DA3-SMALL"
+        "DA3-SMALL"
     }
 
     func da3ProcessResolutionPreference() -> Int {
-        max(64, intEnvValue("EASYSPLAT_DA3_PROCESS_RES") ?? 504)
+        504
     }
 
     func da3MaxPointsPreference(preset: PresetSpec) -> Int {
-        if let override = intEnvValue("EASYSPLAT_DA3_MAX_POINTS"), override > 0 {
-            return override
-        }
         switch preset.quality {
         case .draft:
             return 60_000
@@ -68,12 +49,19 @@ extension PipelineRunner {
         }
     }
 
-    func da3CameraTypePreference(preset: PresetSpec) -> String {
-        stringEnvValue("EASYSPLAT_DA3_CAMERA_TYPE") ?? cameraModel(for: preset)
+    func da3CameraTypePreference(preset: PresetSpec, lensProjection: LensProjection = .automatic) -> String {
+        cameraModel(for: preset, lensProjection: lensProjection)
     }
 
-    func da3SharedCameraPreference(input: InputSpec) -> Bool {
-        boolEnvValue("EASYSPLAT_DA3_SHARED_CAMERA", default: input.hasVideos)
+    func da3SharedCameraPreference(input: InputSpec, cameraGrouping: CameraGrouping = .automatic) -> Bool {
+        switch cameraGrouping {
+        case .automatic:
+            return input.hasVideos && !input.hasPhotos
+        case .sameCameraAndLens:
+            return true
+        case .mixedCamerasOrLenses:
+            return false
+        }
     }
 
     func da3ResolvedInputOrdering(requested: InputOrdering, input: InputSpec) -> InputOrdering {
@@ -89,9 +77,6 @@ extension PipelineRunner {
     }
 
     func da3WindowSizePreference(hardwareTier: HardwareProfile.Tier) -> Int {
-        if let override = intEnvValue("EASYSPLAT_DA3_WINDOW_SIZE"), override > 0 {
-            return override
-        }
         switch hardwareTier {
         case .low:
             return 4
@@ -103,9 +88,6 @@ extension PipelineRunner {
     }
 
     func da3WindowOverlapPreference(hardwareTier: HardwareProfile.Tier) -> Int {
-        if let override = intEnvValue("EASYSPLAT_DA3_WINDOW_OVERLAP"), override >= 0 {
-            return override
-        }
         switch hardwareTier {
         case .low:
             return 1
@@ -115,11 +97,6 @@ extension PipelineRunner {
     }
 
     func da3DirectMinimumMeanTrackLengthPreference(mode: CaptureMode) -> Double {
-        if let override = doubleEnvValue("EASYSPLAT_DA3_DIRECT_MIN_TRACK_LENGTH"),
-           override.isFinite,
-           override > 0 {
-            return override
-        }
         switch mode {
         case .room:
             return 1.20
@@ -185,65 +162,15 @@ extension PipelineRunner {
     }
 
     func shouldUseColmapGpu(colmapPath: URL) -> Bool {
-        if let override = colmapGpuOverride() {
-            return override
-        }
-        return detectColmapGpuSupport(colmapPath: colmapPath)
+        detectColmapGpuSupport(colmapPath: colmapPath)
     }
 
     func shouldAutoTune() -> Bool {
-        if let value = runtimeEnvironment["EASYSPLAT_AUTOTUNE"]?
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-            .lowercased() {
-            if ["0", "false", "no"].contains(value) { return false }
-        }
-        return true
-    }
-
-    func hasEnvValue(_ key: String) -> Bool {
-        if let value = runtimeEnvironment[key]?.trimmingCharacters(in: .whitespacesAndNewlines) {
-            return !value.isEmpty
-        }
-        return false
-    }
-
-    func boolEnvValue(_ key: String, default defaultValue: Bool) -> Bool {
-        if let value = runtimeEnvironment[key]?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() {
-            if ["1", "true", "yes"].contains(value) { return true }
-            if ["0", "false", "no"].contains(value) { return false }
-        }
-        return defaultValue
-    }
-
-    func intEnvValue(_ key: String) -> Int? {
-        guard let raw = runtimeEnvironment[key]?.trimmingCharacters(in: .whitespacesAndNewlines),
-              let value = Int(raw) else {
-            return nil
-        }
-        return value
-    }
-
-    func doubleEnvValue(_ key: String) -> Double? {
-        guard let raw = runtimeEnvironment[key]?.trimmingCharacters(in: .whitespacesAndNewlines),
-              let value = Double(raw),
-              value.isFinite else {
-            return nil
-        }
-        return value
-    }
-
-    func stringEnvValue(_ key: String) -> String? {
-        guard let raw = runtimeEnvironment[key]?.trimmingCharacters(in: .whitespacesAndNewlines),
-              !raw.isEmpty else {
-            return nil
-        }
-        return raw
+        true
     }
 
     func isFastSpeedProfile() -> Bool {
-        if config.speedProfile == .fast { return true }
-        guard let raw = stringEnvValue("EASYSPLAT_SPEED_PROFILE")?.lowercased() else { return false }
-        return ["fast", "apple-silicon-fast"].contains(raw)
+        config.speedProfile == .fast
     }
 
     func fastSpeedProfileFrameBudget() -> Int {
@@ -254,28 +181,16 @@ extension PipelineRunner {
         max(targetCount, Int(ceil(Double(targetCount) / 0.75)))
     }
 
-    func colmapMaxImageSizeOverride() -> Int? {
-        intEnvValue("EASYSPLAT_COLMAP_MAX_IMAGE_SIZE")
-            .flatMap { $0 > 0 ? max(64, $0) : nil }
-    }
-
     func globalMapperOptions(threadHint: Int, defaultUseGpu: Bool = true) -> ColmapGlobalMapperOptions {
-        let preferredThreads = max(1, intEnvValue("EASYSPLAT_GLOBAL_MAPPER_THREADS") ?? threadHint)
-        let gpUseGpu = boolEnvValue("EASYSPLAT_GLOBAL_MAPPER_GP_USE_GPU", default: defaultUseGpu)
-        let baUseGpu = boolEnvValue("EASYSPLAT_GLOBAL_MAPPER_BA_USE_GPU", default: defaultUseGpu)
-        let gpuIndex = stringEnvValue("EASYSPLAT_GLOBAL_MAPPER_GPU_INDEX") ?? "-1"
-        let gpGpuIndex = stringEnvValue("EASYSPLAT_GLOBAL_MAPPER_GP_GPU_INDEX") ?? gpuIndex
-        let baGpuIndex = stringEnvValue("EASYSPLAT_GLOBAL_MAPPER_BA_GPU_INDEX") ?? gpuIndex
-        let minNumMatches = intEnvValue("EASYSPLAT_GLOBAL_MAPPER_MIN_NUM_MATCHES")
-        let baIterations = intEnvValue("EASYSPLAT_GLOBAL_MAPPER_BA_NUM_ITERATIONS")
+        let preferredThreads = max(1, threadHint)
         return ColmapGlobalMapperOptions(
-            useGpuForGlobalPositioning: gpUseGpu,
-            gpuIndexForGlobalPositioning: gpGpuIndex,
-            useGpuForBundleAdjustment: baUseGpu,
-            gpuIndexForBundleAdjustment: baGpuIndex,
+            useGpuForGlobalPositioning: defaultUseGpu,
+            gpuIndexForGlobalPositioning: "-1",
+            useGpuForBundleAdjustment: defaultUseGpu,
+            gpuIndexForBundleAdjustment: "-1",
             numThreads: preferredThreads,
-            minNumMatches: minNumMatches,
-            baNumIterations: baIterations
+            minNumMatches: nil,
+            baNumIterations: nil
         )
     }
 
@@ -312,9 +227,7 @@ extension PipelineRunner {
     ) -> Bool {
         guard isFastSpeedProfile() else { return false }
 
-        if colmapMaxImageSizeOverride() == nil {
-            colmapMaxImageSize = min(colmapMaxImageSize, 512)
-        }
+        colmapMaxImageSize = min(colmapMaxImageSize, 512)
         colmapExtractOptions.sequentialOverlap = min(colmapExtractOptions.sequentialOverlap, 2)
         colmapMatchOptions.sequentialOverlap = min(colmapMatchOptions.sequentialOverlap, 2)
         colmapExtractOptions.maxNumFeatures = colmapExtractOptions.maxNumFeatures.map { min($0, 4_000) } ?? 4_000
@@ -329,29 +242,6 @@ extension PipelineRunner {
         options.environment["OMP_NUM_THREADS"] = "\(threadCount)"
         options.environment["OPENBLAS_NUM_THREADS"] = "\(threadCount)"
         options.environment["MKL_NUM_THREADS"] = "\(threadCount)"
-    }
-
-    func colmapSequentialOverlapOverride() -> Int? {
-        guard let value = intEnvValue("EASYSPLAT_COLMAP_SEQUENTIAL_OVERLAP") else {
-            return nil
-        }
-        return min(30, max(1, value))
-    }
-
-    func colmapGpuOverride() -> Bool? {
-        let env = runtimeEnvironment
-        if let value = env["EASYSPLAT_COLMAP_FORCE_CPU"], value == "1" {
-            return false
-        }
-        if let value = env["EASYSPLAT_COLMAP_FORCE_GPU"], value == "1" {
-            return true
-        }
-        if let value = env["EASYSPLAT_COLMAP_USE_GPU"] {
-            let normalized = value.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-            if ["1", "true", "yes"].contains(normalized) { return true }
-            if ["0", "false", "no"].contains(normalized) { return false }
-        }
-        return nil
     }
 
     func detectColmapGpuSupport(colmapPath: URL) -> Bool {
