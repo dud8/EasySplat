@@ -9,10 +9,7 @@ import SQLite3
 final class PipelineIntegrationTests: XCTestCase {
     private static let clearedTrainingEnvironment: [String: String?] = [
             "EASYSPLAT_TRAINER": nil,
-            "EASYSPLAT_MSPLAT_BIN": nil,
-            "EASYSPLAT_MSPLAT_ITERS": nil,
-            "EASYSPLAT_MSPLAT_NUM_DOWNSCALES": nil,
-            "EASYSPLAT_MSPLAT_DOWNSCALE_FACTOR": nil
+            "EASYSPLAT_MSPLAT_BIN": nil
     ]
 
     private func scopedPipelineEnvironment(_ changes: [String: String?]) async -> @Sendable () -> Void {
@@ -947,7 +944,7 @@ final class PipelineIntegrationTests: XCTestCase {
 
     func testPipelineCanTrainWithMsplatOverride() async throws {
         let temp = makeTempRoot()
-        let externalMsplat = temp.appendingPathComponent("External/msplat-train")
+        let externalMsplat = temp.appendingPathComponent("External/easysplat-train")
         try TestFileBuilder.createExecutable(at: externalMsplat)
 
         let restore = await scopedPipelineEnvironment([
@@ -955,8 +952,7 @@ final class PipelineIntegrationTests: XCTestCase {
             "EASYSPLAT_SFM_MAPPER": nil,
             "EASYSPLAT_TRAINER": "msplat",
             "EASYSPLAT_MSPLAT_BIN": externalMsplat.path,
-            "EASYSPLAT_SKIP_TRAINING": nil,
-            "EASYSPLAT_MSPLAT_ITERS": "1200"
+            "EASYSPLAT_SKIP_TRAINING": nil
         ])
         defer { restore() }
 
@@ -970,13 +966,24 @@ final class PipelineIntegrationTests: XCTestCase {
         let metadata = ProjectMetadata(
             title: "Msplat",
             input: .photos(folder: sourcePhotos.path),
-            preset: PresetSpec(mode: .object, quality: .draft)
+            preset: PresetSpec(mode: .object, quality: .draft),
+            requestedRunOptions: RequestedRunOptions(detailProfile: .fast)
         )
         let paths = ProjectPaths(root: projectURL)
         try paths.ensureDirectories()
         try ProjectMetadataStore.save(metadata, to: paths.metadataURL)
 
         let toolchain = try makeToolchain(root: temp)
+        let plySizeProbe = temp.appendingPathComponent("msplat-size-probe.ply")
+        try TestFileBuilder.writeMinimalPly(at: plySizeProbe)
+        let msplatOutputBytes = try XCTUnwrap(
+            (try FileManager.default.attributesOfItem(atPath: plySizeProbe.path)[.size] as? NSNumber)?.int64Value
+        )
+        try FileManager.default.removeItem(at: plySizeProbe)
+        let msplatEvents = """
+        {"camera_count":12,"event":"started","initial_gaussian_count":1500,"iteration":0,"iteration_limit":3000,"plateau_window":400,"profile":"fast","schema_version":1,"seed":42,"sequence":1,"version":"1.1.3 (git 106499b)"}
+        {"elapsed_seconds":2,"event":"completed","gaussian_count":1800,"iteration":3000,"iteration_limit":3000,"output_bytes":\(msplatOutputBytes),"plateau_window":400,"profile":"fast","schema_version":1,"seed":42,"sequence":2,"stop_reason":"iteration_limit"}
+        """ + "\n"
         var msplatDatasetPath: String?
         let runner = MockSubprocessRunner(scripts: [
             .init(
@@ -1024,15 +1031,16 @@ final class PipelineIntegrationTests: XCTestCase {
             ),
             .init(
                 path: externalMsplat.path,
-                argsPrefix: ["--input"],
-                result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""),
+                argsPrefix: ["--dataset"],
+                result: .init(exitCode: 0, terminationReason: .exit, stdout: msplatEvents, stderr: ""),
                 onRun: { args in
                     guard let datasetArg = args.dropFirst().first,
                           let outputArg = self.value(for: "--output", in: args) else { return }
                     msplatDatasetPath = datasetArg
                     let dataset = URL(fileURLWithPath: datasetArg, isDirectory: true)
                     XCTAssertTrue(FileManager.default.fileExists(atPath: dataset.appendingPathComponent("sparse/0/cameras.bin").path))
-                    XCTAssertTrue(args.contains("1200"))
+                    XCTAssertTrue(args.contains("fast"))
+                    XCTAssertFalse(args.contains("--num-iters"))
                     try? TestFileBuilder.writeMinimalPly(at: URL(fileURLWithPath: outputArg))
                 }
             )
@@ -3285,7 +3293,7 @@ final class PipelineIntegrationTests: XCTestCase {
 
         let colmap = try writeStub("colmap")
         let brush = try writeStub("brush")
-        let msplat = createMsplatFile ? try writeStub("msplat-train") : bin.appendingPathComponent("msplat-train")
+        let msplat = createMsplatFile ? try writeStub("easysplat-train") : bin.appendingPathComponent("easysplat-train")
 
         let da3 = try TestToolchains.da3Toolchain(root: toolchainRoot, createFiles: createDa3Files)
         let mapanything = try TestToolchains.mapAnythingToolchain(root: toolchainRoot, createFiles: createMapAnythingFiles)

@@ -5,6 +5,7 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 BUILD_SCRIPT="$ROOT/scripts/toolchain/build_msplat.sh"
 OVERLAY="$ROOT/Tools/MsplatNative/msplat.cpp"
 UPSTREAM_PATCH="$ROOT/Tools/MsplatNative/msplat-1.1.3-easysplat.patch"
+FIXTURE_GENERATOR="$ROOT/scripts/ci/generate_msplat_sparse_fixtures.py"
 INSTALL_DIR="${EASYSPLAT_MSPLAT_INSTALL_DIR:-$ROOT/Toolchains/build/msplat/install/msplat}"
 
 fail() {
@@ -33,6 +34,7 @@ require_file() {
 require_file "$BUILD_SCRIPT"
 require_file "$OVERLAY"
 require_file "$UPSTREAM_PATCH"
+require_file "$FIXTURE_GENERATOR"
 
 require_contains 'MSPLAT_REPO="https://github.com/rayanht/msplat.git"' "$BUILD_SCRIPT"
 require_contains 'MSPLAT_COMMIT="106499b0a53f82b0c92d013b0861fbebd341b17e"' "$BUILD_SCRIPT"
@@ -62,13 +64,28 @@ for forbidden in 'pip install' 'python-build-standalone' 'site-packages' '_core.
   require_absent "$forbidden" "$BUILD_SCRIPT"
 done
 
-for flag in --input --output --num-iters --num-downscales --downscale-factor --seed --eval --events-jsonl --self-check --validate-ply --version --help; do
+for flag in --dataset --output --profile --seed --events-fd --self-check --validate-ply --version --help; do
   require_contains "$flag" "$OVERLAY"
 done
-for event in started progress completed cancellation_requested cancelled self_check; do
+for flag in --input --num-iters --num-downscales --downscale-factor --eval --events-jsonl; do
+  require_absent "$flag" "$OVERLAY"
+done
+for budget in 'fast", 3000, 400' 'balanced", 7000, 800' 'high-detail", 15000, 1500'; do
+  require_contains "$budget" "$OVERLAY"
+done
+for event in started progress early_stop completed cancellation_requested cancelled self_check; do
   require_contains "\"$event\"" "$OVERLAY"
 done
 require_contains 'InfiniteRandomIterator<size_t> camsIter(camIndices, seed)' "$OVERLAY"
+require_contains 'msplat_record_last_loss' "$OVERLAY"
+require_contains 'msplat_sync_loss_window' "$OVERLAY"
+require_contains 'step < profile.iterationLimit' "$OVERLAY"
+require_contains '"loss_iteration"' "$OVERLAY"
+require_contains 'lossSyncBatch = refineEvery' "$OVERLAY"
+require_contains 'plateauSampleCount == lossSyncBatch' "$OVERLAY"
+require_contains 'bestCameraLosses' "$OVERLAY"
+require_contains 'lastImprovementIteration' "$OVERLAY"
+require_contains 'write(' "$OVERLAY"
 require_contains 'msplat_gpu_sync()' "$OVERLAY"
 require_contains 'SIGINT' "$OVERLAY"
 require_contains 'SIGTERM' "$OVERLAY"
@@ -85,6 +102,9 @@ require_contains 'pipelineLoadFailed' "$UPSTREAM_PATCH"
 require_contains 'std::ios::failbit' "$UPSTREAM_PATCH"
 require_contains 'float3 b_conic = float3(0.0f)' "$UPSTREAM_PATCH"
 require_contains 'int32_t b_id = 0' "$UPSTREAM_PATCH"
+require_contains 'void msplat_record_last_loss' "$UPSTREAM_PATCH"
+require_contains 'void msplat_sync_loss_window' "$UPSTREAM_PATCH"
+require_contains 'syncCB()' "$UPSTREAM_PATCH"
 require_contains 'validateBinaryPly' "$OVERLAY"
 require_contains 'cancelIfRequested(events, step)' "$OVERLAY"
 
@@ -117,14 +137,19 @@ expected_files=$'./LICENSE\n./bin/default.metallib\n./bin/easysplat-train\n./bui
 done
 "$BIN" --version | grep -Fq '1.1.3' || fail "CLI version does not report 1.1.3"
 help="$($BIN --help)"
-for flag in --input --output --num-iters --num-downscales --downscale-factor --seed --eval --events-jsonl --self-check --validate-ply --version --help; do
+for flag in --dataset --output --profile --seed --events-fd --self-check --validate-ply --version --help; do
   grep -Fq -- "$flag" <<<"$help" || fail "CLI help is missing $flag"
+done
+for flag in --input --num-iters --num-downscales --downscale-factor --eval --events-jsonl; do
+  if grep -Fq -- "$flag" <<<"$help"; then
+    fail "CLI help still exposes obsolete control $flag"
+  fi
 done
 
 self_check_stdout="$(mktemp "${TMPDIR:-/tmp}/easysplat-msplat-self-check.XXXXXX")"
 self_check_stderr="$self_check_stdout.stderr"
 trap 'rm -f "$self_check_stdout" "$self_check_stderr"; rm -rf "${negative_dir:-}"' EXIT
-"$BIN" --self-check --events-jsonl >"$self_check_stdout" 2>"$self_check_stderr"
+"$BIN" --self-check --events-fd 1 >"$self_check_stdout" 2>"$self_check_stderr"
 [ "$(wc -l <"$self_check_stdout" | tr -d ' ')" = "1" ] || fail "self-check stdout is not exactly one JSONL record"
 require_contains '"schema_version":1' "$self_check_stdout"
 require_contains '"sequence":1' "$self_check_stdout"
@@ -132,9 +157,55 @@ require_contains '"event":"self_check"' "$self_check_stdout"
 require_contains '"status":"ok"' "$self_check_stdout"
 
 negative_dir="$(mktemp -d "${TMPDIR:-/tmp}/easysplat-msplat-negative.XXXXXX")"
+"$BIN" --self-check --events-fd 3 \
+  3>"$negative_dir/fd3.events" \
+  >"$negative_dir/fd3.stdout" \
+  2>"$negative_dir/fd3.stderr"
+[ ! -s "$negative_dir/fd3.stdout" ] || fail "event-fd self-check polluted stdout"
+[ ! -s "$negative_dir/fd3.stderr" ] || fail "event-fd self-check polluted stderr"
+require_contains '"event":"self_check"' "$negative_dir/fd3.events"
+
+set +e
+"$BIN" --self-check --events-fd 9 \
+  >"$negative_dir/closed-fd.stdout" \
+  2>"$negative_dir/closed-fd.stderr"
+closed_fd_status=$?
+"$BIN" --dataset "$negative_dir" --output "$negative_dir/invalid.ply" \
+  --profile extravagant --seed 42 --events-fd 1 \
+  >"$negative_dir/invalid-profile.stdout" \
+  2>"$negative_dir/invalid-profile.stderr"
+invalid_profile_status=$?
+set -e
+[ "$closed_fd_status" -ne 0 ] || fail "closed event file descriptor falsely succeeded"
+grep -qi 'file descriptor' "$negative_dir/closed-fd.stderr" || fail "closed event-fd diagnostic is not useful"
+[ "$invalid_profile_status" -ne 0 ] || fail "unknown training profile falsely succeeded"
+grep -qi 'profile' "$negative_dir/invalid-profile.stderr" || fail "unknown profile diagnostic is not useful"
+
+python3 - "$BIN" "$negative_dir/broken-pipe.stdout" "$negative_dir/broken-pipe.stderr" <<'PY'
+import os
+import subprocess
+import sys
+
+read_fd, write_fd = os.pipe()
+os.close(read_fd)
+with open(sys.argv[2], "wb") as stdout, open(sys.argv[3], "wb") as stderr:
+    result = subprocess.run(
+        [sys.argv[1], "--self-check", "--events-fd", str(write_fd)],
+        stdout=stdout,
+        stderr=stderr,
+        pass_fds=(write_fd,),
+        check=False,
+    )
+os.close(write_fd)
+if result.returncode == 0 or result.returncode < 0:
+    raise SystemExit(f"broken event pipe exited with unsafe status {result.returncode}")
+PY
+grep -Eqi 'event file descriptor|broken pipe' "$negative_dir/broken-pipe.stderr" \
+  || fail "broken event-pipe diagnostic is not useful"
+
 cp "$BIN" "$negative_dir/easysplat-train"
 set +e
-"$negative_dir/easysplat-train" --self-check --events-jsonl >"$negative_dir/missing.stdout" 2>"$negative_dir/missing.stderr"
+"$negative_dir/easysplat-train" --self-check --events-fd 1 >"$negative_dir/missing.stdout" 2>"$negative_dir/missing.stderr"
 missing_status=$?
 set -e
 [ "$missing_status" -ne 0 ] || fail "missing metallib self-check falsely succeeded"
@@ -144,7 +215,7 @@ grep -qi 'metallib' "$negative_dir/missing.stderr" || fail "missing metallib dia
 
 printf 'not a metallib\n' >"$negative_dir/default.metallib"
 set +e
-"$negative_dir/easysplat-train" --self-check --events-jsonl >"$negative_dir/corrupt.stdout" 2>"$negative_dir/corrupt.stderr"
+"$negative_dir/easysplat-train" --self-check --events-fd 1 >"$negative_dir/corrupt.stdout" 2>"$negative_dir/corrupt.stderr"
 corrupt_status=$?
 set -e
 [ "$corrupt_status" -ne 0 ] || fail "corrupt metallib self-check falsely succeeded"
@@ -162,7 +233,7 @@ METAL
 xcrun -sdk macosx metal -c "$negative_dir/incomplete.metal" -o "$negative_dir/incomplete.air"
 xcrun -sdk macosx metallib "$negative_dir/incomplete.air" -o "$negative_dir/default.metallib"
 set +e
-"$negative_dir/easysplat-train" --self-check --events-jsonl >"$negative_dir/incomplete.stdout" 2>"$negative_dir/incomplete.stderr"
+"$negative_dir/easysplat-train" --self-check --events-fd 1 >"$negative_dir/incomplete.stdout" 2>"$negative_dir/incomplete.stderr"
 incomplete_status=$?
 set -e
 [ "$incomplete_status" -ne 0 ] || fail "incomplete metallib self-check falsely succeeded"
@@ -196,7 +267,7 @@ valid_ply="$negative_dir/valid.ply"
     'end_header'
   dd if=/dev/zero bs=68 count=1 2>/dev/null
 } >"$valid_ply"
-"$BIN" --validate-ply "$valid_ply" --events-jsonl >"$negative_dir/valid-ply.stdout" 2>"$negative_dir/valid-ply.stderr"
+"$BIN" --validate-ply "$valid_ply" --events-fd 1 >"$negative_dir/valid-ply.stdout" 2>"$negative_dir/valid-ply.stderr"
 require_contains '"event":"output_validation"' "$negative_dir/valid-ply.stdout"
 require_contains '"status":"ok"' "$negative_dir/valid-ply.stdout"
 
@@ -204,7 +275,7 @@ truncated_ply="$negative_dir/truncated.ply"
 cp "$valid_ply" "$truncated_ply"
 truncate -s -4 "$truncated_ply"
 set +e
-"$BIN" --validate-ply "$truncated_ply" --events-jsonl >"$negative_dir/truncated-ply.stdout" 2>"$negative_dir/truncated-ply.stderr"
+"$BIN" --validate-ply "$truncated_ply" --events-fd 1 >"$negative_dir/truncated-ply.stdout" 2>"$negative_dir/truncated-ply.stderr"
 truncated_status=$?
 set -e
 [ "$truncated_status" -ne 0 ] || fail "truncated PLY validation falsely succeeded"
@@ -240,39 +311,120 @@ validate_jsonl() {
   done <"$jsonl"
 }
 
-training_fixture="${EASYSPLAT_MSPLAT_TRAINING_FIXTURE:-}"
-if [ -n "$training_fixture" ] && [ -d "$training_fixture" ]; then
-  training_dir="$negative_dir/training"
+validate_training_events() {
+  local jsonl="$1"
+  local expected_points="$2"
+  python3 - "$jsonl" "$expected_points" <<'PY'
+import json
+import math
+import sys
+from pathlib import Path
+
+
+def reject_constant(value):
+    raise ValueError(f"non-finite JSON constant: {value}")
+
+
+records = [
+    json.loads(line, parse_constant=reject_constant)
+    for line in Path(sys.argv[1]).read_text(encoding="utf-8").splitlines()
+]
+if len(records) < 3:
+    raise SystemExit("training emitted fewer than three events")
+for index, record in enumerate(records, start=1):
+    if record.get("schema_version") != 1 or record.get("sequence") != index:
+        raise SystemExit(f"invalid event envelope at sequence {index}")
+    for value in record.values():
+        if isinstance(value, float) and not math.isfinite(value):
+            raise SystemExit(f"non-finite event value at sequence {index}")
+started = records[0]
+completed = records[-1]
+expected_points = int(sys.argv[2])
+if started.get("event") != "started" or completed.get("event") != "completed":
+    raise SystemExit("training event stream has invalid boundaries")
+if started.get("initial_gaussian_count") != expected_points:
+    raise SystemExit("started event has the wrong sparse-point count")
+expected_contract = {
+    "iteration_limit": 3000,
+    "plateau_window": 400,
+    "profile": "fast",
+    "seed": 42,
+}
+for key, expected in expected_contract.items():
+    if started.get(key) != expected or completed.get(key) != expected:
+        raise SystemExit(f"training profile contract mismatch for {key}")
+iterations = [
+    record["iteration"]
+    for record in records
+    if record.get("event") in {"progress", "early_stop", "completed"}
+]
+if not iterations or iterations != sorted(iterations) or iterations[-1] > 3000:
+    raise SystemExit("training iterations are not monotonic and bounded")
+if completed.get("stop_reason") not in {"iteration_limit", "plateau"}:
+    raise SystemExit("completed event has an invalid stop reason")
+if completed.get("gaussian_count", 0) <= 0 or completed.get("output_bytes", 0) <= 0:
+    raise SystemExit("completed event is missing output evidence")
+if sum(record.get("event") == "completed" for record in records) != 1:
+    raise SystemExit("training emitted multiple completion records")
+PY
+}
+
+fixture_root="$negative_dir/sparse-fixtures"
+existing_fixture_root="$negative_dir/existing-fixture-output"
+mkdir -p "$existing_fixture_root"
+printf 'preserve\n' >"$existing_fixture_root/sentinel"
+if python3 "$FIXTURE_GENERATOR" --output "$existing_fixture_root" >/dev/null 2>&1; then
+  fail "sparse fixture generator replaced an existing directory"
+fi
+require_contains 'preserve' "$existing_fixture_root/sentinel"
+python3 "$FIXTURE_GENERATOR" --output "$fixture_root"
+fixture_count=0
+while IFS=$'\t' read -r fixture_name expected_points; do
+  fixture_count=$((fixture_count + 1))
+  training_fixture="$fixture_root/$fixture_name"
+  training_dir="$negative_dir/training-$fixture_name"
   mkdir -p "$training_dir"
   "$BIN" \
-    --input "$training_fixture" \
+    --dataset "$training_fixture" \
     --output "$training_dir/splat.ply" \
-    --num-iters 1 \
-    --num-downscales 0 \
-    --downscale-factor 32 \
+    --profile fast \
     --seed 42 \
-    --events-jsonl \
+    --events-fd 1 \
     >"$training_dir/events.jsonl" 2>"$training_dir/stderr.log"
   validate_jsonl "$training_dir/events.jsonl"
-  [ "$(wc -l <"$training_dir/events.jsonl" | tr -d ' ')" = "3" ] || fail "one-step training did not emit exactly three events"
-  require_contains '"event":"started"' "$training_dir/events.jsonl"
-  require_contains '"event":"progress"' "$training_dir/events.jsonl"
-  require_contains '"event":"completed"' "$training_dir/events.jsonl"
-  [ -s "$training_dir/splat.ply" ] || fail "one-step training did not atomically publish a nonempty PLY"
+  validate_training_events "$training_dir/events.jsonl" "$expected_points"
+  [ -s "$training_dir/splat.ply" ] || fail "Fast-profile training did not atomically publish a nonempty PLY"
+  "$BIN" --validate-ply "$training_dir/splat.ply" --events-fd 1 \
+    >"$training_dir/validation.jsonl" 2>"$training_dir/validation.stderr"
+  require_contains '"status":"ok"' "$training_dir/validation.jsonl"
   if find "$training_dir" -maxdepth 1 -name '*.tmp.*' -print -quit | grep -q .; then
-    fail "one-step training left a temporary output behind"
+    fail "Fast-profile training left a temporary output behind"
   fi
+done < <(python3 - "$fixture_root/manifest.json" <<'PY'
+import json
+import sys
+from pathlib import Path
 
-  cancellation_dir="$negative_dir/cancellation"
+manifest = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+for fixture in manifest["fixtures"]:
+    print(f'{fixture["dataset"]}\t{fixture["point_count"]}')
+PY
+)
+[ "$fixture_count" = "12" ] || fail "sparse fixture generator did not produce twelve cases"
+
+run_cancelled_profile() {
+  local profile="$1"
+  local expected_limit="$2"
+  local expected_plateau="$3"
+  local cancellation_dir="$negative_dir/cancellation-$profile"
+  local cancellation_pid started cancellation_status
   mkdir -p "$cancellation_dir"
   "$BIN" \
-    --input "$training_fixture" \
+    --dataset "$fixture_root/12-clusters-1500" \
     --output "$cancellation_dir/splat.ply" \
-    --num-iters 100000 \
-    --num-downscales 0 \
-    --downscale-factor 32 \
+    --profile "$profile" \
     --seed 42 \
-    --events-jsonl \
+    --events-fd 1 \
     >"$cancellation_dir/events.jsonl" 2>"$cancellation_dir/stderr.log" &
   cancellation_pid=$!
   started=0
@@ -286,21 +438,41 @@ if [ -n "$training_fixture" ] && [ -d "$training_fixture" ]; then
   [ "$started" = "1" ] || {
     kill -KILL "$cancellation_pid" 2>/dev/null || true
     wait "$cancellation_pid" 2>/dev/null || true
-    fail "training did not emit started before the cancellation timeout"
+    fail "$profile training did not emit started before the cancellation timeout"
   }
+  python3 - "$cancellation_dir/events.jsonl" "$profile" "$expected_limit" "$expected_plateau" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+started = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8").splitlines()[0])
+expected = {
+    "event": "started",
+    "iteration_limit": int(sys.argv[3]),
+    "plateau_window": int(sys.argv[4]),
+    "profile": sys.argv[2],
+    "seed": 42,
+}
+for key, value in expected.items():
+    if started.get(key) != value:
+        raise SystemExit(f"{sys.argv[2]} started-event mismatch for {key}")
+PY
   kill -TERM "$cancellation_pid"
   set +e
   wait "$cancellation_pid"
   cancellation_status=$?
   set -e
-  [ "$cancellation_status" = "130" ] || fail "signaled training exited $cancellation_status instead of 130"
+  [ "$cancellation_status" = "130" ] || fail "signaled $profile training exited $cancellation_status instead of 130"
   validate_jsonl "$cancellation_dir/events.jsonl"
   require_contains '"event":"cancellation_requested"' "$cancellation_dir/events.jsonl"
   require_contains '"event":"cancelled"' "$cancellation_dir/events.jsonl"
   if grep -Fq '"event":"completed"' "$cancellation_dir/events.jsonl"; then
-    fail "cancelled training emitted completed"
+    fail "cancelled $profile training emitted completed"
   fi
-  [ ! -e "$cancellation_dir/splat.ply" ] || fail "cancelled training published a final PLY"
-fi
+  [ ! -e "$cancellation_dir/splat.ply" ] || fail "cancelled $profile training published a final PLY"
+}
+
+run_cancelled_profile balanced 7000 800
+run_cancelled_profile high-detail 15000 1500
 
 echo "native msplat build and CLI contracts passed"

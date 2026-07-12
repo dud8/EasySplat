@@ -3748,19 +3748,40 @@ public final class PipelineRunner: @unchecked Sendable {
                             "tool": msplatPath.path
                         ]
                     )
-                    try await self.tooling.msplat.runTrain(
+                    let detailProfile = metadata.requestedRunOptions?.detailProfile ?? {
+                        switch metadata.preset.quality {
+                        case .draft: return .fast
+                        case .standard: return .balanced
+                        case .ultra: return .highDetail
+                        }
+                    }()
+                    let trainingResult = try await self.tooling.msplat.runTrain(
                         msplatPath: msplatPath,
                         datasetPath: datasetURL,
                         outputPath: outputURL,
-                        iterations: msplatDefaultIterations(),
+                        profile: detailProfile,
+                        seed: 42,
+                        onProgress: { progress in
+                            let fraction = Double(progress.iteration) / Double(progress.iterationLimit)
+                            emit(.stageProgress(
+                                stage: .trainBrush,
+                                fraction: fraction,
+                                message: "Training splat · \(progress.iteration.formatted()) of \(progress.iterationLimit.formatted())"
+                            ))
+                        },
                         onLog: { line, isErr in
                             msplatToolLog.append(stream: isErr ? "stderr" : "stdout", line: line)
                             let cleaned = Self.stripAnsiCodes(line)
                             let trimmed = Self.sanitizeToolLogLine(cleaned)
                                 .trimmingCharacters(in: .whitespacesAndNewlines)
                             guard !trimmed.isEmpty else { return }
-                            if Self.shouldEmitToolLogLine(trimmed, isError: isErr) {
-                                emit(.stageLog(stage: .trainBrush, line: trimmed, isError: isErr))
+                            let effectiveIsError = isErr && Self.looksLikeErrorishLine(trimmed.lowercased())
+                            if Self.shouldEmitToolLogLine(trimmed, isError: effectiveIsError) {
+                                emit(.stageLog(
+                                    stage: .trainBrush,
+                                    line: trimmed,
+                                    isError: effectiveIsError
+                                ))
                             }
                         }
                     )
@@ -3771,8 +3792,8 @@ public final class PipelineRunner: @unchecked Sendable {
                         details: .trainBrush(TrainBrushCheckpoint(
                             latestExportStep: nil,
                             latestExportPath: outputURL.path,
-                            progressStep: nil,
-                            progressTotal: nil,
+                            progressStep: trainingResult.completedIteration,
+                            progressTotal: trainingResult.iterationLimit,
                             stepsPerSecond: nil,
                             resumeSnapshotPath: nil,
                             trainingBackend: .msplat

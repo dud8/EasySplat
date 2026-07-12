@@ -167,7 +167,7 @@ private func makeResolvedRunPlan() -> ResolvedRunPlan {
         cameraGrouping: .sameCameraAndLens,
         lensProjection: .perspective,
         refinementIterationLimit: 75,
-        trainerIterationLimit: 30_000,
+        trainerIterationLimit: 15_000,
         plateauWindow: 1_500,
         requiredToolchainCapabilities: ["geometry-v2", "training-v2"],
         fallbackRouteIdentifiers: ["geometry.apple-silicon.fallback"]
@@ -216,7 +216,7 @@ func makeTrainingArtifact(
         runtimeVersion: "runtime-3.12",
         geometryDigest: "sha256:geometry",
         detailProfile: .highDetail,
-        iterationLimit: 30_000,
+        iterationLimit: 15_000,
         plateauWindow: 1_500,
         deterministicSeed: 42,
         checkpointPath: checkpointPath,

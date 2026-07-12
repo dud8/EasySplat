@@ -606,7 +606,7 @@ extension ToolchainManager {
     func validateMsplatSelfCheck(executable: URL, runtimeVersion: String) throws {
         let result: SubprocessResult
         do {
-            result = try runner.run(executable.path, ["--self-check", "--events-jsonl"])
+            result = try runner.run(executable.path, ["--self-check", "--events-fd", "1"])
         } catch {
             throw ToolchainError.invalidToolchain("easysplat-train self-check could not run (\(error.localizedDescription)).")
         }

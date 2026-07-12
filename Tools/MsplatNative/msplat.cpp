@@ -2,9 +2,10 @@
 #include <nlohmann/json.hpp>
 
 #include <algorithm>
-#include <atomic>
+#include <array>
 #include <chrono>
 #include <cerrno>
+#include <cmath>
 #include <csignal>
 #include <cstdint>
 #include <cstring>
@@ -14,10 +15,10 @@
 #include <iostream>
 #include <limits>
 #include <numeric>
-#include <optional>
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <unistd.h>
 #include <vector>
 
@@ -26,7 +27,6 @@
 #include "loaders.hpp"
 #include "model.hpp"
 #include "random_iter.hpp"
-#include "ssim.hpp"
 
 namespace fs = std::filesystem;
 using json = nlohmann::json;
@@ -41,21 +41,64 @@ void observeCancellation(int signal) {
 
 class EventWriter {
 public:
-    EventWriter(bool enabled, std::ostream &stream) : enabled_(enabled), stream_(stream) {}
+    explicit EventWriter(int descriptor) : descriptor_(descriptor) {
+        if (descriptor_ >= 0 && ::fcntl(descriptor_, F_GETFD) == -1) {
+            throw std::runtime_error("event file descriptor is not open");
+        }
+    }
+
+    bool enabled() const { return descriptor_ >= 0; }
 
     void emit(const std::string &event, json fields = json::object()) {
-        if (!enabled_) return;
+        if (!enabled()) return;
         fields["event"] = event;
         fields["schema_version"] = 1;
         fields["sequence"] = ++sequence_;
-        stream_ << fields.dump() << '\n' << std::flush;
+        std::string record = fields.dump();
+        record.push_back('\n');
+        const char *cursor = record.data();
+        std::size_t remaining = record.size();
+        while (remaining > 0) {
+            const ssize_t written = ::write(descriptor_, cursor, remaining);
+            if (written < 0 && errno == EINTR) continue;
+            if (written <= 0) {
+                throw std::runtime_error(
+                    "cannot write event file descriptor: " + std::string(std::strerror(errno))
+                );
+            }
+            cursor += written;
+            remaining -= static_cast<std::size_t>(written);
+        }
     }
 
 private:
-    bool enabled_;
-    std::ostream &stream_;
+    int descriptor_;
     std::uint64_t sequence_ = 0;
 };
+
+struct TrainingProfileConfig {
+    const char *name;
+    int iterationLimit;
+    int plateauWindow;
+    int numDownscales;
+};
+
+constexpr std::array<TrainingProfileConfig, 3> trainingProfiles = {{
+    {"fast", 3000, 400, 0},
+    {"balanced", 7000, 800, 0},
+    {"high-detail", 15000, 1500, 0},
+}};
+
+const TrainingProfileConfig &trainingProfileNamed(const std::string &name) {
+    const auto match = std::find_if(
+        trainingProfiles.begin(), trainingProfiles.end(),
+        [&](const TrainingProfileConfig &candidate) { return name == candidate.name; }
+    );
+    if (match == trainingProfiles.end()) {
+        throw std::runtime_error("--profile must be fast, balanced, or high-detail");
+    }
+    return *match;
+}
 
 bool cancelIfRequested(EventWriter &events, int completedIteration) {
     if (cancellationSignal == 0) return false;
@@ -176,6 +219,7 @@ bool savePlyAtomically(Model &model, const fs::path &output, int step, EventWrit
     fs::remove(temporary, ignored);
 
     try {
+        msplat_gpu_sync();
         model.save(temporary.string(), step);
         if (!fs::is_regular_file(temporary) || fs::file_size(temporary) == 0) {
             throw std::runtime_error("msplat produced an empty PLY");
@@ -197,40 +241,6 @@ bool savePlyAtomically(Model &model, const fs::path &output, int step, EventWrit
     }
 }
 
-struct EvaluationMetrics {
-    double psnr = 0;
-    double ssim = 0;
-    double l1 = 0;
-    int views = 0;
-};
-
-std::optional<EvaluationMetrics> evaluate(
-    Model &model,
-    std::vector<Camera> &cameras,
-    int step,
-    EventWriter &events
-) {
-    EvaluationMetrics metrics;
-    metrics.views = static_cast<int>(cameras.size());
-    for (Camera &camera : cameras) {
-        if (cancelIfRequested(events, step)) return std::nullopt;
-        MTensor rendered = model.render(camera, step);
-        msplat_gpu_sync();
-        MTensor renderedCpu = rendered.cpu();
-        MTensor targetCpu = camera.getGPUImage(model.getDownscaleFactor(step)).cpu();
-        metrics.psnr += psnr(renderedCpu, targetCpu);
-        metrics.ssim += ssim_eval(renderedCpu, targetCpu);
-        metrics.l1 += l1_loss(renderedCpu, targetCpu);
-        if (cancelIfRequested(events, step)) return std::nullopt;
-    }
-    if (metrics.views > 0) {
-        metrics.psnr /= metrics.views;
-        metrics.ssim /= metrics.views;
-        metrics.l1 /= metrics.views;
-    }
-    return metrics;
-}
-
 } // namespace
 
 int main(int argc, char *argv[]) {
@@ -238,46 +248,51 @@ int main(int argc, char *argv[]) {
     app.set_help_flag("-h,--help", "Show this help message");
     app.set_version_flag("--version", APP_VERSION);
 
-    std::string inputPath;
-    std::string outputPath = "splat.ply";
-    int numIterations = 30000;
-    int numDownscales = 2;
-    float downscaleFactor = 1.0f;
+    std::string datasetPath;
+    std::string outputPath;
+    std::string profileName;
     std::uint64_t seed = 42;
-    bool evalMode = false;
-    bool eventsJsonl = false;
+    int eventsFileDescriptor = -1;
     bool selfCheck = false;
     std::string plyToValidate;
 
-    app.add_option("--input", inputPath, "COLMAP dataset directory");
-    app.add_option("--output", outputPath, "Final PLY output path");
-    app.add_option("--num-iters", numIterations, "Training iterations")
-        ->check(CLI::Range(1, 1000000));
-    app.add_option("--num-downscales", numDownscales, "Progressive downscale levels")
-        ->check(CLI::Range(0, 16));
-    app.add_option("--downscale-factor", downscaleFactor, "Initial image downscale factor")
-        ->check(CLI::Range(1.0f, 32.0f));
-    app.add_option("--seed", seed, "Deterministic uint64 camera-order seed");
-    app.add_flag("--eval", evalMode, "Hold out every eighth camera for evaluation");
-    app.add_flag("--events-jsonl", eventsJsonl, "Reserve stdout for schema-v1 JSONL events");
+    CLI::Option *datasetOption = app.add_option(
+        "--dataset", datasetPath, "Canonical COLMAP dataset directory"
+    );
+    CLI::Option *outputOption = app.add_option("--output", outputPath, "Final PLY output path");
+    CLI::Option *profileOption = app.add_option(
+        "--profile", profileName, "Training profile: fast, balanced, or high-detail"
+    );
+    CLI::Option *seedOption = app.add_option(
+        "--seed", seed, "Deterministic uint64 camera-order seed"
+    );
+    CLI::Option *eventsOption = app.add_option(
+        "--events-fd", eventsFileDescriptor, "Descriptor for schema-v1 JSONL events"
+    );
+    eventsOption->check(CLI::Range(0, std::numeric_limits<int>::max()));
     app.add_flag("--self-check", selfCheck, "Initialize Metal and load the adjacent metallib");
     app.add_option("--validate-ply", plyToValidate, "Validate a binary Gaussian PLY")
         ->check(CLI::ExistingFile);
 
     CLI11_PARSE(app, argc, argv);
 
-    std::streambuf *jsonBuffer = std::cout.rdbuf();
-    std::ostream jsonOutput(jsonBuffer);
-    if (eventsJsonl) std::cout.rdbuf(std::cerr.rdbuf());
-    EventWriter events(eventsJsonl, jsonOutput);
-
     try {
+        struct sigaction ignoreBrokenPipe {};
+        ignoreBrokenPipe.sa_handler = SIG_IGN;
+        sigemptyset(&ignoreBrokenPipe.sa_mask);
+        ignoreBrokenPipe.sa_flags = 0;
+        if (sigaction(SIGPIPE, &ignoreBrokenPipe, nullptr) != 0) {
+            throw std::runtime_error("failed to configure event-pipe handling");
+        }
+        EventWriter events(eventsFileDescriptor);
+        if (eventsFileDescriptor == STDOUT_FILENO) std::cout.rdbuf(std::cerr.rdbuf());
+
         if (!plyToValidate.empty()) {
             const PlyValidation validation = validateBinaryPly(plyToValidate);
             events.emit("output_validation", {{"output_bytes", validation.bytes},
                                                {"status", "ok"},
                                                {"vertex_count", validation.vertices}});
-            if (!eventsJsonl) std::cout << "PLY validation passed\n";
+            if (!events.enabled()) std::cout << "PLY validation passed\n";
             return 0;
         }
         if (selfCheck) {
@@ -286,12 +301,17 @@ int main(int argc, char *argv[]) {
             }
             msplat_gpu_sync();
             events.emit("self_check", {{"status", "ok"}, {"version", APP_VERSION}});
-            if (!eventsJsonl) std::cout << "Metal self-check passed\n";
+            if (!events.enabled()) std::cout << "Metal self-check passed\n";
             return 0;
         }
 
-        if (inputPath.empty()) throw std::runtime_error("--input is required for training");
-        if (!fs::is_directory(inputPath)) throw std::runtime_error("input dataset directory does not exist");
+        if (datasetOption->count() == 0) throw std::runtime_error("--dataset is required for training");
+        if (outputOption->count() == 0) throw std::runtime_error("--output is required for training");
+        if (profileOption->count() == 0) throw std::runtime_error("--profile is required for training");
+        if (seedOption->count() == 0) throw std::runtime_error("--seed is required for training");
+        if (eventsOption->count() == 0) throw std::runtime_error("--events-fd is required for training");
+        const TrainingProfileConfig &profile = trainingProfileNamed(profileName);
+        if (!fs::is_directory(datasetPath)) throw std::runtime_error("dataset directory does not exist");
         if (fs::path(outputPath).extension() != ".ply") throw std::runtime_error("--output must end in .ply");
 
         struct sigaction action {};
@@ -302,23 +322,19 @@ int main(int argc, char *argv[]) {
             throw std::runtime_error("failed to install cancellation handlers");
         }
 
-        InputData inputData = inputDataFromX(inputPath);
-        for (Camera &camera : inputData.cameras) camera.loadImage(downscaleFactor);
+        InputData inputData = inputDataFromX(datasetPath);
+        for (Camera &camera : inputData.cameras) camera.loadImage(1.0f);
 
         std::vector<Camera> cameras;
-        std::vector<Camera> testCameras;
-        if (evalMode) {
-            std::tie(cameras, testCameras) = inputData.splitTrainTest(8);
-        } else {
-            Camera *unusedValidationCamera = nullptr;
-            std::tie(cameras, unusedValidationCamera) = inputData.getCameras(false);
-        }
+        Camera *unusedValidationCamera = nullptr;
+        std::tie(cameras, unusedValidationCamera) = inputData.getCameras(false);
         if (cameras.empty()) throw std::runtime_error("input dataset contains no training cameras");
 
         constexpr int resolutionSchedule = 3000;
         constexpr int shDegree = 3;
         constexpr int shDegreeInterval = 1000;
         constexpr int refineEvery = 100;
+        constexpr int lossSyncBatch = refineEvery;
         constexpr int warmupLength = 500;
         constexpr int resetAlphaEvery = 30;
         constexpr float densifyGradThreshold = 0.0002f;
@@ -328,79 +344,142 @@ int main(int argc, char *argv[]) {
         constexpr float ssimWeight = 0.2f;
         constexpr float background[3] = {0.6130f, 0.0101f, 0.3984f};
 
-        Model model(inputData, static_cast<int>(cameras.size()), numDownscales,
+        Model model(inputData, static_cast<int>(cameras.size()), profile.numDownscales,
                     resolutionSchedule, shDegree, shDegreeInterval, refineEvery,
                     warmupLength, resetAlphaEvery, densifyGradThreshold,
                     densifySizeThreshold, stopScreenSizeAt, splitScreenSize,
-                    numIterations, false, background);
+                    profile.iterationLimit, false, background);
 
         std::vector<size_t> camIndices(cameras.size());
         std::iota(camIndices.begin(), camIndices.end(), 0);
         InfiniteRandomIterator<size_t> camsIter(camIndices, seed);
 
-        events.emit("started", {{"iteration", 0},
-                                {"iteration_limit", numIterations},
+        events.emit("started", {{"camera_count", cameras.size()},
+                                {"initial_gaussian_count", model.num_active},
+                                {"iteration", 0},
+                                {"iteration_limit", profile.iterationLimit},
+                                {"plateau_window", profile.plateauWindow},
+                                {"profile", profile.name},
                                 {"seed", seed},
                                 {"version", APP_VERSION}});
 
         const auto startedAt = std::chrono::steady_clock::now();
         auto lastProgressAt = startedAt;
-        for (int step = 1; step <= numIterations; ++step) {
+        int plateauSampleCount = 0;
+        std::vector<float> plateauLosses(lossSyncBatch);
+        std::vector<std::size_t> plateauCameraIndices(lossSyncBatch);
+        std::vector<double> bestCameraLosses(
+            cameras.size(),
+            std::numeric_limits<double>::infinity()
+        );
+        int lastImprovementIteration = warmupLength;
+        double latestWindowLoss = std::numeric_limits<double>::quiet_NaN();
+        int latestLossIteration = 0;
+        int completedIteration = 0;
+        std::string stopReason = "iteration_limit";
+        for (int step = 1; step <= profile.iterationLimit; ++step) {
             if (cancelIfRequested(events, step - 1)) return 130;
 
-            Camera &camera = cameras[camsIter.next()];
+            const std::size_t cameraIndex = camsIter.next();
+            Camera &camera = cameras[cameraIndex];
             MTensor target = camera.getGPUImage(model.getDownscaleFactor(step));
             model.fullIteration(camera, step, target, ssimWeight);
             model.schedulersStep(step);
             model.afterTrain(step);
+            if (step > warmupLength) {
+                const float normalization = 1.0f /
+                    static_cast<float>(model.lastHeight * model.lastWidth);
+                plateauCameraIndices[plateauSampleCount] = cameraIndex;
+                msplat_record_last_loss(
+                    plateauSampleCount,
+                    lossSyncBatch,
+                    normalization
+                );
+                ++plateauSampleCount;
+            }
             msplat_commit();
+            completedIteration = step;
+
+            bool plateauReached = false;
+            if (plateauSampleCount == lossSyncBatch) {
+                msplat_sync_loss_window(plateauSampleCount, plateauLosses.data());
+                double totalLoss = 0;
+                const int firstWindowIteration = step - plateauSampleCount + 1;
+                for (int index = 0; index < plateauSampleCount; ++index) {
+                    const double loss = plateauLosses[index];
+                    const std::size_t sampledCamera = plateauCameraIndices[index];
+                    double &bestCameraLoss = bestCameraLosses[sampledCamera];
+                    const double improvementThreshold = std::isfinite(bestCameraLoss)
+                        ? std::max(1e-7, std::abs(bestCameraLoss) * 1e-4)
+                        : 0;
+                    if (!std::isfinite(bestCameraLoss) ||
+                        loss < bestCameraLoss - improvementThreshold) {
+                        bestCameraLoss = loss;
+                        lastImprovementIteration = firstWindowIteration + index;
+                    }
+                    totalLoss += loss;
+                }
+                latestWindowLoss = totalLoss / static_cast<double>(plateauSampleCount);
+                latestLossIteration = step;
+                plateauSampleCount = 0;
+                plateauReached = step - lastImprovementIteration >= profile.plateauWindow;
+            }
 
             if (cancelIfRequested(events, step)) return 130;
 
             auto now = std::chrono::steady_clock::now();
-            if (step == numIterations || now - lastProgressAt >= std::chrono::seconds(1)) {
+            if (step == profile.iterationLimit || now - lastProgressAt >= std::chrono::seconds(1)) {
                 msplat_gpu_sync();
                 now = std::chrono::steady_clock::now();
                 const double elapsed = std::chrono::duration<double>(now - startedAt).count();
                 const double rate = elapsed > 0 ? static_cast<double>(step) / elapsed : 0;
-                const double eta = rate > 0 ? static_cast<double>(numIterations - step) / rate : 0;
-                events.emit("progress", {{"elapsed_seconds", elapsed},
-                                         {"eta_seconds", eta},
-                                         {"gaussian_count", model.num_active},
-                                         {"iteration", step},
-                                         {"iteration_limit", numIterations},
-                                         {"iterations_per_second", rate}});
+                const double eta = rate > 0
+                    ? static_cast<double>(profile.iterationLimit - step) / rate
+                    : 0;
+                json progress = {{"elapsed_seconds", elapsed},
+                                 {"eta_seconds", eta},
+                                 {"gaussian_count", model.num_active},
+                                 {"iteration", step},
+                                 {"iteration_limit", profile.iterationLimit},
+                                 {"iterations_per_second", rate}};
+                if (std::isfinite(latestWindowLoss)) {
+                    progress["loss"] = latestWindowLoss;
+                    progress["loss_iteration"] = latestLossIteration;
+                }
+                events.emit("progress", std::move(progress));
                 lastProgressAt = now;
+            }
+
+            if (plateauReached && step < profile.iterationLimit) {
+                stopReason = "plateau";
+                events.emit("early_stop", {{"iteration", step},
+                                           {"last_improvement_iteration", lastImprovementIteration},
+                                           {"loss", latestWindowLoss},
+                                           {"loss_iteration", latestLossIteration},
+                                           {"plateau_window", profile.plateauWindow},
+                                           {"reason", stopReason}});
+                break;
             }
         }
 
-        if (cancelIfRequested(events, numIterations)) return 130;
-        EvaluationMetrics metrics;
-        if (evalMode) {
-            const auto evaluation = evaluate(model, testCameras, numIterations, events);
-            if (!evaluation) return 130;
-            metrics = *evaluation;
-        }
-        if (cancelIfRequested(events, numIterations)) return 130;
+        if (cancelIfRequested(events, completedIteration)) return 130;
 
-        if (!savePlyAtomically(model, outputPath, numIterations, events)) return 130;
+        if (!savePlyAtomically(model, outputPath, completedIteration, events)) return 130;
         const std::uintmax_t outputBytes = fs::file_size(outputPath);
         const double elapsed = std::chrono::duration<double>(
             std::chrono::steady_clock::now() - startedAt).count();
 
         json completed = {{"elapsed_seconds", elapsed},
                           {"gaussian_count", model.num_active},
-                          {"iteration", numIterations},
-                          {"iteration_limit", numIterations},
-                          {"output_bytes", outputBytes}};
-        if (evalMode) {
-            completed["evaluation"] = {{"l1", metrics.l1},
-                                       {"psnr", metrics.psnr},
-                                       {"ssim", metrics.ssim},
-                                       {"views", metrics.views}};
-        }
+                          {"iteration", completedIteration},
+                          {"iteration_limit", profile.iterationLimit},
+                          {"output_bytes", outputBytes},
+                          {"plateau_window", profile.plateauWindow},
+                          {"profile", profile.name},
+                          {"seed", seed},
+                          {"stop_reason", stopReason}};
         events.emit("completed", completed);
-        if (!eventsJsonl) std::cerr << "EasySplat training completed: " << outputPath << '\n';
+        if (!events.enabled()) std::cout << "EasySplat training completed: " << outputPath << '\n';
         return 0;
     } catch (const std::exception &error) {
         std::cerr << "easysplat-train: " << error.what() << '\n';

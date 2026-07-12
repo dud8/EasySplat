@@ -817,7 +817,7 @@ final class ToolchainManagerDownloadTests: XCTestCase {
             ),
             .init(
                 path: msplat.path,
-                argsPrefix: ["--self-check", "--events-jsonl"],
+                argsPrefix: ["--self-check", "--events-fd", "1"],
                 result: .init(
                     exitCode: 0,
                     terminationReason: .exit,

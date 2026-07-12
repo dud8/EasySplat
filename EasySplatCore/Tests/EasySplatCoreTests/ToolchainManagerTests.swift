@@ -826,7 +826,7 @@ final class ToolchainManagerTests: XCTestCase {
             .init(path: "/usr/bin/file", argsPrefix: ["-b", root.appendingPathComponent("bin/easysplat-train").path], result: .init(exitCode: 0, terminationReason: .exit, stdout: msplatArch, stderr: ""), onRun: nil),
             .init(
                 path: root.appendingPathComponent("bin/easysplat-train").path,
-                argsPrefix: ["--self-check", "--events-jsonl"],
+                argsPrefix: ["--self-check", "--events-fd", "1"],
                 result: .init(
                     exitCode: msplatSelfCheckExitCode,
                     terminationReason: .exit,

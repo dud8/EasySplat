@@ -85,7 +85,7 @@ swift test --package-path Tools/ManifestTool
 ./scripts/benchmark_mapanything.sh --video /absolute/path/to/input.mp4
 ```
 
-Use `EASYSPLAT_MSPLAT_BIN=/path/to/msplat-train` only when comparing a local msplat build outside the signed toolchain.
+Use `EASYSPLAT_MSPLAT_BIN=/path/to/easysplat-train` only when comparing a local native trainer outside the signed toolchain.
 
 The app's default Fast profile uses the measured Apple Silicon path.
 
@@ -107,9 +107,9 @@ Most useful runtime overrides:
 | `EASYSPLAT_LOCAL_TOOLCHAIN_ROOT` | Skip download/install and validate an already-present local toolchain. |
 | `EASYSPLAT_SFM_BACKEND` | Force `da3`, `mapanything`, `colmap`, `glomap`, `global_mapper`, `vggt`, or `fastvggt`. |
 | `EASYSPLAT_SFM_MAPPER` | Steer mapper fallback inside the integrated path: `glomap` means COLMAP `global_mapper`; `colmap` means classic COLMAP `mapper`. |
-| `EASYSPLAT_SPEED_PROFILE` | Set `fast` for the measured Apple Silicon quick path: select about 30 frames with blur-filter headroom, use COLMAP `global_mapper` by default, keep 960px training frames, solve COLMAP at 512px with low overlap, and run msplat for accepted sparse solves with a 1,800-iteration budget. |
+| `EASYSPLAT_SPEED_PROFILE` | Set `fast` for the measured Apple Silicon quick path: select about 30 frames with blur-filter headroom, use COLMAP `global_mapper` by default, keep 960px training frames, solve COLMAP at 512px with low overlap, and use the 3,000-iteration Fast training profile. |
 | `EASYSPLAT_TRAINER` | Override trainer selection with `brush` or `msplat`; the fast profile auto-selects packaged msplat unless sparse quality is too low. |
-| `EASYSPLAT_MSPLAT_BIN` | Point at a local `msplat-train` binary for comparison testing instead of the packaged binary. |
+| `EASYSPLAT_MSPLAT_BIN` | Point at a local `easysplat-train` binary for comparison testing instead of the packaged binary. |
 | `EASYSPLAT_FRAME_TARGET_COUNT` | Override the selected frame budget for speed-profile runs. |
 | `EASYSPLAT_FRAME_MAX_DIMENSION` | Override extracted frame size before SfM. |
 | `EASYSPLAT_COLMAP_MAX_IMAGE_SIZE` | Override COLMAP feature-extraction image size independently from extracted frame size. |
@@ -173,12 +173,11 @@ Common Brush overrides:
 - `EASYSPLAT_BRUSH_SNAPSHOT_MAX_SECONDS=<n>`
 - `EASYSPLAT_BRUSH_SNAPSHOT_DEFAULT_SECONDS=<n>`
 
-Common msplat overrides:
+Native trainer override:
 
-- `EASYSPLAT_MSPLAT_BIN=/path/to/msplat-train`
-- `EASYSPLAT_MSPLAT_ITERS=<n>`
-- `EASYSPLAT_MSPLAT_NUM_DOWNSCALES=<n>`
-- `EASYSPLAT_MSPLAT_DOWNSCALE_FACTOR=<n>`
+- `EASYSPLAT_MSPLAT_BIN=/path/to/easysplat-train`
+
+Training budgets are fixed by the Fast, Balanced, and High Detail profiles. Raw iteration and resolution controls are not runtime settings.
 
 The automatic fast profile uses a 2,000-step Brush run instead of msplat when the sparse solve has fewer than 1,500 points. Set `EASYSPLAT_TRAINER=msplat` to force msplat anyway.
 

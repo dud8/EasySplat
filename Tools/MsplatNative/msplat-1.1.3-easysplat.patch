@@ -16,7 +16,8 @@ diff --git a/core/metal/msplat_metal.mm b/core/metal/msplat_metal.mm
 index 791e124..2477337 100644
 --- a/core/metal/msplat_metal.mm
 +++ b/core/metal/msplat_metal.mm
-@@ -14,0 +15 @@
+@@ -14,0 +15,2 @@
++#include <cmath>
 +#include <stdexcept>
 @@ -174 +175 @@ MetalContext* init_msplat_metal_context() {
 -    MetalContext* ctx = (MetalContext*)malloc(sizeof(MetalContext));
@@ -76,3 +77,83 @@ index 1111349..1ab144d 100644
 @@ -53,0 +56,2 @@ void saveGaussianPly(const std::string &path, GaussianParams &p, int step) {
 +    o.flush();
 +    o.close();
+diff --git a/core/include/random_iter.hpp b/core/include/random_iter.hpp
+index a9047e2..bd49f5b 100644
+--- a/core/include/random_iter.hpp
++++ b/core/include/random_iter.hpp
+@@ -3,0 +4 @@
++#include <cstdint>
+@@ -12 +13 @@ public:
+-    InfiniteRandomIterator(const std::vector<T> &items, unsigned seed = 42)
++    InfiniteRandomIterator(const std::vector<T> &items, std::uint64_t seed = 42)
+@@ -29 +30 @@ private:
+-    std::mt19937 rng_;
++    std::mt19937_64 rng_;
+diff --git a/core/metal/bindings.h b/core/metal/bindings.h
+index 3ae3234..9676211 100644
+--- a/core/metal/bindings.h
++++ b/core/metal/bindings.h
+@@ -25,0 +26,2 @@ void msplat_gpu_sync();
++void msplat_record_last_loss(int slot, int capacity, float normalization);
++void msplat_sync_loss_window(int count, float* output);
+diff --git a/core/metal/msplat_metal.mm b/core/metal/msplat_metal.mm
+index 791e124..8e29764 100644
+--- a/core/metal/msplat_metal.mm
++++ b/core/metal/msplat_metal.mm
+@@ -407,0 +408,3 @@ struct FusedTensorCache {
++    MTensor loss_history;
++    std::vector<float> loss_normalizers;
++    int loss_history_capacity = 0;
+@@ -480 +483,51 @@
+-static FusedTensorCache g_tcache;
++static FusedTensorCache g_tcache;
++void msplat_record_last_loss(int slot, int capacity, float normalization) {
++    if (capacity <= 0 || slot < 0 || slot >= capacity ||
++        !std::isfinite(normalization) || normalization <= 0) {
++        throw std::runtime_error("msplat: invalid loss-history request");
++    }
++    if (!g_tcache.loss_sum.defined()) {
++        throw std::runtime_error("msplat: no training loss is available to record");
++    }
++    MetalContext* ctx = get_global_context();
++    if (g_tcache.loss_history_capacity != capacity) {
++        if (slot != 0) {
++            throw std::runtime_error("msplat: loss-history capacity changed mid-window");
++        }
++        g_tcache.loss_history = mtensor_empty(
++            ctx->device, {capacity}, DType::Float32
++        );
++        g_tcache.loss_normalizers.assign(capacity, 0);
++        g_tcache.loss_history_capacity = capacity;
++    }
++    g_tcache.loss_normalizers[slot] = normalization;
++
++    id<MTLBlitCommandEncoder> blit = [ctx->getCommandBuffer() blitCommandEncoder];
++    if (!blit) {
++        throw std::runtime_error("msplat: failed to create loss-history blit encoder");
++    }
++    [blit copyFromBuffer:g_tcache.loss_sum.buffer()
++            sourceOffset:0
++                toBuffer:g_tcache.loss_history.buffer()
++       destinationOffset:static_cast<NSUInteger>(slot) * sizeof(float)
++                    size:sizeof(float)];
++    [blit endEncoding];
++}
++
++void msplat_sync_loss_window(int count, float* output) {
++    if (count <= 0 || count > g_tcache.loss_history_capacity ||
++        !g_tcache.loss_history.defined() || output == nullptr) {
++        throw std::runtime_error("msplat: invalid completed loss window");
++    }
++    get_global_context()->syncCB();
++    const float* losses = g_tcache.loss_history.data<float>();
++    for (int index = 0; index < count; ++index) {
++        const double value = static_cast<double>(losses[index]) *
++            static_cast<double>(g_tcache.loss_normalizers[index]);
++        if (!std::isfinite(value)) {
++            throw std::runtime_error("msplat: loss window contains a non-finite value");
++        }
++        output[index] = static_cast<float>(value);
++    }
++}
++

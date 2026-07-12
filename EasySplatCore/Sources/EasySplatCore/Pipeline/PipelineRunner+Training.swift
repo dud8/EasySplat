@@ -174,10 +174,6 @@ extension PipelineRunner {
         return config.toolchain.msplat
     }
 
-    func msplatDefaultIterations() -> Int? {
-        isFastSpeedProfile() ? 1_800 : nil
-    }
-
     func shouldUseBrushInsteadOfAutomaticMsplat(for score: ReconstructionScore?) -> Bool {
         guard isFastSpeedProfile() else { return false }
         guard !hasExplicitTrainingBackendPreference() else { return false }

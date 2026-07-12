@@ -243,7 +243,7 @@ validate_stage() {
     die "provenance contains private or machine-local data"
   fi
 
-  self_check="$("$binary" --self-check --events-jsonl)"
+  self_check="$("$binary" --self-check --events-fd 1)"
   [ "$(printf '%s\n' "$self_check" | wc -l | tr -d ' ')" = "1" ] || die "self-check did not emit exactly one JSON line"
   grep -Fq '"event":"self_check"' <<<"$self_check" || die "self-check event missing"
   grep -Fq '"status":"ok"' <<<"$self_check" || die "self-check status missing"

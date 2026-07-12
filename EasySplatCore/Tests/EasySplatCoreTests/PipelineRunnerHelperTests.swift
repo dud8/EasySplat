@@ -214,20 +214,6 @@ final class PipelineRunnerHelperTests: XCTestCase {
         }
     }
 
-    func testFastSpeedProfileUsesMsplatIterationBudget() async throws {
-        let root = try TestFileBuilder.makeTempDir()
-        defer { try? FileManager.default.removeItem(at: root) }
-        let runner = makeRunner(projectURL: root)
-
-        await withEnvironmentAsync(["EASYSPLAT_SPEED_PROFILE": "fast"]) {
-            XCTAssertEqual(runner.test_msplatDefaultIterations(), 1_800)
-        }
-
-        await withEnvironmentAsync(["EASYSPLAT_SPEED_PROFILE": nil]) {
-            XCTAssertNil(runner.test_msplatDefaultIterations())
-        }
-    }
-
     func testFastSpeedProfileAvoidsAutomaticMsplatWhenSparsePointCountIsLow() async throws {
         let root = try TestFileBuilder.makeTempDir()
         defer { try? FileManager.default.removeItem(at: root) }

@@ -141,10 +141,6 @@ extension PipelineRunner {
         )
     }
 
-    func test_msplatDefaultIterations() -> Int? {
-        msplatDefaultIterations()
-    }
-
     func test_shouldUseBrushInsteadOfAutomaticMsplat(for score: ReconstructionScore?) -> Bool {
         shouldUseBrushInsteadOfAutomaticMsplat(for: score)
     }

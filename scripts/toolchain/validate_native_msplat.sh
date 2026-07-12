@@ -101,8 +101,8 @@ exact_values = {
     "source_commit": "106499b0a53f82b0c92d013b0861fbebd341b17e",
     "source_version": "1.1.3",
     "source_tree_sha256": "866fd6d051b5cf98ca08ae1552236473f504d8f13756cbda68201e48532c3e6a",
-    "overlay_sha256": "4c0443117b9d9f4a464311d78bf54f0028598a20d0226a770cf35011364b0920",
-    "patch_sha256": "ff5dac620fd2327fda800fc16ccb721f1c91e99a7b3afd9dc5100138abd95c80",
+    "overlay_sha256": "bbb38851e0b7f80c9568fa6b551482ac9abdfb95fe5ce8de01aaafb7de87259a",
+    "patch_sha256": "ee2dde253eb2a53df56811a59a8c490208e3c7bad19cef38ae96f81a7d5be2a1",
     "deployment_target": "macOS 15.0",
     "build_configuration": "Release",
 }
@@ -197,7 +197,7 @@ validate_binary() {
 
   stdout_file="$(mktemp "${TMPDIR:-/tmp}/easysplat-msplat-self-check.XXXXXX")"
   stderr_file="$stdout_file.stderr"
-  if ! "$executable" --self-check --events-jsonl >"$stdout_file" 2>"$stderr_file"; then
+  if ! "$executable" --self-check --events-fd 1 >"$stdout_file" 2>"$stderr_file"; then
     cat "$stderr_file" >&2 || true
     rm -f "$stdout_file" "$stderr_file"
     fail "native trainer self-check failed"
