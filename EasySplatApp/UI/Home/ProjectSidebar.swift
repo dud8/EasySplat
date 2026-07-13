@@ -191,14 +191,14 @@ struct ProjectSidebar: View {
                 "\(project.title), \(statusText(for: project)), \(project.lastActivityAt.formatted(date: .long, time: .omitted))"
             )
 
-            if let actionTitle = Self.rowActionTitle(status: project.status) {
+            if !isRunActive,
+               let actionTitle = Self.rowActionTitle(status: project.status) {
                 Button(actionTitle) {
                     open(project)
                 }
                 .buttonStyle(.borderless)
                 .controlSize(.small)
                 .fixedSize()
-                .disabled(isRunActive)
                 .accessibilityLabel("\(actionTitle) \(project.title)")
                 .accessibilityIdentifier(Self.actionAccessibilityIdentifier(for: project.url))
             }
