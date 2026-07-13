@@ -73,7 +73,7 @@ public enum PackagedAppVerifier {
             processingProjectURL: nil
         )
 
-        let running = try await NSWorkspace.shared.openApplication(
+        let running = try await launchApplication(
             at: appURL,
             configuration: configuration
         )
@@ -404,6 +404,26 @@ public enum PackagedAppVerifier {
         return configuration
     }
 
+    private static func launchApplication(
+        at appURL: URL,
+        configuration: NSWorkspace.OpenConfiguration
+    ) async throws -> NSRunningApplication {
+        try await withCheckedThrowingContinuation { continuation in
+            NSWorkspace.shared.openApplication(
+                at: appURL,
+                configuration: configuration
+            ) { runningApplication, error in
+                if let error {
+                    continuation.resume(throwing: error)
+                } else if let runningApplication {
+                    continuation.resume(returning: runningApplication)
+                } else {
+                    continuation.resume(throwing: PackagedAppVerificationError.launchFailed)
+                }
+            }
+        }
+    }
+
     private static func verifyProcessingFixture(
         appURL: URL,
         projectURL: URL,
@@ -411,7 +431,7 @@ public enum PackagedAppVerifier {
         harnessHome: URL,
         screenshotDirectory: URL
     ) async throws -> ProcessingVerification {
-        let running = try await NSWorkspace.shared.openApplication(
+        let running = try await launchApplication(
             at: appURL,
             configuration: appConfiguration(
                 scenario: scenario,
