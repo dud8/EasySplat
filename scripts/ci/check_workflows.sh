@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Source-contract assertions intentionally match literal shell and Actions expressions.
-# shellcheck disable=SC2016
+# shellcheck disable=SC1003,SC2016
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
