@@ -354,7 +354,7 @@ extension AppModel {
             }
             let fallbackMessage: String
             if statusTitle == "Preparing tools" {
-                fallbackMessage = "Couldn’t prepare the required tools. Check your connection and try again."
+                fallbackMessage = toolchainPreparationFailureMessage(for: error)
             } else if currentProjectURL == nil {
                 fallbackMessage = "Couldn’t create the project. Check free space and folder permissions."
             } else {
@@ -365,11 +365,7 @@ extension AppModel {
                 lastError = failureMessage
             }
             persistProjectFailure(failureMessage, at: currentProjectURL)
-            let envDetails = """
-            Underlying error: \(String(reflecting: error))
-            Manifest URL: \(AppConfig.toolchainManifestURL.absoluteString)
-            Public key present: \(!AppConfig.toolchainPublicKeyBase64.isEmpty)
-            """
+            let envDetails = failureTechnicalDetails(for: error)
             if let existing = errorDetails, !existing.isEmpty {
                 errorDetails = existing + "\n\n" + envDetails
             } else {
@@ -545,7 +541,7 @@ extension AppModel {
             }
             let fallbackMessage: String
             if statusTitle == "Preparing tools" {
-                fallbackMessage = "Couldn’t prepare the required tools. Check your connection and try again."
+                fallbackMessage = toolchainPreparationFailureMessage(for: error)
             } else if runnerStarted {
                 fallbackMessage = "Processing stopped. Try again."
             } else {
@@ -558,11 +554,7 @@ extension AppModel {
             if runnerStarted {
                 persistProjectFailure(failureMessage, at: currentProjectURL)
             }
-            let envDetails = """
-            Underlying error: \(String(reflecting: error))
-            Manifest URL: \(AppConfig.toolchainManifestURL.absoluteString)
-            Public key present: \(!AppConfig.toolchainPublicKeyBase64.isEmpty)
-            """
+            let envDetails = failureTechnicalDetails(for: error)
             if let existing = errorDetails, !existing.isEmpty {
                 errorDetails = existing + "\n\n" + envDetails
             } else {
@@ -582,6 +574,27 @@ extension AppModel {
             viewState = .processing
             refreshProjectSummaries()
         }
+    }
+
+    private func toolchainPreparationFailureMessage(for error: Error) -> String {
+        if let toolchainError = error as? ToolchainManager.ToolchainError,
+           case .manifestHTTPFailure(let statusCode, _) = toolchainError,
+           statusCode == 404 || statusCode == 410 {
+            return "The tools for this EasySplat build aren’t available. Download the latest EasySplat release or try again later."
+        }
+        return "Couldn’t prepare the required tools. Check your connection and try again."
+    }
+
+    private func failureTechnicalDetails(for error: Error) -> String {
+        var lines = ["Underlying error: \(String(reflecting: error))"]
+        if let toolchainError = error as? ToolchainManager.ToolchainError,
+           case .manifestHTTPFailure(let statusCode, let resourceURL) = toolchainError {
+            lines.append("HTTP status: \(statusCode)")
+            lines.append("HTTP resource: \(resourceURL.absoluteString)")
+        }
+        lines.append("Manifest URL: \(AppConfig.toolchainManifestURL.absoluteString)")
+        lines.append("Public key present: \(!AppConfig.toolchainPublicKeyBase64.isEmpty)")
+        return lines.joined(separator: "\n")
     }
 
     func reset() {

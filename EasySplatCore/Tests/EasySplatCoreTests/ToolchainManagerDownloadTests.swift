@@ -649,32 +649,94 @@ final class ToolchainManagerDownloadTests: XCTestCase {
         }
     }
 
-    func testDownloadManifestRejectsNon200() async {
-        await withEnvironmentAsync(["EASYSPLAT_LOCAL_TOOLCHAIN_ROOT": nil]) {
+    func testDownloadManifestPreservesMissingReleaseStatusWithoutRetrying() async {
+        for expectedStatus in [404, 410] {
             let token = UUID().uuidString
             let manifestURL = tokenizedURL("https://example.com/manifest.json", token: token)
+            let requests = LockedCounter()
             MockURLProtocol.register(token: token) { request in
-                let response = HTTPURLResponse(url: request.url!, statusCode: 404, httpVersion: nil, headerFields: nil)!
+                _ = requests.increment()
+                let response = HTTPURLResponse(
+                    url: request.url!,
+                    statusCode: expectedStatus,
+                    httpVersion: nil,
+                    headerFields: nil
+                )!
                 return (response, Data())
             }
-            defer { MockURLProtocol.unregister(token: token) }
 
             let manager = ToolchainManager(
                 runner: MockSubprocessRunner(scripts: []),
                 urlSession: makeSession()
             )
             await XCTAssertThrowsErrorAsync({
-                _ = try await manager.ensureToolchain(
-                    manifestURL: manifestURL,
-                    publicKeyBase64: "ignored",
-                    request: ToolchainCapabilityRequest(capabilities: [.da3Base, .da3Small]),
-                    onProgress: { _, _ in }
-                )
+                _ = try await manager.downloadManifest(url: manifestURL)
             }, errorHandler: { error in
-                guard case ToolchainManager.ToolchainError.downloadFailed = error else {
-                    return XCTFail("Expected downloadFailed error, got \(error)")
+                guard case let ToolchainManager.ToolchainError.manifestHTTPFailure(statusCode, resourceURL) = error else {
+                    return XCTFail("Expected manifestHTTPFailure error, got \(error)")
                 }
+                XCTAssertEqual(statusCode, expectedStatus)
+                XCTAssertEqual(resourceURL, manifestURL)
             })
+            XCTAssertEqual(requests.current(), 1)
+            MockURLProtocol.unregister(token: token)
+        }
+    }
+
+    func testDownloadManifestRetriesTransientHTTPFailure() async throws {
+        let signed = try minimalSignedManifest()
+        let token = UUID().uuidString
+        let manifestURL = tokenizedURL("https://example.com/manifest.json", token: token)
+        let requests = LockedCounter()
+        MockURLProtocol.register(token: token) { request in
+            let attempt = requests.increment()
+            let statusCode = attempt < 3 ? 503 : 200
+            let response = HTTPURLResponse(
+                url: request.url!,
+                statusCode: statusCode,
+                httpVersion: nil,
+                headerFields: nil
+            )!
+            return (response, statusCode == 200 ? signed.data : Data())
+        }
+        defer { MockURLProtocol.unregister(token: token) }
+
+        let manager = ToolchainManager(
+            runner: MockSubprocessRunner(scripts: []),
+            urlSession: makeSession()
+        )
+
+        let manifest = try await manager.downloadManifest(url: manifestURL)
+
+        XCTAssertEqual(manifest.version, signed.manifest.version)
+        XCTAssertEqual(requests.current(), 3)
+    }
+
+    func testManifestHTTPRetryAndOfflineFallbackPolicy() {
+        let manager = ToolchainManager(
+            runner: MockSubprocessRunner(scripts: []),
+            urlSession: makeSession()
+        )
+        let resourceURL = URL(string: "https://example.com/manifest.json")!
+
+        for statusCode in [408, 429, 500, 503, 599] {
+            XCTAssertTrue(
+                manager.isTransientRetryable(
+                    ToolchainManager.ToolchainError.manifestHTTPFailure(
+                        statusCode: statusCode,
+                        resourceURL: resourceURL
+                    )
+                ),
+                "HTTP \(statusCode) should be retried"
+            )
+        }
+        for statusCode in [400, 404, 410, 499] {
+            let error = ToolchainManager.ToolchainError.manifestHTTPFailure(
+                statusCode: statusCode,
+                resourceURL: resourceURL
+            )
+            XCTAssertFalse(manager.isTransientRetryable(error), "HTTP \(statusCode) must not be retried")
+            XCTAssertTrue(manager.shouldAttemptOfflineFallback(forManifestError: error))
         }
     }
 
@@ -1946,7 +2008,7 @@ final class ToolchainManagerDownloadTests: XCTestCase {
             ),
             .init(
                 path: fixture.colmap.path,
-                argsPrefix: ["global_mapper"],
+                argsPrefix: ["mapper"],
                 result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""),
                 onRun: nil
             ),

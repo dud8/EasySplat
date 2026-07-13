@@ -4,7 +4,7 @@ extension ToolchainManager {
     func shouldAttemptOfflineFallback(forManifestError error: Error) -> Bool {
         if let toolchainError = error as? ToolchainError {
             switch toolchainError {
-            case .downloadFailed:
+            case .downloadFailed, .manifestHTTPFailure:
                 return true
             default:
                 return false

@@ -114,6 +114,7 @@ public final class ToolchainManager: @unchecked Sendable, ToolchainManaging {
         case signatureFailed
         case artifactNotFound
         case downloadFailed
+        case manifestHTTPFailure(statusCode: Int, resourceURL: URL)
         case manifestTooLarge(maximumBytes: Int)
         case hashMismatch
         case unzipFailed
@@ -135,6 +136,8 @@ public final class ToolchainManager: @unchecked Sendable, ToolchainManaging {
                 return "Toolchain artifact not found for this Mac."
             case .downloadFailed:
                 return "Failed to download the toolchain."
+            case .manifestHTTPFailure(let statusCode, let resourceURL):
+                return "Toolchain manifest request failed with HTTP \(statusCode): \(resourceURL.absoluteString)"
             case .manifestTooLarge(let maximumBytes):
                 return "Toolchain manifest exceeds the \(maximumBytes)-byte download limit."
             case .hashMismatch:

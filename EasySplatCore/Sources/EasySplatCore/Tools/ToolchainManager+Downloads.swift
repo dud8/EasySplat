@@ -88,9 +88,26 @@ extension ToolchainManager {
             didReceive response: URLResponse,
             completionHandler: @escaping (URLSession.ResponseDisposition) -> Void
         ) {
-            guard let http = response as? HTTPURLResponse, http.statusCode == 200 else {
+            guard let http = response as? HTTPURLResponse else {
                 completionHandler(.cancel)
                 finish(with: ToolchainError.downloadFailed)
+                return
+            }
+            guard http.statusCode == 200 else {
+                completionHandler(.cancel)
+                let resourceURL = http.url
+                    ?? dataTask.currentRequest?.url
+                    ?? dataTask.originalRequest?.url
+                if let resourceURL {
+                    finish(
+                        with: ToolchainError.manifestHTTPFailure(
+                            statusCode: http.statusCode,
+                            resourceURL: resourceURL
+                        )
+                    )
+                } else {
+                    finish(with: ToolchainError.downloadFailed)
+                }
                 return
             }
 
@@ -491,6 +508,8 @@ extension ToolchainManager {
             switch toolchainError {
             case .downloadFailed:
                 return true
+            case .manifestHTTPFailure(let statusCode, _):
+                return statusCode == 408 || statusCode == 429 || (500...599).contains(statusCode)
             default:
                 return false
             }

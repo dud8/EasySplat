@@ -1066,9 +1066,15 @@ final class AppModelTests: XCTestCase {
         try Data("geometry".utf8).write(to: geometrySentinel, options: [.atomic])
         try Data("training".utf8).write(to: trainingSentinel, options: [.atomic])
         let metadataBefore = try Data(contentsOf: paths.metadataURL)
+        let missingManifestURL = URL(
+            string: "https://github.com/dud8/EasySplat/releases/download/toolchain-v2.0.0/manifest.json"
+        )!
 
         let model = AppModel(
-            toolchainManager: FailingToolchainManager(message: "manifest unreachable"),
+            toolchainManager: MissingManifestToolchainManager(
+                statusCode: 410,
+                resourceURL: missingManifestURL
+            ),
             projectBaseURL: tempBase,
             hardwareProfile: standardHardwareProfile
         ) { _, _ in
@@ -1080,9 +1086,12 @@ final class AppModelTests: XCTestCase {
 
         XCTAssertEqual(
             model.lastError,
-            "Couldn’t prepare the required tools. Check your connection and try again."
+            "The tools for this EasySplat build aren’t available. Download the latest EasySplat release or try again later."
         )
-        XCTAssertTrue(model.errorDetails?.contains("manifest unreachable") == true)
+        let errorDetails = try XCTUnwrap(model.errorDetails)
+        XCTAssertTrue(errorDetails.contains("HTTP status: 410"))
+        XCTAssertTrue(errorDetails.contains("HTTP resource: \(missingManifestURL.absoluteString)"))
+        XCTAssertTrue(errorDetails.contains("Manifest URL: \(AppConfig.toolchainManifestURL.absoluteString)"))
         XCTAssertEqual(
             model.statusDetail,
             "The saved project and its checkpoint are unchanged."
@@ -1321,6 +1330,42 @@ final class AppModelTests: XCTestCase {
             includingPropertiesForKeys: nil
         ).filter { $0.pathExtension == "easysplatproj" }
         XCTAssertTrue(projectBundles.isEmpty)
+    }
+
+    func testStartProjectMissingToolchainReleaseExplainsUnavailableBuild() async throws {
+        let tempBase = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: tempBase) }
+        try FileManager.default.createDirectory(at: tempBase, withIntermediateDirectories: true)
+        let input = tempBase.appendingPathComponent("input.mov")
+        try Data("video".utf8).write(to: input)
+        let missingManifestURL = URL(
+            string: "https://github.com/dud8/EasySplat/releases/download/toolchain-v2.0.0/manifest.json"
+        )!
+        let model = AppModel(
+            toolchainManager: MissingManifestToolchainManager(
+                statusCode: 404,
+                resourceURL: missingManifestURL
+            ),
+            projectBaseURL: tempBase,
+            hardwareProfile: standardHardwareProfile
+        ) { _, _ in
+            XCTFail("Pipeline runner should not start when the toolchain release is missing.")
+            return BlockingPipelineRunner()
+        }
+
+        await model.startProject(input: .video(files: [input.path]), title: "MissingTools")
+
+        XCTAssertEqual(
+            model.lastError,
+            "The tools for this EasySplat build aren’t available. Download the latest EasySplat release or try again later."
+        )
+        let errorDetails = try XCTUnwrap(model.errorDetails)
+        XCTAssertTrue(errorDetails.contains("HTTP status: 404"))
+        XCTAssertTrue(errorDetails.contains("HTTP resource: \(missingManifestURL.absoluteString)"))
+        XCTAssertTrue(errorDetails.contains("Manifest URL: \(AppConfig.toolchainManifestURL.absoluteString)"))
+        XCTAssertNil(model.currentProjectURL)
+        XCTAssertTrue(model.projectSummaries.isEmpty)
     }
 
     func testContinuousMultipleClipsFailsBeforeToolchainOrProjectCreation() async throws {
@@ -2810,6 +2855,23 @@ struct FailingToolchainManager: ToolchainManaging {
         onProgress: @escaping @Sendable (Double, String) -> Void
     ) async throws -> ToolchainPaths {
         throw NSError(domain: "FailingToolchainManager", code: 1, userInfo: [NSLocalizedDescriptionKey: message])
+    }
+}
+
+struct MissingManifestToolchainManager: ToolchainManaging {
+    var statusCode: Int
+    var resourceURL: URL
+
+    func ensureToolchain(
+        manifestURL: URL,
+        publicKeyBase64: String,
+        request: ToolchainCapabilityRequest,
+        onProgress: @escaping @Sendable (Double, String) -> Void
+    ) async throws -> ToolchainPaths {
+        throw ToolchainManager.ToolchainError.manifestHTTPFailure(
+            statusCode: statusCode,
+            resourceURL: resourceURL
+        )
     }
 }
 
