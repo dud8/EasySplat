@@ -351,14 +351,27 @@ fi
 
 validate_jsonl() {
   local jsonl="$1"
-  local line_file="$negative_dir/line.json"
-  local expected_sequence=1
-  while IFS= read -r line; do
-    printf '%s\n' "$line" >"$line_file"
-    /usr/bin/plutil -p "$line_file" >/dev/null || fail "stdout contains a non-JSONL line: $line"
-    grep -Fq "\"sequence\":$expected_sequence" "$line_file" || fail "JSONL sequence is not monotonic at $expected_sequence"
-    expected_sequence=$((expected_sequence + 1))
-  done <"$jsonl"
+  python3 - "$jsonl" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+
+def reject_constant(value):
+    raise ValueError(f"non-finite JSON constant: {value}")
+
+
+lines = Path(sys.argv[1]).read_text(encoding="utf-8").splitlines()
+for expected_sequence, line in enumerate(lines, start=1):
+    try:
+        record = json.loads(line, parse_constant=reject_constant)
+    except (TypeError, ValueError) as exc:
+        raise SystemExit(f"stdout contains a non-JSONL line: {exc}") from exc
+    if not isinstance(record, dict):
+        raise SystemExit(f"JSONL record {expected_sequence} is not an object")
+    if record.get("sequence") != expected_sequence:
+        raise SystemExit(f"JSONL sequence is not monotonic at {expected_sequence}")
+PY
 }
 
 validate_training_events() {
@@ -455,14 +468,17 @@ while IFS=$'\t' read -r fixture_name expected_points; do
   training_fixture="$fixture_root/$fixture_name"
   training_dir="$negative_dir/training-$fixture_name"
   mkdir -p "$training_dir"
-"$BIN" \
+  if ! "$BIN" \
     --dataset "$training_fixture" \
     --output "$training_dir/splat.ply" \
     --profile fast \
     --checkpoint "$training_dir/checkpoint" \
     --seed 42 \
     --events-fd 1 \
-    >"$training_dir/events.jsonl" 2>"$training_dir/stderr.log"
+    >"$training_dir/events.jsonl" 2>"$training_dir/stderr.log"; then
+    sed -n '1,200p' "$training_dir/stderr.log" >&2
+    fail "$fixture_name training failed"
+  fi
   validate_jsonl "$training_dir/events.jsonl"
   validate_training_events "$training_dir/events.jsonl" "$expected_points"
   [ -s "$training_dir/splat.ply" ] || fail "Fast-profile training did not atomically publish a nonempty PLY"
