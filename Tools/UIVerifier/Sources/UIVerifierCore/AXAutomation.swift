@@ -308,17 +308,19 @@ final class AXApplicationController {
     }
 
     func performViewerShortcutGroup(_ group: ViewerShortcutGroup) async throws {
-        let commands: [(CGKeyCode, CGEventFlags)] = switch group {
+        let commands: [(CGKeyCode, CGEventFlags)]
+        switch group {
         case .orbitPanZoom:
-            Array(repeating: (CGKeyCode(124), CGEventFlags()), count: 8)
-                + Array(repeating: (CGKeyCode(126), CGEventFlags()), count: 4)
-                + Array(repeating: (CGKeyCode(124), CGEventFlags.maskAlternate), count: 5)
-                + Array(repeating: (CGKeyCode(126), CGEventFlags.maskAlternate), count: 3)
-                + Array(repeating: (CGKeyCode(24), CGEventFlags.maskShift), count: 4)
+            var sequence = Array(repeating: (CGKeyCode(124), CGEventFlags()), count: 8)
+            sequence.append(contentsOf: Array(repeating: (CGKeyCode(126), CGEventFlags()), count: 4))
+            sequence.append(contentsOf: Array(repeating: (CGKeyCode(124), CGEventFlags.maskAlternate), count: 5))
+            sequence.append(contentsOf: Array(repeating: (CGKeyCode(126), CGEventFlags.maskAlternate), count: 3))
+            sequence.append(contentsOf: Array(repeating: (CGKeyCode(24), CGEventFlags.maskShift), count: 4))
+            commands = sequence
         case .fit:
-            [(CGKeyCode(3), CGEventFlags())]
+            commands = [(CGKeyCode(3), CGEventFlags())]
         case .reset:
-            [(CGKeyCode(15), CGEventFlags())]
+            commands = [(CGKeyCode(15), CGEventFlags())]
         }
         for (keyCode, flags) in commands {
             try sendKey(keyCode, flags: flags)
