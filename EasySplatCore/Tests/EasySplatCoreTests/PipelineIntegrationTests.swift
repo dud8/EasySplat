@@ -12,7 +12,11 @@ final class PipelineIntegrationTests: XCTestCase {
         candidateRoute: SfmBackend? = nil,
         skipTraining: Bool = false,
         stopAfterStage: PipelineStage? = nil,
-        hardwareProfile: HardwareProfile? = nil
+        hardwareProfile: HardwareProfile? = HardwareProfile(
+            memoryGB: 48,
+            cpuCount: 16,
+            gpuWorkingSetGB: 36
+        )
     ) -> PipelineRunner.PipelineConfig {
         PipelineRunner.PipelineConfig(
             toolchain: toolchain,

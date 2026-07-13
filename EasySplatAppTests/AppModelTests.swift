@@ -11,10 +11,20 @@ import XCTest
 
 @MainActor
 final class AppModelTests: XCTestCase {
+    private let standardHardwareProfile = HardwareProfile(
+        memoryGB: 48,
+        cpuCount: 16,
+        gpuWorkingSetGB: 36
+    )
+
     func testRequestedRunOptionsUseProfessionalDefaults() {
         let base = FileManager.default.temporaryDirectory
             .appendingPathComponent(UUID().uuidString, isDirectory: true)
-        let model = AppModel(toolchainManager: MockToolchainManager(), projectBaseURL: base) { url, config in
+        let model = AppModel(
+            toolchainManager: MockToolchainManager(),
+            projectBaseURL: base,
+            hardwareProfile: standardHardwareProfile
+        ) { url, config in
             MockPipelineRunner(projectURL: url, config: config)
         }
 
@@ -334,7 +344,11 @@ final class AppModelTests: XCTestCase {
         let input = tempBase.appendingPathComponent("clip.mov")
         try Data("video".utf8).write(to: input)
 
-        let model = AppModel(toolchainManager: MockToolchainManager(), projectBaseURL: tempBase) { _, _ in
+        let model = AppModel(
+            toolchainManager: MockToolchainManager(),
+            projectBaseURL: tempBase,
+            hardwareProfile: standardHardwareProfile
+        ) { _, _ in
             BlockingPipelineRunner()
         }
         model.requestedRunOptions.capturePath = .walkthrough
@@ -692,7 +706,11 @@ final class AppModelTests: XCTestCase {
 
         let toolchainManager = CapabilityRecordingToolchainManager()
         var runnerPlan: ResolvedRunPlan?
-        let model = AppModel(toolchainManager: toolchainManager, projectBaseURL: tempBase) { projectURL, config in
+        let model = AppModel(
+            toolchainManager: toolchainManager,
+            projectBaseURL: tempBase,
+            hardwareProfile: standardHardwareProfile
+        ) { projectURL, config in
             runnerPlan = config.resolvedRunPlan
             return MockPipelineRunner(projectURL: projectURL, config: config)
         }
@@ -803,7 +821,11 @@ final class AppModelTests: XCTestCase {
             stage: .sfmFeatures
         )
 
-        let model = AppModel(toolchainManager: MockToolchainManager(), projectBaseURL: tempBase) { _, _ in
+        let model = AppModel(
+            toolchainManager: MockToolchainManager(),
+            projectBaseURL: tempBase,
+            hardwareProfile: standardHardwareProfile
+        ) { _, _ in
             BlockingPipelineRunner()
         }
         model.refreshProjectSummaries()
@@ -1039,7 +1061,8 @@ final class AppModelTests: XCTestCase {
 
         let model = AppModel(
             toolchainManager: FailingToolchainManager(message: "manifest unreachable"),
-            projectBaseURL: tempBase
+            projectBaseURL: tempBase,
+            hardwareProfile: standardHardwareProfile
         ) { _, _ in
             XCTFail("Pipeline runner must not start when resume tool setup fails.")
             return BlockingPipelineRunner()
@@ -1187,7 +1210,8 @@ final class AppModelTests: XCTestCase {
 
         let model = AppModel(
             toolchainManager: MockToolchainManager(),
-            projectBaseURL: tempBase
+            projectBaseURL: tempBase,
+            hardwareProfile: standardHardwareProfile
         ) { projectURL, config in
             capturedPlan = config.resolvedRunPlan
             return MockPipelineRunner(projectURL: projectURL, config: config)
@@ -1467,7 +1491,8 @@ final class AppModelTests: XCTestCase {
         let started = expectation(description: "resumed training started")
         let model = AppModel(
             toolchainManager: MockToolchainManager(),
-            projectBaseURL: tempBase
+            projectBaseURL: tempBase,
+            hardwareProfile: standardHardwareProfile
         ) { _, _ in
             StopFailingPipelineRunner(started: started, stage: .trainSplat)
         }
@@ -1615,7 +1640,11 @@ final class AppModelTests: XCTestCase {
         try ProjectMetadataStore.save(metadata, to: paths.metadataURL)
 
         let runner = DirectoryOutputRepairingPipelineRunner(projectURL: projectURL)
-        let model = AppModel(toolchainManager: MockToolchainManager(), projectBaseURL: tempBase) { _, _ in
+        let model = AppModel(
+            toolchainManager: MockToolchainManager(),
+            projectBaseURL: tempBase,
+            hardwareProfile: standardHardwareProfile
+        ) { _, _ in
             runner
         }
 
@@ -1649,7 +1678,11 @@ final class AppModelTests: XCTestCase {
         try ProjectMetadataStore.save(metadata, to: paths.metadataURL)
 
         let runner = DirectoryOutputRepairingPipelineRunner(projectURL: projectURL)
-        let model = AppModel(toolchainManager: MockToolchainManager(), projectBaseURL: tempBase) { _, _ in
+        let model = AppModel(
+            toolchainManager: MockToolchainManager(),
+            projectBaseURL: tempBase,
+            hardwareProfile: standardHardwareProfile
+        ) { _, _ in
             runner
         }
 
@@ -1667,7 +1700,11 @@ final class AppModelTests: XCTestCase {
         let firstURL = try makeProject(at: tempBase, name: "First", lastError: nil, withOutput: false)
         let secondURL = try makeProject(at: tempBase, name: "Second", lastError: nil, withOutput: false)
         var callCount = 0
-        let model = AppModel(toolchainManager: MockToolchainManager(), projectBaseURL: tempBase) { _, _ in
+        let model = AppModel(
+            toolchainManager: MockToolchainManager(),
+            projectBaseURL: tempBase,
+            hardwareProfile: standardHardwareProfile
+        ) { _, _ in
             callCount += 1
             return BlockingPipelineRunner()
         }
