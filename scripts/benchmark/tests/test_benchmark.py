@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib.util
+import hashlib
 import io
 import json
 import os
@@ -17,6 +18,8 @@ if SPEC is None or SPEC.loader is None:
     raise RuntimeError(f"Cannot load benchmark module at {MODULE_PATH}")
 benchmark = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(benchmark)
+evidence = benchmark.evidence
+from scripts.benchmark import run_lane as lane_runner
 
 
 def measured(value: object) -> dict[str, object]:
@@ -30,7 +33,7 @@ def unavailable() -> dict[str, object]:
 def valid_scene(
     scene_id: str = "orbit-01",
     category: str = "object_orbit",
-    adapter: str = "external-result",
+    adapter: str = "fixture",
 ) -> dict[str, object]:
     return {
         "id": scene_id,
@@ -57,10 +60,17 @@ def valid_scene(
             "rendering_reference": False,
         },
         "expected_outcome": {"kind": "valid"},
-        "adapter": {
-            "type": adapter,
-            "result_path": f"external/{scene_id}.result.json",
-        },
+        "adapter": (
+            {
+                "type": "protected-evidence",
+                "evidence_path": f"external/{scene_id}.evidence",
+            }
+            if adapter == "protected-evidence"
+            else {
+                "type": "fixture",
+                "result_path": f"external/{scene_id}.result.json",
+            }
+        ),
     }
 
 
@@ -84,7 +94,7 @@ def release_corpus() -> dict[str, object]:
     scenes: list[dict[str, object]] = []
     for category, count in counts.items():
         for index in range(1, count + 1):
-            scene = valid_scene(f"{category}-{index:02d}", category)
+            scene = valid_scene(f"{category}-{index:02d}", category, "protected-evidence")
             if category == "invalid":
                 scene["expected_outcome"] = {
                     "kind": "invalid",
@@ -131,21 +141,21 @@ def valid_reference_config() -> dict[str, object]:
                 "balanced_speedup_min": 2.0,
                 "constrained_fast_p50_seconds_max": 300.0,
             },
-            "streaming": {"inference_fps_min": 5.0, "sustained_frames_min": 3000},
+            "long_sequence": {"inference_fps_min": 5.0, "sustained_frames_min": 3000},
             "memory": {
                 "eight_gb_fast_bytes_max": 6_500_000_000,
                 "constrained_bytes_max": 12_000_000_000,
                 "larger_fraction_max": 0.75,
             },
-            "stability": {"repeat_runs_min": 50, "crashes_max": 0, "corrupt_outputs_max": 0},
+            "stability": {
+                "repeat_runs_min": 50,
+                "crashes_max": 0,
+                "corrupt_outputs_max": 0,
+                "deterministic_restart_required": True,
+            },
             "toolchain": {
                 "normal_photo_bytes_max": 2_500_000_000,
-                "streaming_bytes_max": 6_000_000_000,
-            },
-            "compatibility": {
-                "finished_v1_opens_required": True,
-                "valid_v1_geometry_retrains_required": True,
-                "deterministic_restart_required": True,
+                "large_area_bytes_max": 2_500_000_000,
             },
         },
     }
@@ -175,8 +185,8 @@ def passing_metrics() -> dict[str, object]:
         "m4_max_p50_seconds": measured(120.0),
         "balanced_geometry_speedup": measured(2.0),
         "constrained_fast_p50_seconds": measured(300.0),
-        "streaming_inference_fps": measured(5.0),
-        "streaming_sustained_frames": measured(3000),
+        "long_sequence_geometry_fps": measured(5.0),
+        "long_sequence_frames": measured(3000),
         "peak_memory_bytes": measured(6_500_000_000),
         "machine_memory_bytes": measured(8_000_000_000),
         "memory_lane": measured("eight_gb_fast"),
@@ -184,9 +194,7 @@ def passing_metrics() -> dict[str, object]:
         "crashes": measured(0),
         "corrupt_outputs": measured(0),
         "normal_photo_toolchain_bytes": measured(2_500_000_000),
-        "streaming_toolchain_bytes": measured(6_000_000_000),
-        "finished_v1_opens": measured(True),
-        "valid_v1_geometry_retrains": measured(True),
+        "large_area_toolchain_bytes": measured(2_500_000_000),
         "deterministic_restart": measured(True),
     }
 
@@ -199,6 +207,145 @@ def successful_actual() -> dict[str, object]:
         "failure_type": None,
         "corrupt_ply": False,
     }
+
+
+def evidence_machine(lane: str) -> dict[str, object]:
+    memory = {
+        evidence.LANE_REFERENCE: 48 * 1024**3,
+        evidence.LANE_CONSTRAINED: 16 * 1024**3,
+        evidence.LANE_EIGHT_GB: 8 * 1024**3,
+    }[lane]
+    return {
+        "architecture": "arm64",
+        "chip": "Apple M4 Max" if lane == evidence.LANE_REFERENCE else "Apple M4",
+        "hardware_model": "Mac16,5",
+        "logical_cpus": 16,
+        "macos_build": "24F74",
+        "macos_version": "15.5",
+        "physical_cpus": 12,
+        "physical_memory_bytes": memory,
+        "swift_version": "Swift 6.1",
+        "xcode_version": "Xcode 16.4",
+    }
+
+
+def runner_identity(lane: str, digest_character: str = "a") -> dict[str, str]:
+    return {
+        "label": evidence.RUNNER_LABELS[lane],
+        "sha256": "sha256:" + digest_character * 64,
+    }
+
+
+def runner_identities() -> dict[str, dict[str, str]]:
+    return {lane: runner_identity(lane) for lane in sorted(evidence.RELEASE_LANES)}
+
+
+def evidence_request(scene_id: str = "orbit-01", scale: int = 30) -> dict[str, object]:
+    return {
+        "schema_version": 1,
+        "binding": {
+            "profile": "release",
+            "scene_id": scene_id,
+            "scale": scale,
+            "input_digest": "sha256:" + "1" * 64,
+            "corpus_digest": "sha256:" + "2" * 64,
+            "thresholds_digest": "sha256:" + "3" * 64,
+            "git_commit": "4" * 40,
+            "app_version": "0.2.0-beta.1",
+            "toolchain_identity": "sha256:" + "5" * 64,
+        },
+        "expected_outcome": {"kind": "valid"},
+        "input_kind": "video",
+    }
+
+
+def raw_observations(lane: str) -> dict[str, object]:
+    observations: dict[str, object] = {
+        "schema_version": 1,
+        "artifacts": {
+            "command_log": "command.jsonl",
+            "stdout_log": "stdout.log",
+            "stderr_log": "stderr.log",
+            "output_ply": "splat.ply",
+        },
+        "commands": [["easysplat-benchmark", "corpus://orbit-01", "toolchain://2.0.0"]],
+        "actual": successful_actual(),
+        "timing": {"candidate_end_to_end_seconds": [100.0]},
+        "memory_bytes": [6_000_000_000],
+    }
+    if lane == evidence.LANE_REFERENCE:
+        observations["artifacts"].update(
+            {
+                "normal_photo_toolchain": "normal-photo.zip",
+                "large_area_toolchain": "large-area.zip",
+            }
+        )
+        observations.update(
+            {
+                "registration": {"candidate": [True] * 30, "colmap": [True] * 30},
+                "residual_pixels": [1.0, 1.5, 2.0],
+                "pose": {
+                    "candidate_ate": [1.0, 1.0],
+                    "colmap_ate": [1.0, 1.0],
+                    "candidate_rotation_rpe_degrees": [0.2],
+                    "colmap_rotation_rpe_degrees": [0.1],
+                    "candidate_translation_rpe_percentage_points": [2.0],
+                    "colmap_translation_rpe_percentage_points": [1.0],
+                },
+                "rendering": {
+                    "balanced": [
+                        {
+                            "candidate_psnr": 29.8,
+                            "reference_psnr": 30.0,
+                            "candidate_ssim": 0.99,
+                            "reference_ssim": 0.995,
+                            "candidate_lpips": 0.05,
+                            "reference_lpips": 0.04,
+                        }
+                    ],
+                    "fast": [
+                        {
+                            "candidate_psnr": 29.5,
+                            "reference_psnr": 30.0,
+                            "candidate_ssim": 0.98,
+                            "reference_ssim": 0.99,
+                            "candidate_lpips": 0.05,
+                            "reference_lpips": 0.04,
+                        }
+                    ],
+                },
+                "timing": {
+                    "candidate_end_to_end_seconds": [100.0],
+                    "baseline_end_to_end_seconds": [250.0],
+                    "candidate_geometry_seconds": [40.0],
+                    "baseline_geometry_seconds": [100.0],
+                    "training_seconds": [60.0],
+                },
+                "long_sequence": {"frames": 3000, "seconds": 500.0},
+                "stability": {
+                    "runs": [{"crashed": False, "corrupt_output": False}] * 50,
+                    "deterministic_restart": [True],
+                },
+            }
+        )
+    elif lane == evidence.LANE_CONSTRAINED:
+        observations["timing"] = {"candidate_end_to_end_seconds": [250.0]}
+        observations["memory_bytes"] = [10_000_000_000]
+    return observations
+
+
+def write_evidence_artifacts(root: Path, observations: dict[str, object]) -> None:
+    root.mkdir(parents=True, exist_ok=True)
+    for name, content in (
+        ("command.jsonl", '{"event":"run"}\n'),
+        ("stdout.log", "complete\n"),
+        ("stderr.log", ""),
+        ("splat.ply", "ply\nformat ascii 1.0\nelement vertex 0\nend_header\n"),
+        ("normal-photo.zip", "photo toolchain"),
+        ("large-area.zip", "large-area toolchain"),
+    ):
+        (root / name).write_text(content, encoding="utf-8")
+    (root / "observations.json").write_bytes(evidence.canonical_json_bytes(observations) + b"\n")
 
 
 def external_envelope(
@@ -246,12 +393,29 @@ class ConfigurationValidationTests(unittest.TestCase):
             all(not any(scene["reference"].values()) for scene in corpus["scenes"]),
             "unsupplied release slots must not claim reference availability",
         )
+        self.assertTrue(
+            all(scene["adapter"]["type"] == "protected-evidence" for scene in corpus["scenes"]),
+            "release slots must never use a metrics fixture or geometry-only adapter",
+        )
 
     def test_result_schema_closes_top_level_and_scene_contracts(self) -> None:
         schema = json.loads((ROOT / "scripts/benchmark/result.schema.json").read_text(encoding="utf-8"))
         self.assertIs(schema["additionalProperties"], False)
         self.assertIs(schema["$defs"]["sceneResult"]["additionalProperties"], False)
         self.assertIs(schema["$defs"]["metrics"]["additionalProperties"], False)
+        boolean_metrics = {
+            name
+            for name, definition in schema["$defs"]["metrics"]["properties"].items()
+            if definition == {"$ref": "#/$defs/booleanMetric"}
+        }
+        self.assertEqual(boolean_metrics, {"deterministic_restart"})
+        evidence_schema = json.loads(
+            (ROOT / "scripts/benchmark/evidence.schema.json").read_text(encoding="utf-8")
+        )
+        self.assertIs(evidence_schema["additionalProperties"], False)
+        self.assertIs(evidence_schema["properties"]["artifacts"]["additionalProperties"]["additionalProperties"], False)
+        self.assertIn("measurement_runner", evidence_schema["required"])
+        self.assertIn("measurement_runner", schema["$defs"]["evidenceRecord"]["required"])
 
     def test_result_schema_reserves_exit_code_130_for_cancellation(self) -> None:
         schema = json.loads((ROOT / "scripts/benchmark/result.schema.json").read_text(encoding="utf-8"))
@@ -324,20 +488,6 @@ class ConfigurationValidationTests(unittest.TestCase):
             benchmark.validate_corpus(corpus, expected_profile="smoke")
 
 
-class TimeParserTests(unittest.TestCase):
-    def test_parses_present_rss_and_footprint(self) -> None:
-        parsed = benchmark.parse_time_l(
-            "  12345  maximum resident set size\n  67890  peak memory footprint\n"
-        )
-        self.assertEqual(parsed["max_resident_set_size_bytes"], 12345)
-        self.assertEqual(parsed["peak_memory_footprint_bytes"], 67890)
-
-    def test_missing_values_remain_unavailable(self) -> None:
-        parsed = benchmark.parse_time_l("no memory metrics here")
-        self.assertEqual(parsed["max_resident_set_size_bytes"], unavailable())
-        self.assertEqual(parsed["peak_memory_footprint_bytes"], unavailable())
-
-
 class GateEvaluationTests(unittest.TestCase):
     def setUp(self) -> None:
         self.thresholds = valid_reference_config()["thresholds"]
@@ -374,15 +524,13 @@ class GateEvaluationTests(unittest.TestCase):
             "m4_max_p50_seconds": measured(120.0001),
             "balanced_geometry_speedup": measured(1.9999),
             "constrained_fast_p50_seconds": measured(300.0001),
-            "streaming_inference_fps": measured(4.9999),
-            "streaming_sustained_frames": measured(2999),
+            "long_sequence_geometry_fps": measured(4.9999),
+            "long_sequence_frames": measured(2999),
             "repeat_runs": measured(49),
             "crashes": measured(1),
             "corrupt_outputs": measured(1),
             "normal_photo_toolchain_bytes": measured(2_500_000_001),
-            "streaming_toolchain_bytes": measured(6_000_000_001),
-            "finished_v1_opens": measured(False),
-            "valid_v1_geometry_retrains": measured(False),
+            "large_area_toolchain_bytes": measured(2_500_000_001),
             "deterministic_restart": measured(False),
         }
         for key, value in misses.items():
@@ -561,6 +709,535 @@ class MetadataAndPersistenceTests(unittest.TestCase):
             self.assertEqual(list(path.parent.glob(".suite.json.*.tmp")), [])
 
 
+class EvidenceProtocolTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.key = b"release-evidence-test-key-material-32-bytes"
+
+    def produce(self, root: Path, lane: str) -> tuple[Path, dict[str, object]]:
+        observations = raw_observations(lane)
+        write_evidence_artifacts(root, observations)
+        output = root / "attestation.json"
+        attestation = evidence.produce_attestation(
+            evidence_request(),
+            observations,
+            root,
+            output,
+            self.key,
+            lane,
+            runner_identity(lane),
+            machine=evidence_machine(lane),
+        )
+        output.write_bytes(evidence.canonical_json_bytes(attestation) + b"\n")
+        return output, attestation
+
+    def test_producer_derives_metrics_from_raw_samples(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            output, attestation = self.produce(Path(directory), evidence.LANE_REFERENCE)
+            metrics = attestation["metrics"]
+            self.assertEqual(metrics["registered_views"], measured(30))
+            self.assertEqual(metrics["repeat_runs"], measured(50))
+            self.assertEqual(metrics["deterministic_restart"], measured(True))
+            self.assertEqual(metrics["m4_max_p50_seconds"], measured(100.0))
+            self.assertEqual(
+                attestation["measurement_runner"],
+                runner_identity(evidence.LANE_REFERENCE),
+            )
+            verified = evidence.verify_attestation(
+                output,
+                evidence_request(),
+                evidence.LANE_REFERENCE,
+                self.key,
+                runner_identity(evidence.LANE_REFERENCE),
+            )
+            self.assertEqual(verified["metrics"], metrics)
+
+    def test_prefilled_metrics_are_rejected_instead_of_trusted(self) -> None:
+        observations = raw_observations(evidence.LANE_REFERENCE)
+        observations["metrics"] = passing_metrics()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            write_evidence_artifacts(root, observations)
+            with self.assertRaisesRegex(evidence.EvidenceError, "unknown metrics"):
+                evidence.produce_attestation(
+                    evidence_request(),
+                    observations,
+                    root,
+                    root / "attestation.json",
+                    self.key,
+                    evidence.LANE_REFERENCE,
+                    runner_identity(evidence.LANE_REFERENCE),
+                    machine=evidence_machine(evidence.LANE_REFERENCE),
+                )
+
+    def test_metric_or_artifact_tampering_breaks_verification(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            output, attestation = self.produce(root, evidence.LANE_REFERENCE)
+            changed = json.loads(json.dumps(attestation))
+            changed["metrics"]["registered_views"] = measured(999)
+            output.write_bytes(evidence.canonical_json_bytes(changed) + b"\n")
+            with self.assertRaisesRegex(evidence.EvidenceError, "signature"):
+                evidence.verify_attestation(
+                    output,
+                    evidence_request(),
+                    evidence.LANE_REFERENCE,
+                    self.key,
+                    runner_identity(evidence.LANE_REFERENCE),
+                )
+            changed = json.loads(json.dumps(attestation))
+            changed["measurement_runner"]["sha256"] = "sha256:" + "f" * 64
+            output.write_bytes(evidence.canonical_json_bytes(changed) + b"\n")
+            with self.assertRaisesRegex(evidence.EvidenceError, "signature"):
+                evidence.verify_attestation(
+                    output,
+                    evidence_request(),
+                    evidence.LANE_REFERENCE,
+                    self.key,
+                    runner_identity(evidence.LANE_REFERENCE),
+                )
+            changed = json.loads(json.dumps(attestation))
+            del changed["measurement_runner"]
+            output.write_bytes(evidence.canonical_json_bytes(changed) + b"\n")
+            with self.assertRaisesRegex(evidence.EvidenceError, "missing measurement_runner"):
+                evidence.verify_attestation(
+                    output,
+                    evidence_request(),
+                    evidence.LANE_REFERENCE,
+                    self.key,
+                    runner_identity(evidence.LANE_REFERENCE),
+                )
+            output.write_bytes(evidence.canonical_json_bytes(attestation) + b"\n")
+            (root / "splat.ply").write_text("ply\nchanged\n", encoding="utf-8")
+            with self.assertRaisesRegex(evidence.EvidenceError, "mismatch"):
+                evidence.verify_attestation(
+                    output,
+                    evidence_request(),
+                    evidence.LANE_REFERENCE,
+                    self.key,
+                    runner_identity(evidence.LANE_REFERENCE),
+                )
+
+    def test_missing_or_malformed_runner_identities_are_rejected(self) -> None:
+        missing = runner_identities()
+        del missing[evidence.LANE_EIGHT_GB]
+        with self.assertRaisesRegex(evidence.EvidenceError, "missing"):
+            evidence.validate_runner_identities(missing)
+        malformed = runner_identities()
+        malformed[evidence.LANE_REFERENCE]["sha256"] = "sha256:" + "A" * 64
+        with self.assertRaisesRegex(evidence.EvidenceError, "SHA-256"):
+            evidence.validate_runner_identities(malformed)
+
+    def test_lane_claim_must_match_real_machine_metadata(self) -> None:
+        observations = raw_observations(evidence.LANE_CONSTRAINED)
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            write_evidence_artifacts(root, observations)
+            with self.assertRaisesRegex(evidence.EvidenceError, "14-16 GiB"):
+                evidence.produce_attestation(
+                    evidence_request(),
+                    observations,
+                    root,
+                    root / "attestation.json",
+                    self.key,
+                    evidence.LANE_CONSTRAINED,
+                    runner_identity(evidence.LANE_CONSTRAINED),
+                    machine=evidence_machine(evidence.LANE_REFERENCE),
+                )
+
+    def test_release_scales_require_reference_and_constrained_attestations(self) -> None:
+        self.assertEqual(
+            benchmark.required_evidence_lanes(250),
+            (evidence.LANE_REFERENCE, evidence.LANE_CONSTRAINED),
+        )
+        self.assertEqual(
+            benchmark.required_evidence_lanes(120),
+            (evidence.LANE_REFERENCE, evidence.LANE_CONSTRAINED, evidence.LANE_EIGHT_GB),
+        )
+
+    def test_suite_accepts_only_complete_verified_multi_machine_evidence(self) -> None:
+        scene = valid_scene(adapter="protected-evidence")
+        scene["input"]["supplied"] = True
+        identity = benchmark.RunIdentity(
+            profile="release",
+            corpus_digest="sha256:" + "2" * 64,
+            thresholds_digest="sha256:" + "3" * 64,
+            git_commit="4" * 40,
+            app_version="0.2.0-beta.1",
+            toolchain_identity="sha256:" + "5" * 64,
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            corpus_root = Path(directory)
+            scale_root = corpus_root / scene["adapter"]["evidence_path"] / "30"
+            for lane in benchmark.required_evidence_lanes(30):
+                root = scale_root / lane
+                observations = raw_observations(lane)
+                write_evidence_artifacts(root, observations)
+                attestation = evidence.produce_attestation(
+                    evidence_request(),
+                    observations,
+                    root,
+                    root / "attestation.json",
+                    self.key,
+                    lane,
+                    runner_identity(lane),
+                    machine=evidence_machine(lane),
+                )
+                (root / "attestation.json").write_bytes(
+                    evidence.canonical_json_bytes(attestation) + b"\n"
+                )
+            result = benchmark._copy_protected_evidence(
+                scene,
+                30,
+                corpus_root,
+                identity,
+                "sha256:" + "1" * 64,
+                self.key,
+                runner_identities(),
+            )
+            self.assertEqual(result["status"], "passed")
+            self.assertEqual(
+                {item["lane"] for item in result["evidence"]},
+                set(benchmark.required_evidence_lanes(30)),
+            )
+            wrong_index_identities = runner_identities()
+            wrong_index_identities[evidence.LANE_REFERENCE] = runner_identity(
+                evidence.LANE_REFERENCE,
+                "f",
+            )
+            wrong_index = benchmark._copy_protected_evidence(
+                scene,
+                30,
+                corpus_root,
+                identity,
+                "sha256:" + "1" * 64,
+                self.key,
+                wrong_index_identities,
+            )
+            self.assertEqual(wrong_index["status"], "failed")
+            self.assertTrue(any("approved request index" in item for item in wrong_index["failures"]))
+            (scale_root / evidence.LANE_CONSTRAINED / "attestation.json").unlink()
+            rejected = benchmark._copy_protected_evidence(
+                scene,
+                30,
+                corpus_root,
+                identity,
+                "sha256:" + "1" * 64,
+                self.key,
+                runner_identities(),
+            )
+            self.assertEqual(rejected["status"], "failed")
+            self.assertTrue(any("constrained" in item for item in rejected["failures"]))
+
+    def test_request_emitter_binds_each_machine_job_to_one_run_identity(self) -> None:
+        scene = valid_scene(adapter="protected-evidence")
+        scene["input"]["supplied"] = True
+        scene["scale_lanes"] = [30]
+        corpus = {"schema_version": 1, "manifest_profile": "release", "scenes": [scene]}
+        identity = benchmark.RunIdentity(
+            profile="release",
+            corpus_digest="sha256:" + "2" * 64,
+            thresholds_digest="sha256:" + "3" * 64,
+            git_commit="4" * 40,
+            app_version="0.2.0-beta.1",
+            toolchain_identity="sha256:" + "5" * 64,
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            corpus_path = root / "corpus.json"
+            media = root / scene["input"]["media_path"]
+            media.parent.mkdir(parents=True)
+            media.write_bytes(b"scene")
+            with (
+                mock.patch.object(
+                    benchmark,
+                    "resolved_toolchain_identity",
+                    return_value=identity.toolchain_identity,
+                ),
+                mock.patch.object(
+                    benchmark,
+                    "collect_git_state",
+                    return_value={"commit": identity.git_commit, "dirty": False},
+                ),
+                mock.patch.object(benchmark, "make_run_identity", return_value=identity),
+            ):
+                index = benchmark.emit_evidence_requests(
+                    corpus,
+                    valid_reference_config(),
+                    corpus_path,
+                    root / "toolchain",
+                    root / "requests",
+                    runner_identities(),
+                )
+            self.assertEqual(len(index["requests"]), 3)
+            self.assertEqual(index["runner_identities"], runner_identities())
+            self.assertEqual(
+                {item["lane"] for item in index["requests"]},
+                set(benchmark.required_evidence_lanes(30)),
+            )
+            for item in index["requests"]:
+                request = json.loads((root / "requests" / item["request"]).read_text(encoding="utf-8"))
+                self.assertEqual(request["binding"]["git_commit"], identity.git_commit)
+                self.assertEqual(request["binding"]["input_digest"], benchmark.digest_input(media))
+            missing_identity_index = json.loads(json.dumps(index))
+            del missing_identity_index["runner_identities"][evidence.LANE_EIGHT_GB]
+            with self.assertRaisesRegex(benchmark.ConfigError, "runner identities"):
+                benchmark.validate_request_index(missing_identity_index, identity, corpus)
+
+    def test_lane_orchestrator_runs_measurement_and_seals_raw_outputs(self) -> None:
+        scene = valid_scene(adapter="protected-evidence")
+        scene["input"]["supplied"] = True
+        scene["scale_lanes"] = [250]
+        corpus = {"schema_version": 1, "manifest_profile": "release", "scenes": [scene]}
+        config = valid_reference_config()
+        identity = benchmark.RunIdentity(
+            profile="release",
+            corpus_digest=benchmark.sha256_json(corpus),
+            thresholds_digest=benchmark.sha256_json(config),
+            git_commit="4" * 40,
+            app_version="0.2.0-beta.1",
+            toolchain_identity="sha256:" + "5" * 64,
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            corpus_path = root / "corpus.json"
+            config_path = root / "reference.json"
+            corpus_path.write_bytes(benchmark.canonical_json_bytes(corpus) + b"\n")
+            config_path.write_bytes(benchmark.canonical_json_bytes(config) + b"\n")
+            media = root / scene["input"]["media_path"]
+            media.parent.mkdir(parents=True)
+            media.write_bytes(b"scene")
+            request = benchmark._evidence_request(
+                scene,
+                250,
+                identity,
+                benchmark.digest_input(media),
+            )
+            requests_root = root / "requests"
+            request_relative = Path("orbit-01/250/constrained_14_16gb.request.json")
+            (requests_root / request_relative).parent.mkdir(parents=True)
+            (requests_root / request_relative).write_bytes(
+                benchmark.canonical_json_bytes(request) + b"\n"
+            )
+            index = {
+                "schema_version": 1,
+                "producer_protocol": evidence.PROTOCOL_VERSION,
+                "producer_version": evidence.PRODUCER_VERSION,
+                "producer_digest": evidence.sha256_file(ROOT / evidence.PRODUCER_RELATIVE_PATH),
+                "corpus_digest": identity.corpus_digest,
+                "thresholds_digest": identity.thresholds_digest,
+                "git_commit": identity.git_commit,
+                "app_version": identity.app_version,
+                "toolchain_identity": identity.toolchain_identity,
+                "requests": [
+                    {
+                        "scene_id": scene["id"],
+                        "scale": 250,
+                        "lane": evidence.LANE_CONSTRAINED,
+                        "request": request_relative.as_posix(),
+                        "media_path": scene["input"]["media_path"],
+                        "evidence_path": scene["adapter"]["evidence_path"],
+                        "producer_command": ["fixture"],
+                    }
+                ],
+            }
+            index_path = requests_root / "index.json"
+            index_path.write_bytes(benchmark.canonical_json_bytes(index) + b"\n")
+            source = root / "runner-source"
+            source.mkdir()
+            observations = raw_observations(evidence.LANE_CONSTRAINED)
+            (source / "observations.json").write_bytes(
+                evidence.canonical_json_bytes(observations) + b"\n"
+            )
+            (source / "splat.ply").write_text(
+                "ply\nformat ascii 1.0\nelement vertex 0\nend_header\n",
+                encoding="utf-8",
+            )
+            runner = root / "measurement-runner"
+            runner.write_text(
+                "#!/usr/bin/env python3\n"
+                "import argparse, os, pathlib, shutil\n"
+                "p=argparse.ArgumentParser()\n"
+                "p.add_argument('--request'); p.add_argument('--input'); p.add_argument('--toolchain-root')\n"
+                "p.add_argument('--artifact-root'); p.add_argument('--lane'); a=p.parse_args()\n"
+                "source=pathlib.Path(os.environ['EASYSPLAT_TEST_OBSERVATIONS'])\n"
+                "root=pathlib.Path(a.artifact_root)\n"
+                "shutil.copy2(source/'observations.json', root/'observations.json')\n"
+                "shutil.copy2(source/'splat.ply', root/'splat.ply')\n",
+                encoding="utf-8",
+            )
+            runner.chmod(0o755)
+            approved_runners = runner_identities()
+            approved_runners[evidence.LANE_CONSTRAINED] = {
+                "label": evidence.RUNNER_LABELS[evidence.LANE_CONSTRAINED],
+                "sha256": evidence.sha256_file(runner),
+            }
+            reference_request = Path("orbit-01/250/reference_m4_max.request.json")
+            (requests_root / reference_request).write_bytes(
+                benchmark.canonical_json_bytes(request) + b"\n"
+            )
+            index["runner_identities"] = approved_runners
+            index["requests"].append(
+                {
+                    "scene_id": scene["id"],
+                    "scale": 250,
+                    "lane": evidence.LANE_REFERENCE,
+                    "request": reference_request.as_posix(),
+                    "media_path": scene["input"]["media_path"],
+                    "evidence_path": scene["adapter"]["evidence_path"],
+                    "producer_command": ["fixture"],
+                }
+            )
+            index_path.write_bytes(benchmark.canonical_json_bytes(index) + b"\n")
+            toolchain = root / "toolchain"
+            toolchain.mkdir()
+            (toolchain / "manifest.json").write_text("{}\n", encoding="utf-8")
+            key_path = root / "evidence.key"
+            key_path.write_bytes(self.key)
+            with (
+                mock.patch.object(lane_runner.benchmark, "validate_corpus"),
+                mock.patch.object(
+                    lane_runner.benchmark,
+                    "collect_git_state",
+                    return_value={"commit": identity.git_commit, "dirty": False},
+                ),
+                mock.patch.object(
+                    lane_runner.benchmark,
+                    "resolved_toolchain_identity",
+                    return_value=identity.toolchain_identity,
+                ),
+                mock.patch.object(
+                    lane_runner.evidence,
+                    "collect_machine_metadata",
+                    return_value=evidence_machine(evidence.LANE_CONSTRAINED),
+                ),
+                mock.patch.dict(
+                    os.environ,
+                    {"EASYSPLAT_TEST_OBSERVATIONS": str(source)},
+                ),
+            ):
+                result = lane_runner.run_lane(
+                    index_path,
+                    requests_root,
+                    corpus_path,
+                    config_path,
+                    toolchain,
+                    root / "evidence",
+                    evidence.LANE_CONSTRAINED,
+                    runner,
+                    key_path,
+                )
+            self.assertEqual(len(result["attestations"]), 1)
+            attestation_path = (
+                root
+                / "evidence"
+                / scene["adapter"]["evidence_path"]
+                / "250"
+                / evidence.LANE_CONSTRAINED
+                / "attestation.json"
+            )
+            self.assertTrue(attestation_path.is_file())
+            original_runner = runner.read_text(encoding="utf-8")
+            runner.write_text(original_runner + "\n# pre-run mutation\n", encoding="utf-8")
+            with (
+                mock.patch.object(lane_runner.benchmark, "validate_corpus"),
+                mock.patch.object(
+                    lane_runner.benchmark,
+                    "collect_git_state",
+                    return_value={"commit": identity.git_commit, "dirty": False},
+                ),
+                mock.patch.object(
+                    lane_runner.benchmark,
+                    "resolved_toolchain_identity",
+                    return_value=identity.toolchain_identity,
+                ),
+            ):
+                with self.assertRaisesRegex(
+                    lane_runner.benchmark.ConfigError,
+                    "before the first scene",
+                ):
+                    lane_runner.run_lane(
+                        index_path,
+                        requests_root,
+                        corpus_path,
+                        config_path,
+                        toolchain,
+                        root / "evidence",
+                        evidence.LANE_CONSTRAINED,
+                        runner,
+                        key_path,
+                    )
+
+            runner.write_text(
+                original_runner + "\nwith open(__file__, 'a', encoding='utf-8') as handle: handle.write('# mutated')\n",
+                encoding="utf-8",
+            )
+            runner.chmod(0o755)
+            index["runner_identities"][evidence.LANE_CONSTRAINED]["sha256"] = evidence.sha256_file(runner)
+            index_path.write_bytes(benchmark.canonical_json_bytes(index) + b"\n")
+            with (
+                mock.patch.object(lane_runner.benchmark, "validate_corpus"),
+                mock.patch.object(
+                    lane_runner.benchmark,
+                    "collect_git_state",
+                    return_value={"commit": identity.git_commit, "dirty": False},
+                ),
+                mock.patch.object(
+                    lane_runner.benchmark,
+                    "resolved_toolchain_identity",
+                    return_value=identity.toolchain_identity,
+                ),
+                mock.patch.object(
+                    lane_runner.evidence,
+                    "collect_machine_metadata",
+                    return_value=evidence_machine(evidence.LANE_CONSTRAINED),
+                ),
+                mock.patch.dict(
+                    os.environ,
+                    {"EASYSPLAT_TEST_OBSERVATIONS": str(source)},
+                ),
+            ):
+                with self.assertRaisesRegex(
+                    lane_runner.benchmark.ConfigError,
+                    "after subprocess completion",
+                ):
+                    lane_runner.run_lane(
+                        index_path,
+                        requests_root,
+                        corpus_path,
+                        config_path,
+                        toolchain,
+                        root / "evidence",
+                        evidence.LANE_CONSTRAINED,
+                        runner,
+                        key_path,
+                    )
+
+
+class RunnerIntegrityTests(unittest.TestCase):
+    def test_pre_run_digest_mismatch_is_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            runner = Path(directory) / "runner"
+            runner.write_bytes(b"approved")
+            approved = runner_identity(evidence.LANE_REFERENCE, "0")
+            with self.assertRaisesRegex(lane_runner.benchmark.ConfigError, "before the first scene"):
+                lane_runner._verify_runner_digest(runner, approved, "before the first scene")
+
+    def test_runner_mutation_between_or_after_runs_is_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            runner = Path(directory) / "runner"
+            runner.write_bytes(b"approved")
+            approved = {
+                "label": evidence.RUNNER_LABELS[evidence.LANE_CONSTRAINED],
+                "sha256": evidence.sha256_file(runner),
+            }
+            lane_runner._verify_runner_digest(runner, approved, "before subprocess launch")
+            runner.write_bytes(b"mutated")
+            for phase in ("after subprocess completion", "before the next subprocess", "at lane completion"):
+                with self.subTest(phase=phase):
+                    with self.assertRaisesRegex(lane_runner.benchmark.ConfigError, phase):
+                        lane_runner._verify_runner_digest(runner, approved, phase)
+
+
 class OrchestrationTests(unittest.TestCase):
     def test_external_result_is_bound_to_scene_input_build_and_toolchain(self) -> None:
         scene = valid_scene()
@@ -584,7 +1261,7 @@ class OrchestrationTests(unittest.TestCase):
             payload = external_envelope(scene, 30, input_digest, identity)
             result_path.write_bytes(benchmark.canonical_json_bytes(payload) + b"\n")
             self.assertEqual(
-                benchmark._copy_external_result(scene, 30, root, identity)["status"],
+                benchmark._copy_fixture_result(scene, 30, root, identity)["status"],
                 "passed",
             )
             mismatches = {
@@ -602,7 +1279,7 @@ class OrchestrationTests(unittest.TestCase):
                     changed[key] = mismatch
                     result_path.write_bytes(benchmark.canonical_json_bytes(changed) + b"\n")
                     with self.assertRaisesRegex(benchmark.ConfigError, key):
-                        benchmark._copy_external_result(scene, 30, root, identity)
+                        benchmark._copy_fixture_result(scene, 30, root, identity)
 
     def test_failed_cancelled_or_identity_bearing_external_result_cannot_pass(self) -> None:
         scene = valid_scene()
@@ -640,13 +1317,13 @@ class OrchestrationTests(unittest.TestCase):
                     payload = external_envelope(scene, 30, input_digest, identity, actual=actual)
                     result_path.write_bytes(benchmark.canonical_json_bytes(payload) + b"\n")
                     self.assertEqual(
-                        benchmark._copy_external_result(scene, 30, root, identity)["status"],
+                        benchmark._copy_fixture_result(scene, 30, root, identity)["status"],
                         expected_status,
                     )
             payload = external_envelope(scene, 30, input_digest, identity, route="/Users/private/model")
             result_path.write_bytes(benchmark.canonical_json_bytes(payload) + b"\n")
             with self.assertRaisesRegex(benchmark.ConfigError, "route"):
-                benchmark._copy_external_result(scene, 30, root, identity)
+                benchmark._copy_fixture_result(scene, 30, root, identity)
 
             contradictory = {
                 **successful_actual(),
@@ -656,7 +1333,7 @@ class OrchestrationTests(unittest.TestCase):
             payload = external_envelope(scene, 30, input_digest, identity, actual=contradictory)
             result_path.write_bytes(benchmark.canonical_json_bytes(payload) + b"\n")
             with self.assertRaisesRegex(benchmark.ConfigError, "termination"):
-                benchmark._copy_external_result(scene, 30, root, identity)
+                benchmark._copy_fixture_result(scene, 30, root, identity)
 
             payload = external_envelope(scene, 30, input_digest, identity)
             payload["scale_results"]["30"]["artifacts"] = {
@@ -664,21 +1341,77 @@ class OrchestrationTests(unittest.TestCase):
             }
             result_path.write_bytes(benchmark.canonical_json_bytes(payload) + b"\n")
             with self.assertRaisesRegex(benchmark.ConfigError, "artifacts"):
-                benchmark._copy_external_result(scene, 30, root, identity)
+                benchmark._copy_fixture_result(scene, 30, root, identity)
 
-    def test_toolchain_identity_changes_with_installed_content(self) -> None:
+    def test_toolchain_identity_uses_complete_toolchain_manager_install_state(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            (root / "manifest.json").write_text('{"schema":2}\n', encoding="utf-8")
-            binary = root / "bin/colmap"
-            binary.parent.mkdir(parents=True)
-            binary.write_bytes(b"first")
-            first = benchmark.resolved_toolchain_identity(root, "release")
-            binary.write_bytes(b"second")
-            second = benchmark.resolved_toolchain_identity(root, "release")
-        self.assertIsNotNone(first)
-        self.assertIsNotNone(second)
-        self.assertNotEqual(first, second)
+            files = {
+                "bin/colmap": b"colmap",
+                "da3_mps/models/DA3-BASE/model.safetensors": b"base",
+                "da3_mps/models/DA3-SMALL/model.safetensors": b"small",
+            }
+            components = []
+            installed_artifacts = {}
+            for index, (name, path) in enumerate(
+                zip(("macos-arm64-core", "geometry-da3-base", "geometry-da3-small"), files),
+                start=1,
+            ):
+                target = root / path
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_bytes(files[path])
+                digest = hashlib.sha256(files[path]).hexdigest()
+                archive_digest = f"{index}" * 64
+                installed_artifacts[name] = archive_digest
+                components.append(
+                    {
+                        "name": name,
+                        "capabilities": [f"fixture.{name}"],
+                        "url": f"https://example.invalid/{name}.zip",
+                        "sha256": archive_digest,
+                        "sizeBytes": 100 + index,
+                        "expandedSizeBytes": 200 + index,
+                        "contents": [path],
+                        "criticalFileHashes": {path: digest},
+                        "dependencies": [] if index == 1 else ["macos-arm64-core"],
+                        "requirement": "optional" if index == 3 else "required",
+                    }
+                )
+            manifest = {
+                "schemaVersion": 2,
+                "toolchainAPI": 2,
+                "keyID": "a" * 64,
+                "version": "2.0.0",
+                "publishedAt": "2026-07-01T00:00:00Z",
+                "appVersionRange": {"minimum": "0.2.0-beta.1"},
+                "components": components,
+                "signatureEd25519": "c2lnbmF0dXJl",
+            }
+            state = {
+                "schemaVersion": 2,
+                "installedArtifacts": installed_artifacts,
+                "installedCapabilities": sorted(
+                    capability
+                    for component in components
+                    for capability in component["capabilities"]
+                ),
+                "signedManifest": manifest,
+            }
+            (root / ".easysplat_toolchain_state.json").write_text(
+                json.dumps(state),
+                encoding="utf-8",
+            )
+
+            identity = benchmark.resolved_toolchain_identity(root, "release")
+            self.assertRegex(identity or "", r"^sha256:[0-9a-f]{64}$")
+
+            state["installedArtifacts"].pop("geometry-da3-base")
+            (root / ".easysplat_toolchain_state.json").write_text(
+                json.dumps(state),
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(benchmark.ConfigError, "complete component closure"):
+                benchmark.resolved_toolchain_identity(root, "release")
 
     def test_tracked_smoke_fixture_runs_without_a_toolchain(self) -> None:
         config_path = ROOT / "scripts/benchmark/reference-config.json"
@@ -733,6 +1466,7 @@ class OrchestrationTests(unittest.TestCase):
         self.assertTrue(result["blocking_reasons"])
         self.assertTrue(result["missing_requirements"]["media"])
         self.assertIn("toolchain", result["missing_requirements"])
+        self.assertEqual(result["missing_requirements"]["request_index"], "protected request index")
 
     def test_final_suite_validation_rejects_unknown_metrics_and_private_paths(self) -> None:
         config_path = ROOT / "scripts/benchmark/reference-config.json"

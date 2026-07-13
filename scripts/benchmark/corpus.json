@@ -47,7 +47,8 @@
         "kind": "valid"
       },
       "adapter": {
-        "type": "da3"
+        "type": "protected-evidence",
+        "evidence_path": "external/orbit-01/evidence"
       }
     },
     {
@@ -94,7 +95,8 @@
         "kind": "valid"
       },
       "adapter": {
-        "type": "da3"
+        "type": "protected-evidence",
+        "evidence_path": "external/orbit-02/evidence"
       }
     },
     {
@@ -140,7 +142,8 @@
         "kind": "valid"
       },
       "adapter": {
-        "type": "da3"
+        "type": "protected-evidence",
+        "evidence_path": "external/orbit-03/evidence"
       }
     },
     {
@@ -186,7 +189,8 @@
         "kind": "valid"
       },
       "adapter": {
-        "type": "da3"
+        "type": "protected-evidence",
+        "evidence_path": "external/orbit-04/evidence"
       }
     },
     {
@@ -233,7 +237,8 @@
         "kind": "valid"
       },
       "adapter": {
-        "type": "da3"
+        "type": "protected-evidence",
+        "evidence_path": "external/orbit-05/evidence"
       }
     },
     {
@@ -279,7 +284,8 @@
         "kind": "valid"
       },
       "adapter": {
-        "type": "da3"
+        "type": "protected-evidence",
+        "evidence_path": "external/orbit-06/evidence"
       }
     },
     {
@@ -327,7 +333,8 @@
         "kind": "valid"
       },
       "adapter": {
-        "type": "da3"
+        "type": "protected-evidence",
+        "evidence_path": "external/interior-01/evidence"
       }
     },
     {
@@ -373,7 +380,8 @@
         "kind": "valid"
       },
       "adapter": {
-        "type": "da3"
+        "type": "protected-evidence",
+        "evidence_path": "external/interior-02/evidence"
       }
     },
     {
@@ -419,7 +427,8 @@
         "kind": "valid"
       },
       "adapter": {
-        "type": "da3"
+        "type": "protected-evidence",
+        "evidence_path": "external/interior-03/evidence"
       }
     },
     {
@@ -465,7 +474,8 @@
         "kind": "valid"
       },
       "adapter": {
-        "type": "da3"
+        "type": "protected-evidence",
+        "evidence_path": "external/interior-04/evidence"
       }
     },
     {
@@ -511,7 +521,8 @@
         "kind": "valid"
       },
       "adapter": {
-        "type": "da3"
+        "type": "protected-evidence",
+        "evidence_path": "external/interior-05/evidence"
       }
     },
     {
@@ -558,7 +569,8 @@
         "kind": "valid"
       },
       "adapter": {
-        "type": "da3"
+        "type": "protected-evidence",
+        "evidence_path": "external/interior-06/evidence"
       }
     },
     {
@@ -605,8 +617,8 @@
         "kind": "valid"
       },
       "adapter": {
-        "type": "external-result",
-        "result_path": "external/photos-01/reference-result.json"
+        "type": "protected-evidence",
+        "evidence_path": "external/photos-01/evidence"
       }
     },
     {
@@ -652,8 +664,8 @@
         "kind": "valid"
       },
       "adapter": {
-        "type": "external-result",
-        "result_path": "external/photos-02/reference-result.json"
+        "type": "protected-evidence",
+        "evidence_path": "external/photos-02/evidence"
       }
     },
     {
@@ -699,8 +711,8 @@
         "kind": "valid"
       },
       "adapter": {
-        "type": "external-result",
-        "result_path": "external/photos-03/reference-result.json"
+        "type": "protected-evidence",
+        "evidence_path": "external/photos-03/evidence"
       }
     },
     {
@@ -748,8 +760,8 @@
         "kind": "valid"
       },
       "adapter": {
-        "type": "external-result",
-        "result_path": "external/photos-04/reference-result.json"
+        "type": "protected-evidence",
+        "evidence_path": "external/photos-04/evidence"
       }
     },
     {
@@ -796,7 +808,8 @@
         "kind": "valid"
       },
       "adapter": {
-        "type": "da3"
+        "type": "protected-evidence",
+        "evidence_path": "external/exterior-01/evidence"
       }
     },
     {
@@ -842,7 +855,8 @@
         "kind": "valid"
       },
       "adapter": {
-        "type": "da3"
+        "type": "protected-evidence",
+        "evidence_path": "external/exterior-02/evidence"
       }
     },
     {
@@ -888,7 +902,8 @@
         "kind": "valid"
       },
       "adapter": {
-        "type": "da3"
+        "type": "protected-evidence",
+        "evidence_path": "external/exterior-03/evidence"
       }
     },
     {
@@ -937,7 +952,8 @@
         "kind": "valid"
       },
       "adapter": {
-        "type": "da3"
+        "type": "protected-evidence",
+        "evidence_path": "external/exterior-04/evidence"
       }
     },
     {
@@ -984,7 +1000,8 @@
         "kind": "valid"
       },
       "adapter": {
-        "type": "da3"
+        "type": "protected-evidence",
+        "evidence_path": "external/low-light-01/evidence"
       }
     },
     {
@@ -1030,7 +1047,8 @@
         "kind": "valid"
       },
       "adapter": {
-        "type": "da3"
+        "type": "protected-evidence",
+        "evidence_path": "external/low-light-02/evidence"
       }
     },
     {
@@ -1076,7 +1094,8 @@
         "kind": "valid"
       },
       "adapter": {
-        "type": "da3"
+        "type": "protected-evidence",
+        "evidence_path": "external/low-light-03/evidence"
       }
     },
     {
@@ -1123,8 +1142,8 @@
         "failure_type": "disconnected_input"
       },
       "adapter": {
-        "type": "external-result",
-        "result_path": "external/invalid-01/reference-result.json"
+        "type": "protected-evidence",
+        "evidence_path": "external/invalid-01/evidence"
       }
     },
     {
@@ -1171,8 +1190,8 @@
         "failure_type": "multiple_scenes"
       },
       "adapter": {
-        "type": "external-result",
-        "result_path": "external/invalid-02/reference-result.json"
+        "type": "protected-evidence",
+        "evidence_path": "external/invalid-02/evidence"
       }
     },
     {
@@ -1219,8 +1238,8 @@
         "failure_type": "insufficient_overlap"
       },
       "adapter": {
-        "type": "external-result",
-        "result_path": "external/invalid-03/reference-result.json"
+        "type": "protected-evidence",
+        "evidence_path": "external/invalid-03/evidence"
       }
     }
   ]

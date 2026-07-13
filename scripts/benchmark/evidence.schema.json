@@ -1,0 +1,115 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "EasySplat protected benchmark attestation",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "binding",
+    "expected_outcome",
+    "input_kind",
+    "lane",
+    "machine",
+    "producer",
+    "measurement_runner",
+    "commands",
+    "actual",
+    "metrics",
+    "artifacts",
+    "signature"
+  ],
+  "properties": {
+    "schema_version": {"const": 1},
+    "binding": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "profile",
+        "scene_id",
+        "scale",
+        "input_digest",
+        "corpus_digest",
+        "thresholds_digest",
+        "git_commit",
+        "app_version",
+        "toolchain_identity"
+      ],
+      "properties": {
+        "profile": {"const": "release"},
+        "scene_id": {"type": "string", "pattern": "^[a-z0-9][a-z0-9_.-]{0,63}$"},
+        "scale": {"enum": [30, 120, 250, 500, 3000]},
+        "input_digest": {"$ref": "#/$defs/sha256"},
+        "corpus_digest": {"$ref": "#/$defs/sha256"},
+        "thresholds_digest": {"$ref": "#/$defs/sha256"},
+        "git_commit": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
+        "app_version": {"const": "0.2.0-beta.1"},
+        "toolchain_identity": {"$ref": "#/$defs/sha256"}
+      }
+    },
+    "expected_outcome": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind"],
+          "properties": {"kind": {"const": "valid"}}
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind", "failure_type"],
+          "properties": {
+            "kind": {"const": "invalid"},
+            "failure_type": {"type": "string", "pattern": "^[a-z0-9][a-z0-9_.-]{0,63}$"}
+          }
+        }
+      ]
+    },
+    "input_kind": {"enum": ["video", "photos", "mixed"]},
+    "lane": {"enum": ["reference_m4_max", "constrained_14_16gb", "eight_gb_fast"]},
+    "machine": {"$ref": "result.schema.json#/$defs/machine"},
+    "producer": {"$ref": "result.schema.json#/$defs/producer"},
+    "measurement_runner": {"$ref": "result.schema.json#/$defs/measurementRunner"},
+    "commands": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "array",
+        "minItems": 1,
+        "items": {"type": "string", "minLength": 1}
+      }
+    },
+    "actual": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["exit_code", "termination_reason", "cancelled", "failure_type", "corrupt_ply"],
+      "properties": {
+        "exit_code": {"type": ["integer", "null"]},
+        "termination_reason": {"enum": ["exit", "signal", "cancelled", "not_available"]},
+        "cancelled": {"type": "boolean"},
+        "failure_type": {"type": ["string", "null"]},
+        "corrupt_ply": {"type": ["boolean", "null"]}
+      }
+    },
+    "metrics": {"$ref": "result.schema.json#/$defs/metrics"},
+    "artifacts": {
+      "type": "object",
+      "minProperties": 4,
+      "propertyNames": {"pattern": "^[a-z0-9][a-z0-9_.-]{0,63}$"},
+      "additionalProperties": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["path", "sha256", "bytes"],
+        "properties": {
+          "path": {"type": "string", "minLength": 1},
+          "sha256": {"$ref": "#/$defs/sha256"},
+          "bytes": {"type": "integer", "minimum": 0}
+        }
+      }
+    },
+    "signature": {"type": "string", "pattern": "^hmac-sha256:[0-9a-f]{64}$"}
+  },
+  "$defs": {
+    "sha256": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"}
+  }
+}

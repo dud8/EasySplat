@@ -182,8 +182,8 @@
         "m4_max_p50_seconds": {"$ref": "#/$defs/nonnegativeNumberMetric"},
         "balanced_geometry_speedup": {"$ref": "#/$defs/nonnegativeNumberMetric"},
         "constrained_fast_p50_seconds": {"$ref": "#/$defs/nonnegativeNumberMetric"},
-        "streaming_inference_fps": {"$ref": "#/$defs/nonnegativeNumberMetric"},
-        "streaming_sustained_frames": {"$ref": "#/$defs/nonnegativeIntegerMetric"},
+        "long_sequence_geometry_fps": {"$ref": "#/$defs/nonnegativeNumberMetric"},
+        "long_sequence_frames": {"$ref": "#/$defs/nonnegativeIntegerMetric"},
         "peak_memory_bytes": {"$ref": "#/$defs/nonnegativeIntegerMetric"},
         "machine_memory_bytes": {"$ref": "#/$defs/nonnegativeIntegerMetric"},
         "memory_lane": {"$ref": "#/$defs/memoryLaneMetric"},
@@ -191,9 +191,7 @@
         "crashes": {"$ref": "#/$defs/nonnegativeIntegerMetric"},
         "corrupt_outputs": {"$ref": "#/$defs/nonnegativeIntegerMetric"},
         "normal_photo_toolchain_bytes": {"$ref": "#/$defs/nonnegativeIntegerMetric"},
-        "streaming_toolchain_bytes": {"$ref": "#/$defs/nonnegativeIntegerMetric"},
-        "finished_v1_opens": {"$ref": "#/$defs/booleanMetric"},
-        "valid_v1_geometry_retrains": {"$ref": "#/$defs/booleanMetric"},
+        "large_area_toolchain_bytes": {"$ref": "#/$defs/nonnegativeIntegerMetric"},
         "deterministic_restart": {"$ref": "#/$defs/booleanMetric"},
         "wall_time_seconds": {"$ref": "#/$defs/nonnegativeNumberMetric"},
         "geometry_seconds": {"$ref": "#/$defs/nonnegativeNumberMetric"},
@@ -218,12 +216,13 @@
         "exit",
         "command",
         "metrics",
-        "artifacts"
+        "artifacts",
+        "evidence"
       ],
       "properties": {
         "scene_id": {"type": "string", "minLength": 1},
         "scale": {"enum": [30, 120, 250, 500, 3000]},
-        "adapter": {"enum": ["da3", "external-result"]},
+        "adapter": {"enum": ["fixture", "protected-evidence"]},
         "status": {"enum": ["passed", "failed", "blocked"]},
         "blocking_reasons": {"$ref": "#/$defs/stringArray"},
         "failures": {"$ref": "#/$defs/stringArray"},
@@ -299,7 +298,51 @@
           "type": "object",
           "propertyNames": {"pattern": "^[a-z][a-z0-9_]*$"},
           "additionalProperties": {"$ref": "#/$defs/sha256"}
+        },
+        "evidence": {
+          "type": "array",
+          "items": {"$ref": "#/$defs/evidenceRecord"}
         }
+      }
+    },
+    "producer": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["protocol_version", "version", "executable", "sha256"],
+      "properties": {
+        "protocol_version": {"const": 1},
+        "version": {"const": "1.0.0"},
+        "executable": {"const": "scripts/benchmark/evidence_protocol.py"},
+        "sha256": {"$ref": "#/$defs/sha256"}
+      }
+    },
+    "measurementRunner": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["label", "sha256"],
+      "properties": {
+        "label": {
+          "enum": [
+            "reference-measurement-runner",
+            "constrained-measurement-runner",
+            "eight-gb-measurement-runner"
+          ]
+        },
+        "sha256": {"$ref": "#/$defs/sha256"}
+      }
+    },
+    "evidenceRecord": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["lane", "machine", "producer", "measurement_runner", "attestation_digest"],
+      "properties": {
+        "lane": {
+          "enum": ["reference_m4_max", "constrained_14_16gb", "eight_gb_fast"]
+        },
+        "machine": {"$ref": "#/$defs/machine"},
+        "producer": {"$ref": "#/$defs/producer"},
+        "measurement_runner": {"$ref": "#/$defs/measurementRunner"},
+        "attestation_digest": {"$ref": "#/$defs/sha256"}
       }
     },
     "aggregates": {
@@ -363,10 +406,10 @@
     "missingRequirements": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["media", "external_results", "toolchain"],
+      "required": ["media", "evidence", "toolchain", "evidence_key", "request_index"],
       "properties": {
         "media": {"type": "array", "items": {"$ref": "#/$defs/missingRequirement"}},
-        "external_results": {"type": "array", "items": {"$ref": "#/$defs/missingRequirement"}},
+        "evidence": {"type": "array", "items": {"$ref": "#/$defs/missingRequirement"}},
         "toolchain": {
           "oneOf": [
             {"type": "null"},
@@ -380,6 +423,14 @@
               }
             }
           ]
+        },
+        "evidence_key": {
+          "type": ["string", "null"],
+          "enum": [null, "protected evidence key file"]
+        },
+        "request_index": {
+          "type": ["string", "null"],
+          "enum": [null, "protected request index"]
         }
       }
     }

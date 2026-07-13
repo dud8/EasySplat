@@ -43,7 +43,7 @@
       "balanced_speedup_min": 2.0,
       "constrained_fast_p50_seconds_max": 300.0
     },
-    "streaming": {
+    "long_sequence": {
       "inference_fps_min": 5.0,
       "sustained_frames_min": 3000
     },
@@ -55,16 +55,12 @@
     "stability": {
       "repeat_runs_min": 50,
       "crashes_max": 0,
-      "corrupt_outputs_max": 0
+      "corrupt_outputs_max": 0,
+      "deterministic_restart_required": true
     },
     "toolchain": {
       "normal_photo_bytes_max": 2500000000,
-      "streaming_bytes_max": 6000000000
-    },
-    "compatibility": {
-      "finished_v1_opens_required": true,
-      "valid_v1_geometry_retrains_required": true,
-      "deterministic_restart_required": true
+      "large_area_bytes_max": 2500000000
     }
   }
 }

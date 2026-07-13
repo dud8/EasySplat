@@ -13,11 +13,15 @@ import re
 import subprocess
 import sys
 import tempfile
-import time
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
 from typing import Any, Callable, Iterable, Mapping, NamedTuple, TextIO
+
+try:
+    from scripts.benchmark import evidence_protocol as evidence
+except ModuleNotFoundError:
+    import evidence_protocol as evidence
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -38,7 +42,7 @@ RELEASE_CATEGORY_COUNTS = {
     "invalid": 3,
 }
 ALLOWED_SCALE_LANES = {30, 120, 250, 500, 3_000}
-ALLOWED_ADAPTERS = {"da3", "external-result"}
+ALLOWED_ADAPTERS = {"fixture", "protected-evidence"}
 APP_VERSION = "0.2.0-beta.1"
 SHA256_PATTERN = re.compile(r"^sha256:[0-9a-f]{64}$")
 SAFE_TOKEN_PATTERN = re.compile(r"^[a-z0-9][a-z0-9_.-]{0,63}$")
@@ -63,14 +67,14 @@ NONNEGATIVE_INTEGER_METRICS = {
     "colmap_registered_views",
     "points",
     "observations",
-    "streaming_sustained_frames",
+    "long_sequence_frames",
     "peak_memory_bytes",
     "machine_memory_bytes",
     "repeat_runs",
     "crashes",
     "corrupt_outputs",
     "normal_photo_toolchain_bytes",
-    "streaming_toolchain_bytes",
+    "large_area_toolchain_bytes",
     "max_resident_set_size_bytes",
 }
 NONNEGATIVE_NUMBER_METRICS = {
@@ -92,14 +96,12 @@ NONNEGATIVE_NUMBER_METRICS = {
     "m4_max_p50_seconds",
     "balanced_geometry_speedup",
     "constrained_fast_p50_seconds",
-    "streaming_inference_fps",
+    "long_sequence_geometry_fps",
     "wall_time_seconds",
     "geometry_seconds",
     "training_seconds",
 }
 BOOLEAN_METRICS = {
-    "finished_v1_opens",
-    "valid_v1_geometry_retrains",
     "deterministic_restart",
 }
 ENUM_METRICS = {
@@ -140,21 +142,21 @@ APPROVED_THRESHOLDS: dict[str, Any] = {
         "balanced_speedup_min": 2.0,
         "constrained_fast_p50_seconds_max": 300.0,
     },
-    "streaming": {"inference_fps_min": 5.0, "sustained_frames_min": 3_000},
+    "long_sequence": {"inference_fps_min": 5.0, "sustained_frames_min": 3_000},
     "memory": {
         "eight_gb_fast_bytes_max": 6_500_000_000,
         "constrained_bytes_max": 12_000_000_000,
         "larger_fraction_max": 0.75,
     },
-    "stability": {"repeat_runs_min": 50, "crashes_max": 0, "corrupt_outputs_max": 0},
+    "stability": {
+        "repeat_runs_min": 50,
+        "crashes_max": 0,
+        "corrupt_outputs_max": 0,
+        "deterministic_restart_required": True,
+    },
     "toolchain": {
         "normal_photo_bytes_max": 2_500_000_000,
-        "streaming_bytes_max": 6_000_000_000,
-    },
-    "compatibility": {
-        "finished_v1_opens_required": True,
-        "valid_v1_geometry_retrains_required": True,
-        "deterministic_restart_required": True,
+        "large_area_bytes_max": 2_500_000_000,
     },
 }
 
@@ -358,13 +360,16 @@ def validate_corpus(corpus: Any, expected_profile: str) -> None:
         adapter_type = adapter.get("type")
         if adapter_type not in ALLOWED_ADAPTERS:
             raise ConfigError(f"{label}.adapter type is unsupported")
-        if adapter_type == "external-result":
+        if adapter_type == "fixture":
             _require_exact_keys(adapter, {"type", "result_path"}, f"{label}.adapter")
             _safe_relative_path(adapter["result_path"], "result path")
+            if expected_profile != "smoke":
+                raise ConfigError(f"{label}.adapter fixture is smoke-only")
         else:
-            _require_exact_keys(adapter, {"type"}, f"{label}.adapter")
-            if input_info["kind"] != "video":
-                raise ConfigError(f"{label}.adapter da3 requires video input")
+            _require_exact_keys(adapter, {"type", "evidence_path"}, f"{label}.adapter")
+            _safe_relative_path(adapter["evidence_path"], "evidence path")
+            if expected_profile != "release":
+                raise ConfigError(f"{label}.adapter protected-evidence is release-only")
 
     if expected_profile == "release" and counts != RELEASE_CATEGORY_COUNTS:
         raise ConfigError(f"release category counts must be {RELEASE_CATEGORY_COUNTS}, got {counts}")
@@ -456,17 +461,6 @@ def metric_validation_failures(metrics: Any) -> list[str]:
     return failures
 
 
-def parse_time_l(stderr: str) -> dict[str, Any]:
-    def parse(label: str) -> Any:
-        match = re.search(rf"^\s*(\d+)\s+{re.escape(label)}\s*$", stderr, re.MULTILINE | re.IGNORECASE)
-        return int(match.group(1)) if match else unavailable()
-
-    return {
-        "max_resident_set_size_bytes": parse("maximum resident set size"),
-        "peak_memory_footprint_bytes": parse("peak memory footprint"),
-    }
-
-
 def _metric(metrics: Mapping[str, Any], name: str, blocking: list[str]) -> Any:
     raw = metrics.get(name)
     if not isinstance(raw, Mapping) or raw.get("availability") != "measured" or "value" not in raw:
@@ -503,8 +497,8 @@ def evaluate_gates(metrics: Mapping[str, Any], thresholds: Mapping[str, Any]) ->
         "m4_max_p50_seconds",
         "balanced_geometry_speedup",
         "constrained_fast_p50_seconds",
-        "streaming_inference_fps",
-        "streaming_sustained_frames",
+        "long_sequence_geometry_fps",
+        "long_sequence_frames",
         "peak_memory_bytes",
         "machine_memory_bytes",
         "memory_lane",
@@ -512,9 +506,7 @@ def evaluate_gates(metrics: Mapping[str, Any], thresholds: Mapping[str, Any]) ->
         "crashes",
         "corrupt_outputs",
         "normal_photo_toolchain_bytes",
-        "streaming_toolchain_bytes",
-        "finished_v1_opens",
-        "valid_v1_geometry_retrains",
+        "large_area_toolchain_bytes",
         "deterministic_restart",
     )}
     if blocking:
@@ -573,8 +565,8 @@ def evaluate_gates(metrics: Mapping[str, Any], thresholds: Mapping[str, Any]) ->
     maximum("m4_max_p50_seconds", thresholds["speed"]["m4_max_p50_seconds_max"])
     minimum("balanced_geometry_speedup", thresholds["speed"]["balanced_speedup_min"])
     maximum("constrained_fast_p50_seconds", thresholds["speed"]["constrained_fast_p50_seconds_max"])
-    minimum("streaming_inference_fps", thresholds["streaming"]["inference_fps_min"])
-    minimum("streaming_sustained_frames", thresholds["streaming"]["sustained_frames_min"])
+    minimum("long_sequence_geometry_fps", thresholds["long_sequence"]["inference_fps_min"])
+    minimum("long_sequence_frames", thresholds["long_sequence"]["sustained_frames_min"])
 
     lane = values["memory_lane"]
     if lane == "eight_gb_fast":
@@ -599,10 +591,9 @@ def evaluate_gates(metrics: Mapping[str, Any], thresholds: Mapping[str, Any]) ->
     if values["corrupt_outputs"] > values["repeat_runs"]:
         failures.append("corrupt_outputs exceeds repeat_runs")
     maximum("normal_photo_toolchain_bytes", thresholds["toolchain"]["normal_photo_bytes_max"])
-    maximum("streaming_toolchain_bytes", thresholds["toolchain"]["streaming_bytes_max"])
-    for name in ("finished_v1_opens", "valid_v1_geometry_retrains", "deterministic_restart"):
-        if values[name] is not True:
-            failures.append(f"{name} must be true")
+    maximum("large_area_toolchain_bytes", thresholds["toolchain"]["large_area_bytes_max"])
+    if thresholds["stability"]["deterministic_restart_required"] and values["deterministic_restart"] is not True:
+        failures.append("deterministic_restart must be true")
 
     return {
         "status": "failed" if failures else "passed",
@@ -723,23 +714,9 @@ def atomic_write_json(
 
 def _redacted_scene_command(scene: Mapping[str, Any], scale: int) -> list[str]:
     adapter = scene["adapter"]["type"]
-    if adapter == "da3":
-        return [
-            "scripts/benchmark_da3.sh",
-            "--video",
-            f"corpus://{scene['id']}",
-            "--frame-count",
-            str(scale),
-            "--profile",
-            "single",
-            "--da3-tool",
-            "toolchain://da3",
-            "--da3-models-dir",
-            "toolchain://da3-models",
-            "--colmap-bin",
-            "toolchain://colmap",
-        ]
-    return ["external-result", f"corpus://{scene['id']}", "--scale", str(scale)]
+    if adapter == "fixture":
+        return ["verify-fixture", f"corpus://{scene['id']}", "--scale", str(scale)]
+    return ["verify-protected-evidence", f"corpus://{scene['id']}", "--scale", str(scale)]
 
 
 def build_dry_run_plan(
@@ -832,56 +809,179 @@ def digest_input(path: Path) -> str:
     return "sha256:" + hasher.hexdigest()
 
 
+def _stable_file_sha256(path: Path, label: str) -> str:
+    with path.open("rb") as handle:
+        before = os.fstat(handle.fileno())
+        hasher = hashlib.sha256()
+        bytes_read = 0
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            hasher.update(chunk)
+            bytes_read += len(chunk)
+        after = os.fstat(handle.fileno())
+    if (
+        bytes_read != before.st_size
+        or before.st_size != after.st_size
+        or before.st_mtime_ns != after.st_mtime_ns
+        or before.st_ino != after.st_ino
+        or before.st_mode != after.st_mode
+    ):
+        raise ConfigError(f"{label} changed while it was being hashed")
+    return hasher.hexdigest()
+
+
+def _validated_toolchain_closure(toolchain_root: Path) -> Mapping[str, Any] | None:
+    state_path = toolchain_root / ".easysplat_toolchain_state.json"
+    manifest_path = toolchain_root / "manifest.json"
+    if state_path.is_file() and not state_path.is_symlink():
+        if state_path.stat().st_size > 1024 * 1024:
+            raise ConfigError("toolchain install state exceeds its size limit")
+        state = _load_json(state_path, "toolchain install state")
+        if not isinstance(state, dict):
+            raise ConfigError("toolchain install state must be an object")
+        manifest = state.get("signedManifest")
+        installed_artifacts = state.get("installedArtifacts")
+        installed_capabilities = state.get("installedCapabilities")
+        if state.get("schemaVersion") != 2:
+            raise ConfigError("toolchain install state schema is unsupported")
+    elif manifest_path.is_file() and not manifest_path.is_symlink():
+        manifest = _load_json(manifest_path, "toolchain manifest")
+        if not isinstance(manifest, dict):
+            raise ConfigError("toolchain manifest must be an object")
+        components_value = manifest.get("components")
+        if not isinstance(components_value, list):
+            raise ConfigError("toolchain manifest components are invalid")
+        installed_artifacts = {
+            component.get("name"): component.get("sha256")
+            for component in components_value
+            if isinstance(component, dict)
+        }
+        installed_capabilities = sorted(
+            capability
+            for component in components_value
+            if isinstance(component, dict)
+            for capability in component.get("capabilities", [])
+        )
+    else:
+        return None
+
+    if not isinstance(manifest, dict):
+        raise ConfigError("toolchain install state has no signed manifest")
+    if (
+        manifest.get("schemaVersion") != 2
+        or manifest.get("toolchainAPI") != 2
+        or not isinstance(manifest.get("version"), str)
+        or not isinstance(manifest.get("signatureEd25519"), str)
+        or not manifest["signatureEd25519"]
+        or not isinstance(manifest.get("keyID"), str)
+        or re.fullmatch(r"[0-9a-f]{64}", manifest["keyID"]) is None
+    ):
+        raise ConfigError("toolchain signed manifest identity is invalid")
+    components = manifest.get("components")
+    if not isinstance(components, list) or not components:
+        raise ConfigError("toolchain signed manifest has no components")
+    if not isinstance(installed_artifacts, dict) or not isinstance(installed_capabilities, list):
+        raise ConfigError("toolchain install state component closure is invalid")
+
+    normalized_components: list[dict[str, Any]] = []
+    component_names: set[str] = set()
+    manifest_capabilities: set[str] = set()
+    manifest_artifacts: dict[str, str] = {}
+    canonical_root = toolchain_root.resolve()
+    for component in components:
+        if not isinstance(component, dict):
+            raise ConfigError("toolchain manifest component must be an object")
+        name = component.get("name")
+        capabilities = component.get("capabilities")
+        digest = component.get("sha256")
+        critical_hashes = component.get("criticalFileHashes")
+        if (
+            not isinstance(name, str)
+            or SAFE_TOKEN_PATTERN.fullmatch(name) is None
+            or name in component_names
+            or not isinstance(capabilities, list)
+            or not capabilities
+            or not all(isinstance(value, str) and SAFE_TOKEN_PATTERN.fullmatch(value) for value in capabilities)
+            or not isinstance(digest, str)
+            or re.fullmatch(r"[0-9a-f]{64}", digest) is None
+            or not isinstance(critical_hashes, dict)
+            or not critical_hashes
+        ):
+            raise ConfigError("toolchain manifest component identity is invalid")
+        component_names.add(name)
+        manifest_capabilities.update(capabilities)
+        manifest_artifacts[name] = digest
+        for relative, expected_hash in critical_hashes.items():
+            if (
+                not isinstance(relative, str)
+                or not isinstance(expected_hash, str)
+                or re.fullmatch(r"[0-9a-f]{64}", expected_hash) is None
+            ):
+                raise ConfigError(f"toolchain critical-file record is invalid: {name}")
+            path = PurePosixPath(relative)
+            if path.is_absolute() or "\\" in relative or any(part in {"", ".", ".."} for part in path.parts):
+                raise ConfigError(f"toolchain critical-file path is unsafe: {relative}")
+            target = toolchain_root.joinpath(*path.parts)
+            if target.is_symlink() or not target.is_file():
+                raise ConfigError(f"toolchain critical file is missing or unsafe: {relative}")
+            resolved = target.resolve(strict=True)
+            if resolved != canonical_root and canonical_root not in resolved.parents:
+                raise ConfigError(f"toolchain critical file escapes its root: {relative}")
+            if _stable_file_sha256(target, f"toolchain critical file {relative}") != expected_hash:
+                raise ConfigError(f"toolchain critical file does not match its signed digest: {relative}")
+        normalized_components.append(
+            {
+                key: component.get(key)
+                for key in (
+                    "name",
+                    "capabilities",
+                    "url",
+                    "sha256",
+                    "sizeBytes",
+                    "expandedSizeBytes",
+                    "contents",
+                    "criticalFileHashes",
+                    "dependencies",
+                    "requirement",
+                )
+            }
+        )
+
+    normalized_installed = {
+        key: value.lower() if isinstance(value, str) else value
+        for key, value in installed_artifacts.items()
+    }
+    if normalized_installed != manifest_artifacts or set(installed_capabilities) != manifest_capabilities:
+        raise ConfigError("toolchain install state does not contain the complete component closure")
+    app_range = manifest.get("appVersionRange")
+    if not isinstance(app_range, dict) or not isinstance(app_range.get("minimum"), str):
+        raise ConfigError("toolchain app-version range is invalid")
+    return {
+        "schema_version": 2,
+        "toolchain_api": 2,
+        "key_id": manifest["keyID"],
+        "version": manifest["version"],
+        "app_version_range": {
+            "minimum": app_range["minimum"],
+            "maximum_exclusive": app_range.get("maximumExclusive"),
+        },
+        "signature_ed25519": manifest["signatureEd25519"],
+        "components": sorted(normalized_components, key=lambda value: value["name"]),
+        "installed_artifacts": dict(sorted(manifest_artifacts.items())),
+        "installed_capabilities": sorted(manifest_capabilities),
+    }
+
+
 def resolved_toolchain_identity(toolchain_root: Path, profile: str) -> str | None:
     if profile == "smoke":
         return "fixture:smoke"
-    identity_files = [
-        toolchain_root / name
-        for name in ("signed_receipt.json", "toolchain_receipt.json", "manifest.json")
-    ]
-    if not any(path.is_file() and not path.is_symlink() for path in identity_files):
-        return None
     if not toolchain_root.is_dir() or toolchain_root.is_symlink():
-        raise ConfigError("toolchain root must be a real directory")
-
-    canonical_root = toolchain_root.resolve()
+        return None
+    closure = _validated_toolchain_closure(toolchain_root)
+    if closure is None:
+        return None
     hasher = hashlib.sha256()
-    _hash_length_prefixed(hasher, b"easysplat-benchmark-toolchain-v1")
-    entries = sorted(toolchain_root.rglob("*"), key=lambda path: path.relative_to(toolchain_root).as_posix())
-    for entry in entries:
-        relative = entry.relative_to(toolchain_root).as_posix()
-        if entry.is_symlink():
-            target = os.readlink(entry)
-            resolved = entry.resolve(strict=True)
-            if resolved != canonical_root and canonical_root not in resolved.parents:
-                raise ConfigError(f"toolchain symlink escapes its root: {relative}")
-            _hash_length_prefixed(hasher, b"symlink")
-            _hash_length_prefixed(hasher, relative.encode("utf-8"))
-            _hash_length_prefixed(hasher, target.encode("utf-8"))
-            continue
-        if entry.is_dir():
-            continue
-        if not entry.is_file():
-            raise ConfigError(f"toolchain contains unsupported filesystem entry: {relative}")
-        _hash_length_prefixed(hasher, b"file")
-        _hash_length_prefixed(hasher, relative.encode("utf-8"))
-        with entry.open("rb") as handle:
-            before = os.fstat(handle.fileno())
-            hasher.update((before.st_mode & 0o777).to_bytes(4, "big"))
-            hasher.update(before.st_size.to_bytes(8, "big"))
-            bytes_read = 0
-            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
-                hasher.update(chunk)
-                bytes_read += len(chunk)
-            after = os.fstat(handle.fileno())
-        if (
-            bytes_read != before.st_size
-            or before.st_size != after.st_size
-            or before.st_mtime_ns != after.st_mtime_ns
-            or before.st_ino != after.st_ino
-            or before.st_mode != after.st_mode
-        ):
-            raise ConfigError(f"toolchain changed while it was being hashed: {relative}")
+    _hash_length_prefixed(hasher, b"easysplat-benchmark-toolchain-v2")
+    _hash_length_prefixed(hasher, canonical_json_bytes(closure))
     return "sha256:" + hasher.hexdigest()
 
 
@@ -912,34 +1012,158 @@ def make_run_identity(
     )
 
 
+def required_evidence_lanes(scale: int) -> tuple[str, ...]:
+    lanes = [evidence.LANE_REFERENCE, evidence.LANE_CONSTRAINED]
+    if scale <= 120:
+        lanes.append(evidence.LANE_EIGHT_GB)
+    return tuple(lanes)
+
+
+def parse_runner_identities(values: list[str] | None) -> dict[str, dict[str, str]] | None:
+    if not values:
+        return None
+    identities: dict[str, dict[str, str]] = {}
+    for raw in values:
+        lane, separator, digest = raw.partition("=")
+        if not separator or lane in identities:
+            raise ConfigError("--runner-identity must contain one unique lane=sha256:<digest> value")
+        identities[lane] = {"label": evidence.RUNNER_LABELS.get(lane, ""), "sha256": digest}
+    try:
+        return evidence.validate_runner_identities(identities)
+    except evidence.EvidenceError as error:
+        raise ConfigError(str(error)) from error
+
+
+def validate_request_index(
+    value: Any,
+    identity: RunIdentity,
+    corpus: Mapping[str, Any],
+) -> dict[str, Any]:
+    index = _require_mapping(value, "request index")
+    _require_exact_keys(
+        index,
+        {
+            "schema_version",
+            "producer_protocol",
+            "producer_version",
+            "producer_digest",
+            "corpus_digest",
+            "thresholds_digest",
+            "git_commit",
+            "app_version",
+            "toolchain_identity",
+            "runner_identities",
+            "requests",
+        },
+        "request index",
+    )
+    expected = {
+        "schema_version": 1,
+        "producer_protocol": evidence.PROTOCOL_VERSION,
+        "producer_version": evidence.PRODUCER_VERSION,
+        "producer_digest": evidence.sha256_file(ROOT / evidence.PRODUCER_RELATIVE_PATH),
+        "corpus_digest": identity.corpus_digest,
+        "thresholds_digest": identity.thresholds_digest,
+        "git_commit": identity.git_commit,
+        "app_version": identity.app_version,
+        "toolchain_identity": identity.toolchain_identity,
+    }
+    for field, expected_value in expected.items():
+        if index[field] != expected_value:
+            raise ConfigError(f"request index {field} does not match this run")
+    try:
+        runner_identities = evidence.validate_runner_identities(index["runner_identities"])
+    except evidence.EvidenceError as error:
+        raise ConfigError(f"request index runner identities are invalid: {error}") from error
+
+    scenes = {scene["id"]: scene for scene in corpus["scenes"]}
+    requests = index["requests"]
+    if not isinstance(requests, list):
+        raise ConfigError("request index requests must be an array")
+    actual_runs: set[tuple[str, int, str]] = set()
+    for request_number, raw_request in enumerate(requests):
+        label = f"request index requests[{request_number}]"
+        entry = _require_mapping(raw_request, label)
+        _require_exact_keys(
+            entry,
+            {
+                "scene_id",
+                "scale",
+                "lane",
+                "request",
+                "media_path",
+                "evidence_path",
+                "producer_command",
+            },
+            label,
+        )
+        scene_id = _require_safe_token(entry["scene_id"], f"{label}.scene_id")
+        scene = scenes.get(scene_id)
+        scale = entry["scale"]
+        lane = entry["lane"]
+        if scene is None or type(scale) is not int or scale not in scene["scale_lanes"]:
+            raise ConfigError(f"{label} scene or scale is not declared by the corpus")
+        if lane not in required_evidence_lanes(scale):
+            raise ConfigError(f"{label}.lane is not required for this scale")
+        run = (scene_id, scale, lane)
+        if run in actual_runs:
+            raise ConfigError(f"{label} duplicates a scene, scale, and lane")
+        actual_runs.add(run)
+        expected_request_path = f"{scene_id}/{scale}/{lane}.request.json"
+        if entry["request"] != expected_request_path:
+            raise ConfigError(f"{label}.request is not canonical")
+        if entry["media_path"] != scene["input"]["media_path"]:
+            raise ConfigError(f"{label}.media_path does not match the corpus")
+        if entry["evidence_path"] != scene["adapter"]["evidence_path"]:
+            raise ConfigError(f"{label}.evidence_path does not match the corpus")
+        if not isinstance(entry["producer_command"], list) or not entry["producer_command"]:
+            raise ConfigError(f"{label}.producer_command is invalid")
+        for argument in entry["producer_command"]:
+            _require_public_text(argument, f"{label}.producer_command argument")
+    expected_runs = {
+        (scene["id"], scale, lane)
+        for scene in corpus["scenes"]
+        for scale in scene["scale_lanes"]
+        for lane in required_evidence_lanes(scale)
+    }
+    if actual_runs != expected_runs:
+        raise ConfigError("request index does not contain the exact corpus lane closure")
+    return {**dict(index), "runner_identities": runner_identities}
+
+
 def _requirements(
     corpus: Mapping[str, Any],
     corpus_directory: Path,
+    evidence_directory: Path,
     toolchain_root: Path,
     profile: str,
     toolchain_identity: str | None,
+    evidence_key_path: Path | None,
+    request_index_path: Path | None,
 ) -> dict[str, Any]:
     missing_media = []
-    missing_results = []
-    requires_toolchain = False
+    missing_evidence = []
     for scene in corpus["scenes"]:
         media = corpus_directory / scene["input"]["media_path"]
         if not scene["input"]["supplied"] or not media.exists():
             missing_media.append({"scene_id": scene["id"], "path": scene["input"]["media_path"]})
-        if scene["adapter"]["type"] == "external-result":
+        if scene["adapter"]["type"] == "fixture":
             result = corpus_directory / scene["adapter"]["result_path"]
             if not result.is_file() or result.is_symlink():
-                missing_results.append({"scene_id": scene["id"], "path": scene["adapter"]["result_path"]})
+                missing_evidence.append({"scene_id": scene["id"], "path": scene["adapter"]["result_path"]})
         else:
-            requires_toolchain = True
+            for scale in scene["scale_lanes"]:
+                for lane in required_evidence_lanes(scale):
+                    relative = (
+                        PurePosixPath(scene["adapter"]["evidence_path"])
+                        / str(scale)
+                        / lane
+                        / "attestation.json"
+                    ).as_posix()
+                    attestation = evidence_directory / Path(*PurePosixPath(relative).parts)
+                    if not attestation.is_file() or attestation.is_symlink():
+                        missing_evidence.append({"scene_id": scene["id"], "path": relative})
     missing_toolchain = []
-    if requires_toolchain:
-        required = [
-            toolchain_root / "bin/colmap",
-            toolchain_root / "da3_mps/bin/easysplat_da3_sfm",
-            toolchain_root / "da3_mps/models",
-        ]
-        missing_toolchain.extend(path.relative_to(toolchain_root).as_posix() for path in required if not path.exists())
     if profile == "release" and toolchain_identity is None:
         missing_toolchain.append("signed receipt or manifest identity")
     toolchain = (
@@ -947,7 +1171,27 @@ def _requirements(
         if missing_toolchain
         else None
     )
-    return {"media": missing_media, "external_results": missing_results, "toolchain": toolchain}
+    missing_key = None
+    if profile == "release" and (
+        evidence_key_path is None
+        or evidence_key_path.is_symlink()
+        or not evidence_key_path.is_file()
+    ):
+        missing_key = "protected evidence key file"
+    missing_index = None
+    if profile == "release" and (
+        request_index_path is None
+        or request_index_path.is_symlink()
+        or not request_index_path.is_file()
+    ):
+        missing_index = "protected request index"
+    return {
+        "media": missing_media,
+        "evidence": missing_evidence,
+        "toolchain": toolchain,
+        "evidence_key": missing_key,
+        "request_index": missing_index,
+    }
 
 
 def _result_shell(
@@ -975,7 +1219,13 @@ def _result_shell(
         "corpus_digest": sha256_json(corpus),
         "git": collect_git_state(),
         "raw_artifact_directory": "raw",
-        "missing_requirements": {"media": [], "external_results": [], "toolchain": None},
+        "missing_requirements": {
+            "media": [],
+            "evidence": [],
+            "toolchain": None,
+            "evidence_key": None,
+            "request_index": None,
+        },
     }
 
 
@@ -1089,6 +1339,7 @@ def validate_suite_result(result: Any) -> None:
         "command",
         "metrics",
         "artifacts",
+        "evidence",
     }
     for index, raw_scene in enumerate(scene_results):
         label = f"suite result.scene_results[{index}]"
@@ -1133,6 +1384,48 @@ def validate_suite_result(result: Any) -> None:
         if metric_errors:
             raise ConfigError(f"{label}.metrics is invalid: {'; '.join(metric_errors)}")
         _validate_artifacts(scene["artifacts"], f"{label}.artifacts")
+        evidence_records = scene["evidence"]
+        if not isinstance(evidence_records, list):
+            raise ConfigError(f"{label}.evidence must be an array")
+        seen_lanes: set[str] = set()
+        for evidence_index, raw_evidence in enumerate(evidence_records):
+            evidence_label = f"{label}.evidence[{evidence_index}]"
+            record = _require_mapping(raw_evidence, evidence_label)
+            _require_exact_keys(
+                record,
+                {"lane", "machine", "producer", "measurement_runner", "attestation_digest"},
+                evidence_label,
+            )
+            lane = record["lane"]
+            if lane not in evidence.RELEASE_LANES or lane in seen_lanes:
+                raise ConfigError(f"{evidence_label}.lane is invalid")
+            seen_lanes.add(lane)
+            producer = _require_mapping(record["producer"], f"{evidence_label}.producer")
+            _require_exact_keys(
+                producer,
+                {"protocol_version", "version", "executable", "sha256"},
+                f"{evidence_label}.producer",
+            )
+            if producer["protocol_version"] != evidence.PROTOCOL_VERSION:
+                raise ConfigError(f"{evidence_label}.producer protocol is invalid")
+            _require_safe_token(producer["version"], f"{evidence_label}.producer.version")
+            if producer["executable"] != evidence.PRODUCER_RELATIVE_PATH:
+                raise ConfigError(f"{evidence_label}.producer executable is invalid")
+            for digest_field, digest_value in (
+                ("producer.sha256", producer["sha256"]),
+                ("attestation_digest", record["attestation_digest"]),
+            ):
+                if not isinstance(digest_value, str) or not SHA256_PATTERN.fullmatch(digest_value):
+                    raise ConfigError(f"{evidence_label}.{digest_field} is invalid")
+            try:
+                evidence.validate_runner_identity(record["measurement_runner"], lane)
+            except evidence.EvidenceError as error:
+                raise ConfigError(f"{evidence_label}.measurement_runner is invalid: {error}") from error
+            machine_record = _require_mapping(record["machine"], f"{evidence_label}.machine")
+            try:
+                evidence.validate_machine_lane(machine_record, lane)
+            except evidence.EvidenceError as error:
+                raise ConfigError(f"{evidence_label}.machine is invalid: {error}") from error
 
     aggregates = _require_mapping(root["aggregates"], "suite result.aggregates")
     if aggregates:
@@ -1151,8 +1444,12 @@ def validate_suite_result(result: Any) -> None:
             raise ConfigError("suite result aggregate wall time is invalid")
 
     missing = _require_mapping(root["missing_requirements"], "suite result.missing_requirements")
-    _require_exact_keys(missing, {"media", "external_results", "toolchain"}, "suite result.missing_requirements")
-    for key in ("media", "external_results"):
+    _require_exact_keys(
+        missing,
+        {"media", "evidence", "toolchain", "evidence_key", "request_index"},
+        "suite result.missing_requirements",
+    )
+    for key in ("media", "evidence"):
         if not isinstance(missing[key], list):
             raise ConfigError(f"suite result.missing_requirements.{key} must be an array")
         for item in missing[key]:
@@ -1166,6 +1463,12 @@ def validate_suite_result(result: Any) -> None:
         if toolchain["label"] != "toolchain://resolved":
             raise ConfigError("suite result toolchain label is invalid")
         _validate_string_list(toolchain["missing"], "suite result.missing_requirements.toolchain.missing")
+    if missing["evidence_key"] is not None:
+        if missing["evidence_key"] != "protected evidence key file":
+            raise ConfigError("suite result missing evidence key label is invalid")
+    if missing["request_index"] is not None:
+        if missing["request_index"] != "protected request index":
+            raise ConfigError("suite result missing request index label is invalid")
 
     if root["status"] == "passed" and (root["blocking_reasons"] or root["failures"]):
         raise ConfigError("passed suite result contains blockers or failures")
@@ -1228,13 +1531,15 @@ def _validate_artifacts(artifacts: Any, label: str) -> Mapping[str, str]:
     return value
 
 
-def _validate_external_envelope(
+def _validate_fixture_envelope(
     payload: Any,
     scene: Mapping[str, Any],
     identity: RunIdentity,
     input_digest: str,
 ) -> Mapping[str, Any]:
-    label = f"external result for {scene['id']}"
+    if identity.profile != "smoke":
+        raise ConfigError("fixture evidence is smoke-only")
+    label = f"fixture result for {scene['id']}"
     value = _require_mapping(payload, label)
     _require_exact_keys(
         value,
@@ -1291,7 +1596,7 @@ def _validate_external_envelope(
     return value
 
 
-def _copy_external_result(
+def _copy_fixture_result(
     scene: Mapping[str, Any],
     scale: int,
     corpus_directory: Path,
@@ -1299,28 +1604,29 @@ def _copy_external_result(
     input_digest: str | None = None,
 ) -> dict[str, Any]:
     source = corpus_directory / scene["adapter"]["result_path"]
-    payload = _load_json(source, f"external result for {scene['id']}")
+    payload = _load_json(source, f"fixture result for {scene['id']}")
     if input_digest is None:
         input_digest = digest_input(corpus_directory / scene["input"]["media_path"])
-    payload = _validate_external_envelope(payload, scene, identity, input_digest)
+    payload = _validate_fixture_envelope(payload, scene, identity, input_digest)
     scale_results = payload["scale_results"]
     raw = scale_results.get(str(scale))
     if not isinstance(raw, Mapping):
         return {
             "scene_id": scene["id"],
             "scale": scale,
-            "adapter": "external-result",
+            "adapter": "fixture",
             "status": "blocked",
             "blocking_reasons": [f"external result is missing scale {scale}"],
             "failures": [],
             "input_kind": scene["input"]["kind"],
             "expected_outcome": scene["expected_outcome"],
-            "route": "external-result",
+            "route": "fixture",
             "detail_profile": "benchmark",
             "exit": {"code": None, "reason": "not_available", "cancelled": False},
             "command": _redacted_scene_command(scene, scale),
             "metrics": {},
             "artifacts": {},
+            "evidence": [],
         }
     actual = raw.get("actual")
     metrics = raw.get("metrics")
@@ -1349,13 +1655,13 @@ def _copy_external_result(
     return {
         "scene_id": scene["id"],
         "scale": scale,
-        "adapter": "external-result",
+        "adapter": "fixture",
         "status": evaluation["status"],
         "blocking_reasons": evaluation["blocking_reasons"],
         "failures": evaluation["failures"],
         "input_kind": scene["input"]["kind"],
         "expected_outcome": scene["expected_outcome"],
-        "route": raw.get("route", "external-result"),
+        "route": raw.get("route", "fixture"),
         "detail_profile": raw.get("detail_profile", "benchmark"),
         "exit": {
             "code": actual.get("exit_code") if isinstance(actual, Mapping) else None,
@@ -1365,130 +1671,294 @@ def _copy_external_result(
         "command": _redacted_scene_command(scene, scale),
         "metrics": dict(metrics) if isinstance(metrics, Mapping) else {},
         "artifacts": dict(artifacts) if isinstance(artifacts, Mapping) else {},
+        "evidence": [],
     }
 
 
-def _run_da3(
+def _evidence_request(
+    scene: Mapping[str, Any],
+    scale: int,
+    identity: RunIdentity,
+    input_digest: str,
+) -> dict[str, Any]:
+    return {
+        "schema_version": 1,
+        "binding": {
+            "profile": identity.profile,
+            "scene_id": scene["id"],
+            "scale": scale,
+            "input_digest": input_digest,
+            "corpus_digest": identity.corpus_digest,
+            "thresholds_digest": identity.thresholds_digest,
+            "git_commit": identity.git_commit,
+            "app_version": identity.app_version,
+            "toolchain_identity": identity.toolchain_identity,
+        },
+        "expected_outcome": scene["expected_outcome"],
+        "input_kind": scene["input"]["kind"],
+    }
+
+
+def _required_lane_metric(metrics: Mapping[str, Any], name: str, blocking: list[str]) -> Any:
+    raw = metrics.get(name)
+    if not isinstance(raw, Mapping) or raw.get("availability") != "measured":
+        blocking.append(f"required {name} evidence is unavailable")
+        return None
+    return raw.get("value")
+
+
+def _evaluate_protected_attestations(
+    scene: Mapping[str, Any],
+    attestations: Mapping[str, Mapping[str, Any]],
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    expected = scene["expected_outcome"]
+    reference = attestations[evidence.LANE_REFERENCE]
+    if expected["kind"] == "invalid":
+        evaluations = [evaluate_invalid_scene(expected, item["actual"]) for item in attestations.values()]
+        failures = [failure for item in evaluations for failure in item["failures"]]
+        blocking = [reason for item in evaluations for reason in item["blocking_reasons"]]
+        return (
+            {
+                "status": "blocked" if blocking else "failed" if failures else "passed",
+                "blocking_reasons": blocking,
+                "failures": failures,
+            },
+            dict(reference["metrics"]),
+        )
+
+    failures: list[str] = []
+    blocking: list[str] = []
+    for lane, attestation in attestations.items():
+        actual = attestation["actual"]
+        try:
+            _validate_actual_evidence(actual, f"{lane} actual evidence")
+        except ConfigError:
+            blocking.append(f"{lane} termination evidence is invalid")
+            continue
+        if (
+            actual["exit_code"] != 0
+            or actual["cancelled"]
+            or actual["failure_type"] is not None
+            or actual["corrupt_ply"] is not False
+        ):
+            failures.append(f"{lane} run did not complete with a valid output")
+
+    reference_metrics = dict(reference["metrics"])
+    constrained = attestations[evidence.LANE_CONSTRAINED]
+    constrained_metrics = constrained["metrics"]
+    constrained_p50 = _required_lane_metric(
+        constrained_metrics,
+        "constrained_fast_p50_seconds",
+        blocking,
+    )
+    if constrained_p50 is not None:
+        reference_metrics["constrained_fast_p50_seconds"] = measured(constrained_p50)
+    gate_evaluation = evaluate_gates(reference_metrics, APPROVED_THRESHOLDS)
+    failures.extend(gate_evaluation["failures"])
+    blocking.extend(gate_evaluation["blocking_reasons"])
+
+    lane_contracts = (
+        (
+            evidence.LANE_REFERENCE,
+            "larger",
+            None,
+        ),
+        (
+            evidence.LANE_CONSTRAINED,
+            "constrained",
+            APPROVED_THRESHOLDS["memory"]["constrained_bytes_max"],
+        ),
+    )
+    if evidence.LANE_EIGHT_GB in attestations:
+        lane_contracts += (
+            (
+                evidence.LANE_EIGHT_GB,
+                "eight_gb_fast",
+                APPROVED_THRESHOLDS["memory"]["eight_gb_fast_bytes_max"],
+            ),
+        )
+    for lane, expected_memory_lane, maximum_peak in lane_contracts:
+        attestation = attestations[lane]
+        metrics = attestation["metrics"]
+        memory_lane = _required_lane_metric(metrics, "memory_lane", blocking)
+        machine_memory = _required_lane_metric(metrics, "machine_memory_bytes", blocking)
+        peak_memory = _required_lane_metric(metrics, "peak_memory_bytes", blocking)
+        if memory_lane is not None and memory_lane != expected_memory_lane:
+            failures.append(f"{lane} reports the wrong memory lane")
+        physical_memory = attestation["machine"].get("physical_memory_bytes")
+        if machine_memory is not None and machine_memory != physical_memory:
+            failures.append(f"{lane} memory metric does not match the attested machine")
+        if maximum_peak is not None and peak_memory is not None and peak_memory > maximum_peak:
+            failures.append(f"{lane} peak memory exceeds {maximum_peak}")
+
+    return (
+        {
+            "status": "blocked" if blocking else "failed" if failures else "passed",
+            "blocking_reasons": blocking,
+            "failures": failures,
+        },
+        reference_metrics,
+    )
+
+
+def _copy_protected_evidence(
     scene: Mapping[str, Any],
     scale: int,
     corpus_directory: Path,
-    toolchain_root: Path,
-    raw_directory: Path,
-    expected_input_digest: str,
+    identity: RunIdentity,
+    input_digest: str,
+    key: bytes,
+    runner_identities: Mapping[str, Mapping[str, str]],
 ) -> dict[str, Any]:
-    scene_directory = raw_directory / scene["id"] / f"{scale}-frames"
-    scene_directory.mkdir(parents=True, exist_ok=True)
-    media = corpus_directory / scene["input"]["media_path"]
-    command = [
-        "/usr/bin/time",
-        "-l",
-        str(ROOT / "scripts/benchmark_da3.sh"),
-        "--video",
-        str(media),
-        "--out",
-        str(scene_directory),
-        "--frame-count",
-        str(scale),
-        "--profile",
-        "single",
-        "--da3-tool",
-        str(toolchain_root / "da3_mps/bin/easysplat_da3_sfm"),
-        "--da3-models-dir",
-        str(toolchain_root / "da3_mps/models"),
-        "--colmap-bin",
-        str(toolchain_root / "bin/colmap"),
-    ]
-    started = time.monotonic()
-    completed = subprocess.run(command, capture_output=True, text=True, check=False)
-    wall = time.monotonic() - started
-    termination_reason = (
-        "cancelled" if completed.returncode == 130 else "signal" if completed.returncode < 0 else "exit"
-    )
-    (scene_directory / "stdout.log").write_text(completed.stdout, encoding="utf-8")
-    (scene_directory / "stderr.log").write_text(completed.stderr, encoding="utf-8")
-    atomic_write_json(
-        scene_directory / "command.json",
-        {"argv": _redacted_scene_command(scene, scale), "exit_code": completed.returncode},
-    )
-    time_metrics = parse_time_l(completed.stderr)
-    summary_path = scene_directory / f"{scale}-frames/summary.json"
-    summary = _load_json(summary_path, "DA3 summary") if summary_path.is_file() else {}
-    metrics = {
-        "wall_time_seconds": measured(wall),
-        "max_resident_set_size_bytes": measured(time_metrics["max_resident_set_size_bytes"])
-        if isinstance(time_metrics["max_resident_set_size_bytes"], int)
-        else unavailable(),
-        "peak_memory_bytes": measured(time_metrics["peak_memory_footprint_bytes"])
-        if isinstance(time_metrics["peak_memory_footprint_bytes"], int)
-        else unavailable(),
-        "registered_views": measured(summary["registered_images"])
-        if isinstance(summary, Mapping) and isinstance(summary.get("registered_images"), int)
-        else unavailable(),
-        "total_views": measured(scale),
-        "points": measured(summary["points"])
-        if isinstance(summary, Mapping) and isinstance(summary.get("points"), int)
-        else unavailable(),
-        "observations": measured(summary["observations"])
-        if isinstance(summary, Mapping) and isinstance(summary.get("observations"), int)
-        else unavailable(),
-    }
-    if scene["expected_outcome"]["kind"] == "invalid":
-        failure_type = None
-        for line in reversed((completed.stdout + "\n" + completed.stderr).splitlines()):
-            try:
-                event = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            if isinstance(event, Mapping) and isinstance(event.get("failure_type"), str):
-                candidate = event["failure_type"]
-                if SAFE_TOKEN_PATTERN.fullmatch(candidate):
-                    failure_type = candidate
-                    break
-        ply_exists = any(path.is_file() for path in scene_directory.rglob("*.ply"))
-        actual = {
-            "exit_code": completed.returncode,
-            "termination_reason": termination_reason,
-            "cancelled": completed.returncode == 130,
-            "failure_type": failure_type,
-            "corrupt_ply": ply_exists,
-        }
-        evaluation = evaluate_invalid_scene(scene["expected_outcome"], actual)
-    elif completed.returncode != 0:
-        evaluation = {
-            "status": "failed",
-            "blocking_reasons": [],
-            "failures": [f"DA3 adapter exited {completed.returncode}"],
-        }
+    request = _evidence_request(scene, scale, identity, input_digest)
+    evidence_root = corpus_directory / scene["adapter"]["evidence_path"] / str(scale)
+    attestations: dict[str, Mapping[str, Any]] = {}
+    summaries = []
+    artifacts: dict[str, str] = {}
+    verification_failures = []
+    for lane in required_evidence_lanes(scale):
+        path = evidence_root / lane / "attestation.json"
+        try:
+            attestation = evidence.verify_attestation(
+                path,
+                request,
+                lane,
+                key,
+                runner_identities[lane],
+            )
+        except evidence.EvidenceError as error:
+            verification_failures.append(f"{lane} evidence rejected: {error}")
+            continue
+        metric_errors = metric_validation_failures(attestation["metrics"])
+        if metric_errors:
+            verification_failures.append(f"{lane} metrics invalid: {'; '.join(metric_errors)}")
+            continue
+        attestations[lane] = attestation
+        summaries.append(
+            {
+                "lane": lane,
+                "machine": dict(attestation["machine"]),
+                "producer": dict(attestation["producer"]),
+                "measurement_runner": dict(attestation["measurement_runner"]),
+                "attestation_digest": evidence.sha256_file(path),
+            }
+        )
+        for name, descriptor in attestation["artifacts"].items():
+            output_name = f"{lane}_{name}".replace(".", "_").replace("-", "_")
+            if ARTIFACT_NAME_PATTERN.fullmatch(output_name):
+                artifacts[output_name] = descriptor["sha256"]
+
+    if verification_failures:
+        evaluation = {"status": "failed", "blocking_reasons": [], "failures": verification_failures}
+        metrics: dict[str, Any] = {}
     else:
-        evaluation = {
-            "status": "blocked",
-            "blocking_reasons": ["DA3 adapter does not yet provide all release metrics"],
-            "failures": [],
-        }
-    if digest_input(media) != expected_input_digest:
-        evaluation["status"] = "failed"
-        evaluation["blocking_reasons"] = []
-        evaluation["failures"].append("benchmark input changed during the DA3 run")
+        evaluation, metrics = _evaluate_protected_attestations(scene, attestations)
+    reference = attestations.get(evidence.LANE_REFERENCE)
+    actual = reference.get("actual", {}) if isinstance(reference, Mapping) else {}
+    try:
+        _validate_actual_evidence(actual, "reference evidence")
+    except ConfigError:
+        actual = {}
     return {
         "scene_id": scene["id"],
         "scale": scale,
-        "adapter": "da3",
+        "adapter": "protected-evidence",
         "status": evaluation["status"],
         "blocking_reasons": evaluation["blocking_reasons"],
         "failures": evaluation["failures"],
         "input_kind": scene["input"]["kind"],
         "expected_outcome": scene["expected_outcome"],
-        "route": "da3-anchored",
-        "detail_profile": "geometry-only",
+        "route": "protected-evidence",
+        "detail_profile": "release",
         "exit": {
-            "code": completed.returncode,
-            "reason": termination_reason,
-            "cancelled": completed.returncode == 130,
+            "code": actual.get("exit_code"),
+            "reason": actual.get("termination_reason", "not_available"),
+            "cancelled": actual.get("cancelled", False),
         },
         "command": _redacted_scene_command(scene, scale),
         "metrics": metrics,
-        "artifacts": {},
+        "artifacts": artifacts,
+        "evidence": summaries,
     }
+
+
+def emit_evidence_requests(
+    corpus: Mapping[str, Any],
+    config: Mapping[str, Any],
+    corpus_path: Path,
+    toolchain_root: Path,
+    destination: Path,
+    runner_identities: Mapping[str, Mapping[str, str]],
+) -> dict[str, Any]:
+    try:
+        approved_runners = evidence.validate_runner_identities(runner_identities)
+    except evidence.EvidenceError as error:
+        raise ConfigError(f"cannot emit requests without complete runner identities: {error}") from error
+    toolchain_identity = resolved_toolchain_identity(toolchain_root, "release")
+    if toolchain_identity is None:
+        raise ConfigError("cannot emit evidence requests without a resolved toolchain identity")
+    git = collect_git_state()
+    if git["dirty"]:
+        raise ConfigError("cannot emit release evidence requests from a dirty Git worktree")
+    identity = make_run_identity("release", corpus, config, toolchain_root, toolchain_identity)
+    destination.mkdir(parents=True, exist_ok=True)
+    requests = []
+    for scene in corpus["scenes"]:
+        media = corpus_path.parent / scene["input"]["media_path"]
+        if not scene["input"]["supplied"] or not media.exists():
+            raise ConfigError(f"cannot emit evidence request without media for {scene['id']}")
+        input_digest = digest_input(media)
+        for scale in scene["scale_lanes"]:
+            request = _evidence_request(scene, scale, identity, input_digest)
+            for lane in required_evidence_lanes(scale):
+                relative = Path(scene["id"]) / str(scale) / f"{lane}.request.json"
+                atomic_write_json(destination / relative, request)
+                requests.append(
+                    {
+                        "scene_id": scene["id"],
+                        "scale": scale,
+                        "lane": lane,
+                        "request": relative.as_posix(),
+                        "media_path": scene["input"]["media_path"],
+                        "evidence_path": scene["adapter"]["evidence_path"],
+                        "producer_command": [
+                            "python3",
+                            evidence.PRODUCER_RELATIVE_PATH,
+                            "produce",
+                            "--request",
+                            f"requests://{relative.as_posix()}",
+                            "--observations",
+                            "evidence://observations.json",
+                            "--artifact-root",
+                            "evidence://run",
+                            "--output",
+                            f"evidence://{lane}/attestation.json",
+                            "--lane",
+                            lane,
+                            "--runner-label",
+                            approved_runners[lane]["label"],
+                            "--runner-sha256",
+                            approved_runners[lane]["sha256"],
+                            "--key-file",
+                            "protected://evidence-key",
+                        ],
+                    }
+                )
+    index = {
+        "schema_version": 1,
+        "producer_protocol": evidence.PROTOCOL_VERSION,
+        "producer_version": evidence.PRODUCER_VERSION,
+        "producer_digest": evidence.sha256_file(ROOT / evidence.PRODUCER_RELATIVE_PATH),
+        "corpus_digest": identity.corpus_digest,
+        "thresholds_digest": identity.thresholds_digest,
+        "git_commit": identity.git_commit,
+        "app_version": identity.app_version,
+        "toolchain_identity": identity.toolchain_identity,
+        "runner_identities": approved_runners,
+        "requests": requests,
+    }
+    atomic_write_json(destination / "index.json", index)
+    return index
 
 
 def _aggregate_scene_results(results: list[Mapping[str, Any]]) -> dict[str, Any]:
@@ -1519,11 +1989,34 @@ def run_suite(
     output_directory: Path,
     dry_run: bool,
     stdout: TextIO = sys.stdout,
+    evidence_key_path: Path | None = None,
+    emit_requests_directory: Path | None = None,
+    evidence_root: Path | None = None,
+    request_index_path: Path | None = None,
+    runner_identities: Mapping[str, Mapping[str, str]] | None = None,
 ) -> int:
     corpus = _load_json(corpus_path, "corpus")
     config = _load_json(reference_config_path, "reference config")
     validate_corpus(corpus, expected_profile=profile)
     validate_reference_config(config)
+    if emit_requests_directory is not None:
+        if profile != "release" or dry_run:
+            raise ConfigError("--emit-requests requires a non-dry-run release profile")
+        index = emit_evidence_requests(
+            corpus,
+            config,
+            corpus_path,
+            toolchain_root,
+            emit_requests_directory,
+            runner_identities or {},
+        )
+        stdout.write(
+            canonical_json_bytes(
+                {"status": "requests_emitted", "count": len(index["requests"]), "index": "index.json"}
+            ).decode("utf-8")
+            + "\n"
+        )
+        return 0
     if dry_run:
         stdout.write(canonical_json_bytes(build_dry_run_plan(profile, corpus, config, toolchain_root)).decode("utf-8") + "\n")
         return 0
@@ -1538,18 +2031,25 @@ def run_suite(
     requirements = _requirements(
         corpus,
         corpus_path.parent,
+        evidence_root or corpus_path.parent,
         toolchain_root,
         profile,
         toolchain_identity,
+        evidence_key_path,
+        request_index_path,
     )
     result["missing_requirements"] = requirements
     missing_labels = []
     if requirements["media"]:
         missing_labels.append(f"missing media for {len(requirements['media'])} scene(s)")
-    if requirements["external_results"]:
-        missing_labels.append(f"missing external results for {len(requirements['external_results'])} scene(s)")
+    if requirements["evidence"]:
+        missing_labels.append(f"missing protected evidence for {len(requirements['evidence'])} run(s)")
     if requirements["toolchain"]:
         missing_labels.append("resolved toolchain is unavailable")
+    if requirements["evidence_key"]:
+        missing_labels.append("protected evidence key is unavailable")
+    if requirements["request_index"]:
+        missing_labels.append("protected request index is unavailable")
     if profile == "release" and result["git"]["dirty"]:
         missing_labels.append("release benchmark requires a clean Git worktree")
     if missing_labels:
@@ -1568,12 +2068,23 @@ def run_suite(
         toolchain_identity,
     )
     result["toolchain_identity"] = identity.toolchain_identity
+    evidence_key = evidence.load_key(evidence_key_path) if profile == "release" and evidence_key_path else None
+    approved_runners: dict[str, dict[str, str]] = {}
+    if profile == "release":
+        if request_index_path is None:
+            raise ConfigError("protected request index is unavailable")
+        request_index = validate_request_index(
+            _load_json(request_index_path, "request index"),
+            identity,
+            corpus,
+        )
+        approved_runners = request_index["runner_identities"]
     input_digests: dict[str, str] = {}
     for scene in corpus["scenes"]:
         input_digests[scene["id"]] = digest_input(corpus_path.parent / scene["input"]["media_path"])
         for scale in scene["scale_lanes"]:
-            if scene["adapter"]["type"] == "external-result":
-                scene_result = _copy_external_result(
+            if scene["adapter"]["type"] == "fixture":
+                scene_result = _copy_fixture_result(
                     scene,
                     scale,
                     corpus_path.parent,
@@ -1581,13 +2092,16 @@ def run_suite(
                     input_digests[scene["id"]],
                 )
             else:
-                scene_result = _run_da3(
+                if evidence_key is None:
+                    raise ConfigError("protected evidence key is unavailable")
+                scene_result = _copy_protected_evidence(
                     scene,
                     scale,
-                    corpus_path.parent,
-                    toolchain_root,
-                    raw_directory,
+                    evidence_root or corpus_path.parent,
+                    identity,
                     input_digests[scene["id"]],
+                    evidence_key,
+                    approved_runners,
                 )
             scene_results.append(scene_result)
     result["scene_results"] = scene_results
@@ -1616,6 +2130,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--reference-config", type=Path, required=True)
     parser.add_argument("--toolchain-root", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--evidence-key-file", type=Path)
+    parser.add_argument("--emit-requests", type=Path)
+    parser.add_argument("--evidence-root", type=Path)
+    parser.add_argument("--request-index", type=Path)
+    parser.add_argument("--runner-identity", action="append")
     parser.add_argument("--dry-run", action="store_true")
     return parser
 
@@ -1630,8 +2149,13 @@ def main(argv: list[str] | None = None) -> int:
             toolchain_root=args.toolchain_root,
             output_directory=args.output,
             dry_run=args.dry_run,
+            evidence_key_path=args.evidence_key_file,
+            emit_requests_directory=args.emit_requests,
+            evidence_root=args.evidence_root,
+            request_index_path=args.request_index,
+            runner_identities=parse_runner_identities(args.runner_identity),
         )
-    except ConfigError as error:
+    except (ConfigError, evidence.EvidenceError) as error:
         print(f"benchmark configuration error: {error}", file=sys.stderr)
         return 64
 

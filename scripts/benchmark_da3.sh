@@ -297,7 +297,6 @@ run_case() {
       --models-dir "$DA3_MODELS_DIR" \
       --manifest-out "$manifest_path" \
       --device mps \
-      --mode seed_refine \
       --input-ordering continuous \
       --model-subdir DA3-BASE \
       --fallback-model-subdir DA3-SMALL \
