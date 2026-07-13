@@ -103,7 +103,7 @@ exact_values = {
     "source_version": "1.1.3",
     "source_tree_sha256": "866fd6d051b5cf98ca08ae1552236473f504d8f13756cbda68201e48532c3e6a",
     "overlay_sha256": "26b10371a53485608d292603468e5d24fca65ed2558fb77e512ef1ee51a29723",
-    "patch_sha256": "ee2dde253eb2a53df56811a59a8c490208e3c7bad19cef38ae96f81a7d5be2a1",
+    "patch_sha256": "fafbf6f43a3be474a708607a903fc0dbb0029a4d4664c261a1ebaf301f3e9f3f",
     "checkpoint_patch_sha256": "c8b9a8dd03afb4bc50b8a12adf78dc46f5280d67bb62823c58aff2305a4870dc",
     "deployment_target": "macOS 15.0",
     "build_configuration": "Release",

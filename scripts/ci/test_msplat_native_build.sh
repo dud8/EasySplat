@@ -131,6 +131,18 @@ require_contains 'pipelineLoadFailed' "$UPSTREAM_PATCH"
 require_contains 'std::ios::failbit' "$UPSTREAM_PATCH"
 require_contains 'float3 b_conic = float3(0.0f)' "$UPSTREAM_PATCH"
 require_contains 'int32_t b_id = 0' "$UPSTREAM_PATCH"
+if [ "$(grep -Fc 'std::array<float, 4>' "$UPSTREAM_PATCH")" -lt 2 ] ||
+   [ "$(grep -Fc 'cam_pos[0], cam_pos[1], cam_pos[2], 0.0f' "$UPSTREAM_PATCH")" -lt 2 ]; then
+  fail "$UPSTREAM_PATCH must pad every inline Metal float3 argument to sixteen bytes"
+fi
+require_contains 'staticThreadgroupMemoryLength' "$UPSTREAM_PATCH"
+require_contains 'maxThreadgroupMemoryLength' "$UPSTREAM_PATCH"
+require_contains '#define SSIM_TG 8' "$UPSTREAM_PATCH"
+if [ "$(grep -Fc 'MTLSizeMake(8, 8, 1)' "$UPSTREAM_PATCH")" -lt 2 ]; then
+  fail "$UPSTREAM_PATCH must dispatch every SSIM path with its eight-by-eight kernel shape"
+fi
+require_contains 'pixel_has_contributors' "$UPSTREAM_PATCH"
+require_contains 'pixel_has_contributors ? bin_final : -1' "$UPSTREAM_PATCH"
 require_contains 'void msplat_record_last_loss' "$UPSTREAM_PATCH"
 require_contains 'void msplat_sync_loss_window' "$UPSTREAM_PATCH"
 require_contains 'syncCB()' "$UPSTREAM_PATCH"
@@ -467,8 +479,19 @@ while IFS=$'\t' read -r fixture_name expected_points; do
   fixture_count=$((fixture_count + 1))
   training_fixture="$fixture_root/$fixture_name"
   training_dir="$negative_dir/training-$fixture_name"
+  validation_environment=(env)
+  if [ "$fixture_count" = "1" ]; then
+    validation_environment=(
+      env
+      MTL_DEBUG_LAYER=1
+      MTL_SHADER_VALIDATION=1
+      MTL_SHADER_VALIDATION_ENABLE_ERROR_REPORTING=1
+      MTL_SHADER_VALIDATION_REPORT_TO_STDERR=1
+      MTL_SHADER_VALIDATION_ABORT_ON_FAULT=1
+    )
+  fi
   mkdir -p "$training_dir"
-  if ! "$BIN" \
+  if ! "${validation_environment[@]}" "$BIN" \
     --dataset "$training_fixture" \
     --output "$training_dir/splat.ply" \
     --profile fast \
@@ -478,6 +501,12 @@ while IFS=$'\t' read -r fixture_name expected_points; do
     >"$training_dir/events.jsonl" 2>"$training_dir/stderr.log"; then
     sed -n '1,200p' "$training_dir/stderr.log" >&2
     fail "$fixture_name training failed"
+  fi
+  if [ "$fixture_count" = "1" ] &&
+     grep -Eqi 'shader validation|invalid (device|threadgroup|texture)|validation (error|fault)|gpu fault' \
+       "$training_dir/stderr.log"; then
+    sed -n '1,200p' "$training_dir/stderr.log" >&2
+    fail "$fixture_name emitted Metal validation diagnostics"
   fi
   validate_jsonl "$training_dir/events.jsonl"
   validate_training_events "$training_dir/events.jsonl" "$expected_points"
