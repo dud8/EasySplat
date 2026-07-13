@@ -1,0 +1,295 @@
+name: Release Benchmark Evidence
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: release-benchmark-${{ github.sha }}
+  cancel-in-progress: false
+
+jobs:
+  prepare:
+    if: github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
+    runs-on: [self-hosted, macOS, ARM64, easysplat-benchmark-reference]
+    environment: benchmark-release
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: "3.12"
+
+      - name: Verify protected source and prepare bound requests
+        env:
+          GH_TOKEN: ${{ github.token }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+          RELEASE_CORPUS: ${{ vars.EASYSPLAT_BENCHMARK_REFERENCE_CORPUS }}
+          TOOLCHAIN_ROOT: ${{ vars.EASYSPLAT_BENCHMARK_REFERENCE_TOOLCHAIN_ROOT }}
+          REFERENCE_RUNNER_SHA256: ${{ vars.EASYSPLAT_BENCHMARK_REFERENCE_RUNNER_SHA256 }}
+          CONSTRAINED_RUNNER_SHA256: ${{ vars.EASYSPLAT_BENCHMARK_CONSTRAINED_RUNNER_SHA256 }}
+          EIGHT_GB_RUNNER_SHA256: ${{ vars.EASYSPLAT_BENCHMARK_8GB_RUNNER_SHA256 }}
+        run: |
+          test -n "$RELEASE_CORPUS"
+          test -f "$RELEASE_CORPUS"
+          test -n "$TOOLCHAIN_ROOT"
+          test -d "$TOOLCHAIN_ROOT"
+          runner_sha_re='^sha256:[0-9a-f]{64}$'
+          for runner_sha in "$REFERENCE_RUNNER_SHA256" "$CONSTRAINED_RUNNER_SHA256" "$EIGHT_GB_RUNNER_SHA256"; do
+            if ! [[ "$runner_sha" =~ $runner_sha_re ]]; then
+              echo "Each protected benchmark runner needs an approved lowercase sha256:<64 hex> identity." >&2
+              exit 1
+            fi
+          done
+          CURRENT_HEAD="$(gh api "repos/$GITHUB_REPOSITORY/commits/$DEFAULT_BRANCH" --jq .sha)"
+          test "$GITHUB_SHA" = "$CURRENT_HEAD"
+          test -z "$(git status --porcelain)"
+          REQUESTS="$RUNNER_TEMP/easysplat-benchmark-requests"
+          rm -rf "$REQUESTS"
+          scripts/benchmark/run_suite.sh \
+            --profile release \
+            --corpus "$RELEASE_CORPUS" \
+            --toolchain-root "$TOOLCHAIN_ROOT" \
+            --output "$RUNNER_TEMP/unused-benchmark-output" \
+            --runner-identity "reference_m4_max=$REFERENCE_RUNNER_SHA256" \
+            --runner-identity "constrained_14_16gb=$CONSTRAINED_RUNNER_SHA256" \
+            --runner-identity "eight_gb_fast=$EIGHT_GB_RUNNER_SHA256" \
+            --emit-requests "$REQUESTS"
+
+      - name: Upload bound requests
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: easysplat-benchmark-requests-${{ github.sha }}
+          path: ${{ runner.temp }}/easysplat-benchmark-requests
+          if-no-files-found: error
+          retention-days: 7
+
+  reference:
+    needs: prepare
+    if: github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
+    runs-on: [self-hosted, macOS, ARM64, easysplat-benchmark-reference]
+    environment: benchmark-release
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: "3.12"
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: easysplat-benchmark-requests-${{ github.sha }}
+          path: ${{ runner.temp }}/requests
+      - name: Measure and attest reference lane
+        env:
+          RELEASE_CORPUS: ${{ vars.EASYSPLAT_BENCHMARK_REFERENCE_CORPUS }}
+          TOOLCHAIN_ROOT: ${{ vars.EASYSPLAT_BENCHMARK_REFERENCE_TOOLCHAIN_ROOT }}
+          MEASUREMENT_RUNNER: ${{ vars.EASYSPLAT_BENCHMARK_REFERENCE_RUNNER }}
+          EVIDENCE_KEY_BASE64: ${{ secrets.BENCHMARK_EVIDENCE_KEY_BASE64 }}
+        run: |
+          test -n "$RELEASE_CORPUS" && test -f "$RELEASE_CORPUS"
+          test -n "$TOOLCHAIN_ROOT" && test -d "$TOOLCHAIN_ROOT"
+          test -n "$MEASUREMENT_RUNNER" && test -x "$MEASUREMENT_RUNNER" && test ! -L "$MEASUREMENT_RUNNER"
+          test -n "$EVIDENCE_KEY_BASE64"
+          umask 077
+          trap 'rm -f "$RUNNER_TEMP/evidence.key"' EXIT
+          python3 - "$RUNNER_TEMP/evidence.key" <<'PY'
+          import base64, os, pathlib, sys
+          pathlib.Path(sys.argv[1]).write_bytes(base64.b64decode(os.environ["EVIDENCE_KEY_BASE64"], validate=True))
+          PY
+          unset EVIDENCE_KEY_BASE64
+          python3 scripts/benchmark/run_lane.py \
+            --index "$RUNNER_TEMP/requests/index.json" \
+            --requests-root "$RUNNER_TEMP/requests" \
+            --corpus "$RELEASE_CORPUS" \
+            --reference-config scripts/benchmark/reference-config.json \
+            --toolchain-root "$TOOLCHAIN_ROOT" \
+            --output "$RUNNER_TEMP/reference-evidence" \
+            --lane reference_m4_max \
+            --runner "$MEASUREMENT_RUNNER" \
+            --evidence-key-file "$RUNNER_TEMP/evidence.key"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: easysplat-benchmark-reference-${{ github.sha }}
+          path: ${{ runner.temp }}/reference-evidence
+          if-no-files-found: error
+          retention-days: 30
+
+  constrained:
+    needs: prepare
+    if: github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
+    runs-on: [self-hosted, macOS, ARM64, easysplat-benchmark-constrained]
+    environment: benchmark-release
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: "3.12"
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: easysplat-benchmark-requests-${{ github.sha }}
+          path: ${{ runner.temp }}/requests
+      - name: Measure and attest constrained lane
+        env:
+          RELEASE_CORPUS: ${{ vars.EASYSPLAT_BENCHMARK_CONSTRAINED_CORPUS }}
+          TOOLCHAIN_ROOT: ${{ vars.EASYSPLAT_BENCHMARK_CONSTRAINED_TOOLCHAIN_ROOT }}
+          MEASUREMENT_RUNNER: ${{ vars.EASYSPLAT_BENCHMARK_CONSTRAINED_RUNNER }}
+          EVIDENCE_KEY_BASE64: ${{ secrets.BENCHMARK_EVIDENCE_KEY_BASE64 }}
+        run: |
+          test -n "$RELEASE_CORPUS" && test -f "$RELEASE_CORPUS"
+          test -n "$TOOLCHAIN_ROOT" && test -d "$TOOLCHAIN_ROOT"
+          test -n "$MEASUREMENT_RUNNER" && test -x "$MEASUREMENT_RUNNER" && test ! -L "$MEASUREMENT_RUNNER"
+          test -n "$EVIDENCE_KEY_BASE64"
+          umask 077
+          trap 'rm -f "$RUNNER_TEMP/evidence.key"' EXIT
+          python3 - "$RUNNER_TEMP/evidence.key" <<'PY'
+          import base64, os, pathlib, sys
+          pathlib.Path(sys.argv[1]).write_bytes(base64.b64decode(os.environ["EVIDENCE_KEY_BASE64"], validate=True))
+          PY
+          unset EVIDENCE_KEY_BASE64
+          python3 scripts/benchmark/run_lane.py \
+            --index "$RUNNER_TEMP/requests/index.json" \
+            --requests-root "$RUNNER_TEMP/requests" \
+            --corpus "$RELEASE_CORPUS" \
+            --reference-config scripts/benchmark/reference-config.json \
+            --toolchain-root "$TOOLCHAIN_ROOT" \
+            --output "$RUNNER_TEMP/constrained-evidence" \
+            --lane constrained_14_16gb \
+            --runner "$MEASUREMENT_RUNNER" \
+            --evidence-key-file "$RUNNER_TEMP/evidence.key"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: easysplat-benchmark-constrained-${{ github.sha }}
+          path: ${{ runner.temp }}/constrained-evidence
+          if-no-files-found: error
+          retention-days: 30
+
+  eight-gb:
+    needs: prepare
+    if: github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
+    runs-on: [self-hosted, macOS, ARM64, easysplat-benchmark-8gb]
+    environment: benchmark-release
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: "3.12"
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: easysplat-benchmark-requests-${{ github.sha }}
+          path: ${{ runner.temp }}/requests
+      - name: Measure and attest physical 8 GB lane
+        env:
+          RELEASE_CORPUS: ${{ vars.EASYSPLAT_BENCHMARK_8GB_CORPUS }}
+          TOOLCHAIN_ROOT: ${{ vars.EASYSPLAT_BENCHMARK_8GB_TOOLCHAIN_ROOT }}
+          MEASUREMENT_RUNNER: ${{ vars.EASYSPLAT_BENCHMARK_8GB_RUNNER }}
+          EVIDENCE_KEY_BASE64: ${{ secrets.BENCHMARK_EVIDENCE_KEY_BASE64 }}
+        run: |
+          test -n "$RELEASE_CORPUS" && test -f "$RELEASE_CORPUS"
+          test -n "$TOOLCHAIN_ROOT" && test -d "$TOOLCHAIN_ROOT"
+          test -n "$MEASUREMENT_RUNNER" && test -x "$MEASUREMENT_RUNNER" && test ! -L "$MEASUREMENT_RUNNER"
+          test -n "$EVIDENCE_KEY_BASE64"
+          umask 077
+          trap 'rm -f "$RUNNER_TEMP/evidence.key"' EXIT
+          python3 - "$RUNNER_TEMP/evidence.key" <<'PY'
+          import base64, os, pathlib, sys
+          pathlib.Path(sys.argv[1]).write_bytes(base64.b64decode(os.environ["EVIDENCE_KEY_BASE64"], validate=True))
+          PY
+          unset EVIDENCE_KEY_BASE64
+          python3 scripts/benchmark/run_lane.py \
+            --index "$RUNNER_TEMP/requests/index.json" \
+            --requests-root "$RUNNER_TEMP/requests" \
+            --corpus "$RELEASE_CORPUS" \
+            --reference-config scripts/benchmark/reference-config.json \
+            --toolchain-root "$TOOLCHAIN_ROOT" \
+            --output "$RUNNER_TEMP/eight-gb-evidence" \
+            --lane eight_gb_fast \
+            --runner "$MEASUREMENT_RUNNER" \
+            --evidence-key-file "$RUNNER_TEMP/evidence.key"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: easysplat-benchmark-8gb-${{ github.sha }}
+          path: ${{ runner.temp }}/eight-gb-evidence
+          if-no-files-found: error
+          retention-days: 30
+
+  aggregate:
+    needs: [prepare, reference, constrained, eight-gb]
+    if: github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
+    runs-on: [self-hosted, macOS, ARM64, easysplat-benchmark-reference]
+    environment: benchmark-release
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: "3.12"
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: easysplat-benchmark-requests-${{ github.sha }}
+          path: ${{ runner.temp }}/requests
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: easysplat-benchmark-reference-${{ github.sha }}
+          path: ${{ runner.temp }}/evidence
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: easysplat-benchmark-constrained-${{ github.sha }}
+          path: ${{ runner.temp }}/evidence
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: easysplat-benchmark-8gb-${{ github.sha }}
+          path: ${{ runner.temp }}/evidence
+      - name: Verify and aggregate protected evidence
+        env:
+          RELEASE_CORPUS: ${{ vars.EASYSPLAT_BENCHMARK_REFERENCE_CORPUS }}
+          TOOLCHAIN_ROOT: ${{ vars.EASYSPLAT_BENCHMARK_REFERENCE_TOOLCHAIN_ROOT }}
+          EVIDENCE_KEY_BASE64: ${{ secrets.BENCHMARK_EVIDENCE_KEY_BASE64 }}
+        run: |
+          test -n "$RELEASE_CORPUS" && test -f "$RELEASE_CORPUS"
+          test -n "$TOOLCHAIN_ROOT" && test -d "$TOOLCHAIN_ROOT"
+          test -n "$EVIDENCE_KEY_BASE64"
+          umask 077
+          trap 'rm -f "$RUNNER_TEMP/evidence.key"' EXIT
+          python3 - "$RUNNER_TEMP/evidence.key" <<'PY'
+          import base64, os, pathlib, sys
+          pathlib.Path(sys.argv[1]).write_bytes(base64.b64decode(os.environ["EVIDENCE_KEY_BASE64"], validate=True))
+          PY
+          unset EVIDENCE_KEY_BASE64
+          OUTPUT="$RUNNER_TEMP/verified-benchmark"
+          scripts/benchmark/run_suite.sh \
+            --profile release \
+            --corpus "$RELEASE_CORPUS" \
+            --toolchain-root "$TOOLCHAIN_ROOT" \
+            --evidence-root "$RUNNER_TEMP/evidence" \
+            --evidence-key-file "$RUNNER_TEMP/evidence.key" \
+            --request-index "$RUNNER_TEMP/requests/index.json" \
+            --output "$OUTPUT"
+          test "$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["status"])' "$OUTPUT/suite.json")" = "passed"
+          FINAL="$RUNNER_TEMP/final-benchmark"
+          rm -rf "$FINAL"
+          mkdir -p "$FINAL"
+          cp "$OUTPUT/suite.json" "$FINAL/suite.json"
+          cp -R "$RUNNER_TEMP/requests" "$FINAL/requests"
+          cp -R "$RUNNER_TEMP/evidence" "$FINAL/evidence"
+      - name: Upload verified benchmark closure
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: easysplat-benchmark-${{ github.sha }}
+          path: ${{ runner.temp }}/final-benchmark
+          if-no-files-found: error
+          retention-days: 90

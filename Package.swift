@@ -6,7 +6,9 @@ let package = Package(
     platforms: [.macOS(.v15)],
     products: [
         .library(name: "EasySplatCore", targets: ["EasySplatCore"]),
-        .executable(name: "EasySplatApp", targets: ["EasySplatApp"])
+        .executable(name: "EasySplatApp", targets: ["EasySplatApp"]),
+        .executable(name: "EasySplatReleaseVerifier", targets: ["EasySplatReleaseVerifier"]),
+        .executable(name: "EasySplatUIVerifier", targets: ["EasySplatUIVerifier"])
     ],
     dependencies: [
         .package(path: "ThirdParty/MetalSplatter")
@@ -26,10 +28,27 @@ let package = Package(
                 .product(name: "SplatIO", package: "MetalSplatter")
             ],
             path: "EasySplatApp",
-            exclude: ["AGENTS.md"],
+            exclude: ["AGENTS.md", "Resources/EasySplatAppIcon.icns"],
             resources: [
-                .process("Resources")
+                .copy("Resources/project_home_url.txt"),
+                .copy("Resources/public_key_ed25519.txt"),
+                .copy("Resources/toolchain_manifest_url.txt")
             ]
+        ),
+        .executableTarget(
+            name: "EasySplatReleaseVerifier",
+            dependencies: ["EasySplatCore"],
+            path: "Tools/ReleaseVerifier"
+        ),
+        .target(
+            name: "EasySplatUIVerifierCore",
+            dependencies: ["EasySplatCore"],
+            path: "Tools/UIVerifier/Sources/UIVerifierCore"
+        ),
+        .executableTarget(
+            name: "EasySplatUIVerifier",
+            dependencies: ["EasySplatUIVerifierCore"],
+            path: "Tools/UIVerifier/Sources/UIVerifier"
         ),
         .testTarget(
             name: "EasySplatCoreTests",
@@ -43,9 +62,9 @@ let package = Package(
             path: "EasySplatAppTests"
         ),
         .testTarget(
-            name: "EasySplatUITests",
-            dependencies: ["EasySplatApp"],
-            path: "EasySplatUITests"
+            name: "EasySplatUIVerifierTests",
+            dependencies: ["EasySplatUIVerifierCore"],
+            path: "Tools/UIVerifier/Tests"
         )
     ]
 )

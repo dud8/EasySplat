@@ -6,26 +6,78 @@ on:
   pull_request:
     branches: ["main"]
 
+permissions:
+  contents: read
+
+concurrency:
+  group: tests-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   swift-tests:
+    name: Swift · macOS 15 arm64 · Xcode 16.4
     runs-on: macos-15
+    timeout-minutes: 45
     steps:
-      - uses: actions/checkout@v4
-      - name: Select supported Xcode 16
-        run: sudo xcode-select -s /Applications/Xcode_16.4.app
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+      - name: Verify Apple Silicon test host
+        run: |
+          test "$(uname -m)" = "arm64"
+          case "$(sw_vers -productVersion)" in
+            15.*) ;;
+            *) echo "Expected macOS 15, found $(sw_vers -productVersion)" >&2; exit 1 ;;
+          esac
+      - name: Select Xcode 16.4
+        run: |
+          test -d /Applications/Xcode_16.4.app
+          sudo xcode-select -s /Applications/Xcode_16.4.app
+          xcodebuild -version | grep -Fx 'Xcode 16.4'
       - name: Run app and core tests
         run: ./scripts/test.sh
       - name: Run manifest tool tests
         run: swift test --package-path Tools/ManifestTool
 
-  native-msplat:
+  constrained-memory-policy:
+    name: Real 8 GB-class policy lane
     runs-on: macos-15
+    timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
-      - name: Select supported Xcode 16
-        run: sudo xcode-select -s /Applications/Xcode_16.4.app
-      - name: Install native build tools
-        run: brew install cmake ninja
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+      - name: Verify physical constrained-memory host
+        run: |
+          test "$(uname -m)" = "arm64"
+          memory_bytes="$(sysctl -n hw.memsize)"
+          maximum_bytes=$((8 * 1024 * 1024 * 1024))
+          echo "Physical unified memory: $memory_bytes bytes"
+          if [ "$memory_bytes" -gt "$maximum_bytes" ]; then
+            echo "This lane requires a physical 8 GB-class runner; it does not simulate a memory cap." >&2
+            exit 1
+          fi
+      - name: Select Xcode 16.4
+        run: |
+          test -d /Applications/Xcode_16.4.app
+          sudo xcode-select -s /Applications/Xcode_16.4.app
+      - name: Test constrained run planning
+        run: |
+          swift test --filter RunPlanResolverTests
+
+  native-msplat:
+    name: Native Metal trainer
+    runs-on: macos-15
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+      - name: Select Xcode 16.4
+        run: |
+          test "$(uname -m)" = "arm64"
+          test -d /Applications/Xcode_16.4.app
+          sudo xcode-select -s /Applications/Xcode_16.4.app
       - name: Build pinned native trainer
         run: ./scripts/toolchain/build_msplat.sh
       - name: Validate native trainer and release integration
@@ -34,29 +86,37 @@ jobs:
           ./scripts/ci/test_release_scripts.sh
 
   repo-health:
-    runs-on: ubuntu-latest
+    name: Repository contracts
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v4
-      - name: Install repo health dependencies
-        run: sudo apt-get update && sudo apt-get install -y ripgrep
-      - name: Verify public repo collateral
-        run: ./scripts/ci/check_repo_health.sh
-      - name: Lint shell scripts
-        run: find scripts -type f -name '*.sh' -print0 | xargs -0 -n1 bash -n
-      - name: Validate release script behavior
-        run: ./scripts/ci/test_release_scripts.sh
-
-  python-tools:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
-          python-version: '3.12'
-          cache: 'pip'
-      - name: Install minimal Python test deps
+          persist-credentials: false
+      - name: Install repository check dependencies
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends ripgrep
+      - name: Verify public repository collateral
+        run: ./scripts/ci/check_repo_health.sh
+      - name: Verify workflow contracts
+        run: ./scripts/ci/check_workflows.sh
+      - name: Check shell syntax
+        run: git ls-files -z 'scripts/*.sh' 'scripts/**/*.sh' | xargs -0 -r -n1 bash -n
+  python-tools:
+    name: DA3 bridge · Python 3.12
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: Tools/Da3Sfm/requirements.txt
+      - name: Install minimal bridge test dependencies
         run: |
-          python -m pip install --upgrade pip
-          python -m pip install numpy pillow torch==2.10.0 torchvision==0.25.0
+          python -m pip install --disable-pip-version-check --no-input \
+            numpy==2.3.5 pillow==12.2.0 torch==2.12.1 torchvision==0.27.1
       - name: Run Python bridge tests
         run: ./scripts/test_python_tools.sh

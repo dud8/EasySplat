@@ -19,10 +19,14 @@ required_files=(
   "$ROOT/.github/ISSUE_TEMPLATE/feature_request.yml"
   "$ROOT/scripts/benchmark/run_suite.sh"
   "$ROOT/scripts/benchmark/easysplat_benchmark.py"
+  "$ROOT/scripts/benchmark/evidence_protocol.py"
+  "$ROOT/scripts/benchmark/run_lane.py"
   "$ROOT/scripts/benchmark/result.schema.json"
+  "$ROOT/scripts/benchmark/evidence.schema.json"
   "$ROOT/scripts/benchmark/corpus.json"
   "$ROOT/scripts/benchmark/reference-config.json"
   "$ROOT/scripts/benchmark/tests/test_benchmark.py"
+  "$ROOT/.github/workflows/benchmark-release.yml"
 )
 
 for path in "${required_files[@]}"; do
@@ -44,6 +48,8 @@ public_text_files=(
   "$ROOT/.github/ISSUE_TEMPLATE/feature_request.yml"
 )
 
+# The final alternative intentionally matches a Windows path prefix.
+# shellcheck disable=SC1003
 if rg -n '/Users/|/home/|C:\\\\' "${public_text_files[@]}" >/dev/null; then
   echo "Public repo docs/templates contain machine-specific absolute paths." >&2
   exit 1
@@ -61,22 +67,33 @@ if rg -n 'sparkle-project/Sparkle|Sparkle.framework' \
   exit 1
 fi
 
-if rg -n 'github.com/dud8/EasySplat|http://localhost:8000' \
+if rg -n 'github.com/EasySplat/EasySplat|http://localhost:8000' \
   "$ROOT/EasySplatApp/AppConfig.swift" \
   "$ROOT/EasySplatApp/AppModel.swift" \
   "$ROOT/EasySplatApp/Resources" >/dev/null; then
-  echo "Shipped app sources/resources still contain personal or localhost defaults." >&2
+  echo "Shipped app sources/resources contain a stale or localhost release default." >&2
   exit 1
 fi
 
-for path in "$ROOT/scripts/release/build_dmg.sh" "$ROOT/.github/workflows/toolchain-build.yml"; do
-  for builder in build_colmap.sh build_openssl.sh build_msplat.sh build_da3_mps.sh; do
-    if ! rg -n "scripts/toolchain/$builder" "$path" >/dev/null; then
-      echo "Release path no longer runs required toolchain builder $builder: $path" >&2
-      exit 1
-    fi
-  done
+toolchain_workflow="$ROOT/.github/workflows/toolchain-build.yml"
+for builder in \
+  build_suitesparse.sh \
+  build_ceres.sh \
+  build_openimageio.sh \
+  build_colmap.sh \
+  build_msplat.sh \
+  build_da3_mps.sh; do
+  if ! rg -n "scripts/toolchain/$builder" "$toolchain_workflow" >/dev/null; then
+    echo "Toolchain workflow no longer runs required builder $builder: $toolchain_workflow" >&2
+    exit 1
+  fi
 done
+
+if rg -n 'brew install .*\b(suitesparse|ceres-solver|cgal|freeimage|qt)\b' \
+  "$ROOT/.github/workflows/toolchain-build.yml" >/dev/null; then
+  echo "Toolchain workflow installs a forbidden prebuilt or disabled COLMAP dependency." >&2
+  exit 1
+fi
 
 legacy_runtime_pattern='brush|mapanything|fastvggt|vggt|glomap'
 for path in \
@@ -90,12 +107,10 @@ for path in \
   fi
 done
 
-for path in "$ROOT/scripts/release/build_dmg.sh" "$ROOT/.github/workflows/toolchain-build.yml"; do
-  if ! rg -n 'refuses EASYSPLAT_ALLOW_UNPINNED_DA3_SOURCE' "$path" >/dev/null; then
-    echo "Release path no longer rejects unpinned DA3 source overrides: $path" >&2
-    exit 1
-  fi
-done
+if ! rg -n 'refuses EASYSPLAT_ALLOW_UNPINNED_DA3_SOURCE' "$toolchain_workflow" >/dev/null; then
+  echo "Toolchain workflow no longer rejects unpinned DA3 source overrides: $toolchain_workflow" >&2
+  exit 1
+fi
 
 if rg -n '(^|[^A-Za-z0-9_])(xformers|flash[-_]attn|triton|torch[-_]scatter)([^A-Za-z0-9_]|$)' \
   "$ROOT/Tools/Da3Sfm" \

@@ -17,3 +17,4 @@ research_papers/
 tmp/
 __pycache__/
 *.pyc
+*.profraw

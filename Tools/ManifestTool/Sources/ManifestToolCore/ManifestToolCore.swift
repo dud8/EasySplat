@@ -32,19 +32,11 @@ public struct ManifestDocument: Codable, Equatable {
         public var url: String
         public var sha256: String
         public var sizeBytes: UInt64
+        public var expandedSizeBytes: UInt64
         public var contents: [String]
         public var criticalFileHashes: [String: String]
         public var dependencies: [String]
         public var requirement: ComponentRequirement
-        private var encodesLegacyExecutableHashes: Bool
-
-        public var executableHashes: [String: String] {
-            get { criticalFileHashes }
-            set {
-                criticalFileHashes = newValue
-                encodesLegacyExecutableHashes = true
-            }
-        }
 
         public init(
             name: String,
@@ -52,29 +44,7 @@ public struct ManifestDocument: Codable, Equatable {
             url: String,
             sha256: String,
             sizeBytes: UInt64,
-            contents: [String],
-            executableHashes: [String: String],
-            dependencies: [String],
-            requirement: ComponentRequirement
-        ) {
-            self.name = name
-            self.capabilities = capabilities
-            self.url = url
-            self.sha256 = sha256
-            self.sizeBytes = sizeBytes
-            self.contents = contents
-            self.criticalFileHashes = executableHashes
-            self.dependencies = dependencies
-            self.requirement = requirement
-            self.encodesLegacyExecutableHashes = true
-        }
-
-        public init(
-            name: String,
-            capabilities: [String],
-            url: String,
-            sha256: String,
-            sizeBytes: UInt64,
+            expandedSizeBytes: UInt64? = nil,
             contents: [String],
             criticalFileHashes: [String: String],
             dependencies: [String],
@@ -85,104 +55,12 @@ public struct ManifestDocument: Codable, Equatable {
             self.url = url
             self.sha256 = sha256
             self.sizeBytes = sizeBytes
+            self.expandedSizeBytes = expandedSizeBytes ?? sizeBytes
             self.contents = contents
             self.criticalFileHashes = criticalFileHashes
             self.dependencies = dependencies
             self.requirement = requirement
-            self.encodesLegacyExecutableHashes = false
         }
-
-        public init(
-            name: String,
-            url: String,
-            sha256: String,
-            sizeBytes: UInt64,
-            contents: [String]
-        ) {
-            self.init(
-                name: name,
-                capabilities: [],
-                url: url,
-                sha256: sha256,
-                sizeBytes: sizeBytes,
-                contents: contents,
-                executableHashes: [:],
-                dependencies: [],
-                requirement: .required
-            )
-        }
-
-        private enum CodingKeys: String, CodingKey {
-            case name
-            case capabilities
-            case url
-            case sha256
-            case sizeBytes
-            case contents
-            case criticalFileHashes
-            case executableHashes
-            case dependencies
-            case requirement
-        }
-
-        public init(from decoder: Decoder) throws {
-            let container = try decoder.container(keyedBy: CodingKeys.self)
-            name = try container.decode(String.self, forKey: .name)
-            capabilities = try container.decode([String].self, forKey: .capabilities)
-            url = try container.decode(String.self, forKey: .url)
-            sha256 = try container.decode(String.self, forKey: .sha256)
-            sizeBytes = try container.decode(UInt64.self, forKey: .sizeBytes)
-            contents = try container.decode([String].self, forKey: .contents)
-            dependencies = try container.decode([String].self, forKey: .dependencies)
-            requirement = try container.decode(ComponentRequirement.self, forKey: .requirement)
-
-            let critical = try container.decodeIfPresent(
-                [String: String].self,
-                forKey: .criticalFileHashes
-            )
-            let legacy = try container.decodeIfPresent(
-                [String: String].self,
-                forKey: .executableHashes
-            )
-            guard critical == nil || legacy == nil else {
-                throw DecodingError.dataCorruptedError(
-                    forKey: .criticalFileHashes,
-                    in: container,
-                    debugDescription: "Component cannot contain both criticalFileHashes and executableHashes."
-                )
-            }
-            if let critical {
-                criticalFileHashes = critical
-                encodesLegacyExecutableHashes = false
-            } else {
-                criticalFileHashes = legacy ?? [:]
-                encodesLegacyExecutableHashes = true
-            }
-        }
-
-        public func encode(to encoder: Encoder) throws {
-            var container = encoder.container(keyedBy: CodingKeys.self)
-            try container.encode(name, forKey: .name)
-            try container.encode(capabilities, forKey: .capabilities)
-            try container.encode(url, forKey: .url)
-            try container.encode(sha256, forKey: .sha256)
-            try container.encode(sizeBytes, forKey: .sizeBytes)
-            try container.encode(contents, forKey: .contents)
-            if encodesLegacyExecutableHashes {
-                try container.encode(criticalFileHashes, forKey: .executableHashes)
-            } else {
-                try container.encode(criticalFileHashes, forKey: .criticalFileHashes)
-            }
-            try container.encode(dependencies, forKey: .dependencies)
-            try container.encode(requirement, forKey: .requirement)
-        }
-    }
-
-    public typealias Artifact = Component
-
-    public var artifacts: [Artifact] {
-        get { components }
-        set { components = newValue }
     }
 
     public init(
@@ -204,99 +82,6 @@ public struct ManifestDocument: Codable, Equatable {
         self.components = components
         self.signatureEd25519 = signatureEd25519
     }
-
-    public init(
-        version: String,
-        publishedAt: Date,
-        artifacts: [Artifact],
-        signatureEd25519: String
-    ) {
-        self.init(
-            schemaVersion: 1,
-            toolchainAPI: 1,
-            keyID: "",
-            version: version,
-            publishedAt: publishedAt,
-            appVersionRange: .init(minimum: "0.0.0", maximumExclusive: nil),
-            components: artifacts,
-            signatureEd25519: signatureEd25519
-        )
-    }
-
-    private enum CodingKeys: String, CodingKey {
-        case schemaVersion
-        case toolchainAPI
-        case keyID
-        case version
-        case publishedAt
-        case appVersionRange
-        case components
-        case artifacts
-        case signatureEd25519
-    }
-
-    private struct LegacyArtifact: Codable {
-        var name: String
-        var url: String
-        var sha256: String
-        var sizeBytes: UInt64
-        var contents: [String]
-
-        init(_ component: Component) {
-            name = component.name
-            url = component.url
-            sha256 = component.sha256
-            sizeBytes = component.sizeBytes
-            contents = component.contents
-        }
-
-        var component: Component {
-            Component(
-                name: name,
-                url: url,
-                sha256: sha256,
-                sizeBytes: sizeBytes,
-                contents: contents
-            )
-        }
-    }
-
-    public init(from decoder: Decoder) throws {
-        let container = try decoder.container(keyedBy: CodingKeys.self)
-        schemaVersion = try container.decodeIfPresent(Int.self, forKey: .schemaVersion) ?? 1
-        version = try container.decode(String.self, forKey: .version)
-        publishedAt = try container.decode(Date.self, forKey: .publishedAt)
-        signatureEd25519 = try container.decode(String.self, forKey: .signatureEd25519)
-
-        if schemaVersion >= 2 {
-            toolchainAPI = try container.decode(Int.self, forKey: .toolchainAPI)
-            keyID = try container.decode(String.self, forKey: .keyID)
-            appVersionRange = try container.decode(AppVersionRange.self, forKey: .appVersionRange)
-            components = try container.decode([Component].self, forKey: .components)
-        } else {
-            toolchainAPI = 1
-            keyID = ""
-            appVersionRange = .init(minimum: "0.0.0", maximumExclusive: nil)
-            components = try container.decode([LegacyArtifact].self, forKey: .artifacts).map(\.component)
-        }
-    }
-
-    public func encode(to encoder: Encoder) throws {
-        var container = encoder.container(keyedBy: CodingKeys.self)
-        try container.encode(version, forKey: .version)
-        try container.encode(publishedAt, forKey: .publishedAt)
-        try container.encode(signatureEd25519, forKey: .signatureEd25519)
-
-        if schemaVersion >= 2 {
-            try container.encode(schemaVersion, forKey: .schemaVersion)
-            try container.encode(toolchainAPI, forKey: .toolchainAPI)
-            try container.encode(keyID, forKey: .keyID)
-            try container.encode(appVersionRange, forKey: .appVersionRange)
-            try container.encode(components, forKey: .components)
-        } else {
-            try container.encode(components.map(LegacyArtifact.init), forKey: .artifacts)
-        }
-    }
 }
 
 public struct ManifestArtifactInput: Equatable {
@@ -309,18 +94,6 @@ public struct ManifestArtifactInput: Equatable {
     public var requirement: ManifestDocument.ComponentRequirement
     public var criticalFilePaths: [String]
     public var deriveExactContents: Bool
-
-    public init(name: String, artifactURL: String, zipURL: URL, contents: [String]) {
-        self.name = name
-        self.artifactURL = artifactURL
-        self.zipURL = zipURL
-        self.contents = contents
-        self.capabilities = []
-        self.dependencies = []
-        self.requirement = .required
-        self.criticalFilePaths = []
-        self.deriveExactContents = false
-    }
 
     public init(
         name: String,
@@ -347,28 +120,7 @@ public struct ManifestArtifactInput: Equatable {
 
 public enum ManifestBuilder {
     public static let maximumReleaseAssetBytes: UInt64 = 2_147_483_648
-
-    public static func build(
-        version: String,
-        publishedAt: Date,
-        artifacts: [ManifestArtifactInput],
-        privateKeyBase64: String
-    ) throws -> ManifestDocument {
-        let key = try privateKey(from: privateKeyBase64)
-        let builtArtifacts = try artifacts.map {
-            try makeComponent(from: $0, deriveCoreCriticalFiles: false)
-        }
-        var manifest = ManifestDocument(
-            version: version,
-            publishedAt: publishedAt,
-            artifacts: builtArtifacts,
-            signatureEd25519: ""
-        )
-        manifest.signatureEd25519 = try key.signature(
-            for: canonicalData(for: manifest)
-        ).base64EncodedString()
-        return manifest
-    }
+    public static let maximumExpandedComponentBytes: UInt64 = 16 * 1_024 * 1_024 * 1_024
 
     public static func build(
         version: String,
@@ -377,6 +129,16 @@ public enum ManifestBuilder {
         components: [ManifestArtifactInput],
         privateKeyBase64: String
     ) throws -> ManifestDocument {
+        try requireValidToolchainVersion(version)
+        guard validAppVersionRange(appVersionRange) else {
+            throw NSError(
+                domain: "ManifestTool",
+                code: 12,
+                userInfo: [
+                    NSLocalizedDescriptionKey: "Schema-2 app version range must contain strict SemVer bounds with maximumExclusive greater than minimum."
+                ]
+            )
+        }
         guard !components.isEmpty,
               components.allSatisfy({ !$0.criticalFilePaths.isEmpty }) else {
             throw NSError(
@@ -388,9 +150,7 @@ public enum ManifestBuilder {
             )
         }
         let key = try privateKey(from: privateKeyBase64)
-        let builtComponents = try components.map {
-            try makeComponent(from: $0, deriveCoreCriticalFiles: true)
-        }
+        let builtComponents = try components.map(makeComponent)
         let publicKeyData = key.publicKey.rawRepresentation
         let keyID = SHA256.hash(data: publicKeyData).map { String(format: "%02x", $0) }.joined()
         var manifest = ManifestDocument(
@@ -432,6 +192,77 @@ public enum ManifestBuilder {
         return publicKey.isValidSignature(signatureData, for: canonical)
     }
 
+    public static func verifyRelease(
+        manifest: ManifestDocument,
+        publicKeyBase64: String,
+        expectedToolchainVersion: String,
+        expectedAppVersion: String,
+        expectedComponentURLs: [String: String],
+        componentArchives: [String: URL]
+    ) throws {
+        func fail(_ message: String) throws -> Never {
+            throw NSError(
+                domain: "ManifestTool",
+                code: 11,
+                userInfo: [NSLocalizedDescriptionKey: message]
+            )
+        }
+
+        guard manifest.schemaVersion == 2, manifest.toolchainAPI == 2 else {
+            try fail("Release manifest must use schema 2 and toolchain API 2.")
+        }
+        guard semanticVersion(from: manifest.version) != nil,
+              semanticVersion(from: expectedToolchainVersion) != nil,
+              manifest.version == expectedToolchainVersion,
+              appVersion(expectedAppVersion, isWithin: manifest.appVersionRange) else {
+            try fail("Release manifest version or app compatibility range does not match the build.")
+        }
+        guard let publicKeyData = Data(base64Encoded: publicKeyBase64) else {
+            try fail("Release public key is not valid base64.")
+        }
+        let expectedKeyID = SHA256.hash(data: publicKeyData)
+            .map { String(format: "%02x", $0) }
+            .joined()
+        guard manifest.keyID == expectedKeyID,
+              verifySignature(for: manifest, publicKeyBase64: publicKeyBase64) else {
+            try fail("Release manifest signature or key identifier is invalid.")
+        }
+
+        let componentsByName = Dictionary(grouping: manifest.components, by: \.name)
+        let expectedNames = Set(expectedComponentURLs.keys)
+        guard Set(componentsByName.keys) == expectedNames,
+              componentsByName.values.allSatisfy({ $0.count == 1 }),
+              Set(componentArchives.keys) == expectedNames else {
+            try fail("Release manifest component set does not match the expected closure.")
+        }
+
+        for name in expectedNames.sorted() {
+            guard let component = componentsByName[name]?.first,
+                  let expectedURL = expectedComponentURLs[name],
+                  let archiveURL = componentArchives[name],
+                  component.url == expectedURL,
+                  URL(string: component.url)?.scheme?.lowercased() == "https" else {
+                try fail("Release component URL is missing, insecure, or unexpected: \(name)")
+            }
+            let size = try FileManager.default.attributesOfItem(atPath: archiveURL.path)[.size] as? UInt64 ?? 0
+            guard size == component.sizeBytes,
+                  try archiveExpandedSize(at: archiveURL) == component.expandedSizeBytes,
+                  try sha256Hex(url: archiveURL) == component.sha256 else {
+                try fail("Release component size or SHA-256 does not match the signed manifest: \(name)")
+            }
+            guard try archiveContents(at: archiveURL) == component.contents.sorted() else {
+                try fail("Release component contents do not match the signed manifest: \(name)")
+            }
+            let hashes = try archiveCriticalFileHashes(
+                zipURL: archiveURL,
+                paths: component.criticalFileHashes.keys.sorted()
+            )
+            guard hashes == component.criticalFileHashes else {
+                try fail("Release component critical-file hashes do not match: \(name)")
+            }
+        }
+    }
+
     public static func writeManifest(_ manifest: ManifestDocument, to url: URL) throws {
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.prettyPrinted, .sortedKeys, .withoutEscapingSlashes]
@@ -451,10 +282,7 @@ public enum ManifestBuilder {
         return hasher.finalize().map { String(format: "%02x", $0) }.joined()
     }
 
-    private static func makeComponent(
-        from input: ManifestArtifactInput,
-        deriveCoreCriticalFiles: Bool
-    ) throws -> ManifestDocument.Component {
+    private static func makeComponent(from input: ManifestArtifactInput) throws -> ManifestDocument.Component {
         let size = try FileManager.default.attributesOfItem(atPath: input.zipURL.path)[.size] as? UInt64 ?? 0
         guard size > 0, size < maximumReleaseAssetBytes else {
             throw NSError(
@@ -467,8 +295,9 @@ public enum ManifestBuilder {
         }
         let sha = try sha256Hex(url: input.zipURL)
         let contents = input.deriveExactContents ? try archiveContents(at: input.zipURL) : input.contents
+        let expandedSize = try archiveExpandedSize(at: input.zipURL)
         var criticalFilePaths = Set(input.criticalFilePaths)
-        if deriveCoreCriticalFiles, input.name == "macos-arm64-core" {
+        if input.name == "macos-arm64-core" {
             criticalFilePaths.formUnion(
                 ManifestToolDefaults.criticalCoreFiles(in: contents)
             )
@@ -484,6 +313,7 @@ public enum ManifestBuilder {
             url: input.artifactURL,
             sha256: sha,
             sizeBytes: size,
+            expandedSizeBytes: expandedSize,
             contents: contents,
             criticalFileHashes: criticalFileHashes,
             dependencies: input.dependencies,
@@ -496,6 +326,162 @@ public enum ManifestBuilder {
             throw NSError(domain: "ManifestTool", code: 3, userInfo: [NSLocalizedDescriptionKey: "Invalid private key base64"])
         }
         return try Curve25519.Signing.PrivateKey(rawRepresentation: keyData)
+    }
+
+    private struct SemanticVersion: Equatable {
+        enum PrereleaseIdentifier: Equatable {
+            case numeric(String)
+            case text(String)
+        }
+
+        var major: String
+        var minor: String
+        var patch: String
+        var prerelease: [PrereleaseIdentifier]
+    }
+
+    private static func validAppVersionRange(_ range: ManifestDocument.AppVersionRange) -> Bool {
+        guard let minimum = semanticVersion(from: range.minimum),
+              let maximumValue = range.maximumExclusive,
+              let maximum = semanticVersion(from: maximumValue) else {
+            return false
+        }
+        return compareSemanticVersions(minimum, maximum) == .orderedAscending
+    }
+
+    private static func requireValidToolchainVersion(_ version: String) throws {
+        guard semanticVersion(from: version) != nil else {
+            throw NSError(
+                domain: "ManifestTool",
+                code: 13,
+                userInfo: [
+                    NSLocalizedDescriptionKey: "Toolchain version must be strict SemVer."
+                ]
+            )
+        }
+    }
+
+    private static func appVersion(
+        _ value: String,
+        isWithin range: ManifestDocument.AppVersionRange
+    ) -> Bool {
+        guard validAppVersionRange(range),
+              let app = semanticVersion(from: value),
+              let minimum = semanticVersion(from: range.minimum),
+              let maximumValue = range.maximumExclusive,
+              let maximum = semanticVersion(from: maximumValue) else {
+            return false
+        }
+        return compareSemanticVersions(app, minimum) != .orderedAscending
+            && compareSemanticVersions(app, maximum) == .orderedAscending
+    }
+
+    private static func semanticVersion(from value: String) -> SemanticVersion? {
+        let buildParts = value.split(separator: "+", maxSplits: 1, omittingEmptySubsequences: false)
+        guard buildParts.count <= 2, !buildParts[0].isEmpty else { return nil }
+        if buildParts.count == 2,
+           !validSemanticIdentifiers(buildParts[1], allowNumericLeadingZero: true) {
+            return nil
+        }
+
+        let versionParts = buildParts[0].split(separator: "-", maxSplits: 1, omittingEmptySubsequences: false)
+        let core = versionParts[0].split(separator: ".", omittingEmptySubsequences: false)
+        guard core.count == 3,
+              let major = semanticCoreNumber(core[0]),
+              let minor = semanticCoreNumber(core[1]),
+              let patch = semanticCoreNumber(core[2]) else {
+            return nil
+        }
+
+        var prerelease: [SemanticVersion.PrereleaseIdentifier] = []
+        if versionParts.count == 2 {
+            let raw = versionParts[1]
+            guard validSemanticIdentifiers(raw, allowNumericLeadingZero: false) else { return nil }
+            prerelease = raw.split(separator: ".", omittingEmptySubsequences: false).map { identifier in
+                if identifier.allSatisfy(\.isNumber) {
+                    return .numeric(String(identifier))
+                }
+                return .text(String(identifier))
+            }
+        }
+        return SemanticVersion(major: major, minor: minor, patch: patch, prerelease: prerelease)
+    }
+
+    private static func compareSemanticVersions(
+        _ lhs: SemanticVersion,
+        _ rhs: SemanticVersion
+    ) -> ComparisonResult {
+        for (left, right) in [(lhs.major, rhs.major), (lhs.minor, rhs.minor), (lhs.patch, rhs.patch)] {
+            let comparison = compareSemanticNumericIdentifiers(left, right)
+            if comparison != .orderedSame { return comparison }
+        }
+        if lhs.prerelease.isEmpty, rhs.prerelease.isEmpty { return .orderedSame }
+        if lhs.prerelease.isEmpty { return .orderedDescending }
+        if rhs.prerelease.isEmpty { return .orderedAscending }
+
+        for (left, right) in zip(lhs.prerelease, rhs.prerelease) {
+            switch (left, right) {
+            case let (.numeric(leftValue), .numeric(rightValue)):
+                let comparison = compareSemanticNumericIdentifiers(leftValue, rightValue)
+                if comparison != .orderedSame { return comparison }
+            case (.numeric, .text):
+                return .orderedAscending
+            case (.text, .numeric):
+                return .orderedDescending
+            case let (.text(leftValue), .text(rightValue)):
+                if leftValue > rightValue { return .orderedDescending }
+                if leftValue < rightValue { return .orderedAscending }
+            }
+        }
+        if lhs.prerelease.count > rhs.prerelease.count { return .orderedDescending }
+        if lhs.prerelease.count < rhs.prerelease.count { return .orderedAscending }
+        return .orderedSame
+    }
+
+    private static func semanticCoreNumber(_ value: Substring) -> String? {
+        guard !value.isEmpty,
+              value.unicodeScalars.allSatisfy({ ("0"..."9").contains(Character(String($0))) }),
+              value == "0" || value.first != "0" else {
+            return nil
+        }
+        return String(value)
+    }
+
+    private static func compareSemanticNumericIdentifiers(
+        _ lhs: String,
+        _ rhs: String
+    ) -> ComparisonResult {
+        if lhs.count > rhs.count { return .orderedDescending }
+        if lhs.count < rhs.count { return .orderedAscending }
+        if lhs > rhs { return .orderedDescending }
+        if lhs < rhs { return .orderedAscending }
+        return .orderedSame
+    }
+
+    private static func validSemanticIdentifiers(
+        _ value: Substring,
+        allowNumericLeadingZero: Bool
+    ) -> Bool {
+        let identifiers = value.split(separator: ".", omittingEmptySubsequences: false)
+        guard !identifiers.isEmpty else { return false }
+        return identifiers.allSatisfy { identifier in
+            guard !identifier.isEmpty,
+                  identifier.unicodeScalars.allSatisfy({ scalar in
+                      ("0"..."9").contains(Character(String(scalar)))
+                          || ("A"..."Z").contains(Character(String(scalar)))
+                          || ("a"..."z").contains(Character(String(scalar)))
+                          || scalar == "-"
+                  }) else {
+                return false
+            }
+            if !allowNumericLeadingZero,
+               identifier.allSatisfy(\.isNumber),
+               identifier.count > 1,
+               identifier.first == "0" {
+                return false
+            }
+            return true
+        }
     }
 
     private static func archiveContents(at zipURL: URL) throws -> [String] {
@@ -529,6 +515,58 @@ public enum ManifestBuilder {
         if text.split(whereSeparator: \.isNewline).contains(where: { $0.first == "l" }) {
             throw NSError(domain: "ManifestTool", code: 8, userInfo: [NSLocalizedDescriptionKey: "Component archive contains a symbolic link"])
         }
+    }
+
+    private static func archiveExpandedSize(at zipURL: URL) throws -> UInt64 {
+        try rejectArchiveLinks(at: zipURL)
+        let process = Process()
+        let stdout = Pipe()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/zipinfo")
+        process.arguments = ["-l", zipURL.path]
+        process.standardOutput = stdout
+        process.standardError = FileHandle.nullDevice
+        try process.run()
+        let output = stdout.fileHandleForReading.readDataToEndOfFile()
+        process.waitUntilExit()
+        guard process.terminationReason == .exit, process.terminationStatus == 0 else {
+            throw NSError(
+                domain: "ManifestTool",
+                code: 8,
+                userInfo: [NSLocalizedDescriptionKey: "Unable to inspect expanded component size"]
+            )
+        }
+
+        var total: UInt64 = 0
+        var fileCount = 0
+        for line in String(decoding: output, as: UTF8.self).split(whereSeparator: \.isNewline) {
+            guard line.first == "-" else { continue }
+            let fields = line.split(separator: " ", maxSplits: 9, omittingEmptySubsequences: true)
+            guard fields.count == 10, let size = UInt64(fields[3]) else {
+                throw NSError(
+                    domain: "ManifestTool",
+                    code: 8,
+                    userInfo: [NSLocalizedDescriptionKey: "Unable to parse expanded component size"]
+                )
+            }
+            fileCount += 1
+            let sum = total.addingReportingOverflow(size)
+            guard !sum.overflow, sum.partialValue <= maximumExpandedComponentBytes else {
+                throw NSError(
+                    domain: "ManifestTool",
+                    code: 10,
+                    userInfo: [NSLocalizedDescriptionKey: "Expanded component exceeds the 16 GiB safety limit."]
+                )
+            }
+            total = sum.partialValue
+        }
+        guard fileCount > 0, total > 0 else {
+            throw NSError(
+                domain: "ManifestTool",
+                code: 8,
+                userInfo: [NSLocalizedDescriptionKey: "Component archive has no regular file payload."]
+            )
+        }
+        return total
     }
 
     private static func archiveExecutablePaths(at zipURL: URL) throws -> Set<String> {
@@ -633,6 +671,7 @@ public enum ManifestToolDefaults {
         "da3_mps/app/easysplat_da3_sfm/run.py",
         "da3_mps/build_info.json",
         "msplat/build_info.json",
+        "supply-chain/components.json",
     ]
 
     public static let criticalCoreFiles = criticalCoreAnchors
@@ -674,43 +713,19 @@ public enum ManifestToolDefaults {
         return required
     }
 
-    public static let splitCoreContents = [
-        "bin/colmap",
-        "bin/easysplat-train",
-        "bin/default.metallib",
-        "lib/libcrypto.3.dylib",
-        "lib/libssl.3.dylib",
-        "msplat/build_info.json",
-        "msplat/LICENSE",
-        "da3_mps/bin/easysplat_da3_sfm",
-        "da3_mps/python/bin/python3",
-        "da3_mps/build_info.json",
-        "da3_mps/app/easysplat_da3_sfm/run.py",
-        "da3_mps/vendor/depth-anything-3/src/depth_anything_3/api.py",
-    ]
-
-    public static let splitModelsContents = [
-        "da3_mps/models/DA3-BASE/config.json",
-        "da3_mps/models/DA3-BASE/model.safetensors",
-        "da3_mps/models/DA3-BASE/easysplat_model_info.json",
-        "da3_mps/models/DA3-SMALL/config.json",
-        "da3_mps/models/DA3-SMALL/model.safetensors",
-        "da3_mps/models/DA3-SMALL/easysplat_model_info.json",
-    ]
-
     public static let da3BaseContents = [
         "da3_mps/models/DA3-BASE/config.json",
         "da3_mps/models/DA3-BASE/model.safetensors",
         "da3_mps/models/DA3-BASE/easysplat_model_info.json",
+        "da3_mps/models/DA3-BASE/LICENSE",
     ]
 
     public static let da3SmallContents = [
         "da3_mps/models/DA3-SMALL/config.json",
         "da3_mps/models/DA3-SMALL/model.safetensors",
         "da3_mps/models/DA3-SMALL/easysplat_model_info.json",
+        "da3_mps/models/DA3-SMALL/LICENSE",
     ]
-
-    public static let monolithicContents = splitCoreContents + splitModelsContents
 }
 
 public enum ManifestKeyInput {

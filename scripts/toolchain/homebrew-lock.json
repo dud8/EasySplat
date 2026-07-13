@@ -1,0 +1,437 @@
+{
+  "core": {
+    "commit": "a0399ab620e48f72567cfab1ad941b3525051690",
+    "repository": "https://github.com/Homebrew/homebrew-core.git"
+  },
+  "formulae": {
+    "boost": {
+      "dependencies": {
+        "build": [],
+        "runtime": [
+          "icu4c@78",
+          "xz",
+          "zstd"
+        ]
+      },
+      "formulaPath": "Formula/b/boost.rb",
+      "formulaSha256": "148dcecb270dda8924e8b3482dad82838edde7cbffba66d6f69f423948bb73bb",
+      "installedVersion": "1.90.0_1",
+      "license": "BSL-1.0",
+      "revision": 1,
+      "source": {
+        "sha256": "9e6bee9ab529fb2b0733049692d57d10a72202af085e553539a05b4204211a6f",
+        "url": "https://github.com/boostorg/boost/releases/download/boost-1.90.0/boost-1.90.0-b2-nodocs.tar.xz"
+      },
+      "version": "1.90.0",
+      "versionScheme": 0
+    },
+    "cmake": {
+      "dependencies": {
+        "build": [],
+        "runtime": []
+      },
+      "formulaPath": "Formula/c/cmake.rb",
+      "formulaSha256": "77c8c8678e3cb204f8245fb260ddd467c872cdc617a39c98e3ffe4dd6bf75758",
+      "installedVersion": "4.4.0",
+      "license": "BSD-3-Clause",
+      "revision": 0,
+      "source": {
+        "sha256": "65757f442fdd242e27f1728fc26dc0cba4164f7a0791a5c788631c00080369bc",
+        "url": "https://github.com/Kitware/CMake/releases/download/v4.4.0/cmake-4.4.0.tar.gz"
+      },
+      "version": "4.4.0",
+      "versionScheme": 0
+    },
+    "gflags": {
+      "dependencies": {
+        "build": [
+          "cmake"
+        ],
+        "runtime": []
+      },
+      "formulaPath": "Formula/g/gflags.rb",
+      "formulaSha256": "537df8e399acc7d226e8bc6f64c096967f2a0436749cd3ec9635b9dd0813dbf9",
+      "installedVersion": "2.3.0",
+      "license": "BSD-3-Clause",
+      "revision": 0,
+      "source": {
+        "sha256": "f619a51371f41c0ad6837b2a98af9d4643b3371015d873887f7e8d3237320b2f",
+        "url": "https://github.com/gflags/gflags/archive/refs/tags/v2.3.0.tar.gz"
+      },
+      "version": "2.3.0",
+      "versionScheme": 0
+    },
+    "giflib": {
+      "dependencies": {
+        "build": [],
+        "runtime": []
+      },
+      "formulaPath": "Formula/g/giflib.rb",
+      "formulaSha256": "d4bb6ce9b07188e21650d06b0824f71530250e5c9ee6e8382129a709dcd91585",
+      "installedVersion": "6.1.3",
+      "license": "MIT",
+      "revision": 0,
+      "source": {
+        "sha256": "b65b66b99f0424b93525f987386f22fc5efb9da2bfc92ad4a532249aaffbab0e",
+        "url": "https://downloads.sourceforge.net/project/giflib/giflib-6.x/giflib-6.1.3.tar.gz"
+      },
+      "version": "6.1.3",
+      "versionScheme": 0
+    },
+    "glog": {
+      "dependencies": {
+        "build": [
+          "cmake"
+        ],
+        "runtime": [
+          "gflags"
+        ]
+      },
+      "formulaPath": "Formula/g/glog.rb",
+      "formulaSha256": "9ed1fd661031f32c44b0a15ca2d97d010cc0f0aa0465c10566bf7db921d58a8c",
+      "installedVersion": "0.7.1",
+      "license": "BSD-3-Clause",
+      "revision": 0,
+      "source": {
+        "sha256": "00e4a87e87b7e7612f519a41e491f16623b12423620006f59f5688bfd8d13b08",
+        "url": "https://github.com/google/glog/archive/refs/tags/v0.7.1.tar.gz"
+      },
+      "version": "0.7.1",
+      "versionScheme": 0
+    },
+    "icu4c@78": {
+      "dependencies": {
+        "build": [],
+        "runtime": []
+      },
+      "formulaPath": "Formula/i/icu4c@78.rb",
+      "formulaSha256": "e858286f1f8eefa8800d7463a55fa57d3f4495d329a8a03c733ba186fd673077",
+      "installedVersion": "78.3",
+      "license": "Unicode-3.0",
+      "revision": 0,
+      "source": {
+        "sha256": "3a2e7a47604ba702f345878308e6fefeca612ee895cf4a5f222e7955fabfe0c0",
+        "url": "https://github.com/unicode-org/icu/releases/download/release-78.3/icu4c-78.3-sources.tgz"
+      },
+      "version": "78.3",
+      "versionScheme": 0
+    },
+    "imath": {
+      "dependencies": {
+        "build": [
+          "cmake"
+        ],
+        "runtime": []
+      },
+      "formulaPath": "Formula/i/imath.rb",
+      "formulaSha256": "797ae5f46fa68addecae2e6ba63e48f009aa51cd68506d2189641650a195d1b3",
+      "installedVersion": "3.2.2",
+      "license": "BSD-3-Clause",
+      "revision": 0,
+      "source": {
+        "sha256": "b4275d83fb95521510e389b8d13af10298ed5bed1c8e13efd961d91b1105e462",
+        "url": "https://github.com/AcademySoftwareFoundation/Imath/archive/refs/tags/v3.2.2.tar.gz"
+      },
+      "version": "3.2.2",
+      "versionScheme": 0
+    },
+    "jpeg-turbo": {
+      "dependencies": {
+        "build": [
+          "cmake"
+        ],
+        "runtime": []
+      },
+      "formulaPath": "Formula/j/jpeg-turbo.rb",
+      "formulaSha256": "c380962c7a8e07405fed2757e7cd3b87c78cdebe2a32f6ea3946374f575e7dc4",
+      "installedVersion": "3.2.0",
+      "license": "IJG AND Zlib AND BSD-3-Clause",
+      "revision": 0,
+      "source": {
+        "sha256": "6f30092cef9fb839779646608f4ee14ae3cbac989c47fa05e841b0841f09878e",
+        "url": "https://github.com/libjpeg-turbo/libjpeg-turbo/releases/download/3.2.0/libjpeg-turbo-3.2.0.tar.gz"
+      },
+      "version": "3.2.0",
+      "versionScheme": 0
+    },
+    "libdeflate": {
+      "dependencies": {
+        "build": [
+          "cmake"
+        ],
+        "runtime": []
+      },
+      "formulaPath": "Formula/lib/libdeflate.rb",
+      "formulaSha256": "1264bb60cb4e8d71b197b25a3bdd5336d64fa191a8810b44faf14b30879ab56a",
+      "installedVersion": "1.25",
+      "license": "MIT",
+      "revision": 0,
+      "source": {
+        "sha256": "d11473c1ad4c57d874695e8026865e38b47116bbcb872bfc622ec8f37a86017d",
+        "url": "https://github.com/ebiggers/libdeflate/archive/refs/tags/v1.25.tar.gz"
+      },
+      "version": "1.25",
+      "versionScheme": 0
+    },
+    "libomp": {
+      "dependencies": {
+        "build": [
+          "cmake"
+        ],
+        "runtime": []
+      },
+      "formulaPath": "Formula/lib/libomp.rb",
+      "formulaSha256": "f0bfebe0c1d023430909f7346dd127ecd610b52b20cc044a2637d0813d2b4b02",
+      "installedVersion": "22.1.8",
+      "license": "MIT",
+      "revision": 0,
+      "source": {
+        "sha256": "922f1817a0df7b1489272d18134ee0087a8b068828f87ac63b9861b1a9965888",
+        "url": "https://github.com/llvm/llvm-project/releases/download/llvmorg-22.1.8/llvm-project-22.1.8.src.tar.xz"
+      },
+      "version": "22.1.8",
+      "versionScheme": 0
+    },
+    "libpng": {
+      "dependencies": {
+        "build": [],
+        "runtime": []
+      },
+      "formulaPath": "Formula/lib/libpng.rb",
+      "formulaSha256": "18814d6ee041754dcdaf0728ecd0383485f2e0ef79c70637bccc2f1db1e2d661",
+      "installedVersion": "1.6.58",
+      "license": "libpng-2.0",
+      "revision": 0,
+      "source": {
+        "sha256": "28eb403f51f0f7405249132cecfe82ea5c0ef97f1b32c5a65828814ae0d34775",
+        "url": "https://downloads.sourceforge.net/project/libpng/libpng16/1.6.58/libpng-1.6.58.tar.xz"
+      },
+      "version": "1.6.58",
+      "versionScheme": 0
+    },
+    "libtiff": {
+      "dependencies": {
+        "build": [],
+        "runtime": [
+          "jpeg-turbo",
+          "webp",
+          "xz",
+          "zstd"
+        ]
+      },
+      "formulaPath": "Formula/lib/libtiff.rb",
+      "formulaSha256": "64da37380f45cd197e0abcab112f06cf7760183642eee00e13a5edf0f4f7b049",
+      "installedVersion": "4.7.2",
+      "license": "libtiff",
+      "revision": 0,
+      "source": {
+        "sha256": "672bd7d10aee4606171afb864f3570b83340f6a33e2c186dc0512f7145ffdf6a",
+        "url": "https://download.osgeo.org/libtiff/tiff-4.7.2.tar.gz"
+      },
+      "version": "4.7.2",
+      "versionScheme": 0
+    },
+    "lz4": {
+      "dependencies": {
+        "build": [],
+        "runtime": []
+      },
+      "formulaPath": "Formula/l/lz4.rb",
+      "formulaSha256": "befc4a1ead0d44e71245e1e90efcf232ff53a144016daa7ae3af316fffd604c6",
+      "installedVersion": "1.10.0",
+      "license": "BSD-2-Clause",
+      "revision": 0,
+      "source": {
+        "sha256": "537512904744b35e232912055ccf8ec66d768639ff3abe5788d90d792ec5f48b",
+        "url": "https://github.com/lz4/lz4/archive/refs/tags/v1.10.0.tar.gz"
+      },
+      "version": "1.10.0",
+      "versionScheme": 0
+    },
+    "metis": {
+      "dependencies": {
+        "build": [
+          "cmake"
+        ],
+        "runtime": []
+      },
+      "formulaPath": "Formula/m/metis.rb",
+      "formulaSha256": "e8dd1a0ad77ec2a498950d415aeb137b6353aa479045699c46ce0b43f8f81949",
+      "installedVersion": "5.1.0",
+      "license": "Apache-2.0",
+      "revision": 0,
+      "source": {
+        "sha256": "76faebe03f6c963127dbb73c13eab58c9a3faeae48779f049066a21c087c5db2",
+        "url": "https://karypis.github.io/glaros/files/sw/metis/metis-5.1.0.tar.gz"
+      },
+      "version": "5.1.0",
+      "versionScheme": 0
+    },
+    "ninja": {
+      "dependencies": {
+        "build": [],
+        "runtime": []
+      },
+      "formulaPath": "Formula/n/ninja.rb",
+      "formulaSha256": "9f2c520d92ba7251740d59496b3bd262a88cb4d62672e4cc1674a448125fc768",
+      "installedVersion": "1.13.2",
+      "license": "Apache-2.0",
+      "revision": 0,
+      "source": {
+        "sha256": "974d6b2f4eeefa25625d34da3cb36bdcebe7fbce40f4c16ac0835fd1c0cbae17",
+        "url": "https://github.com/ninja-build/ninja/archive/refs/tags/v1.13.2.tar.gz"
+      },
+      "version": "1.13.2",
+      "versionScheme": 0
+    },
+    "openexr": {
+      "dependencies": {
+        "build": [
+          "cmake",
+          "pkgconf"
+        ],
+        "runtime": [
+          "imath",
+          "libdeflate",
+          "openjph"
+        ]
+      },
+      "formulaPath": "Formula/o/openexr.rb",
+      "formulaSha256": "924d32f7cb7ac0fe540e872b8f4e1509feec8d28c9fff7b1ecd618882811c1b9",
+      "installedVersion": "3.4.13_1",
+      "license": "BSD-3-Clause",
+      "revision": 1,
+      "source": {
+        "sha256": "1ed0cee48ac8c77da235c8ca8ab85d031d43cd790eda36af87fed4cf316cf2df",
+        "url": "https://github.com/AcademySoftwareFoundation/openexr/archive/refs/tags/v3.4.13.tar.gz"
+      },
+      "version": "3.4.13",
+      "versionScheme": 0
+    },
+    "openjph": {
+      "dependencies": {
+        "build": [
+          "cmake"
+        ],
+        "runtime": [
+          "libtiff"
+        ]
+      },
+      "formulaPath": "Formula/o/openjph.rb",
+      "formulaSha256": "3d4c9fad120498599a8d069180105efde42835da1f94702b06571f42757199cf",
+      "installedVersion": "0.30.1",
+      "license": "BSD-2-Clause",
+      "revision": 0,
+      "source": {
+        "sha256": "fb3ccf71af838ed2a42c6ea669308a2adaba115ae9d5862dfb1e2865b43eb5b8",
+        "url": "https://github.com/aous72/OpenJPH/archive/refs/tags/0.30.1.tar.gz"
+      },
+      "version": "0.30.1",
+      "versionScheme": 0
+    },
+    "pkgconf": {
+      "dependencies": {
+        "build": [],
+        "runtime": []
+      },
+      "formulaPath": "Formula/p/pkgconf.rb",
+      "formulaSha256": "fb6ce6823b926d3b7e54ad93b2148ab301deca88545ada86c8398fc12657574f",
+      "installedVersion": "2.5.1",
+      "license": "ISC",
+      "revision": 0,
+      "source": {
+        "sha256": "cd05c9589b9f86ecf044c10a2269822bc9eb001eced2582cfffd658b0a50c243",
+        "url": "https://distfiles.ariadne.space/pkgconf/pkgconf-2.5.1.tar.xz"
+      },
+      "version": "2.5.1",
+      "versionScheme": 0
+    },
+    "webp": {
+      "dependencies": {
+        "build": [
+          "cmake"
+        ],
+        "runtime": [
+          "giflib",
+          "jpeg-turbo",
+          "libpng"
+        ]
+      },
+      "formulaPath": "Formula/w/webp.rb",
+      "formulaSha256": "80bb5374f9df8cb880529eaaa02aa05e6a7c6cc5e2cf0272da9b8451a03c4052",
+      "installedVersion": "1.6.0",
+      "license": "BSD-3-Clause",
+      "revision": 0,
+      "source": {
+        "sha256": "e4ab7009bf0629fd11982d4c2aa83964cf244cffba7347ecd39019a9e38c4564",
+        "url": "https://storage.googleapis.com/downloads.webmproject.org/releases/webp/libwebp-1.6.0.tar.gz"
+      },
+      "version": "1.6.0",
+      "versionScheme": 0
+    },
+    "xz": {
+      "dependencies": {
+        "build": [],
+        "runtime": []
+      },
+      "formulaPath": "Formula/x/xz.rb",
+      "formulaSha256": "921db7ab1bdeb7b163d1167289602bc6a9ce36b6c36a1c6c41db725b70780514",
+      "installedVersion": "5.8.3",
+      "license": "0BSD AND GPL-2.0-or-later",
+      "revision": 0,
+      "source": {
+        "sha256": "3d3a1b973af218114f4f889bbaa2f4c037deaae0c8e815eec381c3d546b974a0",
+        "url": "https://github.com/tukaani-project/xz/releases/download/v5.8.3/xz-5.8.3.tar.gz"
+      },
+      "version": "5.8.3",
+      "versionScheme": 1
+    },
+    "zstd": {
+      "dependencies": {
+        "build": [
+          "cmake"
+        ],
+        "runtime": [
+          "lz4",
+          "xz"
+        ]
+      },
+      "formulaPath": "Formula/z/zstd.rb",
+      "formulaSha256": "93047c68a5e0f08235821b5a0276b72ea8f25509dcc804b3d59f18a4f2c08298",
+      "installedVersion": "1.5.7_1",
+      "license": "(BSD-3-Clause OR GPL-2.0-only) AND BSD-2-Clause AND MIT",
+      "revision": 1,
+      "source": {
+        "sha256": "37d7284556b20954e56e1ca85b80226768902e2edabd3b649e9e72c0c9012ee3",
+        "url": "https://github.com/facebook/zstd/archive/refs/tags/v1.5.7.tar.gz"
+      },
+      "version": "1.5.7",
+      "versionScheme": 0
+    }
+  },
+  "homebrew": {
+    "commit": "34c40c18ffa2029b611b61c73273e32c003d0842",
+    "repository": "https://github.com/Homebrew/brew.git"
+  },
+  "install": {
+    "mode": "build-from-source",
+    "requestedFormulae": [
+      "cmake",
+      "ninja",
+      "boost",
+      "glog",
+      "imath",
+      "jpeg-turbo",
+      "libdeflate",
+      "libomp",
+      "libpng",
+      "libtiff",
+      "metis",
+      "openexr",
+      "openjph",
+      "xz",
+      "zstd"
+    ]
+  },
+  "schemaVersion": 1
+}

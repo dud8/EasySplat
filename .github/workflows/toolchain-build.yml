@@ -20,23 +20,43 @@ on:
 permissions:
   contents: write
 
+concurrency:
+  group: toolchain-release-${{ inputs.version }}
+  cancel-in-progress: false
+
 jobs:
   build:
     if: github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
     runs-on: [self-hosted, macOS, ARM64, easysplat-release]
     environment: toolchain-release
+    env:
+      HOMEBREW_NO_ANALYTICS: "1"
+      HOMEBREW_NO_AUTO_UPDATE: "1"
+      HOMEBREW_NO_INSTALL_CLEANUP: "1"
+      HOMEBREW_NO_INSTALL_FROM_API: "1"
+      HOMEBREW_NO_INSTALLED_DEPENDENTS_CHECK: "1"
     steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           fetch-depth: 0
+          persist-credentials: false
+
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: "3.12"
 
       - name: Verify release source
         env:
+          GH_TOKEN: ${{ github.token }}
           DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
         run: |
-          git fetch --no-tags origin "refs/heads/$DEFAULT_BRANCH:refs/remotes/origin/$DEFAULT_BRANCH"
-          if ! git merge-base --is-ancestor "$GITHUB_SHA" "origin/$DEFAULT_BRANCH"; then
-            echo "Toolchain releases must come from protected $DEFAULT_BRANCH." >&2
+          CURRENT_HEAD="$(gh api "repos/$GITHUB_REPOSITORY/commits/$DEFAULT_BRANCH" --jq .sha)"
+          if [ "$GITHUB_SHA" != "$CURRENT_HEAD" ]; then
+            echo "Toolchain releases must use the current protected $DEFAULT_BRANCH commit." >&2
+            exit 1
+          fi
+          if [ "$(gh api "repos/$GITHUB_REPOSITORY/immutable-releases" --jq .enabled)" != "true" ]; then
+            echo "Enable GitHub Immutable Releases before publishing toolchain assets." >&2
             exit 1
           fi
 
@@ -63,17 +83,107 @@ jobs:
             echo "Invalid maximum app semantic version: $APP_VERSION_MAXIMUM_EXCLUSIVE" >&2
             exit 1
           fi
-          echo "VERSION=$VERSION" >> "$GITHUB_ENV"
-          echo "TAG=$TAG" >> "$GITHUB_ENV"
-          echo "APP_VERSION_MINIMUM=$APP_VERSION_MINIMUM" >> "$GITHUB_ENV"
-          echo "APP_VERSION_MAXIMUM_EXCLUSIVE=$APP_VERSION_MAXIMUM_EXCLUSIVE" >> "$GITHUB_ENV"
+          {
+            echo "VERSION=$VERSION"
+            echo "TAG=$TAG"
+            echo "APP_VERSION_MINIMUM=$APP_VERSION_MINIMUM"
+            echo "APP_VERSION_MAXIMUM_EXCLUSIVE=$APP_VERSION_MAXIMUM_EXCLUSIVE"
+          } >>"$GITHUB_ENV"
+
+      - name: Guard immutable toolchain version
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "Toolchain release $TAG already exists and will not be overwritten." >&2
+            exit 1
+          fi
+          if gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$TAG" >/dev/null 2>&1; then
+            echo "Toolchain tag $TAG already exists and will not be moved." >&2
+            exit 1
+          fi
+
+      - name: Pin Homebrew source metadata
+        env:
+          HOMEBREW_COMMIT: 34c40c18ffa2029b611b61c73273e32c003d0842
+          HOMEBREW_CORE_COMMIT: a0399ab620e48f72567cfab1ad941b3525051690
+        run: |
+          set -euo pipefail
+          BREW_REPOSITORY="$(brew --repository)"
+          CORE_REPOSITORY="$(brew --repository homebrew/core)"
+
+          checkout_reviewed_commit() {
+            local repository="$1"
+            local origin="$2"
+            local commit="$3"
+            if [ ! -d "$repository/.git" ]; then
+              mkdir -p "$(dirname "$repository")"
+              git init "$repository"
+              git -C "$repository" remote add origin "$origin"
+            fi
+            case "$(git -C "$repository" remote get-url origin)" in
+              "$origin"|"${origin%.git}") ;;
+              *)
+                echo "Unexpected Homebrew Git origin for $repository." >&2
+                exit 1
+                ;;
+            esac
+            if [ -n "$(git -C "$repository" status --porcelain --untracked-files=no)" ]; then
+              echo "Refusing to change a dirty Homebrew checkout: $repository" >&2
+              exit 1
+            fi
+            if ! git -C "$repository" cat-file -e "$commit^{commit}" 2>/dev/null; then
+              git -C "$repository" fetch --no-tags --depth=1 origin "$commit"
+            fi
+            git -C "$repository" checkout --detach "$commit"
+            test "$(git -C "$repository" rev-parse HEAD)" = "$commit"
+          }
+
+          checkout_reviewed_commit \
+            "$BREW_REPOSITORY" \
+            https://github.com/Homebrew/brew.git \
+            "$HOMEBREW_COMMIT"
+          checkout_reviewed_commit \
+            "$CORE_REPOSITORY" \
+            https://github.com/Homebrew/homebrew-core.git \
+            "$HOMEBREW_CORE_COMMIT"
+          hash -r
+          python3 scripts/toolchain/verify_homebrew_lock.py source \
+            --brew-repository "$BREW_REPOSITORY" \
+            --core-repository "$CORE_REPOSITORY"
 
       - name: Install dependencies
         run: |
-          brew install cmake ninja boost eigen freeimage glog gflags suitesparse ceres-solver qt glew cgal libomp openimageio
+          set -euo pipefail
+          test "$(sw_vers -productVersion | cut -d. -f1)" = "15"
+          test -d /Applications/Xcode_16.4.app
+          sudo xcode-select -s /Applications/Xcode_16.4.app
+          test "$(xcodebuild -version | sed -n '1s/^Xcode //p')" = "16.4"
+          BREW_REPOSITORY="$(brew --repository)"
+          CORE_REPOSITORY="$(brew --repository homebrew/core)"
+          python3 scripts/toolchain/verify_homebrew_lock.py source \
+            --brew-repository "$BREW_REPOSITORY" \
+            --core-repository "$CORE_REPOSITORY"
+          while IFS= read -r formula; do
+            if brew list --versions "$formula" >/dev/null 2>&1; then
+              brew reinstall --build-from-source "$formula"
+            else
+              brew install --build-from-source "$formula"
+            fi
+          done < <(python3 scripts/toolchain/verify_homebrew_lock.py formulae)
+          python3 scripts/toolchain/verify_homebrew_lock.py installed \
+            --brew-repository "$BREW_REPOSITORY" \
+            --core-repository "$CORE_REPOSITORY" \
+            --provenance-out Toolchains/build/homebrew/homebrew-provenance.json
 
-      - name: Build OpenSSL
-        run: scripts/toolchain/build_openssl.sh
+      - name: Build minimal OpenImageIO
+        run: scripts/toolchain/build_openimageio.sh
+
+      - name: Build permissive SuiteSparse
+        run: scripts/toolchain/build_suitesparse.sh
+
+      - name: Build Ceres
+        run: scripts/toolchain/build_ceres.sh
 
       - name: Build COLMAP
         run: scripts/toolchain/build_colmap.sh
@@ -99,9 +209,19 @@ jobs:
         env:
           REPOSITORY: ${{ github.repository }}
           TOOLCHAIN_SIGNING_KEY_BASE64: ${{ secrets.TOOLCHAIN_SIGNING_KEY_BASE64 }}
+          TOOLCHAIN_PUBLIC_KEY_BASE64: ${{ secrets.TOOLCHAIN_PUBLIC_KEY_BASE64 }}
         run: |
           if [ -z "$TOOLCHAIN_SIGNING_KEY_BASE64" ]; then
             echo "Missing TOOLCHAIN_SIGNING_KEY_BASE64 secret"
+            exit 1
+          fi
+          if [ -z "$TOOLCHAIN_PUBLIC_KEY_BASE64" ]; then
+            echo "Missing TOOLCHAIN_PUBLIC_KEY_BASE64 secret"
+            exit 1
+          fi
+          TRACKED_PUBLIC_KEY="$(tr -d '[:space:]' <EasySplatApp/Resources/public_key_ed25519.txt)"
+          if [ "$TOOLCHAIN_PUBLIC_KEY_BASE64" != "$TRACKED_PUBLIC_KEY" ]; then
+            echo "TOOLCHAIN_PUBLIC_KEY_BASE64 does not match the reviewed app trust root." >&2
             exit 1
           fi
           CORE_ZIP="Toolchains/out/toolchain-macos-arm64-$VERSION-core.zip"
@@ -111,9 +231,12 @@ jobs:
           DA3_BASE_URL="https://github.com/$REPOSITORY/releases/download/$TAG/toolchain-geometry-da3-base-$VERSION.zip"
           DA3_SMALL_URL="https://github.com/$REPOSITORY/releases/download/$TAG/toolchain-geometry-da3-small-$VERSION.zip"
           PRIVATE_KEY_FILE="$(mktemp)"
-          trap 'rm -f "$PRIVATE_KEY_FILE"' EXIT
+          PUBLIC_KEY_FILE="$(mktemp)"
+          trap 'rm -f "$PRIVATE_KEY_FILE" "$PUBLIC_KEY_FILE"' EXIT
           printf '%s' "$TOOLCHAIN_SIGNING_KEY_BASE64" > "$PRIVATE_KEY_FILE"
+          printf '%s' "$TRACKED_PUBLIC_KEY" > "$PUBLIC_KEY_FILE"
           chmod 600 "$PRIVATE_KEY_FILE"
+          unset TOOLCHAIN_SIGNING_KEY_BASE64 TOOLCHAIN_PUBLIC_KEY_BASE64 TRACKED_PUBLIC_KEY
           swift run --package-path Tools/ManifestTool ManifestTool \
             --core-zip "$CORE_ZIP" \
             --core-url "$CORE_URL" \
@@ -127,14 +250,90 @@ jobs:
             --app-version-maximum-exclusive "$APP_VERSION_MAXIMUM_EXCLUSIVE" \
             --private-key-file "$PRIVATE_KEY_FILE" \
             --manifest-out "Toolchains/out/manifest.json"
+          swift run --package-path Tools/ManifestTool ManifestTool verify-release \
+            --manifest "Toolchains/out/manifest.json" \
+            --public-key-file "$PUBLIC_KEY_FILE" \
+            --toolchain-version "$VERSION" \
+            --app-version "$APP_VERSION_MINIMUM" \
+            --core-zip "$CORE_ZIP" \
+            --core-url "$CORE_URL" \
+            --da3-base-zip "$DA3_BASE_ZIP" \
+            --da3-base-url "$DA3_BASE_URL" \
+            --da3-small-zip "$DA3_SMALL_ZIP" \
+            --da3-small-url "$DA3_SMALL_URL"
+          python3 scripts/release/generate_release_metadata.py verify-toolchain \
+            --toolchain-version "$VERSION" \
+            --manifest "Toolchains/out/manifest.json" \
+            --core "$CORE_ZIP" \
+            --core-url "$CORE_URL" \
+            --da3-base "$DA3_BASE_ZIP" \
+            --da3-base-url "$DA3_BASE_URL" \
+            --da3-small "$DA3_SMALL_ZIP" \
+            --da3-small-url "$DA3_SMALL_URL"
 
-      - name: Upload release assets
-        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
+      - name: Create immutable draft release
+        uses: softprops/action-gh-release@b4309332981a82ec1c5618f44dd2e27cc8bfbfda # v3.0.0
         with:
           tag_name: ${{ env.TAG }}
           target_commitish: ${{ github.sha }}
+          draft: true
+          prerelease: true
+          overwrite_files: false
+          fail_on_unmatched_files: true
+          token: ${{ github.token }}
           files: |
             Toolchains/out/toolchain-macos-arm64-${{ env.VERSION }}-core.zip
             Toolchains/out/toolchain-geometry-da3-base-${{ env.VERSION }}.zip
             Toolchains/out/toolchain-geometry-da3-small-${{ env.VERSION }}.zip
             Toolchains/out/manifest.json
+
+      - name: Verify downloaded draft bytes
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TOOLCHAIN_PUBLIC_KEY_BASE64: ${{ secrets.TOOLCHAIN_PUBLIC_KEY_BASE64 }}
+        run: |
+          REMOTE="$RUNNER_TEMP/toolchain-release-download"
+          PUBLIC_KEY_FILE="$RUNNER_TEMP/toolchain-public-key.txt"
+          rm -rf "$REMOTE"
+          mkdir -p "$REMOTE"
+          TRACKED_PUBLIC_KEY="$(tr -d '[:space:]' <EasySplatApp/Resources/public_key_ed25519.txt)"
+          test "$TOOLCHAIN_PUBLIC_KEY_BASE64" = "$TRACKED_PUBLIC_KEY"
+          printf '%s' "$TRACKED_PUBLIC_KEY" >"$PUBLIC_KEY_FILE"
+          unset TOOLCHAIN_PUBLIC_KEY_BASE64 TRACKED_PUBLIC_KEY
+          gh release download "$TAG" \
+            --repo "$GITHUB_REPOSITORY" \
+            --dir "$REMOTE" \
+            --pattern manifest.json \
+            --pattern "toolchain-macos-arm64-$VERSION-core.zip" \
+            --pattern "toolchain-geometry-da3-base-$VERSION.zip" \
+            --pattern "toolchain-geometry-da3-small-$VERSION.zip"
+          BASE_URL="https://github.com/$GITHUB_REPOSITORY/releases/download/$TAG"
+          swift run --package-path Tools/ManifestTool ManifestTool verify-release \
+            --manifest "$REMOTE/manifest.json" \
+            --public-key-file "$PUBLIC_KEY_FILE" \
+            --toolchain-version "$VERSION" \
+            --app-version "$APP_VERSION_MINIMUM" \
+            --core-zip "$REMOTE/toolchain-macos-arm64-$VERSION-core.zip" \
+            --core-url "$BASE_URL/toolchain-macos-arm64-$VERSION-core.zip" \
+            --da3-base-zip "$REMOTE/toolchain-geometry-da3-base-$VERSION.zip" \
+            --da3-base-url "$BASE_URL/toolchain-geometry-da3-base-$VERSION.zip" \
+            --da3-small-zip "$REMOTE/toolchain-geometry-da3-small-$VERSION.zip" \
+            --da3-small-url "$BASE_URL/toolchain-geometry-da3-small-$VERSION.zip"
+          python3 scripts/release/generate_release_metadata.py verify-toolchain \
+            --toolchain-version "$VERSION" \
+            --manifest "$REMOTE/manifest.json" \
+            --core "$REMOTE/toolchain-macos-arm64-$VERSION-core.zip" \
+            --core-url "$BASE_URL/toolchain-macos-arm64-$VERSION-core.zip" \
+            --da3-base "$REMOTE/toolchain-geometry-da3-base-$VERSION.zip" \
+            --da3-base-url "$BASE_URL/toolchain-geometry-da3-base-$VERSION.zip" \
+            --da3-small "$REMOTE/toolchain-geometry-da3-small-$VERSION.zip" \
+            --da3-small-url "$BASE_URL/toolchain-geometry-da3-small-$VERSION.zip"
+
+      - name: Publish verified toolchain release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          RELEASE_ID="$(gh api "repos/$GITHUB_REPOSITORY/releases/tags/$TAG" --jq .id)"
+          gh api --method PATCH "repos/$GITHUB_REPOSITORY/releases/$RELEASE_ID" \
+            -F draft=false \
+            -F prerelease=true >/dev/null

@@ -21,6 +21,43 @@ struct ManifestTool {
                 exit(ExitCode.ok.rawValue)
             }
 
+            if command == "verify-release" {
+                var parser = ArgParser(Array(args.dropFirst()))
+                let manifestURL = URL(fileURLWithPath: try parser.require("--manifest"))
+                let publicKeyURL = URL(fileURLWithPath: try parser.require("--public-key-file"))
+                let version = try parser.require("--toolchain-version")
+                let appVersion = try parser.require("--app-version")
+                let coreURL = try parser.require("--core-url")
+                let baseURL = try parser.require("--da3-base-url")
+                let smallURL = try parser.require("--da3-small-url")
+                let decoder = JSONDecoder()
+                decoder.dateDecodingStrategy = .iso8601
+                let manifest = try decoder.decode(
+                    ManifestDocument.self,
+                    from: Data(contentsOf: manifestURL)
+                )
+                let publicKey = try String(contentsOf: publicKeyURL, encoding: .utf8)
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+                try ManifestBuilder.verifyRelease(
+                    manifest: manifest,
+                    publicKeyBase64: publicKey,
+                    expectedToolchainVersion: version,
+                    expectedAppVersion: appVersion,
+                    expectedComponentURLs: [
+                        "macos-arm64-core": coreURL,
+                        "geometry-da3-base": baseURL,
+                        "geometry-da3-small": smallURL,
+                    ],
+                    componentArchives: [
+                        "macos-arm64-core": URL(fileURLWithPath: try parser.require("--core-zip")),
+                        "geometry-da3-base": URL(fileURLWithPath: try parser.require("--da3-base-zip")),
+                        "geometry-da3-small": URL(fileURLWithPath: try parser.require("--da3-small-zip")),
+                    ]
+                )
+                print("Verified signed toolchain closure \(version)")
+                exit(ExitCode.ok.rawValue)
+            }
+
             var parser = ArgParser(Array(args))
             let version = try parser.require("--version")
             let publishedAtValue = try parser.require("--published-at")
@@ -60,6 +97,13 @@ struct ManifestTool {
             --version <semver> --published-at <iso8601> \\
             --app-version-minimum <semver> --app-version-maximum-exclusive <semver> \\
             --private-key-file <path> --manifest-out <path>
+
+        Verify a signed release closure:
+          ManifestTool verify-release --manifest <path> --public-key-file <path> \
+            --toolchain-version <semver> --app-version <semver> \
+            --core-zip <path> --core-url <url> \
+            --da3-base-zip <path> --da3-base-url <url> \
+            --da3-small-zip <path> --da3-small-url <url>
 
         Private key source:
           Use exactly one of --private-key-file <path> or --private-key-env <name>.

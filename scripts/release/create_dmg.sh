@@ -36,44 +36,31 @@ if [ ! -d "$APP_PATH" ]; then
   exit 1
 fi
 
-if ! command -v create-dmg >/dev/null 2>&1; then
-  echo "create-dmg is required. Install with: brew install create-dmg" >&2
+HDIUTIL_BIN="${EASYSPLAT_HDIUTIL_BIN:-hdiutil}"
+if ! command -v "$HDIUTIL_BIN" >/dev/null 2>&1 && [ ! -x "$HDIUTIL_BIN" ]; then
+  echo "hdiutil is required to create the disk image." >&2
   exit 1
 fi
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 STAGING="$ROOT/build/dmg_staging"
-DMG_HDIUTIL_RETRIES="${EASYSPLAT_DMG_HDIUTIL_RETRIES:-20}"
-DMG_SKIP_JENKINS="${EASYSPLAT_DMG_SKIP_JENKINS:-}"
-DMG_SANDBOX_SAFE="${EASYSPLAT_DMG_SANDBOX_SAFE:-}"
+trap 'rm -rf "$STAGING"' EXIT
 
 rm -rf "$STAGING"
 mkdir -p "$STAGING"
 
 cp -R "$APP_PATH" "$STAGING/"
+ln -s /Applications "$STAGING/Applications"
 
+mkdir -p "$(dirname "$OUT_PATH")"
 rm -f "$OUT_PATH"
 
-CREATE_DMG_ARGS=(
-  --volname "$VOLNAME"
-  --window-size 600 400
-  --icon-size 120
-  --icon "$(basename "$APP_PATH")" 170 200
-  --app-drop-link 430 200
-  --hdiutil-retries "$DMG_HDIUTIL_RETRIES"
-)
-
-if [ -n "$DMG_SKIP_JENKINS" ] || [ -n "${CI:-}" ]; then
-  CREATE_DMG_ARGS+=(--skip-jenkins)
-fi
-
-if [ -n "$DMG_SANDBOX_SAFE" ] || [ -n "${CI:-}" ]; then
-  CREATE_DMG_ARGS+=(--sandbox-safe)
-fi
-
-create-dmg \
-  "${CREATE_DMG_ARGS[@]}" \
-  "$OUT_PATH" \
-  "$STAGING"
+"$HDIUTIL_BIN" create \
+  -volname "$VOLNAME" \
+  -srcfolder "$STAGING" \
+  -ov \
+  -format UDZO \
+  "$OUT_PATH"
+"$HDIUTIL_BIN" verify "$OUT_PATH"
 
 echo "Created DMG at: $OUT_PATH"

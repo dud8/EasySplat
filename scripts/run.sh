@@ -2,7 +2,7 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-VERSION="${VERSION:-0.1.0}"
+VERSION="${VERSION:-2.0.0}"
 PORT="${EASYSPLAT_DEV_PORT:-8000}"
 TOOLCHAIN_ROOT=""
 FAST=0
@@ -68,7 +68,7 @@ Usage: ./scripts/run.sh [options]
 Options:
   --fast                 Run with the installed toolchain (no rebuild/download).
   --rebuild              Force a toolchain rebuild (preserve models when possible).
-  --version <semver>     Toolchain version (default: 0.1.0).
+  --version <semver>     Toolchain version (default: 2.0.0).
   --toolchain-root <dir> Override installed toolchain path.
   --port <port>          Local manifest server port on 127.0.0.1 (default: 8000).
   -h, --help             Show this help.
@@ -194,8 +194,6 @@ core_zip_valid() {
   unzip -l "$CORE_ZIP" | grep -q "bin/colmap" || return 1
   unzip -l "$CORE_ZIP" | grep -q "bin/easysplat-train" || return 1
   unzip -l "$CORE_ZIP" | grep -q "bin/default.metallib" || return 1
-  unzip -l "$CORE_ZIP" | grep -q "lib/libcrypto.3.dylib" || return 1
-  unzip -l "$CORE_ZIP" | grep -q "lib/libssl.3.dylib" || return 1
   unzip -l "$CORE_ZIP" | grep -q "msplat/build_info.json" || return 1
   unzip -l "$CORE_ZIP" | grep -q "msplat/LICENSE" || return 1
   unzip -l "$CORE_ZIP" | grep -q "da3_mps/bin/easysplat_da3_sfm" || return 1
@@ -210,8 +208,7 @@ core_zip_valid() {
   {
     unzip -p "$CORE_ZIP" bin/colmap >"$tmp/colmap" 2>/dev/null \
       && chmod +x "$tmp/colmap" \
-      && otool -l "$tmp/colmap" | grep -q "@executable_path/../lib" \
-      && otool -L "$tmp/colmap" | grep -q "@rpath/libcrypto.3.dylib"
+      && otool -l "$tmp/colmap" | grep -q "@executable_path/../lib"
   } || rc=1
   rm -rf "$tmp"
   return "$rc"
@@ -353,8 +350,6 @@ refresh_installed_da3_app() {
 validate_installed_toolchain() {
   local root="$1"
   test -x "$root/bin/colmap" || return 1
-  test -f "$root/lib/libcrypto.3.dylib" || return 1
-  test -f "$root/lib/libssl.3.dylib" || return 1
   "$MSPLAT_VALIDATOR" --packaged "$root" >/dev/null 2>&1 || return 1
   test -x "$root/da3_mps/bin/easysplat_da3_sfm" || return 1
   test -x "$root/da3_mps/python/bin/python3" || return 1
@@ -370,7 +365,6 @@ validate_installed_toolchain() {
   test -f "$root/da3_mps/vendor/depth-anything-3/src/depth_anything_3/api.py" || return 1
 
   otool -l "$root/bin/colmap" | grep -q "@executable_path/../lib" || return 1
-  otool -L "$root/bin/colmap" | grep -q "@rpath/libcrypto.3.dylib" || return 1
 }
 
 models_present() {
@@ -385,15 +379,19 @@ models_present() {
 
 wipe_installed_core() {
   local root="$1"
+  if [ -z "$root" ] || [ "$root" = "/" ]; then
+    echo "Refusing to clear an unsafe toolchain root: $root" >&2
+    return 1
+  fi
   rm -rf \
-    "$root/bin" \
-    "$root/lib" \
-    "$root/msplat" \
-    "$root/da3_mps/bin" \
-    "$root/da3_mps/python" \
-    "$root/da3_mps/build_info.json" \
-    "$root/da3_mps/vendor" \
-    "$root/da3_mps/app"
+    "${root:?}/bin" \
+    "${root:?}/lib" \
+    "${root:?}/msplat" \
+    "${root:?}/da3_mps/bin" \
+    "${root:?}/da3_mps/python" \
+    "${root:?}/da3_mps/build_info.json" \
+    "${root:?}/da3_mps/vendor" \
+    "${root:?}/da3_mps/app"
 }
 
 INSTALLED_OK=0
@@ -430,7 +428,12 @@ elif [ "$INSTALLED_OK" -eq 0 ] && toolchain_inputs_newer; then
 fi
 
 if [ "$NEED_PACKAGE" -eq 1 ]; then
-  "$ROOT/scripts/toolchain/build_openssl.sh"
+  test -f "$ROOT/Toolchains/build/suitesparse/install/lib/libcholmod.5.dylib" \
+    || "$ROOT/scripts/toolchain/build_suitesparse.sh"
+  test -f "$ROOT/Toolchains/build/ceres/install/lib/libceres.4.dylib" \
+    || "$ROOT/scripts/toolchain/build_ceres.sh"
+  test -f "$ROOT/Toolchains/build/openimageio/install/lib/libOpenImageIO.2.5.dylib" \
+    || "$ROOT/scripts/toolchain/build_openimageio.sh"
   test -x "$ROOT/Toolchains/build/colmap/install/bin/colmap" || "$ROOT/scripts/toolchain/build_colmap.sh"
   ensure_msplat_bundle
   ensure_da3_mps_bundle
@@ -489,7 +492,8 @@ wait_for_local_manifest_server "$PORT" "$PUBLIC_SERVE_ROOT/manifest.json" "$SERV
 log "Serving local toolchain manifest at http://localhost:$PORT/manifest.json."
 
 export EASYSPLAT_TOOLCHAIN_MANIFEST_URL="http://localhost:$PORT/manifest.json"
-export EASYSPLAT_TOOLCHAIN_PUBLIC_KEY_BASE64="$(cat "$PUB")"
+EASYSPLAT_TOOLCHAIN_PUBLIC_KEY_BASE64="$(<"$PUB")"
+export EASYSPLAT_TOOLCHAIN_PUBLIC_KEY_BASE64
 
 if [ -d "$TOOLCHAIN_ROOT" ]; then
   if models_present "$TOOLCHAIN_ROOT"; then

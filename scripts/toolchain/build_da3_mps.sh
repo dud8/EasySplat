@@ -10,29 +10,43 @@ APP_DIR="$INSTALL_DIR/app"
 BIN_DIR="$INSTALL_DIR/bin"
 VENDOR_DIR="$INSTALL_DIR/vendor"
 DA3_VENDOR="$VENDOR_DIR/depth-anything-3"
+REQUIREMENTS_LOCK="$ROOT/Tools/Da3Sfm/requirements.txt"
+PIP_INSTALL_REPORT="$INSTALL_DIR/licenses/python-packages-install-report.json"
 
-DA3_SOURCE="${DA3_SOURCE:-$ROOT/ThirdParty/Depth-Anything-3}"
-DA3_REPO="${DA3_REPO:-https://github.com/ByteDance-Seed/Depth-Anything-3.git}"
-DA3_REF="${DA3_REF:-41736238f5bced4debf3f2a12375d2466874866d}"
-DA3_BASE_REPO="${DA3_BASE_REPO:-depth-anything/DA3-BASE}"
-DA3_SMALL_REPO="${DA3_SMALL_REPO:-depth-anything/DA3-SMALL}"
-DA3_METRIC_LARGE_REPO="${DA3_METRIC_LARGE_REPO:-depth-anything/DA3METRIC-LARGE}"
-DA3_BASE_REVISION="${DA3_BASE_REVISION:-f4a6c9b3c95e41c82048423d3493a81ec3fa810e}"
-DA3_SMALL_REVISION="${DA3_SMALL_REVISION:-e08cab65ca0ec38e7826075418411ab90cab4da3}"
-DA3_METRIC_LARGE_REVISION="${DA3_METRIC_LARGE_REVISION:-4010e39f3634a45bc60553321fb49fb760bd594e}"
-DA3_INCLUDE_METRIC_LARGE="${EASYSPLAT_DA3_INCLUDE_METRIC_LARGE:-0}"
 ALLOW_UNPINNED_DA3_SOURCE="${EASYSPLAT_ALLOW_UNPINNED_DA3_SOURCE:-0}"
+if [ -n "${DA3_SOURCE:-}" ] && [ "$ALLOW_UNPINNED_DA3_SOURCE" != "1" ]; then
+  echo "DA3_SOURCE requires EASYSPLAT_ALLOW_UNPINNED_DA3_SOURCE=1 and is forbidden in release builds." >&2
+  exit 1
+fi
+for override in DA3_REPO DA3_REF DA3_BASE_REPO DA3_SMALL_REPO DA3_BASE_REVISION DA3_SMALL_REVISION; do
+  if [ -n "${!override:-}" ]; then
+    echo "$override is not configurable; update and review the pinned source in build_da3_mps.sh." >&2
+    exit 1
+  fi
+done
+DA3_SOURCE="${DA3_SOURCE:-$ROOT/ThirdParty/Depth-Anything-3}"
+DA3_REPO="https://github.com/ByteDance-Seed/Depth-Anything-3.git"
+DA3_REF="41736238f5bced4debf3f2a12375d2466874866d"
+DA3_BASE_REPO="depth-anything/DA3-BASE"
+DA3_SMALL_REPO="depth-anything/DA3-SMALL"
+DA3_BASE_REVISION="f4a6c9b3c95e41c82048423d3493a81ec3fa810e"
+DA3_SMALL_REVISION="e08cab65ca0ec38e7826075418411ab90cab4da3"
 DA3_SOURCE_COMMIT=""
 DA3_SOURCE_DESCRIPTOR=""
 DA3_SOURCE_PROVENANCE=""
 DA3_SOURCE_REPO_FOR_BUILD_INFO="$DA3_REPO"
 DA3_SOURCE_REF_FOR_BUILD_INFO="$DA3_REF"
 
-PYTHON_STANDALONE_TAG="${EASYSPLAT_PYTHON_STANDALONE_TAG:-20260127}"
-PYTHON_STANDALONE_VERSION="${EASYSPLAT_PYTHON_VERSION:-3.13.11}"
+PYTHON_STANDALONE_TAG="20260127"
+PYTHON_STANDALONE_VERSION="3.13.11"
 PYTHON_STANDALONE_ASSET="cpython-${PYTHON_STANDALONE_VERSION}+${PYTHON_STANDALONE_TAG}-aarch64-apple-darwin-install_only_stripped.tar.gz"
 PYTHON_STANDALONE_URL="https://github.com/indygreg/python-build-standalone/releases/download/${PYTHON_STANDALONE_TAG}/${PYTHON_STANDALONE_ASSET}"
 PYTHON_STANDALONE_TARBALL="$BUILD_DIR/$PYTHON_STANDALONE_ASSET"
+PYTHON_STANDALONE_SHA256="718a87bf84d81cb81355488ca37be1f66c2252304be2090721016948de96e7ca"
+PYTHON_STANDALONE_FULL_ASSET="cpython-${PYTHON_STANDALONE_VERSION}+${PYTHON_STANDALONE_TAG}-aarch64-apple-darwin-pgo+lto-full.tar.zst"
+PYTHON_STANDALONE_FULL_URL="https://github.com/indygreg/python-build-standalone/releases/download/${PYTHON_STANDALONE_TAG}/${PYTHON_STANDALONE_FULL_ASSET}"
+PYTHON_STANDALONE_FULL_TARBALL="$BUILD_DIR/$PYTHON_STANDALONE_FULL_ASSET"
+PYTHON_STANDALONE_FULL_SHA256="ff7e2bb25f1f29067a0663af42b32980b0da295b948238d5e3fc09d2b27228a6"
 
 if [ "$(uname -m)" != "arm64" ]; then
   echo "da3_mps build must run on Apple Silicon (arm64). Refusing to build under Rosetta." >&2
@@ -45,14 +59,12 @@ ensure_repo() {
   local ref="$3"
 
   if ! is_git_checkout "$repo"; then
-    git clone --recursive "$url" "$repo"
+    git clone "$url" "$repo"
   fi
   pushd "$repo" >/dev/null
   require_clean_git_checkout "$repo"
   git fetch --tags origin "$ref"
   git checkout --detach "$ref"
-  git submodule sync --recursive
-  git submodule update --init --recursive
   require_clean_git_checkout "$repo"
   local current_head
   local expected_head
@@ -114,16 +126,22 @@ resolve_da3_source() {
   DA3_SOURCE_PROVENANCE="pinned-git"
 }
 
-download_file() {
+download_verified() {
   local url="$1"
   local dest="$2"
-  if [ -f "$dest" ]; then
-    return 0
+  local expected_sha256="$3"
+  if [ -f "$dest" ] && [ "$(shasum -a 256 "$dest" | awk '{print $1}')" = "$expected_sha256" ]; then
+    return
   fi
   mkdir -p "$(dirname "$dest")"
   local tmp="$dest.tmp.$$"
-  rm -f "$tmp"
+  rm -f "$dest" "$tmp"
   curl -fL --retry 3 --retry-delay 5 -o "$tmp" "$url"
+  if [ "$(shasum -a 256 "$tmp" | awk '{print $1}')" != "$expected_sha256" ]; then
+    rm -f "$tmp"
+    echo "Checksum mismatch for $url" >&2
+    exit 1
+  fi
   mv "$tmp" "$dest"
 }
 
@@ -152,13 +170,12 @@ PY
   fi
 
   if [ ! -x "$PYTHON_DIR/bin/python3" ]; then
-    download_file "$PYTHON_STANDALONE_URL" "$PYTHON_STANDALONE_TARBALL"
+    download_verified "$PYTHON_STANDALONE_URL" "$PYTHON_STANDALONE_TARBALL" "$PYTHON_STANDALONE_SHA256"
     mkdir -p "$INSTALL_DIR"
     /usr/bin/tar -xzf "$PYTHON_STANDALONE_TARBALL" -C "$INSTALL_DIR"
   fi
 
   echo "da3_mps python version: $("$PYTHON_DIR/bin/python3" -V 2>&1)"
-  PYTHONNOUSERSITE=1 "$PYTHON_DIR/bin/python3" -m pip install --no-user --upgrade pip setuptools wheel
 }
 
 pip_install() {
@@ -240,9 +257,11 @@ Path("${target}/easysplat_model_info.json").write_text(
     encoding="utf-8",
 )
 PY
+  install -m 0644 "$DA3_SOURCE/LICENSE" "$target/LICENSE"
   test -f "$target/config.json"
   test -f "$target/model.safetensors"
   test -f "$target/easysplat_model_info.json"
+  test -f "$target/LICENSE"
 }
 
 stage_da3_app() {
@@ -264,21 +283,50 @@ resolve_da3_source
 ensure_python
 require_arm64_python
 
-pip_install -r "$ROOT/Tools/Da3Sfm/requirements.txt"
+# OmegaConf 2.3.0 requires antlr4-python3-runtime 4.9.x, which has no wheel.
+# Every artifact is hash-locked; all other packages must come from wheels.
+mkdir -p "$(dirname "$PIP_INSTALL_REPORT")"
+install -m 0644 "$REQUIREMENTS_LOCK" "$INSTALL_DIR/licenses/python-packages-requirements.txt"
+pip_install \
+  --require-hashes \
+  --only-binary=:all: \
+  --no-binary=antlr4-python3-runtime \
+  --force-reinstall \
+  --no-cache-dir \
+  --report "$PIP_INSTALL_REPORT" \
+  -r "$REQUIREMENTS_LOCK"
 verify_torch_mps
 
 rm -rf "$DA3_VENDOR"
-mkdir -p "$DA3_VENDOR"
+mkdir -p "$DA3_VENDOR/src/depth_anything_3"
 if command -v rsync >/dev/null 2>&1; then
   rsync -a --delete \
-    --exclude ".git" \
     --exclude "__pycache__" \
     --exclude "*.pyc" \
-    "$DA3_SOURCE/" "$DA3_VENDOR/"
+    "$DA3_SOURCE/src/depth_anything_3/" "$DA3_VENDOR/src/depth_anything_3/"
 else
-  cp -R "$DA3_SOURCE/." "$DA3_VENDOR/"
-  find "$DA3_VENDOR" -type d -name ".git" -prune -exec rm -rf {} +
+  cp -R "$DA3_SOURCE/src/depth_anything_3/." "$DA3_VENDOR/src/depth_anything_3/"
 fi
+install -m 0644 "$DA3_SOURCE/LICENSE" "$DA3_VENDOR/LICENSE"
+test ! -e "$DA3_VENDOR/da3_streaming"
+
+if ! command -v unzstd >/dev/null 2>&1; then
+  echo "unzstd is required to extract python-build-standalone license metadata." >&2
+  exit 1
+fi
+download_verified \
+  "$PYTHON_STANDALONE_FULL_URL" \
+  "$PYTHON_STANDALONE_FULL_TARBALL" \
+  "$PYTHON_STANDALONE_FULL_SHA256"
+rm -rf "$INSTALL_DIR/licenses/python-build-standalone"
+mkdir -p "$INSTALL_DIR/licenses/python-build-standalone"
+/usr/bin/tar --use-compress-program=unzstd \
+  -xf "$PYTHON_STANDALONE_FULL_TARBALL" \
+  -C "$INSTALL_DIR/licenses/python-build-standalone" \
+  --strip-components=1 \
+  python/PYTHON.json python/licenses
+test -s "$INSTALL_DIR/licenses/python-build-standalone/PYTHON.json"
+test -d "$INSTALL_DIR/licenses/python-build-standalone/licenses"
 
 if [ ! -f "$DA3_VENDOR/src/depth_anything_3/api.py" ]; then
   echo "DA3 vendor tree missing expected module: src/depth_anything_3/api.py" >&2
@@ -288,11 +336,9 @@ fi
 stage_da3_app
 download_model "$DA3_BASE_REPO" "DA3-BASE" "$DA3_BASE_REVISION"
 download_model "$DA3_SMALL_REPO" "DA3-SMALL" "$DA3_SMALL_REVISION"
-if [ "$DA3_INCLUDE_METRIC_LARGE" = "1" ]; then
-  download_model "$DA3_METRIC_LARGE_REPO" "DA3METRIC-LARGE" "$DA3_METRIC_LARGE_REVISION"
-fi
 
 PYTHONNOUSERSITE=1 "$PYTHON_DIR/bin/python3" - <<PY
+import hashlib
 import json
 import platform
 from pathlib import Path
@@ -306,7 +352,8 @@ def packaged_model_info(name):
 
 base_info = packaged_model_info("DA3-BASE")
 small_info = packaged_model_info("DA3-SMALL")
-metric_info = packaged_model_info("DA3METRIC-LARGE") if "${DA3_INCLUDE_METRIC_LARGE}" == "1" else None
+requirements_lock = Path("${REQUIREMENTS_LOCK}")
+requirements_lock_sha256 = hashlib.sha256(requirements_lock.read_bytes()).hexdigest()
 
 Path("${INSTALL_DIR}").mkdir(parents=True, exist_ok=True)
 Path("${INSTALL_DIR}/build_info.json").write_text(
@@ -326,10 +373,14 @@ Path("${INSTALL_DIR}/build_info.json").write_text(
             "small_checkpoint_repo": "${DA3_SMALL_REPO}",
             "small_checkpoint_revision": "${DA3_SMALL_REVISION}",
             "small_checkpoint_commit": small_info["resolved_sha"],
-            "metric_large_checkpoint_repo": "${DA3_METRIC_LARGE_REPO}" if "${DA3_INCLUDE_METRIC_LARGE}" == "1" else None,
-            "metric_large_checkpoint_revision": "${DA3_METRIC_LARGE_REVISION}" if "${DA3_INCLUDE_METRIC_LARGE}" == "1" else None,
-            "metric_large_checkpoint_commit": metric_info["resolved_sha"] if metric_info is not None else None,
             "python_version": platform.python_version(),
+            "python_standalone_url": "${PYTHON_STANDALONE_URL}",
+            "python_standalone_sha256": "${PYTHON_STANDALONE_SHA256}",
+            "python_standalone_license_archive_url": "${PYTHON_STANDALONE_FULL_URL}",
+            "python_standalone_license_archive_sha256": "${PYTHON_STANDALONE_FULL_SHA256}",
+            "requirements_lock": "Tools/Da3Sfm/requirements.txt",
+            "requirements_lock_sha256": requirements_lock_sha256,
+            "pip_install_report": "licenses/python-packages-install-report.json",
             "torch_version": torch.__version__,
             "torchvision_version": torchvision.__version__,
             "huggingface_hub_version": huggingface_hub.__version__,
@@ -348,8 +399,10 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 PY="$ROOT/python/bin/python3"
 APP="$ROOT/app"
 VENDOR_DA3="$ROOT/vendor/depth-anything-3"
+unset PYTHONHOME PYTHONUSERBASE PYTHONSTARTUP PYTHONINSPECT
 export PYTHONNOUSERSITE=1
-export PYTHONPATH="$APP:$VENDOR_DA3/src${PYTHONPATH:+:$PYTHONPATH}"
+export PYTHONSAFEPATH=1
+export PYTHONPATH="$APP:$VENDOR_DA3/src"
 export EASYSPLAT_DA3_MODELS_DIR="$ROOT/models"
 export TORCH_HOME="$ROOT/models"
 export HF_HOME="$ROOT/models/huggingface"
@@ -359,7 +412,7 @@ export HF_HUB_DISABLE_TELEMETRY=1
 export DO_NOT_TRACK=1
 export KMP_DUPLICATE_LIB_OK=TRUE
 export TOKENIZERS_PARALLELISM=false
-export PYTORCH_ENABLE_MPS_FALLBACK="${PYTORCH_ENABLE_MPS_FALLBACK:-1}"
+export PYTORCH_ENABLE_MPS_FALLBACK=1
 exec "$PY" -m easysplat_da3_sfm.run "$@"
 SCRIPT
 chmod +x "$BIN_DIR/easysplat_da3_sfm"

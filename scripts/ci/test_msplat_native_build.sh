@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# Source-contract assertions intentionally match literal shell expressions.
+# shellcheck disable=SC2016
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
@@ -7,6 +9,7 @@ OVERLAY="$ROOT/Tools/MsplatNative/msplat.cpp"
 UPSTREAM_PATCH="$ROOT/Tools/MsplatNative/msplat-1.1.3-easysplat.patch"
 CHECKPOINT_PATCH="$ROOT/Tools/MsplatNative/msplat-1.1.3-checkpoint.patch"
 FIXTURE_GENERATOR="$ROOT/scripts/ci/generate_msplat_sparse_fixtures.py"
+VALIDATOR="$ROOT/scripts/toolchain/validate_native_msplat.sh"
 INSTALL_DIR="${EASYSPLAT_MSPLAT_INSTALL_DIR:-$ROOT/Toolchains/build/msplat/install/msplat}"
 
 fail() {
@@ -37,6 +40,7 @@ require_file "$OVERLAY"
 require_file "$UPSTREAM_PATCH"
 require_file "$CHECKPOINT_PATCH"
 require_file "$FIXTURE_GENERATOR"
+require_file "$VALIDATOR"
 
 require_contains 'MSPLAT_REPO="https://github.com/rayanht/msplat.git"' "$BUILD_SCRIPT"
 require_contains 'MSPLAT_COMMIT="106499b0a53f82b0c92d013b0861fbebd341b17e"' "$BUILD_SCRIPT"
@@ -96,6 +100,19 @@ require_contains 'RENAME_NOFOLLOW_ANY' "$OVERLAY"
 require_contains 'computeTrainingIdentity' "$OVERLAY"
 require_contains 'write(' "$OVERLAY"
 require_contains 'msplat_gpu_sync()' "$OVERLAY"
+require_contains '#include <sys/resource.h>' "$OVERLAY"
+require_contains 'getrusage(RUSAGE_SELF' "$OVERLAY"
+require_contains '"peak_memory_bytes"' "$OVERLAY"
+require_contains 'std::vector<Camera> &cameras = inputData.cameras;' "$OVERLAY"
+require_contains 'constexpr float background[3] = {0.0f, 0.0f, 0.0f};' "$OVERLAY"
+require_contains 'constexpr int cameraReuseCount = 2;' "$OVERLAY"
+require_contains 'releaseCameraResources' "$OVERLAY"
+require_absent 'for (Camera &camera : inputData.cameras) camera.loadImage' "$OVERLAY"
+require_absent 'getCameras(false)' "$OVERLAY"
+require_absent '0.6130f, 0.0101f, 0.3984f' "$OVERLAY"
+if [ "$(grep -Fc '"peak_memory_bytes"' "$OVERLAY")" -lt 2 ]; then
+  fail "$OVERLAY must report peak memory for checkpoints and completion"
+fi
 require_contains 'SIGINT' "$OVERLAY"
 require_contains 'SIGTERM' "$OVERLAY"
 require_contains 'return 130' "$OVERLAY"
@@ -301,6 +318,8 @@ done
 [ "$(/usr/bin/plutil -extract source_commit raw "$BUILD_INFO")" = "106499b0a53f82b0c92d013b0861fbebd341b17e" ] || fail "parsed source commit is wrong"
 require_contains '"source_commit": "106499b0a53f82b0c92d013b0861fbebd341b17e"' "$BUILD_INFO"
 require_contains '"source_version": "1.1.3"' "$BUILD_INFO"
+overlay_hash="$(shasum -a 256 "$OVERLAY" | awk '{print $1}')"
+require_contains "\"overlay_sha256\": \"$overlay_hash\"" "$BUILD_INFO"
 
 exe_hash="$(shasum -a 256 "$BIN" | awk '{print $1}')"
 metallib_hash="$(shasum -a 256 "$METALLIB" | awk '{print $1}')"
@@ -310,6 +329,8 @@ require_contains "\"metallib_sha256\": \"$metallib_hash\"" "$BUILD_INFO"
 if grep -Eq '(/Users/|/home/|"hostname"|"username"|"source_path")' "$BUILD_INFO"; then
   fail "build provenance contains a private or machine-local field"
 fi
+
+"$VALIDATOR" --source "$INSTALL_DIR"
 
 validate_jsonl() {
   local jsonl="$1"
@@ -376,6 +397,27 @@ if completed.get("stop_reason") not in {"iteration_limit", "plateau"}:
     raise SystemExit("completed event has an invalid stop reason")
 if completed.get("gaussian_count", 0) <= 0 or completed.get("output_bytes", 0) <= 0:
     raise SystemExit("completed event is missing output evidence")
+memory_records = [
+    record
+    for record in records
+    if record.get("event") in {"checkpoint_completed", "checkpoint_loaded", "completed"}
+]
+if not memory_records:
+    raise SystemExit("training emitted no peak-memory evidence")
+peak_memory_values = []
+for record in memory_records:
+    peak_memory_bytes = record.get("peak_memory_bytes")
+    if (
+        isinstance(peak_memory_bytes, bool)
+        or not isinstance(peak_memory_bytes, int)
+        or peak_memory_bytes <= 0
+    ):
+        raise SystemExit(
+            f"{record.get('event')} is missing positive peak-memory evidence"
+        )
+    peak_memory_values.append(peak_memory_bytes)
+if peak_memory_values != sorted(peak_memory_values):
+    raise SystemExit("peak resident memory decreased within one process")
 if sum(record.get("event") == "completed" for record in records) != 1:
     raise SystemExit("training emitted multiple completion records")
 PY

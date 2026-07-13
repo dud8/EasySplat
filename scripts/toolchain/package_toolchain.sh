@@ -23,17 +23,26 @@ if [ -z "$VERSION" ]; then
 fi
 
 COLMAP_INSTALL="${COLMAP_INSTALL:-$ROOT/Toolchains/build/colmap/install}"
+CERES_INSTALL="${CERES_INSTALL:-$ROOT/Toolchains/build/ceres/install}"
+SUITESPARSE_INSTALL="${SUITESPARSE_INSTALL:-$ROOT/Toolchains/build/suitesparse/install}"
+OPENIMAGEIO_INSTALL="${OPENIMAGEIO_INSTALL:-$ROOT/Toolchains/build/openimageio/install}"
 MSPLAT_INSTALL="${MSPLAT_INSTALL:-$ROOT/Toolchains/build/msplat/install}"
 DA3_MPS_INSTALL="${DA3_MPS_INSTALL:-$ROOT/Toolchains/build/da3_mps/install}"
 MSPLAT_VALIDATOR="$ROOT/scripts/toolchain/validate_native_msplat.sh"
+SUPPLY_CHAIN_GENERATOR="$ROOT/scripts/toolchain/generate_supply_chain_manifest.py"
 
 OUT="$ROOT/Toolchains/out"
 BIN="$OUT/bin"
 LIB="$OUT/lib"
+LICENSES="$OUT/licenses"
+PROVENANCE="$OUT/provenance"
+SUPPLY_CHAIN="$OUT/supply-chain"
+DEPENDENCY_ORIGINS="$SUPPLY_CHAIN/dependency-origins.tsv"
 CORE_ZIP="$OUT/toolchain-macos-arm64-$VERSION-core.zip"
 DA3_BASE_ZIP="$OUT/toolchain-geometry-da3-base-$VERSION.zip"
 DA3_SMALL_ZIP="$OUT/toolchain-geometry-da3-small-$VERSION.zip"
 MAX_RELEASE_ASSET_BYTES=2147483648
+MAX_NORMAL_PHOTO_INSTALL_BYTES=2500000000
 
 assert_release_asset_size() {
   local archive="$1"
@@ -45,8 +54,23 @@ assert_release_asset_size() {
   fi
 }
 
+assert_normal_photo_install_size() {
+  local total=0
+  local archive
+  local size
+  for archive in "$@"; do
+    size="$(stat -f '%z' "$archive")"
+    total=$((total + size))
+  done
+  if (( total > MAX_NORMAL_PHOTO_INSTALL_BYTES )); then
+    echo "Normal photo toolchain download exceeds 2.5 GB: $total bytes" >&2
+    exit 1
+  fi
+}
+
 rm -rf "$OUT"
-mkdir -p "$BIN" "$LIB"
+mkdir -p "$BIN" "$LIB" "$LICENSES" "$PROVENANCE" "$SUPPLY_CHAIN"
+: >"$DEPENDENCY_ORIGINS"
 
 validate_build_info() {
   local python_bin="$1"
@@ -126,17 +150,6 @@ is_system_dependency() {
   esac
 }
 
-is_relative_dependency() {
-  case "$1" in
-    @rpath/*|@loader_path/*|@executable_path/*)
-      return 0
-      ;;
-    *)
-      return 1
-      ;;
-  esac
-}
-
 is_macho_file() {
   local path="$1"
   [ -f "$path" ] && /usr/bin/file "$path" | grep -q "Mach-O"
@@ -192,6 +205,28 @@ resolve_rpath_dependency_for() {
   return 1
 }
 
+resolve_rpath_dependency_path_for() {
+  local file="$1"
+  local dependency="$2"
+  local name="${dependency#@rpath/}"
+  local rpath
+  local resolved
+
+  if [ -f "$LIB/$name" ]; then
+    printf '%s\n' "$LIB/$name"
+    return 0
+  fi
+  while IFS= read -r rpath; do
+    [ -n "$rpath" ] || continue
+    resolved="$(resolve_macho_path_token "$file" "$rpath")"
+    if [ -f "$resolved/$name" ]; then
+      printf '%s\n' "$resolved/$name"
+      return 0
+    fi
+  done < <(otool_rpath_entries "$file")
+  return 1
+}
+
 queued_macho_files=()
 processed_macho_files=()
 queued_macho_file_keys="|"
@@ -227,6 +262,8 @@ copy_dependency_to_lib() {
   local referer="$2"
   local dependency_name
   local destination
+  local existing_origin
+  local real_dependency
 
   if [ ! -f "$dependency" ]; then
     echo "Missing non-system dependency $dependency referenced by $referer." >&2
@@ -235,11 +272,24 @@ copy_dependency_to_lib() {
 
   dependency_name="$(basename "$dependency")"
   destination="$LIB/$dependency_name"
+  real_dependency="$(python3 - "$dependency" <<'PY'
+import os
+import sys
+print(os.path.realpath(sys.argv[1]))
+PY
+)"
   if [ ! -f "$destination" ]; then
     cp -L "$dependency" "$destination"
     chmod u+w "$destination"
     if is_macho_file "$destination"; then
       install_name_tool -id "@rpath/$dependency_name" "$destination" 2>/dev/null || true
+    fi
+    printf 'lib/%s\t%s\n' "$dependency_name" "$real_dependency" >>"$DEPENDENCY_ORIGINS"
+  else
+    existing_origin="$(awk -F '\t' -v path="lib/$dependency_name" '$1 == path { print $2; exit }' "$DEPENDENCY_ORIGINS")"
+    if [ -n "$existing_origin" ] && [ "$existing_origin" != "$real_dependency" ]; then
+      echo "Dependency basename collision for $dependency_name: $existing_origin and $real_dependency." >&2
+      exit 1
     fi
   fi
   enqueue_macho_file "$destination"
@@ -263,18 +313,44 @@ rewrite_dependency_reference() {
 bundle_non_system_dependencies_for() {
   local file="$1"
   local dependency
+  local resolved
 
   while IFS= read -r dependency; do
     [ -n "$dependency" ] || continue
-    if is_system_dependency "$dependency" || is_relative_dependency "$dependency"; then
+    if is_system_dependency "$dependency"; then
       continue
     fi
-    if [[ "$dependency" != /* ]]; then
-      echo "Unexpected dependency reference $dependency in $file." >&2
-      exit 1
-    fi
-    copy_dependency_to_lib "$dependency" "$file"
-    rewrite_dependency_reference "$file" "$dependency"
+    case "$dependency" in
+      @rpath/*)
+        if ! resolved="$(resolve_rpath_dependency_path_for "$file" "$dependency")"; then
+          echo "Unable to resolve $dependency referenced by $file." >&2
+          exit 1
+        fi
+        if [[ "$resolved" != "$LIB/"* ]]; then
+          copy_dependency_to_lib "$resolved" "$file"
+          rewrite_dependency_reference "$file" "$dependency"
+        fi
+        ;;
+      @loader_path/*|@executable_path/*)
+        resolved="$(resolve_macho_path_token "$file" "$dependency")"
+        if [ ! -f "$resolved" ]; then
+          echo "Unable to resolve $dependency referenced by $file." >&2
+          exit 1
+        fi
+        if [[ "$resolved" != "$OUT/"* ]]; then
+          copy_dependency_to_lib "$resolved" "$file"
+          rewrite_dependency_reference "$file" "$dependency"
+        fi
+        ;;
+      /*)
+        copy_dependency_to_lib "$dependency" "$file"
+        rewrite_dependency_reference "$file" "$dependency"
+        ;;
+      *)
+        echo "Unexpected dependency reference $dependency in $file." >&2
+        exit 1
+        ;;
+    esac
   done < <(otool_dependency_names "$file")
 }
 
@@ -308,6 +384,8 @@ validate_portable_dependency_references_for() {
     return
   fi
   local dependency
+  local rpath
+  local rpath_count=0
   local target
 
   while IFS= read -r dependency; do
@@ -342,6 +420,23 @@ validate_portable_dependency_references_for() {
         ;;
     esac
   done < <(otool_dependency_names "$file")
+
+  while IFS= read -r rpath; do
+    [ -n "$rpath" ] || continue
+    rpath_count=$((rpath_count + 1))
+    if [[ "$file" == "$LIB/"* ]]; then
+      echo "$file retains an unnecessary LC_RPATH entry: $rpath" >&2
+      exit 1
+    fi
+    if [[ "$file" == "$BIN/"* ]] && [ "$rpath" != "@executable_path/../lib" ]; then
+      echo "$file has an unportable LC_RPATH entry: $rpath" >&2
+      exit 1
+    fi
+  done < <(otool_rpath_entries "$file")
+  if [[ "$file" == "$BIN/"* ]] && [ "$rpath_count" -ne 1 ]; then
+    echo "$file must contain exactly one canonical LC_RPATH entry." >&2
+    exit 1
+  fi
 }
 
 validate_portable_dependency_references() {
@@ -385,12 +480,114 @@ add_bundle_lib_rpath_if_needed() {
 add_bundle_lib_rpaths() {
   local file
   for file in "$BIN"/*; do
-    [ "$file" = "$BIN/easysplat-train" ] && continue
     add_bundle_lib_rpath_if_needed "$file"
   done
 }
 
+normalize_bundle_rpaths() {
+  local file
+  local rpath
+
+  for file in "$BIN"/* "$LIB"/*; do
+    is_macho_file "$file" || continue
+    while IFS= read -r rpath; do
+      [ -n "$rpath" ] || continue
+      install_name_tool -delete_rpath "$rpath" "$file"
+    done < <(otool_rpath_entries "$file")
+    if [[ "$file" == "$BIN/"* ]]; then
+      install_name_tool -add_rpath "@executable_path/../lib" "$file"
+    fi
+  done
+}
+
+ad_hoc_sign_packaged_machos() {
+  local file
+  local -a dylibs=()
+  local -a other_machos=()
+
+  while IFS= read -r -d '' file; do
+    is_macho_file "$file" || continue
+    chmod u+w "$file"
+    if /usr/bin/file -b "$file" | grep -q 'dynamically linked shared library'; then
+      dylibs+=("$file")
+    else
+      other_machos+=("$file")
+    fi
+  done < <(find "$OUT" -type f -print0)
+
+  # install_name_tool invalidates existing arm64 signatures. Sign the completed
+  # dylib graph first, then executables, bundles, and extension modules.
+  for file in "${dylibs[@]}" "${other_machos[@]}"; do
+    /usr/bin/codesign --force --sign - --timestamp=none "$file"
+  done
+  for file in "${dylibs[@]}" "${other_machos[@]}"; do
+    /usr/bin/codesign --verify --strict "$file" || {
+      echo "Ad-hoc signature verification failed: $file" >&2
+      exit 1
+    }
+  done
+}
+
+refresh_packaged_msplat_hash() {
+  python3 - "$OUT/msplat/build_info.json" "$BIN/easysplat-train" <<'PY'
+import hashlib
+import json
+import sys
+from pathlib import Path
+
+receipt = Path(sys.argv[1])
+executable = Path(sys.argv[2])
+payload = json.loads(receipt.read_text(encoding="utf-8"))
+payload["executable_sha256"] = hashlib.sha256(executable.read_bytes()).hexdigest()
+receipt.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+PY
+}
+
+reject_forbidden_image_dependencies() {
+  local file
+  local dependency
+  local dependency_lower
+  local forbidden='(avcodec|avformat|avutil|swresample|swscale|ffmpeg|heif|de265|x264|x265|aom|dav1d|vpx|svtav1|theora|vorbis|webp|opencolorio|ocio|tbb|freetype|dcmtk|libraw|gif)'
+
+  for file in "$BIN"/* "$LIB"/*; do
+    is_macho_file "$file" || continue
+    while IFS= read -r dependency; do
+      dependency_lower="$(printf '%s' "$dependency" | tr '[:upper:]' '[:lower:]')"
+      if [[ "$dependency_lower" =~ $forbidden ]]; then
+        echo "Forbidden image dependency in $(basename "$file"): $dependency" >&2
+        exit 1
+      fi
+    done < <(otool_dependency_names "$file")
+  done
+  if find "$LIB" -mindepth 1 -maxdepth 1 -print | \
+    grep -Eqi "$forbidden"; then
+    echo "Forbidden image dependency was copied into the runtime library closure." >&2
+    exit 1
+  fi
+  if grep -Eq $'\t/opt/homebrew/(opt|Cellar)/openimageio([^/]*)/' "$DEPENDENCY_ORIGINS"; then
+    echo "Homebrew OpenImageIO entered the runtime closure." >&2
+    exit 1
+  fi
+}
+
 cp "$COLMAP_INSTALL/bin/colmap" "$BIN/colmap"
+
+for install_root in "$COLMAP_INSTALL" "$CERES_INSTALL" "$SUITESPARSE_INSTALL" "$OPENIMAGEIO_INSTALL"; do
+  if [ ! -s "$install_root/build_info.json" ] || [ ! -d "$install_root/licenses" ]; then
+    echo "Missing staged provenance or licenses under $install_root. Rebuild the pinned native dependency." >&2
+    exit 1
+  fi
+done
+cp "$COLMAP_INSTALL/build_info.json" "$PROVENANCE/colmap.json"
+cp "$CERES_INSTALL/build_info.json" "$PROVENANCE/ceres.json"
+cp "$SUITESPARSE_INSTALL/build_info.json" "$PROVENANCE/suitesparse.json"
+cp "$OPENIMAGEIO_INSTALL/build_info.json" "$PROVENANCE/openimageio.json"
+mkdir -p "$LICENSES/EasySplat"
+install -m 0644 "$ROOT/LICENSE" "$LICENSES/EasySplat/LICENSE"
+cp -R "$COLMAP_INSTALL/licenses/." "$LICENSES/"
+cp -R "$CERES_INSTALL/licenses/." "$LICENSES/"
+cp -R "$SUITESPARSE_INSTALL/licenses/." "$LICENSES/"
+cp -R "$OPENIMAGEIO_INSTALL/licenses/." "$LICENSES/"
 
 "$MSPLAT_VALIDATOR" --source "$MSPLAT_INSTALL/msplat"
 mkdir -p "$OUT/msplat"
@@ -398,6 +595,12 @@ cp "$MSPLAT_INSTALL/msplat/bin/easysplat-train" "$BIN/easysplat-train"
 cp "$MSPLAT_INSTALL/msplat/bin/default.metallib" "$BIN/default.metallib"
 cp "$MSPLAT_INSTALL/msplat/build_info.json" "$OUT/msplat/build_info.json"
 cp "$MSPLAT_INSTALL/msplat/LICENSE" "$OUT/msplat/LICENSE"
+
+MSPLAT_DEPS="$ROOT/Toolchains/build/msplat/dependencies"
+mkdir -p "$LICENSES/msplat/CLI11" "$LICENSES/msplat/nanoflann" "$LICENSES/msplat/nlohmann-json"
+install -m 0644 "$MSPLAT_DEPS/CLI11-2.4.2/LICENSE" "$LICENSES/msplat/CLI11/LICENSE"
+install -m 0644 "$MSPLAT_DEPS/nanoflann-1.5.5/COPYING" "$LICENSES/msplat/nanoflann/COPYING"
+install -m 0644 "$MSPLAT_DEPS/nlohmann-json-3.11.3/LICENSE.MIT" "$LICENSES/msplat/nlohmann-json/LICENSE.MIT"
 
 chmod +x "$BIN/colmap" "$BIN/easysplat-train"
 
@@ -456,82 +659,58 @@ if ! command -v otool >/dev/null 2>&1; then
   echo "otool not found; cannot validate toolchain binary dependencies." >&2
   exit 1
 fi
-
-# Prefer a locally built OpenSSL (portable), then fall back to Homebrew.
-OPENSSL_INSTALL="${OPENSSL_INSTALL:-$ROOT/Toolchains/build/openssl/install}"
-OPENSSL_PREFIX=""
-if [ -d "$OPENSSL_INSTALL/lib" ]; then
-  OPENSSL_PREFIX="$OPENSSL_INSTALL"
-elif command -v brew >/dev/null 2>&1; then
-  OPENSSL_PREFIX="$(brew --prefix openssl@3 2>/dev/null || true)"
-  if [ -z "$OPENSSL_PREFIX" ]; then
-    OPENSSL_PREFIX="$(brew --prefix openssl 2>/dev/null || true)"
-  fi
-fi
-if [ -z "$OPENSSL_PREFIX" ] && [ -d "/opt/homebrew/opt/openssl@3" ]; then
-  OPENSSL_PREFIX="/opt/homebrew/opt/openssl@3"
-fi
-if [ -z "$OPENSSL_PREFIX" ] && [ -d "/usr/local/opt/openssl@3" ]; then
-  OPENSSL_PREFIX="/usr/local/opt/openssl@3"
-fi
-
-if [ -z "$OPENSSL_PREFIX" ]; then
-  echo "OpenSSL not found. Build it via scripts/toolchain/build_openssl.sh, or install openssl@3." >&2
+if [ ! -x /usr/bin/codesign ]; then
+  echo "codesign not found; cannot restore integrity after Mach-O rewriting." >&2
   exit 1
 fi
-
-for lib in libcrypto.3.dylib libssl.3.dylib; do
-  if [ ! -f "$OPENSSL_PREFIX/lib/$lib" ]; then
-    echo "Missing $OPENSSL_PREFIX/lib/$lib (required by colmap)." >&2
-    exit 1
-  fi
-  cp -L "$OPENSSL_PREFIX/lib/$lib" "$LIB/$lib"
-done
-
-# Make the dylib IDs rpath-relative so they work from our bundled lib/ directory.
-install_name_tool -id "@rpath/libcrypto.3.dylib" "$LIB/libcrypto.3.dylib"
-install_name_tool -id "@rpath/libssl.3.dylib" "$LIB/libssl.3.dylib"
-
-add_rpath_if_missing() {
-  local bin="$1"
-  local rpath="$2"
-  if ! otool -l "$bin" | grep -q "$rpath"; then
-    install_name_tool -add_rpath "$rpath" "$bin"
-  fi
-}
 
 add_bundle_lib_rpaths
 
-# COLMAP links against OpenSSL too; prefer the bundled dylibs.
-colmap_crypto_dep="$(otool -L "$BIN/colmap" | { grep -m1 -E 'libcrypto\.3\.dylib|libcrypto\.1\.1\.dylib' || true; } | awk '{print $1}')"
-if [ -z "$colmap_crypto_dep" ]; then
-  echo "COLMAP does not link to libcrypto; unexpected build configuration." >&2
+if otool -L "$BIN/colmap" | grep -Eq 'libcrypto|libssl'; then
+  echo "COLMAP unexpectedly links OpenSSL even though download support is disabled." >&2
   exit 1
-fi
-if [[ "$colmap_crypto_dep" == *"libcrypto.1.1.dylib" ]]; then
-  echo "COLMAP links against OpenSSL 1.1; rebuild COLMAP after running build_openssl.sh (OpenSSL 3)." >&2
-  exit 1
-fi
-if [ "$colmap_crypto_dep" != "@rpath/libcrypto.3.dylib" ]; then
-  install_name_tool -change "$colmap_crypto_dep" "@rpath/libcrypto.3.dylib" "$BIN/colmap"
 fi
 
-# Validate: colmap must have rpath + reference @rpath OpenSSL libs, and we must ship those libs.
-otool -l "$BIN/colmap" | grep -q "@executable_path/../lib" || { echo "colmap missing rpath @executable_path/../lib" >&2; exit 1; }
-otool -L "$BIN/colmap" | grep -q "@rpath/libcrypto.3.dylib" || { echo "colmap missing dependency @rpath/libcrypto.3.dylib" >&2; exit 1; }
-test -f "$LIB/libcrypto.3.dylib" || { echo "missing bundled libcrypto.3.dylib" >&2; exit 1; }
-test -f "$LIB/libssl.3.dylib" || { echo "missing bundled libssl.3.dylib" >&2; exit 1; }
-"$BIN/colmap" global_mapper -h >/dev/null 2>&1 || { echo "colmap missing working global_mapper command" >&2; exit 1; }
+# The stripped COLMAP install deliberately carries only its executable, receipts,
+# and notices. Seed its pinned native roots before walking the Mach-O graph.
+copy_dependency_to_lib "$CERES_INSTALL/lib/libceres.4.dylib" "$BIN/colmap"
+copy_dependency_to_lib "$SUITESPARSE_INSTALL/lib/libcholmod.5.dylib" "$BIN/colmap"
+copy_dependency_to_lib "$OPENIMAGEIO_INSTALL/lib/libOpenImageIO.2.5.dylib" "$BIN/colmap"
+copy_dependency_to_lib "$OPENIMAGEIO_INSTALL/lib/libOpenImageIO_Util.2.5.dylib" "$BIN/colmap"
 
 bundle_toolchain_dependency_closure
+normalize_bundle_rpaths
+ad_hoc_sign_packaged_machos
+refresh_packaged_msplat_hash
 validate_portable_dependency_references
+reject_forbidden_image_dependencies
+"$BIN/colmap" global_mapper -h >/dev/null 2>&1 || { echo "colmap missing working global_mapper command" >&2; exit 1; }
+"$BIN/colmap" image_undistorter -h >/dev/null 2>&1 || { echo "colmap missing working image_undistorter command" >&2; exit 1; }
 "$MSPLAT_VALIDATOR" --packaged "$OUT"
+
+if [ ! -x "$SUPPLY_CHAIN_GENERATOR" ]; then
+  echo "Supply-chain manifest generator is missing or not executable: $SUPPLY_CHAIN_GENERATOR" >&2
+  exit 1
+fi
+"$SUPPLY_CHAIN_GENERATOR" \
+  --toolchain-root "$OUT" \
+  --dependency-origins "$DEPENDENCY_ORIGINS" \
+  --version "$VERSION"
+rm -f "$DEPENDENCY_ORIGINS"
+
+for forbidden in AGPL CGAL LSD SPQR SiftGPU da3_streaming salad; do
+  if find "$OUT" -mindepth 1 -print | grep -Eqi "(^|/)${forbidden}([^/]*)(/|$)"; then
+    echo "Forbidden release payload entry matched ${forbidden}." >&2
+    exit 1
+  fi
+done
 
 pushd "$OUT" >/dev/null
 zip -r "$CORE_ZIP" \
   bin lib \
+  licenses provenance supply-chain/components.json \
   msplat/build_info.json msplat/LICENSE \
-  da3_mps/bin da3_mps/python da3_mps/app da3_mps/vendor da3_mps/build_info.json
+  da3_mps/bin da3_mps/python da3_mps/app da3_mps/vendor da3_mps/licenses da3_mps/build_info.json
 zip -r "$DA3_BASE_ZIP" da3_mps/models/DA3-BASE
 zip -r "$DA3_SMALL_ZIP" da3_mps/models/DA3-SMALL
 popd >/dev/null
@@ -539,6 +718,7 @@ popd >/dev/null
 assert_release_asset_size "$CORE_ZIP"
 assert_release_asset_size "$DA3_BASE_ZIP"
 assert_release_asset_size "$DA3_SMALL_ZIP"
+assert_normal_photo_install_size "$CORE_ZIP" "$DA3_BASE_ZIP" "$DA3_SMALL_ZIP"
 
 echo "Packaged toolchain (core): $CORE_ZIP"
 echo "Packaged component (DA3-BASE): $DA3_BASE_ZIP"
