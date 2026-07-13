@@ -58,7 +58,7 @@ preflight() {
   if [ "$(sysctl -in sysctl.proc_translated 2>/dev/null || true)" = "1" ]; then
     die "must run outside Rosetta"
   fi
-  for command in cmake ninja git curl shasum xcrun ditto file; do
+  for command in cmake ninja git curl shasum xcrun ditto file python3; do
     require_command "$command"
   done
   if ! xcrun -f metal >/dev/null 2>&1 || ! xcrun -f metallib >/dev/null 2>&1; then
@@ -172,40 +172,74 @@ write_build_info() {
   patch_sha256="$(sha256 "$UPSTREAM_PATCH")"
   checkpoint_patch_sha256="$(sha256 "$CHECKPOINT_PATCH")"
 
-  /usr/bin/plutil -create xml1 "$build_info"
-  /usr/bin/plutil -insert toolchain_name -string msplat "$build_info"
-  /usr/bin/plutil -insert source_url -string "$MSPLAT_REPO" "$build_info"
-  /usr/bin/plutil -insert source_commit -string "$MSPLAT_COMMIT" "$build_info"
-  /usr/bin/plutil -insert source_version -string "$MSPLAT_VERSION" "$build_info"
-  /usr/bin/plutil -insert source_tree_sha256 -string "$SOURCE_TREE_SHA256" "$build_info"
-  /usr/bin/plutil -insert overlay_sha256 -string "$overlay_sha256" "$build_info"
-  /usr/bin/plutil -insert patch_sha256 -string "$patch_sha256" "$build_info"
-  /usr/bin/plutil -insert checkpoint_patch_sha256 -string "$checkpoint_patch_sha256" "$build_info"
-  /usr/bin/plutil -insert dependencies -json "{
-    \"nlohmann_json_v3.11.3_sha256\": \"$NLOHMANN_JSON_SHA256\",
-    \"nanoflann_v1.5.5_sha256\": \"$NANOFLANN_SHA256\",
-    \"cli11_v2.4.2_sha256\": \"$CLI11_SHA256\"
-  }" "$build_info"
-  /usr/bin/plutil -insert executable_sha256 -string "$executable_sha256" "$build_info"
-  /usr/bin/plutil -insert metallib_sha256 -string "$metallib_sha256" "$build_info"
-  /usr/bin/plutil -insert compiler -string "$compiler" "$build_info"
-  /usr/bin/plutil -insert cmake -string "$cmake_version" "$build_info"
-  /usr/bin/plutil -insert ninja -string "$ninja_version" "$build_info"
-  /usr/bin/plutil -insert deployment_target -string "macOS 15.0" "$build_info"
-  /usr/bin/plutil -insert build_configuration -string Release "$build_info"
-  /usr/bin/plutil -insert cmake_arguments -json '[
-    "-G Ninja",
-    "-DCMAKE_BUILD_TYPE=Release",
-    "-DCMAKE_OSX_ARCHITECTURES=arm64",
-    "-DCMAKE_OSX_DEPLOYMENT_TARGET=15.0",
-    "-DMSPLAT_BUILD_PYTHON=OFF",
-    "-DFETCHCONTENT_FULLY_DISCONNECTED=ON",
-    "FETCHCONTENT_SOURCE_DIR_NLOHMANN_JSON=verified-v3.11.3",
-    "FETCHCONTENT_SOURCE_DIR_NANOFLANN=verified-v1.5.5",
-    "FETCHCONTENT_SOURCE_DIR_CLI11=verified-v2.4.2"
-  ]' "$build_info"
-  /usr/bin/plutil -insert build_timestamp -string "$timestamp" "$build_info"
-  /usr/bin/plutil -convert json "$build_info"
+  python3 - "$build_info" \
+    "$MSPLAT_REPO" "$MSPLAT_COMMIT" "$MSPLAT_VERSION" "$SOURCE_TREE_SHA256" \
+    "$overlay_sha256" "$patch_sha256" "$checkpoint_patch_sha256" \
+    "$NLOHMANN_JSON_SHA256" "$NANOFLANN_SHA256" "$CLI11_SHA256" \
+    "$executable_sha256" "$metallib_sha256" \
+    "$compiler" "$cmake_version" "$ninja_version" "$timestamp" <<'PY'
+import json
+import sys
+
+(
+    output_path,
+    source_url,
+    source_commit,
+    source_version,
+    source_tree_sha256,
+    overlay_sha256,
+    patch_sha256,
+    checkpoint_patch_sha256,
+    nlohmann_json_sha256,
+    nanoflann_sha256,
+    cli11_sha256,
+    executable_sha256,
+    metallib_sha256,
+    compiler,
+    cmake_version,
+    ninja_version,
+    timestamp,
+) = sys.argv[1:]
+
+payload = {
+    "toolchain_name": "msplat",
+    "source_url": source_url,
+    "source_commit": source_commit,
+    "source_version": source_version,
+    "source_tree_sha256": source_tree_sha256,
+    "overlay_sha256": overlay_sha256,
+    "patch_sha256": patch_sha256,
+    "checkpoint_patch_sha256": checkpoint_patch_sha256,
+    "dependencies": {
+        "nlohmann_json_v3.11.3_sha256": nlohmann_json_sha256,
+        "nanoflann_v1.5.5_sha256": nanoflann_sha256,
+        "cli11_v2.4.2_sha256": cli11_sha256,
+    },
+    "executable_sha256": executable_sha256,
+    "metallib_sha256": metallib_sha256,
+    "compiler": compiler,
+    "cmake": cmake_version,
+    "ninja": ninja_version,
+    "deployment_target": "macOS 15.0",
+    "build_configuration": "Release",
+    "cmake_arguments": [
+        "-G Ninja",
+        "-DCMAKE_BUILD_TYPE=Release",
+        "-DCMAKE_OSX_ARCHITECTURES=arm64",
+        "-DCMAKE_OSX_DEPLOYMENT_TARGET=15.0",
+        "-DMSPLAT_BUILD_PYTHON=OFF",
+        "-DFETCHCONTENT_FULLY_DISCONNECTED=ON",
+        "FETCHCONTENT_SOURCE_DIR_NLOHMANN_JSON=verified-v3.11.3",
+        "FETCHCONTENT_SOURCE_DIR_NANOFLANN=verified-v1.5.5",
+        "FETCHCONTENT_SOURCE_DIR_CLI11=verified-v2.4.2",
+    ],
+    "build_timestamp": timestamp,
+}
+
+with open(output_path, "w", encoding="utf-8", newline="\n") as output:
+    json.dump(payload, output, indent=2, sort_keys=True)
+    output.write("\n")
+PY
 }
 
 stage_install() {
