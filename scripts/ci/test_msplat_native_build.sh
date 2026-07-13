@@ -65,7 +65,11 @@ require_contains 'easysplat-train' "$BUILD_SCRIPT"
 require_contains 'msplat-1.1.3-easysplat.patch' "$BUILD_SCRIPT"
 require_contains 'msplat-1.1.3-checkpoint.patch' "$BUILD_SCRIPT"
 require_contains '/usr/bin/plutil -p' "$BUILD_SCRIPT"
+require_contains '/usr/bin/plutil -create xml1 "$build_info"' "$BUILD_SCRIPT"
+require_contains '/usr/bin/plutil -insert compiler -string "$compiler" "$build_info"' "$BUILD_SCRIPT"
+require_contains '/usr/bin/plutil -convert json "$build_info"' "$BUILD_SCRIPT"
 require_contains '/usr/bin/otool -L' "$BUILD_SCRIPT"
+require_absent 'cat >"$STAGE_DIR/build_info.json" <<JSON' "$BUILD_SCRIPT"
 
 for forbidden in 'pip install' 'python-build-standalone' 'site-packages' '_core.so' 'core_extension_path.txt' '/msplat-train'; do
   require_absent "$forbidden" "$BUILD_SCRIPT"
@@ -316,15 +320,14 @@ for key in source_commit source_version source_url source_tree_sha256 overlay_sh
 done
 /usr/bin/plutil -p "$BUILD_INFO" >/dev/null || fail "build provenance is not valid JSON"
 [ "$(/usr/bin/plutil -extract source_commit raw "$BUILD_INFO")" = "106499b0a53f82b0c92d013b0861fbebd341b17e" ] || fail "parsed source commit is wrong"
-require_contains '"source_commit": "106499b0a53f82b0c92d013b0861fbebd341b17e"' "$BUILD_INFO"
-require_contains '"source_version": "1.1.3"' "$BUILD_INFO"
+[ "$(/usr/bin/plutil -extract source_version raw "$BUILD_INFO")" = "1.1.3" ] || fail "parsed source version is wrong"
 overlay_hash="$(shasum -a 256 "$OVERLAY" | awk '{print $1}')"
-require_contains "\"overlay_sha256\": \"$overlay_hash\"" "$BUILD_INFO"
+[ "$(/usr/bin/plutil -extract overlay_sha256 raw "$BUILD_INFO")" = "$overlay_hash" ] || fail "parsed overlay hash is wrong"
 
 exe_hash="$(shasum -a 256 "$BIN" | awk '{print $1}')"
 metallib_hash="$(shasum -a 256 "$METALLIB" | awk '{print $1}')"
-require_contains "\"executable_sha256\": \"$exe_hash\"" "$BUILD_INFO"
-require_contains "\"metallib_sha256\": \"$metallib_hash\"" "$BUILD_INFO"
+[ "$(/usr/bin/plutil -extract executable_sha256 raw "$BUILD_INFO")" = "$exe_hash" ] || fail "parsed executable hash is wrong"
+[ "$(/usr/bin/plutil -extract metallib_sha256 raw "$BUILD_INFO")" = "$metallib_hash" ] || fail "parsed metallib hash is wrong"
 
 if grep -Eq '(/Users/|/home/|"hostname"|"username"|"source_path")' "$BUILD_INFO"; then
   fail "build provenance contains a private or machine-local field"
