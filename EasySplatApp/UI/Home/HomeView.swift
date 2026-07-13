@@ -273,10 +273,10 @@ struct HomeView: View {
     }
 
     nonisolated static func detailAvailabilityHelp(memoryGB: Double) -> String? {
-        if memoryGB <= 8.5 {
+        if !RunPlanResolver.supports(detail: .balanced, memoryGB: memoryGB) {
             return "Balanced and High Detail need more than 8 GB of unified memory."
         }
-        if memoryGB <= 16.5 {
+        if !RunPlanResolver.supports(detail: .highDetail, memoryGB: memoryGB) {
             return "High Detail needs at least 24 GB of unified memory."
         }
         return nil

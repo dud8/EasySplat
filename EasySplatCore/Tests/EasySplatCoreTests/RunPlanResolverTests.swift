@@ -152,6 +152,40 @@ final class RunPlanResolverTests: XCTestCase {
         XCTAssertEqual(performance.colmapThreadLimit, 10)
     }
 
+    func testHighDetailRequiresTheFullNominalTwentyFourGBTier() {
+        for memoryGB in [18.0, 23.0, 23.9] {
+            XCTAssertFalse(RunPlanResolver.supports(detail: .highDetail, memoryGB: memoryGB))
+            XCTAssertThrowsError(try RunPlanResolver.validate(
+                requestedOptions: RequestedRunOptions(detailProfile: .highDetail),
+                input: .video(files: ["/tmp/clip.mov"]),
+                hardware: HardwareProfile(memoryGB: memoryGB, cpuCount: 12, gpuWorkingSetGB: 16)
+            )) { error in
+                XCTAssertEqual(error as? RunPlanResolver.ValidationError, .highDetailRequiresMoreMemory)
+            }
+        }
+
+        XCTAssertTrue(RunPlanResolver.supports(detail: .highDetail, memoryGB: 24))
+        for memoryGB in [18.0, 23.0] {
+            let balancedPlan = RunPlanResolver.resolve(
+                requestedOptions: RequestedRunOptions(detailProfile: .balanced),
+                input: .video(files: ["/tmp/clip.mov"]),
+                hardware: HardwareProfile(memoryGB: memoryGB, cpuCount: 12, gpuWorkingSetGB: 14),
+                developmentOverrides: .none
+            )
+            XCTAssertEqual(balancedPlan.modelIdentifier, "DA3-BASE")
+        }
+        let defensivePlan = RunPlanResolver.resolve(
+            requestedOptions: RequestedRunOptions(
+                detailProfile: .highDetail,
+                resourcePolicy: .maximumPerformance
+            ),
+            input: .video(files: ["/tmp/clip.mov"]),
+            hardware: HardwareProfile(memoryGB: 18, cpuCount: 12, gpuWorkingSetGB: 14),
+            developmentOverrides: .none
+        )
+        XCTAssertEqual(defensivePlan.modelIdentifier, "DA3-SMALL")
+    }
+
     func testMaximumPerformanceIsUnavailableThroughTheConstrainedMemoryBoundary() {
         XCTAssertFalse(RunPlanResolver.supports(resourcePolicy: .maximumPerformance, memoryGB: 8))
         XCTAssertFalse(RunPlanResolver.supports(resourcePolicy: .maximumPerformance, memoryGB: 16))

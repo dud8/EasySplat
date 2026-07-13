@@ -209,6 +209,14 @@ final class AppModelTests: XCTestCase {
             HomeView.detailAvailabilityHelp(memoryGB: 16),
             "High Detail needs at least 24 GB of unified memory."
         )
+        XCTAssertEqual(
+            HomeView.detailAvailabilityHelp(memoryGB: 18),
+            "High Detail needs at least 24 GB of unified memory."
+        )
+        XCTAssertEqual(
+            HomeView.detailAvailabilityHelp(memoryGB: 23),
+            "High Detail needs at least 24 GB of unified memory."
+        )
         XCTAssertNil(HomeView.detailAvailabilityHelp(memoryGB: 24))
     }
 

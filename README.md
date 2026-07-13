@@ -139,8 +139,6 @@ The release toolchain is split into signed capabilities:
 - `geometry-da3-base`
 - `geometry-da3-small`
 
-Deprecated experimental geometry and training paths do not ship in the beta. Neither does the old combined 18 GB model archive.
-
 See [ONBOARDING.md](ONBOARDING.md) for maintainer architecture and [CONTRIBUTING.md](CONTRIBUTING.md) for change rules.
 
 ## Validation

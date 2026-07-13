@@ -2,6 +2,8 @@ import Foundation
 
 /// Turns user intent and measured hardware into the fixed contract used by every pipeline stage.
 public enum RunPlanResolver {
+    public static let minimumHighDetailMemoryGB = 24.0
+
     public enum ValidationError: Error, LocalizedError, Equatable {
         case continuousMultipleClipsUnsupported
         case fastDetailRequired
@@ -44,7 +46,8 @@ public enum RunPlanResolver {
         if hardware.memoryGB <= 8.5, requestedOptions.detailProfile != .fast {
             throw ValidationError.fastDetailRequired
         }
-        if hardware.memoryGB <= 16.5, requestedOptions.detailProfile == .highDetail {
+        if hardware.memoryGB < minimumHighDetailMemoryGB,
+           requestedOptions.detailProfile == .highDetail {
             throw ValidationError.highDetailRequiresMoreMemory
         }
         if !supports(inputOrdering: requestedOptions.inputOrdering, input: input) {
@@ -56,10 +59,7 @@ public enum RunPlanResolver {
         if memoryGB <= 8.5 {
             return detail == .fast
         }
-        if memoryGB <= 16.5 {
-            return detail != .highDetail
-        }
-        return true
+        return detail != .highDetail || memoryGB >= minimumHighDetailMemoryGB
     }
 
     public static func supports(resourcePolicy: ResourcePolicy, memoryGB: Double) -> Bool {
@@ -206,6 +206,7 @@ public enum RunPlanResolver {
         )
         let memoryTier = resolvedMemoryTier(
             resourcePolicy: options.resourcePolicy,
+            detail: options.detailProfile,
             memoryGB: hardware.memoryGB
         )
         let route = developmentOverrides.candidateRoute ?? .da3
@@ -316,9 +317,13 @@ public enum RunPlanResolver {
 
     private static func resolvedMemoryTier(
         resourcePolicy: ResourcePolicy,
+        detail: DetailProfile,
         memoryGB: Double
     ) -> MemoryTier {
-        if memoryGB <= 16.5 { return .constrained }
+        if memoryGB <= 16.5
+            || (detail == .highDetail && memoryGB < minimumHighDetailMemoryGB) {
+            return .constrained
+        }
         switch resourcePolicy {
         case .conserveMemory:
             return .constrained
@@ -336,7 +341,10 @@ public enum RunPlanResolver {
         memoryGB: Double
     ) -> String {
         guard route == .da3 else { return "none" }
-        if detail == .fast || resourcePolicy == .conserveMemory || memoryGB <= 16.5 {
+        if detail == .fast
+            || resourcePolicy == .conserveMemory
+            || memoryGB <= 16.5
+            || (detail == .highDetail && memoryGB < minimumHighDetailMemoryGB) {
             return "DA3-SMALL"
         }
         return "DA3-BASE"

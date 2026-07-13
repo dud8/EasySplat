@@ -472,7 +472,18 @@ final class AXApplicationController {
             guard AXUIElementGetPid(focused, &focusedPID) == .success,
                   focusedPID == processIdentifier else { continue }
             let focusedIdentifier = contextualIdentifier(of: focused)
-            let name = focusedIdentifier
+            let focusedRole = stringAttribute(focused, kAXRoleAttribute)
+            let matchesTargetProxy = (focusedRole == kAXGroupRole as String
+                || focusedRole == kAXButtonRole as String)
+                && findElement(identifier: identifier).flatMap { target in
+                    guard let focusedFrame = frame(of: focused),
+                          let targetFrame = frame(of: target) else { return false }
+                    return Self.focusProxyMatchesTarget(
+                        focusedFrame: focusedFrame,
+                        targetFrame: targetFrame
+                    )
+                } == true
+            let name = (matchesTargetProxy ? identifier : focusedIdentifier)
                 ?? stringAttribute(focused, kAXDescriptionAttribute)
                 ?? stringAttribute(focused, kAXTitleAttribute)
                 ?? stringAttribute(focused, kAXRoleAttribute)
@@ -480,11 +491,23 @@ final class AXApplicationController {
             if order.last != name {
                 order.append(name)
             }
-            if focusedIdentifier == identifier {
+            if focusedIdentifier == identifier || matchesTargetProxy {
                 return (true, order)
             }
         }
         return (false, order)
+    }
+
+    nonisolated static func focusProxyMatchesTarget(
+        focusedFrame: CGRect,
+        targetFrame: CGRect,
+        tolerance: CGFloat = 2
+    ) -> Bool {
+        guard !focusedFrame.isEmpty, !targetFrame.isEmpty else { return false }
+        return abs(focusedFrame.minX - targetFrame.minX) <= tolerance
+            && abs(focusedFrame.minY - targetFrame.minY) <= tolerance
+            && abs(focusedFrame.maxX - targetFrame.maxX) <= tolerance
+            && abs(focusedFrame.maxY - targetFrame.maxY) <= tolerance
     }
 
     private func contextualIdentifier(of element: AXUIElement) -> String? {

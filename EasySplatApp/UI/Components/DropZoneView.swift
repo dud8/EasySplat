@@ -9,8 +9,6 @@ struct DropZoneView: View {
     let onDropURLs: ([URL]) -> Void
 
     @State private var isTargeted = false
-    @FocusState private var isKeyboardFocused: Bool
-
     nonisolated static let releaseInProgressTitle = "Release to add"
     nonisolated static let releaseInProgressSubtitle = "Video or photos folder"
 
@@ -46,17 +44,7 @@ struct DropZoneView: View {
             .contentShape(RoundedRectangle(cornerRadius: Theme.Radius.standard, style: .continuous))
         }
         .buttonStyle(.plain)
-        .focusable()
-        .focused($isKeyboardFocused)
-        .defaultFocus($isKeyboardFocused, true)
-        .onAppear {
-            Task { @MainActor in
-                await Task.yield()
-                isKeyboardFocused = true
-            }
-        }
         .onKeyPress(.return) {
-            guard isKeyboardFocused else { return .ignored }
             onChoose()
             return .handled
         }

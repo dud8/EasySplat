@@ -5,6 +5,23 @@ import XCTest
 @testable import EasySplatUIVerifierCore
 
 final class UIVerifierCoreTests: XCTestCase {
+    func testKeyboardFocusProxyMustCoverTheTargetControl() {
+        let target = CGRect(x: 120, y: 80, width: 580, height: 180)
+
+        XCTAssertTrue(AXApplicationController.focusProxyMatchesTarget(
+            focusedFrame: target.insetBy(dx: -1, dy: -1),
+            targetFrame: target
+        ))
+        XCTAssertFalse(AXApplicationController.focusProxyMatchesTarget(
+            focusedFrame: CGRect(x: 120, y: 80, width: 580, height: 40),
+            targetFrame: target
+        ))
+        XCTAssertFalse(AXApplicationController.focusProxyMatchesTarget(
+            focusedFrame: target.offsetBy(dx: 12, dy: 0),
+            targetFrame: target
+        ))
+    }
+
     func testRunArgumentsRequirePackagedAppScenarioAndOutput() throws {
         let arguments = try UIVerifierArguments.parse([
             "run",
