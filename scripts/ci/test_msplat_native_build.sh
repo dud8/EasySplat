@@ -64,9 +64,9 @@ require_contains 'default.metallib' "$BUILD_SCRIPT"
 require_contains 'easysplat-train' "$BUILD_SCRIPT"
 require_contains 'msplat-1.1.3-easysplat.patch' "$BUILD_SCRIPT"
 require_contains 'msplat-1.1.3-checkpoint.patch' "$BUILD_SCRIPT"
-require_contains '/usr/bin/plutil -p' "$BUILD_SCRIPT"
 require_contains 'python3 - "$build_info"' "$BUILD_SCRIPT"
 require_contains 'json.dump(payload, output, indent=2, sort_keys=True)' "$BUILD_SCRIPT"
+require_contains 'json.load(source, parse_constant=reject_constant)' "$BUILD_SCRIPT"
 require_contains '/usr/bin/otool -L' "$BUILD_SCRIPT"
 require_absent 'cat >"$STAGE_DIR/build_info.json" <<JSON' "$BUILD_SCRIPT"
 
@@ -317,16 +317,31 @@ grep -qi 'payload' "$negative_dir/truncated-ply.stderr" || fail "truncated PLY d
 for key in source_commit source_version source_url source_tree_sha256 overlay_sha256 patch_sha256 checkpoint_patch_sha256 executable_sha256 metallib_sha256 compiler deployment_target cmake_arguments build_timestamp; do
   require_contains "\"$key\"" "$BUILD_INFO"
 done
-/usr/bin/plutil -p "$BUILD_INFO" >/dev/null || fail "build provenance is not valid JSON"
-[ "$(/usr/bin/plutil -extract source_commit raw "$BUILD_INFO")" = "106499b0a53f82b0c92d013b0861fbebd341b17e" ] || fail "parsed source commit is wrong"
-[ "$(/usr/bin/plutil -extract source_version raw "$BUILD_INFO")" = "1.1.3" ] || fail "parsed source version is wrong"
 overlay_hash="$(shasum -a 256 "$OVERLAY" | awk '{print $1}')"
-[ "$(/usr/bin/plutil -extract overlay_sha256 raw "$BUILD_INFO")" = "$overlay_hash" ] || fail "parsed overlay hash is wrong"
-
 exe_hash="$(shasum -a 256 "$BIN" | awk '{print $1}')"
 metallib_hash="$(shasum -a 256 "$METALLIB" | awk '{print $1}')"
-[ "$(/usr/bin/plutil -extract executable_sha256 raw "$BUILD_INFO")" = "$exe_hash" ] || fail "parsed executable hash is wrong"
-[ "$(/usr/bin/plutil -extract metallib_sha256 raw "$BUILD_INFO")" = "$metallib_hash" ] || fail "parsed metallib hash is wrong"
+python3 - "$BUILD_INFO" "$overlay_hash" "$exe_hash" "$metallib_hash" <<'PY'
+import json
+import sys
+
+
+def reject_constant(value):
+    raise ValueError(f"non-finite JSON constant: {value}")
+
+
+with open(sys.argv[1], encoding="utf-8") as source:
+    payload = json.load(source, parse_constant=reject_constant)
+expected = {
+    "source_commit": "106499b0a53f82b0c92d013b0861fbebd341b17e",
+    "source_version": "1.1.3",
+    "overlay_sha256": sys.argv[2],
+    "executable_sha256": sys.argv[3],
+    "metallib_sha256": sys.argv[4],
+}
+for key, value in expected.items():
+    if payload.get(key) != value:
+        raise SystemExit(f"build provenance {key} mismatch")
+PY
 
 if grep -Eq '(/Users/|/home/|"hostname"|"username"|"source_path")' "$BUILD_INFO"; then
   fail "build provenance contains a private or machine-local field"

@@ -275,9 +275,31 @@ validate_stage() {
   expected_files=$'./LICENSE\n./bin/default.metallib\n./bin/easysplat-train\n./build_info.json'
   [ "$actual_files" = "$expected_files" ] || die "unexpected staged files"
 
-  [ "$(/usr/bin/plutil -extract executable_sha256 raw "$STAGE_DIR/build_info.json")" = "$(sha256 "$binary")" ] || die "executable provenance hash mismatch"
-  [ "$(/usr/bin/plutil -extract metallib_sha256 raw "$STAGE_DIR/build_info.json")" = "$(sha256 "$metallib")" ] || die "metallib provenance hash mismatch"
-  /usr/bin/plutil -p "$STAGE_DIR/build_info.json" >/dev/null || die "provenance is not valid JSON"
+  if ! python3 - "$STAGE_DIR/build_info.json" "$(sha256 "$binary")" "$(sha256 "$metallib")" <<'PY'
+import json
+import sys
+
+
+def reject_constant(value):
+    raise ValueError(f"non-finite JSON constant: {value}")
+
+
+try:
+    with open(sys.argv[1], encoding="utf-8") as source:
+        payload = json.load(source, parse_constant=reject_constant)
+except (OSError, UnicodeError, ValueError) as exc:
+    raise SystemExit(f"invalid build provenance JSON: {exc}") from exc
+
+if not isinstance(payload, dict):
+    raise SystemExit("build provenance must be a JSON object")
+if payload.get("executable_sha256") != sys.argv[2]:
+    raise SystemExit("executable provenance hash mismatch")
+if payload.get("metallib_sha256") != sys.argv[3]:
+    raise SystemExit("metallib provenance hash mismatch")
+PY
+  then
+    die "provenance validation failed"
+  fi
   if grep -Eq '(/Users/|/home/|"hostname"|"username"|"source_path")' "$STAGE_DIR/build_info.json"; then
     die "provenance contains private or machine-local data"
   fi
