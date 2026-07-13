@@ -72,20 +72,21 @@ index 3e8b47b..4fcb4a4 100644
 +    return elements * sizeof(float);
 +}
 +
-+static void requireFiniteTensor(const MTensor &tensor) {
++static void requireFiniteTensor(const MTensor &tensor, const char *label) {
 +    if (tensor.dtype() != DType::Float32) {
 +        throw std::runtime_error("Checkpoint tensors must be float32");
 +    }
 +    const float *values = tensor.data<float>();
 +    for (int64_t index = 0; index < tensor.numel(); ++index) {
 +        if (!std::isfinite(values[index])) {
-+            throw std::runtime_error("Checkpoint tensor contains a non-finite value");
++            throw std::runtime_error(std::string("Checkpoint tensor contains a non-finite value for ") + label);
 +        }
 +    }
 +}
 
- static void writeTensor(std::ofstream &f, MTensor &t) {
-+    requireFiniteTensor(t);
+-static void writeTensor(std::ofstream &f, MTensor &t) {
++static void writeTensor(std::ofstream &f, MTensor &t, const char *label) {
++    requireFiniteTensor(t, label);
      uint32_t ndim = t.ndim();
 +    const uint64_t expectedBytes = checkedTensorBytes(t.shape());
 +    if (expectedBytes != t.nbytes()) {
@@ -172,16 +173,35 @@ index 3e8b47b..4fcb4a4 100644
      u = (uint32_t)shDegree;        f.write(reinterpret_cast<const char*>(&u), sizeof(u));
      u = (uint32_t)adam_step_count;  f.write(reinterpret_cast<const char*>(&u), sizeof(u));
 
-@@ -392,6 +473,15 @@ void Model::saveCheckpoint(const std::string &filename, int step) {
-     for (int g = 0; g < N_ADAM_GROUPS; g++) writeTensor(f, adam_exp_avg[g]);
-     for (int g = 0; g < N_ADAM_GROUPS; g++) writeTensor(f, adam_exp_avg_sq[g]);
-
+@@ -383,15 +464,24 @@ void Model::saveCheckpoint(const std::string &filename, int step) {
+     // Gaussian parameters (views — only num_active elements)
+-    writeTensor(f, means);
+-    writeTensor(f, scales);
+-    writeTensor(f, quats);
+-    writeTensor(f, featuresDc);
+-    writeTensor(f, featuresRest);
+-    writeTensor(f, opacities);
++    writeTensor(f, means, "means");
++    writeTensor(f, scales, "scales");
++    writeTensor(f, quats, "quaternions");
++    writeTensor(f, featuresDc, "features_dc");
++    writeTensor(f, featuresRest, "features_rest");
++    writeTensor(f, opacities, "opacities");
+-
++
+     // Optimizer state
+-    for (int g = 0; g < N_ADAM_GROUPS; g++) writeTensor(f, adam_exp_avg[g]);
+-    for (int g = 0; g < N_ADAM_GROUPS; g++) writeTensor(f, adam_exp_avg_sq[g]);
++    for (int g = 0; g < N_ADAM_GROUPS; g++) writeTensor(f, adam_exp_avg[g], "adam_exp_avg");
++    for (int g = 0; g < N_ADAM_GROUPS; g++) writeTensor(f, adam_exp_avg_sq[g], "adam_exp_avg_sq");
+-
++
 +    const uint8_t statsPresent = hasDensificationStats ? 1 : 0;
 +    f.write(reinterpret_cast<const char*>(&statsPresent), sizeof(statsPresent));
 +    if (hasDensificationStats) {
-+        writeTensor(f, xysGradNorm);
-+        writeTensor(f, visCounts);
-+        writeTensor(f, max2DSize);
++        writeTensor(f, xysGradNorm, "xy_gradient_norm");
++        writeTensor(f, visCounts, "visibility_count");
++        writeTensor(f, max2DSize, "maximum_2d_size");
 +    }
 +
 +    f.flush();
