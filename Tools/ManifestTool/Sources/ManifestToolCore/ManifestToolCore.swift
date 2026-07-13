@@ -121,6 +121,7 @@ public struct ManifestArtifactInput: Equatable {
 public enum ManifestBuilder {
     public static let maximumReleaseAssetBytes: UInt64 = 2_147_483_648
     public static let maximumExpandedComponentBytes: UInt64 = 16 * 1_024 * 1_024 * 1_024
+    static let installStateFilename = ".easysplat_toolchain_state.json"
 
     public static func build(
         version: String,
@@ -151,6 +152,7 @@ public enum ManifestBuilder {
         }
         let key = try privateKey(from: privateKeyBase64)
         let builtComponents = try components.map(makeComponent)
+        try validateContentOwnership(builtComponents)
         let publicKeyData = key.publicKey.rawRepresentation
         let keyID = SHA256.hash(data: publicKeyData).map { String(format: "%02x", $0) }.joined()
         var manifest = ManifestDocument(
@@ -235,6 +237,7 @@ public enum ManifestBuilder {
               Set(componentArchives.keys) == expectedNames else {
             try fail("Release manifest component set does not match the expected closure.")
         }
+        try validateContentOwnership(manifest.components)
 
         for name in expectedNames.sorted() {
             guard let component = componentsByName[name]?.first,
@@ -280,6 +283,31 @@ public enum ManifestBuilder {
             hasher.update(data: data)
         }
         return hasher.finalize().map { String(format: "%02x", $0) }.joined()
+    }
+
+    static func validateContentOwnership(_ components: [ManifestDocument.Component]) throws {
+        let paths = components.flatMap(\.contents)
+        let ownershipKeys = paths.map(pathOwnershipKey)
+        let installStateKey = pathOwnershipKey(installStateFilename)
+        guard Set(ownershipKeys).count == ownershipKeys.count,
+              !ownershipKeys.contains(where: {
+                  $0 == installStateKey || $0.hasPrefix(installStateKey + "/")
+              }) else {
+            throw NSError(
+                domain: "ManifestTool",
+                code: 13,
+                userInfo: [
+                    NSLocalizedDescriptionKey: "Release component content ownership overlaps or uses the reserved install-state path."
+                ]
+            )
+        }
+    }
+
+    static func pathOwnershipKey(_ path: String) -> String {
+        path
+            .precomposedStringWithCanonicalMapping
+            .folding(options: [.caseInsensitive], locale: Locale(identifier: "en_US_POSIX"))
+            .precomposedStringWithCanonicalMapping
     }
 
     private static func makeComponent(from input: ManifestArtifactInput) throws -> ManifestDocument.Component {

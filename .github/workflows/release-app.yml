@@ -146,6 +146,8 @@ jobs:
             --dmg "release/DMG/EasySplat-$VERSION-unsigned.dmg" \
             --expected-version "$VERSION" \
             --artifacts \
+            --source-url "https://github.com/$GITHUB_REPOSITORY" \
+            --source-commit "$GITHUB_SHA" \
             --release-manifest Toolchains/manifest.json \
             --core-archive "Toolchains/out/toolchain-macos-arm64-$TOOLCHAIN_VERSION-core.zip" \
             --da3-base-archive "Toolchains/out/toolchain-geometry-da3-base-$TOOLCHAIN_VERSION.zip" \
@@ -270,6 +272,22 @@ jobs:
             --only-fixed \
             --fail-on high
 
+      - name: Record trusted release asset hashes
+        run: |
+          LOCAL_ASSET_HASHES="$RUNNER_TEMP/app-release-assets.sha256"
+          (
+            cd release/DMG
+            shasum -a 256 \
+              "EasySplat-$VERSION-unsigned.dmg" \
+              "EasySplat-$VERSION-unsigned.dmg.sha256" \
+              "EasySplat-$VERSION.provenance.json" \
+              "EasySplat-$VERSION.spdx.json" \
+              "EasySplat-$VERSION-licenses.zip" \
+              "EasySplat-$VERSION-dSYM.zip" \
+              "EasySplat-$VERSION-benchmark.json"
+          ) >"$LOCAL_ASSET_HASHES"
+          test "$(wc -l <"$LOCAL_ASSET_HASHES" | tr -d '[:space:]')" = "7"
+
       - name: Create immutable draft prerelease
         uses: softprops/action-gh-release@b4309332981a82ec1c5618f44dd2e27cc8bfbfda # v3.0.0
         with:
@@ -295,6 +313,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           REMOTE="$RUNNER_TEMP/app-release-download"
+          LOCAL_ASSET_HASHES="$RUNNER_TEMP/app-release-assets.sha256"
           rm -rf "$REMOTE"
           mkdir -p "$REMOTE"
           gh release download "$TAG" \
@@ -307,11 +326,15 @@ jobs:
             --pattern "EasySplat-$VERSION-licenses.zip" \
             --pattern "EasySplat-$VERSION-dSYM.zip" \
             --pattern "EasySplat-$VERSION-benchmark.json"
+          test -s "$LOCAL_ASSET_HASHES"
+          (cd "$REMOTE" && shasum -a 256 -c "$LOCAL_ASSET_HASHES")
           (cd "$REMOTE" && shasum -a 256 -c "EasySplat-$VERSION-unsigned.dmg.sha256")
           python3 scripts/release/generate_release_metadata.py verify \
             --app-version "$VERSION" \
             --toolchain-version "$TOOLCHAIN_VERSION" \
             --release-mode unsigned-beta \
+            --source-url "https://github.com/$GITHUB_REPOSITORY" \
+            --source-commit "$GITHUB_SHA" \
             --dmg "$REMOTE/EasySplat-$VERSION-unsigned.dmg" \
             --manifest Toolchains/manifest.json \
             --core "Toolchains/out/toolchain-macos-arm64-$TOOLCHAIN_VERSION-core.zip" \
@@ -326,9 +349,19 @@ jobs:
           "$RUNNER_TEMP/spdx-tools/bin/pyspdxtools" \
             -i "$REMOTE/EasySplat-$VERSION.spdx.json"
           unzip -tq "$REMOTE/EasySplat-$VERSION-dSYM.zip"
-          cmp \
-            "release/DMG/EasySplat-$VERSION-benchmark.json" \
-            "$REMOTE/EasySplat-$VERSION-benchmark.json"
+          REMOTE_DSYM_ROOT="$RUNNER_TEMP/app-release-dsym"
+          rm -rf "$REMOTE_DSYM_ROOT"
+          mkdir -p "$REMOTE_DSYM_ROOT"
+          ditto -x -k "$REMOTE/EasySplat-$VERSION-dSYM.zip" "$REMOTE_DSYM_ROOT"
+          REMOTE_DSYM="$REMOTE_DSYM_ROOT/EasySplat.app.dSYM"
+          test -d "$REMOTE_DSYM"
+          APP_UUIDS="$(xcrun dwarfdump --uuid \
+            build/Export/EasySplat.app/Contents/MacOS/EasySplatApp)"
+          DSYM_UUIDS="$(xcrun dwarfdump --uuid "$REMOTE_DSYM")"
+          test "$(awk '/^UUID: / { count += 1 } END { print count + 0 }' <<<"$APP_UUIDS")" = "1"
+          test "$(awk '/^UUID: / { count += 1 } END { print count + 0 }' <<<"$DSYM_UUIDS")" = "1"
+          test "$(awk '/^UUID: / { print $2 " " $3 }' <<<"$APP_UUIDS")" = \
+            "$(awk '/^UUID: / { print $2 " " $3 }' <<<"$DSYM_UUIDS")"
 
       - name: Publish verified prerelease
         env:

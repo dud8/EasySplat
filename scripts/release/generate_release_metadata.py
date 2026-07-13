@@ -9,6 +9,7 @@ import json
 import os
 import re
 import stat
+import struct
 import sys
 import zipfile
 from dataclasses import dataclass
@@ -38,6 +39,12 @@ METALSPLATTER_SOURCE_ROOTS = (
     "SplatIO/Sources",
 )
 MAX_NORMAL_PHOTO_INSTALL_BYTES = 2_500_000_000
+CPU_TYPE_ARM64 = 0x0100000C
+CPU_SUBTYPE_ARM64_ALL = 0
+THIN_64_MACHO_ENDIAN = {
+    b"\xcf\xfa\xed\xfe": "<",
+    b"\xfe\xed\xfa\xcf": ">",
+}
 
 
 class MetadataError(ValueError):
@@ -50,6 +57,26 @@ def fail(message: str) -> "NoReturn":
 
 def sha256_stream(stream: BinaryIO) -> str:
     digest = hashlib.sha256()
+    for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+        digest.update(chunk)
+    return digest.hexdigest()
+
+
+def validate_thin_arm64_macho_header(header: bytes, path: str) -> None:
+    if len(header) < 12:
+        fail(f"Mach-O archive entry has a truncated header: {path}")
+    endian = THIN_64_MACHO_ENDIAN.get(header[:4])
+    if endian is None:
+        fail(f"Mach-O archive entry is not a thin 64-bit binary: {path}")
+    cpu_type, cpu_subtype = struct.unpack(f"{endian}II", header[4:12])
+    if cpu_type != CPU_TYPE_ARM64 or (cpu_subtype & 0x00FFFFFF) != CPU_SUBTYPE_ARM64_ALL:
+        fail(f"Mach-O archive entry must be arm64-only: {path}")
+
+
+def sha256_arm64_macho_stream(stream: BinaryIO, path: str) -> str:
+    header = stream.read(12)
+    validate_thin_arm64_macho_header(header, path)
+    digest = hashlib.sha256(header)
     for chunk in iter(lambda: stream.read(1024 * 1024), b""):
         digest.update(chunk)
     return digest.hexdigest()
@@ -401,7 +428,10 @@ def inspect_archive(
                     if info.file_size != row["size"]:
                         fail(f"size mismatch for {path}")
                     with archive.open(info) as stream:
-                        digest = sha256_stream(stream)
+                        if kind == "mach-o":
+                            digest = sha256_arm64_macho_stream(stream, path)
+                        else:
+                            digest = sha256_stream(stream)
                     if digest != row["sha256"]:
                         fail(f"checksum mismatch for {path}")
                     if path in license_paths:
@@ -961,15 +991,12 @@ def verify(args: argparse.Namespace) -> None:
     specs = specs_from_args(args)
     closure = validate_archives(specs, args.toolchain_version)
     created_at = validate_manifest(args.manifest, args.toolchain_version, specs)
-    source = provenance.get("source")
-    if not isinstance(source, dict):
-        fail("release provenance source is missing")
     expected_provenance = build_provenance(
         app_version=args.app_version,
         toolchain_version=args.toolchain_version,
         release_mode=args.release_mode,
-        source_url=source.get("url"),
-        source_commit=source.get("commit"),
+        source_url=args.source_url,
+        source_commit=args.source_commit,
         created_at=created_at,
         dmg=args.dmg,
         manifest=args.manifest,
@@ -1008,6 +1035,8 @@ def parse_args() -> argparse.Namespace:
     generate_parser.set_defaults(operation=generate)
     verify_parser = subparsers.add_parser("verify")
     common_args(verify_parser, require_urls=False)
+    verify_parser.add_argument("--source-url", required=True)
+    verify_parser.add_argument("--source-commit", required=True)
     verify_parser.add_argument("--provenance", type=Path, required=True)
     verify_parser.add_argument("--spdx", type=Path, required=True)
     verify_parser.add_argument("--licenses", type=Path, required=True)

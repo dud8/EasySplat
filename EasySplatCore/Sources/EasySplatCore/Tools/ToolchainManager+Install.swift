@@ -235,6 +235,10 @@ extension ToolchainManager {
                 try copyInstallTree(from: seedFromExistingRoot, to: stagingRoot)
             }
             try await stagingInstall(stagingRoot)
+            try validateInstalledTree(
+                root: stagingRoot,
+                state: loadInstallState(root: stagingRoot)
+            )
 
             if fileManager.fileExists(atPath: versionedRoot.path) {
                 _ = try fileManager.replaceItemAt(
@@ -283,16 +287,30 @@ extension ToolchainManager {
     }
 
     func copyInstallTree(from source: URL, to destination: URL) throws {
-        let entries = try fileManager.contentsOfDirectory(
-            at: source,
-            includingPropertiesForKeys: nil,
-            options: []
+        let expectedFiles = try validateInstalledTree(
+            root: source,
+            state: loadInstallState(root: source)
         )
-        for entry in entries {
-            try fileManager.copyItem(
-                at: entry,
-                to: destination.appendingPathComponent(entry.lastPathComponent)
+        for relativePath in expectedFiles.sorted() {
+            let sourceFile = source.appendingPathComponent(relativePath)
+            let destinationFile = destination.appendingPathComponent(relativePath)
+            let attributes = try fileManager.attributesOfItem(atPath: sourceFile.path)
+            guard attributes[.type] as? FileAttributeType == .typeRegular else {
+                throw ToolchainError.invalidToolchain(
+                    "Toolchain file changed while preparing the install: \(relativePath)."
+                )
+            }
+            if let references = attributes[.referenceCount] as? NSNumber,
+               references.intValue != 1 {
+                throw ToolchainError.invalidToolchain(
+                    "Toolchain file became multiply linked while preparing the install: \(relativePath)."
+                )
+            }
+            try fileManager.createDirectory(
+                at: destinationFile.deletingLastPathComponent(),
+                withIntermediateDirectories: true
             )
+            try fileManager.copyItem(at: sourceFile, to: destinationFile)
         }
     }
 

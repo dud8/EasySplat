@@ -108,10 +108,14 @@ public final class Da3SfmRunner: @unchecked Sendable, Da3SfmRunning {
         }
         environment["PYTHONNOUSERSITE"] = "1"
         environment["PYTHONSAFEPATH"] = "1"
+        environment["PYTHONDONTWRITEBYTECODE"] = "1"
         environment["PYTHONUNBUFFERED"] = "1"
         environment["EASYSPLAT_DA3_MODELS_DIR"] = toolchain.models.path
-        environment["TORCH_HOME"] = toolchain.models.path
-        environment["HF_HOME"] = toolchain.models.appendingPathComponent("huggingface", isDirectory: true).path
+        let cacheRoot = FileManager.default.temporaryDirectory
+            .appendingPathComponent("EasySplat/DA3Cache", isDirectory: true)
+        environment["EASYSPLAT_DA3_CACHE_DIR"] = cacheRoot.path
+        environment["TORCH_HOME"] = cacheRoot.appendingPathComponent("torch", isDirectory: true).path
+        environment["HF_HOME"] = cacheRoot.appendingPathComponent("huggingface", isDirectory: true).path
         environment["HF_HUB_OFFLINE"] = "1"
         environment["TRANSFORMERS_OFFLINE"] = "1"
         environment["HF_HUB_DISABLE_TELEMETRY"] = "1"

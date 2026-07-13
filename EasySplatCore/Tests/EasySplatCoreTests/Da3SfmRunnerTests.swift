@@ -70,10 +70,13 @@ final class Da3SfmRunnerTests: XCTestCase {
         XCTAssertEqual(value(after: "--manifest-out", in: capturedArgs), coverageManifest.path)
 
         let environment = try XCTUnwrap(mock.environments.first)
+        let expectedCacheRoot = FileManager.default.temporaryDirectory
+            .appendingPathComponent("EasySplat/DA3Cache", isDirectory: true)
         XCTAssertEqual(environment["PYTHONUNBUFFERED"], "1")
         XCTAssertEqual(environment["EASYSPLAT_DA3_MODELS_DIR"], toolchain.models.path)
-        XCTAssertEqual(environment["TORCH_HOME"], toolchain.models.path)
-        XCTAssertEqual(environment["HF_HOME"], toolchain.models.appendingPathComponent("huggingface", isDirectory: true).path)
+        XCTAssertEqual(environment["EASYSPLAT_DA3_CACHE_DIR"], expectedCacheRoot.path)
+        XCTAssertEqual(environment["TORCH_HOME"], expectedCacheRoot.appendingPathComponent("torch").path)
+        XCTAssertEqual(environment["HF_HOME"], expectedCacheRoot.appendingPathComponent("huggingface").path)
         XCTAssertEqual(environment["HF_HUB_OFFLINE"], "1")
         XCTAssertEqual(environment["TRANSFORMERS_OFFLINE"], "1")
         XCTAssertEqual(environment["HF_HUB_DISABLE_TELEMETRY"], "1")
@@ -82,6 +85,7 @@ final class Da3SfmRunnerTests: XCTestCase {
         XCTAssertEqual(environment["PYTORCH_ENABLE_MPS_FALLBACK"], "1")
         XCTAssertEqual(environment["PYTHONNOUSERSITE"], "1")
         XCTAssertEqual(environment["PYTHONSAFEPATH"], "1")
+        XCTAssertEqual(environment["PYTHONDONTWRITEBYTECODE"], "1")
         XCTAssertNil(environment["PYTHONPATH"])
         XCTAssertNil(environment["PYTHONHOME"])
         XCTAssertNil(environment["PYTHONUSERBASE"])

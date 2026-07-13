@@ -1,8 +1,162 @@
+import CryptoKit
 import Foundation
 import XCTest
 @testable import ManifestToolCore
 
 final class ManifestToolCoreTests: XCTestCase {
+    func testSchema2BuilderRejectsCrossComponentAndInstallerStateCollisions() throws {
+        let tempDir = try makeTempDir()
+        defer { try? FileManager.default.removeItem(at: tempDir) }
+        let firstZip = try makeZip(
+            named: "ownership-first",
+            files: ["share/Caf\u{00E9}.txt": Data("first".utf8)],
+            in: tempDir
+        )
+        let secondZip = try makeZip(
+            named: "ownership-second",
+            files: ["share/cafe\u{0301}.TXT": Data("second".utf8)],
+            in: tempDir
+        )
+        let keypair = ManifestBuilder.generateKeypair()
+
+        XCTAssertThrowsError(try ManifestBuilder.build(
+            version: "2.0.0",
+            publishedAt: Date(timeIntervalSince1970: 0),
+            appVersionRange: .init(minimum: "0.2.0-beta.1", maximumExclusive: "0.3.0"),
+            components: [
+                .init(
+                    name: "first",
+                    artifactURL: "https://example.com/first.zip",
+                    zipURL: firstZip,
+                    capabilities: ["first"],
+                    dependencies: [],
+                    requirement: .required,
+                    criticalFilePaths: ["share/Caf\u{00E9}.txt"]
+                ),
+                .init(
+                    name: "second",
+                    artifactURL: "https://example.com/second.zip",
+                    zipURL: secondZip,
+                    capabilities: ["second"],
+                    dependencies: [],
+                    requirement: .optional,
+                    criticalFilePaths: ["share/cafe\u{0301}.TXT"]
+                ),
+            ],
+            privateKeyBase64: keypair.privateKeyBase64
+        ))
+
+        let stateZip = try makeZip(
+            named: "ownership-state",
+            files: [".EASYSPLAT_TOOLCHAIN_STATE.JSON": Data("state".utf8)],
+            in: tempDir
+        )
+        XCTAssertThrowsError(try ManifestBuilder.build(
+            version: "2.0.0",
+            publishedAt: Date(timeIntervalSince1970: 0),
+            appVersionRange: .init(minimum: "0.2.0-beta.1", maximumExclusive: "0.3.0"),
+            components: [
+                .init(
+                    name: "state",
+                    artifactURL: "https://example.com/state.zip",
+                    zipURL: stateZip,
+                    capabilities: ["state"],
+                    dependencies: [],
+                    requirement: .required,
+                    criticalFilePaths: [".EASYSPLAT_TOOLCHAIN_STATE.JSON"]
+                ),
+            ],
+            privateKeyBase64: keypair.privateKeyBase64
+        ))
+    }
+
+    func testReleaseVerifierRejectsSignedOwnershipCollisionsBeforeArchiveChecks() throws {
+        let tempDir = try makeTempDir()
+        defer { try? FileManager.default.removeItem(at: tempDir) }
+        let firstZip = try makeZip(
+            named: "verify-first",
+            files: ["first.txt": Data("first".utf8)],
+            in: tempDir
+        )
+        let secondZip = try makeZip(
+            named: "verify-second",
+            files: ["second.txt": Data("second".utf8)],
+            in: tempDir
+        )
+        let urls = [
+            "first": "https://example.com/first.zip",
+            "second": "https://example.com/second.zip",
+        ]
+        let archives = ["first": firstZip, "second": secondZip]
+        let keypair = ManifestBuilder.generateKeypair()
+        let privateKey = try Curve25519.Signing.PrivateKey(
+            rawRepresentation: XCTUnwrap(Data(base64Encoded: keypair.privateKeyBase64))
+        )
+        let original = try ManifestBuilder.build(
+            version: "2.0.0",
+            publishedAt: Date(timeIntervalSince1970: 0),
+            appVersionRange: .init(minimum: "0.2.0-beta.1", maximumExclusive: "0.3.0"),
+            components: [
+                .init(
+                    name: "first",
+                    artifactURL: urls["first"]!,
+                    zipURL: firstZip,
+                    capabilities: ["first"],
+                    dependencies: [],
+                    requirement: .required,
+                    criticalFilePaths: ["first.txt"]
+                ),
+                .init(
+                    name: "second",
+                    artifactURL: urls["second"]!,
+                    zipURL: secondZip,
+                    capabilities: ["second"],
+                    dependencies: [],
+                    requirement: .optional,
+                    criticalFilePaths: ["second.txt"]
+                ),
+            ],
+            privateKeyBase64: keypair.privateKeyBase64
+        )
+
+        func resigned(_ mutation: (inout ManifestDocument) -> Void) throws -> ManifestDocument {
+            var manifest = original
+            mutation(&manifest)
+            manifest.signatureEd25519 = try privateKey.signature(
+                for: ManifestBuilder.canonicalData(for: manifest)
+            ).base64EncodedString()
+            return manifest
+        }
+
+        let overlap = try resigned { manifest in
+            manifest.components[1].contents[0] = "FIRST.TXT"
+        }
+        XCTAssertThrowsError(try ManifestBuilder.verifyRelease(
+            manifest: overlap,
+            publicKeyBase64: keypair.publicKeyBase64,
+            expectedToolchainVersion: "2.0.0",
+            expectedAppVersion: "0.2.0-beta.1",
+            expectedComponentURLs: urls,
+            componentArchives: archives
+        )) { error in
+            XCTAssertTrue(error.localizedDescription.contains("ownership"))
+        }
+
+        let stateCollision = try resigned { manifest in
+            manifest.components[0].contents[0] = ".EASYSPLAT_TOOLCHAIN_STATE.JSON"
+        }
+        XCTAssertThrowsError(try ManifestBuilder.verifyRelease(
+            manifest: stateCollision,
+            publicKeyBase64: keypair.publicKeyBase64,
+            expectedToolchainVersion: "2.0.0",
+            expectedAppVersion: "0.2.0-beta.1",
+            expectedComponentURLs: urls,
+            componentArchives: archives
+        )) { error in
+            XCTAssertTrue(error.localizedDescription.contains("ownership"))
+        }
+    }
+
     func testReleaseVerifierAuthenticatesManifestURLsAndArchives() throws {
         let tempDir = try makeTempDir()
         defer { try? FileManager.default.removeItem(at: tempDir) }

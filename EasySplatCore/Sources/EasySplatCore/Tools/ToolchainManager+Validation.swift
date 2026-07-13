@@ -535,9 +535,16 @@ extension ToolchainManager {
                 "\(label) is not a Mach-O binary (file reported: \(probe.stdout.trimmingCharacters(in: .whitespacesAndNewlines)))."
             )
         }
-        // Universal binaries report each slice; require at least one arm64 slice.
-        guard description.contains("arm64") else {
-            throw ToolchainError.invalidToolchain("\(label) is not arm64 (Rosetta build detected).")
+        let architectures = Set(
+            description
+                .split { !$0.isLetter && !$0.isNumber && $0 != "_" }
+                .map(String.init)
+                .filter { $0 == "arm64" || $0 == "arm64e" || $0 == "x86_64" || $0 == "i386" }
+        )
+        guard architectures == ["arm64"], !description.contains("universal binary") else {
+            throw ToolchainError.invalidToolchain(
+                "\(label) must be an arm64-only Mach-O binary."
+            )
         }
     }
 

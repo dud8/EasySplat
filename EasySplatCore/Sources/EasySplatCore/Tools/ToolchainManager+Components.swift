@@ -103,6 +103,16 @@ extension ToolchainManager {
             "geometry-da3-small": ([ToolchainCapability.da3Small.rawValue], ["macos-arm64-core"], .optional, Self.criticalSmallModelFiles),
         ]
 
+        let allContents = manifest.components.flatMap(\.contents)
+        let ownershipKeys = allContents.map(Self.toolchainPathCollisionKey)
+        let installStateKey = Self.toolchainPathCollisionKey(Self.installStateFilename)
+        guard Set(ownershipKeys).count == ownershipKeys.count,
+              !ownershipKeys.contains(where: {
+                  $0 == installStateKey || $0.hasPrefix(installStateKey + "/")
+              }) else {
+            throw ToolchainError.invalidManifest
+        }
+
         for component in manifest.components {
             let requiredCriticalFiles = component.name == "macos-arm64-core"
                 ? Self.criticalCoreFiles(in: component.contents)
@@ -150,6 +160,13 @@ extension ToolchainManager {
         guard totalDownloadBytes <= Self.maximumNormalPhotoToolchainDownloadBytes else {
             throw ToolchainError.invalidManifest
         }
+    }
+
+    static func toolchainPathCollisionKey(_ path: String) -> String {
+        path
+            .precomposedStringWithCanonicalMapping
+            .folding(options: [.caseInsensitive], locale: Locale(identifier: "en_US_POSIX"))
+            .precomposedStringWithCanonicalMapping
     }
 
     func isAppVersionCompatible(with manifest: ToolchainManifest) -> Bool {
@@ -228,9 +245,117 @@ extension ToolchainManager {
         guard installedComponents.contains(where: { $0.name == "macos-arm64-core" }) else {
             throw ToolchainError.invalidToolchain("Cached toolchain is missing its core component.")
         }
+        try validateInstalledTree(root: root, installedComponents: installedComponents)
 
         state.installedCapabilities = Set(installedComponents.flatMap(\.capabilities)).sorted()
         return state
+    }
+
+    @discardableResult
+    func validateInstalledTree(root: URL, state: ToolchainInstallState) throws -> Set<String> {
+        guard let receipt = state.signedManifest,
+              !state.installedArtifacts.isEmpty else {
+            throw ToolchainError.invalidToolchain("Toolchain has no installed component receipt.")
+        }
+        let byName = Dictionary(uniqueKeysWithValues: receipt.components.map { ($0.name, $0) })
+        let installedComponents = try state.installedArtifacts.keys.map { name in
+            guard let component = byName[name],
+                  state.installedArtifacts[name]?.lowercased() == component.sha256.lowercased() else {
+                throw ToolchainError.invalidToolchain("Toolchain component receipt is invalid: \(name).")
+            }
+            return component
+        }
+        return try validateInstalledTree(root: root, installedComponents: installedComponents)
+    }
+
+    @discardableResult
+    func validateInstalledTree(
+        root: URL,
+        installedComponents: [ToolchainManifest.Component]
+    ) throws -> Set<String> {
+        var expectedFiles = Set(installedComponents.flatMap(\.contents))
+        expectedFiles.insert(Self.installStateFilename)
+
+        var expectedDirectories = Set<String>()
+        for path in expectedFiles {
+            try validateArchiveEntries([path])
+            let parts = path.split(separator: "/", omittingEmptySubsequences: false)
+            guard !path.hasSuffix("/"), parts.allSatisfy({ !$0.isEmpty }) else {
+                throw ToolchainError.invalidToolchain("Toolchain receipt contains a non-canonical file path: \(path).")
+            }
+            guard parts.count > 1 else { continue }
+            var current = ""
+            for part in parts.dropLast() {
+                current = current.isEmpty ? String(part) : "\(current)/\(part)"
+                expectedDirectories.insert(current)
+            }
+        }
+
+        let rootAttributes: [FileAttributeKey: Any]
+        do {
+            rootAttributes = try fileManager.attributesOfItem(atPath: root.path)
+        } catch {
+            throw ToolchainError.invalidToolchain("Toolchain root could not be inspected.")
+        }
+        guard rootAttributes[.type] as? FileAttributeType == .typeDirectory else {
+            throw ToolchainError.invalidToolchain("Toolchain root is not a directory.")
+        }
+
+        var foundFiles = Set<String>()
+        func inspectDirectory(_ directory: URL, relativePath: String) throws {
+            let entries: [URL]
+            do {
+                entries = try fileManager.contentsOfDirectory(
+                    at: directory,
+                    includingPropertiesForKeys: nil,
+                    options: []
+                )
+            } catch {
+                throw ToolchainError.invalidToolchain("Toolchain directory could not be inspected: \(relativePath).")
+            }
+
+            for entry in entries {
+                let path = relativePath.isEmpty
+                    ? entry.lastPathComponent
+                    : "\(relativePath)/\(entry.lastPathComponent)"
+                let attributes: [FileAttributeKey: Any]
+                do {
+                    attributes = try fileManager.attributesOfItem(atPath: entry.path)
+                } catch {
+                    throw ToolchainError.invalidToolchain("Toolchain entry could not be inspected: \(path).")
+                }
+
+                switch attributes[.type] as? FileAttributeType {
+                case .typeDirectory:
+                    guard expectedDirectories.contains(path) else {
+                        throw ToolchainError.invalidToolchain("Toolchain contains an undeclared directory: \(path).")
+                    }
+                    try inspectDirectory(entry, relativePath: path)
+                case .typeRegular:
+                    guard expectedFiles.contains(path) else {
+                        throw ToolchainError.invalidToolchain("Toolchain contains an undeclared file: \(path).")
+                    }
+                    if let references = attributes[.referenceCount] as? NSNumber,
+                       references.intValue != 1 {
+                        throw ToolchainError.invalidToolchain("Toolchain contains a multiply linked file: \(path).")
+                    }
+                    foundFiles.insert(path)
+                case .typeSymbolicLink:
+                    throw ToolchainError.invalidToolchain("Toolchain contains a symbolic link: \(path).")
+                default:
+                    throw ToolchainError.invalidToolchain("Toolchain contains a special file: \(path).")
+                }
+            }
+        }
+
+        try inspectDirectory(root, relativePath: "")
+        guard foundFiles == expectedFiles else {
+            let missing = expectedFiles.subtracting(foundFiles).sorted()
+            throw ToolchainError.invalidToolchain(
+                "Toolchain is missing signed files: \(missing.prefix(5).joined(separator: ", "))."
+            )
+        }
+        return expectedFiles
     }
 
     func requiredDiskBytes(

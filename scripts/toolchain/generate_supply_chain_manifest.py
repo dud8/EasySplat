@@ -37,6 +37,7 @@ MACHO_MAGICS = {
     b"\xce\xfa\xed\xfe",
     b"\xfe\xed\xfa\xce",
 }
+THIN_64_MACHO_MAGICS = {b"\xcf\xfa\xed\xfe", b"\xfe\xed\xfa\xcf"}
 LICENSE_NAME = re.compile(r"^(license|licence|copying|notice)([._-].*)?$", re.IGNORECASE)
 KNOWN_LICENSE_ALIASES = {
     "apache 2.0": "Apache-2.0",
@@ -220,6 +221,20 @@ def validate_macos_15_compatibility(path: Path) -> None:
         padded = parts + (0,) * (3 - len(parts))
         if padded > (15, 0, 0):
             fail(f"{path} requires macOS {value}; public beta minimum is macOS 15.0")
+
+
+def validate_arm64_only(path: Path) -> None:
+    try:
+        with path.open("rb") as stream:
+            magic = stream.read(4)
+    except OSError as exc:
+        fail(f"cannot inspect {path} architecture: {exc}")
+    if magic not in THIN_64_MACHO_MAGICS:
+        fail(f"{path} must be a thin 64-bit arm64 Mach-O binary")
+    architectures = run("/usr/bin/lipo", "-archs", str(path)).strip().split()
+    if architectures != ["arm64"]:
+        rendered = " ".join(architectures) or "unreadable architecture"
+        fail(f"{path} must be an arm64-only Mach-O binary; found {rendered}")
 
 
 def normalize_license(value: Any) -> str:
@@ -993,6 +1008,7 @@ def main() -> int:
     for candidate in root.rglob("*"):
         source = materialized_source(candidate, root)
         if is_macho(source):
+            validate_arm64_only(source)
             validate_macos_15_compatibility(source)
 
     components = builder_components(root, args.version)

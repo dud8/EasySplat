@@ -200,6 +200,35 @@ final class ToolchainManifestTests: XCTestCase {
             try manager.test_validateSchema2Manifest(executableSuperset, publicKeyBase64: publicKey)
         )
 
+        var overlappingContents = manifest
+        overlappingContents.components[2].contents.append(
+            overlappingContents.components[1].contents[0]
+        )
+        XCTAssertThrowsError(
+            try manager.test_validateSchema2Manifest(overlappingContents, publicKeyBase64: publicKey)
+        )
+
+        var caseCollidingContents = manifest
+        caseCollidingContents.components[2].contents.append(
+            manifest.components[1].contents[0].uppercased()
+        )
+        XCTAssertThrowsError(
+            try manager.test_validateSchema2Manifest(caseCollidingContents, publicKeyBase64: publicKey)
+        )
+
+        var unicodeCollidingContents = manifest
+        unicodeCollidingContents.components[0].contents.append("licenses/Caf\u{00E9}.txt")
+        unicodeCollidingContents.components[2].contents.append("licenses/Cafe\u{0301}.txt")
+        XCTAssertThrowsError(
+            try manager.test_validateSchema2Manifest(unicodeCollidingContents, publicKeyBase64: publicKey)
+        )
+
+        var installerStateCollision = manifest
+        installerStateCollision.components[0].contents.append(".EASYSPLAT_TOOLCHAIN_STATE.JSON")
+        XCTAssertThrowsError(
+            try manager.test_validateSchema2Manifest(installerStateCollision, publicKeyBase64: publicKey)
+        )
+
         var missingModelHash = manifest
         missingModelHash.components[1].criticalFileHashes.removeValue(
             forKey: "da3_mps/models/DA3-BASE/config.json"

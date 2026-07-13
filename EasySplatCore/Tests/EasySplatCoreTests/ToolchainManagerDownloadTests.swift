@@ -1,4 +1,5 @@
 import CryptoKit
+import Darwin
 import Foundation
 import XCTest
 @testable import EasySplatCore
@@ -16,6 +17,7 @@ final class ToolchainManagerDownloadTests: XCTestCase {
         "da3_mps/build_info.json",
         "msplat/build_info.json",
         "msplat/LICENSE",
+        "provenance/colmap.json",
         "supply-chain/components.json",
     ]
 
@@ -318,7 +320,7 @@ final class ToolchainManagerDownloadTests: XCTestCase {
             appVersion: "0.2.0-beta.1"
         )
 
-        let corePaths = Array(ToolchainManager.criticalCoreFiles(in: Self.coreFixtureContents)).sorted()
+        let corePaths = Self.coreFixtureContents.sorted()
         let basePaths = [
             "da3_mps/models/DA3-BASE/config.json",
             "da3_mps/models/DA3-BASE/easysplat_model_info.json",
@@ -356,8 +358,12 @@ final class ToolchainManagerDownloadTests: XCTestCase {
                 installedArtifacts: [
                     "macos-arm64-core": String(repeating: "a", count: 64),
                     "geometry-da3-base": String(repeating: "b", count: 64),
+                    "geometry-da3-small": String(repeating: "c", count: 64),
                 ],
-                installedCapabilities: Array(ToolchainManager.coreCapabilities).sorted() + [ToolchainCapability.da3Base.rawValue],
+                installedCapabilities: Array(ToolchainManager.coreCapabilities).sorted() + [
+                    ToolchainCapability.da3Base.rawValue,
+                    ToolchainCapability.da3Small.rawValue,
+                ],
                 signedManifest: signed.manifest
             ),
             root: root
@@ -380,6 +386,124 @@ final class ToolchainManagerDownloadTests: XCTestCase {
         )
     }
 
+    func testSignedReceiptRejectsUndeclaredCachedEntries() throws {
+        for kind in ["file", "directory"] {
+            let root = try TestFileBuilder.makeTempDir()
+            defer { try? FileManager.default.removeItem(at: root) }
+            let manager = ToolchainManager(
+                runner: MockSubprocessRunner(scripts: []),
+                urlSession: makeSession(),
+                appVersion: "0.2.0-beta.1"
+            )
+            let signed = try makeSignedCachedFixture(at: root, manager: manager)
+
+            XCTAssertNoThrow(try manager.test_validateSignedReceipt(
+                root: root,
+                publicKeyBase64: signed.publicKey,
+                request: .init(capabilities: [.da3Base, .da3Small])
+            ))
+
+            let unsigned = root.appendingPathComponent("unsigned/\(kind)")
+            if kind == "file" {
+                try FileManager.default.createDirectory(
+                    at: unsigned.deletingLastPathComponent(),
+                    withIntermediateDirectories: true
+                )
+                try Data("unsigned payload".utf8).write(to: unsigned)
+            } else {
+                try FileManager.default.createDirectory(at: unsigned, withIntermediateDirectories: true)
+            }
+
+            XCTAssertThrowsError(try manager.test_validateSignedReceipt(
+                root: root,
+                publicKeyBase64: signed.publicKey,
+                request: .init(capabilities: [.da3Base, .da3Small])
+            ), "Expected undeclared cached \(kind) to be rejected")
+        }
+    }
+
+    func testSignedReceiptRejectsDeclaredSymlink() throws {
+        let root = try TestFileBuilder.makeTempDir()
+        let outside = try TestFileBuilder.makeTempDir()
+        defer {
+            try? FileManager.default.removeItem(at: root)
+            try? FileManager.default.removeItem(at: outside)
+        }
+        let manager = ToolchainManager(
+            runner: MockSubprocessRunner(scripts: []),
+            urlSession: makeSession(),
+            appVersion: "0.2.0-beta.1"
+        )
+        let relativePath = "share/NOTICE.txt"
+        let signed = try makeSignedCachedFixture(
+            at: root,
+            manager: manager,
+            additionalCoreFiles: [relativePath: Data("signed notice".utf8)]
+        )
+        let declaredFile = root.appendingPathComponent(relativePath)
+        let outsideFile = outside.appendingPathComponent("NOTICE.txt")
+        try Data("signed notice".utf8).write(to: outsideFile)
+        try FileManager.default.removeItem(at: declaredFile)
+        try FileManager.default.createSymbolicLink(at: declaredFile, withDestinationURL: outsideFile)
+
+        XCTAssertThrowsError(try manager.test_validateSignedReceipt(
+            root: root,
+            publicKeyBase64: signed.publicKey,
+            request: .init(capabilities: [.da3Base, .da3Small])
+        ))
+    }
+
+    func testSignedReceiptRejectsDeclaredSpecialFile() throws {
+        let root = try TestFileBuilder.makeTempDir()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let manager = ToolchainManager(
+            runner: MockSubprocessRunner(scripts: []),
+            urlSession: makeSession(),
+            appVersion: "0.2.0-beta.1"
+        )
+        let relativePath = "share/runtime.pipe"
+        let signed = try makeSignedCachedFixture(
+            at: root,
+            manager: manager,
+            additionalCoreFiles: [relativePath: Data("placeholder".utf8)]
+        )
+        let declaredFile = root.appendingPathComponent(relativePath)
+        try FileManager.default.removeItem(at: declaredFile)
+        let result = declaredFile.path.withCString { mkfifo($0, mode_t(0o600)) }
+        XCTAssertEqual(result, 0)
+
+        XCTAssertThrowsError(try manager.test_validateSignedReceipt(
+            root: root,
+            publicKeyBase64: signed.publicKey,
+            request: .init(capabilities: [.da3Base, .da3Small])
+        ))
+    }
+
+    func testSignedReceiptRejectsMultiplyLinkedDeclaredFile() throws {
+        let root = try TestFileBuilder.makeTempDir()
+        let outside = try TestFileBuilder.makeTempDir()
+        defer {
+            try? FileManager.default.removeItem(at: root)
+            try? FileManager.default.removeItem(at: outside)
+        }
+        let manager = ToolchainManager(
+            runner: MockSubprocessRunner(scripts: []),
+            urlSession: makeSession(),
+            appVersion: "0.2.0-beta.1"
+        )
+        let signed = try makeSignedCachedFixture(at: root, manager: manager)
+        try FileManager.default.linkItem(
+            at: signed.fixture.colmap,
+            to: outside.appendingPathComponent("colmap-hardlink")
+        )
+
+        XCTAssertThrowsError(try manager.test_validateSignedReceipt(
+            root: root,
+            publicKeyBase64: signed.publicKey,
+            request: .init(capabilities: [.da3Base, .da3Small])
+        ))
+    }
+
     func testInterruptedStagingAndBackupRecoverMostCompleteValidInstall() throws {
         let toolchainsRoot = try TestFileBuilder.makeTempDir()
         defer { try? FileManager.default.removeItem(at: toolchainsRoot) }
@@ -393,7 +517,7 @@ final class ToolchainManagerDownloadTests: XCTestCase {
             installationRoot: toolchainsRoot
         )
 
-        let corePaths = Array(ToolchainManager.criticalCoreFiles(in: Self.coreFixtureContents)).sorted()
+        let corePaths = Self.coreFixtureContents.sorted()
         let basePaths = [
             "da3_mps/models/DA3-BASE/config.json",
             "da3_mps/models/DA3-BASE/easysplat_model_info.json",
@@ -491,6 +615,38 @@ final class ToolchainManagerDownloadTests: XCTestCase {
         let leftovers = try FileManager.default.contentsOfDirectory(atPath: parent.path)
             .filter { $0.contains(".backup-") || $0.contains(".staging-") }
         XCTAssertTrue(leftovers.isEmpty)
+    }
+
+    func testAtomicInstallRejectsUndeclaredCachedFileBeforeSeeding() async throws {
+        let parent = try TestFileBuilder.makeTempDir()
+        defer { try? FileManager.default.removeItem(at: parent) }
+        let sourceRoot = parent.appendingPathComponent("source", isDirectory: true)
+        let versionedRoot = parent.appendingPathComponent("2.0.0", isDirectory: true)
+        let destinationFixture = try ToolchainFixtureBuilder.createToolchain(at: versionedRoot)
+        let manager = ToolchainManager(
+            runner: MockSubprocessRunner(scripts: validationScripts(for: destinationFixture)),
+            urlSession: makeSession(),
+            appVersion: "0.2.0-beta.1",
+            installationRoot: parent
+        )
+        _ = try makeSignedCachedFixture(at: sourceRoot, manager: manager)
+        try Data("unsigned payload".utf8).write(to: sourceRoot.appendingPathComponent("unsigned-tool"))
+
+        let install = Task.detached {
+            try await manager.installToolchainAtomically(
+                versionedRoot: versionedRoot,
+                requiredCapabilities: [.da3Base, .da3Small],
+                seedFromExistingRoot: sourceRoot,
+                onProgress: { _, _ in },
+                installInto: { _ in }
+            )
+        }
+        do {
+            _ = try await install.value
+            XCTFail("Expected unsigned cached file to be rejected before seeding")
+        } catch {
+            // Expected.
+        }
     }
 
     func testDownloadManifestRejectsNon200() async {
@@ -1709,6 +1865,68 @@ final class ToolchainManagerDownloadTests: XCTestCase {
             dependencies: [],
             requirement: .required
         )
+    }
+
+    private func makeSignedCachedFixture(
+        at root: URL,
+        manager: ToolchainManager,
+        additionalCoreFiles: [String: Data] = [:]
+    ) throws -> (fixture: ToolchainFixture, publicKey: String) {
+        let fixture = try ToolchainFixtureBuilder.createToolchain(at: root)
+        for (relativePath, data) in additionalCoreFiles {
+            let url = root.appendingPathComponent(relativePath)
+            try FileManager.default.createDirectory(
+                at: url.deletingLastPathComponent(),
+                withIntermediateDirectories: true
+            )
+            try data.write(to: url)
+        }
+
+        let coreContents = (Self.coreFixtureContents + Array(additionalCoreFiles.keys)).sorted()
+        let baseContents = [
+            "da3_mps/models/DA3-BASE/config.json",
+            "da3_mps/models/DA3-BASE/easysplat_model_info.json",
+            "da3_mps/models/DA3-BASE/model.safetensors",
+        ]
+        let smallContents = [
+            "da3_mps/models/DA3-SMALL/config.json",
+            "da3_mps/models/DA3-SMALL/easysplat_model_info.json",
+            "da3_mps/models/DA3-SMALL/model.safetensors",
+        ]
+        func hashes(for paths: [String]) throws -> [String: String] {
+            try Dictionary(uniqueKeysWithValues: paths.map { path in
+                (path, try manager.test_sha256Hex(url: root.appendingPathComponent(path)))
+            })
+        }
+
+        let coreCritical = ToolchainManager.criticalCoreFiles(in: coreContents).sorted()
+        let unsigned = ToolchainManifest(
+            schemaVersion: 2,
+            toolchainAPI: 2,
+            keyID: "",
+            version: "2.0.0",
+            publishedAt: Date(timeIntervalSince1970: 0),
+            appVersionRange: .init(minimum: "0.2.0-beta.1", maximumExclusive: "0.3.0"),
+            components: [
+                .init(name: "macos-arm64-core", capabilities: Array(ToolchainManager.coreCapabilities), url: "https://example.com/core.zip", sha256: String(repeating: "a", count: 64), sizeBytes: 1, contents: coreContents, criticalFileHashes: try hashes(for: coreCritical), dependencies: [], requirement: .required),
+                .init(name: "geometry-da3-base", capabilities: [ToolchainCapability.da3Base.rawValue], url: "https://example.com/base.zip", sha256: String(repeating: "b", count: 64), sizeBytes: 1, contents: baseContents, criticalFileHashes: try hashes(for: baseContents), dependencies: ["macos-arm64-core"], requirement: .required),
+                .init(name: "geometry-da3-small", capabilities: [ToolchainCapability.da3Small.rawValue], url: "https://example.com/small.zip", sha256: String(repeating: "c", count: 64), sizeBytes: 1, contents: smallContents, criticalFileHashes: try hashes(for: smallContents), dependencies: ["macos-arm64-core"], requirement: .optional),
+            ],
+            signatureEd25519: ""
+        )
+        let signed = try signedV2Manifest(unsigned)
+        try manager.saveInstallState(
+            .init(
+                schemaVersion: 2,
+                installedArtifacts: Dictionary(
+                    uniqueKeysWithValues: signed.manifest.components.map { ($0.name, $0.sha256) }
+                ),
+                installedCapabilities: Set(signed.manifest.components.flatMap(\.capabilities)).sorted(),
+                signedManifest: signed.manifest
+            ),
+            root: root
+        )
+        return (fixture, signed.publicKey)
     }
 
     private func validationScripts(for fixture: ToolchainFixture) -> [MockSubprocessRunner.Script] {

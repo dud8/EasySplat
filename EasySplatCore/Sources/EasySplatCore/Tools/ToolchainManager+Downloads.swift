@@ -2,6 +2,8 @@ import CryptoKit
 import Foundation
 
 extension ToolchainManager {
+    static let installStateFilename = ".easysplat_toolchain_state.json"
+
     // A capability manifest is metadata. One MiB leaves ample room for components and hashes
     // while bounding the unauthenticated response before signature verification.
     private static let maximumManifestDownloadBytes = 1_048_576
@@ -917,7 +919,7 @@ extension ToolchainManager {
     }
 
     func installStateURL(root: URL) -> URL {
-        root.appendingPathComponent(".easysplat_toolchain_state.json")
+        root.appendingPathComponent(Self.installStateFilename)
     }
 
     func loadInstallState(root: URL) -> ToolchainInstallState {

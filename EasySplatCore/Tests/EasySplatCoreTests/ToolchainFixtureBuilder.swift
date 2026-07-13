@@ -31,9 +31,7 @@ enum ToolchainFixtureBuilder {
     ) throws -> ToolchainFixture {
         let fm = FileManager.default
         let bin = root.appendingPathComponent("bin", isDirectory: true)
-        let lib = root.appendingPathComponent("lib", isDirectory: true)
         try fm.createDirectory(at: bin, withIntermediateDirectories: true)
-        try fm.createDirectory(at: lib, withIntermediateDirectories: true)
         let supplyChain = root.appendingPathComponent("supply-chain", isDirectory: true)
         try fm.createDirectory(at: supplyChain, withIntermediateDirectories: true)
         try Data("{}".utf8).write(to: supplyChain.appendingPathComponent("components.json"))

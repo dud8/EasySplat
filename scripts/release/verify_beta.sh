@@ -18,6 +18,8 @@ RELEASE_MANIFEST=""
 CORE_ARCHIVE=""
 DA3_BASE_ARCHIVE=""
 DA3_SMALL_ARCHIVE=""
+SOURCE_URL=""
+SOURCE_COMMIT=""
 ALLOW_INCOMPLETE=0
 HDIUTIL_BIN="${EASYSPLAT_HDIUTIL_BIN:-hdiutil}"
 MOUNT_DIR=""
@@ -26,7 +28,7 @@ E2E_DIR=""
 SMOKE_LOG=""
 
 usage() {
-  echo "Usage: verify_beta.sh --app <app> --dmg <dmg> --expected-version <semver> --artifacts --fixture <media> --manifest-url <https-url> --public-key-file <file> --toolchain-root <dir> --e2e-runner <executable> --offline-cache-root <dir> --offline-runner <executable>"
+  echo "Usage: verify_beta.sh --app <app> --dmg <dmg> --expected-version <semver> --artifacts --source-url <https-url> --source-commit <sha> --fixture <media> --manifest-url <https-url> --public-key-file <file> --toolchain-root <dir> --e2e-runner <executable> --offline-cache-root <dir> --offline-runner <executable>"
 }
 
 cleanup() {
@@ -57,6 +59,8 @@ while [[ $# -gt 0 ]]; do
     --core-archive) CORE_ARCHIVE="$2"; shift 2 ;;
     --da3-base-archive) DA3_BASE_ARCHIVE="$2"; shift 2 ;;
     --da3-small-archive) DA3_SMALL_ARCHIVE="$2"; shift 2 ;;
+    --source-url) SOURCE_URL="$2"; shift 2 ;;
+    --source-commit) SOURCE_COMMIT="$2"; shift 2 ;;
     --allow-incomplete) ALLOW_INCOMPLETE=1; shift ;;
     -h|--help) usage; exit 0 ;;
     *) echo "Unknown arg: $1" >&2; exit 1 ;;
@@ -74,6 +78,10 @@ fi
 if [ "$ALLOW_INCOMPLETE" -eq 0 ]; then
   [ "$VERIFY_ARTIFACTS" -eq 1 ] || { echo "Release verification requires --artifacts." >&2; exit 1; }
   [ "$SKIP_LAUNCH_SMOKE" -eq 0 ] || { echo "Release verification cannot skip launch smoke." >&2; exit 1; }
+fi
+if [ "$VERIFY_ARTIFACTS" -eq 1 ] && { [ -z "$SOURCE_URL" ] || [ -z "$SOURCE_COMMIT" ]; }; then
+  echo "Artifact verification requires --source-url and --source-commit." >&2
+  exit 1
 fi
 
 SEMVER_RE='^[0-9]+\.[0-9]+\.[0-9]+-[0-9A-Za-z.-]+(\+[0-9A-Za-z.-]+)?$'
@@ -277,6 +285,8 @@ PY
     --app-version "$EXPECTED_VERSION" \
     --toolchain-version "$TOOLCHAIN_VERSION" \
     --release-mode unsigned-beta \
+    --source-url "$SOURCE_URL" \
+    --source-commit "$SOURCE_COMMIT" \
     --dmg "$DMG_PATH" \
     --manifest "$RELEASE_MANIFEST" \
     --core "$CORE_ARCHIVE" \
@@ -298,18 +308,47 @@ fi
 
 if [ "$SKIP_LAUNCH_SMOKE" -eq 0 ]; then
   SMOKE_LOG="$(mktemp "${TMPDIR:-/tmp}/easysplat-launch-smoke.XXXXXX")"
-  "$DISTRIBUTED_EXECUTABLE" >"$SMOKE_LOG" 2>&1 &
-  APP_PID=$!
-  sleep "${EASYSPLAT_SMOKE_SECONDS:-3}"
-  if kill -0 "$APP_PID" 2>/dev/null; then
-    kill "$APP_PID" 2>/dev/null || true
-    wait "$APP_PID" 2>/dev/null || true
-  else
-    exit_status=0
-    wait "$APP_PID" || exit_status=$?
+  if ! python3 - "$DISTRIBUTED_EXECUTABLE" "${EASYSPLAT_SMOKE_SECONDS:-3}" "$SMOKE_LOG" <<'PY'
+import math
+import signal
+import subprocess
+import sys
+from pathlib import Path
+
+executable, raw_timeout, log_path = sys.argv[1:]
+try:
+    timeout = float(raw_timeout)
+except ValueError as exc:
+    raise SystemExit(f"Invalid launch-smoke duration: {raw_timeout!r}") from exc
+if not math.isfinite(timeout) or timeout < 0:
+    raise SystemExit(f"Invalid launch-smoke duration: {raw_timeout!r}")
+
+
+def interrupted(_signal: int, _frame: object) -> None:
+    raise KeyboardInterrupt
+
+
+signal.signal(signal.SIGINT, interrupted)
+signal.signal(signal.SIGTERM, interrupted)
+with Path(log_path).open("wb") as log:
+    process = subprocess.Popen([executable], stdout=log, stderr=subprocess.STDOUT)
+    try:
+        status = process.wait(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        status = None
+    finally:
+        if process.poll() is None:
+            process.terminate()
+            try:
+                process.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait()
+if status is not None:
+    raise SystemExit(f"App exited during launch smoke (status {status}).")
+PY
+  then
     cat "$SMOKE_LOG" >&2
-    rm -f "$SMOKE_LOG"
-    echo "App exited during launch smoke (status $exit_status)." >&2
     exit 1
   fi
   rm -f "$SMOKE_LOG"

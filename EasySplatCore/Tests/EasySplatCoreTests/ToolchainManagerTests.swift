@@ -452,9 +452,9 @@ final class ToolchainManagerTests: XCTestCase {
         }
     }
 
-    /// `/usr/bin/file -b` output for a universal Mach-O lists each slice. As long as one
-    /// slice is arm64, the binary is usable on Apple silicon.
-    func testValidateToolchainAcceptsUniversalArmPython() throws {
+    /// Public-beta toolchains are intentionally arm64-only. Universal binaries waste
+    /// download and install space and can hide an unreviewed x86 dependency closure.
+    func testValidateToolchainRejectsUniversalArmPython() throws {
         let root = try TestFileBuilder.makeTempDir()
         defer { try? FileManager.default.removeItem(at: root) }
         _ = try ToolchainFixtureBuilder.createToolchain(at: root)
@@ -467,7 +467,12 @@ final class ToolchainManagerTests: XCTestCase {
         )
 
         let manager = ToolchainManager(runner: runner)
-        XCTAssertNoThrow(try manager.test_validateToolchain(root: root, requiredCapabilities: [.da3Base, .da3Small]))
+        XCTAssertThrowsError(try manager.test_validateToolchain(root: root, requiredCapabilities: [.da3Base, .da3Small])) { error in
+            guard case ToolchainManager.ToolchainError.invalidToolchain(let message) = error else {
+                return XCTFail("Expected invalidToolchain error")
+            }
+            XCTAssertTrue(message.lowercased().contains("arm64-only"), "expected exact architecture failure; got \(message)")
+        }
     }
 
     /// A Rosetta-installed colmap would launch via Rosetta on Apple silicon and pass `-h`,

@@ -65,6 +65,30 @@ assert module.PINNED_RECEIPTS["colmap:poissonrecon"]["source_tree_sha256"] == \
     "7aacb04853a3fece0d6b2eb3bbaaffe3c2014467ae3c73750c5dba1c6b2e835e"
 assert module.PINNED_RECEIPTS["colmap:vlfeat"]["source_tree_sha256"] == \
     "c1f3020a96d78e2f105aafa63f41b14cdf0a3886196f42f2dbc9c817ccd1d61e"
+original_run = module.run
+architecture_fixture = Path(sys.argv[2]) / "native-architecture-fixture"
+architecture_fixture.write_bytes(b"\xcf\xfa\xed\xfe" + b"\x00" * 8)
+try:
+    module.run = lambda *args, **kwargs: "arm64\n"
+    module.validate_arm64_only(architecture_fixture)
+    for reported in ("x86_64 arm64\n", "arm64e\n", "x86_64\n", ""):
+        module.run = lambda *args, value=reported, **kwargs: value
+        try:
+            module.validate_arm64_only(architecture_fixture)
+        except SystemExit:
+            pass
+        else:
+            raise AssertionError(f"accepted non-arm64-only architecture: {reported!r}")
+    architecture_fixture.write_bytes(b"\xca\xfe\xba\xbe" + b"\x00" * 8)
+    module.run = lambda *args, **kwargs: "arm64\n"
+    try:
+        module.validate_arm64_only(architecture_fixture)
+    except SystemExit:
+        pass
+    else:
+        raise AssertionError("accepted a fat Mach-O containing only an arm64 slice")
+finally:
+    module.run = original_run
 module.validate_homebrew_runtime_member("xz", "lib/liblzma.5.dylib")
 module.validate_homebrew_runtime_member("zstd", "lib/libzstd.1.dylib")
 for formula, path in (("xz", "bin/xz"), ("zstd", "bin/zstd")):
@@ -542,7 +566,7 @@ early_exit_error="$TMP_DIR/release-verifier-early-exit.stderr"
 if EASYSPLAT_HDIUTIL_BIN="$mock_hdiutil" \
   EASYSPLAT_TEST_HDIUTIL_LOG="$hdiutil_log" \
   EASYSPLAT_TEST_APP_PATH="$early_exit_fixture/EasySplat.app" \
-  EASYSPLAT_SMOKE_SECONDS=0.2 \
+  EASYSPLAT_SMOKE_SECONDS=2 \
   "$ROOT/scripts/release/verify_beta.sh" \
   --app "$app_bundle" \
   --dmg "$TMP_DIR/EasySplat-0.2.0-beta.1-unsigned.dmg" \
@@ -722,9 +746,12 @@ PY
 beta_dmg="$TMP_DIR/EasySplat-0.2.0-beta.1-unsigned.dmg"
 beta_stem="${beta_dmg%-unsigned.dmg}"
 metadata_tool="$ROOT/scripts/release/generate_release_metadata.py"
-python3 - "$metadata_tool" <<'PY'
+python3 - "$metadata_tool" "$TMP_DIR" <<'PY'
+import hashlib
 import importlib.util
+import struct
 import sys
+import zipfile
 from pathlib import Path
 
 spec = importlib.util.spec_from_file_location("release_metadata", Path(sys.argv[1]))
@@ -746,6 +773,52 @@ except module.MetadataError:
     pass
 else:
     raise AssertionError("normal photo install size gate accepted more than 2.5 GB")
+
+arm64 = b"\xcf\xfa\xed\xfe" + struct.pack("<II", module.CPU_TYPE_ARM64, 0) + b"payload"
+module.validate_thin_arm64_macho_header(arm64[:12], "bin/native")
+for label, header in {
+    "x86_64": b"\xcf\xfa\xed\xfe" + struct.pack("<II", 0x01000007, 3),
+    "arm64e": b"\xcf\xfa\xed\xfe" + struct.pack("<II", module.CPU_TYPE_ARM64, 2),
+    "universal": b"\xca\xfe\xba\xbe" + b"\x00" * 8,
+}.items():
+    try:
+        module.validate_thin_arm64_macho_header(header, label)
+    except module.MetadataError:
+        pass
+    else:
+        raise AssertionError(f"accepted {label} Mach-O header")
+
+archive_path = Path(sys.argv[2]) / "arm64-archive-contract.zip"
+row = {
+    "path": "bin/native",
+    "component": "fixture",
+    "kind": "mach-o",
+    "size": len(arm64),
+    "sha256": hashlib.sha256(arm64).hexdigest(),
+    "dependencies": [],
+}
+with zipfile.ZipFile(archive_path, "w") as archive:
+    archive.writestr(row["path"], arm64)
+module.inspect_archive(
+    module.ArchiveSpec("geometry-da3-base", archive_path, "https://example.com/native.zip"),
+    {row["path"]: row},
+    set(),
+)
+x86 = b"\xcf\xfa\xed\xfe" + struct.pack("<II", 0x01000007, 3) + b"payload"
+row["size"] = len(x86)
+row["sha256"] = hashlib.sha256(x86).hexdigest()
+with zipfile.ZipFile(archive_path, "w") as archive:
+    archive.writestr(row["path"], x86)
+try:
+    module.inspect_archive(
+        module.ArchiveSpec("geometry-da3-base", archive_path, "https://example.com/native.zip"),
+        {row["path"]: row},
+        set(),
+    )
+except module.MetadataError:
+    pass
+else:
+    raise AssertionError("release archive inspection accepted an x86_64 Mach-O")
 PY
 python3 "$metadata_tool" verify-toolchain \
   --toolchain-version 2.0.0 \
@@ -777,7 +850,7 @@ python3 "$metadata_tool" generate \
   --provenance-out "$beta_stem.provenance.json" \
   --spdx-out "$beta_stem.spdx.json" \
   --licenses-out "$beta_stem-licenses.zip"
-python3 "$metadata_tool" verify \
+metadata_verify_args=(
   --app-version 0.2.0-beta.1 \
   --toolchain-version 2.0.0 \
   --release-mode unsigned-beta \
@@ -792,6 +865,33 @@ python3 "$metadata_tool" verify \
   --provenance "$beta_stem.provenance.json" \
   --spdx "$beta_stem.spdx.json" \
   --licenses "$beta_stem-licenses.zip"
+)
+python3 "$metadata_tool" verify \
+  "${metadata_verify_args[@]}" \
+  --source-url https://example.com/EasySplat \
+  --source-commit deadbeef
+
+mismatched_source_commit_error="$TMP_DIR/mismatched-source-commit.stderr"
+if python3 "$metadata_tool" verify \
+  "${metadata_verify_args[@]}" \
+  --source-url https://example.com/EasySplat \
+  --source-commit cafebabe >/dev/null 2>"$mismatched_source_commit_error"; then
+  echo "Release metadata accepted provenance for a different source commit" >&2
+  exit 1
+fi
+grep -Fqi 'release provenance does not exactly match shipped artifacts' \
+  "$mismatched_source_commit_error"
+
+mismatched_source_url_error="$TMP_DIR/mismatched-source-url.stderr"
+if python3 "$metadata_tool" verify \
+  "${metadata_verify_args[@]}" \
+  --source-url https://example.com/AnotherRepository \
+  --source-commit deadbeef >/dev/null 2>"$mismatched_source_url_error"; then
+  echo "Release metadata accepted provenance for a different source repository" >&2
+  exit 1
+fi
+grep -Fqi 'release provenance does not exactly match shipped artifacts' \
+  "$mismatched_source_url_error"
 python3 -m json.tool "$beta_stem.provenance.json" >/dev/null
 python3 -m json.tool "$beta_stem.spdx.json" >/dev/null
 python3 - "$beta_stem.provenance.json" "$beta_stem.spdx.json" <<'PY'
@@ -831,6 +931,27 @@ release_metadata_args=(
   --da3-base-archive "$metadata_fixture/base.zip"
   --da3-small-archive "$metadata_fixture/small.zip"
 )
+release_source_args=(
+  --source-url https://example.com/EasySplat
+  --source-commit deadbeef
+)
+missing_release_source_error="$TMP_DIR/release-verifier-missing-source.stderr"
+if EASYSPLAT_HDIUTIL_BIN="$mock_hdiutil" \
+  EASYSPLAT_TEST_HDIUTIL_LOG="$hdiutil_log" \
+  EASYSPLAT_TEST_APP_PATH="$app_bundle" \
+  "$ROOT/scripts/release/verify_beta.sh" \
+  --app "$app_bundle" \
+  --dmg "$beta_dmg" \
+  --expected-version "0.2.0-beta.1" \
+  --artifacts \
+  "${release_metadata_args[@]}" \
+  --allow-incomplete \
+  --skip-launch-smoke >/dev/null 2>"$missing_release_source_error"; then
+  echo "Beta verification accepted artifacts without trusted source identity" >&2
+  exit 1
+fi
+grep -Fqi 'requires --source-url and --source-commit' "$missing_release_source_error"
+
 EASYSPLAT_HDIUTIL_BIN="$mock_hdiutil" \
 EASYSPLAT_TEST_HDIUTIL_LOG="$hdiutil_log" \
 EASYSPLAT_TEST_APP_PATH="$app_bundle" \
@@ -840,6 +961,7 @@ EASYSPLAT_TEST_APP_PATH="$app_bundle" \
   --expected-version "0.2.0-beta.1" \
   --artifacts \
   "${release_metadata_args[@]}" \
+  "${release_source_args[@]}" \
   --allow-incomplete \
   --skip-launch-smoke
 
@@ -955,7 +1077,8 @@ if EASYSPLAT_HDIUTIL_BIN="$mock_hdiutil" \
   --dmg "$beta_dmg" \
   --expected-version "0.2.0-beta.1" \
   --artifacts \
-  "${release_metadata_args[@]}" >/dev/null 2>"$missing_e2e_error"; then
+  "${release_metadata_args[@]}" \
+  "${release_source_args[@]}" >/dev/null 2>"$missing_e2e_error"; then
   echo "Strict beta verification accepted a release without end-to-end inputs" >&2
   exit 1
 fi
@@ -973,6 +1096,7 @@ if EASYSPLAT_HDIUTIL_BIN="$mock_hdiutil" \
   --expected-version "0.2.0-beta.1" \
   --artifacts \
   "${release_metadata_args[@]}" \
+  "${release_source_args[@]}" \
   --fixture "$fixture" \
   --manifest-url "$manifest_url" \
   --public-key-file "$public_key_path" \
@@ -995,6 +1119,7 @@ EASYSPLAT_SMOKE_SECONDS=0 \
   --expected-version "0.2.0-beta.1" \
   --artifacts \
   "${release_metadata_args[@]}" \
+  "${release_source_args[@]}" \
   --fixture "$fixture" \
   --manifest-url "$manifest_url" \
   --public-key-file "$public_key_path" \
@@ -1052,6 +1177,35 @@ grep -Fq 'gh run download "$INPUT_BENCHMARK_RUN_ID"' "$app_workflow"
 grep -Fq -- '--evidence-root "$BENCHMARK_ARTIFACT/evidence"' "$app_workflow"
 grep -Fq -- '--evidence-key-file "$RUNNER_TEMP/evidence.key"' "$app_workflow"
 grep -Fq -- '--request-index "$BENCHMARK_ARTIFACT/requests/index.json"' "$app_workflow"
+python3 - "$app_workflow" <<'PY'
+import sys
+from pathlib import Path
+
+workflow = Path(sys.argv[1]).read_text(encoding="utf-8")
+record_marker = "      - name: Record trusted release asset hashes"
+upload_marker = "      - name: Create immutable draft prerelease"
+verify_marker = "      - name: Verify downloaded draft assets"
+assert record_marker in workflow
+assert workflow.index(record_marker) < workflow.index(upload_marker) < workflow.index(verify_marker)
+record_block = workflow.split(record_marker, 1)[1].split("\n      - name:", 1)[0]
+verify_block = workflow.split(verify_marker, 1)[1].split("\n      - name:", 1)[0]
+expected_assets = (
+    "EasySplat-$VERSION-unsigned.dmg",
+    "EasySplat-$VERSION-unsigned.dmg.sha256",
+    "EasySplat-$VERSION.provenance.json",
+    "EasySplat-$VERSION.spdx.json",
+    "EasySplat-$VERSION-licenses.zip",
+    "EasySplat-$VERSION-dSYM.zip",
+    "EasySplat-$VERSION-benchmark.json",
+)
+for asset in expected_assets:
+    assert asset in record_block, f"trusted hash list omits {asset}"
+assert 'shasum -a 256 -c "$LOCAL_ASSET_HASHES"' in verify_block
+assert '--source-url "https://github.com/$GITHUB_REPOSITORY"' in verify_block
+assert '--source-commit "$GITHUB_SHA"' in verify_block
+assert 'ditto -x -k' in verify_block
+assert 'dwarfdump --uuid "$REMOTE_DSYM"' in verify_block
+PY
 if rg -n '^  push:|uses: [^ ]+@(v[0-9]+|main|master)$' "$app_workflow" >/dev/null; then
   echo "App release workflow must be manual and pin actions to commit SHAs" >&2
   exit 1
@@ -1239,8 +1393,14 @@ grep -Fq -- '--require-hashes' "$ROOT/scripts/toolchain/build_da3_mps.sh"
 grep -Fq -- '--only-binary=:all:' "$ROOT/scripts/toolchain/build_da3_mps.sh"
 grep -Fq -- '--no-binary=antlr4-python3-runtime' "$ROOT/scripts/toolchain/build_da3_mps.sh"
 grep -Fq -- '--report "$PIP_INSTALL_REPORT"' "$ROOT/scripts/toolchain/build_da3_mps.sh"
+grep -Fq 'export PYTHONDONTWRITEBYTECODE=1' "$ROOT/scripts/toolchain/build_da3_mps.sh"
 grep -q 'rm -rf "$target"' "$ROOT/scripts/toolchain/build_da3_mps.sh"
-grep -q '/usr/bin/file -b "$python_bin"' "$ROOT/scripts/toolchain/package_toolchain.sh"
+grep -Fq '/usr/bin/lipo -archs "$binary"' "$ROOT/scripts/toolchain/package_toolchain.sh"
+grep -Fq '"$desc" == *"universal binary"*' "$ROOT/scripts/toolchain/package_toolchain.sh"
+grep -Fq 'validate_packaged_architectures' "$ROOT/scripts/toolchain/package_toolchain.sh"
+grep -Fq 'require_arm64_only_macho "Packaged native file $relative" "$file"' \
+  "$ROOT/scripts/toolchain/package_toolchain.sh"
+grep -Fq 'validate_arm64_only(source)' "$ROOT/scripts/toolchain/generate_supply_chain_manifest.py"
 grep -q 'source_provenance' "$ROOT/scripts/toolchain/package_toolchain.sh"
 grep -q 'pinned-git' "$ROOT/scripts/toolchain/package_toolchain.sh"
 grep -Fq 'PYTHON_STANDALONE_SHA256="718a87bf84d81cb81355488ca37be1f66c2252304be2090721016948de96e7ca"' "$ROOT/scripts/toolchain/build_da3_mps.sh"
@@ -1280,9 +1440,9 @@ test "$normalize_line" -lt "$sign_line"
 test "$sign_line" -lt "$validate_line"
 test "$validate_line" -lt "$launch_line"
 test "$launch_line" -lt "$supply_line"
-grep -Fq 'zip -r "$CORE_ZIP"' "$ROOT/scripts/toolchain/package_toolchain.sh"
-grep -Fq 'zip -r "$DA3_BASE_ZIP" da3_mps/models/DA3-BASE' "$ROOT/scripts/toolchain/package_toolchain.sh"
-grep -Fq 'zip -r "$DA3_SMALL_ZIP" da3_mps/models/DA3-SMALL' "$ROOT/scripts/toolchain/package_toolchain.sh"
+grep -Fq 'zip -r -D "$CORE_ZIP"' "$ROOT/scripts/toolchain/package_toolchain.sh"
+grep -Fq 'zip -r -D "$DA3_BASE_ZIP" da3_mps/models/DA3-BASE' "$ROOT/scripts/toolchain/package_toolchain.sh"
+grep -Fq 'zip -r -D "$DA3_SMALL_ZIP" da3_mps/models/DA3-SMALL' "$ROOT/scripts/toolchain/package_toolchain.sh"
 grep -Fq 'MAX_RELEASE_ASSET_BYTES=2147483648' "$ROOT/scripts/toolchain/package_toolchain.sh"
 grep -Fq 'MAX_NORMAL_PHOTO_INSTALL_BYTES=2500000000' "$ROOT/scripts/toolchain/package_toolchain.sh"
 grep -Fq 'assert_release_asset_size "$CORE_ZIP"' "$ROOT/scripts/toolchain/package_toolchain.sh"

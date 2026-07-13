@@ -117,19 +117,31 @@ if tool_name == "da3_mps" and payload.get("source_provenance") != "pinned-git":
 PY
 }
 
+require_arm64_only_macho() {
+  local label="$1"
+  local binary="$2"
+  local desc
+  local architectures
+  desc="$(/usr/bin/file -b "$binary")"
+  if [[ "$desc" != *Mach-O* ]]; then
+    echo "$label is not a Mach-O binary (file reported: $desc)." >&2
+    exit 1
+  fi
+  if ! architectures="$(/usr/bin/lipo -archs "$binary" 2>/dev/null)"; then
+    echo "$label architecture could not be inspected with lipo." >&2
+    exit 1
+  fi
+  if [[ "$architectures" != "arm64" || "$desc" == *"universal binary"* ]]; then
+    echo "$label must be an arm64-only Mach-O binary (found: $architectures)." >&2
+    exit 1
+  fi
+}
+
 require_bundled_arm64_python() {
   local tool_name="$1"
   local python_bin="$2"
-  local desc
-  desc="$(/usr/bin/file -b "$python_bin")"
-  if [[ "$desc" != *Mach-O* ]]; then
-    echo "$tool_name python is not a Mach-O binary (file reported: $desc)." >&2
-    exit 1
-  fi
-  if [[ "$desc" != *arm64* ]]; then
-    echo "$tool_name python is not arm64 (Rosetta build detected). Rebuild $tool_name on Apple Silicon." >&2
-    exit 1
-  fi
+  local target
+  require_arm64_only_macho "$tool_name python" "$python_bin"
   if [ -L "$python_bin" ]; then
     target="$(readlink "$python_bin" || true)"
     if [[ "$target" == /* ]]; then
@@ -153,6 +165,16 @@ is_system_dependency() {
 is_macho_file() {
   local path="$1"
   [ -f "$path" ] && /usr/bin/file "$path" | grep -q "Mach-O"
+}
+
+validate_packaged_architectures() {
+  local file
+  local relative
+  while IFS= read -r -d '' file; do
+    is_macho_file "$file" || continue
+    relative="${file#"$OUT"/}"
+    require_arm64_only_macho "Packaged native file $relative" "$file"
+  done < <(find "$OUT" -type f -print0)
 }
 
 otool_dependency_names() {
@@ -680,6 +702,7 @@ copy_dependency_to_lib "$OPENIMAGEIO_INSTALL/lib/libOpenImageIO_Util.2.5.dylib" 
 
 bundle_toolchain_dependency_closure
 normalize_bundle_rpaths
+validate_packaged_architectures
 ad_hoc_sign_packaged_machos
 refresh_packaged_msplat_hash
 validate_portable_dependency_references
@@ -706,13 +729,13 @@ for forbidden in AGPL CGAL LSD SPQR SiftGPU da3_streaming salad; do
 done
 
 pushd "$OUT" >/dev/null
-zip -r "$CORE_ZIP" \
+zip -r -D "$CORE_ZIP" \
   bin lib \
   licenses provenance supply-chain/components.json \
   msplat/build_info.json msplat/LICENSE \
   da3_mps/bin da3_mps/python da3_mps/app da3_mps/vendor da3_mps/licenses da3_mps/build_info.json
-zip -r "$DA3_BASE_ZIP" da3_mps/models/DA3-BASE
-zip -r "$DA3_SMALL_ZIP" da3_mps/models/DA3-SMALL
+zip -r -D "$DA3_BASE_ZIP" da3_mps/models/DA3-BASE
+zip -r -D "$DA3_SMALL_ZIP" da3_mps/models/DA3-SMALL
 popd >/dev/null
 
 assert_release_asset_size "$CORE_ZIP"
