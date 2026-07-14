@@ -263,6 +263,25 @@ pip_install() {
   PYTHONNOUSERSITE=1 PIP_DISABLE_PIP_VERSION_CHECK=1 "$PYTHON_DIR/bin/python3" -m pip install --no-user "$@"
 }
 
+remove_build_only_python_tools() {
+  local site_packages="$PYTHON_DIR/lib/python3.13/site-packages"
+  rm -f "$PYTHON_DIR/bin/pip" "$PYTHON_DIR/bin/pip3" "$PYTHON_DIR/bin/pip3.13"
+  rm -rf \
+    "$PYTHON_DIR/lib/python3.13/ensurepip" \
+    "$site_packages/pip" \
+    "$site_packages"/pip-*.dist-info
+
+  if [ -e "$PYTHON_DIR/bin/pip" ] \
+    || [ -e "$PYTHON_DIR/bin/pip3" ] \
+    || [ -e "$PYTHON_DIR/bin/pip3.13" ] \
+    || [ -e "$PYTHON_DIR/lib/python3.13/ensurepip" ] \
+    || [ -e "$site_packages/pip" ] \
+    || find "$site_packages" -maxdepth 1 -type d -name 'pip-*.dist-info' -print -quit | grep -F . >/dev/null; then
+    echo "Build-only pip files survived runtime pruning." >&2
+    exit 1
+  fi
+}
+
 require_arm64_python() {
   local arch
   arch="$("$PYTHON_DIR/bin/python3" - <<'PY'
@@ -424,6 +443,7 @@ if find "$PYTHON_DIR" -iname '*opencv*' -print -quit | grep -F . >/dev/null; the
   exit 1
 fi
 install_supplemental_python_licenses
+remove_build_only_python_tools
 verify_torch_mps
 
 rm -rf "$DA3_VENDOR"

@@ -693,6 +693,16 @@ class Da3BuilderLicenseTests(unittest.TestCase):
         self.assertLess(clean, install)
         self.assertLess(install, reject)
 
+    def test_builder_removes_build_only_pip_from_shipping_runtime(self) -> None:
+        install = self.script.index("pip_install \\\n")
+        strip_tools = self.script.rindex("remove_build_only_python_tools")
+        verify_runtime = self.script.rindex("verify_torch_mps")
+        self.assertIn('"$PYTHON_DIR/lib/python3.13/ensurepip"', self.script)
+        self.assertIn('"$site_packages"/pip-*.dist-info', self.script)
+        self.assertIn('rm -f "$PYTHON_DIR/bin/pip"', self.script)
+        self.assertLess(install, strip_tools)
+        self.assertLess(strip_tools, verify_runtime)
+
 
 if __name__ == "__main__":
     unittest.main()
