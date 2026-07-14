@@ -136,13 +136,13 @@ public final class PipelineRunner: @unchecked Sendable {
         let logger = PipelineLogger(eventsURL: paths.eventsLogURL, logURL: paths.pipelineLogURL, emit: events)
         var currentStage: PipelineStage = .importInput
         var didEmitFailure = false
-        var didRetryWithFewerFrames = false
         var didRetryWithCpu = false
-        var didRetryWithHigherSequentialOverlap = false
         var didRetryWithExactMatcher = false
-        var forceExhaustiveMatching = false
-        var lastUsedSequentialMatcher = false
-        var lastExpectedMatchingPairs = 0
+        var pairRecoveryLevel: PairRecoveryLevel = .normal
+        var pairGraphAttempts: [PairGraphAttemptEvidence] = []
+        var attemptedPairConfigurations: Set<String> = []
+        var acceptedPairGraphEvidence: PairGraphEvidence?
+        var matchingDurationSeconds = 0.0
         let resumeValidationMode = effectiveLastCompletedStage != nil
         let hasInterruptionEvidence = metadata.checkpoint != nil || metadata.lastRunStartedAt != nil
         let wasInterrupted = metadata.state.lastError == nil
@@ -309,6 +309,16 @@ public final class PipelineRunner: @unchecked Sendable {
             }
         }
 
+        func suspendStageTimingForRetry(_ stage: PipelineStage) {
+            if let durationText = stageTiming.finish(stage) {
+                logger.emit(.stageLog(
+                    stage: stage,
+                    line: "Cumulative stage duration before retry: \(durationText)",
+                    isError: false
+                ))
+            }
+        }
+
         func markStageComplete(_ stage: PipelineStage) {
             recordFinishedStageTiming(stage)
             metadata.state = PipelineState(stage: stage, lastError: nil)
@@ -326,6 +336,8 @@ public final class PipelineRunner: @unchecked Sendable {
 
         func emitFailure(stage: PipelineStage, userMessage: String, debugMessage: String) {
             didEmitFailure = true
+            _ = stageTiming.finish(stage)
+            recordFinishedStageTiming(stage)
             metadata.state = PipelineState(stage: stage, lastError: userMessage)
             metadata.checkpoint = nil
             metadata.lastRunStartedAt = nil
@@ -363,7 +375,7 @@ public final class PipelineRunner: @unchecked Sendable {
             )
             let targetFrames = frameProfile.targetCount
             let maxDim = frameProfile.maxDimension
-            var colmapMaxImageSize = resolvedRunPlan.colmapMaximumImageDimension
+            let colmapMaxImageSize = resolvedRunPlan.colmapMaximumImageDimension
             var colmapExtractOptions = colmapOptionsForExtraction()
             var colmapMatchOptions = colmapOptionsForMatching()
             let preferColmapGpu = shouldUseColmapGpu(colmapPath: config.toolchain.colmap)
@@ -376,7 +388,6 @@ public final class PipelineRunner: @unchecked Sendable {
             colmapExtractOptions.maxNumFeatures = resolvedRunPlan.colmapMaximumFeatureCount
             colmapMatchOptions.maxNumFeatures = resolvedRunPlan.colmapMaximumFeatureCount
             colmapMatchOptions.maxNumMatches = resolvedRunPlan.colmapMaximumMatchCount
-            colmapMatchOptions.exhaustiveBlockSize = resolvedRunPlan.colmapExhaustiveBlockSize
             colmapExtractOptions.extractThreads = colmapThreads
             colmapMatchOptions.matchThreads = colmapThreads
             updateThreadEnvironment(&colmapExtractOptions, threadCount: colmapThreads)
@@ -621,11 +632,6 @@ public final class PipelineRunner: @unchecked Sendable {
             let geometryMemorySampler = GeometryMemorySampler()
             geometryMemorySampler.start()
             defer { geometryMemorySampler.cancel() }
-
-            if resolvedRunPlan.sequentialOverlap > 0 {
-                colmapExtractOptions.sequentialOverlap = resolvedRunPlan.sequentialOverlap
-                colmapMatchOptions.sequentialOverlap = resolvedRunPlan.sequentialOverlap
-            }
 
             try Task.checkCancellation()
             let da3WindowSize = resolvedRunPlan.chunkSize
@@ -924,21 +930,8 @@ public final class PipelineRunner: @unchecked Sendable {
                                   !localPairs.isEmpty else {
                                 throw PipelineError.outputMissing
                             }
-                            let includesLoopClosures = da3Config.inputOrdering == .continuous
-                            let loopPairs: [String]
-                            if includesLoopClosures {
-                                let descriptors = try ColmapPairEstimator.imageDescriptors(for: selectedFrames)
-                                loopPairs = try ColmapPairEstimator.orderedLoopPairs(
-                                    imageNames: selectedFrames.map(\.lastPathComponent),
-                                    descriptors: descriptors,
-                                    minimumSeparation: max(
-                                        da3ColmapMatchOptions.sequentialOverlap + 1,
-                                        selectedFrames.count / 5
-                                    )
-                                )
-                            } else {
-                                loopPairs = []
-                            }
+                            let includesLoopClosures = false
+                            let loopPairs: [String] = []
                             guard let trustedPairLimit = Da3CoverageManifest.trustedRefinementMatchPairLimit(
                                 selectedImageCount: selectedFrames.count,
                                 windowSize: da3Config.windowSize,
@@ -978,11 +971,10 @@ public final class PipelineRunner: @unchecked Sendable {
                                     recordMappingFallback("exact descriptor matching")
                                 }
                             )
-                            lastUsedSequentialMatcher = false
                             let expectedPairs = pairPlan.pairs.count
                             let processedPairs = (try? ColmapDatabaseProgressPoller(
                                 databasePath: paths.colmapDatabaseURL
-                            ).readProcessedPairCount()) ?? 0
+                            ).readAttemptedPairCount()) ?? 0
                             writeCheckpoint(
                                 stage: .sfmMatching,
                                 progress: 1.0,
@@ -1144,8 +1136,14 @@ public final class PipelineRunner: @unchecked Sendable {
                         emit(.stageProgress(stage: .sfmFeatures, fraction: update.fraction, message: update.message))
                     }
                 }
-                self.removeIfExists(paths.colmapDatabaseURL)
-                try self.resetDirectory(paths.colmapSparseURL)
+                try self.prepareForClassicalFeatureExtraction(paths: paths)
+                pairGraphAttempts.removeAll(keepingCapacity: true)
+                attemptedPairConfigurations.removeAll(keepingCapacity: true)
+                acceptedPairGraphEvidence = nil
+                matchingDurationSeconds = 0
+                pairRecoveryLevel = .normal
+                didRetryWithExactMatcher = false
+                colmapMatchOptions.descriptorMatcher = resolvedRunPlan.normalDescriptorMatcher
                 emit(.stageLog(
                     stage: .sfmFeatures,
                     line: colmapExtractOptions.useGPU ? "Using GPU for COLMAP feature extraction." : "Using CPU for COLMAP feature extraction.",
@@ -1165,6 +1163,21 @@ public final class PipelineRunner: @unchecked Sendable {
                     options: colmapExtractOptions,
                     onLog: onFeaturesLog
                 )
+                let featureImageNames = selectedFrames.map(\.lastPathComponent)
+                let featureDatabaseDigest = try ColmapDatabaseDigester
+                    .digests(at: paths.colmapDatabaseURL).feature
+                try ColmapFeatureEvidenceStore.save(
+                    ColmapFeatureEvidence(
+                        selectedFramesDigest: try GeometryArtifactStore.selectedFramesDigest(
+                            orderedImageNames: featureImageNames,
+                            projectPaths: paths
+                        ),
+                        imageNames: featureImageNames,
+                        featureDatabaseDigest: featureDatabaseDigest
+                    ),
+                    to: paths.colmapFeatureEvidenceURL,
+                    projectPaths: paths
+                )
                 self.logKeypointStats(database: paths.colmapDatabaseURL, emit: emit)
                 writeCheckpoint(
                     stage: .sfmFeatures,
@@ -1180,8 +1193,36 @@ public final class PipelineRunner: @unchecked Sendable {
                 try stopIfRequested(after: .sfmFeatures)
             }
 
+            func loadPairGraphEvidenceIfNeeded() throws {
+                guard acceptedPairGraphEvidence == nil else { return }
+                let imageNames = selectedFrames.map(\.lastPathComponent)
+                let evidence = try PairGraphEvidenceStore.loadVerified(
+                    from: paths.pairGraphEvidenceURL,
+                    expectedImageNames: imageNames,
+                    databaseURL: paths.colmapDatabaseURL,
+                    projectPaths: paths
+                )
+                guard let acceptedAttempt = evidence.attempts.last else {
+                    throw PairGraphEvidenceStoreError.invalidEvidence
+                }
+                pairGraphAttempts = evidence.attempts
+                acceptedPairGraphEvidence = evidence
+                matchingDurationSeconds = evidence.matchingDurationSeconds
+                pairRecoveryLevel = PairRecoveryLevel(
+                    acceptedAttempt.artifact.recoveryLevel
+                )
+                colmapMatchOptions.descriptorMatcher = acceptedAttempt.artifact.matcher
+                didRetryWithExactMatcher = acceptedAttempt.artifact.matcher == .exact
+                for reason in evidence.fallbackReasons {
+                    recordMappingFallback(reason)
+                }
+            }
+
             let runMatching: (Bool) async throws -> Void = { force in
-                guard try (force || shouldRunStage(.sfmMatching)) else { return }
+                guard try (force || shouldRunStage(.sfmMatching)) else {
+                    try loadPairGraphEvidenceIfNeeded()
+                    return
+                }
                 currentStage = .sfmMatching
                 emit(.stageStarted(stage: .sfmMatching))
                 writeCheckpoint(
@@ -1194,170 +1235,174 @@ public final class PipelineRunner: @unchecked Sendable {
                         processedPairs: 0
                     ))
                 )
+                self.removeIfExists(paths.pairGraphEvidenceURL)
                 try resetMatchingIfNeeded()
+                try ColmapDatabaseMatchStore.clearMatchingResults(
+                    at: paths.colmapDatabaseURL
+                )
                 emit(.stageLog(
                     stage: .sfmMatching,
-                    line: colmapMatchOptions.useGPU ? "Using GPU for COLMAP matching." : "Using CPU for COLMAP matching.",
+                    line: colmapMatchOptions.useGPU
+                        ? "Using GPU for image matching."
+                        : "Using CPU for image matching.",
                     isError: false
                 ))
-                let colmapToolLog = ToolLogWriter(fileURL: paths.colmapLogURL, toolName: "colmap")
+                let colmapToolLog = ToolLogWriter(
+                    fileURL: paths.colmapLogURL,
+                    toolName: "colmap"
+                )
                 colmapToolLog.beginSection(
                     title: "matching",
                     metadata: [
                         "database": paths.colmapDatabaseURL.path,
                         "tool": self.config.toolchain.colmap.path,
                         "useGPU": colmapMatchOptions.useGPU ? "1" : "0",
-                        "threads": "\(colmapMatchOptions.matchThreads)"
+                        "threads": "\(colmapMatchOptions.matchThreads)",
+                        "recovery": "\(pairRecoveryLevel.rawValue)",
+                        "matcher": colmapMatchOptions.descriptorMatcher.rawValue,
                     ]
                 )
-                emit(.stageLog(stage: .sfmMatching, line: "COLMAP tool log: \(paths.colmapLogURL.lastPathComponent)", isError: false))
-                let useSequential = self.shouldUseSequential(
-                    selectedFrames: selectedFrames,
-                    input: metadata.input,
-                    forceExhaustive: forceExhaustiveMatching,
-                    pairingPolicy: resolvedRunPlan.pairingPolicy
+                emit(.stageLog(
+                    stage: .sfmMatching,
+                    line: "Tool log: \(paths.colmapLogURL.lastPathComponent)",
+                    isError: false
+                ))
+
+                let imageNames = selectedFrames.map(\.lastPathComponent)
+                let groups = try Self.colmapPairGroups(
+                    imageNames: imageNames,
+                    manifest: selectedFrameManifest
                 )
-
-                let exhaustiveFallbackMaxFrames = 60
-                let useBoundedRetrieval = !useSequential
-                    && !forceExhaustiveMatching
-                    && resolvedRunPlan.pairingPolicy == .unorderedRetrieval
-                    && selectedFrames.count >= 120
-                lastUsedSequentialMatcher = useSequential
-
-                if !useSequential, metadata.input.videoFiles.count > 1 {
-                    let strategy = useBoundedRetrieval
-                        ? "using bounded retrieval pairs so overlapping views across clips can link"
-                        : "using exhaustive matching so frames from different clips can link"
-                    emit(.stageLog(
-                        stage: .sfmMatching,
-                        line: "Multiple video clips detected (\(metadata.input.videoFiles.count)); \(strategy).",
-                        isError: false
+                let attemptNumber = pairGraphAttempts.count + 1
+                let attemptClock = ContinuousClock()
+                let attemptStart = attemptClock.now
+                var pairPlan = try Self.baseColmapPairPlan(
+                    imageNames: imageNames,
+                    groups: groups,
+                    resolvedPlan: resolvedRunPlan,
+                    recoveryLevel: pairRecoveryLevel
+                )
+                func recordPlanningFailure() {
+                    let duration = Self.durationInSeconds(attemptClock.now - attemptStart)
+                    pairGraphAttempts.append(PairGraphAttemptEvidence(
+                        artifact: PairMatchingAttemptArtifact(
+                            attemptNumber: attemptNumber,
+                            matcher: colmapMatchOptions.descriptorMatcher,
+                            recoveryLevel: pairRecoveryLevel.artifactValue,
+                            outcome: .failed,
+                            scheduledPairCount: pairPlan.pairs.count,
+                            attemptedPairCount: 0,
+                            rawMatchedPairCount: 0,
+                            spatiallyVerifiedPairCount: 0,
+                            durationSeconds: duration
+                        ),
+                        scheduledPairs: pairPlan.pairs
                     ))
+                    matchingDurationSeconds += duration
                 }
-
-                func runSequential() async throws {
-                    let descriptors = try ColmapPairEstimator.imageDescriptors(for: selectedFrames)
-                    let loopPairs = try ColmapPairEstimator.orderedLoopPairs(
-                        imageNames: selectedFrames.map(\.lastPathComponent),
-                        descriptors: descriptors,
-                        minimumSeparation: max(
-                            colmapMatchOptions.sequentialOverlap + 1,
-                            selectedFrames.count / 5
-                        )
-                    )
-                    let sequentialExpected = ColmapPairEstimator.expectedSequentialPairs(
-                        imageCount: selectedFrames.count,
-                        overlap: colmapMatchOptions.sequentialOverlap
-                    )
-                    let expected = sequentialExpected + loopPairs.count
-                    lastExpectedMatchingPairs = expected
-                    try await self.runColmapMatcherAttempt(
-                        stage: .sfmMatching,
-                        paths: paths,
-                        colmapToolLog: colmapToolLog,
-                        expectedPairs: expected,
-                        progressStart: 0.0,
-                        progressSpan: 1.0,
-                        blockMessageFallback: "Matching views",
-                        invokeMatcher: { onLog in
-                            try await self.tooling.colmap.runMatcherSequential(
-                                colmapPath: self.config.toolchain.colmap,
-                                database: paths.colmapDatabaseURL,
-                                options: colmapMatchOptions,
-                                onLog: onLog
-                            )
-                        },
-                        emit: emit
-                    )
-                    if !loopPairs.isEmpty {
-                        let listURL = try self.writeColmapPairList(
-                            loopPairs,
-                            fileName: "loop_pairs.txt",
-                            paths: paths
-                        )
-                        emit(.stageLog(
-                            stage: .sfmMatching,
-                            line: "Adding \(loopPairs.count) verified loop-closure pairs.",
-                            isError: false
-                        ))
-                        try await self.runColmapMatcherAttempt(
-                            stage: .sfmMatching,
-                            paths: paths,
-                            colmapToolLog: colmapToolLog,
-                            expectedPairs: expected,
-                            progressStart: 0,
-                            progressSpan: 1,
-                            blockMessageFallback: "Closing capture loops",
-                            invokeMatcher: { onLog in
-                                try await self.tooling.colmap.runMatchesImporter(
-                                    colmapPath: self.config.toolchain.colmap,
-                                    database: paths.colmapDatabaseURL,
-                                    matchListPath: listURL,
-                                    matchType: "pairs",
-                                    options: colmapMatchOptions,
-                                    onLog: onLog
-                                )
-                            },
-                            emit: emit
-                        )
-                    }
-                }
-
-                func runExhaustive() async throws {
-                    let expected = ColmapPairEstimator.expectedExhaustivePairs(imageCount: selectedFrames.count)
-                    lastExpectedMatchingPairs = expected
-                    try await self.runColmapMatcherAttempt(
-                        stage: .sfmMatching,
-                        paths: paths,
-                        colmapToolLog: colmapToolLog,
-                        expectedPairs: expected,
-                        progressStart: 0.0,
-                        progressSpan: 1.0,
-                        blockMessageFallback: "Matching views",
-                        invokeMatcher: { onLog in
-                            try await self.tooling.colmap.runMatcherExhaustive(
-                                colmapPath: self.config.toolchain.colmap,
-                                database: paths.colmapDatabaseURL,
-                                options: colmapMatchOptions,
-                                onLog: onLog
-                            )
-                        },
-                        emit: emit
-                    )
-                }
-
-                func runRetrieval() async throws {
-                    let descriptors = try ColmapPairEstimator.imageDescriptors(for: selectedFrames)
-                    let pairs = try ColmapPairEstimator.boundedRetrievalPairs(
-                        imageNames: selectedFrames.map(\.lastPathComponent),
-                        descriptors: descriptors,
-                        maxNeighbors: 8
-                    )
-                    let listURL = try self.writeColmapPairList(
-                        pairs,
-                        fileName: "retrieval_pairs.txt",
+                if let request = Self.vocabularyRetrievalRequest(
+                    imageNames: imageNames,
+                    resolvedPlan: resolvedRunPlan,
+                    recoveryLevel: pairRecoveryLevel
+                ) {
+                    let queryListURL = try self.writeVocabularyQueryList(
+                        request.queryImageNames,
+                        attemptNumber: attemptNumber,
                         paths: paths
                     )
-                    lastExpectedMatchingPairs = pairs.count
-                    emit(.stageLog(
+                    let outputURL = paths.colmapSeedURL.appendingPathComponent(
+                        "retrieval_pairs_attempt_\(attemptNumber).txt"
+                    )
+                    let excludedPairListURL: URL?
+                    if pairPlan.pairs.isEmpty {
+                        excludedPairListURL = nil
+                    } else {
+                        excludedPairListURL = try self.writeColmapPairList(
+                            pairPlan.pairLines,
+                            fileName: "retrieval_exclusions_attempt_\(attemptNumber).txt",
+                            paths: paths
+                        )
+                    }
+                    self.removeIfExists(outputURL)
+                    emit(.stageProgress(
                         stage: .sfmMatching,
-                        line: "Using \(pairs.count) bounded retrieval pairs for \(selectedFrames.count) unordered views.",
-                        isError: false
+                        fraction: 0,
+                        message: "Finding revisited views"
                     ))
+                    try await self.tooling.colmap.runLocalVocabularyRetriever(
+                        colmapPath: self.config.toolchain.colmap,
+                        database: paths.colmapDatabaseURL,
+                        outputPairListPath: outputURL,
+                        queryImageListPath: queryListURL,
+                        excludedPairListPath: excludedPairListURL,
+                        options: try ColmapVocabularyRetrievalOptions(
+                            candidateCount: request.candidateCount,
+                            returnedNeighborCount: request.returnedNeighborCount,
+                            minimumFrameSeparation: request.minimumFrameSeparation,
+                            threadCount: colmapMatchOptions.matchThreads
+                        ),
+                        environment: colmapMatchOptions.environment,
+                        onLog: { line, isErr in
+                            colmapToolLog.append(
+                                stream: isErr ? "stderr" : "stdout",
+                                line: line
+                            )
+                        }
+                    )
+                    let retrievalLines = try Self.validatedVocabularyRetrievalPairLines(
+                        self.readGeneratedPairLines(from: outputURL),
+                        request: request,
+                        imageNames: imageNames,
+                        excluding: pairPlan
+                    )
+                    pairPlan = try pairPlan.addingRetrievalPairLines(
+                        retrievalLines,
+                        pairingPolicy: resolvedRunPlan.pairingPolicy
+                    )
+                }
+                guard !pairPlan.pairs.isEmpty else {
+                    recordPlanningFailure()
+                    throw ColmapPairPlanningError.disconnectedPairSchedule
+                }
+                guard pairPlan.isConnected else {
+                    recordPlanningFailure()
+                    throw ColmapPairPlanningError.disconnectedPairSchedule
+                }
+                let attemptConfiguration = [
+                    colmapMatchOptions.descriptorMatcher.rawValue,
+                    colmapMatchOptions.useGPU ? "gpu" : "cpu",
+                    pairPlan.sha256,
+                ].joined(separator: ":")
+                guard attemptedPairConfigurations.insert(attemptConfiguration).inserted else {
+                    recordPlanningFailure()
+                    throw ColmapPairPlanningError.repeatedAttempt
+                }
+                let pairListURL = try self.writeColmapPairPlan(
+                    pairPlan,
+                    attemptNumber: attemptNumber,
+                    paths: paths
+                )
+                emit(.stageLog(
+                    stage: .sfmMatching,
+                    line: "Pair graph: \(pairPlan.localPairCount) local, \(pairPlan.retrievalPairCount) retrieval, \(pairPlan.loopRevisitPairCount) revisit (\(pairPlan.pairs.count) total).",
+                    isError: false
+                ))
+
+                let inspection: ColmapPairGraphInspection
+                do {
                     try await self.runColmapMatcherAttempt(
                         stage: .sfmMatching,
                         paths: paths,
                         colmapToolLog: colmapToolLog,
-                        expectedPairs: pairs.count,
+                        expectedPairs: pairPlan.pairs.count,
                         progressStart: 0,
                         progressSpan: 1,
-                        blockMessageFallback: "Matching retrieved views",
+                        blockMessageFallback: "Matching views",
                         invokeMatcher: { onLog in
                             try await self.tooling.colmap.runMatchesImporter(
                                 colmapPath: self.config.toolchain.colmap,
                                 database: paths.colmapDatabaseURL,
-                                matchListPath: listURL,
+                                matchListPath: pairListURL,
                                 matchType: "pairs",
                                 options: colmapMatchOptions,
                                 onLog: onLog
@@ -1365,110 +1410,100 @@ public final class PipelineRunner: @unchecked Sendable {
                         },
                         emit: emit
                     )
+                    inspection = try ColmapPairGraphInspector(
+                        databaseURL: paths.colmapDatabaseURL
+                    ).inspect(
+                        schedule: ColmapPairSchedule(
+                            imageNames: imageNames,
+                            pairs: pairPlan.pairs
+                        ),
+                        completion: .succeeded
+                    )
+                } catch let matcherError {
+                    if matcherError is CancellationError { throw matcherError }
+                    try Task.checkCancellation()
+                    let duration = Self.durationInSeconds(attemptClock.now - attemptStart)
+                    let partialInspection = try? ColmapPairGraphInspector(
+                        databaseURL: paths.colmapDatabaseURL
+                    ).inspect(
+                        schedule: ColmapPairSchedule(
+                            imageNames: imageNames,
+                            pairs: pairPlan.pairs
+                        ),
+                        completion: .failed
+                    )
+                    pairGraphAttempts.append(PairGraphAttemptEvidence(
+                        artifact: PairMatchingAttemptArtifact(
+                            attemptNumber: attemptNumber,
+                            matcher: colmapMatchOptions.descriptorMatcher,
+                            recoveryLevel: pairRecoveryLevel.artifactValue,
+                            outcome: .failed,
+                            scheduledPairCount: pairPlan.pairs.count,
+                            attemptedPairCount: partialInspection?.attemptedPairCount ?? 0,
+                            rawMatchedPairCount: partialInspection?.rawMatchedPairCount ?? 0,
+                            spatiallyVerifiedPairCount: partialInspection?.spatiallyVerifiedPairCount ?? 0,
+                            durationSeconds: duration
+                        ),
+                        scheduledPairs: pairPlan.pairs
+                    ))
+                    matchingDurationSeconds += duration
+                    throw matcherError
                 }
 
-                if useSequential {
-                    do {
-                        try await runSequential()
-                    } catch {
-                        if error is CancellationError { throw error }
-                        try Task.checkCancellation()
-                        if DescriptorMatcherRecoveryPolicy.reason(
-                            for: error,
-                            currentMatcher: colmapMatchOptions.descriptorMatcher
-                        ) != nil {
-                            throw error
-                        }
-                        let previousOverlap = colmapMatchOptions.sequentialOverlap
-                        let increasedOverlap = min(30, max(previousOverlap + 5, previousOverlap * 2))
-                        if increasedOverlap > previousOverlap {
-                            emit(.stageLog(
-                                stage: .sfmMatching,
-                                line: "Sequential matcher failed. Retrying sequential matching with higher overlap (\(previousOverlap) -> \(increasedOverlap)).",
-                                isError: true
-                            ))
-                            self.emitColmapRetryDiagnostics(error, stage: .sfmMatching, emit: emit)
-                            colmapMatchOptions.sequentialOverlap = increasedOverlap
-                            do {
-                                try await runSequential()
-                            } catch {
-                                if error is CancellationError { throw error }
-                                try Task.checkCancellation()
-                                if DescriptorMatcherRecoveryPolicy.reason(
-                                    for: error,
-                                    currentMatcher: colmapMatchOptions.descriptorMatcher
-                                ) != nil {
-                                    throw error
-                                }
-                                emit(.stageLog(
-                                    stage: .sfmMatching,
-                                    line: "Sequential matcher failed again. Rebuilding database and retrying with exhaustive matching on fewer frames.",
-                                    isError: true
-                                ))
-                                self.emitColmapRetryDiagnostics(error, stage: .sfmMatching, emit: emit)
-                                let previousCount = selectedFrames.count
-                                let reduced = try self.downsampleSelectedFrames(to: exhaustiveFallbackMaxFrames, paths: paths)
-                                if let reduced {
-                                    selectedFrames = reduced
-                                }
-                                didRetryWithFewerFrames = true
-                                if previousCount != selectedFrames.count {
-                                    emit(.stageLog(
-                                        stage: .sfmMatching,
-                                        line: "Reduced matching frames \(previousCount) -> \(selectedFrames.count) for exhaustive fallback.",
-                                        isError: true
-                                    ))
-                                }
-                                forceExhaustiveMatching = true
-                                lastUsedSequentialMatcher = false
-
-                                self.removeIfExists(paths.colmapDatabaseURL)
-                                try self.resetDirectory(paths.colmapSparseURL)
-                                try await self.tooling.colmap.runFeatureExtractor(
-                                    colmapPath: self.config.toolchain.colmap,
-                                    database: paths.colmapDatabaseURL,
-                                    imagePath: paths.framesSelectedURL,
-                                    maxImageSize: colmapMaxImageSize,
-                                    cameraModel: self.cameraModel(
-                                        detailProfile: metadata.requestedRunOptions.detailProfile,
-                                        capturePath: resolvedRunPlan.capturePath,
-                                        lensProjection: resolvedRunPlan.lensProjection
-                                    ),
-                                    singleCamera: shareCameraAcrossSelectedFrames,
-                                    options: colmapExtractOptions,
-                                    onLog: { line, isErr in
-                                        colmapToolLog.append(stream: isErr ? "stderr" : "stdout", line: line)
-                                        let sanitized = Self.sanitizeToolLogLine(line)
-                                        let effectiveIsErr = Self.normalizedToolLogIsError(sanitized, isError: isErr)
-                                        if Self.shouldEmitToolLogLine(sanitized, isError: effectiveIsErr) {
-                                            emit(.stageLog(stage: .sfmMatching, line: sanitized, isError: effectiveIsErr))
-                                        }
-                                    }
-                                )
-                                self.logKeypointStats(database: paths.colmapDatabaseURL, stage: .sfmMatching, emit: emit)
-                                try await runExhaustive()
-                            }
-                        } else {
-                            throw error
-                        }
-                    }
-                } else {
-                    lastUsedSequentialMatcher = false
-                    if useBoundedRetrieval {
-                        try await runRetrieval()
-                    } else {
-                        try await runExhaustive()
-                    }
+                let duration = Self.durationInSeconds(attemptClock.now - attemptStart)
+                pairGraphAttempts.append(PairGraphAttemptEvidence(
+                    artifact: PairMatchingAttemptArtifact(
+                        attemptNumber: attemptNumber,
+                        matcher: colmapMatchOptions.descriptorMatcher,
+                        recoveryLevel: pairRecoveryLevel.artifactValue,
+                        outcome: .completed,
+                        scheduledPairCount: inspection.scheduledPairCount,
+                        attemptedPairCount: inspection.attemptedPairCount,
+                        rawMatchedPairCount: inspection.rawMatchedPairCount,
+                        spatiallyVerifiedPairCount: inspection.spatiallyVerifiedPairCount,
+                        durationSeconds: duration
+                    ),
+                    scheduledPairs: pairPlan.pairs
+                ))
+                matchingDurationSeconds += duration
+                guard inspection.connectedComponentCount == 1,
+                      inspection.isolatedViewCount == 0 else {
+                    emit(.stageLog(
+                        stage: .sfmMatching,
+                        line: "Pair graph remained disconnected (\(inspection.connectedComponentCount) components, \(inspection.isolatedViewCount) isolated views).",
+                        isError: true
+                    ))
+                    throw ColmapPairPlanningError.disconnectedVerifiedGraph
                 }
-                let processedPairs = (try? ColmapDatabaseProgressPoller(databasePath: paths.colmapDatabaseURL).readProcessedPairCount()) ?? 0
+
+                let evidence = PairGraphEvidence(
+                    selectedFramesDigest: try GeometryArtifactStore.selectedFramesDigest(
+                        orderedImageNames: imageNames,
+                        projectPaths: paths
+                    ),
+                    imageNames: imageNames,
+                    attempts: pairGraphAttempts,
+                    acceptedAttemptNumber: attemptNumber,
+                    acceptedInspection: inspection,
+                    matchingDurationSeconds: matchingDurationSeconds,
+                    fallbackReasons: mappingFallbackReasons
+                )
+                try PairGraphEvidenceStore.save(
+                    evidence,
+                    to: paths.pairGraphEvidenceURL,
+                    projectPaths: paths
+                )
+                acceptedPairGraphEvidence = evidence
                 writeCheckpoint(
                     stage: .sfmMatching,
-                    progress: 1.0,
-                    message: "COLMAP matching completed",
+                    progress: 1,
+                    message: "Image matching completed",
                     details: .sfmMatching(SfmMatchingCheckpoint(
-                        databasePath: try paths.projectRelativePath(for: paths.colmapDatabaseURL),
-                        expectedPairs: lastExpectedMatchingPairs,
-                        processedPairs: processedPairs
+                        databasePath: try paths.projectRelativePath(
+                            for: paths.colmapDatabaseURL
+                        ),
+                        expectedPairs: inspection.scheduledPairCount,
+                        processedPairs: inspection.attemptedPairCount
                     ))
                 )
                 emit(.stageFinished(stage: .sfmMatching))
@@ -1489,49 +1524,23 @@ public final class PipelineRunner: @unchecked Sendable {
                 return true
             }
 
-            let applyFewerFramesRetry: (String, Bool) async throws -> Bool = { reason, reduceDetail in
-                guard !didRetryWithFewerFrames else { return false }
-                let reducedTarget = max(40, targetFrames / 2)
-                let previousCount = selectedFrames.count
-                let reduced = try self.downsampleSelectedFrames(to: reducedTarget, paths: paths)
-                let previousMaxImageSize = colmapMaxImageSize
-                if reduceDetail {
-                    colmapMaxImageSize = max(800, Int(Double(colmapMaxImageSize) * 0.75))
-                    if let current = colmapExtractOptions.maxNumFeatures {
-                        colmapExtractOptions.maxNumFeatures = max(2000, min(current, 6000))
-                    } else {
-                        colmapExtractOptions.maxNumFeatures = 6000
-                    }
-                    if let currentMatches = colmapMatchOptions.maxNumMatches {
-                        colmapMatchOptions.maxNumMatches = max(2000, min(currentMatches, 6000))
-                    } else {
-                        colmapMatchOptions.maxNumMatches = 6000
-                    }
-                    colmapMatchOptions.exhaustiveBlockSize = min(colmapMatchOptions.exhaustiveBlockSize ?? 20, 20)
-                    colmapMatchOptions.sequentialOverlap = min(colmapMatchOptions.sequentialOverlap, 5)
+            let advancePairRecovery: (String) -> Bool = { reason in
+                guard let next = Self.nextPairRecoveryLevel(
+                    after: pairRecoveryLevel,
+                    imageCount: selectedFrames.count,
+                    pairingPolicy: resolvedRunPlan.pairingPolicy
+                ) else {
+                    return false
                 }
-                didRetryWithFewerFrames = true
-                recordMappingFallback("reduced frames after geometry failure")
-                if let reduced = reduced {
-                    selectedFrames = reduced
-                }
-                forceExhaustiveMatching = true
-                let countDetail = reduced != nil ? "\(previousCount) -> \(selectedFrames.count)" : "\(previousCount) (no reduction)"
-                var details = [countDetail]
-                if reduceDetail {
-                    details.append("\(previousMaxImageSize)px -> \(colmapMaxImageSize)px")
-                }
+                pairRecoveryLevel = next
+                acceptedPairGraphEvidence = nil
+                recordMappingFallback(reason)
                 emit(.stageLog(
                     stage: currentStage,
-                    line: "\(reason) (\(details.joined(separator: ", "))).",
+                    line: "\(reason). Retrying with a denser pair graph.",
                     isError: true
                 ))
                 return true
-            }
-
-            let retryWithFewerFramesIfNeeded: (Error) async throws -> Bool = { error in
-                guard error is ColmapRunnerError || error is ColmapPairPlanningError else { return false }
-                return try await applyFewerFramesRetry("COLMAP failed; retrying with fewer frames and exhaustive matching", true)
             }
 
             var forceSfMRun = false
@@ -1544,19 +1553,17 @@ public final class PipelineRunner: @unchecked Sendable {
                         }
                         try await runMatching(forceSfMRun || forceMatchingRun)
                         forceMatchingRun = false
+                        forceSfMRun = false
                         if didRetryWithCpu {
                             emit(.stageLog(stage: .sfmMatching, line: "Retry on CPU succeeded.", isError: false))
-                        }
-                        if didRetryWithFewerFrames {
-                            emit(.stageLog(stage: .sfmMatching, line: "Retry with fewer frames succeeded.", isError: false))
                         }
                         break
                     } catch {
                         if error is CancellationError { throw error }
                         try Task.checkCancellation()
                         if retryWithCpuIfNeeded(error) {
-                            forceSfMRun = true
-                            forceMatchingRun = false
+                            forceSfMRun = currentStage == .sfmFeatures
+                            forceMatchingRun = currentStage == .sfmMatching
                             continue
                         }
                         if !didRetryWithExactMatcher,
@@ -1567,10 +1574,8 @@ public final class PipelineRunner: @unchecked Sendable {
                             didRetryWithExactMatcher = true
                             colmapMatchOptions.descriptorMatcher = .exact
                             recordMappingFallback("exact descriptor matching")
-                            try ColmapDatabaseMatchStore.clearMatchingResults(
-                                at: paths.colmapDatabaseURL
-                            )
                             try self.resetDirectory(paths.colmapSparseURL)
+                            acceptedPairGraphEvidence = nil
                             emit(.stageLog(
                                 stage: .sfmMatching,
                                 line: "FAISS matching failed (\(reason.rawValue)); preserving features and retrying with exact matching.",
@@ -1581,9 +1586,45 @@ public final class PipelineRunner: @unchecked Sendable {
                             forceMatchingRun = true
                             continue
                         }
-                        if try await retryWithFewerFramesIfNeeded(error) {
-                            forceSfMRun = true
-                            forceMatchingRun = false
+                        let pairPlanningError = error as? ColmapPairPlanningError
+                        if pairPlanningError == .repeatedAttempt,
+                           advancePairRecovery("Image retrieval repeated the previous pair graph") {
+                            forceSfMRun = false
+                            forceMatchingRun = true
+                            continue
+                        }
+                        if (pairPlanningError == .disconnectedPairSchedule
+                                || pairPlanningError == .disconnectedVerifiedGraph),
+                           advancePairRecovery("Image matching did not produce a connected graph") {
+                            self.emitColmapRetryDiagnostics(
+                                error,
+                                stage: .sfmMatching,
+                                emit: emit
+                            )
+                            forceSfMRun = false
+                            forceMatchingRun = true
+                            continue
+                        }
+                        if !didRetryWithExactMatcher,
+                           colmapMatchOptions.descriptorMatcher == .faiss,
+                           (pairPlanningError == .repeatedAttempt
+                               || (pairPlanningError == .disconnectedVerifiedGraph
+                                   && Self.nextPairRecoveryLevel(
+                                       after: pairRecoveryLevel,
+                                       imageCount: selectedFrames.count,
+                                       pairingPolicy: resolvedRunPlan.pairingPolicy
+                                   ) == nil)) {
+                            didRetryWithExactMatcher = true
+                            colmapMatchOptions.descriptorMatcher = .exact
+                            acceptedPairGraphEvidence = nil
+                            recordMappingFallback("exact descriptor matching")
+                            emit(.stageLog(
+                                stage: .sfmMatching,
+                                line: "The densest FAISS graph was still disconnected. Retrying the same schedule with exact descriptor matching.",
+                                isError: true
+                            ))
+                            forceSfMRun = false
+                            forceMatchingRun = true
                             continue
                         }
                         throw error
@@ -1719,29 +1760,10 @@ public final class PipelineRunner: @unchecked Sendable {
                     if !mappingSucceeded,
                        let pipelineError = lastMappingError as? PipelineError,
                        case .lowQualityReconstruction = pipelineError,
-                       lastUsedSequentialMatcher,
-                       !didRetryWithHigherSequentialOverlap {
-                        let previousOverlap = colmapMatchOptions.sequentialOverlap
-                        let increasedOverlap = min(30, max(previousOverlap + 5, previousOverlap * 2))
-                        if increasedOverlap > previousOverlap {
-                            didRetryWithHigherSequentialOverlap = true
-                            colmapMatchOptions.sequentialOverlap = increasedOverlap
-                            recordMappingFallback("higher sequential overlap")
-                            emit(.stageLog(
-                                stage: .sfmMapping,
-                                line: "Reconstruction quality was low. Retrying with higher sequential overlap (\(previousOverlap) -> \(increasedOverlap)).",
-                                isError: true
-                            ))
-                            forceSfMRun = true
-                            continue sfmAttemptLoop
-                        }
-                    }
-
-                    if !mappingSucceeded,
-                       let pipelineError = lastMappingError as? PipelineError,
-                       case .lowQualityReconstruction = pipelineError,
-                       try await applyFewerFramesRetry("Reconstruction quality was low; retrying with fewer frames and exhaustive matching", false) {
-                        forceSfMRun = true
+                       advancePairRecovery("Reconstruction coverage was below the acceptance gate") {
+                        suspendStageTimingForRetry(.sfmMapping)
+                        forceSfMRun = false
+                        forceMatchingRun = true
                         continue sfmAttemptLoop
                     }
 
@@ -1749,20 +1771,21 @@ public final class PipelineRunner: @unchecked Sendable {
                        let pipelineError = lastMappingError as? PipelineError,
                        case .lowQualityReconstruction = pipelineError,
                        !didRetryWithExactMatcher,
-                       let reason = DescriptorMatcherRecoveryPolicy.reasonForRejectedGeometry(
-                           currentMatcher: colmapMatchOptions.descriptorMatcher,
-                           exhaustedFaissRetries: didRetryWithFewerFrames
-                       ) {
+                       colmapMatchOptions.descriptorMatcher == .faiss,
+                       Self.nextPairRecoveryLevel(
+                           after: pairRecoveryLevel,
+                           imageCount: selectedFrames.count,
+                           pairingPolicy: resolvedRunPlan.pairingPolicy
+                       ) == nil {
+                        suspendStageTimingForRetry(.sfmMapping)
                         didRetryWithExactMatcher = true
                         colmapMatchOptions.descriptorMatcher = .exact
                         recordMappingFallback("exact descriptor matching")
-                        try ColmapDatabaseMatchStore.clearMatchingResults(
-                            at: paths.colmapDatabaseURL
-                        )
                         try self.resetDirectory(paths.colmapSparseURL)
+                        acceptedPairGraphEvidence = nil
                         emit(.stageLog(
                             stage: .sfmMatching,
-                            line: "FAISS geometry recovery was exhausted (\(reason.rawValue)); preserving features and retrying with exact matching.",
+                            line: "The densest FAISS solve missed the coverage gate. Retrying the same schedule with exact descriptor matching.",
                             isError: true
                         ))
                         forceSfMRun = false
@@ -1897,6 +1920,23 @@ public final class PipelineRunner: @unchecked Sendable {
                     let mappingFallbackReason = mappingFallbackReasons.isEmpty
                         ? nil
                         : mappingFallbackReasons.joined(separator: "; ")
+                    let measuredPairGraph: PairGraphArtifact
+                    if mapper.lowercased().contains("da3") {
+                        measuredPairGraph = .notEvaluated(
+                            mappingAttemptNumber: mappingAttemptCount,
+                            bundleAdjustmentCycleCount: bundleAdjustmentCycleCount,
+                            fallbackReason: mappingFallbackReason
+                        )
+                    } else {
+                        guard let pairEvidence = acceptedPairGraphEvidence else {
+                            throw PairGraphEvidenceStoreError.invalidEvidence
+                        }
+                        measuredPairGraph = try pairEvidence.pairGraphArtifact(
+                            mappingAttemptNumber: mappingAttemptCount,
+                            bundleAdjustmentCycleCount: bundleAdjustmentCycleCount,
+                            fallbackReason: mappingFallbackReason
+                        )
+                    }
                     try persistMeasuredGeometryArtifact(
                         metadata: &metadata,
                         paths: paths,
@@ -1906,11 +1946,7 @@ public final class PipelineRunner: @unchecked Sendable {
                         selectedFrames: selectedFrames,
                         selectedFrameManifest: currentSelectedFrameManifest,
                         peakMemoryBytes: geometryPeakMemoryBytes,
-                        pairGraph: .notEvaluated(
-                            mappingAttemptNumber: mappingAttemptCount,
-                            bundleAdjustmentCycleCount: bundleAdjustmentCycleCount,
-                            fallbackReason: mappingFallbackReason
-                        )
+                        pairGraph: measuredPairGraph
                     )
                 } catch {
                     metadata.reconstruction = previousReconstruction

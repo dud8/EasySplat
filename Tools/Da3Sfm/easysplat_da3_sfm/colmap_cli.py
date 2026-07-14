@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 import math
+import os
+import sqlite3
 import stat
 import sys
+import tempfile
 from pathlib import Path
-from typing import Any
+from typing import Any, NamedTuple
 
 import numpy as np
 
@@ -28,22 +31,6 @@ _COMMAND_OPTIONS = {
         "FeatureExtraction.use_gpu",
         "FeatureExtraction.num_threads",
     },
-    "sequential_matcher": {
-        "database_path",
-        "FeatureMatching.use_gpu",
-        "FeatureMatching.num_threads",
-        "FeatureMatching.max_num_matches",
-        "SequentialMatching.overlap",
-        "SiftMatching.cpu_brute_force_matcher",
-    },
-    "exhaustive_matcher": {
-        "database_path",
-        "FeatureMatching.use_gpu",
-        "FeatureMatching.num_threads",
-        "FeatureMatching.max_num_matches",
-        "ExhaustiveMatching.block_size",
-        "SiftMatching.cpu_brute_force_matcher",
-    },
     "matches_importer": {
         "database_path",
         "match_list_path",
@@ -52,6 +39,22 @@ _COMMAND_OPTIONS = {
         "FeatureMatching.num_threads",
         "FeatureMatching.max_num_matches",
         "SiftMatching.cpu_brute_force_matcher",
+    },
+    "local_vocab_retriever": {
+        "database_path",
+        "output_pair_list_path",
+        "query_image_list_path",
+        "excluded_pair_list_path",
+        "num_images",
+        "returned_neighbor_count",
+        "minimum_frame_separation",
+        "num_visual_words",
+        "max_features_per_image",
+        "max_training_descriptors",
+        "num_iterations",
+        "num_rounds",
+        "num_checks",
+        "num_threads",
     },
     "mapper": {
         "database_path",
@@ -155,6 +158,15 @@ def _positive_integer(options: dict[str, str], name: str, default: int) -> int:
     return value
 
 
+def _bounded_integer(
+    options: dict[str, str], name: str, default: int, minimum: int, maximum: int
+) -> int:
+    value = _integer(options, name, default)
+    if value < minimum or value > maximum:
+        raise ColmapCliError(f"--{name} must be between {minimum} and {maximum}")
+    return value
+
+
 def _nonnegative_int32(options: dict[str, str], name: str, default: int) -> int:
     value = _integer(options, name, default)
     if value < 0 or value > 2_147_483_647:
@@ -218,7 +230,9 @@ def _feature_matching_options(pycolmap: Any, options: dict[str, str]) -> Any:
     return matching
 
 
-def _read_pairs(path: str) -> list[tuple[str, str]]:
+def _read_pairs(
+    path: str, *, allow_empty: bool = False
+) -> list[tuple[str, str]]:
     try:
         lines = Path(path).read_text(encoding="utf-8").splitlines()
     except OSError as exc:
@@ -238,7 +252,7 @@ def _read_pairs(path: str) -> list[tuple[str, str]]:
                 f"invalid pair list line {line_number}: image cannot match itself"
             )
         pairs.append((names[0], names[1]))
-    if not pairs:
+    if not pairs and not allow_empty:
         raise ColmapCliError("pair list did not contain any image pairs")
     return pairs
 
@@ -359,32 +373,6 @@ def _run_feature_extractor(pycolmap: Any, options: dict[str, str]) -> None:
     _validate_feature_extraction(pycolmap, database_path, image_path)
 
 
-def _run_standard_matcher(pycolmap: Any, command: str, options: dict[str, str]) -> None:
-    database_path = _required(options, "database_path")
-    matching = _feature_matching_options(pycolmap, options)
-    verification = pycolmap.TwoViewGeometryOptions()
-    if command == "sequential_matcher":
-        pairing = pycolmap.SequentialPairingOptions()
-        pairing.overlap = _positive_integer(options, "SequentialMatching.overlap", 10)
-        pycolmap.match_sequential(
-            database_path,
-            matching_options=matching,
-            pairing_options=pairing,
-            verification_options=verification,
-            device=pycolmap.Device.cpu,
-        )
-        return
-    pairing = pycolmap.ExhaustivePairingOptions()
-    pairing.block_size = _positive_integer(options, "ExhaustiveMatching.block_size", 50)
-    pycolmap.match_exhaustive(
-        database_path,
-        matching_options=matching,
-        pairing_options=pairing,
-        verification_options=verification,
-        device=pycolmap.Device.cpu,
-    )
-
-
 def _run_matches_importer(pycolmap: Any, options: dict[str, str]) -> None:
     if options.get("match_type", "pairs") != "pairs":
         raise ColmapCliError("matches_importer supports only --match_type pairs")
@@ -417,6 +405,553 @@ def _run_matches_importer(pycolmap: Any, options: dict[str, str]) -> None:
         verification_options=pycolmap.TwoViewGeometryOptions(),
         device=pycolmap.Device.cpu,
     )
+
+
+def _largest_scale_rows(keypoints: Any, limit: int) -> np.ndarray:
+    matrix = np.asarray(keypoints)
+    if matrix.ndim != 2 or matrix.shape[1] < 4:
+        raise ColmapCliError("retrieval keypoints must be an Nx4 or Nx6 matrix")
+    if matrix.shape[1] >= 6:
+        scales = np.sqrt(
+            np.abs(matrix[:, 2] * matrix[:, 5] - matrix[:, 3] * matrix[:, 4])
+        )
+    else:
+        scales = matrix[:, 2]
+    if not np.all(np.isfinite(scales)):
+        raise ColmapCliError("retrieval keypoint scales must be finite")
+    row_ids = np.arange(matrix.shape[0], dtype=np.int64)
+    return np.lexsort((row_ids, -scales))[:limit]
+
+
+class _RetrievalImage(NamedTuple):
+    image_id: int
+    name: str
+
+
+def _selected_retrieval_features(
+    source: sqlite3.Connection,
+    image: _RetrievalImage,
+    *,
+    descriptor_has_type: bool,
+    max_features_per_image: int,
+) -> tuple[np.ndarray, np.ndarray]:
+    keypoints = _read_feature_matrix(
+        source,
+        table="keypoints",
+        image_id=int(image.image_id),
+        dtype=np.dtype(np.float32),
+    )
+    descriptors = _read_feature_matrix(
+        source,
+        table="descriptors",
+        image_id=int(image.image_id),
+        dtype=np.dtype(np.uint8),
+        expected_columns=128,
+        descriptor_has_type=descriptor_has_type,
+    )
+    if keypoints.shape == (0, 0):
+        keypoints = np.empty((0, 4), dtype=np.float32)
+    if keypoints.ndim != 2:
+        raise ColmapCliError(f"invalid keypoints for retrieval image: {image.name}")
+    if keypoints.shape[0] != descriptors.shape[0]:
+        raise ColmapCliError(f"mismatched retrieval features for image: {image.name}")
+    if descriptors.shape[0] == 0:
+        return (
+            np.empty((0, keypoints.shape[1]), dtype=np.float32),
+            np.empty((0, 128), dtype=np.uint8),
+        )
+    rows = _largest_scale_rows(keypoints, max_features_per_image)
+    return (
+        np.ascontiguousarray(keypoints[rows], dtype=np.float32),
+        np.ascontiguousarray(descriptors[rows], dtype=np.uint8),
+    )
+
+
+def _readonly_feature_database(path: Path) -> sqlite3.Connection:
+    for suffix in ("-wal", "-journal"):
+        sidecar = Path(f"{path}{suffix}")
+        try:
+            if sidecar.is_file() and sidecar.stat().st_size > 0:
+                raise ColmapCliError(
+                    f"retrieval database has a pending SQLite {suffix[1:]} sidecar"
+                )
+        except OSError as exc:
+            raise ColmapCliError(
+                f"could not inspect retrieval database sidecars: {path}"
+            ) from exc
+    database: sqlite3.Connection | None = None
+    try:
+        database = sqlite3.connect(
+            f"{path.as_uri()}?mode=ro&immutable=1",
+            uri=True,
+        )
+        database.execute("PRAGMA query_only = ON")
+        database.execute("BEGIN")
+        return database
+    except sqlite3.Error as exc:
+        if database is not None:
+            database.close()
+        raise ColmapCliError(
+            f"could not open retrieval database read-only: {path}"
+        ) from exc
+
+
+def _database_columns(database: sqlite3.Connection, table: str) -> set[str]:
+    try:
+        return {str(row[1]) for row in database.execute(f"PRAGMA table_info({table})")}
+    except sqlite3.Error as exc:
+        raise ColmapCliError(f"could not inspect retrieval table: {table}") from exc
+
+
+def _validate_retrieval_schema(database: sqlite3.Connection) -> bool:
+    required_by_table = {
+        "images": {"image_id", "name"},
+        "keypoints": {"image_id", "rows", "cols", "data"},
+        "descriptors": {"image_id", "rows", "cols", "data"},
+    }
+    columns_by_table = {
+        table: _database_columns(database, table) for table in required_by_table
+    }
+    for table, required in required_by_table.items():
+        if not required.issubset(columns_by_table[table]):
+            raise ColmapCliError(f"retrieval database has an invalid {table} table")
+    return "type" in columns_by_table["descriptors"]
+
+
+def _read_feature_matrix(
+    database: sqlite3.Connection,
+    *,
+    table: str,
+    image_id: int,
+    dtype: np.dtype[Any],
+    expected_columns: int | None = None,
+    descriptor_has_type: bool = False,
+) -> np.ndarray:
+    query = f"SELECT rows, cols, data FROM {table} WHERE image_id = ?"
+    arguments: tuple[int, ...] = (image_id,)
+    if table == "descriptors" and descriptor_has_type:
+        query += " AND type = ?"
+        arguments = (image_id, 0)
+    try:
+        rows = database.execute(query, arguments).fetchall()
+    except sqlite3.Error as exc:
+        raise ColmapCliError(
+            f"could not read retrieval {table} for image ID {image_id}"
+        ) from exc
+    if not rows:
+        columns_count = expected_columns or 0
+        return np.empty((0, columns_count), dtype=dtype)
+    if len(rows) != 1:
+        raise ColmapCliError(
+            f"retrieval database has duplicate {table} rows for image ID {image_id}"
+        )
+    row_count, column_count, blob = rows[0]
+    if (
+        not isinstance(row_count, int)
+        or not isinstance(column_count, int)
+        or row_count < 0
+        or column_count < 0
+        or (expected_columns is not None and column_count != expected_columns)
+    ):
+        raise ColmapCliError(
+            f"retrieval database has invalid {table} dimensions for image ID {image_id}"
+        )
+    payload = b"" if blob is None else bytes(blob)
+    expected_bytes = row_count * column_count * np.dtype(dtype).itemsize
+    if len(payload) != expected_bytes:
+        raise ColmapCliError(
+            f"retrieval database has an invalid {table} blob for image ID {image_id}"
+        )
+    return np.frombuffer(payload, dtype=dtype).reshape(row_count, column_count)
+
+
+def _populate_retrieval_database(
+    pycolmap: Any,
+    source: sqlite3.Connection,
+    retrieval_database: Any,
+    *,
+    max_features_per_image: int,
+    max_training_descriptors: int,
+) -> tuple[list[Any], np.ndarray]:
+    descriptor_has_type = _validate_retrieval_schema(source)
+    try:
+        image_rows = source.execute(
+            "SELECT image_id, name FROM images ORDER BY name"
+        ).fetchall()
+    except sqlite3.Error as exc:
+        raise ColmapCliError("retrieval database has an invalid images table") from exc
+    images = [_RetrievalImage(int(image_id), str(name)) for image_id, name in image_rows]
+    if len(images) < 2:
+        raise ColmapCliError("retrieval database contains fewer than two images")
+    image_ids = [int(image.image_id) for image in images]
+    image_names = [str(image.name) for image in images]
+    if len(set(image_ids)) != len(image_ids):
+        raise ColmapCliError("retrieval database contains duplicate image identifiers")
+    if len(set(image_names)) != len(image_names) or any(
+        not name or any(character.isspace() for character in name)
+        for name in image_names
+    ):
+        raise ColmapCliError("retrieval database contains invalid image names")
+
+    camera = pycolmap.Camera(
+        model="SIMPLE_PINHOLE",
+        width=1,
+        height=1,
+        params=[1.0, 0.5, 0.5],
+        camera_id=1,
+    )
+    retrieval_database.write_camera(camera, use_camera_id=True)
+    selected_counts: list[tuple[_RetrievalImage, int]] = []
+    usable_images = 0
+    for image in sorted(images, key=lambda value: str(value.name)):
+        retrieval_database.write_image(
+            pycolmap.Image(
+                name=str(image.name),
+                camera_id=1,
+                image_id=int(image.image_id),
+            ),
+            use_image_id=True,
+        )
+        selected_keypoints, selected_descriptors = _selected_retrieval_features(
+            source,
+            image,
+            descriptor_has_type=descriptor_has_type,
+            max_features_per_image=max_features_per_image,
+        )
+        retrieval_database.write_keypoints(int(image.image_id), selected_keypoints)
+        retrieval_database.write_descriptors(
+            int(image.image_id),
+            pycolmap.FeatureDescriptors(
+                pycolmap.FeatureExtractorType.SIFT,
+                selected_descriptors,
+            ),
+        )
+        if selected_descriptors.shape[0] == 0:
+            continue
+        selected_counts.append((image, int(selected_descriptors.shape[0])))
+        usable_images += 1
+    if usable_images < 2:
+        raise ColmapCliError("retrieval requires two images with usable features")
+
+    total_descriptors = sum(count for _, count in selected_counts)
+    training_count = min(total_descriptors, max_training_descriptors)
+    if training_count == total_descriptors:
+        sampled_positions = np.arange(training_count, dtype=np.int64)
+    elif training_count == 1:
+        sampled_positions = np.asarray([0], dtype=np.int64)
+    else:
+        sampled_positions = (
+            np.arange(training_count, dtype=np.int64)
+            * (total_descriptors - 1)
+            // (training_count - 1)
+        )
+    training = np.empty((training_count, 128), dtype=np.uint8)
+    source_offset = 0
+    destination_offset = 0
+    for image, descriptor_count in selected_counts:
+        source_end = source_offset + descriptor_count
+        first = int(np.searchsorted(sampled_positions, source_offset, side="left"))
+        last = int(np.searchsorted(sampled_positions, source_end, side="left"))
+        if first < last:
+            _, selected_descriptors = _selected_retrieval_features(
+                source,
+                image,
+                descriptor_has_type=descriptor_has_type,
+                max_features_per_image=max_features_per_image,
+            )
+            local_rows = sampled_positions[first:last] - source_offset
+            destination_end = destination_offset + len(local_rows)
+            training[destination_offset:destination_end] = selected_descriptors[
+                local_rows
+            ]
+            destination_offset = destination_end
+        source_offset = source_end
+    if destination_offset != training_count:
+        raise ColmapCliError("retrieval training sampling was incomplete")
+    return images, training
+
+
+def _regular_input_path(value: str, label: str) -> Path:
+    path = Path(value)
+    if not path.is_absolute():
+        raise ColmapCliError(f"{label} must be an absolute path")
+    try:
+        mode = path.lstat().st_mode
+    except OSError as exc:
+        raise ColmapCliError(f"could not inspect {label}: {path}") from exc
+    if not stat.S_ISREG(mode):
+        raise ColmapCliError(f"{label} is not a regular file: {path}")
+    return path
+
+
+def _safe_output_path(value: str) -> Path:
+    output = Path(value)
+    if not output.is_absolute():
+        raise ColmapCliError("output pair list path must be absolute")
+    try:
+        parent_mode = output.parent.lstat().st_mode
+    except OSError as exc:
+        raise ColmapCliError(
+            f"could not inspect output pair list directory: {output.parent}"
+        ) from exc
+    if not stat.S_ISDIR(parent_mode):
+        raise ColmapCliError(
+            f"output pair list directory is not a directory: {output.parent}"
+        )
+    try:
+        output_mode = output.lstat().st_mode
+    except FileNotFoundError:
+        return output
+    except OSError as exc:
+        raise ColmapCliError(f"could not inspect output pair list: {output}") from exc
+    if not stat.S_ISREG(output_mode):
+        raise ColmapCliError(f"output pair list is not a regular file: {output}")
+    return output
+
+
+def _query_image_ids(
+    database_images: list[Any], query_image_list_path: str | None
+) -> list[int]:
+    images_by_name = {str(image.name): int(image.image_id) for image in database_images}
+    if len(images_by_name) != len(database_images):
+        raise ColmapCliError("retrieval database contains duplicate image names")
+    if query_image_list_path is None:
+        return [
+            int(image.image_id)
+            for image in sorted(database_images, key=lambda value: str(value.name))
+        ]
+    path = _regular_input_path(query_image_list_path, "query image list")
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except (OSError, UnicodeError) as exc:
+        raise ColmapCliError(f"could not read query image list: {path}") from exc
+    query_ids: list[int] = []
+    seen: set[str] = set()
+    for line in lines:
+        name = line.strip()
+        if not name or name.startswith("#") or name in seen:
+            continue
+        image_id = images_by_name.get(name)
+        if image_id is None:
+            raise ColmapCliError(f"query image is absent from database: {name}")
+        seen.add(name)
+        query_ids.append(image_id)
+    if not query_ids:
+        raise ColmapCliError("query image list did not contain any database images")
+    return query_ids
+
+
+def _atomic_write_pair_lines(output: Path, lines: list[str]) -> None:
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=f".{output.name}.", suffix=".tmp", dir=output.parent
+    )
+    temporary = Path(temporary_name)
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8", newline="\n") as stream:
+            if lines:
+                stream.write("\n".join(lines) + "\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, output)
+        try:
+            directory = os.open(output.parent, os.O_RDONLY)
+            try:
+                os.fsync(directory)
+            finally:
+                os.close(directory)
+        except OSError:
+            pass
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def _run_local_vocab_retriever(pycolmap: Any, options: dict[str, str]) -> str:
+    num_images = _bounded_integer(options, "num_images", 20, 1, 256)
+    returned_count = _bounded_integer(
+        options, "returned_neighbor_count", 8, 1, 64
+    )
+    if returned_count > num_images:
+        raise ColmapCliError(
+            "--returned_neighbor_count cannot exceed --num_images"
+        )
+    minimum_separation = _bounded_integer(
+        options, "minimum_frame_separation", 0, 0, 1_000_000
+    )
+    num_visual_words = _bounded_integer(
+        options, "num_visual_words", 512, 2, 8192
+    )
+    max_features = _bounded_integer(
+        options, "max_features_per_image", 512, 2, 8192
+    )
+    max_training = _bounded_integer(
+        options, "max_training_descriptors", 65536, 512, 262144
+    )
+    num_iterations = _bounded_integer(options, "num_iterations", 10, 1, 100)
+    num_rounds = _bounded_integer(options, "num_rounds", 1, 1, 3)
+    num_checks = _bounded_integer(options, "num_checks", 64, 1, 1024)
+    num_threads = _integer(options, "num_threads", -1)
+    if num_threads == 0 or num_threads < -1 or num_threads > 64:
+        raise ColmapCliError("--num_threads must be -1 or between 1 and 64")
+
+    database_value = _required(options, "database_path")
+    output_value = _required(options, "output_pair_list_path")
+    required_api = (
+        "Database",
+        "Camera",
+        "Image",
+        "FeatureDescriptors",
+        "FeatureExtractorType",
+        "VisualIndex",
+        "VocabTreePairingOptions",
+        "VocabTreePairGenerator",
+    )
+    if any(not hasattr(pycolmap, name) for name in required_api):
+        raise ColmapCliError(
+            "PyCOLMAP VisualIndex and VocabTreePairGenerator APIs are required"
+        )
+    database_path = _regular_input_path(database_value, "database path")
+    output_path = _safe_output_path(output_value)
+
+    source_database = _readonly_feature_database(database_path)
+    database: Any | None = None
+    vocabulary_path: Path | None = None
+    try:
+        database = pycolmap.Database.open(":memory:")
+        images, training = _populate_retrieval_database(
+            pycolmap,
+            source_database,
+            database,
+            max_features_per_image=max_features,
+            max_training_descriptors=max_training,
+        )
+        query_ids = _query_image_ids(images, options.get("query_image_list_path"))
+        names_to_ids = {str(image.name): int(image.image_id) for image in images}
+        excluded_pairs: set[tuple[int, int]] = set()
+        excluded_path = options.get("excluded_pair_list_path")
+        if excluded_path is not None:
+            path = _regular_input_path(excluded_path, "excluded pair list")
+            for first_name, second_name in _read_pairs(str(path), allow_empty=True):
+                first_id = names_to_ids.get(first_name)
+                second_id = names_to_ids.get(second_name)
+                if first_id is None or second_id is None:
+                    raise ColmapCliError(
+                        "excluded pair list contains an image absent from the database"
+                    )
+                excluded_pairs.add((min(first_id, second_id), max(first_id, second_id)))
+        ordered_images = sorted(images, key=lambda value: str(value.name))
+        order_by_id = {
+            int(image.image_id): index for index, image in enumerate(ordered_images)
+        }
+        name_by_id = {
+            int(image.image_id): str(image.name) for image in ordered_images
+        }
+        excluded_neighbors: dict[int, set[int]] = {}
+        for first_id, second_id in excluded_pairs:
+            excluded_neighbors.setdefault(first_id, set()).add(second_id)
+            excluded_neighbors.setdefault(second_id, set()).add(first_id)
+        maximum_filtered_count = 0
+        for query_id in query_ids:
+            query_order = order_by_id[query_id]
+            filtered_ids = set(excluded_neighbors.get(query_id, ()))
+            filtered_ids.add(query_id)
+            if minimum_separation > 0:
+                first_order = max(0, query_order - minimum_separation + 1)
+                last_order = min(
+                    len(ordered_images), query_order + minimum_separation
+                )
+                filtered_ids.update(
+                    int(image.image_id)
+                    for image in ordered_images[first_order:last_order]
+                )
+            maximum_filtered_count = max(
+                maximum_filtered_count, len(filtered_ids)
+            )
+        effective_words = min(num_visual_words, int(training.shape[0]))
+        float_descriptors = pycolmap.FeatureDescriptors(
+            pycolmap.FeatureExtractorType.SIFT, training
+        ).to_float()
+        visual_index = pycolmap.VisualIndex.create(128, 64)
+        build = pycolmap.VisualIndex.BuildOptions()
+        build.num_visual_words = effective_words
+        build.num_iterations = num_iterations
+        build.num_rounds = num_rounds
+        build.num_checks = min(num_checks, effective_words)
+        build.num_threads = num_threads
+        # The pinned COLMAP/FAISS build fixes clustering seed 1234. Stable image,
+        # feature, and training-row order completes the determinism contract.
+        visual_index.build(build, float_descriptors)
+
+        vocabulary_descriptor, vocabulary_name = tempfile.mkstemp(
+            prefix=f".{output_path.name}.vocab-",
+            suffix=".bin",
+            dir=output_path.parent,
+        )
+        os.close(vocabulary_descriptor)
+        vocabulary_path = Path(vocabulary_name)
+        visual_index.write(vocabulary_path)
+
+        pairing = pycolmap.VocabTreePairingOptions()
+        pairing.vocab_tree_path = vocabulary_path
+        pairing.num_images = min(
+            len(images), num_images + maximum_filtered_count
+        )
+        pairing.num_nearest_neighbors = 5
+        pairing.num_checks = min(num_checks, effective_words)
+        pairing.num_images_after_verification = 0
+        pairing.max_num_features = max_features
+        pairing.num_threads = num_threads
+        generated = pycolmap.VocabTreePairGenerator(
+            pairing, database, query_ids
+        ).all_pairs()
+
+        query_set = set(query_ids)
+        ranked: dict[int, list[int]] = {query_id: [] for query_id in query_ids}
+        for raw_first, raw_second in generated:
+            first, second = int(raw_first), int(raw_second)
+            if first in query_set:
+                query_id, candidate_id = first, second
+            elif second in query_set:
+                query_id, candidate_id = second, first
+            else:
+                raise ColmapCliError("vocabulary retrieval returned an unknown query")
+            if candidate_id not in name_by_id:
+                raise ColmapCliError("vocabulary retrieval returned an unknown image")
+            candidates = ranked[query_id]
+            if candidate_id == query_id or candidate_id in candidates:
+                continue
+            if (
+                abs(order_by_id[query_id] - order_by_id[candidate_id])
+                < minimum_separation
+            ):
+                continue
+            if (
+                min(query_id, candidate_id),
+                max(query_id, candidate_id),
+            ) in excluded_pairs:
+                continue
+            if len(candidates) < returned_count:
+                candidates.append(candidate_id)
+
+        pair_lines: list[str] = []
+        emitted_edges: set[tuple[int, int]] = set()
+        for query_id in query_ids:
+            for candidate_id in ranked[query_id]:
+                edge = (min(query_id, candidate_id), max(query_id, candidate_id))
+                if edge in emitted_edges:
+                    continue
+                emitted_edges.add(edge)
+                pair_lines.append(
+                    f"{name_by_id[query_id]} {name_by_id[candidate_id]}"
+                )
+        pair_lines.sort()
+        _atomic_write_pair_lines(output_path, pair_lines)
+        return f"Retrieved image pairs: {len(pair_lines)}"
+    finally:
+        if vocabulary_path is not None:
+            vocabulary_path.unlink(missing_ok=True)
+        source_database.close()
+        if database is not None:
+            database.close()
 
 
 def _incremental_options(pycolmap: Any) -> Any:
@@ -628,10 +1163,10 @@ def run_command(
     pycolmap = pycolmap_module or _load_pycolmap()
     if command == "feature_extractor":
         _run_feature_extractor(pycolmap, options)
-    elif command in {"sequential_matcher", "exhaustive_matcher"}:
-        _run_standard_matcher(pycolmap, command, options)
     elif command == "matches_importer":
         _run_matches_importer(pycolmap, options)
+    elif command == "local_vocab_retriever":
+        return _run_local_vocab_retriever(pycolmap, options)
     elif command == "mapper":
         _run_mapper(pycolmap, options)
     elif command == "point_triangulator":

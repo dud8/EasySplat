@@ -47,6 +47,13 @@ final class RunPlanResolverTests: XCTestCase {
         XCTAssertEqual(plan.capturePath, .automatic)
         XCTAssertEqual(plan.inputOrdering, .unordered)
         XCTAssertEqual(plan.pairingPolicy, .unorderedRetrieval)
+        XCTAssertEqual(plan.temporalPairing, .none)
+        XCTAssertEqual(plan.temporalOffsets, [])
+        XCTAssertEqual(plan.retrievalEngine, .localSiftVocabularyV1)
+        XCTAssertEqual(plan.retrievalCandidateCount, 20)
+        XCTAssertEqual(plan.retrievalNeighborCount, 8)
+        XCTAssertEqual(plan.retrievalQueryStride, 1)
+        XCTAssertEqual(plan.normalDescriptorMatcher, .faiss)
         XCTAssertEqual(plan.cameraGrouping, .mixedCamerasOrLenses)
         XCTAssertEqual(plan.lensProjection, .automatic)
         XCTAssertEqual(plan.trainerIterationLimit, 7_000)
@@ -54,7 +61,6 @@ final class RunPlanResolverTests: XCTestCase {
         XCTAssertEqual(plan.trainerMemoryBudgetBytes, 34_789_235_097)
         XCTAssertEqual(plan.colmapMaximumFeatureCount, 10_000)
         XCTAssertEqual(plan.colmapMaximumMatchCount, 10_000)
-        XCTAssertEqual(plan.colmapExhaustiveBlockSize, 25)
         XCTAssertEqual(plan.colmapThreadLimit, 8)
         XCTAssertEqual(plan.baGlobalFramesRatio, 1.1)
         XCTAssertEqual(plan.baGlobalPointsRatio, 1.1)
@@ -134,7 +140,6 @@ final class RunPlanResolverTests: XCTestCase {
             XCTAssertEqual(plan.colmapMaximumImageDimension, 1_024)
             XCTAssertEqual(plan.colmapMaximumFeatureCount, 4_096)
             XCTAssertEqual(plan.colmapMaximumMatchCount, 4_096)
-            XCTAssertEqual(plan.colmapExhaustiveBlockSize, 10)
             XCTAssertEqual(plan.colmapThreadLimit, 4)
         }
     }
@@ -208,7 +213,6 @@ final class RunPlanResolverTests: XCTestCase {
         XCTAssertGreaterThan(performance.maximumImageDimension, constrained.maximumImageDimension)
         XCTAssertEqual(performance.colmapMaximumFeatureCount, 12_000)
         XCTAssertEqual(performance.colmapMaximumMatchCount, 12_000)
-        XCTAssertEqual(performance.colmapExhaustiveBlockSize, 32)
         XCTAssertEqual(performance.colmapThreadLimit, 10)
     }
 
@@ -339,9 +343,18 @@ final class RunPlanResolverTests: XCTestCase {
         XCTAssertEqual(largeArea.pairingPolicy, .orderedLargeArea)
         XCTAssertLessThan(orbit.keyframeBudget, walkthrough.keyframeBudget)
         XCTAssertGreaterThan(largeArea.keyframeBudget, walkthrough.keyframeBudget)
-        XCTAssertEqual(orbit.sequentialOverlap, 8)
-        XCTAssertEqual(walkthrough.sequentialOverlap, 8)
-        XCTAssertEqual(largeArea.sequentialOverlap, 16)
+        XCTAssertEqual(orbit.temporalPairing, .multiscale)
+        XCTAssertEqual(orbit.temporalOffsets, [1, 2, 4, 8, 16, 32, 64, 128])
+        XCTAssertEqual(orbit.retrievalQueryStride, 5)
+        XCTAssertEqual(orbit.retrievalNeighborCount, 2)
+        XCTAssertEqual(walkthrough.temporalPairing, .linear)
+        XCTAssertEqual(walkthrough.temporalOffsets, [1, 2, 3, 4, 5, 6])
+        XCTAssertEqual(walkthrough.retrievalQueryStride, 10)
+        XCTAssertEqual(walkthrough.retrievalNeighborCount, 2)
+        XCTAssertEqual(largeArea.temporalPairing, .multiscale)
+        XCTAssertEqual(largeArea.temporalOffsets, [1, 2, 4, 8, 16, 32, 64, 128])
+        XCTAssertEqual(largeArea.retrievalQueryStride, 10)
+        XCTAssertEqual(largeArea.retrievalNeighborCount, 4)
     }
 
     func testAutomaticOrderingDoesNotPretendSeparateClipsAreOneContinuousCapture() {
@@ -353,8 +366,12 @@ final class RunPlanResolverTests: XCTestCase {
         )
 
         XCTAssertEqual(plan.inputOrdering, .unordered)
-        XCTAssertEqual(plan.pairingPolicy, .unorderedRetrieval)
-        XCTAssertEqual(plan.sequentialOverlap, 0)
+        XCTAssertEqual(plan.pairingPolicy, .segmentedMixed)
+        XCTAssertEqual(plan.temporalPairing, .linear)
+        XCTAssertEqual(plan.temporalOffsets, [1, 2, 3, 4, 5, 6])
+        XCTAssertEqual(plan.retrievalCandidateCount, 20)
+        XCTAssertEqual(plan.retrievalNeighborCount, 8)
+        XCTAssertEqual(plan.retrievalQueryStride, 1)
         XCTAssertEqual(plan.cameraGrouping, .mixedCamerasOrLenses)
         XCTAssertEqual(plan.baGlobalFramesRatio, 1.1)
         XCTAssertEqual(plan.baGlobalPointsRatio, 1.1)
@@ -365,7 +382,9 @@ final class RunPlanResolverTests: XCTestCase {
             hardware: HardwareProfile(memoryGB: 48, cpuCount: 16, gpuWorkingSetGB: 36),
             developmentOverrides: .none
         )
-        XCTAssertEqual(mixedPlan.pairingPolicy, .unorderedRetrieval)
+        XCTAssertEqual(mixedPlan.pairingPolicy, .segmentedMixed)
+        XCTAssertEqual(mixedPlan.temporalPairing, .linear)
+        XCTAssertEqual(mixedPlan.temporalOffsets, [1, 2, 3, 4, 5, 6])
         XCTAssertEqual(mixedPlan.baGlobalFramesRatio, 1.1)
         XCTAssertEqual(mixedPlan.baGlobalPointsRatio, 1.1)
     }
@@ -381,7 +400,27 @@ final class RunPlanResolverTests: XCTestCase {
         XCTAssertEqual(plan.capturePath, .automatic)
         XCTAssertEqual(plan.inputOrdering, .continuous)
         XCTAssertEqual(plan.pairingPolicy, .orderedContinuous)
+        XCTAssertEqual(plan.temporalPairing, .multiscale)
+        XCTAssertEqual(plan.temporalOffsets, [1, 2, 4, 8, 16, 32, 64, 128])
+        XCTAssertEqual(plan.retrievalCandidateCount, 20)
+        XCTAssertEqual(plan.retrievalNeighborCount, 2)
+        XCTAssertEqual(plan.retrievalQueryStride, 10)
         XCTAssertEqual(plan.lensProjection, .automatic)
+    }
+
+    func testExplicitUnorderedInputDisablesAllTemporalAssumptions() {
+        let plan = RunPlanResolver.resolve(
+            requestedOptions: RequestedRunOptions(inputOrdering: .unordered),
+            input: .video(files: ["/tmp/clip.mov"]),
+            hardware: HardwareProfile(memoryGB: 48, cpuCount: 16, gpuWorkingSetGB: 36),
+            developmentOverrides: .none
+        )
+
+        XCTAssertEqual(plan.pairingPolicy, .unorderedRetrieval)
+        XCTAssertEqual(plan.temporalPairing, .none)
+        XCTAssertEqual(plan.temporalOffsets, [])
+        XCTAssertEqual(plan.retrievalQueryStride, 1)
+        XCTAssertEqual(plan.retrievalNeighborCount, 8)
     }
 
     func testExplicitCandidateRouteIsStrictAndBenchmarkSeedIsPersistedInPlan() {

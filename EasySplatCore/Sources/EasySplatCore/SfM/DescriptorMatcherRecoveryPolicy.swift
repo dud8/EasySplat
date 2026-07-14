@@ -16,11 +16,7 @@ enum DescriptorMatcherRecoveryPolicy {
         SIGSEGV,
     ]
 
-    private static let matchingCommands: Set<String> = [
-        "sequential_matcher",
-        "exhaustive_matcher",
-        "matches_importer",
-    ]
+    private static let matchingCommands: Set<String> = ["matches_importer"]
 
     static func reason(
         for error: Error,

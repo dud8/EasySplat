@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import contextlib
 import io
+import os
+import sqlite3
 import sys
 import tempfile
 import types
@@ -71,9 +73,56 @@ class _IncrementalPipelineOptions:
 
 
 class _Image:
-    def __init__(self, image_id: int, name: str) -> None:
+    def __init__(
+        self,
+        image_id: int,
+        name: str,
+        camera_id: int = 1,
+    ) -> None:
         self.image_id = image_id
         self.name = name
+        self.camera_id = camera_id
+
+
+class _FeatureDescriptors:
+    def __init__(self, feature_type: object, data: np.ndarray) -> None:
+        self.feature_type = feature_type
+        self.data = np.asarray(data)
+
+    def to_float(self) -> "_FeatureDescriptors":
+        return self
+
+
+class _RetrievalDatabase:
+    def __init__(self) -> None:
+        self.closed = False
+        self.cameras: list[object] = []
+        self.images: list[_Image] = []
+        self.keypoints: dict[int, np.ndarray] = {}
+        self.descriptors: dict[int, np.ndarray] = {}
+
+    def write_camera(self, camera: object, *, use_camera_id: bool) -> None:
+        if not use_camera_id:
+            raise AssertionError("camera ID must be preserved")
+        self.cameras.append(camera)
+
+    def write_image(self, image: _Image, *, use_image_id: bool) -> None:
+        if not use_image_id:
+            raise AssertionError("image ID must be preserved")
+        self.images.append(image)
+
+    def write_keypoints(self, image_id: int, keypoints: np.ndarray) -> None:
+        self.keypoints[image_id] = np.asarray(keypoints)
+
+    def write_descriptors(
+        self,
+        image_id: int,
+        descriptors: _FeatureDescriptors,
+    ) -> None:
+        self.descriptors[image_id] = np.asarray(descriptors.data)
+
+    def close(self) -> None:
+        self.closed = True
 
 
 class _Database:
@@ -124,6 +173,685 @@ class _FeatureDatabase:
 
 
 class ColmapCliTests(unittest.TestCase):
+    def _write_retrieval_source(
+        self,
+        path: Path,
+        images: list[_Image],
+        *,
+        feature_rows: int = 130,
+        blank_images: set[str] | None = None,
+        shared_descriptors: bool = False,
+    ) -> None:
+        blank_images = blank_images or set()
+        database = sqlite3.connect(path)
+        try:
+            database.executescript(
+                """
+                CREATE TABLE images(image_id INTEGER PRIMARY KEY, name TEXT NOT NULL);
+                CREATE TABLE keypoints(
+                    image_id INTEGER PRIMARY KEY,
+                    rows INTEGER NOT NULL,
+                    cols INTEGER NOT NULL,
+                    data BLOB
+                );
+                CREATE TABLE descriptors(
+                    image_id INTEGER PRIMARY KEY,
+                    rows INTEGER NOT NULL,
+                    cols INTEGER NOT NULL,
+                    data BLOB
+                );
+                PRAGMA user_version = 3900;
+                """
+            )
+            for image in images:
+                image_feature_rows = 0 if image.name in blank_images else feature_rows
+                keypoints = np.asarray(
+                    [
+                        [0.0, 0.0, float(row + 1), 0.0]
+                        for row in range(image_feature_rows)
+                    ],
+                    dtype=np.float32,
+                ).reshape(image_feature_rows, 4)
+                if shared_descriptors:
+                    rows = np.arange(image_feature_rows, dtype=np.uint16)[:, None]
+                    columns = np.arange(128, dtype=np.uint16)[None, :]
+                    descriptors = ((rows * 17 + columns * 13) % 256).astype(
+                        np.uint8
+                    )
+                else:
+                    descriptors = np.full(
+                        (image_feature_rows, 128),
+                        image.image_id,
+                        dtype=np.uint8,
+                    )
+                database.execute(
+                    "INSERT INTO images(image_id, name) VALUES (?, ?)",
+                    (image.image_id, image.name),
+                )
+                database.execute(
+                    "INSERT INTO keypoints(image_id, rows, cols, data) VALUES (?, ?, ?, ?)",
+                    (
+                        image.image_id,
+                        keypoints.shape[0],
+                        keypoints.shape[1],
+                        keypoints.tobytes(),
+                    ),
+                )
+                database.execute(
+                    "INSERT INTO descriptors(image_id, rows, cols, data) VALUES (?, ?, ?, ?)",
+                    (
+                        image.image_id,
+                        descriptors.shape[0],
+                        descriptors.shape[1],
+                        descriptors.tobytes(),
+                    ),
+                )
+            database.commit()
+        finally:
+            database.close()
+
+    def _retrieval_pycolmap(
+        self,
+        database: _RetrievalDatabase,
+        *,
+        visual_index: object,
+        pair_generator: object,
+    ) -> object:
+        class DatabaseFactory:
+            @staticmethod
+            def open(path: str) -> _RetrievalDatabase:
+                if path != ":memory:":
+                    raise AssertionError(f"canonical database was opened by PyCOLMAP: {path}")
+                return database
+
+        return types.SimpleNamespace(
+            Database=DatabaseFactory,
+            Camera=lambda **values: types.SimpleNamespace(**values),
+            Image=lambda **values: _Image(
+                values["image_id"],
+                values["name"],
+                values["camera_id"],
+            ),
+            FeatureDescriptors=_FeatureDescriptors,
+            FeatureExtractorType=types.SimpleNamespace(SIFT="sift"),
+            VisualIndex=visual_index,
+            VocabTreePairingOptions=_Options,
+            VocabTreePairGenerator=pair_generator,
+        )
+
+    def test_real_pycolmap_local_vocab_retrieval_is_deterministic(self) -> None:
+        try:
+            import pycolmap
+        except ImportError:
+            if os.environ.get("EASYSPLAT_REQUIRE_REAL_PYCOLMAP") == "1":
+                self.fail("the packaged toolchain is missing PyCOLMAP")
+            self.skipTest("real PyCOLMAP is exercised while packaging the toolchain")
+
+        self.assertEqual(pycolmap.__version__, "4.1.0")
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "database.db"
+            images = [
+                _Image(index + 1, f"image_{index:02d}.jpg")
+                for index in range(4)
+            ]
+            self._write_retrieval_source(
+                source,
+                images,
+                feature_rows=32,
+                shared_descriptors=True,
+            )
+            queries = root / "queries.txt"
+            queries.write_text("image_00.jpg\n", encoding="utf-8")
+
+            outputs: list[bytes] = []
+            for run in range(2):
+                output = root / f"pairs_{run}.txt"
+                report = colmap_cli.run_command(
+                    "local_vocab_retriever",
+                    {
+                        "database_path": str(source),
+                        "output_pair_list_path": str(output),
+                        "query_image_list_path": str(queries),
+                        "num_images": "3",
+                        "returned_neighbor_count": "2",
+                        "minimum_frame_separation": "0",
+                        "num_visual_words": "8",
+                        "max_features_per_image": "32",
+                        "max_training_descriptors": "512",
+                        "num_iterations": "5",
+                        "num_rounds": "1",
+                        "num_checks": "8",
+                        "num_threads": "2",
+                    },
+                    pycolmap_module=pycolmap,
+                )
+                outputs.append(output.read_bytes())
+                self.assertEqual(report, "Retrieved image pairs: 2")
+
+            self.assertTrue(outputs[0])
+            self.assertEqual(outputs[0], outputs[1])
+
+    def test_local_vocab_retriever_options_are_explicit_and_offline(self) -> None:
+        parsed = colmap_cli._parse_options(
+            "local_vocab_retriever",
+            [
+                "--database_path",
+                "/tmp/database.db",
+                "--output_pair_list_path",
+                "/tmp/pairs.txt",
+                "--query_image_list_path",
+                "/tmp/queries.txt",
+                "--excluded_pair_list_path",
+                "/tmp/excluded.txt",
+                "--num_images",
+                "40",
+                "--returned_neighbor_count",
+                "16",
+                "--minimum_frame_separation",
+                "25",
+                "--num_visual_words",
+                "1024",
+                "--max_features_per_image",
+                "768",
+                "--max_training_descriptors",
+                "131072",
+                "--num_iterations",
+                "20",
+                "--num_rounds",
+                "2",
+                "--num_checks",
+                "128",
+                "--num_threads",
+                "8",
+            ],
+        )
+
+        self.assertEqual(parsed["returned_neighbor_count"], "16")
+        self.assertEqual(parsed["minimum_frame_separation"], "25")
+        self.assertEqual(parsed["excluded_pair_list_path"], "/tmp/excluded.txt")
+        self.assertNotIn("vocab_tree_path", parsed)
+
+        stderr = io.StringIO()
+        with (
+            mock.patch.object(
+                colmap_cli,
+                "_load_pycolmap",
+                side_effect=AssertionError("invalid options imported pycolmap"),
+            ),
+            contextlib.redirect_stderr(stderr),
+        ):
+            result = colmap_cli.main(
+                [
+                    "local_vocab_retriever",
+                    "--database_path",
+                    "/tmp/database.db",
+                    "--output_pair_list_path",
+                    "/tmp/pairs.txt",
+                    "--vocab_tree_path",
+                    "https://example.invalid/tree.bin",
+                ]
+            )
+        self.assertEqual(result, 2)
+        self.assertIn("unrecognized option", stderr.getvalue())
+
+    def test_largest_scale_selection_is_stable_when_scales_tie(self) -> None:
+        keypoints = np.asarray(
+            [
+                [0.0, 0.0, 2.0, 0.0],
+                [0.0, 0.0, 3.0, 0.0],
+                [0.0, 0.0, 3.0, 0.0],
+                [0.0, 0.0, 1.0, 0.0],
+            ],
+            dtype=np.float32,
+        )
+
+        rows = colmap_cli._largest_scale_rows(keypoints, 3)
+
+        np.testing.assert_array_equal(rows, np.asarray([1, 2, 0]))
+
+    def test_in_memory_retrieval_database_is_capped_and_evenly_sampled(self) -> None:
+        images = [_Image(20, "z.jpg"), _Image(10, "a.jpg")]
+        with tempfile.TemporaryDirectory() as temp_dir:
+            source_path = Path(temp_dir) / "database.db"
+            self._write_retrieval_source(source_path, images, feature_rows=4)
+            source = colmap_cli._readonly_feature_database(source_path)
+            retrieval = _RetrievalDatabase()
+            try:
+                with mock.patch.object(
+                    colmap_cli.np,
+                    "concatenate",
+                    side_effect=AssertionError("training collection exceeded its cap"),
+                ):
+                    populated_images, training = colmap_cli._populate_retrieval_database(
+                        types.SimpleNamespace(
+                            Camera=lambda **values: types.SimpleNamespace(**values),
+                            Image=lambda **values: _Image(
+                                values["image_id"],
+                                values["name"],
+                                values["camera_id"],
+                            ),
+                            FeatureDescriptors=_FeatureDescriptors,
+                            FeatureExtractorType=types.SimpleNamespace(SIFT="sift"),
+                        ),
+                        source,
+                        retrieval,
+                        max_features_per_image=3,
+                        max_training_descriptors=4,
+                    )
+            finally:
+                source.close()
+
+        self.assertEqual([image.name for image in populated_images], ["a.jpg", "z.jpg"])
+        self.assertEqual(retrieval.keypoints[10].shape, (3, 4))
+        self.assertEqual(retrieval.descriptors[20].shape, (3, 128))
+        np.testing.assert_array_equal(training[:, 0], np.asarray([10, 10, 20, 20]))
+
+    def test_in_memory_retrieval_database_types_blank_image_features(self) -> None:
+        images = [
+            _Image(1, "a.jpg"),
+            _Image(2, "blank.jpg"),
+            _Image(3, "c.jpg"),
+        ]
+        with tempfile.TemporaryDirectory() as temp_dir:
+            source_path = Path(temp_dir) / "database.db"
+            self._write_retrieval_source(
+                source_path,
+                images,
+                feature_rows=4,
+                blank_images={"blank.jpg"},
+            )
+            source = colmap_cli._readonly_feature_database(source_path)
+            retrieval = _RetrievalDatabase()
+            try:
+                populated_images, training = colmap_cli._populate_retrieval_database(
+                    types.SimpleNamespace(
+                        Camera=lambda **values: types.SimpleNamespace(**values),
+                        Image=lambda **values: _Image(
+                            values["image_id"],
+                            values["name"],
+                            values["camera_id"],
+                        ),
+                        FeatureDescriptors=_FeatureDescriptors,
+                        FeatureExtractorType=types.SimpleNamespace(SIFT="sift"),
+                    ),
+                    source,
+                    retrieval,
+                    max_features_per_image=3,
+                    max_training_descriptors=6,
+                )
+            finally:
+                source.close()
+
+        self.assertEqual(
+            [image.name for image in populated_images],
+            ["a.jpg", "blank.jpg", "c.jpg"],
+        )
+        self.assertEqual(retrieval.keypoints[2].shape, (0, 4))
+        self.assertEqual(retrieval.descriptors[2].shape, (0, 128))
+        self.assertEqual(training.shape, (6, 128))
+
+    def test_missing_blank_keypoint_row_normalizes_to_colmap_shape(self) -> None:
+        image = _Image(2, "blank.jpg")
+        with tempfile.TemporaryDirectory() as temp_dir:
+            source_path = Path(temp_dir) / "database.db"
+            self._write_retrieval_source(
+                source_path,
+                [image, _Image(3, "usable.jpg")],
+                feature_rows=4,
+                blank_images={"blank.jpg"},
+            )
+            with contextlib.closing(sqlite3.connect(source_path)) as database:
+                database.execute("DELETE FROM keypoints WHERE image_id = 2")
+                database.commit()
+
+            source = colmap_cli._readonly_feature_database(source_path)
+            try:
+                keypoints, descriptors = colmap_cli._selected_retrieval_features(
+                    source,
+                    image,
+                    descriptor_has_type=False,
+                    max_features_per_image=3,
+                )
+            finally:
+                source.close()
+
+        self.assertEqual(keypoints.shape, (0, 4))
+        self.assertEqual(descriptors.shape, (0, 128))
+
+    def test_local_vocab_retriever_builds_local_index_and_atomically_writes_pairs(
+        self,
+    ) -> None:
+        images = [
+            _Image(4, "d.jpg"),
+            _Image(2, "b.jpg"),
+            _Image(5, "e.jpg"),
+            _Image(1, "a.jpg"),
+            _Image(3, "c.jpg"),
+        ]
+
+        database = _RetrievalDatabase()
+        test_case = self
+        build_calls: list[tuple[object, _FeatureDescriptors]] = []
+        pairing_calls: list[tuple[object, list[int]]] = []
+
+        class VisualIndex:
+            BuildOptions = _Options
+
+            @staticmethod
+            def create(descriptor_dimension: int, embedding_dimension: int) -> "VisualIndex":
+                self.assertEqual((descriptor_dimension, embedding_dimension), (128, 64))
+                return VisualIndex()
+
+            def build(self, options: object, descriptors: _FeatureDescriptors) -> None:
+                build_calls.append((options, descriptors))
+
+            def write(self, path: str | Path) -> None:
+                Path(path).write_bytes(b"local visual index")
+
+        class PairGenerator:
+            def __init__(
+                self,
+                options: object,
+                opened_database: _RetrievalDatabase,
+                query_image_ids: list[int],
+            ) -> None:
+                test_case.assertIs(opened_database, database)
+                test_case.assertTrue(Path(options.vocab_tree_path).is_file())
+                test_case.assertNotIn("://", str(options.vocab_tree_path))
+                pairing_calls.append((options, list(query_image_ids)))
+
+            def all_pairs(self) -> list[tuple[int, int]]:
+                return [
+                    (4, 4),
+                    (4, 1),  # excluded; must not consume a retained slot
+                    (4, 2),
+                    (4, 5),
+                    (1, 1),
+                    (1, 5),
+                    (1, 4),  # excluded; must not consume a retained slot
+                    (1, 3),
+                ]
+
+        pycolmap = self._retrieval_pycolmap(
+            database,
+            visual_index=VisualIndex,
+            pair_generator=PairGenerator,
+        )
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            database_path = root / "database.db"
+            self._write_retrieval_source(database_path, images)
+            source_bytes = database_path.read_bytes()
+            source_stat = database_path.stat()
+            queries = root / "queries.txt"
+            queries.write_text("d.jpg\na.jpg\n", encoding="utf-8")
+            exclusions = root / "excluded.txt"
+            exclusions.write_text("a.jpg d.jpg\n", encoding="utf-8")
+            output = root / "pairs.txt"
+            output.write_text("old output\n", encoding="utf-8")
+            real_replace = os.replace
+            replacements: list[tuple[Path, Path]] = []
+
+            def replace(source: str | Path, destination: str | Path) -> None:
+                replacements.append((Path(source), Path(destination)))
+                self.assertEqual(Path(source).parent, output.parent)
+                self.assertEqual(Path(destination), output)
+                real_replace(source, destination)
+
+            with mock.patch.object(colmap_cli.os, "replace", side_effect=replace):
+                report = colmap_cli.run_command(
+                    "local_vocab_retriever",
+                    {
+                        "database_path": str(database_path),
+                        "output_pair_list_path": str(output),
+                        "query_image_list_path": str(queries),
+                        "excluded_pair_list_path": str(exclusions),
+                        "num_images": "3",
+                        "returned_neighbor_count": "2",
+                        "minimum_frame_separation": "1",
+                    },
+                    pycolmap_module=pycolmap,
+                )
+
+            self.assertEqual(
+                output.read_text(encoding="utf-8"),
+                "a.jpg c.jpg\na.jpg e.jpg\nd.jpg b.jpg\nd.jpg e.jpg\n",
+            )
+            self.assertEqual(len(replacements), 1)
+            self.assertEqual(database_path.read_bytes(), source_bytes)
+            self.assertEqual(database_path.stat().st_mtime_ns, source_stat.st_mtime_ns)
+            with contextlib.closing(sqlite3.connect(database_path)) as source:
+                self.assertEqual(source.execute("PRAGMA user_version").fetchone(), (3900,))
+
+        self.assertTrue(database.closed)
+        self.assertEqual(report, "Retrieved image pairs: 4")
+        self.assertEqual(len(build_calls), 1)
+        build_options, training = build_calls[0]
+        self.assertEqual(build_options.num_visual_words, 512)
+        self.assertEqual(build_options.num_iterations, 10)
+        self.assertEqual(build_options.num_rounds, 1)
+        self.assertEqual(build_options.num_checks, 64)
+        self.assertEqual(build_options.num_threads, -1)
+        self.assertEqual(training.feature_type, "sift")
+        self.assertEqual(training.data.shape, (650, 128))
+        pairing_options, query_ids = pairing_calls[0]
+        self.assertEqual(query_ids, [4, 1])
+        # Retrieval overfetches the requested candidate pool so excluded and
+        # nearby images cannot crowd every useful revisit out of the raw result.
+        self.assertEqual(pairing_options.num_images, 5)
+        self.assertEqual(pairing_options.num_images_after_verification, 0)
+        self.assertEqual(pairing_options.max_num_features, 512)
+        self.assertEqual(pairing_options.num_checks, 64)
+
+    def test_local_vocab_retriever_emits_mutual_pair_only_once(self) -> None:
+        images = [_Image(1, "a.jpg"), _Image(2, "b.jpg"), _Image(3, "c.jpg")]
+        database = _RetrievalDatabase()
+
+        class VisualIndex:
+            BuildOptions = _Options
+
+            @staticmethod
+            def create(*args: object) -> "VisualIndex":
+                return VisualIndex()
+
+            def build(self, *args: object) -> None:
+                pass
+
+            def write(self, path: str | Path) -> None:
+                Path(path).write_bytes(b"vocab")
+
+        class PairGenerator:
+            def __init__(self, *args: object) -> None:
+                pass
+
+            def all_pairs(self) -> list[tuple[int, int]]:
+                return [(1, 2), (2, 1), (2, 3)]
+
+        pycolmap = self._retrieval_pycolmap(
+            database,
+            visual_index=VisualIndex,
+            pair_generator=PairGenerator,
+        )
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            database_path = root / "database.db"
+            self._write_retrieval_source(database_path, images)
+            output = root / "pairs.txt"
+
+            colmap_cli.run_command(
+                "local_vocab_retriever",
+                {
+                    "database_path": str(database_path),
+                    "output_pair_list_path": str(output),
+                    "num_images": "2",
+                    "returned_neighbor_count": "2",
+                },
+                pycolmap_module=pycolmap,
+            )
+
+            self.assertEqual(
+                output.read_text(encoding="utf-8"),
+                "a.jpg b.jpg\nb.jpg c.jpg\n",
+            )
+
+    def test_local_vocab_retriever_preserves_old_output_when_retrieval_fails(
+        self,
+    ) -> None:
+        database = _RetrievalDatabase()
+
+        class VisualIndex:
+            BuildOptions = _Options
+
+            @staticmethod
+            def create(*args: object) -> "VisualIndex":
+                return VisualIndex()
+
+            def build(self, *args: object) -> None:
+                pass
+
+            def write(self, path: str | Path) -> None:
+                Path(path).write_bytes(b"vocab")
+
+        class PairGenerator:
+            def __init__(self, *args: object) -> None:
+                pass
+
+            def all_pairs(self) -> list[tuple[int, int]]:
+                raise RuntimeError("retrieval failed")
+
+        pycolmap = self._retrieval_pycolmap(
+            database,
+            visual_index=VisualIndex,
+            pair_generator=PairGenerator,
+        )
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            database_path = root / "database.db"
+            self._write_retrieval_source(
+                database_path,
+                [_Image(1, "a.jpg"), _Image(2, "b.jpg")],
+                feature_rows=300,
+            )
+            output = root / "pairs.txt"
+            output.write_text("prior\n", encoding="utf-8")
+
+            with self.assertRaisesRegex(RuntimeError, "retrieval failed"):
+                colmap_cli.run_command(
+                    "local_vocab_retriever",
+                    {
+                        "database_path": str(database_path),
+                        "output_pair_list_path": str(output),
+                    },
+                    pycolmap_module=pycolmap,
+                )
+
+            self.assertEqual(output.read_text(encoding="utf-8"), "prior\n")
+            self.assertEqual(
+                sorted(path.name for path in root.iterdir()),
+                ["database.db", "pairs.txt"],
+            )
+
+        self.assertTrue(database.closed)
+
+    def test_local_vocab_retriever_rejects_unsafe_bounds_and_missing_api(self) -> None:
+        common = {
+            "database_path": "/tmp/database.db",
+            "output_pair_list_path": "/tmp/pairs.txt",
+        }
+        cases = {
+            "num_images": ("0", "257"),
+            "returned_neighbor_count": ("0", "65"),
+            "minimum_frame_separation": ("-1", "1000001"),
+            "num_visual_words": ("1", "8193"),
+            "max_features_per_image": ("1", "8193"),
+            "max_training_descriptors": ("511", "262145"),
+            "num_iterations": ("0", "101"),
+            "num_rounds": ("0", "4"),
+            "num_checks": ("0", "1025"),
+            "num_threads": ("0", "-2", "65"),
+        }
+        pycolmap = types.SimpleNamespace()
+
+        for name, values in cases.items():
+            for value in values:
+                with (
+                    self.subTest(name=name, value=value),
+                    self.assertRaisesRegex(colmap_cli.ColmapCliError, name),
+                ):
+                    colmap_cli.run_command(
+                        "local_vocab_retriever",
+                        common | {name: value},
+                        pycolmap_module=pycolmap,
+                    )
+
+        with self.assertRaisesRegex(
+            colmap_cli.ColmapCliError,
+            "PyCOLMAP VisualIndex and VocabTreePairGenerator APIs are required",
+        ):
+            colmap_cli.run_command(
+                "local_vocab_retriever",
+                common,
+                pycolmap_module=types.SimpleNamespace(Database=object()),
+            )
+
+    def test_local_vocab_retriever_rejects_pending_wal_and_unknown_exclusion(
+        self,
+    ) -> None:
+        class NeverVisualIndex:
+            BuildOptions = _Options
+
+            @staticmethod
+            def create(*args: object) -> object:
+                raise AssertionError("invalid input reached vocabulary construction")
+
+        database = _RetrievalDatabase()
+        pycolmap = self._retrieval_pycolmap(
+            database,
+            visual_index=NeverVisualIndex,
+            pair_generator=object,
+        )
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            database_path = root / "database.db"
+            self._write_retrieval_source(
+                database_path,
+                [_Image(1, "a.jpg"), _Image(2, "b.jpg")],
+            )
+            output = root / "pairs.txt"
+            output.write_text("prior\n", encoding="utf-8")
+            wal = Path(f"{database_path}-wal")
+            wal.write_bytes(b"pending")
+
+            with self.assertRaisesRegex(colmap_cli.ColmapCliError, "pending SQLite wal"):
+                colmap_cli.run_command(
+                    "local_vocab_retriever",
+                    {
+                        "database_path": str(database_path),
+                        "output_pair_list_path": str(output),
+                    },
+                    pycolmap_module=pycolmap,
+                )
+            self.assertEqual(output.read_text(encoding="utf-8"), "prior\n")
+
+            wal.unlink()
+            exclusions = root / "excluded.txt"
+            exclusions.write_text("a.jpg missing.jpg\n", encoding="utf-8")
+            with self.assertRaisesRegex(colmap_cli.ColmapCliError, "absent from the database"):
+                colmap_cli.run_command(
+                    "local_vocab_retriever",
+                    {
+                        "database_path": str(database_path),
+                        "output_pair_list_path": str(output),
+                        "excluded_pair_list_path": str(exclusions),
+                    },
+                    pycolmap_module=pycolmap,
+                )
+            self.assertEqual(output.read_text(encoding="utf-8"), "prior\n")
+
     def test_runtime_requires_reviewed_pycolmap_release(self) -> None:
         reviewed = types.SimpleNamespace(__version__="4.1.0")
         with mock.patch.dict(sys.modules, {"pycolmap": reviewed}):
@@ -437,52 +1165,6 @@ class ColmapCliTests(unittest.TestCase):
                 {"path": "/tmp/sparse"},
                 pycolmap_module=pycolmap,
             )
-
-    def test_standard_matchers_translate_pairing_options_and_force_cpu(self) -> None:
-        calls: list[tuple[str, tuple[object, ...], dict[str, object]]] = []
-
-        def record(name: str):
-            return lambda *args, **kwargs: calls.append((name, args, kwargs))
-
-        pycolmap = types.SimpleNamespace(
-            Device=types.SimpleNamespace(cpu="cpu"),
-            FeatureMatchingOptions=_Options,
-            TwoViewGeometryOptions=_Options,
-            SequentialPairingOptions=_Options,
-            ExhaustivePairingOptions=_Options,
-            match_sequential=record("sequential"),
-            match_exhaustive=record("exhaustive"),
-        )
-        common = {
-            "database_path": "/tmp/database.db",
-            "FeatureMatching.use_gpu": "1",
-            "FeatureMatching.num_threads": "3",
-            "FeatureMatching.max_num_matches": "2048",
-            "SiftMatching.cpu_brute_force_matcher": "1",
-        }
-
-        colmap_cli.run_command(
-            "sequential_matcher",
-            common | {"SequentialMatching.overlap": "12"},
-            pycolmap_module=pycolmap,
-        )
-        colmap_cli.run_command(
-            "exhaustive_matcher",
-            common | {"ExhaustiveMatching.block_size": "18"},
-            pycolmap_module=pycolmap,
-        )
-
-        self.assertEqual([call[0] for call in calls], ["sequential", "exhaustive"])
-        sequential = calls[0][2]
-        self.assertEqual(sequential["device"], "cpu")
-        self.assertEqual(sequential["pairing_options"].overlap, 12)
-        self.assertFalse(sequential["matching_options"].use_gpu)
-        self.assertEqual(sequential["matching_options"].num_threads, 3)
-        self.assertEqual(sequential["matching_options"].max_num_matches, 2048)
-        self.assertTrue(sequential["matching_options"].sift.cpu_brute_force_matcher)
-        exhaustive = calls[1][2]
-        self.assertEqual(exhaustive["device"], "cpu")
-        self.assertEqual(exhaustive["pairing_options"].block_size, 18)
 
     def test_matches_importer_rejects_bad_pair_files_before_verification(self) -> None:
         database = _Database()

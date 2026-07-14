@@ -7,7 +7,7 @@ import SQLite3
 final class DescriptorMatcherRecoveryTests: XCTestCase {
     func testFaissMatcherSignalSelectsExactRecovery() {
         let error = ColmapRunnerError.failed(
-            command: "sequential_matcher",
+            command: "matches_importer",
             exitCode: SIGSEGV,
             terminationReason: .uncaughtSignal,
             stdoutTail: "",
@@ -26,7 +26,7 @@ final class DescriptorMatcherRecoveryTests: XCTestCase {
     func testCancellationSignalsDoNotSelectExactRecovery() {
         for signal in [Int32(SIGTERM), Int32(SIGKILL)] {
             let error = ColmapRunnerError.failed(
-                command: "sequential_matcher",
+                command: "matches_importer",
                 exitCode: signal,
                 terminationReason: .uncaughtSignal,
                 stdoutTail: "",
@@ -80,7 +80,7 @@ final class DescriptorMatcherRecoveryTests: XCTestCase {
 
     func testGenericFailureDoesNotSelectExactRecovery() {
         let error = ColmapRunnerError.failed(
-            command: "exhaustive_matcher",
+            command: "matches_importer",
             exitCode: 1,
             terminationReason: .exit,
             stdoutTail: "",
@@ -114,7 +114,7 @@ final class DescriptorMatcherRecoveryTests: XCTestCase {
 
     func testExactMatcherFailureCannotRetryExact() {
         let error = ColmapRunnerError.failed(
-            command: "sequential_matcher",
+            command: "matches_importer",
             exitCode: 10,
             terminationReason: .uncaughtSignal,
             stdoutTail: "",
@@ -197,8 +197,7 @@ final class DescriptorMatcherRecoveryTests: XCTestCase {
                 options: ColmapOptions(
                     useGPU: false,
                     extractThreads: 1,
-                    matchThreads: 1,
-                    sequentialOverlap: 1
+                    matchThreads: 1
                 ),
                 onExactRecovery: { didSelectExactRecovery = true }
             )

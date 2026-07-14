@@ -173,18 +173,23 @@ public enum RunPlanResolver {
             || previousPlan.refinementIterationLimit != currentPlan.refinementIterationLimit
             || previousPlan.colmapMaximumFeatureCount != currentPlan.colmapMaximumFeatureCount
             || previousPlan.colmapMaximumMatchCount != currentPlan.colmapMaximumMatchCount
-            || previousPlan.colmapExhaustiveBlockSize != currentPlan.colmapExhaustiveBlockSize
             || previousPlan.colmapThreadLimit != currentPlan.colmapThreadLimit
             || previousPlan.requiredToolchainCapabilities != currentPlan.requiredToolchainCapabilities
             || previousPlan.fallbackRouteIdentifiers != currentPlan.fallbackRouteIdentifiers
             || previousPlan.capturePath != currentPlan.capturePath
             || previousPlan.inputOrdering != currentPlan.inputOrdering
-            || previousPlan.pairingPolicy != currentPlan.pairingPolicy
-            || previousPlan.sequentialOverlap != currentPlan.sequentialOverlap
         let matchingOrMappingPolicyChanged = previousPlan.baGlobalFramesRatio != currentPlan.baGlobalFramesRatio
             || previousPlan.baGlobalPointsRatio != currentPlan.baGlobalPointsRatio
             || previousPlan.baGlobalMaxRefinements != currentPlan.baGlobalMaxRefinements
             || previousPlan.deterministicSeed != currentPlan.deterministicSeed
+            || previousPlan.pairingPolicy != currentPlan.pairingPolicy
+            || previousPlan.temporalPairing != currentPlan.temporalPairing
+            || previousPlan.temporalOffsets != currentPlan.temporalOffsets
+            || previousPlan.retrievalEngine != currentPlan.retrievalEngine
+            || previousPlan.retrievalCandidateCount != currentPlan.retrievalCandidateCount
+            || previousPlan.retrievalNeighborCount != currentPlan.retrievalNeighborCount
+            || previousPlan.retrievalQueryStride != currentPlan.retrievalQueryStride
+            || previousPlan.normalDescriptorMatcher != currentPlan.normalDescriptorMatcher
         let safeBoundary: PipelineStage
         if framePreparationChanged {
             safeBoundary = input.hasVideos ? .importInput : .extractFrames
@@ -212,11 +217,14 @@ public enum RunPlanResolver {
         let inputOrdering = resolvedInputOrdering(options.inputOrdering, input: input)
         let pairingPolicy = resolvedPairingPolicy(
             capturePath: capturePath,
-            inputOrdering: inputOrdering
+            requestedInputOrdering: options.inputOrdering,
+            resolvedInputOrdering: inputOrdering,
+            input: input
         )
+        let pairingConfiguration = pairingConfiguration(for: pairingPolicy)
         let baGlobalRatio: Double
         switch pairingPolicy {
-        case .unorderedRetrieval:
+        case .unorderedRetrieval, .segmentedMixed:
             baGlobalRatio = 1.1
         case .orderedContinuous, .orderedOrbit, .orderedWalkthrough, .orderedLargeArea:
             baGlobalRatio = 1.4
@@ -289,7 +297,6 @@ public enum RunPlanResolver {
             trainerMemoryBudgetBytes: resolvedTrainingMemoryBudget,
             colmapMaximumFeatureCount: colmapBudget.features,
             colmapMaximumMatchCount: colmapBudget.matches,
-            colmapExhaustiveBlockSize: colmapBudget.blockSize,
             colmapThreadLimit: colmapBudget.threads,
             requiredToolchainCapabilities: requiredCapabilities(route: route, model: model),
             fallbackRouteIdentifiers: [],
@@ -297,7 +304,13 @@ public enum RunPlanResolver {
             inputOrdering: inputOrdering,
             photoSelection: options.photoSelection,
             pairingPolicy: pairingPolicy,
-            sequentialOverlap: sequentialOverlap(for: pairingPolicy),
+            temporalPairing: pairingConfiguration.temporalPairing,
+            temporalOffsets: pairingConfiguration.temporalOffsets,
+            retrievalEngine: .localSiftVocabularyV1,
+            retrievalCandidateCount: pairingConfiguration.retrievalCandidateCount,
+            retrievalNeighborCount: pairingConfiguration.retrievalNeighborCount,
+            retrievalQueryStride: pairingConfiguration.retrievalQueryStride,
+            normalDescriptorMatcher: .faiss,
             baGlobalFramesRatio: baGlobalRatio,
             baGlobalPointsRatio: baGlobalRatio,
             baGlobalMaxRefinements: 5,
@@ -333,9 +346,17 @@ public enum RunPlanResolver {
 
     private static func resolvedPairingPolicy(
         capturePath: CapturePath,
-        inputOrdering: InputOrdering
+        requestedInputOrdering: InputOrdering,
+        resolvedInputOrdering: InputOrdering,
+        input: InputSpec
     ) -> ResolvedPairingPolicy {
-        guard inputOrdering == .continuous else { return .unorderedRetrieval }
+        if requestedInputOrdering == .unordered {
+            return .unorderedRetrieval
+        }
+        if input.videoFiles.count > 1 || (input.hasVideos && input.hasPhotos) {
+            return .segmentedMixed
+        }
+        guard resolvedInputOrdering == .continuous else { return .unorderedRetrieval }
         switch capturePath {
         case .automatic:
             return .orderedContinuous
@@ -462,22 +483,21 @@ public enum RunPlanResolver {
         memoryTier: MemoryTier,
         resourcePolicy: ResourcePolicy,
         cpuCount: Int
-    ) -> (features: Int, matches: Int, blockSize: Int, threads: Int) {
-        let values: (features: Int, matches: Int, blockSize: Int, threadCap: Int)
+    ) -> (features: Int, matches: Int, threads: Int) {
+        let values: (features: Int, matches: Int, threadCap: Int)
         switch memoryTier {
         case .constrained:
-            values = (4_096, 4_096, 10, 4)
+            values = (4_096, 4_096, 4)
         case .standard:
-            values = (8_192, 8_192, 20, 6)
+            values = (8_192, 8_192, 6)
         case .performance where resourcePolicy == .maximumPerformance:
-            values = (12_000, 12_000, 32, 10)
+            values = (12_000, 12_000, 10)
         case .performance:
-            values = (10_000, 10_000, 25, 8)
+            values = (10_000, 10_000, 8)
         }
         return (
             values.features,
             values.matches,
-            values.blockSize,
             min(max(1, cpuCount), values.threadCap)
         )
     }
@@ -504,13 +524,66 @@ public enum RunPlanResolver {
         }
     }
 
-    private static func sequentialOverlap(for policy: ResolvedPairingPolicy) -> Int {
+    private struct PairingConfiguration {
+        var temporalPairing: TemporalPairing
+        var temporalOffsets: [Int]
+        var retrievalCandidateCount: Int
+        var retrievalNeighborCount: Int
+        var retrievalQueryStride: Int
+    }
+
+    private static func pairingConfiguration(
+        for policy: ResolvedPairingPolicy
+    ) -> PairingConfiguration {
         switch policy {
-        case .unorderedRetrieval: return 0
-        case .orderedContinuous: return 8
-        case .orderedOrbit: return 8
-        case .orderedWalkthrough: return 8
-        case .orderedLargeArea: return 16
+        case .unorderedRetrieval:
+            return PairingConfiguration(
+                temporalPairing: .none,
+                temporalOffsets: [],
+                retrievalCandidateCount: 20,
+                retrievalNeighborCount: 8,
+                retrievalQueryStride: 1
+            )
+        case .segmentedMixed:
+            return PairingConfiguration(
+                temporalPairing: .linear,
+                temporalOffsets: Array(1...6),
+                retrievalCandidateCount: 20,
+                retrievalNeighborCount: 8,
+                retrievalQueryStride: 1
+            )
+        case .orderedContinuous:
+            return PairingConfiguration(
+                temporalPairing: .multiscale,
+                temporalOffsets: [1, 2, 4, 8, 16, 32, 64, 128],
+                retrievalCandidateCount: 20,
+                retrievalNeighborCount: 2,
+                retrievalQueryStride: 10
+            )
+        case .orderedOrbit:
+            return PairingConfiguration(
+                temporalPairing: .multiscale,
+                temporalOffsets: [1, 2, 4, 8, 16, 32, 64, 128],
+                retrievalCandidateCount: 20,
+                retrievalNeighborCount: 2,
+                retrievalQueryStride: 5
+            )
+        case .orderedWalkthrough:
+            return PairingConfiguration(
+                temporalPairing: .linear,
+                temporalOffsets: Array(1...6),
+                retrievalCandidateCount: 20,
+                retrievalNeighborCount: 2,
+                retrievalQueryStride: 10
+            )
+        case .orderedLargeArea:
+            return PairingConfiguration(
+                temporalPairing: .multiscale,
+                temporalOffsets: [1, 2, 4, 8, 16, 32, 64, 128],
+                retrievalCandidateCount: 20,
+                retrievalNeighborCount: 4,
+                retrievalQueryStride: 10
+            )
         }
     }
 }

@@ -2,6 +2,14 @@ import Foundation
 import SQLite3
 
 extension PipelineRunner {
+    enum ClassicalFeaturePreparationError: Error, LocalizedError, Equatable {
+        case databaseStillPresent
+
+        var errorDescription: String? {
+            "The previous COLMAP feature database could not be removed safely."
+        }
+    }
+
     enum PipelineError: Error {
         case invalidInput
         case insufficientInputImages(Int)
@@ -46,6 +54,50 @@ extension PipelineRunner {
         }
     }
 
+    /// Clears every artifact that could make a new feature database appear to belong
+    /// to an earlier matching run. Public output is deliberately outside this set: a
+    /// failed replacement run must not destroy the last validated splat.
+    func prepareForClassicalFeatureExtraction(paths: ProjectPaths) throws {
+        let fileManager = FileManager.default
+        func removeItemIfPresent(_ url: URL) throws {
+            let isSymlink = (try? fileManager.destinationOfSymbolicLink(
+                atPath: url.path
+            )) != nil
+            if fileManager.fileExists(atPath: url.path) || isSymlink {
+                try fileManager.removeItem(at: url)
+            }
+        }
+
+        let databaseURL = try paths.resolveProjectRelativePath(
+            "SfM/colmap/database.db"
+        )
+        for url in [
+            databaseURL,
+            URL(fileURLWithPath: databaseURL.path + "-wal"),
+            URL(fileURLWithPath: databaseURL.path + "-shm"),
+            URL(fileURLWithPath: databaseURL.path + "-journal"),
+            paths.colmapFeatureEvidenceURL,
+            paths.pairGraphEvidenceURL,
+            paths.colmapSeedURL,
+            paths.colmapSparseURL,
+            paths.geometryManifestURL,
+            paths.trainingURL,
+        ] {
+            try removeItemIfPresent(url)
+        }
+
+        let databaseIsSymlink = (try? fileManager.destinationOfSymbolicLink(
+            atPath: databaseURL.path
+        )) != nil
+        guard !fileManager.fileExists(atPath: databaseURL.path),
+              !databaseIsSymlink else {
+            throw ClassicalFeaturePreparationError.databaseStillPresent
+        }
+
+        try resetDirectory(paths.colmapSeedURL)
+        try resetDirectory(paths.colmapSparseURL)
+    }
+
     func cleanForRetry(failedStage: PipelineStage, paths: ProjectPaths) throws {
         switch failedStage {
         case .importInput:
@@ -55,6 +107,8 @@ extension PipelineRunner {
             self.removeIfExists(paths.framesSelectedURL)
             self.removeIfExists(paths.framesSelectedManifestURL)
             self.removeIfExists(paths.colmapDatabaseURL)
+            self.removeIfExists(paths.colmapFeatureEvidenceURL)
+            self.removeIfExists(paths.pairGraphEvidenceURL)
             self.removeIfExists(paths.colmapSeedURL)
             self.removeIfExists(paths.colmapSparseURL)
             self.removeIfExists(paths.trainingURL)
@@ -62,11 +116,31 @@ extension PipelineRunner {
             self.removeIfExists(paths.framesSelectedURL)
             self.removeIfExists(paths.framesSelectedManifestURL)
             self.removeIfExists(paths.colmapDatabaseURL)
+            self.removeIfExists(paths.colmapFeatureEvidenceURL)
+            self.removeIfExists(paths.pairGraphEvidenceURL)
             self.removeIfExists(paths.colmapSeedURL)
             self.removeIfExists(paths.colmapSparseURL)
             self.removeIfExists(paths.trainingURL)
-        case .sfmFeatures, .sfmMatching:
+        case .sfmFeatures:
             self.removeIfExists(paths.colmapDatabaseURL)
+            self.removeIfExists(paths.colmapFeatureEvidenceURL)
+            self.removeIfExists(paths.pairGraphEvidenceURL)
+            self.removeIfExists(paths.colmapSeedURL)
+            self.removeIfExists(paths.colmapSparseURL)
+            self.removeIfExists(paths.trainingURL)
+        case .sfmMatching:
+            let databaseIsSymlink =
+                (try? FileManager.default.destinationOfSymbolicLink(
+                    atPath: paths.colmapDatabaseURL.path
+                )) != nil
+            if databaseIsSymlink {
+                self.removeIfExists(paths.colmapDatabaseURL)
+            } else if FileManager.default.fileExists(atPath: paths.colmapDatabaseURL.path) {
+                try ColmapDatabaseMatchStore.clearMatchingResults(
+                    at: paths.colmapDatabaseURL
+                )
+            }
+            self.removeIfExists(paths.pairGraphEvidenceURL)
             self.removeIfExists(paths.colmapSeedURL)
             self.removeIfExists(paths.colmapSparseURL)
             self.removeIfExists(paths.trainingURL)
@@ -118,11 +192,15 @@ extension PipelineRunner {
         }
         if boundaryIndex < featuresIndex {
             try removeInvalidatedItem(paths.colmapDatabaseURL)
+            try removeInvalidatedItem(paths.colmapFeatureEvidenceURL)
             try removeInvalidatedItem(paths.colmapSeedURL)
             try removeInvalidatedItem(paths.da3CoverageManifestURL)
         } else if boundaryIndex < matchingIndex,
                   FileManager.default.fileExists(atPath: paths.colmapDatabaseURL.path) {
             try ColmapDatabaseMatchStore.clearMatchingResults(at: paths.colmapDatabaseURL)
+        }
+        if boundaryIndex < matchingIndex {
+            try removeInvalidatedItem(paths.pairGraphEvidenceURL)
         }
         if boundaryIndex < mappingIndex {
             try removeInvalidatedItem(paths.colmapSparseURL)
@@ -198,10 +276,16 @@ extension PipelineRunner {
                 return ("Processing failed. Expected outputs were missing.", String(reflecting: pipelineError))
             }
         }
-        if case ColmapPairPlanningError.disconnectedGraph = error {
+        if case ColmapPairPlanningError.disconnectedPairSchedule = error {
             return (
                 "The capture did not have enough connected overlap. Try again with more overlap.",
-                "The bounded image-retrieval graph was disconnected before COLMAP matching."
+                "The planned pair schedule remained disconnected before matching."
+            )
+        }
+        if case ColmapPairPlanningError.disconnectedVerifiedGraph = error {
+            return (
+                "The capture did not have enough connected overlap. Try again with more overlap.",
+                "The spatially verified pair graph remained disconnected after matching."
             )
         }
         if let memoryError = error as? MsplatRasterMemoryBudgetExceeded {
@@ -381,9 +465,22 @@ extension PipelineRunner {
             if sparseModelFilesExist(at: seedZero) {
                 return .valid
             }
-            return validateColmapDatabaseOutput(paths: paths, requireMatches: false)
+            let databaseStatus = validateColmapDatabaseOutput(
+                paths: paths,
+                requireMatches: false
+            )
+            guard databaseStatus == .valid else { return databaseStatus }
+            return try validateClassicalFeatureEvidence(paths: paths)
         case .sfmMatching:
-            return validateColmapDatabaseOutput(paths: paths, requireMatches: true)
+            let databaseStatus = validateColmapDatabaseOutput(
+                paths: paths,
+                requireMatches: true
+            )
+            guard databaseStatus == .valid else { return databaseStatus }
+            if metadata.resolvedRunPlan?.routeIdentifier == SfmBackend.da3.rawValue {
+                return .valid
+            }
+            return try validateClassicalMatchingEvidence(paths: paths)
         case .sfmMapping:
             let sparseZero = paths.colmapSparseURL.appendingPathComponent("0", isDirectory: true)
             guard sparseModelFilesExist(at: sparseZero) else { return .missing }
@@ -619,6 +716,87 @@ extension PipelineRunner {
             }
         }
         return .valid
+    }
+
+    func validateClassicalMatchingEvidence(paths: ProjectPaths) throws -> StageOutputStatus {
+        let fileManager = FileManager.default
+        guard fileManager.fileExists(atPath: paths.pairGraphEvidenceURL.path),
+              fileManager.fileExists(atPath: paths.framesSelectedManifestURL.path),
+              fileManager.fileExists(atPath: paths.framesSelectedURL.path) else {
+            return .missing
+        }
+
+        let manifest: [SelectedFrameMapping]
+        let selectedFiles: [URL]
+        do {
+            manifest = try loadSelectedFrameManifest(from: paths.framesSelectedManifestURL)
+            selectedFiles = try loadImages(in: paths.framesSelectedURL)
+        } catch is CancellationError {
+            throw CancellationError()
+        } catch {
+            return .corrupt(reason: "selected frame evidence is unreadable")
+        }
+        let manifestNames = manifest.map(\.outputFileName)
+        let selectedNames = selectedFiles.map(\.lastPathComponent)
+        guard !manifestNames.isEmpty,
+              Set(manifestNames).count == manifestNames.count,
+              manifestNames.allSatisfy({
+                  !$0.isEmpty && !$0.contains(where: \.isWhitespace)
+              }),
+              selectedNames.count == manifestNames.count,
+              Set(selectedNames) == Set(manifestNames) else {
+            return .corrupt(reason: "selected frame evidence does not match the manifest")
+        }
+
+        do {
+            _ = try PairGraphEvidenceStore.loadVerified(
+                from: paths.pairGraphEvidenceURL,
+                expectedImageNames: selectedNames,
+                databaseURL: paths.colmapDatabaseURL,
+                projectPaths: paths
+            )
+            return .valid
+        } catch is CancellationError {
+            throw CancellationError()
+        } catch {
+            return .corrupt(reason: error.localizedDescription)
+        }
+    }
+
+    func validateClassicalFeatureEvidence(paths: ProjectPaths) throws -> StageOutputStatus {
+        let fileManager = FileManager.default
+        guard fileManager.fileExists(atPath: paths.colmapFeatureEvidenceURL.path),
+              fileManager.fileExists(atPath: paths.framesSelectedManifestURL.path),
+              fileManager.fileExists(atPath: paths.framesSelectedURL.path) else {
+            return .missing
+        }
+        do {
+            let manifest = try loadSelectedFrameManifest(
+                from: paths.framesSelectedManifestURL
+            )
+            let selectedFiles = try loadImages(in: paths.framesSelectedURL)
+            let manifestNames = manifest.map(\.outputFileName)
+            let selectedNames = selectedFiles.map(\.lastPathComponent)
+            guard !manifestNames.isEmpty,
+                  Set(manifestNames).count == manifestNames.count,
+                  selectedNames.count == manifestNames.count,
+                  Set(selectedNames) == Set(manifestNames) else {
+                return .corrupt(
+                    reason: "selected frame evidence does not match the manifest"
+                )
+            }
+            _ = try ColmapFeatureEvidenceStore.loadVerified(
+                from: paths.colmapFeatureEvidenceURL,
+                expectedImageNames: selectedNames,
+                databaseURL: paths.colmapDatabaseURL,
+                projectPaths: paths
+            )
+            return .valid
+        } catch is CancellationError {
+            throw CancellationError()
+        } catch {
+            return .corrupt(reason: error.localizedDescription)
+        }
     }
 
     func validatePlyFile(at url: URL) -> StageOutputStatus {

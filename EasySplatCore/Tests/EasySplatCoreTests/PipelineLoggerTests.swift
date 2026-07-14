@@ -2,6 +2,26 @@ import XCTest
 @testable import EasySplatCore
 
 final class PipelineLoggerTests: XCTestCase {
+    func testStageTimingAccumulatesFailedAndSuccessfulRetryAttempts() throws {
+        let tracker = StageTimingTracker()
+        tracker.start(.sfmMapping)
+        Thread.sleep(forTimeInterval: 0.01)
+        XCTAssertNotNil(tracker.finish(.sfmMapping))
+        let first = try XCTUnwrap(tracker.consumeRecord(.sfmMapping))
+
+        tracker.start(.sfmMapping)
+        Thread.sleep(forTimeInterval: 0.01)
+        XCTAssertNotNil(tracker.finish(.sfmMapping))
+        let cumulative = try XCTUnwrap(tracker.consumeRecord(.sfmMapping))
+
+        XCTAssertEqual(cumulative.startedAt, first.startedAt)
+        XCTAssertGreaterThan(cumulative.durationSeconds, first.durationSeconds)
+        XCTAssertGreaterThanOrEqual(
+            cumulative.durationSeconds,
+            first.durationSeconds + 0.005
+        )
+    }
+
     func testProgressDeduplication() throws {
         let dir = try TestFileBuilder.makeTempDir()
         defer { try? FileManager.default.removeItem(at: dir) }

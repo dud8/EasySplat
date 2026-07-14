@@ -60,9 +60,22 @@ public enum DescriptorMatcher: String, Codable, Sendable, Equatable {
     case exact
 }
 
+public enum PairGraphRecoveryLevel: String, Codable, Sendable, Equatable {
+    case normal
+    case expanded
+    case maximum
+}
+
+public enum PairMatchingAttemptOutcome: String, Codable, Sendable, Equatable {
+    case completed
+    case failed
+}
+
 public struct PairMatchingAttemptArtifact: Codable, Sendable, Equatable {
     public var attemptNumber: Int
     public var matcher: DescriptorMatcher
+    public var recoveryLevel: PairGraphRecoveryLevel
+    public var outcome: PairMatchingAttemptOutcome
     public var scheduledPairCount: Int
     public var attemptedPairCount: Int
     public var rawMatchedPairCount: Int
@@ -72,6 +85,8 @@ public struct PairMatchingAttemptArtifact: Codable, Sendable, Equatable {
     public init(
         attemptNumber: Int,
         matcher: DescriptorMatcher,
+        recoveryLevel: PairGraphRecoveryLevel,
+        outcome: PairMatchingAttemptOutcome,
         scheduledPairCount: Int,
         attemptedPairCount: Int,
         rawMatchedPairCount: Int,
@@ -80,6 +95,8 @@ public struct PairMatchingAttemptArtifact: Codable, Sendable, Equatable {
     ) {
         self.attemptNumber = attemptNumber
         self.matcher = matcher
+        self.recoveryLevel = recoveryLevel
+        self.outcome = outcome
         self.scheduledPairCount = scheduledPairCount
         self.attemptedPairCount = attemptedPairCount
         self.rawMatchedPairCount = rawMatchedPairCount
@@ -103,6 +120,8 @@ public struct PairGraphMeasurement: Codable, Sendable, Equatable {
     public var degreeP90: Int
     public var matcherAttempts: [PairMatchingAttemptArtifact]
     public var pairListDigest: String
+    public var featureDatabaseDigest: String
+    public var matchingDatabaseDigest: String
     public var matchingDurationSeconds: Double
 
     public init(
@@ -120,6 +139,8 @@ public struct PairGraphMeasurement: Codable, Sendable, Equatable {
         degreeP90: Int,
         matcherAttempts: [PairMatchingAttemptArtifact],
         pairListDigest: String,
+        featureDatabaseDigest: String,
+        matchingDatabaseDigest: String,
         matchingDurationSeconds: Double
     ) {
         self.scheduledPairCount = scheduledPairCount
@@ -136,6 +157,8 @@ public struct PairGraphMeasurement: Codable, Sendable, Equatable {
         self.degreeP90 = degreeP90
         self.matcherAttempts = matcherAttempts
         self.pairListDigest = pairListDigest
+        self.featureDatabaseDigest = featureDatabaseDigest
+        self.matchingDatabaseDigest = matchingDatabaseDigest
         self.matchingDurationSeconds = matchingDurationSeconds
     }
 }

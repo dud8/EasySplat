@@ -1,0 +1,396 @@
+#if canImport(XCTest)
+import Foundation
+import XCTest
+@testable import EasySplatCore
+
+final class PairGraphEvidenceStoreTests: XCTestCase {
+    func testRoundTripPreservesEvidenceAndBuildsMeasuredArtifact() throws {
+        let fixture = try makeProject()
+        defer { try? FileManager.default.removeItem(at: fixture.root) }
+        let evidence = makeEvidence()
+
+        try PairGraphEvidenceStore.save(
+            evidence,
+            to: fixture.paths.pairGraphEvidenceURL,
+            projectPaths: fixture.paths
+        )
+        let loaded = try PairGraphEvidenceStore.load(
+            from: fixture.paths.pairGraphEvidenceURL,
+            projectPaths: fixture.paths
+        )
+
+        XCTAssertEqual(loaded, evidence)
+        let measurement = try loaded.pairGraphMeasurement()
+        XCTAssertEqual(measurement.scheduledPairCount, 4)
+        XCTAssertEqual(measurement.localPairCount, 2)
+        XCTAssertEqual(measurement.retrievalPairCount, 1)
+        XCTAssertEqual(measurement.loopRevisitPairCount, 1)
+        XCTAssertEqual(measurement.matcherAttempts, evidence.attempts.map(\.artifact))
+        XCTAssertEqual(measurement.matchingDurationSeconds, 4)
+        XCTAssertEqual(loaded.fallbackReasons, ["denser pair graph"])
+
+        let artifact = try loaded.pairGraphArtifact(
+            mappingAttemptNumber: 3,
+            bundleAdjustmentCycleCount: 2,
+            fallbackReason: "dense FAISS recovery"
+        )
+        XCTAssertEqual(artifact.status, .measured)
+        XCTAssertEqual(artifact.measurement, measurement)
+        XCTAssertEqual(artifact.mappingAttemptNumber, 3)
+        XCTAssertEqual(artifact.bundleAdjustmentCycleCount, 2)
+        XCTAssertEqual(artifact.fallbackReason, "dense FAISS recovery")
+    }
+
+    func testSaveProducesDeterministicBytes() throws {
+        let fixture = try makeProject()
+        defer { try? FileManager.default.removeItem(at: fixture.root) }
+        let evidence = makeEvidence()
+
+        try PairGraphEvidenceStore.save(
+            evidence,
+            to: fixture.paths.pairGraphEvidenceURL,
+            projectPaths: fixture.paths
+        )
+        let first = try Data(contentsOf: fixture.paths.pairGraphEvidenceURL)
+        try PairGraphEvidenceStore.save(
+            evidence,
+            to: fixture.paths.pairGraphEvidenceURL,
+            projectPaths: fixture.paths
+        )
+        let second = try Data(contentsOf: fixture.paths.pairGraphEvidenceURL)
+
+        XCTAssertEqual(first, second)
+    }
+
+    func testLoadRejectsTamperedPairListDigest() throws {
+        let fixture = try makeProject()
+        defer { try? FileManager.default.removeItem(at: fixture.root) }
+        try PairGraphEvidenceStore.save(
+            makeEvidence(),
+            to: fixture.paths.pairGraphEvidenceURL,
+            projectPaths: fixture.paths
+        )
+        var object = try XCTUnwrap(
+            JSONSerialization.jsonObject(
+                with: Data(contentsOf: fixture.paths.pairGraphEvidenceURL)
+            ) as? [String: Any]
+        )
+        object["pairListDigest"] = String(repeating: "0", count: 64)
+        try JSONSerialization.data(withJSONObject: object, options: [.sortedKeys])
+            .write(to: fixture.paths.pairGraphEvidenceURL, options: [.atomic])
+
+        XCTAssertThrowsError(try PairGraphEvidenceStore.load(
+            from: fixture.paths.pairGraphEvidenceURL,
+            projectPaths: fixture.paths
+        ))
+    }
+
+    func testStoreRejectsOutsidePathAndLoadRejectsSymlink() throws {
+        let fixture = try makeProject()
+        defer { try? FileManager.default.removeItem(at: fixture.root) }
+        let outsideURL = fixture.root.appendingPathComponent("outside.json")
+
+        XCTAssertThrowsError(try PairGraphEvidenceStore.save(
+            makeEvidence(),
+            to: outsideURL,
+            projectPaths: fixture.paths
+        ))
+
+        try PairGraphEvidenceStore.save(
+            makeEvidence(),
+            to: fixture.paths.pairGraphEvidenceURL,
+            projectPaths: fixture.paths
+        )
+        let data = try Data(contentsOf: fixture.paths.pairGraphEvidenceURL)
+        try FileManager.default.removeItem(at: fixture.paths.pairGraphEvidenceURL)
+        try data.write(to: outsideURL)
+        try FileManager.default.createSymbolicLink(
+            at: fixture.paths.pairGraphEvidenceURL,
+            withDestinationURL: outsideURL
+        )
+
+        XCTAssertThrowsError(try PairGraphEvidenceStore.load(
+            from: fixture.paths.pairGraphEvidenceURL,
+            projectPaths: fixture.paths
+        ))
+    }
+
+    func testLoadRejectsOversizeAndMalformedFiles() throws {
+        let fixture = try makeProject()
+        defer { try? FileManager.default.removeItem(at: fixture.root) }
+
+        try Data(repeating: 0x20, count: PairGraphEvidenceStore.maximumBytes + 1)
+            .write(to: fixture.paths.pairGraphEvidenceURL)
+        XCTAssertThrowsError(try PairGraphEvidenceStore.load(
+            from: fixture.paths.pairGraphEvidenceURL,
+            projectPaths: fixture.paths
+        ))
+
+        try FileManager.default.removeItem(at: fixture.paths.pairGraphEvidenceURL)
+        try FileManager.default.createDirectory(
+            at: fixture.paths.pairGraphEvidenceURL,
+            withIntermediateDirectories: false
+        )
+        XCTAssertThrowsError(try PairGraphEvidenceStore.load(
+            from: fixture.paths.pairGraphEvidenceURL,
+            projectPaths: fixture.paths
+        ))
+
+        try FileManager.default.removeItem(at: fixture.paths.pairGraphEvidenceURL)
+        try Data("{not-json".utf8).write(
+            to: fixture.paths.pairGraphEvidenceURL,
+            options: [.atomic]
+        )
+        XCTAssertThrowsError(try PairGraphEvidenceStore.load(
+            from: fixture.paths.pairGraphEvidenceURL,
+            projectPaths: fixture.paths
+        ))
+    }
+
+    func testSaveRejectsNoncontiguousAttemptsAndNonfinalAcceptance() throws {
+        let fixture = try makeProject()
+        defer { try? FileManager.default.removeItem(at: fixture.root) }
+        var evidence = makeEvidence()
+        evidence.attempts[1].artifact.attemptNumber = 3
+
+        XCTAssertThrowsError(try PairGraphEvidenceStore.save(
+            evidence,
+            to: fixture.paths.pairGraphEvidenceURL,
+            projectPaths: fixture.paths
+        ))
+
+        evidence = makeEvidence()
+        evidence.acceptedAttemptNumber = 1
+        XCTAssertThrowsError(try PairGraphEvidenceStore.save(
+            evidence,
+            to: fixture.paths.pairGraphEvidenceURL,
+            projectPaths: fixture.paths
+        ))
+    }
+
+    func testSaveRejectsInvalidAttemptCountsAndDurations() throws {
+        let fixture = try makeProject()
+        defer { try? FileManager.default.removeItem(at: fixture.root) }
+        var evidence = makeEvidence()
+        evidence.attempts[0].artifact.rawMatchedPairCount = 3
+
+        XCTAssertThrowsError(try PairGraphEvidenceStore.save(
+            evidence,
+            to: fixture.paths.pairGraphEvidenceURL,
+            projectPaths: fixture.paths
+        ))
+
+        evidence = makeEvidence()
+        evidence.attempts[0].artifact.durationSeconds = -.infinity
+        XCTAssertThrowsError(try PairGraphEvidenceStore.save(
+            evidence,
+            to: fixture.paths.pairGraphEvidenceURL,
+            projectPaths: fixture.paths
+        ))
+
+        evidence = makeEvidence()
+        evidence.attempts[0].artifact.attemptedPairCount = -1
+        XCTAssertThrowsError(try PairGraphEvidenceStore.save(
+            evidence,
+            to: fixture.paths.pairGraphEvidenceURL,
+            projectPaths: fixture.paths
+        ))
+
+        evidence = makeEvidence()
+        evidence.attempts[0].artifact.durationSeconds = .greatestFiniteMagnitude
+        evidence.attempts[1].artifact.durationSeconds = .greatestFiniteMagnitude
+        evidence.matchingDurationSeconds = .greatestFiniteMagnitude
+        XCTAssertThrowsError(try PairGraphEvidenceStore.save(
+            evidence,
+            to: fixture.paths.pairGraphEvidenceURL,
+            projectPaths: fixture.paths
+        ))
+    }
+
+    func testSaveRejectsMismatchedFinalInspectionAndDuration() throws {
+        let fixture = try makeProject()
+        defer { try? FileManager.default.removeItem(at: fixture.root) }
+        var evidence = makeEvidence()
+        evidence.acceptedInspection.spatiallyVerifiedPairCount = 1
+
+        XCTAssertThrowsError(try PairGraphEvidenceStore.save(
+            evidence,
+            to: fixture.paths.pairGraphEvidenceURL,
+            projectPaths: fixture.paths
+        ))
+
+        evidence = makeEvidence()
+        evidence.matchingDurationSeconds += 0.001
+        XCTAssertThrowsError(try PairGraphEvidenceStore.save(
+            evidence,
+            to: fixture.paths.pairGraphEvidenceURL,
+            projectPaths: fixture.paths
+        ))
+
+        evidence = makeEvidence()
+        evidence.acceptedInspection.localPairCount = 1
+        XCTAssertThrowsError(try PairGraphEvidenceStore.save(
+            evidence,
+            to: fixture.paths.pairGraphEvidenceURL,
+            projectPaths: fixture.paths
+        ))
+
+        evidence = makeEvidence()
+        evidence.fallbackReasons = ["duplicate", "duplicate"]
+        XCTAssertThrowsError(try PairGraphEvidenceStore.save(
+            evidence,
+            to: fixture.paths.pairGraphEvidenceURL,
+            projectPaths: fixture.paths
+        ))
+
+        evidence = makeEvidence()
+        evidence.acceptedInspection.connectedComponentCount = 2
+        XCTAssertThrowsError(try PairGraphEvidenceStore.save(
+            evidence,
+            to: fixture.paths.pairGraphEvidenceURL,
+            projectPaths: fixture.paths
+        ))
+    }
+
+    func testSaveRejectsUnknownDuplicateAndNoncanonicalPairs() throws {
+        let fixture = try makeProject()
+        defer { try? FileManager.default.removeItem(at: fixture.root) }
+        var evidence = makeEvidence()
+        evidence.attempts[1].scheduledPairs[0] = ColmapScheduledPair(
+            "a.jpg",
+            "unknown.jpg",
+            role: .local
+        )
+
+        XCTAssertThrowsError(try PairGraphEvidenceStore.save(
+            evidence,
+            to: fixture.paths.pairGraphEvidenceURL,
+            projectPaths: fixture.paths
+        ))
+
+        evidence = makeEvidence()
+        evidence.attempts[1].scheduledPairs[1] = evidence.attempts[1].scheduledPairs[0]
+        XCTAssertThrowsError(try PairGraphEvidenceStore.save(
+            evidence,
+            to: fixture.paths.pairGraphEvidenceURL,
+            projectPaths: fixture.paths
+        ))
+
+        evidence = makeEvidence()
+        evidence.attempts[1].scheduledPairs[0] = ColmapScheduledPair(
+            "b.jpg",
+            "a.jpg",
+            role: .local
+        )
+        XCTAssertThrowsError(try PairGraphEvidenceStore.save(
+            evidence,
+            to: fixture.paths.pairGraphEvidenceURL,
+            projectPaths: fixture.paths
+        ))
+    }
+
+    func testSaveRejectsIncoherentGraphFactsAndBadSelectedDigest() throws {
+        let fixture = try makeProject()
+        defer { try? FileManager.default.removeItem(at: fixture.root) }
+        var evidence = makeEvidence()
+        evidence.acceptedInspection.degreeMedian = 2
+        evidence.acceptedInspection.degreeP90 = 1
+
+        XCTAssertThrowsError(try PairGraphEvidenceStore.save(
+            evidence,
+            to: fixture.paths.pairGraphEvidenceURL,
+            projectPaths: fixture.paths
+        ))
+
+        evidence = makeEvidence()
+        evidence.selectedFramesDigest = String(repeating: "A", count: 64)
+        XCTAssertThrowsError(try PairGraphEvidenceStore.save(
+            evidence,
+            to: fixture.paths.pairGraphEvidenceURL,
+            projectPaths: fixture.paths
+        ))
+    }
+
+    func testProjectPathsUsesCanonicalEvidenceLocation() throws {
+        let root = URL(fileURLWithPath: "/tmp/easysplat-project", isDirectory: true)
+        let paths = ProjectPaths(root: root)
+
+        XCTAssertEqual(
+            paths.pairGraphEvidenceURL,
+            root.appendingPathComponent("SfM/pair_graph_evidence.json")
+        )
+    }
+
+    private func makeProject() throws -> (root: URL, paths: ProjectPaths) {
+        let root = try TestFileBuilder.makeTempDir()
+        let projectURL = root.appendingPathComponent("Project.easysplatproj", isDirectory: true)
+        let paths = ProjectPaths(root: projectURL)
+        try paths.ensureDirectories()
+        return (root, paths)
+    }
+
+    private func makeEvidence() -> PairGraphEvidence {
+        let firstAttempt = PairGraphAttemptEvidence(
+            artifact: PairMatchingAttemptArtifact(
+                attemptNumber: 1,
+                matcher: .faiss,
+                recoveryLevel: .normal,
+                outcome: .completed,
+                scheduledPairCount: 2,
+                attemptedPairCount: 2,
+                rawMatchedPairCount: 1,
+                spatiallyVerifiedPairCount: 1,
+                durationSeconds: 1.25
+            ),
+            scheduledPairs: [
+                ColmapScheduledPair("a.jpg", "b.jpg", role: .local),
+                ColmapScheduledPair("b.jpg", "c.jpg", role: .local),
+            ]
+        )
+        let acceptedAttempt = PairGraphAttemptEvidence(
+            artifact: PairMatchingAttemptArtifact(
+                attemptNumber: 2,
+                matcher: .faiss,
+                recoveryLevel: .expanded,
+                outcome: .completed,
+                scheduledPairCount: 4,
+                attemptedPairCount: 4,
+                rawMatchedPairCount: 3,
+                spatiallyVerifiedPairCount: 3,
+                durationSeconds: 2.75
+            ),
+            scheduledPairs: [
+                ColmapScheduledPair("a.jpg", "b.jpg", role: .local),
+                ColmapScheduledPair("a.jpg", "d.jpg", role: .loopRevisit),
+                ColmapScheduledPair("b.jpg", "c.jpg", role: .local),
+                ColmapScheduledPair("c.jpg", "d.jpg", role: .retrieval),
+            ]
+        )
+        let inspection = ColmapPairGraphInspection(
+            scheduledPairCount: 4,
+            attemptedPairCount: 4,
+            rawMatchedPairCount: 3,
+            spatiallyVerifiedPairCount: 3,
+            localPairCount: 2,
+            retrievalPairCount: 1,
+            loopRevisitPairCount: 1,
+            connectedComponentCount: 1,
+            isolatedViewCount: 0,
+            degreeP10: 1,
+            degreeMedian: 2,
+            degreeP90: 2,
+            featureDatabaseDigest: String(repeating: "b", count: 64),
+            matchingDatabaseDigest: String(repeating: "c", count: 64)
+        )
+        return PairGraphEvidence(
+            selectedFramesDigest: String(repeating: "a", count: 64),
+            imageNames: ["a.jpg", "b.jpg", "c.jpg", "d.jpg"],
+            attempts: [firstAttempt, acceptedAttempt],
+            acceptedAttemptNumber: 2,
+            acceptedInspection: inspection,
+            matchingDurationSeconds: 4,
+            fallbackReasons: ["denser pair graph"]
+        )
+    }
+}
+#endif

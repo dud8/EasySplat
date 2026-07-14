@@ -419,13 +419,15 @@ final class GeometryArtifactStoreTests: XCTestCase {
                 retrievalPairCount: 0,
                 loopRevisitPairCount: 0,
                 connectedComponentCount: 1,
-                isolatedViewCount: 1,
+                isolatedViewCount: 0,
                 degreeP10: 0,
                 degreeMedian: 0,
                 degreeP90: 0,
                 matcherAttempts: [PairMatchingAttemptArtifact(
                     attemptNumber: 1,
                     matcher: .faiss,
+                    recoveryLevel: .normal,
+                    outcome: .completed,
                     scheduledPairCount: 0,
                     attemptedPairCount: 0,
                     rawMatchedPairCount: 0,
@@ -433,6 +435,8 @@ final class GeometryArtifactStoreTests: XCTestCase {
                     durationSeconds: 0.01
                 )],
                 pairListDigest: String(repeating: "d", count: 64),
+                featureDatabaseDigest: String(repeating: "e", count: 64),
+                matchingDatabaseDigest: String(repeating: "f", count: 64),
                 matchingDurationSeconds: 0.01
             ),
             mappingAttemptNumber: 1,
@@ -449,6 +453,22 @@ final class GeometryArtifactStoreTests: XCTestCase {
         )
 
         XCTAssertNoThrow(try GeometryArtifactStore.validate(artifact, projectPaths: paths))
+
+        var disconnected = artifact
+        disconnected.pairGraph.measurement?.connectedComponentCount = 2
+        XCTAssertThrowsError(
+            try GeometryArtifactStore.validate(disconnected, projectPaths: paths)
+        ) { error in
+            XCTAssertEqual(error as? GeometryArtifactStore.Error, .invalidPairGraph)
+        }
+
+        var failedAcceptedAttempt = artifact
+        failedAcceptedAttempt.pairGraph.measurement?.matcherAttempts[0].outcome = .failed
+        XCTAssertThrowsError(
+            try GeometryArtifactStore.validate(failedAcceptedAttempt, projectPaths: paths)
+        ) { error in
+            XCTAssertEqual(error as? GeometryArtifactStore.Error, .invalidPairGraph)
+        }
     }
 
     func testRejectsFabricatedPairAndOrientationEvidence() throws {
@@ -476,6 +496,8 @@ final class GeometryArtifactStoreTests: XCTestCase {
                 degreeP90: 0,
                 matcherAttempts: [],
                 pairListDigest: String(repeating: "d", count: 64),
+                featureDatabaseDigest: String(repeating: "e", count: 64),
+                matchingDatabaseDigest: String(repeating: "f", count: 64),
                 matchingDurationSeconds: 0
             ),
             mappingAttemptNumber: 1,

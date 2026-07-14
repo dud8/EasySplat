@@ -263,6 +263,173 @@ final class PipelineRunnerRetryTests: XCTestCase {
         XCTAssertEqual(status, .corrupt)
     }
 
+    func testClassicalMatchingResumeRequiresExactDurableEvidence() throws {
+        let root = try TestFileBuilder.makeTempDir()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let fixture = try writeMatchingResumeFixture(at: root, route: .colmap)
+
+        XCTAssertEqual(
+            try makeRunner(projectURL: root).test_validateStageOutput(
+                .sfmMatching,
+                paths: fixture.paths,
+                metadata: fixture.metadata
+            ),
+            .valid
+        )
+    }
+
+    func testClassicalMatchingResumeTreatsMissingEvidenceAsIncomplete() throws {
+        let root = try TestFileBuilder.makeTempDir()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let fixture = try writeMatchingResumeFixture(at: root, route: .colmap)
+        try FileManager.default.removeItem(at: fixture.paths.pairGraphEvidenceURL)
+
+        XCTAssertEqual(
+            try makeRunner(projectURL: root).test_validateStageOutput(
+                .sfmMatching,
+                paths: fixture.paths,
+                metadata: fixture.metadata
+            ),
+            .missing
+        )
+    }
+
+    func testClassicalMatchingResumeTreatsMissingSelectedManifestAsIncomplete() throws {
+        let root = try TestFileBuilder.makeTempDir()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let fixture = try writeMatchingResumeFixture(at: root, route: .colmap)
+        try FileManager.default.removeItem(at: fixture.paths.framesSelectedManifestURL)
+
+        XCTAssertEqual(
+            try makeRunner(projectURL: root).test_validateStageOutput(
+                .sfmMatching,
+                paths: fixture.paths,
+                metadata: fixture.metadata
+            ),
+            .missing
+        )
+    }
+
+    func testClassicalMatchingResumeRejectsChangedSelectedFrame() throws {
+        let root = try TestFileBuilder.makeTempDir()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let fixture = try writeMatchingResumeFixture(at: root, route: .colmap)
+        try Data("changed".utf8).write(
+            to: fixture.paths.framesSelectedURL.appendingPathComponent("b.jpg")
+        )
+
+        XCTAssertEqual(
+            try makeRunner(projectURL: root).test_validateStageOutput(
+                .sfmMatching,
+                paths: fixture.paths,
+                metadata: fixture.metadata
+            ),
+            .corrupt
+        )
+    }
+
+    func testClassicalFeatureResumeRejectsChangedSelectedFrameBytes() throws {
+        let root = try TestFileBuilder.makeTempDir()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let fixture = try writeMatchingResumeFixture(at: root, route: .colmap)
+
+        XCTAssertEqual(
+            try makeRunner(projectURL: root).test_validateStageOutput(
+                .sfmFeatures,
+                paths: fixture.paths,
+                metadata: fixture.metadata
+            ),
+            .valid
+        )
+        try Data("changed".utf8).write(
+            to: fixture.paths.framesSelectedURL.appendingPathComponent("b.jpg")
+        )
+        XCTAssertEqual(
+            try makeRunner(projectURL: root).test_validateStageOutput(
+                .sfmFeatures,
+                paths: fixture.paths,
+                metadata: fixture.metadata
+            ),
+            .corrupt
+        )
+    }
+
+    func testClassicalMatchingResumeRejectsChangedVerifiedPairs() throws {
+        let root = try TestFileBuilder.makeTempDir()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let fixture = try writeMatchingResumeFixture(at: root, route: .colmap)
+        var database: OpaquePointer?
+        XCTAssertEqual(sqlite3_open(fixture.paths.colmapDatabaseURL.path, &database), SQLITE_OK)
+        if let database {
+            XCTAssertEqual(
+                sqlite3_exec(
+                    database,
+                    "DELETE FROM two_view_geometries WHERE pair_id = 4294967297;",
+                    nil,
+                    nil,
+                    nil
+                ),
+                SQLITE_OK
+            )
+            sqlite3_close(database)
+        }
+
+        XCTAssertEqual(
+            try makeRunner(projectURL: root).test_validateStageOutput(
+                .sfmMatching,
+                paths: fixture.paths,
+                metadata: fixture.metadata
+            ),
+            .corrupt
+        )
+    }
+
+    func testClassicalMatchingResumeRejectsChangedCorrespondencePayload() throws {
+        let root = try TestFileBuilder.makeTempDir()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let fixture = try writeMatchingResumeFixture(at: root, route: .colmap)
+        var database: OpaquePointer?
+        XCTAssertEqual(sqlite3_open(fixture.paths.colmapDatabaseURL.path, &database), SQLITE_OK)
+        if let database {
+            XCTAssertEqual(
+                sqlite3_exec(
+                    database,
+                    "UPDATE two_view_geometries SET data = X'09', config = 7 WHERE pair_id = 2147483649;",
+                    nil,
+                    nil,
+                    nil
+                ),
+                SQLITE_OK
+            )
+            sqlite3_close(database)
+        }
+
+        XCTAssertEqual(
+            try makeRunner(projectURL: root).test_validateStageOutput(
+                .sfmMatching,
+                paths: fixture.paths,
+                metadata: fixture.metadata
+            ),
+            .corrupt
+        )
+    }
+
+    func testDa3MatchingResumeTemporarilyAllowsGenericMatchedDatabase() throws {
+        let root = try TestFileBuilder.makeTempDir()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let fixture = try writeMatchingResumeFixture(at: root, route: .da3)
+        try FileManager.default.removeItem(at: fixture.paths.pairGraphEvidenceURL)
+
+        XCTAssertEqual(
+            try makeRunner(projectURL: root).test_validateStageOutput(
+                .sfmMatching,
+                paths: fixture.paths,
+                metadata: fixture.metadata
+            ),
+            .valid
+        )
+    }
+
     func testValidateStageOutputRejectsEmptyDatabaseSparseTextWithoutDa3Manifest() throws {
         let root = try TestFileBuilder.makeTempDir()
         defer { try? FileManager.default.removeItem(at: root) }
@@ -338,12 +505,40 @@ final class PipelineRunnerRetryTests: XCTestCase {
 
         TestFileBuilder.createFile(at: paths.framesSelectedManifestURL, data: Data([0x01]))
         TestFileBuilder.createFile(at: paths.colmapDatabaseURL, data: Data([0x03]))
+        TestFileBuilder.createFile(at: paths.pairGraphEvidenceURL, data: Data([0x04]))
 
         let runner = makeRunner(projectURL: root)
         try runner.test_cleanForRetry(failedStage: .selectFrames, paths: paths)
 
         XCTAssertFalse(FileManager.default.fileExists(atPath: paths.framesSelectedManifestURL.path))
         XCTAssertFalse(FileManager.default.fileExists(atPath: paths.colmapDatabaseURL.path))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: paths.pairGraphEvidenceURL.path))
+    }
+
+    func testCleanForMatchingRetryPreservesFeaturesAndClearsOnlyDownstreamState() throws {
+        let root = try TestFileBuilder.makeTempDir()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let paths = ProjectPaths(root: root)
+        try paths.ensureDirectories()
+        try writeMatchedDatabase(at: paths.colmapDatabaseURL)
+        try Data("stale".utf8).write(to: paths.pairGraphEvidenceURL)
+        try Data("stale".utf8).write(
+            to: paths.colmapSeedURL.appendingPathComponent("stale.txt")
+        )
+
+        try makeRunner(projectURL: root).test_cleanForRetry(
+            failedStage: .sfmMatching,
+            paths: paths
+        )
+
+        XCTAssertTrue(FileManager.default.fileExists(atPath: paths.colmapDatabaseURL.path))
+        XCTAssertEqual(try databaseRowCount("matches", at: paths.colmapDatabaseURL), 0)
+        XCTAssertEqual(
+            try databaseRowCount("two_view_geometries", at: paths.colmapDatabaseURL),
+            0
+        )
+        XCTAssertFalse(FileManager.default.fileExists(atPath: paths.pairGraphEvidenceURL.path))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: paths.colmapSeedURL.path))
     }
 
     func testCleanForRetryRemovesDanglingDatabaseSymlink() throws {
@@ -450,6 +645,7 @@ final class PipelineRunnerRetryTests: XCTestCase {
         try Data("stale".utf8).write(to: sparseSentinel)
         try Data("stale".utf8).write(to: trainingSentinel)
         try Data("stale".utf8).write(to: paths.geometryManifestURL)
+        try Data("stale".utf8).write(to: paths.pairGraphEvidenceURL)
         let publishedOutput = paths.outputURL.appendingPathComponent("splat.ply")
         try TestFileBuilder.writeMinimalPly(at: publishedOutput)
 
@@ -472,8 +668,140 @@ final class PipelineRunnerRetryTests: XCTestCase {
         XCTAssertEqual(try databaseRowCount("two_view_geometries", at: paths.colmapDatabaseURL), 0)
         XCTAssertFalse(FileManager.default.fileExists(atPath: sparseSentinel.path))
         XCTAssertFalse(FileManager.default.fileExists(atPath: paths.geometryManifestURL.path))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: paths.pairGraphEvidenceURL.path))
         XCTAssertFalse(FileManager.default.fileExists(atPath: trainingSentinel.path))
         XCTAssertEqual(ProjectArtifactValidator.validatePlyFile(at: publishedOutput), .valid)
+    }
+
+    private func writeMatchingResumeFixture(
+        at root: URL,
+        route: SfmBackend
+    ) throws -> (paths: ProjectPaths, metadata: ProjectMetadata) {
+        let paths = ProjectPaths(root: root)
+        try paths.ensureDirectories()
+        let imageNames = ["a.jpg", "b.jpg", "c.jpg"]
+        for (index, imageName) in imageNames.enumerated() {
+            try Data("frame-\(index)".utf8).write(
+                to: paths.framesSelectedURL.appendingPathComponent(imageName)
+            )
+        }
+        let manifest = imageNames.map {
+            TestSelectedFrameMapping(
+                outputFileName: $0,
+                groupId: "photos",
+                isVideo: false
+            )
+        }
+        try JSONEncoder().encode(manifest).write(
+            to: paths.framesSelectedManifestURL,
+            options: .atomic
+        )
+
+        var database: OpaquePointer?
+        guard sqlite3_open(paths.colmapDatabaseURL.path, &database) == SQLITE_OK,
+              let database else {
+            throw NSError(domain: "PipelineRunnerRetryTests", code: 1)
+        }
+        let firstPairID = ColmapPairGraphInspector.pairIDDivisor + 2
+        let secondPairID = 2 * ColmapPairGraphInspector.pairIDDivisor + 3
+        let sql = """
+        CREATE TABLE cameras(camera_id INTEGER PRIMARY KEY);
+        CREATE TABLE images(image_id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE, camera_id INTEGER NOT NULL);
+        CREATE TABLE keypoints(image_id INTEGER PRIMARY KEY, rows INTEGER NOT NULL, cols INTEGER NOT NULL, data BLOB);
+        CREATE TABLE descriptors(image_id INTEGER PRIMARY KEY, rows INTEGER NOT NULL, cols INTEGER NOT NULL, data BLOB);
+        CREATE TABLE matches(pair_id INTEGER PRIMARY KEY, rows INTEGER NOT NULL, cols INTEGER NOT NULL, data BLOB);
+        CREATE TABLE two_view_geometries(pair_id INTEGER PRIMARY KEY, rows INTEGER NOT NULL, cols INTEGER NOT NULL, data BLOB, config INTEGER NOT NULL);
+        INSERT INTO cameras(camera_id) VALUES (1);
+        INSERT INTO images(image_id, name, camera_id) VALUES (1, 'a.jpg', 1), (2, 'b.jpg', 1), (3, 'c.jpg', 1);
+        INSERT INTO keypoints(image_id, rows, cols, data) VALUES (1, 64, 4, X'01'), (2, 64, 4, X'02'), (3, 64, 4, X'03');
+        INSERT INTO descriptors(image_id, rows, cols, data) VALUES (1, 64, 128, X'01'), (2, 64, 128, X'02'), (3, 64, 128, X'03');
+        INSERT INTO matches(pair_id, rows, cols, data) VALUES (\(firstPairID), 8, 2, X'01'), (\(secondPairID), 8, 2, X'02');
+        INSERT INTO two_view_geometries(pair_id, rows, cols, data, config) VALUES (\(firstPairID), 6, 2, X'01', 2), (\(secondPairID), 6, 2, X'02', 2);
+        """
+        let sqliteResult = sqlite3_exec(database, sql, nil, nil, nil)
+        sqlite3_close(database)
+        guard sqliteResult == SQLITE_OK else {
+            throw NSError(domain: "PipelineRunnerRetryTests", code: 2)
+        }
+
+        let featureEvidence = ColmapFeatureEvidence(
+            selectedFramesDigest: try GeometryArtifactStore.selectedFramesDigest(
+                orderedImageNames: imageNames,
+                projectPaths: paths
+            ),
+            imageNames: imageNames,
+            featureDatabaseDigest: try ColmapDatabaseDigester
+                .digests(at: paths.colmapDatabaseURL).feature
+        )
+        try ColmapFeatureEvidenceStore.save(
+            featureEvidence,
+            to: paths.colmapFeatureEvidenceURL,
+            projectPaths: paths
+        )
+
+        let plan = try ColmapPairPlan.temporal(
+            groups: [ColmapPairGroup(imageNames: imageNames, isVideo: true)],
+            offsets: [1]
+        )
+        let inspection = try ColmapPairGraphInspector(
+            databaseURL: paths.colmapDatabaseURL
+        ).inspect(
+            schedule: ColmapPairSchedule(imageNames: imageNames, pairs: plan.pairs),
+            completion: .succeeded
+        )
+        let attempt = PairGraphAttemptEvidence(
+            artifact: PairMatchingAttemptArtifact(
+                attemptNumber: 1,
+                matcher: .faiss,
+                recoveryLevel: .normal,
+                outcome: .completed,
+                scheduledPairCount: inspection.scheduledPairCount,
+                attemptedPairCount: inspection.attemptedPairCount,
+                rawMatchedPairCount: inspection.rawMatchedPairCount,
+                spatiallyVerifiedPairCount: inspection.spatiallyVerifiedPairCount,
+                durationSeconds: 0.01
+            ),
+            scheduledPairs: plan.pairs
+        )
+        let evidence = PairGraphEvidence(
+            selectedFramesDigest: try GeometryArtifactStore.selectedFramesDigest(
+                orderedImageNames: imageNames,
+                projectPaths: paths
+            ),
+            imageNames: imageNames,
+            attempts: [attempt],
+            acceptedAttemptNumber: 1,
+            acceptedInspection: inspection,
+            matchingDurationSeconds: 0.01,
+            fallbackReasons: []
+        )
+        try PairGraphEvidenceStore.save(
+            evidence,
+            to: paths.pairGraphEvidenceURL,
+            projectPaths: paths
+        )
+
+        let input = InputSpec.photos(folder: "/tmp/Photos")
+        let options = RequestedRunOptions(
+            detailProfile: .fast,
+            inputOrdering: .unordered,
+            photoSelection: .useAllValidPhotos
+        )
+        let planForRoute = RunPlanResolver.resolve(
+            requestedOptions: options,
+            input: input,
+            hardware: HardwareProfile(memoryGB: 48, cpuCount: 16, gpuWorkingSetGB: 36),
+            developmentOverrides: DevelopmentOverrides(candidateRoute: route)
+        )
+        return (
+            paths,
+            ProjectMetadata(
+                title: "Matching resume",
+                input: input,
+                requestedRunOptions: options,
+                resolvedRunPlan: planForRoute
+            )
+        )
     }
 
     private func writeMatchedDatabase(at url: URL) throws {

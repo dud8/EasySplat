@@ -79,37 +79,89 @@ public struct ColmapMapperOptions: Sendable, Equatable {
     }
 }
 
+public enum ColmapVocabularyRetrievalOptionsValidationError: Error, LocalizedError, Equatable {
+    case candidateCountOutOfRange
+    case neighborCountOutOfRange
+    case neighborCountExceedsCandidateCount
+    case minimumFrameSeparationOutOfRange
+    case threadCountOutOfRange
+
+    public var errorDescription: String? {
+        switch self {
+        case .candidateCountOutOfRange:
+            return "Vocabulary candidate count must be between 1 and 256."
+        case .neighborCountOutOfRange:
+            return "Vocabulary neighbor count must be between 1 and 64."
+        case .neighborCountExceedsCandidateCount:
+            return "Vocabulary neighbor count cannot exceed the candidate count."
+        case .minimumFrameSeparationOutOfRange:
+            return "Vocabulary frame separation must be between 0 and 1,000,000."
+        case .threadCountOutOfRange:
+            return "Vocabulary retrieval thread count must be between 1 and 64."
+        }
+    }
+}
+
+/// Bounded inputs for EasySplat's project-local SIFT vocabulary process boundary.
+public struct ColmapVocabularyRetrievalOptions: Sendable, Equatable {
+    public let candidateCount: Int
+    public let returnedNeighborCount: Int
+    public let minimumFrameSeparation: Int
+    public let threadCount: Int
+
+    public init(
+        candidateCount: Int,
+        returnedNeighborCount: Int,
+        minimumFrameSeparation: Int,
+        threadCount: Int
+    ) throws {
+        guard (1...256).contains(candidateCount) else {
+            throw ColmapVocabularyRetrievalOptionsValidationError.candidateCountOutOfRange
+        }
+        guard (1...64).contains(returnedNeighborCount) else {
+            throw ColmapVocabularyRetrievalOptionsValidationError.neighborCountOutOfRange
+        }
+        guard returnedNeighborCount <= candidateCount else {
+            throw ColmapVocabularyRetrievalOptionsValidationError.neighborCountExceedsCandidateCount
+        }
+        guard (0...1_000_000).contains(minimumFrameSeparation) else {
+            throw ColmapVocabularyRetrievalOptionsValidationError.minimumFrameSeparationOutOfRange
+        }
+        guard (1...64).contains(threadCount) else {
+            throw ColmapVocabularyRetrievalOptionsValidationError.threadCountOutOfRange
+        }
+        self.candidateCount = candidateCount
+        self.returnedNeighborCount = returnedNeighborCount
+        self.minimumFrameSeparation = minimumFrameSeparation
+        self.threadCount = threadCount
+    }
+}
+
 /// Shared COLMAP feature extraction and matching options.
 public struct ColmapOptions: Sendable {
     public var useGPU: Bool
     public var extractThreads: Int
     public var matchThreads: Int
-    public var sequentialOverlap: Int
     public var maxNumFeatures: Int?
     public var maxNumMatches: Int?
     public var descriptorMatcher: DescriptorMatcher
-    public var exhaustiveBlockSize: Int?
     public var environment: [String: String]
 
     public init(
         useGPU: Bool,
         extractThreads: Int,
         matchThreads: Int,
-        sequentialOverlap: Int,
         maxNumFeatures: Int? = nil,
         maxNumMatches: Int? = nil,
         descriptorMatcher: DescriptorMatcher = .faiss,
-        exhaustiveBlockSize: Int? = nil,
         environment: [String: String] = [:]
     ) {
         self.useGPU = useGPU
         self.extractThreads = extractThreads
         self.matchThreads = matchThreads
-        self.sequentialOverlap = sequentialOverlap
         self.maxNumFeatures = maxNumFeatures
         self.maxNumMatches = maxNumMatches
         self.descriptorMatcher = descriptorMatcher
-        self.exhaustiveBlockSize = exhaustiveBlockSize
         self.environment = environment
     }
 
@@ -120,11 +172,9 @@ public struct ColmapOptions: Sendable {
             useGPU: false,
             extractThreads: extractThreads,
             matchThreads: 1,
-            sequentialOverlap: 10,
             maxNumFeatures: 8192,
             maxNumMatches: 8192,
             descriptorMatcher: .faiss,
-            exhaustiveBlockSize: 20,
             environment: [:]
         )
     }
@@ -281,72 +331,47 @@ public final class ColmapRunner {
         try checkResult(result, command: "matches_importer")
     }
 
-    public func runMatcherSequential(
+    public func runLocalVocabularyRetriever(
         colmapPath: URL,
         database: URL,
-        options: ColmapOptions,
+        outputPairListPath: URL,
+        queryImageListPath: URL?,
+        excludedPairListPath: URL?,
+        options: ColmapVocabularyRetrievalOptions,
+        environment: [String: String] = [:],
         onLog: @escaping @Sendable (String, Bool) -> Void
     ) async throws {
-        let args = [
-            "sequential_matcher",
+        var args = [
+            "local_vocab_retriever",
             "--database_path", database.path,
-            "--FeatureMatching.use_gpu", options.useGPU ? "1" : "0",
-            "--FeatureMatching.num_threads", "\(options.matchThreads)",
-            "--SequentialMatching.overlap", "\(options.sequentialOverlap)"
+            "--output_pair_list_path", outputPairListPath.path,
+            "--num_images", "\(options.candidateCount)",
+            "--returned_neighbor_count", "\(options.returnedNeighborCount)",
+            "--minimum_frame_separation", "\(options.minimumFrameSeparation)",
+            "--num_visual_words", "512",
+            "--max_features_per_image", "512",
+            "--max_training_descriptors", "65536",
+            "--num_iterations", "10",
+            "--num_rounds", "1",
+            "--num_checks", "64",
+            "--num_threads", "\(options.threadCount)",
         ]
-        var finalArgs = args
-        if let maxNumMatches = options.maxNumMatches {
-            finalArgs.append(contentsOf: ["--FeatureMatching.max_num_matches", "\(maxNumMatches)"])
+        if let queryImageListPath {
+            args.append(contentsOf: ["--query_image_list_path", queryImageListPath.path])
         }
-        finalArgs.append(contentsOf: [
-            "--SiftMatching.cpu_brute_force_matcher",
-            options.descriptorMatcher == .exact ? "1" : "0",
-        ])
-        onLog("EasySplat: colmap argv: \(colmapPath.path) \(finalArgs.joined(separator: " "))", false)
+        if let excludedPairListPath {
+            args.append(contentsOf: ["--excluded_pair_list_path", excludedPairListPath.path])
+        }
+        onLog("EasySplat: colmap argv: \(colmapPath.path) \(args.joined(separator: " "))", false)
         let result = try await runner.runAsync(
             colmapPath.path,
-            finalArgs,
+            args,
             currentDirectory: nil,
-            environment: options.environment,
+            environment: environment,
             onStdout: { onLog($0, false) },
             onStderr: { onLog($0, true) }
         )
-        try checkResult(result, command: "sequential_matcher")
-    }
-
-    public func runMatcherExhaustive(
-        colmapPath: URL,
-        database: URL,
-        options: ColmapOptions,
-        onLog: @escaping @Sendable (String, Bool) -> Void
-    ) async throws {
-        let args = [
-            "exhaustive_matcher",
-            "--database_path", database.path,
-            "--FeatureMatching.use_gpu", options.useGPU ? "1" : "0",
-            "--FeatureMatching.num_threads", "\(options.matchThreads)"
-        ]
-        var finalArgs = args
-        if let maxNumMatches = options.maxNumMatches {
-            finalArgs.append(contentsOf: ["--FeatureMatching.max_num_matches", "\(maxNumMatches)"])
-        }
-        finalArgs.append(contentsOf: [
-            "--SiftMatching.cpu_brute_force_matcher",
-            options.descriptorMatcher == .exact ? "1" : "0",
-        ])
-        if let blockSize = options.exhaustiveBlockSize {
-            finalArgs.append(contentsOf: ["--ExhaustiveMatching.block_size", "\(blockSize)"])
-        }
-        onLog("EasySplat: colmap argv: \(colmapPath.path) \(finalArgs.joined(separator: " "))", false)
-        let result = try await runner.runAsync(
-            colmapPath.path,
-            finalArgs,
-            currentDirectory: nil,
-            environment: options.environment,
-            onStdout: { onLog($0, false) },
-            onStderr: { onLog($0, true) }
-        )
-        try checkResult(result, command: "exhaustive_matcher")
+        try checkResult(result, command: "local_vocab_retriever")
     }
 
     public func runMapper(

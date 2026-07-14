@@ -3,14 +3,12 @@ import XCTest
 @testable import EasySplatCore
 
 final class ColmapPairEstimatorTests: XCTestCase {
-    func testRetrievalPairPlanningHonorsTaskCancellation() async {
-        let task = Task<[String], Error> {
+    func testTemporalPairPlanningHonorsTaskCancellation() async {
+        let task = Task<ColmapPairPlan, Error> {
             withUnsafeCurrentTask { $0?.cancel() }
-            return try ColmapPairEstimator.boundedRetrievalPairs(
-                imageNames: ["a.jpg", "b.jpg"],
-                descriptors: [[1, 0], [1, 0]],
-                maxNeighbors: 1,
-                minimumSimilarity: 0.5
+            return try ColmapPairPlan.temporal(
+                groups: [ColmapPairGroup(imageNames: ["a.jpg", "b.jpg"], isVideo: true)],
+                offsets: [1]
             )
         }
 
@@ -24,82 +22,108 @@ final class ColmapPairEstimatorTests: XCTestCase {
         }
     }
 
-    func testExpectedSequentialPairs() {
-        XCTAssertEqual(ColmapPairEstimator.expectedSequentialPairs(imageCount: 96, overlap: 10), 905)
+    func testMultiscalePlanSchedulesExactly1745PairsAt250Views() throws {
+        let names = (0..<250).map { String(format: "frame_%06d.jpg", $0) }
+        let plan = try ColmapPairPlan.temporal(
+            groups: [ColmapPairGroup(imageNames: names, isVideo: true)],
+            offsets: [1, 2, 4, 8, 16, 32, 64, 128]
+        )
+
+        XCTAssertEqual(plan.pairs.count, 1_745)
+        XCTAssertEqual(plan.localPairCount, 1_745)
+        XCTAssertEqual(plan.retrievalPairCount, 0)
+        XCTAssertEqual(plan.loopRevisitPairCount, 0)
+        XCTAssertEqual(plan.sha256.count, 64)
+        XCTAssertTrue(plan.validates(plan.serializedData))
     }
 
-    func testExpectedExhaustivePairs() {
-        XCTAssertEqual(ColmapPairEstimator.expectedExhaustivePairs(imageCount: 96), 4560)
+    func testSegmentedPlanNeverCreatesTemporalEdgesAcrossClipsOrPhotos() throws {
+        let plan = try ColmapPairPlan.temporal(
+            groups: [
+                ColmapPairGroup(imageNames: ["a0.jpg", "a1.jpg", "a2.jpg"], isVideo: true),
+                ColmapPairGroup(imageNames: ["b0.jpg", "b1.jpg"], isVideo: true),
+                ColmapPairGroup(imageNames: ["p0.jpg", "p1.jpg"], isVideo: false),
+            ],
+            offsets: [1, 2, 3, 4, 5, 6]
+        )
+
+        XCTAssertEqual(plan.pairLines, [
+            "a0.jpg a1.jpg",
+            "a0.jpg a2.jpg",
+            "a1.jpg a2.jpg",
+            "b0.jpg b1.jpg",
+        ])
+        XCTAssertFalse(plan.pairLines.contains("a2.jpg b0.jpg"))
+        XCTAssertFalse(plan.pairLines.contains("p0.jpg p1.jpg"))
     }
 
-    func testBoundedRetrievalPairsAreDeterministicAtFiveHundredViews() throws {
-        let names = (0..<500).map { String(format: "frame_%06d.jpg", $0) }
-        let descriptors = (0..<500).map { index in
-            let angle = Double(index) * .pi * 2.0 / 500.0
-            return [cos(angle), sin(angle), 0.25]
-        }
+    func testRetrievalUnionDeduplicatesTemporalPairsAndFiltersNearOrderedCandidates() throws {
+        let names = (0..<100).map { String(format: "frame_%03d.jpg", $0) }
+        let temporal = try ColmapPairPlan.temporal(
+            groups: [ColmapPairGroup(imageNames: names, isVideo: true)],
+            offsets: [1]
+        )
+        let result = try temporal.addingRetrievalPairLines(
+            [
+                "frame_000.jpg frame_001.jpg",
+                "frame_000.jpg frame_011.jpg",
+                "frame_000.jpg frame_012.jpg",
+                "frame_099.jpg frame_000.jpg",
+            ],
+            pairingPolicy: .orderedContinuous
+        )
 
-        let first = try ColmapPairEstimator.boundedRetrievalPairs(
-            imageNames: names,
-            descriptors: descriptors,
-            maxNeighbors: 8,
-            minimumSimilarity: 0.7
-        )
-        let second = try ColmapPairEstimator.boundedRetrievalPairs(
-            imageNames: names,
-            descriptors: descriptors,
-            maxNeighbors: 8,
-            minimumSimilarity: 0.7
-        )
+        XCTAssertEqual(result.pairs.count, temporal.pairs.count + 2)
+        XCTAssertEqual(result.loopRevisitPairCount, 2)
+        XCTAssertTrue(result.pairLines.contains("frame_000.jpg frame_012.jpg"))
+        XCTAssertTrue(result.pairLines.contains("frame_000.jpg frame_099.jpg"))
+        XCTAssertFalse(result.pairLines.contains("frame_000.jpg frame_011.jpg"))
+    }
+
+    func testExhaustivePlanIsDeterministicAndClassifiedAsRetrieval() throws {
+        let names = (0..<61).map { String(format: "photo_%03d.jpg", $0) }
+        let first = try ColmapPairPlan.exhaustive(imageNames: names)
+        let second = try ColmapPairPlan.exhaustive(imageNames: names)
 
         XCTAssertEqual(first, second)
-        XCTAssertLessThanOrEqual(first.count, 4_000)
-        XCTAssertGreaterThanOrEqual(first.count, 499)
+        XCTAssertEqual(first.pairs.count, 1_830)
+        XCTAssertEqual(first.retrievalPairCount, 1_830)
+        XCTAssertEqual(first.localPairCount, 0)
+        XCTAssertEqual(first.loopRevisitPairCount, 0)
     }
 
-    func testBoundedRetrievalPairsRejectDisconnectedSceneGraph() {
-        let names = (0..<6).map { "image_\($0).jpg" }
-        let descriptors = [
-            [1.0, 0.0, 0.0], [0.99, 0.1, 0.0], [0.98, 0.2, 0.0],
-            [0.0, 0.0, 1.0], [0.0, 0.1, 0.99], [0.0, 0.2, 0.98],
-        ]
+    func testEmptyPlanCanReceiveRetrievalPairsWithoutTemporalAssumptions() throws {
+        let names = ["photo_a.jpg", "photo_b.jpg", "photo_c.jpg"]
+        let empty = try ColmapPairPlan.empty(imageNames: names)
 
-        XCTAssertThrowsError(try ColmapPairEstimator.boundedRetrievalPairs(
-            imageNames: names,
-            descriptors: descriptors,
-            maxNeighbors: 2
-        )) { error in
-            XCTAssertEqual(error as? ColmapPairPlanningError, .disconnectedGraph)
-        }
+        XCTAssertTrue(empty.pairs.isEmpty)
+        XCTAssertTrue(empty.validates(Data()))
+
+        let retrieved = try empty.addingRetrievalPairLines(
+            ["photo_c.jpg photo_a.jpg", "photo_a.jpg photo_c.jpg"],
+            pairingPolicy: .unorderedRetrieval
+        )
+        XCTAssertEqual(retrieved.pairLines, ["photo_a.jpg photo_c.jpg"])
+        XCTAssertEqual(retrieved.retrievalPairCount, 1)
     }
 
-    func testOrderedLoopPairsIncludeVerifiedFirstLastAndDistantNeighbor() throws {
-        let names = (0..<10).map { "frame_\($0).jpg" }
-        let descriptors = [
-            [1.0, 0.0, 0.0],
-            [0.8, 0.2, 0.0],
-            [0.0, 1.0, 0.0],
-            [0.2, 0.8, 0.0],
-            [0.4, 0.6, 0.0],
-            [0.6, 0.4, 0.0],
-            [0.2, 0.8, 0.0],
-            [0.0, 1.0, 0.0],
-            [0.8, 0.2, 0.0],
-            [1.0, 0.0, 0.0],
-        ]
-
-        let pairs = try ColmapPairEstimator.orderedLoopPairs(
-            imageNames: names,
-            descriptors: descriptors,
-            minimumSeparation: 4,
-            maxNeighbors: 1,
-            minimumSimilarity: 0.95
+    func testConnectivityRejectsSchedulesThatCannotPossiblyJoinAllViews() throws {
+        let names = ["a0.jpg", "a1.jpg", "b0.jpg", "b1.jpg"]
+        let segmented = try ColmapPairPlan.temporal(
+            groups: [
+                ColmapPairGroup(imageNames: Array(names[0...1]), isVideo: true),
+                ColmapPairGroup(imageNames: Array(names[2...3]), isVideo: true),
+            ],
+            offsets: [1]
         )
 
-        XCTAssertTrue(pairs.contains("frame_0.jpg frame_9.jpg"))
-        XCTAssertTrue(pairs.contains("frame_2.jpg frame_7.jpg"))
-        XCTAssertFalse(pairs.contains("frame_0.jpg frame_1.jpg"))
-        XCTAssertEqual(pairs, pairs.sorted())
+        XCTAssertFalse(segmented.isConnected)
+
+        let joined = try segmented.addingRetrievalPairLines(
+            ["a1.jpg b0.jpg"],
+            pairingPolicy: .segmentedMixed
+        )
+        XCTAssertTrue(joined.isConnected)
     }
 
     func testDa3RefinementPairPlanUnionsLoopsAndBindsSerializedDigest() throws {
@@ -150,7 +174,10 @@ final class ColmapPairEstimatorTests: XCTestCase {
             loopPairs: [],
             maxPairCount: 10
         )) { error in
-            XCTAssertEqual(error as? ColmapPairPlanningError, .disconnectedGraph)
+            XCTAssertEqual(
+                error as? ColmapPairPlanningError,
+                .disconnectedPairSchedule
+            )
         }
 
         XCTAssertThrowsError(try ColmapPairEstimator.da3RefinementPairPlan(

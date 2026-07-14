@@ -12,7 +12,7 @@ final class ColmapDatabaseProgressPollerTests: XCTestCase {
         }
 
         let poller = ColmapDatabaseProgressPoller(databasePath: dbURL)
-        XCTAssertEqual(try poller.readProcessedPairCount(), 3)
+        XCTAssertEqual(try poller.readAttemptedPairCount(), 3)
     }
 
     func testFallsBackToMatchesTable() throws {
@@ -23,7 +23,20 @@ final class ColmapDatabaseProgressPollerTests: XCTestCase {
         }
 
         let poller = ColmapDatabaseProgressPoller(databasePath: dbURL)
-        XCTAssertEqual(try poller.readProcessedPairCount(), 2)
+        XCTAssertEqual(try poller.readAttemptedPairCount(), 2)
+    }
+
+    func testCountsAttemptedUnionWhenVerificationLagsRawMatching() throws {
+        let dbURL = try makeTempDatabaseURL()
+        try createDatabase(at: dbURL) { db in
+            try exec(db: db, sql: "CREATE TABLE matches(pair_id INTEGER PRIMARY KEY);")
+            try exec(db: db, sql: "CREATE TABLE two_view_geometries(pair_id INTEGER PRIMARY KEY);")
+            try exec(db: db, sql: "INSERT INTO matches(pair_id) VALUES (1), (2), (3);")
+            try exec(db: db, sql: "INSERT INTO two_view_geometries(pair_id) VALUES (2), (3), (4);")
+        }
+
+        let poller = ColmapDatabaseProgressPoller(databasePath: dbURL)
+        XCTAssertEqual(try poller.readAttemptedPairCount(), 4)
     }
 
     func testReturnsZeroWhenTablesMissing() throws {
@@ -33,7 +46,7 @@ final class ColmapDatabaseProgressPollerTests: XCTestCase {
         }
 
         let poller = ColmapDatabaseProgressPoller(databasePath: dbURL)
-        XCTAssertEqual(try poller.readProcessedPairCount(), 0)
+        XCTAssertEqual(try poller.readAttemptedPairCount(), 0)
     }
 
     private func createColmapSchema(_ db: OpaquePointer) throws {
@@ -134,4 +147,3 @@ final class ColmapDatabaseProgressPollerTests: XCTestCase {
     }
 }
 #endif
-

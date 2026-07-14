@@ -1410,6 +1410,13 @@ if rg -n 'Homebrew|verify_homebrew_lock|build_(colmap|suitesparse|ceres|openimag
 fi
 grep -q 'colmap" mapper -h' "$ROOT/scripts/toolchain/package_toolchain.sh"
 grep -q 'colmap" image_undistorter -h' "$ROOT/scripts/toolchain/package_toolchain.sh"
+grep -Fq 'EASYSPLAT_REQUIRE_REAL_PYCOLMAP=1' "$ROOT/scripts/toolchain/package_toolchain.sh"
+grep -Fq 'test_real_pycolmap_local_vocab_retrieval_is_deterministic' \
+  "$ROOT/scripts/toolchain/package_toolchain.sh"
+sed -n \
+  '/EASYSPLAT_REQUIRE_REAL_PYCOLMAP=1/,/test_real_pycolmap_local_vocab_retrieval_is_deterministic/p' \
+  "$ROOT/scripts/toolchain/package_toolchain.sh" \
+  | grep -Fq 'PYTHONPATH="$OUT/da3_mps/app"'
 if grep -q 'colmap" global_mapper -h' "$ROOT/scripts/toolchain/package_toolchain.sh"; then
   echo "Toolchain package probes the removed global_mapper facade." >&2
   exit 1

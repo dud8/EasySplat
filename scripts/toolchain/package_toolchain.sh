@@ -470,6 +470,14 @@ if not callable(getattr(pycolmap, "match_image_pairs", None)):
     raise SystemExit("packaged PyCOLMAP is missing native imported-pair matching")
 PY
 
+EASYSPLAT_REQUIRE_REAL_PYCOLMAP=1 \
+  PYTHONNOUSERSITE=1 \
+  PYTHONDONTWRITEBYTECODE=1 \
+  PYTHONPATH="$OUT/da3_mps/app" \
+  "$OUT/da3_mps/python/bin/python3" \
+  "$ROOT/Tools/Da3Sfm/tests/test_colmap_cli.py" \
+  ColmapCliTests.test_real_pycolmap_local_vocab_retrieval_is_deterministic
+
 "$BIN/colmap" -h >/dev/null 2>&1 || { echo "colmap bridge failed to launch" >&2; exit 1; }
 "$BIN/colmap" feature_extractor -h >/dev/null 2>&1 || { echo "colmap bridge missing feature_extractor" >&2; exit 1; }
 "$BIN/colmap" mapper -h >/dev/null 2>&1 || { echo "colmap bridge missing mapper" >&2; exit 1; }

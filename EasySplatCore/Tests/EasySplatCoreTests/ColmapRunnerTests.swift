@@ -32,8 +32,7 @@ final class ColmapRunnerTests: XCTestCase {
             options: ColmapOptions(
                 useGPU: false,
                 extractThreads: 1,
-                matchThreads: 1,
-                sequentialOverlap: 10
+                matchThreads: 1
             ),
             mapperOptions: try ColmapMapperOptions(
                 globalFramesRatio: 1.4,
@@ -147,7 +146,6 @@ final class ColmapRunnerTests: XCTestCase {
                 useGPU: false,
                 extractThreads: 2,
                 matchThreads: 1,
-                sequentialOverlap: 10,
                 maxNumFeatures: 5000
             ),
             onLog: { _, _ in }
@@ -177,66 +175,7 @@ final class ColmapRunnerTests: XCTestCase {
             options: ColmapOptions(
                 useGPU: false,
                 extractThreads: 2,
-                matchThreads: 1,
-                sequentialOverlap: 10
-            ),
-            onLog: { _, _ in }
-        )
-    }
-
-    func testExhaustiveMatcherUsesFaissByDefault() async throws {
-        let runner = MockSubprocessRunner(scripts: [
-            .init(
-                path: "/mock/colmap",
-                argsPrefix: ["exhaustive_matcher"],
-                result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""),
-                onRun: { args in
-                    XCTAssertEqual(self.value(for: "--FeatureMatching.max_num_matches", in: args), "7000")
-                    XCTAssertEqual(self.value(for: "--SiftMatching.cpu_brute_force_matcher", in: args), "0")
-                    XCTAssertEqual(self.value(for: "--ExhaustiveMatching.block_size", in: args), "12")
-                }
-            )
-        ])
-
-        let colmap = ColmapRunner(runner: runner)
-        try await colmap.runMatcherExhaustive(
-            colmapPath: URL(fileURLWithPath: "/mock/colmap"),
-            database: URL(fileURLWithPath: "/tmp/db"),
-            options: ColmapOptions(
-                useGPU: false,
-                extractThreads: 1,
-                matchThreads: 1,
-                sequentialOverlap: 10,
-                maxNumMatches: 7000,
-                exhaustiveBlockSize: 12
-            ),
-            onLog: { _, _ in }
-        )
-    }
-
-    func testSequentialMatcherUsesFaissByDefault() async throws {
-        let runner = MockSubprocessRunner(scripts: [
-            .init(
-                path: "/mock/colmap",
-                argsPrefix: ["sequential_matcher"],
-                result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""),
-                onRun: { args in
-                    XCTAssertEqual(self.value(for: "--FeatureMatching.max_num_matches", in: args), "9000")
-                    XCTAssertEqual(self.value(for: "--SiftMatching.cpu_brute_force_matcher", in: args), "0")
-                }
-            )
-        ])
-
-        let colmap = ColmapRunner(runner: runner)
-        try await colmap.runMatcherSequential(
-            colmapPath: URL(fileURLWithPath: "/mock/colmap"),
-            database: URL(fileURLWithPath: "/tmp/db"),
-            options: ColmapOptions(
-                useGPU: false,
-                extractThreads: 1,
-                matchThreads: 1,
-                sequentialOverlap: 5,
-                maxNumMatches: 9000
+                matchThreads: 1
             ),
             onLog: { _, _ in }
         )
@@ -264,11 +203,77 @@ final class ColmapRunnerTests: XCTestCase {
             options: ColmapOptions(
                 useGPU: false,
                 extractThreads: 1,
-                matchThreads: 1,
-                sequentialOverlap: 5
+                matchThreads: 1
             ),
             onLog: { _, _ in }
         )
+    }
+
+    func testLocalVocabularyRetrieverUsesPinnedOfflineConfiguration() async throws {
+        let runner = MockSubprocessRunner(scripts: [
+            .init(
+                path: "/mock/colmap",
+                argsPrefix: ["local_vocab_retriever"],
+                result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""),
+                onRun: { args in
+                    XCTAssertEqual(self.value(for: "--database_path", in: args), "/tmp/database.db")
+                    XCTAssertEqual(self.value(for: "--output_pair_list_path", in: args), "/tmp/retrieval.txt")
+                    XCTAssertEqual(self.value(for: "--query_image_list_path", in: args), "/tmp/queries.txt")
+                    XCTAssertEqual(self.value(for: "--excluded_pair_list_path", in: args), "/tmp/excluded.txt")
+                    XCTAssertEqual(self.value(for: "--num_images", in: args), "40")
+                    XCTAssertEqual(self.value(for: "--returned_neighbor_count", in: args), "16")
+                    XCTAssertEqual(self.value(for: "--minimum_frame_separation", in: args), "25")
+                    XCTAssertEqual(self.value(for: "--num_visual_words", in: args), "512")
+                    XCTAssertEqual(self.value(for: "--max_features_per_image", in: args), "512")
+                    XCTAssertEqual(self.value(for: "--max_training_descriptors", in: args), "65536")
+                    XCTAssertEqual(self.value(for: "--num_iterations", in: args), "10")
+                    XCTAssertEqual(self.value(for: "--num_rounds", in: args), "1")
+                    XCTAssertEqual(self.value(for: "--num_checks", in: args), "64")
+                    XCTAssertEqual(self.value(for: "--num_threads", in: args), "8")
+                }
+            )
+        ])
+
+        try await ColmapRunner(runner: runner).runLocalVocabularyRetriever(
+            colmapPath: URL(fileURLWithPath: "/mock/colmap"),
+            database: URL(fileURLWithPath: "/tmp/database.db"),
+            outputPairListPath: URL(fileURLWithPath: "/tmp/retrieval.txt"),
+            queryImageListPath: URL(fileURLWithPath: "/tmp/queries.txt"),
+            excludedPairListPath: URL(fileURLWithPath: "/tmp/excluded.txt"),
+            options: try ColmapVocabularyRetrievalOptions(
+                candidateCount: 40,
+                returnedNeighborCount: 16,
+                minimumFrameSeparation: 25,
+                threadCount: 8
+            ),
+            onLog: { _, _ in }
+        )
+    }
+
+    func testLocalVocabularyRetrieverRejectsInvalidConfiguration() {
+        XCTAssertThrowsError(try ColmapVocabularyRetrievalOptions(
+            candidateCount: 8,
+            returnedNeighborCount: 9,
+            minimumFrameSeparation: 0,
+            threadCount: 1
+        )) { error in
+            XCTAssertEqual(
+                error as? ColmapVocabularyRetrievalOptionsValidationError,
+                .neighborCountExceedsCandidateCount
+            )
+        }
+        XCTAssertThrowsError(try ColmapVocabularyRetrievalOptions(
+            candidateCount: 20,
+            returnedNeighborCount: 8,
+            minimumFrameSeparation: -1,
+            threadCount: 1
+        ))
+        XCTAssertThrowsError(try ColmapVocabularyRetrievalOptions(
+            candidateCount: 20,
+            returnedNeighborCount: 8,
+            minimumFrameSeparation: 0,
+            threadCount: 0
+        ))
     }
 
     func testExactRecoveryUsesBruteForceMatching() async throws {
@@ -293,7 +298,6 @@ final class ColmapRunnerTests: XCTestCase {
                 useGPU: false,
                 extractThreads: 1,
                 matchThreads: 1,
-                sequentialOverlap: 5,
                 descriptorMatcher: .exact
             ),
             onLog: { _, _ in }
@@ -322,7 +326,7 @@ final class ColmapRunnerTests: XCTestCase {
             imagePath: URL(fileURLWithPath: "/tmp/images"),
             inputPath: URL(fileURLWithPath: "/tmp/seed"),
             outputPath: URL(fileURLWithPath: "/tmp/sparse"),
-            options: ColmapOptions(useGPU: false, extractThreads: 1, matchThreads: 1, sequentialOverlap: 10),
+            options: ColmapOptions(useGPU: false, extractThreads: 1, matchThreads: 1),
             onLog: { _, _ in }
         )
     }
@@ -349,7 +353,7 @@ final class ColmapRunnerTests: XCTestCase {
             colmapPath: URL(fileURLWithPath: "/mock/colmap"),
             inputPath: URL(fileURLWithPath: "/tmp/in"),
             outputPath: URL(fileURLWithPath: "/tmp/out"),
-            options: ColmapOptions(useGPU: false, extractThreads: 1, matchThreads: 1, sequentialOverlap: 10),
+            options: ColmapOptions(useGPU: false, extractThreads: 1, matchThreads: 1),
             bundleOptions: ColmapBundleAdjustmentOptions(
                 maxNumIterations: 35,
                 refineFocalLength: false,
@@ -385,7 +389,7 @@ final class ColmapRunnerTests: XCTestCase {
             colmapPath: URL(fileURLWithPath: "/mock/colmap"),
             inputPath: inputPath,
             outputPath: outputPath,
-            options: ColmapOptions(useGPU: false, extractThreads: 1, matchThreads: 1, sequentialOverlap: 10),
+            options: ColmapOptions(useGPU: false, extractThreads: 1, matchThreads: 1),
             bundleOptions: ColmapBundleAdjustmentOptions(
                 maxNumIterations: 10,
                 refineFocalLength: true,
@@ -428,7 +432,7 @@ final class ColmapRunnerTests: XCTestCase {
             colmapPath: URL(fileURLWithPath: "/mock/colmap"),
             inputPath: URL(fileURLWithPath: "/tmp/in"),
             outputPath: URL(fileURLWithPath: "/tmp/out"),
-            options: ColmapOptions(useGPU: false, extractThreads: 1, matchThreads: 1, sequentialOverlap: 10),
+            options: ColmapOptions(useGPU: false, extractThreads: 1, matchThreads: 1),
             bundleOptions: ColmapBundleAdjustmentOptions(
                 maxNumIterations: 20,
                 refineFocalLength: true,

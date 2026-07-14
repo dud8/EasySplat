@@ -66,11 +66,9 @@ extension PipelineRunner {
             useGPU: false,
             extractThreads: extractThreads,
             matchThreads: 1,
-            sequentialOverlap: 10,
             maxNumFeatures: 8192,
             maxNumMatches: nil,
             descriptorMatcher: .faiss,
-            exhaustiveBlockSize: nil,
             environment: [
                 "OMP_NUM_THREADS": "\(extractThreads)",
                 "OPENBLAS_NUM_THREADS": "\(extractThreads)",
@@ -86,11 +84,9 @@ extension PipelineRunner {
             useGPU: false,
             extractThreads: matchThreads,
             matchThreads: matchThreads,
-            sequentialOverlap: 10,
             maxNumFeatures: nil,
             maxNumMatches: 8192,
             descriptorMatcher: .faiss,
-            exhaustiveBlockSize: 20,
             environment: [
                 "OMP_NUM_THREADS": "\(matchThreads)",
                 "OPENBLAS_NUM_THREADS": "\(matchThreads)",

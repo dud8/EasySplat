@@ -5,6 +5,121 @@ import XCTest
 @testable import EasySplatCore
 
 final class ColmapDatabaseMatchStoreTests: XCTestCase {
+    func testClearMatchingResultsRejectsHardLinkWithoutTouchingExternalDatabase() throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        let projectDirectory = directory.appendingPathComponent("Project", isDirectory: true)
+        let externalDatabase = directory.appendingPathComponent("external.db")
+        let projectDatabase = projectDirectory.appendingPathComponent("database.db")
+        try FileManager.default.createDirectory(
+            at: projectDirectory,
+            withIntermediateDirectories: true
+        )
+        defer { try? FileManager.default.removeItem(at: directory) }
+
+        do {
+            var handle: OpaquePointer?
+            XCTAssertEqual(sqlite3_open(externalDatabase.path, &handle), SQLITE_OK)
+            guard let handle else {
+                XCTFail("Could not create external fixture database")
+                return
+            }
+            defer { sqlite3_close(handle) }
+            try execute(
+                """
+                CREATE TABLE matches(pair_id INTEGER PRIMARY KEY, rows INTEGER);
+                CREATE TABLE two_view_geometries(pair_id INTEGER PRIMARY KEY, rows INTEGER);
+                INSERT INTO matches VALUES (2147483649, 80);
+                INSERT INTO two_view_geometries VALUES (2147483649, 64);
+                """,
+                in: handle
+            )
+        }
+        try FileManager.default.linkItem(at: externalDatabase, to: projectDatabase)
+
+        XCTAssertThrowsError(
+            try ColmapDatabaseMatchStore.clearMatchingResults(at: projectDatabase)
+        ) { error in
+            XCTAssertEqual(
+                error as? ColmapDatabaseMatchStoreError,
+                .unsafeDatabaseFile
+            )
+        }
+        var verificationHandle: OpaquePointer?
+        XCTAssertEqual(
+            sqlite3_open_v2(externalDatabase.path, &verificationHandle, SQLITE_OPEN_READONLY, nil),
+            SQLITE_OK
+        )
+        guard let verificationHandle else {
+            XCTFail("Could not reopen external fixture database")
+            return
+        }
+        defer { sqlite3_close(verificationHandle) }
+        XCTAssertEqual(try count("matches", in: verificationHandle), 1)
+        XCTAssertEqual(try count("two_view_geometries", in: verificationHandle), 1)
+    }
+
+    func testClearMatchingResultsRejectsSymlinkWithoutTouchingExternalDatabase() throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        let projectDirectory = directory.appendingPathComponent("Project", isDirectory: true)
+        let externalDatabase = directory.appendingPathComponent("external.db")
+        let projectDatabase = projectDirectory.appendingPathComponent("database.db")
+        try FileManager.default.createDirectory(
+            at: projectDirectory,
+            withIntermediateDirectories: true
+        )
+        defer { try? FileManager.default.removeItem(at: directory) }
+
+        var handle: OpaquePointer?
+        XCTAssertEqual(sqlite3_open(externalDatabase.path, &handle), SQLITE_OK)
+        guard let handle else {
+            XCTFail("Could not create external fixture database")
+            return
+        }
+        defer { sqlite3_close(handle) }
+        try execute(
+            """
+            CREATE TABLE matches(pair_id INTEGER PRIMARY KEY, rows INTEGER);
+            CREATE TABLE two_view_geometries(pair_id INTEGER PRIMARY KEY, rows INTEGER);
+            INSERT INTO matches VALUES (2147483649, 80);
+            INSERT INTO two_view_geometries VALUES (2147483649, 64);
+            """,
+            in: handle
+        )
+        try FileManager.default.createSymbolicLink(
+            at: projectDatabase,
+            withDestinationURL: externalDatabase
+        )
+
+        XCTAssertThrowsError(
+            try ColmapDatabaseMatchStore.clearMatchingResults(at: projectDatabase)
+        ) { error in
+            XCTAssertEqual(
+                error as? ColmapDatabaseMatchStoreError,
+                .unsafeDatabaseFile
+            )
+        }
+        XCTAssertEqual(try count("matches", in: handle), 1)
+        XCTAssertEqual(try count("two_view_geometries", in: handle), 1)
+    }
+
+    func testClearMatchingResultsRejectsDirectory() throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+
+        XCTAssertThrowsError(
+            try ColmapDatabaseMatchStore.clearMatchingResults(at: directory)
+        ) { error in
+            XCTAssertEqual(
+                error as? ColmapDatabaseMatchStoreError,
+                .unsafeDatabaseFile
+            )
+        }
+    }
+
     func testClearMatchingResultsPreservesFeaturesAndCameras() throws {
         let database = FileManager.default.temporaryDirectory
             .appendingPathComponent(UUID().uuidString)
@@ -71,7 +186,12 @@ final class ColmapDatabaseMatchStoreTests: XCTestCase {
 
         XCTAssertThrowsError(
             try ColmapDatabaseMatchStore.clearMatchingResults(at: database)
-        )
+        ) { error in
+            guard case let .operationFailed(operation, _, _) = error as? ColmapDatabaseMatchStoreError else {
+                return XCTFail("Expected the verified-match delete to fail")
+            }
+            XCTAssertEqual(operation, "clear verified matches")
+        }
         XCTAssertEqual(try count("matches", in: handle), 1)
     }
 

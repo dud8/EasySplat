@@ -69,6 +69,7 @@ final class PipelineIntegrationTests: XCTestCase {
                 result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""),
                 onRun: { args in
                     XCTAssertEqual(self.value(for: "--SiftExtraction.max_image_size", in: args), "1024")
+                    try? self.writeFeatureDatabase(for: args)
                 }
             )
         ])
@@ -113,12 +114,24 @@ final class PipelineIntegrationTests: XCTestCase {
         let powerAssertion = RecordingPowerAssertion()
 
         let runner = MockSubprocessRunner(scripts: [
-            .init(path: toolchain.colmap.path, argsPrefix: ["feature_extractor"], result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""), onRun: { _ in
+            .init(path: toolchain.colmap.path, argsPrefix: ["feature_extractor"], result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""), onRun: { args in
                 let loaded = try? ProjectMetadataStore.load(from: paths.metadataURL)
                 runStartProbe.record(observed: loaded?.lastRunStartedAt != nil)
                 XCTAssertEqual(powerAssertion.active, 1, "The assertion must still be active while subprocess work is running.")
+                try? self.writeFeatureDatabase(for: args)
             }),
-            .init(path: toolchain.colmap.path, argsPrefix: ["exhaustive_matcher"], result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""), onRun: nil),
+            .init(
+                path: toolchain.colmap.path,
+                argsPrefix: ["local_vocab_retriever"],
+                result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""),
+                onRun: { try? self.writeVocabularyOutput(for: $0, connectQueries: true) }
+            ),
+            .init(
+                path: toolchain.colmap.path,
+                argsPrefix: ["matches_importer"],
+                result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""),
+                onRun: { try? self.writeVerifiedPairResults(for: $0) }
+            ),
             .init(
                 path: toolchain.colmap.path,
                 argsPrefix: ["mapper"],
@@ -183,7 +196,11 @@ final class PipelineIntegrationTests: XCTestCase {
         XCTAssertEqual(geometry.provenance.solver.identifier, "colmap")
         XCTAssertNil(geometry.provenance.runtime)
         XCTAssertNil(geometry.provenance.model)
-        XCTAssertEqual(geometry.pairGraph.status, .notEvaluated)
+        XCTAssertEqual(geometry.pairGraph.status, .measured)
+        let pairGraph = try XCTUnwrap(geometry.pairGraph.measurement)
+        XCTAssertEqual(pairGraph.connectedComponentCount, 1)
+        XCTAssertEqual(pairGraph.isolatedViewCount, 0)
+        XCTAssertGreaterThan(pairGraph.retrievalPairCount, 0)
         XCTAssertEqual(geometry.pairGraph.mappingAttemptNumber, 1)
         XCTAssertEqual(geometry.pairGraph.bundleAdjustmentCycleCount, 2)
         XCTAssertNil(geometry.pairGraph.fallbackReason)
@@ -221,14 +238,25 @@ final class PipelineIntegrationTests: XCTestCase {
         try ProjectMetadataStore.save(metadata, to: paths.metadataURL)
         let toolchain = try makeToolchain(root: temp)
         let runner = MockSubprocessRunner(scripts: [
-            .init(path: toolchain.colmap.path, argsPrefix: ["feature_extractor"], result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""), onRun: nil),
-            .init(path: toolchain.colmap.path, argsPrefix: ["sequential_matcher"], result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""), onRun: nil),
+            .init(path: toolchain.colmap.path, argsPrefix: ["feature_extractor"], result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""), onRun: { try? self.writeFeatureDatabase(for: $0) }),
+            .init(
+                path: toolchain.colmap.path,
+                argsPrefix: ["local_vocab_retriever"],
+                result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""),
+                onRun: {
+                    try? self.writeVocabularyOutput(
+                        for: $0,
+                        pairLines: ["frame_000000.jpg frame_000029.jpg"]
+                    )
+                }
+            ),
             .init(path: toolchain.colmap.path, argsPrefix: ["matches_importer"], result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""), onRun: { args in
                 guard let path = self.value(for: "--match_list_path", in: args),
                       let pairs = try? String(contentsOfFile: path, encoding: .utf8) else {
                     return XCTFail("Loop pair list was not readable")
                 }
                 XCTAssertTrue(pairs.contains("frame_000000.jpg frame_000029.jpg"))
+                try? self.writeVerifiedPairResults(for: args)
             }),
             .init(path: toolchain.colmap.path, argsPrefix: ["mapper"], result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""), stdoutLines: ["Retriangulation and Global bundle adjustment"], onRun: { args in
                 XCTAssertEqual(self.value(for: "--Mapper.ba_global_frames_ratio", in: args), "1.4")
@@ -250,9 +278,15 @@ final class PipelineIntegrationTests: XCTestCase {
         try await pipeline.run { _ in }
 
         let commands = runner.calls.compactMap { $0.1.first }
-        XCTAssertTrue(commands.contains("sequential_matcher"))
+        XCTAssertTrue(commands.contains("local_vocab_retriever"))
         XCTAssertTrue(commands.contains("matches_importer"))
-        XCTAssertFalse(commands.contains("exhaustive_matcher"))
+        let geometry = try GeometryArtifactStore.load(
+            from: paths.geometryManifestURL,
+            projectPaths: paths
+        )
+        let pairGraph = try XCTUnwrap(geometry.pairGraph.measurement)
+        XCTAssertEqual(pairGraph.localPairCount, 119)
+        XCTAssertEqual(pairGraph.loopRevisitPairCount, 1)
     }
 
     func testFaissCrashRetriesExactMatchingWithoutReextractingFeatures() async throws {
@@ -286,9 +320,9 @@ final class PipelineIntegrationTests: XCTestCase {
                 path: toolchain.colmap.path,
                 argsPrefix: ["feature_extractor"],
                 result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""),
-                onRun: { _ in
+                onRun: { args in
                     do {
-                        try self.writeMatchableColmapDatabase(at: paths.colmapDatabaseURL)
+                        try self.writeFeatureDatabase(for: args)
                     } catch {
                         XCTFail("Could not create COLMAP database fixture: \(error)")
                     }
@@ -296,7 +330,13 @@ final class PipelineIntegrationTests: XCTestCase {
             ),
             .init(
                 path: toolchain.colmap.path,
-                argsPrefix: ["sequential_matcher"],
+                argsPrefix: ["local_vocab_retriever"],
+                result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""),
+                onRun: { try? self.writeVocabularyOutput(for: $0) }
+            ),
+            .init(
+                path: toolchain.colmap.path,
+                argsPrefix: ["matches_importer"],
                 result: .init(
                     exitCode: SIGSEGV,
                     terminationReason: .uncaughtSignal,
@@ -309,11 +349,9 @@ final class PipelineIntegrationTests: XCTestCase {
             ),
             .init(
                 path: toolchain.colmap.path,
-                argsPrefix: ["sequential_matcher"],
+                argsPrefix: ["local_vocab_retriever"],
                 result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""),
-                onRun: { args in
-                    XCTAssertEqual(self.value(for: "--SiftMatching.cpu_brute_force_matcher", in: args), "1")
-                }
+                onRun: { try? self.writeVocabularyOutput(for: $0) }
             ),
             .init(
                 path: toolchain.colmap.path,
@@ -321,6 +359,7 @@ final class PipelineIntegrationTests: XCTestCase {
                 result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""),
                 onRun: { args in
                     XCTAssertEqual(self.value(for: "--SiftMatching.cpu_brute_force_matcher", in: args), "1")
+                    try? self.writeVerifiedPairResults(for: args)
                 }
             ),
             .init(
@@ -362,7 +401,8 @@ final class PipelineIntegrationTests: XCTestCase {
 
         let commands = runner.calls.compactMap { $0.1.first }
         XCTAssertEqual(commands.filter { $0 == "feature_extractor" }.count, 1)
-        XCTAssertEqual(commands.filter { $0 == "sequential_matcher" }.count, 2)
+        XCTAssertEqual(commands.filter { $0 == "local_vocab_retriever" }.count, 2)
+        XCTAssertEqual(commands.filter { $0 == "matches_importer" }.count, 2)
         XCTAssertNotNil(events.stageLog(containing: "preserving features and retrying with exact matching"))
         let geometry = try GeometryArtifactStore.load(
             from: paths.geometryManifestURL,
@@ -407,9 +447,7 @@ final class PipelineIntegrationTests: XCTestCase {
                 path: toolchain.colmap.path,
                 argsPrefix: ["feature_extractor"],
                 result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""),
-                onRun: { _ in
-                    try? self.writeMatchableColmapDatabase(at: paths.colmapDatabaseURL)
-                }
+                onRun: { try? self.writeFeatureDatabase(for: $0) }
             )
         ])
         let featurePipeline = PipelineRunner(
@@ -423,6 +461,16 @@ final class PipelineIntegrationTests: XCTestCase {
             tooling: .init(runner: featureRunner)
         )
         try await featurePipeline.run { _ in }
+        let partialPairs = temp.appendingPathComponent("partial-pairs.txt")
+        try "frame_000000.jpg frame_000001.jpg\n".write(
+            to: partialPairs,
+            atomically: true,
+            encoding: .utf8
+        )
+        try writeVerifiedPairResults(for: [
+            "--database_path", paths.colmapDatabaseURL.path,
+            "--match_list_path", partialPairs.path,
+        ])
         try markMatchingAsInterrupted(paths: paths)
         XCTAssertEqual(try databaseRowCount("matches", at: paths.colmapDatabaseURL), 1)
         XCTAssertEqual(
@@ -433,7 +481,7 @@ final class PipelineIntegrationTests: XCTestCase {
         let resumeRunner = MockSubprocessRunner(scripts: [
             .init(
                 path: toolchain.colmap.path,
-                argsPrefix: ["exhaustive_matcher"],
+                argsPrefix: ["matches_importer"],
                 result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""),
                 onRun: { args in
                     XCTAssertEqual(
@@ -451,6 +499,7 @@ final class PipelineIntegrationTests: XCTestCase {
                         ),
                         0
                     )
+                    try? self.writeVerifiedPairResults(for: args)
                 }
             ),
             .init(
@@ -524,14 +573,13 @@ final class PipelineIntegrationTests: XCTestCase {
                 path: toolchain.colmap.path,
                 argsPrefix: ["feature_extractor"],
                 result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""),
-                onRun: { _ in
-                    try? self.writeMatchableColmapDatabase(at: paths.colmapDatabaseURL)
-                }
+                onRun: { try? self.writeFeatureDatabase(for: $0) }
             ),
             .init(
                 path: toolchain.colmap.path,
-                argsPrefix: ["exhaustive_matcher"],
-                result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: "")
+                argsPrefix: ["matches_importer"],
+                result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""),
+                onRun: { try? self.writeVerifiedPairResults(for: $0) }
             ),
             .init(
                 path: toolchain.colmap.path,
@@ -565,14 +613,14 @@ final class PipelineIntegrationTests: XCTestCase {
         var staleMetadata = try ProjectMetadataStore.load(from: paths.metadataURL)
         staleMetadata.resolvedRunPlan?.baGlobalFramesRatio = 1.2
         try ProjectMetadataStore.save(staleMetadata, to: paths.metadataURL)
-        XCTAssertEqual(try databaseRowCount("matches", at: paths.colmapDatabaseURL), 1)
+        XCTAssertEqual(try databaseRowCount("matches", at: paths.colmapDatabaseURL), 28)
 
         let resumeRunner = MockSubprocessRunner(scripts: [
             .init(
                 path: toolchain.colmap.path,
-                argsPrefix: ["exhaustive_matcher"],
+                argsPrefix: ["matches_importer"],
                 result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""),
-                onRun: { _ in
+                onRun: { args in
                     XCTAssertEqual(
                         try? self.databaseRowCount("matches", at: paths.colmapDatabaseURL),
                         0
@@ -584,6 +632,7 @@ final class PipelineIntegrationTests: XCTestCase {
                         ),
                         0
                     )
+                    try? self.writeVerifiedPairResults(for: args)
                 }
             ),
             .init(
@@ -617,12 +666,12 @@ final class PipelineIntegrationTests: XCTestCase {
         try await resumedPipeline.run(resumeFrom: .sfmMapping) { events.append($0) }
 
         XCTAssertFalse(resumeRunner.calls.contains { $0.1.first == "feature_extractor" })
-        XCTAssertEqual(resumeRunner.calls.filter { $0.1.first == "exhaustive_matcher" }.count, 1)
+        XCTAssertEqual(resumeRunner.calls.filter { $0.1.first == "matches_importer" }.count, 1)
         XCTAssertEqual(resumeRunner.calls.filter { $0.1.first == "mapper" }.count, 1)
         XCTAssertNotNil(events.stageLog(containing: "Discarded stale image matches"))
     }
 
-    func testFaissCrashOnSequentialRetryUsesExactMatchingWithoutReextractingFeatures() async throws {
+    func testFaissCrashOnDenserRetryUsesExactMatchingWithoutReextractingFeatures() async throws {
         let temp = makeTempRoot()
         let projectURL = temp.appendingPathComponent("FaissRetryRecovery.easysplatproj", isDirectory: true)
         let sourcePhotos = temp.appendingPathComponent("SourcePhotos", isDirectory: true)
@@ -653,25 +702,32 @@ final class PipelineIntegrationTests: XCTestCase {
                 path: toolchain.colmap.path,
                 argsPrefix: ["feature_extractor"],
                 result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""),
-                onRun: { _ in
-                    do {
-                        try self.writeMatchableColmapDatabase(at: paths.colmapDatabaseURL)
-                    } catch {
-                        XCTFail("Could not create COLMAP database fixture: \(error)")
-                    }
-                }
+                onRun: { try? self.writeFeatureDatabase(for: $0) }
             ),
             .init(
                 path: toolchain.colmap.path,
-                argsPrefix: ["sequential_matcher"],
-                result: .init(exitCode: 1, terminationReason: .exit, stdout: "", stderr: "matching failed"),
+                argsPrefix: ["local_vocab_retriever"],
+                result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""),
+                onRun: { try? self.writeVocabularyOutput(for: $0) }
+            ),
+            .init(
+                path: toolchain.colmap.path,
+                argsPrefix: ["matches_importer"],
+                result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""),
                 onRun: { args in
                     XCTAssertEqual(self.value(for: "--SiftMatching.cpu_brute_force_matcher", in: args), "0")
+                    try? self.writeVerifiedPairResults(for: args, verifiedRows: 0)
                 }
             ),
             .init(
                 path: toolchain.colmap.path,
-                argsPrefix: ["sequential_matcher"],
+                argsPrefix: ["local_vocab_retriever"],
+                result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""),
+                onRun: { try? self.writeVocabularyOutput(for: $0) }
+            ),
+            .init(
+                path: toolchain.colmap.path,
+                argsPrefix: ["matches_importer"],
                 result: .init(
                     exitCode: SIGSEGV,
                     terminationReason: .uncaughtSignal,
@@ -684,11 +740,9 @@ final class PipelineIntegrationTests: XCTestCase {
             ),
             .init(
                 path: toolchain.colmap.path,
-                argsPrefix: ["sequential_matcher"],
+                argsPrefix: ["local_vocab_retriever"],
                 result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""),
-                onRun: { args in
-                    XCTAssertEqual(self.value(for: "--SiftMatching.cpu_brute_force_matcher", in: args), "1")
-                }
+                onRun: { try? self.writeVocabularyOutput(for: $0) }
             ),
             .init(
                 path: toolchain.colmap.path,
@@ -696,6 +750,7 @@ final class PipelineIntegrationTests: XCTestCase {
                 result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""),
                 onRun: { args in
                     XCTAssertEqual(self.value(for: "--SiftMatching.cpu_brute_force_matcher", in: args), "1")
+                    try? self.writeVerifiedPairResults(for: args)
                 }
             ),
             .init(
@@ -737,12 +792,19 @@ final class PipelineIntegrationTests: XCTestCase {
 
         let commands = runner.calls.compactMap { $0.1.first }
         XCTAssertEqual(commands.filter { $0 == "feature_extractor" }.count, 1)
-        XCTAssertEqual(commands.filter { $0 == "sequential_matcher" }.count, 3)
-        XCTAssertFalse(commands.contains("exhaustive_matcher"))
+        XCTAssertEqual(commands.filter { $0 == "local_vocab_retriever" }.count, 3)
+        XCTAssertEqual(commands.filter { $0 == "matches_importer" }.count, 3)
         XCTAssertNotNil(events.stageLog(containing: "preserving features and retrying with exact matching"))
+        let geometry = try GeometryArtifactStore.load(
+            from: paths.geometryManifestURL,
+            projectPaths: paths
+        )
+        let attempts = try XCTUnwrap(geometry.pairGraph.measurement).matcherAttempts
+        XCTAssertEqual(attempts.map(\.recoveryLevel), [.normal, .expanded, .expanded])
+        XCTAssertEqual(attempts.map(\.matcher), [.faiss, .faiss, .exact])
     }
 
-    func testFewerFrameRecoveryAfterExactFailureReextractsFeatures() async throws {
+    func testExactMatchingContinuesDensityLadderWithoutReextractingFeatures() async throws {
         let temp = makeTempRoot()
         let projectURL = temp.appendingPathComponent("ExactFallback.easysplatproj", isDirectory: true)
         let sourcePhotos = temp.appendingPathComponent("SourcePhotos", isDirectory: true)
@@ -758,8 +820,9 @@ final class PipelineIntegrationTests: XCTestCase {
             title: "Exact fallback",
             input: .photos(folder: sourcePhotos.path),
             requestedRunOptions: RequestedRunOptions(
+                capturePath: .orbit,
                 detailProfile: .fast,
-                inputOrdering: .unordered,
+                inputOrdering: .continuous,
                 photoSelection: .useAllValidPhotos
             )
         )
@@ -767,23 +830,22 @@ final class PipelineIntegrationTests: XCTestCase {
         try paths.ensureDirectories()
         try ProjectMetadataStore.save(metadata, to: paths.metadataURL)
         let toolchain = try makeToolchain(root: temp)
-        let featureFixture: ([String]) -> Void = { _ in
-            do {
-                try self.writeMatchableColmapDatabase(at: paths.colmapDatabaseURL)
-            } catch {
-                XCTFail("Could not create COLMAP database fixture: \(error)")
-            }
-        }
         let runner = MockSubprocessRunner(scripts: [
             .init(
                 path: toolchain.colmap.path,
                 argsPrefix: ["feature_extractor"],
                 result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""),
-                onRun: featureFixture
+                onRun: { try? self.writeFeatureDatabase(for: $0) }
             ),
             .init(
                 path: toolchain.colmap.path,
-                argsPrefix: ["exhaustive_matcher"],
+                argsPrefix: ["local_vocab_retriever"],
+                result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""),
+                onRun: { try? self.writeVocabularyOutput(for: $0) }
+            ),
+            .init(
+                path: toolchain.colmap.path,
+                argsPrefix: ["matches_importer"],
                 result: .init(
                     exitCode: SIGSEGV,
                     terminationReason: .uncaughtSignal,
@@ -796,24 +858,41 @@ final class PipelineIntegrationTests: XCTestCase {
             ),
             .init(
                 path: toolchain.colmap.path,
-                argsPrefix: ["exhaustive_matcher"],
-                result: .init(exitCode: 1, terminationReason: .exit, stdout: "", stderr: "database failure"),
+                argsPrefix: ["local_vocab_retriever"],
+                result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""),
+                onRun: { try? self.writeVocabularyOutput(for: $0) }
+            ),
+            .init(
+                path: toolchain.colmap.path,
+                argsPrefix: ["matches_importer"],
+                result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""),
                 onRun: { args in
                     XCTAssertEqual(self.value(for: "--SiftMatching.cpu_brute_force_matcher", in: args), "1")
+                    try? self.writeVerifiedPairResults(for: args, verifiedRows: 0)
                 }
             ),
             .init(
                 path: toolchain.colmap.path,
-                argsPrefix: ["feature_extractor"],
+                argsPrefix: ["local_vocab_retriever"],
                 result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""),
-                onRun: featureFixture
+                onRun: { try? self.writeVocabularyOutput(for: $0) }
             ),
             .init(
                 path: toolchain.colmap.path,
-                argsPrefix: ["exhaustive_matcher"],
+                argsPrefix: ["matches_importer"],
                 result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""),
                 onRun: { args in
                     XCTAssertEqual(self.value(for: "--SiftMatching.cpu_brute_force_matcher", in: args), "1")
+                    try? self.writeVerifiedPairResults(for: args, verifiedRows: 0)
+                }
+            ),
+            .init(
+                path: toolchain.colmap.path,
+                argsPrefix: ["matches_importer"],
+                result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""),
+                onRun: { args in
+                    XCTAssertEqual(self.value(for: "--SiftMatching.cpu_brute_force_matcher", in: args), "1")
+                    try? self.writeVerifiedPairResults(for: args)
                 }
             ),
             .init(
@@ -829,7 +908,7 @@ final class PipelineIntegrationTests: XCTestCase {
                 result: .init(
                     exitCode: 0,
                     terminationReason: .exit,
-                    stdout: "Registered images: 40 / 40\nPoints: 1\nObservations: 40\nMean track length: 40.0\nMean reprojection error: 0.5\n",
+                    stdout: "Registered images: 45 / 45\nPoints: 1\nObservations: 45\nMean track length: 45.0\nMean reprojection error: 0.5\n",
                     stderr: ""
                 ),
                 onRun: nil
@@ -853,11 +932,372 @@ final class PipelineIntegrationTests: XCTestCase {
         }
 
         let commands = runner.calls.compactMap { $0.1.first }
-        XCTAssertEqual(commands.filter { $0 == "feature_extractor" }.count, 2)
-        XCTAssertEqual(commands.filter { $0 == "exhaustive_matcher" }.count, 3)
+        XCTAssertEqual(commands.filter { $0 == "feature_extractor" }.count, 1)
+        XCTAssertEqual(commands.filter { $0 == "local_vocab_retriever" }.count, 3)
+        XCTAssertEqual(commands.filter { $0 == "matches_importer" }.count, 4)
+        let geometry = try GeometryArtifactStore.load(
+            from: paths.geometryManifestURL,
+            projectPaths: paths
+        )
+        let attempts = try XCTUnwrap(geometry.pairGraph.measurement).matcherAttempts
+        XCTAssertEqual(
+            attempts.map(\.recoveryLevel),
+            [.normal, .normal, .expanded, .maximum]
+        )
+        XCTAssertEqual(attempts.map(\.matcher), [.faiss, .exact, .exact, .exact])
     }
 
-    func testSequentialFallbackKeepsMixedImageDimensionsOnSeparateCameras() async throws {
+    func testPlanningFailureIsRetainedInAcceptedPairGraphEvidence() async throws {
+        let temp = makeTempRoot()
+        let projectURL = temp.appendingPathComponent(
+            "PlanningEvidence.easysplatproj",
+            isDirectory: true
+        )
+        let sourcePhotos = temp.appendingPathComponent("SourcePhotos", isDirectory: true)
+        try FileManager.default.createDirectory(at: sourcePhotos, withIntermediateDirectories: true)
+        for index in 0..<61 {
+            try writeTestImage(
+                url: sourcePhotos.appendingPathComponent("img\(index).jpg"),
+                value: UInt8(index)
+            )
+        }
+
+        let paths = ProjectPaths(root: projectURL)
+        try paths.ensureDirectories()
+        try ProjectMetadataStore.save(
+            ProjectMetadata(
+                title: "Planning evidence",
+                input: .photos(folder: sourcePhotos.path),
+                requestedRunOptions: RequestedRunOptions(
+                    detailProfile: .fast,
+                    inputOrdering: .unordered,
+                    photoSelection: .useAllValidPhotos
+                )
+            ),
+            to: paths.metadataURL
+        )
+        let toolchain = try makeToolchain(root: temp)
+        let runner = MockSubprocessRunner(scripts: [
+            .init(
+                path: toolchain.colmap.path,
+                argsPrefix: ["feature_extractor"],
+                result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""),
+                onRun: { arguments in
+                    do {
+                        try self.writeFeatureDatabase(for: arguments)
+                    } catch {
+                        XCTFail("Could not create feature database: \(error)")
+                    }
+                }
+            ),
+            .init(
+                path: toolchain.colmap.path,
+                argsPrefix: ["local_vocab_retriever"],
+                result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""),
+                onRun: { arguments in
+                    XCTAssertEqual(self.value(for: "--num_images", in: arguments), "20")
+                    XCTAssertEqual(
+                        self.value(for: "--returned_neighbor_count", in: arguments),
+                        "8"
+                    )
+                    do {
+                        try self.writeVocabularyOutput(for: arguments)
+                    } catch {
+                        XCTFail("Could not write empty retrieval result: \(error)")
+                    }
+                }
+            ),
+            .init(
+                path: toolchain.colmap.path,
+                argsPrefix: ["local_vocab_retriever"],
+                result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""),
+                onRun: { arguments in
+                    XCTAssertEqual(self.value(for: "--num_images", in: arguments), "40")
+                    XCTAssertEqual(
+                        self.value(for: "--returned_neighbor_count", in: arguments),
+                        "16"
+                    )
+                    do {
+                        try self.writeVocabularyOutput(for: arguments, connectQueries: true)
+                    } catch {
+                        XCTFail("Could not write connected retrieval result: \(error)")
+                    }
+                }
+            ),
+            .init(
+                path: toolchain.colmap.path,
+                argsPrefix: ["matches_importer"],
+                result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""),
+                onRun: { arguments in
+                    do {
+                        try self.writeVerifiedPairResults(for: arguments)
+                    } catch {
+                        XCTFail("Could not write verified matches: \(error)")
+                    }
+                }
+            ),
+            .init(
+                path: toolchain.colmap.path,
+                argsPrefix: ["mapper"],
+                result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""),
+                stdoutLines: ["Retriangulation and Global bundle adjustment"],
+                onRun: { _ in
+                    do {
+                        try self.writeSparseModel(at: projectURL)
+                    } catch {
+                        XCTFail("Could not write sparse model: \(error)")
+                    }
+                }
+            ),
+            .init(
+                path: toolchain.colmap.path,
+                argsPrefix: ["model_analyzer"],
+                result: .init(
+                    exitCode: 0,
+                    terminationReason: .exit,
+                    stdout: "Registered images: 61 / 61\nPoints: 1\nObservations: 61\nMean track length: 61.0\nMean reprojection error: 0.5\n",
+                    stderr: ""
+                )
+            ),
+        ])
+        let pipeline = PipelineRunner(
+            projectURL: projectURL,
+            config: makePipelineConfig(
+                toolchain: toolchain,
+                candidateRoute: .colmap,
+                skipTraining: true
+            ),
+            tooling: .init(runner: runner)
+        )
+
+        try await pipeline.run { _ in }
+
+        let geometry = try GeometryArtifactStore.load(
+            from: paths.geometryManifestURL,
+            projectPaths: paths
+        )
+        let measurement = try XCTUnwrap(geometry.pairGraph.measurement)
+        XCTAssertEqual(measurement.matcherAttempts.count, 2)
+        XCTAssertEqual(measurement.matcherAttempts.map(\.recoveryLevel), [.normal, .expanded])
+        XCTAssertEqual(measurement.matcherAttempts.map(\.outcome), [.failed, .completed])
+        XCTAssertEqual(measurement.matcherAttempts[0].scheduledPairCount, 0)
+        XCTAssertEqual(measurement.matcherAttempts[0].attemptedPairCount, 0)
+        XCTAssertEqual(
+            measurement.matchingDurationSeconds,
+            measurement.matcherAttempts.reduce(0) { $0 + $1.durationSeconds },
+            accuracy: 1e-12
+        )
+    }
+
+    func testRepeatedExpandedRetrievalTriesMaximumFaissBeforeExact() async throws {
+        let temp = makeTempRoot()
+        let projectURL = temp.appendingPathComponent(
+            "RepeatedRetrieval.easysplatproj",
+            isDirectory: true
+        )
+        let sourcePhotos = temp.appendingPathComponent("SourcePhotos", isDirectory: true)
+        try FileManager.default.createDirectory(at: sourcePhotos, withIntermediateDirectories: true)
+        for index in 0..<251 {
+            try writeTestImage(
+                url: sourcePhotos.appendingPathComponent("img\(index).jpg"),
+                value: UInt8(truncatingIfNeeded: index)
+            )
+        }
+
+        let paths = ProjectPaths(root: projectURL)
+        try paths.ensureDirectories()
+        try ProjectMetadataStore.save(
+            ProjectMetadata(
+                title: "Repeated retrieval",
+                input: .photos(folder: sourcePhotos.path),
+                requestedRunOptions: RequestedRunOptions(
+                    detailProfile: .highDetail,
+                    inputOrdering: .unordered,
+                    photoSelection: .useAllValidPhotos
+                )
+            ),
+            to: paths.metadataURL
+        )
+        let toolchain = try makeToolchain(root: temp)
+        let lowQuality = "Registered images: 100 / 251\nPoints: 1\nObservations: 100\nMean track length: 100.0\nMean reprojection error: 0.5\n"
+        let accepted = "Registered images: 251 / 251\nPoints: 1\nObservations: 251\nMean track length: 251.0\nMean reprojection error: 0.5\n"
+        let runner = MockSubprocessRunner(scripts: [
+            .init(
+                path: toolchain.colmap.path,
+                argsPrefix: ["feature_extractor"],
+                result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""),
+                onRun: { arguments in
+                    do {
+                        try self.writeFeatureDatabase(for: arguments)
+                    } catch {
+                        XCTFail("Could not create feature database: \(error)")
+                    }
+                }
+            ),
+            .init(
+                path: toolchain.colmap.path,
+                argsPrefix: ["local_vocab_retriever"],
+                result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""),
+                onRun: { arguments in
+                    XCTAssertEqual(self.value(for: "--num_images", in: arguments), "20")
+                    do {
+                        try self.writeVocabularyOutput(for: arguments, connectQueries: true)
+                    } catch {
+                        XCTFail("Could not write normal retrieval result: \(error)")
+                    }
+                }
+            ),
+            .init(
+                path: toolchain.colmap.path,
+                argsPrefix: ["matches_importer"],
+                result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""),
+                onRun: { arguments in
+                    XCTAssertEqual(
+                        self.value(for: "--SiftMatching.cpu_brute_force_matcher", in: arguments),
+                        "0"
+                    )
+                    do {
+                        try self.writeVerifiedPairResults(for: arguments)
+                    } catch {
+                        XCTFail("Could not write normal verified matches: \(error)")
+                    }
+                }
+            ),
+            .init(
+                path: toolchain.colmap.path,
+                argsPrefix: ["mapper"],
+                result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""),
+                stdoutLines: ["Retriangulation and Global bundle adjustment"],
+                onRun: { _ in
+                    do {
+                        try self.writeSparseModel(at: projectURL)
+                    } catch {
+                        XCTFail("Could not write first sparse model: \(error)")
+                    }
+                }
+            ),
+            .init(
+                path: toolchain.colmap.path,
+                argsPrefix: ["model_analyzer"],
+                result: .init(
+                    exitCode: 0,
+                    terminationReason: .exit,
+                    stdout: lowQuality,
+                    stderr: ""
+                )
+            ),
+            .init(
+                path: toolchain.colmap.path,
+                argsPrefix: ["local_vocab_retriever"],
+                result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""),
+                onRun: { arguments in
+                    XCTAssertEqual(self.value(for: "--num_images", in: arguments), "40")
+                    do {
+                        try self.writeVocabularyOutput(for: arguments, connectQueries: true)
+                    } catch {
+                        XCTFail("Could not write expanded retrieval result: \(error)")
+                    }
+                }
+            ),
+            .init(
+                path: toolchain.colmap.path,
+                argsPrefix: ["local_vocab_retriever"],
+                result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""),
+                onRun: { arguments in
+                    XCTAssertEqual(self.value(for: "--num_images", in: arguments), "80")
+                    XCTAssertEqual(
+                        self.value(for: "--returned_neighbor_count", in: arguments),
+                        "32"
+                    )
+                    guard let queryPath = self.value(
+                        for: "--query_image_list_path",
+                        in: arguments
+                    ) else {
+                        return XCTFail("Maximum retrieval is missing its query list")
+                    }
+                    do {
+                        let queryNames = try String(contentsOfFile: queryPath, encoding: .utf8)
+                            .split(whereSeparator: \.isWhitespace)
+                            .map(String.init)
+                        var pairs = zip(queryNames, queryNames.dropFirst()).map {
+                            "\($0.0) \($0.1)"
+                        }
+                        if let first = queryNames.first, let last = queryNames.last {
+                            pairs.append("\(first) \(last)")
+                        }
+                        try self.writeVocabularyOutput(for: arguments, pairLines: pairs)
+                    } catch {
+                        XCTFail("Could not write maximum retrieval result: \(error)")
+                    }
+                }
+            ),
+            .init(
+                path: toolchain.colmap.path,
+                argsPrefix: ["matches_importer"],
+                result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""),
+                onRun: { arguments in
+                    XCTAssertEqual(
+                        self.value(for: "--SiftMatching.cpu_brute_force_matcher", in: arguments),
+                        "0"
+                    )
+                    do {
+                        try self.writeVerifiedPairResults(for: arguments)
+                    } catch {
+                        XCTFail("Could not write maximum verified matches: \(error)")
+                    }
+                }
+            ),
+            .init(
+                path: toolchain.colmap.path,
+                argsPrefix: ["mapper"],
+                result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""),
+                stdoutLines: ["Retriangulation and Global bundle adjustment"],
+                onRun: { _ in
+                    do {
+                        try self.writeSparseModel(at: projectURL)
+                    } catch {
+                        XCTFail("Could not write accepted sparse model: \(error)")
+                    }
+                }
+            ),
+            .init(
+                path: toolchain.colmap.path,
+                argsPrefix: ["model_analyzer"],
+                result: .init(
+                    exitCode: 0,
+                    terminationReason: .exit,
+                    stdout: accepted,
+                    stderr: ""
+                )
+            ),
+        ])
+        let pipeline = PipelineRunner(
+            projectURL: projectURL,
+            config: makePipelineConfig(
+                toolchain: toolchain,
+                candidateRoute: .colmap,
+                skipTraining: true
+            ),
+            tooling: .init(runner: runner)
+        )
+
+        try await pipeline.run { _ in }
+
+        let commands = runner.calls.compactMap { $0.1.first }
+        XCTAssertEqual(commands.filter { $0 == "feature_extractor" }.count, 1)
+        XCTAssertEqual(commands.filter { $0 == "local_vocab_retriever" }.count, 3)
+        XCTAssertEqual(commands.filter { $0 == "matches_importer" }.count, 2)
+        let geometry = try GeometryArtifactStore.load(
+            from: paths.geometryManifestURL,
+            projectPaths: paths
+        )
+        let attempts = try XCTUnwrap(geometry.pairGraph.measurement?.matcherAttempts)
+        XCTAssertEqual(attempts.map(\.recoveryLevel), [.normal, .expanded, .maximum])
+        XCTAssertEqual(attempts.map(\.matcher), [.faiss, .faiss, .faiss])
+        XCTAssertEqual(attempts.map(\.outcome), [.completed, .failed, .completed])
+    }
+
+    func testContinuousMixedImageDimensionsUseSeparateCameras() async throws {
         let temp = makeTempRoot()
         let projectURL = temp.appendingPathComponent("MixedDimensionsRetry.easysplatproj", isDirectory: true)
         let sourcePhotos = temp.appendingPathComponent("SourcePhotos", isDirectory: true)
@@ -888,11 +1328,9 @@ final class PipelineIntegrationTests: XCTestCase {
         try ProjectMetadataStore.save(metadata, to: paths.metadataURL)
         let toolchain = try makeToolchain(root: temp)
         let runner = MockSubprocessRunner(scripts: [
-            .init(path: toolchain.colmap.path, argsPrefix: ["feature_extractor"], result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""), onRun: nil),
-            .init(path: toolchain.colmap.path, argsPrefix: ["sequential_matcher"], result: .init(exitCode: 1, terminationReason: .exit, stdout: "", stderr: "matching failed"), onRun: nil),
-            .init(path: toolchain.colmap.path, argsPrefix: ["sequential_matcher"], result: .init(exitCode: 1, terminationReason: .exit, stdout: "", stderr: "matching failed again"), onRun: nil),
-            .init(path: toolchain.colmap.path, argsPrefix: ["feature_extractor"], result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""), onRun: nil),
-            .init(path: toolchain.colmap.path, argsPrefix: ["exhaustive_matcher"], result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""), onRun: nil),
+            .init(path: toolchain.colmap.path, argsPrefix: ["feature_extractor"], result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""), onRun: { try? self.writeFeatureDatabase(for: $0) }),
+            .init(path: toolchain.colmap.path, argsPrefix: ["local_vocab_retriever"], result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""), onRun: { try? self.writeVocabularyOutput(for: $0) }),
+            .init(path: toolchain.colmap.path, argsPrefix: ["matches_importer"], result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""), onRun: { try? self.writeVerifiedPairResults(for: $0) }),
             .init(path: toolchain.colmap.path, argsPrefix: ["mapper"], result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""), stdoutLines: ["Retriangulation and Global bundle adjustment"], onRun: { _ in
                 try? self.writeSparseModel(at: projectURL)
             }),
@@ -911,7 +1349,7 @@ final class PipelineIntegrationTests: XCTestCase {
         try await pipeline.run { _ in }
 
         let featureCalls = runner.calls.filter { $0.1.first == "feature_extractor" }
-        XCTAssertEqual(featureCalls.count, 2, "Calls: \(runner.calls)")
+        XCTAssertEqual(featureCalls.count, 1, "Calls: \(runner.calls)")
         for call in featureCalls {
             XCTAssertEqual(value(for: "--ImageReader.single_camera", in: call.1), "0")
         }
@@ -942,7 +1380,12 @@ final class PipelineIntegrationTests: XCTestCase {
         try ProjectMetadataStore.save(metadata, to: paths.metadataURL)
         let toolchain = try makeToolchain(root: temp)
         let runner = MockSubprocessRunner(scripts: [
-            .init(path: toolchain.colmap.path, argsPrefix: ["feature_extractor"], result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""), onRun: nil),
+            .init(path: toolchain.colmap.path, argsPrefix: ["feature_extractor"], result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""), onRun: { try? self.writeFeatureDatabase(for: $0) }),
+            .init(path: toolchain.colmap.path, argsPrefix: ["local_vocab_retriever"], result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""), onRun: { args in
+                XCTAssertEqual(self.value(for: "--num_images", in: args), "20")
+                XCTAssertEqual(self.value(for: "--returned_neighbor_count", in: args), "8")
+                try? self.writeVocabularyOutput(for: args, connectQueries: true)
+            }),
             .init(path: toolchain.colmap.path, argsPrefix: ["matches_importer"], result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""), onRun: { args in
                 guard let path = self.value(for: "--match_list_path", in: args),
                       let text = try? String(contentsOfFile: path, encoding: .utf8) else {
@@ -951,6 +1394,7 @@ final class PipelineIntegrationTests: XCTestCase {
                 let pairs = text.split(separator: "\n")
                 XCTAssertLessThanOrEqual(pairs.count, 960)
                 XCTAssertGreaterThanOrEqual(pairs.count, 119)
+                try? self.writeVerifiedPairResults(for: args)
             }),
             .init(path: toolchain.colmap.path, argsPrefix: ["mapper"], result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""), stdoutLines: ["Retriangulation and Global bundle adjustment"], onRun: { _ in
                 try? self.writeSparseModel(at: projectURL)
@@ -970,70 +1414,8 @@ final class PipelineIntegrationTests: XCTestCase {
         try await pipeline.run { _ in }
 
         let commands = runner.calls.compactMap { $0.1.first }
+        XCTAssertTrue(commands.contains("local_vocab_retriever"))
         XCTAssertTrue(commands.contains("matches_importer"))
-        XCTAssertFalse(commands.contains("exhaustive_matcher"))
-    }
-
-    func testDisconnectedThumbnailRetrievalFallsBackToExhaustiveMatching() async throws {
-        let temp = makeTempRoot()
-        let projectURL = temp.appendingPathComponent("RetrievalFallback.easysplatproj", isDirectory: true)
-        let sourcePhotos = temp.appendingPathComponent("SourcePhotos", isDirectory: true)
-        try FileManager.default.createDirectory(at: sourcePhotos, withIntermediateDirectories: true)
-        var sourceURLs: [URL] = []
-        for index in 0..<120 {
-            let url = sourcePhotos.appendingPathComponent(String(format: "img_%03d.png", index))
-            try writeDisconnectedRetrievalTestImage(url: url, index: index)
-            sourceURLs.append(url)
-        }
-        let descriptors = try ColmapPairEstimator.imageDescriptors(for: sourceURLs)
-        XCTAssertThrowsError(try ColmapPairEstimator.boundedRetrievalPairs(
-            imageNames: sourceURLs.map(\.lastPathComponent),
-            descriptors: descriptors,
-            maxNeighbors: 8
-        )) { error in
-            XCTAssertEqual(error as? ColmapPairPlanningError, .disconnectedGraph)
-        }
-
-        let metadata = ProjectMetadata(
-            title: "Retrieval fallback",
-            input: .photos(folder: sourcePhotos.path),
-            requestedRunOptions: RequestedRunOptions(
-                detailProfile: .highDetail,
-                inputOrdering: .unordered,
-                photoSelection: .useAllValidPhotos
-            )
-        )
-        let paths = ProjectPaths(root: projectURL)
-        try paths.ensureDirectories()
-        try ProjectMetadataStore.save(metadata, to: paths.metadataURL)
-        let toolchain = try makeToolchain(root: temp)
-        let runner = MockSubprocessRunner(scripts: [
-            .init(path: toolchain.colmap.path, argsPrefix: ["feature_extractor"], result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""), onRun: nil),
-            .init(path: toolchain.colmap.path, argsPrefix: ["feature_extractor"], result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""), onRun: nil),
-            .init(path: toolchain.colmap.path, argsPrefix: ["exhaustive_matcher"], result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""), onRun: nil),
-            .init(path: toolchain.colmap.path, argsPrefix: ["mapper"], result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""), stdoutLines: ["Retriangulation and Global bundle adjustment"], onRun: { _ in
-                try? self.writeSparseModel(at: projectURL)
-            }),
-            .init(path: toolchain.colmap.path, argsPrefix: ["model_analyzer"], result: .init(exitCode: 0, terminationReason: .exit, stdout: "Registered images: 120 / 120\nPoints: 1\nObservations: 120\nMean track length: 120.0\n", stderr: ""), onRun: nil),
-        ])
-        let events = PipelineEventSink()
-        let pipeline = PipelineRunner(
-            projectURL: projectURL,
-            config: makePipelineConfig(
-                toolchain: toolchain,
-                candidateRoute: .colmap,
-                skipTraining: true
-            ),
-            tooling: .init(runner: runner)
-        )
-
-        try await pipeline.run { events.append($0) }
-
-        let commands = runner.calls.compactMap { $0.1.first }
-        XCTAssertEqual(commands.filter { $0 == "feature_extractor" }.count, 2)
-        XCTAssertTrue(commands.contains("exhaustive_matcher"))
-        XCTAssertFalse(commands.contains("matches_importer"))
-        XCTAssertNotNil(events.stageLog(containing: "retrying with fewer frames and exhaustive matching"))
     }
 
     func testPipelineFailureClearsRunStartMarker() async throws {
@@ -1171,13 +1553,13 @@ final class PipelineIntegrationTests: XCTestCase {
                 path: toolchain.colmap.path,
                 argsPrefix: ["feature_extractor"],
                 result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""),
-                onRun: nil
+                onRun: { try? self.writeFeatureDatabase(for: $0) }
             ),
             .init(
                 path: toolchain.colmap.path,
-                argsPrefix: ["exhaustive_matcher"],
+                argsPrefix: ["matches_importer"],
                 result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""),
-                onRun: nil
+                onRun: { try? self.writeVerifiedPairResults(for: $0) }
             ),
             .init(
                 path: toolchain.colmap.path,
@@ -1368,7 +1750,7 @@ final class PipelineIntegrationTests: XCTestCase {
             to: paths.framesSelectedManifestURL,
             options: [.atomic]
         )
-        try writeCompletedColmapDatabase(at: paths.colmapDatabaseURL)
+        try writeCompletedColmapDatabase(paths: paths)
         let sparse = paths.colmapSparseURL.appendingPathComponent("0", isDirectory: true)
         try FileManager.default.createDirectory(at: sparse, withIntermediateDirectories: true)
         try "1 SIMPLE_PINHOLE 640 480 500 320 240\n".write(
@@ -1555,7 +1937,7 @@ final class PipelineIntegrationTests: XCTestCase {
             to: paths.framesSelectedManifestURL,
             options: [.atomic]
         )
-        try writeCompletedColmapDatabase(at: paths.colmapDatabaseURL)
+        try writeCompletedColmapDatabase(paths: paths)
         let sparse = paths.colmapSparseURL.appendingPathComponent("0", isDirectory: true)
         try FileManager.default.createDirectory(at: sparse, withIntermediateDirectories: true)
         try "1 SIMPLE_PINHOLE 640 480 500 320 240\n".write(
@@ -1806,7 +2188,6 @@ final class PipelineIntegrationTests: XCTestCase {
                 XCTAssertEqual(self.value(for: "--ImageReader.camera_model", in: args), "SIMPLE_RADIAL")
             }),
             .init(path: toolchain.colmap.path, argsPrefix: ["matches_importer"], result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""), onRun: nil),
-            .init(path: toolchain.colmap.path, argsPrefix: ["exhaustive_matcher"], result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""), onRun: nil),
             .init(path: toolchain.colmap.path, argsPrefix: ["point_triangulator"], result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""), onRun: { args in
                 guard let output = self.value(for: "--output_path", in: args) else { return }
                 try? self.writeDa3SparseModel(
@@ -1943,7 +2324,6 @@ final class PipelineIntegrationTests: XCTestCase {
                 onRun: nil
             ),
             .init(path: toolchain.colmap.path, argsPrefix: ["feature_extractor"], result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""), onRun: nil),
-            .init(path: toolchain.colmap.path, argsPrefix: ["exhaustive_matcher"], result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""), onRun: nil),
             .init(
                 path: toolchain.colmap.path,
                 argsPrefix: ["mapper"],
@@ -1987,90 +2367,6 @@ final class PipelineIntegrationTests: XCTestCase {
         let finished = try ProjectMetadataStore.load(from: paths.metadataURL)
         XCTAssertNil(finished.reconstruction)
         XCTAssertNil(finished.geometryArtifact)
-    }
-
-    func testRejectedDa3SummaryIsNotPersistedWhenClassicalFallbackFails() async throws {
-        let temp = makeTempRoot()
-        let projectURL = temp.appendingPathComponent("RejectedResidualFallback.easysplatproj", isDirectory: true)
-        let sourcePhotos = temp.appendingPathComponent("SourcePhotos", isDirectory: true)
-        try FileManager.default.createDirectory(at: sourcePhotos, withIntermediateDirectories: true)
-        for index in 0..<2 {
-            try writeTestImage(
-                url: sourcePhotos.appendingPathComponent("img\(index).jpg"),
-                value: UInt8(index)
-            )
-        }
-
-        let metadata = ProjectMetadata(
-            title: "Rejected residual fallback",
-            input: .photos(folder: sourcePhotos.path),
-            requestedRunOptions: RequestedRunOptions(capturePath: .orbit, detailProfile: .fast)
-        )
-        let paths = ProjectPaths(root: projectURL)
-        try paths.ensureDirectories()
-        try ProjectMetadataStore.save(metadata, to: paths.metadataURL)
-        let toolchain = try makeToolchain(root: temp, createDa3Files: true)
-        let acceptedReport = "Registered images: 2 / 2\nPoints: 16000\nObservations: 32000\nMean track length: 2.0\nMean reprojection error: 0.8\n"
-        let runner = MockSubprocessRunner(scripts: [
-            .init(
-                path: toolchain.da3.sfmTool.path,
-                argsPrefix: ["--images"],
-                result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""),
-                onRun: { args in
-                    try? self.writeDa3RunArtifacts(for: args)
-                }
-            ),
-            .init(path: toolchain.colmap.path, argsPrefix: ["feature_extractor"], result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""), onRun: nil),
-            .init(path: toolchain.colmap.path, argsPrefix: ["matches_importer"], result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""), onRun: nil),
-            .init(path: toolchain.colmap.path, argsPrefix: ["point_triangulator"], result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""), onRun: { args in
-                guard let output = self.value(for: "--output_path", in: args) else { return }
-                let modelURL = URL(fileURLWithPath: output)
-                try? self.writeDa3SparseModel(
-                    at: modelURL,
-                    imageNames: self.selectedImageNames(in: paths),
-                    pointCount: 4
-                )
-                try? self.makeSparseModelHighResidual(at: modelURL)
-            }),
-            .init(path: toolchain.colmap.path, argsPrefix: ["bundle_adjuster"], result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""), onRun: { args in
-                guard let output = self.value(for: "--output_path", in: args) else { return }
-                let modelURL = URL(fileURLWithPath: output)
-                try? self.writeDa3SparseModel(
-                    at: modelURL,
-                    imageNames: self.selectedImageNames(in: paths),
-                    pointCount: 4
-                )
-                try? self.makeSparseModelHighResidual(at: modelURL)
-            }),
-            .init(
-                path: toolchain.colmap.path,
-                argsPrefix: ["model_analyzer"],
-                result: .init(exitCode: 0, terminationReason: .exit, stdout: acceptedReport, stderr: ""),
-                onRun: nil
-            ),
-            .init(path: toolchain.colmap.path, argsPrefix: ["feature_extractor"], result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""), onRun: nil),
-            .init(path: toolchain.colmap.path, argsPrefix: ["exhaustive_matcher"], result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""), onRun: nil),
-            .init(path: toolchain.colmap.path, argsPrefix: ["mapper"], result: .init(exitCode: 1, terminationReason: .exit, stdout: "", stderr: "mapper failed"), onRun: nil),
-        ])
-        let pipeline = PipelineRunner(
-            projectURL: projectURL,
-            config: makePipelineConfig(
-                toolchain: toolchain,
-                skipTraining: true
-            ),
-            tooling: .init(runner: runner)
-        )
-
-        await XCTAssertThrowsErrorAsync {
-            try await pipeline.run { _ in }
-        }
-
-        XCTAssertFalse(runner.calls.contains { $0.1.first == "global_mapper" })
-        XCTAssertEqual(runner.calls.filter { $0.1.first == "mapper" }.count, 1)
-        let failed = try ProjectMetadataStore.load(from: paths.metadataURL)
-        XCTAssertNil(failed.reconstruction)
-        XCTAssertNil(failed.geometryArtifact)
-        XCTAssertFalse(FileManager.default.fileExists(atPath: paths.geometryManifestURL.path))
     }
 
     func testPipelineOversizedDa3SeedRunsBoundedRefinementBeforeAcceptance() async throws {
@@ -2473,14 +2769,16 @@ final class PipelineIntegrationTests: XCTestCase {
         let toolchain = try makeToolchain(root: temp)
 
         let runner = MockSubprocessRunner(scripts: [
-            .init(path: toolchain.colmap.path, argsPrefix: ["feature_extractor"], result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""), onRun: nil),
-            .init(path: toolchain.colmap.path, argsPrefix: ["exhaustive_matcher"], result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""), onRun: nil),
+            .init(path: toolchain.colmap.path, argsPrefix: ["feature_extractor"], result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""), onRun: { try? self.writeFeatureDatabase(for: $0) }),
+            .init(path: toolchain.colmap.path, argsPrefix: ["matches_importer"], result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""), onRun: { try? self.writeVerifiedPairResults(for: $0) }),
             .init(path: toolchain.colmap.path, argsPrefix: ["mapper"], result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""), onRun: { _ in try? self.writeSparseModel(at: projectURL) }),
             .init(path: toolchain.colmap.path, argsPrefix: ["model_analyzer"], result: .init(exitCode: 0, terminationReason: .exit, stdout: "Registered images: 2 / 10\nMean reprojection error: 3.5\n", stderr: ""), onRun: nil),
-            .init(path: toolchain.colmap.path, argsPrefix: ["feature_extractor"], result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""), onRun: nil),
-            .init(path: toolchain.colmap.path, argsPrefix: ["exhaustive_matcher"], result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""), onRun: nil),
+            .init(path: toolchain.colmap.path, argsPrefix: ["matches_importer"], result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""), onRun: { args in
+                XCTAssertEqual(self.value(for: "--SiftMatching.cpu_brute_force_matcher", in: args), "1")
+                try? self.writeVerifiedPairResults(for: args)
+            }),
             .init(path: toolchain.colmap.path, argsPrefix: ["mapper"], result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""), onRun: { _ in try? self.writeSparseModel(at: projectURL) }),
-            .init(path: toolchain.colmap.path, argsPrefix: ["model_analyzer"], result: .init(exitCode: 0, terminationReason: .exit, stdout: "Registered images: 2 / 10\nMean reprojection error: 3.5\n", stderr: ""), onRun: nil)
+            .init(path: toolchain.colmap.path, argsPrefix: ["model_analyzer"], result: .init(exitCode: 0, terminationReason: .exit, stdout: "Registered images: 2 / 10\nMean reprojection error: 3.5\n", stderr: ""), onRun: nil),
         ])
 
         let pipeline = PipelineRunner(
@@ -2494,7 +2792,10 @@ final class PipelineIntegrationTests: XCTestCase {
         }
 
         let featureRuns = runner.calls.filter { $0.0 == toolchain.colmap.path && $0.1.first == "feature_extractor" }
-        XCTAssertEqual(featureRuns.count, 2)
+        XCTAssertEqual(featureRuns.count, 1)
+        XCTAssertEqual(runner.calls.filter { $0.1.first == "matches_importer" }.count, 2)
+        XCTAssertEqual(runner.calls.filter { $0.1.first == "mapper" }.count, 2)
+        XCTAssertEqual(runner.calls.filter { $0.1.first == "model_analyzer" }.count, 2)
     }
 
     func testPipelineFailsOnMissingImages() async throws {
@@ -2578,10 +2879,8 @@ final class PipelineIntegrationTests: XCTestCase {
         let toolchain = try makeToolchain(root: temp)
 
         let runner = MockSubprocessRunner(scripts: [
-            .init(path: toolchain.colmap.path, argsPrefix: ["feature_extractor"], result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""), onRun: nil),
-            .init(path: toolchain.colmap.path, argsPrefix: ["exhaustive_matcher"], result: .init(exitCode: 1, terminationReason: .exit, stdout: "", stderr: "match failed"), onRun: nil),
-            .init(path: toolchain.colmap.path, argsPrefix: ["feature_extractor"], result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""), onRun: nil),
-            .init(path: toolchain.colmap.path, argsPrefix: ["exhaustive_matcher"], result: .init(exitCode: 1, terminationReason: .exit, stdout: "", stderr: "exhaustive failed"), onRun: nil)
+            .init(path: toolchain.colmap.path, argsPrefix: ["feature_extractor"], result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""), onRun: { try? self.writeFeatureDatabase(for: $0) }),
+            .init(path: toolchain.colmap.path, argsPrefix: ["matches_importer"], result: .init(exitCode: 1, terminationReason: .exit, stdout: "", stderr: "database is locked"), onRun: nil),
         ])
 
         let pipeline = PipelineRunner(
@@ -2593,6 +2892,7 @@ final class PipelineIntegrationTests: XCTestCase {
         await XCTAssertThrowsErrorAsync {
             try await pipeline.run { _ in }
         }
+        XCTAssertEqual(runner.calls.map { $0.1.first }, ["feature_extractor", "matches_importer"])
     }
 
     private func writeTestImage(url: URL, value: UInt8) throws {
@@ -2763,6 +3063,243 @@ final class PipelineIntegrationTests: XCTestCase {
             .sorted()
     }
 
+    private func writeFeatureDatabase(for arguments: [String]) throws {
+        guard let databasePath = value(for: "--database_path", in: arguments),
+              let imagePath = value(for: "--image_path", in: arguments) else {
+            throw NSError(domain: "PipelineIntegrationTests", code: 10)
+        }
+        let databaseURL = URL(fileURLWithPath: databasePath)
+        let imageNames = try FileManager.default.contentsOfDirectory(
+            at: URL(fileURLWithPath: imagePath, isDirectory: true),
+            includingPropertiesForKeys: [.isRegularFileKey],
+            options: [.skipsHiddenFiles]
+        )
+        .filter { ["jpg", "jpeg", "png", "heic"].contains($0.pathExtension.lowercased()) }
+        .map(\.lastPathComponent)
+        .sorted()
+        try FileManager.default.createDirectory(
+            at: databaseURL.deletingLastPathComponent(),
+            withIntermediateDirectories: true
+        )
+        try? FileManager.default.removeItem(at: databaseURL)
+
+        var database: OpaquePointer?
+        guard sqlite3_open(databaseURL.path, &database) == SQLITE_OK,
+              let database else {
+            throw NSError(domain: "PipelineIntegrationTests", code: 11)
+        }
+        defer { sqlite3_close(database) }
+        let schema = """
+        CREATE TABLE cameras(camera_id INTEGER PRIMARY KEY);
+        CREATE TABLE images(
+            image_id INTEGER PRIMARY KEY,
+            name TEXT NOT NULL UNIQUE,
+            camera_id INTEGER NOT NULL
+        );
+        CREATE TABLE keypoints(
+            image_id INTEGER PRIMARY KEY,
+            rows INTEGER NOT NULL,
+            cols INTEGER NOT NULL,
+            data BLOB
+        );
+        CREATE TABLE descriptors(
+            image_id INTEGER PRIMARY KEY,
+            rows INTEGER NOT NULL,
+            cols INTEGER NOT NULL,
+            data BLOB,
+            type INTEGER NOT NULL DEFAULT 0
+        );
+        CREATE TABLE matches(
+            pair_id INTEGER PRIMARY KEY,
+            rows INTEGER NOT NULL,
+            cols INTEGER NOT NULL,
+            data BLOB
+        );
+        CREATE TABLE two_view_geometries(
+            pair_id INTEGER PRIMARY KEY,
+            rows INTEGER NOT NULL,
+            cols INTEGER NOT NULL,
+            data BLOB
+        );
+        INSERT INTO cameras(camera_id) VALUES (1);
+        """
+        try executeSQL(schema, in: database)
+
+        var imageStatement: OpaquePointer?
+        var keypointStatement: OpaquePointer?
+        var descriptorStatement: OpaquePointer?
+        guard sqlite3_prepare_v2(
+            database,
+            "INSERT INTO images(image_id, name, camera_id) VALUES (?, ?, 1);",
+            -1,
+            &imageStatement,
+            nil
+        ) == SQLITE_OK,
+        sqlite3_prepare_v2(
+            database,
+            "INSERT INTO keypoints(image_id, rows, cols) VALUES (?, 64, 4);",
+            -1,
+            &keypointStatement,
+            nil
+        ) == SQLITE_OK,
+        sqlite3_prepare_v2(
+            database,
+            "INSERT INTO descriptors(image_id, rows, cols, type) VALUES (?, 64, 128, 0);",
+            -1,
+            &descriptorStatement,
+            nil
+        ) == SQLITE_OK,
+        let imageStatement,
+        let keypointStatement,
+        let descriptorStatement else {
+            throw NSError(domain: "PipelineIntegrationTests", code: 12)
+        }
+        defer {
+            sqlite3_finalize(imageStatement)
+            sqlite3_finalize(keypointStatement)
+            sqlite3_finalize(descriptorStatement)
+        }
+        try executeSQL("BEGIN IMMEDIATE TRANSACTION;", in: database)
+        do {
+            let transient = unsafeBitCast(-1, to: sqlite3_destructor_type.self)
+            for (offset, imageName) in imageNames.enumerated() {
+                let imageID = Int32(offset + 1)
+                sqlite3_bind_int(imageStatement, 1, imageID)
+                sqlite3_bind_text(imageStatement, 2, imageName, -1, transient)
+                guard sqlite3_step(imageStatement) == SQLITE_DONE else {
+                    throw NSError(domain: "PipelineIntegrationTests", code: 13)
+                }
+                sqlite3_reset(imageStatement)
+                sqlite3_clear_bindings(imageStatement)
+                for statement in [keypointStatement, descriptorStatement] {
+                    sqlite3_bind_int(statement, 1, imageID)
+                    guard sqlite3_step(statement) == SQLITE_DONE else {
+                        throw NSError(domain: "PipelineIntegrationTests", code: 14)
+                    }
+                    sqlite3_reset(statement)
+                    sqlite3_clear_bindings(statement)
+                }
+            }
+            try executeSQL("COMMIT;", in: database)
+        } catch {
+            sqlite3_exec(database, "ROLLBACK;", nil, nil, nil)
+            throw error
+        }
+    }
+
+    private func writeVocabularyOutput(
+        for arguments: [String],
+        connectQueries: Bool = false,
+        pairLines: [String] = []
+    ) throws {
+        guard let outputPath = value(for: "--output_pair_list_path", in: arguments) else {
+            throw NSError(domain: "PipelineIntegrationTests", code: 15)
+        }
+        let queryNames: [String]
+        if connectQueries,
+           let queryPath = value(for: "--query_image_list_path", in: arguments) {
+            queryNames = try String(contentsOfFile: queryPath, encoding: .utf8)
+                .split(whereSeparator: \.isWhitespace)
+                .map(String.init)
+        } else {
+            queryNames = []
+        }
+        let lines = pairLines.isEmpty
+            ? zip(queryNames, queryNames.dropFirst()).map { "\($0.0) \($0.1)" }
+            : pairLines
+        let text = lines.isEmpty ? "" : lines.joined(separator: "\n") + "\n"
+        try text.write(
+            to: URL(fileURLWithPath: outputPath),
+            atomically: true,
+            encoding: .utf8
+        )
+    }
+
+    private func writeVerifiedPairResults(
+        for arguments: [String],
+        verifiedRows: Int = 6
+    ) throws {
+        guard let databasePath = value(for: "--database_path", in: arguments),
+              let pairListPath = value(for: "--match_list_path", in: arguments) else {
+            throw NSError(domain: "PipelineIntegrationTests", code: 16)
+        }
+        let pairs = try String(contentsOfFile: pairListPath, encoding: .utf8)
+            .split(separator: "\n")
+            .map { line -> (String, String) in
+                let fields = line.split(whereSeparator: \.isWhitespace).map(String.init)
+                guard fields.count == 2 else { return ("", "") }
+                return (fields[0], fields[1])
+            }
+        guard pairs.allSatisfy({ !$0.0.isEmpty && !$0.1.isEmpty }) else {
+            throw NSError(domain: "PipelineIntegrationTests", code: 17)
+        }
+
+        var database: OpaquePointer?
+        guard sqlite3_open(databasePath, &database) == SQLITE_OK,
+              let database else {
+            throw NSError(domain: "PipelineIntegrationTests", code: 18)
+        }
+        defer { sqlite3_close(database) }
+        var imageStatement: OpaquePointer?
+        guard sqlite3_prepare_v2(
+            database,
+            "SELECT image_id, name FROM images;",
+            -1,
+            &imageStatement,
+            nil
+        ) == SQLITE_OK,
+        let imageStatement else {
+            throw NSError(domain: "PipelineIntegrationTests", code: 19)
+        }
+        defer { sqlite3_finalize(imageStatement) }
+        var imageIDs: [String: Int64] = [:]
+        while sqlite3_step(imageStatement) == SQLITE_ROW {
+            let imageID = sqlite3_column_int64(imageStatement, 0)
+            guard let nameBytes = sqlite3_column_text(imageStatement, 1) else {
+                throw NSError(domain: "PipelineIntegrationTests", code: 20)
+            }
+            imageIDs[String(cString: nameBytes)] = imageID
+        }
+
+        try executeSQL(
+            "DELETE FROM matches; DELETE FROM two_view_geometries; BEGIN IMMEDIATE TRANSACTION;",
+            in: database
+        )
+        do {
+            for (firstName, secondName) in pairs {
+                guard let firstID = imageIDs[firstName], let secondID = imageIDs[secondName] else {
+                    throw NSError(domain: "PipelineIntegrationTests", code: 21)
+                }
+                let low = min(firstID, secondID)
+                let high = max(firstID, secondID)
+                let pairID = low * ColmapPairGraphInspector.pairIDDivisor + high
+                try executeSQL(
+                    "INSERT INTO matches(pair_id, rows, cols) VALUES (\(pairID), 8, 2);" +
+                    "INSERT INTO two_view_geometries(pair_id, rows, cols) VALUES (\(pairID), \(verifiedRows), 2);",
+                    in: database
+                )
+            }
+            try executeSQL("COMMIT;", in: database)
+        } catch {
+            sqlite3_exec(database, "ROLLBACK;", nil, nil, nil)
+            throw error
+        }
+    }
+
+    private func executeSQL(_ sql: String, in database: OpaquePointer) throws {
+        var message: UnsafeMutablePointer<Int8>?
+        guard sqlite3_exec(database, sql, nil, nil, &message) == SQLITE_OK else {
+            let description = message.map { String(cString: $0) }
+                ?? "SQLite error \(sqlite3_errcode(database))"
+            sqlite3_free(message)
+            throw NSError(
+                domain: "PipelineIntegrationTests",
+                code: Int(sqlite3_errcode(database)),
+                userInfo: [NSLocalizedDescriptionKey: description]
+            )
+        }
+    }
+
     private func writeProcessedPairCount(into databaseURL: URL, pairCount: Int) throws {
         var db: OpaquePointer?
         defer { sqlite3_close(db) }
@@ -2810,6 +3347,10 @@ final class PipelineIntegrationTests: XCTestCase {
         ].map { name in
             (name, try GeometryArtifactStore.sha256(of: modelURL.appendingPathComponent(name)))
         })
+        let pairGraphEvidence = try persistPairGraphEvidenceFixture(
+            paths: paths,
+            imageNames: imageNames
+        )
         let artifact = GeometryArtifact(
             schemaVersion: GeometryArtifact.currentSchemaVersion,
             solverVersion: "colmap-test-fixture",
@@ -2851,7 +3392,7 @@ final class PipelineIntegrationTests: XCTestCase {
                 runtime: nil,
                 model: nil
             ),
-            pairGraph: .notEvaluated(
+            pairGraph: try pairGraphEvidence.pairGraphArtifact(
                 mappingAttemptNumber: 1,
                 bundleAdjustmentCycleCount: 1,
                 fallbackReason: nil
@@ -2865,36 +3406,80 @@ final class PipelineIntegrationTests: XCTestCase {
         )
     }
 
-    private func writeCompletedColmapDatabase(at databaseURL: URL) throws {
-        try FileManager.default.createDirectory(at: databaseURL.deletingLastPathComponent(), withIntermediateDirectories: true)
-        var db: OpaquePointer?
-        defer { sqlite3_close(db) }
-        guard sqlite3_open(databaseURL.path, &db) == SQLITE_OK, let db else {
-            throw NSError(
-                domain: "PipelineIntegrationTests",
-                code: 1,
-                userInfo: [NSLocalizedDescriptionKey: "Unable to open sqlite database at \(databaseURL.path)"]
-            )
-        }
+    private func persistPairGraphEvidenceFixture(
+        paths: ProjectPaths,
+        imageNames: [String]
+    ) throws -> PairGraphEvidence {
+        let plan = try ColmapPairPlan.exhaustive(imageNames: imageNames)
+        let inspection = try ColmapPairGraphInspector(
+            databaseURL: paths.colmapDatabaseURL
+        ).inspect(
+            schedule: ColmapPairSchedule(
+                imageNames: imageNames,
+                pairs: plan.pairs
+            ),
+            completion: .succeeded
+        )
+        let attempt = PairGraphAttemptEvidence(
+            artifact: PairMatchingAttemptArtifact(
+                attemptNumber: 1,
+                matcher: .faiss,
+                recoveryLevel: .normal,
+                outcome: .completed,
+                scheduledPairCount: inspection.scheduledPairCount,
+                attemptedPairCount: inspection.attemptedPairCount,
+                rawMatchedPairCount: inspection.rawMatchedPairCount,
+                spatiallyVerifiedPairCount: inspection.spatiallyVerifiedPairCount,
+                durationSeconds: 0.01
+            ),
+            scheduledPairs: plan.pairs
+        )
+        let evidence = PairGraphEvidence(
+            selectedFramesDigest: try GeometryArtifactStore.selectedFramesDigest(
+                orderedImageNames: imageNames,
+                projectPaths: paths
+            ),
+            imageNames: imageNames,
+            attempts: [attempt],
+            acceptedAttemptNumber: 1,
+            acceptedInspection: inspection,
+            matchingDurationSeconds: 0.01,
+            fallbackReasons: []
+        )
+        try PairGraphEvidenceStore.save(
+            evidence,
+            to: paths.pairGraphEvidenceURL,
+            projectPaths: paths
+        )
+        return evidence
+    }
 
-        let sql = """
-        CREATE TABLE images(image_id INTEGER PRIMARY KEY);
-        CREATE TABLE keypoints(image_id INTEGER PRIMARY KEY, rows INTEGER);
-        CREATE TABLE two_view_geometries(pair_id INTEGER PRIMARY KEY);
-        INSERT INTO images(image_id) VALUES (1), (2);
-        INSERT INTO keypoints(image_id, rows) VALUES (1, 1), (2, 1);
-        INSERT INTO two_view_geometries(pair_id) VALUES (1);
-        """
-        var errorMessage: UnsafeMutablePointer<Int8>?
-        if sqlite3_exec(db, sql, nil, nil, &errorMessage) != SQLITE_OK {
-            let message = errorMessage.map { String(cString: $0) } ?? "sqlite error \(sqlite3_errcode(db))"
-            sqlite3_free(errorMessage)
-            throw NSError(
-                domain: "PipelineIntegrationTests",
-                code: Int(sqlite3_errcode(db)),
-                userInfo: [NSLocalizedDescriptionKey: message]
-            )
-        }
+    private func writeCompletedColmapDatabase(paths: ProjectPaths) throws {
+        try writeFeatureDatabase(for: [
+            "--database_path", paths.colmapDatabaseURL.path,
+            "--image_path", paths.framesSelectedURL.path,
+        ])
+        let imageNames = selectedImageNames(in: paths)
+        try ColmapFeatureEvidenceStore.save(
+            ColmapFeatureEvidence(
+                selectedFramesDigest: try GeometryArtifactStore.selectedFramesDigest(
+                    orderedImageNames: imageNames,
+                    projectPaths: paths
+                ),
+                imageNames: imageNames,
+                featureDatabaseDigest: try ColmapDatabaseDigester
+                    .digests(at: paths.colmapDatabaseURL).feature
+            ),
+            to: paths.colmapFeatureEvidenceURL,
+            projectPaths: paths
+        )
+        let plan = try ColmapPairPlan.exhaustive(imageNames: imageNames)
+        let pairList = paths.colmapSeedURL.appendingPathComponent("fixture-pairs.txt")
+        try plan.serializedData.write(to: pairList, options: .atomic)
+        try writeVerifiedPairResults(for: [
+            "--database_path", paths.colmapDatabaseURL.path,
+            "--match_list_path", pairList.path,
+        ])
     }
 
     private func writeMatchableColmapDatabase(at databaseURL: URL) throws {

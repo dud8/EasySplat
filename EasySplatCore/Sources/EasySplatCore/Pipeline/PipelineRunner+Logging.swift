@@ -196,10 +196,22 @@ final class StageTimingTracker: @unchecked Sendable {
     private let clock = ContinuousClock()
     private var starts: [PipelineStage: (instant: ContinuousClock.Instant, wallClock: Date)] = [:]
     private var pendingRecords: [PipelineStage: (startedAt: Date, durationSeconds: TimeInterval)] = [:]
+    private var firstStarts: [PipelineStage: Date] = [:]
+    private var accumulatedSeconds: [PipelineStage: TimeInterval] = [:]
 
     func start(_ stage: PipelineStage) {
         lock.lock()
-        starts[stage] = (instant: clock.now, wallClock: Date())
+        let now = clock.now
+        let wallClock = Date()
+        if let active = starts[stage] {
+            accumulatedSeconds[stage, default: 0] += Self.durationInSeconds(
+                now - active.instant
+            )
+        }
+        if firstStarts[stage] == nil {
+            firstStarts[stage] = wallClock
+        }
+        starts[stage] = (instant: now, wallClock: wallClock)
         lock.unlock()
     }
 
@@ -211,10 +223,14 @@ final class StageTimingTracker: @unchecked Sendable {
         }
         starts[stage] = nil
         let duration = clock.now - entry.instant
-        let seconds = Self.durationInSeconds(duration)
-        pendingRecords[stage] = (startedAt: entry.wallClock, durationSeconds: seconds)
+        accumulatedSeconds[stage, default: 0] += Self.durationInSeconds(duration)
+        let totalSeconds = accumulatedSeconds[stage, default: 0]
+        pendingRecords[stage] = (
+            startedAt: firstStarts[stage] ?? entry.wallClock,
+            durationSeconds: totalSeconds
+        )
         lock.unlock()
-        return Self.format(seconds: seconds)
+        return Self.format(seconds: totalSeconds)
     }
 
     /// Pop the most recent completed timing for a stage. Used by the runner to

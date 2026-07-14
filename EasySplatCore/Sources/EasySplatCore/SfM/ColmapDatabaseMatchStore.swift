@@ -2,11 +2,14 @@ import Foundation
 import SQLite3
 
 enum ColmapDatabaseMatchStoreError: LocalizedError, Equatable {
+    case unsafeDatabaseFile
     case openFailed(code: Int32, message: String)
     case operationFailed(operation: String, code: Int32, message: String)
 
     var errorDescription: String? {
         switch self {
+        case .unsafeDatabaseFile:
+            return "The COLMAP database must be a plain regular file."
         case let .openFailed(code, message):
             return "Could not open the COLMAP database (SQLite \(code)): \(message)"
         case let .operationFailed(operation, code, message):
@@ -17,41 +20,62 @@ enum ColmapDatabaseMatchStoreError: LocalizedError, Equatable {
 
 enum ColmapDatabaseMatchStore {
     static func clearMatchingResults(at databaseURL: URL) throws {
-        var database: OpaquePointer?
-        let openResult = sqlite3_open_v2(
-            databaseURL.path,
-            &database,
-            SQLITE_OPEN_READWRITE,
-            nil
-        )
-        guard openResult == SQLITE_OK, let database else {
-            let message = database.map { String(cString: sqlite3_errmsg($0)) }
-                ?? "unknown SQLite error"
-            if let database {
-                sqlite3_close(database)
-            }
-            throw ColmapDatabaseMatchStoreError.openFailed(
-                code: openResult,
-                message: message
-            )
-        }
-        defer { sqlite3_close(database) }
+        let handle = try openDatabase(at: databaseURL)
+        let database = handle.database
 
         sqlite3_extended_result_codes(database, 1)
         sqlite3_busy_timeout(database, 5_000)
 
         try execute("BEGIN IMMEDIATE TRANSACTION;", operation: "begin the match reset", in: database)
         do {
+            try verifyUnchanged(handle)
             try execute("DELETE FROM matches;", operation: "clear raw matches", in: database)
             try execute(
                 "DELETE FROM two_view_geometries;",
                 operation: "clear verified matches",
                 in: database
             )
+            try verifyUnchanged(handle)
             try execute("COMMIT;", operation: "commit the match reset", in: database)
+            try verifyUnchanged(handle)
         } catch {
             try? execute("ROLLBACK;", operation: "roll back the match reset", in: database)
             throw error
+        }
+    }
+
+    private static func openDatabase(at databaseURL: URL) throws -> ColmapSQLiteDatabaseHandle {
+        do {
+            return try ColmapSQLiteDatabaseHandle.open(
+                at: databaseURL,
+                flags: SQLITE_OPEN_READWRITE
+            )
+        } catch {
+            throw mapped(error)
+        }
+    }
+
+    private static func verifyUnchanged(_ handle: ColmapSQLiteDatabaseHandle) throws {
+        do {
+            try handle.verifyUnchanged()
+        } catch {
+            throw mapped(error)
+        }
+    }
+
+    private static func mapped(_ error: Error) -> ColmapDatabaseMatchStoreError {
+        switch error as? ColmapSQLiteDatabaseHandleError {
+        case .unsafeDatabaseFile:
+            return .unsafeDatabaseFile
+        case let .openFailed(code, message):
+            return .openFailed(code: code, message: message)
+        case let .verificationFailed(code, message):
+            return .openFailed(
+                code: code,
+                message: "File identity verification failed: \(message)"
+            )
+        case nil:
+            return .openFailed(code: SQLITE_ERROR, message: error.localizedDescription)
         }
     }
 

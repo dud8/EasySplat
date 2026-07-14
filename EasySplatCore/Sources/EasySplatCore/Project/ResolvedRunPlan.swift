@@ -2,14 +2,27 @@ import Foundation
 
 public enum ResolvedPairingPolicy: String, Codable, Sendable, Equatable {
     case unorderedRetrieval
+    case segmentedMixed
     case orderedContinuous
     case orderedOrbit
     case orderedWalkthrough
     case orderedLargeArea
 }
 
+public enum TemporalPairing: String, Codable, Sendable, Equatable {
+    case none
+    case linear
+    case multiscale
+}
+
+public enum RetrievalEngine: String, Codable, Sendable, Equatable {
+    case localSiftVocabularyV1
+}
+
 public enum ResolvedRunPlanValidationError: Error, LocalizedError, Equatable {
     case emptyToolchainCapabilities
+    case invalidPairingConfiguration
+    case unsupportedNormalDescriptorMatcher
     case unknownToolchainCapability(String)
     case unknownRouteIdentifier(String)
 
@@ -17,6 +30,10 @@ public enum ResolvedRunPlanValidationError: Error, LocalizedError, Equatable {
         switch self {
         case .emptyToolchainCapabilities:
             return "Run plan does not request any tool capabilities."
+        case .invalidPairingConfiguration:
+            return "Run plan contains an invalid image-pairing configuration."
+        case .unsupportedNormalDescriptorMatcher:
+            return "Run plan must use FAISS for normal descriptor matching."
         case .unknownToolchainCapability(let capability):
             return "Run plan requires an unsupported tool capability: \(capability)."
         case .unknownRouteIdentifier(let identifier):
@@ -43,7 +60,6 @@ public struct ResolvedRunPlan: Codable, Sendable, Equatable {
     public var trainerMemoryBudgetBytes: Int64
     public var colmapMaximumFeatureCount: Int
     public var colmapMaximumMatchCount: Int
-    public var colmapExhaustiveBlockSize: Int
     public var colmapThreadLimit: Int
     public var requiredToolchainCapabilities: [String]
     public var fallbackRouteIdentifiers: [String]
@@ -51,7 +67,13 @@ public struct ResolvedRunPlan: Codable, Sendable, Equatable {
     public var inputOrdering: InputOrdering
     public var photoSelection: PhotoSelection
     public var pairingPolicy: ResolvedPairingPolicy
-    public var sequentialOverlap: Int
+    public var temporalPairing: TemporalPairing
+    public var temporalOffsets: [Int]
+    public var retrievalEngine: RetrievalEngine
+    public var retrievalCandidateCount: Int
+    public var retrievalNeighborCount: Int
+    public var retrievalQueryStride: Int
+    public var normalDescriptorMatcher: DescriptorMatcher
     public var baGlobalFramesRatio: Double
     public var baGlobalPointsRatio: Double
     public var baGlobalMaxRefinements: Int
@@ -75,7 +97,6 @@ public struct ResolvedRunPlan: Codable, Sendable, Equatable {
         trainerMemoryBudgetBytes: Int64,
         colmapMaximumFeatureCount: Int = 8_192,
         colmapMaximumMatchCount: Int = 8_192,
-        colmapExhaustiveBlockSize: Int = 20,
         colmapThreadLimit: Int = 6,
         requiredToolchainCapabilities: [String],
         fallbackRouteIdentifiers: [String],
@@ -83,7 +104,13 @@ public struct ResolvedRunPlan: Codable, Sendable, Equatable {
         inputOrdering: InputOrdering = .automatic,
         photoSelection: PhotoSelection = .automatic,
         pairingPolicy: ResolvedPairingPolicy = .unorderedRetrieval,
-        sequentialOverlap: Int = 10,
+        temporalPairing: TemporalPairing = .none,
+        temporalOffsets: [Int] = [],
+        retrievalEngine: RetrievalEngine = .localSiftVocabularyV1,
+        retrievalCandidateCount: Int = 20,
+        retrievalNeighborCount: Int = 8,
+        retrievalQueryStride: Int = 1,
+        normalDescriptorMatcher: DescriptorMatcher = .faiss,
         baGlobalFramesRatio: Double = 1.1,
         baGlobalPointsRatio: Double = 1.1,
         baGlobalMaxRefinements: Int = 5,
@@ -106,7 +133,6 @@ public struct ResolvedRunPlan: Codable, Sendable, Equatable {
         self.trainerMemoryBudgetBytes = trainerMemoryBudgetBytes
         self.colmapMaximumFeatureCount = colmapMaximumFeatureCount
         self.colmapMaximumMatchCount = colmapMaximumMatchCount
-        self.colmapExhaustiveBlockSize = colmapExhaustiveBlockSize
         self.colmapThreadLimit = colmapThreadLimit
         self.requiredToolchainCapabilities = requiredToolchainCapabilities
         self.fallbackRouteIdentifiers = fallbackRouteIdentifiers
@@ -114,7 +140,13 @@ public struct ResolvedRunPlan: Codable, Sendable, Equatable {
         self.inputOrdering = inputOrdering
         self.photoSelection = photoSelection
         self.pairingPolicy = pairingPolicy
-        self.sequentialOverlap = sequentialOverlap
+        self.temporalPairing = temporalPairing
+        self.temporalOffsets = temporalOffsets
+        self.retrievalEngine = retrievalEngine
+        self.retrievalCandidateCount = retrievalCandidateCount
+        self.retrievalNeighborCount = retrievalNeighborCount
+        self.retrievalQueryStride = retrievalQueryStride
+        self.normalDescriptorMatcher = normalDescriptorMatcher
         self.baGlobalFramesRatio = baGlobalFramesRatio
         self.baGlobalPointsRatio = baGlobalPointsRatio
         self.baGlobalMaxRefinements = baGlobalMaxRefinements
@@ -122,6 +154,7 @@ public struct ResolvedRunPlan: Codable, Sendable, Equatable {
     }
 
     public func toolchainCapabilityRequest() throws -> ToolchainCapabilityRequest {
+        try validatePairingConfiguration()
         _ = try validatedBackendOrder()
         var capabilities = Set<ToolchainCapability>()
         for rawValue in requiredToolchainCapabilities {
@@ -146,6 +179,26 @@ public struct ResolvedRunPlan: Codable, Sendable, Equatable {
                 throw ResolvedRunPlanValidationError.unknownRouteIdentifier(identifier)
             }
             return backend
+        }
+    }
+
+    private func validatePairingConfiguration() throws {
+        guard normalDescriptorMatcher == .faiss else {
+            throw ResolvedRunPlanValidationError.unsupportedNormalDescriptorMatcher
+        }
+        let offsetsAreValid = temporalOffsets.allSatisfy { $0 > 0 }
+            && temporalOffsets == temporalOffsets.sorted()
+            && Set(temporalOffsets).count == temporalOffsets.count
+        let temporalPolicyIsCoherent = temporalPairing == .none
+            ? temporalOffsets.isEmpty
+            : !temporalOffsets.isEmpty
+        guard offsetsAreValid,
+              temporalPolicyIsCoherent,
+              retrievalCandidateCount > 0,
+              retrievalNeighborCount > 0,
+              retrievalNeighborCount <= retrievalCandidateCount,
+              retrievalQueryStride > 0 else {
+            throw ResolvedRunPlanValidationError.invalidPairingConfiguration
         }
     }
 }

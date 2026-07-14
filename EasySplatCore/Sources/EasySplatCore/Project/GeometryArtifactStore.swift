@@ -290,21 +290,29 @@ enum GeometryArtifactStore {
                   measurement.localPairCount <= measurement.scheduledPairCount,
                   measurement.retrievalPairCount <= measurement.scheduledPairCount,
                   measurement.loopRevisitPairCount <= measurement.scheduledPairCount,
-                  measurement.connectedComponentCount > 0,
-                  measurement.connectedComponentCount <= totalViewCount,
-                  measurement.isolatedViewCount >= 0,
-                  measurement.isolatedViewCount <= totalViewCount,
+                  measurement.localPairCount
+                    + measurement.retrievalPairCount
+                    + measurement.loopRevisitPairCount
+                    == measurement.scheduledPairCount,
+                  measurement.connectedComponentCount == 1,
+                  measurement.isolatedViewCount == 0,
+                  measurement.spatiallyVerifiedPairCount >= max(0, totalViewCount - 1),
                   measurement.degreeP10 >= 0,
                   measurement.degreeP10 <= measurement.degreeMedian,
                   measurement.degreeMedian <= measurement.degreeP90,
                   measurement.degreeP90 < totalViewCount,
                   !measurement.matcherAttempts.isEmpty,
                   isSHA256(measurement.pairListDigest),
+                  isSHA256(measurement.featureDatabaseDigest),
+                  isSHA256(measurement.matchingDatabaseDigest),
                   measurement.matchingDurationSeconds.isFinite,
                   measurement.matchingDurationSeconds >= 0 else {
                 throw Error.invalidPairGraph
             }
             let attemptNumbers = measurement.matcherAttempts.map(\.attemptNumber)
+            let measuredDuration = measurement.matcherAttempts.reduce(0.0) {
+                $0 + $1.durationSeconds
+            }
             guard Set(attemptNumbers).count == attemptNumbers.count,
                   attemptNumbers.sorted() == Array(1...attemptNumbers.count),
                   measurement.matcherAttempts.allSatisfy({ attempt in
@@ -317,7 +325,20 @@ enum GeometryArtifactStore {
                           && attempt.spatiallyVerifiedPairCount <= attempt.rawMatchedPairCount
                           && attempt.durationSeconds.isFinite
                           && attempt.durationSeconds >= 0
-                  }) else {
+                  }),
+                  measuredDuration.isFinite,
+                  approximatelyEqual(
+                      measuredDuration,
+                      measurement.matchingDurationSeconds,
+                      relativeTolerance: 1e-12
+                  ),
+                  let acceptedAttempt = measurement.matcherAttempts.last,
+                  acceptedAttempt.outcome == .completed,
+                  acceptedAttempt.scheduledPairCount == measurement.scheduledPairCount,
+                  acceptedAttempt.attemptedPairCount == measurement.attemptedPairCount,
+                  acceptedAttempt.rawMatchedPairCount == measurement.rawMatchedPairCount,
+                  acceptedAttempt.spatiallyVerifiedPairCount
+                    == measurement.spatiallyVerifiedPairCount else {
                 throw Error.invalidPairGraph
             }
         }

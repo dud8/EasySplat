@@ -18,6 +18,8 @@ private final class ColmapMatchingProgressState: @unchecked Sendable {
 }
 
 extension PipelineRunner {
+    private static let maximumGeneratedPairListBytes = 64 * 1_024 * 1_024
+
     func writeColmapPairList(_ pairs: [String], fileName: String, paths: ProjectPaths) throws -> URL {
         let url = paths.colmapSeedURL.appendingPathComponent(fileName)
         try (pairs.joined(separator: "\n") + "\n").write(
@@ -26,6 +28,49 @@ extension PipelineRunner {
             encoding: .utf8
         )
         return url
+    }
+
+    func writeColmapPairPlan(
+        _ plan: ColmapPairPlan,
+        attemptNumber: Int,
+        paths: ProjectPaths
+    ) throws -> URL {
+        let url = paths.colmapSeedURL.appendingPathComponent(
+            "match_pairs_attempt_\(attemptNumber).txt"
+        )
+        try plan.serializedData.write(to: url, options: .atomic)
+        guard plan.validates(try Data(contentsOf: url)) else {
+            throw PipelineError.outputMissing
+        }
+        return url
+    }
+
+    func writeVocabularyQueryList(
+        _ imageNames: [String],
+        attemptNumber: Int,
+        paths: ProjectPaths
+    ) throws -> URL {
+        guard !imageNames.isEmpty,
+              Set(imageNames).count == imageNames.count,
+              imageNames.allSatisfy({ !$0.isEmpty && !$0.contains(where: \.isWhitespace) }) else {
+            throw ColmapPairPlanningError.invalidPairPlan
+        }
+        return try writeColmapPairList(
+            imageNames,
+            fileName: "retrieval_queries_attempt_\(attemptNumber).txt",
+            paths: paths
+        )
+    }
+
+    func readGeneratedPairLines(from url: URL) throws -> [String] {
+        let data = try BoundedFileReader.readRegularFile(
+            at: url,
+            maximumBytes: Self.maximumGeneratedPairListBytes
+        )
+        guard let text = String(data: data, encoding: .utf8) else {
+            throw ColmapPairPlanningError.invalidPairPlan
+        }
+        return text.split(whereSeparator: \.isNewline).map(String.init)
     }
 
     /// Runs one COLMAP matcher attempt with database-polling progress.
@@ -63,7 +108,7 @@ extension PipelineRunner {
             var lastEmit = Date.distantPast
 
             while !Task.isCancelled {
-                var processed = (try? poller.readProcessedPairCount()) ?? 0
+                var processed = (try? poller.readAttemptedPairCount()) ?? 0
                 if lastProcessed >= 0, processed < lastProcessed {
                     processed = lastProcessed
                 }

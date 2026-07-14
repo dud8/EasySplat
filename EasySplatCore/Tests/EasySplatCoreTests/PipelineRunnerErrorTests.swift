@@ -126,7 +126,7 @@ final class PipelineRunnerErrorTests: XCTestCase {
         let runner = makeRunner()
 
         let message = runner.test_failureMessages(
-            for: ColmapPairPlanningError.disconnectedGraph,
+            for: ColmapPairPlanningError.disconnectedVerifiedGraph,
             stage: .sfmMatching
         )
 
@@ -134,13 +134,13 @@ final class PipelineRunnerErrorTests: XCTestCase {
             message.userMessage,
             "The capture did not have enough connected overlap. Try again with more overlap."
         )
-        XCTAssertTrue(message.debugMessage.contains("retrieval graph was disconnected"))
+        XCTAssertTrue(message.debugMessage.contains("pair graph remained disconnected"))
     }
 
     func testRetryDiagnosticEventIncludesCommandTerminationAndLastStderrLine() {
         let runner = makeRunner()
         let error = ColmapRunnerError.failed(
-            command: "sequential_matcher",
+            command: "matches_importer",
             exitCode: 10,
             terminationReason: .uncaughtSignal,
             stdoutTail: "ignored stdout",
@@ -158,7 +158,7 @@ final class PipelineRunnerErrorTests: XCTestCase {
         XCTAssertTrue(isError)
         XCTAssertEqual(
             line,
-            "Previous sequential_matcher attempt failed: exit 10, \(Process.TerminationReason.uncaughtSignal) — segmentation fault"
+            "Previous matches_importer attempt failed: exit 10, \(Process.TerminationReason.uncaughtSignal) — segmentation fault"
         )
     }
 
