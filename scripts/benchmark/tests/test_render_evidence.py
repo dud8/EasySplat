@@ -6,7 +6,8 @@ import subprocess
 import sys
 import tempfile
 import unittest
-from pathlib import Path
+from pathlib import Path, PurePosixPath
+from unittest import mock
 
 from PIL import Image
 
@@ -84,6 +85,7 @@ def commands() -> list[dict[str, object]]:
             "checkout_commit": character * 40,
             "toolchain_identity": "sha256:" + character * 64,
             "executable_sha256": "sha256:" + character * 64,
+            "published_output": run_id == "candidate-run",
         }
         for run_id, phase, variant, character in specs
     ]
@@ -170,6 +172,18 @@ def write_render_closure(root: Path) -> tuple[dict[str, object], Path]:
     }
     reference_path = root / "accurate-rendering-reference.json"
     reference_path.write_bytes(evidence.canonical_json_bytes(reference) + b"\n")
+    operations_by_key = {
+        (item["variant"], item["holdout_index"]): item
+        for item in render_operations
+    }
+    render_operations = [
+        operations_by_key[(variant, holdout)]
+        for variant in VARIANTS
+        for holdout in HOLDOUTS
+    ]
+    for index, operation in enumerate(render_operations):
+        operation["started_monotonic_seconds"] = float(index)
+        operation["ended_monotonic_seconds"] = float(index + 1)
     manifest = {
         "schema_version": 1,
         "scene_id": req["binding"]["scene_id"],
@@ -218,6 +232,194 @@ class RenderEvidenceTests(unittest.TestCase):
             self.assertEqual([sample["holdout_index"] for sample in result.samples], HOLDOUTS)
             self.assertEqual(len(result.artifacts), len(HOLDOUTS) * 5 + 1)
             self.assertTrue(all(sample["candidate_psnr"] < 100 for sample in result.samples))
+
+    def test_scores_the_ground_truth_bytes_that_were_hashed(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            req, reference_path = write_render_closure(root)
+            target = root / "rendering" / "ground-truth" / f"{HOLDOUTS[0]:06d}.png"
+            original_open = Image.open
+            open_count = 0
+
+            def replace_before_decode(file, *args, **kwargs):
+                nonlocal open_count
+                open_count += 1
+                if open_count == 1:
+                    write_png(target, 255)
+                return original_open(file, *args, **kwargs)
+
+            with mock.patch.object(Image, "open", side_effect=replace_before_decode):
+                result = self.score(root, req, reference_path)
+
+            self.assertEqual(result.balanced[0]["reference_psnr"], 100.0)
+
+    def test_scores_the_render_bytes_that_were_hashed(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            req, reference_path = write_render_closure(root)
+            target = root / "rendering" / "accurate_reference" / f"{HOLDOUTS[0]:06d}.png"
+            original_open = Image.open
+            open_count = 0
+
+            def replace_before_decode(file, *args, **kwargs):
+                nonlocal open_count
+                open_count += 1
+                if open_count == 2:
+                    write_png(target, 255)
+                return original_open(file, *args, **kwargs)
+
+            with mock.patch.object(Image, "open", side_effect=replace_before_decode):
+                result = self.score(root, req, reference_path)
+
+            self.assertEqual(result.balanced[0]["reference_psnr"], 100.0)
+
+    def test_rejects_wrong_dimensions_before_decoding_pixels(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            image_path = root / "image.png"
+            digest = write_png(image_path, 64)
+
+            class OversizedImage:
+                format = "PNG"
+                mode = "RGB"
+                size = (100_000, 100_000)
+
+                def __enter__(self):
+                    return self
+
+                def __exit__(self, *_):
+                    return False
+
+                def load(self):
+                    raise AssertionError("pixel decoding ran before the signed size check")
+
+            with (
+                mock.patch.object(Image, "open", return_value=OversizedImage()),
+                self.assertRaisesRegex(evidence.EvidenceError, "dimensions"),
+            ):
+                evidence._load_render_image(
+                    artifact_root=root,
+                    relative_path=PurePosixPath("image.png"),
+                    expected_sha256=digest,
+                    expected_width=64,
+                    expected_height=64,
+                    label="oversized image",
+                )
+
+    def test_maps_pillow_decompression_bombs_to_evidence_errors(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            image_path = root / "image.png"
+            digest = write_png(image_path, 64)
+            with (
+                mock.patch.object(
+                    Image,
+                    "open",
+                    side_effect=Image.DecompressionBombError("bomb"),
+                ),
+                self.assertRaisesRegex(evidence.EvidenceError, "readable PNG"),
+            ):
+                evidence._load_render_image(
+                    artifact_root=root,
+                    relative_path=PurePosixPath("image.png"),
+                    expected_sha256=digest,
+                    expected_width=64,
+                    expected_height=64,
+                    label="bomb image",
+                )
+
+    def test_scores_canonical_source_major_render_operations(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            req, reference_path = write_render_closure(root)
+            manifest_path = root / "rendering-manifest.json"
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            operations = {
+                (item["variant"], item["holdout_index"]): item
+                for item in manifest["render_operations"]
+            }
+            manifest["render_operations"] = [
+                operations[(variant, holdout)]
+                for variant in VARIANTS
+                for holdout in HOLDOUTS
+            ]
+            for index, operation in enumerate(manifest["render_operations"]):
+                operation["started_monotonic_seconds"] = float(index)
+                operation["ended_monotonic_seconds"] = float(index + 1)
+            manifest_path.write_bytes(evidence.canonical_json_bytes(manifest) + b"\n")
+
+            result = self.score(root, req, reference_path)
+
+            self.assertEqual([sample["holdout_index"] for sample in result.samples], HOLDOUTS)
+
+    def test_rejects_nonpublished_candidate_source_even_when_receipt_is_valid(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            req, reference_path = write_render_closure(root)
+            manifest_path = root / "rendering-manifest.json"
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            alternate = {
+                **commands()[1],
+                "run_id": "candidate-earlier-run",
+                "output_sha256": "sha256:" + "9" * 64,
+                "published_output": False,
+            }
+            for view in manifest["views"]:
+                render = view["renders"][2]
+                render["source_run_id"] = alternate["run_id"]
+                render["ply_sha256"] = alternate["output_sha256"]
+            for operation in manifest["render_operations"]:
+                if operation["variant"] == "candidate_balanced":
+                    operation["source_run_id"] = alternate["run_id"]
+                    operation["input_ply_sha256"] = alternate["output_sha256"]
+            manifest_path.write_bytes(evidence.canonical_json_bytes(manifest) + b"\n")
+
+            with self.assertRaisesRegex(evidence.EvidenceError, "published output"):
+                evidence.validate_and_score_rendering(
+                    artifact_root=root,
+                    manifest_path=manifest_path,
+                    reference_path=reference_path,
+                    request=req,
+                    commands=[*commands(), alternate],
+                    renderer_executable_sha256=RENDERER_SHA256,
+                    lpips_distance=lambda first, second: float(abs(first.mean() - second.mean())),
+                )
+
+    def test_rejects_mixed_source_run_across_holdouts(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            req, reference_path = write_render_closure(root)
+            manifest_path = root / "rendering-manifest.json"
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            alternate = {
+                **commands()[0],
+                "run_id": "baseline-earlier-run",
+                "output_sha256": "sha256:" + "9" * 64,
+                "published_output": False,
+            }
+            render = manifest["views"][1]["renders"][1]
+            render["source_run_id"] = alternate["run_id"]
+            render["ply_sha256"] = alternate["output_sha256"]
+            operation = next(
+                item
+                for item in manifest["render_operations"]
+                if item["holdout_index"] == HOLDOUTS[1]
+                and item["variant"] == "paired_baseline"
+            )
+            operation["source_run_id"] = alternate["run_id"]
+            operation["input_ply_sha256"] = alternate["output_sha256"]
+            manifest_path.write_bytes(evidence.canonical_json_bytes(manifest) + b"\n")
+
+            with self.assertRaisesRegex(evidence.EvidenceError, "one source execution"):
+                evidence.validate_and_score_rendering(
+                    artifact_root=root,
+                    manifest_path=manifest_path,
+                    reference_path=reference_path,
+                    request=req,
+                    commands=[alternate, *commands()],
+                    renderer_executable_sha256=RENDERER_SHA256,
+                    lpips_distance=lambda first, second: float(abs(first.mean() - second.mean())),
+                )
 
     def test_rejects_missing_duplicate_misordered_or_altered_images(self) -> None:
         mutations = {
@@ -380,11 +582,27 @@ class RenderEvidenceTests(unittest.TestCase):
 
             program = """
 import sys
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from scripts.benchmark import evidence_protocol as evidence
 evidence.LPIPS_DEVICE_OVERRIDE = sys.argv[3]
-candidate = evidence._load_render_image(Path(sys.argv[1]), 64, 64, 'candidate')
-target = evidence._load_render_image(Path(sys.argv[2]), 64, 64, 'target')
+candidate_path = Path(sys.argv[1])
+target_path = Path(sys.argv[2])
+candidate, _ = evidence._load_render_image(
+    artifact_root=candidate_path.parent,
+    relative_path=PurePosixPath(candidate_path.name),
+    expected_sha256=evidence.sha256_file(candidate_path),
+    expected_width=64,
+    expected_height=64,
+    label='candidate',
+)
+target, _ = evidence._load_render_image(
+    artifact_root=target_path.parent,
+    relative_path=PurePosixPath(target_path.name),
+    expected_sha256=evidence.sha256_file(target_path),
+    expected_width=64,
+    expected_height=64,
+    label='target',
+)
 print(f'{evidence._lpips_distance(candidate, target):.17g}')
 """
 

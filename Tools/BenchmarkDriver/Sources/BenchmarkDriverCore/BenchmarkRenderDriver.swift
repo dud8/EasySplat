@@ -4,15 +4,24 @@ import Foundation
 
 public final class BenchmarkRenderDriver {
     typealias RenderImage = (URL, RenderCamera, URL) throws -> String
+    typealias LoadScene = (URL) throws -> any LoadedSceneRendering
 
-    private let renderImage: RenderImage
+    private let loadScene: LoadScene
 
     public convenience init(renderer: MetalOffscreenRenderer) {
-        self.init(renderImage: renderer.render)
+        self.init(loadScene: renderer.loadScene)
     }
 
     init(renderImage: @escaping RenderImage) {
-        self.renderImage = renderImage
+        self.loadScene = { source in
+            ClosureLoadedScene { camera, output in
+                try renderImage(source, camera, output)
+            }
+        }
+    }
+
+    init(loadScene: @escaping LoadScene) {
+        self.loadScene = loadScene
     }
 
     @discardableResult
@@ -50,34 +59,58 @@ public final class BenchmarkRenderDriver {
             throw BenchmarkDriverError.invalidJob("A render checkout does not match its signed commit.")
         }
 
-        var manifestViews = [RenderingManifestView]()
+        let groundTruthInputs = try job.views.enumerated().map { position, view in
+            try StableArtifactInput.capture(
+                artifactRoot: artifacts.root,
+                relativePath: view.groundTruth.path,
+                expectedSHA256: view.groundTruth.sha256,
+                label: "held-out ground-truth image \(position)"
+            )
+        }
+        let cameraDigests = try job.views.map { try Self.digest(of: $0.camera) }
+        let snapshots = try RenderInputSnapshotDirectory()
+        var rendersByView = Array(
+            repeating: [RenderVariant: RenderingManifestRender](),
+            count: job.views.count
+        )
         var renderOperations = [RenderOperationReceipt]()
         var previousCommandEnd = 0.0
+
+        func verifyProtectedState() throws {
+            for input in groundTruthInputs {
+                try input.verifyUnchanged()
+            }
+            try candidate.verifyUnchanged()
+            try baseline.verifyUnchanged()
+        }
+
         do {
-            for view in job.views {
-                try candidate.verifyUnchanged()
-                try baseline.verifyUnchanged()
-                let cameraDigest = try Self.digest(of: view.camera)
-                let groundTruthURL = try artifacts.existingFile(for: view.groundTruth.path)
-                let actualGroundTruthSHA = try MetalOffscreenRenderer.sha256(fileAt: groundTruthURL)
-                guard actualGroundTruthSHA == view.groundTruth.sha256 else {
+            for (sourceIndex, variant) in RenderVariant.allCases.enumerated() {
+                let immutableSource = job.views[0].sources[sourceIndex]
+                guard immutableSource.variant == variant else {
                     throw BenchmarkDriverError.invalidJob(
-                        "A held-out ground-truth image changed after the job was created."
+                        "Render sources must use the canonical variant order."
                     )
                 }
+                let snapshot = try snapshots.copy(
+                    artifactRoot: artifacts.root,
+                    relativePath: immutableSource.plyPath,
+                    expectedSHA256: immutableSource.plySHA256,
+                    filename: "\(variant.rawValue).ply"
+                )
+                let loadedScene = try loadScene(snapshot.url)
+                try snapshot.verifyUnchanged()
 
-                var renders = [RenderingManifestRender]()
-                for source in view.sources {
-                    let sourceURL = try artifacts.existingFile(for: source.plyPath)
-                    guard try MetalOffscreenRenderer.sha256(fileAt: sourceURL) == source.plySHA256 else {
-                        throw BenchmarkDriverError.invalidJob(
-                            "A source PLY changed after the job was created."
-                        )
-                    }
+                for (viewIndex, view) in job.views.enumerated() {
+                    let source = view.sources[sourceIndex]
+                    let cameraDigest = cameraDigests[viewIndex]
                     let outputURL = try artifacts.outputURL(for: source.outputPath)
                     let operationID = "render-\(String(format: "%06d", view.holdoutIndex))-\(source.variant.rawValue)"
                     let started = max(ProcessInfo.processInfo.systemUptime, previousCommandEnd)
-                    let reportedOutputSHA = try renderImage(sourceURL, view.camera, outputURL)
+                    let reportedOutputSHA = try loadedScene.render(
+                        camera: view.camera,
+                        outputURL: outputURL
+                    )
                     let actualOutputSHA = try MetalOffscreenRenderer.sha256(fileAt: outputURL)
                     guard reportedOutputSHA == actualOutputSHA else {
                         throw BenchmarkDriverError.renderFailed(
@@ -86,17 +119,15 @@ public final class BenchmarkRenderDriver {
                     }
                     let ended = max(ProcessInfo.processInfo.systemUptime, started.nextUp)
                     previousCommandEnd = ended
-                    renders.append(
-                        RenderingManifestRender(
-                            variant: source.variant,
-                            path: source.outputPath,
-                            sha256: actualOutputSHA,
-                            cameraDigest: cameraDigest,
-                            sourceRunID: source.runID,
-                            plySHA256: source.plySHA256,
-                            rendererExecutableSHA256: rendererExecutableSHA256,
-                            renderOperationID: operationID
-                        )
+                    rendersByView[viewIndex][source.variant] = RenderingManifestRender(
+                        variant: source.variant,
+                        path: source.outputPath,
+                        sha256: actualOutputSHA,
+                        cameraDigest: cameraDigest,
+                        sourceRunID: source.runID,
+                        plySHA256: source.plySHA256,
+                        rendererExecutableSHA256: rendererExecutableSHA256,
+                        renderOperationID: operationID
                     )
                     renderOperations.append(
                         RenderOperationReceipt(
@@ -116,27 +147,35 @@ public final class BenchmarkRenderDriver {
                             status: "completed"
                         )
                     )
-                    try candidate.verifyUnchanged()
-                    try baseline.verifyUnchanged()
                 }
-                manifestViews.append(
-                    RenderingManifestView(
-                        holdoutIndex: view.holdoutIndex,
-                        camera: view.camera,
-                        cameraDigest: cameraDigest,
-                        groundTruth: ManifestGroundTruth(
-                            path: view.groundTruth.path,
-                            sha256: actualGroundTruthSHA,
-                            inputDigest: job.inputDigest
-                        ),
-                        renders: renders
-                    )
-                )
+                try snapshot.verifyUnchanged()
             }
         } catch {
-            try candidate.verifyUnchanged()
-            try baseline.verifyUnchanged()
+            try verifyProtectedState()
             throw error
+        }
+
+        try verifyProtectedState()
+        let manifestViews = try job.views.enumerated().map { viewIndex, view in
+            let renders = try RenderVariant.allCases.map { variant in
+                guard let render = rendersByView[viewIndex][variant] else {
+                    throw BenchmarkDriverError.renderFailed(
+                        "A held-out render is missing from the canonical evidence order."
+                    )
+                }
+                return render
+            }
+            return RenderingManifestView(
+                holdoutIndex: view.holdoutIndex,
+                camera: view.camera,
+                cameraDigest: cameraDigests[viewIndex],
+                groundTruth: ManifestGroundTruth(
+                    path: view.groundTruth.path,
+                    sha256: groundTruthInputs[viewIndex].fingerprint.sha256,
+                    inputDigest: job.inputDigest
+                ),
+                renders: renders
+            )
         }
 
         let manifest = RenderingManifest(
@@ -156,8 +195,7 @@ public final class BenchmarkRenderDriver {
         )
         let data = try Self.canonicalJSON(manifest)
         try data.write(to: manifestURL, options: .atomic)
-        try candidate.verifyUnchanged()
-        try baseline.verifyUnchanged()
+        try verifyProtectedState()
         return manifestURL
     }
 
@@ -187,7 +225,19 @@ public final class BenchmarkRenderDriver {
     }
 }
 
-private struct ArtifactRoot {
+private final class ClosureLoadedScene: LoadedSceneRendering {
+    private let renderImage: (RenderCamera, URL) throws -> String
+
+    init(renderImage: @escaping (RenderCamera, URL) throws -> String) {
+        self.renderImage = renderImage
+    }
+
+    func render(camera: RenderCamera, outputURL: URL) throws -> String {
+        try renderImage(camera, outputURL)
+    }
+}
+
+struct ArtifactRoot {
     let root: URL
 
     init(root: URL) throws {
@@ -199,15 +249,6 @@ private struct ArtifactRoot {
             throw BenchmarkDriverError.invalidJob("The render artifact root is not a real directory.")
         }
         self.root = resolved
-    }
-
-    func existingFile(for relativePath: String) throws -> URL {
-        let url = try containedURL(for: relativePath)
-        let values = try url.resourceValues(forKeys: [.isRegularFileKey, .isSymbolicLinkKey])
-        guard values.isRegularFile == true, values.isSymbolicLink != true else {
-            throw BenchmarkDriverError.invalidJob("A render input is missing or is not a regular file.")
-        }
-        return url
     }
 
     func outputURL(for relativePath: String) throws -> URL {

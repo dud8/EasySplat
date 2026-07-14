@@ -12,6 +12,7 @@ import argparse
 import base64
 import hashlib
 import hmac
+import io
 import json
 import math
 import mmap
@@ -25,6 +26,7 @@ import struct
 import subprocess
 import sys
 import tempfile
+import warnings
 import zipfile
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -2682,6 +2684,7 @@ def _render_relative_path(value: Any, label: str) -> PurePosixPath:
     path = PurePosixPath(value)
     if (
         path.is_absolute()
+        or not path.parts
         or any(part in {"", ".", ".."} for part in path.parts)
         or "\\" in value
     ):
@@ -2730,7 +2733,49 @@ def _render_camera(value: Any, label: str) -> dict[str, Any]:
     return dict(camera)
 
 
-def _load_render_image(path: Path, expected_width: int, expected_height: int, label: str) -> Any:
+def _open_render_artifact(root: Path, relative: PurePosixPath, label: str) -> int:
+    if not relative.parts:
+        raise EvidenceError(f"{label} path is empty")
+    directory_flags = (
+        os.O_RDONLY
+        | getattr(os, "O_DIRECTORY", 0)
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+    )
+    file_flags = (
+        os.O_RDONLY
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+    )
+    try:
+        directory = os.open(root, directory_flags)
+    except OSError as error:
+        raise EvidenceError("render artifact root is missing or unsafe") from error
+    try:
+        for component in relative.parts[:-1]:
+            try:
+                child = os.open(component, directory_flags, dir_fd=directory)
+            except OSError as error:
+                raise EvidenceError(f"{label} path is missing or unsafe") from error
+            os.close(directory)
+            directory = child
+        try:
+            return os.open(relative.parts[-1], file_flags, dir_fd=directory)
+        except OSError as error:
+            raise EvidenceError(f"{label} is missing or unsafe") from error
+    finally:
+        os.close(directory)
+
+
+def _load_render_image(
+    *,
+    artifact_root: Path,
+    relative_path: PurePosixPath,
+    expected_sha256: str,
+    expected_width: int,
+    expected_height: int,
+    label: str,
+) -> tuple[Any, dict[str, Any]]:
     try:
         import numpy
         from PIL import Image
@@ -2738,21 +2783,73 @@ def _load_render_image(path: Path, expected_width: int, expected_height: int, la
         raise EvidenceError(
             "render scoring requires the hash-locked numpy and Pillow packages"
         ) from error
+    descriptor = _open_render_artifact(artifact_root, relative_path, label)
     try:
-        with Image.open(path) as image:
-            image.load()
-            if image.format != "PNG" or image.mode != "RGB":
-                raise EvidenceError(f"{label} must be an 8-bit RGB PNG")
-            if image.size != (expected_width, expected_height):
-                raise EvidenceError(f"{label} dimensions do not match its signed camera")
-            pixels = numpy.asarray(image, dtype=numpy.float32) / 255.0
+        try:
+            before = os.fstat(descriptor)
+            if not stat.S_ISREG(before.st_mode):
+                raise EvidenceError(f"{label} must be a regular file")
+            maximum_bytes = max(16 * 1024 * 1024, expected_width * expected_height * 4)
+            chunks = []
+            total = 0
+            while True:
+                try:
+                    chunk = os.read(descriptor, 1024 * 1024)
+                except InterruptedError:
+                    continue
+                if not chunk:
+                    break
+                total += len(chunk)
+                if total > maximum_bytes:
+                    raise EvidenceError(f"{label} is larger than its signed dimensions allow")
+                chunks.append(chunk)
+            after = os.fstat(descriptor)
+        except EvidenceError:
+            raise
+        except OSError as error:
+            raise EvidenceError(f"{label} could not be read safely") from error
+    finally:
+        os.close(descriptor)
+    stable_fields = (
+        "st_dev",
+        "st_ino",
+        "st_mode",
+        "st_size",
+        "st_mtime_ns",
+        "st_ctime_ns",
+    )
+    if any(getattr(before, field) != getattr(after, field) for field in stable_fields):
+        raise EvidenceError(f"{label} changed while it was read")
+    encoded = b"".join(chunks)
+    digest = sha256_bytes(encoded)
+    if digest != expected_sha256:
+        raise EvidenceError(f"{label} digest does not match its pinned reference")
+    try:
+        with warnings.catch_warnings():
+            warnings.simplefilter("error", Image.DecompressionBombWarning)
+            with Image.open(io.BytesIO(encoded)) as image:
+                if image.format != "PNG" or image.mode != "RGB":
+                    raise EvidenceError(f"{label} must be an 8-bit RGB PNG")
+                if image.size != (expected_width, expected_height):
+                    raise EvidenceError(f"{label} dimensions do not match its signed camera")
+                image.load()
+                pixels = numpy.asarray(image, dtype=numpy.float32) / 255.0
     except EvidenceError:
         raise
-    except (OSError, ValueError) as error:
+    except (
+        OSError,
+        ValueError,
+        Image.DecompressionBombError,
+        Image.DecompressionBombWarning,
+    ) as error:
         raise EvidenceError(f"{label} is not a readable PNG") from error
     if pixels.shape != (expected_height, expected_width, 3) or not numpy.isfinite(pixels).all():
         raise EvidenceError(f"{label} pixel data is invalid")
-    return pixels
+    return pixels, {
+        "path": relative_path.as_posix(),
+        "sha256": digest,
+        "bytes": len(encoded),
+    }
 
 
 def _separable_gaussian_blur(image: Any) -> Any:
@@ -3027,19 +3124,71 @@ def validate_and_score_rendering(
     ):
         raise EvidenceError("rendering views must cover every signed holdout")
 
-    if not isinstance(commands, list):
-        raise EvidenceError("rendering source receipts are unavailable")
     source_specs = {
         "accurate_reference": ("fast_profile", "accurate_reference"),
         "paired_baseline": ("ordinary", "baseline"),
         "candidate_balanced": ("ordinary", "candidate"),
         "candidate_fast": ("fast_profile", "fast_candidate"),
     }
+    selected_sources = select_render_source_receipts(commands, source_specs)
     render_operations = manifest["render_operations"]
     expected_render_operation_count = len(holdouts) * len(RENDER_VARIANTS)
     if not isinstance(render_operations, list) or len(render_operations) != expected_render_operation_count:
         raise EvidenceError("render operations must cover every holdout and variant")
+    render_operation_fields = {
+        "operation_id",
+        "holdout_index",
+        "variant",
+        "renderer_executable_sha256",
+        "source_run_id",
+        "source_checkout_commit",
+        "source_toolchain_identity",
+        "source_executable_sha256",
+        "input_ply_sha256",
+        "camera_digest",
+        "output_sha256",
+        "started_monotonic_seconds",
+        "ended_monotonic_seconds",
+        "status",
+    }
+    render_operations_by_key: dict[tuple[int, str], Mapping[str, Any]] = {}
     previous_render_end = -math.inf
+    expected_operation_order = [
+        (holdout_index, variant)
+        for variant in RENDER_VARIANTS
+        for holdout_index in holdouts
+    ]
+    for operation_position, ((holdout_index, variant), raw_operation) in enumerate(
+        zip(expected_operation_order, render_operations, strict=True)
+    ):
+        operation = _mapping(
+            raw_operation,
+            f"rendering manifest.render_operations[{operation_position}]",
+        )
+        _exact_keys(
+            operation,
+            render_operation_fields,
+            f"rendering manifest.render_operations[{operation_position}]",
+        )
+        started = operation["started_monotonic_seconds"]
+        ended = operation["ended_monotonic_seconds"]
+        if (
+            operation["holdout_index"] != holdout_index
+            or operation["variant"] != variant
+            or operation["renderer_executable_sha256"] != renderer_executable_sha256
+            or operation["status"] != "completed"
+            or isinstance(started, bool)
+            or isinstance(ended, bool)
+            or not isinstance(started, (int, float))
+            or not isinstance(ended, (int, float))
+            or not math.isfinite(started)
+            or not math.isfinite(ended)
+            or started < previous_render_end
+            or ended <= started
+        ):
+            raise EvidenceError("render operations are not in canonical source-major order")
+        previous_render_end = float(ended)
+        render_operations_by_key[(holdout_index, variant)] = operation
 
     artifacts = {"rendering_manifest": _artifact_descriptor(manifest_path, artifact_root)}
     image_paths: set[PurePosixPath] = set()
@@ -3097,21 +3246,18 @@ def validate_and_score_rendering(
         if ground_truth_relative in image_paths:
             raise EvidenceError("rendering image paths must be unique")
         image_paths.add(ground_truth_relative)
-        ground_truth_path = artifact_root / Path(*ground_truth_relative.parts)
-        ground_truth_descriptor = _artifact_descriptor(ground_truth_path, artifact_root)
         _digest(ground_truth["sha256"], "ground-truth image digest")
-        if (
-            ground_truth_descriptor["sha256"] != ground_truth["sha256"]
-            or ground_truth["sha256"] != reference_view["ground_truth_sha256"]
-        ):
+        if ground_truth["sha256"] != reference_view["ground_truth_sha256"]:
             raise EvidenceError("ground-truth image digest does not match its pinned reference")
-        artifacts[f"render_ground_truth_{holdout_index:06d}"] = ground_truth_descriptor
-        ground_truth_pixels = _load_render_image(
-            ground_truth_path,
-            camera["width"],
-            camera["height"],
-            f"ground-truth image {holdout_index}",
+        ground_truth_pixels, ground_truth_descriptor = _load_render_image(
+            artifact_root=artifact_root,
+            relative_path=ground_truth_relative,
+            expected_sha256=ground_truth["sha256"],
+            expected_width=camera["width"],
+            expected_height=camera["height"],
+            label=f"ground-truth image {holdout_index}",
         )
+        artifacts[f"render_ground_truth_{holdout_index:06d}"] = ground_truth_descriptor
 
         render_records = view["renders"]
         if not isinstance(render_records, list) or len(render_records) != len(RENDER_VARIANTS):
@@ -3137,43 +3283,19 @@ def validate_and_score_rendering(
                 },
                 f"rendering manifest.views[{position}].renders[{variant_position}]",
             )
-            command_position = position * len(RENDER_VARIANTS) + variant_position
-            render_operation = _mapping(
-                render_operations[command_position],
-                f"rendering manifest.render_operations[{command_position}]",
-            )
-            _exact_keys(
-                render_operation,
-                {
-                    "operation_id",
-                    "holdout_index",
-                    "variant",
-                    "renderer_executable_sha256",
-                    "source_run_id",
-                    "source_checkout_commit",
-                    "source_toolchain_identity",
-                    "source_executable_sha256",
-                    "input_ply_sha256",
-                    "camera_digest",
-                    "output_sha256",
-                    "started_monotonic_seconds",
-                    "ended_monotonic_seconds",
-                    "status",
-                },
-                f"rendering manifest.render_operations[{command_position}]",
-            )
-            phase, execution_variant = source_specs[variant]
-            matching_sources = [
-                _mapping(command, "rendering source receipt")
-                for command in commands
-                if isinstance(command, Mapping)
-                and command.get("run_id") == render_operation["source_run_id"]
-                and command.get("phase") == phase
-                and command.get("variant") == execution_variant
-            ]
-            if len(matching_sources) != 1:
-                raise EvidenceError(f"{variant} must bind exactly one source execution receipt")
-            source = matching_sources[0]
+            render_operation = render_operations_by_key[(holdout_index, variant)]
+            source = selected_sources[variant]
+            if (
+                render["source_run_id"] != source.get("run_id")
+                or render_operation["source_run_id"] != source.get("run_id")
+            ):
+                if variant == "candidate_balanced":
+                    raise EvidenceError(
+                        "candidate_balanced must bind the sole published output receipt"
+                    )
+                raise EvidenceError(
+                    f"{variant} must bind one source execution receipt across all holdouts"
+                )
             if (
                 render["variant"] != variant
                 or render["camera_digest"] != camera_digest
@@ -3190,13 +3312,15 @@ def validate_and_score_rendering(
             if render_relative in image_paths:
                 raise EvidenceError("rendering image paths must be unique")
             image_paths.add(render_relative)
-            render_path = artifact_root / Path(*render_relative.parts)
-            descriptor = _artifact_descriptor(render_path, artifact_root)
             _digest(render["sha256"], f"{variant} render digest")
-            if descriptor["sha256"] != render["sha256"]:
-                raise EvidenceError(f"{variant} render changed after it was recorded")
-            started = render_operation["started_monotonic_seconds"]
-            ended = render_operation["ended_monotonic_seconds"]
+            pixels, descriptor = _load_render_image(
+                artifact_root=artifact_root,
+                relative_path=render_relative,
+                expected_sha256=render["sha256"],
+                expected_width=camera["width"],
+                expected_height=camera["height"],
+                label=f"{variant} render {holdout_index}",
+            )
             if (
                 render_operation["operation_id"] != render["render_operation_id"]
                 or render_operation["holdout_index"] != holdout_index
@@ -3209,25 +3333,9 @@ def validate_and_score_rendering(
                 or render_operation["input_ply_sha256"] != source.get("output_sha256")
                 or render_operation["camera_digest"] != camera_digest
                 or render_operation["output_sha256"] != descriptor["sha256"]
-                or render_operation["status"] != "completed"
-                or isinstance(started, bool)
-                or isinstance(ended, bool)
-                or not isinstance(started, (int, float))
-                or not isinstance(ended, (int, float))
-                or not math.isfinite(started)
-                or not math.isfinite(ended)
-                or started < previous_render_end
-                or ended <= started
             ):
                 raise EvidenceError(f"{variant} render operation receipt is invalid")
-            previous_render_end = float(ended)
             artifacts[f"render_{variant}_{holdout_index:06d}"] = descriptor
-            pixels = _load_render_image(
-                render_path,
-                camera["width"],
-                camera["height"],
-                f"{variant} render {holdout_index}",
-            )
             measured[variant] = _pixel_metrics(pixels, ground_truth_pixels, lpips_distance)
 
         reference_metrics = measured["accurate_reference"]
@@ -3260,6 +3368,50 @@ def validate_and_score_rendering(
             }
         )
     return RenderingEvidence(balanced=balanced, fast=fast, artifacts=artifacts)
+
+
+def select_render_source_receipts(
+    commands: Any,
+    source_specs: Mapping[str, tuple[str, str]] | None = None,
+) -> dict[str, Mapping[str, Any]]:
+    """Choose one image-independent execution receipt for every rendered variant."""
+    if not isinstance(commands, list):
+        raise EvidenceError("rendering source receipts are unavailable")
+    if source_specs is None:
+        source_specs = {
+            "accurate_reference": ("fast_profile", "accurate_reference"),
+            "paired_baseline": ("ordinary", "baseline"),
+            "candidate_balanced": ("ordinary", "candidate"),
+            "candidate_fast": ("fast_profile", "fast_candidate"),
+        }
+    receipts = [
+        _mapping(command, f"rendering source receipt[{index}]")
+        for index, command in enumerate(commands)
+    ]
+    published = [receipt for receipt in receipts if receipt.get("published_output") is True]
+    if len(published) != 1:
+        raise EvidenceError("candidate_balanced must bind the sole published output receipt")
+
+    selected: dict[str, Mapping[str, Any]] = {}
+    for render_variant, (phase, execution_variant) in source_specs.items():
+        matching = [
+            receipt
+            for receipt in receipts
+            if receipt.get("phase") == phase and receipt.get("variant") == execution_variant
+        ]
+        if not matching:
+            raise EvidenceError(f"{render_variant} source execution receipt is unavailable")
+        if render_variant == "candidate_balanced":
+            source = published[0]
+            if source not in matching:
+                raise EvidenceError("candidate_balanced must bind the sole published output receipt")
+        else:
+            # Execution receipts are already validated against their signed timing
+            # order. The final receipt is therefore deterministic and independent
+            # of any rendered image or quality score.
+            source = matching[-1]
+        selected[render_variant] = source
+    return selected
 
 
 def _validate_splat_ply(path: Path) -> int:

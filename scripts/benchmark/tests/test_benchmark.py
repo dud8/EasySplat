@@ -4,9 +4,11 @@ import importlib.util
 import base64
 import hashlib
 import io
+import itertools
 import json
 import os
 import subprocess
+import sys
 import tempfile
 import time
 import unittest
@@ -1473,6 +1475,18 @@ def write_evidence_artifacts(
                     "renders": render_records,
                 }
             )
+        operations_by_key = {
+            (operation["variant"], operation["holdout_index"]): operation
+            for operation in render_operations
+        }
+        render_operations = [
+            operations_by_key[(variant, holdout_index)]
+            for variant in evidence.RENDER_VARIANTS
+            for holdout_index in holdouts
+        ]
+        for index, operation in enumerate(render_operations):
+            operation["started_monotonic_seconds"] = float(index)
+            operation["ended_monotonic_seconds"] = float(index + 1)
         manifest = {
             "schema_version": 1,
             "scene_id": representative["scene_id"],
@@ -4265,15 +4279,18 @@ class EvidenceProtocolTests(unittest.TestCase):
                 mock.patch.object(
                     lane_runner.time,
                     "monotonic",
-                    side_effect=[
-                        0.0,
-                        max(
-                            receipt["ended_monotonic_seconds"]
-                            for receipt in observations["commands"]
-                        )
-                        + 1.0,
-                    ],
+                    side_effect=itertools.chain(
+                        [0.0],
+                        itertools.repeat(
+                            max(
+                                receipt["ended_monotonic_seconds"]
+                                for receipt in observations["commands"]
+                            )
+                            + 1.0
+                        ),
+                    ),
                 ),
+                mock.patch.object(lane_runner, "_PROCESS_GROUP_DRAIN_SECONDS", 0.0),
             ):
                 result = lane_runner.run_lane(
                     index_path,
@@ -4512,6 +4529,60 @@ class RunnerIntegrityTests(unittest.TestCase):
         request_path.write_bytes(evidence.canonical_json_bytes(request) + b"\n")
         request_digest = evidence.sha256_file(request_path)
         holdouts = request["holdout_indices"]
+        commands = [
+            {
+                "run_id": "baseline-run",
+                "phase": "ordinary",
+                "variant": "baseline",
+                "output_sha256": "sha256:" + "a" * 64,
+                "checkout_commit": request["binding"]["baseline_git_commit"],
+                "toolchain_identity": request["binding"]["baseline_toolchain_identity"],
+                "executable_sha256": "sha256:" + "1" * 64,
+                "published_output": False,
+            },
+            {
+                "run_id": "candidate-run",
+                "phase": "ordinary",
+                "variant": "candidate",
+                "output_sha256": "sha256:" + "b" * 64,
+                "checkout_commit": request["binding"]["git_commit"],
+                "toolchain_identity": request["binding"]["toolchain_identity"],
+                "executable_sha256": "sha256:" + "2" * 64,
+                "published_output": True,
+            },
+            {
+                "run_id": "reference-run",
+                "phase": "fast_profile",
+                "variant": "accurate_reference",
+                "output_sha256": "sha256:" + "c" * 64,
+                "checkout_commit": request["binding"]["git_commit"],
+                "toolchain_identity": request["binding"]["toolchain_identity"],
+                "executable_sha256": "sha256:" + "3" * 64,
+                "published_output": False,
+            },
+            {
+                "run_id": "fast-run",
+                "phase": "fast_profile",
+                "variant": "fast_candidate",
+                "output_sha256": "sha256:" + "d" * 64,
+                "checkout_commit": request["binding"]["git_commit"],
+                "toolchain_identity": request["binding"]["toolchain_identity"],
+                "executable_sha256": "sha256:" + "4" * 64,
+                "published_output": False,
+            },
+        ]
+        command_by_render_variant = {
+            "accurate_reference": commands[2],
+            "paired_baseline": commands[0],
+            "candidate_balanced": commands[1],
+            "candidate_fast": commands[3],
+        }
+        identity_matrix = [
+            1.0, 0.0, 0.0, 0.0,
+            0.0, 1.0, 0.0, 0.0,
+            0.0, 0.0, 1.0, 0.0,
+            0.0, 0.0, 0.0, 1.0,
+        ]
         job = {
             "schema_version": 1,
             "scene_id": request["binding"]["scene_id"],
@@ -4533,7 +4604,40 @@ class RunnerIntegrityTests(unittest.TestCase):
                 "path": str(baseline),
                 "commit": request["binding"]["baseline_git_commit"],
             },
-            "views": [{} for _ in holdouts],
+            "views": [
+                {
+                    "holdout_index": holdout,
+                    "camera": {
+                        "width": 64,
+                        "height": 64,
+                        "projection_matrix_column_major": identity_matrix,
+                        "world_to_camera_matrix_column_major": identity_matrix,
+                    },
+                    "ground_truth": {
+                        "path": f"rendering/ground-truth/{holdout:06d}.png",
+                        "sha256": "sha256:" + "e" * 64,
+                    },
+                    "sources": [
+                        {
+                            "variant": render_variant,
+                            "run_id": command_by_render_variant[render_variant]["run_id"],
+                            "checkout_commit": command_by_render_variant[render_variant]["checkout_commit"],
+                            "toolchain_identity": command_by_render_variant[render_variant]["toolchain_identity"],
+                            "source_executable_sha256": command_by_render_variant[render_variant]["executable_sha256"],
+                            "ply_path": f"sources/{render_variant}.ply",
+                            "ply_sha256": command_by_render_variant[render_variant]["output_sha256"],
+                            "output_path": f"rendering/{render_variant}/{holdout:06d}.png",
+                        }
+                        for render_variant in (
+                            "accurate_reference",
+                            "paired_baseline",
+                            "candidate_balanced",
+                            "candidate_fast",
+                        )
+                    ],
+                }
+                for holdout in holdouts
+            ],
         }
         (artifact_root / "render-job.json").write_bytes(
             evidence.canonical_json_bytes(job) + b"\n"
@@ -4548,6 +4652,7 @@ class RunnerIntegrityTests(unittest.TestCase):
             "request_path": request_path,
             "request_digest": request_digest,
             "invocation_marker": invocation_marker,
+            "commands": commands,
         }
 
     def _run_renderer_stage(self, fixture: dict[str, object]) -> dict[str, object]:
@@ -4560,8 +4665,34 @@ class RunnerIntegrityTests(unittest.TestCase):
             renderer_identity=fixture["identity"],
             candidate_checkout=fixture["candidate"],
             baseline_checkout=fixture["baseline"],
+            commands=fixture["commands"],
             timeout_seconds=10.0,
         )
+
+    def test_rendering_stage_rejects_nonpublished_candidate_source_before_launch(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = self._renderer_stage_fixture(Path(directory))
+            alternate = {
+                **fixture["commands"][1],
+                "run_id": "candidate-earlier-run",
+                "output_sha256": "sha256:" + "9" * 64,
+                "published_output": False,
+            }
+            fixture["commands"].append(alternate)
+            job_path = fixture["artifact_root"] / "render-job.json"
+            job = json.loads(job_path.read_text(encoding="utf-8"))
+            for view in job["views"]:
+                source = view["sources"][2]
+                source["run_id"] = alternate["run_id"]
+                source["ply_sha256"] = alternate["output_sha256"]
+            job_path.write_bytes(evidence.canonical_json_bytes(job) + b"\n")
+
+            with self.assertRaisesRegex(
+                lane_runner.benchmark.ConfigError,
+                "published output",
+            ):
+                self._run_renderer_stage(fixture)
+            self.assertFalse(fixture["invocation_marker"].exists())
 
     def test_rendering_stage_is_launched_and_receipted_by_the_supervisor(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -4712,8 +4843,15 @@ class RunnerIntegrityTests(unittest.TestCase):
             stdin=subprocess.DEVNULL,
             stdout=mock.ANY,
             stderr=mock.ANY,
-            env=environment,
+            env=mock.ANY,
             start_new_session=True,
+        )
+        protected_environment = popen.call_args.kwargs["env"]
+        self.assertEqual(environment, {"PATH": "/usr/bin"})
+        self.assertEqual(protected_environment["PATH"], "/usr/bin")
+        self.assertRegex(
+            protected_environment[lane_runner._PROCESS_TOKEN_ENVIRONMENT_KEY],
+            r"^[0-9a-f]{64}$",
         )
         terminate.assert_called_once_with(process)
 
@@ -4748,6 +4886,192 @@ class RunnerIntegrityTests(unittest.TestCase):
                 )
             time.sleep(1.1)
             self.assertFalse(marker.exists())
+
+    def test_measurement_process_rejects_a_child_that_creates_a_new_session(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            marker = root / "escaped-session-marker"
+            child = (
+                "import pathlib,time; "
+                "time.sleep(1); "
+                f"pathlib.Path({str(marker)!r}).write_text('escaped')"
+            )
+            command = [
+                "/usr/bin/python3",
+                "-c",
+                (
+                    "import subprocess,sys,time; "
+                    f"subprocess.Popen([sys.executable, '-c', {child!r}], start_new_session=True); "
+                    "time.sleep(0.25)"
+                ),
+            ]
+            with (
+                (root / "stdout").open("wb") as stdout_handle,
+                (root / "stderr").open("wb") as stderr_handle,
+                self.assertRaisesRegex(
+                    lane_runner.benchmark.ConfigError,
+                    "left live child processes",
+                ),
+            ):
+                lane_runner._run_measurement_process(
+                    command,
+                    stdout_handle,
+                    stderr_handle,
+                    {"PATH": "/usr/bin:/bin"},
+                    10.0,
+                )
+            time.sleep(1.1)
+            self.assertFalse(marker.exists())
+
+    def test_measurement_process_allows_a_child_to_finish_within_the_drain(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            marker = root / "drained-child-marker"
+            child = (
+                "import pathlib,time; "
+                "time.sleep(0.15); "
+                f"pathlib.Path({str(marker)!r}).write_text('finished')"
+            )
+            command = [
+                "/usr/bin/python3",
+                "-c",
+                (
+                    "import subprocess,sys; "
+                    f"subprocess.Popen([sys.executable, '-c', {child!r}])"
+                ),
+            ]
+            with (
+                (root / "stdout").open("wb") as stdout_handle,
+                (root / "stderr").open("wb") as stderr_handle,
+            ):
+                completed, timed_out = lane_runner._run_measurement_process(
+                    command,
+                    stdout_handle,
+                    stderr_handle,
+                    {"PATH": "/usr/bin:/bin"},
+                    10.0,
+                )
+            self.assertFalse(timed_out)
+            self.assertEqual(completed.returncode, 0)
+            self.assertEqual(marker.read_text(encoding="utf-8"), "finished")
+
+    def test_measurement_process_rejects_an_immediately_reparented_session_child(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            marker = root / "immediate-escaped-session-marker"
+            child = (
+                "import pathlib,time; "
+                "time.sleep(0.5); "
+                f"pathlib.Path({str(marker)!r}).write_text('escaped')"
+            )
+            command = [
+                "/usr/bin/python3",
+                "-c",
+                (
+                    "import subprocess,sys; "
+                    f"subprocess.Popen([sys.executable, '-c', {child!r}], start_new_session=True)"
+                ),
+            ]
+            with (
+                (root / "stdout").open("wb") as stdout_handle,
+                (root / "stderr").open("wb") as stderr_handle,
+                self.assertRaisesRegex(
+                    lane_runner.benchmark.ConfigError,
+                    "left live child processes",
+                ),
+            ):
+                lane_runner._run_measurement_process(
+                    command,
+                    stdout_handle,
+                    stderr_handle,
+                    {"PATH": "/usr/bin:/bin"},
+                    10.0,
+                )
+            time.sleep(0.6)
+            self.assertFalse(marker.exists())
+
+    def test_descendant_drain_rechecks_for_a_late_process_token(self) -> None:
+        child = lane_runner._ProcessRecord(101, 1, 101, os.getuid(), "", (20, 0))
+        process_tree = mock.Mock()
+        process_tree.live_descendants.side_effect = itertools.chain(
+            [[]],
+            itertools.repeat([child]),
+        )
+        with (
+            mock.patch.object(lane_runner, "_process_group_exists", return_value=False),
+            mock.patch.object(lane_runner, "_PROCESS_GROUP_DRAIN_SECONDS", 0.05),
+            self.assertRaisesRegex(
+                lane_runner.benchmark.ConfigError,
+                "left live child processes",
+            ),
+        ):
+            lane_runner._reject_live_descendants(100, process_tree)
+        self.assertGreaterEqual(process_tree.refresh_reparented_descendants.call_count, 2)
+        process_tree.terminate_descendants.assert_called_once()
+
+    def test_run_lane_import_does_not_load_libproc_off_macos(self) -> None:
+        code = """
+import ctypes
+import sys
+from unittest import mock
+sys.platform = 'linux'
+with mock.patch.object(ctypes, 'CDLL', side_effect=AssertionError('libproc loaded')):
+    import scripts.benchmark.run_lane
+"""
+        completed = subprocess.run(
+            [sys.executable, "-c", code],
+            cwd=ROOT,
+            env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1", "PYTHONPATH": str(ROOT)},
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+
+    def test_process_tree_tracker_does_not_follow_a_recycled_parent_pid(self) -> None:
+        root = lane_runner._ProcessRecord(100, 1, 100, os.getuid(), "", (10, 0))
+        child = lane_runner._ProcessRecord(101, 100, 100, os.getuid(), "", (11, 0))
+        recycled_child = lane_runner._ProcessRecord(
+            101,
+            1,
+            101,
+            os.getuid(),
+            "",
+            (20, 0),
+        )
+        unrelated = lane_runner._ProcessRecord(
+            102,
+            101,
+            101,
+            os.getuid(),
+            "",
+            (21, 0),
+        )
+        records = {100: root, 101: child, 102: unrelated}
+        children = {100: [101], 101: []}
+
+        with (
+            mock.patch.object(
+                lane_runner,
+                "_process_record",
+                side_effect=lambda pid: records.get(pid),
+            ),
+            mock.patch.object(
+                lane_runner,
+                "_child_process_ids",
+                side_effect=lambda pid: children.get(pid, []),
+            ),
+        ):
+            tracker = lane_runner._ProcessTreeTracker(root.pid, "a" * 64)
+            tracker._scan()
+            self.assertIn(child.pid, tracker._tracked)
+
+            records[child.pid] = recycled_child
+            children[root.pid] = []
+            children[child.pid] = [unrelated.pid]
+            tracker._scan()
+
+        self.assertNotIn(unrelated.pid, tracker._tracked)
 
     def test_artifact_cleanup_refuses_intermediate_symlinks(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

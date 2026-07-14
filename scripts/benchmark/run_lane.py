@@ -4,14 +4,18 @@
 from __future__ import annotations
 
 import argparse
+import ctypes
 import math
 import os
+import secrets
 import signal
 import shutil
 import stat
 import subprocess
 import sys
+import threading
 import time
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
 from typing import Any, BinaryIO, Mapping, Sequence
@@ -31,6 +35,8 @@ _MINIMUM_TIMEOUT_OVERRIDE_SECONDS = 0.1
 _MAXIMUM_TIMEOUT_OVERRIDE_SECONDS = 7 * 24 * 60 * 60
 _PROCESS_GROUP_TERMINATION_GRACE_SECONDS = 5.0
 _PROCESS_GROUP_DRAIN_SECONDS = 0.25
+_PROCESS_TREE_SCAN_SECONDS = 0.01
+_PROCESS_TOKEN_ENVIRONMENT_KEY = "EASYSPLAT_INTERNAL_BENCHMARK_PROCESS_TOKEN"
 
 
 def _load(path: Path, label: str) -> Any:
@@ -260,6 +266,353 @@ def _process_group_exists(process_group_id: int) -> bool:
         return True
 
 
+@dataclass(frozen=True)
+class _ProcessRecord:
+    pid: int
+    parent_pid: int
+    process_group_id: int
+    real_user_id: int
+    state: str
+    started: tuple[int, int]
+
+
+class _ProcBSDInfo(ctypes.Structure):
+    _fields_ = [
+        ("flags", ctypes.c_uint32),
+        ("status", ctypes.c_uint32),
+        ("xstatus", ctypes.c_uint32),
+        ("pid", ctypes.c_uint32),
+        ("ppid", ctypes.c_uint32),
+        ("uid", ctypes.c_uint32),
+        ("gid", ctypes.c_uint32),
+        ("ruid", ctypes.c_uint32),
+        ("rgid", ctypes.c_uint32),
+        ("svuid", ctypes.c_uint32),
+        ("svgid", ctypes.c_uint32),
+        ("reserved", ctypes.c_uint32),
+        ("command", ctypes.c_char * 16),
+        ("name", ctypes.c_char * 32),
+        ("open_files", ctypes.c_uint32),
+        ("process_group_id", ctypes.c_uint32),
+        ("job_control_count", ctypes.c_uint32),
+        ("controlling_device", ctypes.c_uint32),
+        ("terminal_process_group", ctypes.c_uint32),
+        ("nice", ctypes.c_int32),
+        ("started_seconds", ctypes.c_uint64),
+        ("started_microseconds", ctypes.c_uint64),
+    ]
+
+
+_LIBPROC = None
+_LIBC = None
+if sys.platform == "darwin":
+    _LIBPROC = ctypes.CDLL("/usr/lib/libproc.dylib")
+    _LIBPROC.proc_listallpids.argtypes = [ctypes.c_void_p, ctypes.c_int]
+    _LIBPROC.proc_listallpids.restype = ctypes.c_int
+    _LIBPROC.proc_listchildpids.argtypes = [ctypes.c_int, ctypes.c_void_p, ctypes.c_int]
+    _LIBPROC.proc_listchildpids.restype = ctypes.c_int
+    _LIBPROC.proc_pidinfo.argtypes = [
+        ctypes.c_int,
+        ctypes.c_int,
+        ctypes.c_uint64,
+        ctypes.c_void_p,
+        ctypes.c_int,
+    ]
+    _LIBPROC.proc_pidinfo.restype = ctypes.c_int
+    _LIBC = ctypes.CDLL(None, use_errno=True)
+    _LIBC.sysctl.argtypes = [
+        ctypes.POINTER(ctypes.c_int),
+        ctypes.c_uint,
+        ctypes.c_void_p,
+        ctypes.POINTER(ctypes.c_size_t),
+        ctypes.c_void_p,
+        ctypes.c_size_t,
+    ]
+    _LIBC.sysctl.restype = ctypes.c_int
+_PROC_PIDTBSDINFO = 3
+_CTL_KERN = 1
+_KERN_PROCARGS2 = 49
+_SZOMB = 5
+_CHILD_PID_CAPACITY = 4096
+_MAXIMUM_PROCESS_ENVIRONMENT_BYTES = 16 * 1024 * 1024
+
+
+def _process_record(pid: int) -> _ProcessRecord | None:
+    if _LIBPROC is None:
+        if not sys.platform.startswith("linux"):
+            return None
+        process_root = Path("/proc") / str(pid)
+        try:
+            raw = (process_root / "stat").read_text(encoding="utf-8")
+            closing_parenthesis = raw.rfind(")")
+            fields = raw[closing_parenthesis + 2 :].split()
+            if closing_parenthesis < 0 or len(fields) < 20:
+                return None
+            return _ProcessRecord(
+                pid=pid,
+                parent_pid=int(fields[1]),
+                process_group_id=int(fields[2]),
+                real_user_id=process_root.stat().st_uid,
+                state=fields[0],
+                started=(int(fields[19]), 0),
+            )
+        except (OSError, UnicodeError, ValueError):
+            return None
+    info = _ProcBSDInfo()
+    copied = _LIBPROC.proc_pidinfo(
+        pid,
+        _PROC_PIDTBSDINFO,
+        0,
+        ctypes.byref(info),
+        ctypes.sizeof(info),
+    )
+    if copied != ctypes.sizeof(info) or info.pid != pid:
+        return None
+    return _ProcessRecord(
+        pid=pid,
+        parent_pid=int(info.ppid),
+        process_group_id=int(info.process_group_id),
+        real_user_id=int(info.ruid),
+        state="Z" if info.status == _SZOMB else "",
+        started=(int(info.started_seconds), int(info.started_microseconds)),
+    )
+
+
+def _child_process_ids(pid: int) -> list[int]:
+    if _LIBPROC is None:
+        if not sys.platform.startswith("linux"):
+            return []
+        try:
+            children = (Path("/proc") / str(pid) / "task" / str(pid) / "children").read_text(
+                encoding="utf-8"
+            )
+            return [int(child) for child in children.split() if int(child) > 0]
+        except (OSError, UnicodeError, ValueError):
+            return []
+    children = (ctypes.c_int32 * _CHILD_PID_CAPACITY)()
+    count = _LIBPROC.proc_listchildpids(pid, children, ctypes.sizeof(children))
+    if count <= 0:
+        return []
+    return [int(child) for child in children[: min(count, _CHILD_PID_CAPACITY)] if child > 0]
+
+
+def _all_process_ids() -> list[int]:
+    if _LIBPROC is None:
+        if not sys.platform.startswith("linux"):
+            return []
+        try:
+            return [int(entry.name) for entry in Path("/proc").iterdir() if entry.name.isdigit()]
+        except OSError:
+            return []
+    reported = _LIBPROC.proc_listallpids(None, 0)
+    capacity = max(1024, reported + 64 if reported > 0 else 1024)
+    while capacity <= 131_072:
+        pids = (ctypes.c_int32 * capacity)()
+        count = _LIBPROC.proc_listallpids(pids, ctypes.sizeof(pids))
+        if count <= 0:
+            return []
+        if count < capacity:
+            return [int(pid) for pid in pids[:count] if pid > 0]
+        capacity *= 2
+    return []
+
+
+def _process_environment(pid: int) -> bytes | None:
+    if _LIBC is None:
+        if not sys.platform.startswith("linux"):
+            return None
+        try:
+            value = (Path("/proc") / str(pid) / "environ").read_bytes()
+        except OSError:
+            return None
+        return value if len(value) <= _MAXIMUM_PROCESS_ENVIRONMENT_BYTES else None
+    mib = (ctypes.c_int * 3)(_CTL_KERN, _KERN_PROCARGS2, pid)
+    size = ctypes.c_size_t()
+    if _LIBC.sysctl(mib, 3, None, ctypes.byref(size), None, 0) != 0:
+        return None
+    if size.value <= 0 or size.value > _MAXIMUM_PROCESS_ENVIRONMENT_BYTES:
+        return None
+    buffer = ctypes.create_string_buffer(size.value)
+    actual = ctypes.c_size_t(size.value)
+    if _LIBC.sysctl(mib, 3, buffer, ctypes.byref(actual), None, 0) != 0:
+        return None
+    return buffer.raw[: actual.value]
+
+
+def _process_has_token(pid: int, token: str) -> bool:
+    environment = _process_environment(pid)
+    if environment is None:
+        return False
+    expected = f"{_PROCESS_TOKEN_ENVIRONMENT_KEY}={token}".encode("utf-8")
+    return expected in environment.split(b"\0")
+
+
+def _tagged_process_records(token: str) -> list[_ProcessRecord]:
+    records = []
+    for pid in _all_process_ids():
+        record = _process_record(pid)
+        if (
+            record is not None
+            and record.real_user_id == os.getuid()
+            and not record.state.startswith("Z")
+            and _process_has_token(pid, token)
+        ):
+            records.append(record)
+    return records
+
+
+class _ProcessTreeTracker:
+    """Track trusted descendants across reparenting and new sessions.
+
+    Token discovery is a cleanup backstop for the pinned runner, not a sandbox:
+    a process that deliberately scrubs its environment is outside this contract.
+    """
+
+    def __init__(self, root_pid: int, process_token: str) -> None:
+        self.root_pid = root_pid
+        self.process_token = process_token
+        self._root = _process_record(root_pid)
+        self._tracked: dict[int, _ProcessRecord] = {}
+        self._tagged_identities: set[tuple[int, tuple[int, int]]] = set()
+        self._lock = threading.Lock()
+        self._stop = threading.Event()
+        self._thread = threading.Thread(target=self._watch, daemon=True)
+
+    def start(self) -> None:
+        self._scan()
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._stop.set()
+        self._thread.join(timeout=1.0)
+        self._scan()
+        self._scan_tagged()
+
+    def refresh_reparented_descendants(self) -> None:
+        self._scan_tagged()
+
+    def live_descendants(self) -> list[_ProcessRecord]:
+        with self._lock:
+            tracked = tuple(self._tracked.values())
+        live = []
+        for expected in tracked:
+            current = _process_record(expected.pid)
+            if (
+                current is None
+                or current.real_user_id != expected.real_user_id
+                or current.started != expected.started
+                or current.state.startswith("Z")
+            ):
+                continue
+            identity = (expected.pid, expected.started)
+            if identity in self._tagged_identities and not _process_has_token(
+                expected.pid,
+                self.process_token,
+            ):
+                continue
+            live.append(current)
+        return live
+
+    def terminate_descendants(
+        self,
+        grace_seconds: float = _PROCESS_GROUP_TERMINATION_GRACE_SECONDS,
+    ) -> None:
+        self._scan_tagged()
+        self._signal_live(signal.SIGTERM)
+        deadline = time.monotonic() + grace_seconds
+        while time.monotonic() < deadline:
+            self._scan_tagged()
+            if not self.live_descendants():
+                return
+            time.sleep(0.05)
+        self._scan_tagged()
+        self._signal_live(signal.SIGKILL)
+
+    def _signal_live(self, signal_number: int) -> None:
+        self._scan_tagged()
+        for expected in self.live_descendants():
+            current = _process_record(expected.pid)
+            identity = (expected.pid, expected.started)
+            if (
+                current is None
+                or current.real_user_id != expected.real_user_id
+                or current.started != expected.started
+                or current.state.startswith("Z")
+                or (
+                    identity in self._tagged_identities
+                    and not _process_has_token(expected.pid, self.process_token)
+                )
+            ):
+                continue
+            try:
+                os.kill(current.pid, signal_number)
+            except (ProcessLookupError, PermissionError):
+                continue
+
+    def _watch(self) -> None:
+        while not self._stop.wait(_PROCESS_TREE_SCAN_SECONDS):
+            self._scan()
+
+    def _scan(self) -> None:
+        with self._lock:
+            pending = ([self._root] if self._root is not None else []) + list(
+                self._tracked.values()
+            )
+            inspected: set[int] = set()
+            while pending:
+                expected_parent = pending.pop()
+                if expected_parent.pid in inspected:
+                    continue
+                inspected.add(expected_parent.pid)
+                current_parent = _process_record(expected_parent.pid)
+                if (
+                    current_parent is None
+                    or current_parent.real_user_id != expected_parent.real_user_id
+                    or current_parent.started != expected_parent.started
+                    or current_parent.state.startswith("Z")
+                ):
+                    continue
+                for child_pid in _child_process_ids(current_parent.pid):
+                    record = _process_record(child_pid)
+                    if (
+                        record is None
+                        or record.parent_pid != current_parent.pid
+                        or record.real_user_id != os.getuid()
+                    ):
+                        continue
+                    tracked = self._tracked.get(child_pid)
+                    if tracked is None:
+                        self._tracked[child_pid] = record
+                        tracked = record
+                    elif (
+                        tracked.real_user_id != record.real_user_id
+                        or tracked.started != record.started
+                    ):
+                        continue
+                    pending.append(tracked)
+
+    def _scan_tagged(self) -> None:
+        tagged = _tagged_process_records(self.process_token)
+        with self._lock:
+            for record in tagged:
+                if record.pid == self.root_pid:
+                    continue
+                tracked = self._tracked.get(record.pid)
+                if tracked is not None and (
+                    tracked.real_user_id != record.real_user_id
+                    or tracked.started != record.started
+                ):
+                    current = _process_record(tracked.pid)
+                    if (
+                        current is not None
+                        and current.real_user_id == tracked.real_user_id
+                        and current.started == tracked.started
+                    ):
+                        continue
+                self._tracked[record.pid] = record
+                self._tagged_identities.add((record.pid, record.started))
+
+
 def _terminate_reaped_leader_group(
     process_group_id: int,
     grace_seconds: float = _PROCESS_GROUP_TERMINATION_GRACE_SECONDS,
@@ -286,15 +639,26 @@ def _terminate_reaped_leader_group(
         time.sleep(0.05)
 
 
-def _reject_live_descendants(process_group_id: int) -> None:
-    if not _process_group_exists(process_group_id):
-        return
+def _reject_live_descendants(
+    process_group_id: int,
+    process_tree: _ProcessTreeTracker | None = None,
+) -> None:
     deadline = time.monotonic() + _PROCESS_GROUP_DRAIN_SECONDS
-    while _process_group_exists(process_group_id) and time.monotonic() < deadline:
-        time.sleep(0.01)
-    if not _process_group_exists(process_group_id):
+    while True:
+        if process_tree is not None:
+            process_tree.refresh_reparented_descendants()
+        group_live = _process_group_exists(process_group_id)
+        tree_live = process_tree.live_descendants() if process_tree is not None else []
+        now = time.monotonic()
+        if now >= deadline:
+            break
+        time.sleep(min(0.01, deadline - now))
+    if not group_live and not tree_live:
         return
-    _terminate_reaped_leader_group(process_group_id)
+    if group_live:
+        _terminate_reaped_leader_group(process_group_id)
+    if process_tree is not None and tree_live:
+        process_tree.terminate_descendants()
     raise benchmark.ConfigError(
         "protected subprocess left live child processes after its session leader exited"
     )
@@ -307,27 +671,46 @@ def _run_measurement_process(
     environment: Mapping[str, str],
     timeout_seconds: float,
 ) -> tuple[subprocess.CompletedProcess[bytes], bool]:
+    process_token = secrets.token_hex(32)
+    protected_environment = dict(environment)
+    protected_environment[_PROCESS_TOKEN_ENVIRONMENT_KEY] = process_token
     process = subprocess.Popen(
         command,
         stdin=subprocess.DEVNULL,
         stdout=stdout_handle,
         stderr=stderr_handle,
-        env=environment,
+        env=protected_environment,
         start_new_session=True,
     )
+    process_tree = (
+        _ProcessTreeTracker(process.pid, process_token)
+        if isinstance(process.pid, int)
+        else None
+    )
+    if process_tree is not None:
+        process_tree.start()
     try:
         return_code = process.wait(timeout=timeout_seconds)
-        _reject_live_descendants(process.pid)
+        if process_tree is not None:
+            process_tree.stop()
+        _reject_live_descendants(process.pid, process_tree)
         return subprocess.CompletedProcess(command, return_code), False
     except subprocess.TimeoutExpired:
         return_code = _terminate_process_group(process)
+        if process_tree is not None:
+            process_tree.stop()
+            process_tree.terminate_descendants()
         return subprocess.CompletedProcess(command, return_code), True
     except BaseException:
         try:
+            if process_tree is not None:
+                process_tree.stop()
             if process.poll() is None:
                 _terminate_process_group(process)
             else:
                 _terminate_reaped_leader_group(process.pid)
+            if process_tree is not None:
+                process_tree.terminate_descendants()
         except Exception:
             pass
         raise
@@ -355,6 +738,7 @@ def _validate_render_job(
     renderer_identity: Mapping[str, Any],
     candidate_checkout: Path,
     baseline_checkout: Path,
+    commands: Sequence[Mapping[str, Any]],
 ) -> dict[str, Any]:
     _require_owned_artifact(job_path, artifact_root, "render-job.json")
     job = benchmark._require_mapping(_load(job_path, "render job"), "render job")
@@ -416,6 +800,84 @@ def _validate_render_job(
     views = job.get("views")
     if not isinstance(views, list) or len(views) != len(request["holdout_indices"]):
         raise benchmark.ConfigError("render job does not cover every protected holdout")
+    try:
+        selected_sources = evidence.select_render_source_receipts(list(commands))
+    except evidence.EvidenceError as error:
+        raise benchmark.ConfigError(str(error)) from error
+    source_fields = {
+        "variant",
+        "run_id",
+        "checkout_commit",
+        "toolchain_identity",
+        "source_executable_sha256",
+        "ply_path",
+        "ply_sha256",
+        "output_path",
+    }
+    immutable_paths: dict[str, str] = {}
+    output_paths: set[Path] = set()
+    for position, (raw_view, holdout_index) in enumerate(
+        zip(views, request["holdout_indices"], strict=True)
+    ):
+        view = benchmark._require_mapping(raw_view, f"render job views[{position}]")
+        benchmark._require_exact_keys(
+            view,
+            {"holdout_index", "camera", "ground_truth", "sources"},
+            f"render job views[{position}]",
+        )
+        if view.get("holdout_index") != holdout_index:
+            raise benchmark.ConfigError("render job views are not in signed holdout order")
+        sources = view.get("sources")
+        if not isinstance(sources, list) or len(sources) != len(evidence.RENDER_VARIANTS):
+            raise benchmark.ConfigError("render job sources are incomplete")
+        for source_position, (raw_source, variant) in enumerate(
+            zip(sources, evidence.RENDER_VARIANTS, strict=True)
+        ):
+            source = benchmark._require_mapping(
+                raw_source,
+                f"render job views[{position}].sources[{source_position}]",
+            )
+            benchmark._require_exact_keys(
+                source,
+                source_fields,
+                f"render job views[{position}].sources[{source_position}]",
+            )
+            selected = selected_sources[variant]
+            if source.get("run_id") != selected.get("run_id"):
+                if variant == "candidate_balanced":
+                    raise benchmark.ConfigError(
+                        "candidate_balanced must bind the sole published output receipt"
+                    )
+                raise benchmark.ConfigError(
+                    f"{variant} does not use the deterministic source execution receipt"
+                )
+            expected_identity = {
+                "variant": variant,
+                "checkout_commit": selected.get("checkout_commit"),
+                "toolchain_identity": selected.get("toolchain_identity"),
+                "source_executable_sha256": selected.get("executable_sha256"),
+                "ply_sha256": selected.get("output_sha256"),
+            }
+            if any(source.get(field) != value for field, value in expected_identity.items()):
+                raise benchmark.ConfigError(
+                    f"{variant} source identity does not match its protected execution receipt"
+                )
+            ply_path = _relative(
+                source.get("ply_path"),
+                f"render job views[{position}].sources[{source_position}].ply_path",
+            ).as_posix()
+            if variant in immutable_paths and immutable_paths[variant] != ply_path:
+                raise benchmark.ConfigError(
+                    f"{variant} must use one immutable PLY across all holdouts"
+                )
+            immutable_paths[variant] = ply_path
+            output_path = _relative(
+                source.get("output_path"),
+                f"render job views[{position}].sources[{source_position}].output_path",
+            )
+            if output_path in output_paths:
+                raise benchmark.ConfigError("render job output paths must be unique")
+            output_paths.add(output_path)
     return dict(job)
 
 
@@ -429,6 +891,7 @@ def _execute_rendering_stage(
     renderer_identity: Mapping[str, Any],
     candidate_checkout: Path,
     baseline_checkout: Path,
+    commands: Sequence[Mapping[str, Any]],
     timeout_seconds: float,
 ) -> dict[str, Any]:
     job_path = artifact_root / "render-job.json"
@@ -460,6 +923,7 @@ def _execute_rendering_stage(
         renderer_identity,
         candidate_checkout,
         baseline_checkout,
+        commands,
     )
     job_digest = evidence.sha256_file(job_path)
     redacted_command = [
@@ -827,6 +1291,16 @@ def run_lane(
                 f"{lane} measurement runner failed for {scene_id}@{scale} with exit {completed.returncode}"
             )
 
+        observations_path = artifact_root / "observations.json"
+        observations = _load(observations_path, "raw observations")
+        if not isinstance(observations, Mapping):
+            raise benchmark.ConfigError("measurement runner observations must be an object")
+        raw_receipts = observations.get("commands")
+        if not isinstance(raw_receipts, list) or any(
+            not isinstance(receipt, Mapping) for receipt in raw_receipts
+        ):
+            raise benchmark.ConfigError("measurement runner did not emit execution receipts")
+
         rendered = _rendering_required(request, lane)
         if rendered:
             _execute_rendering_stage(
@@ -838,16 +1312,10 @@ def run_lane(
                 renderer_identity=renderer_identity,
                 candidate_checkout=candidate_checkout,
                 baseline_checkout=baseline_checkout,
+                commands=raw_receipts,
                 timeout_seconds=timeout_seconds,
             )
 
-        observations_path = artifact_root / "observations.json"
-        observations = _load(observations_path, "raw observations")
-        if not isinstance(observations, Mapping):
-            raise benchmark.ConfigError("measurement runner observations must be an object")
-        raw_receipts = observations.get("commands") if isinstance(observations, Mapping) else None
-        if not isinstance(raw_receipts, list):
-            raise benchmark.ConfigError("measurement runner did not emit execution receipts")
         command_log.write_bytes(
             b"".join(evidence.canonical_json_bytes(receipt) + b"\n" for receipt in raw_receipts)
         )

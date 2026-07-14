@@ -224,6 +224,7 @@ public struct BenchmarkRenderJob: Codable, Equatable, Sendable {
             throw BenchmarkDriverError.invalidJob("A checkout commit is invalid.")
         }
         var imagePaths = Set<String>()
+        var immutableSources = [RenderVariant: RenderSource]()
         for view in views {
             try Self.validate(camera: view.camera)
             guard Self.isSafeRelativePath(view.groundTruth.path),
@@ -248,6 +249,15 @@ public struct BenchmarkRenderJob: Codable, Equatable, Sendable {
                       source.outputPath != "rendering-manifest.json",
                       imagePaths.insert(source.outputPath).inserted else {
                     throw BenchmarkDriverError.invalidJob("A render source binding is invalid.")
+                }
+                if let immutableSource = immutableSources[source.variant] {
+                    guard source.hasSameImmutableIdentity(as: immutableSource) else {
+                        throw BenchmarkDriverError.invalidJob(
+                            "Every holdout must use one immutable source per render variant."
+                        )
+                    }
+                } else {
+                    immutableSources[source.variant] = source
                 }
             }
         }
@@ -285,5 +295,16 @@ public struct BenchmarkRenderJob: Codable, Equatable, Sendable {
     static func isToken(_ value: String) -> Bool {
         guard !value.isEmpty, value.count <= 64 else { return false }
         return value.allSatisfy { $0.isLowercase || $0.isNumber || "_.-".contains($0) }
+    }
+}
+
+private extension RenderSource {
+    func hasSameImmutableIdentity(as other: RenderSource) -> Bool {
+        runID == other.runID
+            && checkoutCommit == other.checkoutCommit
+            && toolchainIdentity == other.toolchainIdentity
+            && sourceExecutableSHA256 == other.sourceExecutableSHA256
+            && plyPath == other.plyPath
+            && plySHA256 == other.plySHA256
     }
 }

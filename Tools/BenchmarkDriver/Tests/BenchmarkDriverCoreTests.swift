@@ -24,6 +24,30 @@ final class BenchmarkDriverCoreTests: XCTestCase {
         XCTAssertThrowsError(try misorderedSources.validate())
     }
 
+    func testValidationRejectsMixedSourceRunAcrossHoldouts() throws {
+        var job = makeJob()
+        job.views[1].sources[2].runID = "different-candidate-run"
+
+        XCTAssertThrowsError(try job.validate()) { error in
+            XCTAssertTrue(
+                error.localizedDescription.contains("one immutable source"),
+                error.localizedDescription
+            )
+        }
+    }
+
+    func testValidationRejectsMixedSourcePLYAcrossHoldouts() throws {
+        var job = makeJob()
+        job.views[1].sources[2].plySHA256 = digest("9")
+
+        XCTAssertThrowsError(try job.validate()) { error in
+            XCTAssertTrue(
+                error.localizedDescription.contains("one immutable source"),
+                error.localizedDescription
+            )
+        }
+    }
+
     func testValidationRejectsRenderTargetsAbovePixelBudget() throws {
         var job = makeJob()
         job.views[0].camera.width = 4_096
@@ -191,6 +215,115 @@ final class BenchmarkDriverCoreTests: XCTestCase {
         XCTAssertEqual(try CheckoutSnapshot.capture(root: baseline.root).commit, baseline.commit)
     }
 
+    func testDriverLoadsEachImmutableSourceOnceAndKeepsCanonicalEvidenceOrder() throws {
+        let fixture = try makeDriverFixture()
+        defer { try? FileManager.default.removeItem(at: fixture.root) }
+        var loads = [String]()
+        let driver = BenchmarkRenderDriver(loadScene: { source in
+            loads.append(source.lastPathComponent)
+            return StubLoadedScene { _, output in
+                try Data("rendered \(source.lastPathComponent)".utf8).write(
+                    to: output,
+                    options: .atomic
+                )
+                return try MetalOffscreenRenderer.sha256(fileAt: output)
+            }
+        })
+        let manifestURL = fixture.artifacts.appendingPathComponent("rendering-manifest.json")
+
+        try driver.execute(
+            job: fixture.job,
+            artifactRoot: fixture.artifacts,
+            manifestURL: manifestURL,
+            rendererExecutableURL: fixture.executable
+        )
+
+        XCTAssertEqual(
+            loads,
+            RenderVariant.allCases.map { "\($0.rawValue).ply" }
+        )
+        let manifest = try XCTUnwrap(
+            try JSONSerialization.jsonObject(with: Data(contentsOf: manifestURL)) as? [String: Any]
+        )
+        let views = try XCTUnwrap(manifest["views"] as? [[String: Any]])
+        XCTAssertEqual(views.compactMap { $0["holdout_index"] as? Int }, fixture.job.holdoutIndices)
+        for view in views {
+            let renders = try XCTUnwrap(view["renders"] as? [[String: Any]])
+            XCTAssertEqual(
+                renders.compactMap { $0["variant"] as? String },
+                RenderVariant.allCases.map(\.rawValue)
+            )
+        }
+        let operations = try XCTUnwrap(manifest["render_operations"] as? [[String: Any]])
+        let expectedOperations = RenderVariant.allCases.flatMap { variant in
+            fixture.job.holdoutIndices.map { "render-\(String(format: "%06d", $0))-\(variant.rawValue)" }
+        }
+        XCTAssertEqual(
+            operations.compactMap { $0["operation_id"] as? String },
+            expectedOperations
+        )
+    }
+
+    func testDriverRejectsSnapshotMutationDuringSceneLoad() throws {
+        let fixture = try makeDriverFixture()
+        defer { try? FileManager.default.removeItem(at: fixture.root) }
+        let driver = BenchmarkRenderDriver(loadScene: { source in
+            try Data("tampered snapshot".utf8).write(to: source, options: .atomic)
+            return StubLoadedScene { _, _ in self.digest("f") }
+        })
+
+        XCTAssertThrowsError(
+            try driver.execute(
+                job: fixture.job,
+                artifactRoot: fixture.artifacts,
+                manifestURL: fixture.artifacts.appendingPathComponent("rendering-manifest.json"),
+                rendererExecutableURL: fixture.executable
+            )
+        ) { error in
+            XCTAssertTrue(
+                error.localizedDescription.contains("snapshot changed"),
+                error.localizedDescription
+            )
+        }
+    }
+
+    func testDriverRejectsGroundTruthMutationBeforeCompletion() throws {
+        let fixture = try makeDriverFixture()
+        defer { try? FileManager.default.removeItem(at: fixture.root) }
+        let groundTruth = fixture.artifacts.appendingPathComponent(
+            fixture.job.views[0].groundTruth.path
+        )
+        var mutated = false
+        let driver = BenchmarkRenderDriver(loadScene: { source in
+            StubLoadedScene { _, output in
+                if !mutated {
+                    mutated = true
+                    try Data("changed ground truth".utf8).write(to: groundTruth, options: .atomic)
+                }
+                try Data("rendered \(source.lastPathComponent)".utf8).write(
+                    to: output,
+                    options: .atomic
+                )
+                return try MetalOffscreenRenderer.sha256(fileAt: output)
+            }
+        })
+
+        XCTAssertThrowsError(
+            try driver.execute(
+                job: fixture.job,
+                artifactRoot: fixture.artifacts,
+                manifestURL: fixture.artifacts.appendingPathComponent("rendering-manifest.json"),
+                rendererExecutableURL: fixture.executable
+            )
+        ) { error in
+            let description = error.localizedDescription
+            XCTAssertTrue(
+                description.contains("ground-truth image") && description.contains("changed"),
+                description
+            )
+        }
+    }
+
     func testProductionRendererProducesDeterministicRGBPNG() throws {
         guard let device = MTLCreateSystemDefaultDevice() else {
             throw XCTSkip("Metal is unavailable on this test host.")
@@ -311,8 +444,11 @@ final class BenchmarkDriverCoreTests: XCTestCase {
                 sha256: try MetalOffscreenRenderer.sha256(fileAt: groundTruth)
             )
         }
-        job.views[0].sources[0].plyPath = "linked/source.ply"
-        job.views[0].sources[0].plySHA256 = try MetalOffscreenRenderer.sha256(fileAt: outsidePLY)
+        for viewIndex in job.views.indices {
+            job.views[viewIndex].sources[0].plyPath = "linked/source.ply"
+            job.views[viewIndex].sources[0].plySHA256 =
+                try MetalOffscreenRenderer.sha256(fileAt: outsidePLY)
+        }
 
         XCTAssertThrowsError(
             try driver.execute(
@@ -375,6 +511,64 @@ final class BenchmarkDriverCoreTests: XCTestCase {
             }
         )
         return job
+    }
+
+    private func makeDriverFixture() throws -> DriverFixture {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        let candidate = try makeCheckout(at: root.appendingPathComponent("candidate"))
+        let baseline = try makeCheckout(at: root.appendingPathComponent("baseline"))
+        let artifacts = root.appendingPathComponent("artifacts", isDirectory: true)
+        try FileManager.default.createDirectory(at: artifacts, withIntermediateDirectories: true)
+        let executable = root.appendingPathComponent("benchmark-driver")
+        try Data("renderer executable".utf8).write(to: executable)
+        var job = makeJob()
+        job.candidateCheckout = CheckoutBinding(path: candidate.root.path, commit: candidate.commit)
+        job.baselineCheckout = CheckoutBinding(path: baseline.root.path, commit: baseline.commit)
+        job.rendererExecutableSHA256 = try MetalOffscreenRenderer.sha256(fileAt: executable)
+        for variant in RenderVariant.allCases {
+            let source = artifacts.appendingPathComponent("sources/\(variant.rawValue).ply")
+            try FileManager.default.createDirectory(
+                at: source.deletingLastPathComponent(),
+                withIntermediateDirectories: true
+            )
+            try Data("ply \(variant.rawValue)".utf8).write(to: source)
+        }
+        for viewIndex in job.views.indices {
+            let holdout = job.views[viewIndex].holdoutIndex
+            let groundTruth = artifacts.appendingPathComponent(
+                "rendering/ground-truth/\(holdout).png"
+            )
+            try FileManager.default.createDirectory(
+                at: groundTruth.deletingLastPathComponent(),
+                withIntermediateDirectories: true
+            )
+            try Data("ground truth \(holdout)".utf8).write(to: groundTruth)
+            job.views[viewIndex].groundTruth = GroundTruthImage(
+                path: "rendering/ground-truth/\(holdout).png",
+                sha256: try MetalOffscreenRenderer.sha256(fileAt: groundTruth)
+            )
+            for sourceIndex in job.views[viewIndex].sources.indices {
+                let variant = job.views[viewIndex].sources[sourceIndex].variant
+                let sourcePath = "sources/\(variant.rawValue).ply"
+                let source = artifacts.appendingPathComponent(sourcePath)
+                job.views[viewIndex].sources[sourceIndex].runID = "\(variant.rawValue)-run"
+                job.views[viewIndex].sources[sourceIndex].checkoutCommit =
+                    variant == .pairedBaseline ? baseline.commit : candidate.commit
+                job.views[viewIndex].sources[sourceIndex].plyPath = sourcePath
+                job.views[viewIndex].sources[sourceIndex].plySHA256 =
+                    try MetalOffscreenRenderer.sha256(fileAt: source)
+                job.views[viewIndex].sources[sourceIndex].outputPath =
+                    "rendering/\(variant.rawValue)/\(holdout).png"
+            }
+        }
+        return DriverFixture(
+            root: root,
+            artifacts: artifacts,
+            executable: executable,
+            job: job
+        )
     }
 
     private var identity: [Float] {
@@ -461,5 +655,24 @@ final class BenchmarkDriverCoreTests: XCTestCase {
             at: root
         )
         return try CheckoutSnapshot.capture(root: root)
+    }
+}
+
+private struct DriverFixture {
+    let root: URL
+    let artifacts: URL
+    let executable: URL
+    let job: BenchmarkRenderJob
+}
+
+private final class StubLoadedScene: LoadedSceneRendering {
+    private let body: (RenderCamera, URL) throws -> String
+
+    init(body: @escaping (RenderCamera, URL) throws -> String) {
+        self.body = body
+    }
+
+    func render(camera: RenderCamera, outputURL: URL) throws -> String {
+        try body(camera, outputURL)
     }
 }

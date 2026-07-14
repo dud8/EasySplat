@@ -8,6 +8,10 @@ import simd
 import MetalSplatter
 import UniformTypeIdentifiers
 
+public protocol LoadedSceneRendering: AnyObject {
+    func render(camera: RenderCamera, outputURL: URL) throws -> String
+}
+
 public final class MetalOffscreenRenderer {
     private let device: MTLDevice
     private let commandQueue: MTLCommandQueue
@@ -28,6 +32,10 @@ public final class MetalOffscreenRenderer {
 
     @discardableResult
     public func render(plyURL: URL, camera: RenderCamera, outputURL: URL) throws -> String {
+        try loadScene(plyURL: plyURL).render(camera: camera, outputURL: outputURL)
+    }
+
+    public func loadScene(plyURL: URL) throws -> any LoadedSceneRendering {
         guard case .valid = ProjectArtifactValidator.validatePlyFile(at: plyURL) else {
             throw BenchmarkDriverError.renderFailed("The render source is not a valid Gaussian PLY.")
         }
@@ -48,12 +56,104 @@ public final class MetalOffscreenRenderer {
                 "MetalSplatter could not load the render source: \(error.localizedDescription)"
             )
         }
+        return MetalLoadedScene(
+            renderer: renderer,
+            device: device,
+            commandQueue: commandQueue,
+            sortTimeout: sortTimeout
+        )
+    }
+
+    public static func sha256(fileAt url: URL) throws -> String {
+        let handle = try FileHandle(forReadingFrom: url)
+        defer { try? handle.close() }
+        var hasher = SHA256()
+        while true {
+            let chunk = try handle.read(upToCount: 1024 * 1024) ?? Data()
+            if chunk.isEmpty { break }
+            hasher.update(data: chunk)
+        }
+        return "sha256:" + hasher.finalize().map { String(format: "%02x", $0) }.joined()
+    }
+
+    static func awaitSort(
+        timeout: DispatchTimeInterval,
+        start: (@escaping @Sendable (SortOutcome) -> Void) -> Void
+    ) throws {
+        let signal = SortSignal()
+        start { outcome in signal.finish(with: outcome) }
+        guard signal.wait(timeout: timeout) else {
+            throw BenchmarkDriverError.renderFailed("MetalSplatter did not finish depth sorting.")
+        }
+        if case .failure(let detail) = signal.outcome {
+            throw BenchmarkDriverError.renderFailed("MetalSplatter could not sort the render source: \(detail)")
+        }
+    }
+
+    fileprivate static func pngData(rgb: [UInt8], width: Int, height: Int) throws -> Data {
+        let colorSpace = CGColorSpace(name: CGColorSpace.sRGB)!
+        guard let provider = CGDataProvider(data: Data(rgb) as CFData),
+              let image = CGImage(
+                width: width,
+                height: height,
+                bitsPerComponent: 8,
+                bitsPerPixel: 24,
+                bytesPerRow: width * 3,
+                space: colorSpace,
+                bitmapInfo: CGBitmapInfo(rawValue: CGImageAlphaInfo.none.rawValue),
+                provider: provider,
+                decode: nil,
+                shouldInterpolate: false,
+                intent: .defaultIntent
+              ) else {
+            throw BenchmarkDriverError.renderFailed("The rendered pixels could not be encoded.")
+        }
+        let data = NSMutableData()
+        guard let destination = CGImageDestinationCreateWithData(
+            data,
+            UTType.png.identifier as CFString,
+            1,
+            nil
+        ) else {
+            throw BenchmarkDriverError.renderFailed("The PNG encoder is unavailable.")
+        }
+        CGImageDestinationAddImage(destination, image, nil)
+        guard CGImageDestinationFinalize(destination) else {
+            throw BenchmarkDriverError.renderFailed("The rendered PNG could not be finalized.")
+        }
+        return data as Data
+    }
+
+    fileprivate static func sha256(data: Data) -> String {
+        "sha256:" + SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
+    }
+}
+
+private final class MetalLoadedScene: LoadedSceneRendering {
+    private let renderer: SplatRenderer
+    private let device: MTLDevice
+    private let commandQueue: MTLCommandQueue
+    private let sortTimeout: DispatchTimeInterval
+
+    init(
+        renderer: SplatRenderer,
+        device: MTLDevice,
+        commandQueue: MTLCommandQueue,
+        sortTimeout: DispatchTimeInterval
+    ) {
+        self.renderer = renderer
+        self.device = device
+        self.commandQueue = commandQueue
+        self.sortTimeout = sortTimeout
+    }
+
+    func render(camera: RenderCamera, outputURL: URL) throws -> String {
         let descriptor = SplatRenderer.CameraDescriptor(
             projectionMatrix: try camera.projectionMatrix(),
             viewMatrix: try camera.worldToCameraMatrix(),
             screenSize: SIMD2(camera.width, camera.height)
         )
-        try Self.awaitSort(timeout: sortTimeout) { finish in
+        try MetalOffscreenRenderer.awaitSort(timeout: sortTimeout) { finish in
             renderer.onSortFailure = { failure in
                 finish(.failure(failure.localizedDescription))
             }
@@ -108,77 +208,17 @@ public final class MetalOffscreenRenderer {
             rgb.append(rgba[offset + 1])
             rgb.append(rgba[offset + 2])
         }
-        let png = try Self.pngData(rgb: rgb, width: camera.width, height: camera.height)
+        let png = try MetalOffscreenRenderer.pngData(
+            rgb: rgb,
+            width: camera.width,
+            height: camera.height
+        )
         try FileManager.default.createDirectory(
             at: outputURL.deletingLastPathComponent(),
             withIntermediateDirectories: true
         )
         try png.write(to: outputURL, options: .atomic)
-        return Self.sha256(data: png)
-    }
-
-    public static func sha256(fileAt url: URL) throws -> String {
-        let handle = try FileHandle(forReadingFrom: url)
-        defer { try? handle.close() }
-        var hasher = SHA256()
-        while true {
-            let chunk = try handle.read(upToCount: 1024 * 1024) ?? Data()
-            if chunk.isEmpty { break }
-            hasher.update(data: chunk)
-        }
-        return "sha256:" + hasher.finalize().map { String(format: "%02x", $0) }.joined()
-    }
-
-    static func awaitSort(
-        timeout: DispatchTimeInterval,
-        start: (@escaping @Sendable (SortOutcome) -> Void) -> Void
-    ) throws {
-        let signal = SortSignal()
-        start { outcome in signal.finish(with: outcome) }
-        guard signal.wait(timeout: timeout) else {
-            throw BenchmarkDriverError.renderFailed("MetalSplatter did not finish depth sorting.")
-        }
-        if case .failure(let detail) = signal.outcome {
-            throw BenchmarkDriverError.renderFailed("MetalSplatter could not sort the render source: \(detail)")
-        }
-    }
-
-    private static func pngData(rgb: [UInt8], width: Int, height: Int) throws -> Data {
-        let colorSpace = CGColorSpace(name: CGColorSpace.sRGB)!
-        guard let provider = CGDataProvider(data: Data(rgb) as CFData),
-              let image = CGImage(
-                width: width,
-                height: height,
-                bitsPerComponent: 8,
-                bitsPerPixel: 24,
-                bytesPerRow: width * 3,
-                space: colorSpace,
-                bitmapInfo: CGBitmapInfo(rawValue: CGImageAlphaInfo.none.rawValue),
-                provider: provider,
-                decode: nil,
-                shouldInterpolate: false,
-                intent: .defaultIntent
-              ) else {
-            throw BenchmarkDriverError.renderFailed("The rendered pixels could not be encoded.")
-        }
-        let data = NSMutableData()
-        guard let destination = CGImageDestinationCreateWithData(
-            data,
-            UTType.png.identifier as CFString,
-            1,
-            nil
-        ) else {
-            throw BenchmarkDriverError.renderFailed("The PNG encoder is unavailable.")
-        }
-        CGImageDestinationAddImage(destination, image, nil)
-        guard CGImageDestinationFinalize(destination) else {
-            throw BenchmarkDriverError.renderFailed("The rendered PNG could not be finalized.")
-        }
-        return data as Data
-    }
-
-    private static func sha256(data: Data) -> String {
-        "sha256:" + SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
+        return MetalOffscreenRenderer.sha256(data: png)
     }
 }
 
