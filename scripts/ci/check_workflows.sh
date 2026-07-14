@@ -80,6 +80,8 @@ require_line '^[[:space:]]+test -d /Applications/Xcode_16\.4\.app$' "$TESTS"
 require_line '^[[:space:]]+test "\$\(uname -m\)" = "arm64"$' "$TESTS"
 require_line '^[[:space:]]+memory_bytes="\$\(sysctl -n hw\.memsize\)"$' "$TESTS"
 require_line '^[[:space:]]+swift test --filter RunPlanResolverTests$' "$TESTS"
+require_text 'cache-dependency-path: scripts/benchmark/requirements.txt' "$TESTS"
+require_line '^[[:space:]]+--require-hashes --requirement scripts/benchmark/requirements\.txt$' "$TESTS"
 require_line '^  pull_request:$' "$CODEQL"
 
 require_line '^[[:space:]]+GOBIN=.*go install github\.com/rhysd/actionlint/cmd/actionlint@v[0-9]+\.[0-9]+\.[0-9]+$' "$SECURITY"

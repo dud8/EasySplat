@@ -4,12 +4,14 @@
 from __future__ import annotations
 
 import argparse
+import base64
 import hashlib
 import json
 import math
 import os
 import platform
 import re
+import statistics
 import subprocess
 import sys
 import tempfile
@@ -29,7 +31,7 @@ ALLOWED_CATEGORIES = {
     "object_orbit",
     "interior_walkthrough",
     "professional_photos",
-    "exterior_drone",
+    "large_area_exterior",
     "low_light",
     "invalid",
 }
@@ -37,14 +39,115 @@ RELEASE_CATEGORY_COUNTS = {
     "object_orbit": 6,
     "interior_walkthrough": 6,
     "professional_photos": 4,
-    "exterior_drone": 4,
+    "large_area_exterior": 4,
     "low_light": 3,
     "invalid": 3,
+}
+RELEASE_CATEGORY_SCENARIOS = {
+    "object_orbit": {
+        "camera",
+        "complete_loop",
+        "glossy",
+        "low_texture",
+        "partial_orbit",
+        "phone",
+    },
+    "interior_walkthrough": {
+        "multi_room_loop",
+        "narrow_hall",
+        "open_room",
+        "repeated_doors",
+        "stairs_or_elevation",
+        "windows_and_mirrors",
+    },
+    "professional_photos": {
+        "curated_property_set",
+        "fisheye_or_action_camera",
+        "mixed_cameras_or_lenses",
+        "shared_lens",
+    },
+    "large_area_exterior": {
+        "ground_level_building_or_campus_perimeter",
+        "long_facade_block_or_grounds_traversal",
+        "nadir_or_steep_down_aerial_capture",
+        "oblique_aerial_orbit_or_loop",
+    },
+    "low_light": {
+        "dim_interior",
+        "dusk_exterior",
+        "night_or_high_iso",
+    },
+    "invalid": {
+        "disconnected_captures",
+        "dynamic_dominated_or_inconsistent_input",
+        "pan_only_or_near_zero_parallax",
+    },
+}
+ALLOWED_AUTHORIZATION_STATUSES = {
+    "documented_consent",
+    "pending",
+    "redistributable",
+}
+ALLOWED_CAPTURE_TRAITS = {
+    "ordered",
+    "unordered",
+    "segmented",
+    "loop",
+    "forward_motion",
+    "mixed_intrinsics",
+    "fisheye",
+    "large_area",
+    "low_texture",
+    "low_light",
+    "nadir",
+}
+ALLOWED_GATE_SCOPES = {
+    "scene_quality",
+    "scene_performance",
+    "suite_performance",
+    "long_sequence",
+    "stability",
+    "invalid_input",
+    "toolchain",
 }
 ALLOWED_SCALE_LANES = {30, 120, 250, 500, 3_000}
 ALLOWED_ADAPTERS = {"fixture", "protected-evidence"}
 APP_VERSION = "0.2.0-beta.1"
+APPROVED_PAIRED_BASELINE = {
+    "git_commit": "4f3c11735ad15e1318ee2043ce351e185c225d30",
+    "toolchain_identity": "sha256:bd32d5868c5cb6a06a2ae5822d87753f08daf050ea7299c9e373c174be49116b",
+    "run_configuration": {
+        "detail_profile": "balanced",
+        "selected_frame_count": "request_scale",
+        "geometry_route": "colmap",
+        "feature_type": "sift",
+        "feature_max_image_size": 1_024,
+        "feature_max_count": 10_000,
+        "descriptor_matcher": "exact_cpu_brute_force",
+        "maximum_match_count": 10_000,
+        "matcher_threads": 8,
+        "sequential_overlap": {
+            "automatic": 8,
+            "orbit": 8,
+            "walkthrough": 8,
+            "large_area": 16,
+        },
+        "exhaustive_block_size": 25,
+        "mapper": "incremental",
+        "bundle_adjustment_max_iterations": {
+            "automatic": 75,
+            "orbit": 75,
+            "walkthrough": 75,
+            "large_area": 94,
+        },
+        "trainer": "native_msplat",
+        "trainer_iterations": 7_000,
+        "trainer_plateau_window": 800,
+        "deterministic_seed": 42,
+    },
+}
 MAX_TOOLCHAIN_INSTALL_STATE_BYTES = 16 * 1024 * 1024
+PINNED_TOOLCHAIN_PUBLIC_KEY_PATH = ROOT / "EasySplatApp/Resources/public_key_ed25519.txt"
 SHA256_PATTERN = re.compile(r"^sha256:[0-9a-f]{64}$")
 SAFE_TOKEN_PATTERN = re.compile(r"^[a-z0-9][a-z0-9_.-]{0,63}$")
 ARTIFACT_NAME_PATTERN = re.compile(r"^[a-z][a-z0-9_]*$")
@@ -66,10 +169,13 @@ NONNEGATIVE_INTEGER_METRICS = {
     "registered_views",
     "total_views",
     "colmap_registered_views",
+    "baseline_registered_views",
     "points",
     "observations",
+    "output_splat_count",
     "long_sequence_frames",
     "peak_memory_bytes",
+    "peak_metal_allocated_bytes",
     "machine_memory_bytes",
     "repeat_runs",
     "crashes",
@@ -77,6 +183,19 @@ NONNEGATIVE_INTEGER_METRICS = {
     "normal_photo_toolchain_bytes",
     "large_area_toolchain_bytes",
     "max_resident_set_size_bytes",
+    "scheduled_pairs",
+    "attempted_pairs",
+    "raw_matched_pairs",
+    "spatially_verified_pairs",
+    "connected_components",
+    "isolated_views",
+    "local_pairs",
+    "retrieval_pairs",
+    "loop_pairs",
+    "bundle_adjustment_cycles",
+    "raster_fallback_count",
+    "maximum_tile_intersections",
+    "dropped_intersection_count",
 }
 NONNEGATIVE_NUMBER_METRICS = {
     "residual_median_pixels",
@@ -93,21 +212,44 @@ NONNEGATIVE_NUMBER_METRICS = {
     "fast_scene_psnr_loss_db",
     "fast_scene_ssim_loss",
     "fast_scene_lpips_increase",
+    "paired_balanced_scene_psnr_loss_db",
+    "paired_balanced_scene_ssim_loss",
+    "paired_balanced_scene_lpips_increase",
     "fast_end_to_end_speedup",
     "m4_max_p50_seconds",
     "balanced_geometry_speedup",
     "constrained_fast_p50_seconds",
-    "long_sequence_geometry_fps",
+    "eight_gb_fast_p50_seconds",
+    "long_sequence_analysis_fps",
+    "long_sequence_rss_growth_fraction",
     "wall_time_seconds",
     "geometry_seconds",
     "training_seconds",
+    "matcher_seconds",
+    "mapping_seconds",
+    "orientation_median_residual_degrees",
+    "orientation_p90_residual_degrees",
+    "orientation_bootstrap_p95_degrees",
+    "orientation_physical_up_error_degrees",
+    "matching_speedup",
+    "mapping_speedup",
 }
 BOOLEAN_METRICS = {
     "deterministic_restart",
+    "orientation_sign_correct",
+    "toolchain_fresh_install",
+    "toolchain_cached_offline_run",
+    "toolchain_interrupted_download_recovered",
+    "toolchain_low_disk_rejected",
+    "toolchain_wrong_key_rejected",
+    "toolchain_corrupt_archive_rejected",
+    "toolchain_rollback_succeeded",
+    "toolchain_traversal_rejected",
 }
 ENUM_METRICS = {
     "residual_provenance": {"track_reprojection"},
     "memory_lane": {"eight_gb_fast", "constrained", "larger"},
+    "orientation_status": {"verified", "axis_aligned_sign_unverified", "unresolved"},
 }
 ALLOWED_METRICS = (
     NONNEGATIVE_INTEGER_METRICS
@@ -116,6 +258,81 @@ ALLOWED_METRICS = (
     | set(ENUM_METRICS)
 )
 
+GATE_SCOPE_METRICS = {
+    "scene_quality": {
+        "registered_views",
+        "total_views",
+        "colmap_registered_views",
+        "baseline_registered_views",
+        "points",
+        "observations",
+        "output_splat_count",
+        "residual_provenance",
+        "residual_median_pixels",
+        "residual_p90_pixels",
+        "ate_colmap_ratio",
+        "rotation_rpe_delta_degrees",
+        "translation_rpe_delta_percentage_points",
+        "balanced_scene_psnr_loss_db",
+        "balanced_scene_ssim_loss",
+        "balanced_scene_lpips_increase",
+        "fast_scene_psnr_loss_db",
+        "fast_scene_ssim_loss",
+        "fast_scene_lpips_increase",
+        "paired_balanced_scene_psnr_loss_db",
+        "paired_balanced_scene_ssim_loss",
+        "paired_balanced_scene_lpips_increase",
+        "scheduled_pairs",
+        "attempted_pairs",
+        "raw_matched_pairs",
+        "spatially_verified_pairs",
+        "connected_components",
+        "isolated_views",
+        "local_pairs",
+        "retrieval_pairs",
+        "loop_pairs",
+        "orientation_status",
+        "dropped_intersection_count",
+    },
+    "scene_performance": {
+        "peak_memory_bytes",
+        "peak_metal_allocated_bytes",
+        "machine_memory_bytes",
+        "memory_lane",
+        "matcher_seconds",
+        "mapping_seconds",
+        "bundle_adjustment_cycles",
+        "raster_fallback_count",
+        "maximum_tile_intersections",
+    },
+    "suite_performance": {
+        "m4_max_p50_seconds",
+        "balanced_geometry_speedup",
+        "fast_end_to_end_speedup",
+        "matching_speedup",
+        "mapping_speedup",
+    },
+    "long_sequence": {
+        "long_sequence_analysis_fps",
+        "long_sequence_frames",
+        "long_sequence_rss_growth_fraction",
+    },
+    "stability": {"repeat_runs", "crashes", "corrupt_outputs", "deterministic_restart"},
+    "invalid_input": set(),
+    "toolchain": {
+        "normal_photo_toolchain_bytes",
+        "large_area_toolchain_bytes",
+        "toolchain_fresh_install",
+        "toolchain_cached_offline_run",
+        "toolchain_interrupted_download_recovered",
+        "toolchain_low_disk_rejected",
+        "toolchain_wrong_key_rejected",
+        "toolchain_corrupt_archive_rejected",
+        "toolchain_rollback_succeeded",
+        "toolchain_traversal_rejected",
+    },
+}
+
 APPROVED_THRESHOLDS: dict[str, Any] = {
     "coverage": {"absolute_min": 0.90, "colmap_relative_min": 0.95},
     "residual_pixels": {"median_max": 1.5, "p90_max": 3.0},
@@ -123,6 +340,12 @@ APPROVED_THRESHOLDS: dict[str, Any] = {
         "ate_colmap_ratio_max": 1.10,
         "rotation_rpe_delta_degrees_max": 0.2,
         "translation_rpe_delta_percentage_points_max": 2.0,
+    },
+    "orientation": {
+        "median_residual_degrees_max": 3.0,
+        "p90_residual_degrees_max": 8.0,
+        "bootstrap_p95_degrees_max": 5.0,
+        "physical_up_error_degrees_max": 5.0,
     },
     "balanced_rendering": {
         "median_psnr_loss_db_max": 0.5,
@@ -138,12 +361,38 @@ APPROVED_THRESHOLDS: dict[str, Any] = {
         "scene_lpips_increase_max": 0.03,
         "end_to_end_speedup_min": 2.0,
     },
-    "speed": {
-        "m4_max_p50_seconds_max": 120.0,
-        "balanced_speedup_min": 2.0,
-        "constrained_fast_p50_seconds_max": 300.0,
+    "paired_baseline_rendering": {
+        "median_psnr_loss_db_max": 0.2,
+        "median_ssim_loss_max": 0.005,
+        "median_lpips_increase_max": 0.01,
+        "scene_psnr_loss_db_max": 0.5,
+        "scene_ssim_loss_max": 0.01,
+        "scene_lpips_increase_max": 0.02,
     },
-    "long_sequence": {"inference_fps_min": 5.0, "sustained_frames_min": 3_000},
+    "speed": {
+        "m4_max_balanced_p50_seconds_max_by_scale": {
+            "30": 120.0,
+            "120": 300.0,
+            "250": 600.0,
+            "500": 1_200.0,
+        },
+        "constrained_fast_p50_seconds_max_by_scale": {
+            "30": 300.0,
+            "120": 600.0,
+        },
+        "eight_gb_fast_p50_seconds_max_by_scale": {"30": 300.0},
+        "geometry_geometric_mean_speedup_min": 2.0,
+        "category_median_geometry_speedup_min": 1.5,
+        "matching_geometric_mean_speedup_min": 10.0,
+        "matching_speedup_scales": [120, 250, 500],
+        "ordered_mapping_speedup_min": 1.5,
+        "unordered_mapping_regression_max_fraction": 0.10,
+    },
+    "long_sequence": {
+        "analysis_fps_min": 5.0,
+        "sustained_frames_min": 3_000,
+        "rss_growth_fraction_max": 0.05,
+    },
     "memory": {
         "eight_gb_fast_bytes_max": 6_500_000_000,
         "constrained_bytes_max": 12_000_000_000,
@@ -262,10 +511,14 @@ def validate_corpus(corpus: Any, expected_profile: str) -> None:
             {
                 "id",
                 "category",
+                "scenario",
+                "capture_traits",
+                "gate_scopes",
                 "license",
                 "provenance",
                 "input",
                 "scale_lanes",
+                "aggregate_scale",
                 "split",
                 "reference",
                 "expected_outcome",
@@ -285,6 +538,28 @@ def validate_corpus(corpus: Any, expected_profile: str) -> None:
             raise ConfigError(f"unknown category: {category}")
         counts[category] += 1
 
+        _require_safe_token(scene["scenario"], f"{label}.scenario")
+
+        capture_traits = scene["capture_traits"]
+        if (
+            not isinstance(capture_traits, list)
+            or not capture_traits
+            or any(trait not in ALLOWED_CAPTURE_TRAITS for trait in capture_traits)
+            or len(capture_traits) != len(set(capture_traits))
+            or capture_traits != sorted(capture_traits)
+        ):
+            raise ConfigError(f"{label}.capture_traits must be a nonempty sorted list of supported traits")
+
+        gate_scopes = scene["gate_scopes"]
+        if (
+            not isinstance(gate_scopes, list)
+            or not gate_scopes
+            or any(scope not in ALLOWED_GATE_SCOPES for scope in gate_scopes)
+            or len(gate_scopes) != len(set(gate_scopes))
+            or gate_scopes != sorted(gate_scopes)
+        ):
+            raise ConfigError(f"{label}.gate_scopes must be a nonempty sorted list of supported scopes")
+
         license_info = _require_mapping(scene["license"], f"{label}.license")
         _require_exact_keys(license_info, {"name", "url", "redistributable"}, f"{label}.license")
         _require_nonempty_string(license_info["name"], f"{label}.license.name")
@@ -295,9 +570,32 @@ def validate_corpus(corpus: Any, expected_profile: str) -> None:
             raise ConfigError(f"{label}.license.redistributable must be boolean")
 
         provenance = _require_mapping(scene["provenance"], f"{label}.provenance")
-        _require_exact_keys(provenance, {"source", "consent"}, f"{label}.provenance")
-        _require_nonempty_string(provenance["source"], f"{label}.provenance.source")
-        _require_nonempty_string(provenance["consent"], f"{label}.provenance.consent")
+        _require_exact_keys(
+            provenance,
+            {"source", "authorization_status", "authorization_sha256"},
+            f"{label}.provenance",
+        )
+        _require_public_text(provenance["source"], f"{label}.provenance.source")
+        authorization_status = provenance["authorization_status"]
+        if authorization_status not in ALLOWED_AUTHORIZATION_STATUSES:
+            raise ConfigError(f"{label}.provenance.authorization_status is invalid")
+        authorization_digest = provenance["authorization_sha256"]
+        if authorization_status == "documented_consent":
+            if not isinstance(authorization_digest, str) or not SHA256_PATTERN.fullmatch(
+                authorization_digest
+            ):
+                raise ConfigError(
+                    f"{label}.provenance documented consent requires an authorization SHA-256"
+                )
+        elif authorization_digest is not None:
+            raise ConfigError(
+                f"{label}.provenance authorization_sha256 is reserved for documented consent"
+            )
+        if authorization_status == "redistributable" and not license_info["redistributable"]:
+            raise ConfigError(
+                f"{label}.provenance cannot claim redistributable authorization "
+                "for a non-redistributable license"
+            )
 
         input_info = _require_mapping(scene["input"], f"{label}.input")
         _require_exact_keys(input_info, {"kind", "media_path", "supplied"}, f"{label}.input")
@@ -306,6 +604,17 @@ def validate_corpus(corpus: Any, expected_profile: str) -> None:
         _safe_relative_path(input_info["media_path"], "media path")
         if not isinstance(input_info["supplied"], bool):
             raise ConfigError(f"{label}.input.supplied must be boolean")
+        if input_info["supplied"] and authorization_status == "pending":
+            raise ConfigError(f"{label} supplied input requires completed authorization")
+        if expected_profile == "release" and input_info["supplied"]:
+            commercially_authorized = (
+                authorization_status == "redistributable" and license_info["redistributable"]
+            ) or authorization_status == "documented_consent"
+            if not commercially_authorized:
+                raise ConfigError(
+                    f"{label} supplied release media requires redistributable licensing "
+                    "or documented consent"
+                )
 
         lanes = scene["scale_lanes"]
         if (
@@ -316,32 +625,112 @@ def validate_corpus(corpus: Any, expected_profile: str) -> None:
             or lanes != sorted(lanes)
         ):
             raise ConfigError(f"{label}.scale lane list is invalid")
+        if type(scene["aggregate_scale"]) is not int or scene["aggregate_scale"] not in lanes:
+            raise ConfigError(f"{label}.aggregate_scale must select one declared scale lane")
+        if "long_sequence" in gate_scopes and lanes != [3000]:
+            raise ConfigError(f"{label}.long_sequence must use only the 3000-frame scale")
 
         split = _require_mapping(scene["split"], f"{label}.split")
-        _require_exact_keys(split, {"train", "holdout"}, f"{label}.split")
-        train = split["train"]
-        holdout = split["holdout"]
-        for split_name, values in (("train", train), ("holdout", holdout)):
-            if (
-                not isinstance(values, list)
-                or not values
-                or any(type(value) is not int or value < 0 for value in values)
-                or len(values) != len(set(values))
-            ):
-                raise ConfigError(f"{label}.split.{split_name} is invalid")
-        if set(train) & set(holdout):
-            raise ConfigError(f"{label}.split train/holdout overlap")
+        split_status = split.get("status")
+        if split_status == "pending":
+            _require_exact_keys(split, {"status"}, f"{label}.split")
+            if category == "invalid":
+                raise ConfigError(f"{label}.split must be not_applicable for invalid input")
+            if input_info["supplied"]:
+                raise ConfigError(f"{label} supplied input cannot retain a pending split")
+        elif split_status == "fixture":
+            _require_exact_keys(split, {"status"}, f"{label}.split")
+            if category == "invalid":
+                raise ConfigError(f"{label}.split must be not_applicable for invalid input")
+            if expected_profile != "smoke":
+                raise ConfigError(f"{label}.split fixture is smoke-only")
+        elif split_status == "pinned":
+            if category == "invalid":
+                raise ConfigError(f"{label}.split must be not_applicable for invalid input")
+            if not input_info["supplied"]:
+                raise ConfigError(f"{label} unsupplied input cannot claim a pinned split")
+            _require_exact_keys(split, {"status", "holdout_by_scale"}, f"{label}.split")
+            holdout_by_scale = _require_mapping(
+                split["holdout_by_scale"],
+                f"{label}.split.holdout_by_scale",
+            )
+            if set(holdout_by_scale) != {str(scale) for scale in lanes}:
+                raise ConfigError(f"{label}.split must pin the exact declared scale closure")
+            for scale in lanes:
+                holdout = holdout_by_scale[str(scale)]
+                if (
+                    not isinstance(holdout, list)
+                    or not holdout
+                    or holdout != sorted(holdout)
+                    or len(holdout) != len(set(holdout))
+                    or any(type(value) is not int or value < 0 or value >= scale for value in holdout)
+                    or len(holdout) >= scale
+                ):
+                    raise ConfigError(f"{label}.split holdouts are invalid at scale {scale}")
+                if input_info["kind"] == "video" and holdout != list(range(4, scale, 5)):
+                    raise ConfigError(
+                        f"{label}.split video holdouts must contain every fifth selected frame"
+                    )
+        elif split_status == "not_applicable":
+            _require_exact_keys(split, {"status"}, f"{label}.split")
+            if category != "invalid":
+                raise ConfigError(f"{label}.split not_applicable is reserved for invalid input")
+        else:
+            raise ConfigError(f"{label}.split status is invalid")
 
         reference = _require_mapping(scene["reference"], f"{label}.reference")
-        _require_exact_keys(
-            reference,
-            {"ground_truth_poses", "accurate_colmap", "rendering_reference"},
-            f"{label}.reference",
-        )
-        if any(not isinstance(value, bool) for value in reference.values()):
-            raise ConfigError(f"{label}.reference values must be boolean")
-        if not input_info["supplied"] and any(reference.values()):
-            raise ConfigError(f"{label} unsupplied input cannot claim reference availability")
+        reference_status = reference.get("status")
+        if reference_status == "pending":
+            _require_exact_keys(reference, {"status"}, f"{label}.reference")
+            if category == "invalid":
+                raise ConfigError(f"{label}.reference must be not_applicable for invalid input")
+            if input_info["supplied"]:
+                raise ConfigError(f"{label} supplied input cannot retain pending references")
+        elif reference_status == "fixture":
+            _require_exact_keys(reference, {"status"}, f"{label}.reference")
+            if category == "invalid":
+                raise ConfigError(f"{label}.reference must be not_applicable for invalid input")
+            if expected_profile != "smoke":
+                raise ConfigError(f"{label}.reference fixture is smoke-only")
+        elif reference_status == "pinned":
+            if category == "invalid":
+                raise ConfigError(f"{label}.reference must be not_applicable for invalid input")
+            if not input_info["supplied"]:
+                raise ConfigError(f"{label} unsupplied input cannot claim pinned references")
+            _require_exact_keys(reference, {"status", "by_scale"}, f"{label}.reference")
+            by_scale = _require_mapping(reference["by_scale"], f"{label}.reference.by_scale")
+            if set(by_scale) != {str(scale) for scale in lanes}:
+                raise ConfigError(f"{label}.reference must pin the exact declared scale closure")
+            digest_fields = {
+                "selection_manifest_sha256",
+                "ground_truth_poses_sha256",
+                "accurate_colmap_model_sha256",
+                "accurate_rendering_reference_sha256",
+                "paired_baseline_rendering_reference_sha256",
+                "orientation_label_sha256",
+            }
+            for scale in lanes:
+                pinned = _require_mapping(by_scale[str(scale)], f"{label}.reference.{scale}")
+                _require_exact_keys(
+                    pinned,
+                    digest_fields | {"orientation_expected_status"},
+                    f"{label}.reference.{scale}",
+                )
+                for field in digest_fields:
+                    if not isinstance(pinned[field], str) or not SHA256_PATTERN.fullmatch(pinned[field]):
+                        raise ConfigError(f"{label}.reference.{scale}.{field} is not a SHA-256 digest")
+                if pinned["orientation_expected_status"] not in {
+                    "verified",
+                    "axis_aligned_sign_unverified",
+                    "unresolved",
+                }:
+                    raise ConfigError(f"{label}.reference.{scale} orientation expectation is invalid")
+        elif reference_status == "not_applicable":
+            _require_exact_keys(reference, {"status"}, f"{label}.reference")
+            if category != "invalid":
+                raise ConfigError(f"{label}.reference not_applicable is reserved for invalid input")
+        else:
+            raise ConfigError(f"{label}.reference status is invalid")
 
         expected = _require_mapping(scene["expected_outcome"], f"{label}.expected_outcome")
         kind = expected.get("kind")
@@ -349,11 +738,15 @@ def validate_corpus(corpus: Any, expected_profile: str) -> None:
             _require_exact_keys(expected, {"kind"}, f"{label}.expected_outcome")
             if category == "invalid":
                 raise ConfigError(f"{label} invalid category must declare an invalid outcome")
+            if "invalid_input" in gate_scopes:
+                raise ConfigError(f"{label} valid outcomes cannot use the invalid_input gate scope")
         elif kind == "invalid":
             _require_exact_keys(expected, {"kind", "failure_type"}, f"{label}.expected_outcome")
             _require_nonempty_string(expected["failure_type"], f"{label}.expected_outcome.failure_type")
             if category != "invalid":
                 raise ConfigError(f"{label} valid category cannot declare an invalid outcome")
+            if gate_scopes != ["invalid_input"]:
+                raise ConfigError(f"{label} invalid outcomes must use only the invalid_input gate scope")
         else:
             raise ConfigError(f"{label}.expected_outcome.kind is invalid")
 
@@ -374,6 +767,64 @@ def validate_corpus(corpus: Any, expected_profile: str) -> None:
 
     if expected_profile == "release" and counts != RELEASE_CATEGORY_COUNTS:
         raise ConfigError(f"release category counts must be {RELEASE_CATEGORY_COUNTS}, got {counts}")
+    if expected_profile == "release":
+        for category in sorted(ALLOWED_CATEGORIES):
+            actual_scenarios = {
+                scene["scenario"] for scene in scenes if scene["category"] == category
+            }
+            expected_scenarios = RELEASE_CATEGORY_SCENARIOS[category]
+            if actual_scenarios != expected_scenarios:
+                raise ConfigError(
+                    f"release {category} scenarios must be {sorted(expected_scenarios)}, "
+                    f"got {sorted(actual_scenarios)}"
+                )
+        scale_closure = {scale for scene in scenes for scale in scene["scale_lanes"]}
+        if scale_closure != ALLOWED_SCALE_LANES:
+            raise ConfigError(
+                f"release scale closure must be {sorted(ALLOWED_SCALE_LANES)}, "
+                f"got {sorted(scale_closure)}"
+            )
+        invalid_failure_types = {
+            scene["expected_outcome"]["failure_type"]
+            for scene in scenes
+            if scene["category"] == "invalid"
+        }
+        if invalid_failure_types != {
+            "disconnected_input",
+            "multiple_scenes",
+            "insufficient_overlap",
+        }:
+            raise ConfigError("release invalid scenario closure must retain three distinct failures")
+        valid_scenes = [scene for scene in scenes if scene["expected_outcome"] == {"kind": "valid"}]
+        core_scopes = {"scene_quality", "scene_performance", "suite_performance"}
+        for scene in valid_scenes:
+            if not core_scopes.issubset(scene["gate_scopes"]):
+                raise ConfigError(
+                    f"{scene['id']} must retain the scene_quality, scene_performance, "
+                    "and suite_performance core gate scopes"
+                )
+            if 3_000 in scene["scale_lanes"] and "long_sequence" not in scene["gate_scopes"]:
+                raise ConfigError(f"{scene['id']} 3000-frame lane must retain long_sequence gates")
+        for suite_scope in ("stability", "toolchain"):
+            if not any(suite_scope in scene["gate_scopes"] for scene in valid_scenes):
+                raise ConfigError(f"release corpus must retain at least one {suite_scope} gate owner")
+
+        large_area_traits = [
+            scene["capture_traits"]
+            for scene in scenes
+            if scene["category"] == "large_area_exterior"
+        ]
+        expected_large_area_traits = [
+            ["large_area", "loop", "ordered"],
+            ["forward_motion", "large_area", "ordered"],
+            ["large_area", "loop", "ordered"],
+            ["large_area", "nadir", "ordered"],
+        ]
+        if large_area_traits != expected_large_area_traits:
+            raise ConfigError(
+                "large_area_exterior slots must cover a ground loop, forward route, "
+                "oblique loop, and nadir route in manifest order"
+            )
 
 
 def validate_reference_config(config: Any) -> None:
@@ -382,7 +833,19 @@ def validate_reference_config(config: Any) -> None:
     if root["schema_version"] != 1:
         raise ConfigError("reference config schema_version must be 1")
     references = _require_mapping(root["references"], "references")
-    _require_exact_keys(references, {"accurate_colmap", "rendering"}, "references")
+    _require_exact_keys(
+        references,
+        {"paired_baseline", "accurate_colmap", "rendering"},
+        "references",
+    )
+    baseline = _require_mapping(references["paired_baseline"], "references.paired_baseline")
+    _require_exact_keys(
+        baseline,
+        {"git_commit", "toolchain_identity", "run_configuration"},
+        "references.paired_baseline",
+    )
+    if baseline != APPROVED_PAIRED_BASELINE:
+        raise ConfigError("references.paired_baseline must remain frozen to the approved baseline")
     colmap = _require_mapping(references["accurate_colmap"], "references.accurate_colmap")
     _require_exact_keys(colmap, {"mapper", "bundle_adjustment"}, "references.accurate_colmap")
     if colmap != {"mapper": "mapper", "bundle_adjustment": "full"}:
@@ -470,46 +933,48 @@ def _metric(metrics: Mapping[str, Any], name: str, blocking: list[str]) -> Any:
     return raw["value"]
 
 
-def evaluate_gates(metrics: Mapping[str, Any], thresholds: Mapping[str, Any]) -> dict[str, Any]:
+def evaluate_gates(
+    metrics: Mapping[str, Any],
+    thresholds: Mapping[str, Any],
+    *,
+    gate_scopes: Iterable[str] | None = None,
+    scale: int = 30,
+) -> dict[str, Any]:
+    if gate_scopes is None:
+        selected_scopes = sorted(ALLOWED_GATE_SCOPES - {"invalid_input"})
+    else:
+        selected_scopes = list(gate_scopes)
+        if (
+            not selected_scopes
+            or any(scope not in ALLOWED_GATE_SCOPES for scope in selected_scopes)
+            or len(selected_scopes) != len(set(selected_scopes))
+        ):
+            raise ConfigError("gate_scopes must be a nonempty list of supported scopes")
+    if "invalid_input" in selected_scopes:
+        raise ConfigError("invalid_input scenes must use evaluate_invalid_scene")
+
     blocking: list[str] = []
     failures = metric_validation_failures(metrics)
     if failures:
         return {"status": "failed", "blocking_reasons": [], "failures": failures}
-    values = {name: _metric(metrics, name, blocking) for name in (
-        "registered_views",
-        "total_views",
-        "colmap_registered_views",
-        "residual_provenance",
-        "residual_median_pixels",
-        "residual_p90_pixels",
-        "ate_colmap_ratio",
-        "rotation_rpe_delta_degrees",
-        "translation_rpe_delta_percentage_points",
-        "balanced_median_psnr_loss_db",
-        "balanced_median_ssim_loss",
-        "balanced_median_lpips_increase",
-        "balanced_scene_psnr_loss_db",
-        "balanced_scene_ssim_loss",
-        "balanced_scene_lpips_increase",
-        "fast_scene_psnr_loss_db",
-        "fast_scene_ssim_loss",
-        "fast_scene_lpips_increase",
-        "fast_end_to_end_speedup",
-        "m4_max_p50_seconds",
-        "balanced_geometry_speedup",
-        "constrained_fast_p50_seconds",
-        "long_sequence_geometry_fps",
-        "long_sequence_frames",
-        "peak_memory_bytes",
-        "machine_memory_bytes",
-        "memory_lane",
-        "repeat_runs",
-        "crashes",
-        "corrupt_outputs",
-        "normal_photo_toolchain_bytes",
-        "large_area_toolchain_bytes",
-        "deterministic_restart",
-    )}
+    required_metrics = set().union(*(GATE_SCOPE_METRICS[scope] for scope in selected_scopes))
+    orientation_status = metrics.get("orientation_status")
+    if "scene_quality" in selected_scopes and isinstance(orientation_status, Mapping):
+        if orientation_status.get("availability") == "measured" and orientation_status.get("value") in {
+            "verified",
+            "axis_aligned_sign_unverified",
+        }:
+            required_metrics.update(
+                {
+                    "orientation_median_residual_degrees",
+                    "orientation_p90_residual_degrees",
+                    "orientation_bootstrap_p95_degrees",
+                    "orientation_physical_up_error_degrees",
+                }
+            )
+            if orientation_status.get("value") == "verified":
+                required_metrics.add("orientation_sign_correct")
+    values = {name: _metric(metrics, name, blocking) for name in sorted(required_metrics)}
     if blocking:
         return {"status": "blocked", "blocking_reasons": blocking, "failures": failures}
 
@@ -521,80 +986,156 @@ def evaluate_gates(metrics: Mapping[str, Any], thresholds: Mapping[str, Any]) ->
         if not isinstance(values[name], (int, float)) or isinstance(values[name], bool) or values[name] < limit:
             failures.append(f"{name} is below minimum {limit}")
 
-    total = values["total_views"]
-    registered = values["registered_views"]
-    colmap_registered = values["colmap_registered_views"]
-    if not isinstance(total, (int, float)) or total <= 0:
-        failures.append("total_views must be positive")
-    elif registered / total < thresholds["coverage"]["absolute_min"]:
-        failures.append("coverage.absolute is below minimum")
-    if isinstance(registered, int) and isinstance(total, int) and registered > total:
-        failures.append("registered_views exceeds total_views")
-    if not isinstance(colmap_registered, (int, float)) or colmap_registered <= 0:
-        failures.append("colmap_registered_views must be positive")
-    elif registered / colmap_registered < thresholds["coverage"]["colmap_relative_min"]:
-        failures.append("coverage.colmap_relative is below minimum")
+    if "scene_quality" in selected_scopes:
+        total = values["total_views"]
+        registered = values["registered_views"]
+        colmap_registered = values["colmap_registered_views"]
+        baseline_registered = values["baseline_registered_views"]
+        if not isinstance(total, (int, float)) or total <= 0:
+            failures.append("total_views must be positive")
+        elif registered / total < thresholds["coverage"]["absolute_min"]:
+            failures.append("coverage.absolute is below minimum")
+        if isinstance(registered, int) and isinstance(total, int) and registered > total:
+            failures.append("registered_views exceeds total_views")
+        if not isinstance(colmap_registered, (int, float)) or colmap_registered <= 0:
+            failures.append("colmap_registered_views must be positive")
+        elif registered / colmap_registered < thresholds["coverage"]["colmap_relative_min"]:
+            failures.append("coverage.colmap_relative is below minimum")
+        if not isinstance(baseline_registered, int) or baseline_registered <= 0:
+            failures.append("baseline_registered_views must be positive")
+        elif isinstance(registered, int):
+            allowed_loss = min(2, math.floor(baseline_registered * 0.01))
+            if registered < baseline_registered - allowed_loss:
+                failures.append("coverage.paired_baseline loses too many registered views")
 
-    if values["residual_provenance"] != "track_reprojection":
-        failures.append("residual_provenance is not real track reprojection")
-    maximum("residual_median_pixels", thresholds["residual_pixels"]["median_max"])
-    maximum("residual_p90_pixels", thresholds["residual_pixels"]["p90_max"])
-    if values["residual_p90_pixels"] < values["residual_median_pixels"]:
-        failures.append("residual_p90_pixels is below residual_median_pixels")
-    maximum("ate_colmap_ratio", thresholds["pose"]["ate_colmap_ratio_max"])
-    maximum("rotation_rpe_delta_degrees", thresholds["pose"]["rotation_rpe_delta_degrees_max"])
-    maximum(
-        "translation_rpe_delta_percentage_points",
-        thresholds["pose"]["translation_rpe_delta_percentage_points_max"],
-    )
-    for name, key in (
-        ("balanced_median_psnr_loss_db", "median_psnr_loss_db_max"),
-        ("balanced_median_ssim_loss", "median_ssim_loss_max"),
-        ("balanced_median_lpips_increase", "median_lpips_increase_max"),
-        ("balanced_scene_psnr_loss_db", "scene_psnr_loss_db_max"),
-        ("balanced_scene_ssim_loss", "scene_ssim_loss_max"),
-        ("balanced_scene_lpips_increase", "scene_lpips_increase_max"),
-    ):
-        maximum(name, thresholds["balanced_rendering"][key])
-    for name, key in (
-        ("fast_scene_psnr_loss_db", "scene_psnr_loss_db_max"),
-        ("fast_scene_ssim_loss", "scene_ssim_loss_max"),
-        ("fast_scene_lpips_increase", "scene_lpips_increase_max"),
-    ):
-        maximum(name, thresholds["fast_rendering"][key])
-    minimum("fast_end_to_end_speedup", thresholds["fast_rendering"]["end_to_end_speedup_min"])
-    maximum("m4_max_p50_seconds", thresholds["speed"]["m4_max_p50_seconds_max"])
-    minimum("balanced_geometry_speedup", thresholds["speed"]["balanced_speedup_min"])
-    maximum("constrained_fast_p50_seconds", thresholds["speed"]["constrained_fast_p50_seconds_max"])
-    minimum("long_sequence_geometry_fps", thresholds["long_sequence"]["inference_fps_min"])
-    minimum("long_sequence_frames", thresholds["long_sequence"]["sustained_frames_min"])
-
-    lane = values["memory_lane"]
-    if lane == "eight_gb_fast":
-        maximum("peak_memory_bytes", thresholds["memory"]["eight_gb_fast_bytes_max"])
-    elif lane == "constrained":
-        maximum("peak_memory_bytes", thresholds["memory"]["constrained_bytes_max"])
-    elif lane == "larger":
+        if values["residual_provenance"] != "track_reprojection":
+            failures.append("residual_provenance is not real track reprojection")
+        maximum("residual_median_pixels", thresholds["residual_pixels"]["median_max"])
+        maximum("residual_p90_pixels", thresholds["residual_pixels"]["p90_max"])
+        if values["residual_p90_pixels"] < values["residual_median_pixels"]:
+            failures.append("residual_p90_pixels is below residual_median_pixels")
+        maximum("ate_colmap_ratio", thresholds["pose"]["ate_colmap_ratio_max"])
+        maximum("rotation_rpe_delta_degrees", thresholds["pose"]["rotation_rpe_delta_degrees_max"])
         maximum(
-            "peak_memory_bytes",
-            values["machine_memory_bytes"] * thresholds["memory"]["larger_fraction_max"],
+            "translation_rpe_delta_percentage_points",
+            thresholds["pose"]["translation_rpe_delta_percentage_points_max"],
         )
-    else:
-        failures.append("memory_lane is unsupported")
-    if values["peak_memory_bytes"] > values["machine_memory_bytes"]:
-        failures.append("peak_memory_bytes exceeds machine_memory_bytes")
+        for name, key in (
+            ("balanced_scene_psnr_loss_db", "scene_psnr_loss_db_max"),
+            ("balanced_scene_ssim_loss", "scene_ssim_loss_max"),
+            ("balanced_scene_lpips_increase", "scene_lpips_increase_max"),
+        ):
+            maximum(name, thresholds["balanced_rendering"][key])
+        for name, key in (
+            ("fast_scene_psnr_loss_db", "scene_psnr_loss_db_max"),
+            ("fast_scene_ssim_loss", "scene_ssim_loss_max"),
+            ("fast_scene_lpips_increase", "scene_lpips_increase_max"),
+        ):
+            maximum(name, thresholds["fast_rendering"][key])
+        for name, key in (
+            ("paired_balanced_scene_psnr_loss_db", "scene_psnr_loss_db_max"),
+            ("paired_balanced_scene_ssim_loss", "scene_ssim_loss_max"),
+            ("paired_balanced_scene_lpips_increase", "scene_lpips_increase_max"),
+        ):
+            maximum(name, thresholds["paired_baseline_rendering"][key])
+        if values["attempted_pairs"] > values["scheduled_pairs"]:
+            failures.append("attempted_pairs exceeds scheduled_pairs")
+        if values["raw_matched_pairs"] > values["attempted_pairs"]:
+            failures.append("raw_matched_pairs exceeds attempted_pairs")
+        if values["spatially_verified_pairs"] > values["raw_matched_pairs"]:
+            failures.append("spatially_verified_pairs exceeds raw_matched_pairs")
+        if values["connected_components"] != 1:
+            failures.append("verified pair graph is disconnected")
+        if values["isolated_views"] != 0:
+            failures.append("verified pair graph contains isolated views")
+        if values["dropped_intersection_count"] != 0:
+            failures.append("rasterization dropped intersections")
+        minimum("output_splat_count", 1)
+        if values["orientation_status"] in {"verified", "axis_aligned_sign_unverified"}:
+            maximum(
+                "orientation_median_residual_degrees",
+                thresholds["orientation"]["median_residual_degrees_max"],
+            )
+            maximum(
+                "orientation_p90_residual_degrees",
+                thresholds["orientation"]["p90_residual_degrees_max"],
+            )
+            maximum(
+                "orientation_bootstrap_p95_degrees",
+                thresholds["orientation"]["bootstrap_p95_degrees_max"],
+            )
+            maximum(
+                "orientation_physical_up_error_degrees",
+                thresholds["orientation"]["physical_up_error_degrees_max"],
+            )
+        if values["orientation_status"] == "verified" and values["orientation_sign_correct"] is not True:
+            failures.append("verified orientation has the wrong upright sign")
 
-    minimum("repeat_runs", thresholds["stability"]["repeat_runs_min"])
-    maximum("crashes", thresholds["stability"]["crashes_max"])
-    maximum("corrupt_outputs", thresholds["stability"]["corrupt_outputs_max"])
-    if values["crashes"] > values["repeat_runs"]:
-        failures.append("crashes exceeds repeat_runs")
-    if values["corrupt_outputs"] > values["repeat_runs"]:
-        failures.append("corrupt_outputs exceeds repeat_runs")
-    maximum("normal_photo_toolchain_bytes", thresholds["toolchain"]["normal_photo_bytes_max"])
-    maximum("large_area_toolchain_bytes", thresholds["toolchain"]["large_area_bytes_max"])
-    if thresholds["stability"]["deterministic_restart_required"] and values["deterministic_restart"] is not True:
-        failures.append("deterministic_restart must be true")
+    if "suite_performance" in selected_scopes:
+        minimum("fast_end_to_end_speedup", thresholds["fast_rendering"]["end_to_end_speedup_min"])
+        scale_limit = thresholds["speed"]["m4_max_balanced_p50_seconds_max_by_scale"].get(str(scale))
+        if scale_limit is not None:
+            maximum("m4_max_p50_seconds", scale_limit)
+
+    if "long_sequence" in selected_scopes:
+        minimum("long_sequence_analysis_fps", thresholds["long_sequence"]["analysis_fps_min"])
+        minimum("long_sequence_frames", thresholds["long_sequence"]["sustained_frames_min"])
+        maximum(
+            "long_sequence_rss_growth_fraction",
+            thresholds["long_sequence"]["rss_growth_fraction_max"],
+        )
+
+    if "scene_performance" in selected_scopes:
+        lane = values["memory_lane"]
+        unified_memory_peak = max(
+            values["peak_memory_bytes"],
+            values["peak_metal_allocated_bytes"],
+        )
+        if lane == "eight_gb_fast":
+            unified_memory_limit = thresholds["memory"]["eight_gb_fast_bytes_max"]
+        elif lane == "constrained":
+            unified_memory_limit = thresholds["memory"]["constrained_bytes_max"]
+        elif lane == "larger":
+            unified_memory_limit = (
+                values["machine_memory_bytes"] * thresholds["memory"]["larger_fraction_max"]
+            )
+        else:
+            failures.append("memory_lane is unsupported")
+            unified_memory_limit = None
+        if unified_memory_limit is not None and unified_memory_peak > unified_memory_limit:
+            failures.append(f"unified memory peak exceeds maximum {unified_memory_limit}")
+        if unified_memory_peak > values["machine_memory_bytes"]:
+            failures.append("unified memory peak exceeds machine_memory_bytes")
+
+    if "stability" in selected_scopes:
+        minimum("repeat_runs", thresholds["stability"]["repeat_runs_min"])
+        maximum("crashes", thresholds["stability"]["crashes_max"])
+        maximum("corrupt_outputs", thresholds["stability"]["corrupt_outputs_max"])
+        if values["crashes"] > values["repeat_runs"]:
+            failures.append("crashes exceeds repeat_runs")
+        if values["corrupt_outputs"] > values["repeat_runs"]:
+            failures.append("corrupt_outputs exceeds repeat_runs")
+        if (
+            thresholds["stability"]["deterministic_restart_required"]
+            and values["deterministic_restart"] is not True
+        ):
+            failures.append("deterministic_restart must be true")
+
+    if "toolchain" in selected_scopes:
+        maximum("normal_photo_toolchain_bytes", thresholds["toolchain"]["normal_photo_bytes_max"])
+        maximum("large_area_toolchain_bytes", thresholds["toolchain"]["large_area_bytes_max"])
+        for name in (
+            "toolchain_fresh_install",
+            "toolchain_cached_offline_run",
+            "toolchain_interrupted_download_recovered",
+            "toolchain_low_disk_rejected",
+            "toolchain_wrong_key_rejected",
+            "toolchain_corrupt_archive_rejected",
+            "toolchain_rollback_succeeded",
+            "toolchain_traversal_rejected",
+        ):
+            if values[name] is not True:
+                failures.append(f"{name} must be true")
 
     return {
         "status": "failed" if failures else "passed",
@@ -737,6 +1278,9 @@ def build_dry_run_plan(
             {
                 "id": scene["id"],
                 "category": scene["category"],
+                "scenario": scene["scenario"],
+                "capture_traits": scene["capture_traits"],
+                "gate_scopes": scene["gate_scopes"],
                 "expected_outcome": scene["expected_outcome"],
                 "runs": [
                     {
@@ -810,6 +1354,22 @@ def digest_input(path: Path) -> str:
     return "sha256:" + hasher.hexdigest()
 
 
+def _record_unique_release_input_digest(
+    scene: Mapping[str, Any],
+    input_digest: str,
+    seen: dict[str, str],
+) -> None:
+    """Reject one capture presented as multiple release-corpus scenes."""
+    if not scene["input"]["supplied"]:
+        return
+    previous_scene = seen.get(input_digest)
+    if previous_scene is not None:
+        raise ConfigError(
+            f"release inputs {previous_scene} and {scene['id']} have the same content digest"
+        )
+    seen[input_digest] = scene["id"]
+
+
 def _stable_file_sha256(path: Path, label: str) -> str:
     with path.open("rb") as handle:
         before = os.fstat(handle.fileno())
@@ -830,45 +1390,138 @@ def _stable_file_sha256(path: Path, label: str) -> str:
     return hasher.hexdigest()
 
 
-def _validated_toolchain_closure(toolchain_root: Path) -> Mapping[str, Any] | None:
-    state_path = toolchain_root / ".easysplat_toolchain_state.json"
-    manifest_path = toolchain_root / "manifest.json"
-    if state_path.is_file() and not state_path.is_symlink():
-        if state_path.stat().st_size > MAX_TOOLCHAIN_INSTALL_STATE_BYTES:
-            raise ConfigError("toolchain install state exceeds its size limit")
-        state = _load_json(state_path, "toolchain install state")
-        if not isinstance(state, dict):
-            raise ConfigError("toolchain install state must be an object")
-        manifest = state.get("signedManifest")
-        installed_artifacts = state.get("installedArtifacts")
-        installed_capabilities = state.get("installedCapabilities")
-        if state.get("schemaVersion") != 2:
-            raise ConfigError("toolchain install state schema is unsupported")
-    elif manifest_path.is_file() and not manifest_path.is_symlink():
-        manifest = _load_json(manifest_path, "toolchain manifest")
-        if not isinstance(manifest, dict):
-            raise ConfigError("toolchain manifest must be an object")
-        components_value = manifest.get("components")
-        if not isinstance(components_value, list):
-            raise ConfigError("toolchain manifest components are invalid")
-        installed_artifacts = {
-            component.get("name"): component.get("sha256")
-            for component in components_value
-            if isinstance(component, dict)
-        }
-        installed_capabilities = sorted(
-            capability
-            for component in components_value
-            if isinstance(component, dict)
-            for capability in component.get("capabilities", [])
+def _semantic_version(value: Any, label: str) -> tuple[int, int, int, tuple[str, ...] | None]:
+    if not isinstance(value, str):
+        raise ConfigError(f"{label} is not a semantic version")
+    match = re.fullmatch(
+        r"(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(?:-([0-9A-Za-z.-]+))?",
+        value,
+    )
+    if match is None:
+        raise ConfigError(f"{label} is not a semantic version")
+    prerelease = tuple(match.group(4).split(".")) if match.group(4) else None
+    if prerelease is not None and any(
+        not token or (token.isdigit() and len(token) > 1 and token.startswith("0"))
+        for token in prerelease
+    ):
+        raise ConfigError(f"{label} is not a semantic version")
+    return int(match.group(1)), int(match.group(2)), int(match.group(3)), prerelease
+
+
+def _compare_semantic_versions(left: str, right: str) -> int:
+    left_major, left_minor, left_patch, left_pre = _semantic_version(left, "version")
+    right_major, right_minor, right_patch, right_pre = _semantic_version(right, "version")
+    left_core = (left_major, left_minor, left_patch)
+    right_core = (right_major, right_minor, right_patch)
+    if left_core != right_core:
+        return -1 if left_core < right_core else 1
+    if left_pre is None or right_pre is None:
+        return 0 if left_pre is right_pre else 1 if left_pre is None else -1
+    for left_token, right_token in zip(left_pre, right_pre, strict=False):
+        if left_token == right_token:
+            continue
+        left_numeric = left_token.isdigit()
+        right_numeric = right_token.isdigit()
+        if left_numeric and right_numeric:
+            return -1 if int(left_token) < int(right_token) else 1
+        if left_numeric != right_numeric:
+            return -1 if left_numeric else 1
+        return -1 if left_token < right_token else 1
+    return (len(left_pre) > len(right_pre)) - (len(left_pre) < len(right_pre))
+
+
+def _verify_toolchain_manifest_signature(
+    manifest: Mapping[str, Any],
+    public_key_base64: str,
+) -> None:
+    try:
+        from cryptography.exceptions import InvalidSignature
+        from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
+    except ImportError as error:
+        raise ConfigError(
+            "release toolchain signature verification requires the pinned benchmark environment"
+        ) from error
+    try:
+        public_key = base64.b64decode(public_key_base64, validate=True)
+        signature = base64.b64decode(str(manifest.get("signatureEd25519", "")), validate=True)
+    except (ValueError, TypeError) as error:
+        raise ConfigError("toolchain signed manifest signature is invalid") from error
+    if len(public_key) != 32 or len(signature) != 64:
+        raise ConfigError("toolchain signed manifest signature is invalid")
+    if manifest.get("keyID") != hashlib.sha256(public_key).hexdigest():
+        raise ConfigError("toolchain signed manifest key identifier is invalid")
+    unsigned = dict(manifest)
+    unsigned["signatureEd25519"] = ""
+    published_at = unsigned.get("publishedAt")
+    if isinstance(published_at, bool) or not isinstance(published_at, (int, float, str)):
+        raise ConfigError("toolchain signed manifest publication date is invalid")
+    if isinstance(published_at, (int, float)):
+        if not math.isfinite(float(published_at)):
+            raise ConfigError("toolchain signed manifest publication date is invalid")
+        apple_reference_unix_seconds = 978_307_200
+        published_date = datetime.fromtimestamp(
+            apple_reference_unix_seconds + float(published_at),
+            tz=timezone.utc,
         )
     else:
+        try:
+            published_date = datetime.fromisoformat(published_at.replace("Z", "+00:00"))
+        except ValueError as error:
+            raise ConfigError("toolchain signed manifest publication date is invalid") from error
+        if published_date.tzinfo is None:
+            raise ConfigError("toolchain signed manifest publication date is invalid")
+        published_date = published_date.astimezone(timezone.utc)
+    unsigned["publishedAt"] = published_date.strftime("%Y-%m-%dT%H:%M:%SZ")
+    try:
+        Ed25519PublicKey.from_public_bytes(public_key).verify(
+            signature,
+            canonical_json_bytes(unsigned),
+        )
+    except (InvalidSignature, ValueError) as error:
+        raise ConfigError("toolchain signed manifest signature is invalid") from error
+
+
+def _validated_toolchain_closure(
+    toolchain_root: Path,
+    public_key_base64: str,
+) -> Mapping[str, Any] | None:
+    state_path = toolchain_root / ".easysplat_toolchain_state.json"
+    if not state_path.is_file() or state_path.is_symlink():
         return None
+    if state_path.stat().st_size > MAX_TOOLCHAIN_INSTALL_STATE_BYTES:
+        raise ConfigError("toolchain install state exceeds its size limit")
+    state = _load_json(state_path, "toolchain install state")
+    if not isinstance(state, dict):
+        raise ConfigError("toolchain install state must be an object")
+    required_state_fields = {
+        "schemaVersion",
+        "installedArtifacts",
+        "installedCapabilities",
+        "signedManifest",
+    }
+    if not required_state_fields.issubset(state):
+        raise ConfigError("toolchain install state is incomplete")
+    manifest = state.get("signedManifest")
+    installed_artifacts = state.get("installedArtifacts")
+    installed_capabilities = state.get("installedCapabilities")
+    if state.get("schemaVersion") != 2:
+        raise ConfigError("toolchain install state schema is unsupported")
 
     if not isinstance(manifest, dict):
         raise ConfigError("toolchain install state has no signed manifest")
+    manifest_fields = {
+        "schemaVersion",
+        "toolchainAPI",
+        "keyID",
+        "version",
+        "publishedAt",
+        "appVersionRange",
+        "components",
+        "signatureEd25519",
+    }
     if (
-        manifest.get("schemaVersion") != 2
+        set(manifest) != manifest_fields
+        or manifest.get("schemaVersion") != 2
         or manifest.get("toolchainAPI") != 2
         or not isinstance(manifest.get("version"), str)
         or not isinstance(manifest.get("signatureEd25519"), str)
@@ -877,40 +1530,105 @@ def _validated_toolchain_closure(toolchain_root: Path) -> Mapping[str, Any] | No
         or re.fullmatch(r"[0-9a-f]{64}", manifest["keyID"]) is None
     ):
         raise ConfigError("toolchain signed manifest identity is invalid")
+    _semantic_version(manifest["version"], "toolchain version")
+    _verify_toolchain_manifest_signature(manifest, public_key_base64)
     components = manifest.get("components")
     if not isinstance(components, list) or not components:
         raise ConfigError("toolchain signed manifest has no components")
     if not isinstance(installed_artifacts, dict) or not isinstance(installed_capabilities, list):
         raise ConfigError("toolchain install state component closure is invalid")
+    normalized_installed = {
+        key: value.lower() if isinstance(value, str) else value
+        for key, value in installed_artifacts.items()
+    }
+    if (
+        not normalized_installed
+        or any(
+            not isinstance(name, str)
+            or SAFE_TOKEN_PATTERN.fullmatch(name) is None
+            or not isinstance(digest, str)
+            or re.fullmatch(r"[0-9a-f]{64}", digest) is None
+            for name, digest in normalized_installed.items()
+        )
+        or any(
+            not isinstance(capability, str) or SAFE_TOKEN_PATTERN.fullmatch(capability) is None
+            for capability in installed_capabilities
+        )
+        or len(installed_capabilities) != len(set(installed_capabilities))
+    ):
+        raise ConfigError("toolchain install state component closure is invalid")
+    installed_names = set(normalized_installed)
 
     normalized_components: list[dict[str, Any]] = []
     component_names: set[str] = set()
-    manifest_capabilities: set[str] = set()
     manifest_artifacts: dict[str, str] = {}
+    components_by_name: dict[str, Mapping[str, Any]] = {}
     canonical_root = toolchain_root.resolve()
     for component in components:
         if not isinstance(component, dict):
             raise ConfigError("toolchain manifest component must be an object")
+        component_fields = {
+            "name",
+            "capabilities",
+            "url",
+            "sha256",
+            "sizeBytes",
+            "expandedSizeBytes",
+            "contents",
+            "criticalFileHashes",
+            "dependencies",
+            "requirement",
+        }
         name = component.get("name")
         capabilities = component.get("capabilities")
         digest = component.get("sha256")
         critical_hashes = component.get("criticalFileHashes")
+        contents = component.get("contents")
+        dependencies = component.get("dependencies")
         if (
-            not isinstance(name, str)
+            set(component) != component_fields
+            or not isinstance(name, str)
             or SAFE_TOKEN_PATTERN.fullmatch(name) is None
             or name in component_names
             or not isinstance(capabilities, list)
             or not capabilities
+            or len(capabilities) != len(set(capabilities))
             or not all(isinstance(value, str) and SAFE_TOKEN_PATTERN.fullmatch(value) for value in capabilities)
             or not isinstance(digest, str)
             or re.fullmatch(r"[0-9a-f]{64}", digest) is None
             or not isinstance(critical_hashes, dict)
             or not critical_hashes
+            or not isinstance(contents, list)
+            or not contents
+            or len(contents) != len(set(contents))
+            or not isinstance(dependencies, list)
+            or len(dependencies) != len(set(dependencies))
+            or not all(
+                isinstance(value, str) and SAFE_TOKEN_PATTERN.fullmatch(value)
+                for value in dependencies
+            )
+            or component.get("requirement") not in {"required", "optional"}
+            or type(component.get("sizeBytes")) is not int
+            or component["sizeBytes"] <= 0
+            or type(component.get("expandedSizeBytes")) is not int
+            or component["expandedSizeBytes"] < component["sizeBytes"]
+            or not isinstance(component.get("url"), str)
+            or not component["url"].startswith("https://")
         ):
             raise ConfigError("toolchain manifest component identity is invalid")
         component_names.add(name)
-        manifest_capabilities.update(capabilities)
         manifest_artifacts[name] = digest
+        components_by_name[name] = component
+        for relative in contents:
+            if not isinstance(relative, str):
+                raise ConfigError(f"toolchain content path is invalid: {name}")
+            content_path = PurePosixPath(relative)
+            if (
+                content_path.is_absolute()
+                or "\\" in relative
+                or any(part in {"", ".", ".."} for part in content_path.parts)
+            ):
+                raise ConfigError(f"toolchain content path is unsafe: {relative}")
         for relative, expected_hash in critical_hashes.items():
             if (
                 not isinstance(relative, str)
@@ -921,14 +1639,20 @@ def _validated_toolchain_closure(toolchain_root: Path) -> Mapping[str, Any] | No
             path = PurePosixPath(relative)
             if path.is_absolute() or "\\" in relative or any(part in {"", ".", ".."} for part in path.parts):
                 raise ConfigError(f"toolchain critical-file path is unsafe: {relative}")
-            target = toolchain_root.joinpath(*path.parts)
-            if target.is_symlink() or not target.is_file():
-                raise ConfigError(f"toolchain critical file is missing or unsafe: {relative}")
-            resolved = target.resolve(strict=True)
-            if resolved != canonical_root and canonical_root not in resolved.parents:
-                raise ConfigError(f"toolchain critical file escapes its root: {relative}")
-            if _stable_file_sha256(target, f"toolchain critical file {relative}") != expected_hash:
-                raise ConfigError(f"toolchain critical file does not match its signed digest: {relative}")
+            if name in installed_names:
+                target = toolchain_root.joinpath(*path.parts)
+                if target.is_symlink() or not target.is_file():
+                    raise ConfigError(f"toolchain critical file is missing or unsafe: {relative}")
+                resolved = target.resolve(strict=True)
+                if resolved != canonical_root and canonical_root not in resolved.parents:
+                    raise ConfigError(f"toolchain critical file escapes its root: {relative}")
+                if (
+                    _stable_file_sha256(target, f"toolchain critical file {relative}")
+                    != expected_hash
+                ):
+                    raise ConfigError(
+                        f"toolchain critical file does not match its signed digest: {relative}"
+                    )
         normalized_components.append(
             {
                 key: component.get(key)
@@ -947,15 +1671,46 @@ def _validated_toolchain_closure(toolchain_root: Path) -> Mapping[str, Any] | No
             }
         )
 
-    normalized_installed = {
-        key: value.lower() if isinstance(value, str) else value
-        for key, value in installed_artifacts.items()
+    if not installed_names.issubset(component_names):
+        raise ConfigError("toolchain install state contains an unknown component")
+    if "macos-arm64-core" not in installed_names:
+        raise ConfigError("toolchain install state is missing its core component")
+    for name in installed_names:
+        if normalized_installed[name] != manifest_artifacts[name]:
+            raise ConfigError(f"toolchain installed artifact digest is invalid: {name}")
+        missing_dependencies = set(components_by_name[name]["dependencies"]) - installed_names
+        if missing_dependencies:
+            raise ConfigError(
+                f"toolchain installed component {name} is missing dependencies: "
+                + ", ".join(sorted(missing_dependencies))
+            )
+    selected_capabilities = {
+        capability
+        for name in installed_names
+        for capability in components_by_name[name]["capabilities"]
     }
-    if normalized_installed != manifest_artifacts or set(installed_capabilities) != manifest_capabilities:
-        raise ConfigError("toolchain install state does not contain the complete component closure")
+    if set(installed_capabilities) != selected_capabilities:
+        raise ConfigError("toolchain installed capability receipt does not match its components")
     app_range = manifest.get("appVersionRange")
-    if not isinstance(app_range, dict) or not isinstance(app_range.get("minimum"), str):
+    if (
+        not isinstance(app_range, dict)
+        or set(app_range) - {"minimum", "maximumExclusive"}
+        or "minimum" not in app_range
+        or not isinstance(app_range.get("minimum"), str)
+        or (
+            app_range.get("maximumExclusive") is not None
+            and not isinstance(app_range.get("maximumExclusive"), str)
+        )
+    ):
         raise ConfigError("toolchain app-version range is invalid")
+    _semantic_version(app_range["minimum"], "toolchain minimum app version")
+    maximum = app_range.get("maximumExclusive")
+    if maximum is not None:
+        _semantic_version(maximum, "toolchain maximum app version")
+    if _compare_semantic_versions(APP_VERSION, app_range["minimum"]) < 0 or (
+        maximum is not None and _compare_semantic_versions(APP_VERSION, maximum) >= 0
+    ):
+        raise ConfigError("toolchain signed manifest is incompatible with this app version")
     return {
         "schema_version": 2,
         "toolchain_api": 2,
@@ -967,23 +1722,32 @@ def _validated_toolchain_closure(toolchain_root: Path) -> Mapping[str, Any] | No
         },
         "signature_ed25519": manifest["signatureEd25519"],
         "components": sorted(normalized_components, key=lambda value: value["name"]),
-        "installed_artifacts": dict(sorted(manifest_artifacts.items())),
-        "installed_capabilities": sorted(manifest_capabilities),
+        "installed_artifacts": dict(sorted(normalized_installed.items())),
+        "installed_capabilities": sorted(selected_capabilities),
     }
 
 
-def resolved_toolchain_identity(toolchain_root: Path, profile: str) -> str | None:
+def resolved_toolchain_identity(
+    toolchain_root: Path,
+    profile: str,
+    *,
+    public_key_base64: str | None = None,
+) -> str | None:
     if profile == "smoke":
         return "fixture:smoke"
     if not toolchain_root.is_dir() or toolchain_root.is_symlink():
         return None
-    closure = _validated_toolchain_closure(toolchain_root)
+    if public_key_base64 is None:
+        try:
+            public_key_base64 = PINNED_TOOLCHAIN_PUBLIC_KEY_PATH.read_text(
+                encoding="utf-8"
+            ).strip()
+        except OSError as error:
+            raise ConfigError("pinned toolchain public key is unavailable") from error
+    closure = _validated_toolchain_closure(toolchain_root, public_key_base64)
     if closure is None:
         return None
-    hasher = hashlib.sha256()
-    _hash_length_prefixed(hasher, b"easysplat-benchmark-toolchain-v2")
-    _hash_length_prefixed(hasher, canonical_json_bytes(closure))
-    return "sha256:" + hasher.hexdigest()
+    return evidence.toolchain_identity_from_closure(closure)
 
 
 def make_run_identity(
@@ -1013,9 +1777,15 @@ def make_run_identity(
     )
 
 
-def required_evidence_lanes(scale: int) -> tuple[str, ...]:
-    lanes = [evidence.LANE_REFERENCE, evidence.LANE_CONSTRAINED]
-    if scale <= 120:
+def required_evidence_lanes(scene: Mapping[str, Any], scale: int) -> tuple[str, ...]:
+    lanes = [evidence.LANE_REFERENCE]
+    if scene["expected_outcome"] == {"kind": "valid"} and scale <= 120:
+        lanes.append(evidence.LANE_CONSTRAINED)
+    if (
+        scene["expected_outcome"] == {"kind": "valid"}
+        and scale == 30
+        and scene["category"] in {"object_orbit", "interior_walkthrough", "low_light"}
+    ):
         lanes.append(evidence.LANE_EIGHT_GB)
     return tuple(lanes)
 
@@ -1053,6 +1823,10 @@ def validate_request_index(
             "git_commit",
             "app_version",
             "toolchain_identity",
+            "baseline_git_commit",
+            "baseline_toolchain_identity",
+            "baseline_configuration_digest",
+            "baseline_run_configuration",
             "runner_identities",
             "requests",
         },
@@ -1068,6 +1842,10 @@ def validate_request_index(
         "git_commit": identity.git_commit,
         "app_version": identity.app_version,
         "toolchain_identity": identity.toolchain_identity,
+        "baseline_git_commit": APPROVED_PAIRED_BASELINE["git_commit"],
+        "baseline_toolchain_identity": APPROVED_PAIRED_BASELINE["toolchain_identity"],
+        "baseline_configuration_digest": sha256_json(APPROVED_PAIRED_BASELINE["run_configuration"]),
+        "baseline_run_configuration": APPROVED_PAIRED_BASELINE["run_configuration"],
     }
     for field, expected_value in expected.items():
         if index[field] != expected_value:
@@ -1104,7 +1882,7 @@ def validate_request_index(
         lane = entry["lane"]
         if scene is None or type(scale) is not int or scale not in scene["scale_lanes"]:
             raise ConfigError(f"{label} scene or scale is not declared by the corpus")
-        if lane not in required_evidence_lanes(scale):
+        if lane not in required_evidence_lanes(scene, scale):
             raise ConfigError(f"{label}.lane is not required for this scale")
         run = (scene_id, scale, lane)
         if run in actual_runs:
@@ -1125,7 +1903,7 @@ def validate_request_index(
         (scene["id"], scale, lane)
         for scene in corpus["scenes"]
         for scale in scene["scale_lanes"]
-        for lane in required_evidence_lanes(scale)
+        for lane in required_evidence_lanes(scene, scale)
     }
     if actual_runs != expected_runs:
         raise ConfigError("request index does not contain the exact corpus lane closure")
@@ -1154,7 +1932,7 @@ def _requirements(
                 missing_evidence.append({"scene_id": scene["id"], "path": scene["adapter"]["result_path"]})
         else:
             for scale in scene["scale_lanes"]:
-                for lane in required_evidence_lanes(scale):
+                for lane in required_evidence_lanes(scene, scale):
                     relative = (
                         PurePosixPath(scene["adapter"]["evidence_path"])
                         / str(scale)
@@ -1327,13 +2105,17 @@ def validate_suite_result(result: Any) -> None:
         raise ConfigError("suite result.scene_results must be an array")
     scene_keys = {
         "scene_id",
+        "category",
+        "capture_traits",
         "scale",
+        "aggregate_scale",
         "adapter",
         "status",
         "blocking_reasons",
         "failures",
         "input_kind",
         "expected_outcome",
+        "gate_scopes",
         "route",
         "detail_profile",
         "exit",
@@ -1347,12 +2129,34 @@ def validate_suite_result(result: Any) -> None:
         scene = _require_mapping(raw_scene, label)
         _require_exact_keys(scene, scene_keys, label)
         _require_safe_token(scene["scene_id"], f"{label}.scene_id")
+        if scene["category"] not in ALLOWED_CATEGORIES:
+            raise ConfigError(f"{label}.category is invalid")
+        capture_traits = scene["capture_traits"]
+        if (
+            not isinstance(capture_traits, list)
+            or not capture_traits
+            or any(trait not in ALLOWED_CAPTURE_TRAITS for trait in capture_traits)
+            or len(capture_traits) != len(set(capture_traits))
+            or capture_traits != sorted(capture_traits)
+        ):
+            raise ConfigError(f"{label}.capture_traits is invalid")
         if scene["scale"] not in ALLOWED_SCALE_LANES:
             raise ConfigError(f"{label}.scale is invalid")
+        if scene["aggregate_scale"] not in ALLOWED_SCALE_LANES:
+            raise ConfigError(f"{label}.aggregate_scale is invalid")
         if scene["adapter"] not in ALLOWED_ADAPTERS or scene["status"] not in {"passed", "failed", "blocked"}:
             raise ConfigError(f"{label} adapter or status is invalid")
         if scene["input_kind"] not in {"video", "photos", "mixed"}:
             raise ConfigError(f"{label}.input_kind is invalid")
+        gate_scopes = scene["gate_scopes"]
+        if (
+            not isinstance(gate_scopes, list)
+            or not gate_scopes
+            or any(scope not in ALLOWED_GATE_SCOPES for scope in gate_scopes)
+            or len(gate_scopes) != len(set(gate_scopes))
+            or gate_scopes != sorted(gate_scopes)
+        ):
+            raise ConfigError(f"{label}.gate_scopes is invalid")
         expected_outcome = _require_mapping(scene["expected_outcome"], f"{label}.expected_outcome")
         if expected_outcome.get("kind") == "valid":
             _require_exact_keys(expected_outcome, {"kind"}, f"{label}.expected_outcome")
@@ -1614,13 +2418,17 @@ def _copy_fixture_result(
     if not isinstance(raw, Mapping):
         return {
             "scene_id": scene["id"],
+            "category": scene["category"],
+            "capture_traits": scene["capture_traits"],
             "scale": scale,
+            "aggregate_scale": scene["aggregate_scale"],
             "adapter": "fixture",
             "status": "blocked",
             "blocking_reasons": [f"external result is missing scale {scale}"],
             "failures": [],
             "input_kind": scene["input"]["kind"],
             "expected_outcome": scene["expected_outcome"],
+            "gate_scopes": scene["gate_scopes"],
             "route": "fixture",
             "detail_profile": "benchmark",
             "exit": {"code": None, "reason": "not_available", "cancelled": False},
@@ -1649,19 +2457,28 @@ def _copy_fixture_result(
                 "failures": ["external run did not complete successfully with a valid output"],
             }
         else:
-            evaluation = evaluate_gates(metrics, APPROVED_THRESHOLDS)
+            evaluation = evaluate_gates(
+                metrics,
+                APPROVED_THRESHOLDS,
+                gate_scopes=scene["gate_scopes"],
+                scale=scale,
+            )
             if identity.profile == "release" and "output_ply" not in artifacts:
                 evaluation["status"] = "failed"
                 evaluation["failures"].append("release evidence is missing output_ply digest")
     return {
         "scene_id": scene["id"],
+        "category": scene["category"],
+        "capture_traits": scene["capture_traits"],
         "scale": scale,
+        "aggregate_scale": scene["aggregate_scale"],
         "adapter": "fixture",
         "status": evaluation["status"],
         "blocking_reasons": evaluation["blocking_reasons"],
         "failures": evaluation["failures"],
         "input_kind": scene["input"]["kind"],
         "expected_outcome": scene["expected_outcome"],
+        "gate_scopes": scene["gate_scopes"],
         "route": raw.get("route", "fixture"),
         "detail_profile": raw.get("detail_profile", "benchmark"),
         "exit": {
@@ -1679,24 +2496,143 @@ def _copy_fixture_result(
 def _evidence_request(
     scene: Mapping[str, Any],
     scale: int,
+    lane: str,
     identity: RunIdentity,
     input_digest: str,
 ) -> dict[str, Any]:
+    if lane not in required_evidence_lanes(scene, scale):
+        raise ConfigError(f"{scene['id']}@{scale} does not support the {lane} evidence lane")
+
+    traits = set(scene["capture_traits"])
+    input_kind = scene["input"]["kind"]
+    if input_kind == "photos" or "unordered" in traits:
+        topology = "unordered"
+        capture_path = "automatic"
+        temporal_pairing = "none"
+        temporal_offsets: list[int] = []
+        pairing_policy = "unordered_exhaustive" if scale <= 60 else "unordered_retrieval"
+        vocabulary_candidates = 0 if scale <= 60 else 20
+        vocabulary_neighbors = 0 if scale <= 60 else 8
+        vocabulary_stride = 1
+        ba_ratio = 1.1
+    elif input_kind == "mixed" or "segmented" in traits:
+        topology = "segmented_mixed"
+        capture_path = "automatic"
+        temporal_pairing = "linear"
+        temporal_offsets = [1, 2, 3, 4, 5, 6]
+        pairing_policy = "segmented_mixed"
+        vocabulary_candidates = 20
+        vocabulary_neighbors = 8
+        vocabulary_stride = 1
+        ba_ratio = 1.1
+    elif scene["category"] == "object_orbit":
+        topology = "continuous"
+        capture_path = "around_subject"
+        temporal_pairing = "multiscale"
+        temporal_offsets = [offset for offset in (1, 2, 4, 8, 16, 32, 64, 128) if offset < scale]
+        pairing_policy = "object_orbit"
+        vocabulary_candidates = 20 if scale >= 120 else 0
+        vocabulary_neighbors = 2 if scale >= 120 else 0
+        vocabulary_stride = 5
+        ba_ratio = 1.4
+    elif scene["category"] == "interior_walkthrough":
+        topology = "continuous"
+        capture_path = "through_space"
+        temporal_pairing = "linear"
+        temporal_offsets = [offset for offset in range(1, 7) if offset < scale]
+        pairing_policy = "walkthrough"
+        vocabulary_candidates = 20
+        vocabulary_neighbors = 2
+        vocabulary_stride = 10
+        ba_ratio = 1.4
+    elif scene["category"] == "large_area_exterior":
+        topology = "continuous"
+        capture_path = "large_area"
+        temporal_pairing = "multiscale"
+        temporal_offsets = [offset for offset in (1, 2, 4, 8, 16, 32, 64, 128) if offset < scale]
+        pairing_policy = "large_area"
+        vocabulary_candidates = 20
+        vocabulary_neighbors = 4
+        vocabulary_stride = 10
+        ba_ratio = 1.4
+    else:
+        topology = "continuous"
+        capture_path = "automatic"
+        temporal_pairing = "multiscale"
+        temporal_offsets = [offset for offset in (1, 2, 4, 8, 16, 32, 64, 128) if offset < scale]
+        pairing_policy = "generic_continuous"
+        vocabulary_candidates = 20 if scale >= 120 else 0
+        vocabulary_neighbors = 2 if scale >= 120 else 0
+        vocabulary_stride = 10
+        ba_ratio = 1.4
+
+    detail_profile = "balanced" if lane == evidence.LANE_REFERENCE else "fast"
+    split = scene["split"]
+    references = scene["reference"]
+    if scene["expected_outcome"]["kind"] == "invalid":
+        if split != {"status": "not_applicable"} or references != {
+            "status": "not_applicable"
+        }:
+            raise ConfigError(
+                f"{scene['id']} invalid evidence must not claim rendering or pose references"
+            )
+        holdout_indices: list[int] = []
+        reference_artifacts = {"status": "not_applicable"}
+    else:
+        if split.get("status") != "pinned" or references.get("status") != "pinned":
+            raise ConfigError(f"{scene['id']} cannot emit protected evidence with pending references")
+        holdout_indices = list(split["holdout_by_scale"][str(scale)])
+        reference_artifacts = dict(references["by_scale"][str(scale)])
+    candidate_configuration = {
+        "detail_profile": detail_profile,
+        "selected_frame_count": scale,
+        "capture_path": capture_path,
+        "input_topology": topology,
+        "camera_grouping": "automatic",
+        "lens_projection": "fisheye" if "fisheye" in traits else "automatic",
+        "resource_policy": "automatic" if lane == evidence.LANE_REFERENCE else "conserve_memory",
+        "compute_policy": "metal_for_supported_stages",
+        "pairing_policy": pairing_policy,
+        "temporal_pairing": temporal_pairing,
+        "temporal_offsets": temporal_offsets,
+        "vocabulary_candidate_count": vocabulary_candidates,
+        "vocabulary_verified_neighbor_count": vocabulary_neighbors,
+        "vocabulary_query_stride": vocabulary_stride,
+        "descriptor_matcher": "faiss",
+        "ba_global_frames_ratio": ba_ratio,
+        "ba_global_points_ratio": ba_ratio,
+        "ba_global_max_refinements": 5,
+        "trainer_iterations": 7_000 if detail_profile == "balanced" else 3_000,
+        "trainer_plateau_window": 800 if detail_profile == "balanced" else 400,
+        "deterministic_seed": 42,
+    }
     return {
-        "schema_version": 1,
+        "schema_version": 2,
         "binding": {
             "profile": identity.profile,
             "scene_id": scene["id"],
             "scale": scale,
+            "lane": lane,
             "input_digest": input_digest,
             "corpus_digest": identity.corpus_digest,
             "thresholds_digest": identity.thresholds_digest,
             "git_commit": identity.git_commit,
             "app_version": identity.app_version,
             "toolchain_identity": identity.toolchain_identity,
+            "baseline_git_commit": APPROVED_PAIRED_BASELINE["git_commit"],
+            "baseline_toolchain_identity": APPROVED_PAIRED_BASELINE["toolchain_identity"],
+            "baseline_configuration_digest": sha256_json(APPROVED_PAIRED_BASELINE["run_configuration"]),
         },
+        "baseline_run_configuration": APPROVED_PAIRED_BASELINE["run_configuration"],
+        "candidate_run_configuration": candidate_configuration,
+        "category": scene["category"],
+        "capture_traits": scene["capture_traits"],
+        "holdout_indices": holdout_indices,
+        "reference_artifacts": reference_artifacts,
+        "timing_basis": "selected_view_count",
         "expected_outcome": scene["expected_outcome"],
         "input_kind": scene["input"]["kind"],
+        "gate_scopes": scene["gate_scopes"],
     }
 
 
@@ -1710,6 +2646,7 @@ def _required_lane_metric(metrics: Mapping[str, Any], name: str, blocking: list[
 
 def _evaluate_protected_attestations(
     scene: Mapping[str, Any],
+    scale: int,
     attestations: Mapping[str, Mapping[str, Any]],
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     expected = scene["expected_outcome"]
@@ -1745,52 +2682,77 @@ def _evaluate_protected_attestations(
             failures.append(f"{lane} run did not complete with a valid output")
 
     reference_metrics = dict(reference["metrics"])
-    constrained = attestations[evidence.LANE_CONSTRAINED]
-    constrained_metrics = constrained["metrics"]
-    constrained_p50 = _required_lane_metric(
-        constrained_metrics,
-        "constrained_fast_p50_seconds",
-        blocking,
+    gate_evaluation = evaluate_gates(
+        reference_metrics,
+        APPROVED_THRESHOLDS,
+        gate_scopes=scene["gate_scopes"],
+        scale=scale,
     )
-    if constrained_p50 is not None:
-        reference_metrics["constrained_fast_p50_seconds"] = measured(constrained_p50)
-    gate_evaluation = evaluate_gates(reference_metrics, APPROVED_THRESHOLDS)
     failures.extend(gate_evaluation["failures"])
     blocking.extend(gate_evaluation["blocking_reasons"])
 
-    lane_contracts = (
-        (
-            evidence.LANE_REFERENCE,
-            "larger",
-            None,
-        ),
-        (
-            evidence.LANE_CONSTRAINED,
-            "constrained",
-            APPROVED_THRESHOLDS["memory"]["constrained_bytes_max"],
-        ),
-    )
-    if evidence.LANE_EIGHT_GB in attestations:
-        lane_contracts += (
+    if "suite_performance" in scene["gate_scopes"]:
+        low_memory_timing_contracts = (
+            (
+                evidence.LANE_CONSTRAINED,
+                "constrained_fast_p50_seconds",
+                APPROVED_THRESHOLDS["speed"]["constrained_fast_p50_seconds_max_by_scale"],
+            ),
             (
                 evidence.LANE_EIGHT_GB,
-                "eight_gb_fast",
-                APPROVED_THRESHOLDS["memory"]["eight_gb_fast_bytes_max"],
+                "eight_gb_fast_p50_seconds",
+                APPROVED_THRESHOLDS["speed"]["eight_gb_fast_p50_seconds_max_by_scale"],
             ),
         )
-    for lane, expected_memory_lane, maximum_peak in lane_contracts:
-        attestation = attestations[lane]
-        metrics = attestation["metrics"]
-        memory_lane = _required_lane_metric(metrics, "memory_lane", blocking)
-        machine_memory = _required_lane_metric(metrics, "machine_memory_bytes", blocking)
-        peak_memory = _required_lane_metric(metrics, "peak_memory_bytes", blocking)
-        if memory_lane is not None and memory_lane != expected_memory_lane:
-            failures.append(f"{lane} reports the wrong memory lane")
-        physical_memory = attestation["machine"].get("physical_memory_bytes")
-        if machine_memory is not None and machine_memory != physical_memory:
-            failures.append(f"{lane} memory metric does not match the attested machine")
-        if maximum_peak is not None and peak_memory is not None and peak_memory > maximum_peak:
-            failures.append(f"{lane} peak memory exceeds {maximum_peak}")
+        for lane, metric_name, limits in low_memory_timing_contracts:
+            limit = limits.get(str(scale))
+            if limit is None:
+                continue
+            attestation = attestations.get(lane)
+            if attestation is None:
+                blocking.append(f"required {lane} timing attestation is unavailable")
+                continue
+            value = _required_lane_metric(attestation["metrics"], metric_name, blocking)
+            if value is not None and value > limit:
+                failures.append(f"{lane} {metric_name} exceeds {limit}")
+
+    if "scene_performance" in scene["gate_scopes"]:
+        lane_contracts = (
+            (
+                evidence.LANE_REFERENCE,
+                "larger",
+                None,
+            ),
+        )
+        if evidence.LANE_CONSTRAINED in attestations:
+            lane_contracts += (
+                (
+                    evidence.LANE_CONSTRAINED,
+                    "constrained",
+                    APPROVED_THRESHOLDS["memory"]["constrained_bytes_max"],
+                ),
+            )
+        if evidence.LANE_EIGHT_GB in attestations:
+            lane_contracts += (
+                (
+                    evidence.LANE_EIGHT_GB,
+                    "eight_gb_fast",
+                    APPROVED_THRESHOLDS["memory"]["eight_gb_fast_bytes_max"],
+                ),
+            )
+        for lane, expected_memory_lane, maximum_peak in lane_contracts:
+            attestation = attestations[lane]
+            metrics = attestation["metrics"]
+            memory_lane = _required_lane_metric(metrics, "memory_lane", blocking)
+            machine_memory = _required_lane_metric(metrics, "machine_memory_bytes", blocking)
+            peak_memory = _required_lane_metric(metrics, "peak_memory_bytes", blocking)
+            if memory_lane is not None and memory_lane != expected_memory_lane:
+                failures.append(f"{lane} reports the wrong memory lane")
+            physical_memory = attestation["machine"].get("physical_memory_bytes")
+            if machine_memory is not None and machine_memory != physical_memory:
+                failures.append(f"{lane} memory metric does not match the attested machine")
+            if maximum_peak is not None and peak_memory is not None and peak_memory > maximum_peak:
+                failures.append(f"{lane} peak memory exceeds {maximum_peak}")
 
     return (
         {
@@ -1811,13 +2773,13 @@ def _copy_protected_evidence(
     key: bytes,
     runner_identities: Mapping[str, Mapping[str, str]],
 ) -> dict[str, Any]:
-    request = _evidence_request(scene, scale, identity, input_digest)
     evidence_root = corpus_directory / scene["adapter"]["evidence_path"] / str(scale)
     attestations: dict[str, Mapping[str, Any]] = {}
     summaries = []
     artifacts: dict[str, str] = {}
     verification_failures = []
-    for lane in required_evidence_lanes(scale):
+    for lane in required_evidence_lanes(scene, scale):
+        request = _evidence_request(scene, scale, lane, identity, input_digest)
         path = evidence_root / lane / "attestation.json"
         try:
             attestation = evidence.verify_attestation(
@@ -1853,7 +2815,7 @@ def _copy_protected_evidence(
         evaluation = {"status": "failed", "blocking_reasons": [], "failures": verification_failures}
         metrics: dict[str, Any] = {}
     else:
-        evaluation, metrics = _evaluate_protected_attestations(scene, attestations)
+        evaluation, metrics = _evaluate_protected_attestations(scene, scale, attestations)
     reference = attestations.get(evidence.LANE_REFERENCE)
     actual = reference.get("actual", {}) if isinstance(reference, Mapping) else {}
     try:
@@ -1862,13 +2824,17 @@ def _copy_protected_evidence(
         actual = {}
     return {
         "scene_id": scene["id"],
+        "category": scene["category"],
+        "capture_traits": scene["capture_traits"],
         "scale": scale,
+        "aggregate_scale": scene["aggregate_scale"],
         "adapter": "protected-evidence",
         "status": evaluation["status"],
         "blocking_reasons": evaluation["blocking_reasons"],
         "failures": evaluation["failures"],
         "input_kind": scene["input"]["kind"],
         "expected_outcome": scene["expected_outcome"],
+        "gate_scopes": scene["gate_scopes"],
         "route": "protected-evidence",
         "detail_profile": "release",
         "exit": {
@@ -1902,16 +2868,31 @@ def emit_evidence_requests(
     if git["dirty"]:
         raise ConfigError("cannot emit release evidence requests from a dirty Git worktree")
     identity = make_run_identity("release", corpus, config, toolchain_root, toolchain_identity)
-    destination.mkdir(parents=True, exist_ok=True)
-    requests = []
+    input_digests: dict[str, str] = {}
+    input_digest_owners: dict[str, str] = {}
     for scene in corpus["scenes"]:
         media = corpus_path.parent / scene["input"]["media_path"]
         if not scene["input"]["supplied"] or not media.exists():
             raise ConfigError(f"cannot emit evidence request without media for {scene['id']}")
-        input_digest = digest_input(media)
+        input_digests[scene["id"]] = digest_input(media)
+        _record_unique_release_input_digest(
+            scene,
+            input_digests[scene["id"]],
+            input_digest_owners,
+        )
+
+    destination.mkdir(parents=True, exist_ok=True)
+    requests = []
+    for scene in corpus["scenes"]:
         for scale in scene["scale_lanes"]:
-            request = _evidence_request(scene, scale, identity, input_digest)
-            for lane in required_evidence_lanes(scale):
+            for lane in required_evidence_lanes(scene, scale):
+                request = _evidence_request(
+                    scene,
+                    scale,
+                    lane,
+                    identity,
+                    input_digests[scene["id"]],
+                )
                 relative = Path(scene["id"]) / str(scale) / f"{lane}.request.json"
                 atomic_write_json(destination / relative, request)
                 requests.append(
@@ -1955,11 +2936,230 @@ def emit_evidence_requests(
         "git_commit": identity.git_commit,
         "app_version": identity.app_version,
         "toolchain_identity": identity.toolchain_identity,
+        "baseline_git_commit": APPROVED_PAIRED_BASELINE["git_commit"],
+        "baseline_toolchain_identity": APPROVED_PAIRED_BASELINE["toolchain_identity"],
+        "baseline_configuration_digest": sha256_json(APPROVED_PAIRED_BASELINE["run_configuration"]),
+        "baseline_run_configuration": APPROVED_PAIRED_BASELINE["run_configuration"],
         "runner_identities": approved_runners,
         "requests": requests,
     }
     atomic_write_json(destination / "index.json", index)
     return index
+
+
+def _geometric_mean(values: list[float]) -> float:
+    return math.exp(sum(math.log(value) for value in values) / len(values))
+
+
+def evaluate_suite_performance(
+    results: Iterable[Mapping[str, Any]],
+    thresholds: Mapping[str, Any],
+) -> dict[str, Any]:
+    selected = [
+        result
+        for result in results
+        if result.get("expected_outcome") == {"kind": "valid"}
+        and "suite_performance" in result.get("gate_scopes", [])
+    ]
+    if not selected:
+        return {
+            "status": "blocked",
+            "blocking_reasons": ["suite performance has no valid scoped runs"],
+            "failures": [],
+        }
+
+    blocking: list[str] = []
+    failures: list[str] = []
+
+    def speedup(result: Mapping[str, Any], name: str) -> float | None:
+        label = f"{result.get('scene_id', 'unknown')}@{result.get('scale', 'unknown')}"
+        metrics = result.get("metrics")
+        raw = metrics.get(name) if isinstance(metrics, Mapping) else None
+        if not isinstance(raw, Mapping) or raw.get("availability") != "measured":
+            blocking.append(f"{label}: required suite metric not available: {name}")
+            return None
+        value = raw.get("value")
+        if (
+            isinstance(value, bool)
+            or not isinstance(value, (int, float))
+            or not math.isfinite(value)
+            or value <= 0
+        ):
+            failures.append(f"{label}: {name} must be positive and finite")
+            return None
+        return float(value)
+
+    primary = [result for result in selected if result.get("scale") == result.get("aggregate_scale")]
+    if len(primary) != len({result.get("scene_id") for result in selected}):
+        blocking.append("suite performance is missing an exact primary scale for one or more scenes")
+    geometry_by_category: dict[str, list[float]] = {}
+    geometry_values: list[float] = []
+    matching_values: list[float] = []
+    ordered_mapping: list[float] = []
+    unordered_mapping: list[tuple[str, float]] = []
+    matching_scales = set(thresholds["speed"]["matching_speedup_scales"])
+    matching_scales_present: set[int] = set()
+    for result in selected:
+        category = result.get("category")
+        traits = result.get("capture_traits")
+        if category not in ALLOWED_CATEGORIES or not isinstance(traits, list):
+            blocking.append("suite performance result is missing category or capture traits")
+            continue
+        geometry = (
+            speedup(result, "balanced_geometry_speedup")
+            if result.get("scale") == result.get("aggregate_scale")
+            else None
+        )
+        if geometry is not None:
+            geometry_values.append(geometry)
+            geometry_by_category.setdefault(str(category), []).append(geometry)
+        if result.get("scale") in matching_scales:
+            matching_scales_present.add(result["scale"])
+            matching = speedup(result, "matching_speedup")
+            if matching is not None:
+                matching_values.append(matching)
+                if matching < 1.0:
+                    failures.append(
+                        f"{result.get('scene_id')}@{result.get('scale')}: matching is slower than baseline"
+                    )
+        if result.get("scale") != result.get("aggregate_scale"):
+            continue
+        mapping = speedup(result, "mapping_speedup")
+        if mapping is None:
+            continue
+        if "unordered" in traits or "segmented" in traits:
+            unordered_mapping.append((str(result.get("scene_id")), mapping))
+        elif "ordered" in traits:
+            ordered_mapping.append(mapping)
+        else:
+            blocking.append(
+                f"{result.get('scene_id')}@{result.get('scale')}: mapping topology is not declared"
+            )
+
+    speed = thresholds["speed"]
+    if geometry_values and _geometric_mean(geometry_values) < speed["geometry_geometric_mean_speedup_min"]:
+        failures.append("suite geometry geometric-mean speedup is below minimum")
+    for category, values in geometry_by_category.items():
+        if statistics.median(values) < speed["category_median_geometry_speedup_min"]:
+            failures.append(f"{category} median geometry speedup is below minimum")
+    if matching_scales_present != matching_scales:
+        blocking.append(
+            "matching speedup evidence must cover exactly scales "
+            + ", ".join(str(value) for value in sorted(matching_scales))
+        )
+    if not matching_values:
+        blocking.append("matching speedup evidence is unavailable at required scales")
+    elif _geometric_mean(matching_values) < speed["matching_geometric_mean_speedup_min"]:
+        failures.append("matching geometric-mean speedup is below minimum")
+    if not ordered_mapping:
+        blocking.append("ordered mapping speedup evidence is unavailable")
+    elif _geometric_mean(ordered_mapping) < speed["ordered_mapping_speedup_min"]:
+        failures.append("ordered mapping geometric-mean speedup is below minimum")
+    minimum_unordered_speedup = 1.0 / (1.0 + speed["unordered_mapping_regression_max_fraction"])
+    if not unordered_mapping:
+        blocking.append("unordered or segmented mapping speedup evidence is unavailable")
+    for scene_id, mapping in unordered_mapping:
+        if mapping < minimum_unordered_speedup:
+            failures.append(f"{scene_id}: unordered mapping regresses more than allowed")
+
+    return {
+        "status": "blocked" if blocking else "failed" if failures else "passed",
+        "blocking_reasons": blocking,
+        "failures": failures,
+    }
+
+
+def evaluate_suite_quality(
+    results: Iterable[Mapping[str, Any]],
+    thresholds: Mapping[str, Any],
+) -> dict[str, Any]:
+    scoped = [
+        result
+        for result in results
+        if result.get("expected_outcome") == {"kind": "valid"}
+        and "scene_quality" in result.get("gate_scopes", [])
+    ]
+    if not scoped:
+        return {
+            "status": "blocked",
+            "blocking_reasons": ["suite quality has no scoped scene evidence"],
+            "failures": [],
+        }
+    blocking: list[str] = []
+    failures: list[str] = []
+    selected = [
+        result for result in scoped if result.get("scale") == result.get("aggregate_scale")
+    ]
+    primary_counts: dict[str, int] = {}
+    for result in selected:
+        scene_id = str(result.get("scene_id"))
+        primary_counts[scene_id] = primary_counts.get(scene_id, 0) + 1
+    scoped_scene_ids = {str(result.get("scene_id")) for result in scoped}
+    invalid_primary = sorted(
+        scene_id for scene_id in scoped_scene_ids if primary_counts.get(scene_id) != 1
+    )
+    if invalid_primary:
+        blocking.append(
+            "suite quality requires exactly one primary scale for: " + ", ".join(invalid_primary)
+        )
+
+    def values(name: str) -> tuple[list[float], dict[str, list[float]]]:
+        measured_values: list[float] = []
+        by_category: dict[str, list[float]] = {}
+        for result in selected:
+            category = result.get("category")
+            if category not in ALLOWED_CATEGORIES or category == "invalid":
+                blocking.append(
+                    f"{result.get('scene_id')}: suite quality category is unavailable"
+                )
+                continue
+            raw = result.get("metrics", {}).get(name)
+            if not isinstance(raw, Mapping) or raw.get("availability") != "measured":
+                blocking.append(f"{result.get('scene_id')}: suite quality metric unavailable: {name}")
+                continue
+            value = raw.get("value")
+            if (
+                isinstance(value, bool)
+                or not isinstance(value, (int, float))
+                or not math.isfinite(value)
+                or value < 0
+            ):
+                failures.append(f"{result.get('scene_id')}: {name} must be finite and nonnegative")
+                continue
+            numeric = float(value)
+            measured_values.append(numeric)
+            by_category.setdefault(str(category), []).append(numeric)
+        return measured_values, by_category
+
+    checks = (
+        ("balanced_scene_psnr_loss_db", thresholds["balanced_rendering"]["median_psnr_loss_db_max"]),
+        ("balanced_scene_ssim_loss", thresholds["balanced_rendering"]["median_ssim_loss_max"]),
+        ("balanced_scene_lpips_increase", thresholds["balanced_rendering"]["median_lpips_increase_max"]),
+        (
+            "paired_balanced_scene_psnr_loss_db",
+            thresholds["paired_baseline_rendering"]["median_psnr_loss_db_max"],
+        ),
+        (
+            "paired_balanced_scene_ssim_loss",
+            thresholds["paired_baseline_rendering"]["median_ssim_loss_max"],
+        ),
+        (
+            "paired_balanced_scene_lpips_increase",
+            thresholds["paired_baseline_rendering"]["median_lpips_increase_max"],
+        ),
+    )
+    for name, limit in checks:
+        metric_values, category_values = values(name)
+        if metric_values and statistics.median(metric_values) > limit:
+            failures.append(f"suite median {name} exceeds maximum {limit}")
+        for category, measured_values in sorted(category_values.items()):
+            if statistics.median(measured_values) > limit:
+                failures.append(f"{category} median {name} exceeds maximum {limit}")
+    return {
+        "status": "blocked" if blocking else "failed" if failures else "passed",
+        "blocking_reasons": blocking,
+        "failures": failures,
+    }
 
 
 def _aggregate_scene_results(results: list[Mapping[str, Any]]) -> dict[str, Any]:
@@ -1972,7 +3172,7 @@ def _aggregate_scene_results(results: list[Mapping[str, Any]]) -> dict[str, Any]
                 wall_values.append(float(value))
     geometric_mean = None
     if wall_values:
-        geometric_mean = math.exp(sum(math.log(value) for value in wall_values) / len(wall_values))
+        geometric_mean = _geometric_mean(wall_values)
     return {
         "scene_scale_runs": len(results),
         "passed": sum(result.get("status") == "passed" for result in results),
@@ -2081,8 +3281,15 @@ def run_suite(
         )
         approved_runners = request_index["runner_identities"]
     input_digests: dict[str, str] = {}
+    input_digest_owners: dict[str, str] = {}
     for scene in corpus["scenes"]:
         input_digests[scene["id"]] = digest_input(corpus_path.parent / scene["input"]["media_path"])
+        if profile == "release":
+            _record_unique_release_input_digest(
+                scene,
+                input_digests[scene["id"]],
+                input_digest_owners,
+            )
         for scale in scene["scale_lanes"]:
             if scene["adapter"]["type"] == "fixture":
                 scene_result = _copy_fixture_result(
@@ -2117,6 +3324,21 @@ def run_suite(
         for item in scene_results
         for failure in item["failures"]
     ]
+    if profile == "release":
+        suite_performance = evaluate_suite_performance(scene_results, APPROVED_THRESHOLDS)
+        suite_quality = evaluate_suite_quality(scene_results, APPROVED_THRESHOLDS)
+        result["blocking_reasons"].extend(
+            f"suite performance: {reason}" for reason in suite_performance["blocking_reasons"]
+        )
+        result["failures"].extend(
+            f"suite performance: {failure}" for failure in suite_performance["failures"]
+        )
+        result["blocking_reasons"].extend(
+            f"suite quality: {reason}" for reason in suite_quality["blocking_reasons"]
+        )
+        result["failures"].extend(
+            f"suite quality: {failure}" for failure in suite_quality["failures"]
+        )
     status = "blocked" if result["blocking_reasons"] else "failed" if result["failures"] else "passed"
     _finish_result(result, status)
     write_suite_result(output_directory / "suite.json", result)

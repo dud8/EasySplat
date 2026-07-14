@@ -141,4 +141,43 @@ if [ "${#RUNNER_IDENTITIES[@]}" -gt 0 ]; then
   done
 fi
 
+dependency_error="$(
+  /usr/bin/env python3 - "$ROOT/scripts/benchmark/requirements.txt" <<'PY'
+import importlib
+import importlib.metadata
+import re
+import sys
+from pathlib import Path
+
+issues = []
+for line in Path(sys.argv[1]).read_text(encoding="utf-8").splitlines():
+    match = re.match(r"^([A-Za-z0-9_.-]+)==([^ \\]+)", line)
+    if match is None:
+        continue
+    name, expected = match.groups()
+    try:
+        actual = importlib.metadata.version(name)
+    except importlib.metadata.PackageNotFoundError:
+        actual = "missing"
+    if actual != expected:
+        issues.append(f"{name}: expected {expected}, found {actual}")
+
+try:
+    importlib.import_module("cryptography")
+except Exception as error:
+    issues.append(f"cryptography: installed but cannot be imported ({type(error).__name__})")
+
+if issues:
+    print("\n".join(issues))
+    raise SystemExit(1)
+PY
+)" || {
+  echo "Benchmark Python dependencies are missing or do not match the lock:" >&2
+  echo "$dependency_error" >&2
+  echo >&2
+  echo "Install the hash-locked benchmark dependencies before retrying:" >&2
+  echo "  python3 -m pip install --require-hashes -r scripts/benchmark/requirements.txt" >&2
+  exit 69
+}
+
 exec /usr/bin/env python3 "${arguments[@]}"

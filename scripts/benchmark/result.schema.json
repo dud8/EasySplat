@@ -154,6 +154,53 @@
         {"$ref": "#/$defs/notAvailableMetric"}
       ]
     },
+    "orientationStatusMetric": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["availability"],
+      "properties": {
+        "availability": {"enum": ["measured", "not_available"]},
+        "value": {
+          "enum": ["verified", "axis_aligned_sign_unverified", "unresolved"]
+        },
+        "reason": {
+          "enum": [
+            "adapter_incomplete",
+            "not_measured",
+            "reference_unavailable",
+            "tool_unavailable",
+            "unsupported"
+          ]
+        }
+      },
+      "oneOf": [
+        {
+          "required": ["value"],
+          "properties": {"availability": {"const": "measured"}},
+          "not": {"required": ["reason"]}
+        },
+        {
+          "properties": {"availability": {"const": "not_available"}},
+          "not": {"required": ["value"]}
+        }
+      ]
+    },
+    "gateScopes": {
+      "type": "array",
+      "minItems": 1,
+      "uniqueItems": true,
+      "items": {
+        "enum": [
+          "scene_quality",
+          "scene_performance",
+          "suite_performance",
+          "long_sequence",
+          "stability",
+          "invalid_input",
+          "toolchain"
+        ]
+      }
+    },
     "metrics": {
       "type": "object",
       "additionalProperties": false,
@@ -161,8 +208,10 @@
         "registered_views": {"$ref": "#/$defs/nonnegativeIntegerMetric"},
         "total_views": {"$ref": "#/$defs/nonnegativeIntegerMetric"},
         "colmap_registered_views": {"$ref": "#/$defs/nonnegativeIntegerMetric"},
+        "baseline_registered_views": {"$ref": "#/$defs/nonnegativeIntegerMetric"},
         "points": {"$ref": "#/$defs/nonnegativeIntegerMetric"},
         "observations": {"$ref": "#/$defs/nonnegativeIntegerMetric"},
+        "output_splat_count": {"$ref": "#/$defs/nonnegativeIntegerMetric"},
         "residual_provenance": {"$ref": "#/$defs/residualProvenanceMetric"},
         "residual_median_pixels": {"$ref": "#/$defs/nonnegativeNumberMetric"},
         "residual_p90_pixels": {"$ref": "#/$defs/nonnegativeNumberMetric"},
@@ -178,13 +227,19 @@
         "fast_scene_psnr_loss_db": {"$ref": "#/$defs/nonnegativeNumberMetric"},
         "fast_scene_ssim_loss": {"$ref": "#/$defs/nonnegativeNumberMetric"},
         "fast_scene_lpips_increase": {"$ref": "#/$defs/nonnegativeNumberMetric"},
+        "paired_balanced_scene_psnr_loss_db": {"$ref": "#/$defs/nonnegativeNumberMetric"},
+        "paired_balanced_scene_ssim_loss": {"$ref": "#/$defs/nonnegativeNumberMetric"},
+        "paired_balanced_scene_lpips_increase": {"$ref": "#/$defs/nonnegativeNumberMetric"},
         "fast_end_to_end_speedup": {"$ref": "#/$defs/nonnegativeNumberMetric"},
         "m4_max_p50_seconds": {"$ref": "#/$defs/nonnegativeNumberMetric"},
         "balanced_geometry_speedup": {"$ref": "#/$defs/nonnegativeNumberMetric"},
         "constrained_fast_p50_seconds": {"$ref": "#/$defs/nonnegativeNumberMetric"},
-        "long_sequence_geometry_fps": {"$ref": "#/$defs/nonnegativeNumberMetric"},
+        "eight_gb_fast_p50_seconds": {"$ref": "#/$defs/nonnegativeNumberMetric"},
+        "long_sequence_analysis_fps": {"$ref": "#/$defs/nonnegativeNumberMetric"},
         "long_sequence_frames": {"$ref": "#/$defs/nonnegativeIntegerMetric"},
+        "long_sequence_rss_growth_fraction": {"$ref": "#/$defs/nonnegativeNumberMetric"},
         "peak_memory_bytes": {"$ref": "#/$defs/nonnegativeIntegerMetric"},
+        "peak_metal_allocated_bytes": {"$ref": "#/$defs/nonnegativeIntegerMetric"},
         "machine_memory_bytes": {"$ref": "#/$defs/nonnegativeIntegerMetric"},
         "memory_lane": {"$ref": "#/$defs/memoryLaneMetric"},
         "repeat_runs": {"$ref": "#/$defs/nonnegativeIntegerMetric"},
@@ -193,10 +248,41 @@
         "normal_photo_toolchain_bytes": {"$ref": "#/$defs/nonnegativeIntegerMetric"},
         "large_area_toolchain_bytes": {"$ref": "#/$defs/nonnegativeIntegerMetric"},
         "deterministic_restart": {"$ref": "#/$defs/booleanMetric"},
+        "toolchain_fresh_install": {"$ref": "#/$defs/booleanMetric"},
+        "toolchain_cached_offline_run": {"$ref": "#/$defs/booleanMetric"},
+        "toolchain_interrupted_download_recovered": {"$ref": "#/$defs/booleanMetric"},
+        "toolchain_low_disk_rejected": {"$ref": "#/$defs/booleanMetric"},
+        "toolchain_wrong_key_rejected": {"$ref": "#/$defs/booleanMetric"},
+        "toolchain_corrupt_archive_rejected": {"$ref": "#/$defs/booleanMetric"},
+        "toolchain_rollback_succeeded": {"$ref": "#/$defs/booleanMetric"},
+        "toolchain_traversal_rejected": {"$ref": "#/$defs/booleanMetric"},
         "wall_time_seconds": {"$ref": "#/$defs/nonnegativeNumberMetric"},
         "geometry_seconds": {"$ref": "#/$defs/nonnegativeNumberMetric"},
         "training_seconds": {"$ref": "#/$defs/nonnegativeNumberMetric"},
-        "max_resident_set_size_bytes": {"$ref": "#/$defs/nonnegativeIntegerMetric"}
+        "max_resident_set_size_bytes": {"$ref": "#/$defs/nonnegativeIntegerMetric"},
+        "scheduled_pairs": {"$ref": "#/$defs/nonnegativeIntegerMetric"},
+        "attempted_pairs": {"$ref": "#/$defs/nonnegativeIntegerMetric"},
+        "raw_matched_pairs": {"$ref": "#/$defs/nonnegativeIntegerMetric"},
+        "spatially_verified_pairs": {"$ref": "#/$defs/nonnegativeIntegerMetric"},
+        "connected_components": {"$ref": "#/$defs/nonnegativeIntegerMetric"},
+        "isolated_views": {"$ref": "#/$defs/nonnegativeIntegerMetric"},
+        "local_pairs": {"$ref": "#/$defs/nonnegativeIntegerMetric"},
+        "retrieval_pairs": {"$ref": "#/$defs/nonnegativeIntegerMetric"},
+        "loop_pairs": {"$ref": "#/$defs/nonnegativeIntegerMetric"},
+        "matcher_seconds": {"$ref": "#/$defs/nonnegativeNumberMetric"},
+        "mapping_seconds": {"$ref": "#/$defs/nonnegativeNumberMetric"},
+        "matching_speedup": {"$ref": "#/$defs/nonnegativeNumberMetric"},
+        "mapping_speedup": {"$ref": "#/$defs/nonnegativeNumberMetric"},
+        "bundle_adjustment_cycles": {"$ref": "#/$defs/nonnegativeIntegerMetric"},
+        "orientation_status": {"$ref": "#/$defs/orientationStatusMetric"},
+        "orientation_median_residual_degrees": {"$ref": "#/$defs/nonnegativeNumberMetric"},
+        "orientation_p90_residual_degrees": {"$ref": "#/$defs/nonnegativeNumberMetric"},
+        "orientation_bootstrap_p95_degrees": {"$ref": "#/$defs/nonnegativeNumberMetric"},
+        "orientation_physical_up_error_degrees": {"$ref": "#/$defs/nonnegativeNumberMetric"},
+        "orientation_sign_correct": {"$ref": "#/$defs/booleanMetric"},
+        "raster_fallback_count": {"$ref": "#/$defs/nonnegativeIntegerMetric"},
+        "maximum_tile_intersections": {"$ref": "#/$defs/nonnegativeIntegerMetric"},
+        "dropped_intersection_count": {"$ref": "#/$defs/nonnegativeIntegerMetric"}
       }
     },
     "sceneResult": {
@@ -204,13 +290,17 @@
       "additionalProperties": false,
       "required": [
         "scene_id",
+        "category",
+        "capture_traits",
         "scale",
+        "aggregate_scale",
         "adapter",
         "status",
         "blocking_reasons",
         "failures",
         "input_kind",
         "expected_outcome",
+        "gate_scopes",
         "route",
         "detail_profile",
         "exit",
@@ -221,7 +311,38 @@
       ],
       "properties": {
         "scene_id": {"type": "string", "minLength": 1},
+        "category": {
+          "enum": [
+            "object_orbit",
+            "interior_walkthrough",
+            "professional_photos",
+            "large_area_exterior",
+            "low_light",
+            "invalid"
+          ]
+        },
+        "capture_traits": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": {
+            "enum": [
+              "ordered",
+              "unordered",
+              "segmented",
+              "loop",
+              "forward_motion",
+              "mixed_intrinsics",
+              "fisheye",
+              "large_area",
+              "low_texture",
+              "low_light",
+              "nadir"
+            ]
+          }
+        },
         "scale": {"enum": [30, 120, 250, 500, 3000]},
+        "aggregate_scale": {"enum": [30, 120, 250, 500, 3000]},
         "adapter": {"enum": ["fixture", "protected-evidence"]},
         "status": {"enum": ["passed", "failed", "blocked"]},
         "blocking_reasons": {"$ref": "#/$defs/stringArray"},
@@ -246,6 +367,7 @@
             }
           ]
         },
+        "gate_scopes": {"$ref": "#/$defs/gateScopes"},
         "route": {"type": "string", "pattern": "^[a-z0-9][a-z0-9_.-]{0,63}$"},
         "detail_profile": {"type": "string", "pattern": "^[a-z0-9][a-z0-9_.-]{0,63}$"},
         "exit": {
@@ -310,8 +432,8 @@
       "additionalProperties": false,
       "required": ["protocol_version", "version", "executable", "sha256"],
       "properties": {
-        "protocol_version": {"const": 1},
-        "version": {"const": "1.0.0"},
+        "protocol_version": {"const": 2},
+        "version": {"const": "2.0.0"},
         "executable": {"const": "scripts/benchmark/evidence_protocol.py"},
         "sha256": {"$ref": "#/$defs/sha256"}
       }
