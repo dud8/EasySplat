@@ -164,6 +164,8 @@ Novelty is not a shipping criterion. Code, weights, training data, transitive li
 
 An untracked local single-capture diagnostic explains why DA3 is not the default, but is not release evidence. A 29-view Base run at 336 px spent 1.39 seconds in the model forward pass and 3.61 seconds in the full DA3 bridge, followed by a separately timed 32-second refinement. The bridge reported a 15.74 GB peak footprint. It registered every view with low aggregate residuals, but several cameras had weak track support. The 392 px variant contained a camera with only two observations and a 25× adjacent-position jump; a same-frame COLMAP comparison also showed a grossly different camera path. The fast result was not trustworthy.
 
+The default route has a separate local end-to-end sanity result on an M4 Max with 48 GB. A 9.54-second 4K HEVC drone clip selected 30 frames at the persisted 3 FPS analysis rate, registered 30/30 views, produced 4,728 sparse points and 43,709 observations at 0.55 px mean reprojection error, then trained 247,750 Gaussians in 46.08 seconds. Input-to-validated-PLY time was 85.46 seconds with 2.61 GB maximum resident memory, down from 258.77 seconds for the earlier 1,600 px/55-frame plan. This proves the signed-cache COLMAP-to-Metal path on one real capture; it does not replace the release corpus or held-out rendering gates.
+
 The next learned route must use a bounded initializer subset, register the remaining selected views into one canonical model, reject weak per-view topology, and pass true held-out PSNR, SSIM, and LPIPS comparisons. Until then, direct COLMAP is the honest default.
 
 ## Native training
