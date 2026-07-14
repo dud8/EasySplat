@@ -4926,18 +4926,26 @@ class RunnerIntegrityTests(unittest.TestCase):
     def test_measurement_process_allows_a_child_to_finish_within_the_drain(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
+            started = root / "drained-child-started"
             marker = root / "drained-child-marker"
             child = (
                 "import pathlib,time; "
-                "time.sleep(0.15); "
+                f"pathlib.Path({str(started)!r}).write_text('started'); "
+                "time.sleep(0.02); "
                 f"pathlib.Path({str(marker)!r}).write_text('finished')"
             )
             command = [
                 "/usr/bin/python3",
                 "-c",
                 (
-                    "import subprocess,sys; "
-                    f"subprocess.Popen([sys.executable, '-c', {child!r}])"
+                    "import pathlib,subprocess,sys,time\n"
+                    f"started = pathlib.Path({str(started)!r})\n"
+                    f"subprocess.Popen([sys.executable, '-c', {child!r}])\n"
+                    "deadline = time.monotonic() + 1.0\n"
+                    "while not started.exists() and time.monotonic() < deadline:\n"
+                    "    time.sleep(0.001)\n"
+                    "if not started.exists():\n"
+                    "    raise RuntimeError('child did not start')\n"
                 ),
             ]
             with (
