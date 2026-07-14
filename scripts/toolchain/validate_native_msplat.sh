@@ -79,6 +79,7 @@ expected_keys = {
     "executable_sha256",
     "metallib_sha256",
     "ninja",
+    "numeric_stability_patch_sha256",
     "overlay_sha256",
     "patch_sha256",
     "source_commit",
@@ -105,6 +106,7 @@ exact_values = {
     "overlay_sha256": "26b10371a53485608d292603468e5d24fca65ed2558fb77e512ef1ee51a29723",
     "patch_sha256": "fafbf6f43a3be474a708607a903fc0dbb0029a4d4664c261a1ebaf301f3e9f3f",
     "checkpoint_patch_sha256": "c8b9a8dd03afb4bc50b8a12adf78dc46f5280d67bb62823c58aff2305a4870dc",
+    "numeric_stability_patch_sha256": "231586b17e4f47c8c55432a631e08bf293b31a92f8d6ec49b367d11632350ec3",
     "deployment_target": "macOS 15.0",
     "build_configuration": "Release",
 }
@@ -143,6 +145,7 @@ for key in (
     "overlay_sha256",
     "patch_sha256",
     "checkpoint_patch_sha256",
+    "numeric_stability_patch_sha256",
     "executable_sha256",
     "metallib_sha256",
 ):

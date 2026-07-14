@@ -1,0 +1,41 @@
+diff --git a/core/metal/msplat_metal.metal b/core/metal/msplat_metal.metal
+--- a/core/metal/msplat_metal.metal
++++ b/core/metal/msplat_metal.metal
+@@ -1658,3 +1658,8 @@
+-    float gx = xys_grad[idx * 2];
+-    float gy = xys_grad[idx * 2 + 1];
+-    xys_grad_norm[idx] += sqrt(gx * gx + gy * gy);
++    float gx = isfinite(xys_grad[idx * 2])
++        ? clamp(xys_grad[idx * 2], -1.0e10f, 1.0e10f)
++        : 0.0f;
++    float gy = isfinite(xys_grad[idx * 2 + 1])
++        ? clamp(xys_grad[idx * 2 + 1], -1.0e10f, 1.0e10f)
++        : 0.0f;
++    float gradient_norm = sqrt(gx * gx + gy * gy);
++    if (isfinite(gradient_norm)) xys_grad_norm[idx] += gradient_norm;
+@@ -1681,5 +1686,9 @@
+-    float g = grads[tid];
+-    float m = fma(beta1, exp_avg[tid], (1.0f - beta1) * g);
+-    float v = fma(beta2, exp_avg_sq[tid], (1.0f - beta2) * g * g);
+-
+-    params[tid] -= step_size * m / (sqrt(v) / bc2_sqrt + eps);
++    float g = isfinite(grads[tid]) ? clamp(grads[tid], -1.0e10f, 1.0e10f) : 0.0f;
++    float previous_m = isfinite(exp_avg[tid]) ? exp_avg[tid] : 0.0f;
++    float previous_v = isfinite(exp_avg_sq[tid]) && exp_avg_sq[tid] >= 0.0f
++        ? exp_avg_sq[tid]
++        : 0.0f;
++    float m = fma(beta1, previous_m, (1.0f - beta1) * g);
++    float v = fma(beta2, previous_v, (1.0f - beta2) * g * g);
++    float candidate = params[tid] - step_size * m / (sqrt(v) / bc2_sqrt + eps);
++    if (isfinite(candidate)) params[tid] = candidate;
+@@ -1795,3 +1804,7 @@
+-    float m = fma(beta1, ea, (1.0f - beta1) * grad);
+-    float v = fma(beta2, eas, (1.0f - beta2) * grad * grad);
+-    param -= step_size * m / (sqrt(v) / bc2_sqrt + eps);
++    float g = isfinite(grad) ? clamp(grad, -1.0e10f, 1.0e10f) : 0.0f;
++    float previous_m = isfinite(ea) ? ea : 0.0f;
++    float previous_v = isfinite(eas) && eas >= 0.0f ? eas : 0.0f;
++    float m = fma(beta1, previous_m, (1.0f - beta1) * g);
++    float v = fma(beta2, previous_v, (1.0f - beta2) * g * g);
++    float candidate = param - step_size * m / (sqrt(v) / bc2_sqrt + eps);
++    if (isfinite(candidate)) param = candidate;

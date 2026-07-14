@@ -15,6 +15,8 @@ BACKUP_DIR="$INSTALL_PARENT/msplat.previous.$$"
 OVERLAY="$ROOT/Tools/MsplatNative/msplat.cpp"
 UPSTREAM_PATCH="$ROOT/Tools/MsplatNative/msplat-1.1.3-easysplat.patch"
 CHECKPOINT_PATCH="$ROOT/Tools/MsplatNative/msplat-1.1.3-checkpoint.patch"
+NUMERIC_STABILITY_PATCH="$ROOT/Tools/MsplatNative/msplat-1.1.3-numeric-stability.patch"
+NUMERIC_STABILITY_PATCH_SHA256="231586b17e4f47c8c55432a631e08bf293b31a92f8d6ec49b367d11632350ec3"
 
 MSPLAT_REPO="https://github.com/rayanht/msplat.git"
 MSPLAT_COMMIT="106499b0a53f82b0c92d013b0861fbebd341b17e"
@@ -69,6 +71,9 @@ preflight() {
   [ -f "$OVERLAY" ] || die "missing CLI overlay: $OVERLAY"
   [ -f "$UPSTREAM_PATCH" ] || die "missing upstream patch: $UPSTREAM_PATCH"
   [ -f "$CHECKPOINT_PATCH" ] || die "missing checkpoint patch: $CHECKPOINT_PATCH"
+  [ -f "$NUMERIC_STABILITY_PATCH" ] || die "missing numeric-stability patch: $NUMERIC_STABILITY_PATCH"
+  [ "$(sha256 "$NUMERIC_STABILITY_PATCH")" = "$NUMERIC_STABILITY_PATCH_SHA256" ] \
+    || die "numeric-stability patch SHA-256 mismatch"
 }
 
 download_verified() {
@@ -143,6 +148,8 @@ prepare_source() {
   git -C "$SOURCE_DIR" apply --unidiff-zero "$UPSTREAM_PATCH"
   git -C "$SOURCE_DIR" apply --check "$CHECKPOINT_PATCH"
   git -C "$SOURCE_DIR" apply "$CHECKPOINT_PATCH"
+  git -C "$SOURCE_DIR" apply --unidiff-zero --check "$NUMERIC_STABILITY_PATCH"
+  git -C "$SOURCE_DIR" apply --unidiff-zero "$NUMERIC_STABILITY_PATCH"
 }
 
 configure_and_build() {
@@ -162,7 +169,7 @@ configure_and_build() {
 write_build_info() {
   local executable_sha256="$1"
   local metallib_sha256="$2"
-  local build_info compiler cmake_version ninja_version timestamp overlay_sha256 patch_sha256 checkpoint_patch_sha256
+  local build_info compiler cmake_version ninja_version timestamp overlay_sha256 patch_sha256 checkpoint_patch_sha256 numeric_stability_patch_sha256
   build_info="$STAGE_DIR/build_info.json"
   compiler="$(xcrun clang++ --version | head -n 1)"
   cmake_version="$(cmake --version | head -n 1)"
@@ -171,10 +178,11 @@ write_build_info() {
   overlay_sha256="$(sha256 "$OVERLAY")"
   patch_sha256="$(sha256 "$UPSTREAM_PATCH")"
   checkpoint_patch_sha256="$(sha256 "$CHECKPOINT_PATCH")"
+  numeric_stability_patch_sha256="$(sha256 "$NUMERIC_STABILITY_PATCH")"
 
   python3 - "$build_info" \
     "$MSPLAT_REPO" "$MSPLAT_COMMIT" "$MSPLAT_VERSION" "$SOURCE_TREE_SHA256" \
-    "$overlay_sha256" "$patch_sha256" "$checkpoint_patch_sha256" \
+    "$overlay_sha256" "$patch_sha256" "$checkpoint_patch_sha256" "$numeric_stability_patch_sha256" \
     "$NLOHMANN_JSON_SHA256" "$NANOFLANN_SHA256" "$CLI11_SHA256" \
     "$executable_sha256" "$metallib_sha256" \
     "$compiler" "$cmake_version" "$ninja_version" "$timestamp" <<'PY'
@@ -190,6 +198,7 @@ import sys
     overlay_sha256,
     patch_sha256,
     checkpoint_patch_sha256,
+    numeric_stability_patch_sha256,
     nlohmann_json_sha256,
     nanoflann_sha256,
     cli11_sha256,
@@ -210,6 +219,7 @@ payload = {
     "overlay_sha256": overlay_sha256,
     "patch_sha256": patch_sha256,
     "checkpoint_patch_sha256": checkpoint_patch_sha256,
+    "numeric_stability_patch_sha256": numeric_stability_patch_sha256,
     "dependencies": {
         "nlohmann_json_v3.11.3_sha256": nlohmann_json_sha256,
         "nanoflann_v1.5.5_sha256": nanoflann_sha256,

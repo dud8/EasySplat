@@ -87,10 +87,23 @@ def point(layout: str, index: int, count: int) -> tuple[float, float, float]:
     return cx + radius * math.cos(angle), cy + radius * math.sin(angle), cz + 0.06 * math.sin(index * 0.23)
 
 
-def write_cameras(path: Path) -> None:
+def write_cameras(path: Path, width: int, height: int) -> None:
+    focal_length = width * 0.9375
     with path.open("wb") as output:
         output.write(struct.pack("<Q", 1))
-        output.write(struct.pack("<iiQQ4d", 1, 1, 32, 32, 30.0, 30.0, 16.0, 16.0))
+        output.write(
+            struct.pack(
+                "<iiQQ4d",
+                1,
+                1,
+                width,
+                height,
+                focal_length,
+                focal_length,
+                width / 2,
+                height / 2,
+            )
+        )
 
 
 def write_images(path: Path, camera_count: int) -> None:
@@ -139,9 +152,16 @@ def generate(root: Path) -> None:
         images.mkdir(parents=True)
         sparse.mkdir(parents=True)
         camera_count = 4 + case_index % 5
+        numeric_stability_stress = case_index == 10
+        width, height = (320, 180) if numeric_stability_stress else (32, 32)
         for image_index in range(camera_count):
-            write_png(images / f"{image_index:04d}.png", 32, 32, case_index * 11 + image_index)
-        write_cameras(sparse / "cameras.bin")
+            write_png(
+                images / f"{image_index:04d}.png",
+                width,
+                height,
+                case_index * 11 + image_index,
+            )
+        write_cameras(sparse / "cameras.bin", width, height)
         write_images(sparse / "images.bin", camera_count)
         write_points(sparse / "points3D.bin", count, layout)
         fixtures.append(
@@ -149,7 +169,9 @@ def generate(root: Path) -> None:
                 "camera_count": camera_count,
                 "dataset": name,
                 "layout": layout,
+                "numeric_stability_stress": numeric_stability_stress,
                 "point_count": count,
+                "resolution": [width, height],
             }
         )
     (root / "manifest.json").write_text(

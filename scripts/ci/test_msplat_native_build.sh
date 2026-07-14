@@ -8,6 +8,7 @@ BUILD_SCRIPT="$ROOT/scripts/toolchain/build_msplat.sh"
 OVERLAY="$ROOT/Tools/MsplatNative/msplat.cpp"
 UPSTREAM_PATCH="$ROOT/Tools/MsplatNative/msplat-1.1.3-easysplat.patch"
 CHECKPOINT_PATCH="$ROOT/Tools/MsplatNative/msplat-1.1.3-checkpoint.patch"
+NUMERIC_STABILITY_PATCH="$ROOT/Tools/MsplatNative/msplat-1.1.3-numeric-stability.patch"
 FIXTURE_GENERATOR="$ROOT/scripts/ci/generate_msplat_sparse_fixtures.py"
 VALIDATOR="$ROOT/scripts/toolchain/validate_native_msplat.sh"
 INSTALL_DIR="${EASYSPLAT_MSPLAT_INSTALL_DIR:-$ROOT/Toolchains/build/msplat/install/msplat}"
@@ -39,6 +40,7 @@ require_file "$BUILD_SCRIPT"
 require_file "$OVERLAY"
 require_file "$UPSTREAM_PATCH"
 require_file "$CHECKPOINT_PATCH"
+require_file "$NUMERIC_STABILITY_PATCH"
 require_file "$FIXTURE_GENERATOR"
 require_file "$VALIDATOR"
 
@@ -64,6 +66,13 @@ require_contains 'default.metallib' "$BUILD_SCRIPT"
 require_contains 'easysplat-train' "$BUILD_SCRIPT"
 require_contains 'msplat-1.1.3-easysplat.patch' "$BUILD_SCRIPT"
 require_contains 'msplat-1.1.3-checkpoint.patch' "$BUILD_SCRIPT"
+require_contains 'msplat-1.1.3-numeric-stability.patch' "$BUILD_SCRIPT"
+require_contains 'NUMERIC_STABILITY_PATCH_SHA256="231586b17e4f47c8c55432a631e08bf293b31a92f8d6ec49b367d11632350ec3"' "$BUILD_SCRIPT"
+require_contains '[ "$(sha256 "$NUMERIC_STABILITY_PATCH")" = "$NUMERIC_STABILITY_PATCH_SHA256" ]' "$BUILD_SCRIPT"
+require_contains 'git -C "$SOURCE_DIR" apply --unidiff-zero --check "$NUMERIC_STABILITY_PATCH"' "$BUILD_SCRIPT"
+require_contains 'git -C "$SOURCE_DIR" apply --unidiff-zero "$NUMERIC_STABILITY_PATCH"' "$BUILD_SCRIPT"
+require_contains 'numeric_stability_patch_sha256' "$BUILD_SCRIPT"
+require_contains '"numeric_stability_patch_sha256": "231586b17e4f47c8c55432a631e08bf293b31a92f8d6ec49b367d11632350ec3"' "$VALIDATOR"
 require_contains 'python3 - "$build_info"' "$BUILD_SCRIPT"
 require_contains 'json.dump(payload, output, indent=2, sort_keys=True)' "$BUILD_SCRIPT"
 require_contains 'json.load(source, parse_constant=reject_constant)' "$BUILD_SCRIPT"
@@ -149,6 +158,13 @@ require_contains 'syncCB()' "$UPSTREAM_PATCH"
 require_contains 'CKPT_VERSION = 2' "$CHECKPOINT_PATCH"
 require_contains 'Checkpoint tensor shape mismatch' "$CHECKPOINT_PATCH"
 require_contains 'Metal command buffer failed' "$CHECKPOINT_PATCH"
+require_contains 'float g = isfinite(grads[tid]) ? clamp(grads[tid], -1.0e10f, 1.0e10f) : 0.0f;' "$NUMERIC_STABILITY_PATCH"
+require_contains 'isfinite(exp_avg_sq[tid]) && exp_avg_sq[tid] >= 0.0f' "$NUMERIC_STABILITY_PATCH"
+require_contains 'if (isfinite(candidate)) params[tid] = candidate;' "$NUMERIC_STABILITY_PATCH"
+require_contains 'float g = isfinite(grad) ? clamp(grad, -1.0e10f, 1.0e10f) : 0.0f;' "$NUMERIC_STABILITY_PATCH"
+require_contains 'if (isfinite(candidate)) param = candidate;' "$NUMERIC_STABILITY_PATCH"
+require_contains 'float gradient_norm = sqrt(gx * gx + gy * gy);' "$NUMERIC_STABILITY_PATCH"
+require_contains 'if (isfinite(gradient_norm)) xys_grad_norm[idx] += gradient_norm;' "$NUMERIC_STABILITY_PATCH"
 require_contains 'validateBinaryPly' "$OVERLAY"
 require_contains 'if (handleCancellation()) return 130' "$OVERLAY"
 
@@ -326,13 +342,14 @@ set -e
 [ ! -s "$negative_dir/truncated-ply.stdout" ] || fail "truncated PLY emitted a false success event"
 grep -qi 'payload' "$negative_dir/truncated-ply.stderr" || fail "truncated PLY diagnostic is not useful"
 
-for key in source_commit source_version source_url source_tree_sha256 overlay_sha256 patch_sha256 checkpoint_patch_sha256 executable_sha256 metallib_sha256 compiler deployment_target cmake_arguments build_timestamp; do
+for key in source_commit source_version source_url source_tree_sha256 overlay_sha256 patch_sha256 checkpoint_patch_sha256 numeric_stability_patch_sha256 executable_sha256 metallib_sha256 compiler deployment_target cmake_arguments build_timestamp; do
   require_contains "\"$key\"" "$BUILD_INFO"
 done
 overlay_hash="$(shasum -a 256 "$OVERLAY" | awk '{print $1}')"
+numeric_stability_patch_hash="$(shasum -a 256 "$NUMERIC_STABILITY_PATCH" | awk '{print $1}')"
 exe_hash="$(shasum -a 256 "$BIN" | awk '{print $1}')"
 metallib_hash="$(shasum -a 256 "$METALLIB" | awk '{print $1}')"
-python3 - "$BUILD_INFO" "$overlay_hash" "$exe_hash" "$metallib_hash" <<'PY'
+python3 - "$BUILD_INFO" "$overlay_hash" "$numeric_stability_patch_hash" "$exe_hash" "$metallib_hash" <<'PY'
 import json
 import sys
 
@@ -347,8 +364,9 @@ expected = {
     "source_commit": "106499b0a53f82b0c92d013b0861fbebd341b17e",
     "source_version": "1.1.3",
     "overlay_sha256": sys.argv[2],
-    "executable_sha256": sys.argv[3],
-    "metallib_sha256": sys.argv[4],
+    "numeric_stability_patch_sha256": sys.argv[3],
+    "executable_sha256": sys.argv[4],
+    "metallib_sha256": sys.argv[5],
 }
 for key, value in expected.items():
     if payload.get(key) != value:
@@ -474,6 +492,19 @@ if python3 "$FIXTURE_GENERATOR" --output "$existing_fixture_root" >/dev/null 2>&
 fi
 require_contains 'preserve' "$existing_fixture_root/sentinel"
 python3 "$FIXTURE_GENERATOR" --output "$fixture_root"
+python3 - "$fixture_root/manifest.json" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+manifest = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+stress = [fixture for fixture in manifest["fixtures"] if fixture.get("numeric_stability_stress")]
+if len(stress) != 1:
+    raise SystemExit("sparse fixtures must contain exactly one numeric-stability stress case")
+fixture = stress[0]
+if fixture.get("resolution") != [320, 180] or fixture.get("point_count") != 1279:
+    raise SystemExit("numeric-stability stress fixture contract changed")
+PY
 fixture_count=0
 while IFS=$'\t' read -r fixture_name expected_points; do
   fixture_count=$((fixture_count + 1))
