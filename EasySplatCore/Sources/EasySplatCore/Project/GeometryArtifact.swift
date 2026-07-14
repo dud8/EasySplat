@@ -104,9 +104,6 @@ public struct PairGraphMeasurement: Codable, Sendable, Equatable {
     public var matcherAttempts: [PairMatchingAttemptArtifact]
     public var pairListDigest: String
     public var matchingDurationSeconds: Double
-    public var mappingAttemptNumber: Int
-    public var bundleAdjustmentCycleCount: Int
-    public var fallbackReason: String?
 
     public init(
         scheduledPairCount: Int,
@@ -123,10 +120,7 @@ public struct PairGraphMeasurement: Codable, Sendable, Equatable {
         degreeP90: Int,
         matcherAttempts: [PairMatchingAttemptArtifact],
         pairListDigest: String,
-        matchingDurationSeconds: Double,
-        mappingAttemptNumber: Int,
-        bundleAdjustmentCycleCount: Int,
-        fallbackReason: String?
+        matchingDurationSeconds: Double
     ) {
         self.scheduledPairCount = scheduledPairCount
         self.attemptedPairCount = attemptedPairCount
@@ -143,25 +137,57 @@ public struct PairGraphMeasurement: Codable, Sendable, Equatable {
         self.matcherAttempts = matcherAttempts
         self.pairListDigest = pairListDigest
         self.matchingDurationSeconds = matchingDurationSeconds
-        self.mappingAttemptNumber = mappingAttemptNumber
-        self.bundleAdjustmentCycleCount = bundleAdjustmentCycleCount
-        self.fallbackReason = fallbackReason
     }
 }
 
 public struct PairGraphArtifact: Codable, Sendable, Equatable {
     public var status: PairGraphMeasurementStatus
     public var measurement: PairGraphMeasurement?
+    public var mappingAttemptNumber: Int
+    public var bundleAdjustmentCycleCount: Int
+    public var fallbackReason: String?
 
-    public init(status: PairGraphMeasurementStatus, measurement: PairGraphMeasurement?) {
+    public init(
+        status: PairGraphMeasurementStatus,
+        measurement: PairGraphMeasurement?,
+        mappingAttemptNumber: Int,
+        bundleAdjustmentCycleCount: Int,
+        fallbackReason: String?
+    ) {
         self.status = status
         self.measurement = measurement
+        self.mappingAttemptNumber = mappingAttemptNumber
+        self.bundleAdjustmentCycleCount = bundleAdjustmentCycleCount
+        self.fallbackReason = fallbackReason
     }
 
-    public static let notEvaluated = PairGraphArtifact(status: .notEvaluated, measurement: nil)
+    public static func notEvaluated(
+        mappingAttemptNumber: Int,
+        bundleAdjustmentCycleCount: Int,
+        fallbackReason: String?
+    ) -> PairGraphArtifact {
+        PairGraphArtifact(
+            status: .notEvaluated,
+            measurement: nil,
+            mappingAttemptNumber: mappingAttemptNumber,
+            bundleAdjustmentCycleCount: bundleAdjustmentCycleCount,
+            fallbackReason: fallbackReason
+        )
+    }
 
-    public static func measured(_ measurement: PairGraphMeasurement) -> PairGraphArtifact {
-        PairGraphArtifact(status: .measured, measurement: measurement)
+    public static func measured(
+        _ measurement: PairGraphMeasurement,
+        mappingAttemptNumber: Int,
+        bundleAdjustmentCycleCount: Int,
+        fallbackReason: String?
+    ) -> PairGraphArtifact {
+        PairGraphArtifact(
+            status: .measured,
+            measurement: measurement,
+            mappingAttemptNumber: mappingAttemptNumber,
+            bundleAdjustmentCycleCount: bundleAdjustmentCycleCount,
+            fallbackReason: fallbackReason
+        )
     }
 }
 
@@ -353,8 +379,8 @@ public struct GeometryArtifact: Codable, Sendable, Equatable {
         modelHashes: [String: String],
         fallbackReason: String?,
         provenance: GeometryProvenance,
+        pairGraph: PairGraphArtifact,
         learnedPointInitializer: LearnedPointInitializerArtifact? = nil,
-        pairGraph: PairGraphArtifact = .notEvaluated,
         canonicalOrientation: CanonicalOrientationArtifact = .notEvaluated
     ) {
         self.schemaVersion = schemaVersion

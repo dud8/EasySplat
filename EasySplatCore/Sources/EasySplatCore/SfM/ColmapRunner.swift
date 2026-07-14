@@ -20,6 +20,65 @@ public struct ColmapBundleAdjustmentOptions: Sendable {
     }
 }
 
+public enum ColmapMapperOptionsValidationError: Error, LocalizedError, Equatable {
+    case invalidRatio(String)
+    case nonPositiveValue(String)
+    case randomSeedOutOfRange
+
+    public var errorDescription: String? {
+        switch self {
+        case .invalidRatio(let name):
+            return "\(name) must be finite and greater than one."
+        case .nonPositiveValue(let name):
+            return "\(name) must be greater than zero."
+        case .randomSeedOutOfRange:
+            return "Mapper random seed must fit in a signed 32-bit integer."
+        }
+    }
+}
+
+/// Fixed incremental-mapper policy passed across the native COLMAP process boundary.
+public struct ColmapMapperOptions: Sendable, Equatable {
+    public let globalFramesRatio: Double
+    public let globalPointsRatio: Double
+    public let globalMaxRefinements: Int
+    public let globalMaxNumIterations: Int
+    public let randomSeed: Int32
+    public let refineFocalLength: Bool
+
+    public init(
+        globalFramesRatio: Double,
+        globalPointsRatio: Double,
+        globalMaxRefinements: Int,
+        globalMaxNumIterations: Int,
+        randomSeed: UInt64,
+        refineFocalLength: Bool
+    ) throws {
+        guard globalFramesRatio.isFinite, globalFramesRatio > 1 else {
+            throw ColmapMapperOptionsValidationError.invalidRatio("Global frame ratio")
+        }
+        guard globalPointsRatio.isFinite, globalPointsRatio > 1 else {
+            throw ColmapMapperOptionsValidationError.invalidRatio("Global point ratio")
+        }
+        guard globalMaxRefinements > 0 else {
+            throw ColmapMapperOptionsValidationError.nonPositiveValue("Global refinement limit")
+        }
+        guard globalMaxNumIterations > 0 else {
+            throw ColmapMapperOptionsValidationError.nonPositiveValue("Global iteration limit")
+        }
+        guard let randomSeed = Int32(exactly: randomSeed) else {
+            throw ColmapMapperOptionsValidationError.randomSeedOutOfRange
+        }
+
+        self.globalFramesRatio = globalFramesRatio
+        self.globalPointsRatio = globalPointsRatio
+        self.globalMaxRefinements = globalMaxRefinements
+        self.globalMaxNumIterations = globalMaxNumIterations
+        self.randomSeed = randomSeed
+        self.refineFocalLength = refineFocalLength
+    }
+}
+
 /// Shared COLMAP feature extraction and matching options.
 public struct ColmapOptions: Sendable {
     public var useGPU: Bool
@@ -296,21 +355,21 @@ public final class ColmapRunner {
         imagePath: URL,
         outputPath: URL,
         options: ColmapOptions,
-        bundleAdjustmentIterationLimit: Int? = nil,
+        mapperOptions: ColmapMapperOptions,
         onLog: @escaping @Sendable (String, Bool) -> Void
     ) async throws {
-        var args = [
+        let args = [
             "mapper",
             "--database_path", database.path,
             "--image_path", imagePath.path,
-            "--output_path", outputPath.path
+            "--output_path", outputPath.path,
+            "--Mapper.ba_global_frames_ratio", "\(mapperOptions.globalFramesRatio)",
+            "--Mapper.ba_global_points_ratio", "\(mapperOptions.globalPointsRatio)",
+            "--Mapper.ba_global_max_refinements", "\(mapperOptions.globalMaxRefinements)",
+            "--Mapper.ba_global_max_num_iterations", "\(mapperOptions.globalMaxNumIterations)",
+            "--Mapper.random_seed", "\(mapperOptions.randomSeed)",
+            "--Mapper.ba_refine_focal_length", mapperOptions.refineFocalLength ? "1" : "0",
         ]
-        if let bundleAdjustmentIterationLimit {
-            args.append(contentsOf: [
-                "--Mapper.ba_global_max_num_iterations",
-                "\(max(1, bundleAdjustmentIterationLimit))",
-            ])
-        }
         onLog("EasySplat: colmap argv: \(colmapPath.path) \(args.joined(separator: " "))", false)
         let result = try await runner.runAsync(
             colmapPath.path,

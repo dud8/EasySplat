@@ -185,6 +185,36 @@ extension PipelineRunner {
         try cleanForRetry(failedStage: failedStage, paths: paths)
     }
 
+    func test_persistResolvedPlanChange(
+        _ resolvedPlan: ResolvedRunPlan,
+        completedBoundary: PipelineStage?,
+        metadata: inout ProjectMetadata,
+        paths: ProjectPaths
+    ) throws {
+        try persistResolvedPlanChange(
+            resolvedPlan,
+            completedBoundary: completedBoundary,
+            metadata: &metadata,
+            paths: paths
+        )
+    }
+
+    func test_runDa3MatchesImporterWithOneShotExactRecovery(
+        database: URL,
+        matchListPath: URL,
+        options: ColmapOptions,
+        onExactRecovery: () -> Void
+    ) async throws {
+        try await runDa3MatchesImporterWithOneShotExactRecovery(
+            database: database,
+            matchListPath: matchListPath,
+            options: options,
+            onLog: { _, _ in },
+            emit: { _ in },
+            onExactRecovery: onExactRecovery
+        )
+    }
+
     func test_makePipelineErrorInvalidInput() -> Error {
         PipelineError.invalidInput
     }

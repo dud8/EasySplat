@@ -4,7 +4,7 @@ import XCTest
 @testable import EasySplatCore
 
 final class ColmapRunnerTests: XCTestCase {
-    func testMapperReceivesBoundedGlobalBundleAdjustmentLimit() async throws {
+    func testMapperReceivesBoundedGlobalBundleAdjustmentPolicy() async throws {
         let runner = MockSubprocessRunner(scripts: [
             .init(
                 path: "/mock/colmap",
@@ -15,6 +15,11 @@ final class ColmapRunnerTests: XCTestCase {
                         self.value(for: "--Mapper.ba_global_max_num_iterations", in: args),
                         "75"
                     )
+                    XCTAssertEqual(self.value(for: "--Mapper.ba_global_frames_ratio", in: args), "1.4")
+                    XCTAssertEqual(self.value(for: "--Mapper.ba_global_points_ratio", in: args), "1.4")
+                    XCTAssertEqual(self.value(for: "--Mapper.ba_global_max_refinements", in: args), "5")
+                    XCTAssertEqual(self.value(for: "--Mapper.random_seed", in: args), "42")
+                    XCTAssertEqual(self.value(for: "--Mapper.ba_refine_focal_length", in: args), "1")
                 }
             )
         ])
@@ -30,9 +35,92 @@ final class ColmapRunnerTests: XCTestCase {
                 matchThreads: 1,
                 sequentialOverlap: 10
             ),
-            bundleAdjustmentIterationLimit: 75,
+            mapperOptions: try ColmapMapperOptions(
+                globalFramesRatio: 1.4,
+                globalPointsRatio: 1.4,
+                globalMaxRefinements: 5,
+                globalMaxNumIterations: 75,
+                randomSeed: 42,
+                refineFocalLength: true
+            ),
             onLog: { _, _ in }
         )
+    }
+
+    func testMapperOptionsRejectInvalidBundleAdjustmentPolicy() {
+        XCTAssertThrowsError(try ColmapMapperOptions(
+            globalFramesRatio: 1,
+            globalPointsRatio: 1.4,
+            globalMaxRefinements: 5,
+            globalMaxNumIterations: 75,
+            randomSeed: 42,
+            refineFocalLength: true
+        )) { error in
+            XCTAssertEqual(
+                error as? ColmapMapperOptionsValidationError,
+                .invalidRatio("Global frame ratio")
+            )
+        }
+        XCTAssertThrowsError(try ColmapMapperOptions(
+            globalFramesRatio: .infinity,
+            globalPointsRatio: 1.4,
+            globalMaxRefinements: 5,
+            globalMaxNumIterations: 75,
+            randomSeed: 42,
+            refineFocalLength: true
+        ))
+        XCTAssertThrowsError(try ColmapMapperOptions(
+            globalFramesRatio: 1.4,
+            globalPointsRatio: .nan,
+            globalMaxRefinements: 5,
+            globalMaxNumIterations: 75,
+            randomSeed: 42,
+            refineFocalLength: true
+        )) { error in
+            XCTAssertEqual(
+                error as? ColmapMapperOptionsValidationError,
+                .invalidRatio("Global point ratio")
+            )
+        }
+        XCTAssertThrowsError(try ColmapMapperOptions(
+            globalFramesRatio: 1.4,
+            globalPointsRatio: 1.4,
+            globalMaxRefinements: 0,
+            globalMaxNumIterations: 75,
+            randomSeed: 42,
+            refineFocalLength: true
+        )) { error in
+            XCTAssertEqual(
+                error as? ColmapMapperOptionsValidationError,
+                .nonPositiveValue("Global refinement limit")
+            )
+        }
+        XCTAssertThrowsError(try ColmapMapperOptions(
+            globalFramesRatio: 1.4,
+            globalPointsRatio: 1.4,
+            globalMaxRefinements: 5,
+            globalMaxNumIterations: 0,
+            randomSeed: 42,
+            refineFocalLength: true
+        )) { error in
+            XCTAssertEqual(
+                error as? ColmapMapperOptionsValidationError,
+                .nonPositiveValue("Global iteration limit")
+            )
+        }
+        XCTAssertThrowsError(try ColmapMapperOptions(
+            globalFramesRatio: 1.4,
+            globalPointsRatio: 1.4,
+            globalMaxRefinements: 5,
+            globalMaxNumIterations: 75,
+            randomSeed: UInt64(Int32.max) + 1,
+            refineFocalLength: true
+        )) { error in
+            XCTAssertEqual(
+                error as? ColmapMapperOptionsValidationError,
+                .randomSeedOutOfRange
+            )
+        }
     }
 
     func testFeatureExtractorPassesMaxNumFeatures() async throws {

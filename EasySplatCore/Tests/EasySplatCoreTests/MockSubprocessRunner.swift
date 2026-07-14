@@ -6,7 +6,25 @@ final class MockSubprocessRunner: @unchecked Sendable, SubprocessRunning {
         let path: String
         let argsPrefix: [String]
         let result: SubprocessResult
+        let stdoutLines: [String]
+        let stderrLines: [String]
         let onRun: (([String]) -> Void)?
+
+        init(
+            path: String,
+            argsPrefix: [String],
+            result: SubprocessResult,
+            stdoutLines: [String] = [],
+            stderrLines: [String] = [],
+            onRun: (([String]) -> Void)? = nil
+        ) {
+            self.path = path
+            self.argsPrefix = argsPrefix
+            self.result = result
+            self.stdoutLines = stdoutLines
+            self.stderrLines = stderrLines
+            self.onRun = onRun
+        }
     }
 
     private let lock = NSLock()
@@ -44,6 +62,8 @@ final class MockSubprocessRunner: @unchecked Sendable, SubprocessRunning {
             return script
         }
         script.onRun?(arguments)
+        script.stdoutLines.forEach(onStdout)
+        script.stderrLines.forEach(onStderr)
         return script.result
     }
 

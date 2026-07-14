@@ -1,5 +1,6 @@
 import XCTest
 import UniformTypeIdentifiers
+import SQLite3
 @testable import EasySplatCore
 
 final class PipelineRunnerRetryTests: XCTestCase {
@@ -410,6 +411,101 @@ final class PipelineRunnerRetryTests: XCTestCase {
 
         XCTAssertFalse(FileManager.default.fileExists(atPath: trainingSentinel.path))
         XCTAssertEqual(ProjectArtifactValidator.validatePlyFile(at: output), .valid)
+    }
+
+    func testResolvedPlanChangePersistsDurableFeaturesBoundaryBeforeRelaunch() throws {
+        let root = try TestFileBuilder.makeTempDir()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let paths = ProjectPaths(root: root)
+        try paths.ensureDirectories()
+
+        let options = RequestedRunOptions(inputOrdering: .unordered)
+        let hardware = HardwareProfile(memoryGB: 48, cpuCount: 16, gpuWorkingSetGB: 36)
+        var previousPlan = RunPlanResolver.resolve(
+            requestedOptions: options,
+            input: .photos(folder: "/tmp/Photos"),
+            hardware: hardware,
+            developmentOverrides: .none
+        )
+        previousPlan.baGlobalFramesRatio = 1.2
+        let currentPlan = RunPlanResolver.resolve(
+            requestedOptions: options,
+            input: .photos(folder: "/tmp/Photos"),
+            hardware: hardware,
+            developmentOverrides: .none
+        )
+        var metadata = ProjectMetadata(
+            title: "Durable plan change",
+            input: .photos(folder: "/tmp/Photos"),
+            resolvedRunPlan: previousPlan,
+            state: PipelineState(stage: .sfmMapping, lastError: nil),
+            checkpoint: PipelineCheckpoint(stage: .sfmMapping),
+            lastRunStartedAt: Date()
+        )
+        try ProjectMetadataStore.save(metadata, to: paths.metadataURL)
+        try writeMatchedDatabase(at: paths.colmapDatabaseURL)
+
+        let sparseSentinel = paths.colmapSparseURL.appendingPathComponent("stale.txt")
+        let trainingSentinel = paths.trainingURL.appendingPathComponent("stale.txt")
+        try Data("stale".utf8).write(to: sparseSentinel)
+        try Data("stale".utf8).write(to: trainingSentinel)
+        try Data("stale".utf8).write(to: paths.geometryManifestURL)
+        let publishedOutput = paths.outputURL.appendingPathComponent("splat.ply")
+        try TestFileBuilder.writeMinimalPly(at: publishedOutput)
+
+        try makeRunner(projectURL: root).test_persistResolvedPlanChange(
+            currentPlan,
+            completedBoundary: .sfmFeatures,
+            metadata: &metadata,
+            paths: paths
+        )
+
+        let persisted = try ProjectMetadataStore.load(from: paths.metadataURL)
+        XCTAssertEqual(persisted.resolvedRunPlan, currentPlan)
+        XCTAssertEqual(persisted.state.stage, .sfmFeatures)
+        XCTAssertNil(persisted.state.lastError)
+        XCTAssertNil(persisted.checkpoint)
+        XCTAssertNil(persisted.lastRunStartedAt)
+        XCTAssertNil(persisted.geometryArtifact)
+        XCTAssertNil(persisted.trainingArtifact)
+        XCTAssertEqual(try databaseRowCount("matches", at: paths.colmapDatabaseURL), 0)
+        XCTAssertEqual(try databaseRowCount("two_view_geometries", at: paths.colmapDatabaseURL), 0)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: sparseSentinel.path))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: paths.geometryManifestURL.path))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: trainingSentinel.path))
+        XCTAssertEqual(ProjectArtifactValidator.validatePlyFile(at: publishedOutput), .valid)
+    }
+
+    private func writeMatchedDatabase(at url: URL) throws {
+        var database: OpaquePointer?
+        defer { sqlite3_close(database) }
+        XCTAssertEqual(sqlite3_open(url.path, &database), SQLITE_OK)
+        guard let database else { return }
+        let sql = """
+        CREATE TABLE matches(pair_id INTEGER PRIMARY KEY, rows INTEGER, cols INTEGER, data BLOB);
+        CREATE TABLE two_view_geometries(pair_id INTEGER PRIMARY KEY, rows INTEGER, cols INTEGER, data BLOB);
+        INSERT INTO matches(pair_id, rows, cols, data) VALUES (1, 1, 2, X'0000');
+        INSERT INTO two_view_geometries(pair_id, rows, cols, data) VALUES (1, 1, 2, X'0000');
+        """
+        XCTAssertEqual(sqlite3_exec(database, sql, nil, nil, nil), SQLITE_OK)
+    }
+
+    private func databaseRowCount(_ table: String, at url: URL) throws -> Int {
+        var database: OpaquePointer?
+        defer { sqlite3_close(database) }
+        guard sqlite3_open_v2(url.path, &database, SQLITE_OPEN_READONLY, nil) == SQLITE_OK,
+              let database else { return -1 }
+        var statement: OpaquePointer?
+        defer { sqlite3_finalize(statement) }
+        guard sqlite3_prepare_v2(
+            database,
+            "SELECT COUNT(*) FROM \(table);",
+            -1,
+            &statement,
+            nil
+        ) == SQLITE_OK,
+              sqlite3_step(statement) == SQLITE_ROW else { return -1 }
+        return Int(sqlite3_column_int64(statement, 0))
     }
 
     private func makeRunner(projectURL: URL) -> PipelineRunner {

@@ -119,7 +119,23 @@ final class PipelineIntegrationTests: XCTestCase {
                 XCTAssertEqual(powerAssertion.active, 1, "The assertion must still be active while subprocess work is running.")
             }),
             .init(path: toolchain.colmap.path, argsPrefix: ["exhaustive_matcher"], result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""), onRun: nil),
-            .init(path: toolchain.colmap.path, argsPrefix: ["mapper"], result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""), onRun: { _ in try? self.writeSparseModel(at: projectURL) }),
+            .init(
+                path: toolchain.colmap.path,
+                argsPrefix: ["mapper"],
+                result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""),
+                stderrLines: [
+                    "Retriangulation and Global bundle adjustment",
+                    "Retriangulation and Global bundle adjustment",
+                ],
+                onRun: { args in
+                    XCTAssertEqual(self.value(for: "--Mapper.ba_global_frames_ratio", in: args), "1.1")
+                    XCTAssertEqual(self.value(for: "--Mapper.ba_global_points_ratio", in: args), "1.1")
+                    XCTAssertEqual(self.value(for: "--Mapper.ba_global_max_refinements", in: args), "5")
+                    XCTAssertEqual(self.value(for: "--Mapper.random_seed", in: args), "42")
+                    XCTAssertEqual(self.value(for: "--Mapper.ba_refine_focal_length", in: args), "1")
+                    try? self.writeSparseModel(at: projectURL)
+                }
+            ),
             .init(path: toolchain.colmap.path, argsPrefix: ["model_analyzer"], result: .init(exitCode: 0, terminationReason: .exit, stdout: "Registered images: 100 / 100\nMean reprojection error: 1.0\n", stderr: ""), onRun: nil)
         ])
 
@@ -167,6 +183,10 @@ final class PipelineIntegrationTests: XCTestCase {
         XCTAssertEqual(geometry.provenance.solver.identifier, "colmap")
         XCTAssertNil(geometry.provenance.runtime)
         XCTAssertNil(geometry.provenance.model)
+        XCTAssertEqual(geometry.pairGraph.status, .notEvaluated)
+        XCTAssertEqual(geometry.pairGraph.mappingAttemptNumber, 1)
+        XCTAssertEqual(geometry.pairGraph.bundleAdjustmentCycleCount, 2)
+        XCTAssertNil(geometry.pairGraph.fallbackReason)
         XCTAssertEqual(finalMetadata.geometryArtifact, geometry)
         XCTAssertNotNil(events.stageLog(containing: "SfM backend: COLMAP mapper."))
         XCTAssertNil(events.stageLog(containing: "global mapper"))
@@ -210,7 +230,9 @@ final class PipelineIntegrationTests: XCTestCase {
                 }
                 XCTAssertTrue(pairs.contains("frame_000000.jpg frame_000029.jpg"))
             }),
-            .init(path: toolchain.colmap.path, argsPrefix: ["mapper"], result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""), onRun: { _ in
+            .init(path: toolchain.colmap.path, argsPrefix: ["mapper"], result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""), stdoutLines: ["Retriangulation and Global bundle adjustment"], onRun: { args in
+                XCTAssertEqual(self.value(for: "--Mapper.ba_global_frames_ratio", in: args), "1.4")
+                XCTAssertEqual(self.value(for: "--Mapper.ba_global_points_ratio", in: args), "1.4")
                 try? self.writeSparseModel(at: projectURL)
             }),
             .init(path: toolchain.colmap.path, argsPrefix: ["model_analyzer"], result: .init(exitCode: 0, terminationReason: .exit, stdout: "Registered images: 30 / 30\nPoints: 1\nObservations: 30\nMean track length: 30.0\n", stderr: ""), onRun: nil),
@@ -305,6 +327,7 @@ final class PipelineIntegrationTests: XCTestCase {
                 path: toolchain.colmap.path,
                 argsPrefix: ["mapper"],
                 result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""),
+                stdoutLines: ["Retriangulation and Global bundle adjustment"],
                 onRun: { _ in try? self.writeSparseModel(at: projectURL) }
             ),
             .init(
@@ -341,6 +364,12 @@ final class PipelineIntegrationTests: XCTestCase {
         XCTAssertEqual(commands.filter { $0 == "feature_extractor" }.count, 1)
         XCTAssertEqual(commands.filter { $0 == "sequential_matcher" }.count, 2)
         XCTAssertNotNil(events.stageLog(containing: "preserving features and retrying with exact matching"))
+        let geometry = try GeometryArtifactStore.load(
+            from: paths.geometryManifestURL,
+            projectPaths: paths
+        )
+        XCTAssertEqual(geometry.pairGraph.mappingAttemptNumber, 1)
+        XCTAssertEqual(geometry.pairGraph.fallbackReason, "exact descriptor matching")
     }
 
     func testInterruptedClassicalMatchingClearsPartialExactRowsBeforeFaissResume() async throws {
@@ -428,6 +457,7 @@ final class PipelineIntegrationTests: XCTestCase {
                 path: toolchain.colmap.path,
                 argsPrefix: ["mapper"],
                 result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""),
+                stdoutLines: ["Retriangulation and Global bundle adjustment"],
                 onRun: { _ in try? self.writeSparseModel(at: projectURL) }
             ),
             .init(
@@ -457,6 +487,139 @@ final class PipelineIntegrationTests: XCTestCase {
 
         XCTAssertNotNil(events.stageLog(containing: "Discarded partial image matches"))
         XCTAssertFalse(resumeRunner.calls.contains { $0.1.first == "feature_extractor" })
+    }
+
+    func testBundleAdjustmentPolicyChangeClearsMatchesAndRerunsMapping() async throws {
+        let temp = makeTempRoot()
+        let projectURL = temp.appendingPathComponent(
+            "BundleAdjustmentPolicyChange.easysplatproj",
+            isDirectory: true
+        )
+        let sourcePhotos = temp.appendingPathComponent("SourcePhotos", isDirectory: true)
+        try FileManager.default.createDirectory(at: sourcePhotos, withIntermediateDirectories: true)
+        for index in 0..<8 {
+            try writeTestImage(
+                url: sourcePhotos.appendingPathComponent("img\(index).jpg"),
+                value: UInt8(index)
+            )
+        }
+
+        let paths = ProjectPaths(root: projectURL)
+        try paths.ensureDirectories()
+        try ProjectMetadataStore.save(
+            ProjectMetadata(
+                title: "Bundle adjustment policy change",
+                input: .photos(folder: sourcePhotos.path),
+                requestedRunOptions: RequestedRunOptions(
+                    detailProfile: .fast,
+                    inputOrdering: .unordered,
+                    photoSelection: .useAllValidPhotos
+                )
+            ),
+            to: paths.metadataURL
+        )
+        let toolchain = try makeToolchain(root: temp)
+        let firstRunner = MockSubprocessRunner(scripts: [
+            .init(
+                path: toolchain.colmap.path,
+                argsPrefix: ["feature_extractor"],
+                result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""),
+                onRun: { _ in
+                    try? self.writeMatchableColmapDatabase(at: paths.colmapDatabaseURL)
+                }
+            ),
+            .init(
+                path: toolchain.colmap.path,
+                argsPrefix: ["exhaustive_matcher"],
+                result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: "")
+            ),
+            .init(
+                path: toolchain.colmap.path,
+                argsPrefix: ["mapper"],
+                result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""),
+                stdoutLines: ["Retriangulation and Global bundle adjustment"],
+                onRun: { _ in try? self.writeSparseModel(at: projectURL) }
+            ),
+            .init(
+                path: toolchain.colmap.path,
+                argsPrefix: ["model_analyzer"],
+                result: .init(
+                    exitCode: 0,
+                    terminationReason: .exit,
+                    stdout: "Registered images: 8 / 8\nPoints: 1\nObservations: 8\nMean track length: 8.0\nMean reprojection error: 0.5\n",
+                    stderr: ""
+                )
+            ),
+        ])
+        let firstPipeline = PipelineRunner(
+            projectURL: projectURL,
+            config: makePipelineConfig(
+                toolchain: toolchain,
+                candidateRoute: .colmap,
+                skipTraining: true
+            ),
+            tooling: .init(runner: firstRunner)
+        )
+        try await firstPipeline.run { _ in }
+
+        var staleMetadata = try ProjectMetadataStore.load(from: paths.metadataURL)
+        staleMetadata.resolvedRunPlan?.baGlobalFramesRatio = 1.2
+        try ProjectMetadataStore.save(staleMetadata, to: paths.metadataURL)
+        XCTAssertEqual(try databaseRowCount("matches", at: paths.colmapDatabaseURL), 1)
+
+        let resumeRunner = MockSubprocessRunner(scripts: [
+            .init(
+                path: toolchain.colmap.path,
+                argsPrefix: ["exhaustive_matcher"],
+                result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""),
+                onRun: { _ in
+                    XCTAssertEqual(
+                        try? self.databaseRowCount("matches", at: paths.colmapDatabaseURL),
+                        0
+                    )
+                    XCTAssertEqual(
+                        try? self.databaseRowCount(
+                            "two_view_geometries",
+                            at: paths.colmapDatabaseURL
+                        ),
+                        0
+                    )
+                }
+            ),
+            .init(
+                path: toolchain.colmap.path,
+                argsPrefix: ["mapper"],
+                result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""),
+                stdoutLines: ["Retriangulation and Global bundle adjustment"],
+                onRun: { _ in try? self.writeSparseModel(at: projectURL) }
+            ),
+            .init(
+                path: toolchain.colmap.path,
+                argsPrefix: ["model_analyzer"],
+                result: .init(
+                    exitCode: 0,
+                    terminationReason: .exit,
+                    stdout: "Registered images: 8 / 8\nPoints: 1\nObservations: 8\nMean track length: 8.0\nMean reprojection error: 0.5\n",
+                    stderr: ""
+                )
+            ),
+        ])
+        let events = PipelineEventSink()
+        let resumedPipeline = PipelineRunner(
+            projectURL: projectURL,
+            config: makePipelineConfig(
+                toolchain: toolchain,
+                candidateRoute: .colmap,
+                skipTraining: true
+            ),
+            tooling: .init(runner: resumeRunner)
+        )
+        try await resumedPipeline.run(resumeFrom: .sfmMapping) { events.append($0) }
+
+        XCTAssertFalse(resumeRunner.calls.contains { $0.1.first == "feature_extractor" })
+        XCTAssertEqual(resumeRunner.calls.filter { $0.1.first == "exhaustive_matcher" }.count, 1)
+        XCTAssertEqual(resumeRunner.calls.filter { $0.1.first == "mapper" }.count, 1)
+        XCTAssertNotNil(events.stageLog(containing: "Discarded stale image matches"))
     }
 
     func testFaissCrashOnSequentialRetryUsesExactMatchingWithoutReextractingFeatures() async throws {
@@ -539,6 +702,7 @@ final class PipelineIntegrationTests: XCTestCase {
                 path: toolchain.colmap.path,
                 argsPrefix: ["mapper"],
                 result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""),
+                stdoutLines: ["Retriangulation and Global bundle adjustment"],
                 onRun: { _ in try? self.writeSparseModel(at: projectURL) }
             ),
             .init(
@@ -656,6 +820,7 @@ final class PipelineIntegrationTests: XCTestCase {
                 path: toolchain.colmap.path,
                 argsPrefix: ["mapper"],
                 result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""),
+                stdoutLines: ["Retriangulation and Global bundle adjustment"],
                 onRun: { _ in try? self.writeSparseModel(at: projectURL) }
             ),
             .init(
@@ -728,7 +893,7 @@ final class PipelineIntegrationTests: XCTestCase {
             .init(path: toolchain.colmap.path, argsPrefix: ["sequential_matcher"], result: .init(exitCode: 1, terminationReason: .exit, stdout: "", stderr: "matching failed again"), onRun: nil),
             .init(path: toolchain.colmap.path, argsPrefix: ["feature_extractor"], result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""), onRun: nil),
             .init(path: toolchain.colmap.path, argsPrefix: ["exhaustive_matcher"], result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""), onRun: nil),
-            .init(path: toolchain.colmap.path, argsPrefix: ["mapper"], result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""), onRun: { _ in
+            .init(path: toolchain.colmap.path, argsPrefix: ["mapper"], result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""), stdoutLines: ["Retriangulation and Global bundle adjustment"], onRun: { _ in
                 try? self.writeSparseModel(at: projectURL)
             }),
             .init(path: toolchain.colmap.path, argsPrefix: ["model_analyzer"], result: .init(exitCode: 0, terminationReason: .exit, stdout: "Registered images: 30 / 30\nPoints: 1\nObservations: 30\nMean track length: 30.0\nMean reprojection error: 0.5\n", stderr: ""), onRun: nil),
@@ -787,7 +952,7 @@ final class PipelineIntegrationTests: XCTestCase {
                 XCTAssertLessThanOrEqual(pairs.count, 960)
                 XCTAssertGreaterThanOrEqual(pairs.count, 119)
             }),
-            .init(path: toolchain.colmap.path, argsPrefix: ["mapper"], result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""), onRun: { _ in
+            .init(path: toolchain.colmap.path, argsPrefix: ["mapper"], result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""), stdoutLines: ["Retriangulation and Global bundle adjustment"], onRun: { _ in
                 try? self.writeSparseModel(at: projectURL)
             }),
             .init(path: toolchain.colmap.path, argsPrefix: ["model_analyzer"], result: .init(exitCode: 0, terminationReason: .exit, stdout: "Registered images: 120 / 120\nPoints: 1\nObservations: 120\nMean track length: 120.0\n", stderr: ""), onRun: nil),
@@ -846,7 +1011,7 @@ final class PipelineIntegrationTests: XCTestCase {
             .init(path: toolchain.colmap.path, argsPrefix: ["feature_extractor"], result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""), onRun: nil),
             .init(path: toolchain.colmap.path, argsPrefix: ["feature_extractor"], result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""), onRun: nil),
             .init(path: toolchain.colmap.path, argsPrefix: ["exhaustive_matcher"], result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""), onRun: nil),
-            .init(path: toolchain.colmap.path, argsPrefix: ["mapper"], result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""), onRun: { _ in
+            .init(path: toolchain.colmap.path, argsPrefix: ["mapper"], result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""), stdoutLines: ["Retriangulation and Global bundle adjustment"], onRun: { _ in
                 try? self.writeSparseModel(at: projectURL)
             }),
             .init(path: toolchain.colmap.path, argsPrefix: ["model_analyzer"], result: .init(exitCode: 0, terminationReason: .exit, stdout: "Registered images: 120 / 120\nPoints: 1\nObservations: 120\nMean track length: 120.0\n", stderr: ""), onRun: nil),
@@ -1018,6 +1183,7 @@ final class PipelineIntegrationTests: XCTestCase {
                 path: toolchain.colmap.path,
                 argsPrefix: ["mapper"],
                 result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""),
+                stdoutLines: ["Retriangulation and Global bundle adjustment"],
                 onRun: { _ in
                     try? self.writeSparseModel(at: projectURL)
                 }
@@ -1999,6 +2165,11 @@ final class PipelineIntegrationTests: XCTestCase {
             0,
             "Persisted reconstruction facts must use residuals recomputed from COLMAP tracks."
         )
+        let pairGraph = try XCTUnwrap(finished.geometryArtifact?.pairGraph)
+        XCTAssertEqual(pairGraph.status, .notEvaluated)
+        XCTAssertEqual(pairGraph.mappingAttemptNumber, 1)
+        XCTAssertEqual(pairGraph.bundleAdjustmentCycleCount, 1)
+        XCTAssertNil(pairGraph.fallbackReason)
     }
 
     func testDa3RefinementFaissCrashRetriesExactWithoutReextractingFeatures() async throws {
@@ -2130,6 +2301,13 @@ final class PipelineIntegrationTests: XCTestCase {
             ["feature_extractor", "matches_importer", "matches_importer", "point_triangulator", "bundle_adjuster", "model_analyzer"]
         )
         XCTAssertNotNil(events.stageLog(containing: "preserving features and retrying with exact matching"))
+        let geometry = try GeometryArtifactStore.load(
+            from: paths.geometryManifestURL,
+            projectPaths: paths
+        )
+        XCTAssertEqual(geometry.pairGraph.mappingAttemptNumber, 1)
+        XCTAssertEqual(geometry.pairGraph.bundleAdjustmentCycleCount, 1)
+        XCTAssertEqual(geometry.pairGraph.fallbackReason, "exact descriptor matching")
     }
 
     func testInterruptedDa3MatchingClearsPartialExactRowsBeforeFaissResume() async throws {
@@ -2672,6 +2850,11 @@ final class PipelineIntegrationTests: XCTestCase {
                 ),
                 runtime: nil,
                 model: nil
+            ),
+            pairGraph: .notEvaluated(
+                mappingAttemptNumber: 1,
+                bundleAdjustmentCycleCount: 1,
+                fallbackReason: nil
             )
         )
         try GeometryArtifactStore.persist(

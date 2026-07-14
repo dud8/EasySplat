@@ -181,11 +181,17 @@ public enum RunPlanResolver {
             || previousPlan.inputOrdering != currentPlan.inputOrdering
             || previousPlan.pairingPolicy != currentPlan.pairingPolicy
             || previousPlan.sequentialOverlap != currentPlan.sequentialOverlap
+        let matchingOrMappingPolicyChanged = previousPlan.baGlobalFramesRatio != currentPlan.baGlobalFramesRatio
+            || previousPlan.baGlobalPointsRatio != currentPlan.baGlobalPointsRatio
+            || previousPlan.baGlobalMaxRefinements != currentPlan.baGlobalMaxRefinements
+            || previousPlan.deterministicSeed != currentPlan.deterministicSeed
         let safeBoundary: PipelineStage
         if framePreparationChanged {
             safeBoundary = input.hasVideos ? .importInput : .extractFrames
         } else if geometryChanged {
             safeBoundary = .selectFrames
+        } else if matchingOrMappingPolicyChanged {
+            safeBoundary = .sfmFeatures
         } else {
             safeBoundary = .sfmMapping
         }
@@ -208,6 +214,13 @@ public enum RunPlanResolver {
             capturePath: capturePath,
             inputOrdering: inputOrdering
         )
+        let baGlobalRatio: Double
+        switch pairingPolicy {
+        case .unorderedRetrieval:
+            baGlobalRatio = 1.1
+        case .orderedContinuous, .orderedOrbit, .orderedWalkthrough, .orderedLargeArea:
+            baGlobalRatio = 1.4
+        }
         let memoryTier = resolvedMemoryTier(
             resourcePolicy: options.resourcePolicy,
             detail: options.detailProfile,
@@ -285,6 +298,9 @@ public enum RunPlanResolver {
             photoSelection: options.photoSelection,
             pairingPolicy: pairingPolicy,
             sequentialOverlap: sequentialOverlap(for: pairingPolicy),
+            baGlobalFramesRatio: baGlobalRatio,
+            baGlobalPointsRatio: baGlobalRatio,
+            baGlobalMaxRefinements: 5,
             deterministicSeed: UInt64(max(0, developmentOverrides.benchmarkSeed ?? 42))
         )
     }

@@ -174,7 +174,10 @@ private func makeResolvedRunPlan() -> ResolvedRunPlan {
         plateauWindow: 1_500,
         trainerMemoryBudgetBytes: 32_212_254_720,
         requiredToolchainCapabilities: ["geometry-v2", "training-v2"],
-        fallbackRouteIdentifiers: ["geometry.apple-silicon.fallback"]
+        fallbackRouteIdentifiers: ["geometry.apple-silicon.fallback"],
+        baGlobalFramesRatio: 1.4,
+        baGlobalPointsRatio: 1.4,
+        baGlobalMaxRefinements: 5
     )
 }
 
@@ -218,6 +221,11 @@ func makeGeometryArtifact(
             ),
             runtime: nil,
             model: nil
+        ),
+        pairGraph: .notEvaluated(
+            mappingAttemptNumber: 1,
+            bundleAdjustmentCycleCount: 1,
+            fallbackReason: nil
         )
     )
 }

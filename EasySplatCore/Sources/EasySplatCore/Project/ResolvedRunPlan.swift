@@ -52,6 +52,9 @@ public struct ResolvedRunPlan: Codable, Sendable, Equatable {
     public var photoSelection: PhotoSelection
     public var pairingPolicy: ResolvedPairingPolicy
     public var sequentialOverlap: Int
+    public var baGlobalFramesRatio: Double
+    public var baGlobalPointsRatio: Double
+    public var baGlobalMaxRefinements: Int
     public var deterministicSeed: UInt64
 
     public init(
@@ -81,6 +84,9 @@ public struct ResolvedRunPlan: Codable, Sendable, Equatable {
         photoSelection: PhotoSelection = .automatic,
         pairingPolicy: ResolvedPairingPolicy = .unorderedRetrieval,
         sequentialOverlap: Int = 10,
+        baGlobalFramesRatio: Double = 1.1,
+        baGlobalPointsRatio: Double = 1.1,
+        baGlobalMaxRefinements: Int = 5,
         deterministicSeed: UInt64 = 42
     ) {
         self.routeIdentifier = routeIdentifier
@@ -109,6 +115,9 @@ public struct ResolvedRunPlan: Codable, Sendable, Equatable {
         self.photoSelection = photoSelection
         self.pairingPolicy = pairingPolicy
         self.sequentialOverlap = sequentialOverlap
+        self.baGlobalFramesRatio = baGlobalFramesRatio
+        self.baGlobalPointsRatio = baGlobalPointsRatio
+        self.baGlobalMaxRefinements = baGlobalMaxRefinements
         self.deterministicSeed = deterministicSeed
     }
 

@@ -1,6 +1,7 @@
 #if canImport(XCTest)
 import Foundation
 import XCTest
+import SQLite3
 @testable import EasySplatCore
 
 final class DescriptorMatcherRecoveryTests: XCTestCase {
@@ -147,6 +148,81 @@ final class DescriptorMatcherRecoveryTests: XCTestCase {
                 currentMatcher: .exact,
                 exhaustedFaissRetries: true
             )
+        )
+    }
+
+    func testDa3ExactTransitionIsReportedEvenWhenExactAttemptAlsoFails() async throws {
+        let root = try TestFileBuilder.makeTempDir()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let paths = ProjectPaths(root: root)
+        try paths.ensureDirectories()
+        try writeEmptyMatchTables(at: paths.colmapDatabaseURL)
+        let pairList = root.appendingPathComponent("pairs.txt")
+        try "a.jpg b.jpg\n".write(to: pairList, atomically: true, encoding: .utf8)
+
+        let toolchain = TestToolchains.toolchainPaths(root: root)
+        let subprocess = MockSubprocessRunner(scripts: [
+            .init(
+                path: toolchain.colmap.path,
+                argsPrefix: ["matches_importer"],
+                result: .init(
+                    exitCode: SIGSEGV,
+                    terminationReason: .uncaughtSignal,
+                    stdout: "",
+                    stderr: "segmentation fault"
+                )
+            ),
+            .init(
+                path: toolchain.colmap.path,
+                argsPrefix: ["matches_importer"],
+                result: .init(
+                    exitCode: 1,
+                    terminationReason: .exit,
+                    stdout: "",
+                    stderr: "exact matcher failed"
+                )
+            ),
+        ])
+        let runner = PipelineRunner(
+            projectURL: root,
+            config: .init(toolchain: toolchain),
+            tooling: .init(runner: subprocess)
+        )
+        var didSelectExactRecovery = false
+
+        do {
+            try await runner.test_runDa3MatchesImporterWithOneShotExactRecovery(
+                database: paths.colmapDatabaseURL,
+                matchListPath: pairList,
+                options: ColmapOptions(
+                    useGPU: false,
+                    extractThreads: 1,
+                    matchThreads: 1,
+                    sequentialOverlap: 1
+                ),
+                onExactRecovery: { didSelectExactRecovery = true }
+            )
+            XCTFail("Expected the exact retry to fail")
+        } catch {
+            XCTAssertTrue(didSelectExactRecovery)
+        }
+    }
+
+    private func writeEmptyMatchTables(at url: URL) throws {
+        var database: OpaquePointer?
+        defer { sqlite3_close(database) }
+        guard sqlite3_open(url.path, &database) == SQLITE_OK, let database else {
+            return XCTFail("Could not create matcher database")
+        }
+        XCTAssertEqual(
+            sqlite3_exec(
+                database,
+                "CREATE TABLE matches(pair_id INTEGER PRIMARY KEY); CREATE TABLE two_view_geometries(pair_id INTEGER PRIMARY KEY);",
+                nil,
+                nil,
+                nil
+            ),
+            SQLITE_OK
         )
     }
 }

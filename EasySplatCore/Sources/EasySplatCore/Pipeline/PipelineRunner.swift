@@ -102,7 +102,22 @@ public final class PipelineRunner: @unchecked Sendable {
         let resolvedRunPlan = config.resolvedRunPlan ?? hardwareResolvedRunPlan
         let planChangedForCurrentHardware = previousResolvedRunPlan != nil
             && previousResolvedRunPlan != resolvedRunPlan
-        if metadata.resolvedRunPlan != resolvedRunPlan {
+        let effectiveLastCompletedStage = RunPlanResolver.safeResumeStage(
+            lastCompletedStage,
+            input: metadata.input,
+            previousPlan: planChangedForCurrentHardware ? previousResolvedRunPlan : resolvedRunPlan,
+            currentPlan: resolvedRunPlan
+        )
+        let invalidatedMatchingForPlanChange = planChangedForCurrentHardware
+            && effectiveLastCompletedStage == .sfmFeatures
+        if planChangedForCurrentHardware {
+            try persistResolvedPlanChange(
+                resolvedRunPlan,
+                completedBoundary: effectiveLastCompletedStage,
+                metadata: &metadata,
+                paths: paths
+            )
+        } else if metadata.resolvedRunPlan != resolvedRunPlan {
             metadata.resolvedRunPlan = resolvedRunPlan
             try ProjectMetadataStore.savePreservingUserEditableFields(metadata, to: paths.metadataURL)
         }
@@ -128,12 +143,6 @@ public final class PipelineRunner: @unchecked Sendable {
         var forceExhaustiveMatching = false
         var lastUsedSequentialMatcher = false
         var lastExpectedMatchingPairs = 0
-        let effectiveLastCompletedStage = RunPlanResolver.safeResumeStage(
-            lastCompletedStage,
-            input: metadata.input,
-            previousPlan: planChangedForCurrentHardware ? previousResolvedRunPlan : resolvedRunPlan,
-            currentPlan: resolvedRunPlan
-        )
         let resumeValidationMode = effectiveLastCompletedStage != nil
         let hasInterruptionEvidence = metadata.checkpoint != nil || metadata.lastRunStartedAt != nil
         let wasInterrupted = metadata.state.lastError == nil
@@ -171,17 +180,26 @@ public final class PipelineRunner: @unchecked Sendable {
                 isError: true
             ))
         }
-
-        var shouldResetInterruptedMatching = wasInterrupted
-            && metadataForResumeValidation.checkpoint?.stage == .sfmMatching
-
-        func resetInterruptedMatchingIfNeeded() throws {
-            guard shouldResetInterruptedMatching else { return }
-            try ColmapDatabaseMatchStore.clearMatchingResults(at: paths.colmapDatabaseURL)
-            shouldResetInterruptedMatching = false
+        if invalidatedMatchingForPlanChange {
             emit(.stageLog(
                 stage: .sfmMatching,
-                line: "Discarded partial image matches before resuming reconstruction.",
+                line: "Discarded stale image matches after reconstruction policy changed.",
+                isError: false
+            ))
+        }
+
+        var pendingMatchingResetMessage: String?
+        if wasInterrupted && metadataForResumeValidation.checkpoint?.stage == .sfmMatching {
+            pendingMatchingResetMessage = "Discarded partial image matches before resuming reconstruction."
+        }
+
+        func resetMatchingIfNeeded() throws {
+            guard let message = pendingMatchingResetMessage else { return }
+            try ColmapDatabaseMatchStore.clearMatchingResults(at: paths.colmapDatabaseURL)
+            pendingMatchingResetMessage = nil
+            emit(.stageLog(
+                stage: .sfmMatching,
+                line: message,
                 isError: false
             ))
         }
@@ -623,6 +641,15 @@ public final class PipelineRunner: @unchecked Sendable {
             }
 
             var acceptedReconstructionSummary: ReconstructionSummary?
+            var mappingAttemptCount = 0
+            var bundleAdjustmentCycleCount = 0
+            var mappingFallbackReasons: [String] = []
+
+            func recordMappingFallback(_ reason: String) {
+                guard !mappingFallbackReasons.contains(reason) else { return }
+                mappingFallbackReasons.append(reason)
+            }
+
             for (index, backendPolicy) in backendOrder.enumerated() {
                 // Reset accepted-quality state at the start of every backend attempt so a
                 // partial failure from the previous backend cannot leak its score/summary
@@ -890,7 +917,7 @@ public final class PipelineRunner: @unchecked Sendable {
                                 }
                             )
                             self.logKeypointStats(database: paths.colmapDatabaseURL, stage: .sfmMatching, emit: emit)
-                            try resetInterruptedMatchingIfNeeded()
+                            try resetMatchingIfNeeded()
 
                             let seedManifest = try readDa3CoverageManifest(required: true)
                             guard let localPairs = seedManifest?.boundedMatchPairs,
@@ -946,7 +973,10 @@ public final class PipelineRunner: @unchecked Sendable {
                                 matchListPath: matchListURL,
                                 options: da3ColmapMatchOptions,
                                 onLog: matcherLog,
-                                emit: emit
+                                emit: emit,
+                                onExactRecovery: {
+                                    recordMappingFallback("exact descriptor matching")
+                                }
                             )
                             lastUsedSequentialMatcher = false
                             let expectedPairs = pairPlan.pairs.count
@@ -999,6 +1029,7 @@ public final class PipelineRunner: @unchecked Sendable {
                                 ]
                             )
                             emit(.stageLog(stage: .sfmMapping, line: "Running DA3 refinement: point_triangulator.", isError: false))
+                            mappingAttemptCount += 1
                             try await self.tooling.colmap.runPointTriangulator(
                                 colmapPath: self.config.toolchain.colmap,
                                 database: paths.colmapDatabaseURL,
@@ -1015,6 +1046,7 @@ public final class PipelineRunner: @unchecked Sendable {
                             self.removeIfExists(baOutput)
                             try fm.createDirectory(at: baOutput, withIntermediateDirectories: true)
                             emit(.stageLog(stage: .sfmMapping, line: "Running DA3 refinement: bundle_adjuster.", isError: false))
+                            bundleAdjustmentCycleCount += 1
                             try await self.tooling.colmap.runBundleAdjuster(
                                 colmapPath: self.config.toolchain.colmap,
                                 inputPath: sparseZero,
@@ -1162,7 +1194,7 @@ public final class PipelineRunner: @unchecked Sendable {
                         processedPairs: 0
                     ))
                 )
-                try resetInterruptedMatchingIfNeeded()
+                try resetMatchingIfNeeded()
                 emit(.stageLog(
                     stage: .sfmMatching,
                     line: colmapMatchOptions.useGPU ? "Using GPU for COLMAP matching." : "Using CPU for COLMAP matching.",
@@ -1452,6 +1484,7 @@ public final class PipelineRunner: @unchecked Sendable {
                 didRetryWithCpu = true
                 colmapExtractOptions.useGPU = false
                 colmapMatchOptions.useGPU = false
+                recordMappingFallback("CPU recovery after GPU failure")
                 emit(.stageLog(stage: currentStage, line: "COLMAP GPU failed or unsupported; retrying on CPU.", isError: true))
                 return true
             }
@@ -1478,6 +1511,7 @@ public final class PipelineRunner: @unchecked Sendable {
                     colmapMatchOptions.sequentialOverlap = min(colmapMatchOptions.sequentialOverlap, 5)
                 }
                 didRetryWithFewerFrames = true
+                recordMappingFallback("reduced frames after geometry failure")
                 if let reduced = reduced {
                     selectedFrames = reduced
                 }
@@ -1532,6 +1566,7 @@ public final class PipelineRunner: @unchecked Sendable {
                            ) {
                             didRetryWithExactMatcher = true
                             colmapMatchOptions.descriptorMatcher = .exact
+                            recordMappingFallback("exact descriptor matching")
                             try ColmapDatabaseMatchStore.clearMatchingResults(
                                 at: paths.colmapDatabaseURL
                             )
@@ -1653,13 +1688,21 @@ public final class PipelineRunner: @unchecked Sendable {
 
                     do {
                         try self.resetDirectory(paths.colmapSparseURL)
+                        mappingAttemptCount += 1
                         try await self.tooling.colmap.runMapper(
                             colmapPath: self.config.toolchain.colmap,
                             database: paths.colmapDatabaseURL,
                             imagePath: paths.framesSelectedURL,
                             outputPath: paths.colmapSparseURL,
                             options: colmapMatchOptions,
-                            bundleAdjustmentIterationLimit: resolvedRunPlan.refinementIterationLimit,
+                            mapperOptions: try ColmapMapperOptions(
+                                globalFramesRatio: resolvedRunPlan.baGlobalFramesRatio,
+                                globalPointsRatio: resolvedRunPlan.baGlobalPointsRatio,
+                                globalMaxRefinements: resolvedRunPlan.baGlobalMaxRefinements,
+                                globalMaxNumIterations: resolvedRunPlan.refinementIterationLimit,
+                                randomSeed: resolvedRunPlan.deterministicSeed,
+                                refineFocalLength: true
+                            ),
                             onLog: { line, isErr in
                                 colmapToolLog.append(stream: isErr ? "stderr" : "stdout", line: line)
                                 onMappingLog(line, isErr)
@@ -1671,6 +1714,7 @@ public final class PipelineRunner: @unchecked Sendable {
                         try Task.checkCancellation()
                         lastMappingError = error
                     }
+                    bundleAdjustmentCycleCount += mappingProgress.globalRefinementCycleCount
 
                     if !mappingSucceeded,
                        let pipelineError = lastMappingError as? PipelineError,
@@ -1682,6 +1726,7 @@ public final class PipelineRunner: @unchecked Sendable {
                         if increasedOverlap > previousOverlap {
                             didRetryWithHigherSequentialOverlap = true
                             colmapMatchOptions.sequentialOverlap = increasedOverlap
+                            recordMappingFallback("higher sequential overlap")
                             emit(.stageLog(
                                 stage: .sfmMapping,
                                 line: "Reconstruction quality was low. Retrying with higher sequential overlap (\(previousOverlap) -> \(increasedOverlap)).",
@@ -1710,6 +1755,7 @@ public final class PipelineRunner: @unchecked Sendable {
                        ) {
                         didRetryWithExactMatcher = true
                         colmapMatchOptions.descriptorMatcher = .exact
+                        recordMappingFallback("exact descriptor matching")
                         try ColmapDatabaseMatchStore.clearMatchingResults(
                             at: paths.colmapDatabaseURL
                         )
@@ -1848,6 +1894,9 @@ public final class PipelineRunner: @unchecked Sendable {
                     metadata.reconstruction = summary
                 }
                 do {
+                    let mappingFallbackReason = mappingFallbackReasons.isEmpty
+                        ? nil
+                        : mappingFallbackReasons.joined(separator: "; ")
                     try persistMeasuredGeometryArtifact(
                         metadata: &metadata,
                         paths: paths,
@@ -1856,7 +1905,12 @@ public final class PipelineRunner: @unchecked Sendable {
                         acceptedDa3ModelSubdirectory: acceptedDa3ModelSubdirectory,
                         selectedFrames: selectedFrames,
                         selectedFrameManifest: currentSelectedFrameManifest,
-                        peakMemoryBytes: geometryPeakMemoryBytes
+                        peakMemoryBytes: geometryPeakMemoryBytes,
+                        pairGraph: .notEvaluated(
+                            mappingAttemptNumber: mappingAttemptCount,
+                            bundleAdjustmentCycleCount: bundleAdjustmentCycleCount,
+                            fallbackReason: mappingFallbackReason
+                        )
                     )
                 } catch {
                     metadata.reconstruction = previousReconstruction
@@ -1899,6 +1953,7 @@ public final class PipelineRunner: @unchecked Sendable {
                     throw error
                 }
                 let nextBackend = backendOrder[index + 1]
+                recordMappingFallback("\(backendPolicy.rawValue) fallback to \(nextBackend.rawValue)")
                 let debug = failureMessages(for: error, stage: .sfmFeatures).debugMessage
                 emit(.stageLog(
                     stage: .sfmFeatures,

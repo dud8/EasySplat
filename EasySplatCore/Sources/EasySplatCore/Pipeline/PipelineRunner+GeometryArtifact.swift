@@ -9,7 +9,8 @@ extension PipelineRunner {
         acceptedDa3ModelSubdirectory: String?,
         selectedFrames: [URL],
         selectedFrameManifest: [SelectedFrameMapping],
-        peakMemoryBytes: Int64
+        peakMemoryBytes: Int64,
+        pairGraph: PairGraphArtifact
     ) throws {
         let modelDirectory = paths.colmapSparseURL.appendingPathComponent("0", isDirectory: true)
         // The artifact contract uses COLMAP's text form so residuals remain inspectable
@@ -151,6 +152,7 @@ extension PipelineRunner {
             modelHashes: modelHashes,
             fallbackReason: fallbackReason,
             provenance: provenance,
+            pairGraph: pairGraph,
             learnedPointInitializer: learnedPointInitializer
         )
         metadata.reconstruction = ReconstructionSummary(

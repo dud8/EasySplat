@@ -56,6 +56,9 @@ final class RunPlanResolverTests: XCTestCase {
         XCTAssertEqual(plan.colmapMaximumMatchCount, 10_000)
         XCTAssertEqual(plan.colmapExhaustiveBlockSize, 25)
         XCTAssertEqual(plan.colmapThreadLimit, 8)
+        XCTAssertEqual(plan.baGlobalFramesRatio, 1.1)
+        XCTAssertEqual(plan.baGlobalPointsRatio, 1.1)
+        XCTAssertEqual(plan.baGlobalMaxRefinements, 5)
         XCTAssertEqual(plan.deterministicSeed, 42)
         XCTAssertEqual(
             plan.requiredToolchainCapabilities,
@@ -70,6 +73,31 @@ final class RunPlanResolverTests: XCTestCase {
             try plan.toolchainCapabilityRequest().capabilities,
             [.core, .colmap, .msplat]
         )
+    }
+
+    func testOrderedPlansUseLessFrequentGlobalBundleAdjustment() {
+        let hardware = HardwareProfile(memoryGB: 48, cpuCount: 16, gpuWorkingSetGB: 36)
+
+        for capturePath in [
+            CapturePath.automatic,
+            .orbit,
+            .walkthrough,
+            .largeArea,
+        ] {
+            let plan = RunPlanResolver.resolve(
+                requestedOptions: RequestedRunOptions(
+                    capturePath: capturePath,
+                    inputOrdering: .continuous
+                ),
+                input: .video(files: ["/tmp/clip.mov"]),
+                hardware: hardware,
+                developmentOverrides: .none
+            )
+
+            XCTAssertEqual(plan.baGlobalFramesRatio, 1.4, "capture path: \(capturePath)")
+            XCTAssertEqual(plan.baGlobalPointsRatio, 1.4, "capture path: \(capturePath)")
+            XCTAssertEqual(plan.baGlobalMaxRefinements, 5, "capture path: \(capturePath)")
+        }
     }
 
     func testLowMemoryAndConserveMemoryBoundClassicalBudgets() {
@@ -328,6 +356,18 @@ final class RunPlanResolverTests: XCTestCase {
         XCTAssertEqual(plan.pairingPolicy, .unorderedRetrieval)
         XCTAssertEqual(plan.sequentialOverlap, 0)
         XCTAssertEqual(plan.cameraGrouping, .mixedCamerasOrLenses)
+        XCTAssertEqual(plan.baGlobalFramesRatio, 1.1)
+        XCTAssertEqual(plan.baGlobalPointsRatio, 1.1)
+
+        let mixedPlan = RunPlanResolver.resolve(
+            requestedOptions: RequestedRunOptions(),
+            input: .mixed(videos: ["/tmp/clip.mov"], photosFolder: "/tmp/photos"),
+            hardware: HardwareProfile(memoryGB: 48, cpuCount: 16, gpuWorkingSetGB: 36),
+            developmentOverrides: .none
+        )
+        XCTAssertEqual(mixedPlan.pairingPolicy, .unorderedRetrieval)
+        XCTAssertEqual(mixedPlan.baGlobalFramesRatio, 1.1)
+        XCTAssertEqual(mixedPlan.baGlobalPointsRatio, 1.1)
     }
 
     func testAutomaticSingleVideoUsesNeutralContinuousPolicyWithoutInventingCaptureIntent() {
@@ -692,6 +732,54 @@ final class RunPlanResolverTests: XCTestCase {
                 currentPlan: memoryPlan
             ),
             .sfmMapping
+        )
+
+        var mappingPolicyPlan = currentVideoPlan
+        mappingPolicyPlan.baGlobalFramesRatio = 1.5
+        XCTAssertEqual(
+            RunPlanResolver.safeResumeStage(
+                .exportSplat,
+                input: video,
+                previousPlan: currentVideoPlan,
+                currentPlan: mappingPolicyPlan
+            ),
+            .sfmFeatures
+        )
+
+        mappingPolicyPlan = currentVideoPlan
+        mappingPolicyPlan.baGlobalPointsRatio = 1.5
+        XCTAssertEqual(
+            RunPlanResolver.safeResumeStage(
+                .exportSplat,
+                input: video,
+                previousPlan: currentVideoPlan,
+                currentPlan: mappingPolicyPlan
+            ),
+            .sfmFeatures
+        )
+
+        mappingPolicyPlan = currentVideoPlan
+        mappingPolicyPlan.baGlobalMaxRefinements = 4
+        XCTAssertEqual(
+            RunPlanResolver.safeResumeStage(
+                .exportSplat,
+                input: video,
+                previousPlan: currentVideoPlan,
+                currentPlan: mappingPolicyPlan
+            ),
+            .sfmFeatures
+        )
+
+        mappingPolicyPlan = currentVideoPlan
+        mappingPolicyPlan.deterministicSeed = 43
+        XCTAssertEqual(
+            RunPlanResolver.safeResumeStage(
+                .exportSplat,
+                input: video,
+                previousPlan: currentVideoPlan,
+                currentPlan: mappingPolicyPlan
+            ),
+            .sfmFeatures
         )
     }
 }

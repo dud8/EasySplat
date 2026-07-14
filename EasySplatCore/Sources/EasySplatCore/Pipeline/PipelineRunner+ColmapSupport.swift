@@ -104,7 +104,8 @@ extension PipelineRunner {
         matchListPath: URL,
         options: ColmapOptions,
         onLog: @escaping @Sendable (String, Bool) -> Void,
-        emit: @escaping @Sendable (PipelineEvent) -> Void
+        emit: @escaping @Sendable (PipelineEvent) -> Void,
+        onExactRecovery: () -> Void
     ) async throws {
         var attemptOptions = options
         do {
@@ -129,6 +130,7 @@ extension PipelineRunner {
 
             try ColmapDatabaseMatchStore.clearMatchingResults(at: database)
             attemptOptions.descriptorMatcher = .exact
+            onExactRecovery()
             emit(.stageLog(
                 stage: .sfmMatching,
                 line: "FAISS matching failed (\(reason.rawValue)); preserving features and retrying with exact matching.",

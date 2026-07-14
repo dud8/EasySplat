@@ -81,15 +81,30 @@ final class ColmapMatchingProgressTracker: @unchecked Sendable {
 }
 
 final class ColmapMappingProgressTracker: @unchecked Sendable {
+    private static let globalRefinementMarker = "Retriangulation and Global bundle adjustment"
+
     private let lock = NSLock()
     private let totalImages: Int
     private var lastFraction: Double = 0
+    private var recordedGlobalRefinementCycleCount = 0
 
     init(totalImages: Int) {
         self.totalImages = totalImages
     }
 
+    var globalRefinementCycleCount: Int {
+        lock.lock()
+        defer { lock.unlock() }
+        return recordedGlobalRefinementCycleCount
+    }
+
     func ingest(_ line: String) -> (fraction: Double, message: String)? {
+        if line.contains(Self.globalRefinementMarker) {
+            lock.lock()
+            recordedGlobalRefinementCycleCount += 1
+            lock.unlock()
+        }
+
         if line.contains("Keeping successful reconstruction") {
             return update(fraction: 0.99, message: "Solving cameras (finalizing reconstruction)")
         }

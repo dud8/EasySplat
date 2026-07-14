@@ -265,6 +265,13 @@ enum GeometryArtifactStore {
         _ artifact: PairGraphArtifact,
         totalViewCount: Int
     ) throws {
+        guard artifact.mappingAttemptNumber > 0,
+              artifact.bundleAdjustmentCycleCount > 0,
+              artifact.fallbackReason.map({
+                  !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+              }) ?? true else {
+            throw Error.invalidPairGraph
+        }
         switch artifact.status {
         case .notEvaluated:
             guard artifact.measurement == nil else { throw Error.invalidPairGraph }
@@ -294,12 +301,7 @@ enum GeometryArtifactStore {
                   !measurement.matcherAttempts.isEmpty,
                   isSHA256(measurement.pairListDigest),
                   measurement.matchingDurationSeconds.isFinite,
-                  measurement.matchingDurationSeconds >= 0,
-                  measurement.mappingAttemptNumber > 0,
-                  measurement.bundleAdjustmentCycleCount >= 0,
-                  measurement.fallbackReason.map({
-                      !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-                  }) ?? true else {
+                  measurement.matchingDurationSeconds >= 0 else {
                 throw Error.invalidPairGraph
             }
             let attemptNumbers = measurement.matcherAttempts.map(\.attemptNumber)

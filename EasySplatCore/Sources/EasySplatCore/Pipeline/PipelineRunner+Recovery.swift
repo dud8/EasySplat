@@ -82,6 +82,71 @@ extension PipelineRunner {
         }
     }
 
+    /// Invalidates every artifact downstream of a changed run policy before the new
+    /// policy is committed. If the process stops during cleanup, project.json still
+    /// contains the old policy and resume validation sees the missing output. Once the
+    /// save succeeds, the persisted stage boundary is sufficient to resume safely.
+    func persistResolvedPlanChange(
+        _ resolvedPlan: ResolvedRunPlan,
+        completedBoundary: PipelineStage?,
+        metadata: inout ProjectMetadata,
+        paths: ProjectPaths
+    ) throws {
+        let fileManager = FileManager.default
+        func removeInvalidatedItem(_ url: URL) throws {
+            let isSymlink = (try? fileManager.destinationOfSymbolicLink(atPath: url.path)) != nil
+            if fileManager.fileExists(atPath: url.path) || isSymlink {
+                try fileManager.removeItem(at: url)
+            }
+        }
+
+        let stages = PipelineStage.allCases
+        let boundaryIndex = completedBoundary.flatMap(stages.firstIndex(of:)) ?? -1
+        let extractFramesIndex = stages.firstIndex(of: .extractFrames) ?? 1
+        let selectFramesIndex = stages.firstIndex(of: .selectFrames) ?? 2
+        let featuresIndex = stages.firstIndex(of: .sfmFeatures) ?? 3
+        let matchingIndex = stages.firstIndex(of: .sfmMatching) ?? 4
+        let mappingIndex = stages.firstIndex(of: .sfmMapping) ?? 5
+        let trainingIndex = stages.firstIndex(of: .trainSplat) ?? 6
+
+        if boundaryIndex < extractFramesIndex {
+            try removeInvalidatedItem(paths.framesRawURL)
+        }
+        if boundaryIndex < selectFramesIndex {
+            try removeInvalidatedItem(paths.framesSelectedURL)
+            try removeInvalidatedItem(paths.framesSelectedManifestURL)
+        }
+        if boundaryIndex < featuresIndex {
+            try removeInvalidatedItem(paths.colmapDatabaseURL)
+            try removeInvalidatedItem(paths.colmapSeedURL)
+            try removeInvalidatedItem(paths.da3CoverageManifestURL)
+        } else if boundaryIndex < matchingIndex,
+                  FileManager.default.fileExists(atPath: paths.colmapDatabaseURL.path) {
+            try ColmapDatabaseMatchStore.clearMatchingResults(at: paths.colmapDatabaseURL)
+        }
+        if boundaryIndex < mappingIndex {
+            try removeInvalidatedItem(paths.colmapSparseURL)
+            try removeInvalidatedItem(paths.geometryManifestURL)
+            metadata.geometryArtifact = nil
+            metadata.reconstruction = nil
+        }
+        if boundaryIndex < trainingIndex {
+            try removeInvalidatedItem(paths.trainingURL)
+            metadata.trainingArtifact = nil
+        }
+
+        metadata.stageTimings = metadata.stageTimings?.filter { timing in
+            (stages.firstIndex(of: timing.stage) ?? stages.count) <= boundaryIndex
+        }
+        metadata.resolvedRunPlan = resolvedPlan
+        metadata.state = PipelineState(stage: completedBoundary ?? .importInput, lastError: nil)
+        metadata.checkpoint = nil
+        metadata.lastRunStartedAt = nil
+        metadata.lastFailureAt = nil
+        try paths.ensureDirectories()
+        try ProjectMetadataStore.savePreservingUserEditableFields(metadata, to: paths.metadataURL)
+    }
+
     func failureMessages(for error: Error, stage: PipelineStage) -> (userMessage: String, debugMessage: String) {
         if let pipelineError = error as? PipelineError {
             switch pipelineError {

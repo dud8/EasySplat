@@ -49,6 +49,27 @@ class _BundleAdjustmentOptions:
         self.ceres = _CeresBundleAdjustmentOptions()
 
 
+class _IncrementalPipelineOptions:
+    __slots__ = (
+        "ba_global_frames_ratio",
+        "ba_global_points_ratio",
+        "ba_global_max_refinements",
+        "ba_global_max_num_iterations",
+        "random_seed",
+        "ba_refine_focal_length",
+        "ba_use_gpu",
+    )
+
+    def __init__(self) -> None:
+        self.ba_global_frames_ratio = 1.1
+        self.ba_global_points_ratio = 1.1
+        self.ba_global_max_refinements = 5
+        self.ba_global_max_num_iterations = 50
+        self.random_seed = -1
+        self.ba_refine_focal_length = True
+        self.ba_use_gpu = False
+
+
 class _Image:
     def __init__(self, image_id: int, name: str) -> None:
         self.image_id = image_id
@@ -493,10 +514,10 @@ class ColmapCliTests(unittest.TestCase):
         self.assertTrue(database.closed)
         pycolmap.verify_matches.assert_not_called()
 
-    def test_mapper_uses_incremental_mapping_on_cpu(self) -> None:
+    def test_mapper_propagates_bounded_refinement_options_on_cpu(self) -> None:
         calls: list[dict[str, object]] = []
         pycolmap = types.SimpleNamespace(
-            IncrementalPipelineOptions=_Options,
+            IncrementalPipelineOptions=_IncrementalPipelineOptions,
             incremental_mapping=lambda **kwargs: calls.append(kwargs) or {},
         )
         common = {
@@ -507,13 +528,101 @@ class ColmapCliTests(unittest.TestCase):
 
         colmap_cli.run_command(
             "mapper",
-            common | {"Mapper.ba_global_max_num_iterations": "17"},
+            common
+            | {
+                "Mapper.ba_global_frames_ratio": "1.4",
+                "Mapper.ba_global_points_ratio": "1.25",
+                "Mapper.ba_global_max_refinements": "4",
+                "Mapper.ba_global_max_num_iterations": "17",
+                "Mapper.random_seed": "42",
+                "Mapper.ba_refine_focal_length": "0",
+            },
             pycolmap_module=pycolmap,
         )
         self.assertEqual(len(calls), 1)
         mapper = calls[0]["options"]
+        self.assertEqual(mapper.ba_global_frames_ratio, 1.4)
+        self.assertEqual(mapper.ba_global_points_ratio, 1.25)
+        self.assertEqual(mapper.ba_global_max_refinements, 4)
         self.assertEqual(mapper.ba_global_max_num_iterations, 17)
+        self.assertEqual(mapper.random_seed, 42)
+        self.assertFalse(mapper.ba_refine_focal_length)
         self.assertFalse(mapper.ba_use_gpu)
+
+    def test_mapper_help_exposes_supported_refinement_controls(self) -> None:
+        stdout = io.StringIO()
+        with contextlib.redirect_stdout(stdout):
+            self.assertEqual(colmap_cli.main(["mapper", "--help"]), 0)
+
+        help_text = stdout.getvalue()
+        for name in (
+            "Mapper.ba_global_frames_ratio",
+            "Mapper.ba_global_points_ratio",
+            "Mapper.ba_global_max_refinements",
+            "Mapper.ba_global_max_num_iterations",
+            "Mapper.random_seed",
+            "Mapper.ba_refine_focal_length",
+        ):
+            with self.subTest(name=name):
+                self.assertIn(f"--{name} <value>", help_text)
+
+    def test_mapper_uses_deterministic_defaults(self) -> None:
+        calls: list[dict[str, object]] = []
+        pycolmap = types.SimpleNamespace(
+            IncrementalPipelineOptions=_IncrementalPipelineOptions,
+            incremental_mapping=lambda **kwargs: calls.append(kwargs) or {},
+        )
+
+        colmap_cli.run_command(
+            "mapper",
+            {
+                "database_path": "/tmp/database.db",
+                "image_path": "/tmp/images",
+                "output_path": "/tmp/sparse",
+            },
+            pycolmap_module=pycolmap,
+        )
+
+        options = calls[0]["options"]
+        self.assertEqual(options.ba_global_frames_ratio, 1.1)
+        self.assertEqual(options.ba_global_points_ratio, 1.1)
+        self.assertEqual(options.ba_global_max_refinements, 5)
+        self.assertEqual(options.ba_global_max_num_iterations, 50)
+        self.assertEqual(options.random_seed, 42)
+        self.assertTrue(options.ba_refine_focal_length)
+
+    def test_mapper_rejects_unsafe_refinement_options(self) -> None:
+        pycolmap = types.SimpleNamespace(
+            IncrementalPipelineOptions=_IncrementalPipelineOptions,
+            incremental_mapping=mock.Mock(),
+        )
+        common = {
+            "database_path": "/tmp/database.db",
+            "image_path": "/tmp/images",
+            "output_path": "/tmp/sparse",
+        }
+        cases = {
+            "Mapper.ba_global_frames_ratio": ("1", "nan", "inf", "-inf"),
+            "Mapper.ba_global_points_ratio": ("0.99", "nan", "infinity"),
+            "Mapper.ba_global_max_refinements": ("0", "-1", "1.5"),
+            "Mapper.ba_global_max_num_iterations": ("0", "-1", "1.5"),
+            "Mapper.random_seed": ("-1", "2147483648", "1.5"),
+            "Mapper.ba_refine_focal_length": ("true", "false", "2"),
+        }
+
+        for name, values in cases.items():
+            for value in values:
+                with (
+                    self.subTest(name=name, value=value),
+                    self.assertRaisesRegex(colmap_cli.ColmapCliError, name),
+                ):
+                    colmap_cli.run_command(
+                        "mapper",
+                        common | {name: value},
+                        pycolmap_module=pycolmap,
+                    )
+
+        pycolmap.incremental_mapping.assert_not_called()
 
     def test_triangulator_bundle_adjuster_converter_and_analyzer_round_trip(
         self,

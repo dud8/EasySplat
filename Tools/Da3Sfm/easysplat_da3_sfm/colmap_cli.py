@@ -57,7 +57,12 @@ _COMMAND_OPTIONS = {
         "database_path",
         "image_path",
         "output_path",
+        "Mapper.ba_global_frames_ratio",
+        "Mapper.ba_global_points_ratio",
+        "Mapper.ba_global_max_refinements",
         "Mapper.ba_global_max_num_iterations",
+        "Mapper.random_seed",
+        "Mapper.ba_refine_focal_length",
     },
     "point_triangulator": {
         "database_path",
@@ -147,6 +152,28 @@ def _positive_integer(options: dict[str, str], name: str, default: int) -> int:
     value = _integer(options, name, default)
     if value < 1:
         raise ColmapCliError(f"--{name} must be at least 1")
+    return value
+
+
+def _nonnegative_int32(options: dict[str, str], name: str, default: int) -> int:
+    value = _integer(options, name, default)
+    if value < 0 or value > 2_147_483_647:
+        raise ColmapCliError(f"--{name} must be between 0 and 2147483647")
+    return value
+
+
+def _refinement_ratio(options: dict[str, str], name: str, default: float) -> float:
+    text = options.get(name)
+    if text is None:
+        return default
+    try:
+        value = float(text)
+    except ValueError as exc:
+        raise ColmapCliError(f"--{name} must be a finite number") from exc
+    if not math.isfinite(value):
+        raise ColmapCliError(f"--{name} must be a finite number")
+    if value <= 1.0:
+        raise ColmapCliError(f"--{name} must be greater than 1.0")
     return value
 
 
@@ -400,10 +427,35 @@ def _incremental_options(pycolmap: Any) -> Any:
 
 def _run_mapper(pycolmap: Any, options: dict[str, str]) -> None:
     pipeline = _incremental_options(pycolmap)
+    pipeline.ba_global_frames_ratio = _refinement_ratio(
+        options,
+        "Mapper.ba_global_frames_ratio",
+        pipeline.ba_global_frames_ratio,
+    )
+    pipeline.ba_global_points_ratio = _refinement_ratio(
+        options,
+        "Mapper.ba_global_points_ratio",
+        pipeline.ba_global_points_ratio,
+    )
+    pipeline.ba_global_max_refinements = _positive_integer(
+        options,
+        "Mapper.ba_global_max_refinements",
+        pipeline.ba_global_max_refinements,
+    )
     pipeline.ba_global_max_num_iterations = _positive_integer(
         options,
         "Mapper.ba_global_max_num_iterations",
-        50,
+        pipeline.ba_global_max_num_iterations,
+    )
+    pipeline.random_seed = _nonnegative_int32(
+        options,
+        "Mapper.random_seed",
+        42,
+    )
+    pipeline.ba_refine_focal_length = _boolean(
+        options,
+        "Mapper.ba_refine_focal_length",
+        pipeline.ba_refine_focal_length,
     )
     output_path = _required(options, "output_path")
     Path(output_path).mkdir(parents=True, exist_ok=True)

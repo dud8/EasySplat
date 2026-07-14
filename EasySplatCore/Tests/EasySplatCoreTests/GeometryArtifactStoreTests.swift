@@ -34,6 +34,14 @@ final class GeometryArtifactStoreTests: XCTestCase {
             "notEvaluated"
         )
         XCTAssertEqual(
+            (sidecar["pairGraph"] as? [String: Any])?["mappingAttemptNumber"] as? Int,
+            1
+        )
+        XCTAssertEqual(
+            (sidecar["pairGraph"] as? [String: Any])?["bundleAdjustmentCycleCount"] as? Int,
+            1
+        )
+        XCTAssertEqual(
             (sidecar["canonicalOrientation"] as? [String: Any])?["status"] as? String,
             "notEvaluated"
         )
@@ -401,34 +409,36 @@ final class GeometryArtifactStoreTests: XCTestCase {
         try paths.ensureDirectories()
         let fixture = try writeCanonicalModel(at: paths)
         var artifact = makeArtifact(fixture: fixture)
-        artifact.pairGraph = .measured(PairGraphMeasurement(
-            scheduledPairCount: 0,
-            attemptedPairCount: 0,
-            rawMatchedPairCount: 0,
-            spatiallyVerifiedPairCount: 0,
-            localPairCount: 0,
-            retrievalPairCount: 0,
-            loopRevisitPairCount: 0,
-            connectedComponentCount: 1,
-            isolatedViewCount: 1,
-            degreeP10: 0,
-            degreeMedian: 0,
-            degreeP90: 0,
-            matcherAttempts: [PairMatchingAttemptArtifact(
-                attemptNumber: 1,
-                matcher: .faiss,
+        artifact.pairGraph = .measured(
+            PairGraphMeasurement(
                 scheduledPairCount: 0,
                 attemptedPairCount: 0,
                 rawMatchedPairCount: 0,
                 spatiallyVerifiedPairCount: 0,
-                durationSeconds: 0.01
-            )],
-            pairListDigest: String(repeating: "d", count: 64),
-            matchingDurationSeconds: 0.01,
+                localPairCount: 0,
+                retrievalPairCount: 0,
+                loopRevisitPairCount: 0,
+                connectedComponentCount: 1,
+                isolatedViewCount: 1,
+                degreeP10: 0,
+                degreeMedian: 0,
+                degreeP90: 0,
+                matcherAttempts: [PairMatchingAttemptArtifact(
+                    attemptNumber: 1,
+                    matcher: .faiss,
+                    scheduledPairCount: 0,
+                    attemptedPairCount: 0,
+                    rawMatchedPairCount: 0,
+                    spatiallyVerifiedPairCount: 0,
+                    durationSeconds: 0.01
+                )],
+                pairListDigest: String(repeating: "d", count: 64),
+                matchingDurationSeconds: 0.01
+            ),
             mappingAttemptNumber: 1,
             bundleAdjustmentCycleCount: 2,
             fallbackReason: nil
-        ))
+        )
         artifact.canonicalOrientation = CanonicalOrientationArtifact(
             status: .unresolved,
             method: nil,
@@ -466,14 +476,50 @@ final class GeometryArtifactStoreTests: XCTestCase {
                 degreeP90: 0,
                 matcherAttempts: [],
                 pairListDigest: String(repeating: "d", count: 64),
-                matchingDurationSeconds: 0,
-                mappingAttemptNumber: 1,
-                bundleAdjustmentCycleCount: 0,
-                fallbackReason: nil
-            )
+                matchingDurationSeconds: 0
+            ),
+            mappingAttemptNumber: 1,
+            bundleAdjustmentCycleCount: 0,
+            fallbackReason: nil
         )
         XCTAssertThrowsError(
             try GeometryArtifactStore.validate(fabricatedPairGraph, projectPaths: paths)
+        ) { error in
+            XCTAssertEqual(error as? GeometryArtifactStore.Error, .invalidPairGraph)
+        }
+
+        var missingMappingEvidence = makeArtifact(fixture: fixture)
+        missingMappingEvidence.pairGraph = .notEvaluated(
+            mappingAttemptNumber: 0,
+            bundleAdjustmentCycleCount: 0,
+            fallbackReason: nil
+        )
+        XCTAssertThrowsError(
+            try GeometryArtifactStore.validate(missingMappingEvidence, projectPaths: paths)
+        ) { error in
+            XCTAssertEqual(error as? GeometryArtifactStore.Error, .invalidPairGraph)
+        }
+
+        var missingCycleEvidence = makeArtifact(fixture: fixture)
+        missingCycleEvidence.pairGraph = .notEvaluated(
+            mappingAttemptNumber: 1,
+            bundleAdjustmentCycleCount: 0,
+            fallbackReason: nil
+        )
+        XCTAssertThrowsError(
+            try GeometryArtifactStore.validate(missingCycleEvidence, projectPaths: paths)
+        ) { error in
+            XCTAssertEqual(error as? GeometryArtifactStore.Error, .invalidPairGraph)
+        }
+
+        var blankFallbackEvidence = makeArtifact(fixture: fixture)
+        blankFallbackEvidence.pairGraph = .notEvaluated(
+            mappingAttemptNumber: 1,
+            bundleAdjustmentCycleCount: 1,
+            fallbackReason: "  "
+        )
+        XCTAssertThrowsError(
+            try GeometryArtifactStore.validate(blankFallbackEvidence, projectPaths: paths)
         ) { error in
             XCTAssertEqual(error as? GeometryArtifactStore.Error, .invalidPairGraph)
         }
@@ -540,6 +586,11 @@ final class GeometryArtifactStoreTests: XCTestCase {
                 ),
                 runtime: nil,
                 model: nil
+            ),
+            pairGraph: .notEvaluated(
+                mappingAttemptNumber: 1,
+                bundleAdjustmentCycleCount: 1,
+                fallbackReason: nil
             )
         )
     }
