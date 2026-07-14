@@ -38,6 +38,24 @@ final class PipelineRunnerErrorTests: XCTestCase {
         XCTAssertFalse(message.userMessage.contains("Conserve Memory"))
     }
 
+    func testVideoBudgetFailureExplainsSeparateClipLimitWithoutBackendCopy() {
+        let runner = makeRunner()
+        let error = runner.test_makePipelineErrorVideoFrameBudgetTooSmall(
+            required: 8,
+            available: 6
+        )
+
+        let message = runner.test_failureMessages(for: error, stage: .selectFrames)
+
+        XCTAssertEqual(
+            message.userMessage,
+            "This capture has too many separate clips for the selected detail."
+        )
+        XCTAssertTrue(message.debugMessage.contains("requires 8 frames"))
+        XCTAssertTrue(message.debugMessage.contains("budget is 6"))
+        XCTAssertFalse(message.userMessage.lowercased().contains("backend"))
+    }
+
     func testLowQualityFailureMessageKeepsReliableMapperReprojection() {
         let runner = makeRunner()
         let score = ReconstructionScore(

@@ -93,6 +93,143 @@ final class PipelineIntegrationTests: XCTestCase {
         XCTAssertNil(stoppedMetadata.checkpoint)
     }
 
+    func testMixedVideoSelectionUsesExactGlobalBudgetAndCleansCommittedRawFrames() async throws {
+        let temp = makeTempRoot()
+        let projectURL = temp.appendingPathComponent(
+            "MixedVideoSelection.easysplatproj",
+            isDirectory: true
+        )
+        let firstVideo = temp.appendingPathComponent("first.mov")
+        let secondVideo = temp.appendingPathComponent("second.mov")
+        let firstTimes = [0.0, 0.02, 0.20, 0.22, 0.40, 0.42, 0.60, 0.62]
+        let secondTimes = [0.0, 0.03, 0.15, 0.30]
+        try await TestVideoBuilder.writeH264(
+            to: firstVideo,
+            times: firstTimes,
+            levels: firstTimes.indices.map { UInt8(30 + $0 * 20) }
+        )
+        try await TestVideoBuilder.writeH264(
+            to: secondVideo,
+            times: secondTimes,
+            levels: secondTimes.indices.map { UInt8(50 + $0 * 30) }
+        )
+        let photos = temp.appendingPathComponent("InvalidPhotos", isDirectory: true)
+        try FileManager.default.createDirectory(at: photos, withIntermediateDirectories: true)
+        try Data("not an image".utf8).write(to: photos.appendingPathComponent("broken.jpg"))
+
+        let metadata = ProjectMetadata(
+            title: "Mixed selection",
+            input: .mixed(
+                videos: [firstVideo.path, secondVideo.path],
+                photosFolder: photos.path
+            ),
+            requestedRunOptions: RequestedRunOptions(detailProfile: .fast)
+        )
+        let paths = ProjectPaths(root: projectURL)
+        try paths.ensureDirectories()
+        try ProjectMetadataStore.save(metadata, to: paths.metadataURL)
+        let toolchain = try makeToolchain(root: temp)
+        let events = PipelineEventSink()
+        let pipeline = PipelineRunner(
+            projectURL: projectURL,
+            config: makePipelineConfig(
+                toolchain: toolchain,
+                candidateRoute: .colmap,
+                stopAfterStage: .selectFrames
+            ),
+            tooling: .init(runner: MockSubprocessRunner(scripts: []))
+        )
+
+        try await pipeline.run { events.append($0) }
+
+        let saved = try ProjectMetadataStore.load(from: paths.metadataURL)
+        XCTAssertEqual(saved.state.stage, .selectFrames)
+        let manifest = try pipeline.loadSelectedFrameManifest(
+            from: paths.framesSelectedManifestURL
+        )
+        let firstGroup = manifest.filter { $0.groupId == "video_000" }
+        let secondGroup = manifest.filter { $0.groupId == "video_001" }
+        XCTAssertEqual(firstGroup.count, firstTimes.count)
+        XCTAssertEqual(secondGroup.count, secondTimes.count)
+        XCTAssertEqual(manifest.count, firstTimes.count + secondTimes.count)
+        XCTAssertEqual(firstGroup.first?.timestampSeconds ?? -1, firstTimes.first ?? -1, accuracy: 0.001)
+        XCTAssertEqual(firstGroup.last?.timestampSeconds ?? -1, firstTimes.last ?? -1, accuracy: 0.001)
+        XCTAssertEqual(secondGroup.first?.timestampSeconds ?? -1, secondTimes.first ?? -1, accuracy: 0.001)
+        XCTAssertEqual(secondGroup.last?.timestampSeconds ?? -1, secondTimes.last ?? -1, accuracy: 0.001)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: paths.framesRawURL.path))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: paths.framesRawManifestURL.path))
+
+        let extractionProgress = events.progressFractions(for: .extractFrames)
+        XCTAssertFalse(extractionProgress.isEmpty)
+        XCTAssertTrue(zip(extractionProgress, extractionProgress.dropFirst()).allSatisfy {
+            $1 >= $0
+        })
+        XCTAssertEqual(extractionProgress.last ?? -1, 1, accuracy: 0.000_001)
+        let selectionProgress = events.progressFractions(for: .selectFrames)
+        XCTAssertFalse(selectionProgress.isEmpty)
+        XCTAssertTrue(zip(selectionProgress, selectionProgress.dropFirst()).allSatisfy {
+            $1 >= $0
+        })
+        XCTAssertEqual(selectionProgress.last ?? -1, 1, accuracy: 0.000_001)
+    }
+
+    func testMultiVideoAnalysisRecoversBudgetAfterSparseClipSaturates() async throws {
+        let temp = makeTempRoot()
+        let projectURL = temp.appendingPathComponent(
+            "RedistributedVideoSelection.easysplatproj",
+            isDirectory: true
+        )
+        let denseVideo = temp.appendingPathComponent("dense.mov")
+        let sparseVideo = temp.appendingPathComponent("sparse.mov")
+        let denseTimes = (0..<120).map { Double($0) / 12 }
+        try await TestVideoBuilder.writeH264(
+            to: denseVideo,
+            times: denseTimes,
+            levels: denseTimes.indices.map { UInt8(40 + $0 % 180) },
+            expectedFrameRate: 12
+        )
+        try await TestVideoBuilder.writeH264(
+            to: sparseVideo,
+            times: [0, 90],
+            levels: [80, 120],
+            expectedFrameRate: 30
+        )
+
+        let metadata = ProjectMetadata(
+            title: "Redistributed selection",
+            input: .video(files: [denseVideo.path, sparseVideo.path]),
+            requestedRunOptions: RequestedRunOptions(detailProfile: .fast)
+        )
+        let paths = ProjectPaths(root: projectURL)
+        try paths.ensureDirectories()
+        try ProjectMetadataStore.save(metadata, to: paths.metadataURL)
+        let toolchain = try makeToolchain(root: temp)
+        let events = PipelineEventSink()
+        let pipeline = PipelineRunner(
+            projectURL: projectURL,
+            config: makePipelineConfig(
+                toolchain: toolchain,
+                candidateRoute: .colmap,
+                stopAfterStage: .selectFrames
+            ),
+            tooling: .init(runner: MockSubprocessRunner(scripts: []))
+        )
+
+        try await pipeline.run { events.append($0) }
+
+        let manifest = try pipeline.loadSelectedFrameManifest(
+            from: paths.framesSelectedManifestURL
+        )
+        XCTAssertEqual(manifest.filter { $0.groupId == "video_000" }.count, 118)
+        XCTAssertEqual(manifest.filter { $0.groupId == "video_001" }.count, 2)
+        XCTAssertEqual(manifest.count, 120)
+        let extractionProgress = events.progressFractions(for: .extractFrames)
+        XCTAssertTrue(zip(extractionProgress, extractionProgress.dropFirst()).allSatisfy {
+            $1 >= $0
+        })
+        XCTAssertEqual(extractionProgress.last ?? -1, 1, accuracy: 0.000_001)
+    }
+
     func testPipelineSuccessWithMapper() async throws {
         let temp = makeTempRoot()
         let projectURL = temp.appendingPathComponent("Test.easysplatproj", isDirectory: true)
@@ -3881,6 +4018,18 @@ private final class PipelineEventSink: @unchecked Sendable {
             guard case let .stageLog(_, line, _) = event, line.contains(fragment) else { return nil }
             return line
         }.first
+    }
+
+    func progressFractions(for stage: PipelineStage) -> [Double] {
+        lock.lock()
+        defer { lock.unlock() }
+        return events.compactMap { event in
+            guard case let .stageProgress(eventStage, fraction, _) = event,
+                  eventStage == stage else {
+                return nil
+            }
+            return fraction
+        }
     }
 }
 

@@ -114,6 +114,9 @@ public enum RunPlanResolver {
         resolvedPlan: ResolvedRunPlan,
         input: InputSpec
     ) throws {
+        if validPhotoCount == 0, input.hasVideos {
+            return
+        }
         try validatePhotoSelection(
             validPhotoCount: validPhotoCount,
             maximum: maximumValidPhotoCount(for: resolvedPlan, input: input)
@@ -162,6 +165,7 @@ public enum RunPlanResolver {
             || previousPlan.maximumImageDimension != currentPlan.maximumImageDimension
             || previousPlan.analysisFrameRate != currentPlan.analysisFrameRate
             || previousPlan.photoSelection != currentPlan.photoSelection
+            || previousPlan.capturePath != currentPlan.capturePath
         let geometryChanged = previousPlan.routeIdentifier != currentPlan.routeIdentifier
             || previousPlan.modelIdentifier != currentPlan.modelIdentifier
             || previousPlan.memoryTier != currentPlan.memoryTier
@@ -176,7 +180,6 @@ public enum RunPlanResolver {
             || previousPlan.colmapThreadLimit != currentPlan.colmapThreadLimit
             || previousPlan.requiredToolchainCapabilities != currentPlan.requiredToolchainCapabilities
             || previousPlan.fallbackRouteIdentifiers != currentPlan.fallbackRouteIdentifiers
-            || previousPlan.capturePath != currentPlan.capturePath
             || previousPlan.inputOrdering != currentPlan.inputOrdering
         let matchingOrMappingPolicyChanged = previousPlan.baGlobalFramesRatio != currentPlan.baGlobalFramesRatio
             || previousPlan.baGlobalPointsRatio != currentPlan.baGlobalPointsRatio

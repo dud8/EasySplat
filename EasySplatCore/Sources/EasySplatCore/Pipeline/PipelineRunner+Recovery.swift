@@ -1,4 +1,5 @@
 import Foundation
+import ImageIO
 import SQLite3
 
 extension PipelineRunner {
@@ -20,6 +21,7 @@ extension PipelineRunner {
         case geometryResidualsUnavailable(String)
         case geometryResidualsTooHigh(median: Double, p90: Double)
         case geometryProvenanceUnavailable(String)
+        case videoFrameBudgetTooSmall(required: Int, available: Int)
         case photoSelectionExceedsBudget(selected: Int, maximum: Int)
         case imageTranscodeFailed(String)
         case outputMissing
@@ -52,6 +54,45 @@ extension PipelineRunner {
         if fm.fileExists(atPath: url.path) || isSymlink {
             try? fm.removeItem(at: url)
         }
+    }
+
+    func cleanupRawFramesAfterDurableSelection(
+        paths: ProjectPaths,
+        metadata: ProjectMetadata
+    ) throws {
+        let fileManager = FileManager.default
+        let rawManifestExists = fileManager.fileExists(
+            atPath: paths.framesRawManifestURL.path
+        ) || ((try? fileManager.destinationOfSymbolicLink(
+            atPath: paths.framesRawManifestURL.path
+        )) != nil)
+        guard metadata.input.hasVideos,
+              rawManifestExists,
+              try validateStageOutput(
+                .selectFrames,
+                paths: paths,
+                metadata: metadata
+              ) == .valid else {
+            return
+        }
+        let rawExists = fileManager.fileExists(atPath: paths.framesRawURL.path)
+            || ((try? fileManager.destinationOfSymbolicLink(
+                atPath: paths.framesRawURL.path
+            )) != nil)
+        if rawExists {
+            try fileManager.removeItem(at: paths.framesRawURL)
+        }
+        let rawStillExists = fileManager.fileExists(atPath: paths.framesRawURL.path)
+            || ((try? fileManager.destinationOfSymbolicLink(
+                atPath: paths.framesRawURL.path
+            )) != nil)
+        guard !rawStillExists else {
+            throw CocoaError(
+                .fileWriteUnknown,
+                userInfo: [NSFilePathErrorKey: paths.framesRawURL.path]
+            )
+        }
+        try fileManager.removeItem(at: paths.framesRawManifestURL)
     }
 
     /// Clears every artifact that could make a new feature database appear to belong
@@ -104,6 +145,7 @@ extension PipelineRunner {
             return
         case .extractFrames:
             self.removeIfExists(paths.framesRawURL)
+            self.removeIfExists(paths.framesRawManifestURL)
             self.removeIfExists(paths.framesSelectedURL)
             self.removeIfExists(paths.framesSelectedManifestURL)
             self.removeIfExists(paths.colmapDatabaseURL)
@@ -185,6 +227,7 @@ extension PipelineRunner {
 
         if boundaryIndex < extractFramesIndex {
             try removeInvalidatedItem(paths.framesRawURL)
+            try removeInvalidatedItem(paths.framesRawManifestURL)
         }
         if boundaryIndex < selectFramesIndex {
             try removeInvalidatedItem(paths.framesSelectedURL)
@@ -264,6 +307,11 @@ extension PipelineRunner {
                 return (
                     "The installed reconstruction tools could not be verified. Reinstall the required tools.",
                     "Geometry provenance was unavailable: \(reason)"
+                )
+            case let .videoFrameBudgetTooSmall(required, available):
+                return (
+                    "This capture has too many separate clips for the selected detail.",
+                    "Preserving clip endpoints requires \(required) frames; the resolved budget is \(available)."
                 )
             case let .photoSelectionExceedsBudget(selected, maximum):
                 return (
@@ -412,33 +460,40 @@ extension PipelineRunner {
                 let dest = paths.importedPhotosURL
                 guard fm.fileExists(atPath: dest.path) else { return .missing }
                 let photos = try loadPhotos(in: dest)
-                if photos.isEmpty {
+                if photos.isEmpty, !metadata.input.hasVideos {
                     return .corrupt(reason: "photos folder \(name) is empty")
                 }
             }
             return .valid
         case .extractFrames:
             guard metadata.input.hasVideos else { return .valid }
-            for index in metadata.input.videoFiles.indices {
-                let rawDir = rawFramesDirectory(index: index, paths: paths)
-                guard fm.fileExists(atPath: rawDir.path) else { return .missing }
-                let frames = try loadImages(in: rawDir)
-                if frames.isEmpty {
-                    return .corrupt(reason: "raw frame folder \(rawDir.lastPathComponent) is empty")
-                }
-                let readableCount = frames.reduce(into: 0) { partial, frameURL in
-                    let size = (try? fm.attributesOfItem(atPath: frameURL.path)[.size] as? NSNumber)?.int64Value ?? 0
-                    if size > 0 {
-                        partial += 1
-                    }
-                }
-                if readableCount <= 0 {
-                    return .corrupt(reason: "raw frame folder \(rawDir.lastPathComponent) has no readable frames")
-                }
+            let currentIndex = PipelineStage.allCases.firstIndex(of: metadata.state.stage) ?? 0
+            let selectIndex = PipelineStage.allCases.firstIndex(of: .selectFrames) ?? 2
+            if currentIndex >= selectIndex,
+               try validateStageOutput(.selectFrames, paths: paths, metadata: metadata) == .valid {
+                return .valid
+            }
+            do {
+                _ = try ExtractedFrameManifestStore.loadVerified(
+                    paths: paths,
+                    expectedVideoCount: metadata.input.videoFiles.count,
+                    maximumTotalFrames: metadata.resolvedRunPlan?.keyframeBudget ?? 3_000
+                )
+            } catch ExtractedFrameManifestError.missingManifest {
+                return .missing
+            } catch {
+                return .corrupt(reason: "raw frame manifest or extracted frames are invalid")
             }
             return .valid
         case .selectFrames:
             guard fm.fileExists(atPath: paths.framesSelectedURL.path) else { return .missing }
+            let selectedDirectoryValues = try paths.framesSelectedURL.resourceValues(
+                forKeys: [.isDirectoryKey, .isSymbolicLinkKey]
+            )
+            guard selectedDirectoryValues.isDirectory == true,
+                  selectedDirectoryValues.isSymbolicLink != true else {
+                return .corrupt(reason: "selected frame directory is unsafe")
+            }
             guard fm.fileExists(atPath: paths.framesSelectedManifestURL.path) else {
                 return .corrupt(reason: "selected frame manifest is missing")
             }
@@ -455,9 +510,25 @@ extension PipelineRunner {
             if files.count != manifest.count {
                 return .corrupt(reason: "selected frame file count (\(files.count)) does not match manifest (\(manifest.count))")
             }
-            let names = Set(files.map(\.lastPathComponent))
-            for entry in manifest where !names.contains(entry.outputFileName) {
-                return .corrupt(reason: "manifest references missing file \(entry.outputFileName)")
+            let imageNames = files.map(\.lastPathComponent)
+            guard Set(imageNames).count == imageNames.count,
+                  Set(manifest.map(\.outputFileName)).count == manifest.count,
+                  Set(imageNames) == Set(manifest.map(\.outputFileName)) else {
+                return .corrupt(reason: "selected frame manifest does not match the selected files")
+            }
+            do {
+                _ = try Self.colmapPairGroups(
+                    imageNames: imageNames,
+                    manifest: manifest
+                )
+            } catch {
+                return .corrupt(reason: "selected frame manifest has invalid groups or timestamps")
+            }
+            if files.contains(where: { !ExtractedFrameManifestStore.isSafeRegularFrameFile($0) }) {
+                return .corrupt(reason: "selected frame directory contains an unsafe file")
+            }
+            if files.contains(where: { !Self.canDecodeSelectedFrame($0) }) {
+                return .corrupt(reason: "selected frame directory contains an unreadable image")
             }
             return .valid
         case .sfmFeatures:
@@ -604,6 +675,27 @@ extension PipelineRunner {
             }
             return validatePlyFile(at: output)
         }
+    }
+
+    private static func canDecodeSelectedFrame(_ url: URL) -> Bool {
+        guard let source = CGImageSourceCreateWithURL(url as CFURL, nil),
+              CGImageSourceGetCount(source) == 1 else {
+            return false
+        }
+        let options: [CFString: Any] = [
+            kCGImageSourceCreateThumbnailFromImageAlways: true,
+            kCGImageSourceCreateThumbnailWithTransform: true,
+            kCGImageSourceThumbnailMaxPixelSize: 8,
+            kCGImageSourceShouldCache: false,
+        ]
+        guard let image = CGImageSourceCreateThumbnailAtIndex(
+            source,
+            0,
+            options as CFDictionary
+        ) else {
+            return false
+        }
+        return image.width > 0 && image.height > 0
     }
 
     func colmapSparseTextStats(at sparseZero: URL) -> ColmapSparseTextStats {

@@ -250,6 +250,34 @@ final class PipelineRunnerImageFilteringTests: XCTestCase {
         XCTAssertEqual(try runner.loadPhotosForTesting(in: imported).count, 2)
     }
 
+    func testMixedImportAllowsAnAllInvalidPhotoFolderWhenVideoRemains() throws {
+        let root = try TestFileBuilder.makeTempDir()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let projectURL = root.appendingPathComponent("Project.easysplatproj", isDirectory: true)
+        let video = root.appendingPathComponent("walkthrough.mov")
+        try Data("video".utf8).write(to: video)
+        let photos = root.appendingPathComponent("Photos", isDirectory: true)
+        try FileManager.default.createDirectory(at: photos, withIntermediateDirectories: true)
+        try Data("not an image".utf8).write(to: photos.appendingPathComponent("broken.jpg"))
+
+        let paths = ProjectPaths(root: projectURL)
+        try paths.ensureDirectories()
+        let runner = try makeRunner(projectURL: projectURL)
+        let metadata = ProjectMetadata(
+            title: "Mixed",
+            input: .mixed(videos: [video.path], photosFolder: photos.path),
+            requestedRunOptions: RequestedRunOptions(detailProfile: .fast)
+        )
+
+        try runner.importInputs(metadata: metadata, paths: paths) { _, _ in }
+
+        XCTAssertEqual(try runner.loadPhotosForTesting(in: paths.importedPhotosURL), [])
+        XCTAssertEqual(
+            try runner.test_validateStageOutput(.importInput, paths: paths, metadata: metadata),
+            .valid
+        )
+    }
+
     func testImportInputsCopiesOnlyValidUniquePhotosWithStableCollisionNames() throws {
         let root = try TestFileBuilder.makeTempDir()
         defer { try? FileManager.default.removeItem(at: root) }
@@ -331,6 +359,128 @@ final class PipelineRunnerImageFilteringTests: XCTestCase {
         XCTAssertFalse(FileManager.default.fileExists(atPath: destination.path))
     }
 
+    func testAtomicInputCopyUsesCopyOnWriteCloneOnAPFS() throws {
+        let root = try TestFileBuilder.makeTempDir()
+        defer { try? FileManager.default.removeItem(at: root) }
+        var fileSystem = statfs()
+        guard statfs(root.path, &fileSystem) == 0 else {
+            throw XCTSkip("Could not inspect the test filesystem")
+        }
+        let fileSystemName = withUnsafePointer(to: &fileSystem.f_fstypename) { pointer in
+            pointer.withMemoryRebound(to: CChar.self, capacity: Int(MFSNAMELEN)) {
+                String(cString: $0)
+            }
+        }
+        guard fileSystemName == "apfs" else {
+            throw XCTSkip("Copy-on-write cloning requires APFS")
+        }
+
+        let source = root.appendingPathComponent("source.mov")
+        let destination = root.appendingPathComponent("destination.mov")
+        let original = Data(repeating: 0x2A, count: 2 * 1_024 * 1_024)
+        try original.write(to: source)
+        let attributeName = "com.easysplat.clone-test"
+        let attributeValue = Data("private-source-metadata".utf8)
+        let setAttributeResult = attributeValue.withUnsafeBytes { bytes in
+            source.path.withCString { path in
+                attributeName.withCString { name in
+                    setxattr(
+                        path,
+                        name,
+                        bytes.baseAddress,
+                        bytes.count,
+                        0,
+                        XATTR_NOFOLLOW
+                    )
+                }
+            }
+        }
+        XCTAssertEqual(setAttributeResult, 0)
+        XCTAssertEqual(chmod(source.path, S_IRUSR | S_IRGRP | S_IROTH), 0)
+        let runner = try makeRunner(projectURL: root)
+
+        let strategy = try runner.test_copyFileContents(
+            from: source,
+            to: destination
+        )
+
+        XCTAssertEqual(strategy, .copyOnWriteClone)
+        XCTAssertEqual(try Data(contentsOf: destination), original)
+        var sourceMetadata = stat()
+        var destinationMetadata = stat()
+        XCTAssertEqual(lstat(source.path, &sourceMetadata), 0)
+        XCTAssertEqual(lstat(destination.path, &destinationMetadata), 0)
+        XCTAssertNotEqual(sourceMetadata.st_ino, destinationMetadata.st_ino)
+        XCTAssertEqual(
+            destinationMetadata.st_mode & mode_t(0o7777),
+            mode_t(S_IRUSR | S_IWUSR)
+        )
+        let destinationAttributeSize = destination.path.withCString { path in
+            attributeName.withCString { name in
+                getxattr(path, name, nil, 0, 0, XATTR_NOFOLLOW)
+            }
+        }
+        XCTAssertEqual(destinationAttributeSize, -1)
+        XCTAssertEqual(errno, ENOATTR)
+        try Data(repeating: 0x51, count: original.count).write(to: destination)
+        XCTAssertEqual(try Data(contentsOf: source), original)
+    }
+
+    func testFilesystemCompressedAPFSInputUsesStreamedCopyWithoutCorruption() throws {
+        let root = try TestFileBuilder.makeTempDir()
+        defer { try? FileManager.default.removeItem(at: root) }
+        var fileSystem = statfs()
+        guard statfs(root.path, &fileSystem) == 0 else {
+            throw XCTSkip("Could not inspect the test filesystem")
+        }
+        let fileSystemName = withUnsafePointer(to: &fileSystem.f_fstypename) { pointer in
+            pointer.withMemoryRebound(to: CChar.self, capacity: Int(MFSNAMELEN)) {
+                String(cString: $0)
+            }
+        }
+        guard fileSystemName == "apfs" else {
+            throw XCTSkip("Filesystem compression requires APFS")
+        }
+
+        let plain = root.appendingPathComponent("plain.mov")
+        let source = root.appendingPathComponent("compressed.mov")
+        let destination = root.appendingPathComponent("destination.mov")
+        let original = Data(repeating: 0x2A, count: 2 * 1_024 * 1_024)
+        try original.write(to: plain)
+        let ditto = Process()
+        ditto.executableURL = URL(fileURLWithPath: "/usr/bin/ditto")
+        ditto.arguments = ["--hfsCompression", plain.path, source.path]
+        try ditto.run()
+        ditto.waitUntilExit()
+        guard ditto.terminationReason == .exit, ditto.terminationStatus == 0 else {
+            throw XCTSkip("Could not create an APFS-compressed fixture")
+        }
+        var sourceMetadata = stat()
+        guard lstat(source.path, &sourceMetadata) == 0,
+              sourceMetadata.st_flags & UInt32(UF_COMPRESSED) != 0 else {
+            throw XCTSkip("The test filesystem did not compress the fixture")
+        }
+        try FileManager.default.removeItem(at: plain)
+        let runner = try makeRunner(projectURL: root)
+
+        let strategy = try runner.test_copyFileContents(from: source, to: destination)
+
+        XCTAssertEqual(strategy, .streamed)
+        XCTAssertEqual(try Data(contentsOf: destination), original)
+        var destinationMetadata = stat()
+        XCTAssertEqual(lstat(destination.path, &destinationMetadata), 0)
+        XCTAssertEqual(destinationMetadata.st_size, sourceMetadata.st_size)
+        XCTAssertEqual(destinationMetadata.st_flags & UInt32(UF_COMPRESSED), 0)
+    }
+
+    func testCloneFailureFallsBackOnlyForUnsupportedOrCrossVolumeCopies() {
+        XCTAssertTrue(PipelineRunner.test_shouldFallBackFromCloneError(ENOTSUP))
+        XCTAssertTrue(PipelineRunner.test_shouldFallBackFromCloneError(EXDEV))
+        XCTAssertFalse(PipelineRunner.test_shouldFallBackFromCloneError(ENOSPC))
+        XCTAssertFalse(PipelineRunner.test_shouldFallBackFromCloneError(EIO))
+        XCTAssertFalse(PipelineRunner.test_shouldFallBackFromCloneError(EINVAL))
+    }
+
     func testFrameBudgetAppliesToPhotoOnlyInputs() throws {
         let root = try TestFileBuilder.makeTempDir()
         defer { try? FileManager.default.removeItem(at: root) }
@@ -362,6 +512,39 @@ final class PipelineRunnerImageFilteringTests: XCTestCase {
         XCTAssertEqual(budgeted.reduce(0) { $0 + $1.frames.count }, 120)
         XCTAssertTrue(budgeted.contains { $0.id == "video_000" })
         XCTAssertTrue(budgeted.contains { $0.id == "photos" })
+    }
+
+    func testFrameBudgetPreservesEveryVideoClipAndItsEndpoints() throws {
+        let root = try TestFileBuilder.makeTempDir()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let runner = try makeRunner(projectURL: root)
+        let shortVideo = (0..<3).map {
+            root.appendingPathComponent("short_\($0).jpg")
+        }
+        let longVideo = (0..<100).map {
+            root.appendingPathComponent("long_\($0).jpg")
+        }
+        let photos = (0..<100).map {
+            root.appendingPathComponent("photo_\($0).jpg")
+        }
+
+        let budgeted = try runner.test_applyFrameBudget(
+            to: [
+                .init(id: "video_000", frames: shortVideo, isVideo: true),
+                .init(id: "video_001", frames: longVideo, isVideo: true),
+                .init(id: "photos", frames: photos, isVideo: false),
+            ],
+            targetCount: 50
+        )
+
+        XCTAssertEqual(budgeted.reduce(0) { $0 + $1.frames.count }, 50)
+        for (id, source) in [("video_000", shortVideo), ("video_001", longVideo)] {
+            let frames = try XCTUnwrap(budgeted.first { $0.id == id }?.frames)
+            XCTAssertGreaterThanOrEqual(frames.count, 2)
+            XCTAssertEqual(frames.first, source.first)
+            XCTAssertEqual(frames.last, source.last)
+        }
+        XCTAssertNotNil(budgeted.first { $0.id == "photos" })
     }
 
     func testUseAllValidPhotosRejectsCorruptDuplicatesAndUnsafeCounts() throws {

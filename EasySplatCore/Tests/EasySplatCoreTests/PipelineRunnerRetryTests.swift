@@ -46,7 +46,12 @@ final class PipelineRunnerRetryTests: XCTestCase {
         XCTAssertFalse(runner.test_isStageComplete(.selectFrames, paths: paths, metadata: metadata))
 
         let file = paths.framesSelectedURL.appendingPathComponent("frame_000000.jpg")
-        TestFileBuilder.createFile(at: file, data: Data([0x00]))
+        XCTAssertTrue(try TestFileBuilder.writeGrayscaleImage(
+            url: file,
+            size: 16,
+            value: 64,
+            utType: .jpeg
+        ))
         let manifest = [TestSelectedFrameMapping(
             outputFileName: "frame_000000.jpg",
             groupId: "photos",
@@ -456,7 +461,7 @@ final class PipelineRunnerRetryTests: XCTestCase {
         XCTAssertEqual(status, .corrupt)
     }
 
-    func testValidateStageOutputExtractFramesAllowsLowFrameCount() throws {
+    func testValidateStageOutputExtractFramesRequiresCommittedManifest() throws {
         let root = try TestFileBuilder.makeTempDir()
         defer { try? FileManager.default.removeItem(at: root) }
         let paths = ProjectPaths(root: root)
@@ -480,8 +485,281 @@ final class PipelineRunnerRetryTests: XCTestCase {
         )
 
         let runner = makeRunner(projectURL: root)
-        let status = try runner.test_validateStageOutput(.extractFrames, paths: paths, metadata: metadata)
-        XCTAssertEqual(status, .valid)
+        XCTAssertEqual(
+            try runner.test_validateStageOutput(.extractFrames, paths: paths, metadata: metadata),
+            .missing
+        )
+
+        _ = try ExtractedFrameManifestStore.persist(
+            groups: [[rawDir.appendingPathComponent("frame_000000.jpg")]],
+            targetCounts: [1],
+            paths: paths
+        )
+        XCTAssertEqual(
+            try runner.test_validateStageOutput(.extractFrames, paths: paths, metadata: metadata),
+            .valid
+        )
+
+    }
+
+    func testValidateStageOutputTreatsSelectedFramesAsDurableSuccessorToRawFrames() throws {
+        let root = try TestFileBuilder.makeTempDir()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let paths = ProjectPaths(root: root)
+        try paths.ensureDirectories()
+
+        let selected = paths.framesSelectedURL.appendingPathComponent("frame_000000.jpg")
+        XCTAssertTrue(try TestFileBuilder.writeGrayscaleImage(
+            url: selected,
+            size: 16,
+            value: 64,
+            utType: .jpeg
+        ))
+        try JSONEncoder().encode([
+            PipelineRunner.SelectedFrameMapping(
+                outputFileName: selected.lastPathComponent,
+                groupId: "video_000",
+                isVideo: true,
+                timestampSeconds: 0,
+                lowLightExposureEV: nil
+            )
+        ]).write(to: paths.framesSelectedManifestURL, options: [.atomic])
+
+        var metadata = ProjectMetadata(
+            title: "Test",
+            input: .video(files: ["/tmp/video.mp4"]),
+            requestedRunOptions: RequestedRunOptions(capturePath: .orbit, detailProfile: .fast)
+        )
+        metadata.state = PipelineState(stage: .sfmFeatures, lastError: nil)
+
+        let runner = makeRunner(projectURL: root)
+        XCTAssertEqual(
+            try runner.test_validateStageOutput(.extractFrames, paths: paths, metadata: metadata),
+            .valid
+        )
+
+        TestFileBuilder.createFile(
+            at: paths.framesRawURL.appendingPathComponent("stale.jpg"),
+            data: Data("stale".utf8)
+        )
+        TestFileBuilder.createFile(
+            at: paths.framesRawManifestURL,
+            data: Data("stale".utf8)
+        )
+        try runner.test_cleanupRawFramesAfterDurableSelection(
+            paths: paths,
+            metadata: metadata
+        )
+        XCTAssertFalse(FileManager.default.fileExists(atPath: paths.framesRawURL.path))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: paths.framesRawManifestURL.path))
+    }
+
+    func testRawCleanupFailurePreservesManifestForRetry() throws {
+        let root = try TestFileBuilder.makeTempDir()
+        let paths = ProjectPaths(root: root)
+        try paths.ensureDirectories()
+        let rawFrame = paths.framesRawURL.appendingPathComponent("keep.jpg")
+        defer {
+            _ = chflags(rawFrame.path, 0)
+            try? FileManager.default.removeItem(at: root)
+        }
+
+        let selected = paths.framesSelectedURL.appendingPathComponent("frame_000000.jpg")
+        XCTAssertTrue(try TestFileBuilder.writeGrayscaleImage(
+            url: selected,
+            size: 16,
+            value: 64,
+            utType: .jpeg
+        ))
+        try JSONEncoder().encode([
+            PipelineRunner.SelectedFrameMapping(
+                outputFileName: selected.lastPathComponent,
+                groupId: "video_000",
+                isVideo: true,
+                timestampSeconds: 0
+            )
+        ]).write(to: paths.framesSelectedManifestURL, options: [.atomic])
+        TestFileBuilder.createFile(at: rawFrame, data: Data("raw".utf8))
+        TestFileBuilder.createFile(
+            at: paths.framesRawManifestURL,
+            data: Data("raw manifest".utf8)
+        )
+        XCTAssertEqual(chflags(rawFrame.path, UInt32(UF_IMMUTABLE)), 0)
+        var metadata = ProjectMetadata(
+            title: "Test",
+            input: .video(files: ["/tmp/video.mp4"])
+        )
+        metadata.state = PipelineState(stage: .sfmFeatures, lastError: nil)
+        let runner = makeRunner(projectURL: root)
+
+        XCTAssertThrowsError(try runner.test_cleanupRawFramesAfterDurableSelection(
+            paths: paths,
+            metadata: metadata
+        ))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: paths.framesRawURL.path))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: paths.framesRawManifestURL.path))
+    }
+
+    func testValidateStageOutputRejectsSelectedFrameLinks() throws {
+        for hardLink in [false, true] {
+            let root = try TestFileBuilder.makeTempDir()
+            defer { try? FileManager.default.removeItem(at: root) }
+            let paths = ProjectPaths(root: root)
+            try paths.ensureDirectories()
+            let outside = root.appendingPathComponent("outside.jpg")
+            XCTAssertTrue(try TestFileBuilder.writeGrayscaleImage(
+                url: outside,
+                size: 16,
+                value: 64,
+                utType: .jpeg
+            ))
+            let selected = paths.framesSelectedURL.appendingPathComponent("frame_000000.jpg")
+            if hardLink {
+                try FileManager.default.linkItem(at: outside, to: selected)
+            } else {
+                try FileManager.default.createSymbolicLink(at: selected, withDestinationURL: outside)
+            }
+            try JSONEncoder().encode([
+                PipelineRunner.SelectedFrameMapping(
+                    outputFileName: selected.lastPathComponent,
+                    groupId: "video_000",
+                    isVideo: true,
+                    timestampSeconds: 0,
+                    lowLightExposureEV: nil
+                )
+            ]).write(to: paths.framesSelectedManifestURL, options: [.atomic])
+
+            let metadata = ProjectMetadata(
+                title: "Test",
+                input: .video(files: ["/tmp/video.mp4"])
+            )
+            XCTAssertEqual(
+                try makeRunner(projectURL: root).test_validateStageOutput(
+                    .selectFrames,
+                    paths: paths,
+                    metadata: metadata
+                ),
+                .corrupt
+            )
+        }
+    }
+
+    func testInvalidSelectedSuccessorDoesNotDeleteRawFrames() throws {
+        let root = try TestFileBuilder.makeTempDir()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let paths = ProjectPaths(root: root)
+        try paths.ensureDirectories()
+        let selected = (0..<2).map { index in
+            paths.framesSelectedURL.appendingPathComponent(
+                String(format: "frame_%06d.jpg", index)
+            )
+        }
+        for (index, file) in selected.enumerated() {
+            XCTAssertTrue(try TestFileBuilder.writeGrayscaleImage(
+                url: file,
+                size: 16,
+                value: UInt8(64 + index),
+                utType: .jpeg
+            ))
+        }
+        try JSONEncoder().encode([
+            PipelineRunner.SelectedFrameMapping(
+                outputFileName: selected[0].lastPathComponent,
+                groupId: "",
+                isVideo: true,
+                timestampSeconds: 0
+            ),
+            PipelineRunner.SelectedFrameMapping(
+                outputFileName: selected[0].lastPathComponent,
+                groupId: "",
+                isVideo: true,
+                timestampSeconds: 1
+            ),
+        ]).write(to: paths.framesSelectedManifestURL, options: [.atomic])
+        TestFileBuilder.createFile(
+            at: paths.framesRawURL.appendingPathComponent("keep.jpg"),
+            data: Data("raw".utf8)
+        )
+        TestFileBuilder.createFile(
+            at: paths.framesRawManifestURL,
+            data: Data("raw manifest".utf8)
+        )
+        var metadata = ProjectMetadata(
+            title: "Test",
+            input: .video(files: ["/tmp/video.mp4"])
+        )
+        metadata.state = PipelineState(stage: .sfmFeatures, lastError: nil)
+        let runner = makeRunner(projectURL: root)
+
+        XCTAssertEqual(
+            try runner.test_validateStageOutput(
+                .selectFrames,
+                paths: paths,
+                metadata: metadata
+            ),
+            .corrupt
+        )
+        try runner.test_cleanupRawFramesAfterDurableSelection(
+            paths: paths,
+            metadata: metadata
+        )
+        XCTAssertTrue(FileManager.default.fileExists(atPath: paths.framesRawURL.path))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: paths.framesRawManifestURL.path))
+    }
+
+    func testUnreadableSelectedSuccessorDoesNotDeleteRawFrames() throws {
+        let root = try TestFileBuilder.makeTempDir()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let paths = ProjectPaths(root: root)
+        try paths.ensureDirectories()
+        let selected = (0..<2).map { index in
+            paths.framesSelectedURL.appendingPathComponent(
+                String(format: "frame_%06d.jpg", index)
+            )
+        }
+        for file in selected {
+            TestFileBuilder.createFile(
+                at: file,
+                data: Data("regular file, not an image".utf8)
+            )
+        }
+        try JSONEncoder().encode(selected.enumerated().map { index, file in
+            PipelineRunner.SelectedFrameMapping(
+                outputFileName: file.lastPathComponent,
+                groupId: "video_000",
+                isVideo: true,
+                timestampSeconds: Double(index)
+            )
+        }).write(to: paths.framesSelectedManifestURL, options: [.atomic])
+        TestFileBuilder.createFile(
+            at: paths.framesRawURL.appendingPathComponent("keep.jpg"),
+            data: Data("raw".utf8)
+        )
+        TestFileBuilder.createFile(
+            at: paths.framesRawManifestURL,
+            data: Data("raw manifest".utf8)
+        )
+        var metadata = ProjectMetadata(
+            title: "Test",
+            input: .video(files: ["/tmp/video.mp4"])
+        )
+        metadata.state = PipelineState(stage: .sfmFeatures, lastError: nil)
+        let runner = makeRunner(projectURL: root)
+
+        XCTAssertEqual(
+            try runner.test_validateStageOutput(
+                .selectFrames,
+                paths: paths,
+                metadata: metadata
+            ),
+            .corrupt
+        )
+        try runner.test_cleanupRawFramesAfterDurableSelection(
+            paths: paths,
+            metadata: metadata
+        )
+        XCTAssertTrue(FileManager.default.fileExists(atPath: paths.framesRawURL.path))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: paths.framesRawManifestURL.path))
     }
 
     func testValidateStageOutputDetectsCorruptPly() throws {
@@ -513,6 +791,21 @@ final class PipelineRunnerRetryTests: XCTestCase {
         XCTAssertFalse(FileManager.default.fileExists(atPath: paths.framesSelectedManifestURL.path))
         XCTAssertFalse(FileManager.default.fileExists(atPath: paths.colmapDatabaseURL.path))
         XCTAssertFalse(FileManager.default.fileExists(atPath: paths.pairGraphEvidenceURL.path))
+    }
+
+    func testCleanForRetryExtractFramesRemovesRawManifest() throws {
+        let root = try TestFileBuilder.makeTempDir()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let paths = ProjectPaths(root: root)
+        try paths.ensureDirectories()
+        TestFileBuilder.createFile(at: paths.framesRawManifestURL, data: Data("{}".utf8))
+
+        try makeRunner(projectURL: root).test_cleanForRetry(
+            failedStage: .extractFrames,
+            paths: paths
+        )
+
+        XCTAssertFalse(FileManager.default.fileExists(atPath: paths.framesRawManifestURL.path))
     }
 
     func testCleanForMatchingRetryPreservesFeaturesAndClearsOnlyDownstreamState() throws {

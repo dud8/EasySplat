@@ -21,23 +21,63 @@ public enum FrameScoring {
     }
 
     public static func scoreFrame(cgImage: CGImage) -> FrameScore {
-        let grayscale = grayscalePixels(cgImage: cgImage, width: 64, height: 64)
-        let blur = blurScore(pixels: grayscale, width: 64, height: 64)
-        let laplacian = laplacianVariance(pixels: grayscale, width: 64, height: 64)
-        let exposure = exposureScore(pixels: grayscale)
+        let luma = lumaPixels(cgImage: cgImage, width: 64, height: 64)
+        return scoreFrame(cgImage: cgImage, lumaPixels: luma)
+    }
+
+    static func scoreFrame(cgImage: CGImage, lumaPixels: [UInt8]) -> FrameScore {
+        var score = scoreLumaPixels(lumaPixels, width: 64, height: 64)
         let maximumColorComponent = maximumColorComponent(cgImage: cgImage, width: 64, height: 64)
-        let hash = dHash(pixels: grayscale, width: 64, height: 64)
+        score.maximumColorComponent = maximumColorComponent
+        score.lowLightExposureEV = lowLightExposureEV(
+            brightness: score.brightness,
+            maximumColorComponent: maximumColorComponent
+        )
+        return score
+    }
+
+    static func lumaPixels(cgImage: CGImage, width: Int, height: Int) -> [UInt8] {
+        grayscalePixels(cgImage: cgImage, width: width, height: height)
+    }
+
+    static func scoreLumaPixels(
+        _ pixels: [UInt8],
+        width: Int,
+        height: Int
+    ) -> FrameScore {
+        guard width > 0,
+              height > 0,
+              pixels.count >= width * height else {
+            return FrameScore(
+                blurScore: 0,
+                laplacianScore: 0,
+                brightness: 0,
+                maximumColorComponent: 0,
+                clippedFraction: 1,
+                lowLightExposureEV: 0,
+                dHash: 0
+            )
+        }
+        let samples = pixels.count == width * height
+            ? pixels
+            : Array(pixels.prefix(width * height))
+        let exposure = exposureScore(pixels: samples)
+        let maximum = Double(samples.max() ?? 0) / 255
         return FrameScore(
-            blurScore: blur,
-            laplacianScore: laplacian,
+            blurScore: blurScore(pixels: samples, width: width, height: height),
+            laplacianScore: laplacianVariance(
+                pixels: samples,
+                width: width,
+                height: height
+            ),
             brightness: exposure.brightness,
-            maximumColorComponent: maximumColorComponent,
+            maximumColorComponent: maximum,
             clippedFraction: exposure.clippedFraction,
             lowLightExposureEV: lowLightExposureEV(
                 brightness: exposure.brightness,
-                maximumColorComponent: maximumColorComponent
+                maximumColorComponent: maximum
             ),
-            dHash: hash
+            dHash: dHash(pixels: samples, width: width, height: height)
         )
     }
 

@@ -33,15 +33,6 @@ final class PipelineRunnerHelperTests: XCTestCase {
         XCTAssertEqual(runner.test_downsampleFrames(urls, targetCount: 10), urls)
     }
 
-    func testTargetCountForVideoDistribution() throws {
-        let root = try TestFileBuilder.makeTempDir()
-        defer { try? FileManager.default.removeItem(at: root) }
-        let runner = makeRunner(projectURL: root)
-        XCTAssertEqual(runner.test_targetCountForVideo(index: 0, total: 3, targetCount: 10), 4)
-        XCTAssertEqual(runner.test_targetCountForVideo(index: 1, total: 3, targetCount: 10), 3)
-        XCTAssertEqual(runner.test_targetCountForVideo(index: 2, total: 3, targetCount: 10), 3)
-    }
-
     func testResolveSparseModelDirectoryHandlesNestedOutputs() throws {
         let root = try TestFileBuilder.makeTempDir()
         defer { try? FileManager.default.removeItem(at: root) }

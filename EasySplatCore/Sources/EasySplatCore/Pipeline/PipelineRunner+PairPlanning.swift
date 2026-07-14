@@ -74,6 +74,7 @@ extension PipelineRunner {
         var groupOrder: [String] = []
         var framesByGroup: [String: [String]] = [:]
         var videoFlagByGroup: [String: Bool] = [:]
+        var lastTimestampByVideoGroup: [String: Double] = [:]
         for imageName in imageNames {
             guard let entries = mappingByName[imageName], entries.count == 1,
                   let entry = entries.first,
@@ -81,6 +82,18 @@ extension PipelineRunner {
                 throw PairPolicyError.invalidSelectedFrameManifest
             }
             if let existing = videoFlagByGroup[entry.groupId], existing != entry.isVideo {
+                throw PairPolicyError.invalidSelectedFrameManifest
+            }
+            if entry.isVideo {
+                guard let timestamp = entry.timestampSeconds,
+                      timestamp.isFinite,
+                      timestamp >= 0,
+                      lastTimestampByVideoGroup[entry.groupId]
+                        .map({ timestamp > $0 }) ?? true else {
+                    throw PairPolicyError.invalidSelectedFrameManifest
+                }
+                lastTimestampByVideoGroup[entry.groupId] = timestamp
+            } else if entry.timestampSeconds != nil {
                 throw PairPolicyError.invalidSelectedFrameManifest
             }
             if videoFlagByGroup[entry.groupId] == nil {

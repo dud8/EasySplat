@@ -16,6 +16,7 @@ public struct ProjectPaths: Sendable {
     public var originalsURL: URL { root.appendingPathComponent("Originals", isDirectory: true) }
     public var importedPhotosURL: URL { originalsURL.appendingPathComponent("Photos", isDirectory: true) }
     public var framesRawURL: URL { root.appendingPathComponent("Frames/raw", isDirectory: true) }
+    public var framesRawManifestURL: URL { root.appendingPathComponent("Frames/raw_manifest.json") }
     public var framesSelectedURL: URL { root.appendingPathComponent("Frames/selected", isDirectory: true) }
     public var framesSelectedManifestURL: URL { root.appendingPathComponent("Frames/selected_manifest.json") }
     public var colmapDatabaseURL: URL { root.appendingPathComponent("SfM/colmap/database.db") }

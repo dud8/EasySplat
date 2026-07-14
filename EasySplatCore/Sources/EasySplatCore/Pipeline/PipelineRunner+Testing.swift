@@ -30,6 +30,24 @@ enum TestStageOutputStatus: Equatable, Sendable {
 }
 
 extension PipelineRunner {
+    func test_copyFileContents(
+        from source: URL,
+        to destination: URL
+    ) throws -> LocalFileCopyStrategy {
+        try copyFileContents(from: source, to: destination)
+    }
+
+    static func test_videoAnalysisConcurrency(
+        threadLimit: Int,
+        videoCount: Int
+    ) -> Int {
+        videoAnalysisConcurrency(threadLimit: threadLimit, videoCount: videoCount)
+    }
+
+    static func test_shouldFallBackFromCloneError(_ code: Int32) -> Bool {
+        shouldFallBackFromCloneError(code)
+    }
+
     func loadImagesForTesting(in directory: URL) throws -> [URL] {
         try loadImages(in: directory)
     }
@@ -39,7 +57,7 @@ extension PipelineRunner {
     }
 
     func test_downsampleFrames(_ frames: [URL], targetCount: Int) -> [URL] {
-        downsampleFrames(frames, targetCount: targetCount)
+        evenlySpacedFrames(frames, targetCount: targetCount)
     }
 
     func test_downsampleSelectedFrames(to targetCount: Int, paths: ProjectPaths) throws -> [URL]? {
@@ -100,39 +118,8 @@ extension PipelineRunner {
         try selectedImagesHaveUniformPixelDimensions(images)
     }
 
-    func test_targetCountForVideo(index: Int, total: Int, targetCount: Int) -> Int {
-        targetCountForVideo(index: index, total: total, targetCount: targetCount)
-    }
-
     func test_resolveSparseModelDirectory(_ candidate: URL) throws -> URL {
         try resolveSparseModelDirectory(at: candidate)
-    }
-
-    func test_filterVeryBlurryVideoFrames(
-        frames: [URL],
-        sharpnessByFrame: [URL: Double],
-        sharpnessFloor: Double,
-        maxDropFraction: Double,
-        floorScale: Double
-    ) -> (frames: [URL], dropped: Int) {
-        let profile = FrameExtractionProfile(
-            targetCount: 0,
-            maxDimension: 0,
-            targetFPS: 1,
-            minDistanceRatio: 0,
-            sharpnessFloor: sharpnessFloor,
-            sharpnessRatio: 0,
-            outputFormat: .jpeg,
-            maxExtractedFrames: nil
-        )
-        let result = filterVeryBlurryVideoFrames(
-            frames: frames,
-            sharpnessByFrame: sharpnessByFrame,
-            profile: profile,
-            maxDropFraction: maxDropFraction,
-            floorScale: floorScale
-        )
-        return (result.frames, result.dropped)
     }
 
     func test_shouldUseSequential(selectedFrames: [URL], input: InputSpec, forceExhaustive: Bool) -> Bool {
@@ -185,6 +172,13 @@ extension PipelineRunner {
         try cleanForRetry(failedStage: failedStage, paths: paths)
     }
 
+    func test_cleanupRawFramesAfterDurableSelection(
+        paths: ProjectPaths,
+        metadata: ProjectMetadata
+    ) throws {
+        try cleanupRawFramesAfterDurableSelection(paths: paths, metadata: metadata)
+    }
+
     func test_persistResolvedPlanChange(
         _ resolvedPlan: ResolvedRunPlan,
         completedBoundary: PipelineStage?,
@@ -229,6 +223,10 @@ extension PipelineRunner {
 
     func test_makePipelineErrorPhotoSelectionExceedsBudget(selected: Int, maximum: Int) -> Error {
         PipelineError.photoSelectionExceedsBudget(selected: selected, maximum: maximum)
+    }
+
+    func test_makePipelineErrorVideoFrameBudgetTooSmall(required: Int, available: Int) -> Error {
+        PipelineError.videoFrameBudgetTooSmall(required: required, available: available)
     }
 
     func test_makePipelineErrorOutputMissing() -> Error {

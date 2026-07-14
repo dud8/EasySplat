@@ -256,7 +256,10 @@ final class ColmapPairPlanningPolicyTests: XCTestCase {
         PipelineRunner.SelectedFrameMapping(
             outputFileName: name,
             groupId: group,
-            isVideo: video
+            isVideo: video,
+            timestampSeconds: video
+                ? Double(name.filter(\.isNumber)) ?? 0
+                : nil
         )
     }
 

@@ -183,6 +183,46 @@ final class RunPlanResolverTests: XCTestCase {
         )
     }
 
+    func testDA3CapturePathChangeInvalidatesVideoFrameSelection() {
+        let input = InputSpec.video(files: ["/tmp/clip.mov"])
+        let hardware = HardwareProfile(
+            memoryGB: 48,
+            cpuCount: 16,
+            gpuWorkingSetGB: 36
+        )
+        let automatic = RunPlanResolver.resolve(
+            requestedOptions: RequestedRunOptions(
+                capturePath: .automatic,
+                detailProfile: .balanced
+            ),
+            input: input,
+            hardware: hardware,
+            developmentOverrides: DevelopmentOverrides(candidateRoute: .da3)
+        )
+        let orbit = RunPlanResolver.resolve(
+            requestedOptions: RequestedRunOptions(
+                capturePath: .orbit,
+                detailProfile: .balanced
+            ),
+            input: input,
+            hardware: hardware,
+            developmentOverrides: DevelopmentOverrides(candidateRoute: .da3)
+        )
+
+        XCTAssertEqual(automatic.keyframeBudget, orbit.keyframeBudget)
+        XCTAssertEqual(automatic.analysisFrameRate, orbit.analysisFrameRate)
+        XCTAssertEqual(automatic.maximumImageDimension, orbit.maximumImageDimension)
+        XCTAssertEqual(
+            RunPlanResolver.safeResumeStage(
+                .trainSplat,
+                input: input,
+                previousPlan: automatic,
+                currentPlan: orbit
+            ),
+            .importInput
+        )
+    }
+
     func testMaximumPerformanceNeverOverridesSixteenGBSafetyBoundary() {
         let constrained = RunPlanResolver.resolve(
             requestedOptions: RequestedRunOptions(
@@ -627,6 +667,25 @@ final class RunPlanResolverTests: XCTestCase {
         }
     }
 
+    func testMixedInputAllowsNoValidPhotosWhenVideoRemains() {
+        let input = InputSpec.mixed(
+            videos: ["/tmp/walkthrough.mov"],
+            photosFolder: "/tmp/photos"
+        )
+        let plan = RunPlanResolver.resolve(
+            requestedOptions: RequestedRunOptions(),
+            input: input,
+            hardware: HardwareProfile(memoryGB: 24, cpuCount: 12, gpuWorkingSetGB: 18),
+            developmentOverrides: .none
+        )
+
+        XCTAssertNoThrow(try RunPlanResolver.validatePhotoSelection(
+            validPhotoCount: 0,
+            resolvedPlan: plan,
+            input: input
+        ))
+    }
+
     func testAutomaticPhotoSelectionHasNoPreflightPhotoLimit() throws {
         let plan = RunPlanResolver.resolve(
             requestedOptions: RequestedRunOptions(photoSelection: .automatic),
@@ -733,6 +792,18 @@ final class RunPlanResolverTests: XCTestCase {
                 input: video,
                 previousPlan: currentVideoPlan,
                 currentPlan: frameRatePlan
+            ),
+            .importInput
+        )
+
+        var capturePathPlan = currentVideoPlan
+        capturePathPlan.capturePath = .orbit
+        XCTAssertEqual(
+            RunPlanResolver.safeResumeStage(
+                .trainSplat,
+                input: video,
+                previousPlan: currentVideoPlan,
+                currentPlan: capturePathPlan
             ),
             .importInput
         )

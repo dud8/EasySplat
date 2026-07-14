@@ -394,6 +394,9 @@ public final class PipelineRunner: @unchecked Sendable {
             updateThreadEnvironment(&colmapMatchOptions, threadCount: colmapThreads)
             var selectedFrames: [URL] = []
             var selectedFrameManifest: [SelectedFrameMapping] = []
+            var preparedPhotoFilter: ValidPhotoFilterResult?
+            var resolvedFrameTargets: GlobalFrameTargets?
+            var verifiedRawFrameManifest: ExtractedFrameManifest?
             if metadata.input.hasVideos {
                 if try shouldRunStage(.extractFrames) {
                     currentStage = .extractFrames
@@ -404,46 +407,212 @@ public final class PipelineRunner: @unchecked Sendable {
                         line: "Target frames: \(targetFrames).",
                         isError: false
                     ))
+                    self.removeIfExists(paths.framesRawManifestURL)
+                    try self.resetDirectory(paths.framesRawURL)
                     let extractor = FrameExtractor()
                     let videos = metadata.input.videoFiles
                     let importedVideos = importedVideoURLs(for: videos, paths: paths)
-                    let totalVideos = Double(max(videos.count, 1))
+                    let analysisOptions = FrameExtractionOptions(
+                        targetCount: targetFrames,
+                        maxDimension: maxDim,
+                        targetFPS: frameProfile.targetFPS,
+                        minDistanceRatio: frameProfile.minDistanceRatio,
+                        outputFormat: frameProfile.outputFormat
+                    )
+                    var sources: [FrameExtractionSource] = []
+                    sources.reserveCapacity(videos.count)
                     for (index, file) in videos.enumerated() {
                         try Task.checkCancellation()
                         let sourceName = URL(fileURLWithPath: file).lastPathComponent
-                        let videoURL = importedVideos[index]
-                        let perVideoTarget = targetCountForVideo(index: index, total: videos.count, targetCount: targetFrames)
-                        if perVideoTarget == 0 {
-                            continue
-                        }
-                        let perVideoExtractionCap = frameProfile.maxExtractedFrames.map {
-                            targetCountForVideo(index: index, total: videos.count, targetCount: $0)
-                        }
                         emit(.stageLog(
                             stage: .extractFrames,
-                            line: "Extracting frames from \(sourceName) (target=\(perVideoTarget), maxDim=\(Int(maxDim))px, rawCap=\(perVideoExtractionCap.map(String.init) ?? "none")).",
+                            line: "Inspecting \(sourceName).",
+                            isError: false
+                        ))
+                        sources.append(try await extractor.inspect(importedVideos[index]))
+                    }
+                    var cumulativeDurations = [0.0]
+                    cumulativeDurations.reserveCapacity(sources.count + 1)
+                    for source in sources {
+                        cumulativeDurations.append(
+                            cumulativeDurations[cumulativeDurations.count - 1]
+                                + source.durationSeconds
+                        )
+                    }
+                    let totalVideoDuration = cumulativeDurations.last ?? 0
+                    guard totalVideoDuration.isFinite, totalVideoDuration > 0 else {
+                        throw PipelineError.invalidInput
+                    }
+                    if metadata.input.hasPhotos {
+                        let discoveredPhotos = try loadPhotos(in: paths.importedPhotosURL)
+                        preparedPhotoFilter = try filterValidUniquePhotos(discoveredPhotos)
+                    }
+                    let preliminaryPlan = try resolveGlobalFrameTargets(
+                        videos: sources.map {
+                            VideoFrameAllocationInput(
+                                durationSeconds: $0.durationSeconds,
+                                availableCandidateCount: targetFrames
+                            )
+                        },
+                        validPhotoCount: preparedPhotoFilter?.frames.count ?? 0,
+                        targetCount: targetFrames,
+                        photoSelection: resolvedRunPlan.photoSelection
+                    )
+                    let preliminaryTargets = preliminaryPlan.videoTargets
+                    let analysisConcurrency = Self.videoAnalysisConcurrency(
+                        threadLimit: resolvedRunPlan.colmapThreadLimit,
+                        videoCount: sources.count
+                    )
+                    for file in videos {
+                        try Task.checkCancellation()
+                        let sourceName = URL(fileURLWithPath: file).lastPathComponent
+                        emit(.stageLog(
+                            stage: .extractFrames,
+                            line: "Analyzing \(sourceName).",
+                            isError: false
+                        ))
+                    }
+                    let initialAnalysisProgress = WeightedVideoAnalysisProgress(
+                        weights: sources.map(\.durationSeconds),
+                        base: 0,
+                        span: 0.4
+                    ) { fraction in
+                        emit(.stageProgress(
+                            stage: .extractFrames,
+                            fraction: fraction,
+                            message: "Analyzing videos"
+                        ))
+                    }
+                    var analyses = try await analyzeVideoSources(
+                        sources,
+                        options: analysisOptions,
+                        targetCounts: preliminaryTargets,
+                        maximumConcurrency: analysisConcurrency
+                    ) { index, fraction in
+                        initialAnalysisProgress.update(index: index, fraction: fraction)
+                    }
+                    emit(.stageProgress(
+                        stage: .extractFrames,
+                        fraction: 0.4,
+                        message: "Analyzing videos"
+                    ))
+                    let attainablePlan = try resolveGlobalFrameTargets(
+                        videos: analyses.map {
+                            VideoFrameAllocationInput(
+                                durationSeconds: $0.durationSeconds,
+                                availableCandidateCount: $0.decodedFrameCount
+                            )
+                        },
+                        validPhotoCount: preparedPhotoFilter?.frames.count ?? 0,
+                        targetCount: targetFrames,
+                        photoSelection: resolvedRunPlan.photoSelection
+                    )
+                    let reanalysisIndices = analyses.indices.filter {
+                        analyses[$0].availableCandidateCount
+                            < attainablePlan.videoTargets[$0]
+                    }
+                    for index in reanalysisIndices {
+                        try Task.checkCancellation()
+                        let sourceName = URL(fileURLWithPath: videos[index]).lastPathComponent
+                        emit(.stageLog(
+                            stage: .extractFrames,
+                            line: "Analyzing \(sourceName) again after redistributing the frame budget.",
+                            isError: false
+                        ))
+                    }
+                    if !reanalysisIndices.isEmpty {
+                        let sourcesToReanalyze = reanalysisIndices.map { sources[$0] }
+                        let reanalysisTargets = reanalysisIndices.map {
+                            attainablePlan.videoTargets[$0]
+                        }
+                        let reanalysisProgress = WeightedVideoAnalysisProgress(
+                            weights: sourcesToReanalyze.map(\.durationSeconds),
+                            base: 0.4,
+                            span: 0.05
+                        ) { fraction in
+                            emit(.stageProgress(
+                                stage: .extractFrames,
+                                fraction: fraction,
+                                message: "Analyzing videos"
+                            ))
+                        }
+                        let expandedAnalyses = try await analyzeVideoSources(
+                            sourcesToReanalyze,
+                            options: analysisOptions,
+                            targetCounts: reanalysisTargets,
+                            maximumConcurrency: min(
+                                analysisConcurrency,
+                                sourcesToReanalyze.count
+                            )
+                        ) { index, fraction in
+                            reanalysisProgress.update(index: index, fraction: fraction)
+                        }
+                        for (offset, sourceIndex) in reanalysisIndices.enumerated() {
+                            analyses[sourceIndex] = expandedAnalyses[offset]
+                        }
+                    }
+                    emit(.stageProgress(
+                        stage: .extractFrames,
+                        fraction: 0.45,
+                        message: "Choosing frames"
+                    ))
+                    let finalPlan = try resolveGlobalFrameTargets(
+                        videos: analyses.map {
+                            VideoFrameAllocationInput(
+                                durationSeconds: $0.durationSeconds,
+                                availableCandidateCount: $0.availableCandidateCount
+                            )
+                        },
+                        validPhotoCount: preparedPhotoFilter?.frames.count ?? 0,
+                        targetCount: targetFrames,
+                        photoSelection: resolvedRunPlan.photoSelection
+                    )
+                    if finalPlan.totalTargetCount < attainablePlan.totalTargetCount {
+                        emit(.stageLog(
+                            stage: .extractFrames,
+                            line: "Using \(finalPlan.totalTargetCount) frames because only that many decoded frames produced valid analysis data.",
+                            isError: true
+                        ))
+                    }
+                    resolvedFrameTargets = finalPlan
+                    let targets = finalPlan.videoTargets
+                    var extractedGroups: [[URL]] = []
+                    extractedGroups.reserveCapacity(analyses.count)
+                    for (index, analysis) in analyses.enumerated() {
+                        try Task.checkCancellation()
+                        let perVideoTarget = targets[index]
+                        guard perVideoTarget > 0 else {
+                            throw PipelineError.videoFrameBudgetTooSmall(
+                                required: videos.count,
+                                available: targets.reduce(0, +)
+                            )
+                        }
+                        let sourceName = URL(fileURLWithPath: videos[index]).lastPathComponent
+                        emit(.stageLog(
+                            stage: .extractFrames,
+                            line: "Extracting \(perVideoTarget) frames from \(sourceName).",
                             isError: false
                         ))
                         let rawDir = rawFramesDirectory(index: index, paths: paths)
                         try self.resetDirectory(rawDir)
+                        var outputOptions = analysisOptions
+                        outputOptions.targetCount = perVideoTarget
+                        let progressStartDuration = cumulativeDurations[index]
+                        let progressClipDuration = sources[index].durationSeconds
                         let extracted = try await extractor.extractFrames(
-                            from: videoURL,
+                            from: analysis,
+                            targetCount: perVideoTarget,
                             to: rawDir,
-                            options: FrameExtractionOptions(
-                                targetCount: perVideoTarget,
-                                maxDimension: maxDim,
-                                targetFPS: frameProfile.targetFPS,
-                                minDistanceRatio: frameProfile.minDistanceRatio,
-                                sharpnessFloor: frameProfile.sharpnessFloor,
-                                sharpnessRatio: frameProfile.sharpnessRatio,
-                                outputFormat: frameProfile.outputFormat,
-                                maxExtractedFrames: perVideoExtractionCap
-                            ),
+                            options: outputOptions,
                             progress: { fraction, message in
-                                let scaled = (Double(index) / totalVideos) + (fraction / totalVideos)
+                                let completedDuration = progressStartDuration
+                                    + progressClipDuration * fraction
+                                let scaled = 0.45
+                                    + 0.55 * completedDuration / totalVideoDuration
                                 emit(.stageProgress(stage: .extractFrames, fraction: scaled, message: message))
                             }
                         )
+                        extractedGroups.append(extracted)
                         emit(.stageLog(
                             stage: .extractFrames,
                             line: "Wrote \(extracted.count) extracted frame(s) from \(sourceName).",
@@ -451,7 +620,8 @@ public final class PipelineRunner: @unchecked Sendable {
                         ))
                         writeCheckpoint(
                             stage: .extractFrames,
-                            progress: Double(index + 1) / totalVideos,
+                            progress: 0.45
+                                + 0.55 * cumulativeDurations[index + 1] / totalVideoDuration,
                             message: "Extracted \(extracted.count) frames from \(sourceName)",
                             details: .extractFrames(ExtractFramesCheckpoint(
                                 videoIndex: index,
@@ -461,6 +631,11 @@ public final class PipelineRunner: @unchecked Sendable {
                             ))
                         )
                     }
+                    verifiedRawFrameManifest = try ExtractedFrameManifestStore.persist(
+                        groups: extractedGroups,
+                        targetCounts: targets,
+                        paths: paths
+                    )
                     emit(.stageFinished(stage: .extractFrames))
                     markStageComplete(.extractFrames)
                     try stopIfRequested(after: .extractFrames)
@@ -477,57 +652,58 @@ public final class PipelineRunner: @unchecked Sendable {
                     var groups: [SelectedFrameGroup] = []
 
                     if metadata.input.hasVideos {
-                        let videos = metadata.input.videoFiles
-                        let totalVideos = Double(max(videos.count, 1))
-                        for (index, _) in videos.enumerated() {
+                        let manifest: ExtractedFrameManifest
+                        if let verifiedRawFrameManifest {
+                            manifest = verifiedRawFrameManifest
+                        } else {
+                            manifest = try ExtractedFrameManifestStore.loadVerified(
+                                paths: paths,
+                                expectedVideoCount: metadata.input.videoFiles.count,
+                                maximumTotalFrames: targetFrames
+                            )
+                        }
+                        let frameGroups = try ExtractedFrameManifestStore.frameGroups(
+                            from: manifest,
+                            paths: paths
+                        )
+                        for (index, rawFrames) in frameGroups.enumerated() {
                             try Task.checkCancellation()
-                            let rawDir = rawFramesDirectory(index: index, paths: paths)
-                            let rawFrames = try loadImages(in: rawDir)
-                            guard !rawFrames.isEmpty else { continue }
-                            let sharpnessByFrame = try scoreSharpnessForFrames(
-                                rawFrames,
-                                progress: { fraction, message in
-                                    let scaled = (Double(index) / totalVideos) + (fraction / totalVideos)
-                                    emit(.stageProgress(stage: .selectFrames, fraction: scaled, message: message))
-                                }
-                            )
-                            let filterResult = filterVeryBlurryVideoFrames(
-                                frames: rawFrames,
-                                sharpnessByFrame: sharpnessByFrame,
-                                profile: frameProfile,
-                                maxDropFraction: 0.25,
-                                floorScale: 0.5
-                            )
-                            let chosen = filterResult.frames
-                            if !chosen.isEmpty {
-                                let groupId = String(format: "video_%03d", index)
-                                groups.append(.init(id: groupId, frames: chosen, isVideo: true))
-                                if filterResult.dropped > 0 {
-                                    emit(.stageLog(
-                                        stage: .selectFrames,
-                                        line: "Filtered \(filterResult.dropped) very blurry frame(s) from \(groupId) (kept \(chosen.count) of \(rawFrames.count)).",
-                                        isError: false
-                                    ))
-                                } else {
-                                    emit(.stageLog(
-                                        stage: .selectFrames,
-                                        line: "Kept all extracted frames from \(groupId) (no downsampling).",
-                                        isError: false
-                                    ))
-                                }
-                            }
+                            let groupID = String(format: "video_%03d", index)
+                            groups.append(.init(id: groupID, frames: rawFrames, isVideo: true))
                         }
                     }
 
                     if metadata.input.photosFolder != nil {
                         let sourceFolder = paths.importedPhotosURL
-                        let discoveredPhotos = try loadPhotos(in: sourceFolder)
-                        let photoFilter = try filterValidUniquePhotos(discoveredPhotos)
-                        if !photoFilter.frames.isEmpty {
-                            groups.append(.init(id: "photos", frames: photoFilter.frames, isVideo: false))
+                        let photoFilter: ValidPhotoFilterResult
+                        if let preparedPhotoFilter {
+                            photoFilter = preparedPhotoFilter
+                        } else {
+                            let discoveredPhotos = try loadPhotos(in: sourceFolder)
+                            photoFilter = try filterValidUniquePhotos(discoveredPhotos)
+                        }
+                        let photoTarget: Int
+                        if metadata.input.hasVideos {
+                            let videoFrameCount = groups
+                                .filter(\.isVideo)
+                                .reduce(0) { $0 + $1.frames.count }
+                            photoTarget = resolvedFrameTargets?.photoTarget
+                                ?? min(
+                                    photoFilter.frames.count,
+                                    max(0, targetFrames - videoFrameCount)
+                                )
+                        } else {
+                            photoTarget = photoFilter.frames.count
+                        }
+                        let selectedPhotos = evenlySpacedFrames(
+                            photoFilter.frames,
+                            targetCount: photoTarget
+                        )
+                        if !selectedPhotos.isEmpty {
+                            groups.append(.init(id: "photos", frames: selectedPhotos, isVideo: false))
                             emit(.stageLog(
                                 stage: .selectFrames,
-                                line: "Using \(photoFilter.frames.count) valid, unique photos from \(sourceFolder.lastPathComponent).",
+                                line: "Using \(selectedPhotos.count) of \(photoFilter.frames.count) valid, unique photos.",
                                 isError: false
                             ))
                         }
@@ -588,12 +764,18 @@ public final class PipelineRunner: @unchecked Sendable {
                     )
                     emit(.stageFinished(stage: .selectFrames))
                     markStageComplete(.selectFrames)
-                    if metadata.input.hasVideos {
-                        removeIfExists(paths.framesRawURL)
-                    }
+                    try cleanupRawFramesAfterDurableSelection(
+                        paths: paths,
+                        metadata: metadata
+                    )
                     try stopIfRequested(after: .selectFrames)
                 }
             }
+
+            try cleanupRawFramesAfterDurableSelection(
+                paths: paths,
+                metadata: metadata
+            )
 
             selectedFrames = try loadImages(in: paths.framesSelectedURL)
             if selectedFrames.isEmpty {
