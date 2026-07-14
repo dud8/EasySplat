@@ -281,6 +281,58 @@ final class ToolchainManagerDownloadTests: XCTestCase {
         XCTAssertThrowsError(try manager.test_validateArchiveEntries(["bin\\escape"]))
     }
 
+    func testArchiveInspectionKeepsListingsLargerThanSubprocessCaptureTail() throws {
+        let entries = (0..<20_000).map { index in
+            "da3_mps/python/lib/python3.13/site-packages/runtime/"
+                + String(repeating: "nested/", count: 3)
+                + "file-\(index).py"
+        }
+        XCTAssertGreaterThan(entries.joined(separator: "\n").utf8.count, 1_048_576)
+        let runner = StreamingArchiveInspectionRunner(entries: entries)
+        let manager = ToolchainManager(runner: runner)
+
+        XCTAssertEqual(
+            try manager.test_inspectArchiveEntries(zipURL: URL(fileURLWithPath: "/tmp/core.zip")),
+            entries
+        )
+    }
+
+    func testArchiveInspectionFindsSymlinkOutsideCapturedMetadataTail() throws {
+        let runner = StreamingArchiveInspectionRunner(
+            entries: ["bin/colmap"],
+            metadataLines: [
+                "lrwxr-xr-x  3.0 unx  12 bx  12 stor 01-Jan-26 00:00 bin/escape",
+                "-rwxr-xr-x  3.0 unx 100 bx 100 defN 01-Jan-26 00:00 bin/colmap",
+            ]
+        )
+        let manager = ToolchainManager(runner: runner)
+
+        XCTAssertThrowsError(
+            try manager.test_inspectArchiveEntries(zipURL: URL(fileURLWithPath: "/tmp/core.zip"))
+        ) { error in
+            guard case ToolchainManager.ToolchainError.invalidToolchain(let message) = error else {
+                return XCTFail("Expected invalidToolchain, got \(error)")
+            }
+            XCTAssertTrue(message.contains("symbolic link"))
+        }
+    }
+
+    func testArchiveInspectionRejectsExcessiveEntryCount() throws {
+        let runner = StreamingArchiveInspectionRunner(
+            entries: (0...250_000).map { "runtime/file-\($0)" }
+        )
+        let manager = ToolchainManager(runner: runner)
+
+        XCTAssertThrowsError(
+            try manager.test_inspectArchiveEntries(zipURL: URL(fileURLWithPath: "/tmp/core.zip"))
+        ) { error in
+            guard case ToolchainManager.ToolchainError.invalidToolchain(let message) = error else {
+                return XCTFail("Expected invalidToolchain, got \(error)")
+            }
+            XCTAssertTrue(message.contains("inspection limit"))
+        }
+    }
+
     func testCriticalFileHashesAreEnforced() throws {
         let root = try TestFileBuilder.makeTempDir()
         defer { try? FileManager.default.removeItem(at: root) }
@@ -2223,5 +2275,71 @@ final class ToolchainManagerDownloadTests: XCTestCase {
         items.append(URLQueryItem(name: "easysplat_test_token", value: token))
         components.queryItems = items
         return components.url!
+    }
+}
+
+private final class StreamingArchiveInspectionRunner: @unchecked Sendable, SubprocessRunning {
+    private let entries: [String]
+    private let metadataLines: [String]
+
+    init(
+        entries: [String],
+        metadataLines: [String] = [
+            "-rw-r--r--  3.0 unx 100 bx 100 defN 01-Jan-26 00:00 bin/colmap"
+        ]
+    ) {
+        self.entries = entries
+        self.metadataLines = metadataLines
+    }
+
+    func run(
+        _ launchPath: String,
+        _ arguments: [String],
+        currentDirectory: URL?,
+        environment: [String: String],
+        onStdout: @escaping @Sendable (String) -> Void,
+        onStderr: @escaping @Sendable (String) -> Void
+    ) throws -> SubprocessResult {
+        if launchPath == "/usr/bin/zipinfo", arguments.first == "-l" {
+            metadataLines.forEach(onStdout)
+            return SubprocessResult(
+                exitCode: 0,
+                terminationReason: .exit,
+                stdout: metadataLines.suffix(1).joined(separator: "\n"),
+                stderr: ""
+            )
+        }
+        if launchPath == "/usr/bin/unzip", arguments.first == "-Z1" {
+            entries.forEach(onStdout)
+            return SubprocessResult(
+                exitCode: 0,
+                terminationReason: .exit,
+                stdout: entries.suffix(16).joined(separator: "\n"),
+                stderr: ""
+            )
+        }
+        throw NSError(
+            domain: "StreamingArchiveInspectionRunner",
+            code: 1,
+            userInfo: [NSLocalizedDescriptionKey: "Unexpected command: \(launchPath) \(arguments)"]
+        )
+    }
+
+    func runAsync(
+        _ launchPath: String,
+        _ arguments: [String],
+        currentDirectory: URL?,
+        environment: [String: String],
+        onStdout: @escaping @Sendable (String) -> Void,
+        onStderr: @escaping @Sendable (String) -> Void
+    ) async throws -> SubprocessResult {
+        try run(
+            launchPath,
+            arguments,
+            currentDirectory: currentDirectory,
+            environment: environment,
+            onStdout: onStdout,
+            onStderr: onStderr
+        )
     }
 }

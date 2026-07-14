@@ -1044,24 +1044,40 @@ extension ToolchainManager {
         try? saveInstallState(state, root: root)
     }
 
-    func inspectArchiveEntries(zipURL: URL) throws -> [String] {
+    func inspectArchiveEntries(zipURL: URL, forceInspection: Bool = false) throws -> [String] {
         // Existing URLProtocol tests deliberately use fake zip bytes and mock extraction.
         // Production downloads always take this path before `/usr/bin/unzip` is allowed to write.
-        if shouldUseDataTaskForTests() {
+        if shouldUseDataTaskForTests(), !forceInspection {
             return []
         }
-        let metadata = try runner.run("/usr/bin/zipinfo", ["-l", zipURL.path])
+        let inspection = ArchiveInspectionAccumulator(
+            maximumEntryBytes: Self.maximumManifestDownloadBytes,
+            maximumEntryCount: 250_000
+        )
+        let metadata = try runner.run(
+            "/usr/bin/zipinfo",
+            ["-l", zipURL.path],
+            onStdout: inspection.inspectMetadataLine
+        )
         guard metadata.exitCode == 0 else {
             throw ToolchainError.unzipFailed
         }
-        if metadata.stdout.split(whereSeparator: \.isNewline).contains(where: { $0.first == "l" }) {
+        if inspection.foundSymbolicLink() {
             throw ToolchainError.invalidToolchain("Archive contains a symbolic link entry.")
         }
-        let result = try runner.run("/usr/bin/unzip", ["-Z1", zipURL.path])
+        let result = try runner.run(
+            "/usr/bin/unzip",
+            ["-Z1", zipURL.path],
+            onStdout: inspection.appendEntry
+        )
         guard result.exitCode == 0 else {
             throw ToolchainError.unzipFailed
         }
-        return result.stdout.split(whereSeparator: \.isNewline).map(String.init)
+        let listing = inspection.entrySnapshot()
+        guard !listing.exceededLimit else {
+            throw ToolchainError.invalidToolchain("Archive entry listing exceeds the inspection limit.")
+        }
+        return listing.entries
     }
 
     func validateArchiveEntries(_ entries: [String]) throws {
@@ -1180,5 +1196,57 @@ extension ToolchainManager {
         throw ToolchainError.invalidToolchain(
             "Artifact '\(artifact.name)' is missing expected files: \(missingPreview)\(suffix)."
         )
+    }
+}
+
+private final class ArchiveInspectionAccumulator: @unchecked Sendable {
+    private let lock = NSLock()
+    private let maximumEntryBytes: Int
+    private let maximumEntryCount: Int
+    private var entries: [String] = []
+    private var entryBytes = 0
+    private var exceededLimit = false
+    private var containsSymbolicLink = false
+
+    init(maximumEntryBytes: Int, maximumEntryCount: Int) {
+        self.maximumEntryBytes = maximumEntryBytes
+        self.maximumEntryCount = maximumEntryCount
+    }
+
+    func inspectMetadataLine(_ line: String) {
+        guard line.first == "l" else { return }
+        lock.lock()
+        containsSymbolicLink = true
+        lock.unlock()
+    }
+
+    func appendEntry(_ entry: String) {
+        guard !entry.isEmpty else { return }
+        lock.lock()
+        defer { lock.unlock() }
+        guard !exceededLimit else { return }
+        let addedBytes = entry.utf8.count.addingReportingOverflow(1)
+        let nextBytes = entryBytes.addingReportingOverflow(addedBytes.partialValue)
+        guard !addedBytes.overflow,
+              !nextBytes.overflow,
+              nextBytes.partialValue <= maximumEntryBytes,
+              entries.count < maximumEntryCount else {
+            exceededLimit = true
+            return
+        }
+        entries.append(entry)
+        entryBytes = nextBytes.partialValue
+    }
+
+    func foundSymbolicLink() -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return containsSymbolicLink
+    }
+
+    func entrySnapshot() -> (entries: [String], exceededLimit: Bool) {
+        lock.lock()
+        defer { lock.unlock() }
+        return (entries, exceededLimit)
     }
 }

@@ -30,6 +30,10 @@ extension ToolchainManager {
         try validateArchiveEntries(entries)
     }
 
+    func test_inspectArchiveEntries(zipURL: URL) throws -> [String] {
+        try inspectArchiveEntries(zipURL: zipURL, forceInspection: true)
+    }
+
     func test_validateCriticalFileHashes(_ hashes: [String: String], root: URL) throws {
         try validateCriticalFileHashes(hashes, root: root)
     }
