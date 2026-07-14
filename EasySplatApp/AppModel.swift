@@ -92,6 +92,7 @@ final class AppModel: ObservableObject {
     let trainingStepLogInterval = 120
     let trainingProgressLogMinInterval: TimeInterval = 3.0
     var notesSaveTask: Task<Void, Never>?
+    var projectSummaryRefreshTask: Task<Void, Never>?
     var pendingNotesSave: (url: URL, text: String)?
     var photoFolderCountTask: Task<Void, Never>?
     var exitIntent: ExitIntent = .none

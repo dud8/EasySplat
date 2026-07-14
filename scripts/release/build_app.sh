@@ -203,6 +203,8 @@ cat > "$APP_BUNDLE/Contents/Info.plist" <<EOF
   <string>15.0</string>
   <key>NSHighResolutionCapable</key>
   <true/>
+  <key>NSPrincipalClass</key>
+  <string>NSApplication</string>
 </dict>
 </plist>
 EOF

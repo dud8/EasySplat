@@ -90,15 +90,46 @@ extension AppModel {
     }
 
     func refreshProjectSummaries() {
+        projectSummaryRefreshTask?.cancel()
+        projectSummaryRefreshTask = nil
+        projectSummaries = Self.loadProjectSummaries(
+            from: projectBaseDirectory(),
+            currentProjectURL: currentProjectURL,
+            isRunActive: isRunActive
+        )
+    }
+
+    func refreshProjectSummariesInBackground() {
+        projectSummaryRefreshTask?.cancel()
         let base = projectBaseDirectory()
+        let activeProjectURL = currentProjectURL
+        let runIsActive = isRunActive
+        projectSummaryRefreshTask = Task { [weak self] in
+            let summaries = await Task.detached(priority: .utility) {
+                Self.loadProjectSummaries(
+                    from: base,
+                    currentProjectURL: activeProjectURL,
+                    isRunActive: runIsActive
+                )
+            }.value
+            guard !Task.isCancelled else { return }
+            self?.projectSummaries = summaries
+            self?.projectSummaryRefreshTask = nil
+        }
+    }
+
+    nonisolated private static func loadProjectSummaries(
+        from base: URL,
+        currentProjectURL: URL?,
+        isRunActive: Bool
+    ) -> [ProjectSummary] {
         try? FileManager.default.createDirectory(at: base, withIntermediateDirectories: true)
         guard let contents = try? FileManager.default.contentsOfDirectory(
             at: base,
             includingPropertiesForKeys: [.isDirectoryKey, .isSymbolicLinkKey],
             options: [.skipsHiddenFiles]
         ) else {
-            projectSummaries = []
-            return
+            return []
         }
 
         var summaries: [ProjectSummary] = []
@@ -113,14 +144,16 @@ extension AppModel {
             do {
                 metadata = try ProjectMetadataStore.load(from: metadataURL)
             } catch ProjectMetadataStore.LoadError.requiresNewerApp {
-                // Keep projects from newer app versions visible with an explicit update state.
                 summaries.append(makeNeedsAppUpdateSummary(at: url, metadataURL: metadataURL))
                 continue
             } catch {
                 continue
             }
-            // Project list refresh runs on the main actor; avoid scanning large ASCII PLY bodies here.
-            let outputURL = readyOutputURL(projectURL: url, metadata: metadata, validationDepth: .quick)
+            let outputURL = readyOutputURLOnDisk(
+                projectURL: url,
+                metadata: metadata,
+                validationDepth: .quick
+            )
             let outputExists = outputURL != nil
             let isActive = ProjectSummary.hasSameLocation(currentProjectURL, url)
                 && isRunActive
@@ -161,7 +194,7 @@ extension AppModel {
             ))
         }
 
-        projectSummaries = summaries.sorted { $0.createdAt > $1.createdAt }
+        return summaries.sorted { $0.createdAt > $1.createdAt }
     }
 
     func createProjectDirectory(title: String) throws -> URL {
@@ -504,7 +537,7 @@ extension AppModel {
     /// Build a minimal summary for a project whose metadata is unreadable due to a
     /// formatVersion mismatch. We pull `title` from a raw JSON peek if possible so the
     /// listing still shows the user's chosen name; otherwise fall back to the directory.
-    private func makeNeedsAppUpdateSummary(at url: URL, metadataURL: URL) -> ProjectSummary {
+    nonisolated private static func makeNeedsAppUpdateSummary(at url: URL, metadataURL: URL) -> ProjectSummary {
         let fallbackTitle = url.deletingPathExtension().lastPathComponent
         var title = fallbackTitle
         if let data = try? Data(contentsOf: metadataURL),

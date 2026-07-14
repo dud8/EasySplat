@@ -1,7 +1,7 @@
 import Foundation
 import EasySplatCore
 
-struct ProjectSummary: Identifiable {
+struct ProjectSummary: Identifiable, Sendable {
     let id: UUID
     let title: String
     let url: URL
@@ -98,7 +98,7 @@ enum ProjectListSort: String, CaseIterable, Identifiable {
     }
 }
 
-enum ProjectStatus: String {
+enum ProjectStatus: String, Sendable {
     case ready
     case inProgress
     case failed

@@ -1,12 +1,207 @@
 import AppKit
+import EasySplatCore
+import SwiftUI
 
 @MainActor
-final class AppDelegate: NSObject, NSApplicationDelegate {
-    weak var model: AppModel?
+final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
+    let model: AppModel
+    private var mainWindow: NSWindow?
+
+    override init() {
+        model = AppModel()
+        super.init()
+    }
+
+    init(model: AppModel) {
+        self.model = model
+        super.init()
+    }
+
+    func applicationWillFinishLaunching(_ notification: Notification) {
+        NSWindow.allowsAutomaticWindowTabbing = false
+        guard let application = notification.object as? NSApplication else { return }
+        application.mainMenu = makeMainMenu(for: application)
+    }
+
+    func applicationDidFinishLaunching(_ notification: Notification) {
+        DispatchQueue.main.async { [weak self] in
+            self?.showMainWindow()
+        }
+    }
+
+    func showMainWindow() {
+        if let mainWindow {
+            mainWindow.makeKeyAndOrderFront(nil)
+            return
+        }
+        let window = makeMainWindow()
+        mainWindow = window
+        window.makeKeyAndOrderFront(nil)
+        NSApp.activate(ignoringOtherApps: true)
+    }
+
+    func applicationDidBecomeActive(_ notification: Notification) {
+        guard model.viewState == .home else { return }
+        model.refreshProjectSummariesInBackground()
+        model.refreshFreeDiskSpace()
+    }
+
+    func applicationDidResignActive(_ notification: Notification) {
+        model.flushPendingNotesSave()
+    }
+
+    func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
+        true
+    }
+
+    func makeMainWindow() -> NSWindow {
+        let controller = NSHostingController(rootView: AppRootView(model: model))
+        let window = NSWindow(
+            contentRect: NSRect(x: 0, y: 0, width: 1100, height: 760),
+            styleMask: [.titled, .closable, .miniaturizable, .resizable],
+            backing: .buffered,
+            defer: false
+        )
+        window.title = "EasySplat"
+        window.minSize = NSSize(width: 920, height: 640)
+        window.contentViewController = controller
+        window.isReleasedWhenClosed = false
+        window.isRestorable = false
+        window.tabbingMode = .disallowed
+        if !window.setFrameUsingName("EasySplatMainWindow") {
+            window.center()
+        }
+        window.setFrameAutosaveName("EasySplatMainWindow")
+        return window
+    }
+
+    func makeMainMenu(for application: NSApplication) -> NSMenu {
+        let mainMenu = NSMenu()
+
+        let applicationMenu = NSMenu(title: "EasySplat")
+        let applicationItem = NSMenuItem()
+        applicationItem.submenu = applicationMenu
+        mainMenu.addItem(applicationItem)
+
+        let aboutItem = NSMenuItem(title: "About EasySplat", action: #selector(showAbout(_:)), keyEquivalent: "")
+        aboutItem.target = self
+        applicationMenu.addItem(aboutItem)
+        applicationMenu.addItem(.separator())
+
+        let servicesMenu = NSMenu(title: "Services")
+        let servicesItem = NSMenuItem(title: "Services", action: nil, keyEquivalent: "")
+        servicesItem.submenu = servicesMenu
+        applicationMenu.addItem(servicesItem)
+        application.servicesMenu = servicesMenu
+        applicationMenu.addItem(.separator())
+
+        let hideItem = NSMenuItem(title: "Hide EasySplat", action: #selector(NSApplication.hide(_:)), keyEquivalent: "h")
+        hideItem.target = application
+        applicationMenu.addItem(hideItem)
+        let hideOthersItem = NSMenuItem(
+            title: "Hide Others",
+            action: #selector(NSApplication.hideOtherApplications(_:)),
+            keyEquivalent: "h"
+        )
+        hideOthersItem.keyEquivalentModifierMask = [.command, .option]
+        hideOthersItem.target = application
+        applicationMenu.addItem(hideOthersItem)
+        let showAllItem = NSMenuItem(
+            title: "Show All",
+            action: #selector(NSApplication.unhideAllApplications(_:)),
+            keyEquivalent: ""
+        )
+        showAllItem.target = application
+        applicationMenu.addItem(showAllItem)
+        applicationMenu.addItem(.separator())
+        let quitItem = NSMenuItem(
+            title: "Quit EasySplat",
+            action: #selector(NSApplication.terminate(_:)),
+            keyEquivalent: "q"
+        )
+        quitItem.target = application
+        applicationMenu.addItem(quitItem)
+
+        let editMenu = NSMenu(title: "Edit")
+        let editItem = NSMenuItem()
+        editItem.submenu = editMenu
+        mainMenu.addItem(editItem)
+        editMenu.addItem(NSMenuItem(title: "Undo", action: Selector(("undo:")), keyEquivalent: "z"))
+        let redoItem = NSMenuItem(title: "Redo", action: Selector(("redo:")), keyEquivalent: "z")
+        redoItem.keyEquivalentModifierMask = [.command, .shift]
+        editMenu.addItem(redoItem)
+        editMenu.addItem(.separator())
+        editMenu.addItem(NSMenuItem(title: "Cut", action: #selector(NSText.cut(_:)), keyEquivalent: "x"))
+        editMenu.addItem(NSMenuItem(title: "Copy", action: #selector(NSText.copy(_:)), keyEquivalent: "c"))
+        editMenu.addItem(NSMenuItem(title: "Paste", action: #selector(NSText.paste(_:)), keyEquivalent: "v"))
+        editMenu.addItem(NSMenuItem(title: "Select All", action: #selector(NSText.selectAll(_:)), keyEquivalent: "a"))
+
+        let viewMenu = NSMenu(title: "View")
+        let viewItem = NSMenuItem()
+        viewItem.submenu = viewMenu
+        mainMenu.addItem(viewItem)
+        let fullScreenItem = NSMenuItem(
+            title: "Enter Full Screen",
+            action: #selector(NSWindow.toggleFullScreen(_:)),
+            keyEquivalent: "f"
+        )
+        fullScreenItem.keyEquivalentModifierMask = [.command, .control]
+        viewMenu.addItem(fullScreenItem)
+
+        let windowMenu = NSMenu(title: "Window")
+        let windowItem = NSMenuItem()
+        windowItem.submenu = windowMenu
+        mainMenu.addItem(windowItem)
+        windowMenu.addItem(NSMenuItem(title: "Close", action: #selector(NSWindow.performClose(_:)), keyEquivalent: "w"))
+        windowMenu.addItem(.separator())
+        windowMenu.addItem(NSMenuItem(title: "Minimize", action: #selector(NSWindow.performMiniaturize(_:)), keyEquivalent: "m"))
+        windowMenu.addItem(NSMenuItem(title: "Zoom", action: #selector(NSWindow.performZoom(_:)), keyEquivalent: ""))
+        windowMenu.addItem(.separator())
+        windowMenu.addItem(NSMenuItem(title: "Bring All to Front", action: #selector(NSApplication.arrangeInFront(_:)), keyEquivalent: ""))
+        application.windowsMenu = windowMenu
+
+        let helpMenu = NSMenu(title: "Help")
+        let helpItem = NSMenuItem()
+        helpItem.submenu = helpMenu
+        mainMenu.addItem(helpItem)
+        let diagnosticsItem = NSMenuItem(
+            title: "Copy Diagnostics for Current Project",
+            action: #selector(copyDiagnostics(_:)),
+            keyEquivalent: ""
+        )
+        diagnosticsItem.target = self
+        helpMenu.addItem(diagnosticsItem)
+
+        return mainMenu
+    }
+
+    func validateMenuItem(_ menuItem: NSMenuItem) -> Bool {
+        if menuItem.action == #selector(copyDiagnostics(_:)) {
+            return model.currentProjectURL != nil
+        }
+        return true
+    }
+
+    @objc private func showAbout(_ sender: Any?) {
+        let panel = NSAlert()
+        panel.messageText = "EasySplat"
+        let build = Bundle.main.infoDictionary?["CFBundleVersion"] as? String ?? ""
+        let suffix = build.isEmpty ? "" : " (build \(build))"
+        panel.informativeText = [
+            "macOS-only Apple Silicon app for turning videos, photos, or mixed inputs into 3D Gaussian splats.",
+            "Version \(EasySplatReleaseIdentity.version())\(suffix).",
+            "Hardware: \(AppModel.hardwareSummaryLine())"
+        ].joined(separator: "\n\n")
+        panel.addButton(withTitle: "OK")
+        panel.runModal()
+    }
+
+    @objc private func copyDiagnostics(_ sender: Any?) {
+        guard let projectURL = model.currentProjectURL else { return }
+        model.copyDiagnosticBundle(forProjectURL: projectURL)
+    }
 
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
-        guard let model else { return .terminateNow }
-
         // Flush any pending notes-save before we hand control to the
         // termination flow so the user's last edit isn't dropped by the
         // debounce timer being cancelled mid-write.

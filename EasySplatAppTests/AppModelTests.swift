@@ -4,6 +4,7 @@ import CoreGraphics
 import Darwin
 import Foundation
 import ImageIO
+import SwiftUI
 import UniformTypeIdentifiers
 import XCTest
 @testable import EasySplatApp
@@ -2009,6 +2010,28 @@ final class AppModelTests: XCTestCase {
         XCTAssertEqual(summary.lastActivityAt, failedAt)
     }
 
+    func testBackgroundProjectSummaryRefreshPublishesProjectLibrarySnapshot() async throws {
+        let base = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: base) }
+        try FileManager.default.createDirectory(at: base, withIntermediateDirectories: true)
+        let model = AppModel(toolchainManager: MockToolchainManager(), projectBaseURL: base)
+        _ = try makeProject(
+            at: base,
+            name: "Background Refresh",
+            lastError: "capture failed",
+            withOutput: false
+        )
+
+        model.refreshProjectSummariesInBackground()
+
+        let deadline = Date().addingTimeInterval(2)
+        while model.projectSummaries.isEmpty && Date() < deadline {
+            try await Task.sleep(nanoseconds: 10_000_000)
+        }
+        XCTAssertEqual(model.projectSummaries.map(\.title), ["Background Refresh"])
+    }
+
     func testRefreshProjectSummariesAndProjectActionsRejectSymlinkedBundle() throws {
         let parent = FileManager.default.temporaryDirectory
             .appendingPathComponent(UUID().uuidString, isDirectory: true)
@@ -2342,10 +2365,31 @@ final class AppModelTests: XCTestCase {
         let model = AppModel(toolchainManager: MockToolchainManager())
         model.viewState = .processing
         model.lastError = "Capture needs more overlap."
-        let delegate = AppDelegate()
-        delegate.model = model
+        let delegate = AppDelegate(model: model)
 
         XCTAssertEqual(delegate.applicationShouldTerminate(NSApplication.shared), .terminateNow)
+    }
+
+    func testAppTerminatesAfterItsOnlyWindowCloses() {
+        let delegate = AppDelegate()
+
+        XCTAssertTrue(delegate.applicationShouldTerminateAfterLastWindowClosed(NSApplication.shared))
+    }
+
+    func testAppKitWindowHostsTheSwiftUIWorkspace() {
+        let model = AppModel(toolchainManager: MockToolchainManager())
+        let delegate = AppDelegate(model: model)
+
+        let window = delegate.makeMainWindow()
+
+        XCTAssertEqual(window.title, "EasySplat")
+        XCTAssertEqual(window.minSize, NSSize(width: 920, height: 640))
+        XCTAssertGreaterThanOrEqual(window.frame.width, 920)
+        XCTAssertGreaterThanOrEqual(window.frame.height, 640)
+        XCTAssertTrue(window.contentViewController is NSHostingController<AppRootView>)
+        XCTAssertFalse(window.isReleasedWhenClosed)
+        XCTAssertFalse(window.isRestorable)
+        XCTAssertEqual(window.tabbingMode, .disallowed)
     }
 
     func testFailedProcessingScreenDoesNotBlockWindowClose() {

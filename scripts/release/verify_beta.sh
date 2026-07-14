@@ -346,6 +346,7 @@ plutil -lint "$INFO_PLIST" >/dev/null
 [ "$(read_plist CFBundleIconFile)" = "EasySplatAppIcon" ]
 [ "$(read_plist CFBundleShortVersionString)" = "$NUMERIC_VERSION" ]
 [ "$(read_plist CFBundleVersion)" = "$NUMERIC_VERSION" ]
+[ "$(read_plist NSPrincipalClass)" = "NSApplication" ]
 [ "$(read_plist EasySplatReleaseVersion)" = "$EXPECTED_VERSION" ]
 [ "$(read_plist EasySplatReleaseChannel)" = "unsigned-beta" ]
 [ -x "$EXECUTABLE" ]
@@ -374,14 +375,18 @@ DISTRIBUTED_EXECUTABLE="$DISTRIBUTED_APP/Contents/MacOS/EasySplatApp"
 [ -d "$DISTRIBUTED_APP" ] && [ -x "$DISTRIBUTED_EXECUTABLE" ]
 verify_arm64_executable "Mounted app" "$DISTRIBUTED_EXECUTABLE"
 verify_adhoc_bundle "$DISTRIBUTED_APP"
-verify_matching_executable_hashes "$EXECUTABLE" "$DISTRIBUTED_EXECUTABLE"
 [ -s "$DISTRIBUTED_APP/Contents/Resources/Licenses/EasySplat-LICENSE.txt" ]
 [ -s "$DISTRIBUTED_APP/Contents/Resources/Licenses/EasySplat-NOTICE.md" ]
 [ -s "$DISTRIBUTED_APP/Contents/Resources/Licenses/MetalSplatter-LICENSE.txt" ]
 plutil -lint "$DISTRIBUTED_INFO_PLIST" >/dev/null
 [ "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$DISTRIBUTED_INFO_PLIST")" = "com.easysplat.app" ]
+[ "$(/usr/libexec/PlistBuddy -c 'Print :NSPrincipalClass' "$DISTRIBUTED_INFO_PLIST" 2>/dev/null || true)" = "NSApplication" ] || {
+  echo "Mounted app NSPrincipalClass must be NSApplication." >&2
+  exit 1
+}
 [ "$(/usr/libexec/PlistBuddy -c 'Print :EasySplatReleaseVersion' "$DISTRIBUTED_INFO_PLIST")" = "$EXPECTED_VERSION" ]
 [ "$(/usr/libexec/PlistBuddy -c 'Print :EasySplatReleaseChannel' "$DISTRIBUTED_INFO_PLIST")" = "unsigned-beta" ]
+verify_matching_executable_hashes "$EXECUTABLE" "$DISTRIBUTED_EXECUTABLE"
 EFFECTIVE_MANIFEST_URL=""
 EFFECTIVE_PUBLIC_KEY_FILE=""
 if [ "$VERIFY_BUNDLED_TOOLCHAIN" -eq 1 ]; then
@@ -447,45 +452,94 @@ fi
 
 if [ "$SKIP_LAUNCH_SMOKE" -eq 0 ]; then
   SMOKE_LOG="$(mktemp "${TMPDIR:-/tmp}/easysplat-launch-smoke.XXXXXX")"
-  if ! python3 - "$DISTRIBUTED_EXECUTABLE" "${EASYSPLAT_SMOKE_SECONDS:-3}" "$SMOKE_LOG" <<'PY'
-import math
-import signal
-import subprocess
-import sys
-from pathlib import Path
+  if ! /usr/bin/xcrun swift - "$DISTRIBUTED_APP" "${EASYSPLAT_SMOKE_SECONDS:-3}" \
+    >"$SMOKE_LOG" 2>&1 <<'SWIFT'
+import AppKit
+import CoreGraphics
+import Foundation
 
-executable, raw_timeout, log_path = sys.argv[1:]
-try:
-    timeout = float(raw_timeout)
-except ValueError as exc:
-    raise SystemExit(f"Invalid launch-smoke duration: {raw_timeout!r}") from exc
-if not math.isfinite(timeout) or timeout < 0:
-    raise SystemExit(f"Invalid launch-smoke duration: {raw_timeout!r}")
+func fail(_ message: String) -> Never {
+    FileHandle.standardError.write(Data((message + "\n").utf8))
+    exit(1)
+}
 
+func runLoopBriefly() {
+    RunLoop.current.run(until: Date().addingTimeInterval(0.05))
+}
 
-def interrupted(_signal: int, _frame: object) -> None:
-    raise KeyboardInterrupt
+func stop(_ application: NSRunningApplication) {
+    guard !application.isTerminated else { return }
+    _ = application.terminate()
+    let deadline = Date().addingTimeInterval(2)
+    while !application.isTerminated && Date() < deadline {
+        runLoopBriefly()
+    }
+    if !application.isTerminated {
+        _ = application.forceTerminate()
+    }
+}
 
+func hasVisibleWindow(processIdentifier: pid_t) -> Bool {
+    let options: CGWindowListOption = [.optionOnScreenOnly, .excludeDesktopElements]
+    guard let windows = CGWindowListCopyWindowInfo(options, kCGNullWindowID) as? [[String: Any]] else {
+        return false
+    }
+    return windows.contains { window in
+        let owner = (window[kCGWindowOwnerPID as String] as? NSNumber)?.int32Value
+        let layer = (window[kCGWindowLayer as String] as? NSNumber)?.intValue
+        let isOnScreen = (window[kCGWindowIsOnscreen as String] as? NSNumber)?.boolValue
+        let alpha = (window[kCGWindowAlpha as String] as? NSNumber)?.doubleValue ?? 0
+        return owner == processIdentifier && layer == 0 && isOnScreen == true && alpha > 0
+    }
+}
 
-signal.signal(signal.SIGINT, interrupted)
-signal.signal(signal.SIGTERM, interrupted)
-with Path(log_path).open("wb") as log:
-    process = subprocess.Popen([executable], stdout=log, stderr=subprocess.STDOUT)
-    try:
-        status = process.wait(timeout=timeout)
-    except subprocess.TimeoutExpired:
-        status = None
-    finally:
-        if process.poll() is None:
-            process.terminate()
-            try:
-                process.wait(timeout=2)
-            except subprocess.TimeoutExpired:
-                process.kill()
-                process.wait()
-if status is not None:
-    raise SystemExit(f"App exited during launch smoke (status {status}).")
-PY
+guard CommandLine.arguments.count == 3 else {
+    fail("Launch smoke requires an app bundle and timeout.")
+}
+let appURL = URL(fileURLWithPath: CommandLine.arguments[1], isDirectory: true)
+guard let timeout = Double(CommandLine.arguments[2]), timeout.isFinite, timeout > 0 else {
+    fail("Invalid launch-smoke duration: \(CommandLine.arguments[2]).")
+}
+
+let configuration = NSWorkspace.OpenConfiguration()
+configuration.activates = true
+configuration.addsToRecentItems = false
+configuration.createsNewApplicationInstance = true
+
+var launchedApplication: NSRunningApplication?
+var launchError: Error?
+NSWorkspace.shared.openApplication(at: appURL, configuration: configuration) { application, error in
+    launchedApplication = application
+    launchError = error
+}
+
+let deadline = Date().addingTimeInterval(timeout)
+while launchedApplication == nil && launchError == nil && Date() < deadline {
+    runLoopBriefly()
+}
+if let launchError {
+    fail("LaunchServices could not open the app during launch smoke: \(launchError.localizedDescription)")
+}
+guard let application = launchedApplication else {
+    fail("App exited during launch smoke, or LaunchServices did not return it before the timeout.")
+}
+
+var foundVisibleWindow = false
+while Date() < deadline {
+    if application.isTerminated {
+        fail("App exited during launch smoke.")
+    }
+    if hasVisibleWindow(processIdentifier: application.processIdentifier) {
+        foundVisibleWindow = true
+        break
+    }
+    runLoopBriefly()
+}
+stop(application)
+if !foundVisibleWindow {
+    fail("App opened without an on-screen window during launch smoke.")
+}
+SWIFT
   then
     cat "$SMOKE_LOG" >&2
     exit 1

@@ -82,9 +82,6 @@ struct ProjectSidebar: View {
             .listStyle(.sidebar)
             .searchable(text: $searchText, placement: .sidebar, prompt: "Search Projects")
         }
-        .onAppear {
-            model.refreshProjectSummaries()
-        }
         .confirmationDialog(
             "Move project to Trash?",
             isPresented: Binding(

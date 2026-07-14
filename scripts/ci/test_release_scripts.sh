@@ -197,6 +197,7 @@ test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$info_plist")" =
 test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIconFile' "$info_plist")" = "EasySplatAppIcon"
 test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$info_plist")" = "0.2.0"
 test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleVersion' "$info_plist")" = "0.2.0"
+test "$(/usr/libexec/PlistBuddy -c 'Print :NSPrincipalClass' "$info_plist")" = "NSApplication"
 test "$(/usr/libexec/PlistBuddy -c 'Print :EasySplatReleaseChannel' "$info_plist")" = "unsigned-beta"
 test -d "$ROOT/build/Export/EasySplat.app.dSYM"
 test -s "$resources_dir/EasySplatAppIcon.icns"
@@ -215,29 +216,25 @@ xcrun dsymutil \
   "$early_exit_fixture/EasySplat.app/Contents/MacOS/EasySplatApp" \
   -o "$early_exit_fixture/EasySplat.app.dSYM"
 
-smoke_fixture_source="$TMP_DIR/smoke-fixture.c"
+smoke_fixture_source="$TMP_DIR/smoke-fixture.m"
 cat >"$smoke_fixture_source" <<'EOF'
-#include <signal.h>
-#include <unistd.h>
-
-static volatile sig_atomic_t running = 1;
-
-static void stop(int signal) {
-    (void)signal;
-    running = 0;
-}
+#import <AppKit/AppKit.h>
 
 int main(void) {
-    signal(SIGINT, stop);
-    signal(SIGTERM, stop);
-    while (running) pause();
+    @autoreleasepool {
+        NSApplication *application = [NSApplication sharedApplication];
+        [application setActivationPolicy:NSApplicationActivationPolicyRegular];
+        [application run];
+    }
     return 0;
 }
 EOF
 smoke_fixture_object="$TMP_DIR/smoke-fixture-arm64.o"
-xcrun clang -arch arm64 -g -c "$smoke_fixture_source" -o "$smoke_fixture_object"
+xcrun clang -arch arm64 -g -fobjc-arc -c \
+  "$smoke_fixture_source" -o "$smoke_fixture_object"
 xcrun clang -arch arm64 \
   "$smoke_fixture_object" \
+  -framework AppKit \
   -o "$app_bundle/Contents/MacOS/EasySplatApp"
 rm -rf "$ROOT/build/Export/EasySplat.app.dSYM"
 xcrun dsymutil \
@@ -403,8 +400,10 @@ fi
 
 x86_fixture_object="$TMP_DIR/smoke-fixture-x86_64.o"
 x86_fixture_binary="$TMP_DIR/EasySplatApp-x86_64"
-xcrun clang -arch x86_64 -g -c "$smoke_fixture_source" -o "$x86_fixture_object"
-xcrun clang -arch x86_64 "$x86_fixture_object" -o "$x86_fixture_binary"
+xcrun clang -arch x86_64 -g -fobjc-arc -c \
+  "$smoke_fixture_source" -o "$x86_fixture_object"
+xcrun clang -arch x86_64 "$x86_fixture_object" \
+  -framework AppKit -o "$x86_fixture_binary"
 x86_app_fixture="$TMP_DIR/x86-app-fixture"
 mkdir -p "$x86_app_fixture"
 cp -R "$app_bundle" "$x86_app_fixture/EasySplat.app"
@@ -487,6 +486,31 @@ fi
 grep -Fqi 'Mounted app executable SHA-256 does not match release app executable' \
   "$mismatched_distributed_error"
 
+missing_distributed_principal_fixture="$TMP_DIR/missing-distributed-principal-fixture"
+mkdir -p "$missing_distributed_principal_fixture"
+cp -R "$app_bundle" "$missing_distributed_principal_fixture/EasySplat.app"
+/usr/libexec/PlistBuddy -c 'Delete :NSPrincipalClass' \
+  "$missing_distributed_principal_fixture/EasySplat.app/Contents/Info.plist"
+/usr/bin/codesign --force --deep --sign - --timestamp=none \
+  "$missing_distributed_principal_fixture/EasySplat.app"
+missing_distributed_principal_error="$TMP_DIR/release-verifier-missing-distributed-principal.stderr"
+if EASYSPLAT_HDIUTIL_BIN="$mock_hdiutil" \
+  EASYSPLAT_TEST_HDIUTIL_LOG="$hdiutil_log" \
+  EASYSPLAT_TEST_APP_PATH="$missing_distributed_principal_fixture/EasySplat.app" \
+  "$ROOT/scripts/release/verify_beta.sh" \
+  --app "$app_bundle" \
+  --dmg "$TMP_DIR/EasySplat-0.2.0-beta.1-unsigned.dmg" \
+  --expected-version "0.2.0-beta.1" \
+  --allow-incomplete \
+  --skip-launch-smoke >/dev/null 2>"$missing_distributed_principal_error"; then
+  echo "Beta verification accepted a distributed app without NSPrincipalClass" >&2
+  exit 1
+fi
+if ! grep -Fqi 'NSPrincipalClass' "$missing_distributed_principal_error"; then
+  cat "$missing_distributed_principal_error" >&2
+  exit 1
+fi
+
 early_exit_error="$TMP_DIR/release-verifier-early-exit.stderr"
 if EASYSPLAT_HDIUTIL_BIN="$mock_hdiutil" \
   EASYSPLAT_TEST_HDIUTIL_LOG="$hdiutil_log" \
@@ -500,7 +524,73 @@ if EASYSPLAT_HDIUTIL_BIN="$mock_hdiutil" \
   echo "Beta verification accepted an app that exited before the smoke interval" >&2
   exit 1
 fi
-grep -Fqi 'exited during launch smoke' "$early_exit_error"
+if ! grep -Fqi 'exited during launch smoke' "$early_exit_error"; then
+  cat "$early_exit_error" >&2
+  exit 1
+fi
+
+headless_error="$TMP_DIR/release-verifier-headless.stderr"
+if EASYSPLAT_HDIUTIL_BIN="$mock_hdiutil" \
+  EASYSPLAT_TEST_HDIUTIL_LOG="$hdiutil_log" \
+  EASYSPLAT_TEST_APP_PATH="$app_bundle" \
+  EASYSPLAT_SMOKE_SECONDS=1 \
+  "$ROOT/scripts/release/verify_beta.sh" \
+  --app "$app_bundle" \
+  --dmg "$TMP_DIR/EasySplat-0.2.0-beta.1-unsigned.dmg" \
+  --expected-version "0.2.0-beta.1" \
+  --allow-incomplete >/dev/null 2>"$headless_error"; then
+  echo "Beta verification accepted an app that opened without a window" >&2
+  exit 1
+fi
+if ! grep -Fqi 'without an on-screen window' "$headless_error"; then
+  cat "$headless_error" >&2
+  exit 1
+fi
+
+window_fixture_source="$TMP_DIR/window-fixture.m"
+cat >"$window_fixture_source" <<'EOF'
+#import <AppKit/AppKit.h>
+
+int main(void) {
+    @autoreleasepool {
+        NSApplication *application = [NSApplication sharedApplication];
+        [application setActivationPolicy:NSApplicationActivationPolicyRegular];
+        NSWindow *window = [[NSWindow alloc]
+            initWithContentRect:NSMakeRect(0, 0, 640, 480)
+            styleMask:(NSWindowStyleMaskTitled | NSWindowStyleMaskClosable)
+            backing:NSBackingStoreBuffered
+            defer:NO];
+        window.title = @"EasySplat launch fixture";
+        [window center];
+        [window makeKeyAndOrderFront:nil];
+        [application activateIgnoringOtherApps:YES];
+        [application run];
+    }
+    return 0;
+}
+EOF
+window_fixture_binary="$TMP_DIR/EasySplatApp-window"
+window_fixture_object="$TMP_DIR/window-fixture.o"
+xcrun clang -arch arm64 -g -fobjc-arc -c \
+  "$window_fixture_source" -o "$window_fixture_object"
+xcrun clang -arch arm64 "$window_fixture_object" \
+  -framework AppKit -o "$window_fixture_binary"
+window_app_fixture="$TMP_DIR/window-app-fixture"
+mkdir -p "$window_app_fixture"
+cp -R "$app_bundle" "$window_app_fixture/EasySplat.app"
+cp "$window_fixture_binary" "$window_app_fixture/EasySplat.app/Contents/MacOS/EasySplatApp"
+xcrun dsymutil "$window_fixture_binary" -o "$window_app_fixture/EasySplat.app.dSYM"
+/usr/bin/codesign --force --deep --sign - --timestamp=none \
+  "$window_app_fixture/EasySplat.app"
+EASYSPLAT_HDIUTIL_BIN="$mock_hdiutil" \
+EASYSPLAT_TEST_HDIUTIL_LOG="$hdiutil_log" \
+EASYSPLAT_TEST_APP_PATH="$window_app_fixture/EasySplat.app" \
+EASYSPLAT_SMOKE_SECONDS=3 \
+  "$ROOT/scripts/release/verify_beta.sh" \
+  --app "$window_app_fixture/EasySplat.app" \
+  --dmg "$TMP_DIR/EasySplat-0.2.0-beta.1-unsigned.dmg" \
+  --expected-version "0.2.0-beta.1" \
+  --allow-incomplete >/dev/null
 
 missing_public_key_fixture="$TMP_DIR/missing-public-key-fixture"
 mkdir -p "$missing_public_key_fixture"
