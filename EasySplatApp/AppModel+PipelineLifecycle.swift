@@ -586,15 +586,29 @@ extension AppModel {
     }
 
     private func failureTechnicalDetails(for error: Error) -> String {
-        var lines = ["Underlying error: \(String(reflecting: error))"]
+        var lines: [String]
         if let toolchainError = error as? ToolchainManager.ToolchainError,
            case .manifestHTTPFailure(let statusCode, let resourceURL) = toolchainError {
+            lines = ["Underlying error: EasySplatCore.ToolchainManager.ToolchainError.manifestHTTPFailure"]
             lines.append("HTTP status: \(statusCode)")
-            lines.append("HTTP resource: \(resourceURL.absoluteString)")
+            lines.append("HTTP resource: \(redactedDiagnosticURL(resourceURL))")
+        } else {
+            lines = ["Underlying error: \(String(reflecting: error))"]
         }
-        lines.append("Manifest URL: \(AppConfig.toolchainManifestURL.absoluteString)")
+        lines.append("Manifest URL: \(redactedDiagnosticURL(AppConfig.toolchainManifestURL))")
         lines.append("Public key present: \(!AppConfig.toolchainPublicKeyBase64.isEmpty)")
         return lines.joined(separator: "\n")
+    }
+
+    private func redactedDiagnosticURL(_ url: URL) -> String {
+        guard var components = URLComponents(url: url, resolvingAgainstBaseURL: false) else {
+            return "<invalid URL>"
+        }
+        components.user = nil
+        components.password = nil
+        components.query = nil
+        components.fragment = nil
+        return components.string ?? "<invalid URL>"
     }
 
     func reset() {

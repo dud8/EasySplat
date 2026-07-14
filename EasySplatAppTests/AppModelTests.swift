@@ -1067,7 +1067,7 @@ final class AppModelTests: XCTestCase {
         try Data("training".utf8).write(to: trainingSentinel, options: [.atomic])
         let metadataBefore = try Data(contentsOf: paths.metadataURL)
         let missingManifestURL = URL(
-            string: "https://github.com/dud8/EasySplat/releases/download/toolchain-v2.0.0/manifest.json"
+            string: "https://release-user:release-secret@example.com/toolchain/manifest.json?token=private#download"
         )!
 
         let model = AppModel(
@@ -1090,7 +1090,11 @@ final class AppModelTests: XCTestCase {
         )
         let errorDetails = try XCTUnwrap(model.errorDetails)
         XCTAssertTrue(errorDetails.contains("HTTP status: 410"))
-        XCTAssertTrue(errorDetails.contains("HTTP resource: \(missingManifestURL.absoluteString)"))
+        XCTAssertTrue(errorDetails.contains("HTTP resource: https://example.com/toolchain/manifest.json"))
+        XCTAssertFalse(errorDetails.contains("release-user"))
+        XCTAssertFalse(errorDetails.contains("release-secret"))
+        XCTAssertFalse(errorDetails.contains("token=private"))
+        XCTAssertFalse(errorDetails.contains("#download"))
         XCTAssertTrue(errorDetails.contains("Manifest URL: \(AppConfig.toolchainManifestURL.absoluteString)"))
         XCTAssertEqual(
             model.statusDetail,
