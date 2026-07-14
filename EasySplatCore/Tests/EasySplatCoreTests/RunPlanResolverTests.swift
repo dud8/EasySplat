@@ -40,8 +40,10 @@ final class RunPlanResolverTests: XCTestCase {
         XCTAssertEqual(plan.memoryTier, "performance")
         XCTAssertEqual(plan.chunkSize, 0)
         XCTAssertEqual(plan.geometryProcessResolution, 0)
+        XCTAssertEqual(plan.analysisFrameRate, 0)
         XCTAssertEqual(plan.keyframeBudget, 250)
         XCTAssertEqual(plan.maximumImageDimension, 1_600)
+        XCTAssertEqual(plan.colmapMaximumImageDimension, 1_024)
         XCTAssertEqual(plan.capturePath, .automatic)
         XCTAssertEqual(plan.inputOrdering, .unordered)
         XCTAssertEqual(plan.pairingPolicy, .unorderedRetrieval)
@@ -97,8 +99,10 @@ final class RunPlanResolverTests: XCTestCase {
             XCTAssertEqual(plan.modelIdentifier, "none")
             XCTAssertEqual(plan.chunkSize, 0)
             XCTAssertEqual(plan.geometryProcessResolution, 0)
+            XCTAssertEqual(plan.analysisFrameRate, 3)
             XCTAssertLessThan(plan.keyframeBudget, automatic48GB.keyframeBudget)
             XCTAssertLessThan(plan.maximumImageDimension, automatic48GB.maximumImageDimension)
+            XCTAssertEqual(plan.colmapMaximumImageDimension, 1_024)
             XCTAssertEqual(plan.colmapMaximumFeatureCount, 4_096)
             XCTAssertEqual(plan.colmapMaximumMatchCount, 4_096)
             XCTAssertEqual(plan.colmapExhaustiveBlockSize, 10)
@@ -305,7 +309,9 @@ final class RunPlanResolverTests: XCTestCase {
         XCTAssertEqual(largeArea.pairingPolicy, .orderedLargeArea)
         XCTAssertLessThan(orbit.keyframeBudget, walkthrough.keyframeBudget)
         XCTAssertGreaterThan(largeArea.keyframeBudget, walkthrough.keyframeBudget)
-        XCTAssertLessThan(orbit.sequentialOverlap, largeArea.sequentialOverlap)
+        XCTAssertEqual(orbit.sequentialOverlap, 8)
+        XCTAssertEqual(walkthrough.sequentialOverlap, 8)
+        XCTAssertEqual(largeArea.sequentialOverlap, 16)
     }
 
     func testAutomaticOrderingDoesNotPretendSeparateClipsAreOneContinuousCapture() {
@@ -634,6 +640,30 @@ final class RunPlanResolverTests: XCTestCase {
                 input: video,
                 previousPlan: currentVideoPlan,
                 currentPlan: geometryPlan
+            ),
+            .selectFrames
+        )
+
+        var frameRatePlan = currentVideoPlan
+        frameRatePlan.analysisFrameRate += 1
+        XCTAssertEqual(
+            RunPlanResolver.safeResumeStage(
+                .trainSplat,
+                input: video,
+                previousPlan: currentVideoPlan,
+                currentPlan: frameRatePlan
+            ),
+            .importInput
+        )
+
+        var geometryResolutionPlan = currentVideoPlan
+        geometryResolutionPlan.colmapMaximumImageDimension -= 1
+        XCTAssertEqual(
+            RunPlanResolver.safeResumeStage(
+                .trainSplat,
+                input: video,
+                previousPlan: currentVideoPlan,
+                currentPlan: geometryResolutionPlan
             ),
             .selectFrames
         )

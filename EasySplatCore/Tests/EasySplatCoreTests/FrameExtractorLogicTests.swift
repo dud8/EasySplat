@@ -9,15 +9,15 @@ final class FrameExtractorLogicTests: XCTestCase {
     }
 
     func testEffectiveTargetFPSClampsToVideoFPS() {
-        let options = FrameExtractionOptions(targetCount: 600, maxDimension: 1024, targetFPS: 2)
+        let options = FrameExtractionOptions(targetCount: 600, maxDimension: 1024, targetFPS: 30)
         let fps = FrameExtractor.test_effectiveTargetFPS(options: options, duration: 10, videoFPS: 24)
         XCTAssertEqual(fps, 24)
     }
 
-    func testEffectiveTargetFPSHonorsTargetCount() {
+    func testEffectiveTargetFPSTreatsTargetCountAsACapInsteadOfAQuota() {
         let options = FrameExtractionOptions(targetCount: 120, maxDimension: 1024, targetFPS: 2)
         let fps = FrameExtractor.test_effectiveTargetFPS(options: options, duration: 20, videoFPS: 30)
-        XCTAssertEqual(fps, 6)
+        XCTAssertEqual(fps, 2)
     }
 
     func testFrameOutputFormatMappings() {

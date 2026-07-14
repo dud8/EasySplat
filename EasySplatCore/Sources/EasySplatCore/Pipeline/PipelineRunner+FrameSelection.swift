@@ -853,11 +853,6 @@ extension PipelineRunner {
     }
 
     func frameExtractionProfile(for plan: ResolvedRunPlan, detail: DetailProfile) -> FrameExtractionProfile {
-        let targetFPS: Int = switch (detail, plan.capturePath) {
-        case (.fast, _): 2
-        case (_, .largeArea): 4
-        default: 3
-        }
         let minDistanceRatio: Double = switch plan.capturePath {
         case .orbit: 0.12
         case .automatic, .walkthrough: 0.20
@@ -871,7 +866,7 @@ extension PipelineRunner {
         return FrameExtractionProfile(
             targetCount: plan.keyframeBudget,
             maxDimension: CGFloat(plan.maximumImageDimension),
-            targetFPS: targetFPS,
+            targetFPS: plan.analysisFrameRate,
             minDistanceRatio: minDistanceRatio,
             sharpnessFloor: sharpness.floor,
             sharpnessRatio: sharpness.ratio,

@@ -31,8 +31,10 @@ public struct ResolvedRunPlan: Codable, Sendable, Equatable {
     public var memoryTier: String
     public var chunkSize: Int
     public var geometryProcessResolution: Int
+    public var analysisFrameRate: Int
     public var keyframeBudget: Int
     public var maximumImageDimension: Int
+    public var colmapMaximumImageDimension: Int
     public var cameraGrouping: CameraGrouping
     public var lensProjection: LensProjection
     public var refinementIterationLimit: Int
@@ -57,8 +59,10 @@ public struct ResolvedRunPlan: Codable, Sendable, Equatable {
         memoryTier: String,
         chunkSize: Int,
         geometryProcessResolution: Int = 0,
+        analysisFrameRate: Int = 3,
         keyframeBudget: Int,
         maximumImageDimension: Int,
+        colmapMaximumImageDimension: Int = 1_024,
         cameraGrouping: CameraGrouping,
         lensProjection: LensProjection,
         refinementIterationLimit: Int,
@@ -82,8 +86,10 @@ public struct ResolvedRunPlan: Codable, Sendable, Equatable {
         self.memoryTier = memoryTier
         self.chunkSize = chunkSize
         self.geometryProcessResolution = geometryProcessResolution
+        self.analysisFrameRate = analysisFrameRate
         self.keyframeBudget = keyframeBudget
         self.maximumImageDimension = maximumImageDimension
+        self.colmapMaximumImageDimension = colmapMaximumImageDimension
         self.cameraGrouping = cameraGrouping
         self.lensProjection = lensProjection
         self.refinementIterationLimit = refinementIterationLimit

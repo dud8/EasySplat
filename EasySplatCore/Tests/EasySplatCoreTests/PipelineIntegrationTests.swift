@@ -44,7 +44,7 @@ final class PipelineIntegrationTests: XCTestCase {
         let metadata = ProjectMetadata(
             title: "Stop after features",
             input: .photos(folder: sourcePhotos.path),
-            requestedRunOptions: RequestedRunOptions(capturePath: .orbit, detailProfile: .fast)
+            requestedRunOptions: RequestedRunOptions(capturePath: .orbit, detailProfile: .balanced)
         )
         let paths = ProjectPaths(root: projectURL)
         try paths.ensureDirectories()
@@ -56,7 +56,9 @@ final class PipelineIntegrationTests: XCTestCase {
                 path: toolchain.colmap.path,
                 argsPrefix: ["feature_extractor"],
                 result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""),
-                onRun: nil
+                onRun: { args in
+                    XCTAssertEqual(self.value(for: "--SiftExtraction.max_image_size", in: args), "1024")
+                }
             )
         ])
         let pipeline = PipelineRunner(

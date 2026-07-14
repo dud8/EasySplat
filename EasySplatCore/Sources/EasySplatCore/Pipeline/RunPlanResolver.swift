@@ -160,12 +160,14 @@ public enum RunPlanResolver {
         }
         let framePreparationChanged = previousPlan.keyframeBudget != currentPlan.keyframeBudget
             || previousPlan.maximumImageDimension != currentPlan.maximumImageDimension
+            || previousPlan.analysisFrameRate != currentPlan.analysisFrameRate
             || previousPlan.photoSelection != currentPlan.photoSelection
         let geometryChanged = previousPlan.routeIdentifier != currentPlan.routeIdentifier
             || previousPlan.modelIdentifier != currentPlan.modelIdentifier
             || previousPlan.memoryTier != currentPlan.memoryTier
             || previousPlan.chunkSize != currentPlan.chunkSize
             || previousPlan.geometryProcessResolution != currentPlan.geometryProcessResolution
+            || previousPlan.colmapMaximumImageDimension != currentPlan.colmapMaximumImageDimension
             || previousPlan.cameraGrouping != currentPlan.cameraGrouping
             || previousPlan.lensProjection != currentPlan.lensProjection
             || previousPlan.refinementIterationLimit != currentPlan.refinementIterationLimit
@@ -225,6 +227,10 @@ public enum RunPlanResolver {
             memoryTier: memoryTier,
             resourcePolicy: options.resourcePolicy
         )
+        let colmapMaximumImageDimension = min(
+            maximumImageDimension,
+            resolvedColmapMaximumImageDimension(detail: options.detailProfile)
+        )
         let trainerBudget = trainerBudget(for: options.detailProfile)
         let cameraGrouping = resolvedCameraGrouping(options.cameraGrouping, input: input)
         let lensProjection = options.lensProjection
@@ -240,8 +246,12 @@ public enum RunPlanResolver {
             memoryTier: memoryTier.rawValue,
             chunkSize: route == .da3 ? 29 : 0,
             geometryProcessResolution: route == .da3 ? 336 : 0,
+            analysisFrameRate: input.hasVideos
+                ? resolvedAnalysisFrameRate(detail: options.detailProfile, capturePath: capturePath)
+                : 0,
             keyframeBudget: keyframeBudget,
             maximumImageDimension: maximumImageDimension,
+            colmapMaximumImageDimension: colmapMaximumImageDimension,
             cameraGrouping: cameraGrouping,
             lensProjection: lensProjection,
             refinementIterationLimit: resolvedRefinementLimit(
@@ -382,6 +392,20 @@ public enum RunPlanResolver {
         return Int((Double(base) * 1.125).rounded())
     }
 
+    private static func resolvedAnalysisFrameRate(detail: DetailProfile, capturePath: CapturePath) -> Int {
+        switch (detail, capturePath) {
+        case (.fast, _): return 2
+        case (.balanced, .largeArea): return 4
+        case (.balanced, _): return 3
+        case (.highDetail, .largeArea): return 4
+        case (.highDetail, _): return 3
+        }
+    }
+
+    private static func resolvedColmapMaximumImageDimension(detail: DetailProfile) -> Int {
+        detail == .highDetail ? 1_280 : 1_024
+    }
+
     private static func resolvedRefinementLimit(
         detail: DetailProfile,
         capturePath: CapturePath,
@@ -454,10 +478,10 @@ public enum RunPlanResolver {
     private static func sequentialOverlap(for policy: ResolvedPairingPolicy) -> Int {
         switch policy {
         case .unorderedRetrieval: return 0
-        case .orderedContinuous: return 12
-        case .orderedOrbit: return 12
-        case .orderedWalkthrough: return 10
-        case .orderedLargeArea: return 24
+        case .orderedContinuous: return 8
+        case .orderedOrbit: return 8
+        case .orderedWalkthrough: return 8
+        case .orderedLargeArea: return 16
         }
     }
 }

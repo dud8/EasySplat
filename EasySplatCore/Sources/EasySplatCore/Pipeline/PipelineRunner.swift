@@ -329,7 +329,7 @@ public final class PipelineRunner: @unchecked Sendable {
             )
             let targetFrames = frameProfile.targetCount
             let maxDim = frameProfile.maxDimension
-            var colmapMaxImageSize = Int(maxDim)
+            var colmapMaxImageSize = resolvedRunPlan.colmapMaximumImageDimension
             var colmapExtractOptions = colmapOptionsForExtraction()
             var colmapMatchOptions = colmapOptionsForMatching()
             let preferColmapGpu = shouldUseColmapGpu(colmapPath: config.toolchain.colmap)

@@ -396,11 +396,8 @@ public final class FrameExtractor {
 
     private static func effectiveTargetFPS(options: FrameExtractionOptions, duration: Double, videoFPS: Double) -> Int {
         let baseFPS = max(1, options.targetFPS)
-        guard duration > 0 else { return baseFPS }
-        let fpsForTarget = Double(options.targetCount) / duration
-        let desired = max(Double(baseFPS), fpsForTarget)
-        let clamped = min(desired, max(videoFPS, 1.0))
-        return max(1, Int(round(clamped)))
+        guard duration > 0, videoFPS.isFinite, videoFPS > 0 else { return baseFPS }
+        return max(1, min(baseFPS, Int(videoFPS.rounded(.down))))
     }
 
     private static func cappedCandidateFrameIndex(seconds: Double, videoFPS: Double) -> Int {
