@@ -1171,6 +1171,7 @@ def main() -> int:
                 )
         component["files"] = sorted(component_files.get(component_id, []))
 
+    files.sort(key=lambda entry: entry["path"])
     payload = {
         "schemaVersion": 1,
         "toolchainVersion": args.version,

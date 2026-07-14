@@ -711,6 +711,18 @@ except module.MetadataError:
 else:
     raise AssertionError("normal photo install size gate accepted more than 2.5 GB")
 
+wheel_url = "https://files.pythonhosted.org/packages/addict-2.4.0-py3-none-any.whl"
+assert module.validate_https_url(wheel_url, "wheel URL") == wheel_url
+protobuf_path = "torch/include/google/protobuf/unknown_field_set.h"
+assert module.require_text(protobuf_path, "runtime path") == protobuf_path
+for placeholder in ("unknown", "NOASSERTION", "none"):
+    try:
+        module.validate_https_url(placeholder, "placeholder URL")
+    except module.MetadataError:
+        pass
+    else:
+        raise AssertionError(f"release metadata accepted placeholder URL: {placeholder}")
+
 arm64 = b"\xcf\xfa\xed\xfe" + struct.pack("<II", module.CPU_TYPE_ARM64, 0) + b"payload"
 module.validate_thin_arm64_macho_header(arm64[:12], "bin/native")
 for label, header in {

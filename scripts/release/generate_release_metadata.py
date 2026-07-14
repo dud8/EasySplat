@@ -14,7 +14,7 @@ import sys
 import zipfile
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
-from typing import Any, BinaryIO
+from typing import Any, BinaryIO, NoReturn
 from urllib.parse import quote, urlparse
 
 
@@ -51,7 +51,7 @@ class MetadataError(ValueError):
     pass
 
 
-def fail(message: str) -> "NoReturn":
+def fail(message: str) -> NoReturn:
     raise MetadataError(message)
 
 
@@ -143,7 +143,7 @@ def load_json(path: Path, label: str) -> dict[str, Any]:
 
 
 def require_text(value: Any, label: str) -> str:
-    if not isinstance(value, str) or not value.strip() or PLACEHOLDER.search(value):
+    if not isinstance(value, str) or not value.strip() or PLACEHOLDER.fullmatch(value.strip()):
         fail(f"{label} is empty or uses a placeholder")
     return value.strip()
 

@@ -306,6 +306,12 @@ class MachOPortabilityTests(unittest.TestCase):
 
 
 class FilesystemSafetyTests(unittest.TestCase):
+    def test_file_closure_is_sorted_by_relative_path(self) -> None:
+        source = SCRIPT.read_text(encoding="utf-8")
+        sort_files = source.index('files.sort(key=lambda entry: entry["path"])')
+        write_payload = source.index('"files": files,')
+        self.assertLess(sort_files, write_payload)
+
     def test_nested_zip_files_are_not_exempt_from_inventory(self) -> None:
         source = SCRIPT.read_text(encoding="utf-8")
         self.assertNotIn('path.name.endswith(".zip")', source)
