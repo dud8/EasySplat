@@ -9,6 +9,7 @@ public struct ProjectMetadata: Codable, Sendable {
     public var input: InputSpec
     public var requestedRunOptions: RequestedRunOptions
     public var resolvedRunPlan: ResolvedRunPlan?
+    public var trainingMemoryRetryBudgetBytes: Int64?
     public var geometryArtifact: GeometryArtifact?
     public var trainingArtifact: TrainingArtifact?
     public var state: PipelineState
@@ -21,13 +22,14 @@ public struct ProjectMetadata: Codable, Sendable {
     public var lastFailureAt: Date?
 
     public init(
-        formatVersion: Int = 2,
+        formatVersion: Int = 3,
         id: UUID = UUID(),
         createdAt: Date = Date(),
         title: String,
         input: InputSpec,
         requestedRunOptions: RequestedRunOptions = RequestedRunOptions(),
         resolvedRunPlan: ResolvedRunPlan? = nil,
+        trainingMemoryRetryBudgetBytes: Int64? = nil,
         geometryArtifact: GeometryArtifact? = nil,
         trainingArtifact: TrainingArtifact? = nil,
         state: PipelineState = PipelineState(stage: .importInput, lastError: nil),
@@ -46,6 +48,7 @@ public struct ProjectMetadata: Codable, Sendable {
         self.input = input
         self.requestedRunOptions = requestedRunOptions
         self.resolvedRunPlan = resolvedRunPlan
+        self.trainingMemoryRetryBudgetBytes = trainingMemoryRetryBudgetBytes
         self.geometryArtifact = geometryArtifact
         self.trainingArtifact = trainingArtifact
         self.state = state

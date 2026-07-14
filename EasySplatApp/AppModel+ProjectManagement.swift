@@ -1,5 +1,11 @@
 import EasySplatCore
 import Foundation
+import OSLog
+
+private let projectLibraryLogger = Logger(
+    subsystem: Bundle.main.bundleIdentifier ?? "com.easysplat.app",
+    category: "ProjectLibrary"
+)
 
 extension AppModel {
     func startFromPendingSelection() {
@@ -143,10 +149,10 @@ extension AppModel {
             let metadata: ProjectMetadata
             do {
                 metadata = try ProjectMetadataStore.load(from: metadataURL)
-            } catch ProjectMetadataStore.LoadError.requiresNewerApp {
-                summaries.append(makeNeedsAppUpdateSummary(at: url, metadataURL: metadataURL))
-                continue
             } catch {
+                projectLibraryLogger.notice(
+                    "Skipping unreadable project at \(url.path, privacy: .private): \(String(describing: error), privacy: .public)"
+                )
                 continue
             }
             let outputURL = readyOutputURLOnDisk(
@@ -534,34 +540,4 @@ extension AppModel {
         }
     }
 
-    /// Build a minimal summary for a project whose metadata is unreadable due to a
-    /// formatVersion mismatch. We pull `title` from a raw JSON peek if possible so the
-    /// listing still shows the user's chosen name; otherwise fall back to the directory.
-    nonisolated private static func makeNeedsAppUpdateSummary(at url: URL, metadataURL: URL) -> ProjectSummary {
-        let fallbackTitle = url.deletingPathExtension().lastPathComponent
-        var title = fallbackTitle
-        if let data = try? Data(contentsOf: metadataURL),
-           let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-           let raw = object["title"] as? String,
-           !raw.isEmpty {
-            title = raw
-        }
-        let createdAt = (try? FileManager.default.attributesOfItem(atPath: url.path)[.creationDate] as? Date) ?? Date()
-        return ProjectSummary(
-            id: UUID(),
-            title: title,
-            url: url,
-            createdAt: createdAt,
-            status: .needsAppUpdate,
-            isActive: false,
-            isInterrupted: false,
-            checkpointUpdatedAt: nil,
-            stageTimings: [],
-            input: nil,
-            requestedRunOptions: nil,
-            lastOpenedAt: nil,
-            lastRunStartedAt: nil,
-            lastFailureAt: nil
-        )
-    }
 }

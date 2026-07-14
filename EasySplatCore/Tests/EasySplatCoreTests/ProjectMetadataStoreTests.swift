@@ -71,19 +71,19 @@ final class ProjectMetadataStoreTests: XCTestCase {
         try future.write(to: url, atomically: true, encoding: .utf8)
 
         XCTAssertThrowsError(try ProjectMetadataStore.load(from: url)) { error in
-            guard case ProjectMetadataStore.LoadError.requiresNewerApp(let v) = error else {
-                XCTFail("Expected requiresNewerApp, got \(error)")
+            guard case ProjectMetadataStore.LoadError.unsupportedFormatVersion(let v) = error else {
+                XCTFail("Expected unsupportedFormatVersion, got \(error)")
                 return
             }
             XCTAssertEqual(v, ProjectMetadataStore.supportedFormatVersion + 1)
-            XCTAssertTrue(error.localizedDescription.contains("Update EasySplat"))
+            XCTAssertTrue(error.localizedDescription.contains("opens format 3 projects only"))
         }
     }
 
     /// Regression: a future EasySplat may rename or drop fields that today's strict
     /// ProjectMetadata decoder requires. The formatVersion check must fire BEFORE the
-    /// strict decode, otherwise such projects throw a generic DecodingError and silently
-    /// disappear from the listing instead of being surfaced as "needs app update".
+    /// strict decode so the library can classify and exclude the incompatible bundle
+    /// without partially interpreting a schema it does not understand.
     func testLoadRejectsFutureFormatVersionEvenWithMissingRequiredFields() throws {
         let root = try TestFileBuilder.makeTempDir()
         defer { try? FileManager.default.removeItem(at: root) }
@@ -100,8 +100,8 @@ final class ProjectMetadataStoreTests: XCTestCase {
         try future.write(to: url, atomically: true, encoding: .utf8)
 
         XCTAssertThrowsError(try ProjectMetadataStore.load(from: url)) { error in
-            guard case ProjectMetadataStore.LoadError.requiresNewerApp(let v) = error else {
-                XCTFail("Expected requiresNewerApp even with missing fields, got \(error)")
+            guard case ProjectMetadataStore.LoadError.unsupportedFormatVersion(let v) = error else {
+                XCTFail("Expected envelope-first unsupportedFormatVersion, got \(error)")
                 return
             }
             XCTAssertEqual(v, ProjectMetadataStore.supportedFormatVersion + 1)
@@ -128,14 +128,32 @@ final class ProjectMetadataStoreTests: XCTestCase {
         XCTAssertFalse(FileManager.default.fileExists(atPath: url.path))
     }
 
+    func testSaveRejectsNonpositiveTrainingMemoryRetryBudget() throws {
+        let root = try TestFileBuilder.makeTempDir()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let url = root.appendingPathComponent("project.json")
+        let metadata = ProjectMetadata(
+            title: "Invalid memory retry",
+            input: .photos(folder: "/tmp/photos"),
+            trainingMemoryRetryBudgetBytes: 0
+        )
+
+        XCTAssertThrowsError(try ProjectMetadataStore.save(metadata, to: url)) { error in
+            guard case ProjectMetadataStore.LoadError.invalidTrainingMemoryRetryBudget(0) = error else {
+                return XCTFail("Expected invalidTrainingMemoryRetryBudget, got \(error)")
+            }
+        }
+        XCTAssertFalse(FileManager.default.fileExists(atPath: url.path))
+    }
+
     func testLoadRejectsTrainingArtifactMissingCurrentResumeBinding() throws {
         let root = try TestFileBuilder.makeTempDir()
         defer { try? FileManager.default.removeItem(at: root) }
         let url = root.appendingPathComponent("project.json")
-        let incompleteVersionTwo = """
+        let incompleteCurrentFormat = """
         {
           "createdAt":"1970-01-01T00:00:00Z",
-          "formatVersion":2,
+          "formatVersion":\(ProjectMetadataStore.supportedFormatVersion),
           "id":"00000000-0000-0000-0000-000000000003",
           "input":{"photos":{"folder":"/tmp/photos"}},
           "outputs":{"colmapModelPath":"SfM/colmap/sparse/0","splatPlyPath":"Output/splat.ply"},
@@ -149,7 +167,7 @@ final class ProjectMetadataStoreTests: XCTestCase {
             "resourcePolicy":"automatic"
           },
           "state":{"lastError":null,"stage":"done"},
-          "title":"Incomplete v2",
+          "title":"Incomplete current project",
           "trainingArtifact":{
             "completionStatus":"completed",
             "completedIteration":7000,
@@ -169,7 +187,7 @@ final class ProjectMetadataStoreTests: XCTestCase {
           }
         }
         """
-        try incompleteVersionTwo.write(to: url, atomically: true, encoding: .utf8)
+        try incompleteCurrentFormat.write(to: url, atomically: true, encoding: .utf8)
 
         XCTAssertThrowsError(try ProjectMetadataStore.load(from: url)) { error in
             guard case DecodingError.keyNotFound(let key, _) = error else {

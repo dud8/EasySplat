@@ -2,6 +2,19 @@ import XCTest
 @testable import EasySplatCore
 
 final class ProjectMetadataValidationTests: XCTestCase {
+    func testLoadRejectsRetiredVersionTwoBeforeDecodingItsPayload() throws {
+        let root = try TestFileBuilder.makeTempDir()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let url = root.appendingPathComponent("project.json")
+        try Data(#"{"formatVersion":2,"title":false}"#.utf8).write(to: url)
+
+        XCTAssertThrowsError(try ProjectMetadataStore.load(from: url)) { error in
+            guard case ProjectMetadataStore.LoadError.unsupportedFormatVersion(2) = error else {
+                return XCTFail("Expected unsupportedFormatVersion(2), got \(error)")
+            }
+        }
+    }
+
     func testLoadRejectsVersionOneBeforeDecodingItsPayload() throws {
         let root = try TestFileBuilder.makeTempDir()
         defer { try? FileManager.default.removeItem(at: root) }
@@ -40,6 +53,19 @@ final class ProjectMetadataValidationTests: XCTestCase {
             }
             XCTAssertEqual(field, "geometryArtifact.canonicalModelPath")
             XCTAssertEqual(path, "/tmp/model")
+        }
+    }
+
+    func testLoadRejectsEmbeddedRetiredGeometryArtifactSchema() throws {
+        var geometry = makeGeometryArtifact()
+        geometry.schemaVersion = 2
+        let fixture = try writeMetadataWithoutStoreValidation(makeMetadata(geometry: geometry))
+        defer { try? FileManager.default.removeItem(at: fixture.root) }
+
+        XCTAssertThrowsError(try ProjectMetadataStore.load(from: fixture.url)) { error in
+            guard case ProjectMetadataStore.LoadError.unsupportedGeometryArtifactSchema(2) = error else {
+                return XCTFail("Expected unsupportedGeometryArtifactSchema(2), got \(error)")
+            }
         }
     }
 

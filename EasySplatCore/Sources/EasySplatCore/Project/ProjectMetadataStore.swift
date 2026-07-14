@@ -5,24 +5,27 @@ public enum ProjectMetadataStore {
     private static let maximumMetadataBytes = 8 * 1_024 * 1_024
     private static let fileLocks = ProjectMetadataFileLocks()
     /// The one project format this beta reads and writes.
-    public static let supportedFormatVersion: Int = 2
+    public static let supportedFormatVersion: Int = 3
 
     public enum LoadError: Error, LocalizedError {
         case unsupportedFormatVersion(Int)
-        case requiresNewerApp(Int)
         case invalidArtifactPath(field: String, path: String)
         case invalidArtifactNamespace(field: String, path: String)
+        case unsupportedGeometryArtifactSchema(Int)
+        case invalidTrainingMemoryRetryBudget(Int64)
 
         public var errorDescription: String? {
             switch self {
             case .unsupportedFormatVersion(let version):
                 return "Project format \(version) is not supported. This version of EasySplat opens format \(ProjectMetadataStore.supportedFormatVersion) projects only."
-            case .requiresNewerApp(let version):
-                return "Project format \(version) requires a newer version of EasySplat. Update EasySplat to open this project."
             case .invalidArtifactPath(let field, let path):
                 return "Project metadata contains an invalid project-relative artifact path for \(field): \(path)"
             case .invalidArtifactNamespace(let field, let path):
                 return "Project metadata stores \(field) outside its allowed project directory: \(path)"
+            case .unsupportedGeometryArtifactSchema(let schema):
+                return "Project metadata contains unsupported geometry artifact schema \(schema)."
+            case .invalidTrainingMemoryRetryBudget(let bytes):
+                return "Project metadata contains an invalid training memory retry budget: \(bytes) bytes."
             }
         }
     }
@@ -98,9 +101,6 @@ public enum ProjectMetadataStore {
         // clearly without partially interpreting another format.
         let envelope = try JSONDecoder().decode(FormatVersionEnvelope.self, from: data)
         guard envelope.formatVersion == supportedFormatVersion else {
-            if envelope.formatVersion > supportedFormatVersion {
-                throw LoadError.requiresNewerApp(envelope.formatVersion)
-            }
             throw LoadError.unsupportedFormatVersion(envelope.formatVersion)
         }
         let decoder = JSONDecoder()
@@ -139,6 +139,14 @@ public enum ProjectMetadataStore {
         metadataURL: URL
     ) throws {
         let paths = ProjectPaths(root: metadataURL.deletingLastPathComponent())
+        if let retryBudget = metadata.trainingMemoryRetryBudgetBytes,
+           retryBudget <= 0 {
+            throw LoadError.invalidTrainingMemoryRetryBudget(retryBudget)
+        }
+        if let artifact = metadata.geometryArtifact,
+           artifact.schemaVersion != GeometryArtifact.currentSchemaVersion {
+            throw LoadError.unsupportedGeometryArtifactSchema(artifact.schemaVersion)
+        }
         var artifactPaths: [(field: String, path: String)] = []
         if let path = metadata.geometryArtifact?.canonicalModelPath {
             artifactPaths.append(("geometryArtifact.canonicalModelPath", path))

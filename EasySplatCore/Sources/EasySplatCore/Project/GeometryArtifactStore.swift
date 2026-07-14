@@ -21,6 +21,8 @@ enum GeometryArtifactStore {
         case manifestTooLarge
         case invalidLearnedInitializer
         case learnedInitializerDigestMismatch
+        case invalidPairGraph
+        case invalidCanonicalOrientation
 
         var errorDescription: String? {
             switch self {
@@ -48,6 +50,10 @@ enum GeometryArtifactStore {
                 return "Geometry artifact has an invalid learned point initializer."
             case .learnedInitializerDigestMismatch:
                 return "Learned point initialization no longer matches accepted geometry."
+            case .invalidPairGraph:
+                return "Geometry artifact pair-graph evidence is incomplete or inconsistent."
+            case .invalidCanonicalOrientation:
+                return "Geometry artifact orientation evidence is incomplete or inconsistent."
             }
         }
     }
@@ -57,9 +63,17 @@ enum GeometryArtifactStore {
             at: url,
             maximumBytes: maximumManifestBytes
         )
+        let envelope = try JSONDecoder().decode(SchemaVersionEnvelope.self, from: data)
+        guard envelope.schemaVersion == GeometryArtifact.currentSchemaVersion else {
+            throw Error.invalidSchema(envelope.schemaVersion)
+        }
         let artifact = try JSONDecoder().decode(GeometryArtifact.self, from: data)
         try validate(artifact, projectPaths: projectPaths)
         return artifact
+    }
+
+    private struct SchemaVersionEnvelope: Decodable {
+        let schemaVersion: Int
     }
 
     static func persist(
@@ -181,6 +195,11 @@ enum GeometryArtifactStore {
         guard artifact.peakMemoryBytes > 0 else {
             throw Error.invalidPeakMemory
         }
+        try validatePairGraph(artifact.pairGraph, totalViewCount: artifact.totalViewCount)
+        try validateCanonicalOrientation(
+            artifact.canonicalOrientation,
+            registeredViewCount: artifact.registeredViewCount
+        )
         guard Set(artifact.modelHashes.keys) == ["cameras.txt", "images.txt", "points3D.txt"],
               artifact.modelHashes.values.allSatisfy(isSHA256) else {
             throw Error.invalidDigest("model")
@@ -240,6 +259,209 @@ enum GeometryArtifactStore {
             && !component.version.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
             && !component.revision.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
             && isSHA256(component.payloadSHA256)
+    }
+
+    private static func validatePairGraph(
+        _ artifact: PairGraphArtifact,
+        totalViewCount: Int
+    ) throws {
+        switch artifact.status {
+        case .notEvaluated:
+            guard artifact.measurement == nil else { throw Error.invalidPairGraph }
+        case .measured:
+            guard let measurement = artifact.measurement,
+                  measurement.scheduledPairCount >= 0,
+                  measurement.attemptedPairCount >= 0,
+                  measurement.attemptedPairCount <= measurement.scheduledPairCount,
+                  measurement.rawMatchedPairCount >= 0,
+                  measurement.rawMatchedPairCount <= measurement.attemptedPairCount,
+                  measurement.spatiallyVerifiedPairCount >= 0,
+                  measurement.spatiallyVerifiedPairCount <= measurement.rawMatchedPairCount,
+                  measurement.localPairCount >= 0,
+                  measurement.retrievalPairCount >= 0,
+                  measurement.loopRevisitPairCount >= 0,
+                  measurement.localPairCount <= measurement.scheduledPairCount,
+                  measurement.retrievalPairCount <= measurement.scheduledPairCount,
+                  measurement.loopRevisitPairCount <= measurement.scheduledPairCount,
+                  measurement.connectedComponentCount > 0,
+                  measurement.connectedComponentCount <= totalViewCount,
+                  measurement.isolatedViewCount >= 0,
+                  measurement.isolatedViewCount <= totalViewCount,
+                  measurement.degreeP10 >= 0,
+                  measurement.degreeP10 <= measurement.degreeMedian,
+                  measurement.degreeMedian <= measurement.degreeP90,
+                  measurement.degreeP90 < totalViewCount,
+                  !measurement.matcherAttempts.isEmpty,
+                  isSHA256(measurement.pairListDigest),
+                  measurement.matchingDurationSeconds.isFinite,
+                  measurement.matchingDurationSeconds >= 0,
+                  measurement.mappingAttemptNumber > 0,
+                  measurement.bundleAdjustmentCycleCount >= 0,
+                  measurement.fallbackReason.map({
+                      !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                  }) ?? true else {
+                throw Error.invalidPairGraph
+            }
+            let attemptNumbers = measurement.matcherAttempts.map(\.attemptNumber)
+            guard Set(attemptNumbers).count == attemptNumbers.count,
+                  attemptNumbers.sorted() == Array(1...attemptNumbers.count),
+                  measurement.matcherAttempts.allSatisfy({ attempt in
+                      attempt.scheduledPairCount >= 0
+                          && attempt.attemptedPairCount >= 0
+                          && attempt.attemptedPairCount <= attempt.scheduledPairCount
+                          && attempt.rawMatchedPairCount >= 0
+                          && attempt.rawMatchedPairCount <= attempt.attemptedPairCount
+                          && attempt.spatiallyVerifiedPairCount >= 0
+                          && attempt.spatiallyVerifiedPairCount <= attempt.rawMatchedPairCount
+                          && attempt.durationSeconds.isFinite
+                          && attempt.durationSeconds >= 0
+                  }) else {
+                throw Error.invalidPairGraph
+            }
+        }
+    }
+
+    private static func validateCanonicalOrientation(
+        _ artifact: CanonicalOrientationArtifact,
+        registeredViewCount: Int
+    ) throws {
+        guard !artifact.isViewOnlyFlipActive
+                || artifact.status == .axisAlignedSignUnverified else {
+            throw Error.invalidCanonicalOrientation
+        }
+        switch artifact.status {
+        case .notEvaluated:
+            guard artifact.method == nil,
+                  artifact.sourceToCanonicalQuaternionWXYZ == nil,
+                  artifact.evidence == nil,
+                  artifact.canonicalOpeningViewDirection == nil,
+                  !artifact.isViewOnlyFlipActive else {
+                throw Error.invalidCanonicalOrientation
+            }
+        case .unresolved:
+            guard artifact.sourceToCanonicalQuaternionWXYZ == nil,
+                  let direction = artifact.canonicalOpeningViewDirection,
+                  validUnitDirection(direction),
+                  (artifact.method == nil) == (artifact.evidence == nil),
+                  !artifact.isViewOnlyFlipActive else {
+                throw Error.invalidCanonicalOrientation
+            }
+            if let evidence = artifact.evidence {
+                try validateOrientationEvidence(evidence, registeredViewCount: registeredViewCount)
+            }
+        case .verified, .axisAlignedSignUnverified:
+            guard let method = artifact.method,
+                  let quaternion = artifact.sourceToCanonicalQuaternionWXYZ,
+                  validUnitQuaternion(quaternion),
+                  let evidence = artifact.evidence,
+                  let direction = artifact.canonicalOpeningViewDirection,
+                  validUnitDirection(direction) else {
+                throw Error.invalidCanonicalOrientation
+            }
+            try validateOrientationEvidence(evidence, registeredViewCount: registeredViewCount)
+            switch method {
+            case .cameraRightNullspace:
+                guard evidence.supportCount >= 8,
+                      evidence.eigenvalue1 >= 0.03,
+                      evidence.eigengap >= 25,
+                      evidence.medianResidualDegrees <= 3,
+                      evidence.p90ResidualDegrees <= 8,
+                      evidence.bootstrapP95VariationDegrees <= 5 else {
+                    throw Error.invalidCanonicalOrientation
+                }
+                if artifact.status == .verified {
+                    guard let medianAgreement = evidence.medianAbsoluteImageUpAgreement,
+                          medianAgreement >= 0.20,
+                          let signAgreement = evidence.signAgreement,
+                          signAgreement >= 0.75,
+                          evidence.trajectoryPlaneAgreementDegrees.map({ $0 <= 15 }) ?? true else {
+                        throw Error.invalidCanonicalOrientation
+                    }
+                }
+            case .cameraUpConsensus:
+                guard artifact.status == .verified,
+                      let concentration = evidence.cameraUpConcentration,
+                      concentration >= 0.90,
+                      let medianSpread = evidence.cameraUpMedianSpreadDegrees,
+                      medianSpread <= 10,
+                      let p90Spread = evidence.cameraUpP90SpreadDegrees,
+                      p90Spread <= 20,
+                      evidence.bootstrapP95VariationDegrees <= 5 else {
+                    throw Error.invalidCanonicalOrientation
+                }
+            }
+        }
+    }
+
+    private static func validateOrientationEvidence(
+        _ evidence: CanonicalOrientationEvidence,
+        registeredViewCount: Int
+    ) throws {
+        let finiteValues = [
+            evidence.eigenvalue0,
+            evidence.eigenvalue1,
+            evidence.eigenvalue2,
+            evidence.eigengap,
+            evidence.medianResidualDegrees,
+            evidence.p90ResidualDegrees,
+            evidence.bootstrapP95VariationDegrees,
+        ]
+        guard finiteValues.allSatisfy(\.isFinite),
+              evidence.supportCount > 0,
+              evidence.supportCount <= registeredViewCount,
+              evidence.eigenvalue0 >= 0,
+              evidence.eigenvalue0 <= evidence.eigenvalue1,
+              evidence.eigenvalue1 <= evidence.eigenvalue2,
+              abs(evidence.eigenvalue0 + evidence.eigenvalue1 + evidence.eigenvalue2 - 1) <= 1e-6,
+              evidence.eigengap >= 0,
+              approximatelyEqual(
+                  evidence.eigengap,
+                  evidence.eigenvalue1 / max(evidence.eigenvalue0, 1e-9),
+                  relativeTolerance: 1e-6
+              ),
+              evidence.medianResidualDegrees >= 0,
+              evidence.p90ResidualDegrees >= evidence.medianResidualDegrees,
+              evidence.bootstrapP95VariationDegrees >= 0,
+              validUnitInterval(evidence.medianAbsoluteImageUpAgreement),
+              validUnitInterval(evidence.signAgreement),
+              validUnitInterval(evidence.cameraUpConcentration),
+              validDegrees(evidence.trajectoryPlaneAgreementDegrees),
+              validDegrees(evidence.cameraUpMedianSpreadDegrees),
+              validDegrees(evidence.cameraUpP90SpreadDegrees) else {
+            throw Error.invalidCanonicalOrientation
+        }
+    }
+
+    private static func validUnitQuaternion(_ value: CanonicalQuaternionWXYZ) -> Bool {
+        let components = [value.w, value.x, value.y, value.z]
+        guard components.allSatisfy(\.isFinite) else { return false }
+        let squaredNorm = components.reduce(0) { $0 + $1 * $1 }
+        return abs(squaredNorm - 1) <= 1e-6
+    }
+
+    private static func validUnitDirection(_ value: CanonicalDirection) -> Bool {
+        let components = [value.x, value.y, value.z]
+        guard components.allSatisfy(\.isFinite) else { return false }
+        let squaredNorm = components.reduce(0) { $0 + $1 * $1 }
+        return abs(squaredNorm - 1) <= 1e-6
+    }
+
+    private static func validUnitInterval(_ value: Double?) -> Bool {
+        guard let value else { return true }
+        return value.isFinite && value >= 0 && value <= 1
+    }
+
+    private static func validDegrees(_ value: Double?) -> Bool {
+        guard let value else { return true }
+        return value.isFinite && value >= 0 && value <= 180
+    }
+
+    private static func approximatelyEqual(
+        _ first: Double,
+        _ second: Double,
+        relativeTolerance: Double
+    ) -> Bool {
+        abs(first - second) <= max(1e-9, max(abs(first), abs(second)) * relativeTolerance)
     }
 
     static func inputDigest(projectPaths: ProjectPaths) throws -> String {

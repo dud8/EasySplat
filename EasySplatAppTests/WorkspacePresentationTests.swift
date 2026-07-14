@@ -68,11 +68,9 @@ final class WorkspacePresentationTests: XCTestCase {
         XCTAssertTrue(ProjectSidebar.opensOnSelection(status: .ready))
         XCTAssertFalse(ProjectSidebar.opensOnSelection(status: .inProgress))
         XCTAssertFalse(ProjectSidebar.opensOnSelection(status: .failed))
-        XCTAssertFalse(ProjectSidebar.opensOnSelection(status: .needsAppUpdate))
         XCTAssertEqual(ProjectSidebar.rowActionTitle(status: .inProgress), "Resume")
         XCTAssertEqual(ProjectSidebar.rowActionTitle(status: .failed), "Try Again")
         XCTAssertNil(ProjectSidebar.rowActionTitle(status: .ready))
-        XCTAssertNil(ProjectSidebar.rowActionTitle(status: .needsAppUpdate))
     }
 
     func testSetupStopCopyDoesNotPromiseAProjectOrCheckpoint() {

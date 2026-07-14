@@ -2069,83 +2069,63 @@ final class AppModelTests: XCTestCase {
         XCTAssertFalse(FileManager.default.fileExists(atPath: outsidePaths.lastOpenedSidecarURL.path))
     }
 
-    /// A project whose metadata uses a future formatVersion should appear in the listing
-    /// with `.needsAppUpdate` so the user gets a clear prompt to update, instead of the
-    /// project silently disappearing.
-    func testRefreshProjectSummariesSurfacesUnsupportedFormatVersion() throws {
+    func testRefreshProjectSummariesLoadsOnlyCurrentFormatWithoutMutatingSkippedBundles() throws {
         let base = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: base) }
         try FileManager.default.createDirectory(at: base, withIntermediateDirectories: true)
-
-        let projectURL = base.appendingPathComponent("FromTheFuture.easysplatproj", isDirectory: true)
-        try FileManager.default.createDirectory(at: projectURL, withIntermediateDirectories: true)
-        let metadataURL = projectURL.appendingPathComponent("project.json")
-        let futureVersion = ProjectMetadataStore.supportedFormatVersion + 1
-        let raw = """
-        {
-          "createdAt":"1970-01-01T00:00:00Z",
-          "formatVersion":\(futureVersion),
-          "id":"00000000-0000-0000-0000-000000000003",
-          "input":{"photos":{"folder":"/tmp/photos"}},
-          "requestedRunOptions":{"capturePath":"automatic","detailProfile":"balanced"},
-          "state":{"lastError":null,"stage":"importInput"},
-          "title":"User-chosen title"
-        }
-        """
-        try raw.write(to: metadataURL, atomically: true, encoding: .utf8)
+        _ = try makeProject(
+            at: base,
+            name: "Current",
+            lastError: "capture failed",
+            withOutput: false
+        )
+        let skipped = try [
+            makeSkippedProject(at: base, name: "Old", metadata: #"{"formatVersion":2}"#),
+            makeSkippedProject(at: base, name: "Future", metadata: #"{"formatVersion":4,"renamedField":42}"#),
+            makeSkippedProject(at: base, name: "Corrupt", metadata: "{not-json")
+        ]
+        let fileBundle = base.appendingPathComponent("NotADirectory.easysplatproj")
+        try Data("leave this file alone".utf8).write(to: fileBundle)
+        let fileBundleBytes = try Data(contentsOf: fileBundle)
+        let fileBundleDate = try modificationDate(of: fileBundle)
 
         let model = AppModel(toolchainManager: MockToolchainManager(), projectBaseURL: base) { _, config in
             MockPipelineRunner(projectURL: base, config: config)
         }
         model.refreshProjectSummaries()
 
-        // contentsOfDirectory may canonicalize /tmp/... → /private/tmp/... on macOS, so
-        // match by directory name rather than URL identity.
-        let summary = try XCTUnwrap(
-            model.projectSummaries.first {
-                $0.url.lastPathComponent == projectURL.lastPathComponent
-            },
-            "expected a summary for FromTheFuture.easysplatproj; got titles: \(model.projectSummaries.map(\.title))"
-        )
-        XCTAssertEqual(summary.status, .needsAppUpdate)
-        // Title should be preserved from the JSON peek so the user recognizes their project.
-        XCTAssertEqual(summary.title, "User-chosen title")
+        XCTAssertEqual(model.projectSummaries.map(\.title), ["Current"])
+        try assertSkippedProjectsUnchanged(skipped)
+        XCTAssertEqual(try Data(contentsOf: fileBundle), fileBundleBytes)
+        XCTAssertEqual(try modificationDate(of: fileBundle), fileBundleDate)
     }
 
-    /// A future build may add or rename required fields, so the listing must surface
-    /// `.needsAppUpdate` even when the strict ProjectMetadata decoder cannot make sense
-    /// of the file at all. The formatVersion guard short-circuits before strict decode.
-    func testRefreshProjectSummariesSurfacesUnsupportedFormatVersionWithChangedSchema() throws {
+    func testBackgroundProjectSummaryRefreshIgnoresNoncurrentBundlesWithoutMutation() async throws {
         let base = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: base) }
         try FileManager.default.createDirectory(at: base, withIntermediateDirectories: true)
-
-        let projectURL = base.appendingPathComponent("ChangedSchema.easysplatproj", isDirectory: true)
-        try FileManager.default.createDirectory(at: projectURL, withIntermediateDirectories: true)
-        let metadataURL = projectURL.appendingPathComponent("project.json")
-        let futureVersion = ProjectMetadataStore.supportedFormatVersion + 1
-        // Deliberately omit `state`, `input`, `preset`, `id`, `createdAt`. Today's strict
-        // decoder cannot make sense of this — but the formatVersion bump must still surface.
-        let raw = """
-        {
-          "formatVersion":\(futureVersion),
-          "title":"Renamed-Schema project",
-          "renamedField":42
-        }
-        """
-        try raw.write(to: metadataURL, atomically: true, encoding: .utf8)
+        _ = try makeProject(
+            at: base,
+            name: "Current Background",
+            lastError: "capture failed",
+            withOutput: false
+        )
+        let skipped = try [
+            makeSkippedProject(at: base, name: "Old Background", metadata: #"{"formatVersion":2}"#),
+            makeSkippedProject(at: base, name: "Future Background", metadata: #"{"formatVersion":4}"#)
+        ]
 
         let model = AppModel(toolchainManager: MockToolchainManager(), projectBaseURL: base) { _, config in
             MockPipelineRunner(projectURL: base, config: config)
         }
-        model.refreshProjectSummaries()
+        model.refreshProjectSummariesInBackground()
 
-        let summary = try XCTUnwrap(
-            model.projectSummaries.first {
-                $0.url.lastPathComponent == projectURL.lastPathComponent
-            },
-            "expected ChangedSchema project to surface as needsAppUpdate; got \(model.projectSummaries.map(\.title))"
-        )
-        XCTAssertEqual(summary.status, .needsAppUpdate)
-        XCTAssertEqual(summary.title, "Renamed-Schema project")
+        let deadline = Date().addingTimeInterval(2)
+        while model.projectSummaries.isEmpty && Date() < deadline {
+            try await Task.sleep(nanoseconds: 10_000_000)
+        }
+        XCTAssertEqual(model.projectSummaries.map(\.title), ["Current Background"])
+        try assertSkippedProjectsUnchanged(skipped)
     }
 
     func testRefreshProjectSummariesDoesNotMarkOutputDirectoryReady() throws {
@@ -2743,6 +2723,77 @@ final class AppModelTests: XCTestCase {
         )
         try ProjectMetadataStore.save(metadata, to: paths.metadataURL)
         return url
+    }
+
+    private struct SkippedProjectSnapshot {
+        let metadataURL: URL
+        let metadataBytes: Data
+        let metadataDate: Date
+        let sentinelURL: URL
+        let sentinelBytes: Data
+        let sentinelDate: Date
+    }
+
+    private func makeSkippedProject(
+        at base: URL,
+        name: String,
+        metadata: String
+    ) throws -> SkippedProjectSnapshot {
+        let projectURL = base.appendingPathComponent("\(name).easysplatproj", isDirectory: true)
+        try FileManager.default.createDirectory(at: projectURL, withIntermediateDirectories: true)
+        let metadataURL = projectURL.appendingPathComponent("project.json")
+        let sentinelURL = projectURL.appendingPathComponent("do-not-touch.bin")
+        try Data(metadata.utf8).write(to: metadataURL)
+        try Data("preserve \(name)".utf8).write(to: sentinelURL)
+        let fixedDate = Date(timeIntervalSince1970: 1_700_000_000)
+        try FileManager.default.setAttributes([.modificationDate: fixedDate], ofItemAtPath: metadataURL.path)
+        try FileManager.default.setAttributes([.modificationDate: fixedDate], ofItemAtPath: sentinelURL.path)
+        return SkippedProjectSnapshot(
+            metadataURL: metadataURL,
+            metadataBytes: try Data(contentsOf: metadataURL),
+            metadataDate: try modificationDate(of: metadataURL),
+            sentinelURL: sentinelURL,
+            sentinelBytes: try Data(contentsOf: sentinelURL),
+            sentinelDate: try modificationDate(of: sentinelURL)
+        )
+    }
+
+    private func assertSkippedProjectsUnchanged(
+        _ snapshots: [SkippedProjectSnapshot],
+        file: StaticString = #filePath,
+        line: UInt = #line
+    ) throws {
+        for snapshot in snapshots {
+            XCTAssertEqual(
+                try Data(contentsOf: snapshot.metadataURL),
+                snapshot.metadataBytes,
+                file: file,
+                line: line
+            )
+            XCTAssertEqual(
+                try modificationDate(of: snapshot.metadataURL),
+                snapshot.metadataDate,
+                file: file,
+                line: line
+            )
+            XCTAssertEqual(
+                try Data(contentsOf: snapshot.sentinelURL),
+                snapshot.sentinelBytes,
+                file: file,
+                line: line
+            )
+            XCTAssertEqual(
+                try modificationDate(of: snapshot.sentinelURL),
+                snapshot.sentinelDate,
+                file: file,
+                line: line
+            )
+        }
+    }
+
+    private func modificationDate(of url: URL) throws -> Date {
+        let attributes = try FileManager.default.attributesOfItem(atPath: url.path)
+        return try XCTUnwrap(attributes[.modificationDate] as? Date)
     }
 }
 

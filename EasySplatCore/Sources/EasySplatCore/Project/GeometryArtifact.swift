@@ -50,8 +50,247 @@ public struct LearnedPointInitializerArtifact: Codable, Sendable, Equatable {
     }
 }
 
+public enum PairGraphMeasurementStatus: String, Codable, Sendable, Equatable {
+    case notEvaluated
+    case measured
+}
+
+public enum DescriptorMatcher: String, Codable, Sendable, Equatable {
+    case faiss
+    case exact
+}
+
+public struct PairMatchingAttemptArtifact: Codable, Sendable, Equatable {
+    public var attemptNumber: Int
+    public var matcher: DescriptorMatcher
+    public var scheduledPairCount: Int
+    public var attemptedPairCount: Int
+    public var rawMatchedPairCount: Int
+    public var spatiallyVerifiedPairCount: Int
+    public var durationSeconds: Double
+
+    public init(
+        attemptNumber: Int,
+        matcher: DescriptorMatcher,
+        scheduledPairCount: Int,
+        attemptedPairCount: Int,
+        rawMatchedPairCount: Int,
+        spatiallyVerifiedPairCount: Int,
+        durationSeconds: Double
+    ) {
+        self.attemptNumber = attemptNumber
+        self.matcher = matcher
+        self.scheduledPairCount = scheduledPairCount
+        self.attemptedPairCount = attemptedPairCount
+        self.rawMatchedPairCount = rawMatchedPairCount
+        self.spatiallyVerifiedPairCount = spatiallyVerifiedPairCount
+        self.durationSeconds = durationSeconds
+    }
+}
+
+public struct PairGraphMeasurement: Codable, Sendable, Equatable {
+    public var scheduledPairCount: Int
+    public var attemptedPairCount: Int
+    public var rawMatchedPairCount: Int
+    public var spatiallyVerifiedPairCount: Int
+    public var localPairCount: Int
+    public var retrievalPairCount: Int
+    public var loopRevisitPairCount: Int
+    public var connectedComponentCount: Int
+    public var isolatedViewCount: Int
+    public var degreeP10: Int
+    public var degreeMedian: Int
+    public var degreeP90: Int
+    public var matcherAttempts: [PairMatchingAttemptArtifact]
+    public var pairListDigest: String
+    public var matchingDurationSeconds: Double
+    public var mappingAttemptNumber: Int
+    public var bundleAdjustmentCycleCount: Int
+    public var fallbackReason: String?
+
+    public init(
+        scheduledPairCount: Int,
+        attemptedPairCount: Int,
+        rawMatchedPairCount: Int,
+        spatiallyVerifiedPairCount: Int,
+        localPairCount: Int,
+        retrievalPairCount: Int,
+        loopRevisitPairCount: Int,
+        connectedComponentCount: Int,
+        isolatedViewCount: Int,
+        degreeP10: Int,
+        degreeMedian: Int,
+        degreeP90: Int,
+        matcherAttempts: [PairMatchingAttemptArtifact],
+        pairListDigest: String,
+        matchingDurationSeconds: Double,
+        mappingAttemptNumber: Int,
+        bundleAdjustmentCycleCount: Int,
+        fallbackReason: String?
+    ) {
+        self.scheduledPairCount = scheduledPairCount
+        self.attemptedPairCount = attemptedPairCount
+        self.rawMatchedPairCount = rawMatchedPairCount
+        self.spatiallyVerifiedPairCount = spatiallyVerifiedPairCount
+        self.localPairCount = localPairCount
+        self.retrievalPairCount = retrievalPairCount
+        self.loopRevisitPairCount = loopRevisitPairCount
+        self.connectedComponentCount = connectedComponentCount
+        self.isolatedViewCount = isolatedViewCount
+        self.degreeP10 = degreeP10
+        self.degreeMedian = degreeMedian
+        self.degreeP90 = degreeP90
+        self.matcherAttempts = matcherAttempts
+        self.pairListDigest = pairListDigest
+        self.matchingDurationSeconds = matchingDurationSeconds
+        self.mappingAttemptNumber = mappingAttemptNumber
+        self.bundleAdjustmentCycleCount = bundleAdjustmentCycleCount
+        self.fallbackReason = fallbackReason
+    }
+}
+
+public struct PairGraphArtifact: Codable, Sendable, Equatable {
+    public var status: PairGraphMeasurementStatus
+    public var measurement: PairGraphMeasurement?
+
+    public init(status: PairGraphMeasurementStatus, measurement: PairGraphMeasurement?) {
+        self.status = status
+        self.measurement = measurement
+    }
+
+    public static let notEvaluated = PairGraphArtifact(status: .notEvaluated, measurement: nil)
+
+    public static func measured(_ measurement: PairGraphMeasurement) -> PairGraphArtifact {
+        PairGraphArtifact(status: .measured, measurement: measurement)
+    }
+}
+
+public enum CanonicalOrientationStatus: String, Codable, Sendable, Equatable {
+    case notEvaluated
+    case verified
+    case axisAlignedSignUnverified
+    case unresolved
+}
+
+public enum CanonicalOrientationMethod: String, Codable, Sendable, Equatable {
+    case cameraRightNullspace
+    case cameraUpConsensus
+}
+
+public struct CanonicalQuaternionWXYZ: Codable, Sendable, Equatable {
+    public var w: Double
+    public var x: Double
+    public var y: Double
+    public var z: Double
+
+    public init(w: Double, x: Double, y: Double, z: Double) {
+        self.w = w
+        self.x = x
+        self.y = y
+        self.z = z
+    }
+}
+
+public struct CanonicalDirection: Codable, Sendable, Equatable {
+    public var x: Double
+    public var y: Double
+    public var z: Double
+
+    public init(x: Double, y: Double, z: Double) {
+        self.x = x
+        self.y = y
+        self.z = z
+    }
+}
+
+public struct CanonicalOrientationEvidence: Codable, Sendable, Equatable {
+    public var supportCount: Int
+    /// Ascending, trace-normalized eigenvalues of the camera-right scatter matrix.
+    public var eigenvalue0: Double
+    public var eigenvalue1: Double
+    public var eigenvalue2: Double
+    /// `eigenvalue1 / max(eigenvalue0, 1e-9)`.
+    public var eigengap: Double
+    public var medianResidualDegrees: Double
+    public var p90ResidualDegrees: Double
+    public var medianAbsoluteImageUpAgreement: Double?
+    public var signAgreement: Double?
+    public var bootstrapP95VariationDegrees: Double
+    public var trajectoryPlaneAgreementDegrees: Double?
+    public var cameraUpConcentration: Double?
+    public var cameraUpMedianSpreadDegrees: Double?
+    public var cameraUpP90SpreadDegrees: Double?
+
+    public init(
+        supportCount: Int,
+        eigenvalue0: Double,
+        eigenvalue1: Double,
+        eigenvalue2: Double,
+        eigengap: Double,
+        medianResidualDegrees: Double,
+        p90ResidualDegrees: Double,
+        medianAbsoluteImageUpAgreement: Double?,
+        signAgreement: Double?,
+        bootstrapP95VariationDegrees: Double,
+        trajectoryPlaneAgreementDegrees: Double?,
+        cameraUpConcentration: Double? = nil,
+        cameraUpMedianSpreadDegrees: Double? = nil,
+        cameraUpP90SpreadDegrees: Double? = nil
+    ) {
+        self.supportCount = supportCount
+        self.eigenvalue0 = eigenvalue0
+        self.eigenvalue1 = eigenvalue1
+        self.eigenvalue2 = eigenvalue2
+        self.eigengap = eigengap
+        self.medianResidualDegrees = medianResidualDegrees
+        self.p90ResidualDegrees = p90ResidualDegrees
+        self.medianAbsoluteImageUpAgreement = medianAbsoluteImageUpAgreement
+        self.signAgreement = signAgreement
+        self.bootstrapP95VariationDegrees = bootstrapP95VariationDegrees
+        self.trajectoryPlaneAgreementDegrees = trajectoryPlaneAgreementDegrees
+        self.cameraUpConcentration = cameraUpConcentration
+        self.cameraUpMedianSpreadDegrees = cameraUpMedianSpreadDegrees
+        self.cameraUpP90SpreadDegrees = cameraUpP90SpreadDegrees
+    }
+}
+
+public struct CanonicalOrientationArtifact: Codable, Sendable, Equatable {
+    public var status: CanonicalOrientationStatus
+    public var method: CanonicalOrientationMethod?
+    /// Proper source-to-canonical rotation. Component order is fixed by the type name.
+    public var sourceToCanonicalQuaternionWXYZ: CanonicalQuaternionWXYZ?
+    public var evidence: CanonicalOrientationEvidence?
+    public var canonicalOpeningViewDirection: CanonicalDirection?
+    public var isViewOnlyFlipActive: Bool
+
+    public init(
+        status: CanonicalOrientationStatus,
+        method: CanonicalOrientationMethod?,
+        sourceToCanonicalQuaternionWXYZ: CanonicalQuaternionWXYZ?,
+        evidence: CanonicalOrientationEvidence?,
+        canonicalOpeningViewDirection: CanonicalDirection?,
+        isViewOnlyFlipActive: Bool
+    ) {
+        self.status = status
+        self.method = method
+        self.sourceToCanonicalQuaternionWXYZ = sourceToCanonicalQuaternionWXYZ
+        self.evidence = evidence
+        self.canonicalOpeningViewDirection = canonicalOpeningViewDirection
+        self.isViewOnlyFlipActive = isViewOnlyFlipActive
+    }
+
+    public static let notEvaluated = CanonicalOrientationArtifact(
+        status: .notEvaluated,
+        method: nil,
+        sourceToCanonicalQuaternionWXYZ: nil,
+        evidence: nil,
+        canonicalOpeningViewDirection: nil,
+        isViewOnlyFlipActive: false
+    )
+}
+
 public struct GeometryArtifact: Codable, Sendable, Equatable {
-    public static let currentSchemaVersion = 2
+    public static let currentSchemaVersion = 3
 
     public var schemaVersion: Int
     public var solverVersion: String
@@ -83,6 +322,8 @@ public struct GeometryArtifact: Codable, Sendable, Equatable {
     public var fallbackReason: String?
     public var provenance: GeometryProvenance
     public var learnedPointInitializer: LearnedPointInitializerArtifact?
+    public var pairGraph: PairGraphArtifact
+    public var canonicalOrientation: CanonicalOrientationArtifact
 
     public init(
         schemaVersion: Int,
@@ -112,7 +353,9 @@ public struct GeometryArtifact: Codable, Sendable, Equatable {
         modelHashes: [String: String],
         fallbackReason: String?,
         provenance: GeometryProvenance,
-        learnedPointInitializer: LearnedPointInitializerArtifact? = nil
+        learnedPointInitializer: LearnedPointInitializerArtifact? = nil,
+        pairGraph: PairGraphArtifact = .notEvaluated,
+        canonicalOrientation: CanonicalOrientationArtifact = .notEvaluated
     ) {
         self.schemaVersion = schemaVersion
         self.solverVersion = solverVersion
@@ -142,5 +385,7 @@ public struct GeometryArtifact: Codable, Sendable, Equatable {
         self.fallbackReason = fallbackReason
         self.provenance = provenance
         self.learnedPointInitializer = learnedPointInitializer
+        self.pairGraph = pairGraph
+        self.canonicalOrientation = canonicalOrientation
     }
 }

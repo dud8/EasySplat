@@ -45,8 +45,7 @@ final class ProjectListFilterSortTests: XCTestCase {
         let projects = [
             makeSummary(status: .ready),
             makeSummary(status: .inProgress),
-            makeSummary(status: .failed),
-            makeSummary(status: .needsAppUpdate)
+            makeSummary(status: .failed)
         ]
         for project in projects {
             XCTAssertTrue(ProjectListFilter.all.matches(project))

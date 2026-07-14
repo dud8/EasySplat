@@ -208,13 +208,13 @@ struct ProjectSidebar: View {
         Button(openActionTitle(for: project)) {
             open(project)
         }
-        .disabled(isRunActive || project.status == .needsAppUpdate)
+        .disabled(isRunActive)
 
         Button("Rename…") {
             renameDraft = project.title
             renameTarget = project
         }
-        .disabled(isLocked(project) || project.status == .needsAppUpdate)
+        .disabled(isLocked(project))
 
         Divider()
 
@@ -270,7 +270,6 @@ struct ProjectSidebar: View {
         case .ready: return "Ready"
         case .inProgress: return "In Progress"
         case .failed: return "Failed"
-        case .needsAppUpdate: return "Update Required"
         }
     }
 
@@ -279,7 +278,6 @@ struct ProjectSidebar: View {
         case .ready: return "Open"
         case .failed: return "Try Again"
         case .inProgress: return "Resume"
-        case .needsAppUpdate: return "Open"
         }
     }
 
@@ -291,7 +289,7 @@ struct ProjectSidebar: View {
         switch status {
         case .inProgress: return "Resume"
         case .failed: return "Try Again"
-        case .ready, .needsAppUpdate: return nil
+        case .ready: return nil
         }
     }
 

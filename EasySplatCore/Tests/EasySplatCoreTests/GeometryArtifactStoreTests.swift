@@ -25,6 +25,18 @@ final class GeometryArtifactStoreTests: XCTestCase {
             artifact
         )
         XCTAssertEqual(try ProjectMetadataStore.load(from: paths.metadataURL).geometryArtifact, artifact)
+        let sidecar = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: Data(contentsOf: paths.geometryManifestURL))
+                as? [String: Any]
+        )
+        XCTAssertEqual(
+            (sidecar["pairGraph"] as? [String: Any])?["status"] as? String,
+            "notEvaluated"
+        )
+        XCTAssertEqual(
+            (sidecar["canonicalOrientation"] as? [String: Any])?["status"] as? String,
+            "notEvaluated"
+        )
     }
 
     func testLoadRejectsSymlinkedGeometryManifest() throws {
@@ -294,7 +306,7 @@ final class GeometryArtifactStoreTests: XCTestCase {
         }
     }
 
-    func testSchemaTwoRequiresCompleteToolchainProvenance() throws {
+    func testSchemaThreeRequiresCompleteToolchainProvenance() throws {
         let root = try TestFileBuilder.makeTempDir()
         defer { try? FileManager.default.removeItem(at: root) }
         let paths = ProjectPaths(root: root)
@@ -361,6 +373,124 @@ final class GeometryArtifactStoreTests: XCTestCase {
 
         XCTAssertThrowsError(try GeometryArtifactStore.validate(artifact, projectPaths: paths)) { error in
             XCTAssertEqual(error as? GeometryArtifactStore.Error, .invalidSchema(1))
+        }
+    }
+
+    func testLoadRejectsFutureSchemaBeforeDecodingItsPayload() throws {
+        let root = try TestFileBuilder.makeTempDir()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let paths = ProjectPaths(root: root)
+        try paths.ensureDirectories()
+        try Data(#"{"schemaVersion":4,"futurePayload":true}"#.utf8)
+            .write(to: paths.geometryManifestURL)
+
+        XCTAssertThrowsError(
+            try GeometryArtifactStore.load(
+                from: paths.geometryManifestURL,
+                projectPaths: paths
+            )
+        ) { error in
+            XCTAssertEqual(error as? GeometryArtifactStore.Error, .invalidSchema(4))
+        }
+    }
+
+    func testAcceptsMeasuredPairGraphAndExplicitUnresolvedOrientation() throws {
+        let root = try TestFileBuilder.makeTempDir()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let paths = ProjectPaths(root: root)
+        try paths.ensureDirectories()
+        let fixture = try writeCanonicalModel(at: paths)
+        var artifact = makeArtifact(fixture: fixture)
+        artifact.pairGraph = .measured(PairGraphMeasurement(
+            scheduledPairCount: 0,
+            attemptedPairCount: 0,
+            rawMatchedPairCount: 0,
+            spatiallyVerifiedPairCount: 0,
+            localPairCount: 0,
+            retrievalPairCount: 0,
+            loopRevisitPairCount: 0,
+            connectedComponentCount: 1,
+            isolatedViewCount: 1,
+            degreeP10: 0,
+            degreeMedian: 0,
+            degreeP90: 0,
+            matcherAttempts: [PairMatchingAttemptArtifact(
+                attemptNumber: 1,
+                matcher: .faiss,
+                scheduledPairCount: 0,
+                attemptedPairCount: 0,
+                rawMatchedPairCount: 0,
+                spatiallyVerifiedPairCount: 0,
+                durationSeconds: 0.01
+            )],
+            pairListDigest: String(repeating: "d", count: 64),
+            matchingDurationSeconds: 0.01,
+            mappingAttemptNumber: 1,
+            bundleAdjustmentCycleCount: 2,
+            fallbackReason: nil
+        ))
+        artifact.canonicalOrientation = CanonicalOrientationArtifact(
+            status: .unresolved,
+            method: nil,
+            sourceToCanonicalQuaternionWXYZ: nil,
+            evidence: nil,
+            canonicalOpeningViewDirection: CanonicalDirection(x: 0, y: 0, z: -1),
+            isViewOnlyFlipActive: false
+        )
+
+        XCTAssertNoThrow(try GeometryArtifactStore.validate(artifact, projectPaths: paths))
+    }
+
+    func testRejectsFabricatedPairAndOrientationEvidence() throws {
+        let root = try TestFileBuilder.makeTempDir()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let paths = ProjectPaths(root: root)
+        try paths.ensureDirectories()
+        let fixture = try writeCanonicalModel(at: paths)
+
+        var fabricatedPairGraph = makeArtifact(fixture: fixture)
+        fabricatedPairGraph.pairGraph = PairGraphArtifact(
+            status: .notEvaluated,
+            measurement: PairGraphMeasurement(
+                scheduledPairCount: 0,
+                attemptedPairCount: 0,
+                rawMatchedPairCount: 0,
+                spatiallyVerifiedPairCount: 0,
+                localPairCount: 0,
+                retrievalPairCount: 0,
+                loopRevisitPairCount: 0,
+                connectedComponentCount: 1,
+                isolatedViewCount: 1,
+                degreeP10: 0,
+                degreeMedian: 0,
+                degreeP90: 0,
+                matcherAttempts: [],
+                pairListDigest: String(repeating: "d", count: 64),
+                matchingDurationSeconds: 0,
+                mappingAttemptNumber: 1,
+                bundleAdjustmentCycleCount: 0,
+                fallbackReason: nil
+            )
+        )
+        XCTAssertThrowsError(
+            try GeometryArtifactStore.validate(fabricatedPairGraph, projectPaths: paths)
+        ) { error in
+            XCTAssertEqual(error as? GeometryArtifactStore.Error, .invalidPairGraph)
+        }
+
+        var fabricatedOrientation = makeArtifact(fixture: fixture)
+        fabricatedOrientation.canonicalOrientation = CanonicalOrientationArtifact(
+            status: .notEvaluated,
+            method: nil,
+            sourceToCanonicalQuaternionWXYZ: CanonicalQuaternionWXYZ(w: 1, x: 0, y: 0, z: 0),
+            evidence: nil,
+            canonicalOpeningViewDirection: nil,
+            isViewOnlyFlipActive: false
+        )
+        XCTAssertThrowsError(
+            try GeometryArtifactStore.validate(fabricatedOrientation, projectPaths: paths)
+        ) { error in
+            XCTAssertEqual(error as? GeometryArtifactStore.Error, .invalidCanonicalOrientation)
         }
     }
 

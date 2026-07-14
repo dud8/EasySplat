@@ -102,6 +102,4 @@ enum ProjectStatus: String, Sendable {
     case ready
     case inProgress
     case failed
-    /// Project metadata is from a future build of EasySplat; current build can't safely open it.
-    case needsAppUpdate
 }

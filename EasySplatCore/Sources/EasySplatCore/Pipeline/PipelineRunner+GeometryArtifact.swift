@@ -121,7 +121,7 @@ extension PipelineRunner {
             learnedPointInitializer = nil
         }
         let artifact = GeometryArtifact(
-            schemaVersion: 2,
+            schemaVersion: GeometryArtifact.currentSchemaVersion,
             solverVersion: solverVersion,
             runtimeVersion: runtimeVersion,
             modelVersion: modelVersion,
