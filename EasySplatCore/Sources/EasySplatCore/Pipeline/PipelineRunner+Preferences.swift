@@ -43,7 +43,7 @@ extension PipelineRunner {
     func da3SharedCameraPreference(input: InputSpec, cameraGrouping: CameraGrouping = .automatic) -> Bool {
         switch cameraGrouping {
         case .automatic:
-            return input.hasVideos && !input.hasPhotos
+            return input.videoFiles.count == 1 && !input.hasPhotos
         case .sameCameraAndLens:
             return true
         case .mixedCamerasOrLenses:

@@ -46,3 +46,4 @@ run_suite() {
 }
 
 run_suite "Tools/Da3Sfm" "Tools/Da3Sfm/tests/test_run.py"
+run_suite "Tools/Da3Sfm" "Tools/Da3Sfm/tests/test_colmap_cli.py"

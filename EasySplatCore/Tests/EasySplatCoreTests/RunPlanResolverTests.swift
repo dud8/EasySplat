@@ -103,7 +103,7 @@ final class RunPlanResolverTests: XCTestCase {
         }
     }
 
-    func testFastUsesSmallLearnedGeometryEvenOnLargeMemoryMac() {
+    func testFastUsesSmallLearnedGeometryEvenOnLargeMemoryMac() throws {
         let plan = RunPlanResolver.resolve(
             requestedOptions: RequestedRunOptions(detailProfile: .fast),
             input: .video(files: ["/tmp/clip.mov"]),
@@ -116,6 +116,10 @@ final class RunPlanResolverTests: XCTestCase {
         XCTAssertEqual(plan.fallbackRouteIdentifiers, [SfmBackend.colmap.rawValue])
         XCTAssertEqual(plan.cameraGrouping, .sameCameraAndLens)
         XCTAssertEqual(plan.lensProjection, .automatic)
+        XCTAssertEqual(
+            try plan.toolchainCapabilityRequest().capabilities,
+            [.core, .colmap, .da3Runtime, .msplat, .da3Small]
+        )
     }
 
     func testMaximumPerformanceNeverOverridesSixteenGBSafetyBoundary() {

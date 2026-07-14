@@ -16,21 +16,21 @@ extension ToolchainManager {
             throw ToolchainError.invalidToolchain("COLMAP failed to launch (exit \(colmapCheck.exitCode)).")
         }
 
-        let globalMapperProbe: SubprocessResult
+        let mapperProbe: SubprocessResult
         do {
-            globalMapperProbe = try runner.run(colmap.path, ["global_mapper", "-h"])
+            mapperProbe = try runner.run(colmap.path, ["mapper", "-h"])
         } catch {
-            throw ToolchainError.invalidToolchain("COLMAP global_mapper could not be launched.")
+            throw ToolchainError.invalidToolchain("COLMAP mapper could not be launched.")
         }
-        guard globalMapperProbe.exitCode == 0 else {
-            let text = "\(globalMapperProbe.stdout)\n\(globalMapperProbe.stderr)".lowercased()
+        guard mapperProbe.exitCode == 0 else {
+            let text = "\(mapperProbe.stdout)\n\(mapperProbe.stderr)".lowercased()
             if text.contains("library not loaded") || text.contains("no lc_rpath") {
-                throw ToolchainError.invalidToolchain("COLMAP global_mapper failed to launch (missing dylib/rpath).")
+                throw ToolchainError.invalidToolchain("COLMAP mapper failed to launch (missing dylib/rpath).")
             }
             if text.contains("not recognized") || text.contains("unknown command") || text.contains("unrecognized command") {
-                throw ToolchainError.invalidToolchain("COLMAP does not include the required global_mapper command.")
+                throw ToolchainError.invalidToolchain("COLMAP does not include the required mapper command.")
             }
-            throw ToolchainError.invalidToolchain("COLMAP global_mapper self-check failed (exit \(globalMapperProbe.exitCode)).")
+            throw ToolchainError.invalidToolchain("COLMAP mapper self-check failed (exit \(mapperProbe.exitCode)).")
         }
 
         let da3Root = root.appendingPathComponent("da3_mps", isDirectory: true)
@@ -316,6 +316,7 @@ extension ToolchainManager {
             "overlay_sha256",
             "patch_sha256",
             "checkpoint_patch_sha256",
+            "numeric_stability_patch_sha256",
             "dependencies",
             "executable_sha256",
             "metallib_sha256",
@@ -371,6 +372,7 @@ extension ToolchainManager {
             "overlay_sha256",
             "patch_sha256",
             "checkpoint_patch_sha256",
+            "numeric_stability_patch_sha256",
             "executable_sha256",
             "metallib_sha256",
         ]

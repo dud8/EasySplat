@@ -103,90 +103,17 @@ jobs:
             exit 1
           fi
 
-      - name: Pin Homebrew source metadata
-        env:
-          HOMEBREW_COMMIT: 34c40c18ffa2029b611b61c73273e32c003d0842
-          HOMEBREW_CORE_COMMIT: a0399ab620e48f72567cfab1ad941b3525051690
-        run: |
-          set -euo pipefail
-          BREW_REPOSITORY="$(brew --repository)"
-          CORE_REPOSITORY="$(brew --repository homebrew/core)"
-
-          checkout_reviewed_commit() {
-            local repository="$1"
-            local origin="$2"
-            local commit="$3"
-            if [ ! -d "$repository/.git" ]; then
-              mkdir -p "$(dirname "$repository")"
-              git init "$repository"
-              git -C "$repository" remote add origin "$origin"
-            fi
-            case "$(git -C "$repository" remote get-url origin)" in
-              "$origin"|"${origin%.git}") ;;
-              *)
-                echo "Unexpected Homebrew Git origin for $repository." >&2
-                exit 1
-                ;;
-            esac
-            if [ -n "$(git -C "$repository" status --porcelain --untracked-files=no)" ]; then
-              echo "Refusing to change a dirty Homebrew checkout: $repository" >&2
-              exit 1
-            fi
-            if ! git -C "$repository" cat-file -e "$commit^{commit}" 2>/dev/null; then
-              git -C "$repository" fetch --no-tags --depth=1 origin "$commit"
-            fi
-            git -C "$repository" checkout --detach "$commit"
-            test "$(git -C "$repository" rev-parse HEAD)" = "$commit"
-          }
-
-          checkout_reviewed_commit \
-            "$BREW_REPOSITORY" \
-            https://github.com/Homebrew/brew.git \
-            "$HOMEBREW_COMMIT"
-          checkout_reviewed_commit \
-            "$CORE_REPOSITORY" \
-            https://github.com/Homebrew/homebrew-core.git \
-            "$HOMEBREW_CORE_COMMIT"
-          hash -r
-          python3 scripts/toolchain/verify_homebrew_lock.py source \
-            --brew-repository "$BREW_REPOSITORY" \
-            --core-repository "$CORE_REPOSITORY"
-
-      - name: Install dependencies
+      - name: Validate release host
         run: |
           set -euo pipefail
           test "$(sw_vers -productVersion | cut -d. -f1)" = "15"
           test -d /Applications/Xcode_16.4.app
           sudo xcode-select -s /Applications/Xcode_16.4.app
           test "$(xcodebuild -version | sed -n '1s/^Xcode //p')" = "16.4"
-          BREW_REPOSITORY="$(brew --repository)"
-          CORE_REPOSITORY="$(brew --repository homebrew/core)"
-          python3 scripts/toolchain/verify_homebrew_lock.py source \
-            --brew-repository "$BREW_REPOSITORY" \
-            --core-repository "$CORE_REPOSITORY"
-          while IFS= read -r formula; do
-            if brew list --versions "$formula" >/dev/null 2>&1; then
-              brew reinstall --build-from-source "$formula"
-            else
-              brew install --build-from-source "$formula"
-            fi
-          done < <(python3 scripts/toolchain/verify_homebrew_lock.py formulae)
-          python3 scripts/toolchain/verify_homebrew_lock.py installed \
-            --brew-repository "$BREW_REPOSITORY" \
-            --core-repository "$CORE_REPOSITORY" \
-            --provenance-out Toolchains/build/homebrew/homebrew-provenance.json
-
-      - name: Build minimal OpenImageIO
-        run: scripts/toolchain/build_openimageio.sh
-
-      - name: Build permissive SuiteSparse
-        run: scripts/toolchain/build_suitesparse.sh
-
-      - name: Build Ceres
-        run: scripts/toolchain/build_ceres.sh
-
-      - name: Build COLMAP
-        run: scripts/toolchain/build_colmap.sh
+          command -v cmake
+          command -v ninja
+          command -v unzstd
+          command -v zip
 
       - name: Build msplat
         run: scripts/toolchain/build_msplat.sh

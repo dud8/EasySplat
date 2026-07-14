@@ -6,6 +6,25 @@ import ImageIO
 import UniformTypeIdentifiers
 
 final class PipelineRunnerImageFilteringTests: XCTestCase {
+    func testSharedCameraRequiresUniformSelectedImageDimensions() throws {
+        let root = try TestFileBuilder.makeTempDir()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let landscape = root.appendingPathComponent("landscape.jpg")
+        let landscapeCopy = root.appendingPathComponent("landscape-copy.jpg")
+        let portrait = root.appendingPathComponent("portrait.jpg")
+        try writeImage(url: landscape, width: 30, height: 20, value: 90)
+        try writeImage(url: landscapeCopy, width: 30, height: 20, value: 100)
+        try writeImage(url: portrait, width: 20, height: 30, value: 110)
+        let runner = try makeRunner(projectURL: root)
+
+        XCTAssertTrue(
+            try runner.test_selectedImagesHaveUniformPixelDimensions([landscape, landscapeCopy])
+        )
+        XCTAssertFalse(
+            try runner.test_selectedImagesHaveUniformPixelDimensions([landscape, portrait])
+        )
+    }
+
     func testLoadImagesFiltersNonImages() throws {
         let dir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
         try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
@@ -431,8 +450,15 @@ final class PipelineRunnerImageFilteringTests: XCTestCase {
     }
 
     private func writeImage(url: URL, size: Int, value: UInt8) throws {
-        let width = size
-        let height = size
+        try writeImage(url: url, width: size, height: size, value: value)
+    }
+
+    private func writeImage(
+        url: URL,
+        width: Int,
+        height: Int,
+        value: UInt8
+    ) throws {
         let bytesPerRow = width
         var pixels = [UInt8](repeating: value, count: width * height)
         let colorSpace = CGColorSpaceCreateDeviceGray()

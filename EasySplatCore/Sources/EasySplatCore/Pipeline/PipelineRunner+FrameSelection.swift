@@ -47,6 +47,31 @@ extension PipelineRunner {
         return ext == "heic" || ext == "heif"
     }
 
+    func selectedImagesHaveUniformPixelDimensions(_ images: [URL]) throws -> Bool {
+        var expectedDimensions: (width: Int, height: Int)?
+        for image in images {
+            guard let source = CGImageSourceCreateWithURL(image as CFURL, nil),
+                  let properties = CGImageSourceCopyPropertiesAtIndex(source, 0, nil)
+                    as? [CFString: Any],
+                  let width = (properties[kCGImagePropertyPixelWidth] as? NSNumber)?.intValue,
+                  let height = (properties[kCGImagePropertyPixelHeight] as? NSNumber)?.intValue,
+                  width > 0,
+                  height > 0 else {
+                throw PipelineError.imageTranscodeFailed(
+                    "Failed to inspect selected image: \(image.lastPathComponent)"
+                )
+            }
+            let dimensions = (width: width, height: height)
+            if let expectedDimensions,
+               expectedDimensions.width != dimensions.width
+                || expectedDimensions.height != dimensions.height {
+                return false
+            }
+            expectedDimensions = dimensions
+        }
+        return expectedDimensions != nil
+    }
+
     func transcodeHeicToJpeg(source: URL, destination: URL) throws {
         guard let sourceRef = CGImageSourceCreateWithURL(source as CFURL, nil) else {
             throw PipelineError.imageTranscodeFailed("Failed to read HEIC image: \(source.lastPathComponent)")

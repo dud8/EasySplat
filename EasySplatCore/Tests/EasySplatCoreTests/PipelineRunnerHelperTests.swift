@@ -13,6 +13,25 @@ final class PipelineRunnerHelperTests: XCTestCase {
         XCTAssertEqual(runner.test_da3SeedWindowOverlap(windowSize: 8, hardwareTier: .high), 3)
     }
 
+    func testAutomaticCameraSharingRequiresOneVideoClip() throws {
+        let root = try TestFileBuilder.makeTempDir()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let runner = makeRunner(projectURL: root)
+
+        XCTAssertTrue(runner.test_da3SharedCameraPreference(
+            input: .video(files: ["/tmp/a.mov"]),
+            cameraGrouping: .automatic
+        ))
+        XCTAssertFalse(runner.test_da3SharedCameraPreference(
+            input: .video(files: ["/tmp/a.mov", "/tmp/b.mov"]),
+            cameraGrouping: .automatic
+        ))
+        XCTAssertTrue(runner.test_da3SharedCameraPreference(
+            input: .video(files: ["/tmp/a.mov", "/tmp/b.mov"]),
+            cameraGrouping: .sameCameraAndLens
+        ))
+    }
+
     func testDownsampleFramesEdgeCases() throws {
         let root = try TestFileBuilder.makeTempDir()
         defer { try? FileManager.default.removeItem(at: root) }

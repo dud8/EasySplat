@@ -30,15 +30,15 @@ final class ToolchainManagerTests: XCTestCase {
         XCTAssertEqual(toolchain.da3.root, root.appendingPathComponent("da3_mps", isDirectory: true))
     }
 
-    func testValidateToolchainRejectsBrokenIntegratedGlobalMapperLinkage() throws {
+    func testValidateToolchainRejectsBrokenMapperLinkage() throws {
         let root = try TestFileBuilder.makeTempDir()
         defer { try? FileManager.default.removeItem(at: root) }
         _ = try ToolchainFixtureBuilder.createToolchain(at: root)
 
         let runner = makeValidationRunner(
             root: root,
-            globalMapperExitCode: 1,
-            globalMapperStderr: "Library not loaded: @rpath/libceres.4.dylib"
+            mapperExitCode: 1,
+            mapperStderr: "Library not loaded: @rpath/libceres.4.dylib"
         )
 
         let manager = ToolchainManager(runner: runner)
@@ -46,19 +46,19 @@ final class ToolchainManagerTests: XCTestCase {
             guard case ToolchainManager.ToolchainError.invalidToolchain(let message) = error else {
                 return XCTFail("Expected invalidToolchain error, got \(error)")
             }
-            XCTAssertTrue(message.contains("global_mapper"))
+            XCTAssertTrue(message.contains("mapper"))
         }
     }
 
-    func testValidateToolchainRejectsMissingIntegratedGlobalMapperCommand() throws {
+    func testValidateToolchainRejectsMissingMapperCommand() throws {
         let root = try TestFileBuilder.makeTempDir()
         defer { try? FileManager.default.removeItem(at: root) }
         _ = try ToolchainFixtureBuilder.createToolchain(at: root)
 
         let runner = makeValidationRunner(
             root: root,
-            globalMapperExitCode: 1,
-            globalMapperStderr: "ERROR: command `global_mapper` not recognized"
+            mapperExitCode: 1,
+            mapperStderr: "ERROR: command `mapper` not recognized"
         )
 
         let manager = ToolchainManager(runner: runner)
@@ -66,7 +66,7 @@ final class ToolchainManagerTests: XCTestCase {
             guard case ToolchainManager.ToolchainError.invalidToolchain(let message) = error else {
                 return XCTFail("Expected invalidToolchain error, got \(error)")
             }
-            XCTAssertTrue(message.contains("required global_mapper"))
+            XCTAssertTrue(message.contains("required mapper"))
         }
     }
 
@@ -192,34 +192,36 @@ final class ToolchainManagerTests: XCTestCase {
         }
     }
 
-    func testValidateToolchainRequiresCheckpointPatchProvenance() throws {
-        for mutation in ["missing", "malformed"] {
-            let root = try TestFileBuilder.makeTempDir()
-            defer { try? FileManager.default.removeItem(at: root) }
-            _ = try ToolchainFixtureBuilder.createToolchain(at: root)
-            let buildInfo = root.appendingPathComponent("msplat/build_info.json")
-            var payload = try XCTUnwrap(
-                try JSONSerialization.jsonObject(with: Data(contentsOf: buildInfo)) as? [String: Any]
-            )
-            if mutation == "missing" {
-                payload.removeValue(forKey: "checkpoint_patch_sha256")
-            } else {
-                payload["checkpoint_patch_sha256"] = "not-a-hash"
-            }
-            try JSONSerialization.data(withJSONObject: payload).write(
-                to: buildInfo,
-                options: .atomic
-            )
-
-            let manager = ToolchainManager(runner: makeValidationRunner(root: root))
-            XCTAssertThrowsError(try manager.test_validateToolchain(root: root, requiredCapabilities: [.da3Base, .da3Small])) { error in
-                guard case ToolchainManager.ToolchainError.invalidToolchain(let message) = error else {
-                    return XCTFail("Expected invalidToolchain error")
-                }
-                XCTAssertTrue(
-                    message.contains("checkpoint_patch_sha256"),
-                    "Expected checkpoint-patch provenance failure for \(mutation), got \(message)"
+    func testValidateToolchainRequiresPatchProvenance() throws {
+        for key in ["checkpoint_patch_sha256", "numeric_stability_patch_sha256"] {
+            for mutation in ["missing", "malformed"] {
+                let root = try TestFileBuilder.makeTempDir()
+                defer { try? FileManager.default.removeItem(at: root) }
+                _ = try ToolchainFixtureBuilder.createToolchain(at: root)
+                let buildInfo = root.appendingPathComponent("msplat/build_info.json")
+                var payload = try XCTUnwrap(
+                    try JSONSerialization.jsonObject(with: Data(contentsOf: buildInfo)) as? [String: Any]
                 )
+                if mutation == "missing" {
+                    payload.removeValue(forKey: key)
+                } else {
+                    payload[key] = "not-a-hash"
+                }
+                try JSONSerialization.data(withJSONObject: payload).write(
+                    to: buildInfo,
+                    options: .atomic
+                )
+
+                let manager = ToolchainManager(runner: makeValidationRunner(root: root))
+                XCTAssertThrowsError(try manager.test_validateToolchain(root: root, requiredCapabilities: [.da3Base, .da3Small])) { error in
+                    guard case ToolchainManager.ToolchainError.invalidToolchain(let message) = error else {
+                        return XCTFail("Expected invalidToolchain error")
+                    }
+                    XCTAssertTrue(
+                        message.contains(key),
+                        "Expected \(key) provenance failure for \(mutation), got \(message)"
+                    )
+                }
             }
         }
     }
@@ -733,8 +735,8 @@ final class ToolchainManagerTests: XCTestCase {
         colmapArch: String = "Mach-O 64-bit executable arm64",
         da3PythonArch: String = "Mach-O 64-bit executable arm64",
         msplatArch: String = "Mach-O 64-bit executable arm64",
-        globalMapperExitCode: Int32 = 0,
-        globalMapperStderr: String = "",
+        mapperExitCode: Int32 = 0,
+        mapperStderr: String = "",
         da3HelpExitCode: Int32 = 0,
         msplatSelfCheckExitCode: Int32 = 0,
         msplatSelfCheckStdout: String = "{\"event\":\"self_check\",\"schema_version\":1,\"sequence\":1,\"status\":\"ok\",\"version\":\"1.1.3 (git 106499b)\"}\n"
@@ -742,7 +744,7 @@ final class ToolchainManagerTests: XCTestCase {
         MockSubprocessRunner(scripts: [
             .init(path: "/usr/bin/file", argsPrefix: ["-b", root.appendingPathComponent("bin/colmap").path], result: .init(exitCode: 0, terminationReason: .exit, stdout: colmapArch, stderr: ""), onRun: nil),
             .init(path: root.appendingPathComponent("bin/colmap").path, argsPrefix: ["-h"], result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""), onRun: nil),
-            .init(path: root.appendingPathComponent("bin/colmap").path, argsPrefix: ["global_mapper"], result: .init(exitCode: globalMapperExitCode, terminationReason: .exit, stdout: "", stderr: globalMapperStderr), onRun: nil),
+            .init(path: root.appendingPathComponent("bin/colmap").path, argsPrefix: ["mapper"], result: .init(exitCode: mapperExitCode, terminationReason: .exit, stdout: "", stderr: mapperStderr), onRun: nil),
             .init(path: "/usr/bin/file", argsPrefix: ["-b", root.appendingPathComponent("da3_mps/python/bin/python3").path], result: .init(exitCode: 0, terminationReason: .exit, stdout: da3PythonArch, stderr: ""), onRun: nil),
             .init(path: root.appendingPathComponent("da3_mps/bin/easysplat_da3_sfm").path, argsPrefix: ["--help"], result: .init(exitCode: da3HelpExitCode, terminationReason: .exit, stdout: "", stderr: ""), onRun: nil),
             .init(path: "/usr/bin/file", argsPrefix: ["-b", root.appendingPathComponent("bin/easysplat-train").path], result: .init(exitCode: 0, terminationReason: .exit, stdout: msplatArch, stderr: ""), onRun: nil),

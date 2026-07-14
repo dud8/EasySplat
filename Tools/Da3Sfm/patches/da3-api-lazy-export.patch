@@ -1,0 +1,47 @@
+diff --git a/src/depth_anything_3/api.py b/src/depth_anything_3/api.py
+index d0f18aa..df67293 100644
+--- a/src/depth_anything_3/api.py
++++ b/src/depth_anything_3/api.py
+@@ -34 +33,0 @@ from depth_anything_3.specs import Prediction
+-from depth_anything_3.utils.export import export
+@@ -39 +37,0 @@ from depth_anything_3.utils.logger import logger
+-from depth_anything_3.utils.pose_align import align_poses_umeyama
+@@ -351,0 +350,2 @@ class DepthAnything3(nn.Module, PyTorchModelHubMixin):
++        from depth_anything_3.utils.pose_align import align_poses_umeyama
++
+@@ -417,0 +418,2 @@ class DepthAnything3(nn.Module, PyTorchModelHubMixin):
++        from depth_anything_3.utils.export import export
++
+diff --git a/src/depth_anything_3/utils/io/input_processor.py b/src/depth_anything_3/utils/io/input_processor.py
+index fa60194..05218f3 100644
+--- a/src/depth_anything_3/utils/io/input_processor.py
++++ b/src/depth_anything_3/utils/io/input_processor.py
+@@ -25 +24,0 @@ from typing import Sequence
+-import cv2
+@@ -332,3 +331,2 @@ class InputProcessor:
+-        interpolation = cv2.INTER_CUBIC if scale > 1.0 else cv2.INTER_AREA
+-        arr = cv2.resize(np.asarray(img), (new_w, new_h), interpolation=interpolation)
+-        return Image.fromarray(arr)
++        resample = Image.Resampling.BICUBIC if scale > 1.0 else Image.Resampling.BOX
++        return img.resize((new_w, new_h), resample=resample)
+@@ -344,3 +342,2 @@ class InputProcessor:
+-        interpolation = cv2.INTER_CUBIC if scale > 1.0 else cv2.INTER_AREA
+-        arr = cv2.resize(np.asarray(img), (new_w, new_h), interpolation=interpolation)
+-        return Image.fromarray(arr)
++        resample = Image.Resampling.BICUBIC if scale > 1.0 else Image.Resampling.BOX
++        return img.resize((new_w, new_h), resample=resample)
+@@ -381,3 +378,2 @@ class InputProcessor:
+-        interpolation = cv2.INTER_CUBIC if upscale else cv2.INTER_AREA
+-        arr = cv2.resize(np.asarray(img), (new_w, new_h), interpolation=interpolation)
+-        return Image.fromarray(arr)
++        resample = Image.Resampling.BICUBIC if upscale else Image.Resampling.BOX
++        return img.resize((new_w, new_h), resample=resample)
+diff --git a/src/depth_anything_3/utils/parallel_utils.py b/src/depth_anything_3/utils/parallel_utils.py
+index 9ff108e..cc0140a 100644
+--- a/src/depth_anything_3/utils/parallel_utils.py
++++ b/src/depth_anything_3/utils/parallel_utils.py
+@@ -21 +20,0 @@ from typing import Callable, Dict, List
+-import imageio
+@@ -48,0 +48,2 @@ def _save_image_impl(save_img, save_path):
++    import imageio
++

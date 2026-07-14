@@ -124,7 +124,6 @@ public final class PipelineRunner: @unchecked Sendable {
         var didRetryWithCpu = false
         var didRetryWithHigherSequentialOverlap = false
         var forceExhaustiveMatching = false
-        var disableGlobalMapperForThisRun = false
         var lastUsedSequentialMatcher = false
         var lastExpectedMatchingPairs = 0
         let effectiveLastCompletedStage = RunPlanResolver.safeResumeStage(
@@ -572,6 +571,18 @@ public final class PipelineRunner: @unchecked Sendable {
             if selectedFrames.count < 2 {
                 throw PipelineError.insufficientInputImages(selectedFrames.count)
             }
+            let sharedCameraRequested = da3SharedCameraPreference(
+                input: metadata.input,
+                cameraGrouping: resolvedRunPlan.cameraGrouping
+            )
+            let shareCameraAcrossSelectedFrames: Bool
+            if sharedCameraRequested {
+                shareCameraAcrossSelectedFrames = try selectedImagesHaveUniformPixelDimensions(
+                    selectedFrames
+                )
+            } else {
+                shareCameraAcrossSelectedFrames = false
+            }
 
             let geometryMemorySampler = GeometryMemorySampler()
             geometryMemorySampler.start()
@@ -629,10 +640,7 @@ public final class PipelineRunner: @unchecked Sendable {
                                 capturePath: resolvedRunPlan.capturePath,
                                 lensProjection: resolvedRunPlan.lensProjection
                             ),
-                            sharedCamera: da3SharedCameraPreference(
-                                input: metadata.input,
-                                cameraGrouping: resolvedRunPlan.cameraGrouping
-                            ),
+                            sharedCamera: shareCameraAcrossSelectedFrames,
                             inputOrdering: da3InputOrdering,
                             windowSize: effectiveDa3WindowSize,
                             windowOverlap: da3SeedWindowOverlap(
@@ -1000,7 +1008,10 @@ public final class PipelineRunner: @unchecked Sendable {
                                 outputPath: baOutput,
                                 options: da3ColmapMatchOptions,
                                 bundleOptions: ColmapBundleAdjustmentOptions(
-                                    maxNumIterations: resolvedRunPlan.refinementIterationLimit
+                                    maxNumIterations: resolvedRunPlan.refinementIterationLimit,
+                                    refineExtraParams: !["PINHOLE", "SIMPLE_PINHOLE"].contains(
+                                        da3Config.cameraType
+                                    )
                                 ),
                                 onLog: { line, isErr in
                                     colmapToolLog.append(stream: isErr ? "stderr" : "stdout", line: line)
@@ -1052,7 +1063,7 @@ public final class PipelineRunner: @unchecked Sendable {
                 emit(.stageStarted(stage: .sfmFeatures))
                 emit(.stageLog(
                     stage: .sfmFeatures,
-                    line: "SfM backend: COLMAP global mapper, with COLMAP mapper fallback.",
+                    line: "SfM backend: COLMAP mapper.",
                     isError: false
                 ))
                 writeCheckpoint(
@@ -1105,10 +1116,7 @@ public final class PipelineRunner: @unchecked Sendable {
                         capturePath: resolvedRunPlan.capturePath,
                         lensProjection: resolvedRunPlan.lensProjection
                     ),
-                    singleCamera: self.da3SharedCameraPreference(
-                        input: metadata.input,
-                        cameraGrouping: resolvedRunPlan.cameraGrouping
-                    ),
+                    singleCamera: shareCameraAcrossSelectedFrames,
                     options: colmapExtractOptions,
                     onLog: onFeaturesLog
                 )
@@ -1368,10 +1376,7 @@ public final class PipelineRunner: @unchecked Sendable {
                                         capturePath: resolvedRunPlan.capturePath,
                                         lensProjection: resolvedRunPlan.lensProjection
                                     ),
-                                    singleCamera: self.da3SharedCameraPreference(
-                                        input: metadata.input,
-                                        cameraGrouping: resolvedRunPlan.cameraGrouping
-                                    ),
+                                    singleCamera: shareCameraAcrossSelectedFrames,
                                     options: colmapExtractOptions,
                                     onLog: { line, isErr in
                                         colmapToolLog.append(stream: isErr ? "stderr" : "stdout", line: line)
@@ -1508,7 +1513,7 @@ public final class PipelineRunner: @unchecked Sendable {
                         progress: 0,
                         message: "Camera mapping started",
                         details: .sfmMapping(SfmMappingCheckpoint(
-                            mapper: "global_mapper",
+                            mapper: "colmap",
                             sparsePath: try paths.projectRelativePath(
                                 for: paths.colmapSparseURL.appendingPathComponent("0", isDirectory: true)
                             ),
@@ -1525,19 +1530,11 @@ public final class PipelineRunner: @unchecked Sendable {
                             "tool": self.config.toolchain.colmap.path
                         ]
                     )
-                    let globalMapperToolLog = ToolLogWriter(fileURL: paths.globalMapperLogURL, toolName: "colmap-global_mapper")
-                    globalMapperToolLog.beginSection(
-                        title: "global_mapper",
-                        metadata: [
-                            "database": paths.colmapDatabaseURL.path,
-                            "images": paths.framesSelectedURL.path,
-                            "output": paths.colmapSparseURL.path,
-                            "tool": self.config.toolchain.colmap.path
-                        ]
-                    )
-                    let toolLogNames = [paths.colmapLogURL.lastPathComponent, paths.globalMapperLogURL.lastPathComponent]
-                        .joined(separator: ", ")
-                    emit(.stageLog(stage: .sfmMapping, line: "Tool logs: \(toolLogNames)", isError: false))
+                    emit(.stageLog(
+                        stage: .sfmMapping,
+                        line: "Tool log: \(paths.colmapLogURL.lastPathComponent)",
+                        isError: false
+                    ))
                     let mappingProgress = ColmapMappingProgressTracker(totalImages: selectedFrames.count)
                     let onMappingLog: @Sendable (String, Bool) -> Void = { line, isErr in
                         let sanitized = Self.sanitizeToolLogLine(line)
@@ -1551,11 +1548,8 @@ public final class PipelineRunner: @unchecked Sendable {
                     }
                     var mappingSucceeded = false
                     var lastMappingError: Error?
-                    var acceptedMappingStrategy = "global_mapper"
-                    var lastMappingAttempt = "none"
 
-                    func evaluateMappingResult(candidate: String) async throws -> Bool {
-                        lastMappingAttempt = candidate
+                    func evaluateMappingResult() async throws -> Bool {
                         let modelURL = paths.colmapSparseURL.appendingPathComponent("0", isDirectory: true)
                         guard sparseModelFilesExist(at: modelURL) else {
                             throw PipelineError.outputMissing
@@ -1578,250 +1572,152 @@ public final class PipelineRunner: @unchecked Sendable {
                             progress: 0.95,
                             message: "Mapping score: \(ReconstructionScorer.summary(score))",
                             details: .sfmMapping(SfmMappingCheckpoint(
-                                mapper: candidate,
+                                mapper: "colmap",
                                 sparsePath: try paths.projectRelativePath(for: modelURL),
                                 registeredImages: score.registeredImages
                             ))
                         )
                         emit(.stageLog(
                             stage: .sfmMapping,
-                            line: "Reconstruction score (\(candidate)): \(ReconstructionScorer.summary(score)).",
+                            line: "Reconstruction score (colmap): \(ReconstructionScorer.summary(score)).",
                             isError: false
                         ))
                         if ReconstructionScorer.isAcceptable(
                             score,
                             capturePath: resolvedRunPlan.capturePath
                         ) {
-                            acceptedMappingStrategy = candidate
-                            self.warnIfWeakAcceptedSolve(score: score, mapper: candidate, emit: emit)
+                            self.warnIfWeakAcceptedSolve(score: score, mapper: "colmap", emit: emit)
                             acceptedReconstructionSummary = ReconstructionSummary(
                                 score: score,
-                                mapper: candidate,
+                                mapper: "colmap",
                                 capturedAt: Date()
                             )
                             return true
                         } else {
-                            lastMappingError = PipelineError.lowQualityReconstruction(score, mapper: candidate)
+                            lastMappingError = PipelineError.lowQualityReconstruction(score, mapper: "colmap")
                             return false
                         }
                     }
 
-                    let mapperLabel = disableGlobalMapperForThisRun
-                        ? "COLMAP global_mapper disabled for this run; COLMAP mapper fallback only"
-                        : "COLMAP global_mapper preferred with COLMAP mapper fallback"
-                    emit(.stageLog(
-                        stage: .sfmMapping,
-                        line: "Mapping preference: \(mapperLabel).",
-                        isError: false
-                    ))
-
-                    if !disableGlobalMapperForThisRun {
-                        let threadHint = max(colmapExtractOptions.extractThreads, colmapMatchOptions.matchThreads)
-                        var baseGlobalMapperOptions = self.globalMapperOptions(
-                            threadHint: threadHint,
-                            defaultUseGpu: colmapExtractOptions.useGPU || colmapMatchOptions.useGPU
+                    do {
+                        try self.resetDirectory(paths.colmapSparseURL)
+                        try await self.tooling.colmap.runMapper(
+                            colmapPath: self.config.toolchain.colmap,
+                            database: paths.colmapDatabaseURL,
+                            imagePath: paths.framesSelectedURL,
+                            outputPath: paths.colmapSparseURL,
+                            options: colmapMatchOptions,
+                            bundleAdjustmentIterationLimit: resolvedRunPlan.refinementIterationLimit,
+                            onLog: { line, isErr in
+                                colmapToolLog.append(stream: isErr ? "stderr" : "stdout", line: line)
+                                onMappingLog(line, isErr)
+                            }
                         )
-                        baseGlobalMapperOptions.baNumIterations = resolvedRunPlan.refinementIterationLimit
-                        let gpuRequested = baseGlobalMapperOptions.useGpuForGlobalPositioning || baseGlobalMapperOptions.useGpuForBundleAdjustment
-                        do {
-                            try self.resetDirectory(paths.colmapSparseURL)
+                        mappingSucceeded = try await evaluateMappingResult()
+                    } catch {
+                        if error is CancellationError { throw error }
+                        try Task.checkCancellation()
+                        lastMappingError = error
+                    }
+
+                    if !mappingSucceeded,
+                       let pipelineError = lastMappingError as? PipelineError,
+                       case .lowQualityReconstruction = pipelineError,
+                       lastUsedSequentialMatcher,
+                       !didRetryWithHigherSequentialOverlap {
+                        let previousOverlap = colmapMatchOptions.sequentialOverlap
+                        let increasedOverlap = min(30, max(previousOverlap + 5, previousOverlap * 2))
+                        if increasedOverlap > previousOverlap {
+                            didRetryWithHigherSequentialOverlap = true
+                            colmapMatchOptions.sequentialOverlap = increasedOverlap
                             emit(.stageLog(
                                 stage: .sfmMapping,
-                                line: "Running COLMAP global_mapper (gp_use_gpu=\(baseGlobalMapperOptions.useGpuForGlobalPositioning), ba_use_gpu=\(baseGlobalMapperOptions.useGpuForBundleAdjustment), threads=\(baseGlobalMapperOptions.numThreads)).",
-                                isError: false
+                                line: "Reconstruction quality was low. Retrying with higher sequential overlap (\(previousOverlap) -> \(increasedOverlap)).",
+                                isError: true
                             ))
-                            lastMappingAttempt = gpuRequested ? "global_mapper-gpu" : "global_mapper"
-                            try await self.tooling.colmap.runGlobalMapper(
-                                colmapPath: self.config.toolchain.colmap,
-                                database: paths.colmapDatabaseURL,
-                                imagePath: paths.framesSelectedURL,
-                                outputPath: paths.colmapSparseURL,
-                                options: baseGlobalMapperOptions,
-                                environment: colmapMatchOptions.environment,
-                                onLog: { line, isErr in
-                                    globalMapperToolLog.append(stream: isErr ? "stderr" : "stdout", line: line)
-                                    onMappingLog(line, isErr)
-                                }
-                            )
-                            mappingSucceeded = try await evaluateMappingResult(candidate: gpuRequested ? "global_mapper-gpu" : "global_mapper")
-                        } catch {
-                            if error is CancellationError { throw error }
-                            try Task.checkCancellation()
-                            lastMappingError = error
-                            if let colmapError = error as? ColmapRunnerError,
-                               colmapErrorIndicatesMissingGlobalMapper(colmapError) {
-                                disableGlobalMapperForThisRun = true
-                                emit(.stageLog(
-                                    stage: .sfmMapping,
-                                    line: "COLMAP global_mapper is unavailable in this toolchain; falling back to COLMAP mapper.",
-                                    isError: true
-                                ))
-                            } else if let colmapError = error as? ColmapRunnerError,
-                                      gpuRequested,
-                                      colmapErrorIndicatesGpuFailure(colmapError) {
-                                var cpuGlobalMapperOptions = baseGlobalMapperOptions
-                                cpuGlobalMapperOptions.useGpuForGlobalPositioning = false
-                                cpuGlobalMapperOptions.useGpuForBundleAdjustment = false
-                                emit(.stageLog(
-                                    stage: .sfmMapping,
-                                    line: "global_mapper GPU path failed; retrying global_mapper with GPU disabled.",
-                                    isError: true
-                                ))
-                                self.emitColmapRetryDiagnostics(colmapError, stage: .sfmMapping, emit: emit)
-                                do {
-                                    try self.resetDirectory(paths.colmapSparseURL)
-                                    lastMappingAttempt = "global_mapper-cpu"
-                                    try await self.tooling.colmap.runGlobalMapper(
-                                        colmapPath: self.config.toolchain.colmap,
-                                        database: paths.colmapDatabaseURL,
-                                        imagePath: paths.framesSelectedURL,
-                                        outputPath: paths.colmapSparseURL,
-                                        options: cpuGlobalMapperOptions,
-                                        environment: colmapMatchOptions.environment,
-                                        onLog: { line, isErr in
-                                            globalMapperToolLog.append(stream: isErr ? "stderr" : "stdout", line: line)
-                                            onMappingLog(line, isErr)
-                                        }
-                                    )
-                                    mappingSucceeded = try await evaluateMappingResult(candidate: "global_mapper-cpu")
-                                } catch {
-                                    if error is CancellationError { throw error }
-                                    try Task.checkCancellation()
-                                    lastMappingError = error
-                                }
-                            }
-                        }
-                    } else {
-                        emit(.stageLog(
-                            stage: .sfmMapping,
-                            line: "Skipping global_mapper for this run due to previous launch failure.",
-                            isError: true
-                        ))
-                    }
-
-                    if !mappingSucceeded {
-                        emit(.stageLog(stage: .sfmMapping, line: "global_mapper mapping failed; trying COLMAP mapper.", isError: true))
-                        do {
-                            try self.resetDirectory(paths.colmapSparseURL)
-                            lastMappingAttempt = "colmap"
-                            try await self.tooling.colmap.runMapper(
-                                colmapPath: self.config.toolchain.colmap,
-                                database: paths.colmapDatabaseURL,
-                                imagePath: paths.framesSelectedURL,
-                                outputPath: paths.colmapSparseURL,
-                                options: colmapMatchOptions,
-                                bundleAdjustmentIterationLimit: resolvedRunPlan.refinementIterationLimit,
-                                onLog: { line, isErr in
-                                    colmapToolLog.append(stream: isErr ? "stderr" : "stdout", line: line)
-                                    onMappingLog(line, isErr)
-                                }
-                            )
-                            mappingSucceeded = try await evaluateMappingResult(candidate: "colmap")
-                        } catch {
-                            if error is CancellationError { throw error }
-                            try Task.checkCancellation()
-                            lastMappingError = error
-                        }
-                    }
-
-                        if !mappingSucceeded,
-                           let pipelineError = lastMappingError as? PipelineError,
-                           case .lowQualityReconstruction = pipelineError,
-                           lastUsedSequentialMatcher,
-                           !didRetryWithHigherSequentialOverlap {
-                            let previousOverlap = colmapMatchOptions.sequentialOverlap
-                            let increasedOverlap = min(30, max(previousOverlap + 5, previousOverlap * 2))
-                            if increasedOverlap > previousOverlap {
-                                didRetryWithHigherSequentialOverlap = true
-                                colmapMatchOptions.sequentialOverlap = increasedOverlap
-                                emit(.stageLog(
-                                    stage: .sfmMapping,
-                                    line: "Reconstruction quality was low. Retrying with higher sequential overlap (\(previousOverlap) -> \(increasedOverlap)).",
-                                    isError: true
-                                ))
-                                forceSfMRun = true
-                                continue sfmAttemptLoop
-                            }
-                        }
-
-                        if !mappingSucceeded,
-                           let pipelineError = lastMappingError as? PipelineError,
-                           case .lowQualityReconstruction = pipelineError,
-                           try await applyFewerFramesRetry("Reconstruction quality was low; retrying with fewer frames and exhaustive matching", false) {
                             forceSfMRun = true
                             continue sfmAttemptLoop
                         }
+                    }
 
-                        guard mappingSucceeded else {
-                            let debugMessage: String
-                            if let pipelineError = lastMappingError as? PipelineError,
-                               case let .lowQualityReconstruction(score, _) = pipelineError {
-                                let summary = ReconstructionScorer.summary(score)
-                                debugMessage = "Low-quality reconstruction. \(summary). Last attempt: \(lastMappingAttempt)."
-                            } else if let colmapError = lastMappingError as? ColmapRunnerError {
-                                debugMessage = debugDescription(for: colmapError)
-                            } else {
-                                debugMessage = "\(lastMappingError ?? PipelineError.lowQualityReconstruction(.init(registeredImages: 0, totalImages: 0, meanReprojectionError: nil), mapper: nil))"
-                            }
-                            let userMessage = "The camera solve was unstable. Try a slower capture with more light."
-                            emitFailure(
-                                stage: .sfmMapping,
-                                userMessage: userMessage,
-                                debugMessage: debugMessage
-                            )
-                            throw lastMappingError ?? PipelineError.lowQualityReconstruction(.init(registeredImages: 0, totalImages: 0, meanReprojectionError: nil), mapper: nil)
+                    if !mappingSucceeded,
+                       let pipelineError = lastMappingError as? PipelineError,
+                       case .lowQualityReconstruction = pipelineError,
+                       try await applyFewerFramesRetry("Reconstruction quality was low; retrying with fewer frames and exhaustive matching", false) {
+                        forceSfMRun = true
+                        continue sfmAttemptLoop
+                    }
+
+                    guard mappingSucceeded else {
+                        let debugMessage: String
+                        if let pipelineError = lastMappingError as? PipelineError,
+                           case let .lowQualityReconstruction(score, _) = pipelineError {
+                            let summary = ReconstructionScorer.summary(score)
+                            debugMessage = "Low-quality reconstruction. \(summary). Last attempt: colmap."
+                        } else if let colmapError = lastMappingError as? ColmapRunnerError {
+                            debugMessage = debugDescription(for: colmapError)
+                        } else {
+                            debugMessage = "\(lastMappingError ?? PipelineError.lowQualityReconstruction(.init(registeredImages: 0, totalImages: 0, meanReprojectionError: nil), mapper: nil))"
                         }
-                        let canonicalSparseModel = paths.colmapSparseURL.appendingPathComponent("0", isDirectory: true)
-                        let resolvedSparseModel = try resolveSparseModelDirectory(at: canonicalSparseModel)
-                        if resolvedSparseModel.standardizedFileURL != canonicalSparseModel.standardizedFileURL {
-                            try self.resetDirectory(canonicalSparseModel)
-                            let fm = FileManager.default
-                            let files = try fm.contentsOfDirectory(
-                                at: resolvedSparseModel,
-                                includingPropertiesForKeys: [.isRegularFileKey],
-                                options: [.skipsHiddenFiles]
-                            )
-                            for file in files {
-                                let isRegular = (try? file.resourceValues(forKeys: [.isRegularFileKey]).isRegularFile) ?? false
-                                guard isRegular else { continue }
-                                try fm.copyItem(at: file, to: canonicalSparseModel.appendingPathComponent(file.lastPathComponent))
-                            }
-                            emit(.stageLog(
-                                stage: .sfmMapping,
-                                line: "Canonicalized sparse model layout: \(resolvedSparseModel.lastPathComponent) -> 0.",
-                                isError: false
-                            ))
-                        }
-                        if try ensureTextSparseModelFiles(at: canonicalSparseModel) {
-                            emit(.stageLog(
-                                stage: .sfmMapping,
-                                line: "Converted sparse model to COLMAP text format for training compatibility.",
-                                isError: false
-                            ))
-                        }
-                        let normalizedImagesTxt = canonicalSparseModel.appendingPathComponent("images.txt")
-                        if try ColmapTextModelNormalizer.normalizeImagesTxtIfNeeded(at: normalizedImagesTxt) {
-                            emit(.stageLog(
-                                stage: .sfmMapping,
-                                line: "Normalized COLMAP model (added missing POINTS2D lines to images.txt).",
-                                isError: false
-                            ))
-                        }
-                        let finalSparseModel = canonicalSparseModel
-                        writeCheckpoint(
+                        let userMessage = "The camera solve was unstable. Try a slower capture with more light."
+                        emitFailure(
                             stage: .sfmMapping,
-                            progress: 1.0,
-                            message: "Camera mapping completed",
-                            details: .sfmMapping(SfmMappingCheckpoint(
-                                mapper: acceptedMappingStrategy,
-                                sparsePath: try paths.projectRelativePath(for: finalSparseModel),
-                                registeredImages: nil
-                            ))
+                            userMessage: userMessage,
+                            debugMessage: debugMessage
                         )
+                        throw lastMappingError ?? PipelineError.lowQualityReconstruction(.init(registeredImages: 0, totalImages: 0, meanReprojectionError: nil), mapper: nil)
+                    }
+                    let canonicalSparseModel = paths.colmapSparseURL.appendingPathComponent("0", isDirectory: true)
+                    let resolvedSparseModel = try resolveSparseModelDirectory(at: canonicalSparseModel)
+                    if resolvedSparseModel.standardizedFileURL != canonicalSparseModel.standardizedFileURL {
+                        try self.resetDirectory(canonicalSparseModel)
+                        let fm = FileManager.default
+                        let files = try fm.contentsOfDirectory(
+                            at: resolvedSparseModel,
+                            includingPropertiesForKeys: [.isRegularFileKey],
+                            options: [.skipsHiddenFiles]
+                        )
+                        for file in files {
+                            let isRegular = (try? file.resourceValues(forKeys: [.isRegularFileKey]).isRegularFile) ?? false
+                            guard isRegular else { continue }
+                            try fm.copyItem(at: file, to: canonicalSparseModel.appendingPathComponent(file.lastPathComponent))
+                        }
+                        emit(.stageLog(
+                            stage: .sfmMapping,
+                            line: "Canonicalized sparse model layout: \(resolvedSparseModel.lastPathComponent) -> 0.",
+                            isError: false
+                        ))
+                    }
+                    if try ensureTextSparseModelFiles(at: canonicalSparseModel) {
+                        emit(.stageLog(
+                            stage: .sfmMapping,
+                            line: "Converted sparse model to COLMAP text format for training compatibility.",
+                            isError: false
+                        ))
+                    }
+                    let normalizedImagesTxt = canonicalSparseModel.appendingPathComponent("images.txt")
+                    if try ColmapTextModelNormalizer.normalizeImagesTxtIfNeeded(at: normalizedImagesTxt) {
+                        emit(.stageLog(
+                            stage: .sfmMapping,
+                            line: "Normalized COLMAP model (added missing POINTS2D lines to images.txt).",
+                            isError: false
+                        ))
+                    }
+                    let finalSparseModel = canonicalSparseModel
+                    writeCheckpoint(
+                        stage: .sfmMapping,
+                        progress: 1.0,
+                        message: "Camera mapping completed",
+                        details: .sfmMapping(SfmMappingCheckpoint(
+                            mapper: "colmap",
+                            sparsePath: try paths.projectRelativePath(for: finalSparseModel),
+                            registeredImages: nil
+                        ))
+                    )
                 }
 
-                    break
-                }
+                break
+            }
             }
 
             try Task.checkCancellation()

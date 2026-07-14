@@ -11,7 +11,20 @@ BIN_DIR="$INSTALL_DIR/bin"
 VENDOR_DIR="$INSTALL_DIR/vendor"
 DA3_VENDOR="$VENDOR_DIR/depth-anything-3"
 REQUIREMENTS_LOCK="$ROOT/Tools/Da3Sfm/requirements.txt"
+DA3_RUNTIME_PATCH="$ROOT/Tools/Da3Sfm/patches/da3-api-lazy-export.patch"
+DA3_RUNTIME_PATCH_SHA256="885ade24b466ab3dff04169ff47dd3813d64c40ffd0bdb7dd9b779de97a370eb"
+COLMAP_LAUNCHER_SOURCE="$ROOT/Tools/Da3Sfm/colmap_launcher.c"
+COLMAP_LAUNCHER_SOURCE_SHA256="ab491ab2bf2aac71c7c0e65ae10241dd695aefd7158d967a2244d9ce692f8900"
 PIP_INSTALL_REPORT="$INSTALL_DIR/licenses/python-packages-install-report.json"
+SUPPLEMENTAL_LICENSE_MANIFEST="$INSTALL_DIR/licenses/python-package-upstream-notices.json"
+TOKENIZERS_LICENSE_COMMIT="f383101a26663708484cac0727792aad74f78234"
+TOKENIZERS_LICENSE_URL="https://raw.githubusercontent.com/huggingface/tokenizers/${TOKENIZERS_LICENSE_COMMIT}/LICENSE"
+TOKENIZERS_LICENSE_SHA256="c71d239df91726fc519c6eb72d318ec65820627232b2f796219e87dcf35d0ab4"
+TOKENIZERS_LICENSE_CACHE="$BUILD_DIR/licenses/tokenizers-0.22.2-LICENSE"
+ANTLR_LICENSE_COMMIT="e4c1a74c66bd5290364ea2b36c97cd724b247357"
+ANTLR_LICENSE_URL="https://raw.githubusercontent.com/antlr/antlr4/${ANTLR_LICENSE_COMMIT}/LICENSE.txt"
+ANTLR_LICENSE_SHA256="b1b379fcaf3219593a4c433feb1b35c780bed23fafaae440b1ae2771a9521e3a"
+ANTLR_LICENSE_CACHE="$BUILD_DIR/licenses/antlr4-python3-runtime-4.9.3-LICENSE.txt"
 
 ALLOW_UNPINNED_DA3_SOURCE="${EASYSPLAT_ALLOW_UNPINNED_DA3_SOURCE:-0}"
 if [ -n "${DA3_SOURCE:-}" ] && [ "$ALLOW_UNPINNED_DA3_SOURCE" != "1" ]; then
@@ -145,37 +158,105 @@ download_verified() {
   mv "$tmp" "$dest"
 }
 
-ensure_python() {
-  if [ -f "$PYTHON_DIR/pyvenv.cfg" ]; then
-    rm -rf "$PYTHON_DIR"
-  elif [ -L "$PYTHON_DIR/bin/python3" ]; then
-    local target
-    target="$(readlink "$PYTHON_DIR/bin/python3" || true)"
-    if [[ "$target" == /* ]]; then
-      rm -rf "$PYTHON_DIR"
-    fi
+install_supplemental_python_licenses() {
+  local -a tokenizers_dist_info=(
+    "$PYTHON_DIR"/lib/python*/site-packages/tokenizers-0.22.2.dist-info
+  )
+  local -a antlr_dist_info=(
+    "$PYTHON_DIR"/lib/python*/site-packages/antlr4_python3_runtime-4.9.3.dist-info
+  )
+  if [ "${#tokenizers_dist_info[@]}" -ne 1 ] || [ ! -d "${tokenizers_dist_info[0]}" ]; then
+    echo "Expected exactly one tokenizers 0.22.2 distribution." >&2
+    exit 1
+  fi
+  if [ "${#antlr_dist_info[@]}" -ne 1 ] || [ ! -d "${antlr_dist_info[0]}" ]; then
+    echo "Expected exactly one antlr4-python3-runtime 4.9.3 distribution." >&2
+    exit 1
   fi
 
-  if [ -x "$PYTHON_DIR/bin/python3" ]; then
-    local current_python_version
-    current_python_version="$("$PYTHON_DIR/bin/python3" - <<'PY'
+  download_verified \
+    "$TOKENIZERS_LICENSE_URL" \
+    "$TOKENIZERS_LICENSE_CACHE" \
+    "$TOKENIZERS_LICENSE_SHA256"
+  download_verified \
+    "$ANTLR_LICENSE_URL" \
+    "$ANTLR_LICENSE_CACHE" \
+    "$ANTLR_LICENSE_SHA256"
+
+  local tokenizers_license="${tokenizers_dist_info[0]}/licenses/UPSTREAM_LICENSE"
+  local antlr_license="${antlr_dist_info[0]}/licenses/UPSTREAM_LICENSE.txt"
+  mkdir -p "$(dirname "$tokenizers_license")" "$(dirname "$antlr_license")"
+  install -m 0644 "$TOKENIZERS_LICENSE_CACHE" "$tokenizers_license"
+  install -m 0644 "$ANTLR_LICENSE_CACHE" "$antlr_license"
+
+  "$PYTHON_DIR/bin/python3" - \
+    "$INSTALL_DIR" \
+    "$SUPPLEMENTAL_LICENSE_MANIFEST" \
+    "$tokenizers_license" \
+    "$antlr_license" <<PY
+import json
 import sys
-print(f"{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}")
-PY
-)"
-    if [ "$current_python_version" != "$PYTHON_STANDALONE_VERSION" ]; then
-      echo "da3_mps python version mismatch (found $current_python_version, expected $PYTHON_STANDALONE_VERSION); rebuilding runtime." >&2
-      rm -rf "$PYTHON_DIR"
-    fi
-  fi
+from pathlib import Path
 
-  if [ ! -x "$PYTHON_DIR/bin/python3" ]; then
-    download_verified "$PYTHON_STANDALONE_URL" "$PYTHON_STANDALONE_TARBALL" "$PYTHON_STANDALONE_SHA256"
-    mkdir -p "$INSTALL_DIR"
-    /usr/bin/tar -xzf "$PYTHON_STANDALONE_TARBALL" -C "$INSTALL_DIR"
-  fi
+root = Path(sys.argv[1]).resolve()
+manifest = Path(sys.argv[2])
+
+def relative(path_text):
+    path = Path(path_text).resolve(strict=True).relative_to(root).as_posix()
+    return f"da3_mps/{path}"
+
+payload = {
+    "schemaVersion": 1,
+    "notices": [
+        {
+            "package": "tokenizers",
+            "version": "0.22.2",
+            "license": "Apache-2.0",
+            "source": "https://github.com/huggingface/tokenizers",
+            "sourceCommit": "${TOKENIZERS_LICENSE_COMMIT}",
+            "artifact": "${TOKENIZERS_LICENSE_URL}",
+            "artifactSha256": "${TOKENIZERS_LICENSE_SHA256}",
+            "distInfo": "tokenizers-0.22.2.dist-info",
+            "filename": "UPSTREAM_LICENSE",
+            "installedPath": relative(sys.argv[3]),
+        },
+        {
+            "package": "antlr4-python3-runtime",
+            "version": "4.9.3",
+            "license": "BSD-3-Clause",
+            "source": "https://github.com/antlr/antlr4",
+            "sourceCommit": "${ANTLR_LICENSE_COMMIT}",
+            "artifact": "${ANTLR_LICENSE_URL}",
+            "artifactSha256": "${ANTLR_LICENSE_SHA256}",
+            "distInfo": "antlr4_python3_runtime-4.9.3.dist-info",
+            "filename": "UPSTREAM_LICENSE.txt",
+            "installedPath": relative(sys.argv[4]),
+        },
+    ],
+}
+manifest.parent.mkdir(parents=True, exist_ok=True)
+manifest.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+PY
+}
+
+ensure_python() {
+  download_verified "$PYTHON_STANDALONE_URL" "$PYTHON_STANDALONE_TARBALL" "$PYTHON_STANDALONE_SHA256"
+  mkdir -p "$INSTALL_DIR"
+  /usr/bin/tar -xzf "$PYTHON_STANDALONE_TARBALL" -C "$INSTALL_DIR"
 
   echo "da3_mps python version: $("$PYTHON_DIR/bin/python3" -V 2>&1)"
+}
+
+reset_install_dir() {
+  case "$INSTALL_DIR" in
+    "$BUILD_DIR/install/da3_mps") ;;
+    *)
+      echo "Refusing to clean unsafe DA3 install directory: $INSTALL_DIR" >&2
+      exit 1
+      ;;
+  esac
+  rm -rf "$INSTALL_DIR"
+  mkdir -p "$INSTALL_DIR" "$MODELS_DIR" "$BIN_DIR"
 }
 
 pip_install() {
@@ -193,6 +274,47 @@ PY
     echo "da3_mps python is not arm64 (got: $arch). Rebuild toolchain on Apple Silicon without Rosetta." >&2
     exit 1
   fi
+}
+
+verify_runtime_patch() {
+  if [ ! -f "$DA3_RUNTIME_PATCH" ] || [ -L "$DA3_RUNTIME_PATCH" ]; then
+    echo "DA3 runtime patch is missing or is not a regular file: $DA3_RUNTIME_PATCH" >&2
+    exit 1
+  fi
+  local actual_sha256
+  actual_sha256="$(shasum -a 256 "$DA3_RUNTIME_PATCH" | awk '{print $1}')"
+  if [ "$actual_sha256" != "$DA3_RUNTIME_PATCH_SHA256" ]; then
+    echo "DA3 runtime patch checksum mismatch: expected $DA3_RUNTIME_PATCH_SHA256, got $actual_sha256" >&2
+    exit 1
+  fi
+}
+
+build_colmap_launcher() {
+  if [ ! -f "$COLMAP_LAUNCHER_SOURCE" ] || [ -L "$COLMAP_LAUNCHER_SOURCE" ]; then
+    echo "COLMAP launcher source is missing or is not a regular file: $COLMAP_LAUNCHER_SOURCE" >&2
+    exit 1
+  fi
+  local actual_sha256
+  actual_sha256="$(shasum -a 256 "$COLMAP_LAUNCHER_SOURCE" | awk '{print $1}')"
+  if [ "$actual_sha256" != "$COLMAP_LAUNCHER_SOURCE_SHA256" ]; then
+    echo "COLMAP launcher source checksum mismatch: expected $COLMAP_LAUNCHER_SOURCE_SHA256, got $actual_sha256" >&2
+    exit 1
+  fi
+  xcrun clang \
+    -arch arm64 \
+    -mmacosx-version-min=15.0 \
+    -O2 \
+    -Wall \
+    -Wextra \
+    -Werror \
+    "$COLMAP_LAUNCHER_SOURCE" \
+    -o "$BIN_DIR/easysplat_colmap"
+  chmod +x "$BIN_DIR/easysplat_colmap"
+  /usr/bin/file -b "$BIN_DIR/easysplat_colmap" | \
+    grep -q 'Mach-O 64-bit executable arm64' || {
+      echo "COLMAP launcher is not an arm64 Mach-O executable." >&2
+      exit 1
+    }
 }
 
 verify_torch_mps() {
@@ -277,9 +399,11 @@ stage_da3_app() {
   find "$APP_DIR" -type f -name "*.pyc" -delete
 }
 
-mkdir -p "$BUILD_DIR" "$INSTALL_DIR" "$MODELS_DIR" "$BIN_DIR"
+mkdir -p "$BUILD_DIR"
 
 resolve_da3_source
+verify_runtime_patch
+reset_install_dir
 ensure_python
 require_arm64_python
 
@@ -295,6 +419,11 @@ pip_install \
   --no-cache-dir \
   --report "$PIP_INSTALL_REPORT" \
   -r "$REQUIREMENTS_LOCK"
+if find "$PYTHON_DIR" -iname '*opencv*' -print -quit | grep -F . >/dev/null; then
+  echo "opencv-python-headless survived the clean install; refusing the release runtime." >&2
+  exit 1
+fi
+install_supplemental_python_licenses
 verify_torch_mps
 
 rm -rf "$DA3_VENDOR"
@@ -309,6 +438,8 @@ else
 fi
 install -m 0644 "$DA3_SOURCE/LICENSE" "$DA3_VENDOR/LICENSE"
 test ! -e "$DA3_VENDOR/da3_streaming"
+/usr/bin/patch --dry-run -s -p1 -d "$DA3_VENDOR" < "$DA3_RUNTIME_PATCH"
+/usr/bin/patch -s -p1 -d "$DA3_VENDOR" < "$DA3_RUNTIME_PATCH"
 
 if ! command -v unzstd >/dev/null 2>&1; then
   echo "unzstd is required to extract python-build-standalone license metadata." >&2
@@ -334,6 +465,7 @@ if [ ! -f "$DA3_VENDOR/src/depth_anything_3/api.py" ]; then
 fi
 
 stage_da3_app
+build_colmap_launcher
 download_model "$DA3_BASE_REPO" "DA3-BASE" "$DA3_BASE_REVISION"
 download_model "$DA3_SMALL_REPO" "DA3-SMALL" "$DA3_SMALL_REVISION"
 
@@ -354,6 +486,18 @@ base_info = packaged_model_info("DA3-BASE")
 small_info = packaged_model_info("DA3-SMALL")
 requirements_lock = Path("${REQUIREMENTS_LOCK}")
 requirements_lock_sha256 = hashlib.sha256(requirements_lock.read_bytes()).hexdigest()
+runtime_patch = Path("${DA3_RUNTIME_PATCH}")
+runtime_patch_sha256 = hashlib.sha256(runtime_patch.read_bytes()).hexdigest()
+colmap_launcher_source = Path("${COLMAP_LAUNCHER_SOURCE}")
+colmap_launcher_source_sha256 = hashlib.sha256(colmap_launcher_source.read_bytes()).hexdigest()
+colmap_launcher = Path("${BIN_DIR}/easysplat_colmap")
+colmap_launcher_sha256 = hashlib.sha256(colmap_launcher.read_bytes()).hexdigest()
+colmap_bridge_source = Path("${APP_DIR}/easysplat_da3_sfm/colmap_cli.py")
+colmap_bridge_source_sha256 = hashlib.sha256(colmap_bridge_source.read_bytes()).hexdigest()
+supplemental_license_manifest = Path("${SUPPLEMENTAL_LICENSE_MANIFEST}")
+supplemental_license_manifest_sha256 = hashlib.sha256(
+    supplemental_license_manifest.read_bytes()
+).hexdigest()
 
 Path("${INSTALL_DIR}").mkdir(parents=True, exist_ok=True)
 Path("${INSTALL_DIR}/build_info.json").write_text(
@@ -380,6 +524,15 @@ Path("${INSTALL_DIR}/build_info.json").write_text(
             "python_standalone_license_archive_sha256": "${PYTHON_STANDALONE_FULL_SHA256}",
             "requirements_lock": "Tools/Da3Sfm/requirements.txt",
             "requirements_lock_sha256": requirements_lock_sha256,
+            "runtime_patch": "Tools/Da3Sfm/patches/da3-api-lazy-export.patch",
+            "runtime_patch_sha256": runtime_patch_sha256,
+            "colmap_launcher_source": "Tools/Da3Sfm/colmap_launcher.c",
+            "colmap_launcher_source_sha256": colmap_launcher_source_sha256,
+            "colmap_launcher_sha256": colmap_launcher_sha256,
+            "colmap_bridge_source": "Tools/Da3Sfm/easysplat_da3_sfm/colmap_cli.py",
+            "colmap_bridge_source_sha256": colmap_bridge_source_sha256,
+            "supplemental_license_manifest": "licenses/python-package-upstream-notices.json",
+            "supplemental_license_manifest_sha256": supplemental_license_manifest_sha256,
             "pip_install_report": "licenses/python-packages-install-report.json",
             "torch_version": torch.__version__,
             "torchvision_version": torchvision.__version__,
@@ -432,5 +585,6 @@ except Exception as exc:  # noqa: BLE001
 PY
 
 "$BIN_DIR/easysplat_da3_sfm" --help >/dev/null
+"$BIN_DIR/easysplat_colmap" -h >/dev/null
 
 echo "da3_mps ready at $INSTALL_DIR"

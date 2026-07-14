@@ -96,6 +96,10 @@ extension PipelineRunner {
         try normalizeSelectedImagesForTooling(paths: paths)
     }
 
+    func test_selectedImagesHaveUniformPixelDimensions(_ images: [URL]) throws -> Bool {
+        try selectedImagesHaveUniformPixelDimensions(images)
+    }
+
     func test_targetCountForVideo(index: Int, total: Int, targetCount: Int) -> Int {
         targetCountForVideo(index: index, total: total, targetCount: targetCount)
     }
@@ -145,6 +149,13 @@ extension PipelineRunner {
 
     func test_da3SeedWindowOverlap(windowSize: Int, hardwareTier: HardwareProfile.Tier) -> Int {
         da3SeedWindowOverlap(windowSize: windowSize, hardwareTier: hardwareTier)
+    }
+
+    func test_da3SharedCameraPreference(
+        input: InputSpec,
+        cameraGrouping: CameraGrouping
+    ) -> Bool {
+        da3SharedCameraPreference(input: input, cameraGrouping: cameraGrouping)
     }
 
     func test_globalMapperOptions(threadHint: Int, defaultUseGpu: Bool = true) -> ColmapGlobalMapperOptions {
