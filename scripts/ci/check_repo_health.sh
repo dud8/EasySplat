@@ -77,14 +77,21 @@ fi
 
 toolchain_workflow="$ROOT/.github/workflows/toolchain-build.yml"
 for builder in \
-  build_suitesparse.sh \
-  build_ceres.sh \
-  build_openimageio.sh \
-  build_colmap.sh \
   build_msplat.sh \
   build_da3_mps.sh; do
   if ! rg -n "scripts/toolchain/$builder" "$toolchain_workflow" >/dev/null; then
     echo "Toolchain workflow no longer runs required builder $builder: $toolchain_workflow" >&2
+    exit 1
+  fi
+done
+
+for retired_builder in \
+  build_suitesparse.sh \
+  build_ceres.sh \
+  build_openimageio.sh \
+  build_colmap.sh; do
+  if rg -n "scripts/toolchain/$retired_builder" "$toolchain_workflow" >/dev/null; then
+    echo "Toolchain workflow restored retired native builder $retired_builder: $toolchain_workflow" >&2
     exit 1
   fi
 done

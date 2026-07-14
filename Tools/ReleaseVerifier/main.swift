@@ -107,11 +107,11 @@ private enum ReleaseVerifier {
 
         let options = RequestedRunOptions(
             capturePath: .automatic,
-            detailProfile: .fast,
+            detailProfile: .balanced,
             cameraGrouping: .automatic,
             lensProjection: .automatic,
             inputOrdering: .automatic,
-            resourcePolicy: .conserveMemory,
+            resourcePolicy: .automatic,
             photoSelection: .automatic
         )
         try RunPlanResolver.validate(requestedOptions: options, input: input)
@@ -120,9 +120,7 @@ private enum ReleaseVerifier {
             input: input,
             developmentOverrides: DevelopmentOverrides(benchmarkSeed: 42)
         )
-        let request = ToolchainCapabilityRequest(
-            capabilities: Set(ToolchainCapability.allCases)
-        )
+        let request = try plan.toolchainCapabilityRequest()
         let manifestURL = arguments.offline
             ? URL(string: "https://127.0.0.1:1/easysplat-offline-verification.json")!
             : arguments.manifestURL

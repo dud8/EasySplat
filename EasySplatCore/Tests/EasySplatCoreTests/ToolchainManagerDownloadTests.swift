@@ -75,7 +75,26 @@ final class ToolchainManagerDownloadTests: XCTestCase {
         XCTAssertTrue(manager.loadInstallState(root: root).installedArtifacts.isEmpty)
     }
 
-    func testLoadInstallStateIgnoresReceiptLargerThanOneMiB() throws {
+    func testLoadInstallStateAcceptsReceiptBetweenOneAndSixteenMiB() throws {
+        let root = try TestFileBuilder.makeTempDir()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let stateURL = root.appendingPathComponent(".easysplat_toolchain_state.json")
+        let state = ToolchainManager.ToolchainInstallState(
+            installedArtifacts: ["macos-arm64-core": String(repeating: "a", count: 2 * 1_024 * 1_024)]
+        )
+        let data = try JSONEncoder().encode(state)
+        XCTAssertGreaterThan(data.count, 1_024 * 1_024)
+        XCTAssertLessThan(data.count, 16 * 1_024 * 1_024)
+        try data.write(to: stateURL)
+        let manager = ToolchainManager(
+            runner: MockSubprocessRunner(scripts: []),
+            urlSession: makeSession()
+        )
+
+        XCTAssertFalse(manager.loadInstallState(root: root).installedArtifacts.isEmpty)
+    }
+
+    func testLoadInstallStateIgnoresReceiptLargerThanSixteenMiB() throws {
         let root = try TestFileBuilder.makeTempDir()
         defer { try? FileManager.default.removeItem(at: root) }
         let stateURL = root.appendingPathComponent(".easysplat_toolchain_state.json")
@@ -83,8 +102,8 @@ final class ToolchainManagerDownloadTests: XCTestCase {
             installedArtifacts: ["macos-arm64-core": String(repeating: "a", count: 64)]
         )
         var data = try JSONEncoder().encode(state)
-        data.append(Data(repeating: 0x20, count: 1_024 * 1_024))
-        XCTAssertGreaterThan(data.count, 1_024 * 1_024)
+        data.append(Data(repeating: 0x20, count: 16 * 1_024 * 1_024))
+        XCTAssertGreaterThan(data.count, 16 * 1_024 * 1_024)
         try data.write(to: stateURL)
         let manager = ToolchainManager(
             runner: MockSubprocessRunner(scripts: []),
@@ -769,8 +788,8 @@ final class ToolchainManagerDownloadTests: XCTestCase {
         }
     }
 
-    func testDownloadManifestAcceptsExactlyOneMiB() async throws {
-        let maximumBytes = 1_048_576
+    func testDownloadManifestAcceptsExactlySixteenMiB() async throws {
+        let maximumBytes = 16 * 1_024 * 1_024
         let signed = try minimalSignedManifest()
         var data = signed.data
         data.append(Data(repeating: 0x20, count: maximumBytes - data.count))
@@ -803,7 +822,7 @@ final class ToolchainManagerDownloadTests: XCTestCase {
     }
 
     func testDownloadManifestRejectsOversizedContentLengthBeforeReadingBody() async throws {
-        let maximumBytes = 1_048_576
+        let maximumBytes = 16 * 1_024 * 1_024
         let signed = try minimalSignedManifest()
         let token = UUID().uuidString
         let manifestURL = tokenizedURL("https://example.com/manifest.json", token: token)
@@ -833,13 +852,13 @@ final class ToolchainManagerDownloadTests: XCTestCase {
             guard case ToolchainManager.ToolchainError.manifestTooLarge(maximumBytes) = error else {
                 return XCTFail("Expected manifestTooLarge, got \(error)")
             }
-            XCTAssertEqual(maximumBytes, 1_048_576)
+            XCTAssertEqual(maximumBytes, 16 * 1_024 * 1_024)
         })
         XCTAssertEqual(requests.current(), 1)
     }
 
     func testDownloadManifestRejectsStreamingOverflowWithoutContentLength() async throws {
-        let maximumBytes = 1_048_576
+        let maximumBytes = 16 * 1_024 * 1_024
         let signed = try minimalSignedManifest()
         var data = signed.data
         data.append(Data(repeating: 0x20, count: maximumBytes + 1 - data.count))
@@ -874,7 +893,7 @@ final class ToolchainManagerDownloadTests: XCTestCase {
             guard case ToolchainManager.ToolchainError.manifestTooLarge(maximumBytes) = error else {
                 return XCTFail("Expected manifestTooLarge, got \(error)")
             }
-            XCTAssertEqual(maximumBytes, 1_048_576)
+            XCTAssertEqual(maximumBytes, 16 * 1_024 * 1_024)
         })
         XCTAssertEqual(requests.current(), 1)
     }

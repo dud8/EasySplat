@@ -4,10 +4,10 @@ import Foundation
 extension ToolchainManager {
     static let installStateFilename = ".easysplat_toolchain_state.json"
 
-    // A capability manifest is metadata. One MiB leaves ample room for components and hashes
-    // while bounding the unauthenticated response before signature verification.
-    private static let maximumManifestDownloadBytes = 1_048_576
-    private static let maximumInstallStateBytes = 1 * 1_024 * 1_024
+    // The signed manifest carries the exact Python runtime closure. Keep the
+    // unauthenticated response and cached receipt bounded above that real size.
+    private static let maximumManifestDownloadBytes = 16 * 1_024 * 1_024
+    private static let maximumInstallStateBytes = 16 * 1_024 * 1_024
 
     final class RedirectValidationDelegate: NSObject, URLSessionTaskDelegate, @unchecked Sendable {
         private let validate: @Sendable (URL) throws -> Void

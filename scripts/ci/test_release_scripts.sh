@@ -7,123 +7,21 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 TMP_DIR="$(mktemp -d "${TMPDIR:-/tmp}/easysplat-release-test.XXXXXX")"
 trap 'rm -rf "$TMP_DIR"' EXIT
 
-python3 - "$ROOT/scripts/toolchain/generate_supply_chain_manifest.py" "$TMP_DIR" <<'PY'
-import importlib.util
-import sys
-from pathlib import Path
+python3 "$ROOT/scripts/toolchain/tests/test_generate_supply_chain_manifest.py"
 
-spec = importlib.util.spec_from_file_location("supply_chain", sys.argv[1])
-module = importlib.util.module_from_spec(spec)
-spec.loader.exec_module(module)
-
-assert module.homebrew_component_id("xz") == "homebrew:xz:liblzma"
-assert module.homebrew_component_id("zstd") == "homebrew:zstd:libzstd"
-assert module.component_build_command("colmap", {}) == "./scripts/toolchain/build_colmap.sh"
-assert module.component_build_command("model:da3-base", {}) == "./scripts/toolchain/build_da3_mps.sh"
-assert module.component_build_command("python:numpy", {}) == "./scripts/toolchain/build_da3_mps.sh"
-assert module.component_build_command("homebrew:xz:liblzma", {"formula": "xz"}) == \
-    "brew install --build-from-source xz"
-try:
-    module.component_build_command("unreviewed-component", {})
-except SystemExit:
-    pass
-else:
-    raise AssertionError("unreviewed component received an implicit build command")
-assert module.homebrew_runtime_license("xz", "0BSD AND GPL-2.0-or-later") == "0BSD"
-assert module.homebrew_runtime_license(
-    "zstd",
-    "(BSD-3-Clause OR GPL-2.0-only) AND BSD-2-Clause AND MIT",
-) == "BSD-3-Clause AND MIT"
-for component_id in (
-    "colmap",
-    "openimageio",
-    "openimageio:fmt",
-    "openimageio:robin-map",
-    "openimageio:pugixml",
-    "colmap:poselib",
-    "colmap:faiss",
-    "colmap:poissonrecon",
-    "colmap:vlfeat",
-):
-    expected = module.PINNED_RECEIPTS[component_id]
-    module.require_pinned_receipt(dict(expected), expected, component_id)
-    tampered = dict(expected)
-    first_key = next(iter(tampered))
-    tampered[first_key] = "tampered"
-    try:
-        module.require_pinned_receipt(tampered, expected, component_id)
-    except SystemExit:
-        pass
-    else:
-        raise AssertionError(f"accepted tampered pinned receipt: {component_id}")
-pugixml = module.PINNED_RECEIPTS["openimageio:pugixml"]
-assert pugixml["source_commit"] == "f32bf6e6f8de38ab6d197a72fd72366b66fd30a3"
-assert pugixml["source_tree_sha256"] == "316f7a67b75417c9cad506a4e14fac8488528b24e66e9fbf7cbe4fe88bbd1ed8"
-assert pugixml["upstream_source_commit"] == "314baf6605143f1e837209008f490e8559529e1c"
-assert pugixml["upstream_source_tree_sha256"] == "fbd994ba2b46894d2a643f6fc19acb412554e297a0880666f402219b6aaf8864"
-assert module.PINNED_RECEIPTS["colmap:poissonrecon"]["source_tree_sha256"] == \
-    "7aacb04853a3fece0d6b2eb3bbaaffe3c2014467ae3c73750c5dba1c6b2e835e"
-assert module.PINNED_RECEIPTS["colmap:vlfeat"]["source_tree_sha256"] == \
-    "c1f3020a96d78e2f105aafa63f41b14cdf0a3886196f42f2dbc9c817ccd1d61e"
-original_run = module.run
-architecture_fixture = Path(sys.argv[2]) / "native-architecture-fixture"
-architecture_fixture.write_bytes(b"\xcf\xfa\xed\xfe" + b"\x00" * 8)
-try:
-    module.run = lambda *args, **kwargs: "arm64\n"
-    module.validate_arm64_only(architecture_fixture)
-    for reported in ("x86_64 arm64\n", "arm64e\n", "x86_64\n", ""):
-        module.run = lambda *args, value=reported, **kwargs: value
-        try:
-            module.validate_arm64_only(architecture_fixture)
-        except SystemExit:
-            pass
-        else:
-            raise AssertionError(f"accepted non-arm64-only architecture: {reported!r}")
-    architecture_fixture.write_bytes(b"\xca\xfe\xba\xbe" + b"\x00" * 8)
-    module.run = lambda *args, **kwargs: "arm64\n"
-    try:
-        module.validate_arm64_only(architecture_fixture)
-    except SystemExit:
-        pass
-    else:
-        raise AssertionError("accepted a fat Mach-O containing only an arm64 slice")
-finally:
-    module.run = original_run
-module.validate_homebrew_runtime_member("xz", "lib/liblzma.5.dylib")
-module.validate_homebrew_runtime_member("zstd", "lib/libzstd.1.dylib")
-for formula, path in (("xz", "bin/xz"), ("zstd", "bin/zstd")):
-    try:
-        module.validate_homebrew_runtime_member(formula, path)
-    except SystemExit:
-        pass
-    else:
-        raise AssertionError(f"accepted forbidden {formula} payload: {path}")
-try:
-    module.normalize_license("GPL-3.0-only")
-except SystemExit:
-    pass
-else:
-    raise AssertionError("generic GPL rejection was weakened")
-
-fixture = Path(sys.argv[2]) / "materialized-symlink"
-root = fixture / "root"
-root.mkdir(parents=True)
-target = root / "python3.13"
-target.write_bytes(b"python-runtime")
-alias = root / "python3"
-alias.symlink_to("python3.13")
-assert module.materialized_source(alias, root) == target.resolve()
-outside = fixture / "outside"
-outside.write_bytes(b"outside")
-escaping = root / "escaping"
-escaping.symlink_to(outside)
-try:
-    module.materialized_source(escaping, root)
-except SystemExit:
-    pass
-else:
-    raise AssertionError("accepted a symlink that escapes the toolchain")
-PY
+unsafe_toolchain_root="$TMP_DIR/unsafe-toolchain-root"
+mkdir -p "$unsafe_toolchain_root"
+printf '%s' 'preserve' >"$unsafe_toolchain_root/sentinel"
+unsafe_toolchain_error="$TMP_DIR/unsafe-toolchain-root.stderr"
+if "$ROOT/scripts/run.sh" \
+  --fast \
+  --toolchain-root "$unsafe_toolchain_root" \
+  >/dev/null 2>"$unsafe_toolchain_error"; then
+  echo "Local launcher accepted an unsafe destructive toolchain root." >&2
+  exit 1
+fi
+grep -Fqi 'Refusing unsafe toolchain root' "$unsafe_toolchain_error"
+test "$(cat "$unsafe_toolchain_root/sentinel")" = preserve
 
 signature_fixture="$TMP_DIR/rewritten-macho"
 cp "$(command -v rg)" "$signature_fixture"
@@ -211,7 +109,10 @@ public_before="$(cat "$ROOT/EasySplatApp/Resources/public_key_ed25519.txt")"
 manifest_url="https://example.com/releases/download/toolchain-v1.2.3/manifest.json"
 project_url="https://example.com/EasySplat"
 public_key_path="$TMP_DIR/public_key.txt"
-printf '%s' 'PUBLIC_KEY_TEST_VALUE' >"$public_key_path"
+private_key_path="$TMP_DIR/private_key.txt"
+swift run --package-path "$ROOT/Tools/ManifestTool" ManifestTool generate-keypair \
+  --public-key-out "$public_key_path" \
+  --private-key-out "$private_key_path"
 xcodebuild_log="$TMP_DIR/xcodebuild.log"
 
 insecure_app_url_error="$TMP_DIR/insecure-app-url.stderr"
@@ -284,12 +185,12 @@ test "$(cat "$ROOT/EasySplatApp/Resources/public_key_ed25519.txt")" = "$public_b
 
 test "$(cat "$resources_dir/toolchain_manifest_url.txt")" = "$manifest_url"
 test "$(cat "$resources_dir/project_home_url.txt")" = "$project_url"
-test "$(cat "$resources_dir/public_key_ed25519.txt")" = 'PUBLIC_KEY_TEST_VALUE'
+cmp -s "$resources_dir/public_key_ed25519.txt" "$public_key_path"
 
 module_resources_dir="$resources_dir/EasySplat_EasySplatApp.bundle"
 test "$(cat "$module_resources_dir/toolchain_manifest_url.txt")" = "$manifest_url"
 test "$(cat "$module_resources_dir/project_home_url.txt")" = "$project_url"
-test "$(cat "$module_resources_dir/public_key_ed25519.txt")" = 'PUBLIC_KEY_TEST_VALUE'
+cmp -s "$module_resources_dir/public_key_ed25519.txt" "$public_key_path"
 
 info_plist="$app_bundle/Contents/Info.plist"
 test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$info_plist")" = "com.easysplat.app"
@@ -310,6 +211,9 @@ test "$(cat "$resources_dir/release_channel.txt")" = "unsigned public beta"
 early_exit_fixture="$TMP_DIR/early-exit-fixture"
 mkdir -p "$early_exit_fixture"
 cp -R "$app_bundle" "$early_exit_fixture/EasySplat.app"
+xcrun dsymutil \
+  "$early_exit_fixture/EasySplat.app/Contents/MacOS/EasySplatApp" \
+  -o "$early_exit_fixture/EasySplat.app.dSYM"
 
 smoke_fixture_source="$TMP_DIR/smoke-fixture.c"
 cat >"$smoke_fixture_source" <<'EOF'
@@ -490,7 +394,12 @@ EASYSPLAT_TEST_APP_PATH="$app_bundle" \
   --skip-launch-smoke >"$bundled_contract_only_output"
 grep -Fq 'INCOMPLETE TEST MODE: end-to-end splat not supplied.' "$bundled_contract_only_output"
 grep -Fq 'INCOMPLETE TEST MODE: cached offline run not supplied.' "$bundled_contract_only_output"
-grep -Fq 'Verified unsigned public beta: 0.2.0-beta.1' "$bundled_contract_only_output"
+grep -Fq 'Inspection only:' "$bundled_contract_only_output"
+grep -Fq 'release verification is incomplete' "$bundled_contract_only_output"
+if grep -Eiq 'Verified unsigned public beta|usable|distributable' "$bundled_contract_only_output"; then
+  echo "Incomplete beta inspection made a release-readiness claim" >&2
+  exit 1
+fi
 
 x86_fixture_object="$TMP_DIR/smoke-fixture-x86_64.o"
 x86_fixture_binary="$TMP_DIR/EasySplatApp-x86_64"
@@ -562,13 +471,29 @@ if EASYSPLAT_HDIUTIL_BIN="$mock_hdiutil" \
 fi
 grep -Fqi 'Exported dSYM UUID does not match app executable' "$mismatched_dsym_error"
 
+mismatched_distributed_error="$TMP_DIR/release-verifier-mismatched-distributed.stderr"
+if EASYSPLAT_HDIUTIL_BIN="$mock_hdiutil" \
+  EASYSPLAT_TEST_HDIUTIL_LOG="$hdiutil_log" \
+  EASYSPLAT_TEST_APP_PATH="$early_exit_fixture/EasySplat.app" \
+  "$ROOT/scripts/release/verify_beta.sh" \
+  --app "$app_bundle" \
+  --dmg "$TMP_DIR/EasySplat-0.2.0-beta.1-unsigned.dmg" \
+  --expected-version "0.2.0-beta.1" \
+  --allow-incomplete \
+  --skip-launch-smoke >/dev/null 2>"$mismatched_distributed_error"; then
+  echo "Beta verification accepted a DMG executable that differed from the release app" >&2
+  exit 1
+fi
+grep -Fqi 'Mounted app executable SHA-256 does not match release app executable' \
+  "$mismatched_distributed_error"
+
 early_exit_error="$TMP_DIR/release-verifier-early-exit.stderr"
 if EASYSPLAT_HDIUTIL_BIN="$mock_hdiutil" \
   EASYSPLAT_TEST_HDIUTIL_LOG="$hdiutil_log" \
   EASYSPLAT_TEST_APP_PATH="$early_exit_fixture/EasySplat.app" \
   EASYSPLAT_SMOKE_SECONDS=2 \
   "$ROOT/scripts/release/verify_beta.sh" \
-  --app "$app_bundle" \
+  --app "$early_exit_fixture/EasySplat.app" \
   --dmg "$TMP_DIR/EasySplat-0.2.0-beta.1-unsigned.dmg" \
   --expected-version "0.2.0-beta.1" \
   --allow-incomplete >/dev/null 2>"$early_exit_error"; then
@@ -583,12 +508,14 @@ cp -R "$app_bundle" "$missing_public_key_fixture/EasySplat.app"
 rm "$missing_public_key_fixture/EasySplat.app/Contents/Resources/EasySplat_EasySplatApp.bundle/public_key_ed25519.txt"
 /usr/bin/codesign --force --deep --sign - --timestamp=none \
   "$missing_public_key_fixture/EasySplat.app"
+cp -R "$ROOT/build/Export/EasySplat.app.dSYM" \
+  "$missing_public_key_fixture/EasySplat.app.dSYM"
 missing_public_key_error="$TMP_DIR/release-verifier-missing-public-key.stderr"
 if EASYSPLAT_HDIUTIL_BIN="$mock_hdiutil" \
   EASYSPLAT_TEST_HDIUTIL_LOG="$hdiutil_log" \
   EASYSPLAT_TEST_APP_PATH="$missing_public_key_fixture/EasySplat.app" \
   "$ROOT/scripts/release/verify_beta.sh" \
-  --app "$app_bundle" \
+  --app "$missing_public_key_fixture/EasySplat.app" \
   --dmg "$TMP_DIR/EasySplat-0.2.0-beta.1-unsigned.dmg" \
   --expected-version "0.2.0-beta.1" \
   --manifest-url "$manifest_url" \
@@ -607,12 +534,14 @@ printf '%s' 'https://downloads.example.com/wrong-manifest.json' \
   >"$mismatched_manifest_fixture/EasySplat.app/Contents/Resources/EasySplat_EasySplatApp.bundle/toolchain_manifest_url.txt"
 /usr/bin/codesign --force --deep --sign - --timestamp=none \
   "$mismatched_manifest_fixture/EasySplat.app"
+cp -R "$ROOT/build/Export/EasySplat.app.dSYM" \
+  "$mismatched_manifest_fixture/EasySplat.app.dSYM"
 mismatched_manifest_error="$TMP_DIR/release-verifier-mismatched-manifest.stderr"
 if EASYSPLAT_HDIUTIL_BIN="$mock_hdiutil" \
   EASYSPLAT_TEST_HDIUTIL_LOG="$hdiutil_log" \
   EASYSPLAT_TEST_APP_PATH="$mismatched_manifest_fixture/EasySplat.app" \
   "$ROOT/scripts/release/verify_beta.sh" \
-  --app "$app_bundle" \
+  --app "$mismatched_manifest_fixture/EasySplat.app" \
   --dmg "$TMP_DIR/EasySplat-0.2.0-beta.1-unsigned.dmg" \
   --expected-version "0.2.0-beta.1" \
   --manifest-url "$manifest_url" \
@@ -635,13 +564,36 @@ grep -Fq -- '-licenses.zip' "$ROOT/scripts/release/build_dmg.sh"
 metadata_fixture="$TMP_DIR/release-metadata"
 mkdir -p \
   "$metadata_fixture/core/bin" \
+  "$metadata_fixture/core/da3_mps/bin" \
+  "$metadata_fixture/core/da3_mps/python/bin" \
+  "$metadata_fixture/core/da3_mps/app/easysplat_da3_sfm" \
+  "$metadata_fixture/core/msplat" \
   "$metadata_fixture/core/licenses/example" \
   "$metadata_fixture/base/da3_mps/models/DA3-BASE" \
   "$metadata_fixture/small/da3_mps/models/DA3-SMALL"
 printf 'Apache-2.0 test license\n' >"$metadata_fixture/core/licenses/example/LICENSE"
 ln -s ../licenses/example/LICENSE "$metadata_fixture/core/bin/license-link"
-printf 'base-weights' >"$metadata_fixture/base/da3_mps/models/DA3-BASE/weights.bin"
-printf 'small-weights' >"$metadata_fixture/small/da3_mps/models/DA3-SMALL/weights.bin"
+for path in \
+  bin/colmap \
+  bin/easysplat-train \
+  bin/default.metallib \
+  da3_mps/bin/easysplat_da3_sfm \
+  da3_mps/python/bin/python3 \
+  da3_mps/app/easysplat_da3_sfm/run.py \
+  da3_mps/build_info.json \
+  msplat/build_info.json; do
+  printf 'release fixture: %s\n' "$path" >"$metadata_fixture/core/$path"
+done
+for model in DA3-BASE DA3-SMALL; do
+  case "$model" in
+    DA3-BASE) model_root="$metadata_fixture/base/da3_mps/models/$model" ;;
+    DA3-SMALL) model_root="$metadata_fixture/small/da3_mps/models/$model" ;;
+  esac
+  printf '{}\n' >"$model_root/config.json"
+  printf '%s-weights' "$model" >"$model_root/model.safetensors"
+  printf '{"model":"%s"}\n' "$model" >"$model_root/easysplat_model_info.json"
+  printf 'Apache-2.0 test license\n' >"$model_root/LICENSE"
+done
 python3 - "$metadata_fixture" <<'PY'
 import hashlib
 import json
@@ -652,10 +604,20 @@ from pathlib import Path
 root = Path(sys.argv[1])
 locations = {
     "bin/license-link": root / "core/bin/license-link",
+    "bin/colmap": root / "core/bin/colmap",
+    "bin/default.metallib": root / "core/bin/default.metallib",
+    "bin/easysplat-train": root / "core/bin/easysplat-train",
+    "da3_mps/app/easysplat_da3_sfm/run.py": root / "core/da3_mps/app/easysplat_da3_sfm/run.py",
+    "da3_mps/bin/easysplat_da3_sfm": root / "core/da3_mps/bin/easysplat_da3_sfm",
+    "da3_mps/build_info.json": root / "core/da3_mps/build_info.json",
+    "da3_mps/python/bin/python3": root / "core/da3_mps/python/bin/python3",
+    "msplat/build_info.json": root / "core/msplat/build_info.json",
     "licenses/example/LICENSE": root / "core/licenses/example/LICENSE",
-    "da3_mps/models/DA3-BASE/weights.bin": root / "base/da3_mps/models/DA3-BASE/weights.bin",
-    "da3_mps/models/DA3-SMALL/weights.bin": root / "small/da3_mps/models/DA3-SMALL/weights.bin",
 }
+for model, archive in (("DA3-BASE", "base"), ("DA3-SMALL", "small")):
+    for filename in ("LICENSE", "config.json", "easysplat_model_info.json", "model.safetensors"):
+        path = f"da3_mps/models/{model}/{filename}"
+        locations[path] = root / archive / path
 paths = sorted(locations)
 component = {
     "id": "test:closure",
@@ -704,44 +666,19 @@ with zipfile.ZipFile(sys.argv[1]) as archive:
     assert not any(stat.S_ISLNK(info.external_attr >> 16) for info in archive.infolist())
     assert archive.read("bin/license-link") == archive.read("licenses/example/LICENSE")
 PY
-python3 - "$metadata_fixture" <<'PY'
-import hashlib
-import json
-import sys
-import zipfile
-from pathlib import Path
-
-root = Path(sys.argv[1])
-rows = []
-for name, filename in (
-    ("macos-arm64-core", "core.zip"),
-    ("geometry-da3-base", "base.zip"),
-    ("geometry-da3-small", "small.zip"),
-):
-    path = root / filename
-    with zipfile.ZipFile(path) as archive:
-        expanded_size = sum(info.file_size for info in archive.infolist() if not info.is_dir())
-    rows.append({
-        "name": name,
-        "url": f"https://example.com/{filename}",
-        "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
-        "sizeBytes": path.stat().st_size,
-        "expandedSizeBytes": expanded_size,
-    })
-manifest = {
-    "schemaVersion": 2,
-    "toolchainAPI": 2,
-    "version": "2.0.0",
-    "publishedAt": "2026-07-11T00:00:00Z",
-    "keyID": "release-test-key",
-    "signatureEd25519": "release-test-signature",
-    "components": rows,
-}
-(root / "manifest.json").write_text(
-    json.dumps(manifest, indent=2, sort_keys=True) + "\n",
-    encoding="utf-8",
-)
-PY
+swift run --package-path "$ROOT/Tools/ManifestTool" ManifestTool \
+  --core-zip "$metadata_fixture/core.zip" \
+  --core-url https://example.com/core.zip \
+  --da3-base-zip "$metadata_fixture/base.zip" \
+  --da3-base-url https://example.com/base.zip \
+  --da3-small-zip "$metadata_fixture/small.zip" \
+  --da3-small-url https://example.com/small.zip \
+  --version 2.0.0 \
+  --published-at 2026-07-11T00:00:00Z \
+  --app-version-minimum 0.2.0-beta.1 \
+  --app-version-maximum-exclusive 0.3.0 \
+  --private-key-file "$private_key_path" \
+  --manifest-out "$metadata_fixture/manifest.json"
 
 beta_dmg="$TMP_DIR/EasySplat-0.2.0-beta.1-unsigned.dmg"
 beta_stem="${beta_dmg%-unsigned.dmg}"
@@ -968,86 +905,46 @@ EASYSPLAT_TEST_APP_PATH="$app_bundle" \
 fixture="$TMP_DIR/release-verifier-fixture.mov"
 online_cache="$TMP_DIR/release-verifier-online-cache"
 offline_cache="$TMP_DIR/release-verifier-offline-cache"
-runner_log="$TMP_DIR/release-verifier-runners.log"
 printf '%s' 'fixture' >"$fixture"
 mkdir -p "$online_cache" "$offline_cache"
 
-mock_runner="$TMP_DIR/mock-release-runner"
-cat >"$mock_runner" <<'EOF'
+online_runner="$TMP_DIR/arbitrary-release-runner"
+cat >"$online_runner" <<'EOF'
 #!/usr/bin/env bash
-set -euo pipefail
-
-fixture=""
-manifest_url=""
-public_key_file=""
-cache_root=""
-output=""
-app_version=""
-offline=0
-while [[ $# -gt 0 ]]; do
-  case "$1" in
-    --fixture) fixture="$2"; shift 2 ;;
-    --manifest-url) manifest_url="$2"; shift 2 ;;
-    --public-key-file) public_key_file="$2"; shift 2 ;;
-    --cache-root) cache_root="$2"; shift 2 ;;
-    --output) output="$2"; shift 2 ;;
-    --app-version) app_version="$2"; shift 2 ;;
-    --offline) offline=1; shift ;;
-    *) echo "Unknown mock runner argument: $1" >&2; exit 2 ;;
-  esac
-done
-
-mode="$(basename "$0")"
-test -f "$fixture"
-test -f "$public_key_file"
-test "$(cat "$public_key_file")" = 'PUBLIC_KEY_TEST_VALUE'
-test -d "$cache_root"
-test -n "$output"
-test "$app_version" = "0.2.0-beta.1"
-case "$manifest_url" in
-  https://*) ;;
-  *) echo "Mock runner requires an HTTPS manifest URL." >&2; exit 2 ;;
-esac
-case "$mode" in
-  mock-online-runner) test "$offline" -eq 0 ;;
-  mock-offline-runner) test "$offline" -eq 1 ;;
-  *) echo "Unexpected mock runner name: $mode" >&2; exit 2 ;;
-esac
-
-printf '%s|%s|%s|%s|%s|version=%s|offline=%s|%s\n' \
-  "$mode" "$fixture" "$manifest_url" "$public_key_file" "$cache_root" "$app_version" "$offline" "$output" \
-  >>"$EASYSPLAT_TEST_RUNNER_LOG"
-{
-  printf '%s\n' \
-    'ply' \
-    'format binary_little_endian 1.0' \
-    'element vertex 1' \
-    'property float x' \
-    'property float y' \
-    'property float z' \
-    'property float nx' \
-    'property float ny' \
-    'property float nz' \
-    'property float f_dc_0' \
-    'property float f_dc_1' \
-    'property float f_dc_2' \
-    'property float opacity' \
-    'property float scale_0' \
-    'property float scale_1' \
-    'property float scale_2' \
-    'property float rot_0' \
-    'property float rot_1' \
-    'property float rot_2' \
-    'property float rot_3' \
-    'end_header'
-  dd if=/dev/zero bs=68 count=1 2>/dev/null
-} >"$output"
+echo "Arbitrary release runner was invoked." >&2
+exit 97
 EOF
-chmod +x "$mock_runner"
-online_runner="$TMP_DIR/mock-online-runner"
-offline_runner="$TMP_DIR/mock-offline-runner"
-cp "$mock_runner" "$online_runner"
-cp "$mock_runner" "$offline_runner"
+chmod +x "$online_runner"
+
+run_strict_verifier() {
+  local dmg=$1
+  local release_manifest=$2
+  local cache=$3
+  local offline_cache=$4
+  local runner=$5
+  EASYSPLAT_HDIUTIL_BIN="$mock_hdiutil" \
+    EASYSPLAT_TEST_HDIUTIL_LOG="$hdiutil_log" \
+    EASYSPLAT_TEST_APP_PATH="$app_bundle" \
+    EASYSPLAT_SMOKE_SECONDS=0 \
+    "$ROOT/scripts/release/verify_beta.sh" \
+    --app "$app_bundle" \
+    --dmg "$dmg" \
+    --expected-version "0.2.0-beta.1" \
+    --artifacts \
+    --source-url https://example.com/EasySplat \
+    --source-commit deadbeef \
+    --release-manifest "$release_manifest" \
+    --core-archive "$metadata_fixture/core.zip" \
+    --da3-base-archive "$metadata_fixture/base.zip" \
+    --da3-small-archive "$metadata_fixture/small.zip" \
+    --fixture "$fixture" \
+    --manifest-url "$manifest_url" \
+    --public-key-file "$public_key_path" \
+    --toolchain-root "$cache" \
+    --e2e-runner "$runner" \
+    --offline-cache-root "$offline_cache" \
+    --offline-runner "$runner"
+}
 
 partial_e2e_error="$TMP_DIR/release-verifier-partial-e2e.stderr"
 if EASYSPLAT_HDIUTIL_BIN="$mock_hdiutil" \
@@ -1088,7 +985,6 @@ missing_offline_error="$TMP_DIR/release-verifier-missing-offline.stderr"
 if EASYSPLAT_HDIUTIL_BIN="$mock_hdiutil" \
   EASYSPLAT_TEST_HDIUTIL_LOG="$hdiutil_log" \
   EASYSPLAT_TEST_APP_PATH="$app_bundle" \
-  EASYSPLAT_TEST_RUNNER_LOG="$runner_log" \
   EASYSPLAT_SMOKE_SECONDS=0 \
   "$ROOT/scripts/release/verify_beta.sh" \
   --app "$app_bundle" \
@@ -1105,36 +1001,179 @@ if EASYSPLAT_HDIUTIL_BIN="$mock_hdiutil" \
   echo "Strict beta verification accepted a release without cached-offline inputs" >&2
   exit 1
 fi
-grep -Fqi 'requires a populated offline cache and runner' "$missing_offline_error"
+grep -Fqi 'requires a shared offline cache and runner' "$missing_offline_error"
 
-: >"$runner_log"
-EASYSPLAT_HDIUTIL_BIN="$mock_hdiutil" \
-EASYSPLAT_TEST_HDIUTIL_LOG="$hdiutil_log" \
-EASYSPLAT_TEST_APP_PATH="$app_bundle" \
-EASYSPLAT_TEST_RUNNER_LOG="$runner_log" \
-EASYSPLAT_SMOKE_SECONDS=0 \
-  "$ROOT/scripts/release/verify_beta.sh" \
-  --app "$app_bundle" \
-  --dmg "$beta_dmg" \
-  --expected-version "0.2.0-beta.1" \
-  --artifacts \
-  "${release_metadata_args[@]}" \
-  "${release_source_args[@]}" \
-  --fixture "$fixture" \
+arbitrary_runner_error="$TMP_DIR/release-verifier-arbitrary-runner.stderr"
+if run_strict_verifier \
+  "$beta_dmg" "$metadata_fixture/manifest.json" \
+  "$online_cache" "$online_cache" "$online_runner" \
+  >/dev/null 2>"$arbitrary_runner_error"; then
+  echo "Strict beta verification accepted an arbitrary end-to-end runner" >&2
+  exit 1
+fi
+grep -Fqi 'repository-built EasySplatReleaseVerifier' "$arbitrary_runner_error"
+
+repository_runner="$(swift build --package-path "$ROOT" -c release --show-bin-path)/EasySplatReleaseVerifier"
+mismatched_cache_error="$TMP_DIR/release-verifier-mismatched-cache.stderr"
+if run_strict_verifier \
+  "$beta_dmg" "$metadata_fixture/manifest.json" \
+  "$online_cache" "$offline_cache" "$repository_runner" \
+  >/dev/null 2>"$mismatched_cache_error"; then
+  echo "Strict beta verification accepted separate online and offline caches" >&2
+  exit 1
+fi
+grep -Fqi 'exact same toolchain cache' "$mismatched_cache_error"
+
+dirty_cache="$TMP_DIR/release-verifier-dirty-cache"
+mkdir -p "$dirty_cache"
+printf '%s' stale >"$dirty_cache/stale"
+dirty_cache_error="$TMP_DIR/release-verifier-dirty-cache.stderr"
+if run_strict_verifier \
+  "$beta_dmg" "$metadata_fixture/manifest.json" \
+  "$dirty_cache" "$dirty_cache" "$repository_runner" \
+  >/dev/null 2>"$dirty_cache_error"; then
+  echo "Strict beta verification accepted a pre-populated toolchain cache" >&2
+  exit 1
+fi
+grep -Fqi 'must start with an empty toolchain cache' "$dirty_cache_error"
+
+tampered_manifest="$TMP_DIR/tampered-manifest.json"
+python3 - "$metadata_fixture/manifest.json" "$tampered_manifest" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+manifest = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+manifest["signatureEd25519"] = "AAAA"
+Path(sys.argv[2]).write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+PY
+tampered_dmg="$TMP_DIR/EasySplat-tampered-unsigned.dmg"
+tampered_stem="${tampered_dmg%-unsigned.dmg}"
+cp "$beta_dmg" "$tampered_dmg"
+python3 "$metadata_tool" generate \
+  --app-version 0.2.0-beta.1 \
+  --toolchain-version 2.0.0 \
+  --release-mode unsigned-beta \
+  --source-url https://example.com/EasySplat \
+  --source-commit deadbeef \
+  --dmg "$tampered_dmg" \
+  --manifest "$tampered_manifest" \
   --manifest-url "$manifest_url" \
-  --public-key-file "$public_key_path" \
-  --toolchain-root "$online_cache" \
-  --e2e-runner "$online_runner" \
-  --offline-cache-root "$offline_cache" \
-  --offline-runner "$offline_runner"
-grep -F "mock-online-runner|$fixture|$manifest_url|" "$runner_log" \
-  | grep -F "|$online_cache|version=0.2.0-beta.1|offline=0|" \
-  | grep -Fq '/EasySplat.app/Contents/Resources/EasySplat_EasySplatApp.bundle/public_key_ed25519.txt'
-grep -F "mock-offline-runner|$fixture|$manifest_url|" "$runner_log" \
-  | grep -F "|$offline_cache|version=0.2.0-beta.1|offline=1|" \
-  | grep -Fq '/EasySplat.app/Contents/Resources/EasySplat_EasySplatApp.bundle/public_key_ed25519.txt'
+  --core "$metadata_fixture/core.zip" \
+  --core-url https://example.com/core.zip \
+  --da3-base "$metadata_fixture/base.zip" \
+  --da3-base-url https://example.com/base.zip \
+  --da3-small "$metadata_fixture/small.zip" \
+  --da3-small-url https://example.com/small.zip \
+  --app-license "$ROOT/LICENSE" \
+  --notice "$ROOT/NOTICE.md" \
+  --viewer-license "$ROOT/ThirdParty/MetalSplatter/LICENSE" \
+  --provenance-out "$tampered_stem.provenance.json" \
+  --spdx-out "$tampered_stem.spdx.json" \
+  --licenses-out "$tampered_stem-licenses.zip"
+(cd "$TMP_DIR" && shasum -a 256 "$(basename "$tampered_dmg")" >"$(basename "$tampered_dmg").sha256")
+(cd "$ROOT/build/Export" && zip -qry "$tampered_stem-dSYM.zip" EasySplat.app.dSYM)
+printf '%s\n' 'EasySplat 0.2.0-beta.1 is an unsigned public beta.' >"$tampered_stem-release-notes.txt"
+tampered_cache="$TMP_DIR/release-verifier-tampered-cache"
+mkdir -p "$tampered_cache"
+tampered_manifest_error="$TMP_DIR/release-verifier-tampered-manifest.stderr"
+if run_strict_verifier \
+  "$tampered_dmg" "$tampered_manifest" \
+  "$tampered_cache" "$tampered_cache" "$repository_runner" \
+  >/dev/null 2>"$tampered_manifest_error"; then
+  echo "Strict beta verification accepted a manifest with an invalid signature" >&2
+  exit 1
+fi
+grep -Fqi 'manifest signature or key identifier is invalid' "$tampered_manifest_error"
+
+mock_curl="$TMP_DIR/mock-curl.sh"
+cat >"$mock_curl" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+
+printf '%s\n' "$*" >>"$EASYSPLAT_TEST_CURL_LOG"
+output=""
+previous=""
+for argument in "$@"; do
+  case "$argument" in
+    -H|-H?*|--header|--header=*|-u|-u?*|--user|--user=*|--netrc|--netrc-*|--oauth2-bearer|--oauth2-bearer=*)
+      echo "Manifest request supplied authentication material." >&2
+      exit 3
+      ;;
+  esac
+  if [ "$previous" = "--output" ]; then
+    output="$argument"
+  fi
+  previous="$argument"
+done
+test -n "$output"
+test "${!#}" = "$EASYSPLAT_TEST_EXPECTED_MANIFEST_URL"
+case "$EASYSPLAT_TEST_CURL_MODE" in
+  missing)
+    printf '404'
+    echo "curl: (22) The requested URL returned error: 404" >&2
+    exit 22
+    ;;
+  mismatch)
+    printf '%s' '{"different":true}' >"$output"
+    printf '200'
+    ;;
+  oversize)
+    dd if=/dev/zero of="$output" bs=16777217 count=1 2>/dev/null
+    printf '200'
+    ;;
+  *) exit 4 ;;
+esac
+EOF
+chmod +x "$mock_curl"
+curl_log="$TMP_DIR/release-verifier-curl.log"
+remote_cache="$TMP_DIR/release-verifier-remote-cache"
+mkdir -p "$remote_cache"
+run_strict_manifest_probe() {
+  local mode=$1
+  EASYSPLAT_HDIUTIL_BIN="$mock_hdiutil" \
+    EASYSPLAT_CURL_BIN="$mock_curl" \
+    EASYSPLAT_TEST_CURL_LOG="$curl_log" \
+    EASYSPLAT_TEST_CURL_MODE="$mode" \
+    EASYSPLAT_TEST_EXPECTED_MANIFEST_URL="$manifest_url" \
+    run_strict_verifier \
+    "$beta_dmg" "$metadata_fixture/manifest.json" \
+    "$remote_cache" "$remote_cache" "$repository_runner"
+}
+missing_remote_manifest_error="$TMP_DIR/release-verifier-remote-404.stderr"
+if run_strict_manifest_probe missing >/dev/null 2>"$missing_remote_manifest_error"; then
+  echo "Strict beta verification accepted a missing published manifest" >&2
+  exit 1
+fi
+grep -Fqi 'Published toolchain manifest HTTPS GET failed (HTTP 404)' "$missing_remote_manifest_error"
+grep -Fq -- '--disable' "$curl_log"
+grep -Fq -- '--proto =https' "$curl_log"
+grep -Fq -- '--max-filesize 16777216' "$curl_log"
+grep -Fq "$manifest_url" "$curl_log"
+
+mismatched_remote_manifest_error="$TMP_DIR/release-verifier-remote-mismatch.stderr"
+if run_strict_manifest_probe mismatch >/dev/null 2>"$mismatched_remote_manifest_error"; then
+  echo "Strict beta verification accepted different published manifest bytes" >&2
+  exit 1
+fi
+grep -Fqi 'bytes differ from the locally verified signed manifest' "$mismatched_remote_manifest_error"
+
+oversized_remote_manifest_error="$TMP_DIR/release-verifier-remote-oversize.stderr"
+if run_strict_manifest_probe oversize >/dev/null 2>"$oversized_remote_manifest_error"; then
+  echo "Strict beta verification accepted a published manifest larger than 16 MiB" >&2
+  exit 1
+fi
+grep -Fqi 'exceeds the 16 MiB release limit' "$oversized_remote_manifest_error"
 grep -q '^attach ' "$hdiutil_log"
 grep -q '^detach ' "$hdiutil_log"
+
+grep -Fq 'detailProfile: .balanced,' "$ROOT/Tools/ReleaseVerifier/main.swift"
+grep -Fq 'resourcePolicy: .automatic,' "$ROOT/Tools/ReleaseVerifier/main.swift"
+if rg -n 'detailProfile: \.fast|resourcePolicy: \.conserveMemory' \
+  "$ROOT/Tools/ReleaseVerifier/main.swift" >/dev/null; then
+  echo "Release verifier still exercises a reduced profile instead of the app default." >&2
+  exit 1
+fi
 
 app_workflow="$ROOT/.github/workflows/release-app.yml"
 grep -Fq 'workflow_dispatch:' "$app_workflow"
@@ -1259,115 +1298,20 @@ metadata_verify_line="$(grep -n -m1 'generate_release_metadata.py" verify-toolch
 app_build_line="$(grep -n -m1 'build_app.sh"' "$ROOT/scripts/release/build_dmg.sh" | cut -d: -f1)"
 test -n "$metadata_verify_line"
 test "$metadata_verify_line" -lt "$app_build_line"
-grep -q 'scripts/toolchain/build_colmap.sh' "$ROOT/.github/workflows/toolchain-build.yml"
-grep -q 'scripts/toolchain/build_suitesparse.sh' "$ROOT/.github/workflows/toolchain-build.yml"
-grep -q 'scripts/toolchain/build_ceres.sh' "$ROOT/.github/workflows/toolchain-build.yml"
-grep -q 'scripts/toolchain/build_openimageio.sh' "$ROOT/.github/workflows/toolchain-build.yml"
-grep -Fq 'SUITESPARSE_COMMIT="42151688813c45846a597edcb601435a0e38f3dd"' "$ROOT/scripts/toolchain/build_suitesparse.sh"
-grep -Fq 'SUITESPARSE_VERSION="7.12.2"' "$ROOT/scripts/toolchain/build_suitesparse.sh"
-grep -Fq -- '-DSUITESPARSE_ENABLE_PROJECTS=suitesparse_config;amd;colamd;cholmod' "$ROOT/scripts/toolchain/build_suitesparse.sh"
-grep -Fq -- '-DCHOLMOD_GPL=OFF' "$ROOT/scripts/toolchain/build_suitesparse.sh"
-grep -Fq -- '-DCHOLMOD_CAMD=OFF' "$ROOT/scripts/toolchain/build_suitesparse.sh"
-grep -Fq -- '-DCHOLMOD_PARTITION=OFF' "$ROOT/scripts/toolchain/build_suitesparse.sh"
-grep -Fq -- '-DSUITESPARSE_USE_CUDA=OFF' "$ROOT/scripts/toolchain/build_suitesparse.sh"
-grep -Fq -- '-DSUITESPARSE_USE_FORTRAN=OFF' "$ROOT/scripts/toolchain/build_suitesparse.sh"
-grep -Fq 'prune_forbidden_sources' "$ROOT/scripts/toolchain/build_suitesparse.sh"
-grep -Fq -- '-DSUITESPARSE_DEMOS=OFF' "$ROOT/scripts/toolchain/build_suitesparse.sh"
-grep -Fq -- '-DBUILD_SHARED_LIBS=ON' "$ROOT/scripts/toolchain/build_suitesparse.sh"
-grep -Fq -- '-DBUILD_STATIC_LIBS=OFF' "$ROOT/scripts/toolchain/build_suitesparse.sh"
-grep -Fq 'CERES_COMMIT="85331393dc0dff09f6fb9903ab0c4bfa3e134b01"' "$ROOT/scripts/toolchain/build_ceres.sh"
-grep -Fq 'CERES_VERSION="2.2.0"' "$ROOT/scripts/toolchain/build_ceres.sh"
-grep -Fq 'EIGEN_COMMIT="3147391d946bb4b6c68edd901f2add6ac1f31f8c"' "$ROOT/scripts/toolchain/build_ceres.sh"
-grep -Fq 'EIGEN_VERSION="3.4.0"' "$ROOT/scripts/toolchain/build_ceres.sh"
-for option in \
-  '-DSUITESPARSE=OFF' \
-  '-DACCELERATESPARSE=ON' \
-  '-DEIGENSPARSE=ON' \
-  '-DUSE_CUDA=OFF' \
-  '-DMINIGLOG=ON' \
-  '-DGFLAGS=OFF' \
-  '-DBUILD_EXAMPLES=OFF' \
-  '-DBUILD_BENCHMARKS=OFF' \
-  '-DBUILD_SHARED_LIBS=ON'; do
-  grep -Fq -- "$option" "$ROOT/scripts/toolchain/build_ceres.sh"
-done
-grep -Fq 'OIIO_COMMIT="f32bf6e6f8de38ab6d197a72fd72366b66fd30a3"' "$ROOT/scripts/toolchain/build_openimageio.sh"
-grep -Fq 'OIIO_VERSION="2.5.19.1"' "$ROOT/scripts/toolchain/build_openimageio.sh"
-grep -Fq 'FMT_COMMIT="a0b8a92e3d1532361c2f7feb63babc5c18d00ef2"' "$ROOT/scripts/toolchain/build_openimageio.sh"
-grep -Fq 'ROBINMAP_COMMIT="908ccf9f039a0e50813544c0444ca664ca292d7c"' "$ROOT/scripts/toolchain/build_openimageio.sh"
-grep -Fq 'PUGIXML_COMMIT="314baf6605143f1e837209008f490e8559529e1c"' "$ROOT/scripts/toolchain/build_openimageio.sh"
-for option in \
-  '-DCMAKE_OSX_DEPLOYMENT_TARGET=15.0' \
-  '-DCMAKE_CXX_STANDARD:STRING=17' \
-  '-DBUILD_SHARED_LIBS:BOOL=ON' \
-  '-DEMBEDPLUGINS:BOOL=ON' \
-  '-DOIIO_BUILD_TOOLS:BOOL=OFF' \
-  '-DOIIO_BUILD_TESTS:BOOL=OFF' \
-  '-DBUILD_DOCS:BOOL=OFF' \
-  '-DINSTALL_FONTS:BOOL=OFF' \
-  '-DUSE_PYTHON:BOOL=OFF' \
-  '-DUSE_OPENCOLORIO:BOOL=OFF' \
-  '-DUSE_OPENCV:BOOL=OFF' \
-  '-DUSE_TBB:BOOL=OFF' \
-  '-DUSE_FFMPEG:BOOL=OFF' \
-  '-DUSE_LIBHEIF:BOOL=OFF' \
-  '-DUSE_LIBRAW:BOOL=OFF' \
-  '-DUSE_OPENJPEG:BOOL=OFF' \
-  '-DUSE_OPENVDB:BOOL=OFF' \
-  '-DUSE_PTEX:BOOL=OFF' \
-  '-DUSE_WEBP:BOOL=OFF' \
-  '-DUSE_FREETYPE:BOOL=OFF'; do
-  grep -Fq -- "$option" "$ROOT/scripts/toolchain/build_openimageio.sh"
-done
-grep -Fq 'allowed = {"jpeg", "openexr", "png", "tiff"}' "$ROOT/scripts/toolchain/build_openimageio.sh"
-grep -Fq 'COLMAP_COMMIT="fa8e3b3ff591552855f8ad2806723c80f963f69c"' "$ROOT/scripts/toolchain/build_colmap.sh"
-grep -Fq 'COLMAP_VERSION="4.1.0"' "$ROOT/scripts/toolchain/build_colmap.sh"
-grep -Fq 'git -C "$SRC" checkout --detach --force "$COLMAP_COMMIT"' "$ROOT/scripts/toolchain/build_colmap.sh"
-grep -Fq 'install -m 0644 "$SRC/COPYING.txt" "$INSTALL/licenses/COLMAP/COPYING.txt"' "$ROOT/scripts/toolchain/build_colmap.sh"
-grep -Fq 'POSELIB_SHA256="5408d4ae8ce367cb2f076bc6c5f0f6f78abd3573d2c015304b04e46f23455f5b"' "$ROOT/scripts/toolchain/build_colmap.sh"
-grep -Fq 'FAISS_SHA256="4b1ae7e7a0a46385b4084f0e3945623a15fcf99d793bf44d82aae8e24f11e5f5"' "$ROOT/scripts/toolchain/build_colmap.sh"
-for option in \
-  '-DGUI_ENABLED=OFF' \
-  '-DCUDA_ENABLED=OFF' \
-  '-DOPENGL_ENABLED=OFF' \
-  '-DMVS_ENABLED=OFF' \
-  '-DCGAL_ENABLED=OFF' \
-  '-DLSD_ENABLED=OFF' \
-  '-DONNX_ENABLED=OFF' \
-  '-DFETCH_ONNX=OFF' \
-  '-DDOWNLOAD_ENABLED=OFF' \
-  '-DCASPAR_ENABLED=OFF' \
-  '-DTESTS_ENABLED=OFF'; do
-  grep -Fq -- "$option" "$ROOT/scripts/toolchain/build_colmap.sh"
-done
-grep -Fq -- '-DCeres_DIR="$CERES_INSTALL/lib/cmake/Ceres"' "$ROOT/scripts/toolchain/build_colmap.sh"
-grep -Fq -- '-DCHOLMOD_LIBRARY_DIR_HINTS="$SUITESPARSE_INSTALL/lib"' "$ROOT/scripts/toolchain/build_colmap.sh"
-grep -Fq 'assert_permissive_closure' "$ROOT/scripts/toolchain/build_colmap.sh"
 grep -q 'scripts/toolchain/build_msplat.sh' "$ROOT/.github/workflows/toolchain-build.yml"
 grep -q 'scripts/toolchain/build_da3_mps.sh' "$ROOT/.github/workflows/toolchain-build.yml"
 toolchain_workflow="$ROOT/.github/workflows/toolchain-build.yml"
-suitesparse_line="$(grep -n -m1 'scripts/toolchain/build_suitesparse.sh' "$toolchain_workflow" | cut -d: -f1)"
-ceres_line="$(grep -n -m1 'scripts/toolchain/build_ceres.sh' "$toolchain_workflow" | cut -d: -f1)"
-openimageio_line="$(grep -n -m1 'scripts/toolchain/build_openimageio.sh' "$toolchain_workflow" | cut -d: -f1)"
-colmap_line="$(grep -n -m1 'scripts/toolchain/build_colmap.sh' "$toolchain_workflow" | cut -d: -f1)"
-test "$suitesparse_line" -lt "$ceres_line"
-test "$ceres_line" -lt "$colmap_line"
-test "$openimageio_line" -lt "$colmap_line"
-if rg -n 'brew install .*\b(suitesparse|ceres-solver|cgal|freeimage|openimageio|qt)\b' \
-  "$ROOT/.github/workflows/toolchain-build.yml" >/dev/null; then
-  echo "Toolchain workflow must not install prebuilt native builders or disabled dependencies." >&2
+if rg -n 'Homebrew|verify_homebrew_lock|build_(colmap|suitesparse|ceres|openimageio)\.sh' \
+  "$toolchain_workflow" "$ROOT/scripts/run.sh" >/dev/null; then
+  echo "Release and local launch paths still require the removed native COLMAP/Homebrew closure." >&2
   exit 1
 fi
-grep -Fq 'python3 scripts/toolchain/verify_homebrew_lock.py source' \
-  "$ROOT/.github/workflows/toolchain-build.yml"
-grep -Fq 'brew install --build-from-source "$formula"' \
-  "$ROOT/.github/workflows/toolchain-build.yml"
-grep -Fq 'brew reinstall --build-from-source "$formula"' \
-  "$ROOT/.github/workflows/toolchain-build.yml"
-grep -Fq 'python3 scripts/toolchain/verify_homebrew_lock.py installed' \
-  "$ROOT/.github/workflows/toolchain-build.yml"
-grep -q 'colmap" global_mapper -h' "$ROOT/scripts/toolchain/package_toolchain.sh"
+grep -q 'colmap" mapper -h' "$ROOT/scripts/toolchain/package_toolchain.sh"
 grep -q 'colmap" image_undistorter -h' "$ROOT/scripts/toolchain/package_toolchain.sh"
+if grep -q 'colmap" global_mapper -h' "$ROOT/scripts/toolchain/package_toolchain.sh"; then
+  echo "Toolchain package probes the removed global_mapper facade." >&2
+  exit 1
+fi
 grep -q 'DA3_SOURCE_DESCRIPTOR="git:${DA3_REPO}@${DA3_SOURCE_COMMIT}"' "$ROOT/scripts/toolchain/build_da3_mps.sh"
 grep -q 'MSPLAT_COMMIT="106499b0a53f82b0c92d013b0861fbebd341b17e"' "$ROOT/scripts/toolchain/build_msplat.sh"
 grep -q 'MSPLAT_VERSION="1\.1\.3"' "$ROOT/scripts/toolchain/build_msplat.sh"
@@ -1385,6 +1329,14 @@ if grep -Eqi 'pip install|python-build-standalone|site-packages|_core\.so|core_e
   exit 1
 fi
 grep -q '^numpy==2\.3\.5$' "$ROOT/Tools/Da3Sfm/requirements.in"
+if rg -n 'opencv-python-headless|\bcv2\b' \
+  "$ROOT/Tools/Da3Sfm/requirements.in" \
+  "$ROOT/Tools/Da3Sfm/requirements.txt" \
+  "$ROOT/Tools/Da3Sfm/easysplat_da3_sfm" \
+  "$ROOT/scripts/toolchain/package_toolchain.sh" >/dev/null; then
+  echo "Lean DA3/COLMAP runtime still includes OpenCV." >&2
+  exit 1
+fi
 # This asserts the requirements continuation backslash.
 # shellcheck disable=SC1003
 grep -q '^numpy==2\.3\.5 \\' "$ROOT/Tools/Da3Sfm/requirements.txt"
@@ -1411,38 +1363,31 @@ if grep -Fq '"$DA3_SOURCE/" "$DA3_VENDOR/"' "$ROOT/scripts/toolchain/build_da3_m
   exit 1
 fi
 grep -Fq 'test ! -e "$DA3_VENDOR/da3_streaming"' "$ROOT/scripts/toolchain/build_da3_mps.sh"
-grep -q 'resolve_rpath_dependency_for' "$ROOT/scripts/toolchain/package_toolchain.sh"
 grep -q 'require_bundled_arm64_python "da3_mps" "$DA3_PY_BIN"' "$ROOT/scripts/toolchain/package_toolchain.sh"
-grep -Fq 'cp "$OPENIMAGEIO_INSTALL/build_info.json" "$PROVENANCE/openimageio.json"' "$ROOT/scripts/toolchain/package_toolchain.sh"
-grep -Fq 'cp -R "$OPENIMAGEIO_INSTALL/licenses/." "$LICENSES/"' "$ROOT/scripts/toolchain/package_toolchain.sh"
-grep -Fq 'copy_dependency_to_lib "$OPENIMAGEIO_INSTALL/lib/libOpenImageIO.2.5.dylib" "$BIN/colmap"' "$ROOT/scripts/toolchain/package_toolchain.sh"
-grep -Fq 'copy_dependency_to_lib "$OPENIMAGEIO_INSTALL/lib/libOpenImageIO_Util.2.5.dylib" "$BIN/colmap"' "$ROOT/scripts/toolchain/package_toolchain.sh"
-grep -Fq 'normalize_bundle_rpaths' "$ROOT/scripts/toolchain/package_toolchain.sh"
-grep -Fq 'reject_forbidden_image_dependencies' "$ROOT/scripts/toolchain/package_toolchain.sh"
-grep -Fq '/usr/bin/codesign --force --sign - --timestamp=none "$file"' "$ROOT/scripts/toolchain/package_toolchain.sh"
+grep -Fq 'find "$OUT/da3_mps/python" -type f -name '\''*.pyc'\'' -delete' "$ROOT/scripts/toolchain/package_toolchain.sh"
+grep -Fq 'find "$OUT/da3_mps/python" -type d -name '\''__pycache__'\'' -empty -delete' "$ROOT/scripts/toolchain/package_toolchain.sh"
 grep -Fq '/usr/bin/codesign --verify --strict "$file"' "$ROOT/scripts/toolchain/package_toolchain.sh"
-grep -Fq 'done < <(find "$OUT" -type f -print0)' "$ROOT/scripts/toolchain/package_toolchain.sh"
-grep -Fq 'for file in "${dylibs[@]}" "${other_machos[@]}"; do' "$ROOT/scripts/toolchain/package_toolchain.sh"
-for dependency in x264 x265 aom dav1d vpx svtav1 theora vorbis; do
-  grep -Fq "$dependency" "$ROOT/scripts/toolchain/package_toolchain.sh"
-done
-grep -Fq 'refresh_packaged_msplat_hash' "$ROOT/scripts/toolchain/package_toolchain.sh"
-bundle_line="$(grep -n -m1 '^bundle_toolchain_dependency_closure$' "$ROOT/scripts/toolchain/package_toolchain.sh" | cut -d: -f1)"
-normalize_line="$(grep -n -m1 '^normalize_bundle_rpaths$' "$ROOT/scripts/toolchain/package_toolchain.sh" | cut -d: -f1)"
-sign_line="$(grep -n -m1 '^ad_hoc_sign_packaged_machos$' "$ROOT/scripts/toolchain/package_toolchain.sh" | cut -d: -f1)"
-validate_line="$(grep -n -m1 '^validate_portable_dependency_references$' "$ROOT/scripts/toolchain/package_toolchain.sh" | cut -d: -f1)"
-launch_line="$(grep -n -m1 '^"$BIN/colmap" global_mapper -h' "$ROOT/scripts/toolchain/package_toolchain.sh" | cut -d: -f1)"
+if grep -Fq '/usr/bin/codesign --force' "$ROOT/scripts/toolchain/package_toolchain.sh" || \
+   grep -Fq 'lipo -thin' "$ROOT/scripts/toolchain/package_toolchain.sh"; then
+  echo "Toolchain packaging mutates signed wheel Mach-Os and invalidates RECORD hashes." >&2
+  exit 1
+fi
+architecture_line="$(grep -n -m1 '^validate_packaged_architectures$' "$ROOT/scripts/toolchain/package_toolchain.sh" | cut -d: -f1)"
+portable_line="$(grep -n -m1 '^validate_portable_dependencies$' "$ROOT/scripts/toolchain/package_toolchain.sh" | cut -d: -f1)"
+verify_line="$(grep -n -m1 '^verify_packaged_signatures$' "$ROOT/scripts/toolchain/package_toolchain.sh" | cut -d: -f1)"
+receipt_line="$(grep -n -m1 '^write_colmap_provenance$' "$ROOT/scripts/toolchain/package_toolchain.sh" | cut -d: -f1)"
+launch_line="$(grep -n -m1 '^"$BIN/colmap" -h' "$ROOT/scripts/toolchain/package_toolchain.sh" | cut -d: -f1)"
 # This asserts the command continuation backslash.
 # shellcheck disable=SC1003
 supply_line="$(grep -n -m1 '^"$SUPPLY_CHAIN_GENERATOR" \\' "$ROOT/scripts/toolchain/package_toolchain.sh" | cut -d: -f1)"
-test "$bundle_line" -lt "$normalize_line"
-test "$normalize_line" -lt "$sign_line"
-test "$sign_line" -lt "$validate_line"
-test "$validate_line" -lt "$launch_line"
+test "$architecture_line" -lt "$portable_line"
+test "$portable_line" -lt "$verify_line"
+test "$verify_line" -lt "$receipt_line"
+test "$receipt_line" -lt "$launch_line"
 test "$launch_line" -lt "$supply_line"
-grep -Fq 'zip -r -D "$CORE_ZIP"' "$ROOT/scripts/toolchain/package_toolchain.sh"
-grep -Fq 'zip -r -D "$DA3_BASE_ZIP" da3_mps/models/DA3-BASE' "$ROOT/scripts/toolchain/package_toolchain.sh"
-grep -Fq 'zip -r -D "$DA3_SMALL_ZIP" da3_mps/models/DA3-SMALL' "$ROOT/scripts/toolchain/package_toolchain.sh"
+grep -Fq 'zip -q -r -D "$CORE_ZIP"' "$ROOT/scripts/toolchain/package_toolchain.sh"
+grep -Fq 'zip -q -r -D "$DA3_BASE_ZIP" da3_mps/models/DA3-BASE' "$ROOT/scripts/toolchain/package_toolchain.sh"
+grep -Fq 'zip -q -r -D "$DA3_SMALL_ZIP" da3_mps/models/DA3-SMALL' "$ROOT/scripts/toolchain/package_toolchain.sh"
 grep -Fq 'MAX_RELEASE_ASSET_BYTES=2147483648' "$ROOT/scripts/toolchain/package_toolchain.sh"
 grep -Fq 'MAX_NORMAL_PHOTO_INSTALL_BYTES=2500000000' "$ROOT/scripts/toolchain/package_toolchain.sh"
 grep -Fq 'assert_release_asset_size "$CORE_ZIP"' "$ROOT/scripts/toolchain/package_toolchain.sh"
@@ -1450,22 +1395,16 @@ grep -Fq 'assert_release_asset_size "$DA3_BASE_ZIP"' "$ROOT/scripts/toolchain/pa
 grep -Fq 'assert_release_asset_size "$DA3_SMALL_ZIP"' "$ROOT/scripts/toolchain/package_toolchain.sh"
 grep -Fq 'assert_normal_photo_install_size "$CORE_ZIP" "$DA3_BASE_ZIP" "$DA3_SMALL_ZIP"' "$ROOT/scripts/toolchain/package_toolchain.sh"
 grep -Fq 'licenses provenance supply-chain/components.json' "$ROOT/scripts/toolchain/package_toolchain.sh"
-grep -Fq '"openimageio": native(' "$ROOT/scripts/toolchain/generate_supply_chain_manifest.py"
-grep -Fq '"openimageio:fmt"' "$ROOT/scripts/toolchain/generate_supply_chain_manifest.py"
-grep -Fq '"openimageio:pugixml"' "$ROOT/scripts/toolchain/generate_supply_chain_manifest.py"
-grep -Fq '"openimageio:robin-map"' "$ROOT/scripts/toolchain/generate_supply_chain_manifest.py"
-grep -Fq '"colmap:faiss"' "$ROOT/scripts/toolchain/generate_supply_chain_manifest.py"
-grep -Fq '"colmap:poselib"' "$ROOT/scripts/toolchain/generate_supply_chain_manifest.py"
-grep -Fq '"colmap:poissonrecon"' "$ROOT/scripts/toolchain/generate_supply_chain_manifest.py"
-grep -Fq '"colmap:vlfeat"' "$ROOT/scripts/toolchain/generate_supply_chain_manifest.py"
-grep -Fq '/Toolchains/build/openimageio/install/' "$ROOT/scripts/toolchain/generate_supply_chain_manifest.py"
-if grep -Fq 'colmap:vendored-static' "$ROOT/scripts/toolchain/generate_supply_chain_manifest.py"; then
-  echo "Supply-chain inventory still collapses COLMAP dependencies into one component." >&2
+grep -Fq '"easysplat-colmap-bridge"' "$ROOT/scripts/toolchain/generate_supply_chain_manifest.py"
+grep -Fq '"python:pycolmap"' "$ROOT/scripts/toolchain/generate_supply_chain_manifest.py"
+if rg -n 'homebrewBuild|COLMAP_INSTALL|CERES_INSTALL|SUITESPARSE_INSTALL|OPENIMAGEIO_INSTALL|colmap:(faiss|poselib|poissonrecon|vlfeat)|openimageio:' \
+  "$ROOT/scripts/toolchain/package_toolchain.sh" \
+  "$ROOT/scripts/toolchain/generate_supply_chain_manifest.py" >/dev/null; then
+  echo "Lean toolchain packaging still references the removed native/Homebrew closure." >&2
   exit 1
 fi
 grep -Fq -- '--da3-base-zip "$DA3_BASE_ZIP"' "$ROOT/scripts/run.sh"
 grep -Fq -- '--da3-small-zip "$DA3_SMALL_ZIP"' "$ROOT/scripts/run.sh"
-grep -Fq 'test -x "$ROOT/Toolchains/build/colmap/install/bin/colmap" || "$ROOT/scripts/toolchain/build_colmap.sh"' "$ROOT/scripts/run.sh"
 grep -Fq 'ensure_msplat_bundle' "$ROOT/scripts/run.sh"
 grep -Fq 'ensure_da3_mps_bundle' "$ROOT/scripts/run.sh"
 
@@ -1542,8 +1481,8 @@ if grep -E '^[A-Z0-9_]+_URL="http://' "$ROOT/scripts/toolchain/build_msplat.sh";
 fi
 
 msplat_source="$ROOT/Toolchains/build/msplat/install/msplat"
-if [ -d "$msplat_source" ]; then
-  "$msplat_validator" --source "$msplat_source"
+if [ -d "$msplat_source" ] && \
+   "$msplat_validator" --source "$msplat_source" >/dev/null 2>&1; then
 
   packaged_fixture="$TMP_DIR/native-msplat-packaged"
   mkdir -p "$packaged_fixture/bin" "$packaged_fixture/msplat"

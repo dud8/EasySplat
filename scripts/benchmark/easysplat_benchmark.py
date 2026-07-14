@@ -44,6 +44,7 @@ RELEASE_CATEGORY_COUNTS = {
 ALLOWED_SCALE_LANES = {30, 120, 250, 500, 3_000}
 ALLOWED_ADAPTERS = {"fixture", "protected-evidence"}
 APP_VERSION = "0.2.0-beta.1"
+MAX_TOOLCHAIN_INSTALL_STATE_BYTES = 16 * 1024 * 1024
 SHA256_PATTERN = re.compile(r"^sha256:[0-9a-f]{64}$")
 SAFE_TOKEN_PATTERN = re.compile(r"^[a-z0-9][a-z0-9_.-]{0,63}$")
 ARTIFACT_NAME_PATTERN = re.compile(r"^[a-z][a-z0-9_]*$")
@@ -833,7 +834,7 @@ def _validated_toolchain_closure(toolchain_root: Path) -> Mapping[str, Any] | No
     state_path = toolchain_root / ".easysplat_toolchain_state.json"
     manifest_path = toolchain_root / "manifest.json"
     if state_path.is_file() and not state_path.is_symlink():
-        if state_path.stat().st_size > 1024 * 1024:
+        if state_path.stat().st_size > MAX_TOOLCHAIN_INSTALL_STATE_BYTES:
             raise ConfigError("toolchain install state exceeds its size limit")
         state = _load_json(state_path, "toolchain install state")
         if not isinstance(state, dict):

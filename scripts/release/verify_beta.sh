@@ -22,10 +22,14 @@ SOURCE_URL=""
 SOURCE_COMMIT=""
 ALLOW_INCOMPLETE=0
 HDIUTIL_BIN="${EASYSPLAT_HDIUTIL_BIN:-hdiutil}"
+CURL_BIN="${EASYSPLAT_CURL_BIN:-/usr/bin/curl}"
+EXPECTED_RELEASE_RUNNER=""
 MOUNT_DIR=""
 MOUNT_ATTACHED=0
 E2E_DIR=""
 SMOKE_LOG=""
+REMOTE_MANIFEST=""
+MAX_PUBLISHED_MANIFEST_BYTES=16777216
 
 usage() {
   echo "Usage: verify_beta.sh --app <app> --dmg <dmg> --expected-version <semver> --artifacts --source-url <https-url> --source-commit <sha> --fixture <media> --manifest-url <https-url> --public-key-file <file> --toolchain-root <dir> --e2e-runner <executable> --offline-cache-root <dir> --offline-runner <executable>"
@@ -38,6 +42,7 @@ cleanup() {
   [ -z "$MOUNT_DIR" ] || rm -rf "$MOUNT_DIR"
   [ -z "$E2E_DIR" ] || rm -rf "$E2E_DIR"
   [ -z "$SMOKE_LOG" ] || rm -f "$SMOKE_LOG"
+  [ -z "$REMOTE_MANIFEST" ] || rm -f "$REMOTE_MANIFEST"
 }
 trap cleanup EXIT
 
@@ -84,6 +89,122 @@ if [ "$VERIFY_ARTIFACTS" -eq 1 ] && { [ -z "$SOURCE_URL" ] || [ -z "$SOURCE_COMM
   exit 1
 fi
 
+canonical_path() {
+  python3 - "$1" <<'PY'
+import os
+import sys
+
+print(os.path.realpath(sys.argv[1]))
+PY
+}
+
+manifest_component_url() {
+  python3 - "$1" "$2" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+manifest = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+matches = [row.get("url") for row in manifest.get("components", []) if row.get("name") == sys.argv[2]]
+if len(matches) != 1 or not isinstance(matches[0], str) or not matches[0]:
+    raise SystemExit(f"Signed manifest has no unique URL for {sys.argv[2]}.")
+if "\n" in matches[0] or "\r" in matches[0]:
+    raise SystemExit(f"Signed manifest URL contains a line break for {sys.argv[2]}.")
+print(matches[0])
+PY
+}
+
+verify_signed_toolchain_closure() {
+  local toolchain_version=$1
+  local core_url
+  local base_url
+  local small_url
+  core_url="$(manifest_component_url "$RELEASE_MANIFEST" macos-arm64-core)"
+  base_url="$(manifest_component_url "$RELEASE_MANIFEST" geometry-da3-base)"
+  small_url="$(manifest_component_url "$RELEASE_MANIFEST" geometry-da3-small)"
+  swift run --package-path "$ROOT/Tools/ManifestTool" ManifestTool verify-release \
+    --manifest "$RELEASE_MANIFEST" \
+    --public-key-file "$EFFECTIVE_PUBLIC_KEY_FILE" \
+    --toolchain-version "$toolchain_version" \
+    --app-version "$EXPECTED_VERSION" \
+    --core-zip "$CORE_ARCHIVE" \
+    --core-url "$core_url" \
+    --da3-base-zip "$DA3_BASE_ARCHIVE" \
+    --da3-base-url "$base_url" \
+    --da3-small-zip "$DA3_SMALL_ARCHIVE" \
+    --da3-small-url "$small_url"
+}
+
+fetch_and_compare_published_manifest() {
+  local http_status=""
+  local size
+  python3 - "$EFFECTIVE_MANIFEST_URL" <<'PY'
+import sys
+from urllib.parse import urlsplit
+
+url = urlsplit(sys.argv[1])
+if url.scheme.lower() != "https" or not url.hostname or url.username is not None or url.password is not None:
+    raise SystemExit("Published toolchain manifest URL must be credential-free HTTPS.")
+PY
+  REMOTE_MANIFEST="$(mktemp "${TMPDIR:-/tmp}/easysplat-published-manifest.XXXXXX")"
+  if ! http_status="$("$CURL_BIN" --disable \
+    --fail \
+    --silent \
+    --show-error \
+    --location \
+    --proto '=https' \
+    --proto-redir '=https' \
+    --max-redirs 3 \
+    --max-filesize "$MAX_PUBLISHED_MANIFEST_BYTES" \
+    --request GET \
+    --write-out '%{http_code}' \
+    --output "$REMOTE_MANIFEST" \
+    "$EFFECTIVE_MANIFEST_URL")"; then
+    echo "Published toolchain manifest HTTPS GET failed (HTTP ${http_status:-unknown})." >&2
+    return 1
+  fi
+  if [ "$http_status" != "200" ]; then
+    echo "Published toolchain manifest HTTPS GET failed (HTTP $http_status)." >&2
+    return 1
+  fi
+  size="$(wc -c <"$REMOTE_MANIFEST" | tr -d '[:space:]')"
+  if [ "$size" -gt "$MAX_PUBLISHED_MANIFEST_BYTES" ]; then
+    echo "Published toolchain manifest exceeds the 16 MiB release limit." >&2
+    return 1
+  fi
+  if ! cmp -s "$REMOTE_MANIFEST" "$RELEASE_MANIFEST"; then
+    echo "Published toolchain manifest bytes differ from the locally verified signed manifest." >&2
+    return 1
+  fi
+}
+
+if [ "$ALLOW_INCOMPLETE" -eq 0 ]; then
+  if [ ! -e "$E2E_FIXTURE" ] || [ ! -d "$TOOLCHAIN_ROOT" ] || [ -z "$E2E_RUNNER" ] \
+    || [ -z "$MANIFEST_URL" ] || [ ! -f "$PUBLIC_KEY_FILE" ]; then
+    echo "Release verification requires an end-to-end fixture, installed toolchain, and runner." >&2
+    exit 1
+  fi
+  if [ ! -d "$OFFLINE_CACHE_ROOT" ] || [ -z "$OFFLINE_RUNNER" ]; then
+    echo "Release verification requires a shared offline cache and runner." >&2
+    exit 1
+  fi
+
+  EXPECTED_RELEASE_RUNNER="$(swift build --package-path "$ROOT" -c release --show-bin-path)/EasySplatReleaseVerifier"
+  if [ "$(canonical_path "$E2E_RUNNER")" != "$(canonical_path "$EXPECTED_RELEASE_RUNNER")" ] \
+    || [ "$(canonical_path "$OFFLINE_RUNNER")" != "$(canonical_path "$EXPECTED_RELEASE_RUNNER")" ]; then
+    echo "Strict release verification requires the repository-built EasySplatReleaseVerifier for both runs." >&2
+    exit 1
+  fi
+  if [ "$(canonical_path "$TOOLCHAIN_ROOT")" != "$(canonical_path "$OFFLINE_CACHE_ROOT")" ]; then
+    echo "Online and offline release verification must use the exact same toolchain cache." >&2
+    exit 1
+  fi
+  if find "$TOOLCHAIN_ROOT" -mindepth 1 -print -quit | grep -q .; then
+    echo "Release verification must start with an empty toolchain cache." >&2
+    exit 1
+  fi
+fi
+
 SEMVER_RE='^[0-9]+\.[0-9]+\.[0-9]+-[0-9A-Za-z.-]+(\+[0-9A-Za-z.-]+)?$'
 if ! [[ "$EXPECTED_VERSION" =~ $SEMVER_RE ]]; then
   echo "Public beta version must be a semantic prerelease: $EXPECTED_VERSION" >&2
@@ -118,6 +239,19 @@ verify_arm64_executable() {
   fi
   if [ "$architectures" != "arm64" ]; then
     echo "$label executable must contain exactly arm64 (found: $architectures)." >&2
+    return 1
+  fi
+}
+
+verify_matching_executable_hashes() {
+  local release_executable=$1
+  local mounted_executable=$2
+  local release_sha256
+  local mounted_sha256
+  release_sha256="$(/usr/bin/shasum -a 256 "$release_executable" | awk '{ print $1 }')"
+  mounted_sha256="$(/usr/bin/shasum -a 256 "$mounted_executable" | awk '{ print $1 }')"
+  if [ "$release_sha256" != "$mounted_sha256" ]; then
+    echo "Mounted app executable SHA-256 does not match release app executable." >&2
     return 1
   fi
 }
@@ -240,6 +374,7 @@ DISTRIBUTED_EXECUTABLE="$DISTRIBUTED_APP/Contents/MacOS/EasySplatApp"
 [ -d "$DISTRIBUTED_APP" ] && [ -x "$DISTRIBUTED_EXECUTABLE" ]
 verify_arm64_executable "Mounted app" "$DISTRIBUTED_EXECUTABLE"
 verify_adhoc_bundle "$DISTRIBUTED_APP"
+verify_matching_executable_hashes "$EXECUTABLE" "$DISTRIBUTED_EXECUTABLE"
 [ -s "$DISTRIBUTED_APP/Contents/Resources/Licenses/EasySplat-LICENSE.txt" ]
 [ -s "$DISTRIBUTED_APP/Contents/Resources/Licenses/EasySplat-NOTICE.md" ]
 [ -s "$DISTRIBUTED_APP/Contents/Resources/Licenses/MetalSplatter-LICENSE.txt" ]
@@ -298,6 +433,10 @@ PY
     --provenance "$PROVENANCE" \
     --spdx "$SBOM" \
     --licenses "$LICENSES"
+  if [ "$ALLOW_INCOMPLETE" -eq 0 ]; then
+    verify_signed_toolchain_closure "$TOOLCHAIN_VERSION"
+    fetch_and_compare_published_manifest
+  fi
   unzip -tq "$DSYM" >/dev/null
   grep -Fqi 'unsigned public beta' "$RELEASE_NOTES"
   if grep -Fqi 'production-ready' "$RELEASE_NOTES"; then
@@ -358,6 +497,15 @@ else
 fi
 
 if [ -n "$E2E_FIXTURE" ] || [ -n "$TOOLCHAIN_ROOT" ] || [ -n "$E2E_RUNNER" ]; then
+  if [ "$ALLOW_INCOMPLETE" -eq 0 ]; then
+    swift build --package-path "$ROOT" -c release --product EasySplatReleaseVerifier >/dev/null
+    [ -x "$EXPECTED_RELEASE_RUNNER" ] || {
+      echo "Repository-built EasySplatReleaseVerifier is missing after the release build." >&2
+      exit 1
+    }
+    E2E_RUNNER="$EXPECTED_RELEASE_RUNNER"
+    OFFLINE_RUNNER="$EXPECTED_RELEASE_RUNNER"
+  fi
   if [ ! -e "$E2E_FIXTURE" ] || [ ! -d "$TOOLCHAIN_ROOT" ] || [ ! -x "$E2E_RUNNER" ] \
     || [ -z "$MANIFEST_URL" ] || [ ! -f "$PUBLIC_KEY_FILE" ]; then
     echo "End-to-end verification requires a fixture, manifest URL, public key, toolchain cache, and executable runner." >&2
@@ -403,10 +551,14 @@ if [ -n "$OFFLINE_CACHE_ROOT" ] || [ -n "$OFFLINE_RUNNER" ]; then
   grep -a -m1 -Eq '^element vertex [1-9][0-9]*$' "$OFFLINE_OUTPUT"
 else
   if [ "$ALLOW_INCOMPLETE" -eq 0 ]; then
-    echo "Release verification requires a populated offline cache and runner." >&2
+    echo "Release verification requires a shared offline cache and runner." >&2
     exit 1
   fi
   echo "INCOMPLETE TEST MODE: cached offline run not supplied."
 fi
 
-echo "Verified unsigned public beta: $EXPECTED_VERSION"
+if [ "$ALLOW_INCOMPLETE" -eq 1 ]; then
+  echo "Inspection only: static checks completed for $EXPECTED_VERSION; release verification is incomplete."
+else
+  echo "Verified unsigned public beta: $EXPECTED_VERSION"
+fi

@@ -69,7 +69,7 @@ Options:
   --fast                 Run with the installed toolchain (no rebuild/download).
   --rebuild              Force a toolchain rebuild (preserve models when possible).
   --version <semver>     Toolchain version (default: 2.0.0).
-  --toolchain-root <dir> Override installed toolchain path.
+  --toolchain-root <dir> Override with a version leaf under an EasySplat toolchain root.
   --port <port>          Local manifest server port on 127.0.0.1 (default: 8000).
   -h, --help             Show this help.
 EOF
@@ -116,6 +116,35 @@ fi
 if [ -z "$TOOLCHAIN_ROOT" ]; then
   TOOLCHAIN_ROOT="$HOME/Library/Application Support/EasySplat/Toolchains/$VERSION"
 fi
+
+TOOLCHAIN_ROOT="$(python3 - \
+  "$TOOLCHAIN_ROOT" \
+  "$VERSION" \
+  "$HOME/Library/Application Support/EasySplat/Toolchains" \
+  "$ROOT/Toolchains/dev" \
+  "${TMPDIR:-/tmp}/EasySplat/Toolchains" <<'PY'
+import re
+import sys
+from pathlib import Path
+
+root = Path(sys.argv[1]).expanduser().resolve(strict=False)
+version = sys.argv[2]
+allowed_parents = {Path(value).expanduser().resolve(strict=False) for value in sys.argv[3:]}
+semver = re.compile(
+    r"^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)"
+    r"(?:-[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?"
+    r"(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?$"
+)
+if not semver.fullmatch(version):
+    raise SystemExit(f"Invalid toolchain version: {version}")
+if root.name != version or root.parent not in allowed_parents:
+    allowed = ", ".join(str(parent / version) for parent in sorted(allowed_parents))
+    raise SystemExit(
+        f"Refusing unsafe toolchain root: {root}. Expected one of: {allowed}"
+    )
+print(root)
+PY
+)"
 
 TOOLCHAINS="$ROOT/Toolchains"
 OUT="$TOOLCHAINS/out"
@@ -164,22 +193,6 @@ if payload.get("toolchain_name") != tool_name:
 PY
 }
 
-copy_da3_app_into() {
-  local bundle_root="$1"
-  local source_root="$ROOT/Tools/Da3Sfm/easysplat_da3_sfm"
-  local app_root="$bundle_root/app"
-  if [ ! -d "$source_root" ]; then
-    echo "DA3 app source missing at $source_root" >&2
-    exit 1
-  fi
-
-  rm -rf "$app_root"
-  mkdir -p "$app_root"
-  cp -R "$source_root" "$app_root/"
-  find "$app_root" -type d -name "__pycache__" -prune -exec rm -rf {} +
-  find "$app_root" -type f -name "*.pyc" -delete
-}
-
 toolchain_inputs_newer() {
   test -f "$CORE_ZIP" || return 1
   find "$ROOT/Tools/Da3Sfm" -type f -newer "$CORE_ZIP" -print -quit | grep -q . && return 0
@@ -188,19 +201,24 @@ toolchain_inputs_newer() {
   return 1
 }
 
+archive_contains() {
+  unzip -Z1 "$1" | grep -Fx "$2" >/dev/null
+}
+
 core_zip_valid() {
   test -f "$CORE_ZIP" || return 1
   "$MSPLAT_VALIDATOR" --archive "$CORE_ZIP" >/dev/null 2>&1 || return 1
-  unzip -l "$CORE_ZIP" | grep -q "bin/colmap" || return 1
-  unzip -l "$CORE_ZIP" | grep -q "bin/easysplat-train" || return 1
-  unzip -l "$CORE_ZIP" | grep -q "bin/default.metallib" || return 1
-  unzip -l "$CORE_ZIP" | grep -q "msplat/build_info.json" || return 1
-  unzip -l "$CORE_ZIP" | grep -q "msplat/LICENSE" || return 1
-  unzip -l "$CORE_ZIP" | grep -q "da3_mps/bin/easysplat_da3_sfm" || return 1
-  unzip -l "$CORE_ZIP" | grep -q "da3_mps/python/bin/python3" || return 1
-  unzip -l "$CORE_ZIP" | grep -q "da3_mps/build_info.json" || return 1
-  unzip -l "$CORE_ZIP" | grep -q "da3_mps/app/easysplat_da3_sfm/run.py" || return 1
-  unzip -l "$CORE_ZIP" | grep -q "da3_mps/vendor/depth-anything-3/src/depth_anything_3/api.py" || return 1
+  archive_contains "$CORE_ZIP" "bin/colmap" || return 1
+  archive_contains "$CORE_ZIP" "bin/easysplat-train" || return 1
+  archive_contains "$CORE_ZIP" "bin/default.metallib" || return 1
+  archive_contains "$CORE_ZIP" "msplat/build_info.json" || return 1
+  archive_contains "$CORE_ZIP" "msplat/LICENSE" || return 1
+  archive_contains "$CORE_ZIP" "da3_mps/bin/easysplat_da3_sfm" || return 1
+  archive_contains "$CORE_ZIP" "da3_mps/python/bin/python3" || return 1
+  archive_contains "$CORE_ZIP" "da3_mps/build_info.json" || return 1
+  archive_contains "$CORE_ZIP" "da3_mps/app/easysplat_da3_sfm/run.py" || return 1
+  archive_contains "$CORE_ZIP" "da3_mps/vendor/depth-anything-3/src/depth_anything_3/api.py" || return 1
+  archive_contains "$CORE_ZIP" "supply-chain/components.json" || return 1
 
   local tmp
   tmp="$(mktemp -d)"
@@ -208,7 +226,7 @@ core_zip_valid() {
   {
     unzip -p "$CORE_ZIP" bin/colmap >"$tmp/colmap" 2>/dev/null \
       && chmod +x "$tmp/colmap" \
-      && otool -l "$tmp/colmap" | grep -q "@executable_path/../lib"
+      && /usr/bin/codesign --verify --strict "$tmp/colmap"
   } || rc=1
   rm -rf "$tmp"
   return "$rc"
@@ -254,9 +272,16 @@ da3_model_zip_valid() {
   local zip_path="$1"
   local model="$2"
   test -f "$zip_path" || return 1
-  unzip -l "$zip_path" | grep -q "da3_mps/models/$model/config\\.json" || return 1
-  unzip -l "$zip_path" | grep -q "da3_mps/models/$model/model\\.safetensors" || return 1
-  unzip -l "$zip_path" | grep -q "da3_mps/models/$model/easysplat_model_info\\.json" || return 1
+  archive_contains "$zip_path" "da3_mps/models/$model/config.json" || return 1
+  archive_contains "$zip_path" "da3_mps/models/$model/model.safetensors" || return 1
+  archive_contains "$zip_path" "da3_mps/models/$model/easysplat_model_info.json" || return 1
+}
+
+da3_bundle_sources_newer() {
+  local receipt="$DA3_MPS_BUNDLE/build_info.json"
+  [ -f "$receipt" ] || return 0
+  [ "$DA3_MPS_BUILD" -nt "$receipt" ] && return 0
+  [ -n "$(find "$ROOT/Tools/Da3Sfm" -type f -newer "$receipt" -print -quit)" ]
 }
 
 ensure_da3_mps_bundle() {
@@ -275,7 +300,8 @@ ensure_da3_mps_bundle() {
        [ -f "$DA3_MPS_BUNDLE/models/DA3-SMALL/config.json" ] && \
        [ -f "$DA3_MPS_BUNDLE/models/DA3-SMALL/easysplat_model_info.json" ] && \
        [ -f "$DA3_MPS_BUNDLE/vendor/depth-anything-3/src/depth_anything_3/api.py" ] && \
-       validate_bundle_build_info "$DA3_MPS_BUNDLE/python/bin/python3" "$DA3_MPS_BUNDLE/build_info.json" "da3_mps"; then
+       validate_bundle_build_info "$DA3_MPS_BUNDLE/python/bin/python3" "$DA3_MPS_BUNDLE/build_info.json" "da3_mps" && \
+       ! da3_bundle_sources_newer; then
       ok=1
     fi
   fi
@@ -313,40 +339,6 @@ ensure_da3_mps_bundle() {
   fi
 }
 
-refresh_da3_mps_app() {
-  if [ -d "$DA3_MPS_BUNDLE" ]; then
-    copy_da3_app_into "$DA3_MPS_BUNDLE"
-  fi
-}
-
-da3_app_needs_refresh() {
-  local root="$1"
-  local app_root="$root/da3_mps/app"
-  local sentinel="$app_root/easysplat_da3_sfm/run.py"
-  if [ ! -d "$ROOT/Tools/Da3Sfm" ]; then
-    return 1
-  fi
-  if [ ! -d "$root/da3_mps" ]; then
-    return 1
-  fi
-  if [ ! -f "$sentinel" ]; then
-    return 0
-  fi
-  find "$ROOT/Tools/Da3Sfm/easysplat_da3_sfm" \
-    -type f \
-    ! -name "*.pyc" \
-    ! -path "*/__pycache__/*" \
-    -newer "$sentinel" \
-    -print -quit | grep -q .
-}
-
-refresh_installed_da3_app() {
-  local root="$1"
-  if da3_app_needs_refresh "$root"; then
-    copy_da3_app_into "$root/da3_mps"
-  fi
-}
-
 validate_installed_toolchain() {
   local root="$1"
   test -x "$root/bin/colmap" || return 1
@@ -364,7 +356,8 @@ validate_installed_toolchain() {
   test -f "$root/da3_mps/models/DA3-SMALL/easysplat_model_info.json" || return 1
   test -f "$root/da3_mps/vendor/depth-anything-3/src/depth_anything_3/api.py" || return 1
 
-  otool -l "$root/bin/colmap" | grep -q "@executable_path/../lib" || return 1
+  /usr/bin/codesign --verify --strict "$root/bin/colmap" || return 1
+  "$root/bin/colmap" -h >/dev/null 2>&1 || return 1
 }
 
 models_present() {
@@ -385,7 +378,6 @@ wipe_installed_core() {
   fi
   rm -rf \
     "${root:?}/bin" \
-    "${root:?}/lib" \
     "${root:?}/msplat" \
     "${root:?}/da3_mps/bin" \
     "${root:?}/da3_mps/python" \
@@ -405,14 +397,12 @@ if [ "$FAST" -eq 1 ]; then
     echo "Run ./scripts/run.sh to auto-build/install it, or use --rebuild to force a fresh toolchain." >&2
     exit 1
   fi
-  refresh_installed_da3_app "$TOOLCHAIN_ROOT"
   export EASYSPLAT_LOCAL_TOOLCHAIN_ROOT="$TOOLCHAIN_ROOT"
   launch_app "installed toolchain at $TOOLCHAIN_ROOT"
   exit 0
 fi
 
 if [ "$REBUILD" -eq 0 ] && [ "$INSTALLED_OK" -eq 1 ]; then
-  refresh_installed_da3_app "$TOOLCHAIN_ROOT"
   export EASYSPLAT_LOCAL_TOOLCHAIN_ROOT="$TOOLCHAIN_ROOT"
   launch_app "installed toolchain at $TOOLCHAIN_ROOT"
   exit 0
@@ -428,16 +418,8 @@ elif [ "$INSTALLED_OK" -eq 0 ] && toolchain_inputs_newer; then
 fi
 
 if [ "$NEED_PACKAGE" -eq 1 ]; then
-  test -f "$ROOT/Toolchains/build/suitesparse/install/lib/libcholmod.5.dylib" \
-    || "$ROOT/scripts/toolchain/build_suitesparse.sh"
-  test -f "$ROOT/Toolchains/build/ceres/install/lib/libceres.4.dylib" \
-    || "$ROOT/scripts/toolchain/build_ceres.sh"
-  test -f "$ROOT/Toolchains/build/openimageio/install/lib/libOpenImageIO.2.5.dylib" \
-    || "$ROOT/scripts/toolchain/build_openimageio.sh"
-  test -x "$ROOT/Toolchains/build/colmap/install/bin/colmap" || "$ROOT/scripts/toolchain/build_colmap.sh"
   ensure_msplat_bundle
   ensure_da3_mps_bundle
-  refresh_da3_mps_app
   rm -f "$CORE_ZIP" "$DA3_BASE_ZIP" "$DA3_SMALL_ZIP"
   "$ROOT/scripts/toolchain/package_toolchain.sh" --version "$VERSION"
 fi

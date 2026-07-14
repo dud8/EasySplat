@@ -1405,6 +1405,23 @@ class OrchestrationTests(unittest.TestCase):
             identity = benchmark.resolved_toolchain_identity(root, "release")
             self.assertRegex(identity or "", r"^sha256:[0-9a-f]{64}$")
 
+            state["padding"] = "x" * (2 * 1024 * 1024)
+            (root / ".easysplat_toolchain_state.json").write_text(
+                json.dumps(state),
+                encoding="utf-8",
+            )
+            identity = benchmark.resolved_toolchain_identity(root, "release")
+            self.assertRegex(identity or "", r"^sha256:[0-9a-f]{64}$")
+
+            state["padding"] = "x" * benchmark.MAX_TOOLCHAIN_INSTALL_STATE_BYTES
+            (root / ".easysplat_toolchain_state.json").write_text(
+                json.dumps(state),
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(benchmark.ConfigError, "size limit"):
+                benchmark.resolved_toolchain_identity(root, "release")
+
+            state.pop("padding")
             state["installedArtifacts"].pop("geometry-da3-base")
             (root / ".easysplat_toolchain_state.json").write_text(
                 json.dumps(state),
