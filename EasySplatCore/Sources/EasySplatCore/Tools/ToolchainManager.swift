@@ -228,12 +228,18 @@ public final class ToolchainManager: @unchecked Sendable, ToolchainManaging {
         } catch {
             if shouldAttemptOfflineFallback(forManifestError: error) {
                 onProgress(-1.0, "Trying cached tools")
-                if let cached = try? loadBestCachedToolchain(
-                    publicKeyBase64: publicKeyBase64,
-                    request: request
-                ) {
-                    onProgress(1.0, "Tools ready (offline cached)")
-                    return cached
+                do {
+                    if let cached = try loadBestCachedToolchain(
+                        publicKeyBase64: publicKeyBase64,
+                        request: request
+                    ) {
+                        onProgress(1.0, "Tools ready (offline cached)")
+                        return cached
+                    }
+                } catch {
+                    throw ToolchainError.invalidToolchain(
+                        "The download failed, and cached tools could not be verified. \(error.localizedDescription)"
+                    )
                 }
             }
             throw error

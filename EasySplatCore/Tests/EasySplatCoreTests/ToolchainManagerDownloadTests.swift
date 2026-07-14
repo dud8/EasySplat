@@ -811,6 +811,53 @@ final class ToolchainManagerDownloadTests: XCTestCase {
         }
     }
 
+    func testOfflineFallbackReportsRejectedCachedToolchainInsteadOfOnlyNetworkFailure() async throws {
+        let installationRoot = try TestFileBuilder.makeTempDir()
+        defer { try? FileManager.default.removeItem(at: installationRoot) }
+        let versionedRoot = installationRoot.appendingPathComponent("2.0.0", isDirectory: true)
+        let token = UUID().uuidString
+        let manifestURL = tokenizedURL("https://example.com/manifest.json", token: token)
+        let manager = ToolchainManager(
+            runner: MockSubprocessRunner(scripts: []),
+            urlSession: makeSession(),
+            appVersion: "0.2.0-beta.1",
+            localToolchainRoot: nil,
+            installationRoot: installationRoot
+        )
+        let signed = try makeSignedCachedFixture(at: versionedRoot, manager: manager)
+        try Data("undeclared bytecode".utf8).write(
+            to: versionedRoot.appendingPathComponent("da3_mps/python/runtime.pyc")
+        )
+        MockURLProtocol.register(token: token) { request in
+            (
+                HTTPURLResponse(
+                    url: request.url!,
+                    statusCode: 404,
+                    httpVersion: nil,
+                    headerFields: nil
+                )!,
+                Data()
+            )
+        }
+        defer { MockURLProtocol.unregister(token: token) }
+
+        await XCTAssertThrowsErrorAsync({
+            _ = try await manager.ensureToolchain(
+                manifestURL: manifestURL,
+                publicKeyBase64: signed.publicKey,
+                request: .init(capabilities: [.da3Base, .da3Small]),
+                onProgress: { _, _ in }
+            )
+        }, errorHandler: { error in
+            guard case ToolchainManager.ToolchainError.invalidToolchain(let message) = error else {
+                return XCTFail("Expected invalidToolchain, got \(error)")
+            }
+            XCTAssertTrue(message.contains("cached tools could not be verified"))
+            XCTAssertTrue(message.contains("undeclared file"))
+            XCTAssertTrue(message.contains("da3_mps/python/runtime.pyc"))
+        })
+    }
+
     func testDownloadManifestInvalidJSON() async {
         await withEnvironmentAsync(["EASYSPLAT_LOCAL_TOOLCHAIN_ROOT": nil]) {
             let token = UUID().uuidString

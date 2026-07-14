@@ -75,6 +75,7 @@ extension ToolchainManager {
             return lhs.url.lastPathComponent > rhs.url.lastPathComponent
         }
 
+        var firstRejectedCandidateError: Error?
         for candidate in candidates {
             do {
                 _ = try validateSignedReceipt(
@@ -88,8 +89,14 @@ extension ToolchainManager {
                 )
                 return toolchain
             } catch {
+                if firstRejectedCandidateError == nil {
+                    firstRejectedCandidateError = error
+                }
                 continue
             }
+        }
+        if let firstRejectedCandidateError {
+            throw firstRejectedCandidateError
         }
         return nil
     }
