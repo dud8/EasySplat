@@ -1376,6 +1376,62 @@ class Da3RunTests(unittest.TestCase):
                 [float(value) for value in camera_row.split()[4:]], [8.0, 8.0, 4.0, 4.0]
             )
 
+    def test_seed_refine_single_batch_accepts_collinear_camera_path(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            images = []
+            for index in range(5):
+                path = root / f"img{index}.jpg"
+                Image.new("RGB", (8, 8), color=(index * 20, 0, 0)).save(path)
+                images.append(path)
+
+            class FakeModel:
+                def inference(self, **kwargs):
+                    count = len(kwargs["image"])
+                    poses = np.repeat(np.eye(4)[None, ...], count, axis=0)
+                    poses[:, 0, 3] = -np.arange(count, dtype=np.float64)
+                    intrinsics = np.repeat(
+                        np.array(
+                            [[4.0, 0.0, 1.0], [0.0, 4.0, 1.0], [0.0, 0.0, 1.0]]
+                        )[None, ...],
+                        count,
+                        axis=0,
+                    )
+                    return {
+                        "extrinsics": poses,
+                        "intrinsics": intrinsics,
+                        "depth": np.ones((count, 2, 2)),
+                        "conf": np.ones((count, 2, 2)),
+                    }
+
+            args = build_arg_parser().parse_args(
+                [
+                    "--images",
+                    str(root),
+                    "--out-sparse",
+                    str(root / "seed" / "0"),
+                    "--input-ordering",
+                    "continuous",
+                    "--window-size",
+                    "5",
+                    "--window-overlap",
+                    "3",
+                ]
+            )
+
+            registered, evidence = _run_da3_seed_refine(
+                args,
+                FakeModel(),
+                images,
+                "cpu",
+                root / "seed" / "0",
+            )
+
+            self.assertEqual(registered, 5)
+            self.assertEqual(evidence["batches"], [[0, 1, 2, 3, 4]])
+            self.assertEqual(evidence["anchor_indices"], [0, 2, 4])
+            self.assertEqual(evidence["alignment_edge_count"], 0)
+
     def test_seed_refine_rejects_missing_prediction_view(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)

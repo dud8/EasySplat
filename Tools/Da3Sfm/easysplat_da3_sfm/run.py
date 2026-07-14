@@ -732,7 +732,13 @@ def _run_da3_seed_refine(
         first_confidence,
         first_processed_sizes,
     ) = infer_batch(initial_batch, 0)
-    local_anchor_indices = _select_anchor_indices(_camera_centers_from_w2c(first_poses))
+    if len(batches) == 1:
+        # These names are manifest evidence only when no cross-window transform
+        # exists. A valid straight capture must not be rejected for lacking a
+        # non-collinear alignment basis that the solve never uses.
+        local_anchor_indices = [0, len(initial_batch) // 2, len(initial_batch) - 1]
+    else:
+        local_anchor_indices = _select_anchor_indices(_camera_centers_from_w2c(first_poses))
     anchor_indices = [initial_batch[index] for index in local_anchor_indices]
     sample_batch(
         initial_batch,
