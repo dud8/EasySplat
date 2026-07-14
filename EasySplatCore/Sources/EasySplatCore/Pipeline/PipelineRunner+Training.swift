@@ -330,6 +330,7 @@ extension PipelineRunner {
               artifact.detailProfile == profile,
               artifact.iterationLimit == resolvedPlan.trainerIterationLimit,
               artifact.plateauWindow == resolvedPlan.plateauWindow,
+              artifact.memoryBudgetBytes == resolvedPlan.trainerMemoryBudgetBytes,
               artifact.deterministicSeed == seed,
               artifact.checkpointPath == "Training/checkpoints/msplat" else {
             throw MsplatCheckpointValidationError(
@@ -367,7 +368,9 @@ extension PipelineRunner {
         paths: ProjectPaths
     ) throws -> TrainingArtifact {
         guard receipt.inputDigest == datasetIdentity.inputDigest,
-              receipt.geometryDigest == datasetIdentity.geometryDigest else {
+              receipt.geometryDigest == datasetIdentity.geometryDigest,
+              receipt.memoryBudgetBytes == resolvedPlan.trainerMemoryBudgetBytes,
+              receipt.droppedIntersectionCount == 0 else {
             throw MsplatCheckpointValidationError(
                 "native checkpoint identity does not match the prepared dataset"
             )
@@ -389,6 +392,9 @@ extension PipelineRunner {
             gaussianCount: receipt.gaussianCount,
             elapsedSeconds: nil,
             peakMemoryBytes: receipt.peakMemoryBytes,
+            memoryBudgetBytes: receipt.memoryBudgetBytes,
+            rasterFallbackCount: receipt.rasterFallbackCount,
+            droppedIntersectionCount: receipt.droppedIntersectionCount,
             completionStatus: .checkpointed
         )
         var currentMetadata = try ProjectMetadataStore.load(from: paths.metadataURL)
@@ -405,7 +411,9 @@ extension PipelineRunner {
         paths: ProjectPaths
     ) throws -> TrainingArtifact {
         let outputURL = paths.msplatOutputURL
-        guard ProjectArtifactValidator.validatePlyFile(at: outputURL) == .valid,
+        guard result.memoryBudgetBytes == resolvedPlan.trainerMemoryBudgetBytes,
+              result.droppedIntersectionCount == 0,
+              ProjectArtifactValidator.validatePlyFile(at: outputURL) == .valid,
               let header = ProjectArtifactValidator.readPlyHeader(at: outputURL),
               header.vertexCount == result.gaussianCount,
               let size = try? outputURL.resourceValues(forKeys: [.fileSizeKey]).fileSize else {
@@ -430,6 +438,9 @@ extension PipelineRunner {
             gaussianCount: result.gaussianCount,
             elapsedSeconds: result.elapsedSeconds,
             peakMemoryBytes: result.peakMemoryBytes,
+            memoryBudgetBytes: result.memoryBudgetBytes,
+            rasterFallbackCount: result.rasterFallbackCount,
+            droppedIntersectionCount: result.droppedIntersectionCount,
             completionStatus: .completed
         )
         var currentMetadata = try ProjectMetadataStore.load(from: paths.metadataURL)

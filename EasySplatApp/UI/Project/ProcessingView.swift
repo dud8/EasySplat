@@ -140,13 +140,15 @@ struct ProcessingView: View {
             .accessibilityElement(children: .combine)
 
             HStack(spacing: 12) {
-                Button(Self.failureActionTitle(recovery: model.validationRecovery)) {
-                    model.retryAfterFailure()
+                if model.failureRetryAllowed {
+                    Button(Self.failureActionTitle(recovery: model.validationRecovery)) {
+                        model.retryAfterFailure()
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .keyboardShortcut(.defaultAction)
+                    .disabled(!canTryAgain || model.isStopping || model.isRunActive)
+                    .accessibilityIdentifier("processing.tryAgain")
                 }
-                .buttonStyle(.borderedProminent)
-                .keyboardShortcut(.defaultAction)
-                .disabled(!canTryAgain || model.isStopping || model.isRunActive)
-                .accessibilityIdentifier("processing.tryAgain")
 
                 Button("Back to Projects") {
                     onBackToProjects()
@@ -226,9 +228,10 @@ struct ProcessingView: View {
     nonisolated static func failureActionTitle(recovery: RunValidationRecovery?) -> String {
         switch recovery {
         case .useUnordered: return "Use Unordered"
-        case .useFast: return "Use Fast"
+        case .useFast, .useFastForMemory: return "Use Fast"
         case .useBalanced: return "Use Balanced"
         case .useAutomaticPhotoSelection: return "Use Automatic Selection"
+        case .useMoreTrainingMemory: return "Use More Memory"
         case nil: return "Try Again"
         }
     }

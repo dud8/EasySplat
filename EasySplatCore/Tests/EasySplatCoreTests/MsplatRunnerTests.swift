@@ -14,6 +14,7 @@ final class MsplatRunnerTests: XCTestCase {
                 outputPath: context.output,
                 profile: .balanced,
                 seed: 42,
+                memoryBudgetBytes: testMemoryBudgetBytes,
                 onLog: { _, _ in }
             )
             XCTFail("Expected failure")
@@ -33,6 +34,7 @@ final class MsplatRunnerTests: XCTestCase {
                 outputPath: context.output,
                 profile: .balanced,
                 seed: 42,
+                memoryBudgetBytes: testMemoryBudgetBytes,
                 onLog: { _, _ in }
             )
             XCTFail("Expected failure")
@@ -58,16 +60,18 @@ final class MsplatRunnerTests: XCTestCase {
             let mock = MockSubprocessRunner(scripts: [
                 .init(
                     path: context.executable.path,
-                    argsPrefix: [
-                        "--dataset", context.dataset.path,
-                        "--output", context.output.path,
-                        "--profile", argument,
-                        "--checkpoint", context.checkpoint.path,
-                        "--seed", "9",
-                        "--events-fd", "1",
-                    ],
+                    argsPrefix: ["--dataset", context.dataset.path],
                     result: .init(exitCode: 0, terminationReason: .exit, stdout: stdout, stderr: ""),
-                    onRun: { _ in TestFileBuilder.createFile(at: context.output, data: fixtureOutputData) }
+                    onRun: { arguments in
+                        XCTAssertEqual(argumentValue("--profile", in: arguments), argument)
+                        XCTAssertEqual(argumentValue("--checkpoint", in: arguments), context.checkpoint.path)
+                        XCTAssertEqual(argumentValue("--seed", in: arguments), "9")
+                        XCTAssertEqual(
+                            argumentValue("--memory-budget-bytes", in: arguments),
+                            String(testMemoryBudgetBytes)
+                        )
+                        try? writeFixtureOutput(arguments: arguments)
+                    }
                 ),
             ])
 
@@ -77,6 +81,7 @@ final class MsplatRunnerTests: XCTestCase {
                 outputPath: context.output,
                 profile: profile,
                 seed: 9,
+                memoryBudgetBytes: testMemoryBudgetBytes,
                 onLog: { _, _ in }
             )
 
@@ -93,6 +98,295 @@ final class MsplatRunnerTests: XCTestCase {
             )
             XCTAssertTrue(FileManager.default.fileExists(atPath: context.output.deletingLastPathComponent().path))
         }
+    }
+
+    func testRunTrainPassesMemoryBudgetAndReportsExactRasterFallback() async throws {
+        let context = try makeContext()
+        defer { context.cleanup() }
+        let fallbacks = LockedBox<[MsplatRasterFallback]>([])
+        let mock = MockSubprocessRunner(scripts: [
+            .init(
+                path: context.executable.path,
+                argsPrefix: ["--dataset", context.dataset.path],
+                result: .init(
+                    exitCode: 0,
+                    terminationReason: .exit,
+                    stdout: validEvents(rasterFallbackCount: 1),
+                    stderr: ""
+                ),
+                onRun: { arguments in
+                    guard let output = argumentValue("--output", in: arguments) else {
+                        return XCTFail("Missing staged output argument")
+                    }
+                    XCTAssertTrue(output.hasSuffix(".training.tmp.ply"))
+                    XCTAssertNotEqual(output, context.output.path)
+                    try? writeFixtureOutput(arguments: arguments)
+                }
+            ),
+        ])
+
+        let result = try await MsplatRunner(runner: mock).runTrain(
+            msplatPath: context.executable,
+            datasetPath: context.dataset,
+            outputPath: context.output,
+            profile: .balanced,
+            seed: 42,
+            memoryBudgetBytes: testMemoryBudgetBytes,
+            onRasterFallback: { fallback in fallbacks.withValue { $0.append(fallback) } },
+            onLog: { _, _ in }
+        )
+
+        XCTAssertEqual(result.memoryBudgetBytes, testMemoryBudgetBytes)
+        XCTAssertEqual(result.rasterFallbackCount, 1)
+        XCTAssertEqual(result.droppedIntersectionCount, 0)
+        XCTAssertEqual(
+            fallbacks.value,
+            [
+                MsplatRasterFallback(
+                    iteration: 3_500,
+                    fallbackCount: 1,
+                    intersectionCount: 4_096,
+                    allocationBytes: 65_536
+                ),
+            ]
+        )
+        XCTAssertTrue(FileManager.default.fileExists(atPath: context.output.path))
+        XCTAssertFalse(try containsStagingOutput(in: context.output.deletingLastPathComponent()))
+    }
+
+    func testRunTrainAcceptsNativeRasterReplayBeforeFallback() async throws {
+        let context = try makeContext()
+        defer { context.cleanup() }
+        let mock = MockSubprocessRunner(scripts: [
+            .init(
+                path: context.executable.path,
+                argsPrefix: ["--dataset", context.dataset.path],
+                result: .init(
+                    exitCode: 0,
+                    terminationReason: .exit,
+                    stdout: validEvents(
+                        rasterFallbackCount: 1,
+                        includeRasterReplay: true
+                    ),
+                    stderr: ""
+                ),
+                onRun: { arguments in try? writeFixtureOutput(arguments: arguments) }
+            ),
+        ])
+
+        let result = try await MsplatRunner(runner: mock).runTrain(
+            msplatPath: context.executable,
+            datasetPath: context.dataset,
+            outputPath: context.output,
+            profile: .balanced,
+            seed: 42,
+            memoryBudgetBytes: testMemoryBudgetBytes,
+            onLog: { _, _ in }
+        )
+
+        XCTAssertEqual(result.rasterFallbackCount, 1)
+        XCTAssertEqual(result.droppedIntersectionCount, 0)
+    }
+
+    func testMemoryBudgetFailureIsTypedAndPreservesExistingOutput() async throws {
+        let context = try makeContext()
+        defer { context.cleanup() }
+        let prior = Data("previous validated output".utf8)
+        try FileManager.default.createDirectory(
+            at: context.output.deletingLastPathComponent(),
+            withIntermediateDirectories: true
+        )
+        try prior.write(to: context.output)
+        let stdout = """
+        {"camera_count":8,"checkpoint_schema":2,"event":"started","geometry_digest":"\(testGeometryDigest)","initial_gaussian_count":750,"input_digest":"\(testInputDigest)","iteration":0,"iteration_limit":7000,"memory_budget_bytes":\(testMemoryBudgetBytes),"payload_schema":2,"plateau_window":800,"profile":"balanced","resumed":false,"schema_version":1,"seed":42,"sequence":1,"trainer_build_digest":"\(testTrainerDigest)","version":"1.1.3 (git 106499b)"}
+        {"budget_bytes":\(testMemoryBudgetBytes),"event":"raster_memory_budget_exceeded","iteration":12,"required_bytes":\(testMemoryBudgetBytes + 1),"schema_version":1,"sequence":2}
+        """ + "\n"
+        let mock = MockSubprocessRunner(scripts: [
+            .init(
+                path: context.executable.path,
+                argsPrefix: ["--dataset", context.dataset.path],
+                result: .init(exitCode: 75, terminationReason: .exit, stdout: stdout, stderr: ""),
+                onRun: nil
+            ),
+        ])
+
+        do {
+            _ = try await MsplatRunner(runner: mock).runTrain(
+                msplatPath: context.executable,
+                datasetPath: context.dataset,
+                outputPath: context.output,
+                profile: .balanced,
+                seed: 42,
+                memoryBudgetBytes: testMemoryBudgetBytes,
+                onLog: { _, _ in }
+            )
+            XCTFail("Expected raster memory budget failure")
+        } catch let failure as MsplatRasterMemoryBudgetExceeded {
+            XCTAssertEqual(failure.iteration, 12)
+            XCTAssertEqual(failure.requiredBytes, testMemoryBudgetBytes + 1)
+            XCTAssertEqual(failure.budgetBytes, testMemoryBudgetBytes)
+        }
+        XCTAssertEqual(try Data(contentsOf: context.output), prior)
+        XCTAssertFalse(try containsStagingOutput(in: context.output.deletingLastPathComponent()))
+    }
+
+    func testSetupMemoryBudgetFailureIsTypedBeforeStartedEvent() async throws {
+        let context = try makeContext()
+        defer { context.cleanup() }
+        let stdout = """
+        {"budget_bytes":\(testMemoryBudgetBytes),"event":"raster_memory_budget_exceeded","iteration":0,"required_bytes":\(testMemoryBudgetBytes + 1),"schema_version":1,"sequence":1}
+        """ + "\n"
+        let mock = MockSubprocessRunner(scripts: [
+            .init(
+                path: context.executable.path,
+                argsPrefix: ["--dataset", context.dataset.path],
+                result: .init(exitCode: 75, terminationReason: .exit, stdout: stdout, stderr: ""),
+                onRun: nil
+            ),
+        ])
+
+        do {
+            _ = try await MsplatRunner(runner: mock).runTrain(
+                msplatPath: context.executable,
+                datasetPath: context.dataset,
+                outputPath: context.output,
+                profile: .balanced,
+                seed: 42,
+                memoryBudgetBytes: testMemoryBudgetBytes,
+                onLog: { _, _ in }
+            )
+            XCTFail("Expected setup memory budget failure")
+        } catch let failure as MsplatRasterMemoryBudgetExceeded {
+            XCTAssertEqual(failure.iteration, 0)
+            XCTAssertEqual(failure.requiredBytes, testMemoryBudgetBytes + 1)
+            XCTAssertEqual(failure.budgetBytes, testMemoryBudgetBytes)
+        }
+        XCTAssertFalse(FileManager.default.fileExists(atPath: context.output.path))
+        XCTAssertFalse(try containsStagingOutput(in: context.output.deletingLastPathComponent()))
+    }
+
+    func testRasterResourceLimitFailureIsTypedAndPreservesExistingOutput() async throws {
+        let context = try makeContext()
+        defer { context.cleanup() }
+        let prior = Data("previous validated output".utf8)
+        try FileManager.default.createDirectory(
+            at: context.output.deletingLastPathComponent(),
+            withIntermediateDirectories: true
+        )
+        try prior.write(to: context.output)
+        let maximumBufferBytes: Int64 = 4_294_967_296
+        let requiredBytes = maximumBufferBytes + 4_096
+        XCTAssertLessThan(requiredBytes, testMemoryBudgetBytes)
+        let stdout = """
+        {"camera_count":8,"checkpoint_schema":2,"event":"started","geometry_digest":"\(testGeometryDigest)","initial_gaussian_count":750,"input_digest":"\(testInputDigest)","iteration":0,"iteration_limit":7000,"memory_budget_bytes":\(testMemoryBudgetBytes),"payload_schema":2,"plateau_window":800,"profile":"balanced","resumed":false,"schema_version":1,"seed":42,"sequence":1,"trainer_build_digest":"\(testTrainerDigest)","version":"1.1.3 (git 106499b)"}
+        {"event":"raster_resource_limit_exceeded","intersection_count":4096,"iteration":12,"max_buffer_bytes":\(maximumBufferBytes),"required_bytes":\(requiredBytes),"schema_version":1,"sequence":2}
+        """ + "\n"
+        let mock = MockSubprocessRunner(scripts: [
+            .init(
+                path: context.executable.path,
+                argsPrefix: ["--dataset", context.dataset.path],
+                result: .init(exitCode: 75, terminationReason: .exit, stdout: stdout, stderr: ""),
+                onRun: nil
+            ),
+        ])
+
+        do {
+            _ = try await MsplatRunner(runner: mock).runTrain(
+                msplatPath: context.executable,
+                datasetPath: context.dataset,
+                outputPath: context.output,
+                profile: .balanced,
+                seed: 42,
+                memoryBudgetBytes: testMemoryBudgetBytes,
+                onLog: { _, _ in }
+            )
+            XCTFail("Expected raster resource limit failure")
+        } catch let failure as MsplatRasterResourceLimitExceeded {
+            XCTAssertEqual(failure.iteration, 12)
+            XCTAssertEqual(failure.requiredBytes, requiredBytes)
+            XCTAssertEqual(failure.maximumBufferBytes, maximumBufferBytes)
+            XCTAssertEqual(failure.intersectionCount, 4_096)
+        }
+        XCTAssertEqual(try Data(contentsOf: context.output), prior)
+        XCTAssertFalse(try containsStagingOutput(in: context.output.deletingLastPathComponent()))
+    }
+
+    func testSetupResourceLimitFailureIsTypedBeforeStartedEvent() async throws {
+        let context = try makeContext()
+        defer { context.cleanup() }
+        let maximumBufferBytes: Int64 = 4_294_967_296
+        let requiredBytes = maximumBufferBytes + 4_096
+        let stdout = """
+        {"event":"raster_resource_limit_exceeded","iteration":0,"max_buffer_bytes":\(maximumBufferBytes),"required_bytes":\(requiredBytes),"schema_version":1,"sequence":1}
+        """ + "\n"
+        let mock = MockSubprocessRunner(scripts: [
+            .init(
+                path: context.executable.path,
+                argsPrefix: ["--dataset", context.dataset.path],
+                result: .init(exitCode: 75, terminationReason: .exit, stdout: stdout, stderr: ""),
+                onRun: nil
+            ),
+        ])
+
+        do {
+            _ = try await MsplatRunner(runner: mock).runTrain(
+                msplatPath: context.executable,
+                datasetPath: context.dataset,
+                outputPath: context.output,
+                profile: .balanced,
+                seed: 42,
+                memoryBudgetBytes: testMemoryBudgetBytes,
+                onLog: { _, _ in }
+            )
+            XCTFail("Expected setup resource limit failure")
+        } catch let failure as MsplatRasterResourceLimitExceeded {
+            XCTAssertEqual(failure.iteration, 0)
+            XCTAssertEqual(failure.requiredBytes, requiredBytes)
+            XCTAssertEqual(failure.maximumBufferBytes, maximumBufferBytes)
+            XCTAssertNil(failure.intersectionCount)
+        }
+        XCTAssertFalse(FileManager.default.fileExists(atPath: context.output.path))
+        XCTAssertFalse(try containsStagingOutput(in: context.output.deletingLastPathComponent()))
+    }
+
+    func testDroppedIntersectionsRejectCompletionBeforeReplacingExistingOutput() async throws {
+        let context = try makeContext()
+        defer { context.cleanup() }
+        let prior = Data("previous validated output".utf8)
+        try FileManager.default.createDirectory(
+            at: context.output.deletingLastPathComponent(),
+            withIntermediateDirectories: true
+        )
+        try prior.write(to: context.output)
+        let mock = MockSubprocessRunner(scripts: [
+            .init(
+                path: context.executable.path,
+                argsPrefix: ["--dataset", context.dataset.path],
+                result: .init(
+                    exitCode: 0,
+                    terminationReason: .exit,
+                    stdout: validEvents(droppedIntersectionCount: 1),
+                    stderr: ""
+                ),
+                onRun: { arguments in
+                    try? writeFixtureOutput(arguments: arguments)
+                }
+            ),
+        ])
+
+        await XCTAssertThrowsErrorAsync {
+            _ = try await MsplatRunner(runner: mock).runTrain(
+                msplatPath: context.executable,
+                datasetPath: context.dataset,
+                outputPath: context.output,
+                profile: .balanced,
+                seed: 42,
+                memoryBudgetBytes: testMemoryBudgetBytes,
+                onLog: { _, _ in }
+            )
+        }
+        XCTAssertEqual(try Data(contentsOf: context.output), prior)
+        XCTAssertFalse(try containsStagingOutput(in: context.output.deletingLastPathComponent()))
     }
 
     func testRunTrainValidatesEventsAgainstResolvedBudget() async throws {
@@ -113,7 +407,7 @@ final class MsplatRunnerTests: XCTestCase {
                     ),
                     stderr: ""
                 ),
-                onRun: { _ in TestFileBuilder.createFile(at: context.output, data: fixtureOutputData) }
+                onRun: { arguments in try? writeFixtureOutput(arguments: arguments) }
             )
         ])
 
@@ -125,6 +419,7 @@ final class MsplatRunnerTests: XCTestCase {
             seed: 7,
             iterationLimit: 123,
             plateauWindow: 50,
+            memoryBudgetBytes: testMemoryBudgetBytes,
             onLog: { _, _ in }
         )
 
@@ -144,6 +439,7 @@ final class MsplatRunnerTests: XCTestCase {
             outputPath: context.output,
             profile: .balanced,
             seed: 42,
+            memoryBudgetBytes: testMemoryBudgetBytes,
             onProgress: { update in progress.withValue { $0.append(update) } },
             onLog: { _, _ in }
         )
@@ -168,7 +464,7 @@ final class MsplatRunnerTests: XCTestCase {
                     stdout: validEvents(includeProgressLoss: false),
                     stderr: ""
                 ),
-                onRun: { _ in TestFileBuilder.createFile(at: context.output, data: fixtureOutputData) }
+                onRun: { arguments in try? writeFixtureOutput(arguments: arguments) }
             ),
         ])
 
@@ -178,6 +474,7 @@ final class MsplatRunnerTests: XCTestCase {
             outputPath: context.output,
             profile: .balanced,
             seed: 42,
+            memoryBudgetBytes: testMemoryBudgetBytes,
             onProgress: { update in progress.withValue { $0.append(update) } },
             onLog: { _, _ in }
         )
@@ -190,10 +487,13 @@ final class MsplatRunnerTests: XCTestCase {
         let cases: [(String, String)] = [
             ("malformed", "not json\n"),
             ("wrong schema", validEvents().replacingOccurrences(of: "\"schema_version\":1", with: "\"schema_version\":2")),
+            ("invented payload schema", validEvents().replacingOccurrences(of: "\"payload_schema\":2", with: "\"payload_schema\":3")),
             ("skipped sequence", validEvents().replacingOccurrences(of: "\"sequence\":2", with: "\"sequence\":4")),
             ("wrong version", validEvents().replacingOccurrences(of: "1.1.3 (git 106499b)", with: "1.1.4 (git deadbee)")),
             ("profile mismatch", validEvents().replacingOccurrences(of: "\"profile\":\"balanced\"", with: "\"profile\":\"fast\"")),
             ("plateau without early stop", validEvents().replacingOccurrences(of: "\"stop_reason\":\"iteration_limit\"", with: "\"stop_reason\":\"plateau\"")),
+            ("fallback beyond event iteration", validEvents(rasterFallbackCount: 3_501)),
+            ("fallback beyond native counter", validEvents(rasterFallbackCount: Int(UInt32.max) + 1)),
             (
                 "peak memory overflow",
                 validEvents().replacingOccurrences(
@@ -212,7 +512,7 @@ final class MsplatRunnerTests: XCTestCase {
                     path: context.executable.path,
                     argsPrefix: ["--dataset", context.dataset.path],
                     result: .init(exitCode: 0, terminationReason: .exit, stdout: stdout, stderr: ""),
-                    onRun: { _ in TestFileBuilder.createFile(at: context.output, data: fixtureOutputData) }
+                    onRun: { arguments in try? writeFixtureOutput(arguments: arguments) }
                 ),
             ])
 
@@ -223,6 +523,7 @@ final class MsplatRunnerTests: XCTestCase {
                     outputPath: context.output,
                     profile: .balanced,
                     seed: 42,
+                    memoryBudgetBytes: testMemoryBudgetBytes,
                     onLog: { _, _ in }
                 )
                 XCTFail("Expected protocol failure for \(name)")
@@ -257,9 +558,7 @@ final class MsplatRunnerTests: XCTestCase {
                         ),
                         stderr: ""
                     ),
-                    onRun: { _ in
-                        TestFileBuilder.createFile(at: context.output, data: fixtureOutputData)
-                    }
+                    onRun: { arguments in try? writeFixtureOutput(arguments: arguments) }
                 ),
             ])
 
@@ -270,6 +569,7 @@ final class MsplatRunnerTests: XCTestCase {
                     outputPath: context.output,
                     profile: .balanced,
                     seed: 42,
+                    memoryBudgetBytes: testMemoryBudgetBytes,
                     onLog: { _, _ in }
                 )
                 XCTFail("Expected peak-memory protocol failure for \(name)")
@@ -301,12 +601,101 @@ final class MsplatRunnerTests: XCTestCase {
                 outputPath: context.output,
                 profile: .balanced,
                 seed: 42,
+                memoryBudgetBytes: testMemoryBudgetBytes,
                 onLog: { _, _ in }
             )
             XCTFail("Expected missing-output failure")
         } catch {
             XCTAssertTrue(error.localizedDescription.lowercased().contains("output"))
         }
+    }
+
+    func testRunTrainRejectsStagedOutputSymlinkBeforeReadingIt() async throws {
+        let context = try makeContext()
+        defer { context.cleanup() }
+        let externalOutput = context.output.deletingLastPathComponent()
+            .appendingPathComponent("untrusted-target.ply")
+        try FileManager.default.createDirectory(
+            at: externalOutput.deletingLastPathComponent(),
+            withIntermediateDirectories: true
+        )
+        try fixtureOutputData.write(to: externalOutput)
+        let mock = MockSubprocessRunner(scripts: [
+            .init(
+                path: context.executable.path,
+                argsPrefix: ["--dataset", context.dataset.path],
+                result: .init(
+                    exitCode: 0,
+                    terminationReason: .exit,
+                    stdout: validEvents(),
+                    stderr: ""
+                ),
+                onRun: { arguments in
+                    guard let output = argumentValue("--output", in: arguments) else {
+                        return XCTFail("Missing staged output argument")
+                    }
+                    try? FileManager.default.createSymbolicLink(
+                        at: URL(fileURLWithPath: output),
+                        withDestinationURL: externalOutput
+                    )
+                }
+            ),
+        ])
+
+        do {
+            _ = try await MsplatRunner(runner: mock).runTrain(
+                msplatPath: context.executable,
+                datasetPath: context.dataset,
+                outputPath: context.output,
+                profile: .balanced,
+                seed: 42,
+                memoryBudgetBytes: testMemoryBudgetBytes,
+                onLog: { _, _ in }
+            )
+            XCTFail("Expected staged-symlink rejection")
+        } catch {
+            XCTAssertTrue(error.localizedDescription.lowercased().contains("regular file"))
+        }
+
+        XCTAssertEqual(try Data(contentsOf: externalOutput), fixtureOutputData)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: context.output.path))
+    }
+
+    func testRunTrainPreservesDanglingExistingOutputSymlink() async throws {
+        let context = try makeContext()
+        defer { context.cleanup() }
+        try FileManager.default.createDirectory(
+            at: context.output.deletingLastPathComponent(),
+            withIntermediateDirectories: true
+        )
+        let missingTarget = context.output.deletingLastPathComponent()
+            .appendingPathComponent("missing-output.ply")
+        try FileManager.default.createSymbolicLink(
+            at: context.output,
+            withDestinationURL: missingTarget
+        )
+        let mock = successfulMock(context: context)
+
+        do {
+            _ = try await MsplatRunner(runner: mock).runTrain(
+                msplatPath: context.executable,
+                datasetPath: context.dataset,
+                outputPath: context.output,
+                profile: .balanced,
+                seed: 42,
+                memoryBudgetBytes: testMemoryBudgetBytes,
+                onLog: { _, _ in }
+            )
+            XCTFail("Expected existing-output symlink rejection")
+        } catch {
+            XCTAssertTrue(error.localizedDescription.lowercased().contains("regular file"))
+        }
+
+        XCTAssertEqual(
+            try FileManager.default.destinationOfSymbolicLink(atPath: context.output.path),
+            missingTarget.path
+        )
+        XCTAssertFalse(FileManager.default.fileExists(atPath: missingTarget.path))
     }
 
     func testRunTrainThrowsSubprocessFailureOnNonZeroExit() async throws {
@@ -328,6 +717,7 @@ final class MsplatRunnerTests: XCTestCase {
                 outputPath: context.output,
                 profile: .balanced,
                 seed: 42,
+                memoryBudgetBytes: testMemoryBudgetBytes,
                 onLog: { _, _ in }
             )
             XCTFail("Expected failure")
@@ -371,6 +761,7 @@ final class MsplatRunnerTests: XCTestCase {
                     resumeFrom: context.checkpoint,
                     profile: .balanced,
                     seed: 42,
+                    memoryBudgetBytes: testMemoryBudgetBytes,
                     onLog: { _, _ in }
                 )
                 XCTFail("Expected typed resume rejection for \(reason.rawValue)")
@@ -406,6 +797,7 @@ final class MsplatRunnerTests: XCTestCase {
                 outputPath: context.output,
                 profile: .balanced,
                 seed: 42,
+                memoryBudgetBytes: testMemoryBudgetBytes,
                 onLog: { _, _ in }
             )
             XCTFail("Expected event protocol failure")
@@ -446,6 +838,7 @@ final class MsplatRunnerTests: XCTestCase {
                 resumeFrom: context.checkpoint,
                 profile: .balanced,
                 seed: 42,
+                memoryBudgetBytes: testMemoryBudgetBytes,
                 onLog: { _, _ in }
             )
             XCTFail("Expected event protocol failure")
@@ -463,15 +856,7 @@ final class MsplatRunnerTests: XCTestCase {
         let mock = MockSubprocessRunner(scripts: [
             .init(
                 path: context.executable.path,
-                argsPrefix: [
-                    "--dataset", context.dataset.path,
-                    "--output", context.output.path,
-                    "--profile", "balanced",
-                    "--checkpoint", context.checkpoint.path,
-                    "--seed", "42",
-                    "--events-fd", "1",
-                    "--resume", context.checkpoint.path,
-                ],
+                argsPrefix: ["--dataset", context.dataset.path],
                 result: .init(
                     exitCode: 0,
                     terminationReason: .exit,
@@ -482,7 +867,10 @@ final class MsplatRunnerTests: XCTestCase {
                     ),
                     stderr: ""
                 ),
-                onRun: { _ in TestFileBuilder.createFile(at: context.output, data: fixtureOutputData) }
+                onRun: { arguments in
+                    XCTAssertEqual(argumentValue("--resume", in: arguments), context.checkpoint.path)
+                    try? writeFixtureOutput(arguments: arguments)
+                }
             ),
         ])
 
@@ -494,6 +882,7 @@ final class MsplatRunnerTests: XCTestCase {
             resumeFrom: context.checkpoint,
             profile: .balanced,
             seed: 42,
+            memoryBudgetBytes: testMemoryBudgetBytes,
             onLog: { _, _ in }
         )
 
@@ -501,6 +890,53 @@ final class MsplatRunnerTests: XCTestCase {
         XCTAssertEqual(result.inputDigest, receipt.inputDigest)
         XCTAssertEqual(result.geometryDigest, receipt.geometryDigest)
         XCTAssertEqual(mock.calls.count, 1)
+    }
+
+    func testResumePreservesCumulativeRasterFallbackCount() async throws {
+        let context = try makeContext()
+        defer { context.cleanup() }
+        let receipt = try makeMsplatCheckpointFixture(
+            at: context.checkpoint,
+            iteration: 500,
+            rasterFallbackCount: 3
+        )
+        let fallbacks = LockedBox<[MsplatRasterFallback]>([])
+        let mock = MockSubprocessRunner(scripts: [
+            .init(
+                path: context.executable.path,
+                argsPrefix: ["--dataset", context.dataset.path],
+                result: .init(
+                    exitCode: 0,
+                    terminationReason: .exit,
+                    stdout: validEvents(
+                        startIteration: 500,
+                        resumed: true,
+                        checkpoint: receipt
+                    ),
+                    stderr: ""
+                ),
+                onRun: { arguments in
+                    try? writeFixtureOutput(arguments: arguments)
+                }
+            ),
+        ])
+
+        let result = try await MsplatRunner(runner: mock).runTrain(
+            msplatPath: context.executable,
+            datasetPath: context.dataset,
+            outputPath: context.output,
+            checkpointPath: context.checkpoint,
+            resumeFrom: context.checkpoint,
+            profile: .balanced,
+            seed: 42,
+            memoryBudgetBytes: testMemoryBudgetBytes,
+            onRasterFallback: { fallback in fallbacks.withValue { $0.append(fallback) } },
+            onLog: { _, _ in }
+        )
+
+        XCTAssertEqual(result.rasterFallbackCount, 3)
+        XCTAssertEqual(result.latestCheckpoint?.rasterFallbackCount, 3)
+        XCTAssertTrue(fallbacks.value.isEmpty)
     }
 
     func testCancelledRunReturnsOnlyVerifiedCheckpointEvidence() async throws {
@@ -521,12 +957,13 @@ final class MsplatRunnerTests: XCTestCase {
                 resumeFrom: context.checkpoint,
                 profile: .balanced,
                 seed: 42,
+                memoryBudgetBytes: testMemoryBudgetBytes,
                 onCheckpoint: { receipt in checkpointEvents.withValue { $0.append(receipt) } },
                 onLog: { _, _ in }
             )
             XCTFail("Expected resumable interruption")
         } catch let interruption as MsplatTrainingInterrupted {
-            XCTAssertEqual(interruption.completedIteration, 575)
+            XCTAssertEqual(interruption.completedIteration, 500)
             XCTAssertEqual(interruption.checkpoint, receipt)
         }
         XCTAssertEqual(checkpointEvents.value, [receipt])
@@ -547,6 +984,7 @@ final class MsplatRunnerTests: XCTestCase {
                 checkpointPath: context.checkpoint,
                 profile: .balanced,
                 seed: 42,
+                memoryBudgetBytes: testMemoryBudgetBytes,
                 onLog: { _, _ in }
             )
             XCTFail("Expected cancellation to win the completion race")
@@ -576,6 +1014,7 @@ final class MsplatRunnerTests: XCTestCase {
                 resumeFrom: context.checkpoint,
                 profile: .balanced,
                 seed: 42,
+                memoryBudgetBytes: testMemoryBudgetBytes,
                 onLog: { _, _ in }
             )
             XCTFail("Expected cancellation to win the resume-rejection race")
@@ -609,6 +1048,7 @@ final class MsplatRunnerTests: XCTestCase {
                 resumeFrom: context.checkpoint,
                 profile: .balanced,
                 seed: 42,
+                memoryBudgetBytes: testMemoryBudgetBytes,
                 onLog: { _, _ in }
             )
             XCTFail("Expected checkpoint validation failure")
@@ -646,6 +1086,26 @@ final class MsplatRunnerTests: XCTestCase {
                 artifact: artifact
             )
         )
+    }
+
+    func testResumePreflightRejectsFallbackCountsBeyondCheckpointIterationAndNativeRange() throws {
+        for invalidCount in [501, Int(UInt32.max) + 1] {
+            let context = try makeContext()
+            defer { context.cleanup() }
+            let receipt = try makeMsplatCheckpointFixture(
+                at: context.checkpoint,
+                iteration: 500,
+                rasterFallbackCount: invalidCount
+            )
+
+            XCTAssertThrowsError(
+                try MsplatCheckpointValidator.validateResume(
+                    checkpointURL: context.checkpoint,
+                    artifact: checkpointedArtifact(for: receipt)
+                ),
+                "Accepted raster fallback count \(invalidCount) at iteration 500"
+            )
+        }
     }
 
     func testResumePreflightRejectsSymlinkedGenerationsDirectory() throws {
@@ -705,9 +1165,33 @@ private func successfulMock(context: MsplatTestContext) -> MockSubprocessRunner 
             path: context.executable.path,
             argsPrefix: ["--dataset", context.dataset.path],
             result: .init(exitCode: 0, terminationReason: .exit, stdout: validEvents(), stderr: ""),
-            onRun: { _ in TestFileBuilder.createFile(at: context.output, data: fixtureOutputData) }
+            onRun: { arguments in try? writeFixtureOutput(arguments: arguments) }
         ),
     ])
+}
+
+private func argumentValue(_ name: String, in arguments: [String]) -> String? {
+    guard let index = arguments.firstIndex(of: name), index + 1 < arguments.count else {
+        return nil
+    }
+    return arguments[index + 1]
+}
+
+private func writeFixtureOutput(arguments: [String]) throws {
+    let outputPath = try XCTUnwrap(argumentValue("--output", in: arguments))
+    let output = URL(fileURLWithPath: outputPath)
+    try FileManager.default.createDirectory(
+        at: output.deletingLastPathComponent(),
+        withIntermediateDirectories: true
+    )
+    try fixtureOutputData.write(to: output)
+}
+
+private func containsStagingOutput(in directory: URL) throws -> Bool {
+    try FileManager.default.contentsOfDirectory(
+        at: directory,
+        includingPropertiesForKeys: nil
+    ).contains { $0.lastPathComponent.hasSuffix(".training.tmp.ply") }
 }
 
 private func validEvents(
@@ -720,7 +1204,11 @@ private func validEvents(
     resumed: Bool = false,
     checkpoint: MsplatCheckpointReceipt? = nil,
     checkpointPeakMemoryBytes: Int64? = testCheckpointPeakMemoryBytes,
-    completionPeakMemoryBytes: Int64? = testCompletionPeakMemoryBytes
+    completionPeakMemoryBytes: Int64? = testCompletionPeakMemoryBytes,
+    rasterFallbackCount: Int = 0,
+    includeRasterReplay: Bool = false,
+    droppedIntersectionCount: Int = 0,
+    memoryBudgetBytes: Int64 = testMemoryBudgetBytes
 ) -> String {
     let checkpoint = checkpoint ?? MsplatCheckpointReceipt(
         iteration: 0,
@@ -729,6 +1217,9 @@ private func validEvents(
         payloadBytes: 128,
         gaussianCount: 750,
         peakMemoryBytes: testCheckpointPeakMemoryBytes,
+        memoryBudgetBytes: memoryBudgetBytes,
+        rasterFallbackCount: 0,
+        droppedIntersectionCount: 0,
         inputDigest: testInputDigest,
         geometryDigest: testGeometryDigest,
         trainerBuildDigest: testTrainerDigest
@@ -744,15 +1235,75 @@ private func validEvents(
     let completionMemoryField = completionPeakMemoryBytes.map {
         ",\"peak_memory_bytes\":\($0)"
     } ?? ""
-    return """
-    {"camera_count":8,"checkpoint_schema":1,"event":"started","geometry_digest":"\(checkpoint.geometryDigest)","initial_gaussian_count":750,"input_digest":"\(checkpoint.inputDigest)","iteration":\(startIteration),"iteration_limit":\(limit),"payload_schema":2,"plateau_window":\(plateau),"profile":"\(profile)","resumed":\(resumed),"schema_version":1,"seed":\(seed),"sequence":1,"trainer_build_digest":"\(checkpoint.trainerBuildDigest)","version":"1.1.3 (git 106499b)"}
-    {"checkpoint_generation":"\(checkpoint.generation)","checkpoint_payload_bytes":\(checkpoint.payloadBytes),"checkpoint_payload_sha256":"\(checkpoint.payloadSHA256)","event":"\(checkpointEvent)","gaussian_count":\(checkpoint.gaussianCount),"geometry_digest":"\(checkpoint.geometryDigest)","input_digest":"\(checkpoint.inputDigest)","iteration":\(checkpoint.iteration)\(checkpointMemoryField),"profile":"\(profile)","schema_version":1,"seed":\(seed),"sequence":2,"trainer_build_digest":"\(checkpoint.trainerBuildDigest)","version":"1.1.3 (git 106499b)"}
-    {"elapsed_seconds":2.5,"eta_seconds":2.5,"event":"progress","gaussian_count":1000,"iteration":\(progressIteration),"iteration_limit":\(limit),"iterations_per_second":1400\(lossFields),"schema_version":1,"sequence":3}
-    {"elapsed_seconds":5,"event":"completed","gaussian_count":1250,"geometry_digest":"\(checkpoint.geometryDigest)","input_digest":"\(checkpoint.inputDigest)","iteration":\(limit),"iteration_limit":\(limit),"output_bytes":4096\(completionMemoryField),"plateau_window":\(plateau),"profile":"\(profile)","schema_version":1,"seed":\(seed),"sequence":4,"stop_reason":"iteration_limit","trainer_build_digest":"\(checkpoint.trainerBuildDigest)","version":"1.1.3 (git 106499b)"}
-    """ + "\n"
+    let replayEvent: String
+    let fallbackEvent: String
+    let progressSequence: Int
+    let completionSequence: Int
+    let completedRasterFallbackCount = max(
+        rasterFallbackCount,
+        checkpoint.rasterFallbackCount
+    )
+    if completedRasterFallbackCount > checkpoint.rasterFallbackCount {
+        replayEvent = includeRasterReplay
+            ? """
+            {"budget_bytes":\(memoryBudgetBytes),"camera_index":2,"event":"raster_replay","first_overflow_iteration":12,"intersection_count":4096,"iteration":11,"required_bytes":65536,"schema_version":1,"sequence":3}
+            """ + "\n"
+            : ""
+        let fallbackSequence = includeRasterReplay ? 4 : 3
+        fallbackEvent = """
+        {"allocation_bytes":65536,"event":"raster_fallback","fallback_count":\(completedRasterFallbackCount),"intersection_count":4096,"iteration":\(progressIteration),"schema_version":1,"sequence":\(fallbackSequence)}
+        """ + "\n"
+        progressSequence = fallbackSequence + 1
+        completionSequence = fallbackSequence + 2
+    } else {
+        replayEvent = ""
+        fallbackEvent = ""
+        progressSequence = 3
+        completionSequence = 4
+    }
+    let startedEvent = """
+    {"camera_count":8,"checkpoint_schema":2,"event":"started","geometry_digest":"\(checkpoint.geometryDigest)","initial_gaussian_count":750,"input_digest":"\(checkpoint.inputDigest)","iteration":\(startIteration),"iteration_limit":\(limit),"memory_budget_bytes":\(memoryBudgetBytes),"payload_schema":2,"plateau_window":\(plateau),"profile":"\(profile)","resumed":\(resumed),"schema_version":1,"seed":\(seed),"sequence":1,"trainer_build_digest":"\(checkpoint.trainerBuildDigest)","version":"1.1.3 (git 106499b)"}
+    """
+    let checkpointRecord = """
+    {"checkpoint_generation":"\(checkpoint.generation)","checkpoint_payload_bytes":\(checkpoint.payloadBytes),"checkpoint_payload_sha256":"\(checkpoint.payloadSHA256)","dropped_intersection_count":0,"event":"\(checkpointEvent)","gaussian_count":\(checkpoint.gaussianCount),"geometry_digest":"\(checkpoint.geometryDigest)","input_digest":"\(checkpoint.inputDigest)","iteration":\(checkpoint.iteration)\(checkpointMemoryField),"memory_budget_bytes":\(memoryBudgetBytes),"profile":"\(profile)","raster_fallback_count":\(checkpoint.rasterFallbackCount),"schema_version":1,"seed":\(seed),"sequence":2,"trainer_build_digest":"\(checkpoint.trainerBuildDigest)","version":"1.1.3 (git 106499b)"}
+    """
+    let progressRecord = """
+    {"elapsed_seconds":2.5,"eta_seconds":2.5,"event":"progress","gaussian_count":1000,"iteration":\(progressIteration),"iteration_limit":\(limit),"iterations_per_second":1400\(lossFields),"schema_version":1,"sequence":\(progressSequence)}
+    """
+    let completedRecord = """
+    {"dropped_intersection_count":\(droppedIntersectionCount),"elapsed_seconds":5,"event":"completed","gaussian_count":1250,"geometry_digest":"\(checkpoint.geometryDigest)","input_digest":"\(checkpoint.inputDigest)","iteration":\(limit),"iteration_limit":\(limit),"memory_budget_bytes":\(memoryBudgetBytes),"output_bytes":\(fixtureOutputData.count)\(completionMemoryField),"plateau_window":\(plateau),"profile":"\(profile)","raster_fallback_count":\(completedRasterFallbackCount),"schema_version":1,"seed":\(seed),"sequence":\(completionSequence),"stop_reason":"iteration_limit","trainer_build_digest":"\(checkpoint.trainerBuildDigest)","version":"1.1.3 (git 106499b)"}
+    """
+    return startedEvent + "\n" + checkpointRecord + "\n" + replayEvent + fallbackEvent
+        + progressRecord + "\n" + completedRecord + "\n"
 }
 
-private let fixtureOutputData = Data(repeating: 0, count: 4_096)
+private let fixtureOutputData: Data = {
+    let body = Array(
+        repeating: "0 0 0 1 1 1 -4 -4 -4 1 1 0 0 0",
+        count: 1_250
+    ).joined(separator: "\n")
+    return Data("""
+    ply
+    format ascii 1.0
+    element vertex 1250
+    property float x
+    property float y
+    property float z
+    property float f_dc_0
+    property float f_dc_1
+    property float f_dc_2
+    property float scale_0
+    property float scale_1
+    property float scale_2
+    property float opacity
+    property float rot_0
+    property float rot_1
+    property float rot_2
+    property float rot_3
+    end_header
+    \(body)
+    """.utf8)
+}()
 private let testInputDigest = String(repeating: "1", count: 64)
 private let testGeometryDigest = String(repeating: "2", count: 64)
 private let testTrainerDigest = String(repeating: "3", count: 64)
@@ -760,6 +1311,7 @@ private let testPayloadDigest = String(repeating: "4", count: 64)
 private let testGenerationDigest = String(repeating: "5", count: 64)
 private let testCheckpointPeakMemoryBytes: Int64 = 268_435_456
 private let testCompletionPeakMemoryBytes: Int64 = 536_870_912
+private let testMemoryBudgetBytes: Int64 = 8_589_934_592
 
 private func checkpointedArtifact(for receipt: MsplatCheckpointReceipt) -> TrainingArtifact {
     TrainingArtifact(
@@ -779,6 +1331,9 @@ private func checkpointedArtifact(for receipt: MsplatCheckpointReceipt) -> Train
         gaussianCount: receipt.gaussianCount,
         elapsedSeconds: nil,
         peakMemoryBytes: receipt.peakMemoryBytes,
+        memoryBudgetBytes: receipt.memoryBudgetBytes,
+        rasterFallbackCount: receipt.rasterFallbackCount,
+        droppedIntersectionCount: receipt.droppedIntersectionCount,
         completionStatus: .checkpointed
     )
 }
@@ -790,7 +1345,9 @@ func makeMsplatCheckpointFixture(
     iterationLimit: Int = 7_000,
     plateauWindow: Int = 800,
     inputDigest: String = testInputDigest,
-    geometryDigest: String = testGeometryDigest
+    geometryDigest: String = testGeometryDigest,
+    memoryBudgetBytes: Int64 = testMemoryBudgetBytes,
+    rasterFallbackCount: Int = 0
 ) throws -> MsplatCheckpointReceipt {
     let fileManager = FileManager.default
     let generations = root.appendingPathComponent("generations", isDirectory: true)
@@ -802,6 +1359,7 @@ func makeMsplatCheckpointFixture(
         "best_camera_losses": Array(repeating: NSNull(), count: 8),
         "camera_count": 8,
         "camera_draw_count": iteration,
+        "dropped_intersection_count": 0,
         "elapsed_seconds": 1.25,
         "gaussian_count": 750,
         "geometry_digest": geometryDigest,
@@ -811,13 +1369,15 @@ func makeMsplatCheckpointFixture(
         "last_improvement_iteration": 500,
         "latest_loss": NSNull(),
         "latest_loss_iteration": 0,
+        "memory_budget_bytes": memoryBudgetBytes,
         "payload_bytes": payload.count,
         "payload_file": "state.msplat",
         "payload_schema": 2,
         "payload_sha256": payloadDigest,
         "plateau_window": plateauWindow,
         "profile": profile,
-        "schema_version": 1,
+        "raster_fallback_count": rasterFallbackCount,
+        "schema_version": 2,
         "seed": 42,
         "trainer_build_digest": testTrainerDigest,
         "trainer_version": "1.1.3 (git 106499b)",
@@ -840,6 +1400,9 @@ func makeMsplatCheckpointFixture(
         payloadBytes: Int64(payload.count),
         gaussianCount: 750,
         peakMemoryBytes: testCheckpointPeakMemoryBytes,
+        memoryBudgetBytes: memoryBudgetBytes,
+        rasterFallbackCount: rasterFallbackCount,
+        droppedIntersectionCount: 0,
         inputDigest: inputDigest,
         geometryDigest: geometryDigest,
         trainerBuildDigest: testTrainerDigest
@@ -851,10 +1414,10 @@ private func interruptedEvents(
     currentIteration: Int
 ) -> String {
     """
-    {"camera_count":8,"checkpoint_schema":1,"event":"started","geometry_digest":"\(checkpoint.geometryDigest)","initial_gaussian_count":750,"input_digest":"\(checkpoint.inputDigest)","iteration":\(checkpoint.iteration),"iteration_limit":7000,"payload_schema":2,"plateau_window":800,"profile":"balanced","resumed":true,"schema_version":1,"seed":42,"sequence":1,"trainer_build_digest":"\(checkpoint.trainerBuildDigest)","version":"1.1.3 (git 106499b)"}
-    {"checkpoint_generation":"\(checkpoint.generation)","checkpoint_payload_bytes":\(checkpoint.payloadBytes),"checkpoint_payload_sha256":"\(checkpoint.payloadSHA256)","event":"checkpoint_loaded","gaussian_count":\(checkpoint.gaussianCount),"geometry_digest":"\(checkpoint.geometryDigest)","input_digest":"\(checkpoint.inputDigest)","iteration":\(checkpoint.iteration),"peak_memory_bytes":\(checkpoint.peakMemoryBytes),"profile":"balanced","schema_version":1,"seed":42,"sequence":2,"trainer_build_digest":"\(checkpoint.trainerBuildDigest)","version":"1.1.3 (git 106499b)"}
+    {"camera_count":8,"checkpoint_schema":2,"event":"started","geometry_digest":"\(checkpoint.geometryDigest)","initial_gaussian_count":750,"input_digest":"\(checkpoint.inputDigest)","iteration":\(checkpoint.iteration),"iteration_limit":7000,"memory_budget_bytes":\(checkpoint.memoryBudgetBytes),"payload_schema":2,"plateau_window":800,"profile":"balanced","resumed":true,"schema_version":1,"seed":42,"sequence":1,"trainer_build_digest":"\(checkpoint.trainerBuildDigest)","version":"1.1.3 (git 106499b)"}
+    {"checkpoint_generation":"\(checkpoint.generation)","checkpoint_payload_bytes":\(checkpoint.payloadBytes),"checkpoint_payload_sha256":"\(checkpoint.payloadSHA256)","dropped_intersection_count":0,"event":"checkpoint_loaded","gaussian_count":\(checkpoint.gaussianCount),"geometry_digest":"\(checkpoint.geometryDigest)","input_digest":"\(checkpoint.inputDigest)","iteration":\(checkpoint.iteration),"memory_budget_bytes":\(checkpoint.memoryBudgetBytes),"peak_memory_bytes":\(checkpoint.peakMemoryBytes),"profile":"balanced","raster_fallback_count":\(checkpoint.rasterFallbackCount),"schema_version":1,"seed":42,"sequence":2,"trainer_build_digest":"\(checkpoint.trainerBuildDigest)","version":"1.1.3 (git 106499b)"}
     {"event":"cancellation_requested","iteration":\(currentIteration),"schema_version":1,"sequence":3,"signal":2}
-    {"checkpoint_generation":"\(checkpoint.generation)","checkpoint_iteration":\(checkpoint.iteration),"checkpoint_payload_sha256":"\(checkpoint.payloadSHA256)","event":"cancelled","geometry_digest":"\(checkpoint.geometryDigest)","input_digest":"\(checkpoint.inputDigest)","iteration":\(currentIteration),"schema_version":1,"sequence":4}
+    {"checkpoint_generation":"\(checkpoint.generation)","checkpoint_iteration":\(checkpoint.iteration),"checkpoint_payload_sha256":"\(checkpoint.payloadSHA256)","dropped_intersection_count":0,"event":"cancelled","geometry_digest":"\(checkpoint.geometryDigest)","input_digest":"\(checkpoint.inputDigest)","iteration":\(currentIteration),"memory_budget_bytes":\(checkpoint.memoryBudgetBytes),"raster_fallback_count":\(checkpoint.rasterFallbackCount),"schema_version":1,"sequence":4}
     """ + "\n"
 }
 

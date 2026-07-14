@@ -6,13 +6,16 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 BUILD_SCRIPT="$ROOT/scripts/toolchain/build_msplat.sh"
 OVERLAY="$ROOT/Tools/MsplatNative/msplat.cpp"
+RASTER_TEST_SOURCE="$ROOT/Tools/MsplatNative/msplat_raster_tests.cpp"
 UPSTREAM_PATCH="$ROOT/Tools/MsplatNative/msplat-1.1.3-easysplat.patch"
 CHECKPOINT_PATCH="$ROOT/Tools/MsplatNative/msplat-1.1.3-checkpoint.patch"
 NUMERIC_STABILITY_PATCH="$ROOT/Tools/MsplatNative/msplat-1.1.3-numeric-stability.patch"
 METAL_SAFETY_PATCH="$ROOT/Tools/MsplatNative/msplat-1.1.3-metal-safety.patch"
+EXACT_RASTER_PATCH="$ROOT/Tools/MsplatNative/msplat-1.1.3-exact-raster.patch"
 FIXTURE_GENERATOR="$ROOT/scripts/ci/generate_msplat_sparse_fixtures.py"
 VALIDATOR="$ROOT/scripts/toolchain/validate_native_msplat.sh"
 INSTALL_DIR="${EASYSPLAT_MSPLAT_INSTALL_DIR:-$ROOT/Toolchains/build/msplat/install/msplat}"
+RASTER_TEST_BIN="${EASYSPLAT_MSPLAT_RASTER_TEST_BIN:-$ROOT/Toolchains/build/msplat/native-build/msplat_raster_tests}"
 
 fail() {
   echo "native msplat build contract failed: $*" >&2
@@ -39,10 +42,12 @@ require_file() {
 
 require_file "$BUILD_SCRIPT"
 require_file "$OVERLAY"
+require_file "$RASTER_TEST_SOURCE"
 require_file "$UPSTREAM_PATCH"
 require_file "$CHECKPOINT_PATCH"
 require_file "$NUMERIC_STABILITY_PATCH"
 require_file "$METAL_SAFETY_PATCH"
+require_file "$EXACT_RASTER_PATCH"
 require_file "$FIXTURE_GENERATOR"
 require_file "$VALIDATOR"
 
@@ -82,6 +87,21 @@ require_contains 'git -C "$SOURCE_DIR" apply --unidiff-zero --check "$METAL_SAFE
 require_contains 'git -C "$SOURCE_DIR" apply --unidiff-zero "$METAL_SAFETY_PATCH"' "$BUILD_SCRIPT"
 require_contains 'metal_safety_patch_sha256' "$BUILD_SCRIPT"
 require_contains '"metal_safety_patch_sha256": "5d3dfff3edcbca940d37f6ee3145c76c678ebd36ebc03016cfd5dab78e1d45ac"' "$VALIDATOR"
+require_contains 'msplat-1.1.3-exact-raster.patch' "$BUILD_SCRIPT"
+require_contains 'EXACT_RASTER_PATCH_SHA256="23c6a6a6c89dabe0827de9f13d2b026a0c416d912edc73468864b23bc376b27e"' "$BUILD_SCRIPT"
+require_contains '[ "$(sha256 "$EXACT_RASTER_PATCH")" = "$EXACT_RASTER_PATCH_SHA256" ]' "$BUILD_SCRIPT"
+require_contains 'git -C "$SOURCE_DIR" apply --check "$EXACT_RASTER_PATCH"' "$BUILD_SCRIPT"
+require_contains 'git -C "$SOURCE_DIR" apply "$EXACT_RASTER_PATCH"' "$BUILD_SCRIPT"
+require_contains 'exact_raster_patch_sha256' "$BUILD_SCRIPT"
+require_contains 'exact_raster_patch_sha256' "$VALIDATOR"
+require_contains 'MSPLAT_BUILD_RASTER_TESTS=ON' "$BUILD_SCRIPT"
+require_contains 'msplat_raster_tests' "$BUILD_SCRIPT"
+require_contains 'add_library(msplat_core_raster_tests STATIC' "$EXACT_RASTER_PATCH"
+require_contains 'target_link_libraries(msplat_raster_tests PRIVATE msplat_core_raster_tests pthread)' "$EXACT_RASTER_PATCH"
+require_contains 'reject_raster_test_symbols' "$BUILD_SCRIPT"
+require_contains 'reject_raster_test_symbols' "$VALIDATOR"
+require_contains 'raster_test_sha256' "$BUILD_SCRIPT"
+require_contains 'raster_test_sha256' "$VALIDATOR"
 require_contains 'python3 - "$build_info"' "$BUILD_SCRIPT"
 require_contains 'json.dump(payload, output, indent=2, sort_keys=True)' "$BUILD_SCRIPT"
 require_contains 'json.load(source, parse_constant=reject_constant)' "$BUILD_SCRIPT"
@@ -92,7 +112,7 @@ for forbidden in 'pip install' 'python-build-standalone' 'site-packages' '_core.
   require_absent "$forbidden" "$BUILD_SCRIPT"
 done
 
-for flag in --dataset --output --profile --checkpoint --resume --seed --events-fd --self-check --validate-ply --version --help; do
+for flag in --dataset --output --profile --checkpoint --resume --seed --memory-budget-bytes --events-fd --self-check --validate-ply --version --help; do
   require_contains "$flag" "$OVERLAY"
 done
 for flag in --input --num-iters --num-downscales --downscale-factor --eval --events-jsonl; do
@@ -183,6 +203,70 @@ require_contains 'clamp(input[i], 0, MAX_TILE_ELEMS)' "$METAL_SAFETY_PATCH"
 require_contains 'ENC_SCALAR(enc, capacity_u32, 13)' "$METAL_SAFETY_PATCH"
 require_contains 'validateBinaryPly' "$OVERLAY"
 require_contains 'if (handleCancellation()) return 130' "$OVERLAY"
+require_contains '--memory-budget-bytes' "$OVERLAY"
+require_contains 'msplat_set_raster_memory_budget_bytes' "$OVERLAY"
+require_contains 'msplat_get_raster_stats' "$OVERLAY"
+require_contains '"raster_fallback"' "$OVERLAY"
+require_contains '"raster_memory_budget_exceeded"' "$OVERLAY"
+require_contains '"raster_resource_limit_exceeded"' "$OVERLAY"
+require_contains '"raster_fallback_count"' "$OVERLAY"
+require_contains '"dropped_intersection_count"' "$OVERLAY"
+require_contains 'msplat_preflight_raster_memory' "$OVERLAY"
+require_contains 'msplat_raster_memory_budget_was_exceeded' "$OVERLAY"
+require_contains 'msplat_raster_resource_limit_was_exceeded' "$OVERLAY"
+require_contains 'msplat_gpu_sync_for_raster_replay' "$OVERLAY"
+require_contains 'msplat_grow_exact_raster_capacity' "$OVERLAY"
+require_contains '{"payload_schema", 2}' "$OVERLAY"
+require_contains '{"schema_version", 2}' "$OVERLAY"
+
+require_contains 'radix_sort_histogram_kernel_cpso' "$EXACT_RASTER_PATCH"
+require_contains 'radix_sort_scan_kernel_cpso' "$EXACT_RASTER_PATCH"
+require_contains 'radix_sort_scatter_kernel_cpso' "$EXACT_RASTER_PATCH"
+require_contains 'map_gaussian_to_intersects_kernel_cpso' "$EXACT_RASTER_PATCH"
+require_contains 'get_tile_bin_edges_kernel_cpso' "$EXACT_RASTER_PATCH"
+require_contains 'pack_sorted_gaussians_kernel_cpso' "$EXACT_RASTER_PATCH"
+require_contains 'dispatchThreadgroupsWithIndirectBuffer' "$EXACT_RASTER_PATCH"
+require_contains 'prepare_exact_dispatch_kernel' "$EXACT_RASTER_PATCH"
+require_contains 'exact_block_reduce_u64_kernel' "$EXACT_RASTER_PATCH"
+require_contains 'device const uint64_t* cum_tiles_hit' "$EXACT_RASTER_PATCH"
+require_absent 'kExactBytesPerIntersection = 64' "$EXACT_RASTER_PATCH"
+require_contains 'raster_allocation_bytes' "$EXACT_RASTER_PATCH"
+require_contains 'release_exact_buffers' "$EXACT_RASTER_PATCH"
+require_absent 'dispatchThreads:MTLSizeMake(capacity, 1, 1)' "$EXACT_RASTER_PATCH"
+require_contains 'for (uint32_t pass = 0; pass < 8; ++pass)' "$EXACT_RASTER_PATCH"
+require_contains '((uint64_t)tile_id << 32) | (uint64_t)as_type<uint>(depths[idx])' "$EXACT_RASTER_PATCH"
+require_contains 'isect_ids_sorted[idx] >> 32' "$EXACT_RASTER_PATCH"
+require_contains 'raster_memory_budget_exceeded' "$EXACT_RASTER_PATCH"
+require_contains 'msplat_set_raster_memory_budget_bytes' "$EXACT_RASTER_PATCH"
+require_contains 'if (raster_execution_blocked(fatal_flag)) return;' "$EXACT_RASTER_PATCH"
+require_contains 'const int next_adam_step_count = adam_step_count + 1;' "$EXACT_RASTER_PATCH"
+require_contains 'adam_step_count = next_adam_step_count;' "$EXACT_RASTER_PATCH"
+require_contains 'void msplat_preflight_raster_memory(' "$EXACT_RASTER_PATCH"
+require_contains 'bool msplat_raster_memory_budget_was_exceeded()' "$EXACT_RASTER_PATCH"
+require_contains 'bool msplat_raster_resource_limit_was_exceeded()' "$EXACT_RASTER_PATCH"
+require_contains 'void msplat_gpu_sync_for_raster_replay()' "$EXACT_RASTER_PATCH"
+require_contains 'void msplat_grow_exact_raster_capacity(uint64_t intersection_count)' "$EXACT_RASTER_PATCH"
+require_contains 'void msplat_clear_raster_capacity_failure()' "$EXACT_RASTER_PATCH"
+require_contains 'kRasterStatFirstOverflowIteration' "$EXACT_RASTER_PATCH"
+require_contains 'MSPLAT_ENABLE_RASTER_TEST_HOOKS' "$EXACT_RASTER_PATCH"
+
+for evidence in forward_rgb forward_alpha position_gradients color_gradients opacity_gradients position_first_moment color_first_moment opacity_first_moment common_path_disabled_seconds mixed_resolution_growth; do
+  require_contains "$evidence" "$RASTER_TEST_SOURCE"
+done
+require_contains 'exact_only_budget_evidence passed' "$RASTER_TEST_SOURCE"
+require_contains 'shared_allocation_budget passed' "$RASTER_TEST_SOURCE"
+require_contains 'msplat_validate_gpu_allocation' "$EXACT_RASTER_PATCH"
+require_contains 'msplat_report_gpu_allocation_failure' "$EXACT_RASTER_PATCH"
+require_contains 'Metal buffer allocation failed after capacity validation' "$EXACT_RASTER_PATCH"
+require_contains 'const MsplatRasterStats replayStats = msplat_get_raster_stats();' "$OVERLAY"
+require_contains '{"required_bytes", replayStats.required_bytes}' "$OVERLAY"
+require_contains 'relativeTolerance = 2.0e-3f' "$RASTER_TEST_SOURCE"
+require_contains 'absoluteTolerance = 2.0e-4f' "$RASTER_TEST_SOURCE"
+require_contains 'msplat_set_force_exact_for_testing' "$RASTER_TEST_SOURCE"
+require_contains 'msplat_set_exact_fallback_enabled_for_testing' "$RASTER_TEST_SOURCE"
+require_contains 'deterministic_window_replay passed' "$RASTER_TEST_SOURCE"
+require_contains 'increasing_window_replay passed' "$RASTER_TEST_SOURCE"
+require_contains 'gpu_capacity_failure passed' "$RASTER_TEST_SOURCE"
 
 if [ "${1:-}" = "--source-only" ]; then
   echo "native msplat source contracts passed"
@@ -205,6 +289,17 @@ expected_files=$'./LICENSE\n./bin/default.metallib\n./bin/easysplat-train\n./bui
 [ "$actual_files" = "$expected_files" ] || fail "unexpected staged install contents:\n$actual_files"
 
 /usr/bin/file -b "$BIN" | grep -q 'Mach-O 64-bit executable arm64' || fail "CLI is not an arm64 Mach-O"
+for symbol in \
+  msplat_set_force_exact_for_testing \
+  msplat_set_exact_fallback_enabled_for_testing \
+  msplat_set_exact_execution_capacity_for_testing \
+  msplat_set_exact_capacity_limit_for_testing \
+  msplat_set_raster_memory_budget_for_testing \
+  msplat_copy_last_raster_debug; do
+  if nm -gU "$BIN" | grep -Fq "$symbol"; then
+    fail "production CLI exports raster test hook: $symbol"
+  fi
+done
 /usr/bin/otool -L "$BIN" | tail -n +2 | awk '{print $1}' | while IFS= read -r dependency; do
   case "$dependency" in
     /System/Library/*|/usr/lib/*) ;;
@@ -213,7 +308,7 @@ expected_files=$'./LICENSE\n./bin/default.metallib\n./bin/easysplat-train\n./bui
 done
 "$BIN" --version | grep -Fq '1.1.3' || fail "CLI version does not report 1.1.3"
 help="$($BIN --help)"
-for flag in --dataset --output --profile --checkpoint --resume --seed --events-fd --self-check --validate-ply --version --help; do
+for flag in --dataset --output --profile --checkpoint --resume --seed --memory-budget-bytes --events-fd --self-check --validate-ply --version --help; do
   grep -Fq -- "$flag" <<<"$help" || fail "CLI help is missing $flag"
 done
 for flag in --input --num-iters --num-downscales --downscale-factor --eval --events-jsonl; do
@@ -247,7 +342,8 @@ set +e
   2>"$negative_dir/closed-fd.stderr"
 closed_fd_status=$?
 "$BIN" --dataset "$negative_dir" --output "$negative_dir/invalid.ply" \
-  --profile extravagant --checkpoint "$negative_dir/invalid-checkpoint" --seed 42 --events-fd 1 \
+  --profile extravagant --checkpoint "$negative_dir/invalid-checkpoint" --seed 42 \
+  --memory-budget-bytes 536870912 --events-fd 1 \
   >"$negative_dir/invalid-profile.stdout" \
   2>"$negative_dir/invalid-profile.stderr"
 invalid_profile_status=$?
@@ -358,15 +454,17 @@ set -e
 [ ! -s "$negative_dir/truncated-ply.stdout" ] || fail "truncated PLY emitted a false success event"
 grep -qi 'payload' "$negative_dir/truncated-ply.stderr" || fail "truncated PLY diagnostic is not useful"
 
-for key in source_commit source_version source_url source_tree_sha256 overlay_sha256 patch_sha256 checkpoint_patch_sha256 numeric_stability_patch_sha256 metal_safety_patch_sha256 executable_sha256 metallib_sha256 compiler deployment_target cmake_arguments build_timestamp; do
+for key in source_commit source_version source_url source_tree_sha256 overlay_sha256 raster_test_sha256 patch_sha256 checkpoint_patch_sha256 numeric_stability_patch_sha256 metal_safety_patch_sha256 exact_raster_patch_sha256 executable_sha256 metallib_sha256 compiler deployment_target cmake_arguments build_timestamp; do
   require_contains "\"$key\"" "$BUILD_INFO"
 done
 overlay_hash="$(shasum -a 256 "$OVERLAY" | awk '{print $1}')"
 numeric_stability_patch_hash="$(shasum -a 256 "$NUMERIC_STABILITY_PATCH" | awk '{print $1}')"
 metal_safety_patch_hash="$(shasum -a 256 "$METAL_SAFETY_PATCH" | awk '{print $1}')"
+exact_raster_patch_hash="$(shasum -a 256 "$EXACT_RASTER_PATCH" | awk '{print $1}')"
+raster_test_hash="$(shasum -a 256 "$RASTER_TEST_SOURCE" | awk '{print $1}')"
 exe_hash="$(shasum -a 256 "$BIN" | awk '{print $1}')"
 metallib_hash="$(shasum -a 256 "$METALLIB" | awk '{print $1}')"
-python3 - "$BUILD_INFO" "$overlay_hash" "$numeric_stability_patch_hash" "$metal_safety_patch_hash" "$exe_hash" "$metallib_hash" <<'PY'
+python3 - "$BUILD_INFO" "$overlay_hash" "$numeric_stability_patch_hash" "$metal_safety_patch_hash" "$exact_raster_patch_hash" "$raster_test_hash" "$exe_hash" "$metallib_hash" <<'PY'
 import json
 import sys
 
@@ -383,8 +481,10 @@ expected = {
     "overlay_sha256": sys.argv[2],
     "numeric_stability_patch_sha256": sys.argv[3],
     "metal_safety_patch_sha256": sys.argv[4],
-    "executable_sha256": sys.argv[5],
-    "metallib_sha256": sys.argv[6],
+    "exact_raster_patch_sha256": sys.argv[5],
+    "raster_test_sha256": sys.argv[6],
+    "executable_sha256": sys.argv[7],
+    "metallib_sha256": sys.argv[8],
 }
 for key, value in expected.items():
     if payload.get(key) != value:
@@ -426,7 +526,8 @@ validate_training_events() {
   local jsonl="$1"
   local expected_points="$2"
   local metal_pipeline_stress="$3"
-  python3 - "$jsonl" "$expected_points" "$metal_pipeline_stress" <<'PY'
+  local expected_memory_budget="$4"
+  python3 - "$jsonl" "$expected_points" "$metal_pipeline_stress" "$expected_memory_budget" <<'PY'
 import json
 import math
 import sys
@@ -453,19 +554,47 @@ started = records[0]
 completed = records[-1]
 expected_points = int(sys.argv[2])
 metal_pipeline_stress = sys.argv[3] == "true"
+expected_memory_budget = int(sys.argv[4])
 if started.get("event") != "started" or completed.get("event") != "completed":
     raise SystemExit("training event stream has invalid boundaries")
 if started.get("initial_gaussian_count") != expected_points:
     raise SystemExit("started event has the wrong sparse-point count")
 expected_contract = {
+    "checkpoint_schema": 2,
+    "dropped_intersection_count": 0,
     "iteration_limit": 3000,
+    "memory_budget_bytes": expected_memory_budget,
+    "payload_schema": 2,
+    "plateau_window": 400,
+    "profile": "fast",
+    "raster_fallback_count": 0,
+    "seed": 42,
+}
+for key, expected in expected_contract.items():
+    if started.get(key) != expected:
+        raise SystemExit(f"training profile contract mismatch for {key}")
+completed_contract = {
+    "dropped_intersection_count": 0,
+    "iteration_limit": 3000,
+    "memory_budget_bytes": expected_memory_budget,
     "plateau_window": 400,
     "profile": "fast",
     "seed": 42,
 }
-for key, expected in expected_contract.items():
-    if started.get(key) != expected or completed.get(key) != expected:
-        raise SystemExit(f"training profile contract mismatch for {key}")
+for key, expected in completed_contract.items():
+    if completed.get(key) != expected:
+        raise SystemExit(f"completed contract mismatch for {key}")
+fallback_count = completed.get("raster_fallback_count")
+if isinstance(fallback_count, bool) or not isinstance(fallback_count, int) or fallback_count < 0:
+    raise SystemExit("completed event has invalid raster fallback evidence")
+for record in records:
+    if record.get("event") != "checkpoint_completed":
+        continue
+    for key in ("memory_budget_bytes", "raster_fallback_count", "dropped_intersection_count"):
+        if isinstance(record.get(key), bool) or not isinstance(record.get(key), int):
+            raise SystemExit(f"checkpoint event has invalid {key}")
+    if record["memory_budget_bytes"] != expected_memory_budget or record["dropped_intersection_count"] != 0:
+        raise SystemExit("checkpoint event lost the raster run contract")
 iterations = [
     record["iteration"]
     for record in records
@@ -534,14 +663,53 @@ metal_stress = [
 ]
 if metal_stress != stress:
     raise SystemExit("Metal pipeline stress must use the numeric-stability fixture")
+overflow = [
+    fixture for fixture in manifest["fixtures"] if fixture.get("raster_overflow_stress")
+]
+if len(overflow) != 1 or overflow[0].get("dataset") != "13-overflow-2304":
+    raise SystemExit("sparse fixtures must contain the exact-raster overflow case")
+if overflow[0].get("point_count") != 2304 or overflow[0].get("resolution") != [32, 32]:
+    raise SystemExit("exact-raster overflow fixture contract changed")
+broad = [fixture for fixture in manifest["fixtures"] if fixture.get("broad_raster_stress")]
+if len(broad) != 1 or broad[0].get("dataset") != "16-broad-overflow-2304":
+    raise SystemExit("sparse fixtures must contain the broad-splat growth case")
+replay = [fixture for fixture in manifest["fixtures"] if fixture.get("raster_replay_stress")]
+if len(replay) != 1 or replay[0].get("dataset") != "15-increasing-overflow-10000":
+    raise SystemExit("sparse fixtures must contain the increasing replay case")
+exact_budget = [fixture for fixture in manifest["fixtures"] if fixture.get("exact_budget_stress")]
+if len(exact_budget) != 1 or exact_budget[0].get("dataset") != "17-exact-budget-1279":
+    raise SystemExit("sparse fixtures must contain the exact-only budget case")
+if exact_budget[0].get("point_count") != 1279 or exact_budget[0].get("resolution") != [640, 360]:
+    raise SystemExit("exact-only budget fixture contract changed")
+mixed = [
+    fixture for fixture in manifest["fixtures"] if fixture.get("mixed_resolution_stress")
+]
+if len(mixed) != 1 or mixed[0].get("dataset") != "14-mixed-resolution-500":
+    raise SystemExit("sparse fixtures must contain the mixed-resolution growth case")
+if mixed[0].get("resolution") != [[32, 32], [320, 180]]:
+    raise SystemExit("mixed-resolution fixture contract changed")
 PY
+require_file "$RASTER_TEST_BIN"
+[ -x "$RASTER_TEST_BIN" ] || fail "raster parity test is not executable: $RASTER_TEST_BIN"
+"$RASTER_TEST_BIN" \
+  "$fixture_root/01-sphere-500" \
+  "$fixture_root/14-mixed-resolution-500" \
+  "$fixture_root/13-overflow-2304" \
+  "$fixture_root/16-broad-overflow-2304" \
+  "$fixture_root/15-increasing-overflow-10000" \
+  "$fixture_root/17-exact-budget-1279"
 fixture_count=0
 while IFS=$'\t' read -r fixture_name expected_points metal_pipeline_stress; do
   fixture_count=$((fixture_count + 1))
   training_fixture="$fixture_root/$fixture_name"
   training_dir="$negative_dir/training-$fixture_name"
+  memory_budget_bytes=536870912
   validation_environment=(env)
   if [ "$metal_pipeline_stress" = "true" ]; then
+    # Metal shader validation inflates device.currentAllocatedSize far beyond
+    # the process RSS. Keep the real 512 MiB RSS gate below, but give the debug
+    # layer enough room for its shadow allocations.
+    memory_budget_bytes=8589934592
     validation_environment=(
       env
       MTL_DEBUG_LAYER=1
@@ -558,6 +726,7 @@ while IFS=$'\t' read -r fixture_name expected_points metal_pipeline_stress; do
     --profile fast \
     --checkpoint "$training_dir/checkpoint" \
     --seed 42 \
+    --memory-budget-bytes "$memory_budget_bytes" \
     --events-fd 1 \
     >"$training_dir/events.jsonl" 2>"$training_dir/stderr.log"; then
     sed -n '1,200p' "$training_dir/stderr.log" >&2
@@ -571,7 +740,8 @@ while IFS=$'\t' read -r fixture_name expected_points metal_pipeline_stress; do
   fi
   validate_jsonl "$training_dir/events.jsonl"
   validate_training_events \
-    "$training_dir/events.jsonl" "$expected_points" "$metal_pipeline_stress"
+    "$training_dir/events.jsonl" "$expected_points" "$metal_pipeline_stress" \
+    "$memory_budget_bytes"
   [ -s "$training_dir/splat.ply" ] || fail "Fast-profile training did not atomically publish a nonempty PLY"
   "$BIN" --validate-ply "$training_dir/splat.ply" --events-fd 1 \
     >"$training_dir/validation.jsonl" 2>"$training_dir/validation.stderr"
@@ -586,11 +756,195 @@ from pathlib import Path
 
 manifest = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
 for fixture in manifest["fixtures"]:
+    if (
+        fixture.get("raster_overflow_stress")
+        or fixture.get("mixed_resolution_stress")
+        or fixture.get("broad_raster_stress")
+        or fixture.get("raster_replay_stress")
+        or fixture.get("exact_budget_stress")
+    ):
+        continue
     metal_stress = "true" if fixture.get("metal_pipeline_stress") else "false"
     print(f'{fixture["dataset"]}\t{fixture["point_count"]}\t{metal_stress}')
 PY
 )
 [ "$fixture_count" = "12" ] || fail "sparse fixture generator did not produce twelve cases"
+
+overflow_dir="$negative_dir/raster-overflow"
+mkdir -p "$overflow_dir"
+"$BIN" \
+  --dataset "$fixture_root/13-overflow-2304" \
+  --output "$overflow_dir/splat.ply" \
+  --profile fast \
+  --checkpoint "$overflow_dir/checkpoint" \
+  --seed 42 \
+  --memory-budget-bytes 100663296 \
+  --events-fd 1 \
+  >"$overflow_dir/events.jsonl" 2>"$overflow_dir/stderr.log"
+validate_jsonl "$overflow_dir/events.jsonl"
+python3 - "$overflow_dir" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+root = Path(sys.argv[1])
+records = [json.loads(line) for line in (root / "events.jsonl").read_text().splitlines()]
+started = records[0]
+completed = records[-1]
+if started.get("event") != "started" or completed.get("event") != "completed":
+    raise SystemExit("overflow run has invalid event boundaries")
+if started.get("checkpoint_schema") != 2 or started.get("payload_schema") != 2:
+    raise SystemExit("overflow run did not advertise checkpoint schema 2")
+if started.get("memory_budget_bytes") != 100663296:
+    raise SystemExit("overflow run lost its explicit memory budget")
+fallbacks = [record for record in records if record.get("event") == "raster_fallback"]
+if not fallbacks:
+    raise SystemExit("overflow fixture did not exercise exact raster fallback")
+counts = [record.get("fallback_count") for record in fallbacks]
+if any(isinstance(value, bool) or not isinstance(value, int) for value in counts):
+    raise SystemExit("overflow fallback count is not integral")
+if counts != sorted(counts) or counts[-1] <= 0:
+    raise SystemExit("overflow fallback count is not positive and monotonic")
+if any(record.get("intersection_count", 0) <= 2048 for record in fallbacks):
+    raise SystemExit("overflow evidence did not exceed the tile-local limit")
+if completed.get("raster_fallback_count", 0) < counts[-1]:
+    raise SystemExit("completion lost raster fallback evidence")
+if completed.get("dropped_intersection_count") != 0:
+    raise SystemExit("overflow run dropped raster intersections")
+if completed.get("memory_budget_bytes") != 100663296:
+    raise SystemExit("completion lost the explicit memory budget")
+current = (root / "checkpoint" / "CURRENT").read_text().strip()
+manifest = json.loads(
+    (root / "checkpoint" / "generations" / current / "manifest.json").read_text()
+)
+expected_manifest = {
+    "schema_version": 2,
+    "payload_schema": 2,
+    "memory_budget_bytes": 100663296,
+    "dropped_intersection_count": 0,
+}
+for key, expected in expected_manifest.items():
+    if manifest.get(key) != expected:
+        raise SystemExit(f"overflow checkpoint mismatch for {key}")
+if manifest.get("raster_fallback_count", 0) <= 0:
+    raise SystemExit("overflow checkpoint lost fallback count")
+PY
+[ -s "$overflow_dir/splat.ply" ] || fail "exact fallback did not publish a PLY"
+"$BIN" --validate-ply "$overflow_dir/splat.ply" --events-fd 1 \
+  >"$overflow_dir/validation.jsonl" 2>"$overflow_dir/validation.stderr"
+require_contains '"status":"ok"' "$overflow_dir/validation.jsonl"
+
+low_budget_dir="$negative_dir/raster-low-budget"
+mkdir -p "$low_budget_dir"
+printf 'SENTINEL' >"$low_budget_dir/existing.ply"
+printf 'SENTINEL' >"$low_budget_dir/expected.ply"
+set +e
+"$BIN" \
+  --dataset "$fixture_root/13-overflow-2304" \
+  --output "$low_budget_dir/existing.ply" \
+  --profile fast \
+  --checkpoint "$low_budget_dir/checkpoint" \
+  --seed 42 \
+  --memory-budget-bytes 1048576 \
+  --events-fd 1 \
+  >"$low_budget_dir/events.jsonl" 2>"$low_budget_dir/stderr.log"
+low_budget_status=$?
+set -e
+[ "$low_budget_status" = "75" ] || fail "raster budget failure exited $low_budget_status instead of 75"
+cmp -s "$low_budget_dir/existing.ply" "$low_budget_dir/expected.ply" \
+  || fail "raster budget failure replaced an existing PLY"
+[ ! -e "$low_budget_dir/checkpoint" ] || fail "raster preflight failure wrote a checkpoint"
+if find "$low_budget_dir" -name '*.tmp.*' -print -quit | grep -q .; then
+  fail "raster preflight failure left a temporary artifact"
+fi
+validate_jsonl "$low_budget_dir/events.jsonl"
+python3 - "$low_budget_dir/events.jsonl" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+records = [json.loads(line) for line in Path(sys.argv[1]).read_text().splitlines()]
+if len(records) != 1 or records[0].get("event") != "raster_memory_budget_exceeded":
+    raise SystemExit("setup-time budget failure did not emit one terminal event")
+record = records[0]
+if record.get("iteration") != 0 or record.get("budget_bytes") != 1048576:
+    raise SystemExit("raster preflight failure has the wrong iteration or budget")
+required = record.get("required_bytes")
+if isinstance(required, bool) or not isinstance(required, int) or required <= 1048576:
+    raise SystemExit("raster preflight failure lacks authoritative required bytes")
+PY
+require_contains 'raster_memory_budget_exceeded' "$low_budget_dir/stderr.log"
+require_contains 'required_bytes=' "$low_budget_dir/stderr.log"
+require_contains 'budget_bytes=1048576' "$low_budget_dir/stderr.log"
+
+marginal_budget_dir="$negative_dir/raster-marginal-budget"
+mkdir -p "$marginal_budget_dir"
+printf 'SENTINEL' >"$marginal_budget_dir/existing.ply"
+marginal_budget_bytes="$(python3 - "$low_budget_dir/events.jsonl" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+record = json.loads(Path(sys.argv[1]).read_text().splitlines()[-1])
+print(record["required_bytes"] - 1)
+PY
+)"
+set +e
+"$BIN" \
+  --dataset "$fixture_root/13-overflow-2304" \
+  --output "$marginal_budget_dir/existing.ply" \
+  --profile fast \
+  --checkpoint "$marginal_budget_dir/checkpoint" \
+  --seed 42 \
+  --memory-budget-bytes "$marginal_budget_bytes" \
+  --events-fd 1 \
+  >"$marginal_budget_dir/events.jsonl" 2>"$marginal_budget_dir/stderr.log"
+marginal_budget_status=$?
+set -e
+[ "$marginal_budget_status" = "75" ] \
+  || fail "marginal raster budget exited $marginal_budget_status instead of 75"
+[ ! -e "$marginal_budget_dir/checkpoint" ] \
+  || fail "marginal raster preflight wrote a checkpoint"
+require_contains 'SENTINEL' "$marginal_budget_dir/existing.ply"
+python3 - "$marginal_budget_dir/events.jsonl" "$marginal_budget_bytes" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+records = [json.loads(line) for line in Path(sys.argv[1]).read_text().splitlines()]
+budget = int(sys.argv[2])
+if len(records) != 1 or records[0].get("event") != "raster_memory_budget_exceeded":
+    raise SystemExit("marginal setup budget did not emit one terminal event")
+record = records[0]
+if record.get("iteration") != 0 or record.get("budget_bytes") != budget:
+    raise SystemExit("marginal raster budget event lost its run contract")
+if record.get("required_bytes") != budget + 1:
+    raise SystemExit("marginal raster budget did not report its exact shortfall")
+PY
+
+misleading_error_dir="$negative_dir/raster_memory_budget_exceeded-unrelated"
+cp -R "$fixture_root/01-sphere-500" "$misleading_error_dir"
+find "$misleading_error_dir/images" -type f -exec sh -c 'printf invalid > "$1"' _ {} \;
+set +e
+"$BIN" \
+  --dataset "$misleading_error_dir" \
+  --output "$negative_dir/misleading-error.ply" \
+  --profile fast \
+  --checkpoint "$negative_dir/misleading-error-checkpoint" \
+  --seed 42 \
+  --memory-budget-bytes 536870912 \
+  --events-fd 1 \
+  >"$negative_dir/misleading-error.jsonl" 2>"$negative_dir/misleading-error.stderr"
+misleading_error_status=$?
+set -e
+[ "$misleading_error_status" = "1" ] \
+  || fail "unrelated raster-named error exited $misleading_error_status instead of 1"
+require_contains 'raster_memory_budget_exceeded-unrelated' "$negative_dir/misleading-error.stderr"
+if grep -Fq '"event":"raster_memory_budget_exceeded"' "$negative_dir/misleading-error.jsonl"; then
+  fail "unrelated exception text was mislabeled as a raster budget failure"
+fi
+[ ! -e "$negative_dir/misleading-error.ply" ] \
+  || fail "unrelated raster-named failure published output"
 
 run_cancelled_profile() {
   local profile="$1"
@@ -605,6 +959,7 @@ run_cancelled_profile() {
     --profile "$profile" \
     --checkpoint "$cancellation_dir/checkpoint" \
     --seed 42 \
+    --memory-budget-bytes 536870912 \
     --events-fd 1 \
     >"$cancellation_dir/events.jsonl" 2>"$cancellation_dir/stderr.log" &
   cancellation_pid=$!
@@ -675,6 +1030,10 @@ if digest != manifest.get("payload_sha256") or digest != latest.get("checkpoint_
     raise SystemExit("cancelled checkpoint payload digest mismatch")
 if manifest.get("iteration") != cancelled.get("checkpoint_iteration"):
     raise SystemExit("cancelled checkpoint iteration mismatch")
+if cancelled.get("raster_fallback_count") != manifest.get("raster_fallback_count"):
+    raise SystemExit("cancelled event did not report its durable fallback count")
+if cancelled.get("dropped_intersection_count") != 0:
+    raise SystemExit("cancelled event reported dropped intersections")
 PY
 }
 
@@ -689,6 +1048,7 @@ mkdir -p "$resume_dir"
   --profile fast \
   --checkpoint "$resume_dir/checkpoint" \
   --seed 42 \
+  --memory-budget-bytes 536870912 \
   --events-fd 1 \
   >"$resume_dir/first.jsonl" 2>"$resume_dir/first.stderr" &
 resume_pid=$!
@@ -731,9 +1091,10 @@ current = (root / "CURRENT").read_text(encoding="utf-8").strip()
 generation = root / "generations" / current
 manifest_path = generation / "manifest.json"
 manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-if field == "camera_count":
+if field in {"camera_count", "memory_budget_bytes", "raster_fallback_count"}:
     manifest[field] = int(value)
-    manifest["best_camera_losses"] = [None] * int(value)
+    if field == "camera_count":
+        manifest["best_camera_losses"] = [None] * int(value)
 else:
     manifest[field] = value
 encoded = (json.dumps(manifest, indent=2, sort_keys=True) + "\n").encode("utf-8")
@@ -759,6 +1120,7 @@ assert_resume_rejected() {
     --checkpoint "$checkpoint" \
     --resume "$checkpoint" \
     --seed 42 \
+    --memory-budget-bytes 536870912 \
     --events-fd 1 \
     >"$events" 2>"$stderr"
   local status=$?
@@ -790,6 +1152,51 @@ make_incompatible_checkpoint \
   "$(printf 'b%.0s' {1..64})"
 assert_resume_rejected "$resume_dir/trainer-mismatch-checkpoint" trainer_changed
 
+make_incompatible_checkpoint \
+  "$resume_dir/budget-mismatch-checkpoint" \
+  memory_budget_bytes \
+  100663296
+assert_resume_rejected "$resume_dir/budget-mismatch-checkpoint" run_contract_changed
+
+assert_malformed_checkpoint() {
+  local checkpoint="$1"
+  local label="$2"
+  local events="$resume_dir/malformed-$label.jsonl"
+  local stderr="$resume_dir/malformed-$label.stderr"
+  set +e
+  "$BIN" \
+    --dataset "$fixture_root/12-clusters-1500" \
+    --output "$resume_dir/malformed-$label.ply" \
+    --profile fast \
+    --checkpoint "$checkpoint" \
+    --resume "$checkpoint" \
+    --seed 42 \
+    --memory-budget-bytes 536870912 \
+    --events-fd 1 \
+    >"$events" 2>"$stderr"
+  local command_status=$?
+  set -e
+  [ "$command_status" = "1" ] || fail "$label malformed checkpoint exited $command_status"
+  [ ! -s "$events" ] || fail "$label malformed checkpoint emitted events"
+  [ ! -e "$resume_dir/malformed-$label.ply" ] || fail "$label malformed checkpoint published output"
+  grep -qi 'checkpoint manifest' "$stderr" \
+    || fail "$label malformed checkpoint diagnostic is not useful"
+}
+
+make_incompatible_checkpoint \
+  "$resume_dir/fallback-after-iteration-checkpoint" \
+  raster_fallback_count \
+  501
+assert_malformed_checkpoint \
+  "$resume_dir/fallback-after-iteration-checkpoint" fallback-after-iteration
+
+make_incompatible_checkpoint \
+  "$resume_dir/fallback-uint32-overflow-checkpoint" \
+  raster_fallback_count \
+  4294967296
+assert_malformed_checkpoint \
+  "$resume_dir/fallback-uint32-overflow-checkpoint" fallback-uint32-overflow
+
 "$BIN" \
   --dataset "$fixture_root/12-clusters-1500" \
   --output "$resume_dir/splat.ply" \
@@ -797,6 +1204,7 @@ assert_resume_rejected "$resume_dir/trainer-mismatch-checkpoint" trainer_changed
   --checkpoint "$resume_dir/checkpoint" \
   --resume "$resume_dir/checkpoint" \
   --seed 42 \
+  --memory-budget-bytes 536870912 \
   --events-fd 1 \
   >"$resume_dir/resumed.jsonl" 2>"$resume_dir/resumed.stderr"
 validate_jsonl "$resume_dir/resumed.jsonl"
@@ -826,6 +1234,7 @@ set +e
   --checkpoint "$resume_dir/tampered-checkpoint" \
   --resume "$resume_dir/tampered-checkpoint" \
   --seed 42 \
+  --memory-budget-bytes 536870912 \
   --events-fd 1 \
   >"$resume_dir/tampered.jsonl" 2>"$resume_dir/tampered.stderr"
 tampered_status=$?

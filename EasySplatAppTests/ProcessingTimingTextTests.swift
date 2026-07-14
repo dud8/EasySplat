@@ -49,8 +49,190 @@ final class ProcessingTimingTextTests: XCTestCase {
     func testValidationFailuresPresentSpecificRecoveryActions() {
         XCTAssertEqual(ProcessingView.failureActionTitle(recovery: .useUnordered), "Use Unordered")
         XCTAssertEqual(ProcessingView.failureActionTitle(recovery: .useFast), "Use Fast")
+        XCTAssertEqual(ProcessingView.failureActionTitle(recovery: .useFastForMemory), "Use Fast")
         XCTAssertEqual(ProcessingView.failureActionTitle(recovery: .useBalanced), "Use Balanced")
+        XCTAssertEqual(ProcessingView.failureActionTitle(recovery: .useMoreTrainingMemory(123)), "Use More Memory")
         XCTAssertEqual(ProcessingView.failureActionTitle(recovery: nil), "Try Again")
+    }
+
+    func testRasterMemoryRecoveryUsesMoreMemoryBeforeReducingDetail() {
+        let hardware = HardwareProfile(memoryGB: 48, cpuCount: 16, gpuWorkingSetGB: 36)
+        let automaticBudget = TrainingMemoryBudget.resolve(
+            hardware: hardware,
+            resourcePolicy: .automatic
+        )
+        let maximumBudget = TrainingMemoryBudget.resolve(
+            hardware: hardware,
+            resourcePolicy: .maximumPerformance
+        )
+        XCTAssertEqual(
+            AppModel.rasterMemoryRecovery(
+                requestedOptions: RequestedRunOptions(
+                    detailProfile: .balanced,
+                    resourcePolicy: .automatic
+                ),
+                currentBudgetBytes: automaticBudget,
+                hardware: hardware
+            ),
+            .useMoreTrainingMemory(maximumBudget)
+        )
+        XCTAssertEqual(
+            AppModel.rasterMemoryRecovery(
+                requestedOptions: RequestedRunOptions(
+                    detailProfile: .balanced,
+                    resourcePolicy: .maximumPerformance
+                ),
+                currentBudgetBytes: maximumBudget,
+                hardware: hardware
+            ),
+            .useFastForMemory
+        )
+        XCTAssertEqual(
+            AppModel.rasterMemoryRecovery(
+                requestedOptions: RequestedRunOptions(
+                    detailProfile: .highDetail,
+                    resourcePolicy: .maximumPerformance
+                ),
+                currentBudgetBytes: maximumBudget,
+                hardware: hardware
+            ),
+            .useBalanced
+        )
+        XCTAssertNil(
+            AppModel.rasterMemoryRecovery(
+                requestedOptions: RequestedRunOptions(
+                    detailProfile: .fast,
+                    resourcePolicy: .maximumPerformance
+                ),
+                currentBudgetBytes: maximumBudget,
+                hardware: hardware
+            )
+        )
+    }
+
+    func testRasterResourceRecoveryReducesDetailWithoutOfferingMoreMemory() {
+        XCTAssertEqual(
+            AppModel.rasterResourceRecovery(
+                requestedOptions: RequestedRunOptions(detailProfile: .highDetail)
+            ),
+            .useBalanced
+        )
+        XCTAssertEqual(
+            AppModel.rasterResourceRecovery(
+                requestedOptions: RequestedRunOptions(detailProfile: .balanced)
+            ),
+            .useFastForMemory
+        )
+        XCTAssertNil(
+            AppModel.rasterResourceRecovery(
+                requestedOptions: RequestedRunOptions(detailProfile: .fast)
+            )
+        )
+    }
+
+    func testConstrainedRasterMemoryRecoveryRaisesOnlyTheTrainerBudgetFirst() {
+        let hardware = HardwareProfile(memoryGB: 16, cpuCount: 10, gpuWorkingSetGB: 12)
+        let conserveBudget = TrainingMemoryBudget.resolve(
+            hardware: hardware,
+            resourcePolicy: .conserveMemory
+        )
+        let automaticBudget = TrainingMemoryBudget.resolve(
+            hardware: hardware,
+            resourcePolicy: .automatic
+        )
+        XCTAssertEqual(
+            AppModel.rasterMemoryRecovery(
+                requestedOptions: RequestedRunOptions(
+                    detailProfile: .balanced,
+                    resourcePolicy: .conserveMemory
+                ),
+                currentBudgetBytes: conserveBudget,
+                hardware: hardware
+            ),
+            .useMoreTrainingMemory(automaticBudget)
+        )
+        XCTAssertEqual(
+            AppModel.rasterMemoryRecovery(
+                requestedOptions: RequestedRunOptions(
+                    detailProfile: .balanced,
+                    resourcePolicy: .automatic
+                ),
+                currentBudgetBytes: automaticBudget,
+                hardware: hardware
+            ),
+            .useFastForMemory
+        )
+    }
+
+    func testMoreMemoryRecoveryChangesOnlyTheTrainingContract() throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let projectURL = root.appendingPathComponent("Retry.easysplatproj", isDirectory: true)
+        let paths = ProjectPaths(root: projectURL)
+        try paths.ensureDirectories()
+        let hardware = HardwareProfile(memoryGB: 48, cpuCount: 16, gpuWorkingSetGB: 36)
+        let input = InputSpec.photos(folder: "/tmp/photos")
+        let options = RequestedRunOptions(
+            detailProfile: .balanced,
+            resourcePolicy: .automatic
+        )
+        let originalPlan = RunPlanResolver.resolve(
+            requestedOptions: options,
+            input: input,
+            hardware: hardware,
+            developmentOverrides: .none
+        )
+        try ProjectMetadataStore.save(
+            ProjectMetadata(
+                title: "Retry",
+                input: input,
+                requestedRunOptions: options,
+                resolvedRunPlan: originalPlan
+            ),
+            to: paths.metadataURL
+        )
+        let model = AppModel(
+            toolchainManager: MockToolchainManager(),
+            projectBaseURL: root,
+            hardwareProfile: hardware
+        ) { url, config in
+            MockPipelineRunner(projectURL: url, config: config)
+        }
+        let largerBudget = TrainingMemoryBudget.resolve(
+            hardware: hardware,
+            resourcePolicy: .maximumPerformance
+        )
+
+        XCTAssertTrue(model.applyValidationRecovery(
+            .useMoreTrainingMemory(largerBudget),
+            projectURL: projectURL
+        ))
+        let updated = try ProjectMetadataStore.load(from: paths.metadataURL)
+        XCTAssertEqual(updated.requestedRunOptions, options)
+        XCTAssertEqual(updated.resolvedRunPlan, originalPlan)
+        XCTAssertEqual(updated.trainingMemoryRetryBudgetBytes, largerBudget)
+
+        let retryPlan = RunPlanResolver.resolve(
+            requestedOptions: options,
+            input: input,
+            hardware: hardware,
+            developmentOverrides: .none,
+            trainingMemoryRetryBudgetBytes: updated.trainingMemoryRetryBudgetBytes
+        )
+        var expectedPlan = originalPlan
+        expectedPlan.trainerMemoryBudgetBytes = largerBudget
+        XCTAssertEqual(retryPlan, expectedPlan)
+        XCTAssertEqual(
+            RunPlanResolver.safeResumeStage(
+                .trainSplat,
+                input: input,
+                previousPlan: originalPlan,
+                currentPlan: retryPlan
+            ),
+            .sfmMapping,
+            "A training-only memory retry must reuse accepted geometry."
+        )
     }
 
     func testFailureMessageShowsOnlyTheTrimmedUserFacingError() {

@@ -18,6 +18,22 @@ sha256() {
   shasum -a 256 "$1" | awk '{print $1}'
 }
 
+reject_raster_test_symbols() {
+  local binary="$1"
+  local symbol
+  for symbol in \
+    msplat_set_force_exact_for_testing \
+    msplat_set_exact_fallback_enabled_for_testing \
+    msplat_set_exact_execution_capacity_for_testing \
+    msplat_set_exact_capacity_limit_for_testing \
+    msplat_set_raster_memory_budget_for_testing \
+    msplat_copy_last_raster_debug; do
+    if /usr/bin/nm -gU "$binary" | grep -Fq "$symbol"; then
+      fail "native trainer exports raster test hook: $symbol"
+    fi
+  done
+}
+
 require_regular_file() {
   local path="$1"
   local description="$2"
@@ -76,6 +92,7 @@ expected_keys = {
     "compiler",
     "dependencies",
     "deployment_target",
+    "exact_raster_patch_sha256",
     "executable_sha256",
     "metallib_sha256",
     "metal_safety_patch_sha256",
@@ -83,6 +100,7 @@ expected_keys = {
     "numeric_stability_patch_sha256",
     "overlay_sha256",
     "patch_sha256",
+    "raster_test_sha256",
     "source_commit",
     "source_tree_sha256",
     "source_url",
@@ -104,11 +122,13 @@ exact_values = {
     "source_commit": "106499b0a53f82b0c92d013b0861fbebd341b17e",
     "source_version": "1.1.3",
     "source_tree_sha256": "866fd6d051b5cf98ca08ae1552236473f504d8f13756cbda68201e48532c3e6a",
-    "overlay_sha256": "26b10371a53485608d292603468e5d24fca65ed2558fb77e512ef1ee51a29723",
+    "overlay_sha256": "a2d0fe4f283e82ee31f05cbb4852f5633b59586dd471d4d2874c73ce18aab89d",
+    "raster_test_sha256": "2f2bc54801933bdcc5abe63cec1b18fd5075ad14ec45d07bf43cfdebe916df44",
     "patch_sha256": "fafbf6f43a3be474a708607a903fc0dbb0029a4d4664c261a1ebaf301f3e9f3f",
     "checkpoint_patch_sha256": "c8b9a8dd03afb4bc50b8a12adf78dc46f5280d67bb62823c58aff2305a4870dc",
     "numeric_stability_patch_sha256": "231586b17e4f47c8c55432a631e08bf293b31a92f8d6ec49b367d11632350ec3",
     "metal_safety_patch_sha256": "5d3dfff3edcbca940d37f6ee3145c76c678ebd36ebc03016cfd5dab78e1d45ac",
+    "exact_raster_patch_sha256": "23c6a6a6c89dabe0827de9f13d2b026a0c416d912edc73468864b23bc376b27e",
     "deployment_target": "macOS 15.0",
     "build_configuration": "Release",
 }
@@ -133,6 +153,7 @@ expected_cmake_arguments = [
     "-DCMAKE_OSX_ARCHITECTURES=arm64",
     "-DCMAKE_OSX_DEPLOYMENT_TARGET=15.0",
     "-DMSPLAT_BUILD_PYTHON=OFF",
+    "-DMSPLAT_BUILD_RASTER_TESTS=ON",
     "-DFETCHCONTENT_FULLY_DISCONNECTED=ON",
     "FETCHCONTENT_SOURCE_DIR_NLOHMANN_JSON=verified-v3.11.3",
     "FETCHCONTENT_SOURCE_DIR_NANOFLANN=verified-v1.5.5",
@@ -149,6 +170,8 @@ for key in (
     "checkpoint_patch_sha256",
     "numeric_stability_patch_sha256",
     "metal_safety_patch_sha256",
+    "exact_raster_patch_sha256",
+    "raster_test_sha256",
     "executable_sha256",
     "metallib_sha256",
 ):
@@ -195,6 +218,7 @@ validate_binary() {
   description="$(/usr/bin/file -b "$executable")"
   [ "$description" = "Mach-O 64-bit executable arm64" ] \
     || fail "native trainer is not an arm64 Mach-O (file reported: $description)"
+  reject_raster_test_symbols "$executable"
 
   while IFS= read -r dependency; do
     [ -n "$dependency" ] || continue

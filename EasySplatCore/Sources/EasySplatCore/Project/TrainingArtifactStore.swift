@@ -132,7 +132,7 @@ public enum TrainingArtifactStore {
         case .balanced: (7_000, 800)
         case .highDetail: (15_000, 1_500)
         }
-        guard artifact.schemaVersion == 1,
+        guard artifact.schemaVersion == 2,
               !artifact.trainerVersion.isEmpty,
               !artifact.runtimeVersion.isEmpty,
               isSHA256(artifact.trainerBuildDigest),
@@ -144,7 +144,14 @@ public enum TrainingArtifactStore {
               artifact.completedIteration <= artifact.iterationLimit,
               artifact.gaussianCount > 0,
               artifact.elapsedSeconds.map({ $0.isFinite && $0 >= 0 }) ?? true,
-              artifact.peakMemoryBytes > 0 else {
+              artifact.peakMemoryBytes > 0,
+              artifact.memoryBudgetBytes > 0,
+              artifact.rasterFallbackCount >= 0,
+              artifact.rasterFallbackCount <= min(
+                  artifact.completedIteration,
+                  Int(UInt32.max)
+              ),
+              artifact.droppedIntersectionCount == 0 else {
             throw TrainingArtifactStoreError.invalidManifest
         }
 

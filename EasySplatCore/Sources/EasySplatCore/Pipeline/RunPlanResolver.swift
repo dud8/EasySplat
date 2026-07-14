@@ -199,7 +199,8 @@ public enum RunPlanResolver {
         requestedOptions options: RequestedRunOptions,
         input: InputSpec,
         hardware: HardwareProfile,
-        developmentOverrides: DevelopmentOverrides
+        developmentOverrides: DevelopmentOverrides,
+        trainingMemoryRetryBudgetBytes: Int64? = nil
     ) -> ResolvedRunPlan {
         let capturePath = options.capturePath
         let inputOrdering = resolvedInputOrdering(options.inputOrdering, input: input)
@@ -232,6 +233,17 @@ public enum RunPlanResolver {
             resolvedColmapMaximumImageDimension(detail: options.detailProfile)
         )
         let trainerBudget = trainerBudget(for: options.detailProfile)
+        let baseTrainingMemoryBudget = TrainingMemoryBudget.resolve(
+            hardware: hardware,
+            resourcePolicy: options.resourcePolicy
+        )
+        let maximumTrainingMemoryBudget = TrainingMemoryBudget.resolve(
+            hardware: hardware,
+            resourcePolicy: .maximumPerformance
+        )
+        let resolvedTrainingMemoryBudget = trainingMemoryRetryBudgetBytes
+            .map { max(baseTrainingMemoryBudget, min($0, maximumTrainingMemoryBudget)) }
+            ?? baseTrainingMemoryBudget
         let cameraGrouping = resolvedCameraGrouping(options.cameraGrouping, input: input)
         let lensProjection = options.lensProjection
         let colmapBudget = resolvedColmapBudget(
@@ -261,6 +273,7 @@ public enum RunPlanResolver {
             ),
             trainerIterationLimit: trainerBudget.iterations,
             plateauWindow: trainerBudget.plateau,
+            trainerMemoryBudgetBytes: resolvedTrainingMemoryBudget,
             colmapMaximumFeatureCount: colmapBudget.features,
             colmapMaximumMatchCount: colmapBudget.matches,
             colmapExhaustiveBlockSize: colmapBudget.blockSize,

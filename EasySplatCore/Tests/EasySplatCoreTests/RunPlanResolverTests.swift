@@ -51,6 +51,7 @@ final class RunPlanResolverTests: XCTestCase {
         XCTAssertEqual(plan.lensProjection, .automatic)
         XCTAssertEqual(plan.trainerIterationLimit, 7_000)
         XCTAssertEqual(plan.plateauWindow, 800)
+        XCTAssertEqual(plan.trainerMemoryBudgetBytes, 34_789_235_097)
         XCTAssertEqual(plan.colmapMaximumFeatureCount, 10_000)
         XCTAssertEqual(plan.colmapMaximumMatchCount, 10_000)
         XCTAssertEqual(plan.colmapExhaustiveBlockSize, 25)
@@ -226,7 +227,7 @@ final class RunPlanResolverTests: XCTestCase {
         XCTAssertTrue(RunPlanResolver.supports(resourcePolicy: .automatic, memoryGB: 8))
         XCTAssertTrue(RunPlanResolver.supports(resourcePolicy: .conserveMemory, memoryGB: 8))
 
-        let hardware = HardwareProfile(memoryGB: 16.5, cpuCount: 10, gpuWorkingSetGB: 12)
+        let hardware = HardwareProfile(memoryGB: 16.5, cpuCount: 10, gpuWorkingSetGB: 16.5)
         let automatic = RunPlanResolver.resolve(
             requestedOptions: RequestedRunOptions(resourcePolicy: .automatic),
             input: .video(files: ["/tmp/one.mov"]),
@@ -240,6 +241,7 @@ final class RunPlanResolverTests: XCTestCase {
             developmentOverrides: .none
         )
         XCTAssertEqual(maximum, automatic)
+        XCTAssertEqual(automatic.trainerMemoryBudgetBytes, 12 * 1_073_741_824)
     }
 
     func testContinuousOrderingIsUnavailableForSeparateClipsAndMixedInput() {
@@ -676,6 +678,18 @@ final class RunPlanResolverTests: XCTestCase {
                 input: video,
                 previousPlan: currentVideoPlan,
                 currentPlan: trainingPlan
+            ),
+            .sfmMapping
+        )
+
+        var memoryPlan = currentVideoPlan
+        memoryPlan.trainerMemoryBudgetBytes -= 1
+        XCTAssertEqual(
+            RunPlanResolver.safeResumeStage(
+                .exportSplat,
+                input: video,
+                previousPlan: currentVideoPlan,
+                currentPlan: memoryPlan
             ),
             .sfmMapping
         )

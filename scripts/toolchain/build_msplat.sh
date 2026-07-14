@@ -13,12 +13,17 @@ STAGE_DIR="$INSTALL_PARENT/msplat.stage.$$"
 BACKUP_DIR="$INSTALL_PARENT/msplat.previous.$$"
 
 OVERLAY="$ROOT/Tools/MsplatNative/msplat.cpp"
+RASTER_TEST_SOURCE="$ROOT/Tools/MsplatNative/msplat_raster_tests.cpp"
+FIXTURE_GENERATOR="$ROOT/scripts/ci/generate_msplat_sparse_fixtures.py"
 UPSTREAM_PATCH="$ROOT/Tools/MsplatNative/msplat-1.1.3-easysplat.patch"
 CHECKPOINT_PATCH="$ROOT/Tools/MsplatNative/msplat-1.1.3-checkpoint.patch"
 NUMERIC_STABILITY_PATCH="$ROOT/Tools/MsplatNative/msplat-1.1.3-numeric-stability.patch"
 NUMERIC_STABILITY_PATCH_SHA256="231586b17e4f47c8c55432a631e08bf293b31a92f8d6ec49b367d11632350ec3"
 METAL_SAFETY_PATCH="$ROOT/Tools/MsplatNative/msplat-1.1.3-metal-safety.patch"
 METAL_SAFETY_PATCH_SHA256="5d3dfff3edcbca940d37f6ee3145c76c678ebd36ebc03016cfd5dab78e1d45ac"
+EXACT_RASTER_PATCH="$ROOT/Tools/MsplatNative/msplat-1.1.3-exact-raster.patch"
+EXACT_RASTER_PATCH_SHA256="23c6a6a6c89dabe0827de9f13d2b026a0c416d912edc73468864b23bc376b27e"
+RASTER_TEST_FIXTURES="$BUILD_DIR/raster-test-fixtures"
 
 MSPLAT_REPO="https://github.com/rayanht/msplat.git"
 MSPLAT_COMMIT="106499b0a53f82b0c92d013b0861fbebd341b17e"
@@ -57,6 +62,22 @@ sha256() {
   shasum -a 256 "$1" | awk '{print $1}'
 }
 
+reject_raster_test_symbols() {
+  local binary="$1"
+  local symbol
+  for symbol in \
+    msplat_set_force_exact_for_testing \
+    msplat_set_exact_fallback_enabled_for_testing \
+    msplat_set_exact_execution_capacity_for_testing \
+    msplat_set_exact_capacity_limit_for_testing \
+    msplat_set_raster_memory_budget_for_testing \
+    msplat_copy_last_raster_debug; do
+    if /usr/bin/nm -gU "$binary" | grep -Fq "$symbol"; then
+      die "staged CLI exports raster test hook: $symbol"
+    fi
+  done
+}
+
 preflight() {
   [ "$(uname -m)" = "arm64" ] || die "must run natively on Apple Silicon arm64; Rosetta is unsupported"
   if [ "$(sysctl -in sysctl.proc_translated 2>/dev/null || true)" = "1" ]; then
@@ -71,6 +92,8 @@ preflight() {
     exit 1
   fi
   [ -f "$OVERLAY" ] || die "missing CLI overlay: $OVERLAY"
+  [ -f "$RASTER_TEST_SOURCE" ] || die "missing raster parity test: $RASTER_TEST_SOURCE"
+  [ -f "$FIXTURE_GENERATOR" ] || die "missing sparse fixture generator: $FIXTURE_GENERATOR"
   [ -f "$UPSTREAM_PATCH" ] || die "missing upstream patch: $UPSTREAM_PATCH"
   [ -f "$CHECKPOINT_PATCH" ] || die "missing checkpoint patch: $CHECKPOINT_PATCH"
   [ -f "$NUMERIC_STABILITY_PATCH" ] || die "missing numeric-stability patch: $NUMERIC_STABILITY_PATCH"
@@ -79,6 +102,9 @@ preflight() {
   [ -f "$METAL_SAFETY_PATCH" ] || die "missing Metal-safety patch: $METAL_SAFETY_PATCH"
   [ "$(sha256 "$METAL_SAFETY_PATCH")" = "$METAL_SAFETY_PATCH_SHA256" ] \
     || die "Metal-safety patch SHA-256 mismatch"
+  [ -f "$EXACT_RASTER_PATCH" ] || die "missing exact-raster patch: $EXACT_RASTER_PATCH"
+  [ "$(sha256 "$EXACT_RASTER_PATCH")" = "$EXACT_RASTER_PATCH_SHA256" ] \
+    || die "exact-raster patch SHA-256 mismatch"
 }
 
 download_verified() {
@@ -149,6 +175,8 @@ prepare_source() {
 
   SOURCE_TREE_SHA256="$(git -C "$SOURCE_DIR" ls-tree -r --full-tree "$MSPLAT_COMMIT" | shasum -a 256 | awk '{print $1}')"
   cp "$OVERLAY" "$SOURCE_DIR/cli/msplat.cpp"
+  mkdir -p "$SOURCE_DIR/tests"
+  cp "$RASTER_TEST_SOURCE" "$SOURCE_DIR/tests/msplat_raster_tests.cpp"
   git -C "$SOURCE_DIR" apply --unidiff-zero --check "$UPSTREAM_PATCH"
   git -C "$SOURCE_DIR" apply --unidiff-zero "$UPSTREAM_PATCH"
   git -C "$SOURCE_DIR" apply --check "$CHECKPOINT_PATCH"
@@ -157,6 +185,8 @@ prepare_source() {
   git -C "$SOURCE_DIR" apply --unidiff-zero "$NUMERIC_STABILITY_PATCH"
   git -C "$SOURCE_DIR" apply --unidiff-zero --check "$METAL_SAFETY_PATCH"
   git -C "$SOURCE_DIR" apply --unidiff-zero "$METAL_SAFETY_PATCH"
+  git -C "$SOURCE_DIR" apply --check "$EXACT_RASTER_PATCH"
+  git -C "$SOURCE_DIR" apply "$EXACT_RASTER_PATCH"
 }
 
 configure_and_build() {
@@ -166,31 +196,43 @@ configure_and_build() {
     -DCMAKE_OSX_ARCHITECTURES=arm64 \
     -DCMAKE_OSX_DEPLOYMENT_TARGET=15.0 \
     -DMSPLAT_BUILD_PYTHON=OFF \
+    -DMSPLAT_BUILD_RASTER_TESTS=ON \
     -DFETCHCONTENT_FULLY_DISCONNECTED=ON \
     -DFETCHCONTENT_SOURCE_DIR_NLOHMANN_JSON="$DEPS_DIR/nlohmann-json-3.11.3" \
     -DFETCHCONTENT_SOURCE_DIR_NANOFLANN="$DEPS_DIR/nanoflann-1.5.5" \
     -DFETCHCONTENT_SOURCE_DIR_CLI11="$DEPS_DIR/CLI11-2.4.2"
-  cmake --build "$NATIVE_BUILD_DIR" --target msplat metallib
+  cmake --build "$NATIVE_BUILD_DIR" --target msplat metallib msplat_raster_tests
+  rm -rf "$RASTER_TEST_FIXTURES"
+  python3 "$FIXTURE_GENERATOR" --output "$RASTER_TEST_FIXTURES"
+  "$NATIVE_BUILD_DIR/msplat_raster_tests" \
+    "$RASTER_TEST_FIXTURES/01-sphere-500" \
+    "$RASTER_TEST_FIXTURES/14-mixed-resolution-500" \
+    "$RASTER_TEST_FIXTURES/13-overflow-2304" \
+    "$RASTER_TEST_FIXTURES/16-broad-overflow-2304" \
+    "$RASTER_TEST_FIXTURES/15-increasing-overflow-10000" \
+    "$RASTER_TEST_FIXTURES/17-exact-budget-1279"
 }
 
 write_build_info() {
   local executable_sha256="$1"
   local metallib_sha256="$2"
-  local build_info compiler cmake_version ninja_version timestamp overlay_sha256 patch_sha256 checkpoint_patch_sha256 numeric_stability_patch_sha256 metal_safety_patch_sha256
+  local build_info compiler cmake_version ninja_version timestamp overlay_sha256 raster_test_sha256 patch_sha256 checkpoint_patch_sha256 numeric_stability_patch_sha256 metal_safety_patch_sha256 exact_raster_patch_sha256
   build_info="$STAGE_DIR/build_info.json"
   compiler="$(xcrun clang++ --version | head -n 1)"
   cmake_version="$(cmake --version | head -n 1)"
   ninja_version="$(ninja --version)"
   timestamp="$(date -u +'%Y-%m-%dT%H:%M:%SZ')"
   overlay_sha256="$(sha256 "$OVERLAY")"
+  raster_test_sha256="$(sha256 "$RASTER_TEST_SOURCE")"
   patch_sha256="$(sha256 "$UPSTREAM_PATCH")"
   checkpoint_patch_sha256="$(sha256 "$CHECKPOINT_PATCH")"
   numeric_stability_patch_sha256="$(sha256 "$NUMERIC_STABILITY_PATCH")"
   metal_safety_patch_sha256="$(sha256 "$METAL_SAFETY_PATCH")"
+  exact_raster_patch_sha256="$(sha256 "$EXACT_RASTER_PATCH")"
 
   python3 - "$build_info" \
     "$MSPLAT_REPO" "$MSPLAT_COMMIT" "$MSPLAT_VERSION" "$SOURCE_TREE_SHA256" \
-    "$overlay_sha256" "$patch_sha256" "$checkpoint_patch_sha256" "$numeric_stability_patch_sha256" "$metal_safety_patch_sha256" \
+    "$overlay_sha256" "$raster_test_sha256" "$patch_sha256" "$checkpoint_patch_sha256" "$numeric_stability_patch_sha256" "$metal_safety_patch_sha256" "$exact_raster_patch_sha256" \
     "$NLOHMANN_JSON_SHA256" "$NANOFLANN_SHA256" "$CLI11_SHA256" \
     "$executable_sha256" "$metallib_sha256" \
     "$compiler" "$cmake_version" "$ninja_version" "$timestamp" <<'PY'
@@ -204,10 +246,12 @@ import sys
     source_version,
     source_tree_sha256,
     overlay_sha256,
+    raster_test_sha256,
     patch_sha256,
     checkpoint_patch_sha256,
     numeric_stability_patch_sha256,
     metal_safety_patch_sha256,
+    exact_raster_patch_sha256,
     nlohmann_json_sha256,
     nanoflann_sha256,
     cli11_sha256,
@@ -226,10 +270,12 @@ payload = {
     "source_version": source_version,
     "source_tree_sha256": source_tree_sha256,
     "overlay_sha256": overlay_sha256,
+    "raster_test_sha256": raster_test_sha256,
     "patch_sha256": patch_sha256,
     "checkpoint_patch_sha256": checkpoint_patch_sha256,
     "numeric_stability_patch_sha256": numeric_stability_patch_sha256,
     "metal_safety_patch_sha256": metal_safety_patch_sha256,
+    "exact_raster_patch_sha256": exact_raster_patch_sha256,
     "dependencies": {
         "nlohmann_json_v3.11.3_sha256": nlohmann_json_sha256,
         "nanoflann_v1.5.5_sha256": nanoflann_sha256,
@@ -248,6 +294,7 @@ payload = {
         "-DCMAKE_OSX_ARCHITECTURES=arm64",
         "-DCMAKE_OSX_DEPLOYMENT_TARGET=15.0",
         "-DMSPLAT_BUILD_PYTHON=OFF",
+        "-DMSPLAT_BUILD_RASTER_TESTS=ON",
         "-DFETCHCONTENT_FULLY_DISCONNECTED=ON",
         "FETCHCONTENT_SOURCE_DIR_NLOHMANN_JSON=verified-v3.11.3",
         "FETCHCONTENT_SOURCE_DIR_NANOFLANN=verified-v1.5.5",
@@ -284,6 +331,7 @@ validate_stage() {
   [ -s "$STAGE_DIR/LICENSE" ] || die "staged license is empty"
   [ -s "$STAGE_DIR/build_info.json" ] || die "staged provenance is empty"
   /usr/bin/file -b "$binary" | grep -q 'Mach-O 64-bit executable arm64' || die "staged CLI is not arm64 Mach-O"
+  reject_raster_test_symbols "$binary"
   /usr/bin/otool -L "$binary" | tail -n +2 | awk '{print $1}' | while IFS= read -r dependency; do
     case "$dependency" in
       /System/Library/*|/usr/lib/*) ;;

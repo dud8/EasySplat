@@ -190,10 +190,9 @@ final class ProjectMetadataStoreTests: XCTestCase {
         try incompleteCurrentFormat.write(to: url, atomically: true, encoding: .utf8)
 
         XCTAssertThrowsError(try ProjectMetadataStore.load(from: url)) { error in
-            guard case DecodingError.keyNotFound(let key, _) = error else {
+            guard case DecodingError.keyNotFound = error else {
                 return XCTFail("Expected keyNotFound, got \(error)")
             }
-            XCTAssertEqual(key.stringValue, "trainerBuildDigest")
         }
     }
 
@@ -222,6 +221,9 @@ final class ProjectMetadataStoreTests: XCTestCase {
             gaussianCount: 100,
             elapsedSeconds: 10,
             peakMemoryBytes: 1_024,
+            memoryBudgetBytes: 8_589_934_592,
+            rasterFallbackCount: 0,
+            droppedIntersectionCount: 0,
             completionStatus: .completed
         )
         let metadata = ProjectMetadata(

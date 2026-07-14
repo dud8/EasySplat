@@ -7,6 +7,17 @@ import UniformTypeIdentifiers
 import SQLite3
 
 final class PipelineIntegrationTests: XCTestCase {
+    private var automaticTrainingMemoryBudgetBytes: Int64 {
+        TrainingMemoryBudget.resolve(
+            hardware: HardwareProfile(
+                memoryGB: 48,
+                cpuCount: 16,
+                gpuWorkingSetGB: 36
+            ),
+            resourcePolicy: .automatic
+        )
+    }
+
     private func makePipelineConfig(
         toolchain: ToolchainPaths,
         candidateRoute: SfmBackend? = nil,
@@ -150,7 +161,7 @@ final class PipelineIntegrationTests: XCTestCase {
         XCTAssertEqual(geometry.medianPixelResidual, 0, accuracy: 0.000_001)
         XCTAssertEqual(geometry.p90PixelResidual, 0, accuracy: 0.000_001)
         XCTAssertGreaterThan(try XCTUnwrap(geometry.timings[PipelineStage.sfmMapping.rawValue]), 0)
-        XCTAssertEqual(geometry.schemaVersion, 2)
+        XCTAssertEqual(geometry.schemaVersion, GeometryArtifact.currentSchemaVersion)
         XCTAssertEqual(geometry.modelVersion, "none")
         XCTAssertEqual(geometry.provenance.toolchainVersion, "Toolchain")
         XCTAssertEqual(geometry.provenance.solver.identifier, "colmap")
@@ -524,10 +535,11 @@ final class PipelineIntegrationTests: XCTestCase {
         let trainerDigest = String(repeating: "3", count: 64)
         let payloadDigest = String(repeating: "4", count: 64)
         let generation = "00000000-" + String(repeating: "5", count: 64)
+        let memoryBudgetBytes = automaticTrainingMemoryBudgetBytes
         let msplatEvents = """
-        {"camera_count":12,"checkpoint_schema":1,"event":"started","geometry_digest":"\(geometryDigest)","initial_gaussian_count":1500,"input_digest":"\(inputDigest)","iteration":0,"iteration_limit":3000,"payload_schema":2,"plateau_window":400,"profile":"fast","resumed":false,"schema_version":1,"seed":42,"sequence":1,"trainer_build_digest":"\(trainerDigest)","version":"1.1.3 (git 106499b)"}
-        {"checkpoint_generation":"\(generation)","checkpoint_payload_bytes":128,"checkpoint_payload_sha256":"\(payloadDigest)","event":"checkpoint_completed","gaussian_count":1500,"geometry_digest":"\(geometryDigest)","input_digest":"\(inputDigest)","iteration":0,"peak_memory_bytes":268435456,"profile":"fast","schema_version":1,"seed":42,"sequence":2,"trainer_build_digest":"\(trainerDigest)","version":"1.1.3 (git 106499b)"}
-        {"elapsed_seconds":2,"event":"completed","gaussian_count":1800,"geometry_digest":"\(geometryDigest)","input_digest":"\(inputDigest)","iteration":3000,"iteration_limit":3000,"output_bytes":\(msplatOutputBytes),"peak_memory_bytes":536870912,"plateau_window":400,"profile":"fast","schema_version":1,"seed":42,"sequence":3,"stop_reason":"iteration_limit","trainer_build_digest":"\(trainerDigest)","version":"1.1.3 (git 106499b)"}
+        {"camera_count":12,"checkpoint_schema":2,"event":"started","geometry_digest":"\(geometryDigest)","initial_gaussian_count":1500,"input_digest":"\(inputDigest)","iteration":0,"iteration_limit":3000,"memory_budget_bytes":\(memoryBudgetBytes),"payload_schema":2,"plateau_window":400,"profile":"fast","resumed":false,"schema_version":1,"seed":42,"sequence":1,"trainer_build_digest":"\(trainerDigest)","version":"1.1.3 (git 106499b)"}
+        {"checkpoint_generation":"\(generation)","checkpoint_payload_bytes":128,"checkpoint_payload_sha256":"\(payloadDigest)","dropped_intersection_count":0,"event":"checkpoint_completed","gaussian_count":1500,"geometry_digest":"\(geometryDigest)","input_digest":"\(inputDigest)","iteration":0,"memory_budget_bytes":\(memoryBudgetBytes),"peak_memory_bytes":268435456,"profile":"fast","raster_fallback_count":0,"schema_version":1,"seed":42,"sequence":2,"trainer_build_digest":"\(trainerDigest)","version":"1.1.3 (git 106499b)"}
+        {"dropped_intersection_count":0,"elapsed_seconds":2,"event":"completed","gaussian_count":1800,"geometry_digest":"\(geometryDigest)","input_digest":"\(inputDigest)","iteration":3000,"iteration_limit":3000,"memory_budget_bytes":\(memoryBudgetBytes),"output_bytes":\(msplatOutputBytes),"peak_memory_bytes":536870912,"plateau_window":400,"profile":"fast","raster_fallback_count":0,"schema_version":1,"seed":42,"sequence":3,"stop_reason":"iteration_limit","trainer_build_digest":"\(trainerDigest)","version":"1.1.3 (git 106499b)"}
         """ + "\n"
         var msplatDatasetPath: String?
         let runner = MockSubprocessRunner(scripts: [
@@ -587,6 +599,10 @@ final class PipelineIntegrationTests: XCTestCase {
                     XCTAssertTrue(FileManager.default.fileExists(atPath: dataset.appendingPathComponent("sparse/0/cameras.bin").path))
                     XCTAssertTrue(args.contains("fast"))
                     XCTAssertFalse(args.contains("--num-iters"))
+                    XCTAssertEqual(
+                        self.value(for: "--memory-budget-bytes", in: args),
+                        String(memoryBudgetBytes)
+                    )
                     try? TestFileBuilder.writeMinimalPly(
                         at: URL(fileURLWithPath: outputArg),
                         vertexCount: 1_800
@@ -618,6 +634,10 @@ final class PipelineIntegrationTests: XCTestCase {
         let plan = try XCTUnwrap(completedMetadata.resolvedRunPlan)
         let trainingArtifact = try XCTUnwrap(completedMetadata.trainingArtifact)
         XCTAssertEqual(trainingArtifact.completionStatus, .completed)
+        XCTAssertEqual(plan.trainerMemoryBudgetBytes, memoryBudgetBytes)
+        XCTAssertEqual(trainingArtifact.memoryBudgetBytes, memoryBudgetBytes)
+        XCTAssertEqual(trainingArtifact.rasterFallbackCount, 0)
+        XCTAssertEqual(trainingArtifact.droppedIntersectionCount, 0)
         XCTAssertEqual(trainingArtifact.trainerBuildDigest, trainerDigest)
         XCTAssertEqual(trainingArtifact.outputPath, "Output/splat.ply")
         XCTAssertEqual(trainingArtifact.iterationLimit, plan.trainerIterationLimit)
@@ -757,6 +777,7 @@ final class PipelineIntegrationTests: XCTestCase {
             ),
             sparseDirectory: sparse
         )
+        let memoryBudgetBytes = automaticTrainingMemoryBudgetBytes
         let receipt = try makeMsplatCheckpointFixture(
             at: paths.msplatCheckpointURL,
             iteration: 500,
@@ -764,14 +785,15 @@ final class PipelineIntegrationTests: XCTestCase {
             iterationLimit: 3_000,
             plateauWindow: 400,
             inputDigest: datasetIdentity.inputDigest,
-            geometryDigest: datasetIdentity.geometryDigest
+            geometryDigest: datasetIdentity.geometryDigest,
+            memoryBudgetBytes: memoryBudgetBytes
         )
         let initialGeneration = "00000000-" + String(repeating: "5", count: 64)
         let interruptedEvents = """
-        {"camera_count":8,"checkpoint_schema":1,"event":"started","geometry_digest":"\(receipt.geometryDigest)","initial_gaussian_count":750,"input_digest":"\(receipt.inputDigest)","iteration":0,"iteration_limit":3000,"payload_schema":2,"plateau_window":400,"profile":"fast","resumed":false,"schema_version":1,"seed":42,"sequence":1,"trainer_build_digest":"\(receipt.trainerBuildDigest)","version":"1.1.3 (git 106499b)"}
-        {"checkpoint_generation":"\(initialGeneration)","checkpoint_payload_bytes":128,"checkpoint_payload_sha256":"\(String(repeating: "4", count: 64))","event":"checkpoint_completed","gaussian_count":750,"geometry_digest":"\(receipt.geometryDigest)","input_digest":"\(receipt.inputDigest)","iteration":0,"peak_memory_bytes":\(receipt.peakMemoryBytes),"profile":"fast","schema_version":1,"seed":42,"sequence":2,"trainer_build_digest":"\(receipt.trainerBuildDigest)","version":"1.1.3 (git 106499b)"}
+        {"camera_count":8,"checkpoint_schema":2,"event":"started","geometry_digest":"\(receipt.geometryDigest)","initial_gaussian_count":750,"input_digest":"\(receipt.inputDigest)","iteration":0,"iteration_limit":3000,"memory_budget_bytes":\(memoryBudgetBytes),"payload_schema":2,"plateau_window":400,"profile":"fast","resumed":false,"schema_version":1,"seed":42,"sequence":1,"trainer_build_digest":"\(receipt.trainerBuildDigest)","version":"1.1.3 (git 106499b)"}
+        {"checkpoint_generation":"\(initialGeneration)","checkpoint_payload_bytes":128,"checkpoint_payload_sha256":"\(String(repeating: "4", count: 64))","dropped_intersection_count":0,"event":"checkpoint_completed","gaussian_count":750,"geometry_digest":"\(receipt.geometryDigest)","input_digest":"\(receipt.inputDigest)","iteration":0,"memory_budget_bytes":\(memoryBudgetBytes),"peak_memory_bytes":\(receipt.peakMemoryBytes),"profile":"fast","raster_fallback_count":0,"schema_version":1,"seed":42,"sequence":2,"trainer_build_digest":"\(receipt.trainerBuildDigest)","version":"1.1.3 (git 106499b)"}
         {"elapsed_seconds":2,"eta_seconds":20,"event":"progress","gaussian_count":750,"iteration":500,"iteration_limit":3000,"iterations_per_second":250,"schema_version":1,"sequence":3}
-        {"checkpoint_generation":"\(receipt.generation)","checkpoint_payload_bytes":\(receipt.payloadBytes),"checkpoint_payload_sha256":"\(receipt.payloadSHA256)","event":"checkpoint_completed","gaussian_count":\(receipt.gaussianCount),"geometry_digest":"\(receipt.geometryDigest)","input_digest":"\(receipt.inputDigest)","iteration":\(receipt.iteration),"peak_memory_bytes":\(receipt.peakMemoryBytes),"profile":"fast","schema_version":1,"seed":42,"sequence":4,"trainer_build_digest":"\(receipt.trainerBuildDigest)","version":"1.1.3 (git 106499b)"}
+        {"checkpoint_generation":"\(receipt.generation)","checkpoint_payload_bytes":\(receipt.payloadBytes),"checkpoint_payload_sha256":"\(receipt.payloadSHA256)","dropped_intersection_count":0,"event":"checkpoint_completed","gaussian_count":\(receipt.gaussianCount),"geometry_digest":"\(receipt.geometryDigest)","input_digest":"\(receipt.inputDigest)","iteration":\(receipt.iteration),"memory_budget_bytes":\(memoryBudgetBytes),"peak_memory_bytes":\(receipt.peakMemoryBytes),"profile":"fast","raster_fallback_count":0,"schema_version":1,"seed":42,"sequence":4,"trainer_build_digest":"\(receipt.trainerBuildDigest)","version":"1.1.3 (git 106499b)"}
         {"event":"cancellation_requested","iteration":575,"schema_version":1,"sequence":5,"signal":2}
         {"checkpoint_generation":"\(receipt.generation)","checkpoint_iteration":\(receipt.iteration),"checkpoint_payload_sha256":"\(receipt.payloadSHA256)","event":"cancelled","geometry_digest":"\(receipt.geometryDigest)","input_digest":"\(receipt.inputDigest)","iteration":575,"schema_version":1,"sequence":6}
         """ + "\n"
@@ -807,6 +829,9 @@ final class PipelineIntegrationTests: XCTestCase {
         XCTAssertEqual(interruptedMetadata.trainingArtifact?.completedIteration, 500)
         XCTAssertEqual(interruptedMetadata.trainingArtifact?.checkpointDigest, receipt.payloadSHA256)
         XCTAssertEqual(interruptedMetadata.trainingArtifact?.peakMemoryBytes, receipt.peakMemoryBytes)
+        XCTAssertEqual(interruptedMetadata.trainingArtifact?.memoryBudgetBytes, memoryBudgetBytes)
+        XCTAssertEqual(interruptedMetadata.trainingArtifact?.rasterFallbackCount, 0)
+        XCTAssertEqual(interruptedMetadata.trainingArtifact?.droppedIntersectionCount, 0)
 
         let outputProbe = temp.appendingPathComponent("resume-output-probe.ply")
         try TestFileBuilder.writeMinimalPly(at: outputProbe, vertexCount: 1_400)
@@ -815,10 +840,10 @@ final class PipelineIntegrationTests: XCTestCase {
         )
         try FileManager.default.removeItem(at: outputProbe)
         let freshEvents = """
-        {"camera_count":8,"checkpoint_schema":1,"event":"started","geometry_digest":"\(receipt.geometryDigest)","initial_gaussian_count":\(receipt.gaussianCount),"input_digest":"\(receipt.inputDigest)","iteration":0,"iteration_limit":3000,"payload_schema":2,"plateau_window":400,"profile":"fast","resumed":false,"schema_version":1,"seed":42,"sequence":1,"trainer_build_digest":"\(receipt.trainerBuildDigest)","version":"1.1.3 (git 106499b)"}
-        {"checkpoint_generation":"\(initialGeneration)","checkpoint_payload_bytes":128,"checkpoint_payload_sha256":"\(String(repeating: "4", count: 64))","event":"checkpoint_completed","gaussian_count":\(receipt.gaussianCount),"geometry_digest":"\(receipt.geometryDigest)","input_digest":"\(receipt.inputDigest)","iteration":0,"peak_memory_bytes":\(receipt.peakMemoryBytes),"profile":"fast","schema_version":1,"seed":42,"sequence":2,"trainer_build_digest":"\(receipt.trainerBuildDigest)","version":"1.1.3 (git 106499b)"}
+        {"camera_count":8,"checkpoint_schema":2,"event":"started","geometry_digest":"\(receipt.geometryDigest)","initial_gaussian_count":\(receipt.gaussianCount),"input_digest":"\(receipt.inputDigest)","iteration":0,"iteration_limit":3000,"memory_budget_bytes":\(memoryBudgetBytes),"payload_schema":2,"plateau_window":400,"profile":"fast","resumed":false,"schema_version":1,"seed":42,"sequence":1,"trainer_build_digest":"\(receipt.trainerBuildDigest)","version":"1.1.3 (git 106499b)"}
+        {"checkpoint_generation":"\(initialGeneration)","checkpoint_payload_bytes":128,"checkpoint_payload_sha256":"\(String(repeating: "4", count: 64))","dropped_intersection_count":0,"event":"checkpoint_completed","gaussian_count":\(receipt.gaussianCount),"geometry_digest":"\(receipt.geometryDigest)","input_digest":"\(receipt.inputDigest)","iteration":0,"memory_budget_bytes":\(memoryBudgetBytes),"peak_memory_bytes":\(receipt.peakMemoryBytes),"profile":"fast","raster_fallback_count":0,"schema_version":1,"seed":42,"sequence":2,"trainer_build_digest":"\(receipt.trainerBuildDigest)","version":"1.1.3 (git 106499b)"}
         {"elapsed_seconds":4,"eta_seconds":0,"event":"progress","gaussian_count":1400,"iteration":3000,"iteration_limit":3000,"iterations_per_second":1600,"schema_version":1,"sequence":3}
-        {"elapsed_seconds":4,"event":"completed","gaussian_count":1400,"geometry_digest":"\(receipt.geometryDigest)","input_digest":"\(receipt.inputDigest)","iteration":3000,"iteration_limit":3000,"output_bytes":\(outputBytes),"peak_memory_bytes":536870912,"plateau_window":400,"profile":"fast","schema_version":1,"seed":42,"sequence":4,"stop_reason":"iteration_limit","trainer_build_digest":"\(receipt.trainerBuildDigest)","version":"1.1.3 (git 106499b)"}
+        {"dropped_intersection_count":0,"elapsed_seconds":4,"event":"completed","gaussian_count":1400,"geometry_digest":"\(receipt.geometryDigest)","input_digest":"\(receipt.inputDigest)","iteration":3000,"iteration_limit":3000,"memory_budget_bytes":\(memoryBudgetBytes),"output_bytes":\(outputBytes),"peak_memory_bytes":536870912,"plateau_window":400,"profile":"fast","raster_fallback_count":0,"schema_version":1,"seed":42,"sequence":4,"stop_reason":"iteration_limit","trainer_build_digest":"\(receipt.trainerBuildDigest)","version":"1.1.3 (git 106499b)"}
         """ + "\n"
         let secondRunner = MockSubprocessRunner(scripts: [
             .init(path: toolchain.colmap.path, argsPrefix: ["model_converter"], result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""), onRun: { args in
@@ -940,11 +965,13 @@ final class PipelineIntegrationTests: XCTestCase {
             sparseDirectory: sparse
         )
 
+        let memoryBudgetBytes = automaticTrainingMemoryBudgetBytes
         let receipt = try makeMsplatCheckpointFixture(
             at: paths.msplatCheckpointURL,
             iteration: 500,
             inputDigest: datasetIdentity.inputDigest,
-            geometryDigest: datasetIdentity.geometryDigest
+            geometryDigest: datasetIdentity.geometryDigest,
+            memoryBudgetBytes: memoryBudgetBytes
         )
         let artifact = TrainingArtifact(
             trainerVersion: "1.1.3 (git 106499b)",
@@ -963,6 +990,9 @@ final class PipelineIntegrationTests: XCTestCase {
             gaussianCount: receipt.gaussianCount,
             elapsedSeconds: nil,
             peakMemoryBytes: receipt.peakMemoryBytes,
+            memoryBudgetBytes: receipt.memoryBudgetBytes,
+            rasterFallbackCount: receipt.rasterFallbackCount,
+            droppedIntersectionCount: receipt.droppedIntersectionCount,
             completionStatus: .checkpointed
         )
         var metadata = ProjectMetadata(
@@ -1038,10 +1068,10 @@ final class PipelineIntegrationTests: XCTestCase {
         )
         try FileManager.default.removeItem(at: outputProbe)
         let resumedEvents = """
-        {"camera_count":8,"checkpoint_schema":1,"event":"started","geometry_digest":"\(receipt.geometryDigest)","initial_gaussian_count":\(receipt.gaussianCount),"input_digest":"\(receipt.inputDigest)","iteration":500,"iteration_limit":7000,"payload_schema":2,"plateau_window":800,"profile":"balanced","resumed":true,"schema_version":1,"seed":42,"sequence":1,"trainer_build_digest":"\(receipt.trainerBuildDigest)","version":"1.1.3 (git 106499b)"}
-        {"checkpoint_generation":"\(receipt.generation)","checkpoint_payload_bytes":\(receipt.payloadBytes),"checkpoint_payload_sha256":"\(receipt.payloadSHA256)","event":"checkpoint_loaded","gaussian_count":\(receipt.gaussianCount),"geometry_digest":"\(receipt.geometryDigest)","input_digest":"\(receipt.inputDigest)","iteration":500,"peak_memory_bytes":\(receipt.peakMemoryBytes),"profile":"balanced","schema_version":1,"seed":42,"sequence":2,"trainer_build_digest":"\(receipt.trainerBuildDigest)","version":"1.1.3 (git 106499b)"}
+        {"camera_count":8,"checkpoint_schema":2,"event":"started","geometry_digest":"\(receipt.geometryDigest)","initial_gaussian_count":\(receipt.gaussianCount),"input_digest":"\(receipt.inputDigest)","iteration":500,"iteration_limit":7000,"memory_budget_bytes":\(memoryBudgetBytes),"payload_schema":2,"plateau_window":800,"profile":"balanced","resumed":true,"schema_version":1,"seed":42,"sequence":1,"trainer_build_digest":"\(receipt.trainerBuildDigest)","version":"1.1.3 (git 106499b)"}
+        {"checkpoint_generation":"\(receipt.generation)","checkpoint_payload_bytes":\(receipt.payloadBytes),"checkpoint_payload_sha256":"\(receipt.payloadSHA256)","dropped_intersection_count":0,"event":"checkpoint_loaded","gaussian_count":\(receipt.gaussianCount),"geometry_digest":"\(receipt.geometryDigest)","input_digest":"\(receipt.inputDigest)","iteration":500,"memory_budget_bytes":\(memoryBudgetBytes),"peak_memory_bytes":\(receipt.peakMemoryBytes),"profile":"balanced","raster_fallback_count":0,"schema_version":1,"seed":42,"sequence":2,"trainer_build_digest":"\(receipt.trainerBuildDigest)","version":"1.1.3 (git 106499b)"}
         {"elapsed_seconds":4,"eta_seconds":0,"event":"progress","gaussian_count":1400,"iteration":7000,"iteration_limit":7000,"iterations_per_second":1600,"schema_version":1,"sequence":3}
-        {"elapsed_seconds":4,"event":"completed","gaussian_count":1400,"geometry_digest":"\(receipt.geometryDigest)","input_digest":"\(receipt.inputDigest)","iteration":7000,"iteration_limit":7000,"output_bytes":\(outputBytes),"peak_memory_bytes":805306368,"plateau_window":800,"profile":"balanced","schema_version":1,"seed":42,"sequence":4,"stop_reason":"iteration_limit","trainer_build_digest":"\(receipt.trainerBuildDigest)","version":"1.1.3 (git 106499b)"}
+        {"dropped_intersection_count":0,"elapsed_seconds":4,"event":"completed","gaussian_count":1400,"geometry_digest":"\(receipt.geometryDigest)","input_digest":"\(receipt.inputDigest)","iteration":7000,"iteration_limit":7000,"memory_budget_bytes":\(memoryBudgetBytes),"output_bytes":\(outputBytes),"peak_memory_bytes":805306368,"plateau_window":800,"profile":"balanced","raster_fallback_count":0,"schema_version":1,"seed":42,"sequence":4,"stop_reason":"iteration_limit","trainer_build_digest":"\(receipt.trainerBuildDigest)","version":"1.1.3 (git 106499b)"}
         """ + "\n"
         let retryRunner = MockSubprocessRunner(scripts: [
             converterScript(),

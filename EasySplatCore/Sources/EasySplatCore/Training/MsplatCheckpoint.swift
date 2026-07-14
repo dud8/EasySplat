@@ -9,6 +9,9 @@ public struct MsplatCheckpointReceipt: Sendable, Equatable {
     public let payloadBytes: Int64
     public let gaussianCount: Int
     public let peakMemoryBytes: Int64
+    public let memoryBudgetBytes: Int64
+    public let rasterFallbackCount: Int
+    public let droppedIntersectionCount: Int
     public let inputDigest: String
     public let geometryDigest: String
     public let trainerBuildDigest: String
@@ -20,6 +23,9 @@ public struct MsplatCheckpointReceipt: Sendable, Equatable {
         payloadBytes: Int64,
         gaussianCount: Int,
         peakMemoryBytes: Int64,
+        memoryBudgetBytes: Int64,
+        rasterFallbackCount: Int,
+        droppedIntersectionCount: Int,
         inputDigest: String,
         geometryDigest: String,
         trainerBuildDigest: String
@@ -30,6 +36,9 @@ public struct MsplatCheckpointReceipt: Sendable, Equatable {
         self.payloadBytes = payloadBytes
         self.gaussianCount = gaussianCount
         self.peakMemoryBytes = peakMemoryBytes
+        self.memoryBudgetBytes = memoryBudgetBytes
+        self.rasterFallbackCount = rasterFallbackCount
+        self.droppedIntersectionCount = droppedIntersectionCount
         self.inputDigest = inputDigest
         self.geometryDigest = geometryDigest
         self.trainerBuildDigest = trainerBuildDigest
@@ -56,6 +65,7 @@ struct MsplatCheckpointExpectation: Sendable {
     let cameraCount: Int
     let inputDigest: String
     let geometryDigest: String
+    let memoryBudgetBytes: Int64
 }
 
 enum MsplatCheckpointValidator {
@@ -63,11 +73,11 @@ enum MsplatCheckpointValidator {
     private static let maximumPayloadBytes: Int64 = 32 * 1_024 * 1_024 * 1_024
     private static let manifestKeys: Set<String> = [
         "backing_capacity", "best_camera_losses", "camera_count", "camera_draw_count",
-        "elapsed_seconds", "gaussian_count", "geometry_digest", "input_digest",
+        "dropped_intersection_count", "elapsed_seconds", "gaussian_count", "geometry_digest", "input_digest",
         "iteration", "iteration_limit", "last_improvement_iteration", "latest_loss",
-        "latest_loss_iteration", "payload_bytes", "payload_file", "payload_schema",
+        "latest_loss_iteration", "memory_budget_bytes", "payload_bytes", "payload_file", "payload_schema",
         "payload_sha256", "plateau_window", "profile", "schema_version", "seed",
-        "trainer_build_digest", "trainer_version",
+        "raster_fallback_count", "trainer_build_digest", "trainer_version",
     ]
 
     static func validate(
@@ -87,7 +97,13 @@ enum MsplatCheckpointValidator {
               receipt.payloadBytes > 0,
               receipt.payloadBytes <= maximumPayloadBytes,
               receipt.gaussianCount > 0,
-              receipt.peakMemoryBytes > 0 else {
+              receipt.peakMemoryBytes > 0,
+              receipt.memoryBudgetBytes == expectation.memoryBudgetBytes,
+              isValidRasterFallbackCount(
+                  receipt.rasterFallbackCount,
+                  through: receipt.iteration
+              ),
+              receipt.droppedIntersectionCount == 0 else {
             throw MsplatCheckpointValidationError("checkpoint receipt is invalid")
         }
 
@@ -118,12 +134,12 @@ enum MsplatCheckpointValidator {
         let manifestData = try boundedData(from: manifestURL, maximumBytes: maximumManifestBytes)
         guard let object = try JSONSerialization.jsonObject(with: manifestData) as? [String: Any],
               Set(object.keys) == manifestKeys else {
-            throw MsplatCheckpointValidationError("checkpoint manifest keys do not match schema 1")
+            throw MsplatCheckpointValidationError("checkpoint manifest keys do not match schema 2")
         }
         let decoder = JSONDecoder()
         let manifest = try decoder.decode(Manifest.self, from: manifestData)
 
-        guard manifest.schemaVersion == 1,
+        guard manifest.schemaVersion == 2,
               manifest.payloadSchema == 2,
               manifest.trainerVersion == expectation.trainerVersion,
               manifest.trainerBuildDigest == expectation.trainerBuildDigest,
@@ -135,10 +151,17 @@ enum MsplatCheckpointValidator {
               manifest.cameraDrawCount == manifest.iteration,
               manifest.inputDigest == expectation.inputDigest,
               manifest.geometryDigest == expectation.geometryDigest,
+              manifest.memoryBudgetBytes == expectation.memoryBudgetBytes,
               manifest.iteration >= 0,
               manifest.iteration < expectation.iterationLimit,
               manifest.iteration == receipt.iteration,
               manifest.gaussianCount == receipt.gaussianCount,
+              manifest.rasterFallbackCount == receipt.rasterFallbackCount,
+              isValidRasterFallbackCount(
+                  manifest.rasterFallbackCount,
+                  through: manifest.iteration
+              ),
+              manifest.droppedIntersectionCount == 0,
               manifest.gaussianCount > 0,
               manifest.backingCapacity >= manifest.gaussianCount,
               manifest.payloadFile == "state.msplat",
@@ -185,7 +208,7 @@ enum MsplatCheckpointValidator {
         artifact: TrainingArtifact
     ) throws -> MsplatCheckpointReceipt {
         do {
-            guard artifact.schemaVersion == 1,
+            guard artifact.schemaVersion == 2,
                   artifact.completionStatus == .checkpointed,
                   artifact.trainerVersion == "1.1.3 (git 106499b)",
                   artifact.runtimeVersion == "native-metal-cli-v1",
@@ -199,7 +222,13 @@ enum MsplatCheckpointValidator {
                   artifact.completedIteration >= 0,
                   artifact.completedIteration < artifact.iterationLimit,
                   artifact.gaussianCount > 0,
-                  artifact.peakMemoryBytes > 0 else {
+                  artifact.peakMemoryBytes > 0,
+                  artifact.memoryBudgetBytes > 0,
+                  isValidRasterFallbackCount(
+                      artifact.rasterFallbackCount,
+                      through: artifact.completedIteration
+                  ),
+                  artifact.droppedIntersectionCount == 0 else {
                 throw MsplatCheckpointValidationError("training manifest has no compatible resume record")
             }
             let peakMemoryBytes = artifact.peakMemoryBytes
@@ -228,7 +257,7 @@ enum MsplatCheckpointValidator {
             let manifestData = try boundedData(from: manifestURL, maximumBytes: maximumManifestBytes)
             guard let object = try JSONSerialization.jsonObject(with: manifestData) as? [String: Any],
                   Set(object.keys) == manifestKeys else {
-                throw MsplatCheckpointValidationError("checkpoint manifest keys do not match schema 1")
+                throw MsplatCheckpointValidationError("checkpoint manifest keys do not match schema 2")
             }
             let manifest = try JSONDecoder().decode(Manifest.self, from: manifestData)
             let receipt = MsplatCheckpointReceipt(
@@ -238,6 +267,9 @@ enum MsplatCheckpointValidator {
                 payloadBytes: manifest.payloadBytes,
                 gaussianCount: manifest.gaussianCount,
                 peakMemoryBytes: peakMemoryBytes,
+                memoryBudgetBytes: manifest.memoryBudgetBytes,
+                rasterFallbackCount: manifest.rasterFallbackCount,
+                droppedIntersectionCount: 0,
                 inputDigest: manifest.inputDigest,
                 geometryDigest: manifest.geometryDigest,
                 trainerBuildDigest: manifest.trainerBuildDigest
@@ -260,10 +292,12 @@ enum MsplatCheckpointValidator {
                     seed: artifact.deterministicSeed,
                     cameraCount: manifest.cameraCount,
                     inputDigest: artifact.inputDigest,
-                    geometryDigest: artifact.geometryDigest
+                    geometryDigest: artifact.geometryDigest,
+                    memoryBudgetBytes: artifact.memoryBudgetBytes
                 )
             )
             guard receipt.iteration >= artifact.completedIteration,
+                  receipt.rasterFallbackCount >= artifact.rasterFallbackCount,
                   receipt.iteration != artifact.completedIteration
                     || receipt.payloadSHA256 == recordedPayloadDigest else {
                 throw MsplatCheckpointValidationError("checkpoint is older than its training manifest")
@@ -329,6 +363,13 @@ enum MsplatCheckpointValidator {
         }
     }
 
+    private static func isValidRasterFallbackCount(
+        _ count: Int,
+        through iteration: Int
+    ) -> Bool {
+        count >= 0 && count <= min(iteration, Int(UInt32.max))
+    }
+
     private static func isGeneration(_ value: String) -> Bool {
         guard value.count == 73 else { return false }
         let bytes = Array(value.utf8)
@@ -343,6 +384,7 @@ enum MsplatCheckpointValidator {
         let cameraCount: Int
         let cameraDrawCount: Int
         let elapsedSeconds: Double
+        let droppedIntersectionCount: Int
         let gaussianCount: Int
         let geometryDigest: String
         let inputDigest: String
@@ -351,12 +393,14 @@ enum MsplatCheckpointValidator {
         let lastImprovementIteration: Int
         let latestLoss: Double?
         let latestLossIteration: Int
+        let memoryBudgetBytes: Int64
         let payloadBytes: Int64
         let payloadFile: String
         let payloadSchema: Int
         let payloadSHA256: String
         let plateauWindow: Int
         let profile: String
+        let rasterFallbackCount: Int
         let schemaVersion: Int
         let seed: UInt64
         let trainerBuildDigest: String
@@ -368,6 +412,7 @@ enum MsplatCheckpointValidator {
             case cameraCount = "camera_count"
             case cameraDrawCount = "camera_draw_count"
             case elapsedSeconds = "elapsed_seconds"
+            case droppedIntersectionCount = "dropped_intersection_count"
             case gaussianCount = "gaussian_count"
             case geometryDigest = "geometry_digest"
             case inputDigest = "input_digest"
@@ -376,12 +421,14 @@ enum MsplatCheckpointValidator {
             case lastImprovementIteration = "last_improvement_iteration"
             case latestLoss = "latest_loss"
             case latestLossIteration = "latest_loss_iteration"
+            case memoryBudgetBytes = "memory_budget_bytes"
             case payloadBytes = "payload_bytes"
             case payloadFile = "payload_file"
             case payloadSchema = "payload_schema"
             case payloadSHA256 = "payload_sha256"
             case plateauWindow = "plateau_window"
             case profile
+            case rasterFallbackCount = "raster_fallback_count"
             case schemaVersion = "schema_version"
             case seed
             case trainerBuildDigest = "trainer_build_digest"

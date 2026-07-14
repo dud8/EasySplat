@@ -172,6 +172,7 @@ private func makeResolvedRunPlan() -> ResolvedRunPlan {
         refinementIterationLimit: 75,
         trainerIterationLimit: 15_000,
         plateauWindow: 1_500,
+        trainerMemoryBudgetBytes: 32_212_254_720,
         requiredToolchainCapabilities: ["geometry-v2", "training-v2"],
         fallbackRouteIdentifiers: ["geometry.apple-silicon.fallback"]
     )
@@ -245,6 +246,9 @@ func makeTrainingArtifact(
         gaussianCount: 245_000,
         elapsedSeconds: 812.5,
         peakMemoryBytes: 4_294_967_296,
+        memoryBudgetBytes: 32_212_254_720,
+        rasterFallbackCount: 0,
+        droppedIntersectionCount: 0,
         completionStatus: completionStatus
     )
 }

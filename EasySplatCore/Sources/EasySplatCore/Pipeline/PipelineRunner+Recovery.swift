@@ -139,6 +139,18 @@ extension PipelineRunner {
                 "The bounded image-retrieval graph was disconnected before COLMAP matching."
             )
         }
+        if let memoryError = error as? MsplatRasterMemoryBudgetExceeded {
+            return (
+                "Training needs more memory than this run allows.",
+                "Exact raster allocation required \(memoryError.requiredBytes) bytes at iteration \(memoryError.iteration); resolved budget \(memoryError.budgetBytes) bytes."
+            )
+        }
+        if let resourceError = error as? MsplatRasterResourceLimitExceeded {
+            return (
+                "This scene exceeded Metal's size limit for one training buffer.",
+                "Exact raster allocation required \(resourceError.requiredBytes) bytes at iteration \(resourceError.iteration); Metal maximum \(resourceError.maximumBufferBytes) bytes."
+            )
+        }
         if let subprocessFailure = error as? SubprocessFailure {
             return ("Processing failed. Check details for more info.", subprocessFailure.debugDescription)
         }
@@ -378,6 +390,15 @@ extension PipelineRunner {
                         return .corrupt(
                             reason: "completed training profile does not match the requested detail"
                         )
+                    }
+                    if let plan = metadata.resolvedRunPlan {
+                        guard artifact.iterationLimit == plan.trainerIterationLimit,
+                              artifact.plateauWindow == plan.plateauWindow,
+                              artifact.memoryBudgetBytes == plan.trainerMemoryBudgetBytes else {
+                            return .corrupt(
+                                reason: "completed training manifest does not match the resolved training plan"
+                            )
+                        }
                     }
                     guard let outputPath = artifact.outputPath else {
                         return .corrupt(reason: "completed training manifest has no output path")

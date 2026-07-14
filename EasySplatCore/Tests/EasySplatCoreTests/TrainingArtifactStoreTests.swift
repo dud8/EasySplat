@@ -61,6 +61,55 @@ final class TrainingArtifactStoreTests: XCTestCase {
         )
     }
 
+    func testCompletedArtifactRequiresZeroDroppedRasterIntersections() throws {
+        let context = try makeContext()
+        defer { context.cleanup() }
+        var artifact = try makeCompletedArtifact(in: context)
+        artifact.droppedIntersectionCount = 1
+
+        XCTAssertThrowsError(
+            try TrainingArtifactStore.save(
+                artifact,
+                to: context.paths.trainingManifestURL,
+                projectPaths: context.paths
+            )
+        )
+    }
+
+    func testArtifactRejectsFallbackCountsOutsideCompletedIterationsAndNativeRange() throws {
+        let context = try makeContext()
+        defer { context.cleanup() }
+
+        for invalidCount in [501, Int(UInt32.max) + 1] {
+            var artifact = makeCheckpointedArtifact()
+            artifact.rasterFallbackCount = invalidCount
+
+            XCTAssertThrowsError(
+                try TrainingArtifactStore.save(
+                    artifact,
+                    to: context.paths.trainingManifestURL,
+                    projectPaths: context.paths
+                ),
+                "Accepted raster fallback count \(invalidCount) at iteration \(artifact.completedIteration)"
+            )
+        }
+    }
+
+    func testTrainingSchemaOneIsRejected() throws {
+        let context = try makeContext()
+        defer { context.cleanup() }
+        var artifact = makeCheckpointedArtifact()
+        artifact.schemaVersion = 1
+
+        XCTAssertThrowsError(
+            try TrainingArtifactStore.save(
+                artifact,
+                to: context.paths.trainingManifestURL,
+                projectPaths: context.paths
+            )
+        )
+    }
+
     func testSaveRequiresMeasuredPeakMemoryForNewArtifacts() throws {
         let context = try makeContext()
         defer { context.cleanup() }
@@ -389,6 +438,9 @@ final class TrainingArtifactStoreTests: XCTestCase {
             gaussianCount: 1_250,
             elapsedSeconds: 12.5,
             peakMemoryBytes: 2_147_483_648,
+            memoryBudgetBytes: 8_589_934_592,
+            rasterFallbackCount: 0,
+            droppedIntersectionCount: 0,
             completionStatus: .checkpointed
         )
     }

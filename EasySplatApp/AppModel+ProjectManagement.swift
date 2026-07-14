@@ -46,11 +46,114 @@ extension AppModel {
         }
     }
 
+    static func rasterMemoryRecovery(
+        requestedOptions: RequestedRunOptions,
+        currentBudgetBytes: Int64,
+        hardware: HardwareProfile
+    ) -> RunValidationRecovery? {
+        let largerBudgets = [
+            TrainingMemoryBudget.resolve(hardware: hardware, resourcePolicy: .automatic),
+            TrainingMemoryBudget.resolve(hardware: hardware, resourcePolicy: .maximumPerformance),
+        ]
+            .filter { $0 > currentBudgetBytes }
+            .sorted()
+        if let nextBudget = largerBudgets.first {
+            return .useMoreTrainingMemory(nextBudget)
+        }
+        if requestedOptions.detailProfile == .highDetail {
+            return .useBalanced
+        }
+        if requestedOptions.detailProfile != .fast {
+            return .useFastForMemory
+        }
+        return nil
+    }
+
+    static func rasterResourceRecovery(
+        requestedOptions: RequestedRunOptions
+    ) -> RunValidationRecovery? {
+        switch requestedOptions.detailProfile {
+        case .highDetail:
+            return .useBalanced
+        case .balanced:
+            return .useFastForMemory
+        case .fast:
+            return nil
+        }
+    }
+
+    func configureRuntimeRecovery(for error: Error) {
+        let options = currentRunOptions ?? requestedRunOptions
+        if error is MsplatRasterResourceLimitExceeded {
+            let recovery = Self.rasterResourceRecovery(requestedOptions: options)
+            validationRecovery = recovery
+            failureRetryAllowed = recovery != nil
+            let message: String = switch recovery {
+            case .useBalanced:
+                "This scene exceeded Metal's buffer limit. Use Balanced detail."
+            case .useFastForMemory:
+                "This scene exceeded Metal's buffer limit. Use Fast detail."
+            case nil:
+                "This scene exceeded Metal's buffer limit even at Fast detail."
+            case .useMoreTrainingMemory, .useUnordered, .useFast, .useAutomaticPhotoSelection:
+                preconditionFailure("Unexpected recovery for a raster resource limit")
+            }
+            lastError = message
+            statusTitle = message
+            statusDetail = nil
+            return
+        }
+        guard error is MsplatRasterMemoryBudgetExceeded else { return }
+        let currentBudget = currentProjectURL
+            .flatMap { try? ProjectMetadataStore.load(from: ProjectPaths(root: $0).metadataURL) }
+            .flatMap(\.resolvedRunPlan)
+            .map(\.trainerMemoryBudgetBytes)
+            ?? TrainingMemoryBudget.resolve(
+                hardware: hardwareProfile,
+                resourcePolicy: options.resourcePolicy
+            )
+        let recovery = Self.rasterMemoryRecovery(
+            requestedOptions: options,
+            currentBudgetBytes: currentBudget,
+            hardware: hardwareProfile
+        )
+        validationRecovery = recovery
+        failureRetryAllowed = recovery != nil
+        let message: String = switch recovery {
+        case .useMoreTrainingMemory:
+            "Training needs more memory than this run allows. Use more unified memory."
+        case .useFastForMemory:
+            "Training needs more memory than this run allows. Use Fast detail."
+        case nil:
+            "Training needs more memory than this Mac can safely use for this scene."
+        case .useBalanced:
+            "Training needs more memory than this run allows. Use Balanced detail."
+        case .useUnordered, .useFast, .useAutomaticPhotoSelection:
+            preconditionFailure("Unexpected recovery for a raster memory failure")
+        }
+        lastError = message
+        statusTitle = message
+        statusDetail = nil
+    }
+
     @discardableResult
     func applyValidationRecovery(
         _ recovery: RunValidationRecovery,
         projectURL: URL?
     ) -> Bool {
+        if case .useMoreTrainingMemory(let budgetBytes) = recovery {
+            guard let projectURL,
+                  budgetBytes > 0,
+                  mutateProjectMetadata(at: projectURL, mutation: { metadata in
+                      metadata.trainingMemoryRetryBudgetBytes = budgetBytes
+                  }) != nil else {
+                statusTitle = "Couldn’t update the training plan"
+                statusDetail = "The project was not changed. Check folder permissions and try again."
+                lastError = statusTitle
+                return false
+            }
+            return true
+        }
         if let projectURL {
             let updated = mutateProjectMetadata(at: projectURL) { metadata in
                 var options = metadata.requestedRunOptions
@@ -83,6 +186,7 @@ extension AppModel {
     }
 
     func retryAfterFailure() {
+        guard failureRetryAllowed else { return }
         let projectURL = currentProjectURL
         if let recovery = validationRecovery {
             guard applyValidationRecovery(recovery, projectURL: projectURL) else { return }

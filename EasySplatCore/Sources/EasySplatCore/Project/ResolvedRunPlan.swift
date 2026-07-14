@@ -40,6 +40,7 @@ public struct ResolvedRunPlan: Codable, Sendable, Equatable {
     public var refinementIterationLimit: Int
     public var trainerIterationLimit: Int
     public var plateauWindow: Int
+    public var trainerMemoryBudgetBytes: Int64
     public var colmapMaximumFeatureCount: Int
     public var colmapMaximumMatchCount: Int
     public var colmapExhaustiveBlockSize: Int
@@ -68,6 +69,7 @@ public struct ResolvedRunPlan: Codable, Sendable, Equatable {
         refinementIterationLimit: Int,
         trainerIterationLimit: Int,
         plateauWindow: Int,
+        trainerMemoryBudgetBytes: Int64,
         colmapMaximumFeatureCount: Int = 8_192,
         colmapMaximumMatchCount: Int = 8_192,
         colmapExhaustiveBlockSize: Int = 20,
@@ -95,6 +97,7 @@ public struct ResolvedRunPlan: Codable, Sendable, Equatable {
         self.refinementIterationLimit = refinementIterationLimit
         self.trainerIterationLimit = trainerIterationLimit
         self.plateauWindow = plateauWindow
+        self.trainerMemoryBudgetBytes = trainerMemoryBudgetBytes
         self.colmapMaximumFeatureCount = colmapMaximumFeatureCount
         self.colmapMaximumMatchCount = colmapMaximumMatchCount
         self.colmapExhaustiveBlockSize = colmapExhaustiveBlockSize

@@ -25,10 +25,13 @@ public struct TrainingArtifact: Codable, Sendable, Equatable {
     public var gaussianCount: Int
     public var elapsedSeconds: Double?
     public var peakMemoryBytes: Int64
+    public var memoryBudgetBytes: Int64
+    public var rasterFallbackCount: Int
+    public var droppedIntersectionCount: Int
     public var completionStatus: TrainingCompletionStatus
 
     public init(
-        schemaVersion: Int = 1,
+        schemaVersion: Int = 2,
         trainerVersion: String,
         runtimeVersion: String,
         trainerBuildDigest: String,
@@ -47,6 +50,9 @@ public struct TrainingArtifact: Codable, Sendable, Equatable {
         gaussianCount: Int,
         elapsedSeconds: Double?,
         peakMemoryBytes: Int64,
+        memoryBudgetBytes: Int64,
+        rasterFallbackCount: Int,
+        droppedIntersectionCount: Int,
         completionStatus: TrainingCompletionStatus
     ) {
         self.schemaVersion = schemaVersion
@@ -68,6 +74,9 @@ public struct TrainingArtifact: Codable, Sendable, Equatable {
         self.gaussianCount = gaussianCount
         self.elapsedSeconds = elapsedSeconds
         self.peakMemoryBytes = peakMemoryBytes
+        self.memoryBudgetBytes = memoryBudgetBytes
+        self.rasterFallbackCount = rasterFallbackCount
+        self.droppedIntersectionCount = droppedIntersectionCount
         self.completionStatus = completionStatus
     }
 

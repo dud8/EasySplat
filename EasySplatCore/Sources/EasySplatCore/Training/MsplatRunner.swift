@@ -35,6 +35,71 @@ public struct MsplatTrainingProgress: Sendable, Equatable {
     public let lossIteration: Int?
 }
 
+public struct MsplatRasterFallback: Sendable, Equatable {
+    public let iteration: Int
+    public let fallbackCount: Int
+    public let intersectionCount: Int64
+    public let allocationBytes: Int64
+
+    public init(
+        iteration: Int,
+        fallbackCount: Int,
+        intersectionCount: Int64,
+        allocationBytes: Int64
+    ) {
+        self.iteration = iteration
+        self.fallbackCount = fallbackCount
+        self.intersectionCount = intersectionCount
+        self.allocationBytes = allocationBytes
+    }
+}
+
+public struct MsplatRasterMemoryBudgetExceeded: Error, LocalizedError, Sendable, Equatable {
+    public let iteration: Int
+    public let requiredBytes: Int64
+    public let budgetBytes: Int64
+    public let intersectionCount: Int64?
+
+    public init(
+        iteration: Int,
+        requiredBytes: Int64,
+        budgetBytes: Int64,
+        intersectionCount: Int64? = nil
+    ) {
+        self.iteration = iteration
+        self.requiredBytes = requiredBytes
+        self.budgetBytes = budgetBytes
+        self.intersectionCount = intersectionCount
+    }
+
+    public var errorDescription: String? {
+        "Training needed more unified memory than this run allowed."
+    }
+}
+
+public struct MsplatRasterResourceLimitExceeded: Error, LocalizedError, Sendable, Equatable {
+    public let iteration: Int
+    public let requiredBytes: Int64
+    public let maximumBufferBytes: Int64
+    public let intersectionCount: Int64?
+
+    public init(
+        iteration: Int,
+        requiredBytes: Int64,
+        maximumBufferBytes: Int64,
+        intersectionCount: Int64? = nil
+    ) {
+        self.iteration = iteration
+        self.requiredBytes = requiredBytes
+        self.maximumBufferBytes = maximumBufferBytes
+        self.intersectionCount = intersectionCount
+    }
+
+    public var errorDescription: String? {
+        "This scene exceeded Metal's maximum size for one training buffer."
+    }
+}
+
 public struct MsplatTrainingResult: Sendable, Equatable {
     public let profile: DetailProfile
     public let iterationLimit: Int
@@ -44,6 +109,9 @@ public struct MsplatTrainingResult: Sendable, Equatable {
     public let gaussianCount: Int
     public let elapsedSeconds: Double
     public let peakMemoryBytes: Int64
+    public let memoryBudgetBytes: Int64
+    public let rasterFallbackCount: Int
+    public let droppedIntersectionCount: Int
     public let outputBytes: Int64
     public let inputDigest: String
     public let geometryDigest: String
@@ -68,13 +136,22 @@ public final class MsplatRunner: Sendable {
         seed: UInt64,
         iterationLimit: Int? = nil,
         plateauWindow: Int? = nil,
+        memoryBudgetBytes: Int64,
         onProgress: @escaping @Sendable (MsplatTrainingProgress) -> Void = { _ in },
         onCheckpoint: @escaping @Sendable (MsplatCheckpointReceipt) -> Void = { _ in },
+        onRasterFallback: @escaping @Sendable (MsplatRasterFallback) -> Void = { _ in },
         onLog: @escaping @Sendable (String, Bool) -> Void
     ) async throws -> MsplatTrainingResult {
         let fileManager = FileManager.default
+        guard memoryBudgetBytes > 0 else {
+            throw MsplatEventProtocolError("training memory budget must be positive")
+        }
         let checkpointPath = requestedCheckpointPath
             ?? outputPath.deletingLastPathComponent().appendingPathComponent("checkpoint")
+        let stagingOutputPath = outputPath.deletingLastPathComponent()
+            .appendingPathComponent(
+                ".\(outputPath.lastPathComponent).\(UUID().uuidString).training.tmp.ply"
+            )
         guard fileManager.isExecutableFile(atPath: msplatPath.path) else {
             throw SubprocessFailure(
                 tool: "msplat",
@@ -104,6 +181,16 @@ public final class MsplatRunner: Sendable {
             at: checkpointPath.deletingLastPathComponent(),
             withIntermediateDirectories: true
         )
+        if fileManager.fileExists(atPath: stagingOutputPath.path)
+            || (try? fileManager.destinationOfSymbolicLink(atPath: stagingOutputPath.path)) != nil {
+            try fileManager.removeItem(at: stagingOutputPath)
+        }
+        defer {
+            if fileManager.fileExists(atPath: stagingOutputPath.path)
+                || (try? fileManager.destinationOfSymbolicLink(atPath: stagingOutputPath.path)) != nil {
+                try? fileManager.removeItem(at: stagingOutputPath)
+            }
+        }
         if let resumeFrom {
             var isDirectory: ObjCBool = false
             guard fileManager.fileExists(atPath: resumeFrom.path, isDirectory: &isDirectory),
@@ -119,10 +206,11 @@ public final class MsplatRunner: Sendable {
         )
         var arguments = [
             "--dataset", datasetPath.path,
-            "--output", outputPath.path,
+            "--output", stagingOutputPath.path,
             "--profile", contract.argument,
             "--checkpoint", checkpointPath.path,
             "--seed", String(seed),
+            "--memory-budget-bytes", String(memoryBudgetBytes),
             "--events-fd", "1",
         ]
         if let resumeFrom {
@@ -131,10 +219,12 @@ public final class MsplatRunner: Sendable {
         let events = MsplatEventStream(
             contract: contract,
             seed: seed,
+            memoryBudgetBytes: memoryBudgetBytes,
             checkpointURL: checkpointPath,
             resumeRequested: resumeFrom != nil,
             onProgress: onProgress,
-            onCheckpoint: onCheckpoint
+            onCheckpoint: onCheckpoint,
+            onRasterFallback: onRasterFallback
         )
 
         onLog("EasySplat: running native splat training", false)
@@ -180,6 +270,22 @@ public final class MsplatRunner: Sendable {
             }
             throw rejection
         }
+        if let memoryFailure = try events.finishMemoryBudgetFailure() {
+            guard result.exitCode == 75, result.terminationReason == .exit else {
+                throw MsplatEventProtocolError(
+                    "raster_memory_budget_exceeded must terminate with temporary-failure status 75"
+                )
+            }
+            throw memoryFailure
+        }
+        if let resourceFailure = try events.finishResourceLimitFailure() {
+            guard result.exitCode == 75, result.terminationReason == .exit else {
+                throw MsplatEventProtocolError(
+                    "raster_resource_limit_exceeded must terminate with temporary-failure status 75"
+                )
+            }
+            throw resourceFailure
+        }
         guard result.exitCode == 0 else {
             throw SubprocessFailure(
                 tool: "msplat",
@@ -192,7 +298,16 @@ public final class MsplatRunner: Sendable {
         }
 
         let completion = try events.finish()
-        guard let attributes = try? fileManager.attributesOfItem(atPath: outputPath.path),
+        guard let stagedValuesBeforeValidation = try? stagingOutputPath.resourceValues(
+            forKeys: [.isRegularFileKey, .isSymbolicLinkKey]
+        ) else {
+            throw MsplatEventProtocolError("event stream completed without a published output")
+        }
+        guard stagedValuesBeforeValidation.isRegularFile == true,
+              stagedValuesBeforeValidation.isSymbolicLink != true else {
+            throw MsplatEventProtocolError("published output is not a regular file")
+        }
+        guard let attributes = try? fileManager.attributesOfItem(atPath: stagingOutputPath.path),
               let size = attributes[.size] as? NSNumber,
               size.int64Value > 0 else {
             throw MsplatEventProtocolError("event stream completed without a published output")
@@ -201,6 +316,40 @@ public final class MsplatRunner: Sendable {
             throw MsplatEventProtocolError(
                 "event output size \(completion.outputBytes) does not match file size \(size.int64Value)"
             )
+        }
+        guard ProjectArtifactValidator.validatePlyFile(at: stagingOutputPath) == .valid,
+              let header = ProjectArtifactValidator.readPlyHeader(at: stagingOutputPath),
+              header.vertexCount == completion.gaussianCount else {
+            throw MsplatEventProtocolError(
+                "published output does not match the completed Gaussian count"
+            )
+        }
+        let stagedValuesBeforeReplacement = try stagingOutputPath.resourceValues(
+            forKeys: [.isRegularFileKey, .isSymbolicLinkKey]
+        )
+        guard stagedValuesBeforeReplacement.isRegularFile == true,
+              stagedValuesBeforeReplacement.isSymbolicLink != true else {
+            throw MsplatEventProtocolError("published output is not a regular file")
+        }
+        let outputAlreadyExists = fileManager.fileExists(atPath: outputPath.path)
+            || (try? fileManager.destinationOfSymbolicLink(atPath: outputPath.path)) != nil
+        if outputAlreadyExists {
+            guard let existingValues = try? outputPath.resourceValues(
+                forKeys: [.isRegularFileKey, .isSymbolicLinkKey]
+            ) else {
+                throw MsplatEventProtocolError("existing output is not a regular file")
+            }
+            guard existingValues.isRegularFile == true, existingValues.isSymbolicLink != true else {
+                throw MsplatEventProtocolError("existing output is not a regular file")
+            }
+            _ = try fileManager.replaceItemAt(
+                outputPath,
+                withItemAt: stagingOutputPath,
+                backupItemName: nil,
+                options: []
+            )
+        } else {
+            try fileManager.moveItem(at: stagingOutputPath, to: outputPath)
         }
         return completion
     }
@@ -255,6 +404,7 @@ private struct MsplatNativeEvent: Decodable {
     let initialGaussianCount: Int?
     let gaussianCount: Int?
     let peakMemoryBytes: Int64?
+    let memoryBudgetBytes: Int64?
     let elapsedSeconds: Double?
     let iterationsPerSecond: Double?
     let etaSeconds: Double?
@@ -271,6 +421,16 @@ private struct MsplatNativeEvent: Decodable {
     let checkpointPayloadBytes: Int64?
     let checkpointIteration: Int?
     let signal: Int?
+    let cameraIndex: Int?
+    let firstOverflowIteration: Int?
+    let fallbackCount: Int?
+    let rasterFallbackCount: Int?
+    let droppedIntersectionCount: Int?
+    let intersectionCount: Int64?
+    let allocationBytes: Int64?
+    let requiredBytes: Int64?
+    let budgetBytes: Int64?
+    let maximumBufferBytes: Int64?
 
     enum CodingKeys: String, CodingKey {
         case event
@@ -289,6 +449,7 @@ private struct MsplatNativeEvent: Decodable {
         case initialGaussianCount = "initial_gaussian_count"
         case gaussianCount = "gaussian_count"
         case peakMemoryBytes = "peak_memory_bytes"
+        case memoryBudgetBytes = "memory_budget_bytes"
         case elapsedSeconds = "elapsed_seconds"
         case iterationsPerSecond = "iterations_per_second"
         case etaSeconds = "eta_seconds"
@@ -305,6 +466,16 @@ private struct MsplatNativeEvent: Decodable {
         case checkpointPayloadBytes = "checkpoint_payload_bytes"
         case checkpointIteration = "checkpoint_iteration"
         case signal
+        case cameraIndex = "camera_index"
+        case firstOverflowIteration = "first_overflow_iteration"
+        case fallbackCount = "fallback_count"
+        case rasterFallbackCount = "raster_fallback_count"
+        case droppedIntersectionCount = "dropped_intersection_count"
+        case intersectionCount = "intersection_count"
+        case allocationBytes = "allocation_bytes"
+        case requiredBytes = "required_bytes"
+        case budgetBytes = "budget_bytes"
+        case maximumBufferBytes = "max_buffer_bytes"
     }
 }
 
@@ -312,10 +483,12 @@ private final class MsplatEventStream: @unchecked Sendable {
     private let lock = NSLock()
     private let contract: MsplatProfileContract
     private let seed: UInt64
+    private let memoryBudgetBytes: Int64
     private let checkpointURL: URL
     private let resumeRequested: Bool
     private let onProgress: @Sendable (MsplatTrainingProgress) -> Void
     private let onCheckpoint: @Sendable (MsplatCheckpointReceipt) -> Void
+    private let onRasterFallback: @Sendable (MsplatRasterFallback) -> Void
     private var nextSequence: UInt64 = 1
     private var started = false
     private var completed = false
@@ -334,21 +507,28 @@ private final class MsplatEventStream: @unchecked Sendable {
     private var failure: Error?
     private var result: MsplatTrainingResult?
     private var resumeRejection: MsplatResumeRejected?
+    private var memoryBudgetFailure: MsplatRasterMemoryBudgetExceeded?
+    private var resourceLimitFailure: MsplatRasterResourceLimitExceeded?
+    private var rasterFallbackCount = 0
 
     init(
         contract: MsplatProfileContract,
         seed: UInt64,
+        memoryBudgetBytes: Int64,
         checkpointURL: URL,
         resumeRequested: Bool,
         onProgress: @escaping @Sendable (MsplatTrainingProgress) -> Void,
-        onCheckpoint: @escaping @Sendable (MsplatCheckpointReceipt) -> Void
+        onCheckpoint: @escaping @Sendable (MsplatCheckpointReceipt) -> Void,
+        onRasterFallback: @escaping @Sendable (MsplatRasterFallback) -> Void
     ) {
         self.contract = contract
         self.seed = seed
+        self.memoryBudgetBytes = memoryBudgetBytes
         self.checkpointURL = checkpointURL
         self.resumeRequested = resumeRequested
         self.onProgress = onProgress
         self.onCheckpoint = onCheckpoint
+        self.onRasterFallback = onRasterFallback
     }
 
     var consumedLineCount: Int {
@@ -372,6 +552,9 @@ private final class MsplatEventStream: @unchecked Sendable {
                 }
                 if let checkpoint = effect?.checkpoint {
                     onCheckpoint(checkpoint)
+                }
+                if let rasterFallback = effect?.rasterFallback {
+                    onRasterFallback(rasterFallback)
                 }
             } catch {
                 failure = error is MsplatEventProtocolError
@@ -401,21 +584,36 @@ private final class MsplatEventStream: @unchecked Sendable {
         }
     }
 
+    func finishMemoryBudgetFailure() throws -> MsplatRasterMemoryBudgetExceeded? {
+        try lock.withLock {
+            if let failure { throw failure }
+            return memoryBudgetFailure
+        }
+    }
+
+    func finishResourceLimitFailure() throws -> MsplatRasterResourceLimitExceeded? {
+        try lock.withLock {
+            if let failure { throw failure }
+            return resourceLimitFailure
+        }
+    }
+
     func finishInterruption() throws -> MsplatTrainingInterrupted? {
         let evidence: (Int, MsplatCheckpointReceipt, MsplatCheckpointExpectation)? = try lock.withLock {
             if let failure { throw failure }
             guard lineCount > 0 else { return nil }
-            if completed || resumeRejection != nil { return nil }
+            if completed || resumeRejection != nil || memoryBudgetFailure != nil
+                || resourceLimitFailure != nil { return nil }
             guard started else {
                 throw MsplatEventProtocolError("cancelled event stream is missing started")
             }
             guard cancelled,
-                  let cancellationIteration,
+                  cancellationIteration != nil,
                   let latestCheckpoint else {
                 throw MsplatEventProtocolError("cancelled training has no terminal checkpoint evidence")
             }
             return (
-                cancellationIteration,
+                latestCheckpoint.iteration,
                 latestCheckpoint,
                 MsplatCheckpointExpectation(
                     trainerVersion: "1.1.3 (git 106499b)",
@@ -426,7 +624,8 @@ private final class MsplatEventStream: @unchecked Sendable {
                     seed: seed,
                     cameraCount: cameraCount,
                     inputDigest: inputDigest,
-                    geometryDigest: geometryDigest
+                    geometryDigest: geometryDigest,
+                    memoryBudgetBytes: memoryBudgetBytes
                 )
             )
         }
@@ -452,7 +651,8 @@ private final class MsplatEventStream: @unchecked Sendable {
             )
         }
         nextSequence += 1
-        guard !completed, !cancelled, resumeRejection == nil else {
+        guard !completed, !cancelled, resumeRejection == nil,
+              memoryBudgetFailure == nil, resourceLimitFailure == nil else {
             throw MsplatEventProtocolError("event arrived after a terminal event")
         }
 
@@ -477,7 +677,8 @@ private final class MsplatEventStream: @unchecked Sendable {
                   eventCameraCount > 0,
                   event.initialGaussianCount.map({ $0 > 0 }) == true,
                   event.resumed == resumeRequested,
-                  event.checkpointSchema == 1,
+                  event.memoryBudgetBytes == memoryBudgetBytes,
+                  event.checkpointSchema == 2,
                   event.payloadSchema == 2,
                   let eventInputDigest = event.inputDigest,
                   let eventGeometryDigest = event.geometryDigest,
@@ -497,6 +698,89 @@ private final class MsplatEventStream: @unchecked Sendable {
             trainerBuildDigest = eventTrainerBuildDigest
             started = true
             return nil
+        case "raster_replay":
+            guard started,
+                  let successfulPrefix = event.iteration,
+                  successfulPrefix >= lastIteration,
+                  successfulPrefix < contract.iterationLimit,
+                  event.firstOverflowIteration == successfulPrefix + 1,
+                  let cameraIndex = event.cameraIndex,
+                  cameraIndex >= 0,
+                  cameraIndex < cameraCount,
+                  let intersectionCount = event.intersectionCount,
+                  intersectionCount > 2_048,
+                  event.budgetBytes == memoryBudgetBytes,
+                  let requiredBytes = event.requiredBytes,
+                  requiredBytes > 0,
+                  requiredBytes <= memoryBudgetBytes else {
+                throw MsplatEventProtocolError("event raster_replay record is invalid")
+            }
+            return nil
+        case "raster_fallback":
+            guard started,
+                  let iteration = event.iteration,
+                  iteration >= lastIteration,
+                  iteration <= contract.iterationLimit,
+                  let fallbackCount = event.fallbackCount,
+                  fallbackCount > rasterFallbackCount,
+                  validRasterFallbackCount(fallbackCount, through: iteration),
+                  let intersectionCount = event.intersectionCount,
+                  intersectionCount > 2_048,
+                  let allocationBytes = event.allocationBytes,
+                  allocationBytes > 0,
+                  allocationBytes <= memoryBudgetBytes else {
+                throw MsplatEventProtocolError("event raster_fallback record is invalid")
+            }
+            rasterFallbackCount = fallbackCount
+            return AcceptedEffect(
+                rasterFallback: MsplatRasterFallback(
+                    iteration: iteration,
+                    fallbackCount: fallbackCount,
+                    intersectionCount: intersectionCount,
+                    allocationBytes: allocationBytes
+                )
+            )
+        case "raster_memory_budget_exceeded":
+            guard let iteration = event.iteration,
+                  (started
+                    ? iteration >= lastIteration && iteration <= contract.iterationLimit
+                    : event.sequence == 1 && iteration == 0),
+                  let requiredBytes = event.requiredBytes,
+                  requiredBytes > memoryBudgetBytes,
+                  event.budgetBytes == memoryBudgetBytes,
+                  event.intersectionCount.map({ $0 > 0 }) ?? true else {
+                throw MsplatEventProtocolError(
+                    "event raster_memory_budget_exceeded record is invalid"
+                )
+            }
+            memoryBudgetFailure = MsplatRasterMemoryBudgetExceeded(
+                iteration: iteration,
+                requiredBytes: requiredBytes,
+                budgetBytes: memoryBudgetBytes,
+                intersectionCount: event.intersectionCount
+            )
+            return nil
+        case "raster_resource_limit_exceeded":
+            guard let iteration = event.iteration,
+                  (started
+                    ? iteration >= lastIteration && iteration <= contract.iterationLimit
+                    : event.sequence == 1 && iteration == 0),
+                  let requiredBytes = event.requiredBytes,
+                  let maximumBufferBytes = event.maximumBufferBytes,
+                  maximumBufferBytes > 0,
+                  requiredBytes > maximumBufferBytes,
+                  event.intersectionCount.map({ $0 > 0 }) ?? true else {
+                throw MsplatEventProtocolError(
+                    "event raster_resource_limit_exceeded record is invalid"
+                )
+            }
+            resourceLimitFailure = MsplatRasterResourceLimitExceeded(
+                iteration: iteration,
+                requiredBytes: requiredBytes,
+                maximumBufferBytes: maximumBufferBytes,
+                intersectionCount: event.intersectionCount
+            )
+            return nil
         case "checkpoint_loaded", "checkpoint_completed":
             guard started else {
                 throw MsplatEventProtocolError("checkpoint event arrived before started")
@@ -505,16 +789,22 @@ private final class MsplatEventStream: @unchecked Sendable {
             if event.event == "checkpoint_loaded" {
                 guard resumeRequested,
                       latestCheckpoint == nil,
-                      receipt.iteration == startIteration else {
+                      receipt.iteration == startIteration,
+                      receipt.rasterFallbackCount >= rasterFallbackCount else {
                     throw MsplatEventProtocolError("checkpoint_loaded does not match requested resume")
                 }
+                rasterFallbackCount = receipt.rasterFallbackCount
             } else if latestCheckpoint == nil {
-                guard !resumeRequested, receipt.iteration == 0 else {
+                guard !resumeRequested,
+                      receipt.iteration == 0,
+                      receipt.rasterFallbackCount == rasterFallbackCount else {
                     throw MsplatEventProtocolError("initial checkpoint_completed is invalid")
                 }
             } else {
                 guard receipt.iteration > latestCheckpoint!.iteration,
-                      receipt.iteration < contract.iterationLimit else {
+                      receipt.iteration < contract.iterationLimit,
+                      receipt.rasterFallbackCount >= latestCheckpoint!.rasterFallbackCount,
+                      receipt.rasterFallbackCount == rasterFallbackCount else {
                     throw MsplatEventProtocolError("checkpoint iterations are not strictly increasing")
                 }
             }
@@ -597,7 +887,10 @@ private final class MsplatEventStream: @unchecked Sendable {
                   event.checkpointGeneration == checkpoint.generation,
                   event.checkpointPayloadSHA256 == checkpoint.payloadSHA256,
                   event.inputDigest == inputDigest,
-                  event.geometryDigest == geometryDigest else {
+                  event.geometryDigest == geometryDigest,
+                  event.memoryBudgetBytes == memoryBudgetBytes,
+                  event.rasterFallbackCount == checkpoint.rasterFallbackCount,
+                  event.droppedIntersectionCount == 0 else {
                 throw MsplatEventProtocolError("event cancelled record has no matching checkpoint")
             }
             cancellationIteration = iteration
@@ -624,6 +917,13 @@ private final class MsplatEventStream: @unchecked Sendable {
             }
             try validateContract(event)
             try validateIdentity(event)
+            guard event.memoryBudgetBytes == memoryBudgetBytes,
+                  event.rasterFallbackCount == rasterFallbackCount,
+                  event.droppedIntersectionCount == 0 else {
+                throw MsplatEventProtocolError(
+                    "event completed raster evidence is incomplete or unsafe"
+                )
+            }
             if stopReason == .iterationLimit && iteration != contract.iterationLimit {
                 throw MsplatEventProtocolError("event iteration-limit completion stopped early")
             }
@@ -643,6 +943,9 @@ private final class MsplatEventStream: @unchecked Sendable {
                 gaussianCount: gaussianCount,
                 elapsedSeconds: elapsed,
                 peakMemoryBytes: peakMemoryBytes,
+                memoryBudgetBytes: memoryBudgetBytes,
+                rasterFallbackCount: rasterFallbackCount,
+                droppedIntersectionCount: 0,
                 outputBytes: outputBytes,
                 inputDigest: inputDigest,
                 geometryDigest: geometryDigest,
@@ -669,6 +972,10 @@ private final class MsplatEventStream: @unchecked Sendable {
               gaussianCount > 0,
               let peakMemoryBytes = event.peakMemoryBytes,
               peakMemoryBytes > 0,
+              event.memoryBudgetBytes == memoryBudgetBytes,
+              let eventRasterFallbackCount = event.rasterFallbackCount,
+              validRasterFallbackCount(eventRasterFallbackCount, through: iteration),
+              event.droppedIntersectionCount == 0,
               event.version == "1.1.3 (git 106499b)",
               event.profile == contract.argument,
               event.seed == seed,
@@ -684,6 +991,9 @@ private final class MsplatEventStream: @unchecked Sendable {
             payloadBytes: payloadBytes,
             gaussianCount: gaussianCount,
             peakMemoryBytes: peakMemoryBytes,
+            memoryBudgetBytes: memoryBudgetBytes,
+            rasterFallbackCount: eventRasterFallbackCount,
+            droppedIntersectionCount: 0,
             inputDigest: inputDigest,
             geometryDigest: geometryDigest,
             trainerBuildDigest: trainerBuildDigest
@@ -718,16 +1028,23 @@ private final class MsplatEventStream: @unchecked Sendable {
         value.isFinite && value >= 0
     }
 
+    private func validRasterFallbackCount(_ count: Int, through iteration: Int) -> Bool {
+        count >= 0 && count <= min(iteration, Int(UInt32.max))
+    }
+
     private struct AcceptedEffect {
         let progress: MsplatTrainingProgress?
         let checkpoint: MsplatCheckpointReceipt?
+        let rasterFallback: MsplatRasterFallback?
 
         init(
             progress: MsplatTrainingProgress? = nil,
-            checkpoint: MsplatCheckpointReceipt? = nil
+            checkpoint: MsplatCheckpointReceipt? = nil,
+            rasterFallback: MsplatRasterFallback? = nil
         ) {
             self.progress = progress
             self.checkpoint = checkpoint
+            self.rasterFallback = rasterFallback
         }
     }
 }

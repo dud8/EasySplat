@@ -5,8 +5,10 @@ import EasySplatCore
 enum RunValidationRecovery: Equatable {
     case useUnordered
     case useFast
+    case useFastForMemory
     case useBalanced
     case useAutomaticPhotoSelection
+    case useMoreTrainingMemory(Int64)
 
     func apply(to options: inout RequestedRunOptions) {
         switch self {
@@ -15,10 +17,14 @@ enum RunValidationRecovery: Equatable {
         case .useFast:
             options.detailProfile = .fast
             options.resourcePolicy = .conserveMemory
+        case .useFastForMemory:
+            options.detailProfile = .fast
         case .useBalanced:
             options.detailProfile = .balanced
         case .useAutomaticPhotoSelection:
             options.photoSelection = .automatic
+        case .useMoreTrainingMemory:
+            break
         }
     }
 }
@@ -46,6 +52,7 @@ final class AppModel: ObservableObject {
     @Published var lastError: String? = nil
     @Published var errorDetails: String? = nil
     @Published var validationRecovery: RunValidationRecovery? = nil
+    @Published var failureRetryAllowed = true
     @Published var outputPlyURL: URL? = nil
     @Published var currentReconstruction: ReconstructionSummary? = nil
     @Published var currentStageTimings: [StageTimingRecord] = []

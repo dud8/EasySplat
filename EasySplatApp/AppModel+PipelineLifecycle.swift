@@ -345,6 +345,7 @@ extension AppModel {
             viewState = .processing
         } catch {
             guard isCurrentTaskToken(taskToken) else { return }
+            configureRuntimeRecovery(for: error)
             let stopFailureCopy = stopAction.map {
                 stopFailurePresentation(for: $0)
             }
@@ -426,7 +427,8 @@ extension AppModel {
                 requestedOptions: requestedOptions,
                 input: metadata.input,
                 hardware: hardwareProfile,
-                developmentOverrides: developmentOverrides
+                developmentOverrides: developmentOverrides,
+                trainingMemoryRetryBudgetBytes: metadata.trainingMemoryRetryBudgetBytes
             )
             if metadata.input.photosFolder != nil {
                 let importedPhotos = paths.importedPhotosURL
@@ -532,6 +534,7 @@ extension AppModel {
             refreshProjectSummaries()
         } catch {
             guard isCurrentTaskToken(taskToken) else { return }
+            configureRuntimeRecovery(for: error)
             let stopFailureCopy = stopAction.map {
                 stopFailurePresentation(for: $0)
             }
@@ -636,6 +639,7 @@ extension AppModel {
         lastError = nil
         errorDetails = nil
         validationRecovery = nil
+        failureRetryAllowed = true
         // Flush any pending notes save before tearing down so the user's last
         // edit isn't lost when they start or resume a different project (or
         // when reset() runs as part of app teardown).

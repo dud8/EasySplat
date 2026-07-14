@@ -68,6 +68,45 @@ final class PipelineRunnerErrorTests: XCTestCase {
         XCTAssertTrue(message.debugMessage.contains("Tool: geometry-helper"))
     }
 
+    func testRasterMemoryFailureNamesTheResolvedLimitWithoutBackendCopy() {
+        let runner = makeRunner()
+        let error = MsplatRasterMemoryBudgetExceeded(
+            iteration: 12,
+            requiredBytes: 9_000_000_000,
+            budgetBytes: 8_000_000_000
+        )
+
+        let message = runner.test_failureMessages(for: error, stage: .trainSplat)
+
+        XCTAssertEqual(
+            message.userMessage,
+            "Training needs more memory than this run allows."
+        )
+        XCTAssertFalse(message.userMessage.lowercased().contains("msplat"))
+        XCTAssertTrue(message.debugMessage.contains("required 9000000000 bytes"))
+        XCTAssertTrue(message.debugMessage.contains("budget 8000000000 bytes"))
+    }
+
+    func testRasterResourceFailureNamesTheMetalLimitWithoutSuggestingMoreMemory() {
+        let runner = makeRunner()
+        let error = MsplatRasterResourceLimitExceeded(
+            iteration: 12,
+            requiredBytes: 5_000_000_000,
+            maximumBufferBytes: 4_000_000_000,
+            intersectionCount: 400_000_000
+        )
+
+        let message = runner.test_failureMessages(for: error, stage: .trainSplat)
+
+        XCTAssertEqual(
+            message.userMessage,
+            "This scene exceeded Metal's size limit for one training buffer."
+        )
+        XCTAssertFalse(message.userMessage.lowercased().contains("more memory"))
+        XCTAssertTrue(message.debugMessage.contains("required 5000000000 bytes"))
+        XCTAssertTrue(message.debugMessage.contains("maximum 4000000000 bytes"))
+    }
+
     func testFailureMessagesForColmapCrash() throws {
         let runner = makeRunner()
         let error = ColmapRunnerError.failed(

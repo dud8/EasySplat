@@ -96,7 +96,8 @@ public final class PipelineRunner: @unchecked Sendable {
             requestedOptions: requestedOptions,
             input: metadata.input,
             hardware: detectedHardwareProfile,
-            developmentOverrides: config.developmentOverrides
+            developmentOverrides: config.developmentOverrides,
+            trainingMemoryRetryBudgetBytes: metadata.trainingMemoryRetryBudgetBytes
         )
         let resolvedRunPlan = config.resolvedRunPlan ?? hardwareResolvedRunPlan
         let planChangedForCurrentHardware = previousResolvedRunPlan != nil
@@ -1930,6 +1931,7 @@ public final class PipelineRunner: @unchecked Sendable {
                                 seed: seed,
                                 iterationLimit: resolvedRunPlan.trainerIterationLimit,
                                 plateauWindow: resolvedRunPlan.plateauWindow,
+                                memoryBudgetBytes: resolvedRunPlan.trainerMemoryBudgetBytes,
                                 onProgress: { progress in
                                     let fraction = Double(progress.iteration) / Double(progress.iterationLimit)
                                     emit(.stageProgress(
@@ -1955,6 +1957,13 @@ public final class PipelineRunner: @unchecked Sendable {
                                             isError: true
                                         ))
                                     }
+                                },
+                                onRasterFallback: { fallback in
+                                    emit(.stageLog(
+                                        stage: .trainSplat,
+                                        line: "Exact raster fallback \(fallback.fallbackCount): \(fallback.intersectionCount.formatted()) intersections, \(ByteCountFormatter.string(fromByteCount: fallback.allocationBytes, countStyle: .memory)).",
+                                        isError: false
+                                    ))
                                 },
                                 onLog: { line, isErr in
                                     msplatToolLog.append(stream: isErr ? "stderr" : "stdout", line: line)

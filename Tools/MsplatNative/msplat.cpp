@@ -146,6 +146,8 @@ struct TrainerCheckpointState {
     std::optional<double> latestLoss;
     int latestLossIteration = 0;
     double elapsedSeconds = 0;
+    std::uint64_t rasterFallbackCount = 0;
+    std::uint64_t droppedIntersectionCount = 0;
 };
 
 struct CheckpointReceipt {
@@ -391,6 +393,7 @@ struct CheckpointContext {
     std::size_t cameraCount;
     TrainingIdentity identity;
     std::string trainerBuildDigest;
+    std::uint64_t memoryBudgetBytes;
 };
 
 class CheckpointCompatibilityError : public std::runtime_error {
@@ -556,7 +559,8 @@ std::set<std::string> checkpointManifestKeys() {
         "elapsed_seconds", "gaussian_count", "geometry_digest", "input_digest",
         "iteration", "iteration_limit", "last_improvement_iteration", "latest_loss",
         "latest_loss_iteration", "payload_bytes", "payload_file", "payload_schema",
-        "payload_sha256", "plateau_window", "profile", "schema_version", "seed",
+        "memory_budget_bytes", "payload_sha256", "plateau_window", "profile",
+        "raster_fallback_count", "dropped_intersection_count", "schema_version", "seed",
         "trainer_build_digest", "trainer_version"
     };
 }
@@ -589,7 +593,7 @@ ValidatedCheckpoint validateCheckpointGeneration(
         actualKeys.insert(iterator.key());
     }
     if (actualKeys != checkpointManifestKeys()) {
-        throw std::runtime_error("checkpoint manifest keys do not match schema 1");
+        throw std::runtime_error("checkpoint manifest keys do not match schema 2");
     }
 
     const int schemaVersion = manifest.at("schema_version").get<int>();
@@ -613,8 +617,14 @@ ValidatedCheckpoint validateCheckpointGeneration(
     const int lastImprovement = manifest.at("last_improvement_iteration").get<int>();
     const int latestLossIteration = manifest.at("latest_loss_iteration").get<int>();
     const double elapsedSeconds = manifest.at("elapsed_seconds").get<double>();
+    const std::uint64_t memoryBudgetBytes =
+        manifest.at("memory_budget_bytes").get<std::uint64_t>();
+    const std::uint64_t rasterFallbackCount =
+        manifest.at("raster_fallback_count").get<std::uint64_t>();
+    const std::uint64_t droppedIntersectionCount =
+        manifest.at("dropped_intersection_count").get<std::uint64_t>();
 
-    if (schemaVersion != 1 || payloadSchema != 2 || !isLowercaseHex(trainerDigest) ||
+    if (schemaVersion != 2 || payloadSchema != 2 || !isLowercaseHex(trainerDigest) ||
         !isLowercaseHex(inputDigest) || !isLowercaseHex(geometryDigest) || cameraCount == 0 ||
         iteration < 0 || iteration >= iterationLimit || cameraDrawCount != iteration ||
         iterationLimit <= 0 || plateauWindow <= 0 ||
@@ -622,7 +632,12 @@ ValidatedCheckpoint validateCheckpointGeneration(
         !isLowercaseHex(payloadDigest) || payloadBytes == 0 ||
         payloadBytes > maximumCheckpointPayloadBytes || lastImprovement < 0 ||
         lastImprovement > std::max(iteration, 500) || latestLossIteration < 0 ||
-        latestLossIteration > iteration || !std::isfinite(elapsedSeconds) || elapsedSeconds < 0) {
+        latestLossIteration > iteration || !std::isfinite(elapsedSeconds) || elapsedSeconds < 0 ||
+        memoryBudgetBytes == 0 ||
+        rasterFallbackCount > std::min<std::uint64_t>(
+            static_cast<std::uint64_t>(iteration),
+            std::numeric_limits<std::uint32_t>::max()
+        ) || droppedIntersectionCount != 0) {
         throw std::runtime_error("checkpoint manifest does not match this training run");
     }
 
@@ -676,7 +691,8 @@ ValidatedCheckpoint validateCheckpointGeneration(
     }
     if (profile != context.profile.name || seed != context.seed ||
         iterationLimit != context.profile.iterationLimit ||
-        plateauWindow != context.profile.plateauWindow) {
+        plateauWindow != context.profile.plateauWindow ||
+        memoryBudgetBytes != context.memoryBudgetBytes) {
         throw CheckpointCompatibilityError(
             "run_contract_changed",
             "checkpoint profile, seed, or budget no longer matches"
@@ -704,6 +720,8 @@ ValidatedCheckpoint validateCheckpointGeneration(
             latestLoss,
             latestLossIteration,
             elapsedSeconds,
+            rasterFallbackCount,
+            droppedIntersectionCount,
         },
         gaussianCount,
         backingCapacity,
@@ -760,13 +778,16 @@ std::string checkpointManifestText(
         {"last_improvement_iteration", state.lastImprovementIteration},
         {"latest_loss", state.latestLoss ? json(*state.latestLoss) : json(nullptr)},
         {"latest_loss_iteration", state.latestLossIteration},
+        {"memory_budget_bytes", context.memoryBudgetBytes},
         {"payload_bytes", payloadBytes},
         {"payload_file", "state.msplat"},
         {"payload_schema", 2},
         {"payload_sha256", payloadDigest},
         {"plateau_window", context.profile.plateauWindow},
         {"profile", context.profile.name},
-        {"schema_version", 1},
+        {"raster_fallback_count", state.rasterFallbackCount},
+        {"dropped_intersection_count", state.droppedIntersectionCount},
+        {"schema_version", 2},
         {"seed", context.seed},
         {"trainer_build_digest", context.trainerBuildDigest},
         {"trainer_version", APP_VERSION},
@@ -789,7 +810,11 @@ CheckpointReceipt saveCheckpoint(
         state.bestCameraLosses.size() != context.cameraCount ||
         state.lastImprovementIteration < 0 ||
         state.lastImprovementIteration > std::max(state.iteration, 500) ||
-        !std::isfinite(state.elapsedSeconds) || state.elapsedSeconds < 0) {
+        !std::isfinite(state.elapsedSeconds) || state.elapsedSeconds < 0 ||
+        state.rasterFallbackCount > std::min<std::uint64_t>(
+            static_cast<std::uint64_t>(state.iteration),
+            std::numeric_limits<std::uint32_t>::max()
+        ) || state.droppedIntersectionCount != 0) {
         throw std::runtime_error("cannot save inconsistent trainer checkpoint state");
     }
     if ((state.latestLoss.has_value() &&
@@ -1034,6 +1059,7 @@ int main(int argc, char *argv[]) {
     std::string checkpointPath;
     std::string resumePath;
     std::uint64_t seed = 42;
+    std::uint64_t memoryBudgetBytes = 0;
     int eventsFileDescriptor = -1;
     bool selfCheck = false;
     std::string plyToValidate;
@@ -1047,6 +1073,11 @@ int main(int argc, char *argv[]) {
     );
     CLI::Option *seedOption = app.add_option(
         "--seed", seed, "Deterministic uint64 camera-order seed"
+    );
+    CLI::Option *memoryBudgetOption = app.add_option(
+        "--memory-budget-bytes",
+        memoryBudgetBytes,
+        "Maximum bytes available to the native raster working set"
     );
     CLI::Option *checkpointOption = app.add_option(
         "--checkpoint", checkpointPath, "Atomic optimizer-checkpoint directory"
@@ -1062,6 +1093,8 @@ int main(int argc, char *argv[]) {
 
     CLI11_PARSE(app, argc, argv);
 
+    std::optional<EventWriter> events;
+    int terminalIteration = 0;
     try {
         struct sigaction ignoreBrokenPipe {};
         ignoreBrokenPipe.sa_handler = SIG_IGN;
@@ -1070,15 +1103,15 @@ int main(int argc, char *argv[]) {
         if (sigaction(SIGPIPE, &ignoreBrokenPipe, nullptr) != 0) {
             throw std::runtime_error("failed to configure event-pipe handling");
         }
-        EventWriter events(eventsFileDescriptor);
+        events.emplace(eventsFileDescriptor);
         if (eventsFileDescriptor == STDOUT_FILENO) std::cout.rdbuf(std::cerr.rdbuf());
 
         if (!plyToValidate.empty()) {
             const PlyValidation validation = validateBinaryPly(plyToValidate);
-            events.emit("output_validation", {{"output_bytes", validation.bytes},
-                                               {"status", "ok"},
-                                               {"vertex_count", validation.vertices}});
-            if (!events.enabled()) std::cout << "PLY validation passed\n";
+            events->emit("output_validation", {{"output_bytes", validation.bytes},
+                                                {"status", "ok"},
+                                                {"vertex_count", validation.vertices}});
+            if (!events->enabled()) std::cout << "PLY validation passed\n";
             return 0;
         }
         if (selfCheck) {
@@ -1086,8 +1119,8 @@ int main(int argc, char *argv[]) {
                 throw std::runtime_error("Metal device initialization returned null");
             }
             msplat_gpu_sync();
-            events.emit("self_check", {{"status", "ok"}, {"version", APP_VERSION}});
-            if (!events.enabled()) std::cout << "Metal self-check passed\n";
+            events->emit("self_check", {{"status", "ok"}, {"version", APP_VERSION}});
+            if (!events->enabled()) std::cout << "Metal self-check passed\n";
             return 0;
         }
 
@@ -1095,6 +1128,11 @@ int main(int argc, char *argv[]) {
         if (outputOption->count() == 0) throw std::runtime_error("--output is required for training");
         if (profileOption->count() == 0) throw std::runtime_error("--profile is required for training");
         if (seedOption->count() == 0) throw std::runtime_error("--seed is required for training");
+        if (memoryBudgetOption->count() == 0 || memoryBudgetBytes == 0) {
+            throw std::runtime_error(
+                "--memory-budget-bytes is required for training and must be positive"
+            );
+        }
         if (checkpointOption->count() == 0) {
             throw std::runtime_error("--checkpoint is required for training");
         }
@@ -1102,6 +1140,7 @@ int main(int argc, char *argv[]) {
         const TrainingProfileConfig &profile = trainingProfileNamed(profileName);
         if (!fs::is_directory(datasetPath)) throw std::runtime_error("dataset directory does not exist");
         if (fs::path(outputPath).extension() != ".ply") throw std::runtime_error("--output must end in .ply");
+        msplat_set_raster_memory_budget_bytes(memoryBudgetBytes);
 
         struct sigaction action {};
         action.sa_handler = observeCancellation;
@@ -1162,6 +1201,7 @@ int main(int argc, char *argv[]) {
             cameras.size(),
             identity,
             trainerBuildDigest,
+            memoryBudgetBytes,
         };
 
         const auto startedAt = std::chrono::steady_clock::now();
@@ -1177,15 +1217,42 @@ int main(int argc, char *argv[]) {
         int latestLossIteration = 0;
         int completedIteration = 0;
         double priorElapsedSeconds = 0;
+        std::uint64_t restoredRasterFallbackCount = 0;
         std::optional<CheckpointReceipt> lastCheckpoint;
         const bool resumed = !resumePath.empty();
+
+        auto preflightRasterMemory = [&]() {
+            const auto largestCamera = std::max_element(
+                cameras.begin(),
+                cameras.end(),
+                [](const Camera &left, const Camera &right) {
+                    const std::uint64_t leftPixels =
+                        static_cast<std::uint64_t>(std::max(0, left.width)) *
+                        static_cast<std::uint64_t>(std::max(0, left.height));
+                    const std::uint64_t rightPixels =
+                        static_cast<std::uint64_t>(std::max(0, right.width)) *
+                        static_cast<std::uint64_t>(std::max(0, right.height));
+                    return leftPixels < rightPixels;
+                }
+            );
+            if (largestCamera == cameras.end() || largestCamera->width <= 0 ||
+                largestCamera->height <= 0) {
+                throw std::runtime_error("input camera dimensions are invalid");
+            }
+            msplat_preflight_raster_memory(
+                model.num_active,
+                largestCamera->height,
+                largestCamera->width,
+                static_cast<int>(model.featuresRest.size(-2))
+            );
+        };
 
         if (resumed) {
             std::optional<ValidatedCheckpoint> validatedCheckpoint;
             try {
                 validatedCheckpoint = loadCheckpoint(model, checkpointRoot, checkpointContext);
             } catch (const CheckpointCompatibilityError &error) {
-                events.emit("resume_rejected", {{"reason", error.reason()}});
+                events->emit("resume_rejected", {{"reason", error.reason()}});
                 std::cerr << error.what() << '\n';
                 return 78;
             }
@@ -1198,11 +1265,87 @@ int main(int argc, char *argv[]) {
             }
             latestLossIteration = checkpoint.trainerState.latestLossIteration;
             priorElapsedSeconds = checkpoint.trainerState.elapsedSeconds;
+            restoredRasterFallbackCount = checkpoint.trainerState.rasterFallbackCount;
+            msplat_set_raster_fallback_count(restoredRasterFallbackCount);
             lastCheckpoint = checkpoint.receipt;
             for (int draw = 0; draw < completedIteration / cameraReuseCount; ++draw) {
                 (void)camsIter.next();
             }
-        } else {
+        }
+        const int startingIteration = completedIteration;
+        std::uint64_t lastReportedFallbackCount = restoredRasterFallbackCount;
+        std::uint64_t durableRasterFallbackCount = restoredRasterFallbackCount;
+
+        auto checkedRasterStats = [&]() {
+            const MsplatRasterStats stats = msplat_get_raster_stats();
+            if (stats.capacity_exceeded) {
+                throw std::runtime_error(
+                    "native raster capacity overflow was not replayed"
+                );
+            }
+            if (stats.dropped_intersection_count != 0) {
+                throw std::runtime_error(
+                    "native raster reported dropped intersections; output publication is blocked"
+                );
+            }
+            return stats;
+        };
+
+        auto emitRasterFallbackIfNeeded = [&](int iteration) {
+            const MsplatRasterStats stats = checkedRasterStats();
+            if (stats.fallback_count > lastReportedFallbackCount) {
+                events->emit("raster_fallback", {
+                    {"allocation_bytes", stats.allocation_bytes},
+                    {"fallback_count", stats.fallback_count},
+                    {"intersection_count", stats.latest_intersection_count},
+                    {"iteration", iteration},
+                });
+                lastReportedFallbackCount = stats.fallback_count;
+            }
+            return stats;
+        };
+
+        auto emitCheckpoint = [&](const char *eventName, const CheckpointReceipt &receipt) {
+            const MsplatRasterStats stats = checkedRasterStats();
+            events->emit(eventName, {
+                {"checkpoint_generation", receipt.generation},
+                {"checkpoint_payload_bytes", receipt.payloadBytes},
+                {"checkpoint_payload_sha256", receipt.payloadDigest},
+                {"gaussian_count", model.num_active},
+                {"geometry_digest", identity.geometryDigest},
+                {"input_digest", identity.inputDigest},
+                {"iteration", receipt.iteration},
+                {"memory_budget_bytes", memoryBudgetBytes},
+                {"peak_memory_bytes", peakResidentMemoryBytes()},
+                {"profile", profile.name},
+                {"raster_fallback_count", stats.fallback_count},
+                {"dropped_intersection_count", stats.dropped_intersection_count},
+                {"seed", seed},
+                {"trainer_build_digest", trainerBuildDigest},
+                {"version", APP_VERSION},
+            });
+        };
+
+        events->emit("started", {{"camera_count", cameras.size()},
+                                {"checkpoint_schema", 2},
+                                {"geometry_digest", identity.geometryDigest},
+                                {"initial_gaussian_count", model.num_active},
+                                {"input_digest", identity.inputDigest},
+                                {"iteration", completedIteration},
+                                {"iteration_limit", profile.iterationLimit},
+                                {"memory_budget_bytes", memoryBudgetBytes},
+                                {"payload_schema", 2},
+                                {"plateau_window", profile.plateauWindow},
+                                {"profile", profile.name},
+                                {"raster_fallback_count", restoredRasterFallbackCount},
+                                {"dropped_intersection_count", 0},
+                                {"resumed", resumed},
+                                {"seed", seed},
+                                {"trainer_build_digest", trainerBuildDigest},
+                                {"version", APP_VERSION}});
+        terminalIteration = completedIteration;
+        preflightRasterMemory();
+        if (!resumed) {
             lastCheckpoint = saveCheckpoint(
                 model,
                 checkpointRoot,
@@ -1214,42 +1357,14 @@ int main(int argc, char *argv[]) {
                     std::nullopt,
                     0,
                     0,
+                    0,
+                    0,
                 }
             );
         }
-        const int startingIteration = completedIteration;
-
-        auto emitCheckpoint = [&](const char *eventName, const CheckpointReceipt &receipt) {
-            events.emit(eventName, {
-                {"checkpoint_generation", receipt.generation},
-                {"checkpoint_payload_bytes", receipt.payloadBytes},
-                {"checkpoint_payload_sha256", receipt.payloadDigest},
-                {"gaussian_count", model.num_active},
-                {"geometry_digest", identity.geometryDigest},
-                {"input_digest", identity.inputDigest},
-                {"iteration", receipt.iteration},
-                {"peak_memory_bytes", peakResidentMemoryBytes()},
-                {"profile", profile.name},
-                {"seed", seed},
-                {"trainer_build_digest", trainerBuildDigest},
-                {"version", APP_VERSION},
-            });
-        };
-
-        events.emit("started", {{"camera_count", cameras.size()},
-                                {"checkpoint_schema", 1},
-                                {"geometry_digest", identity.geometryDigest},
-                                {"initial_gaussian_count", model.num_active},
-                                {"input_digest", identity.inputDigest},
-                                {"iteration", completedIteration},
-                                {"iteration_limit", profile.iterationLimit},
-                                {"payload_schema", 2},
-                                {"plateau_window", profile.plateauWindow},
-                                {"profile", profile.name},
-                                {"resumed", resumed},
-                                {"seed", seed},
-                                {"trainer_build_digest", trainerBuildDigest},
-                                {"version", APP_VERSION}});
+        if (!lastCheckpoint) {
+            throw std::runtime_error("training did not establish a durable checkpoint");
+        }
         emitCheckpoint(resumed ? "checkpoint_loaded" : "checkpoint_completed", *lastCheckpoint);
 
         auto lastProgressAt = startedAt;
@@ -1260,16 +1375,19 @@ int main(int argc, char *argv[]) {
         };
         auto handleCancellation = [&]() {
             if (cancellationSignal == 0) return false;
-            events.emit("cancellation_requested", {{"iteration", completedIteration},
-                                                   {"signal", cancellationSignal}});
-            msplat_gpu_sync();
-            events.emit("cancelled", {
+            events->emit("cancellation_requested", {{"iteration", completedIteration},
+                                                    {"signal", cancellationSignal}});
+            msplat_gpu_sync_for_raster_replay();
+            events->emit("cancelled", {
                 {"checkpoint_generation", lastCheckpoint->generation},
                 {"checkpoint_iteration", lastCheckpoint->iteration},
                 {"checkpoint_payload_sha256", lastCheckpoint->payloadDigest},
                 {"geometry_digest", identity.geometryDigest},
                 {"input_digest", identity.inputDigest},
                 {"iteration", completedIteration},
+                {"memory_budget_bytes", memoryBudgetBytes},
+                {"raster_fallback_count", durableRasterFallbackCount},
+                {"dropped_intersection_count", 0},
             });
             return true;
         };
@@ -1278,14 +1396,37 @@ int main(int argc, char *argv[]) {
         std::string stopReason = "iteration_limit";
         std::size_t residentCameraIndex = std::numeric_limits<std::size_t>::max();
         int residentUsesRemaining = 0;
-        const int partialCameraGroup = completedIteration % cameraReuseCount;
-        if (partialCameraGroup != 0) {
-            residentCameraIndex = camsIter.next();
-            residentUsesRemaining = cameraReuseCount - partialCameraGroup;
-        }
-        for (int step = completedIteration + 1; step <= profile.iterationLimit; ++step) {
-            if (handleCancellation()) return 130;
 
+        auto rewindTrainingState = [&](int iteration) {
+            if (iteration < 0 || iteration > profile.iterationLimit) {
+                throw std::runtime_error("raster replay iteration is invalid");
+            }
+            if (residentCameraIndex != std::numeric_limits<std::size_t>::max()) {
+                releaseCameraResources(cameras[residentCameraIndex]);
+            }
+            camsIter = InfiniteRandomIterator<size_t>(camIndices, seed);
+            for (int draw = 0; draw < iteration / cameraReuseCount; ++draw) {
+                (void)camsIter.next();
+            }
+            residentCameraIndex = std::numeric_limits<std::size_t>::max();
+            residentUsesRemaining = 0;
+            const int partialCameraGroup = iteration % cameraReuseCount;
+            if (partialCameraGroup != 0) {
+                residentCameraIndex = camsIter.next();
+                residentUsesRemaining = cameraReuseCount - partialCameraGroup;
+            }
+            model.adam_step_count = iteration;
+            model.schedulersStep(iteration);
+            plateauSampleCount = iteration > warmupLength
+                ? (iteration - warmupLength) % lossSyncBatch
+                : 0;
+            completedIteration = iteration;
+            terminalIteration = iteration;
+        };
+
+        rewindTrainingState(completedIteration);
+
+        auto enqueueIteration = [&](int step) {
             if (residentUsesRemaining == 0) {
                 if (residentCameraIndex != std::numeric_limits<std::size_t>::max()) {
                     releaseCameraResources(cameras[residentCameraIndex]);
@@ -1303,22 +1444,98 @@ int main(int argc, char *argv[]) {
             }
             --residentUsesRemaining;
             MTensor target = camera.getGPUImage(model.getDownscaleFactor(step));
+            msplat_set_raster_iteration_context(step, cameraIndex);
             model.fullIteration(camera, step, target, ssimWeight);
             model.schedulersStep(step);
-            model.afterTrain(step);
             if (step > warmupLength) {
+                const int lossSlot = (step - warmupLength - 1) % lossSyncBatch;
                 const float normalization = 1.0f /
                     static_cast<float>(model.lastHeight * model.lastWidth);
-                plateauCameraIndices[plateauSampleCount] = cameraIndex;
-                msplat_record_last_loss(
-                    plateauSampleCount,
-                    lossSyncBatch,
-                    normalization
-                );
-                ++plateauSampleCount;
+                plateauCameraIndices[lossSlot] = cameraIndex;
+                msplat_record_last_loss(lossSlot, lossSyncBatch, normalization);
+                plateauSampleCount = lossSlot + 1;
             }
             msplat_commit();
-            completedIteration = step;
+        };
+
+        auto synchronizeWindow = [&](int windowEnd) {
+            int attemptEnd = windowEnd;
+            bool cancellationObserved = false;
+            while (true) {
+                msplat_gpu_sync_for_raster_replay();
+                const MsplatRasterStats stats = msplat_get_raster_stats();
+                if (stats.dropped_intersection_count != 0) {
+                    throw std::runtime_error(
+                        "native raster reported dropped intersections; output publication is blocked"
+                    );
+                }
+                if (!stats.capacity_exceeded) {
+                    completedIteration = attemptEnd;
+                    terminalIteration = attemptEnd;
+                    return !cancellationObserved && attemptEnd == windowEnd;
+                }
+                if (stats.first_overflow_iteration == 0 ||
+                    stats.first_overflow_iteration > static_cast<std::uint64_t>(attemptEnd) ||
+                    stats.first_overflow_iteration <= static_cast<std::uint64_t>(completedIteration) ||
+                    stats.first_overflow_camera >= cameras.size() ||
+                    stats.latest_intersection_count == 0) {
+                    throw std::runtime_error("native raster overflow evidence is inconsistent");
+                }
+
+                const int firstOverflow = static_cast<int>(stats.first_overflow_iteration);
+                const int successfulPrefix = firstOverflow - 1;
+                rewindTrainingState(successfulPrefix);
+                if (cancellationSignal != 0 || cancellationObserved) {
+                    return false;
+                }
+
+                // Growth performs the authoritative budget and Metal-buffer checks.
+                // No optimizer state after successfulPrefix was mutated: the GPU fatal
+                // flag guards the failed step and every later command in this window.
+                msplat_grow_exact_raster_capacity(stats.latest_intersection_count);
+                const MsplatRasterStats replayStats = msplat_get_raster_stats();
+                if (replayStats.required_bytes == 0 ||
+                    replayStats.required_bytes > replayStats.budget_bytes) {
+                    throw std::runtime_error(
+                        "native raster grow returned invalid allocation evidence"
+                    );
+                }
+                events->emit("raster_replay", {
+                    {"budget_bytes", replayStats.budget_bytes},
+                    {"camera_index", stats.first_overflow_camera},
+                    {"first_overflow_iteration", stats.first_overflow_iteration},
+                    {"intersection_count", stats.latest_intersection_count},
+                    {"iteration", successfulPrefix},
+                    {"required_bytes", replayStats.required_bytes},
+                });
+                msplat_clear_raster_capacity_failure();
+
+                attemptEnd = successfulPrefix;
+                for (int replayStep = firstOverflow; replayStep <= windowEnd; ++replayStep) {
+                    if (cancellationSignal != 0) {
+                        cancellationObserved = true;
+                        break;
+                    }
+                    enqueueIteration(replayStep);
+                    attemptEnd = replayStep;
+                }
+                if (attemptEnd == successfulPrefix) {
+                    return false;
+                }
+            }
+        };
+
+        for (int step = completedIteration + 1; step <= profile.iterationLimit; ++step) {
+            enqueueIteration(step);
+
+            const bool windowComplete = step % refineEvery == 0 ||
+                step == profile.iterationLimit;
+            if (!windowComplete) continue;
+            if (!synchronizeWindow(step)) {
+                if (handleCancellation()) return 130;
+                throw std::runtime_error("raster replay stopped before completing its window");
+            }
+            model.afterTrain(step);
 
             bool plateauReached = false;
             if (plateauSampleCount == lossSyncBatch) {
@@ -1349,7 +1566,7 @@ int main(int argc, char *argv[]) {
 
             auto now = std::chrono::steady_clock::now();
             if (step == profile.iterationLimit || now - lastProgressAt >= std::chrono::seconds(1)) {
-                msplat_gpu_sync();
+                emitRasterFallbackIfNeeded(step);
                 now = std::chrono::steady_clock::now();
                 const double sessionElapsed = std::chrono::duration<double>(now - startedAt).count();
                 const double elapsed = priorElapsedSeconds + sessionElapsed;
@@ -1370,13 +1587,13 @@ int main(int argc, char *argv[]) {
                     progress["loss"] = latestWindowLoss;
                     progress["loss_iteration"] = latestLossIteration;
                 }
-                events.emit("progress", std::move(progress));
+                events->emit("progress", std::move(progress));
                 lastProgressAt = now;
             }
 
             if (plateauReached && step < profile.iterationLimit) {
                 stopReason = "plateau";
-                events.emit("early_stop", {{"iteration", step},
+                events->emit("early_stop", {{"iteration", step},
                                            {"last_improvement_iteration", lastImprovementIteration},
                                            {"loss", latestWindowLoss},
                                            {"loss_iteration", latestLossIteration},
@@ -1390,6 +1607,7 @@ int main(int argc, char *argv[]) {
                 if (plateauSampleCount != 0) {
                     throw std::runtime_error("checkpoint cadence split a pending loss batch");
                 }
+                const MsplatRasterStats stats = emitRasterFallbackIfNeeded(step);
                 lastCheckpoint = saveCheckpoint(
                     model,
                     checkpointRoot,
@@ -1403,8 +1621,11 @@ int main(int argc, char *argv[]) {
                             : std::nullopt,
                         latestLossIteration,
                         cumulativeElapsed(),
+                        stats.fallback_count,
+                        stats.dropped_intersection_count,
                     }
                 );
+                durableRasterFallbackCount = stats.fallback_count;
                 emitCheckpoint("checkpoint_completed", *lastCheckpoint);
                 if (handleCancellation()) return 130;
             }
@@ -1416,6 +1637,8 @@ int main(int argc, char *argv[]) {
             if (handleCancellation()) return 130;
             throw std::runtime_error("final output was not published");
         }
+        const MsplatRasterStats finalRasterStats =
+            emitRasterFallbackIfNeeded(completedIteration);
         const std::uintmax_t outputBytes = fs::file_size(outputPath);
         const double elapsed = cumulativeElapsed();
 
@@ -1425,18 +1648,66 @@ int main(int argc, char *argv[]) {
                           {"input_digest", identity.inputDigest},
                           {"iteration", completedIteration},
                           {"iteration_limit", profile.iterationLimit},
+                          {"memory_budget_bytes", memoryBudgetBytes},
                           {"output_bytes", outputBytes},
                           {"peak_memory_bytes", peakResidentMemoryBytes()},
                           {"plateau_window", profile.plateauWindow},
                           {"profile", profile.name},
+                          {"raster_fallback_count", finalRasterStats.fallback_count},
+                          {"dropped_intersection_count",
+                           finalRasterStats.dropped_intersection_count},
                           {"seed", seed},
                           {"stop_reason", stopReason},
                           {"trainer_build_digest", trainerBuildDigest},
                           {"version", APP_VERSION}};
-        events.emit("completed", completed);
-        if (!events.enabled()) std::cout << "EasySplat training completed: " << outputPath << '\n';
+        events->emit("completed", completed);
+        if (!events->enabled()) std::cout << "EasySplat training completed: " << outputPath << '\n';
         return 0;
     } catch (const std::exception &error) {
+        if (msplat_raster_resource_limit_was_exceeded()) {
+            const MsplatRasterStats stats = msplat_get_raster_stats();
+            if (events) {
+                try {
+                    json fields = {
+                        {"allocation_bytes", stats.allocation_bytes},
+                        {"iteration", terminalIteration},
+                        {"max_buffer_bytes", stats.max_buffer_bytes},
+                        {"required_bytes", stats.required_bytes},
+                    };
+                    if (stats.latest_intersection_count > 0) {
+                        fields["intersection_count"] = stats.latest_intersection_count;
+                    }
+                    events->emit("raster_resource_limit_exceeded", std::move(fields));
+                } catch (const std::exception &eventError) {
+                    std::cerr << "easysplat-train: cannot report raster resource failure: "
+                              << eventError.what() << '\n';
+                }
+            }
+            std::cerr << "easysplat-train: " << error.what() << '\n';
+            return 75;
+        }
+        if (msplat_raster_memory_budget_was_exceeded()) {
+            const MsplatRasterStats stats = msplat_get_raster_stats();
+            if (events) {
+                try {
+                    json fields = {
+                        {"allocation_bytes", stats.allocation_bytes},
+                        {"budget_bytes", stats.budget_bytes},
+                        {"iteration", terminalIteration},
+                        {"required_bytes", stats.required_bytes},
+                    };
+                    if (stats.latest_intersection_count > 0) {
+                        fields["intersection_count"] = stats.latest_intersection_count;
+                    }
+                    events->emit("raster_memory_budget_exceeded", std::move(fields));
+                } catch (const std::exception &eventError) {
+                    std::cerr << "easysplat-train: cannot report raster budget failure: "
+                              << eventError.what() << '\n';
+                }
+            }
+            std::cerr << "easysplat-train: " << error.what() << '\n';
+            return 75;
+        }
         std::cerr << "easysplat-train: " << error.what() << '\n';
         return 1;
     }
