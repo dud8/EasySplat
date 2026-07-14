@@ -8,6 +8,7 @@ import math
 import os
 import signal
 import shutil
+import stat
 import subprocess
 import sys
 import time
@@ -18,15 +19,18 @@ from typing import Any, BinaryIO, Mapping, Sequence
 try:
     from scripts.benchmark import easysplat_benchmark as benchmark
     from scripts.benchmark import evidence_protocol as evidence
+    from scripts.benchmark import renderer_closure
 except ModuleNotFoundError:
     import easysplat_benchmark as benchmark
     import evidence_protocol as evidence
+    import renderer_closure
 
 
 _TIMEOUT_OVERRIDE_ENVIRONMENT_KEY = "EASYSPLAT_INTERNAL_BENCHMARK_TIMEOUT_SECONDS"
 _MINIMUM_TIMEOUT_OVERRIDE_SECONDS = 0.1
 _MAXIMUM_TIMEOUT_OVERRIDE_SECONDS = 7 * 24 * 60 * 60
 _PROCESS_GROUP_TERMINATION_GRACE_SECONDS = 5.0
+_PROCESS_GROUP_DRAIN_SECONDS = 0.25
 
 
 def _load(path: Path, label: str) -> Any:
@@ -52,10 +56,35 @@ def _verify_runner_digest(path: Path, expected: Mapping[str, str], phase: str) -
         )
 
 
+def _verify_renderer_closure(
+    path: Path,
+    expected: Mapping[str, Any],
+    phase: str,
+) -> renderer_closure.VerifiedClosure:
+    try:
+        return renderer_closure.verify_closure(path, expected)
+    except renderer_closure.ClosureError as error:
+        raise benchmark.ConfigError(
+            f"rendering driver closure mismatch {phase}; refusing protected measurement: {error}"
+        ) from error
+
+
+def _canonical_real_directory(path: Path, label: str) -> Path:
+    absolute = Path(os.path.abspath(path))
+    try:
+        metadata = absolute.lstat()
+        resolved = absolute.resolve(strict=True)
+    except OSError as error:
+        raise benchmark.ConfigError(f"{label} is missing") from error
+    if not stat.S_ISDIR(metadata.st_mode):
+        raise benchmark.ConfigError(f"{label} must be a real directory")
+    if absolute != resolved:
+        raise benchmark.ConfigError(f"{label} path contains a symbolic link")
+    return resolved
+
+
 def _verify_baseline_checkout(path: Path, expected_commit: str) -> Path:
-    if path.is_symlink() or not path.is_dir():
-        raise benchmark.ConfigError("baseline checkout must be a real directory")
-    resolved = path.resolve()
+    resolved = _canonical_real_directory(path, "baseline checkout")
 
     def git(*arguments: str) -> str:
         completed = subprocess.run(
@@ -90,10 +119,12 @@ def _verify_baseline_toolchain(path: Path, expected_identity: str) -> tuple[Path
     return resolved, identity
 
 
-def _verify_candidate_checkout(expected_commit: str) -> None:
+def _verify_candidate_checkout(expected_commit: str) -> Path:
+    resolved = _canonical_real_directory(benchmark.ROOT, "candidate checkout")
     state = benchmark.collect_git_state()
     if state["dirty"] or state["commit"] != expected_commit:
         raise benchmark.ConfigError("candidate checkout changed during lane measurement")
+    return resolved
 
 
 def _verify_file_digest(path: Path, expected_digest: str, label: str) -> None:
@@ -125,10 +156,10 @@ def _prepare_artifact_root(output_root: Path, relative: Path, scale: int, lane: 
     return artifact_root
 
 
-def _measurement_environment(artifact_root: Path) -> dict[str, str]:
-    home = artifact_root / "runner-home"
-    temporary = artifact_root / "tmp"
-    cache = artifact_root / "cache"
+def _isolated_environment(artifact_root: Path, namespace: str) -> dict[str, str]:
+    home = artifact_root / f"{namespace}-home"
+    temporary = artifact_root / f"{namespace}-tmp"
+    cache = artifact_root / f"{namespace}-cache"
     for directory in (home, temporary, cache):
         directory.mkdir()
     return {
@@ -139,6 +170,10 @@ def _measurement_environment(artifact_root: Path) -> dict[str, str]:
         "LANG": "en_US.UTF-8",
         "LC_ALL": "en_US.UTF-8",
     }
+
+
+def _measurement_environment(artifact_root: Path) -> dict[str, str]:
+    return _isolated_environment(artifact_root, "runner")
 
 
 def _measurement_timeout_seconds(scale: int, override: str | None = None) -> float:
@@ -197,6 +232,74 @@ def _terminate_process_group(
         ) from error
 
 
+def _process_group_exists(process_group_id: int) -> bool:
+    try:
+        completed = subprocess.run(
+            ["/bin/ps", "-axo", "pid=,pgid=,state="],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            check=False,
+            text=True,
+        )
+        if completed.returncode == 0:
+            for line in completed.stdout.splitlines():
+                fields = line.split()
+                if len(fields) >= 3 and int(fields[1]) == process_group_id:
+                    if not fields[2].startswith("Z"):
+                        return True
+            return False
+    except (OSError, ValueError):
+        pass
+    try:
+        os.killpg(process_group_id, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+
+
+def _terminate_reaped_leader_group(
+    process_group_id: int,
+    grace_seconds: float = _PROCESS_GROUP_TERMINATION_GRACE_SECONDS,
+) -> None:
+    # A surviving process still owns this PGID, so it cannot be reused while
+    # these signals are sent. Never signal the ID after the group disappears.
+    if not _process_group_exists(process_group_id):
+        return
+    try:
+        os.killpg(process_group_id, signal.SIGTERM)
+    except ProcessLookupError:
+        return
+    deadline = time.monotonic() + grace_seconds
+    while _process_group_exists(process_group_id) and time.monotonic() < deadline:
+        time.sleep(0.05)
+    if not _process_group_exists(process_group_id):
+        return
+    try:
+        os.killpg(process_group_id, signal.SIGKILL)
+    except ProcessLookupError:
+        return
+    deadline = time.monotonic() + grace_seconds
+    while _process_group_exists(process_group_id) and time.monotonic() < deadline:
+        time.sleep(0.05)
+
+
+def _reject_live_descendants(process_group_id: int) -> None:
+    if not _process_group_exists(process_group_id):
+        return
+    deadline = time.monotonic() + _PROCESS_GROUP_DRAIN_SECONDS
+    while _process_group_exists(process_group_id) and time.monotonic() < deadline:
+        time.sleep(0.01)
+    if not _process_group_exists(process_group_id):
+        return
+    _terminate_reaped_leader_group(process_group_id)
+    raise benchmark.ConfigError(
+        "protected subprocess left live child processes after its session leader exited"
+    )
+
+
 def _run_measurement_process(
     command: Sequence[str],
     stdout_handle: BinaryIO,
@@ -214,16 +317,236 @@ def _run_measurement_process(
     )
     try:
         return_code = process.wait(timeout=timeout_seconds)
+        _reject_live_descendants(process.pid)
         return subprocess.CompletedProcess(command, return_code), False
     except subprocess.TimeoutExpired:
         return_code = _terminate_process_group(process)
         return subprocess.CompletedProcess(command, return_code), True
     except BaseException:
         try:
-            _terminate_process_group(process)
+            if process.poll() is None:
+                _terminate_process_group(process)
+            else:
+                _terminate_reaped_leader_group(process.pid)
         except Exception:
             pass
         raise
+
+
+def _require_owned_artifact(path: Path, artifact_root: Path, label: str) -> Path:
+    if path.parent != artifact_root or path.is_symlink() or not path.is_file():
+        raise benchmark.ConfigError(f"{label} must be a supervisor-visible regular artifact")
+    return path
+
+
+def _rendering_required(request: Mapping[str, Any], lane: str) -> bool:
+    return (
+        lane == evidence.LANE_REFERENCE
+        and request["expected_outcome"]["kind"] == "valid"
+        and "scene_quality" in request["gate_scopes"]
+    )
+
+
+def _validate_render_job(
+    job_path: Path,
+    artifact_root: Path,
+    request: Mapping[str, Any],
+    request_digest: str,
+    renderer_identity: Mapping[str, Any],
+    candidate_checkout: Path,
+    baseline_checkout: Path,
+) -> dict[str, Any]:
+    _require_owned_artifact(job_path, artifact_root, "render-job.json")
+    job = benchmark._require_mapping(_load(job_path, "render job"), "render job")
+    benchmark._require_exact_keys(
+        job,
+        {
+            "schema_version",
+            "scene_id",
+            "scale",
+            "request_digest",
+            "input_digest",
+            "renderer_closure_sha256",
+            "renderer_executable_sha256",
+            "holdout_indices",
+            "training_view_indices",
+            "candidate_checkout",
+            "baseline_checkout",
+            "views",
+        },
+        "render job",
+    )
+    binding = request["binding"]
+    expected = {
+        "schema_version": 1,
+        "scene_id": binding["scene_id"],
+        "scale": binding["scale"],
+        "request_digest": request_digest,
+        "input_digest": binding["input_digest"],
+        "renderer_closure_sha256": renderer_identity["sha256"],
+        "renderer_executable_sha256": renderer_identity["executable_sha256"],
+        "holdout_indices": request["holdout_indices"],
+        "training_view_indices": [
+            index
+            for index in range(binding["scale"])
+            if index not in set(request["holdout_indices"])
+        ],
+    }
+    for field, expected_value in expected.items():
+        if job.get(field) != expected_value:
+            raise benchmark.ConfigError(f"render job {field} does not match the protected request")
+    checkout_expectations = (
+        ("candidate_checkout", candidate_checkout, binding["git_commit"]),
+        ("baseline_checkout", baseline_checkout, binding["baseline_git_commit"]),
+    )
+    for field, root, commit in checkout_expectations:
+        checkout = benchmark._require_mapping(job.get(field), f"render job {field}")
+        benchmark._require_exact_keys(checkout, {"path", "commit"}, f"render job {field}")
+        try:
+            supplied_root = _canonical_real_directory(
+                Path(checkout["path"]),
+                f"render job {field}",
+            )
+        except (OSError, TypeError) as error:
+            raise benchmark.ConfigError(f"render job {field} path is invalid") from error
+        if supplied_root != root.resolve(strict=True) or checkout["commit"] != commit:
+            raise benchmark.ConfigError(
+                f"render job {field} does not match the verified checkout root"
+            )
+    views = job.get("views")
+    if not isinstance(views, list) or len(views) != len(request["holdout_indices"]):
+        raise benchmark.ConfigError("render job does not cover every protected holdout")
+    return dict(job)
+
+
+def _execute_rendering_stage(
+    *,
+    artifact_root: Path,
+    request: Mapping[str, Any],
+    request_path: Path,
+    request_digest: str,
+    renderer_closure_path: Path,
+    renderer_identity: Mapping[str, Any],
+    candidate_checkout: Path,
+    baseline_checkout: Path,
+    timeout_seconds: float,
+) -> dict[str, Any]:
+    job_path = artifact_root / "render-job.json"
+    manifest_path = artifact_root / "rendering-manifest.json"
+    supervisor_path = artifact_root / "render-supervisor.json"
+    renderer_stdout = artifact_root / "renderer-stdout.log"
+    renderer_stderr = artifact_root / "renderer-stderr.log"
+    for path, label in (
+        (manifest_path, "rendering-manifest.json"),
+        (supervisor_path, "render-supervisor.json"),
+        (renderer_stdout, "renderer-stdout.log"),
+        (renderer_stderr, "renderer-stderr.log"),
+    ):
+        if path.exists() or path.is_symlink():
+            raise benchmark.ConfigError(
+                f"measurement runner cannot pre-create supervisor-owned {label}"
+            )
+
+    verified = _verify_renderer_closure(
+        renderer_closure_path,
+        renderer_identity,
+        "immediately before rendering",
+    )
+    _validate_render_job(
+        job_path,
+        artifact_root,
+        request,
+        request_digest,
+        renderer_identity,
+        candidate_checkout,
+        baseline_checkout,
+    )
+    job_digest = evidence.sha256_file(job_path)
+    redacted_command = [
+        "approved-rendering-driver",
+        f"renderer-closure://{renderer_identity['sha256']}",
+        f"renderer-executable://{renderer_identity['executable_sha256']}",
+        "render",
+        "--job",
+        "evidence://render-job.json",
+        "--artifact-root",
+        "evidence://run",
+        "--output",
+        "evidence://rendering-manifest.json",
+    ]
+    command = [
+        str(verified.executable),
+        "render",
+        "--job",
+        str(job_path),
+        "--artifact-root",
+        str(artifact_root),
+        "--output",
+        str(manifest_path),
+    ]
+    completed: subprocess.CompletedProcess[bytes] | None = None
+    launch_error: OSError | None = None
+    timed_out = False
+    started_monotonic = time.monotonic()
+    try:
+        with renderer_stdout.open("wb") as stdout_handle, renderer_stderr.open("wb") as stderr_handle:
+            completed, timed_out = _run_measurement_process(
+                command,
+                stdout_handle,
+                stderr_handle,
+                _isolated_environment(artifact_root, "renderer"),
+                timeout_seconds,
+            )
+    except OSError as error:
+        launch_error = error
+    finally:
+        ended_monotonic = time.monotonic()
+        _verify_renderer_closure(
+            renderer_closure_path,
+            renderer_identity,
+            "after rendering",
+        )
+        _verify_file_digest(job_path, job_digest, "render job")
+        _verify_file_digest(request_path, request_digest, "evidence request")
+    if completed is None:
+        detail = launch_error.strerror if launch_error is not None else "unknown launch failure"
+        raise benchmark.ConfigError(f"rendering driver could not start: {detail}")
+    if timed_out:
+        raise benchmark.ConfigError(
+            f"rendering driver timed out after {timeout_seconds:g} seconds"
+        )
+    if completed.returncode != 0:
+        raise benchmark.ConfigError(
+            f"rendering driver failed with exit {completed.returncode}"
+        )
+    _require_owned_artifact(manifest_path, artifact_root, "rendering-manifest.json")
+    if supervisor_path.exists() or supervisor_path.is_symlink():
+        raise benchmark.ConfigError("rendering driver cannot pre-create render-supervisor.json")
+    manifest_digest = evidence.sha256_file(manifest_path)
+    actual_argv_digest = evidence.sha256_bytes(evidence.canonical_json_bytes(command))
+    receipt = {
+        "schema_version": 1,
+        "scene_id": request["binding"]["scene_id"],
+        "scale": request["binding"]["scale"],
+        "lane": request["binding"]["lane"],
+        "request_sha256": request_digest,
+        "candidate_checkout_commit": request["binding"]["git_commit"],
+        "baseline_checkout_commit": request["binding"]["baseline_git_commit"],
+        "renderer_closure_sha256": renderer_identity["sha256"],
+        "renderer_executable_sha256": renderer_identity["executable_sha256"],
+        "job_sha256": job_digest,
+        "manifest_sha256": manifest_digest,
+        "stdout_sha256": evidence.sha256_file(renderer_stdout),
+        "stderr_sha256": evidence.sha256_file(renderer_stderr),
+        "argv": redacted_command,
+        "actual_argv_sha256": actual_argv_digest,
+        "started_monotonic_seconds": started_monotonic,
+        "ended_monotonic_seconds": ended_monotonic,
+        "exit_code": completed.returncode,
+        "timed_out": False,
+    }
+    supervisor_path.write_bytes(evidence.canonical_json_bytes(receipt) + b"\n")
+    return receipt
 
 
 def run_lane(
@@ -237,6 +560,7 @@ def run_lane(
     output_root: Path,
     lane: str,
     runner_path: Path,
+    renderer_closure_path: Path,
     evidence_key_path: Path,
 ) -> dict[str, Any]:
     if lane not in evidence.RELEASE_LANES:
@@ -277,7 +601,7 @@ def run_lane(
         raise benchmark.ConfigError("lane corpus does not match the prepared request index")
     if benchmark.sha256_json(config) != index["thresholds_digest"]:
         raise benchmark.ConfigError("lane thresholds do not match the prepared request index")
-    _verify_candidate_checkout(index["git_commit"])
+    candidate_checkout = _verify_candidate_checkout(index["git_commit"])
     git = benchmark.collect_git_state()
     toolchain_identity = benchmark.resolved_toolchain_identity(toolchain_root, "release")
     if toolchain_identity != index["toolchain_identity"]:
@@ -300,7 +624,13 @@ def run_lane(
     )
     index = benchmark.validate_request_index(index, identity, corpus)
     approved_runner = index["runner_identities"][lane]
+    renderer_identity = index["runner_identities"][evidence.RENDERING_DRIVER_IDENTITY]
     _verify_runner_digest(runner, approved_runner, "before the first scene")
+    _verify_renderer_closure(
+        renderer_closure_path,
+        renderer_identity,
+        "before the first scene",
+    )
 
     machine = evidence.collect_machine_metadata()
     evidence.validate_machine_lane(machine, lane)
@@ -322,6 +652,11 @@ def run_lane(
                 label,
             )
         _verify_runner_digest(runner, approved_runner, "before subprocess launch")
+        _verify_renderer_closure(
+            renderer_closure_path,
+            renderer_identity,
+            "before measurement launch",
+        )
         entry = benchmark._require_mapping(raw_entry, "request index entry")
         request_path = requests_root / _relative(entry.get("request"), "request path")
         request = _load(request_path, "evidence request")
@@ -344,6 +679,7 @@ def run_lane(
             lane,
             identity,
             request["binding"]["input_digest"],
+            index["runner_identities"][evidence.RENDERING_DRIVER_IDENTITY],
         )
         if request != expected_request:
             raise benchmark.ConfigError("request policy does not match the prepared corpus and lane")
@@ -365,7 +701,10 @@ def run_lane(
         media_relative = _relative(entry.get("media_path"), "request media path")
         media = corpus_path.parent / media_relative
         expected_input_digest = request["binding"]["input_digest"]
-        if benchmark.digest_input(media) != expected_input_digest:
+        if benchmark.digest_input(
+            media,
+            trusted_root=corpus_path.parent,
+        ) != expected_input_digest:
             raise benchmark.ConfigError(f"{scene_id} input does not match the prepared request")
 
         evidence_relative = _relative(entry.get("evidence_path"), "request evidence path")
@@ -416,7 +755,7 @@ def run_lane(
             "--toolchain-root",
             str(toolchain_root),
             "--candidate-checkout-root",
-            str(benchmark.ROOT),
+            str(candidate_checkout),
             "--baseline-checkout-root",
             str(baseline_checkout),
             "--baseline-toolchain-root",
@@ -460,6 +799,11 @@ def run_lane(
                     label,
                 )
             _verify_file_digest(request_path, request_digest, "evidence request")
+            _verify_renderer_closure(
+                renderer_closure_path,
+                renderer_identity,
+                "after measurement completion",
+            )
         if completed is None:
             detail = launch_error.strerror if launch_error is not None else "unknown launch failure"
             raise benchmark.ConfigError(
@@ -483,6 +827,20 @@ def run_lane(
                 f"{lane} measurement runner failed for {scene_id}@{scale} with exit {completed.returncode}"
             )
 
+        rendered = _rendering_required(request, lane)
+        if rendered:
+            _execute_rendering_stage(
+                artifact_root=artifact_root,
+                request=request,
+                request_path=request_path,
+                request_digest=request_digest,
+                renderer_closure_path=renderer_closure_path,
+                renderer_identity=renderer_identity,
+                candidate_checkout=candidate_checkout,
+                baseline_checkout=baseline_checkout,
+                timeout_seconds=timeout_seconds,
+            )
+
         observations_path = artifact_root / "observations.json"
         observations = _load(observations_path, "raw observations")
         if not isinstance(observations, Mapping):
@@ -497,6 +855,16 @@ def run_lane(
         if not isinstance(raw_artifacts, dict):
             raise benchmark.ConfigError("measurement runner artifacts must be an object")
         raw_artifacts["supervisor_run"] = "supervisor-run.json"
+        if rendered:
+            raw_artifacts.update(
+                {
+                    "render_job": "render-job.json",
+                    "rendering_manifest": "rendering-manifest.json",
+                    "render_supervisor": "render-supervisor.json",
+                    "renderer_stdout_log": "renderer-stdout.log",
+                    "renderer_stderr_log": "renderer-stderr.log",
+                }
+            )
         supervisor_run = {
             "schema_version": 1,
             "scene_id": scene_id,
@@ -529,7 +897,10 @@ def run_lane(
         )
         attestation_path = artifact_root / "attestation.json"
         benchmark.atomic_write_json(attestation_path, attestation)
-        if benchmark.digest_input(media) != expected_input_digest:
+        if benchmark.digest_input(
+            media,
+            trusted_root=corpus_path.parent,
+        ) != expected_input_digest:
             raise benchmark.ConfigError(f"{scene_id} input changed during measurement")
         results.append(
             {
@@ -542,6 +913,11 @@ def run_lane(
         )
 
     _verify_runner_digest(runner, approved_runner, "at lane completion")
+    _verify_renderer_closure(
+        renderer_closure_path,
+        renderer_identity,
+        "at lane completion",
+    )
     _verify_candidate_checkout(index["git_commit"])
     for label, digest in protected_file_digests.items():
         _verify_file_digest(
@@ -568,6 +944,7 @@ def run_lane(
         "toolchain_identity": index["toolchain_identity"],
         "producer_digest": index["producer_digest"],
         "runner_identity": approved_runner,
+        "rendering_driver_identity": renderer_identity,
         "attestations": results,
     }
     benchmark.atomic_write_json(output_root / f"lane-{lane}.json", lane_result)
@@ -586,6 +963,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--lane", choices=sorted(evidence.RELEASE_LANES), required=True)
     parser.add_argument("--runner", type=Path, required=True)
+    parser.add_argument("--rendering-driver-closure", type=Path, required=True)
     parser.add_argument("--evidence-key-file", type=Path, required=True)
     args = parser.parse_args(argv)
     try:
@@ -600,6 +978,7 @@ def main(argv: list[str] | None = None) -> int:
             args.output,
             args.lane,
             args.runner,
+            args.rendering_driver_closure,
             args.evidence_key_file,
         )
         print(evidence.canonical_json_bytes({"status": "attested", "count": len(result["attestations"])}).decode())

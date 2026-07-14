@@ -433,7 +433,7 @@
       "required": ["protocol_version", "version", "executable", "sha256"],
       "properties": {
         "protocol_version": {"const": 2},
-        "version": {"const": "2.0.0"},
+        "version": {"const": "2.1.0"},
         "executable": {"const": "scripts/benchmark/evidence_protocol.py"},
         "sha256": {"$ref": "#/$defs/sha256"}
       }
@@ -452,6 +452,87 @@
         },
         "sha256": {"$ref": "#/$defs/sha256"}
       }
+    },
+    "renderingDriver": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "label",
+        "sha256",
+        "executable_path",
+        "executable_sha256",
+        "resource_bundle_path",
+        "manifest_path",
+        "manifest_bytes",
+        "manifest_sha256"
+      ],
+      "properties": {
+        "label": {"const": "metal-splatter-benchmark-driver"},
+        "sha256": {"$ref": "#/$defs/sha256"},
+        "executable_path": {"const": "EasySplatBenchmarkDriver"},
+        "executable_sha256": {"$ref": "#/$defs/sha256"},
+        "resource_bundle_path": {"const": "MetalSplatter_MetalSplatter.bundle"},
+        "manifest_path": {"const": "closure-manifest.json"},
+        "manifest_bytes": {"type": "integer", "minimum": 1},
+        "manifest_sha256": {"$ref": "#/$defs/sha256"}
+      }
+    },
+    "renderScoringRuntime": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["status"],
+          "properties": {"status": {"const": "not_used"}}
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["status", "requirements_lock_sha256", "packages", "lpips"],
+          "properties": {
+            "status": {"const": "required"},
+            "requirements_lock_sha256": {"$ref": "#/$defs/sha256"},
+            "packages": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["lpips", "numpy", "pillow", "torch", "torchvision"],
+              "properties": {
+                "lpips": {"const": "0.1.4"},
+                "numpy": {"const": "2.5.1"},
+                "pillow": {"const": "12.3.0"},
+                "torch": {"const": "2.13.0"},
+                "torchvision": {"const": "0.28.0"}
+              }
+            },
+            "lpips": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["network_access", "backbone", "calibration"],
+              "properties": {
+                "network_access": {"const": "disabled"},
+                "backbone": {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "required": ["name", "sha256"],
+                  "properties": {
+                    "name": {"const": "torchvision_squeezenet1_1_imagenet1k_v1"},
+                    "sha256": {"const": "sha256:b8a52dc049b60e4b6ab68ad0df457362afab8b6304b2febdc1650a5dab4d7e7b"}
+                  }
+                },
+                "calibration": {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "required": ["name", "sha256"],
+                  "properties": {
+                    "name": {"const": "lpips_v0.1_squeeze"},
+                    "sha256": {"const": "sha256:4a5350f23600cb79923ce65bb07cbf57dca461329894153e05a1346bd531cf76"}
+                  }
+                }
+              }
+            }
+          }
+        }
+      ]
     },
     "evidenceRecord": {
       "type": "object",

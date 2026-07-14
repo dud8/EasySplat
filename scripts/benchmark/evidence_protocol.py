@@ -18,6 +18,7 @@ import mmap
 import os
 import platform
 import re
+import shutil
 import stat
 import statistics
 import struct
@@ -25,22 +26,25 @@ import subprocess
 import sys
 import tempfile
 import zipfile
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
 from typing import Any, Iterable, Mapping
 
 
 PROTOCOL_VERSION = 2
-PRODUCER_VERSION = "2.0.0"
+PRODUCER_VERSION = "2.1.0"
 PRODUCER_RELATIVE_PATH = "scripts/benchmark/evidence_protocol.py"
 LANE_REFERENCE = "reference_m4_max"
 LANE_CONSTRAINED = "constrained_14_16gb"
 LANE_EIGHT_GB = "eight_gb_fast"
+RENDERING_DRIVER_IDENTITY = "rendering_driver"
 RELEASE_LANES = {LANE_REFERENCE, LANE_CONSTRAINED, LANE_EIGHT_GB}
 RUNNER_LABELS = {
     LANE_REFERENCE: "reference-measurement-runner",
     LANE_CONSTRAINED: "constrained-measurement-runner",
     LANE_EIGHT_GB: "eight-gb-measurement-runner",
+    RENDERING_DRIVER_IDENTITY: "metal-splatter-benchmark-driver",
 }
 ACCURATE_REFERENCE_CONFIGURATION = {
     "mapper": "mapper",
@@ -226,6 +230,61 @@ TOOLCHAIN_SCENARIO_SPECS = {
     },
 }
 
+RENDER_VARIANTS = (
+    "accurate_reference",
+    "paired_baseline",
+    "candidate_balanced",
+    "candidate_fast",
+)
+LPIPS_SQUEEZENET_BACKBONE_SHA256 = (
+    "sha256:b8a52dc049b60e4b6ab68ad0df457362afab8b6304b2febdc1650a5dab4d7e7b"
+)
+LPIPS_SQUEEZENET_CALIBRATION_SHA256 = (
+    "sha256:4a5350f23600cb79923ce65bb07cbf57dca461329894153e05a1346bd531cf76"
+)
+LPIPS_CALIBRATION_HEAD_KEYS = frozenset(
+    f"lin{index}.model.1.weight"
+    for index in range(7)
+)
+RENDER_SCORING_PACKAGE_VERSIONS = {
+    "lpips": "0.1.4",
+    "numpy": "2.5.1",
+    "pillow": "12.3.0",
+    "torch": "2.13.0",
+    "torchvision": "0.28.0",
+}
+
+
+def render_scoring_runtime() -> dict[str, Any]:
+    lock = Path(__file__).resolve().with_name("render-requirements.txt")
+    return {
+        "status": "required",
+        "requirements_lock_sha256": sha256_file(lock),
+        "packages": dict(RENDER_SCORING_PACKAGE_VERSIONS),
+        "lpips": {
+            "network_access": "disabled",
+            "backbone": {
+                "name": "torchvision_squeezenet1_1_imagenet1k_v1",
+                "sha256": LPIPS_SQUEEZENET_BACKBONE_SHA256,
+            },
+            "calibration": {
+                "name": "lpips_v0.1_squeeze",
+                "sha256": LPIPS_SQUEEZENET_CALIBRATION_SHA256,
+            },
+        },
+    }
+
+
+@dataclass(frozen=True)
+class RenderingEvidence:
+    balanced: list[dict[str, float | int]]
+    fast: list[dict[str, float | int]]
+    artifacts: dict[str, dict[str, Any]]
+
+    @property
+    def samples(self) -> list[dict[str, float | int]]:
+        return self.balanced
+
 
 class EvidenceError(ValueError):
     """Raw evidence is incomplete, inconsistent, or unsafe."""
@@ -305,7 +364,9 @@ def _digest(value: Any, label: str) -> str:
     return value
 
 
-def validate_runner_identity(value: Any, lane: str) -> dict[str, str]:
+def validate_runner_identity(value: Any, lane: str) -> dict[str, Any]:
+    if lane == RENDERING_DRIVER_IDENTITY:
+        return validate_rendering_driver_identity(value)
     identity = _mapping(value, f"{lane} measurement runner")
     _exact_keys(identity, {"label", "sha256"}, f"{lane} measurement runner")
     expected_label = RUNNER_LABELS.get(lane)
@@ -317,10 +378,56 @@ def validate_runner_identity(value: Any, lane: str) -> dict[str, str]:
     }
 
 
-def validate_runner_identities(value: Any) -> dict[str, dict[str, str]]:
+def validate_rendering_driver_identity(value: Any) -> dict[str, Any]:
+    identity = _mapping(value, "rendering driver identity")
+    _exact_keys(
+        identity,
+        {
+            "label",
+            "sha256",
+            "executable_path",
+            "executable_sha256",
+            "resource_bundle_path",
+            "manifest_path",
+            "manifest_bytes",
+            "manifest_sha256",
+        },
+        "rendering driver identity",
+    )
+    if identity["label"] != RUNNER_LABELS[RENDERING_DRIVER_IDENTITY]:
+        raise EvidenceError("rendering driver identity label is invalid")
+    expected_paths = {
+        "executable_path": "EasySplatBenchmarkDriver",
+        "resource_bundle_path": "MetalSplatter_MetalSplatter.bundle",
+        "manifest_path": "closure-manifest.json",
+    }
+    for field, expected in expected_paths.items():
+        if identity[field] != expected:
+            raise EvidenceError(f"rendering driver identity {field} is invalid")
+    manifest_bytes = identity["manifest_bytes"]
+    if type(manifest_bytes) is not int or manifest_bytes <= 0:
+        raise EvidenceError("rendering driver identity manifest_bytes is invalid")
+    return {
+        "label": RUNNER_LABELS[RENDERING_DRIVER_IDENTITY],
+        "sha256": _digest(identity["sha256"], "rendering driver closure sha256"),
+        "executable_path": expected_paths["executable_path"],
+        "executable_sha256": _digest(
+            identity["executable_sha256"], "rendering driver executable sha256"
+        ),
+        "resource_bundle_path": expected_paths["resource_bundle_path"],
+        "manifest_path": expected_paths["manifest_path"],
+        "manifest_bytes": manifest_bytes,
+        "manifest_sha256": _digest(
+            identity["manifest_sha256"], "rendering driver manifest sha256"
+        ),
+    }
+
+
+def validate_runner_identities(value: Any) -> dict[str, dict[str, Any]]:
     identities = _mapping(value, "measurement runner identities")
-    _exact_keys(identities, RELEASE_LANES, "measurement runner identities")
-    return {lane: validate_runner_identity(identities[lane], lane) for lane in sorted(RELEASE_LANES)}
+    required = RELEASE_LANES | {RENDERING_DRIVER_IDENTITY}
+    _exact_keys(identities, required, "measurement runner identities")
+    return {name: validate_runner_identity(identities[name], name) for name in sorted(required)}
 
 
 def _finite_numbers(
@@ -786,6 +893,31 @@ def _timing_metrics(
         )
         return metrics
 
+    if lane == LANE_REFERENCE and "scene_quality" in gate_scopes:
+        _exact_keys(
+            timing,
+            {"ordinary_runs", "fast_profile_runs"},
+            "observations.timing",
+        )
+        ordinary = _validate_timing_sequence(
+            timing["ordinary_runs"],
+            "timing.ordinary_runs",
+            repetitions=3,
+            measurement_fields=("end_to_end_seconds", "geometry_seconds", "training_seconds"),
+        )
+        _validate_timing_sequence(
+            timing["fast_profile_runs"],
+            "timing.fast_profile_runs",
+            repetitions=3,
+            measurement_fields=("end_to_end_seconds",),
+            baseline_variant="accurate_reference",
+            candidate_variant="fast_candidate",
+        )
+        metrics["wall_time_seconds"] = measured(
+            statistics.median(record["end_to_end_seconds"] for record in ordinary["candidate"])
+        )
+        return metrics
+
     _exact_keys(timing, {"candidate_runs"}, "observations.timing")
     candidate_median = statistics.median(_validate_candidate_timing(timing["candidate_runs"]))
     metrics["wall_time_seconds"] = measured(candidate_median)
@@ -803,6 +935,8 @@ def _execution_runs(
 ) -> list[dict[str, Any]]:
     if lane == LANE_REFERENCE and "suite_performance" in gate_scopes:
         group_names = ("ordinary_runs", "phase_runs", "fast_profile_runs")
+    elif lane == LANE_REFERENCE and "scene_quality" in gate_scopes:
+        group_names = ("ordinary_runs", "fast_profile_runs")
     else:
         group_names = ("candidate_runs",)
     runs: list[dict[str, Any]] = []
@@ -1108,6 +1242,93 @@ def _validate_supervisor_run(
     unattributed_seconds = supervisor_span - covered_seconds
     if unattributed_seconds > max(60.0, supervisor_span * 0.1):
         raise EvidenceError("execution receipts leave too much supervisor time unattributed")
+
+
+def _validate_render_supervisor(
+    path: Path,
+    job_path: Path,
+    manifest_path: Path,
+    request: Mapping[str, Any],
+    renderer_identity: Mapping[str, Any],
+) -> None:
+    receipt = _mapping(
+        _load_bounded_json(path, "render_supervisor"),
+        "render_supervisor",
+    )
+    _exact_keys(
+        receipt,
+        {
+            "schema_version",
+            "scene_id",
+            "scale",
+            "lane",
+            "request_sha256",
+            "candidate_checkout_commit",
+            "baseline_checkout_commit",
+            "renderer_closure_sha256",
+            "renderer_executable_sha256",
+            "job_sha256",
+            "manifest_sha256",
+            "stdout_sha256",
+            "stderr_sha256",
+            "argv",
+            "actual_argv_sha256",
+            "started_monotonic_seconds",
+            "ended_monotonic_seconds",
+            "exit_code",
+            "timed_out",
+        },
+        "render_supervisor",
+    )
+    binding = request["binding"]
+    expected = {
+        "schema_version": 1,
+        "scene_id": binding["scene_id"],
+        "scale": binding["scale"],
+        "lane": binding["lane"],
+        "request_sha256": sha256_bytes(canonical_json_bytes(request) + b"\n"),
+        "candidate_checkout_commit": binding["git_commit"],
+        "baseline_checkout_commit": binding["baseline_git_commit"],
+        "renderer_closure_sha256": renderer_identity["sha256"],
+        "renderer_executable_sha256": renderer_identity["executable_sha256"],
+        "job_sha256": sha256_file(job_path),
+        "manifest_sha256": sha256_file(manifest_path),
+        "stdout_sha256": sha256_file(path.parent / "renderer-stdout.log"),
+        "stderr_sha256": sha256_file(path.parent / "renderer-stderr.log"),
+        "exit_code": 0,
+        "timed_out": False,
+    }
+    for field, expected_value in expected.items():
+        if receipt.get(field) != expected_value:
+            raise EvidenceError(f"render_supervisor {field} is invalid")
+    _digest(receipt["actual_argv_sha256"], "render_supervisor actual_argv_sha256")
+    started = receipt["started_monotonic_seconds"]
+    ended = receipt["ended_monotonic_seconds"]
+    if (
+        isinstance(started, bool)
+        or isinstance(ended, bool)
+        or not isinstance(started, (int, float))
+        or not isinstance(ended, (int, float))
+        or not math.isfinite(started)
+        or not math.isfinite(ended)
+        or started < 0
+        or ended <= started
+    ):
+        raise EvidenceError("render_supervisor monotonic timestamps are invalid")
+    argv = receipt["argv"]
+    if not isinstance(argv, list) or any(not isinstance(item, str) or not item for item in argv):
+        raise EvidenceError("render_supervisor argv must be a nonempty redacted argument array")
+    expected_tokens = {
+        "approved-rendering-driver",
+        f"renderer-closure://{renderer_identity['sha256']}",
+        f"renderer-executable://{renderer_identity['executable_sha256']}",
+        "evidence://render-job.json",
+        "evidence://rendering-manifest.json",
+    }
+    if not expected_tokens.issubset(set(argv)) or any(
+        "/Users/" in argument or "/home/" in argument for argument in argv
+    ):
+        raise EvidenceError("render_supervisor argv is not bound to the protected rendering process")
 
 
 def _memory_metrics(
@@ -1754,6 +1975,7 @@ def derive_metrics(
     holdout_indices: list[int],
     expected_orientation_status: str | None,
     request_binding: Mapping[str, Any],
+    rendering_evidence: RenderingEvidence | None = None,
 ) -> dict[str, Any]:
     """Derive gate metrics from raw samples; aggregate metrics are not accepted."""
     if lane not in RELEASE_LANES:
@@ -1899,9 +2121,10 @@ def derive_metrics(
         if colmap_rms == 0:
             raise EvidenceError("COLMAP ATE reference must be nonzero")
         candidate_rms = math.sqrt(sum(value * value for value in candidate_ate) / len(candidate_ate))
-        rendering = _mapping(observations.get("rendering"), "observations.rendering")
-        balanced_records = rendering.get("balanced")
-        fast_records = rendering.get("fast")
+        if rendering_evidence is None:
+            raise EvidenceError("scene quality requires rendered pixel evidence")
+        balanced_records = rendering_evidence.balanced
+        fast_records = rendering_evidence.fast
         if not isinstance(balanced_records, list) or len(balanced_records) != holdout_count:
             raise EvidenceError(
                 f"rendering.balanced must contain exactly {holdout_count} held-out views"
@@ -2216,12 +2439,17 @@ def validate_request(request: Any) -> Mapping[str, Any]:
             "expected_outcome",
             "input_kind",
             "gate_scopes",
+            "rendering_driver_identity",
         },
         "request",
     )
     if value["schema_version"] != 2:
         raise EvidenceError("request schema_version must be 2")
     binding = _mapping(value["binding"], "request.binding")
+    validate_runner_identity(
+        value["rendering_driver_identity"],
+        RENDERING_DRIVER_IDENTITY,
+    )
     _exact_keys(
         binding,
         {
@@ -2446,6 +2674,592 @@ def _artifact_descriptor(path: Path, root: Path) -> dict[str, Any]:
     if not path.is_file():
         raise EvidenceError(f"artifact must be a regular file: {relative}")
     return {"path": relative, "sha256": sha256_file(path), "bytes": path.stat().st_size}
+
+
+def _render_relative_path(value: Any, label: str) -> PurePosixPath:
+    if not isinstance(value, str):
+        raise EvidenceError(f"{label} must be a relative path")
+    path = PurePosixPath(value)
+    if (
+        path.is_absolute()
+        or any(part in {"", ".", ".."} for part in path.parts)
+        or "\\" in value
+    ):
+        raise EvidenceError(f"{label} is unsafe")
+    return path
+
+
+def _render_camera(value: Any, label: str) -> dict[str, Any]:
+    camera = _mapping(value, label)
+    _exact_keys(
+        camera,
+        {
+            "width",
+            "height",
+            "projection_matrix_column_major",
+            "world_to_camera_matrix_column_major",
+        },
+        label,
+    )
+    width = camera["width"]
+    height = camera["height"]
+    if (
+        type(width) is not int
+        or type(height) is not int
+        or not 64 <= width <= 16_384
+        or not 64 <= height <= 16_384
+        or width * height > 4_194_304
+    ):
+        raise EvidenceError(f"{label} dimensions exceed the 4,194,304-pixel render limit")
+    for field in (
+        "projection_matrix_column_major",
+        "world_to_camera_matrix_column_major",
+    ):
+        matrix = camera[field]
+        if (
+            not isinstance(matrix, list)
+            or len(matrix) != 16
+            or any(
+                isinstance(number, bool)
+                or not isinstance(number, (int, float))
+                or not math.isfinite(number)
+                for number in matrix
+            )
+        ):
+            raise EvidenceError(f"{label}.{field} must contain 16 finite numbers")
+    return dict(camera)
+
+
+def _load_render_image(path: Path, expected_width: int, expected_height: int, label: str) -> Any:
+    try:
+        import numpy
+        from PIL import Image
+    except ImportError as error:
+        raise EvidenceError(
+            "render scoring requires the hash-locked numpy and Pillow packages"
+        ) from error
+    try:
+        with Image.open(path) as image:
+            image.load()
+            if image.format != "PNG" or image.mode != "RGB":
+                raise EvidenceError(f"{label} must be an 8-bit RGB PNG")
+            if image.size != (expected_width, expected_height):
+                raise EvidenceError(f"{label} dimensions do not match its signed camera")
+            pixels = numpy.asarray(image, dtype=numpy.float32) / 255.0
+    except EvidenceError:
+        raise
+    except (OSError, ValueError) as error:
+        raise EvidenceError(f"{label} is not a readable PNG") from error
+    if pixels.shape != (expected_height, expected_width, 3) or not numpy.isfinite(pixels).all():
+        raise EvidenceError(f"{label} pixel data is invalid")
+    return pixels
+
+
+def _separable_gaussian_blur(image: Any) -> Any:
+    import numpy
+
+    kernel = numpy.asarray(
+        [
+            0.00102838008447911,
+            0.007598758135239185,
+            0.03600077212843082,
+            0.10936068950970002,
+            0.21300552785396576,
+            0.26601171493530273,
+            0.21300552785396576,
+            0.10936068950970002,
+            0.03600077212843082,
+            0.007598758135239185,
+            0.00102838008447911,
+        ],
+        dtype=numpy.float32,
+    )
+    radius = len(kernel) // 2
+    horizontal_source = numpy.pad(image, ((0, 0), (radius, radius), (0, 0)), mode="reflect")
+    horizontal = numpy.zeros_like(image)
+    for offset, weight in enumerate(kernel):
+        horizontal += horizontal_source[:, offset : offset + image.shape[1], :] * weight
+    vertical_source = numpy.pad(horizontal, ((radius, radius), (0, 0), (0, 0)), mode="reflect")
+    result = numpy.zeros_like(image)
+    for offset, weight in enumerate(kernel):
+        result += vertical_source[offset : offset + image.shape[0], :, :] * weight
+    return result
+
+
+def _pixel_metrics(candidate: Any, target: Any, lpips_distance: Any) -> tuple[float, float, float]:
+    import numpy
+
+    if candidate.shape != target.shape:
+        raise EvidenceError("rendered and ground-truth image dimensions do not match")
+    difference = candidate - target
+    mean_squared_error = float(numpy.mean(difference * difference, dtype=numpy.float64))
+    psnr = 100.0 if mean_squared_error == 0 else -10.0 * math.log10(mean_squared_error)
+
+    mu_candidate = _separable_gaussian_blur(candidate)
+    mu_target = _separable_gaussian_blur(target)
+    variance_candidate = numpy.maximum(
+        0,
+        _separable_gaussian_blur(candidate * candidate) - mu_candidate * mu_candidate,
+    )
+    variance_target = numpy.maximum(
+        0,
+        _separable_gaussian_blur(target * target) - mu_target * mu_target,
+    )
+    covariance = (
+        _separable_gaussian_blur(candidate * target) - mu_candidate * mu_target
+    )
+    c1 = 0.01**2
+    c2 = 0.03**2
+    numerator = (2 * mu_candidate * mu_target + c1) * (2 * covariance + c2)
+    denominator = (
+        (mu_candidate * mu_candidate + mu_target * mu_target + c1)
+        * (variance_candidate + variance_target + c2)
+    )
+    ssim = float(numpy.mean(numerator / denominator, dtype=numpy.float64))
+    lpips_value = lpips_distance(candidate, target)
+    if (
+        isinstance(lpips_value, bool)
+        or not isinstance(lpips_value, (int, float))
+        or not math.isfinite(lpips_value)
+        or lpips_value < 0
+    ):
+        raise EvidenceError("LPIPS scorer returned an invalid value")
+    return float(psnr), min(1.0, max(0.0, ssim)), float(lpips_value)
+
+
+_LPIPS_MODEL: tuple[Any, Any] | None = None
+LPIPS_DISTANCE_OVERRIDE: Any | None = None
+LPIPS_DEVICE_OVERRIDE: str | None = None
+
+
+def _verify_lpips_calibration(
+    model_state: Mapping[str, Any],
+    calibration_state: Mapping[str, Any],
+    *,
+    tensors_equal: Any,
+) -> None:
+    if set(calibration_state) != LPIPS_CALIBRATION_HEAD_KEYS:
+        raise EvidenceError("the LPIPS calibration linear heads are invalid")
+    model_head_keys = {
+        key
+        for key in model_state
+        if re.fullmatch(r"lin\d+\.model\.\d+\.weight", key)
+    }
+    if model_head_keys != LPIPS_CALIBRATION_HEAD_KEYS:
+        raise EvidenceError("the constructed LPIPS linear heads do not match the calibration")
+    if any(
+        not tensors_equal(model_state[key], calibration_state[key])
+        for key in LPIPS_CALIBRATION_HEAD_KEYS
+    ):
+        raise EvidenceError("the LPIPS calibration weights were not loaded")
+
+
+def _lpips_distance(candidate: Any, target: Any) -> float:
+    global _LPIPS_MODEL
+    raw_backbone = os.environ.get("EASYSPLAT_BENCHMARK_LPIPS_BACKBONE")
+    if not raw_backbone:
+        raise EvidenceError("the pinned LPIPS SqueezeNet backbone is unavailable")
+    backbone = Path(raw_backbone)
+    try:
+        backbone_sha256 = sha256_file(backbone)
+    except OSError as error:
+        raise EvidenceError("the pinned LPIPS SqueezeNet backbone is unavailable") from error
+    if backbone_sha256 != LPIPS_SQUEEZENET_BACKBONE_SHA256:
+        raise EvidenceError("the LPIPS SqueezeNet backbone digest is invalid")
+    try:
+        import importlib.metadata
+        import inspect
+        import lpips
+        import numpy
+        import torch
+    except ImportError as error:
+        raise EvidenceError(
+            "render scoring requires the hash-locked torch, torchvision, and lpips packages"
+        ) from error
+    for package, expected_version in RENDER_SCORING_PACKAGE_VERSIONS.items():
+        if importlib.metadata.version(package) != expected_version:
+            raise EvidenceError(f"render scoring package {package} is not the pinned version")
+    if _LPIPS_MODEL is None:
+        calibration = (
+            Path(inspect.getfile(lpips.LPIPS)).resolve().parent
+            / "weights"
+            / "v0.1"
+            / "squeeze.pth"
+        )
+        if sha256_file(calibration) != LPIPS_SQUEEZENET_CALIBRATION_SHA256:
+            raise EvidenceError("the LPIPS calibration digest is invalid")
+        try:
+            calibration_state = torch.load(
+                calibration,
+                map_location="cpu",
+                weights_only=True,
+            )
+        except (OSError, RuntimeError, TypeError, ValueError) as error:
+            raise EvidenceError("the LPIPS calibration could not be loaded safely") from error
+        if not isinstance(calibration_state, Mapping):
+            raise EvidenceError("the LPIPS calibration is invalid")
+        with tempfile.TemporaryDirectory() as directory:
+            checkpoint_root = Path(directory) / "hub" / "checkpoints"
+            checkpoint_root.mkdir(parents=True)
+            shutil.copy2(backbone, checkpoint_root / "squeezenet1_1-b8a52dc0.pth")
+            previous_torch_home = os.environ.get("TORCH_HOME")
+            original_download = torch.hub.download_url_to_file
+
+            def reject_download(*_args: Any, **_kwargs: Any) -> None:
+                raise EvidenceError("LPIPS attempted an unapproved weight download")
+
+            os.environ["TORCH_HOME"] = directory
+            torch.hub.download_url_to_file = reject_download
+            try:
+                model = lpips.LPIPS(
+                    net="squeeze",
+                    version="0.1",
+                    lpips=True,
+                    spatial=False,
+                    use_dropout=True,
+                    eval_mode=True,
+                    verbose=False,
+                )
+            finally:
+                torch.hub.download_url_to_file = original_download
+                if previous_torch_home is None:
+                    os.environ.pop("TORCH_HOME", None)
+                else:
+                    os.environ["TORCH_HOME"] = previous_torch_home
+        _verify_lpips_calibration(
+            model.state_dict(),
+            calibration_state,
+            tensors_equal=torch.equal,
+        )
+        device_name = LPIPS_DEVICE_OVERRIDE or (
+            "mps" if torch.backends.mps.is_available() else "cpu"
+        )
+        if device_name not in {"cpu", "mps"}:
+            raise EvidenceError("the LPIPS scoring device is invalid")
+        if device_name == "mps" and not torch.backends.mps.is_available():
+            raise EvidenceError("the requested LPIPS MPS device is unavailable")
+        device = torch.device(device_name)
+        model = model.to(device).eval()
+        _LPIPS_MODEL = (model, device)
+    model, device = _LPIPS_MODEL
+    candidate_tensor = torch.from_numpy(
+        numpy.ascontiguousarray(candidate.transpose(2, 0, 1))
+    ).unsqueeze(0).to(device)
+    target_tensor = torch.from_numpy(
+        numpy.ascontiguousarray(target.transpose(2, 0, 1))
+    ).unsqueeze(0).to(device)
+    with torch.inference_mode():
+        value = model(candidate_tensor, target_tensor, normalize=True)
+    return float(value.detach().to("cpu").item())
+
+
+def validate_and_score_rendering(
+    *,
+    artifact_root: Path,
+    manifest_path: Path,
+    reference_path: Path,
+    request: Mapping[str, Any],
+    commands: Any,
+    renderer_executable_sha256: str,
+    lpips_distance: Any = None,
+) -> RenderingEvidence:
+    if lpips_distance is None:
+        lpips_distance = LPIPS_DISTANCE_OVERRIDE or _lpips_distance
+    manifest = _mapping(_load_bounded_json(manifest_path, "rendering manifest"), "rendering manifest")
+    _exact_keys(
+        manifest,
+        {
+            "schema_version",
+            "scene_id",
+            "scale",
+            "request_digest",
+            "input_digest",
+            "holdout_indices",
+            "training_view_indices",
+            "color_space",
+            "pixel_format",
+            "renderer_closure_sha256",
+            "renderer_executable_sha256",
+            "render_operations",
+            "views",
+        },
+        "rendering manifest",
+    )
+    binding = _mapping(request.get("binding"), "request.binding")
+    holdouts = request.get("holdout_indices")
+    if (
+        manifest["schema_version"] != 1
+        or manifest["scene_id"] != binding.get("scene_id")
+        or manifest["scale"] != binding.get("scale")
+        or manifest["input_digest"] != binding.get("input_digest")
+        or manifest["request_digest"]
+        != sha256_bytes(canonical_json_bytes(request) + b"\n")
+        or manifest["holdout_indices"] != holdouts
+        or manifest["color_space"] != "srgb"
+        or manifest["pixel_format"] != "png_rgb8"
+        or manifest["renderer_closure_sha256"]
+        != request["rendering_driver_identity"]["sha256"]
+        or manifest["renderer_executable_sha256"] != renderer_executable_sha256
+    ):
+        raise EvidenceError("rendering manifest does not match its signed request")
+    _digest(renderer_executable_sha256, "approved renderer executable digest")
+    scale = binding.get("scale")
+    if type(scale) is not int or not isinstance(holdouts, list):
+        raise EvidenceError("rendering request scale or holdouts are invalid")
+    expected_training = [index for index in range(scale) if index not in set(holdouts)]
+    if manifest["training_view_indices"] != expected_training:
+        raise EvidenceError("held-out views must be excluded from the training selection")
+
+    reference = _mapping(
+        _load_bounded_json(reference_path, "accurate rendering reference"),
+        "accurate rendering reference",
+    )
+    _exact_keys(reference, {"schema_version", "views"}, "accurate rendering reference")
+    if reference["schema_version"] != 1:
+        raise EvidenceError("accurate rendering reference schema is unsupported")
+    reference_views = reference["views"]
+    views = manifest["views"]
+    if (
+        not isinstance(views, list)
+        or not isinstance(reference_views, list)
+        or len(views) != len(holdouts)
+        or len(reference_views) != len(holdouts)
+    ):
+        raise EvidenceError("rendering views must cover every signed holdout")
+
+    if not isinstance(commands, list):
+        raise EvidenceError("rendering source receipts are unavailable")
+    source_specs = {
+        "accurate_reference": ("fast_profile", "accurate_reference"),
+        "paired_baseline": ("ordinary", "baseline"),
+        "candidate_balanced": ("ordinary", "candidate"),
+        "candidate_fast": ("fast_profile", "fast_candidate"),
+    }
+    render_operations = manifest["render_operations"]
+    expected_render_operation_count = len(holdouts) * len(RENDER_VARIANTS)
+    if not isinstance(render_operations, list) or len(render_operations) != expected_render_operation_count:
+        raise EvidenceError("render operations must cover every holdout and variant")
+    previous_render_end = -math.inf
+
+    artifacts = {"rendering_manifest": _artifact_descriptor(manifest_path, artifact_root)}
+    image_paths: set[PurePosixPath] = set()
+    balanced: list[dict[str, float | int]] = []
+    fast: list[dict[str, float | int]] = []
+    for position, holdout_index in enumerate(holdouts):
+        view = _mapping(views[position], f"rendering manifest.views[{position}]")
+        reference_view = _mapping(
+            reference_views[position],
+            f"accurate rendering reference.views[{position}]",
+        )
+        view_fields = {"holdout_index", "camera", "camera_digest", "ground_truth", "renders"}
+        reference_fields = {
+            "holdout_index",
+            "camera",
+            "camera_digest",
+            "ground_truth_sha256",
+        }
+        _exact_keys(view, view_fields, f"rendering manifest.views[{position}]")
+        _exact_keys(
+            reference_view,
+            reference_fields,
+            f"accurate rendering reference.views[{position}]",
+        )
+        if view["holdout_index"] != holdout_index or reference_view["holdout_index"] != holdout_index:
+            raise EvidenceError("rendering views must be ordered by signed holdout index")
+        camera = _render_camera(view["camera"], f"rendering manifest.views[{position}].camera")
+        reference_camera = _render_camera(
+            reference_view["camera"],
+            f"accurate rendering reference.views[{position}].camera",
+        )
+        camera_digest = sha256_bytes(canonical_json_bytes(camera))
+        if (
+            camera != reference_camera
+            or view["camera_digest"] != camera_digest
+            or reference_view["camera_digest"] != camera_digest
+        ):
+            raise EvidenceError("render camera does not match the pinned holdout camera")
+
+        ground_truth = _mapping(
+            view["ground_truth"],
+            f"rendering manifest.views[{position}].ground_truth",
+        )
+        _exact_keys(
+            ground_truth,
+            {"path", "sha256", "input_digest"},
+            f"rendering manifest.views[{position}].ground_truth",
+        )
+        if ground_truth["input_digest"] != binding["input_digest"]:
+            raise EvidenceError("ground-truth image is not bound to the requested input")
+        ground_truth_relative = _render_relative_path(
+            ground_truth["path"],
+            f"rendering manifest.views[{position}].ground_truth.path",
+        )
+        if ground_truth_relative in image_paths:
+            raise EvidenceError("rendering image paths must be unique")
+        image_paths.add(ground_truth_relative)
+        ground_truth_path = artifact_root / Path(*ground_truth_relative.parts)
+        ground_truth_descriptor = _artifact_descriptor(ground_truth_path, artifact_root)
+        _digest(ground_truth["sha256"], "ground-truth image digest")
+        if (
+            ground_truth_descriptor["sha256"] != ground_truth["sha256"]
+            or ground_truth["sha256"] != reference_view["ground_truth_sha256"]
+        ):
+            raise EvidenceError("ground-truth image digest does not match its pinned reference")
+        artifacts[f"render_ground_truth_{holdout_index:06d}"] = ground_truth_descriptor
+        ground_truth_pixels = _load_render_image(
+            ground_truth_path,
+            camera["width"],
+            camera["height"],
+            f"ground-truth image {holdout_index}",
+        )
+
+        render_records = view["renders"]
+        if not isinstance(render_records, list) or len(render_records) != len(RENDER_VARIANTS):
+            raise EvidenceError("rendering variants are incomplete")
+        measured: dict[str, tuple[float, float, float]] = {}
+        for variant_position, variant in enumerate(RENDER_VARIANTS):
+            render = _mapping(
+                render_records[variant_position],
+                f"rendering manifest.views[{position}].renders[{variant_position}]",
+            )
+            _exact_keys(
+                render,
+                {
+                    "variant",
+                    "path",
+                    "sha256",
+                    "camera_digest",
+                    "source_run_id",
+                    "ply_sha256",
+                    "renderer",
+                    "renderer_executable_sha256",
+                    "render_operation_id",
+                },
+                f"rendering manifest.views[{position}].renders[{variant_position}]",
+            )
+            command_position = position * len(RENDER_VARIANTS) + variant_position
+            render_operation = _mapping(
+                render_operations[command_position],
+                f"rendering manifest.render_operations[{command_position}]",
+            )
+            _exact_keys(
+                render_operation,
+                {
+                    "operation_id",
+                    "holdout_index",
+                    "variant",
+                    "renderer_executable_sha256",
+                    "source_run_id",
+                    "source_checkout_commit",
+                    "source_toolchain_identity",
+                    "source_executable_sha256",
+                    "input_ply_sha256",
+                    "camera_digest",
+                    "output_sha256",
+                    "started_monotonic_seconds",
+                    "ended_monotonic_seconds",
+                    "status",
+                },
+                f"rendering manifest.render_operations[{command_position}]",
+            )
+            phase, execution_variant = source_specs[variant]
+            matching_sources = [
+                _mapping(command, "rendering source receipt")
+                for command in commands
+                if isinstance(command, Mapping)
+                and command.get("run_id") == render_operation["source_run_id"]
+                and command.get("phase") == phase
+                and command.get("variant") == execution_variant
+            ]
+            if len(matching_sources) != 1:
+                raise EvidenceError(f"{variant} must bind exactly one source execution receipt")
+            source = matching_sources[0]
+            if (
+                render["variant"] != variant
+                or render["camera_digest"] != camera_digest
+                or render["source_run_id"] != source.get("run_id")
+                or render["ply_sha256"] != source.get("output_sha256")
+                or render["renderer"] != "MetalSplatter"
+                or render["renderer_executable_sha256"] != renderer_executable_sha256
+            ):
+                raise EvidenceError(f"{variant} render is not bound to its camera and source PLY")
+            render_relative = _render_relative_path(
+                render["path"],
+                f"rendering manifest.views[{position}].renders[{variant_position}].path",
+            )
+            if render_relative in image_paths:
+                raise EvidenceError("rendering image paths must be unique")
+            image_paths.add(render_relative)
+            render_path = artifact_root / Path(*render_relative.parts)
+            descriptor = _artifact_descriptor(render_path, artifact_root)
+            _digest(render["sha256"], f"{variant} render digest")
+            if descriptor["sha256"] != render["sha256"]:
+                raise EvidenceError(f"{variant} render changed after it was recorded")
+            started = render_operation["started_monotonic_seconds"]
+            ended = render_operation["ended_monotonic_seconds"]
+            if (
+                render_operation["operation_id"] != render["render_operation_id"]
+                or render_operation["holdout_index"] != holdout_index
+                or render_operation["variant"] != variant
+                or render_operation["renderer_executable_sha256"] != renderer_executable_sha256
+                or render_operation["source_run_id"] != source.get("run_id")
+                or render_operation["source_checkout_commit"] != source.get("checkout_commit")
+                or render_operation["source_toolchain_identity"] != source.get("toolchain_identity")
+                or render_operation["source_executable_sha256"] != source.get("executable_sha256")
+                or render_operation["input_ply_sha256"] != source.get("output_sha256")
+                or render_operation["camera_digest"] != camera_digest
+                or render_operation["output_sha256"] != descriptor["sha256"]
+                or render_operation["status"] != "completed"
+                or isinstance(started, bool)
+                or isinstance(ended, bool)
+                or not isinstance(started, (int, float))
+                or not isinstance(ended, (int, float))
+                or not math.isfinite(started)
+                or not math.isfinite(ended)
+                or started < previous_render_end
+                or ended <= started
+            ):
+                raise EvidenceError(f"{variant} render operation receipt is invalid")
+            previous_render_end = float(ended)
+            artifacts[f"render_{variant}_{holdout_index:06d}"] = descriptor
+            pixels = _load_render_image(
+                render_path,
+                camera["width"],
+                camera["height"],
+                f"{variant} render {holdout_index}",
+            )
+            measured[variant] = _pixel_metrics(pixels, ground_truth_pixels, lpips_distance)
+
+        reference_metrics = measured["accurate_reference"]
+        baseline_metrics = measured["paired_baseline"]
+        candidate_metrics = measured["candidate_balanced"]
+        fast_metrics = measured["candidate_fast"]
+        balanced.append(
+            {
+                "holdout_index": holdout_index,
+                "candidate_psnr": candidate_metrics[0],
+                "reference_psnr": reference_metrics[0],
+                "candidate_ssim": candidate_metrics[1],
+                "reference_ssim": reference_metrics[1],
+                "candidate_lpips": candidate_metrics[2],
+                "reference_lpips": reference_metrics[2],
+                "baseline_psnr": baseline_metrics[0],
+                "baseline_ssim": baseline_metrics[1],
+                "baseline_lpips": baseline_metrics[2],
+            }
+        )
+        fast.append(
+            {
+                "holdout_index": holdout_index,
+                "candidate_psnr": fast_metrics[0],
+                "reference_psnr": reference_metrics[0],
+                "candidate_ssim": fast_metrics[1],
+                "reference_ssim": reference_metrics[1],
+                "candidate_lpips": fast_metrics[2],
+                "reference_lpips": reference_metrics[2],
+            }
+        )
+    return RenderingEvidence(balanced=balanced, fast=fast, artifacts=artifacts)
 
 
 def _validate_splat_ply(path: Path) -> int:
@@ -3070,7 +3884,7 @@ def produce_attestation(
         observation_keys.update({"timing", "memory", "resolved_compute", "pipeline_metrics"})
     if lane == LANE_REFERENCE and request["expected_outcome"]["kind"] == "valid":
         if "scene_quality" in scopes:
-            observation_keys.update({"registration", "residual_pixels", "pose", "rendering"})
+            observation_keys.update({"registration", "residual_pixels", "pose"})
         if "long_sequence" in scopes:
             observation_keys.add("long_sequence")
         if "stability" in scopes:
@@ -3114,6 +3928,11 @@ def produce_attestation(
         "accurate_rendering_reference": "accurate-rendering-reference.json",
         "paired_baseline_rendering_reference": "paired-baseline-rendering-reference.json",
         "orientation_label": "orientation-label.json",
+        "render_job": "render-job.json",
+        "rendering_manifest": "rendering-manifest.json",
+        "render_supervisor": "render-supervisor.json",
+        "renderer_stdout_log": "renderer-stdout.log",
+        "renderer_stderr_log": "renderer-stderr.log",
     }
     for name, expected_path in canonical_artifacts.items():
         if name in raw_artifacts and raw_artifacts[name] != expected_path:
@@ -3160,7 +3979,16 @@ def produce_attestation(
     }
     if lane == LANE_REFERENCE and "scene_quality" in scopes:
         required.update(reference_descriptor_fields)
-        required.add("pair_list")
+        required.update(
+            {
+                "pair_list",
+                "render_job",
+                "rendering_manifest",
+                "render_supervisor",
+                "renderer_stdout_log",
+                "renderer_stderr_log",
+            }
+        )
     missing = required - set(descriptors)
     if missing:
         raise EvidenceError("missing required evidence artifacts: " + ", ".join(sorted(missing)))
@@ -3179,6 +4007,7 @@ def produce_attestation(
             raise EvidenceError(
                 "toolchain_scenarios log does not match the signed scenario receipts"
             )
+    rendering_evidence: RenderingEvidence | None = None
     if lane == LANE_REFERENCE and "scene_quality" in scopes:
         for artifact_name, request_field in reference_descriptor_fields.items():
             if descriptors[artifact_name]["sha256"] != request["reference_artifacts"][request_field]:
@@ -3192,6 +4021,28 @@ def produce_attestation(
             request["candidate_run_configuration"],
             _mapping(observations.get("pipeline_metrics"), "observations.pipeline_metrics"),
         )
+        rendering_evidence = validate_and_score_rendering(
+            artifact_root=artifact_root,
+            manifest_path=artifact_root / descriptors["rendering_manifest"]["path"],
+            reference_path=artifact_root / descriptors["accurate_rendering_reference"]["path"],
+            request=request,
+            commands=observations.get("commands"),
+            renderer_executable_sha256=request["rendering_driver_identity"][
+                "executable_sha256"
+            ],
+        )
+        _validate_render_supervisor(
+            artifact_root / descriptors["render_supervisor"]["path"],
+            artifact_root / descriptors["render_job"]["path"],
+            artifact_root / descriptors["rendering_manifest"]["path"],
+            request,
+            request["rendering_driver_identity"],
+        )
+        for name, descriptor in rendering_evidence.artifacts.items():
+            existing = descriptors.get(name)
+            if existing is not None and existing != descriptor:
+                raise EvidenceError(f"rendering artifact descriptor conflicts with {name}")
+            descriptors[name] = descriptor
     output_splat_count: int | None = None
     if "output_ply" in descriptors:
         output_ply = artifact_root / descriptors["output_ply"]["path"]
@@ -3219,6 +4070,7 @@ def produce_attestation(
             "orientation_expected_status"
         ),
         request_binding=request["binding"],
+        rendering_evidence=rendering_evidence,
     )
     commands = observations.get("commands")
     _validate_execution_receipts(
@@ -3267,6 +4119,12 @@ def produce_attestation(
         "expected_outcome": dict(request["expected_outcome"]),
         "input_kind": request["input_kind"],
         "gate_scopes": list(request["gate_scopes"]),
+        "rendering_driver_identity": dict(request["rendering_driver_identity"]),
+        "scoring_runtime": (
+            render_scoring_runtime()
+            if "scene_quality" in request["gate_scopes"]
+            else {"status": "not_used"}
+        ),
         "lane": lane,
         "machine": machine,
         "producer": {
@@ -3315,6 +4173,8 @@ def verify_attestation(
             "expected_outcome",
             "input_kind",
             "gate_scopes",
+            "rendering_driver_identity",
+            "scoring_runtime",
             "lane",
             "machine",
             "producer",
@@ -3343,12 +4203,20 @@ def verify_attestation(
         "expected_outcome",
         "input_kind",
         "gate_scopes",
+        "rendering_driver_identity",
         "resolved_compute",
     ):
         if field == "resolved_compute":
             continue
         if attestation[field] != request[field]:
             raise EvidenceError(f"attestation {field} does not match its request")
+    expected_scoring_runtime = (
+        render_scoring_runtime()
+        if "scene_quality" in request["gate_scopes"]
+        else {"status": "not_used"}
+    )
+    if attestation["scoring_runtime"] != expected_scoring_runtime:
+        raise EvidenceError("attestation render-scoring runtime is invalid")
     if request["expected_outcome"]["kind"] == "valid":
         _validate_resolved_compute(
             attestation["resolved_compute"],

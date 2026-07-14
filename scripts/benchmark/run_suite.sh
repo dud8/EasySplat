@@ -12,6 +12,7 @@ EMIT_REQUESTS=""
 EVIDENCE_ROOT=""
 REQUEST_INDEX=""
 RUNNER_IDENTITIES=()
+RENDERING_DRIVER_IDENTITY=""
 
 usage() {
   /bin/cat <<'EOF'
@@ -27,6 +28,8 @@ Options:
   --evidence-root DIRECTORY Read protected attestations from this separate root
   --request-index PATH      Bound protected-producer request index
   --runner-identity VALUE   Approved lane=sha256:<digest>; repeat for all lanes
+  --rendering-driver-identity PATH
+                            Complete identity for the built renderer closure
   --dry-run                 Validate and print the deterministic run plan
   -h, --help                Show this help
 EOF
@@ -77,6 +80,11 @@ while [ "$#" -gt 0 ]; do
     --runner-identity)
       [ "$#" -ge 2 ] || { echo "--runner-identity requires a value" >&2; exit 64; }
       RUNNER_IDENTITIES+=("$2")
+      shift 2
+      ;;
+    --rendering-driver-identity)
+      [ "$#" -ge 2 ] || { echo "--rendering-driver-identity requires a value" >&2; exit 64; }
+      RENDERING_DRIVER_IDENTITY="$2"
       shift 2
       ;;
     --dry-run)
@@ -140,9 +148,16 @@ if [ "${#RUNNER_IDENTITIES[@]}" -gt 0 ]; then
     arguments+=(--runner-identity "$runner_identity")
   done
 fi
+if [ -n "$RENDERING_DRIVER_IDENTITY" ]; then
+  arguments+=(--rendering-driver-identity "$RENDERING_DRIVER_IDENTITY")
+fi
 
+dependency_locks=("$ROOT/scripts/benchmark/requirements.txt")
+if [ -n "$EVIDENCE_ROOT" ]; then
+  dependency_locks+=("$ROOT/scripts/benchmark/render-requirements.txt")
+fi
 dependency_error="$(
-  /usr/bin/env python3 - "$ROOT/scripts/benchmark/requirements.txt" <<'PY'
+  /usr/bin/env python3 - "${dependency_locks[@]}" <<'PY'
 import importlib
 import importlib.metadata
 import re
@@ -150,22 +165,27 @@ import sys
 from pathlib import Path
 
 issues = []
-for line in Path(sys.argv[1]).read_text(encoding="utf-8").splitlines():
-    match = re.match(r"^([A-Za-z0-9_.-]+)==([^ \\]+)", line)
-    if match is None:
-        continue
-    name, expected = match.groups()
-    try:
-        actual = importlib.metadata.version(name)
-    except importlib.metadata.PackageNotFoundError:
-        actual = "missing"
-    if actual != expected:
-        issues.append(f"{name}: expected {expected}, found {actual}")
+for lock in map(Path, sys.argv[1:]):
+    for line in lock.read_text(encoding="utf-8").splitlines():
+        match = re.match(r"^([A-Za-z0-9_.-]+)==([^ \\]+)", line)
+        if match is None:
+            continue
+        name, expected = match.groups()
+        try:
+            actual = importlib.metadata.version(name)
+        except importlib.metadata.PackageNotFoundError:
+            actual = "missing"
+        if actual != expected:
+            issues.append(f"{name}: expected {expected}, found {actual}")
 
-try:
-    importlib.import_module("cryptography")
-except Exception as error:
-    issues.append(f"cryptography: installed but cannot be imported ({type(error).__name__})")
+modules = ["cryptography", "numpy", "PIL"]
+if len(sys.argv) > 2:
+    modules.extend(("torch", "torchvision", "lpips"))
+for module in modules:
+    try:
+        importlib.import_module(module)
+    except Exception as error:
+        issues.append(f"{module}: installed but cannot be imported ({type(error).__name__})")
 
 if issues:
     print("\n".join(issues))
@@ -177,6 +197,9 @@ PY
   echo >&2
   echo "Install the hash-locked benchmark dependencies before retrying:" >&2
   echo "  python3 -m pip install --require-hashes -r scripts/benchmark/requirements.txt" >&2
+  if [ -n "$EVIDENCE_ROOT" ]; then
+    echo "  python3 -m pip install --require-hashes -r scripts/benchmark/render-requirements.txt" >&2
+  fi
   exit 69
 }
 

@@ -8,6 +8,7 @@ import json
 import os
 import subprocess
 import tempfile
+import time
 import unittest
 import zipfile
 from pathlib import Path
@@ -17,6 +18,7 @@ from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 from jsonschema import Draft202012Validator, ValidationError
 from referencing import Registry, Resource
+from PIL import Image
 
 
 ROOT = Path(__file__).resolve().parents[3]
@@ -44,13 +46,63 @@ FIXTURE_SELECTION_MANIFEST = benchmark.canonical_json_bytes(
     }
 ) + b"\n"
 
+
+def fixture_render_camera(index: int) -> dict[str, object]:
+    return {
+        "width": 64,
+        "height": 64,
+        "projection_matrix_column_major": [
+            1.0, 0.0, 0.0, 0.0,
+            0.0, 1.0, 0.0, 0.0,
+            0.0, 0.0, 1.0, 0.0,
+            0.0, 0.0, 0.0, 1.0,
+        ],
+        "world_to_camera_matrix_column_major": [
+            1.0, 0.0, 0.0, 0.0,
+            0.0, 1.0, 0.0, 0.0,
+            0.0, 0.0, 1.0, 0.0,
+            float(index), 0.0, 0.0, 1.0,
+        ],
+    }
+
+
+def fixture_png(value: int) -> bytes:
+    buffer = io.BytesIO()
+    Image.new("RGB", (64, 64), (value, value, value)).save(buffer, format="PNG")
+    return buffer.getvalue()
+
+
+FIXTURE_HOLDOUTS = list(range(4, 30, 5))
+FIXTURE_GROUND_TRUTH_IMAGES = {
+    index: fixture_png(80 + position)
+    for position, index in enumerate(FIXTURE_HOLDOUTS)
+}
+FIXTURE_ACCURATE_RENDERING_REFERENCE = benchmark.canonical_json_bytes(
+    {
+        "schema_version": 1,
+        "views": [
+            {
+                "holdout_index": index,
+                "camera": fixture_render_camera(index),
+                "camera_digest": evidence.sha256_bytes(
+                    evidence.canonical_json_bytes(fixture_render_camera(index))
+                ),
+                "ground_truth_sha256": evidence.sha256_bytes(
+                    FIXTURE_GROUND_TRUTH_IMAGES[index]
+                ),
+            }
+            for index in FIXTURE_HOLDOUTS
+        ],
+    }
+) + b"\n"
+
 REFERENCE_ARTIFACT_CONTENTS = {
     "selection_manifest_sha256": ("selection-manifest.json", FIXTURE_SELECTION_MANIFEST),
     "ground_truth_poses_sha256": ("ground-truth-poses.json", b"ground truth poses\n"),
     "accurate_colmap_model_sha256": ("accurate-colmap-model.json", b"accurate COLMAP\n"),
     "accurate_rendering_reference_sha256": (
         "accurate-rendering-reference.json",
-        b"accurate rendering reference\n",
+        FIXTURE_ACCURATE_RENDERING_REFERENCE,
     ),
     "paired_baseline_rendering_reference_sha256": (
         "paired-baseline-rendering-reference.json",
@@ -611,15 +663,31 @@ def evidence_machine(lane: str) -> dict[str, object]:
     }
 
 
-def runner_identity(lane: str, digest_character: str = "a") -> dict[str, str]:
-    return {
+def runner_identity(lane: str, digest_character: str = "a") -> dict[str, object]:
+    identity: dict[str, object] = {
         "label": evidence.RUNNER_LABELS[lane],
         "sha256": "sha256:" + digest_character * 64,
     }
+    if lane == evidence.RENDERING_DRIVER_IDENTITY:
+        identity.update(
+            {
+                "executable_path": "EasySplatBenchmarkDriver",
+                "executable_sha256": "sha256:" + digest_character * 64,
+                "resource_bundle_path": "MetalSplatter_MetalSplatter.bundle",
+                "manifest_path": "closure-manifest.json",
+                "manifest_bytes": 512,
+                "manifest_sha256": "sha256:" + digest_character * 64,
+            }
+        )
+    return identity
 
 
-def runner_identities() -> dict[str, dict[str, str]]:
-    return {lane: runner_identity(lane) for lane in sorted(evidence.RELEASE_LANES)}
+def runner_identities() -> dict[str, dict[str, object]]:
+    names = evidence.RELEASE_LANES | {evidence.RENDERING_DRIVER_IDENTITY}
+    return {
+        name: runner_identity(name, "e" if name == evidence.RENDERING_DRIVER_IDENTITY else "a")
+        for name in sorted(names)
+    }
 
 
 def evidence_request(
@@ -660,6 +728,7 @@ def evidence_request(
         lane,
         identity,
         "sha256:" + "1" * 64,
+        runner_identity(evidence.RENDERING_DRIVER_IDENTITY, "e"),
     )
 
 
@@ -1202,6 +1271,11 @@ def raw_observations(
         observations["artifacts"].update(
             {
                 "pair_list": "pair-list.json",
+                "render_job": "render-job.json",
+                "rendering_manifest": "rendering-manifest.json",
+                "render_supervisor": "render-supervisor.json",
+                "renderer_stdout_log": "renderer-stdout.log",
+                "renderer_stderr_log": "renderer-stderr.log",
                 "normal_photo_toolchain": "normal-photo.zip",
                 "normal_photo_toolchain_state": "normal-photo-toolchain-state.json",
                 "large_area_toolchain": "large-area.zip",
@@ -1245,35 +1319,6 @@ def raw_observations(
                         for view_index in range(29)
                     ],
                 },
-                "rendering": {
-                    "balanced": [
-                        {
-                            "holdout_index": holdout_index,
-                            "candidate_psnr": 29.8,
-                            "reference_psnr": 30.0,
-                            "candidate_ssim": 0.99,
-                            "reference_ssim": 0.995,
-                            "candidate_lpips": 0.05,
-                            "reference_lpips": 0.04,
-                            "baseline_psnr": 29.9,
-                            "baseline_ssim": 0.992,
-                            "baseline_lpips": 0.045,
-                        }
-                        for holdout_index in range(4, 30, 5)
-                    ],
-                    "fast": [
-                        {
-                            "holdout_index": holdout_index,
-                            "candidate_psnr": 29.5,
-                            "reference_psnr": 30.0,
-                            "candidate_ssim": 0.98,
-                            "reference_ssim": 0.99,
-                            "candidate_lpips": 0.05,
-                            "reference_lpips": 0.04,
-                        }
-                        for holdout_index in range(4, 30, 5)
-                    ],
-                },
                 "stability": {
                     "runs": stability_runs(),
                 },
@@ -1298,11 +1343,17 @@ def raw_observations(
     return observations
 
 
-def write_evidence_artifacts(root: Path, observations: dict[str, object]) -> None:
+def write_evidence_artifacts(
+    root: Path,
+    observations: dict[str, object],
+    render_request: dict[str, object] | None = None,
+) -> None:
     root.mkdir(parents=True, exist_ok=True)
     for name, content in (
         ("stdout.log", "complete\n"),
         ("stderr.log", ""),
+        ("renderer-stdout.log", "render complete\n"),
+        ("renderer-stderr.log", ""),
         ("splat.ply", VALID_SPLAT_PLY),
     ):
         (root / name).write_text(content, encoding="utf-8")
@@ -1333,6 +1384,154 @@ def write_evidence_artifacts(root: Path, observations: dict[str, object]) -> Non
                 evidence.canonical_json_bytes(record) + b"\n"
                 for record in observations["toolchain_scenarios"]
             )
+            )
+    if (
+        "registration" in observations
+        and observations.get("artifacts", {}).get("rendering_manifest")
+        == "rendering-manifest.json"
+    ):
+        commands_by_source = {
+            "accurate_reference": ("fast_profile", "accurate_reference"),
+            "paired_baseline": ("ordinary", "baseline"),
+            "candidate_balanced": ("ordinary", "candidate"),
+            "candidate_fast": ("fast_profile", "fast_candidate"),
+        }
+        source_receipts = {}
+        for render_variant, (phase, execution_variant) in commands_by_source.items():
+            source_receipts[render_variant] = [
+                command
+                for command in observations["commands"]
+                if command["phase"] == phase and command["variant"] == execution_variant
+            ][-1]
+        representative = source_receipts["candidate_balanced"]
+        render_request = render_request or evidence_request(lane=evidence.LANE_REFERENCE)
+        renderer_identity = render_request["rendering_driver_identity"]
+        renderer_digest = renderer_identity["executable_sha256"]
+        renderer_closure_digest = renderer_identity["sha256"]
+        scale = len(observations["registration"]["candidate"])
+        holdouts = list(range(4, scale, 5))
+        manifest_views = []
+        render_operations = []
+        for holdout_index in holdouts:
+            ground_truth = FIXTURE_GROUND_TRUTH_IMAGES[holdout_index]
+            ground_truth_path = Path("rendering/ground-truth") / f"{holdout_index:06d}.png"
+            (root / ground_truth_path).parent.mkdir(parents=True, exist_ok=True)
+            (root / ground_truth_path).write_bytes(ground_truth)
+            camera = fixture_render_camera(holdout_index)
+            camera_digest = evidence.sha256_bytes(evidence.canonical_json_bytes(camera))
+            render_records = []
+            for variant in evidence.RENDER_VARIANTS:
+                render_path = Path("rendering") / variant / f"{holdout_index:06d}.png"
+                (root / render_path).parent.mkdir(parents=True, exist_ok=True)
+                render_bytes = ground_truth
+                (root / render_path).write_bytes(render_bytes)
+                source = source_receipts[variant]
+                render_digest = evidence.sha256_bytes(render_bytes)
+                render_operation_id = f"render-{holdout_index:06d}-{variant}"
+                render_records.append(
+                    {
+                        "variant": variant,
+                        "path": render_path.as_posix(),
+                        "sha256": render_digest,
+                        "camera_digest": camera_digest,
+                        "source_run_id": source["run_id"],
+                        "ply_sha256": source["output_sha256"],
+                        "renderer": "MetalSplatter",
+                        "renderer_executable_sha256": renderer_digest,
+                        "render_operation_id": render_operation_id,
+                    }
+                )
+                started = float(len(render_operations))
+                render_operations.append(
+                    {
+                        "operation_id": render_operation_id,
+                        "holdout_index": holdout_index,
+                        "variant": variant,
+                        "renderer_executable_sha256": renderer_digest,
+                        "source_run_id": source["run_id"],
+                        "source_checkout_commit": source["checkout_commit"],
+                        "source_toolchain_identity": source["toolchain_identity"],
+                        "source_executable_sha256": source["executable_sha256"],
+                        "input_ply_sha256": source["output_sha256"],
+                        "camera_digest": camera_digest,
+                        "output_sha256": render_digest,
+                        "started_monotonic_seconds": started,
+                        "ended_monotonic_seconds": started + 1.0,
+                        "status": "completed",
+                    }
+                )
+            manifest_views.append(
+                {
+                    "holdout_index": holdout_index,
+                    "camera": camera,
+                    "camera_digest": camera_digest,
+                    "ground_truth": {
+                        "path": ground_truth_path.as_posix(),
+                        "sha256": evidence.sha256_bytes(ground_truth),
+                        "input_digest": representative["input_digest"],
+                    },
+                    "renders": render_records,
+                }
+            )
+        manifest = {
+            "schema_version": 1,
+            "scene_id": representative["scene_id"],
+            "scale": scale,
+            "request_digest": evidence.sha256_bytes(
+                evidence.canonical_json_bytes(render_request) + b"\n"
+            ),
+            "input_digest": representative["input_digest"],
+            "holdout_indices": holdouts,
+            "training_view_indices": [
+                index for index in range(scale) if index not in set(holdouts)
+            ],
+            "color_space": "srgb",
+            "pixel_format": "png_rgb8",
+            "renderer_closure_sha256": renderer_closure_digest,
+            "renderer_executable_sha256": renderer_digest,
+            "render_operations": render_operations,
+            "views": manifest_views,
+        }
+        (root / "rendering-manifest.json").write_bytes(
+            evidence.canonical_json_bytes(manifest) + b"\n"
+        )
+        (root / "render-job.json").write_bytes(
+            evidence.canonical_json_bytes({"fixture": True}) + b"\n"
+        )
+        render_supervisor = {
+            "schema_version": 1,
+            "scene_id": representative["scene_id"],
+            "scale": scale,
+            "lane": render_request["binding"]["lane"],
+            "request_sha256": manifest["request_digest"],
+            "candidate_checkout_commit": render_request["binding"]["git_commit"],
+            "baseline_checkout_commit": render_request["binding"]["baseline_git_commit"],
+            "renderer_closure_sha256": renderer_identity["sha256"],
+            "renderer_executable_sha256": renderer_identity["executable_sha256"],
+            "job_sha256": evidence.sha256_file(root / "render-job.json"),
+            "manifest_sha256": evidence.sha256_file(root / "rendering-manifest.json"),
+            "stdout_sha256": evidence.sha256_file(root / "renderer-stdout.log"),
+            "stderr_sha256": evidence.sha256_file(root / "renderer-stderr.log"),
+            "argv": [
+                "approved-rendering-driver",
+                f"renderer-closure://{renderer_identity['sha256']}",
+                f"renderer-executable://{renderer_identity['executable_sha256']}",
+                "render",
+                "--job",
+                "evidence://render-job.json",
+                "--artifact-root",
+                "evidence://run",
+                "--output",
+                "evidence://rendering-manifest.json",
+            ],
+            "actual_argv_sha256": "sha256:" + "9" * 64,
+            "started_monotonic_seconds": 0.0,
+            "ended_monotonic_seconds": 1.0,
+            "exit_code": 0,
+            "timed_out": False,
+        }
+        (root / "render-supervisor.json").write_bytes(
+            evidence.canonical_json_bytes(render_supervisor) + b"\n"
         )
     for _, (name, content) in REFERENCE_ARTIFACT_CONTENTS.items():
         (root / name).write_bytes(content)
@@ -2226,6 +2425,12 @@ class MetadataAndPersistenceTests(unittest.TestCase):
 class EvidenceProtocolTests(unittest.TestCase):
     def setUp(self) -> None:
         self.key = b"release-evidence-test-key-material-32-bytes"
+        evidence.LPIPS_DISTANCE_OVERRIDE = lambda first, second: float(
+            abs(first.mean() - second.mean())
+        )
+
+    def tearDown(self) -> None:
+        evidence.LPIPS_DISTANCE_OVERRIDE = None
 
     def produce(self, root: Path, lane: str) -> tuple[Path, dict[str, object]]:
         observations = raw_observations(lane)
@@ -2304,6 +2509,7 @@ class EvidenceProtocolTests(unittest.TestCase):
             evidence.LANE_REFERENCE,
             identity,
             "sha256:" + "1" * 64,
+            runner_identity(evidence.RENDERING_DRIVER_IDENTITY, "e"),
         )
         self.assertEqual(request["holdout_indices"], [])
         self.assertEqual(request["reference_artifacts"], {"status": "not_applicable"})
@@ -2394,31 +2600,48 @@ class EvidenceProtocolTests(unittest.TestCase):
                         machine=evidence_machine(evidence.LANE_REFERENCE),
                     )
 
-    def test_rendering_metrics_reject_impossible_domains(self) -> None:
+    def test_runner_cannot_supply_rendering_scores(self) -> None:
         observations = raw_observations(evidence.LANE_REFERENCE)
-        cases = (
-            ("candidate_psnr", -1.0),
-            ("candidate_ssim", 1.01),
-            ("candidate_lpips", -0.01),
-            ("baseline_ssim", -0.01),
-        )
-        for field, value in cases:
-            changed = json.loads(json.dumps(observations))
-            changed["rendering"]["balanced"][0][field] = value
-            with self.subTest(field=field), tempfile.TemporaryDirectory() as directory:
-                root = Path(directory)
-                write_evidence_artifacts(root, changed)
-                with self.assertRaisesRegex(evidence.EvidenceError, "rendering.*domain"):
-                    evidence.produce_attestation(
-                        evidence_request(),
-                        changed,
-                        root,
-                        root / "attestation.json",
-                        self.key,
-                        evidence.LANE_REFERENCE,
-                        runner_identity(evidence.LANE_REFERENCE),
-                        machine=evidence_machine(evidence.LANE_REFERENCE),
-                    )
+        observations["rendering"] = {
+            "balanced": [{"candidate_psnr": 100.0}],
+            "fast": [{"candidate_psnr": 100.0}],
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            write_evidence_artifacts(root, observations)
+            with self.assertRaisesRegex(evidence.EvidenceError, "unknown rendering"):
+                evidence.produce_attestation(
+                    evidence_request(),
+                    observations,
+                    root,
+                    root / "attestation.json",
+                    self.key,
+                    evidence.LANE_REFERENCE,
+                    runner_identity(evidence.LANE_REFERENCE),
+                    machine=evidence_machine(evidence.LANE_REFERENCE),
+                )
+
+    def test_scene_quality_rejects_self_reported_rendering_without_pixel_artifacts(self) -> None:
+        observations = raw_observations(evidence.LANE_REFERENCE)
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            write_evidence_artifacts(root, observations)
+            observations["artifacts"].pop("rendering_manifest", None)
+            (root / "rendering-manifest.json").unlink(missing_ok=True)
+            (root / "observations.json").write_bytes(
+                evidence.canonical_json_bytes(observations) + b"\n"
+            )
+            with self.assertRaisesRegex(evidence.EvidenceError, "rendering_manifest"):
+                evidence.produce_attestation(
+                    evidence_request(),
+                    observations,
+                    root,
+                    root / "attestation.json",
+                    self.key,
+                    evidence.LANE_REFERENCE,
+                    runner_identity(evidence.LANE_REFERENCE),
+                    machine=evidence_machine(evidence.LANE_REFERENCE),
+                )
 
     def test_pair_list_is_bound_to_the_resolved_policy_and_verified_graph(self) -> None:
         observations = raw_observations(evidence.LANE_REFERENCE)
@@ -2532,7 +2755,7 @@ class EvidenceProtocolTests(unittest.TestCase):
         for label, mutate in mutations.items():
             with self.subTest(case=label), tempfile.TemporaryDirectory() as directory:
                 root = Path(directory)
-                write_evidence_artifacts(root, observations)
+                write_evidence_artifacts(root, observations, request)
                 pair_list = fixture_pair_list_with_retrieval()
                 mutate(pair_list)
                 (root / "pair-list.json").write_bytes(
@@ -2683,7 +2906,7 @@ class EvidenceProtocolTests(unittest.TestCase):
                 elif label == "extra pair":
                     changed_observations["pipeline_metrics"]["scheduled_pairs"] += 1
                 root = Path(directory)
-                write_evidence_artifacts(root, changed_observations)
+                write_evidence_artifacts(root, changed_observations, request)
                 (root / "selection-manifest.json").write_bytes(selection)
                 (root / "pair-list.json").write_bytes(
                     evidence.canonical_json_bytes(pair_list) + b"\n"
@@ -2933,8 +3156,16 @@ class EvidenceProtocolTests(unittest.TestCase):
         del observations["stability"]
         del observations["toolchain_scenarios"]
         del observations["artifacts"]["toolchain_scenarios"]
-        for key in ("registration", "residual_pixels", "pose", "rendering"):
+        for key in ("registration", "residual_pixels", "pose"):
             del observations[key]
+        for artifact in (
+            "render_job",
+            "rendering_manifest",
+            "render_supervisor",
+            "renderer_stdout_log",
+            "renderer_stderr_log",
+        ):
+            del observations["artifacts"][artifact]
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             write_evidence_artifacts(root, observations)
@@ -3107,7 +3338,7 @@ class EvidenceProtocolTests(unittest.TestCase):
             ]
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            write_evidence_artifacts(root, observations)
+            write_evidence_artifacts(root, observations, request)
             (root / "large-area-toolchain-state.json").write_bytes(
                 evidence.canonical_json_bytes(TEST_NORMAL_TOOLCHAIN_STATE) + b"\n"
             )
@@ -3331,9 +3562,9 @@ class EvidenceProtocolTests(unittest.TestCase):
         unresolved["pipeline_metrics"]["orientation_sign_correct"] = None
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            write_evidence_artifacts(root, unresolved)
             unresolved_request = evidence_request()
             unresolved_request["reference_artifacts"]["orientation_expected_status"] = "unresolved"
+            write_evidence_artifacts(root, unresolved, unresolved_request)
             attestation = evidence.produce_attestation(
                 unresolved_request,
                 unresolved,
@@ -3443,10 +3674,15 @@ class EvidenceProtocolTests(unittest.TestCase):
         request = evidence_request()
         request["gate_scopes"] = ["scene_quality"]
         observations = raw_observations(evidence.LANE_REFERENCE)
-        observations["timing"] = candidate_timing(100.0)
+        full_timing = paired_timing()
+        observations["timing"] = {
+            "ordinary_runs": full_timing["ordinary_runs"],
+            "fast_profile_runs": full_timing["fast_profile_runs"],
+        }
         observations["commands"] = execution_receipts(
             observations["timing"],
             evidence.LANE_REFERENCE,
+            request,
         )
         observations["memory"] = memory_observation(
             observations["timing"],
@@ -3459,7 +3695,7 @@ class EvidenceProtocolTests(unittest.TestCase):
         del observations["artifacts"]["large_area_toolchain"]
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            write_evidence_artifacts(root, observations)
+            write_evidence_artifacts(root, observations, request)
             attestation = evidence.produce_attestation(
                 request,
                 observations,
@@ -3853,12 +4089,29 @@ class EvidenceProtocolTests(unittest.TestCase):
             media = root / scene["input"]["media_path"]
             media.parent.mkdir(parents=True)
             media.write_bytes(b"scene")
+            renderer_source = root / "renderer-source"
+            renderer_source.write_bytes(b"#!/bin/sh\nexit 0\n")
+            renderer_source.chmod(0o755)
+            renderer_bundle = root / "MetalSplatter_MetalSplatter.bundle"
+            renderer_bundle.mkdir()
+            (renderer_bundle / "Shaders.metal").write_text(
+                "kernel void draw() {}\n",
+                encoding="utf-8",
+            )
+            renderer_closure_root = root / "renderer-closure"
+            renderer_identity = lane_runner.renderer_closure.build_closure(
+                renderer_source,
+                renderer_bundle,
+                renderer_closure_root,
+                root / "renderer-identity.json",
+            )
             request = benchmark._evidence_request(
                 scene,
                 120,
                 evidence.LANE_CONSTRAINED,
                 identity,
                 benchmark.digest_input(media),
+                renderer_identity,
             )
             requests_root = root / "requests"
             request_relative = Path("orbit-01/120/constrained_14_16gb.request.json")
@@ -3938,6 +4191,7 @@ class EvidenceProtocolTests(unittest.TestCase):
             )
             runner.chmod(0o755)
             approved_runners = runner_identities()
+            approved_runners[evidence.RENDERING_DRIVER_IDENTITY] = renderer_identity
             approved_runners[evidence.LANE_CONSTRAINED] = {
                 "label": evidence.RUNNER_LABELS[evidence.LANE_CONSTRAINED],
                 "sha256": evidence.sha256_file(runner),
@@ -4032,6 +4286,7 @@ class EvidenceProtocolTests(unittest.TestCase):
                     root / "evidence",
                     evidence.LANE_CONSTRAINED,
                     runner,
+                    renderer_closure_root,
                     key_path,
                 )
             self.assertEqual(len(result["attestations"]), 1)
@@ -4087,6 +4342,7 @@ class EvidenceProtocolTests(unittest.TestCase):
                         root / "evidence",
                         evidence.LANE_CONSTRAINED,
                         runner,
+                        renderer_closure_root,
                         key_path,
                     )
 
@@ -4147,11 +4403,278 @@ class EvidenceProtocolTests(unittest.TestCase):
                         root / "evidence",
                         evidence.LANE_CONSTRAINED,
                         runner,
+                        renderer_closure_root,
                         key_path,
                     )
 
 
 class RunnerIntegrityTests(unittest.TestCase):
+    def test_release_workflow_builds_and_distributes_the_renderer_closure(self) -> None:
+        workflow = (ROOT / ".github/workflows/benchmark-release.yml").read_text(
+            encoding="utf-8"
+        )
+
+        self.assertNotIn("EASYSPLAT_BENCHMARK_RENDERING_DRIVER_SHA256", workflow)
+        self.assertIn("--product EasySplatBenchmarkDriver", workflow)
+        self.assertIn("renderer_closure.py build", workflow)
+        self.assertIn(
+            '--rendering-driver-identity "$RENDERER_PACKAGE/identity.json"',
+            workflow,
+        )
+        self.assertEqual(
+            workflow.count("name: easysplat-benchmark-renderer-${{ github.sha }}"),
+            4,
+            "prepare must upload one renderer package and each measurement lane must download it",
+        )
+        self.assertEqual(
+            workflow.count(
+                '--rendering-driver-closure "$RUNNER_TEMP/renderer-package/closure"'
+            ),
+            3,
+        )
+        self.assertEqual(workflow.count('--baseline-checkout-root "$BASELINE_CHECKOUT"'), 3)
+        self.assertEqual(
+            workflow.count('--baseline-toolchain-root "$BASELINE_TOOLCHAIN_ROOT"'),
+            3,
+        )
+
+    def test_release_workflow_installs_heavy_render_scoring_only_where_used(self) -> None:
+        workflow = (ROOT / ".github/workflows/benchmark-release.yml").read_text(
+            encoding="utf-8"
+        )
+        constrained = workflow.split("  constrained:\n", 1)[1].split("  eight-gb:\n", 1)[0]
+        eight_gb = workflow.split("  eight-gb:\n", 1)[1].split("  aggregate:\n", 1)[0]
+
+        self.assertEqual(
+            workflow.count("name: Install protected render-scoring dependencies"),
+            2,
+            "only reference measurement and aggregate verification score pixels",
+        )
+        self.assertNotIn("render-requirements.txt", constrained)
+        self.assertNotIn("render-requirements.txt", eight_gb)
+
+    def test_run_suite_requires_render_dependencies_only_when_verifying_evidence(self) -> None:
+        launcher = (ROOT / "scripts/benchmark/run_suite.sh").read_text(encoding="utf-8")
+
+        self.assertIn('if [ -n "$EVIDENCE_ROOT" ]; then', launcher)
+        self.assertNotIn('if [ "$DRY_RUN" -eq 0 ]; then\n  dependency_locks+=', launcher)
+
+    def _renderer_stage_fixture(
+        self,
+        root: Path,
+        *,
+        exit_code: int = 0,
+        mutate_shader: bool = False,
+    ) -> dict[str, object]:
+        root = root.resolve()
+        artifact_root = root / "artifacts"
+        artifact_root.mkdir()
+        candidate = root / "candidate"
+        baseline = root / "baseline"
+        candidate.mkdir()
+        baseline.mkdir()
+        request = evidence_request(lane=evidence.LANE_REFERENCE)
+        request_path = root / "request.json"
+        request_path.write_bytes(evidence.canonical_json_bytes(request) + b"\n")
+        executable = root / "renderer"
+        invocation_marker = root / "renderer-invoked"
+        executable.write_text(
+            "#!/usr/bin/python3\n"
+            "import pathlib, sys\n"
+            f"status={exit_code}\n"
+            f"pathlib.Path({str(invocation_marker)!r}).write_text('invoked\\n', encoding='utf-8')\n"
+            "if status == 0:\n"
+            "    output=pathlib.Path(sys.argv[sys.argv.index('--output')+1])\n"
+            "    output.write_text('{}\\n', encoding='utf-8')\n"
+            + (
+                "    (pathlib.Path(__file__).parent / "
+                "'MetalSplatter_MetalSplatter.bundle' / 'Shaders.metal').write_text("
+                "'kernel void tampered() {}\\n', encoding='utf-8')\n"
+                if mutate_shader
+                else ""
+            )
+            +
+            "raise SystemExit(status)\n",
+            encoding="utf-8",
+        )
+        executable.chmod(0o755)
+        bundle = root / "MetalSplatter_MetalSplatter.bundle"
+        bundle.mkdir()
+        (bundle / "Shaders.metal").write_text("kernel void draw() {}\n", encoding="utf-8")
+        closure = root / "renderer-closure"
+        identity = lane_runner.renderer_closure.build_closure(
+            executable,
+            bundle,
+            closure,
+            root / "renderer-identity.json",
+        )
+        request["rendering_driver_identity"] = identity
+        request_path.write_bytes(evidence.canonical_json_bytes(request) + b"\n")
+        request_digest = evidence.sha256_file(request_path)
+        holdouts = request["holdout_indices"]
+        job = {
+            "schema_version": 1,
+            "scene_id": request["binding"]["scene_id"],
+            "scale": request["binding"]["scale"],
+            "request_digest": request_digest,
+            "input_digest": request["binding"]["input_digest"],
+            "renderer_closure_sha256": identity["sha256"],
+            "renderer_executable_sha256": identity["executable_sha256"],
+            "holdout_indices": holdouts,
+            "training_view_indices": [
+                index for index in range(request["binding"]["scale"])
+                if index not in set(holdouts)
+            ],
+            "candidate_checkout": {
+                "path": str(candidate),
+                "commit": request["binding"]["git_commit"],
+            },
+            "baseline_checkout": {
+                "path": str(baseline),
+                "commit": request["binding"]["baseline_git_commit"],
+            },
+            "views": [{} for _ in holdouts],
+        }
+        (artifact_root / "render-job.json").write_bytes(
+            evidence.canonical_json_bytes(job) + b"\n"
+        )
+        return {
+            "artifact_root": artifact_root,
+            "candidate": candidate,
+            "baseline": baseline,
+            "closure": closure,
+            "identity": identity,
+            "request": request,
+            "request_path": request_path,
+            "request_digest": request_digest,
+            "invocation_marker": invocation_marker,
+        }
+
+    def _run_renderer_stage(self, fixture: dict[str, object]) -> dict[str, object]:
+        return lane_runner._execute_rendering_stage(
+            artifact_root=fixture["artifact_root"],
+            request=fixture["request"],
+            request_path=fixture["request_path"],
+            request_digest=fixture["request_digest"],
+            renderer_closure_path=fixture["closure"],
+            renderer_identity=fixture["identity"],
+            candidate_checkout=fixture["candidate"],
+            baseline_checkout=fixture["baseline"],
+            timeout_seconds=10.0,
+        )
+
+    def test_rendering_stage_is_launched_and_receipted_by_the_supervisor(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = self._renderer_stage_fixture(Path(directory))
+
+            receipt = self._run_renderer_stage(fixture)
+
+            artifact_root = fixture["artifact_root"]
+            self.assertEqual(receipt["exit_code"], 0)
+            self.assertEqual(receipt["renderer_closure_sha256"], fixture["identity"]["sha256"])
+            self.assertEqual(
+                receipt["manifest_sha256"],
+                evidence.sha256_file(artifact_root / "rendering-manifest.json"),
+            )
+            self.assertEqual(receipt["request_sha256"], fixture["request_digest"])
+            self.assertEqual(
+                receipt["stdout_sha256"],
+                evidence.sha256_file(artifact_root / "renderer-stdout.log"),
+            )
+            self.assertEqual(
+                receipt["stderr_sha256"],
+                evidence.sha256_file(artifact_root / "renderer-stderr.log"),
+            )
+            self.assertEqual(
+                receipt["candidate_checkout_commit"],
+                fixture["request"]["binding"]["git_commit"],
+            )
+            self.assertEqual(
+                receipt["baseline_checkout_commit"],
+                fixture["request"]["binding"]["baseline_git_commit"],
+            )
+            self.assertTrue((artifact_root / "render-supervisor.json").is_file())
+            self.assertTrue((artifact_root / "renderer-stdout.log").is_file())
+            self.assertTrue(fixture["invocation_marker"].is_file())
+
+    def test_rendering_stage_rejects_non_invocation_precreation_and_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = self._renderer_stage_fixture(Path(directory))
+            (fixture["artifact_root"] / "render-job.json").unlink()
+            with self.assertRaisesRegex(
+                lane_runner.benchmark.ConfigError,
+                "render-job.json",
+            ):
+                self._run_renderer_stage(fixture)
+            self.assertFalse(fixture["invocation_marker"].exists())
+
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = self._renderer_stage_fixture(Path(directory))
+            (fixture["artifact_root"] / "rendering-manifest.json").write_text(
+                "fabricated\n",
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(
+                lane_runner.benchmark.ConfigError,
+                "cannot pre-create",
+            ):
+                self._run_renderer_stage(fixture)
+
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = self._renderer_stage_fixture(Path(directory), exit_code=7)
+            with self.assertRaisesRegex(
+                lane_runner.benchmark.ConfigError,
+                "failed with exit 7",
+            ):
+                self._run_renderer_stage(fixture)
+            self.assertFalse((fixture["artifact_root"] / "render-supervisor.json").exists())
+
+        for log_name in ("renderer-stdout.log", "renderer-stderr.log"):
+            with self.subTest(log_name=log_name), tempfile.TemporaryDirectory() as directory:
+                fixture = self._renderer_stage_fixture(Path(directory))
+                outside = Path(directory).resolve() / "outside.log"
+                outside.write_text("keep\n", encoding="utf-8")
+                (fixture["artifact_root"] / log_name).symlink_to(outside)
+                with self.assertRaisesRegex(
+                    lane_runner.benchmark.ConfigError,
+                    "cannot pre-create",
+                ):
+                    self._run_renderer_stage(fixture)
+                self.assertEqual(outside.read_text(encoding="utf-8"), "keep\n")
+                self.assertFalse(fixture["invocation_marker"].exists())
+
+    def test_rendering_stage_rejects_renderer_closure_tampering_after_invocation(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = self._renderer_stage_fixture(
+                Path(directory),
+                mutate_shader=True,
+            )
+
+            with self.assertRaisesRegex(
+                lane_runner.benchmark.ConfigError,
+                "closure mismatch after rendering",
+            ):
+                self._run_renderer_stage(fixture)
+            self.assertTrue(fixture["invocation_marker"].is_file())
+
+    def test_render_job_rejects_a_checkout_path_with_a_symlinked_ancestor(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            fixture = self._renderer_stage_fixture(root)
+            alias = root / "checkout-alias"
+            alias.symlink_to(root, target_is_directory=True)
+            job_path = fixture["artifact_root"] / "render-job.json"
+            job = json.loads(job_path.read_text(encoding="utf-8"))
+            job["candidate_checkout"]["path"] = str(alias / "candidate")
+            job_path.write_bytes(evidence.canonical_json_bytes(job) + b"\n")
+
+            with self.assertRaisesRegex(
+                lane_runner.benchmark.ConfigError,
+                "symbolic link",
+            ):
+                self._run_renderer_stage(fixture)
+            self.assertFalse(fixture["invocation_marker"].exists())
+
     def test_measurement_deadlines_are_scale_aware_bounded_and_strictly_parsed(self) -> None:
         self.assertEqual(lane_runner._measurement_timeout_seconds(30), 7200.0)
         self.assertEqual(lane_runner._measurement_timeout_seconds(120), 10800.0)
@@ -4194,6 +4717,38 @@ class RunnerIntegrityTests(unittest.TestCase):
         )
         terminate.assert_called_once_with(process)
 
+    def test_measurement_process_rejects_and_terminates_a_leaked_child(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            marker = root / "leaked-child-marker"
+            command = [
+                "/usr/bin/python3",
+                "-c",
+                (
+                    "import os,time,pathlib; pid=os.fork(); "
+                    f"path=pathlib.Path({str(marker)!r}); "
+                    "(time.sleep(1),path.write_text('leaked')) if pid == 0 else None; "
+                    "os._exit(0) if pid == 0 else None"
+                ),
+            ]
+            with (
+                (root / "stdout").open("wb") as stdout_handle,
+                (root / "stderr").open("wb") as stderr_handle,
+                self.assertRaisesRegex(
+                    lane_runner.benchmark.ConfigError,
+                    "left live child processes",
+                ),
+            ):
+                lane_runner._run_measurement_process(
+                    command,
+                    stdout_handle,
+                    stderr_handle,
+                    {"PATH": "/usr/bin:/bin"},
+                    10.0,
+                )
+            time.sleep(1.1)
+            self.assertFalse(marker.exists())
+
     def test_artifact_cleanup_refuses_intermediate_symlinks(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -4225,7 +4780,7 @@ class RunnerIntegrityTests(unittest.TestCase):
 
     def test_baseline_checkout_must_be_exact_and_clean(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
+            root = Path(directory).resolve()
             subprocess.run(["git", "init", "-q", str(root)], check=True)
             (root / "fixture.txt").write_text("baseline\n", encoding="utf-8")
             subprocess.run(["git", "-C", str(root), "add", "fixture.txt"], check=True)
@@ -4258,6 +4813,41 @@ class RunnerIntegrityTests(unittest.TestCase):
             with self.assertRaisesRegex(lane_runner.benchmark.ConfigError, "clean"):
                 lane_runner._verify_baseline_checkout(root, commit)
 
+    def test_baseline_checkout_rejects_a_symlinked_ancestor(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            checkout = root / "checkout"
+            checkout.mkdir()
+            subprocess.run(["git", "init", "-q", str(checkout)], check=True)
+            (checkout / "fixture.txt").write_text("baseline\n", encoding="utf-8")
+            subprocess.run(["git", "-C", str(checkout), "add", "fixture.txt"], check=True)
+            subprocess.run(
+                [
+                    "git", "-C", str(checkout),
+                    "-c", "user.name=EasySplat Test",
+                    "-c", "user.email=test@easysplat.invalid",
+                    "commit", "-q", "-m", "test: baseline fixture",
+                ],
+                check=True,
+            )
+            commit = subprocess.run(
+                ["git", "-C", str(checkout), "rev-parse", "HEAD"],
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout.strip()
+            linked_parent = root / "linked-parent"
+            linked_parent.symlink_to(root, target_is_directory=True)
+
+            with self.assertRaisesRegex(
+                lane_runner.benchmark.ConfigError,
+                "symbolic link",
+            ):
+                lane_runner._verify_baseline_checkout(
+                    linked_parent / "checkout",
+                    commit,
+                )
+
     def test_pre_run_digest_mismatch_is_rejected(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             runner = Path(directory) / "runner"
@@ -4283,6 +4873,22 @@ class RunnerIntegrityTests(unittest.TestCase):
 
 
 class OrchestrationTests(unittest.TestCase):
+    def test_input_digest_rejects_symlinked_ancestors_inside_the_corpus(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            corpus_root = root / "corpus"
+            outside = root / "outside"
+            corpus_root.mkdir()
+            outside.mkdir()
+            (outside / "input.mp4").write_bytes(b"video")
+            (corpus_root / "linked-media").symlink_to(outside, target_is_directory=True)
+
+            with self.assertRaisesRegex(benchmark.ConfigError, "symbolic link"):
+                benchmark.digest_input(
+                    corpus_root / "linked-media/input.mp4",
+                    trusted_root=corpus_root,
+                )
+
     def test_external_result_is_bound_to_scene_input_build_and_toolchain(self) -> None:
         scene = valid_scene()
         scene["input"]["supplied"] = True

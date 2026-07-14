@@ -82,6 +82,9 @@ require_line '^[[:space:]]+memory_bytes="\$\(sysctl -n hw\.memsize\)"$' "$TESTS"
 require_line '^[[:space:]]+swift test --filter RunPlanResolverTests$' "$TESTS"
 require_text 'cache-dependency-path: scripts/benchmark/requirements.txt' "$TESTS"
 require_line '^[[:space:]]+--require-hashes --requirement scripts/benchmark/requirements\.txt$' "$TESTS"
+if grep -Fq 'scripts/benchmark/render-requirements.txt' "$TESTS"; then
+  fail "ordinary repository tests must not install the protected render-scoring closure"
+fi
 require_line '^  pull_request:$' "$CODEQL"
 
 require_line '^[[:space:]]+GOBIN=.*go install github\.com/rhysd/actionlint/cmd/actionlint@v[0-9]+\.[0-9]+\.[0-9]+$' "$SECURITY"
@@ -145,6 +148,13 @@ require_line '^    runs-on: \[self-hosted, macOS, ARM64, easysplat-benchmark-ref
 require_line '^    runs-on: \[self-hosted, macOS, ARM64, easysplat-benchmark-constrained\]$' "$BENCHMARK_GATE"
 require_line '^    runs-on: \[self-hosted, macOS, ARM64, easysplat-benchmark-8gb\]$' "$BENCHMARK_GATE"
 require_line '^    environment: benchmark-release$' "$BENCHMARK_GATE"
+require_text 'scripts/benchmark/render-requirements.txt' "$BENCHMARK_GATE"
+base_install_count="$(grep -Fc 'name: Install protected benchmark dependencies' "$BENCHMARK_GATE")"
+[ "$base_install_count" -eq 5 ] \
+  || fail "all release benchmark jobs must install the base evidence dependencies"
+render_install_count="$(grep -Fc 'name: Install protected render-scoring dependencies' "$BENCHMARK_GATE")"
+[ "$render_install_count" -eq 2 ] \
+  || fail "only reference measurement and aggregate verification may install render scoring"
 for required in \
   EASYSPLAT_BENCHMARK_REFERENCE_RUNNER \
   EASYSPLAT_BENCHMARK_CONSTRAINED_RUNNER \
@@ -152,6 +162,8 @@ for required in \
   EASYSPLAT_BENCHMARK_REFERENCE_RUNNER_SHA256 \
   EASYSPLAT_BENCHMARK_CONSTRAINED_RUNNER_SHA256 \
   EASYSPLAT_BENCHMARK_8GB_RUNNER_SHA256 \
+  EASYSPLAT_BENCHMARK_BASELINE_TOOLCHAIN_ROOT \
+  EASYSPLAT_BENCHMARK_LPIPS_BACKBONE \
   BENCHMARK_EVIDENCE_KEY_BASE64 \
   scripts/benchmark/run_lane.py \
   reference_m4_max \
@@ -160,6 +172,16 @@ for required in \
   'easysplat-benchmark-${{ github.sha }}'; do
   require_text "$required" "$BENCHMARK_GATE"
 done
+if grep -Fq 'EASYSPLAT_BENCHMARK_RENDERING_DRIVER_SHA256' "$BENCHMARK_GATE"; then
+  fail "the protected renderer identity must be derived from the exact source build"
+fi
+require_text '--product EasySplatBenchmarkDriver' "$BENCHMARK_GATE"
+require_text 'renderer_closure.py build' "$BENCHMARK_GATE"
+require_text '--rendering-driver-identity "$RENDERER_PACKAGE/identity.json"' "$BENCHMARK_GATE"
+require_text 'easysplat-benchmark-renderer-${{ github.sha }}' "$BENCHMARK_GATE"
+require_text '--rendering-driver-closure "$RUNNER_TEMP/renderer-package/closure"' "$BENCHMARK_GATE"
+require_text '--baseline-checkout-root "$BASELINE_CHECKOUT"' "$BENCHMARK_GATE"
+require_text '--baseline-toolchain-root "$BASELINE_TOOLCHAIN_ROOT"' "$BENCHMARK_GATE"
 require_text '--request-index "$RUNNER_TEMP/requests/index.json"' "$BENCHMARK_GATE"
 if grep -Eq '^[[:space:]]*(pull_request|pull_request_target):' "$BENCHMARK_GATE"; then
   fail "release benchmark must never run pull-request code"

@@ -11,6 +11,7 @@ import math
 import os
 import platform
 import re
+import stat
 import statistics
 import subprocess
 import sys
@@ -1313,7 +1314,28 @@ def _hash_length_prefixed(hasher: Any, value: bytes) -> None:
     hasher.update(value)
 
 
-def digest_input(path: Path) -> str:
+def _reject_symlinked_input_ancestors(path: Path, trusted_root: Path) -> None:
+    root = Path(os.path.abspath(trusted_root))
+    candidate = Path(os.path.abspath(path))
+    try:
+        relative = candidate.relative_to(root)
+    except ValueError as error:
+        raise ConfigError("benchmark input escapes its corpus root") from error
+    cursor = root
+    for component in (Path("."), *relative.parts):
+        if component != Path("."):
+            cursor /= component
+        try:
+            metadata = cursor.lstat()
+        except OSError as error:
+            raise ConfigError(f"benchmark input is missing: {path.name}") from error
+        if stat.S_ISLNK(metadata.st_mode):
+            raise ConfigError("benchmark input path contains a symbolic link")
+
+
+def digest_input(path: Path, *, trusted_root: Path | None = None) -> str:
+    if trusted_root is not None:
+        _reject_symlinked_input_ancestors(path, trusted_root)
     if not path.exists():
         raise ConfigError(f"benchmark input is missing: {path.name}")
     if path.is_symlink():
@@ -1790,15 +1812,28 @@ def required_evidence_lanes(scene: Mapping[str, Any], scale: int) -> tuple[str, 
     return tuple(lanes)
 
 
-def parse_runner_identities(values: list[str] | None) -> dict[str, dict[str, str]] | None:
-    if not values:
+def parse_runner_identities(
+    values: list[str] | None,
+    rendering_driver_identity_path: Path | None = None,
+) -> dict[str, dict[str, Any]] | None:
+    if not values and rendering_driver_identity_path is None:
         return None
-    identities: dict[str, dict[str, str]] = {}
-    for raw in values:
+    identities: dict[str, dict[str, Any]] = {}
+    for raw in values or []:
         lane, separator, digest = raw.partition("=")
         if not separator or lane in identities:
             raise ConfigError("--runner-identity must contain one unique lane=sha256:<digest> value")
+        if lane == evidence.RENDERING_DRIVER_IDENTITY:
+            raise ConfigError(
+                "the rendering driver requires --rendering-driver-identity with its complete closure identity"
+            )
         identities[lane] = {"label": evidence.RUNNER_LABELS.get(lane, ""), "sha256": digest}
+    if rendering_driver_identity_path is not None:
+        rendering_identity = _load_json(
+            rendering_driver_identity_path,
+            "rendering driver identity",
+        )
+        identities[evidence.RENDERING_DRIVER_IDENTITY] = dict(rendering_identity)
     try:
         return evidence.validate_runner_identities(identities)
     except evidence.EvidenceError as error:
@@ -2411,7 +2446,10 @@ def _copy_fixture_result(
     source = corpus_directory / scene["adapter"]["result_path"]
     payload = _load_json(source, f"fixture result for {scene['id']}")
     if input_digest is None:
-        input_digest = digest_input(corpus_directory / scene["input"]["media_path"])
+        input_digest = digest_input(
+            corpus_directory / scene["input"]["media_path"],
+            trusted_root=corpus_directory,
+        )
     payload = _validate_fixture_envelope(payload, scene, identity, input_digest)
     scale_results = payload["scale_results"]
     raw = scale_results.get(str(scale))
@@ -2499,6 +2537,7 @@ def _evidence_request(
     lane: str,
     identity: RunIdentity,
     input_digest: str,
+    rendering_driver_identity: Mapping[str, str],
 ) -> dict[str, Any]:
     if lane not in required_evidence_lanes(scene, scale):
         raise ConfigError(f"{scene['id']}@{scale} does not support the {lane} evidence lane")
@@ -2633,6 +2672,10 @@ def _evidence_request(
         "expected_outcome": scene["expected_outcome"],
         "input_kind": scene["input"]["kind"],
         "gate_scopes": scene["gate_scopes"],
+        "rendering_driver_identity": evidence.validate_runner_identity(
+            rendering_driver_identity,
+            evidence.RENDERING_DRIVER_IDENTITY,
+        ),
     }
 
 
@@ -2771,7 +2814,7 @@ def _copy_protected_evidence(
     identity: RunIdentity,
     input_digest: str,
     key: bytes,
-    runner_identities: Mapping[str, Mapping[str, str]],
+    runner_identities: Mapping[str, Mapping[str, Any]],
 ) -> dict[str, Any]:
     evidence_root = corpus_directory / scene["adapter"]["evidence_path"] / str(scale)
     attestations: dict[str, Mapping[str, Any]] = {}
@@ -2779,7 +2822,14 @@ def _copy_protected_evidence(
     artifacts: dict[str, str] = {}
     verification_failures = []
     for lane in required_evidence_lanes(scene, scale):
-        request = _evidence_request(scene, scale, lane, identity, input_digest)
+        request = _evidence_request(
+            scene,
+            scale,
+            lane,
+            identity,
+            input_digest,
+            runner_identities[evidence.RENDERING_DRIVER_IDENTITY],
+        )
         path = evidence_root / lane / "attestation.json"
         try:
             attestation = evidence.verify_attestation(
@@ -2855,7 +2905,7 @@ def emit_evidence_requests(
     corpus_path: Path,
     toolchain_root: Path,
     destination: Path,
-    runner_identities: Mapping[str, Mapping[str, str]],
+    runner_identities: Mapping[str, Mapping[str, Any]],
 ) -> dict[str, Any]:
     try:
         approved_runners = evidence.validate_runner_identities(runner_identities)
@@ -2874,7 +2924,10 @@ def emit_evidence_requests(
         media = corpus_path.parent / scene["input"]["media_path"]
         if not scene["input"]["supplied"] or not media.exists():
             raise ConfigError(f"cannot emit evidence request without media for {scene['id']}")
-        input_digests[scene["id"]] = digest_input(media)
+        input_digests[scene["id"]] = digest_input(
+            media,
+            trusted_root=corpus_path.parent,
+        )
         _record_unique_release_input_digest(
             scene,
             input_digests[scene["id"]],
@@ -2892,6 +2945,7 @@ def emit_evidence_requests(
                     lane,
                     identity,
                     input_digests[scene["id"]],
+                    approved_runners[evidence.RENDERING_DRIVER_IDENTITY],
                 )
                 relative = Path(scene["id"]) / str(scale) / f"{lane}.request.json"
                 atomic_write_json(destination / relative, request)
@@ -3194,7 +3248,7 @@ def run_suite(
     emit_requests_directory: Path | None = None,
     evidence_root: Path | None = None,
     request_index_path: Path | None = None,
-    runner_identities: Mapping[str, Mapping[str, str]] | None = None,
+    runner_identities: Mapping[str, Mapping[str, Any]] | None = None,
 ) -> int:
     corpus = _load_json(corpus_path, "corpus")
     config = _load_json(reference_config_path, "reference config")
@@ -3283,7 +3337,10 @@ def run_suite(
     input_digests: dict[str, str] = {}
     input_digest_owners: dict[str, str] = {}
     for scene in corpus["scenes"]:
-        input_digests[scene["id"]] = digest_input(corpus_path.parent / scene["input"]["media_path"])
+        input_digests[scene["id"]] = digest_input(
+            corpus_path.parent / scene["input"]["media_path"],
+            trusted_root=corpus_path.parent,
+        )
         if profile == "release":
             _record_unique_release_input_digest(
                 scene,
@@ -3358,6 +3415,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--evidence-root", type=Path)
     parser.add_argument("--request-index", type=Path)
     parser.add_argument("--runner-identity", action="append")
+    parser.add_argument("--rendering-driver-identity", type=Path)
     parser.add_argument("--dry-run", action="store_true")
     return parser
 
@@ -3376,7 +3434,10 @@ def main(argv: list[str] | None = None) -> int:
             emit_requests_directory=args.emit_requests,
             evidence_root=args.evidence_root,
             request_index_path=args.request_index,
-            runner_identities=parse_runner_identities(args.runner_identity),
+            runner_identities=parse_runner_identities(
+                args.runner_identity,
+                args.rendering_driver_identity,
+            ),
         )
     except (ConfigError, evidence.EvidenceError) as error:
         print(f"benchmark configuration error: {error}", file=sys.stderr)
