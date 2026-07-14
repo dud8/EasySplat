@@ -2,6 +2,7 @@ import Foundation
 
 enum AppConfig {
     private static let defaultProjectHomeURLString = "https://github.com/dud8/EasySplat"
+    private static let defaultToolchainManifestURLString = "https://github.com/dud8/EasySplat/releases/download/toolchain-v2.0.0/manifest.json"
 
     static var projectHomeURL: URL {
         if let url = urlFromEnv("EASYSPLAT_PROJECT_HOME_URL") {
@@ -20,11 +21,7 @@ enum AppConfig {
         if let url = readURLResource(named: "toolchain_manifest_url") {
             return url
         }
-        return projectHomeURL
-            .appendingPathComponent("releases", isDirectory: true)
-            .appendingPathComponent("latest", isDirectory: true)
-            .appendingPathComponent("download", isDirectory: true)
-            .appendingPathComponent("manifest.json")
+        return URL(string: defaultToolchainManifestURLString) ?? projectHomeURL
     }
 
     static var toolchainPublicKeyBase64: String {

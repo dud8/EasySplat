@@ -6,6 +6,7 @@ enum GeometryArtifactStore {
     static let maximumMedianPixelResidual = 1.5
     static let maximumP90PixelResidual = 3.0
     static let minimumRegisteredViewFraction = 0.90
+    static let minimumLearnedObservationsPerView = 20
 
     enum Error: Swift.Error, LocalizedError, Equatable {
         case invalidSchema(Int)
@@ -207,12 +208,19 @@ enum GeometryArtifactStore {
         let canonicalModel = try projectPaths.resolveProjectRelativePath(artifact.canonicalModelPath)
         let measured = try measuredResiduals
             ?? ColmapResidualAnalyzer.analyze(modelDirectory: canonicalModel)
+        let stronglyMeasuredViewCount = measured.observationCountByImage.values.filter {
+            $0 >= minimumLearnedObservationsPerView
+        }.count
+        let learnedSupportIsValid = artifact.learnedPointInitializer == nil
+            || Double(stronglyMeasuredViewCount) / Double(artifact.totalViewCount)
+                >= minimumRegisteredViewFraction
         guard measured.provenance == artifact.residualProvenance,
               measured.registeredViewCount == artifact.registeredViewCount,
               Set(measured.registeredImageNames).isSubset(of: Set(artifact.orderedImageNames)),
               Set(measured.measuredImageNames).isSubset(of: Set(artifact.orderedImageNames)),
               Double(measured.measuredImageNames.count) / Double(artifact.totalViewCount)
                   >= minimumRegisteredViewFraction,
+              learnedSupportIsValid,
               measured.pointCount == artifact.pointCount,
               measured.observationCount == artifact.trackCount,
               approximatelyEqual(measured.medianPixelResidual, artifact.medianPixelResidual),

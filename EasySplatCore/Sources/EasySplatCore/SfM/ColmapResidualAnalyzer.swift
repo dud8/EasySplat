@@ -48,6 +48,7 @@ enum ColmapResidualAnalyzer {
         let registeredViewCount: Int
         let registeredImageNames: [String]
         let measuredImageNames: [String]
+        let observationCountByImage: [String: Int]
         let pointCount: Int
         let observationCount: Int
         let meanPixelResidual: Double
@@ -184,7 +185,7 @@ enum ColmapResidualAnalyzer {
         var residuals: [Double] = []
         var registeredImageIDs = Set<Int>()
         var registeredImageNames = Set<String>()
-        var measuredImageNames = Set<String>()
+        var observationCountByImage: [String: Int] = [:]
         var verifiedObservations: [ObservationKey: Int64] = [:]
         var index = 0
 
@@ -227,7 +228,6 @@ enum ColmapResidualAnalyzer {
                 throw Error.malformedRecord(file: "images.txt", line: observationLineNumber)
             }
 
-            var imageHasMeasuredObservation = false
             for offset in stride(from: 0, to: observationFields.count, by: 3) {
                 guard let observedX = Double(observationFields[offset]),
                       let observedY = Double(observationFields[offset + 1]),
@@ -268,9 +268,8 @@ enum ColmapResidualAnalyzer {
                     )
                 }
                 residuals.append(residual)
-                imageHasMeasuredObservation = true
+                observationCountByImage[imageName, default: 0] += 1
             }
-            if imageHasMeasuredObservation { measuredImageNames.insert(imageName) }
         }
 
 
@@ -297,7 +296,8 @@ enum ColmapResidualAnalyzer {
         return Result(
             registeredViewCount: registeredImageNames.count,
             registeredImageNames: registeredImageNames.sorted(),
-            measuredImageNames: measuredImageNames.sorted(),
+            measuredImageNames: observationCountByImage.keys.sorted(),
+            observationCountByImage: observationCountByImage,
             pointCount: points.count,
             observationCount: residuals.count,
             meanPixelResidual: mean,

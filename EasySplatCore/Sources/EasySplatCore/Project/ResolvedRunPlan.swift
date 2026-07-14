@@ -30,6 +30,7 @@ public struct ResolvedRunPlan: Codable, Sendable, Equatable {
     public var modelIdentifier: String
     public var memoryTier: String
     public var chunkSize: Int
+    public var geometryProcessResolution: Int
     public var keyframeBudget: Int
     public var maximumImageDimension: Int
     public var cameraGrouping: CameraGrouping
@@ -55,6 +56,7 @@ public struct ResolvedRunPlan: Codable, Sendable, Equatable {
         modelIdentifier: String,
         memoryTier: String,
         chunkSize: Int,
+        geometryProcessResolution: Int = 0,
         keyframeBudget: Int,
         maximumImageDimension: Int,
         cameraGrouping: CameraGrouping,
@@ -79,6 +81,7 @@ public struct ResolvedRunPlan: Codable, Sendable, Equatable {
         self.modelIdentifier = modelIdentifier
         self.memoryTier = memoryTier
         self.chunkSize = chunkSize
+        self.geometryProcessResolution = geometryProcessResolution
         self.keyframeBudget = keyframeBudget
         self.maximumImageDimension = maximumImageDimension
         self.cameraGrouping = cameraGrouping

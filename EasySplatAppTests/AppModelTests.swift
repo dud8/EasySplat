@@ -769,7 +769,7 @@ final class AppModelTests: XCTestCase {
 
         let plan = try XCTUnwrap(runnerPlan)
         XCTAssertEqual(plan.memoryTier, "constrained")
-        XCTAssertEqual(plan.modelIdentifier, "DA3-SMALL")
+        XCTAssertEqual(plan.modelIdentifier, "none")
         XCTAssertEqual(plan.keyframeBudget, 77)
     }
 
@@ -946,7 +946,7 @@ final class AppModelTests: XCTestCase {
 
         let plan = try XCTUnwrap(runnerPlan)
         XCTAssertEqual(plan.memoryTier, "constrained")
-        XCTAssertEqual(plan.modelIdentifier, "DA3-SMALL")
+        XCTAssertEqual(plan.modelIdentifier, "none")
         XCTAssertEqual(plan.keyframeBudget, 160)
         XCTAssertEqual(runner.resumeFrom, .importInput)
         XCTAssertEqual(toolchainManager.lastRequest, try plan.toolchainCapabilityRequest())
@@ -1267,7 +1267,7 @@ final class AppModelTests: XCTestCase {
         await model.startProject(input: .video(files: [input.path]), title: "Fast")
 
         XCTAssertEqual(capturedPlan?.trainerIterationLimit, 3_000)
-        XCTAssertEqual(capturedPlan?.modelIdentifier, "DA3-SMALL")
+        XCTAssertEqual(capturedPlan?.modelIdentifier, "none")
         let projectURL = try XCTUnwrap(model.currentProjectURL)
         let metadata = try ProjectMetadataStore.load(from: ProjectPaths(root: projectURL).metadataURL)
         XCTAssertEqual(metadata.requestedRunOptions.detailProfile, .fast)
@@ -2374,6 +2374,10 @@ final class AppModelTests: XCTestCase {
         ]) {
             XCTAssertEqual(AppConfig.toolchainPublicKeyBase64, expectedPublicKey)
             XCTAssertFalse(AppConfig.toolchainPublicKeyBase64.isEmpty)
+            XCTAssertEqual(
+                AppConfig.toolchainManifestURL.absoluteString,
+                "https://github.com/dud8/EasySplat/releases/download/toolchain-v2.0.0/manifest.json"
+            )
         }
 
         await withAppEnvironmentAsync([

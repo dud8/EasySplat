@@ -631,7 +631,7 @@ public final class PipelineRunner: @unchecked Sendable {
                             fallbackModelSubdirectory: resolvedRunPlan.modelIdentifier == "DA3-BASE"
                                 ? da3FallbackModelPreference()
                                 : resolvedRunPlan.modelIdentifier,
-                            processResolution: da3ProcessResolutionPreference(),
+                            processResolution: resolvedRunPlan.geometryProcessResolution,
                             maxPoints: da3MaxPointsPreference(
                                 detailProfile: metadata.requestedRunOptions.detailProfile
                             ),
@@ -643,10 +643,7 @@ public final class PipelineRunner: @unchecked Sendable {
                             sharedCamera: shareCameraAcrossSelectedFrames,
                             inputOrdering: da3InputOrdering,
                             windowSize: effectiveDa3WindowSize,
-                            windowOverlap: da3SeedWindowOverlap(
-                                windowSize: effectiveDa3WindowSize,
-                                hardwareTier: detectedHardwareProfile.tier
-                            ),
+                            windowOverlap: 0,
                             coverageManifestPath: da3CoverageManifest
                         )
                         da3ConfigurationForAttempt = da3Config
@@ -759,7 +756,7 @@ public final class PipelineRunner: @unchecked Sendable {
                             emit(.stageLog(stage: .sfmFeatures, line: "SfM backend: da3-mps.", isError: false))
                             emit(.stageLog(
                                 stage: .sfmFeatures,
-                                line: "DA3 policy: aligned seed, ordering=\(da3Config.inputOrdering.rawValue) model=\(da3Config.modelSubdirectory) fallback=\(da3Config.fallbackModelSubdirectory) device=\(da3Config.device) processRes=\(da3Config.processResolution) maxPoints=\(da3Config.maxPoints) sharedCamera=\(da3Config.sharedCamera) cameraType=\(da3Config.cameraType) window=\(da3Config.windowSize) overlap=\(da3Config.windowOverlap).",
+                                line: "DA3 candidate: single batch, ordering=\(da3Config.inputOrdering.rawValue) model=\(da3Config.modelSubdirectory) fallback=\(da3Config.fallbackModelSubdirectory) device=\(da3Config.device) processRes=\(da3Config.processResolution) maxPoints=\(da3Config.maxPoints) sharedCamera=\(da3Config.sharedCamera) cameraType=\(da3Config.cameraType) views=\(da3Config.windowSize).",
                                 isError: false
                             ))
 
@@ -801,7 +798,7 @@ public final class PipelineRunner: @unchecked Sendable {
                                 }
                             }
 
-                            emit(.stageProgress(stage: .sfmFeatures, fraction: 0.0, message: "Starting DA3 aligned seed solve (\(selectedFrames.count) images)…"))
+                            emit(.stageProgress(stage: .sfmFeatures, fraction: 0.0, message: "Starting DA3 single-batch seed (\(selectedFrames.count) images)…"))
                             try await self.tooling.da3Sfm.run(
                                 toolchain: self.config.toolchain.da3,
                                 images: paths.framesSelectedURL,

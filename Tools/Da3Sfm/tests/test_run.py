@@ -855,6 +855,38 @@ class Da3RunTests(unittest.TestCase):
             self.assertEqual(payload["fused_sparse_point_count"], 12_000)
             self.assertNotIn("final_observation_count", payload)
 
+    def test_main_rejects_a_second_inference_window_before_loading_a_model(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            images = root / "images"
+            images.mkdir()
+            for index in range(30):
+                Image.new("RGB", (8, 8)).save(images / f"img{index:02d}.jpg")
+
+            with mock.patch("easysplat_da3_sfm.run._select_device") as select_device:
+                with mock.patch("easysplat_da3_sfm.run._run_da3_attempt") as run_attempt:
+                    with self.assertRaisesRegex(
+                        SystemExit,
+                        "one coherent batch of at most 29 images",
+                    ):
+                        main(
+                            [
+                                "--images",
+                                str(images),
+                                "--out-sparse",
+                                str(root / "sparse" / "0"),
+                                "--models-dir",
+                                str(root / "models"),
+                                "--window-size",
+                                "29",
+                                "--window-overlap",
+                                "0",
+                            ]
+                        )
+
+            select_device.assert_not_called()
+            run_attempt.assert_not_called()
+
     def test_main_forces_offline_env_and_retries_small_on_oom(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
@@ -933,7 +965,7 @@ class Da3RunTests(unittest.TestCase):
             out_sparse = root / "sparse" / "0"
             manifest = root / "da3_coverage_manifest.json"
             images.mkdir()
-            for index in range(7):
+            for index in range(4):
                 Image.new("RGB", (8, 8)).save(images / f"img{index}.jpg")
             for model_name in ("DA3-BASE", "DA3-SMALL"):
                 model = models / model_name
@@ -958,13 +990,13 @@ class Da3RunTests(unittest.TestCase):
                 for name in ("cameras.txt", "images.txt", "points3D.txt"):
                     (sparse_path / name).write_text("# empty\n", encoding="utf-8")
                 return len(image_paths), {
-                    "batches": [list(range(4)), [0, 1, 2, 4, 5, 6]],
+                    "batches": [list(range(4))],
                     "anchor_indices": [0, 1, 2],
-                    "alignment_edge_count": 1,
+                    "alignment_edge_count": 0,
                     "max_alignment_rmse": 0.0,
                     "alignment_complete": True,
-                    "raw_point_sample_count": 28,
-                    "fused_sparse_point_count": 14,
+                    "raw_point_sample_count": 16,
+                    "fused_sparse_point_count": 8,
                 }
 
             with mock.patch(
@@ -997,7 +1029,7 @@ class Da3RunTests(unittest.TestCase):
             self.assertEqual(payload["model_subdir"], "DA3-SMALL")
             self.assertEqual(payload["export_strategy"], "aligned_pose_depth_seed")
 
-    def test_seed_oom_restarts_every_batch_with_small_model(self) -> None:
+    def test_seed_oom_restarts_the_coherent_batch_with_small_model(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
             images = root / "images"
@@ -1005,7 +1037,7 @@ class Da3RunTests(unittest.TestCase):
             out_sparse = root / "seed" / "0"
             manifest = root / "manifest.json"
             images.mkdir()
-            for index in range(7):
+            for index in range(4):
                 Image.new("RGB", (8, 8)).save(images / f"img{index}.jpg")
             for model_name in ("DA3-BASE", "DA3-SMALL"):
                 model = models / model_name
@@ -1027,7 +1059,7 @@ class Da3RunTests(unittest.TestCase):
                 def inference(self, **kwargs):
                     names = [Path(value).name for value in kwargs["image"]]
                     calls[self.name].append(names)
-                    if self.name == "DA3-BASE" and len(calls[self.name]) == 2:
+                    if self.name == "DA3-BASE":
                         raise RuntimeError("MPS backend out of memory")
                     centers = []
                     for name in names:
@@ -1104,18 +1136,15 @@ class Da3RunTests(unittest.TestCase):
             self.assertEqual(loads, ["DA3-BASE", "DA3-SMALL"])
             self.assertEqual(
                 calls["DA3-BASE"],
-                [
-                    ["img0.jpg", "img1.jpg", "img2.jpg", "img3.jpg"],
-                    ["img2.jpg", "img3.jpg", "img4.jpg", "img5.jpg"],
-                ],
+                [["img0.jpg", "img1.jpg", "img2.jpg", "img3.jpg"]],
             )
             self.assertEqual(
                 calls["DA3-SMALL"][0], ["img0.jpg", "img1.jpg", "img2.jpg", "img3.jpg"]
             )
-            self.assertEqual(len(calls["DA3-SMALL"]), 3)
+            self.assertEqual(len(calls["DA3-SMALL"]), 1)
             payload = json.loads(manifest.read_text(encoding="utf-8"))
             self.assertEqual(payload["model_subdir"], "DA3-SMALL")
-            self.assertEqual(payload["registered_image_count"], 7)
+            self.assertEqual(payload["registered_image_count"], 4)
 
     def test_main_does_not_retry_non_memory_failure(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

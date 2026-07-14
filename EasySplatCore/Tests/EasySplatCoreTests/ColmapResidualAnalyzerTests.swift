@@ -21,6 +21,7 @@ final class ColmapResidualAnalyzerTests: XCTestCase {
         XCTAssertEqual(result.registeredViewCount, 1)
         XCTAssertEqual(result.registeredImageNames, ["frame_000001.jpg"])
         XCTAssertEqual(result.measuredImageNames, ["frame_000001.jpg"])
+        XCTAssertEqual(result.observationCountByImage, ["frame_000001.jpg": 2])
         XCTAssertEqual(result.pointCount, 2)
         XCTAssertEqual(result.observationCount, 2)
         XCTAssertEqual(result.meanPixelResidual, 0.5, accuracy: 0.000_001)
@@ -125,6 +126,7 @@ final class ColmapResidualAnalyzerTests: XCTestCase {
 
         XCTAssertEqual(result.registeredViewCount, 1)
         XCTAssertEqual(result.measuredImageNames, ["frame.jpg"])
+        XCTAssertEqual(result.observationCountByImage, ["frame.jpg": 2])
         XCTAssertEqual(result.pointCount, 1)
         XCTAssertEqual(result.observationCount, 2)
         XCTAssertEqual(result.medianPixelResidual, 0, accuracy: 0.000_001)

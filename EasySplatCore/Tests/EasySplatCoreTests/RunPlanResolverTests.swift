@@ -27,7 +27,7 @@ final class RunPlanResolverTests: XCTestCase {
         )
     }
 
-    func testDefaultBalancedPhotoPlanUsesAnchoredBaseThenColmapFallback() {
+    func testDefaultBalancedPhotoPlanUsesClassicalGeometryWithoutLearnedModels() throws {
         let plan = RunPlanResolver.resolve(
             requestedOptions: RequestedRunOptions(),
             input: .photos(folder: "/tmp/photos"),
@@ -35,10 +35,11 @@ final class RunPlanResolverTests: XCTestCase {
             developmentOverrides: .none
         )
 
-        XCTAssertEqual(plan.routeIdentifier, SfmBackend.da3.rawValue)
-        XCTAssertEqual(plan.modelIdentifier, "DA3-BASE")
+        XCTAssertEqual(plan.routeIdentifier, SfmBackend.colmap.rawValue)
+        XCTAssertEqual(plan.modelIdentifier, "none")
         XCTAssertEqual(plan.memoryTier, "performance")
-        XCTAssertEqual(plan.chunkSize, 8)
+        XCTAssertEqual(plan.chunkSize, 0)
+        XCTAssertEqual(plan.geometryProcessResolution, 0)
         XCTAssertEqual(plan.keyframeBudget, 250)
         XCTAssertEqual(plan.maximumImageDimension, 1_600)
         XCTAssertEqual(plan.capturePath, .automatic)
@@ -57,17 +58,18 @@ final class RunPlanResolverTests: XCTestCase {
             plan.requiredToolchainCapabilities,
             [
                 "geometry.colmap",
-                "geometry.da3.base",
-                "geometry.da3.runtime",
-                "geometry.da3.small",
                 "runtime.core",
                 "training.msplat",
             ]
         )
-        XCTAssertEqual(plan.fallbackRouteIdentifiers, [SfmBackend.colmap.rawValue])
+        XCTAssertEqual(plan.fallbackRouteIdentifiers, [])
+        XCTAssertEqual(
+            try plan.toolchainCapabilityRequest().capabilities,
+            [.core, .colmap, .msplat]
+        )
     }
 
-    func testLowMemoryAndConserveMemoryProactivelyChooseSmallAndBoundBudgets() {
+    func testLowMemoryAndConserveMemoryBoundClassicalBudgets() {
         let automatic8GB = RunPlanResolver.resolve(
             requestedOptions: RequestedRunOptions(detailProfile: .balanced),
             input: .video(files: ["/tmp/clip.mov"]),
@@ -92,8 +94,9 @@ final class RunPlanResolverTests: XCTestCase {
 
         for plan in [automatic8GB, conserved48GB] {
             XCTAssertEqual(plan.memoryTier, "constrained")
-            XCTAssertEqual(plan.modelIdentifier, "DA3-SMALL")
-            XCTAssertEqual(plan.chunkSize, 4)
+            XCTAssertEqual(plan.modelIdentifier, "none")
+            XCTAssertEqual(plan.chunkSize, 0)
+            XCTAssertEqual(plan.geometryProcessResolution, 0)
             XCTAssertLessThan(plan.keyframeBudget, automatic48GB.keyframeBudget)
             XCTAssertLessThan(plan.maximumImageDimension, automatic48GB.maximumImageDimension)
             XCTAssertEqual(plan.colmapMaximumFeatureCount, 4_096)
@@ -103,7 +106,7 @@ final class RunPlanResolverTests: XCTestCase {
         }
     }
 
-    func testFastUsesSmallLearnedGeometryEvenOnLargeMemoryMac() throws {
+    func testFastDefaultsToClassicalGeometryEvenOnLargeMemoryMac() throws {
         let plan = RunPlanResolver.resolve(
             requestedOptions: RequestedRunOptions(detailProfile: .fast),
             input: .video(files: ["/tmp/clip.mov"]),
@@ -111,14 +114,34 @@ final class RunPlanResolverTests: XCTestCase {
             developmentOverrides: .none
         )
 
-        XCTAssertEqual(plan.routeIdentifier, SfmBackend.da3.rawValue)
-        XCTAssertEqual(plan.modelIdentifier, "DA3-SMALL")
-        XCTAssertEqual(plan.fallbackRouteIdentifiers, [SfmBackend.colmap.rawValue])
+        XCTAssertEqual(plan.routeIdentifier, SfmBackend.colmap.rawValue)
+        XCTAssertEqual(plan.modelIdentifier, "none")
+        XCTAssertEqual(plan.fallbackRouteIdentifiers, [])
         XCTAssertEqual(plan.cameraGrouping, .sameCameraAndLens)
         XCTAssertEqual(plan.lensProjection, .automatic)
         XCTAssertEqual(
             try plan.toolchainCapabilityRequest().capabilities,
-            [.core, .colmap, .da3Runtime, .msplat, .da3Small]
+            [.core, .colmap, .msplat]
+        )
+    }
+
+    func testExplicitDa3CandidateUsesOneMeasuredCoherentBatch() throws {
+        let plan = RunPlanResolver.resolve(
+            requestedOptions: RequestedRunOptions(detailProfile: .balanced),
+            input: .video(files: ["/tmp/clip.mov"]),
+            hardware: HardwareProfile(memoryGB: 48, cpuCount: 16, gpuWorkingSetGB: 36),
+            developmentOverrides: DevelopmentOverrides(candidateRoute: .da3)
+        )
+
+        XCTAssertEqual(plan.routeIdentifier, SfmBackend.da3.rawValue)
+        XCTAssertEqual(plan.modelIdentifier, "DA3-BASE")
+        XCTAssertEqual(plan.keyframeBudget, 29)
+        XCTAssertEqual(plan.chunkSize, 29)
+        XCTAssertEqual(plan.geometryProcessResolution, 336)
+        XCTAssertEqual(plan.fallbackRouteIdentifiers, [])
+        XCTAssertEqual(
+            try plan.toolchainCapabilityRequest().capabilities,
+            [.core, .colmap, .da3Runtime, .msplat, .da3Base, .da3Small]
         )
     }
 
@@ -143,11 +166,11 @@ final class RunPlanResolverTests: XCTestCase {
         )
 
         XCTAssertEqual(constrained.memoryTier, "constrained")
-        XCTAssertEqual(constrained.modelIdentifier, "DA3-SMALL")
-        XCTAssertEqual(constrained.chunkSize, 4)
+        XCTAssertEqual(constrained.modelIdentifier, "none")
+        XCTAssertEqual(constrained.chunkSize, 0)
         XCTAssertEqual(performance.memoryTier, "performance")
-        XCTAssertEqual(performance.modelIdentifier, "DA3-BASE")
-        XCTAssertEqual(performance.chunkSize, 10)
+        XCTAssertEqual(performance.modelIdentifier, "none")
+        XCTAssertEqual(performance.chunkSize, 0)
         XCTAssertGreaterThan(performance.keyframeBudget, constrained.keyframeBudget)
         XCTAssertGreaterThan(performance.maximumImageDimension, constrained.maximumImageDimension)
         XCTAssertEqual(performance.colmapMaximumFeatureCount, 12_000)
@@ -176,7 +199,7 @@ final class RunPlanResolverTests: XCTestCase {
                 hardware: HardwareProfile(memoryGB: memoryGB, cpuCount: 12, gpuWorkingSetGB: 14),
                 developmentOverrides: .none
             )
-            XCTAssertEqual(balancedPlan.modelIdentifier, "DA3-BASE")
+            XCTAssertEqual(balancedPlan.modelIdentifier, "none")
         }
         let defensivePlan = RunPlanResolver.resolve(
             requestedOptions: RequestedRunOptions(
@@ -187,7 +210,7 @@ final class RunPlanResolverTests: XCTestCase {
             hardware: HardwareProfile(memoryGB: 18, cpuCount: 12, gpuWorkingSetGB: 14),
             developmentOverrides: .none
         )
-        XCTAssertEqual(defensivePlan.modelIdentifier, "DA3-SMALL")
+        XCTAssertEqual(defensivePlan.modelIdentifier, "none")
     }
 
     func testMaximumPerformanceIsUnavailableThroughTheConstrainedMemoryBoundary() {
@@ -347,7 +370,7 @@ final class RunPlanResolverTests: XCTestCase {
 
         XCTAssertEqual(
             request.capabilities,
-            [.core, .colmap, .da3Runtime, .msplat, .da3Base, .da3Small]
+            [.core, .colmap, .msplat]
         )
 
         var corrupt = plan
@@ -421,8 +444,8 @@ final class RunPlanResolverTests: XCTestCase {
         let saved = try ProjectMetadataStore.load(from: paths.metadataURL)
         let plan = try XCTUnwrap(saved.resolvedRunPlan)
         XCTAssertEqual(plan.capturePath, .largeArea)
-        XCTAssertEqual(plan.routeIdentifier, SfmBackend.da3.rawValue)
-        XCTAssertEqual(plan.modelIdentifier, "DA3-SMALL")
+        XCTAssertEqual(plan.routeIdentifier, SfmBackend.colmap.rawValue)
+        XCTAssertEqual(plan.modelIdentifier, "none")
         XCTAssertEqual(plan.photoSelection, .useAllValidPhotos)
         XCTAssertEqual(plan.deterministicSeed, 7)
         XCTAssertEqual(saved.state.stage, .importInput)

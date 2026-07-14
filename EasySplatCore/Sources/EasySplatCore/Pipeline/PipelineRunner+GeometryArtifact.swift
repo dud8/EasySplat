@@ -40,6 +40,17 @@ extension PipelineRunner {
                 total: selectedFrames.count
             )
         }
+        if acceptedDa3ModelSubdirectory != nil {
+            let stronglyMeasuredViews = residuals.observationCountByImage.values.filter {
+                $0 >= GeometryArtifactStore.minimumLearnedObservationsPerView
+            }.count
+            guard stronglyMeasuredViews >= requiredRegisteredViews else {
+                throw PipelineError.geometryResidualCoverageTooLow(
+                    measured: stronglyMeasuredViews,
+                    total: selectedFrames.count
+                )
+            }
+        }
         guard residuals.medianPixelResidual <= GeometryArtifactStore.maximumMedianPixelResidual,
               residuals.p90PixelResidual <= GeometryArtifactStore.maximumP90PixelResidual else {
             throw PipelineError.geometryResidualsTooHigh(

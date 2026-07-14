@@ -3,16 +3,6 @@ import XCTest
 @testable import EasySplatCore
 
 final class PipelineRunnerHelperTests: XCTestCase {
-    func testConstrainedDa3SeedWindowKeepsRoomForTwoNewViews() throws {
-        let root = try TestFileBuilder.makeTempDir()
-        defer { try? FileManager.default.removeItem(at: root) }
-        let runner = makeRunner(projectURL: root)
-
-        XCTAssertEqual(runner.test_da3SeedWindowOverlap(windowSize: 4, hardwareTier: .low), 2)
-        XCTAssertEqual(runner.test_da3SeedWindowOverlap(windowSize: 6, hardwareTier: .mid), 3)
-        XCTAssertEqual(runner.test_da3SeedWindowOverlap(windowSize: 8, hardwareTier: .high), 3)
-    }
-
     func testAutomaticCameraSharingRequiresOneVideoClip() throws {
         let root = try TestFileBuilder.makeTempDir()
         defer { try? FileManager.default.removeItem(at: root) }

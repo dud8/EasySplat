@@ -147,10 +147,6 @@ extension PipelineRunner {
         Self.normalizedToolLogIsError(line, isError: isError)
     }
 
-    func test_da3SeedWindowOverlap(windowSize: Int, hardwareTier: HardwareProfile.Tier) -> Int {
-        da3SeedWindowOverlap(windowSize: windowSize, hardwareTier: hardwareTier)
-    }
-
     func test_da3SharedCameraPreference(
         input: InputSpec,
         cameraGrouping: CameraGrouping

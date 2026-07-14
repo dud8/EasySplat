@@ -942,6 +942,11 @@ def main(argv: list[str] | None = None) -> int:
         raise SystemExit(f"--window-size must be >= {MIN_WINDOW_SIZE}")
     if args.window_overlap < 0 or args.window_overlap >= args.window_size:
         raise SystemExit("--window-overlap must be >= 0 and smaller than --window-size")
+    if len(image_paths) > args.window_size:
+        raise SystemExit(
+            "DA3 production inference requires one coherent batch of at most "
+            f"{args.window_size} images"
+        )
 
     selected_device = _select_device(args.device)
     primary_model = _model_path(models_dir, args.model_subdir)

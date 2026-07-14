@@ -219,7 +219,7 @@ final class GeometryArtifactStoreTests: XCTestCase {
         defer { try? FileManager.default.removeItem(at: root) }
         let paths = ProjectPaths(root: root)
         try paths.ensureDirectories()
-        let fixture = try writeCanonicalModel(at: paths)
+        let fixture = try writeCanonicalModel(at: paths, observationCount: 20)
         try FileManager.default.createDirectory(
             at: paths.colmapSeedModelURL,
             withIntermediateDirectories: true
@@ -299,7 +299,7 @@ final class GeometryArtifactStoreTests: XCTestCase {
         defer { try? FileManager.default.removeItem(at: root) }
         let paths = ProjectPaths(root: root)
         try paths.ensureDirectories()
-        let fixture = try writeCanonicalModel(at: paths)
+        let fixture = try writeCanonicalModel(at: paths, observationCount: 20)
 
         var artifact = makeArtifact(fixture: fixture)
         artifact.provenance.solver.identifier = ""
@@ -367,7 +367,9 @@ final class GeometryArtifactStoreTests: XCTestCase {
     private typealias Fixture = (
         modelHashes: [String: String],
         inputDigest: String,
-        selectedFramesDigest: String
+        selectedFramesDigest: String,
+        pointCount: Int,
+        observationCount: Int
     )
 
     private func makeArtifact(fixture: Fixture) -> GeometryArtifact {
@@ -389,8 +391,8 @@ final class GeometryArtifactStoreTests: XCTestCase {
             cameraGrouping: .sameCameraAndLens,
             registeredViewCount: 1,
             totalViewCount: 1,
-            trackCount: 1,
-            pointCount: 1,
+            trackCount: fixture.observationCount,
+            pointCount: fixture.pointCount,
             residualProvenance: "colmap-text-tracks-v1",
             medianPixelResidual: 0,
             p90PixelResidual: 0,
@@ -412,13 +414,22 @@ final class GeometryArtifactStoreTests: XCTestCase {
         )
     }
 
-    private func writeCanonicalModel(at paths: ProjectPaths) throws -> Fixture {
+    private func writeCanonicalModel(
+        at paths: ProjectPaths,
+        observationCount: Int = 1
+    ) throws -> Fixture {
         let model = paths.colmapSparseURL.appendingPathComponent("0", isDirectory: true)
         try FileManager.default.createDirectory(at: model, withIntermediateDirectories: true)
+        let observations = (1...observationCount)
+            .map { "320 240 \($0)" }
+            .joined(separator: " ")
+        let points = (1...observationCount)
+            .map { "\($0) 0 0 1 255 255 255 0 1 \($0 - 1)" }
+            .joined(separator: "\n")
         let contents = [
             "cameras.txt": "1 SIMPLE_PINHOLE 640 480 500 320 240\n",
-            "images.txt": "1 1 0 0 0 0 0 0 1 frame_000001.jpg\n320 240 1\n",
-            "points3D.txt": "1 0 0 1 255 255 255 0 1 0\n",
+            "images.txt": "1 1 0 0 0 0 0 0 1 frame_000001.jpg\n\(observations)\n",
+            "points3D.txt": points + "\n",
         ]
         var hashes: [String: String] = [:]
         for (name, contents) in contents {
@@ -440,7 +451,9 @@ final class GeometryArtifactStoreTests: XCTestCase {
             selectedFramesDigest: try GeometryArtifactStore.selectedFramesDigest(
                 orderedImageNames: ["frame_000001.jpg"],
                 projectPaths: paths
-            )
+            ),
+            pointCount: observationCount,
+            observationCount: observationCount
         )
     }
 }

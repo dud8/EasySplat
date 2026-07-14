@@ -1115,7 +1115,7 @@ final class PipelineIntegrationTests: XCTestCase {
         XCTAssertNotNil(interruptedMetadata.lastRunStartedAt, "Cancellation should preserve lastRunStartedAt for crash/interruption detection.")
     }
 
-    func testPipelineDefaultsToDa3AndRecordsAcceptedSmallFallback() async throws {
+    func testExplicitDa3CandidateRecordsAcceptedSmallFallback() async throws {
         let temp = makeTempRoot()
         let projectURL = temp.appendingPathComponent("Test.easysplatproj", isDirectory: true)
         let sourcePhotos = temp.appendingPathComponent("SourcePhotos", isDirectory: true)
@@ -1152,9 +1152,10 @@ final class PipelineIntegrationTests: XCTestCase {
             .init(path: toolchain.colmap.path, argsPrefix: ["exhaustive_matcher"], result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""), onRun: nil),
             .init(path: toolchain.colmap.path, argsPrefix: ["point_triangulator"], result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""), onRun: { args in
                 guard let output = self.value(for: "--output_path", in: args) else { return }
-                try? self.writeSparseModel(
+                try? self.writeDa3SparseModel(
                     at: URL(fileURLWithPath: output),
-                    imageNames: self.selectedImageNames(in: paths)
+                    imageNames: self.selectedImageNames(in: paths),
+                    pointCount: 20
                 )
             }),
             .init(path: toolchain.colmap.path, argsPrefix: ["bundle_adjuster"], result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""), onRun: { args in
@@ -1163,9 +1164,10 @@ final class PipelineIntegrationTests: XCTestCase {
                     "1"
                 )
                 guard let output = self.value(for: "--output_path", in: args) else { return }
-                try? self.writeSparseModel(
+                try? self.writeDa3SparseModel(
                     at: URL(fileURLWithPath: output),
-                    imageNames: self.selectedImageNames(in: paths)
+                    imageNames: self.selectedImageNames(in: paths),
+                    pointCount: 20
                 )
             }),
             .init(path: toolchain.colmap.path, argsPrefix: ["model_analyzer"], result: .init(exitCode: 0, terminationReason: .exit, stdout: "Registered images: 2 / 2\nPoints: 16000\nObservations: 32000\nMean track length: 2.0\nMean reprojection error: 0.8\n", stderr: ""), onRun: nil)
@@ -1175,6 +1177,7 @@ final class PipelineIntegrationTests: XCTestCase {
             projectURL: projectURL,
             config: makePipelineConfig(
                 toolchain: toolchain,
+                candidateRoute: .da3,
                 skipTraining: true,
                 hardwareProfile: HardwareProfile(
                     memoryGB: 48,
@@ -1213,7 +1216,7 @@ final class PipelineIntegrationTests: XCTestCase {
         )
     }
 
-    func testMeasuredDa3ResidualFailureFallsBackToClassicalSolve() async throws {
+    func testUnderSupportedDa3ViewsStopStrictCandidateRun() async throws {
         let temp = makeTempRoot()
         let projectURL = temp.appendingPathComponent("ResidualFallback.easysplatproj", isDirectory: true)
         let sourcePhotos = temp.appendingPathComponent("SourcePhotos", isDirectory: true)
@@ -1259,9 +1262,8 @@ final class PipelineIntegrationTests: XCTestCase {
                         imageNames: self.selectedImageNames(in: paths),
                         pointCount: 4
                     )
-                    try self.makeSparseModelHighResidual(at: modelURL)
                 } catch {
-                    XCTFail("Failed to prepare high-residual triangulated model: \(error)")
+                    XCTFail("Failed to prepare under-supported triangulated model: \(error)")
                 }
             }),
             .init(path: toolchain.colmap.path, argsPrefix: ["bundle_adjuster"], result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""), onRun: { args in
@@ -1273,9 +1275,8 @@ final class PipelineIntegrationTests: XCTestCase {
                         imageNames: self.selectedImageNames(in: paths),
                         pointCount: 4
                     )
-                    try self.makeSparseModelHighResidual(at: modelURL)
                 } catch {
-                    XCTFail("Failed to prepare high-residual adjusted model: \(error)")
+                    XCTFail("Failed to prepare under-supported adjusted model: \(error)")
                 }
             }),
             .init(
@@ -1310,26 +1311,25 @@ final class PipelineIntegrationTests: XCTestCase {
             projectURL: projectURL,
             config: makePipelineConfig(
                 toolchain: toolchain,
+                candidateRoute: .da3,
                 skipTraining: true
             ),
             tooling: .init(runner: runner)
         )
         let events = PipelineEventSink()
 
-        try await pipeline.run { event in
-            events.append(event)
-        }
+        await XCTAssertThrowsErrorAsync({
+            try await pipeline.run { event in
+                events.append(event)
+            }
+        })
 
         XCTAssertFalse(runner.calls.contains { $0.1.first == "global_mapper" })
-        XCTAssertEqual(runner.calls.filter { $0.1.first == "mapper" }.count, 1)
-        XCTAssertNotNil(events.stageLog(containing: "Falling back to COLMAP"))
+        XCTAssertFalse(runner.calls.contains { $0.1.first == "mapper" })
+        XCTAssertNil(events.stageLog(containing: "Falling back to COLMAP"))
         let finished = try ProjectMetadataStore.load(from: paths.metadataURL)
-        XCTAssertEqual(finished.reconstruction?.mapper, "colmap")
-        XCTAssertEqual(finished.geometryArtifact?.fallbackReason, "learned geometry did not pass; used classical compatibility solve")
-        XCTAssertEqual(finished.geometryArtifact?.medianPixelResidual, 0)
-        XCTAssertEqual(finished.geometryArtifact?.modelVersion, "none")
-        XCTAssertNil(finished.geometryArtifact?.provenance.runtime)
-        XCTAssertNil(finished.geometryArtifact?.provenance.model)
+        XCTAssertNil(finished.reconstruction)
+        XCTAssertNil(finished.geometryArtifact)
     }
 
     func testRejectedDa3SummaryIsNotPersistedWhenClassicalFallbackFails() async throws {
@@ -1421,7 +1421,7 @@ final class PipelineIntegrationTests: XCTestCase {
         let projectURL = temp.appendingPathComponent("Da3AlignedSeed.easysplatproj", isDirectory: true)
         let sourcePhotos = temp.appendingPathComponent("SourcePhotos", isDirectory: true)
         try FileManager.default.createDirectory(at: sourcePhotos, withIntermediateDirectories: true)
-        for index in 0..<30 {
+        for index in 0..<29 {
             try writeRetrievalTestImage(
                 url: sourcePhotos.appendingPathComponent(String(format: "img_%03d.jpg", index)),
                 index: index
@@ -1453,20 +1453,22 @@ final class PipelineIntegrationTests: XCTestCase {
                       let pairs = try? String(contentsOfFile: path, encoding: .utf8) else {
                     return XCTFail("DA3 refinement pair list was not readable")
                 }
-                XCTAssertTrue(pairs.contains("frame_000000.jpg frame_000029.jpg"))
+                XCTAssertTrue(pairs.contains("frame_000000.jpg frame_000028.jpg"))
             }),
             .init(path: toolchain.colmap.path, argsPrefix: ["point_triangulator"], result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""), onRun: { args in
                 guard let output = self.value(for: "--output_path", in: args) else { return }
-                try? self.writeSparseModel(
+                try? self.writeDa3SparseModel(
                     at: URL(fileURLWithPath: output),
-                    imageNames: self.selectedImageNames(in: paths)
+                    imageNames: self.selectedImageNames(in: paths),
+                    pointCount: 20
                 )
             }),
             .init(path: toolchain.colmap.path, argsPrefix: ["bundle_adjuster"], result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""), onRun: { args in
                 guard let output = self.value(for: "--output_path", in: args) else { return }
-                try? self.writeSparseModel(
+                try? self.writeDa3SparseModel(
                     at: URL(fileURLWithPath: output),
-                    imageNames: self.selectedImageNames(in: paths)
+                    imageNames: self.selectedImageNames(in: paths),
+                    pointCount: 20
                 )
             }),
             .init(
@@ -1475,7 +1477,7 @@ final class PipelineIntegrationTests: XCTestCase {
                 result: .init(
                     exitCode: 0,
                     terminationReason: .exit,
-                    stdout: "Registered images: 30 / 30\nPoints: 16000\nObservations: 32000\nMean track length: 2.0\nMean reprojection error: 0.8\n",
+                    stdout: "Registered images: 29 / 29\nPoints: 16000\nObservations: 32000\nMean track length: 2.0\nMean reprojection error: 0.8\n",
                     stderr: ""
                 ),
                 onRun: nil

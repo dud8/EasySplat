@@ -13,10 +13,6 @@ extension PipelineRunner {
         "DA3-SMALL"
     }
 
-    func da3ProcessResolutionPreference() -> Int {
-        504
-    }
-
     func da3MaxPointsPreference(detailProfile: DetailProfile) -> Int {
         switch detailProfile {
         case .fast:
@@ -49,20 +45,6 @@ extension PipelineRunner {
         case .mixedCamerasOrLenses:
             return false
         }
-    }
-
-    func da3WindowOverlapPreference(hardwareTier: HardwareProfile.Tier) -> Int {
-        switch hardwareTier {
-        case .low:
-            return 1
-        case .mid, .high:
-            return 2
-        }
-    }
-
-    func da3SeedWindowOverlap(windowSize: Int, hardwareTier: HardwareProfile.Tier) -> Int {
-        let requested = max(3, da3WindowOverlapPreference(hardwareTier: hardwareTier))
-        return min(requested, max(2, windowSize - 2))
     }
 
     func shouldUseColmapGpu(colmapPath: URL) -> Bool {

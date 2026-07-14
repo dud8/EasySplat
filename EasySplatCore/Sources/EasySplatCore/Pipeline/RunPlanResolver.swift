@@ -165,6 +165,7 @@ public enum RunPlanResolver {
             || previousPlan.modelIdentifier != currentPlan.modelIdentifier
             || previousPlan.memoryTier != currentPlan.memoryTier
             || previousPlan.chunkSize != currentPlan.chunkSize
+            || previousPlan.geometryProcessResolution != currentPlan.geometryProcessResolution
             || previousPlan.cameraGrouping != currentPlan.cameraGrouping
             || previousPlan.lensProjection != currentPlan.lensProjection
             || previousPlan.refinementIterationLimit != currentPlan.refinementIterationLimit
@@ -209,19 +210,16 @@ public enum RunPlanResolver {
             detail: options.detailProfile,
             memoryGB: hardware.memoryGB
         )
-        let route = developmentOverrides.candidateRoute ?? .da3
-        let model = resolvedModel(
-            route: route,
-            detail: options.detailProfile,
-            resourcePolicy: options.resourcePolicy,
-            memoryGB: hardware.memoryGB
-        )
-        let keyframeBudget = resolvedKeyframeBudget(
-            detail: options.detailProfile,
-            capturePath: capturePath,
-            memoryTier: memoryTier,
-            resourcePolicy: options.resourcePolicy
-        )
+        let route = developmentOverrides.candidateRoute ?? .colmap
+        let model = resolvedModel(route: route)
+        let keyframeBudget = route == .da3
+            ? 29
+            : resolvedKeyframeBudget(
+                detail: options.detailProfile,
+                capturePath: capturePath,
+                memoryTier: memoryTier,
+                resourcePolicy: options.resourcePolicy
+            )
         let maximumImageDimension = resolvedMaximumImageDimension(
             detail: options.detailProfile,
             memoryTier: memoryTier,
@@ -240,10 +238,8 @@ public enum RunPlanResolver {
             routeIdentifier: route.rawValue,
             modelIdentifier: model,
             memoryTier: memoryTier.rawValue,
-            chunkSize: resolvedChunkSize(
-                memoryTier: memoryTier,
-                resourcePolicy: options.resourcePolicy
-            ),
+            chunkSize: route == .da3 ? 29 : 0,
+            geometryProcessResolution: route == .da3 ? 336 : 0,
             keyframeBudget: keyframeBudget,
             maximumImageDimension: maximumImageDimension,
             cameraGrouping: cameraGrouping,
@@ -260,9 +256,7 @@ public enum RunPlanResolver {
             colmapExhaustiveBlockSize: colmapBudget.blockSize,
             colmapThreadLimit: colmapBudget.threads,
             requiredToolchainCapabilities: requiredCapabilities(route: route, model: model),
-            fallbackRouteIdentifiers: developmentOverrides.candidateRoute == nil
-                ? [SfmBackend.colmap.rawValue]
-                : [],
+            fallbackRouteIdentifiers: [],
             capturePath: capturePath,
             inputOrdering: inputOrdering,
             photoSelection: options.photoSelection,
@@ -334,34 +328,9 @@ public enum RunPlanResolver {
         }
     }
 
-    private static func resolvedModel(
-        route: SfmBackend,
-        detail: DetailProfile,
-        resourcePolicy: ResourcePolicy,
-        memoryGB: Double
-    ) -> String {
+    private static func resolvedModel(route: SfmBackend) -> String {
         guard route == .da3 else { return "none" }
-        if detail == .fast
-            || resourcePolicy == .conserveMemory
-            || memoryGB <= 16.5
-            || (detail == .highDetail && memoryGB < minimumHighDetailMemoryGB) {
-            return "DA3-SMALL"
-        }
         return "DA3-BASE"
-    }
-
-    private static func resolvedChunkSize(
-        memoryTier: MemoryTier,
-        resourcePolicy: ResourcePolicy
-    ) -> Int {
-        switch memoryTier {
-        case .constrained:
-            return 4
-        case .standard:
-            return 6
-        case .performance:
-            return resourcePolicy == .maximumPerformance ? 10 : 8
-        }
     }
 
     private static func resolvedKeyframeBudget(
