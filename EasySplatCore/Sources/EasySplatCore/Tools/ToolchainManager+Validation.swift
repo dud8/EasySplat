@@ -317,6 +317,7 @@ extension ToolchainManager {
             "patch_sha256",
             "checkpoint_patch_sha256",
             "numeric_stability_patch_sha256",
+            "metal_safety_patch_sha256",
             "dependencies",
             "executable_sha256",
             "metallib_sha256",
@@ -373,6 +374,7 @@ extension ToolchainManager {
             "patch_sha256",
             "checkpoint_patch_sha256",
             "numeric_stability_patch_sha256",
+            "metal_safety_patch_sha256",
             "executable_sha256",
             "metallib_sha256",
         ]

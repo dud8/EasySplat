@@ -9,6 +9,7 @@ OVERLAY="$ROOT/Tools/MsplatNative/msplat.cpp"
 UPSTREAM_PATCH="$ROOT/Tools/MsplatNative/msplat-1.1.3-easysplat.patch"
 CHECKPOINT_PATCH="$ROOT/Tools/MsplatNative/msplat-1.1.3-checkpoint.patch"
 NUMERIC_STABILITY_PATCH="$ROOT/Tools/MsplatNative/msplat-1.1.3-numeric-stability.patch"
+METAL_SAFETY_PATCH="$ROOT/Tools/MsplatNative/msplat-1.1.3-metal-safety.patch"
 FIXTURE_GENERATOR="$ROOT/scripts/ci/generate_msplat_sparse_fixtures.py"
 VALIDATOR="$ROOT/scripts/toolchain/validate_native_msplat.sh"
 INSTALL_DIR="${EASYSPLAT_MSPLAT_INSTALL_DIR:-$ROOT/Toolchains/build/msplat/install/msplat}"
@@ -41,6 +42,7 @@ require_file "$OVERLAY"
 require_file "$UPSTREAM_PATCH"
 require_file "$CHECKPOINT_PATCH"
 require_file "$NUMERIC_STABILITY_PATCH"
+require_file "$METAL_SAFETY_PATCH"
 require_file "$FIXTURE_GENERATOR"
 require_file "$VALIDATOR"
 
@@ -73,6 +75,13 @@ require_contains 'git -C "$SOURCE_DIR" apply --unidiff-zero --check "$NUMERIC_ST
 require_contains 'git -C "$SOURCE_DIR" apply --unidiff-zero "$NUMERIC_STABILITY_PATCH"' "$BUILD_SCRIPT"
 require_contains 'numeric_stability_patch_sha256' "$BUILD_SCRIPT"
 require_contains '"numeric_stability_patch_sha256": "231586b17e4f47c8c55432a631e08bf293b31a92f8d6ec49b367d11632350ec3"' "$VALIDATOR"
+require_contains 'msplat-1.1.3-metal-safety.patch' "$BUILD_SCRIPT"
+require_contains 'METAL_SAFETY_PATCH_SHA256="5d3dfff3edcbca940d37f6ee3145c76c678ebd36ebc03016cfd5dab78e1d45ac"' "$BUILD_SCRIPT"
+require_contains '[ "$(sha256 "$METAL_SAFETY_PATCH")" = "$METAL_SAFETY_PATCH_SHA256" ]' "$BUILD_SCRIPT"
+require_contains 'git -C "$SOURCE_DIR" apply --unidiff-zero --check "$METAL_SAFETY_PATCH"' "$BUILD_SCRIPT"
+require_contains 'git -C "$SOURCE_DIR" apply --unidiff-zero "$METAL_SAFETY_PATCH"' "$BUILD_SCRIPT"
+require_contains 'metal_safety_patch_sha256' "$BUILD_SCRIPT"
+require_contains '"metal_safety_patch_sha256": "5d3dfff3edcbca940d37f6ee3145c76c678ebd36ebc03016cfd5dab78e1d45ac"' "$VALIDATOR"
 require_contains 'python3 - "$build_info"' "$BUILD_SCRIPT"
 require_contains 'json.dump(payload, output, indent=2, sort_keys=True)' "$BUILD_SCRIPT"
 require_contains 'json.load(source, parse_constant=reject_constant)' "$BUILD_SCRIPT"
@@ -165,6 +174,13 @@ require_contains 'float g = isfinite(grad) ? clamp(grad, -1.0e10f, 1.0e10f) : 0.
 require_contains 'if (isfinite(candidate)) param = candidate;' "$NUMERIC_STABILITY_PATCH"
 require_contains 'float gradient_norm = sqrt(gx * gx + gy * gy);' "$NUMERIC_STABILITY_PATCH"
 require_contains 'if (isfinite(gradient_norm)) xys_grad_norm[idx] += gradient_norm;' "$NUMERIC_STABILITY_PATCH"
+require_contains 'std::shared_ptr<GPUStorage> _gpu_storage;' "$METAL_SAFETY_PATCH"
+require_contains 'throw std::out_of_range("MTensor::view exceeds dimension zero")' "$METAL_SAFETY_PATCH"
+require_contains 'packed_intersection_capacity' "$METAL_SAFETY_PATCH"
+require_contains 'num_tiles) * static_cast<uint64_t>(kMaxTileElements)' "$METAL_SAFETY_PATCH"
+require_contains 'std::numeric_limits<int32_t>::max()' "$METAL_SAFETY_PATCH"
+require_contains 'clamp(input[i], 0, MAX_TILE_ELEMS)' "$METAL_SAFETY_PATCH"
+require_contains 'ENC_SCALAR(enc, capacity_u32, 13)' "$METAL_SAFETY_PATCH"
 require_contains 'validateBinaryPly' "$OVERLAY"
 require_contains 'if (handleCancellation()) return 130' "$OVERLAY"
 
@@ -342,14 +358,15 @@ set -e
 [ ! -s "$negative_dir/truncated-ply.stdout" ] || fail "truncated PLY emitted a false success event"
 grep -qi 'payload' "$negative_dir/truncated-ply.stderr" || fail "truncated PLY diagnostic is not useful"
 
-for key in source_commit source_version source_url source_tree_sha256 overlay_sha256 patch_sha256 checkpoint_patch_sha256 numeric_stability_patch_sha256 executable_sha256 metallib_sha256 compiler deployment_target cmake_arguments build_timestamp; do
+for key in source_commit source_version source_url source_tree_sha256 overlay_sha256 patch_sha256 checkpoint_patch_sha256 numeric_stability_patch_sha256 metal_safety_patch_sha256 executable_sha256 metallib_sha256 compiler deployment_target cmake_arguments build_timestamp; do
   require_contains "\"$key\"" "$BUILD_INFO"
 done
 overlay_hash="$(shasum -a 256 "$OVERLAY" | awk '{print $1}')"
 numeric_stability_patch_hash="$(shasum -a 256 "$NUMERIC_STABILITY_PATCH" | awk '{print $1}')"
+metal_safety_patch_hash="$(shasum -a 256 "$METAL_SAFETY_PATCH" | awk '{print $1}')"
 exe_hash="$(shasum -a 256 "$BIN" | awk '{print $1}')"
 metallib_hash="$(shasum -a 256 "$METALLIB" | awk '{print $1}')"
-python3 - "$BUILD_INFO" "$overlay_hash" "$numeric_stability_patch_hash" "$exe_hash" "$metallib_hash" <<'PY'
+python3 - "$BUILD_INFO" "$overlay_hash" "$numeric_stability_patch_hash" "$metal_safety_patch_hash" "$exe_hash" "$metallib_hash" <<'PY'
 import json
 import sys
 
@@ -365,8 +382,9 @@ expected = {
     "source_version": "1.1.3",
     "overlay_sha256": sys.argv[2],
     "numeric_stability_patch_sha256": sys.argv[3],
-    "executable_sha256": sys.argv[4],
-    "metallib_sha256": sys.argv[5],
+    "metal_safety_patch_sha256": sys.argv[4],
+    "executable_sha256": sys.argv[5],
+    "metallib_sha256": sys.argv[6],
 }
 for key, value in expected.items():
     if payload.get(key) != value:
@@ -407,7 +425,8 @@ PY
 validate_training_events() {
   local jsonl="$1"
   local expected_points="$2"
-  python3 - "$jsonl" "$expected_points" <<'PY'
+  local metal_pipeline_stress="$3"
+  python3 - "$jsonl" "$expected_points" "$metal_pipeline_stress" <<'PY'
 import json
 import math
 import sys
@@ -433,6 +452,7 @@ for index, record in enumerate(records, start=1):
 started = records[0]
 completed = records[-1]
 expected_points = int(sys.argv[2])
+metal_pipeline_stress = sys.argv[3] == "true"
 if started.get("event") != "started" or completed.get("event") != "completed":
     raise SystemExit("training event stream has invalid boundaries")
 if started.get("initial_gaussian_count") != expected_points:
@@ -478,6 +498,11 @@ for record in memory_records:
     peak_memory_values.append(peak_memory_bytes)
 if peak_memory_values != sorted(peak_memory_values):
     raise SystemExit("peak resident memory decreased within one process")
+if metal_pipeline_stress and peak_memory_values[-1] > 512 * 1024 * 1024:
+    raise SystemExit(
+        "Metal pipeline stress exceeded the 512 MiB resident-memory ceiling: "
+        f"{peak_memory_values[-1]} bytes"
+    )
 if sum(record.get("event") == "completed" for record in records) != 1:
     raise SystemExit("training emitted multiple completion records")
 PY
@@ -504,14 +529,19 @@ if len(stress) != 1:
 fixture = stress[0]
 if fixture.get("resolution") != [320, 180] or fixture.get("point_count") != 1279:
     raise SystemExit("numeric-stability stress fixture contract changed")
+metal_stress = [
+    fixture for fixture in manifest["fixtures"] if fixture.get("metal_pipeline_stress")
+]
+if metal_stress != stress:
+    raise SystemExit("Metal pipeline stress must use the numeric-stability fixture")
 PY
 fixture_count=0
-while IFS=$'\t' read -r fixture_name expected_points; do
+while IFS=$'\t' read -r fixture_name expected_points metal_pipeline_stress; do
   fixture_count=$((fixture_count + 1))
   training_fixture="$fixture_root/$fixture_name"
   training_dir="$negative_dir/training-$fixture_name"
   validation_environment=(env)
-  if [ "$fixture_count" = "1" ]; then
+  if [ "$metal_pipeline_stress" = "true" ]; then
     validation_environment=(
       env
       MTL_DEBUG_LAYER=1
@@ -533,14 +563,15 @@ while IFS=$'\t' read -r fixture_name expected_points; do
     sed -n '1,200p' "$training_dir/stderr.log" >&2
     fail "$fixture_name training failed"
   fi
-  if [ "$fixture_count" = "1" ] &&
+  if [ "$metal_pipeline_stress" = "true" ] &&
      grep -Eqi 'shader validation|invalid (device|threadgroup|texture)|validation (error|fault)|gpu fault' \
        "$training_dir/stderr.log"; then
     sed -n '1,200p' "$training_dir/stderr.log" >&2
     fail "$fixture_name emitted Metal validation diagnostics"
   fi
   validate_jsonl "$training_dir/events.jsonl"
-  validate_training_events "$training_dir/events.jsonl" "$expected_points"
+  validate_training_events \
+    "$training_dir/events.jsonl" "$expected_points" "$metal_pipeline_stress"
   [ -s "$training_dir/splat.ply" ] || fail "Fast-profile training did not atomically publish a nonempty PLY"
   "$BIN" --validate-ply "$training_dir/splat.ply" --events-fd 1 \
     >"$training_dir/validation.jsonl" 2>"$training_dir/validation.stderr"
@@ -555,7 +586,8 @@ from pathlib import Path
 
 manifest = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
 for fixture in manifest["fixtures"]:
-    print(f'{fixture["dataset"]}\t{fixture["point_count"]}')
+    metal_stress = "true" if fixture.get("metal_pipeline_stress") else "false"
+    print(f'{fixture["dataset"]}\t{fixture["point_count"]}\t{metal_stress}')
 PY
 )
 [ "$fixture_count" = "12" ] || fail "sparse fixture generator did not produce twelve cases"

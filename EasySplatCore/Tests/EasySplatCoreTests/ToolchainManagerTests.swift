@@ -193,7 +193,11 @@ final class ToolchainManagerTests: XCTestCase {
     }
 
     func testValidateToolchainRequiresPatchProvenance() throws {
-        for key in ["checkpoint_patch_sha256", "numeric_stability_patch_sha256"] {
+        for key in [
+            "checkpoint_patch_sha256",
+            "numeric_stability_patch_sha256",
+            "metal_safety_patch_sha256",
+        ] {
             for mutation in ["missing", "malformed"] {
                 let root = try TestFileBuilder.makeTempDir()
                 defer { try? FileManager.default.removeItem(at: root) }

@@ -1,0 +1,184 @@
+diff --git a/core/include/metal_tensor.hpp b/core/include/metal_tensor.hpp
+index 4d2446c..39342ff 100644
+--- a/core/include/metal_tensor.hpp
++++ b/core/include/metal_tensor.hpp
+@@ -7,0 +8 @@
++#include <memory>
+@@ -49,2 +50,14 @@ public:
+-        _buffer = (__bridge_retained void*)buf;
+-        _data = [buf contents];  // cache CPU-accessible pointer for C++ access
++        if (!buf) throw std::bad_alloc();
++#if __has_feature(objc_arc)
++        void *retainedBuffer = (__bridge_retained void*)buf;
++#else
++        void *retainedBuffer = (void*)buf;
++#endif
++        auto *storage = new GPUStorage {
++            retainedBuffer,
++            [buf contents],
++        };
++        _gpu_storage = std::shared_ptr<GPUStorage>(storage, [](GPUStorage *value) {
++            if (value->buffer) CFRelease(value->buffer);
++            delete value;
++        });
+@@ -53 +66,5 @@ public:
+-    id<MTLBuffer> buffer() const { return (__bridge id<MTLBuffer>)_buffer; }
++    id<MTLBuffer> buffer() const {
++        return _gpu_storage
++            ? (__bridge id<MTLBuffer>)_gpu_storage->buffer
++            : nil;
++    }
+@@ -65,2 +82,2 @@ public:
+-    bool defined() const { return _buffer != nullptr || !_cpu_data.empty(); }
+-    bool isGpu() const { return _buffer != nullptr; }
++    bool defined() const { return _gpu_storage != nullptr || !_cpu_data.empty(); }
++    bool isGpu() const { return _gpu_storage != nullptr; }
+@@ -80 +97 @@ public:
+-        if (_data) return _data;
++        if (_gpu_storage) return _gpu_storage->data;
+@@ -84 +101 @@ public:
+-        if (_data) return _data;
++        if (_gpu_storage) return _gpu_storage->data;
+@@ -103,5 +120 @@ public:
+-#ifdef __OBJC__
+-        if (_buffer) { CFRelease(_buffer); }
+-#endif
+-        _buffer = nullptr;
+-        _data = nullptr;
++        _gpu_storage.reset();
+@@ -122,3 +135 @@ public:
+-    // WARNING: Non-owning — shares the underlying MTLBuffer without retaining it.
+-    // The caller MUST ensure the parent MTensor outlives all views.
+-    // Use-after-free if the parent is destroyed while a view exists.
++    // GPU views share ownership of the underlying MTLBuffer.
+@@ -125,0 +137,6 @@ public:
++        if (!_gpu_storage) {
++            throw std::invalid_argument("MTensor::view requires GPU storage");
++        }
++        if (_shape.empty() || n < 0 || n > _shape[0]) {
++            throw std::out_of_range("MTensor::view exceeds dimension zero");
++        }
+@@ -127,2 +144 @@ public:
+-        v._buffer = _buffer;  // shares the buffer (non-owning)
+-        v._data = _data;      // shares the CPU-accessible pointer
++        v._gpu_storage = _gpu_storage;
+@@ -137,2 +153,6 @@ private:
+-    void* _buffer = nullptr;  // retained id<MTLBuffer> as void*
+-    void* _data = nullptr;    // cached CPU-accessible pointer (shared memory on Apple Silicon)
++    struct GPUStorage {
++        void *buffer;
++        void *data;
++    };
++
++    std::shared_ptr<GPUStorage> _gpu_storage;
+diff --git a/core/metal/msplat_metal.metal b/core/metal/msplat_metal.metal
+index 9a7be47..190b776 100644
+--- a/core/metal/msplat_metal.metal
++++ b/core/metal/msplat_metal.metal
+@@ -2091,0 +2092,2 @@ kernel void bitonic_sort_per_tile_kernel(
++    constant uint& output_capacity      [[buffer(13)]],
++    device atomic_uint* overflow_flag   [[buffer(14)]],
+@@ -2101,0 +2104,8 @@ kernel void bitonic_sort_per_tile_kernel(
++    if (start < 0 || end < start || (uint)end > output_capacity) {
++        if (tid == 0) {
++            write_packed_int2(tile_bins, tg_id, int2(0));
++            atomic_store_explicit(overflow_flag, 1u, memory_order_relaxed);
++        }
++        return;
++    }
++
+@@ -2342 +2352 @@ kernel void prefix_sum_kernel(
+-        my_sum += input[i];
++        my_sum += clamp(input[i], 0, MAX_TILE_ELEMS);
+@@ -2374 +2384 @@ kernel void prefix_sum_kernel(
+-        running += input[i];
++        running += clamp(input[i], 0, MAX_TILE_ELEMS);
+diff --git a/core/metal/msplat_metal.mm b/core/metal/msplat_metal.mm
+index 7adf860..2763c99 100644
+--- a/core/metal/msplat_metal.mm
++++ b/core/metal/msplat_metal.mm
+@@ -15,0 +16 @@
++#include <limits>
+@@ -390,0 +392,13 @@ void msplat_drain_stage_times(std::vector<double> stage_times[], int max_stages,
++static constexpr int64_t kMaxTileElements = 2048;
++
++static uint32_t packed_intersection_capacity(int num_tiles) {
++    if (num_tiles <= 0) {
++        throw std::runtime_error("msplat: raster grid has no tiles");
++    }
++    const uint64_t capacity =
++        static_cast<uint64_t>(num_tiles) * static_cast<uint64_t>(kMaxTileElements);
++    if (capacity > static_cast<uint64_t>(std::numeric_limits<int32_t>::max())) {
++        throw std::runtime_error("msplat: raster intersection capacity exceeds int32 offsets");
++    }
++    return static_cast<uint32_t>(capacity);
++}
+@@ -396 +410,2 @@ struct FusedTensorCache {
+-    int fwd_num_points = 0, capacity = 0, img_height = 0, img_width = 0, num_tiles = 0;
++    int fwd_num_points = 0, img_height = 0, img_width = 0, num_tiles = 0;
++    int64_t capacity = 0;
+@@ -417,2 +431,0 @@ struct FusedTensorCache {
+-    int64_t capacity_multiplier = 16;
+-
+@@ -467 +480 @@ struct FusedTensorCache {
+-            prealloc_bins = mtensor_empty(dev, {(int64_t)nt * 2048}, DType::Int64);
++            prealloc_bins = mtensor_empty(dev, {(int64_t)nt * kMaxTileElements}, DType::Int64);
+@@ -590,2 +603,2 @@ static void forward_pipeline(
+-            fprintf(stderr, "WARNING: per-tile overflow (>2048 gaussians in a tile). "
+-                    "Some gaussians were dropped from overfull tiles.\n");
++            fprintf(stderr, "WARNING: raster intersection limit exceeded. "
++                    "Some intersections were dropped.\n");
+@@ -595 +608,2 @@ static void forward_pipeline(
+-    int64_t capacity = (int64_t)num_points * g_tcache.capacity_multiplier;
++    const uint32_t capacity_u32 = packed_intersection_capacity(num_tiles);
++    const int64_t capacity = capacity_u32;
+@@ -629,2 +642,0 @@ static void forward_pipeline(
+-    uint32_t capacity_u32 = (uint32_t)capacity;
+-    uint32_t prefix_N = (uint32_t)num_points;
+@@ -640 +652 @@ static void forward_pipeline(
+-            fprintf(stderr, "  capacity:       %lld (= num_points * %lld)\n", (long long)capacity, (long long)g_tcache.capacity_multiplier);
++            fprintf(stderr, "  capacity:       %lld (= num_tiles * %lld)\n", (long long)capacity, (long long)kMaxTileElements);
+@@ -709,0 +722 @@ static void forward_pipeline(
++            ENC_SCALAR(enc, capacity_u32, 13); ENC_BUF(enc, g_tcache.overflow_flag, 14);
+@@ -797,5 +810,2 @@ static void forward_pipeline(
+-    // Compute K_max conservatively from CPU-side data (no GPU sync needed).
+-    // avg_per_tile = capacity / num_tiles. Use 6x average to cover heavy-tailed
+-    // tile distributions. Overestimate is cheap: empty chunks early-exit immediately.
+-    // If the densest tile exceeds K_max * CHUNK_SIZE, those gaussians are silently
+-    // skipped — but 6x covers typical skew (measured max/avg ratio: ~1.5-2.5x).
++    // Every tile is capped at kMaxTileElements before the prefix sum. Low-resolution
++    // chunking therefore needs exactly enough chunks for that hard per-tile bound.
+@@ -806,6 +816,3 @@ static void forward_pipeline(
+-        uint32_t avg_per_tile = (uint32_t)(capacity / std::max(1, num_tiles));
+-        uint32_t conservative_max = avg_per_tile * 6;  // 6x average — covers heavy-tailed distributions
+-        K_max = (conservative_max + CHUNK_SIZE - 1) / CHUNK_SIZE;
+-        if (K_max < 2) K_max = 2;
+-        uint32_t abs_max = (uint32_t)((capacity + CHUNK_SIZE - 1) / CHUNK_SIZE);
+-        if (K_max > abs_max) K_max = abs_max;
++        K_max = static_cast<uint32_t>(
++            (kMaxTileElements + CHUNK_SIZE - 1) / CHUNK_SIZE
++        );
+@@ -905,2 +912,2 @@ std::tuple<MTensor, float> msplat_train_step(
+-            fprintf(stderr, "WARNING: per-tile overflow (>2048 gaussians in a tile). "
+-                    "Some gaussians were dropped from overfull tiles.\n");
++            fprintf(stderr, "WARNING: raster intersection limit exceeded. "
++                    "Some intersections were dropped.\n");
+@@ -910 +917,2 @@ std::tuple<MTensor, float> msplat_train_step(
+-    int64_t capacity = (int64_t)num_points * g_tcache.capacity_multiplier;
++    const uint32_t capacity_u32 = packed_intersection_capacity(num_tiles);
++    const int64_t capacity = capacity_u32;
+@@ -961,2 +968,0 @@ std::tuple<MTensor, float> msplat_train_step(
+-    uint32_t capacity_u32 = (uint32_t)capacity;
+-    uint32_t prefix_N = (uint32_t)num_points;
+@@ -979,6 +985,3 @@ std::tuple<MTensor, float> msplat_train_step(
+-        uint32_t avg_per_tile = (uint32_t)(capacity / std::max(1, num_tiles));
+-        uint32_t conservative_max = avg_per_tile * 6;
+-        K_max = (conservative_max + CHUNK_SIZE - 1) / CHUNK_SIZE;
+-        if (K_max < 2) K_max = 2;
+-        uint32_t abs_max = (uint32_t)((capacity + CHUNK_SIZE - 1) / CHUNK_SIZE);
+-        if (K_max > abs_max) K_max = abs_max;
++        K_max = static_cast<uint32_t>(
++            (kMaxTileElements + CHUNK_SIZE - 1) / CHUNK_SIZE
++        );
+@@ -1052,0 +1056 @@ std::tuple<MTensor, float> msplat_train_step(
++            ENC_SCALAR(enc, capacity_u32, 13); ENC_BUF(enc, g_tcache.overflow_flag, 14);

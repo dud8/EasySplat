@@ -153,6 +153,7 @@ def generate(root: Path) -> None:
         sparse.mkdir(parents=True)
         camera_count = 4 + case_index % 5
         numeric_stability_stress = case_index == 10
+        metal_pipeline_stress = case_index == 10
         width, height = (320, 180) if numeric_stability_stress else (32, 32)
         for image_index in range(camera_count):
             write_png(
@@ -169,6 +170,7 @@ def generate(root: Path) -> None:
                 "camera_count": camera_count,
                 "dataset": name,
                 "layout": layout,
+                "metal_pipeline_stress": metal_pipeline_stress,
                 "numeric_stability_stress": numeric_stability_stress,
                 "point_count": count,
                 "resolution": [width, height],
