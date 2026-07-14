@@ -142,7 +142,7 @@ class Da3RunTests(unittest.TestCase):
         self.assertIn("pillow==12.2.0", lines)
         self.assertIn("safetensors==0.7.0", lines)
         self.assertIn("huggingface_hub==1.14.0", lines)
-        self.assertIn("transformers==5.8.1", lines)
+        self.assertNotIn("transformers==5.8.1", lines)
         self.assertIn("einops==0.8.2", lines)
         self.assertIn("omegaconf==2.3.0", lines)
         self.assertIn("pycolmap==3.13.0", lines)
@@ -155,6 +155,7 @@ class Da3RunTests(unittest.TestCase):
             self.assertIn(f"{normalized}=={version} \\", lock)
         self.assertIn("antlr4-python3-runtime==4.9.3 \\", lock)
         self.assertNotIn("opencv-python-headless", lock)
+        self.assertNotIn("transformers==", lock)
         self.assertNotIn("==unknown", lock)
         self.assertGreaterEqual(lock.count("--hash=sha256:"), len(lines) + 1)
 
