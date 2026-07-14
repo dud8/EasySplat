@@ -172,6 +172,20 @@ public final class PipelineRunner: @unchecked Sendable {
             ))
         }
 
+        var shouldResetInterruptedMatching = wasInterrupted
+            && metadataForResumeValidation.checkpoint?.stage == .sfmMatching
+
+        func resetInterruptedMatchingIfNeeded() throws {
+            guard shouldResetInterruptedMatching else { return }
+            try ColmapDatabaseMatchStore.clearMatchingResults(at: paths.colmapDatabaseURL)
+            shouldResetInterruptedMatching = false
+            emit(.stageLog(
+                stage: .sfmMatching,
+                line: "Discarded partial image matches before resuming reconstruction.",
+                isError: false
+            ))
+        }
+
         func stageIndex(_ stage: PipelineStage) -> Int {
             PipelineStage.allCases.firstIndex(of: stage) ?? 0
         }
@@ -876,6 +890,7 @@ public final class PipelineRunner: @unchecked Sendable {
                                 }
                             )
                             self.logKeypointStats(database: paths.colmapDatabaseURL, stage: .sfmMatching, emit: emit)
+                            try resetInterruptedMatchingIfNeeded()
 
                             let seedManifest = try readDa3CoverageManifest(required: true)
                             guard let localPairs = seedManifest?.boundedMatchPairs,
@@ -1147,6 +1162,7 @@ public final class PipelineRunner: @unchecked Sendable {
                         processedPairs: 0
                     ))
                 )
+                try resetInterruptedMatchingIfNeeded()
                 emit(.stageLog(
                     stage: .sfmMatching,
                     line: colmapMatchOptions.useGPU ? "Using GPU for COLMAP matching." : "Using CPU for COLMAP matching.",

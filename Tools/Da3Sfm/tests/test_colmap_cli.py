@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import contextlib
 import io
+import sys
 import tempfile
 import types
 import unittest
@@ -16,7 +17,36 @@ from easysplat_da3_sfm import colmap_cli
 class _Options:
     def __init__(self) -> None:
         self.sift = types.SimpleNamespace()
-        self.solver_options = types.SimpleNamespace()
+
+
+class _SolverOptions:
+    __slots__ = ("max_num_iterations",)
+
+    def __init__(self) -> None:
+        self.max_num_iterations = 100
+
+
+class _CeresBundleAdjustmentOptions:
+    __slots__ = ("use_gpu", "solver_options")
+
+    def __init__(self) -> None:
+        self.use_gpu = False
+        self.solver_options = _SolverOptions()
+
+
+class _BundleAdjustmentOptions:
+    __slots__ = (
+        "refine_focal_length",
+        "refine_principal_point",
+        "refine_extra_params",
+        "ceres",
+    )
+
+    def __init__(self) -> None:
+        self.refine_focal_length = True
+        self.refine_principal_point = False
+        self.refine_extra_params = True
+        self.ceres = _CeresBundleAdjustmentOptions()
 
 
 class _Image:
@@ -31,26 +61,10 @@ class _Database:
             "later.jpg": _Image(9, "later.jpg"),
             "earlier.jpg": _Image(3, "earlier.jpg"),
         }
-        self.descriptors = {
-            9: np.array([[1, 0], [0, 1]], dtype=np.uint8),
-            3: np.array([[1, 0], [1, 1]], dtype=np.uint8),
-        }
-        self.writes: list[tuple[int, int, np.ndarray]] = []
         self.closed = False
 
     def read_image_with_name(self, name: str) -> _Image | None:
         return self.images.get(name)
-
-    def read_descriptors(self, image_id: int) -> np.ndarray:
-        return self.descriptors[image_id]
-
-    def write_matches(
-        self, image_id1: int, image_id2: int, matches: np.ndarray
-    ) -> None:
-        self.writes.append((image_id1, image_id2, matches.copy()))
-
-    def exists_matches(self, image_id1: int, image_id2: int) -> bool:
-        return False
 
     def close(self) -> None:
         self.closed = True
@@ -88,53 +102,19 @@ class _FeatureDatabase:
         self.closed = True
 
 
-def _reference_match_descriptors(
-    descriptors1: np.ndarray,
-    descriptors2: np.ndarray,
-    *,
-    max_ratio: float,
-    max_distance: float,
-    cross_check: bool,
-    max_num_matches: int,
-) -> np.ndarray:
-    first = colmap_cli._normalized_descriptors(descriptors1)
-    second = colmap_cli._normalized_descriptors(descriptors2)
-
-    def ratio_matches(
-        queries: np.ndarray, candidates: np.ndarray
-    ) -> dict[int, tuple[int, float]]:
-        if queries.shape[0] == 0 or candidates.shape[0] < 2:
-            return {}
-        distances = np.linalg.norm(
-            queries[:, np.newaxis, :] - candidates[np.newaxis, :, :], axis=2
-        )
-        accepted: dict[int, tuple[int, float]] = {}
-        candidate_indices = np.arange(candidates.shape[0])
-        for query_index, row in enumerate(distances):
-            order = np.lexsort((candidate_indices, row))
-            best, runner_up = order[:2]
-            if row[best] > max_distance or row[best] >= max_ratio * row[runner_up]:
-                continue
-            accepted[query_index] = (int(best), float(row[best]))
-        return accepted
-
-    forward = ratio_matches(first, second)
-    reverse = ratio_matches(second, first) if cross_check else {}
-    matches = [
-        (query, train, distance)
-        for query, (train, distance) in forward.items()
-        if not cross_check or reverse.get(train, (-1, 0.0))[0] == query
-    ]
-    matches.sort(key=lambda match: (match[2], match[0], match[1]))
-    if not matches:
-        return np.empty((0, 2), dtype=np.uint32)
-    return np.asarray(
-        [(query, train) for query, train, _ in matches[:max_num_matches]],
-        dtype=np.uint32,
-    )
-
-
 class ColmapCliTests(unittest.TestCase):
+    def test_runtime_requires_reviewed_pycolmap_release(self) -> None:
+        reviewed = types.SimpleNamespace(__version__="4.1.0")
+        with mock.patch.dict(sys.modules, {"pycolmap": reviewed}):
+            self.assertIs(colmap_cli._load_pycolmap(), reviewed)
+
+        stale = types.SimpleNamespace(__version__="3.13.0")
+        with (
+            mock.patch.dict(sys.modules, {"pycolmap": stale}),
+            self.assertRaisesRegex(colmap_cli.ColmapCliError, "4.1.0 is required"),
+        ):
+            colmap_cli._load_pycolmap()
+
     def test_help_probes_do_not_import_pycolmap(self) -> None:
         for argv in (["-h"], ["--help"], ["mapper", "-h"]):
             stdout = io.StringIO()
@@ -350,180 +330,57 @@ class ColmapCliTests(unittest.TestCase):
 
         self.assertTrue(database.closed)
 
-    def test_matches_importer_matches_only_listed_pairs_and_preserves_indices(
+    def test_matches_importer_delegates_pair_schedule_and_matcher_mode_to_colmap(
         self,
     ) -> None:
-        database = _Database()
-        verify_calls: list[tuple[str, str]] = []
+        for brute_force in ("0", "1"):
+            with self.subTest(brute_force=brute_force):
+                database = _Database()
+                calls: list[dict[str, object]] = []
 
-        class DatabaseFactory:
-            @staticmethod
-            def open(path: str) -> _Database:
-                self.assertEqual(path, "/tmp/database.db")
-                return database
+                class DatabaseFactory:
+                    @staticmethod
+                    def open(path: str) -> _Database:
+                        self.assertEqual(path, "/tmp/database.db")
+                        return database
 
-        pycolmap = types.SimpleNamespace(
-            Database=DatabaseFactory,
-            FeatureMatchingOptions=_Options,
-            TwoViewGeometryOptions=_Options,
-            verify_matches=lambda database_path, pairs_path, options: (
-                verify_calls.append((database_path, pairs_path))
-            ),
-        )
-        with tempfile.TemporaryDirectory() as temp_dir:
-            pairs = Path(temp_dir) / "pairs.txt"
-            pairs.write_text("later.jpg earlier.jpg\n", encoding="utf-8")
-            colmap_cli.run_command(
-                "matches_importer",
-                {
-                    "database_path": "/tmp/database.db",
-                    "match_list_path": str(pairs),
-                    "match_type": "pairs",
-                    "FeatureMatching.max_num_matches": "64",
-                    "FeatureMatching.num_threads": "2",
-                    "FeatureMatching.use_gpu": "0",
-                    "SiftMatching.cpu_brute_force_matcher": "1",
-                },
-                pycolmap_module=pycolmap,
-            )
+                pycolmap = types.SimpleNamespace(
+                    Device=types.SimpleNamespace(cpu="cpu"),
+                    Database=DatabaseFactory,
+                    FeatureMatchingOptions=_Options,
+                    ImportedPairingOptions=_Options,
+                    TwoViewGeometryOptions=_Options,
+                    match_image_pairs=lambda *args, **kwargs: calls.append(kwargs),
+                )
+                with tempfile.TemporaryDirectory() as temp_dir:
+                    pairs = Path(temp_dir) / "pairs.txt"
+                    pairs.write_text("later.jpg earlier.jpg\n", encoding="utf-8")
+                    colmap_cli.run_command(
+                        "matches_importer",
+                        {
+                            "database_path": "/tmp/database.db",
+                            "match_list_path": str(pairs),
+                            "match_type": "pairs",
+                            "FeatureMatching.max_num_matches": "64",
+                            "FeatureMatching.num_threads": "2",
+                            "FeatureMatching.use_gpu": "0",
+                            "SiftMatching.cpu_brute_force_matcher": brute_force,
+                        },
+                        pycolmap_module=pycolmap,
+                    )
 
-        self.assertTrue(database.closed)
-        self.assertEqual(verify_calls, [("/tmp/database.db", str(pairs))])
-        self.assertEqual(len(database.writes), 1)
-        image_id1, image_id2, matches = database.writes[0]
-        self.assertEqual((image_id1, image_id2), (3, 9))
-        np.testing.assert_array_equal(matches, np.array([[0, 0]], dtype=np.uint32))
-
-    def test_matches_importer_preserves_existing_pairs_and_matches_only_missing_pairs(
-        self,
-    ) -> None:
-        class MixedDatabase(_Database):
-            def __init__(self) -> None:
-                super().__init__()
-                self.images["new.jpg"] = _Image(5, "new.jpg")
-                self.descriptors[5] = np.array([[1, 0], [1, 1]], dtype=np.uint8)
-                self.exists_calls: list[tuple[int, int]] = []
-                self.descriptor_reads: list[int] = []
-
-            def exists_matches(self, image_id1: int, image_id2: int) -> bool:
-                self.exists_calls.append((image_id1, image_id2))
-                return (image_id1, image_id2) == (3, 9)
-
-            def read_descriptors(self, image_id: int) -> np.ndarray:
-                self.descriptor_reads.append(image_id)
-                return super().read_descriptors(image_id)
-
-        database = MixedDatabase()
-        verify_calls: list[tuple[str, str]] = []
-
-        class DatabaseFactory:
-            @staticmethod
-            def open(path: str) -> MixedDatabase:
-                self.assertEqual(path, "/tmp/database.db")
-                return database
-
-        pycolmap = types.SimpleNamespace(
-            Database=DatabaseFactory,
-            FeatureMatchingOptions=_Options,
-            TwoViewGeometryOptions=_Options,
-            verify_matches=lambda database_path, pairs_path, options: (
-                verify_calls.append((database_path, pairs_path))
-            ),
-        )
-        with tempfile.TemporaryDirectory() as temp_dir:
-            pairs = Path(temp_dir) / "pairs.txt"
-            pairs.write_text(
-                "later.jpg earlier.jpg\nlater.jpg new.jpg\n",
-                encoding="utf-8",
-            )
-            colmap_cli.run_command(
-                "matches_importer",
-                {
-                    "database_path": "/tmp/database.db",
-                    "match_list_path": str(pairs),
-                    "match_type": "pairs",
-                },
-                pycolmap_module=pycolmap,
-            )
-
-        self.assertTrue(database.closed)
-        self.assertEqual(database.exists_calls, [(3, 9), (5, 9)])
-        self.assertEqual(database.descriptor_reads, [9, 5])
-        self.assertEqual(len(database.writes), 1)
-        image_id1, image_id2, matches = database.writes[0]
-        self.assertEqual((image_id1, image_id2), (5, 9))
-        np.testing.assert_array_equal(matches, np.array([[0, 0]], dtype=np.uint32))
-        self.assertEqual(verify_calls, [("/tmp/database.db", str(pairs))])
-
-    def test_numpy_matcher_matches_full_matrix_reference_across_chunks(self) -> None:
-        rng = np.random.default_rng(42)
-        first = rng.integers(0, 256, size=(37, 32), dtype=np.uint8)
-        second = rng.integers(0, 256, size=(43, 32), dtype=np.uint8)
-        arguments = {
-            "max_ratio": 0.97,
-            "max_distance": 1.2,
-            "cross_check": True,
-            "max_num_matches": 11,
-        }
-
-        expected = _reference_match_descriptors(first, second, **arguments)
-        actual = colmap_cli._match_descriptors(
-            first,
-            second,
-            **arguments,
-            working_memory_bytes=768,
-        )
-
-        np.testing.assert_array_equal(actual, expected)
-
-    def test_numpy_matcher_handles_empty_and_single_candidate_inputs(self) -> None:
-        descriptors = np.array([[1, 0], [0, 1]], dtype=np.uint8)
-        empty = np.empty((0, 2), dtype=np.uint8)
-        one = np.array([[1, 0]], dtype=np.uint8)
-        arguments = {
-            "max_ratio": 0.8,
-            "max_distance": 0.7,
-            "cross_check": True,
-            "max_num_matches": 64,
-        }
-
-        for first, second in (
-            (empty, descriptors),
-            (descriptors, empty),
-            (descriptors, one),
-        ):
-            with self.subTest(shape1=first.shape, shape2=second.shape):
-                matches = colmap_cli._match_descriptors(first, second, **arguments)
-                self.assertEqual(matches.shape, (0, 2))
-                self.assertEqual(matches.dtype, np.uint32)
-
-    def test_numpy_matcher_bounds_each_distance_block(self) -> None:
-        rng = np.random.default_rng(7)
-        first = rng.normal(size=(257, 24)).astype(np.float32)
-        second = rng.normal(size=(263, 24)).astype(np.float32)
-        working_memory_bytes = 4096
-        calls: list[tuple[int, int]] = []
-        real_matmul = np.matmul
-
-        def recording_matmul(left: np.ndarray, right: np.ndarray) -> np.ndarray:
-            calls.append((left.shape[0], right.shape[1]))
-            return real_matmul(left, right)
-
-        with mock.patch.object(colmap_cli.np, "matmul", side_effect=recording_matmul):
-            colmap_cli._match_descriptors(
-                first,
-                second,
-                max_ratio=0.99,
-                max_distance=2.0,
-                cross_check=False,
-                max_num_matches=300,
-                working_memory_bytes=working_memory_bytes,
-            )
-
-        self.assertGreater(len(calls), 1)
-        self.assertTrue(
-            all(rows * columns * 12 <= working_memory_bytes for rows, columns in calls)
-        )
+                self.assertTrue(database.closed)
+                self.assertEqual(len(calls), 1)
+                call = calls[0]
+                self.assertEqual(call["database_path"], "/tmp/database.db")
+                self.assertEqual(call["device"], "cpu")
+                self.assertEqual(call["pairing_options"].match_list_path, str(pairs))
+                self.assertEqual(call["matching_options"].num_threads, 2)
+                self.assertEqual(call["matching_options"].max_num_matches, 64)
+                self.assertEqual(
+                    call["matching_options"].sift.cpu_brute_force_matcher,
+                    brute_force == "1",
+                )
 
     def test_model_analyzer_rejects_nonfinite_residuals_with_observations(self) -> None:
         class Reconstruction:
@@ -720,7 +577,7 @@ class ColmapCliTests(unittest.TestCase):
         pycolmap = types.SimpleNamespace(
             Reconstruction=FakeReconstruction,
             IncrementalPipelineOptions=_Options,
-            BundleAdjustmentOptions=_Options,
+            BundleAdjustmentOptions=_BundleAdjustmentOptions,
             triangulate_points=lambda *args, **kwargs: triangulate_calls.append(kwargs),
             bundle_adjustment=lambda reconstruction, options: adjustment_calls.append(
                 (reconstruction, options)
@@ -772,8 +629,8 @@ class ColmapCliTests(unittest.TestCase):
         self.assertFalse(adjustment.refine_focal_length)
         self.assertTrue(adjustment.refine_principal_point)
         self.assertFalse(adjustment.refine_extra_params)
-        self.assertFalse(adjustment.use_gpu)
-        self.assertEqual(adjustment.solver_options.max_num_iterations, 31)
+        self.assertFalse(adjustment.ceres.use_gpu)
+        self.assertEqual(adjustment.ceres.solver_options.max_num_iterations, 31)
         adjusted = adjustment_calls[0][0]
         self.assertEqual(adjusted.updated_point_errors, 2)
         self.assertEqual(adjusted.deleted_point_ids, [99])
@@ -788,7 +645,7 @@ class ColmapCliTests(unittest.TestCase):
     def test_image_undistorter_uses_copy_and_requested_size(self) -> None:
         calls: list[dict[str, object]] = []
         pycolmap = types.SimpleNamespace(
-            CopyType=types.SimpleNamespace(copy="copy"),
+            FileCopyType=types.SimpleNamespace(copy="copy"),
             UndistortCameraOptions=_Options,
             undistort_images=lambda **kwargs: calls.append(kwargs),
         )

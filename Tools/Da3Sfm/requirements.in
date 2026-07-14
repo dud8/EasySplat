@@ -6,5 +6,5 @@ torchvision==0.27.1
 huggingface_hub==1.14.0
 einops==0.8.2
 omegaconf==2.3.0
-pycolmap==3.13.0
+pycolmap==4.1.0
 addict==2.4.0

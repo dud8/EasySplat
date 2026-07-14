@@ -16,7 +16,15 @@ SPEC.loader.exec_module(MODULE)
 
 
 PYCOLMAP_WHEEL_SHA256 = (
-    "46d2108eaa1191584796a63f17a5f0204d59e30ec5f2778489ce44e19fff6ac2"
+    "f31c0584d6c85ad5192fb224a9ec1a2413c6af405bc558ca38e9017eb510967f"
+)
+PYCOLMAP_SOURCE_COMMIT = "fa8e3b3ff591552855f8ad2806723c80f963f69c"
+FAISS_LICENSE_SHA256 = (
+    "52412d7bc7ce4157ea628bbaacb8829e0a9cb3c58f57f99176126bc8cf2bfc85"
+)
+FAISS_SOURCE_COMMIT = "5622e93733b64b2e033362dbdfda019b2ab33ef0"
+FAISS_SOURCE_ARCHIVE_SHA256 = (
+    "4b1ae7e7a0a46385b4084f0e3945623a15fcf99d793bf44d82aae8e24f11e5f5"
 )
 ANTLR_LICENSE_SHA256 = (
     "b1b379fcaf3219593a4c433feb1b35c780bed23fafaae440b1ae2771a9521e3a"
@@ -151,6 +159,10 @@ class SupplementalLicenseTests(unittest.TestCase):
             ],
             ANTLR_LICENSE_SHA256,
         )
+        self.assertEqual(
+            MODULE.REVIEWED_SUPPLEMENTAL_LICENSES["faiss"]["artifactSha256"],
+            FAISS_LICENSE_SHA256,
+        )
 
     def _write_fixture(self, root: Path) -> dict[str, dict[str, str]]:
         notices = []
@@ -158,13 +170,22 @@ class SupplementalLicenseTests(unittest.TestCase):
             (
                 "antlr4-python3-runtime",
                 "4.9.3",
+                "BSD-3-Clause",
                 "antlr4_python3_runtime-4.9.3.dist-info",
                 "UPSTREAM_LICENSE.txt",
                 b"antlr license",
             ),
+            (
+                "faiss",
+                "1.14.1",
+                "MIT",
+                "pycolmap-4.1.0.dist-info",
+                "FAISS-LICENSE",
+                b"faiss license",
+            ),
         )
         reviewed: dict[str, dict[str, str]] = {}
-        for package, version, dist_info, filename, content in entries:
+        for package, version, license_name, dist_info, filename, content in entries:
             path = (
                 root
                 / "da3_mps/python/lib/python3.13/site-packages"
@@ -178,7 +199,7 @@ class SupplementalLicenseTests(unittest.TestCase):
             reviewed[package] = {
                 "package": package,
                 "version": version,
-                "license": "BSD-3-Clause",
+                "license": license_name,
                 "source": f"https://example.com/{package}",
                 "sourceCommit": "a" * 40,
                 "artifact": f"https://example.com/{package}/LICENSE",
@@ -211,6 +232,94 @@ class SupplementalLicenseTests(unittest.TestCase):
             (root / notice["installedPath"]).write_bytes(b"tampered")
             with self.assertRaisesRegex(SystemExit, "artifact hash"):
                 MODULE.validate_supplemental_license_receipts(root, reviewed=reviewed)
+
+
+class PythonComponentTests(unittest.TestCase):
+    def test_pycolmap_declares_its_compiled_faiss_dependency(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            site_packages = root / "da3_mps/python/lib/python3.13/site-packages"
+            dist_info = site_packages / "pycolmap-4.1.0.dist-info"
+            dist_info.mkdir(parents=True)
+            (dist_info / "METADATA").write_text(
+                "\n".join(
+                    (
+                        "Name: pycolmap",
+                        "Version: 4.1.0",
+                        "License: BSD-3-Clause",
+                        "Home-page: https://github.com/colmap/colmap",
+                        "",
+                    )
+                ),
+                encoding="utf-8",
+            )
+            (dist_info / "LICENSE").write_text("BSD\n", encoding="utf-8")
+            (dist_info / "RECORD").write_text(
+                "\n".join(
+                    (
+                        "pycolmap-4.1.0.dist-info/METADATA,,",
+                        "pycolmap-4.1.0.dist-info/LICENSE,,",
+                        "pycolmap-4.1.0.dist-info/RECORD,,",
+                        "",
+                    )
+                ),
+                encoding="utf-8",
+            )
+            install_report = root / "da3_mps/licenses/python-packages-install-report.json"
+            install_report.parent.mkdir(parents=True)
+            install_report.write_text(
+                json.dumps(
+                    {
+                        "install": [
+                            {
+                                "metadata": {"name": "pycolmap", "version": "4.1.0"},
+                                "download_info": {
+                                    "url": "https://example.com/pycolmap.whl",
+                                    "archive_info": {"hashes": {"sha256": "f" * 64}},
+                                },
+                            }
+                        ]
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            components, _ = MODULE.python_components(root)
+
+            self.assertEqual(components["python:pycolmap"]["dependencies"], ["faiss"])
+
+
+class FaissComponentTests(unittest.TestCase):
+    def test_component_describes_faiss_compiled_into_pycolmap(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            license_path = (
+                root
+                / "da3_mps/python/lib/python3.13/site-packages"
+                / "pycolmap-4.1.0.dist-info/licenses/FAISS-LICENSE"
+            )
+            license_path.parent.mkdir(parents=True)
+            license_path.write_text("MIT\n", encoding="utf-8")
+
+            component = MODULE.faiss_component(root)
+
+            self.assertEqual(component["id"], "faiss")
+            self.assertEqual(component["version"], "1.14.1")
+            self.assertEqual(component["revision"], FAISS_SOURCE_COMMIT)
+            self.assertEqual(
+                component["artifact"],
+                "https://github.com/facebookresearch/faiss/archive/refs/tags/v1.14.1.zip",
+            )
+            self.assertEqual(
+                component["artifactSha256"], FAISS_SOURCE_ARCHIVE_SHA256
+            )
+            self.assertEqual(component["license"], "MIT")
+            self.assertEqual(component["linkage"], "compiled-in")
+            self.assertEqual(component["incorporatedInto"], ["python:pycolmap"])
+            self.assertEqual(
+                component["licenseFiles"],
+                [license_path.relative_to(root).as_posix()],
+            )
 
 
 class MachOPortabilityTests(unittest.TestCase):
@@ -347,6 +456,10 @@ class BuildCommandTests(unittest.TestCase):
             "./scripts/toolchain/build_da3_mps.sh",
         )
         self.assertEqual(
+            MODULE.component_build_command("faiss", {}),
+            "./scripts/toolchain/build_da3_mps.sh",
+        )
+        self.assertEqual(
             MODULE.component_build_command("msplat", {}),
             "./scripts/toolchain/build_msplat.sh",
         )
@@ -457,8 +570,9 @@ class ColmapBridgeComponentTests(unittest.TestCase):
             "toolchain_name": "colmap",
             "source_url": "https://github.com/colmap/colmap",
             "source_repo": "https://github.com/colmap/colmap",
-            "source_version": "3.13.0",
-            "source_commit": f"sha256:{PYCOLMAP_WHEEL_SHA256}",
+            "source_version": "4.1.0",
+            "source_commit": PYCOLMAP_SOURCE_COMMIT,
+            "artifact_sha256": PYCOLMAP_WHEEL_SHA256,
             "license": "BSD-3-Clause",
             "backend": "pycolmap",
             "runtime": "bundled-python",
@@ -484,7 +598,7 @@ class ColmapBridgeComponentTests(unittest.TestCase):
         self._write_receipt()
         self.python_components = {
             "python:pycolmap": {
-                "version": "3.13.0",
+                "version": "4.1.0",
                 "artifactSha256": PYCOLMAP_WHEEL_SHA256,
             },
         }
@@ -507,6 +621,8 @@ class ColmapBridgeComponentTests(unittest.TestCase):
 
         self.assertEqual(component["id"], "easysplat-colmap-bridge")
         self.assertEqual(component["linkage"], "python-launcher")
+        self.assertEqual(component["runtimeVersion"], "4.1.0")
+        self.assertEqual(component["runtimeRevision"], PYCOLMAP_SOURCE_COMMIT)
         self.assertEqual(
             component["dependencies"],
             [
@@ -528,10 +644,22 @@ class ColmapBridgeComponentTests(unittest.TestCase):
             )
 
     def test_bridge_rejects_receipt_not_bound_to_pycolmap_wheel(self) -> None:
-        self.receipt["source_commit"] = f"sha256:{'f' * 64}"
+        self.receipt["artifact_sha256"] = "f" * 64
         self._write_receipt()
 
         with self.assertRaisesRegex(SystemExit, "PyCOLMAP wheel"):
+            MODULE.colmap_bridge_component(
+                self.root,
+                version="2.0.0",
+                repository_revision="a" * 40,
+                python_components=self.python_components,
+            )
+
+    def test_bridge_rejects_unreviewed_pycolmap_source_revision(self) -> None:
+        self.receipt["source_commit"] = "f" * 40
+        self._write_receipt()
+
+        with self.assertRaisesRegex(SystemExit, "source revision"):
             MODULE.colmap_bridge_component(
                 self.root,
                 version="2.0.0",
@@ -658,8 +786,11 @@ class Da3BuilderLicenseTests(unittest.TestCase):
         for expected in (
             "e4c1a74c66bd5290364ea2b36c97cd724b247357",
             ANTLR_LICENSE_SHA256,
+            FAISS_SOURCE_COMMIT,
+            FAISS_LICENSE_SHA256,
             "python-package-upstream-notices.json",
             "UPSTREAM_LICENSE.txt",
+            "FAISS-LICENSE",
         ):
             self.assertIn(expected, self.script)
         self.assertNotIn("TOKENIZERS_LICENSE", self.script)

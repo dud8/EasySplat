@@ -322,10 +322,13 @@ if not artifact_sha256:
     if raw_hash.startswith("sha256="):
         artifact_sha256 = raw_hash.removeprefix("sha256=")
 
-expected_sha256 = "46d2108eaa1191584796a63f17a5f0204d59e30ec5f2778489ce44e19fff6ac2"
+expected_version = "4.1.0"
+expected_sha256 = "f31c0584d6c85ad5192fb224a9ec1a2413c6af405bc558ca38e9017eb510967f"
 artifact_url = str(download.get("url") or "")
-if metadata.get("version") != "3.13.0" or artifact_sha256 != expected_sha256:
-    raise SystemExit("packaged PyCOLMAP is not the reviewed 3.13.0 arm64 wheel")
+if metadata.get("version") != expected_version or artifact_sha256 != expected_sha256:
+    raise SystemExit(
+        f"packaged PyCOLMAP is not the reviewed {expected_version} arm64 wheel"
+    )
 if metadata.get("license") != "BSD-3-Clause" or not artifact_url.startswith("https://"):
     raise SystemExit("PyCOLMAP license or artifact provenance is incomplete")
 
@@ -338,8 +341,8 @@ receipt = {
     "toolchain_name": "colmap",
     "source_url": "https://github.com/colmap/colmap",
     "source_repo": "https://github.com/colmap/colmap",
-    "source_version": "3.13.0",
-    "source_commit": f"sha256:{artifact_sha256}",
+    "source_version": expected_version,
+    "source_commit": "fa8e3b3ff591552855f8ad2806723c80f963f69c",
     "license": "BSD-3-Clause",
     "backend": "pycolmap",
     "runtime": "bundled-python",
@@ -461,8 +464,10 @@ PYTHONNOUSERSITE=1 PYTHONDONTWRITEBYTECODE=1 \
   "$OUT/da3_mps/python/bin/python3" - <<'PY'
 import pycolmap
 
-if pycolmap.__version__ != "3.13.0":
+if pycolmap.__version__ != "4.1.0":
     raise SystemExit(f"unexpected PyCOLMAP version: {pycolmap.__version__}")
+if not callable(getattr(pycolmap, "match_image_pairs", None)):
+    raise SystemExit("packaged PyCOLMAP is missing native imported-pair matching")
 PY
 
 "$BIN/colmap" -h >/dev/null 2>&1 || { echo "colmap bridge failed to launch" >&2; exit 1; }

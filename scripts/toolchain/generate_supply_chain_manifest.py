@@ -18,6 +18,19 @@ from pathlib import Path, PurePosixPath
 from typing import Any, NoReturn
 
 
+PYCOLMAP_VERSION = "4.1.0"
+PYCOLMAP_SOURCE_COMMIT = "fa8e3b3ff591552855f8ad2806723c80f963f69c"
+FAISS_VERSION = "1.14.1"
+FAISS_SOURCE_COMMIT = "5622e93733b64b2e033362dbdfda019b2ab33ef0"
+FAISS_SOURCE_ARCHIVE_URL = (
+    "https://github.com/facebookresearch/faiss/archive/refs/tags/v1.14.1.zip"
+)
+FAISS_SOURCE_ARCHIVE_SHA256 = (
+    "4b1ae7e7a0a46385b4084f0e3945623a15fcf99d793bf44d82aae8e24f11e5f5"
+)
+FAISS_LICENSE_SHA256 = (
+    "52412d7bc7ce4157ea628bbaacb8829e0a9cb3c58f57f99176126bc8cf2bfc85"
+)
 FORBIDDEN_LICENSE = re.compile(r"AGPL|(?<!L)GPL|NON.?COMMERCIAL", re.IGNORECASE)
 MACHO_MAGICS = {
     b"\xca\xfe\xba\xbe",
@@ -77,6 +90,20 @@ REVIEWED_SUPPLEMENTAL_LICENSES = {
         "artifactSha256": "b1b379fcaf3219593a4c433feb1b35c780bed23fafaae440b1ae2771a9521e3a",
         "distInfo": "antlr4_python3_runtime-4.9.3.dist-info",
         "filename": "UPSTREAM_LICENSE.txt",
+    },
+    "faiss": {
+        "package": "faiss",
+        "version": FAISS_VERSION,
+        "license": "MIT",
+        "source": "https://github.com/facebookresearch/faiss",
+        "sourceCommit": FAISS_SOURCE_COMMIT,
+        "artifact": (
+            "https://raw.githubusercontent.com/facebookresearch/faiss/"
+            f"{FAISS_SOURCE_COMMIT}/LICENSE"
+        ),
+        "artifactSha256": FAISS_LICENSE_SHA256,
+        "distInfo": f"pycolmap-{PYCOLMAP_VERSION}.dist-info",
+        "filename": "FAISS-LICENSE",
     },
 }
 CLASSIFIER_LICENSES = {
@@ -381,6 +408,7 @@ def component_build_command(component_id: str, component: dict[str, Any]) -> str
         "da3",
         "easysplat-colmap-bridge",
         "easysplat-da3-bridge",
+        "faiss",
         "python-build-standalone",
     } or component_id.startswith(("model:", "python:")):
         return "./scripts/toolchain/build_da3_mps.sh"
@@ -667,6 +695,8 @@ def python_components(
                 dependencies.append(
                     f"python:{re.sub(r'[-_.]+', '-', dependency).lower()}"
                 )
+        if slug == "pycolmap":
+            dependencies.append("faiss")
         components[component_id] = {
             "id": component_id,
             "name": name,
@@ -723,6 +753,33 @@ def python_components(
     return components, ownership
 
 
+def faiss_component(root: Path) -> dict[str, Any]:
+    notice = REVIEWED_SUPPLEMENTAL_LICENSES["faiss"]
+    candidates = sorted(
+        root.glob(
+            "da3_mps/python/lib/python*/site-packages/"
+            f"{notice['distInfo']}/licenses/{notice['filename']}"
+        )
+    )
+    if len(candidates) != 1 or not candidates[0].is_file():
+        fail("FAISS compiled-in dependency notice is missing or ambiguous")
+    return {
+        "id": "faiss",
+        "name": "FAISS",
+        "type": "static-dependency",
+        "version": FAISS_VERSION,
+        "revision": FAISS_SOURCE_COMMIT,
+        "source": "https://github.com/facebookresearch/faiss",
+        "artifact": FAISS_SOURCE_ARCHIVE_URL,
+        "artifactSha256": FAISS_SOURCE_ARCHIVE_SHA256,
+        "license": "MIT",
+        "licenseFiles": [relative(candidates[0], root)],
+        "linkage": "compiled-in",
+        "dependencies": [],
+        "incorporatedInto": ["python:pycolmap"],
+    }
+
+
 def colmap_bridge_component(
     root: Path,
     version: str,
@@ -743,7 +800,6 @@ def colmap_bridge_component(
     wheel_sha256 = str(pycolmap.get("artifactSha256") or "")
     if not re.fullmatch(r"[0-9a-f]{64}", wheel_sha256):
         fail("PyCOLMAP has no exact wheel SHA-256")
-    expected_revision = f"sha256:{wheel_sha256}"
     expected_source = "https://github.com/colmap/colmap"
     if receipt.get("toolchain_name") != "colmap":
         fail("COLMAP bridge receipt has the wrong toolchain_name")
@@ -752,9 +808,16 @@ def colmap_bridge_component(
         or receipt.get("source_repo") != expected_source
     ):
         fail("COLMAP bridge receipt has the wrong source repository")
-    if receipt.get("source_version") != "3.13.0" or pycolmap.get("version") != "3.13.0":
-        fail("COLMAP bridge receipt does not identify PyCOLMAP 3.13.0")
-    if receipt.get("source_commit") != expected_revision:
+    if (
+        receipt.get("source_version") != PYCOLMAP_VERSION
+        or pycolmap.get("version") != PYCOLMAP_VERSION
+    ):
+        fail(
+            f"COLMAP bridge receipt does not identify PyCOLMAP {PYCOLMAP_VERSION}"
+        )
+    if receipt.get("source_commit") != PYCOLMAP_SOURCE_COMMIT:
+        fail("COLMAP bridge receipt has an unreviewed PyCOLMAP source revision")
+    if receipt.get("artifact_sha256") != wheel_sha256:
         fail("COLMAP bridge receipt is not bound to the PyCOLMAP wheel")
     if receipt.get("license") != "BSD-3-Clause":
         fail("COLMAP bridge receipt has the wrong PyCOLMAP license")
@@ -785,8 +848,8 @@ def colmap_bridge_component(
         "version": version,
         "revision": repository_revision,
         "source": "https://github.com/dud8/EasySplat",
-        "runtimeVersion": "3.13.0",
-        "runtimeRevision": expected_revision,
+        "runtimeVersion": PYCOLMAP_VERSION,
+        "runtimeRevision": PYCOLMAP_SOURCE_COMMIT,
         "license": "MIT",
         "licenseFiles": [relative(project_license, root)],
         "linkage": "python-launcher",
@@ -862,6 +925,7 @@ def builder_components(
             repository_revision,
             python_components,
         ),
+        "faiss": faiss_component(root),
         "msplat": {
             "id": "msplat",
             "name": "msplat",

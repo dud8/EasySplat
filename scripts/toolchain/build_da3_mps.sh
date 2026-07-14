@@ -21,6 +21,11 @@ ANTLR_LICENSE_COMMIT="e4c1a74c66bd5290364ea2b36c97cd724b247357"
 ANTLR_LICENSE_URL="https://raw.githubusercontent.com/antlr/antlr4/${ANTLR_LICENSE_COMMIT}/LICENSE.txt"
 ANTLR_LICENSE_SHA256="b1b379fcaf3219593a4c433feb1b35c780bed23fafaae440b1ae2771a9521e3a"
 ANTLR_LICENSE_CACHE="$BUILD_DIR/licenses/antlr4-python3-runtime-4.9.3-LICENSE.txt"
+FAISS_VERSION="1.14.1"
+FAISS_SOURCE_COMMIT="5622e93733b64b2e033362dbdfda019b2ab33ef0"
+FAISS_LICENSE_URL="https://raw.githubusercontent.com/facebookresearch/faiss/${FAISS_SOURCE_COMMIT}/LICENSE"
+FAISS_LICENSE_SHA256="52412d7bc7ce4157ea628bbaacb8829e0a9cb3c58f57f99176126bc8cf2bfc85"
+FAISS_LICENSE_CACHE="$BUILD_DIR/licenses/faiss-${FAISS_VERSION}-LICENSE.txt"
 
 ALLOW_UNPINNED_DA3_SOURCE="${EASYSPLAT_ALLOW_UNPINNED_DA3_SOURCE:-0}"
 if [ -n "${DA3_SOURCE:-}" ] && [ "$ALLOW_UNPINNED_DA3_SOURCE" != "1" ]; then
@@ -162,20 +167,35 @@ install_supplemental_python_licenses() {
     echo "Expected exactly one antlr4-python3-runtime 4.9.3 distribution." >&2
     exit 1
   fi
+  local -a pycolmap_dist_info=(
+    "$PYTHON_DIR"/lib/python*/site-packages/pycolmap-4.1.0.dist-info
+  )
+  if [ "${#pycolmap_dist_info[@]}" -ne 1 ] || [ ! -d "${pycolmap_dist_info[0]}" ]; then
+    echo "Expected exactly one PyCOLMAP 4.1.0 distribution." >&2
+    exit 1
+  fi
 
   download_verified \
     "$ANTLR_LICENSE_URL" \
     "$ANTLR_LICENSE_CACHE" \
     "$ANTLR_LICENSE_SHA256"
+  download_verified \
+    "$FAISS_LICENSE_URL" \
+    "$FAISS_LICENSE_CACHE" \
+    "$FAISS_LICENSE_SHA256"
 
   local antlr_license="${antlr_dist_info[0]}/licenses/UPSTREAM_LICENSE.txt"
   mkdir -p "$(dirname "$antlr_license")"
   install -m 0644 "$ANTLR_LICENSE_CACHE" "$antlr_license"
+  local faiss_license="${pycolmap_dist_info[0]}/licenses/FAISS-LICENSE"
+  mkdir -p "$(dirname "$faiss_license")"
+  install -m 0644 "$FAISS_LICENSE_CACHE" "$faiss_license"
 
   "$PYTHON_DIR/bin/python3" - \
     "$INSTALL_DIR" \
     "$SUPPLEMENTAL_LICENSE_MANIFEST" \
-    "$antlr_license" <<PY
+    "$antlr_license" \
+    "$faiss_license" <<PY
 import json
 import sys
 from pathlib import Path
@@ -201,6 +221,18 @@ payload = {
             "distInfo": "antlr4_python3_runtime-4.9.3.dist-info",
             "filename": "UPSTREAM_LICENSE.txt",
             "installedPath": relative(sys.argv[3]),
+        },
+        {
+            "package": "faiss",
+            "version": "${FAISS_VERSION}",
+            "license": "MIT",
+            "source": "https://github.com/facebookresearch/faiss",
+            "sourceCommit": "${FAISS_SOURCE_COMMIT}",
+            "artifact": "${FAISS_LICENSE_URL}",
+            "artifactSha256": "${FAISS_LICENSE_SHA256}",
+            "distInfo": "pycolmap-4.1.0.dist-info",
+            "filename": "FAISS-LICENSE",
+            "installedPath": relative(sys.argv[4]),
         },
     ],
 }
@@ -566,12 +598,16 @@ KMP_DUPLICATE_LIB_OK=TRUE PYTHONDONTWRITEBYTECODE=1 PYTHONNOUSERSITE=1 \
   PYTHONPATH="$APP_DIR:$DA3_VENDOR/src" "$PYTHON_DIR/bin/python3" - <<'PY'
 import sys
 try:
-    import pycolmap  # noqa: F401
+    import pycolmap
     import depth_anything_3.api  # noqa: F401
     import easysplat_da3_sfm  # noqa: F401
 except Exception as exc:  # noqa: BLE001
     sys.stderr.write(f"da3_mps import sanity check failed: {exc}\n")
     raise SystemExit(1)
+if pycolmap.__version__ != "4.1.0" or not callable(
+    getattr(pycolmap, "match_image_pairs", None)
+):
+    raise SystemExit("da3_mps requires the reviewed PyCOLMAP 4.1.0 pair matcher")
 PY
 
 "$BIN_DIR/easysplat_da3_sfm" --help >/dev/null

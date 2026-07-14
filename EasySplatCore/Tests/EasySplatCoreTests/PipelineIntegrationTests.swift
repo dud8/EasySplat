@@ -343,6 +343,122 @@ final class PipelineIntegrationTests: XCTestCase {
         XCTAssertNotNil(events.stageLog(containing: "preserving features and retrying with exact matching"))
     }
 
+    func testInterruptedClassicalMatchingClearsPartialExactRowsBeforeFaissResume() async throws {
+        let temp = makeTempRoot()
+        let projectURL = temp.appendingPathComponent(
+            "InterruptedClassicalMatching.easysplatproj",
+            isDirectory: true
+        )
+        let sourcePhotos = temp.appendingPathComponent("SourcePhotos", isDirectory: true)
+        try FileManager.default.createDirectory(at: sourcePhotos, withIntermediateDirectories: true)
+        for index in 0..<8 {
+            try writeTestImage(
+                url: sourcePhotos.appendingPathComponent("img\(index).jpg"),
+                value: UInt8(index)
+            )
+        }
+
+        let paths = ProjectPaths(root: projectURL)
+        try paths.ensureDirectories()
+        try ProjectMetadataStore.save(
+            ProjectMetadata(
+                title: "Interrupted classical matching",
+                input: .photos(folder: sourcePhotos.path),
+                requestedRunOptions: RequestedRunOptions(
+                    detailProfile: .fast,
+                    inputOrdering: .unordered,
+                    photoSelection: .useAllValidPhotos
+                )
+            ),
+            to: paths.metadataURL
+        )
+        let toolchain = try makeToolchain(root: temp)
+        let featureRunner = MockSubprocessRunner(scripts: [
+            .init(
+                path: toolchain.colmap.path,
+                argsPrefix: ["feature_extractor"],
+                result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""),
+                onRun: { _ in
+                    try? self.writeMatchableColmapDatabase(at: paths.colmapDatabaseURL)
+                }
+            )
+        ])
+        let featurePipeline = PipelineRunner(
+            projectURL: projectURL,
+            config: makePipelineConfig(
+                toolchain: toolchain,
+                candidateRoute: .colmap,
+                skipTraining: true,
+                stopAfterStage: .sfmFeatures
+            ),
+            tooling: .init(runner: featureRunner)
+        )
+        try await featurePipeline.run { _ in }
+        try markMatchingAsInterrupted(paths: paths)
+        XCTAssertEqual(try databaseRowCount("matches", at: paths.colmapDatabaseURL), 1)
+        XCTAssertEqual(
+            try databaseRowCount("two_view_geometries", at: paths.colmapDatabaseURL),
+            1
+        )
+
+        let resumeRunner = MockSubprocessRunner(scripts: [
+            .init(
+                path: toolchain.colmap.path,
+                argsPrefix: ["exhaustive_matcher"],
+                result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""),
+                onRun: { args in
+                    XCTAssertEqual(
+                        self.value(for: "--SiftMatching.cpu_brute_force_matcher", in: args),
+                        "0"
+                    )
+                    XCTAssertEqual(
+                        try? self.databaseRowCount("matches", at: paths.colmapDatabaseURL),
+                        0
+                    )
+                    XCTAssertEqual(
+                        try? self.databaseRowCount(
+                            "two_view_geometries",
+                            at: paths.colmapDatabaseURL
+                        ),
+                        0
+                    )
+                }
+            ),
+            .init(
+                path: toolchain.colmap.path,
+                argsPrefix: ["mapper"],
+                result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""),
+                onRun: { _ in try? self.writeSparseModel(at: projectURL) }
+            ),
+            .init(
+                path: toolchain.colmap.path,
+                argsPrefix: ["model_analyzer"],
+                result: .init(
+                    exitCode: 0,
+                    terminationReason: .exit,
+                    stdout: "Registered images: 8 / 8\nPoints: 1\nObservations: 8\nMean track length: 8.0\nMean reprojection error: 0.5\n",
+                    stderr: ""
+                ),
+                onRun: nil
+            ),
+        ])
+        let events = PipelineEventSink()
+        let resumedPipeline = PipelineRunner(
+            projectURL: projectURL,
+            config: makePipelineConfig(
+                toolchain: toolchain,
+                candidateRoute: .colmap,
+                skipTraining: true
+            ),
+            tooling: .init(runner: resumeRunner)
+        )
+
+        try await resumedPipeline.run(resumeFrom: .sfmFeatures) { events.append($0) }
+
+        XCTAssertNotNil(events.stageLog(containing: "Discarded partial image matches"))
+        XCTAssertFalse(resumeRunner.calls.contains { $0.1.first == "feature_extractor" })
+    }
+
     func testFaissCrashOnSequentialRetryUsesExactMatchingWithoutReextractingFeatures() async throws {
         let temp = makeTempRoot()
         let projectURL = temp.appendingPathComponent("FaissRetryRecovery.easysplatproj", isDirectory: true)
@@ -2016,6 +2132,151 @@ final class PipelineIntegrationTests: XCTestCase {
         XCTAssertNotNil(events.stageLog(containing: "preserving features and retrying with exact matching"))
     }
 
+    func testInterruptedDa3MatchingClearsPartialExactRowsBeforeFaissResume() async throws {
+        let temp = makeTempRoot()
+        let projectURL = temp.appendingPathComponent(
+            "InterruptedDa3Matching.easysplatproj",
+            isDirectory: true
+        )
+        let sourcePhotos = temp.appendingPathComponent("SourcePhotos", isDirectory: true)
+        try FileManager.default.createDirectory(at: sourcePhotos, withIntermediateDirectories: true)
+        for index in 0..<29 {
+            try writeRetrievalTestImage(
+                url: sourcePhotos.appendingPathComponent(String(format: "img_%03d.jpg", index)),
+                index: index
+            )
+        }
+
+        let paths = ProjectPaths(root: projectURL)
+        try paths.ensureDirectories()
+        try ProjectMetadataStore.save(
+            ProjectMetadata(
+                title: "Interrupted DA3 matching",
+                input: .photos(folder: sourcePhotos.path),
+                requestedRunOptions: RequestedRunOptions(
+                    capturePath: .orbit,
+                    detailProfile: .fast,
+                    inputOrdering: .continuous,
+                    photoSelection: .useAllValidPhotos
+                )
+            ),
+            to: paths.metadataURL
+        )
+
+        let toolchain = try makeToolchain(root: temp, createDa3Files: true)
+        let seedRunner = MockSubprocessRunner(scripts: [
+            .init(
+                path: toolchain.da3.sfmTool.path,
+                argsPrefix: ["--images"],
+                result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""),
+                onRun: { args in try? self.writeDa3RunArtifacts(for: args) }
+            )
+        ])
+        let seedPipeline = PipelineRunner(
+            projectURL: projectURL,
+            config: makePipelineConfig(
+                toolchain: toolchain,
+                candidateRoute: .da3,
+                skipTraining: true,
+                stopAfterStage: .sfmFeatures
+            ),
+            tooling: .init(runner: seedRunner)
+        )
+        try await seedPipeline.run { _ in }
+
+        try? FileManager.default.removeItem(at: paths.colmapDatabaseURL)
+        try writeMatchableColmapDatabase(at: paths.colmapDatabaseURL)
+        try markMatchingAsInterrupted(paths: paths)
+        XCTAssertEqual(try databaseRowCount("matches", at: paths.colmapDatabaseURL), 1)
+        XCTAssertEqual(
+            try databaseRowCount("two_view_geometries", at: paths.colmapDatabaseURL),
+            1
+        )
+
+        let resumeRunner = MockSubprocessRunner(scripts: [
+            .init(
+                path: toolchain.colmap.path,
+                argsPrefix: ["feature_extractor"],
+                result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""),
+                onRun: nil
+            ),
+            .init(
+                path: toolchain.colmap.path,
+                argsPrefix: ["matches_importer"],
+                result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""),
+                onRun: { args in
+                    XCTAssertEqual(
+                        self.value(for: "--SiftMatching.cpu_brute_force_matcher", in: args),
+                        "0"
+                    )
+                    XCTAssertEqual(
+                        try? self.databaseRowCount("matches", at: paths.colmapDatabaseURL),
+                        0
+                    )
+                    XCTAssertEqual(
+                        try? self.databaseRowCount(
+                            "two_view_geometries",
+                            at: paths.colmapDatabaseURL
+                        ),
+                        0
+                    )
+                }
+            ),
+            .init(
+                path: toolchain.colmap.path,
+                argsPrefix: ["point_triangulator"],
+                result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""),
+                onRun: { args in
+                    guard let output = self.value(for: "--output_path", in: args) else { return }
+                    try? self.writeDa3SparseModel(
+                        at: URL(fileURLWithPath: output),
+                        imageNames: self.selectedImageNames(in: paths),
+                        pointCount: 20
+                    )
+                }
+            ),
+            .init(
+                path: toolchain.colmap.path,
+                argsPrefix: ["bundle_adjuster"],
+                result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""),
+                onRun: { args in
+                    guard let output = self.value(for: "--output_path", in: args) else { return }
+                    try? self.writeDa3SparseModel(
+                        at: URL(fileURLWithPath: output),
+                        imageNames: self.selectedImageNames(in: paths),
+                        pointCount: 20
+                    )
+                }
+            ),
+            .init(
+                path: toolchain.colmap.path,
+                argsPrefix: ["model_analyzer"],
+                result: .init(
+                    exitCode: 0,
+                    terminationReason: .exit,
+                    stdout: "Registered images: 29 / 29\nPoints: 16000\nObservations: 32000\nMean track length: 2.0\nMean reprojection error: 0.8\n",
+                    stderr: ""
+                ),
+                onRun: nil
+            ),
+        ])
+        let events = PipelineEventSink()
+        let resumedPipeline = PipelineRunner(
+            projectURL: projectURL,
+            config: makePipelineConfig(
+                toolchain: toolchain,
+                candidateRoute: .da3,
+                skipTraining: true
+            ),
+            tooling: .init(runner: resumeRunner)
+        )
+
+        try await resumedPipeline.run(resumeFrom: .sfmFeatures) { events.append($0) }
+
+        XCTAssertNotNil(events.stageLog(containing: "Discarded partial image matches"))
+        XCTAssertFalse(resumeRunner.calls.contains { $0.0 == toolchain.da3.sfmTool.path })
+    }
+
     func testPipelineFailsOnLowQuality() async throws {
         let temp = makeTempRoot()
         let projectURL = temp.appendingPathComponent("Test.easysplatproj", isDirectory: true)
@@ -2490,6 +2751,23 @@ final class PipelineIntegrationTests: XCTestCase {
         }
     }
 
+    private func markMatchingAsInterrupted(paths: ProjectPaths) throws {
+        var metadata = try ProjectMetadataStore.load(from: paths.metadataURL)
+        metadata.checkpoint = PipelineCheckpoint(
+            stage: .sfmMatching,
+            updatedAt: Date(timeIntervalSince1970: 2),
+            progressFraction: 0.5,
+            message: "Exact matching interrupted",
+            details: .sfmMatching(SfmMatchingCheckpoint(
+                databasePath: try paths.projectRelativePath(for: paths.colmapDatabaseURL),
+                expectedPairs: 1,
+                processedPairs: 1
+            ))
+        )
+        metadata.lastRunStartedAt = Date(timeIntervalSince1970: 1)
+        try ProjectMetadataStore.save(metadata, to: paths.metadataURL)
+    }
+
     private func databaseRowCount(_ table: String, at databaseURL: URL) throws -> Int {
         var database: OpaquePointer?
         defer { sqlite3_close(database) }
@@ -2725,8 +3003,8 @@ final class PipelineIntegrationTests: XCTestCase {
         try """
         {
           "toolchain_name": "colmap",
-          "source_version": "3.13.0",
-          "source_commit": "fa7280fee27f97aff31ae7f98bab7f583fac7d08",
+          "source_version": "4.1.0",
+          "source_commit": "fa8e3b3ff591552855f8ad2806723c80f963f69c",
           "executable_sha256": "\(colmapExecutableSHA256)"
         }
         """.write(to: colmapProvenance, atomically: true, encoding: .utf8)

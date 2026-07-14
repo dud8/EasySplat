@@ -145,7 +145,7 @@ class Da3RunTests(unittest.TestCase):
         self.assertNotIn("transformers==5.8.1", lines)
         self.assertIn("einops==0.8.2", lines)
         self.assertIn("omegaconf==2.3.0", lines)
-        self.assertIn("pycolmap==3.13.0", lines)
+        self.assertIn("pycolmap==4.1.0", lines)
         self.assertIn("addict==2.4.0", lines)
 
         lock = (root / "requirements.txt").read_text(encoding="utf-8")

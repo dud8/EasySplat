@@ -14,6 +14,7 @@ class ColmapCliError(RuntimeError):
 
 
 _IMAGE_EXTENSIONS = frozenset({".jpg", ".jpeg", ".png"})
+_PYCOLMAP_VERSION = "4.1.0"
 
 
 _COMMAND_OPTIONS = {
@@ -95,7 +96,7 @@ def _help(command: str | None = None) -> str:
         )
         return (
             "EasySplat COLMAP compatibility bridge\n"
-            "pycolmap 3.13.0 · CPU\n\n"
+            f"pycolmap {_PYCOLMAP_VERSION} · CPU\n\n"
             f"Commands:\n{commands}\n"
         )
     if command == "feature_importer":
@@ -104,7 +105,7 @@ def _help(command: str | None = None) -> str:
         f"  --{name} <value>" for name in sorted(_COMMAND_OPTIONS[command])
     )
     suffix = f"\nOptions:\n{options}\n" if options else "\n"
-    return f"{command} via pycolmap 3.13.0 (CPU){suffix}"
+    return f"{command} via pycolmap {_PYCOLMAP_VERSION} (CPU){suffix}"
 
 
 def _parse_options(command: str, arguments: list[str]) -> dict[str, str]:
@@ -164,10 +165,11 @@ def _load_pycolmap() -> Any:
     try:
         import pycolmap
     except ImportError as exc:
-        raise ColmapCliError("pycolmap 3.13.0 is not installed") from exc
-    if getattr(pycolmap, "__version__", None) != "3.13.0":
+        raise ColmapCliError(f"pycolmap {_PYCOLMAP_VERSION} is not installed") from exc
+    if getattr(pycolmap, "__version__", None) != _PYCOLMAP_VERSION:
         raise ColmapCliError(
-            f"pycolmap 3.13.0 is required; found {getattr(pycolmap, '__version__', 'unknown')}"
+            f"pycolmap {_PYCOLMAP_VERSION} is required; "
+            f"found {getattr(pycolmap, '__version__', 'unknown')}"
         )
     return pycolmap
 
@@ -187,169 +189,6 @@ def _feature_matching_options(pycolmap: Any, options: dict[str, str]) -> Any:
         False,
     )
     return matching
-
-
-def _normalized_descriptors(descriptors: np.ndarray) -> np.ndarray:
-    values = np.asarray(descriptors, dtype=np.float32)
-    if values.ndim != 2:
-        raise ColmapCliError("COLMAP descriptors must be a two-dimensional array")
-    if not np.isfinite(values).all():
-        raise ColmapCliError("COLMAP descriptors must contain only finite values")
-    if values.shape[0] == 0:
-        return values
-    norms = np.linalg.norm(values, axis=1, keepdims=True)
-    return values / np.maximum(norms, np.finfo(np.float32).eps)
-
-
-def _nearest_two_l2(
-    first: np.ndarray,
-    second: np.ndarray,
-    *,
-    working_memory_bytes: int,
-) -> tuple[np.ndarray, np.ndarray]:
-    query_count = first.shape[0]
-    candidate_count = second.shape[0]
-    indices = np.full((query_count, 2), -1, dtype=np.int64)
-    distances = np.full((query_count, 2), np.inf, dtype=np.float32)
-    if query_count == 0 or candidate_count == 0:
-        return indices, distances
-    if working_memory_bytes < 16:
-        raise ColmapCliError("descriptor matcher working-memory budget is too small")
-
-    # Each product entry needs a float32 distance and an int64 argpartition index.
-    # The extra margin covers norms and per-row tie resolution.
-    max_pairs = max(1, working_memory_bytes // 16)
-    query_block_size = max(1, min(query_count, math.isqrt(max_pairs)))
-    candidate_block_size = max(1, min(candidate_count, max_pairs // query_block_size))
-    candidate_norms = np.einsum("ij,ij->i", second, second)
-
-    for query_start in range(0, query_count, query_block_size):
-        query_stop = min(query_start + query_block_size, query_count)
-        queries = first[query_start:query_stop]
-        query_norms = np.einsum("ij,ij->i", queries, queries)
-        best_indices = indices[query_start:query_stop]
-        best_distances_squared = np.full(best_indices.shape, np.inf, dtype=np.float32)
-
-        for candidate_start in range(0, candidate_count, candidate_block_size):
-            candidate_stop = min(
-                candidate_start + candidate_block_size, candidate_count
-            )
-            candidates = second[candidate_start:candidate_stop]
-            block = np.matmul(queries, candidates.T)
-            block *= -2.0
-            block += query_norms[:, np.newaxis]
-            block += candidate_norms[candidate_start:candidate_stop][np.newaxis, :]
-            np.maximum(block, 0.0, out=block)
-
-            if block.shape[1] == 1:
-                local_indices = np.zeros((block.shape[0], 1), dtype=np.int64)
-            else:
-                local_indices = np.argpartition(block, kth=1, axis=1)[:, :2]
-
-            for row in range(block.shape[0]):
-                selected = local_indices[row]
-                cutoff = float(np.max(block[row, selected]))
-                tied = np.flatnonzero(block[row] <= cutoff)
-                global_tied = tied + candidate_start
-                order = np.lexsort((global_tied, block[row, tied]))
-                local = [
-                    (float(block[row, tied[index]]), int(global_tied[index]))
-                    for index in order[:2]
-                ]
-                retained = [
-                    (
-                        float(best_distances_squared[row, column]),
-                        int(best_indices[row, column]),
-                    )
-                    for column in range(2)
-                    if best_indices[row, column] >= 0
-                ]
-                retained.extend(local)
-                retained.sort(key=lambda match: (match[0], match[1]))
-                retained = retained[:2]
-                best_indices[row] = -1
-                best_distances_squared[row] = np.inf
-                for column, (distance_squared, candidate_index) in enumerate(retained):
-                    best_indices[row, column] = candidate_index
-                    best_distances_squared[row, column] = distance_squared
-
-        indices[query_start:query_stop] = best_indices
-        distances[query_start:query_stop] = np.sqrt(best_distances_squared)
-    return indices, distances
-
-
-def _ratio_matches(
-    first: np.ndarray,
-    second: np.ndarray,
-    max_ratio: float,
-    max_distance: float,
-    *,
-    working_memory_bytes: int,
-) -> dict[int, tuple[int, float]]:
-    if first.shape[0] == 0 or second.shape[0] < 2:
-        return {}
-    indices, distances = _nearest_two_l2(
-        first,
-        second,
-        working_memory_bytes=working_memory_bytes,
-    )
-    accepted: dict[int, tuple[int, float]] = {}
-    for query_index in range(first.shape[0]):
-        best_index, runner_up_index = indices[query_index]
-        best_distance, runner_up_distance = distances[query_index]
-        if best_index < 0 or runner_up_index < 0:
-            continue
-        if (
-            best_distance > max_distance
-            or best_distance >= max_ratio * runner_up_distance
-        ):
-            continue
-        accepted[query_index] = (int(best_index), float(best_distance))
-    return accepted
-
-
-def _match_descriptors(
-    descriptors1: np.ndarray,
-    descriptors2: np.ndarray,
-    *,
-    max_ratio: float,
-    max_distance: float,
-    cross_check: bool,
-    max_num_matches: int,
-    working_memory_bytes: int = 16 * 1024 * 1024,
-) -> np.ndarray:
-    first = _normalized_descriptors(descriptors1)
-    second = _normalized_descriptors(descriptors2)
-    if first.shape[1] != second.shape[1]:
-        raise ColmapCliError("COLMAP descriptor dimensions do not match")
-    forward = _ratio_matches(
-        first,
-        second,
-        max_ratio,
-        max_distance,
-        working_memory_bytes=working_memory_bytes,
-    )
-    reverse = (
-        _ratio_matches(
-            second,
-            first,
-            max_ratio,
-            max_distance,
-            working_memory_bytes=working_memory_bytes,
-        )
-        if cross_check
-        else {}
-    )
-    matches = [
-        (query, train, distance)
-        for query, (train, distance) in forward.items()
-        if not cross_check or reverse.get(train, (-1, 0.0))[0] == query
-    ]
-    matches.sort(key=lambda match: (match[2], match[0], match[1]))
-    limited = matches[:max_num_matches]
-    if not limited:
-        return np.empty((0, 2), dtype=np.uint32)
-    return np.asarray([(query, train) for query, train, _ in limited], dtype=np.uint32)
 
 
 def _read_pairs(path: str) -> list[tuple[str, str]]:
@@ -526,7 +365,6 @@ def _run_matches_importer(pycolmap: Any, options: dict[str, str]) -> None:
     pairs_path = _required(options, "match_list_path")
     pairs = _read_pairs(pairs_path)
     matching = _feature_matching_options(pycolmap, options)
-    sift = matching.sift
     database = pycolmap.Database.open(database_path)
     try:
         for name1, name2 in pairs:
@@ -540,27 +378,17 @@ def _run_matches_importer(pycolmap: Any, options: dict[str, str]) -> None:
                 raise ColmapCliError(
                     f"pair list image is absent from database: {name2}"
                 )
-            low_id, high_id = sorted((image1.image_id, image2.image_id))
-            if database.exists_matches(low_id, high_id):
-                continue
-            matches = _match_descriptors(
-                database.read_descriptors(image1.image_id),
-                database.read_descriptors(image2.image_id),
-                max_ratio=float(getattr(sift, "max_ratio", 0.8)),
-                max_distance=float(getattr(sift, "max_distance", 0.7)),
-                cross_check=bool(getattr(sift, "cross_check", True)),
-                max_num_matches=matching.max_num_matches,
-            )
-            if image1.image_id == low_id:
-                database.write_matches(low_id, high_id, matches)
-            else:
-                database.write_matches(low_id, high_id, matches[:, ::-1].copy())
     finally:
         database.close()
-    pycolmap.verify_matches(
-        database_path,
-        pairs_path,
-        pycolmap.TwoViewGeometryOptions(),
+
+    pairing = pycolmap.ImportedPairingOptions()
+    pairing.match_list_path = pairs_path
+    pycolmap.match_image_pairs(
+        database_path=database_path,
+        matching_options=matching,
+        pairing_options=pairing,
+        verification_options=pycolmap.TwoViewGeometryOptions(),
+        device=pycolmap.Device.cpu,
     )
 
 
@@ -652,13 +480,13 @@ def _run_bundle_adjuster(pycolmap: Any, options: dict[str, str]) -> None:
         "BundleAdjustment.refine_extra_params",
         True,
     )
-    adjustment.use_gpu = False
+    adjustment.ceres.use_gpu = False
     iteration_name = (
         "BundleAdjustmentCeres.max_num_iterations"
         if "BundleAdjustmentCeres.max_num_iterations" in options
         else "BundleAdjustment.max_num_iterations"
     )
-    adjustment.solver_options.max_num_iterations = _positive_integer(
+    adjustment.ceres.solver_options.max_num_iterations = _positive_integer(
         options,
         iteration_name,
         50,
@@ -715,7 +543,7 @@ def _run_image_undistorter(pycolmap: Any, options: dict[str, str]) -> None:
         input_path=_required(options, "input_path"),
         image_path=_required(options, "image_path"),
         output_type=output_type,
-        copy_policy=pycolmap.CopyType.copy,
+        copy_policy=pycolmap.FileCopyType.copy,
         undistort_options=undistort,
     )
 

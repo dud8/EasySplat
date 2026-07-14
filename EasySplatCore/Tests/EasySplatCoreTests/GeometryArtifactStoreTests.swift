@@ -326,8 +326,8 @@ final class GeometryArtifactStoreTests: XCTestCase {
             toolchainVersion: "2.0.0",
             solver: GeometryComponentProvenance(
                 identifier: "colmap",
-                version: "3.13.0",
-                revision: "fa7280fee27f97aff31ae7f98bab7f583fac7d08",
+                version: "4.1.0",
+                revision: "fa8e3b3ff591552855f8ad2806723c80f963f69c",
                 payloadSHA256: String(repeating: "a", count: 64)
             ),
             runtime: GeometryComponentProvenance(
@@ -505,7 +505,7 @@ final class GeometryArtifactStoreTests: XCTestCase {
     private func makeArtifact(fixture: Fixture) -> GeometryArtifact {
         GeometryArtifact(
             schemaVersion: GeometryArtifact.currentSchemaVersion,
-            solverVersion: "colmap; COLMAP 3.13.0",
+            solverVersion: "colmap; COLMAP 4.1.0",
             runtimeVersion: "easysplat-core-v2",
             modelVersion: "none",
             inputDigest: fixture.inputDigest,
@@ -534,8 +534,8 @@ final class GeometryArtifactStoreTests: XCTestCase {
                 toolchainVersion: "2.0.0",
                 solver: GeometryComponentProvenance(
                     identifier: "colmap",
-                    version: "3.13.0",
-                    revision: "fa7280fee27f97aff31ae7f98bab7f583fac7d08",
+                    version: "4.1.0",
+                    revision: "fa8e3b3ff591552855f8ad2806723c80f963f69c",
                     payloadSHA256: String(repeating: "a", count: 64)
                 ),
                 runtime: nil,
