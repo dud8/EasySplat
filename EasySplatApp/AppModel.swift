@@ -256,7 +256,9 @@ final class AppModel: ObservableObject {
             requestedRunOptions.detailProfile = .fast
             requestedRunOptions.resourcePolicy = .conserveMemory
         }
-        refreshProjectSummaries()
+        if projectBaseURL != nil {
+            refreshProjectSummaries()
+        }
     }
 
     func applyUIVerificationProcessingFixture(

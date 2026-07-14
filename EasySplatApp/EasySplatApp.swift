@@ -14,6 +14,9 @@ struct EasySplatApp: App {
                 .onAppear {
                     appDelegate.model = model
                     model.refreshFreeDiskSpace()
+                    DispatchQueue.main.async {
+                        model.refreshProjectSummaries()
+                    }
                     if let projectURL = AppConfig.uiVerificationProcessingProjectURL {
                         model.applyUIVerificationProcessingFixture(projectURL: projectURL)
                     }
