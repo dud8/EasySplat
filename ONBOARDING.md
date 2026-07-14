@@ -119,7 +119,7 @@ Do not call an intermediate file a checkpoint or snapshot unless its complete-st
 
 ## Geometry
 
-The normal route is anchored DA3 pose, depth, and confidence inference followed by measured global correctness checks and bounded COLMAP refinement. Confidence-filtered depth points seed native training, but they never enter the canonical residual-bearing COLMAP model; only triangulated tracks can satisfy geometry acceptance.
+The public-beta route uses bounded COLMAP matching and camera reconstruction. A DA3 Base experiment remains behind the typed candidate override, with DA3 Small as its memory-failure retry: one coherent batch of at most 29 images at 336 px, followed by triangulation and bounded bundle adjustment. The bridge rejects a second inference window because independently inferred windows do not share a trustworthy coordinate frame.
 
 Video extraction is dual-purpose: low-resolution analysis chooses useful timestamps, and only selected timestamps are extracted at training resolution. Selected-frame names and manifests preserve exact video timestamps.
 
@@ -139,11 +139,32 @@ Accepted geometry must provide:
 - timings and measured peak memory;
 - fallback reason when applicable.
 
-`ColmapResidualAnalyzer` recomputes residuals from actual tracks. Placeholder or mapper-reported pseudo-residuals cannot pass. The pipeline requires at least 90% registration, median residual at most 1.5 px, and p90 at most 3 px before training.
+`ColmapResidualAnalyzer` recomputes residuals from actual tracks. Placeholder or mapper-reported pseudo-residuals cannot pass. The pipeline requires at least 90% registration, median residual at most 1.5 px, and p90 at most 3 px before training. A learned candidate must also give at least 90% of selected views 20 or more verified track observations; one residual is not meaningful camera support.
 
 The retained COLMAP binary supplies feature extraction, matching, `point_triangulator`, bounded `bundle_adjuster`, `global_mapper`, classic `mapper`, conversion, and analysis. It is the correctness reference and recovery route, not a user option.
 
 The release benchmark calls the 3,000-frame measurement the long-sequence route. It measures whichever route actually ships. The beta does not claim a separate streaming engine or package unless one later clears the same license, memory, throughput, and quality gates.
+
+### Research ledger · July 2026
+
+Novelty is not a shipping criterion. Code, weights, training data, transitive licenses, Apple-Silicon behavior, memory, pose quality, and held-out rendering all have to clear the release gates.
+
+| Work | Current decision |
+| --- | --- |
+| [Depth Anything 3](https://github.com/ByteDance-Seed/Depth-Anything-3) Base and Small | Keep as the only learned candidate. The official small checkpoints are Apache-2.0 and use safetensors. Multi-window stitching is disabled. |
+| [LingBot-Map](https://arxiv.org/abs/2604.14141) | Do not port or redistribute yet. The official path is CUDA/FlashInfer, its checkpoints are executable `.pt` files, and the paper lists Waymo training data. [Waymo's terms](https://waymo.com/open/terms/) treat trained parameters as derivative IP restricted to non-commercial use. Written lineage clearance is required first. |
+| [Anchor3R](https://arxiv.org/abs/2606.05035) | Best current long-sequence architecture to watch: transient anchors, loop reinsertion, and motion averaging. No auditable implementation or weights are available. |
+| [GLUEMAP](https://github.com/colmap/gluemap) | Use the local-estimate/global-fusion design as a future reference, not as a current implementation or dependency. The reference stack combines several large or license-sensitive learned systems. |
+| [LongStream](https://arxiv.org/abs/2602.13172) | Reject for this beta. The public lineage is VGGT-derived, the available checkpoint is large and executable, and redistribution terms are not explicit. |
+| [InstantSfM](https://arxiv.org/abs/2510.13310) | Paper-only Metal sparse-solver experiment. No stable official implementation was available to audit. |
+| [Speed3R](https://github.com/Visual-AI/speed3r) | Reuse the sparse-attention principle only. Its Pi3-derived weights are non-commercial. |
+| [Faster-GS](https://github.com/nerficg-project/faster-gaussian-splatting) | Clean-room candidate for measured raster, backward-pass, load-balancing, and buffer-reuse improvements in msplat. Do not import the CUDA stack. |
+| [FastGS](https://github.com/fastgs/FastGS) and [SAD-GS](https://arxiv.org/abs/2604.28016) | Benchmark their multi-view splitting and early anisotropic densification ideas independently. Retain only Pareto improvements with a clean license closure. |
+| [TurboGS](https://arxiv.org/abs/2606.15924) | Watchlist. No implementation was available to validate against Metal's tile-coherent renderer. |
+
+An untracked local single-capture diagnostic explains why DA3 is not the default, but is not release evidence. A 29-view Base run at 336 px spent 1.39 seconds in the model forward pass and 3.61 seconds in the full DA3 bridge, followed by a separately timed 32-second refinement. The bridge reported a 15.74 GB peak footprint. It registered every view with low aggregate residuals, but several cameras had weak track support. The 392 px variant contained a camera with only two observations and a 25× adjacent-position jump; a same-frame COLMAP comparison also showed a grossly different camera path. The fast result was not trustworthy.
+
+The next learned route must use a bounded initializer subset, register the remaining selected views into one canonical model, reject weak per-view topology, and pass true held-out PSNR, SSIM, and LPIPS comparisons. Until then, direct COLMAP is the honest default.
 
 ## Native training
 

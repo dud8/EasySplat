@@ -124,20 +124,21 @@ The only supported development overrides are the local toolchain root, candidate
 ```text
 input
   → preflight and topology policy
-  → anchored DA3 pose, depth, and confidence inference on MPS
-  → measured tracks, global fusion, and bounded COLMAP refinement
+  → bounded COLMAP feature matching and camera reconstruction
   → canonical COLMAP model
-  → native msplat Metal training with confidence-filtered initialization
+  → native msplat Metal training
   → validated Output/splat.ply
 ```
 
-COLMAP remains the quality reference, seeded refiner, and recovery route. It is not a user-facing backend choice. MetalSplatter is the native result viewer.
+COLMAP is the automatic geometry route for this beta. It is not a user-facing backend choice. A single-batch DA3 initializer remains available only to the typed benchmark override until it clears the full quality corpus. MetalSplatter is the native result viewer.
 
 The release toolchain is split into signed capabilities:
 
 - `macos-arm64-core`
 - `geometry-da3-base`
 - `geometry-da3-small`
+
+Normal runs install only the capabilities they need. The automatic route does not download DA3 weight components; the shared core still contains the Python runtime used by the stripped COLMAP bridge.
 
 See [ONBOARDING.md](ONBOARDING.md) for maintainer architecture and [CONTRIBUTING.md](CONTRIBUTING.md) for change rules.
 
