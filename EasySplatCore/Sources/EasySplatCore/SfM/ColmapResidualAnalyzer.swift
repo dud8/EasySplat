@@ -378,7 +378,6 @@ enum ColmapResidualAnalyzer {
             guard points[id] == nil else { throw Error.duplicatePoint(id) }
 
             var track = Set<ObservationKey>()
-            var trackedImages = Set<Int>()
             for offset in stride(from: 8, to: fields.count, by: 2) {
                 guard let imageID = Int(fields[offset]), imageID > 0,
                       let point2DIndex = Int(fields[offset + 1]), point2DIndex >= 0 else {
@@ -386,7 +385,6 @@ enum ColmapResidualAnalyzer {
                 }
                 let key = ObservationKey(imageID: imageID, point2DIndex: point2DIndex)
                 guard track.insert(key).inserted,
-                      trackedImages.insert(imageID).inserted,
                       trackOwners.updateValue(id, forKey: key) == nil else {
                     throw Error.duplicateTrack(imageID: imageID, point2DIndex: point2DIndex)
                 }
