@@ -28,7 +28,7 @@ public struct ColmapOptions: Sendable {
     public var sequentialOverlap: Int
     public var maxNumFeatures: Int?
     public var maxNumMatches: Int?
-    public var useBruteForceMatcher: Bool
+    public var descriptorMatcher: DescriptorMatcher
     public var exhaustiveBlockSize: Int?
     public var environment: [String: String]
 
@@ -39,7 +39,7 @@ public struct ColmapOptions: Sendable {
         sequentialOverlap: Int,
         maxNumFeatures: Int? = nil,
         maxNumMatches: Int? = nil,
-        useBruteForceMatcher: Bool = false,
+        descriptorMatcher: DescriptorMatcher = .faiss,
         exhaustiveBlockSize: Int? = nil,
         environment: [String: String] = [:]
     ) {
@@ -49,7 +49,7 @@ public struct ColmapOptions: Sendable {
         self.sequentialOverlap = sequentialOverlap
         self.maxNumFeatures = maxNumFeatures
         self.maxNumMatches = maxNumMatches
-        self.useBruteForceMatcher = useBruteForceMatcher
+        self.descriptorMatcher = descriptorMatcher
         self.exhaustiveBlockSize = exhaustiveBlockSize
         self.environment = environment
     }
@@ -64,7 +64,7 @@ public struct ColmapOptions: Sendable {
             sequentialOverlap: 10,
             maxNumFeatures: 8192,
             maxNumMatches: 8192,
-            useBruteForceMatcher: true,
+            descriptorMatcher: .faiss,
             exhaustiveBlockSize: 20,
             environment: [:]
         )
@@ -206,12 +206,10 @@ public final class ColmapRunner {
         if let maxNumMatches = options.maxNumMatches {
             finalArgs.append(contentsOf: ["--FeatureMatching.max_num_matches", "\(maxNumMatches)"])
         }
-        // matches_importer runs SIFT matching per listed pair, so on this toolchain's
-        // FLANN-segfaulting COLMAP build it needs the brute-force flag just like the
-        // sequential/exhaustive matchers, or it would crash the same way.
-        if options.useBruteForceMatcher {
-            finalArgs.append(contentsOf: ["--SiftMatching.cpu_brute_force_matcher", "1"])
-        }
+        finalArgs.append(contentsOf: [
+            "--SiftMatching.cpu_brute_force_matcher",
+            options.descriptorMatcher == .exact ? "1" : "0",
+        ])
         onLog("EasySplat: colmap argv: \(colmapPath.path) \(finalArgs.joined(separator: " "))", false)
         let result = try await runner.runAsync(
             colmapPath.path,
@@ -241,9 +239,10 @@ public final class ColmapRunner {
         if let maxNumMatches = options.maxNumMatches {
             finalArgs.append(contentsOf: ["--FeatureMatching.max_num_matches", "\(maxNumMatches)"])
         }
-        if options.useBruteForceMatcher {
-            finalArgs.append(contentsOf: ["--SiftMatching.cpu_brute_force_matcher", "1"])
-        }
+        finalArgs.append(contentsOf: [
+            "--SiftMatching.cpu_brute_force_matcher",
+            options.descriptorMatcher == .exact ? "1" : "0",
+        ])
         onLog("EasySplat: colmap argv: \(colmapPath.path) \(finalArgs.joined(separator: " "))", false)
         let result = try await runner.runAsync(
             colmapPath.path,
@@ -272,9 +271,10 @@ public final class ColmapRunner {
         if let maxNumMatches = options.maxNumMatches {
             finalArgs.append(contentsOf: ["--FeatureMatching.max_num_matches", "\(maxNumMatches)"])
         }
-        if options.useBruteForceMatcher {
-            finalArgs.append(contentsOf: ["--SiftMatching.cpu_brute_force_matcher", "1"])
-        }
+        finalArgs.append(contentsOf: [
+            "--SiftMatching.cpu_brute_force_matcher",
+            options.descriptorMatcher == .exact ? "1" : "0",
+        ])
         if let blockSize = options.exhaustiveBlockSize {
             finalArgs.append(contentsOf: ["--ExhaustiveMatching.block_size", "\(blockSize)"])
         }

@@ -69,7 +69,7 @@ extension PipelineRunner {
             sequentialOverlap: 10,
             maxNumFeatures: 8192,
             maxNumMatches: nil,
-            useBruteForceMatcher: false,
+            descriptorMatcher: .faiss,
             exhaustiveBlockSize: nil,
             environment: [
                 "OMP_NUM_THREADS": "\(extractThreads)",
@@ -89,7 +89,7 @@ extension PipelineRunner {
             sequentialOverlap: 10,
             maxNumFeatures: nil,
             maxNumMatches: 8192,
-            useBruteForceMatcher: true,
+            descriptorMatcher: .faiss,
             exhaustiveBlockSize: 20,
             environment: [
                 "OMP_NUM_THREADS": "\(matchThreads)",
@@ -97,6 +97,54 @@ extension PipelineRunner {
                 "MKL_NUM_THREADS": "\(matchThreads)"
             ]
         )
+    }
+
+    func runDa3MatchesImporterWithOneShotExactRecovery(
+        database: URL,
+        matchListPath: URL,
+        options: ColmapOptions,
+        onLog: @escaping @Sendable (String, Bool) -> Void,
+        emit: @escaping @Sendable (PipelineEvent) -> Void
+    ) async throws {
+        var attemptOptions = options
+        do {
+            try await tooling.colmap.runMatchesImporter(
+                colmapPath: config.toolchain.colmap,
+                database: database,
+                matchListPath: matchListPath,
+                matchType: "pairs",
+                options: attemptOptions,
+                onLog: onLog
+            )
+            return
+        } catch {
+            if error is CancellationError { throw error }
+            try Task.checkCancellation()
+            guard let reason = DescriptorMatcherRecoveryPolicy.reason(
+                for: error,
+                currentMatcher: attemptOptions.descriptorMatcher
+            ) else {
+                throw error
+            }
+
+            try ColmapDatabaseMatchStore.clearMatchingResults(at: database)
+            attemptOptions.descriptorMatcher = .exact
+            emit(.stageLog(
+                stage: .sfmMatching,
+                line: "FAISS matching failed (\(reason.rawValue)); preserving features and retrying with exact matching.",
+                isError: true
+            ))
+            emitColmapRetryDiagnostics(error, stage: .sfmMatching, emit: emit)
+            try Task.checkCancellation()
+            try await tooling.colmap.runMatchesImporter(
+                colmapPath: config.toolchain.colmap,
+                database: database,
+                matchListPath: matchListPath,
+                matchType: "pairs",
+                options: attemptOptions,
+                onLog: onLog
+            )
+        }
     }
 
 }

@@ -124,6 +124,7 @@ public final class PipelineRunner: @unchecked Sendable {
         var didRetryWithFewerFrames = false
         var didRetryWithCpu = false
         var didRetryWithHigherSequentialOverlap = false
+        var didRetryWithExactMatcher = false
         var forceExhaustiveMatching = false
         var lastUsedSequentialMatcher = false
         var lastExpectedMatchingPairs = 0
@@ -925,13 +926,12 @@ public final class PipelineRunner: @unchecked Sendable {
                             let matcherLog: @Sendable (String, Bool) -> Void = { line, isErr in
                                 colmapToolLog.append(stream: isErr ? "stderr" : "stdout", line: line)
                             }
-                            try await self.tooling.colmap.runMatchesImporter(
-                                colmapPath: self.config.toolchain.colmap,
+                            try await self.runDa3MatchesImporterWithOneShotExactRecovery(
                                 database: paths.colmapDatabaseURL,
                                 matchListPath: matchListURL,
-                                matchType: "pairs",
                                 options: da3ColmapMatchOptions,
-                                onLog: matcherLog
+                                onLog: matcherLog,
+                                emit: emit
                             )
                             lastUsedSequentialMatcher = false
                             let expectedPairs = pairPlan.pairs.count
@@ -1325,6 +1325,12 @@ public final class PipelineRunner: @unchecked Sendable {
                     } catch {
                         if error is CancellationError { throw error }
                         try Task.checkCancellation()
+                        if DescriptorMatcherRecoveryPolicy.reason(
+                            for: error,
+                            currentMatcher: colmapMatchOptions.descriptorMatcher
+                        ) != nil {
+                            throw error
+                        }
                         let previousOverlap = colmapMatchOptions.sequentialOverlap
                         let increasedOverlap = min(30, max(previousOverlap + 5, previousOverlap * 2))
                         if increasedOverlap > previousOverlap {
@@ -1340,6 +1346,12 @@ public final class PipelineRunner: @unchecked Sendable {
                             } catch {
                                 if error is CancellationError { throw error }
                                 try Task.checkCancellation()
+                                if DescriptorMatcherRecoveryPolicy.reason(
+                                    for: error,
+                                    currentMatcher: colmapMatchOptions.descriptorMatcher
+                                ) != nil {
+                                    throw error
+                                }
                                 emit(.stageLog(
                                     stage: .sfmMatching,
                                     line: "Sequential matcher failed again. Rebuilding database and retrying with exhaustive matching on fewer frames.",
@@ -1446,7 +1458,6 @@ public final class PipelineRunner: @unchecked Sendable {
                     } else {
                         colmapMatchOptions.maxNumMatches = 6000
                     }
-                    colmapMatchOptions.useBruteForceMatcher = true
                     colmapMatchOptions.exhaustiveBlockSize = min(colmapMatchOptions.exhaustiveBlockSize ?? 20, 20)
                     colmapMatchOptions.sequentialOverlap = min(colmapMatchOptions.sequentialOverlap, 5)
                 }
@@ -1474,11 +1485,15 @@ public final class PipelineRunner: @unchecked Sendable {
             }
 
             var forceSfMRun = false
+            var forceMatchingRun = false
             sfmAttemptLoop: while true {
                 while true {
                     do {
-                        try await runFeatures(forceSfMRun)
-                        try await runMatching(forceSfMRun)
+                        if !forceMatchingRun {
+                            try await runFeatures(forceSfMRun)
+                        }
+                        try await runMatching(forceSfMRun || forceMatchingRun)
+                        forceMatchingRun = false
                         if didRetryWithCpu {
                             emit(.stageLog(stage: .sfmMatching, line: "Retry on CPU succeeded.", isError: false))
                         }
@@ -1491,10 +1506,33 @@ public final class PipelineRunner: @unchecked Sendable {
                         try Task.checkCancellation()
                         if retryWithCpuIfNeeded(error) {
                             forceSfMRun = true
+                            forceMatchingRun = false
+                            continue
+                        }
+                        if !didRetryWithExactMatcher,
+                           let reason = DescriptorMatcherRecoveryPolicy.reason(
+                               for: error,
+                               currentMatcher: colmapMatchOptions.descriptorMatcher
+                           ) {
+                            didRetryWithExactMatcher = true
+                            colmapMatchOptions.descriptorMatcher = .exact
+                            try ColmapDatabaseMatchStore.clearMatchingResults(
+                                at: paths.colmapDatabaseURL
+                            )
+                            try self.resetDirectory(paths.colmapSparseURL)
+                            emit(.stageLog(
+                                stage: .sfmMatching,
+                                line: "FAISS matching failed (\(reason.rawValue)); preserving features and retrying with exact matching.",
+                                isError: true
+                            ))
+                            self.emitColmapRetryDiagnostics(error, stage: .sfmMatching, emit: emit)
+                            forceSfMRun = false
+                            forceMatchingRun = true
                             continue
                         }
                         if try await retryWithFewerFramesIfNeeded(error) {
                             forceSfMRun = true
+                            forceMatchingRun = false
                             continue
                         }
                         throw error
@@ -1643,6 +1681,30 @@ public final class PipelineRunner: @unchecked Sendable {
                        case .lowQualityReconstruction = pipelineError,
                        try await applyFewerFramesRetry("Reconstruction quality was low; retrying with fewer frames and exhaustive matching", false) {
                         forceSfMRun = true
+                        continue sfmAttemptLoop
+                    }
+
+                    if !mappingSucceeded,
+                       let pipelineError = lastMappingError as? PipelineError,
+                       case .lowQualityReconstruction = pipelineError,
+                       !didRetryWithExactMatcher,
+                       let reason = DescriptorMatcherRecoveryPolicy.reasonForRejectedGeometry(
+                           currentMatcher: colmapMatchOptions.descriptorMatcher,
+                           exhaustedFaissRetries: didRetryWithFewerFrames
+                       ) {
+                        didRetryWithExactMatcher = true
+                        colmapMatchOptions.descriptorMatcher = .exact
+                        try ColmapDatabaseMatchStore.clearMatchingResults(
+                            at: paths.colmapDatabaseURL
+                        )
+                        try self.resetDirectory(paths.colmapSparseURL)
+                        emit(.stageLog(
+                            stage: .sfmMatching,
+                            line: "FAISS geometry recovery was exhausted (\(reason.rawValue)); preserving features and retrying with exact matching.",
+                            isError: true
+                        ))
+                        forceSfMRun = false
+                        forceMatchingRun = true
                         continue sfmAttemptLoop
                     }
 

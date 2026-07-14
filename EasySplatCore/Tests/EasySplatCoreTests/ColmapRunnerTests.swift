@@ -96,7 +96,7 @@ final class ColmapRunnerTests: XCTestCase {
         )
     }
 
-    func testExhaustiveMatcherPassesSafeOptions() async throws {
+    func testExhaustiveMatcherUsesFaissByDefault() async throws {
         let runner = MockSubprocessRunner(scripts: [
             .init(
                 path: "/mock/colmap",
@@ -104,7 +104,7 @@ final class ColmapRunnerTests: XCTestCase {
                 result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""),
                 onRun: { args in
                     XCTAssertEqual(self.value(for: "--FeatureMatching.max_num_matches", in: args), "7000")
-                    XCTAssertEqual(self.value(for: "--SiftMatching.cpu_brute_force_matcher", in: args), "1")
+                    XCTAssertEqual(self.value(for: "--SiftMatching.cpu_brute_force_matcher", in: args), "0")
                     XCTAssertEqual(self.value(for: "--ExhaustiveMatching.block_size", in: args), "12")
                 }
             )
@@ -120,14 +120,13 @@ final class ColmapRunnerTests: XCTestCase {
                 matchThreads: 1,
                 sequentialOverlap: 10,
                 maxNumMatches: 7000,
-                useBruteForceMatcher: true,
                 exhaustiveBlockSize: 12
             ),
             onLog: { _, _ in }
         )
     }
 
-    func testSequentialMatcherPassesMaxMatches() async throws {
+    func testSequentialMatcherUsesFaissByDefault() async throws {
         let runner = MockSubprocessRunner(scripts: [
             .init(
                 path: "/mock/colmap",
@@ -135,7 +134,7 @@ final class ColmapRunnerTests: XCTestCase {
                 result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""),
                 onRun: { args in
                     XCTAssertEqual(self.value(for: "--FeatureMatching.max_num_matches", in: args), "9000")
-                    XCTAssertEqual(self.value(for: "--SiftMatching.cpu_brute_force_matcher", in: args), "1")
+                    XCTAssertEqual(self.value(for: "--SiftMatching.cpu_brute_force_matcher", in: args), "0")
                 }
             )
         ])
@@ -149,23 +148,20 @@ final class ColmapRunnerTests: XCTestCase {
                 extractThreads: 1,
                 matchThreads: 1,
                 sequentialOverlap: 5,
-                maxNumMatches: 9000,
-                useBruteForceMatcher: true
+                maxNumMatches: 9000
             ),
             onLog: { _, _ in }
         )
     }
 
-    func testMatchesImporterPassesBruteForceFlag() async throws {
+    func testMatchesImporterUsesFaissByDefault() async throws {
         let runner = MockSubprocessRunner(scripts: [
             .init(
                 path: "/mock/colmap",
                 argsPrefix: ["matches_importer"],
                 result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""),
                 onRun: { args in
-                    // matches_importer runs SIFT matching per pair; on the FLANN-segfaulting
-                    // build it must carry the brute-force flag like the other matchers.
-                    XCTAssertEqual(self.value(for: "--SiftMatching.cpu_brute_force_matcher", in: args), "1")
+                    XCTAssertEqual(self.value(for: "--SiftMatching.cpu_brute_force_matcher", in: args), "0")
                     XCTAssertEqual(self.value(for: "--match_type", in: args), "pairs")
                 }
             )
@@ -181,22 +177,20 @@ final class ColmapRunnerTests: XCTestCase {
                 useGPU: false,
                 extractThreads: 1,
                 matchThreads: 1,
-                sequentialOverlap: 5,
-                useBruteForceMatcher: true
+                sequentialOverlap: 5
             ),
             onLog: { _, _ in }
         )
     }
 
-    func testMatchesImporterOmitsBruteForceFlagWhenDisabled() async throws {
+    func testExactRecoveryUsesBruteForceMatching() async throws {
         let runner = MockSubprocessRunner(scripts: [
             .init(
                 path: "/mock/colmap",
                 argsPrefix: ["matches_importer"],
                 result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""),
                 onRun: { args in
-                    XCTAssertFalse(args.contains("--SiftMatching.cpu_brute_force_matcher"),
-                                   "The brute-force flag must be absent when it is not requested.")
+                    XCTAssertEqual(self.value(for: "--SiftMatching.cpu_brute_force_matcher", in: args), "1")
                 }
             )
         ])
@@ -212,7 +206,7 @@ final class ColmapRunnerTests: XCTestCase {
                 extractThreads: 1,
                 matchThreads: 1,
                 sequentialOverlap: 5,
-                useBruteForceMatcher: false
+                descriptorMatcher: .exact
             ),
             onLog: { _, _ in }
         )
