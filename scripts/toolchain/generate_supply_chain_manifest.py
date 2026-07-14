@@ -67,17 +67,6 @@ REVIEWED_LICENSE_IDENTIFIERS = {
     "Python-2.0",
 }
 REVIEWED_SUPPLEMENTAL_LICENSES = {
-    "tokenizers": {
-        "package": "tokenizers",
-        "version": "0.22.2",
-        "license": "Apache-2.0",
-        "source": "https://github.com/huggingface/tokenizers",
-        "sourceCommit": "f383101a26663708484cac0727792aad74f78234",
-        "artifact": "https://raw.githubusercontent.com/huggingface/tokenizers/f383101a26663708484cac0727792aad74f78234/LICENSE",
-        "artifactSha256": "c71d239df91726fc519c6eb72d318ec65820627232b2f796219e87dcf35d0ab4",
-        "distInfo": "tokenizers-0.22.2.dist-info",
-        "filename": "UPSTREAM_LICENSE",
-    },
     "antlr4-python3-runtime": {
         "package": "antlr4-python3-runtime",
         "version": "4.9.3",

@@ -18,9 +18,6 @@ SPEC.loader.exec_module(MODULE)
 PYCOLMAP_WHEEL_SHA256 = (
     "46d2108eaa1191584796a63f17a5f0204d59e30ec5f2778489ce44e19fff6ac2"
 )
-TOKENIZERS_LICENSE_SHA256 = (
-    "c71d239df91726fc519c6eb72d318ec65820627232b2f796219e87dcf35d0ab4"
-)
 ANTLR_LICENSE_SHA256 = (
     "b1b379fcaf3219593a4c433feb1b35c780bed23fafaae440b1ae2771a9521e3a"
 )
@@ -149,10 +146,6 @@ class PythonLicenseTests(unittest.TestCase):
 class SupplementalLicenseTests(unittest.TestCase):
     def test_reviewed_notice_hashes_are_pinned(self) -> None:
         self.assertEqual(
-            MODULE.REVIEWED_SUPPLEMENTAL_LICENSES["tokenizers"]["artifactSha256"],
-            TOKENIZERS_LICENSE_SHA256,
-        )
-        self.assertEqual(
             MODULE.REVIEWED_SUPPLEMENTAL_LICENSES["antlr4-python3-runtime"][
                 "artifactSha256"
             ],
@@ -162,13 +155,6 @@ class SupplementalLicenseTests(unittest.TestCase):
     def _write_fixture(self, root: Path) -> dict[str, dict[str, str]]:
         notices = []
         entries = (
-            (
-                "tokenizers",
-                "0.22.2",
-                "tokenizers-0.22.2.dist-info",
-                "UPSTREAM_LICENSE",
-                b"tokenizers license",
-            ),
             (
                 "antlr4-python3-runtime",
                 "4.9.3",
@@ -192,7 +178,7 @@ class SupplementalLicenseTests(unittest.TestCase):
             reviewed[package] = {
                 "package": package,
                 "version": version,
-                "license": "Apache-2.0" if package == "tokenizers" else "BSD-3-Clause",
+                "license": "BSD-3-Clause",
                 "source": f"https://example.com/{package}",
                 "sourceCommit": "a" * 40,
                 "artifact": f"https://example.com/{package}/LICENSE",
@@ -664,15 +650,13 @@ class Da3BuilderLicenseTests(unittest.TestCase):
 
     def test_builder_installs_checksum_pinned_missing_notices(self) -> None:
         for expected in (
-            "f383101a26663708484cac0727792aad74f78234",
-            TOKENIZERS_LICENSE_SHA256,
             "e4c1a74c66bd5290364ea2b36c97cd724b247357",
             ANTLR_LICENSE_SHA256,
             "python-package-upstream-notices.json",
-            "UPSTREAM_LICENSE",
             "UPSTREAM_LICENSE.txt",
         ):
             self.assertIn(expected, self.script)
+        self.assertNotIn("TOKENIZERS_LICENSE", self.script)
 
     def test_builder_records_exact_staged_bridge_sources(self) -> None:
         self.assertIn('"colmap_bridge_source_sha256"', self.script)

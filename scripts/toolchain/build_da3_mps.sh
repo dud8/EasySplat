@@ -17,10 +17,6 @@ COLMAP_LAUNCHER_SOURCE="$ROOT/Tools/Da3Sfm/colmap_launcher.c"
 COLMAP_LAUNCHER_SOURCE_SHA256="ab491ab2bf2aac71c7c0e65ae10241dd695aefd7158d967a2244d9ce692f8900"
 PIP_INSTALL_REPORT="$INSTALL_DIR/licenses/python-packages-install-report.json"
 SUPPLEMENTAL_LICENSE_MANIFEST="$INSTALL_DIR/licenses/python-package-upstream-notices.json"
-TOKENIZERS_LICENSE_COMMIT="f383101a26663708484cac0727792aad74f78234"
-TOKENIZERS_LICENSE_URL="https://raw.githubusercontent.com/huggingface/tokenizers/${TOKENIZERS_LICENSE_COMMIT}/LICENSE"
-TOKENIZERS_LICENSE_SHA256="c71d239df91726fc519c6eb72d318ec65820627232b2f796219e87dcf35d0ab4"
-TOKENIZERS_LICENSE_CACHE="$BUILD_DIR/licenses/tokenizers-0.22.2-LICENSE"
 ANTLR_LICENSE_COMMIT="e4c1a74c66bd5290364ea2b36c97cd724b247357"
 ANTLR_LICENSE_URL="https://raw.githubusercontent.com/antlr/antlr4/${ANTLR_LICENSE_COMMIT}/LICENSE.txt"
 ANTLR_LICENSE_SHA256="b1b379fcaf3219593a4c433feb1b35c780bed23fafaae440b1ae2771a9521e3a"
@@ -159,40 +155,26 @@ download_verified() {
 }
 
 install_supplemental_python_licenses() {
-  local -a tokenizers_dist_info=(
-    "$PYTHON_DIR"/lib/python*/site-packages/tokenizers-0.22.2.dist-info
-  )
   local -a antlr_dist_info=(
     "$PYTHON_DIR"/lib/python*/site-packages/antlr4_python3_runtime-4.9.3.dist-info
   )
-  if [ "${#tokenizers_dist_info[@]}" -ne 1 ] || [ ! -d "${tokenizers_dist_info[0]}" ]; then
-    echo "Expected exactly one tokenizers 0.22.2 distribution." >&2
-    exit 1
-  fi
   if [ "${#antlr_dist_info[@]}" -ne 1 ] || [ ! -d "${antlr_dist_info[0]}" ]; then
     echo "Expected exactly one antlr4-python3-runtime 4.9.3 distribution." >&2
     exit 1
   fi
 
   download_verified \
-    "$TOKENIZERS_LICENSE_URL" \
-    "$TOKENIZERS_LICENSE_CACHE" \
-    "$TOKENIZERS_LICENSE_SHA256"
-  download_verified \
     "$ANTLR_LICENSE_URL" \
     "$ANTLR_LICENSE_CACHE" \
     "$ANTLR_LICENSE_SHA256"
 
-  local tokenizers_license="${tokenizers_dist_info[0]}/licenses/UPSTREAM_LICENSE"
   local antlr_license="${antlr_dist_info[0]}/licenses/UPSTREAM_LICENSE.txt"
-  mkdir -p "$(dirname "$tokenizers_license")" "$(dirname "$antlr_license")"
-  install -m 0644 "$TOKENIZERS_LICENSE_CACHE" "$tokenizers_license"
+  mkdir -p "$(dirname "$antlr_license")"
   install -m 0644 "$ANTLR_LICENSE_CACHE" "$antlr_license"
 
   "$PYTHON_DIR/bin/python3" - \
     "$INSTALL_DIR" \
     "$SUPPLEMENTAL_LICENSE_MANIFEST" \
-    "$tokenizers_license" \
     "$antlr_license" <<PY
 import json
 import sys
@@ -209,18 +191,6 @@ payload = {
     "schemaVersion": 1,
     "notices": [
         {
-            "package": "tokenizers",
-            "version": "0.22.2",
-            "license": "Apache-2.0",
-            "source": "https://github.com/huggingface/tokenizers",
-            "sourceCommit": "${TOKENIZERS_LICENSE_COMMIT}",
-            "artifact": "${TOKENIZERS_LICENSE_URL}",
-            "artifactSha256": "${TOKENIZERS_LICENSE_SHA256}",
-            "distInfo": "tokenizers-0.22.2.dist-info",
-            "filename": "UPSTREAM_LICENSE",
-            "installedPath": relative(sys.argv[3]),
-        },
-        {
             "package": "antlr4-python3-runtime",
             "version": "4.9.3",
             "license": "BSD-3-Clause",
@@ -230,7 +200,7 @@ payload = {
             "artifactSha256": "${ANTLR_LICENSE_SHA256}",
             "distInfo": "antlr4_python3_runtime-4.9.3.dist-info",
             "filename": "UPSTREAM_LICENSE.txt",
-            "installedPath": relative(sys.argv[4]),
+            "installedPath": relative(sys.argv[3]),
         },
     ],
 }
