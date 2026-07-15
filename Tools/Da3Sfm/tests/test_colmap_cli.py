@@ -377,6 +377,57 @@ class ColmapCliTests(unittest.TestCase):
             self.assertTrue(outputs[0])
             self.assertEqual(outputs[0], outputs[1])
 
+    def test_real_pycolmap_feature_extraction_uses_reviewed_signature(self) -> None:
+        try:
+            import pycolmap
+            from PIL import Image
+        except ImportError:
+            if os.environ.get("EASYSPLAT_REQUIRE_REAL_PYCOLMAP") == "1":
+                self.fail("the packaged toolchain is missing PyCOLMAP or Pillow")
+            self.skipTest("real PyCOLMAP is exercised while packaging the toolchain")
+
+        self.assertEqual(pycolmap.__version__, "4.1.0")
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            image_path = root / "images"
+            image_path.mkdir()
+            random = np.random.default_rng(42)
+            for index in range(2):
+                pixels = random.integers(
+                    0,
+                    256,
+                    size=(256, 256, 3),
+                    dtype=np.uint8,
+                )
+                Image.fromarray(pixels).save(image_path / f"image_{index}.png")
+
+            database_path = root / "database.db"
+            colmap_cli.run_command(
+                "feature_extractor",
+                {
+                    "database_path": str(database_path),
+                    "image_path": str(image_path),
+                    "ImageReader.single_camera": "1",
+                    "ImageReader.camera_model": "SIMPLE_RADIAL",
+                    "SiftExtraction.max_image_size": "256",
+                    "SiftExtraction.max_num_features": "1024",
+                    "FeatureExtraction.num_threads": "2",
+                },
+                pycolmap_module=pycolmap,
+            )
+
+            database = pycolmap.Database.open(database_path)
+            try:
+                images = list(database.read_all_images())
+                self.assertEqual(len(images), 2)
+                feature_counts = [
+                    database.read_keypoints(image.image_id).shape[0]
+                    for image in images
+                ]
+                self.assertTrue(all(count > 0 for count in feature_counts))
+            finally:
+                database.close()
+
     def test_local_vocab_retriever_options_are_explicit_and_offline(self) -> None:
         parsed = colmap_cli._parse_options(
             "local_vocab_retriever",
@@ -1033,7 +1084,7 @@ class ColmapCliTests(unittest.TestCase):
         self.assertEqual(kwargs["database_path"], "/tmp/database.db")
         self.assertEqual(kwargs["image_path"], str(image_path))
         self.assertEqual(kwargs["camera_mode"], "single")
-        self.assertEqual(kwargs["camera_model"], "PINHOLE")
+        self.assertNotIn("camera_model", kwargs)
         self.assertEqual(kwargs["device"], "cpu")
         self.assertEqual(kwargs["reader_options"].camera_model, "PINHOLE")
         extraction = kwargs["extraction_options"]
@@ -1042,6 +1093,14 @@ class ColmapCliTests(unittest.TestCase):
         self.assertEqual(extraction.num_threads, 4)
         self.assertEqual(extraction.sift.max_num_features, 4096)
         self.assertTrue(database.closed)
+
+    def test_feature_descriptor_wrapper_reports_its_matrix_rows(self) -> None:
+        descriptors = _FeatureDescriptors(
+            "sift",
+            np.ones((3, 128), dtype=np.uint8),
+        )
+
+        self.assertEqual(colmap_cli._matrix_rows(descriptors), 3)
 
     def test_feature_extractor_rejects_missing_or_mismatched_database_results(self) -> None:
         cases = {

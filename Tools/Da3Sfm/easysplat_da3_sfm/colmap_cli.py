@@ -425,6 +425,8 @@ def _input_image_names(image_path: str) -> list[str]:
 
 def _matrix_rows(values: Any) -> int:
     array = np.asarray(values)
+    if array.ndim != 2 and hasattr(values, "data"):
+        array = np.asarray(values.data)
     if array.ndim != 2 or array.size == 0:
         return 0
     return int(array.shape[0])
@@ -512,7 +514,6 @@ def _run_feature_extractor(pycolmap: Any, options: dict[str, str]) -> None:
         database_path=database_path,
         image_path=image_path,
         camera_mode=camera_mode,
-        camera_model=camera_model,
         reader_options=reader,
         extraction_options=extraction,
         device=pycolmap.Device.cpu,

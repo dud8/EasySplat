@@ -476,7 +476,8 @@ EASYSPLAT_REQUIRE_REAL_PYCOLMAP=1 \
   PYTHONPATH="$OUT/da3_mps/app" \
   "$OUT/da3_mps/python/bin/python3" \
   "$ROOT/Tools/Da3Sfm/tests/test_colmap_cli.py" \
-  ColmapCliTests.test_real_pycolmap_local_vocab_retrieval_is_deterministic
+  ColmapCliTests.test_real_pycolmap_local_vocab_retrieval_is_deterministic \
+  ColmapCliTests.test_real_pycolmap_feature_extraction_uses_reviewed_signature
 
 colmap_root_help="$("$BIN/colmap" -h 2>&1)" || {
   echo "colmap bridge failed to launch" >&2
