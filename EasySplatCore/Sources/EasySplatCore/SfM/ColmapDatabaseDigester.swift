@@ -183,7 +183,11 @@ enum ColmapDatabaseDigester {
             nil
         )
         guard prepareResult == SQLITE_OK, let statement else {
-            throw ColmapDatabaseDigesterError.invalidTable(table.name)
+            throw ColmapDatabaseDigesterError.operationFailed(
+                operation: "inspect the \(table.name) table",
+                code: prepareResult,
+                message: String(cString: sqlite3_errmsg(database))
+            )
         }
         defer { sqlite3_finalize(statement) }
 
@@ -191,8 +195,14 @@ enum ColmapDatabaseDigester {
         while true {
             let stepResult = sqlite3_step(statement)
             if stepResult == SQLITE_DONE { break }
-            guard stepResult == SQLITE_ROW,
-                  sqlite3_column_type(statement, 1) == SQLITE_TEXT,
+            guard stepResult == SQLITE_ROW else {
+                throw ColmapDatabaseDigesterError.operationFailed(
+                    operation: "inspect the \(table.name) table",
+                    code: stepResult,
+                    message: String(cString: sqlite3_errmsg(database))
+                )
+            }
+            guard sqlite3_column_type(statement, 1) == SQLITE_TEXT,
                   let bytes = sqlite3_column_text(statement, 1) else {
                 throw ColmapDatabaseDigesterError.invalidTable(table.name)
             }

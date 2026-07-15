@@ -17,6 +17,8 @@ final class ColmapSQLiteDatabaseHandle {
     private let canonicalParentIdentity: FileIdentity
     private let databaseURL: URL
     private let databaseIdentity: FileIdentity
+    private let databaseSnapshotIdentity: FileSnapshotIdentity?
+    private let requiresAbsentSidecars: Bool
 
     private init(
         database: OpaquePointer,
@@ -25,7 +27,9 @@ final class ColmapSQLiteDatabaseHandle {
         canonicalParentURL: URL,
         canonicalParentIdentity: FileIdentity,
         databaseURL: URL,
-        databaseIdentity: FileIdentity
+        databaseIdentity: FileIdentity,
+        databaseSnapshotIdentity: FileSnapshotIdentity?,
+        requiresAbsentSidecars: Bool
     ) {
         self.database = database
         self.sourceParentURL = sourceParentURL
@@ -34,6 +38,8 @@ final class ColmapSQLiteDatabaseHandle {
         self.canonicalParentIdentity = canonicalParentIdentity
         self.databaseURL = databaseURL
         self.databaseIdentity = databaseIdentity
+        self.databaseSnapshotIdentity = databaseSnapshotIdentity
+        self.requiresAbsentSidecars = requiresAbsentSidecars
     }
 
     deinit {
@@ -85,11 +91,33 @@ final class ColmapSQLiteDatabaseHandle {
         )
         let databaseIdentity = FileIdentity(databaseMetadata)
 
+        let isReadOnlySnapshot = flags & SQLITE_OPEN_READONLY != 0
+            && flags & SQLITE_OPEN_READWRITE == 0
+        let walURL = URL(fileURLWithPath: databaseURL.path + "-wal")
+        let sharedMemoryURL = URL(fileURLWithPath: databaseURL.path + "-shm")
+        let hasWALSidecar = try optionalRegularFileMetadata(at: walURL) != nil
+        let hasSharedMemorySidecar = try optionalRegularFileMetadata(at: sharedMemoryURL) != nil
+        // A clean WAL database can retain its WAL header after SQLite removes both
+        // sidecars. Immutable mode reads that stable main-file snapshot without
+        // creating files; verifyUnchanged binds the snapshot before and after use.
+        let useImmutableSnapshot = isReadOnlySnapshot
+            && !hasWALSidecar
+            && !hasSharedMemorySidecar
+
+        let openPath: String
+        var openFlags = flags | SQLITE_OPEN_NOFOLLOW
+        if useImmutableSnapshot {
+            openPath = databaseURL.absoluteString + "?immutable=1"
+            openFlags |= SQLITE_OPEN_URI
+        } else {
+            openPath = databaseURL.path
+        }
+
         var database: OpaquePointer?
         let openResult = sqlite3_open_v2(
-            databaseURL.path,
+            openPath,
             &database,
-            flags | SQLITE_OPEN_NOFOLLOW,
+            openFlags,
             nil
         )
         guard openResult == SQLITE_OK, let database else {
@@ -111,7 +139,11 @@ final class ColmapSQLiteDatabaseHandle {
             canonicalParentURL: canonicalParentURL,
             canonicalParentIdentity: canonicalParentIdentity,
             databaseURL: databaseURL,
-            databaseIdentity: databaseIdentity
+            databaseIdentity: databaseIdentity,
+            databaseSnapshotIdentity: isReadOnlySnapshot
+                ? FileSnapshotIdentity(databaseMetadata)
+                : nil,
+            requiresAbsentSidecars: useImmutableSnapshot
         )
         try handle.verifyUnchanged()
         return handle
@@ -133,9 +165,21 @@ final class ColmapSQLiteDatabaseHandle {
             expectedType: S_IFREG,
             requireSingleLink: true
         )
+        let matchesSnapshot = databaseSnapshotIdentity.map {
+            FileSnapshotIdentity(databaseMetadata) == $0
+        } ?? true
+        if requiresAbsentSidecars {
+            let walURL = URL(fileURLWithPath: databaseURL.path + "-wal")
+            let sharedMemoryURL = URL(fileURLWithPath: databaseURL.path + "-shm")
+            guard try Self.optionalRegularFileMetadata(at: walURL) == nil,
+                  try Self.optionalRegularFileMetadata(at: sharedMemoryURL) == nil else {
+                throw ColmapSQLiteDatabaseHandleError.unsafeDatabaseFile
+            }
+        }
         guard FileIdentity(sourceParent) == sourceParentIdentity,
               FileIdentity(canonicalParent) == canonicalParentIdentity,
-              FileIdentity(databaseMetadata) == databaseIdentity else {
+              FileIdentity(databaseMetadata) == databaseIdentity,
+              matchesSnapshot else {
             throw ColmapSQLiteDatabaseHandleError.unsafeDatabaseFile
         }
 
@@ -172,6 +216,21 @@ final class ColmapSQLiteDatabaseHandle {
         return metadata
     }
 
+    private static func optionalRegularFileMetadata(at url: URL) throws -> stat? {
+        var metadata = stat()
+        guard lstat(url.path, &metadata) == 0 else {
+            if errno == ENOENT {
+                return nil
+            }
+            throw ColmapSQLiteDatabaseHandleError.unsafeDatabaseFile
+        }
+        guard (metadata.st_mode & S_IFMT) == S_IFREG,
+              metadata.st_nlink == 1 else {
+            throw ColmapSQLiteDatabaseHandleError.unsafeDatabaseFile
+        }
+        return metadata
+    }
+
     private struct FileIdentity: Equatable {
         let device: dev_t
         let inode: ino_t
@@ -179,6 +238,26 @@ final class ColmapSQLiteDatabaseHandle {
         init(_ metadata: stat) {
             device = metadata.st_dev
             inode = metadata.st_ino
+        }
+    }
+
+    private struct FileSnapshotIdentity: Equatable {
+        let device: dev_t
+        let inode: ino_t
+        let size: off_t
+        let modificationSeconds: Int
+        let modificationNanoseconds: Int
+        let changeSeconds: Int
+        let changeNanoseconds: Int
+
+        init(_ metadata: stat) {
+            device = metadata.st_dev
+            inode = metadata.st_ino
+            size = metadata.st_size
+            modificationSeconds = metadata.st_mtimespec.tv_sec
+            modificationNanoseconds = metadata.st_mtimespec.tv_nsec
+            changeSeconds = metadata.st_ctimespec.tv_sec
+            changeNanoseconds = metadata.st_ctimespec.tv_nsec
         }
     }
 }

@@ -77,6 +77,24 @@ final class ColmapDatabaseDigesterTests: XCTestCase {
         XCTAssertThrowsError(try ColmapDatabaseDigester.digests(at: databaseURL))
     }
 
+    func testDigestReadsCheckpointedWALDatabaseWithoutSidecars() throws {
+        let root = try TestFileBuilder.makeTempDir()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let databaseURL = root.appendingPathComponent("database.db")
+        try makeDatabase(at: databaseURL)
+        try execute("PRAGMA journal_mode = WAL;", at: databaseURL)
+
+        let header = try Data(contentsOf: databaseURL, options: .mappedIfSafe)
+        XCTAssertGreaterThanOrEqual(header.count, 20)
+        XCTAssertEqual(Array(header[18...19]), [2, 2])
+        XCTAssertFalse(FileManager.default.fileExists(atPath: databaseURL.path + "-wal"))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: databaseURL.path + "-shm"))
+
+        let digests = try ColmapDatabaseDigester.digests(at: databaseURL)
+        XCTAssertEqual(digests.feature.count, 64)
+        XCTAssertEqual(digests.matching.count, 64)
+    }
+
     private func makeDatabase(at url: URL) throws {
         try execute(
             """
