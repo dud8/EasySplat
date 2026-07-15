@@ -75,6 +75,7 @@ final class AppModel: ObservableObject {
     @Published var shareStatusMessage: String? = nil
     @Published var shareStatusIsError: Bool = false
     @Published var isShareSheetActive: Bool = false
+    @Published var isShareReady: Bool = false
 
     let toolchainManager: ToolchainManaging
     let hardwareProfile: HardwareProfile
@@ -110,7 +111,8 @@ final class AppModel: ObservableObject {
     }
     var forcedExitTask: Task<Void, Never>?
     var activeShareSession: ShareSession?
-    var shareValidationToken: UUID?
+    var preparedShareItem: PreparedShareItem?
+    var sharePreparationToken: UUID?
     static let forcedExitTimeoutNanoseconds: UInt64 = 25_000_000_000
 
     enum StopAction {

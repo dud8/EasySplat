@@ -59,6 +59,10 @@ struct ViewerView: View {
         }
         .onAppear(perform: loadMetadata)
         .onChange(of: model.currentProjectURL) { _, _ in loadMetadata() }
+        .task(id: model.outputPlyURL) {
+            guard model.outputPlyURL != nil else { return }
+            await model.prepareCurrentSplatForSharing()
+        }
     }
 
     @ToolbarContentBuilder
@@ -77,14 +81,13 @@ struct ViewerView: View {
             .help("Save a copy of the validated PLY")
             .accessibilityIdentifier("result.export")
 
-            Button {
-                Task { await model.shareCurrentSplat() }
-            } label: {
-                Label("Share", systemImage: "square.and.arrow.up")
+            ShareToolbarButton(
+                isEnabled: model.outputPlyURL != nil
+                    && model.isShareReady
+                    && !model.isShareSheetActive
+            ) { sourceView in
+                model.presentPreparedShare(from: sourceView)
             }
-            .disabled(model.outputPlyURL == nil || model.isShareSheetActive)
-            .help("Share the validated PLY")
-            .accessibilityIdentifier("result.share")
 
             Button {
                 isInspectorPresented.toggle()

@@ -2526,18 +2526,18 @@ final class AppModelTests: XCTestCase {
 
         let projectURL = try XCTUnwrap(model.currentProjectURL)
         let outputURL = try XCTUnwrap(model.outputPlyURL)
-        let validatedItems = try await model.test_validatedShareItems()
-        let items = try XCTUnwrap(validatedItems)
-        XCTAssertEqual(items.count, 1)
-        XCTAssertEqual(try XCTUnwrap(items.first as? URL).standardizedFileURL, outputURL.standardizedFileURL)
-
-        await model.shareCurrentSplat()
+        await model.prepareCurrentSplatForSharing()
+        let preparedItem = try XCTUnwrap(model.test_preparedShareItem())
+        XCTAssertEqual(preparedItem.outputURL.standardizedFileURL, outputURL.standardizedFileURL)
+        let outputBytes = try XCTUnwrap(outputURL.resourceValues(forKeys: [.fileSizeKey]).fileSize)
+        XCTAssertEqual(preparedItem.byteCount, Int64(outputBytes))
+        XCTAssertTrue(model.isShareReady)
 
         let appEventsURL = projectURL.appendingPathComponent("Logs/app_events.jsonl")
         XCTAssertFalse(FileManager.default.fileExists(atPath: appEventsURL.path))
     }
 
-    func testShareCurrentSplatReportsMissingOutputFile() async throws {
+    func testSharePreparationReportsMissingOutputFile() async throws {
         let tempBase = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
         defer { try? FileManager.default.removeItem(at: tempBase) }
         try FileManager.default.createDirectory(at: tempBase, withIntermediateDirectories: true)
@@ -2558,10 +2558,13 @@ final class AppModelTests: XCTestCase {
         }
         try FileManager.default.removeItem(at: output)
 
-        await model.shareCurrentSplat()
+        await model.prepareCurrentSplatForSharing()
 
         XCTAssertTrue(model.shareStatusIsError)
-        XCTAssertTrue((model.shareStatusMessage ?? "").contains("Could not find"))
+        XCTAssertEqual(
+            model.shareStatusMessage,
+            "Could not find splat.ply. Rebuild or reopen the project."
+        )
         XCTAssertFalse(
             FileManager.default.fileExists(
                 atPath: projectURL.appendingPathComponent("Logs/app_events.jsonl").path
@@ -2569,7 +2572,7 @@ final class AppModelTests: XCTestCase {
         )
     }
 
-    func testShareCurrentSplatReportsInvalidOutputDirectoryPath() async throws {
+    func testSharePreparationReportsInvalidOutputDirectoryPath() async throws {
         let tempBase = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
         defer { try? FileManager.default.removeItem(at: tempBase) }
         try FileManager.default.createDirectory(at: tempBase, withIntermediateDirectories: true)
@@ -2591,12 +2594,12 @@ final class AppModelTests: XCTestCase {
         try FileManager.default.removeItem(at: output)
         try FileManager.default.createDirectory(at: output, withIntermediateDirectories: true)
 
-        await model.shareCurrentSplat()
+        await model.prepareCurrentSplatForSharing()
 
         XCTAssertTrue(model.shareStatusIsError)
     }
 
-    func testShareCurrentSplatRejectsFallbackOutputFromDifferentProject() async throws {
+    func testSharePreparationRejectsFallbackOutputFromDifferentProject() async throws {
         let tempBase = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
         defer { try? FileManager.default.removeItem(at: tempBase) }
         try FileManager.default.createDirectory(at: tempBase, withIntermediateDirectories: true)
@@ -2609,14 +2612,14 @@ final class AppModelTests: XCTestCase {
         model.currentProjectURL = secondURL
         model.outputPlyURL = firstOutput
 
-        await model.shareCurrentSplat()
+        await model.prepareCurrentSplatForSharing()
 
         XCTAssertTrue(model.shareStatusIsError)
-        let fallbackItems = try await model.test_validatedShareItems()
-        XCTAssertNil(fallbackItems)
+        XCTAssertNil(model.test_preparedShareItem())
+        XCTAssertFalse(model.isShareReady)
     }
 
-    func testShareCurrentSplatIgnoredWhileSessionAlreadyActive() async throws {
+    func testPreparedSharePresentationIsIgnoredWhileSessionAlreadyActive() async throws {
         let tempBase = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
         defer { try? FileManager.default.removeItem(at: tempBase) }
         try FileManager.default.createDirectory(at: tempBase, withIntermediateDirectories: true)
@@ -2633,11 +2636,25 @@ final class AppModelTests: XCTestCase {
 
         model.test_activateShareSession()
 
-        await model.shareCurrentSplat()
+        model.presentPreparedShare(from: NSButton())
 
         XCTAssertEqual(model.shareStatusMessage, "Share is already open.")
         XCTAssertFalse(model.shareStatusIsError)
         XCTAssertTrue(model.isShareSheetActive)
+    }
+
+    func testResetClosesTheActiveShareSessionExactlyOnce() throws {
+        let model = AppModel(toolchainManager: MockToolchainManager()) { projectURL, config in
+            MockPipelineRunner(projectURL: projectURL, config: config)
+        }
+        model.test_activateShareSession()
+        let session = try XCTUnwrap(model.activeShareSession)
+
+        model.reset()
+
+        XCTAssertNil(model.activeShareSession)
+        XCTAssertFalse(model.isShareSheetActive)
+        XCTAssertFalse(session.close(), "reset() must close rather than merely release the picker session")
     }
 
     func testErrorStageLogsBypassThrottle() async throws {

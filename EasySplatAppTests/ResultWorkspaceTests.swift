@@ -1,8 +1,9 @@
-import EasySplatCore
+import AppKit
 import Foundation
 import MetalKit
 import XCTest
 @testable import EasySplatApp
+@testable import EasySplatCore
 
 final class ResultWorkspaceTests: XCTestCase {
     func testPhotoSelectionFactAppearsOnlyForInputsContainingPhotos() {
@@ -111,6 +112,141 @@ final class ResultWorkspaceTests: XCTestCase {
             view.focusRingMaskBounds,
             view.bounds.insetBy(dx: 2, dy: 2)
         )
+    }
+
+    @MainActor
+    func testShareToolbarButtonUsesMouseDownAndProgrammaticActivationKeepsItsOwnAnchor() {
+        let button = ShareToolbarNSButton()
+        var activationSource: NSView?
+        button.onActivate = { activationSource = $0 }
+
+        XCTAssertEqual(
+            button.sendAction(on: .leftMouseDown),
+            Int(NSEvent.EventTypeMask.leftMouseDown.rawValue)
+        )
+        button.performClick(nil)
+
+        XCTAssertTrue(activationSource === button)
+        activationSource = nil
+        XCTAssertTrue(button.accessibilityPerformPress())
+        XCTAssertTrue(activationSource === button)
+        XCTAssertEqual(button.accessibilityIdentifier(), "result.share")
+        XCTAssertEqual(button.accessibilityLabel(), "Share")
+    }
+
+    @MainActor
+    func testShareSessionUsesTheButtonBoundsForBothPickerAndSharingServiceAnchors() {
+        let model = AppModel(toolchainManager: ResultTestToolchainManager())
+        let source = NSButton(frame: NSRect(x: 0, y: 0, width: 31, height: 27))
+        var presentedRect: NSRect?
+        weak var presentedView: NSView?
+        var presentedEdge: NSRectEdge?
+        let session = ShareSession(
+            model: model,
+            presenter: { _, rect, view, edge in
+                presentedRect = rect
+                presentedView = view
+                presentedEdge = edge
+            }
+        )
+
+        session.present(items: [URL(fileURLWithPath: "/tmp/result.ply")], from: source)
+
+        XCTAssertEqual(presentedRect, source.bounds)
+        XCTAssertTrue(presentedView === source)
+        XCTAssertEqual(presentedEdge, .minY)
+
+        let service = NSSharingService(
+            title: "Test",
+            image: NSImage(size: NSSize(width: 16, height: 16)),
+            alternateImage: nil,
+            handler: {}
+        )
+        var serviceRect = NSRect.zero
+        var serviceEdge = NSRectEdge.maxX
+        let serviceAnchor = session.anchoringView(
+            for: service,
+            showRelativeTo: &serviceRect,
+            preferredEdge: &serviceEdge
+        )
+
+        XCTAssertTrue(serviceAnchor === source)
+        XCTAssertEqual(serviceRect, source.bounds)
+        XCTAssertEqual(serviceEdge, .minY)
+        XCTAssertTrue(session.close())
+        XCTAssertFalse(session.close())
+    }
+
+    @MainActor
+    func testSharePreparationCarriesPersistedDigestAndRejectsAChangedFileSnapshot() async throws {
+        let base = try temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: base) }
+        let projectURL = try makeFinishedProject(
+            in: base,
+            validOutput: true,
+            includeTrainingArtifact: true
+        )
+        let outputURL = ProjectPaths(root: projectURL).outputURL.appendingPathComponent("splat.ply")
+        let metadata = try ProjectMetadataStore.load(from: ProjectPaths(root: projectURL).metadataURL)
+        let model = AppModel(toolchainManager: ResultTestToolchainManager(), projectBaseURL: base)
+        model.currentProjectURL = projectURL
+        model.outputPlyURL = outputURL
+
+        await model.prepareCurrentSplatForSharing()
+
+        let prepared = try XCTUnwrap(model.test_preparedShareItem())
+        XCTAssertEqual(prepared.validatedSHA256, metadata.trainingArtifact?.outputSHA256)
+        XCTAssertEqual(prepared.byteCount, metadata.trainingArtifact?.outputBytes)
+        XCTAssertTrue(model.isShareReady)
+
+        let handle = try FileHandle(forWritingTo: outputURL)
+        try handle.seekToEnd()
+        try handle.write(contentsOf: Data("\n".utf8))
+        try handle.close()
+
+        model.presentPreparedShare(from: NSButton())
+
+        XCTAssertNil(model.test_preparedShareItem())
+        XCTAssertFalse(model.isShareReady)
+        XCTAssertNil(model.activeShareSession)
+        XCTAssertTrue(model.shareStatusIsError)
+    }
+
+    @MainActor
+    func testSharePreparationIsDiscardedWhenTheProjectChangesDuringValidation() async throws {
+        let base = try temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: base) }
+        let firstProject = try makeFinishedProject(in: base, validOutput: true)
+        let secondProject = base.appendingPathComponent("Second.easysplatproj", isDirectory: true)
+        let firstOutput = ProjectPaths(root: firstProject).outputURL.appendingPathComponent("splat.ply")
+        let validationStarted = DispatchSemaphore(value: 0)
+        let allowValidationToFinish = DispatchSemaphore(value: 0)
+        let model = AppModel(
+            toolchainManager: ResultTestToolchainManager(),
+            projectBaseURL: base,
+            finishedOutputValidator: { _ in
+                validationStarted.signal()
+                _ = allowValidationToFinish.wait(timeout: .now() + 2)
+                return firstOutput
+            }
+        )
+        model.currentProjectURL = firstProject
+        model.outputPlyURL = firstOutput
+
+        let preparation = Task { await model.prepareCurrentSplatForSharing() }
+        let validationStartResult = await withCheckedContinuation { continuation in
+            DispatchQueue.global().async {
+                continuation.resume(returning: validationStarted.wait(timeout: .now() + 1))
+            }
+        }
+        XCTAssertEqual(validationStartResult, .success)
+        model.currentProjectURL = secondProject
+        model.outputPlyURL = nil
+        allowValidationToFinish.signal()
+        await preparation.value
+
+        XCTAssertNil(model.test_preparedShareItem())
+        XCTAssertFalse(model.isShareReady)
     }
 
     @MainActor
@@ -637,7 +773,8 @@ final class ResultWorkspaceTests: XCTestCase {
     private func makeFinishedProject(
         in base: URL,
         validOutput: Bool,
-        stage: PipelineStage = .done
+        stage: PipelineStage = .done,
+        includeTrainingArtifact: Bool = false
     ) throws -> URL {
         let projectURL = base.appendingPathComponent("Result.easysplatproj", isDirectory: true)
         let paths = ProjectPaths(root: projectURL)
@@ -648,10 +785,47 @@ final class ResultWorkspaceTests: XCTestCase {
         } else {
             try Data("not a ply".utf8).write(to: outputURL)
         }
+        let trainingArtifact: TrainingArtifact?
+        if validOutput, includeTrainingArtifact {
+            let outputBytes = Int64(try XCTUnwrap(outputURL.resourceValues(forKeys: [.fileSizeKey]).fileSize))
+            trainingArtifact = TrainingArtifact(
+                trainerVersion: "test",
+                runtimeVersion: "native-metal-cli-v2",
+                trainerBuildDigest: String(repeating: "a", count: 64),
+                inputDigest: String(repeating: "b", count: 64),
+                geometryDigest: String(repeating: "c", count: 64),
+                detailProfile: .balanced,
+                iterationLimit: 7_000,
+                plateauWindow: 800,
+                deterministicSeed: 42,
+                completedIteration: 7_000,
+                checkpointPath: nil,
+                checkpointDigest: nil,
+                outputPath: "Output/splat.ply",
+                outputSHA256: try GeometryArtifactStore.sha256(of: outputURL),
+                outputBytes: outputBytes,
+                gaussianCount: 1,
+                elapsedSeconds: 1,
+                peakMemoryBytes: 1,
+                memoryBudgetBytes: 1,
+                rasterFallbackCount: 0,
+                rasterExactFallbackElapsedSeconds: 0,
+                rasterExactBufferGrowthCount: 0,
+                rasterExactBufferBytesAdded: 0,
+                rasterReplayElapsedSeconds: 0,
+                rasterPeakExactIntersectionCapacity: 0,
+                droppedIntersectionCount: 0,
+                sceneBounds: SplatSceneBounds(center: .init(x: 0, y: 0, z: 0), radius: 1),
+                completionStatus: .completed
+            )
+        } else {
+            trainingArtifact = nil
+        }
         let metadata = ProjectMetadata(
             title: "Result",
             input: .photos(folder: "/tmp/photos"),
             requestedRunOptions: RequestedRunOptions(capturePath: .walkthrough, detailProfile: .balanced),
+            trainingArtifact: trainingArtifact,
             state: PipelineState(stage: stage, lastError: nil),
             outputs: OutputSpec(
                 splatPlyPath: "Output/splat.ply",

@@ -653,11 +653,9 @@ extension AppModel {
         currentProjectNotes = ""
         currentProjectURL = nil
         stopAction = nil
+        cancelSharing()
         shareStatusMessage = nil
         shareStatusIsError = false
-        isShareSheetActive = false
-        activeShareSession = nil
-        shareValidationToken = nil
         if notesSaved {
             notesSaveState = .idle
             actionFailure = nil

@@ -2,81 +2,151 @@ import AppKit
 import EasySplatCore
 import Foundation
 
+struct ShareFileSnapshot: Equatable {
+    let deviceNumber: UInt64
+    let fileNumber: UInt64
+    let byteCount: Int64
+    let modificationDate: Date
+
+    static func capture(at url: URL) -> ShareFileSnapshot? {
+        guard let attributes = try? FileManager.default.attributesOfItem(atPath: url.path),
+              attributes[.type] as? FileAttributeType == .typeRegular,
+              let deviceNumber = (attributes[.systemNumber] as? NSNumber)?.uint64Value,
+              let fileNumber = (attributes[.systemFileNumber] as? NSNumber)?.uint64Value,
+              let byteCount = (attributes[.size] as? NSNumber)?.int64Value,
+              byteCount > 0,
+              let modificationDate = attributes[.modificationDate] as? Date else {
+            return nil
+        }
+        return ShareFileSnapshot(
+            deviceNumber: deviceNumber,
+            fileNumber: fileNumber,
+            byteCount: byteCount,
+            modificationDate: modificationDate
+        )
+    }
+}
+
+struct PreparedShareItem: Equatable {
+    let projectURL: URL
+    let outputURL: URL
+    let validatedSHA256: String?
+    let byteCount: Int64
+    let fileSnapshot: ShareFileSnapshot
+}
+
 extension AppModel {
-    func shareCurrentSplat() async {
+    func prepareCurrentSplatForSharing() async {
+        let token = UUID()
+        sharePreparationToken = token
+        preparedShareItem = nil
+        isShareReady = false
+
+        guard let projectURL = currentProjectURL,
+              let displayedOutputURL = outputPlyURL,
+              let expectedOutputURL = metadataOutputURL(projectURL: projectURL),
+              ProjectSummary.hasSameLocation(displayedOutputURL, expectedOutputURL) else {
+            finishSharePreparationFailure(
+                token: token,
+                message: "Finish a project before sharing."
+            )
+            return
+        }
+        guard let snapshotBeforeValidation = ShareFileSnapshot.capture(at: expectedOutputURL) else {
+            finishSharePreparationFailure(
+                token: token,
+                message: unavailableOutputMessage(for: expectedOutputURL)
+            )
+            return
+        }
+
+        let validatedOutputURL: URL?
+        do {
+            validatedOutputURL = try await validatedFinishedOutputURL(projectURL: projectURL)
+        } catch is CancellationError {
+            clearSharePreparation(token: token)
+            return
+        } catch {
+            finishSharePreparationFailure(
+                token: token,
+                message: "Couldn’t check the splat. Try again."
+            )
+            return
+        }
+
+        guard sharePreparationToken == token,
+              ProjectSummary.hasSameLocation(currentProjectURL, projectURL),
+              ProjectSummary.hasSameLocation(outputPlyURL, displayedOutputURL) else {
+            clearSharePreparation(token: token)
+            return
+        }
+        guard let validatedOutputURL,
+              ProjectSummary.hasSameLocation(validatedOutputURL, expectedOutputURL),
+              let snapshotAfterValidation = ShareFileSnapshot.capture(at: validatedOutputURL),
+              snapshotAfterValidation == snapshotBeforeValidation else {
+            finishSharePreparationFailure(
+                token: token,
+                message: unavailableOutputMessage(for: expectedOutputURL)
+            )
+            return
+        }
+
+        let metadata = try? ProjectMetadataStore.load(
+            from: ProjectPaths(root: projectURL).metadataURL
+        )
+        let validatedSHA256 = metadata?.trainingArtifact?.outputSHA256
+        if let recordedBytes = metadata?.trainingArtifact?.outputBytes,
+           recordedBytes != snapshotAfterValidation.byteCount {
+            finishSharePreparationFailure(
+                token: token,
+                message: "Could not open \(expectedOutputURL.lastPathComponent). Rebuild or reopen the project."
+            )
+            return
+        }
+
+        preparedShareItem = PreparedShareItem(
+            projectURL: projectURL.standardizedFileURL,
+            outputURL: validatedOutputURL.standardizedFileURL,
+            validatedSHA256: validatedSHA256,
+            byteCount: snapshotAfterValidation.byteCount,
+            fileSnapshot: snapshotAfterValidation
+        )
+        sharePreparationToken = nil
+        isShareReady = true
+        shareStatusMessage = nil
+        shareStatusIsError = false
+    }
+
+    func presentPreparedShare(from sourceView: NSView) {
         guard activeShareSession == nil else {
             shareStatusMessage = "Share is already open."
             shareStatusIsError = false
             return
         }
-        guard !isShareSheetActive, let projectURL = currentProjectURL else { return }
-
-        let validationToken = UUID()
-        shareValidationToken = validationToken
-        isShareSheetActive = true
-        shareStatusMessage = "Checking splat…"
-        shareStatusIsError = false
-        let items: [Any]?
-        do {
-            items = try await validatedShareItems(for: projectURL)
-        } catch is CancellationError {
-            clearShareValidation(validationToken)
-            return
-        } catch {
-            clearShareValidation(validationToken)
-            shareStatusMessage = "Couldn’t check the splat. Try again."
-            shareStatusIsError = true
-            return
-        }
-        guard shareValidationToken == validationToken else { return }
-        guard let items else {
-            clearShareValidation(validationToken, preserveStatus: true)
-            return
-        }
-        guard ProjectSummary.hasSameLocation(currentProjectURL, projectURL) else {
-            clearShareValidation(validationToken)
+        guard !isShareSheetActive,
+              let preparedShareItem,
+              let projectURL = currentProjectURL,
+              ProjectSummary.hasSameLocation(projectURL, preparedShareItem.projectURL),
+              ProjectSummary.hasSameLocation(outputPlyURL, preparedShareItem.outputURL),
+              let currentOutputURL = readyOutputURL(
+                projectURL: projectURL,
+                validationDepth: .quick
+              ),
+              ProjectSummary.hasSameLocation(currentOutputURL, preparedShareItem.outputURL),
+              ShareFileSnapshot.capture(at: currentOutputURL) == preparedShareItem.fileSnapshot,
+              currentShareArtifactStillMatches(preparedShareItem, projectURL: projectURL) else {
+            invalidatePreparedShareItem(
+                message: "Could not open the validated splat. Reopen the project and try again."
+            )
             return
         }
 
-        let shareWindow = NSApplication.shared.keyWindow ?? NSApplication.shared.mainWindow
-        guard let contentView = shareWindow?.contentView else {
-            clearShareValidation(validationToken, preserveStatus: true)
-            shareStatusMessage = "Couldn’t open share options right now. Try again."
-            shareStatusIsError = true
-            return
-        }
-
-        let picker = NSSharingServicePicker(items: items)
         let session = ShareSession(model: self)
-        shareValidationToken = nil
         activeShareSession = session
+        isShareSheetActive = true
         shareStatusMessage = nil
         shareStatusIsError = false
-        session.present(picker: picker, in: contentView)
-    }
-
-    func validatedShareItems(for projectURL: URL? = nil) async throws -> [Any]? {
-        guard let projectURL = projectURL ?? currentProjectURL else {
-            shareStatusMessage = "Finish a project before sharing."
-            shareStatusIsError = true
-            return nil
-        }
-        guard let expectedURL = metadataOutputURL(projectURL: projectURL) else {
-            shareStatusMessage = "Finish a project before sharing."
-            shareStatusIsError = true
-            return nil
-        }
-        guard let validatedURL = try await validatedFinishedOutputURL(projectURL: projectURL) else {
-            let outputState = outputFileState(at: expectedURL)
-            if outputState.exists {
-                shareStatusMessage = "Could not open \(expectedURL.lastPathComponent). Rebuild or reopen the project."
-            } else {
-                shareStatusMessage = "Could not find \(expectedURL.lastPathComponent). Rebuild or reopen the project."
-            }
-            shareStatusIsError = true
-            return nil
-        }
-        return [validatedURL]
+        session.present(items: [preparedShareItem.outputURL], from: sourceView)
     }
 
     func shareDidStart(from session: ShareSession) {
@@ -105,39 +175,121 @@ extension AppModel {
 
     func clearShareSession(_ session: ShareSession) {
         guard activeShareSession === session else { return }
+        session.finish()
         activeShareSession = nil
         isShareSheetActive = false
     }
 
-    private func clearShareValidation(_ token: UUID, preserveStatus: Bool = false) {
-        guard shareValidationToken == token else { return }
-        shareValidationToken = nil
+    func cancelSharing() {
+        sharePreparationToken = nil
+        preparedShareItem = nil
+        isShareReady = false
+        _ = activeShareSession?.close()
+        activeShareSession = nil
         isShareSheetActive = false
-        if !preserveStatus {
-            shareStatusMessage = nil
-            shareStatusIsError = false
+    }
+
+    private func currentShareArtifactStillMatches(
+        _ preparedItem: PreparedShareItem,
+        projectURL: URL
+    ) -> Bool {
+        guard let metadata = try? ProjectMetadataStore.load(
+            from: ProjectPaths(root: projectURL).metadataURL
+        ) else {
+            return false
         }
+        guard let trainingArtifact = metadata.trainingArtifact else {
+            return preparedItem.validatedSHA256 == nil
+        }
+        return trainingArtifact.outputSHA256 == preparedItem.validatedSHA256
+            && trainingArtifact.outputBytes == preparedItem.byteCount
+    }
+
+    private func unavailableOutputMessage(for expectedURL: URL) -> String {
+        let outputState = outputFileState(at: expectedURL)
+        if outputState.exists {
+            return "Could not open \(expectedURL.lastPathComponent). Rebuild or reopen the project."
+        }
+        return "Could not find \(expectedURL.lastPathComponent). Rebuild or reopen the project."
+    }
+
+    private func invalidatePreparedShareItem(message: String) {
+        preparedShareItem = nil
+        sharePreparationToken = nil
+        isShareReady = false
+        shareStatusMessage = message
+        shareStatusIsError = true
+    }
+
+    private func finishSharePreparationFailure(token: UUID, message: String) {
+        guard sharePreparationToken == token else { return }
+        invalidatePreparedShareItem(message: message)
+    }
+
+    private func clearSharePreparation(token: UUID) {
+        guard sharePreparationToken == token else { return }
+        sharePreparationToken = nil
+        preparedShareItem = nil
+        isShareReady = false
     }
 }
 
 @MainActor
 final class ShareSession: NSObject, @preconcurrency NSSharingServicePickerDelegate, NSSharingServiceDelegate {
-    private weak var model: AppModel?
-    // The session owns the picker until AppKit reports completion or cancellation.
-    private var picker: NSSharingServicePicker?
+    typealias Presenter = (
+        NSSharingServicePicker,
+        NSRect,
+        NSView,
+        NSRectEdge
+    ) -> Void
 
-    init(model: AppModel) {
+    private weak var model: AppModel?
+    private weak var anchorView: NSView?
+    private var picker: NSSharingServicePicker?
+    private var isClosed = false
+    private let presenter: Presenter
+
+    init(
+        model: AppModel,
+        presenter: @escaping Presenter = { picker, rect, view, edge in
+            picker.show(relativeTo: rect, of: view, preferredEdge: edge)
+        }
+    ) {
         self.model = model
+        self.presenter = presenter
     }
 
-    func present(picker: NSSharingServicePicker, in sourceView: NSView) {
+    func present(items: [Any], from sourceView: NSView) {
+        guard !isClosed, picker == nil else { return }
+        let picker = NSSharingServicePicker(items: items)
         picker.delegate = self
         self.picker = picker
-        let anchor = NSRect(x: sourceView.bounds.midX, y: sourceView.bounds.midY, width: 1, height: 1)
-        picker.show(relativeTo: anchor, of: sourceView, preferredEdge: .minY)
+        anchorView = sourceView
+        presenter(picker, sourceView.bounds, sourceView, .minY)
     }
 
-    func sharingServicePicker(_ sharingServicePicker: NSSharingServicePicker, didChoose service: NSSharingService?) {
+    @discardableResult
+    func close() -> Bool {
+        guard !isClosed else { return false }
+        isClosed = true
+        picker?.delegate = nil
+        picker?.close()
+        picker = nil
+        anchorView = nil
+        return true
+    }
+
+    func finish() {
+        isClosed = true
+        picker?.delegate = nil
+        picker = nil
+        anchorView = nil
+    }
+
+    func sharingServicePicker(
+        _ sharingServicePicker: NSSharingServicePicker,
+        didChoose service: NSSharingService?
+    ) {
         guard let service else {
             model?.shareDidCancel(from: self)
             model?.clearShareSession(self)
@@ -152,8 +304,23 @@ final class ShareSession: NSObject, @preconcurrency NSSharingServicePickerDelega
         model?.clearShareSession(self)
     }
 
-    func sharingService(_ sharingService: NSSharingService, didFailToShareItems items: [Any], error: Error) {
+    func sharingService(
+        _ sharingService: NSSharingService,
+        didFailToShareItems items: [Any],
+        error: Error
+    ) {
         model?.shareDidFail(from: self)
         model?.clearShareSession(self)
+    }
+
+    func anchoringView(
+        for sharingService: NSSharingService,
+        showRelativeTo positioningRect: UnsafeMutablePointer<NSRect>,
+        preferredEdge: UnsafeMutablePointer<NSRectEdge>
+    ) -> NSView? {
+        guard let anchorView else { return nil }
+        positioningRect.pointee = anchorView.bounds
+        preferredEdge.pointee = .minY
+        return anchorView
     }
 }
