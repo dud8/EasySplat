@@ -1866,35 +1866,86 @@ public final class PipelineRunner: @unchecked Sendable {
                     }
                     var mappingSucceeded = false
                     var lastMappingError: Error?
+                    var selectedMappedModel: MappedSparseModelCandidate?
+                    var selectedMappedModelSnapshot: MappedSparseModelSnapshot?
 
                     func evaluateMappingResult() async throws -> Bool {
-                        let modelURL = paths.colmapSparseURL.appendingPathComponent("0", isDirectory: true)
-                        guard sparseModelFilesExist(at: modelURL) else {
+                        let modelDirectories = try self.mappedSparseModelDirectories(
+                            in: paths.colmapSparseURL
+                        )
+                        var candidates: [(
+                            candidate: MappedSparseModelCandidate,
+                            snapshot: MappedSparseModelSnapshot
+                        )] = []
+                        candidates.reserveCapacity(modelDirectories.count)
+                        var firstAnalysisError: Error?
+                        for model in modelDirectories {
+                            try Task.checkCancellation()
+                            do {
+                                let snapshot = try self.captureMappedSparseModel(at: model.url)
+                                let report = try await self.tooling.colmap.runModelAnalyzer(
+                                    colmapPath: self.config.toolchain.colmap,
+                                    modelPath: model.url,
+                                    options: colmapMatchOptions
+                                )
+                                try Task.checkCancellation()
+                                try self.validateMappedSparseModel(snapshot, at: model.url)
+                                for line in report.split(separator: "\n", omittingEmptySubsequences: false) {
+                                    colmapToolLog.append(stream: "stdout", line: String(line))
+                                }
+                                candidates.append((
+                                    candidate: MappedSparseModelCandidate(
+                                        url: model.url,
+                                        order: model.order,
+                                        score: ReconstructionScorer.applyingExpectedTotalImages(
+                                            ReconstructionScorer.parseModelAnalyzerOutput(report),
+                                            expectedTotalImages: selectedFrames.count
+                                        )
+                                    ),
+                                    snapshot: snapshot
+                                ))
+                            } catch {
+                                if error is CancellationError { throw error }
+                                try Task.checkCancellation()
+                                if firstAnalysisError == nil { firstAnalysisError = error }
+                                emit(.stageLog(
+                                    stage: .sfmMapping,
+                                    line: "Could not inspect COLMAP model \(model.order); trying the remaining reconstruction candidates.",
+                                    isError: true
+                                ))
+                            }
+                        }
+                        guard !candidates.isEmpty else {
+                            throw firstAnalysisError ?? PipelineError.outputMissing
+                        }
+                        guard let selectedCandidate = Self.selectMappedSparseModel(
+                            from: candidates.map(\.candidate),
+                            capturePath: resolvedRunPlan.capturePath
+                        ), let selected = candidates.first(where: {
+                            $0.candidate.order == selectedCandidate.order
+                                && $0.candidate.url == selectedCandidate.url
+                        }) else {
                             throw PipelineError.outputMissing
                         }
-
-                        let report = try await self.tooling.colmap.runModelAnalyzer(
-                            colmapPath: self.config.toolchain.colmap,
-                            modelPath: modelURL,
-                            options: colmapMatchOptions
-                        )
-                        for line in report.split(separator: "\n", omittingEmptySubsequences: false) {
-                            colmapToolLog.append(stream: "stdout", line: String(line))
-                        }
-                        let score = ReconstructionScorer.applyingExpectedTotalImages(
-                            ReconstructionScorer.parseModelAnalyzerOutput(report),
-                            expectedTotalImages: selectedFrames.count
-                        )
+                        selectedMappedModel = selected.candidate
+                        selectedMappedModelSnapshot = selected.snapshot
+                        let score = selected.candidate.score
+                        let modelLabel = String(selected.candidate.order)
                         writeCheckpoint(
                             stage: .sfmMapping,
                             progress: 0.95,
                             message: "Mapping score: \(ReconstructionScorer.summary(score))",
                             details: .sfmMapping(SfmMappingCheckpoint(
                                 mapper: "colmap",
-                                sparsePath: try paths.projectRelativePath(for: modelURL),
+                                sparsePath: try paths.projectRelativePath(for: selected.candidate.url),
                                 registeredImages: score.registeredImages
                             ))
                         )
+                        emit(.stageLog(
+                            stage: .sfmMapping,
+                            line: "Selected COLMAP model \(modelLabel) (\(score.registeredImages)/\(score.totalImages) registered views).",
+                            isError: false
+                        ))
                         emit(.stageLog(
                             stage: .sfmMapping,
                             line: "Reconstruction score (colmap): \(ReconstructionScorer.summary(score)).",
@@ -2002,27 +2053,16 @@ public final class PipelineRunner: @unchecked Sendable {
                         )
                         throw lastMappingError ?? PipelineError.lowQualityReconstruction(.init(registeredImages: 0, totalImages: 0, meanReprojectionError: nil), mapper: nil)
                     }
-                    let canonicalSparseModel = paths.colmapSparseURL.appendingPathComponent("0", isDirectory: true)
-                    let resolvedSparseModel = try resolveSparseModelDirectory(at: canonicalSparseModel)
-                    if resolvedSparseModel.standardizedFileURL != canonicalSparseModel.standardizedFileURL {
-                        try self.resetDirectory(canonicalSparseModel)
-                        let fm = FileManager.default
-                        let files = try fm.contentsOfDirectory(
-                            at: resolvedSparseModel,
-                            includingPropertiesForKeys: [.isRegularFileKey],
-                            options: [.skipsHiddenFiles]
-                        )
-                        for file in files {
-                            let isRegular = (try? file.resourceValues(forKeys: [.isRegularFileKey]).isRegularFile) ?? false
-                            guard isRegular else { continue }
-                            try fm.copyItem(at: file, to: canonicalSparseModel.appendingPathComponent(file.lastPathComponent))
-                        }
-                        emit(.stageLog(
-                            stage: .sfmMapping,
-                            line: "Canonicalized sparse model layout: \(resolvedSparseModel.lastPathComponent) -> 0.",
-                            isError: false
-                        ))
+                    guard let selectedMappedModel, let selectedMappedModelSnapshot else {
+                        throw PipelineError.outputMissing
                     }
+                    try Task.checkCancellation()
+                    try self.publishCanonicalSparseModel(
+                        from: selectedMappedModel.url,
+                        snapshot: selectedMappedModelSnapshot,
+                        at: paths.colmapSparseURL
+                    )
+                    let canonicalSparseModel = paths.colmapSparseURL.appendingPathComponent("0", isDirectory: true)
                     if try ensureTextSparseModelFiles(at: canonicalSparseModel) {
                         emit(.stageLog(
                             stage: .sfmMapping,

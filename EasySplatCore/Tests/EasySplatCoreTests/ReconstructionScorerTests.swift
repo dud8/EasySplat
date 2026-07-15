@@ -117,6 +117,36 @@ final class ReconstructionScorerTests: XCTestCase {
         XCTAssertFalse(ReconstructionScorer.isAcceptable(score, capturePath: .orbit))
     }
 
+    func testAcceptableRejectsImpossibleCountsAndResiduals() {
+        func score(registered: Int = 90, residual: Double?) -> ReconstructionScore {
+            ReconstructionScore(
+                registeredImages: registered,
+                totalImages: 100,
+                meanReprojectionError: residual,
+                pointCount: 100,
+                observationCount: 300,
+                meanTrackLength: 3
+            )
+        }
+
+        XCTAssertFalse(ReconstructionScorer.isAcceptable(
+            score(registered: 101, residual: 1),
+            capturePath: .automatic
+        ))
+        XCTAssertFalse(ReconstructionScorer.isAcceptable(
+            score(residual: -0.1),
+            capturePath: .automatic
+        ))
+        XCTAssertFalse(ReconstructionScorer.isAcceptable(
+            score(residual: .infinity),
+            capturePath: .automatic
+        ))
+        XCTAssertFalse(ReconstructionScorer.isAcceptable(
+            score(residual: .nan),
+            capturePath: .automatic
+        ))
+    }
+
     func testExpectedTotalImagesKeepsPartialSparseModelsFromPassing() {
         let sparseOnlyScore = ReconstructionScore(
             registeredImages: 5,

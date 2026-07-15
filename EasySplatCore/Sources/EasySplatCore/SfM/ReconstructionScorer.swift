@@ -171,10 +171,17 @@ public enum ReconstructionScorer {
         _ score: ReconstructionScore,
         capturePath _: CapturePath
     ) -> Bool {
-        guard score.totalImages > 0 else { return false }
+        guard score.totalImages > 0,
+              score.registeredImages > 0,
+              score.registeredImages <= score.totalImages else {
+            return false
+        }
         let ratio = Double(score.registeredImages) / Double(score.totalImages)
         if ratio < minimumRegisteredViewFraction { return false }
-        if let reproj = score.meanReprojectionError, reproj > 2.5 { return false }
+        if let reproj = score.meanReprojectionError,
+           !reproj.isFinite || reproj < 0 || reproj > 2.5 {
+            return false
+        }
         if let points = score.pointCount, points <= 0 { return false }
         if let observations = score.observationCount, observations <= 0 { return false }
         if let meanTrackLength = score.meanTrackLength, meanTrackLength <= 0 { return false }

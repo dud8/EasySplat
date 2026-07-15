@@ -283,10 +283,20 @@ final class PipelineIntegrationTests: XCTestCase {
                     XCTAssertEqual(self.value(for: "--Mapper.ba_global_max_refinements", in: args), "5")
                     XCTAssertEqual(self.value(for: "--Mapper.random_seed", in: args), "42")
                     XCTAssertEqual(self.value(for: "--Mapper.ba_refine_focal_length", in: args), "1")
-                    try? self.writeSparseModel(at: projectURL)
+                    let imageNames = self.selectedImageNames(in: paths)
+                    let sparseRoot = paths.colmapSparseURL
+                    try? self.writeSparseModel(
+                        at: sparseRoot.appendingPathComponent("0", isDirectory: true),
+                        imageNames: Array(imageNames.prefix(80))
+                    )
+                    try? self.writeSparseModel(
+                        at: sparseRoot.appendingPathComponent("1", isDirectory: true),
+                        imageNames: imageNames
+                    )
                 }
             ),
-            .init(path: toolchain.colmap.path, argsPrefix: ["model_analyzer"], result: .init(exitCode: 0, terminationReason: .exit, stdout: "Registered images: 100 / 100\nMean reprojection error: 1.0\n", stderr: ""), onRun: nil)
+            .init(path: toolchain.colmap.path, argsPrefix: ["model_analyzer"], result: .init(exitCode: 1, terminationReason: .exit, stdout: "", stderr: "Unreadable model"), onRun: nil),
+            .init(path: toolchain.colmap.path, argsPrefix: ["model_analyzer"], result: .init(exitCode: 0, terminationReason: .exit, stdout: "Registered images: 100 / 100\nPoints: 100\nObservations: 300\nMean track length: 3.0\nMean reprojection error: 1.0\n", stderr: ""), onRun: nil)
         ])
 
         let pipeline = PipelineRunner(
@@ -361,6 +371,17 @@ final class PipelineIntegrationTests: XCTestCase {
         XCTAssertEqual(finalMetadata.geometryArtifact, geometry)
         XCTAssertNotNil(events.stageLog(containing: "SfM backend: COLMAP mapper."))
         XCTAssertNil(events.stageLog(containing: "global mapper"))
+        XCTAssertNotNil(events.stageLog(containing: "Could not inspect COLMAP model 0"))
+        XCTAssertNotNil(events.stageLog(containing: "Selected COLMAP model 1 (100/100 registered views)."))
+        XCTAssertEqual(
+            try FileManager.default.contentsOfDirectory(atPath: paths.colmapSparseURL.path).sorted(),
+            ["0"]
+        )
+        let analyzedModels = runner.calls
+            .filter { $0.1.first == "model_analyzer" }
+            .compactMap { self.value(for: "--path", in: $0.1) }
+            .map { URL(fileURLWithPath: $0).lastPathComponent }
+        XCTAssertEqual(analyzedModels, ["0", "1"])
         let selectedManifest = try String(contentsOf: paths.framesSelectedManifestURL, encoding: .utf8)
         XCTAssertFalse(selectedManifest.contains("sourcePath"))
     }

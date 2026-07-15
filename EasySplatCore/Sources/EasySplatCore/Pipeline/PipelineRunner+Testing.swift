@@ -118,10 +118,6 @@ extension PipelineRunner {
         try selectedImagesHaveUniformPixelDimensions(images)
     }
 
-    func test_resolveSparseModelDirectory(_ candidate: URL) throws -> URL {
-        try resolveSparseModelDirectory(at: candidate)
-    }
-
     func test_shouldUseSequential(selectedFrames: [URL], input: InputSpec, forceExhaustive: Bool) -> Bool {
         shouldUseSequential(selectedFrames: selectedFrames, input: input, forceExhaustive: forceExhaustive)
     }

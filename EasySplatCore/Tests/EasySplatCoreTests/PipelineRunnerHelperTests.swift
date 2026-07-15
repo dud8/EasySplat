@@ -35,21 +35,167 @@ final class PipelineRunnerHelperTests: XCTestCase {
         XCTAssertEqual(runner.test_downsampleFrames(urls, targetCount: 10), urls)
     }
 
-    func testResolveSparseModelDirectoryHandlesNestedOutputs() throws {
-        let root = try TestFileBuilder.makeTempDir()
-        defer { try? FileManager.default.removeItem(at: root) }
-        let runner = makeRunner(projectURL: root)
-
-        let sparseRoot = root.appendingPathComponent("sparse/0", isDirectory: true)
-        let nested = sparseRoot.appendingPathComponent("0", isDirectory: true)
-        try FileManager.default.createDirectory(at: nested, withIntermediateDirectories: true)
-        for name in ["cameras.bin", "images.bin", "points3D.bin"] {
-            let file = nested.appendingPathComponent(name)
-            XCTAssertTrue(FileManager.default.createFile(atPath: file.path, contents: Data([1, 2, 3])))
+    func testMappedSparseModelPreferenceUsesGeometryEvidenceAndStableOrder() {
+        func candidate(
+            order: Int,
+            registered: Int = 90,
+            observations: Int? = 300,
+            points: Int? = 100,
+            residual: Double? = 1
+        ) -> MappedSparseModelCandidate {
+            MappedSparseModelCandidate(
+                url: URL(fileURLWithPath: "/tmp/\(order)"),
+                order: order,
+                score: ReconstructionScore(
+                    registeredImages: registered,
+                    totalImages: 100,
+                    meanReprojectionError: residual,
+                    pointCount: points,
+                    observationCount: observations,
+                    meanTrackLength: 3
+                )
+            )
         }
 
-        let resolved = try runner.test_resolveSparseModelDirectory(sparseRoot)
-        XCTAssertEqual(resolved.standardizedFileURL, nested.standardizedFileURL)
+        XCTAssertTrue(PipelineRunner.preferredMappedSparseModel(
+            candidate(order: 1, registered: 91, observations: 1, points: 1, residual: 2),
+            over: candidate(order: 0, registered: 90, observations: 10_000, points: 10_000, residual: 0.1)
+        ))
+        XCTAssertTrue(PipelineRunner.preferredMappedSparseModel(
+            candidate(order: 1, observations: 301, points: 1, residual: 2),
+            over: candidate(order: 0, observations: 300, points: 10_000, residual: 0.1)
+        ))
+        XCTAssertTrue(PipelineRunner.preferredMappedSparseModel(
+            candidate(order: 1, points: 101, residual: 2),
+            over: candidate(order: 0, points: 100, residual: 0.1)
+        ))
+        XCTAssertTrue(PipelineRunner.preferredMappedSparseModel(
+            candidate(order: 1, residual: 0.9),
+            over: candidate(order: 0, residual: 1)
+        ))
+        XCTAssertTrue(PipelineRunner.preferredMappedSparseModel(
+            candidate(order: 0),
+            over: candidate(order: 1)
+        ))
+        XCTAssertTrue(PipelineRunner.preferredMappedSparseModel(
+            candidate(order: 1, residual: 1),
+            over: candidate(order: 0, residual: nil)
+        ))
+
+        let acceptable = candidate(order: 0, registered: 90, residual: 1)
+        let higherCoverageButInvalid = candidate(order: 1, registered: 91, residual: 3)
+        XCTAssertEqual(
+            PipelineRunner.selectMappedSparseModel(
+                from: [higherCoverageButInvalid, acceptable],
+                capturePath: .automatic
+            )?.order,
+            0
+        )
+        XCTAssertEqual(
+            PipelineRunner.selectMappedSparseModel(
+                from: [candidate(order: 0, registered: 89, residual: 1), higherCoverageButInvalid],
+                capturePath: .automatic
+            )?.order,
+            1
+        )
+    }
+
+    func testMappedSparseModelDiscoveryRejectsSymlinksHardLinksAndNonnumericFolders() throws {
+        let root = try TestFileBuilder.makeTempDir()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let sparse = root.appendingPathComponent("sparse", isDirectory: true)
+        let valid = sparse.appendingPathComponent("0", isDirectory: true)
+        let external = root.appendingPathComponent("external", isDirectory: true)
+        let named = sparse.appendingPathComponent("named", isDirectory: true)
+        let second = sparse.appendingPathComponent("2", isDirectory: true)
+        let tenth = sparse.appendingPathComponent("10", isDirectory: true)
+        let noncanonical = sparse.appendingPathComponent("01", isDirectory: true)
+        let hardLinked = sparse.appendingPathComponent("3", isDirectory: true)
+        for directory in [valid, external, named, second, tenth, noncanonical, hardLinked] {
+            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+            for name in ["cameras.bin", "images.bin", "points3D.bin"] {
+                try Data([1, 2, 3]).write(to: directory.appendingPathComponent(name))
+            }
+        }
+        try FileManager.default.createSymbolicLink(
+            at: sparse.appendingPathComponent("1", isDirectory: true),
+            withDestinationURL: external
+        )
+        let externalFile = root.appendingPathComponent("shared.bin")
+        try Data([4, 5, 6]).write(to: externalFile)
+        try FileManager.default.removeItem(at: hardLinked.appendingPathComponent("images.bin"))
+        try FileManager.default.linkItem(
+            at: externalFile,
+            to: hardLinked.appendingPathComponent("images.bin")
+        )
+
+        let discovered = try makeRunner(projectURL: root).mappedSparseModelDirectories(in: sparse)
+
+        XCTAssertEqual(discovered.map(\.order), [0, 2, 10])
+        XCTAssertEqual(
+            discovered.map { $0.url.resolvingSymlinksInPath() },
+            [valid, second, tenth].map { $0.resolvingSymlinksInPath() }
+        )
+
+        let linkedSparse = root.appendingPathComponent("linked-sparse", isDirectory: true)
+        try FileManager.default.createSymbolicLink(at: linkedSparse, withDestinationURL: sparse)
+        XCTAssertThrowsError(
+            try makeRunner(projectURL: root).mappedSparseModelDirectories(in: linkedSparse)
+        )
+        XCTAssertTrue(FileManager.default.fileExists(atPath: valid.path))
+    }
+
+    func testCanonicalSparsePublicationCancelsOrRejectsBeforeChangingModelZero() throws {
+        let root = try TestFileBuilder.makeTempDir()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let sparse = root.appendingPathComponent("sparse", isDirectory: true)
+        let modelZero = sparse.appendingPathComponent("0", isDirectory: true)
+        let modelOne = sparse.appendingPathComponent("1", isDirectory: true)
+        let external = root.appendingPathComponent("external", isDirectory: true)
+        func writeModel(at url: URL, marker: UInt8) throws {
+            try FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
+            for name in ["cameras.bin", "images.bin", "points3D.bin"] {
+                try Data([marker]).write(to: url.appendingPathComponent(name))
+            }
+        }
+        try writeModel(at: modelZero, marker: 0)
+        try writeModel(at: modelOne, marker: 1)
+        try writeModel(at: external, marker: 2)
+        let runner = makeRunner(projectURL: root)
+        let modelOneSnapshot = try runner.captureMappedSparseModel(at: modelOne)
+
+        XCTAssertThrowsError(try runner.publishCanonicalSparseModel(
+            from: modelOne,
+            snapshot: modelOneSnapshot,
+            at: sparse,
+            checkCancellation: { throw CancellationError() }
+        )) { error in
+            XCTAssertTrue(error is CancellationError)
+        }
+        XCTAssertEqual(
+            try Data(contentsOf: modelZero.appendingPathComponent("cameras.bin")),
+            Data([0])
+        )
+        XCTAssertEqual(
+            try Data(contentsOf: modelOne.appendingPathComponent("cameras.bin")),
+            Data([1])
+        )
+
+        let externalSnapshot = try runner.captureMappedSparseModel(at: external)
+        XCTAssertThrowsError(try runner.publishCanonicalSparseModel(
+            from: external,
+            snapshot: externalSnapshot,
+            at: sparse,
+            checkCancellation: {}
+        ))
+        XCTAssertEqual(
+            try Data(contentsOf: modelZero.appendingPathComponent("cameras.bin")),
+            Data([0])
+        )
+        XCTAssertEqual(
+            try Data(contentsOf: external.appendingPathComponent("cameras.bin")),
+            Data([2])
+        )
     }
 
     func testPrepareDa3RefinementSeedBuildsFreshTextOnlyModelWithoutChangingRawSeed() throws {
