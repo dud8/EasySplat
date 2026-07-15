@@ -456,9 +456,10 @@ extension PipelineRunner {
                 "Failed to create selected image: \(destination.lastPathComponent)"
             )
         }
-        let options: [CFString: Any] = outputType == .jpeg
-            ? [kCGImageDestinationLossyCompressionQuality: 0.95]
-            : [:]
+        var options = safeCameraMetadata(from: properties)
+        if outputType == .jpeg {
+            options[kCGImageDestinationLossyCompressionQuality] = 0.95
+        }
         CGImageDestinationAddImage(destinationRef, outputImage, options as CFDictionary)
         guard CGImageDestinationFinalize(destinationRef) else {
             throw PipelineError.imageTranscodeFailed(
@@ -466,6 +467,51 @@ extension PipelineRunner {
             )
         }
         return exposureEV > 0 ? exposureEV : nil
+    }
+
+    private func safeCameraMetadata(from properties: [CFString: Any]) -> [CFString: Any] {
+        var output: [CFString: Any] = [kCGImagePropertyOrientation: 1]
+
+        if let sourceTIFF = properties[kCGImagePropertyTIFFDictionary] as? [CFString: Any] {
+            var tiff: [CFString: Any] = [:]
+            for key in [kCGImagePropertyTIFFMake, kCGImagePropertyTIFFModel] {
+                if let value = boundedMetadataString(sourceTIFF[key]) {
+                    tiff[key] = value
+                }
+            }
+            if !tiff.isEmpty {
+                output[kCGImagePropertyTIFFDictionary] = tiff
+            }
+        }
+
+        if let sourceExif = properties[kCGImagePropertyExifDictionary] as? [CFString: Any] {
+            var exif: [CFString: Any] = [:]
+            for key in [kCGImagePropertyExifFocalLength, kCGImagePropertyExifFocalLenIn35mmFilm] {
+                if let value = sourceExif[key] as? NSNumber,
+                   value.doubleValue.isFinite,
+                   value.doubleValue > 0,
+                   value.doubleValue <= 10_000 {
+                    exif[key] = value
+                }
+            }
+            if let lensModel = boundedMetadataString(sourceExif[kCGImagePropertyExifLensModel]) {
+                exif[kCGImagePropertyExifLensModel] = lensModel
+            }
+            if !exif.isEmpty {
+                output[kCGImagePropertyExifDictionary] = exif
+            }
+        }
+
+        return output
+    }
+
+    private func boundedMetadataString(_ value: Any?) -> String? {
+        guard let value = value as? String else { return nil }
+        let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty, trimmed.utf8.count <= 256, !trimmed.contains("\0") else {
+            return nil
+        }
+        return trimmed
     }
 
     func saveSelectedFrameManifest(_ manifest: [SelectedFrameMapping], to url: URL) throws {

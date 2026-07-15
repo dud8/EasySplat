@@ -399,6 +399,26 @@ final class PipelineRunnerHelperTests: XCTestCase {
             (outputProperties[kCGImagePropertyOrientation] as? NSNumber)?.intValue ?? 1,
             1
         )
+        let tiff = try XCTUnwrap(
+            outputProperties[kCGImagePropertyTIFFDictionary] as? [CFString: Any]
+        )
+        XCTAssertEqual(tiff[kCGImagePropertyTIFFMake] as? String, "Test Camera Maker")
+        XCTAssertEqual(tiff[kCGImagePropertyTIFFModel] as? String, "Test Camera Model")
+        XCTAssertNil(tiff[kCGImagePropertyTIFFDateTime])
+        let exif = try XCTUnwrap(
+            outputProperties[kCGImagePropertyExifDictionary] as? [CFString: Any]
+        )
+        XCTAssertEqual(
+            (exif[kCGImagePropertyExifFocalLength] as? NSNumber)?.doubleValue,
+            6.3
+        )
+        XCTAssertEqual(
+            (exif[kCGImagePropertyExifFocalLenIn35mmFilm] as? NSNumber)?.intValue,
+            46
+        )
+        XCTAssertEqual(exif[kCGImagePropertyExifLensModel] as? String, "Test Prime 6.3 mm")
+        XCTAssertNil(exif[kCGImagePropertyExifBodySerialNumber])
+        XCTAssertNil(outputProperties[kCGImagePropertyGPSDictionary])
 
         let outputImage = try XCTUnwrap(CGImageSourceCreateImageAtIndex(outputSource, 0, nil))
         let sideMeans = grayscaleSideMeans(outputImage)
@@ -476,6 +496,21 @@ final class PipelineRunnerHelperTests: XCTestCase {
             image,
             [
                 kCGImagePropertyOrientation: orientation,
+                kCGImagePropertyTIFFDictionary: [
+                    kCGImagePropertyTIFFMake: "Test Camera Maker",
+                    kCGImagePropertyTIFFModel: "Test Camera Model",
+                    kCGImagePropertyTIFFDateTime: "2026:07:13 21:49:47",
+                ],
+                kCGImagePropertyExifDictionary: [
+                    kCGImagePropertyExifFocalLength: 6.3,
+                    kCGImagePropertyExifFocalLenIn35mmFilm: 46,
+                    kCGImagePropertyExifLensModel: "Test Prime 6.3 mm",
+                    kCGImagePropertyExifBodySerialNumber: "private-serial",
+                ],
+                kCGImagePropertyGPSDictionary: [
+                    kCGImagePropertyGPSLatitude: 39.0,
+                    kCGImagePropertyGPSLatitudeRef: "N",
+                ],
                 kCGImageDestinationLossyCompressionQuality: 1.0,
             ] as CFDictionary
         )
