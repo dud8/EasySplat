@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import math
 import os
 import sqlite3
@@ -18,6 +19,95 @@ class ColmapCliError(RuntimeError):
 
 _IMAGE_EXTENSIONS = frozenset({".jpg", ".jpeg", ".png"})
 _PYCOLMAP_VERSION = "4.1.0"
+
+_REQUIRED_PYCOLMAP_API_PATHS = (
+    "BundleAdjustmentOptions",
+    "Camera",
+    "CameraMode.AUTO",
+    "CameraMode.SINGLE",
+    "Database.open",
+    "Device.cpu",
+    "FeatureDescriptors",
+    "FeatureExtractionOptions",
+    "FeatureExtractorType.SIFT",
+    "FeatureMatchingOptions",
+    "FileCopyType.copy",
+    "Image",
+    "ImageReaderOptions",
+    "ImportedPairingOptions",
+    "IncrementalPipelineOptions",
+    "Reconstruction",
+    "TwoViewGeometryOptions",
+    "UndistortCameraOptions",
+    "VisualIndex.BuildOptions",
+    "VisualIndex.create",
+    "VocabTreePairGenerator",
+    "VocabTreePairingOptions",
+    "bundle_adjustment",
+    "extract_features",
+    "incremental_mapping",
+    "match_image_pairs",
+    "triangulate_points",
+    "undistort_images",
+)
+
+_CALLABLE_PYCOLMAP_API_PATHS = frozenset(_REQUIRED_PYCOLMAP_API_PATHS) - {
+    "CameraMode.AUTO",
+    "CameraMode.SINGLE",
+    "Device.cpu",
+    "FeatureExtractorType.SIFT",
+    "FileCopyType.copy",
+}
+
+_REQUIRED_OPTION_FIELDS = {
+    "ImageReaderOptions": ("camera_model",),
+    "FeatureExtractionOptions": (
+        "max_image_size",
+        "num_threads",
+        "use_gpu",
+        "sift.max_num_features",
+    ),
+    "FeatureMatchingOptions": (
+        "num_threads",
+        "max_num_matches",
+        "use_gpu",
+        "sift.cpu_brute_force_matcher",
+    ),
+    "ImportedPairingOptions": ("match_list_path",),
+    "IncrementalPipelineOptions": (
+        "ba_use_gpu",
+        "ba_global_frames_ratio",
+        "ba_global_points_ratio",
+        "ba_global_max_refinements",
+        "ba_global_max_num_iterations",
+        "random_seed",
+        "ba_refine_focal_length",
+    ),
+    "BundleAdjustmentOptions": (
+        "refine_focal_length",
+        "refine_principal_point",
+        "refine_extra_params",
+        "ceres.use_gpu",
+        "ceres.solver_options.max_num_iterations",
+    ),
+    "UndistortCameraOptions": ("max_image_size",),
+    "VisualIndex.BuildOptions": (
+        "num_visual_words",
+        "num_iterations",
+        "num_rounds",
+        "num_checks",
+        "num_threads",
+    ),
+    "VocabTreePairingOptions": (
+        "vocab_tree_path",
+        "num_images",
+        "num_nearest_neighbors",
+        "num_checks",
+        "num_images_after_verification",
+        "max_num_features",
+        "num_threads",
+    ),
+}
 
 
 _COMMAND_OPTIONS = {
@@ -211,6 +301,63 @@ def _load_pycolmap() -> Any:
             f"found {getattr(pycolmap, '__version__', 'unknown')}"
         )
     return pycolmap
+
+
+def _runtime_self_check() -> dict[str, object]:
+    pycolmap = _load_pycolmap()
+    unavailable: list[str] = []
+    sentinel = object()
+
+    def resolve(root: object, path: str) -> object:
+        value = root
+        for component in path.split("."):
+            value = getattr(value, component, sentinel)
+            if value is sentinel:
+                break
+        return value
+
+    for path in _REQUIRED_PYCOLMAP_API_PATHS:
+        value = resolve(pycolmap, path)
+        if value is sentinel or (
+            path in _CALLABLE_PYCOLMAP_API_PATHS and not callable(value)
+        ):
+            unavailable.append(path)
+
+    for constructor_path, fields in _REQUIRED_OPTION_FIELDS.items():
+        constructor = resolve(pycolmap, constructor_path)
+        if constructor is sentinel or not callable(constructor):
+            continue
+        try:
+            options = constructor()
+        except Exception:
+            unavailable.append(f"{constructor_path}()")
+            continue
+        for field in fields:
+            if resolve(options, field) is sentinel:
+                unavailable.append(f"{constructor_path}.{field}")
+
+    visual_index_factory = resolve(pycolmap, "VisualIndex.create")
+    if callable(visual_index_factory):
+        try:
+            visual_index = visual_index_factory(128, 64)
+        except Exception:
+            unavailable.append("VisualIndex.create(128, 64)")
+        else:
+            for method in ("build", "write"):
+                if not callable(getattr(visual_index, method, None)):
+                    unavailable.append(f"VisualIndex.{method}")
+
+    if unavailable:
+        raise ColmapCliError(
+            "required PyCOLMAP APIs are unavailable: "
+            + ", ".join(sorted(set(unavailable)))
+        )
+    return {
+        "runtime": "pycolmap",
+        "runtime_version": _PYCOLMAP_VERSION,
+        "schema_version": 1,
+        "status": "ok",
+    }
 
 
 def _feature_matching_options(pycolmap: Any, options: dict[str, str]) -> Any:
@@ -1187,6 +1334,19 @@ def main(argv: list[str] | None = None) -> int:
     if not arguments or arguments[0] in {"-h", "--help"}:
         print(_help(), end="")
         return 0
+    if arguments[0] == "--self-check":
+        if len(arguments) != 1:
+            print("ERROR: self-check does not accept arguments", file=sys.stderr)
+            return 2
+        try:
+            print(json.dumps(_runtime_self_check(), sort_keys=True, separators=(",", ":")))
+            return 0
+        except ColmapCliError as exc:
+            print(f"ERROR: runtime self-check failed: {exc}", file=sys.stderr)
+            return 2
+        except Exception as exc:
+            print(f"ERROR: runtime self-check failed: {exc}", file=sys.stderr)
+            return 1
     command = arguments.pop(0)
     if command not in _COMMAND_OPTIONS:
         print(f"ERROR: unrecognized command: {command}", file=sys.stderr)

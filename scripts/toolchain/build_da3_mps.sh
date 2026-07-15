@@ -612,5 +612,26 @@ PY
 
 "$BIN_DIR/easysplat_da3_sfm" --help >/dev/null
 "$BIN_DIR/easysplat_colmap" -h >/dev/null
+colmap_self_check="$("$BIN_DIR/easysplat_colmap" --self-check)" || {
+  echo "da3_mps COLMAP runtime self-check failed" >&2
+  exit 1
+}
+"$PYTHON_DIR/bin/python3" - "$colmap_self_check" <<'PY'
+import json
+import sys
+
+expected = {
+    "runtime": "pycolmap",
+    "runtime_version": "4.1.0",
+    "schema_version": 1,
+    "status": "ok",
+}
+try:
+    payload = json.loads(sys.argv[1])
+except (IndexError, json.JSONDecodeError) as exc:
+    raise SystemExit(f"invalid COLMAP runtime self-check JSON: {exc}") from exc
+if payload != expected:
+    raise SystemExit(f"unexpected COLMAP runtime self-check: {payload!r}")
+PY
 
 echo "da3_mps ready at $INSTALL_DIR"

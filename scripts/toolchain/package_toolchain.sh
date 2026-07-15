@@ -478,11 +478,73 @@ EASYSPLAT_REQUIRE_REAL_PYCOLMAP=1 \
   "$ROOT/Tools/Da3Sfm/tests/test_colmap_cli.py" \
   ColmapCliTests.test_real_pycolmap_local_vocab_retrieval_is_deterministic
 
-"$BIN/colmap" -h >/dev/null 2>&1 || { echo "colmap bridge failed to launch" >&2; exit 1; }
+colmap_root_help="$("$BIN/colmap" -h 2>&1)" || {
+  echo "colmap bridge failed to launch" >&2
+  exit 1
+}
+if ! printf '%s\n' "$colmap_root_help" | awk '$1 == "pycolmap" && $2 == "4.1.0" { found = 1 } END { exit found ? 0 : 1 }'; then
+  echo "colmap bridge does not declare the reviewed PyCOLMAP 4.1.0 runtime" >&2
+  exit 1
+fi
+colmap_self_check="$("$BIN/colmap" --self-check)" || {
+  echo "colmap bridge runtime self-check failed" >&2
+  exit 1
+}
+"$OUT/da3_mps/python/bin/python3" - "$colmap_self_check" <<'PY'
+import json
+import sys
+
+expected = {
+    "runtime": "pycolmap",
+    "runtime_version": "4.1.0",
+    "schema_version": 1,
+    "status": "ok",
+}
+try:
+    payload = json.loads(sys.argv[1])
+except (IndexError, json.JSONDecodeError) as exc:
+    raise SystemExit(f"invalid COLMAP runtime self-check JSON: {exc}") from exc
+if payload != expected:
+    raise SystemExit(f"unexpected COLMAP runtime self-check: {payload!r}")
+PY
+
+require_colmap_options() {
+  local command="$1"
+  shift
+  local help_output option
+  help_output="$("$BIN/colmap" "$command" -h 2>&1)" || {
+    echo "colmap bridge missing $command" >&2
+    exit 1
+  }
+  for option in "$@"; do
+    if ! printf '%s\n' "$help_output" | awk -v required="--$option" '$1 == required { found = 1 } END { exit found ? 0 : 1 }'; then
+      echo "colmap $command is missing required option --$option" >&2
+      exit 1
+    fi
+  done
+}
+
 "$BIN/colmap" feature_extractor -h >/dev/null 2>&1 || { echo "colmap bridge missing feature_extractor" >&2; exit 1; }
+"$BIN/colmap" matches_importer -h >/dev/null 2>&1 || { echo "colmap bridge missing matches_importer" >&2; exit 1; }
 "$BIN/colmap" mapper -h >/dev/null 2>&1 || { echo "colmap bridge missing mapper" >&2; exit 1; }
+"$BIN/colmap" local_vocab_retriever -h >/dev/null 2>&1 || { echo "colmap bridge missing local_vocab_retriever" >&2; exit 1; }
 "$BIN/colmap" point_triangulator -h >/dev/null 2>&1 || { echo "colmap bridge missing point_triangulator" >&2; exit 1; }
+"$BIN/colmap" bundle_adjuster -h >/dev/null 2>&1 || { echo "colmap bridge missing bundle_adjuster" >&2; exit 1; }
+"$BIN/colmap" model_analyzer -h >/dev/null 2>&1 || { echo "colmap bridge missing model_analyzer" >&2; exit 1; }
 "$BIN/colmap" image_undistorter -h >/dev/null 2>&1 || { echo "colmap missing working image_undistorter command" >&2; exit 1; }
+"$BIN/colmap" model_converter -h >/dev/null 2>&1 || { echo "colmap bridge missing model_converter" >&2; exit 1; }
+
+require_colmap_options mapper \
+  database_path image_path output_path \
+  Mapper.ba_global_frames_ratio Mapper.ba_global_points_ratio \
+  Mapper.ba_global_max_refinements Mapper.ba_global_max_num_iterations \
+  Mapper.random_seed Mapper.ba_refine_focal_length
+require_colmap_options local_vocab_retriever \
+  database_path output_pair_list_path query_image_list_path excluded_pair_list_path \
+  num_images returned_neighbor_count minimum_frame_separation num_visual_words \
+  max_features_per_image max_training_descriptors num_iterations num_rounds \
+  num_checks num_threads
+
 "$MSPLAT_VALIDATOR" --packaged "$OUT"
 
 if [ ! -x "$SUPPLY_CHAIN_GENERATOR" ]; then

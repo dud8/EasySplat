@@ -1409,8 +1409,20 @@ if rg -n 'Homebrew|verify_homebrew_lock|build_(colmap|suitesparse|ceres|openimag
   exit 1
 fi
 grep -q 'colmap" mapper -h' "$ROOT/scripts/toolchain/package_toolchain.sh"
+grep -q 'colmap" --self-check' "$ROOT/scripts/toolchain/package_toolchain.sh"
+grep -Fq 'unexpected COLMAP runtime self-check' "$ROOT/scripts/toolchain/package_toolchain.sh"
+grep -q 'colmap" local_vocab_retriever -h' "$ROOT/scripts/toolchain/package_toolchain.sh"
 grep -q 'colmap" image_undistorter -h' "$ROOT/scripts/toolchain/package_toolchain.sh"
+grep -Fq 'Mapper.ba_global_frames_ratio' "$ROOT/scripts/toolchain/package_toolchain.sh"
+grep -Fq 'Mapper.ba_global_points_ratio' "$ROOT/scripts/toolchain/package_toolchain.sh"
+grep -Fq 'Mapper.ba_global_max_refinements' "$ROOT/scripts/toolchain/package_toolchain.sh"
+grep -Fq 'Mapper.random_seed' "$ROOT/scripts/toolchain/package_toolchain.sh"
+grep -Fq 'returned_neighbor_count' "$ROOT/scripts/toolchain/package_toolchain.sh"
+grep -Fq 'minimum_frame_separation' "$ROOT/scripts/toolchain/package_toolchain.sh"
+grep -Fq 'max_training_descriptors' "$ROOT/scripts/toolchain/package_toolchain.sh"
 grep -Fq 'EASYSPLAT_REQUIRE_REAL_PYCOLMAP=1' "$ROOT/scripts/toolchain/package_toolchain.sh"
+grep -q 'easysplat_colmap" --self-check' "$ROOT/scripts/toolchain/build_da3_mps.sh"
+grep -Fq 'unexpected COLMAP runtime self-check' "$ROOT/scripts/toolchain/build_da3_mps.sh"
 grep -Fq 'test_real_pycolmap_local_vocab_retrieval_is_deterministic' \
   "$ROOT/scripts/toolchain/package_toolchain.sh"
 sed -n \
@@ -1485,7 +1497,7 @@ architecture_line="$(grep -n -m1 '^validate_packaged_architectures$' "$ROOT/scri
 portable_line="$(grep -n -m1 '^validate_portable_dependencies$' "$ROOT/scripts/toolchain/package_toolchain.sh" | cut -d: -f1)"
 verify_line="$(grep -n -m1 '^verify_packaged_signatures$' "$ROOT/scripts/toolchain/package_toolchain.sh" | cut -d: -f1)"
 receipt_line="$(grep -n -m1 '^write_colmap_provenance$' "$ROOT/scripts/toolchain/package_toolchain.sh" | cut -d: -f1)"
-launch_line="$(grep -n -m1 '^"$BIN/colmap" -h' "$ROOT/scripts/toolchain/package_toolchain.sh" | cut -d: -f1)"
+launch_line="$(grep -n -m1 '^colmap_root_help=' "$ROOT/scripts/toolchain/package_toolchain.sh" | cut -d: -f1)"
 # This asserts the command continuation backslash.
 # shellcheck disable=SC1003
 supply_line="$(grep -n -m1 '^"$SUPPLY_CHAIN_GENERATOR" \\' "$ROOT/scripts/toolchain/package_toolchain.sh" | cut -d: -f1)"

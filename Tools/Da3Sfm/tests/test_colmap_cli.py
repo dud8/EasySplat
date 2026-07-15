@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import contextlib
 import io
+import json
 import os
 import sqlite3
 import sys
@@ -173,6 +174,50 @@ class _FeatureDatabase:
 
 
 class ColmapCliTests(unittest.TestCase):
+    @staticmethod
+    def _runtime_with_required_api() -> types.SimpleNamespace:
+        runtime = types.SimpleNamespace(__version__="4.1.0")
+        for path in colmap_cli._REQUIRED_PYCOLMAP_API_PATHS:
+            parent = runtime
+            parts = path.split(".")
+            for part in parts[:-1]:
+                child = getattr(parent, part, None)
+                if child is None:
+                    child = types.SimpleNamespace()
+                    setattr(parent, part, child)
+                parent = child
+            setattr(parent, parts[-1], lambda: None)
+
+        def option_factory(fields: tuple[str, ...]) -> object:
+            root = types.SimpleNamespace()
+            for field in fields:
+                parent = root
+                parts = field.split(".")
+                for part in parts[:-1]:
+                    child = getattr(parent, part, None)
+                    if child is None:
+                        child = types.SimpleNamespace()
+                        setattr(parent, part, child)
+                    parent = child
+                setattr(parent, parts[-1], 0)
+            return root
+
+        for constructor_path, fields in colmap_cli._REQUIRED_OPTION_FIELDS.items():
+            parent = runtime
+            parts = constructor_path.split(".")
+            for part in parts[:-1]:
+                parent = getattr(parent, part)
+            setattr(
+                parent,
+                parts[-1],
+                lambda fields=fields: option_factory(fields),
+            )
+        runtime.VisualIndex.create = lambda *args: types.SimpleNamespace(
+            build=lambda *args: None,
+            write=lambda *args: None,
+        )
+        return runtime
+
     def _write_retrieval_source(
         self,
         path: Path,
@@ -892,6 +937,52 @@ class ColmapCliTests(unittest.TestCase):
         with contextlib.redirect_stdout(stdout):
             self.assertEqual(colmap_cli.main(["feature_importer", "--help"]), 0)
         self.assertIn("not supported", stdout.getvalue())
+
+    def test_runtime_self_check_imports_pycolmap_and_reports_reviewed_contract(self) -> None:
+        runtime = self._runtime_with_required_api()
+        stdout = io.StringIO()
+        with (
+            mock.patch.object(colmap_cli, "_load_pycolmap", return_value=runtime),
+            contextlib.redirect_stdout(stdout),
+        ):
+            self.assertEqual(colmap_cli.main(["--self-check"]), 0)
+
+        self.assertEqual(
+            json.loads(stdout.getvalue()),
+            {
+                "runtime": "pycolmap",
+                "runtime_version": "4.1.0",
+                "schema_version": 1,
+                "status": "ok",
+            },
+        )
+
+    def test_runtime_self_check_rejects_missing_production_api(self) -> None:
+        runtime = self._runtime_with_required_api()
+        del runtime.VisualIndex
+        stderr = io.StringIO()
+        with (
+            mock.patch.object(colmap_cli, "_load_pycolmap", return_value=runtime),
+            contextlib.redirect_stderr(stderr),
+        ):
+            self.assertEqual(colmap_cli.main(["--self-check"]), 2)
+        self.assertIn("VisualIndex", stderr.getvalue())
+
+    def test_runtime_self_check_rejects_missing_option_field(self) -> None:
+        runtime = self._runtime_with_required_api()
+        options = runtime.IncrementalPipelineOptions()
+        del options.ba_global_frames_ratio
+        runtime.IncrementalPipelineOptions = lambda: options
+        stderr = io.StringIO()
+        with (
+            mock.patch.object(colmap_cli, "_load_pycolmap", return_value=runtime),
+            contextlib.redirect_stderr(stderr),
+        ):
+            self.assertEqual(colmap_cli.main(["--self-check"]), 2)
+        self.assertIn(
+            "IncrementalPipelineOptions.ba_global_frames_ratio",
+            stderr.getvalue(),
+        )
 
     def test_feature_extractor_translates_flags_and_validates_complete_output(
         self,

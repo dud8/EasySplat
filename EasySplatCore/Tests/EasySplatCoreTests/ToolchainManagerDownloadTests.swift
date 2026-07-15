@@ -2121,13 +2121,45 @@ final class ToolchainManagerDownloadTests: XCTestCase {
             .init(
                 path: fixture.colmap.path,
                 argsPrefix: ["-h"],
-                result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""),
+                result: .init(
+                    exitCode: 0,
+                    terminationReason: .exit,
+                    stdout: ColmapBridgeHelpFixture.root,
+                    stderr: ""
+                ),
                 onRun: nil
             ),
             .init(
                 path: fixture.colmap.path,
-                argsPrefix: ["mapper"],
-                result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""),
+                argsPrefix: ["--self-check"],
+                result: .init(
+                    exitCode: 0,
+                    terminationReason: .exit,
+                    stdout: ColmapBridgeHelpFixture.selfCheck,
+                    stderr: ""
+                ),
+                onRun: nil
+            ),
+            .init(
+                path: fixture.colmap.path,
+                argsPrefix: ["mapper", "-h"],
+                result: .init(
+                    exitCode: 0,
+                    terminationReason: .exit,
+                    stdout: ColmapBridgeHelpFixture.mapper,
+                    stderr: ""
+                ),
+                onRun: nil
+            ),
+            .init(
+                path: fixture.colmap.path,
+                argsPrefix: ["local_vocab_retriever", "-h"],
+                result: .init(
+                    exitCode: 0,
+                    terminationReason: .exit,
+                    stdout: ColmapBridgeHelpFixture.vocabulary,
+                    stderr: ""
+                ),
                 onRun: nil
             ),
             .init(

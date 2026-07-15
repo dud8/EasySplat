@@ -70,6 +70,278 @@ final class ToolchainManagerTests: XCTestCase {
         }
     }
 
+    func testValidateToolchainRejectsObsoleteColmapBridgeRuntime() throws {
+        let root = try TestFileBuilder.makeTempDir()
+        defer { try? FileManager.default.removeItem(at: root) }
+        _ = try ToolchainFixtureBuilder.createToolchain(at: root)
+
+        let runner = makeValidationRunner(
+            root: root,
+            colmapHelpStdout: ColmapBridgeHelpFixture.root.replacingOccurrences(
+                of: "pycolmap 4.1.0",
+                with: "pycolmap 3.13.0"
+            )
+        )
+
+        let manager = ToolchainManager(runner: runner)
+        XCTAssertThrowsError(
+            try manager.test_validateToolchain(root: root, requiredCapabilities: [.da3Base])
+        ) { error in
+            guard case ToolchainManager.ToolchainError.invalidToolchain(let message) = error else {
+                return XCTFail("Expected invalidToolchain error, got \(error)")
+            }
+            XCTAssertTrue(message.contains("pycolmap 4.1.0"), "expected reviewed runtime requirement; got \(message)")
+        }
+        XCTAssertEqual(runner.calls.filter { $0.0 == root.appendingPathComponent("bin/colmap").path }.count, 1)
+    }
+
+    func testValidateToolchainRejectsMissingRequiredColmapCommand() throws {
+        let root = try TestFileBuilder.makeTempDir()
+        defer { try? FileManager.default.removeItem(at: root) }
+        _ = try ToolchainFixtureBuilder.createToolchain(at: root)
+
+        let runner = makeValidationRunner(
+            root: root,
+            colmapHelpStdout: ColmapBridgeHelpFixture.root.replacingOccurrences(
+                of: "  local_vocab_retriever\n",
+                with: ""
+            )
+        )
+
+        let manager = ToolchainManager(runner: runner)
+        XCTAssertThrowsError(
+            try manager.test_validateToolchain(root: root, requiredCapabilities: [.da3Base])
+        ) { error in
+            guard case ToolchainManager.ToolchainError.invalidToolchain(let message) = error else {
+                return XCTFail("Expected invalidToolchain error, got \(error)")
+            }
+            XCTAssertTrue(message.contains("local_vocab_retriever"), "expected missing command name; got \(message)")
+        }
+    }
+
+    func testValidateToolchainRejectsFailedColmapRuntimeSelfCheck() throws {
+        let root = try TestFileBuilder.makeTempDir()
+        defer { try? FileManager.default.removeItem(at: root) }
+        _ = try ToolchainFixtureBuilder.createToolchain(at: root)
+
+        let runner = makeValidationRunner(
+            root: root,
+            colmapSelfCheckExitCode: 2,
+            colmapSelfCheckStderr: "ERROR: self-check failed: pycolmap 4.1.0 is required; found 3.13.0"
+        )
+
+        let manager = ToolchainManager(runner: runner)
+        XCTAssertThrowsError(
+            try manager.test_validateToolchain(root: root, requiredCapabilities: [.da3Base])
+        ) { error in
+            guard case ToolchainManager.ToolchainError.invalidToolchain(let message) = error else {
+                return XCTFail("Expected invalidToolchain error, got \(error)")
+            }
+            XCTAssertTrue(message.contains("runtime self-check"), "expected runtime self-check failure; got \(message)")
+        }
+    }
+
+    func testValidateToolchainRejectsMalformedColmapRuntimeSelfCheck() throws {
+        for output in [
+            "not json\n",
+            "{\"schema_version\":1,\"status\":\"ok\",\"runtime\":\"pycolmap\",\"runtime_version\":\"3.13.0\"}\n",
+            "{\"schema_version\":1,\"status\":\"failed\",\"runtime\":\"pycolmap\",\"runtime_version\":\"4.1.0\"}\n",
+        ] {
+            let root = try TestFileBuilder.makeTempDir()
+            defer { try? FileManager.default.removeItem(at: root) }
+            _ = try ToolchainFixtureBuilder.createToolchain(at: root)
+
+            let manager = ToolchainManager(
+                runner: makeValidationRunner(root: root, colmapSelfCheckStdout: output)
+            )
+            XCTAssertThrowsError(
+                try manager.test_validateToolchain(root: root, requiredCapabilities: [.da3Base])
+            ) { error in
+                guard case ToolchainManager.ToolchainError.invalidToolchain(let message) = error else {
+                    return XCTFail("Expected invalidToolchain error, got \(error)")
+                }
+                XCTAssertTrue(message.contains("runtime self-check"), "expected malformed self-check rejection; got \(message)")
+            }
+        }
+    }
+
+    func testValidateToolchainRejectsMissingRequiredMapperOptions() throws {
+        for option in ColmapBridgeHelpFixture.mapperOptions {
+            let root = try TestFileBuilder.makeTempDir()
+            defer { try? FileManager.default.removeItem(at: root) }
+            _ = try ToolchainFixtureBuilder.createToolchain(at: root)
+
+            let runner = makeValidationRunner(
+                root: root,
+                mapperStdout: ColmapBridgeHelpFixture.mapper.replacingOccurrences(
+                    of: "  --\(option) <value>\n",
+                    with: ""
+                )
+            )
+
+            let manager = ToolchainManager(runner: runner)
+            XCTAssertThrowsError(
+                try manager.test_validateToolchain(root: root, requiredCapabilities: [.da3Base]),
+                "Expected missing option rejection for \(option)"
+            ) { error in
+                guard case ToolchainManager.ToolchainError.invalidToolchain(let message) = error else {
+                    return XCTFail("Expected invalidToolchain error for \(option), got \(error)")
+                }
+                XCTAssertTrue(message.contains(option), "expected missing option \(option); got \(message)")
+            }
+        }
+    }
+
+    func testValidateToolchainRejectsMissingVocabularyRetrieverCommand() throws {
+        let root = try TestFileBuilder.makeTempDir()
+        defer { try? FileManager.default.removeItem(at: root) }
+        _ = try ToolchainFixtureBuilder.createToolchain(at: root)
+
+        let runner = makeValidationRunner(
+            root: root,
+            vocabularyExitCode: 2,
+            vocabularyStderr: "ERROR: unrecognized command: local_vocab_retriever"
+        )
+
+        let manager = ToolchainManager(runner: runner)
+        XCTAssertThrowsError(
+            try manager.test_validateToolchain(root: root, requiredCapabilities: [.da3Base])
+        ) { error in
+            guard case ToolchainManager.ToolchainError.invalidToolchain(let message) = error else {
+                return XCTFail("Expected invalidToolchain error, got \(error)")
+            }
+            XCTAssertTrue(message.contains("local_vocab_retriever"), "expected missing retriever command; got \(message)")
+        }
+    }
+
+    func testValidateToolchainRejectsMissingRequiredVocabularyOptions() throws {
+        for option in ColmapBridgeHelpFixture.vocabularyOptions {
+            let root = try TestFileBuilder.makeTempDir()
+            defer { try? FileManager.default.removeItem(at: root) }
+            _ = try ToolchainFixtureBuilder.createToolchain(at: root)
+
+            let runner = makeValidationRunner(
+                root: root,
+                vocabularyStdout: ColmapBridgeHelpFixture.vocabulary.replacingOccurrences(
+                    of: "  --\(option) <value>\n",
+                    with: ""
+                )
+            )
+
+            let manager = ToolchainManager(runner: runner)
+            XCTAssertThrowsError(
+                try manager.test_validateToolchain(root: root, requiredCapabilities: [.da3Base]),
+                "Expected missing option rejection for \(option)"
+            ) { error in
+                guard case ToolchainManager.ToolchainError.invalidToolchain(let message) = error else {
+                    return XCTFail("Expected invalidToolchain error for \(option), got \(error)")
+                }
+                XCTAssertTrue(message.contains(option), "expected missing option \(option); got \(message)")
+            }
+        }
+    }
+
+    func testValidateToolchainRejectsPrefixSpoofedColmapOption() throws {
+        let root = try TestFileBuilder.makeTempDir()
+        defer { try? FileManager.default.removeItem(at: root) }
+        _ = try ToolchainFixtureBuilder.createToolchain(at: root)
+
+        let runner = makeValidationRunner(
+            root: root,
+            mapperStdout: ColmapBridgeHelpFixture.mapper.replacingOccurrences(
+                of: "--Mapper.random_seed <value>",
+                with: "--Mapper.random_seed_extra <value>"
+            )
+        )
+
+        let manager = ToolchainManager(runner: runner)
+        XCTAssertThrowsError(
+            try manager.test_validateToolchain(root: root, requiredCapabilities: [.da3Base])
+        ) { error in
+            guard case ToolchainManager.ToolchainError.invalidToolchain(let message) = error else {
+                return XCTFail("Expected invalidToolchain error, got \(error)")
+            }
+            XCTAssertTrue(message.contains("Mapper.random_seed"), "expected exact option rejection; got \(message)")
+        }
+    }
+
+    func testValidateToolchainRejectsRuntimeVersionMentionedOnlyInProse() throws {
+        let root = try TestFileBuilder.makeTempDir()
+        defer { try? FileManager.default.removeItem(at: root) }
+        _ = try ToolchainFixtureBuilder.createToolchain(at: root)
+
+        let staleHelp = ColmapBridgeHelpFixture.root.replacingOccurrences(
+            of: "pycolmap 4.1.0 · CPU",
+            with: "pycolmap 3.13.0 · CPU\nRequires pycolmap 4.1.0"
+        )
+        let manager = ToolchainManager(
+            runner: makeValidationRunner(root: root, colmapHelpStdout: staleHelp)
+        )
+
+        XCTAssertThrowsError(
+            try manager.test_validateToolchain(root: root, requiredCapabilities: [.da3Base])
+        ) { error in
+            guard case ToolchainManager.ToolchainError.invalidToolchain(let message) = error else {
+                return XCTFail("Expected invalidToolchain error, got \(error)")
+            }
+            XCTAssertTrue(message.contains("pycolmap 4.1.0"), "expected exact runtime banner check; got \(message)")
+        }
+    }
+
+    func testValidateToolchainRejectsOptionMentionedOnlyInProse() throws {
+        let root = try TestFileBuilder.makeTempDir()
+        defer { try? FileManager.default.removeItem(at: root) }
+        _ = try ToolchainFixtureBuilder.createToolchain(at: root)
+
+        let misleadingHelp = ColmapBridgeHelpFixture.mapper.replacingOccurrences(
+            of: "  --Mapper.random_seed <value>",
+            with: "  Note: --Mapper.random_seed <value> is unavailable"
+        )
+        let manager = ToolchainManager(
+            runner: makeValidationRunner(root: root, mapperStdout: misleadingHelp)
+        )
+
+        XCTAssertThrowsError(
+            try manager.test_validateToolchain(root: root, requiredCapabilities: [.da3Base])
+        ) { error in
+            guard case ToolchainManager.ToolchainError.invalidToolchain(let message) = error else {
+                return XCTFail("Expected invalidToolchain error, got \(error)")
+            }
+            XCTAssertTrue(message.contains("Mapper.random_seed"), "expected declared-option check; got \(message)")
+        }
+    }
+
+    func testValidateToolchainRejectsAbnormalColmapProbeTermination() throws {
+        let cases: [(String, Process.TerminationReason, Process.TerminationReason, Process.TerminationReason)] = [
+            ("root", .uncaughtSignal, .exit, .exit),
+            ("mapper", .exit, .uncaughtSignal, .exit),
+            ("local_vocab_retriever", .exit, .exit, .uncaughtSignal),
+        ]
+
+        for (label, rootTermination, mapperTermination, vocabularyTermination) in cases {
+            let root = try TestFileBuilder.makeTempDir()
+            defer { try? FileManager.default.removeItem(at: root) }
+            _ = try ToolchainFixtureBuilder.createToolchain(at: root)
+
+            let runner = makeValidationRunner(
+                root: root,
+                colmapTerminationReason: rootTermination,
+                mapperTerminationReason: mapperTermination,
+                vocabularyTerminationReason: vocabularyTermination
+            )
+
+            let manager = ToolchainManager(runner: runner)
+            XCTAssertThrowsError(
+                try manager.test_validateToolchain(root: root, requiredCapabilities: [.da3Base]),
+                "Expected abnormal \(label) termination rejection"
+            ) { error in
+                guard case ToolchainManager.ToolchainError.invalidToolchain = error else {
+                    return XCTFail("Expected invalidToolchain error for \(label), got \(error)")
+                }
+            }
+        }
+    }
+
     func testValidateToolchainAcceptsNativeMsplatClosure() throws {
         let root = try TestFileBuilder.makeTempDir()
         defer { try? FileManager.default.removeItem(at: root) }
@@ -741,18 +1013,32 @@ final class ToolchainManagerTests: XCTestCase {
     private func makeValidationRunner(
         root: URL,
         colmapArch: String = "Mach-O 64-bit executable arm64",
+        colmapHelpStdout: String = ColmapBridgeHelpFixture.root,
+        colmapTerminationReason: Process.TerminationReason = .exit,
+        colmapSelfCheckExitCode: Int32 = 0,
+        colmapSelfCheckStdout: String = ColmapBridgeHelpFixture.selfCheck,
+        colmapSelfCheckStderr: String = "",
+        colmapSelfCheckTerminationReason: Process.TerminationReason = .exit,
         da3PythonArch: String = "Mach-O 64-bit executable arm64",
         msplatArch: String = "Mach-O 64-bit executable arm64",
         mapperExitCode: Int32 = 0,
+        mapperStdout: String = ColmapBridgeHelpFixture.mapper,
         mapperStderr: String = "",
+        mapperTerminationReason: Process.TerminationReason = .exit,
+        vocabularyExitCode: Int32 = 0,
+        vocabularyStdout: String = ColmapBridgeHelpFixture.vocabulary,
+        vocabularyStderr: String = "",
+        vocabularyTerminationReason: Process.TerminationReason = .exit,
         da3HelpExitCode: Int32 = 0,
         msplatSelfCheckExitCode: Int32 = 0,
         msplatSelfCheckStdout: String = "{\"event\":\"self_check\",\"scene_bounds_status\":\"ok\",\"schema_version\":1,\"sequence\":1,\"status\":\"ok\",\"version\":\"1.1.3 (git 106499b)\"}\n"
     ) -> MockSubprocessRunner {
         MockSubprocessRunner(scripts: [
             .init(path: "/usr/bin/file", argsPrefix: ["-b", root.appendingPathComponent("bin/colmap").path], result: .init(exitCode: 0, terminationReason: .exit, stdout: colmapArch, stderr: ""), onRun: nil),
-            .init(path: root.appendingPathComponent("bin/colmap").path, argsPrefix: ["-h"], result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""), onRun: nil),
-            .init(path: root.appendingPathComponent("bin/colmap").path, argsPrefix: ["mapper"], result: .init(exitCode: mapperExitCode, terminationReason: .exit, stdout: "", stderr: mapperStderr), onRun: nil),
+            .init(path: root.appendingPathComponent("bin/colmap").path, argsPrefix: ["-h"], result: .init(exitCode: 0, terminationReason: colmapTerminationReason, stdout: colmapHelpStdout, stderr: ""), onRun: nil),
+            .init(path: root.appendingPathComponent("bin/colmap").path, argsPrefix: ["--self-check"], result: .init(exitCode: colmapSelfCheckExitCode, terminationReason: colmapSelfCheckTerminationReason, stdout: colmapSelfCheckStdout, stderr: colmapSelfCheckStderr), onRun: nil),
+            .init(path: root.appendingPathComponent("bin/colmap").path, argsPrefix: ["mapper", "-h"], result: .init(exitCode: mapperExitCode, terminationReason: mapperTerminationReason, stdout: mapperStdout, stderr: mapperStderr), onRun: nil),
+            .init(path: root.appendingPathComponent("bin/colmap").path, argsPrefix: ["local_vocab_retriever", "-h"], result: .init(exitCode: vocabularyExitCode, terminationReason: vocabularyTerminationReason, stdout: vocabularyStdout, stderr: vocabularyStderr), onRun: nil),
             .init(path: "/usr/bin/file", argsPrefix: ["-b", root.appendingPathComponent("da3_mps/python/bin/python3").path], result: .init(exitCode: 0, terminationReason: .exit, stdout: da3PythonArch, stderr: ""), onRun: nil),
             .init(path: root.appendingPathComponent("da3_mps/bin/easysplat_da3_sfm").path, argsPrefix: ["--help"], result: .init(exitCode: da3HelpExitCode, terminationReason: .exit, stdout: "", stderr: ""), onRun: nil),
             .init(path: "/usr/bin/file", argsPrefix: ["-b", root.appendingPathComponent("bin/easysplat-train").path], result: .init(exitCode: 0, terminationReason: .exit, stdout: msplatArch, stderr: ""), onRun: nil),
@@ -768,5 +1054,64 @@ final class ToolchainManagerTests: XCTestCase {
                 onRun: nil
             )
         ])
+    }
+}
+
+enum ColmapBridgeHelpFixture {
+    static let selfCheck = "{\"runtime\":\"pycolmap\",\"runtime_version\":\"4.1.0\",\"schema_version\":1,\"status\":\"ok\"}\n"
+
+    static let mapperOptions = [
+        "database_path",
+        "image_path",
+        "output_path",
+        "Mapper.ba_global_frames_ratio",
+        "Mapper.ba_global_points_ratio",
+        "Mapper.ba_global_max_refinements",
+        "Mapper.ba_global_max_num_iterations",
+        "Mapper.random_seed",
+        "Mapper.ba_refine_focal_length",
+    ]
+
+    static let vocabularyOptions = [
+        "database_path",
+        "output_pair_list_path",
+        "query_image_list_path",
+        "excluded_pair_list_path",
+        "num_images",
+        "returned_neighbor_count",
+        "minimum_frame_separation",
+        "num_visual_words",
+        "max_features_per_image",
+        "max_training_descriptors",
+        "num_iterations",
+        "num_rounds",
+        "num_checks",
+        "num_threads",
+    ]
+
+    static let root = """
+    EasySplat COLMAP compatibility bridge
+    pycolmap 4.1.0 · CPU
+
+    Commands:
+      feature_extractor
+      matches_importer
+      local_vocab_retriever
+      mapper
+      point_triangulator
+      bundle_adjuster
+      model_analyzer
+      image_undistorter
+      model_converter
+      feature_importer (not supported)
+
+    """
+
+    static let mapper = help(command: "mapper", options: mapperOptions)
+    static let vocabulary = help(command: "local_vocab_retriever", options: vocabularyOptions)
+
+    private static func help(command: String, options: [String]) -> String {
+        "\(command) via pycolmap 4.1.0 (CPU)\nOptions:\n" +
+            options.sorted().map { "  --\($0) <value>" }.joined(separator: "\n") + "\n"
     }
 }

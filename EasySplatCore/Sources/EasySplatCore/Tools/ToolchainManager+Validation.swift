@@ -11,10 +11,17 @@ extension ToolchainManager {
 
         try requireArm64Binary(at: colmap, label: "colmap")
 
-        let colmapCheck = try runner.run(colmap.path, ["-h"])
-        guard colmapCheck.exitCode == 0 else {
+        let colmapCheck: SubprocessResult
+        do {
+            colmapCheck = try runner.run(colmap.path, ["-h"])
+        } catch {
+            throw ToolchainError.invalidToolchain("COLMAP could not be launched.")
+        }
+        guard colmapCheck.terminationReason == .exit, colmapCheck.exitCode == 0 else {
             throw ToolchainError.invalidToolchain("COLMAP failed to launch (exit \(colmapCheck.exitCode)).")
         }
+        try validateColmapBridgeRoot(colmapCheck)
+        try validateColmapRuntime(executable: colmap)
 
         let mapperProbe: SubprocessResult
         do {
@@ -22,7 +29,7 @@ extension ToolchainManager {
         } catch {
             throw ToolchainError.invalidToolchain("COLMAP mapper could not be launched.")
         }
-        guard mapperProbe.exitCode == 0 else {
+        guard mapperProbe.terminationReason == .exit, mapperProbe.exitCode == 0 else {
             let text = "\(mapperProbe.stdout)\n\(mapperProbe.stderr)".lowercased()
             if text.contains("library not loaded") || text.contains("no lc_rpath") {
                 throw ToolchainError.invalidToolchain("COLMAP mapper failed to launch (missing dylib/rpath).")
@@ -32,6 +39,34 @@ extension ToolchainManager {
             }
             throw ToolchainError.invalidToolchain("COLMAP mapper self-check failed (exit \(mapperProbe.exitCode)).")
         }
+        try requireColmapHelpTokens(
+            ColmapBridgeContract.mapperOptions,
+            in: mapperProbe,
+            subject: "COLMAP mapper"
+        )
+
+        let vocabularyProbe: SubprocessResult
+        do {
+            vocabularyProbe = try runner.run(colmap.path, ["local_vocab_retriever", "-h"])
+        } catch {
+            throw ToolchainError.invalidToolchain("COLMAP local_vocab_retriever could not be launched.")
+        }
+        guard vocabularyProbe.terminationReason == .exit, vocabularyProbe.exitCode == 0 else {
+            let text = "\(vocabularyProbe.stdout)\n\(vocabularyProbe.stderr)".lowercased()
+            if text.contains("not recognized") || text.contains("unknown command") || text.contains("unrecognized command") {
+                throw ToolchainError.invalidToolchain(
+                    "COLMAP does not include the required local_vocab_retriever command."
+                )
+            }
+            throw ToolchainError.invalidToolchain(
+                "COLMAP local_vocab_retriever self-check failed (exit \(vocabularyProbe.exitCode))."
+            )
+        }
+        try requireColmapHelpTokens(
+            ColmapBridgeContract.vocabularyOptions,
+            in: vocabularyProbe,
+            subject: "COLMAP local_vocab_retriever"
+        )
 
         let da3Root = root.appendingPathComponent("da3_mps", isDirectory: true)
         let da3SfmTool = da3Root.appendingPathComponent("bin/easysplat_da3_sfm")
@@ -155,6 +190,93 @@ extension ToolchainManager {
         guard fileManager.fileExists(atPath: url.path) else { return }
         if fileManager.isExecutableFile(atPath: url.path) { return }
         try? fileManager.setAttributes([.posixPermissions: 0o755], ofItemAtPath: url.path)
+    }
+
+    private func validateColmapBridgeRoot(_ result: SubprocessResult) throws {
+        let lines = colmapHelpLines(in: result)
+        let hasReviewedRuntime = lines.contains { line in
+            let fields = line.split(whereSeparator: \Character.isWhitespace)
+            return fields.count >= 2
+                && fields[0] == "pycolmap"
+                && fields[1] == Substring(ColmapBridgeContract.pycolmapVersion)
+        }
+        guard hasReviewedRuntime else {
+            throw ToolchainError.invalidToolchain(
+                "COLMAP bridge requires the reviewed pycolmap \(ColmapBridgeContract.pycolmapVersion) runtime."
+            )
+        }
+
+        var insideCommands = false
+        var commands = Set<String>()
+        for line in lines {
+            if line == "Commands:" {
+                insideCommands = true
+                continue
+            }
+            guard insideCommands else { continue }
+            let fields = line.split(whereSeparator: \Character.isWhitespace)
+            if fields.count == 1 {
+                commands.insert(String(fields[0]))
+            }
+        }
+        let missing = ColmapBridgeContract.commands.subtracting(commands).sorted()
+        if !missing.isEmpty {
+            let suffix = missing.count == 1 ? "" : "s"
+            throw ToolchainError.invalidToolchain(
+                "COLMAP bridge is missing required command\(suffix): \(missing.joined(separator: ", "))."
+            )
+        }
+    }
+
+    private func validateColmapRuntime(executable: URL) throws {
+        let result: SubprocessResult
+        do {
+            result = try runner.run(executable.path, ["--self-check"])
+        } catch {
+            throw ToolchainError.invalidToolchain("COLMAP runtime self-check could not be launched.")
+        }
+        guard result.terminationReason == .exit, result.exitCode == 0 else {
+            throw ToolchainError.invalidToolchain(
+                "COLMAP runtime self-check failed (exit \(result.exitCode))."
+            )
+        }
+
+        guard let data = result.stdout.data(using: .utf8),
+              let payload = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              Set(payload.keys) == ["runtime", "runtime_version", "schema_version", "status"],
+              payload["schema_version"] as? Int == 1,
+              payload["status"] as? String == "ok",
+              payload["runtime"] as? String == "pycolmap",
+              payload["runtime_version"] as? String == ColmapBridgeContract.pycolmapVersion else {
+            throw ToolchainError.invalidToolchain("COLMAP runtime self-check returned an invalid result.")
+        }
+    }
+
+    private func requireColmapHelpTokens(
+        _ required: Set<String>,
+        in result: SubprocessResult,
+        subject: String
+    ) throws {
+        let declaredOptions = Set(colmapHelpLines(in: result).compactMap { line -> String? in
+            guard line.hasPrefix("--") else { return nil }
+            let option = line.dropFirst(2).prefix { character in
+                character.isLetter || character.isNumber || character == "_" || character == "."
+            }
+            return option.isEmpty ? nil : String(option)
+        })
+        let missing = required.subtracting(declaredOptions).sorted()
+        guard missing.isEmpty else {
+            let suffix = missing.count == 1 ? "" : "s"
+            throw ToolchainError.invalidToolchain(
+                "\(subject) is missing required option\(suffix): \(missing.joined(separator: ", "))."
+            )
+        }
+    }
+
+    private func colmapHelpLines(in result: SubprocessResult) -> [String] {
+        "\(result.stdout)\n\(result.stderr)"
+            .split(whereSeparator: \Character.isNewline)
+            .map { $0.trimmingCharacters(in: .whitespaces) }
     }
 
     func validateBuildInfo(at url: URL, expectedToolchainName: String) throws {
@@ -647,4 +769,49 @@ extension ToolchainManager {
             && fileManager.fileExists(atPath: da3SmallConfig.path)
             && fileManager.fileExists(atPath: da3SmallInfo.path)
     }
+}
+
+private enum ColmapBridgeContract {
+    static let pycolmapVersion = "4.1.0"
+
+    static let commands: Set<String> = [
+        "feature_extractor",
+        "matches_importer",
+        "local_vocab_retriever",
+        "mapper",
+        "point_triangulator",
+        "bundle_adjuster",
+        "model_analyzer",
+        "image_undistorter",
+        "model_converter",
+    ]
+
+    static let mapperOptions: Set<String> = [
+        "database_path",
+        "image_path",
+        "output_path",
+        "Mapper.ba_global_frames_ratio",
+        "Mapper.ba_global_points_ratio",
+        "Mapper.ba_global_max_refinements",
+        "Mapper.ba_global_max_num_iterations",
+        "Mapper.random_seed",
+        "Mapper.ba_refine_focal_length",
+    ]
+
+    static let vocabularyOptions: Set<String> = [
+        "database_path",
+        "output_pair_list_path",
+        "query_image_list_path",
+        "excluded_pair_list_path",
+        "num_images",
+        "returned_neighbor_count",
+        "minimum_frame_separation",
+        "num_visual_words",
+        "max_features_per_image",
+        "max_training_descriptors",
+        "num_iterations",
+        "num_rounds",
+        "num_checks",
+        "num_threads",
+    ]
 }
