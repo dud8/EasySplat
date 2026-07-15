@@ -43,7 +43,7 @@ final class RunPlanResolverTests: XCTestCase {
         XCTAssertEqual(plan.analysisFrameRate, 0)
         XCTAssertEqual(plan.keyframeBudget, 250)
         XCTAssertEqual(plan.maximumImageDimension, 1_600)
-        XCTAssertEqual(plan.colmapMaximumImageDimension, 1_024)
+        XCTAssertEqual(plan.colmapMaximumImageDimension, 1_232)
         XCTAssertEqual(plan.capturePath, .automatic)
         XCTAssertEqual(plan.inputOrdering, .unordered)
         XCTAssertEqual(plan.pairingPolicy, .unorderedRetrieval)
@@ -141,6 +141,36 @@ final class RunPlanResolverTests: XCTestCase {
             XCTAssertEqual(plan.colmapMaximumFeatureCount, 4_096)
             XCTAssertEqual(plan.colmapMaximumMatchCount, 4_096)
             XCTAssertEqual(plan.colmapThreadLimit, 4)
+        }
+    }
+
+    func testColmapImageDimensionFollowsDetailAndMemoryTier() {
+        let cases: [(DetailProfile, ResourcePolicy, Double, String, Int)] = [
+            (.fast, .automatic, 8, "constrained", 960),
+            (.fast, .automatic, 24, "standard", 1_024),
+            (.fast, .automatic, 48, "performance", 1_024),
+            (.balanced, .automatic, 16, "constrained", 1_024),
+            (.balanced, .automatic, 24, "standard", 1_024),
+            (.balanced, .automatic, 48, "performance", 1_232),
+            (.highDetail, .conserveMemory, 48, "constrained", 1_280),
+            (.highDetail, .automatic, 24, "standard", 1_280),
+            (.highDetail, .automatic, 48, "performance", 1_280),
+        ]
+
+        for (detail, resourcePolicy, memoryGB, memoryTier, expected) in cases {
+            let plan = RunPlanResolver.resolve(
+                requestedOptions: RequestedRunOptions(
+                    detailProfile: detail,
+                    resourcePolicy: resourcePolicy
+                ),
+                input: .video(files: ["/tmp/clip.mov"]),
+                hardware: HardwareProfile(memoryGB: memoryGB, cpuCount: 16, gpuWorkingSetGB: 12),
+                developmentOverrides: .none
+            )
+
+            let caseName = "\(detail), \(resourcePolicy), \(memoryGB) GB"
+            XCTAssertEqual(plan.memoryTier, memoryTier, caseName)
+            XCTAssertEqual(plan.colmapMaximumImageDimension, expected, caseName)
         }
     }
 

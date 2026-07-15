@@ -68,7 +68,7 @@ final class PipelineIntegrationTests: XCTestCase {
                 argsPrefix: ["feature_extractor"],
                 result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""),
                 onRun: { args in
-                    XCTAssertEqual(self.value(for: "--SiftExtraction.max_image_size", in: args), "1024")
+                    XCTAssertEqual(self.value(for: "--SiftExtraction.max_image_size", in: args), "1232")
                     try? self.writeFeatureDatabase(for: args)
                 }
             )

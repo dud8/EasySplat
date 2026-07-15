@@ -254,7 +254,10 @@ public enum RunPlanResolver {
         )
         let colmapMaximumImageDimension = min(
             maximumImageDimension,
-            resolvedColmapMaximumImageDimension(detail: options.detailProfile)
+            resolvedColmapMaximumImageDimension(
+                detail: options.detailProfile,
+                memoryTier: memoryTier
+            )
         )
         let trainerBudget = trainerBudget(for: options.detailProfile)
         let baseTrainingMemoryBudget = TrainingMemoryBudget.resolve(
@@ -455,8 +458,18 @@ public enum RunPlanResolver {
         }
     }
 
-    private static func resolvedColmapMaximumImageDimension(detail: DetailProfile) -> Int {
-        detail == .highDetail ? 1_280 : 1_024
+    private static func resolvedColmapMaximumImageDimension(
+        detail: DetailProfile,
+        memoryTier: MemoryTier
+    ) -> Int {
+        switch detail {
+        case .fast:
+            return 1_024
+        case .balanced:
+            return memoryTier == .performance ? 1_232 : 1_024
+        case .highDetail:
+            return 1_280
+        }
     }
 
     private static func resolvedRefinementLimit(
