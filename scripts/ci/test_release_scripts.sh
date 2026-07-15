@@ -1271,6 +1271,9 @@ grep -q '^detach ' "$hdiutil_log"
 
 grep -Fq 'detailProfile: .balanced,' "$ROOT/Tools/ReleaseVerifier/main.swift"
 grep -Fq 'resourcePolicy: .automatic,' "$ROOT/Tools/ReleaseVerifier/main.swift"
+grep -Fq 'option == "--allow-insecure-loopback-http"' "$ROOT/Tools/ReleaseVerifier/main.swift"
+grep -Fq 'allowInsecureLoopbackHTTP: arguments.allowInsecureLoopbackHTTP' \
+  "$ROOT/Tools/ReleaseVerifier/main.swift"
 if rg -n 'detailProfile: \.fast|resourcePolicy: \.conserveMemory' \
   "$ROOT/Tools/ReleaseVerifier/main.swift" >/dev/null; then
   echo "Release verifier still exercises a reduced profile instead of the app default." >&2

@@ -9,15 +9,22 @@ private struct Arguments {
     var output: URL
     var appVersion: String
     var offline: Bool
+    var allowInsecureLoopbackHTTP: Bool
 
     static func parse(_ raw: [String]) throws -> Arguments {
         var values: [String: String] = [:]
         var offline = false
+        var allowInsecureLoopbackHTTP = false
         var index = 0
         while index < raw.count {
             let option = raw[index]
             if option == "--offline" {
                 offline = true
+                index += 1
+                continue
+            }
+            if option == "--allow-insecure-loopback-http" {
+                allowInsecureLoopbackHTTP = true
                 index += 1
                 continue
             }
@@ -41,7 +48,7 @@ private struct Arguments {
             throw VerificationError.usage(
                 "Usage: EasySplatReleaseVerifier --fixture <media> --manifest-url <https-url> "
                     + "--public-key-file <file> --cache-root <dir> --output <splat.ply> "
-                    + "--app-version <semver> [--offline]"
+                    + "--app-version <semver> [--offline] [--allow-insecure-loopback-http]"
             )
         }
         return Arguments(
@@ -51,7 +58,8 @@ private struct Arguments {
             cacheRoot: URL(fileURLWithPath: cacheRoot, isDirectory: true),
             output: URL(fileURLWithPath: output),
             appVersion: appVersion,
-            offline: offline
+            offline: offline,
+            allowInsecureLoopbackHTTP: allowInsecureLoopbackHTTP
         )
     }
 }
@@ -127,7 +135,8 @@ private enum ReleaseVerifier {
         let manager = ToolchainManager(
             appVersion: arguments.appVersion,
             localToolchainRoot: nil,
-            installationRoot: arguments.cacheRoot
+            installationRoot: arguments.cacheRoot,
+            allowInsecureLoopbackHTTP: arguments.allowInsecureLoopbackHTTP
         )
         let toolchain = try await manager.ensureToolchain(
             manifestURL: manifestURL,
