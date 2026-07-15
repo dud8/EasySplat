@@ -12,6 +12,10 @@ final class ResultWorkspaceTests: XCTestCase {
         XCTAssertFalse(ViewerView.inputContainsPhotos(nil))
     }
 
+    func testUprightFlipIsHiddenWithoutAValidatedGeometryArtifact() {
+        XCTAssertFalse(ViewerView.offersUprightFlip(for: nil))
+    }
+
     func testViewerKeyboardCommandsMapWithoutHijackingSystemShortcuts() {
         XCTAssertEqual(
             ViewerKeyboardCommand.resolve(keyCode: 123, characters: nil, modifiers: []),
@@ -66,6 +70,356 @@ final class ResultWorkspaceTests: XCTestCase {
     }
 
     @MainActor
+    func testRendererKeepsCameraInteractionInLogicalPointsOnRetinaDisplays() throws {
+        let device = try XCTUnwrap(MTLCreateSystemDefaultDevice())
+        let view = MTKView(frame: NSRect(x: 0, y: 0, width: 1_200, height: 800), device: device)
+        view.drawableSize = CGSize(width: 2_400, height: 1_600)
+        let renderer = try XCTUnwrap(MetalKitSceneRenderer(view))
+
+        renderer.mtkView(view, drawableSizeWillChange: view.drawableSize)
+
+        XCTAssertEqual(renderer.cameraState.viewportSize, CGSize(width: 1_200, height: 800))
+        XCTAssertEqual(renderer.drawableSize, CGSize(width: 2_400, height: 1_600))
+        XCTAssertEqual(renderer.viewportCamera.screenSize, SIMD2<Int>(2_400, 1_600))
+    }
+
+    @MainActor
+    func testRendererKeyboardZoomOutUsesOneReciprocalStep() throws {
+        let device = try XCTUnwrap(MTLCreateSystemDefaultDevice())
+        let view = MTKView(frame: NSRect(x: 0, y: 0, width: 1_200, height: 800), device: device)
+        let renderer = try XCTUnwrap(MetalKitSceneRenderer(view))
+        renderer.applyBounds(center: .zero, radius: 5)
+        let startingDistance = renderer.cameraState.distance
+
+        renderer.keyboardZoomOut()
+
+        XCTAssertEqual(renderer.cameraState.distance, startingDistance / 0.85, accuracy: 1e-5)
+    }
+
+    @MainActor
+    func testInteractiveViewerProvidesAVisibleKeyboardFocusMask() throws {
+        let device = try XCTUnwrap(MTLCreateSystemDefaultDevice())
+        let view = InteractiveMTKView(
+            frame: NSRect(x: 0, y: 0, width: 800, height: 600),
+            device: device
+        )
+
+        XCTAssertTrue(view.acceptsFirstResponder)
+        XCTAssertTrue(view.canBecomeKeyView)
+        XCTAssertEqual(view.focusRingType, .exterior)
+        XCTAssertEqual(
+            view.focusRingMaskBounds,
+            view.bounds.insetBy(dx: 2, dy: 2)
+        )
+    }
+
+    @MainActor
+    func testRendererUsesThePersistedOpeningDirectionWithoutBlanketCalibration() throws {
+        let device = try XCTUnwrap(MTLCreateSystemDefaultDevice())
+        let view = MTKView(frame: NSRect(x: 0, y: 0, width: 1_200, height: 800), device: device)
+        let renderer = try XCTUnwrap(MetalKitSceneRenderer(view))
+        let opening = simd_normalize(SIMD3<Float>(0.4, 0.2, -1))
+
+        XCTAssertTrue(
+            renderer.applyBounds(
+                center: SIMD3<Float>(2, 3, 4),
+                radius: 8,
+                openingDirection: opening,
+                ifInteractionRevisionMatches: renderer.interactionRevision
+            )
+        )
+
+        XCTAssertEqual(renderer.cameraState.forwardDirection.x, opening.x, accuracy: 1e-5)
+        XCTAssertEqual(renderer.cameraState.forwardDirection.y, opening.y, accuracy: 1e-5)
+        XCTAssertEqual(renderer.cameraState.forwardDirection.z, opening.z, accuracy: 1e-5)
+        XCTAssertEqual(renderer.cameraState.sceneRadius, 8)
+        XCTAssertGreaterThan(renderer.cameraState.clipPlanes.far, renderer.cameraState.clipPlanes.near)
+    }
+
+    @MainActor
+    func testViewOnlyUprightFlipIsProperAndReversible() throws {
+        let device = try XCTUnwrap(MTLCreateSystemDefaultDevice())
+        let view = MTKView(frame: NSRect(x: 0, y: 0, width: 1_200, height: 800), device: device)
+        let renderer = try XCTUnwrap(MetalKitSceneRenderer(view))
+        let opening = simd_normalize(SIMD3<Float>(0.4, 0.3, -1))
+        renderer.applyBounds(center: .zero, radius: 5)
+        _ = renderer.applyBounds(
+            center: .zero,
+            radius: 5,
+            openingDirection: opening,
+            ifInteractionRevisionMatches: renderer.interactionRevision
+        )
+
+        renderer.setViewOnlyFlipActive(true)
+
+        XCTAssertTrue(renderer.isViewOnlyFlipActive)
+        XCTAssertEqual(renderer.cameraState.forwardDirection.y, -opening.y, accuracy: 1e-5)
+        XCTAssertEqual(
+            simd_length(renderer.cameraState.forwardDirection),
+            1,
+            accuracy: 1e-5
+        )
+
+        renderer.setViewOnlyFlipActive(false)
+
+        XCTAssertFalse(renderer.isViewOnlyFlipActive)
+        XCTAssertEqual(renderer.cameraState.forwardDirection.x, opening.x, accuracy: 1e-5)
+        XCTAssertEqual(renderer.cameraState.forwardDirection.y, opening.y, accuracy: 1e-5)
+        XCTAssertEqual(renderer.cameraState.forwardDirection.z, opening.z, accuracy: 1e-5)
+    }
+
+    @MainActor
+    func testPersistedFlipUsesTheIncomingOpeningDirectionOnFirstFit() throws {
+        let device = try XCTUnwrap(MTLCreateSystemDefaultDevice())
+        let view = MTKView(frame: NSRect(x: 0, y: 0, width: 1_200, height: 800), device: device)
+        let renderer = try XCTUnwrap(MetalKitSceneRenderer(view))
+        let opening = simd_normalize(SIMD3<Float>(0.7, 0.4, -0.2))
+        renderer.setViewOnlyFlipActive(true)
+        let revision = renderer.interactionRevision
+
+        XCTAssertTrue(
+            renderer.applyBounds(
+                center: .zero,
+                radius: 5,
+                openingDirection: opening,
+                ifInteractionRevisionMatches: revision
+            )
+        )
+
+        XCTAssertEqual(renderer.cameraState.forwardDirection.x, opening.x, accuracy: 1e-5)
+        XCTAssertEqual(renderer.cameraState.forwardDirection.y, -opening.y, accuracy: 1e-5)
+        XCTAssertEqual(renderer.cameraState.forwardDirection.z, opening.z, accuracy: 1e-5)
+    }
+
+    @MainActor
+    func testLateBoundsUpdateClippingWithoutOverridingInteraction() throws {
+        let device = try XCTUnwrap(MTLCreateSystemDefaultDevice())
+        let view = MTKView(frame: NSRect(x: 0, y: 0, width: 1_200, height: 800), device: device)
+        let renderer = try XCTUnwrap(MetalKitSceneRenderer(view))
+        let expectedRevision = renderer.interactionRevision
+        renderer.orbit(deltaX: 30, deltaY: -20)
+        let interacted = renderer.cameraState
+
+        XCTAssertFalse(
+            renderer.applyBounds(
+                center: SIMD3<Float>(10, 20, 30),
+                radius: 40,
+                openingDirection: SIMD3<Float>(0, 0, -1),
+                ifInteractionRevisionMatches: expectedRevision
+            )
+        )
+
+        XCTAssertEqual(renderer.cameraState.target, interacted.target)
+        XCTAssertEqual(renderer.cameraState.yaw, interacted.yaw)
+        XCTAssertEqual(renderer.cameraState.pitch, interacted.pitch)
+        XCTAssertEqual(renderer.cameraState.distance, interacted.distance)
+        XCTAssertEqual(renderer.cameraState.sceneRadius, 40)
+    }
+
+    @MainActor
+    func testPreparedSceneConfigurationDoesNotRedrawTheDisplayedSplatBeforeActivation() throws {
+        let device = try XCTUnwrap(MTLCreateSystemDefaultDevice())
+        let view = MTKView(frame: NSRect(x: 0, y: 0, width: 1_200, height: 800), device: device)
+        let renderer = try XCTUnwrap(MetalKitSceneRenderer(view))
+        let controller = SplatViewerController()
+        controller.renderer = renderer
+        let oldBounds = ViewerSceneBounds(center: SIMD3<Float>(1, 2, 3), radius: 4)
+        let newBounds = ViewerSceneBounds(center: SIMD3<Float>(20, 30, 40), radius: 50)
+        let oldRequest = PreviewLoadRequest(url: URL(fileURLWithPath: "/tmp/a.ply"), reloadToken: 0)
+        let newRequest = PreviewLoadRequest(url: URL(fileURLWithPath: "/tmp/b.ply"), reloadToken: 0)
+        controller.prepareBounds(
+            for: oldRequest,
+            configuration: SplatViewerSceneConfiguration(bounds: oldBounds)
+        )
+        let displayedCamera = renderer.cameraState
+
+        controller.prepareBounds(
+            for: newRequest,
+            configuration: SplatViewerSceneConfiguration(
+                bounds: newBounds,
+                openingDirection: SIMD3<Float>(1, 0, 0),
+                isViewOnlyFlipActive: true
+            ),
+            activate: false
+        )
+
+        XCTAssertEqual(renderer.cameraState, displayedCamera)
+        XCTAssertFalse(renderer.isViewOnlyFlipActive)
+
+        controller.activatePreparedSceneConfiguration()
+
+        XCTAssertEqual(renderer.cameraState.target, newBounds.center)
+        XCTAssertEqual(renderer.cameraState.sceneRadius, newBounds.radius)
+        XCTAssertTrue(renderer.isViewOnlyFlipActive)
+    }
+
+    @MainActor
+    func testPreparedSceneActivationDrawsOnlyAfterTheEntireConfigurationIsInstalled() throws {
+        let device = try XCTUnwrap(MTLCreateSystemDefaultDevice())
+        let view = DrawRecordingMTKView(
+            frame: NSRect(x: 0, y: 0, width: 1_200, height: 800),
+            device: device
+        )
+        let renderer = try XCTUnwrap(MetalKitSceneRenderer(view))
+        let controller = SplatViewerController()
+        controller.renderer = renderer
+        let oldRequest = PreviewLoadRequest(
+            url: URL(fileURLWithPath: "/tmp/atomic-old.ply"),
+            reloadToken: 0
+        )
+        controller.prepareBounds(
+            for: oldRequest,
+            configuration: SplatViewerSceneConfiguration(
+                bounds: ViewerSceneBounds(center: .zero, radius: 2)
+            )
+        )
+
+        var drawSnapshots: [(target: SIMD3<Float>, radius: Float, flipped: Bool)] = []
+        view.onDraw = {
+            drawSnapshots.append(
+                (
+                    target: renderer.cameraState.target,
+                    radius: renderer.cameraState.sceneRadius,
+                    flipped: renderer.isViewOnlyFlipActive
+                )
+            )
+        }
+        let newBounds = ViewerSceneBounds(
+            center: SIMD3<Float>(20, 30, 40),
+            radius: 50
+        )
+        controller.prepareBounds(
+            for: PreviewLoadRequest(
+                url: URL(fileURLWithPath: "/tmp/atomic-new.ply"),
+                reloadToken: 0
+            ),
+            configuration: SplatViewerSceneConfiguration(
+                bounds: newBounds,
+                openingDirection: SIMD3<Float>(1, 0, 0),
+                isViewOnlyFlipActive: true
+            ),
+            activate: false
+        )
+
+        controller.activatePreparedSceneConfiguration()
+
+        XCTAssertEqual(drawSnapshots.count, 1)
+        XCTAssertEqual(drawSnapshots.first?.target, newBounds.center)
+        XCTAssertEqual(drawSnapshots.first?.radius, newBounds.radius)
+        XCTAssertEqual(drawSnapshots.first?.flipped, true)
+    }
+
+    @MainActor
+    func testPreparedSceneActivationPreservesInteractionThatOccurredWhileLoading() throws {
+        let device = try XCTUnwrap(MTLCreateSystemDefaultDevice())
+        let view = MTKView(
+            frame: NSRect(x: 0, y: 0, width: 1_200, height: 800),
+            device: device
+        )
+        let renderer = try XCTUnwrap(MetalKitSceneRenderer(view))
+        let controller = SplatViewerController()
+        controller.renderer = renderer
+        let newBounds = ViewerSceneBounds(
+            center: SIMD3<Float>(20, 30, 40),
+            radius: 50
+        )
+        controller.prepareBounds(
+            for: PreviewLoadRequest(
+                url: URL(fileURLWithPath: "/tmp/interacted-new.ply"),
+                reloadToken: 0
+            ),
+            configuration: SplatViewerSceneConfiguration(
+                bounds: newBounds,
+                openingDirection: SIMD3<Float>(1, 0, 0),
+                isViewOnlyFlipActive: true
+            ),
+            activate: false
+        )
+        renderer.orbit(deltaX: 30, deltaY: -20)
+        renderer.pan(deltaX: 12, deltaY: -7)
+        renderer.keyboardZoomIn()
+        let interactedCamera = renderer.cameraState
+
+        controller.activatePreparedSceneConfiguration()
+
+        XCTAssertEqual(renderer.cameraState.target, interactedCamera.target)
+        XCTAssertEqual(renderer.cameraState.yaw, interactedCamera.yaw)
+        XCTAssertEqual(renderer.cameraState.pitch, interactedCamera.pitch)
+        XCTAssertEqual(renderer.cameraState.distance, interactedCamera.distance)
+        XCTAssertEqual(renderer.cameraState.sceneRadius, newBounds.radius)
+        XCTAssertTrue(renderer.isViewOnlyFlipActive)
+    }
+
+    func testCancelledSerialModelLoadCannotBlockOrPublishStaleWork() async throws {
+        let executor = SerialModelLoadExecutor(
+            queue: DispatchQueue(label: "com.easysplat.tests.model-load")
+        )
+        let started = AsyncSignal()
+        let release = DispatchSemaphore(value: 0)
+        let staleWorkPublished = LockedBoolean()
+        let abandonedLoad = Task {
+            try await executor.perform { cancellation in
+                started.signal()
+                release.wait()
+                try cancellation.checkCancellation()
+                staleWorkPublished.setTrue()
+                return 1
+            }
+        }
+        await started.wait()
+
+        abandonedLoad.cancel()
+        release.signal()
+
+        do {
+            _ = try await abandonedLoad.value
+            XCTFail("Expected the abandoned model load to be cancelled")
+        } catch is CancellationError {
+            // Expected.
+        }
+        let nextResult = try await executor.perform { cancellation in
+            try cancellation.checkCancellation()
+            return 2
+        }
+
+        XCTAssertEqual(nextResult, 2)
+        XCTAssertFalse(staleWorkPublished.value)
+    }
+
+    @MainActor
+    func testDeferredRequestKeepsItsConfigurationOffTheDisplayedSplat() throws {
+        let device = try XCTUnwrap(MTLCreateSystemDefaultDevice())
+        let view = MTKView(frame: NSRect(x: 0, y: 0, width: 1_200, height: 800), device: device)
+        let renderer = try XCTUnwrap(MetalKitSceneRenderer(view))
+        let controller = SplatViewerController()
+        controller.renderer = renderer
+        let oldBounds = ViewerSceneBounds(center: SIMD3<Float>(1, 2, 3), radius: 4)
+        controller.prepareBounds(
+            for: PreviewLoadRequest(url: URL(fileURLWithPath: "/tmp/a.ply"), reloadToken: 0),
+            configuration: SplatViewerSceneConfiguration(bounds: oldBounds)
+        )
+        let displayedCamera = renderer.cameraState
+        let coordinator = MetalKitSceneView.Coordinator()
+        coordinator.renderer = renderer
+        coordinator.controller = controller
+        coordinator.recordInteraction()
+
+        coordinator.requestLoad(
+            url: URL(fileURLWithPath: "/tmp/b.ply"),
+            reloadToken: 0,
+            configuration: SplatViewerSceneConfiguration(
+                bounds: ViewerSceneBounds(center: SIMD3<Float>(90, 80, 70), radius: 60),
+                openingDirection: SIMD3<Float>(1, 0, 0),
+                isViewOnlyFlipActive: true
+            )
+        )
+
+        XCTAssertEqual(renderer.cameraState, displayedCamera)
+        XCTAssertFalse(renderer.isViewOnlyFlipActive)
+        XCTAssertEqual(controller.currentBounds, oldBounds)
+    }
+
+    @MainActor
     func testViewerBoundsIgnoreAnOlderRequestThatFinishesLast() async {
         let loader = ControlledBoundsLoader()
         let controller = SplatViewerController(boundsLoader: { url in
@@ -80,7 +434,7 @@ final class ResultWorkspaceTests: XCTestCase {
         await loader.waitUntilRequested(oldURL)
         await loader.complete(
             oldURL,
-            with: (center: SIMD3<Float>(1, 2, 3), radius: 4)
+            with: ViewerSceneBounds(center: SIMD3<Float>(1, 2, 3), radius: 4)
         )
         await waitForBounds(on: controller, center: SIMD3<Float>(1, 2, 3))
 
@@ -96,13 +450,13 @@ final class ResultWorkspaceTests: XCTestCase {
         await loader.waitUntilRequested(newURL)
         await loader.complete(
             newURL,
-            with: (center: SIMD3<Float>(7, 8, 9), radius: 10)
+            with: ViewerSceneBounds(center: SIMD3<Float>(7, 8, 9), radius: 10)
         )
         await waitForBounds(on: controller, center: SIMD3<Float>(7, 8, 9))
 
         await loader.complete(
             oldURL,
-            with: (center: SIMD3<Float>(40, 50, 60), radius: 70)
+            with: ViewerSceneBounds(center: SIMD3<Float>(40, 50, 60), radius: 70)
         )
         for _ in 0..<20 {
             await Task.yield()
@@ -110,6 +464,31 @@ final class ResultWorkspaceTests: XCTestCase {
 
         XCTAssertEqual(controller.currentBounds?.center, SIMD3<Float>(7, 8, 9))
         XCTAssertEqual(controller.currentBounds?.radius, 10)
+    }
+
+    @MainActor
+    func testPersistedBoundsWinIfTheyArriveDuringFallbackSampling() async {
+        let loader = ControlledBoundsLoader()
+        let controller = SplatViewerController(boundsLoader: { url in
+            await loader.load(url)
+        })
+        let url = URL(fileURLWithPath: "/tmp/result.ply")
+        let request = PreviewLoadRequest(url: url, reloadToken: 0)
+        controller.prepareBounds(for: request)
+        controller.startBoundsLoad(for: request)
+        await loader.waitUntilRequested(url)
+        let persisted = ViewerSceneBounds(center: SIMD3<Float>(1, 2, 3), radius: 4)
+
+        controller.updateSceneConfiguration(
+            SplatViewerSceneConfiguration(bounds: persisted)
+        )
+        await loader.complete(
+            url,
+            with: ViewerSceneBounds(center: SIMD3<Float>(90, 90, 90), radius: 900)
+        )
+        for _ in 0..<20 { await Task.yield() }
+
+        XCTAssertEqual(controller.currentBounds, persisted)
     }
 
     @MainActor
@@ -337,6 +716,15 @@ private actor ControlledBoundsLoader {
     }
 }
 
+@MainActor
+private final class DrawRecordingMTKView: MTKView {
+    var onDraw: (() -> Void)?
+
+    override func draw() {
+        onDraw?()
+    }
+}
+
 private final class ThreadObservation: @unchecked Sendable {
     private let lock = NSLock()
     private var value: Bool?
@@ -348,6 +736,51 @@ private final class ThreadObservation: @unchecked Sendable {
     func record(isMainThread: Bool) {
         lock.withLock {
             value = isMainThread
+        }
+    }
+}
+
+private final class AsyncSignal: @unchecked Sendable {
+    private let lock = NSLock()
+    private var signaled = false
+    private var continuation: CheckedContinuation<Void, Never>?
+
+    func signal() {
+        let continuation = lock.withLock { () -> CheckedContinuation<Void, Never>? in
+            signaled = true
+            defer { self.continuation = nil }
+            return self.continuation
+        }
+        continuation?.resume()
+    }
+
+    func wait() async {
+        await withCheckedContinuation { continuation in
+            let resumeImmediately = lock.withLock {
+                if signaled {
+                    return true
+                }
+                self.continuation = continuation
+                return false
+            }
+            if resumeImmediately {
+                continuation.resume()
+            }
+        }
+    }
+}
+
+private final class LockedBoolean: @unchecked Sendable {
+    private let lock = NSLock()
+    private var storage = false
+
+    var value: Bool {
+        lock.withLock { storage }
+    }
+
+    func setTrue() {
+        lock.withLock {
+            storage = true
         }
     }
 }

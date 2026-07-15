@@ -137,6 +137,12 @@ Viewer keyboard controls:
 - `F`: fit
 - `R`: reset
 
+Pointer and trackpad controls:
+
+- drag: orbit
+- Option-drag: pan
+- scroll or pinch: zoom
+
 ## Review matrix
 
 Before release, check light and dark appearance at 920×640, 1100×760, and 1440×900. Repeat with:

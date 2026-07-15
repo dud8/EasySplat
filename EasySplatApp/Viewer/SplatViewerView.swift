@@ -15,6 +15,7 @@ struct SplatViewerView: View {
     let splatURL: URL
     var reloadToken: Int = 0
     var resetCameraToken: Int = 0
+    var sceneConfiguration = SplatViewerSceneConfiguration()
     var showsLoadErrors: Bool = true
     var onLoadStateChanged: ((SplatViewerLoadState) -> Void)? = nil
     var overlayDensity: SplatViewerOverlayDensity = .regular
@@ -32,6 +33,7 @@ struct SplatViewerView: View {
                 splatURL: splatURL,
                 reloadToken: reloadToken,
                 controller: controller,
+                sceneConfiguration: sceneConfiguration,
                 onLoadStateChanged: onLoadStateChanged
             )
                 .clipShape(RoundedRectangle(cornerRadius: Theme.Radius.standard, style: .continuous))
@@ -50,7 +52,7 @@ struct SplatViewerView: View {
                     Text("Controls").font(.headline)
                     Text("Orbit: Drag")
                     Text("Pan: Option + Drag")
-                    Text("Zoom: Scroll")
+                    Text("Zoom: Scroll or pinch")
                     Divider()
                     Text("Keyboard: arrows orbit")
                     Text("Option + arrows pan")

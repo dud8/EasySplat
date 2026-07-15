@@ -53,9 +53,9 @@ final class GeometryArtifactStoreTests: XCTestCase {
         }
     }
 
-    func testLoadRejectsBaselineSchemaThreeBeforeDecodingLegacyOrientation() throws {
+    func testLoadRejectsSchemaFourBeforeDecodingRetiredViewerState() throws {
         let baselineSchemaVersion = GeometryArtifact.currentSchemaVersion - 1
-        XCTAssertEqual(baselineSchemaVersion, 3)
+        XCTAssertEqual(baselineSchemaVersion, 4)
 
         let root = try TestFileBuilder.makeTempDir()
         defer { try? FileManager.default.removeItem(at: root) }
@@ -71,7 +71,7 @@ final class GeometryArtifactStoreTests: XCTestCase {
         var orientation = try XCTUnwrap(
             object["canonicalOrientation"] as? [String: Any]
         )
-        orientation["status"] = "notEvaluated"
+        orientation["isViewOnlyFlipActive"] = true
         object["canonicalOrientation"] = orientation
         try JSONSerialization.data(withJSONObject: object).write(
             to: paths.geometryManifestURL
@@ -592,8 +592,7 @@ final class GeometryArtifactStoreTests: XCTestCase {
             method: nil,
             sourceToCanonicalQuaternionWXYZ: nil,
             evidence: nil,
-            canonicalOpeningViewDirection: CanonicalDirection(x: 0, y: 0, z: -1),
-            isViewOnlyFlipActive: false
+            canonicalOpeningViewDirection: CanonicalDirection(x: 0, y: 0, z: -1)
         )
 
         XCTAssertNoThrow(try GeometryArtifactStore.validate(artifact, projectPaths: paths))

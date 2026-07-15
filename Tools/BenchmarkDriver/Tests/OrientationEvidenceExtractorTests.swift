@@ -435,7 +435,7 @@ final class OrientationEvidenceExtractorTests: XCTestCase {
         if let evidence { orientation["evidence"] = evidence }
         let imagesDigest = try bareSHA256(fileAt: candidateImages)
         let manifestObject: [String: Any] = [
-            "schemaVersion": 4,
+            "schemaVersion": 5,
             "poseConvention": "world-to-camera",
             "quaternionOrder": "wxyz",
             "handedness": "right-handed",

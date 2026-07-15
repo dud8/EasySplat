@@ -11,22 +11,30 @@ struct ViewerView: View {
     @State private var isTechnicalExpanded = false
     @State private var resetCameraToken = 0
     @State private var metadata: ProjectMetadata?
-    @State private var exportAlert: ExportAlert?
+    @State private var loadedMetadataProjectURL: URL?
+    @State private var viewerAlert: ViewerAlert?
     @State private var isExporting = false
 
     var body: some View {
         Group {
             if let plyURL = model.outputPlyURL {
-                SplatViewerView(
-                    splatURL: plyURL,
-                    resetCameraToken: resetCameraToken,
-                    overlayDensity: .compact
-                )
-                .frame(maxWidth: .infinity, maxHeight: .infinity)
-                .padding(Theme.Spacing.large)
-                .accessibilityElement(children: .contain)
-                .accessibilityLabel("Interactive 3D splat viewer")
-                .accessibilityHint("Click the viewer, then use arrow keys to orbit. Option with arrow keys pans.")
+                if loadedMetadataProjectURL == model.currentProjectURL?.standardizedFileURL {
+                    SplatViewerView(
+                        splatURL: plyURL,
+                        resetCameraToken: resetCameraToken,
+                        sceneConfiguration: viewerSceneConfiguration,
+                        overlayDensity: .compact
+                    )
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+                    .padding(Theme.Spacing.large)
+                    .accessibilityElement(children: .contain)
+                    .accessibilityLabel("Interactive 3D splat viewer")
+                    .accessibilityHint(
+                        "Drag to orbit. Option-drag pans. Scroll or pinch zooms. Press F to fit or R to reset."
+                    )
+                } else {
+                    ProgressView("Opening splat…")
+                }
             } else {
                 ContentUnavailableView(
                     "Splat unavailable",
@@ -42,9 +50,9 @@ struct ViewerView: View {
             resultInspector
                 .inspectorColumnWidth(min: 260, ideal: 300, max: 380)
         }
-        .alert(item: $exportAlert) { alert in
+        .alert(item: $viewerAlert) { alert in
             Alert(
-                title: Text("Couldn’t export splat"),
+                title: Text(alert.title),
                 message: Text(alert.message),
                 dismissButton: .default(Text("OK"))
             )
@@ -96,6 +104,18 @@ struct ViewerView: View {
                     resetCameraToken &+= 1
                 }
                 .disabled(model.outputPlyURL == nil)
+
+                if Self.offersUprightFlip(for: metadata?.geometryArtifact) {
+                    Toggle(
+                        "Flip Upright",
+                        isOn: Binding(
+                            get: { metadata?.viewerPreferences.isUprightFlipActive == true },
+                            set: { isActive in updateUprightFlip(isActive) }
+                        )
+                    )
+                    .help("Changes only this view; the exported PLY stays unchanged")
+                    .accessibilityHint("Changes only the viewer. The exported PLY is unchanged.")
+                }
 
                 Button("Check for Updates…", systemImage: "arrow.triangle.2.circlepath") {
                     let releases = AppConfig.projectHomeURL
@@ -321,6 +341,9 @@ struct ViewerView: View {
                     LabeledContent("Model", value: geometry.modelVersion)
                     LabeledContent("Camera", value: geometry.cameraModel)
                     LabeledContent("Residuals", value: geometry.residualProvenance)
+                    if geometry.canonicalOrientation.status == .unresolved {
+                        LabeledContent("Upright", value: "Not determined")
+                    }
                 } else if let reconstruction = model.currentReconstruction {
                     LabeledContent("Solver", value: reconstruction.displayMapper)
                 }
@@ -382,9 +405,11 @@ struct ViewerView: View {
     private func loadMetadata() {
         guard let projectURL = model.currentProjectURL else {
             metadata = nil
+            loadedMetadataProjectURL = nil
             return
         }
         metadata = try? ProjectMetadataStore.load(from: ProjectPaths(root: projectURL).metadataURL)
+        loadedMetadataProjectURL = projectURL.standardizedFileURL
     }
 
     private func presentExportPanel() {
@@ -399,13 +424,19 @@ struct ViewerView: View {
                 return
             } catch {
                 isExporting = false
-                exportAlert = ExportAlert(message: error.localizedDescription)
+                viewerAlert = ViewerAlert(
+                    title: "Couldn’t export splat",
+                    message: error.localizedDescription
+                )
                 return
             }
 
             guard let plyType = UTType(filenameExtension: "ply") else {
                 isExporting = false
-                exportAlert = ExportAlert(message: "PLY export is unavailable on this Mac.")
+                viewerAlert = ViewerAlert(
+                    title: "Couldn’t export splat",
+                    message: "PLY export is unavailable on this Mac."
+                )
                 return
             }
 
@@ -429,7 +460,10 @@ struct ViewerView: View {
                             try AppModel.exportValidatedSplat(from: source, to: destination)
                         }.value
                     } catch {
-                        exportAlert = ExportAlert(message: error.localizedDescription)
+                        viewerAlert = ViewerAlert(
+                            title: "Couldn’t export splat",
+                            message: error.localizedDescription
+                        )
                     }
                 }
             }
@@ -440,6 +474,52 @@ struct ViewerView: View {
         Task { @MainActor in
             guard let output = try? await model.validatedCurrentSplatForExport() else { return }
             NSWorkspace.shared.activateFileViewerSelecting([output])
+        }
+    }
+
+    private var viewerSceneConfiguration: SplatViewerSceneConfiguration {
+        let storedBounds = metadata?.trainingArtifact?.sceneBounds
+        let bounds = storedBounds.flatMap { stored -> ViewerSceneBounds? in
+            let center = SIMD3<Float>(
+                Float(stored.center.x),
+                Float(stored.center.y),
+                Float(stored.center.z)
+            )
+            let radius = Float(stored.radius)
+            guard center.x.isFinite,
+                  center.y.isFinite,
+                  center.z.isFinite,
+                  radius.isFinite,
+                  radius > 0 else { return nil }
+            return ViewerSceneBounds(center: center, radius: radius)
+        }
+        let storedDirection = metadata?.geometryArtifact?
+            .canonicalOrientation.canonicalOpeningViewDirection
+        let openingDirection = storedDirection.map {
+            SIMD3<Float>(Float($0.x), Float($0.y), Float($0.z))
+        }
+        let canFlip = metadata?.geometryArtifact?.allowsViewOnlyUprightFlip == true
+        return SplatViewerSceneConfiguration(
+            bounds: bounds,
+            openingDirection: openingDirection,
+            isViewOnlyFlipActive: canFlip
+                && metadata?.viewerPreferences.isUprightFlipActive == true
+        )
+    }
+
+    private func updateUprightFlip(_ isActive: Bool) {
+        guard let projectURL = model.currentProjectURL else { return }
+        do {
+            metadata = try ProjectMetadataStore.update(
+                at: ProjectPaths(root: projectURL).metadataURL
+            ) { metadata in
+                metadata.viewerPreferences.isUprightFlipActive = isActive
+            }
+        } catch {
+            viewerAlert = ViewerAlert(
+                title: "Couldn’t update view",
+                message: error.localizedDescription
+            )
         }
     }
 
@@ -461,6 +541,12 @@ struct ViewerView: View {
         case .video, nil:
             return false
         }
+    }
+
+    nonisolated static func offersUprightFlip(
+        for artifact: GeometryArtifact?
+    ) -> Bool {
+        artifact?.allowsViewOnlyUprightFlip == true
     }
 
     private func capturePathLabel(_ path: CapturePath) -> String {
@@ -513,7 +599,8 @@ struct ViewerView: View {
     }
 }
 
-private struct ExportAlert: Identifiable {
+private struct ViewerAlert: Identifiable {
     let id = UUID()
+    let title: String
     let message: String
 }

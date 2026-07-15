@@ -658,8 +658,7 @@ enum CanonicalOrientationEstimator {
                 method: method,
                 sourceToCanonicalQuaternionWXYZ: transform.canonicalQuaternion(),
                 evidence: evidence,
-                canonicalOpeningViewDirection: direction.map(CanonicalDirection.init),
-                isViewOnlyFlipActive: false
+                canonicalOpeningViewDirection: direction.map(CanonicalDirection.init)
             ),
             sourceToCanonical: transform
         )
@@ -676,8 +675,7 @@ enum CanonicalOrientationEstimator {
                 method: method,
                 sourceToCanonicalQuaternionWXYZ: nil,
                 evidence: evidence,
-                canonicalOpeningViewDirection: openingCamera?.forwardInWorld.normalized.map(CanonicalDirection.init),
-                isViewOnlyFlipActive: false
+                canonicalOpeningViewDirection: openingCamera?.forwardInWorld.normalized.map(CanonicalDirection.init)
             ),
             sourceToCanonical: .identity
         )

@@ -5,7 +5,7 @@ public enum ProjectMetadataStore {
     private static let maximumMetadataBytes = 8 * 1_024 * 1_024
     private static let fileLocks = ProjectMetadataFileLocks()
     /// The one project format this beta reads and writes.
-    public static let supportedFormatVersion: Int = 4
+    public static let supportedFormatVersion: Int = 5
 
     public enum LoadError: Error, LocalizedError {
         case unsupportedFormatVersion(Int)
@@ -63,6 +63,7 @@ public enum ProjectMetadataStore {
                 let current = try decodeWithoutArtifactValidation(from: url)
                 merged.title = current.title
                 merged.notes = current.notes
+                merged.viewerPreferences = current.viewerPreferences
             } catch {
                 guard BoundedFileReader.isMissingFileError(error) else {
                     throw error
@@ -80,6 +81,7 @@ public enum ProjectMetadataStore {
         try fileLocks.withLock(for: url) {
             var metadata = try loadWithoutLock(from: url)
             try mutation(&metadata)
+            normalizeViewerPreferences(in: &metadata)
             try saveWithoutLock(metadata, to: url)
             return metadata
         }
@@ -105,10 +107,11 @@ public enum ProjectMetadataStore {
         }
         let decoder = JSONDecoder()
         decoder.dateDecodingStrategy = .iso8601
-        let metadata = try decoder.decode(ProjectMetadata.self, from: data)
+        var metadata = try decoder.decode(ProjectMetadata.self, from: data)
         guard metadata.formatVersion == supportedFormatVersion else {
             throw SaveError.invalidFormatVersion(metadata.formatVersion)
         }
+        normalizeViewerPreferences(in: &metadata)
         return metadata
     }
 
@@ -120,18 +123,27 @@ public enum ProjectMetadataStore {
 
     private static func saveWithoutLock(_ metadata: ProjectMetadata, to url: URL) throws {
         try ProjectPaths(root: url.deletingLastPathComponent()).validateRootDirectory()
-        guard metadata.formatVersion == supportedFormatVersion else {
-            throw SaveError.invalidFormatVersion(metadata.formatVersion)
+        var persistedMetadata = metadata
+        guard persistedMetadata.formatVersion == supportedFormatVersion else {
+            throw SaveError.invalidFormatVersion(persistedMetadata.formatVersion)
         }
-        try validateArtifactPaths(in: metadata, metadataURL: url)
+        normalizeViewerPreferences(in: &persistedMetadata)
+        try validateArtifactPaths(in: persistedMetadata, metadataURL: url)
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.prettyPrinted, .sortedKeys, .withoutEscapingSlashes]
         encoder.dateEncodingStrategy = .iso8601
-        let data = try encoder.encode(metadata)
+        let data = try encoder.encode(persistedMetadata)
         guard data.count <= maximumMetadataBytes else {
             throw SaveError.metadataTooLarge(maximumBytes: maximumMetadataBytes)
         }
         try data.write(to: url, options: [.atomic])
+    }
+
+    private static func normalizeViewerPreferences(in metadata: inout ProjectMetadata) {
+        guard metadata.geometryArtifact?.allowsViewOnlyUprightFlip == true else {
+            metadata.viewerPreferences.isUprightFlipActive = false
+            return
+        }
     }
 
     private static func validateArtifactPaths(

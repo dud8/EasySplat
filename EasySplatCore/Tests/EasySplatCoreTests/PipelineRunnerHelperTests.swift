@@ -998,8 +998,7 @@ final class PipelineRunnerHelperTests: XCTestCase {
             method: .cameraRightNullspace,
             sourceToCanonicalQuaternionWXYZ: quaternion,
             evidence: nil,
-            canonicalOpeningViewDirection: CanonicalDirection(x: 0, y: 0, z: -1),
-            isViewOnlyFlipActive: false
+            canonicalOpeningViewDirection: CanonicalDirection(x: 0, y: 0, z: -1)
         )
     }
 

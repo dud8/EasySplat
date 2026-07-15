@@ -2,6 +2,131 @@ import XCTest
 @testable import EasySplatCore
 
 final class ProjectMetadataStoreTests: XCTestCase {
+    func testRoundTripPreservesPermittedUprightFlipWithoutChangingGeometryArtifact() throws {
+        let root = try TestFileBuilder.makeTempDir()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let url = root.appendingPathComponent("project.json")
+        let geometry = makeAxisAlignedSignUnverifiedGeometryArtifact()
+        let geometryBytes = try JSONEncoder().encode(geometry)
+        XCTAssertNil(String(data: geometryBytes, encoding: .utf8)?.range(
+            of: "isViewOnlyFlipActive"
+        ))
+        let metadata = ProjectMetadata(
+            title: "Ambiguous upright",
+            input: .photos(folder: "/tmp/photos"),
+            geometryArtifact: geometry
+        )
+
+        try ProjectMetadataStore.save(metadata, to: url)
+        _ = try ProjectMetadataStore.update(at: url) { metadata in
+            metadata.viewerPreferences.isUprightFlipActive = true
+        }
+        let loaded = try ProjectMetadataStore.load(from: url)
+
+        XCTAssertTrue(loaded.viewerPreferences.isUprightFlipActive)
+        XCTAssertEqual(loaded.geometryArtifact, geometry)
+        XCTAssertEqual(loaded.geometryArtifact?.modelHashes, geometry.modelHashes)
+        XCTAssertEqual(loaded.geometryArtifact?.provenance, geometry.provenance)
+
+        let updated = try ProjectMetadataStore.update(at: url) { metadata in
+            metadata.notes = "Keep the view flipped"
+        }
+        XCTAssertTrue(updated.viewerPreferences.isUprightFlipActive)
+        XCTAssertTrue(
+            try ProjectMetadataStore.load(from: url)
+                .viewerPreferences.isUprightFlipActive
+        )
+    }
+
+    func testSaveNormalizesUprightFlipWhenOrientationCannotBeFlipped() throws {
+        for (name, geometry) in [
+            ("unresolved", makeGeometryArtifact()),
+            ("verified", makeVerifiedGeometryArtifact()),
+        ] {
+            let root = try TestFileBuilder.makeTempDir()
+            defer { try? FileManager.default.removeItem(at: root) }
+            let url = root.appendingPathComponent("project.json")
+            let metadata = ProjectMetadata(
+                title: name,
+                input: .photos(folder: "/tmp/photos"),
+                geometryArtifact: geometry,
+                viewerPreferences: ViewerPreferences(isUprightFlipActive: true)
+            )
+
+            try ProjectMetadataStore.save(metadata, to: url)
+
+            XCTAssertFalse(
+                try ProjectMetadataStore.load(from: url)
+                    .viewerPreferences.isUprightFlipActive,
+                "\(name) projects cannot persist the view-only flip."
+            )
+        }
+    }
+
+    func testLoadNormalizesForgedUprightFlipWhenOrientationIsUnresolved() throws {
+        let root = try TestFileBuilder.makeTempDir()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let url = root.appendingPathComponent("project.json")
+        let metadata = ProjectMetadata(
+            title: "Forged preference",
+            input: .photos(folder: "/tmp/photos"),
+            geometryArtifact: makeGeometryArtifact(),
+            viewerPreferences: ViewerPreferences(isUprightFlipActive: true)
+        )
+        let encoder = JSONEncoder()
+        encoder.dateEncodingStrategy = .iso8601
+        try encoder.encode(metadata).write(to: url)
+
+        XCTAssertFalse(
+            try ProjectMetadataStore.load(from: url)
+                .viewerPreferences.isUprightFlipActive
+        )
+    }
+
+    func testLoadNormalizesForgedUprightFlipWhenSignUnverifiedArtifactIsMalformed() throws {
+        let mutations: [(String, (inout GeometryArtifact) -> Void)] = [
+            ("missing method", { $0.canonicalOrientation.method = nil }),
+            ("missing quaternion", {
+                $0.canonicalOrientation.sourceToCanonicalQuaternionWXYZ = nil
+            }),
+            ("non-unit quaternion", {
+                $0.canonicalOrientation.sourceToCanonicalQuaternionWXYZ = CanonicalQuaternionWXYZ(
+                    w: 2,
+                    x: 0,
+                    y: 0,
+                    z: 0
+                )
+            }),
+            ("invalid evidence", { $0.canonicalOrientation.evidence?.supportCount = 0 }),
+            ("missing opening direction", {
+                $0.canonicalOrientation.canonicalOpeningViewDirection = nil
+            }),
+        ]
+
+        for (name, mutate) in mutations {
+            let root = try TestFileBuilder.makeTempDir()
+            defer { try? FileManager.default.removeItem(at: root) }
+            let url = root.appendingPathComponent("project.json")
+            var geometry = makeAxisAlignedSignUnverifiedGeometryArtifact()
+            mutate(&geometry)
+            let metadata = ProjectMetadata(
+                title: name,
+                input: .photos(folder: "/tmp/photos"),
+                geometryArtifact: geometry,
+                viewerPreferences: ViewerPreferences(isUprightFlipActive: true)
+            )
+            let encoder = JSONEncoder()
+            encoder.dateEncodingStrategy = .iso8601
+            try encoder.encode(metadata).write(to: url)
+
+            XCTAssertFalse(
+                try ProjectMetadataStore.load(from: url)
+                    .viewerPreferences.isUprightFlipActive,
+                "\(name) must not enable the view-only upright flip."
+            )
+        }
+    }
+
     func testRoundTripMetadata() throws {
         let root = try TestFileBuilder.makeTempDir()
         defer { try? FileManager.default.removeItem(at: root) }
@@ -172,6 +297,7 @@ final class ProjectMetadataStoreTests: XCTestCase {
           },
           "state":{"lastError":null,"stage":"done"},
           "title":"Incomplete current project",
+          "viewerPreferences":{"isUprightFlipActive":false},
           "trainingArtifact":{
             "completionStatus":"completed",
             "completedIteration":7000,
@@ -392,6 +518,7 @@ final class ProjectMetadataStoreTests: XCTestCase {
             title: "Original",
             input: .photos(folder: "/tmp/photos"),
             requestedRunOptions: RequestedRunOptions(capturePath: .orbit, detailProfile: .balanced),
+            geometryArtifact: makeAxisAlignedSignUnverifiedGeometryArtifact(),
             state: PipelineState(stage: .importInput, lastError: nil),
             notes: "old note"
         )
@@ -410,6 +537,7 @@ final class ProjectMetadataStoreTests: XCTestCase {
                 _ = try ProjectMetadataStore.update(at: url) { metadata in
                     metadata.title = "Client-facing name"
                     metadata.notes = "final keystroke"
+                    metadata.viewerPreferences.isUprightFlipActive = true
                     mutationEntered.signal()
                     releaseMutation.wait()
                 }
@@ -451,6 +579,7 @@ final class ProjectMetadataStoreTests: XCTestCase {
         let loaded = try ProjectMetadataStore.load(from: url)
         XCTAssertEqual(loaded.title, "Client-facing name")
         XCTAssertEqual(loaded.notes, "final keystroke")
+        XCTAssertTrue(loaded.viewerPreferences.isUprightFlipActive)
         XCTAssertEqual(loaded.state.stage, .sfmFeatures)
     }
 
@@ -630,4 +759,45 @@ final class ReconstructionSummaryTests: XCTestCase {
         XCTAssertEqual(summary.observationCount, 25_000)
         XCTAssertEqual(summary.meanTrackLength, 5.0)
     }
+}
+
+private func makeAxisAlignedSignUnverifiedGeometryArtifact() -> GeometryArtifact {
+    var geometry = makeGeometryArtifact()
+    geometry.registeredViewCount = 8
+    geometry.totalViewCount = 8
+    geometry.orderedImageNames = (0..<8).map { String(format: "frame_%06d.jpg", $0) }
+    geometry.orderedImageTimestamps = (0..<8).map { Double($0) }
+    geometry.canonicalOrientation = CanonicalOrientationArtifact(
+        status: .axisAlignedSignUnverified,
+        method: .cameraRightNullspace,
+        sourceToCanonicalQuaternionWXYZ: CanonicalQuaternionWXYZ(
+            w: 1,
+            x: 0,
+            y: 0,
+            z: 0
+        ),
+        evidence: CanonicalOrientationEvidence(
+            supportCount: 8,
+            eigenvalue0: 0.001,
+            eigenvalue1: 0.1,
+            eigenvalue2: 0.899,
+            eigengap: 100,
+            medianResidualDegrees: 1,
+            p90ResidualDegrees: 2,
+            medianAbsoluteImageUpAgreement: 0.1,
+            signAgreement: 0.5,
+            bootstrapP95VariationDegrees: 1,
+            trajectoryPlaneAgreementDegrees: nil
+        ),
+        canonicalOpeningViewDirection: CanonicalDirection(x: 0, y: 0, z: 1)
+    )
+    return geometry
+}
+
+private func makeVerifiedGeometryArtifact() -> GeometryArtifact {
+    var geometry = makeAxisAlignedSignUnverifiedGeometryArtifact()
+    geometry.canonicalOrientation.status = .verified
+    geometry.canonicalOrientation.evidence?.medianAbsoluteImageUpAgreement = 0.8
+    geometry.canonicalOrientation.evidence?.signAgreement = 0.9
+    return geometry
 }

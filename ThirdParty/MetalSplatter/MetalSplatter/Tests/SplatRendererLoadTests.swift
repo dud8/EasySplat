@@ -44,6 +44,28 @@ final class SplatRendererLoadTests: XCTestCase {
         XCTAssertEqual(renderer.splatCount, originalCount)
     }
 
+    func testReadPLYPropagatesCooperativeCancellationWithoutPublishing() throws {
+        let renderer = try makeRenderer()
+        try renderer.add(makePoint())
+        let originalCount = renderer.splatCount
+        let url = try makePLY(
+            declaredPointCount: 1,
+            body: "0 0 0 255 255 255 0 0 0 1 1 0 0 0"
+        )
+        let probe = CancellationProbe()
+
+        XCTAssertThrowsError(
+            try renderer.readPLY(
+                from: url,
+                shouldCancel: { probe.cancelOnCheck() }
+            )
+        ) { error in
+            XCTAssertTrue(error is CancellationError)
+        }
+        XCTAssertTrue(probe.wasChecked)
+        XCTAssertEqual(renderer.splatCount, originalCount)
+    }
+
     private func makeRenderer(maximumSplatCount: Int? = nil) throws -> SplatRenderer {
         guard let device = MTLCreateSystemDefaultDevice() else {
             throw XCTSkip("Metal is unavailable")
@@ -102,5 +124,21 @@ final class SplatRendererLoadTests: XCTestCase {
             try? FileManager.default.removeItem(at: directory)
         }
         return url
+    }
+}
+
+private final class CancellationProbe: @unchecked Sendable {
+    private let lock = NSLock()
+    private var checked = false
+
+    var wasChecked: Bool {
+        lock.withLock { checked }
+    }
+
+    func cancelOnCheck() -> Bool {
+        lock.withLock {
+            checked = true
+            return true
+        }
     }
 }

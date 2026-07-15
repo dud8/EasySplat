@@ -257,6 +257,13 @@ public class SplatRenderer {
     }
 
     public func readPLY(from url: URL) throws {
+        try readPLY(from: url, shouldCancel: { false })
+    }
+
+    public func readPLY(
+        from url: URL,
+        shouldCancel: @escaping @Sendable () -> Bool
+    ) throws {
         readFailure = nil
         readFinished = false
         let pendingSplatBuffer = try MetalBuffer<Splat>(
@@ -270,9 +277,12 @@ public class SplatRenderer {
             self.readFinished = false
         }
 
-        SplatPLYSceneReader(url).read(to: self)
+        SplatPLYSceneReader(url).read(to: self, shouldCancel: shouldCancel)
         if let readFailure {
             throw readFailure
+        }
+        if shouldCancel() {
+            throw CancellationError()
         }
         guard readFinished else {
             throw ReadError.incomplete

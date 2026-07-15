@@ -3,17 +3,19 @@ import PLYIO
 import Spatial
 
 final class PLYIOTests: XCTestCase {
-    class ContentCounter: PLYReaderDelegate {
+    class ContentCounter: PLYReaderDelegate, @unchecked Sendable {
         var header: PLYHeader? = nil
         var elements: [Int] = []
         var didFinish = false
         var didFail = false
+        var failure: Error?
 
         func reset() {
             header = nil
             elements = []
             didFinish = false
             didFail = false
+            failure = nil
         }
 
         func didStartReading(withHeader header: PLYHeader) {
@@ -32,6 +34,7 @@ final class PLYIOTests: XCTestCase {
 
         func didFailReading(withError error: Error?) {
             didFail = true
+            failure = error
         }
     }
 
@@ -95,6 +98,24 @@ final class PLYIOTests: XCTestCase {
 
     func testReadBinary() throws {
         try testRead(binaryURL)
+    }
+
+    func testReadStopsAtTheCooperativeCancellationBoundary() {
+        let reader = PLYReader(asciiURL)
+        let content = ContentCounter()
+
+        reader.read(to: content) {
+            content.elements.reduce(0, +) >= 10
+        }
+
+        XCTAssertFalse(content.didFinish)
+        XCTAssertTrue(content.didFail)
+        XCTAssertTrue(content.failure is CancellationError)
+        XCTAssertEqual(content.elements.reduce(0, +), 10)
+        XCTAssertGreaterThan(
+            content.header?.elements.reduce(0) { $0 + Int($1.count) } ?? 0,
+            10
+        )
     }
 
     func testASCIIBinaryEqual() throws {

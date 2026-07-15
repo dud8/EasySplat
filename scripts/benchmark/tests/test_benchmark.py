@@ -1466,7 +1466,7 @@ def write_orientation_evidence_artifacts(
                     },
                     "poseConvention": "world-to-camera",
                     "quaternionOrder": "wxyz",
-                    "schemaVersion": 4,
+                    "schemaVersion": 5,
                 }
             )
             + b"\n"
@@ -4921,7 +4921,7 @@ class RunnerIntegrityTests(unittest.TestCase):
             (run_root / "geometry-manifest.json").write_bytes(
                 evidence.canonical_json_bytes(
                     {
-                        "schemaVersion": 4,
+                        "schemaVersion": 5,
                     }
                 )
                 + b"\n"

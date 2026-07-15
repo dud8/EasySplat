@@ -313,22 +313,19 @@ public struct CanonicalOrientationArtifact: Codable, Sendable, Equatable {
     public var evidence: CanonicalOrientationEvidence?
     /// Camera-forward direction from the opening eye position toward the scene.
     public var canonicalOpeningViewDirection: CanonicalDirection?
-    public var isViewOnlyFlipActive: Bool
 
     public init(
         status: CanonicalOrientationStatus,
         method: CanonicalOrientationMethod?,
         sourceToCanonicalQuaternionWXYZ: CanonicalQuaternionWXYZ?,
         evidence: CanonicalOrientationEvidence?,
-        canonicalOpeningViewDirection: CanonicalDirection?,
-        isViewOnlyFlipActive: Bool
+        canonicalOpeningViewDirection: CanonicalDirection?
     ) {
         self.status = status
         self.method = method
         self.sourceToCanonicalQuaternionWXYZ = sourceToCanonicalQuaternionWXYZ
         self.evidence = evidence
         self.canonicalOpeningViewDirection = canonicalOpeningViewDirection
-        self.isViewOnlyFlipActive = isViewOnlyFlipActive
     }
 
     public static func unresolved(openingViewDirection: CanonicalDirection) -> Self {
@@ -337,14 +334,13 @@ public struct CanonicalOrientationArtifact: Codable, Sendable, Equatable {
             method: nil,
             sourceToCanonicalQuaternionWXYZ: nil,
             evidence: nil,
-            canonicalOpeningViewDirection: openingViewDirection,
-            isViewOnlyFlipActive: false
+            canonicalOpeningViewDirection: openingViewDirection
         )
     }
 }
 
 public struct GeometryArtifact: Codable, Sendable, Equatable {
-    public static let currentSchemaVersion = 4
+    public static let currentSchemaVersion = 5
 
     public var schemaVersion: Int
     public var solverVersion: String
@@ -380,6 +376,14 @@ public struct GeometryArtifact: Codable, Sendable, Equatable {
     public var learnedPointInitializer: LearnedPointInitializerArtifact?
     public var pairGraph: PairGraphArtifact
     public var canonicalOrientation: CanonicalOrientationArtifact
+
+    public var allowsViewOnlyUprightFlip: Bool {
+        canonicalOrientation.status == .axisAlignedSignUnverified
+            && GeometryArtifactStore.isCanonicalOrientationValid(
+                canonicalOrientation,
+                registeredViewCount: registeredViewCount
+            )
+    }
 
     public init(
         schemaVersion: Int,

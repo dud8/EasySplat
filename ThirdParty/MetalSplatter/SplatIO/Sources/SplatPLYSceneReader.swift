@@ -34,7 +34,18 @@ public class SplatPLYSceneReader: SplatSceneReader {
     }
 
     public func read(to delegate: SplatSceneReaderDelegate) {
-        SplatPLYSceneReaderStream().read(ply, to: delegate)
+        read(to: delegate, shouldCancel: { false })
+    }
+
+    public func read(
+        to delegate: SplatSceneReaderDelegate,
+        shouldCancel: @escaping @Sendable () -> Bool
+    ) {
+        SplatPLYSceneReaderStream().read(
+            ply,
+            to: delegate,
+            shouldCancel: shouldCancel
+        )
     }
 }
 
@@ -46,14 +57,18 @@ private class SplatPLYSceneReaderStream {
     private var pointCount: UInt32 = 0
     private var reusablePoint = SplatScenePoint(position: .zero, normal: .zero, color: .none, opacity: .zero, scale: .zero, rotation: .init(vector: .zero))
 
-    func read(_ ply: PLYReader, to delegate: SplatSceneReaderDelegate) {
+    func read(
+        _ ply: PLYReader,
+        to delegate: SplatSceneReaderDelegate,
+        shouldCancel: @escaping @Sendable () -> Bool
+    ) {
         self.delegate = delegate
         active = true
         pointElementMapping = nil
         expectedPointCount = 0
         pointCount = 0
 
-        ply.read(to: self)
+        ply.read(to: self, shouldCancel: shouldCancel)
 
         assert(!active)
     }

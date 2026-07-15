@@ -204,7 +204,7 @@ public enum OrientationEvidenceExtractor {
     }
 
     private static func validateManifestContract(_ manifest: GeometryManifest) throws {
-        guard manifest.schemaVersion == 4 else {
+        guard manifest.schemaVersion == 5 else {
             throw invalid("The geometry manifest uses an unsupported schema.")
         }
         guard manifest.poseConvention == "world-to-camera",

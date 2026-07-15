@@ -56,7 +56,6 @@ final class CanonicalOrientationEstimatorTests: XCTestCase {
         )
         XCTAssertEqual(try XCTUnwrap(solution.artifact.evidence?.signAgreement), 0.5, accuracy: 1e-12)
         XCTAssertNotNil(solution.artifact.sourceToCanonicalQuaternionWXYZ)
-        XCTAssertFalse(solution.artifact.isViewOnlyFlipActive)
     }
 
     func testDegenerateNonWalkthroughDoesNotInventAnAxis() {

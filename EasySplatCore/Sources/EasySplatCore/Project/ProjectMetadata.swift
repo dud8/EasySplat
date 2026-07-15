@@ -12,6 +12,7 @@ public struct ProjectMetadata: Codable, Sendable {
     public var trainingMemoryRetryBudgetBytes: Int64?
     public var geometryArtifact: GeometryArtifact?
     public var trainingArtifact: TrainingArtifact?
+    public var viewerPreferences: ViewerPreferences
     public var state: PipelineState
     public var outputs: OutputSpec?
     public var checkpoint: PipelineCheckpoint?
@@ -32,6 +33,7 @@ public struct ProjectMetadata: Codable, Sendable {
         trainingMemoryRetryBudgetBytes: Int64? = nil,
         geometryArtifact: GeometryArtifact? = nil,
         trainingArtifact: TrainingArtifact? = nil,
+        viewerPreferences: ViewerPreferences = ViewerPreferences(),
         state: PipelineState = PipelineState(stage: .importInput, lastError: nil),
         outputs: OutputSpec? = nil,
         checkpoint: PipelineCheckpoint? = nil,
@@ -51,6 +53,7 @@ public struct ProjectMetadata: Codable, Sendable {
         self.trainingMemoryRetryBudgetBytes = trainingMemoryRetryBudgetBytes
         self.geometryArtifact = geometryArtifact
         self.trainingArtifact = trainingArtifact
+        self.viewerPreferences = viewerPreferences
         self.state = state
         self.outputs = outputs
         self.checkpoint = checkpoint
@@ -59,6 +62,14 @@ public struct ProjectMetadata: Codable, Sendable {
         self.stageTimings = stageTimings
         self.notes = notes
         self.lastFailureAt = lastFailureAt
+    }
+}
+
+public struct ViewerPreferences: Codable, Sendable, Equatable {
+    public var isUprightFlipActive: Bool
+
+    public init(isUprightFlipActive: Bool = false) {
+        self.isUprightFlipActive = isUprightFlipActive
     }
 }
 

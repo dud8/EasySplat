@@ -2,11 +2,9 @@ import XCTest
 @testable import EasySplatCore
 
 final class ProjectMetadataValidationTests: XCTestCase {
-    func testLoadRejectsBaselineFormatThreeBeforeDecodingLegacyOrientation() throws {
-        let baselineFormatVersion = ProjectMetadataStore.supportedFormatVersion - 1
-        let baselineGeometrySchemaVersion = GeometryArtifact.currentSchemaVersion - 1
-        XCTAssertEqual(baselineFormatVersion, 3)
-        XCTAssertEqual(baselineGeometrySchemaVersion, 3)
+    func testLoadRejectsRetiredFormatFourBeforeDecodingEmbeddedViewerState() throws {
+        let retiredFormatVersion = ProjectMetadataStore.supportedFormatVersion - 1
+        XCTAssertEqual(retiredFormatVersion, 4)
 
         let metadata = makeMetadata()
         let encoder = JSONEncoder()
@@ -14,13 +12,13 @@ final class ProjectMetadataValidationTests: XCTestCase {
         var object = try XCTUnwrap(
             JSONSerialization.jsonObject(with: encoder.encode(metadata)) as? [String: Any]
         )
-        object["formatVersion"] = baselineFormatVersion
+        object["formatVersion"] = retiredFormatVersion
+        object.removeValue(forKey: "viewerPreferences")
         var geometry = try XCTUnwrap(object["geometryArtifact"] as? [String: Any])
-        geometry["schemaVersion"] = baselineGeometrySchemaVersion
         var orientation = try XCTUnwrap(
             geometry["canonicalOrientation"] as? [String: Any]
         )
-        orientation["status"] = "notEvaluated"
+        orientation["isViewOnlyFlipActive"] = true
         geometry["canonicalOrientation"] = orientation
         object["geometryArtifact"] = geometry
 
@@ -33,7 +31,7 @@ final class ProjectMetadataValidationTests: XCTestCase {
             guard case ProjectMetadataStore.LoadError.unsupportedFormatVersion(let version) = error else {
                 return XCTFail("Expected envelope-first unsupported format, got \(error)")
             }
-            XCTAssertEqual(version, baselineFormatVersion)
+            XCTAssertEqual(version, retiredFormatVersion)
         }
     }
 

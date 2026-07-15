@@ -402,17 +402,12 @@ enum GeometryArtifactStore {
         _ artifact: CanonicalOrientationArtifact,
         registeredViewCount: Int
     ) throws {
-        guard !artifact.isViewOnlyFlipActive
-                || artifact.status == .axisAlignedSignUnverified else {
-            throw Error.invalidCanonicalOrientation
-        }
         switch artifact.status {
         case .unresolved:
             guard artifact.sourceToCanonicalQuaternionWXYZ == nil,
                   let direction = artifact.canonicalOpeningViewDirection,
                   validUnitDirection(direction),
-                  (artifact.method == nil) == (artifact.evidence == nil),
-                  !artifact.isViewOnlyFlipActive else {
+                  (artifact.method == nil) == (artifact.evidence == nil) else {
                 throw Error.invalidCanonicalOrientation
             }
             if let evidence = artifact.evidence {
@@ -478,6 +473,21 @@ enum GeometryArtifactStore {
                     throw Error.invalidCanonicalOrientation
                 }
             }
+        }
+    }
+
+    static func isCanonicalOrientationValid(
+        _ artifact: CanonicalOrientationArtifact,
+        registeredViewCount: Int
+    ) -> Bool {
+        do {
+            try validateCanonicalOrientation(
+                artifact,
+                registeredViewCount: registeredViewCount
+            )
+            return true
+        } catch {
+            return false
         }
     }
 

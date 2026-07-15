@@ -104,7 +104,7 @@ The new-project order is deliberate:
 
 A setup failure therefore creates no failed project and keeps input available for Try Again.
 
-`project.json` format v3 is the only supported project format. The project library logs and skips older, newer, malformed, and unsafe bundles without changing or deleting them.
+`project.json` format v5 is the only supported project format. The project library logs and skips older, newer, malformed, and unsafe bundles without changing or deleting them.
 
 ## Durable stages and recovery
 
@@ -139,7 +139,7 @@ Accepted geometry must provide:
 - timings and measured peak memory;
 - fallback reason when applicable.
 - measured pair-graph topology and per-attempt matcher evidence, or an explicit `notEvaluated` state;
-- raw canonical-orientation evidence and opening-view direction, or an explicit `notEvaluated` or `unresolved` state.
+- raw canonical-orientation evidence and opening-view direction, with a `verified`, `axisAlignedSignUnverified`, or `unresolved` result.
 
 `ColmapResidualAnalyzer` recomputes residuals from actual tracks. Placeholder or mapper-reported pseudo-residuals cannot pass. The pipeline requires at least 90% registration, median residual at most 1.5 px, and p90 at most 3 px before training. A learned candidate must also give at least 90% of selected views 20 or more verified track observations; one residual is not meaningful camera support.
 
@@ -210,7 +210,7 @@ Use native SwiftUI/AppKit behavior first:
 
 Do not reintroduce dashboards, generic cards, quality badges, hover lift, shimmer, ornamental shadows, custom button styles, generated captions, or metadata-chip piles.
 
-Every control needs a useful accessibility label and keyboard path. The input target must remain a real button with drop support. Viewer keys are arrows to orbit, Option-arrows to pan, `+`/`-` to zoom, `F` to fit, and `R` to reset.
+Every control needs a useful accessibility label and keyboard path. The input target must remain a real button with drop support. In the viewer, drag or the arrow keys orbit, Option-drag or Option-arrows pan, scroll, pinch, or `+`/`-` zoom, `F` fits, and `R` resets the opening view.
 
 ## Diagnostics and privacy
 

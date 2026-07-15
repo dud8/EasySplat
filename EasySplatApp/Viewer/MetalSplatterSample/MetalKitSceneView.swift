@@ -3,9 +3,25 @@ import MetalKit
 import AppKit
 import SplatIO
 
-struct PreviewLoadRequest: Equatable {
+struct PreviewLoadRequest: Hashable {
     let url: URL?
     let reloadToken: Int
+}
+
+struct SplatViewerSceneConfiguration: Equatable {
+    var bounds: ViewerSceneBounds?
+    var openingDirection: SIMD3<Float>?
+    var isViewOnlyFlipActive: Bool
+
+    init(
+        bounds: ViewerSceneBounds? = nil,
+        openingDirection: SIMD3<Float>? = nil,
+        isViewOnlyFlipActive: Bool = false
+    ) {
+        self.bounds = bounds
+        self.openingDirection = openingDirection
+        self.isViewOnlyFlipActive = isViewOnlyFlipActive
+    }
 }
 
 enum PreviewLoadDecision: Equatable {
@@ -78,7 +94,7 @@ struct PreviewReloadPlanner {
 
 @MainActor
 final class SplatViewerController: ObservableObject {
-    typealias Bounds = (center: SIMD3<Float>, radius: Float)
+    typealias Bounds = ViewerSceneBounds
     typealias BoundsLoader = @Sendable (URL) async throws -> Bounds?
 
     @Published var errorMessage: String? = nil
@@ -86,16 +102,27 @@ final class SplatViewerController: ObservableObject {
     @Published var isUpdating: Bool = false
     @Published var hasRenderedPreview: Bool = false
     private(set) var currentBounds: Bounds?
-    fileprivate var renderer: MetalKitSceneRenderer?
+    var renderer: MetalKitSceneRenderer?
     private let boundsLoader: BoundsLoader
     private var boundsTask: Task<Void, Never>?
     private var boundsRequest: PreviewLoadRequest?
     private var boundsGeneration: UInt64 = 0
+    private var boundsInteractionRevision: UInt64 = 0
+    private var sceneConfiguration = SplatViewerSceneConfiguration()
+    private var isSceneConfigurationActive = false
 
     init(boundsLoader: @escaping BoundsLoader = { url in
-        try await Task.detached {
-            try BoundsCalculator.computeBounds(for: url)
-        }.value
+        let worker = Task.detached {
+            try BoundsCalculator.computeBounds(
+                for: url,
+                shouldCancel: { Task.isCancelled }
+            )
+        }
+        return try await withTaskCancellationHandler {
+            try await worker.value
+        } onCancel: {
+            worker.cancel()
+        }
     }) {
         self.boundsLoader = boundsLoader
     }
@@ -109,38 +136,87 @@ final class SplatViewerController: ObservableObject {
     }
 
     func fitToView() {
-        if let bounds = currentBounds {
-            renderer?.applyBounds(center: bounds.center, radius: bounds.radius)
-        } else {
-            renderer?.fitToView()
-        }
+        renderer?.fitToView()
     }
 
-    func prepareBounds(for request: PreviewLoadRequest) {
+    func prepareBounds(
+        for request: PreviewLoadRequest,
+        configuration: SplatViewerSceneConfiguration,
+        activate: Bool = true
+    ) {
         boundsTask?.cancel()
         boundsTask = nil
         boundsGeneration &+= 1
         boundsRequest = request
-        currentBounds = nil
+        sceneConfiguration = configuration
+        currentBounds = configuration.bounds
+        boundsInteractionRevision = renderer?.interactionRevision ?? 0
+        isSceneConfigurationActive = false
+        if activate {
+            activatePreparedSceneConfiguration()
+        }
+    }
+
+    func prepareBounds(for request: PreviewLoadRequest) {
+        prepareBounds(for: request, configuration: sceneConfiguration)
+    }
+
+    func updateSceneConfiguration(_ configuration: SplatViewerSceneConfiguration) {
+        let previous = sceneConfiguration
+        guard previous != configuration else { return }
+        sceneConfiguration = configuration
+        if let bounds = configuration.bounds {
+            currentBounds = bounds
+        } else if previous.bounds != nil {
+            currentBounds = nil
+        }
+        guard isSceneConfigurationActive else { return }
+        if previous.isViewOnlyFlipActive != configuration.isViewOnlyFlipActive {
+            renderer?.setViewOnlyFlipActive(configuration.isViewOnlyFlipActive)
+            boundsInteractionRevision = renderer?.interactionRevision ?? boundsInteractionRevision
+        }
+        if currentBounds != nil,
+           previous.bounds != configuration.bounds
+            || previous.openingDirection != configuration.openingDirection {
+            applyCurrentBoundsIfPossible()
+        }
+    }
+
+    func activatePreparedSceneConfiguration() {
+        guard !isSceneConfigurationActive else { return }
+        isSceneConfigurationActive = true
+        _ = renderer?.activateSceneConfiguration(
+            bounds: currentBounds,
+            openingDirection: sceneConfiguration.openingDirection,
+            isViewOnlyFlipActive: sceneConfiguration.isViewOnlyFlipActive,
+            ifInteractionRevisionMatches: boundsInteractionRevision
+        )
     }
 
     func startBoundsLoad(for request: PreviewLoadRequest) {
-        guard let url = request.url, boundsRequest == request else { return }
+        boundsTask = Task { [weak self] in
+            await self?.loadBoundsAndApply(for: request)
+        }
+    }
+
+    func loadBoundsAndApply(for request: PreviewLoadRequest) async {
+        guard currentBounds == nil,
+              let url = request.url,
+              boundsRequest == request else { return }
         let generation = boundsGeneration
         let loader = boundsLoader
-        boundsTask = Task { [weak self] in
-            do {
-                let bounds = try await loader(url)
-                guard !Task.isCancelled,
-                      let self,
-                      self.boundsGeneration == generation,
-                      self.boundsRequest == request else {
-                    return
-                }
-                self.currentBounds = bounds
-            } catch {
-                // Bounds are optional for rendering; keep the preview interactive.
+        do {
+            let bounds = try await loader(url)
+            guard !Task.isCancelled,
+                  boundsGeneration == generation,
+                  boundsRequest == request,
+                  sceneConfiguration.bounds == nil else {
+                return
             }
+            currentBounds = bounds
+            applyCurrentBoundsIfPossible()
+        } catch {
+            // Development PLY bounds are optional; keep the preview interactive.
         }
     }
 
@@ -150,6 +226,17 @@ final class SplatViewerController: ObservableObject {
         boundsGeneration &+= 1
         boundsRequest = nil
         currentBounds = nil
+        isSceneConfigurationActive = false
+    }
+
+    private func applyCurrentBoundsIfPossible() {
+        guard isSceneConfigurationActive, let bounds = currentBounds else { return }
+        _ = renderer?.applyBounds(
+            center: bounds.center,
+            radius: bounds.radius,
+            openingDirection: sceneConfiguration.openingDirection,
+            ifInteractionRevisionMatches: boundsInteractionRevision
+        )
     }
 }
 
@@ -158,6 +245,7 @@ struct MetalKitSceneView: NSViewRepresentable {
     var splatURL: URL?
     var reloadToken: Int = 0
     var controller: SplatViewerController
+    var sceneConfiguration = SplatViewerSceneConfiguration()
     var onLoadStateChanged: ((SplatViewerLoadState) -> Void)?
 
     @MainActor
@@ -168,14 +256,25 @@ struct MetalKitSceneView: NSViewRepresentable {
         var loadTask: Task<Void, Never>?
         var deferredLoadTask: Task<Void, Never>?
         var planner = PreviewReloadPlanner()
+        private var sceneConfigurations: [PreviewLoadRequest: SplatViewerSceneConfiguration] = [:]
+        private(set) var displayedRequest: PreviewLoadRequest?
 
         deinit {
             loadTask?.cancel()
             deferredLoadTask?.cancel()
         }
 
-        func requestLoad(url: URL?, reloadToken: Int) {
-            planner.request(PreviewLoadRequest(url: url, reloadToken: reloadToken))
+        func requestLoad(
+            url: URL?,
+            reloadToken: Int,
+            configuration: SplatViewerSceneConfiguration
+        ) {
+            let request = PreviewLoadRequest(url: url, reloadToken: reloadToken)
+            sceneConfigurations[request] = configuration
+            if displayedRequest == request, planner.inFlightRequest == nil {
+                controller?.updateSceneConfiguration(configuration)
+            }
+            planner.request(request)
             evaluateAndStartLoad()
         }
 
@@ -221,7 +320,12 @@ struct MetalKitSceneView: NSViewRepresentable {
             renderer: MetalKitSceneRenderer,
             controller: SplatViewerController
         ) {
-            controller.prepareBounds(for: request)
+            let configuration = sceneConfigurations[request] ?? SplatViewerSceneConfiguration()
+            controller.prepareBounds(
+                for: request,
+                configuration: configuration,
+                activate: false
+            )
             if controller.hasRenderedPreview {
                 controller.isLoading = false
                 controller.isUpdating = true
@@ -236,22 +340,37 @@ struct MetalKitSceneView: NSViewRepresentable {
                 defer {
                     self.loadTask = nil
                     self.planner.completeInFlight()
+                    let retainedRequests = Set([
+                        self.displayedRequest,
+                        self.planner.latestRequested,
+                        self.planner.pendingRequest,
+                        self.planner.inFlightRequest,
+                    ].compactMap { $0 })
+                    self.sceneConfigurations = self.sceneConfigurations.filter {
+                        retainedRequests.contains($0.key)
+                    }
                     self.evaluateAndStartLoad()
                 }
                 do {
+                    async let boundsPreparation: Void = controller.loadBoundsAndApply(
+                        for: request
+                    )
                     try await renderer.load(
                         request.url.map { ModelIdentifier.gaussianSplat($0) },
                         forceReload: forceReload
                     )
+                    await boundsPreparation
                     guard !Task.isCancelled else { return }
+                    if let latestConfiguration = self.sceneConfigurations[request] {
+                        controller.updateSceneConfiguration(latestConfiguration)
+                    }
+                    controller.activatePreparedSceneConfiguration()
+                    self.displayedRequest = request
                     controller.errorMessage = nil
                     controller.isLoading = false
                     controller.isUpdating = false
                     controller.hasRenderedPreview = request.url != nil
                     self.onLoadStateChanged?(.ready)
-                    if request.url != nil {
-                        controller.startBoundsLoad(for: request)
-                    }
                 } catch {
                     guard !Task.isCancelled else { return }
                     controller.isLoading = false
@@ -281,7 +400,7 @@ struct MetalKitSceneView: NSViewRepresentable {
     }
 
     func makeNSView(context: NSViewRepresentableContext<MetalKitSceneView>) -> MTKView {
-        let metalKitView = InteractiveMTKView()
+        let metalKitView = InteractiveMTKView(frame: .zero, device: nil)
         guard let metalDevice = MTLCreateSystemDefaultDevice() else {
             controller.errorMessage = "Metal is not available on this Mac."
             controller.isLoading = false
@@ -305,8 +424,11 @@ struct MetalKitSceneView: NSViewRepresentable {
         metalKitView.onOrbit = { deltaX, deltaY in
             renderer.orbit(deltaX: Float(deltaX), deltaY: Float(deltaY))
         }
-        metalKitView.onZoom = { delta in
-            renderer.zoom(delta: Float(delta))
+        metalKitView.onScrollZoom = { delta, point in
+            renderer.zoomByScroll(delta: Float(delta), anchoredAt: point)
+        }
+        metalKitView.onMagnify = { magnification, point in
+            renderer.zoomByPinch(magnification: Float(magnification), anchoredAt: point)
         }
         metalKitView.onPan = { deltaX, deltaY in
             renderer.pan(deltaX: Float(deltaX), deltaY: Float(deltaY))
@@ -326,9 +448,9 @@ struct MetalKitSceneView: NSViewRepresentable {
                     deltaY: Float(vertical) * panStep
                 )
             case .zoomIn:
-                renderer?.zoom(delta: -12)
+                renderer?.keyboardZoomIn()
             case .zoomOut:
-                renderer?.zoom(delta: 12)
+                renderer?.keyboardZoomOut()
             case .fit:
                 controller?.fitToView()
             case .reset:
@@ -350,43 +472,64 @@ struct MetalKitSceneView: NSViewRepresentable {
     }
 
     private func loadIfNeeded(context: NSViewRepresentableContext<MetalKitSceneView>) {
-        context.coordinator.requestLoad(url: splatURL, reloadToken: reloadToken)
+        context.coordinator.requestLoad(
+            url: splatURL,
+            reloadToken: reloadToken,
+            configuration: sceneConfiguration
+        )
     }
 }
 
-private enum BoundsCalculator {
-    static func computeBounds(for url: URL) throws -> (center: SIMD3<Float>, radius: Float)? {
+enum BoundsCalculator {
+    static func computeBounds(
+        for url: URL,
+        shouldCancel: @escaping @Sendable () -> Bool = { false }
+    ) throws -> ViewerSceneBounds? {
         let collector = BoundsCollector()
         let reader = SplatPLYSceneReader(url)
-        reader.read(to: collector)
+        reader.read(to: collector, shouldCancel: shouldCancel)
 
         if let error = collector.error {
             throw error
         }
-        guard collector.hasPoints else { return nil }
-        let minPoint = collector.minPoint
-        let maxPoint = collector.maxPoint
-        let center = (minPoint + maxPoint) * 0.5
-        let radius = simd_length(maxPoint - minPoint) * 0.5
-        return radius.isFinite ? (center: center, radius: radius) : nil
+        return RobustSplatBounds.compute(samples: collector.samples)
     }
 
     private final class BoundsCollector: NSObject, SplatSceneReaderDelegate {
-        fileprivate var minPoint = SIMD3<Float>(repeating: .greatestFiniteMagnitude)
-        fileprivate var maxPoint = SIMD3<Float>(repeating: -.greatestFiniteMagnitude)
-        fileprivate var hasPoints = false
+        fileprivate var samples: [SplatBoundsSample] = []
         fileprivate var error: Error?
+        private var pointCount = 0
+        private var pointIndex = 0
+        private var sampleSlot = 0
+        private var nextSampleIndex: Int?
 
-        func didStartReading(withPointCount pointCount: UInt32) {}
+        func didStartReading(withPointCount pointCount: UInt32) {
+            self.pointCount = Int(pointCount)
+            let capacity = min(self.pointCount, RobustSplatBounds.maximumFallbackSampleCount)
+            samples.reserveCapacity(capacity)
+            nextSampleIndex = RobustSplatBounds.sampleIndex(
+                slot: sampleSlot,
+                pointCount: self.pointCount
+            )
+        }
 
         func didRead(points: [SplatScenePoint]) {
             for point in points {
-                let pos = point.position
-                minPoint = simd.min(minPoint, pos)
-                maxPoint = simd.max(maxPoint, pos)
-            }
-            if !points.isEmpty {
-                hasPoints = true
+                if let scheduledIndex = nextSampleIndex, pointIndex == scheduledIndex {
+                    samples.append(
+                        SplatBoundsSample(
+                            position: point.position,
+                            logScale: point.scale,
+                            opacityLogit: point.opacity
+                        )
+                    )
+                    sampleSlot += 1
+                    nextSampleIndex = RobustSplatBounds.sampleIndex(
+                        slot: sampleSlot,
+                        pointCount: pointCount
+                    )
+                }
+                pointIndex += 1
             }
         }
 
@@ -400,7 +543,8 @@ private enum BoundsCalculator {
 
 final class InteractiveMTKView: MTKView {
     var onOrbit: ((CGFloat, CGFloat) -> Void)?
-    var onZoom: ((CGFloat) -> Void)?
+    var onScrollZoom: ((CGFloat, CGPoint) -> Void)?
+    var onMagnify: ((CGFloat, CGPoint) -> Void)?
     var onPan: ((CGFloat, CGFloat) -> Void)?
     var onKeyboardCommand: ((ViewerKeyboardCommand) -> Void)?
     var onInteractionActivity: (() -> Void)?
@@ -408,12 +552,46 @@ final class InteractiveMTKView: MTKView {
     private var lastLocation: NSPoint?
     private var isPanning = false
 
+    override init(frame frameRect: CGRect, device: MTLDevice?) {
+        super.init(frame: frameRect, device: device)
+        focusRingType = .exterior
+    }
+
+    required init(coder: NSCoder) {
+        super.init(coder: coder)
+        focusRingType = .exterior
+    }
+
     override var acceptsFirstResponder: Bool { true }
     override var canBecomeKeyView: Bool { true }
 
+    override var focusRingMaskBounds: NSRect {
+        bounds.insetBy(dx: 2, dy: 2)
+    }
+
+    override func drawFocusRingMask() {
+        NSColor.black.setFill()
+        NSBezierPath(
+            roundedRect: focusRingMaskBounds,
+            xRadius: Theme.Radius.standard - 2,
+            yRadius: Theme.Radius.standard - 2
+        ).fill()
+    }
+
     override func becomeFirstResponder() -> Bool {
-        focusRingType = .exterior
-        return super.becomeFirstResponder()
+        let accepted = super.becomeFirstResponder()
+        if accepted {
+            noteFocusRingMaskChanged()
+        }
+        return accepted
+    }
+
+    override func resignFirstResponder() -> Bool {
+        let resigned = super.resignFirstResponder()
+        if resigned {
+            noteFocusRingMaskChanged()
+        }
+        return resigned
     }
 
     override func mouseDown(with event: NSEvent) {
@@ -440,7 +618,12 @@ final class InteractiveMTKView: MTKView {
 
     override func scrollWheel(with event: NSEvent) {
         onInteractionActivity?()
-        onZoom?(event.deltaY)
+        onScrollZoom?(event.scrollingDeltaY, viewerPoint(for: event))
+    }
+
+    override func magnify(with event: NSEvent) {
+        onInteractionActivity?()
+        onMagnify?(event.magnification, viewerPoint(for: event))
     }
 
     override func mouseUp(with event: NSEvent) {
@@ -459,5 +642,10 @@ final class InteractiveMTKView: MTKView {
         }
         onInteractionActivity?()
         onKeyboardCommand?(command)
+    }
+
+    private func viewerPoint(for event: NSEvent) -> CGPoint {
+        let local = convert(event.locationInWindow, from: nil)
+        return CGPoint(x: local.x, y: bounds.height - local.y)
     }
 }
