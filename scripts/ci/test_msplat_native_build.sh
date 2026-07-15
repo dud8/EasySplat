@@ -92,7 +92,7 @@ require_contains 'git -C "$SOURCE_DIR" apply --unidiff-zero "$METAL_SAFETY_PATCH
 require_contains 'metal_safety_patch_sha256' "$BUILD_SCRIPT"
 require_contains '"metal_safety_patch_sha256": "5d3dfff3edcbca940d37f6ee3145c76c678ebd36ebc03016cfd5dab78e1d45ac"' "$VALIDATOR"
 require_contains 'msplat-1.1.3-exact-raster.patch' "$BUILD_SCRIPT"
-require_contains 'EXACT_RASTER_PATCH_SHA256="dd1f1a802cabaaceeab8825535e374f21ad723c680d4e70bcfc7d3d4e865962d"' "$BUILD_SCRIPT"
+require_contains 'EXACT_RASTER_PATCH_SHA256="278deba531d1503b8f6fe3428e0b6c5103129f388a6bc425c41780ff9e4c453b"' "$BUILD_SCRIPT"
 require_contains '[ "$(sha256 "$EXACT_RASTER_PATCH")" = "$EXACT_RASTER_PATCH_SHA256" ]' "$BUILD_SCRIPT"
 require_contains 'git -C "$SOURCE_DIR" apply --check "$EXACT_RASTER_PATCH"' "$BUILD_SCRIPT"
 require_contains 'git -C "$SOURCE_DIR" apply "$EXACT_RASTER_PATCH"' "$BUILD_SCRIPT"
@@ -231,6 +231,7 @@ require_contains 'msplat_raster_memory_budget_was_exceeded' "$OVERLAY"
 require_contains 'msplat_raster_resource_limit_was_exceeded' "$OVERLAY"
 require_contains 'msplat_gpu_sync_for_raster_replay' "$OVERLAY"
 require_contains 'msplat_grow_exact_raster_capacity' "$OVERLAY"
+require_contains 'msplat_restore_exact_raster_capacity' "$OVERLAY"
 require_contains '{"payload_schema", 2}' "$OVERLAY"
 require_contains 'fields["schema_version"] = 2' "$OVERLAY"
 require_contains 'Descriptor for schema-v2 JSONL events' "$OVERLAY"
@@ -263,6 +264,10 @@ require_contains 'bool msplat_raster_memory_budget_was_exceeded()' "$EXACT_RASTE
 require_contains 'bool msplat_raster_resource_limit_was_exceeded()' "$EXACT_RASTER_PATCH"
 require_contains 'void msplat_gpu_sync_for_raster_replay()' "$EXACT_RASTER_PATCH"
 require_contains 'void msplat_grow_exact_raster_capacity(uint64_t intersection_count)' "$EXACT_RASTER_PATCH"
+require_contains 'void msplat_restore_exact_raster_capacity(uint64_t intersection_count)' "$EXACT_RASTER_PATCH"
+require_contains 'geometric_raster_capacity' "$EXACT_RASTER_PATCH"
+require_contains 'raster_allocation_fits' "$EXACT_RASTER_PATCH"
+require_contains 'targetCapacity = intersection_count' "$EXACT_RASTER_PATCH"
 require_contains 'void msplat_restore_raster_metrics(' "$EXACT_RASTER_PATCH"
 require_contains 'exact_fallback_elapsed_seconds' "$EXACT_RASTER_PATCH"
 require_contains 'sync_and_drain_exact_raster_timing' "$EXACT_RASTER_PATCH"
@@ -299,6 +304,8 @@ require_contains 'increasing_window_replay passed' "$RASTER_TEST_SOURCE"
 require_contains 'gpu_capacity_failure passed' "$RASTER_TEST_SOURCE"
 require_contains 'verifyRepeatedExactFallbackMetrics' "$RASTER_TEST_SOURCE"
 require_contains 'repeated_exact_fallback_metrics passed' "$RASTER_TEST_SOURCE"
+require_contains 'restored_exact_capacity passed' "$RASTER_TEST_SOURCE"
+require_contains 'geometric headroom did not fall back to the minimum fitting capacity' "$RASTER_TEST_SOURCE"
 require_contains 'queued_exact_timing passed' "$RASTER_TEST_SOURCE"
 require_contains 'sync_failure_timing_lifecycle passed' "$RASTER_TEST_SOURCE"
 require_contains 'msplat_fail_next_sync_for_testing' "$RASTER_TEST_SOURCE"
@@ -1343,6 +1350,42 @@ generation.rename(new_generation)
 PY
 }
 
+make_raster_resume_checkpoint() {
+  local destination="$1"
+  local peak_capacity="$2"
+  local memory_budget="$3"
+  cp -R "$resume_dir/checkpoint" "$destination"
+  python3 - "$destination" "$peak_capacity" "$memory_budget" <<'PY'
+import hashlib
+import json
+import sys
+from pathlib import Path
+
+root = Path(sys.argv[1])
+peak_capacity = int(sys.argv[2])
+memory_budget = int(sys.argv[3])
+current = (root / "CURRENT").read_text(encoding="utf-8").strip()
+generation = root / "generations" / current
+manifest_path = generation / "manifest.json"
+manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+manifest.update({
+    "memory_budget_bytes": memory_budget,
+    "raster_exact_buffer_bytes_added": 65536,
+    "raster_exact_buffer_growth_count": 1,
+    "raster_exact_fallback_elapsed_seconds": 0.001,
+    "raster_fallback_count": 1,
+    "raster_peak_exact_intersection_capacity": peak_capacity,
+    "raster_replay_elapsed_seconds": 0.001,
+})
+encoded = (json.dumps(manifest, indent=2, sort_keys=True) + "\n").encode("utf-8")
+new_name = f"{manifest['iteration']:08d}-{hashlib.sha256(encoded).hexdigest()}"
+new_generation = generation.with_name(new_name)
+generation.rename(new_generation)
+(new_generation / "manifest.json").write_bytes(encoded)
+(root / "CURRENT").write_text(new_name + "\n", encoding="utf-8")
+PY
+}
+
 assert_resume_rejected() {
   local checkpoint="$1"
   local reason="$2"
@@ -1433,6 +1476,150 @@ make_incompatible_checkpoint \
   4294967296
 assert_malformed_checkpoint \
   "$resume_dir/fallback-uint32-overflow-checkpoint" fallback-uint32-overflow
+
+restore_budget=100663296
+restore_capacity=2305
+restore_checkpoint="$resume_dir/non-geometric-restore-checkpoint"
+restore_events="$resume_dir/non-geometric-restore.jsonl"
+make_raster_resume_checkpoint "$restore_checkpoint" "$restore_capacity" "$restore_budget"
+"$BIN" \
+  --dataset "$fixture_root/12-clusters-1500" \
+  --output "$resume_dir/non-geometric-restore.ply" \
+  --profile fast \
+  --checkpoint "$restore_checkpoint" \
+  --resume "$restore_checkpoint" \
+  --seed 42 \
+  --memory-budget-bytes "$restore_budget" \
+  --events-fd 1 \
+  >"$restore_events" 2>"$resume_dir/non-geometric-restore.stderr" &
+restore_pid=$!
+restore_loaded=0
+for _ in $(seq 1 2000); do
+  if grep -Fq '"event":"checkpoint_loaded"' "$restore_events" 2>/dev/null; then
+    restore_loaded=1
+    break
+  fi
+  sleep 0.01
+done
+[ "$restore_loaded" = "1" ] || {
+  kill -KILL "$restore_pid" 2>/dev/null || true
+  wait "$restore_pid" 2>/dev/null || true
+  fail "non-geometric resume did not load its checkpoint"
+}
+kill -TERM "$restore_pid"
+set +e
+wait "$restore_pid"
+restore_status=$?
+set -e
+[ "$restore_status" = "130" ] \
+  || fail "non-geometric resume cancellation exited $restore_status instead of 130"
+validate_jsonl "$restore_events"
+[ ! -e "$resume_dir/non-geometric-restore.ply" ] \
+  || fail "non-geometric resume cancellation published output"
+python3 - "$restore_checkpoint" "$restore_events" "$restore_capacity" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+checkpoint = Path(sys.argv[1])
+records = [json.loads(line) for line in Path(sys.argv[2]).read_text().splitlines()]
+expected_capacity = int(sys.argv[3])
+current = (checkpoint / "CURRENT").read_text().strip()
+manifest = json.loads(
+    (checkpoint / "generations" / current / "manifest.json").read_text()
+)
+expected_events = [
+    "started",
+    "checkpoint_loaded",
+    "cancellation_requested",
+    "cancelled",
+]
+event_names = [record.get("event") for record in records]
+event_positions = []
+for event in expected_events:
+    matches = [index for index, name in enumerate(event_names) if name == event]
+    if len(matches) != 1:
+        raise SystemExit(f"non-geometric resume emitted {event!r} {len(matches)} times")
+    event_positions.append(matches[0])
+if event_positions != sorted(event_positions):
+    raise SystemExit("non-geometric resume emitted required events out of order")
+if event_names[0] != "started" or event_names[-1] != "cancelled":
+    raise SystemExit("non-geometric resume did not start and cancel cleanly")
+if "completed" in event_names:
+    raise SystemExit("non-geometric resume completed after cancellation was requested")
+started, loaded, _, cancelled = (records[index] for index in event_positions)
+if manifest.get("raster_peak_exact_intersection_capacity") != expected_capacity:
+    raise SystemExit("non-geometric checkpoint fixture lost its persisted capacity")
+metric_keys = (
+    "raster_fallback_count",
+    "raster_exact_fallback_elapsed_seconds",
+    "raster_exact_buffer_growth_count",
+    "raster_exact_buffer_bytes_added",
+    "raster_replay_elapsed_seconds",
+    "raster_peak_exact_intersection_capacity",
+)
+for record in (started, loaded, cancelled):
+    for key in metric_keys:
+        if record.get(key) != manifest.get(key):
+            raise SystemExit(f"non-geometric resume changed durable {key}")
+if loaded.get("iteration") != manifest.get("iteration"):
+    raise SystemExit("checkpoint_loaded changed the persisted iteration")
+if cancelled.get("checkpoint_iteration") != manifest.get("iteration"):
+    raise SystemExit("cancelled event did not retain the durable iteration")
+PY
+
+failure_capacity=30000001
+failure_budget=1073741824
+failure_checkpoint="$resume_dir/restore-budget-failure-checkpoint"
+failure_events="$resume_dir/restore-budget-failure.jsonl"
+make_raster_resume_checkpoint "$failure_checkpoint" "$failure_capacity" "$failure_budget"
+failure_generation="$(tr -d '\n' <"$failure_checkpoint/CURRENT")"
+set +e
+"$BIN" \
+  --dataset "$fixture_root/12-clusters-1500" \
+  --output "$resume_dir/restore-budget-failure.ply" \
+  --profile fast \
+  --checkpoint "$failure_checkpoint" \
+  --resume "$failure_checkpoint" \
+  --seed 42 \
+  --memory-budget-bytes "$failure_budget" \
+  --events-fd 1 \
+  >"$failure_events" 2>"$resume_dir/restore-budget-failure.stderr"
+failure_status=$?
+set -e
+[ "$failure_status" = "75" ] \
+  || fail "resume restore budget failure exited $failure_status instead of 75"
+validate_jsonl "$failure_events"
+[ ! -e "$resume_dir/restore-budget-failure.ply" ] \
+  || fail "resume restore budget failure published output"
+[ "$(tr -d '\n' <"$failure_checkpoint/CURRENT")" = "$failure_generation" ] \
+  || fail "resume restore budget failure changed the durable checkpoint"
+if find "$failure_checkpoint" -name '*.tmp.*' -print -quit | grep -q .; then
+  fail "resume restore budget failure left a temporary checkpoint artifact"
+fi
+python3 - "$failure_events" "$failure_budget" "$failure_capacity" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+records = [json.loads(line) for line in Path(sys.argv[1]).read_text().splitlines()]
+expected_budget = int(sys.argv[2])
+expected_capacity = int(sys.argv[3])
+if len(records) != 1 or records[0].get("event") != "raster_memory_budget_exceeded":
+    raise SystemExit("resume restore failure did not emit one typed setup event")
+record = records[0]
+if record.get("iteration") != 0:
+    raise SystemExit("resume restore failure exposed its checkpoint iteration before started")
+if record.get("budget_bytes") != expected_budget:
+    raise SystemExit("resume restore failure lost the checkpoint budget")
+if record.get("required_bytes", 0) <= expected_budget:
+    raise SystemExit("resume restore failure lacks authoritative allocation evidence")
+if record.get("intersection_count") != expected_capacity:
+    raise SystemExit(
+        "resume restore failure did not come from the persisted capacity: "
+        f"expected {expected_capacity}, got {record.get('intersection_count')!r}"
+    )
+PY
 
 "$BIN" \
   --dataset "$fixture_root/12-clusters-1500" \

@@ -79,7 +79,7 @@ index 39342ff..1b51129 100644
          void *retainedBuffer = (__bridge_retained void*)buf;
  #else
 diff --git a/core/metal/bindings.h b/core/metal/bindings.h
-index 159e98b..21c1b9a 100644
+index 159e98b..89be4ee 100644
 --- a/core/metal/bindings.h
 +++ b/core/metal/bindings.h
 @@ -2,8 +2,28 @@
@@ -111,7 +111,7 @@ index 159e98b..21c1b9a 100644
  // Release all cached GPU tensors (call before exit to prevent GPU memory leak)
  void cleanup_msplat_metal();
  
-@@ -23,6 +43,48 @@ void msplat_commit();
+@@ -23,6 +43,49 @@ void msplat_commit();
  
  // Synchronize (commit + wait for completion)
  void msplat_gpu_sync();
@@ -133,6 +133,7 @@ index 159e98b..21c1b9a 100644
 +);
 +void msplat_set_raster_iteration_context(uint64_t iteration, uint64_t camera_index);
 +void msplat_grow_exact_raster_capacity(uint64_t intersection_count);
++void msplat_restore_exact_raster_capacity(uint64_t intersection_count);
 +void msplat_clear_raster_capacity_failure();
 +#ifdef MSPLAT_ENABLE_RASTER_TEST_HOOKS
 +void msplat_set_force_exact_for_testing(bool force_exact);
@@ -516,7 +517,7 @@ index 190b776..aacbc5a 100644
      // Early exit for threadgroups entirely beyond N
      if (bid * RS_TG_SIZE >= N) return;
 diff --git a/core/metal/msplat_metal.mm b/core/metal/msplat_metal.mm
-index 2763c99..63c5e17 100644
+index 2763c99..9fff022 100644
 --- a/core/metal/msplat_metal.mm
 +++ b/core/metal/msplat_metal.mm
 @@ -6,13 +6,14 @@
@@ -535,7 +536,7 @@ index 2763c99..63c5e17 100644
  #include <limits>
  #include <stdexcept>
  #include <string>
-@@ -149,6 +151,17 @@ struct MetalContext {
+@@ -149,6 +150,17 @@ struct MetalContext {
      // Tile-local sorting
      id<MTLComputePipelineState> scatter_to_prealloc_bins_kernel_cpso;
      id<MTLComputePipelineState> bitonic_sort_per_tile_kernel_cpso;
@@ -553,7 +554,7 @@ index 2763c99..63c5e17 100644
      // Prefix sum
      id<MTLComputePipelineState> prefix_sum_kernel_cpso;
      id<MTLComputePipelineState> block_reduce_kernel_cpso;
-@@ -277,6 +290,18 @@ MetalContext* init_msplat_metal_context() {
+@@ -277,6 +289,18 @@ MetalContext* init_msplat_metal_context() {
      // Tile-local sorting
      ctx->scatter_to_prealloc_bins_kernel_cpso      = load(@"scatter_to_prealloc_bins_kernel");
      ctx->bitonic_sort_per_tile_kernel_cpso        = load(@"bitonic_sort_per_tile_kernel");
@@ -646,7 +647,7 @@ index 2763c99..63c5e17 100644
  }
  
  void msplat_enable_gpu_timing(bool enable) {
-@@ -390,17 +455,173 @@ void msplat_drain_stage_times(std::vector<double> stage_times[], int max_stages,
+@@ -390,17 +470,199 @@ void msplat_drain_stage_times(std::vector<double> stage_times[], int max_stages,
  #define RAST_BLOCK_X 8
  #define RAST_BLOCK_Y 8
  static constexpr int64_t kMaxTileElements = 2048;
@@ -715,8 +716,7 @@ index 2763c99..63c5e17 100644
 +    for (int64_t extent : shape) {
 +        if (extent < 0) throw std::runtime_error("msplat: negative raster tensor extent");
 +        elements = checked_mul_u64(elements, static_cast<uint64_t>(extent), "sizing raster tensors");
-     }
--    return static_cast<uint32_t>(capacity);
++    }
 +    return std::max<uint64_t>(4, checked_mul_u64(elements, dtypeSize(dtype), "sizing raster tensors"));
 +}
 +
@@ -773,7 +773,8 @@ index 2763c99..63c5e17 100644
 +    const uint64_t budget = effective_raster_budget(device);
 +    if (budget == 0 || required > budget) {
 +        throw_raster_memory_budget_exceeded(required, budget, 0, allocated);
-+    }
+     }
+-    return static_cast<uint32_t>(capacity);
 +}
 +
 +[[noreturn]] void msplat_report_gpu_allocation_failure(
@@ -819,6 +820,32 @@ index 2763c99..63c5e17 100644
 +    return required;
 +}
 +
++static bool raster_allocation_fits(
++    id<MTLDevice> device,
++    const std::vector<std::pair<std::vector<int64_t>, DType>> &requests,
++    uint64_t allocated
++) {
++    uint64_t requested = 0;
++    const uint64_t maximum = static_cast<uint64_t>(device.maxBufferLength);
++    for (const auto &request : requests) {
++        const uint64_t bytes = tensor_bytes(request.first, request.second);
++        if (bytes > maximum || bytes > std::numeric_limits<uint64_t>::max() - requested) {
++            return false;
++        }
++        requested += bytes;
++    }
++    if (requested > std::numeric_limits<uint64_t>::max() - allocated) return false;
++    const uint64_t budget = effective_raster_budget(device);
++    return budget != 0 && allocated + requested <= budget;
++}
++
++static uint64_t geometric_raster_capacity(uint64_t required) {
++    const uint64_t maximum = std::numeric_limits<uint32_t>::max();
++    uint64_t capacity = 1;
++    while (capacity < required && capacity <= maximum / 2) capacity *= 2;
++    return capacity < required ? maximum : capacity;
++}
++
 +static void reserve_raster_allocation(
 +    id<MTLDevice> device,
 +    const std::vector<std::pair<std::vector<int64_t>, DType>> &requests
@@ -828,7 +855,7 @@ index 2763c99..63c5e17 100644
  }
  
  // Cached buffer pool — all intermediate GPU buffers are reused across iterations.
-@@ -408,11 +600,13 @@ static uint32_t packed_intersection_capacity(int num_tiles) {
+@@ -408,11 +670,13 @@ static uint32_t packed_intersection_capacity(int num_tiles) {
  // this eliminates all per-iteration GPU allocations.
  struct FusedTensorCache {
      int fwd_num_points = 0, img_height = 0, img_width = 0, num_tiles = 0;
@@ -843,7 +870,7 @@ index 2763c99..63c5e17 100644
      MTensor gaussian_ids;
      MTensor packed_xy_opac, packed_conic, packed_rgb;
      MTensor out_img, final_Ts, final_idx;
-@@ -424,11 +618,18 @@ struct FusedTensorCache {
+@@ -424,11 +688,18 @@ struct FusedTensorCache {
      MTensor tile_offsets, tile_scatter_counters;
      MTensor prealloc_bins;  // [num_tiles × MAX_TILE_ELEMS] uint64 — pre-allocated per-tile bins
  
@@ -862,7 +889,7 @@ index 2763c99..63c5e17 100644
      // Depth-chunked rasterization buffers
      uint32_t current_K_max = 1;
      int chunk_K_max = 0;
-@@ -446,6 +647,13 @@ struct FusedTensorCache {
+@@ -446,6 +717,13 @@ struct FusedTensorCache {
      void ensure_forward(int np, int64_t cap, int ih, int iw, int nt,
                          id<MTLDevice> dev) {
          if (np != fwd_num_points) {
@@ -876,7 +903,7 @@ index 2763c99..63c5e17 100644
              fwd_num_points = np;
              xys = mtensor_empty(dev, {np, 2}, DType::Float32);
              depths = mtensor_empty(dev, {np}, DType::Float32);
-@@ -454,16 +662,27 @@ struct FusedTensorCache {
+@@ -454,16 +732,27 @@ struct FusedTensorCache {
              num_tiles_hit = mtensor_empty(dev, {np}, DType::Int32);
              colors = mtensor_empty(dev, {np, 3}, DType::Float32);
              aabb = mtensor_empty(dev, {np, 2}, DType::Float32);
@@ -907,7 +934,7 @@ index 2763c99..63c5e17 100644
              img_height = ih; img_width = iw;
              out_img = mtensor_empty(dev, {ih, iw, 3}, DType::Float32);
              final_Ts = mtensor_empty(dev, {ih, iw}, DType::Float32);
-@@ -473,6 +692,10 @@ struct FusedTensorCache {
+@@ -473,6 +762,10 @@ struct FusedTensorCache {
              v_rendered = mtensor_empty(dev, {ih, iw, 3}, DType::Float32);
          }
          if (nt != num_tiles) {
@@ -918,7 +945,7 @@ index 2763c99..63c5e17 100644
              num_tiles = nt;
              tile_bins = mtensor_empty(dev, {nt, 2}, DType::Int32);
              tile_offsets = mtensor_empty(dev, {nt}, DType::Int32);
-@@ -480,15 +703,54 @@ struct FusedTensorCache {
+@@ -480,15 +773,54 @@ struct FusedTensorCache {
              prealloc_bins = mtensor_empty(dev, {(int64_t)nt * kMaxTileElements}, DType::Int64);
          }
          if (!loss_sum.defined()) {
@@ -973,7 +1000,7 @@ index 2763c99..63c5e17 100644
          chunk_K_max = K;
          chunk_T = mtensor_empty(dev, {K, ih, iw}, DType::Float32);
          chunk_C = mtensor_empty(dev, {K, ih, iw, 3}, DType::Float32);
-@@ -499,6 +761,13 @@ struct FusedTensorCache {
+@@ -499,6 +831,13 @@ struct FusedTensorCache {
  
      void ensure_backward(int np, int frb, id<MTLDevice> dev) {
          if (np != bwd_num_points || frb != features_rest_bases || !v_xy.defined()) {
@@ -987,7 +1014,7 @@ index 2763c99..63c5e17 100644
              bwd_num_points = np;
              features_rest_bases = frb;
              v_xy = mtensor_empty(dev, {np, 2}, DType::Float32);
-@@ -513,9 +782,569 @@ struct FusedTensorCache {
+@@ -513,9 +852,643 @@ struct FusedTensorCache {
              v_features_rest = mtensor_empty(dev, {(int64_t)np, (int64_t)frb, 3}, DType::Float32);
          }
      }
@@ -1235,7 +1262,15 @@ index 2763c99..63c5e17 100644
 +    g_raster_camera_index = camera_index;
 +}
 +
-+void msplat_grow_exact_raster_capacity(uint64_t intersection_count) {
++enum class ExactRasterCapacityMode {
++    geometricGrowth,
++    checkpointRestore,
++};
++
++static void resize_exact_raster_capacity(
++    uint64_t intersection_count,
++    ExactRasterCapacityMode mode
++) {
 +    if (intersection_count == 0 || intersection_count > std::numeric_limits<uint32_t>::max()) {
 +        throw_raster_resource_limit_exceeded(
 +            intersection_count,
@@ -1269,23 +1304,6 @@ index 2763c99..63c5e17 100644
 +        return;
 +    }
 +
-+    const int64_t capacity = static_cast<int64_t>(intersection_count);
-+    const int64_t radixCount = ((capacity + 255) / 256) * 256;
-+    std::vector<std::pair<std::vector<int64_t>, DType>> requests {
-+        {{capacity}, DType::Int64},
-+        {{capacity}, DType::Int64},
-+        {{capacity}, DType::Int32},
-+        {{radixCount}, DType::Int32},
-+    };
-+    if (growPacked) {
-+        requests.insert(requests.end(), {
-+            {{capacity}, DType::Int32},
-+            {{capacity, 3}, DType::Float32},
-+            {{capacity, 3}, DType::Float32},
-+            {{capacity, 3}, DType::Float32},
-+        });
-+    }
-+
 +    const uint64_t allocated = static_cast<uint64_t>(context->device.currentAllocatedSize);
 +    uint64_t released = g_tcache.exact_allocation_bytes();
 +    if (growPacked) {
@@ -1297,6 +1315,55 @@ index 2763c99..63c5e17 100644
 +    }
 +    const uint64_t trackedBytesBeforeGrowth = released;
 +    const uint64_t allocationAfterRelease = allocated > released ? allocated - released : 0;
++
++    auto allocationRequests = [&](uint64_t requestedCapacity) {
++        const int64_t capacity = static_cast<int64_t>(requestedCapacity);
++        const int64_t radixCount = ((capacity + 255) / 256) * 256;
++        std::vector<std::pair<std::vector<int64_t>, DType>> requests {
++            {{capacity}, DType::Int64},
++            {{capacity}, DType::Int64},
++            {{capacity}, DType::Int32},
++            {{radixCount}, DType::Int32},
++        };
++        if (growPacked) {
++            requests.insert(requests.end(), {
++                {{capacity}, DType::Int32},
++                {{capacity, 3}, DType::Float32},
++                {{capacity, 3}, DType::Float32},
++                {{capacity, 3}, DType::Float32},
++            });
++        }
++        return requests;
++    };
++
++    const auto minimumRequests = allocationRequests(intersection_count);
++    validate_raster_allocation(
++        context->device,
++        minimumRequests,
++        allocationAfterRelease,
++        intersection_count
++    );
++
++    uint64_t targetCapacity = mode == ExactRasterCapacityMode::geometricGrowth
++        ? geometric_raster_capacity(intersection_count)
++        : intersection_count;
++    if (!growPacked) {
++        targetCapacity = std::min(
++            targetCapacity,
++            static_cast<uint64_t>(g_tcache.packed_capacity)
++        );
++    }
++    if (g_exact_capacity_limit_for_testing != 0) {
++        targetCapacity = std::min(targetCapacity, g_exact_capacity_limit_for_testing);
++    }
++    targetCapacity = std::max(targetCapacity, intersection_count);
++
++    auto requests = allocationRequests(targetCapacity);
++    if (targetCapacity > intersection_count &&
++        !raster_allocation_fits(context->device, requests, allocationAfterRelease)) {
++        targetCapacity = intersection_count;
++        requests = minimumRequests;
++    }
 +    const uint64_t required = validate_raster_allocation(
 +        context->device,
 +        requests,
@@ -1306,6 +1373,8 @@ index 2763c99..63c5e17 100644
 +
 +    g_tcache.release_exact_buffers();
 +    if (growPacked) g_tcache.release_packed_buffers();
++    const int64_t capacity = static_cast<int64_t>(targetCapacity);
++    const int64_t radixCount = ((capacity + 255) / 256) * 256;
 +    if (growPacked) {
 +        g_tcache.packed_capacity = capacity;
 +        g_tcache.gaussian_ids = mtensor_empty(context->device, {capacity}, DType::Int32);
@@ -1329,17 +1398,23 @@ index 2763c99..63c5e17 100644
 +    if (trackedBytesAfterGrowth <= trackedBytesBeforeGrowth) {
 +        throw std::runtime_error("msplat: exact raster growth did not add buffer capacity");
 +    }
-+    {
++    if (mode == ExactRasterCapacityMode::geometricGrowth) {
 +        std::lock_guard<std::mutex> lock(g_exact_raster_metric_mutex);
-+        ++g_exact_buffer_growth_count;
-+        g_exact_buffer_bytes_added = checked_add_u64(
++        const uint64_t nextGrowthCount = checked_add_u64(
++            g_exact_buffer_growth_count,
++            1,
++            "accounting exact raster buffer growths"
++        );
++        const uint64_t nextBytesAdded = checked_add_u64(
 +            g_exact_buffer_bytes_added,
 +            trackedBytesAfterGrowth - trackedBytesBeforeGrowth,
 +            "accounting exact raster buffer growth"
 +        );
++        g_exact_buffer_growth_count = nextGrowthCount;
++        g_exact_buffer_bytes_added = nextBytesAdded;
 +        g_peak_exact_intersection_capacity = std::max(
 +            g_peak_exact_intersection_capacity,
-+            intersection_count
++            targetCapacity
 +        );
 +    }
 +#ifdef MSPLAT_ENABLE_RASTER_TEST_HOOKS
@@ -1347,6 +1422,28 @@ index 2763c99..63c5e17 100644
 +#endif
 +    g_last_raster_allocation_bytes = allocationAfterRelease;
 +    g_last_raster_required_bytes = required;
++}
++
++void msplat_grow_exact_raster_capacity(uint64_t intersection_count) {
++    resize_exact_raster_capacity(
++        intersection_count,
++        ExactRasterCapacityMode::geometricGrowth
++    );
++}
++
++void msplat_restore_exact_raster_capacity(uint64_t intersection_count) {
++    {
++        std::lock_guard<std::mutex> lock(g_exact_raster_metric_mutex);
++        if (g_peak_exact_intersection_capacity != intersection_count) {
++            throw std::invalid_argument(
++                "msplat: restored exact capacity does not match durable history"
++            );
++        }
++    }
++    resize_exact_raster_capacity(
++        intersection_count,
++        ExactRasterCapacityMode::checkpointRestore
++    );
 +}
 +
 +void msplat_clear_raster_capacity_failure() {
@@ -1456,6 +1553,10 @@ index 2763c99..63c5e17 100644
 +    const uint64_t actual =
 +        (static_cast<uint64_t>(stats[kRasterStatLatestIntersectionCountHigh]) << 32) |
 +        static_cast<uint64_t>(stats[kRasterStatLatestIntersectionCount]);
++    const uint64_t reportedIntersectionCount =
++        g_last_raster_memory_budget_exceeded || g_last_raster_resource_limit_exceeded
++        ? g_last_raster_intersection_count
++        : actual;
 +    const uint64_t allocation = g_tcache.raster_allocation_bytes();
 +    return MsplatRasterStats {
 +        stats[kRasterStatFallbackCount],
@@ -1464,7 +1565,7 @@ index 2763c99..63c5e17 100644
 +        exactBufferGrowthCount,
 +        exactBufferBytesAdded,
 +        peakExactIntersectionCapacity,
-+        actual,
++        reportedIntersectionCount,
 +        allocation,
 +        g_last_raster_required_bytes,
 +        budget,
@@ -1557,7 +1658,7 @@ index 2763c99..63c5e17 100644
  void msplat_record_last_loss(int slot, int capacity, float normalization) {
      if (capacity <= 0 || slot < 0 || slot >= capacity ||
          !std::isfinite(normalization) || normalization <= 0) {
-@@ -554,7 +1361,7 @@ void msplat_sync_loss_window(int count, float* output) {
+@@ -554,7 +1527,7 @@ void msplat_sync_loss_window(int count, float* output) {
          !g_tcache.loss_history.defined() || output == nullptr) {
          throw std::runtime_error("msplat: invalid completed loss window");
      }
@@ -1566,7 +1667,7 @@ index 2763c99..63c5e17 100644
      const float* losses = g_tcache.loss_history.data<float>();
      for (int index = 0; index < count; ++index) {
          const double value = static_cast<double>(losses[index]) *
-@@ -567,7 +1374,192 @@ void msplat_sync_loss_window(int count, float* output) {
+@@ -567,7 +1540,192 @@ void msplat_sync_loss_window(int count, float* output) {
  }
  
  void cleanup_msplat_metal() {
@@ -1759,7 +1860,7 @@ index 2763c99..63c5e17 100644
  }
  
  // Internal forward pipeline — used by both msplat_render and msplat_train_step.
-@@ -589,28 +1572,25 @@ static void forward_pipeline(
+@@ -589,28 +1747,25 @@ static void forward_pipeline(
      int tile_bounds_y = std::get<1>(tile_bounds);
      int num_tiles = tile_bounds_x * tile_bounds_y;
  
@@ -1804,7 +1905,7 @@ index 2763c99..63c5e17 100644
      MTensor &xys = g_tcache.xys;
      MTensor &depths = g_tcache.depths;
      MTensor &radii_out = g_tcache.radii_out;
-@@ -649,14 +1629,14 @@ static void forward_pipeline(
+@@ -649,14 +1804,14 @@ static void forward_pipeline(
      if (std::getenv("BENCHMARK") && (diag_count == 100 || diag_count == 500 || diag_count == 1500)) {
              fprintf(stderr, "\n=== Roofline Dimensions (iter %d) ===\n", diag_count);
              fprintf(stderr, "  num_points:     %d\n", num_points);
@@ -1821,7 +1922,7 @@ index 2763c99..63c5e17 100644
              fprintf(stderr, "  opacities:      [%lld]\n", (long long)opacities.size(0));
              fprintf(stderr, "===========================\n\n");
      }
-@@ -724,7 +1704,8 @@ static void forward_pipeline(
+@@ -724,7 +1879,8 @@ static void forward_pipeline(
          }
      };
  
@@ -1831,7 +1932,7 @@ index 2763c99..63c5e17 100644
      uint32_t K_max = 1;
      constexpr uint32_t CHUNK_SIZE = 512;
  
-@@ -807,20 +1788,8 @@ static void forward_pipeline(
+@@ -807,20 +1963,8 @@ static void forward_pipeline(
      // Zero cached buffers will be done inside the command encoder via blit.
      // (CPU memset would race with previous CB's GPU reads.)
  
@@ -1853,7 +1954,7 @@ index 2763c99..63c5e17 100644
  
      {
          id<MTLCommandBuffer> command_buffer = ctx->getCommandBuffer();
-@@ -832,7 +1801,9 @@ static void forward_pipeline(
+@@ -832,7 +1976,9 @@ static void forward_pipeline(
              id<MTLBlitCommandEncoder> blit = [command_buffer blitCommandEncoder];
              // tile_bins written by sort kernel, tile_counts no longer used
              [blit fillBuffer:loss_sum.buffer() range:NSMakeRange(0, loss_sum.nbytes()) value:0];
@@ -1864,7 +1965,7 @@ index 2763c99..63c5e17 100644
              [blit fillBuffer:g_tcache.tile_scatter_counters.buffer() range:NSMakeRange(0, g_tcache.tile_scatter_counters.nbytes()) value:0];
              [blit endEncoding];
  
-@@ -843,6 +1814,15 @@ static void forward_pipeline(
+@@ -843,6 +1989,15 @@ static void forward_pipeline(
              [encoder memoryBarrierWithScope:MTLBarrierScopeBuffers];
              encode_prefix_map(encoder);
              [encoder memoryBarrierWithScope:MTLBarrierScopeBuffers];
@@ -1880,7 +1981,7 @@ index 2763c99..63c5e17 100644
              encode_rast_fwd(encoder);
              if (compute_loss) {
                  [encoder memoryBarrierWithScope:MTLBarrierScopeBuffers];
-@@ -898,29 +1878,26 @@ std::tuple<MTensor, float> msplat_train_step(
+@@ -898,29 +2053,26 @@ std::tuple<MTensor, float> msplat_train_step(
      int tile_bounds_y = std::get<1>(tile_bounds);
      int num_tiles = tile_bounds_x * tile_bounds_y;
  
@@ -1926,7 +2027,7 @@ index 2763c99..63c5e17 100644
  
      MTensor &xys = g_tcache.xys;
      MTensor &depths = g_tcache.depths;
-@@ -979,17 +1956,8 @@ std::tuple<MTensor, float> msplat_train_step(
+@@ -979,17 +2131,8 @@ std::tuple<MTensor, float> msplat_train_step(
      // --- K_max for chunked rasterization ---
      uint32_t K_max = 1;
      constexpr uint32_t CHUNK_SIZE = 512;
@@ -1945,7 +2046,7 @@ index 2763c99..63c5e17 100644
  
      uint32_t bwd_K_max = K_max;
      constexpr uint32_t BWD_CHUNK_SIZE = 512;
-@@ -1217,6 +2185,7 @@ std::tuple<MTensor, float> msplat_train_step(
+@@ -1217,6 +2360,7 @@ std::tuple<MTensor, float> msplat_train_step(
          [enc setBuffer:adam_exp_avg[4].buffer() offset:0 atIndex:25]; // rest exp_avg
          [enc setBuffer:adam_exp_avg_sq[4].buffer() offset:0 atIndex:26]; // rest exp_avg_sq
          [enc setBytes:sh_adam_hp.get() length:sizeof(SHAdamParams) atIndex:27];
@@ -1953,7 +2054,7 @@ index 2763c99..63c5e17 100644
          [enc dispatchThreads:MTLSizeMake(num_points, 1, 1) threadsPerThreadgroup:MTLSizeMake(tpg, 1, 1)];
          // Adam for remaining groups (skip 3=featuresDc, 4=featuresRest — fused above)
          if (num_adam_groups > 0) {
-@@ -1237,6 +2206,7 @@ std::tuple<MTensor, float> msplat_train_step(
+@@ -1237,6 +2381,7 @@ std::tuple<MTensor, float> msplat_train_step(
                  ENC_SCALAR(enc, adam_bc2_sqrts[g], 7);
                  ENC_SCALAR(enc, adam_eps, 8);
                  ENC_SCALAR(enc, n, 9);
@@ -1961,7 +2062,7 @@ index 2763c99..63c5e17 100644
                  [enc dispatchThreads:MTLSizeMake(n, 1, 1) threadsPerThreadgroup:MTLSizeMake(atpg, 1, 1)];
              }
          }
-@@ -1255,6 +2225,7 @@ std::tuple<MTensor, float> msplat_train_step(
+@@ -1255,6 +2400,7 @@ std::tuple<MTensor, float> msplat_train_step(
          ENC_BUF(enc, xys_grad_norm, 4);
          ENC_BUF(enc, max_2d_size, 5);
          ENC_SCALAR(enc, inv_max_dim, 6);
@@ -1969,7 +2070,7 @@ index 2763c99..63c5e17 100644
          [enc dispatchThreads:MTLSizeMake(num_points, 1, 1) threadsPerThreadgroup:MTLSizeMake(tpg, 1, 1)];
      };
  
-@@ -1263,7 +2234,9 @@ std::tuple<MTensor, float> msplat_train_step(
+@@ -1263,7 +2409,9 @@ std::tuple<MTensor, float> msplat_train_step(
          id<MTLBlitCommandEncoder> blit = [cb blitCommandEncoder];
          // tile_bins written by sort kernel, tile_counts no longer used
          [blit fillBuffer:loss_sum.buffer() range:NSMakeRange(0, loss_sum.nbytes()) value:0];
@@ -1980,7 +2081,7 @@ index 2763c99..63c5e17 100644
          [blit fillBuffer:g_tcache.tile_scatter_counters.buffer() range:NSMakeRange(0, g_tcache.tile_scatter_counters.nbytes()) value:0];
          [blit fillBuffer:v_xy.buffer() range:NSMakeRange(0, v_xy.nbytes()) value:0];
          [blit fillBuffer:v_conic.buffer() range:NSMakeRange(0, v_conic.nbytes()) value:0];
-@@ -1330,6 +2303,15 @@ std::tuple<MTensor, float> msplat_train_step(
+@@ -1330,6 +2478,15 @@ std::tuple<MTensor, float> msplat_train_step(
              // Stage 2: prefix_sort_pack
              enc = make_profiled_encoder(1);
              encode_prefix_map(enc);
@@ -1996,7 +2097,7 @@ index 2763c99..63c5e17 100644
              [enc endEncoding];
  
              // Stage 3: rast_fwd
-@@ -1412,6 +2394,15 @@ std::tuple<MTensor, float> msplat_train_step(
+@@ -1412,6 +2569,15 @@ std::tuple<MTensor, float> msplat_train_step(
              [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
              encode_prefix_map(enc);
              [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
@@ -2012,7 +2113,7 @@ index 2763c99..63c5e17 100644
              encode_rast_fwd(enc);
              [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
              // --- Fused loss forward + backward ---
-@@ -1690,7 +2681,7 @@ int msplat_densify(
+@@ -1690,7 +2856,7 @@ int msplat_densify(
      });
  
      // Single GPU→CPU sync: read new_count from keep_prefix[worst_case - 1]

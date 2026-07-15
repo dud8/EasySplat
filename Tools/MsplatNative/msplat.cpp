@@ -2142,6 +2142,27 @@ int main(int argc, char *argv[]) {
             });
         };
 
+        preflightRasterMemory();
+        if (resumed && restoredRasterPeakExactIntersectionCapacity != 0) {
+            msplat_restore_exact_raster_capacity(
+                restoredRasterPeakExactIntersectionCapacity
+            );
+            const MsplatRasterStats restoredCapacity = checkedRasterStats();
+            if (restoredCapacity.fallback_count != restoredRasterFallbackCount ||
+                restoredCapacity.exact_fallback_elapsed_seconds !=
+                    restoredRasterExactFallbackElapsedSeconds ||
+                restoredCapacity.exact_buffer_growth_count !=
+                    restoredRasterExactBufferGrowthCount ||
+                restoredCapacity.exact_buffer_bytes_added !=
+                    restoredRasterExactBufferBytesAdded ||
+                restoredCapacity.peak_exact_intersection_capacity !=
+                    restoredRasterPeakExactIntersectionCapacity) {
+                throw std::runtime_error(
+                    "restored exact raster capacity changed durable checkpoint metrics"
+                );
+            }
+        }
+
         events->emit("started", {{"camera_count", cameras.size()},
                                 {"checkpoint_schema", 3},
                                 {"geometry_digest", identity.geometryDigest},
@@ -2169,7 +2190,6 @@ int main(int argc, char *argv[]) {
                                 {"trainer_build_digest", trainerBuildDigest},
                                 {"version", APP_VERSION}});
         terminalIteration = completedIteration;
-        preflightRasterMemory();
         if (!resumed) {
             lastCheckpoint = saveCheckpoint(
                 model,

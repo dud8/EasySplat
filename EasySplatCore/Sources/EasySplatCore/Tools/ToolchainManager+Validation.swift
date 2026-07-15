@@ -480,9 +480,9 @@ extension ToolchainManager {
             "source_url": "https://github.com/rayanht/msplat.git",
             "source_commit": "106499b0a53f82b0c92d013b0861fbebd341b17e",
             "source_version": "1.1.3",
-            "overlay_sha256": "da1a4289fa9ab3993d9db3cee2450bcf0c5a15d34778d59d81f092196300f922",
-            "raster_test_sha256": "f98e008a3d813cb8b8b3ae9d0b5e42f5f9d08ba7662835aebcdbad04fa910f7c",
-            "exact_raster_patch_sha256": "dd1f1a802cabaaceeab8825535e374f21ad723c680d4e70bcfc7d3d4e865962d",
+            "overlay_sha256": "b284e0aa4397518e573c919e86e0cd2c2d50fbd7af3a1343cd5e15539b61a153",
+            "raster_test_sha256": "01678dbef4b7cc5bd3f65ab7c16ded68cbb353b6ef88f01d11416ddcacf8b3a6",
+            "exact_raster_patch_sha256": "278deba531d1503b8f6fe3428e0b6c5103129f388a6bc425c41780ff9e4c453b",
             "deployment_target": "macOS 15.0",
             "build_configuration": "Release",
         ]

@@ -3,6 +3,7 @@
 #include <cmath>
 #include <cstdint>
 #include <iostream>
+#include <limits>
 #include <stdexcept>
 #include <string>
 #include <tuple>
@@ -17,6 +18,13 @@ namespace {
 constexpr std::uint64_t memoryBudgetBytes = 512ULL * 1024ULL * 1024ULL;
 constexpr float relativeTolerance = 2.0e-3f;
 constexpr float absoluteTolerance = 2.0e-4f;
+
+std::uint64_t geometricCapacity(std::uint64_t required) {
+    const std::uint64_t maximum = std::numeric_limits<std::uint32_t>::max();
+    std::uint64_t capacity = 1;
+    while (capacity < required && capacity <= maximum / 2) capacity *= 2;
+    return capacity < required ? maximum : capacity;
+}
 
 struct RasterResult {
     std::vector<float> rgb;
@@ -419,23 +427,41 @@ void verifyExactOnlyBudgetEvidence(const std::string &dataset) {
     std::cout << "exact_only_budget_evidence passed\n";
 }
 
-void verifySharedAllocationBudget() {
+void verifySharedAllocationBudget(const std::string &dataset) {
     cleanup_msplat_metal();
-    msplat_set_raster_memory_budget_bytes(1);
-    bool rejected = false;
-    try {
-        (void)gpu_empty({4096}, DType::Float32);
-    } catch (const std::exception &) {
-        rejected = true;
-    }
-    const MsplatRasterStats stats = msplat_get_raster_stats();
-    if (!rejected || !stats.memory_budget_exceeded ||
-        !msplat_raster_memory_budget_was_exceeded() ||
-        stats.resource_limit_exceeded || stats.required_bytes <= stats.budget_bytes ||
-        stats.latest_intersection_count != 0) {
-        throw std::runtime_error(
-            "shared Metal allocation bypassed the resolved training budget"
-        );
+    msplat_set_raster_memory_budget_bytes(memoryBudgetBytes);
+    msplat_set_raster_fallback_count(0);
+    msplat_set_force_exact_for_testing(true);
+    {
+        InputData inputData = inputDataFromX(dataset);
+        Camera &camera = inputData.cameras.front();
+        Model model = makeModel(inputData);
+        msplat_set_exact_execution_capacity_for_testing(2048);
+        enqueueStep(model, camera, 1, 0);
+        msplat_gpu_sync_for_raster_replay();
+        const MsplatRasterStats overflow = msplat_get_raster_stats();
+        if (!overflow.capacity_exceeded || overflow.latest_intersection_count == 0) {
+            throw std::runtime_error(
+                "shared allocation fixture did not establish prior raster evidence"
+            );
+        }
+
+        msplat_set_raster_memory_budget_for_testing(1);
+        bool rejected = false;
+        try {
+            (void)gpu_empty({4096}, DType::Float32);
+        } catch (const std::exception &) {
+            rejected = true;
+        }
+        const MsplatRasterStats stats = msplat_get_raster_stats();
+        if (!rejected || !stats.memory_budget_exceeded ||
+            !msplat_raster_memory_budget_was_exceeded() ||
+            stats.resource_limit_exceeded || stats.required_bytes <= stats.budget_bytes ||
+            stats.latest_intersection_count != 0) {
+            throw std::runtime_error(
+                "shared Metal allocation inherited stale raster evidence"
+            );
+        }
     }
     cleanup_msplat_metal();
     std::cout << "shared_allocation_budget passed\n";
@@ -626,10 +652,11 @@ void verifyRepeatedExactFallbackMetrics(const std::string &dataset) {
         Model model = makeModel(inputData);
         const std::uint64_t intersections = primeExactWorkspace(model, camera, 1, 0);
         const MsplatRasterStats grown = msplat_get_raster_stats();
+        const std::uint64_t expectedHeadroom = geometricCapacity(intersections);
         if (grown.exact_buffer_growth_count != 1 ||
             grown.exact_buffer_bytes_added == 0 ||
-            grown.peak_exact_intersection_capacity < intersections) {
-            throw std::runtime_error("exact buffer growth was not measured once");
+            grown.peak_exact_intersection_capacity != expectedHeadroom) {
+            throw std::runtime_error("exact buffer growth did not reserve geometric headroom");
         }
 
         enqueueStep(model, camera, 1, 0);
@@ -660,6 +687,80 @@ void verifyRepeatedExactFallbackMetrics(const std::string &dataset) {
 
     cleanup_msplat_metal();
     std::cout << "repeated_exact_fallback_metrics passed\n";
+}
+
+void verifyRestoredExactCapacity(const std::string &dataset) {
+    cleanup_msplat_metal();
+    msplat_set_raster_memory_budget_bytes(memoryBudgetBytes);
+    msplat_set_raster_fallback_count(0);
+    msplat_set_force_exact_for_testing(true);
+
+    MsplatRasterStats durable {};
+    {
+        InputData inputData = inputDataFromX(dataset);
+        Camera &camera = inputData.cameras.front();
+        Model model = makeModel(inputData);
+        (void)primeExactWorkspace(model, camera, 1, 0);
+        enqueueStep(model, camera, 1, 0);
+        msplat_gpu_sync_for_raster_replay();
+        durable = msplat_get_raster_stats();
+        if (durable.fallback_count != 1 || durable.exact_buffer_growth_count != 1 ||
+            durable.peak_exact_intersection_capacity <= 2048) {
+            throw std::runtime_error("restored-capacity fixture has no durable exact history");
+        }
+    }
+
+    const std::uint64_t persistedCapacity = durable.latest_intersection_count;
+    if (persistedCapacity <= 2048 || geometricCapacity(persistedCapacity) == persistedCapacity) {
+        throw std::runtime_error(
+            "restored-capacity fixture did not produce a non-geometric durable capacity"
+        );
+    }
+
+    cleanup_msplat_metal();
+    msplat_set_raster_memory_budget_bytes(memoryBudgetBytes);
+    msplat_restore_raster_metrics(
+        durable.fallback_count,
+        durable.exact_fallback_elapsed_seconds,
+        durable.exact_buffer_growth_count,
+        durable.exact_buffer_bytes_added,
+        persistedCapacity
+    );
+    msplat_set_force_exact_for_testing(true);
+    {
+        InputData inputData = inputDataFromX(dataset);
+        Camera &camera = inputData.cameras.front();
+        Model model = makeModel(inputData);
+        msplat_preflight_raster_memory(
+            model.num_active,
+            camera.height,
+            camera.width,
+            static_cast<int>(model.featuresRest.size(-2))
+        );
+        msplat_restore_exact_raster_capacity(persistedCapacity);
+
+        const MsplatRasterStats restored = msplat_get_raster_stats();
+        if (restored.memory_budget_exceeded || restored.resource_limit_exceeded ||
+            restored.required_bytes > restored.budget_bytes ||
+            restored.exact_buffer_growth_count != durable.exact_buffer_growth_count ||
+            restored.exact_buffer_bytes_added != durable.exact_buffer_bytes_added ||
+            restored.peak_exact_intersection_capacity != persistedCapacity) {
+            throw std::runtime_error("restored exact capacity changed durable history");
+        }
+
+        enqueueStep(model, camera, 1, 0);
+        msplat_gpu_sync_for_raster_replay();
+        const MsplatRasterStats resumed = msplat_get_raster_stats();
+        if (resumed.capacity_exceeded || resumed.dropped_intersection_count != 0 ||
+            resumed.fallback_count != durable.fallback_count + 1 ||
+            resumed.exact_buffer_growth_count != durable.exact_buffer_growth_count ||
+            resumed.exact_buffer_bytes_added != durable.exact_buffer_bytes_added ||
+            resumed.peak_exact_intersection_capacity != persistedCapacity) {
+            throw std::runtime_error("restored exact capacity replayed or changed history");
+        }
+    }
+    cleanup_msplat_metal();
+    std::cout << "restored_exact_capacity passed\n";
 }
 
 void verifyQueuedExactFallbackTiming(const std::string &dataset) {
@@ -798,8 +899,10 @@ ModelSnapshot runIncreasingWindow(const std::string &dataset, bool replay) {
                 secondCameraStep,
                 1
             );
-            if (second <= first) {
-                throw std::runtime_error("increasing-overflow fixture is not increasing");
+            if (second <= first || geometricCapacity(second) <= geometricCapacity(first)) {
+                throw std::runtime_error(
+                    "increasing-overflow fixture does not cross a geometric bucket"
+                );
             }
         }
 
@@ -827,7 +930,9 @@ ModelSnapshot runIncreasingWindow(const std::string &dataset, bool replay) {
             replayStart = firstOverflow;
         }
         if (replay && (growths.size() != 2 || growths[1] <= growths[0])) {
-            throw std::runtime_error("window replay did not perform two increasing exact grows");
+            throw std::runtime_error(
+                "window replay did not perform two geometric bucket grows"
+            );
         }
         const MsplatRasterStats completed = msplat_get_raster_stats();
         if (completed.capacity_exceeded || completed.memory_budget_exceeded ||
@@ -877,6 +982,51 @@ void verifyGPUCapacityFailure(const std::string &dataset) {
 
     const MsplatRasterStats initialFailure = probe(memoryBudgetBytes);
     const std::uint64_t intersections = initialFailure.latest_intersection_count;
+
+    auto growProbe = [&](bool clampToObserved, std::uint64_t budgetOverride) {
+        cleanup_msplat_metal();
+        msplat_set_raster_memory_budget_bytes(memoryBudgetBytes);
+        msplat_set_raster_fallback_count(0);
+        msplat_set_force_exact_for_testing(true);
+        if (clampToObserved) {
+            msplat_set_exact_capacity_limit_for_testing(intersections);
+        }
+        InputData inputData = inputDataFromX(dataset);
+        Camera &camera = inputData.cameras.front();
+        Model model = makeModel(inputData);
+        makeBroadSplats(model);
+        enqueueStep(model, camera, 1, 0);
+        msplat_gpu_sync_for_raster_replay();
+        const MsplatRasterStats overflow = msplat_get_raster_stats();
+        if (!overflow.capacity_exceeded || overflow.latest_intersection_count != intersections) {
+            throw std::runtime_error("geometric budget probe changed the intersection count");
+        }
+        if (budgetOverride != 0) {
+            msplat_set_raster_memory_budget_for_testing(budgetOverride);
+        }
+        msplat_grow_exact_raster_capacity(intersections);
+        return msplat_get_raster_stats();
+    };
+
+    const MsplatRasterStats minimumGrowth = growProbe(true, 0);
+    const MsplatRasterStats geometricGrowth = growProbe(false, 0);
+    if (minimumGrowth.peak_exact_intersection_capacity != intersections ||
+        geometricGrowth.peak_exact_intersection_capacity != geometricCapacity(intersections) ||
+        geometricGrowth.required_bytes <= minimumGrowth.required_bytes) {
+        throw std::runtime_error("geometric budget probe did not create distinct capacities");
+    }
+    const std::uint64_t tightBudget = minimumGrowth.required_bytes +
+        (geometricGrowth.required_bytes - minimumGrowth.required_bytes) / 4;
+    const MsplatRasterStats tightGrowth = growProbe(false, tightBudget);
+    if (tightGrowth.memory_budget_exceeded || tightGrowth.resource_limit_exceeded ||
+        msplat_raster_memory_budget_was_exceeded() ||
+        msplat_raster_resource_limit_was_exceeded() ||
+        tightGrowth.required_bytes > tightGrowth.budget_bytes ||
+        tightGrowth.peak_exact_intersection_capacity != intersections) {
+        throw std::runtime_error(
+            "geometric headroom did not fall back to the minimum fitting capacity"
+        );
+    }
 
     // A device buffer limit is distinct from memory pressure. Make the exact
     // growth fail after the GPU count so the typed evidence is authoritative.
@@ -1033,8 +1183,9 @@ int main(int argc, char **argv) {
         }
         verifyMixedResolutionGrowth(argv[2]);
         verifyExactOnlyBudgetEvidence(argv[6]);
-        verifySharedAllocationBudget();
+        verifySharedAllocationBudget(argv[3]);
         verifyRepeatedExactFallbackMetrics(argv[3]);
+        verifyRestoredExactCapacity(argv[3]);
         verifyQueuedExactFallbackTiming(argv[3]);
         verifySyncFailureDrainsTimingHandlers(argv[3]);
         verifyDeterministicWindowReplay(argv[3]);

@@ -285,6 +285,86 @@ final class MsplatRunnerTests: XCTestCase {
         XCTAssertFalse(try containsStagingOutput(in: context.output.deletingLastPathComponent()))
     }
 
+    func testResumeSetupMemoryBudgetFailureIsTypedAtIterationZero() async throws {
+        let context = try makeContext()
+        defer { context.cleanup() }
+        _ = try makeMsplatCheckpointFixture(at: context.checkpoint, iteration: 500)
+        let stdout = """
+        {"budget_bytes":\(testMemoryBudgetBytes),"event":"raster_memory_budget_exceeded","intersection_count":4000001,"iteration":0,"required_bytes":\(testMemoryBudgetBytes + 1),"schema_version":2,"sequence":1}
+        """ + "\n"
+        let mock = MockSubprocessRunner(scripts: [
+            .init(
+                path: context.executable.path,
+                argsPrefix: ["--dataset", context.dataset.path],
+                result: .init(exitCode: 75, terminationReason: .exit, stdout: stdout, stderr: ""),
+                onRun: nil
+            ),
+        ])
+
+        do {
+            _ = try await MsplatRunner(runner: mock).runTrain(
+                msplatPath: context.executable,
+                datasetPath: context.dataset,
+                outputPath: context.output,
+                checkpointPath: context.checkpoint,
+                resumeFrom: context.checkpoint,
+                profile: .balanced,
+                seed: 42,
+                memoryBudgetBytes: testMemoryBudgetBytes,
+                onLog: { _, _ in }
+            )
+            XCTFail("Expected resumed setup memory budget failure")
+        } catch let failure as MsplatRasterMemoryBudgetExceeded {
+            XCTAssertEqual(failure.iteration, 0)
+            XCTAssertEqual(failure.intersectionCount, 4_000_001)
+            XCTAssertEqual(failure.requiredBytes, testMemoryBudgetBytes + 1)
+            XCTAssertEqual(failure.budgetBytes, testMemoryBudgetBytes)
+        }
+        XCTAssertFalse(FileManager.default.fileExists(atPath: context.output.path))
+        XCTAssertFalse(try containsStagingOutput(in: context.output.deletingLastPathComponent()))
+    }
+
+    func testResumeSetupResourceLimitFailureIsTypedAtIterationZero() async throws {
+        let context = try makeContext()
+        defer { context.cleanup() }
+        _ = try makeMsplatCheckpointFixture(at: context.checkpoint, iteration: 500)
+        let maximumBufferBytes: Int64 = 4_294_967_296
+        let requiredBytes = maximumBufferBytes + 4_096
+        let stdout = """
+        {"event":"raster_resource_limit_exceeded","intersection_count":4000001,"iteration":0,"max_buffer_bytes":\(maximumBufferBytes),"required_bytes":\(requiredBytes),"schema_version":2,"sequence":1}
+        """ + "\n"
+        let mock = MockSubprocessRunner(scripts: [
+            .init(
+                path: context.executable.path,
+                argsPrefix: ["--dataset", context.dataset.path],
+                result: .init(exitCode: 75, terminationReason: .exit, stdout: stdout, stderr: ""),
+                onRun: nil
+            ),
+        ])
+
+        do {
+            _ = try await MsplatRunner(runner: mock).runTrain(
+                msplatPath: context.executable,
+                datasetPath: context.dataset,
+                outputPath: context.output,
+                checkpointPath: context.checkpoint,
+                resumeFrom: context.checkpoint,
+                profile: .balanced,
+                seed: 42,
+                memoryBudgetBytes: testMemoryBudgetBytes,
+                onLog: { _, _ in }
+            )
+            XCTFail("Expected resumed setup resource limit failure")
+        } catch let failure as MsplatRasterResourceLimitExceeded {
+            XCTAssertEqual(failure.iteration, 0)
+            XCTAssertEqual(failure.intersectionCount, 4_000_001)
+            XCTAssertEqual(failure.requiredBytes, requiredBytes)
+            XCTAssertEqual(failure.maximumBufferBytes, maximumBufferBytes)
+        }
+        XCTAssertFalse(FileManager.default.fileExists(atPath: context.output.path))
+        XCTAssertFalse(try containsStagingOutput(in: context.output.deletingLastPathComponent()))
+    }
+
     func testRasterResourceLimitFailureIsTypedAndPreservesExistingOutput() async throws {
         let context = try makeContext()
         defer { context.cleanup() }
@@ -1301,6 +1381,44 @@ final class MsplatRunnerTests: XCTestCase {
         }
         XCTAssertEqual(checkpointEvents.value, [receipt])
         XCTAssertFalse(FileManager.default.fileExists(atPath: context.output.path))
+    }
+
+    func testImmediateCancellationAfterResumePreservesExactRasterReceipt() async throws {
+        let context = try makeContext()
+        defer { context.cleanup() }
+        let receipt = try makeMsplatCheckpointFixture(
+            at: context.checkpoint,
+            iteration: 500,
+            rasterFallbackCount: 1,
+            peakExactIntersectionCapacity: 2_305
+        )
+        let runner = CancellingSubprocessRunner(
+            events: interruptedEvents(checkpoint: receipt, currentIteration: 500)
+        )
+
+        do {
+            _ = try await MsplatRunner(runner: runner).runTrain(
+                msplatPath: context.executable,
+                datasetPath: context.dataset,
+                outputPath: context.output,
+                checkpointPath: context.checkpoint,
+                resumeFrom: context.checkpoint,
+                profile: .balanced,
+                seed: 42,
+                memoryBudgetBytes: testMemoryBudgetBytes,
+                onLog: { _, _ in }
+            )
+            XCTFail("Expected resumable interruption")
+        } catch let interruption as MsplatTrainingInterrupted {
+            XCTAssertEqual(interruption.completedIteration, 500)
+            XCTAssertEqual(interruption.checkpoint, receipt)
+            XCTAssertEqual(
+                interruption.checkpoint.rasterPeakExactIntersectionCapacity,
+                2_305
+            )
+        }
+        XCTAssertFalse(FileManager.default.fileExists(atPath: context.output.path))
+        XCTAssertFalse(try containsStagingOutput(in: context.output.deletingLastPathComponent()))
     }
 
     func testCancellationAfterCompletedEventStreamStaysCancellation() async throws {
