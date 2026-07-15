@@ -26,6 +26,8 @@ public struct ReconstructionScore: Sendable {
 }
 
 public enum ReconstructionScorer {
+    static let minimumRegisteredViewFraction = 0.90
+
     static func parseSparseTextModel(at sparseModelURL: URL, expectedTotalImages: Int? = nil) -> ReconstructionScore? {
         let imagesTxt = sparseModelURL.appendingPathComponent("images.txt")
         let pointsTxt = sparseModelURL.appendingPathComponent("points3D.txt")
@@ -165,18 +167,13 @@ public enum ReconstructionScorer {
         )
     }
 
-    public static func isAcceptable(_ score: ReconstructionScore, capturePath: CapturePath) -> Bool {
+    public static func isAcceptable(
+        _ score: ReconstructionScore,
+        capturePath _: CapturePath
+    ) -> Bool {
         guard score.totalImages > 0 else { return false }
         let ratio = Double(score.registeredImages) / Double(score.totalImages)
-        let threshold: Double = switch capturePath {
-        case .automatic:
-            0.60
-        case .orbit:
-            0.65
-        case .walkthrough, .largeArea:
-            0.55
-        }
-        if ratio < threshold { return false }
+        if ratio < minimumRegisteredViewFraction { return false }
         if let reproj = score.meanReprojectionError, reproj > 2.5 { return false }
         if let points = score.pointCount, points <= 0 { return false }
         if let observations = score.observationCount, observations <= 0 { return false }

@@ -28,7 +28,7 @@ extension PipelineRunner {
             throw PipelineError.geometryResidualsUnavailable(error.localizedDescription)
         }
         let requiredRegisteredViews = Int(ceil(
-            Double(selectedFrames.count) * GeometryArtifactStore.minimumRegisteredViewFraction
+            Double(selectedFrames.count) * ReconstructionScorer.minimumRegisteredViewFraction
         ))
         let selectedNames = Set(selectedFrames.map(\.lastPathComponent))
         guard Set(residuals.registeredImageNames).isSubset(of: selectedNames) else {

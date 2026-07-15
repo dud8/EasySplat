@@ -55,29 +55,38 @@ final class ReconstructionScorerTests: XCTestCase {
     }
 
     func testAcceptableThresholds() {
-        let score = ReconstructionScore(
-            registeredImages: 70,
-            totalImages: 100,
+        let passing = ReconstructionScore(
+            registeredImages: 20,
+            totalImages: 22,
             meanReprojectionError: 1.0,
             pointCount: 10_000,
             observationCount: 30_000,
             meanTrackLength: 3.0
         )
-        XCTAssertTrue(ReconstructionScorer.isAcceptable(score, capturePath: .orbit))
-        let low = ReconstructionScore(
-            registeredImages: 40,
-            totalImages: 100,
+        let failing = ReconstructionScore(
+            registeredImages: 19,
+            totalImages: 22,
             meanReprojectionError: 1.0,
             pointCount: 10_000,
             observationCount: 30_000,
             meanTrackLength: 3.0
         )
-        XCTAssertFalse(ReconstructionScorer.isAcceptable(low, capturePath: .orbit))
+
+        XCTAssertTrue(ReconstructionScorer.isAcceptable(passing, capturePath: .orbit))
+        XCTAssertFalse(ReconstructionScorer.isAcceptable(failing, capturePath: .orbit))
     }
 
-    func testCapturePathThresholdsDoNotTreatAutomaticAsAnObjectOrbit() {
-        let score = ReconstructionScore(
-            registeredImages: 60,
+    func testEveryCapturePathUsesThePublishedRegistrationFloor() {
+        let belowFloor = ReconstructionScore(
+            registeredImages: 89,
+            totalImages: 100,
+            meanReprojectionError: 1.0,
+            pointCount: 10_000,
+            observationCount: 30_000,
+            meanTrackLength: 3.0
+        )
+        let atFloor = ReconstructionScore(
+            registeredImages: 90,
             totalImages: 100,
             meanReprojectionError: 1.0,
             pointCount: 10_000,
@@ -85,15 +94,20 @@ final class ReconstructionScorerTests: XCTestCase {
             meanTrackLength: 3.0
         )
 
-        XCTAssertTrue(ReconstructionScorer.isAcceptable(score, capturePath: .automatic))
-        XCTAssertTrue(ReconstructionScorer.isAcceptable(score, capturePath: .walkthrough))
-        XCTAssertTrue(ReconstructionScorer.isAcceptable(score, capturePath: .largeArea))
-        XCTAssertFalse(ReconstructionScorer.isAcceptable(score, capturePath: .orbit))
+        for capturePath in [
+            CapturePath.automatic,
+            .orbit,
+            .walkthrough,
+            .largeArea,
+        ] {
+            XCTAssertFalse(ReconstructionScorer.isAcceptable(belowFloor, capturePath: capturePath))
+            XCTAssertTrue(ReconstructionScorer.isAcceptable(atFloor, capturePath: capturePath))
+        }
     }
 
     func testAcceptableRejectsTracklessSparseModel() {
         let score = ReconstructionScore(
-            registeredImages: 70,
+            registeredImages: 90,
             totalImages: 100,
             meanReprojectionError: 1.0,
             pointCount: 10_000,

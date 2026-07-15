@@ -6,7 +6,6 @@ enum GeometryArtifactStore {
     static let maximumManifestBytes = 1_048_576
     static let maximumMedianPixelResidual = 1.5
     static let maximumP90PixelResidual = 3.0
-    static let minimumRegisteredViewFraction = 0.90
     static let minimumLearnedObservationsPerView = 20
 
     enum Error: Swift.Error, LocalizedError, Equatable {
@@ -214,7 +213,7 @@ enum GeometryArtifactStore {
               artifact.registeredViewCount > 0,
               artifact.registeredViewCount <= artifact.totalViewCount,
               Double(artifact.registeredViewCount) / Double(artifact.totalViewCount)
-                  >= minimumRegisteredViewFraction,
+                  >= ReconstructionScorer.minimumRegisteredViewFraction,
               artifact.orderedImageNames.count == artifact.totalViewCount,
               artifact.orderedImageTimestamps.count == artifact.totalViewCount,
               artifact.medianPixelResidual.isFinite,
@@ -286,13 +285,13 @@ enum GeometryArtifactStore {
         }.count
         let learnedSupportIsValid = artifact.learnedPointInitializer == nil
             || Double(stronglyMeasuredViewCount) / Double(artifact.totalViewCount)
-                >= minimumRegisteredViewFraction
+                >= ReconstructionScorer.minimumRegisteredViewFraction
         guard measured.provenance == artifact.residualProvenance,
               measured.registeredViewCount == artifact.registeredViewCount,
               Set(measured.registeredImageNames).isSubset(of: Set(artifact.orderedImageNames)),
               Set(measured.measuredImageNames).isSubset(of: Set(artifact.orderedImageNames)),
               Double(measured.measuredImageNames.count) / Double(artifact.totalViewCount)
-                  >= minimumRegisteredViewFraction,
+                  >= ReconstructionScorer.minimumRegisteredViewFraction,
               learnedSupportIsValid,
               measured.pointCount == artifact.pointCount,
               measured.observationCount == artifact.trackCount,

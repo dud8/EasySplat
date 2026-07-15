@@ -3035,18 +3035,25 @@ final class PipelineIntegrationTests: XCTestCase {
         try ProjectMetadataStore.save(metadata, to: paths.metadataURL)
 
         let toolchain = try makeToolchain(root: temp)
+        let belowCoverageReport = """
+        Registered images: 8 / 10
+        Points: 100
+        Observations: 300
+        Mean track length: 3.0
+        Mean reprojection error: 0.8
+        """
 
         let runner = MockSubprocessRunner(scripts: [
             .init(path: toolchain.colmap.path, argsPrefix: ["feature_extractor"], result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""), onRun: { try? self.writeFeatureDatabase(for: $0) }),
             .init(path: toolchain.colmap.path, argsPrefix: ["matches_importer"], result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""), onRun: { try? self.writeVerifiedPairResults(for: $0) }),
             .init(path: toolchain.colmap.path, argsPrefix: ["mapper"], result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""), onRun: { _ in try? self.writeSparseModel(at: projectURL) }),
-            .init(path: toolchain.colmap.path, argsPrefix: ["model_analyzer"], result: .init(exitCode: 0, terminationReason: .exit, stdout: "Registered images: 2 / 10\nMean reprojection error: 3.5\n", stderr: ""), onRun: nil),
+            .init(path: toolchain.colmap.path, argsPrefix: ["model_analyzer"], result: .init(exitCode: 0, terminationReason: .exit, stdout: belowCoverageReport, stderr: ""), onRun: nil),
             .init(path: toolchain.colmap.path, argsPrefix: ["matches_importer"], result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""), onRun: { args in
                 XCTAssertEqual(self.value(for: "--SiftMatching.cpu_brute_force_matcher", in: args), "1")
                 try? self.writeVerifiedPairResults(for: args)
             }),
             .init(path: toolchain.colmap.path, argsPrefix: ["mapper"], result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""), onRun: { _ in try? self.writeSparseModel(at: projectURL) }),
-            .init(path: toolchain.colmap.path, argsPrefix: ["model_analyzer"], result: .init(exitCode: 0, terminationReason: .exit, stdout: "Registered images: 2 / 10\nMean reprojection error: 3.5\n", stderr: ""), onRun: nil),
+            .init(path: toolchain.colmap.path, argsPrefix: ["model_analyzer"], result: .init(exitCode: 0, terminationReason: .exit, stdout: belowCoverageReport, stderr: ""), onRun: nil),
         ])
 
         let pipeline = PipelineRunner(
