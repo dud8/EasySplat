@@ -6,6 +6,7 @@ import hashlib
 import io
 import itertools
 import json
+import math
 import os
 import subprocess
 import sys
@@ -42,6 +43,23 @@ FIXTURE_SELECTION_MANIFEST = benchmark.canonical_json_bytes(
                 "view_index": index,
                 "clip_id": "clip-0",
                 "source_kind": "video",
+            }
+            for index in range(30)
+        ],
+    }
+) + b"\n"
+FIXTURE_GROUND_TRUTH_POSES = benchmark.canonical_json_bytes(
+    {
+        "schema_version": 1,
+        "pose_convention": "world_to_camera",
+        "quaternion_order": "wxyz",
+        "handedness": "right_handed",
+        "coordinate_space": "ground_truth_world",
+        "image_coordinates": "normalized_display_pixels",
+        "poses": [
+            {
+                "image_name": f"frame {index:04d}.jpg",
+                "rcw_wxyz": {"w": 1.0, "x": 0.0, "y": 0.0, "z": 0.0},
             }
             for index in range(30)
         ],
@@ -100,7 +118,10 @@ FIXTURE_ACCURATE_RENDERING_REFERENCE = benchmark.canonical_json_bytes(
 
 REFERENCE_ARTIFACT_CONTENTS = {
     "selection_manifest_sha256": ("selection-manifest.json", FIXTURE_SELECTION_MANIFEST),
-    "ground_truth_poses_sha256": ("ground-truth-poses.json", b"ground truth poses\n"),
+    "ground_truth_poses_sha256": (
+        "ground-truth-poses.json",
+        FIXTURE_GROUND_TRUTH_POSES,
+    ),
     "accurate_colmap_model_sha256": ("accurate-colmap-model.json", b"accurate COLMAP\n"),
     "accurate_rendering_reference_sha256": (
         "accurate-rendering-reference.json",
@@ -110,7 +131,11 @@ REFERENCE_ARTIFACT_CONTENTS = {
         "paired-baseline-rendering-reference.json",
         b"paired baseline rendering reference\n",
     ),
-    "orientation_label_sha256": ("orientation-label.json", b"physical up label\n"),
+    "orientation_label_sha256": (
+        "orientation-label.json",
+        b'{"coordinate_space":"ground_truth_world","physical_up":{"x":0,"y":1,"z":0},'
+        b'"schema_version":1}\n',
+    ),
 }
 
 VALID_SPLAT_PLY = """ply
@@ -481,9 +506,6 @@ def valid_reference_config() -> dict[str, object]:
                 "translation_rpe_delta_percentage_points_max": 2.0,
             },
             "orientation": {
-                "median_residual_degrees_max": 3.0,
-                "p90_residual_degrees_max": 8.0,
-                "bootstrap_p95_degrees_max": 5.0,
                 "physical_up_error_degrees_max": 5.0,
             },
             "balanced_rendering": {
@@ -622,9 +644,6 @@ def passing_metrics() -> dict[str, object]:
             "mapping_speedup": measured(1.5),
             "bundle_adjustment_cycles": measured(3),
             "orientation_status": measured("verified"),
-            "orientation_median_residual_degrees": measured(0.5),
-            "orientation_p90_residual_degrees": measured(1.0),
-            "orientation_bootstrap_p95_degrees": measured(2.0),
             "orientation_physical_up_error_degrees": measured(0.75),
             "orientation_sign_correct": measured(True),
             "raster_fallback_count": measured(0),
@@ -1259,9 +1278,6 @@ def raw_observations(
             "mapping_seconds": 20.0,
             "bundle_adjustment_cycles": 3,
             "orientation_status": "verified",
-            "orientation_median_residual_degrees": 0.5,
-            "orientation_p90_residual_degrees": 1.0,
-            "orientation_bootstrap_p95_degrees": 2.0,
             "orientation_physical_up_error_degrees": 0.75,
             "orientation_sign_correct": True,
             "raster_fallback_count": 0,
@@ -1269,6 +1285,13 @@ def raw_observations(
             "dropped_intersection_count": 0,
         },
     }
+    if lane != evidence.LANE_REFERENCE:
+        for name in (
+            "orientation_status",
+            "orientation_physical_up_error_degrees",
+            "orientation_sign_correct",
+        ):
+            observations["pipeline_metrics"][name] = None
     if lane == evidence.LANE_REFERENCE:
         observations["artifacts"].update(
             {
@@ -1345,6 +1368,209 @@ def raw_observations(
     return observations
 
 
+def orientation_metrics_for_observations(
+    observations: dict[str, object],
+    alignment_offset: float = 0.0,
+) -> dict[str, object]:
+    pipeline = observations["pipeline_metrics"]
+    status = pipeline["orientation_status"]
+    fixture_status = (
+        status
+        if status in {"verified", "axis_aligned_sign_unverified", "unresolved"}
+        else "verified"
+    )
+    return {
+        "alignment_median_residual_degrees": 0.1 + alignment_offset,
+        "alignment_p90_residual_degrees": 0.2 + alignment_offset,
+        "alignment_support_count": 30,
+        "candidate_source_to_ground_truth_wxyz": [1.0, 0.0, 0.0, 0.0],
+        "orientation_physical_up_error_degrees": pipeline[
+            "orientation_physical_up_error_degrees"
+        ],
+        "orientation_sign_correct": pipeline["orientation_sign_correct"],
+        "orientation_status": fixture_status,
+    }
+
+
+def write_orientation_evidence_artifacts(
+    root: Path,
+    observations: dict[str, object],
+    request: dict[str, object],
+) -> None:
+    timing = observations["timing"]
+    candidate_runs = [
+        record
+        for record in timing["ordinary_runs"]
+        if record["variant"] == "candidate"
+    ]
+    published = [
+        receipt
+        for receipt in observations["commands"]
+        if receipt["variant"] == "candidate" and receipt["published_output"]
+    ]
+    if len(published) != 1:
+        raise AssertionError("orientation fixture requires one published candidate run")
+    scoring_run_id = published[0]["run_id"]
+    run_receipts = []
+    aggregate_runs = []
+    for index, record in enumerate(candidate_runs):
+        run_id = record["run_id"]
+        run_root = root / "orientation-runs" / run_id
+        run_root.mkdir(parents=True)
+        geometry_manifest = run_root / "geometry-manifest.json"
+        candidate_images = run_root / "candidate-images.txt"
+        metrics_path = run_root / "orientation-metrics.json"
+        stdout_path = run_root / "orientation-stdout.log"
+        stderr_path = run_root / "orientation-stderr.log"
+        candidate_data = (
+            f"# Image list for {run_id}\n"
+            + "".join(
+                f"{index + 1} 1 0 0 0 0 0 0 1 frame {index:04d}.jpg\n\n"
+                for index in range(30)
+            )
+        ).encode("utf-8")
+        candidate_images.write_bytes(candidate_data)
+        pipeline = observations["pipeline_metrics"]
+        status = pipeline["orientation_status"]
+        fixture_status = (
+            status
+            if status in {"verified", "axis_aligned_sign_unverified", "unresolved"}
+            else "verified"
+        )
+        manifest_status = {
+            "verified": "verified",
+            "axis_aligned_sign_unverified": "axisAlignedSignUnverified",
+            "unresolved": "unresolved",
+        }[fixture_status]
+        orientation: dict[str, object] = {"status": manifest_status}
+        if fixture_status != "unresolved":
+            error_degrees = float(
+                pipeline["orientation_physical_up_error_degrees"] or 0.0
+            )
+            half_angle = math.radians(error_degrees) / 2
+            orientation["sourceToCanonicalQuaternionWXYZ"] = {
+                "w": math.cos(half_angle),
+                "x": math.sin(half_angle),
+                "y": 0.0,
+                "z": 0.0,
+            }
+        geometry_manifest.write_bytes(
+            evidence.canonical_json_bytes(
+                {
+                    "canonicalOrientation": orientation,
+                    "handedness": "right-handed",
+                    "modelHashes": {
+                        "cameras.txt": "1" * 64,
+                        "images.txt": hashlib.sha256(candidate_data).hexdigest(),
+                        "points3D.txt": "2" * 64,
+                    },
+                    "poseConvention": "world-to-camera",
+                    "quaternionOrder": "wxyz",
+                    "schemaVersion": 4,
+                }
+            )
+            + b"\n"
+        )
+        metrics = orientation_metrics_for_observations(observations, index * 0.01)
+        metrics_path.write_bytes(evidence.canonical_json_bytes(metrics) + b"\n")
+        stdout_path.write_text(f"orientation complete: {run_id}\n", encoding="utf-8")
+        stderr_path.write_text(f"orientation diagnostics: {run_id}\n", encoding="utf-8")
+        relative_root = Path("orientation-runs") / run_id
+        aggregate_runs.append(
+            {
+                "metrics": metrics,
+                "metrics_path": (relative_root / "orientation-metrics.json").as_posix(),
+                "run_id": run_id,
+            }
+        )
+        run_receipts.append(
+            {
+                "actual_argv_sha256": "sha256:" + str(index + 1) * 64,
+                "argv": [
+                    "approved-orientation-driver",
+                    f"renderer-closure://{request['rendering_driver_identity']['sha256']}",
+                    f"renderer-executable://{request['rendering_driver_identity']['executable_sha256']}",
+                    "extract-orientation",
+                    "--geometry-manifest",
+                    f"evidence://{(relative_root / 'geometry-manifest.json').as_posix()}",
+                    "--candidate-images",
+                    f"evidence://{(relative_root / 'candidate-images.txt').as_posix()}",
+                    "--ground-truth-poses",
+                    "evidence://ground-truth-poses.json",
+                    "--ground-truth-poses-sha256",
+                    request["reference_artifacts"]["ground_truth_poses_sha256"],
+                    "--orientation-label",
+                    "evidence://orientation-label.json",
+                    "--orientation-label-sha256",
+                    request["reference_artifacts"]["orientation_label_sha256"],
+                    "--output",
+                    f"evidence://{(relative_root / 'orientation-metrics.json').as_posix()}",
+                ],
+                "candidate_images_path": (
+                    relative_root / "candidate-images.txt"
+                ).as_posix(),
+                "candidate_images_sha256": evidence.sha256_file(candidate_images),
+                "ended_monotonic_seconds": float(index + 1),
+                "exit_code": 0,
+                "geometry_manifest_path": (
+                    relative_root / "geometry-manifest.json"
+                ).as_posix(),
+                "geometry_manifest_sha256": evidence.sha256_file(geometry_manifest),
+                "metrics_path": (
+                    relative_root / "orientation-metrics.json"
+                ).as_posix(),
+                "metrics_sha256": evidence.sha256_file(metrics_path),
+                "run_id": run_id,
+                "started_monotonic_seconds": float(index),
+                "stderr_path": (relative_root / "orientation-stderr.log").as_posix(),
+                "stderr_sha256": evidence.sha256_file(stderr_path),
+                "stdout_path": (relative_root / "orientation-stdout.log").as_posix(),
+                "stdout_sha256": evidence.sha256_file(stdout_path),
+                "timed_out": False,
+            }
+        )
+    aggregate = {
+        "runs": aggregate_runs,
+        "schema_version": 1,
+        "scoring_run_id": scoring_run_id,
+    }
+    aggregate_path = root / "orientation-metrics.json"
+    aggregate_path.write_bytes(evidence.canonical_json_bytes(aggregate) + b"\n")
+    request_sha256 = evidence.sha256_bytes(
+        evidence.canonical_json_bytes(request) + b"\n"
+    )
+    supervisor = {
+        "candidate_git_commit": request["binding"]["git_commit"],
+        "ground_truth_poses_sha256": request["reference_artifacts"][
+            "ground_truth_poses_sha256"
+        ],
+        "lane": request["binding"]["lane"],
+        "metrics_index_sha256": evidence.sha256_file(aggregate_path),
+        "orientation_label_sha256": request["reference_artifacts"][
+            "orientation_label_sha256"
+        ],
+        "renderer_closure_sha256": request["rendering_driver_identity"]["sha256"],
+        "renderer_executable_sha256": request["rendering_driver_identity"][
+            "executable_sha256"
+        ],
+        "request_sha256": request_sha256,
+        "runs": run_receipts,
+        "scale": request["binding"]["scale"],
+        "scene_id": request["binding"]["scene_id"],
+        "schema_version": 1,
+        "scoring_run_id": scoring_run_id,
+    }
+    (root / "orientation-supervisor.json").write_bytes(
+        evidence.canonical_json_bytes(supervisor) + b"\n"
+    )
+    observations["artifacts"].update(
+        {
+            "orientation_metrics": "orientation-metrics.json",
+            "orientation_supervisor": "orientation-supervisor.json",
+        }
+    )
+
+
 def write_evidence_artifacts(
     root: Path,
     observations: dict[str, object],
@@ -1387,6 +1613,12 @@ def write_evidence_artifacts(
                 for record in observations["toolchain_scenarios"]
             )
             )
+    if "registration" in observations:
+        write_orientation_evidence_artifacts(
+            root,
+            observations,
+            render_request or evidence_request(lane=evidence.LANE_REFERENCE),
+        )
     if (
         "registration" in observations
         and observations.get("artifacts", {}).get("rendering_manifest")
@@ -1798,14 +2030,20 @@ class ConfigurationValidationTests(unittest.TestCase):
             "mapping_speedup",
             "bundle_adjustment_cycles",
             "orientation_status",
-            "orientation_median_residual_degrees",
-            "orientation_p90_residual_degrees",
-            "orientation_bootstrap_p95_degrees",
+            "orientation_physical_up_error_degrees",
+            "orientation_sign_correct",
             "raster_fallback_count",
             "maximum_tile_intersections",
             "dropped_intersection_count",
         ):
             self.assertIn(name, schema["$defs"]["metrics"]["properties"])
+        for name in (
+            "orientation_seconds",
+            "orientation_median_residual_degrees",
+            "orientation_p90_residual_degrees",
+            "orientation_bootstrap_p95_degrees",
+        ):
+            self.assertNotIn(name, schema["$defs"]["metrics"]["properties"])
         evidence_schema = json.loads(
             (ROOT / "scripts/benchmark/evidence.schema.json").read_text(encoding="utf-8")
         )
@@ -2004,9 +2242,6 @@ class GateEvaluationTests(unittest.TestCase):
     def test_gate_scopes_only_require_their_own_metrics(self) -> None:
         metrics = passing_metrics()
         quality_names = benchmark.GATE_SCOPE_METRICS["scene_quality"] | {
-            "orientation_median_residual_degrees",
-            "orientation_p90_residual_degrees",
-            "orientation_bootstrap_p95_degrees",
             "orientation_physical_up_error_degrees",
             "orientation_sign_correct",
         }
@@ -2481,10 +2716,7 @@ class EvidenceProtocolTests(unittest.TestCase):
             self.assertEqual(metrics["matching_speedup"], measured(10.0))
             self.assertEqual(metrics["mapping_speedup"], measured(1.5))
             self.assertEqual(metrics["orientation_status"], measured("verified"))
-            self.assertEqual(
-                metrics["orientation_bootstrap_p95_degrees"],
-                measured(2.0),
-            )
+            self.assertEqual(metrics["orientation_physical_up_error_degrees"], measured(0.75))
             self.assertEqual(
                 attestation["measurement_runner"],
                 runner_identity(evidence.LANE_REFERENCE),
@@ -2552,7 +2784,7 @@ class EvidenceProtocolTests(unittest.TestCase):
         )
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            write_evidence_artifacts(root, observations)
+            write_evidence_artifacts(root, observations, request)
             attestation = evidence.produce_attestation(
                 request,
                 observations,
@@ -2573,7 +2805,7 @@ class EvidenceProtocolTests(unittest.TestCase):
         observations["artifacts"]["output_ply"] = "splat.ply"
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            write_evidence_artifacts(root, observations)
+            write_evidence_artifacts(root, observations, request)
             with self.assertRaisesRegex(evidence.EvidenceError, "invalid.*output_ply"):
                 evidence.produce_attestation(
                     request,
@@ -2704,7 +2936,7 @@ class EvidenceProtocolTests(unittest.TestCase):
         )
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            write_evidence_artifacts(root, observations)
+            write_evidence_artifacts(root, observations, request)
             with self.assertRaisesRegex(evidence.EvidenceError, "retrieval.*quer"):
                 evidence.produce_attestation(
                     request,
@@ -2825,7 +3057,7 @@ class EvidenceProtocolTests(unittest.TestCase):
         )
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            write_evidence_artifacts(root, observations)
+            write_evidence_artifacts(root, observations, request)
             pair_list = fixture_pair_list_with_retrieval()
             pair_list["retrieval"]["queries"][0]["verified_retained_neighbors"] = [13]
             for pair in pair_list["pairs"]:
@@ -3173,6 +3405,7 @@ class EvidenceProtocolTests(unittest.TestCase):
         for key in ("registration", "residual_pixels", "pose"):
             del observations[key]
         for artifact in (
+            "orientation_label",
             "render_job",
             "rendering_manifest",
             "render_supervisor",
@@ -3180,6 +3413,8 @@ class EvidenceProtocolTests(unittest.TestCase):
             "renderer_stderr_log",
         ):
             del observations["artifacts"][artifact]
+        for field in evidence.ORIENTATION_PIPELINE_FIELDS:
+            observations["pipeline_metrics"][field] = None
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             write_evidence_artifacts(root, observations)
@@ -3541,37 +3776,8 @@ class EvidenceProtocolTests(unittest.TestCase):
 
     def test_orientation_evidence_is_status_consistent(self) -> None:
         observations = raw_observations(evidence.LANE_REFERENCE)
-        cases = []
-        verified_missing = json.loads(json.dumps(observations["pipeline_metrics"]))
-        verified_missing["orientation_bootstrap_p95_degrees"] = None
-        cases.append((verified_missing, "verified orientation"))
-        unresolved_partial = json.loads(json.dumps(observations["pipeline_metrics"]))
-        unresolved_partial["orientation_status"] = "unresolved"
-        unresolved_partial["orientation_median_residual_degrees"] = None
-        cases.append((unresolved_partial, "unresolved orientation"))
-        for raw_metrics, expected in cases:
-            with self.subTest(expected=expected), tempfile.TemporaryDirectory() as directory:
-                changed = json.loads(json.dumps(observations))
-                changed["pipeline_metrics"] = raw_metrics
-                root = Path(directory)
-                write_evidence_artifacts(root, changed)
-                with self.assertRaisesRegex(evidence.EvidenceError, expected):
-                    evidence.produce_attestation(
-                        evidence_request(),
-                        changed,
-                        root,
-                        root / "attestation.json",
-                        self.key,
-                        evidence.LANE_REFERENCE,
-                        runner_identity(evidence.LANE_REFERENCE),
-                        machine=evidence_machine(evidence.LANE_REFERENCE),
-                    )
-
         unresolved = json.loads(json.dumps(observations))
         unresolved["pipeline_metrics"]["orientation_status"] = "unresolved"
-        unresolved["pipeline_metrics"]["orientation_median_residual_degrees"] = None
-        unresolved["pipeline_metrics"]["orientation_p90_residual_degrees"] = None
-        unresolved["pipeline_metrics"]["orientation_bootstrap_p95_degrees"] = None
         unresolved["pipeline_metrics"]["orientation_physical_up_error_degrees"] = None
         unresolved["pipeline_metrics"]["orientation_sign_correct"] = None
         with tempfile.TemporaryDirectory() as directory:
@@ -3590,6 +3796,217 @@ class EvidenceProtocolTests(unittest.TestCase):
                 machine=evidence_machine(evidence.LANE_REFERENCE),
             )
         self.assertEqual(attestation["metrics"]["orientation_status"], measured("unresolved"))
+
+    def test_axis_aligned_sign_unverified_uses_undirected_error_without_sign_evidence(self) -> None:
+        observations = raw_observations(evidence.LANE_REFERENCE)
+        observations["pipeline_metrics"]["orientation_status"] = (
+            "axis_aligned_sign_unverified"
+        )
+        observations["pipeline_metrics"]["orientation_physical_up_error_degrees"] = 0.75
+        observations["pipeline_metrics"]["orientation_sign_correct"] = None
+        request = evidence_request()
+        request["reference_artifacts"]["orientation_expected_status"] = (
+            "axis_aligned_sign_unverified"
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            write_evidence_artifacts(root, observations, request)
+            attestation = evidence.produce_attestation(
+                request,
+                observations,
+                root,
+                root / "attestation.json",
+                self.key,
+                evidence.LANE_REFERENCE,
+                runner_identity(evidence.LANE_REFERENCE),
+                machine=evidence_machine(evidence.LANE_REFERENCE),
+            )
+        self.assertEqual(
+            attestation["metrics"]["orientation_status"],
+            measured("axis_aligned_sign_unverified"),
+        )
+        self.assertEqual(
+            attestation["metrics"]["orientation_physical_up_error_degrees"],
+            measured(0.75),
+        )
+        self.assertEqual(
+            attestation["metrics"]["orientation_sign_correct"],
+            {"availability": "not_available", "reason": "not_measured"},
+        )
+
+        invalid = json.loads(json.dumps(observations))
+        invalid["pipeline_metrics"]["orientation_sign_correct"] = True
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            write_evidence_artifacts(root, invalid, request)
+            with self.assertRaisesRegex(evidence.EvidenceError, "without a sign claim"):
+                evidence.produce_attestation(
+                    request,
+                    invalid,
+                    root,
+                    root / "attestation.json",
+                    self.key,
+                    evidence.LANE_REFERENCE,
+                    runner_identity(evidence.LANE_REFERENCE),
+                    machine=evidence_machine(evidence.LANE_REFERENCE),
+                )
+
+    def test_orientation_label_uses_closed_ground_truth_world_physical_up_schema(self) -> None:
+        observations = raw_observations(evidence.LANE_REFERENCE)
+        request = evidence_request()
+        malformed_label = (
+            b'{"coordinate_space":"source_world","physical_up":{"x":0,"y":0,"z":0},'
+            b'"schema_version":1}\n'
+        )
+        request["reference_artifacts"]["orientation_label_sha256"] = evidence.sha256_bytes(
+            malformed_label
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            write_evidence_artifacts(root, observations, request)
+            label = root / "orientation-label.json"
+            label.write_bytes(malformed_label)
+            with self.assertRaisesRegex(evidence.EvidenceError, "orientation label"):
+                evidence.produce_attestation(
+                    request,
+                    observations,
+                    root,
+                    root / "attestation.json",
+                    self.key,
+                    evidence.LANE_REFERENCE,
+                    runner_identity(evidence.LANE_REFERENCE),
+                    machine=evidence_machine(evidence.LANE_REFERENCE),
+                )
+
+    def test_scene_quality_rejects_unbound_runner_orientation_claims(self) -> None:
+        observations = raw_observations(evidence.LANE_REFERENCE)
+        request = evidence_request()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            write_evidence_artifacts(root, observations, request)
+            observations["artifacts"].pop("orientation_metrics")
+            observations["artifacts"].pop("orientation_supervisor")
+            (root / "orientation-metrics.json").unlink()
+            (root / "orientation-supervisor.json").unlink()
+            (root / "observations.json").write_bytes(
+                evidence.canonical_json_bytes(observations) + b"\n"
+            )
+            with self.assertRaisesRegex(
+                evidence.EvidenceError,
+                "orientation.*artifacts|missing required evidence artifacts",
+            ):
+                evidence.produce_attestation(
+                    request,
+                    observations,
+                    root,
+                    root / "attestation.json",
+                    self.key,
+                    evidence.LANE_REFERENCE,
+                    runner_identity(evidence.LANE_REFERENCE),
+                    machine=evidence_machine(evidence.LANE_REFERENCE),
+                )
+
+    def test_removed_orientation_claims_are_rejected_by_closed_schemas(self) -> None:
+        observations = raw_observations(evidence.LANE_REFERENCE)
+        removed = (
+            "orientation_seconds",
+            "orientation_median_residual_degrees",
+            "orientation_p90_residual_degrees",
+            "orientation_bootstrap_p95_degrees",
+        )
+        for name in removed:
+            with self.subTest(surface="pipeline", name=name):
+                raw_pipeline = dict(observations["pipeline_metrics"])
+                raw_pipeline[name] = 0.0
+                with self.assertRaisesRegex(evidence.EvidenceError, "unknown "):
+                    evidence._pipeline_metrics(raw_pipeline)
+
+            with self.subTest(surface="orientation evidence", name=name):
+                metrics = orientation_metrics_for_observations(observations)
+                metrics[name] = 0.0
+                with self.assertRaisesRegex(evidence.EvidenceError, "unknown "):
+                    evidence.validate_orientation_metrics(metrics)
+
+        timing = json.loads(json.dumps(observations["timing"]))
+        candidate = next(
+            record for record in timing["ordinary_runs"] if record["variant"] == "candidate"
+        )
+        candidate["orientation_seconds"] = 0.0
+        with self.assertRaisesRegex(evidence.EvidenceError, "unknown "):
+            evidence._timing_metrics(
+                timing,
+                evidence.LANE_REFERENCE,
+                {"scene_quality", "suite_performance"},
+            )
+
+    def test_supervisor_orientation_rejects_swapped_run_artifacts(self) -> None:
+        observations = raw_observations(evidence.LANE_REFERENCE)
+        request = evidence_request()
+        cases = (
+            "geometry-manifest.json",
+            "candidate-images.txt",
+            "orientation-metrics.json",
+            "orientation-stdout.log",
+            "orientation-stderr.log",
+        )
+        for filename in cases:
+            with self.subTest(filename=filename), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                write_evidence_artifacts(root, observations, request)
+                first_run = next(
+                    record["run_id"]
+                    for record in observations["timing"]["ordinary_runs"]
+                    if record["variant"] == "candidate"
+                )
+                second_run = next(
+                    record["run_id"]
+                    for record in observations["timing"]["ordinary_runs"]
+                    if record["variant"] == "candidate" and record["run_id"] != first_run
+                )
+                first_path = root / "orientation-runs" / first_run / filename
+                second_path = root / "orientation-runs" / second_run / filename
+                first_bytes = first_path.read_bytes()
+                first_path.write_bytes(second_path.read_bytes())
+                second_path.write_bytes(first_bytes)
+                with self.assertRaisesRegex(
+                    evidence.EvidenceError,
+                    "orientation.*digest|orientation.*changed|orientation.*does not match",
+                ):
+                    evidence.produce_attestation(
+                        request,
+                        observations,
+                        root,
+                        root / "attestation.json",
+                        self.key,
+                        evidence.LANE_REFERENCE,
+                        runner_identity(evidence.LANE_REFERENCE),
+                        machine=evidence_machine(evidence.LANE_REFERENCE),
+                    )
+
+    def test_supervisor_orientation_rejects_a_swapped_receipt(self) -> None:
+        observations = raw_observations(evidence.LANE_REFERENCE)
+        request = evidence_request()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            write_evidence_artifacts(root, observations, request)
+            path = root / "orientation-supervisor.json"
+            receipt = json.loads(path.read_text(encoding="utf-8"))
+            receipt["runs"][0], receipt["runs"][1] = receipt["runs"][1], receipt["runs"][0]
+            path.write_bytes(evidence.canonical_json_bytes(receipt) + b"\n")
+            with self.assertRaisesRegex(
+                evidence.EvidenceError,
+                "orientation supervisor runs are not in candidate timing order",
+            ):
+                evidence.produce_attestation(
+                    request,
+                    observations,
+                    root,
+                    root / "attestation.json",
+                    self.key,
+                    evidence.LANE_REFERENCE,
+                    runner_identity(evidence.LANE_REFERENCE),
+                    machine=evidence_machine(evidence.LANE_REFERENCE),
+                )
 
     def test_requested_scale_holdouts_and_pair_schedule_are_binding(self) -> None:
         request = evidence_request(scale=250)
@@ -3610,7 +4027,7 @@ class EvidenceProtocolTests(unittest.TestCase):
         )
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            write_evidence_artifacts(root, observations)
+            write_evidence_artifacts(root, observations, request)
             with self.assertRaisesRegex(evidence.EvidenceError, "requested scale 250"):
                 evidence.produce_attestation(
                     request,
@@ -3639,6 +4056,8 @@ class EvidenceProtocolTests(unittest.TestCase):
             )["status"],
             "failed",
         )
+
+    def test_orientation_physical_up_error_is_gated(self) -> None:
         metrics = passing_metrics()
         metrics["orientation_physical_up_error_degrees"] = measured(5.001)
         self.assertEqual(
@@ -3732,6 +4151,57 @@ class EvidenceProtocolTests(unittest.TestCase):
             attestation["metrics"]["normal_photo_toolchain_bytes"],
             {"availability": "not_available", "reason": "not_measured"},
         )
+
+    def test_orientation_pipeline_claims_require_the_reference_scene_quality_lane(self) -> None:
+        observations = raw_observations(evidence.LANE_CONSTRAINED)
+        observations["pipeline_metrics"].update(
+            {
+                "orientation_status": "verified",
+                "orientation_physical_up_error_degrees": 0.75,
+                "orientation_sign_correct": True,
+            }
+        )
+        request = evidence_request(lane=evidence.LANE_CONSTRAINED)
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            write_evidence_artifacts(root, observations)
+            with self.assertRaisesRegex(
+                evidence.EvidenceError,
+                "orientation pipeline metrics require reference scene_quality evidence",
+            ):
+                evidence.produce_attestation(
+                    request,
+                    observations,
+                    root,
+                    root / "attestation.json",
+                    self.key,
+                    evidence.LANE_CONSTRAINED,
+                    runner_identity(evidence.LANE_CONSTRAINED),
+                    machine=evidence_machine(evidence.LANE_CONSTRAINED),
+                )
+
+    def test_orientation_artifacts_require_the_reference_scene_quality_lane(self) -> None:
+        observations = raw_observations(evidence.LANE_CONSTRAINED)
+        observations["artifacts"]["orientation_metrics"] = "orientation-metrics.json"
+        request = evidence_request(lane=evidence.LANE_CONSTRAINED)
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            write_evidence_artifacts(root, observations)
+            (root / "orientation-metrics.json").write_text("{}\n", encoding="utf-8")
+            with self.assertRaisesRegex(
+                evidence.EvidenceError,
+                "orientation artifacts require reference scene_quality evidence",
+            ):
+                evidence.produce_attestation(
+                    request,
+                    observations,
+                    root,
+                    root / "attestation.json",
+                    self.key,
+                    evidence.LANE_CONSTRAINED,
+                    runner_identity(evidence.LANE_CONSTRAINED),
+                    machine=evidence_machine(evidence.LANE_CONSTRAINED),
+                )
 
     def test_baseline_observations_must_match_the_signed_request(self) -> None:
         observations = raw_observations(evidence.LANE_REFERENCE)
@@ -4426,6 +4896,137 @@ class EvidenceProtocolTests(unittest.TestCase):
 
 
 class RunnerIntegrityTests(unittest.TestCase):
+    def _orientation_stage_fixture(
+        self,
+        root: Path,
+    ) -> tuple[
+        dict[str, object],
+        dict[str, object],
+        Path,
+        dict[str, object],
+        Path,
+    ]:
+        observations = raw_observations(evidence.LANE_REFERENCE)
+        request = evidence_request()
+        request_path = root / "request.json"
+        request_path.write_bytes(evidence.canonical_json_bytes(request) + b"\n")
+        for field in ("ground_truth_poses_sha256", "orientation_label_sha256"):
+            filename, content = REFERENCE_ARTIFACT_CONTENTS[field]
+            (root / filename).write_bytes(content)
+        for record in observations["timing"]["ordinary_runs"]:
+            if record["variant"] != "candidate":
+                continue
+            run_root = root / "orientation-runs" / record["run_id"]
+            run_root.mkdir(parents=True)
+            (run_root / "geometry-manifest.json").write_bytes(
+                evidence.canonical_json_bytes(
+                    {
+                        "schemaVersion": 4,
+                    }
+                )
+                + b"\n"
+            )
+            (run_root / "candidate-images.txt").write_text(
+                "# fixture candidate images\n",
+                encoding="utf-8",
+            )
+        executable = root / "orientation-driver-source"
+        executable.write_text(
+            "#!/usr/bin/python3\n"
+            "import json, pathlib, sys\n"
+            "args=sys.argv\n"
+            "def value(flag): return args[args.index(flag)+1]\n"
+            "metrics={\n"
+            "'alignment_median_residual_degrees':0.1,"
+            "'alignment_p90_residual_degrees':0.2,"
+            "'alignment_support_count':30,"
+            "'candidate_source_to_ground_truth_wxyz':[1.0,0.0,0.0,0.0],"
+            "'orientation_physical_up_error_degrees':0.75,"
+            "'orientation_sign_correct':True,"
+            "'orientation_status':'verified'}\n"
+            "pathlib.Path(value('--output')).write_text(json.dumps(metrics,sort_keys=True)+'\\n')\n",
+            encoding="utf-8",
+        )
+        executable.chmod(0o755)
+        bundle = root / "MetalSplatter_MetalSplatter.bundle"
+        bundle.mkdir()
+        (bundle / "Shaders.metal").write_text("kernel void draw() {}\n", encoding="utf-8")
+        closure = root / "renderer-closure"
+        renderer_identity = lane_runner.renderer_closure.build_closure(
+            executable,
+            bundle,
+            closure,
+            root / "renderer-identity.json",
+        )
+        request["rendering_driver_identity"] = renderer_identity
+        request_path.write_bytes(evidence.canonical_json_bytes(request) + b"\n")
+        return observations, request, request_path, renderer_identity, closure
+
+    def test_orientation_stage_invokes_the_approved_driver_for_every_candidate_run(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            observations, request, request_path, renderer_identity, closure = (
+                self._orientation_stage_fixture(root)
+            )
+            lane_runner._execute_orientation_stage(
+                artifact_root=root,
+                request=request,
+                request_path=request_path,
+                request_digest=evidence.sha256_file(request_path),
+                renderer_closure_path=closure,
+                renderer_identity=renderer_identity,
+                observations=observations,
+                commands=observations["commands"],
+                timeout_seconds=30.0,
+            )
+
+            aggregate = json.loads(
+                (root / "orientation-metrics.json").read_text(encoding="utf-8")
+            )
+            candidate_run_ids = [
+                record["run_id"]
+                for record in observations["timing"]["ordinary_runs"]
+                if record["variant"] == "candidate"
+            ]
+            self.assertEqual(
+                [run["run_id"] for run in aggregate["runs"]],
+                candidate_run_ids,
+            )
+            self.assertTrue((root / "orientation-supervisor.json").is_file())
+            for run_id in candidate_run_ids:
+                self.assertTrue(
+                    (root / "orientation-runs" / run_id / "orientation-metrics.json").is_file()
+                )
+
+    def test_orientation_stage_rejects_precreated_supervisor_output(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            observations, request, request_path, renderer_identity, closure = (
+                self._orientation_stage_fixture(root)
+            )
+            first_run_id = next(
+                record["run_id"]
+                for record in observations["timing"]["ordinary_runs"]
+                if record["variant"] == "candidate"
+            )
+            precreated = root / "orientation-runs" / first_run_id / "orientation-metrics.json"
+            precreated.write_text("runner controlled\n", encoding="utf-8")
+            with self.assertRaisesRegex(
+                lane_runner.benchmark.ConfigError,
+                "cannot pre-create supervisor-owned orientation-metrics.json",
+            ):
+                lane_runner._execute_orientation_stage(
+                    artifact_root=root,
+                    request=request,
+                    request_path=request_path,
+                    request_digest=evidence.sha256_file(request_path),
+                    renderer_closure_path=closure,
+                    renderer_identity=renderer_identity,
+                    observations=observations,
+                    commands=observations["commands"],
+                    timeout_seconds=30.0,
+                )
+
     def test_release_workflow_builds_and_distributes_the_renderer_closure(self) -> None:
         workflow = (ROOT / ".github/workflows/benchmark-release.yml").read_text(
             encoding="utf-8"

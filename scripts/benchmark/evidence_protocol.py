@@ -91,9 +91,6 @@ PIPELINE_INTEGER_METRICS = {
 PIPELINE_NUMBER_METRICS = {
     "matcher_seconds",
     "mapping_seconds",
-    "orientation_median_residual_degrees",
-    "orientation_p90_residual_degrees",
-    "orientation_bootstrap_p95_degrees",
     "orientation_physical_up_error_degrees",
 }
 PIPELINE_BOOLEAN_METRICS = {"orientation_sign_correct"}
@@ -106,6 +103,20 @@ PIPELINE_METRICS = (
     | PIPELINE_BOOLEAN_METRICS
     | set(PIPELINE_ENUM_METRICS)
 )
+ORIENTATION_EVIDENCE_FIELDS = {
+    "alignment_median_residual_degrees",
+    "alignment_p90_residual_degrees",
+    "alignment_support_count",
+    "candidate_source_to_ground_truth_wxyz",
+    "orientation_physical_up_error_degrees",
+    "orientation_sign_correct",
+    "orientation_status",
+}
+ORIENTATION_PIPELINE_FIELDS = {
+    "orientation_physical_up_error_degrees",
+    "orientation_sign_correct",
+    "orientation_status",
+}
 QUALITY_METRICS = {
     "registered_views",
     "total_views",
@@ -649,21 +660,6 @@ def _pipeline_metrics(value: Any) -> dict[str, Any]:
         else:
             result[name] = measured(item)
     orientation_status = raw["orientation_status"]
-    orientation_names = (
-        "orientation_median_residual_degrees",
-        "orientation_p90_residual_degrees",
-        "orientation_bootstrap_p95_degrees",
-    )
-    orientation_available = [raw[name] is not None for name in orientation_names]
-    if orientation_status in {"verified", "axis_aligned_sign_unverified"} and not all(
-        orientation_available
-    ):
-        raise EvidenceError(f"{orientation_status} orientation requires all residual and bootstrap evidence")
-    if orientation_status in {None, "unresolved"} and any(orientation_available) and not all(
-        orientation_available
-    ):
-        label = "unresolved" if orientation_status == "unresolved" else "unavailable"
-        raise EvidenceError(f"{label} orientation evidence must be all measured or all unavailable")
     physical_error = raw["orientation_physical_up_error_degrees"]
     sign_correct = raw["orientation_sign_correct"]
     if orientation_status == "verified":
@@ -680,6 +676,115 @@ def _pipeline_metrics(value: Any) -> dict[str, Any]:
         raise EvidenceError(
             "unresolved or unavailable orientation cannot claim labeled physical-up or sign evidence"
         )
+    return result
+
+
+def _validate_orientation_label(path: Path) -> None:
+    raw = _mapping(
+        _load_bounded_json(path, "orientation-label.json"),
+        "orientation label",
+    )
+    _exact_keys(
+        raw,
+        {"schema_version", "coordinate_space", "physical_up"},
+        "orientation label",
+    )
+    if raw["schema_version"] != 1 or raw["coordinate_space"] != "ground_truth_world":
+        raise EvidenceError(
+            "orientation label must use schema 1 ground-truth-world coordinates"
+        )
+    physical_up = _mapping(raw["physical_up"], "orientation label physical_up")
+    _exact_keys(physical_up, {"x", "y", "z"}, "orientation label physical_up")
+    components: list[float] = []
+    for name in ("x", "y", "z"):
+        value = physical_up[name]
+        if (
+            isinstance(value, bool)
+            or not isinstance(value, (int, float))
+            or not math.isfinite(value)
+        ):
+            raise EvidenceError(
+                f"orientation label physical_up.{name} must be finite"
+            )
+        components.append(float(value))
+    if math.sqrt(sum(value * value for value in components)) <= 1e-12:
+        raise EvidenceError("orientation label physical_up must be nonzero")
+
+
+def validate_orientation_metrics(value: Any, label: str = "orientation metrics") -> dict[str, Any]:
+    raw = _mapping(value, label)
+    _exact_keys(raw, ORIENTATION_EVIDENCE_FIELDS, label)
+    status = raw["orientation_status"]
+    if status not in PIPELINE_ENUM_METRICS["orientation_status"]:
+        raise EvidenceError(f"{label}.orientation_status is invalid")
+
+    result = dict(raw)
+    support = raw["alignment_support_count"]
+    if type(support) is not int or support < 8:
+        raise EvidenceError(f"{label}.alignment_support_count must be at least 8")
+    for name in (
+        "alignment_median_residual_degrees",
+        "alignment_p90_residual_degrees",
+    ):
+        result[name] = _nonnegative_number(raw[name], f"{label}.{name}")
+    if result["alignment_p90_residual_degrees"] < result[
+        "alignment_median_residual_degrees"
+    ]:
+        raise EvidenceError(f"{label} alignment p90 residual cannot be below its median")
+
+    quaternion = raw["candidate_source_to_ground_truth_wxyz"]
+    if (
+        not isinstance(quaternion, list)
+        or len(quaternion) != 4
+        or any(
+            isinstance(component, bool)
+            or not isinstance(component, (int, float))
+            or not math.isfinite(component)
+            for component in quaternion
+        )
+    ):
+        raise EvidenceError(f"{label}.candidate_source_to_ground_truth_wxyz is invalid")
+    normalized_quaternion = [float(component) for component in quaternion]
+    if abs(math.sqrt(sum(component * component for component in normalized_quaternion)) - 1) > 1e-6:
+        raise EvidenceError(f"{label} source-to-ground-truth quaternion must be normalized")
+    first_nonzero = next(
+        (component for component in normalized_quaternion if component != 0),
+        0.0,
+    )
+    if first_nonzero < 0:
+        raise EvidenceError(f"{label} source-to-ground-truth quaternion must be sign-canonical")
+    result["candidate_source_to_ground_truth_wxyz"] = normalized_quaternion
+
+    physical_error = raw["orientation_physical_up_error_degrees"]
+    result["orientation_physical_up_error_degrees"] = (
+        None
+        if physical_error is None
+        else _nonnegative_number(
+            physical_error,
+            f"{label}.orientation_physical_up_error_degrees",
+        )
+    )
+    sign_correct = raw["orientation_sign_correct"]
+    if sign_correct is not None and type(sign_correct) is not bool:
+        raise EvidenceError(f"{label}.orientation_sign_correct must be null or boolean")
+    if status == "verified":
+        if result["orientation_physical_up_error_degrees"] is None or sign_correct is None:
+            raise EvidenceError(f"{label} verified orientation lacks directed up evidence")
+    elif status == "axis_aligned_sign_unverified":
+        if result["orientation_physical_up_error_degrees"] is None or sign_correct is not None:
+            raise EvidenceError(
+                f"{label} axis_aligned_sign_unverified orientation requires physical-up "
+                "error without a sign claim"
+            )
+    elif result["orientation_physical_up_error_degrees"] is not None or sign_correct is not None:
+        raise EvidenceError(f"{label} unresolved orientation cannot claim physical up")
+    angle_fields = (
+        "alignment_median_residual_degrees",
+        "alignment_p90_residual_degrees",
+        "orientation_physical_up_error_degrees",
+    )
+    if any(result[name] is not None and result[name] > 180 for name in angle_fields):
+        raise EvidenceError(f"{label} angular evidence cannot exceed 180 degrees")
     return result
 
 
@@ -750,6 +855,17 @@ def _positive_number(value: Any, label: str) -> float:
     return float(value)
 
 
+def _nonnegative_number(value: Any, label: str) -> float:
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, (int, float))
+        or not math.isfinite(value)
+        or value < 0
+    ):
+        raise EvidenceError(f"{label} must be nonnegative and finite")
+    return float(value)
+
+
 def _validate_timing_sequence(
     value: Any,
     label: str,
@@ -773,9 +889,9 @@ def _validate_timing_sequence(
         baseline_variant: [],
         candidate_variant: [],
     }
-    expected_fields = {"run_id", "variant", "discarded", *measurement_fields}
     for index, (raw, expected_variant) in enumerate(zip(value, expected_variants)):
         record = _mapping(raw, f"{label}[{index}]")
+        expected_fields = {"run_id", "variant", "discarded", *measurement_fields}
         _exact_keys(record, expected_fields, f"{label}[{index}]")
         if record["variant"] != expected_variant:
             raise EvidenceError(f"{label} must alternate baseline and candidate runs")
@@ -1331,6 +1447,324 @@ def _validate_render_supervisor(
         "/Users/" in argument or "/home/" in argument for argument in argv
     ):
         raise EvidenceError("render_supervisor argv is not bound to the protected rendering process")
+
+
+def _single_link_artifact_descriptor(
+    path: Path,
+    root: Path,
+    label: str,
+) -> dict[str, Any]:
+    descriptor = _artifact_descriptor(path, root)
+    try:
+        metadata = path.lstat()
+    except OSError as error:
+        raise EvidenceError(f"{label} is missing") from error
+    if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1:
+        raise EvidenceError(f"{label} must be a single-link regular file")
+    return descriptor
+
+
+def _orientation_candidate_records(
+    observations: Mapping[str, Any],
+) -> tuple[list[Mapping[str, Any]], list[str]]:
+    timing = _mapping(observations.get("timing"), "observations.timing")
+    ordinary_runs = timing.get("ordinary_runs")
+    if not isinstance(ordinary_runs, list):
+        raise EvidenceError("orientation evidence requires ordinary timing runs")
+    records: list[Mapping[str, Any]] = []
+    run_ids: list[str] = []
+    for index, raw_record in enumerate(ordinary_runs):
+        record = _mapping(raw_record, f"observations.timing.ordinary_runs[{index}]")
+        if record.get("variant") != "candidate":
+            continue
+        run_id = _token(record.get("run_id"), f"ordinary candidate run {index} id")
+        if run_id in run_ids:
+            raise EvidenceError("orientation candidate timing run ids must be unique")
+        run_ids.append(run_id)
+        records.append(record)
+    if not records:
+        raise EvidenceError("orientation evidence requires candidate ordinary runs")
+    return records, run_ids
+
+
+def _orientation_scoring_run_id(
+    observations: Mapping[str, Any],
+    candidate_run_ids: list[str],
+) -> str:
+    commands = observations.get("commands")
+    if not isinstance(commands, list):
+        raise EvidenceError("orientation evidence requires execution receipts")
+    published = [
+        command
+        for command in commands
+        if isinstance(command, Mapping)
+        and command.get("variant") == "candidate"
+        and command.get("published_output") is True
+    ]
+    if len(published) != 1 or published[0].get("run_id") not in candidate_run_ids:
+        raise EvidenceError(
+            "orientation evidence requires one published candidate ordinary run"
+        )
+    return str(published[0]["run_id"])
+
+
+def _validate_orientation_supervisor(
+    supervisor_path: Path,
+    metrics_index_path: Path,
+    artifact_root: Path,
+    request: Mapping[str, Any],
+    observations: Mapping[str, Any],
+    renderer_identity: Mapping[str, Any],
+) -> dict[str, dict[str, Any]]:
+    _single_link_artifact_descriptor(
+        supervisor_path,
+        artifact_root,
+        "orientation supervisor receipt",
+    )
+    supervisor = _mapping(
+        _load_bounded_json(supervisor_path, "orientation-supervisor.json"),
+        "orientation supervisor",
+    )
+    _exact_keys(
+        supervisor,
+        {
+            "candidate_git_commit",
+            "ground_truth_poses_sha256",
+            "lane",
+            "metrics_index_sha256",
+            "orientation_label_sha256",
+            "renderer_closure_sha256",
+            "renderer_executable_sha256",
+            "request_sha256",
+            "runs",
+            "scale",
+            "scene_id",
+            "schema_version",
+            "scoring_run_id",
+        },
+        "orientation supervisor",
+    )
+    binding = request["binding"]
+    expected = {
+        "candidate_git_commit": binding["git_commit"],
+        "ground_truth_poses_sha256": request["reference_artifacts"][
+            "ground_truth_poses_sha256"
+        ],
+        "lane": binding["lane"],
+        "orientation_label_sha256": request["reference_artifacts"][
+            "orientation_label_sha256"
+        ],
+        "renderer_closure_sha256": renderer_identity["sha256"],
+        "renderer_executable_sha256": renderer_identity["executable_sha256"],
+        "request_sha256": sha256_bytes(canonical_json_bytes(request) + b"\n"),
+        "scale": binding["scale"],
+        "scene_id": binding["scene_id"],
+        "schema_version": 1,
+    }
+    for field, expected_value in expected.items():
+        if supervisor[field] != expected_value:
+            raise EvidenceError(
+                f"orientation supervisor {field} does not match the protected request"
+            )
+    for filename, digest_field, label in (
+        (
+            "ground-truth-poses.json",
+            "ground_truth_poses_sha256",
+            "orientation ground-truth poses",
+        ),
+        (
+            "orientation-label.json",
+            "orientation_label_sha256",
+            "orientation physical-up label",
+        ),
+    ):
+        descriptor = _single_link_artifact_descriptor(
+            artifact_root / filename,
+            artifact_root,
+            label,
+        )
+        if descriptor["sha256"] != supervisor[digest_field]:
+            raise EvidenceError(f"{label} digest does not match")
+
+    metrics_index_descriptor = _single_link_artifact_descriptor(
+        metrics_index_path,
+        artifact_root,
+        "orientation metrics index",
+    )
+    if supervisor["metrics_index_sha256"] != metrics_index_descriptor["sha256"]:
+        raise EvidenceError("orientation supervisor metrics index digest does not match")
+    aggregate = _mapping(
+        _load_bounded_json(metrics_index_path, "orientation-metrics.json"),
+        "orientation metrics index",
+    )
+    _exact_keys(
+        aggregate,
+        {"runs", "schema_version", "scoring_run_id"},
+        "orientation metrics index",
+    )
+    if aggregate["schema_version"] != 1:
+        raise EvidenceError("orientation metrics index schema is invalid")
+
+    candidate_records, candidate_run_ids = _orientation_candidate_records(observations)
+    scoring_run_id = _orientation_scoring_run_id(observations, candidate_run_ids)
+    if (
+        supervisor["scoring_run_id"] != scoring_run_id
+        or aggregate["scoring_run_id"] != scoring_run_id
+    ):
+        raise EvidenceError("orientation scoring run does not match the published output")
+    raw_receipts = supervisor["runs"]
+    aggregate_runs = aggregate["runs"]
+    if (
+        not isinstance(raw_receipts, list)
+        or not isinstance(aggregate_runs, list)
+        or len(raw_receipts) != len(candidate_records)
+        or len(aggregate_runs) != len(candidate_records)
+    ):
+        raise EvidenceError("orientation supervisor does not cover every candidate run")
+
+    receipt_fields = {
+        "actual_argv_sha256",
+        "argv",
+        "candidate_images_path",
+        "candidate_images_sha256",
+        "ended_monotonic_seconds",
+        "exit_code",
+        "geometry_manifest_path",
+        "geometry_manifest_sha256",
+        "metrics_path",
+        "metrics_sha256",
+        "run_id",
+        "started_monotonic_seconds",
+        "stderr_path",
+        "stderr_sha256",
+        "stdout_path",
+        "stdout_sha256",
+        "timed_out",
+    }
+    dynamic_descriptors: dict[str, dict[str, Any]] = {}
+    scoring_metrics: dict[str, Any] | None = None
+    for index, (raw_receipt, raw_aggregate) in enumerate(
+        zip(raw_receipts, aggregate_runs, strict=True)
+    ):
+        run_id = candidate_run_ids[index]
+        receipt = _mapping(raw_receipt, f"orientation supervisor runs[{index}]")
+        _exact_keys(receipt, receipt_fields, f"orientation supervisor runs[{index}]")
+        if receipt["run_id"] != run_id:
+            raise EvidenceError("orientation supervisor runs are not in candidate timing order")
+        aggregate_run = _mapping(
+            raw_aggregate,
+            f"orientation metrics index runs[{index}]",
+        )
+        _exact_keys(
+            aggregate_run,
+            {"metrics", "metrics_path", "run_id"},
+            f"orientation metrics index runs[{index}]",
+        )
+        if aggregate_run["run_id"] != run_id:
+            raise EvidenceError("orientation metrics runs are not in candidate timing order")
+
+        relative_root = PurePosixPath("orientation-runs") / run_id
+        expected_paths = {
+            "geometry_manifest_path": relative_root / "geometry-manifest.json",
+            "candidate_images_path": relative_root / "candidate-images.txt",
+            "metrics_path": relative_root / "orientation-metrics.json",
+            "stdout_path": relative_root / "orientation-stdout.log",
+            "stderr_path": relative_root / "orientation-stderr.log",
+        }
+        descriptor_names = {
+            "geometry_manifest_path": "geometry_manifest",
+            "candidate_images_path": "candidate_images",
+            "metrics_path": "metrics",
+            "stdout_path": "stdout",
+            "stderr_path": "stderr",
+        }
+        for path_field, expected_relative in expected_paths.items():
+            if receipt[path_field] != expected_relative.as_posix():
+                raise EvidenceError(
+                    f"orientation supervisor {path_field} is not canonical for {run_id}"
+                )
+            descriptor_name = descriptor_names[path_field]
+            descriptor = _single_link_artifact_descriptor(
+                artifact_root / Path(*expected_relative.parts),
+                artifact_root,
+                f"orientation {descriptor_name} for {run_id}",
+            )
+            digest_field = path_field.removesuffix("_path") + "_sha256"
+            if descriptor["sha256"] != receipt[digest_field]:
+                raise EvidenceError(
+                    f"orientation {descriptor_name} digest does not match for {run_id}"
+                )
+            dynamic_descriptors[f"orientation_{descriptor_name}_{index:02d}"] = descriptor
+
+        if aggregate_run["metrics_path"] != receipt["metrics_path"]:
+            raise EvidenceError("orientation metrics index path does not match its receipt")
+        metrics_path = artifact_root / Path(*expected_paths["metrics_path"].parts)
+        metrics = validate_orientation_metrics(
+            _load_bounded_json(metrics_path, f"orientation metrics for {run_id}"),
+            f"orientation metrics for {run_id}",
+        )
+        if metrics["alignment_support_count"] > binding["scale"]:
+            raise EvidenceError(
+                f"orientation alignment support for {run_id} exceeds the selected scale"
+            )
+        if aggregate_run["metrics"] != metrics:
+            raise EvidenceError("orientation metrics index does not match the driver output")
+        started = receipt["started_monotonic_seconds"]
+        ended = receipt["ended_monotonic_seconds"]
+        if (
+            isinstance(started, bool)
+            or isinstance(ended, bool)
+            or not isinstance(started, (int, float))
+            or not isinstance(ended, (int, float))
+            or not math.isfinite(started)
+            or not math.isfinite(ended)
+            or started < 0
+            or ended <= started
+            or receipt["exit_code"] != 0
+            or receipt["timed_out"] is not False
+        ):
+            raise EvidenceError(f"orientation supervisor execution for {run_id} is invalid")
+        _digest(
+            receipt["actual_argv_sha256"],
+            f"orientation supervisor actual argv digest for {run_id}",
+        )
+        expected_argv = [
+            "approved-orientation-driver",
+            f"renderer-closure://{renderer_identity['sha256']}",
+            f"renderer-executable://{renderer_identity['executable_sha256']}",
+            "extract-orientation",
+            "--geometry-manifest",
+            f"evidence://{expected_paths['geometry_manifest_path'].as_posix()}",
+            "--candidate-images",
+            f"evidence://{expected_paths['candidate_images_path'].as_posix()}",
+            "--ground-truth-poses",
+            "evidence://ground-truth-poses.json",
+            "--ground-truth-poses-sha256",
+            request["reference_artifacts"]["ground_truth_poses_sha256"],
+            "--orientation-label",
+            "evidence://orientation-label.json",
+            "--orientation-label-sha256",
+            request["reference_artifacts"]["orientation_label_sha256"],
+            "--output",
+            f"evidence://{expected_paths['metrics_path'].as_posix()}",
+        ]
+        if receipt["argv"] != expected_argv:
+            raise EvidenceError(f"orientation supervisor argv for {run_id} is invalid")
+        if run_id == scoring_run_id:
+            scoring_metrics = metrics
+
+    if scoring_metrics is None:
+        raise EvidenceError("orientation scoring metrics are missing")
+    raw_pipeline = _mapping(
+        observations.get("pipeline_metrics"),
+        "observations.pipeline_metrics",
+    )
+    for name in ORIENTATION_PIPELINE_FIELDS:
+        if raw_pipeline.get(name) != scoring_metrics[name]:
+            raise EvidenceError(
+                f"supervisor orientation {name} does not match pipeline metrics"
+            )
+    return dynamic_descriptors
 
 
 def _memory_metrics(
@@ -1996,11 +2430,21 @@ def derive_metrics(
     if not valid_outcome:
         return metrics
     raw_pipeline = _mapping(observations.get("pipeline_metrics"), "observations.pipeline_metrics")
+    orientation_required = lane == LANE_REFERENCE and "scene_quality" in scopes
+    if not orientation_required:
+        unexpected_orientation = sorted(
+            name
+            for name in ORIENTATION_PIPELINE_FIELDS
+            if raw_pipeline.get(name) is not None
+        )
+        if unexpected_orientation:
+            raise EvidenceError(
+                "orientation pipeline metrics require reference scene_quality evidence: "
+                + ", ".join(unexpected_orientation)
+            )
     metrics.update(_pipeline_metrics(raw_pipeline))
     if (
-        lane == LANE_REFERENCE
-        and valid_outcome
-        and "scene_quality" in scopes
+        orientation_required
         and raw_pipeline.get("orientation_status") != expected_orientation_status
     ):
         raise EvidenceError(
@@ -4062,6 +4506,20 @@ def produce_attestation(
         raise EvidenceError("observations.baseline does not match the signed request")
 
     raw_artifacts = _mapping(observations.get("artifacts"), "observations.artifacts")
+    orientation_required = (
+        lane == LANE_REFERENCE
+        and request["expected_outcome"]["kind"] == "valid"
+        and "scene_quality" in scopes
+    )
+    if not orientation_required:
+        unexpected_orientation_artifacts = sorted(
+            name for name in raw_artifacts if name.startswith("orientation_")
+        )
+        if unexpected_orientation_artifacts:
+            raise EvidenceError(
+                "orientation artifacts require reference scene_quality evidence: "
+                + ", ".join(unexpected_orientation_artifacts)
+            )
     canonical_artifacts = {
         "command_log": "command.jsonl",
         "supervisor_run": "supervisor-run.json",
@@ -4080,6 +4538,8 @@ def produce_attestation(
         "accurate_rendering_reference": "accurate-rendering-reference.json",
         "paired_baseline_rendering_reference": "paired-baseline-rendering-reference.json",
         "orientation_label": "orientation-label.json",
+        "orientation_metrics": "orientation-metrics.json",
+        "orientation_supervisor": "orientation-supervisor.json",
         "render_job": "render-job.json",
         "rendering_manifest": "rendering-manifest.json",
         "render_supervisor": "render-supervisor.json",
@@ -4134,6 +4594,8 @@ def produce_attestation(
         required.update(
             {
                 "pair_list",
+                "orientation_metrics",
+                "orientation_supervisor",
                 "render_job",
                 "rendering_manifest",
                 "render_supervisor",
@@ -4166,6 +4628,22 @@ def produce_attestation(
                 raise EvidenceError(
                     f"{artifact_name} does not match the pinned reference artifact digest"
                 )
+        _validate_orientation_label(
+            artifact_root / descriptors["orientation_label"]["path"]
+        )
+        orientation_descriptors = _validate_orientation_supervisor(
+            artifact_root / descriptors["orientation_supervisor"]["path"],
+            artifact_root / descriptors["orientation_metrics"]["path"],
+            artifact_root,
+            request,
+            observations,
+            request["rendering_driver_identity"],
+        )
+        for name, descriptor in orientation_descriptors.items():
+            existing = descriptors.get(name)
+            if existing is not None and existing != descriptor:
+                raise EvidenceError(f"orientation artifact descriptor conflicts with {name}")
+            descriptors[name] = descriptor
         _validate_pair_list(
             artifact_root / descriptors["pair_list"]["path"],
             artifact_root / descriptors["selection_manifest"]["path"],

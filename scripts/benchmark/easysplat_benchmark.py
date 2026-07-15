@@ -228,9 +228,6 @@ NONNEGATIVE_NUMBER_METRICS = {
     "training_seconds",
     "matcher_seconds",
     "mapping_seconds",
-    "orientation_median_residual_degrees",
-    "orientation_p90_residual_degrees",
-    "orientation_bootstrap_p95_degrees",
     "orientation_physical_up_error_degrees",
     "matching_speedup",
     "mapping_speedup",
@@ -343,9 +340,6 @@ APPROVED_THRESHOLDS: dict[str, Any] = {
         "translation_rpe_delta_percentage_points_max": 2.0,
     },
     "orientation": {
-        "median_residual_degrees_max": 3.0,
-        "p90_residual_degrees_max": 8.0,
-        "bootstrap_p95_degrees_max": 5.0,
         "physical_up_error_degrees_max": 5.0,
     },
     "balanced_rendering": {
@@ -967,9 +961,6 @@ def evaluate_gates(
         }:
             required_metrics.update(
                 {
-                    "orientation_median_residual_degrees",
-                    "orientation_p90_residual_degrees",
-                    "orientation_bootstrap_p95_degrees",
                     "orientation_physical_up_error_degrees",
                 }
             )
@@ -1053,18 +1044,6 @@ def evaluate_gates(
             failures.append("rasterization dropped intersections")
         minimum("output_splat_count", 1)
         if values["orientation_status"] in {"verified", "axis_aligned_sign_unverified"}:
-            maximum(
-                "orientation_median_residual_degrees",
-                thresholds["orientation"]["median_residual_degrees_max"],
-            )
-            maximum(
-                "orientation_p90_residual_degrees",
-                thresholds["orientation"]["p90_residual_degrees_max"],
-            )
-            maximum(
-                "orientation_bootstrap_p95_degrees",
-                thresholds["orientation"]["bootstrap_p95_degrees_max"],
-            )
             maximum(
                 "orientation_physical_up_error_degrees",
                 thresholds["orientation"]["physical_up_error_degrees_max"],

@@ -37,6 +37,7 @@ _PROCESS_GROUP_TERMINATION_GRACE_SECONDS = 5.0
 _PROCESS_GROUP_DRAIN_SECONDS = 0.25
 _PROCESS_TREE_SCAN_SECONDS = 0.01
 _PROCESS_TOKEN_ENVIRONMENT_KEY = "EASYSPLAT_INTERNAL_BENCHMARK_PROCESS_TOKEN"
+_ORIENTATION_EXTRACTION_TIMEOUT_SECONDS = 60.0
 
 
 def _load(path: Path, label: str) -> Any:
@@ -730,6 +731,344 @@ def _rendering_required(request: Mapping[str, Any], lane: str) -> bool:
     )
 
 
+def _orientation_required(request: Mapping[str, Any], lane: str) -> bool:
+    return _rendering_required(request, lane)
+
+
+def _require_single_link_artifact(
+    path: Path,
+    artifact_root: Path,
+    label: str,
+) -> Path:
+    try:
+        relative = path.relative_to(artifact_root)
+    except ValueError as error:
+        raise benchmark.ConfigError(f"{label} escapes the benchmark artifact root") from error
+    cursor = artifact_root
+    for part in relative.parts[:-1]:
+        cursor /= part
+        try:
+            metadata = cursor.lstat()
+        except OSError as error:
+            raise benchmark.ConfigError(f"{label} has a missing parent directory") from error
+        if not stat.S_ISDIR(metadata.st_mode) or cursor.is_symlink():
+            raise benchmark.ConfigError(f"{label} has an unsafe parent directory")
+    try:
+        metadata = path.lstat()
+        resolved = path.resolve(strict=True)
+        root = artifact_root.resolve(strict=True)
+    except OSError as error:
+        raise benchmark.ConfigError(f"{label} is missing") from error
+    if (
+        not stat.S_ISREG(metadata.st_mode)
+        or metadata.st_nlink != 1
+        or path.is_symlink()
+        or (resolved != root and root not in resolved.parents)
+    ):
+        raise benchmark.ConfigError(f"{label} must be a contained single-link regular file")
+    return path
+
+
+def _orientation_candidate_records(
+    observations: Mapping[str, Any],
+) -> list[Mapping[str, Any]]:
+    timing = benchmark._require_mapping(observations.get("timing"), "observations timing")
+    ordinary = timing.get("ordinary_runs")
+    expected_variants = ["candidate"] + ["baseline", "candidate"] * 3
+    if not isinstance(ordinary, list) or len(ordinary) != len(expected_variants):
+        raise benchmark.ConfigError(
+            "orientation extraction requires the bounded ordinary timing sequence"
+        )
+    records: list[Mapping[str, Any]] = []
+    run_ids: set[str] = set()
+    for index, (raw_record, expected_variant) in enumerate(
+        zip(ordinary, expected_variants, strict=True)
+    ):
+        record = benchmark._require_mapping(
+            raw_record,
+            f"ordinary timing run {index}",
+        )
+        if (
+            record.get("variant") != expected_variant
+            or record.get("discarded") is not (index == 0)
+        ):
+            raise benchmark.ConfigError(
+                "orientation extraction requires the canonical ordinary timing sequence"
+            )
+        if expected_variant != "candidate":
+            continue
+        run_id = benchmark._require_safe_token(record.get("run_id"), "candidate run id")
+        if run_id in run_ids:
+            raise benchmark.ConfigError("candidate orientation timing record is invalid")
+        run_ids.add(run_id)
+        records.append(record)
+    if not records:
+        raise benchmark.ConfigError("orientation extraction requires candidate timing runs")
+    return records
+
+
+def _published_orientation_run_id(
+    commands: Sequence[Mapping[str, Any]],
+    candidate_run_ids: set[str],
+) -> str:
+    published = [
+        command
+        for command in commands
+        if command.get("variant") == "candidate"
+        and command.get("published_output") is True
+    ]
+    if len(published) != 1 or published[0].get("run_id") not in candidate_run_ids:
+        raise benchmark.ConfigError(
+            "orientation extraction requires one published candidate ordinary run"
+        )
+    return str(published[0]["run_id"])
+
+
+def _write_exclusive_json(path: Path, value: Mapping[str, Any], label: str) -> None:
+    try:
+        with path.open("xb") as handle:
+            handle.write(evidence.canonical_json_bytes(value) + b"\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+    except FileExistsError as error:
+        raise benchmark.ConfigError(
+            f"measurement runner cannot pre-create supervisor-owned {label}"
+        ) from error
+
+
+def _execute_orientation_stage(
+    *,
+    artifact_root: Path,
+    request: Mapping[str, Any],
+    request_path: Path,
+    request_digest: str,
+    renderer_closure_path: Path,
+    renderer_identity: Mapping[str, Any],
+    observations: Mapping[str, Any],
+    commands: Sequence[Mapping[str, Any]],
+    timeout_seconds: float,
+) -> dict[str, Any]:
+    metrics_index_path = artifact_root / "orientation-metrics.json"
+    supervisor_path = artifact_root / "orientation-supervisor.json"
+    for path, label in (
+        (metrics_index_path, "orientation-metrics.json"),
+        (supervisor_path, "orientation-supervisor.json"),
+    ):
+        if path.exists() or path.is_symlink():
+            raise benchmark.ConfigError(
+                f"measurement runner cannot pre-create supervisor-owned {label}"
+            )
+
+    ground_truth_path = _require_single_link_artifact(
+        artifact_root / "ground-truth-poses.json",
+        artifact_root,
+        "ground-truth-poses.json",
+    )
+    orientation_label_path = _require_single_link_artifact(
+        artifact_root / "orientation-label.json",
+        artifact_root,
+        "orientation-label.json",
+    )
+    ground_truth_digest = evidence.sha256_file(ground_truth_path)
+    label_digest = evidence.sha256_file(orientation_label_path)
+    if ground_truth_digest != request["reference_artifacts"]["ground_truth_poses_sha256"]:
+        raise benchmark.ConfigError("ground-truth poses do not match the protected request")
+    if label_digest != request["reference_artifacts"]["orientation_label_sha256"]:
+        raise benchmark.ConfigError("orientation label does not match the protected request")
+
+    candidate_records = _orientation_candidate_records(observations)
+    candidate_run_ids = {str(record["run_id"]) for record in candidate_records}
+    scoring_run_id = _published_orientation_run_id(commands, candidate_run_ids)
+    receipts: list[dict[str, Any]] = []
+    aggregate_runs: list[dict[str, Any]] = []
+    orientation_timeout = min(timeout_seconds, _ORIENTATION_EXTRACTION_TIMEOUT_SECONDS)
+    for record in candidate_records:
+        run_id = str(record["run_id"])
+        relative_root = Path("orientation-runs") / run_id
+        run_root = artifact_root / relative_root
+        geometry_manifest = _require_single_link_artifact(
+            run_root / "geometry-manifest.json",
+            artifact_root,
+            f"geometry manifest for {run_id}",
+        )
+        candidate_images = _require_single_link_artifact(
+            run_root / "candidate-images.txt",
+            artifact_root,
+            f"candidate images for {run_id}",
+        )
+        metrics_path = run_root / "orientation-metrics.json"
+        stdout_path = run_root / "orientation-stdout.log"
+        stderr_path = run_root / "orientation-stderr.log"
+        for path, label in (
+            (metrics_path, "orientation-metrics.json"),
+            (stdout_path, "orientation-stdout.log"),
+            (stderr_path, "orientation-stderr.log"),
+        ):
+            if path.exists() or path.is_symlink():
+                raise benchmark.ConfigError(
+                    f"measurement runner cannot pre-create supervisor-owned {label}"
+                )
+
+        verified = _verify_renderer_closure(
+            renderer_closure_path,
+            renderer_identity,
+            f"immediately before orientation extraction for {run_id}",
+        )
+        immutable_digests = {
+            geometry_manifest: evidence.sha256_file(geometry_manifest),
+            candidate_images: evidence.sha256_file(candidate_images),
+            ground_truth_path: ground_truth_digest,
+            orientation_label_path: label_digest,
+        }
+        relative_geometry = (relative_root / "geometry-manifest.json").as_posix()
+        relative_images = (relative_root / "candidate-images.txt").as_posix()
+        relative_metrics = (relative_root / "orientation-metrics.json").as_posix()
+        redacted_command = [
+            "approved-orientation-driver",
+            f"renderer-closure://{renderer_identity['sha256']}",
+            f"renderer-executable://{renderer_identity['executable_sha256']}",
+            "extract-orientation",
+            "--geometry-manifest",
+            f"evidence://{relative_geometry}",
+            "--candidate-images",
+            f"evidence://{relative_images}",
+            "--ground-truth-poses",
+            "evidence://ground-truth-poses.json",
+            "--ground-truth-poses-sha256",
+            ground_truth_digest,
+            "--orientation-label",
+            "evidence://orientation-label.json",
+            "--orientation-label-sha256",
+            label_digest,
+            "--output",
+            f"evidence://{relative_metrics}",
+        ]
+        command = [
+            str(verified.executable),
+            "extract-orientation",
+            "--geometry-manifest",
+            str(geometry_manifest),
+            "--candidate-images",
+            str(candidate_images),
+            "--ground-truth-poses",
+            str(ground_truth_path),
+            "--ground-truth-poses-sha256",
+            ground_truth_digest,
+            "--orientation-label",
+            str(orientation_label_path),
+            "--orientation-label-sha256",
+            label_digest,
+            "--output",
+            str(metrics_path),
+        ]
+        completed: subprocess.CompletedProcess[bytes] | None = None
+        launch_error: OSError | None = None
+        timed_out = False
+        started_monotonic = time.monotonic()
+        try:
+            with stdout_path.open("xb") as stdout_handle, stderr_path.open("xb") as stderr_handle:
+                completed, timed_out = _run_measurement_process(
+                    command,
+                    stdout_handle,
+                    stderr_handle,
+                    _isolated_environment(artifact_root, f"orientation-{len(receipts):02d}"),
+                    orientation_timeout,
+                )
+        except OSError as error:
+            launch_error = error
+        finally:
+            ended_monotonic = time.monotonic()
+            _verify_renderer_closure(
+                renderer_closure_path,
+                renderer_identity,
+                f"after orientation extraction for {run_id}",
+            )
+            for path, digest in immutable_digests.items():
+                _verify_file_digest(path, digest, f"orientation input {path.name}")
+            _verify_file_digest(request_path, request_digest, "evidence request")
+        if completed is None:
+            detail = launch_error.strerror if launch_error is not None else "unknown launch failure"
+            raise benchmark.ConfigError(
+                f"orientation driver could not start for {run_id}: {detail}"
+            )
+        if timed_out:
+            raise benchmark.ConfigError(
+                f"orientation driver timed out for {run_id} after {orientation_timeout:g} seconds"
+            )
+        if completed.returncode != 0:
+            raise benchmark.ConfigError(
+                f"orientation driver failed for {run_id} with exit {completed.returncode}"
+            )
+        _require_single_link_artifact(
+            metrics_path,
+            artifact_root,
+            f"orientation metrics for {run_id}",
+        )
+        raw_metrics = _load(metrics_path, f"orientation metrics for {run_id}")
+        try:
+            metrics = evidence.validate_orientation_metrics(
+                raw_metrics,
+                f"orientation metrics for {run_id}",
+            )
+        except evidence.EvidenceError as error:
+            raise benchmark.ConfigError(str(error)) from error
+        metrics_digest = evidence.sha256_file(metrics_path)
+        aggregate_runs.append(
+            {
+                "metrics": metrics,
+                "metrics_path": relative_metrics,
+                "run_id": run_id,
+            }
+        )
+        receipts.append(
+            {
+                "actual_argv_sha256": evidence.sha256_bytes(
+                    evidence.canonical_json_bytes(command)
+                ),
+                "argv": redacted_command,
+                "candidate_images_path": relative_images,
+                "candidate_images_sha256": immutable_digests[candidate_images],
+                "ended_monotonic_seconds": ended_monotonic,
+                "exit_code": completed.returncode,
+                "geometry_manifest_path": relative_geometry,
+                "geometry_manifest_sha256": immutable_digests[geometry_manifest],
+                "metrics_path": relative_metrics,
+                "metrics_sha256": metrics_digest,
+                "run_id": run_id,
+                "started_monotonic_seconds": started_monotonic,
+                "stderr_path": (relative_root / "orientation-stderr.log").as_posix(),
+                "stderr_sha256": evidence.sha256_file(stderr_path),
+                "stdout_path": (relative_root / "orientation-stdout.log").as_posix(),
+                "stdout_sha256": evidence.sha256_file(stdout_path),
+                "timed_out": False,
+            }
+        )
+
+    aggregate = {
+        "runs": aggregate_runs,
+        "schema_version": 1,
+        "scoring_run_id": scoring_run_id,
+    }
+    _write_exclusive_json(metrics_index_path, aggregate, "orientation-metrics.json")
+    supervisor = {
+        "candidate_git_commit": request["binding"]["git_commit"],
+        "ground_truth_poses_sha256": ground_truth_digest,
+        "lane": request["binding"]["lane"],
+        "metrics_index_sha256": evidence.sha256_file(metrics_index_path),
+        "orientation_label_sha256": label_digest,
+        "renderer_closure_sha256": renderer_identity["sha256"],
+        "renderer_executable_sha256": renderer_identity["executable_sha256"],
+        "request_sha256": request_digest,
+        "runs": receipts,
+        "scale": request["binding"]["scale"],
+        "scene_id": request["binding"]["scene_id"],
+        "schema_version": 1,
+        "scoring_run_id": scoring_run_id,
+    }
+    _write_exclusive_json(supervisor_path, supervisor, "orientation-supervisor.json")
+    return supervisor
+
+
 def _validate_render_job(
     job_path: Path,
     artifact_root: Path,
@@ -1301,6 +1640,21 @@ def run_lane(
         ):
             raise benchmark.ConfigError("measurement runner did not emit execution receipts")
 
+        oriented = _orientation_required(request, lane)
+        if oriented:
+            _execute_orientation_stage(
+                artifact_root=artifact_root,
+                request=request,
+                request_path=request_path,
+                request_digest=request_digest,
+                renderer_closure_path=renderer_closure_path,
+                renderer_identity=renderer_identity,
+                observations=observations,
+                commands=raw_receipts,
+                timeout_seconds=timeout_seconds,
+            )
+            _verify_candidate_checkout(index["git_commit"])
+
         rendered = _rendering_required(request, lane)
         if rendered:
             _execute_rendering_stage(
@@ -1323,6 +1677,13 @@ def run_lane(
         if not isinstance(raw_artifacts, dict):
             raise benchmark.ConfigError("measurement runner artifacts must be an object")
         raw_artifacts["supervisor_run"] = "supervisor-run.json"
+        if oriented:
+            raw_artifacts.update(
+                {
+                    "orientation_metrics": "orientation-metrics.json",
+                    "orientation_supervisor": "orientation-supervisor.json",
+                }
+            )
         if rendered:
             raw_artifacts.update(
                 {

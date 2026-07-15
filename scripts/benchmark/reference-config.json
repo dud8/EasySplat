@@ -58,9 +58,6 @@
       "translation_rpe_delta_percentage_points_max": 2.0
     },
     "orientation": {
-      "median_residual_degrees_max": 3.0,
-      "p90_residual_degrees_max": 8.0,
-      "bootstrap_p95_degrees_max": 5.0,
       "physical_up_error_degrees_max": 5.0
     },
     "balanced_rendering": {
