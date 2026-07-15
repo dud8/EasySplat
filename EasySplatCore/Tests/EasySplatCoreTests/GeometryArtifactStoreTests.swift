@@ -1,9 +1,95 @@
 import CryptoKit
+import Darwin
 import Foundation
 import XCTest
 @testable import EasySplatCore
 
 final class GeometryArtifactStoreTests: XCTestCase {
+    func testValidateAcceptsCurrentTrustedCanonicalSnapshot() throws {
+        let root = try TestFileBuilder.makeTempDir()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let paths = ProjectPaths(root: root)
+        try paths.ensureDirectories()
+        let fixture = try writeCanonicalModel(at: paths)
+        let model = paths.colmapSparseURL.appendingPathComponent("0", isDirectory: true)
+        let measured = try ColmapResidualAnalyzer.analyze(modelDirectory: model)
+        let snapshot = try GeometryModelSnapshot.capture(in: model)
+
+        XCTAssertNoThrow(
+            try GeometryArtifactStore.validate(
+                makeArtifact(fixture: fixture),
+                projectPaths: paths,
+                measuredResiduals: measured,
+                verifiedSourceSnapshot: snapshot
+            )
+        )
+    }
+
+    func testValidateRejectsInvalidTimingEvidence() throws {
+        let root = try TestFileBuilder.makeTempDir()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let paths = ProjectPaths(root: root)
+        try paths.ensureDirectories()
+        let fixture = try writeCanonicalModel(at: paths)
+
+        for timings in [
+            [:],
+            ["  ": 1],
+            ["sfmMapping": -0.01],
+            ["sfmMapping": Double.nan],
+            ["sfmMapping": 1],
+            ["sfmMapping": 1, "orientation_seconds": 0.01],
+        ] {
+            var artifact = makeArtifact(fixture: fixture)
+            artifact.timings = timings
+            XCTAssertThrowsError(
+                try GeometryArtifactStore.validate(artifact, projectPaths: paths)
+            ) { error in
+                XCTAssertEqual(
+                    error as? GeometryArtifactStore.Error,
+                    .invalidTimings
+                )
+            }
+        }
+    }
+
+    func testLoadRejectsBaselineSchemaThreeBeforeDecodingLegacyOrientation() throws {
+        let baselineSchemaVersion = GeometryArtifact.currentSchemaVersion - 1
+        XCTAssertEqual(baselineSchemaVersion, 3)
+
+        let root = try TestFileBuilder.makeTempDir()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let paths = ProjectPaths(root: root)
+        try paths.ensureDirectories()
+        let fixture = try writeCanonicalModel(at: paths)
+        var object = try XCTUnwrap(
+            JSONSerialization.jsonObject(
+                with: JSONEncoder().encode(makeArtifact(fixture: fixture))
+            ) as? [String: Any]
+        )
+        object["schemaVersion"] = baselineSchemaVersion
+        var orientation = try XCTUnwrap(
+            object["canonicalOrientation"] as? [String: Any]
+        )
+        orientation["status"] = "notEvaluated"
+        object["canonicalOrientation"] = orientation
+        try JSONSerialization.data(withJSONObject: object).write(
+            to: paths.geometryManifestURL
+        )
+
+        XCTAssertThrowsError(
+            try GeometryArtifactStore.load(
+                from: paths.geometryManifestURL,
+                projectPaths: paths
+            )
+        ) { error in
+            XCTAssertEqual(
+                error as? GeometryArtifactStore.Error,
+                .invalidSchema(baselineSchemaVersion)
+            )
+        }
+    }
+
     func testPersistsRelativeMeasuredArtifactToSidecarAndMetadata() throws {
         let root = try TestFileBuilder.makeTempDir()
         defer { try? FileManager.default.removeItem(at: root) }
@@ -43,7 +129,7 @@ final class GeometryArtifactStoreTests: XCTestCase {
         )
         XCTAssertEqual(
             (sidecar["canonicalOrientation"] as? [String: Any])?["status"] as? String,
-            "notEvaluated"
+            "unresolved"
         )
     }
 
@@ -181,9 +267,9 @@ final class GeometryArtifactStoreTests: XCTestCase {
         let fixture = try writeCanonicalModel(at: paths)
 
         var escaping = makeArtifact(fixture: fixture)
-        escaping.canonicalModelPath = "../outside"
+        escaping.sourceModelPath = "../outside"
         XCTAssertThrowsError(try GeometryArtifactStore.validate(escaping, projectPaths: paths)) { error in
-            XCTAssertEqual(error as? GeometryArtifactStore.Error, .invalidCanonicalPath)
+            XCTAssertEqual(error as? GeometryArtifactStore.Error, .invalidSourceModelPath)
         }
 
         let alternate = try paths.resolveProjectRelativePath("SfM/alternate")
@@ -192,11 +278,11 @@ final class GeometryArtifactStoreTests: XCTestCase {
             to: alternate
         )
         var inBundleButNotCanonical = makeArtifact(fixture: fixture)
-        inBundleButNotCanonical.canonicalModelPath = "SfM/alternate"
+        inBundleButNotCanonical.sourceModelPath = "SfM/alternate"
         XCTAssertThrowsError(
             try GeometryArtifactStore.validate(inBundleButNotCanonical, projectPaths: paths)
         ) { error in
-            XCTAssertEqual(error as? GeometryArtifactStore.Error, .invalidCanonicalPath)
+            XCTAssertEqual(error as? GeometryArtifactStore.Error, .invalidSourceModelPath)
         }
 
         var placeholder = makeArtifact(fixture: fixture)
@@ -234,17 +320,70 @@ final class GeometryArtifactStoreTests: XCTestCase {
         }
     }
 
+    func testRejectsHardLinkedCanonicalModelFile() throws {
+        let root = try TestFileBuilder.makeTempDir()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let paths = ProjectPaths(root: root)
+        try paths.ensureDirectories()
+        let fixture = try writeCanonicalModel(at: paths)
+        let artifact = makeArtifact(fixture: fixture)
+        let imagesURL = paths.colmapSparseURL.appendingPathComponent("0/images.txt")
+        let externalURL = root.appendingPathComponent("hardlinked-images.txt")
+        try FileManager.default.moveItem(at: imagesURL, to: externalURL)
+        XCTAssertEqual(Darwin.link(externalURL.path, imagesURL.path), 0)
+
+        XCTAssertThrowsError(try GeometryArtifactStore.validate(artifact, projectPaths: paths)) { error in
+            XCTAssertEqual(
+                error as? GeometryArtifactStore.Error,
+                .modelHashMismatch("images.txt")
+            )
+        }
+    }
+
+    func testSelectedFramesDigestRejectsHardLinkedFrame() throws {
+        let root = try TestFileBuilder.makeTempDir()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let paths = ProjectPaths(root: root)
+        try paths.ensureDirectories()
+        _ = try writeCanonicalModel(at: paths)
+        let frameURL = paths.framesSelectedURL.appendingPathComponent("frame_000001.jpg")
+        let externalURL = root.appendingPathComponent("hardlinked-frame.jpg")
+        try FileManager.default.moveItem(at: frameURL, to: externalURL)
+        XCTAssertEqual(Darwin.link(externalURL.path, frameURL.path), 0)
+
+        XCTAssertThrowsError(
+            try GeometryArtifactStore.selectedFramesDigest(
+                orderedImageNames: ["frame_000001.jpg"],
+                projectPaths: paths
+            )
+        )
+    }
+
+    func testInputDigestRejectsHardLinkedOriginal() throws {
+        let root = try TestFileBuilder.makeTempDir()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let paths = ProjectPaths(root: root)
+        try paths.ensureDirectories()
+        _ = try writeCanonicalModel(at: paths)
+        let inputURL = paths.originalsURL.appendingPathComponent("source.jpg")
+        let externalURL = root.appendingPathComponent("hardlinked-input.jpg")
+        try FileManager.default.moveItem(at: inputURL, to: externalURL)
+        XCTAssertEqual(Darwin.link(externalURL.path, inputURL.path), 0)
+
+        XCTAssertThrowsError(try GeometryArtifactStore.inputDigest(projectPaths: paths))
+    }
+
     func testRejectsLearnedInitializerChangedAfterGeometryAcceptance() throws {
         let root = try TestFileBuilder.makeTempDir()
         defer { try? FileManager.default.removeItem(at: root) }
         let paths = ProjectPaths(root: root)
         try paths.ensureDirectories()
         let fixture = try writeCanonicalModel(at: paths, observationCount: 20)
+        let learnedURL = paths.colmapSeedModelURL.appendingPathComponent("learned_points3D.txt")
         try FileManager.default.createDirectory(
             at: paths.colmapSeedModelURL,
             withIntermediateDirectories: true
         )
-        let learnedURL = paths.colmapSeedModelURL.appendingPathComponent("learned_points3D.txt")
         try "1 1 2 3 10 20 30 -1\n".write(
             to: learnedURL,
             atomically: true,
@@ -314,7 +453,7 @@ final class GeometryArtifactStoreTests: XCTestCase {
         }
     }
 
-    func testSchemaThreeRequiresCompleteToolchainProvenance() throws {
+    func testCurrentSchemaRequiresCompleteToolchainProvenance() throws {
         let root = try TestFileBuilder.makeTempDir()
         defer { try? FileManager.default.removeItem(at: root) }
         let paths = ProjectPaths(root: root)
@@ -351,11 +490,11 @@ final class GeometryArtifactStoreTests: XCTestCase {
                 payloadSHA256: String(repeating: "c", count: 64)
             )
         )
+        let learnedURL = paths.colmapSeedModelURL.appendingPathComponent("learned_points3D.txt")
         try FileManager.default.createDirectory(
             at: paths.colmapSeedModelURL,
             withIntermediateDirectories: true
         )
-        let learnedURL = paths.colmapSeedModelURL.appendingPathComponent("learned_points3D.txt")
         try "1 1 2 3 10 20 30 -1\n".write(
             to: learnedURL,
             atomically: true,
@@ -389,7 +528,9 @@ final class GeometryArtifactStoreTests: XCTestCase {
         defer { try? FileManager.default.removeItem(at: root) }
         let paths = ProjectPaths(root: root)
         try paths.ensureDirectories()
-        try Data(#"{"schemaVersion":4,"futurePayload":true}"#.utf8)
+        let futureSchemaVersion = GeometryArtifact.currentSchemaVersion + 1
+        let payload = #"{"schemaVersion":\#(futureSchemaVersion),"futurePayload":true}"#
+        try Data(payload.utf8)
             .write(to: paths.geometryManifestURL)
 
         XCTAssertThrowsError(
@@ -398,7 +539,10 @@ final class GeometryArtifactStoreTests: XCTestCase {
                 projectPaths: paths
             )
         ) { error in
-            XCTAssertEqual(error as? GeometryArtifactStore.Error, .invalidSchema(4))
+            XCTAssertEqual(
+                error as? GeometryArtifactStore.Error,
+                .invalidSchema(futureSchemaVersion)
+            )
         }
     }
 
@@ -547,14 +691,8 @@ final class GeometryArtifactStoreTests: XCTestCase {
         }
 
         var fabricatedOrientation = makeArtifact(fixture: fixture)
-        fabricatedOrientation.canonicalOrientation = CanonicalOrientationArtifact(
-            status: .notEvaluated,
-            method: nil,
-            sourceToCanonicalQuaternionWXYZ: CanonicalQuaternionWXYZ(w: 1, x: 0, y: 0, z: 0),
-            evidence: nil,
-            canonicalOpeningViewDirection: nil,
-            isViewOnlyFlipActive: false
-        )
+        fabricatedOrientation.canonicalOrientation.sourceToCanonicalQuaternionWXYZ =
+            CanonicalQuaternionWXYZ(w: 1, x: 0, y: 0, z: 0)
         XCTAssertThrowsError(
             try GeometryArtifactStore.validate(fabricatedOrientation, projectPaths: paths)
         ) { error in
@@ -580,7 +718,7 @@ final class GeometryArtifactStoreTests: XCTestCase {
             selectedFramesDigest: fixture.selectedFramesDigest,
             orderedImageNames: ["frame_000001.jpg"],
             orderedImageTimestamps: [nil],
-            canonicalModelPath: "SfM/colmap/sparse/0",
+            sourceModelPath: "SfM/colmap/sparse/0",
             poseConvention: "world-to-camera",
             quaternionOrder: "wxyz",
             handedness: "right-handed",
@@ -594,7 +732,7 @@ final class GeometryArtifactStoreTests: XCTestCase {
             residualProvenance: "colmap-text-tracks-v1",
             medianPixelResidual: 0,
             p90PixelResidual: 0,
-            timings: ["sfmMapping": 1.5],
+            timings: ["sfmMapping": 1.5, "orientation_estimation_seconds": 0.001],
             peakMemoryBytes: 1_024,
             modelHashes: fixture.modelHashes,
             fallbackReason: nil,
@@ -613,6 +751,9 @@ final class GeometryArtifactStoreTests: XCTestCase {
                 mappingAttemptNumber: 1,
                 bundleAdjustmentCycleCount: 1,
                 fallbackReason: nil
+            ),
+            canonicalOrientation: .unresolved(
+                openingViewDirection: CanonicalDirection(x: 0, y: 0, z: 1)
             )
         )
     }

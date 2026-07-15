@@ -215,7 +215,6 @@ public struct PairGraphArtifact: Codable, Sendable, Equatable {
 }
 
 public enum CanonicalOrientationStatus: String, Codable, Sendable, Equatable {
-    case notEvaluated
     case verified
     case axisAlignedSignUnverified
     case unresolved
@@ -266,6 +265,7 @@ public struct CanonicalOrientationEvidence: Codable, Sendable, Equatable {
     public var signAgreement: Double?
     public var bootstrapP95VariationDegrees: Double
     public var trajectoryPlaneAgreementDegrees: Double?
+    public var trajectoryLineConcentration: Double?
     public var cameraUpConcentration: Double?
     public var cameraUpMedianSpreadDegrees: Double?
     public var cameraUpP90SpreadDegrees: Double?
@@ -282,6 +282,7 @@ public struct CanonicalOrientationEvidence: Codable, Sendable, Equatable {
         signAgreement: Double?,
         bootstrapP95VariationDegrees: Double,
         trajectoryPlaneAgreementDegrees: Double?,
+        trajectoryLineConcentration: Double? = nil,
         cameraUpConcentration: Double? = nil,
         cameraUpMedianSpreadDegrees: Double? = nil,
         cameraUpP90SpreadDegrees: Double? = nil
@@ -297,6 +298,7 @@ public struct CanonicalOrientationEvidence: Codable, Sendable, Equatable {
         self.signAgreement = signAgreement
         self.bootstrapP95VariationDegrees = bootstrapP95VariationDegrees
         self.trajectoryPlaneAgreementDegrees = trajectoryPlaneAgreementDegrees
+        self.trajectoryLineConcentration = trajectoryLineConcentration
         self.cameraUpConcentration = cameraUpConcentration
         self.cameraUpMedianSpreadDegrees = cameraUpMedianSpreadDegrees
         self.cameraUpP90SpreadDegrees = cameraUpP90SpreadDegrees
@@ -309,6 +311,7 @@ public struct CanonicalOrientationArtifact: Codable, Sendable, Equatable {
     /// Proper source-to-canonical rotation. Component order is fixed by the type name.
     public var sourceToCanonicalQuaternionWXYZ: CanonicalQuaternionWXYZ?
     public var evidence: CanonicalOrientationEvidence?
+    /// Camera-forward direction from the opening eye position toward the scene.
     public var canonicalOpeningViewDirection: CanonicalDirection?
     public var isViewOnlyFlipActive: Bool
 
@@ -328,18 +331,20 @@ public struct CanonicalOrientationArtifact: Codable, Sendable, Equatable {
         self.isViewOnlyFlipActive = isViewOnlyFlipActive
     }
 
-    public static let notEvaluated = CanonicalOrientationArtifact(
-        status: .notEvaluated,
-        method: nil,
-        sourceToCanonicalQuaternionWXYZ: nil,
-        evidence: nil,
-        canonicalOpeningViewDirection: nil,
-        isViewOnlyFlipActive: false
-    )
+    public static func unresolved(openingViewDirection: CanonicalDirection) -> Self {
+        Self(
+            status: .unresolved,
+            method: nil,
+            sourceToCanonicalQuaternionWXYZ: nil,
+            evidence: nil,
+            canonicalOpeningViewDirection: openingViewDirection,
+            isViewOnlyFlipActive: false
+        )
+    }
 }
 
 public struct GeometryArtifact: Codable, Sendable, Equatable {
-    public static let currentSchemaVersion = 3
+    public static let currentSchemaVersion = 4
 
     public var schemaVersion: Int
     public var solverVersion: String
@@ -349,7 +354,9 @@ public struct GeometryArtifact: Codable, Sendable, Equatable {
     public var selectedFramesDigest: String
     public var orderedImageNames: [String]
     public var orderedImageTimestamps: [Double?]
-    public var canonicalModelPath: String
+    /// Accepted source-frame COLMAP model. `canonicalOrientation` is applied by
+    /// the trainer without rewriting this measured geometry.
+    public var sourceModelPath: String
     /// Describes whether persisted poses transform world-to-camera or camera-to-world.
     public var poseConvention: String
     /// Component order used by every persisted quaternion, such as `wxyz`.
@@ -383,7 +390,7 @@ public struct GeometryArtifact: Codable, Sendable, Equatable {
         selectedFramesDigest: String,
         orderedImageNames: [String],
         orderedImageTimestamps: [Double?],
-        canonicalModelPath: String,
+        sourceModelPath: String,
         poseConvention: String,
         quaternionOrder: String,
         handedness: String,
@@ -404,7 +411,7 @@ public struct GeometryArtifact: Codable, Sendable, Equatable {
         provenance: GeometryProvenance,
         pairGraph: PairGraphArtifact,
         learnedPointInitializer: LearnedPointInitializerArtifact? = nil,
-        canonicalOrientation: CanonicalOrientationArtifact = .notEvaluated
+        canonicalOrientation: CanonicalOrientationArtifact
     ) {
         self.schemaVersion = schemaVersion
         self.solverVersion = solverVersion
@@ -414,7 +421,7 @@ public struct GeometryArtifact: Codable, Sendable, Equatable {
         self.selectedFramesDigest = selectedFramesDigest
         self.orderedImageNames = orderedImageNames
         self.orderedImageTimestamps = orderedImageTimestamps
-        self.canonicalModelPath = canonicalModelPath
+        self.sourceModelPath = sourceModelPath
         self.poseConvention = poseConvention
         self.quaternionOrder = quaternionOrder
         self.handedness = handedness

@@ -326,7 +326,19 @@ final class PipelineIntegrationTests: XCTestCase {
         XCTAssertEqual(geometry.residualProvenance, "colmap-text-tracks-v1")
         XCTAssertEqual(geometry.medianPixelResidual, 0, accuracy: 0.000_001)
         XCTAssertEqual(geometry.p90PixelResidual, 0, accuracy: 0.000_001)
-        XCTAssertGreaterThan(try XCTUnwrap(geometry.timings[PipelineStage.sfmMapping.rawValue]), 0)
+        let artifactMappingDuration = try XCTUnwrap(
+            geometry.timings[PipelineStage.sfmMapping.rawValue]
+        )
+        let finalMappingDuration = try XCTUnwrap(
+            finalMetadata.stageTimings?.first(where: { $0.stage == .sfmMapping })?.durationSeconds
+        )
+        XCTAssertGreaterThan(artifactMappingDuration, 0)
+        XCTAssertGreaterThan(finalMappingDuration, artifactMappingDuration)
+        XCTAssertGreaterThan(
+            try XCTUnwrap(geometry.timings["orientation_estimation_seconds"]),
+            0
+        )
+        XCTAssertNil(geometry.timings["orientation_seconds"])
         XCTAssertEqual(geometry.schemaVersion, GeometryArtifact.currentSchemaVersion)
         XCTAssertEqual(geometry.modelVersion, "none")
         XCTAssertEqual(geometry.provenance.toolchainVersion, "Toolchain")
@@ -341,6 +353,11 @@ final class PipelineIntegrationTests: XCTestCase {
         XCTAssertEqual(geometry.pairGraph.mappingAttemptNumber, 1)
         XCTAssertEqual(geometry.pairGraph.bundleAdjustmentCycleCount, 2)
         XCTAssertNil(geometry.pairGraph.fallbackReason)
+        XCTAssertEqual(geometry.canonicalOrientation.status, .unresolved)
+        XCTAssertFalse(
+            try FileManager.default.contentsOfDirectory(atPath: paths.colmapSparseURL.path)
+                .contains(where: { $0.hasPrefix(".orientation-candidate-") })
+        )
         XCTAssertEqual(finalMetadata.geometryArtifact, geometry)
         XCTAssertNotNil(events.stageLog(containing: "SfM backend: COLMAP mapper."))
         XCTAssertNil(events.stageLog(containing: "global mapper"))
@@ -1914,12 +1931,16 @@ final class PipelineIntegrationTests: XCTestCase {
             try Data([1]).write(to: sparse.appendingPathComponent(name))
         }
         try persistGeometryArtifactFixture(metadata: &metadata, paths: paths)
+        let identitySparse = try makeMsplatIdentitySparseFixture(
+            from: sparse,
+            under: paths.trainingURL
+        )
         let datasetIdentity = try MsplatDatasetIdentity.compute(
             imageFiles: try FileManager.default.contentsOfDirectory(
                 at: paths.framesSelectedURL,
                 includingPropertiesForKeys: nil
             ),
-            sparseDirectory: sparse
+            sparseDirectory: identitySparse
         )
         let memoryBudgetBytes = automaticTrainingMemoryBudgetBytes
         let receipt = try makeMsplatCheckpointFixture(
@@ -2101,12 +2122,16 @@ final class PipelineIntegrationTests: XCTestCase {
         for name in ["cameras.bin", "images.bin", "points3D.bin"] {
             try Data([1]).write(to: sparse.appendingPathComponent(name))
         }
+        let identitySparse = try makeMsplatIdentitySparseFixture(
+            from: sparse,
+            under: paths.trainingURL
+        )
         let datasetIdentity = try MsplatDatasetIdentity.compute(
             imageFiles: try FileManager.default.contentsOfDirectory(
                 at: paths.framesSelectedURL,
                 includingPropertiesForKeys: nil
             ),
-            sparseDirectory: sparse
+            sparseDirectory: identitySparse
         )
 
         let memoryBudgetBytes = automaticTrainingMemoryBudgetBytes
@@ -2323,6 +2348,7 @@ final class PipelineIntegrationTests: XCTestCase {
             .init(path: toolchain.colmap.path, argsPrefix: ["feature_extractor"], result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""), onRun: { args in
                 XCTAssertEqual(self.value(for: "--ImageReader.single_camera", in: args), "0")
                 XCTAssertEqual(self.value(for: "--ImageReader.camera_model", in: args), "SIMPLE_RADIAL")
+                try? self.writeFeatureDatabase(for: args)
             }),
             .init(path: toolchain.colmap.path, argsPrefix: ["matches_importer"], result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""), onRun: nil),
             .init(path: toolchain.colmap.path, argsPrefix: ["point_triangulator"], result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""), onRun: { args in
@@ -2537,7 +2563,9 @@ final class PipelineIntegrationTests: XCTestCase {
             .init(path: toolchain.da3.sfmTool.path, argsPrefix: ["--images"], result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""), onRun: { args in
                 try? self.writeDa3RunArtifacts(for: args)
             }),
-            .init(path: toolchain.colmap.path, argsPrefix: ["feature_extractor"], result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""), onRun: nil),
+            .init(path: toolchain.colmap.path, argsPrefix: ["feature_extractor"], result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""), onRun: { args in
+                try? self.writeFeatureDatabase(for: args)
+            }),
             .init(path: toolchain.colmap.path, argsPrefix: ["matches_importer"], result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""), onRun: { args in
                 guard let path = self.value(for: "--match_list_path", in: args),
                       let pairs = try? String(contentsOfFile: path, encoding: .utf8) else {
@@ -2605,6 +2633,92 @@ final class PipelineIntegrationTests: XCTestCase {
         XCTAssertNil(pairGraph.fallbackReason)
     }
 
+    func testDa3CancellationBeforeTriangulationDoesNotLaunchColmap() async throws {
+        let temp = makeTempRoot()
+        let projectURL = temp.appendingPathComponent(
+            "Da3CancelledBeforeTriangulation.easysplatproj",
+            isDirectory: true
+        )
+        let sourcePhotos = temp.appendingPathComponent("SourcePhotos", isDirectory: true)
+        try FileManager.default.createDirectory(at: sourcePhotos, withIntermediateDirectories: true)
+        for index in 0..<2 {
+            try writeTestImage(
+                url: sourcePhotos.appendingPathComponent("img\(index).jpg"),
+                value: UInt8(index)
+            )
+        }
+        let paths = ProjectPaths(root: projectURL)
+        try paths.ensureDirectories()
+        try ProjectMetadataStore.save(
+            ProjectMetadata(
+                title: "DA3 cancellation",
+                input: .photos(folder: sourcePhotos.path),
+                requestedRunOptions: RequestedRunOptions(
+                    capturePath: .orbit,
+                    detailProfile: .fast
+                )
+            ),
+            to: paths.metadataURL
+        )
+
+        let toolchain = try makeToolchain(root: temp, createDa3Files: true)
+        let seedRunner = MockSubprocessRunner(scripts: [
+            .init(
+                path: toolchain.da3.sfmTool.path,
+                argsPrefix: ["--images"],
+                result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""),
+                onRun: { args in try? self.writeDa3RunArtifacts(for: args) }
+            ),
+            .init(
+                path: toolchain.colmap.path,
+                argsPrefix: ["feature_extractor"],
+                result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""),
+                onRun: { args in try? self.writeFeatureDatabase(for: args) }
+            ),
+            .init(
+                path: toolchain.colmap.path,
+                argsPrefix: ["matches_importer"],
+                result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""),
+                onRun: { args in try? self.writeVerifiedPairResults(for: args) }
+            ),
+        ])
+        let seedPipeline = PipelineRunner(
+            projectURL: projectURL,
+            config: makePipelineConfig(
+                toolchain: toolchain,
+                candidateRoute: .da3,
+                skipTraining: true,
+                stopAfterStage: .sfmMatching
+            ),
+            tooling: .init(runner: seedRunner)
+        )
+        try await seedPipeline.run { _ in }
+
+        let resumeRunner = MockSubprocessRunner(scripts: [])
+        let resumedPipeline = PipelineRunner(
+            projectURL: projectURL,
+            config: makePipelineConfig(
+                toolchain: toolchain,
+                candidateRoute: .da3,
+                skipTraining: true
+            ),
+            tooling: .init(
+                runner: resumeRunner,
+                checkCancellation: { throw CancellationError() }
+            )
+        )
+        let events = PipelineEventSink()
+
+        await XCTAssertThrowsErrorAsync({
+            try await resumedPipeline.run(resumeFrom: .sfmMatching) { events.append($0) }
+        }, errorHandler: { error in
+            XCTAssertTrue(error is CancellationError, "Unexpected error: \(error)")
+        })
+
+        XCTAssertTrue(events.didStart(.sfmMapping))
+        XCTAssertTrue(resumeRunner.calls.isEmpty)
+    }
+
     func testDa3RefinementFaissCrashRetriesExactWithoutReextractingFeatures() async throws {
         let temp = makeTempRoot()
         let projectURL = temp.appendingPathComponent("Da3FaissRecovery.easysplatproj", isDirectory: true)
@@ -2643,9 +2757,9 @@ final class PipelineIntegrationTests: XCTestCase {
                 path: toolchain.colmap.path,
                 argsPrefix: ["feature_extractor"],
                 result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""),
-                onRun: { _ in
+                onRun: { args in
                     do {
-                        try self.writeMatchableColmapDatabase(at: paths.colmapDatabaseURL)
+                        try self.writeFeatureDatabase(for: args)
                     } catch {
                         XCTFail("Could not create COLMAP database fixture: \(error)")
                     }
@@ -2670,8 +2784,8 @@ final class PipelineIntegrationTests: XCTestCase {
                 result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""),
                 onRun: { args in
                     XCTAssertEqual(self.value(for: "--SiftMatching.cpu_brute_force_matcher", in: args), "1")
-                    XCTAssertEqual(try? self.databaseRowCount("descriptors", at: paths.colmapDatabaseURL), 2)
-                    XCTAssertEqual(try? self.databaseRowCount("keypoints", at: paths.colmapDatabaseURL), 2)
+                    XCTAssertEqual(try? self.databaseRowCount("descriptors", at: paths.colmapDatabaseURL), 29)
+                    XCTAssertEqual(try? self.databaseRowCount("keypoints", at: paths.colmapDatabaseURL), 29)
                     XCTAssertEqual(try? self.databaseRowCount("matches", at: paths.colmapDatabaseURL), 0)
                     XCTAssertEqual(try? self.databaseRowCount("two_view_geometries", at: paths.colmapDatabaseURL), 0)
                 }
@@ -2796,7 +2910,11 @@ final class PipelineIntegrationTests: XCTestCase {
         try await seedPipeline.run { _ in }
 
         try? FileManager.default.removeItem(at: paths.colmapDatabaseURL)
-        try writeMatchableColmapDatabase(at: paths.colmapDatabaseURL)
+        try writeFeatureDatabase(for: [
+            "--database_path", paths.colmapDatabaseURL.path,
+            "--image_path", paths.framesSelectedURL.path,
+        ])
+        try writePartialMatchRows(at: paths.colmapDatabaseURL)
         try markMatchingAsInterrupted(paths: paths)
         XCTAssertEqual(try databaseRowCount("matches", at: paths.colmapDatabaseURL), 1)
         XCTAssertEqual(
@@ -3500,7 +3618,7 @@ final class PipelineIntegrationTests: XCTestCase {
             ),
             orderedImageNames: imageNames,
             orderedImageTimestamps: Array(repeating: nil, count: imageNames.count),
-            canonicalModelPath: "SfM/colmap/sparse/0",
+            sourceModelPath: "SfM/colmap/sparse/0",
             poseConvention: "world-to-camera",
             quaternionOrder: "wxyz",
             handedness: "right-handed",
@@ -3514,7 +3632,10 @@ final class PipelineIntegrationTests: XCTestCase {
             residualProvenance: residuals.provenance,
             medianPixelResidual: residuals.medianPixelResidual,
             p90PixelResidual: residuals.p90PixelResidual,
-            timings: [PipelineStage.sfmMapping.rawValue: 1],
+            timings: [
+                PipelineStage.sfmMapping.rawValue: 1,
+                "orientation_estimation_seconds": 0.001,
+            ],
             peakMemoryBytes: 1,
             modelHashes: modelHashes,
             fallbackReason: nil,
@@ -3533,6 +3654,9 @@ final class PipelineIntegrationTests: XCTestCase {
                 mappingAttemptNumber: 1,
                 bundleAdjustmentCycleCount: 1,
                 fallbackReason: nil
+            ),
+            canonicalOrientation: .unresolved(
+                openingViewDirection: CanonicalDirection(x: 0, y: 0, z: 1)
             )
         )
         try GeometryArtifactStore.persist(
@@ -3619,29 +3743,16 @@ final class PipelineIntegrationTests: XCTestCase {
         ])
     }
 
-    private func writeMatchableColmapDatabase(at databaseURL: URL) throws {
-        try FileManager.default.createDirectory(
-            at: databaseURL.deletingLastPathComponent(),
-            withIntermediateDirectories: true
-        )
+    private func writePartialMatchRows(at databaseURL: URL) throws {
         var database: OpaquePointer?
         defer { sqlite3_close(database) }
         guard sqlite3_open(databaseURL.path, &database) == SQLITE_OK, let database else {
             throw NSError(domain: "PipelineIntegrationTests", code: 1)
         }
         let sql = """
-        CREATE TABLE cameras(camera_id INTEGER PRIMARY KEY);
-        CREATE TABLE images(image_id INTEGER PRIMARY KEY);
-        CREATE TABLE keypoints(image_id INTEGER PRIMARY KEY, rows INTEGER);
-        CREATE TABLE descriptors(image_id INTEGER PRIMARY KEY, rows INTEGER);
-        CREATE TABLE matches(pair_id INTEGER PRIMARY KEY, rows INTEGER);
-        CREATE TABLE two_view_geometries(pair_id INTEGER PRIMARY KEY, rows INTEGER);
-        INSERT INTO cameras VALUES (1);
-        INSERT INTO images VALUES (1), (2);
-        INSERT INTO keypoints VALUES (1, 1), (2, 1);
-        INSERT INTO descriptors VALUES (1, 1), (2, 1);
-        INSERT INTO matches VALUES (2147483649, 1);
-        INSERT INTO two_view_geometries VALUES (2147483649, 1);
+        INSERT INTO matches(pair_id, rows, cols, data) VALUES (2147483649, 1, 2, X'0000');
+        INSERT INTO two_view_geometries(pair_id, rows, cols, data)
+            VALUES (2147483649, 1, 2, X'0000');
         """
         var errorMessage: UnsafeMutablePointer<Int8>?
         guard sqlite3_exec(database, sql, nil, nil, &errorMessage) == SQLITE_OK else {
@@ -3924,6 +4035,29 @@ final class PipelineIntegrationTests: XCTestCase {
         )
     }
 
+    private func makeMsplatIdentitySparseFixture(
+        from sourceSparse: URL,
+        under root: URL
+    ) throws -> URL {
+        let sparse = root
+            .appendingPathComponent("identity-fixtures", isDirectory: true)
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(at: sparse, withIntermediateDirectories: true)
+        for name in ["cameras.bin", "images.bin", "points3D.bin"] {
+            try FileManager.default.copyItem(
+                at: sourceSparse.appendingPathComponent(name),
+                to: sparse.appendingPathComponent(name)
+            )
+        }
+        try MsplatOrientationOverlay.write(
+            canonicalOrientation: .unresolved(
+                openingViewDirection: CanonicalDirection(x: 0, y: 0, z: 1)
+            ),
+            to: sparse
+        )
+        return sparse
+    }
+
     private func makeTempRoot() -> URL {
         let temp = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
         addTeardownBlock {
@@ -4029,6 +4163,15 @@ private final class PipelineEventSink: @unchecked Sendable {
                 return nil
             }
             return fraction
+        }
+    }
+
+    func didStart(_ stage: PipelineStage) -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return events.contains { event in
+            guard case .stageStarted(let eventStage) = event else { return false }
+            return eventStage == stage
         }
     }
 }

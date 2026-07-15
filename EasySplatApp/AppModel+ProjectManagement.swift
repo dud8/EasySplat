@@ -490,7 +490,7 @@ extension AppModel {
         }
     }
 
-    /// Leaves room for selected frames, canonical geometry, checkpoints, and output.
+    /// Leaves room for selected frames, accepted geometry, checkpoints, and output.
     static let recommendedFreeSpaceBytes: Int64 = 8 * 1024 * 1024 * 1024
 
     static let notesAutoSaveDelay: TimeInterval = 0.5

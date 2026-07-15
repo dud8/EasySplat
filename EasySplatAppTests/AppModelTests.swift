@@ -2079,9 +2079,24 @@ final class AppModelTests: XCTestCase {
             lastError: "capture failed",
             withOutput: false
         )
+        let baselineFormat = """
+        {
+          "formatVersion": \(ProjectMetadataStore.supportedFormatVersion - 1),
+          "geometryArtifact": {
+            "schemaVersion": \(GeometryArtifact.currentSchemaVersion - 1),
+            "canonicalOrientation": {"status": "notEvaluated"}
+          }
+        }
+        """
+        let futureFormat = """
+        {
+          "formatVersion": \(ProjectMetadataStore.supportedFormatVersion + 1),
+          "renamedField": 42
+        }
+        """
         let skipped = try [
-            makeSkippedProject(at: base, name: "Old", metadata: #"{"formatVersion":2}"#),
-            makeSkippedProject(at: base, name: "Future", metadata: #"{"formatVersion":4,"renamedField":42}"#),
+            makeSkippedProject(at: base, name: "Baseline", metadata: baselineFormat),
+            makeSkippedProject(at: base, name: "Future", metadata: futureFormat),
             makeSkippedProject(at: base, name: "Corrupt", metadata: "{not-json")
         ]
         let fileBundle = base.appendingPathComponent("NotADirectory.easysplatproj")
@@ -2110,9 +2125,21 @@ final class AppModelTests: XCTestCase {
             lastError: "capture failed",
             withOutput: false
         )
+        let baselineFormat = """
+        {
+          "formatVersion": \(ProjectMetadataStore.supportedFormatVersion - 1),
+          "geometryArtifact": {
+            "schemaVersion": \(GeometryArtifact.currentSchemaVersion - 1),
+            "canonicalOrientation": {"status": "notEvaluated"}
+          }
+        }
+        """
+        let futureFormat = """
+        {"formatVersion": \(ProjectMetadataStore.supportedFormatVersion + 1)}
+        """
         let skipped = try [
-            makeSkippedProject(at: base, name: "Old Background", metadata: #"{"formatVersion":2}"#),
-            makeSkippedProject(at: base, name: "Future Background", metadata: #"{"formatVersion":4}"#)
+            makeSkippedProject(at: base, name: "Baseline Background", metadata: baselineFormat),
+            makeSkippedProject(at: base, name: "Future Background", metadata: futureFormat)
         ]
 
         let model = AppModel(toolchainManager: MockToolchainManager(), projectBaseURL: base) { _, config in

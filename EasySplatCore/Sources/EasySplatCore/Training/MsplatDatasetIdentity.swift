@@ -6,6 +6,26 @@ struct MsplatDatasetIdentity: Sendable, Equatable {
     let inputDigest: String
     let geometryDigest: String
 
+    private static let supportedImageExtensions: Set<String> = ["jpg", "jpeg", "png"]
+
+    static func compute(
+        imageDirectory: URL,
+        sparseDirectory: URL
+    ) throws -> MsplatDatasetIdentity {
+        let entries = try FileManager.default.contentsOfDirectory(
+            at: imageDirectory,
+            includingPropertiesForKeys: nil,
+            options: []
+        )
+        for entry in entries {
+            guard !entry.lastPathComponent.hasPrefix("."),
+                  supportedImageExtensions.contains(entry.pathExtension.lowercased()) else {
+                throw MsplatDatasetIdentityError.unsupportedImageEntry(entry.lastPathComponent)
+            }
+        }
+        return try compute(imageFiles: entries, sparseDirectory: sparseDirectory)
+    }
+
     static func compute(
         imageFiles: [URL],
         sparseDirectory: URL
@@ -13,11 +33,19 @@ struct MsplatDatasetIdentity: Sendable, Equatable {
         guard !imageFiles.isEmpty else {
             throw MsplatDatasetIdentityError.emptyImageSet
         }
-        let sortedImages = imageFiles.sorted { $0.lastPathComponent < $1.lastPathComponent }
-        guard Set(sortedImages.map(\.lastPathComponent)).count == sortedImages.count else {
+        let sortedImages = imageFiles.sorted {
+            $0.lastPathComponent.utf8.lexicographicallyPrecedes($1.lastPathComponent.utf8)
+        }
+        guard Set(sortedImages.map { Data($0.lastPathComponent.utf8) }).count
+                == sortedImages.count else {
             throw MsplatDatasetIdentityError.ambiguousFileSet
         }
-        let sparseFiles = ["cameras.bin", "images.bin", "points3D.bin"].map {
+        let sparseFiles = [
+            "cameras.bin",
+            "images.bin",
+            "points3D.bin",
+            MsplatOrientationOverlay.fileName,
+        ].map {
             sparseDirectory.appendingPathComponent($0)
         }
         return MsplatDatasetIdentity(
@@ -39,7 +67,10 @@ struct MsplatDatasetIdentity: Sendable, Equatable {
     }
 
     private static func updateFile(_ url: URL, digest: inout SHA256) throws {
-        let descriptor = Darwin.open(url.path, O_RDONLY | O_NOFOLLOW | O_CLOEXEC)
+        let descriptor = Darwin.open(
+            url.path,
+            O_RDONLY | O_NONBLOCK | O_NOFOLLOW | O_CLOEXEC
+        )
         guard descriptor >= 0 else {
             throw MsplatDatasetIdentityError.cannotRead(url.lastPathComponent)
         }
@@ -48,6 +79,7 @@ struct MsplatDatasetIdentity: Sendable, Equatable {
         var initial = stat()
         guard fstat(descriptor, &initial) == 0,
               (initial.st_mode & S_IFMT) == S_IFREG,
+              initial.st_nlink == 1,
               initial.st_size >= 0 else {
             throw MsplatDatasetIdentityError.cannotRead(url.lastPathComponent)
         }
@@ -70,12 +102,30 @@ struct MsplatDatasetIdentity: Sendable, Equatable {
 
         var final = stat()
         guard fstat(descriptor, &final) == 0,
+              (final.st_mode & S_IFMT) == S_IFREG,
+              final.st_nlink == 1,
               final.st_dev == initial.st_dev,
               final.st_ino == initial.st_ino,
               final.st_size == initial.st_size,
               final.st_mtimespec.tv_sec == initial.st_mtimespec.tv_sec,
               final.st_mtimespec.tv_nsec == initial.st_mtimespec.tv_nsec,
+              final.st_ctimespec.tv_sec == initial.st_ctimespec.tv_sec,
+              final.st_ctimespec.tv_nsec == initial.st_ctimespec.tv_nsec,
               consumed == initial.st_size else {
+            throw MsplatDatasetIdentityError.changedDuringRead(url.lastPathComponent)
+        }
+
+        var installed = stat()
+        guard lstat(url.path, &installed) == 0,
+              (installed.st_mode & S_IFMT) == S_IFREG,
+              installed.st_nlink == 1,
+              installed.st_dev == final.st_dev,
+              installed.st_ino == final.st_ino,
+              installed.st_size == final.st_size,
+              installed.st_mtimespec.tv_sec == final.st_mtimespec.tv_sec,
+              installed.st_mtimespec.tv_nsec == final.st_mtimespec.tv_nsec,
+              installed.st_ctimespec.tv_sec == final.st_ctimespec.tv_sec,
+              installed.st_ctimespec.tv_nsec == final.st_ctimespec.tv_nsec else {
             throw MsplatDatasetIdentityError.changedDuringRead(url.lastPathComponent)
         }
     }
@@ -91,6 +141,7 @@ struct MsplatDatasetIdentity: Sendable, Equatable {
 private enum MsplatDatasetIdentityError: Error, LocalizedError {
     case emptyImageSet
     case ambiguousFileSet
+    case unsupportedImageEntry(String)
     case cannotRead(String)
     case changedDuringRead(String)
 
@@ -100,6 +151,8 @@ private enum MsplatDatasetIdentityError: Error, LocalizedError {
             return "Training input contains no images."
         case .ambiguousFileSet:
             return "Training input contains duplicate image names."
+        case .unsupportedImageEntry(let name):
+            return "Training input contains an unsupported entry named \(name)."
         case .cannotRead(let name):
             return "Could not safely read training file \(name)."
         case .changedDuringRead(let name):

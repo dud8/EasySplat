@@ -216,7 +216,7 @@ private:
 
 struct OpenFile {
     explicit OpenFile(const fs::path &path) {
-        descriptor = ::open(path.c_str(), O_RDONLY | O_NOFOLLOW);
+        descriptor = ::open(path.c_str(), O_RDONLY | O_NOFOLLOW | O_CLOEXEC);
         if (descriptor < 0) throwSystemError("cannot open", path);
     }
 
@@ -233,23 +233,37 @@ struct stat requireRegularFile(const fs::path &path, bool requireSingleLink = fa
     struct stat metadata {};
     if (::lstat(path.c_str(), &metadata) != 0) throwSystemError("cannot inspect", path);
     if (!S_ISREG(metadata.st_mode) || (requireSingleLink && metadata.st_nlink != 1)) {
-        throw std::runtime_error("expected an ordinary, unlinked file: " + path.string());
+        throw std::runtime_error(
+            requireSingleLink
+                ? "expected an ordinary, single-link file: " + path.string()
+                : "expected an ordinary file: " + path.string()
+        );
     }
     return metadata;
+}
+
+bool sameStableFileMetadata(const struct stat &left, const struct stat &right) {
+    return S_ISREG(left.st_mode) && S_ISREG(right.st_mode) &&
+        left.st_dev == right.st_dev && left.st_ino == right.st_ino &&
+        left.st_nlink == right.st_nlink && left.st_size == right.st_size &&
+        left.st_mtimespec.tv_sec == right.st_mtimespec.tv_sec &&
+        left.st_mtimespec.tv_nsec == right.st_mtimespec.tv_nsec &&
+        left.st_ctimespec.tv_sec == right.st_ctimespec.tv_sec &&
+        left.st_ctimespec.tv_nsec == right.st_ctimespec.tv_nsec;
 }
 
 void hashFileInto(
     Sha256Accumulator &digest,
     const fs::path &path,
     const std::string &relativeName,
-    bool requireSingleLink = false
+    bool requireSingleLink = false,
+    const std::optional<std::string> &expectedContentDigest = std::nullopt
 ) {
     const struct stat pathMetadata = requireRegularFile(path, requireSingleLink);
     OpenFile file(path);
     struct stat openedMetadata {};
     if (::fstat(file.descriptor, &openedMetadata) != 0) throwSystemError("cannot inspect", path);
-    if (!S_ISREG(openedMetadata.st_mode) || openedMetadata.st_dev != pathMetadata.st_dev ||
-        openedMetadata.st_ino != pathMetadata.st_ino || openedMetadata.st_size != pathMetadata.st_size) {
+    if (!sameStableFileMetadata(pathMetadata, openedMetadata)) {
         throw std::runtime_error("file changed while opening: " + path.string());
     }
 
@@ -258,16 +272,30 @@ void hashFileInto(
     digest.updateInteger(static_cast<std::uint64_t>(openedMetadata.st_size));
     std::array<unsigned char, 1024 * 1024> buffer {};
     std::uint64_t consumed = 0;
+    std::optional<Sha256Accumulator> contentDigest;
+    if (expectedContentDigest) contentDigest.emplace();
     while (true) {
         const ssize_t count = ::read(file.descriptor, buffer.data(), buffer.size());
         if (count < 0 && errno == EINTR) continue;
         if (count < 0) throwSystemError("cannot read", path);
         if (count == 0) break;
         digest.update(buffer.data(), static_cast<std::size_t>(count));
+        if (contentDigest) contentDigest->update(buffer.data(), static_cast<std::size_t>(count));
         consumed += static_cast<std::uint64_t>(count);
     }
     if (consumed != static_cast<std::uint64_t>(openedMetadata.st_size)) {
         throw std::runtime_error("file size changed while hashing: " + path.string());
+    }
+    struct stat finalOpenedMetadata {};
+    struct stat finalPathMetadata {};
+    if (::fstat(file.descriptor, &finalOpenedMetadata) != 0 ||
+        ::lstat(path.c_str(), &finalPathMetadata) != 0 ||
+        !sameStableFileMetadata(openedMetadata, finalOpenedMetadata) ||
+        !sameStableFileMetadata(openedMetadata, finalPathMetadata)) {
+        throw std::runtime_error("file changed while hashing: " + path.string());
+    }
+    if (contentDigest && contentDigest->finish() != *expectedContentDigest) {
+        throw std::runtime_error("orientation file changed after validation");
     }
 }
 
@@ -304,16 +332,34 @@ std::pair<std::string, std::uintmax_t> hashFileContent(
     return {digest.finish(), consumed};
 }
 
-std::string digestFiles(const fs::path &root, const std::vector<std::string> &names) {
+std::string digestFiles(
+    const fs::path &root,
+    const std::vector<std::string> &names,
+    bool requireSingleLink = false
+) {
     Sha256Accumulator digest;
     digest.update("EasySplat file digest v1");
     for (const std::string &name : names) {
-        hashFileInto(digest, root / name, name);
+        hashFileInto(digest, root / name, name, requireSingleLink);
     }
     return digest.finish();
 }
 
-TrainingIdentity computeTrainingIdentity(const fs::path &dataset) {
+bool isSupportedTrainingImageName(const std::string &name) {
+    if (name.empty() || name.front() == '.') return false;
+    std::string extension = fs::path(name).extension().string();
+    for (char &character : extension) {
+        if (character >= 'A' && character <= 'Z') {
+            character = static_cast<char>(character - 'A' + 'a');
+        }
+    }
+    return extension == ".jpg" || extension == ".jpeg" || extension == ".png";
+}
+
+TrainingIdentity computeTrainingIdentity(
+    const fs::path &dataset,
+    const std::string &orientationContentDigest
+) {
     const fs::path images = dataset / "images";
     const fs::path sparse = dataset / "sparse" / "0";
     if (!fs::is_directory(images) || !fs::is_directory(sparse)) {
@@ -322,24 +368,33 @@ TrainingIdentity computeTrainingIdentity(const fs::path &dataset) {
 
     std::vector<std::string> imageNames;
     for (const fs::directory_entry &entry : fs::directory_iterator(images)) {
-        const fs::file_status status = entry.symlink_status();
-        if (!fs::is_regular_file(status)) {
-            throw std::runtime_error("dataset images must be ordinary files");
-        }
         imageNames.push_back(entry.path().filename().string());
     }
     std::sort(imageNames.begin(), imageNames.end());
     if (imageNames.empty() || std::adjacent_find(imageNames.begin(), imageNames.end()) != imageNames.end()) {
         throw std::runtime_error("dataset image set is empty or ambiguous");
     }
+    for (const std::string &name : imageNames) {
+        if (!isSupportedTrainingImageName(name)) {
+            throw std::runtime_error("unsupported entry in dataset images: " + name);
+        }
+        (void)requireRegularFile(images / name, true);
+    }
 
-    return TrainingIdentity {
-        digestFiles(images, imageNames),
-        digestFiles(
-            sparse,
-            {"cameras.bin", "images.bin", "points3D.bin"}
-        ),
-    };
+    Sha256Accumulator geometryDigest;
+    geometryDigest.update("EasySplat file digest v1");
+    hashFileInto(geometryDigest, sparse / "cameras.bin", "cameras.bin", true);
+    hashFileInto(geometryDigest, sparse / "images.bin", "images.bin", true);
+    hashFileInto(geometryDigest, sparse / "points3D.bin", "points3D.bin", true);
+    hashFileInto(
+        geometryDigest,
+        sparse / "easysplat_orientation.json",
+        "easysplat_orientation.json",
+        true,
+        orientationContentDigest
+    );
+
+    return TrainingIdentity {digestFiles(images, imageNames, true), geometryDigest.finish()};
 }
 
 std::string computeTrainerBuildDigest() {
@@ -450,12 +505,19 @@ std::string readBoundedTextFile(
     std::uintmax_t maximumBytes,
     bool requireSingleLink = true
 ) {
-    const struct stat metadata = requireRegularFile(path, requireSingleLink);
-    if (metadata.st_size < 0 || static_cast<std::uintmax_t>(metadata.st_size) > maximumBytes) {
+    const struct stat pathMetadata = requireRegularFile(path, requireSingleLink);
+    if (pathMetadata.st_size < 0 ||
+        static_cast<std::uintmax_t>(pathMetadata.st_size) > maximumBytes) {
         throw std::runtime_error("file exceeds its size limit: " + path.string());
     }
     OpenFile file(path);
-    std::string contents(static_cast<std::size_t>(metadata.st_size), '\0');
+    struct stat openedMetadata {};
+    if (::fstat(file.descriptor, &openedMetadata) != 0) throwSystemError("cannot inspect", path);
+    if (!sameStableFileMetadata(pathMetadata, openedMetadata)) {
+        throw std::runtime_error("file changed while opening: " + path.string());
+    }
+
+    std::string contents(static_cast<std::size_t>(openedMetadata.st_size), '\0');
     std::size_t consumed = 0;
     while (consumed < contents.size()) {
         const ssize_t count = ::read(
@@ -464,10 +526,362 @@ std::string readBoundedTextFile(
             contents.size() - consumed
         );
         if (count < 0 && errno == EINTR) continue;
-        if (count <= 0) throwSystemError("cannot read", path);
+        if (count < 0) throwSystemError("cannot read", path);
+        if (count == 0) {
+            throw std::runtime_error("file ended while being read: " + path.string());
+        }
         consumed += static_cast<std::size_t>(count);
     }
+
+    struct stat finalOpenedMetadata {};
+    struct stat finalPathMetadata {};
+    if (::fstat(file.descriptor, &finalOpenedMetadata) != 0 ||
+        ::lstat(path.c_str(), &finalPathMetadata) != 0 ||
+        !sameStableFileMetadata(openedMetadata, finalOpenedMetadata) ||
+        !sameStableFileMetadata(openedMetadata, finalPathMetadata)) {
+        throw std::runtime_error("file changed while being read: " + path.string());
+    }
     return contents;
+}
+
+struct OrientationOverlay {
+    std::array<double, 4> sourceToCanonicalWxyz;
+    std::array<double, 9> sourceToCanonical;
+    std::string contentDigest;
+    bool isIdentity;
+};
+
+std::string sha256(const std::string &contents) {
+    Sha256Accumulator digest;
+    digest.update(contents);
+    return digest.finish();
+}
+
+std::array<double, 9> rotationMatrixFromUnitQuaternion(
+    const std::array<double, 4> &quaternion
+) {
+    const double w = quaternion[0];
+    const double x = quaternion[1];
+    const double y = quaternion[2];
+    const double z = quaternion[3];
+    const std::array<double, 9> rotation = {
+        1.0 - 2.0 * (y * y + z * z),
+        2.0 * (x * y - w * z),
+        2.0 * (x * z + w * y),
+        2.0 * (x * y + w * z),
+        1.0 - 2.0 * (x * x + z * z),
+        2.0 * (y * z - w * x),
+        2.0 * (x * z - w * y),
+        2.0 * (y * z + w * x),
+        1.0 - 2.0 * (x * x + y * y),
+    };
+
+    const double determinant =
+        rotation[0] * (rotation[4] * rotation[8] - rotation[5] * rotation[7]) -
+        rotation[1] * (rotation[3] * rotation[8] - rotation[5] * rotation[6]) +
+        rotation[2] * (rotation[3] * rotation[7] - rotation[4] * rotation[6]);
+    if (!std::isfinite(determinant) || std::abs(determinant - 1.0) > 1.0e-10) {
+        throw std::runtime_error("orientation quaternion does not produce a proper rotation");
+    }
+    return rotation;
+}
+
+OrientationOverlay parseOrientationOverlay(const std::string &contents) {
+    bool duplicateKey = false;
+    std::set<std::string> parsedKeys;
+    json payload;
+    try {
+        payload = json::parse(
+            contents,
+            [&](int, json::parse_event_t event, json &parsed) {
+                if (event == json::parse_event_t::key) {
+                    const std::string key = parsed.get<std::string>();
+                    if (!parsedKeys.insert(key).second) duplicateKey = true;
+                }
+                return true;
+            }
+        );
+    } catch (const std::exception &error) {
+        throw std::runtime_error(
+            "orientation file is not valid JSON: " + std::string(error.what())
+        );
+    }
+    if (duplicateKey || !payload.is_object() || payload.size() != 2 ||
+        !payload.contains("schema_version") ||
+        !payload.contains("source_to_canonical_wxyz")) {
+        throw std::runtime_error("orientation file does not match closed schema 1");
+    }
+    const json &schemaVersion = payload.at("schema_version");
+    if (!schemaVersion.is_number_integer() || schemaVersion.get<int>() != 1) {
+        throw std::runtime_error("orientation schema_version must be integer 1");
+    }
+    const json &encodedQuaternion = payload.at("source_to_canonical_wxyz");
+    if (!encodedQuaternion.is_array() || encodedQuaternion.size() != 4) {
+        throw std::runtime_error("orientation quaternion must contain four numbers in wxyz order");
+    }
+
+    std::array<double, 4> quaternion {};
+    double squaredNorm = 0;
+    for (std::size_t index = 0; index < quaternion.size(); ++index) {
+        if (!encodedQuaternion[index].is_number()) {
+            throw std::runtime_error("orientation quaternion must contain only numbers");
+        }
+        quaternion[index] = encodedQuaternion[index].get<double>();
+        if (!std::isfinite(quaternion[index])) {
+            throw std::runtime_error("orientation quaternion must be finite");
+        }
+        squaredNorm += quaternion[index] * quaternion[index];
+    }
+    if (!std::isfinite(squaredNorm) || squaredNorm <= 0) {
+        throw std::runtime_error("orientation quaternion has an invalid norm");
+    }
+    if (std::abs(squaredNorm - 1.0) > 1.0e-6) {
+        throw std::runtime_error("orientation quaternion must have unit length");
+    }
+    const double norm = std::sqrt(squaredNorm);
+    if (quaternion[0] < 0) {
+        throw std::runtime_error("orientation quaternion sign is not canonical");
+    }
+    if (quaternion[0] == 0) {
+        const auto firstNonzero = std::find_if(
+            quaternion.begin() + 1,
+            quaternion.end(),
+            [](double value) { return value != 0; }
+        );
+        if (firstNonzero == quaternion.end() || *firstNonzero < 0) {
+            throw std::runtime_error("orientation quaternion sign is not canonical");
+        }
+    }
+    for (double &value : quaternion) value /= norm;
+
+    const bool identity = quaternion[0] == 1.0 && quaternion[1] == 0.0 &&
+        quaternion[2] == 0.0 && quaternion[3] == 0.0;
+    return OrientationOverlay {
+        quaternion,
+        rotationMatrixFromUnitQuaternion(quaternion),
+        sha256(contents),
+        identity,
+    };
+}
+
+OrientationOverlay readOrientationOverlay(const fs::path &dataset) {
+    constexpr std::uintmax_t maximumOrientationBytes = 4096;
+    const fs::path path = dataset / "sparse" / "0" / "easysplat_orientation.json";
+    return parseOrientationOverlay(readBoundedTextFile(path, maximumOrientationBytes, true));
+}
+
+std::array<double, 3> rotateVector(
+    const std::array<double, 9> &rotation,
+    const std::array<double, 3> &vector
+) {
+    return {
+        rotation[0] * vector[0] + rotation[1] * vector[1] + rotation[2] * vector[2],
+        rotation[3] * vector[0] + rotation[4] * vector[1] + rotation[5] * vector[2],
+        rotation[6] * vector[0] + rotation[7] * vector[1] + rotation[8] * vector[2],
+    };
+}
+
+float checkedFloat(double value, const char *description) {
+    if (!std::isfinite(value) ||
+        std::abs(value) > static_cast<double>(std::numeric_limits<float>::max())) {
+        throw std::runtime_error(std::string(description) + " exceeds the finite float range");
+    }
+    return static_cast<float>(value);
+}
+
+void applyOrientationOverlay(InputData &inputData, const OrientationOverlay &orientation) {
+    if (orientation.isIdentity) return;
+    if (!std::isfinite(inputData.scale) || inputData.scale <= 0) {
+        throw std::runtime_error("input normalization scale is invalid");
+    }
+    if (inputData.points.count < 0 ||
+        static_cast<std::uint64_t>(inputData.points.count) >
+            std::numeric_limits<std::size_t>::max() / 3 ||
+        inputData.points.xyz.size() != static_cast<std::size_t>(inputData.points.count) * 3) {
+        throw std::runtime_error("input sparse-point storage is inconsistent");
+    }
+
+    double maximumAbsoluteCenter = 0;
+    for (const Camera &camera : inputData.cameras) {
+        if (!camera.image.empty() || !camera.imagePyramids.empty() ||
+            !camera.mtensorImageCache.empty() || camera.cachedViewMat.defined() ||
+            camera.cachedProjViewMat.defined()) {
+            throw std::runtime_error("orientation must be applied before camera resources are cached");
+        }
+        for (float value : camera.camToWorld) {
+            if (!std::isfinite(value)) {
+                throw std::runtime_error("input camera pose is not finite");
+            }
+        }
+        if (camera.camToWorld[12] != 0 || camera.camToWorld[13] != 0 ||
+            camera.camToWorld[14] != 0 || camera.camToWorld[15] != 1) {
+            throw std::runtime_error("input camera pose is not an affine c2w transform");
+        }
+        const auto rotatedCenter = rotateVector(
+            orientation.sourceToCanonical,
+            {camera.camToWorld[3], camera.camToWorld[7], camera.camToWorld[11]}
+        );
+        for (double value : rotatedCenter) {
+            if (!std::isfinite(value)) {
+                throw std::runtime_error("rotated camera center is not finite");
+            }
+            maximumAbsoluteCenter = std::max(maximumAbsoluteCenter, std::abs(value));
+        }
+    }
+
+    // Upstream uses scale 1 for coincident camera centers. Preserve that
+    // degenerate convention; otherwise re-normalize in canonical axes.
+    const double normalizationFactor = maximumAbsoluteCenter > 0
+        ? 1.0 / maximumAbsoluteCenter
+        : 1.0;
+    if (!std::isfinite(normalizationFactor) || normalizationFactor <= 0) {
+        throw std::runtime_error("canonical camera normalization is invalid");
+    }
+
+    for (Camera &camera : inputData.cameras) {
+        const std::array<double, 9> sourceBasis = {
+            camera.camToWorld[0], camera.camToWorld[1], camera.camToWorld[2],
+            camera.camToWorld[4], camera.camToWorld[5], camera.camToWorld[6],
+            camera.camToWorld[8], camera.camToWorld[9], camera.camToWorld[10],
+        };
+        for (int row = 0; row < 3; ++row) {
+            for (int column = 0; column < 3; ++column) {
+                double value = 0;
+                for (int inner = 0; inner < 3; ++inner) {
+                    value += orientation.sourceToCanonical[row * 3 + inner] *
+                        sourceBasis[inner * 3 + column];
+                }
+                camera.camToWorld[row * 4 + column] = checkedFloat(
+                    value,
+                    "canonical camera basis"
+                );
+            }
+        }
+        const auto center = rotateVector(
+            orientation.sourceToCanonical,
+            {camera.camToWorld[3], camera.camToWorld[7], camera.camToWorld[11]}
+        );
+        camera.camToWorld[3] = checkedFloat(
+            center[0] * normalizationFactor,
+            "canonical camera center"
+        );
+        camera.camToWorld[7] = checkedFloat(
+            center[1] * normalizationFactor,
+            "canonical camera center"
+        );
+        camera.camToWorld[11] = checkedFloat(
+            center[2] * normalizationFactor,
+            "canonical camera center"
+        );
+    }
+
+    for (std::int64_t index = 0; index < inputData.points.count; ++index) {
+        const std::size_t offset = static_cast<std::size_t>(index) * 3;
+        const std::array<double, 3> sourcePoint = {
+            inputData.points.xyz[offset],
+            inputData.points.xyz[offset + 1],
+            inputData.points.xyz[offset + 2],
+        };
+        if (!std::isfinite(sourcePoint[0]) || !std::isfinite(sourcePoint[1]) ||
+            !std::isfinite(sourcePoint[2])) {
+            throw std::runtime_error("input sparse point is not finite");
+        }
+        const auto point = rotateVector(orientation.sourceToCanonical, sourcePoint);
+        for (int component = 0; component < 3; ++component) {
+            inputData.points.xyz[offset + component] = checkedFloat(
+                point[component] * normalizationFactor,
+                "canonical sparse point"
+            );
+        }
+    }
+
+    const std::array<double, 3> sourceTranslation = {
+        inputData.translation[0], inputData.translation[1], inputData.translation[2],
+    };
+    if (!std::isfinite(sourceTranslation[0]) || !std::isfinite(sourceTranslation[1]) ||
+        !std::isfinite(sourceTranslation[2])) {
+        throw std::runtime_error("input normalization translation is not finite");
+    }
+    const auto translation = rotateVector(
+        orientation.sourceToCanonical,
+        sourceTranslation
+    );
+    for (int component = 0; component < 3; ++component) {
+        inputData.translation[component] = checkedFloat(
+            translation[component],
+            "canonical normalization translation"
+        );
+    }
+    inputData.scale = checkedFloat(
+        static_cast<double>(inputData.scale) * normalizationFactor,
+        "canonical normalization scale"
+    );
+    if (inputData.scale <= 0) {
+        throw std::runtime_error("canonical normalization scale is invalid");
+    }
+}
+
+void verifyOrientationOverlaySelfCheck() {
+    const OrientationOverlay orientation = parseOrientationOverlay(
+        "{\"schema_version\":1,\"source_to_canonical_wxyz\":"
+        "[0.9238795325112867,0,0,0.3826834323650898]}"
+    );
+
+    const std::array<std::string, 4> invalid = {
+        "{\"schema_version\":1,\"source_to_canonical_wxyz\":[1,0,0,0],\"extra\":0}",
+        "{\"schema_version\":1,\"schema_version\":1,\"source_to_canonical_wxyz\":[1,0,0,0]}",
+        "{\"schema_version\":1,\"source_to_canonical_wxyz\":[2,0,0,0]}",
+        "{\"schema_version\":1,\"source_to_canonical_wxyz\":[-1,0,0,0]}",
+    };
+    for (const std::string &candidate : invalid) {
+        bool rejected = false;
+        try {
+            (void)parseOrientationOverlay(candidate);
+        } catch (const std::exception &) {
+            rejected = true;
+        }
+        if (!rejected) throw std::runtime_error("orientation parser self-check accepted invalid input");
+    }
+
+    InputData inputData;
+    inputData.scale = 2;
+    inputData.translation[0] = 3;
+    inputData.translation[1] = 4;
+    inputData.translation[2] = 5;
+    inputData.points.count = 1;
+    inputData.points.xyz = {1, 0, 0};
+    inputData.points.rgb = {0, 0, 0};
+    for (float centerSign : {1.0f, -1.0f}) {
+        Camera camera;
+        camera.camToWorld[0] = 1;
+        camera.camToWorld[5] = 1;
+        camera.camToWorld[10] = 1;
+        camera.camToWorld[15] = 1;
+        camera.camToWorld[3] = centerSign;
+        camera.camToWorld[7] = centerSign;
+        inputData.cameras.push_back(std::move(camera));
+    }
+
+    applyOrientationOverlay(inputData, orientation);
+    const auto approximately = [](double actual, double expected) {
+        return std::abs(actual - expected) <= 2.0e-6;
+    };
+    const double inverseRootTwo = 1.0 / std::sqrt(2.0);
+    const Camera &camera = inputData.cameras.front();
+    if (!approximately(camera.camToWorld[0], inverseRootTwo) ||
+        !approximately(camera.camToWorld[1], -inverseRootTwo) ||
+        !approximately(camera.camToWorld[4], inverseRootTwo) ||
+        !approximately(camera.camToWorld[5], inverseRootTwo) ||
+        !approximately(camera.camToWorld[3], 0) ||
+        !approximately(camera.camToWorld[7], 1) ||
+        !approximately(inputData.points.xyz[0], 0.5) ||
+        !approximately(inputData.points.xyz[1], 0.5) ||
+        !approximately(inputData.scale, std::sqrt(2.0)) ||
+        !approximately(inputData.translation[0], -inverseRootTwo) ||
+        !approximately(inputData.translation[1], 7.0 * inverseRootTwo) ||
+        !approximately(inputData.translation[2], 5)) {
+        throw std::runtime_error("orientation transform self-check failed");
+    }
 }
 
 void writeAll(int descriptor, const std::string &contents, const fs::path &path) {
@@ -1119,6 +1533,7 @@ int main(int argc, char *argv[]) {
                 throw std::runtime_error("Metal device initialization returned null");
             }
             msplat_gpu_sync();
+            verifyOrientationOverlaySelfCheck();
             events->emit("self_check", {{"status", "ok"}, {"version", APP_VERSION}});
             if (!events->enabled()) std::cout << "Metal self-check passed\n";
             return 0;
@@ -1150,10 +1565,15 @@ int main(int argc, char *argv[]) {
             throw std::runtime_error("failed to install cancellation handlers");
         }
 
-        const TrainingIdentity identity = computeTrainingIdentity(datasetPath);
+        const OrientationOverlay orientation = readOrientationOverlay(datasetPath);
+        const TrainingIdentity identity = computeTrainingIdentity(
+            datasetPath,
+            orientation.contentDigest
+        );
         const std::string trainerBuildDigest = computeTrainerBuildDigest();
 
         InputData inputData = inputDataFromX(datasetPath);
+        applyOrientationOverlay(inputData, orientation);
 
         std::vector<Camera> &cameras = inputData.cameras;
         if (cameras.empty()) throw std::runtime_error("input dataset contains no training cameras");

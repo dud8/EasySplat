@@ -5,7 +5,7 @@ public enum ProjectMetadataStore {
     private static let maximumMetadataBytes = 8 * 1_024 * 1_024
     private static let fileLocks = ProjectMetadataFileLocks()
     /// The one project format this beta reads and writes.
-    public static let supportedFormatVersion: Int = 3
+    public static let supportedFormatVersion: Int = 4
 
     public enum LoadError: Error, LocalizedError {
         case unsupportedFormatVersion(Int)
@@ -148,8 +148,11 @@ public enum ProjectMetadataStore {
             throw LoadError.unsupportedGeometryArtifactSchema(artifact.schemaVersion)
         }
         var artifactPaths: [(field: String, path: String)] = []
-        if let path = metadata.geometryArtifact?.canonicalModelPath {
-            artifactPaths.append(("geometryArtifact.canonicalModelPath", path))
+        if let path = metadata.geometryArtifact?.sourceModelPath {
+            artifactPaths.append(("geometryArtifact.sourceModelPath", path))
+        }
+        if let path = metadata.geometryArtifact?.learnedPointInitializer?.path {
+            artifactPaths.append(("geometryArtifact.learnedPointInitializer.path", path))
         }
         if let path = metadata.trainingArtifact?.checkpointPath {
             artifactPaths.append(("trainingArtifact.checkpointPath", path))
@@ -216,8 +219,10 @@ public enum ProjectMetadataStore {
 
     private static func pathUsesAllowedNamespace(field: String, path: String) -> Bool {
         switch field {
-        case "geometryArtifact.canonicalModelPath":
-            return path.hasPrefix("SfM/")
+        case "geometryArtifact.sourceModelPath":
+            return path == "SfM/colmap/sparse/0"
+        case "geometryArtifact.learnedPointInitializer.path":
+            return path == "SfM/colmap/seed/0/learned_points3D.txt"
         case "trainingArtifact.checkpointPath":
             return path == "Training/checkpoints/msplat"
                 || path.hasPrefix("Training/checkpoints/msplat/")

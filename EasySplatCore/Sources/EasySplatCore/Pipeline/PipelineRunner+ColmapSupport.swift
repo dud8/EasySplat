@@ -59,6 +59,61 @@ extension PipelineRunner {
         return true
     }
 
+    func prepareDa3RefinementSeed(
+        rawModelURL: URL,
+        outputModelURL: URL,
+        databaseURL: URL,
+        checkCancellation: () throws -> Void = {}
+    ) throws -> Bool {
+        let fileManager = FileManager.default
+        let outputRootURL = outputModelURL.deletingLastPathComponent()
+        try removeItemIfPresent(outputRootURL)
+        let files = [
+            (name: "cameras.txt", maximumBytes: ColmapTextFileLimits.cameras),
+            (name: "images.txt", maximumBytes: ColmapTextFileLimits.images),
+            (name: "points3D.txt", maximumBytes: ColmapTextFileLimits.points),
+        ]
+        do {
+            try checkCancellation()
+            try fileManager.createDirectory(
+                at: outputModelURL,
+                withIntermediateDirectories: true
+            )
+            for file in files {
+                try checkCancellation()
+                let reader = try BoundedUTF8LineReader(
+                    at: rawModelURL.appendingPathComponent(file.name),
+                    maximumBytes: file.maximumBytes,
+                    maximumLineBytes: min(
+                        file.maximumBytes,
+                        ColmapTextFileLimits.maximumLine
+                    )
+                )
+                let writer = try BufferedUTF8LineWriter(
+                    at: outputModelURL.appendingPathComponent(file.name)
+                )
+                while let line = try reader.next(checkCancellation: checkCancellation) {
+                    try writer.write(line)
+                }
+                try writer.finish()
+            }
+            let normalized = try ColmapTextModelNormalizer.normalizeImagesTxtIfNeeded(
+                at: outputModelURL.appendingPathComponent("images.txt"),
+                checkCancellation: checkCancellation
+            )
+            let remapped = try ColmapTextModelNormalizer.remapSeedModelIDsToDatabase(
+                seedModelURL: outputModelURL,
+                databaseURL: databaseURL,
+                checkCancellation: checkCancellation
+            )
+            try checkCancellation()
+            return normalized || remapped
+        } catch {
+            try removeItemIfPresent(outputRootURL)
+            throw error
+        }
+    }
+
     func colmapOptionsForExtraction() -> ColmapOptions {
         let cores = ProcessInfo.processInfo.activeProcessorCount
         let extractThreads = min(8, max(2, cores / 2))

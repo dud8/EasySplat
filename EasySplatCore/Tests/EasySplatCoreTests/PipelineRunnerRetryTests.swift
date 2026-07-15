@@ -793,6 +793,33 @@ final class PipelineRunnerRetryTests: XCTestCase {
         XCTAssertFalse(FileManager.default.fileExists(atPath: paths.pairGraphEvidenceURL.path))
     }
 
+    func testCleanForRetryStopsWhenAnInvalidatedArtifactCannotBeRemoved() throws {
+        let root = try TestFileBuilder.makeTempDir()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let paths = ProjectPaths(root: root)
+        try paths.ensureDirectories()
+        let selectedSentinel = paths.framesSelectedURL.appendingPathComponent("stale.jpg")
+        try Data("stale".utf8).write(to: selectedSentinel)
+        try FileManager.default.setAttributes(
+            [.immutable: true],
+            ofItemAtPath: selectedSentinel.path
+        )
+        defer {
+            try? FileManager.default.setAttributes(
+                [.immutable: false],
+                ofItemAtPath: selectedSentinel.path
+            )
+        }
+
+        XCTAssertThrowsError(
+            try makeRunner(projectURL: root).test_cleanForRetry(
+                failedStage: .selectFrames,
+                paths: paths
+            )
+        )
+        XCTAssertTrue(FileManager.default.fileExists(atPath: selectedSentinel.path))
+    }
+
     func testCleanForRetryExtractFramesRemovesRawManifest() throws {
         let root = try TestFileBuilder.makeTempDir()
         defer { try? FileManager.default.removeItem(at: root) }
@@ -808,7 +835,35 @@ final class PipelineRunnerRetryTests: XCTestCase {
         XCTAssertFalse(FileManager.default.fileExists(atPath: paths.framesRawManifestURL.path))
     }
 
-    func testCleanForMatchingRetryPreservesFeaturesAndClearsOnlyDownstreamState() throws {
+    func testCleanForRetryImportInvalidatesAcceptedGeometryButPreservesPublishedOutput() throws {
+        let root = try TestFileBuilder.makeTempDir()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let paths = ProjectPaths(root: root)
+        try paths.ensureDirectories()
+        let sparseSentinel = paths.colmapSparseURL.appendingPathComponent("0/stale.txt")
+        try FileManager.default.createDirectory(
+            at: sparseSentinel.deletingLastPathComponent(),
+            withIntermediateDirectories: true
+        )
+        try Data("stale".utf8).write(to: sparseSentinel)
+        try Data("stale".utf8).write(to: paths.geometryManifestURL)
+        let trainingSentinel = paths.trainingURL.appendingPathComponent("stale.txt")
+        try Data("stale".utf8).write(to: trainingSentinel)
+        let output = paths.outputURL.appendingPathComponent("splat.ply")
+        try TestFileBuilder.writeMinimalPly(at: output)
+
+        try makeRunner(projectURL: root).test_cleanForRetry(
+            failedStage: .importInput,
+            paths: paths
+        )
+
+        XCTAssertFalse(FileManager.default.fileExists(atPath: sparseSentinel.path))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: paths.geometryManifestURL.path))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: trainingSentinel.path))
+        XCTAssertEqual(ProjectArtifactValidator.validatePlyFile(at: output), .valid)
+    }
+
+    func testCleanForMatchingRetryPreservesFeaturesAndLearnedSeed() throws {
         let root = try TestFileBuilder.makeTempDir()
         defer { try? FileManager.default.removeItem(at: root) }
         let paths = ProjectPaths(root: root)
@@ -831,7 +886,11 @@ final class PipelineRunnerRetryTests: XCTestCase {
             0
         )
         XCTAssertFalse(FileManager.default.fileExists(atPath: paths.pairGraphEvidenceURL.path))
-        XCTAssertFalse(FileManager.default.fileExists(atPath: paths.colmapSeedURL.path))
+        XCTAssertTrue(
+            FileManager.default.fileExists(
+                atPath: paths.colmapSeedURL.appendingPathComponent("stale.txt").path
+            )
+        )
     }
 
     func testCleanForRetryRemovesDanglingDatabaseSymlink() throws {
@@ -889,6 +948,15 @@ final class PipelineRunnerRetryTests: XCTestCase {
         try paths.ensureDirectories()
         let trainingSentinel = paths.trainingURL.appendingPathComponent("stale.txt")
         try Data("stale".utf8).write(to: trainingSentinel)
+        let learnedInitializer = paths.colmapSeedModelURL.appendingPathComponent(
+            "learned_points3D.txt"
+        )
+        try FileManager.default.createDirectory(
+            at: learnedInitializer.deletingLastPathComponent(),
+            withIntermediateDirectories: true
+        )
+        try Data("stale".utf8).write(to: learnedInitializer)
+        try Data("stale".utf8).write(to: paths.geometryManifestURL)
         let output = paths.outputURL.appendingPathComponent("splat.ply")
         try TestFileBuilder.writeMinimalPly(at: output)
 
@@ -898,7 +966,89 @@ final class PipelineRunnerRetryTests: XCTestCase {
         )
 
         XCTAssertFalse(FileManager.default.fileExists(atPath: trainingSentinel.path))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: learnedInitializer.path))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: paths.geometryManifestURL.path))
         XCTAssertEqual(ProjectArtifactValidator.validatePlyFile(at: output), .valid)
+    }
+
+    func testGeometryRerunInvalidatesAcceptedMetadataAndPreservesPublishedOutput() throws {
+        let root = try TestFileBuilder.makeTempDir()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let paths = ProjectPaths(root: root)
+        try paths.ensureDirectories()
+        var metadata = ProjectMetadata(
+            title: "Geometry rerun",
+            input: .photos(folder: "/tmp/Photos"),
+            geometryArtifact: makeGeometryArtifact(
+                sourceModelPath: "SfM/colmap/sparse/0"
+            ),
+            trainingArtifact: makeTrainingArtifact(),
+            checkpoint: PipelineCheckpoint(stage: .sfmMapping),
+            reconstruction: ReconstructionSummary(
+                mapper: "colmap",
+                capturedAt: Date(timeIntervalSince1970: 1),
+                registeredImages: 2,
+                totalImages: 2
+            ),
+            stageTimings: [
+                StageTimingRecord(
+                    stage: .sfmMatching,
+                    startedAt: Date(timeIntervalSince1970: 1),
+                    durationSeconds: 1
+                ),
+                StageTimingRecord(
+                    stage: .sfmMapping,
+                    startedAt: Date(timeIntervalSince1970: 2),
+                    durationSeconds: 2
+                ),
+                StageTimingRecord(
+                    stage: .trainSplat,
+                    startedAt: Date(timeIntervalSince1970: 3),
+                    durationSeconds: 3
+                ),
+            ]
+        )
+        try Data("stale".utf8).write(to: paths.geometryManifestURL)
+        let sparseSentinel = paths.colmapSparseURL.appendingPathComponent("0/stale.txt")
+        try FileManager.default.createDirectory(
+            at: sparseSentinel.deletingLastPathComponent(),
+            withIntermediateDirectories: true
+        )
+        try Data("stale".utf8).write(to: sparseSentinel)
+        let refinementSentinel = paths.colmapRefinementSeedModelURL
+            .appendingPathComponent("stale.txt")
+        try FileManager.default.createDirectory(
+            at: refinementSentinel.deletingLastPathComponent(),
+            withIntermediateDirectories: true
+        )
+        try Data("stale".utf8).write(to: refinementSentinel)
+        let trainingSentinel = paths.trainingURL.appendingPathComponent("stale.txt")
+        try Data("stale".utf8).write(to: trainingSentinel)
+        let output = paths.outputURL.appendingPathComponent("splat.ply")
+        try TestFileBuilder.writeMinimalPly(at: output)
+
+        try makeRunner(projectURL: root).test_invalidateAcceptedArtifactsForGeometryRerun(
+            startingAt: .sfmMapping,
+            metadata: &metadata,
+            paths: paths
+        )
+
+        XCTAssertNil(metadata.reconstruction)
+        XCTAssertNil(metadata.geometryArtifact)
+        XCTAssertNil(metadata.trainingArtifact)
+        XCTAssertNil(metadata.checkpoint)
+        XCTAssertEqual(metadata.stageTimings?.map(\.stage), [.sfmMatching])
+        XCTAssertFalse(FileManager.default.fileExists(atPath: sparseSentinel.path))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: refinementSentinel.path))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: paths.geometryManifestURL.path))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: trainingSentinel.path))
+        XCTAssertEqual(ProjectArtifactValidator.validatePlyFile(at: output), .valid)
+        let persisted = try ProjectMetadataStore.load(from: paths.metadataURL)
+        XCTAssertNil(persisted.reconstruction)
+        XCTAssertNil(persisted.geometryArtifact)
+        XCTAssertNil(persisted.trainingArtifact)
+        XCTAssertNil(persisted.checkpoint)
+        XCTAssertEqual(persisted.stageTimings?.map(\.stage), [.sfmMatching])
     }
 
     func testResolvedPlanChangePersistsDurableFeaturesBoundaryBeforeRelaunch() throws {

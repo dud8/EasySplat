@@ -4,49 +4,62 @@ extension PipelineRunner {
     func prepareMsplatDataset(
         paths: ProjectPaths,
         maxImageSize: Int,
-        learnedPointInitializer: LearnedPointInitializerArtifact?,
+        geometryArtifact: GeometryArtifact,
         progress: (Double, String) -> Void
-    ) async throws -> URL {
-        let sourceSparseRoot = paths.colmapSparseURL.appendingPathComponent("0", isDirectory: true)
-        let sourceSparse = try resolveSparseModelDirectory(at: sourceSparseRoot)
+    ) async throws -> (url: URL, identity: MsplatDatasetIdentity) {
+        let (sourceSparse, sourceSnapshot) = try verifiedGeometrySource(
+            geometryArtifact,
+            paths: paths
+        )
         if try MsplatCameraCompatibility.requiresUndistortion(modelDirectory: sourceSparse) {
             return try await prepareUndistortedMsplatDataset(
                 paths: paths,
                 sourceSparse: sourceSparse,
+                sourceSnapshot: sourceSnapshot,
                 maxImageSize: maxImageSize,
-                learnedPointInitializer: learnedPointInitializer,
+                geometryArtifact: geometryArtifact,
                 progress: progress
             )
         }
 
-        return try prepareTrainingDataset(
+        return try prepareDirectMsplatDataset(
             paths: paths,
-            datasetName: "msplat_dataset",
-            progressName: "msplat",
-            sparseEnsureMessage: "ensuring binary model files",
-            requiredSparseFiles: ["cameras.bin", "images.bin", "points3D.bin"],
-            prepareSourceSparse: { _ = try regenerateBinarySparseModelFiles(at: $0) },
-            ensureCopiedSparse: { try requireBinarySparseModelFiles(at: $0); return false },
-            finalizeCopiedSparse: { sparse in
-                guard let learnedPointInitializer else { return }
-                try mergeLearnedPointInitializer(
-                    learnedPointInitializer,
-                    paths: paths,
-                    into: sparse.appendingPathComponent("points3D.txt")
-                )
-                _ = try regenerateBinarySparseModelFiles(at: sparse)
-            },
+            sourceSparse: sourceSparse,
+            sourceSnapshot: sourceSnapshot,
+            geometryArtifact: geometryArtifact,
             progress: progress
         )
+    }
+
+    private func verifiedGeometrySource(
+        _ geometryArtifact: GeometryArtifact,
+        paths: ProjectPaths
+    ) throws -> (URL, GeometryModelSnapshot.Verified) {
+        guard geometryArtifact.schemaVersion == GeometryArtifact.currentSchemaVersion else {
+            throw GeometryArtifactStore.Error.invalidSchema(geometryArtifact.schemaVersion)
+        }
+        let sourceSparse = try paths.resolveProjectRelativePath(geometryArtifact.sourceModelPath)
+        let sourceSnapshot = try GeometryModelSnapshot.capture(in: sourceSparse)
+        let requiredNames = ["cameras.txt", "images.txt", "points3D.txt"]
+        guard Set(geometryArtifact.modelHashes.keys) == Set(requiredNames) else {
+            throw GeometryArtifactStore.Error.invalidDigest("model")
+        }
+        for name in requiredNames {
+            guard geometryArtifact.modelHashes[name] == sourceSnapshot.modelHashes[name] else {
+                throw GeometryArtifactStore.Error.modelHashMismatch(name)
+            }
+        }
+        return (sourceSparse, sourceSnapshot)
     }
 
     private func prepareUndistortedMsplatDataset(
         paths: ProjectPaths,
         sourceSparse: URL,
+        sourceSnapshot: GeometryModelSnapshot.Verified,
         maxImageSize: Int,
-        learnedPointInitializer: LearnedPointInitializerArtifact?,
+        geometryArtifact: GeometryArtifact,
         progress: (Double, String) -> Void
-    ) async throws -> URL {
+    ) async throws -> (url: URL, identity: MsplatDatasetIdentity) {
         let fm = FileManager.default
         try requireTextSparseModelFiles(at: sourceSparse)
 
@@ -54,16 +67,30 @@ extension PipelineRunner {
             ".msplat-undistort-\(UUID().uuidString)",
             isDirectory: true
         )
+        let undistorterInput = stagingRoot.appendingPathComponent(
+            "verified-source",
+            isDirectory: true
+        )
         let workspace = stagingRoot.appendingPathComponent("workspace", isDirectory: true)
         let candidate = stagingRoot.appendingPathComponent("candidate", isDirectory: true)
+        try fm.createDirectory(at: undistorterInput, withIntermediateDirectories: true)
         try fm.createDirectory(at: workspace, withIntermediateDirectories: true)
         defer { try? fm.removeItem(at: stagingRoot) }
 
         progress(0.05, "Preparing corrected lens images")
+        for name in ["cameras.txt", "images.txt", "points3D.txt"] {
+            try fm.copyItem(
+                at: sourceSparse.appendingPathComponent(name),
+                to: undistorterInput.appendingPathComponent(name)
+            )
+        }
+        _ = try regenerateBinarySparseModelFiles(at: undistorterInput)
+        try requireBinarySparseModelFiles(at: undistorterInput)
+        try Task.checkCancellation()
         try await tooling.colmap.runImageUndistorter(
             colmapPath: config.toolchain.colmap,
             imagePath: paths.framesSelectedURL,
-            inputPath: sourceSparse,
+            inputPath: undistorterInput,
             outputPath: workspace,
             maxImageSize: maxImageSize,
             environment: colmapOptionsForMatching().environment,
@@ -99,7 +126,7 @@ extension PipelineRunner {
             try fm.moveItem(at: file, to: candidateSparse.appendingPathComponent(file.lastPathComponent))
         }
         try requireBinarySparseModelFiles(at: candidateSparse)
-        if let learnedPointInitializer {
+        if let learnedPointInitializer = geometryArtifact.learnedPointInitializer {
             _ = try ensureTextSparseModelFiles(at: candidateSparse)
             try mergeLearnedPointInitializer(
                 learnedPointInitializer,
@@ -108,33 +135,33 @@ extension PipelineRunner {
             )
             _ = try regenerateBinarySparseModelFiles(at: candidateSparse)
         }
-        _ = try msplatDatasetIdentity(at: candidate)
+        try Task.checkCancellation()
+        try MsplatOrientationOverlay.write(
+            canonicalOrientation: geometryArtifact.canonicalOrientation,
+            to: candidateSparse
+        )
+        let identity = try msplatDatasetIdentity(at: candidate)
+        try Task.checkCancellation()
 
-        let dataset = paths.trainingURL.appendingPathComponent("msplat_dataset", isDirectory: true)
-        let backup = paths.trainingURL.appendingPathComponent(".msplat-dataset-backup", isDirectory: true)
-        if fm.fileExists(atPath: backup.path) { try fm.removeItem(at: backup) }
-        if fm.fileExists(atPath: dataset.path) { try fm.moveItem(at: dataset, to: backup) }
-        do {
-            try fm.moveItem(at: candidate, to: dataset)
-            if fm.fileExists(atPath: backup.path) { try fm.removeItem(at: backup) }
-        } catch {
-            if fm.fileExists(atPath: dataset.path) { try? fm.removeItem(at: dataset) }
-            if fm.fileExists(atPath: backup.path) { try? fm.moveItem(at: backup, to: dataset) }
-            throw error
-        }
+        let dataset = try publishMsplatDatasetCandidate(
+            candidate,
+            paths: paths,
+            sourceSparse: sourceSparse,
+            sourceSnapshot: sourceSnapshot
+        )
         progress(1.0, "Corrected lens images are ready")
-        return dataset
+        return (dataset, identity)
     }
 
     private func mergeLearnedPointInitializer(
         _ initializer: LearnedPointInitializerArtifact,
         paths: ProjectPaths,
-        into canonicalPointsURL: URL
+        into pointsURL: URL
     ) throws {
         let initializerURL = try paths.resolveProjectRelativePath(initializer.path)
         try Da3LearnedPointInitializer.merge(
             learnedPointsURL: initializerURL,
-            into: canonicalPointsURL,
+            into: pointsURL,
             expectedPointCount: initializer.pointCount,
             maximumPointCount: initializer.pointCount,
             expectedSHA256: initializer.sha256
@@ -150,34 +177,30 @@ extension PipelineRunner {
     func msplatDatasetIdentity(at datasetURL: URL) throws -> MsplatDatasetIdentity {
         let images = datasetURL.appendingPathComponent("images", isDirectory: true)
         let sparse = datasetURL.appendingPathComponent("sparse/0", isDirectory: true)
-        let imageFiles = try FileManager.default.contentsOfDirectory(
-            at: images,
-            includingPropertiesForKeys: [.isRegularFileKey],
-            options: [.skipsHiddenFiles]
-        ).filter { supportedImageExtensions.contains($0.pathExtension.lowercased()) }
         return try MsplatDatasetIdentity.compute(
-            imageFiles: imageFiles,
+            imageDirectory: images,
             sparseDirectory: sparse
         )
     }
 
-    private func prepareTrainingDataset(
+    private func prepareDirectMsplatDataset(
         paths: ProjectPaths,
-        datasetName: String,
-        progressName: String,
-        sparseEnsureMessage: String,
-        requiredSparseFiles: [String],
-        prepareSourceSparse: (URL) throws -> Void,
-        ensureCopiedSparse: (URL) throws -> Bool,
-        finalizeCopiedSparse: (URL) throws -> Void,
+        sourceSparse: URL,
+        sourceSnapshot: GeometryModelSnapshot.Verified,
+        geometryArtifact: GeometryArtifact,
         progress: (Double, String) -> Void
-    ) throws -> URL {
+    ) throws -> (url: URL, identity: MsplatDatasetIdentity) {
         let fm = FileManager.default
-        let dataset = paths.trainingURL.appendingPathComponent(datasetName, isDirectory: true)
-        let images = dataset.appendingPathComponent("images", isDirectory: true)
-        let sparse = dataset.appendingPathComponent("sparse/0", isDirectory: true)
-        try resetDirectory(images)
-        try resetDirectory(sparse)
+        let stagingRoot = paths.trainingURL.appendingPathComponent(
+            ".msplat-prepare-\(UUID().uuidString)",
+            isDirectory: true
+        )
+        let candidate = stagingRoot.appendingPathComponent("candidate", isDirectory: true)
+        let images = candidate.appendingPathComponent("images", isDirectory: true)
+        let sparse = candidate.appendingPathComponent("sparse/0", isDirectory: true)
+        try fm.createDirectory(at: images, withIntermediateDirectories: true)
+        try fm.createDirectory(at: sparse, withIntermediateDirectories: true)
+        defer { try? fm.removeItem(at: stagingRoot) }
 
         let selected = try fm.contentsOfDirectory(at: paths.framesSelectedURL, includingPropertiesForKeys: nil)
         let imageFiles = selected.filter { supportedImageExtensions.contains($0.pathExtension.lowercased()) }
@@ -185,51 +208,101 @@ extension PipelineRunner {
         let imageProgressScale = 0.7
         let imageTotal = max(1, imageFiles.count)
         for (index, url) in imageFiles.enumerated() {
+            try Task.checkCancellation()
             let dest = images.appendingPathComponent(url.lastPathComponent)
             if fm.fileExists(atPath: dest.path) { try fm.removeItem(at: dest) }
             try fm.copyItem(at: url, to: dest)
             if index % 5 == 0 || index + 1 == imageFiles.count {
                 let fraction = imageProgressScale * (Double(index + 1) / Double(imageTotal))
-                progress(fraction, "Preparing \(progressName) dataset (images) \(index + 1)/\(imageTotal)")
+                progress(fraction, "Preparing msplat dataset (images) \(index + 1)/\(imageTotal)")
             }
         }
 
-        let sourceSparseRoot = paths.colmapSparseURL.appendingPathComponent("0", isDirectory: true)
-        let sourceSparse = try resolveSparseModelDirectory(at: sourceSparseRoot)
         guard sparseModelFilesExist(at: sourceSparse) else { throw PipelineError.outputMissing }
-        try prepareSourceSparse(sourceSparse)
+        try requireTextSparseModelFiles(at: sourceSparse)
         let files = try fm.contentsOfDirectory(
             at: sourceSparse,
             includingPropertiesForKeys: [.isRegularFileKey],
             options: [.skipsHiddenFiles]
         )
+        let authenticatedTextFiles = Set(["cameras.txt", "images.txt", "points3D.txt"])
         let fileItems = files.filter { url in
-            (try? url.resourceValues(forKeys: [.isRegularFileKey]).isRegularFile) ?? false
+            authenticatedTextFiles.contains(url.lastPathComponent)
+                && ((try? url.resourceValues(forKeys: [.isRegularFileKey]).isRegularFile) ?? false)
         }
-        let sparseProgressScale = 1.0 - imageProgressScale
+        // Leave the final five percent for model conversion, verification, and
+        // publication so progress never moves backward after the file copies finish.
+        let sparseProgressScale = 0.25
         let sparseTotal = max(1, fileItems.count)
         for (index, file) in fileItems.enumerated() {
+            try Task.checkCancellation()
             let dest = sparse.appendingPathComponent(file.lastPathComponent)
             if fm.fileExists(atPath: dest.path) { try fm.removeItem(at: dest) }
             try fm.copyItem(at: file, to: dest)
             let fraction = imageProgressScale + sparseProgressScale * (Double(index + 1) / Double(sparseTotal))
-            progress(fraction, "Preparing \(progressName) dataset (sparse) \(index + 1)/\(sparseTotal)")
+            progress(fraction, "Preparing msplat dataset (sparse) \(index + 1)/\(sparseTotal)")
         }
 
-        progress(0.98, "Preparing \(progressName) dataset (sparse): \(sparseEnsureMessage).")
-        let converted = try ensureCopiedSparse(sparse)
-        if converted {
-            progress(0.99, "Preparing \(progressName) dataset (sparse): conversion complete.")
+        progress(0.98, "Preparing msplat dataset (sparse): ensuring binary model files.")
+        if let learnedPointInitializer = geometryArtifact.learnedPointInitializer {
+            try mergeLearnedPointInitializer(
+                learnedPointInitializer,
+                paths: paths,
+                into: sparse.appendingPathComponent("points3D.txt")
+            )
         }
+        _ = try regenerateBinarySparseModelFiles(at: sparse)
+        try requireBinarySparseModelFiles(at: sparse)
+        progress(0.99, "Preparing msplat dataset (sparse): conversion complete.")
+        try MsplatOrientationOverlay.write(
+            canonicalOrientation: geometryArtifact.canonicalOrientation,
+            to: sparse
+        )
+        let identity = try msplatDatasetIdentity(at: candidate)
+        try Task.checkCancellation()
+        let dataset = try publishMsplatDatasetCandidate(
+            candidate,
+            paths: paths,
+            sourceSparse: sourceSparse,
+            sourceSnapshot: sourceSnapshot
+        )
+        progress(1.0, "Preparing msplat dataset: ready.")
+        return (dataset, identity)
+    }
 
-        for name in requiredSparseFiles {
-            let fileURL = sparse.appendingPathComponent(name)
-            guard fm.fileExists(atPath: fileURL.path) else { throw PipelineError.outputMissing }
-            let size = (try? fm.attributesOfItem(atPath: fileURL.path)[.size] as? NSNumber)?.int64Value ?? 0
-            guard size > 0 else { throw PipelineError.outputMissing }
+    private func publishMsplatDatasetCandidate(
+        _ candidate: URL,
+        paths: ProjectPaths,
+        sourceSparse: URL,
+        sourceSnapshot: GeometryModelSnapshot.Verified
+    ) throws -> URL {
+        let fm = FileManager.default
+        let dataset = paths.trainingURL.appendingPathComponent("msplat_dataset", isDirectory: true)
+        let backup = paths.trainingURL.appendingPathComponent(
+            ".msplat-dataset-backup",
+            isDirectory: true
+        )
+        try GeometryModelSnapshot.validate(sourceSnapshot, at: sourceSparse)
+        try removeItemIfPresent(backup)
+        if entryExists(at: dataset) {
+            try fm.moveItem(at: dataset, to: backup)
         }
-        try finalizeCopiedSparse(sparse)
-        return dataset
+        do {
+            try fm.moveItem(at: candidate, to: dataset)
+            try removeItemIfPresent(backup)
+            return dataset
+        } catch {
+            try? removeItemIfPresent(dataset)
+            if entryExists(at: backup) {
+                try? fm.moveItem(at: backup, to: dataset)
+            }
+            throw error
+        }
+    }
+
+    private func entryExists(at url: URL) -> Bool {
+        FileManager.default.fileExists(atPath: url.path)
+            || ((try? FileManager.default.destinationOfSymbolicLink(atPath: url.path)) != nil)
     }
 
     func requireTextSparseModelFiles(at url: URL) throws {
@@ -258,7 +331,7 @@ extension PipelineRunner {
         }
     }
 
-    /// The geometry manifest authenticates the canonical text model. Always derive the
+    /// The geometry manifest authenticates the accepted text model. Always derive the
     /// trainer's binary model from that verified source so stale binaries from an older
     /// training attempt can never bypass the geometry gate.
     func regenerateBinarySparseModelFiles(at url: URL) throws -> Bool {
@@ -473,7 +546,7 @@ extension PipelineRunner {
         return artifact
     }
 
-    /// Finished projects retain canonical geometry, the training manifest, and one
+    /// Finished projects retain accepted geometry, the training manifest, and one
     /// authenticated public PLY. The copied image dataset and trainer-private PLY are
     /// rebuildable payloads, not user artifacts.
     func removeDisposableCompletedTrainingPayload(paths: ProjectPaths) throws {

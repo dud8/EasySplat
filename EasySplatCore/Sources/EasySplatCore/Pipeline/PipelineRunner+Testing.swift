@@ -172,6 +172,18 @@ extension PipelineRunner {
         try cleanForRetry(failedStage: failedStage, paths: paths)
     }
 
+    func test_invalidateAcceptedArtifactsForGeometryRerun(
+        startingAt stage: PipelineStage,
+        metadata: inout ProjectMetadata,
+        paths: ProjectPaths
+    ) throws {
+        try invalidateAcceptedArtifactsForGeometryRerun(
+            startingAt: stage,
+            metadata: &metadata,
+            paths: paths
+        )
+    }
+
     func test_cleanupRawFramesAfterDurableSelection(
         paths: ProjectPaths,
         metadata: ProjectMetadata

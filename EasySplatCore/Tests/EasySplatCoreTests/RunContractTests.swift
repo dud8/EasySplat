@@ -64,16 +64,16 @@ final class RequestedRunOptionsTests: XCTestCase {
     }
 }
 
-final class ProjectMetadataVersionThreeTests: XCTestCase {
-    func testNewMetadataUsesVersionThreeAndSuppliedRequestedOptions() {
+final class ProjectMetadataVersionFourTests: XCTestCase {
+    func testNewMetadataUsesVersionFourAndSuppliedRequestedOptions() {
         let metadata = ProjectMetadata(
             title: "New project",
             input: .photos(folder: "/tmp/photos"),
             requestedRunOptions: RequestedRunOptions(capturePath: .orbit, detailProfile: .balanced)
         )
 
-        XCTAssertEqual(ProjectMetadataStore.supportedFormatVersion, 3)
-        XCTAssertEqual(metadata.formatVersion, 3)
+        XCTAssertEqual(ProjectMetadataStore.supportedFormatVersion, 4)
+        XCTAssertEqual(metadata.formatVersion, ProjectMetadataStore.supportedFormatVersion)
         XCTAssertEqual(
             metadata.requestedRunOptions,
             RequestedRunOptions(capturePath: .orbit, detailProfile: .balanced)
@@ -182,7 +182,7 @@ private func makeResolvedRunPlan() -> ResolvedRunPlan {
 }
 
 func makeGeometryArtifact(
-    canonicalModelPath: String = "SfM/canonical/model"
+    sourceModelPath: String = "SfM/colmap/sparse/0"
 ) -> GeometryArtifact {
     GeometryArtifact(
         schemaVersion: GeometryArtifact.currentSchemaVersion,
@@ -193,7 +193,7 @@ func makeGeometryArtifact(
         selectedFramesDigest: "sha256:selected-frames",
         orderedImageNames: ["frame_000001.jpg", "frame_000002.jpg"],
         orderedImageTimestamps: [0.0, 0.5],
-        canonicalModelPath: canonicalModelPath,
+        sourceModelPath: sourceModelPath,
         poseConvention: "worldToCamera",
         quaternionOrder: "wxyz",
         handedness: "rightHanded",
@@ -226,6 +226,9 @@ func makeGeometryArtifact(
             mappingAttemptNumber: 1,
             bundleAdjustmentCycleCount: 1,
             fallbackReason: nil
+        ),
+        canonicalOrientation: .unresolved(
+            openingViewDirection: CanonicalDirection(x: 0, y: 0, z: 1)
         )
     )
 }

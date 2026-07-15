@@ -233,6 +233,15 @@ final class StageTimingTracker: @unchecked Sendable {
         return Self.format(seconds: totalSeconds)
     }
 
+    /// Samples cumulative elapsed time without ending the active stage.
+    func elapsedSeconds(_ stage: PipelineStage) -> TimeInterval? {
+        lock.lock()
+        defer { lock.unlock() }
+        guard let active = starts[stage] else { return nil }
+        return accumulatedSeconds[stage, default: 0]
+            + Self.durationInSeconds(clock.now - active.instant)
+    }
+
     /// Pop the most recent completed timing for a stage. Used by the runner to
     /// persist a `StageTimingRecord` into project metadata at stage completion.
     func consumeRecord(_ stage: PipelineStage) -> (startedAt: Date, durationSeconds: TimeInterval)? {

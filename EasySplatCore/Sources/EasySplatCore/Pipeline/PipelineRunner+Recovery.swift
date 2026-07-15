@@ -40,6 +40,20 @@ extension PipelineRunner {
         var meanTrackLength: Double?
     }
 
+    private enum ColmapSparseTextScanError: Error, LocalizedError {
+        case malformedRecord(file: String, line: Int)
+        case countOverflow(file: String)
+
+        var errorDescription: String? {
+            switch self {
+            case .malformedRecord(let file, let line):
+                return "COLMAP model has a malformed \(file) record at line \(line)."
+            case .countOverflow(let file):
+                return "COLMAP model has too many records in \(file)."
+            }
+        }
+    }
+
     func resetDirectory(_ url: URL) throws {
         let fm = FileManager.default
         if fm.fileExists(atPath: url.path) {
@@ -48,12 +62,16 @@ extension PipelineRunner {
         try fm.createDirectory(at: url, withIntermediateDirectories: true)
     }
 
-    func removeIfExists(_ url: URL) {
+    func removeItemIfPresent(_ url: URL) throws {
         let fm = FileManager.default
         let isSymlink = (try? fm.destinationOfSymbolicLink(atPath: url.path)) != nil
         if fm.fileExists(atPath: url.path) || isSymlink {
-            try? fm.removeItem(at: url)
+            try fm.removeItem(at: url)
         }
+    }
+
+    func removeIfExists(_ url: URL) {
+        try? removeItemIfPresent(url)
     }
 
     func cleanupRawFramesAfterDurableSelection(
@@ -140,55 +158,58 @@ extension PipelineRunner {
     }
 
     func cleanForRetry(failedStage: PipelineStage, paths: ProjectPaths) throws {
+        func removeAcceptedGeometryAndTraining() throws {
+            try self.removeItemIfPresent(
+                paths.colmapRefinementSeedModelURL.deletingLastPathComponent()
+            )
+            try self.removeItemIfPresent(paths.colmapSparseURL)
+            try self.removeItemIfPresent(paths.geometryManifestURL)
+            try self.removeItemIfPresent(paths.trainingURL)
+        }
+
         switch failedStage {
         case .importInput:
-            return
+            try removeAcceptedGeometryAndTraining()
         case .extractFrames:
-            self.removeIfExists(paths.framesRawURL)
-            self.removeIfExists(paths.framesRawManifestURL)
-            self.removeIfExists(paths.framesSelectedURL)
-            self.removeIfExists(paths.framesSelectedManifestURL)
-            self.removeIfExists(paths.colmapDatabaseURL)
-            self.removeIfExists(paths.colmapFeatureEvidenceURL)
-            self.removeIfExists(paths.pairGraphEvidenceURL)
-            self.removeIfExists(paths.colmapSeedURL)
-            self.removeIfExists(paths.colmapSparseURL)
-            self.removeIfExists(paths.trainingURL)
+            try self.removeItemIfPresent(paths.framesRawURL)
+            try self.removeItemIfPresent(paths.framesRawManifestURL)
+            try self.removeItemIfPresent(paths.framesSelectedURL)
+            try self.removeItemIfPresent(paths.framesSelectedManifestURL)
+            try self.removeItemIfPresent(paths.colmapDatabaseURL)
+            try self.removeItemIfPresent(paths.colmapFeatureEvidenceURL)
+            try self.removeItemIfPresent(paths.pairGraphEvidenceURL)
+            try self.removeItemIfPresent(paths.colmapSeedURL)
+            try removeAcceptedGeometryAndTraining()
         case .selectFrames:
-            self.removeIfExists(paths.framesSelectedURL)
-            self.removeIfExists(paths.framesSelectedManifestURL)
-            self.removeIfExists(paths.colmapDatabaseURL)
-            self.removeIfExists(paths.colmapFeatureEvidenceURL)
-            self.removeIfExists(paths.pairGraphEvidenceURL)
-            self.removeIfExists(paths.colmapSeedURL)
-            self.removeIfExists(paths.colmapSparseURL)
-            self.removeIfExists(paths.trainingURL)
+            try self.removeItemIfPresent(paths.framesSelectedURL)
+            try self.removeItemIfPresent(paths.framesSelectedManifestURL)
+            try self.removeItemIfPresent(paths.colmapDatabaseURL)
+            try self.removeItemIfPresent(paths.colmapFeatureEvidenceURL)
+            try self.removeItemIfPresent(paths.pairGraphEvidenceURL)
+            try self.removeItemIfPresent(paths.colmapSeedURL)
+            try removeAcceptedGeometryAndTraining()
         case .sfmFeatures:
-            self.removeIfExists(paths.colmapDatabaseURL)
-            self.removeIfExists(paths.colmapFeatureEvidenceURL)
-            self.removeIfExists(paths.pairGraphEvidenceURL)
-            self.removeIfExists(paths.colmapSeedURL)
-            self.removeIfExists(paths.colmapSparseURL)
-            self.removeIfExists(paths.trainingURL)
+            try self.removeItemIfPresent(paths.colmapDatabaseURL)
+            try self.removeItemIfPresent(paths.colmapFeatureEvidenceURL)
+            try self.removeItemIfPresent(paths.pairGraphEvidenceURL)
+            try self.removeItemIfPresent(paths.colmapSeedURL)
+            try removeAcceptedGeometryAndTraining()
         case .sfmMatching:
             let databaseIsSymlink =
                 (try? FileManager.default.destinationOfSymbolicLink(
                     atPath: paths.colmapDatabaseURL.path
                 )) != nil
             if databaseIsSymlink {
-                self.removeIfExists(paths.colmapDatabaseURL)
+                try self.removeItemIfPresent(paths.colmapDatabaseURL)
             } else if FileManager.default.fileExists(atPath: paths.colmapDatabaseURL.path) {
                 try ColmapDatabaseMatchStore.clearMatchingResults(
                     at: paths.colmapDatabaseURL
                 )
             }
-            self.removeIfExists(paths.pairGraphEvidenceURL)
-            self.removeIfExists(paths.colmapSeedURL)
-            self.removeIfExists(paths.colmapSparseURL)
-            self.removeIfExists(paths.trainingURL)
+            try self.removeItemIfPresent(paths.pairGraphEvidenceURL)
+            try removeAcceptedGeometryAndTraining()
         case .sfmMapping:
-            self.removeIfExists(paths.colmapSparseURL)
-            self.removeIfExists(paths.trainingURL)
+            try removeAcceptedGeometryAndTraining()
         case .trainSplat:
             return
         case .exportSplat:
@@ -196,6 +217,32 @@ extension PipelineRunner {
         case .done:
             return
         }
+    }
+
+    func invalidateAcceptedArtifactsForGeometryRerun(
+        startingAt stage: PipelineStage,
+        metadata: inout ProjectMetadata,
+        paths: ProjectPaths
+    ) throws {
+        try removeItemIfPresent(
+            paths.colmapRefinementSeedModelURL.deletingLastPathComponent()
+        )
+        try removeItemIfPresent(paths.colmapSparseURL)
+        try removeItemIfPresent(paths.geometryManifestURL)
+        try removeItemIfPresent(paths.trainingURL)
+
+        metadata.geometryArtifact = nil
+        metadata.reconstruction = nil
+        metadata.trainingArtifact = nil
+        metadata.checkpoint = nil
+        let rerunIndex = PipelineStage.allCases.firstIndex(of: stage) ?? 0
+        metadata.stageTimings = metadata.stageTimings?.filter { timing in
+            (PipelineStage.allCases.firstIndex(of: timing.stage) ?? 0) < rerunIndex
+        }
+        try ProjectMetadataStore.savePreservingUserEditableFields(
+            metadata,
+            to: paths.metadataURL
+        )
     }
 
     /// Invalidates every artifact downstream of a changed run policy before the new
@@ -281,7 +328,7 @@ extension PipelineRunner {
             case let .geometryCoverageTooLow(registered, total):
                 return (
                     "The capture did not have enough connected overlap. Try again with more overlap.",
-                    "Canonical model registered \(registered) of \(total) selected views; at least 90% is required."
+                    "Accepted reconstruction registered \(registered) of \(total) selected views; at least 90% is required."
                 )
             case let .geometryResidualCoverageTooLow(measured, total):
                 return (
@@ -291,7 +338,7 @@ extension PipelineRunner {
             case .geometryRegisteredImagesMismatch:
                 return (
                     "The camera solve did not match this capture. Try again.",
-                    "Canonical model registered image names outside the selected-frame set."
+                    "Accepted reconstruction contains image names outside the selected-frame set."
                 )
             case let .geometryResidualsUnavailable(reason):
                 return (
@@ -555,7 +602,12 @@ extension PipelineRunner {
         case .sfmMapping:
             let sparseZero = paths.colmapSparseURL.appendingPathComponent("0", isDirectory: true)
             guard sparseModelFilesExist(at: sparseZero) else { return .missing }
-            let textStats = colmapSparseTextStats(at: sparseZero)
+            let textStats: ColmapSparseTextStats
+            do {
+                textStats = try colmapSparseTextStats(at: sparseZero)
+            } catch {
+                return .corrupt(reason: error.localizedDescription)
+            }
             for name in ["cameras.bin", "images.bin", "points3D.bin", "cameras.txt", "images.txt", "points3D.txt"] {
                 let fileURL = sparseZero.appendingPathComponent(name)
                 if !fm.fileExists(atPath: fileURL.path) { continue }
@@ -575,12 +627,7 @@ extension PipelineRunner {
             }
             let imagesTxt = sparseZero.appendingPathComponent("images.txt")
             if fm.fileExists(atPath: imagesTxt.path) {
-                let text = (try? String(contentsOf: imagesTxt, encoding: .utf8)) ?? ""
-                let imageRows = text.split(separator: "\n").filter { line in
-                    let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
-                    return !trimmed.isEmpty && !trimmed.hasPrefix("#")
-                }
-                if imageRows.isEmpty {
+                if (textStats.registeredImageCount ?? 0) <= 0 {
                     return .corrupt(reason: "images.txt has no registered images")
                 }
             } else {
@@ -698,29 +745,70 @@ extension PipelineRunner {
         return image.width > 0 && image.height > 0
     }
 
-    func colmapSparseTextStats(at sparseZero: URL) -> ColmapSparseTextStats {
+    func colmapSparseTextStats(at sparseZero: URL) throws -> ColmapSparseTextStats {
+        let fileManager = FileManager.default
         let imagesTxt = sparseZero.appendingPathComponent("images.txt")
         var registeredImageCount: Int?
-        if let text = try? String(contentsOf: imagesTxt, encoding: .utf8) {
-            registeredImageCount = text
-                .components(separatedBy: .newlines)
-                .filter { isColmapImagePoseRow($0) }
-                .count
+        if fileManager.fileExists(atPath: imagesTxt.path)
+            || (try? fileManager.destinationOfSymbolicLink(atPath: imagesTxt.path)) != nil {
+            let reader = try BoundedUTF8LineReader(
+                at: imagesTxt,
+                maximumBytes: ColmapTextFileLimits.images,
+                maximumLineBytes: ColmapTextFileLimits.maximumLine
+            )
+            var count = 0
+            var pendingPoseLine: Int?
+            while let rawLine = try reader.next() {
+                let line = rawLine.text.trimmingCharacters(in: .whitespacesAndNewlines)
+                if pendingPoseLine != nil {
+                    try validateColmapImageObservations(line, lineNumber: rawLine.number)
+                    pendingPoseLine = nil
+                    continue
+                }
+                if line.isEmpty || line.hasPrefix("#") { continue }
+                try validateColmapImagePose(line, lineNumber: rawLine.number)
+                let increment = count.addingReportingOverflow(1)
+                guard !increment.overflow else {
+                    throw ColmapSparseTextScanError.countOverflow(file: "images.txt")
+                }
+                count = increment.partialValue
+                pendingPoseLine = rawLine.number
+            }
+            if let pendingPoseLine {
+                throw ColmapSparseTextScanError.malformedRecord(
+                    file: "images.txt",
+                    line: pendingPoseLine
+                )
+            }
+            registeredImageCount = count
         }
 
         let pointsTxt = sparseZero.appendingPathComponent("points3D.txt")
         var pointCount: Int?
         var observationCount: Int?
-        if let text = try? String(contentsOf: pointsTxt, encoding: .utf8) {
+        if fileManager.fileExists(atPath: pointsTxt.path)
+            || (try? fileManager.destinationOfSymbolicLink(atPath: pointsTxt.path)) != nil {
+            let reader = try BoundedUTF8LineReader(
+                at: pointsTxt,
+                maximumBytes: ColmapTextFileLimits.points,
+                maximumLineBytes: ColmapTextFileLimits.maximumLine
+            )
             var points = 0
             var observations = 0
-            for line in text.split(separator: "\n") {
-                let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
-                guard !trimmed.isEmpty, !trimmed.hasPrefix("#") else { continue }
-                let parts = trimmed.split(separator: " ")
-                guard parts.count >= 8 else { continue }
-                points += 1
-                observations += max(0, (parts.count - 8) / 2)
+            while let rawLine = try reader.next() {
+                let line = rawLine.text.trimmingCharacters(in: .whitespacesAndNewlines)
+                if line.isEmpty || line.hasPrefix("#") { continue }
+                let trackCount = try validateColmapPoint(line, lineNumber: rawLine.number)
+                let nextPoints = points.addingReportingOverflow(1)
+                guard !nextPoints.overflow else {
+                    throw ColmapSparseTextScanError.countOverflow(file: "points3D.txt")
+                }
+                let nextObservations = observations.addingReportingOverflow(trackCount)
+                guard !nextObservations.overflow else {
+                    throw ColmapSparseTextScanError.countOverflow(file: "points3D.txt")
+                }
+                points = nextPoints.partialValue
+                observations = nextObservations.partialValue
             }
             pointCount = points
             observationCount = observations
@@ -740,15 +828,126 @@ extension PipelineRunner {
         )
     }
 
-    private func isColmapImagePoseRow(_ line: String) -> Bool {
-        let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty, !trimmed.hasPrefix("#") else { return false }
-        let parts = trimmed.split(maxSplits: 9, whereSeparator: { $0 == " " || $0 == "\t" })
-        guard parts.count >= 10 else { return false }
-        guard Int(parts[0]) != nil else { return false }
-        return parts[1..<9].allSatisfy { Double(String($0)) != nil }
-            && Int(parts[8]) != nil
-            && String(parts[9]).rangeOfCharacter(from: .letters) != nil
+    private func validateColmapImagePose(_ line: String, lineNumber: Int) throws {
+        var fields = ColmapTextTokenScanner(line)
+        guard let imageIDField = fields.next(),
+              let qwField = fields.next(),
+              let qxField = fields.next(),
+              let qyField = fields.next(),
+              let qzField = fields.next(),
+              let txField = fields.next(),
+              let tyField = fields.next(),
+              let tzField = fields.next(),
+              let cameraIDField = fields.next(),
+              fields.next() != nil,
+              let imageID = Int(imageIDField), imageID > 0,
+              let qw = Double(qwField), qw.isFinite,
+              let qx = Double(qxField), qx.isFinite,
+              let qy = Double(qyField), qy.isFinite,
+              let qz = Double(qzField), qz.isFinite,
+              let tx = Double(txField), tx.isFinite,
+              let ty = Double(tyField), ty.isFinite,
+              let tz = Double(tzField), tz.isFinite,
+              let cameraID = Int(cameraIDField), cameraID > 0 else {
+            throw ColmapSparseTextScanError.malformedRecord(
+                file: "images.txt",
+                line: lineNumber
+            )
+        }
+        let quaternionNormSquared = qw * qw + qx * qx + qy * qy + qz * qz
+        guard quaternionNormSquared.isFinite,
+              quaternionNormSquared > 0 else {
+            throw ColmapSparseTextScanError.malformedRecord(
+                file: "images.txt",
+                line: lineNumber
+            )
+        }
+    }
+
+    private func validateColmapImageObservations(_ line: String, lineNumber: Int) throws {
+        var fields = ColmapTextTokenScanner(line)
+        while let xField = fields.next() {
+            guard let yField = fields.next(),
+                  let pointIDField = fields.next(),
+                  let x = Double(xField), x.isFinite,
+                  let y = Double(yField), y.isFinite,
+                  let pointID = Int64(pointIDField), pointID == -1 || pointID > 0 else {
+                throw ColmapSparseTextScanError.malformedRecord(
+                    file: "images.txt",
+                    line: lineNumber
+                )
+            }
+        }
+    }
+
+    private func validateColmapPoint(_ line: String, lineNumber: Int) throws -> Int {
+        var fields = ColmapTextTokenScanner(line)
+        guard let pointIDField = fields.next(),
+              let xField = fields.next(),
+              let yField = fields.next(),
+              let zField = fields.next(),
+              let redField = fields.next(),
+              let greenField = fields.next(),
+              let blueField = fields.next(),
+              let errorField = fields.next(),
+              let pointID = Int64(pointIDField), pointID > 0,
+              let x = Double(xField), x.isFinite,
+              let y = Double(yField), y.isFinite,
+              let z = Double(zField), z.isFinite,
+              let red = Int(redField), (0...255).contains(red),
+              let green = Int(greenField), (0...255).contains(green),
+              let blue = Int(blueField), (0...255).contains(blue),
+              let error = Double(errorField), error.isFinite, error >= 0 else {
+            throw ColmapSparseTextScanError.malformedRecord(
+                file: "points3D.txt",
+                line: lineNumber
+            )
+        }
+        var trackCount = 0
+        while let imageIDField = fields.next() {
+            guard let point2DIndexField = fields.next(),
+                  let imageID = Int(imageIDField), imageID > 0,
+                  let point2DIndex = Int(point2DIndexField), point2DIndex >= 0 else {
+                throw ColmapSparseTextScanError.malformedRecord(
+                    file: "points3D.txt",
+                    line: lineNumber
+                )
+            }
+            let increment = trackCount.addingReportingOverflow(1)
+            guard !increment.overflow else {
+                throw ColmapSparseTextScanError.countOverflow(file: "points3D.txt")
+            }
+            trackCount = increment.partialValue
+        }
+        guard trackCount > 0 else {
+            throw ColmapSparseTextScanError.malformedRecord(
+                file: "points3D.txt",
+                line: lineNumber
+            )
+        }
+        return trackCount
+    }
+
+    private struct ColmapTextTokenScanner {
+        private let text: String
+        private var index: String.Index
+
+        init(_ text: String) {
+            self.text = text
+            index = text.startIndex
+        }
+
+        mutating func next() -> Substring? {
+            while index < text.endIndex, text[index].isWhitespace {
+                text.formIndex(after: &index)
+            }
+            guard index < text.endIndex else { return nil }
+            let start = index
+            while index < text.endIndex, !text[index].isWhitespace {
+                text.formIndex(after: &index)
+            }
+            return text[start..<index]
+        }
     }
 
     func isStageComplete(_ stage: PipelineStage, paths: ProjectPaths, metadata: ProjectMetadata) -> Bool {

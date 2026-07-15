@@ -10,15 +10,20 @@ extension PipelineRunner {
         selectedFrames: [URL],
         selectedFrameManifest: [SelectedFrameMapping],
         peakMemoryBytes: Int64,
-        pairGraph: PairGraphArtifact
+        pairGraph: PairGraphArtifact,
+        acceptedReconstructionSummary: ReconstructionSummary?,
+        currentMappingDurationSeconds: () -> TimeInterval?
     ) throws {
         let modelDirectory = paths.colmapSparseURL.appendingPathComponent("0", isDirectory: true)
         // The artifact contract uses COLMAP's text form so residuals remain inspectable
         // and model files remain hashable across trainer versions.
         _ = try ensureTextSparseModelFiles(at: modelDirectory)
+        let sourceSnapshot = try GeometryModelSnapshot.capture(in: modelDirectory)
+        let sourceModelHashes = sourceSnapshot.modelHashes
         let residuals: ColmapResidualAnalyzer.Result
         do {
             residuals = try ColmapResidualAnalyzer.analyze(modelDirectory: modelDirectory)
+            try GeometryModelSnapshot.validate(sourceSnapshot, at: modelDirectory)
         } catch {
             throw PipelineError.geometryResidualsUnavailable(error.localizedDescription)
         }
@@ -69,19 +74,10 @@ extension PipelineRunner {
         guard peakMemoryBytes > 0 else {
             throw PipelineError.geometryResidualsUnavailable("Peak resident memory could not be measured")
         }
-        let modelFiles = ["cameras.txt", "images.txt", "points3D.txt"].map {
-            modelDirectory.appendingPathComponent($0)
-        }
-        let modelHashes = try Dictionary(uniqueKeysWithValues: modelFiles.map { file in
-            (file.lastPathComponent, try GeometryArtifactStore.sha256(of: file))
-        })
         let fallbackReason = resolvedPlan.routeIdentifier == SfmBackend.da3.rawValue
             && !mapper.lowercased().contains("da3")
             ? "learned geometry did not pass; used classical compatibility solve"
             : nil
-        let timings = Dictionary(uniqueKeysWithValues: (metadata.stageTimings ?? []).map {
-            ($0.stage.rawValue, $0.durationSeconds)
-        })
         let provenance = try geometryProvenance(
             acceptedDa3ModelSubdirectory: acceptedDa3ModelSubdirectory
         )
@@ -94,6 +90,27 @@ extension PipelineRunner {
             runtimeVersion = "toolchain \(provenance.toolchainVersion)"
         }
         let modelVersion = provenance.model.map { "\($0.identifier)@\($0.revision)" } ?? "none"
+
+        let orientationEstimationClock = ContinuousClock()
+        let orientationEstimationStart = orientationEstimationClock.now
+        let isOrderedInput: Bool
+        switch resolvedPlan.pairingPolicy {
+        case .unorderedRetrieval, .segmentedMixed:
+            isOrderedInput = false
+        case .orderedContinuous, .orderedOrbit, .orderedWalkthrough, .orderedLargeArea:
+            isOrderedInput = true
+        }
+        let allowCameraUpFallback = resolvedPlan.pairingPolicy == .orderedContinuous
+            || resolvedPlan.pairingPolicy == .orderedWalkthrough
+        let orientation = CanonicalOrientationEstimator.estimate(
+            cameras: residuals.cameraSamples,
+            orderedImageNames: orderedFrames.map(\.lastPathComponent),
+            orderedInput: isOrderedInput,
+            allowCameraUpFallback: allowCameraUpFallback,
+            deterministicSeed: resolvedPlan.deterministicSeed
+        )
+        let orientationEstimationDuration = orientationEstimationClock.now - orientationEstimationStart
+
         let learnedPointInitializer: LearnedPointInitializerArtifact?
         if provenance.model != nil {
             let manifest = try Da3CoverageManifest.load(from: paths.da3CoverageManifestURL)
@@ -106,21 +123,31 @@ extension PipelineRunner {
                   pointCount <= maximumPointCount else {
                 throw PipelineError.outputMissing
             }
-            let relativePath = "SfM/colmap/seed/0/learned_points3D.txt"
-            let initializerURL = try paths.resolveProjectRelativePath(relativePath)
+            let rawURL = paths.colmapSeedModelURL.appendingPathComponent("learned_points3D.txt")
             let validation = try Da3LearnedPointInitializer.inspect(
-                learnedPointsURL: initializerURL,
+                learnedPointsURL: rawURL,
                 expectedPointCount: pointCount,
                 maximumPointCount: maximumPointCount
             )
             learnedPointInitializer = LearnedPointInitializerArtifact(
-                path: relativePath,
+                path: "SfM/colmap/seed/0/learned_points3D.txt",
                 sha256: validation.sha256,
                 pointCount: validation.pointCount
             )
         } else {
             learnedPointInitializer = nil
         }
+        var timings = Dictionary(uniqueKeysWithValues: (metadata.stageTimings ?? []).map {
+            ($0.stage.rawValue, $0.durationSeconds)
+        })
+        if let mappingDuration = currentMappingDurationSeconds() {
+            timings[PipelineStage.sfmMapping.rawValue] = mappingDuration
+        }
+        timings["orientation_estimation_seconds"] = max(
+            0,
+            TimeInterval(orientationEstimationDuration.components.seconds)
+                + TimeInterval(orientationEstimationDuration.components.attoseconds) / 1e18
+        )
         let artifact = GeometryArtifact(
             schemaVersion: GeometryArtifact.currentSchemaVersion,
             solverVersion: solverVersion,
@@ -133,12 +160,12 @@ extension PipelineRunner {
             ),
             orderedImageNames: orderedFrames.map(\.lastPathComponent),
             orderedImageTimestamps: orderedTimestamps,
-            canonicalModelPath: "SfM/colmap/sparse/0",
+            sourceModelPath: "SfM/colmap/sparse/0",
             poseConvention: "world-to-camera",
             quaternionOrder: "wxyz",
             handedness: "right-handed",
             scaleType: "arbitrary-sim3",
-            cameraModel: try Self.firstCameraModel(in: modelFiles[0]),
+            cameraModel: residuals.cameraModel,
             cameraGrouping: resolvedPlan.cameraGrouping,
             registeredViewCount: residuals.registeredViewCount,
             totalViewCount: orderedFrames.count,
@@ -149,39 +176,37 @@ extension PipelineRunner {
             p90PixelResidual: residuals.p90PixelResidual,
             timings: timings,
             peakMemoryBytes: peakMemoryBytes,
-            modelHashes: modelHashes,
+            modelHashes: sourceModelHashes,
             fallbackReason: fallbackReason,
             provenance: provenance,
             pairGraph: pairGraph,
-            learnedPointInitializer: learnedPointInitializer
+            learnedPointInitializer: learnedPointInitializer,
+            canonicalOrientation: orientation.artifact
         )
-        metadata.reconstruction = ReconstructionSummary(
+        let reconstruction = ReconstructionSummary(
             mapper: mapper,
-            capturedAt: metadata.reconstruction?.capturedAt ?? Date(),
+            capturedAt: acceptedReconstructionSummary?.capturedAt
+                ?? metadata.reconstruction?.capturedAt
+                ?? Date(),
             registeredImages: residuals.registeredViewCount,
             totalImages: orderedFrames.count,
             meanReprojectionError: residuals.meanPixelResidual,
             pointCount: residuals.pointCount,
             observationCount: residuals.observationCount,
-            meanTrackLength: Double(residuals.observationCount) / Double(residuals.pointCount)
+            meanTrackLength: Double(residuals.observationCount)
+                / Double(residuals.pointCount)
         )
+        try Task.checkCancellation()
+        var persistedMetadata = metadata
+        persistedMetadata.reconstruction = reconstruction
         try GeometryArtifactStore.persist(
             artifact,
-            metadata: &metadata,
+            metadata: &persistedMetadata,
             paths: paths,
-            measuredResiduals: residuals
+            measuredResiduals: residuals,
+            verifiedSourceSnapshot: sourceSnapshot
         )
-    }
-
-    private static func firstCameraModel(in camerasFile: URL) throws -> String {
-        let text = try String(contentsOf: camerasFile, encoding: .utf8)
-        for rawLine in text.components(separatedBy: .newlines) {
-            let line = rawLine.trimmingCharacters(in: .whitespacesAndNewlines)
-            if line.isEmpty || line.hasPrefix("#") { continue }
-            let fields = line.split(whereSeparator: \.isWhitespace)
-            if fields.count >= 2 { return String(fields[1]) }
-        }
-        throw PipelineError.geometryResidualsUnavailable("cameras.txt contains no camera record")
+        metadata = persistedMetadata
     }
 
     private func geometryProvenance(

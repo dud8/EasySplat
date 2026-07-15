@@ -2,6 +2,20 @@ import XCTest
 @testable import EasySplatCore
 
 final class PipelineLoggerTests: XCTestCase {
+    func testStageTimingCanBeSampledWithoutStoppingTheStage() throws {
+        let tracker = StageTimingTracker()
+        tracker.start(.sfmMapping)
+        Thread.sleep(forTimeInterval: 0.01)
+
+        let sampled = try XCTUnwrap(tracker.elapsedSeconds(.sfmMapping))
+        Thread.sleep(forTimeInterval: 0.01)
+        XCTAssertNotNil(tracker.finish(.sfmMapping))
+        let finished = try XCTUnwrap(tracker.consumeRecord(.sfmMapping))
+
+        XCTAssertGreaterThan(sampled, 0)
+        XCTAssertGreaterThan(finished.durationSeconds, sampled)
+    }
+
     func testStageTimingAccumulatesFailedAndSuccessfulRetryAttempts() throws {
         let tracker = StageTimingTracker()
         tracker.start(.sfmMapping)

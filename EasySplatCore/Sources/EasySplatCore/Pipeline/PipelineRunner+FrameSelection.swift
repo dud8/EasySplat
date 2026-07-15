@@ -392,6 +392,7 @@ extension PipelineRunner {
             )
         }
         let largestDimension = max(width, height)
+        let orientation = (properties[kCGImagePropertyOrientation] as? NSNumber)?.intValue ?? 1
         let boundedDimension: Int
         if maxDimension.isFinite, maxDimension > 0 {
             let clampedDimension = min(CGFloat(largestDimension), maxDimension.rounded(.down))
@@ -401,6 +402,7 @@ extension PipelineRunner {
         }
         let needsTranscode = exposureEV > 0
             || isHeicImage(source)
+            || orientation != 1
             || largestDimension > boundedDimension
         guard needsTranscode else {
             try FileManager.default.copyItem(at: source, to: destination)

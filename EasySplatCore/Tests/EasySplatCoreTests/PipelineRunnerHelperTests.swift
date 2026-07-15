@@ -1,4 +1,6 @@
 import ImageIO
+import SQLite3
+import UniformTypeIdentifiers
 import XCTest
 @testable import EasySplatCore
 
@@ -48,6 +50,118 @@ final class PipelineRunnerHelperTests: XCTestCase {
 
         let resolved = try runner.test_resolveSparseModelDirectory(sparseRoot)
         XCTAssertEqual(resolved.standardizedFileURL, nested.standardizedFileURL)
+    }
+
+    func testPrepareDa3RefinementSeedBuildsFreshTextOnlyModelWithoutChangingRawSeed() throws {
+        let root = try TestFileBuilder.makeTempDir()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let rawModel = root.appendingPathComponent("raw/0", isDirectory: true)
+        try FileManager.default.createDirectory(at: rawModel, withIntermediateDirectories: true)
+        let rawFiles: [String: Data] = [
+            "cameras.txt": Data("1 PINHOLE 100 80 50 50 50 40\n".utf8),
+            "images.txt": Data("1 1 0 0 0 0 0 0 1 café frame.jpg".utf8),
+            "points3D.txt": Data("1 0 0 1 255 255 255 0 1 0\n".utf8),
+            "learned_points3D.txt": Data("1 0 0 1 255 255 255 -1\n".utf8),
+        ]
+        for (name, data) in rawFiles {
+            try data.write(to: rawModel.appendingPathComponent(name))
+        }
+        let outputModel = root.appendingPathComponent("refinement/0", isDirectory: true)
+        try FileManager.default.createDirectory(at: outputModel, withIntermediateDirectories: true)
+        try Data("stale".utf8).write(to: outputModel.appendingPathComponent("cameras.bin"))
+        try Data("stale".utf8).write(to: outputModel.appendingPathComponent("notes.json"))
+        let databaseURL = root.appendingPathComponent("database.db")
+        try writeImageMappingDatabase(
+            at: databaseURL,
+            rows: [(1, "café frame.jpg", 1)]
+        )
+
+        let changed = try makeRunner(projectURL: root).prepareDa3RefinementSeed(
+            rawModelURL: rawModel,
+            outputModelURL: outputModel,
+            databaseURL: databaseURL
+        )
+
+        XCTAssertTrue(changed)
+        XCTAssertEqual(
+            try FileManager.default.contentsOfDirectory(atPath: outputModel.path).sorted(),
+            ["cameras.txt", "images.txt", "points3D.txt"]
+        )
+        for (name, data) in rawFiles {
+            XCTAssertEqual(try Data(contentsOf: rawModel.appendingPathComponent(name)), data)
+        }
+    }
+
+    func testPrepareDa3RefinementSeedFailureRemovesPartialAndStaleOutput() throws {
+        let root = try TestFileBuilder.makeTempDir()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let rawModel = root.appendingPathComponent("raw/0", isDirectory: true)
+        try FileManager.default.createDirectory(at: rawModel, withIntermediateDirectories: true)
+        try Data("1 PINHOLE 100 80 50 50 50 40\n".utf8)
+            .write(to: rawModel.appendingPathComponent("cameras.txt"))
+        try Data("1 1 0 0 0 0 0 0 1 frame.jpg\n\n".utf8)
+            .write(to: rawModel.appendingPathComponent("images.txt"))
+        let points = (1...10_000).map { "\($0) 0 0 1 255 255 255 0 1 0" }
+            .joined(separator: "\n") + "\n10001 malformed\n"
+        try Data(points.utf8).write(to: rawModel.appendingPathComponent("points3D.txt"))
+        let outputParent = root.appendingPathComponent("refinement", isDirectory: true)
+        let outputModel = outputParent.appendingPathComponent("0", isDirectory: true)
+        try FileManager.default.createDirectory(at: outputModel, withIntermediateDirectories: true)
+        try Data("stale".utf8).write(to: outputModel.appendingPathComponent("cameras.bin"))
+        let databaseURL = root.appendingPathComponent("database.db")
+        try writeImageMappingDatabase(at: databaseURL, rows: [(10, "frame.jpg", 20)])
+
+        XCTAssertThrowsError(
+            try makeRunner(projectURL: root).prepareDa3RefinementSeed(
+                rawModelURL: rawModel,
+                outputModelURL: outputModel,
+                databaseURL: databaseURL
+            )
+        )
+
+        XCTAssertFalse(FileManager.default.fileExists(atPath: outputParent.path))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: rawModel.path))
+    }
+
+    func testPrepareDa3RefinementSeedCancellationInterruptsEveryTextFileCopy() throws {
+        for targetName in ["cameras.txt", "images.txt", "points3D.txt"] {
+            let root = try TestFileBuilder.makeTempDir()
+            defer { try? FileManager.default.removeItem(at: root) }
+            let rawModel = root.appendingPathComponent("raw/0", isDirectory: true)
+            try FileManager.default.createDirectory(at: rawModel, withIntermediateDirectories: true)
+            try Data("1 PINHOLE 100 80 50 50 50 40\n".utf8)
+                .write(to: rawModel.appendingPathComponent("cameras.txt"))
+            try Data("1 1 0 0 0 0 0 0 1 frame.jpg\n\n".utf8)
+                .write(to: rawModel.appendingPathComponent("images.txt"))
+            try Data("1 0 0 1 255 255 255 0 1 0\n".utf8)
+                .write(to: rawModel.appendingPathComponent("points3D.txt"))
+            let outputParent = root.appendingPathComponent("refinement", isDirectory: true)
+            let outputModel = outputParent.appendingPathComponent("0", isDirectory: true)
+            let databaseURL = root.appendingPathComponent("database.db")
+            try writeImageMappingDatabase(at: databaseURL, rows: [(10, "frame.jpg", 20)])
+            var reachedTarget = false
+
+            XCTAssertThrowsError(
+                try makeRunner(projectURL: root).prepareDa3RefinementSeed(
+                    rawModelURL: rawModel,
+                    outputModelURL: outputModel,
+                    databaseURL: databaseURL,
+                    checkCancellation: {
+                        guard FileManager.default.fileExists(
+                            atPath: outputModel.appendingPathComponent(targetName).path
+                        ) else { return }
+                        reachedTarget = true
+                        throw CancellationError()
+                    }
+                )
+            ) { error in
+                XCTAssertTrue(error is CancellationError, "Unexpected error: \(error)")
+            }
+
+            XCTAssertTrue(reachedTarget, "Cancellation never reached \(targetName)")
+            XCTAssertFalse(FileManager.default.fileExists(atPath: outputParent.path))
+            XCTAssertTrue(FileManager.default.fileExists(atPath: rawModel.path))
+        }
     }
 
     func testShouldUseSequentialConditions() throws {
@@ -251,6 +365,46 @@ final class PipelineRunnerHelperTests: XCTestCase {
         )
     }
 
+    func testCopySelectedBakesJPEGOrientationIntoPixels() throws {
+        let root = try TestFileBuilder.makeTempDir()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let source = root.appendingPathComponent("oriented.jpg")
+        try writeOrientedJPEG(to: source, width: 8, height: 12, orientation: 6)
+        XCTAssertEqual(try FrameScoring.scoreFrame(at: source).lowLightExposureEV, 0)
+
+        let selected = root.appendingPathComponent("selected", isDirectory: true)
+        try FileManager.default.createDirectory(at: selected, withIntermediateDirectories: true)
+        let runner = makeRunner(projectURL: root)
+        _ = try runner.test_copySelected(
+            groups: [.init(id: "photos", frames: [source], isVideo: false)],
+            to: selected,
+            manifestURL: root.appendingPathComponent("selected_frames.json"),
+            maxDimension: 128
+        )
+
+        let output = selected.appendingPathComponent("frame_000000.jpg")
+        let outputSource = try XCTUnwrap(CGImageSourceCreateWithURL(output as CFURL, nil))
+        let outputProperties = try XCTUnwrap(
+            CGImageSourceCopyPropertiesAtIndex(outputSource, 0, nil) as? [CFString: Any]
+        )
+        XCTAssertEqual(
+            (outputProperties[kCGImagePropertyPixelWidth] as? NSNumber)?.intValue,
+            12
+        )
+        XCTAssertEqual(
+            (outputProperties[kCGImagePropertyPixelHeight] as? NSNumber)?.intValue,
+            8
+        )
+        XCTAssertEqual(
+            (outputProperties[kCGImagePropertyOrientation] as? NSNumber)?.intValue ?? 1,
+            1
+        )
+
+        let outputImage = try XCTUnwrap(CGImageSourceCreateImageAtIndex(outputSource, 0, nil))
+        let sideMeans = grayscaleSideMeans(outputImage)
+        XCTAssertGreaterThan(sideMeans.left, sideMeans.right + 0.25)
+    }
+
     func testNormalizeSelectedImagesForToolingHeic() throws {
         let root = try TestFileBuilder.makeTempDir()
         defer { try? FileManager.default.removeItem(at: root) }
@@ -280,6 +434,82 @@ final class PipelineRunnerHelperTests: XCTestCase {
         let updatedData = try Data(contentsOf: paths.framesSelectedManifestURL)
         let updated = try JSONDecoder().decode([TestSelectedFrameMapping].self, from: updatedData)
         XCTAssertEqual(updated.first?.outputFileName, "frame_000000.jpg")
+    }
+
+    private func writeOrientedJPEG(
+        to url: URL,
+        width: Int,
+        height: Int,
+        orientation: Int
+    ) throws {
+        var pixels = (0..<height).flatMap { row -> [UInt8] in
+            let value: UInt8
+            switch row {
+            case ..<(height / 3): value = 64
+            case (height / 3)..<(2 * height / 3): value = 160
+            default: value = 240
+            }
+            return [UInt8](repeating: value, count: width)
+        }
+        let data = Data(bytes: &pixels, count: pixels.count)
+        let image = try XCTUnwrap(CGImage(
+            width: width,
+            height: height,
+            bitsPerComponent: 8,
+            bitsPerPixel: 8,
+            bytesPerRow: width,
+            space: CGColorSpaceCreateDeviceGray(),
+            bitmapInfo: CGBitmapInfo(rawValue: CGImageAlphaInfo.none.rawValue),
+            provider: try XCTUnwrap(CGDataProvider(data: data as CFData)),
+            decode: nil,
+            shouldInterpolate: false,
+            intent: .defaultIntent
+        ))
+        let destination = try XCTUnwrap(CGImageDestinationCreateWithURL(
+            url as CFURL,
+            UTType.jpeg.identifier as CFString,
+            1,
+            nil
+        ))
+        CGImageDestinationAddImage(
+            destination,
+            image,
+            [
+                kCGImagePropertyOrientation: orientation,
+                kCGImageDestinationLossyCompressionQuality: 1.0,
+            ] as CFDictionary
+        )
+        XCTAssertTrue(CGImageDestinationFinalize(destination))
+    }
+
+    private func grayscaleSideMeans(_ image: CGImage) -> (left: Double, right: Double) {
+        let width = image.width
+        let height = image.height
+        var pixels = [UInt8](repeating: 0, count: width * height)
+        pixels.withUnsafeMutableBytes { bytes in
+            let context = CGContext(
+                data: bytes.baseAddress,
+                width: width,
+                height: height,
+                bitsPerComponent: 8,
+                bytesPerRow: width,
+                space: CGColorSpaceCreateDeviceGray(),
+                bitmapInfo: CGImageAlphaInfo.none.rawValue
+            )
+            context?.draw(image, in: CGRect(x: 0, y: 0, width: width, height: height))
+        }
+        let columnCount = max(1, width / 3)
+        var left = 0
+        var right = 0
+        for row in 0..<height {
+            let offset = row * width
+            left += pixels[offset..<(offset + columnCount)].reduce(0) { $0 + Int($1) }
+            right += pixels[(offset + width - columnCount)..<(offset + width)].reduce(0) {
+                $0 + Int($1)
+            }
+        }
+        let sampleCount = Double(columnCount * height * 255)
+        return (Double(left) / sampleCount, Double(right) / sampleCount)
     }
 
     func testMapperDefaultsToIntegratedGlobalMapperWithGpuEnabled() async throws {
@@ -422,8 +652,9 @@ final class PipelineRunnerHelperTests: XCTestCase {
             value: 128,
             utType: .jpeg
         ))
-        let canonical = paths.colmapSparseURL.appendingPathComponent("0", isDirectory: true)
-        try writeSparseTextModel(at: canonical, cameraModel: "PINHOLE")
+        let sourceSparse = paths.colmapSparseURL.appendingPathComponent("0", isDirectory: true)
+        try writeSparseTextModel(at: sourceSparse, cameraModel: "PINHOLE")
+        let sourceModelBytes = try sparseTextModelBytes(at: sourceSparse)
         try writeLearnedPoints(to: paths.colmapSeedModelURL, count: 2)
         let learnedURL = paths.colmapSeedModelURL.appendingPathComponent("learned_points3D.txt")
         let initializer = LearnedPointInitializerArtifact(
@@ -433,16 +664,34 @@ final class PipelineRunnerHelperTests: XCTestCase {
         )
         let subprocess = MockSubprocessRunner(scripts: [
             modelConverterScript { try self.writeBinaryModel(to: $0) },
-            modelConverterScript { try self.writeBinaryModel(to: $0) },
         ])
         let runner = makeRunner(projectURL: root, subprocess: subprocess)
+        let previousSparse = paths.trainingURL.appendingPathComponent(
+            "msplat_dataset/sparse/0",
+            isDirectory: true
+        )
+        try FileManager.default.createDirectory(at: previousSparse, withIntermediateDirectories: true)
+        try Data(#"{"stale":true}"#.utf8).write(
+            to: previousSparse.appendingPathComponent("easysplat_orientation.json")
+        )
+        let halfTurn = CanonicalQuaternionWXYZ(w: 0, x: 1, y: 0, z: 0)
+        let geometryArtifact = try trainingGeometryArtifact(
+            sourceSparse: sourceSparse,
+            learnedPointInitializer: initializer,
+            canonicalOrientation: testOrientation(
+                status: .verified,
+                quaternion: halfTurn
+            )
+        )
 
-        let dataset = try await runner.prepareMsplatDataset(
+        var progressValues: [Double] = []
+        let preparedDataset = try await runner.prepareMsplatDataset(
             paths: paths,
             maxImageSize: 1_024,
-            learnedPointInitializer: initializer,
-            progress: { _, _ in }
+            geometryArtifact: geometryArtifact,
+            progress: { value, _ in progressValues.append(value) }
         )
+        let dataset = preparedDataset.url
 
         let points = try String(
             contentsOf: dataset.appendingPathComponent("sparse/0/points3D.txt"),
@@ -450,7 +699,26 @@ final class PipelineRunnerHelperTests: XCTestCase {
         )
         XCTAssertTrue(points.contains("2 1.0 0.0 2.0 10 20 30 -1.0"))
         XCTAssertTrue(points.contains("3 2.0 0.0 2.0 10 20 30 -1.0"))
-        XCTAssertEqual(subprocess.calls.map { $0.1.first }, ["model_converter", "model_converter"])
+        XCTAssertEqual(subprocess.calls.map { $0.1.first }, ["model_converter"])
+        XCTAssertEqual(
+            try orientationQuaternion(in: dataset),
+            [halfTurn.w, halfTurn.x, halfTurn.y, halfTurn.z]
+        )
+        XCTAssertEqual(preparedDataset.identity.inputDigest.count, 64)
+        XCTAssertEqual(preparedDataset.identity.geometryDigest.count, 64)
+        XCTAssertEqual(progressValues.last, 1)
+        XCTAssertEqual(progressValues, progressValues.sorted())
+        XCTAssertFalse(
+            FileManager.default.fileExists(
+                atPath: sourceSparse.appendingPathComponent("cameras.bin").path
+            )
+        )
+        XCTAssertFalse(
+            FileManager.default.fileExists(
+                atPath: sourceSparse.appendingPathComponent("learned_points3D.txt").path
+            )
+        )
+        XCTAssertEqual(try sparseTextModelBytes(at: sourceSparse), sourceModelBytes)
     }
 
     func testPrepareMsplatDatasetUndistortsFisheyeBeforeTraining() async throws {
@@ -465,8 +733,12 @@ final class PipelineRunnerHelperTests: XCTestCase {
             value: 128,
             utType: .jpeg
         ))
-        let canonical = paths.colmapSparseURL.appendingPathComponent("0", isDirectory: true)
-        try writeSparseTextModel(at: canonical, cameraModel: "OPENCV_FISHEYE")
+        let sourceSparse = paths.colmapSparseURL.appendingPathComponent("0", isDirectory: true)
+        try writeSparseTextModel(at: sourceSparse, cameraModel: "OPENCV_FISHEYE")
+        let sourceModelBytes = try sparseTextModelBytes(at: sourceSparse)
+        for name in ["cameras.bin", "images.bin", "points3D.bin"] {
+            try Data("stale \(name)".utf8).write(to: sourceSparse.appendingPathComponent(name))
+        }
         try writeLearnedPoints(to: paths.colmapSeedModelURL, count: 1)
         let learnedURL = paths.colmapSeedModelURL.appendingPathComponent("learned_points3D.txt")
         let initializer = LearnedPointInitializerArtifact(
@@ -481,6 +753,16 @@ final class PipelineRunnerHelperTests: XCTestCase {
             result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""),
             onRun: { args in
                 do {
+                    let inputPath = try XCTUnwrap(self.argumentValue("--input_path", args))
+                    let input = URL(fileURLWithPath: inputPath)
+                    XCTAssertNotEqual(input.standardizedFileURL, sourceSparse.standardizedFileURL)
+                    XCTAssertEqual(try self.sparseTextModelBytes(at: input), sourceModelBytes)
+                    for name in ["cameras.bin", "images.bin", "points3D.bin"] {
+                        XCTAssertEqual(
+                            try Data(contentsOf: input.appendingPathComponent(name)),
+                            Data([1, 2, 3])
+                        )
+                    }
                     let outputPath = try XCTUnwrap(self.argumentValue("--output_path", args))
                     let output = URL(fileURLWithPath: outputPath)
                     let images = output.appendingPathComponent("images", isDirectory: true)
@@ -501,18 +783,27 @@ final class PipelineRunnerHelperTests: XCTestCase {
             try self.writeSparseTextModel(at: output, cameraModel: "PINHOLE")
         }
         let subprocess = MockSubprocessRunner(scripts: [
+            modelConverterScript { try self.writeBinaryModel(to: $0) },
             undistort,
             textConverter,
             modelConverterScript { try self.writeBinaryModel(to: $0) },
         ])
         let runner = makeRunner(projectURL: root, subprocess: subprocess)
+        let geometryArtifact = try trainingGeometryArtifact(
+            sourceSparse: sourceSparse,
+            learnedPointInitializer: initializer,
+            canonicalOrientation: .unresolved(
+                openingViewDirection: CanonicalDirection(x: 0, y: 0, z: -1)
+            )
+        )
 
-        let dataset = try await runner.prepareMsplatDataset(
+        let preparedDataset = try await runner.prepareMsplatDataset(
             paths: paths,
             maxImageSize: 2_048,
-            learnedPointInitializer: initializer,
+            geometryArtifact: geometryArtifact,
             progress: { _, _ in }
         )
+        let dataset = preparedDataset.url
 
         let cameras = try String(
             contentsOf: dataset.appendingPathComponent("sparse/0/cameras.txt"),
@@ -521,8 +812,126 @@ final class PipelineRunnerHelperTests: XCTestCase {
         XCTAssertTrue(cameras.contains(" PINHOLE "))
         XCTAssertEqual(
             subprocess.calls.map { $0.1.first },
-            ["image_undistorter", "model_converter", "model_converter"]
+            ["model_converter", "image_undistorter", "model_converter", "model_converter"]
         )
+        XCTAssertEqual(try orientationQuaternion(in: dataset), [1, 0, 0, 0])
+        XCTAssertEqual(preparedDataset.identity.inputDigest.count, 64)
+        XCTAssertEqual(preparedDataset.identity.geometryDigest.count, 64)
+        XCTAssertFalse(
+            FileManager.default.fileExists(
+                atPath: sourceSparse.appendingPathComponent("learned_points3D.txt").path
+            )
+        )
+        XCTAssertEqual(try sparseTextModelBytes(at: sourceSparse), sourceModelBytes)
+        for name in ["cameras.bin", "images.bin", "points3D.bin"] {
+            XCTAssertEqual(
+                try Data(contentsOf: sourceSparse.appendingPathComponent(name)),
+                Data("stale \(name)".utf8)
+            )
+        }
+    }
+
+    func testPrepareMsplatDatasetRejectsSourceModelHashMismatchWithoutReplacingDataset() async throws {
+        let root = try TestFileBuilder.makeTempDir()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let paths = ProjectPaths(root: root)
+        try paths.ensureDirectories()
+        XCTAssertTrue(try TestFileBuilder.writeGrayscaleImage(
+            url: paths.framesSelectedURL.appendingPathComponent("frame.jpg"),
+            size: 8,
+            value: 128,
+            utType: .jpeg
+        ))
+        let sourceSparse = paths.colmapSparseURL.appendingPathComponent("0", isDirectory: true)
+        try writeSparseTextModel(at: sourceSparse, cameraModel: "PINHOLE")
+        let geometryArtifact = try trainingGeometryArtifact(
+            sourceSparse: sourceSparse,
+            learnedPointInitializer: nil,
+            canonicalOrientation: .unresolved(
+                openingViewDirection: CanonicalDirection(x: 0, y: 0, z: -1)
+            )
+        )
+        try "changed\n".write(
+            to: sourceSparse.appendingPathComponent("cameras.txt"),
+            atomically: true,
+            encoding: .utf8
+        )
+
+        let existingDataset = paths.trainingURL.appendingPathComponent(
+            "msplat_dataset",
+            isDirectory: true
+        )
+        try FileManager.default.createDirectory(at: existingDataset, withIntermediateDirectories: true)
+        let marker = existingDataset.appendingPathComponent("keep.txt")
+        try Data("existing".utf8).write(to: marker)
+        let runner = makeRunner(projectURL: root)
+
+        do {
+            _ = try await runner.prepareMsplatDataset(
+                paths: paths,
+                maxImageSize: 1_024,
+                geometryArtifact: geometryArtifact,
+                progress: { _, _ in }
+            )
+            XCTFail("Expected geometry provenance validation to fail")
+        } catch let error as GeometryArtifactStore.Error {
+            XCTAssertEqual(error, .modelHashMismatch("cameras.txt"))
+        }
+
+        XCTAssertEqual(try Data(contentsOf: marker), Data("existing".utf8))
+    }
+
+    func testPrepareMsplatDatasetRejectsSourceMutationDuringConversionWithoutReplacingDataset() async throws {
+        let root = try TestFileBuilder.makeTempDir()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let paths = ProjectPaths(root: root)
+        try paths.ensureDirectories()
+        XCTAssertTrue(try TestFileBuilder.writeGrayscaleImage(
+            url: paths.framesSelectedURL.appendingPathComponent("frame.jpg"),
+            size: 8,
+            value: 128,
+            utType: .jpeg
+        ))
+        let sourceSparse = paths.colmapSparseURL.appendingPathComponent("0", isDirectory: true)
+        try writeSparseTextModel(at: sourceSparse, cameraModel: "PINHOLE")
+        let geometryArtifact = try trainingGeometryArtifact(
+            sourceSparse: sourceSparse,
+            learnedPointInitializer: nil,
+            canonicalOrientation: .unresolved(
+                openingViewDirection: CanonicalDirection(x: 0, y: 0, z: -1)
+            )
+        )
+
+        let existingDataset = paths.trainingURL.appendingPathComponent(
+            "msplat_dataset",
+            isDirectory: true
+        )
+        try FileManager.default.createDirectory(at: existingDataset, withIntermediateDirectories: true)
+        let marker = existingDataset.appendingPathComponent("keep.txt")
+        try Data("existing".utf8).write(to: marker)
+        let subprocess = MockSubprocessRunner(scripts: [
+            modelConverterScript { arguments in
+                try self.writeBinaryModel(to: arguments)
+                try Data("changed during conversion".utf8).write(
+                    to: sourceSparse.appendingPathComponent("cameras.txt")
+                )
+            },
+        ])
+        let runner = makeRunner(projectURL: root, subprocess: subprocess)
+
+        do {
+            _ = try await runner.prepareMsplatDataset(
+                paths: paths,
+                maxImageSize: 1_024,
+                geometryArtifact: geometryArtifact,
+                progress: { _, _ in }
+            )
+            XCTFail("Expected a changed source model to be rejected")
+        } catch let error as GeometryModelSnapshot.Error {
+            XCTAssertEqual(error, .modelChanged)
+        }
+
+        XCTAssertEqual(try Data(contentsOf: marker), Data("existing".utf8))
     }
 
     private func makeRunner(
@@ -580,6 +989,52 @@ final class PipelineRunnerHelperTests: XCTestCase {
         )
     }
 
+    private func testOrientation(
+        status: CanonicalOrientationStatus,
+        quaternion: CanonicalQuaternionWXYZ?
+    ) -> CanonicalOrientationArtifact {
+        CanonicalOrientationArtifact(
+            status: status,
+            method: .cameraRightNullspace,
+            sourceToCanonicalQuaternionWXYZ: quaternion,
+            evidence: nil,
+            canonicalOpeningViewDirection: CanonicalDirection(x: 0, y: 0, z: -1),
+            isViewOnlyFlipActive: false
+        )
+    }
+
+    private func trainingGeometryArtifact(
+        sourceSparse: URL,
+        learnedPointInitializer: LearnedPointInitializerArtifact?,
+        canonicalOrientation: CanonicalOrientationArtifact
+    ) throws -> GeometryArtifact {
+        var artifact = makeGeometryArtifact()
+        artifact.modelHashes = try GeometryModelSnapshot.capture(in: sourceSparse).modelHashes
+        artifact.learnedPointInitializer = learnedPointInitializer
+        artifact.canonicalOrientation = canonicalOrientation
+        return artifact
+    }
+
+    private func orientationQuaternion(in dataset: URL) throws -> [Double] {
+        let data = try Data(
+            contentsOf: dataset.appendingPathComponent(
+                "sparse/0/easysplat_orientation.json"
+            )
+        )
+        let object = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: data) as? [String: Any]
+        )
+        XCTAssertEqual(Set(object.keys), ["schema_version", "source_to_canonical_wxyz"])
+        XCTAssertEqual(object["schema_version"] as? Int, 1)
+        return try XCTUnwrap(object["source_to_canonical_wxyz"] as? [Double])
+    }
+
+    private func sparseTextModelBytes(at directory: URL) throws -> [String: Data] {
+        try Dictionary(uniqueKeysWithValues: ["cameras.txt", "images.txt", "points3D.txt"].map {
+            ($0, try Data(contentsOf: directory.appendingPathComponent($0)))
+        })
+    }
+
     private func writeLearnedPoints(to directory: URL, count: Int) throws {
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         let rows = (1...count).map { "\($0) \(Double($0)) 0.0 2.0 10 20 30 -1.0" }
@@ -588,6 +1043,48 @@ final class PipelineRunnerHelperTests: XCTestCase {
             atomically: true,
             encoding: .utf8
         )
+    }
+
+    private func writeImageMappingDatabase(
+        at url: URL,
+        rows: [(imageID: Int, name: String, cameraID: Int)]
+    ) throws {
+        var database: OpaquePointer?
+        guard sqlite3_open(url.path, &database) == SQLITE_OK, let database else {
+            throw NSError(domain: "PipelineRunnerHelperTests", code: 100)
+        }
+        defer { sqlite3_close(database) }
+        guard sqlite3_exec(
+            database,
+            "CREATE TABLE images (image_id INTEGER PRIMARY KEY, name TEXT UNIQUE, camera_id INTEGER NOT NULL);",
+            nil,
+            nil,
+            nil
+        ) == SQLITE_OK else {
+            throw NSError(domain: "PipelineRunnerHelperTests", code: 101)
+        }
+        let transient = unsafeBitCast(-1, to: sqlite3_destructor_type.self)
+        var statement: OpaquePointer?
+        guard sqlite3_prepare_v2(
+            database,
+            "INSERT INTO images (image_id, name, camera_id) VALUES (?, ?, ?);",
+            -1,
+            &statement,
+            nil
+        ) == SQLITE_OK, let statement else {
+            throw NSError(domain: "PipelineRunnerHelperTests", code: 102)
+        }
+        defer { sqlite3_finalize(statement) }
+        for row in rows {
+            sqlite3_reset(statement)
+            sqlite3_clear_bindings(statement)
+            guard sqlite3_bind_int64(statement, 1, sqlite3_int64(row.imageID)) == SQLITE_OK,
+                  sqlite3_bind_text(statement, 2, row.name, -1, transient) == SQLITE_OK,
+                  sqlite3_bind_int64(statement, 3, sqlite3_int64(row.cameraID)) == SQLITE_OK,
+                  sqlite3_step(statement) == SQLITE_DONE else {
+                throw NSError(domain: "PipelineRunnerHelperTests", code: 103)
+            }
+        }
     }
 
 }

@@ -2,6 +2,41 @@ import XCTest
 @testable import EasySplatCore
 
 final class ProjectMetadataValidationTests: XCTestCase {
+    func testLoadRejectsBaselineFormatThreeBeforeDecodingLegacyOrientation() throws {
+        let baselineFormatVersion = ProjectMetadataStore.supportedFormatVersion - 1
+        let baselineGeometrySchemaVersion = GeometryArtifact.currentSchemaVersion - 1
+        XCTAssertEqual(baselineFormatVersion, 3)
+        XCTAssertEqual(baselineGeometrySchemaVersion, 3)
+
+        let metadata = makeMetadata()
+        let encoder = JSONEncoder()
+        encoder.dateEncodingStrategy = .iso8601
+        var object = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: encoder.encode(metadata)) as? [String: Any]
+        )
+        object["formatVersion"] = baselineFormatVersion
+        var geometry = try XCTUnwrap(object["geometryArtifact"] as? [String: Any])
+        geometry["schemaVersion"] = baselineGeometrySchemaVersion
+        var orientation = try XCTUnwrap(
+            geometry["canonicalOrientation"] as? [String: Any]
+        )
+        orientation["status"] = "notEvaluated"
+        geometry["canonicalOrientation"] = orientation
+        object["geometryArtifact"] = geometry
+
+        let root = try TestFileBuilder.makeTempDir()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let url = root.appendingPathComponent("project.json")
+        try JSONSerialization.data(withJSONObject: object).write(to: url)
+
+        XCTAssertThrowsError(try ProjectMetadataStore.load(from: url)) { error in
+            guard case ProjectMetadataStore.LoadError.unsupportedFormatVersion(let version) = error else {
+                return XCTFail("Expected envelope-first unsupported format, got \(error)")
+            }
+            XCTAssertEqual(version, baselineFormatVersion)
+        }
+    }
+
     func testLoadRejectsRetiredVersionTwoBeforeDecodingItsPayload() throws {
         let root = try TestFileBuilder.makeTempDir()
         defer { try? FileManager.default.removeItem(at: root) }
@@ -43,7 +78,7 @@ final class ProjectMetadataValidationTests: XCTestCase {
     }
 
     func testLoadRejectsAbsoluteGeometryArtifactPathWithSpecificError() throws {
-        let metadata = makeMetadata(geometry: makeGeometryArtifact(canonicalModelPath: "/tmp/model"))
+        let metadata = makeMetadata(geometry: makeGeometryArtifact(sourceModelPath: "/tmp/model"))
         let fixture = try writeMetadataWithoutStoreValidation(metadata)
         defer { try? FileManager.default.removeItem(at: fixture.root) }
 
@@ -51,7 +86,7 @@ final class ProjectMetadataValidationTests: XCTestCase {
             guard case ProjectMetadataStore.LoadError.invalidArtifactPath(let field, let path) = error else {
                 return XCTFail("Expected invalidArtifactPath, got \(error)")
             }
-            XCTAssertEqual(field, "geometryArtifact.canonicalModelPath")
+            XCTAssertEqual(field, "geometryArtifact.sourceModelPath")
             XCTAssertEqual(path, "/tmp/model")
         }
     }
@@ -134,6 +169,100 @@ final class ProjectMetadataValidationTests: XCTestCase {
             }
             XCTAssertEqual(field, "outputs.splatPlyPath")
             XCTAssertEqual(path, "Training/msplat/splat.ply")
+        }
+    }
+
+    func testSaveAcceptsRawSeedLearnedInitializerPath() throws {
+        let root = try TestFileBuilder.makeTempDir()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let url = root.appendingPathComponent("project.json")
+        var geometry = makeGeometryArtifact(
+            sourceModelPath: "SfM/colmap/sparse/0"
+        )
+        geometry.learnedPointInitializer = LearnedPointInitializerArtifact(
+            path: "SfM/colmap/seed/0/learned_points3D.txt",
+            sha256: String(repeating: "a", count: 64),
+            pointCount: 1
+        )
+        let metadata = ProjectMetadata(
+            title: "Raw learned initializer",
+            input: .photos(folder: "/tmp/photos"),
+            requestedRunOptions: RequestedRunOptions(
+                capturePath: .orbit,
+                detailProfile: .balanced
+            ),
+            geometryArtifact: geometry
+        )
+
+        XCTAssertNoThrow(try ProjectMetadataStore.save(metadata, to: url))
+    }
+
+    func testSaveRejectsSourceModelLearnedInitializerPath() throws {
+        let root = try TestFileBuilder.makeTempDir()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let url = root.appendingPathComponent("project.json")
+        var geometry = makeGeometryArtifact()
+        geometry.learnedPointInitializer = LearnedPointInitializerArtifact(
+            path: "SfM/colmap/sparse/0/learned_points3D.txt",
+            sha256: String(repeating: "a", count: 64),
+            pointCount: 1
+        )
+        let metadata = ProjectMetadata(
+            title: "Source-model learned initializer",
+            input: .photos(folder: "/tmp/photos"),
+            requestedRunOptions: RequestedRunOptions(
+                capturePath: .orbit,
+                detailProfile: .balanced
+            ),
+            geometryArtifact: geometry
+        )
+
+        XCTAssertThrowsError(try ProjectMetadataStore.save(metadata, to: url)) { error in
+            guard case ProjectMetadataStore.LoadError.invalidArtifactNamespace(let field, let path) = error else {
+                return XCTFail("Expected invalidArtifactNamespace, got \(error)")
+            }
+            XCTAssertEqual(field, "geometryArtifact.learnedPointInitializer.path")
+            XCTAssertEqual(path, "SfM/colmap/sparse/0/learned_points3D.txt")
+        }
+    }
+
+    func testSaveRejectsNearSeedLearnedInitializerPaths() throws {
+        for path in [
+            "SfM/colmap/seed/1/learned_points3D.txt",
+            "SfM/colmap/seed/0/other.txt",
+        ] {
+            let root = try TestFileBuilder.makeTempDir()
+            defer { try? FileManager.default.removeItem(at: root) }
+            var geometry = makeGeometryArtifact(
+                sourceModelPath: "SfM/colmap/sparse/0"
+            )
+            geometry.learnedPointInitializer = LearnedPointInitializerArtifact(
+                path: path,
+                sha256: String(repeating: "a", count: 64),
+                pointCount: 1
+            )
+            let metadata = ProjectMetadata(
+                title: "Near-seed learned initializer",
+                input: .photos(folder: "/tmp/photos"),
+                requestedRunOptions: RequestedRunOptions(
+                    capturePath: .orbit,
+                    detailProfile: .balanced
+                ),
+                geometryArtifact: geometry
+            )
+
+            XCTAssertThrowsError(
+                try ProjectMetadataStore.save(
+                    metadata,
+                    to: root.appendingPathComponent("project.json")
+                )
+            ) { error in
+                guard case ProjectMetadataStore.LoadError.invalidArtifactNamespace(let field, let rejectedPath) = error else {
+                    return XCTFail("Expected invalidArtifactNamespace for \(path), got \(error)")
+                }
+                XCTAssertEqual(field, "geometryArtifact.learnedPointInitializer.path")
+                XCTAssertEqual(rejectedPath, path)
+            }
         }
     }
 

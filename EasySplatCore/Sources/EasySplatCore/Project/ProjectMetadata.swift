@@ -22,7 +22,7 @@ public struct ProjectMetadata: Codable, Sendable {
     public var lastFailureAt: Date?
 
     public init(
-        formatVersion: Int = 3,
+        formatVersion: Int = ProjectMetadataStore.supportedFormatVersion,
         id: UUID = UUID(),
         createdAt: Date = Date(),
         title: String,

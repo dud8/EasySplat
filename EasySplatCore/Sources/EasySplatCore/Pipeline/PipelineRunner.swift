@@ -8,6 +8,7 @@ public final class PipelineRunner: @unchecked Sendable {
         public var colmap: ColmapRunner
         public var msplat: MsplatRunner
         public var da3Sfm: Da3SfmRunning
+        let checkCancellation: @Sendable () throws -> Void
 
         public init(colmap: ColmapRunner = ColmapRunner(),
                     msplat: MsplatRunner = MsplatRunner(),
@@ -15,12 +16,24 @@ public final class PipelineRunner: @unchecked Sendable {
             self.colmap = colmap
             self.msplat = msplat
             self.da3Sfm = da3Sfm
+            self.checkCancellation = { try Task.checkCancellation() }
         }
 
         public init(runner: SubprocessRunning) {
             self.colmap = ColmapRunner(runner: runner)
             self.msplat = MsplatRunner(runner: runner)
             self.da3Sfm = Da3SfmRunner(runner: runner)
+            self.checkCancellation = { try Task.checkCancellation() }
+        }
+
+        init(
+            runner: SubprocessRunning,
+            checkCancellation: @escaping @Sendable () throws -> Void
+        ) {
+            self.colmap = ColmapRunner(runner: runner)
+            self.msplat = MsplatRunner(runner: runner)
+            self.da3Sfm = Da3SfmRunner(runner: runner)
+            self.checkCancellation = checkCancellation
         }
     }
 
@@ -154,8 +167,8 @@ public final class PipelineRunner: @unchecked Sendable {
         try? ProjectMetadataStore.savePreservingUserEditableFields(metadata, to: paths.metadataURL)
 
         if metadata.state.lastError != nil {
-            try? cleanForRetry(failedStage: metadata.state.stage, paths: paths)
-            try? paths.ensureDirectories()
+            try cleanForRetry(failedStage: metadata.state.stage, paths: paths)
+            try paths.ensureDirectories()
         }
 
         let stageTiming = StageTimingTracker()
@@ -214,14 +227,12 @@ public final class PipelineRunner: @unchecked Sendable {
             guard stageIndex(stage) < stageIndex(.trainSplat) else { return true }
             guard !reranStageBeforeTraining else { return true }
             reranStageBeforeTraining = true
-            removeIfExists(paths.trainingURL)
-            if metadata.trainingArtifact != nil {
-                metadata.trainingArtifact = nil
-                try ProjectMetadataStore.savePreservingUserEditableFields(
-                    metadata,
-                    to: paths.metadataURL
-                )
-            }
+            try invalidateAcceptedArtifactsForGeometryRerun(
+                startingAt: stage,
+                metadata: &metadata,
+                paths: paths
+            )
+            try paths.ensureDirectories()
             return true
         }
 
@@ -288,8 +299,8 @@ public final class PipelineRunner: @unchecked Sendable {
                         line: "Detected partial/corrupt stage output for resume (\(reason)). Re-running \(stage.displayName).",
                         isError: true
                     ))
-                    try? cleanForRetry(failedStage: stage, paths: paths)
-                    try? paths.ensureDirectories()
+                    try cleanForRetry(failedStage: stage, paths: paths)
+                    try paths.ensureDirectories()
                     return try markStageForRerun(stage)
                 }
             }
@@ -1040,14 +1051,6 @@ public final class PipelineRunner: @unchecked Sendable {
                             guard sparseModelFilesExist(at: seedZero) else {
                                 throw PipelineError.outputMissing
                             }
-                            let imagesTxt = seedZero.appendingPathComponent("images.txt")
-                            if try ColmapTextModelNormalizer.normalizeImagesTxtIfNeeded(at: imagesTxt) {
-                                emit(.stageLog(
-                                    stage: .sfmFeatures,
-                                    line: "Normalized DA3 aligned seed COLMAP model (added missing POINTS2D lines to images.txt).",
-                                    isError: false
-                                ))
-                            }
                             _ = try readDa3CoverageManifest(required: true)
                             if !fm.fileExists(atPath: paths.colmapDatabaseURL.path) {
                                 fm.createFile(atPath: paths.colmapDatabaseURL.path, contents: Data())
@@ -1179,13 +1182,17 @@ public final class PipelineRunner: @unchecked Sendable {
                             guard sparseModelFilesExist(at: seedZero) else {
                                 throw PipelineError.outputMissing
                             }
-                            if try ColmapTextModelNormalizer.remapSeedModelIDsToDatabase(
-                                seedModelURL: seedZero,
-                                databaseURL: paths.colmapDatabaseURL
+                            let refinementSeed = paths.colmapRefinementSeedModelURL
+                            defer { self.removeIfExists(refinementSeed.deletingLastPathComponent()) }
+                            if try self.prepareDa3RefinementSeed(
+                                rawModelURL: seedZero,
+                                outputModelURL: refinementSeed,
+                                databaseURL: paths.colmapDatabaseURL,
+                                checkCancellation: self.tooling.checkCancellation
                             ) {
                                 emit(.stageLog(
                                     stage: .sfmMapping,
-                                    line: "Aligned DA3 seed IDs with the COLMAP feature database.",
+                                    line: "Prepared the DA3 refinement seed for the COLMAP feature database.",
                                     isError: false
                                 ))
                             }
@@ -1197,18 +1204,19 @@ public final class PipelineRunner: @unchecked Sendable {
                                 metadata: [
                                     "database": paths.colmapDatabaseURL.path,
                                     "images": paths.framesSelectedURL.path,
-                                    "seed": seedZero.path,
+                                    "seed": refinementSeed.path,
                                     "output": sparseZero.path,
                                     "tool": self.config.toolchain.colmap.path
                                 ]
                             )
                             emit(.stageLog(stage: .sfmMapping, line: "Running DA3 refinement: point_triangulator.", isError: false))
                             mappingAttemptCount += 1
+                            try self.tooling.checkCancellation()
                             try await self.tooling.colmap.runPointTriangulator(
                                 colmapPath: self.config.toolchain.colmap,
                                 database: paths.colmapDatabaseURL,
                                 imagePath: paths.framesSelectedURL,
-                                inputPath: seedZero,
+                                inputPath: refinementSeed,
                                 outputPath: sparseZero,
                                 options: da3ColmapMatchOptions,
                                 onLog: { line, isErr in
@@ -2051,19 +2059,13 @@ public final class PipelineRunner: @unchecked Sendable {
             // Geometry reconciliation is part of the durable mapping boundary even
             // when resume validation skipped the mapper subprocess itself.
             currentStage = .sfmMapping
-            let mappingDurationText: String?
-            if completedMappingThisAttempt {
-                mappingDurationText = stageTiming.finish(.sfmMapping)
-                recordFinishedStageTiming(.sfmMapping)
-            } else {
-                mappingDurationText = nil
-            }
+            var mappingDurationText: String?
             if acceptedReconstructionSummary != nil
                 || metadata.geometryArtifact == nil
                 || !FileManager.default.fileExists(atPath: paths.geometryManifestURL.path) {
                 guard let mapper = (acceptedReconstructionSummary ?? metadata.reconstruction)?.mapper else {
                     throw PipelineError.geometryResidualsUnavailable(
-                        "The current project has canonical geometry without solver provenance"
+                        "The current project has accepted geometry without solver provenance"
                     )
                 }
                 if mapper.lowercased().contains("da3"),
@@ -2094,46 +2096,41 @@ public final class PipelineRunner: @unchecked Sendable {
                         "Geometry-stage physical memory could not be measured"
                     )
                 }
-                let previousReconstruction = metadata.reconstruction
-                if let summary = acceptedReconstructionSummary, metadata.reconstruction != summary {
-                    metadata.reconstruction = summary
-                }
-                do {
-                    let mappingFallbackReason = mappingFallbackReasons.isEmpty
-                        ? nil
-                        : mappingFallbackReasons.joined(separator: "; ")
-                    let measuredPairGraph: PairGraphArtifact
-                    if mapper.lowercased().contains("da3") {
-                        measuredPairGraph = .notEvaluated(
-                            mappingAttemptNumber: mappingAttemptCount,
-                            bundleAdjustmentCycleCount: bundleAdjustmentCycleCount,
-                            fallbackReason: mappingFallbackReason
-                        )
-                    } else {
-                        guard let pairEvidence = acceptedPairGraphEvidence else {
-                            throw PairGraphEvidenceStoreError.invalidEvidence
-                        }
-                        measuredPairGraph = try pairEvidence.pairGraphArtifact(
-                            mappingAttemptNumber: mappingAttemptCount,
-                            bundleAdjustmentCycleCount: bundleAdjustmentCycleCount,
-                            fallbackReason: mappingFallbackReason
-                        )
-                    }
-                    try persistMeasuredGeometryArtifact(
-                        metadata: &metadata,
-                        paths: paths,
-                        resolvedPlan: resolvedRunPlan,
-                        mapper: mapper,
-                        acceptedDa3ModelSubdirectory: acceptedDa3ModelSubdirectory,
-                        selectedFrames: selectedFrames,
-                        selectedFrameManifest: currentSelectedFrameManifest,
-                        peakMemoryBytes: geometryPeakMemoryBytes,
-                        pairGraph: measuredPairGraph
+                let mappingFallbackReason = mappingFallbackReasons.isEmpty
+                    ? nil
+                    : mappingFallbackReasons.joined(separator: "; ")
+                let measuredPairGraph: PairGraphArtifact
+                if mapper.lowercased().contains("da3") {
+                    measuredPairGraph = .notEvaluated(
+                        mappingAttemptNumber: mappingAttemptCount,
+                        bundleAdjustmentCycleCount: bundleAdjustmentCycleCount,
+                        fallbackReason: mappingFallbackReason
                     )
-                } catch {
-                    metadata.reconstruction = previousReconstruction
-                    throw error
+                } else {
+                    guard let pairEvidence = acceptedPairGraphEvidence else {
+                        throw PairGraphEvidenceStoreError.invalidEvidence
+                    }
+                    measuredPairGraph = try pairEvidence.pairGraphArtifact(
+                        mappingAttemptNumber: mappingAttemptCount,
+                        bundleAdjustmentCycleCount: bundleAdjustmentCycleCount,
+                        fallbackReason: mappingFallbackReason
+                    )
                 }
+                try persistMeasuredGeometryArtifact(
+                    metadata: &metadata,
+                    paths: paths,
+                    resolvedPlan: resolvedRunPlan,
+                    mapper: mapper,
+                    acceptedDa3ModelSubdirectory: acceptedDa3ModelSubdirectory,
+                    selectedFrames: selectedFrames,
+                    selectedFrameManifest: currentSelectedFrameManifest,
+                    peakMemoryBytes: geometryPeakMemoryBytes,
+                    pairGraph: measuredPairGraph,
+                    acceptedReconstructionSummary: acceptedReconstructionSummary,
+                    currentMappingDurationSeconds: {
+                        stageTiming.elapsedSeconds(.sfmMapping)
+                    }
+                )
             } else {
                 let artifact = try GeometryArtifactStore.load(
                     from: paths.geometryManifestURL,
@@ -2143,6 +2140,10 @@ public final class PipelineRunner: @unchecked Sendable {
                     metadata.geometryArtifact = artifact
                     try ProjectMetadataStore.savePreservingUserEditableFields(metadata, to: paths.metadataURL)
                 }
+            }
+            if completedMappingThisAttempt {
+                mappingDurationText = stageTiming.finish(.sfmMapping)
+                recordFinishedStageTiming(.sfmMapping)
             }
             _ = geometryMemorySampler.stop()
             if completedMappingThisAttempt {
@@ -2178,7 +2179,8 @@ public final class PipelineRunner: @unchecked Sendable {
                     line: "\(backendName(backendPolicy)) failed (\(debug)). Falling back to \(backendName(nextBackend)).",
                     isError: true
                 ))
-                try? cleanForRetry(failedStage: .sfmFeatures, paths: paths)
+                try cleanForRetry(failedStage: .sfmFeatures, paths: paths)
+                try paths.ensureDirectories()
                 continue
             }
             break
@@ -2213,22 +2215,19 @@ public final class PipelineRunner: @unchecked Sendable {
                     ))
                 )
                     try paths.ensureMutableTrainingDirectories()
-                    let learnedPointInitializer: LearnedPointInitializerArtifact?
-                    if metadata.geometryArtifact?.provenance.model != nil,
-                       metadata.reconstruction?.mapper.lowercased().contains("da3") == true {
-                        learnedPointInitializer = metadata.geometryArtifact?.learnedPointInitializer
-                    } else {
-                        learnedPointInitializer = nil
+                    guard let geometryArtifact = metadata.geometryArtifact else {
+                        throw PipelineError.outputMissing
                     }
-                    let datasetURL = try await prepareMsplatDataset(
+                    let preparedDataset = try await prepareMsplatDataset(
                         paths: paths,
                         maxImageSize: resolvedRunPlan.maximumImageDimension,
-                        learnedPointInitializer: learnedPointInitializer,
+                        geometryArtifact: geometryArtifact,
                         progress: { _, message in
                             emit(.stageProgress(stage: .trainSplat, fraction: -1.0, message: message))
                         }
                     )
-                    let datasetIdentity = try msplatDatasetIdentity(at: datasetURL)
+                    let datasetURL = preparedDataset.url
+                    let datasetIdentity = preparedDataset.identity
                     let outputURL = paths.msplatOutputURL
                     emit(.stageProgress(stage: .trainSplat, fraction: -1.0, message: "Training model with msplat"))
 

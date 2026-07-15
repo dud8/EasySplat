@@ -25,6 +25,9 @@ public struct ProjectPaths: Sendable {
     }
     public var colmapSeedURL: URL { root.appendingPathComponent("SfM/colmap/seed", isDirectory: true) }
     public var colmapSeedModelURL: URL { colmapSeedURL.appendingPathComponent("0", isDirectory: true) }
+    public var colmapRefinementSeedModelURL: URL {
+        colmapSeedURL.appendingPathComponent("refinement/0", isDirectory: true)
+    }
     public var colmapSparseURL: URL { root.appendingPathComponent("SfM/colmap/sparse", isDirectory: true) }
     public var pairGraphEvidenceURL: URL { root.appendingPathComponent("SfM/pair_graph_evidence.json") }
     public var geometryManifestURL: URL { root.appendingPathComponent("SfM/geometry_manifest.json") }

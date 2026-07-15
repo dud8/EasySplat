@@ -1,8 +1,9 @@
 import CryptoKit
+import Darwin
 import Foundation
 
 enum GeometryArtifactStore {
-    private static let maximumManifestBytes = 1_048_576
+    static let maximumManifestBytes = 1_048_576
     static let maximumMedianPixelResidual = 1.5
     static let maximumP90PixelResidual = 3.0
     static let minimumRegisteredViewFraction = 0.90
@@ -10,7 +11,7 @@ enum GeometryArtifactStore {
 
     enum Error: Swift.Error, LocalizedError, Equatable {
         case invalidSchema(Int)
-        case invalidCanonicalPath
+        case invalidSourceModelPath
         case invalidDigest(String)
         case invalidResiduals
         case invalidPeakMemory
@@ -23,12 +24,13 @@ enum GeometryArtifactStore {
         case learnedInitializerDigestMismatch
         case invalidPairGraph
         case invalidCanonicalOrientation
+        case invalidTimings
 
         var errorDescription: String? {
             switch self {
             case .invalidSchema(let schema):
                 return "Unsupported geometry artifact schema \(schema)."
-            case .invalidCanonicalPath:
+            case .invalidSourceModelPath:
                 return "Geometry artifact points outside the project."
             case .invalidDigest(let field):
                 return "Geometry artifact has an invalid \(field) digest."
@@ -43,7 +45,7 @@ enum GeometryArtifactStore {
             case .modelHashMismatch(let name):
                 return "Geometry artifact model file does not match its digest: \(name)."
             case .measuredResidualMismatch:
-                return "Geometry artifact measurements do not match its canonical model."
+                return "Geometry artifact measurements do not match its source model."
             case .manifestTooLarge:
                 return "Geometry artifact exceeds the supported size."
             case .invalidLearnedInitializer:
@@ -54,6 +56,8 @@ enum GeometryArtifactStore {
                 return "Geometry artifact pair-graph evidence is incomplete or inconsistent."
             case .invalidCanonicalOrientation:
                 return "Geometry artifact orientation evidence is incomplete or inconsistent."
+            case .invalidTimings:
+                return "Geometry artifact timing evidence is incomplete or invalid."
             }
         }
     }
@@ -80,12 +84,14 @@ enum GeometryArtifactStore {
         _ artifact: GeometryArtifact,
         metadata: inout ProjectMetadata,
         paths: ProjectPaths,
-        measuredResiduals: ColmapResidualAnalyzer.Result? = nil
+        measuredResiduals: ColmapResidualAnalyzer.Result? = nil,
+        verifiedSourceSnapshot: GeometryModelSnapshot.Verified? = nil
     ) throws {
         try validate(
             artifact,
             projectPaths: paths,
-            measuredResiduals: measuredResiduals
+            measuredResiduals: measuredResiduals,
+            verifiedSourceSnapshot: verifiedSourceSnapshot
         )
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
@@ -103,8 +109,19 @@ enum GeometryArtifactStore {
         try data.write(to: paths.geometryManifestURL, options: [.atomic])
 
         let previousArtifact = metadata.geometryArtifact
-        metadata.geometryArtifact = artifact
         do {
+            if let verifiedSourceSnapshot {
+                let sourceModel = try paths.resolveProjectRelativePath(artifact.sourceModelPath)
+                do {
+                    try GeometryModelSnapshot.validate(
+                        verifiedSourceSnapshot,
+                        at: sourceModel
+                    )
+                } catch {
+                    throw Error.modelHashMismatch("source snapshot")
+                }
+            }
+            metadata.geometryArtifact = artifact
             try ProjectMetadataStore.savePreservingUserEditableFields(metadata, to: paths.metadataURL)
         } catch {
             metadata.geometryArtifact = previousArtifact
@@ -120,7 +137,8 @@ enum GeometryArtifactStore {
     static func validate(
         _ artifact: GeometryArtifact,
         projectPaths: ProjectPaths,
-        measuredResiduals: ColmapResidualAnalyzer.Result? = nil
+        measuredResiduals: ColmapResidualAnalyzer.Result? = nil,
+        verifiedSourceSnapshot: GeometryModelSnapshot.Verified? = nil
     ) throws {
         guard artifact.schemaVersion == GeometryArtifact.currentSchemaVersion else {
             throw Error.invalidSchema(artifact.schemaVersion)
@@ -145,6 +163,25 @@ enum GeometryArtifactStore {
         } else if artifact.modelVersion != "none" {
             throw Error.invalidProvenance
         }
+        guard artifact.poseConvention == "world-to-camera",
+              artifact.quaternionOrder == "wxyz",
+              artifact.handedness == "right-handed",
+              artifact.scaleType == "arbitrary-sim3" else {
+            throw Error.invalidCanonicalOrientation
+        }
+        guard artifact.sourceModelPath == "SfM/colmap/sparse/0",
+              let sourceModel = try? projectPaths.resolveProjectRelativePath(
+                  artifact.sourceModelPath
+              ) else {
+            throw Error.invalidSourceModelPath
+        }
+        if let verifiedSourceSnapshot {
+            do {
+                try GeometryModelSnapshot.validate(verifiedSourceSnapshot, at: sourceModel)
+            } catch {
+                throw Error.modelHashMismatch("source snapshot")
+            }
+        }
         if provenance.model != nil {
             guard let initializer = artifact.learnedPointInitializer,
                   initializer.path == "SfM/colmap/seed/0/learned_points3D.txt",
@@ -167,10 +204,6 @@ enum GeometryArtifactStore {
             }
         } else if artifact.learnedPointInitializer != nil {
             throw Error.invalidLearnedInitializer
-        }
-        guard artifact.canonicalModelPath == "SfM/colmap/sparse/0",
-              (try? projectPaths.resolveProjectRelativePath(artifact.canonicalModelPath)) != nil else {
-            throw Error.invalidCanonicalPath
         }
         guard isSHA256(artifact.inputDigest) else { throw Error.invalidDigest("input") }
         guard isSHA256(artifact.selectedFramesDigest) else { throw Error.invalidDigest("selected frames") }
@@ -195,6 +228,19 @@ enum GeometryArtifactStore {
         guard artifact.peakMemoryBytes > 0 else {
             throw Error.invalidPeakMemory
         }
+        guard let orientationEstimationDuration = artifact.timings[
+            "orientation_estimation_seconds"
+        ],
+              orientationEstimationDuration.isFinite,
+              orientationEstimationDuration >= 0,
+              artifact.timings["orientation_seconds"] == nil,
+              artifact.timings.allSatisfy({ key, value in
+                  !key.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                      && value.isFinite
+                      && value >= 0
+              }) else {
+            throw Error.invalidTimings
+        }
         try validatePairGraph(artifact.pairGraph, totalViewCount: artifact.totalViewCount)
         try validateCanonicalOrientation(
             artifact.canonicalOrientation,
@@ -204,12 +250,21 @@ enum GeometryArtifactStore {
               artifact.modelHashes.values.allSatisfy(isSHA256) else {
             throw Error.invalidDigest("model")
         }
-        for name in ["cameras.txt", "images.txt", "points3D.txt"] {
-            let relativePath = artifact.canonicalModelPath + "/" + name
-            guard let file = try? projectPaths.resolveProjectRelativePath(relativePath),
-                  let digest = try? sha256(of: file),
-                  digest == artifact.modelHashes[name] else {
-                throw Error.modelHashMismatch(name)
+        if let verifiedSourceSnapshot {
+            for name in ["cameras.txt", "images.txt", "points3D.txt"] {
+                guard verifiedSourceSnapshot.modelHashes[name]
+                        == artifact.modelHashes[name] else {
+                    throw Error.modelHashMismatch(name)
+                }
+            }
+        } else {
+            for name in ["cameras.txt", "images.txt", "points3D.txt"] {
+                let relativePath = artifact.sourceModelPath + "/" + name
+                guard let file = try? projectPaths.resolveProjectRelativePath(relativePath),
+                      let digest = try? sha256(of: file),
+                      digest == artifact.modelHashes[name] else {
+                    throw Error.modelHashMismatch(name)
+                }
             }
         }
         let currentInputDigest = try inputDigest(projectPaths: projectPaths)
@@ -224,9 +279,8 @@ enum GeometryArtifactStore {
             throw Error.artifactDigestMismatch("selected frames")
         }
 
-        let canonicalModel = try projectPaths.resolveProjectRelativePath(artifact.canonicalModelPath)
         let measured = try measuredResiduals
-            ?? ColmapResidualAnalyzer.analyze(modelDirectory: canonicalModel)
+            ?? ColmapResidualAnalyzer.analyze(modelDirectory: sourceModel)
         let stronglyMeasuredViewCount = measured.observationCountByImage.values.filter {
             $0 >= minimumLearnedObservationsPerView
         }.count
@@ -248,7 +302,7 @@ enum GeometryArtifactStore {
         }
     }
 
-    private static func isSHA256(_ value: String) -> Bool {
+    static func isSHA256(_ value: String) -> Bool {
         value.count == 64 && value.unicodeScalars.allSatisfy {
             ($0.value >= 48 && $0.value <= 57) || ($0.value >= 97 && $0.value <= 102)
         }
@@ -353,14 +407,6 @@ enum GeometryArtifactStore {
             throw Error.invalidCanonicalOrientation
         }
         switch artifact.status {
-        case .notEvaluated:
-            guard artifact.method == nil,
-                  artifact.sourceToCanonicalQuaternionWXYZ == nil,
-                  artifact.evidence == nil,
-                  artifact.canonicalOpeningViewDirection == nil,
-                  !artifact.isViewOnlyFlipActive else {
-                throw Error.invalidCanonicalOrientation
-            }
         case .unresolved:
             guard artifact.sourceToCanonicalQuaternionWXYZ == nil,
                   let direction = artifact.canonicalOpeningViewDirection,
@@ -382,6 +428,9 @@ enum GeometryArtifactStore {
                 throw Error.invalidCanonicalOrientation
             }
             try validateOrientationEvidence(evidence, registeredViewCount: registeredViewCount)
+            guard evidence.trajectoryPlaneAgreementDegrees.map({ $0 <= 15 }) ?? true else {
+                throw Error.invalidCanonicalOrientation
+            }
             switch method {
             case .cameraRightNullspace:
                 guard evidence.supportCount >= 8,
@@ -392,6 +441,12 @@ enum GeometryArtifactStore {
                       evidence.bootstrapP95VariationDegrees <= 5 else {
                     throw Error.invalidCanonicalOrientation
                 }
+                guard evidence.cameraUpConcentration == nil,
+                      evidence.cameraUpMedianSpreadDegrees == nil,
+                      evidence.cameraUpP90SpreadDegrees == nil,
+                      evidence.trajectoryPlaneAgreementDegrees.map({ $0 <= 15 }) ?? true else {
+                    throw Error.invalidCanonicalOrientation
+                }
                 if artifact.status == .verified {
                     guard let medianAgreement = evidence.medianAbsoluteImageUpAgreement,
                           medianAgreement >= 0.20,
@@ -400,9 +455,19 @@ enum GeometryArtifactStore {
                           evidence.trajectoryPlaneAgreementDegrees.map({ $0 <= 15 }) ?? true else {
                         throw Error.invalidCanonicalOrientation
                     }
+                } else {
+                    guard let medianAgreement = evidence.medianAbsoluteImageUpAgreement,
+                          let signAgreement = evidence.signAgreement,
+                          medianAgreement < 0.20 || signAgreement < 0.75 else {
+                        throw Error.invalidCanonicalOrientation
+                    }
                 }
             case .cameraUpConsensus:
                 guard artifact.status == .verified,
+                      evidence.supportCount >= 8,
+                      (evidence.eigenvalue1 < 0.03 || evidence.eigengap < 25),
+                      let lineConcentration = evidence.trajectoryLineConcentration,
+                      lineConcentration >= 0.90,
                       let concentration = evidence.cameraUpConcentration,
                       concentration >= 0.90,
                       let medianSpread = evidence.cameraUpMedianSpreadDegrees,
@@ -447,6 +512,7 @@ enum GeometryArtifactStore {
               evidence.bootstrapP95VariationDegrees >= 0,
               validUnitInterval(evidence.medianAbsoluteImageUpAgreement),
               validUnitInterval(evidence.signAgreement),
+              validUnitInterval(evidence.trajectoryLineConcentration),
               validUnitInterval(evidence.cameraUpConcentration),
               validDegrees(evidence.trajectoryPlaneAgreementDegrees),
               validDegrees(evidence.cameraUpMedianSpreadDegrees),
@@ -459,7 +525,13 @@ enum GeometryArtifactStore {
         let components = [value.w, value.x, value.y, value.z]
         guard components.allSatisfy(\.isFinite) else { return false }
         let squaredNorm = components.reduce(0) { $0 + $1 * $1 }
-        return abs(squaredNorm - 1) <= 1e-6
+        guard abs(squaredNorm - 1) <= 1e-6 else { return false }
+        if value.w > 0 { return true }
+        if value.w < 0 { return false }
+        for component in [value.x, value.y, value.z] where component != 0 {
+            return component > 0
+        }
+        return false
     }
 
     private static func validUnitDirection(_ value: CanonicalDirection) -> Bool {
@@ -556,25 +628,11 @@ enum GeometryArtifactStore {
             guard resolved.path.hasPrefix(rootPath + "/") else {
                 throw Error.artifactDigestMismatch("path root")
             }
-            let values = try file.resourceValues(forKeys: [
-                .isRegularFileKey,
-                .isSymbolicLinkKey,
-                .fileSizeKey,
-            ])
-            guard values.isRegularFile == true,
-                  values.isSymbolicLink != true,
-                  let fileSize = values.fileSize,
-                  fileSize >= 0 else {
-                throw Error.artifactDigestMismatch("file")
-            }
             let relativePath = String(resolved.path.dropFirst(rootPath.count + 1))
             update(UInt64(relativePath.utf8.count), in: &hasher)
             hasher.update(data: Data(relativePath.utf8))
-            update(UInt64(fileSize), in: &hasher)
-            let handle = try FileHandle(forReadingFrom: file)
-            defer { try? handle.close() }
-            while let chunk = try handle.read(upToCount: 1_048_576), !chunk.isEmpty {
-                hasher.update(data: chunk)
+            try hashRegularFileContents(at: file, into: &hasher) { fileSize, hasher in
+                update(fileSize, in: &hasher)
             }
         }
         return hasher.finalize().map { String(format: "%02x", $0) }.joined()
@@ -592,16 +650,81 @@ enum GeometryArtifactStore {
     }
 
     static func sha256(of file: URL) throws -> String {
-        let values = try file.resourceValues(forKeys: [.isRegularFileKey, .isSymbolicLinkKey])
-        guard values.isRegularFile == true, values.isSymbolicLink != true else {
+        var hasher = SHA256()
+        try hashRegularFileContents(at: file, into: &hasher)
+        return hasher.finalize().map { String(format: "%02x", $0) }.joined()
+    }
+
+    private static func hashRegularFileContents(
+        at file: URL,
+        into hasher: inout SHA256,
+        beforeContents: (UInt64, inout SHA256) -> Void = { _, _ in }
+    ) throws {
+        let descriptor: Int32
+        while true {
+            let opened = Darwin.open(file.path, O_RDONLY | O_NOFOLLOW | O_CLOEXEC)
+            if opened >= 0 {
+                descriptor = opened
+                break
+            }
+            let code = errno
+            if code == EINTR { continue }
+            throw NSError(domain: NSPOSIXErrorDomain, code: Int(code))
+        }
+        defer { Darwin.close(descriptor) }
+
+        func descriptorStatus() throws -> stat {
+            while true {
+                var status = stat()
+                if Darwin.fstat(descriptor, &status) == 0 { return status }
+                let code = errno
+                if code == EINTR { continue }
+                throw NSError(domain: NSPOSIXErrorDomain, code: Int(code))
+            }
+        }
+
+        let initial = try descriptorStatus()
+        guard (initial.st_mode & S_IFMT) == S_IFREG,
+              initial.st_nlink == 1,
+              initial.st_size >= 0 else {
             throw CocoaError(.fileReadUnsupportedScheme)
         }
-        let handle = try FileHandle(forReadingFrom: file)
-        defer { try? handle.close() }
-        var hasher = SHA256()
-        while let chunk = try handle.read(upToCount: 1_048_576), !chunk.isEmpty {
-            hasher.update(data: chunk)
+        let expectedByteCount = UInt64(initial.st_size)
+        beforeContents(expectedByteCount, &hasher)
+
+        var totalByteCount: UInt64 = 0
+        var buffer = [UInt8](repeating: 0, count: 1_048_576)
+        while true {
+            let count = buffer.withUnsafeMutableBytes { bytes in
+                Darwin.read(descriptor, bytes.baseAddress, bytes.count)
+            }
+            if count < 0 {
+                let code = errno
+                if code == EINTR { continue }
+                throw NSError(domain: NSPOSIXErrorDomain, code: Int(code))
+            }
+            if count == 0 { break }
+            guard totalByteCount <= expectedByteCount,
+                  UInt64(count) <= expectedByteCount - totalByteCount else {
+                throw CocoaError(.fileReadUnknown)
+            }
+            hasher.update(data: Data(buffer[0..<count]))
+            totalByteCount += UInt64(count)
         }
-        return hasher.finalize().map { String(format: "%02x", $0) }.joined()
+
+        let final = try descriptorStatus()
+        guard (final.st_mode & S_IFMT) == S_IFREG,
+              final.st_nlink == 1,
+              final.st_size >= 0,
+              final.st_dev == initial.st_dev,
+              final.st_ino == initial.st_ino,
+              final.st_size == initial.st_size,
+              final.st_mtimespec.tv_sec == initial.st_mtimespec.tv_sec,
+              final.st_mtimespec.tv_nsec == initial.st_mtimespec.tv_nsec,
+              final.st_ctimespec.tv_sec == initial.st_ctimespec.tv_sec,
+              final.st_ctimespec.tv_nsec == initial.st_ctimespec.tv_nsec,
+              totalByteCount == expectedByteCount else {
+            throw CocoaError(.fileReadUnknown)
+        }
     }
 }

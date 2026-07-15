@@ -26,6 +26,8 @@ CASES = (
     (1500, "clusters"),
 )
 
+IDENTITY_ORIENTATION = '{"schema_version":1,"source_to_canonical_wxyz":[1,0,0,0]}\n'
+
 
 def png_chunk(kind: bytes, payload: bytes) -> bytes:
     return struct.pack(">I", len(payload)) + kind + payload + struct.pack(">I", zlib.crc32(kind + payload))
@@ -161,6 +163,13 @@ def write_points(path: Path, count: int, layout: str) -> None:
             output.write(struct.pack("<dQ", 0.5, 0))
 
 
+def write_identity_orientation(sparse: Path) -> None:
+    (sparse / "easysplat_orientation.json").write_text(
+        IDENTITY_ORIENTATION,
+        encoding="utf-8",
+    )
+
+
 def write_overflow_points(path: Path, count: int) -> None:
     with path.open("wb") as output:
         output.write(struct.pack("<Q", count))
@@ -222,6 +231,7 @@ def generate(root: Path) -> None:
         write_cameras(sparse / "cameras.bin", width, height)
         write_images(sparse / "images.bin", [1] * camera_count)
         write_points(sparse / "points3D.bin", count, layout)
+        write_identity_orientation(sparse)
         fixtures.append(
             {
                 "camera_count": camera_count,
@@ -247,6 +257,7 @@ def generate(root: Path) -> None:
     write_cameras(overflow_sparse / "cameras.bin", 32, 32)
     write_images(overflow_sparse / "images.bin", [1, 1, 1, 1])
     write_overflow_points(overflow_sparse / "points3D.bin", 2304)
+    write_identity_orientation(overflow_sparse)
     fixtures.append(
         {
             "camera_count": 4,
@@ -271,6 +282,7 @@ def generate(root: Path) -> None:
     write_cameras(broad_sparse / "cameras.bin", 128, 128)
     write_images(broad_sparse / "images.bin", [1])
     write_overflow_points(broad_sparse / "points3D.bin", 2304)
+    write_identity_orientation(broad_sparse)
     fixtures.append(
         {
             "camera_count": 1,
@@ -297,6 +309,7 @@ def generate(root: Path) -> None:
     write_cameras(increasing_sparse / "cameras.bin", 32, 32)
     write_images_with_x_offsets(increasing_sparse / "images.bin", [1.0, 0.0])
     write_overflow_points(increasing_sparse / "points3D.bin", 10000)
+    write_identity_orientation(increasing_sparse)
     fixtures.append(
         {
             "camera_count": 2,
@@ -323,6 +336,7 @@ def generate(root: Path) -> None:
     write_mixed_cameras(mixed_sparse / "cameras.bin")
     write_images(mixed_sparse / "images.bin", [1, 2])
     write_points(mixed_sparse / "points3D.bin", 500, "sphere")
+    write_identity_orientation(mixed_sparse)
     fixtures.append(
         {
             "camera_count": 2,
@@ -347,6 +361,7 @@ def generate(root: Path) -> None:
     write_cameras(exact_budget_sparse / "cameras.bin", 640, 360)
     write_images(exact_budget_sparse / "images.bin", [1])
     write_points(exact_budget_sparse / "points3D.bin", 1279, "room")
+    write_identity_orientation(exact_budget_sparse)
     fixtures.append(
         {
             "camera_count": 1,

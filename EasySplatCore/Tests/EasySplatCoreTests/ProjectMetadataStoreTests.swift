@@ -76,7 +76,11 @@ final class ProjectMetadataStoreTests: XCTestCase {
                 return
             }
             XCTAssertEqual(v, ProjectMetadataStore.supportedFormatVersion + 1)
-            XCTAssertTrue(error.localizedDescription.contains("opens format 3 projects only"))
+            XCTAssertTrue(
+                error.localizedDescription.contains(
+                    "opens format \(ProjectMetadataStore.supportedFormatVersion) projects only"
+                )
+            )
         }
     }
 

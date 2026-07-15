@@ -637,6 +637,34 @@ if sum(record.get("event") == "completed" for record in records) != 1:
 PY
 }
 
+assert_identity_input_rejected() {
+  local label="$1"
+  local dataset="$2"
+  local diagnostic_pattern="$3"
+  local result_dir="$negative_dir/identity-rejection-$label"
+  mkdir -p "$result_dir"
+
+  set +e
+  "$BIN" \
+    --dataset "$dataset" \
+    --output "$result_dir/splat.ply" \
+    --profile fast \
+    --checkpoint "$result_dir/checkpoint" \
+    --seed 42 \
+    --memory-budget-bytes 536870912 \
+    --events-fd 1 \
+    >"$result_dir/events.jsonl" 2>"$result_dir/stderr.log"
+  local status=$?
+  set -e
+
+  [ "$status" -eq 1 ] || fail "$label identity input exited with unexpected status $status"
+  [ ! -s "$result_dir/events.jsonl" ] || fail "$label identity input emitted a training event"
+  [ ! -e "$result_dir/checkpoint" ] || fail "$label identity input created a checkpoint"
+  [ ! -e "$result_dir/splat.ply" ] || fail "$label identity input published an output"
+  grep -Eqi "$diagnostic_pattern" "$result_dir/stderr.log" \
+    || fail "$label identity input diagnostic is not useful"
+}
+
 fixture_root="$negative_dir/sparse-fixtures"
 existing_fixture_root="$negative_dir/existing-fixture-output"
 mkdir -p "$existing_fixture_root"
@@ -689,6 +717,35 @@ if len(mixed) != 1 or mixed[0].get("dataset") != "14-mixed-resolution-500":
 if mixed[0].get("resolution") != [[32, 32], [320, 180]]:
     raise SystemExit("mixed-resolution fixture contract changed")
 PY
+
+hardlinked_image_dataset="$negative_dir/hardlinked-image-dataset"
+cp -R "$fixture_root/01-sphere-500" "$hardlinked_image_dataset"
+cp "$hardlinked_image_dataset/images/0000.png" "$negative_dir/hardlinked-image-source.png"
+rm "$hardlinked_image_dataset/images/0000.png"
+ln "$negative_dir/hardlinked-image-source.png" "$hardlinked_image_dataset/images/0000.png"
+assert_identity_input_rejected \
+  "hardlinked-image" "$hardlinked_image_dataset" 'single-link|hard.?link'
+
+hardlinked_bin_dataset="$negative_dir/hardlinked-bin-dataset"
+cp -R "$fixture_root/01-sphere-500" "$hardlinked_bin_dataset"
+cp "$hardlinked_bin_dataset/sparse/0/cameras.bin" "$negative_dir/hardlinked-cameras-source.bin"
+rm "$hardlinked_bin_dataset/sparse/0/cameras.bin"
+ln "$negative_dir/hardlinked-cameras-source.bin" "$hardlinked_bin_dataset/sparse/0/cameras.bin"
+assert_identity_input_rejected \
+  "hardlinked-bin" "$hardlinked_bin_dataset" 'single-link|hard.?link'
+
+extra_directory_dataset="$negative_dir/extra-directory-dataset"
+cp -R "$fixture_root/01-sphere-500" "$extra_directory_dataset"
+mkdir "$extra_directory_dataset/images/unexpected"
+assert_identity_input_rejected \
+  "extra-directory" "$extra_directory_dataset" 'supported|ordinary|image'
+
+extra_file_dataset="$negative_dir/extra-file-dataset"
+cp -R "$fixture_root/01-sphere-500" "$extra_file_dataset"
+printf 'not an image\n' >"$extra_file_dataset/images/notes.txt"
+assert_identity_input_rejected \
+  "extra-file" "$extra_file_dataset" 'supported|ordinary|image'
+
 require_file "$RASTER_TEST_BIN"
 [ -x "$RASTER_TEST_BIN" ] || fail "raster parity test is not executable: $RASTER_TEST_BIN"
 "$RASTER_TEST_BIN" \
