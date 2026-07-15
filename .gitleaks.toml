@@ -15,3 +15,10 @@ regexes = [
   '''^c71d239df91726fc519c6eb72d318ec65820627232b2f796219e87dcf35d0ab4$''',
 ]
 paths = ['''^scripts/toolchain/build_da3_mps\.sh$''']
+
+[[rules.allowlists]]
+description = "Swift coding key mistaken for a generic API key"
+condition = "AND"
+regexTarget = "line"
+regexes = ['''^[[:space:]]*forKey: \.alignmentP90ResidualDegrees[[:space:]]*$''']
+paths = ['''^Tools/BenchmarkDriver/Sources/BenchmarkDriverCore/OrientationEvidenceExtractor\.swift$''']
