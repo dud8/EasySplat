@@ -278,6 +278,11 @@
         "orientation_physical_up_error_degrees": {"$ref": "#/$defs/nonnegativeNumberMetric"},
         "orientation_sign_correct": {"$ref": "#/$defs/booleanMetric"},
         "raster_fallback_count": {"$ref": "#/$defs/nonnegativeIntegerMetric"},
+        "raster_exact_fallback_elapsed_seconds": {"$ref": "#/$defs/nonnegativeNumberMetric"},
+        "raster_exact_buffer_growth_count": {"$ref": "#/$defs/nonnegativeIntegerMetric"},
+        "raster_exact_buffer_bytes_added": {"$ref": "#/$defs/nonnegativeIntegerMetric"},
+        "raster_replay_elapsed_seconds": {"$ref": "#/$defs/nonnegativeNumberMetric"},
+        "raster_peak_exact_intersection_capacity": {"$ref": "#/$defs/nonnegativeIntegerMetric"},
         "maximum_tile_intersections": {"$ref": "#/$defs/nonnegativeIntegerMetric"},
         "dropped_intersection_count": {"$ref": "#/$defs/nonnegativeIntegerMetric"}
       }

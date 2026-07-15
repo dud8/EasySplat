@@ -151,6 +151,31 @@ public enum TrainingArtifactStore {
                   artifact.completedIteration,
                   Int(UInt32.max)
               ),
+              artifact.rasterExactFallbackElapsedSeconds.isFinite,
+              artifact.rasterExactFallbackElapsedSeconds >= 0,
+              artifact.rasterExactBufferGrowthCount >= 0,
+              artifact.rasterExactBufferGrowthCount <= artifact.rasterFallbackCount,
+              artifact.rasterExactBufferBytesAdded >= 0,
+              artifact.rasterReplayElapsedSeconds.isFinite,
+              artifact.rasterReplayElapsedSeconds >= 0,
+              artifact.rasterPeakExactIntersectionCapacity >= 0,
+              artifact.rasterPeakExactIntersectionCapacity <= Int64(UInt32.max),
+              (artifact.rasterExactBufferBytesAdded == 0
+                  || 1 + ((artifact.rasterExactBufferBytesAdded - 1)
+                      / artifact.memoryBudgetBytes)
+                      <= Int64(artifact.rasterExactBufferGrowthCount)),
+              ((artifact.rasterFallbackCount == 0
+                  && artifact.rasterExactFallbackElapsedSeconds == 0
+                  && artifact.rasterExactBufferGrowthCount == 0
+                  && artifact.rasterExactBufferBytesAdded == 0
+                  && artifact.rasterReplayElapsedSeconds == 0
+                  && artifact.rasterPeakExactIntersectionCapacity == 0)
+               || (artifact.rasterFallbackCount > 0
+                  && artifact.rasterExactFallbackElapsedSeconds > 0
+                  && artifact.rasterExactBufferGrowthCount > 0
+                  && artifact.rasterExactBufferBytesAdded > 0
+                  && artifact.rasterReplayElapsedSeconds > 0
+                  && artifact.rasterPeakExactIntersectionCapacity > 2_048)),
               artifact.droppedIntersectionCount == 0 else {
             throw TrainingArtifactStoreError.invalidManifest
         }
@@ -165,6 +190,7 @@ public enum TrainingArtifactStore {
                   artifact.outputPath == nil,
                   artifact.outputSHA256 == nil,
                   artifact.outputBytes == nil,
+                  artifact.elapsedSeconds == nil,
                   artifact.sceneBounds == nil else {
                 throw TrainingArtifactStoreError.invalidManifest
             }
@@ -179,7 +205,10 @@ public enum TrainingArtifactStore {
                   artifact.completedIteration > 0,
                   artifact.checkpointPath == nil,
                   artifact.checkpointDigest == nil,
-                  artifact.sceneBounds?.isValid == true else {
+                  artifact.sceneBounds?.isValid == true,
+                  let elapsedSeconds = artifact.elapsedSeconds,
+                  artifact.rasterExactFallbackElapsedSeconds <= elapsedSeconds,
+                  artifact.rasterReplayElapsedSeconds <= elapsedSeconds else {
                 throw TrainingArtifactStoreError.invalidManifest
             }
             _ = try projectPaths.resolveProjectRelativePath(path)

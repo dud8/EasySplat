@@ -82,6 +82,11 @@
         "orientation_physical_up_error_degrees": {"availability": "measured", "value": 0.75},
         "orientation_sign_correct": {"availability": "measured", "value": true},
         "raster_fallback_count": {"availability": "measured", "value": 0},
+        "raster_exact_fallback_elapsed_seconds": {"availability": "measured", "value": 0.0},
+        "raster_exact_buffer_growth_count": {"availability": "measured", "value": 0},
+        "raster_exact_buffer_bytes_added": {"availability": "measured", "value": 0},
+        "raster_replay_elapsed_seconds": {"availability": "measured", "value": 0.0},
+        "raster_peak_exact_intersection_capacity": {"availability": "measured", "value": 0},
         "maximum_tile_intersections": {"availability": "measured", "value": 100},
         "dropped_intersection_count": {"availability": "measured", "value": 0}
       },

@@ -450,7 +450,7 @@ extension PipelineRunner {
         }
         let artifact = TrainingArtifact(
             trainerVersion: "1.1.3 (git 106499b)",
-            runtimeVersion: "native-metal-cli-v1",
+            runtimeVersion: "native-metal-cli-v2",
             trainerBuildDigest: receipt.trainerBuildDigest,
             inputDigest: receipt.inputDigest,
             geometryDigest: receipt.geometryDigest,
@@ -467,6 +467,11 @@ extension PipelineRunner {
             peakMemoryBytes: receipt.peakMemoryBytes,
             memoryBudgetBytes: receipt.memoryBudgetBytes,
             rasterFallbackCount: receipt.rasterFallbackCount,
+            rasterExactFallbackElapsedSeconds: receipt.rasterExactFallbackElapsedSeconds,
+            rasterExactBufferGrowthCount: receipt.rasterExactBufferGrowthCount,
+            rasterExactBufferBytesAdded: receipt.rasterExactBufferBytesAdded,
+            rasterReplayElapsedSeconds: receipt.rasterReplayElapsedSeconds,
+            rasterPeakExactIntersectionCapacity: receipt.rasterPeakExactIntersectionCapacity,
             droppedIntersectionCount: receipt.droppedIntersectionCount,
             completionStatus: .checkpointed
         )
@@ -499,7 +504,7 @@ extension PipelineRunner {
         }
         let artifact = TrainingArtifact(
             trainerVersion: "1.1.3 (git 106499b)",
-            runtimeVersion: "native-metal-cli-v1",
+            runtimeVersion: "native-metal-cli-v2",
             trainerBuildDigest: result.trainerBuildDigest,
             inputDigest: result.inputDigest,
             geometryDigest: result.geometryDigest,
@@ -518,6 +523,11 @@ extension PipelineRunner {
             peakMemoryBytes: result.peakMemoryBytes,
             memoryBudgetBytes: result.memoryBudgetBytes,
             rasterFallbackCount: result.rasterFallbackCount,
+            rasterExactFallbackElapsedSeconds: result.rasterExactFallbackElapsedSeconds,
+            rasterExactBufferGrowthCount: result.rasterExactBufferGrowthCount,
+            rasterExactBufferBytesAdded: result.rasterExactBufferBytesAdded,
+            rasterReplayElapsedSeconds: result.rasterReplayElapsedSeconds,
+            rasterPeakExactIntersectionCapacity: result.rasterPeakExactIntersectionCapacity,
             droppedIntersectionCount: result.droppedIntersectionCount,
             sceneBounds: result.sceneBounds,
             completionStatus: .completed

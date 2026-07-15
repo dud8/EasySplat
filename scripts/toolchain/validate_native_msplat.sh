@@ -27,6 +27,8 @@ reject_raster_test_symbols() {
     msplat_set_exact_execution_capacity_for_testing \
     msplat_set_exact_capacity_limit_for_testing \
     msplat_set_raster_memory_budget_for_testing \
+    msplat_fail_next_sync_for_testing \
+    msplat_pending_exact_raster_timing_handlers_for_testing \
     msplat_copy_last_raster_debug; do
     if /usr/bin/nm -gU "$binary" | grep -Fq "$symbol"; then
       fail "native trainer exports raster test hook: $symbol"
@@ -122,13 +124,13 @@ exact_values = {
     "source_commit": "106499b0a53f82b0c92d013b0861fbebd341b17e",
     "source_version": "1.1.3",
     "source_tree_sha256": "866fd6d051b5cf98ca08ae1552236473f504d8f13756cbda68201e48532c3e6a",
-    "overlay_sha256": "20dbd357b47416c8f9857482fe73068bed3923131f62cd5689153299e24b4a69",
-    "raster_test_sha256": "2f2bc54801933bdcc5abe63cec1b18fd5075ad14ec45d07bf43cfdebe916df44",
+    "overlay_sha256": "da1a4289fa9ab3993d9db3cee2450bcf0c5a15d34778d59d81f092196300f922",
+    "raster_test_sha256": "f98e008a3d813cb8b8b3ae9d0b5e42f5f9d08ba7662835aebcdbad04fa910f7c",
     "patch_sha256": "fafbf6f43a3be474a708607a903fc0dbb0029a4d4664c261a1ebaf301f3e9f3f",
     "checkpoint_patch_sha256": "c8b9a8dd03afb4bc50b8a12adf78dc46f5280d67bb62823c58aff2305a4870dc",
     "numeric_stability_patch_sha256": "231586b17e4f47c8c55432a631e08bf293b31a92f8d6ec49b367d11632350ec3",
     "metal_safety_patch_sha256": "5d3dfff3edcbca940d37f6ee3145c76c678ebd36ebc03016cfd5dab78e1d45ac",
-    "exact_raster_patch_sha256": "23c6a6a6c89dabe0827de9f13d2b026a0c416d912edc73468864b23bc376b27e",
+    "exact_raster_patch_sha256": "dd1f1a802cabaaceeab8825535e374f21ad723c680d4e70bcfc7d3d4e865962d",
     "deployment_target": "macOS 15.0",
     "build_configuration": "Release",
 }
@@ -249,7 +251,7 @@ lines = Path(sys.argv[1]).read_text(encoding="utf-8").splitlines()
 expected = {
     "event": "self_check",
     "scene_bounds_status": "ok",
-    "schema_version": 1,
+    "schema_version": 2,
     "sequence": 1,
     "status": "ok",
     "version": sys.argv[2],

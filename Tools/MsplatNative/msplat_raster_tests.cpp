@@ -5,6 +5,7 @@
 #include <iostream>
 #include <stdexcept>
 #include <string>
+#include <tuple>
 #include <vector>
 
 #include "bindings.h"
@@ -578,6 +579,201 @@ void verifyDeterministicWindowReplay(const std::string &dataset) {
     std::cout << "deterministic_window_replay passed\n";
 }
 
+void verifyRepeatedExactFallbackMetrics(const std::string &dataset) {
+    cleanup_msplat_metal();
+    msplat_set_raster_memory_budget_bytes(memoryBudgetBytes);
+    const std::vector<std::tuple<std::uint64_t, double, std::uint64_t,
+                                 std::uint64_t, std::uint64_t>> invalidHistory {
+        {0, 0.1, 0, 0, 0},
+        {1, 0.0, 0, 0, 0},
+        {1, 0.1, 0, 0, 0},
+        {1, 0.1, 1, 0, 2304},
+        {1, 0.1, 1, 4096, 2048},
+        {1, 0.1, 2, 4096, 2304},
+        {1, 0.1, 1, memoryBudgetBytes + 1, 2304},
+        {1, 0.1, 1, 4096, std::uint64_t {1} << 32},
+    };
+    for (const auto &[fallbacks, elapsed, growths, bytes, peak] : invalidHistory) {
+        bool rejected = false;
+        try {
+            msplat_restore_raster_metrics(fallbacks, elapsed, growths, bytes, peak);
+        } catch (const std::invalid_argument &) {
+            rejected = true;
+        }
+        if (!rejected) {
+            throw std::runtime_error("native raster restore accepted inconsistent history");
+        }
+    }
+    msplat_restore_raster_metrics(3, 0.1, 2, memoryBudgetBytes + 1, 2304);
+    const MsplatRasterStats restored = msplat_get_raster_stats();
+    if (restored.fallback_count != 3 || restored.exact_fallback_elapsed_seconds != 0.1 ||
+        restored.exact_buffer_growth_count != 2 ||
+        restored.exact_buffer_bytes_added != memoryBudgetBytes + 1 ||
+        restored.peak_exact_intersection_capacity != 2304) {
+        throw std::runtime_error("native raster restore rejected consistent history");
+    }
+    cleanup_msplat_metal();
+    msplat_set_raster_memory_budget_bytes(memoryBudgetBytes);
+    msplat_set_raster_fallback_count(0);
+    msplat_set_force_exact_for_testing(true);
+
+    {
+        InputData inputData = inputDataFromX(dataset);
+        if (inputData.cameras.empty()) {
+            throw std::runtime_error("repeated exact-fallback fixture has no camera");
+        }
+        Camera &camera = inputData.cameras.front();
+        Model model = makeModel(inputData);
+        const std::uint64_t intersections = primeExactWorkspace(model, camera, 1, 0);
+        const MsplatRasterStats grown = msplat_get_raster_stats();
+        if (grown.exact_buffer_growth_count != 1 ||
+            grown.exact_buffer_bytes_added == 0 ||
+            grown.peak_exact_intersection_capacity < intersections) {
+            throw std::runtime_error("exact buffer growth was not measured once");
+        }
+
+        enqueueStep(model, camera, 1, 0);
+        msplat_gpu_sync_for_raster_replay();
+        const MsplatRasterStats first = msplat_get_raster_stats();
+        enqueueStep(model, camera, 2, 0);
+        msplat_gpu_sync_for_raster_replay();
+        const MsplatRasterStats second = msplat_get_raster_stats();
+
+        if (second.fallback_count != 2 ||
+            second.exact_buffer_growth_count != 1 ||
+            second.exact_buffer_bytes_added != grown.exact_buffer_bytes_added ||
+            second.peak_exact_intersection_capacity != grown.peak_exact_intersection_capacity ||
+            second.exact_fallback_elapsed_seconds <= 0 ||
+            second.exact_fallback_elapsed_seconds < first.exact_fallback_elapsed_seconds) {
+            throw std::runtime_error(
+                "repeated exact dispatches were confused with buffer allocations"
+            );
+        }
+
+        msplat_grow_exact_raster_capacity(intersections);
+        const MsplatRasterStats cached = msplat_get_raster_stats();
+        if (cached.exact_buffer_growth_count != 1 ||
+            cached.exact_buffer_bytes_added != grown.exact_buffer_bytes_added) {
+            throw std::runtime_error("cached exact capacity was counted as new growth");
+        }
+    }
+
+    cleanup_msplat_metal();
+    std::cout << "repeated_exact_fallback_metrics passed\n";
+}
+
+void verifyQueuedExactFallbackTiming(const std::string &dataset) {
+    cleanup_msplat_metal();
+    msplat_set_raster_memory_budget_bytes(memoryBudgetBytes);
+    msplat_set_raster_fallback_count(0);
+    msplat_set_force_exact_for_testing(true);
+
+    double wallSeconds = 0;
+    double exactSeconds = 0;
+    {
+        InputData inputData = inputDataFromX(dataset);
+        if (inputData.cameras.empty()) {
+            throw std::runtime_error("queued-timing fixture has no camera");
+        }
+        Camera &camera = inputData.cameras.front();
+        Model model = makeModel(inputData);
+        (void)primeExactWorkspace(model, camera, 1, 0);
+
+        constexpr int batchSize = 100;
+        const auto started = std::chrono::steady_clock::now();
+        for (int step = 1; step <= batchSize; ++step) {
+            enqueueStep(model, camera, step, 0);
+        }
+        msplat_gpu_sync_for_raster_replay();
+        wallSeconds = std::chrono::duration<double>(
+            std::chrono::steady_clock::now() - started
+        ).count();
+        const MsplatRasterStats stats = msplat_get_raster_stats();
+        exactSeconds = stats.exact_fallback_elapsed_seconds;
+        if (stats.fallback_count != batchSize || !std::isfinite(exactSeconds) ||
+            exactSeconds <= 0 || exactSeconds > wallSeconds + 1.0e-6) {
+            throw std::runtime_error(
+                "queued exact GPU timing exceeded its enclosing wall time: exact=" +
+                std::to_string(exactSeconds) + " wall=" + std::to_string(wallSeconds)
+            );
+        }
+    }
+
+    cleanup_msplat_metal();
+    std::cout << "queued_exact_gpu_seconds=" << exactSeconds
+              << " wall_seconds=" << wallSeconds
+              << " queued_exact_timing passed\n";
+}
+
+void verifySyncFailureDrainsTimingHandlers(const std::string &dataset) {
+    cleanup_msplat_metal();
+    msplat_set_raster_memory_budget_bytes(memoryBudgetBytes);
+    msplat_set_raster_fallback_count(0);
+    msplat_set_force_exact_for_testing(true);
+
+    {
+        InputData inputData = inputDataFromX(dataset);
+        if (inputData.cameras.empty()) {
+            throw std::runtime_error("sync-failure fixture has no camera");
+        }
+        Camera &camera = inputData.cameras.front();
+        Model model = makeModel(inputData);
+        (void)primeExactWorkspace(model, camera, 1, 0);
+
+        msplat_fail_next_sync_for_testing();
+        enqueueStep(model, camera, 1, 0);
+        if (msplat_pending_exact_raster_timing_handlers_for_testing() == 0) {
+            throw std::runtime_error(
+                "sync-failure fixture did not queue an exact-raster timing handler"
+            );
+        }
+        bool syncRejected = false;
+        try {
+            msplat_gpu_sync_for_raster_replay();
+        } catch (const std::runtime_error &error) {
+            syncRejected = std::string(error.what()).find("injected sync failure") !=
+                std::string::npos;
+        }
+        if (!syncRejected ||
+            msplat_pending_exact_raster_timing_handlers_for_testing() != 0) {
+            throw std::runtime_error(
+                "sync failure escaped before exact-raster timing handlers drained"
+            );
+        }
+
+        msplat_fail_next_sync_for_testing();
+        enqueueStep(model, camera, 2, 0);
+        if (msplat_pending_exact_raster_timing_handlers_for_testing() == 0) {
+            throw std::runtime_error(
+                "cleanup fixture did not queue an exact-raster timing handler"
+            );
+        }
+        bool cleanupRejected = false;
+        try {
+            cleanup_msplat_metal();
+        } catch (const std::runtime_error &error) {
+            cleanupRejected = std::string(error.what()).find("injected sync failure") !=
+                std::string::npos;
+        }
+        const MsplatRasterStats reset = msplat_get_raster_stats();
+        if (!cleanupRejected ||
+            msplat_pending_exact_raster_timing_handlers_for_testing() != 0 ||
+            reset.fallback_count != 0 ||
+            reset.exact_fallback_elapsed_seconds != 0 ||
+            reset.exact_buffer_growth_count != 0 ||
+            reset.exact_buffer_bytes_added != 0 ||
+            reset.peak_exact_intersection_capacity != 0) {
+            throw std::runtime_error(
+                "cleanup failure did not drain handlers and reset exact-raster state"
+            );
+        }
+    }
+
+    // A failed cleanup must leave the next lifecycle usable.
+    cleanup_msplat_metal();
+    std::cout << "sync_failure_timing_lifecycle passed\n";
+}
+
 ModelSnapshot runIncreasingWindow(const std::string &dataset, bool replay) {
     cleanup_msplat_metal();
     msplat_set_raster_memory_budget_bytes(memoryBudgetBytes);
@@ -838,6 +1034,9 @@ int main(int argc, char **argv) {
         verifyMixedResolutionGrowth(argv[2]);
         verifyExactOnlyBudgetEvidence(argv[6]);
         verifySharedAllocationBudget();
+        verifyRepeatedExactFallbackMetrics(argv[3]);
+        verifyQueuedExactFallbackTiming(argv[3]);
+        verifySyncFailureDrainsTimingHandlers(argv[3]);
         verifyDeterministicWindowReplay(argv[3]);
         verifyGPUCapacityFailure(argv[4]);
         verifyIncreasingWindowReplay(argv[5]);

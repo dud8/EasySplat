@@ -128,6 +128,21 @@ final class TrainingArtifactStoreTests: XCTestCase {
         )
     }
 
+    func testCheckpointedArtifactCannotClaimElapsedTrainingTime() throws {
+        let context = try makeContext()
+        defer { context.cleanup() }
+        var artifact = makeCheckpointedArtifact()
+        artifact.elapsedSeconds = 0.1
+
+        XCTAssertThrowsError(
+            try TrainingArtifactStore.save(
+                artifact,
+                to: context.paths.trainingManifestURL,
+                projectPaths: context.paths
+            )
+        )
+    }
+
     func testArtifactRejectsFallbackCountsOutsideCompletedIterationsAndNativeRange() throws {
         let context = try makeContext()
         defer { context.cleanup() }
@@ -147,11 +162,112 @@ final class TrainingArtifactStoreTests: XCTestCase {
         }
     }
 
+    func testArtifactRequiresConsistentRasterRecoveryMetrics() throws {
+        let context = try makeContext()
+        defer { context.cleanup() }
+
+        var valid = try makeCompletedArtifact(in: context)
+        valid.rasterFallbackCount = 3
+        valid.rasterExactFallbackElapsedSeconds = 0.25
+        valid.rasterExactBufferGrowthCount = 1
+        valid.rasterExactBufferBytesAdded = 65_536
+        valid.rasterReplayElapsedSeconds = 0.5
+        valid.rasterPeakExactIntersectionCapacity = 4_096
+        try TrainingArtifactStore.save(
+            valid,
+            to: context.paths.trainingManifestURL,
+            projectPaths: context.paths
+        )
+
+        var invalid = valid
+        invalid.rasterExactBufferGrowthCount = 4
+        XCTAssertThrowsError(try TrainingArtifactStore.save(
+            invalid,
+            to: context.paths.trainingManifestURL,
+            projectPaths: context.paths
+        ))
+
+        invalid = valid
+        invalid.rasterExactBufferBytesAdded = 0
+        XCTAssertThrowsError(try TrainingArtifactStore.save(
+            invalid,
+            to: context.paths.trainingManifestURL,
+            projectPaths: context.paths
+        ))
+
+        invalid = valid
+        invalid.rasterExactFallbackElapsedSeconds = .infinity
+        XCTAssertThrowsError(try TrainingArtifactStore.save(
+            invalid,
+            to: context.paths.trainingManifestURL,
+            projectPaths: context.paths
+        ))
+
+        invalid = valid
+        invalid.rasterExactFallbackElapsedSeconds = 0
+        XCTAssertThrowsError(try TrainingArtifactStore.save(
+            invalid,
+            to: context.paths.trainingManifestURL,
+            projectPaths: context.paths
+        ))
+
+        invalid = valid
+        invalid.rasterReplayElapsedSeconds = 0
+        XCTAssertThrowsError(try TrainingArtifactStore.save(
+            invalid,
+            to: context.paths.trainingManifestURL,
+            projectPaths: context.paths
+        ))
+
+        invalid = valid
+        invalid.rasterExactBufferGrowthCount = 0
+        invalid.rasterExactBufferBytesAdded = 0
+        invalid.rasterPeakExactIntersectionCapacity = 0
+        XCTAssertThrowsError(try TrainingArtifactStore.save(
+            invalid,
+            to: context.paths.trainingManifestURL,
+            projectPaths: context.paths
+        ))
+
+        invalid = valid
+        invalid.rasterReplayElapsedSeconds = try XCTUnwrap(valid.elapsedSeconds) + 1
+        XCTAssertThrowsError(try TrainingArtifactStore.save(
+            invalid,
+            to: context.paths.trainingManifestURL,
+            projectPaths: context.paths
+        ))
+
+        invalid = valid
+        invalid.rasterPeakExactIntersectionCapacity = Int64(UInt32.max) + 1
+        XCTAssertThrowsError(try TrainingArtifactStore.save(
+            invalid,
+            to: context.paths.trainingManifestURL,
+            projectPaths: context.paths
+        ))
+
+        invalid = valid
+        invalid.rasterExactBufferBytesAdded = invalid.memoryBudgetBytes + 1
+        XCTAssertThrowsError(try TrainingArtifactStore.save(
+            invalid,
+            to: context.paths.trainingManifestURL,
+            projectPaths: context.paths
+        ))
+
+        var cumulative = valid
+        cumulative.rasterExactBufferGrowthCount = 2
+        cumulative.rasterExactBufferBytesAdded = cumulative.memoryBudgetBytes + 1
+        try TrainingArtifactStore.save(
+            cumulative,
+            to: context.paths.trainingManifestURL,
+            projectPaths: context.paths
+        )
+    }
+
     func testPriorTrainingSchemasAreRejected() throws {
         let context = try makeContext()
         defer { context.cleanup() }
         var artifact = makeCheckpointedArtifact()
-        for schema in [1, 2] {
+        for schema in [1, 2, 3] {
             artifact.schemaVersion = schema
             XCTAssertThrowsError(
                 try TrainingArtifactStore.save(
@@ -159,6 +275,41 @@ final class TrainingArtifactStoreTests: XCTestCase {
                     to: context.paths.trainingManifestURL,
                     projectPaths: context.paths
                 )
+            )
+        }
+    }
+
+    func testCurrentManifestRequiresEveryRasterRecoveryField() throws {
+        let fields = [
+            "rasterExactFallbackElapsedSeconds",
+            "rasterExactBufferGrowthCount",
+            "rasterExactBufferBytesAdded",
+            "rasterReplayElapsedSeconds",
+            "rasterPeakExactIntersectionCapacity",
+        ]
+        for field in fields {
+            let context = try makeContext()
+            defer { context.cleanup() }
+            let artifact = try makeCompletedArtifact(in: context)
+            try TrainingArtifactStore.save(
+                artifact,
+                to: context.paths.trainingManifestURL,
+                projectPaths: context.paths
+            )
+            let data = try Data(contentsOf: context.paths.trainingManifestURL)
+            var payload = try XCTUnwrap(
+                JSONSerialization.jsonObject(with: data) as? [String: Any]
+            )
+            payload.removeValue(forKey: field)
+            try JSONSerialization.data(withJSONObject: payload, options: [.sortedKeys])
+                .write(to: context.paths.trainingManifestURL, options: .atomic)
+
+            XCTAssertThrowsError(
+                try TrainingArtifactStore.load(
+                    from: context.paths.trainingManifestURL,
+                    projectPaths: context.paths
+                ),
+                "Decoded schema-4 manifest without required field \(field)"
             )
         }
     }
@@ -330,6 +481,11 @@ final class TrainingArtifactStoreTests: XCTestCase {
                 peakMemoryBytes: 2_147_483_648,
                 memoryBudgetBytes: plan.trainerMemoryBudgetBytes,
                 rasterFallbackCount: 0,
+                rasterExactFallbackElapsedSeconds: 0,
+                rasterExactBufferGrowthCount: 0,
+                rasterExactBufferBytesAdded: 0,
+                rasterReplayElapsedSeconds: 0,
+                rasterPeakExactIntersectionCapacity: 0,
                 droppedIntersectionCount: 0,
                 sceneBounds: SplatSceneBounds(
                     center: .init(x: 0, y: 0, z: 0),
@@ -572,7 +728,7 @@ final class TrainingArtifactStoreTests: XCTestCase {
     private func makeCheckpointedArtifact() -> TrainingArtifact {
         TrainingArtifact(
             trainerVersion: "1.1.3 (git 106499b)",
-            runtimeVersion: "native-metal-cli-v1",
+            runtimeVersion: "native-metal-cli-v2",
             trainerBuildDigest: String(repeating: "a", count: 64),
             inputDigest: String(repeating: "b", count: 64),
             geometryDigest: String(repeating: "c", count: 64),
@@ -585,10 +741,15 @@ final class TrainingArtifactStoreTests: XCTestCase {
             checkpointDigest: String(repeating: "d", count: 64),
             outputPath: nil,
             gaussianCount: 1_250,
-            elapsedSeconds: 12.5,
+            elapsedSeconds: nil,
             peakMemoryBytes: 2_147_483_648,
             memoryBudgetBytes: 8_589_934_592,
             rasterFallbackCount: 0,
+            rasterExactFallbackElapsedSeconds: 0,
+            rasterExactBufferGrowthCount: 0,
+            rasterExactBufferBytesAdded: 0,
+            rasterReplayElapsedSeconds: 0,
+            rasterPeakExactIntersectionCapacity: 0,
             droppedIntersectionCount: 0,
             completionStatus: .checkpointed
         )
@@ -610,6 +771,7 @@ final class TrainingArtifactStoreTests: XCTestCase {
             )
         )
         artifact.gaussianCount = 1
+        artifact.elapsedSeconds = 12.5
         artifact.sceneBounds = SplatSceneBounds(
             center: .init(x: 0.25, y: -0.5, z: 1.5),
             radius: 3.75

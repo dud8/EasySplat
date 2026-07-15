@@ -22,7 +22,7 @@ NUMERIC_STABILITY_PATCH_SHA256="231586b17e4f47c8c55432a631e08bf293b31a92f8d6ec49
 METAL_SAFETY_PATCH="$ROOT/Tools/MsplatNative/msplat-1.1.3-metal-safety.patch"
 METAL_SAFETY_PATCH_SHA256="5d3dfff3edcbca940d37f6ee3145c76c678ebd36ebc03016cfd5dab78e1d45ac"
 EXACT_RASTER_PATCH="$ROOT/Tools/MsplatNative/msplat-1.1.3-exact-raster.patch"
-EXACT_RASTER_PATCH_SHA256="23c6a6a6c89dabe0827de9f13d2b026a0c416d912edc73468864b23bc376b27e"
+EXACT_RASTER_PATCH_SHA256="dd1f1a802cabaaceeab8825535e374f21ad723c680d4e70bcfc7d3d4e865962d"
 RASTER_TEST_FIXTURES="$BUILD_DIR/raster-test-fixtures"
 
 MSPLAT_REPO="https://github.com/rayanht/msplat.git"
@@ -71,6 +71,8 @@ reject_raster_test_symbols() {
     msplat_set_exact_execution_capacity_for_testing \
     msplat_set_exact_capacity_limit_for_testing \
     msplat_set_raster_memory_budget_for_testing \
+    msplat_fail_next_sync_for_testing \
+    msplat_pending_exact_raster_timing_handlers_for_testing \
     msplat_copy_last_raster_debug; do
     if /usr/bin/nm -gU "$binary" | grep -Fq "$symbol"; then
       die "staged CLI exports raster test hook: $symbol"

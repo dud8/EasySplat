@@ -334,7 +334,7 @@ final class ProjectMetadataStoreTests: XCTestCase {
         let missingOutput = "Training/msplat/splat.ply"
         let artifact = TrainingArtifact(
             trainerVersion: "1.1.3",
-            runtimeVersion: "native-metal-cli-v1",
+            runtimeVersion: "native-metal-cli-v2",
             trainerBuildDigest: String(repeating: "a", count: 64),
             inputDigest: String(repeating: "b", count: 64),
             geometryDigest: String(repeating: "c", count: 64),
@@ -353,6 +353,11 @@ final class ProjectMetadataStoreTests: XCTestCase {
             peakMemoryBytes: 1_024,
             memoryBudgetBytes: 8_589_934_592,
             rasterFallbackCount: 0,
+            rasterExactFallbackElapsedSeconds: 0,
+            rasterExactBufferGrowthCount: 0,
+            rasterExactBufferBytesAdded: 0,
+            rasterReplayElapsedSeconds: 0,
+            rasterPeakExactIntersectionCapacity: 0,
             droppedIntersectionCount: 0,
             sceneBounds: SplatSceneBounds(
                 center: .init(x: 0, y: 0, z: 0),

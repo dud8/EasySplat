@@ -85,6 +85,9 @@ PIPELINE_INTEGER_METRICS = {
     "loop_pairs",
     "bundle_adjustment_cycles",
     "raster_fallback_count",
+    "raster_exact_buffer_growth_count",
+    "raster_exact_buffer_bytes_added",
+    "raster_peak_exact_intersection_capacity",
     "maximum_tile_intersections",
     "dropped_intersection_count",
 }
@@ -92,6 +95,8 @@ PIPELINE_NUMBER_METRICS = {
     "matcher_seconds",
     "mapping_seconds",
     "orientation_physical_up_error_degrees",
+    "raster_exact_fallback_elapsed_seconds",
+    "raster_replay_elapsed_seconds",
 }
 PIPELINE_BOOLEAN_METRICS = {"orientation_sign_correct"}
 PIPELINE_ENUM_METRICS = {
@@ -659,6 +664,59 @@ def _pipeline_metrics(value: Any) -> dict[str, Any]:
             raise EvidenceError(f"observations.pipeline_metrics.{name} has an unsupported value")
         else:
             result[name] = measured(item)
+    raster_values = {
+        name: raw[name]
+        for name in (
+            "raster_fallback_count",
+            "raster_exact_fallback_elapsed_seconds",
+            "raster_exact_buffer_growth_count",
+            "raster_exact_buffer_bytes_added",
+            "raster_replay_elapsed_seconds",
+            "raster_peak_exact_intersection_capacity",
+        )
+    }
+    measured_raster = {name for name, item in raster_values.items() if item is not None}
+    if measured_raster and len(measured_raster) != len(raster_values):
+        raise EvidenceError("raster recovery pipeline metrics must be measured together")
+    if measured_raster:
+        fallback_count = raster_values["raster_fallback_count"]
+        exact_elapsed = raster_values["raster_exact_fallback_elapsed_seconds"]
+        growth_count = raster_values["raster_exact_buffer_growth_count"]
+        bytes_added = raster_values["raster_exact_buffer_bytes_added"]
+        replay_elapsed = raster_values["raster_replay_elapsed_seconds"]
+        peak_capacity = raster_values["raster_peak_exact_intersection_capacity"]
+        if peak_capacity > (1 << 32) - 1:
+            raise EvidenceError("raster peak exact capacity exceeds the native counter range")
+        if growth_count > fallback_count:
+            raise EvidenceError("raster buffer growth count exceeds fallback count")
+        if fallback_count == 0 and any(
+            value != 0
+            for value in (exact_elapsed, growth_count, bytes_added, replay_elapsed, peak_capacity)
+        ):
+            raise EvidenceError("zero raster fallbacks require zero recovery metrics")
+        if fallback_count > 0 and (
+            exact_elapsed <= 0
+            or growth_count <= 0
+            or bytes_added <= 0
+            or replay_elapsed <= 0
+            or peak_capacity <= 2_048
+        ):
+            raise EvidenceError("raster fallback recovery evidence is incomplete")
+        if growth_count == 0 and (bytes_added != 0 or peak_capacity != 0):
+            raise EvidenceError("zero raster buffer growth requires zero allocation evidence")
+        if growth_count > 0 and (bytes_added == 0 or peak_capacity <= 2_048):
+            raise EvidenceError("raster buffer growth evidence is incomplete")
+        maximum_tile_intersections = raw["maximum_tile_intersections"]
+        if maximum_tile_intersections is not None:
+            crossed_overflow_threshold = maximum_tile_intersections > 2_048
+            if (fallback_count > 0) != crossed_overflow_threshold:
+                raise EvidenceError(
+                    "raster fallback evidence contradicts the measured overflow threshold"
+                )
+            if crossed_overflow_threshold and peak_capacity < maximum_tile_intersections:
+                raise EvidenceError(
+                    "raster peak exact capacity is below the measured tile intersections"
+                )
     orientation_status = raw["orientation_status"]
     physical_error = raw["orientation_physical_up_error_degrees"]
     sign_correct = raw["orientation_sign_correct"]
@@ -1081,6 +1139,49 @@ def _execution_runs(
                 }
             )
     return runs
+
+
+def _published_training_duration(
+    commands: Any,
+    timing: Mapping[str, Any],
+) -> float:
+    if not isinstance(commands, list):
+        raise EvidenceError("published training receipt is unavailable")
+    published = [
+        _mapping(command, f"commands[{index}]")
+        for index, command in enumerate(commands)
+        if isinstance(command, Mapping) and command.get("published_output") is True
+    ]
+    if len(published) != 1:
+        raise EvidenceError("valid evidence requires exactly one published training receipt")
+    receipt = published[0]
+    run_id = _token(receipt.get("run_id"), "published training receipt run_id")
+    phase = _token(receipt.get("phase"), "published training receipt phase")
+    variant = _token(receipt.get("variant"), "published training receipt variant")
+    expected_phase = "ordinary" if "ordinary_runs" in timing else "candidate"
+    if variant != "candidate" or phase != expected_phase:
+        raise EvidenceError("published output must come from the candidate end-to-end run")
+    group_name = f"{phase}_runs"
+    records = timing.get(group_name)
+    if not isinstance(records, list):
+        raise EvidenceError("published training receipt has no timing group")
+    matching = [
+        _mapping(record, f"timing.{group_name}[{index}]")
+        for index, record in enumerate(records)
+        if isinstance(record, Mapping)
+        and record.get("run_id") == run_id
+        and record.get("variant") == variant
+    ]
+    if len(matching) != 1:
+        raise EvidenceError("published training receipt does not resolve to one timing run")
+    record = matching[0]
+    if record.get("discarded") is not False:
+        raise EvidenceError("published output must come from a measured candidate end-to-end run")
+    field = "training_seconds" if "training_seconds" in record else "end_to_end_seconds"
+    return _positive_number(
+        record.get(field),
+        f"published timing run {group_name}.{run_id}.{field}",
+    )
 
 
 def _configuration_digest(value: Mapping[str, Any]) -> str:
@@ -2490,6 +2591,11 @@ def derive_metrics(
                     "mapping_seconds",
                     "bundle_adjustment_cycles",
                     "raster_fallback_count",
+                    "raster_exact_fallback_elapsed_seconds",
+                    "raster_exact_buffer_growth_count",
+                    "raster_exact_buffer_bytes_added",
+                    "raster_replay_elapsed_seconds",
+                    "raster_peak_exact_intersection_capacity",
                     "maximum_tile_intersections",
                 }
             )
@@ -4015,6 +4121,227 @@ def _validate_splat_ply(path: Path) -> int:
     return vertex_count
 
 
+def _validate_training_manifest(
+    path: Path,
+    output_descriptor: Mapping[str, Any],
+    output_splat_count: int,
+    pipeline_metrics: Mapping[str, Any],
+    candidate_configuration: Mapping[str, Any],
+    maximum_training_seconds: float,
+) -> None:
+    manifest = _mapping(
+        _load_bounded_json(path, "training manifest", maximum_bytes=1024 * 1024),
+        "training manifest",
+    )
+    _exact_keys(
+        manifest,
+        {
+            "schemaVersion",
+            "trainerVersion",
+            "runtimeVersion",
+            "trainerBuildDigest",
+            "inputDigest",
+            "geometryDigest",
+            "detailProfile",
+            "iterationLimit",
+            "plateauWindow",
+            "deterministicSeed",
+            "completedIteration",
+            "outputPath",
+            "outputSHA256",
+            "outputBytes",
+            "gaussianCount",
+            "elapsedSeconds",
+            "peakMemoryBytes",
+            "memoryBudgetBytes",
+            "rasterFallbackCount",
+            "rasterExactFallbackElapsedSeconds",
+            "rasterExactBufferGrowthCount",
+            "rasterExactBufferBytesAdded",
+            "rasterReplayElapsedSeconds",
+            "rasterPeakExactIntersectionCapacity",
+            "droppedIntersectionCount",
+            "sceneBounds",
+            "completionStatus",
+        },
+        "training manifest",
+    )
+    if manifest["schemaVersion"] != 4 or manifest["completionStatus"] != "completed":
+        raise EvidenceError("training manifest is not a completed schema-4 artifact")
+    if manifest["runtimeVersion"] != "native-metal-cli-v2":
+        raise EvidenceError("training manifest runtime contract is unsupported")
+    if (
+        not isinstance(manifest["detailProfile"], str)
+        or manifest["detailProfile"] not in {"fast", "balanced", "highDetail"}
+    ):
+        raise EvidenceError("training manifest detail profile is invalid")
+    expected_profile = candidate_configuration["detail_profile"]
+    if manifest["detailProfile"] != expected_profile:
+        raise EvidenceError("training manifest detail profile does not match request")
+    requested_contract = {
+        "iterationLimit": candidate_configuration["trainer_iterations"],
+        "plateauWindow": candidate_configuration["trainer_plateau_window"],
+    }
+    for name, expected in requested_contract.items():
+        if manifest[name] != expected:
+            raise EvidenceError(f"training manifest {name} does not match request")
+    if manifest["outputPath"] != "Output/splat.ply":
+        raise EvidenceError("training manifest output path is not canonical")
+    digest = manifest["outputSHA256"]
+    if (
+        not isinstance(digest, str)
+        or not re.fullmatch(r"[0-9a-f]{64}", digest)
+        or "sha256:" + digest != output_descriptor["sha256"]
+    ):
+        raise EvidenceError("training manifest output digest does not match output_ply")
+    signed_integer_fields = (
+        "iterationLimit",
+        "plateauWindow",
+        "completedIteration",
+        "outputBytes",
+        "gaussianCount",
+        "peakMemoryBytes",
+        "memoryBudgetBytes",
+        "rasterFallbackCount",
+        "rasterExactBufferGrowthCount",
+        "rasterExactBufferBytesAdded",
+        "rasterPeakExactIntersectionCapacity",
+        "droppedIntersectionCount",
+    )
+    for name in signed_integer_fields:
+        if (
+            type(manifest[name]) is not int
+            or manifest[name] < 0
+            or manifest[name] > (1 << 63) - 1
+        ):
+            raise EvidenceError(f"training manifest {name} must be a nonnegative integer")
+    if (
+        type(manifest["deterministicSeed"]) is not int
+        or not 0 <= manifest["deterministicSeed"] <= (1 << 64) - 1
+    ):
+        raise EvidenceError("training manifest deterministicSeed is outside UInt64")
+    if manifest["deterministicSeed"] != candidate_configuration["deterministic_seed"]:
+        raise EvidenceError("training manifest deterministicSeed does not match request")
+    if manifest["iterationLimit"] == 0 or manifest["plateauWindow"] == 0:
+        raise EvidenceError("training manifest iteration contract is invalid")
+    if not 0 < manifest["completedIteration"] <= manifest["iterationLimit"]:
+        raise EvidenceError("training manifest completion iteration is invalid")
+    if manifest["outputBytes"] == 0 or manifest["gaussianCount"] == 0:
+        raise EvidenceError("training manifest output contract is invalid")
+    if manifest["peakMemoryBytes"] == 0 or manifest["memoryBudgetBytes"] == 0:
+        raise EvidenceError("training manifest memory contract is invalid")
+    if manifest["rasterFallbackCount"] > min(
+        manifest["completedIteration"],
+        (1 << 32) - 1,
+    ):
+        raise EvidenceError("training manifest raster fallback count is invalid")
+    if manifest["rasterExactBufferGrowthCount"] > manifest["rasterFallbackCount"]:
+        raise EvidenceError("training manifest raster growth count is invalid")
+    for name in (
+        "elapsedSeconds",
+        "rasterExactFallbackElapsedSeconds",
+        "rasterReplayElapsedSeconds",
+    ):
+        value = manifest[name]
+        if (
+            isinstance(value, bool)
+            or not isinstance(value, (int, float))
+            or not math.isfinite(value)
+            or value < 0
+        ):
+            raise EvidenceError(f"training manifest {name} must be finite and nonnegative")
+    if manifest["rasterPeakExactIntersectionCapacity"] > (1 << 32) - 1:
+        raise EvidenceError("training manifest raster peak capacity exceeds UInt32")
+    if (
+        manifest["rasterExactBufferBytesAdded"]
+        > manifest["rasterExactBufferGrowthCount"] * manifest["memoryBudgetBytes"]
+    ):
+        raise EvidenceError("training manifest raster allocation evidence exceeds its budget")
+    if manifest["rasterFallbackCount"] == 0 and any(
+        manifest[name] != 0
+        for name in (
+            "rasterExactFallbackElapsedSeconds",
+            "rasterExactBufferGrowthCount",
+            "rasterExactBufferBytesAdded",
+            "rasterReplayElapsedSeconds",
+            "rasterPeakExactIntersectionCapacity",
+        )
+    ):
+        raise EvidenceError("training manifest zero raster fallbacks have recovery evidence")
+    if manifest["rasterFallbackCount"] > 0 and (
+        manifest["rasterExactFallbackElapsedSeconds"] <= 0
+        or manifest["rasterExactBufferGrowthCount"] <= 0
+        or manifest["rasterExactBufferBytesAdded"] <= 0
+        or manifest["rasterReplayElapsedSeconds"] <= 0
+        or manifest["rasterPeakExactIntersectionCapacity"] <= 2_048
+    ):
+        raise EvidenceError("training manifest raster fallback evidence is incomplete")
+    if manifest["rasterExactBufferGrowthCount"] == 0 and (
+        manifest["rasterExactBufferBytesAdded"] != 0
+        or manifest["rasterPeakExactIntersectionCapacity"] != 0
+    ):
+        raise EvidenceError("training manifest zero raster growth has allocation evidence")
+    if manifest["rasterExactBufferGrowthCount"] > 0 and (
+        manifest["rasterExactBufferBytesAdded"] == 0
+        or manifest["rasterPeakExactIntersectionCapacity"] <= 2_048
+    ):
+        raise EvidenceError("training manifest raster growth evidence is invalid")
+    if manifest["outputBytes"] != output_descriptor["bytes"]:
+        raise EvidenceError("training manifest output size does not match output_ply")
+    if manifest["gaussianCount"] != output_splat_count:
+        raise EvidenceError("training manifest Gaussian count does not match output_ply")
+    if manifest["droppedIntersectionCount"] != 0:
+        raise EvidenceError("training manifest reports dropped raster intersections")
+    if (
+        manifest["rasterExactFallbackElapsedSeconds"] > manifest["elapsedSeconds"]
+        or manifest["rasterReplayElapsedSeconds"] > manifest["elapsedSeconds"]
+    ):
+        raise EvidenceError("training manifest raster elapsed time exceeds training time")
+    if manifest["elapsedSeconds"] > maximum_training_seconds + 1e-6:
+        raise EvidenceError("training manifest elapsed time exceeds its published timing run")
+    for name in ("trainerBuildDigest", "inputDigest", "geometryDigest"):
+        digest = manifest[name]
+        if not isinstance(digest, str) or not re.fullmatch(r"[0-9a-f]{64}", digest):
+            raise EvidenceError(f"training manifest {name} is not a SHA-256 digest")
+    for name in ("trainerVersion", "runtimeVersion"):
+        if not isinstance(manifest[name], str) or not manifest[name]:
+            raise EvidenceError(f"training manifest {name} is invalid")
+    bounds = _mapping(manifest["sceneBounds"], "training manifest sceneBounds")
+    _exact_keys(bounds, {"center", "radius"}, "training manifest sceneBounds")
+    center = _mapping(bounds["center"], "training manifest scene center")
+    _exact_keys(center, {"x", "y", "z"}, "training manifest scene center")
+    coordinates = [center[axis] for axis in ("x", "y", "z")]
+    if any(
+        isinstance(value, bool)
+        or not isinstance(value, (int, float))
+        or not math.isfinite(value)
+        for value in coordinates
+    ):
+        raise EvidenceError("training manifest scene center is invalid")
+    radius = bounds["radius"]
+    if (
+        isinstance(radius, bool)
+        or not isinstance(radius, (int, float))
+        or not math.isfinite(radius)
+        or radius <= 0
+    ):
+        raise EvidenceError("training manifest scene radius is invalid")
+    manifest_to_pipeline = {
+        "rasterFallbackCount": "raster_fallback_count",
+        "rasterExactFallbackElapsedSeconds": "raster_exact_fallback_elapsed_seconds",
+        "rasterExactBufferGrowthCount": "raster_exact_buffer_growth_count",
+        "rasterExactBufferBytesAdded": "raster_exact_buffer_bytes_added",
+        "rasterReplayElapsedSeconds": "raster_replay_elapsed_seconds",
+        "rasterPeakExactIntersectionCapacity": "raster_peak_exact_intersection_capacity",
+        "droppedIntersectionCount": "dropped_intersection_count",
+    }
+    for manifest_name, pipeline_name in manifest_to_pipeline.items():
+        if manifest[manifest_name] != pipeline_metrics.get(pipeline_name):
+            raise EvidenceError(
+                f"training manifest {manifest_name} does not match pipeline metrics"
+            )
+
+
 def _load_bounded_json(path: Path, label: str, maximum_bytes: int = 256 * 1024 * 1024) -> Any:
     if path.stat().st_size > maximum_bytes:
         raise EvidenceError(f"{label} exceeds its size limit")
@@ -4531,6 +4858,7 @@ def produce_attestation(
         "stdout_log": "stdout.log",
         "stderr_log": "stderr.log",
         "output_ply": "splat.ply",
+        "training_manifest": "training-manifest.json",
         "pair_list": "pair-list.json",
         "selection_manifest": "selection-manifest.json",
         "ground_truth_poses": "ground-truth-poses.json",
@@ -4570,7 +4898,7 @@ def produce_attestation(
         raise EvidenceError("in-memory observations do not match observations.json")
     required = {"command_log", "supervisor_run", "stdout_log", "stderr_log", "observations"}
     if request["expected_outcome"]["kind"] == "valid":
-        required.add("output_ply")
+        required.update({"output_ply", "training_manifest"})
     if lane == LANE_REFERENCE and "toolchain" in scopes:
         required.update(
             {
@@ -4677,6 +5005,17 @@ def produce_attestation(
     if "output_ply" in descriptors:
         output_ply = artifact_root / descriptors["output_ply"]["path"]
         output_splat_count = _validate_splat_ply(output_ply)
+        _validate_training_manifest(
+            artifact_root / descriptors["training_manifest"]["path"],
+            descriptors["output_ply"],
+            output_splat_count,
+            _mapping(observations.get("pipeline_metrics"), "observations.pipeline_metrics"),
+            request["candidate_run_configuration"],
+            _published_training_duration(
+                observations.get("commands"),
+                _mapping(observations.get("timing"), "observations.timing"),
+            ),
+        )
 
     actual = _validate_actual(
         observations.get("actual"),

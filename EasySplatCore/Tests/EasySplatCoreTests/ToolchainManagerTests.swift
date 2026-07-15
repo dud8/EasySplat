@@ -470,6 +470,7 @@ final class ToolchainManagerTests: XCTestCase {
             "exact_raster_patch_sha256",
             "numeric_stability_patch_sha256",
             "metal_safety_patch_sha256",
+            "overlay_sha256",
             "raster_test_sha256",
         ] {
             for mutation in ["missing", "malformed"] {
@@ -504,6 +505,44 @@ final class ToolchainManagerTests: XCTestCase {
         }
     }
 
+    func testValidateToolchainPinsNativeMsplatSourceArtifacts() throws {
+        for key in [
+            "exact_raster_patch_sha256",
+            "overlay_sha256",
+            "raster_test_sha256",
+        ] {
+            let root = try TestFileBuilder.makeTempDir()
+            defer { try? FileManager.default.removeItem(at: root) }
+            _ = try ToolchainFixtureBuilder.createToolchain(at: root)
+            let buildInfo = root.appendingPathComponent("msplat/build_info.json")
+            var payload = try XCTUnwrap(
+                try JSONSerialization.jsonObject(with: Data(contentsOf: buildInfo))
+                    as? [String: Any]
+            )
+            payload[key] = String(repeating: "0", count: 64)
+            try JSONSerialization.data(withJSONObject: payload).write(
+                to: buildInfo,
+                options: .atomic
+            )
+
+            let manager = ToolchainManager(runner: makeValidationRunner(root: root))
+            XCTAssertThrowsError(
+                try manager.test_validateToolchain(
+                    root: root,
+                    requiredCapabilities: [.da3Base, .da3Small]
+                )
+            ) { error in
+                guard case ToolchainManager.ToolchainError.invalidToolchain(let message) = error else {
+                    return XCTFail("Expected invalidToolchain error")
+                }
+                XCTAssertTrue(
+                    message.contains(key),
+                    "Expected pinned \(key) provenance failure, got \(message)"
+                )
+            }
+        }
+    }
+
     func testValidateToolchainRejectsMsplatPayloadHashMismatch() throws {
         let root = try TestFileBuilder.makeTempDir()
         defer { try? FileManager.default.removeItem(at: root) }
@@ -524,12 +563,13 @@ final class ToolchainManagerTests: XCTestCase {
     func testValidateToolchainRejectsMalformedMsplatSelfCheckEvents() throws {
         let invalidOutputs = [
             "not json\n",
-            "{\"event\":\"self_check\",\"schema_version\":1,\"sequence\":1,\"status\":\"ok\",\"version\":\"1.1.3 (git 106499b)\"}\n",
-            "{\"event\":\"self_check\",\"scene_bounds_status\":\"failed\",\"schema_version\":1,\"sequence\":1,\"status\":\"ok\",\"version\":\"1.1.3 (git 106499b)\"}\n",
-            "{\"event\":\"self_check\",\"schema_version\":1,\"sequence\":1,\"status\":\"ok\",\"version\":\"1.1.3 (git 106499b)\"}\n{\"event\":\"self_check\"}\n",
-            "{\"event\":\"self_check\",\"schema_version\":1,\"sequence\":2,\"status\":\"ok\",\"version\":\"1.1.3 (git 106499b)\"}\n",
-            "{\"event\":\"self_check\",\"schema_version\":1,\"sequence\":1,\"status\":\"ok\",\"version\":\"1.1.3\"}\n",
-            "{\"event\":\"self_check\",\"schema_version\":1,\"sequence\":1,\"status\":\"ok\",\"version\":\"9.9.9\"}\n",
+            "{\"event\":\"self_check\",\"schema_version\":2,\"sequence\":1,\"status\":\"ok\",\"version\":\"1.1.3 (git 106499b)\"}\n",
+            "{\"event\":\"self_check\",\"scene_bounds_status\":\"failed\",\"schema_version\":2,\"sequence\":1,\"status\":\"ok\",\"version\":\"1.1.3 (git 106499b)\"}\n",
+            "{\"event\":\"self_check\",\"scene_bounds_status\":\"ok\",\"schema_version\":1,\"sequence\":1,\"status\":\"ok\",\"version\":\"1.1.3 (git 106499b)\"}\n",
+            "{\"event\":\"self_check\",\"schema_version\":2,\"sequence\":1,\"status\":\"ok\",\"version\":\"1.1.3 (git 106499b)\"}\n{\"event\":\"self_check\"}\n",
+            "{\"event\":\"self_check\",\"schema_version\":2,\"sequence\":2,\"status\":\"ok\",\"version\":\"1.1.3 (git 106499b)\"}\n",
+            "{\"event\":\"self_check\",\"schema_version\":2,\"sequence\":1,\"status\":\"ok\",\"version\":\"1.1.3\"}\n",
+            "{\"event\":\"self_check\",\"schema_version\":2,\"sequence\":1,\"status\":\"ok\",\"version\":\"9.9.9\"}\n",
         ]
         for output in invalidOutputs {
             let root = try TestFileBuilder.makeTempDir()
@@ -1031,7 +1071,7 @@ final class ToolchainManagerTests: XCTestCase {
         vocabularyTerminationReason: Process.TerminationReason = .exit,
         da3HelpExitCode: Int32 = 0,
         msplatSelfCheckExitCode: Int32 = 0,
-        msplatSelfCheckStdout: String = "{\"event\":\"self_check\",\"scene_bounds_status\":\"ok\",\"schema_version\":1,\"sequence\":1,\"status\":\"ok\",\"version\":\"1.1.3 (git 106499b)\"}\n"
+        msplatSelfCheckStdout: String = "{\"event\":\"self_check\",\"scene_bounds_status\":\"ok\",\"schema_version\":2,\"sequence\":1,\"status\":\"ok\",\"version\":\"1.1.3 (git 106499b)\"}\n"
     ) -> MockSubprocessRunner {
         MockSubprocessRunner(scripts: [
             .init(path: "/usr/bin/file", argsPrefix: ["-b", root.appendingPathComponent("bin/colmap").path], result: .init(exitCode: 0, terminationReason: .exit, stdout: colmapArch, stderr: ""), onRun: nil),

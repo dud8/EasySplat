@@ -11,6 +11,11 @@ public struct MsplatCheckpointReceipt: Sendable, Equatable {
     public let peakMemoryBytes: Int64
     public let memoryBudgetBytes: Int64
     public let rasterFallbackCount: Int
+    public let rasterExactFallbackElapsedSeconds: Double
+    public let rasterExactBufferGrowthCount: Int
+    public let rasterExactBufferBytesAdded: Int64
+    public let rasterReplayElapsedSeconds: Double
+    public let rasterPeakExactIntersectionCapacity: Int64
     public let droppedIntersectionCount: Int
     public let inputDigest: String
     public let geometryDigest: String
@@ -25,6 +30,11 @@ public struct MsplatCheckpointReceipt: Sendable, Equatable {
         peakMemoryBytes: Int64,
         memoryBudgetBytes: Int64,
         rasterFallbackCount: Int,
+        rasterExactFallbackElapsedSeconds: Double,
+        rasterExactBufferGrowthCount: Int,
+        rasterExactBufferBytesAdded: Int64,
+        rasterReplayElapsedSeconds: Double,
+        rasterPeakExactIntersectionCapacity: Int64,
         droppedIntersectionCount: Int,
         inputDigest: String,
         geometryDigest: String,
@@ -38,6 +48,11 @@ public struct MsplatCheckpointReceipt: Sendable, Equatable {
         self.peakMemoryBytes = peakMemoryBytes
         self.memoryBudgetBytes = memoryBudgetBytes
         self.rasterFallbackCount = rasterFallbackCount
+        self.rasterExactFallbackElapsedSeconds = rasterExactFallbackElapsedSeconds
+        self.rasterExactBufferGrowthCount = rasterExactBufferGrowthCount
+        self.rasterExactBufferBytesAdded = rasterExactBufferBytesAdded
+        self.rasterReplayElapsedSeconds = rasterReplayElapsedSeconds
+        self.rasterPeakExactIntersectionCapacity = rasterPeakExactIntersectionCapacity
         self.droppedIntersectionCount = droppedIntersectionCount
         self.inputDigest = inputDigest
         self.geometryDigest = geometryDigest
@@ -77,7 +92,10 @@ enum MsplatCheckpointValidator {
         "iteration", "iteration_limit", "last_improvement_iteration", "latest_loss",
         "latest_loss_iteration", "memory_budget_bytes", "payload_bytes", "payload_file", "payload_schema",
         "payload_sha256", "plateau_window", "profile", "schema_version", "seed",
-        "raster_fallback_count", "trainer_build_digest", "trainer_version",
+        "raster_exact_buffer_bytes_added", "raster_exact_buffer_growth_count",
+        "raster_exact_fallback_elapsed_seconds", "raster_fallback_count",
+        "raster_peak_exact_intersection_capacity", "raster_replay_elapsed_seconds",
+        "trainer_build_digest", "trainer_version",
     ]
 
     static func validate(
@@ -102,6 +120,15 @@ enum MsplatCheckpointValidator {
               isValidRasterFallbackCount(
                   receipt.rasterFallbackCount,
                   through: receipt.iteration
+              ),
+              recoveryMetricsAreValid(
+                  fallbackCount: receipt.rasterFallbackCount,
+                  exactFallbackElapsedSeconds: receipt.rasterExactFallbackElapsedSeconds,
+                  exactBufferGrowthCount: receipt.rasterExactBufferGrowthCount,
+                  exactBufferBytesAdded: receipt.rasterExactBufferBytesAdded,
+                  replayElapsedSeconds: receipt.rasterReplayElapsedSeconds,
+                  peakExactIntersectionCapacity: receipt.rasterPeakExactIntersectionCapacity,
+                  memoryBudgetBytes: receipt.memoryBudgetBytes
               ),
               receipt.droppedIntersectionCount == 0 else {
             throw MsplatCheckpointValidationError("checkpoint receipt is invalid")
@@ -134,12 +161,12 @@ enum MsplatCheckpointValidator {
         let manifestData = try boundedData(from: manifestURL, maximumBytes: maximumManifestBytes)
         guard let object = try JSONSerialization.jsonObject(with: manifestData) as? [String: Any],
               Set(object.keys) == manifestKeys else {
-            throw MsplatCheckpointValidationError("checkpoint manifest keys do not match schema 2")
+            throw MsplatCheckpointValidationError("checkpoint manifest keys do not match schema 3")
         }
         let decoder = JSONDecoder()
         let manifest = try decoder.decode(Manifest.self, from: manifestData)
 
-        guard manifest.schemaVersion == 2,
+        guard manifest.schemaVersion == 3,
               manifest.payloadSchema == 2,
               manifest.trainerVersion == expectation.trainerVersion,
               manifest.trainerBuildDigest == expectation.trainerBuildDigest,
@@ -157,6 +184,22 @@ enum MsplatCheckpointValidator {
               manifest.iteration == receipt.iteration,
               manifest.gaussianCount == receipt.gaussianCount,
               manifest.rasterFallbackCount == receipt.rasterFallbackCount,
+              manifest.rasterExactFallbackElapsedSeconds
+                  == receipt.rasterExactFallbackElapsedSeconds,
+              manifest.rasterExactBufferGrowthCount == receipt.rasterExactBufferGrowthCount,
+              manifest.rasterExactBufferBytesAdded == receipt.rasterExactBufferBytesAdded,
+              manifest.rasterReplayElapsedSeconds == receipt.rasterReplayElapsedSeconds,
+              manifest.rasterPeakExactIntersectionCapacity
+                  == receipt.rasterPeakExactIntersectionCapacity,
+              recoveryMetricsAreValid(
+                  fallbackCount: manifest.rasterFallbackCount,
+                  exactFallbackElapsedSeconds: manifest.rasterExactFallbackElapsedSeconds,
+                  exactBufferGrowthCount: manifest.rasterExactBufferGrowthCount,
+                  exactBufferBytesAdded: manifest.rasterExactBufferBytesAdded,
+                  replayElapsedSeconds: manifest.rasterReplayElapsedSeconds,
+                  peakExactIntersectionCapacity: manifest.rasterPeakExactIntersectionCapacity,
+                  memoryBudgetBytes: manifest.memoryBudgetBytes
+              ),
               isValidRasterFallbackCount(
                   manifest.rasterFallbackCount,
                   through: manifest.iteration
@@ -174,6 +217,8 @@ enum MsplatCheckpointValidator {
               manifest.latestLossIteration <= manifest.iteration,
               manifest.elapsedSeconds.isFinite,
               manifest.elapsedSeconds >= 0,
+              manifest.rasterExactFallbackElapsedSeconds <= manifest.elapsedSeconds,
+              manifest.rasterReplayElapsedSeconds <= manifest.elapsedSeconds,
               manifest.bestCameraLosses.count == expectation.cameraCount,
               manifest.bestCameraLosses.allSatisfy({ $0.map { $0.isFinite && $0 >= 0 } ?? true }),
               (manifest.latestLoss.map { $0.isFinite && $0 >= 0 }
@@ -211,7 +256,7 @@ enum MsplatCheckpointValidator {
             guard artifact.schemaVersion == TrainingArtifact.currentSchemaVersion,
                   artifact.completionStatus == .checkpointed,
                   artifact.trainerVersion == "1.1.3 (git 106499b)",
-                  artifact.runtimeVersion == "native-metal-cli-v1",
+                  artifact.runtimeVersion == "native-metal-cli-v2",
                   artifact.checkpointPath == "Training/checkpoints/msplat",
                   artifact.outputPath == nil,
                   isSHA256(artifact.trainerBuildDigest),
@@ -227,6 +272,15 @@ enum MsplatCheckpointValidator {
                   isValidRasterFallbackCount(
                       artifact.rasterFallbackCount,
                       through: artifact.completedIteration
+                  ),
+                  recoveryMetricsAreValid(
+                      fallbackCount: artifact.rasterFallbackCount,
+                      exactFallbackElapsedSeconds: artifact.rasterExactFallbackElapsedSeconds,
+                      exactBufferGrowthCount: artifact.rasterExactBufferGrowthCount,
+                      exactBufferBytesAdded: artifact.rasterExactBufferBytesAdded,
+                      replayElapsedSeconds: artifact.rasterReplayElapsedSeconds,
+                      peakExactIntersectionCapacity: artifact.rasterPeakExactIntersectionCapacity,
+                      memoryBudgetBytes: artifact.memoryBudgetBytes
                   ),
                   artifact.droppedIntersectionCount == 0,
                   artifact.sceneBounds == nil else {
@@ -258,7 +312,7 @@ enum MsplatCheckpointValidator {
             let manifestData = try boundedData(from: manifestURL, maximumBytes: maximumManifestBytes)
             guard let object = try JSONSerialization.jsonObject(with: manifestData) as? [String: Any],
                   Set(object.keys) == manifestKeys else {
-                throw MsplatCheckpointValidationError("checkpoint manifest keys do not match schema 2")
+                throw MsplatCheckpointValidationError("checkpoint manifest keys do not match schema 3")
             }
             let manifest = try JSONDecoder().decode(Manifest.self, from: manifestData)
             let receipt = MsplatCheckpointReceipt(
@@ -270,6 +324,13 @@ enum MsplatCheckpointValidator {
                 peakMemoryBytes: peakMemoryBytes,
                 memoryBudgetBytes: manifest.memoryBudgetBytes,
                 rasterFallbackCount: manifest.rasterFallbackCount,
+                rasterExactFallbackElapsedSeconds:
+                    manifest.rasterExactFallbackElapsedSeconds,
+                rasterExactBufferGrowthCount: manifest.rasterExactBufferGrowthCount,
+                rasterExactBufferBytesAdded: manifest.rasterExactBufferBytesAdded,
+                rasterReplayElapsedSeconds: manifest.rasterReplayElapsedSeconds,
+                rasterPeakExactIntersectionCapacity:
+                    manifest.rasterPeakExactIntersectionCapacity,
                 droppedIntersectionCount: 0,
                 inputDigest: manifest.inputDigest,
                 geometryDigest: manifest.geometryDigest,
@@ -299,8 +360,29 @@ enum MsplatCheckpointValidator {
             )
             guard receipt.iteration >= artifact.completedIteration,
                   receipt.rasterFallbackCount >= artifact.rasterFallbackCount,
+                  receipt.rasterExactFallbackElapsedSeconds
+                      >= artifact.rasterExactFallbackElapsedSeconds,
+                  receipt.rasterExactBufferGrowthCount
+                      >= artifact.rasterExactBufferGrowthCount,
+                  receipt.rasterExactBufferBytesAdded >= artifact.rasterExactBufferBytesAdded,
+                  receipt.rasterReplayElapsedSeconds >= artifact.rasterReplayElapsedSeconds,
+                  receipt.rasterPeakExactIntersectionCapacity
+                      >= artifact.rasterPeakExactIntersectionCapacity,
                   receipt.iteration != artifact.completedIteration
-                    || receipt.payloadSHA256 == recordedPayloadDigest else {
+                    || (
+                        receipt.payloadSHA256 == recordedPayloadDigest
+                            && receipt.rasterFallbackCount == artifact.rasterFallbackCount
+                            && receipt.rasterExactFallbackElapsedSeconds
+                                == artifact.rasterExactFallbackElapsedSeconds
+                            && receipt.rasterExactBufferGrowthCount
+                                == artifact.rasterExactBufferGrowthCount
+                            && receipt.rasterExactBufferBytesAdded
+                                == artifact.rasterExactBufferBytesAdded
+                            && receipt.rasterReplayElapsedSeconds
+                                == artifact.rasterReplayElapsedSeconds
+                            && receipt.rasterPeakExactIntersectionCapacity
+                                == artifact.rasterPeakExactIntersectionCapacity
+                    ) else {
                 throw MsplatCheckpointValidationError("checkpoint is older than its training manifest")
             }
             return receipt
@@ -371,6 +453,42 @@ enum MsplatCheckpointValidator {
         count >= 0 && count <= min(iteration, Int(UInt32.max))
     }
 
+    private static func recoveryMetricsAreValid(
+        fallbackCount: Int,
+        exactFallbackElapsedSeconds: Double,
+        exactBufferGrowthCount: Int,
+        exactBufferBytesAdded: Int64,
+        replayElapsedSeconds: Double,
+        peakExactIntersectionCapacity: Int64,
+        memoryBudgetBytes: Int64
+    ) -> Bool {
+        exactFallbackElapsedSeconds.isFinite
+            && exactFallbackElapsedSeconds >= 0
+            && exactBufferGrowthCount >= 0
+            && exactBufferGrowthCount <= fallbackCount
+            && exactBufferBytesAdded >= 0
+            && replayElapsedSeconds.isFinite
+            && replayElapsedSeconds >= 0
+            && peakExactIntersectionCapacity >= 0
+            && peakExactIntersectionCapacity <= Int64(UInt32.max)
+            && memoryBudgetBytes > 0
+            && (exactBufferBytesAdded == 0
+                || 1 + ((exactBufferBytesAdded - 1) / memoryBudgetBytes)
+                    <= Int64(exactBufferGrowthCount))
+            && ((fallbackCount == 0
+                && exactFallbackElapsedSeconds == 0
+                && exactBufferGrowthCount == 0
+                && exactBufferBytesAdded == 0
+                && replayElapsedSeconds == 0
+                && peakExactIntersectionCapacity == 0)
+              || (fallbackCount > 0
+                && exactFallbackElapsedSeconds > 0
+                && exactBufferGrowthCount > 0
+                && exactBufferBytesAdded > 0
+                && replayElapsedSeconds > 0
+                && peakExactIntersectionCapacity > 2_048))
+    }
+
     private static func isGeneration(_ value: String) -> Bool {
         guard value.count == 73 else { return false }
         let bytes = Array(value.utf8)
@@ -401,7 +519,12 @@ enum MsplatCheckpointValidator {
         let payloadSHA256: String
         let plateauWindow: Int
         let profile: String
+        let rasterExactBufferBytesAdded: Int64
+        let rasterExactBufferGrowthCount: Int
+        let rasterExactFallbackElapsedSeconds: Double
         let rasterFallbackCount: Int
+        let rasterPeakExactIntersectionCapacity: Int64
+        let rasterReplayElapsedSeconds: Double
         let schemaVersion: Int
         let seed: UInt64
         let trainerBuildDigest: String
@@ -429,7 +552,12 @@ enum MsplatCheckpointValidator {
             case payloadSHA256 = "payload_sha256"
             case plateauWindow = "plateau_window"
             case profile
+            case rasterExactBufferBytesAdded = "raster_exact_buffer_bytes_added"
+            case rasterExactBufferGrowthCount = "raster_exact_buffer_growth_count"
+            case rasterExactFallbackElapsedSeconds = "raster_exact_fallback_elapsed_seconds"
             case rasterFallbackCount = "raster_fallback_count"
+            case rasterPeakExactIntersectionCapacity = "raster_peak_exact_intersection_capacity"
+            case rasterReplayElapsedSeconds = "raster_replay_elapsed_seconds"
             case schemaVersion = "schema_version"
             case seed
             case trainerBuildDigest = "trainer_build_digest"

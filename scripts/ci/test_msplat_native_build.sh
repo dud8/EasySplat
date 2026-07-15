@@ -92,7 +92,7 @@ require_contains 'git -C "$SOURCE_DIR" apply --unidiff-zero "$METAL_SAFETY_PATCH
 require_contains 'metal_safety_patch_sha256' "$BUILD_SCRIPT"
 require_contains '"metal_safety_patch_sha256": "5d3dfff3edcbca940d37f6ee3145c76c678ebd36ebc03016cfd5dab78e1d45ac"' "$VALIDATOR"
 require_contains 'msplat-1.1.3-exact-raster.patch' "$BUILD_SCRIPT"
-require_contains 'EXACT_RASTER_PATCH_SHA256="23c6a6a6c89dabe0827de9f13d2b026a0c416d912edc73468864b23bc376b27e"' "$BUILD_SCRIPT"
+require_contains 'EXACT_RASTER_PATCH_SHA256="dd1f1a802cabaaceeab8825535e374f21ad723c680d4e70bcfc7d3d4e865962d"' "$BUILD_SCRIPT"
 require_contains '[ "$(sha256 "$EXACT_RASTER_PATCH")" = "$EXACT_RASTER_PATCH_SHA256" ]' "$BUILD_SCRIPT"
 require_contains 'git -C "$SOURCE_DIR" apply --check "$EXACT_RASTER_PATCH"' "$BUILD_SCRIPT"
 require_contains 'git -C "$SOURCE_DIR" apply "$EXACT_RASTER_PATCH"' "$BUILD_SCRIPT"
@@ -220,6 +220,11 @@ require_contains '"raster_fallback"' "$OVERLAY"
 require_contains '"raster_memory_budget_exceeded"' "$OVERLAY"
 require_contains '"raster_resource_limit_exceeded"' "$OVERLAY"
 require_contains '"raster_fallback_count"' "$OVERLAY"
+require_contains '"raster_exact_fallback_elapsed_seconds"' "$OVERLAY"
+require_contains '"raster_exact_buffer_growth_count"' "$OVERLAY"
+require_contains '"raster_exact_buffer_bytes_added"' "$OVERLAY"
+require_contains '"raster_replay_elapsed_seconds"' "$OVERLAY"
+require_contains '"raster_peak_exact_intersection_capacity"' "$OVERLAY"
 require_contains '"dropped_intersection_count"' "$OVERLAY"
 require_contains 'msplat_preflight_raster_memory' "$OVERLAY"
 require_contains 'msplat_raster_memory_budget_was_exceeded' "$OVERLAY"
@@ -227,7 +232,9 @@ require_contains 'msplat_raster_resource_limit_was_exceeded' "$OVERLAY"
 require_contains 'msplat_gpu_sync_for_raster_replay' "$OVERLAY"
 require_contains 'msplat_grow_exact_raster_capacity' "$OVERLAY"
 require_contains '{"payload_schema", 2}' "$OVERLAY"
-require_contains '{"schema_version", 2}' "$OVERLAY"
+require_contains 'fields["schema_version"] = 2' "$OVERLAY"
+require_contains 'Descriptor for schema-v2 JSONL events' "$OVERLAY"
+require_contains 'checkpoint manifest keys do not match schema 3' "$OVERLAY"
 
 require_contains 'radix_sort_histogram_kernel_cpso' "$EXACT_RASTER_PATCH"
 require_contains 'radix_sort_scan_kernel_cpso' "$EXACT_RASTER_PATCH"
@@ -256,6 +263,19 @@ require_contains 'bool msplat_raster_memory_budget_was_exceeded()' "$EXACT_RASTE
 require_contains 'bool msplat_raster_resource_limit_was_exceeded()' "$EXACT_RASTER_PATCH"
 require_contains 'void msplat_gpu_sync_for_raster_replay()' "$EXACT_RASTER_PATCH"
 require_contains 'void msplat_grow_exact_raster_capacity(uint64_t intersection_count)' "$EXACT_RASTER_PATCH"
+require_contains 'void msplat_restore_raster_metrics(' "$EXACT_RASTER_PATCH"
+require_contains 'exact_fallback_elapsed_seconds' "$EXACT_RASTER_PATCH"
+require_contains 'sync_and_drain_exact_raster_timing' "$EXACT_RASTER_PATCH"
+require_contains 'std::exception_ptr syncFailure' "$EXACT_RASTER_PATCH"
+require_contains 'completedCommandBuffer.GPUStartTime' "$EXACT_RASTER_PATCH"
+require_contains 'completedCommandBuffer.GPUEndTime' "$EXACT_RASTER_PATCH"
+require_absent 'addScheduledHandler' "$EXACT_RASTER_PATCH"
+require_contains 'msplat_pending_exact_raster_timing_handlers_for_testing() == 0' "$EXACT_RASTER_PATCH"
+require_contains '(fallback_count != 0 &&' "$EXACT_RASTER_PATCH"
+require_contains 'exact_fallback_elapsed_seconds <= 0' "$EXACT_RASTER_PATCH"
+require_contains 'exact_buffer_growth_count' "$EXACT_RASTER_PATCH"
+require_contains 'exact_buffer_bytes_added' "$EXACT_RASTER_PATCH"
+require_contains 'peak_exact_intersection_capacity' "$EXACT_RASTER_PATCH"
 require_contains 'void msplat_clear_raster_capacity_failure()' "$EXACT_RASTER_PATCH"
 require_contains 'kRasterStatFirstOverflowIteration' "$EXACT_RASTER_PATCH"
 require_contains 'MSPLAT_ENABLE_RASTER_TEST_HOOKS' "$EXACT_RASTER_PATCH"
@@ -277,6 +297,13 @@ require_contains 'msplat_set_exact_fallback_enabled_for_testing' "$RASTER_TEST_S
 require_contains 'deterministic_window_replay passed' "$RASTER_TEST_SOURCE"
 require_contains 'increasing_window_replay passed' "$RASTER_TEST_SOURCE"
 require_contains 'gpu_capacity_failure passed' "$RASTER_TEST_SOURCE"
+require_contains 'verifyRepeatedExactFallbackMetrics' "$RASTER_TEST_SOURCE"
+require_contains 'repeated_exact_fallback_metrics passed' "$RASTER_TEST_SOURCE"
+require_contains 'queued_exact_timing passed' "$RASTER_TEST_SOURCE"
+require_contains 'sync_failure_timing_lifecycle passed' "$RASTER_TEST_SOURCE"
+require_contains 'msplat_fail_next_sync_for_testing' "$RASTER_TEST_SOURCE"
+require_contains 'msplat_pending_exact_raster_timing_handlers_for_testing' "$RASTER_TEST_SOURCE"
+require_contains 'invalidHistory' "$RASTER_TEST_SOURCE"
 
 if [ "${1:-}" = "--source-only" ]; then
   echo "native msplat source contracts passed"
@@ -305,6 +332,8 @@ for symbol in \
   msplat_set_exact_execution_capacity_for_testing \
   msplat_set_exact_capacity_limit_for_testing \
   msplat_set_raster_memory_budget_for_testing \
+  msplat_fail_next_sync_for_testing \
+  msplat_pending_exact_raster_timing_handlers_for_testing \
   msplat_copy_last_raster_debug; do
   if nm -gU "$BIN" | grep -Fq "$symbol"; then
     fail "production CLI exports raster test hook: $symbol"
@@ -332,7 +361,7 @@ self_check_stderr="$self_check_stdout.stderr"
 trap 'rm -f "$self_check_stdout" "$self_check_stderr"; rm -rf "${negative_dir:-}"' EXIT
 "$BIN" --self-check --events-fd 1 >"$self_check_stdout" 2>"$self_check_stderr"
 [ "$(wc -l <"$self_check_stdout" | tr -d ' ')" = "1" ] || fail "self-check stdout is not exactly one JSONL record"
-require_contains '"schema_version":1' "$self_check_stdout"
+require_contains '"schema_version":2' "$self_check_stdout"
 require_contains '"sequence":1' "$self_check_stdout"
 require_contains '"event":"self_check"' "$self_check_stdout"
 require_contains '"status":"ok"' "$self_check_stdout"
@@ -556,7 +585,7 @@ records = [
 if len(records) < 3:
     raise SystemExit("training emitted fewer than three events")
 for index, record in enumerate(records, start=1):
-    if record.get("schema_version") != 1 or record.get("sequence") != index:
+    if record.get("schema_version") != 2 or record.get("sequence") != index:
         raise SystemExit(f"invalid event envelope at sequence {index}")
     for value in record.values():
         if isinstance(value, float) and not math.isfinite(value):
@@ -571,14 +600,19 @@ if started.get("event") != "started" or completed.get("event") != "completed":
 if started.get("initial_gaussian_count") != expected_points:
     raise SystemExit("started event has the wrong sparse-point count")
 expected_contract = {
-    "checkpoint_schema": 2,
+    "checkpoint_schema": 3,
     "dropped_intersection_count": 0,
     "iteration_limit": 3000,
     "memory_budget_bytes": expected_memory_budget,
     "payload_schema": 2,
     "plateau_window": 400,
     "profile": "fast",
+    "raster_exact_buffer_bytes_added": 0,
+    "raster_exact_buffer_growth_count": 0,
+    "raster_exact_fallback_elapsed_seconds": 0,
     "raster_fallback_count": 0,
+    "raster_peak_exact_intersection_capacity": 0,
+    "raster_replay_elapsed_seconds": 0,
     "seed": 42,
 }
 for key, expected in expected_contract.items():
@@ -598,11 +632,43 @@ for key, expected in completed_contract.items():
 fallback_count = completed.get("raster_fallback_count")
 if isinstance(fallback_count, bool) or not isinstance(fallback_count, int) or fallback_count < 0:
     raise SystemExit("completed event has invalid raster fallback evidence")
+recovery_integer_fields = (
+    "raster_exact_buffer_bytes_added",
+    "raster_exact_buffer_growth_count",
+    "raster_peak_exact_intersection_capacity",
+)
+recovery_elapsed_fields = (
+    "raster_exact_fallback_elapsed_seconds",
+    "raster_replay_elapsed_seconds",
+)
+for key in recovery_integer_fields:
+    value = completed.get(key)
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise SystemExit(f"completed event has invalid {key}")
+for key in recovery_elapsed_fields:
+    value = completed.get(key)
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or value < 0:
+        raise SystemExit(f"completed event has invalid {key}")
+if completed["raster_exact_buffer_growth_count"] > fallback_count:
+    raise SystemExit("completed event reports more exact allocations than dispatches")
+if fallback_count == 0 and any(completed[key] != 0 for key in recovery_integer_fields + recovery_elapsed_fields):
+    raise SystemExit("completed event reports raster recovery work without a fallback")
 for record in records:
     if record.get("event") != "checkpoint_completed":
         continue
-    for key in ("memory_budget_bytes", "raster_fallback_count", "dropped_intersection_count"):
+    for key in (
+        "memory_budget_bytes",
+        "raster_exact_buffer_bytes_added",
+        "raster_exact_buffer_growth_count",
+        "raster_fallback_count",
+        "raster_peak_exact_intersection_capacity",
+        "dropped_intersection_count",
+    ):
         if isinstance(record.get(key), bool) or not isinstance(record.get(key), int):
+            raise SystemExit(f"checkpoint event has invalid {key}")
+    for key in recovery_elapsed_fields:
+        value = record.get(key)
+        if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
             raise SystemExit(f"checkpoint event has invalid {key}")
     if record["memory_budget_bytes"] != expected_memory_budget or record["dropped_intersection_count"] != 0:
         raise SystemExit("checkpoint event lost the raster run contract")
@@ -907,8 +973,8 @@ started = records[0]
 completed = records[-1]
 if started.get("event") != "started" or completed.get("event") != "completed":
     raise SystemExit("overflow run has invalid event boundaries")
-if started.get("checkpoint_schema") != 2 or started.get("payload_schema") != 2:
-    raise SystemExit("overflow run did not advertise checkpoint schema 2")
+if started.get("checkpoint_schema") != 3 or started.get("payload_schema") != 2:
+    raise SystemExit("overflow run did not advertise checkpoint schema 3")
 if started.get("memory_budget_bytes") != 100663296:
     raise SystemExit("overflow run lost its explicit memory budget")
 fallbacks = [record for record in records if record.get("event") == "raster_fallback"]
@@ -923,6 +989,39 @@ if any(record.get("intersection_count", 0) <= 2048 for record in fallbacks):
     raise SystemExit("overflow evidence did not exceed the tile-local limit")
 if completed.get("raster_fallback_count", 0) < counts[-1]:
     raise SystemExit("completion lost raster fallback evidence")
+recovery_integer_fields = (
+    "raster_exact_buffer_bytes_added",
+    "raster_exact_buffer_growth_count",
+    "raster_peak_exact_intersection_capacity",
+)
+recovery_elapsed_fields = (
+    "raster_exact_fallback_elapsed_seconds",
+    "raster_replay_elapsed_seconds",
+)
+for record in fallbacks + [completed]:
+    for key in recovery_integer_fields:
+        value = record.get(key)
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            raise SystemExit(f"overflow evidence has invalid {key}")
+    for key in recovery_elapsed_fields:
+        value = record.get(key)
+        if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or value < 0:
+            raise SystemExit(f"overflow evidence has invalid {key}")
+if completed["raster_exact_buffer_growth_count"] <= 0:
+    raise SystemExit("overflow completion lost exact buffer growth evidence")
+if completed["raster_exact_buffer_growth_count"] > completed["raster_fallback_count"]:
+    raise SystemExit("overflow completion reports more allocations than exact dispatches")
+if completed["raster_exact_buffer_bytes_added"] <= 0:
+    raise SystemExit("overflow completion lost exact allocation byte evidence")
+if completed["raster_peak_exact_intersection_capacity"] <= 2048:
+    raise SystemExit("overflow completion lost peak exact capacity evidence")
+if completed["raster_exact_fallback_elapsed_seconds"] <= 0:
+    raise SystemExit("overflow completion lost exact fallback timing evidence")
+if completed["raster_replay_elapsed_seconds"] <= 0:
+    raise SystemExit("overflow completion lost raster replay timing evidence")
+for key in recovery_elapsed_fields:
+    if completed[key] > completed.get("elapsed_seconds", -1):
+        raise SystemExit(f"overflow completion {key} exceeds cumulative elapsed time")
 if completed.get("dropped_intersection_count") != 0:
     raise SystemExit("overflow run dropped raster intersections")
 if completed.get("memory_budget_bytes") != 100663296:
@@ -945,7 +1044,7 @@ manifest = json.loads(
     (root / "checkpoint" / "generations" / current / "manifest.json").read_text()
 )
 expected_manifest = {
-    "schema_version": 2,
+    "schema_version": 3,
     "payload_schema": 2,
     "memory_budget_bytes": 100663296,
     "dropped_intersection_count": 0,
@@ -955,6 +1054,9 @@ for key, expected in expected_manifest.items():
         raise SystemExit(f"overflow checkpoint mismatch for {key}")
 if manifest.get("raster_fallback_count", 0) <= 0:
     raise SystemExit("overflow checkpoint lost fallback count")
+for key in recovery_integer_fields + recovery_elapsed_fields:
+    if manifest.get(key) != completed.get(key):
+        raise SystemExit(f"overflow checkpoint lost durable {key}")
 PY
 [ -s "$overflow_dir/splat.ply" ] || fail "exact fallback did not publish a PLY"
 "$BIN" --validate-ply "$overflow_dir/splat.ply" --events-fd 1 \
@@ -1157,8 +1259,16 @@ if digest != manifest.get("payload_sha256") or digest != latest.get("checkpoint_
     raise SystemExit("cancelled checkpoint payload digest mismatch")
 if manifest.get("iteration") != cancelled.get("checkpoint_iteration"):
     raise SystemExit("cancelled checkpoint iteration mismatch")
-if cancelled.get("raster_fallback_count") != manifest.get("raster_fallback_count"):
-    raise SystemExit("cancelled event did not report its durable fallback count")
+for key in (
+    "raster_fallback_count",
+    "raster_exact_fallback_elapsed_seconds",
+    "raster_exact_buffer_growth_count",
+    "raster_exact_buffer_bytes_added",
+    "raster_replay_elapsed_seconds",
+    "raster_peak_exact_intersection_capacity",
+):
+    if cancelled.get(key) != manifest.get(key) or cancelled.get(key) != latest.get(key):
+        raise SystemExit(f"cancelled event did not report its durable {key}")
 if cancelled.get("dropped_intersection_count") != 0:
     raise SystemExit("cancelled event reported dropped intersections")
 PY

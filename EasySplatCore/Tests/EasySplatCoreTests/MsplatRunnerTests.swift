@@ -126,7 +126,7 @@ final class MsplatRunnerTests: XCTestCase {
                 result: .init(
                     exitCode: 0,
                     terminationReason: .exit,
-                    stdout: validEvents(rasterFallbackCount: 1),
+                    stdout: validEvents(rasterFallbackCount: 1, includeRasterReplay: true),
                     stderr: ""
                 ),
                 onRun: { arguments in
@@ -153,6 +153,11 @@ final class MsplatRunnerTests: XCTestCase {
 
         XCTAssertEqual(result.memoryBudgetBytes, testMemoryBudgetBytes)
         XCTAssertEqual(result.rasterFallbackCount, 1)
+        XCTAssertEqual(result.rasterExactFallbackElapsedSeconds, 0.25)
+        XCTAssertEqual(result.rasterExactBufferGrowthCount, 1)
+        XCTAssertEqual(result.rasterExactBufferBytesAdded, 65_536)
+        XCTAssertEqual(result.rasterReplayElapsedSeconds, 0.5)
+        XCTAssertEqual(result.rasterPeakExactIntersectionCapacity, 4_096)
         XCTAssertEqual(result.droppedIntersectionCount, 0)
         XCTAssertEqual(
             fallbacks.value,
@@ -213,8 +218,8 @@ final class MsplatRunnerTests: XCTestCase {
         )
         try prior.write(to: context.output)
         let stdout = """
-        {"camera_count":8,"checkpoint_schema":2,"event":"started","geometry_digest":"\(testGeometryDigest)","initial_gaussian_count":750,"input_digest":"\(testInputDigest)","iteration":0,"iteration_limit":7000,"memory_budget_bytes":\(testMemoryBudgetBytes),"payload_schema":2,"plateau_window":800,"profile":"balanced","resumed":false,"schema_version":1,"seed":42,"sequence":1,"trainer_build_digest":"\(testTrainerDigest)","version":"1.1.3 (git 106499b)"}
-        {"budget_bytes":\(testMemoryBudgetBytes),"event":"raster_memory_budget_exceeded","iteration":12,"required_bytes":\(testMemoryBudgetBytes + 1),"schema_version":1,"sequence":2}
+        {"camera_count":8,"checkpoint_schema":3,"event":"started","geometry_digest":"\(testGeometryDigest)","initial_gaussian_count":750,"input_digest":"\(testInputDigest)","iteration":0,"iteration_limit":7000,"memory_budget_bytes":\(testMemoryBudgetBytes),"payload_schema":2,"plateau_window":800,"profile":"balanced","raster_exact_buffer_bytes_added":0,"raster_exact_buffer_growth_count":0,"raster_exact_fallback_elapsed_seconds":0,"raster_fallback_count":0,"raster_peak_exact_intersection_capacity":0,"raster_replay_elapsed_seconds":0,"resumed":false,"schema_version":2,"seed":42,"sequence":1,"trainer_build_digest":"\(testTrainerDigest)","version":"1.1.3 (git 106499b)"}
+        {"budget_bytes":\(testMemoryBudgetBytes),"event":"raster_memory_budget_exceeded","iteration":12,"required_bytes":\(testMemoryBudgetBytes + 1),"schema_version":2,"sequence":2}
         """ + "\n"
         let mock = MockSubprocessRunner(scripts: [
             .init(
@@ -249,7 +254,7 @@ final class MsplatRunnerTests: XCTestCase {
         let context = try makeContext()
         defer { context.cleanup() }
         let stdout = """
-        {"budget_bytes":\(testMemoryBudgetBytes),"event":"raster_memory_budget_exceeded","iteration":0,"required_bytes":\(testMemoryBudgetBytes + 1),"schema_version":1,"sequence":1}
+        {"budget_bytes":\(testMemoryBudgetBytes),"event":"raster_memory_budget_exceeded","iteration":0,"required_bytes":\(testMemoryBudgetBytes + 1),"schema_version":2,"sequence":1}
         """ + "\n"
         let mock = MockSubprocessRunner(scripts: [
             .init(
@@ -293,8 +298,8 @@ final class MsplatRunnerTests: XCTestCase {
         let requiredBytes = maximumBufferBytes + 4_096
         XCTAssertLessThan(requiredBytes, testMemoryBudgetBytes)
         let stdout = """
-        {"camera_count":8,"checkpoint_schema":2,"event":"started","geometry_digest":"\(testGeometryDigest)","initial_gaussian_count":750,"input_digest":"\(testInputDigest)","iteration":0,"iteration_limit":7000,"memory_budget_bytes":\(testMemoryBudgetBytes),"payload_schema":2,"plateau_window":800,"profile":"balanced","resumed":false,"schema_version":1,"seed":42,"sequence":1,"trainer_build_digest":"\(testTrainerDigest)","version":"1.1.3 (git 106499b)"}
-        {"event":"raster_resource_limit_exceeded","intersection_count":4096,"iteration":12,"max_buffer_bytes":\(maximumBufferBytes),"required_bytes":\(requiredBytes),"schema_version":1,"sequence":2}
+        {"camera_count":8,"checkpoint_schema":3,"event":"started","geometry_digest":"\(testGeometryDigest)","initial_gaussian_count":750,"input_digest":"\(testInputDigest)","iteration":0,"iteration_limit":7000,"memory_budget_bytes":\(testMemoryBudgetBytes),"payload_schema":2,"plateau_window":800,"profile":"balanced","raster_exact_buffer_bytes_added":0,"raster_exact_buffer_growth_count":0,"raster_exact_fallback_elapsed_seconds":0,"raster_fallback_count":0,"raster_peak_exact_intersection_capacity":0,"raster_replay_elapsed_seconds":0,"resumed":false,"schema_version":2,"seed":42,"sequence":1,"trainer_build_digest":"\(testTrainerDigest)","version":"1.1.3 (git 106499b)"}
+        {"event":"raster_resource_limit_exceeded","intersection_count":4096,"iteration":12,"max_buffer_bytes":\(maximumBufferBytes),"required_bytes":\(requiredBytes),"schema_version":2,"sequence":2}
         """ + "\n"
         let mock = MockSubprocessRunner(scripts: [
             .init(
@@ -332,7 +337,7 @@ final class MsplatRunnerTests: XCTestCase {
         let maximumBufferBytes: Int64 = 4_294_967_296
         let requiredBytes = maximumBufferBytes + 4_096
         let stdout = """
-        {"event":"raster_resource_limit_exceeded","iteration":0,"max_buffer_bytes":\(maximumBufferBytes),"required_bytes":\(requiredBytes),"schema_version":1,"sequence":1}
+        {"event":"raster_resource_limit_exceeded","iteration":0,"max_buffer_bytes":\(maximumBufferBytes),"required_bytes":\(requiredBytes),"schema_version":2,"sequence":1}
         """ + "\n"
         let mock = MockSubprocessRunner(scripts: [
             .init(
@@ -510,7 +515,7 @@ final class MsplatRunnerTests: XCTestCase {
                 with: "\"stop_reason\":\"plateau\""
             )
         records.insert(
-            "{\"event\":\"early_stop\",\"iteration\":3500,\"last_improvement_iteration\":2700,\"loss\":0.12,\"loss_iteration\":3500,\"plateau_window\":800,\"reason\":\"plateau\",\"schema_version\":1,\"sequence\":4}",
+            "{\"event\":\"early_stop\",\"iteration\":3500,\"last_improvement_iteration\":2700,\"loss\":0.12,\"loss_iteration\":3500,\"plateau_window\":800,\"reason\":\"plateau\",\"schema_version\":2,\"sequence\":4}",
             at: 3
         )
         let mock = MockSubprocessRunner(scripts: [
@@ -551,7 +556,7 @@ final class MsplatRunnerTests: XCTestCase {
                 with: "\"stop_reason\":\"plateau\""
             )
         records.insert(
-            "{\"event\":\"early_stop\",\"iteration\":3500,\"last_improvement_iteration\":2800,\"loss\":0.12,\"loss_iteration\":3500,\"plateau_window\":800,\"reason\":\"plateau\",\"schema_version\":1,\"sequence\":4}",
+            "{\"event\":\"early_stop\",\"iteration\":3500,\"last_improvement_iteration\":2800,\"loss\":0.12,\"loss_iteration\":3500,\"plateau_window\":800,\"reason\":\"plateau\",\"schema_version\":2,\"sequence\":4}",
             at: 3
         )
         let context = try makeContext()
@@ -589,14 +594,55 @@ final class MsplatRunnerTests: XCTestCase {
     func testRunTrainRejectsMalformedOrIncompleteEventStreams() async throws {
         let cases: [(String, String)] = [
             ("malformed", "not json\n"),
-            ("wrong schema", validEvents().replacingOccurrences(of: "\"schema_version\":1", with: "\"schema_version\":2")),
+            ("wrong schema", validEvents().replacingOccurrences(of: "\"schema_version\":2", with: "\"schema_version\":1")),
             ("invented payload schema", validEvents().replacingOccurrences(of: "\"payload_schema\":2", with: "\"payload_schema\":3")),
             ("skipped sequence", validEvents().replacingOccurrences(of: "\"sequence\":2", with: "\"sequence\":4")),
             ("wrong version", validEvents().replacingOccurrences(of: "1.1.3 (git 106499b)", with: "1.1.4 (git deadbee)")),
             ("profile mismatch", validEvents().replacingOccurrences(of: "\"profile\":\"balanced\"", with: "\"profile\":\"fast\"")),
             ("plateau without early stop", validEvents().replacingOccurrences(of: "\"stop_reason\":\"iteration_limit\"", with: "\"stop_reason\":\"plateau\"")),
-            ("fallback beyond event iteration", validEvents(rasterFallbackCount: 3_501)),
-            ("fallback beyond native counter", validEvents(rasterFallbackCount: Int(UInt32.max) + 1)),
+            (
+                "fallback beyond event iteration",
+                validEvents(rasterFallbackCount: 3_501, includeRasterReplay: true)
+            ),
+            (
+                "fallback beyond native counter",
+                validEvents(
+                    rasterFallbackCount: Int(UInt32.max) + 1,
+                    includeRasterReplay: true
+                )
+            ),
+            (
+                "fallback without exact timing",
+                validEvents(rasterFallbackCount: 1, includeRasterReplay: true)
+                    .replacingOccurrences(
+                        of: "\"raster_exact_fallback_elapsed_seconds\":0.25",
+                        with: "\"raster_exact_fallback_elapsed_seconds\":0"
+                    )
+            ),
+            (
+                "fallback without replay timing",
+                validEvents(rasterFallbackCount: 1, includeRasterReplay: true)
+                    .replacingOccurrences(
+                        of: "\"raster_replay_elapsed_seconds\":0.5",
+                        with: "\"raster_replay_elapsed_seconds\":0"
+                    )
+            ),
+            (
+                "exact capacity beyond native range",
+                validEvents(rasterFallbackCount: 1, includeRasterReplay: true)
+                    .replacingOccurrences(
+                        of: "\"raster_peak_exact_intersection_capacity\":4096",
+                        with: "\"raster_peak_exact_intersection_capacity\":4294967296"
+                    )
+            ),
+            (
+                "one growth beyond memory budget",
+                validEvents(rasterFallbackCount: 1, includeRasterReplay: true)
+                    .replacingOccurrences(
+                        of: "\"raster_exact_buffer_bytes_added\":65536",
+                        with: "\"raster_exact_buffer_bytes_added\":\(testMemoryBudgetBytes + 1)"
+                    )
+            ),
             (
                 "peak memory overflow",
                 validEvents().replacingOccurrences(
@@ -890,6 +936,11 @@ final class MsplatRunnerTests: XCTestCase {
             peakMemoryBytes: testCheckpointPeakMemoryBytes,
             memoryBudgetBytes: testMemoryBudgetBytes,
             rasterFallbackCount: 0,
+            rasterExactFallbackElapsedSeconds: 0,
+            rasterExactBufferGrowthCount: 0,
+            rasterExactBufferBytesAdded: 0,
+            rasterReplayElapsedSeconds: 0,
+            rasterPeakExactIntersectionCapacity: 0,
             droppedIntersectionCount: 0,
             inputDigest: String(repeating: "a", count: 64),
             geometryDigest: String(repeating: "b", count: 64),
@@ -1007,7 +1058,7 @@ final class MsplatRunnerTests: XCTestCase {
                 withIntermediateDirectories: true
             )
             let stdout = """
-            {"event":"resume_rejected","reason":"\(reason.rawValue)","schema_version":1,"sequence":1}
+            {"event":"resume_rejected","reason":"\(reason.rawValue)","schema_version":2,"sequence":1}
             """ + "\n"
             let mock = MockSubprocessRunner(scripts: [
                 .init(
@@ -1054,7 +1105,7 @@ final class MsplatRunnerTests: XCTestCase {
                 result: .init(
                     exitCode: 78,
                     terminationReason: .exit,
-                    stdout: "{\"event\":\"resume_rejected\",\"reason\":\"geometry_changed\",\"schema_version\":1,\"sequence\":1}\n",
+                    stdout: "{\"event\":\"resume_rejected\",\"reason\":\"geometry_changed\",\"schema_version\":2,\"sequence\":1}\n",
                     stderr: "invalid event"
                 ),
                 onRun: nil
@@ -1093,7 +1144,7 @@ final class MsplatRunnerTests: XCTestCase {
                 result: .init(
                     exitCode: 0,
                     terminationReason: .exit,
-                    stdout: "{\"event\":\"resume_rejected\",\"reason\":\"trainer_changed\",\"schema_version\":1,\"sequence\":1}\n",
+                    stdout: "{\"event\":\"resume_rejected\",\"reason\":\"trainer_changed\",\"schema_version\":2,\"sequence\":1}\n",
                     stderr: ""
                 ),
                 onRun: nil
@@ -1207,6 +1258,17 @@ final class MsplatRunnerTests: XCTestCase {
 
         XCTAssertEqual(result.rasterFallbackCount, 3)
         XCTAssertEqual(result.latestCheckpoint?.rasterFallbackCount, 3)
+        XCTAssertEqual(
+            result.rasterExactFallbackElapsedSeconds,
+            receipt.rasterExactFallbackElapsedSeconds
+        )
+        XCTAssertEqual(result.rasterExactBufferGrowthCount, receipt.rasterExactBufferGrowthCount)
+        XCTAssertEqual(result.rasterExactBufferBytesAdded, receipt.rasterExactBufferBytesAdded)
+        XCTAssertEqual(result.rasterReplayElapsedSeconds, receipt.rasterReplayElapsedSeconds)
+        XCTAssertEqual(
+            result.rasterPeakExactIntersectionCapacity,
+            receipt.rasterPeakExactIntersectionCapacity
+        )
         XCTAssertTrue(fallbacks.value.isEmpty)
     }
 
@@ -1272,7 +1334,7 @@ final class MsplatRunnerTests: XCTestCase {
             at: context.checkpoint,
             withIntermediateDirectories: true
         )
-        let event = "{\"event\":\"resume_rejected\",\"reason\":\"input_changed\",\"schema_version\":1,\"sequence\":1}\n"
+        let event = "{\"event\":\"resume_rejected\",\"reason\":\"input_changed\",\"schema_version\":2,\"sequence\":1}\n"
 
         do {
             _ = try await MsplatRunner(
@@ -1377,6 +1439,96 @@ final class MsplatRunnerTests: XCTestCase {
                 "Accepted raster fallback count \(invalidCount) at iteration 500"
             )
         }
+    }
+
+    func testResumePreflightRejectsImpossibleRasterRecoveryHistory() throws {
+        let context = try makeContext()
+        defer { context.cleanup() }
+        let receipt = try makeMsplatCheckpointFixture(
+            at: context.checkpoint,
+            iteration: 500,
+            rasterFallbackCount: 1,
+            exactFallbackElapsedSeconds: 0,
+            exactBufferGrowthCount: 0,
+            exactBufferBytesAdded: 0,
+            replayElapsedSeconds: 0,
+            peakExactIntersectionCapacity: 0
+        )
+
+        XCTAssertThrowsError(
+            try MsplatCheckpointValidator.validateResume(
+                checkpointURL: context.checkpoint,
+                artifact: checkpointedArtifact(for: receipt)
+            )
+        )
+    }
+
+    func testResumePreflightRejectsRasterTimingsBeyondCheckpointElapsedTime() throws {
+        for (exact, replay) in [(1.26, 0.5), (0.25, 1.26)] {
+            let context = try makeContext()
+            defer { context.cleanup() }
+            let receipt = try makeMsplatCheckpointFixture(
+                at: context.checkpoint,
+                iteration: 500,
+                rasterFallbackCount: 1,
+                exactFallbackElapsedSeconds: exact,
+                replayElapsedSeconds: replay,
+                checkpointElapsedSeconds: 1.25
+            )
+
+            XCTAssertThrowsError(
+                try MsplatCheckpointValidator.validateResume(
+                    checkpointURL: context.checkpoint,
+                    artifact: checkpointedArtifact(for: receipt)
+                ),
+                "Accepted exact=\(exact), replay=\(replay) beyond checkpoint elapsed time"
+            )
+        }
+    }
+
+    func testResumePreflightBoundsRasterAllocationEvidence() throws {
+        let invalidCases: [(bytes: Int64, growths: Int, peak: Int64)] = [
+            (testMemoryBudgetBytes + 1, 1, 4_096),
+            (65_536, 1, Int64(UInt32.max) + 1),
+        ]
+        for values in invalidCases {
+            let context = try makeContext()
+            defer { context.cleanup() }
+            let receipt = try makeMsplatCheckpointFixture(
+                at: context.checkpoint,
+                iteration: 500,
+                rasterFallbackCount: 3,
+                exactBufferGrowthCount: values.growths,
+                exactBufferBytesAdded: values.bytes,
+                peakExactIntersectionCapacity: values.peak
+            )
+            XCTAssertThrowsError(
+                try MsplatCheckpointValidator.validateResume(
+                    checkpointURL: context.checkpoint,
+                    artifact: checkpointedArtifact(for: receipt)
+                )
+            )
+        }
+    }
+
+    func testResumePreflightAllowsCumulativeAllocationAcrossGrowths() throws {
+        let context = try makeContext()
+        defer { context.cleanup() }
+        let receipt = try makeMsplatCheckpointFixture(
+            at: context.checkpoint,
+            iteration: 500,
+            rasterFallbackCount: 3,
+            exactBufferGrowthCount: 2,
+            exactBufferBytesAdded: testMemoryBudgetBytes + 1
+        )
+
+        XCTAssertEqual(
+            try MsplatCheckpointValidator.validateResume(
+                checkpointURL: context.checkpoint,
+                artifact: checkpointedArtifact(for: receipt)
+            ),
+            receipt
+        )
     }
 
     func testResumePreflightRejectsSymlinkedGenerationsDirectory() throws {
@@ -1527,6 +1679,11 @@ private func validEvents(
         peakMemoryBytes: testCheckpointPeakMemoryBytes,
         memoryBudgetBytes: memoryBudgetBytes,
         rasterFallbackCount: 0,
+        rasterExactFallbackElapsedSeconds: 0,
+        rasterExactBufferGrowthCount: 0,
+        rasterExactBufferBytesAdded: 0,
+        rasterReplayElapsedSeconds: 0,
+        rasterPeakExactIntersectionCapacity: 0,
         droppedIntersectionCount: 0,
         inputDigest: testInputDigest,
         geometryDigest: testGeometryDigest,
@@ -1551,15 +1708,29 @@ private func validEvents(
         rasterFallbackCount,
         checkpoint.rasterFallbackCount
     )
+    let addedFallback = completedRasterFallbackCount > checkpoint.rasterFallbackCount
+    let completedExactFallbackElapsed = checkpoint.rasterExactFallbackElapsedSeconds
+        + (addedFallback ? 0.25 : 0)
+    let completedGrowthCount = addedFallback
+        ? max(1, checkpoint.rasterExactBufferGrowthCount)
+        : checkpoint.rasterExactBufferGrowthCount
+    let completedBytesAdded: Int64 = addedFallback
+        ? max(65_536, checkpoint.rasterExactBufferBytesAdded)
+        : checkpoint.rasterExactBufferBytesAdded
+    let completedReplayElapsed = checkpoint.rasterReplayElapsedSeconds
+        + (addedFallback && includeRasterReplay ? 0.5 : 0)
+    let completedPeakCapacity: Int64 = addedFallback
+        ? max(4_096, checkpoint.rasterPeakExactIntersectionCapacity)
+        : checkpoint.rasterPeakExactIntersectionCapacity
     if completedRasterFallbackCount > checkpoint.rasterFallbackCount {
         replayEvent = includeRasterReplay
             ? """
-            {"budget_bytes":\(memoryBudgetBytes),"camera_index":2,"event":"raster_replay","first_overflow_iteration":12,"intersection_count":4096,"iteration":11,"required_bytes":65536,"schema_version":1,"sequence":3}
+            {"budget_bytes":\(memoryBudgetBytes),"camera_index":2,"event":"raster_replay","first_overflow_iteration":12,"intersection_count":4096,"iteration":11,"required_bytes":65536,"schema_version":2,"sequence":3}
             """ + "\n"
             : ""
         let fallbackSequence = includeRasterReplay ? 4 : 3
         fallbackEvent = """
-        {"allocation_bytes":65536,"event":"raster_fallback","fallback_count":\(completedRasterFallbackCount),"intersection_count":4096,"iteration":\(progressIteration),"schema_version":1,"sequence":\(fallbackSequence)}
+        {"allocation_bytes":65536,"event":"raster_fallback","fallback_count":\(completedRasterFallbackCount),"intersection_count":4096,"iteration":\(progressIteration),"raster_exact_buffer_bytes_added":\(completedBytesAdded),"raster_exact_buffer_growth_count":\(completedGrowthCount),"raster_exact_fallback_elapsed_seconds":\(completedExactFallbackElapsed),"raster_peak_exact_intersection_capacity":\(completedPeakCapacity),"raster_replay_elapsed_seconds":\(completedReplayElapsed),"schema_version":2,"sequence":\(fallbackSequence)}
         """ + "\n"
         progressSequence = fallbackSequence + 1
         completionSequence = fallbackSequence + 2
@@ -1570,16 +1741,16 @@ private func validEvents(
         completionSequence = 4
     }
     let startedEvent = """
-    {"camera_count":8,"checkpoint_schema":2,"dropped_intersection_count":0,"event":"started","geometry_digest":"\(checkpoint.geometryDigest)","initial_gaussian_count":750,"input_digest":"\(checkpoint.inputDigest)","iteration":\(startIteration),"iteration_limit":\(limit),"memory_budget_bytes":\(memoryBudgetBytes),"payload_schema":2,"plateau_window":\(plateau),"profile":"\(profile)","raster_fallback_count":\(checkpoint.rasterFallbackCount),"resumed":\(resumed),"schema_version":1,"seed":\(seed),"sequence":1,"trainer_build_digest":"\(checkpoint.trainerBuildDigest)","version":"1.1.3 (git 106499b)"}
+    {"camera_count":8,"checkpoint_schema":3,"dropped_intersection_count":0,"event":"started","geometry_digest":"\(checkpoint.geometryDigest)","initial_gaussian_count":750,"input_digest":"\(checkpoint.inputDigest)","iteration":\(startIteration),"iteration_limit":\(limit),"memory_budget_bytes":\(memoryBudgetBytes),"payload_schema":2,"plateau_window":\(plateau),"profile":"\(profile)","raster_exact_buffer_bytes_added":\(checkpoint.rasterExactBufferBytesAdded),"raster_exact_buffer_growth_count":\(checkpoint.rasterExactBufferGrowthCount),"raster_exact_fallback_elapsed_seconds":\(checkpoint.rasterExactFallbackElapsedSeconds),"raster_fallback_count":\(checkpoint.rasterFallbackCount),"raster_peak_exact_intersection_capacity":\(checkpoint.rasterPeakExactIntersectionCapacity),"raster_replay_elapsed_seconds":\(checkpoint.rasterReplayElapsedSeconds),"resumed":\(resumed),"schema_version":2,"seed":\(seed),"sequence":1,"trainer_build_digest":"\(checkpoint.trainerBuildDigest)","version":"1.1.3 (git 106499b)"}
     """
     let checkpointRecord = """
-    {"checkpoint_generation":"\(checkpoint.generation)","checkpoint_payload_bytes":\(checkpoint.payloadBytes),"checkpoint_payload_sha256":"\(checkpoint.payloadSHA256)","dropped_intersection_count":0,"event":"\(checkpointEvent)","gaussian_count":\(checkpoint.gaussianCount),"geometry_digest":"\(checkpoint.geometryDigest)","input_digest":"\(checkpoint.inputDigest)","iteration":\(checkpoint.iteration)\(checkpointMemoryField),"memory_budget_bytes":\(memoryBudgetBytes),"profile":"\(profile)","raster_fallback_count":\(checkpoint.rasterFallbackCount),"schema_version":1,"seed":\(seed),"sequence":2,"trainer_build_digest":"\(checkpoint.trainerBuildDigest)","version":"1.1.3 (git 106499b)"}
+    {"checkpoint_generation":"\(checkpoint.generation)","checkpoint_payload_bytes":\(checkpoint.payloadBytes),"checkpoint_payload_sha256":"\(checkpoint.payloadSHA256)","dropped_intersection_count":0,"event":"\(checkpointEvent)","gaussian_count":\(checkpoint.gaussianCount),"geometry_digest":"\(checkpoint.geometryDigest)","input_digest":"\(checkpoint.inputDigest)","iteration":\(checkpoint.iteration)\(checkpointMemoryField),"memory_budget_bytes":\(memoryBudgetBytes),"profile":"\(profile)","raster_exact_buffer_bytes_added":\(checkpoint.rasterExactBufferBytesAdded),"raster_exact_buffer_growth_count":\(checkpoint.rasterExactBufferGrowthCount),"raster_exact_fallback_elapsed_seconds":\(checkpoint.rasterExactFallbackElapsedSeconds),"raster_fallback_count":\(checkpoint.rasterFallbackCount),"raster_peak_exact_intersection_capacity":\(checkpoint.rasterPeakExactIntersectionCapacity),"raster_replay_elapsed_seconds":\(checkpoint.rasterReplayElapsedSeconds),"schema_version":2,"seed":\(seed),"sequence":2,"trainer_build_digest":"\(checkpoint.trainerBuildDigest)","version":"1.1.3 (git 106499b)"}
     """
     let progressRecord = """
-    {"elapsed_seconds":2.5,"eta_seconds":2.5,"event":"progress","gaussian_count":1000,"iteration":\(progressIteration),"iteration_limit":\(limit),"iterations_per_second":1400\(lossFields),"schema_version":1,"sequence":\(progressSequence)}
+    {"elapsed_seconds":2.5,"eta_seconds":2.5,"event":"progress","gaussian_count":1000,"iteration":\(progressIteration),"iteration_limit":\(limit),"iterations_per_second":1400\(lossFields),"schema_version":2,"sequence":\(progressSequence)}
     """
     let completedRecord = """
-    {"dropped_intersection_count":\(droppedIntersectionCount),"elapsed_seconds":5,"event":"completed","gaussian_count":1250,"geometry_digest":"\(checkpoint.geometryDigest)","input_digest":"\(checkpoint.inputDigest)","iteration":\(limit),"iteration_limit":\(limit),"memory_budget_bytes":\(memoryBudgetBytes),"output_bytes":\(fixtureOutputData.count)\(completionMemoryField),"plateau_window":\(plateau),"profile":"\(profile)","raster_fallback_count":\(completedRasterFallbackCount),"scene_center":[1.25,-2.5,3.75],"scene_radius":8.5,"schema_version":1,"seed":\(seed),"sequence":\(completionSequence),"stop_reason":"iteration_limit","trainer_build_digest":"\(checkpoint.trainerBuildDigest)","version":"1.1.3 (git 106499b)"}
+    {"dropped_intersection_count":\(droppedIntersectionCount),"elapsed_seconds":5,"event":"completed","gaussian_count":1250,"geometry_digest":"\(checkpoint.geometryDigest)","input_digest":"\(checkpoint.inputDigest)","iteration":\(limit),"iteration_limit":\(limit),"memory_budget_bytes":\(memoryBudgetBytes),"output_bytes":\(fixtureOutputData.count)\(completionMemoryField),"plateau_window":\(plateau),"profile":"\(profile)","raster_exact_buffer_bytes_added":\(completedBytesAdded),"raster_exact_buffer_growth_count":\(completedGrowthCount),"raster_exact_fallback_elapsed_seconds":\(completedExactFallbackElapsed),"raster_fallback_count":\(completedRasterFallbackCount),"raster_peak_exact_intersection_capacity":\(completedPeakCapacity),"raster_replay_elapsed_seconds":\(completedReplayElapsed),"scene_center":[1.25,-2.5,3.75],"scene_radius":8.5,"schema_version":2,"seed":\(seed),"sequence":\(completionSequence),"stop_reason":"iteration_limit","trainer_build_digest":"\(checkpoint.trainerBuildDigest)","version":"1.1.3 (git 106499b)"}
     """
     return startedEvent + "\n" + checkpointRecord + "\n" + replayEvent + fallbackEvent
         + progressRecord + "\n" + completedRecord + "\n"
@@ -1628,7 +1799,7 @@ private let testMemoryBudgetBytes: Int64 = 8_589_934_592
 private func checkpointedArtifact(for receipt: MsplatCheckpointReceipt) -> TrainingArtifact {
     TrainingArtifact(
         trainerVersion: "1.1.3 (git 106499b)",
-        runtimeVersion: "native-metal-cli-v1",
+        runtimeVersion: "native-metal-cli-v2",
         trainerBuildDigest: receipt.trainerBuildDigest,
         inputDigest: receipt.inputDigest,
         geometryDigest: receipt.geometryDigest,
@@ -1645,6 +1816,11 @@ private func checkpointedArtifact(for receipt: MsplatCheckpointReceipt) -> Train
         peakMemoryBytes: receipt.peakMemoryBytes,
         memoryBudgetBytes: receipt.memoryBudgetBytes,
         rasterFallbackCount: receipt.rasterFallbackCount,
+        rasterExactFallbackElapsedSeconds: receipt.rasterExactFallbackElapsedSeconds,
+        rasterExactBufferGrowthCount: receipt.rasterExactBufferGrowthCount,
+        rasterExactBufferBytesAdded: receipt.rasterExactBufferBytesAdded,
+        rasterReplayElapsedSeconds: receipt.rasterReplayElapsedSeconds,
+        rasterPeakExactIntersectionCapacity: receipt.rasterPeakExactIntersectionCapacity,
         droppedIntersectionCount: receipt.droppedIntersectionCount,
         completionStatus: .checkpointed
     )
@@ -1659,8 +1835,21 @@ func makeMsplatCheckpointFixture(
     inputDigest: String = testInputDigest,
     geometryDigest: String = testGeometryDigest,
     memoryBudgetBytes: Int64 = testMemoryBudgetBytes,
-    rasterFallbackCount: Int = 0
+    rasterFallbackCount: Int = 0,
+    exactFallbackElapsedSeconds: Double? = nil,
+    exactBufferGrowthCount: Int? = nil,
+    exactBufferBytesAdded: Int64? = nil,
+    replayElapsedSeconds: Double? = nil,
+    peakExactIntersectionCapacity: Int64? = nil,
+    checkpointElapsedSeconds: Double = 1.25
 ) throws -> MsplatCheckpointReceipt {
+    let exactFallbackElapsedSeconds = exactFallbackElapsedSeconds
+        ?? (rasterFallbackCount > 0 ? 0.25 : 0)
+    let exactBufferGrowthCount = exactBufferGrowthCount ?? (rasterFallbackCount > 0 ? 1 : 0)
+    let exactBufferBytesAdded = exactBufferBytesAdded ?? (rasterFallbackCount > 0 ? 65_536 : 0)
+    let replayElapsedSeconds = replayElapsedSeconds ?? (rasterFallbackCount > 0 ? 0.5 : 0)
+    let peakExactIntersectionCapacity = peakExactIntersectionCapacity
+        ?? (rasterFallbackCount > 0 ? 4_096 : 0)
     let fileManager = FileManager.default
     let generations = root.appendingPathComponent("generations", isDirectory: true)
     try fileManager.createDirectory(at: generations, withIntermediateDirectories: true)
@@ -1672,7 +1861,7 @@ func makeMsplatCheckpointFixture(
         "camera_count": 8,
         "camera_draw_count": iteration,
         "dropped_intersection_count": 0,
-        "elapsed_seconds": 1.25,
+        "elapsed_seconds": checkpointElapsedSeconds,
         "gaussian_count": 750,
         "geometry_digest": geometryDigest,
         "input_digest": inputDigest,
@@ -1688,8 +1877,13 @@ func makeMsplatCheckpointFixture(
         "payload_sha256": payloadDigest,
         "plateau_window": plateauWindow,
         "profile": profile,
+        "raster_exact_buffer_bytes_added": exactBufferBytesAdded,
+        "raster_exact_buffer_growth_count": exactBufferGrowthCount,
+        "raster_exact_fallback_elapsed_seconds": exactFallbackElapsedSeconds,
         "raster_fallback_count": rasterFallbackCount,
-        "schema_version": 2,
+        "raster_peak_exact_intersection_capacity": peakExactIntersectionCapacity,
+        "raster_replay_elapsed_seconds": replayElapsedSeconds,
+        "schema_version": 3,
         "seed": 42,
         "trainer_build_digest": testTrainerDigest,
         "trainer_version": "1.1.3 (git 106499b)",
@@ -1714,6 +1908,11 @@ func makeMsplatCheckpointFixture(
         peakMemoryBytes: testCheckpointPeakMemoryBytes,
         memoryBudgetBytes: memoryBudgetBytes,
         rasterFallbackCount: rasterFallbackCount,
+        rasterExactFallbackElapsedSeconds: exactFallbackElapsedSeconds,
+        rasterExactBufferGrowthCount: exactBufferGrowthCount,
+        rasterExactBufferBytesAdded: exactBufferBytesAdded,
+        rasterReplayElapsedSeconds: replayElapsedSeconds,
+        rasterPeakExactIntersectionCapacity: peakExactIntersectionCapacity,
         droppedIntersectionCount: 0,
         inputDigest: inputDigest,
         geometryDigest: geometryDigest,
@@ -1726,10 +1925,10 @@ private func interruptedEvents(
     currentIteration: Int
 ) -> String {
     """
-    {"camera_count":8,"checkpoint_schema":2,"event":"started","geometry_digest":"\(checkpoint.geometryDigest)","initial_gaussian_count":750,"input_digest":"\(checkpoint.inputDigest)","iteration":\(checkpoint.iteration),"iteration_limit":7000,"memory_budget_bytes":\(checkpoint.memoryBudgetBytes),"payload_schema":2,"plateau_window":800,"profile":"balanced","resumed":true,"schema_version":1,"seed":42,"sequence":1,"trainer_build_digest":"\(checkpoint.trainerBuildDigest)","version":"1.1.3 (git 106499b)"}
-    {"checkpoint_generation":"\(checkpoint.generation)","checkpoint_payload_bytes":\(checkpoint.payloadBytes),"checkpoint_payload_sha256":"\(checkpoint.payloadSHA256)","dropped_intersection_count":0,"event":"checkpoint_loaded","gaussian_count":\(checkpoint.gaussianCount),"geometry_digest":"\(checkpoint.geometryDigest)","input_digest":"\(checkpoint.inputDigest)","iteration":\(checkpoint.iteration),"memory_budget_bytes":\(checkpoint.memoryBudgetBytes),"peak_memory_bytes":\(checkpoint.peakMemoryBytes),"profile":"balanced","raster_fallback_count":\(checkpoint.rasterFallbackCount),"schema_version":1,"seed":42,"sequence":2,"trainer_build_digest":"\(checkpoint.trainerBuildDigest)","version":"1.1.3 (git 106499b)"}
-    {"event":"cancellation_requested","iteration":\(currentIteration),"schema_version":1,"sequence":3,"signal":2}
-    {"checkpoint_generation":"\(checkpoint.generation)","checkpoint_iteration":\(checkpoint.iteration),"checkpoint_payload_sha256":"\(checkpoint.payloadSHA256)","dropped_intersection_count":0,"event":"cancelled","geometry_digest":"\(checkpoint.geometryDigest)","input_digest":"\(checkpoint.inputDigest)","iteration":\(currentIteration),"memory_budget_bytes":\(checkpoint.memoryBudgetBytes),"raster_fallback_count":\(checkpoint.rasterFallbackCount),"schema_version":1,"sequence":4}
+    {"camera_count":8,"checkpoint_schema":3,"event":"started","geometry_digest":"\(checkpoint.geometryDigest)","initial_gaussian_count":750,"input_digest":"\(checkpoint.inputDigest)","iteration":\(checkpoint.iteration),"iteration_limit":7000,"memory_budget_bytes":\(checkpoint.memoryBudgetBytes),"payload_schema":2,"plateau_window":800,"profile":"balanced","raster_exact_buffer_bytes_added":\(checkpoint.rasterExactBufferBytesAdded),"raster_exact_buffer_growth_count":\(checkpoint.rasterExactBufferGrowthCount),"raster_exact_fallback_elapsed_seconds":\(checkpoint.rasterExactFallbackElapsedSeconds),"raster_fallback_count":\(checkpoint.rasterFallbackCount),"raster_peak_exact_intersection_capacity":\(checkpoint.rasterPeakExactIntersectionCapacity),"raster_replay_elapsed_seconds":\(checkpoint.rasterReplayElapsedSeconds),"resumed":true,"schema_version":2,"seed":42,"sequence":1,"trainer_build_digest":"\(checkpoint.trainerBuildDigest)","version":"1.1.3 (git 106499b)"}
+    {"checkpoint_generation":"\(checkpoint.generation)","checkpoint_payload_bytes":\(checkpoint.payloadBytes),"checkpoint_payload_sha256":"\(checkpoint.payloadSHA256)","dropped_intersection_count":0,"event":"checkpoint_loaded","gaussian_count":\(checkpoint.gaussianCount),"geometry_digest":"\(checkpoint.geometryDigest)","input_digest":"\(checkpoint.inputDigest)","iteration":\(checkpoint.iteration),"memory_budget_bytes":\(checkpoint.memoryBudgetBytes),"peak_memory_bytes":\(checkpoint.peakMemoryBytes),"profile":"balanced","raster_exact_buffer_bytes_added":\(checkpoint.rasterExactBufferBytesAdded),"raster_exact_buffer_growth_count":\(checkpoint.rasterExactBufferGrowthCount),"raster_exact_fallback_elapsed_seconds":\(checkpoint.rasterExactFallbackElapsedSeconds),"raster_fallback_count":\(checkpoint.rasterFallbackCount),"raster_peak_exact_intersection_capacity":\(checkpoint.rasterPeakExactIntersectionCapacity),"raster_replay_elapsed_seconds":\(checkpoint.rasterReplayElapsedSeconds),"schema_version":2,"seed":42,"sequence":2,"trainer_build_digest":"\(checkpoint.trainerBuildDigest)","version":"1.1.3 (git 106499b)"}
+    {"event":"cancellation_requested","iteration":\(currentIteration),"schema_version":2,"sequence":3,"signal":2}
+    {"checkpoint_generation":"\(checkpoint.generation)","checkpoint_iteration":\(checkpoint.iteration),"checkpoint_payload_sha256":"\(checkpoint.payloadSHA256)","dropped_intersection_count":0,"event":"cancelled","geometry_digest":"\(checkpoint.geometryDigest)","input_digest":"\(checkpoint.inputDigest)","iteration":\(currentIteration),"memory_budget_bytes":\(checkpoint.memoryBudgetBytes),"raster_exact_buffer_bytes_added":\(checkpoint.rasterExactBufferBytesAdded),"raster_exact_buffer_growth_count":\(checkpoint.rasterExactBufferGrowthCount),"raster_exact_fallback_elapsed_seconds":\(checkpoint.rasterExactFallbackElapsedSeconds),"raster_fallback_count":\(checkpoint.rasterFallbackCount),"raster_peak_exact_intersection_capacity":\(checkpoint.rasterPeakExactIntersectionCapacity),"raster_replay_elapsed_seconds":\(checkpoint.rasterReplayElapsedSeconds),"schema_version":2,"sequence":4}
     """ + "\n"
 }
 

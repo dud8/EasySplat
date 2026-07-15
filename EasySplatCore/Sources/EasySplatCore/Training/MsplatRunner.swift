@@ -111,6 +111,11 @@ public struct MsplatTrainingResult: Sendable, Equatable {
     public let peakMemoryBytes: Int64
     public let memoryBudgetBytes: Int64
     public let rasterFallbackCount: Int
+    public let rasterExactFallbackElapsedSeconds: Double
+    public let rasterExactBufferGrowthCount: Int
+    public let rasterExactBufferBytesAdded: Int64
+    public let rasterReplayElapsedSeconds: Double
+    public let rasterPeakExactIntersectionCapacity: Int64
     public let droppedIntersectionCount: Int
     public let sceneBounds: SplatSceneBounds
     public let outputBytes: Int64
@@ -431,6 +436,11 @@ private struct MsplatNativeEvent: Decodable {
     let firstOverflowIteration: Int?
     let fallbackCount: Int?
     let rasterFallbackCount: Int?
+    let rasterExactFallbackElapsedSeconds: Double?
+    let rasterExactBufferGrowthCount: Int?
+    let rasterExactBufferBytesAdded: Int64?
+    let rasterReplayElapsedSeconds: Double?
+    let rasterPeakExactIntersectionCapacity: Int64?
     let droppedIntersectionCount: Int?
     let intersectionCount: Int64?
     let allocationBytes: Int64?
@@ -479,6 +489,11 @@ private struct MsplatNativeEvent: Decodable {
         case firstOverflowIteration = "first_overflow_iteration"
         case fallbackCount = "fallback_count"
         case rasterFallbackCount = "raster_fallback_count"
+        case rasterExactFallbackElapsedSeconds = "raster_exact_fallback_elapsed_seconds"
+        case rasterExactBufferGrowthCount = "raster_exact_buffer_growth_count"
+        case rasterExactBufferBytesAdded = "raster_exact_buffer_bytes_added"
+        case rasterReplayElapsedSeconds = "raster_replay_elapsed_seconds"
+        case rasterPeakExactIntersectionCapacity = "raster_peak_exact_intersection_capacity"
         case droppedIntersectionCount = "dropped_intersection_count"
         case intersectionCount = "intersection_count"
         case allocationBytes = "allocation_bytes"
@@ -527,6 +542,11 @@ private struct MsplatNativeEvent: Decodable {
         case firstOverflowIteration = "first_overflow_iteration"
         case fallbackCount = "fallback_count"
         case rasterFallbackCount = "raster_fallback_count"
+        case rasterExactFallbackElapsedSeconds = "raster_exact_fallback_elapsed_seconds"
+        case rasterExactBufferGrowthCount = "raster_exact_buffer_growth_count"
+        case rasterExactBufferBytesAdded = "raster_exact_buffer_bytes_added"
+        case rasterReplayElapsedSeconds = "raster_replay_elapsed_seconds"
+        case rasterPeakExactIntersectionCapacity = "raster_peak_exact_intersection_capacity"
         case droppedIntersectionCount = "dropped_intersection_count"
         case intersectionCount = "intersection_count"
         case allocationBytes = "allocation_bytes"
@@ -548,13 +568,19 @@ private struct MsplatNativeEvent: Decodable {
         .cameraCount, .checkpointSchema, .droppedIntersectionCount, .geometryDigest,
         .initialGaussianCount, .inputDigest, .iteration, .iterationLimit,
         .memoryBudgetBytes, .payloadSchema, .plateauWindow, .profile,
-        .rasterFallbackCount, .resumed, .seed, .trainerBuildDigest, .version,
+        .rasterExactBufferBytesAdded, .rasterExactBufferGrowthCount,
+        .rasterExactFallbackElapsedSeconds, .rasterFallbackCount,
+        .rasterPeakExactIntersectionCapacity, .rasterReplayElapsedSeconds,
+        .resumed, .seed, .trainerBuildDigest, .version,
     ]
     private static let checkpointFields: Set<Field> = [
         .checkpointGeneration, .checkpointPayloadBytes, .checkpointPayloadSHA256,
         .droppedIntersectionCount, .gaussianCount, .geometryDigest, .inputDigest,
         .iteration, .memoryBudgetBytes, .peakMemoryBytes, .profile,
-        .rasterFallbackCount, .seed, .trainerBuildDigest, .version,
+        .rasterExactBufferBytesAdded, .rasterExactBufferGrowthCount,
+        .rasterExactFallbackElapsedSeconds, .rasterFallbackCount,
+        .rasterPeakExactIntersectionCapacity, .rasterReplayElapsedSeconds,
+        .seed, .trainerBuildDigest, .version,
     ]
     private static let progressFields: Set<Field> = [
         .elapsedSeconds, .etaSeconds, .gaussianCount, .iteration, .iterationLimit,
@@ -570,6 +596,9 @@ private struct MsplatNativeEvent: Decodable {
     ]
     private static let rasterFallbackFields: Set<Field> = [
         .allocationBytes, .fallbackCount, .intersectionCount, .iteration,
+        .rasterExactBufferBytesAdded, .rasterExactBufferGrowthCount,
+        .rasterExactFallbackElapsedSeconds, .rasterPeakExactIntersectionCapacity,
+        .rasterReplayElapsedSeconds,
     ]
     private static let rasterMemoryBudgetExceededFields: Set<Field> = [
         .allocationBytes, .budgetBytes, .intersectionCount, .iteration, .requiredBytes,
@@ -584,12 +613,17 @@ private struct MsplatNativeEvent: Decodable {
     private static let cancelledFields: Set<Field> = [
         .checkpointGeneration, .checkpointIteration, .checkpointPayloadSHA256,
         .droppedIntersectionCount, .geometryDigest, .inputDigest, .iteration,
-        .memoryBudgetBytes, .rasterFallbackCount,
+        .memoryBudgetBytes, .rasterExactBufferBytesAdded, .rasterExactBufferGrowthCount,
+        .rasterExactFallbackElapsedSeconds, .rasterFallbackCount,
+        .rasterPeakExactIntersectionCapacity, .rasterReplayElapsedSeconds,
     ]
     private static let completedFields: Set<Field> = [
         .droppedIntersectionCount, .elapsedSeconds, .gaussianCount, .geometryDigest,
         .inputDigest, .iteration, .iterationLimit, .memoryBudgetBytes, .outputBytes,
-        .peakMemoryBytes, .plateauWindow, .profile, .rasterFallbackCount,
+        .peakMemoryBytes, .plateauWindow, .profile, .rasterExactBufferBytesAdded,
+        .rasterExactBufferGrowthCount, .rasterExactFallbackElapsedSeconds,
+        .rasterFallbackCount, .rasterPeakExactIntersectionCapacity,
+        .rasterReplayElapsedSeconds,
         .sceneCenter, .sceneRadius, .seed, .stopReason, .trainerBuildDigest, .version,
     ]
 
@@ -683,6 +717,11 @@ private final class MsplatEventStream: @unchecked Sendable {
     private var memoryBudgetFailure: MsplatRasterMemoryBudgetExceeded?
     private var resourceLimitFailure: MsplatRasterResourceLimitExceeded?
     private var rasterFallbackCount = 0
+    private var rasterExactFallbackElapsedSeconds = 0.0
+    private var rasterExactBufferGrowthCount = 0
+    private var rasterExactBufferBytesAdded: Int64 = 0
+    private var rasterReplayElapsedSeconds = 0.0
+    private var rasterPeakExactIntersectionCapacity: Int64 = 0
 
     init(
         contract: MsplatProfileContract,
@@ -816,8 +855,8 @@ private final class MsplatEventStream: @unchecked Sendable {
     }
 
     private func accept(_ event: MsplatNativeEvent) throws -> AcceptedEffect? {
-        guard event.schemaVersion == 1 else {
-            throw MsplatEventProtocolError("event schema must be 1")
+        guard event.schemaVersion == 2 else {
+            throw MsplatEventProtocolError("event schema must be 2")
         }
         guard event.sequence == nextSequence else {
             throw MsplatEventProtocolError(
@@ -852,7 +891,7 @@ private final class MsplatEventStream: @unchecked Sendable {
                   event.initialGaussianCount.map({ $0 > 0 }) == true,
                   event.resumed == resumeRequested,
                   event.memoryBudgetBytes == memoryBudgetBytes,
-                  event.checkpointSchema == 2,
+                  event.checkpointSchema == 3,
                   event.payloadSchema == 2,
                   let eventInputDigest = event.inputDigest,
                   let eventGeometryDigest = event.geometryDigest,
@@ -862,6 +901,8 @@ private final class MsplatEventStream: @unchecked Sendable {
                   isSHA256(eventTrainerBuildDigest),
                   eventInputDigest == expectedIdentity.inputDigest,
                   eventGeometryDigest == expectedIdentity.geometryDigest,
+                  let startedRasterFallbackCount = event.rasterFallbackCount,
+                  validRasterFallbackCount(startedRasterFallbackCount, through: iteration),
                   resumeRequested || iteration == 0 else {
                 throw MsplatEventProtocolError(
                     "event started identity or run contract does not match the prepared dataset"
@@ -874,6 +915,21 @@ private final class MsplatEventStream: @unchecked Sendable {
             inputDigest = eventInputDigest
             geometryDigest = eventGeometryDigest
             trainerBuildDigest = eventTrainerBuildDigest
+            let startedMetrics = try recoveryMetrics(
+                from: event,
+                fallbackCount: startedRasterFallbackCount
+            )
+            if !resumeRequested, startedMetrics != RasterRecoveryMetrics(
+                fallbackCount: 0,
+                exactFallbackElapsedSeconds: 0,
+                exactBufferGrowthCount: 0,
+                exactBufferBytesAdded: 0,
+                replayElapsedSeconds: 0,
+                peakExactIntersectionCapacity: 0
+            ) {
+                throw MsplatEventProtocolError("fresh training started with raster recovery history")
+            }
+            applyRecoveryMetrics(startedMetrics)
             started = true
             return nil
         case "raster_replay":
@@ -909,7 +965,14 @@ private final class MsplatEventStream: @unchecked Sendable {
                   allocationBytes <= memoryBudgetBytes else {
                 throw MsplatEventProtocolError("event raster_fallback record is invalid")
             }
-            rasterFallbackCount = fallbackCount
+            let fallbackMetrics = try recoveryMetrics(
+                from: event,
+                fallbackCount: fallbackCount
+            )
+            guard fallbackMetrics.isAtLeast(currentRecoveryMetrics) else {
+                throw MsplatEventProtocolError("event raster_fallback metrics decreased")
+            }
+            applyRecoveryMetrics(fallbackMetrics)
             return AcceptedEffect(
                 rasterFallback: MsplatRasterFallback(
                     iteration: iteration,
@@ -964,25 +1027,42 @@ private final class MsplatEventStream: @unchecked Sendable {
                 throw MsplatEventProtocolError("checkpoint event arrived before started")
             }
             let receipt = try checkpointReceipt(from: event)
+            let receiptMetrics = RasterRecoveryMetrics(
+                fallbackCount: receipt.rasterFallbackCount,
+                exactFallbackElapsedSeconds: receipt.rasterExactFallbackElapsedSeconds,
+                exactBufferGrowthCount: receipt.rasterExactBufferGrowthCount,
+                exactBufferBytesAdded: receipt.rasterExactBufferBytesAdded,
+                replayElapsedSeconds: receipt.rasterReplayElapsedSeconds,
+                peakExactIntersectionCapacity: receipt.rasterPeakExactIntersectionCapacity
+            )
             if event.event == "checkpoint_loaded" {
                 guard resumeRequested,
                       latestCheckpoint == nil,
                       receipt.iteration == startIteration,
-                      receipt.rasterFallbackCount >= rasterFallbackCount else {
+                      receiptMetrics == currentRecoveryMetrics else {
                     throw MsplatEventProtocolError("checkpoint_loaded does not match requested resume")
                 }
-                rasterFallbackCount = receipt.rasterFallbackCount
             } else if latestCheckpoint == nil {
                 guard !resumeRequested,
                       receipt.iteration == 0,
-                      receipt.rasterFallbackCount == rasterFallbackCount else {
+                      receiptMetrics == currentRecoveryMetrics else {
                     throw MsplatEventProtocolError("initial checkpoint_completed is invalid")
                 }
             } else {
                 guard receipt.iteration > latestCheckpoint!.iteration,
                       receipt.iteration < contract.iterationLimit,
-                      receipt.rasterFallbackCount >= latestCheckpoint!.rasterFallbackCount,
-                      receipt.rasterFallbackCount == rasterFallbackCount else {
+                      receiptMetrics.isAtLeast(RasterRecoveryMetrics(
+                          fallbackCount: latestCheckpoint!.rasterFallbackCount,
+                          exactFallbackElapsedSeconds:
+                              latestCheckpoint!.rasterExactFallbackElapsedSeconds,
+                          exactBufferGrowthCount:
+                              latestCheckpoint!.rasterExactBufferGrowthCount,
+                          exactBufferBytesAdded: latestCheckpoint!.rasterExactBufferBytesAdded,
+                          replayElapsedSeconds: latestCheckpoint!.rasterReplayElapsedSeconds,
+                          peakExactIntersectionCapacity:
+                              latestCheckpoint!.rasterPeakExactIntersectionCapacity
+                      )),
+                      receiptMetrics == currentRecoveryMetrics else {
                     throw MsplatEventProtocolError("checkpoint iterations are not strictly increasing")
                 }
             }
@@ -1079,6 +1159,20 @@ private final class MsplatEventStream: @unchecked Sendable {
                   event.droppedIntersectionCount == 0 else {
                 throw MsplatEventProtocolError("event cancelled record has no matching checkpoint")
             }
+            let cancelledMetrics = try recoveryMetrics(
+                from: event,
+                fallbackCount: checkpoint.rasterFallbackCount
+            )
+            guard cancelledMetrics == RasterRecoveryMetrics(
+                fallbackCount: checkpoint.rasterFallbackCount,
+                exactFallbackElapsedSeconds: checkpoint.rasterExactFallbackElapsedSeconds,
+                exactBufferGrowthCount: checkpoint.rasterExactBufferGrowthCount,
+                exactBufferBytesAdded: checkpoint.rasterExactBufferBytesAdded,
+                replayElapsedSeconds: checkpoint.rasterReplayElapsedSeconds,
+                peakExactIntersectionCapacity: checkpoint.rasterPeakExactIntersectionCapacity
+            ) else {
+                throw MsplatEventProtocolError("event cancelled raster metrics are not durable")
+            }
             cancellationIteration = iteration
             cancelled = true
             return nil
@@ -1110,12 +1204,23 @@ private final class MsplatEventStream: @unchecked Sendable {
             try validateContract(event)
             try validateIdentity(event)
             guard event.memoryBudgetBytes == memoryBudgetBytes,
-                  event.rasterFallbackCount == rasterFallbackCount,
+                  let completedRasterFallbackCount = event.rasterFallbackCount,
+                  completedRasterFallbackCount == rasterFallbackCount,
                   event.droppedIntersectionCount == 0 else {
                 throw MsplatEventProtocolError(
                     "event completed raster evidence is incomplete or unsafe"
                 )
             }
+            let completedMetrics = try recoveryMetrics(
+                from: event,
+                fallbackCount: completedRasterFallbackCount
+            )
+            guard completedMetrics.isAtLeast(currentRecoveryMetrics),
+                  completedMetrics.exactFallbackElapsedSeconds <= elapsed,
+                  completedMetrics.replayElapsedSeconds <= elapsed else {
+                throw MsplatEventProtocolError("event completed raster metrics are inconsistent")
+            }
+            applyRecoveryMetrics(completedMetrics)
             if stopReason == .iterationLimit && iteration != contract.iterationLimit {
                 throw MsplatEventProtocolError("event iteration-limit completion stopped early")
             }
@@ -1137,6 +1242,11 @@ private final class MsplatEventStream: @unchecked Sendable {
                 peakMemoryBytes: peakMemoryBytes,
                 memoryBudgetBytes: memoryBudgetBytes,
                 rasterFallbackCount: rasterFallbackCount,
+                rasterExactFallbackElapsedSeconds: rasterExactFallbackElapsedSeconds,
+                rasterExactBufferGrowthCount: rasterExactBufferGrowthCount,
+                rasterExactBufferBytesAdded: rasterExactBufferBytesAdded,
+                rasterReplayElapsedSeconds: rasterReplayElapsedSeconds,
+                rasterPeakExactIntersectionCapacity: rasterPeakExactIntersectionCapacity,
                 droppedIntersectionCount: 0,
                 sceneBounds: SplatSceneBounds(
                     center: ScenePoint3D(
@@ -1184,6 +1294,10 @@ private final class MsplatEventStream: @unchecked Sendable {
               event.trainerBuildDigest == trainerBuildDigest else {
             throw MsplatEventProtocolError("checkpoint event record is invalid")
         }
+        let metrics = try recoveryMetrics(
+            from: event,
+            fallbackCount: eventRasterFallbackCount
+        )
         return MsplatCheckpointReceipt(
             iteration: iteration,
             generation: generation,
@@ -1193,6 +1307,11 @@ private final class MsplatEventStream: @unchecked Sendable {
             peakMemoryBytes: peakMemoryBytes,
             memoryBudgetBytes: memoryBudgetBytes,
             rasterFallbackCount: eventRasterFallbackCount,
+            rasterExactFallbackElapsedSeconds: metrics.exactFallbackElapsedSeconds,
+            rasterExactBufferGrowthCount: metrics.exactBufferGrowthCount,
+            rasterExactBufferBytesAdded: metrics.exactBufferBytesAdded,
+            rasterReplayElapsedSeconds: metrics.replayElapsedSeconds,
+            rasterPeakExactIntersectionCapacity: metrics.peakExactIntersectionCapacity,
             droppedIntersectionCount: 0,
             inputDigest: inputDigest,
             geometryDigest: geometryDigest,
@@ -1230,6 +1349,97 @@ private final class MsplatEventStream: @unchecked Sendable {
 
     private func validRasterFallbackCount(_ count: Int, through iteration: Int) -> Bool {
         count >= 0 && count <= min(iteration, Int(UInt32.max))
+    }
+
+    private func recoveryMetrics(
+        from event: MsplatNativeEvent,
+        fallbackCount: Int
+    ) throws -> RasterRecoveryMetrics {
+        guard let exactFallbackElapsedSeconds = event.rasterExactFallbackElapsedSeconds,
+              let exactBufferGrowthCount = event.rasterExactBufferGrowthCount,
+              let exactBufferBytesAdded = event.rasterExactBufferBytesAdded,
+              let replayElapsedSeconds = event.rasterReplayElapsedSeconds,
+              let peakExactIntersectionCapacity = event.rasterPeakExactIntersectionCapacity else {
+            throw MsplatEventProtocolError("event raster recovery evidence is incomplete")
+        }
+        let metrics = RasterRecoveryMetrics(
+            fallbackCount: fallbackCount,
+            exactFallbackElapsedSeconds: exactFallbackElapsedSeconds,
+            exactBufferGrowthCount: exactBufferGrowthCount,
+            exactBufferBytesAdded: exactBufferBytesAdded,
+            replayElapsedSeconds: replayElapsedSeconds,
+            peakExactIntersectionCapacity: peakExactIntersectionCapacity
+        )
+        guard metrics.isValid,
+              metrics.exactBufferBytesAdded == 0
+                || 1 + ((metrics.exactBufferBytesAdded - 1) / memoryBudgetBytes)
+                    <= Int64(metrics.exactBufferGrowthCount) else {
+            throw MsplatEventProtocolError("event raster recovery evidence is inconsistent")
+        }
+        return metrics
+    }
+
+    private var currentRecoveryMetrics: RasterRecoveryMetrics {
+        RasterRecoveryMetrics(
+            fallbackCount: rasterFallbackCount,
+            exactFallbackElapsedSeconds: rasterExactFallbackElapsedSeconds,
+            exactBufferGrowthCount: rasterExactBufferGrowthCount,
+            exactBufferBytesAdded: rasterExactBufferBytesAdded,
+            replayElapsedSeconds: rasterReplayElapsedSeconds,
+            peakExactIntersectionCapacity: rasterPeakExactIntersectionCapacity
+        )
+    }
+
+    private func applyRecoveryMetrics(_ metrics: RasterRecoveryMetrics) {
+        rasterFallbackCount = metrics.fallbackCount
+        rasterExactFallbackElapsedSeconds = metrics.exactFallbackElapsedSeconds
+        rasterExactBufferGrowthCount = metrics.exactBufferGrowthCount
+        rasterExactBufferBytesAdded = metrics.exactBufferBytesAdded
+        rasterReplayElapsedSeconds = metrics.replayElapsedSeconds
+        rasterPeakExactIntersectionCapacity = metrics.peakExactIntersectionCapacity
+    }
+
+    private struct RasterRecoveryMetrics: Equatable {
+        let fallbackCount: Int
+        let exactFallbackElapsedSeconds: Double
+        let exactBufferGrowthCount: Int
+        let exactBufferBytesAdded: Int64
+        let replayElapsedSeconds: Double
+        let peakExactIntersectionCapacity: Int64
+
+        var isValid: Bool {
+            fallbackCount >= 0
+                && exactFallbackElapsedSeconds.isFinite
+                && exactFallbackElapsedSeconds >= 0
+                && exactBufferGrowthCount >= 0
+                && exactBufferGrowthCount <= fallbackCount
+                && exactBufferBytesAdded >= 0
+                && replayElapsedSeconds.isFinite
+                && replayElapsedSeconds >= 0
+                && peakExactIntersectionCapacity >= 0
+                && peakExactIntersectionCapacity <= Int64(UInt32.max)
+                && ((fallbackCount == 0
+                    && exactFallbackElapsedSeconds == 0
+                    && exactBufferGrowthCount == 0
+                    && exactBufferBytesAdded == 0
+                    && replayElapsedSeconds == 0
+                    && peakExactIntersectionCapacity == 0)
+                  || (fallbackCount > 0
+                    && exactFallbackElapsedSeconds > 0
+                    && exactBufferGrowthCount > 0
+                    && exactBufferBytesAdded > 0
+                    && replayElapsedSeconds > 0
+                    && peakExactIntersectionCapacity > 2_048))
+        }
+
+        func isAtLeast(_ prior: Self) -> Bool {
+            fallbackCount >= prior.fallbackCount
+                && exactFallbackElapsedSeconds >= prior.exactFallbackElapsedSeconds
+                && exactBufferGrowthCount >= prior.exactBufferGrowthCount
+                && exactBufferBytesAdded >= prior.exactBufferBytesAdded
+                && replayElapsedSeconds >= prior.replayElapsedSeconds
+                && peakExactIntersectionCapacity >= prior.peakExactIntersectionCapacity
+        }
     }
 
     private struct AcceptedEffect {

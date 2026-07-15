@@ -480,6 +480,9 @@ extension ToolchainManager {
             "source_url": "https://github.com/rayanht/msplat.git",
             "source_commit": "106499b0a53f82b0c92d013b0861fbebd341b17e",
             "source_version": "1.1.3",
+            "overlay_sha256": "da1a4289fa9ab3993d9db3cee2450bcf0c5a15d34778d59d81f092196300f922",
+            "raster_test_sha256": "f98e008a3d813cb8b8b3ae9d0b5e42f5f9d08ba7662835aebcdbad04fa910f7c",
+            "exact_raster_patch_sha256": "dd1f1a802cabaaceeab8825535e374f21ad723c680d4e70bcfc7d3d4e865962d",
             "deployment_target": "macOS 15.0",
             "build_configuration": "Release",
         ]
@@ -586,7 +589,7 @@ extension ToolchainManager {
         guard Set(event.keys) == expectedKeys,
               event["event"] as? String == "self_check",
               event["scene_bounds_status"] as? String == "ok",
-              event["schema_version"] as? Int == 1,
+              event["schema_version"] as? Int == 2,
               event["sequence"] as? Int == 1,
               event["status"] as? String == "ok",
               event["version"] as? String == runtimeVersion else {

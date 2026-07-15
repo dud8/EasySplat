@@ -1,5 +1,5 @@
 diff --git a/CMakeLists.txt b/CMakeLists.txt
-index 744a1c958a4c96356f09a2dbac6b44284d6992f1..cb43f5286cbb54592a916f739bb8419ff83dd0df 100644
+index 744a1c9..cb43f52 100644
 --- a/CMakeLists.txt
 +++ b/CMakeLists.txt
 @@ -115,6 +115,27 @@ target_link_libraries(msplat PRIVATE
@@ -31,7 +31,7 @@ index 744a1c958a4c96356f09a2dbac6b44284d6992f1..cb43f5286cbb54592a916f739bb8419f
  
  option(MSPLAT_BUILD_PYTHON "Build nanobind Python bindings" OFF)
 diff --git a/core/include/metal_tensor.hpp b/core/include/metal_tensor.hpp
-index 39342ff2c0ed884ade904725e609eb7b1edd97fc..1b511296d506e103222dec8bff49f16ff49fc15d 100644
+index 39342ff..1b51129 100644
 --- a/core/include/metal_tensor.hpp
 +++ b/core/include/metal_tensor.hpp
 @@ -5,12 +5,19 @@
@@ -79,10 +79,10 @@ index 39342ff2c0ed884ade904725e609eb7b1edd97fc..1b511296d506e103222dec8bff49f16f
          void *retainedBuffer = (__bridge_retained void*)buf;
  #else
 diff --git a/core/metal/bindings.h b/core/metal/bindings.h
-index 159e98b74e8238244ef02736937aad48052bd86a..2e02cd5ed623088ab6d0f1851b4677356a69866a 100644
+index 159e98b..21c1b9a 100644
 --- a/core/metal/bindings.h
 +++ b/core/metal/bindings.h
-@@ -2,8 +2,24 @@
+@@ -2,8 +2,28 @@
  #define MSPLAT_BINDINGS_H
  
  #include <tuple>
@@ -92,6 +92,10 @@ index 159e98b74e8238244ef02736937aad48052bd86a..2e02cd5ed623088ab6d0f1851b467735
 +struct MsplatRasterStats {
 +    uint64_t fallback_count;
 +    uint64_t dropped_intersection_count;
++    double exact_fallback_elapsed_seconds;
++    uint64_t exact_buffer_growth_count;
++    uint64_t exact_buffer_bytes_added;
++    uint64_t peak_exact_intersection_capacity;
 +    uint64_t latest_intersection_count;
 +    uint64_t allocation_bytes;
 +    uint64_t required_bytes;
@@ -107,7 +111,7 @@ index 159e98b74e8238244ef02736937aad48052bd86a..2e02cd5ed623088ab6d0f1851b467735
  // Release all cached GPU tensors (call before exit to prevent GPU memory leak)
  void cleanup_msplat_metal();
  
-@@ -23,6 +39,39 @@ void msplat_commit();
+@@ -23,6 +43,48 @@ void msplat_commit();
  
  // Synchronize (commit + wait for completion)
  void msplat_gpu_sync();
@@ -120,6 +124,13 @@ index 159e98b74e8238244ef02736937aad48052bd86a..2e02cd5ed623088ab6d0f1851b467735
 +    int features_rest_bases
 +);
 +void msplat_set_raster_fallback_count(uint64_t fallback_count);
++void msplat_restore_raster_metrics(
++    uint64_t fallback_count,
++    double exact_fallback_elapsed_seconds,
++    uint64_t exact_buffer_growth_count,
++    uint64_t exact_buffer_bytes_added,
++    uint64_t peak_exact_intersection_capacity
++);
 +void msplat_set_raster_iteration_context(uint64_t iteration, uint64_t camera_index);
 +void msplat_grow_exact_raster_capacity(uint64_t intersection_count);
 +void msplat_clear_raster_capacity_failure();
@@ -129,6 +140,8 @@ index 159e98b74e8238244ef02736937aad48052bd86a..2e02cd5ed623088ab6d0f1851b467735
 +void msplat_set_exact_execution_capacity_for_testing(uint64_t capacity);
 +void msplat_set_exact_capacity_limit_for_testing(uint64_t capacity);
 +void msplat_set_raster_memory_budget_for_testing(uint64_t budget_bytes);
++void msplat_fail_next_sync_for_testing();
++uint64_t msplat_pending_exact_raster_timing_handlers_for_testing();
 +void msplat_copy_last_raster_debug(
 +    float* rgb,
 +    float* alpha,
@@ -148,10 +161,10 @@ index 159e98b74e8238244ef02736937aad48052bd86a..2e02cd5ed623088ab6d0f1851b467735
  void msplat_sync_loss_window(int count, float* output);
  
 diff --git a/core/metal/msplat_metal.metal b/core/metal/msplat_metal.metal
-index 190b77661aa7aa18d36c0bb9443227936978bfa0..bec0092832f69b02ea07526fefee8e7218578b7b 100644
+index 190b776..aacbc5a 100644
 --- a/core/metal/msplat_metal.metal
 +++ b/core/metal/msplat_metal.metal
-@@ -794,21 +794,173 @@ kernel void compute_sh_backward_kernel(
+@@ -794,21 +794,180 @@ kernel void compute_sh_backward_kernel(
      );
  }
  
@@ -263,6 +276,8 @@ index 190b77661aa7aa18d36c0bb9443227936978bfa0..bec0092832f69b02ea07526fefee8e72
 +    constant uint& num_tiles [[buffer(6)]],
 +    constant uint& iteration [[buffer(7)]],
 +    constant uint& camera_index [[buffer(8)]],
++    device atomic_uint* exact_timing_flags [[buffer(9)]],
++    constant uint& exact_timing_slot [[buffer(10)]],
 +    uint idx [[thread_position_in_grid]]
 +) {
 +    if (idx != 0 || atomic_load_explicit(overflow_flag, memory_order_relaxed) == 0u ||
@@ -277,6 +292,11 @@ index 190b77661aa7aa18d36c0bb9443227936978bfa0..bec0092832f69b02ea07526fefee8e72
 +        return;
 +    }
 +    atomic_fetch_add_explicit(&raster_stats[0], 1u, memory_order_relaxed);
++    atomic_store_explicit(
++        &exact_timing_flags[exact_timing_slot],
++        1u,
++        memory_order_relaxed
++    );
 +    write_exact_dispatch(
 +        dispatch_arguments,
 +        EXACT_DISPATCH_MAP,
@@ -328,7 +348,7 @@ index 190b77661aa7aa18d36c0bb9443227936978bfa0..bec0092832f69b02ea07526fefee8e72
      uint idx = gp.x;
      if (idx >= num_points)
          return;
-@@ -820,19 +972,15 @@ kernel void map_gaussian_to_intersects_kernel(
+@@ -820,19 +979,15 @@ kernel void map_gaussian_to_intersects_kernel(
      get_tile_bbox(center, read_packed_float2(aabb, idx), (int3)tile_bounds, tile_min, tile_max);
  
      // update the intersection info for all tiles this gaussian hits
@@ -353,7 +373,7 @@ index 190b77661aa7aa18d36c0bb9443227936978bfa0..bec0092832f69b02ea07526fefee8e72
              gaussian_ids[cur_idx] = idx;                     // 3D gaussian id
              ++cur_idx; // handles gaussians that hit more than one tile
          }
-@@ -844,17 +992,18 @@ kernel void get_tile_bin_edges_kernel(
+@@ -844,17 +999,18 @@ kernel void get_tile_bin_edges_kernel(
      constant uint& capacity,
      constant int64_t* isect_ids_sorted,
      device int* tile_bins, // int2
@@ -377,7 +397,7 @@ index 190b77661aa7aa18d36c0bb9443227936978bfa0..bec0092832f69b02ea07526fefee8e72
      if (idx == 0 || idx == num_intersects - 1) {
          if (idx == 0)
              write_packed_int2x(tile_bins, cur_tile_idx, 0);
-@@ -862,7 +1011,7 @@ kernel void get_tile_bin_edges_kernel(
+@@ -862,7 +1018,7 @@ kernel void get_tile_bin_edges_kernel(
              write_packed_int2y(tile_bins, cur_tile_idx, num_intersects);
          return;
      }
@@ -386,7 +406,7 @@ index 190b77661aa7aa18d36c0bb9443227936978bfa0..bec0092832f69b02ea07526fefee8e72
      if (prev_tile_idx != cur_tile_idx) {
          write_packed_int2y(tile_bins, prev_tile_idx, idx);
          write_packed_int2x(tile_bins, cur_tile_idx, idx);
-@@ -1648,8 +1797,10 @@ kernel void accumulate_grad_stats_kernel(
+@@ -1648,8 +1804,10 @@ kernel void accumulate_grad_stats_kernel(
      device float* xys_grad_norm [[buffer(4)]],   // (N,) in-place
      device float* max_2d_size [[buffer(5)]],     // (N,) in-place
      constant float& inv_max_dim [[buffer(6)]],   // 1.0 / max(H, W)
@@ -397,7 +417,7 @@ index 190b77661aa7aa18d36c0bb9443227936978bfa0..bec0092832f69b02ea07526fefee8e72
      if (idx >= (uint)num_points) return;
      if (radii[idx] <= 0) return;
  
-@@ -1679,8 +1830,10 @@ kernel void fused_adam_kernel(
+@@ -1679,8 +1837,10 @@ kernel void fused_adam_kernel(
      constant float & bc2_sqrt [[buffer(7)]],
      constant float & eps [[buffer(8)]],
      constant uint & n [[buffer(9)]],
@@ -408,7 +428,7 @@ index 190b77661aa7aa18d36c0bb9443227936978bfa0..bec0092832f69b02ea07526fefee8e72
      if (tid >= n) return;
  
      float g = isfinite(grads[tid]) ? clamp(grads[tid], -1.0e10f, 1.0e10f) : 0.0f;
-@@ -1854,8 +2007,10 @@ kernel void project_and_sh_backward_kernel(
+@@ -1854,8 +2014,10 @@ kernel void project_and_sh_backward_kernel(
      device float* rest_exp_avg,
      device float* rest_exp_avg_sq,
      constant SHAdamParams& adam_hp,
@@ -419,7 +439,7 @@ index 190b77661aa7aa18d36c0bb9443227936978bfa0..bec0092832f69b02ea07526fefee8e72
      if (idx >= (uint)num_points || radii[idx] <= 0) {
          return;
      }
-@@ -2010,11 +2165,14 @@ kernel void pack_sorted_gaussians_kernel(
+@@ -2010,11 +2172,14 @@ kernel void pack_sorted_gaussians_kernel(
      device float* packed_conic       [[buffer(6)]],
      device float* packed_rgb         [[buffer(7)]],
      constant uint& N                 [[buffer(8)]],
@@ -436,7 +456,7 @@ index 190b77661aa7aa18d36c0bb9443227936978bfa0..bec0092832f69b02ea07526fefee8e72
      if (idx >= actual_N) return;
      int32_t g_id = gaussian_ids_sorted[idx];
      float2 xy = read_packed_float2(xys, g_id);
-@@ -2173,13 +2331,15 @@ kernel void radix_sort_histogram_kernel(
+@@ -2173,13 +2338,15 @@ kernel void radix_sort_histogram_kernel(
      device const int64_t* keys_in  [[buffer(1)]],
      device uint* counts            [[buffer(2)]],
      constant uint& shift           [[buffer(3)]],
@@ -455,7 +475,7 @@ index 190b77661aa7aa18d36c0bb9443227936978bfa0..bec0092832f69b02ea07526fefee8e72
  
      // Early exit for threadgroups entirely beyond N — write zero and return
      if (bid * RS_TG_SIZE >= N) {
-@@ -2208,13 +2368,15 @@ kernel void radix_sort_histogram_kernel(
+@@ -2208,13 +2375,15 @@ kernel void radix_sort_histogram_kernel(
  kernel void radix_sort_scan_kernel(
      device uint* counts                     [[buffer(0)]],
      constant uint& num_blocks               [[buffer(1)]],
@@ -474,7 +494,7 @@ index 190b77661aa7aa18d36c0bb9443227936978bfa0..bec0092832f69b02ea07526fefee8e72
      uint actual_num_blocks = (actual_N + RS_TG_SIZE - 1) / RS_TG_SIZE;
  
      // Each thread handles one digit value (tid = digit d)
-@@ -2260,15 +2422,17 @@ kernel void radix_sort_scatter_kernel(
+@@ -2260,15 +2429,17 @@ kernel void radix_sort_scatter_kernel(
      device int32_t* vals_out           [[buffer(4)]],
      device const uint* counts          [[buffer(5)]],
      constant uint& shift               [[buffer(6)]],
@@ -496,10 +516,18 @@ index 190b77661aa7aa18d36c0bb9443227936978bfa0..bec0092832f69b02ea07526fefee8e72
      // Early exit for threadgroups entirely beyond N
      if (bid * RS_TG_SIZE >= N) return;
 diff --git a/core/metal/msplat_metal.mm b/core/metal/msplat_metal.mm
-index 2763c992085a240bd4b0780df6a913f1100a9032..e980d547082f6e314fe73352a9ac1a89889a05bc 100644
+index 2763c99..63c5e17 100644
 --- a/core/metal/msplat_metal.mm
 +++ b/core/metal/msplat_metal.mm
-@@ -13,6 +13,7 @@
+@@ -6,13 +6,14 @@
+ 
+ #import <Metal/Metal.h>
+ #import <MetalPerformanceShaders/MetalPerformanceShaders.h>
+-#import <chrono>
+ #import <dlfcn.h>
++#import <exception>
+ #import <unordered_map>
+ #import <functional>
  #import <array>
  #import <mutex>
  #include <cmath>
@@ -507,7 +535,7 @@ index 2763c992085a240bd4b0780df6a913f1100a9032..e980d547082f6e314fe73352a9ac1a89
  #include <limits>
  #include <stdexcept>
  #include <string>
-@@ -149,6 +150,17 @@ struct MetalContext {
+@@ -149,6 +151,17 @@ struct MetalContext {
      // Tile-local sorting
      id<MTLComputePipelineState> scatter_to_prealloc_bins_kernel_cpso;
      id<MTLComputePipelineState> bitonic_sort_per_tile_kernel_cpso;
@@ -525,7 +553,7 @@ index 2763c992085a240bd4b0780df6a913f1100a9032..e980d547082f6e314fe73352a9ac1a89
      // Prefix sum
      id<MTLComputePipelineState> prefix_sum_kernel_cpso;
      id<MTLComputePipelineState> block_reduce_kernel_cpso;
-@@ -277,6 +289,18 @@ MetalContext* init_msplat_metal_context() {
+@@ -277,6 +290,18 @@ MetalContext* init_msplat_metal_context() {
      // Tile-local sorting
      ctx->scatter_to_prealloc_bins_kernel_cpso      = load(@"scatter_to_prealloc_bins_kernel");
      ctx->bitonic_sort_per_tile_kernel_cpso        = load(@"bitonic_sort_per_tile_kernel");
@@ -544,28 +572,81 @@ index 2763c992085a240bd4b0780df6a913f1100a9032..e980d547082f6e314fe73352a9ac1a89
      // Prefix sum
      ctx->prefix_sum_kernel_cpso                   = load(@"prefix_sum_kernel");
      ctx->block_reduce_kernel_cpso                 = load(@"block_reduce_kernel");
-@@ -353,6 +377,8 @@ MTensor gpu_empty(std::vector<int64_t> shape, DType dtype) {
+@@ -353,16 +377,72 @@ MTensor gpu_empty(std::vector<int64_t> shape, DType dtype) {
      return mtensor_empty(get_global_context()->device, std::move(shape), dtype);
  }
  
 +static void throw_if_raster_failed();
++static void attach_exact_raster_timing_handler();
++static void throw_if_exact_raster_timing_invalid();
++static dispatch_group_t g_exact_raster_timing_group = dispatch_group_create();
++#ifdef MSPLAT_ENABLE_RASTER_TEST_HOOKS
++static bool g_fail_next_sync_for_testing = false;
++#endif
++
++static void sync_and_drain_exact_raster_timing() {
++    std::exception_ptr syncFailure;
++#ifdef MSPLAT_ENABLE_RASTER_TEST_HOOKS
++    const bool injectFailure = g_fail_next_sync_for_testing;
++    g_fail_next_sync_for_testing = false;
++#endif
++    try {
++#ifdef MSPLAT_ENABLE_RASTER_TEST_HOOKS
++        if (injectFailure) {
++            if (msplat_pending_exact_raster_timing_handlers_for_testing() == 0) {
++                throw std::runtime_error(
++                    "msplat: injected sync failure did not retain a pending timing handler"
++                );
++            }
++            throw std::runtime_error("msplat: injected sync failure for testing");
++        }
++#endif
++        get_global_context()->syncCB();
++    } catch (...) {
++        syncFailure = std::current_exception();
++    }
++#ifdef MSPLAT_ENABLE_RASTER_TEST_HOOKS
++    if (injectFailure) {
++        try {
++            get_global_context()->syncCB();
++        } catch (...) {
++            // The injected error remains the authoritative failure. The timing
++            // group still drains below before any cache storage is released.
++        }
++    }
++#endif
++    dispatch_group_wait(g_exact_raster_timing_group, DISPATCH_TIME_FOREVER);
++    if (!syncFailure) {
++        try {
++            throw_if_exact_raster_timing_invalid();
++        } catch (...) {
++            syncFailure = std::current_exception();
++        }
++    }
++    if (syncFailure) std::rethrow_exception(syncFailure);
++}
 +
  void msplat_commit() {
      if (!g_gpu_timing_checked) {
          g_gpu_timing_enabled = std::getenv("PROFILE_GPU") != nullptr;
-@@ -363,6 +389,11 @@ void msplat_commit() {
+         g_gpu_timing_checked = true;
+     }
++    attach_exact_raster_timing_handler();
+     get_global_context()->commitCB();
+ }
  
  void msplat_gpu_sync() {
-     get_global_context()->syncCB();
+-    get_global_context()->syncCB();
++    sync_and_drain_exact_raster_timing();
 +    throw_if_raster_failed();
 +}
 +
 +void msplat_gpu_sync_for_raster_replay() {
-+    get_global_context()->syncCB();
++    sync_and_drain_exact_raster_timing();
  }
  
  void msplat_enable_gpu_timing(bool enable) {
-@@ -390,17 +421,165 @@ void msplat_drain_stage_times(std::vector<double> stage_times[], int max_stages,
+@@ -390,17 +455,173 @@ void msplat_drain_stage_times(std::vector<double> stage_times[], int max_stages,
  #define RAST_BLOCK_X 8
  #define RAST_BLOCK_Y 8
  static constexpr int64_t kMaxTileElements = 2048;
@@ -577,6 +658,7 @@ index 2763c992085a240bd4b0780df6a913f1100a9032..e980d547082f6e314fe73352a9ac1a89
 +static constexpr uint32_t kRasterStatFirstOverflowIteration = 5;
 +static constexpr uint32_t kRasterStatFirstOverflowCamera = 6;
 +static constexpr uint32_t kRasterStatCount = 7;
++static constexpr uint64_t kExactRasterTimingSlotCount = 256;
 +
 +static uint64_t g_raster_memory_budget_bytes = 0;
 +static uint64_t g_initial_raster_fallback_count = 0;
@@ -586,6 +668,13 @@ index 2763c992085a240bd4b0780df6a913f1100a9032..e980d547082f6e314fe73352a9ac1a89
 +static uint64_t g_last_raster_max_buffer_bytes = 0;
 +static uint64_t g_raster_iteration = 0;
 +static uint64_t g_raster_camera_index = 0;
++static std::mutex g_exact_raster_metric_mutex;
++static uint64_t g_pending_exact_raster_timing_handlers = 0;
++static double g_exact_fallback_elapsed_seconds = 0;
++static bool g_exact_raster_timing_invalid = false;
++static uint64_t g_exact_buffer_growth_count = 0;
++static uint64_t g_exact_buffer_bytes_added = 0;
++static uint64_t g_peak_exact_intersection_capacity = 0;
 +#ifdef MSPLAT_ENABLE_RASTER_TEST_HOOKS
 +static uint64_t g_exact_execution_capacity_for_testing = 0;
 +static uint64_t g_exact_capacity_limit_for_testing = 0;
@@ -739,7 +828,7 @@ index 2763c992085a240bd4b0780df6a913f1100a9032..e980d547082f6e314fe73352a9ac1a89
  }
  
  // Cached buffer pool — all intermediate GPU buffers are reused across iterations.
-@@ -408,11 +589,13 @@ static uint32_t packed_intersection_capacity(int num_tiles) {
+@@ -408,11 +600,13 @@ static uint32_t packed_intersection_capacity(int num_tiles) {
  // this eliminates all per-iteration GPU allocations.
  struct FusedTensorCache {
      int fwd_num_points = 0, img_height = 0, img_width = 0, num_tiles = 0;
@@ -754,7 +843,7 @@ index 2763c992085a240bd4b0780df6a913f1100a9032..e980d547082f6e314fe73352a9ac1a89
      MTensor gaussian_ids;
      MTensor packed_xy_opac, packed_conic, packed_rgb;
      MTensor out_img, final_Ts, final_idx;
-@@ -424,11 +607,17 @@ struct FusedTensorCache {
+@@ -424,11 +618,18 @@ struct FusedTensorCache {
      MTensor tile_offsets, tile_scatter_counters;
      MTensor prealloc_bins;  // [num_tiles × MAX_TILE_ELEMS] uint64 — pre-allocated per-tile bins
  
@@ -762,6 +851,7 @@ index 2763c992085a240bd4b0780df6a913f1100a9032..e980d547082f6e314fe73352a9ac1a89
 +    // keys and B ping-pong buffers are separate from the tile-local fast bins.
 +    MTensor exact_isect_ids, exact_sort_keys_tmp, exact_sort_vals_tmp, exact_sort_counts;
 +    MTensor exact_dispatch_args;
++    MTensor exact_timing_flags;
 +
      // Multi-threadgroup prefix sum temp buffer
      MTensor block_totals;
@@ -772,7 +862,7 @@ index 2763c992085a240bd4b0780df6a913f1100a9032..e980d547082f6e314fe73352a9ac1a89
      // Depth-chunked rasterization buffers
      uint32_t current_K_max = 1;
      int chunk_K_max = 0;
-@@ -446,6 +635,13 @@ struct FusedTensorCache {
+@@ -446,6 +647,13 @@ struct FusedTensorCache {
      void ensure_forward(int np, int64_t cap, int ih, int iw, int nt,
                          id<MTLDevice> dev) {
          if (np != fwd_num_points) {
@@ -786,7 +876,7 @@ index 2763c992085a240bd4b0780df6a913f1100a9032..e980d547082f6e314fe73352a9ac1a89
              fwd_num_points = np;
              xys = mtensor_empty(dev, {np, 2}, DType::Float32);
              depths = mtensor_empty(dev, {np}, DType::Float32);
-@@ -454,16 +650,27 @@ struct FusedTensorCache {
+@@ -454,16 +662,27 @@ struct FusedTensorCache {
              num_tiles_hit = mtensor_empty(dev, {np}, DType::Int32);
              colors = mtensor_empty(dev, {np, 3}, DType::Float32);
              aabb = mtensor_empty(dev, {np, 2}, DType::Float32);
@@ -817,7 +907,7 @@ index 2763c992085a240bd4b0780df6a913f1100a9032..e980d547082f6e314fe73352a9ac1a89
              img_height = ih; img_width = iw;
              out_img = mtensor_empty(dev, {ih, iw, 3}, DType::Float32);
              final_Ts = mtensor_empty(dev, {ih, iw}, DType::Float32);
-@@ -473,6 +680,10 @@ struct FusedTensorCache {
+@@ -473,6 +692,10 @@ struct FusedTensorCache {
              v_rendered = mtensor_empty(dev, {ih, iw, 3}, DType::Float32);
          }
          if (nt != num_tiles) {
@@ -828,7 +918,7 @@ index 2763c992085a240bd4b0780df6a913f1100a9032..e980d547082f6e314fe73352a9ac1a89
              num_tiles = nt;
              tile_bins = mtensor_empty(dev, {nt, 2}, DType::Int32);
              tile_offsets = mtensor_empty(dev, {nt}, DType::Int32);
-@@ -480,15 +691,46 @@ struct FusedTensorCache {
+@@ -480,15 +703,54 @@ struct FusedTensorCache {
              prealloc_bins = mtensor_empty(dev, {(int64_t)nt * kMaxTileElements}, DType::Int64);
          }
          if (!loss_sum.defined()) {
@@ -849,8 +939,16 @@ index 2763c992085a240bd4b0780df6a913f1100a9032..e980d547082f6e314fe73352a9ac1a89
 +            stats[kRasterStatFallbackCount] = static_cast<uint32_t>(g_initial_raster_fallback_count);
 +        }
 +        if (!exact_dispatch_args.defined()) {
-+            reserve_raster_allocation(dev, {{{5, 3}, DType::Int32}});
++            reserve_raster_allocation(dev, {
++                {{5, 3}, DType::Int32},
++                {{static_cast<int64_t>(kExactRasterTimingSlotCount)}, DType::Int32},
++            });
 +            exact_dispatch_args = mtensor_zeros(dev, {5, 3}, DType::Int32);
++            exact_timing_flags = mtensor_zeros(
++                dev,
++                {static_cast<int64_t>(kExactRasterTimingSlotCount)},
++                DType::Int32
++            );
 +        }
 +        if (!exact_isect_ids.defined()) {
 +            reserve_raster_allocation(dev, {
@@ -875,7 +973,7 @@ index 2763c992085a240bd4b0780df6a913f1100a9032..e980d547082f6e314fe73352a9ac1a89
          chunk_K_max = K;
          chunk_T = mtensor_empty(dev, {K, ih, iw}, DType::Float32);
          chunk_C = mtensor_empty(dev, {K, ih, iw, 3}, DType::Float32);
-@@ -499,6 +741,13 @@ struct FusedTensorCache {
+@@ -499,6 +761,13 @@ struct FusedTensorCache {
  
      void ensure_backward(int np, int frb, id<MTLDevice> dev) {
          if (np != bwd_num_points || frb != features_rest_bases || !v_xy.defined()) {
@@ -889,7 +987,7 @@ index 2763c992085a240bd4b0780df6a913f1100a9032..e980d547082f6e314fe73352a9ac1a89
              bwd_num_points = np;
              features_rest_bases = frb;
              v_xy = mtensor_empty(dev, {np, 2}, DType::Float32);
-@@ -513,9 +762,442 @@ struct FusedTensorCache {
+@@ -513,9 +782,569 @@ struct FusedTensorCache {
              v_features_rest = mtensor_empty(dev, {(int64_t)np, (int64_t)frb, 3}, DType::Float32);
          }
      }
@@ -902,6 +1000,7 @@ index 2763c992085a240bd4b0780df6a913f1100a9032..e980d547082f6e314fe73352a9ac1a89
 +            &tile_bins, &loss_sum, &tile_offsets, &tile_scatter_counters, &prealloc_bins,
 +            &exact_isect_ids, &exact_sort_keys_tmp, &exact_sort_vals_tmp, &exact_sort_counts,
 +            &exact_dispatch_args,
++            &exact_timing_flags,
 +            &block_totals, &overflow_flag, &raster_stats, &chunk_T, &chunk_C,
 +            &chunk_final_idx, &prefix_T, &after_C, &v_rendered, &v_xy, &v_conic,
 +            &v_colors_rast, &v_opacity, &v_depth, &v_mean3d, &v_scale, &v_quat,
@@ -969,6 +1068,45 @@ index 2763c992085a240bd4b0780df6a913f1100a9032..e980d547082f6e314fe73352a9ac1a89
  };
  static FusedTensorCache g_tcache;
  
++static void attach_exact_raster_timing_handler() {
++    if (g_tcache.exact_capacity <= 1 || !g_tcache.raster_stats.defined()) return;
++    const uint64_t slot = g_raster_iteration % kExactRasterTimingSlotCount;
++    auto *timingFlags = g_tcache.exact_timing_flags.data<uint32_t>();
++    {
++        std::lock_guard<std::mutex> lock(g_exact_raster_metric_mutex);
++        if (g_pending_exact_raster_timing_handlers >= kExactRasterTimingSlotCount) {
++            throw std::runtime_error("msplat: exact raster timing queue exceeded its bound");
++        }
++        ++g_pending_exact_raster_timing_handlers;
++    }
++    timingFlags[slot] = 0;
++    id<MTLCommandBuffer> commandBuffer = get_global_context()->getCommandBuffer();
++    dispatch_group_enter(g_exact_raster_timing_group);
++    [commandBuffer addCompletedHandler:^(id<MTLCommandBuffer> completedCommandBuffer) {
++        {
++            std::lock_guard<std::mutex> lock(g_exact_raster_metric_mutex);
++            if (timingFlags[slot] != 0) {
++                const double started = completedCommandBuffer.GPUStartTime;
++                const double ended = completedCommandBuffer.GPUEndTime;
++                if (std::isfinite(started) && std::isfinite(ended) && ended > started) {
++                    g_exact_fallback_elapsed_seconds += ended - started;
++                } else {
++                    g_exact_raster_timing_invalid = true;
++                }
++            }
++            --g_pending_exact_raster_timing_handlers;
++        }
++        dispatch_group_leave(g_exact_raster_timing_group);
++    }];
++}
++
++static void throw_if_exact_raster_timing_invalid() {
++    std::lock_guard<std::mutex> lock(g_exact_raster_metric_mutex);
++    if (g_exact_raster_timing_invalid) {
++        throw std::runtime_error("msplat: exact raster GPU timing was unavailable");
++    }
++}
++
 +static uint32_t fast_intersection_capacity(int num_tiles) {
 +    if (num_tiles <= 0) {
 +        throw std::runtime_error("msplat: raster grid has no tiles");
@@ -1057,6 +1195,37 @@ index 2763c992085a240bd4b0780df6a913f1100a9032..e980d547082f6e314fe73352a9ac1a89
 +    g_initial_raster_fallback_count = fallback_count;
 +}
 +
++void msplat_restore_raster_metrics(
++    uint64_t fallback_count,
++    double exact_fallback_elapsed_seconds,
++    uint64_t exact_buffer_growth_count,
++    uint64_t exact_buffer_bytes_added,
++    uint64_t peak_exact_intersection_capacity
++) {
++    if (!std::isfinite(exact_fallback_elapsed_seconds) ||
++        exact_fallback_elapsed_seconds < 0 ||
++        exact_buffer_growth_count > fallback_count ||
++        peak_exact_intersection_capacity > std::numeric_limits<uint32_t>::max() ||
++        (fallback_count == 0 &&
++         (exact_fallback_elapsed_seconds != 0 || exact_buffer_growth_count != 0 ||
++          exact_buffer_bytes_added != 0 || peak_exact_intersection_capacity != 0)) ||
++        (fallback_count != 0 &&
++         (exact_fallback_elapsed_seconds <= 0 || exact_buffer_growth_count == 0 ||
++          exact_buffer_bytes_added == 0 ||
++          peak_exact_intersection_capacity <= kMaxTileElements ||
++          g_raster_memory_budget_bytes == 0 ||
++          1 + ((exact_buffer_bytes_added - 1) / g_raster_memory_budget_bytes) >
++              exact_buffer_growth_count))) {
++        throw std::invalid_argument("msplat: restored raster metrics are inconsistent");
++    }
++    msplat_set_raster_fallback_count(fallback_count);
++    std::lock_guard<std::mutex> lock(g_exact_raster_metric_mutex);
++    g_exact_fallback_elapsed_seconds = exact_fallback_elapsed_seconds;
++    g_exact_buffer_growth_count = exact_buffer_growth_count;
++    g_exact_buffer_bytes_added = exact_buffer_bytes_added;
++    g_peak_exact_intersection_capacity = peak_exact_intersection_capacity;
++}
++
 +void msplat_set_raster_iteration_context(uint64_t iteration, uint64_t camera_index) {
 +    if (iteration == 0 || iteration > std::numeric_limits<uint32_t>::max() ||
 +        camera_index > std::numeric_limits<uint32_t>::max()) {
@@ -1126,6 +1295,7 @@ index 2763c992085a240bd4b0780df6a913f1100a9032..e980d547082f6e314fe73352a9ac1a89
 +            "accounting replaced raster buffers"
 +        );
 +    }
++    const uint64_t trackedBytesBeforeGrowth = released;
 +    const uint64_t allocationAfterRelease = allocated > released ? allocated - released : 0;
 +    const uint64_t required = validate_raster_allocation(
 +        context->device,
@@ -1148,6 +1318,30 @@ index 2763c992085a240bd4b0780df6a913f1100a9032..e980d547082f6e314fe73352a9ac1a89
 +    g_tcache.exact_sort_keys_tmp = mtensor_empty(context->device, {capacity}, DType::Int64);
 +    g_tcache.exact_sort_vals_tmp = mtensor_empty(context->device, {capacity}, DType::Int32);
 +    g_tcache.exact_sort_counts = mtensor_empty(context->device, {radixCount}, DType::Int32);
++    uint64_t trackedBytesAfterGrowth = g_tcache.exact_allocation_bytes();
++    if (growPacked) {
++        trackedBytesAfterGrowth = checked_add_u64(
++            trackedBytesAfterGrowth,
++            g_tcache.packed_allocation_bytes(),
++            "accounting grown raster buffers"
++        );
++    }
++    if (trackedBytesAfterGrowth <= trackedBytesBeforeGrowth) {
++        throw std::runtime_error("msplat: exact raster growth did not add buffer capacity");
++    }
++    {
++        std::lock_guard<std::mutex> lock(g_exact_raster_metric_mutex);
++        ++g_exact_buffer_growth_count;
++        g_exact_buffer_bytes_added = checked_add_u64(
++            g_exact_buffer_bytes_added,
++            trackedBytesAfterGrowth - trackedBytesBeforeGrowth,
++            "accounting exact raster buffer growth"
++        );
++        g_peak_exact_intersection_capacity = std::max(
++            g_peak_exact_intersection_capacity,
++            intersection_count
++        );
++    }
 +#ifdef MSPLAT_ENABLE_RASTER_TEST_HOOKS
 +    g_exact_execution_capacity_for_testing = 0;
 +#endif
@@ -1209,9 +1403,32 @@ index 2763c992085a240bd4b0780df6a913f1100a9032..e980d547082f6e314fe73352a9ac1a89
 +    g_last_raster_intersection_count = 0;
 +    g_last_raster_memory_budget_exceeded = false;
 +}
++
++void msplat_fail_next_sync_for_testing() {
++    if (g_fail_next_sync_for_testing) {
++        throw std::runtime_error("msplat: a sync failure is already pending");
++    }
++    g_fail_next_sync_for_testing = true;
++}
++
++uint64_t msplat_pending_exact_raster_timing_handlers_for_testing() {
++    std::lock_guard<std::mutex> lock(g_exact_raster_metric_mutex);
++    return g_pending_exact_raster_timing_handlers;
++}
 +#endif
 +
 +MsplatRasterStats msplat_get_raster_stats() {
++    double exactFallbackElapsedSeconds = 0;
++    uint64_t exactBufferGrowthCount = 0;
++    uint64_t exactBufferBytesAdded = 0;
++    uint64_t peakExactIntersectionCapacity = 0;
++    {
++        std::lock_guard<std::mutex> lock(g_exact_raster_metric_mutex);
++        exactFallbackElapsedSeconds = g_exact_fallback_elapsed_seconds;
++        exactBufferGrowthCount = g_exact_buffer_growth_count;
++        exactBufferBytesAdded = g_exact_buffer_bytes_added;
++        peakExactIntersectionCapacity = g_peak_exact_intersection_capacity;
++    }
 +    const uint64_t budget = g_raster_memory_budget_bytes != 0
 +        ? g_raster_memory_budget_bytes
 +        : static_cast<uint64_t>(get_global_context()->device.recommendedMaxWorkingSetSize);
@@ -1219,6 +1436,10 @@ index 2763c992085a240bd4b0780df6a913f1100a9032..e980d547082f6e314fe73352a9ac1a89
 +        return MsplatRasterStats {
 +            g_initial_raster_fallback_count,
 +            0,
++            exactFallbackElapsedSeconds,
++            exactBufferGrowthCount,
++            exactBufferBytesAdded,
++            peakExactIntersectionCapacity,
 +            g_last_raster_intersection_count,
 +            g_last_raster_allocation_bytes,
 +            g_last_raster_required_bytes,
@@ -1239,6 +1460,10 @@ index 2763c992085a240bd4b0780df6a913f1100a9032..e980d547082f6e314fe73352a9ac1a89
 +    return MsplatRasterStats {
 +        stats[kRasterStatFallbackCount],
 +        stats[kRasterStatDroppedCount],
++        exactFallbackElapsedSeconds,
++        exactBufferGrowthCount,
++        exactBufferBytesAdded,
++        peakExactIntersectionCapacity,
 +        actual,
 +        allocation,
 +        g_last_raster_required_bytes,
@@ -1332,7 +1557,7 @@ index 2763c992085a240bd4b0780df6a913f1100a9032..e980d547082f6e314fe73352a9ac1a89
  void msplat_record_last_loss(int slot, int capacity, float normalization) {
      if (capacity <= 0 || slot < 0 || slot >= capacity ||
          !std::isfinite(normalization) || normalization <= 0) {
-@@ -554,7 +1236,7 @@ void msplat_sync_loss_window(int count, float* output) {
+@@ -554,7 +1361,7 @@ void msplat_sync_loss_window(int count, float* output) {
          !g_tcache.loss_history.defined() || output == nullptr) {
          throw std::runtime_error("msplat: invalid completed loss window");
      }
@@ -1341,24 +1566,47 @@ index 2763c992085a240bd4b0780df6a913f1100a9032..e980d547082f6e314fe73352a9ac1a89
      const float* losses = g_tcache.loss_history.data<float>();
      for (int index = 0; index < count; ++index) {
          const double value = static_cast<double>(losses[index]) *
-@@ -568,6 +1250,164 @@ void msplat_sync_loss_window(int count, float* output) {
+@@ -567,7 +1374,192 @@ void msplat_sync_loss_window(int count, float* output) {
+ }
  
  void cleanup_msplat_metal() {
++    std::exception_ptr syncFailure;
++    if (g_tcache.fwd_num_points != 0) {
++        try {
++            sync_and_drain_exact_raster_timing();
++        } catch (...) {
++            syncFailure = std::current_exception();
++        }
++    } else {
++        dispatch_group_wait(g_exact_raster_timing_group, DISPATCH_TIME_FOREVER);
++    }
      g_tcache = FusedTensorCache{};
++    g_initial_raster_fallback_count = 0;
 +    g_last_raster_required_bytes = 0;
 +    g_last_raster_allocation_bytes = 0;
 +    g_last_raster_intersection_count = 0;
 +    g_last_raster_max_buffer_bytes = 0;
 +    g_raster_iteration = 0;
 +    g_raster_camera_index = 0;
++    {
++        std::lock_guard<std::mutex> lock(g_exact_raster_metric_mutex);
++        g_pending_exact_raster_timing_handlers = 0;
++        g_exact_fallback_elapsed_seconds = 0;
++        g_exact_raster_timing_invalid = false;
++        g_exact_buffer_growth_count = 0;
++        g_exact_buffer_bytes_added = 0;
++        g_peak_exact_intersection_capacity = 0;
++    }
 +#ifdef MSPLAT_ENABLE_RASTER_TEST_HOOKS
 +    g_exact_execution_capacity_for_testing = 0;
 +    g_exact_capacity_limit_for_testing = 0;
 +    g_force_exact_for_testing = false;
 +    g_exact_fallback_enabled_for_testing = true;
++    g_fail_next_sync_for_testing = false;
 +#endif
 +    g_last_raster_memory_budget_exceeded = false;
 +    g_last_raster_resource_limit_exceeded = false;
++    if (syncFailure) std::rethrow_exception(syncFailure);
 +}
 +
 +static void encode_exact_raster_fallback(
@@ -1421,6 +1669,11 @@ index 2763c992085a240bd4b0780df6a913f1100a9032..e980d547082f6e314fe73352a9ac1a89
 +    const uint32_t iteration = static_cast<uint32_t>(g_raster_iteration);
 +    const uint32_t cameraIndex = static_cast<uint32_t>(g_raster_camera_index);
 +    ENC_SCALAR(enc, iteration, 7); ENC_SCALAR(enc, cameraIndex, 8);
++    ENC_BUF(enc, g_tcache.exact_timing_flags, 9);
++    const uint32_t timingSlot = static_cast<uint32_t>(
++        g_raster_iteration % kExactRasterTimingSlotCount
++    );
++    ENC_SCALAR(enc, timingSlot, 10);
 +    [enc dispatchThreads:MTLSizeMake(1, 1, 1) threadsPerThreadgroup:MTLSizeMake(1, 1, 1)];
 +    [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
 +
@@ -1506,7 +1759,7 @@ index 2763c992085a240bd4b0780df6a913f1100a9032..e980d547082f6e314fe73352a9ac1a89
  }
  
  // Internal forward pipeline — used by both msplat_render and msplat_train_step.
-@@ -589,28 +1429,25 @@ static void forward_pipeline(
+@@ -589,28 +1572,25 @@ static void forward_pipeline(
      int tile_bounds_y = std::get<1>(tile_bounds);
      int num_tiles = tile_bounds_x * tile_bounds_y;
  
@@ -1551,7 +1804,7 @@ index 2763c992085a240bd4b0780df6a913f1100a9032..e980d547082f6e314fe73352a9ac1a89
      MTensor &xys = g_tcache.xys;
      MTensor &depths = g_tcache.depths;
      MTensor &radii_out = g_tcache.radii_out;
-@@ -649,14 +1486,14 @@ static void forward_pipeline(
+@@ -649,14 +1629,14 @@ static void forward_pipeline(
      if (std::getenv("BENCHMARK") && (diag_count == 100 || diag_count == 500 || diag_count == 1500)) {
              fprintf(stderr, "\n=== Roofline Dimensions (iter %d) ===\n", diag_count);
              fprintf(stderr, "  num_points:     %d\n", num_points);
@@ -1568,7 +1821,7 @@ index 2763c992085a240bd4b0780df6a913f1100a9032..e980d547082f6e314fe73352a9ac1a89
              fprintf(stderr, "  opacities:      [%lld]\n", (long long)opacities.size(0));
              fprintf(stderr, "===========================\n\n");
      }
-@@ -724,7 +1561,8 @@ static void forward_pipeline(
+@@ -724,7 +1704,8 @@ static void forward_pipeline(
          }
      };
  
@@ -1578,7 +1831,7 @@ index 2763c992085a240bd4b0780df6a913f1100a9032..e980d547082f6e314fe73352a9ac1a89
      uint32_t K_max = 1;
      constexpr uint32_t CHUNK_SIZE = 512;
  
-@@ -807,20 +1645,8 @@ static void forward_pipeline(
+@@ -807,20 +1788,8 @@ static void forward_pipeline(
      // Zero cached buffers will be done inside the command encoder via blit.
      // (CPU memset would race with previous CB's GPU reads.)
  
@@ -1600,7 +1853,7 @@ index 2763c992085a240bd4b0780df6a913f1100a9032..e980d547082f6e314fe73352a9ac1a89
  
      {
          id<MTLCommandBuffer> command_buffer = ctx->getCommandBuffer();
-@@ -832,7 +1658,9 @@ static void forward_pipeline(
+@@ -832,7 +1801,9 @@ static void forward_pipeline(
              id<MTLBlitCommandEncoder> blit = [command_buffer blitCommandEncoder];
              // tile_bins written by sort kernel, tile_counts no longer used
              [blit fillBuffer:loss_sum.buffer() range:NSMakeRange(0, loss_sum.nbytes()) value:0];
@@ -1611,7 +1864,7 @@ index 2763c992085a240bd4b0780df6a913f1100a9032..e980d547082f6e314fe73352a9ac1a89
              [blit fillBuffer:g_tcache.tile_scatter_counters.buffer() range:NSMakeRange(0, g_tcache.tile_scatter_counters.nbytes()) value:0];
              [blit endEncoding];
  
-@@ -843,6 +1671,15 @@ static void forward_pipeline(
+@@ -843,6 +1814,15 @@ static void forward_pipeline(
              [encoder memoryBarrierWithScope:MTLBarrierScopeBuffers];
              encode_prefix_map(encoder);
              [encoder memoryBarrierWithScope:MTLBarrierScopeBuffers];
@@ -1627,7 +1880,7 @@ index 2763c992085a240bd4b0780df6a913f1100a9032..e980d547082f6e314fe73352a9ac1a89
              encode_rast_fwd(encoder);
              if (compute_loss) {
                  [encoder memoryBarrierWithScope:MTLBarrierScopeBuffers];
-@@ -898,29 +1735,26 @@ std::tuple<MTensor, float> msplat_train_step(
+@@ -898,29 +1878,26 @@ std::tuple<MTensor, float> msplat_train_step(
      int tile_bounds_y = std::get<1>(tile_bounds);
      int num_tiles = tile_bounds_x * tile_bounds_y;
  
@@ -1673,7 +1926,7 @@ index 2763c992085a240bd4b0780df6a913f1100a9032..e980d547082f6e314fe73352a9ac1a89
  
      MTensor &xys = g_tcache.xys;
      MTensor &depths = g_tcache.depths;
-@@ -979,17 +1813,8 @@ std::tuple<MTensor, float> msplat_train_step(
+@@ -979,17 +1956,8 @@ std::tuple<MTensor, float> msplat_train_step(
      // --- K_max for chunked rasterization ---
      uint32_t K_max = 1;
      constexpr uint32_t CHUNK_SIZE = 512;
@@ -1692,7 +1945,7 @@ index 2763c992085a240bd4b0780df6a913f1100a9032..e980d547082f6e314fe73352a9ac1a89
  
      uint32_t bwd_K_max = K_max;
      constexpr uint32_t BWD_CHUNK_SIZE = 512;
-@@ -1217,6 +2042,7 @@ std::tuple<MTensor, float> msplat_train_step(
+@@ -1217,6 +2185,7 @@ std::tuple<MTensor, float> msplat_train_step(
          [enc setBuffer:adam_exp_avg[4].buffer() offset:0 atIndex:25]; // rest exp_avg
          [enc setBuffer:adam_exp_avg_sq[4].buffer() offset:0 atIndex:26]; // rest exp_avg_sq
          [enc setBytes:sh_adam_hp.get() length:sizeof(SHAdamParams) atIndex:27];
@@ -1700,7 +1953,7 @@ index 2763c992085a240bd4b0780df6a913f1100a9032..e980d547082f6e314fe73352a9ac1a89
          [enc dispatchThreads:MTLSizeMake(num_points, 1, 1) threadsPerThreadgroup:MTLSizeMake(tpg, 1, 1)];
          // Adam for remaining groups (skip 3=featuresDc, 4=featuresRest — fused above)
          if (num_adam_groups > 0) {
-@@ -1237,6 +2063,7 @@ std::tuple<MTensor, float> msplat_train_step(
+@@ -1237,6 +2206,7 @@ std::tuple<MTensor, float> msplat_train_step(
                  ENC_SCALAR(enc, adam_bc2_sqrts[g], 7);
                  ENC_SCALAR(enc, adam_eps, 8);
                  ENC_SCALAR(enc, n, 9);
@@ -1708,7 +1961,7 @@ index 2763c992085a240bd4b0780df6a913f1100a9032..e980d547082f6e314fe73352a9ac1a89
                  [enc dispatchThreads:MTLSizeMake(n, 1, 1) threadsPerThreadgroup:MTLSizeMake(atpg, 1, 1)];
              }
          }
-@@ -1255,6 +2082,7 @@ std::tuple<MTensor, float> msplat_train_step(
+@@ -1255,6 +2225,7 @@ std::tuple<MTensor, float> msplat_train_step(
          ENC_BUF(enc, xys_grad_norm, 4);
          ENC_BUF(enc, max_2d_size, 5);
          ENC_SCALAR(enc, inv_max_dim, 6);
@@ -1716,7 +1969,7 @@ index 2763c992085a240bd4b0780df6a913f1100a9032..e980d547082f6e314fe73352a9ac1a89
          [enc dispatchThreads:MTLSizeMake(num_points, 1, 1) threadsPerThreadgroup:MTLSizeMake(tpg, 1, 1)];
      };
  
-@@ -1263,7 +2091,9 @@ std::tuple<MTensor, float> msplat_train_step(
+@@ -1263,7 +2234,9 @@ std::tuple<MTensor, float> msplat_train_step(
          id<MTLBlitCommandEncoder> blit = [cb blitCommandEncoder];
          // tile_bins written by sort kernel, tile_counts no longer used
          [blit fillBuffer:loss_sum.buffer() range:NSMakeRange(0, loss_sum.nbytes()) value:0];
@@ -1727,7 +1980,7 @@ index 2763c992085a240bd4b0780df6a913f1100a9032..e980d547082f6e314fe73352a9ac1a89
          [blit fillBuffer:g_tcache.tile_scatter_counters.buffer() range:NSMakeRange(0, g_tcache.tile_scatter_counters.nbytes()) value:0];
          [blit fillBuffer:v_xy.buffer() range:NSMakeRange(0, v_xy.nbytes()) value:0];
          [blit fillBuffer:v_conic.buffer() range:NSMakeRange(0, v_conic.nbytes()) value:0];
-@@ -1330,6 +2160,15 @@ std::tuple<MTensor, float> msplat_train_step(
+@@ -1330,6 +2303,15 @@ std::tuple<MTensor, float> msplat_train_step(
              // Stage 2: prefix_sort_pack
              enc = make_profiled_encoder(1);
              encode_prefix_map(enc);
@@ -1743,7 +1996,7 @@ index 2763c992085a240bd4b0780df6a913f1100a9032..e980d547082f6e314fe73352a9ac1a89
              [enc endEncoding];
  
              // Stage 3: rast_fwd
-@@ -1412,6 +2251,15 @@ std::tuple<MTensor, float> msplat_train_step(
+@@ -1412,6 +2394,15 @@ std::tuple<MTensor, float> msplat_train_step(
              [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
              encode_prefix_map(enc);
              [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
@@ -1759,7 +2012,7 @@ index 2763c992085a240bd4b0780df6a913f1100a9032..e980d547082f6e314fe73352a9ac1a89
              encode_rast_fwd(enc);
              [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
              // --- Fused loss forward + backward ---
-@@ -1690,7 +2538,7 @@ int msplat_densify(
+@@ -1690,7 +2681,7 @@ int msplat_densify(
      });
  
      // Single GPU→CPU sync: read new_count from keep_prefix[worst_case - 1]
@@ -1769,7 +2022,7 @@ index 2763c992085a240bd4b0780df6a913f1100a9032..e980d547082f6e314fe73352a9ac1a89
      return new_count;
  }
 diff --git a/core/src/model.cpp b/core/src/model.cpp
-index d07d5699b243188c75046a172b301183704ebe6b..f09b740a1a1cfaa01157aa2fa3202a4f4293969f 100644
+index d07d569..f09b740 100644
 --- a/core/src/model.cpp
 +++ b/core/src/model.cpp
 @@ -241,6 +241,9 @@ void Model::afterTrain(int step){

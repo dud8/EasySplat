@@ -195,6 +195,9 @@ NONNEGATIVE_INTEGER_METRICS = {
     "loop_pairs",
     "bundle_adjustment_cycles",
     "raster_fallback_count",
+    "raster_exact_buffer_growth_count",
+    "raster_exact_buffer_bytes_added",
+    "raster_peak_exact_intersection_capacity",
     "maximum_tile_intersections",
     "dropped_intersection_count",
 }
@@ -229,6 +232,8 @@ NONNEGATIVE_NUMBER_METRICS = {
     "matcher_seconds",
     "mapping_seconds",
     "orientation_physical_up_error_degrees",
+    "raster_exact_fallback_elapsed_seconds",
+    "raster_replay_elapsed_seconds",
     "matching_speedup",
     "mapping_speedup",
 }
@@ -301,6 +306,11 @@ GATE_SCOPE_METRICS = {
         "mapping_seconds",
         "bundle_adjustment_cycles",
         "raster_fallback_count",
+        "raster_exact_fallback_elapsed_seconds",
+        "raster_exact_buffer_growth_count",
+        "raster_exact_buffer_bytes_added",
+        "raster_replay_elapsed_seconds",
+        "raster_peak_exact_intersection_capacity",
         "maximum_tile_intersections",
     },
     "suite_performance": {

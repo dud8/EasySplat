@@ -36,7 +36,7 @@ public struct SplatSceneBounds: Codable, Sendable, Equatable {
 }
 
 public struct TrainingArtifact: Codable, Sendable, Equatable {
-    public static let currentSchemaVersion = 3
+    public static let currentSchemaVersion = 4
 
     public var schemaVersion: Int
     public var trainerVersion: String
@@ -59,6 +59,11 @@ public struct TrainingArtifact: Codable, Sendable, Equatable {
     public var peakMemoryBytes: Int64
     public var memoryBudgetBytes: Int64
     public var rasterFallbackCount: Int
+    public var rasterExactFallbackElapsedSeconds: Double
+    public var rasterExactBufferGrowthCount: Int
+    public var rasterExactBufferBytesAdded: Int64
+    public var rasterReplayElapsedSeconds: Double
+    public var rasterPeakExactIntersectionCapacity: Int64
     public var droppedIntersectionCount: Int
     public var sceneBounds: SplatSceneBounds?
     public var completionStatus: TrainingCompletionStatus
@@ -85,6 +90,11 @@ public struct TrainingArtifact: Codable, Sendable, Equatable {
         peakMemoryBytes: Int64,
         memoryBudgetBytes: Int64,
         rasterFallbackCount: Int,
+        rasterExactFallbackElapsedSeconds: Double,
+        rasterExactBufferGrowthCount: Int,
+        rasterExactBufferBytesAdded: Int64,
+        rasterReplayElapsedSeconds: Double,
+        rasterPeakExactIntersectionCapacity: Int64,
         droppedIntersectionCount: Int,
         sceneBounds: SplatSceneBounds? = nil,
         completionStatus: TrainingCompletionStatus
@@ -110,6 +120,11 @@ public struct TrainingArtifact: Codable, Sendable, Equatable {
         self.peakMemoryBytes = peakMemoryBytes
         self.memoryBudgetBytes = memoryBudgetBytes
         self.rasterFallbackCount = rasterFallbackCount
+        self.rasterExactFallbackElapsedSeconds = rasterExactFallbackElapsedSeconds
+        self.rasterExactBufferGrowthCount = rasterExactBufferGrowthCount
+        self.rasterExactBufferBytesAdded = rasterExactBufferBytesAdded
+        self.rasterReplayElapsedSeconds = rasterReplayElapsedSeconds
+        self.rasterPeakExactIntersectionCapacity = rasterPeakExactIntersectionCapacity
         self.droppedIntersectionCount = droppedIntersectionCount
         self.sceneBounds = sceneBounds
         self.completionStatus = completionStatus

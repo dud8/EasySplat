@@ -647,6 +647,11 @@ def passing_metrics() -> dict[str, object]:
             "orientation_physical_up_error_degrees": measured(0.75),
             "orientation_sign_correct": measured(True),
             "raster_fallback_count": measured(0),
+            "raster_exact_fallback_elapsed_seconds": measured(0.0),
+            "raster_exact_buffer_growth_count": measured(0),
+            "raster_exact_buffer_bytes_added": measured(0),
+            "raster_replay_elapsed_seconds": measured(0.0),
+            "raster_peak_exact_intersection_capacity": measured(0),
             "maximum_tile_intersections": measured(100),
             "dropped_intersection_count": measured(0),
         }
@@ -1238,6 +1243,7 @@ def raw_observations(
             "stdout_log": "stdout.log",
             "stderr_log": "stderr.log",
             "output_ply": "splat.ply",
+            "training_manifest": "training-manifest.json",
         },
         "commands": execution_receipts(timing, lane),
         "actual": successful_actual(),
@@ -1281,6 +1287,11 @@ def raw_observations(
             "orientation_physical_up_error_degrees": 0.75,
             "orientation_sign_correct": True,
             "raster_fallback_count": 0,
+            "raster_exact_fallback_elapsed_seconds": 0.0,
+            "raster_exact_buffer_growth_count": 0,
+            "raster_exact_buffer_bytes_added": 0,
+            "raster_replay_elapsed_seconds": 0.0,
+            "raster_peak_exact_intersection_capacity": 0,
             "maximum_tile_intersections": 4,
             "dropped_intersection_count": 0,
         },
@@ -1571,12 +1582,67 @@ def write_orientation_evidence_artifacts(
     )
 
 
+def training_manifest_for_observations(
+    observations: dict[str, object],
+    candidate_configuration: dict[str, object],
+) -> dict[str, object]:
+    pipeline = observations["pipeline_metrics"]
+    return {
+        "schemaVersion": 4,
+        "trainerVersion": "1.1.3 (git 106499b)",
+        "runtimeVersion": "native-metal-cli-v2",
+        "trainerBuildDigest": "3" * 64,
+        "inputDigest": "1" * 64,
+        "geometryDigest": "2" * 64,
+        "detailProfile": candidate_configuration["detail_profile"],
+        "iterationLimit": candidate_configuration["trainer_iterations"],
+        "plateauWindow": candidate_configuration["trainer_plateau_window"],
+        "deterministicSeed": candidate_configuration["deterministic_seed"],
+        "completedIteration": candidate_configuration["trainer_iterations"],
+        "outputPath": "Output/splat.ply",
+        "outputSHA256": hashlib.sha256(VALID_SPLAT_PLY.encode("utf-8")).hexdigest(),
+        "outputBytes": len(VALID_SPLAT_PLY.encode("utf-8")),
+        "gaussianCount": 1,
+        "elapsedSeconds": 5.0,
+        "peakMemoryBytes": 536_870_912,
+        "memoryBudgetBytes": 8_589_934_592,
+        "rasterFallbackCount": pipeline["raster_fallback_count"],
+        "rasterExactFallbackElapsedSeconds": pipeline[
+            "raster_exact_fallback_elapsed_seconds"
+        ],
+        "rasterExactBufferGrowthCount": pipeline["raster_exact_buffer_growth_count"],
+        "rasterExactBufferBytesAdded": pipeline["raster_exact_buffer_bytes_added"],
+        "rasterReplayElapsedSeconds": pipeline["raster_replay_elapsed_seconds"],
+        "rasterPeakExactIntersectionCapacity": pipeline[
+            "raster_peak_exact_intersection_capacity"
+        ],
+        "droppedIntersectionCount": pipeline["dropped_intersection_count"],
+        "sceneBounds": {
+            "center": {"x": 0.0, "y": 0.0, "z": 0.0},
+            "radius": 2.5,
+        },
+        "completionStatus": "completed",
+    }
+
+
 def write_evidence_artifacts(
     root: Path,
     observations: dict[str, object],
     render_request: dict[str, object] | None = None,
 ) -> None:
     root.mkdir(parents=True, exist_ok=True)
+    if render_request is None:
+        candidate = next(
+            receipt
+            for receipt in observations["commands"]
+            if receipt["variant"] in {"candidate", "fast_candidate"}
+        )
+        artifact_request = evidence_request(
+            scale=candidate["scale"],
+            lane=candidate["lane"],
+        )
+    else:
+        artifact_request = render_request
     for name, content in (
         ("stdout.log", "complete\n"),
         ("stderr.log", ""),
@@ -1585,6 +1651,19 @@ def write_evidence_artifacts(
         ("splat.ply", VALID_SPLAT_PLY),
     ):
         (root / name).write_text(content, encoding="utf-8")
+    if (
+        "pipeline_metrics" in observations
+        and "output_ply" in observations.get("artifacts", {})
+    ):
+        (root / "training-manifest.json").write_bytes(
+            evidence.canonical_json_bytes(
+                training_manifest_for_observations(
+                    observations,
+                    artifact_request["candidate_run_configuration"],
+                )
+            )
+            + b"\n"
+        )
     (root / "normal-photo.zip").write_bytes(
         deterministic_closure_zip(["macos-arm64-core"])
     )
@@ -1617,7 +1696,7 @@ def write_evidence_artifacts(
         write_orientation_evidence_artifacts(
             root,
             observations,
-            render_request or evidence_request(lane=evidence.LANE_REFERENCE),
+            artifact_request,
         )
     if (
         "registration" in observations
@@ -1638,7 +1717,7 @@ def write_evidence_artifacts(
                 if command["phase"] == phase and command["variant"] == execution_variant
             ][-1]
         representative = source_receipts["candidate_balanced"]
-        render_request = render_request or evidence_request(lane=evidence.LANE_REFERENCE)
+        render_request = artifact_request
         renderer_identity = render_request["rendering_driver_identity"]
         renderer_digest = renderer_identity["executable_sha256"]
         renderer_closure_digest = renderer_identity["sha256"]
@@ -3187,6 +3266,79 @@ class EvidenceProtocolTests(unittest.TestCase):
             ({**observations["pipeline_metrics"], "unknown": 1}, "unknown"),
             ({**observations["pipeline_metrics"], "scheduled_pairs": -1}, "scheduled_pairs"),
             ({**observations["pipeline_metrics"], "orientation_status": "guessed"}, "orientation_status"),
+            (
+                {
+                    **observations["pipeline_metrics"],
+                    "raster_exact_fallback_elapsed_seconds": None,
+                },
+                "raster",
+            ),
+            (
+                {
+                    **observations["pipeline_metrics"],
+                    "raster_fallback_count": 1,
+                    "raster_exact_buffer_growth_count": 2,
+                },
+                "growth count",
+            ),
+            (
+                {
+                    **observations["pipeline_metrics"],
+                    "raster_exact_fallback_elapsed_seconds": 0.1,
+                },
+                "zero raster fallbacks",
+            ),
+            (
+                {
+                    **observations["pipeline_metrics"],
+                    "raster_fallback_count": 1,
+                },
+                "evidence",
+            ),
+            (
+                {
+                    **observations["pipeline_metrics"],
+                    "raster_fallback_count": 1,
+                    "raster_exact_fallback_elapsed_seconds": 0.1,
+                    "raster_exact_buffer_growth_count": 1,
+                    "raster_exact_buffer_bytes_added": 65_536,
+                    "raster_replay_elapsed_seconds": 0.2,
+                    "raster_peak_exact_intersection_capacity": 1 << 32,
+                },
+                "exceeds UInt32",
+            ),
+            (
+                {
+                    **observations["pipeline_metrics"],
+                    "maximum_tile_intersections": 4_096,
+                },
+                "overflow threshold",
+            ),
+            (
+                {
+                    **observations["pipeline_metrics"],
+                    "raster_fallback_count": 1,
+                    "raster_exact_fallback_elapsed_seconds": 0.1,
+                    "raster_exact_buffer_growth_count": 1,
+                    "raster_exact_buffer_bytes_added": 65_536,
+                    "raster_replay_elapsed_seconds": 0.2,
+                    "raster_peak_exact_intersection_capacity": 4_096,
+                },
+                "overflow threshold",
+            ),
+            (
+                {
+                    **observations["pipeline_metrics"],
+                    "raster_fallback_count": 1,
+                    "raster_exact_fallback_elapsed_seconds": 0.1,
+                    "raster_exact_buffer_growth_count": 1,
+                    "raster_exact_buffer_bytes_added": 65_536,
+                    "raster_replay_elapsed_seconds": 0.2,
+                    "raster_peak_exact_intersection_capacity": 4_096,
+                    "maximum_tile_intersections": 8_192,
+                },
+                "peak exact capacity",
+            ),
         )
         for raw_metrics, expected in cases:
             with self.subTest(expected=expected), tempfile.TemporaryDirectory() as directory:
@@ -3204,6 +3356,172 @@ class EvidenceProtocolTests(unittest.TestCase):
                         evidence.LANE_REFERENCE,
                         runner_identity(evidence.LANE_REFERENCE),
                         machine=evidence_machine(evidence.LANE_REFERENCE),
+                    )
+
+    def test_training_manifest_binds_raster_recovery_metrics_to_published_output(self) -> None:
+        observations = raw_observations(evidence.LANE_REFERENCE)
+        observations["artifacts"]["training_manifest"] = "training-manifest.json"
+        observations["pipeline_metrics"].update(
+            {
+                "raster_exact_fallback_elapsed_seconds": 1.25,
+                "raster_exact_buffer_growth_count": 1,
+                "raster_exact_buffer_bytes_added": 65_536,
+                "raster_replay_elapsed_seconds": 2.5,
+                "raster_peak_exact_intersection_capacity": 4_096,
+                "raster_fallback_count": 3,
+            }
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            write_evidence_artifacts(root, observations)
+            tampered = json.loads(json.dumps(observations))
+            tampered["pipeline_metrics"]["raster_exact_buffer_bytes_added"] += 1
+            (root / "observations.json").write_bytes(
+                evidence.canonical_json_bytes(tampered) + b"\n"
+            )
+            with self.assertRaisesRegex(evidence.EvidenceError, "training manifest"):
+                evidence.produce_attestation(
+                    evidence_request(),
+                    tampered,
+                    root,
+                    root / "attestation.json",
+                    self.key,
+                    evidence.LANE_REFERENCE,
+                    runner_identity(evidence.LANE_REFERENCE),
+                    machine=evidence_machine(evidence.LANE_REFERENCE),
+                )
+
+    def test_training_manifest_elapsed_is_bound_to_published_timing_run(self) -> None:
+        observations = raw_observations(evidence.LANE_REFERENCE)
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            write_evidence_artifacts(root, observations)
+            manifest_path = root / "training-manifest.json"
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            manifest["elapsedSeconds"] = 61.0
+            manifest_path.write_bytes(evidence.canonical_json_bytes(manifest) + b"\n")
+
+            with self.assertRaisesRegex(evidence.EvidenceError, "published timing run"):
+                evidence.produce_attestation(
+                    evidence_request(),
+                    observations,
+                    root,
+                    root / "attestation.json",
+                    self.key,
+                    evidence.LANE_REFERENCE,
+                    runner_identity(evidence.LANE_REFERENCE),
+                    machine=evidence_machine(evidence.LANE_REFERENCE),
+                )
+
+    def test_training_manifest_matches_requested_training_contract(self) -> None:
+        request = evidence_request(lane=evidence.LANE_CONSTRAINED)
+        observations = raw_observations(evidence.LANE_CONSTRAINED)
+        configuration = request["candidate_run_configuration"]
+        descriptor = {
+            "bytes": len(VALID_SPLAT_PLY.encode("utf-8")),
+            "sha256": "sha256:"
+            + hashlib.sha256(VALID_SPLAT_PLY.encode("utf-8")).hexdigest(),
+        }
+        cases = (
+            ("detailProfile", "balanced"),
+            ("iterationLimit", 7_000),
+            ("plateauWindow", 800),
+            ("deterministicSeed", 43),
+        )
+        for field, value in cases:
+            with self.subTest(field=field), tempfile.TemporaryDirectory() as directory:
+                manifest = training_manifest_for_observations(observations, configuration)
+                manifest[field] = value
+                path = Path(directory) / "training-manifest.json"
+                path.write_bytes(evidence.canonical_json_bytes(manifest) + b"\n")
+                with self.assertRaisesRegex(evidence.EvidenceError, "does not match request"):
+                    evidence._validate_training_manifest(
+                        path,
+                        descriptor,
+                        1,
+                        observations["pipeline_metrics"],
+                        configuration,
+                        60.0,
+                    )
+
+    def test_training_manifest_mirrors_swift_integer_and_resource_guards(self) -> None:
+        request = evidence_request(lane=evidence.LANE_REFERENCE)
+        observations = raw_observations(evidence.LANE_REFERENCE)
+        configuration = request["candidate_run_configuration"]
+        descriptor = {
+            "bytes": len(VALID_SPLAT_PLY.encode("utf-8")),
+            "sha256": "sha256:"
+            + hashlib.sha256(VALID_SPLAT_PLY.encode("utf-8")).hexdigest(),
+        }
+        cases = (
+            ("zero peak memory", {"peakMemoryBytes": 0}, "memory contract"),
+            ("zero memory budget", {"memoryBudgetBytes": 0}, "memory contract"),
+            ("zero output bytes", {"outputBytes": 0}, "output contract"),
+            ("zero Gaussian count", {"gaussianCount": 0}, "output contract"),
+            (
+                "fallback beyond completed iterations",
+                {"rasterFallbackCount": 7_001},
+                "fallback count",
+            ),
+            (
+                "growth beyond fallback count",
+                {"rasterExactBufferGrowthCount": 1},
+                "growth count",
+            ),
+            (
+                "allocation evidence without growth",
+                {"rasterExactBufferBytesAdded": 1},
+                "allocation evidence exceeds",
+            ),
+            (
+                "fallback without recovery evidence",
+                {"rasterFallbackCount": 1},
+                "fallback evidence",
+            ),
+            ("signed integer overflow", {"peakMemoryBytes": 1 << 63}, "nonnegative integer"),
+            ("seed overflow", {"deterministicSeed": 1 << 64}, "outside UInt64"),
+            (
+                "malformed exact duration",
+                {"rasterExactFallbackElapsedSeconds": "not-a-number"},
+                "finite and nonnegative",
+            ),
+            (
+                "malformed detail profile",
+                {"detailProfile": []},
+                "detail profile is invalid",
+            ),
+            (
+                "peak capacity overflow",
+                {"rasterPeakExactIntersectionCapacity": 1 << 32},
+                "exceeds UInt32",
+            ),
+            (
+                "allocation growth exceeds budget",
+                {
+                    "rasterFallbackCount": 1,
+                    "rasterExactFallbackElapsedSeconds": 0.1,
+                    "rasterExactBufferGrowthCount": 1,
+                    "rasterExactBufferBytesAdded": 8_589_934_593,
+                    "rasterReplayElapsedSeconds": 0.2,
+                    "rasterPeakExactIntersectionCapacity": 4_096,
+                },
+                "allocation evidence exceeds",
+            ),
+        )
+        for label, changes, expected in cases:
+            with self.subTest(label=label), tempfile.TemporaryDirectory() as directory:
+                manifest = training_manifest_for_observations(observations, configuration)
+                manifest.update(changes)
+                path = Path(directory) / "training-manifest.json"
+                path.write_bytes(evidence.canonical_json_bytes(manifest) + b"\n")
+                with self.assertRaisesRegex(evidence.EvidenceError, expected):
+                    evidence._validate_training_manifest(
+                        path,
+                        descriptor,
+                        1,
+                        observations["pipeline_metrics"],
+                        configuration,
+                        60.0,
                     )
 
     def test_timing_requires_warmup_alternation_and_declared_repetition_counts(self) -> None:
@@ -3380,6 +3698,37 @@ class EvidenceProtocolTests(unittest.TestCase):
                         evidence.LANE_REFERENCE,
                         runner_identity(evidence.LANE_REFERENCE),
                         machine=evidence_machine(evidence.LANE_REFERENCE),
+                    )
+
+    def test_published_training_duration_requires_candidate_end_to_end_run(self) -> None:
+        for label, predicate in (
+            ("baseline", lambda receipt: receipt["variant"] == "baseline"),
+            (
+                "discarded warm-up",
+                lambda receipt: receipt["variant"] == "candidate"
+                and receipt["run_id"] == "ordinary-0",
+            ),
+        ):
+            with self.subTest(label=label):
+                observations = raw_observations(evidence.LANE_REFERENCE)
+                published = next(
+                    receipt
+                    for receipt in observations["commands"]
+                    if receipt["published_output"]
+                )
+                published["published_output"] = False
+                wrong_run = next(
+                    receipt for receipt in observations["commands"] if predicate(receipt)
+                )
+                wrong_run["published_output"] = True
+
+                with self.assertRaisesRegex(
+                    evidence.EvidenceError,
+                    "candidate end-to-end run",
+                ):
+                    evidence._published_training_duration(
+                        observations["commands"],
+                        observations["timing"],
                     )
 
     def test_long_sequence_samples_are_bound_to_the_3000_frame_request(self) -> None:
@@ -4658,6 +5007,14 @@ class EvidenceProtocolTests(unittest.TestCase):
                 VALID_SPLAT_PLY,
                 encoding="utf-8",
             )
+            training_manifest = training_manifest_for_observations(
+                observations,
+                request["candidate_run_configuration"],
+            )
+            training_manifest["elapsedSeconds"] = 0.0005
+            (source / "training-manifest.json").write_bytes(
+                evidence.canonical_json_bytes(training_manifest) + b"\n"
+            )
             runner = root / "measurement-runner"
             runner.write_text(
                 "#!/usr/bin/env python3\n"
@@ -4670,7 +5027,8 @@ class EvidenceProtocolTests(unittest.TestCase):
                 "source=pathlib.Path(__file__).parent/'runner-source'\n"
                 "root=pathlib.Path(a.artifact_root)\n"
                 "shutil.copy2(source/'observations.json', root/'observations.json')\n"
-                "shutil.copy2(source/'splat.ply', root/'splat.ply')\n",
+                "shutil.copy2(source/'splat.ply', root/'splat.ply')\n"
+                "shutil.copy2(source/'training-manifest.json', root/'training-manifest.json')\n",
                 encoding="utf-8",
             )
             runner.chmod(0o755)

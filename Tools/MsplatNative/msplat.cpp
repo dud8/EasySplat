@@ -86,7 +86,7 @@ public:
     void emit(const std::string &event, json fields = json::object()) {
         if (!enabled()) return;
         fields["event"] = event;
-        fields["schema_version"] = 1;
+        fields["schema_version"] = 2;
         fields["sequence"] = ++sequence_;
         std::string record = fields.dump();
         record.push_back('\n');
@@ -394,6 +394,11 @@ struct TrainerCheckpointState {
     double elapsedSeconds = 0;
     std::uint64_t rasterFallbackCount = 0;
     std::uint64_t droppedIntersectionCount = 0;
+    double rasterExactFallbackElapsedSeconds = 0;
+    std::uint64_t rasterExactBufferGrowthCount = 0;
+    std::uint64_t rasterExactBufferBytesAdded = 0;
+    double rasterReplayElapsedSeconds = 0;
+    std::uint64_t rasterPeakExactIntersectionCapacity = 0;
 };
 
 struct CheckpointReceipt {
@@ -405,6 +410,33 @@ struct CheckpointReceipt {
 
 constexpr std::uintmax_t maximumCheckpointManifestBytes = 4 * 1024 * 1024;
 constexpr std::uintmax_t maximumCheckpointPayloadBytes = 32ULL * 1024 * 1024 * 1024;
+
+bool rasterRecoveryMetricsAreValid(
+    std::uint64_t fallbackCount,
+    double exactFallbackElapsedSeconds,
+    std::uint64_t exactBufferGrowthCount,
+    std::uint64_t exactBufferBytesAdded,
+    double replayElapsedSeconds,
+    std::uint64_t peakExactIntersectionCapacity,
+    std::uint64_t memoryBudgetBytes
+) {
+    if (!std::isfinite(exactFallbackElapsedSeconds) ||
+        !std::isfinite(replayElapsedSeconds) ||
+        exactFallbackElapsedSeconds < 0 || replayElapsedSeconds < 0 ||
+        exactBufferGrowthCount > fallbackCount || memoryBudgetBytes == 0 ||
+        peakExactIntersectionCapacity > std::numeric_limits<std::uint32_t>::max()) {
+        return false;
+    }
+    if (fallbackCount == 0) {
+        return exactFallbackElapsedSeconds == 0 && exactBufferGrowthCount == 0 &&
+            exactBufferBytesAdded == 0 && replayElapsedSeconds == 0 &&
+            peakExactIntersectionCapacity == 0;
+    }
+    return exactFallbackElapsedSeconds > 0 && exactBufferGrowthCount > 0 &&
+        exactBufferBytesAdded > 0 && replayElapsedSeconds > 0 &&
+        peakExactIntersectionCapacity > 2048 &&
+        1 + ((exactBufferBytesAdded - 1) / memoryBudgetBytes) <= exactBufferGrowthCount;
+}
 
 void throwSystemError(const std::string &operation, const fs::path &path);
 
@@ -1220,7 +1252,10 @@ std::set<std::string> checkpointManifestKeys() {
         "iteration", "iteration_limit", "last_improvement_iteration", "latest_loss",
         "latest_loss_iteration", "payload_bytes", "payload_file", "payload_schema",
         "memory_budget_bytes", "payload_sha256", "plateau_window", "profile",
-        "raster_fallback_count", "dropped_intersection_count", "schema_version", "seed",
+        "raster_exact_buffer_bytes_added", "raster_exact_buffer_growth_count",
+        "raster_exact_fallback_elapsed_seconds", "raster_fallback_count",
+        "raster_peak_exact_intersection_capacity", "raster_replay_elapsed_seconds",
+        "dropped_intersection_count", "schema_version", "seed",
         "trainer_build_digest", "trainer_version"
     };
 }
@@ -1253,7 +1288,7 @@ ValidatedCheckpoint validateCheckpointGeneration(
         actualKeys.insert(iterator.key());
     }
     if (actualKeys != checkpointManifestKeys()) {
-        throw std::runtime_error("checkpoint manifest keys do not match schema 2");
+        throw std::runtime_error("checkpoint manifest keys do not match schema 3");
     }
 
     const int schemaVersion = manifest.at("schema_version").get<int>();
@@ -1283,8 +1318,18 @@ ValidatedCheckpoint validateCheckpointGeneration(
         manifest.at("raster_fallback_count").get<std::uint64_t>();
     const std::uint64_t droppedIntersectionCount =
         manifest.at("dropped_intersection_count").get<std::uint64_t>();
+    const double rasterExactFallbackElapsedSeconds =
+        manifest.at("raster_exact_fallback_elapsed_seconds").get<double>();
+    const std::uint64_t rasterExactBufferGrowthCount =
+        manifest.at("raster_exact_buffer_growth_count").get<std::uint64_t>();
+    const std::uint64_t rasterExactBufferBytesAdded =
+        manifest.at("raster_exact_buffer_bytes_added").get<std::uint64_t>();
+    const double rasterReplayElapsedSeconds =
+        manifest.at("raster_replay_elapsed_seconds").get<double>();
+    const std::uint64_t rasterPeakExactIntersectionCapacity =
+        manifest.at("raster_peak_exact_intersection_capacity").get<std::uint64_t>();
 
-    if (schemaVersion != 2 || payloadSchema != 2 || !isLowercaseHex(trainerDigest) ||
+    if (schemaVersion != 3 || payloadSchema != 2 || !isLowercaseHex(trainerDigest) ||
         !isLowercaseHex(inputDigest) || !isLowercaseHex(geometryDigest) || cameraCount == 0 ||
         iteration < 0 || iteration >= iterationLimit || cameraDrawCount != iteration ||
         iterationLimit <= 0 || plateauWindow <= 0 ||
@@ -1297,7 +1342,17 @@ ValidatedCheckpoint validateCheckpointGeneration(
         rasterFallbackCount > std::min<std::uint64_t>(
             static_cast<std::uint64_t>(iteration),
             std::numeric_limits<std::uint32_t>::max()
-        ) || droppedIntersectionCount != 0) {
+        ) || droppedIntersectionCount != 0 ||
+        !rasterRecoveryMetricsAreValid(
+            rasterFallbackCount,
+            rasterExactFallbackElapsedSeconds,
+            rasterExactBufferGrowthCount,
+            rasterExactBufferBytesAdded,
+            rasterReplayElapsedSeconds,
+            rasterPeakExactIntersectionCapacity,
+            memoryBudgetBytes
+        ) || rasterExactFallbackElapsedSeconds > elapsedSeconds ||
+        rasterReplayElapsedSeconds > elapsedSeconds) {
         throw std::runtime_error("checkpoint manifest does not match this training run");
     }
 
@@ -1382,6 +1437,11 @@ ValidatedCheckpoint validateCheckpointGeneration(
             elapsedSeconds,
             rasterFallbackCount,
             droppedIntersectionCount,
+            rasterExactFallbackElapsedSeconds,
+            rasterExactBufferGrowthCount,
+            rasterExactBufferBytesAdded,
+            rasterReplayElapsedSeconds,
+            rasterPeakExactIntersectionCapacity,
         },
         gaussianCount,
         backingCapacity,
@@ -1445,9 +1505,14 @@ std::string checkpointManifestText(
         {"payload_sha256", payloadDigest},
         {"plateau_window", context.profile.plateauWindow},
         {"profile", context.profile.name},
+        {"raster_exact_buffer_bytes_added", state.rasterExactBufferBytesAdded},
+        {"raster_exact_buffer_growth_count", state.rasterExactBufferGrowthCount},
+        {"raster_exact_fallback_elapsed_seconds", state.rasterExactFallbackElapsedSeconds},
         {"raster_fallback_count", state.rasterFallbackCount},
+        {"raster_peak_exact_intersection_capacity", state.rasterPeakExactIntersectionCapacity},
+        {"raster_replay_elapsed_seconds", state.rasterReplayElapsedSeconds},
         {"dropped_intersection_count", state.droppedIntersectionCount},
-        {"schema_version", 2},
+        {"schema_version", 3},
         {"seed", context.seed},
         {"trainer_build_digest", context.trainerBuildDigest},
         {"trainer_version", APP_VERSION},
@@ -1474,7 +1539,17 @@ CheckpointReceipt saveCheckpoint(
         state.rasterFallbackCount > std::min<std::uint64_t>(
             static_cast<std::uint64_t>(state.iteration),
             std::numeric_limits<std::uint32_t>::max()
-        ) || state.droppedIntersectionCount != 0) {
+        ) || state.droppedIntersectionCount != 0 ||
+        !rasterRecoveryMetricsAreValid(
+            state.rasterFallbackCount,
+            state.rasterExactFallbackElapsedSeconds,
+            state.rasterExactBufferGrowthCount,
+            state.rasterExactBufferBytesAdded,
+            state.rasterReplayElapsedSeconds,
+            state.rasterPeakExactIntersectionCapacity,
+            context.memoryBudgetBytes
+        ) || state.rasterExactFallbackElapsedSeconds > state.elapsedSeconds ||
+        state.rasterReplayElapsedSeconds > state.elapsedSeconds) {
         throw std::runtime_error("cannot save inconsistent trainer checkpoint state");
     }
     if ((state.latestLoss.has_value() &&
@@ -1756,7 +1831,7 @@ int main(int argc, char *argv[]) {
     );
     app.add_option("--resume", resumePath, "Validated optimizer-checkpoint directory");
     CLI::Option *eventsOption = app.add_option(
-        "--events-fd", eventsFileDescriptor, "Descriptor for schema-v1 JSONL events"
+        "--events-fd", eventsFileDescriptor, "Descriptor for schema-v2 JSONL events"
     );
     eventsOption->check(CLI::Range(0, std::numeric_limits<int>::max()));
     app.add_flag("--self-check", selfCheck, "Initialize Metal and load the adjacent metallib");
@@ -1916,6 +1991,11 @@ int main(int argc, char *argv[]) {
         int completedIteration = 0;
         double priorElapsedSeconds = 0;
         std::uint64_t restoredRasterFallbackCount = 0;
+        double restoredRasterExactFallbackElapsedSeconds = 0;
+        std::uint64_t restoredRasterExactBufferGrowthCount = 0;
+        std::uint64_t restoredRasterExactBufferBytesAdded = 0;
+        std::uint64_t restoredRasterPeakExactIntersectionCapacity = 0;
+        double rasterReplayElapsedSeconds = 0;
         std::optional<CheckpointReceipt> lastCheckpoint;
         const bool resumed = !resumePath.empty();
 
@@ -1964,7 +2044,22 @@ int main(int argc, char *argv[]) {
             latestLossIteration = checkpoint.trainerState.latestLossIteration;
             priorElapsedSeconds = checkpoint.trainerState.elapsedSeconds;
             restoredRasterFallbackCount = checkpoint.trainerState.rasterFallbackCount;
-            msplat_set_raster_fallback_count(restoredRasterFallbackCount);
+            restoredRasterExactFallbackElapsedSeconds =
+                checkpoint.trainerState.rasterExactFallbackElapsedSeconds;
+            restoredRasterExactBufferGrowthCount =
+                checkpoint.trainerState.rasterExactBufferGrowthCount;
+            restoredRasterExactBufferBytesAdded =
+                checkpoint.trainerState.rasterExactBufferBytesAdded;
+            restoredRasterPeakExactIntersectionCapacity =
+                checkpoint.trainerState.rasterPeakExactIntersectionCapacity;
+            rasterReplayElapsedSeconds = checkpoint.trainerState.rasterReplayElapsedSeconds;
+            msplat_restore_raster_metrics(
+                restoredRasterFallbackCount,
+                restoredRasterExactFallbackElapsedSeconds,
+                restoredRasterExactBufferGrowthCount,
+                restoredRasterExactBufferBytesAdded,
+                restoredRasterPeakExactIntersectionCapacity
+            );
             lastCheckpoint = checkpoint.receipt;
             for (int draw = 0; draw < completedIteration / cameraReuseCount; ++draw) {
                 (void)camsIter.next();
@@ -1973,6 +2068,15 @@ int main(int argc, char *argv[]) {
         const int startingIteration = completedIteration;
         std::uint64_t lastReportedFallbackCount = restoredRasterFallbackCount;
         std::uint64_t durableRasterFallbackCount = restoredRasterFallbackCount;
+        double durableRasterExactFallbackElapsedSeconds =
+            restoredRasterExactFallbackElapsedSeconds;
+        std::uint64_t durableRasterExactBufferGrowthCount =
+            restoredRasterExactBufferGrowthCount;
+        std::uint64_t durableRasterExactBufferBytesAdded =
+            restoredRasterExactBufferBytesAdded;
+        double durableRasterReplayElapsedSeconds = rasterReplayElapsedSeconds;
+        std::uint64_t durableRasterPeakExactIntersectionCapacity =
+            restoredRasterPeakExactIntersectionCapacity;
 
         auto checkedRasterStats = [&]() {
             const MsplatRasterStats stats = msplat_get_raster_stats();
@@ -1997,6 +2101,13 @@ int main(int argc, char *argv[]) {
                     {"fallback_count", stats.fallback_count},
                     {"intersection_count", stats.latest_intersection_count},
                     {"iteration", iteration},
+                    {"raster_exact_buffer_bytes_added", stats.exact_buffer_bytes_added},
+                    {"raster_exact_buffer_growth_count", stats.exact_buffer_growth_count},
+                    {"raster_exact_fallback_elapsed_seconds",
+                     stats.exact_fallback_elapsed_seconds},
+                    {"raster_peak_exact_intersection_capacity",
+                     stats.peak_exact_intersection_capacity},
+                    {"raster_replay_elapsed_seconds", rasterReplayElapsedSeconds},
                 });
                 lastReportedFallbackCount = stats.fallback_count;
             }
@@ -2016,7 +2127,14 @@ int main(int argc, char *argv[]) {
                 {"memory_budget_bytes", memoryBudgetBytes},
                 {"peak_memory_bytes", peakResidentMemoryBytes()},
                 {"profile", profile.name},
+                {"raster_exact_buffer_bytes_added", stats.exact_buffer_bytes_added},
+                {"raster_exact_buffer_growth_count", stats.exact_buffer_growth_count},
+                {"raster_exact_fallback_elapsed_seconds",
+                 stats.exact_fallback_elapsed_seconds},
                 {"raster_fallback_count", stats.fallback_count},
+                {"raster_peak_exact_intersection_capacity",
+                 stats.peak_exact_intersection_capacity},
+                {"raster_replay_elapsed_seconds", rasterReplayElapsedSeconds},
                 {"dropped_intersection_count", stats.dropped_intersection_count},
                 {"seed", seed},
                 {"trainer_build_digest", trainerBuildDigest},
@@ -2025,7 +2143,7 @@ int main(int argc, char *argv[]) {
         };
 
         events->emit("started", {{"camera_count", cameras.size()},
-                                {"checkpoint_schema", 2},
+                                {"checkpoint_schema", 3},
                                 {"geometry_digest", identity.geometryDigest},
                                 {"initial_gaussian_count", model.num_active},
                                 {"input_digest", identity.inputDigest},
@@ -2035,7 +2153,16 @@ int main(int argc, char *argv[]) {
                                 {"payload_schema", 2},
                                 {"plateau_window", profile.plateauWindow},
                                 {"profile", profile.name},
+                                {"raster_exact_buffer_bytes_added",
+                                 restoredRasterExactBufferBytesAdded},
+                                {"raster_exact_buffer_growth_count",
+                                 restoredRasterExactBufferGrowthCount},
+                                {"raster_exact_fallback_elapsed_seconds",
+                                 restoredRasterExactFallbackElapsedSeconds},
                                 {"raster_fallback_count", restoredRasterFallbackCount},
+                                {"raster_peak_exact_intersection_capacity",
+                                 restoredRasterPeakExactIntersectionCapacity},
+                                {"raster_replay_elapsed_seconds", rasterReplayElapsedSeconds},
                                 {"dropped_intersection_count", 0},
                                 {"resumed", resumed},
                                 {"seed", seed},
@@ -2053,6 +2180,11 @@ int main(int argc, char *argv[]) {
                     warmupLength,
                     bestCameraLosses,
                     std::nullopt,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
                     0,
                     0,
                     0,
@@ -2084,7 +2216,14 @@ int main(int argc, char *argv[]) {
                 {"input_digest", identity.inputDigest},
                 {"iteration", completedIteration},
                 {"memory_budget_bytes", memoryBudgetBytes},
+                {"raster_exact_buffer_bytes_added", durableRasterExactBufferBytesAdded},
+                {"raster_exact_buffer_growth_count", durableRasterExactBufferGrowthCount},
+                {"raster_exact_fallback_elapsed_seconds",
+                 durableRasterExactFallbackElapsedSeconds},
                 {"raster_fallback_count", durableRasterFallbackCount},
+                {"raster_peak_exact_intersection_capacity",
+                 durableRasterPeakExactIntersectionCapacity},
+                {"raster_replay_elapsed_seconds", durableRasterReplayElapsedSeconds},
                 {"dropped_intersection_count", 0},
             });
             return true;
@@ -2159,6 +2298,7 @@ int main(int argc, char *argv[]) {
         auto synchronizeWindow = [&](int windowEnd) {
             int attemptEnd = windowEnd;
             bool cancellationObserved = false;
+            std::optional<std::chrono::steady_clock::time_point> replayStartedAt;
             while (true) {
                 msplat_gpu_sync_for_raster_replay();
                 const MsplatRasterStats stats = msplat_get_raster_stats();
@@ -2168,6 +2308,11 @@ int main(int argc, char *argv[]) {
                     );
                 }
                 if (!stats.capacity_exceeded) {
+                    if (replayStartedAt) {
+                        rasterReplayElapsedSeconds += std::chrono::duration<double>(
+                            std::chrono::steady_clock::now() - *replayStartedAt
+                        ).count();
+                    }
                     completedIteration = attemptEnd;
                     terminalIteration = attemptEnd;
                     return !cancellationObserved && attemptEnd == windowEnd;
@@ -2182,6 +2327,7 @@ int main(int argc, char *argv[]) {
 
                 const int firstOverflow = static_cast<int>(stats.first_overflow_iteration);
                 const int successfulPrefix = firstOverflow - 1;
+                if (!replayStartedAt) replayStartedAt = std::chrono::steady_clock::now();
                 rewindTrainingState(successfulPrefix);
                 if (cancellationSignal != 0 || cancellationObserved) {
                     return false;
@@ -2321,9 +2467,21 @@ int main(int argc, char *argv[]) {
                         cumulativeElapsed(),
                         stats.fallback_count,
                         stats.dropped_intersection_count,
+                        stats.exact_fallback_elapsed_seconds,
+                        stats.exact_buffer_growth_count,
+                        stats.exact_buffer_bytes_added,
+                        rasterReplayElapsedSeconds,
+                        stats.peak_exact_intersection_capacity,
                     }
                 );
                 durableRasterFallbackCount = stats.fallback_count;
+                durableRasterExactFallbackElapsedSeconds =
+                    stats.exact_fallback_elapsed_seconds;
+                durableRasterExactBufferGrowthCount = stats.exact_buffer_growth_count;
+                durableRasterExactBufferBytesAdded = stats.exact_buffer_bytes_added;
+                durableRasterReplayElapsedSeconds = rasterReplayElapsedSeconds;
+                durableRasterPeakExactIntersectionCapacity =
+                    stats.peak_exact_intersection_capacity;
                 emitCheckpoint("checkpoint_completed", *lastCheckpoint);
                 if (handleCancellation()) return 130;
             }
@@ -2352,7 +2510,16 @@ int main(int argc, char *argv[]) {
                           {"peak_memory_bytes", peakResidentMemoryBytes()},
                           {"plateau_window", profile.plateauWindow},
                           {"profile", profile.name},
+                          {"raster_exact_buffer_bytes_added",
+                           finalRasterStats.exact_buffer_bytes_added},
+                          {"raster_exact_buffer_growth_count",
+                           finalRasterStats.exact_buffer_growth_count},
+                          {"raster_exact_fallback_elapsed_seconds",
+                           finalRasterStats.exact_fallback_elapsed_seconds},
                           {"raster_fallback_count", finalRasterStats.fallback_count},
+                          {"raster_peak_exact_intersection_capacity",
+                           finalRasterStats.peak_exact_intersection_capacity},
+                          {"raster_replay_elapsed_seconds", rasterReplayElapsedSeconds},
                           {"dropped_intersection_count",
                            finalRasterStats.dropped_intersection_count},
                           {"scene_center", sceneBounds.center},
