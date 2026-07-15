@@ -195,8 +195,10 @@ final class ToolchainManagerTests: XCTestCase {
     func testValidateToolchainRequiresPatchProvenance() throws {
         for key in [
             "checkpoint_patch_sha256",
+            "exact_raster_patch_sha256",
             "numeric_stability_patch_sha256",
             "metal_safety_patch_sha256",
+            "raster_test_sha256",
         ] {
             for mutation in ["missing", "malformed"] {
                 let root = try TestFileBuilder.makeTempDir()
@@ -250,6 +252,8 @@ final class ToolchainManagerTests: XCTestCase {
     func testValidateToolchainRejectsMalformedMsplatSelfCheckEvents() throws {
         let invalidOutputs = [
             "not json\n",
+            "{\"event\":\"self_check\",\"schema_version\":1,\"sequence\":1,\"status\":\"ok\",\"version\":\"1.1.3 (git 106499b)\"}\n",
+            "{\"event\":\"self_check\",\"scene_bounds_status\":\"failed\",\"schema_version\":1,\"sequence\":1,\"status\":\"ok\",\"version\":\"1.1.3 (git 106499b)\"}\n",
             "{\"event\":\"self_check\",\"schema_version\":1,\"sequence\":1,\"status\":\"ok\",\"version\":\"1.1.3 (git 106499b)\"}\n{\"event\":\"self_check\"}\n",
             "{\"event\":\"self_check\",\"schema_version\":1,\"sequence\":2,\"status\":\"ok\",\"version\":\"1.1.3 (git 106499b)\"}\n",
             "{\"event\":\"self_check\",\"schema_version\":1,\"sequence\":1,\"status\":\"ok\",\"version\":\"1.1.3\"}\n",
@@ -743,7 +747,7 @@ final class ToolchainManagerTests: XCTestCase {
         mapperStderr: String = "",
         da3HelpExitCode: Int32 = 0,
         msplatSelfCheckExitCode: Int32 = 0,
-        msplatSelfCheckStdout: String = "{\"event\":\"self_check\",\"schema_version\":1,\"sequence\":1,\"status\":\"ok\",\"version\":\"1.1.3 (git 106499b)\"}\n"
+        msplatSelfCheckStdout: String = "{\"event\":\"self_check\",\"scene_bounds_status\":\"ok\",\"schema_version\":1,\"sequence\":1,\"status\":\"ok\",\"version\":\"1.1.3 (git 106499b)\"}\n"
     ) -> MockSubprocessRunner {
         MockSubprocessRunner(scripts: [
             .init(path: "/usr/bin/file", argsPrefix: ["-b", root.appendingPathComponent("bin/colmap").path], result: .init(exitCode: 0, terminationReason: .exit, stdout: colmapArch, stderr: ""), onRun: nil),

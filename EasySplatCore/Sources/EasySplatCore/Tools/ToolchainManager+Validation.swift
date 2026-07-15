@@ -314,10 +314,12 @@ extension ToolchainManager {
             "source_version",
             "source_tree_sha256",
             "overlay_sha256",
+            "raster_test_sha256",
             "patch_sha256",
             "checkpoint_patch_sha256",
             "numeric_stability_patch_sha256",
             "metal_safety_patch_sha256",
+            "exact_raster_patch_sha256",
             "dependencies",
             "executable_sha256",
             "metallib_sha256",
@@ -371,10 +373,12 @@ extension ToolchainManager {
         let hashKeys = [
             "source_tree_sha256",
             "overlay_sha256",
+            "raster_test_sha256",
             "patch_sha256",
             "checkpoint_patch_sha256",
             "numeric_stability_patch_sha256",
             "metal_safety_patch_sha256",
+            "exact_raster_patch_sha256",
             "executable_sha256",
             "metallib_sha256",
         ]
@@ -404,6 +408,7 @@ extension ToolchainManager {
             "-DCMAKE_OSX_ARCHITECTURES=arm64",
             "-DCMAKE_OSX_DEPLOYMENT_TARGET=15.0",
             "-DMSPLAT_BUILD_PYTHON=OFF",
+            "-DMSPLAT_BUILD_RASTER_TESTS=ON",
             "-DFETCHCONTENT_FULLY_DISCONNECTED=ON",
             "FETCHCONTENT_SOURCE_DIR_NLOHMANN_JSON=verified-v3.11.3",
             "FETCHCONTENT_SOURCE_DIR_NANOFLANN=verified-v1.5.5",
@@ -448,9 +453,17 @@ extension ToolchainManager {
               let event = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
             throw ToolchainError.invalidToolchain("easysplat-train self-check did not emit exactly one JSONL event.")
         }
-        let expectedKeys = Set(["event", "schema_version", "sequence", "status", "version"])
+        let expectedKeys = Set([
+            "event",
+            "scene_bounds_status",
+            "schema_version",
+            "sequence",
+            "status",
+            "version",
+        ])
         guard Set(event.keys) == expectedKeys,
               event["event"] as? String == "self_check",
+              event["scene_bounds_status"] as? String == "ok",
               event["schema_version"] as? Int == 1,
               event["sequence"] as? Int == 1,
               event["status"] as? String == "ok",
