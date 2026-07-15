@@ -1,29 +1,19 @@
 import Foundation
 
 extension PipelineRunner {
-    func persistMeasuredGeometryArtifact(
-        metadata: inout ProjectMetadata,
-        paths: ProjectPaths,
-        resolvedPlan: ResolvedRunPlan,
-        mapper: String,
-        acceptedDa3ModelSubdirectory: String?,
+    func validatedGeometryMeasurement(
+        modelDirectory: URL,
         selectedFrames: [URL],
-        selectedFrameManifest: [SelectedFrameMapping],
-        peakMemoryBytes: Int64,
-        pairGraph: PairGraphArtifact,
-        acceptedReconstructionSummary: ReconstructionSummary?,
-        currentMappingDurationSeconds: () -> TimeInterval?
-    ) throws {
-        let modelDirectory = paths.colmapSparseURL.appendingPathComponent("0", isDirectory: true)
-        // The artifact contract uses COLMAP's text form so residuals remain inspectable
-        // and model files remain hashable across trainer versions.
-        _ = try ensureTextSparseModelFiles(at: modelDirectory)
-        let sourceSnapshot = try GeometryModelSnapshot.capture(in: modelDirectory)
-        let sourceModelHashes = sourceSnapshot.modelHashes
+        requireStrongObservationCoverage: Bool
+    ) throws -> (
+        residuals: ColmapResidualAnalyzer.Result,
+        snapshot: GeometryModelSnapshot.Verified
+    ) {
+        let snapshot = try GeometryModelSnapshot.capture(in: modelDirectory)
         let residuals: ColmapResidualAnalyzer.Result
         do {
             residuals = try ColmapResidualAnalyzer.analyze(modelDirectory: modelDirectory)
-            try GeometryModelSnapshot.validate(sourceSnapshot, at: modelDirectory)
+            try GeometryModelSnapshot.validate(snapshot, at: modelDirectory)
         } catch {
             throw PipelineError.geometryResidualsUnavailable(error.localizedDescription)
         }
@@ -46,7 +36,7 @@ extension PipelineRunner {
                 total: selectedFrames.count
             )
         }
-        if acceptedDa3ModelSubdirectory != nil {
+        if requireStrongObservationCoverage {
             let stronglyMeasuredViews = residuals.observationCountByImage.values.filter {
                 $0 >= GeometryArtifactStore.minimumLearnedObservationsPerView
             }.count
@@ -64,6 +54,34 @@ extension PipelineRunner {
                 p90: residuals.p90PixelResidual
             )
         }
+        return (residuals, snapshot)
+    }
+
+    func persistMeasuredGeometryArtifact(
+        metadata: inout ProjectMetadata,
+        paths: ProjectPaths,
+        resolvedPlan: ResolvedRunPlan,
+        mapper: String,
+        acceptedDa3ModelSubdirectory: String?,
+        selectedFrames: [URL],
+        selectedFrameManifest: [SelectedFrameMapping],
+        peakMemoryBytes: Int64,
+        pairGraph: PairGraphArtifact,
+        acceptedReconstructionSummary: ReconstructionSummary?,
+        currentMappingDurationSeconds: () -> TimeInterval?
+    ) throws {
+        let modelDirectory = paths.colmapSparseURL.appendingPathComponent("0", isDirectory: true)
+        // The artifact contract uses COLMAP's text form so residuals remain inspectable
+        // and model files remain hashable across trainer versions.
+        _ = try ensureTextSparseModelFiles(at: modelDirectory)
+        let measurement = try validatedGeometryMeasurement(
+            modelDirectory: modelDirectory,
+            selectedFrames: selectedFrames,
+            requireStrongObservationCoverage: acceptedDa3ModelSubdirectory != nil
+        )
+        let sourceSnapshot = measurement.snapshot
+        let sourceModelHashes = sourceSnapshot.modelHashes
+        let residuals = measurement.residuals
 
         let orderedFrames = selectedFrames.sorted { $0.lastPathComponent < $1.lastPathComponent }
         let mappingByName = Dictionary(

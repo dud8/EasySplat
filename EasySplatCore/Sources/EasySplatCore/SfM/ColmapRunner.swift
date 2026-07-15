@@ -37,6 +37,10 @@ public enum ColmapMapperOptionsValidationError: Error, LocalizedError, Equatable
     }
 }
 
+enum ColmapMappingPolicy {
+    static let minimumPairInlierCount = 15
+}
+
 /// Fixed incremental-mapper policy passed across the native COLMAP process boundary.
 public struct ColmapMapperOptions: Sendable, Equatable {
     public let globalFramesRatio: Double
@@ -393,6 +397,7 @@ public final class ColmapRunner {
             "--Mapper.ba_global_max_refinements", "\(mapperOptions.globalMaxRefinements)",
             "--Mapper.ba_global_max_num_iterations", "\(mapperOptions.globalMaxNumIterations)",
             "--Mapper.random_seed", "\(mapperOptions.randomSeed)",
+            "--Mapper.min_num_matches", "\(ColmapMappingPolicy.minimumPairInlierCount)",
             "--Mapper.ba_refine_focal_length", mapperOptions.refineFocalLength ? "1" : "0",
         ]
         onLog("EasySplat: colmap argv: \(colmapPath.path) \(args.joined(separator: " "))", false)

@@ -107,6 +107,49 @@ final class ColmapPairEstimatorTests: XCTestCase {
         XCTAssertEqual(retrieved.retrievalPairCount, 1)
     }
 
+    func testPersistedPairPlanRestoresCanonicalSchedule() throws {
+        let source = try ColmapPairPlan.exhaustive(
+            imageNames: ["a.jpg", "b.jpg", "c.jpg", "d.jpg"]
+        )
+
+        let restored = try ColmapPairPlan.persisted(
+            imageNames: source.imageNames,
+            scheduledPairs: source.pairs
+        )
+
+        XCTAssertEqual(restored, source)
+        XCTAssertTrue(restored.validates(restored.serializedData))
+    }
+
+    func testPersistedPairPlanRejectsNoncanonicalOrInvalidSchedule() throws {
+        let source = try ColmapPairPlan.exhaustive(
+            imageNames: ["a.jpg", "b.jpg", "c.jpg", "d.jpg"]
+        )
+        var reversedPair = source.pairs
+        reversedPair[0] = ColmapScheduledPair(
+            reversedPair[0].secondImageName,
+            reversedPair[0].firstImageName,
+            role: reversedPair[0].role
+        )
+        var unknownPair = source.pairs
+        unknownPair[0] = ColmapScheduledPair("a.jpg", "unknown.jpg", role: .retrieval)
+        let invalidSchedules = [
+            Array(source.pairs.reversed()),
+            reversedPair,
+            unknownPair,
+            source.pairs + [source.pairs[0]],
+        ]
+
+        for scheduledPairs in invalidSchedules {
+            XCTAssertThrowsError(try ColmapPairPlan.persisted(
+                imageNames: source.imageNames,
+                scheduledPairs: scheduledPairs
+            )) {
+                XCTAssertEqual($0 as? ColmapPairPlanningError, .invalidPairPlan)
+            }
+        }
+    }
+
     func testConnectivityRejectsSchedulesThatCannotPossiblyJoinAllViews() throws {
         let names = ["a0.jpg", "a1.jpg", "b0.jpg", "b1.jpg"]
         let segmented = try ColmapPairPlan.temporal(
@@ -124,6 +167,193 @@ final class ColmapPairEstimatorTests: XCTestCase {
             pairingPolicy: .segmentedMixed
         )
         XCTAssertTrue(joined.isConnected)
+    }
+
+    func testTargetedExactRecoveryMatchesMeasuredFiftyNinePlusOneSchedule() throws {
+        let names = (0..<60).map { String(format: "photo_%03d.jpg", $0) }
+        let source = try ColmapPairPlan.exhaustive(imageNames: names)
+        let verified = Array(source.pairs.filter {
+            $0.firstImageName != names[59] && $0.secondImageName != names[59]
+        }.prefix(230))
+        let graph = ColmapVerifiedGraphSnapshot(
+            verifiedPairs: verified,
+            components: [Array(names[0..<59]), [names[59]]]
+        )
+
+        let recovery = try source.targetedExactRecovery(verifiedGraph: graph)
+
+        XCTAssertEqual(source.pairs.count, 1_770)
+        XCTAssertEqual(recovery.pairs.count, 289)
+        XCTAssertEqual(recovery.retrievalPairCount, 289)
+        XCTAssertEqual(recovery.localPairCount, 0)
+        XCTAssertEqual(recovery.loopRevisitPairCount, 0)
+        XCTAssertTrue(recovery.isConnected)
+        XCTAssertTrue(Set(verified).isSubset(of: Set(recovery.pairs)))
+        XCTAssertEqual(
+            recovery.pairs.filter {
+                $0.firstImageName == names[59] || $0.secondImageName == names[59]
+            }.count,
+            59
+        )
+    }
+
+    func testTargetedExactRecoveryUsesVerifiedAndCrossComponentEdgesOnly() throws {
+        let names = (0..<7).map { "image_\($0).jpg" }
+        let source = try ColmapPairPlan.exhaustive(imageNames: names)
+        let graph = ColmapVerifiedGraphSnapshot(
+            verifiedPairs: [
+                scheduledPair(source, names[0], names[1]),
+                scheduledPair(source, names[1], names[2]),
+                scheduledPair(source, names[3], names[4]),
+                scheduledPair(source, names[5], names[6]),
+            ],
+            components: [
+                Array(names[0...2]),
+                Array(names[3...4]),
+                Array(names[5...6]),
+            ]
+        )
+
+        let recovery = try source.targetedExactRecovery(verifiedGraph: graph)
+
+        XCTAssertTrue(recovery.isConnected)
+        XCTAssertFalse(recovery.pairs.contains(scheduledPair(source, names[0], names[2])))
+        XCTAssertTrue(recovery.pairs.contains(scheduledPair(source, names[2], names[3])))
+        XCTAssertEqual(recovery.pairs.count, 20)
+    }
+
+    func testTargetedExactRecoveryPreservesSourcePairRoles() throws {
+        let names = (0..<4).map { "image_\($0).jpg" }
+        let temporal = try ColmapPairPlan.temporal(
+            groups: [ColmapPairGroup(imageNames: names, isVideo: true)],
+            offsets: [1]
+        )
+        let source = try temporal.addingRetrievalPairLines(
+            ["\(names[0]) \(names[2])", "\(names[0]) \(names[3])"],
+            pairingPolicy: .segmentedMixed
+        )
+        let recovery = try source.targetedExactRecovery(verifiedGraph: .init(
+            verifiedPairs: [
+                scheduledPair(source, names[0], names[1]),
+                scheduledPair(source, names[1], names[2]),
+            ],
+            components: [Array(names[0...2]), [names[3]]]
+        ))
+
+        XCTAssertEqual(recovery.localPairCount, 3)
+        XCTAssertEqual(recovery.retrievalPairCount, 1)
+        XCTAssertEqual(recovery.loopRevisitPairCount, 0)
+        XCTAssertFalse(recovery.pairs.contains(scheduledPair(source, names[0], names[2])))
+        XCTAssertTrue(recovery.pairs.contains(scheduledPair(source, names[0], names[3])))
+    }
+
+    func testTargetedExactRecoveryIsDeterministicAcrossEvidencePermutation() throws {
+        let names = (0..<6).map { "image_\($0).jpg" }
+        let source = try ColmapPairPlan.exhaustive(imageNames: names)
+        let verified = [
+            scheduledPair(source, names[0], names[1]),
+            scheduledPair(source, names[1], names[2]),
+            scheduledPair(source, names[3], names[4]),
+            scheduledPair(source, names[4], names[5]),
+        ]
+        let first = try source.targetedExactRecovery(verifiedGraph: .init(
+            verifiedPairs: verified,
+            components: [Array(names[0...2]), Array(names[3...5])]
+        ))
+        let second = try source.targetedExactRecovery(verifiedGraph: .init(
+            verifiedPairs: verified.reversed(),
+            components: [Array(names[3...5].reversed()), Array(names[0...2].reversed())]
+        ))
+
+        XCTAssertEqual(first, second)
+        XCTAssertEqual(first.pairs.count, 13)
+    }
+
+    func testTargetedExactRecoveryRejectsInvalidGraphEvidence() throws {
+        let names = (0..<5).map { "image_\($0).jpg" }
+        let source = try ColmapPairPlan.exhaustive(imageNames: names)
+        let edge = scheduledPair(source, names[0], names[1])
+        let cases: [ColmapVerifiedGraphSnapshot] = [
+            .init(verifiedPairs: [edge], components: [[names[0], names[1]], [names[2], names[3]]]),
+            .init(verifiedPairs: [edge], components: [[names[0], names[1]], [names[1], names[2]], [names[3], names[4]]]),
+            .init(verifiedPairs: [edge], components: [[names[0]], Array(names[1...4])]),
+            .init(
+                verifiedPairs: [ColmapScheduledPair(names[0], "unknown.jpg", role: .retrieval)],
+                components: [names]
+            ),
+            .init(verifiedPairs: [edge, edge], components: [names]),
+            .init(
+                verifiedPairs: [ColmapScheduledPair(names[0], names[1], role: .local)],
+                components: [names]
+            ),
+            .init(verifiedPairs: [edge], components: [names]),
+        ]
+
+        for graph in cases {
+            XCTAssertThrowsError(try source.targetedExactRecovery(verifiedGraph: graph)) {
+                XCTAssertEqual($0 as? ColmapPairPlanningError, .invalidPairPlan)
+            }
+        }
+    }
+
+    func testTargetedExactRecoveryRejectsVerifiedEdgeOutsideSourceSchedule() throws {
+        let names = (0..<4).map { "image_\($0).jpg" }
+        let source = try ColmapPairPlan.temporal(
+            groups: [ColmapPairGroup(imageNames: names, isVideo: true)],
+            offsets: [1]
+        )
+        let graph = ColmapVerifiedGraphSnapshot(
+            verifiedPairs: [
+                ColmapScheduledPair(names[0], names[2], role: .local),
+                scheduledPair(source, names[2], names[3]),
+            ],
+            components: [[names[0], names[2], names[3]], [names[1]]]
+        )
+
+        XCTAssertThrowsError(try source.targetedExactRecovery(verifiedGraph: graph)) {
+            XCTAssertEqual($0 as? ColmapPairPlanningError, .invalidPairPlan)
+        }
+    }
+
+    func testTargetedExactRecoverySupportsTwoHundredFiftyViewCrossComponentSchedule() throws {
+        let names = (0..<250).map { String(format: "photo_%03d.jpg", $0) }
+        let source = try ColmapPairPlan.exhaustive(imageNames: names)
+        let firstChain = (0..<124).map {
+            ColmapScheduledPair(names[$0], names[$0 + 1], role: .retrieval)
+        }
+        let secondChain = (125..<249).map {
+            ColmapScheduledPair(names[$0], names[$0 + 1], role: .retrieval)
+        }
+        let recovery = try source.targetedExactRecovery(verifiedGraph: .init(
+            verifiedPairs: firstChain + secondChain,
+            components: [Array(names[0..<125]), Array(names[125..<250])]
+        ))
+
+        XCTAssertEqual(source.pairs.count, 31_125)
+        XCTAssertEqual(recovery.pairs.count, 15_873)
+        XCTAssertLessThanOrEqual(recovery.pairs.count, source.pairs.count)
+        XCTAssertTrue(recovery.isConnected)
+    }
+
+    func testTargetedExactRecoveryHonorsTaskCancellation() async throws {
+        let names = (0..<250).map { String(format: "photo_%03d.jpg", $0) }
+        let source = try ColmapPairPlan.exhaustive(imageNames: names)
+        let graph = ColmapVerifiedGraphSnapshot(
+            verifiedPairs: [],
+            components: names.map { [$0] }
+        )
+        let task = Task<ColmapPairPlan, Error> {
+            withUnsafeCurrentTask { $0?.cancel() }
+            return try source.targetedExactRecovery(verifiedGraph: graph)
+        }
+
+        do {
+            _ = try await task.value
+            XCTFail("Cancelled targeted recovery planning must stop.")
+        } catch is CancellationError {
+        } catch {
+            XCTFail("Unexpected error: \(error)")
+        }
     }
 
     func testDa3RefinementPairPlanUnionsLoopsAndBindsSerializedDigest() throws {
@@ -193,6 +423,16 @@ final class ColmapPairEstimatorTests: XCTestCase {
         )) { error in
             XCTAssertEqual(error as? ColmapPairPlanningError, .pairLimitExceeded)
         }
+    }
+
+    private func scheduledPair(
+        _ plan: ColmapPairPlan,
+        _ first: String,
+        _ second: String
+    ) -> ColmapScheduledPair {
+        plan.pairs.first {
+            Set([$0.firstImageName, $0.secondImageName]) == Set([first, second])
+        }!
     }
 }
 #endif

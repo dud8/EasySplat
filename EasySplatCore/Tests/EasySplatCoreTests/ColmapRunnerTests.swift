@@ -19,6 +19,7 @@ final class ColmapRunnerTests: XCTestCase {
                     XCTAssertEqual(self.value(for: "--Mapper.ba_global_points_ratio", in: args), "1.4")
                     XCTAssertEqual(self.value(for: "--Mapper.ba_global_max_refinements", in: args), "5")
                     XCTAssertEqual(self.value(for: "--Mapper.random_seed", in: args), "42")
+                    XCTAssertEqual(self.value(for: "--Mapper.min_num_matches", in: args), "15")
                     XCTAssertEqual(self.value(for: "--Mapper.ba_refine_focal_length", in: args), "1")
                 }
             )

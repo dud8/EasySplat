@@ -576,7 +576,7 @@ final class PipelineIntegrationTests: XCTestCase {
 
         let commands = runner.calls.compactMap { $0.1.first }
         XCTAssertEqual(commands.filter { $0 == "feature_extractor" }.count, 1)
-        XCTAssertEqual(commands.filter { $0 == "local_vocab_retriever" }.count, 2)
+        XCTAssertEqual(commands.filter { $0 == "local_vocab_retriever" }.count, 1)
         XCTAssertEqual(commands.filter { $0 == "matches_importer" }.count, 2)
         XCTAssertNotNil(events.stageLog(containing: "preserving features and retrying with exact matching"))
         let geometry = try GeometryArtifactStore.load(
@@ -585,6 +585,1468 @@ final class PipelineIntegrationTests: XCTestCase {
         )
         XCTAssertEqual(geometry.pairGraph.mappingAttemptNumber, 1)
         XCTAssertEqual(geometry.pairGraph.fallbackReason, "exact descriptor matching")
+        let evidence = try PairGraphEvidenceStore.load(
+            from: paths.pairGraphEvidenceURL,
+            projectPaths: paths
+        )
+        XCTAssertEqual(evidence.attempts.map(\.purpose), [.policy, .policy])
+        XCTAssertEqual(
+            evidence.attempts[0].scheduledPairs,
+            evidence.attempts[1].scheduledPairs
+        )
+    }
+
+    func testDisconnectedFaissGraphUsesTargetedExactSchedule() async throws {
+        let temp = makeTempRoot()
+        let fixture = try makePhotoRecoveryProject(
+            in: temp,
+            name: "TargetedExactRecovery"
+        )
+        let run = makePhotoRecoveryPipeline(
+            projectURL: fixture.projectURL,
+            toolchain: fixture.toolchain,
+            scripts: [
+            .init(
+                path: fixture.toolchain.colmap.path,
+                argsPrefix: ["feature_extractor"],
+                result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""),
+                onRun: { try self.writeFeatureDatabase(for: $0) }
+            ),
+            .init(
+                path: fixture.toolchain.colmap.path,
+                argsPrefix: ["matches_importer"],
+                result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""),
+                onRun: { arguments in
+                    XCTAssertEqual(
+                        self.value(for: "--SiftMatching.cpu_brute_force_matcher", in: arguments),
+                        "0"
+                    )
+                    do {
+                        let lines = try self.pairListLines(for: arguments)
+                        XCTAssertEqual(lines.count, 1_770)
+                        let imageNames = Set(lines.flatMap {
+                            $0.split(whereSeparator: \.isWhitespace).map(String.init)
+                        }).sorted()
+                        let isolated = try XCTUnwrap(imageNames.last)
+                        let verified = Set(lines.filter { line in
+                            !line.split(whereSeparator: \.isWhitespace).map(String.init)
+                                .contains(isolated)
+                        }.prefix(230))
+                        XCTAssertEqual(verified.count, 230)
+                        try self.writeSelectiveVerifiedPairResults(
+                            for: arguments,
+                            verifiedPairLines: verified
+                        )
+                    } catch {
+                        XCTFail("Could not create disconnected FAISS results: \(error)")
+                    }
+                }
+            ),
+            .init(
+                path: fixture.toolchain.colmap.path,
+                argsPrefix: ["matches_importer"],
+                result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""),
+                onRun: { arguments in
+                    XCTAssertEqual(
+                        self.value(for: "--SiftMatching.cpu_brute_force_matcher", in: arguments),
+                        "1"
+                    )
+                    do {
+                        XCTAssertEqual(try self.pairListLines(for: arguments).count, 289)
+                        XCTAssertEqual(
+                            try self.matchingRowCounts(
+                                databasePath: try XCTUnwrap(
+                                    self.value(for: "--database_path", in: arguments)
+                                )
+                            ),
+                            [0, 0]
+                        )
+                        try self.writeVerifiedPairResults(for: arguments)
+                    } catch {
+                        XCTFail("Could not create targeted exact results: \(error)")
+                    }
+                }
+            ),
+            ] + successfulMappingScripts(
+                colmapPath: fixture.toolchain.colmap.path,
+                projectURL: fixture.projectURL,
+                registeredViews: 60,
+                totalViews: 60,
+                pointCount: 20
+            )
+        )
+
+        try await run.pipeline.run { _ in }
+
+        XCTAssertEqual(run.runner.calls.count { $0.1.first == "feature_extractor" }, 1)
+        XCTAssertEqual(run.runner.calls.count { $0.1.first == "matches_importer" }, 2)
+        XCTAssertFalse(run.runner.calls.contains { $0.1.first == "local_vocab_retriever" })
+        let evidence = try PairGraphEvidenceStore.load(
+            from: fixture.paths.pairGraphEvidenceURL,
+            projectPaths: fixture.paths
+        )
+        XCTAssertEqual(evidence.attempts.map(\.purpose), [
+            .policy,
+            .targetedExactGraphRecovery,
+        ])
+        XCTAssertEqual(evidence.attempts.map(\.scheduledPairs.count), [1_770, 289])
+        XCTAssertEqual(evidence.acceptedInspection.scheduledPairCount, 289)
+        let acceptedPlan = try ColmapPairPlan.persisted(
+            imageNames: evidence.imageNames,
+            scheduledPairs: evidence.attempts[1].scheduledPairs
+        )
+        XCTAssertEqual(evidence.pairListDigest, acceptedPlan.sha256)
+    }
+
+    func testDisconnectedTargetedExactGraphFallsBackToFullExactSchedule() async throws {
+        let temp = makeTempRoot()
+        let fixture = try makePhotoRecoveryProject(
+            in: temp,
+            name: "TargetedGraphFallback"
+        )
+        let run = makePhotoRecoveryPipeline(
+            projectURL: fixture.projectURL,
+            toolchain: fixture.toolchain,
+            scripts: [
+            .init(
+                path: fixture.toolchain.colmap.path,
+                argsPrefix: ["feature_extractor"],
+                result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""),
+                onRun: { try self.writeFeatureDatabase(for: $0) }
+            ),
+            .init(
+                path: fixture.toolchain.colmap.path,
+                argsPrefix: ["matches_importer"],
+                result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""),
+                onRun: { arguments in
+                    do {
+                        try self.writeFiftyNinePlusOneFaissResults(for: arguments)
+                    } catch {
+                        XCTFail("Could not create disconnected FAISS results: \(error)")
+                    }
+                }
+            ),
+            .init(
+                path: fixture.toolchain.colmap.path,
+                argsPrefix: ["matches_importer"],
+                result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""),
+                onRun: { arguments in
+                    do {
+                        XCTAssertEqual(try self.pairListLines(for: arguments).count, 289)
+                        try self.writeVerifiedPairResults(for: arguments, verifiedRows: 0)
+                    } catch {
+                        XCTFail("Could not create disconnected targeted results: \(error)")
+                    }
+                }
+            ),
+            .init(
+                path: fixture.toolchain.colmap.path,
+                argsPrefix: ["matches_importer"],
+                result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""),
+                onRun: { arguments in
+                    do {
+                        XCTAssertEqual(try self.pairListLines(for: arguments).count, 1_770)
+                        XCTAssertEqual(
+                            try self.matchingRowCounts(
+                                databasePath: try XCTUnwrap(
+                                    self.value(for: "--database_path", in: arguments)
+                                )
+                            ),
+                            [0, 0]
+                        )
+                        try self.writeVerifiedPairResults(for: arguments)
+                    } catch {
+                        XCTFail("Could not create full exact results: \(error)")
+                    }
+                }
+            ),
+            ] + successfulMappingScripts(
+                colmapPath: fixture.toolchain.colmap.path,
+                projectURL: fixture.projectURL,
+                registeredViews: 60,
+                totalViews: 60,
+                pointCount: 20
+            )
+        )
+
+        try await run.pipeline.run { _ in }
+
+        let evidence = try PairGraphEvidenceStore.load(
+            from: fixture.paths.pairGraphEvidenceURL,
+            projectPaths: fixture.paths
+        )
+        XCTAssertEqual(evidence.attempts.map(\.purpose), [
+            .policy,
+            .targetedExactGraphRecovery,
+            .fullExactGraphRecovery,
+        ])
+        XCTAssertEqual(evidence.attempts.map(\.scheduledPairs.count), [1_770, 289, 1_770])
+        XCTAssertEqual(evidence.acceptedInspection.scheduledPairCount, 1_770)
+    }
+
+    func testSparseTargetedMapFallsBackToFullExactSchedule() async throws {
+        let temp = makeTempRoot()
+        let fixture = try makePhotoRecoveryProject(
+            in: temp,
+            name: "SparseTargetedMapFallback"
+        )
+        let run = makePhotoRecoveryPipeline(
+            projectURL: fixture.projectURL,
+            toolchain: fixture.toolchain,
+            scripts: [
+            .init(
+                path: fixture.toolchain.colmap.path,
+                argsPrefix: ["feature_extractor"],
+                result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""),
+                onRun: { try self.writeFeatureDatabase(for: $0) }
+            ),
+            .init(
+                path: fixture.toolchain.colmap.path,
+                argsPrefix: ["matches_importer"],
+                result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""),
+                onRun: { try self.writeFiftyNinePlusOneFaissResults(for: $0) }
+            ),
+            .init(
+                path: fixture.toolchain.colmap.path,
+                argsPrefix: ["matches_importer"],
+                result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""),
+                onRun: { arguments in
+                    XCTAssertEqual(try self.pairListLines(for: arguments).count, 289)
+                    try self.writeVerifiedPairResults(for: arguments)
+                }
+            ),
+            ] + successfulMappingScripts(
+                colmapPath: fixture.toolchain.colmap.path,
+                projectURL: fixture.projectURL,
+                registeredViews: 60,
+                totalViews: 60,
+                pointCount: 1
+            ) + [
+            .init(
+                path: fixture.toolchain.colmap.path,
+                argsPrefix: ["matches_importer"],
+                result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""),
+                onRun: { arguments in
+                    XCTAssertEqual(try self.pairListLines(for: arguments).count, 1_770)
+                    try self.writeVerifiedPairResults(for: arguments)
+                }
+            ),
+            ] + successfulMappingScripts(
+                colmapPath: fixture.toolchain.colmap.path,
+                projectURL: fixture.projectURL,
+                registeredViews: 60,
+                totalViews: 60,
+                pointCount: 20
+            )
+        )
+
+        try await run.pipeline.run { _ in }
+
+        let evidence = try PairGraphEvidenceStore.load(
+            from: fixture.paths.pairGraphEvidenceURL,
+            projectPaths: fixture.paths
+        )
+        XCTAssertEqual(evidence.attempts.map(\.purpose), [
+            .policy,
+            .targetedExactGraphRecovery,
+            .fullExactGraphRecovery,
+        ])
+        XCTAssertEqual(evidence.attempts.map(\.scheduledPairs.count), [1_770, 289, 1_770])
+        XCTAssertEqual(run.runner.calls.count { $0.1.first == "mapper" }, 2)
+    }
+
+    func testTargetedMapWithoutModelFallsBackToFullExactSchedule() async throws {
+        let temp = makeTempRoot()
+        let fixture = try makePhotoRecoveryProject(
+            in: temp,
+            name: "MissingTargetedMapFallback"
+        )
+        let run = makePhotoRecoveryPipeline(
+            projectURL: fixture.projectURL,
+            toolchain: fixture.toolchain,
+            scripts: [
+            .init(
+                path: fixture.toolchain.colmap.path,
+                argsPrefix: ["feature_extractor"],
+                result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""),
+                onRun: { try self.writeFeatureDatabase(for: $0) }
+            ),
+            .init(
+                path: fixture.toolchain.colmap.path,
+                argsPrefix: ["matches_importer"],
+                result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""),
+                onRun: { try self.writeFiftyNinePlusOneFaissResults(for: $0) }
+            ),
+            .init(
+                path: fixture.toolchain.colmap.path,
+                argsPrefix: ["matches_importer"],
+                result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""),
+                onRun: { arguments in
+                    XCTAssertEqual(try self.pairListLines(for: arguments).count, 289)
+                    try self.writeVerifiedPairResults(for: arguments)
+                }
+            ),
+            .init(
+                path: fixture.toolchain.colmap.path,
+                argsPrefix: ["mapper"],
+                result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""),
+                stdoutLines: ["Retriangulation and Global bundle adjustment"]
+            ),
+            .init(
+                path: fixture.toolchain.colmap.path,
+                argsPrefix: ["matches_importer"],
+                result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""),
+                onRun: { arguments in
+                    XCTAssertEqual(try self.pairListLines(for: arguments).count, 1_770)
+                    try self.writeVerifiedPairResults(for: arguments)
+                }
+            ),
+            ] + successfulMappingScripts(
+                colmapPath: fixture.toolchain.colmap.path,
+                projectURL: fixture.projectURL,
+                registeredViews: 60,
+                totalViews: 60,
+                pointCount: 20
+            )
+        )
+
+        try await run.pipeline.run { _ in }
+
+        let evidence = try PairGraphEvidenceStore.load(
+            from: fixture.paths.pairGraphEvidenceURL,
+            projectPaths: fixture.paths
+        )
+        XCTAssertEqual(evidence.attempts.map(\.purpose), [
+            .policy,
+            .targetedExactGraphRecovery,
+            .fullExactGraphRecovery,
+        ])
+        XCTAssertEqual(run.runner.calls.count { $0.1.first == "mapper" }, 2)
+    }
+
+    func testUnsafeTargetedSparseLayoutFallsBackToFullExactSchedule() async throws {
+        let temp = makeTempRoot()
+        let fixture = try makePhotoRecoveryProject(
+            in: temp,
+            name: "UnsafeTargetedSparseFallback"
+        )
+        let unsafeSparseRoot = temp.appendingPathComponent(
+            "UnsafeTargetedSparseOutput",
+            isDirectory: true
+        )
+        try FileManager.default.createDirectory(
+            at: unsafeSparseRoot,
+            withIntermediateDirectories: true
+        )
+        let externalSentinel = unsafeSparseRoot.appendingPathComponent("sentinel.txt")
+        let externalSentinelData = Data("external sparse target".utf8)
+        try externalSentinelData.write(to: externalSentinel, options: [.atomic])
+        let run = makePhotoRecoveryPipeline(
+            projectURL: fixture.projectURL,
+            toolchain: fixture.toolchain,
+            scripts: [
+                .init(
+                    path: fixture.toolchain.colmap.path,
+                    argsPrefix: ["feature_extractor"],
+                    result: .init(
+                        exitCode: 0,
+                        terminationReason: .exit,
+                        stdout: "",
+                        stderr: ""
+                    ),
+                    onRun: { try self.writeFeatureDatabase(for: $0) }
+                ),
+                .init(
+                    path: fixture.toolchain.colmap.path,
+                    argsPrefix: ["matches_importer"],
+                    result: .init(
+                        exitCode: 0,
+                        terminationReason: .exit,
+                        stdout: "",
+                        stderr: ""
+                    ),
+                    onRun: { try self.writeFiftyNinePlusOneFaissResults(for: $0) }
+                ),
+                .init(
+                    path: fixture.toolchain.colmap.path,
+                    argsPrefix: ["matches_importer"],
+                    result: .init(
+                        exitCode: 0,
+                        terminationReason: .exit,
+                        stdout: "",
+                        stderr: ""
+                    ),
+                    onRun: { arguments in
+                        XCTAssertEqual(try self.pairListLines(for: arguments).count, 289)
+                        try self.writeVerifiedPairResults(for: arguments)
+                    }
+                ),
+                .init(
+                    path: fixture.toolchain.colmap.path,
+                    argsPrefix: ["mapper"],
+                    result: .init(
+                        exitCode: 0,
+                        terminationReason: .exit,
+                        stdout: "",
+                        stderr: ""
+                    ),
+                    stdoutLines: ["Retriangulation and Global bundle adjustment"],
+                    onRun: { _ in
+                        try FileManager.default.removeItem(
+                            at: fixture.paths.colmapSparseURL
+                        )
+                        try FileManager.default.createSymbolicLink(
+                            at: fixture.paths.colmapSparseURL,
+                            withDestinationURL: unsafeSparseRoot
+                        )
+                    }
+                ),
+                .init(
+                    path: fixture.toolchain.colmap.path,
+                    argsPrefix: ["matches_importer"],
+                    result: .init(
+                        exitCode: 0,
+                        terminationReason: .exit,
+                        stdout: "",
+                        stderr: ""
+                    ),
+                    onRun: { arguments in
+                        XCTAssertEqual(try self.pairListLines(for: arguments).count, 1_770)
+                        try self.writeVerifiedPairResults(for: arguments)
+                    }
+                ),
+            ] + successfulMappingScripts(
+                colmapPath: fixture.toolchain.colmap.path,
+                projectURL: fixture.projectURL,
+                registeredViews: 60,
+                totalViews: 60,
+                pointCount: 20
+            )
+        )
+
+        try await run.pipeline.run { _ in }
+
+        XCTAssertEqual(run.runner.calls.count { $0.1.first == "mapper" }, 2)
+        let evidence = try PairGraphEvidenceStore.load(
+            from: fixture.paths.pairGraphEvidenceURL,
+            projectPaths: fixture.paths
+        )
+        XCTAssertEqual(evidence.attempts.map(\.purpose), [
+            .policy,
+            .targetedExactGraphRecovery,
+            .fullExactGraphRecovery,
+        ])
+        XCTAssertEqual(try Data(contentsOf: externalSentinel), externalSentinelData)
+    }
+
+    func testTargetedPlanEqualToSourceRunsOneDirectFullExactAttempt() async throws {
+        let temp = makeTempRoot()
+        let fixture = try makePhotoRecoveryProject(
+            in: temp,
+            name: "DirectFullExactFallback",
+            photoCount: 8
+        )
+        let run = makePhotoRecoveryPipeline(
+            projectURL: fixture.projectURL,
+            toolchain: fixture.toolchain,
+            scripts: [
+            .init(
+                path: fixture.toolchain.colmap.path,
+                argsPrefix: ["feature_extractor"],
+                result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""),
+                onRun: { try self.writeFeatureDatabase(for: $0) }
+            ),
+            .init(
+                path: fixture.toolchain.colmap.path,
+                argsPrefix: ["matches_importer"],
+                result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""),
+                onRun: { arguments in
+                    do {
+                        let lines = try self.pairListLines(for: arguments)
+                        XCTAssertEqual(lines.count, 28)
+                        let names = Set(lines.flatMap {
+                            $0.split(whereSeparator: \.isWhitespace).map(String.init)
+                        }).sorted()
+                        let firstGroup = Set(names.prefix(4))
+                        let verified = Set(lines.filter { line in
+                            let fields = line.split(whereSeparator: \.isWhitespace)
+                                .map(String.init)
+                            return fields.count == 2
+                                && firstGroup.contains(fields[0])
+                                    == firstGroup.contains(fields[1])
+                        })
+                        XCTAssertEqual(verified.count, 12)
+                        try self.writeSelectiveVerifiedPairResults(
+                            for: arguments,
+                            verifiedPairLines: verified
+                        )
+                    } catch {
+                        XCTFail("Could not create split FAISS graph: \(error)")
+                    }
+                }
+            ),
+            .init(
+                path: fixture.toolchain.colmap.path,
+                argsPrefix: ["matches_importer"],
+                result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""),
+                onRun: { arguments in
+                    do {
+                        XCTAssertEqual(try self.pairListLines(for: arguments).count, 28)
+                        try self.writeVerifiedPairResults(for: arguments)
+                    } catch {
+                        XCTFail("Could not create direct full exact results: \(error)")
+                    }
+                }
+            ),
+            ] + successfulMappingScripts(
+                colmapPath: fixture.toolchain.colmap.path,
+                projectURL: fixture.projectURL,
+                registeredViews: 8,
+                totalViews: 8,
+                pointCount: 1
+            )
+        )
+
+        try await run.pipeline.run { _ in }
+
+        let evidence = try PairGraphEvidenceStore.load(
+            from: fixture.paths.pairGraphEvidenceURL,
+            projectPaths: fixture.paths
+        )
+        XCTAssertEqual(evidence.attempts.map(\.purpose), [
+            .policy,
+            .fullExactGraphRecovery,
+        ])
+        XCTAssertEqual(evidence.attempts.map(\.scheduledPairs.count), [28, 28])
+        XCTAssertEqual(run.runner.calls.count { $0.1.first == "matches_importer" }, 2)
+    }
+
+    func testConnectedFaissMappingMissRetriesSameScheduleWithoutTargeting() async throws {
+        let temp = makeTempRoot()
+        let fixture = try makePhotoRecoveryProject(
+            in: temp,
+            name: "ConnectedMappingExactFallback",
+            photoCount: 8
+        )
+        let run = makePhotoRecoveryPipeline(
+            projectURL: fixture.projectURL,
+            toolchain: fixture.toolchain,
+            scripts: [
+            .init(
+                path: fixture.toolchain.colmap.path,
+                argsPrefix: ["feature_extractor"],
+                result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""),
+                onRun: { try self.writeFeatureDatabase(for: $0) }
+            ),
+            .init(
+                path: fixture.toolchain.colmap.path,
+                argsPrefix: ["matches_importer"],
+                result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""),
+                onRun: { try self.writeVerifiedPairResults(for: $0) }
+            ),
+            ] + successfulMappingScripts(
+                colmapPath: fixture.toolchain.colmap.path,
+                projectURL: fixture.projectURL,
+                registeredViews: 4,
+                totalViews: 8,
+                pointCount: 1
+            ) + [
+            .init(
+                path: fixture.toolchain.colmap.path,
+                argsPrefix: ["matches_importer"],
+                result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""),
+                onRun: { arguments in
+                    XCTAssertEqual(
+                        self.value(for: "--SiftMatching.cpu_brute_force_matcher", in: arguments),
+                        "1"
+                    )
+                    try self.writeVerifiedPairResults(for: arguments)
+                }
+            ),
+            ] + successfulMappingScripts(
+                colmapPath: fixture.toolchain.colmap.path,
+                projectURL: fixture.projectURL,
+                registeredViews: 8,
+                totalViews: 8,
+                pointCount: 1
+            )
+        )
+
+        try await run.pipeline.run { _ in }
+
+        let evidence = try PairGraphEvidenceStore.load(
+            from: fixture.paths.pairGraphEvidenceURL,
+            projectPaths: fixture.paths
+        )
+        XCTAssertEqual(evidence.attempts.map(\.purpose), [.policy, .policy])
+        XCTAssertEqual(evidence.attempts.map(\.artifact.matcher), [.faiss, .exact])
+        XCTAssertEqual(
+            evidence.attempts[0].scheduledPairs,
+            evidence.attempts[1].scheduledPairs
+        )
+        XCTAssertFalse(run.runner.calls.contains { $0.1.first == "local_vocab_retriever" })
+    }
+
+    func testResumedTargetedMappingFailureUsesDurableFullExactSource() async throws {
+        let temp = makeTempRoot()
+        let fixture = try makePhotoRecoveryProject(
+            in: temp,
+            name: "ResumedTargetedMappingFallback"
+        )
+        _ = try await prepareAcceptedTargetedEvidence(fixture: fixture)
+
+        let resumed = makePhotoRecoveryPipeline(
+            projectURL: fixture.projectURL,
+            toolchain: fixture.toolchain,
+            scripts: successfulMappingScripts(
+                colmapPath: fixture.toolchain.colmap.path,
+                projectURL: fixture.projectURL,
+                registeredViews: 20,
+                totalViews: 60,
+                pointCount: 1
+            ) + [
+            .init(
+                path: fixture.toolchain.colmap.path,
+                argsPrefix: ["matches_importer"],
+                result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""),
+                onRun: { arguments in
+                    do {
+                        XCTAssertEqual(try self.pairListLines(for: arguments).count, 1_770)
+                        try self.writeVerifiedPairResults(for: arguments)
+                    } catch {
+                        XCTFail("Could not create resumed full exact results: \(error)")
+                    }
+                }
+            ),
+            ] + successfulMappingScripts(
+                colmapPath: fixture.toolchain.colmap.path,
+                projectURL: fixture.projectURL,
+                registeredViews: 60,
+                totalViews: 60,
+                pointCount: 1
+            )
+        )
+
+        try await resumed.pipeline.run(resumeFrom: .sfmMatching) { _ in }
+
+        XCTAssertFalse(resumed.runner.calls.contains { $0.1.first == "feature_extractor" })
+        XCTAssertFalse(resumed.runner.calls.contains { $0.1.first == "local_vocab_retriever" })
+        let evidence = try PairGraphEvidenceStore.load(
+            from: fixture.paths.pairGraphEvidenceURL,
+            projectPaths: fixture.paths
+        )
+        XCTAssertEqual(evidence.attempts.map(\.purpose), [
+            .policy,
+            .targetedExactGraphRecovery,
+            .fullExactGraphRecovery,
+        ])
+        XCTAssertEqual(evidence.attempts.map(\.scheduledPairs.count), [1_770, 289, 1_770])
+    }
+
+    func testPendingFullExactRecoverySupersedesStaleTargetedEvidence() async throws {
+        let temp = makeTempRoot()
+        let fixture = try makePhotoRecoveryProject(
+            in: temp,
+            name: "PendingFullBeatsStaleTarget"
+        )
+        let staleTargetEvidence = try await prepareAcceptedTargetedEvidence(
+            fixture: fixture
+        )
+        let plans = try staleTargetEvidence.restoredPairPlans()
+        let sourcePlan = try XCTUnwrap(plans.recoverySource)
+        XCTAssertEqual(plans.accepted.pairs.count, 289)
+        XCTAssertEqual(sourcePlan.pairs.count, 1_770)
+
+        try PairGraphRecoveryStore.save(
+            PairGraphRecoveryState(
+                selectedFramesDigest: staleTargetEvidence.selectedFramesDigest,
+                imageNames: staleTargetEvidence.imageNames,
+                mode: .fullExact,
+                activeRecoveryLevel: try XCTUnwrap(
+                    staleTargetEvidence.attempts.first?.artifact.recoveryLevel
+                ),
+                activePlan: sourcePlan,
+                attempts: staleTargetEvidence.attempts,
+                matchingDurationSeconds: staleTargetEvidence.matchingDurationSeconds,
+                fallbackReasons: staleTargetEvidence.fallbackReasons
+            ),
+            to: fixture.paths.pairGraphRecoveryURL,
+            projectPaths: fixture.paths
+        )
+        let previousOutput = Data("previous validated splat".utf8)
+        try FileManager.default.createDirectory(
+            at: fixture.paths.outputURL,
+            withIntermediateDirectories: true
+        )
+        try previousOutput.write(
+            to: fixture.paths.outputURL.appendingPathComponent("splat.ply"),
+            options: [.atomic]
+        )
+
+        let resumed = makePhotoRecoveryPipeline(
+            projectURL: fixture.projectURL,
+            toolchain: fixture.toolchain,
+            scripts: [
+                .init(
+                    path: fixture.toolchain.colmap.path,
+                    argsPrefix: ["matches_importer"],
+                    result: .init(
+                        exitCode: 0,
+                        terminationReason: .exit,
+                        stdout: "",
+                        stderr: ""
+                    ),
+                    onRun: { arguments in
+                        XCTAssertEqual(
+                            self.value(
+                                for: "--SiftMatching.cpu_brute_force_matcher",
+                                in: arguments
+                            ),
+                            "1"
+                        )
+                        XCTAssertEqual(try self.pairListLines(for: arguments).count, 1_770)
+                        try self.writeVerifiedPairResults(for: arguments)
+                    }
+                ),
+            ] + successfulMappingScripts(
+                colmapPath: fixture.toolchain.colmap.path,
+                projectURL: fixture.projectURL,
+                registeredViews: 60,
+                totalViews: 60,
+                pointCount: 20
+            )
+        )
+
+        try await resumed.pipeline.run(resumeFrom: .sfmMatching) { _ in }
+
+        XCTAssertEqual(resumed.runner.calls.first?.1.first, "matches_importer")
+        XCTAssertEqual(
+            resumed.runner.calls.count { $0.1.first == "matches_importer" },
+            1
+        )
+        XCTAssertFalse(resumed.runner.calls.contains { call in
+            ["feature_extractor", "local_vocab_retriever"].contains(call.1.first)
+        })
+        let accepted = try PairGraphEvidenceStore.load(
+            from: fixture.paths.pairGraphEvidenceURL,
+            projectPaths: fixture.paths
+        )
+        XCTAssertEqual(accepted.attempts.map(\.purpose), [
+            .policy,
+            .targetedExactGraphRecovery,
+            .fullExactGraphRecovery,
+        ])
+        XCTAssertEqual(accepted.attempts.map(\.scheduledPairs.count), [1_770, 289, 1_770])
+        XCTAssertFalse(FileManager.default.fileExists(
+            atPath: fixture.paths.pairGraphRecoveryURL.path
+        ))
+        XCTAssertEqual(
+            try Data(contentsOf: fixture.paths.outputURL.appendingPathComponent("splat.ply")),
+            previousOutput
+        )
+    }
+
+    func testAcceptedTargetedEvidenceReconcilesItsPendingRecoveryState() async throws {
+        let temp = makeTempRoot()
+        let fixture = try makePhotoRecoveryProject(
+            in: temp,
+            name: "AcceptedTargetReconciliation"
+        )
+        let acceptedTarget = try await prepareAcceptedTargetedEvidence(fixture: fixture)
+        let plans = try acceptedTarget.restoredPairPlans()
+        let sourcePlan = try XCTUnwrap(plans.recoverySource)
+        let pendingAttempts = Array(acceptedTarget.attempts.dropLast())
+        let pendingDuration = pendingAttempts.reduce(0.0) {
+            $0 + $1.artifact.durationSeconds
+        }
+        try PairGraphRecoveryStore.save(
+            PairGraphRecoveryState(
+                selectedFramesDigest: acceptedTarget.selectedFramesDigest,
+                imageNames: acceptedTarget.imageNames,
+                mode: .targetedExact,
+                activeRecoveryLevel: try XCTUnwrap(
+                    pendingAttempts.last?.artifact.recoveryLevel
+                ),
+                activePlan: plans.accepted,
+                attempts: pendingAttempts,
+                matchingDurationSeconds: pendingDuration,
+                fallbackReasons: acceptedTarget.fallbackReasons
+            ),
+            to: fixture.paths.pairGraphRecoveryURL,
+            projectPaths: fixture.paths
+        )
+        XCTAssertLessThan(plans.accepted.pairs.count, sourcePlan.pairs.count)
+
+        let resumed = makePhotoRecoveryPipeline(
+            projectURL: fixture.projectURL,
+            toolchain: fixture.toolchain,
+            scripts: successfulMappingScripts(
+                colmapPath: fixture.toolchain.colmap.path,
+                projectURL: fixture.projectURL,
+                registeredViews: 60,
+                totalViews: 60,
+                pointCount: 20
+            )
+        )
+
+        try await resumed.pipeline.run(resumeFrom: .sfmMatching) { _ in }
+
+        XCTAssertEqual(
+            resumed.runner.calls.compactMap { $0.1.first },
+            ["mapper", "model_analyzer"]
+        )
+        XCTAssertFalse(FileManager.default.fileExists(
+            atPath: fixture.paths.pairGraphRecoveryURL.path
+        ))
+        XCTAssertEqual(
+            try PairGraphEvidenceStore.load(
+                from: fixture.paths.pairGraphEvidenceURL,
+                projectPaths: fixture.paths
+            ),
+            acceptedTarget
+        )
+    }
+
+    func testMismatchedRecoveryStateRestartsFaissFromPreservedFeatures() async throws {
+        let temp = makeTempRoot()
+        let fixture = try makePhotoRecoveryProject(
+            in: temp,
+            name: "MismatchedRecoveryRestart",
+            photoCount: 8
+        )
+        let featureRun = makePhotoRecoveryPipeline(
+            projectURL: fixture.projectURL,
+            toolchain: fixture.toolchain,
+            scripts: [
+                .init(
+                    path: fixture.toolchain.colmap.path,
+                    argsPrefix: ["feature_extractor"],
+                    result: .init(
+                        exitCode: 0,
+                        terminationReason: .exit,
+                        stdout: "",
+                        stderr: ""
+                    ),
+                    onRun: { try self.writeFeatureDatabase(for: $0) }
+                ),
+            ],
+            stopAfterStage: .sfmFeatures
+        )
+        try await featureRun.pipeline.run { _ in }
+
+        let imageNames = selectedImageNames(in: fixture.paths)
+        let sourcePlan = try ColmapPairPlan.exhaustive(imageNames: imageNames)
+        let pairListURL = fixture.paths.colmapSeedURL.appendingPathComponent(
+            "stale-evidence-pairs.txt"
+        )
+        try sourcePlan.serializedData.write(to: pairListURL, options: [.atomic])
+        try writeVerifiedPairResults(for: [
+            "--database_path", fixture.paths.colmapDatabaseURL.path,
+            "--match_list_path", pairListURL.path,
+        ])
+        var staleEvidence = try persistPairGraphEvidenceFixture(
+            paths: fixture.paths,
+            imageNames: imageNames
+        )
+        staleEvidence.attempts[0].artifact.matcher = .exact
+        try PairGraphEvidenceStore.save(
+            staleEvidence,
+            to: fixture.paths.pairGraphEvidenceURL,
+            projectPaths: fixture.paths
+        )
+        let featureDigest = try ColmapDatabaseDigester
+            .digests(at: fixture.paths.colmapDatabaseURL).feature
+        try PairGraphRecoveryStore.save(
+            PairGraphRecoveryState(
+                selectedFramesDigest: String(repeating: "0", count: 64),
+                imageNames: imageNames,
+                mode: .sameScheduleExact,
+                activeRecoveryLevel: .normal,
+                activePlan: sourcePlan,
+                attempts: [
+                    PairGraphAttemptEvidence(
+                        artifact: PairMatchingAttemptArtifact(
+                            attemptNumber: 1,
+                            matcher: .faiss,
+                            recoveryLevel: .normal,
+                            outcome: .failed,
+                            scheduledPairCount: sourcePlan.pairs.count,
+                            attemptedPairCount: 0,
+                            rawMatchedPairCount: 0,
+                            spatiallyVerifiedPairCount: 0,
+                            durationSeconds: 1
+                        ),
+                        scheduledPairs: sourcePlan.pairs
+                    ),
+                ],
+                matchingDurationSeconds: 1,
+                fallbackReasons: []
+            ),
+            to: fixture.paths.pairGraphRecoveryURL,
+            projectPaths: fixture.paths
+        )
+        try ColmapDatabaseMatchStore.clearMatchingResults(
+            at: fixture.paths.colmapDatabaseURL
+        )
+        try writePartialMatchRows(at: fixture.paths.colmapDatabaseURL)
+        XCTAssertEqual(
+            try matchingRowCounts(databasePath: fixture.paths.colmapDatabaseURL.path),
+            [1, 1]
+        )
+        let previousOutput = Data("previous validated splat".utf8)
+        try FileManager.default.createDirectory(
+            at: fixture.paths.outputURL,
+            withIntermediateDirectories: true
+        )
+        try previousOutput.write(
+            to: fixture.paths.outputURL.appendingPathComponent("splat.ply"),
+            options: [.atomic]
+        )
+
+        let resumed = makePhotoRecoveryPipeline(
+            projectURL: fixture.projectURL,
+            toolchain: fixture.toolchain,
+            scripts: [
+                .init(
+                    path: fixture.toolchain.colmap.path,
+                    argsPrefix: ["matches_importer"],
+                    result: .init(
+                        exitCode: 0,
+                        terminationReason: .exit,
+                        stdout: "",
+                        stderr: ""
+                    ),
+                    onRun: { arguments in
+                        XCTAssertEqual(
+                            self.value(
+                                for: "--SiftMatching.cpu_brute_force_matcher",
+                                in: arguments
+                            ),
+                            "0"
+                        )
+                        XCTAssertEqual(
+                            try self.matchingRowCounts(
+                                databasePath: fixture.paths.colmapDatabaseURL.path
+                            ),
+                            [0, 0]
+                        )
+                        try self.writeVerifiedPairResults(for: arguments)
+                    }
+                ),
+            ] + successfulMappingScripts(
+                colmapPath: fixture.toolchain.colmap.path,
+                projectURL: fixture.projectURL,
+                registeredViews: 8,
+                totalViews: 8,
+                pointCount: 1
+            )
+        )
+        let events = PipelineEventSink()
+
+        try await resumed.pipeline.run(resumeFrom: .sfmFeatures) { events.append($0) }
+
+        XCTAssertNotNil(events.stageLog(
+            containing: "Discarded inconsistent pair-graph recovery state"
+        ))
+        XCTAssertFalse(resumed.runner.calls.contains { call in
+            ["feature_extractor", "local_vocab_retriever"].contains(call.1.first)
+        })
+        XCTAssertEqual(
+            try ColmapDatabaseDigester.digests(
+                at: fixture.paths.colmapDatabaseURL
+            ).feature,
+            featureDigest
+        )
+        let accepted = try PairGraphEvidenceStore.load(
+            from: fixture.paths.pairGraphEvidenceURL,
+            projectPaths: fixture.paths
+        )
+        XCTAssertEqual(accepted.attempts.map(\.artifact.matcher), [.faiss])
+        XCTAssertFalse(FileManager.default.fileExists(
+            atPath: fixture.paths.pairGraphRecoveryURL.path
+        ))
+        XCTAssertEqual(
+            try Data(contentsOf: fixture.paths.outputURL.appendingPathComponent("splat.ply")),
+            previousOutput
+        )
+    }
+
+    func testInterruptedSameScheduleExactMatchingResumesWithoutRepeatingFeaturesOrFaiss() async throws {
+        let temp = makeTempRoot()
+        let fixture = try makePhotoRecoveryProject(
+            in: temp,
+            name: "InterruptedSameScheduleExactRecovery",
+            photoCount: 8
+        )
+        let firstRun = makePhotoRecoveryPipeline(
+            projectURL: fixture.projectURL,
+            toolchain: fixture.toolchain,
+            scripts: [
+                .init(
+                    path: fixture.toolchain.colmap.path,
+                    argsPrefix: ["feature_extractor"],
+                    result: .init(
+                        exitCode: 0,
+                        terminationReason: .exit,
+                        stdout: "",
+                        stderr: ""
+                    ),
+                    onRun: { try self.writeFeatureDatabase(for: $0) }
+                ),
+                .init(
+                    path: fixture.toolchain.colmap.path,
+                    argsPrefix: ["matches_importer"],
+                    result: .init(
+                        exitCode: SIGSEGV,
+                        terminationReason: .uncaughtSignal,
+                        stdout: "",
+                        stderr: "segmentation fault"
+                    ),
+                    onRun: { arguments in
+                        XCTAssertEqual(
+                            self.value(
+                                for: "--SiftMatching.cpu_brute_force_matcher",
+                                in: arguments
+                            ),
+                            "0"
+                        )
+                    }
+                ),
+                .init(
+                    path: fixture.toolchain.colmap.path,
+                    argsPrefix: ["matches_importer"],
+                    result: .init(
+                        exitCode: 0,
+                        terminationReason: .exit,
+                        stdout: "",
+                        stderr: ""
+                    ),
+                    onRun: { arguments in
+                        XCTAssertEqual(
+                            self.value(
+                                for: "--SiftMatching.cpu_brute_force_matcher",
+                                in: arguments
+                            ),
+                            "1"
+                        )
+                        XCTAssertEqual(try self.pairListLines(for: arguments).count, 28)
+                        let databasePath = try XCTUnwrap(
+                            self.value(for: "--database_path", in: arguments)
+                        )
+                        try self.writePartialMatchRows(
+                            at: URL(fileURLWithPath: databasePath)
+                        )
+                        throw CancellationError()
+                    }
+                ),
+            ]
+        )
+        do {
+            try await firstRun.pipeline.run { _ in }
+            XCTFail("Expected same-schedule exact matching to be interrupted")
+        } catch is CancellationError {
+            // Expected.
+        }
+
+        let imageNames = selectedImageNames(in: fixture.paths)
+        let pendingRecovery = try PairGraphRecoveryStore.loadBound(
+            from: fixture.paths.pairGraphRecoveryURL,
+            expectedImageNames: imageNames,
+            projectPaths: fixture.paths
+        ).restoredRecovery()
+        XCTAssertEqual(pendingRecovery.mode, .sameScheduleExact)
+        XCTAssertEqual(pendingRecovery.activePlan.pairs.count, 28)
+        XCTAssertEqual(pendingRecovery.activePlan, pendingRecovery.sourcePlan)
+        XCTAssertEqual(pendingRecovery.attempts.map(\.artifact.matcher), [.faiss])
+        XCTAssertEqual(pendingRecovery.attempts.map(\.artifact.outcome), [.failed])
+        XCTAssertEqual(
+            try matchingRowCounts(databasePath: fixture.paths.colmapDatabaseURL.path),
+            [1, 1]
+        )
+        let featureDigest = try ColmapDatabaseDigester
+            .digests(at: fixture.paths.colmapDatabaseURL).feature
+        let previousOutput = Data("previous validated splat".utf8)
+        try FileManager.default.createDirectory(
+            at: fixture.paths.outputURL,
+            withIntermediateDirectories: true
+        )
+        try previousOutput.write(
+            to: fixture.paths.outputURL.appendingPathComponent("splat.ply"),
+            options: [.atomic]
+        )
+
+        let resumed = makePhotoRecoveryPipeline(
+            projectURL: fixture.projectURL,
+            toolchain: fixture.toolchain,
+            scripts: [
+                .init(
+                    path: fixture.toolchain.colmap.path,
+                    argsPrefix: ["matches_importer"],
+                    result: .init(
+                        exitCode: 0,
+                        terminationReason: .exit,
+                        stdout: "",
+                        stderr: ""
+                    ),
+                    onRun: { arguments in
+                        XCTAssertEqual(
+                            self.value(
+                                for: "--SiftMatching.cpu_brute_force_matcher",
+                                in: arguments
+                            ),
+                            "1"
+                        )
+                        XCTAssertEqual(try self.pairListLines(for: arguments).count, 28)
+                        XCTAssertEqual(
+                            try self.matchingRowCounts(
+                                databasePath: fixture.paths.colmapDatabaseURL.path
+                            ),
+                            [0, 0]
+                        )
+                        try self.writeVerifiedPairResults(for: arguments)
+                    }
+                ),
+            ] + successfulMappingScripts(
+                colmapPath: fixture.toolchain.colmap.path,
+                projectURL: fixture.projectURL,
+                registeredViews: 8,
+                totalViews: 8,
+                pointCount: 1
+            )
+        )
+
+        try await resumed.pipeline.run(resumeFrom: .sfmMatching) { _ in }
+
+        XCTAssertEqual(resumed.runner.calls.first?.1.first, "matches_importer")
+        XCTAssertEqual(
+            resumed.runner.calls.count { $0.1.first == "matches_importer" },
+            1
+        )
+        XCTAssertFalse(resumed.runner.calls.contains { call in
+            ["feature_extractor", "local_vocab_retriever"].contains(call.1.first)
+        })
+        XCTAssertEqual(
+            try ColmapDatabaseDigester.digests(
+                at: fixture.paths.colmapDatabaseURL
+            ).feature,
+            featureDigest
+        )
+        let accepted = try PairGraphEvidenceStore.load(
+            from: fixture.paths.pairGraphEvidenceURL,
+            projectPaths: fixture.paths
+        )
+        XCTAssertEqual(accepted.attempts.map(\.purpose), [.policy, .policy])
+        XCTAssertEqual(accepted.attempts.map(\.artifact.matcher), [.faiss, .exact])
+        XCTAssertEqual(
+            accepted.attempts[0].scheduledPairs,
+            accepted.attempts[1].scheduledPairs
+        )
+        XCTAssertEqual(accepted.pairListDigest, pendingRecovery.activePlan.sha256)
+        XCTAssertFalse(FileManager.default.fileExists(
+            atPath: fixture.paths.pairGraphRecoveryURL.path
+        ))
+        XCTAssertEqual(
+            try Data(contentsOf: fixture.paths.outputURL.appendingPathComponent("splat.ply")),
+            previousOutput
+        )
+    }
+
+    func testInterruptedTargetedExactMatchingResumesItsFocusedSchedule() async throws {
+        let temp = makeTempRoot()
+        let fixture = try makePhotoRecoveryProject(
+            in: temp,
+            name: "InterruptedTargetedExactRecovery"
+        )
+        let firstRun = makePhotoRecoveryPipeline(
+            projectURL: fixture.projectURL,
+            toolchain: fixture.toolchain,
+            scripts: [
+                .init(
+                    path: fixture.toolchain.colmap.path,
+                    argsPrefix: ["feature_extractor"],
+                    result: .init(
+                        exitCode: 0,
+                        terminationReason: .exit,
+                        stdout: "",
+                        stderr: ""
+                    ),
+                    onRun: { try self.writeFeatureDatabase(for: $0) }
+                ),
+                .init(
+                    path: fixture.toolchain.colmap.path,
+                    argsPrefix: ["matches_importer"],
+                    result: .init(
+                        exitCode: 0,
+                        terminationReason: .exit,
+                        stdout: "",
+                        stderr: ""
+                    ),
+                    onRun: { try self.writeFiftyNinePlusOneFaissResults(for: $0) }
+                ),
+                .init(
+                    path: fixture.toolchain.colmap.path,
+                    argsPrefix: ["matches_importer"],
+                    result: .init(
+                        exitCode: 0,
+                        terminationReason: .exit,
+                        stdout: "",
+                        stderr: ""
+                    ),
+                    onRun: { arguments in
+                        XCTAssertEqual(
+                            self.value(
+                                for: "--SiftMatching.cpu_brute_force_matcher",
+                                in: arguments
+                            ),
+                            "1"
+                        )
+                        XCTAssertEqual(try self.pairListLines(for: arguments).count, 289)
+                        let databasePath = try XCTUnwrap(
+                            self.value(for: "--database_path", in: arguments)
+                        )
+                        try self.writePartialMatchRows(
+                            at: URL(fileURLWithPath: databasePath)
+                        )
+                        throw CancellationError()
+                    }
+                ),
+            ]
+        )
+        do {
+            try await firstRun.pipeline.run { _ in }
+            XCTFail("Expected targeted exact matching to be interrupted")
+        } catch is CancellationError {
+            // Expected.
+        }
+
+        let imageNames = selectedImageNames(in: fixture.paths)
+        let pendingRecovery = try PairGraphRecoveryStore.loadBound(
+            from: fixture.paths.pairGraphRecoveryURL,
+            expectedImageNames: imageNames,
+            projectPaths: fixture.paths
+        ).restoredRecovery()
+        XCTAssertEqual(pendingRecovery.mode, .targetedExact)
+        XCTAssertEqual(pendingRecovery.activePlan.pairs.count, 289)
+        XCTAssertEqual(pendingRecovery.sourcePlan.pairs.count, 1_770)
+        XCTAssertEqual(pendingRecovery.attempts.map(\.purpose), [.policy])
+        XCTAssertEqual(pendingRecovery.attempts.map(\.artifact.matcher), [.faiss])
+        XCTAssertEqual(
+            try matchingRowCounts(databasePath: fixture.paths.colmapDatabaseURL.path),
+            [1, 1]
+        )
+        let featureDigest = try ColmapDatabaseDigester
+            .digests(at: fixture.paths.colmapDatabaseURL).feature
+        let previousOutput = Data("previous validated splat".utf8)
+        try FileManager.default.createDirectory(
+            at: fixture.paths.outputURL,
+            withIntermediateDirectories: true
+        )
+        try previousOutput.write(
+            to: fixture.paths.outputURL.appendingPathComponent("splat.ply"),
+            options: [.atomic]
+        )
+
+        let resumed = makePhotoRecoveryPipeline(
+            projectURL: fixture.projectURL,
+            toolchain: fixture.toolchain,
+            scripts: [
+                .init(
+                    path: fixture.toolchain.colmap.path,
+                    argsPrefix: ["matches_importer"],
+                    result: .init(
+                        exitCode: 0,
+                        terminationReason: .exit,
+                        stdout: "",
+                        stderr: ""
+                    ),
+                    onRun: { arguments in
+                        XCTAssertEqual(
+                            self.value(
+                                for: "--SiftMatching.cpu_brute_force_matcher",
+                                in: arguments
+                            ),
+                            "1"
+                        )
+                        XCTAssertEqual(try self.pairListLines(for: arguments).count, 289)
+                        XCTAssertEqual(
+                            try self.matchingRowCounts(
+                                databasePath: fixture.paths.colmapDatabaseURL.path
+                            ),
+                            [0, 0]
+                        )
+                        try self.writeVerifiedPairResults(for: arguments)
+                    }
+                ),
+            ] + successfulMappingScripts(
+                colmapPath: fixture.toolchain.colmap.path,
+                projectURL: fixture.projectURL,
+                registeredViews: 60,
+                totalViews: 60,
+                pointCount: 20
+            )
+        )
+
+        try await resumed.pipeline.run(resumeFrom: .sfmMatching) { _ in }
+
+        XCTAssertEqual(resumed.runner.calls.first?.1.first, "matches_importer")
+        XCTAssertEqual(
+            resumed.runner.calls.count { $0.1.first == "matches_importer" },
+            1
+        )
+        XCTAssertFalse(resumed.runner.calls.contains { call in
+            ["feature_extractor", "local_vocab_retriever"].contains(call.1.first)
+        })
+        XCTAssertEqual(
+            try ColmapDatabaseDigester.digests(
+                at: fixture.paths.colmapDatabaseURL
+            ).feature,
+            featureDigest
+        )
+        let accepted = try PairGraphEvidenceStore.load(
+            from: fixture.paths.pairGraphEvidenceURL,
+            projectPaths: fixture.paths
+        )
+        XCTAssertEqual(accepted.attempts.map(\.purpose), [
+            .policy,
+            .targetedExactGraphRecovery,
+        ])
+        XCTAssertEqual(accepted.attempts.map(\.artifact.matcher), [.faiss, .exact])
+        XCTAssertEqual(accepted.attempts.map(\.scheduledPairs.count), [1_770, 289])
+        XCTAssertEqual(accepted.pairListDigest, pendingRecovery.activePlan.sha256)
+        XCTAssertFalse(FileManager.default.fileExists(
+            atPath: fixture.paths.pairGraphRecoveryURL.path
+        ))
+        XCTAssertEqual(
+            try Data(contentsOf: fixture.paths.outputURL.appendingPathComponent("splat.ply")),
+            previousOutput
+        )
+    }
+
+    func testInterruptedFullExactMatchingRestoresSourceSchedule() async throws {
+        let temp = makeTempRoot()
+        let fixture = try makePhotoRecoveryProject(
+            in: temp,
+            name: "InterruptedFullExactRecovery"
+        )
+        let firstRun = makePhotoRecoveryPipeline(
+            projectURL: fixture.projectURL,
+            toolchain: fixture.toolchain,
+            scripts: [
+            .init(
+                path: fixture.toolchain.colmap.path,
+                argsPrefix: ["feature_extractor"],
+                result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""),
+                onRun: { try self.writeFeatureDatabase(for: $0) }
+            ),
+            .init(
+                path: fixture.toolchain.colmap.path,
+                argsPrefix: ["matches_importer"],
+                result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""),
+                onRun: { try self.writeFiftyNinePlusOneFaissResults(for: $0) }
+            ),
+            .init(
+                path: fixture.toolchain.colmap.path,
+                argsPrefix: ["matches_importer"],
+                result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""),
+                onRun: { arguments in
+                    XCTAssertEqual(try self.pairListLines(for: arguments).count, 289)
+                    try self.writeVerifiedPairResults(for: arguments, verifiedRows: 0)
+                }
+            ),
+            .init(
+                path: fixture.toolchain.colmap.path,
+                argsPrefix: ["matches_importer"],
+                result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""),
+                onRun: { arguments in
+                    XCTAssertEqual(try self.pairListLines(for: arguments).count, 1_770)
+                    guard let databasePath = self.value(
+                        for: "--database_path",
+                        in: arguments
+                    ) else {
+                        throw NSError(domain: "PipelineIntegrationTests", code: 29)
+                    }
+                    try self.writePartialMatchRows(
+                        at: URL(fileURLWithPath: databasePath)
+                    )
+                    throw CancellationError()
+                }
+            ),
+            ]
+        )
+        do {
+            try await firstRun.pipeline.run { _ in }
+            XCTFail("Expected full exact matching to be interrupted")
+        } catch is CancellationError {
+            // Expected.
+        }
+
+        let pendingRecovery = try PairGraphRecoveryStore.loadBound(
+            from: fixture.paths.pairGraphRecoveryURL,
+            expectedImageNames: selectedImageNames(in: fixture.paths),
+            projectPaths: fixture.paths
+        ).restoredRecovery()
+        XCTAssertEqual(pendingRecovery.mode, .fullExact)
+        XCTAssertEqual(pendingRecovery.activePlan.pairs.count, 1_770)
+        XCTAssertEqual(pendingRecovery.attempts.map(\.purpose), [
+            .policy,
+            .targetedExactGraphRecovery,
+        ])
+        XCTAssertEqual(
+            try matchingRowCounts(databasePath: fixture.paths.colmapDatabaseURL.path),
+            [1, 1]
+        )
+
+        let resumed = makePhotoRecoveryPipeline(
+            projectURL: fixture.projectURL,
+            toolchain: fixture.toolchain,
+            scripts: [
+            .init(
+                path: fixture.toolchain.colmap.path,
+                argsPrefix: ["matches_importer"],
+                result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""),
+                onRun: { arguments in
+                    do {
+                        XCTAssertEqual(try self.pairListLines(for: arguments).count, 1_770)
+                        XCTAssertEqual(
+                            try self.matchingRowCounts(
+                                databasePath: try XCTUnwrap(
+                                    self.value(for: "--database_path", in: arguments)
+                                )
+                            ),
+                            [0, 0]
+                        )
+                        try self.writeVerifiedPairResults(for: arguments)
+                    } catch {
+                        XCTFail("Could not recreate interrupted full exact results: \(error)")
+                    }
+                }
+            ),
+            ] + successfulMappingScripts(
+                colmapPath: fixture.toolchain.colmap.path,
+                projectURL: fixture.projectURL,
+                registeredViews: 60,
+                totalViews: 60,
+                pointCount: 20
+            )
+        )
+
+        try await resumed.pipeline.run(resumeFrom: .sfmMatching) { _ in }
+
+        XCTAssertEqual(resumed.runner.calls.first?.1.first, "matches_importer")
+        XCTAssertFalse(resumed.runner.calls.contains { $0.1.first == "feature_extractor" })
+        XCTAssertFalse(resumed.runner.calls.contains { $0.1.first == "local_vocab_retriever" })
+        XCTAssertFalse(FileManager.default.fileExists(
+            atPath: fixture.paths.pairGraphRecoveryURL.path
+        ))
+        let evidence = try PairGraphEvidenceStore.load(
+            from: fixture.paths.pairGraphEvidenceURL,
+            projectPaths: fixture.paths
+        )
+        XCTAssertEqual(evidence.attempts.map(\.purpose), [
+            .policy,
+            .targetedExactGraphRecovery,
+            .fullExactGraphRecovery,
+        ])
     }
 
     func testInterruptedClassicalMatchingClearsPartialExactRowsBeforeFaissResume() async throws {
@@ -967,7 +2429,7 @@ final class PipelineIntegrationTests: XCTestCase {
 
         let commands = runner.calls.compactMap { $0.1.first }
         XCTAssertEqual(commands.filter { $0 == "feature_extractor" }.count, 1)
-        XCTAssertEqual(commands.filter { $0 == "local_vocab_retriever" }.count, 3)
+        XCTAssertEqual(commands.filter { $0 == "local_vocab_retriever" }.count, 2)
         XCTAssertEqual(commands.filter { $0 == "matches_importer" }.count, 3)
         XCTAssertNotNil(events.stageLog(containing: "preserving features and retrying with exact matching"))
         let geometry = try GeometryArtifactStore.load(
@@ -1108,7 +2570,7 @@ final class PipelineIntegrationTests: XCTestCase {
 
         let commands = runner.calls.compactMap { $0.1.first }
         XCTAssertEqual(commands.filter { $0 == "feature_extractor" }.count, 1)
-        XCTAssertEqual(commands.filter { $0 == "local_vocab_retriever" }.count, 3)
+        XCTAssertEqual(commands.filter { $0 == "local_vocab_retriever" }.count, 2)
         XCTAssertEqual(commands.filter { $0 == "matches_importer" }.count, 4)
         let geometry = try GeometryArtifactStore.load(
             from: paths.geometryManifestURL,
@@ -3309,12 +4771,22 @@ final class PipelineIntegrationTests: XCTestCase {
         }
     }
 
-    private func writeSparseModel(at projectURL: URL) throws {
+    private func writeSparseModel(
+        at projectURL: URL,
+        registeredImageCount: Int? = nil,
+        pointCount: Int = 1
+    ) throws {
         let modelURL = projectURL.appendingPathComponent("SfM/colmap/sparse/0", isDirectory: true)
-        try writeSparseModel(
+        let selectedNames = selectedImageNames(in: ProjectPaths(root: projectURL))
+        let imageNames = registeredImageCount.map {
+            Array(selectedNames.prefix(max(0, $0)))
+        } ?? selectedNames
+        try writeDa3SparseModel(
             at: modelURL,
-            imageNames: selectedImageNames(in: ProjectPaths(root: projectURL))
+            imageNames: imageNames.isEmpty ? ["frame_000000.jpg"] : imageNames,
+            pointCount: pointCount
         )
+        try writeSparseModelBinaryOnly(at: modelURL)
     }
 
     private func writeSparseModelBinaryOnlyForProject(at projectURL: URL) throws {
@@ -3511,22 +4983,227 @@ final class PipelineIntegrationTests: XCTestCase {
         )
     }
 
+    private func makePhotoRecoveryProject(
+        in root: URL,
+        name: String,
+        photoCount: Int = 60
+    ) throws -> (
+        projectURL: URL,
+        paths: ProjectPaths,
+        toolchain: ToolchainPaths
+    ) {
+        let projectURL = root.appendingPathComponent(
+            "\(name).easysplatproj",
+            isDirectory: true
+        )
+        let sourcePhotos = root.appendingPathComponent(
+            "\(name)-SourcePhotos",
+            isDirectory: true
+        )
+        try FileManager.default.createDirectory(
+            at: sourcePhotos,
+            withIntermediateDirectories: true
+        )
+        for index in 0..<photoCount {
+            try writeTestImage(
+                url: sourcePhotos.appendingPathComponent("img\(index).jpg"),
+                value: UInt8(index)
+            )
+        }
+        let paths = ProjectPaths(root: projectURL)
+        try paths.ensureDirectories()
+        try ProjectMetadataStore.save(
+            ProjectMetadata(
+                title: name,
+                input: .photos(folder: sourcePhotos.path),
+                requestedRunOptions: RequestedRunOptions(
+                    detailProfile: .fast,
+                    inputOrdering: .unordered,
+                    photoSelection: .useAllValidPhotos
+                )
+            ),
+            to: paths.metadataURL
+        )
+        return (projectURL, paths, try makeToolchain(root: root))
+    }
+
+    private func makePhotoRecoveryPipeline(
+        projectURL: URL,
+        toolchain: ToolchainPaths,
+        scripts: [MockSubprocessRunner.Script],
+        stopAfterStage: PipelineStage? = nil
+    ) -> (pipeline: PipelineRunner, runner: MockSubprocessRunner) {
+        let runner = MockSubprocessRunner(scripts: scripts)
+        return (
+            PipelineRunner(
+                projectURL: projectURL,
+                config: makePipelineConfig(
+                    toolchain: toolchain,
+                    candidateRoute: .colmap,
+                    skipTraining: true,
+                    stopAfterStage: stopAfterStage
+                ),
+                tooling: .init(runner: runner)
+            ),
+            runner
+        )
+    }
+
+    private func successfulMappingScripts(
+        colmapPath: String,
+        projectURL: URL,
+        registeredViews: Int,
+        totalViews: Int,
+        pointCount: Int
+    ) -> [MockSubprocessRunner.Script] {
+        let observationCount = registeredViews * pointCount
+        return [
+            .init(
+                path: colmapPath,
+                argsPrefix: ["mapper"],
+                result: .init(
+                    exitCode: 0,
+                    terminationReason: .exit,
+                    stdout: "",
+                    stderr: ""
+                ),
+                stdoutLines: ["Retriangulation and Global bundle adjustment"],
+                onRun: { _ in
+                    try self.writeSparseModel(
+                        at: projectURL,
+                        registeredImageCount: registeredViews,
+                        pointCount: pointCount
+                    )
+                }
+            ),
+            .init(
+                path: colmapPath,
+                argsPrefix: ["model_analyzer"],
+                result: .init(
+                    exitCode: 0,
+                    terminationReason: .exit,
+                    stdout: "Registered images: \(registeredViews) / \(totalViews)\nPoints: \(pointCount)\nObservations: \(observationCount)\nMean track length: \(registeredViews).0\nMean reprojection error: 0.5\n",
+                    stderr: ""
+                )
+            ),
+        ]
+    }
+
+    private func prepareAcceptedTargetedEvidence(
+        fixture: (
+            projectURL: URL,
+            paths: ProjectPaths,
+            toolchain: ToolchainPaths
+        )
+    ) async throws -> PairGraphEvidence {
+        let setup = makePhotoRecoveryPipeline(
+            projectURL: fixture.projectURL,
+            toolchain: fixture.toolchain,
+            scripts: [
+                .init(
+                    path: fixture.toolchain.colmap.path,
+                    argsPrefix: ["feature_extractor"],
+                    result: .init(
+                        exitCode: 0,
+                        terminationReason: .exit,
+                        stdout: "",
+                        stderr: ""
+                    ),
+                    onRun: { try self.writeFeatureDatabase(for: $0) }
+                ),
+                .init(
+                    path: fixture.toolchain.colmap.path,
+                    argsPrefix: ["matches_importer"],
+                    result: .init(
+                        exitCode: 0,
+                        terminationReason: .exit,
+                        stdout: "",
+                        stderr: ""
+                    ),
+                    onRun: { arguments in
+                        XCTAssertEqual(
+                            self.value(
+                                for: "--SiftMatching.cpu_brute_force_matcher",
+                                in: arguments
+                            ),
+                            "0"
+                        )
+                        try self.writeFiftyNinePlusOneFaissResults(for: arguments)
+                    }
+                ),
+                .init(
+                    path: fixture.toolchain.colmap.path,
+                    argsPrefix: ["matches_importer"],
+                    result: .init(
+                        exitCode: 0,
+                        terminationReason: .exit,
+                        stdout: "",
+                        stderr: ""
+                    ),
+                    onRun: { arguments in
+                        XCTAssertEqual(
+                            self.value(
+                                for: "--SiftMatching.cpu_brute_force_matcher",
+                                in: arguments
+                            ),
+                            "1"
+                        )
+                        XCTAssertEqual(try self.pairListLines(for: arguments).count, 289)
+                        try self.writeVerifiedPairResults(for: arguments)
+                    }
+                ),
+            ],
+            stopAfterStage: .sfmMatching
+        )
+        try await setup.pipeline.run { _ in }
+        return try PairGraphEvidenceStore.load(
+            from: fixture.paths.pairGraphEvidenceURL,
+            projectPaths: fixture.paths
+        )
+    }
+
+    private func writeFiftyNinePlusOneFaissResults(
+        for arguments: [String]
+    ) throws {
+        let lines = try pairListLines(for: arguments)
+        guard lines.count == 1_770 else {
+            throw NSError(domain: "PipelineIntegrationTests", code: 26)
+        }
+        let imageNames = Set(lines.flatMap {
+            $0.split(whereSeparator: \.isWhitespace).map(String.init)
+        }).sorted()
+        guard let isolated = imageNames.last else {
+            throw NSError(domain: "PipelineIntegrationTests", code: 27)
+        }
+        let verified = Set(lines.filter { line in
+            !line.split(whereSeparator: \.isWhitespace).map(String.init)
+                .contains(isolated)
+        }.prefix(230))
+        guard verified.count == 230 else {
+            throw NSError(domain: "PipelineIntegrationTests", code: 28)
+        }
+        try writeSelectiveVerifiedPairResults(
+            for: arguments,
+            verifiedPairLines: verified
+        )
+    }
+
     private func writeVerifiedPairResults(
         for arguments: [String],
-        verifiedRows: Int = 6
+        verifiedRows: Int = ColmapMappingPolicy.minimumPairInlierCount,
+        verifiedPairLines: Set<String>? = nil
     ) throws {
         guard let databasePath = value(for: "--database_path", in: arguments),
-              let pairListPath = value(for: "--match_list_path", in: arguments) else {
+              value(for: "--match_list_path", in: arguments) != nil else {
             throw NSError(domain: "PipelineIntegrationTests", code: 16)
         }
-        let pairs = try String(contentsOfFile: pairListPath, encoding: .utf8)
-            .split(separator: "\n")
-            .map { line -> (String, String) in
+        let pairs = try pairListLines(for: arguments)
+            .map { line -> (line: String, first: String, second: String) in
                 let fields = line.split(whereSeparator: \.isWhitespace).map(String.init)
-                guard fields.count == 2 else { return ("", "") }
-                return (fields[0], fields[1])
+                guard fields.count == 2 else { return (line, "", "") }
+                return (line, fields[0], fields[1])
             }
-        guard pairs.allSatisfy({ !$0.0.isEmpty && !$0.1.isEmpty }) else {
+        guard pairs.allSatisfy({ !$0.first.isEmpty && !$0.second.isEmpty }) else {
             throw NSError(domain: "PipelineIntegrationTests", code: 17)
         }
 
@@ -3562,16 +5239,25 @@ final class PipelineIntegrationTests: XCTestCase {
             in: database
         )
         do {
-            for (firstName, secondName) in pairs {
+            for pair in pairs {
+                let firstName = pair.first
+                let secondName = pair.second
                 guard let firstID = imageIDs[firstName], let secondID = imageIDs[secondName] else {
                     throw NSError(domain: "PipelineIntegrationTests", code: 21)
                 }
                 let low = min(firstID, secondID)
                 let high = max(firstID, secondID)
                 let pairID = low * ColmapPairGraphInspector.pairIDDivisor + high
+                let pairVerifiedRows = verifiedPairLines
+                    .map { $0.contains(pair.line) ? verifiedRows : 0 }
+                    ?? verifiedRows
+                let rawRows = max(
+                    ColmapMappingPolicy.minimumPairInlierCount,
+                    pairVerifiedRows
+                )
                 try executeSQL(
-                    "INSERT INTO matches(pair_id, rows, cols) VALUES (\(pairID), 8, 2);" +
-                    "INSERT INTO two_view_geometries(pair_id, rows, cols) VALUES (\(pairID), \(verifiedRows), 2);",
+                    "INSERT INTO matches(pair_id, rows, cols) VALUES (\(pairID), \(rawRows), 2);" +
+                    "INSERT INTO two_view_geometries(pair_id, rows, cols) VALUES (\(pairID), \(pairVerifiedRows), 2);",
                     in: database
                 )
             }
@@ -3579,6 +5265,53 @@ final class PipelineIntegrationTests: XCTestCase {
         } catch {
             sqlite3_exec(database, "ROLLBACK;", nil, nil, nil)
             throw error
+        }
+    }
+
+    private func pairListLines(for arguments: [String]) throws -> [String] {
+        guard let pairListPath = value(for: "--match_list_path", in: arguments) else {
+            throw NSError(domain: "PipelineIntegrationTests", code: 22)
+        }
+        return try String(contentsOfFile: pairListPath, encoding: .utf8)
+            .split(separator: "\n")
+            .map(String.init)
+    }
+
+    private func writeSelectiveVerifiedPairResults(
+        for arguments: [String],
+        verifiedPairLines: Set<String>
+    ) throws {
+        try writeVerifiedPairResults(
+            for: arguments,
+            verifiedRows: ColmapMappingPolicy.minimumPairInlierCount,
+            verifiedPairLines: verifiedPairLines
+        )
+    }
+
+    private func matchingRowCounts(databasePath: String) throws -> [Int] {
+        var database: OpaquePointer?
+        guard sqlite3_open(databasePath, &database) == SQLITE_OK,
+              let database else {
+            throw NSError(domain: "PipelineIntegrationTests", code: 23)
+        }
+        defer { sqlite3_close(database) }
+        return try ["matches", "two_view_geometries"].map { table in
+            var statement: OpaquePointer?
+            guard sqlite3_prepare_v2(
+                database,
+                "SELECT COUNT(*) FROM \(table);",
+                -1,
+                &statement,
+                nil
+            ) == SQLITE_OK,
+            let statement else {
+                throw NSError(domain: "PipelineIntegrationTests", code: 24)
+            }
+            defer { sqlite3_finalize(statement) }
+            guard sqlite3_step(statement) == SQLITE_ROW else {
+                throw NSError(domain: "PipelineIntegrationTests", code: 25)
+            }
+            return Int(sqlite3_column_int64(statement, 0))
         }
     }
 
@@ -3814,9 +5547,11 @@ final class PipelineIntegrationTests: XCTestCase {
             stage: .sfmMatching,
             updatedAt: Date(timeIntervalSince1970: 2),
             progressFraction: 0.5,
-            message: "Exact matching interrupted",
+            message: "Image matching interrupted",
             details: .sfmMatching(SfmMatchingCheckpoint(
-                databasePath: try paths.projectRelativePath(for: paths.colmapDatabaseURL),
+                databasePath: try paths.projectRelativePath(
+                    for: paths.colmapDatabaseURL
+                ),
                 expectedPairs: 1,
                 processedPairs: 1
             ))

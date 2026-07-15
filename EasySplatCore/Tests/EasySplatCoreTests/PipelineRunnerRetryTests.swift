@@ -4,6 +4,36 @@ import SQLite3
 @testable import EasySplatCore
 
 final class PipelineRunnerRetryTests: XCTestCase {
+    func testTargetedExactEscalatesOnlyRecoverableGeometryFailures() {
+        XCTAssertTrue(PipelineRunner.shouldEscalateTargetedExact(
+            after: PipelineRunner.PipelineError.outputMissing
+        ))
+        XCTAssertTrue(PipelineRunner.shouldEscalateTargetedExact(
+            after: PipelineRunner.PipelineError.geometryResidualCoverageTooLow(
+                measured: 12,
+                total: 60
+            )
+        ))
+        XCTAssertTrue(PipelineRunner.shouldEscalateTargetedExact(
+            after: PipelineRunner.PipelineError.geometryResidualsTooHigh(
+                median: 2,
+                p90: 4
+            )
+        ))
+        XCTAssertFalse(PipelineRunner.shouldEscalateTargetedExact(
+            after: PipelineRunner.PipelineError.geometryProvenanceUnavailable("missing")
+        ))
+        XCTAssertFalse(PipelineRunner.shouldEscalateTargetedExact(
+            after: ColmapRunnerError.failed(
+                command: "mapper",
+                exitCode: 1,
+                terminationReason: .exit,
+                stdoutTail: "",
+                stderrTail: "fatal"
+            )
+        ))
+    }
+
     func testPipelineStageDecodingRejectsUnknownStage() throws {
         let unknown = try JSONEncoder().encode("unknownStage")
 
@@ -784,6 +814,7 @@ final class PipelineRunnerRetryTests: XCTestCase {
         TestFileBuilder.createFile(at: paths.framesSelectedManifestURL, data: Data([0x01]))
         TestFileBuilder.createFile(at: paths.colmapDatabaseURL, data: Data([0x03]))
         TestFileBuilder.createFile(at: paths.pairGraphEvidenceURL, data: Data([0x04]))
+        TestFileBuilder.createFile(at: paths.pairGraphRecoveryURL, data: Data([0x05]))
 
         let runner = makeRunner(projectURL: root)
         try runner.test_cleanForRetry(failedStage: .selectFrames, paths: paths)
@@ -791,6 +822,7 @@ final class PipelineRunnerRetryTests: XCTestCase {
         XCTAssertFalse(FileManager.default.fileExists(atPath: paths.framesSelectedManifestURL.path))
         XCTAssertFalse(FileManager.default.fileExists(atPath: paths.colmapDatabaseURL.path))
         XCTAssertFalse(FileManager.default.fileExists(atPath: paths.pairGraphEvidenceURL.path))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: paths.pairGraphRecoveryURL.path))
     }
 
     func testCleanForRetryStopsWhenAnInvalidatedArtifactCannotBeRemoved() throws {
@@ -826,6 +858,7 @@ final class PipelineRunnerRetryTests: XCTestCase {
         let paths = ProjectPaths(root: root)
         try paths.ensureDirectories()
         TestFileBuilder.createFile(at: paths.framesRawManifestURL, data: Data("{}".utf8))
+        TestFileBuilder.createFile(at: paths.pairGraphRecoveryURL, data: Data("{}".utf8))
 
         try makeRunner(projectURL: root).test_cleanForRetry(
             failedStage: .extractFrames,
@@ -833,6 +866,22 @@ final class PipelineRunnerRetryTests: XCTestCase {
         )
 
         XCTAssertFalse(FileManager.default.fileExists(atPath: paths.framesRawManifestURL.path))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: paths.pairGraphRecoveryURL.path))
+    }
+
+    func testCleanForRetryFeaturesRemovesRecoveryState() throws {
+        let root = try TestFileBuilder.makeTempDir()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let paths = ProjectPaths(root: root)
+        try paths.ensureDirectories()
+        TestFileBuilder.createFile(at: paths.pairGraphRecoveryURL, data: Data("{}".utf8))
+
+        try makeRunner(projectURL: root).test_cleanForRetry(
+            failedStage: .sfmFeatures,
+            paths: paths
+        )
+
+        XCTAssertFalse(FileManager.default.fileExists(atPath: paths.pairGraphRecoveryURL.path))
     }
 
     func testCleanForRetryImportInvalidatesAcceptedGeometryButPreservesPublishedOutput() throws {
@@ -870,6 +919,7 @@ final class PipelineRunnerRetryTests: XCTestCase {
         try paths.ensureDirectories()
         try writeMatchedDatabase(at: paths.colmapDatabaseURL)
         try Data("stale".utf8).write(to: paths.pairGraphEvidenceURL)
+        try Data("stale".utf8).write(to: paths.pairGraphRecoveryURL)
         try Data("stale".utf8).write(
             to: paths.colmapSeedURL.appendingPathComponent("stale.txt")
         )
@@ -886,6 +936,7 @@ final class PipelineRunnerRetryTests: XCTestCase {
             0
         )
         XCTAssertFalse(FileManager.default.fileExists(atPath: paths.pairGraphEvidenceURL.path))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: paths.pairGraphRecoveryURL.path))
         XCTAssertTrue(
             FileManager.default.fileExists(
                 atPath: paths.colmapSeedURL.appendingPathComponent("stale.txt").path
@@ -1089,6 +1140,7 @@ final class PipelineRunnerRetryTests: XCTestCase {
         try Data("stale".utf8).write(to: trainingSentinel)
         try Data("stale".utf8).write(to: paths.geometryManifestURL)
         try Data("stale".utf8).write(to: paths.pairGraphEvidenceURL)
+        try Data("stale".utf8).write(to: paths.pairGraphRecoveryURL)
         let publishedOutput = paths.outputURL.appendingPathComponent("splat.ply")
         try TestFileBuilder.writeMinimalPly(at: publishedOutput)
 
@@ -1112,6 +1164,7 @@ final class PipelineRunnerRetryTests: XCTestCase {
         XCTAssertFalse(FileManager.default.fileExists(atPath: sparseSentinel.path))
         XCTAssertFalse(FileManager.default.fileExists(atPath: paths.geometryManifestURL.path))
         XCTAssertFalse(FileManager.default.fileExists(atPath: paths.pairGraphEvidenceURL.path))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: paths.pairGraphRecoveryURL.path))
         XCTAssertFalse(FileManager.default.fileExists(atPath: trainingSentinel.path))
         XCTAssertEqual(ProjectArtifactValidator.validatePlyFile(at: publishedOutput), .valid)
     }
@@ -1158,8 +1211,8 @@ final class PipelineRunnerRetryTests: XCTestCase {
         INSERT INTO images(image_id, name, camera_id) VALUES (1, 'a.jpg', 1), (2, 'b.jpg', 1), (3, 'c.jpg', 1);
         INSERT INTO keypoints(image_id, rows, cols, data) VALUES (1, 64, 4, X'01'), (2, 64, 4, X'02'), (3, 64, 4, X'03');
         INSERT INTO descriptors(image_id, rows, cols, data) VALUES (1, 64, 128, X'01'), (2, 64, 128, X'02'), (3, 64, 128, X'03');
-        INSERT INTO matches(pair_id, rows, cols, data) VALUES (\(firstPairID), 8, 2, X'01'), (\(secondPairID), 8, 2, X'02');
-        INSERT INTO two_view_geometries(pair_id, rows, cols, data, config) VALUES (\(firstPairID), 6, 2, X'01', 2), (\(secondPairID), 6, 2, X'02', 2);
+        INSERT INTO matches(pair_id, rows, cols, data) VALUES (\(firstPairID), 24, 2, X'01'), (\(secondPairID), 24, 2, X'02');
+        INSERT INTO two_view_geometries(pair_id, rows, cols, data, config) VALUES (\(firstPairID), 18, 2, X'01', 2), (\(secondPairID), 18, 2, X'02', 2);
         """
         let sqliteResult = sqlite3_exec(database, sql, nil, nil, nil)
         sqlite3_close(database)

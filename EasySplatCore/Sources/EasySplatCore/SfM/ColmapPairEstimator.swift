@@ -41,6 +41,12 @@ struct ColmapPairPlan: Sendable, Equatable {
     let pairs: [ColmapScheduledPair]
     let sha256: String
 
+    private init(imageNames: [String], pairs: [ColmapScheduledPair], sha256: String) {
+        self.imageNames = imageNames
+        self.pairs = pairs
+        self.sha256 = sha256
+    }
+
     var pairLines: [String] { pairs.map(\.line) }
     var localPairCount: Int { pairs.count { $0.role == .local } }
     var retrievalPairCount: Int { pairs.count { $0.role == .retrieval } }
@@ -80,6 +86,21 @@ struct ColmapPairPlan: Sendable, Equatable {
             throw ColmapPairPlanningError.invalidPairPlan
         }
         return try make(imageNames: imageNames, proposedPairs: [])
+    }
+
+    static func persisted(
+        imageNames: [String],
+        scheduledPairs: [ColmapScheduledPair]
+    ) throws -> ColmapPairPlan {
+        try Task.checkCancellation()
+        guard validImageNames(imageNames) else {
+            throw ColmapPairPlanningError.invalidPairPlan
+        }
+        let plan = try make(imageNames: imageNames, proposedPairs: scheduledPairs)
+        guard plan.pairs == scheduledPairs else {
+            throw ColmapPairPlanningError.invalidPairPlan
+        }
+        return plan
     }
 
     static func temporal(groups: [ColmapPairGroup], offsets: [Int]) throws -> ColmapPairPlan {
@@ -166,6 +187,117 @@ struct ColmapPairPlan: Sendable, Equatable {
             ))
         }
         return try Self.make(imageNames: imageNames, proposedPairs: proposed)
+    }
+
+    func targetedExactRecovery(
+        verifiedGraph: ColmapVerifiedGraphSnapshot
+    ) throws -> ColmapPairPlan {
+        try Task.checkCancellation()
+        guard Self.validImageNames(imageNames) else {
+            throw ColmapPairPlanningError.invalidPairPlan
+        }
+        let indexByName = Dictionary(uniqueKeysWithValues: imageNames.enumerated().map {
+            ($0.element, $0.offset)
+        })
+        var sourcePairByEdge: [Edge: ColmapScheduledPair] = [:]
+        for pair in pairs {
+            try Task.checkCancellation()
+            guard let first = indexByName[pair.firstImageName],
+                  let second = indexByName[pair.secondImageName],
+                  first != second else {
+                throw ColmapPairPlanningError.invalidPairPlan
+            }
+            let edge = Edge(first: min(first, second), second: max(first, second))
+            guard sourcePairByEdge.updateValue(pair, forKey: edge) == nil else {
+                throw ColmapPairPlanningError.invalidPairPlan
+            }
+        }
+        guard isConnected else {
+            throw ColmapPairPlanningError.disconnectedPairSchedule
+        }
+
+        var componentByImage = Array(repeating: -1, count: imageNames.count)
+        var assignedImages: Set<String> = []
+        for (componentIndex, component) in verifiedGraph.components.enumerated() {
+            try Task.checkCancellation()
+            guard !component.isEmpty else {
+                throw ColmapPairPlanningError.invalidPairPlan
+            }
+            for imageName in component {
+                guard let imageIndex = indexByName[imageName],
+                      assignedImages.insert(imageName).inserted else {
+                    throw ColmapPairPlanningError.invalidPairPlan
+                }
+                componentByImage[imageIndex] = componentIndex
+            }
+        }
+        guard assignedImages.count == imageNames.count,
+              componentByImage.allSatisfy({ $0 >= 0 }) else {
+            throw ColmapPairPlanningError.invalidPairPlan
+        }
+
+        var verifiedEdges: Set<Edge> = []
+        var verifiedAdjacency = Array(repeating: [Int](), count: imageNames.count)
+        for pair in verifiedGraph.verifiedPairs {
+            try Task.checkCancellation()
+            guard let first = indexByName[pair.firstImageName],
+                  let second = indexByName[pair.secondImageName],
+                  first != second else {
+                throw ColmapPairPlanningError.invalidPairPlan
+            }
+            let edge = Edge(first: min(first, second), second: max(first, second))
+            guard let sourcePair = sourcePairByEdge[edge],
+                  sourcePair.role == pair.role,
+                  verifiedEdges.insert(edge).inserted,
+                  componentByImage[first] == componentByImage[second] else {
+                throw ColmapPairPlanningError.invalidPairPlan
+            }
+            verifiedAdjacency[first].append(second)
+            verifiedAdjacency[second].append(first)
+        }
+
+        for component in verifiedGraph.components {
+            try Task.checkCancellation()
+            guard let firstName = component.first,
+                  let firstIndex = indexByName[firstName] else {
+                throw ColmapPairPlanningError.invalidPairPlan
+            }
+            let expected = Set(component.compactMap { indexByName[$0] })
+            var visited: Set<Int> = [firstIndex]
+            var frontier = [firstIndex]
+            while let current = frontier.popLast() {
+                try Task.checkCancellation()
+                for neighbor in verifiedAdjacency[current]
+                    where expected.contains(neighbor)
+                        && visited.insert(neighbor).inserted {
+                    frontier.append(neighbor)
+                }
+            }
+            guard visited == expected else {
+                throw ColmapPairPlanningError.invalidPairPlan
+            }
+        }
+
+        var proposedPairs: [ColmapScheduledPair] = []
+        proposedPairs.reserveCapacity(pairs.count)
+        for pair in pairs {
+            try Task.checkCancellation()
+            guard let first = indexByName[pair.firstImageName],
+                  let second = indexByName[pair.secondImageName] else {
+                throw ColmapPairPlanningError.invalidPairPlan
+            }
+            let edge = Edge(first: min(first, second), second: max(first, second))
+            if verifiedEdges.contains(edge)
+                || componentByImage[first] != componentByImage[second]
+            {
+                proposedPairs.append(pair)
+            }
+        }
+        let recovery = try Self.make(imageNames: imageNames, proposedPairs: proposedPairs)
+        guard recovery.pairs.count <= pairs.count, recovery.isConnected else {
+            throw ColmapPairPlanningError.invalidPairPlan
+        }
+        return recovery
     }
 
     func validates(_ data: Data) -> Bool {

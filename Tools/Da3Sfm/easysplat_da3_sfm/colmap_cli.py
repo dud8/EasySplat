@@ -80,6 +80,7 @@ _REQUIRED_OPTION_FIELDS = {
         "ba_global_points_ratio",
         "ba_global_max_refinements",
         "ba_global_max_num_iterations",
+        "min_num_matches",
         "random_seed",
         "ba_refine_focal_length",
     ),
@@ -154,6 +155,7 @@ _COMMAND_OPTIONS = {
         "Mapper.ba_global_points_ratio",
         "Mapper.ba_global_max_refinements",
         "Mapper.ba_global_max_num_iterations",
+        "Mapper.min_num_matches",
         "Mapper.random_seed",
         "Mapper.ba_refine_focal_length",
     },
@@ -1129,6 +1131,11 @@ def _run_mapper(pycolmap: Any, options: dict[str, str]) -> None:
         options,
         "Mapper.ba_global_max_num_iterations",
         pipeline.ba_global_max_num_iterations,
+    )
+    pipeline.min_num_matches = _positive_integer(
+        options,
+        "Mapper.min_num_matches",
+        pipeline.min_num_matches,
     )
     pipeline.random_seed = _nonnegative_int32(
         options,

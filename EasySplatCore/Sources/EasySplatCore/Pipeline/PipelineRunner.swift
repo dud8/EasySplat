@@ -152,6 +152,10 @@ public final class PipelineRunner: @unchecked Sendable {
         var didRetryWithCpu = false
         var didRetryWithExactMatcher = false
         var pairRecoveryLevel: PairRecoveryLevel = .normal
+        var pairAttemptMode: PairAttemptMode = .policy
+        var latestPreparedPairPlan: ColmapPairPlan?
+        var latestCompletedPairPlan: ColmapPairPlan?
+        var latestCompletedPairInspection: ColmapPairGraphInspection?
         var pairGraphAttempts: [PairGraphAttemptEvidence] = []
         var attemptedPairConfigurations: Set<String> = []
         var acceptedPairGraphEvidence: PairGraphEvidence?
@@ -1284,6 +1288,217 @@ public final class PipelineRunner: @unchecked Sendable {
                             ))
                         }
                     } else {
+            func restoreAcceptedPairEvidence(_ evidence: PairGraphEvidence) throws {
+                guard let acceptedAttempt = evidence.attempts.last else {
+                    throw PairGraphEvidenceStoreError.invalidEvidence
+                }
+                let plans = try evidence.restoredPairPlans()
+                pairGraphAttempts = evidence.attempts
+                acceptedPairGraphEvidence = evidence
+                matchingDurationSeconds = evidence.matchingDurationSeconds
+                pairRecoveryLevel = PairRecoveryLevel(
+                    acceptedAttempt.artifact.recoveryLevel
+                )
+                colmapMatchOptions.descriptorMatcher = acceptedAttempt.artifact.matcher
+                didRetryWithExactMatcher = acceptedAttempt.artifact.matcher == .exact
+                latestPreparedPairPlan = plans.accepted
+                switch acceptedAttempt.purpose {
+                case .policy:
+                    pairAttemptMode = acceptedAttempt.artifact.matcher == .exact
+                        ? .sameScheduleExact(plans.accepted)
+                        : .policy
+                case .targetedExactGraphRecovery:
+                    guard let source = plans.recoverySource else {
+                        throw PairGraphEvidenceStoreError.invalidEvidence
+                    }
+                    pairAttemptMode = .targetedExact(
+                        plan: plans.accepted,
+                        source: source
+                    )
+                case .fullExactGraphRecovery:
+                    guard let source = plans.recoverySource else {
+                        throw PairGraphEvidenceStoreError.invalidEvidence
+                    }
+                    pairAttemptMode = .fullExact(source: source)
+                }
+                for reason in evidence.fallbackReasons {
+                    recordMappingFallback(reason)
+                }
+            }
+
+            let selectedImageNames = selectedFrames.map(\.lastPathComponent)
+            var selectedFramesDigestForRecovery: String?
+            var resumingPersistedExactRecovery = false
+            var recoveredAcceptedExactEvidence = false
+            var restartingAfterInvalidRecoveryState = false
+
+            func selectedFramesDigestForExactRecovery() throws -> String {
+                if let selectedFramesDigestForRecovery {
+                    return selectedFramesDigestForRecovery
+                }
+                let digest = try GeometryArtifactStore.selectedFramesDigest(
+                    orderedImageNames: selectedImageNames,
+                    projectPaths: paths
+                )
+                selectedFramesDigestForRecovery = digest
+                return digest
+            }
+
+            func exactRecoveryMode(
+                for mode: PairAttemptMode
+            ) -> PairGraphExactRecoveryMode? {
+                guard colmapMatchOptions.descriptorMatcher == .exact else {
+                    return nil
+                }
+                switch mode {
+                case .policy, .sameScheduleExact:
+                    return .sameScheduleExact
+                case .targetedExact:
+                    return .targetedExact
+                case .fullExact:
+                    return .fullExact
+                }
+            }
+
+            func persistExactRecoveryIntent(
+                mode: PairAttemptMode,
+                activePlan: ColmapPairPlan
+            ) throws {
+                guard let recoveryMode = exactRecoveryMode(for: mode) else {
+                    return
+                }
+                let state = PairGraphRecoveryState(
+                    selectedFramesDigest: try selectedFramesDigestForExactRecovery(),
+                    imageNames: selectedImageNames,
+                    mode: recoveryMode,
+                    activeRecoveryLevel: pairRecoveryLevel.artifactValue,
+                    activePlan: activePlan,
+                    attempts: pairGraphAttempts,
+                    matchingDurationSeconds: matchingDurationSeconds,
+                    fallbackReasons: mappingFallbackReasons
+                )
+                try PairGraphRecoveryStore.save(
+                    state,
+                    to: paths.pairGraphRecoveryURL,
+                    projectPaths: paths
+                )
+            }
+
+            func restorePendingExactRecovery(
+                _ recovered: RestoredPairGraphRecovery
+            ) {
+                pairGraphAttempts = recovered.attempts
+                matchingDurationSeconds = recovered.matchingDurationSeconds
+                pairRecoveryLevel = PairRecoveryLevel(recovered.recoveryLevel)
+                colmapMatchOptions.descriptorMatcher = .exact
+                didRetryWithExactMatcher = true
+                latestPreparedPairPlan = recovered.activePlan
+                switch recovered.mode {
+                case .sameScheduleExact:
+                    pairAttemptMode = .sameScheduleExact(recovered.activePlan)
+                case .targetedExact:
+                    pairAttemptMode = .targetedExact(
+                        plan: recovered.activePlan,
+                        source: recovered.sourcePlan
+                    )
+                case .fullExact:
+                    pairAttemptMode = .fullExact(source: recovered.sourcePlan)
+                }
+                for reason in recovered.fallbackReasons {
+                    recordMappingFallback(reason)
+                }
+            }
+
+            func evidenceCompletesPendingRecovery(
+                _ evidence: PairGraphEvidence,
+                recovered: RestoredPairGraphRecovery
+            ) -> Bool {
+                guard evidence.attempts.count == recovered.attempts.count + 1,
+                      Array(evidence.attempts.dropLast()) == recovered.attempts,
+                      evidence.fallbackReasons == recovered.fallbackReasons,
+                      let accepted = evidence.attempts.last,
+                      accepted.artifact.matcher == .exact,
+                      accepted.artifact.recoveryLevel == recovered.recoveryLevel,
+                      accepted.artifact.outcome == .completed,
+                      accepted.scheduledPairs == recovered.activePlan.pairs else {
+                    return false
+                }
+                switch recovered.mode {
+                case .sameScheduleExact:
+                    return accepted.purpose == .policy
+                case .targetedExact:
+                    return accepted.purpose == .targetedExactGraphRecovery
+                case .fullExact:
+                    return accepted.purpose == .fullExactGraphRecovery
+                }
+            }
+
+            let recoveryFileManager = FileManager.default
+            let recoveryFileExists = recoveryFileManager.fileExists(
+                atPath: paths.pairGraphRecoveryURL.path
+            ) || ((try? recoveryFileManager.destinationOfSymbolicLink(
+                atPath: paths.pairGraphRecoveryURL.path
+            )) != nil)
+            if recoveryFileExists {
+                do {
+                    let recoveryState = try PairGraphRecoveryStore.loadBound(
+                        from: paths.pairGraphRecoveryURL,
+                        expectedImageNames: selectedImageNames,
+                        projectPaths: paths
+                    )
+                    let recovered = try recoveryState.restoredRecovery()
+                    let completedEvidence: PairGraphEvidence?
+                    do {
+                        completedEvidence = try PairGraphEvidenceStore.loadVerified(
+                            from: paths.pairGraphEvidenceURL,
+                            expectedImageNames: selectedImageNames,
+                            databaseURL: paths.colmapDatabaseURL,
+                            projectPaths: paths
+                        )
+                    } catch is CancellationError {
+                        throw CancellationError()
+                    } catch {
+                        completedEvidence = nil
+                    }
+                    if let completedEvidence,
+                       evidenceCompletesPendingRecovery(
+                        completedEvidence,
+                        recovered: recovered
+                       ) {
+                        try restoreAcceptedPairEvidence(completedEvidence)
+                        markStageComplete(.sfmMatching)
+                        try self.removeItemIfPresent(paths.pairGraphRecoveryURL)
+                        recoveredAcceptedExactEvidence = true
+                    } else {
+                        restorePendingExactRecovery(recovered)
+                        acceptedPairGraphEvidence = nil
+                        resumingPersistedExactRecovery = true
+                    }
+                } catch is CancellationError {
+                    throw CancellationError()
+                } catch {
+                    try self.removeItemIfPresent(paths.pairGraphRecoveryURL)
+                    try self.removeItemIfPresent(paths.pairGraphEvidenceURL)
+                    pairGraphAttempts.removeAll(keepingCapacity: true)
+                    matchingDurationSeconds = 0
+                    pairRecoveryLevel = .normal
+                    pairAttemptMode = .policy
+                    latestPreparedPairPlan = nil
+                    latestCompletedPairPlan = nil
+                    latestCompletedPairInspection = nil
+                    acceptedPairGraphEvidence = nil
+                    didRetryWithExactMatcher = false
+                    colmapMatchOptions.descriptorMatcher = resolvedRunPlan.normalDescriptorMatcher
+                    pendingMatchingResetMessage = "Discarded inconsistent image-matching recovery data before resuming reconstruction."
+                    restartingAfterInvalidRecoveryState = true
+                    emit(.stageLog(
+                        stage: .sfmMatching,
+                        line: "Discarded inconsistent pair-graph recovery state and restarted matching from preserved features.",
+                        isError: true
+                    ))
+                }
+            }
+
             let runFeatures: (Bool) async throws -> Void = { force in
                 guard try (force || shouldRunStage(.sfmFeatures)) else { return }
                 currentStage = .sfmFeatures
@@ -1332,8 +1547,15 @@ public final class PipelineRunner: @unchecked Sendable {
                 acceptedPairGraphEvidence = nil
                 matchingDurationSeconds = 0
                 pairRecoveryLevel = .normal
+                pairAttemptMode = .policy
+                latestPreparedPairPlan = nil
+                latestCompletedPairPlan = nil
+                latestCompletedPairInspection = nil
                 didRetryWithExactMatcher = false
                 colmapMatchOptions.descriptorMatcher = resolvedRunPlan.normalDescriptorMatcher
+                resumingPersistedExactRecovery = false
+                recoveredAcceptedExactEvidence = false
+                restartingAfterInvalidRecoveryState = false
                 emit(.stageLog(
                     stage: .sfmFeatures,
                     line: colmapExtractOptions.useGPU ? "Using GPU for COLMAP feature extraction." : "Using CPU for COLMAP feature extraction.",
@@ -1392,27 +1614,23 @@ public final class PipelineRunner: @unchecked Sendable {
                     databaseURL: paths.colmapDatabaseURL,
                     projectPaths: paths
                 )
-                guard let acceptedAttempt = evidence.attempts.last else {
-                    throw PairGraphEvidenceStoreError.invalidEvidence
-                }
-                pairGraphAttempts = evidence.attempts
-                acceptedPairGraphEvidence = evidence
-                matchingDurationSeconds = evidence.matchingDurationSeconds
-                pairRecoveryLevel = PairRecoveryLevel(
-                    acceptedAttempt.artifact.recoveryLevel
-                )
-                colmapMatchOptions.descriptorMatcher = acceptedAttempt.artifact.matcher
-                didRetryWithExactMatcher = acceptedAttempt.artifact.matcher == .exact
-                for reason in evidence.fallbackReasons {
-                    recordMappingFallback(reason)
-                }
+                try restoreAcceptedPairEvidence(evidence)
             }
 
             let runMatching: (Bool) async throws -> Void = { force in
-                guard try (force || shouldRunStage(.sfmMatching)) else {
+                if recoveredAcceptedExactEvidence {
+                    recoveredAcceptedExactEvidence = false
+                    return
+                }
+                guard try (force
+                    || resumingPersistedExactRecovery
+                    || restartingAfterInvalidRecoveryState
+                    || shouldRunStage(.sfmMatching)) else {
                     try loadPairGraphEvidenceIfNeeded()
                     return
                 }
+                resumingPersistedExactRecovery = false
+                restartingAfterInvalidRecoveryState = false
                 currentStage = .sfmMatching
                 emit(.stageStarted(stage: .sfmMatching))
                 writeCheckpoint(
@@ -1424,11 +1642,6 @@ public final class PipelineRunner: @unchecked Sendable {
                         expectedPairs: nil,
                         processedPairs: 0
                     ))
-                )
-                self.removeIfExists(paths.pairGraphEvidenceURL)
-                try resetMatchingIfNeeded()
-                try ColmapDatabaseMatchStore.clearMatchingResults(
-                    at: paths.colmapDatabaseURL
                 )
                 emit(.stageLog(
                     stage: .sfmMatching,
@@ -1466,15 +1679,21 @@ public final class PipelineRunner: @unchecked Sendable {
                 let attemptNumber = pairGraphAttempts.count + 1
                 let attemptClock = ContinuousClock()
                 let attemptStart = attemptClock.now
-                var pairPlan = try Self.baseColmapPairPlan(
-                    imageNames: imageNames,
-                    groups: groups,
-                    resolvedPlan: resolvedRunPlan,
-                    recoveryLevel: pairRecoveryLevel
-                )
+                latestPreparedPairPlan = nil
+                latestCompletedPairPlan = nil
+                latestCompletedPairInspection = nil
+                let attemptMode = pairAttemptMode
+                var pairPlan = try attemptMode.planOverride
+                    ?? Self.baseColmapPairPlan(
+                        imageNames: imageNames,
+                        groups: groups,
+                        resolvedPlan: resolvedRunPlan,
+                        recoveryLevel: pairRecoveryLevel
+                    )
                 func recordPlanningFailure() {
                     let duration = Self.durationInSeconds(attemptClock.now - attemptStart)
                     pairGraphAttempts.append(PairGraphAttemptEvidence(
+                        purpose: attemptMode.evidencePurpose,
                         artifact: PairMatchingAttemptArtifact(
                             attemptNumber: attemptNumber,
                             matcher: colmapMatchOptions.descriptorMatcher,
@@ -1490,7 +1709,8 @@ public final class PipelineRunner: @unchecked Sendable {
                     ))
                     matchingDurationSeconds += duration
                 }
-                if let request = Self.vocabularyRetrievalRequest(
+                if attemptMode.planOverride == nil,
+                   let request = Self.vocabularyRetrievalRequest(
                     imageNames: imageNames,
                     resolvedPlan: resolvedRunPlan,
                     recoveryLevel: pairRecoveryLevel
@@ -1550,6 +1770,7 @@ public final class PipelineRunner: @unchecked Sendable {
                         pairingPolicy: resolvedRunPlan.pairingPolicy
                     )
                 }
+                latestPreparedPairPlan = pairPlan
                 guard !pairPlan.pairs.isEmpty else {
                     recordPlanningFailure()
                     throw ColmapPairPlanningError.disconnectedPairSchedule
@@ -1572,6 +1793,18 @@ public final class PipelineRunner: @unchecked Sendable {
                     attemptNumber: attemptNumber,
                     paths: paths
                 )
+                try persistExactRecoveryIntent(
+                    mode: attemptMode,
+                    activePlan: pairPlan
+                )
+                try self.removeItemIfPresent(paths.pairGraphEvidenceURL)
+                if pendingMatchingResetMessage == nil {
+                    try ColmapDatabaseMatchStore.clearMatchingResults(
+                        at: paths.colmapDatabaseURL
+                    )
+                } else {
+                    try resetMatchingIfNeeded()
+                }
                 emit(.stageLog(
                     stage: .sfmMatching,
                     line: "Pair graph: \(pairPlan.localPairCount) local, \(pairPlan.retrievalPairCount) retrieval, \(pairPlan.loopRevisitPairCount) revisit (\(pairPlan.pairs.count) total).",
@@ -1623,6 +1856,7 @@ public final class PipelineRunner: @unchecked Sendable {
                         completion: .failed
                     )
                     pairGraphAttempts.append(PairGraphAttemptEvidence(
+                        purpose: attemptMode.evidencePurpose,
                         artifact: PairMatchingAttemptArtifact(
                             attemptNumber: attemptNumber,
                             matcher: colmapMatchOptions.descriptorMatcher,
@@ -1637,11 +1871,16 @@ public final class PipelineRunner: @unchecked Sendable {
                         scheduledPairs: pairPlan.pairs
                     ))
                     matchingDurationSeconds += duration
+                    try persistExactRecoveryIntent(
+                        mode: attemptMode,
+                        activePlan: pairPlan
+                    )
                     throw matcherError
                 }
 
                 let duration = Self.durationInSeconds(attemptClock.now - attemptStart)
                 pairGraphAttempts.append(PairGraphAttemptEvidence(
+                    purpose: attemptMode.evidencePurpose,
                     artifact: PairMatchingAttemptArtifact(
                         attemptNumber: attemptNumber,
                         matcher: colmapMatchOptions.descriptorMatcher,
@@ -1656,6 +1895,8 @@ public final class PipelineRunner: @unchecked Sendable {
                     scheduledPairs: pairPlan.pairs
                 ))
                 matchingDurationSeconds += duration
+                latestCompletedPairPlan = pairPlan
+                latestCompletedPairInspection = inspection
                 guard inspection.connectedComponentCount == 1,
                       inspection.isolatedViewCount == 0 else {
                     emit(.stageLog(
@@ -1698,6 +1939,7 @@ public final class PipelineRunner: @unchecked Sendable {
                 )
                 emit(.stageFinished(stage: .sfmMatching))
                 markStageComplete(.sfmMatching)
+                try self.removeItemIfPresent(paths.pairGraphRecoveryURL)
                 try stopIfRequested(after: .sfmMatching)
             }
 
@@ -1723,6 +1965,10 @@ public final class PipelineRunner: @unchecked Sendable {
                     return false
                 }
                 pairRecoveryLevel = next
+                pairAttemptMode = .policy
+                latestPreparedPairPlan = nil
+                latestCompletedPairPlan = nil
+                latestCompletedPairInspection = nil
                 acceptedPairGraphEvidence = nil
                 recordMappingFallback(reason)
                 emit(.stageLog(
@@ -1757,13 +2003,19 @@ public final class PipelineRunner: @unchecked Sendable {
                             continue
                         }
                         if !didRetryWithExactMatcher,
+                           let sourcePlan = latestPreparedPairPlan,
                            let reason = DescriptorMatcherRecoveryPolicy.reason(
                                for: error,
                                currentMatcher: colmapMatchOptions.descriptorMatcher
                            ) {
                             didRetryWithExactMatcher = true
                             colmapMatchOptions.descriptorMatcher = .exact
+                            pairAttemptMode = .sameScheduleExact(sourcePlan)
                             recordMappingFallback("exact descriptor matching")
+                            try persistExactRecoveryIntent(
+                                mode: pairAttemptMode,
+                                activePlan: sourcePlan
+                            )
                             try self.resetDirectory(paths.colmapSparseURL)
                             acceptedPairGraphEvidence = nil
                             emit(.stageLog(
@@ -1777,6 +2029,23 @@ public final class PipelineRunner: @unchecked Sendable {
                             continue
                         }
                         let pairPlanningError = error as? ColmapPairPlanningError
+                        if pairPlanningError == .disconnectedVerifiedGraph,
+                           case .targetedExact(_, let sourcePlan) = pairAttemptMode {
+                            pairAttemptMode = .fullExact(source: sourcePlan)
+                            try persistExactRecoveryIntent(
+                                mode: pairAttemptMode,
+                                activePlan: sourcePlan
+                            )
+                            acceptedPairGraphEvidence = nil
+                            emit(.stageLog(
+                                stage: .sfmMatching,
+                                line: "The targeted exact graph remained disconnected. Retrying the complete exact schedule.",
+                                isError: true
+                            ))
+                            forceSfMRun = false
+                            forceMatchingRun = true
+                            continue
+                        }
                         if pairPlanningError == .repeatedAttempt,
                            advancePairRecovery("Image retrieval repeated the previous pair graph") {
                             forceSfMRun = false
@@ -1804,13 +2073,42 @@ public final class PipelineRunner: @unchecked Sendable {
                                        imageCount: selectedFrames.count,
                                        pairingPolicy: resolvedRunPlan.pairingPolicy
                                    ) == nil)) {
+                            guard let sourcePlan = pairPlanningError == .disconnectedVerifiedGraph
+                                ? latestCompletedPairPlan
+                                : latestPreparedPairPlan else {
+                                throw PairGraphEvidenceStoreError.invalidEvidence
+                            }
+                            let nextMode: PairAttemptMode
+                            if pairPlanningError == .disconnectedVerifiedGraph {
+                                guard let inspection = latestCompletedPairInspection else {
+                                    throw PairGraphEvidenceStoreError.invalidEvidence
+                                }
+                                let targetedPlan = try sourcePlan.targetedExactRecovery(
+                                    verifiedGraph: inspection.verifiedGraph
+                                )
+                                nextMode = targetedPlan.sha256 == sourcePlan.sha256
+                                    ? .fullExact(source: sourcePlan)
+                                    : .targetedExact(
+                                        plan: targetedPlan,
+                                        source: sourcePlan
+                                    )
+                            } else {
+                                nextMode = .sameScheduleExact(sourcePlan)
+                            }
                             didRetryWithExactMatcher = true
                             colmapMatchOptions.descriptorMatcher = .exact
-                            acceptedPairGraphEvidence = nil
+                            pairAttemptMode = nextMode
                             recordMappingFallback("exact descriptor matching")
+                            try persistExactRecoveryIntent(
+                                mode: nextMode,
+                                activePlan: nextMode.planOverride ?? sourcePlan
+                            )
+                            acceptedPairGraphEvidence = nil
                             emit(.stageLog(
                                 stage: .sfmMatching,
-                                line: "The densest FAISS graph was still disconnected. Retrying the same schedule with exact descriptor matching.",
+                                line: pairPlanningError == .disconnectedVerifiedGraph
+                                    ? "The densest FAISS graph was still disconnected. Retrying a focused exact recovery schedule."
+                                    : "The FAISS pair schedule repeated. Retrying that schedule with exact descriptor matching.",
                                 isError: true
                             ))
                             forceSfMRun = false
@@ -1927,8 +2225,7 @@ public final class PipelineRunner: @unchecked Sendable {
                         }) else {
                             throw PipelineError.outputMissing
                         }
-                        selectedMappedModel = selected.candidate
-                        selectedMappedModelSnapshot = selected.snapshot
+                        var selectedSnapshot = selected.snapshot
                         let score = selected.candidate.score
                         let modelLabel = String(selected.candidate.order)
                         writeCheckpoint(
@@ -1955,6 +2252,28 @@ public final class PipelineRunner: @unchecked Sendable {
                             score,
                             capturePath: resolvedRunPlan.capturePath
                         ) {
+                            if case .targetedExact = pairAttemptMode {
+                                do {
+                                    _ = try self.ensureTextSparseModelFiles(
+                                        at: selected.candidate.url
+                                    )
+                                    _ = try self.validatedGeometryMeasurement(
+                                        modelDirectory: selected.candidate.url,
+                                        selectedFrames: selectedFrames,
+                                        requireStrongObservationCoverage: true
+                                    )
+                                    selectedSnapshot = try self.captureMappedSparseModel(
+                                        at: selected.candidate.url
+                                    )
+                                } catch {
+                                    if error is CancellationError { throw error }
+                                    try Task.checkCancellation()
+                                    lastMappingError = Self.normalizedUnusableSparseModelError(error)
+                                    return false
+                                }
+                            }
+                            selectedMappedModel = selected.candidate
+                            selectedMappedModelSnapshot = selectedSnapshot
                             self.warnIfWeakAcceptedSolve(score: score, mapper: "colmap", emit: emit)
                             acceptedReconstructionSummary = ReconstructionSummary(
                                 score: score,
@@ -1994,9 +2313,30 @@ public final class PipelineRunner: @unchecked Sendable {
                     } catch {
                         if error is CancellationError { throw error }
                         try Task.checkCancellation()
-                        lastMappingError = error
+                        lastMappingError = Self.normalizedUnusableSparseModelError(error)
                     }
                     bundleAdjustmentCycleCount += mappingProgress.globalRefinementCycleCount
+
+                    if !mappingSucceeded,
+                       Self.shouldEscalateTargetedExact(after: lastMappingError),
+                       case .targetedExact(_, let sourcePlan) = pairAttemptMode {
+                        suspendStageTimingForRetry(.sfmMapping)
+                        pairAttemptMode = .fullExact(source: sourcePlan)
+                        try persistExactRecoveryIntent(
+                            mode: pairAttemptMode,
+                            activePlan: sourcePlan
+                        )
+                        try self.resetDirectory(paths.colmapSparseURL)
+                        acceptedPairGraphEvidence = nil
+                        emit(.stageLog(
+                            stage: .sfmMatching,
+                            line: "The focused exact graph missed the coverage gate. Retrying the complete exact schedule.",
+                            isError: true
+                        ))
+                        forceSfMRun = false
+                        forceMatchingRun = true
+                        continue sfmAttemptLoop
+                    }
 
                     if !mappingSucceeded,
                        let pipelineError = lastMappingError as? PipelineError,
@@ -2018,10 +2358,18 @@ public final class PipelineRunner: @unchecked Sendable {
                            imageCount: selectedFrames.count,
                            pairingPolicy: resolvedRunPlan.pairingPolicy
                        ) == nil {
+                        guard let sourcePlan = latestPreparedPairPlan else {
+                            throw PairGraphEvidenceStoreError.invalidEvidence
+                        }
                         suspendStageTimingForRetry(.sfmMapping)
                         didRetryWithExactMatcher = true
                         colmapMatchOptions.descriptorMatcher = .exact
+                        pairAttemptMode = .sameScheduleExact(sourcePlan)
                         recordMappingFallback("exact descriptor matching")
+                        try persistExactRecoveryIntent(
+                            mode: pairAttemptMode,
+                            activePlan: sourcePlan
+                        )
                         try self.resetDirectory(paths.colmapSparseURL)
                         acceptedPairGraphEvidence = nil
                         emit(.stageLog(

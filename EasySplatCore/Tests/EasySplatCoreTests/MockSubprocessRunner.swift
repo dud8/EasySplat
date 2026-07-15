@@ -9,7 +9,7 @@ final class MockSubprocessRunner: @unchecked Sendable, SubprocessRunning {
         let stdoutLines: [String]
         let stdoutLinesProvider: (([String]) -> [String])?
         let stderrLines: [String]
-        let onRun: (([String]) -> Void)?
+        let onRun: (([String]) throws -> Void)?
 
         init(
             path: String,
@@ -18,7 +18,7 @@ final class MockSubprocessRunner: @unchecked Sendable, SubprocessRunning {
             stdoutLines: [String] = [],
             stdoutLinesProvider: (([String]) -> [String])? = nil,
             stderrLines: [String] = [],
-            onRun: (([String]) -> Void)? = nil
+            onRun: (([String]) throws -> Void)? = nil
         ) {
             self.path = path
             self.argsPrefix = argsPrefix
@@ -64,7 +64,7 @@ final class MockSubprocessRunner: @unchecked Sendable, SubprocessRunning {
             recordedEnvironments.append(environment)
             return script
         }
-        script.onRun?(arguments)
+        try script.onRun?(arguments)
         (script.stdoutLinesProvider?(arguments) ?? script.stdoutLines).forEach(onStdout)
         script.stderrLines.forEach(onStderr)
         return script.result

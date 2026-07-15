@@ -1,4 +1,5 @@
 #if canImport(XCTest)
+import CryptoKit
 import Foundation
 import XCTest
 @testable import EasySplatCore
@@ -311,6 +312,121 @@ final class PairGraphEvidenceStoreTests: XCTestCase {
         ))
     }
 
+    func testTargetedAndFullExactRecoveryPurposesRoundTrip() throws {
+        let fixture = try makeProject()
+        defer { try? FileManager.default.removeItem(at: fixture.root) }
+        let evidence = makeExactRecoveryEvidence(includeFullRecovery: true)
+
+        try PairGraphEvidenceStore.save(
+            evidence,
+            to: fixture.paths.pairGraphEvidenceURL,
+            projectPaths: fixture.paths
+        )
+        let loaded = try PairGraphEvidenceStore.load(
+            from: fixture.paths.pairGraphEvidenceURL,
+            projectPaths: fixture.paths
+        )
+
+        XCTAssertEqual(
+            loaded.attempts.map(\.purpose),
+            [.policy, .targetedExactGraphRecovery, .fullExactGraphRecovery]
+        )
+        XCTAssertEqual(loaded, evidence)
+        let restored = try loaded.restoredPairPlans()
+        XCTAssertEqual(restored.accepted.pairs, evidence.attempts[2].scheduledPairs)
+        XCTAssertEqual(restored.recoverySource?.pairs, evidence.attempts[0].scheduledPairs)
+    }
+
+    func testDirectFullRecoveryAndFailedTargetedRetryAreValid() throws {
+        let fixture = try makeProject()
+        defer { try? FileManager.default.removeItem(at: fixture.root) }
+
+        var directFull = makeExactRecoveryEvidence(includeFullRecovery: true)
+        directFull.attempts.remove(at: 1)
+        directFull.attempts[1].artifact.attemptNumber = 2
+        directFull.acceptedAttemptNumber = 2
+        directFull.matchingDurationSeconds = 4
+        try PairGraphEvidenceStore.save(
+            directFull,
+            to: fixture.paths.pairGraphEvidenceURL,
+            projectPaths: fixture.paths
+        )
+
+        var retriedTarget = makeExactRecoveryEvidence(includeFullRecovery: false)
+        var failedTarget = retriedTarget.attempts[1]
+        failedTarget.artifact.outcome = .failed
+        retriedTarget.attempts[1].artifact.attemptNumber = 3
+        retriedTarget.attempts.insert(failedTarget, at: 1)
+        retriedTarget.acceptedAttemptNumber = 3
+        retriedTarget.matchingDurationSeconds = 5
+        try PairGraphEvidenceStore.save(
+            retriedTarget,
+            to: fixture.paths.pairGraphEvidenceURL,
+            projectPaths: fixture.paths
+        )
+    }
+
+    func testSaveRejectsInvalidExactRecoverySequence() throws {
+        let fixture = try makeProject()
+        defer { try? FileManager.default.removeItem(at: fixture.root) }
+
+        var evidence = makeExactRecoveryEvidence(includeFullRecovery: false)
+        evidence.attempts[1].artifact.matcher = .faiss
+        XCTAssertThrowsError(try PairGraphEvidenceStore.save(
+            evidence,
+            to: fixture.paths.pairGraphEvidenceURL,
+            projectPaths: fixture.paths
+        ))
+
+        evidence = makeExactRecoveryEvidence(includeFullRecovery: false)
+        evidence.attempts[1].scheduledPairs[1] = ColmapScheduledPair(
+            "a.jpg",
+            "c.jpg",
+            role: .retrieval
+        )
+        XCTAssertThrowsError(try PairGraphEvidenceStore.save(
+            evidence,
+            to: fixture.paths.pairGraphEvidenceURL,
+            projectPaths: fixture.paths
+        ))
+
+        evidence = makeExactRecoveryEvidence(includeFullRecovery: false)
+        var unrelatedPolicy = evidence.attempts[0]
+        unrelatedPolicy.artifact.attemptNumber = 2
+        unrelatedPolicy.artifact.matcher = .exact
+        evidence.attempts[1].artifact.attemptNumber = 3
+        evidence.attempts.insert(unrelatedPolicy, at: 1)
+        evidence.acceptedAttemptNumber = 3
+        evidence.matchingDurationSeconds += unrelatedPolicy.artifact.durationSeconds
+        XCTAssertThrowsError(try PairGraphEvidenceStore.save(
+            evidence,
+            to: fixture.paths.pairGraphEvidenceURL,
+            projectPaths: fixture.paths
+        ))
+
+        evidence = makeExactRecoveryEvidence(includeFullRecovery: true)
+        evidence.attempts[2].scheduledPairs.removeLast()
+        evidence.attempts[2].artifact.scheduledPairCount -= 1
+        evidence.attempts[2].artifact.attemptedPairCount -= 1
+        evidence.attempts[2].artifact.rawMatchedPairCount -= 1
+        evidence.attempts[2].artifact.spatiallyVerifiedPairCount -= 1
+        evidence.acceptedInspection.scheduledPairCount -= 1
+        evidence.acceptedInspection.attemptedPairCount -= 1
+        evidence.acceptedInspection.rawMatchedPairCount -= 1
+        evidence.acceptedInspection.spatiallyVerifiedPairCount -= 1
+        evidence.acceptedInspection.retrievalPairCount -= 1
+        let pairData = Data((evidence.attempts[2].scheduledPairs.map(\.line)
+            .joined(separator: "\n") + "\n").utf8)
+        evidence.pairListDigest = SHA256.hash(data: pairData)
+            .map { String(format: "%02x", $0) }
+            .joined()
+        XCTAssertThrowsError(try PairGraphEvidenceStore.save(
+            evidence,
+            to: fixture.paths.pairGraphEvidenceURL,
+            projectPaths: fixture.paths
+        ))
+    }
+
     func testProjectPathsUsesCanonicalEvidenceLocation() throws {
         let root = URL(fileURLWithPath: "/tmp/easysplat-project", isDirectory: true)
         let paths = ProjectPaths(root: root)
@@ -390,6 +506,90 @@ final class PairGraphEvidenceStoreTests: XCTestCase {
             acceptedInspection: inspection,
             matchingDurationSeconds: 4,
             fallbackReasons: ["denser pair graph"]
+        )
+    }
+
+    private func makeExactRecoveryEvidence(includeFullRecovery: Bool) -> PairGraphEvidence {
+        let sourcePairs = [
+            ColmapScheduledPair("a.jpg", "b.jpg", role: .local),
+            ColmapScheduledPair("a.jpg", "d.jpg", role: .retrieval),
+            ColmapScheduledPair("b.jpg", "c.jpg", role: .local),
+            ColmapScheduledPair("c.jpg", "d.jpg", role: .local),
+        ]
+        let targetedPairs = [sourcePairs[0], sourcePairs[2], sourcePairs[3]]
+        let policy = PairGraphAttemptEvidence(
+            purpose: .policy,
+            artifact: PairMatchingAttemptArtifact(
+                attemptNumber: 1,
+                matcher: .faiss,
+                recoveryLevel: .maximum,
+                outcome: .completed,
+                scheduledPairCount: sourcePairs.count,
+                attemptedPairCount: sourcePairs.count,
+                rawMatchedPairCount: targetedPairs.count,
+                spatiallyVerifiedPairCount: targetedPairs.count,
+                durationSeconds: 1
+            ),
+            scheduledPairs: sourcePairs
+        )
+        let targeted = PairGraphAttemptEvidence(
+            purpose: .targetedExactGraphRecovery,
+            artifact: PairMatchingAttemptArtifact(
+                attemptNumber: 2,
+                matcher: .exact,
+                recoveryLevel: .maximum,
+                outcome: .completed,
+                scheduledPairCount: targetedPairs.count,
+                attemptedPairCount: targetedPairs.count,
+                rawMatchedPairCount: targetedPairs.count,
+                spatiallyVerifiedPairCount: targetedPairs.count,
+                durationSeconds: 2
+            ),
+            scheduledPairs: targetedPairs
+        )
+        let full = PairGraphAttemptEvidence(
+            purpose: .fullExactGraphRecovery,
+            artifact: PairMatchingAttemptArtifact(
+                attemptNumber: 3,
+                matcher: .exact,
+                recoveryLevel: .maximum,
+                outcome: .completed,
+                scheduledPairCount: sourcePairs.count,
+                attemptedPairCount: sourcePairs.count,
+                rawMatchedPairCount: sourcePairs.count,
+                spatiallyVerifiedPairCount: sourcePairs.count,
+                durationSeconds: 3
+            ),
+            scheduledPairs: sourcePairs
+        )
+        let attempts = includeFullRecovery ? [policy, targeted, full] : [policy, targeted]
+        let acceptedPairs = attempts.last?.scheduledPairs ?? []
+        let acceptedLocalCount = acceptedPairs.count { $0.role == .local }
+        let acceptedRetrievalCount = acceptedPairs.count { $0.role == .retrieval }
+        let inspection = ColmapPairGraphInspection(
+            scheduledPairCount: acceptedPairs.count,
+            attemptedPairCount: acceptedPairs.count,
+            rawMatchedPairCount: acceptedPairs.count,
+            spatiallyVerifiedPairCount: acceptedPairs.count,
+            localPairCount: acceptedLocalCount,
+            retrievalPairCount: acceptedRetrievalCount,
+            loopRevisitPairCount: 0,
+            connectedComponentCount: 1,
+            isolatedViewCount: 0,
+            degreeP10: 1,
+            degreeMedian: 2,
+            degreeP90: 2,
+            featureDatabaseDigest: String(repeating: "b", count: 64),
+            matchingDatabaseDigest: String(repeating: "c", count: 64)
+        )
+        return PairGraphEvidence(
+            selectedFramesDigest: String(repeating: "a", count: 64),
+            imageNames: ["a.jpg", "b.jpg", "c.jpg", "d.jpg"],
+            attempts: attempts,
+            acceptedAttemptNumber: attempts.count,
+            acceptedInspection: inspection,
+            matchingDurationSeconds: attempts.reduce(0) { $0 + $1.artifact.durationSeconds },
+            fallbackReasons: ["exact descriptor matching"]
         )
     }
 }

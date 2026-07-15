@@ -1,6 +1,46 @@
 import Foundation
 
 extension PipelineRunner {
+    enum PairAttemptMode: Sendable, Equatable {
+        case policy
+        case sameScheduleExact(ColmapPairPlan)
+        case targetedExact(plan: ColmapPairPlan, source: ColmapPairPlan)
+        case fullExact(source: ColmapPairPlan)
+
+        var planOverride: ColmapPairPlan? {
+            switch self {
+            case .policy:
+                nil
+            case .sameScheduleExact(let plan):
+                plan
+            case .targetedExact(let plan, _):
+                plan
+            case .fullExact(let source):
+                source
+            }
+        }
+
+        var evidencePurpose: PairGraphAttemptPurpose {
+            switch self {
+            case .policy, .sameScheduleExact:
+                .policy
+            case .targetedExact:
+                .targetedExactGraphRecovery
+            case .fullExact:
+                .fullExactGraphRecovery
+            }
+        }
+
+        var sourcePlan: ColmapPairPlan? {
+            switch self {
+            case .targetedExact(_, let source), .fullExact(let source):
+                source
+            case .policy, .sameScheduleExact:
+                nil
+            }
+        }
+    }
+
     enum PairRecoveryLevel: Int, Sendable {
         case normal
         case expanded
@@ -33,6 +73,27 @@ extension PipelineRunner {
     enum PairPolicyError: Error, Equatable {
         case invalidSelectedFrameManifest
         case invalidRetrievalOutput
+    }
+
+    static func shouldEscalateTargetedExact(after error: Error?) -> Bool {
+        guard let error = error as? PipelineError else { return false }
+        switch error {
+        case .lowQualityReconstruction,
+             .geometryCoverageTooLow,
+             .geometryResidualCoverageTooLow,
+             .geometryRegisteredImagesMismatch,
+             .geometryResidualsUnavailable,
+             .geometryResidualsTooHigh,
+             .outputMissing:
+            return true
+        case .invalidInput,
+             .insufficientInputImages,
+             .geometryProvenanceUnavailable,
+             .videoFrameBudgetTooSmall,
+             .photoSelectionExceedsBudget,
+             .imageTranscodeFailed:
+            return false
+        }
     }
 
     static func nextPairRecoveryLevel(

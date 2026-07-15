@@ -58,6 +58,7 @@ class _IncrementalPipelineOptions:
         "ba_global_points_ratio",
         "ba_global_max_refinements",
         "ba_global_max_num_iterations",
+        "min_num_matches",
         "random_seed",
         "ba_refine_focal_length",
         "ba_use_gpu",
@@ -68,6 +69,7 @@ class _IncrementalPipelineOptions:
         self.ba_global_points_ratio = 1.1
         self.ba_global_max_refinements = 5
         self.ba_global_max_num_iterations = 50
+        self.min_num_matches = 15
         self.random_seed = -1
         self.ba_refine_focal_length = True
         self.ba_use_gpu = False
@@ -1035,6 +1037,24 @@ class ColmapCliTests(unittest.TestCase):
             stderr.getvalue(),
         )
 
+    def test_runtime_self_check_rejects_missing_mapper_inlier_floor(self) -> None:
+        runtime = self._runtime_with_required_api()
+        options = runtime.IncrementalPipelineOptions()
+        del options.min_num_matches
+        runtime.IncrementalPipelineOptions = lambda: options
+        stderr = io.StringIO()
+
+        with (
+            mock.patch.object(colmap_cli, "_load_pycolmap", return_value=runtime),
+            contextlib.redirect_stderr(stderr),
+        ):
+            self.assertEqual(colmap_cli.main(["--self-check"]), 2)
+
+        self.assertIn(
+            "IncrementalPipelineOptions.min_num_matches",
+            stderr.getvalue(),
+        )
+
     def test_feature_extractor_translates_flags_and_validates_complete_output(
         self,
     ) -> None:
@@ -1348,8 +1368,14 @@ class ColmapCliTests(unittest.TestCase):
 
     def test_mapper_propagates_bounded_refinement_options_on_cpu(self) -> None:
         calls: list[dict[str, object]] = []
+
+        def incremental_options() -> _IncrementalPipelineOptions:
+            options = _IncrementalPipelineOptions()
+            options.min_num_matches = 99
+            return options
+
         pycolmap = types.SimpleNamespace(
-            IncrementalPipelineOptions=_IncrementalPipelineOptions,
+            IncrementalPipelineOptions=incremental_options,
             incremental_mapping=lambda **kwargs: calls.append(kwargs) or {},
         )
         common = {
@@ -1366,6 +1392,7 @@ class ColmapCliTests(unittest.TestCase):
                 "Mapper.ba_global_points_ratio": "1.25",
                 "Mapper.ba_global_max_refinements": "4",
                 "Mapper.ba_global_max_num_iterations": "17",
+                "Mapper.min_num_matches": "15",
                 "Mapper.random_seed": "42",
                 "Mapper.ba_refine_focal_length": "0",
             },
@@ -1377,9 +1404,18 @@ class ColmapCliTests(unittest.TestCase):
         self.assertEqual(mapper.ba_global_points_ratio, 1.25)
         self.assertEqual(mapper.ba_global_max_refinements, 4)
         self.assertEqual(mapper.ba_global_max_num_iterations, 17)
+        self.assertEqual(mapper.min_num_matches, 15)
         self.assertEqual(mapper.random_seed, 42)
         self.assertFalse(mapper.ba_refine_focal_length)
         self.assertFalse(mapper.ba_use_gpu)
+
+    def test_mapper_parser_accepts_reviewed_minimum_match_floor(self) -> None:
+        parsed = colmap_cli._parse_options(
+            "mapper",
+            ["--Mapper.min_num_matches", "15"],
+        )
+
+        self.assertEqual(parsed, {"Mapper.min_num_matches": "15"})
 
     def test_mapper_help_exposes_supported_refinement_controls(self) -> None:
         stdout = io.StringIO()
@@ -1392,6 +1428,7 @@ class ColmapCliTests(unittest.TestCase):
             "Mapper.ba_global_points_ratio",
             "Mapper.ba_global_max_refinements",
             "Mapper.ba_global_max_num_iterations",
+            "Mapper.min_num_matches",
             "Mapper.random_seed",
             "Mapper.ba_refine_focal_length",
         ):
@@ -1420,6 +1457,7 @@ class ColmapCliTests(unittest.TestCase):
         self.assertEqual(options.ba_global_points_ratio, 1.1)
         self.assertEqual(options.ba_global_max_refinements, 5)
         self.assertEqual(options.ba_global_max_num_iterations, 50)
+        self.assertEqual(options.min_num_matches, 15)
         self.assertEqual(options.random_seed, 42)
         self.assertTrue(options.ba_refine_focal_length)
 
@@ -1438,6 +1476,7 @@ class ColmapCliTests(unittest.TestCase):
             "Mapper.ba_global_points_ratio": ("0.99", "nan", "infinity"),
             "Mapper.ba_global_max_refinements": ("0", "-1", "1.5"),
             "Mapper.ba_global_max_num_iterations": ("0", "-1", "1.5"),
+            "Mapper.min_num_matches": ("0", "-1", "1.5"),
             "Mapper.random_seed": ("-1", "2147483648", "1.5"),
             "Mapper.ba_refine_focal_length": ("true", "false", "2"),
         }

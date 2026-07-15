@@ -11,6 +11,11 @@ enum ColmapPairAttemptCompletion: Sendable, Equatable {
     case failed
 }
 
+struct ColmapVerifiedGraphSnapshot: Sendable, Equatable {
+    let verifiedPairs: [ColmapScheduledPair]
+    let components: [[String]]
+}
+
 struct ColmapPairGraphInspection: Sendable, Equatable {
     let scheduledPairCount: Int
     let attemptedPairCount: Int
@@ -26,6 +31,10 @@ struct ColmapPairGraphInspection: Sendable, Equatable {
     let degreeP90: Int
     let featureDatabaseDigest: String
     let matchingDatabaseDigest: String
+    private(set) var verifiedGraph = ColmapVerifiedGraphSnapshot(
+        verifiedPairs: [],
+        components: []
+    )
 }
 
 enum ColmapPairGraphInspectorError: Error, LocalizedError, Equatable {
@@ -206,11 +215,20 @@ struct ColmapPairGraphInspector: Sendable {
 
         let verifiedPairIDs = Set(
             verifiedRows.compactMap { pairID, rows in
-                rows > 0 ? pairID : nil
+                rows >= ColmapMappingPolicy.minimumPairInlierCount ? pairID : nil
             })
-        let graph = graphStatistics(
-            imageIDs: databaseImages.map(\.id),
-            verifiedPairIDs: verifiedPairIDs
+        let verifiedPairs = validatedSchedule.pairs.filter { pair in
+            guard let pairID = pairIDByNames[NameEdge(
+                pair.firstImageName,
+                pair.secondImageName
+            )] else {
+                return false
+            }
+            return verifiedPairIDs.contains(pairID)
+        }
+        let graph = try graphSnapshot(
+            imageNames: validatedSchedule.imageNames,
+            verifiedPairs: verifiedPairs
         )
         let databaseDigests = try ColmapDatabaseDigester.digests(in: database)
         inspection = ColmapPairGraphInspection(
@@ -227,7 +245,8 @@ struct ColmapPairGraphInspector: Sendable {
             degreeMedian: nearestRank(graph.sortedDegrees, percentile: 0.50),
             degreeP90: nearestRank(graph.sortedDegrees, percentile: 0.90),
             featureDatabaseDigest: databaseDigests.feature,
-            matchingDatabaseDigest: databaseDigests.matching
+            matchingDatabaseDigest: databaseDigests.matching,
+            verifiedGraph: graph.snapshot
         )
         try Task.checkCancellation()
         try execute(
@@ -472,38 +491,65 @@ struct ColmapPairGraphInspector: Sendable {
         }
     }
 
-    private func graphStatistics(
-        imageIDs: [Int64],
-        verifiedPairIDs: Set<Int64>
-    ) -> (componentCount: Int, isolatedCount: Int, sortedDegrees: [Int]) {
-        var parent = Dictionary(uniqueKeysWithValues: imageIDs.map { ($0, $0) })
-        var degrees = Dictionary(uniqueKeysWithValues: imageIDs.map { ($0, 0) })
+    private func graphSnapshot(
+        imageNames: [String],
+        verifiedPairs: [ColmapScheduledPair]
+    ) throws -> (
+        componentCount: Int,
+        isolatedCount: Int,
+        sortedDegrees: [Int],
+        snapshot: ColmapVerifiedGraphSnapshot
+    ) {
+        let indexByName = Dictionary(uniqueKeysWithValues: imageNames.enumerated().map {
+            ($0.element, $0.offset)
+        })
+        var parent = Array(imageNames.indices)
+        var degrees = Array(repeating: 0, count: imageNames.count)
 
-        func root(of imageID: Int64) -> Int64 {
-            var current = imageID
+        func root(of index: Int) -> Int {
+            var current = index
             while parent[current] != current {
-                current = parent[current]!
+                current = parent[current]
             }
             return current
         }
 
-        for pairID in verifiedPairIDs {
-            let first = pairID / Self.pairIDDivisor
-            let second = pairID % Self.pairIDDivisor
-            degrees[first, default: 0] += 1
-            degrees[second, default: 0] += 1
+        for pair in verifiedPairs {
+            try Task.checkCancellation()
+            guard let first = indexByName[pair.firstImageName],
+                  let second = indexByName[pair.secondImageName] else {
+                throw ColmapPairGraphInspectorError.scheduledPairUnknownImage(
+                    indexByName[pair.firstImageName] == nil
+                        ? pair.firstImageName
+                        : pair.secondImageName
+                )
+            }
+            degrees[first] += 1
+            degrees[second] += 1
             let firstRoot = root(of: first)
             let secondRoot = root(of: second)
             if firstRoot != secondRoot {
                 parent[secondRoot] = firstRoot
             }
         }
-        let roots = Set(imageIDs.map { root(of: $0) })
-        let sortedDegrees = imageIDs.map { degrees[$0, default: 0] }.sorted()
+
+        var membersByRoot: [Int: [String]] = [:]
+        for index in imageNames.indices {
+            try Task.checkCancellation()
+            membersByRoot[root(of: index), default: []].append(imageNames[index])
+        }
+        let components = membersByRoot.values.sorted { first, second in
+            indexByName[first[0]]! < indexByName[second[0]]!
+        }
+        let sortedDegrees = degrees.sorted()
         return (
-            componentCount: roots.count,
+            componentCount: components.count,
             isolatedCount: sortedDegrees.count(where: { $0 == 0 }),
-            sortedDegrees: sortedDegrees
+            sortedDegrees: sortedDegrees,
+            snapshot: ColmapVerifiedGraphSnapshot(
+                verifiedPairs: verifiedPairs,
+                components: components
+            )
         )
     }
 

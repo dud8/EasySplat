@@ -137,6 +137,7 @@ extension PipelineRunner {
             URL(fileURLWithPath: databaseURL.path + "-journal"),
             paths.colmapFeatureEvidenceURL,
             paths.pairGraphEvidenceURL,
+            paths.pairGraphRecoveryURL,
             paths.colmapSeedURL,
             paths.colmapSparseURL,
             paths.geometryManifestURL,
@@ -178,6 +179,7 @@ extension PipelineRunner {
             try self.removeItemIfPresent(paths.colmapDatabaseURL)
             try self.removeItemIfPresent(paths.colmapFeatureEvidenceURL)
             try self.removeItemIfPresent(paths.pairGraphEvidenceURL)
+            try self.removeItemIfPresent(paths.pairGraphRecoveryURL)
             try self.removeItemIfPresent(paths.colmapSeedURL)
             try removeAcceptedGeometryAndTraining()
         case .selectFrames:
@@ -186,12 +188,14 @@ extension PipelineRunner {
             try self.removeItemIfPresent(paths.colmapDatabaseURL)
             try self.removeItemIfPresent(paths.colmapFeatureEvidenceURL)
             try self.removeItemIfPresent(paths.pairGraphEvidenceURL)
+            try self.removeItemIfPresent(paths.pairGraphRecoveryURL)
             try self.removeItemIfPresent(paths.colmapSeedURL)
             try removeAcceptedGeometryAndTraining()
         case .sfmFeatures:
             try self.removeItemIfPresent(paths.colmapDatabaseURL)
             try self.removeItemIfPresent(paths.colmapFeatureEvidenceURL)
             try self.removeItemIfPresent(paths.pairGraphEvidenceURL)
+            try self.removeItemIfPresent(paths.pairGraphRecoveryURL)
             try self.removeItemIfPresent(paths.colmapSeedURL)
             try removeAcceptedGeometryAndTraining()
         case .sfmMatching:
@@ -207,6 +211,7 @@ extension PipelineRunner {
                 )
             }
             try self.removeItemIfPresent(paths.pairGraphEvidenceURL)
+            try self.removeItemIfPresent(paths.pairGraphRecoveryURL)
             try removeAcceptedGeometryAndTraining()
         case .sfmMapping:
             try removeAcceptedGeometryAndTraining()
@@ -291,6 +296,7 @@ extension PipelineRunner {
         }
         if boundaryIndex < matchingIndex {
             try removeInvalidatedItem(paths.pairGraphEvidenceURL)
+            try removeInvalidatedItem(paths.pairGraphRecoveryURL)
         }
         if boundaryIndex < mappingIndex {
             try removeInvalidatedItem(paths.colmapSparseURL)

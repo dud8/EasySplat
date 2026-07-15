@@ -27,6 +27,18 @@ private enum SparseModelPublicationError: Error, LocalizedError {
 }
 
 extension PipelineRunner {
+    static func normalizedUnusableSparseModelError(_ error: Error) -> Error {
+        guard let publicationError = error as? SparseModelPublicationError else {
+            return error
+        }
+        switch publicationError {
+        case .unsafeLayout:
+            return PipelineError.outputMissing
+        case .atomicRenameFailed:
+            return error
+        }
+    }
+
     func sparseModelFilesExist(at url: URL) -> Bool {
         let fm = FileManager.default
         let binFiles = ["cameras.bin", "images.bin", "points3D.bin"]

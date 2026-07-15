@@ -43,6 +43,7 @@ final class PipelineFeatureRecoverySafetyTests: XCTestCase {
             URL(fileURLWithPath: paths.colmapDatabaseURL.path + "-journal"),
             paths.colmapFeatureEvidenceURL,
             paths.pairGraphEvidenceURL,
+            paths.pairGraphRecoveryURL,
             paths.colmapSeedURL.appendingPathComponent("pairs_attempt_1.txt"),
             paths.colmapSparseURL.appendingPathComponent("stale.txt"),
             paths.geometryManifestURL,

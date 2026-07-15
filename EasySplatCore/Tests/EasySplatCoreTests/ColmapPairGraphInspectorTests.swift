@@ -77,14 +77,14 @@ final class ColmapPairGraphInspectorTests: XCTestCase {
         let databaseURL = try makeDatabase(
             imageIDs: [2, 7, 11, 20],
             matches: [
-                (pairID(2, 7), 12),
-                (pairID(7, 11), 18),
+                (pairID(2, 7), 20),
+                (pairID(7, 11), 22),
                 (pairID(11, 20), 0),
                 (pairID(2, 20), 9),
             ],
             verified: [
-                (pairID(2, 7), 8),
-                (pairID(7, 11), 10),
+                (pairID(2, 7), 15),
+                (pairID(7, 11), 16),
                 (pairID(11, 20), 0),
                 (pairID(2, 20), 0),
             ]
@@ -118,6 +118,14 @@ final class ColmapPairGraphInspectorTests: XCTestCase {
         XCTAssertEqual(result.degreeP90, 2)
         XCTAssertEqual(result.featureDatabaseDigest.count, 64)
         XCTAssertEqual(result.matchingDatabaseDigest.count, 64)
+        XCTAssertEqual(result.verifiedGraph.verifiedPairs, [
+            ColmapScheduledPair(imageName(2), imageName(7), role: .local),
+            ColmapScheduledPair(imageName(7), imageName(11), role: .retrieval),
+        ])
+        XCTAssertEqual(result.verifiedGraph.components, [
+            [imageName(2), imageName(7), imageName(11)],
+            [imageName(20)],
+        ])
     }
 
     func testZeroRowPairsAreAttemptedButNotMatchedOrVerified() throws {
@@ -141,13 +149,37 @@ final class ColmapPairGraphInspectorTests: XCTestCase {
         XCTAssertEqual(result.degreeP10, 0)
         XCTAssertEqual(result.degreeMedian, 0)
         XCTAssertEqual(result.degreeP90, 0)
+        XCTAssertTrue(result.verifiedGraph.verifiedPairs.isEmpty)
+        XCTAssertEqual(result.verifiedGraph.components, [
+            [imageName(3)],
+            [imageName(9)],
+        ])
+    }
+
+    func testPairBelowMapperInlierFloorDoesNotConnectGraph() throws {
+        let databaseURL = try makeDatabase(
+            imageIDs: [3, 9],
+            matches: [(pairID(3, 9), 30)],
+            verified: [(pairID(3, 9), 14)]
+        )
+        let schedule = makeSchedule(imageIDs: [3, 9], pairs: [(3, 9, .local)])
+
+        let result = try ColmapPairGraphInspector(databaseURL: databaseURL).inspect(
+            schedule: schedule,
+            completion: .succeeded
+        )
+
+        XCTAssertEqual(result.spatiallyVerifiedPairCount, 0)
+        XCTAssertEqual(result.connectedComponentCount, 2)
+        XCTAssertEqual(result.isolatedViewCount, 2)
+        XCTAssertTrue(result.verifiedGraph.verifiedPairs.isEmpty)
     }
 
     func testNoncontiguousPositiveImageIDsAreSupported() throws {
         let databaseURL = try makeDatabase(
             imageIDs: [1, 41, 10_003],
-            matches: [(pairID(1, 10_003), 6)],
-            verified: [(pairID(1, 10_003), 4)]
+            matches: [(pairID(1, 10_003), 20)],
+            verified: [(pairID(1, 10_003), 15)]
         )
         let schedule = makeSchedule(
             imageIDs: [1, 41, 10_003],
@@ -161,13 +193,73 @@ final class ColmapPairGraphInspectorTests: XCTestCase {
 
         XCTAssertEqual(result.connectedComponentCount, 2)
         XCTAssertEqual(result.isolatedViewCount, 1)
+        XCTAssertEqual(result.verifiedGraph.verifiedPairs, [
+            ColmapScheduledPair(imageName(10_003), imageName(1), role: .retrieval),
+        ])
+        XCTAssertEqual(result.verifiedGraph.components, [
+            [imageName(1), imageName(10_003)],
+            [imageName(41)],
+        ])
+    }
+
+    func testVerifiedGraphSnapshotIsIndependentOfDatabaseRowOrder() throws {
+        let imageIDs = [40, 3, 900, 12, 77]
+        let scheduledPairs: [(Int, Int, ColmapPairRole)] = [
+            (40, 3, .local),
+            (900, 12, .retrieval),
+            (12, 77, .loopRevisit),
+            (3, 900, .retrieval),
+        ]
+        let matches: [(Int64, Int64)] = [
+            (pairID(3, 40), 20),
+            (pairID(12, 900), 20),
+            (pairID(12, 77), 0),
+            (pairID(3, 900), 0),
+        ]
+        let verified: [(Int64, Int64)] = [
+            (pairID(3, 40), 15),
+            (pairID(12, 900), 16),
+            (pairID(12, 77), 0),
+            (pairID(3, 900), 0),
+        ]
+        let schedule = makeSchedule(imageIDs: imageIDs, pairs: scheduledPairs)
+        let firstDatabase = try makeDatabase(
+            imageIDs: imageIDs,
+            matches: matches,
+            verified: verified
+        )
+        let secondDatabase = try makeDatabase(
+            imageIDs: imageIDs.reversed(),
+            matches: matches.reversed(),
+            verified: verified.reversed()
+        )
+
+        let first = try ColmapPairGraphInspector(databaseURL: firstDatabase).inspect(
+            schedule: schedule,
+            completion: .succeeded
+        )
+        let second = try ColmapPairGraphInspector(databaseURL: secondDatabase).inspect(
+            schedule: schedule,
+            completion: .succeeded
+        )
+
+        XCTAssertEqual(first.verifiedGraph, second.verifiedGraph)
+        XCTAssertEqual(first.verifiedGraph.verifiedPairs, [
+            ColmapScheduledPair(imageName(40), imageName(3), role: .local),
+            ColmapScheduledPair(imageName(900), imageName(12), role: .retrieval),
+        ])
+        XCTAssertEqual(first.verifiedGraph.components, [
+            [imageName(40), imageName(3)],
+            [imageName(900), imageName(12)],
+            [imageName(77)],
+        ])
     }
 
     func testSupportsZeroAndNoncontiguousImageIDs() throws {
         let databaseURL = try makeDatabase(
             imageIDs: [0, 5, 91],
-            matches: [(pairID(0, 5), 7)],
-            verified: [(pairID(0, 5), 5)]
+            matches: [(pairID(0, 5), 20)],
+            verified: [(pairID(0, 5), 15)]
         )
         let schedule = makeSchedule(imageIDs: [0, 5], pairs: [(0, 5, .local)])
         let completeSchedule = ColmapPairSchedule(
@@ -187,8 +279,8 @@ final class ColmapPairGraphInspectorTests: XCTestCase {
     func testSuccessfulAttemptRequiresEveryScheduledPairInBothTables() throws {
         let databaseURL = try makeDatabase(
             imageIDs: [1, 2, 3],
-            matches: [(pairID(1, 2), 5)],
-            verified: [(pairID(1, 2), 3)]
+            matches: [(pairID(1, 2), 20)],
+            verified: [(pairID(1, 2), 15)]
         )
         let schedule = makeSchedule(
             imageIDs: [1, 2, 3],
@@ -214,8 +306,8 @@ final class ColmapPairGraphInspectorTests: XCTestCase {
     func testFailedAttemptAcceptsAValidPartialSchedule() throws {
         let databaseURL = try makeDatabase(
             imageIDs: [1, 2, 3],
-            matches: [(pairID(1, 2), 5)],
-            verified: [(pairID(1, 2), 3)]
+            matches: [(pairID(1, 2), 20)],
+            verified: [(pairID(1, 2), 15)]
         )
         let schedule = makeSchedule(
             imageIDs: [1, 2, 3],
