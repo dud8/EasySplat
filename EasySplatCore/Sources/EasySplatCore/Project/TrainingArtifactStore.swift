@@ -132,7 +132,7 @@ public enum TrainingArtifactStore {
         case .balanced: (7_000, 800)
         case .highDetail: (15_000, 1_500)
         }
-        guard artifact.schemaVersion == 2,
+        guard artifact.schemaVersion == TrainingArtifact.currentSchemaVersion,
               !artifact.trainerVersion.isEmpty,
               !artifact.runtimeVersion.isEmpty,
               isSHA256(artifact.trainerBuildDigest),
@@ -164,7 +164,8 @@ public enum TrainingArtifactStore {
                   artifact.completedIteration < artifact.iterationLimit,
                   artifact.outputPath == nil,
                   artifact.outputSHA256 == nil,
-                  artifact.outputBytes == nil else {
+                  artifact.outputBytes == nil,
+                  artifact.sceneBounds == nil else {
                 throw TrainingArtifactStoreError.invalidManifest
             }
             _ = try projectPaths.resolveProjectRelativePath(path)
@@ -177,7 +178,8 @@ public enum TrainingArtifactStore {
                   outputBytes > 0,
                   artifact.completedIteration > 0,
                   artifact.checkpointPath == nil,
-                  artifact.checkpointDigest == nil else {
+                  artifact.checkpointDigest == nil,
+                  artifact.sceneBounds?.isValid == true else {
                 throw TrainingArtifactStoreError.invalidManifest
             }
             _ = try projectPaths.resolveProjectRelativePath(path)

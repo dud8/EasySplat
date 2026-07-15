@@ -228,6 +228,10 @@ final class ProjectMetadataStoreTests: XCTestCase {
             memoryBudgetBytes: 8_589_934_592,
             rasterFallbackCount: 0,
             droppedIntersectionCount: 0,
+            sceneBounds: SplatSceneBounds(
+                center: .init(x: 0, y: 0, z: 0),
+                radius: 1
+            ),
             completionStatus: .completed
         )
         let metadata = ProjectMetadata(

@@ -376,6 +376,7 @@ PY
   [ "$(printf '%s\n' "$self_check" | wc -l | tr -d ' ')" = "1" ] || die "self-check did not emit exactly one JSON line"
   grep -Fq '"event":"self_check"' <<<"$self_check" || die "self-check event missing"
   grep -Fq '"status":"ok"' <<<"$self_check" || die "self-check status missing"
+  grep -Fq '"scene_bounds_status":"ok"' <<<"$self_check" || die "scene-bounds self-check status missing"
 }
 
 promote_install() {

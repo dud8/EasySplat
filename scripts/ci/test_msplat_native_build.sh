@@ -112,7 +112,7 @@ for forbidden in 'pip install' 'python-build-standalone' 'site-packages' '_core.
   require_absent "$forbidden" "$BUILD_SCRIPT"
 done
 
-for flag in --dataset --output --profile --checkpoint --resume --seed --memory-budget-bytes --events-fd --self-check --validate-ply --version --help; do
+for flag in --dataset --output --profile --checkpoint --resume --seed --expected-input-digest --expected-geometry-digest --memory-budget-bytes --events-fd --self-check --validate-ply --version --help; do
   require_contains "$flag" "$OVERLAY"
 done
 for flag in --input --num-iters --num-downscales --downscale-factor --eval --events-jsonl; do
@@ -308,7 +308,7 @@ done
 done
 "$BIN" --version | grep -Fq '1.1.3' || fail "CLI version does not report 1.1.3"
 help="$($BIN --help)"
-for flag in --dataset --output --profile --checkpoint --resume --seed --memory-budget-bytes --events-fd --self-check --validate-ply --version --help; do
+for flag in --dataset --output --profile --checkpoint --resume --seed --expected-input-digest --expected-geometry-digest --memory-budget-bytes --events-fd --self-check --validate-ply --version --help; do
   grep -Fq -- "$flag" <<<"$help" || fail "CLI help is missing $flag"
 done
 for flag in --input --num-iters --num-downscales --downscale-factor --eval --events-jsonl; do
@@ -326,6 +326,7 @@ require_contains '"schema_version":1' "$self_check_stdout"
 require_contains '"sequence":1' "$self_check_stdout"
 require_contains '"event":"self_check"' "$self_check_stdout"
 require_contains '"status":"ok"' "$self_check_stdout"
+require_contains '"scene_bounds_status":"ok"' "$self_check_stdout"
 
 negative_dir="$(mktemp -d "${TMPDIR:-/tmp}/easysplat-msplat-negative.XXXXXX")"
 "$BIN" --self-check --events-fd 3 \
@@ -606,6 +607,19 @@ if completed.get("stop_reason") not in {"iteration_limit", "plateau"}:
     raise SystemExit("completed event has an invalid stop reason")
 if completed.get("gaussian_count", 0) <= 0 or completed.get("output_bytes", 0) <= 0:
     raise SystemExit("completed event is missing output evidence")
+scene_center = completed.get("scene_center")
+scene_radius = completed.get("scene_radius")
+if (
+    not isinstance(scene_center, list)
+    or len(scene_center) != 3
+    or any(isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value)
+           for value in scene_center)
+    or isinstance(scene_radius, bool)
+    or not isinstance(scene_radius, (int, float))
+    or not math.isfinite(scene_radius)
+    or scene_radius <= 0
+):
+    raise SystemExit("completed event has invalid robust scene bounds")
 memory_records = [
     record
     for record in records
@@ -746,6 +760,38 @@ printf 'not an image\n' >"$extra_file_dataset/images/notes.txt"
 assert_identity_input_rejected \
   "extra-file" "$extra_file_dataset" 'supported|ordinary|image'
 
+identity_mismatch_dir="$negative_dir/expected-identity-mismatch"
+identity_mismatch_checkpoint="$identity_mismatch_dir/checkpoint"
+mkdir -p "$identity_mismatch_checkpoint/generations"
+printf 'preserve-current\n' >"$identity_mismatch_checkpoint/CURRENT"
+printf 'preserve-generation\n' >"$identity_mismatch_checkpoint/generations/sentinel"
+set +e
+"$BIN" \
+  --dataset "$fixture_root/01-sphere-500" \
+  --output "$identity_mismatch_dir/splat.ply" \
+  --profile fast \
+  --checkpoint "$identity_mismatch_checkpoint" \
+  --seed 42 \
+  --expected-input-digest "$(printf '0%.0s' {1..64})" \
+  --expected-geometry-digest "$(printf '1%.0s' {1..64})" \
+  --memory-budget-bytes 536870912 \
+  --events-fd 1 \
+  >"$identity_mismatch_dir/events.jsonl" 2>"$identity_mismatch_dir/stderr.log"
+identity_mismatch_status=$?
+set -e
+[ "$identity_mismatch_status" -eq 1 ] \
+  || fail "expected dataset identity mismatch exited with status $identity_mismatch_status"
+[ ! -s "$identity_mismatch_dir/events.jsonl" ] \
+  || fail "expected dataset identity mismatch emitted a training event"
+[ ! -e "$identity_mismatch_dir/splat.ply" ] \
+  || fail "expected dataset identity mismatch published an output"
+require_contains 'preserve-current' "$identity_mismatch_checkpoint/CURRENT"
+require_contains 'preserve-generation' "$identity_mismatch_checkpoint/generations/sentinel"
+[ "$(find "$identity_mismatch_checkpoint" -type f | wc -l | tr -d ' ')" = "2" ] \
+  || fail "expected dataset identity mismatch changed durable checkpoint contents"
+grep -qi 'expected digests' "$identity_mismatch_dir/stderr.log" \
+  || fail "expected dataset identity mismatch diagnostic is not useful"
+
 require_file "$RASTER_TEST_BIN"
 [ -x "$RASTER_TEST_BIN" ] || fail "raster parity test is not executable: $RASTER_TEST_BIN"
 "$RASTER_TEST_BIN" \
@@ -841,6 +887,7 @@ mkdir -p "$overflow_dir"
 validate_jsonl "$overflow_dir/events.jsonl"
 python3 - "$overflow_dir" <<'PY'
 import json
+import math
 import sys
 from pathlib import Path
 
@@ -870,6 +917,19 @@ if completed.get("dropped_intersection_count") != 0:
     raise SystemExit("overflow run dropped raster intersections")
 if completed.get("memory_budget_bytes") != 100663296:
     raise SystemExit("completion lost the explicit memory budget")
+scene_center = completed.get("scene_center")
+scene_radius = completed.get("scene_radius")
+if (
+    not isinstance(scene_center, list)
+    or len(scene_center) != 3
+    or any(isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value)
+           for value in scene_center)
+    or isinstance(scene_radius, bool)
+    or not isinstance(scene_radius, (int, float))
+    or not math.isfinite(scene_radius)
+    or scene_radius <= 0
+):
+    raise SystemExit("overflow completion lost robust scene bounds")
 current = (root / "checkpoint" / "CURRENT").read_text().strip()
 manifest = json.loads(
     (root / "checkpoint" / "generations" / current / "manifest.json").read_text()

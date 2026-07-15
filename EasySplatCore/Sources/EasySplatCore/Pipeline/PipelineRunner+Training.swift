@@ -481,8 +481,13 @@ extension PipelineRunner {
         profile: DetailProfile,
         seed: UInt64,
         resolvedPlan: ResolvedRunPlan,
+        datasetIdentity: MsplatDatasetIdentity,
         paths: ProjectPaths
     ) throws -> TrainingArtifact {
+        guard result.inputDigest == datasetIdentity.inputDigest,
+              result.geometryDigest == datasetIdentity.geometryDigest else {
+            throw PipelineError.outputMissing
+        }
         let outputURL = paths.msplatOutputURL
         guard result.memoryBudgetBytes == resolvedPlan.trainerMemoryBudgetBytes,
               result.droppedIntersectionCount == 0,
@@ -514,6 +519,7 @@ extension PipelineRunner {
             memoryBudgetBytes: result.memoryBudgetBytes,
             rasterFallbackCount: result.rasterFallbackCount,
             droppedIntersectionCount: result.droppedIntersectionCount,
+            sceneBounds: result.sceneBounds,
             completionStatus: .completed
         )
         var currentMetadata = try ProjectMetadataStore.load(from: paths.metadataURL)

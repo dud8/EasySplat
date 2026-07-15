@@ -2,9 +2,14 @@ import CryptoKit
 import Darwin
 import Foundation
 
-struct MsplatDatasetIdentity: Sendable, Equatable {
-    let inputDigest: String
-    let geometryDigest: String
+public struct MsplatDatasetIdentity: Sendable, Equatable {
+    public let inputDigest: String
+    public let geometryDigest: String
+
+    public init(inputDigest: String, geometryDigest: String) {
+        self.inputDigest = inputDigest
+        self.geometryDigest = geometryDigest
+    }
 
     private static let supportedImageExtensions: Set<String> = ["jpg", "jpeg", "png"]
 

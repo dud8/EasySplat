@@ -134,6 +134,252 @@ const TrainingProfileConfig &trainingProfileNamed(const std::string &name) {
     return *match;
 }
 
+struct SceneBounds {
+    std::array<double, 3> center {};
+    double radius = 0;
+};
+
+struct GaussianBoundsSample {
+    std::array<double, 3> position {};
+    double largestPhysicalScale = 0;
+    double alpha = 0;
+};
+
+double stableSigmoid(double value) {
+    if (value >= 0) {
+        return 1.0 / (1.0 + std::exp(-value));
+    }
+    const double exponential = std::exp(value);
+    return exponential / (1.0 + exponential);
+}
+
+std::optional<GaussianBoundsSample> makeBoundsSample(
+    const float *position,
+    const float *logScales,
+    float opacityLogit
+) {
+    if (!std::isfinite(opacityLogit)) return std::nullopt;
+    GaussianBoundsSample sample;
+    for (std::size_t axis = 0; axis < 3; ++axis) {
+        if (!std::isfinite(position[axis]) || !std::isfinite(logScales[axis])) {
+            return std::nullopt;
+        }
+        sample.position[axis] = position[axis];
+        const double physicalScale = std::exp(static_cast<double>(logScales[axis]));
+        if (!std::isfinite(physicalScale) || physicalScale <= 0 ||
+            physicalScale > std::numeric_limits<float>::max()) {
+            return std::nullopt;
+        }
+        sample.largestPhysicalScale = std::max(
+            sample.largestPhysicalScale,
+            physicalScale
+        );
+    }
+    sample.alpha = stableSigmoid(opacityLogit);
+    if (!std::isfinite(sample.alpha)) return std::nullopt;
+    return sample;
+}
+
+double sortedMedian(std::vector<double> values) {
+    if (values.empty()) throw std::runtime_error("scene bounds have no samples");
+    std::sort(values.begin(), values.end());
+    const std::size_t middle = values.size() / 2;
+    if ((values.size() & 1U) != 0) return values[middle];
+    return values[middle - 1] + (values[middle] - values[middle - 1]) * 0.5;
+}
+
+SceneBounds robustSceneBounds(const std::vector<GaussianBoundsSample> &finiteSamples) {
+    if (finiteSamples.empty()) {
+        throw std::runtime_error("final Gaussians contain no finite scene-bounds samples");
+    }
+
+    std::vector<GaussianBoundsSample> opaqueSamples;
+    opaqueSamples.reserve(finiteSamples.size());
+    for (const auto &sample : finiteSamples) {
+        if (sample.alpha >= 0.01) opaqueSamples.push_back(sample);
+    }
+    // A handful of surviving alpha values cannot define robust scene scale. Require
+    // at least eight samples (or every sample in a tiny fixture) and one per thousand
+    // for large models before excluding low-alpha Gaussians.
+    const std::size_t minimumOpaqueCount = std::min(
+        finiteSamples.size(),
+        std::max<std::size_t>(
+            8,
+            (finiteSamples.size() + 999) / 1000
+        )
+    );
+    const auto &samples = opaqueSamples.size() >= minimumOpaqueCount
+        ? opaqueSamples
+        : finiteSamples;
+
+    SceneBounds bounds;
+    for (std::size_t axis = 0; axis < 3; ++axis) {
+        std::vector<double> coordinates;
+        coordinates.reserve(samples.size());
+        for (const auto &sample : samples) coordinates.push_back(sample.position[axis]);
+        bounds.center[axis] = sortedMedian(std::move(coordinates));
+    }
+
+    std::vector<double> extents;
+    extents.reserve(samples.size());
+    for (const auto &sample : samples) {
+        const double x = sample.position[0] - bounds.center[0];
+        const double y = sample.position[1] - bounds.center[1];
+        const double z = sample.position[2] - bounds.center[2];
+        const double distance = std::hypot(std::hypot(x, y), z);
+        const double extent = distance + 3.0 * sample.largestPhysicalScale;
+        if (!std::isfinite(extent) || extent <= 0) continue;
+        extents.push_back(extent);
+    }
+    if (extents.empty()) {
+        throw std::runtime_error("final Gaussians have no finite positive extents");
+    }
+    std::sort(extents.begin(), extents.end());
+    // Deterministic nearest-rank p99.5: ceil(0.995 * N) - 1.
+    const std::size_t rank = std::max<std::size_t>(
+        1,
+        (995 * extents.size() + 999) / 1000
+    );
+    bounds.radius = extents[std::min(rank, extents.size()) - 1];
+    if (!std::isfinite(bounds.center[0]) || !std::isfinite(bounds.center[1]) ||
+        !std::isfinite(bounds.center[2]) || !std::isfinite(bounds.radius) ||
+        bounds.radius <= 0) {
+        throw std::runtime_error("computed scene bounds are not finite and positive");
+    }
+    return bounds;
+}
+
+SceneBounds robustSceneBounds(const Model &model) {
+    if (model.num_active <= 0 || model.means.numel() < model.num_active * 3LL ||
+        model.scales.numel() < model.num_active * 3LL ||
+        model.opacities.numel() < model.num_active) {
+        throw std::runtime_error("final Gaussian tensors are incomplete");
+    }
+    msplat_gpu_sync();
+    const float *means = model.means.data<float>();
+    const float *scales = model.scales.data<float>();
+    const float *opacities = model.opacities.data<float>();
+    if (model.keepCrs && (!std::isfinite(model.scale) || model.scale <= 0 ||
+        !std::isfinite(model.translation[0]) || !std::isfinite(model.translation[1]) ||
+        !std::isfinite(model.translation[2]))) {
+        throw std::runtime_error("final Gaussian coordinate transform is invalid");
+    }
+    std::vector<GaussianBoundsSample> samples;
+    samples.reserve(static_cast<std::size_t>(model.num_active));
+    for (int index = 0; index < model.num_active; ++index) {
+        auto sample = makeBoundsSample(
+            means + index * 3,
+            scales + index * 3,
+            opacities[index]
+        );
+        if (sample) {
+            if (model.keepCrs) {
+                bool outputTransformIsFinite = true;
+                for (std::size_t axis = 0; axis < 3; ++axis) {
+                    sample->position[axis] =
+                        sample->position[axis] / model.scale + model.translation[axis];
+                    outputTransformIsFinite = outputTransformIsFinite &&
+                        std::isfinite(sample->position[axis]) &&
+                        std::abs(sample->position[axis]) <= std::numeric_limits<float>::max();
+                }
+                sample->largestPhysicalScale /= model.scale;
+                outputTransformIsFinite = outputTransformIsFinite &&
+                    std::isfinite(sample->largestPhysicalScale) &&
+                    sample->largestPhysicalScale > 0 &&
+                    sample->largestPhysicalScale <= std::numeric_limits<float>::max();
+                if (!outputTransformIsFinite) continue;
+            }
+            samples.push_back(*sample);
+        }
+    }
+    return robustSceneBounds(samples);
+}
+
+void verifySceneBoundsSelfCheck() {
+    auto requireNear = [](double actual, double expected, const char *label) {
+        if (!std::isfinite(actual) || std::abs(actual - expected) > 1e-9) {
+            throw std::runtime_error(std::string("scene-bounds self-check failed: ") + label);
+        }
+    };
+    auto sample = [](double x, double y, double z, double scale, double alpha) {
+        return GaussianBoundsSample {{x, y, z}, scale, alpha};
+    };
+
+    std::vector<GaussianBoundsSample> outlierFixture(
+        199,
+        sample(0, 0, 0, 1, 0.5)
+    );
+    outlierFixture.push_back(sample(10'000, 0, 0, 1, 0.5));
+    const SceneBounds outlierBounds = robustSceneBounds(outlierFixture);
+    requireNear(outlierBounds.center[0], 0, "coordinate median");
+    requireNear(outlierBounds.radius, 3, "p99.5 outlier rejection");
+
+    std::vector<GaussianBoundsSample> opacityFixture(
+        100,
+        sample(1'000, 0, 0, 1, 0.001)
+    );
+    for (int index = 0; index < 8; ++index) {
+        opacityFixture.push_back(sample(2, -1, 4, 2, 0.5));
+    }
+    const SceneBounds opacityBounds = robustSceneBounds(opacityFixture);
+    requireNear(opacityBounds.center[0], 2, "alpha-qualified center");
+    requireNear(opacityBounds.radius, 6, "alpha-qualified radius");
+
+    const float anisotropicPosition[] = {0, 0, 0};
+    const float anisotropicLogScales[] = {
+        0,
+        static_cast<float>(std::log(4.0)),
+        static_cast<float>(std::log(2.0)),
+    };
+    const auto anisotropic = makeBoundsSample(
+        anisotropicPosition,
+        anisotropicLogScales,
+        0
+    );
+    if (!anisotropic) throw std::runtime_error("scene-bounds anisotropic fixture was rejected");
+    const SceneBounds anisotropicBounds = robustSceneBounds({*anisotropic});
+    if (std::abs(anisotropicBounds.radius - 12.0) > 1e-5) {
+        throw std::runtime_error("scene-bounds self-check failed: stored log-scale conversion");
+    }
+
+    const float invalidPosition[] = {
+        std::numeric_limits<float>::quiet_NaN(), 0, 0,
+    };
+    const float validLogScales[] = {0, 0, 0};
+    if (makeBoundsSample(invalidPosition, validLogScales, 0)) {
+        throw std::runtime_error("scene-bounds self-check failed: non-finite position accepted");
+    }
+    const float invalidLogScales[] = {
+        0, std::numeric_limits<float>::infinity(), 0,
+    };
+    const float overflowingLogScales[] = {0, 100, 0};
+    if (makeBoundsSample(anisotropicPosition, invalidLogScales, 0) ||
+        makeBoundsSample(anisotropicPosition, overflowingLogScales, 0) ||
+        makeBoundsSample(
+            anisotropicPosition,
+            validLogScales,
+            std::numeric_limits<float>::quiet_NaN()
+        )) {
+        throw std::runtime_error("scene-bounds self-check failed: non-finite parameter accepted");
+    }
+
+    std::vector<GaussianBoundsSample> lowAlphaFallback;
+    for (int index = 0; index < 7; ++index) {
+        lowAlphaFallback.push_back(sample(5, 6, 7, 1, 0.5));
+    }
+    lowAlphaFallback.push_back(sample(5, 6, 7, 1, 0.001));
+    const SceneBounds fallbackBounds = robustSceneBounds(lowAlphaFallback);
+    requireNear(fallbackBounds.center[1], 6, "low-alpha deterministic fallback");
+    requireNear(fallbackBounds.radius, 3, "low-alpha fallback radius");
+
+    const SceneBounds allLowAlphaBounds = robustSceneBounds({
+        sample(-2, 3, 1, 0.5, 0.001),
+        sample(-2, 3, 1, 0.5, 0.001),
+    });
+    requireNear(allLowAlphaBounds.center[2], 1, "all-low-alpha center fallback");
+    requireNear(allLowAlphaBounds.radius, 1.5, "all-low-alpha radius fallback");
+}
+
 struct TrainingIdentity {
     std::string inputDigest;
     std::string geometryDigest;
@@ -1472,6 +1718,8 @@ int main(int argc, char *argv[]) {
     std::string profileName;
     std::string checkpointPath;
     std::string resumePath;
+    std::string expectedInputDigest;
+    std::string expectedGeometryDigest;
     std::uint64_t seed = 42;
     std::uint64_t memoryBudgetBytes = 0;
     int eventsFileDescriptor = -1;
@@ -1495,6 +1743,16 @@ int main(int argc, char *argv[]) {
     );
     CLI::Option *checkpointOption = app.add_option(
         "--checkpoint", checkpointPath, "Atomic optimizer-checkpoint directory"
+    );
+    app.add_option(
+        "--expected-input-digest",
+        expectedInputDigest,
+        "Expected SHA-256 digest of the prepared training images"
+    );
+    app.add_option(
+        "--expected-geometry-digest",
+        expectedGeometryDigest,
+        "Expected SHA-256 digest of the prepared sparse geometry"
     );
     app.add_option("--resume", resumePath, "Validated optimizer-checkpoint directory");
     CLI::Option *eventsOption = app.add_option(
@@ -1534,7 +1792,12 @@ int main(int argc, char *argv[]) {
             }
             msplat_gpu_sync();
             verifyOrientationOverlaySelfCheck();
-            events->emit("self_check", {{"status", "ok"}, {"version", APP_VERSION}});
+            verifySceneBoundsSelfCheck();
+            events->emit("self_check", {
+                {"scene_bounds_status", "ok"},
+                {"status", "ok"},
+                {"version", APP_VERSION},
+            });
             if (!events->enabled()) std::cout << "Metal self-check passed\n";
             return 0;
         }
@@ -1550,6 +1813,14 @@ int main(int argc, char *argv[]) {
         }
         if (checkpointOption->count() == 0) {
             throw std::runtime_error("--checkpoint is required for training");
+        }
+        if (expectedInputDigest.empty() != expectedGeometryDigest.empty() ||
+            (!expectedInputDigest.empty() &&
+             (!isLowercaseHex(expectedInputDigest) ||
+              !isLowercaseHex(expectedGeometryDigest)))) {
+            throw std::runtime_error(
+                "expected dataset digests must be paired lowercase SHA-256 values"
+            );
         }
         if (eventsOption->count() == 0) throw std::runtime_error("--events-fd is required for training");
         const TrainingProfileConfig &profile = trainingProfileNamed(profileName);
@@ -1570,6 +1841,13 @@ int main(int argc, char *argv[]) {
             datasetPath,
             orientation.contentDigest
         );
+        if (!expectedInputDigest.empty() &&
+            (identity.inputDigest != expectedInputDigest ||
+             identity.geometryDigest != expectedGeometryDigest)) {
+            throw std::runtime_error(
+                "prepared dataset identity does not match the expected digests"
+            );
+        }
         const std::string trainerBuildDigest = computeTrainerBuildDigest();
 
         InputData inputData = inputDataFromX(datasetPath);
@@ -2053,6 +2331,7 @@ int main(int argc, char *argv[]) {
 
         if (handleCancellation()) return 130;
 
+        const SceneBounds sceneBounds = robustSceneBounds(model);
         if (!savePlyAtomically(model, outputPath, completedIteration)) {
             if (handleCancellation()) return 130;
             throw std::runtime_error("final output was not published");
@@ -2076,6 +2355,8 @@ int main(int argc, char *argv[]) {
                           {"raster_fallback_count", finalRasterStats.fallback_count},
                           {"dropped_intersection_count",
                            finalRasterStats.dropped_intersection_count},
+                          {"scene_center", sceneBounds.center},
+                          {"scene_radius", sceneBounds.radius},
                           {"seed", seed},
                           {"stop_reason", stopReason},
                           {"trainer_build_digest", trainerBuildDigest},

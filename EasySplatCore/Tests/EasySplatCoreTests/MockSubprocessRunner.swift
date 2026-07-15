@@ -7,6 +7,7 @@ final class MockSubprocessRunner: @unchecked Sendable, SubprocessRunning {
         let argsPrefix: [String]
         let result: SubprocessResult
         let stdoutLines: [String]
+        let stdoutLinesProvider: (([String]) -> [String])?
         let stderrLines: [String]
         let onRun: (([String]) -> Void)?
 
@@ -15,6 +16,7 @@ final class MockSubprocessRunner: @unchecked Sendable, SubprocessRunning {
             argsPrefix: [String],
             result: SubprocessResult,
             stdoutLines: [String] = [],
+            stdoutLinesProvider: (([String]) -> [String])? = nil,
             stderrLines: [String] = [],
             onRun: (([String]) -> Void)? = nil
         ) {
@@ -22,6 +24,7 @@ final class MockSubprocessRunner: @unchecked Sendable, SubprocessRunning {
             self.argsPrefix = argsPrefix
             self.result = result
             self.stdoutLines = stdoutLines
+            self.stdoutLinesProvider = stdoutLinesProvider
             self.stderrLines = stderrLines
             self.onRun = onRun
         }
@@ -62,7 +65,7 @@ final class MockSubprocessRunner: @unchecked Sendable, SubprocessRunning {
             return script
         }
         script.onRun?(arguments)
-        script.stdoutLines.forEach(onStdout)
+        (script.stdoutLinesProvider?(arguments) ?? script.stdoutLines).forEach(onStdout)
         script.stderrLines.forEach(onStderr)
         return script.result
     }

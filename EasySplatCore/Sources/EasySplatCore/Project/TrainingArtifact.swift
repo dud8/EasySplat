@@ -5,7 +5,39 @@ public enum TrainingCompletionStatus: String, Codable, Sendable, Equatable {
     case completed
 }
 
+public struct ScenePoint3D: Codable, Sendable, Equatable {
+    public var x: Double
+    public var y: Double
+    public var z: Double
+
+    public init(x: Double, y: Double, z: Double) {
+        self.x = x
+        self.y = y
+        self.z = z
+    }
+
+    var isFinite: Bool {
+        x.isFinite && y.isFinite && z.isFinite
+    }
+}
+
+public struct SplatSceneBounds: Codable, Sendable, Equatable {
+    public var center: ScenePoint3D
+    public var radius: Double
+
+    public init(center: ScenePoint3D, radius: Double) {
+        self.center = center
+        self.radius = radius
+    }
+
+    var isValid: Bool {
+        center.isFinite && radius.isFinite && radius > 0
+    }
+}
+
 public struct TrainingArtifact: Codable, Sendable, Equatable {
+    public static let currentSchemaVersion = 3
+
     public var schemaVersion: Int
     public var trainerVersion: String
     public var runtimeVersion: String
@@ -28,10 +60,11 @@ public struct TrainingArtifact: Codable, Sendable, Equatable {
     public var memoryBudgetBytes: Int64
     public var rasterFallbackCount: Int
     public var droppedIntersectionCount: Int
+    public var sceneBounds: SplatSceneBounds?
     public var completionStatus: TrainingCompletionStatus
 
     public init(
-        schemaVersion: Int = 2,
+        schemaVersion: Int = currentSchemaVersion,
         trainerVersion: String,
         runtimeVersion: String,
         trainerBuildDigest: String,
@@ -53,6 +86,7 @@ public struct TrainingArtifact: Codable, Sendable, Equatable {
         memoryBudgetBytes: Int64,
         rasterFallbackCount: Int,
         droppedIntersectionCount: Int,
+        sceneBounds: SplatSceneBounds? = nil,
         completionStatus: TrainingCompletionStatus
     ) {
         self.schemaVersion = schemaVersion
@@ -77,6 +111,7 @@ public struct TrainingArtifact: Codable, Sendable, Equatable {
         self.memoryBudgetBytes = memoryBudgetBytes
         self.rasterFallbackCount = rasterFallbackCount
         self.droppedIntersectionCount = droppedIntersectionCount
+        self.sceneBounds = sceneBounds
         self.completionStatus = completionStatus
     }
 

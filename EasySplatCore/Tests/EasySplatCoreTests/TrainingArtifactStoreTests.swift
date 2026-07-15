@@ -76,6 +76,58 @@ final class TrainingArtifactStoreTests: XCTestCase {
         )
     }
 
+    func testCompletedArtifactRequiresFinitePositiveSceneBounds() throws {
+        let context = try makeContext()
+        defer { context.cleanup() }
+        let completed = try makeCompletedArtifact(in: context)
+
+        var missing = completed
+        missing.sceneBounds = nil
+        XCTAssertThrowsError(
+            try TrainingArtifactStore.save(
+                missing,
+                to: context.paths.trainingManifestURL,
+                projectPaths: context.paths
+            )
+        )
+
+        let invalidBounds = [
+            SplatSceneBounds(center: .init(x: .nan, y: 0, z: 0), radius: 1),
+            SplatSceneBounds(center: .init(x: 0, y: .infinity, z: 0), radius: 1),
+            SplatSceneBounds(center: .init(x: 0, y: 0, z: 0), radius: 0),
+            SplatSceneBounds(center: .init(x: 0, y: 0, z: 0), radius: .infinity),
+        ]
+        for bounds in invalidBounds {
+            var invalid = completed
+            invalid.sceneBounds = bounds
+            XCTAssertThrowsError(
+                try TrainingArtifactStore.save(
+                    invalid,
+                    to: context.paths.trainingManifestURL,
+                    projectPaths: context.paths
+                )
+            )
+        }
+    }
+
+    func testCheckpointedArtifactCannotClaimFinalSceneBounds() throws {
+        let context = try makeContext()
+        defer { context.cleanup() }
+        var artifact = makeCheckpointedArtifact()
+        artifact.sceneBounds = SplatSceneBounds(
+            center: .init(x: 1, y: 2, z: 3),
+            radius: 4
+        )
+
+        XCTAssertThrowsError(
+            try TrainingArtifactStore.save(
+                artifact,
+                to: context.paths.trainingManifestURL,
+                projectPaths: context.paths
+            )
+        )
+    }
+
     func testArtifactRejectsFallbackCountsOutsideCompletedIterationsAndNativeRange() throws {
         let context = try makeContext()
         defer { context.cleanup() }
@@ -95,19 +147,20 @@ final class TrainingArtifactStoreTests: XCTestCase {
         }
     }
 
-    func testTrainingSchemaOneIsRejected() throws {
+    func testPriorTrainingSchemasAreRejected() throws {
         let context = try makeContext()
         defer { context.cleanup() }
         var artifact = makeCheckpointedArtifact()
-        artifact.schemaVersion = 1
-
-        XCTAssertThrowsError(
-            try TrainingArtifactStore.save(
-                artifact,
-                to: context.paths.trainingManifestURL,
-                projectPaths: context.paths
+        for schema in [1, 2] {
+            artifact.schemaVersion = schema
+            XCTAssertThrowsError(
+                try TrainingArtifactStore.save(
+                    artifact,
+                    to: context.paths.trainingManifestURL,
+                    projectPaths: context.paths
+                )
             )
-        )
+        }
     }
 
     func testSaveRequiresMeasuredPeakMemoryForNewArtifacts() throws {
@@ -216,6 +269,102 @@ final class TrainingArtifactStoreTests: XCTestCase {
                 at: publicOutput
             )
         )
+    }
+
+    func testCompletionForDifferentDatasetPreservesPriorArtifactAndPublicOutput() throws {
+        let context = try makeContext()
+        defer { context.cleanup() }
+        var metadata = context.metadata
+        var priorArtifact = try makeCompletedArtifact(in: context)
+        let publicOutput = context.paths.outputURL.appendingPathComponent("splat.ply")
+        try FileManager.default.copyItem(at: context.paths.msplatOutputURL, to: publicOutput)
+        priorArtifact.outputPath = "Output/splat.ply"
+        try TrainingArtifactStore.persist(
+            priorArtifact,
+            metadata: &metadata,
+            paths: context.paths
+        )
+        let priorPublicBytes = try Data(contentsOf: publicOutput)
+
+        try TestFileBuilder.writeMinimalPly(
+            at: context.paths.msplatOutputURL,
+            vertexCount: 2
+        )
+        let requestedOptions = RequestedRunOptions(
+            capturePath: .orbit,
+            detailProfile: .balanced
+        )
+        let plan = RunPlanResolver.resolve(
+            requestedOptions: requestedOptions,
+            input: metadata.input,
+            hardware: HardwareProfile(memoryGB: 48, cpuCount: 16, gpuWorkingSetGB: 36),
+            developmentOverrides: .none
+        )
+        let datasetIdentity = MsplatDatasetIdentity(
+            inputDigest: String(repeating: "b", count: 64),
+            geometryDigest: String(repeating: "c", count: 64)
+        )
+        let outputBytes = Int64(
+            try XCTUnwrap(
+                context.paths.msplatOutputURL.resourceValues(forKeys: [.fileSizeKey]).fileSize
+            )
+        )
+        let mismatchedIdentities = [
+            (String(repeating: "f", count: 64), datasetIdentity.geometryDigest),
+            (datasetIdentity.inputDigest, String(repeating: "f", count: 64)),
+        ]
+        let runner = PipelineRunner(
+            projectURL: context.root,
+            config: .init(toolchain: TestToolchains.toolchainPaths(root: context.root))
+        )
+
+        for (inputDigest, geometryDigest) in mismatchedIdentities {
+            let result = MsplatTrainingResult(
+                profile: .balanced,
+                iterationLimit: plan.trainerIterationLimit,
+                plateauWindow: plan.plateauWindow,
+                completedIteration: plan.trainerIterationLimit,
+                stopReason: .iterationLimit,
+                gaussianCount: 2,
+                elapsedSeconds: 2,
+                peakMemoryBytes: 2_147_483_648,
+                memoryBudgetBytes: plan.trainerMemoryBudgetBytes,
+                rasterFallbackCount: 0,
+                droppedIntersectionCount: 0,
+                sceneBounds: SplatSceneBounds(
+                    center: .init(x: 0, y: 0, z: 0),
+                    radius: 2
+                ),
+                outputBytes: outputBytes,
+                inputDigest: inputDigest,
+                geometryDigest: geometryDigest,
+                trainerBuildDigest: String(repeating: "a", count: 64),
+                latestCheckpoint: nil
+            )
+
+            XCTAssertThrowsError(
+                try runner.persistMsplatCompletion(
+                    result,
+                    profile: .balanced,
+                    seed: plan.deterministicSeed,
+                    resolvedPlan: plan,
+                    datasetIdentity: datasetIdentity,
+                    paths: context.paths
+                )
+            )
+            XCTAssertEqual(
+                try ProjectMetadataStore.load(from: context.paths.metadataURL).trainingArtifact,
+                priorArtifact
+            )
+            XCTAssertEqual(
+                try TrainingArtifactStore.load(
+                    from: context.paths.trainingManifestURL,
+                    projectPaths: context.paths
+                ),
+                priorArtifact
+            )
+            XCTAssertEqual(try Data(contentsOf: publicOutput), priorPublicBytes)
+        }
     }
 
     func testCheckpointedArtifactRequiresExactCheckpointNamespaceAndNoOutput() throws {
@@ -461,6 +610,10 @@ final class TrainingArtifactStoreTests: XCTestCase {
             )
         )
         artifact.gaussianCount = 1
+        artifact.sceneBounds = SplatSceneBounds(
+            center: .init(x: 0.25, y: -0.5, z: 1.5),
+            radius: 3.75
+        )
         artifact.completionStatus = .completed
         return artifact
     }

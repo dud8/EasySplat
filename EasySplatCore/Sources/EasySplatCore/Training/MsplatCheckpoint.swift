@@ -208,7 +208,7 @@ enum MsplatCheckpointValidator {
         artifact: TrainingArtifact
     ) throws -> MsplatCheckpointReceipt {
         do {
-            guard artifact.schemaVersion == 2,
+            guard artifact.schemaVersion == TrainingArtifact.currentSchemaVersion,
                   artifact.completionStatus == .checkpointed,
                   artifact.trainerVersion == "1.1.3 (git 106499b)",
                   artifact.runtimeVersion == "native-metal-cli-v1",
@@ -228,7 +228,8 @@ enum MsplatCheckpointValidator {
                       artifact.rasterFallbackCount,
                       through: artifact.completedIteration
                   ),
-                  artifact.droppedIntersectionCount == 0 else {
+                  artifact.droppedIntersectionCount == 0,
+                  artifact.sceneBounds == nil else {
                 throw MsplatCheckpointValidationError("training manifest has no compatible resume record")
             }
             let peakMemoryBytes = artifact.peakMemoryBytes

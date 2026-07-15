@@ -112,6 +112,7 @@ public struct MsplatTrainingResult: Sendable, Equatable {
     public let memoryBudgetBytes: Int64
     public let rasterFallbackCount: Int
     public let droppedIntersectionCount: Int
+    public let sceneBounds: SplatSceneBounds
     public let outputBytes: Int64
     public let inputDigest: String
     public let geometryDigest: String
@@ -130,6 +131,7 @@ public final class MsplatRunner: Sendable {
         msplatPath: URL,
         datasetPath: URL,
         outputPath: URL,
+        expectedIdentity: MsplatDatasetIdentity,
         checkpointPath requestedCheckpointPath: URL? = nil,
         resumeFrom: URL? = nil,
         profile: DetailProfile,
@@ -210,6 +212,8 @@ public final class MsplatRunner: Sendable {
             "--profile", contract.argument,
             "--checkpoint", checkpointPath.path,
             "--seed", String(seed),
+            "--expected-input-digest", expectedIdentity.inputDigest,
+            "--expected-geometry-digest", expectedIdentity.geometryDigest,
             "--memory-budget-bytes", String(memoryBudgetBytes),
             "--events-fd", "1",
         ]
@@ -220,6 +224,7 @@ public final class MsplatRunner: Sendable {
             contract: contract,
             seed: seed,
             memoryBudgetBytes: memoryBudgetBytes,
+            expectedIdentity: expectedIdentity,
             checkpointURL: checkpointPath,
             resumeRequested: resumeFrom != nil,
             onProgress: onProgress,
@@ -410,6 +415,7 @@ private struct MsplatNativeEvent: Decodable {
     let etaSeconds: Double?
     let loss: Double?
     let lossIteration: Int?
+    let lastImprovementIteration: Int?
     let outputBytes: Int64?
     let stopReason: String?
     let reason: String?
@@ -431,8 +437,59 @@ private struct MsplatNativeEvent: Decodable {
     let requiredBytes: Int64?
     let budgetBytes: Int64?
     let maximumBufferBytes: Int64?
+    let sceneCenter: [Double]?
+    let sceneRadius: Double?
 
     enum CodingKeys: String, CodingKey {
+        case event
+        case schemaVersion = "schema_version"
+        case sequence
+        case version
+        case trainerBuildDigest = "trainer_build_digest"
+        case inputDigest = "input_digest"
+        case geometryDigest = "geometry_digest"
+        case profile
+        case seed
+        case iteration
+        case iterationLimit = "iteration_limit"
+        case plateauWindow = "plateau_window"
+        case cameraCount = "camera_count"
+        case initialGaussianCount = "initial_gaussian_count"
+        case gaussianCount = "gaussian_count"
+        case peakMemoryBytes = "peak_memory_bytes"
+        case memoryBudgetBytes = "memory_budget_bytes"
+        case elapsedSeconds = "elapsed_seconds"
+        case iterationsPerSecond = "iterations_per_second"
+        case etaSeconds = "eta_seconds"
+        case loss
+        case lossIteration = "loss_iteration"
+        case lastImprovementIteration = "last_improvement_iteration"
+        case outputBytes = "output_bytes"
+        case stopReason = "stop_reason"
+        case reason
+        case resumed
+        case checkpointSchema = "checkpoint_schema"
+        case payloadSchema = "payload_schema"
+        case checkpointGeneration = "checkpoint_generation"
+        case checkpointPayloadSHA256 = "checkpoint_payload_sha256"
+        case checkpointPayloadBytes = "checkpoint_payload_bytes"
+        case checkpointIteration = "checkpoint_iteration"
+        case signal
+        case cameraIndex = "camera_index"
+        case firstOverflowIteration = "first_overflow_iteration"
+        case fallbackCount = "fallback_count"
+        case rasterFallbackCount = "raster_fallback_count"
+        case droppedIntersectionCount = "dropped_intersection_count"
+        case intersectionCount = "intersection_count"
+        case allocationBytes = "allocation_bytes"
+        case requiredBytes = "required_bytes"
+        case budgetBytes = "budget_bytes"
+        case maximumBufferBytes = "max_buffer_bytes"
+        case sceneCenter = "scene_center"
+        case sceneRadius = "scene_radius"
+    }
+
+    private enum Field: String, Hashable {
         case event
         case schemaVersion = "schema_version"
         case sequence
@@ -476,6 +533,121 @@ private struct MsplatNativeEvent: Decodable {
         case requiredBytes = "required_bytes"
         case budgetBytes = "budget_bytes"
         case maximumBufferBytes = "max_buffer_bytes"
+        case sceneCenter = "scene_center"
+        case sceneRadius = "scene_radius"
+        case lastImprovementIteration = "last_improvement_iteration"
+    }
+
+    private static let envelopeFields: Set<Field> = [
+        .event, .schemaVersion, .sequence,
+    ]
+    private static let resumeRejectedFields: Set<Field> = [
+        .reason,
+    ]
+    private static let startedFields: Set<Field> = [
+        .cameraCount, .checkpointSchema, .droppedIntersectionCount, .geometryDigest,
+        .initialGaussianCount, .inputDigest, .iteration, .iterationLimit,
+        .memoryBudgetBytes, .payloadSchema, .plateauWindow, .profile,
+        .rasterFallbackCount, .resumed, .seed, .trainerBuildDigest, .version,
+    ]
+    private static let checkpointFields: Set<Field> = [
+        .checkpointGeneration, .checkpointPayloadBytes, .checkpointPayloadSHA256,
+        .droppedIntersectionCount, .gaussianCount, .geometryDigest, .inputDigest,
+        .iteration, .memoryBudgetBytes, .peakMemoryBytes, .profile,
+        .rasterFallbackCount, .seed, .trainerBuildDigest, .version,
+    ]
+    private static let progressFields: Set<Field> = [
+        .elapsedSeconds, .etaSeconds, .gaussianCount, .iteration, .iterationLimit,
+        .iterationsPerSecond, .loss, .lossIteration,
+    ]
+    private static let earlyStopFields: Set<Field> = [
+        .iteration, .lastImprovementIteration, .loss, .lossIteration, .plateauWindow,
+        .reason,
+    ]
+    private static let rasterReplayFields: Set<Field> = [
+        .budgetBytes, .cameraIndex, .firstOverflowIteration, .intersectionCount,
+        .iteration, .requiredBytes,
+    ]
+    private static let rasterFallbackFields: Set<Field> = [
+        .allocationBytes, .fallbackCount, .intersectionCount, .iteration,
+    ]
+    private static let rasterMemoryBudgetExceededFields: Set<Field> = [
+        .allocationBytes, .budgetBytes, .intersectionCount, .iteration, .requiredBytes,
+    ]
+    private static let rasterResourceLimitExceededFields: Set<Field> = [
+        .allocationBytes, .intersectionCount, .iteration, .maximumBufferBytes,
+        .requiredBytes,
+    ]
+    private static let cancellationRequestedFields: Set<Field> = [
+        .iteration, .signal,
+    ]
+    private static let cancelledFields: Set<Field> = [
+        .checkpointGeneration, .checkpointIteration, .checkpointPayloadSHA256,
+        .droppedIntersectionCount, .geometryDigest, .inputDigest, .iteration,
+        .memoryBudgetBytes, .rasterFallbackCount,
+    ]
+    private static let completedFields: Set<Field> = [
+        .droppedIntersectionCount, .elapsedSeconds, .gaussianCount, .geometryDigest,
+        .inputDigest, .iteration, .iterationLimit, .memoryBudgetBytes, .outputBytes,
+        .peakMemoryBytes, .plateauWindow, .profile, .rasterFallbackCount,
+        .sceneCenter, .sceneRadius, .seed, .stopReason, .trainerBuildDigest, .version,
+    ]
+
+    static func decodeClosedSchema(from data: Data) throws -> Self {
+        let json = try JSONSerialization.jsonObject(with: data)
+        guard let object = json as? [String: Any],
+              let eventName = object[Field.event.rawValue] as? String else {
+            throw MsplatEventProtocolError("event record must be a JSON object with an event type")
+        }
+        let unknownFields = object.keys.filter { Field(rawValue: $0) == nil }.sorted()
+        guard unknownFields.isEmpty else {
+            throw MsplatEventProtocolError(
+                "event \(eventName) contains unknown fields: \(unknownFields.joined(separator: ", "))"
+            )
+        }
+
+        let eventFields: Set<Field>
+        switch eventName {
+        case "resume_rejected":
+            eventFields = resumeRejectedFields
+        case "started":
+            eventFields = startedFields
+        case "checkpoint_loaded", "checkpoint_completed":
+            eventFields = checkpointFields
+        case "progress":
+            eventFields = progressFields
+        case "early_stop":
+            eventFields = earlyStopFields
+        case "raster_replay":
+            eventFields = rasterReplayFields
+        case "raster_fallback":
+            eventFields = rasterFallbackFields
+        case "raster_memory_budget_exceeded":
+            eventFields = rasterMemoryBudgetExceededFields
+        case "raster_resource_limit_exceeded":
+            eventFields = rasterResourceLimitExceededFields
+        case "cancellation_requested":
+            eventFields = cancellationRequestedFields
+        case "cancelled":
+            eventFields = cancelledFields
+        case "completed":
+            eventFields = completedFields
+        default:
+            throw MsplatEventProtocolError("event type \(eventName) is not valid during training")
+        }
+
+        let presentFields = Set(object.keys.compactMap(Field.init(rawValue:)))
+        let misplacedFields = presentFields
+            .subtracting(envelopeFields.union(eventFields))
+            .map(\.rawValue)
+            .sorted()
+        guard misplacedFields.isEmpty else {
+            throw MsplatEventProtocolError(
+                "event \(eventName) contains fields from another event: "
+                    + misplacedFields.joined(separator: ", ")
+            )
+        }
+        return try JSONDecoder().decode(Self.self, from: data)
     }
 }
 
@@ -484,6 +656,7 @@ private final class MsplatEventStream: @unchecked Sendable {
     private let contract: MsplatProfileContract
     private let seed: UInt64
     private let memoryBudgetBytes: Int64
+    private let expectedIdentity: MsplatDatasetIdentity
     private let checkpointURL: URL
     private let resumeRequested: Bool
     private let onProgress: @Sendable (MsplatTrainingProgress) -> Void
@@ -515,6 +688,7 @@ private final class MsplatEventStream: @unchecked Sendable {
         contract: MsplatProfileContract,
         seed: UInt64,
         memoryBudgetBytes: Int64,
+        expectedIdentity: MsplatDatasetIdentity,
         checkpointURL: URL,
         resumeRequested: Bool,
         onProgress: @escaping @Sendable (MsplatTrainingProgress) -> Void,
@@ -524,6 +698,7 @@ private final class MsplatEventStream: @unchecked Sendable {
         self.contract = contract
         self.seed = seed
         self.memoryBudgetBytes = memoryBudgetBytes
+        self.expectedIdentity = expectedIdentity
         self.checkpointURL = checkpointURL
         self.resumeRequested = resumeRequested
         self.onProgress = onProgress
@@ -542,8 +717,7 @@ private final class MsplatEventStream: @unchecked Sendable {
             lineCount += 1
             guard failure == nil else { return }
             do {
-                let event = try JSONDecoder().decode(
-                    MsplatNativeEvent.self,
+                let event = try MsplatNativeEvent.decodeClosedSchema(
                     from: Data(trimmed.utf8)
                 )
                 let effect = try accept(event)
@@ -686,8 +860,12 @@ private final class MsplatEventStream: @unchecked Sendable {
                   isSHA256(eventInputDigest),
                   isSHA256(eventGeometryDigest),
                   isSHA256(eventTrainerBuildDigest),
+                  eventInputDigest == expectedIdentity.inputDigest,
+                  eventGeometryDigest == expectedIdentity.geometryDigest,
                   resumeRequested || iteration == 0 else {
-                throw MsplatEventProtocolError("event started record is incomplete or duplicated")
+                throw MsplatEventProtocolError(
+                    "event started identity or run contract does not match the prepared dataset"
+                )
             }
             try validateContract(event)
             startIteration = iteration
@@ -860,7 +1038,15 @@ private final class MsplatEventStream: @unchecked Sendable {
                   event.plateauWindow == contract.plateauWindow,
                   let iteration = event.iteration,
                   iteration >= lastIteration,
-                  iteration <= contract.iterationLimit else {
+                  iteration <= contract.iterationLimit,
+                  let lastImprovementIteration = event.lastImprovementIteration,
+                  lastImprovementIteration >= 0,
+                  lastImprovementIteration <= iteration,
+                  iteration - lastImprovementIteration >= contract.plateauWindow,
+                  let loss = event.loss,
+                  loss.isFinite,
+                  loss >= 0,
+                  event.lossIteration == iteration else {
                 throw MsplatEventProtocolError("event early_stop record is invalid")
             }
             lastIteration = iteration
@@ -903,6 +1089,12 @@ private final class MsplatEventStream: @unchecked Sendable {
                   let elapsed = event.elapsedSeconds,
                   let peakMemoryBytes = event.peakMemoryBytes,
                   let outputBytes = event.outputBytes,
+                  let sceneCenter = event.sceneCenter,
+                  sceneCenter.count == 3,
+                  sceneCenter.allSatisfy(\.isFinite),
+                  let sceneRadius = event.sceneRadius,
+                  sceneRadius.isFinite,
+                  sceneRadius > 0,
                   let rawStopReason = event.stopReason,
                   let stopReason = MsplatStopReason(rawValue: rawStopReason),
                   iteration >= lastIteration,
@@ -946,6 +1138,14 @@ private final class MsplatEventStream: @unchecked Sendable {
                 memoryBudgetBytes: memoryBudgetBytes,
                 rasterFallbackCount: rasterFallbackCount,
                 droppedIntersectionCount: 0,
+                sceneBounds: SplatSceneBounds(
+                    center: ScenePoint3D(
+                        x: sceneCenter[0],
+                        y: sceneCenter[1],
+                        z: sceneCenter[2]
+                    ),
+                    radius: sceneRadius
+                ),
                 outputBytes: outputBytes,
                 inputDigest: inputDigest,
                 geometryDigest: geometryDigest,

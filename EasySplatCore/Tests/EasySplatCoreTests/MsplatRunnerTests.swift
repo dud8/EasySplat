@@ -70,6 +70,14 @@ final class MsplatRunnerTests: XCTestCase {
                             argumentValue("--memory-budget-bytes", in: arguments),
                             String(testMemoryBudgetBytes)
                         )
+                        XCTAssertEqual(
+                            argumentValue("--expected-input-digest", in: arguments),
+                            testInputDigest
+                        )
+                        XCTAssertEqual(
+                            argumentValue("--expected-geometry-digest", in: arguments),
+                            testGeometryDigest
+                        )
                         try? writeFixtureOutput(arguments: arguments)
                     }
                 ),
@@ -91,6 +99,13 @@ final class MsplatRunnerTests: XCTestCase {
             XCTAssertEqual(result.completedIteration, limit)
             XCTAssertEqual(result.stopReason, .iterationLimit)
             XCTAssertEqual(result.gaussianCount, 1_250)
+            XCTAssertEqual(
+                result.sceneBounds,
+                SplatSceneBounds(
+                    center: .init(x: 1.25, y: -2.5, z: 3.75),
+                    radius: 8.5
+                )
+            )
             XCTAssertEqual(result.peakMemoryBytes, testCompletionPeakMemoryBytes)
             XCTAssertEqual(
                 result.latestCheckpoint?.peakMemoryBytes,
@@ -483,6 +498,94 @@ final class MsplatRunnerTests: XCTestCase {
         XCTAssertNil(progress.value.first?.lossIteration)
     }
 
+    func testRunTrainAcceptsNativeEarlyStopFields() async throws {
+        let context = try makeContext()
+        defer { context.cleanup() }
+        var records = validEvents().split(separator: "\n").map(String.init)
+        records[3] = records[3]
+            .replacingOccurrences(of: "\"iteration\":7000", with: "\"iteration\":3500")
+            .replacingOccurrences(of: "\"sequence\":4", with: "\"sequence\":5")
+            .replacingOccurrences(
+                of: "\"stop_reason\":\"iteration_limit\"",
+                with: "\"stop_reason\":\"plateau\""
+            )
+        records.insert(
+            "{\"event\":\"early_stop\",\"iteration\":3500,\"last_improvement_iteration\":2700,\"loss\":0.12,\"loss_iteration\":3500,\"plateau_window\":800,\"reason\":\"plateau\",\"schema_version\":1,\"sequence\":4}",
+            at: 3
+        )
+        let mock = MockSubprocessRunner(scripts: [
+            .init(
+                path: context.executable.path,
+                argsPrefix: ["--dataset", context.dataset.path],
+                result: .init(
+                    exitCode: 0,
+                    terminationReason: .exit,
+                    stdout: records.joined(separator: "\n") + "\n",
+                    stderr: ""
+                ),
+                onRun: { arguments in try? writeFixtureOutput(arguments: arguments) }
+            ),
+        ])
+
+        let result = try await MsplatRunner(runner: mock).runTrain(
+            msplatPath: context.executable,
+            datasetPath: context.dataset,
+            outputPath: context.output,
+            profile: .balanced,
+            seed: 42,
+            memoryBudgetBytes: testMemoryBudgetBytes,
+            onLog: { _, _ in }
+        )
+
+        XCTAssertEqual(result.completedIteration, 3_500)
+        XCTAssertEqual(result.stopReason, .plateau)
+    }
+
+    func testRunTrainRejectsEarlyStopWithoutPlateauEvidence() async throws {
+        var records = validEvents().split(separator: "\n").map(String.init)
+        records[3] = records[3]
+            .replacingOccurrences(of: "\"iteration\":7000", with: "\"iteration\":3500")
+            .replacingOccurrences(of: "\"sequence\":4", with: "\"sequence\":5")
+            .replacingOccurrences(
+                of: "\"stop_reason\":\"iteration_limit\"",
+                with: "\"stop_reason\":\"plateau\""
+            )
+        records.insert(
+            "{\"event\":\"early_stop\",\"iteration\":3500,\"last_improvement_iteration\":2800,\"loss\":0.12,\"loss_iteration\":3500,\"plateau_window\":800,\"reason\":\"plateau\",\"schema_version\":1,\"sequence\":4}",
+            at: 3
+        )
+        let context = try makeContext()
+        defer { context.cleanup() }
+        let mock = MockSubprocessRunner(scripts: [
+            .init(
+                path: context.executable.path,
+                argsPrefix: ["--dataset", context.dataset.path],
+                result: .init(
+                    exitCode: 0,
+                    terminationReason: .exit,
+                    stdout: records.joined(separator: "\n") + "\n",
+                    stderr: ""
+                ),
+                onRun: { arguments in try? writeFixtureOutput(arguments: arguments) }
+            ),
+        ])
+
+        do {
+            _ = try await MsplatRunner(runner: mock).runTrain(
+                msplatPath: context.executable,
+                datasetPath: context.dataset,
+                outputPath: context.output,
+                profile: .balanced,
+                seed: 42,
+                memoryBudgetBytes: testMemoryBudgetBytes,
+                onLog: { _, _ in }
+            )
+            XCTFail("Expected insufficient plateau evidence to fail")
+        } catch {
+            XCTAssertTrue(error.localizedDescription.contains("early_stop"))
+        }
+    }
+
     func testRunTrainRejectsMalformedOrIncompleteEventStreams() async throws {
         let cases: [(String, String)] = [
             ("malformed", "not json\n"),
@@ -533,6 +636,70 @@ final class MsplatRunnerTests: XCTestCase {
         }
     }
 
+    func testRunTrainRejectsUnknownEventField() async throws {
+        let context = try makeContext()
+        defer { context.cleanup() }
+        let stdout = validEvents().replacingOccurrences(
+            of: "\"elapsed_seconds\":2.5,",
+            with: "\"elapsed_seconds\":2.5,\"mystery_field\":true,"
+        )
+        let mock = MockSubprocessRunner(scripts: [
+            .init(
+                path: context.executable.path,
+                argsPrefix: ["--dataset", context.dataset.path],
+                result: .init(exitCode: 0, terminationReason: .exit, stdout: stdout, stderr: ""),
+                onRun: { arguments in try? writeFixtureOutput(arguments: arguments) }
+            ),
+        ])
+
+        do {
+            _ = try await MsplatRunner(runner: mock).runTrain(
+                msplatPath: context.executable,
+                datasetPath: context.dataset,
+                outputPath: context.output,
+                profile: .balanced,
+                seed: 42,
+                memoryBudgetBytes: testMemoryBudgetBytes,
+                onLog: { _, _ in }
+            )
+            XCTFail("Expected unknown event field to fail")
+        } catch {
+            XCTAssertTrue(error.localizedDescription.contains("mystery_field"))
+        }
+    }
+
+    func testRunTrainRejectsCompletedSceneBoundsOnProgressEvent() async throws {
+        let context = try makeContext()
+        defer { context.cleanup() }
+        let stdout = validEvents().replacingOccurrences(
+            of: "\"elapsed_seconds\":2.5,",
+            with: "\"elapsed_seconds\":2.5,\"scene_center\":[0,0,0],\"scene_radius\":1,"
+        )
+        let mock = MockSubprocessRunner(scripts: [
+            .init(
+                path: context.executable.path,
+                argsPrefix: ["--dataset", context.dataset.path],
+                result: .init(exitCode: 0, terminationReason: .exit, stdout: stdout, stderr: ""),
+                onRun: { arguments in try? writeFixtureOutput(arguments: arguments) }
+            ),
+        ])
+
+        do {
+            _ = try await MsplatRunner(runner: mock).runTrain(
+                msplatPath: context.executable,
+                datasetPath: context.dataset,
+                outputPath: context.output,
+                profile: .balanced,
+                seed: 42,
+                memoryBudgetBytes: testMemoryBudgetBytes,
+                onLog: { _, _ in }
+            )
+            XCTFail("Expected completed-only fields on progress to fail")
+        } catch {
+            XCTAssertTrue(error.localizedDescription.contains("scene_center"))
+        }
+    }
+
     func testRunTrainRejectsInvalidPeakMemoryEvidence() async throws {
         let cases: [(String, Int64?, Int64?)] = [
             ("missing checkpoint", nil, testCompletionPeakMemoryBytes),
@@ -573,6 +740,50 @@ final class MsplatRunnerTests: XCTestCase {
                     onLog: { _, _ in }
                 )
                 XCTFail("Expected peak-memory protocol failure for \(name)")
+            } catch {
+                XCTAssertTrue(
+                    error.localizedDescription.lowercased().contains("event"),
+                    "\(name): \(error)"
+                )
+            }
+        }
+    }
+
+    func testRunTrainRejectsMissingOrInvalidSceneBounds() async throws {
+        let validCenter = "\"scene_center\":[1.25,-2.5,3.75]"
+        let validRadius = "\"scene_radius\":8.5"
+        let cases: [(String, String)] = [
+            ("missing center", validEvents().replacingOccurrences(of: validCenter + ",", with: "")),
+            ("short center", validEvents().replacingOccurrences(of: validCenter, with: "\"scene_center\":[1.25,-2.5]")),
+            ("non-finite center", validEvents().replacingOccurrences(of: validCenter, with: "\"scene_center\":[1.25,1e999,3.75]")),
+            ("missing radius", validEvents().replacingOccurrences(of: validRadius + ",", with: "")),
+            ("zero radius", validEvents().replacingOccurrences(of: validRadius, with: "\"scene_radius\":0")),
+            ("non-finite radius", validEvents().replacingOccurrences(of: validRadius, with: "\"scene_radius\":1e999")),
+        ]
+
+        for (name, stdout) in cases {
+            let context = try makeContext()
+            defer { context.cleanup() }
+            let mock = MockSubprocessRunner(scripts: [
+                .init(
+                    path: context.executable.path,
+                    argsPrefix: ["--dataset", context.dataset.path],
+                    result: .init(exitCode: 0, terminationReason: .exit, stdout: stdout, stderr: ""),
+                    onRun: { arguments in try? writeFixtureOutput(arguments: arguments) }
+                ),
+            ])
+
+            do {
+                _ = try await MsplatRunner(runner: mock).runTrain(
+                    msplatPath: context.executable,
+                    datasetPath: context.dataset,
+                    outputPath: context.output,
+                    profile: .balanced,
+                    seed: 42,
+                    memoryBudgetBytes: testMemoryBudgetBytes,
+                    onLog: { _, _ in }
+                )
+                XCTFail("Expected scene-bounds protocol failure for \(name)")
             } catch {
                 XCTAssertTrue(
                     error.localizedDescription.lowercased().contains("event"),
@@ -659,6 +870,66 @@ final class MsplatRunnerTests: XCTestCase {
 
         XCTAssertEqual(try Data(contentsOf: externalOutput), fixtureOutputData)
         XCTAssertFalse(FileManager.default.fileExists(atPath: context.output.path))
+    }
+
+    func testRunTrainRejectsWrongDatasetIdentityBeforeReplacingExistingOutput() async throws {
+        let context = try makeContext()
+        defer { context.cleanup() }
+        try FileManager.default.createDirectory(
+            at: context.output.deletingLastPathComponent(),
+            withIntermediateDirectories: true
+        )
+        let previousOutput = Data("previous validated output".utf8)
+        try previousOutput.write(to: context.output)
+        let wrongIdentityReceipt = MsplatCheckpointReceipt(
+            iteration: 0,
+            generation: "00000000-\(testGenerationDigest)",
+            payloadSHA256: testPayloadDigest,
+            payloadBytes: 128,
+            gaussianCount: 750,
+            peakMemoryBytes: testCheckpointPeakMemoryBytes,
+            memoryBudgetBytes: testMemoryBudgetBytes,
+            rasterFallbackCount: 0,
+            droppedIntersectionCount: 0,
+            inputDigest: String(repeating: "a", count: 64),
+            geometryDigest: String(repeating: "b", count: 64),
+            trainerBuildDigest: testTrainerDigest
+        )
+        let checkpointCallbacks = LockedBox(0)
+        let mock = MockSubprocessRunner(scripts: [
+            .init(
+                path: context.executable.path,
+                argsPrefix: ["--dataset", context.dataset.path],
+                result: .init(
+                    exitCode: 0,
+                    terminationReason: .exit,
+                    stdout: validEvents(checkpoint: wrongIdentityReceipt),
+                    stderr: ""
+                ),
+                onRun: { arguments in try? writeFixtureOutput(arguments: arguments) }
+            ),
+        ])
+
+        do {
+            _ = try await MsplatRunner(runner: mock).runTrain(
+                msplatPath: context.executable,
+                datasetPath: context.dataset,
+                outputPath: context.output,
+                expectedIdentity: testDatasetIdentity,
+                profile: .balanced,
+                seed: 42,
+                memoryBudgetBytes: testMemoryBudgetBytes,
+                onCheckpoint: { _ in checkpointCallbacks.withValue { $0 += 1 } },
+                onLog: { _, _ in }
+            )
+            XCTFail("Expected dataset identity mismatch to fail")
+        } catch {
+            XCTAssertTrue(error.localizedDescription.lowercased().contains("identity"))
+        }
+
+        XCTAssertEqual(try Data(contentsOf: context.output), previousOutput)
+        XCTAssertEqual(checkpointCallbacks.value, 0)
+        XCTAssertFalse(try containsStagingOutput(in: context.output.deletingLastPathComponent()))
     }
 
     func testRunTrainPreservesDanglingExistingOutputSymlink() async throws {
@@ -1126,6 +1397,43 @@ final class MsplatRunnerTests: XCTestCase {
     }
 }
 
+private extension MsplatRunner {
+    func runTrain(
+        msplatPath: URL,
+        datasetPath: URL,
+        outputPath: URL,
+        checkpointPath: URL? = nil,
+        resumeFrom: URL? = nil,
+        profile: DetailProfile,
+        seed: UInt64,
+        iterationLimit: Int? = nil,
+        plateauWindow: Int? = nil,
+        memoryBudgetBytes: Int64,
+        onProgress: @escaping @Sendable (MsplatTrainingProgress) -> Void = { _ in },
+        onCheckpoint: @escaping @Sendable (MsplatCheckpointReceipt) -> Void = { _ in },
+        onRasterFallback: @escaping @Sendable (MsplatRasterFallback) -> Void = { _ in },
+        onLog: @escaping @Sendable (String, Bool) -> Void
+    ) async throws -> MsplatTrainingResult {
+        try await runTrain(
+            msplatPath: msplatPath,
+            datasetPath: datasetPath,
+            outputPath: outputPath,
+            expectedIdentity: testDatasetIdentity,
+            checkpointPath: checkpointPath,
+            resumeFrom: resumeFrom,
+            profile: profile,
+            seed: seed,
+            iterationLimit: iterationLimit,
+            plateauWindow: plateauWindow,
+            memoryBudgetBytes: memoryBudgetBytes,
+            onProgress: onProgress,
+            onCheckpoint: onCheckpoint,
+            onRasterFallback: onRasterFallback,
+            onLog: onLog
+        )
+    }
+}
+
 private struct MsplatTestContext {
     let root: URL
     let executable: URL
@@ -1262,7 +1570,7 @@ private func validEvents(
         completionSequence = 4
     }
     let startedEvent = """
-    {"camera_count":8,"checkpoint_schema":2,"event":"started","geometry_digest":"\(checkpoint.geometryDigest)","initial_gaussian_count":750,"input_digest":"\(checkpoint.inputDigest)","iteration":\(startIteration),"iteration_limit":\(limit),"memory_budget_bytes":\(memoryBudgetBytes),"payload_schema":2,"plateau_window":\(plateau),"profile":"\(profile)","resumed":\(resumed),"schema_version":1,"seed":\(seed),"sequence":1,"trainer_build_digest":"\(checkpoint.trainerBuildDigest)","version":"1.1.3 (git 106499b)"}
+    {"camera_count":8,"checkpoint_schema":2,"dropped_intersection_count":0,"event":"started","geometry_digest":"\(checkpoint.geometryDigest)","initial_gaussian_count":750,"input_digest":"\(checkpoint.inputDigest)","iteration":\(startIteration),"iteration_limit":\(limit),"memory_budget_bytes":\(memoryBudgetBytes),"payload_schema":2,"plateau_window":\(plateau),"profile":"\(profile)","raster_fallback_count":\(checkpoint.rasterFallbackCount),"resumed":\(resumed),"schema_version":1,"seed":\(seed),"sequence":1,"trainer_build_digest":"\(checkpoint.trainerBuildDigest)","version":"1.1.3 (git 106499b)"}
     """
     let checkpointRecord = """
     {"checkpoint_generation":"\(checkpoint.generation)","checkpoint_payload_bytes":\(checkpoint.payloadBytes),"checkpoint_payload_sha256":"\(checkpoint.payloadSHA256)","dropped_intersection_count":0,"event":"\(checkpointEvent)","gaussian_count":\(checkpoint.gaussianCount),"geometry_digest":"\(checkpoint.geometryDigest)","input_digest":"\(checkpoint.inputDigest)","iteration":\(checkpoint.iteration)\(checkpointMemoryField),"memory_budget_bytes":\(memoryBudgetBytes),"profile":"\(profile)","raster_fallback_count":\(checkpoint.rasterFallbackCount),"schema_version":1,"seed":\(seed),"sequence":2,"trainer_build_digest":"\(checkpoint.trainerBuildDigest)","version":"1.1.3 (git 106499b)"}
@@ -1271,7 +1579,7 @@ private func validEvents(
     {"elapsed_seconds":2.5,"eta_seconds":2.5,"event":"progress","gaussian_count":1000,"iteration":\(progressIteration),"iteration_limit":\(limit),"iterations_per_second":1400\(lossFields),"schema_version":1,"sequence":\(progressSequence)}
     """
     let completedRecord = """
-    {"dropped_intersection_count":\(droppedIntersectionCount),"elapsed_seconds":5,"event":"completed","gaussian_count":1250,"geometry_digest":"\(checkpoint.geometryDigest)","input_digest":"\(checkpoint.inputDigest)","iteration":\(limit),"iteration_limit":\(limit),"memory_budget_bytes":\(memoryBudgetBytes),"output_bytes":\(fixtureOutputData.count)\(completionMemoryField),"plateau_window":\(plateau),"profile":"\(profile)","raster_fallback_count":\(completedRasterFallbackCount),"schema_version":1,"seed":\(seed),"sequence":\(completionSequence),"stop_reason":"iteration_limit","trainer_build_digest":"\(checkpoint.trainerBuildDigest)","version":"1.1.3 (git 106499b)"}
+    {"dropped_intersection_count":\(droppedIntersectionCount),"elapsed_seconds":5,"event":"completed","gaussian_count":1250,"geometry_digest":"\(checkpoint.geometryDigest)","input_digest":"\(checkpoint.inputDigest)","iteration":\(limit),"iteration_limit":\(limit),"memory_budget_bytes":\(memoryBudgetBytes),"output_bytes":\(fixtureOutputData.count)\(completionMemoryField),"plateau_window":\(plateau),"profile":"\(profile)","raster_fallback_count":\(completedRasterFallbackCount),"scene_center":[1.25,-2.5,3.75],"scene_radius":8.5,"schema_version":1,"seed":\(seed),"sequence":\(completionSequence),"stop_reason":"iteration_limit","trainer_build_digest":"\(checkpoint.trainerBuildDigest)","version":"1.1.3 (git 106499b)"}
     """
     return startedEvent + "\n" + checkpointRecord + "\n" + replayEvent + fallbackEvent
         + progressRecord + "\n" + completedRecord + "\n"
@@ -1309,6 +1617,10 @@ private let testGeometryDigest = String(repeating: "2", count: 64)
 private let testTrainerDigest = String(repeating: "3", count: 64)
 private let testPayloadDigest = String(repeating: "4", count: 64)
 private let testGenerationDigest = String(repeating: "5", count: 64)
+private let testDatasetIdentity = MsplatDatasetIdentity(
+    inputDigest: testInputDigest,
+    geometryDigest: testGeometryDigest
+)
 private let testCheckpointPeakMemoryBytes: Int64 = 268_435_456
 private let testCompletionPeakMemoryBytes: Int64 = 536_870_912
 private let testMemoryBudgetBytes: Int64 = 8_589_934_592

@@ -2275,6 +2275,7 @@ public final class PipelineRunner: @unchecked Sendable {
                                 msplatPath: msplatPath,
                                 datasetPath: datasetURL,
                                 outputPath: outputURL,
+                                expectedIdentity: datasetIdentity,
                                 checkpointPath: paths.msplatCheckpointURL,
                                 resumeFrom: activeResumeURL,
                                 profile: detailProfile,
@@ -2368,6 +2369,7 @@ public final class PipelineRunner: @unchecked Sendable {
                         profile: detailProfile,
                         seed: seed,
                         resolvedPlan: resolvedRunPlan,
+                        datasetIdentity: datasetIdentity,
                         paths: paths
                     )
                     metadata = try ProjectMetadataStore.load(from: paths.metadataURL)
