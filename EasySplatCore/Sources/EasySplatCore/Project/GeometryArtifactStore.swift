@@ -186,8 +186,11 @@ enum GeometryArtifactStore {
             }
         }
         if provenance.model != nil {
+            let expectedInitializerPath = artifact.canonicalOrientation.status == .unresolved
+                ? "SfM/colmap/seed/0/learned_points3D.txt"
+                : "SfM/colmap/sparse/0/learned_points3D.txt"
             guard let initializer = artifact.learnedPointInitializer,
-                  initializer.path == "SfM/colmap/seed/0/learned_points3D.txt",
+                  initializer.path == expectedInitializerPath,
                   initializer.pointCount > 0,
                   isSHA256(initializer.sha256),
                   let initializerURL = try? projectPaths.resolveProjectRelativePath(initializer.path) else {
@@ -234,8 +237,13 @@ enum GeometryArtifactStore {
         guard let orientationEstimationDuration = artifact.timings[
             "orientation_estimation_seconds"
         ],
+              let orientationCanonicalizationDuration = artifact.timings[
+                  "orientation_canonicalization_seconds"
+              ],
               orientationEstimationDuration.isFinite,
               orientationEstimationDuration >= 0,
+              orientationCanonicalizationDuration.isFinite,
+              orientationCanonicalizationDuration >= 0,
               artifact.timings["orientation_seconds"] == nil,
               artifact.timings.allSatisfy({ key, value in
                   !key.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
@@ -295,6 +303,28 @@ enum GeometryArtifactStore {
 
         let measured = try measuredResiduals
             ?? ColmapResidualAnalyzer.analyze(modelDirectory: sourceModel)
+        do {
+            let publishedOrientation = try CanonicalColmapModelTransformer.loadPublishedResult(
+                modelDirectory: sourceModel,
+                measurement: measured
+            )
+            switch artifact.canonicalOrientation.status {
+            case .unresolved:
+                guard case nil = publishedOrientation else {
+                    throw Error.invalidCanonicalOrientation
+                }
+            case .verified, .axisAlignedSignUnverified:
+                guard let publishedOrientation,
+                      publishedOrientation.artifact == artifact.canonicalOrientation,
+                      publishedOrientation.snapshot.modelHashes == artifact.modelHashes else {
+                    throw Error.invalidCanonicalOrientation
+                }
+            }
+        } catch let error as Error {
+            throw error
+        } catch {
+            throw Error.invalidCanonicalOrientation
+        }
         let stronglyMeasuredViewCount = measured.observationCountByImage.values.filter {
             $0 >= minimumLearnedObservationsPerView
         }.count

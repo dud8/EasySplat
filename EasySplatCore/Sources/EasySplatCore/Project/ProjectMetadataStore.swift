@@ -5,7 +5,7 @@ public enum ProjectMetadataStore {
     private static let maximumMetadataBytes = 8 * 1_024 * 1_024
     private static let fileLocks = ProjectMetadataFileLocks()
     /// The one project format this beta reads and writes.
-    public static let supportedFormatVersion: Int = 10
+    public static let supportedFormatVersion: Int = 11
 
     public enum LoadError: Error, LocalizedError {
         case unsupportedFormatVersion(Int)
@@ -251,6 +251,7 @@ public enum ProjectMetadataStore {
             return path == "SfM/colmap/sparse/0"
         case "geometryArtifact.learnedPointInitializer.path":
             return path == "SfM/colmap/seed/0/learned_points3D.txt"
+                || path == "SfM/colmap/sparse/0/learned_points3D.txt"
         case "trainingArtifact.checkpointPath":
             return path == "Training/checkpoints/msplat"
                 || path.hasPrefix("Training/checkpoints/msplat/")

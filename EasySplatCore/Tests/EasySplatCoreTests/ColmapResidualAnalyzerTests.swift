@@ -156,6 +156,40 @@ final class ColmapResidualAnalyzerTests: XCTestCase {
         XCTAssertEqual(result.medianPixelResidual, 0, accuracy: 0.000_001)
     }
 
+    func testResidualComparisonRejectsTopologyChangeEvenWhenResidualsMatch() throws {
+        let source = try makeModel(
+            cameras: "1 SIMPLE_PINHOLE 640 480 100 320 240\n",
+            images: """
+            1 1 0 0 0 0 0 0 1 frame.jpg
+            320 240 1 330 240 2
+            """,
+            points: """
+            1 0 0 10 255 255 255 0 1 0
+            2 1 0 10 255 255 255 0 1 1
+            """
+        )
+        let candidate = try makeModel(
+            cameras: "1 SIMPLE_PINHOLE 640 480 100 320 240\n",
+            images: """
+            1 1 0 0 0 0 0 0 1 frame.jpg
+            320 240 2 330 240 1
+            """,
+            points: """
+            1 1 0 10 255 255 255 0 1 1
+            2 0 0 10 255 255 255 0 1 0
+            """
+        )
+
+        XCTAssertThrowsError(
+            try ColmapResidualAnalyzer.maximumResidualDifference(
+                between: source,
+                and: candidate
+            )
+        ) { error in
+            XCTAssertEqual(error as? ColmapResidualAnalyzer.Error, .modelTopologyChanged)
+        }
+    }
+
     func testRejectsUnsupportedCameraModels() throws {
         let model = try makeModel(
             cameras: "1 FOV 640 480 100 320 240 0.5\n",

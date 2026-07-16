@@ -349,6 +349,10 @@ final class PipelineIntegrationTests: XCTestCase {
             try XCTUnwrap(geometry.timings["orientation_estimation_seconds"]),
             0
         )
+        XCTAssertGreaterThanOrEqual(
+            try XCTUnwrap(geometry.timings["orientation_canonicalization_seconds"]),
+            0
+        )
         XCTAssertNil(geometry.timings["orientation_seconds"])
         XCTAssertEqual(geometry.schemaVersion, GeometryArtifact.currentSchemaVersion)
         XCTAssertEqual(geometry.modelVersion, "none")
@@ -5708,6 +5712,7 @@ final class PipelineIntegrationTests: XCTestCase {
             timings: [
                 PipelineStage.sfmMapping.rawValue: 1,
                 "orientation_estimation_seconds": 0.001,
+                "orientation_canonicalization_seconds": 0.002,
             ],
             peakMemoryBytes: 1,
             modelHashes: modelHashes,
@@ -6136,12 +6141,7 @@ final class PipelineIntegrationTests: XCTestCase {
                 to: sparse.appendingPathComponent(name)
             )
         }
-        try MsplatOrientationOverlay.write(
-            canonicalOrientation: .unresolved(
-                openingViewDirection: CanonicalDirection(x: 0, y: 0, z: 1)
-            ),
-            to: sparse
-        )
+        try MsplatOrientationOverlay.writeIdentity(to: sparse)
         return sparse
     }
 

@@ -2,9 +2,9 @@ import XCTest
 @testable import EasySplatCore
 
 final class ProjectMetadataValidationTests: XCTestCase {
-    func testLoadRejectsRetiredFormatNineBeforeDecodingEmbeddedViewerState() throws {
+    func testLoadRejectsRetiredFormatTenBeforeDecodingCanonicalGeometryState() throws {
         let retiredFormatVersion = ProjectMetadataStore.supportedFormatVersion - 1
-        XCTAssertEqual(retiredFormatVersion, 9)
+        XCTAssertEqual(retiredFormatVersion, 10)
 
         let metadata = makeMetadata()
         let encoder = JSONEncoder()
@@ -195,7 +195,7 @@ final class ProjectMetadataValidationTests: XCTestCase {
         XCTAssertNoThrow(try ProjectMetadataStore.save(metadata, to: url))
     }
 
-    func testSaveRejectsSourceModelLearnedInitializerPath() throws {
+    func testSaveAcceptsCanonicalSourceModelLearnedInitializerPath() throws {
         let root = try TestFileBuilder.makeTempDir()
         defer { try? FileManager.default.removeItem(at: root) }
         let url = root.appendingPathComponent("project.json")
@@ -215,19 +215,15 @@ final class ProjectMetadataValidationTests: XCTestCase {
             geometryArtifact: geometry
         )
 
-        XCTAssertThrowsError(try ProjectMetadataStore.save(metadata, to: url)) { error in
-            guard case ProjectMetadataStore.LoadError.invalidArtifactNamespace(let field, let path) = error else {
-                return XCTFail("Expected invalidArtifactNamespace, got \(error)")
-            }
-            XCTAssertEqual(field, "geometryArtifact.learnedPointInitializer.path")
-            XCTAssertEqual(path, "SfM/colmap/sparse/0/learned_points3D.txt")
-        }
+        XCTAssertNoThrow(try ProjectMetadataStore.save(metadata, to: url))
     }
 
     func testSaveRejectsNearSeedLearnedInitializerPaths() throws {
         for path in [
             "SfM/colmap/seed/1/learned_points3D.txt",
             "SfM/colmap/seed/0/other.txt",
+            "SfM/colmap/sparse/1/learned_points3D.txt",
+            "SfM/colmap/sparse/0/other.txt",
         ] {
             let root = try TestFileBuilder.makeTempDir()
             defer { try? FileManager.default.removeItem(at: root) }

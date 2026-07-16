@@ -53,9 +53,9 @@ final class GeometryArtifactStoreTests: XCTestCase {
         }
     }
 
-    func testLoadRejectsSchemaTenBeforeDecodingRetiredMappingState() throws {
+    func testLoadRejectsSchemaElevenBeforeDecodingSourceFrameOrientationState() throws {
         let baselineSchemaVersion = GeometryArtifact.currentSchemaVersion - 1
-        XCTAssertEqual(baselineSchemaVersion, 10)
+        XCTAssertEqual(baselineSchemaVersion, 11)
 
         let root = try TestFileBuilder.makeTempDir()
         defer { try? FileManager.default.removeItem(at: root) }
@@ -605,6 +605,95 @@ final class GeometryArtifactStoreTests: XCTestCase {
         }
     }
 
+    func testResolvedOrientationRequiresReceiptBoundToCanonicalModelHashes() throws {
+        let root = try TestFileBuilder.makeTempDir()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let paths = ProjectPaths(root: root)
+        try paths.ensureDirectories()
+        let fixture = try writeCanonicalModel(at: paths, imageCount: 8)
+        let model = paths.colmapSparseURL.appendingPathComponent("0", isDirectory: true)
+        let sourceMeasurement = try ColmapResidualAnalyzer.analyze(modelDirectory: model)
+        let canonical = try CanonicalColmapModelTransformer.canonicalize(
+            modelDirectory: model,
+            solution: resolvedOrientationSolution(),
+            sourceMeasurement: sourceMeasurement,
+            sourceSnapshot: GeometryModelSnapshot.capture(in: model),
+            learnedPointInitializer: nil
+        )
+
+        let imageNames = (1...8).map { String(format: "frame_%06d.jpg", $0) }
+        var artifact = makeArtifact(fixture: fixture)
+        artifact.orderedImageNames = imageNames
+        artifact.orderedImageTimestamps = Array(repeating: nil, count: imageNames.count)
+        artifact.registeredViewCount = imageNames.count
+        artifact.totalViewCount = imageNames.count
+        artifact.trackCount = canonical.measurement.observationCount
+        artifact.pointCount = canonical.measurement.pointCount
+        artifact.medianPixelResidual = canonical.measurement.medianPixelResidual
+        artifact.p90PixelResidual = canonical.measurement.p90PixelResidual
+        artifact.modelHashes = canonical.snapshot.modelHashes
+        artifact.canonicalOrientation = canonical.artifact
+        artifact.pairGraph = .measured(PairGraphMeasurement(
+            scheduledPairCount: 28,
+            attemptedPairCount: 28,
+            rawMatchedPairCount: 28,
+            spatiallyVerifiedPairCount: 28,
+            localPairCount: 28,
+            retrievalPairCount: 0,
+            loopRevisitPairCount: 0,
+            connectedComponentCount: 1,
+            isolatedViewCount: 0,
+            descriptorlessViewCount: 0,
+            articulationViewCount: 0,
+            biconnectedBlockCount: 1,
+            largestBiconnectedBlockViewCount: 8,
+            secondLargestBiconnectedBlockViewCount: 0,
+            degreeP10: 7,
+            degreeMedian: 7,
+            degreeP90: 7,
+            matcherAttempts: [PairMatchingAttemptArtifact(
+                attemptNumber: 1,
+                matcher: .faiss,
+                recoveryLevel: .normal,
+                outcome: .completed,
+                scheduledPairCount: 28,
+                attemptedPairCount: 28,
+                rawMatchedPairCount: 28,
+                spatiallyVerifiedPairCount: 28,
+                durationSeconds: 0.01
+            )],
+            pairListDigest: String(repeating: "d", count: 64),
+            featureDatabaseDigest: String(repeating: "e", count: 64),
+            matchingDatabaseDigest: String(repeating: "f", count: 64),
+            matchingDurationSeconds: 0.01
+        ))
+        artifact.mapping.largestModelRegisteredViewCount = 8
+        artifact.mapping.unionRegisteredViewCount = 8
+
+        XCTAssertNoThrow(
+            try GeometryArtifactStore.validate(
+                artifact,
+                projectPaths: paths,
+                measuredResiduals: canonical.measurement,
+                verifiedSourceSnapshot: canonical.snapshot
+            )
+        )
+
+        try FileManager.default.removeItem(
+            at: model.appendingPathComponent(CanonicalColmapModelTransformer.receiptFileName)
+        )
+        XCTAssertThrowsError(
+            try GeometryArtifactStore.validate(
+                artifact,
+                projectPaths: paths,
+                measuredResiduals: canonical.measurement,
+                verifiedSourceSnapshot: canonical.snapshot
+            )
+        ) { error in
+            XCTAssertEqual(error as? GeometryArtifactStore.Error, .invalidCanonicalOrientation)
+        }
+    }
+
     func testMeasuredPairGraphAllowsOnlyDescriptorlessUnregisteredViews() throws {
         let root = try TestFileBuilder.makeTempDir()
         defer { try? FileManager.default.removeItem(at: root) }
@@ -935,7 +1024,11 @@ final class GeometryArtifactStoreTests: XCTestCase {
             residualProvenance: "colmap-text-tracks-v1",
             medianPixelResidual: 0,
             p90PixelResidual: 0,
-            timings: ["sfmMapping": 1.5, "orientation_estimation_seconds": 0.001],
+            timings: [
+                "sfmMapping": 1.5,
+                "orientation_estimation_seconds": 0.001,
+                "orientation_canonicalization_seconds": 0.002,
+            ],
             peakMemoryBytes: 1_024,
             modelHashes: fixture.modelHashes,
             fallbackReason: nil,
@@ -1074,11 +1167,12 @@ final class GeometryArtifactStoreTests: XCTestCase {
 
     private func writeCanonicalModel(
         at paths: ProjectPaths,
-        observationCount: Int = 1
+        observationCount: Int = 1,
+        imageCount: Int = 3
     ) throws -> Fixture {
         let model = paths.colmapSparseURL.appendingPathComponent("0", isDirectory: true)
         try FileManager.default.createDirectory(at: model, withIntermediateDirectories: true)
-        let imageNames = (1...3).map { String(format: "frame_%06d.jpg", $0) }
+        let imageNames = (1...imageCount).map { String(format: "frame_%06d.jpg", $0) }
         let observations = (1...observationCount)
             .map { "320 240 \($0)" }
             .joined(separator: " ")
@@ -1126,6 +1220,36 @@ final class GeometryArtifactStoreTests: XCTestCase {
             ),
             pointCount: observationCount,
             observationCount: observationCount * imageNames.count
+        )
+    }
+
+    private func resolvedOrientationSolution() -> CanonicalOrientationSolution {
+        let rotation = OrientationMatrix3(
+            rows: OrientationVector3(x: 0, y: -1, z: 0),
+            OrientationVector3(x: 1, y: 0, z: 0),
+            OrientationVector3(x: 0, y: 0, z: 1)
+        )
+        return CanonicalOrientationSolution(
+            artifact: CanonicalOrientationArtifact(
+                status: .verified,
+                method: .cameraRightNullspace,
+                sourceToCanonicalQuaternionWXYZ: rotation.canonicalQuaternion(),
+                evidence: CanonicalOrientationEvidence(
+                    supportCount: 8,
+                    eigenvalue0: 0.001,
+                    eigenvalue1: 0.1,
+                    eigenvalue2: 0.899,
+                    eigengap: 100,
+                    medianResidualDegrees: 0,
+                    p90ResidualDegrees: 0,
+                    medianAbsoluteImageUpAgreement: 1,
+                    signAgreement: 1,
+                    bootstrapP95VariationDegrees: 0,
+                    trajectoryPlaneAgreementDegrees: nil
+                ),
+                canonicalOpeningViewDirection: CanonicalDirection(x: 0, y: 0, z: 1)
+            ),
+            sourceToCanonical: rotation
         )
     }
 

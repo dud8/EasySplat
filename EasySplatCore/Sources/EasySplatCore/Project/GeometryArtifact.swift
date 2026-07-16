@@ -431,7 +431,7 @@ public struct CanonicalOrientationArtifact: Codable, Sendable, Equatable {
 }
 
 public struct GeometryArtifact: Codable, Sendable, Equatable {
-    public static let currentSchemaVersion = 11
+    public static let currentSchemaVersion = 12
 
     public var schemaVersion: Int
     public var solverVersion: String
@@ -441,8 +441,7 @@ public struct GeometryArtifact: Codable, Sendable, Equatable {
     public var selectedFramesDigest: String
     public var orderedImageNames: [String]
     public var orderedImageTimestamps: [Double?]
-    /// Accepted source-frame COLMAP model. `canonicalOrientation` is applied by
-    /// the trainer without rewriting this measured geometry.
+    /// Accepted COLMAP model after any confidence-gated canonical world rotation.
     public var sourceModelPath: String
     /// Describes whether persisted poses transform world-to-camera or camera-to-world.
     public var poseConvention: String

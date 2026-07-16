@@ -88,14 +88,11 @@ extension PipelineRunner {
         // The artifact contract uses COLMAP's text form so residuals remain inspectable
         // and model files remain hashable across trainer versions.
         try requireTextSparseModelFiles(at: modelDirectory)
-        let measurement = try validatedGeometryMeasurement(
+        let acceptedMeasurement = try validatedGeometryMeasurement(
             modelDirectory: modelDirectory,
             selectedFrames: selectedFrames,
             requireStrongObservationCoverage: acceptedDa3ModelSubdirectory != nil
         )
-        let sourceSnapshot = measurement.snapshot
-        let sourceModelHashes = sourceSnapshot.modelHashes
-        let residuals = measurement.residuals
 
         let orderedFrames = selectedFrames.sorted { $0.lastPathComponent < $1.lastPathComponent }
         let mappingByName = Dictionary(
@@ -123,27 +120,7 @@ extension PipelineRunner {
         }
         let modelVersion = provenance.model.map { "\($0.identifier)@\($0.revision)" } ?? "none"
 
-        let orientationEstimationClock = ContinuousClock()
-        let orientationEstimationStart = orientationEstimationClock.now
-        let isOrderedInput: Bool
-        switch resolvedPlan.pairingPolicy {
-        case .unorderedRetrieval, .segmentedMixed:
-            isOrderedInput = false
-        case .orderedContinuous, .orderedOrbit, .orderedWalkthrough, .orderedLargeArea:
-            isOrderedInput = true
-        }
-        let allowCameraUpFallback = resolvedPlan.pairingPolicy == .orderedContinuous
-            || resolvedPlan.pairingPolicy == .orderedWalkthrough
-        let orientation = CanonicalOrientationEstimator.estimate(
-            cameras: residuals.cameraSamples,
-            orderedImageNames: orderedFrames.map(\.lastPathComponent),
-            orderedInput: isOrderedInput,
-            allowCameraUpFallback: allowCameraUpFallback,
-            deterministicSeed: resolvedPlan.deterministicSeed
-        )
-        let orientationEstimationDuration = orientationEstimationClock.now - orientationEstimationStart
-
-        let learnedPointInitializer: LearnedPointInitializerArtifact?
+        let learnedPointContract: (maximum: Int, count: Int, rawURL: URL)?
         if provenance.model != nil {
             let manifest = try Da3CoverageManifest.load(from: paths.da3CoverageManifestURL)
             let maximumPointCount = da3MaxPointsPreference(
@@ -155,18 +132,101 @@ extension PipelineRunner {
                   pointCount <= maximumPointCount else {
                 throw PipelineError.outputMissing
             }
-            let rawURL = paths.colmapSeedModelURL.appendingPathComponent("learned_points3D.txt")
-            let validation = try Da3LearnedPointInitializer.inspect(
-                learnedPointsURL: rawURL,
-                expectedPointCount: pointCount,
-                maximumPointCount: maximumPointCount
-            )
-            learnedPointInitializer = LearnedPointInitializerArtifact(
-                path: "SfM/colmap/seed/0/learned_points3D.txt",
-                sha256: validation.sha256,
-                pointCount: validation.pointCount
+            learnedPointContract = (
+                maximumPointCount,
+                pointCount,
+                paths.colmapSeedModelURL.appendingPathComponent("learned_points3D.txt")
             )
         } else {
+            learnedPointContract = nil
+        }
+
+        let canonicalizationClock = ContinuousClock()
+        let canonicalizationStart = canonicalizationClock.now
+        let publishedCanonicalization = try CanonicalColmapModelTransformer.loadPublishedResult(
+            modelDirectory: modelDirectory,
+            measurement: acceptedMeasurement.residuals
+        )
+        var rawInitializerValidation: Da3LearnedPointInitializer.Validation?
+        var rawInitializerInput: CanonicalColmapModelTransformer.LearnedPointInitializer?
+        if case nil = publishedCanonicalization, let learnedPointContract {
+            let validation = try Da3LearnedPointInitializer.inspect(
+                learnedPointsURL: learnedPointContract.rawURL,
+                expectedPointCount: learnedPointContract.count,
+                maximumPointCount: learnedPointContract.maximum
+            )
+            rawInitializerValidation = validation
+            rawInitializerInput = CanonicalColmapModelTransformer.LearnedPointInitializer(
+                sourceURL: learnedPointContract.rawURL,
+                expectedPointCount: validation.pointCount,
+                expectedSHA256: validation.sha256
+            )
+        }
+
+        let orientationEstimationClock = ContinuousClock()
+        var orientationEstimationDuration = Duration.zero
+        let canonicalization: CanonicalColmapModelTransformer.Result
+        if let publishedCanonicalization {
+            canonicalization = publishedCanonicalization
+        } else {
+            let orientationEstimationStart = orientationEstimationClock.now
+            let isOrderedInput: Bool
+            switch resolvedPlan.pairingPolicy {
+            case .unorderedRetrieval, .segmentedMixed:
+                isOrderedInput = false
+            case .orderedContinuous, .orderedOrbit, .orderedWalkthrough, .orderedLargeArea:
+                isOrderedInput = true
+            }
+            let allowCameraUpFallback = resolvedPlan.pairingPolicy == .orderedContinuous
+                || resolvedPlan.pairingPolicy == .orderedWalkthrough
+            let orientation = CanonicalOrientationEstimator.estimate(
+                cameras: acceptedMeasurement.residuals.cameraSamples,
+                orderedImageNames: orderedFrames.map(\.lastPathComponent),
+                orderedInput: isOrderedInput,
+                allowCameraUpFallback: allowCameraUpFallback,
+                deterministicSeed: resolvedPlan.deterministicSeed
+            )
+            orientationEstimationDuration = orientationEstimationClock.now - orientationEstimationStart
+            canonicalization = try CanonicalColmapModelTransformer.canonicalize(
+                modelDirectory: modelDirectory,
+                solution: orientation,
+                sourceMeasurement: acceptedMeasurement.residuals,
+                sourceSnapshot: acceptedMeasurement.snapshot,
+                learnedPointInitializer: rawInitializerInput,
+                checkCancellation: { try Task.checkCancellation() }
+            )
+        }
+        let canonicalizationDuration = canonicalizationClock.now - canonicalizationStart
+        let sourceSnapshot = canonicalization.snapshot
+        let sourceModelHashes = sourceSnapshot.modelHashes
+        let residuals = canonicalization.measurement
+
+        let learnedPointInitializer: LearnedPointInitializerArtifact?
+        if let learnedPointContract {
+            if let validation = canonicalization.learnedPointInitializer {
+                guard validation.pointCount == learnedPointContract.count else {
+                    throw PipelineError.outputMissing
+                }
+                learnedPointInitializer = LearnedPointInitializerArtifact(
+                    path: "SfM/colmap/sparse/0/\(CanonicalColmapModelTransformer.canonicalLearnedPointFileName)",
+                    sha256: validation.sha256,
+                    pointCount: validation.pointCount
+                )
+            } else {
+                guard canonicalization.artifact.status == .unresolved,
+                      let validation = rawInitializerValidation else {
+                    throw PipelineError.outputMissing
+                }
+                learnedPointInitializer = LearnedPointInitializerArtifact(
+                    path: "SfM/colmap/seed/0/learned_points3D.txt",
+                    sha256: validation.sha256,
+                    pointCount: validation.pointCount
+                )
+            }
+        } else {
+            guard canonicalization.learnedPointInitializer == nil else {
+                throw PipelineError.outputMissing
+            }
             learnedPointInitializer = nil
         }
         var timings = Dictionary(uniqueKeysWithValues: (metadata.stageTimings ?? []).map {
@@ -179,6 +239,11 @@ extension PipelineRunner {
             0,
             TimeInterval(orientationEstimationDuration.components.seconds)
                 + TimeInterval(orientationEstimationDuration.components.attoseconds) / 1e18
+        )
+        timings["orientation_canonicalization_seconds"] = max(
+            0,
+            TimeInterval(canonicalizationDuration.components.seconds)
+                + TimeInterval(canonicalizationDuration.components.attoseconds) / 1e18
         )
         let artifact = GeometryArtifact(
             schemaVersion: GeometryArtifact.currentSchemaVersion,
@@ -214,7 +279,7 @@ extension PipelineRunner {
             pairGraph: pairGraph,
             mapping: mapping,
             learnedPointInitializer: learnedPointInitializer,
-            canonicalOrientation: orientation.artifact
+            canonicalOrientation: canonicalization.artifact
         )
         let reconstruction = ReconstructionSummary(
             mapper: mapper,

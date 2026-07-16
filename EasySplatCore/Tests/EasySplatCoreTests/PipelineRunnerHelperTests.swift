@@ -1231,7 +1231,7 @@ final class PipelineRunnerHelperTests: XCTestCase {
         XCTAssertEqual(subprocess.calls.map { $0.1.first }, ["model_converter"])
         XCTAssertEqual(
             try orientationQuaternion(in: dataset),
-            [halfTurn.w, halfTurn.x, halfTurn.y, halfTurn.z]
+            [1, 0, 0, 0]
         )
         XCTAssertEqual(preparedDataset.identity.inputDigest.count, 64)
         XCTAssertEqual(preparedDataset.identity.geometryDigest.count, 64)
