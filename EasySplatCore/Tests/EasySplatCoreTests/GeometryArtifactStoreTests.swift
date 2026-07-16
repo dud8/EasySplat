@@ -53,9 +53,9 @@ final class GeometryArtifactStoreTests: XCTestCase {
         }
     }
 
-    func testLoadRejectsSchemaNineBeforeDecodingRetiredMappingState() throws {
+    func testLoadRejectsSchemaTenBeforeDecodingRetiredMappingState() throws {
         let baselineSchemaVersion = GeometryArtifact.currentSchemaVersion - 1
-        XCTAssertEqual(baselineSchemaVersion, 9)
+        XCTAssertEqual(baselineSchemaVersion, 10)
 
         let root = try TestFileBuilder.makeTempDir()
         defer { try? FileManager.default.removeItem(at: root) }
