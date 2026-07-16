@@ -24,7 +24,7 @@ METAL_SAFETY_PATCH_SHA256="5d3dfff3edcbca940d37f6ee3145c76c678ebd36ebc03016cfd5d
 EXACT_RASTER_PATCH="$ROOT/Tools/MsplatNative/msplat-1.1.3-exact-raster.patch"
 EXACT_RASTER_PATCH_SHA256="278deba531d1503b8f6fe3428e0b6c5103129f388a6bc425c41780ff9e4c453b"
 STAGE_TIMING_PATCH="$ROOT/Tools/MsplatNative/msplat-1.1.3-stage-timing.patch"
-STAGE_TIMING_PATCH_SHA256="ce26212e07d155f436f3f91a78c47f880fc3684cdada88e76623acf56bd3f9f8"
+STAGE_TIMING_PATCH_SHA256="41e7146c2047a7a93b45927d1ee40d1e310db9898c25ab892a27c158acff75dd"
 RASTER_TEST_FIXTURES="$BUILD_DIR/raster-test-fixtures"
 
 MSPLAT_REPO="https://github.com/rayanht/msplat.git"
@@ -77,7 +77,8 @@ reject_raster_test_symbols() {
     msplat_pending_exact_raster_timing_handlers_for_testing \
     msplat_gpu_ticks_to_seconds_for_testing \
     msplat_gpu_frequency_from_timestamp_pairs_for_testing \
-    msplat_stage_timing_coherent_for_testing \
+    msplat_stage_timing_sample_valid_for_testing \
+    msplat_stage_timing_aggregate_coherent_for_testing \
     msplat_enable_stage_profiling_for_testing \
     msplat_gpu_timestamp_calibration_for_testing \
     msplat_copy_last_raster_debug; do

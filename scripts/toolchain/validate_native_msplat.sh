@@ -31,7 +31,8 @@ reject_raster_test_symbols() {
     msplat_pending_exact_raster_timing_handlers_for_testing \
     msplat_gpu_ticks_to_seconds_for_testing \
     msplat_gpu_frequency_from_timestamp_pairs_for_testing \
-    msplat_stage_timing_coherent_for_testing \
+    msplat_stage_timing_sample_valid_for_testing \
+    msplat_stage_timing_aggregate_coherent_for_testing \
     msplat_enable_stage_profiling_for_testing \
     msplat_gpu_timestamp_calibration_for_testing \
     msplat_copy_last_raster_debug; do
@@ -131,13 +132,13 @@ exact_values = {
     "source_version": "1.1.3",
     "source_tree_sha256": "866fd6d051b5cf98ca08ae1552236473f504d8f13756cbda68201e48532c3e6a",
     "overlay_sha256": "cfefabcf9366571241e5a0923ae35fa3b8b263d6d024a87485bccc2e842ad29e",
-    "raster_test_sha256": "1322a4f6801345167b7b1eddac5e51ba7cb5cac2bf95ee5ab8dae63552c39c88",
+    "raster_test_sha256": "6d8b13a0b80b82520303950e472b32aa18ec1ee6986d2c67def2db52c270650f",
     "patch_sha256": "fafbf6f43a3be474a708607a903fc0dbb0029a4d4664c261a1ebaf301f3e9f3f",
     "checkpoint_patch_sha256": "c8b9a8dd03afb4bc50b8a12adf78dc46f5280d67bb62823c58aff2305a4870dc",
     "numeric_stability_patch_sha256": "231586b17e4f47c8c55432a631e08bf293b31a92f8d6ec49b367d11632350ec3",
     "metal_safety_patch_sha256": "5d3dfff3edcbca940d37f6ee3145c76c678ebd36ebc03016cfd5dab78e1d45ac",
     "exact_raster_patch_sha256": "278deba531d1503b8f6fe3428e0b6c5103129f388a6bc425c41780ff9e4c453b",
-    "stage_timing_patch_sha256": "ce26212e07d155f436f3f91a78c47f880fc3684cdada88e76623acf56bd3f9f8",
+    "stage_timing_patch_sha256": "41e7146c2047a7a93b45927d1ee40d1e310db9898c25ab892a27c158acff75dd",
     "deployment_target": "macOS 15.0",
     "build_configuration": "Release",
 }

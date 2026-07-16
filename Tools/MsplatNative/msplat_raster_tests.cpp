@@ -67,13 +67,20 @@ void verifyTimestampMath() {
             throw std::runtime_error("invalid GPU frequency produced a finite duration");
         }
     }
-    if (!msplat_stage_timing_coherent_for_testing(0.95, 1.0) ||
-        !msplat_stage_timing_coherent_for_testing(1.05, 1.0) ||
-        msplat_stage_timing_coherent_for_testing(0.249, 1.0) ||
-        msplat_stage_timing_coherent_for_testing(1.051, 1.0) ||
-        msplat_stage_timing_coherent_for_testing(0.0, 1.0) ||
-        msplat_stage_timing_coherent_for_testing(1.0, 0.0)) {
-        throw std::runtime_error("GPU stage timing coherence bounds are invalid");
+    if (!msplat_stage_timing_sample_valid_for_testing(0.001, 1.0) ||
+        !msplat_stage_timing_sample_valid_for_testing(1.05, 1.0) ||
+        msplat_stage_timing_sample_valid_for_testing(1.051, 1.0) ||
+        msplat_stage_timing_sample_valid_for_testing(0.0, 1.0) ||
+        msplat_stage_timing_sample_valid_for_testing(1.0, 0.0)) {
+        throw std::runtime_error("GPU stage timing sample bounds are invalid");
+    }
+    if (!msplat_stage_timing_aggregate_coherent_for_testing(0.25, 1.0) ||
+        !msplat_stage_timing_aggregate_coherent_for_testing(1.05, 1.0) ||
+        msplat_stage_timing_aggregate_coherent_for_testing(0.249, 1.0) ||
+        msplat_stage_timing_aggregate_coherent_for_testing(1.051, 1.0) ||
+        msplat_stage_timing_aggregate_coherent_for_testing(0.0, 1.0) ||
+        msplat_stage_timing_aggregate_coherent_for_testing(1.0, 0.0)) {
+        throw std::runtime_error("GPU aggregate stage timing bounds are invalid");
     }
 
     constexpr std::uint32_t numer = 125;
@@ -1354,10 +1361,13 @@ void verifyStageTiming(const std::string &dataset) {
     // All seven measured compute encoders execute serially on each command
     // buffer. Their sum excludes the blit encoder and inter-encoder overhead,
     // so it cannot materially exceed either total command-buffer GPU time or
-    // synchronized wall time. Five percent accommodates timestamp sampling and
-    // floating-point aggregation without hiding a clock-domain error.
+    // synchronized wall time. The aggregate gate also rejects an implausibly
+    // small stage total after first-use overhead has been amortized.
     constexpr double aggregationTolerance = 1.05;
-    if (stageMilliseconds > gpuMilliseconds * aggregationTolerance ||
+    if (!msplat_stage_timing_aggregate_coherent_for_testing(
+            stageMilliseconds,
+            gpuMilliseconds
+        ) ||
         stageMilliseconds > wallMilliseconds * aggregationTolerance ||
         gpuMilliseconds > wallMilliseconds * aggregationTolerance) {
         throw std::runtime_error(

@@ -101,12 +101,12 @@ require_contains 'git -C "$SOURCE_DIR" apply "$EXACT_RASTER_PATCH"' "$BUILD_SCRI
 require_contains 'exact_raster_patch_sha256' "$BUILD_SCRIPT"
 require_contains 'exact_raster_patch_sha256' "$VALIDATOR"
 require_contains 'msplat-1.1.3-stage-timing.patch' "$BUILD_SCRIPT"
-require_contains 'STAGE_TIMING_PATCH_SHA256="ce26212e07d155f436f3f91a78c47f880fc3684cdada88e76623acf56bd3f9f8"' "$BUILD_SCRIPT"
+require_contains 'STAGE_TIMING_PATCH_SHA256="41e7146c2047a7a93b45927d1ee40d1e310db9898c25ab892a27c158acff75dd"' "$BUILD_SCRIPT"
 require_contains '[ "$(sha256 "$STAGE_TIMING_PATCH")" = "$STAGE_TIMING_PATCH_SHA256" ]' "$BUILD_SCRIPT"
 require_contains 'git -C "$SOURCE_DIR" apply --check "$STAGE_TIMING_PATCH"' "$BUILD_SCRIPT"
 require_contains 'git -C "$SOURCE_DIR" apply "$STAGE_TIMING_PATCH"' "$BUILD_SCRIPT"
 require_contains 'stage_timing_patch_sha256' "$BUILD_SCRIPT"
-require_contains '"stage_timing_patch_sha256": "ce26212e07d155f436f3f91a78c47f880fc3684cdada88e76623acf56bd3f9f8"' "$VALIDATOR"
+require_contains '"stage_timing_patch_sha256": "41e7146c2047a7a93b45927d1ee40d1e310db9898c25ab892a27c158acff75dd"' "$VALIDATOR"
 require_absent 'queryTimestampFrequency' "$STAGE_TIMING_PATCH"
 require_contains 'sampleTimestamps:&cpuTimestamp gpuTimestamp:&gpuTimestamp' "$STAGE_TIMING_PATCH"
 require_contains 'mach_timebase_info(&timebase)' "$STAGE_TIMING_PATCH"
@@ -115,7 +115,8 @@ require_contains 'kResolvedCounterTimestampFrequencyHz = 1.0e9' "$STAGE_TIMING_P
 require_contains 'dispatch_semaphore_wait' "$STAGE_TIMING_PATCH"
 require_contains 'end <= start' "$STAGE_TIMING_PATCH"
 require_contains 'stageTimingValid' "$STAGE_TIMING_PATCH"
-require_contains 'ratio >= 0.25 && ratio <= 1.05' "$STAGE_TIMING_PATCH"
+require_contains 'return ratio <= 1.05' "$STAGE_TIMING_PATCH"
+require_contains 'stageSeconds / commandBufferSeconds >= 0.25' "$STAGE_TIMING_PATCH"
 require_contains 'stageTimingIterations = 512' "$RASTER_TEST_SOURCE"
 require_contains '--stage-timing' "$RASTER_TEST_SOURCE"
 require_contains '--stage-timing "$RASTER_TEST_FIXTURES/01-sphere-500"' "$BUILD_SCRIPT"
@@ -366,7 +367,8 @@ for symbol in \
   msplat_pending_exact_raster_timing_handlers_for_testing \
   msplat_gpu_ticks_to_seconds_for_testing \
   msplat_gpu_frequency_from_timestamp_pairs_for_testing \
-  msplat_stage_timing_coherent_for_testing \
+  msplat_stage_timing_sample_valid_for_testing \
+  msplat_stage_timing_aggregate_coherent_for_testing \
   msplat_enable_stage_profiling_for_testing \
   msplat_gpu_timestamp_calibration_for_testing \
   msplat_copy_last_raster_debug; do
