@@ -44,6 +44,15 @@ public enum AccessibilityAudit {
         for (identifier, entries) in byIdentifier where entries.count > 1 {
             issues.append("Duplicate accessibility identifier: \(identifier).")
         }
+        if workspace == .result,
+           let viewer = byIdentifier["result.viewer"]?.first?.1 {
+            if viewer.role != "AXGroup" {
+                issues.append("The result viewer must be one native AXGroup accessibility element.")
+            }
+            if viewer.label != "Interactive 3D splat viewer" {
+                issues.append("The result viewer must be labeled Interactive 3D splat viewer.")
+            }
+        }
 
         let expandedWindow = windowFrame.insetBy(dx: -2, dy: -2)
         for node in ordered {

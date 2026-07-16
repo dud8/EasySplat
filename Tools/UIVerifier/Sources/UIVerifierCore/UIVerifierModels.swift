@@ -61,7 +61,7 @@ public enum UIVerificationWorkspace: String, Codable, CaseIterable, Hashable, Se
                 "processing.technicalDetails",
             ]
         case .result:
-            ["result.export", "result.share", "result.inspector"]
+            ["result.export", "result.share", "result.inspector", "result.viewer"]
         case .failure:
             [
                 "processing.phase",
@@ -82,6 +82,7 @@ public enum UIVerificationInteraction: String, Codable, CaseIterable, Hashable, 
     case openReadyProject
     case toggleResultInspector
     case cancelResultExport
+    case verifyViewerKeyboardTraversal
     case verifyViewerShortcutRendering
     case startNewSplatFromResult
     case openInvalidOptionsProject

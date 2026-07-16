@@ -57,6 +57,7 @@ public enum UIHarnessSuiteValidator {
                   result.focusOrder.contains("home.chooseInput"),
                   result.focusOrder.contains("processing.stop"),
                   result.focusOrder.contains("processing.technicalDetails"),
+                  result.focusOrder.contains("result.viewer"),
                   result.longProjectTitleFound,
                   result.observedControlIdentifiers == Array(observedIdentifiers).sorted(),
                   observedIdentifiers.isSuperset(of: requiredIdentifiers),

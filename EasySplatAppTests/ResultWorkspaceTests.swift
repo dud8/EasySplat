@@ -115,6 +115,127 @@ final class ResultWorkspaceTests: XCTestCase {
     }
 
     @MainActor
+    func testInteractiveViewerIsOneNamedNativeAccessibilityElement() throws {
+        let device = try XCTUnwrap(MTLCreateSystemDefaultDevice())
+        let view = InteractiveMTKView(
+            frame: NSRect(x: 0, y: 0, width: 800, height: 600),
+            device: device
+        )
+
+        XCTAssertTrue(view.isAccessibilityElement())
+        XCTAssertEqual(view.accessibilityRole(), .group)
+        XCTAssertEqual(view.accessibilityIdentifier(), "result.viewer")
+        XCTAssertEqual(view.accessibilityLabel(), "Interactive 3D splat viewer")
+        XCTAssertEqual(
+            view.accessibilityHelp(),
+            "Drag to orbit. Option-drag pans. Scroll or pinch zooms. Press F to fit or R to reset."
+        )
+        XCTAssertTrue((view.accessibilityChildren() ?? []).isEmpty)
+    }
+
+    @MainActor
+    func testInteractiveViewerNativeFocusUsesTheWindowFirstResponder() throws {
+        let device = try XCTUnwrap(MTLCreateSystemDefaultDevice())
+        let window = NSWindow(
+            contentRect: NSRect(x: 0, y: 0, width: 800, height: 600),
+            styleMask: [.titled],
+            backing: .buffered,
+            defer: false
+        )
+        let view = InteractiveMTKView(frame: window.contentView?.bounds ?? .zero, device: device)
+        window.contentView?.addSubview(view)
+
+        XCTAssertTrue(window.makeFirstResponder(view))
+        XCTAssertTrue(window.firstResponder === view)
+    }
+
+    @MainActor
+    func testInteractiveViewerTabTraversalEntersAndLeavesWithoutFiringAViewerCommand() throws {
+        let device = try XCTUnwrap(MTLCreateSystemDefaultDevice())
+        let window = NSWindow(
+            contentRect: NSRect(x: 0, y: 0, width: 800, height: 600),
+            styleMask: [.titled],
+            backing: .buffered,
+            defer: false
+        )
+        let content = try XCTUnwrap(window.contentView)
+        let before = ViewerFocusTestView(frame: .zero)
+        let viewer = InteractiveMTKView(
+            frame: NSRect(x: 100, y: 100, width: 600, height: 400),
+            device: device
+        )
+        let after = ViewerFocusTestView(frame: .zero)
+        content.addSubview(before)
+        content.addSubview(viewer)
+        content.addSubview(after)
+        before.nextKeyView = viewer
+        viewer.nextKeyView = after
+        after.nextKeyView = before
+        var commandCount = 0
+        viewer.onKeyboardCommand = { _ in commandCount += 1 }
+
+        XCTAssertTrue(window.makeFirstResponder(before))
+        window.selectNextKeyView(nil)
+        XCTAssertTrue(window.firstResponder === viewer)
+        viewer.keyDown(with: try keyEvent(keyCode: 48))
+        XCTAssertTrue(window.firstResponder === after)
+
+        XCTAssertTrue(window.makeFirstResponder(viewer))
+        viewer.keyDown(with: try keyEvent(keyCode: 48, modifiers: [.shift]))
+        XCTAssertTrue(window.firstResponder === before)
+        XCTAssertEqual(commandCount, 0)
+    }
+
+    @MainActor
+    func testDismantlingViewerClearsCallbacksAndReleasesRendererOwnership() throws {
+        let device = try XCTUnwrap(MTLCreateSystemDefaultDevice())
+        weak var weakView: InteractiveMTKView?
+        weak var weakRenderer: MetalKitSceneRenderer?
+
+        try autoreleasepool {
+            var view: InteractiveMTKView? = InteractiveMTKView(
+                frame: NSRect(x: 0, y: 0, width: 800, height: 600),
+                device: device
+            )
+            var renderer: MetalKitSceneRenderer? = try XCTUnwrap(
+                MetalKitSceneRenderer(try XCTUnwrap(view))
+            )
+            let controller = SplatViewerController()
+            let coordinator = MetalKitSceneView.Coordinator()
+            coordinator.renderer = renderer
+            coordinator.controller = controller
+            controller.renderer = renderer
+            view?.delegate = renderer
+            installStrongViewerCallbackCycle(
+                view: try XCTUnwrap(view),
+                renderer: try XCTUnwrap(renderer)
+            )
+            weakView = view
+            weakRenderer = renderer
+
+            MetalKitSceneView.dismantleNSView(try XCTUnwrap(view), coordinator: coordinator)
+
+            XCTAssertNil(view?.onOrbit)
+            XCTAssertNil(view?.onScrollZoom)
+            XCTAssertNil(view?.onMagnify)
+            XCTAssertNil(view?.onPan)
+            XCTAssertNil(view?.onKeyboardCommand)
+            XCTAssertNil(view?.onInteractionActivity)
+            XCTAssertNil(view?.delegate)
+            XCTAssertNil(coordinator.renderer)
+            XCTAssertNil(coordinator.controller)
+            XCTAssertNil(controller.renderer)
+
+            renderer = nil
+            view = nil
+            XCTAssertNil(weakRenderer)
+        }
+
+        XCTAssertNil(weakRenderer)
+        XCTAssertNil(weakView)
+    }
+
+    @MainActor
     func testShareToolbarButtonUsesMouseDownAndProgrammaticActivationKeepsItsOwnAnchor() {
         let button = ShareToolbarNSButton()
         var activationSource: NSView?
@@ -860,6 +981,37 @@ final class ResultWorkspaceTests: XCTestCase {
         """
         try text.write(to: url, atomically: true, encoding: .utf8)
     }
+
+    private func keyEvent(
+        keyCode: UInt16,
+        modifiers: NSEvent.ModifierFlags = []
+    ) throws -> NSEvent {
+        try XCTUnwrap(NSEvent.keyEvent(
+            with: .keyDown,
+            location: .zero,
+            modifierFlags: modifiers,
+            timestamp: 0,
+            windowNumber: 0,
+            context: nil,
+            characters: keyCode == 48 ? "\t" : "",
+            charactersIgnoringModifiers: keyCode == 48 ? "\t" : "",
+            isARepeat: false,
+            keyCode: keyCode
+        ))
+    }
+
+    @MainActor
+    private func installStrongViewerCallbackCycle(
+        view: InteractiveMTKView,
+        renderer: MetalKitSceneRenderer
+    ) {
+        view.onOrbit = { [renderer] _, _ in _ = renderer }
+        view.onScrollZoom = { [renderer] _, _ in _ = renderer }
+        view.onMagnify = { [renderer] _, _ in _ = renderer }
+        view.onPan = { [renderer] _, _ in _ = renderer }
+        view.onKeyboardCommand = { [renderer] _ in _ = renderer }
+        view.onInteractionActivity = { [renderer] in _ = renderer }
+    }
 }
 
 private actor ControlledBoundsLoader {
@@ -897,6 +1049,12 @@ private final class DrawRecordingMTKView: MTKView {
     override func draw() {
         onDraw?()
     }
+}
+
+@MainActor
+private final class ViewerFocusTestView: NSView {
+    override var acceptsFirstResponder: Bool { true }
+    override var canBecomeKeyView: Bool { true }
 }
 
 private final class ThreadObservation: @unchecked Sendable {

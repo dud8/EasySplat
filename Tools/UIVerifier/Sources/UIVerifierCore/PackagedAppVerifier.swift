@@ -112,6 +112,7 @@ public enum PackagedAppVerifier {
         var observedIdentifiers = processingVerification.observedIdentifiers
         var passedInteractions = processingVerification.passedInteractions
         var viewerShortcutEvidence: ViewerShortcutVerificationEvidence?
+        var viewerFocusOrder: [String] = []
         let readyRowIdentifier = ProjectRowAccessibilityIdentifier.make(for: fixture.readyProject)
         let invalidRowIdentifier = ProjectRowAccessibilityIdentifier.make(for: fixture.invalidOptionsProject)
         let invalidActionIdentifier = ProjectRowAccessibilityIdentifier.action(for: fixture.invalidOptionsProject)
@@ -172,6 +173,8 @@ public enum PackagedAppVerifier {
             relativeTo: mainWindow
         )
         passedInteractions.append(.cancelResultExport)
+        viewerFocusOrder = try await controller.focusViewerForKeyboardEvidence()
+        passedInteractions.append(.verifyViewerKeyboardTraversal)
         viewerShortcutEvidence = try await captureViewerShortcutEvidence(
             scenario: scenario,
             controller: controller,
@@ -236,7 +239,9 @@ public enum PackagedAppVerifier {
             accessibilityPermission: true,
             screenCapturePermission: true,
             keyboardActivationPassed: keyboard.passed,
-            focusOrder: keyboard.focusOrder + processingVerification.focusOrder,
+            focusOrder: keyboard.focusOrder
+                + processingVerification.focusOrder
+                + viewerFocusOrder,
             longProjectTitleFound: homeCapture.longProjectTitleFound,
             observedControlIdentifiers: observedIdentifiers.sorted(),
             passedInteractions: passedInteractions.sorted { $0.rawValue < $1.rawValue },
@@ -583,7 +588,6 @@ public enum PackagedAppVerifier {
         guard await controller.waitForSize(viewport, of: mainWindow) != nil else {
             throw AXAutomationError.noMainWindow("window disappeared before viewer shortcut evidence")
         }
-        try await controller.focusViewerForKeyboardEvidence()
         try await controller.performViewerShortcutGroup(.reset)
         try await Task.sleep(for: .milliseconds(450))
 

@@ -300,11 +300,50 @@ final class AXApplicationController {
         }
     }
 
-    func focusViewerForKeyboardEvidence() async throws {
+    func focusViewerForKeyboardEvidence() async throws -> [String] {
         try await activate()
-        let viewer = try await waitForElement(named: "Interactive 3D splat viewer", timeoutSeconds: 8)
-        try click(viewer, description: "focusing the interactive 3D splat viewer")
-        try await Task.sleep(for: .milliseconds(150))
+        try await requireIdentifiers(["result.viewer"], timeoutSeconds: 8)
+        let focus = try await focusElement(
+            identifier: "result.viewer",
+            maximumTabs: 120,
+            allowProxy: false
+        )
+        guard focus.found else {
+            throw AXAutomationError.actionFailed(
+                "reaching the native result viewer with keyboard focus"
+            )
+        }
+
+        var order = focus.order
+        try sendKey(CGKeyCode(48))
+        try await Task.sleep(for: .milliseconds(120))
+        guard let next = focusedApplicationElement(),
+              stringAttribute(next, kAXIdentifierAttribute) != "result.viewer" else {
+            throw AXAutomationError.actionFailed(
+                "moving keyboard focus forward from the result viewer"
+            )
+        }
+        let nextName = contextualIdentifier(of: next)
+            ?? stringAttribute(next, kAXDescriptionAttribute)
+            ?? stringAttribute(next, kAXTitleAttribute)
+            ?? stringAttribute(next, kAXRoleAttribute)
+            ?? "unnamed"
+        if order.last != nextName {
+            order.append(nextName)
+        }
+
+        try sendKey(CGKeyCode(48), flags: .maskShift)
+        try await Task.sleep(for: .milliseconds(120))
+        guard let returned = focusedApplicationElement(),
+              stringAttribute(returned, kAXIdentifierAttribute) == "result.viewer" else {
+            throw AXAutomationError.actionFailed(
+                "returning keyboard focus to the native result viewer"
+            )
+        }
+        if order.last != "result.viewer" {
+            order.append("result.viewer")
+        }
+        return order
     }
 
     func performViewerShortcutGroup(_ group: ViewerShortcutGroup) async throws {
@@ -458,7 +497,8 @@ final class AXApplicationController {
 
     private func focusElement(
         identifier: String,
-        maximumTabs: Int
+        maximumTabs: Int,
+        allowProxy: Bool = true
     ) async throws -> (found: Bool, order: [String]) {
         var order: [String] = []
         for step in 0...maximumTabs {
@@ -466,14 +506,12 @@ final class AXApplicationController {
                 try sendKey(CGKeyCode(48))
                 try await Task.sleep(for: .milliseconds(90))
             }
-            guard let focused = elementAttribute(application, kAXFocusedUIElementAttribute)
-                ?? elementAttribute(systemWide, kAXFocusedUIElementAttribute) else { continue }
-            var focusedPID = pid_t()
-            guard AXUIElementGetPid(focused, &focusedPID) == .success,
-                  focusedPID == processIdentifier else { continue }
+            guard let focused = focusedApplicationElement() else { continue }
+            let directIdentifier = stringAttribute(focused, kAXIdentifierAttribute)
             let focusedIdentifier = contextualIdentifier(of: focused)
             let focusedRole = stringAttribute(focused, kAXRoleAttribute)
-            let matchesTargetProxy = (focusedRole == kAXGroupRole as String
+            let matchesTargetProxy = allowProxy
+                && (focusedRole == kAXGroupRole as String
                 || focusedRole == kAXButtonRole as String)
                 && findElement(identifier: identifier).flatMap { target in
                     guard let focusedFrame = frame(of: focused),
@@ -491,7 +529,10 @@ final class AXApplicationController {
             if order.last != name {
                 order.append(name)
             }
-            if focusedIdentifier == identifier || matchesTargetProxy {
+            let matchesIdentifier = allowProxy
+                ? focusedIdentifier == identifier
+                : directIdentifier == identifier
+            if matchesIdentifier || matchesTargetProxy {
                 return (true, order)
             }
         }
@@ -538,6 +579,15 @@ final class AXApplicationController {
         }
         visit(element, depth: 0)
         return identifiers.count == 1 ? identifiers.first : nil
+    }
+
+    private func focusedApplicationElement() -> AXUIElement? {
+        guard let focused = elementAttribute(application, kAXFocusedUIElementAttribute)
+            ?? elementAttribute(systemWide, kAXFocusedUIElementAttribute) else { return nil }
+        var focusedPID = pid_t()
+        guard AXUIElementGetPid(focused, &focusedPID) == .success,
+              focusedPID == processIdentifier else { return nil }
+        return focused
     }
 
     private func waitForDialog(

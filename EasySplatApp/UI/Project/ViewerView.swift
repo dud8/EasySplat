@@ -27,11 +27,6 @@ struct ViewerView: View {
                     )
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
                     .padding(Theme.Spacing.large)
-                    .accessibilityElement(children: .contain)
-                    .accessibilityLabel("Interactive 3D splat viewer")
-                    .accessibilityHint(
-                        "Drag to orbit. Option-drag pans. Scroll or pinch zooms. Press F to fit or R to reset."
-                    )
                 } else {
                     ProgressView("Opening splat…")
                 }

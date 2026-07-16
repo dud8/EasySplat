@@ -391,6 +391,14 @@ struct MetalKitSceneView: NSViewRepresentable {
         coordinator.controller?.cancelBoundsLoad()
         coordinator.loadTask?.cancel()
         coordinator.deferredLoadTask?.cancel()
+        if let interactiveView = nsView as? InteractiveMTKView {
+            interactiveView.onOrbit = nil
+            interactiveView.onScrollZoom = nil
+            interactiveView.onMagnify = nil
+            interactiveView.onPan = nil
+            interactiveView.onKeyboardCommand = nil
+            interactiveView.onInteractionActivity = nil
+        }
         if coordinator.controller?.renderer === coordinator.renderer {
             coordinator.controller?.renderer = nil
         }
@@ -421,17 +429,17 @@ struct MetalKitSceneView: NSViewRepresentable {
         controller.renderer = renderer
         metalKitView.delegate = renderer
 
-        metalKitView.onOrbit = { deltaX, deltaY in
-            renderer.orbit(deltaX: Float(deltaX), deltaY: Float(deltaY))
+        metalKitView.onOrbit = { [weak renderer] deltaX, deltaY in
+            renderer?.orbit(deltaX: Float(deltaX), deltaY: Float(deltaY))
         }
-        metalKitView.onScrollZoom = { delta, point in
-            renderer.zoomByScroll(delta: Float(delta), anchoredAt: point)
+        metalKitView.onScrollZoom = { [weak renderer] delta, point in
+            renderer?.zoomByScroll(delta: Float(delta), anchoredAt: point)
         }
-        metalKitView.onMagnify = { magnification, point in
-            renderer.zoomByPinch(magnification: Float(magnification), anchoredAt: point)
+        metalKitView.onMagnify = { [weak renderer] magnification, point in
+            renderer?.zoomByPinch(magnification: Float(magnification), anchoredAt: point)
         }
-        metalKitView.onPan = { deltaX, deltaY in
-            renderer.pan(deltaX: Float(deltaX), deltaY: Float(deltaY))
+        metalKitView.onPan = { [weak renderer] deltaX, deltaY in
+            renderer?.pan(deltaX: Float(deltaX), deltaY: Float(deltaY))
         }
         metalKitView.onKeyboardCommand = { [weak renderer, weak controller] command in
             let orbitStep: Float = 16
@@ -554,12 +562,12 @@ final class InteractiveMTKView: MTKView {
 
     override init(frame frameRect: CGRect, device: MTLDevice?) {
         super.init(frame: frameRect, device: device)
-        focusRingType = .exterior
+        configureInteractionSurface()
     }
 
     required init(coder: NSCoder) {
         super.init(coder: coder)
-        focusRingType = .exterior
+        configureInteractionSurface()
     }
 
     override var acceptsFirstResponder: Bool { true }
@@ -632,6 +640,16 @@ final class InteractiveMTKView: MTKView {
     }
 
     override func keyDown(with event: NSEvent) {
+        let nonTraversalModifiers = event.modifierFlags.intersection([.command, .control, .option])
+        if event.keyCode == 48, nonTraversalModifiers.isEmpty {
+            if event.modifierFlags.contains(.shift) {
+                window?.selectPreviousKeyView(nil)
+            } else {
+                window?.selectNextKeyView(nil)
+            }
+            return
+        }
+
         guard let command = ViewerKeyboardCommand.resolve(
             keyCode: event.keyCode,
             characters: event.charactersIgnoringModifiers,
@@ -647,5 +665,17 @@ final class InteractiveMTKView: MTKView {
     private func viewerPoint(for event: NSEvent) -> CGPoint {
         let local = convert(event.locationInWindow, from: nil)
         return CGPoint(x: local.x, y: bounds.height - local.y)
+    }
+
+    private func configureInteractionSurface() {
+        focusRingType = .exterior
+        setAccessibilityElement(true)
+        setAccessibilityRole(.group)
+        setAccessibilityIdentifier("result.viewer")
+        setAccessibilityLabel("Interactive 3D splat viewer")
+        setAccessibilityHelp(
+            "Drag to orbit. Option-drag pans. Scroll or pinch zooms. Press F to fit or R to reset."
+        )
+        setAccessibilityChildren([])
     }
 }

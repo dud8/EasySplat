@@ -324,19 +324,20 @@ final class UIVerifierCoreTests: XCTestCase {
     }
 
     func testAccessibilityAuditUsesWorkspaceSpecificControlContracts() {
-        let resultNodes = ["result.export", "result.share", "result.inspector"].enumerated().map {
+        let identifiers = ["result.export", "result.share", "result.inspector", "result.viewer"]
+        let resultNodes = identifiers.enumerated().map { offset, identifier in
             AccessibilityNodeSnapshot(
-                order: $0.offset,
-                role: "AXButton",
+                order: offset,
+                role: identifier == "result.viewer" ? "AXGroup" : "AXButton",
                 subrole: nil,
-                title: $0.element,
-                label: nil,
+                title: identifier == "result.viewer" ? nil : identifier,
+                label: identifier == "result.viewer" ? "Interactive 3D splat viewer" : nil,
                 value: nil,
                 placeholder: nil,
-                identifier: $0.element,
+                identifier: identifier,
                 enabled: true,
-                frame: CGRect(x: 20 + CGFloat($0.offset * 100), y: 20, width: 90, height: 32),
-                actions: ["AXPress"]
+                frame: CGRect(x: 20 + CGFloat(offset * 100), y: 20, width: 90, height: 32),
+                actions: identifier == "result.viewer" ? [] : ["AXPress"]
             )
         }
         let window = CGRect(x: 0, y: 0, width: 920, height: 640)
@@ -352,7 +353,52 @@ final class UIVerifierCoreTests: XCTestCase {
             windowFrame: window,
             longProjectTitle: "not required outside Home",
             workspace: .result
-        ).contains(where: { $0.contains("result.inspector") }))
+        ).contains(where: { $0.contains("result.viewer") }))
+    }
+
+    func testAccessibilityAuditRequiresTheNamedNativeViewerGroup() {
+        let window = CGRect(x: 0, y: 0, width: 920, height: 640)
+        let identifiers = ["result.export", "result.share", "result.inspector", "result.viewer"]
+        let valid = identifiers.enumerated().map { offset, identifier in
+            AccessibilityNodeSnapshot(
+                order: offset,
+                role: identifier == "result.viewer" ? "AXGroup" : "AXButton",
+                subrole: nil,
+                title: identifier == "result.viewer" ? nil : identifier,
+                label: identifier == "result.viewer" ? "Interactive 3D splat viewer" : nil,
+                value: nil,
+                placeholder: nil,
+                identifier: identifier,
+                enabled: true,
+                frame: CGRect(x: 20 + CGFloat(offset * 100), y: 20, width: 90, height: 32),
+                actions: identifier == "result.viewer" ? [] : ["AXPress"]
+            )
+        }
+
+        XCTAssertTrue(AccessibilityAudit.issues(
+            nodes: valid,
+            windowFrame: window,
+            longProjectTitle: "not required outside Home",
+            workspace: .result
+        ).isEmpty)
+
+        var wrongRole = valid
+        wrongRole[3].role = "AXButton"
+        XCTAssertTrue(AccessibilityAudit.issues(
+            nodes: wrongRole,
+            windowFrame: window,
+            longProjectTitle: "not required outside Home",
+            workspace: .result
+        ).contains(where: { $0.contains("AXGroup") }))
+
+        var wrongLabel = valid
+        wrongLabel[3].label = "Viewer"
+        XCTAssertTrue(AccessibilityAudit.issues(
+            nodes: wrongLabel,
+            windowFrame: window,
+            longProjectTitle: "not required outside Home",
+            workspace: .result
+        ).contains(where: { $0.contains("Interactive 3D splat viewer") }))
     }
 
     func testAccessibilityAuditEnforcesProcessingFailureAndResultVoiceOverOrder() {
@@ -428,30 +474,31 @@ final class UIVerifierCoreTests: XCTestCase {
         ).contains(where: { $0.contains("processing.tryAgain before processing.backToProjects") }))
 
         XCTAssertTrue(AccessibilityAudit.voiceOverOrderIssues(
-            nodes: nodes(["result.export", "result.share", "result.inspector"]),
+            nodes: nodes(["result.export", "result.share", "result.inspector", "result.viewer"]),
             workspace: .result
         ).isEmpty)
         XCTAssertTrue(AccessibilityAudit.voiceOverOrderIssues(
-            nodes: nodes(["result.share", "result.export", "result.inspector"]),
+            nodes: nodes(["result.share", "result.export", "result.inspector", "result.viewer"]),
             workspace: .result
         ).contains(where: { $0.contains("result.export before result.share") }))
     }
 
     func testAccessibilityAuditRejectsRequiredControlsWithoutVisibleContainedFrames() {
         let window = CGRect(x: 0, y: 0, width: 920, height: 640)
-        let valid = ["result.export", "result.share", "result.inspector"].enumerated().map {
+        let identifiers = ["result.export", "result.share", "result.inspector", "result.viewer"]
+        let valid = identifiers.enumerated().map { offset, identifier in
             AccessibilityNodeSnapshot(
-                order: $0.offset,
-                role: "AXButton",
+                order: offset,
+                role: identifier == "result.viewer" ? "AXGroup" : "AXButton",
                 subrole: nil,
-                title: $0.element,
-                label: nil,
+                title: identifier == "result.viewer" ? nil : identifier,
+                label: identifier == "result.viewer" ? "Interactive 3D splat viewer" : nil,
                 value: nil,
                 placeholder: nil,
-                identifier: $0.element,
+                identifier: identifier,
                 enabled: true,
-                frame: CGRect(x: 20 + CGFloat($0.offset * 100), y: 20, width: 90, height: 32),
-                actions: ["AXPress"]
+                frame: CGRect(x: 20 + CGFloat(offset * 100), y: 20, width: 90, height: 32),
+                actions: identifier == "result.viewer" ? [] : ["AXPress"]
             )
         }
 
@@ -507,6 +554,14 @@ final class UIVerifierCoreTests: XCTestCase {
         var missingInteraction = passing.scenarios
         missingInteraction[0].passedInteractions.removeAll { $0 == .cancelResultExport }
         XCTAssertThrowsError(try UIHarnessSuiteValidator.validate(missingInteraction))
+
+        var missingViewerFocus = passing.scenarios
+        missingViewerFocus[0].focusOrder.removeAll { $0 == "result.viewer" }
+        XCTAssertThrowsError(try UIHarnessSuiteValidator.validate(missingViewerFocus))
+
+        var missingViewerTraversal = passing.scenarios
+        missingViewerTraversal[0].passedInteractions.removeAll { $0 == .verifyViewerKeyboardTraversal }
+        XCTAssertThrowsError(try UIHarnessSuiteValidator.validate(missingViewerTraversal))
 
         var missingViewerEvidence = passing.scenarios
         missingViewerEvidence[0].viewerShortcutEvidence = nil
@@ -851,16 +906,16 @@ final class UIVerifierCoreTests: XCTestCase {
         nodes.append(contentsOf: identifiers.enumerated().map { index, identifier in
             AccessibilityNodeSnapshot(
                 order: index + 1,
-                role: "AXButton",
+                role: identifier == "result.viewer" ? "AXGroup" : "AXButton",
                 subrole: nil,
-                title: identifier,
-                label: nil,
+                title: identifier == "result.viewer" ? nil : identifier,
+                label: identifier == "result.viewer" ? "Interactive 3D splat viewer" : nil,
                 value: nil,
                 placeholder: nil,
                 identifier: identifier,
                 enabled: true,
                 frame: CGRect(x: 20 + CGFloat(index * 110), y: 20, width: 100, height: 32),
-                actions: ["AXPress"]
+                actions: identifier == "result.viewer" ? [] : ["AXPress"]
             )
         })
         if workspace == .home {
@@ -927,6 +982,7 @@ private extension UIHarnessSuiteResult {
                     "home.chooseInput",
                     "processing.stop",
                     "processing.technicalDetails",
+                    "result.viewer",
                 ],
                 longProjectTitleFound: true,
                 observedControlIdentifiers: ([
@@ -946,6 +1002,7 @@ private extension UIHarnessSuiteResult {
                     "result.inspector",
                     "result.newSplat",
                     "result.share",
+                    "result.viewer",
                 ]).sorted(),
                 passedInteractions: UIVerificationInteraction.allCases,
                 viewerShortcutEvidence: ViewerShortcutVerificationEvidence(
