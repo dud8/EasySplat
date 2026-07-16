@@ -67,31 +67,65 @@ enum SmartFrameSelection {
         let lastTime = ordered[ordered.count - 1].timestampSeconds
         let duration = max(0, lastTime - firstTime)
         let targetSpacing = duration / Double(slotCount - 1)
+        // Search past decode fades without sacrificing more than a bounded slice
+        // of either end of the capture.
+        let boundarySearchDuration = min(
+            duration / 4,
+            max(0.25, min(1, targetSpacing * 4))
+        )
         let safeDistance = max(0, minimumTimeDistance)
-        var selected: [TimedFrameCandidate] = []
+        let firstMaximumIndex = ordered.count - slotCount
+        let firstSearchEnd = min(
+            firstMaximumIndex + 1,
+            lowerBound(
+                in: ordered,
+                timestamp: (firstTime + boundarySearchDuration).nextUp
+            )
+        )
+        let firstIndex = bestCandidateIndex(
+            in: ordered,
+            range: 0..<max(1, firstSearchEnd),
+            targetTime: firstTime,
+            targetSpacing: boundarySearchDuration,
+            previousTime: nil,
+            minimumTimeDistance: 0,
+            recentHashes: []
+        )
+        let lastMinimumIndex = firstIndex + slotCount - 1
+        let lastSearchStart = max(
+            lastMinimumIndex,
+            lowerBound(
+                in: ordered,
+                timestamp: lastTime - boundarySearchDuration
+            )
+        )
+        let provisionalLastIndex = bestCandidateIndex(
+            in: ordered,
+            range: lastSearchStart..<ordered.count,
+            targetTime: lastTime,
+            targetSpacing: boundarySearchDuration,
+            previousTime: nil,
+            minimumTimeDistance: 0,
+            recentHashes: []
+        )
+
+        let selectedFirst = ordered[firstIndex]
+        let provisionalLast = ordered[provisionalLastIndex]
+        let usableSpacing = (provisionalLast.timestampSeconds - selectedFirst.timestampSeconds)
+            / Double(slotCount - 1)
+        var selected = [selectedFirst]
         selected.reserveCapacity(slotCount)
         var recentHashes: [UInt64] = []
-        var previousOrderedIndex = 0
+        appendImmediateHash(selectedFirst.candidate.dHash, to: &recentHashes)
+        var previousOrderedIndex = firstIndex
 
-        for slot in 0..<slotCount {
-            if slot == 0 {
-                let first = ordered[0]
-                selected.append(first)
-                appendImmediateHash(first.candidate.dHash, to: &recentHashes)
-                continue
-            }
-            if slot == slotCount - 1 {
-                let last = ordered[ordered.count - 1]
-                selected.append(last)
-                appendImmediateHash(last.candidate.dHash, to: &recentHashes)
-                continue
-            }
-            let targetTime = firstTime + Double(slot) * targetSpacing
+        for slot in 1..<(slotCount - 1) {
+            let targetTime = selectedFirst.timestampSeconds + Double(slot) * usableSpacing
             let minimumIndex = previousOrderedIndex + 1
             let remainingAfterSlot = slotCount - slot - 1
-            let maximumIndex = ordered.count - remainingAfterSlot - 1
-            let lowerTime = targetTime - targetSpacing / 2
-            let upperTime = targetTime + targetSpacing / 2
+            let maximumIndex = provisionalLastIndex - remainingAfterSlot
+            let lowerTime = targetTime - usableSpacing / 2
+            let upperTime = targetTime + usableSpacing / 2
             let windowStart = max(
                 minimumIndex,
                 lowerBound(in: ordered, timestamp: lowerTime)
@@ -100,14 +134,26 @@ enum SmartFrameSelection {
                 maximumIndex + 1,
                 lowerBound(in: ordered, timestamp: upperTime)
             )
-            let candidateRange = windowStart < windowEnd
-                ? windowStart..<windowEnd
-                : minimumIndex..<(maximumIndex + 1)
+            let candidateRange: Range<Int>
+            if windowStart < windowEnd {
+                candidateRange = windowStart..<windowEnd
+            } else {
+                let insertionIndex = lowerBound(in: ordered, timestamp: targetTime)
+                let lowerIndex = max(
+                    minimumIndex,
+                    min(maximumIndex, insertionIndex - 1)
+                )
+                let upperIndex = max(
+                    lowerIndex,
+                    min(maximumIndex, insertionIndex)
+                )
+                candidateRange = lowerIndex..<(upperIndex + 1)
+            }
             let bestIndex = bestCandidateIndex(
                 in: ordered,
                 range: candidateRange,
                 targetTime: targetTime,
-                targetSpacing: targetSpacing,
+                targetSpacing: usableSpacing,
                 previousTime: selected.last?.timestampSeconds,
                 minimumTimeDistance: safeDistance,
                 recentHashes: recentHashes
@@ -117,6 +163,18 @@ enum SmartFrameSelection {
             previousOrderedIndex = bestIndex
             appendImmediateHash(best.candidate.dHash, to: &recentHashes)
         }
+
+        let finalSearchStart = max(previousOrderedIndex + 1, lastSearchStart)
+        let finalIndex = bestCandidateIndex(
+            in: ordered,
+            range: finalSearchStart..<ordered.count,
+            targetTime: lastTime,
+            targetSpacing: boundarySearchDuration,
+            previousTime: selected.last?.timestampSeconds,
+            minimumTimeDistance: safeDistance,
+            recentHashes: recentHashes
+        )
+        selected.append(ordered[finalIndex])
 
         return selected
     }

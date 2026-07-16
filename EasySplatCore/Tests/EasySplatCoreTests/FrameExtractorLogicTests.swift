@@ -271,12 +271,132 @@ final class FrameExtractorLogicTests: XCTestCase {
         )
 
         XCTAssertEqual(selected.count, 250)
-        XCTAssertLessThanOrEqual(selected.first?.timestampSeconds ?? .infinity, 0.25)
-        XCTAssertGreaterThanOrEqual(selected.last?.timestampSeconds ?? 0, 59.75)
+        XCTAssertLessThanOrEqual(selected.first?.timestampSeconds ?? .infinity, 1)
+        XCTAssertGreaterThanOrEqual(selected.last?.timestampSeconds ?? 0, 59)
         XCTAssertEqual(Set(selected.map(\.frameIndex)).count, selected.count)
         XCTAssertTrue(zip(selected, selected.dropFirst()).allSatisfy {
             $1.timestampSeconds > $0.timestampSeconds
         })
+    }
+
+    func testTimelineSelectionDoesNotForceUnusableBoundaryRanges() {
+        let frames = (0...750).map { index in
+            let isBoundary = index <= 11 || index >= 739
+            return TimedFrameCandidate(
+                frameIndex: index,
+                timestampSeconds: Double(index) * 0.04,
+                candidate: SmartFrameCandidate(
+                    index: index,
+                    sharpness: isBoundary ? 0 : 100,
+                    brightness: isBoundary ? 1 : 0.5,
+                    clippedFraction: isBoundary ? 1 : 0,
+                    dHash: UInt64(index)
+                )
+            )
+        }
+
+        let selected = SmartFrameSelection.selectTimeline(
+            frames,
+            targetCount: 250,
+            minimumTimeDistance: 0.2
+        )
+
+        XCTAssertEqual(selected.count, 250)
+        XCTAssertGreaterThan(selected.first?.frameIndex ?? 0, 11)
+        XCTAssertLessThan(selected.last?.frameIndex ?? .max, 739)
+        XCTAssertFalse(selected.contains { $0.frameIndex <= 11 || $0.frameIndex >= 739 })
+        XCTAssertLessThanOrEqual(selected.first?.timestampSeconds ?? .infinity, 1)
+        XCTAssertGreaterThanOrEqual(selected.last?.timestampSeconds ?? 0, 29)
+    }
+
+    func testTimelineSelectionRebasesSpacingAfterAnOpeningFade() {
+        let frames = (0...750).map { index in
+            let isOpeningFade = index <= 11
+            return TimedFrameCandidate(
+                frameIndex: index,
+                timestampSeconds: Double(index) * 0.08,
+                candidate: SmartFrameCandidate(
+                    index: index,
+                    sharpness: isOpeningFade ? 0 : 100,
+                    brightness: isOpeningFade ? 0 : 0.5,
+                    clippedFraction: isOpeningFade ? 1 : 0,
+                    dHash: UInt64(index)
+                )
+            )
+        }
+
+        let selected = SmartFrameSelection.selectTimeline(
+            frames,
+            targetCount: 250,
+            minimumTimeDistance: 0.2
+        )
+
+        XCTAssertEqual(selected.count, 250)
+        XCTAssertEqual(selected.first?.frameIndex, 12)
+        for (first, second) in zip(selected.prefix(10), selected.dropFirst().prefix(9)) {
+            XCTAssertGreaterThanOrEqual(
+                second.timestampSeconds - first.timestampSeconds,
+                0.2,
+                "Opening fade caused adjacent keyframes to bunch at \(first.frameIndex) and \(second.frameIndex)"
+            )
+        }
+    }
+
+    func testTimelineSelectionDoesNotCompressTheUsableTail() {
+        let frames = (0...750).map { index in
+            TimedFrameCandidate(
+                frameIndex: index,
+                timestampSeconds: Double(index) * 0.08,
+                candidate: SmartFrameCandidate(
+                    index: index,
+                    sharpness: 100,
+                    brightness: 0.5,
+                    dHash: UInt64(index)
+                )
+            )
+        }
+
+        let selected = SmartFrameSelection.selectTimeline(
+            frames,
+            targetCount: 250,
+            minimumTimeDistance: 0.2
+        )
+
+        XCTAssertEqual(selected.count, 250)
+        for (first, second) in zip(selected.suffix(10), selected.suffix(9)) {
+            XCTAssertGreaterThanOrEqual(
+                second.timestampSeconds - first.timestampSeconds,
+                0.2,
+                "Trailing boundary search compressed keyframes at \(first.frameIndex) and \(second.frameIndex)"
+            )
+        }
+    }
+
+    func testTimelineSelectionKeepsEmptyWindowFallbackNearItsTarget() {
+        let timestamps = [0.0, 0.2, 1.2, 1.7, 1.9, 2.1, 2.3]
+        let sharpness = [100.0, 20, 60, 1_000, 50, 50, 100]
+        let frames = timestamps.indices.map { index in
+            TimedFrameCandidate(
+                frameIndex: index,
+                timestampSeconds: timestamps[index],
+                candidate: SmartFrameCandidate(
+                    index: index,
+                    sharpness: sharpness[index],
+                    brightness: 0.5
+                )
+            )
+        }
+
+        for minimumDistance in [0.0, 0.2] {
+            let selected = SmartFrameSelection.selectTimeline(
+                frames,
+                targetCount: 4,
+                minimumTimeDistance: minimumDistance
+            )
+
+            XCTAssertEqual(selected.map(\.timestampSeconds), [0, 1.2, 1.7, 2.3])
+            XCTAssertEqual(Set(selected.map(\.frameIndex)).count, 4)
+        }
     }
 
     func testLargeAreaSpacingDoesNotReduceRequestedFrameCount() {
