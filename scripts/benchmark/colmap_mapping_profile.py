@@ -37,7 +37,7 @@ _TIMESTAMP_RE = re.compile(
 )
 _TIMESTAMP_LIKE_RE = re.compile(r"^[IWEF]\d{8}\s")
 _INTEGER_RE = re.compile(r"[+-]?\d+")
-_TERMINATION_RE = re.compile(r"[A-Za-z][A-Za-z -]*")
+_TERMINATION_RE = re.compile(r"[A-Za-z][A-Za-z_ -]*")
 _ELAPSED_MARKER_RE = re.compile(
     r"^Elapsed time: (?:0|[1-9]\d*)(?:\.\d+)? \[minutes\]$"
 )
@@ -221,6 +221,7 @@ def parse_mapping_profile(
     bundle_mode: str | None = None
     active_report: dict[str, Any] | None = None
     global_region_start: datetime | None = None
+    current_global_marker_reported: bool | None = None
     global_region_seconds = 0.0
     saw_reconstruction_end = False
 
@@ -236,8 +237,13 @@ def parse_mapping_profile(
                 raise ProfileError(f"incomplete report before line {line_number}")
 
             if message in {INITIAL_GLOBAL_MARKER, ITERATIVE_GLOBAL_MARKER}:
+                if current_global_marker_reported is False:
+                    raise ProfileError(
+                        f"global refinement marker has no report before line {line_number}"
+                    )
                 if global_region_start is None:
                     global_region_start = timestamp
+                current_global_marker_reported = False
                 bundle_mode = GLOBAL_BUNDLE_ADJUSTMENT
                 if message == INITIAL_GLOBAL_MARKER:
                     marker_counts["initial_global_markers"] += 1
@@ -248,6 +254,12 @@ def parse_mapping_profile(
             if message.startswith("Registering image "):
                 marker_counts["registration_attempts"] += 1
                 if global_region_start is not None:
+                    if current_global_marker_reported is False:
+                        raise ProfileError(
+                            "global refinement marker has no report before "
+                            f"line {line_number}"
+                        )
+                    current_global_marker_reported = None
                     global_region_seconds += (
                         timestamp - global_region_start
                     ).total_seconds()
@@ -260,6 +272,11 @@ def parse_mapping_profile(
             ) or message.startswith("Discarding reconstruction")
             if is_reconstruction_end or line_number == final_elapsed_line:
                 saw_reconstruction_end = saw_reconstruction_end or is_reconstruction_end
+                if current_global_marker_reported is False:
+                    raise ProfileError(
+                        f"global refinement marker has no report before line {line_number}"
+                    )
+                current_global_marker_reported = None
                 if global_region_start is not None:
                     global_region_seconds += (
                         timestamp - global_region_start
@@ -297,7 +314,10 @@ def parse_mapping_profile(
             raise ProfileError(f"duplicate report field at line {line_number}")
         fields[field] = value
         if field == "termination":
+            report_kind = active_report["kind"]
             _record_report(active_report, totals, line_number)
+            if report_kind == GLOBAL_BUNDLE_ADJUSTMENT:
+                current_global_marker_reported = True
             active_report = None
 
     if active_report is not None:
@@ -306,14 +326,6 @@ def parse_mapping_profile(
         raise ProfileError("mapper log ends inside a global region")
     if not saw_reconstruction_end:
         raise ProfileError("log is missing a reconstruction completion marker")
-
-    expected_global_reports = (
-        marker_counts["initial_global_markers"]
-        + marker_counts["iterative_global_refinement_markers"]
-    )
-    actual_global_reports = int(totals[GLOBAL_BUNDLE_ADJUSTMENT]["calls"])
-    if actual_global_reports != expected_global_reports:
-        raise ProfileError("global refinement markers and reports do not match")
 
     observed_span_seconds = (last_timestamp - first_timestamp).total_seconds()
     mapper_wall_seconds = _validated_wall_seconds(

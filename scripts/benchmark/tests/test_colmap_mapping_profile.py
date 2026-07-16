@@ -287,6 +287,48 @@ class ColmapMappingProfileTests(unittest.TestCase):
             4.0,
         )
 
+    def test_accepts_ceres_termination_enum_names(self) -> None:
+        log = "\n".join(
+            [
+                _line("00.000000", "Loading database"),
+                _line("01.000000", "Global bundle adjustment"),
+                *_report(
+                    "01.100000",
+                    "Bundle adjustment report",
+                    termination="NO_CONVERGENCE",
+                ),
+                _line("03.000000", "Keeping successful reconstruction"),
+                _line("04.000000", "Elapsed time: 0.067 [minutes]"),
+            ]
+        )
+
+        profile = _profiler().parse_mapping_profile(log)
+
+        self.assertEqual(
+            profile["report_totals"]["global_bundle_adjustment"]["calls"],
+            1,
+        )
+
+    def test_accepts_multiple_global_reports_for_one_refinement_marker(self) -> None:
+        log = "\n".join(
+            [
+                _line("00.000000", "Loading database"),
+                _line("01.000000", "Global bundle adjustment"),
+                *_report("01.100000", "Bundle adjustment report"),
+                *_report("02.100000", "Bundle adjustment report"),
+                _line("04.000000", "Keeping successful reconstruction"),
+                _line("05.000000", "Elapsed time: 0.083 [minutes]"),
+            ]
+        )
+
+        profile = _profiler().parse_mapping_profile(log)
+
+        self.assertEqual(
+            profile["report_totals"]["global_bundle_adjustment"]["calls"],
+            2,
+        )
+        self.assertEqual(profile["marker_counts"]["initial_global_markers"], 1)
+
     def test_rejects_malformed_incomplete_and_backwards_logs(self) -> None:
         profiler = _profiler()
         complete = _report("02.000000", "Bundle adjustment report")
