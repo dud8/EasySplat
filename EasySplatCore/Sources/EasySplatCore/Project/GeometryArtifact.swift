@@ -115,6 +115,7 @@ public struct PairGraphMeasurement: Codable, Sendable, Equatable {
     public var loopRevisitPairCount: Int
     public var connectedComponentCount: Int
     public var isolatedViewCount: Int
+    public var descriptorlessViewCount: Int
     public var degreeP10: Int
     public var degreeMedian: Int
     public var degreeP90: Int
@@ -134,6 +135,7 @@ public struct PairGraphMeasurement: Codable, Sendable, Equatable {
         loopRevisitPairCount: Int,
         connectedComponentCount: Int,
         isolatedViewCount: Int,
+        descriptorlessViewCount: Int = 0,
         degreeP10: Int,
         degreeMedian: Int,
         degreeP90: Int,
@@ -152,6 +154,7 @@ public struct PairGraphMeasurement: Codable, Sendable, Equatable {
         self.loopRevisitPairCount = loopRevisitPairCount
         self.connectedComponentCount = connectedComponentCount
         self.isolatedViewCount = isolatedViewCount
+        self.descriptorlessViewCount = descriptorlessViewCount
         self.degreeP10 = degreeP10
         self.degreeMedian = degreeMedian
         self.degreeP90 = degreeP90
@@ -340,7 +343,7 @@ public struct CanonicalOrientationArtifact: Codable, Sendable, Equatable {
 }
 
 public struct GeometryArtifact: Codable, Sendable, Equatable {
-    public static let currentSchemaVersion = 5
+    public static let currentSchemaVersion = 6
 
     public var schemaVersion: Int
     public var solverVersion: String

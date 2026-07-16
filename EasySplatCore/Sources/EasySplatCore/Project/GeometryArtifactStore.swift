@@ -240,7 +240,11 @@ enum GeometryArtifactStore {
               }) else {
             throw Error.invalidTimings
         }
-        try validatePairGraph(artifact.pairGraph, totalViewCount: artifact.totalViewCount)
+        try validatePairGraph(
+            artifact.pairGraph,
+            totalViewCount: artifact.totalViewCount,
+            registeredViewCount: artifact.registeredViewCount
+        )
         try validateCanonicalOrientation(
             artifact.canonicalOrientation,
             registeredViewCount: artifact.registeredViewCount
@@ -316,7 +320,8 @@ enum GeometryArtifactStore {
 
     private static func validatePairGraph(
         _ artifact: PairGraphArtifact,
-        totalViewCount: Int
+        totalViewCount: Int,
+        registeredViewCount: Int
     ) throws {
         guard artifact.mappingAttemptNumber > 0,
               artifact.bundleAdjustmentCycleCount > 0,
@@ -329,7 +334,17 @@ enum GeometryArtifactStore {
         case .notEvaluated:
             guard artifact.measurement == nil else { throw Error.invalidPairGraph }
         case .measured:
-            guard let measurement = artifact.measurement,
+            guard let measurement = artifact.measurement else {
+                throw Error.invalidPairGraph
+            }
+            let descriptorlessViewCount = measurement.descriptorlessViewCount
+            guard descriptorlessViewCount >= 0,
+                  descriptorlessViewCount < totalViewCount else {
+                throw Error.invalidPairGraph
+            }
+            let matchableViewCount = totalViewCount - descriptorlessViewCount
+            guard matchableViewCount >= 2,
+                  registeredViewCount <= matchableViewCount,
                   measurement.scheduledPairCount >= 0,
                   measurement.attemptedPairCount >= 0,
                   measurement.attemptedPairCount <= measurement.scheduledPairCount,
@@ -347,13 +362,13 @@ enum GeometryArtifactStore {
                     + measurement.retrievalPairCount
                     + measurement.loopRevisitPairCount
                     == measurement.scheduledPairCount,
-                  measurement.connectedComponentCount == 1,
-                  measurement.isolatedViewCount == 0,
-                  measurement.spatiallyVerifiedPairCount >= max(0, totalViewCount - 1),
+                  measurement.connectedComponentCount == descriptorlessViewCount + 1,
+                  measurement.isolatedViewCount == descriptorlessViewCount,
+                  measurement.spatiallyVerifiedPairCount >= matchableViewCount - 1,
                   measurement.degreeP10 >= 0,
                   measurement.degreeP10 <= measurement.degreeMedian,
                   measurement.degreeMedian <= measurement.degreeP90,
-                  measurement.degreeP90 < totalViewCount,
+                  measurement.degreeP90 < matchableViewCount,
                   !measurement.matcherAttempts.isEmpty,
                   isSHA256(measurement.pairListDigest),
                   isSHA256(measurement.featureDatabaseDigest),

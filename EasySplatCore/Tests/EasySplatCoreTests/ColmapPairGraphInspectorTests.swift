@@ -175,6 +175,145 @@ final class ColmapPairGraphInspectorTests: XCTestCase {
         XCTAssertTrue(result.verifiedGraph.verifiedPairs.isEmpty)
     }
 
+    func testAcceptsDescriptorlessSingletonWithoutHidingRawGraphDisconnection() throws {
+        let databaseURL = try makeDatabase(
+            imageIDs: [1, 2, 3],
+            descriptorRecords: [(1, 64), (2, 64), (3, 0)],
+            matches: [(pairID(1, 2), 30), (pairID(2, 3), 0)],
+            verified: [(pairID(1, 2), 20), (pairID(2, 3), 0)]
+        )
+        let schedule = makeSchedule(
+            imageIDs: [1, 2, 3],
+            pairs: [(1, 2, .local), (2, 3, .local)]
+        )
+
+        let result = try ColmapPairGraphInspector(databaseURL: databaseURL).inspect(
+            schedule: schedule,
+            completion: .succeeded
+        )
+
+        XCTAssertEqual(result.connectedComponentCount, 2)
+        XCTAssertEqual(result.isolatedViewCount, 1)
+        XCTAssertEqual(result.descriptorlessImageNames, [imageName(3)])
+        XCTAssertTrue(result.hasSingleDescriptorBearingComponent)
+    }
+
+    func testDescriptorBearingSingletonRemainsDisconnected() throws {
+        let databaseURL = try makeDatabase(
+            imageIDs: [1, 2, 3],
+            matches: [(pairID(1, 2), 30), (pairID(2, 3), 0)],
+            verified: [(pairID(1, 2), 20), (pairID(2, 3), 0)]
+        )
+        let schedule = makeSchedule(
+            imageIDs: [1, 2, 3],
+            pairs: [(1, 2, .local), (2, 3, .local)]
+        )
+
+        let result = try ColmapPairGraphInspector(databaseURL: databaseURL).inspect(
+            schedule: schedule,
+            completion: .succeeded
+        )
+
+        XCTAssertTrue(result.descriptorlessImageNames.isEmpty)
+        XCTAssertFalse(result.hasSingleDescriptorBearingComponent)
+    }
+
+    func testDescriptorlessSingletonDoesNotExcuseTwoDescriptorBearingComponents() throws {
+        let databaseURL = try makeDatabase(
+            imageIDs: [1, 2, 3, 4, 5],
+            descriptorRecords: [(1, 64), (2, 64), (3, 64), (4, 64), (5, 0)],
+            matches: [
+                (pairID(1, 2), 30),
+                (pairID(2, 3), 0),
+                (pairID(3, 4), 30),
+                (pairID(4, 5), 0),
+            ],
+            verified: [
+                (pairID(1, 2), 20),
+                (pairID(2, 3), 0),
+                (pairID(3, 4), 20),
+                (pairID(4, 5), 0),
+            ]
+        )
+        let schedule = makeSchedule(
+            imageIDs: [1, 2, 3, 4, 5],
+            pairs: [
+                (1, 2, .local),
+                (2, 3, .local),
+                (3, 4, .local),
+                (4, 5, .local),
+            ]
+        )
+
+        let result = try ColmapPairGraphInspector(databaseURL: databaseURL).inspect(
+            schedule: schedule,
+            completion: .succeeded
+        )
+
+        XCTAssertEqual(result.descriptorlessImageNames, [imageName(5)])
+        XCTAssertEqual(result.connectedComponentCount, 3)
+        XCTAssertFalse(result.hasSingleDescriptorBearingComponent)
+    }
+
+    func testRejectsMissingDuplicateNullAndNegativeDescriptorRows() throws {
+        let invalidRecords: [[(Int, Int64?)]] = [
+            [(1, 64)],
+            [(1, 64), (1, 64), (2, 64)],
+            [(1, 64), (2, nil)],
+            [(1, 64), (2, -1)],
+        ]
+
+        for records in invalidRecords {
+            let databaseURL = try makeDatabase(
+                imageIDs: [1, 2],
+                descriptorRecords: records,
+                descriptorImageIDIsPrimaryKey: false,
+                matches: [(pairID(1, 2), 0)],
+                verified: [(pairID(1, 2), 0)]
+            )
+
+            XCTAssertThrowsError(
+                try ColmapPairGraphInspector(databaseURL: databaseURL).inspect(
+                    schedule: makeSchedule(imageIDs: [1, 2], pairs: [(1, 2, .local)]),
+                    completion: .succeeded
+                )
+            ) { error in
+                guard case .malformedSchema(let table, _) = error as? ColmapPairGraphInspectorError else {
+                    return XCTFail("Expected malformed descriptor evidence, got \(error)")
+                }
+                XCTAssertEqual(table, "descriptors")
+            }
+        }
+    }
+
+    func testRejectsPositiveCorrespondencesForDescriptorlessImage() throws {
+        for table in ["matches", "two_view_geometries"] {
+            let rawRows: Int64 = table == "matches" ? 20 : 0
+            let verifiedRows: Int64 = table == "two_view_geometries" ? 20 : 0
+            let databaseURL = try makeDatabase(
+                imageIDs: [1, 2],
+                descriptorRecords: [(1, 64), (2, 0)],
+                matches: [(pairID(1, 2), rawRows)],
+                verified: [(pairID(1, 2), verifiedRows)]
+            )
+
+            XCTAssertThrowsError(
+                try ColmapPairGraphInspector(databaseURL: databaseURL).inspect(
+                    schedule: makeSchedule(imageIDs: [1, 2], pairs: [(1, 2, .local)]),
+                    completion: .succeeded
+                )
+            ) { error in
+                XCTAssertEqual(
+                    error as? ColmapPairGraphInspectorError,
+                    .descriptorlessImageHasCorrespondences(
+                        table: table,
+                        pairID: pairID(1, 2)
+                    )
+                )
+            }
+        }
+    }
+
     func testNoncontiguousPositiveImageIDsAreSupported() throws {
         let databaseURL = try makeDatabase(
             imageIDs: [1, 41, 10_003],
@@ -606,6 +745,8 @@ final class ColmapPairGraphInspectorTests: XCTestCase {
 
     private func makeDatabase(
         imageIDs: [Int],
+        descriptorRecords: [(Int, Int64?)]? = nil,
+        descriptorImageIDIsPrimaryKey: Bool = true,
         matches: [(Int64, Int64)],
         verified: [(Int64, Int64)],
         matchesHasRowsColumn: Bool = true
@@ -636,7 +777,7 @@ final class ColmapPairGraphInspectorTests: XCTestCase {
         )
         try execute(
             database,
-            "CREATE TABLE descriptors(image_id INTEGER PRIMARY KEY, rows INTEGER, cols INTEGER, data BLOB);"
+            "CREATE TABLE descriptors(image_id INTEGER\(descriptorImageIDIsPrimaryKey ? " PRIMARY KEY" : ""), rows INTEGER, cols INTEGER, data BLOB);"
         )
         if matchesHasRowsColumn {
             try execute(
@@ -661,9 +802,12 @@ final class ColmapPairGraphInspectorTests: XCTestCase {
                 database,
                 "INSERT INTO keypoints(image_id, rows, cols, data) VALUES (\(imageID), 1, 4, X'00');"
             )
+        }
+        for (imageID, rows) in descriptorRecords ?? imageIDs.map({ ($0, Int64(1)) }) {
+            let rowsSQL = rows.map(String.init) ?? "NULL"
             try execute(
                 database,
-                "INSERT INTO descriptors(image_id, rows, cols, data) VALUES (\(imageID), 1, 128, X'00');"
+                "INSERT INTO descriptors(image_id, rows, cols, data) VALUES (\(imageID), \(rowsSQL), 128, X'00');"
             )
         }
         guard matchesHasRowsColumn else { return databaseURL }

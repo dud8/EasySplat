@@ -26,6 +26,7 @@ final class PairGraphEvidenceStoreTests: XCTestCase {
         XCTAssertEqual(measurement.localPairCount, 2)
         XCTAssertEqual(measurement.retrievalPairCount, 1)
         XCTAssertEqual(measurement.loopRevisitPairCount, 1)
+        XCTAssertEqual(measurement.descriptorlessViewCount, 0)
         XCTAssertEqual(measurement.matcherAttempts, evidence.attempts.map(\.artifact))
         XCTAssertEqual(measurement.matchingDurationSeconds, 4)
         XCTAssertEqual(loaded.fallbackReasons, ["denser pair graph"])
@@ -312,6 +313,66 @@ final class PairGraphEvidenceStoreTests: XCTestCase {
         ))
     }
 
+    func testDescriptorlessSingletonEvidenceRoundTripsWithoutFlatteningGraphFacts() throws {
+        let fixture = try makeProject()
+        defer { try? FileManager.default.removeItem(at: fixture.root) }
+        let evidence = makeDescriptorlessEvidence()
+
+        try PairGraphEvidenceStore.save(
+            evidence,
+            to: fixture.paths.pairGraphEvidenceURL,
+            projectPaths: fixture.paths
+        )
+        let loaded = try PairGraphEvidenceStore.load(
+            from: fixture.paths.pairGraphEvidenceURL,
+            projectPaths: fixture.paths
+        )
+
+        XCTAssertEqual(loaded.acceptedInspection.connectedComponentCount, 2)
+        XCTAssertEqual(loaded.acceptedInspection.isolatedViewCount, 1)
+        XCTAssertEqual(loaded.acceptedInspection.descriptorlessViewCount, 1)
+        XCTAssertEqual(try loaded.pairGraphMeasurement().descriptorlessViewCount, 1)
+    }
+
+    func testRejectsTamperedDescriptorlessGraphEvidenceAndRetiredSchema() throws {
+        let fixture = try makeProject()
+        defer { try? FileManager.default.removeItem(at: fixture.root) }
+
+        var evidence = makeDescriptorlessEvidence()
+        evidence.acceptedInspection.descriptorlessViewCount = 0
+        XCTAssertThrowsError(try PairGraphEvidenceStore.save(
+            evidence,
+            to: fixture.paths.pairGraphEvidenceURL,
+            projectPaths: fixture.paths
+        ))
+
+        evidence = makeDescriptorlessEvidence()
+        evidence.acceptedInspection.connectedComponentCount = 3
+        XCTAssertThrowsError(try PairGraphEvidenceStore.save(
+            evidence,
+            to: fixture.paths.pairGraphEvidenceURL,
+            projectPaths: fixture.paths
+        ))
+
+        evidence = makeDescriptorlessEvidence()
+        evidence.acceptedInspection.descriptorlessViewCount = .min
+        XCTAssertThrowsError(try PairGraphEvidenceStore.save(
+            evidence,
+            to: fixture.paths.pairGraphEvidenceURL,
+            projectPaths: fixture.paths
+        ))
+
+        evidence = makeDescriptorlessEvidence()
+        evidence.schemaVersion = 2
+        XCTAssertThrowsError(try PairGraphEvidenceStore.save(
+            evidence,
+            to: fixture.paths.pairGraphEvidenceURL,
+            projectPaths: fixture.paths
+        )) { error in
+            XCTAssertEqual(error as? PairGraphEvidenceStoreError, .invalidSchema(2))
+        }
+    }
+
     func testTargetedAndFullExactRecoveryPurposesRoundTrip() throws {
         let fixture = try makeProject()
         defer { try? FileManager.default.removeItem(at: fixture.root) }
@@ -496,7 +557,8 @@ final class PairGraphEvidenceStoreTests: XCTestCase {
             degreeMedian: 2,
             degreeP90: 2,
             featureDatabaseDigest: String(repeating: "b", count: 64),
-            matchingDatabaseDigest: String(repeating: "c", count: 64)
+            matchingDatabaseDigest: String(repeating: "c", count: 64),
+            descriptorlessImageNames: []
         )
         return PairGraphEvidence(
             selectedFramesDigest: String(repeating: "a", count: 64),
@@ -580,7 +642,8 @@ final class PairGraphEvidenceStoreTests: XCTestCase {
             degreeMedian: 2,
             degreeP90: 2,
             featureDatabaseDigest: String(repeating: "b", count: 64),
-            matchingDatabaseDigest: String(repeating: "c", count: 64)
+            matchingDatabaseDigest: String(repeating: "c", count: 64),
+            descriptorlessImageNames: []
         )
         return PairGraphEvidence(
             selectedFramesDigest: String(repeating: "a", count: 64),
@@ -590,6 +653,55 @@ final class PairGraphEvidenceStoreTests: XCTestCase {
             acceptedInspection: inspection,
             matchingDurationSeconds: attempts.reduce(0) { $0 + $1.artifact.durationSeconds },
             fallbackReasons: ["exact descriptor matching"]
+        )
+    }
+
+    private func makeDescriptorlessEvidence() -> PairGraphEvidence {
+        let scheduledPairs = [
+            ColmapScheduledPair("a.jpg", "b.jpg", role: .local),
+            ColmapScheduledPair("a.jpg", "c.jpg", role: .retrieval),
+            ColmapScheduledPair("b.jpg", "c.jpg", role: .local),
+            ColmapScheduledPair("c.jpg", "d.jpg", role: .retrieval),
+        ]
+        let attempt = PairGraphAttemptEvidence(
+            artifact: PairMatchingAttemptArtifact(
+                attemptNumber: 1,
+                matcher: .faiss,
+                recoveryLevel: .normal,
+                outcome: .completed,
+                scheduledPairCount: 4,
+                attemptedPairCount: 4,
+                rawMatchedPairCount: 3,
+                spatiallyVerifiedPairCount: 3,
+                durationSeconds: 1
+            ),
+            scheduledPairs: scheduledPairs
+        )
+        let inspection = ColmapPairGraphInspection(
+            scheduledPairCount: 4,
+            attemptedPairCount: 4,
+            rawMatchedPairCount: 3,
+            spatiallyVerifiedPairCount: 3,
+            localPairCount: 2,
+            retrievalPairCount: 2,
+            loopRevisitPairCount: 0,
+            connectedComponentCount: 2,
+            isolatedViewCount: 1,
+            degreeP10: 0,
+            degreeMedian: 2,
+            degreeP90: 2,
+            featureDatabaseDigest: String(repeating: "b", count: 64),
+            matchingDatabaseDigest: String(repeating: "c", count: 64),
+            descriptorlessImageNames: ["d.jpg"]
+        )
+        return PairGraphEvidence(
+            selectedFramesDigest: String(repeating: "a", count: 64),
+            imageNames: ["a.jpg", "b.jpg", "c.jpg", "d.jpg"],
+            attempts: [attempt],
+            acceptedAttemptNumber: 1,
+            acceptedInspection: inspection,
+            matchingDurationSeconds: 1,
+            fallbackReasons: []
         )
     }
 }

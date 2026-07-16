@@ -53,9 +53,9 @@ final class GeometryArtifactStoreTests: XCTestCase {
         }
     }
 
-    func testLoadRejectsSchemaFourBeforeDecodingRetiredViewerState() throws {
+    func testLoadRejectsSchemaFiveBeforeDecodingRetiredPairGraphState() throws {
         let baselineSchemaVersion = GeometryArtifact.currentSchemaVersion - 1
-        XCTAssertEqual(baselineSchemaVersion, 4)
+        XCTAssertEqual(baselineSchemaVersion, 5)
 
         let root = try TestFileBuilder.makeTempDir()
         defer { try? FileManager.default.removeItem(at: root) }
@@ -68,11 +68,7 @@ final class GeometryArtifactStoreTests: XCTestCase {
             ) as? [String: Any]
         )
         object["schemaVersion"] = baselineSchemaVersion
-        var orientation = try XCTUnwrap(
-            object["canonicalOrientation"] as? [String: Any]
-        )
-        orientation["isViewOnlyFlipActive"] = true
-        object["canonicalOrientation"] = orientation
+        object["retiredPairGraphPayload"] = true
         try JSONSerialization.data(withJSONObject: object).write(
             to: paths.geometryManifestURL
         )
@@ -551,42 +547,9 @@ final class GeometryArtifactStoreTests: XCTestCase {
         defer { try? FileManager.default.removeItem(at: root) }
         let paths = ProjectPaths(root: root)
         try paths.ensureDirectories()
-        let fixture = try writeCanonicalModel(at: paths)
-        var artifact = makeArtifact(fixture: fixture)
-        artifact.pairGraph = .measured(
-            PairGraphMeasurement(
-                scheduledPairCount: 0,
-                attemptedPairCount: 0,
-                rawMatchedPairCount: 0,
-                spatiallyVerifiedPairCount: 0,
-                localPairCount: 0,
-                retrievalPairCount: 0,
-                loopRevisitPairCount: 0,
-                connectedComponentCount: 1,
-                isolatedViewCount: 0,
-                degreeP10: 0,
-                degreeMedian: 0,
-                degreeP90: 0,
-                matcherAttempts: [PairMatchingAttemptArtifact(
-                    attemptNumber: 1,
-                    matcher: .faiss,
-                    recoveryLevel: .normal,
-                    outcome: .completed,
-                    scheduledPairCount: 0,
-                    attemptedPairCount: 0,
-                    rawMatchedPairCount: 0,
-                    spatiallyVerifiedPairCount: 0,
-                    durationSeconds: 0.01
-                )],
-                pairListDigest: String(repeating: "d", count: 64),
-                featureDatabaseDigest: String(repeating: "e", count: 64),
-                matchingDatabaseDigest: String(repeating: "f", count: 64),
-                matchingDurationSeconds: 0.01
-            ),
-            mappingAttemptNumber: 1,
-            bundleAdjustmentCycleCount: 2,
-            fallbackReason: nil
-        )
+        let fixture = try writeDescriptorlessGeometryFixture(at: paths)
+        var artifact = makeDescriptorlessMeasuredArtifact(fixture: fixture)
+        artifact.pairGraph.bundleAdjustmentCycleCount = 2
         artifact.canonicalOrientation = CanonicalOrientationArtifact(
             status: .unresolved,
             method: nil,
@@ -598,7 +561,7 @@ final class GeometryArtifactStoreTests: XCTestCase {
         XCTAssertNoThrow(try GeometryArtifactStore.validate(artifact, projectPaths: paths))
 
         var disconnected = artifact
-        disconnected.pairGraph.measurement?.connectedComponentCount = 2
+        disconnected.pairGraph.measurement?.connectedComponentCount = 3
         XCTAssertThrowsError(
             try GeometryArtifactStore.validate(disconnected, projectPaths: paths)
         ) { error in
@@ -609,6 +572,32 @@ final class GeometryArtifactStoreTests: XCTestCase {
         failedAcceptedAttempt.pairGraph.measurement?.matcherAttempts[0].outcome = .failed
         XCTAssertThrowsError(
             try GeometryArtifactStore.validate(failedAcceptedAttempt, projectPaths: paths)
+        ) { error in
+            XCTAssertEqual(error as? GeometryArtifactStore.Error, .invalidPairGraph)
+        }
+    }
+
+    func testMeasuredPairGraphAllowsOnlyDescriptorlessUnregisteredViews() throws {
+        let root = try TestFileBuilder.makeTempDir()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let paths = ProjectPaths(root: root)
+        try paths.ensureDirectories()
+        let fixture = try writeDescriptorlessGeometryFixture(at: paths)
+        var artifact = makeDescriptorlessMeasuredArtifact(fixture: fixture)
+
+        XCTAssertNoThrow(try GeometryArtifactStore.validate(artifact, projectPaths: paths))
+
+        artifact.registeredViewCount = 10
+        XCTAssertThrowsError(
+            try GeometryArtifactStore.validate(artifact, projectPaths: paths)
+        ) { error in
+            XCTAssertEqual(error as? GeometryArtifactStore.Error, .invalidPairGraph)
+        }
+
+        artifact.registeredViewCount = 9
+        artifact.pairGraph.measurement?.descriptorlessViewCount = .min
+        XCTAssertThrowsError(
+            try GeometryArtifactStore.validate(artifact, projectPaths: paths)
         ) { error in
             XCTAssertEqual(error as? GeometryArtifactStore.Error, .invalidPairGraph)
         }
@@ -757,6 +746,55 @@ final class GeometryArtifactStoreTests: XCTestCase {
         )
     }
 
+    private func makeDescriptorlessMeasuredArtifact(
+        fixture: Fixture
+    ) -> GeometryArtifact {
+        let imageNames = (1...10).map { String(format: "frame_%06d.jpg", $0) }
+        var artifact = makeArtifact(fixture: fixture)
+        artifact.orderedImageNames = imageNames
+        artifact.orderedImageTimestamps = Array(repeating: nil, count: imageNames.count)
+        artifact.registeredViewCount = 9
+        artifact.totalViewCount = 10
+        artifact.trackCount = 9
+        artifact.pointCount = 1
+        artifact.pairGraph = .measured(
+            PairGraphMeasurement(
+                scheduledPairCount: 9,
+                attemptedPairCount: 9,
+                rawMatchedPairCount: 8,
+                spatiallyVerifiedPairCount: 8,
+                localPairCount: 9,
+                retrievalPairCount: 0,
+                loopRevisitPairCount: 0,
+                connectedComponentCount: 2,
+                isolatedViewCount: 1,
+                descriptorlessViewCount: 1,
+                degreeP10: 0,
+                degreeMedian: 2,
+                degreeP90: 2,
+                matcherAttempts: [PairMatchingAttemptArtifact(
+                    attemptNumber: 1,
+                    matcher: .faiss,
+                    recoveryLevel: .normal,
+                    outcome: .completed,
+                    scheduledPairCount: 9,
+                    attemptedPairCount: 9,
+                    rawMatchedPairCount: 8,
+                    spatiallyVerifiedPairCount: 8,
+                    durationSeconds: 0.01
+                )],
+                pairListDigest: String(repeating: "d", count: 64),
+                featureDatabaseDigest: String(repeating: "e", count: 64),
+                matchingDatabaseDigest: String(repeating: "f", count: 64),
+                matchingDurationSeconds: 0.01
+            ),
+            mappingAttemptNumber: 1,
+            bundleAdjustmentCycleCount: 1,
+            fallbackReason: nil
+        )
+        return artifact
+    }
+
     private func writeCanonicalModel(
         at paths: ProjectPaths,
         observationCount: Int = 1
@@ -797,6 +835,53 @@ final class GeometryArtifactStoreTests: XCTestCase {
             ),
             pointCount: observationCount,
             observationCount: observationCount
+        )
+    }
+
+    private func writeDescriptorlessGeometryFixture(
+        at paths: ProjectPaths
+    ) throws -> Fixture {
+        let model = paths.colmapSparseURL.appendingPathComponent("0", isDirectory: true)
+        try FileManager.default.createDirectory(at: model, withIntermediateDirectories: true)
+        let registeredImageNames = (1...9).map { String(format: "frame_%06d.jpg", $0) }
+        let selectedImageNames = registeredImageNames + ["frame_000010.jpg"]
+        let images = registeredImageNames.enumerated().flatMap { offset, name in
+            [
+                "\(offset + 1) 1 0 0 0 0 0 0 1 \(name)",
+                "320 240 1",
+            ]
+        }.joined(separator: "\n") + "\n"
+        let track = (1...9).map { "\($0) 0" }.joined(separator: " ")
+        let contents = [
+            "cameras.txt": "1 SIMPLE_PINHOLE 640 480 500 320 240\n",
+            "images.txt": images,
+            "points3D.txt": "1 0 0 1 255 255 255 0 \(track)\n",
+        ]
+        var hashes: [String: String] = [:]
+        for (name, contents) in contents {
+            let data = Data(contents.utf8)
+            try data.write(to: model.appendingPathComponent(name), options: [.atomic])
+            hashes[name] = SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
+        }
+        try Data("original input".utf8).write(
+            to: paths.originalsURL.appendingPathComponent("source.jpg"),
+            options: [.atomic]
+        )
+        for name in selectedImageNames {
+            try Data(name.utf8).write(
+                to: paths.framesSelectedURL.appendingPathComponent(name),
+                options: [.atomic]
+            )
+        }
+        return (
+            modelHashes: hashes,
+            inputDigest: try GeometryArtifactStore.inputDigest(projectPaths: paths),
+            selectedFramesDigest: try GeometryArtifactStore.selectedFramesDigest(
+                orderedImageNames: selectedImageNames,
+                projectPaths: paths
+            ),
+            pointCount: 1,
+            observationCount: 9
         )
     }
 }

@@ -7,7 +7,7 @@ enum PairGraphExactRecoveryMode: String, Codable, Sendable, Equatable {
 }
 
 struct PairGraphRecoveryState: Codable, Sendable, Equatable {
-    static let currentSchemaVersion = 1
+    static let currentSchemaVersion = 2
 
     var schemaVersion: Int
     var selectedFramesDigest: String

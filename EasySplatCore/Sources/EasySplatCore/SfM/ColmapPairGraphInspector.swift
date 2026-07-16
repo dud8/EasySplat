@@ -31,10 +31,42 @@ struct ColmapPairGraphInspection: Sendable, Equatable {
     let degreeP90: Int
     let featureDatabaseDigest: String
     let matchingDatabaseDigest: String
+    let descriptorlessImageNames: [String]
     private(set) var verifiedGraph = ColmapVerifiedGraphSnapshot(
         verifiedPairs: [],
         components: []
     )
+
+    var descriptorlessViewCount: Int {
+        descriptorlessImageNames.count
+    }
+
+    var hasSingleDescriptorBearingComponent: Bool {
+        let descriptorless = Set(descriptorlessImageNames)
+        let descriptorBearingViewCount = verifiedGraph.components.reduce(0) {
+            $0 + $1.count(where: { !descriptorless.contains($0) })
+        }
+        guard descriptorBearingViewCount >= 2 else { return false }
+
+        var descriptorBearingComponents = 0
+        for component in verifiedGraph.components {
+            let descriptorBearingNames = component.filter { !descriptorless.contains($0) }
+            if descriptorBearingNames.isEmpty {
+                guard component.count == 1,
+                      let name = component.first,
+                      descriptorless.contains(name) else {
+                    return false
+                }
+            } else {
+                guard descriptorBearingNames.count == component.count else { return false }
+                descriptorBearingComponents += 1
+                guard descriptorBearingNames.count == descriptorBearingViewCount else {
+                    return false
+                }
+            }
+        }
+        return descriptorBearingComponents == 1
+    }
 }
 
 enum ColmapPairGraphInspectorError: Error, LocalizedError, Equatable {
@@ -60,6 +92,7 @@ enum ColmapPairGraphInspectorError: Error, LocalizedError, Equatable {
     case duplicateDatabasePair(table: String, pairID: Int64)
     case negativeRows(table: String, pairID: Int64, rows: Int64)
     case verifiedRowsExceedRaw(pairID: Int64, verifiedRows: Int64, rawRows: Int64)
+    case descriptorlessImageHasCorrespondences(table: String, pairID: Int64)
     case incompleteSuccessfulAttempt(table: String, missingPairIDs: [Int64])
 
     var errorDescription: String? {
@@ -110,6 +143,9 @@ enum ColmapPairGraphInspectorError: Error, LocalizedError, Equatable {
         case .verifiedRowsExceedRaw(let pairID, let verifiedRows, let rawRows):
             return
                 "The COLMAP pair \(pairID) has \(verifiedRows) verified rows but only \(rawRows) raw rows."
+        case .descriptorlessImageHasCorrespondences(let table, let pairID):
+            return
+                "The COLMAP \(table) pair \(pairID) contains correspondences for an image without descriptors."
         case .incompleteSuccessfulAttempt(let table, let missingPairIDs):
             return
                 "The successful matching attempt is missing \(table) rows for pair IDs \(missingPairIDs)."
@@ -169,10 +205,21 @@ struct ColmapPairGraphInspector: Sendable {
             uniqueKeysWithValues: databaseImages.map {
                 ($0.id, $0.name)
             })
+        let descriptorRowsByImageID = try readDescriptorRows(
+            imageNameByID: imageNameByID,
+            from: database
+        )
+        let descriptorlessImageIDs = Set(
+            descriptorRowsByImageID.compactMap { imageID, rows in
+                rows == 0 ? imageID : nil
+            }
+        )
+        let imageIDByName = Dictionary(
+            uniqueKeysWithValues: databaseImages.map { ($0.name, $0.id) }
+        )
         let pairIDByNames = try validatedSchedule.pairIDs(
-            imageIDByName: Dictionary(
-                uniqueKeysWithValues: databaseImages.map { ($0.name, $0.id) }
-            ))
+            imageIDByName: imageIDByName
+        )
         let scheduledPairIDs = Set(pairIDByNames.values)
 
         let rawRows = try readPairRows(
@@ -186,6 +233,16 @@ struct ColmapPairGraphInspector: Sendable {
             scheduledPairIDs: scheduledPairIDs,
             imageNameByID: imageNameByID,
             from: database
+        )
+        try validatePairRows(
+            rawRows,
+            table: "matches",
+            descriptorlessImageIDs: descriptorlessImageIDs
+        )
+        try validatePairRows(
+            verifiedRows,
+            table: "two_view_geometries",
+            descriptorlessImageIDs: descriptorlessImageIDs
         )
 
         if completion == .succeeded {
@@ -246,6 +303,9 @@ struct ColmapPairGraphInspector: Sendable {
             degreeP90: nearestRank(graph.sortedDegrees, percentile: 0.90),
             featureDatabaseDigest: databaseDigests.feature,
             matchingDatabaseDigest: databaseDigests.matching,
+            descriptorlessImageNames: validatedSchedule.imageNames.filter { name in
+                imageIDByName[name].map(descriptorlessImageIDs.contains) ?? false
+            },
             verifiedGraph: graph.snapshot
         )
         try Task.checkCancellation()
@@ -440,6 +500,93 @@ struct ColmapPairGraphInspector: Sendable {
             }
             guard result.updateValue(rows, forKey: pairID) == nil else {
                 throw ColmapPairGraphInspectorError.duplicateDatabasePair(
+                    table: table,
+                    pairID: pairID
+                )
+            }
+        }
+    }
+
+    private func readDescriptorRows(
+        imageNameByID: [Int64: String],
+        from database: OpaquePointer
+    ) throws -> [Int64: Int64] {
+        var statement: OpaquePointer?
+        let sql = "SELECT image_id, rows FROM descriptors ORDER BY image_id;"
+        let prepareResult = sqlite3_prepare_v2(database, sql, -1, &statement, nil)
+        guard prepareResult == SQLITE_OK, let statement else {
+            throw ColmapPairGraphInspectorError.malformedSchema(
+                table: "descriptors",
+                message: String(cString: sqlite3_errmsg(database))
+            )
+        }
+        defer { sqlite3_finalize(statement) }
+
+        var rowsByImageID: [Int64: Int64] = [:]
+        while true {
+            try Task.checkCancellation()
+            let stepResult = sqlite3_step(statement)
+            if stepResult == SQLITE_DONE { break }
+            guard stepResult == SQLITE_ROW else {
+                throw ColmapPairGraphInspectorError.databaseReadFailed(
+                    table: "descriptors",
+                    code: stepResult,
+                    message: String(cString: sqlite3_errmsg(database))
+                )
+            }
+            guard sqlite3_column_type(statement, 0) == SQLITE_INTEGER,
+                  sqlite3_column_type(statement, 1) == SQLITE_INTEGER else {
+                throw ColmapPairGraphInspectorError.malformedSchema(
+                    table: "descriptors",
+                    message: "image_id and rows must be non-null INTEGER values"
+                )
+            }
+            let imageID = sqlite3_column_int64(statement, 0)
+            let rows = sqlite3_column_int64(statement, 1)
+            guard imageNameByID[imageID] != nil else {
+                throw ColmapPairGraphInspectorError.malformedSchema(
+                    table: "descriptors",
+                    message: "descriptor row refers to unknown image ID \(imageID)"
+                )
+            }
+            guard rows >= 0 else {
+                throw ColmapPairGraphInspectorError.malformedSchema(
+                    table: "descriptors",
+                    message: "descriptor row count is negative for image ID \(imageID)"
+                )
+            }
+            guard rowsByImageID.updateValue(rows, forKey: imageID) == nil else {
+                throw ColmapPairGraphInspectorError.malformedSchema(
+                    table: "descriptors",
+                    message: "descriptor evidence contains image ID \(imageID) more than once"
+                )
+            }
+        }
+
+        let expectedImageIDs = Set(imageNameByID.keys)
+        let actualImageIDs = Set(rowsByImageID.keys)
+        guard actualImageIDs == expectedImageIDs else {
+            let missing = expectedImageIDs.subtracting(actualImageIDs).sorted()
+            throw ColmapPairGraphInspectorError.malformedSchema(
+                table: "descriptors",
+                message: "descriptor evidence is missing image IDs \(missing)"
+            )
+        }
+        return rowsByImageID
+    }
+
+    private func validatePairRows(
+        _ rowsByPairID: [Int64: Int64],
+        table: String,
+        descriptorlessImageIDs: Set<Int64>
+    ) throws {
+        guard !descriptorlessImageIDs.isEmpty else { return }
+        for (pairID, rows) in rowsByPairID where rows > 0 {
+            try Task.checkCancellation()
+            let endpoints = try decode(pairID: pairID, table: table)
+            guard !descriptorlessImageIDs.contains(endpoints.first),
+                  !descriptorlessImageIDs.contains(endpoints.second) else {
+                throw ColmapPairGraphInspectorError.descriptorlessImageHasCorrespondences(
                     table: table,
                     pairID: pairID
                 )

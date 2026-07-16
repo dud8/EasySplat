@@ -33,6 +33,7 @@ struct PersistedColmapPairGraphInspection: Codable, Sendable, Equatable {
     var loopRevisitPairCount: Int
     var connectedComponentCount: Int
     var isolatedViewCount: Int
+    var descriptorlessViewCount: Int
     var degreeP10: Int
     var degreeMedian: Int
     var degreeP90: Int
@@ -49,6 +50,7 @@ struct PersistedColmapPairGraphInspection: Codable, Sendable, Equatable {
         loopRevisitPairCount = inspection.loopRevisitPairCount
         connectedComponentCount = inspection.connectedComponentCount
         isolatedViewCount = inspection.isolatedViewCount
+        descriptorlessViewCount = inspection.descriptorlessViewCount
         degreeP10 = inspection.degreeP10
         degreeMedian = inspection.degreeMedian
         degreeP90 = inspection.degreeP90
@@ -58,7 +60,7 @@ struct PersistedColmapPairGraphInspection: Codable, Sendable, Equatable {
 }
 
 struct PairGraphEvidence: Codable, Sendable, Equatable {
-    static let currentSchemaVersion = 2
+    static let currentSchemaVersion = 3
 
     var schemaVersion: Int
     var selectedFramesDigest: String
@@ -102,6 +104,7 @@ struct PairGraphEvidence: Codable, Sendable, Equatable {
             loopRevisitPairCount: acceptedInspection.loopRevisitPairCount,
             connectedComponentCount: acceptedInspection.connectedComponentCount,
             isolatedViewCount: acceptedInspection.isolatedViewCount,
+            descriptorlessViewCount: acceptedInspection.descriptorlessViewCount,
             degreeP10: acceptedInspection.degreeP10,
             degreeMedian: acceptedInspection.degreeMedian,
             degreeP90: acceptedInspection.degreeP90,
@@ -388,6 +391,12 @@ enum PairGraphEvidenceStore {
         let localCount = attempt.scheduledPairs.count { $0.role == .local }
         let retrievalCount = attempt.scheduledPairs.count { $0.role == .retrieval }
         let loopCount = attempt.scheduledPairs.count { $0.role == .loopRevisit }
+        let descriptorlessViewCount = inspection.descriptorlessViewCount
+        guard descriptorlessViewCount >= 0,
+              descriptorlessViewCount < imageCount else {
+            throw PairGraphEvidenceStoreError.invalidEvidence
+        }
+        let matchableViewCount = imageCount - descriptorlessViewCount
         guard inspection.scheduledPairCount == artifact.scheduledPairCount,
               artifact.outcome == .completed,
               inspection.attemptedPairCount == artifact.attemptedPairCount,
@@ -404,8 +413,9 @@ enum PairGraphEvidenceStore {
               inspection.rawMatchedPairCount <= inspection.attemptedPairCount,
               inspection.spatiallyVerifiedPairCount >= 0,
               inspection.spatiallyVerifiedPairCount <= inspection.rawMatchedPairCount,
-              inspection.connectedComponentCount == 1,
-              inspection.isolatedViewCount == 0,
+              matchableViewCount >= 2,
+              inspection.connectedComponentCount == descriptorlessViewCount + 1,
+              inspection.isolatedViewCount == descriptorlessViewCount,
               inspection.degreeP10 >= 0,
               inspection.degreeP10 <= inspection.degreeMedian,
               inspection.degreeMedian <= inspection.degreeP90,
@@ -419,9 +429,8 @@ enum PairGraphEvidenceStore {
         }
 
         let verifiedEdges = inspection.spatiallyVerifiedPairCount
-        guard imageCount >= 2,
-              verifiedEdges >= imageCount - 1,
-              inspection.degreeP90 <= min(imageCount - 1, verifiedEdges) else {
+        guard verifiedEdges >= matchableViewCount - 1,
+              inspection.degreeP90 <= min(matchableViewCount - 1, verifiedEdges) else {
             throw PairGraphEvidenceStoreError.invalidEvidence
         }
     }

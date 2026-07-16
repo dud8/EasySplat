@@ -5,6 +5,37 @@ import XCTest
 @testable import EasySplatCore
 
 final class PairGraphRecoveryStoreTests: XCTestCase {
+    func testRetiredRecoverySchemaInvalidatesPendingExactIntent() throws {
+        let fixture = try makeProject()
+        defer { try? FileManager.default.removeItem(at: fixture.root) }
+        let plans = try makePlans()
+        var state = PairGraphRecoveryState(
+            selectedFramesDigest: fixture.selectedFramesDigest,
+            imageNames: plans.source.imageNames,
+            mode: .sameScheduleExact,
+            activeRecoveryLevel: .maximum,
+            activePlan: plans.source,
+            attempts: [makeAttempt(
+                number: 1,
+                matcher: .faiss,
+                outcome: .failed,
+                plan: plans.source,
+                duration: 0.5
+            )],
+            matchingDurationSeconds: 0.5,
+            fallbackReasons: ["exact descriptor matching"]
+        )
+        state.schemaVersion = 1
+
+        XCTAssertThrowsError(try PairGraphRecoveryStore.save(
+            state,
+            to: fixture.paths.pairGraphRecoveryURL,
+            projectPaths: fixture.paths
+        )) { error in
+            XCTAssertEqual(error as? PairGraphRecoveryStoreError, .invalidSchema(1))
+        }
+    }
+
     func testTargetedRecoveryRoundTripRestoresActiveSourceAndHistory() throws {
         let fixture = try makeProject()
         defer { try? FileManager.default.removeItem(at: fixture.root) }

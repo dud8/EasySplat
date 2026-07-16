@@ -1897,14 +1897,20 @@ public final class PipelineRunner: @unchecked Sendable {
                 matchingDurationSeconds += duration
                 latestCompletedPairPlan = pairPlan
                 latestCompletedPairInspection = inspection
-                guard inspection.connectedComponentCount == 1,
-                      inspection.isolatedViewCount == 0 else {
+                guard inspection.hasSingleDescriptorBearingComponent else {
                     emit(.stageLog(
                         stage: .sfmMatching,
                         line: "Pair graph remained disconnected (\(inspection.connectedComponentCount) components, \(inspection.isolatedViewCount) isolated views).",
                         isError: true
                     ))
                     throw ColmapPairPlanningError.disconnectedVerifiedGraph
+                }
+                if inspection.descriptorlessViewCount > 0 {
+                    emit(.stageLog(
+                        stage: .sfmMatching,
+                        line: "\(inspection.descriptorlessViewCount) view\(inspection.descriptorlessViewCount == 1 ? "" : "s") had no usable descriptors and may stay unregistered.",
+                        isError: false
+                    ))
                 }
 
                 let evidence = PairGraphEvidence(

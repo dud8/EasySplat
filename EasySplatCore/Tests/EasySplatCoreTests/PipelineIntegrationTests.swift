@@ -596,6 +596,83 @@ final class PipelineIntegrationTests: XCTestCase {
         )
     }
 
+    func testDescriptorlessSingletonDoesNotTriggerMatchingRecovery() async throws {
+        let temp = makeTempRoot()
+        let fixture = try makePhotoRecoveryProject(
+            in: temp,
+            name: "DescriptorlessSingleton"
+        )
+        let run = makePhotoRecoveryPipeline(
+            projectURL: fixture.projectURL,
+            toolchain: fixture.toolchain,
+            scripts: [
+                .init(
+                    path: fixture.toolchain.colmap.path,
+                    argsPrefix: ["feature_extractor"],
+                    result: .init(
+                        exitCode: 0,
+                        terminationReason: .exit,
+                        stdout: "",
+                        stderr: ""
+                    ),
+                    onRun: { arguments in
+                        try self.writeFeatureDatabase(for: arguments)
+                        try self.markLastImageDescriptorless(for: arguments)
+                    }
+                ),
+                .init(
+                    path: fixture.toolchain.colmap.path,
+                    argsPrefix: ["matches_importer"],
+                    result: .init(
+                        exitCode: 0,
+                        terminationReason: .exit,
+                        stdout: "",
+                        stderr: ""
+                    ),
+                    onRun: { arguments in
+                        XCTAssertEqual(
+                            self.value(
+                                for: "--SiftMatching.cpu_brute_force_matcher",
+                                in: arguments
+                            ),
+                            "0"
+                        )
+                        try self.writeVerifiedPairResults(for: arguments)
+                    }
+                ),
+            ] + successfulMappingScripts(
+                colmapPath: fixture.toolchain.colmap.path,
+                projectURL: fixture.projectURL,
+                registeredViews: 59,
+                totalViews: 60,
+                pointCount: 20
+            )
+        )
+        let events = PipelineEventSink()
+
+        try await run.pipeline.run { events.append($0) }
+
+        XCTAssertEqual(run.runner.calls.count { $0.1.first == "feature_extractor" }, 1)
+        XCTAssertEqual(run.runner.calls.count { $0.1.first == "matches_importer" }, 1)
+        XCTAssertNotNil(events.stageLog(containing: "had no usable descriptors"))
+        let evidence = try PairGraphEvidenceStore.loadVerified(
+            from: fixture.paths.pairGraphEvidenceURL,
+            expectedImageNames: selectedImageNames(in: fixture.paths),
+            databaseURL: fixture.paths.colmapDatabaseURL,
+            projectPaths: fixture.paths
+        )
+        XCTAssertEqual(evidence.attempts.count, 1)
+        XCTAssertEqual(evidence.acceptedInspection.connectedComponentCount, 2)
+        XCTAssertEqual(evidence.acceptedInspection.isolatedViewCount, 1)
+        XCTAssertEqual(evidence.acceptedInspection.descriptorlessViewCount, 1)
+        let geometry = try GeometryArtifactStore.load(
+            from: fixture.paths.geometryManifestURL,
+            projectPaths: fixture.paths
+        )
+        XCTAssertEqual(geometry.registeredViewCount, 59)
+        XCTAssertEqual(geometry.pairGraph.measurement?.descriptorlessViewCount, 1)
+    }
+
     func testDisconnectedFaissGraphUsesTargetedExactSchedule() async throws {
         let temp = makeTempRoot()
         let fixture = try makePhotoRecoveryProject(
@@ -5238,6 +5315,23 @@ final class PipelineIntegrationTests: XCTestCase {
             }
             imageIDs[String(cString: nameBytes)] = imageID
         }
+        var descriptorStatement: OpaquePointer?
+        guard sqlite3_prepare_v2(
+            database,
+            "SELECT image_id, rows FROM descriptors;",
+            -1,
+            &descriptorStatement,
+            nil
+        ) == SQLITE_OK,
+        let descriptorStatement else {
+            throw NSError(domain: "PipelineIntegrationTests", code: 29)
+        }
+        defer { sqlite3_finalize(descriptorStatement) }
+        var descriptorRowsByImageID: [Int64: Int64] = [:]
+        while sqlite3_step(descriptorStatement) == SQLITE_ROW {
+            descriptorRowsByImageID[sqlite3_column_int64(descriptorStatement, 0)] =
+                sqlite3_column_int64(descriptorStatement, 1)
+        }
 
         try executeSQL(
             "DELETE FROM matches; DELETE FROM two_view_geometries; BEGIN IMMEDIATE TRANSACTION;",
@@ -5253,13 +5347,16 @@ final class PipelineIntegrationTests: XCTestCase {
                 let low = min(firstID, secondID)
                 let high = max(firstID, secondID)
                 let pairID = low * ColmapPairGraphInspector.pairIDDivisor + high
-                let pairVerifiedRows = verifiedPairLines
-                    .map { $0.contains(pair.line) ? verifiedRows : 0 }
-                    ?? verifiedRows
-                let rawRows = max(
-                    ColmapMappingPolicy.minimumPairInlierCount,
-                    pairVerifiedRows
-                )
+                let pairHasDescriptors = descriptorRowsByImageID[firstID].map { $0 > 0 } == true
+                    && descriptorRowsByImageID[secondID].map { $0 > 0 } == true
+                let pairVerifiedRows = pairHasDescriptors
+                    ? (verifiedPairLines
+                        .map { $0.contains(pair.line) ? verifiedRows : 0 }
+                        ?? verifiedRows)
+                    : 0
+                let rawRows = pairHasDescriptors
+                    ? max(ColmapMappingPolicy.minimumPairInlierCount, pairVerifiedRows)
+                    : 0
                 try executeSQL(
                     "INSERT INTO matches(pair_id, rows, cols) VALUES (\(pairID), \(rawRows), 2);" +
                     "INSERT INTO two_view_geometries(pair_id, rows, cols) VALUES (\(pairID), \(pairVerifiedRows), 2);",
@@ -5271,6 +5368,22 @@ final class PipelineIntegrationTests: XCTestCase {
             sqlite3_exec(database, "ROLLBACK;", nil, nil, nil)
             throw error
         }
+    }
+
+    private func markLastImageDescriptorless(for arguments: [String]) throws {
+        guard let databasePath = value(for: "--database_path", in: arguments) else {
+            throw NSError(domain: "PipelineIntegrationTests", code: 30)
+        }
+        var database: OpaquePointer?
+        guard sqlite3_open(databasePath, &database) == SQLITE_OK,
+              let database else {
+            throw NSError(domain: "PipelineIntegrationTests", code: 31)
+        }
+        defer { sqlite3_close(database) }
+        try executeSQL(
+            "UPDATE descriptors SET rows = 0 WHERE image_id = (SELECT MAX(image_id) FROM images);",
+            in: database
+        )
     }
 
     private func pairListLines(for arguments: [String]) throws -> [String] {
