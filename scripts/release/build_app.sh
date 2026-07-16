@@ -7,6 +7,7 @@ PUBLIC_KEY_PATH=""
 PROJECT_URL=""
 VERSION=""
 RELEASE_MODE=""
+BUILD_ROOT="$ROOT/build"
 XCODEBUILD_BIN="${EASYSPLAT_XCODEBUILD_BIN:-xcodebuild}"
 CODESIGN_BIN="${EASYSPLAT_CODESIGN_BIN:-codesign}"
 
@@ -26,6 +27,14 @@ while [[ $# -gt 0 ]]; do
       ;;
     --version)
       VERSION="$2"
+      shift 2
+      ;;
+    --build-root)
+      if [ "$#" -lt 2 ] || [ -z "$2" ] || [[ "$2" == --* ]]; then
+        echo "--build-root requires an absolute path." >&2
+        exit 1
+      fi
+      BUILD_ROOT="$2"
       shift 2
       ;;
     --unsigned-beta)
@@ -52,9 +61,45 @@ while [[ $# -gt 0 ]]; do
 done
 
 if [ -z "$MANIFEST_URL" ] || [ -z "$PUBLIC_KEY_PATH" ] || [ -z "$VERSION" ] || [ -z "$RELEASE_MODE" ]; then
-  echo "Usage: build_app.sh --manifest-url <url> --public-key-path <path> --version <semver> [--project-url <url>] --unsigned-beta" >&2
+  echo "Usage: build_app.sh --manifest-url <url> --public-key-path <path> --version <semver> [--project-url <url>] [--build-root <absolute-path>] --unsigned-beta" >&2
   exit 1
 fi
+
+validated_build_root="$(python3 - "$BUILD_ROOT" "$ROOT" <<'PY'
+import os
+import sys
+
+candidate, repository = sys.argv[1:]
+if not os.path.isabs(candidate):
+    raise SystemExit("Build root must be an absolute path.")
+if os.path.normpath(candidate) != candidate:
+    raise SystemExit("Build root must be normalized (no trailing slash, '.' or '..' segments).")
+
+resolved = os.path.realpath(candidate)
+repository = os.path.realpath(repository)
+protected_roots = {
+    os.path.sep,
+    "/Applications",
+    "/Library",
+    "/System",
+    "/Users",
+    "/Volumes",
+    "/private",
+    "/private/tmp",
+    "/private/var",
+    "/usr",
+    "/opt",
+}
+is_repository_ancestor = os.path.commonpath((resolved, repository)) == resolved
+if resolved in protected_roots or is_repository_ancestor:
+    raise SystemExit(f"Refusing unsafe build root: {candidate}")
+if os.path.lexists(resolved) and not os.path.isdir(resolved):
+    raise SystemExit(f"Build root is not a directory: {candidate}")
+
+print(resolved)
+PY
+)" || exit 1
+BUILD_ROOT="$validated_build_root"
 
 python3 - "$MANIFEST_URL" "$PROJECT_URL" <<'PY'
 import sys
@@ -100,8 +145,8 @@ if [ "${EASYSPLAT_SKIP_METAL_TOOLCHAIN_CHECK:-}" != "1" ] && [ "${XCODEBUILD_BIN
   fi
 fi
 
-BUILD_LOCK="$ROOT/build/.build-app.lock"
-mkdir -p "$ROOT/build"
+BUILD_LOCK="$BUILD_ROOT/.build-app.lock"
+mkdir -p "$BUILD_ROOT"
 if ! mkdir "$BUILD_LOCK" 2>/dev/null; then
   lock_owner=""
   if [ -r "$BUILD_LOCK/pid" ]; then
@@ -117,8 +162,8 @@ release_build_lock() {
 }
 trap release_build_lock EXIT
 
-DERIVED="$ROOT/build/DerivedData"
-OUT="$ROOT/build/Export"
+DERIVED="$BUILD_ROOT/DerivedData"
+OUT="$BUILD_ROOT/Export"
 BIN_PATH="$DERIVED/Build/Products/Release/EasySplatApp"
 BUILT_DSYM_PATH="$DERIVED/Build/Products/Release/EasySplatApp.dSYM"
 APP_BUNDLE="$OUT/EasySplat.app"

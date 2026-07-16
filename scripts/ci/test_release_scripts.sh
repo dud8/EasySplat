@@ -5,7 +5,60 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 TMP_DIR="$(mktemp -d "${TMPDIR:-/tmp}/easysplat-release-test.XXXXXX")"
-trap 'rm -rf "$TMP_DIR"' EXIT
+TMP_DIR="$(cd "$TMP_DIR" && pwd -P)"
+release_test_build_root="$TMP_DIR/app-build"
+default_export="$ROOT/build/Export"
+
+tree_digest() {
+  python3 - "$1" <<'PY'
+import hashlib
+import os
+import stat
+import sys
+from pathlib import Path
+
+root = Path(sys.argv[1])
+digest = hashlib.sha256()
+if not os.path.lexists(root):
+    digest.update(b"absent\0")
+    print(digest.hexdigest())
+    raise SystemExit(0)
+
+paths = [root]
+if root.is_dir() and not root.is_symlink():
+    paths.extend(sorted(root.rglob("*"), key=lambda path: path.relative_to(root).as_posix()))
+
+for path in paths:
+    relative = "." if path == root else path.relative_to(root).as_posix()
+    metadata = path.lstat()
+    digest.update(relative.encode("utf-8", errors="surrogateescape"))
+    digest.update(b"\0")
+    digest.update(f"{metadata.st_mode}:{metadata.st_size}:{metadata.st_mtime_ns}".encode())
+    digest.update(b"\0")
+    if stat.S_ISLNK(metadata.st_mode):
+        digest.update(os.readlink(path).encode("utf-8", errors="surrogateescape"))
+    elif stat.S_ISREG(metadata.st_mode):
+        with path.open("rb") as handle:
+            while chunk := handle.read(1024 * 1024):
+                digest.update(chunk)
+print(digest.hexdigest())
+PY
+}
+
+default_export_before="$(tree_digest "$default_export")"
+cleanup() {
+  local status=$?
+  local default_export_after
+  trap - EXIT
+  default_export_after="$(tree_digest "$default_export")" || status=1
+  if [ "$default_export_after" != "$default_export_before" ]; then
+    echo "Release-script tests modified the default app export at $default_export" >&2
+    status=1
+  fi
+  rm -rf "$TMP_DIR"
+  exit "$status"
+}
+trap cleanup EXIT
 
 python3 "$ROOT/scripts/toolchain/tests/test_generate_supply_chain_manifest.py"
 
@@ -115,9 +168,54 @@ swift run --package-path "$ROOT/Tools/ManifestTool" ManifestTool generate-keypai
   --private-key-out "$private_key_path"
 xcodebuild_log="$TMP_DIR/xcodebuild.log"
 
+missing_build_root_error="$TMP_DIR/missing-build-root.stderr"
+if "$ROOT/scripts/release/build_app.sh" \
+  --manifest-url "$manifest_url" \
+  --public-key-path "$public_key_path" \
+  --version "0.2.0-beta.1" \
+  --unsigned-beta \
+  --build-root >/dev/null 2>"$missing_build_root_error"; then
+  echo "Release app build accepted --build-root without a value" >&2
+  exit 1
+fi
+grep -Fqi -- '--build-root requires an absolute path' "$missing_build_root_error"
+
+assert_unsafe_build_root_rejected() {
+  local candidate="$1"
+  local expected_error="$2"
+  local error_path="$3"
+  if "$ROOT/scripts/release/build_app.sh" \
+    --build-root "$candidate" \
+    --manifest-url "$manifest_url" \
+    --public-key-path "$public_key_path" \
+    --version "0.2.0-beta.1" \
+    --unsigned-beta >/dev/null 2>"$error_path"; then
+    echo "Release app build accepted unsafe build root: $candidate" >&2
+    exit 1
+  fi
+  grep -Fqi "$expected_error" "$error_path"
+}
+
+assert_unsafe_build_root_rejected \
+  "relative-build" "must be an absolute path" "$TMP_DIR/relative-build-root.stderr"
+assert_unsafe_build_root_rejected \
+  "/" "unsafe build root" "$TMP_DIR/filesystem-root.stderr"
+assert_unsafe_build_root_rejected \
+  "$ROOT" "unsafe build root" "$TMP_DIR/repository-root.stderr"
+assert_unsafe_build_root_rejected \
+  "$(dirname "$ROOT")" "unsafe build root" "$TMP_DIR/repository-parent.stderr"
+assert_unsafe_build_root_rejected \
+  "$TMP_DIR/app-build/../app-build" "must be normalized" \
+  "$TMP_DIR/non-normalized-build-root.stderr"
+root_build_link="$TMP_DIR/root-build-link"
+ln -s / "$root_build_link"
+assert_unsafe_build_root_rejected \
+  "$root_build_link" "unsafe build root" "$TMP_DIR/symlinked-root.stderr"
+
 insecure_app_url_error="$TMP_DIR/insecure-app-url.stderr"
 if EASYSPLAT_XCODEBUILD_BIN="$mock_xcodebuild" \
   "$ROOT/scripts/release/build_app.sh" \
+  --build-root "$release_test_build_root" \
   --manifest-url "http://localhost:8000/manifest.json" \
   --public-key-path "$public_key_path" \
   --version "0.2.0-beta.1" \
@@ -131,6 +229,7 @@ x86_build_error="$TMP_DIR/build-app-x86.stderr"
 if EASYSPLAT_XCODEBUILD_BIN="$mock_xcodebuild" \
   EASYSPLAT_TEST_BINARY_ARCH=x86_64 \
   "$ROOT/scripts/release/build_app.sh" \
+  --build-root "$release_test_build_root" \
   --manifest-url "$manifest_url" \
   --public-key-path "$public_key_path" \
   --project-url "$project_url" \
@@ -148,6 +247,7 @@ profiled_build_error="$TMP_DIR/build-app-profiled.stderr"
 if EASYSPLAT_XCODEBUILD_BIN="$mock_xcodebuild" \
   EASYSPLAT_TEST_ENABLE_COVERAGE=1 \
   "$ROOT/scripts/release/build_app.sh" \
+  --build-root "$release_test_build_root" \
   --manifest-url "$manifest_url" \
   --public-key-path "$public_key_path" \
   --project-url "$project_url" \
@@ -164,6 +264,7 @@ fi
 EASYSPLAT_XCODEBUILD_BIN="$mock_xcodebuild" \
 EASYSPLAT_TEST_XCODEBUILD_LOG="$xcodebuild_log" \
   "$ROOT/scripts/release/build_app.sh" \
+  --build-root "$release_test_build_root" \
   --manifest-url "$manifest_url" \
   --public-key-path "$public_key_path" \
   --project-url "$project_url" \
@@ -176,7 +277,8 @@ grep -Eq '(^| )CLANG_ENABLE_CODE_COVERAGE=NO( |$)' "$xcodebuild_log"
 grep -Eq '(^| )CLANG_COVERAGE_MAPPING=NO( |$)' "$xcodebuild_log"
 grep -Eq '(^| )CLANG_COVERAGE_MAPPING_LINKER_ARGS=NO( |$)' "$xcodebuild_log"
 
-app_bundle="$ROOT/build/Export/EasySplat.app"
+app_bundle="$release_test_build_root/Export/EasySplat.app"
+app_dsym="$release_test_build_root/Export/EasySplat.app.dSYM"
 resources_dir="$app_bundle/Contents/Resources"
 
 test "$(cat "$ROOT/EasySplatApp/Resources/toolchain_manifest_url.txt")" = "$manifest_before"
@@ -199,7 +301,7 @@ test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$info_pl
 test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleVersion' "$info_plist")" = "0.2.0"
 test "$(/usr/libexec/PlistBuddy -c 'Print :NSPrincipalClass' "$info_plist")" = "NSApplication"
 test "$(/usr/libexec/PlistBuddy -c 'Print :EasySplatReleaseChannel' "$info_plist")" = "unsigned-beta"
-test -d "$ROOT/build/Export/EasySplat.app.dSYM"
+test -d "$app_dsym"
 test -s "$resources_dir/EasySplatAppIcon.icns"
 test -s "$resources_dir/Licenses/EasySplat-LICENSE.txt"
 test -s "$resources_dir/Licenses/EasySplat-NOTICE.md"
@@ -236,10 +338,10 @@ xcrun clang -arch arm64 \
   "$smoke_fixture_object" \
   -framework AppKit \
   -o "$app_bundle/Contents/MacOS/EasySplatApp"
-rm -rf "$ROOT/build/Export/EasySplat.app.dSYM"
+rm -rf "$app_dsym"
 xcrun dsymutil \
   "$app_bundle/Contents/MacOS/EasySplatApp" \
-  -o "$ROOT/build/Export/EasySplat.app.dSYM"
+  -o "$app_dsym"
 /usr/bin/codesign --force --deep --sign - --timestamp=none "$app_bundle"
 
 production_error="$TMP_DIR/production.stderr"
@@ -250,6 +352,7 @@ if EASYSPLAT_DEVELOPER_ID_APPLICATION="Developer ID Application: Test" \
   EASYSPLAT_XCODEBUILD_BIN="$mock_xcodebuild" \
   EASYSPLAT_TEST_XCODEBUILD_LOG="$production_xcodebuild_log" \
   "$ROOT/scripts/release/build_app.sh" \
+  --build-root "$release_test_build_root" \
   --manifest-url "$manifest_url" \
   --public-key-path "$public_key_path" \
   --project-url "$project_url" \
@@ -271,6 +374,7 @@ fi
 
 mode_error="$TMP_DIR/mode.stderr"
 if "$ROOT/scripts/release/build_app.sh" \
+  --build-root "$release_test_build_root" \
   --manifest-url "$manifest_url" \
   --public-key-path "$public_key_path" \
   --version "0.2.0-beta.1" \
@@ -879,7 +983,7 @@ cp -R "$app_bundle" "$missing_public_key_fixture/EasySplat.app"
 rm "$missing_public_key_fixture/EasySplat.app/Contents/Resources/EasySplat_EasySplatApp.bundle/public_key_ed25519.txt"
 /usr/bin/codesign --force --deep --sign - --timestamp=none \
   "$missing_public_key_fixture/EasySplat.app"
-cp -R "$ROOT/build/Export/EasySplat.app.dSYM" \
+cp -R "$app_dsym" \
   "$missing_public_key_fixture/EasySplat.app.dSYM"
 missing_public_key_error="$TMP_DIR/release-verifier-missing-public-key.stderr"
 if EASYSPLAT_HDIUTIL_BIN="$mock_hdiutil" \
@@ -905,7 +1009,7 @@ printf '%s' 'https://downloads.example.com/wrong-manifest.json' \
   >"$mismatched_manifest_fixture/EasySplat.app/Contents/Resources/EasySplat_EasySplatApp.bundle/toolchain_manifest_url.txt"
 /usr/bin/codesign --force --deep --sign - --timestamp=none \
   "$mismatched_manifest_fixture/EasySplat.app"
-cp -R "$ROOT/build/Export/EasySplat.app.dSYM" \
+cp -R "$app_dsym" \
   "$mismatched_manifest_fixture/EasySplat.app.dSYM"
 mismatched_manifest_error="$TMP_DIR/release-verifier-mismatched-manifest.stderr"
 if EASYSPLAT_HDIUTIL_BIN="$mock_hdiutil" \
@@ -1243,7 +1347,7 @@ PY
 unzip -tq "$beta_stem-licenses.zip" >/dev/null
 unzip -Z1 "$beta_stem-licenses.zip" | grep -Fx 'toolchain-closure.json' >/dev/null
 (cd "$TMP_DIR" && shasum -a 256 "$(basename "$beta_dmg")" >"$(basename "$beta_dmg").sha256")
-(cd "$ROOT/build/Export" && zip -qry "$beta_stem-dSYM.zip" EasySplat.app.dSYM)
+(cd "$release_test_build_root/Export" && zip -qry "$beta_stem-dSYM.zip" EasySplat.app.dSYM)
 printf '%s\n' 'EasySplat 0.2.0-beta.1 is an unsigned public beta.' >"$beta_stem-release-notes.txt"
 release_metadata_args=(
   --release-manifest "$metadata_fixture/manifest.json"
@@ -1455,7 +1559,7 @@ python3 "$metadata_tool" generate \
   --spdx-out "$tampered_stem.spdx.json" \
   --licenses-out "$tampered_stem-licenses.zip"
 (cd "$TMP_DIR" && shasum -a 256 "$(basename "$tampered_dmg")" >"$(basename "$tampered_dmg").sha256")
-(cd "$ROOT/build/Export" && zip -qry "$tampered_stem-dSYM.zip" EasySplat.app.dSYM)
+(cd "$release_test_build_root/Export" && zip -qry "$tampered_stem-dSYM.zip" EasySplat.app.dSYM)
 printf '%s\n' 'EasySplat 0.2.0-beta.1 is an unsigned public beta.' >"$tampered_stem-release-notes.txt"
 tampered_cache="$TMP_DIR/release-verifier-tampered-cache"
 mkdir -p "$tampered_cache"
@@ -2067,6 +2171,7 @@ first_build_log="$TMP_DIR/first-build.log"
 EASYSPLAT_TEST_BUILD_WAIT_PATH="$build_wait_path" \
 EASYSPLAT_XCODEBUILD_BIN="$mock_xcodebuild" \
   "$ROOT/scripts/release/build_app.sh" \
+  --build-root "$release_test_build_root" \
   --manifest-url "$manifest_url" \
   --public-key-path "$public_key_path" \
   --project-url "$project_url" \
@@ -2089,6 +2194,7 @@ second_build_error="$TMP_DIR/second-build.stderr"
 second_build_succeeded=0
 if EASYSPLAT_XCODEBUILD_BIN="$mock_xcodebuild" \
   "$ROOT/scripts/release/build_app.sh" \
+  --build-root "$release_test_build_root" \
   --manifest-url "$manifest_url" \
   --public-key-path "$public_key_path" \
   --project-url "$project_url" \
