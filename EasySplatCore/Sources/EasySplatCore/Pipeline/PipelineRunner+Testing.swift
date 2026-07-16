@@ -44,6 +44,20 @@ extension PipelineRunner {
         videoAnalysisConcurrency(threadLimit: threadLimit, videoCount: videoCount)
     }
 
+    static func test_durationAwareVideoFrameTarget(
+        durations: [Double],
+        frameCeiling: Int,
+        analysisFrameRate: Int,
+        detail: DetailProfile
+    ) -> Int? {
+        durationAwareVideoFrameTarget(
+            durations: durations,
+            frameCeiling: frameCeiling,
+            analysisFrameRate: analysisFrameRate,
+            detail: detail
+        )
+    }
+
     static func test_shouldFallBackFromCloneError(_ code: Int32) -> Bool {
         shouldFallBackFromCloneError(code)
     }

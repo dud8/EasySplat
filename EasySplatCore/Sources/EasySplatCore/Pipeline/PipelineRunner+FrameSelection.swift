@@ -88,6 +88,35 @@ extension PipelineRunner {
         return min(videoCount, 4, max(1, threadLimit / 2))
     }
 
+    static func durationAwareVideoFrameTarget(
+        durations: [Double],
+        frameCeiling: Int,
+        analysisFrameRate: Int,
+        detail: DetailProfile
+    ) -> Int? {
+        guard !durations.isEmpty,
+              frameCeiling > 0,
+              analysisFrameRate > 0,
+              durations.allSatisfy({ $0.isFinite && $0 > 0 }) else {
+            return nil
+        }
+        guard detail != .highDetail else { return frameCeiling }
+        let totalDuration = durations.reduce(0, +)
+        guard totalDuration.isFinite, totalDuration > 0 else { return nil }
+        let density = Double(analysisFrameRate)
+        let durationTarget = ceil(totalDuration * density)
+        guard durationTarget.isFinite, durationTarget > 0 else { return nil }
+        if durationTarget >= Double(frameCeiling) {
+            return frameCeiling
+        }
+        let (clipCoverage, overflowed) = durations.count.multipliedReportingOverflow(by: 2)
+        guard !overflowed else { return frameCeiling }
+        return min(
+            frameCeiling,
+            max(30, clipCoverage, Int(durationTarget))
+        )
+    }
+
     func analyzeVideoSources(
         _ sources: [FrameExtractionSource],
         options: FrameExtractionOptions,

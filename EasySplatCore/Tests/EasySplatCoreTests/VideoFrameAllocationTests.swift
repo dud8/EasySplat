@@ -71,6 +71,102 @@ final class VideoFrameAllocationTests: XCTestCase {
         ))
     )
 
+    func testDurationAwareTargetTreatsProfileBudgetAsACeiling() {
+        XCTAssertEqual(
+            PipelineRunner.test_durationAwareVideoFrameTarget(
+                durations: [9.5428666667],
+                frameCeiling: 250,
+                analysisFrameRate: 3,
+                detail: .balanced
+            ),
+            30
+        )
+        XCTAssertEqual(
+            PipelineRunner.test_durationAwareVideoFrameTarget(
+                durations: [9.5428666667],
+                frameCeiling: 500,
+                analysisFrameRate: 3,
+                detail: .highDetail
+            ),
+            500
+        )
+        XCTAssertEqual(
+            PipelineRunner.test_durationAwareVideoFrameTarget(
+                durations: [100],
+                frameCeiling: 250,
+                analysisFrameRate: 3,
+                detail: .balanced
+            ),
+            250
+        )
+        XCTAssertEqual(
+            PipelineRunner.test_durationAwareVideoFrameTarget(
+                durations: [66.0326333333],
+                frameCeiling: 250,
+                analysisFrameRate: 3,
+                detail: .balanced
+            ),
+            199
+        )
+    }
+
+    func testDurationAwareTargetUsesTotalClipDurationWithoutMultiplyingTheFloor() {
+        XCTAssertEqual(
+            PipelineRunner.test_durationAwareVideoFrameTarget(
+                durations: [1, 2, 3],
+                frameCeiling: 250,
+                analysisFrameRate: 3,
+                detail: .balanced
+            ),
+            30
+        )
+        XCTAssertEqual(
+            PipelineRunner.test_durationAwareVideoFrameTarget(
+                durations: [20, 20],
+                frameCeiling: 250,
+                analysisFrameRate: 3,
+                detail: .balanced
+            ),
+            120
+        )
+        XCTAssertEqual(
+            PipelineRunner.test_durationAwareVideoFrameTarget(
+                durations: [1, 1, 1, 1],
+                frameCeiling: 6,
+                analysisFrameRate: 3,
+                detail: .balanced
+            ),
+            6
+        )
+    }
+
+    func testDurationAwareTargetRejectsInvalidInputs() {
+        XCTAssertNil(PipelineRunner.test_durationAwareVideoFrameTarget(
+            durations: [],
+            frameCeiling: 250,
+            analysisFrameRate: 3,
+            detail: .balanced
+        ))
+        XCTAssertNil(PipelineRunner.test_durationAwareVideoFrameTarget(
+            durations: [.nan],
+            frameCeiling: 250,
+            analysisFrameRate: 3,
+            detail: .balanced
+        ))
+        XCTAssertNil(PipelineRunner.test_durationAwareVideoFrameTarget(
+            durations: [10],
+            frameCeiling: 0,
+            analysisFrameRate: 3,
+            detail: .balanced
+        ))
+        XCTAssertNil(PipelineRunner.test_durationAwareVideoFrameTarget(
+            durations: [10],
+            frameCeiling: 250,
+            analysisFrameRate: 0,
+            detail: .balanced
+        ))
+    }
+
     func testTargetsFollowClipDurationInsteadOfClipCount() throws {
         XCTAssertEqual(
             try runner.allocateVideoFrameTargets(

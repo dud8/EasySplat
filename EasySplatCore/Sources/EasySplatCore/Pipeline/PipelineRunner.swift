@@ -458,7 +458,7 @@ public final class PipelineRunner: @unchecked Sendable {
                     writeCheckpoint(stage: .extractFrames, progress: 0, message: "Frame extraction started")
                     emit(.stageLog(
                         stage: .extractFrames,
-                        line: "Target frames: \(targetFrames).",
+                        line: "Detail frame ceiling: \(targetFrames).",
                         isError: false
                     ))
                     self.removeIfExists(paths.framesRawManifestURL)
@@ -466,7 +466,7 @@ public final class PipelineRunner: @unchecked Sendable {
                     let extractor = FrameExtractor()
                     let videos = metadata.input.videoFiles
                     let importedVideos = importedVideoURLs(for: videos, paths: paths)
-                    let analysisOptions = FrameExtractionOptions(
+                    var analysisOptions = FrameExtractionOptions(
                         targetCount: targetFrames,
                         maxDimension: maxDim,
                         targetFPS: frameProfile.targetFPS,
@@ -501,15 +501,37 @@ public final class PipelineRunner: @unchecked Sendable {
                         let discoveredPhotos = try loadPhotos(in: paths.importedPhotosURL)
                         preparedPhotoFilter = try filterValidUniquePhotos(discoveredPhotos)
                     }
+                    let videoTargetFrames: Int
+                    if preparedPhotoFilter?.frames.isEmpty == false {
+                        videoTargetFrames = targetFrames
+                    } else {
+                        guard let durationTarget = Self.durationAwareVideoFrameTarget(
+                            durations: sources.map(\.durationSeconds),
+                            frameCeiling: targetFrames,
+                            analysisFrameRate: resolvedRunPlan.analysisFrameRate,
+                            detail: requestedOptions.detailProfile
+                        ) else {
+                            throw PipelineError.invalidInput
+                        }
+                        videoTargetFrames = durationTarget
+                    }
+                    analysisOptions.targetCount = videoTargetFrames
+                    if videoTargetFrames < targetFrames {
+                        emit(.stageLog(
+                            stage: .extractFrames,
+                            line: "Using up to \(videoTargetFrames) frames for \(String(format: "%.0f", ceil(totalVideoDuration))) seconds of video.",
+                            isError: false
+                        ))
+                    }
                     let preliminaryPlan = try resolveGlobalFrameTargets(
                         videos: sources.map {
                             VideoFrameAllocationInput(
                                 durationSeconds: $0.durationSeconds,
-                                availableCandidateCount: targetFrames
+                                availableCandidateCount: videoTargetFrames
                             )
                         },
                         validPhotoCount: preparedPhotoFilter?.frames.count ?? 0,
-                        targetCount: targetFrames,
+                        targetCount: videoTargetFrames,
                         photoSelection: resolvedRunPlan.photoSelection
                     )
                     let preliminaryTargets = preliminaryPlan.videoTargets
@@ -558,7 +580,7 @@ public final class PipelineRunner: @unchecked Sendable {
                             )
                         },
                         validPhotoCount: preparedPhotoFilter?.frames.count ?? 0,
-                        targetCount: targetFrames,
+                        targetCount: videoTargetFrames,
                         photoSelection: resolvedRunPlan.photoSelection
                     )
                     let reanalysisIndices = analyses.indices.filter {
@@ -618,7 +640,7 @@ public final class PipelineRunner: @unchecked Sendable {
                             )
                         },
                         validPhotoCount: preparedPhotoFilter?.frames.count ?? 0,
-                        targetCount: targetFrames,
+                        targetCount: videoTargetFrames,
                         photoSelection: resolvedRunPlan.photoSelection
                     )
                     if finalPlan.totalTargetCount < attainablePlan.totalTargetCount {
