@@ -2,9 +2,9 @@ import XCTest
 @testable import EasySplatCore
 
 final class ProjectMetadataValidationTests: XCTestCase {
-    func testLoadRejectsRetiredFormatSevenBeforeDecodingEmbeddedViewerState() throws {
+    func testLoadRejectsRetiredFormatEightBeforeDecodingEmbeddedViewerState() throws {
         let retiredFormatVersion = ProjectMetadataStore.supportedFormatVersion - 1
-        XCTAssertEqual(retiredFormatVersion, 7)
+        XCTAssertEqual(retiredFormatVersion, 8)
 
         let metadata = makeMetadata()
         let encoder = JSONEncoder()

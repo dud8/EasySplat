@@ -580,9 +580,9 @@ final class PipelineIntegrationTests: XCTestCase {
                 try? self.writeVerifiedPairResults(for: args)
             }),
             .init(path: toolchain.colmap.path, argsPrefix: ["mapper"], result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""), stdoutLines: ["Retriangulation and Global bundle adjustment"], onRun: { args in
-                XCTAssertEqual(self.value(for: "--Mapper.ba_global_frames_ratio", in: args), "1.4")
-                XCTAssertEqual(self.value(for: "--Mapper.ba_global_points_ratio", in: args), "1.4")
-                XCTAssertEqual(self.value(for: "--Mapper.ba_local_max_refinements", in: args), "2")
+                XCTAssertEqual(self.value(for: "--Mapper.ba_global_frames_ratio", in: args), "4.0")
+                XCTAssertEqual(self.value(for: "--Mapper.ba_global_points_ratio", in: args), "4.0")
+                XCTAssertEqual(self.value(for: "--Mapper.ba_local_max_refinements", in: args), "1")
                 try? self.writeSparseModel(at: projectURL)
             }),
             .init(path: toolchain.colmap.path, argsPrefix: ["model_analyzer"], result: .init(exitCode: 0, terminationReason: .exit, stdout: "Registered images: 30 / 30\nPoints: 1\nObservations: 30\nMean track length: 30.0\n", stderr: ""), onRun: nil),
@@ -2443,7 +2443,7 @@ final class PipelineIntegrationTests: XCTestCase {
         XCTAssertFalse(resumeRunner.calls.contains { $0.1.first == "feature_extractor" })
     }
 
-    func testBundleAdjustmentPolicyChangeClearsMatchesAndRerunsMapping() async throws {
+    func testBundleAdjustmentPolicyChangePreservesMatchesAndRerunsOnlyMapping() async throws {
         let temp = makeTempRoot()
         let projectURL = temp.appendingPathComponent(
             "BundleAdjustmentPolicyChange.easysplatproj",
@@ -2519,27 +2519,9 @@ final class PipelineIntegrationTests: XCTestCase {
         staleMetadata.resolvedRunPlan?.baGlobalFramesRatio = 1.2
         try ProjectMetadataStore.save(staleMetadata, to: paths.metadataURL)
         XCTAssertEqual(try databaseRowCount("matches", at: paths.colmapDatabaseURL), 28)
+        let pairEvidenceBefore = try Data(contentsOf: paths.pairGraphEvidenceURL)
 
         let resumeRunner = MockSubprocessRunner(scripts: [
-            .init(
-                path: toolchain.colmap.path,
-                argsPrefix: ["matches_importer"],
-                result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""),
-                onRun: { args in
-                    XCTAssertEqual(
-                        try? self.databaseRowCount("matches", at: paths.colmapDatabaseURL),
-                        0
-                    )
-                    XCTAssertEqual(
-                        try? self.databaseRowCount(
-                            "two_view_geometries",
-                            at: paths.colmapDatabaseURL
-                        ),
-                        0
-                    )
-                    try? self.writeVerifiedPairResults(for: args)
-                }
-            ),
             .init(
                 path: toolchain.colmap.path,
                 argsPrefix: ["mapper"],
@@ -2571,9 +2553,15 @@ final class PipelineIntegrationTests: XCTestCase {
         try await resumedPipeline.run(resumeFrom: .sfmMapping) { events.append($0) }
 
         XCTAssertFalse(resumeRunner.calls.contains { $0.1.first == "feature_extractor" })
-        XCTAssertEqual(resumeRunner.calls.filter { $0.1.first == "matches_importer" }.count, 1)
+        XCTAssertFalse(resumeRunner.calls.contains { $0.1.first == "matches_importer" })
         XCTAssertEqual(resumeRunner.calls.filter { $0.1.first == "mapper" }.count, 1)
-        XCTAssertNotNil(events.stageLog(containing: "Discarded stale image matches"))
+        XCTAssertNil(events.stageLog(containing: "Discarded stale image matches"))
+        XCTAssertEqual(try databaseRowCount("matches", at: paths.colmapDatabaseURL), 28)
+        XCTAssertEqual(
+            try databaseRowCount("two_view_geometries", at: paths.colmapDatabaseURL),
+            28
+        )
+        XCTAssertEqual(try Data(contentsOf: paths.pairGraphEvidenceURL), pairEvidenceBefore)
     }
 
     func testFaissCrashOnDenserRetryUsesExactMatchingWithoutReextractingFeatures() async throws {

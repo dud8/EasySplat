@@ -16,7 +16,9 @@ final class ProjectMetadataStoreTests: XCTestCase {
             activeBackend: .colmap,
             mappingAttemptCount: 1,
             mappingFallbackReasons: ["interrupted mapping resumed"],
-            colmapComputeMode: .cpu
+            colmapComputeMode: .cpu,
+            plannedIncrementalCadence: .conservative,
+            activeIncrementalCadence: .conservative
         )
         let metadata = ProjectMetadata(
             title: "Recovering geometry",

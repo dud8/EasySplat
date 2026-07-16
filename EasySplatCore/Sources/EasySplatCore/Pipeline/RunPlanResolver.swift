@@ -195,12 +195,12 @@ public enum RunPlanResolver {
             || previousPlan.requiredToolchainCapabilities != currentPlan.requiredToolchainCapabilities
             || previousPlan.fallbackRouteIdentifiers != currentPlan.fallbackRouteIdentifiers
             || previousPlan.inputOrdering != currentPlan.inputOrdering
-        let matchingOrMappingPolicyChanged = previousPlan.baGlobalFramesRatio != currentPlan.baGlobalFramesRatio
+        let mappingPolicyChanged = previousPlan.baGlobalFramesRatio != currentPlan.baGlobalFramesRatio
             || previousPlan.baGlobalPointsRatio != currentPlan.baGlobalPointsRatio
             || previousPlan.baLocalMaxRefinements != currentPlan.baLocalMaxRefinements
             || previousPlan.baGlobalMaxRefinements != currentPlan.baGlobalMaxRefinements
             || previousPlan.deterministicSeed != currentPlan.deterministicSeed
-            || previousPlan.pairingPolicy != currentPlan.pairingPolicy
+        let matchingPolicyChanged = previousPlan.pairingPolicy != currentPlan.pairingPolicy
             || previousPlan.temporalPairing != currentPlan.temporalPairing
             || previousPlan.temporalOffsets != currentPlan.temporalOffsets
             || previousPlan.retrievalEngine != currentPlan.retrievalEngine
@@ -213,8 +213,10 @@ public enum RunPlanResolver {
             safeBoundary = input.hasVideos ? .importInput : .extractFrames
         } else if geometryChanged {
             safeBoundary = .selectFrames
-        } else if matchingOrMappingPolicyChanged {
+        } else if matchingPolicyChanged {
             safeBoundary = .sfmFeatures
+        } else if mappingPolicyChanged {
+            safeBoundary = .sfmMatching
         } else {
             safeBoundary = .sfmMapping
         }
@@ -241,11 +243,14 @@ public enum RunPlanResolver {
         )
         let pairingConfiguration = pairingConfiguration(for: pairingPolicy)
         let baGlobalRatio: Double
+        let baLocalMaxRefinements: Int
         switch pairingPolicy {
         case .unorderedRetrieval, .segmentedMixed:
             baGlobalRatio = 1.1
+            baLocalMaxRefinements = 2
         case .orderedContinuous, .orderedOrbit, .orderedWalkthrough, .orderedLargeArea:
-            baGlobalRatio = 1.4
+            baGlobalRatio = 4
+            baLocalMaxRefinements = 1
         }
         let memoryTier = resolvedMemoryTier(
             resourcePolicy: options.resourcePolicy,
@@ -334,7 +339,7 @@ public enum RunPlanResolver {
             normalDescriptorMatcher: .faiss,
             baGlobalFramesRatio: baGlobalRatio,
             baGlobalPointsRatio: baGlobalRatio,
-            baLocalMaxRefinements: 2,
+            baLocalMaxRefinements: baLocalMaxRefinements,
             baGlobalMaxRefinements: 5,
             deterministicSeed: UInt64(max(0, developmentOverrides.benchmarkSeed ?? 42))
         )

@@ -189,6 +189,15 @@ public struct ResolvedRunPlan: Codable, Sendable, Equatable {
         }
     }
 
+    public var incrementalMappingCadence: IncrementalMappingCadenceArtifact {
+        IncrementalMappingCadenceArtifact(
+            localMaxRefinements: baLocalMaxRefinements,
+            globalFramesRatio: baGlobalFramesRatio,
+            globalPointsRatio: baGlobalPointsRatio,
+            globalMaxRefinements: baGlobalMaxRefinements
+        )
+    }
+
     private func validatePairingConfiguration() throws {
         guard normalDescriptorMatcher == .faiss else {
             throw ResolvedRunPlanValidationError.unsupportedNormalDescriptorMatcher

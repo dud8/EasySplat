@@ -118,6 +118,32 @@ extension PipelineRunner {
         }
     }
 
+    static func conservativeCadenceFallbackReason(after error: Error?) -> String? {
+        guard let error = error as? PipelineError else { return nil }
+        switch error {
+        case .lowQualityReconstruction:
+            return "conservative mapping cadence after quality rejection"
+        case .fragmentedReconstruction:
+            return "conservative mapping cadence after fragmented solve"
+        case .geometryCoverageTooLow:
+            return "conservative mapping cadence after low coverage"
+        case .geometryResidualCoverageTooLow:
+            return "conservative mapping cadence after sparse residual coverage"
+        case .geometryResidualsTooHigh:
+            return "conservative mapping cadence after high residuals"
+        case .invalidInput,
+             .insufficientInputImages,
+             .geometryRegisteredImagesMismatch,
+             .geometryResidualsUnavailable,
+             .geometryProvenanceUnavailable,
+             .videoFrameBudgetTooSmall,
+             .photoSelectionExceedsBudget,
+             .imageTranscodeFailed,
+             .outputMissing:
+            return nil
+        }
+    }
+
     static func nextPairRecoveryLevel(
         after current: PairRecoveryLevel,
         imageCount: Int,

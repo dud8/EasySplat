@@ -239,7 +239,9 @@ final class GeometryRecoveryIntegrationTests: XCTestCase {
             activeBackend: .colmap,
             mappingAttemptCount: previousRecovery.mappingAttemptCount,
             mappingFallbackReasons: ["da3 fallback to colmap"],
-            colmapComputeMode: .gpu
+            colmapComputeMode: .gpu,
+            plannedIncrementalCadence: plan.incrementalMappingCadence,
+            activeIncrementalCadence: plan.incrementalMappingCadence
         )
         try ProjectMetadataStore.save(interrupted, to: fixture.paths.metadataURL)
         XCTAssertTrue(FileManager.default.fileExists(atPath: fixture.paths.colmapSeedModelURL.path))
@@ -403,6 +405,30 @@ final class GeometryRecoveryIntegrationTests: XCTestCase {
             ),
             .init(
                 path: fixture.toolchain.colmap.path,
+                argsPrefix: ["mapper"],
+                result: successfulResult,
+                onRun: { arguments in
+                    XCTAssertEqual(self.value(for: "--Mapper.ba_global_frames_ratio", in: arguments), "1.4")
+                    XCTAssertEqual(self.value(for: "--Mapper.ba_local_max_refinements", in: arguments), "2")
+                    try self.writeSparseModel(
+                        for: fixture,
+                        mapperArguments: arguments,
+                        registeredImageCount: 2
+                    )
+                }
+            ),
+            .init(
+                path: fixture.toolchain.colmap.path,
+                argsPrefix: ["model_analyzer"],
+                result: SubprocessResult(
+                    exitCode: 0,
+                    terminationReason: .exit,
+                    stdout: lowCoverageReport,
+                    stderr: ""
+                )
+            ),
+            .init(
+                path: fixture.toolchain.colmap.path,
                 argsPrefix: ["matches_importer"],
                 result: successfulResult,
                 onRun: { arguments in
@@ -427,11 +453,14 @@ final class GeometryRecoveryIntegrationTests: XCTestCase {
         let interrupted = try ProjectMetadataStore.load(from: fixture.paths.metadataURL)
         XCTAssertEqual(interrupted.checkpoint?.stage, .sfmMatching)
         XCTAssertEqual(interrupted.geometryRecovery?.activeBackend, .colmap)
-        XCTAssertEqual(interrupted.geometryRecovery?.mappingAttemptCount, 1)
+        XCTAssertEqual(interrupted.geometryRecovery?.mappingAttemptCount, 2)
         XCTAssertEqual(interrupted.geometryRecovery?.pendingPairRecoveryLevel, .expanded)
         XCTAssertEqual(
             interrupted.geometryRecovery?.mappingFallbackReasons,
-            ["Reconstruction coverage was below the acceptance gate"]
+            [
+                "conservative mapping cadence after quality rejection",
+                "Reconstruction coverage was below the acceptance gate",
+            ]
         )
 
         let resumeRunner = MockSubprocessRunner(scripts: [
@@ -455,6 +484,8 @@ final class GeometryRecoveryIntegrationTests: XCTestCase {
                 result: successfulResult,
                 stdoutLines: ["Retriangulation and Global bundle adjustment"],
                 onRun: { arguments in
+                    XCTAssertEqual(self.value(for: "--Mapper.ba_global_frames_ratio", in: arguments), "1.4")
+                    XCTAssertEqual(self.value(for: "--Mapper.ba_local_max_refinements", in: arguments), "2")
                     try self.writeSparseModel(for: fixture, mapperArguments: arguments)
                 }
             ),
@@ -484,10 +515,11 @@ final class GeometryRecoveryIntegrationTests: XCTestCase {
         XCTAssertEqual(matcherAttempts.map(\.recoveryLevel), [.normal, .expanded])
         XCTAssertEqual(matcherAttempts.map(\.outcome), [.completed, .completed])
         XCTAssertEqual(matcherAttempts.map(\.scheduledPairCount), [17, 28])
-        XCTAssertEqual(geometry.mapping.attemptCount, 2)
+        XCTAssertEqual(geometry.mapping.attemptCount, 3)
+        XCTAssertEqual(geometry.mapping.incrementalCadence, .conservative)
         XCTAssertEqual(
             geometry.mapping.fallbackReason,
-            "Reconstruction coverage was below the acceptance gate"
+            "conservative mapping cadence after quality rejection; Reconstruction coverage was below the acceptance gate"
         )
         XCTAssertNil(finished.geometryRecovery)
     }
@@ -641,6 +673,50 @@ final class GeometryRecoveryIntegrationTests: XCTestCase {
             ),
             .init(
                 path: fixture.toolchain.colmap.path,
+                argsPrefix: ["mapper"],
+                result: successfulResult,
+                onRun: { arguments in
+                    XCTAssertEqual(self.value(for: "--Mapper.ba_global_frames_ratio", in: arguments), "1.4")
+                    XCTAssertEqual(self.value(for: "--Mapper.ba_local_max_refinements", in: arguments), "2")
+                    guard let outputPath = self.value(for: "--output_path", in: arguments) else {
+                        throw FixtureError.missingArgument
+                    }
+                    let names = try self.selectedImageNames(for: fixture)
+                    let sparseRoot = URL(fileURLWithPath: outputPath, isDirectory: true)
+                    try self.writeSparseModel(
+                        at: sparseRoot.appendingPathComponent("0", isDirectory: true),
+                        for: fixture,
+                        imageNames: Array(names.prefix(27))
+                    )
+                    try self.writeSparseModel(
+                        at: sparseRoot.appendingPathComponent("1", isDirectory: true),
+                        for: fixture,
+                        imageNames: Array(names.suffix(3))
+                    )
+                }
+            ),
+            .init(
+                path: fixture.toolchain.colmap.path,
+                argsPrefix: ["model_analyzer"],
+                result: SubprocessResult(
+                    exitCode: 0,
+                    terminationReason: .exit,
+                    stdout: "Registered images: 27 / 30\nPoints: 20\nObservations: 540\nMean track length: 27.0\nMean reprojection error: 0.5\n",
+                    stderr: ""
+                )
+            ),
+            .init(
+                path: fixture.toolchain.colmap.path,
+                argsPrefix: ["model_analyzer"],
+                result: SubprocessResult(
+                    exitCode: 0,
+                    terminationReason: .exit,
+                    stdout: "Registered images: 3 / 30\nPoints: 20\nObservations: 60\nMean track length: 3.0\nMean reprojection error: 0.5\n",
+                    stderr: ""
+                )
+            ),
+            .init(
+                path: fixture.toolchain.colmap.path,
                 argsPrefix: ["matches_importer"],
                 result: successfulResult,
                 onRun: { arguments in
@@ -667,11 +743,14 @@ final class GeometryRecoveryIntegrationTests: XCTestCase {
         ), "The split mapper output must not be mistaken for canonical publication.")
         XCTAssertNotNil(events.stageLog(containing: "omitted 3 views"))
         let interrupted = try ProjectMetadataStore.load(from: fixture.paths.metadataURL)
-        XCTAssertEqual(interrupted.geometryRecovery?.mappingAttemptCount, 1)
+        XCTAssertEqual(interrupted.geometryRecovery?.mappingAttemptCount, 2)
         XCTAssertEqual(interrupted.geometryRecovery?.pendingPairRecoveryLevel, .expanded)
         XCTAssertEqual(
             interrupted.geometryRecovery?.mappingFallbackReasons,
-            ["Camera mapping split recoverable views across separate models"]
+            [
+                "conservative mapping cadence after fragmented solve",
+                "Camera mapping split recoverable views across separate models",
+            ]
         )
 
         let expandedSchedule = pairSchedules.expanded
@@ -691,6 +770,8 @@ final class GeometryRecoveryIntegrationTests: XCTestCase {
                 argsPrefix: ["mapper"],
                 result: successfulResult,
                 onRun: { arguments in
+                    XCTAssertEqual(self.value(for: "--Mapper.ba_global_frames_ratio", in: arguments), "1.4")
+                    XCTAssertEqual(self.value(for: "--Mapper.ba_local_max_refinements", in: arguments), "2")
                     try self.writeSparseModel(for: fixture, mapperArguments: arguments)
                 }
             ),
@@ -702,10 +783,11 @@ final class GeometryRecoveryIntegrationTests: XCTestCase {
 
         let finished = try ProjectMetadataStore.load(from: fixture.paths.metadataURL)
         let mapping = try XCTUnwrap(finished.geometryArtifact?.mapping)
-        XCTAssertEqual(mapping.attemptCount, 2)
+        XCTAssertEqual(mapping.attemptCount, 3)
+        XCTAssertEqual(mapping.incrementalCadence, .conservative)
         XCTAssertEqual(
             mapping.fallbackReason,
-            "Camera mapping split recoverable views across separate models"
+            "conservative mapping cadence after fragmented solve; Camera mapping split recoverable views across separate models"
         )
         XCTAssertNil(finished.geometryRecovery)
         XCTAssertEqual(
@@ -805,6 +887,227 @@ final class GeometryRecoveryIntegrationTests: XCTestCase {
         XCTAssertNil(finished.checkpoint)
         XCTAssertNil(finished.lastRunStartedAt)
         XCTAssertNil(finished.geometryRecovery)
+    }
+
+    func testOrderedQualityRejectionRetriesSameGraphWithConservativeCadence() async throws {
+        let fixture = try makeFixture(
+            named: "OrderedConservativeCadence",
+            imageCount: 8,
+            requestedRunOptions: RequestedRunOptions(
+                capturePath: .orbit,
+                detailProfile: .fast,
+                inputOrdering: .continuous,
+                photoSelection: .useAllValidPhotos
+            )
+        )
+        let matchingProbe = MappingCadenceProbe()
+        let lowCoverageReport = "Registered images: 2 / 8\nPoints: 20\nObservations: 40\nMean track length: 2.0\nMean reprojection error: 0.5\n"
+        let runner = MockSubprocessRunner(scripts: [
+            featureExtractionScript(for: fixture),
+            emptyVocabularyScript(for: fixture),
+            matchingScript(for: fixture),
+            .init(
+                path: fixture.toolchain.colmap.path,
+                argsPrefix: ["mapper"],
+                result: successfulResult,
+                stdoutLines: Array(
+                    repeating: "Retriangulation and Global bundle adjustment",
+                    count: 4
+                ),
+                onRun: { arguments in
+                    XCTAssertEqual(self.value(for: "--Mapper.ba_global_frames_ratio", in: arguments), "4.0")
+                    XCTAssertEqual(self.value(for: "--Mapper.ba_global_points_ratio", in: arguments), "4.0")
+                    XCTAssertEqual(self.value(for: "--Mapper.ba_local_max_refinements", in: arguments), "1")
+                    matchingProbe.record(
+                        try ColmapDatabaseDigester.digests(
+                            at: fixture.paths.colmapDatabaseURL
+                        ).matching
+                    )
+                    try self.writeSparseModel(
+                        for: fixture,
+                        mapperArguments: arguments,
+                        registeredImageCount: 2
+                    )
+                }
+            ),
+            .init(
+                path: fixture.toolchain.colmap.path,
+                argsPrefix: ["model_analyzer"],
+                result: SubprocessResult(
+                    exitCode: 0,
+                    terminationReason: .exit,
+                    stdout: lowCoverageReport,
+                    stderr: ""
+                )
+            ),
+            .init(
+                path: fixture.toolchain.colmap.path,
+                argsPrefix: ["mapper"],
+                result: successfulResult,
+                stdoutLines: ["Retriangulation and Global bundle adjustment"],
+                onRun: { arguments in
+                    XCTAssertEqual(self.value(for: "--Mapper.ba_global_frames_ratio", in: arguments), "1.4")
+                    XCTAssertEqual(self.value(for: "--Mapper.ba_global_points_ratio", in: arguments), "1.4")
+                    XCTAssertEqual(self.value(for: "--Mapper.ba_local_max_refinements", in: arguments), "2")
+                    matchingProbe.record(
+                        try ColmapDatabaseDigester.digests(
+                            at: fixture.paths.colmapDatabaseURL
+                        ).matching
+                    )
+                    try self.writeSparseModel(for: fixture, mapperArguments: arguments)
+                }
+            ),
+            analyzerScript(for: fixture),
+        ])
+
+        try await makePipeline(fixture: fixture, runner: runner).run { _ in }
+
+        XCTAssertEqual(
+            runner.calls.compactMap { $0.1.first },
+            [
+                "feature_extractor",
+                "local_vocab_retriever",
+                "matches_importer",
+                "mapper",
+                "model_analyzer",
+                "mapper",
+                "model_analyzer",
+            ]
+        )
+        XCTAssertEqual(Set(matchingProbe.digests).count, 1)
+        let geometry = try XCTUnwrap(
+            ProjectMetadataStore.load(from: fixture.paths.metadataURL).geometryArtifact
+        )
+        XCTAssertEqual(geometry.mapping.attemptCount, 2)
+        XCTAssertEqual(geometry.mapping.acceptedRefinementInvocationCount, 1)
+        XCTAssertEqual(geometry.mapping.incrementalCadence, .conservative)
+        XCTAssertEqual(
+            geometry.mapping.fallbackReason,
+            "conservative mapping cadence after quality rejection"
+        )
+        XCTAssertEqual(geometry.pairGraph.measurement?.matcherAttempts.count, 1)
+    }
+
+    func testConservativeCadenceSurvivesCancellationWithoutRematching() async throws {
+        let fixture = try makeFixture(
+            named: "ConservativeCadenceResume",
+            imageCount: 8,
+            requestedRunOptions: RequestedRunOptions(
+                capturePath: .walkthrough,
+                detailProfile: .fast,
+                inputOrdering: .continuous,
+                photoSelection: .useAllValidPhotos
+            )
+        )
+        let lowCoverageReport = "Registered images: 2 / 8\nPoints: 20\nObservations: 40\nMean track length: 2.0\nMean reprojection error: 0.5\n"
+        let firstRunner = MockSubprocessRunner(scripts: [
+            featureExtractionScript(for: fixture),
+            emptyVocabularyScript(for: fixture),
+            matchingScript(for: fixture),
+            .init(
+                path: fixture.toolchain.colmap.path,
+                argsPrefix: ["mapper"],
+                result: successfulResult,
+                onRun: { arguments in
+                    try self.writeSparseModel(
+                        for: fixture,
+                        mapperArguments: arguments,
+                        registeredImageCount: 2
+                    )
+                }
+            ),
+            .init(
+                path: fixture.toolchain.colmap.path,
+                argsPrefix: ["model_analyzer"],
+                result: SubprocessResult(
+                    exitCode: 0,
+                    terminationReason: .exit,
+                    stdout: lowCoverageReport,
+                    stderr: ""
+                )
+            ),
+            .init(
+                path: fixture.toolchain.colmap.path,
+                argsPrefix: ["mapper"],
+                result: successfulResult,
+                onRun: { arguments in
+                    XCTAssertEqual(self.value(for: "--Mapper.ba_global_frames_ratio", in: arguments), "1.4")
+                    XCTAssertEqual(self.value(for: "--Mapper.ba_local_max_refinements", in: arguments), "2")
+                    throw CancellationError()
+                }
+            ),
+        ])
+
+        do {
+            try await makePipeline(fixture: fixture, runner: firstRunner).run { _ in }
+            XCTFail("Expected conservative mapper cancellation")
+        } catch is CancellationError {
+            // Active cadence and accepted pair evidence must already be durable.
+        }
+
+        let interrupted = try ProjectMetadataStore.load(from: fixture.paths.metadataURL)
+        XCTAssertEqual(
+            interrupted.geometryRecovery?.plannedIncrementalCadence,
+            IncrementalMappingCadenceArtifact(
+                localMaxRefinements: 1,
+                globalFramesRatio: 4,
+                globalPointsRatio: 4,
+                globalMaxRefinements: 5
+            )
+        )
+        XCTAssertEqual(
+            interrupted.geometryRecovery?.activeIncrementalCadence,
+            .conservative
+        )
+        XCTAssertEqual(interrupted.geometryRecovery?.mappingAttemptCount, 2)
+        let matchingDigest = try ColmapDatabaseDigester.digests(
+            at: fixture.paths.colmapDatabaseURL
+        ).matching
+        let pairEvidence = try Data(contentsOf: fixture.paths.pairGraphEvidenceURL)
+
+        let resumeRunner = MockSubprocessRunner(scripts: [
+            .init(
+                path: fixture.toolchain.colmap.path,
+                argsPrefix: ["mapper"],
+                result: successfulResult,
+                stdoutLines: [
+                    "Retriangulation and Global bundle adjustment",
+                    "Retriangulation and Global bundle adjustment",
+                ],
+                onRun: { arguments in
+                    XCTAssertEqual(self.value(for: "--Mapper.ba_global_frames_ratio", in: arguments), "1.4")
+                    XCTAssertEqual(self.value(for: "--Mapper.ba_global_points_ratio", in: arguments), "1.4")
+                    XCTAssertEqual(self.value(for: "--Mapper.ba_local_max_refinements", in: arguments), "2")
+                    try self.writeSparseModel(for: fixture, mapperArguments: arguments)
+                }
+            ),
+            analyzerScript(for: fixture),
+        ])
+        try await makePipeline(fixture: fixture, runner: resumeRunner).run(
+            resumeFrom: .sfmMatching
+        ) { _ in }
+
+        XCTAssertEqual(
+            resumeRunner.calls.compactMap { $0.1.first },
+            ["mapper", "model_analyzer"]
+        )
+        XCTAssertEqual(
+            try ColmapDatabaseDigester.digests(
+                at: fixture.paths.colmapDatabaseURL
+            ).matching,
+            matchingDigest
+        )
+        XCTAssertEqual(try Data(contentsOf: fixture.paths.pairGraphEvidenceURL), pairEvidence)
+        let mapping = try XCTUnwrap(
+            ProjectMetadataStore.load(from: fixture.paths.metadataURL).geometryArtifact?.mapping
+        )
+        XCTAssertEqual(mapping.attemptCount, 3)
+        XCTAssertEqual(mapping.acceptedRefinementInvocationCount, 2)
+        XCTAssertEqual(mapping.incrementalCadence, .conservative)
+        XCTAssertEqual(
+            mapping.fallbackReason,
+            "conservative mapping cadence after quality rejection; interrupted mapping resumed"
+        )
     }
 
     private struct Fixture {
@@ -973,6 +1276,27 @@ final class GeometryRecoveryIntegrationTests: XCTestCase {
             argsPrefix: ["matches_importer"],
             result: successfulResult,
             onRun: { arguments in try self.writeVerifiedMatches(for: arguments) }
+        )
+    }
+
+    private func emptyVocabularyScript(for fixture: Fixture) -> MockSubprocessRunner.Script {
+        .init(
+            path: fixture.toolchain.colmap.path,
+            argsPrefix: ["local_vocab_retriever"],
+            result: successfulResult,
+            onRun: { arguments in
+                guard let outputPath = self.value(
+                    for: "--output_pair_list_path",
+                    in: arguments
+                ) else {
+                    throw FixtureError.missingArgument
+                }
+                try "".write(
+                    to: URL(fileURLWithPath: outputPath),
+                    atomically: true,
+                    encoding: .utf8
+                )
+            }
         )
     }
 
@@ -1383,6 +1707,19 @@ private final class PairScheduleProbe: @unchecked Sendable {
 
     func recordExpanded(_ pairs: [String]) {
         lock.withLock { expandedStorage = pairs }
+    }
+}
+
+private final class MappingCadenceProbe: @unchecked Sendable {
+    private let lock = NSLock()
+    private var storage: [String] = []
+
+    var digests: [String] {
+        lock.withLock { storage }
+    }
+
+    func record(_ digest: String) {
+        lock.withLock { storage.append(digest) }
     }
 }
 

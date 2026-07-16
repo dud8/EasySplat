@@ -25,6 +25,12 @@ final class GeometryRecoveryStateTests: XCTestCase {
     }
 
     func testValidColmapStateRoundTrips() throws {
+        let plannedCadence = IncrementalMappingCadenceArtifact(
+            localMaxRefinements: 1,
+            globalFramesRatio: 4,
+            globalPointsRatio: 4,
+            globalMaxRefinements: 5
+        )
         let state = GeometryRecoveryState(
             selectedFramesDigest: digest,
             orderedImageNames: imageNames,
@@ -32,7 +38,9 @@ final class GeometryRecoveryStateTests: XCTestCase {
             mappingAttemptCount: 1,
             mappingFallbackReasons: [],
             pendingPairRecoveryLevel: .expanded,
-            colmapComputeMode: .cpu
+            colmapComputeMode: .cpu,
+            plannedIncrementalCadence: plannedCadence,
+            activeIncrementalCadence: .conservative
         )
 
         try state.validate()
@@ -131,13 +139,60 @@ final class GeometryRecoveryStateTests: XCTestCase {
         var da3ComputeState = validState()
         da3ComputeState.activeBackend = .da3
 
+        var da3CadenceState = validState()
+        da3CadenceState.activeBackend = .da3
+        da3CadenceState.colmapComputeMode = nil
+
         var colmapComputeState = validState()
         colmapComputeState.colmapComputeMode = nil
 
         XCTAssertThrowsError(try da3State.validate())
         XCTAssertThrowsError(try colmapState.validate())
         XCTAssertThrowsError(try da3ComputeState.validate())
+        XCTAssertThrowsError(try da3CadenceState.validate())
         XCTAssertThrowsError(try colmapComputeState.validate())
+    }
+
+    func testRejectsMissingOrUnrecognizedColmapCadence() {
+        var missingPlanned = validState()
+        missingPlanned.plannedIncrementalCadence = nil
+
+        var missingActive = validState()
+        missingActive.activeIncrementalCadence = nil
+
+        var unrelatedActive = validState()
+        unrelatedActive.activeIncrementalCadence = IncrementalMappingCadenceArtifact(
+            localMaxRefinements: 1,
+            globalFramesRatio: 2,
+            globalPointsRatio: 2,
+            globalMaxRefinements: 5
+        )
+
+        var invalidPlanned = validState()
+        invalidPlanned.plannedIncrementalCadence?.globalFramesRatio = .nan
+
+        XCTAssertThrowsError(try missingPlanned.validate())
+        XCTAssertThrowsError(try missingActive.validate())
+        XCTAssertThrowsError(try unrelatedActive.validate())
+        XCTAssertThrowsError(try invalidPlanned.validate())
+    }
+
+    func testRejectsConservativeFallbackForUnorderedPlannedCadence() {
+        var state = validState()
+        state.plannedIncrementalCadence = IncrementalMappingCadenceArtifact(
+            localMaxRefinements: 2,
+            globalFramesRatio: 1.1,
+            globalPointsRatio: 1.1,
+            globalMaxRefinements: 5
+        )
+        state.activeIncrementalCadence = .conservative
+
+        XCTAssertThrowsError(try state.validate()) { error in
+            XCTAssertEqual(
+                error as? GeometryRecoveryState.ValidationError,
+                .invalidBackendFields
+            )
+        }
     }
 
     func testRejectsPersistedNormalMatcherForDA3() {
@@ -153,18 +208,33 @@ final class GeometryRecoveryStateTests: XCTestCase {
 
         try state.validateBinding(
             expectedImageNames: imageNames,
-            expectedSelectedFramesDigest: digest
+            expectedSelectedFramesDigest: digest,
+            expectedPlannedIncrementalCadence: state.plannedIncrementalCadence
         )
         XCTAssertThrowsError(
             try state.validateBinding(
                 expectedImageNames: imageNames.reversed(),
-                expectedSelectedFramesDigest: digest
+                expectedSelectedFramesDigest: digest,
+                expectedPlannedIncrementalCadence: state.plannedIncrementalCadence
             )
         )
         XCTAssertThrowsError(
             try state.validateBinding(
                 expectedImageNames: imageNames,
-                expectedSelectedFramesDigest: String(repeating: "b", count: 64)
+                expectedSelectedFramesDigest: String(repeating: "b", count: 64),
+                expectedPlannedIncrementalCadence: state.plannedIncrementalCadence
+            )
+        )
+        XCTAssertThrowsError(
+            try state.validateBinding(
+                expectedImageNames: imageNames,
+                expectedSelectedFramesDigest: digest,
+                expectedPlannedIncrementalCadence: IncrementalMappingCadenceArtifact(
+                    localMaxRefinements: 1,
+                    globalFramesRatio: 8,
+                    globalPointsRatio: 8,
+                    globalMaxRefinements: 5
+                )
             )
         )
     }
@@ -181,7 +251,9 @@ final class GeometryRecoveryStateTests: XCTestCase {
             activeBackend: .colmap,
             mappingAttemptCount: 0,
             mappingFallbackReasons: [],
-            colmapComputeMode: .gpu
+            colmapComputeMode: .gpu,
+            plannedIncrementalCadence: .conservative,
+            activeIncrementalCadence: .conservative
         )
     }
 

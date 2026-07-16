@@ -449,7 +449,9 @@ final class ProjectDiagnosticBundleTests: XCTestCase {
             mappingAttemptCount: 2,
             mappingFallbackReasons: ["interrupted mapping resumed"],
             pendingPairRecoveryLevel: .expanded,
-            colmapComputeMode: .cpu
+            colmapComputeMode: .cpu,
+            plannedIncrementalCadence: .orderedFast,
+            activeIncrementalCadence: .conservative
         )
         try ProjectMetadataStore.save(
             ProjectMetadata(
@@ -478,6 +480,20 @@ final class ProjectDiagnosticBundleTests: XCTestCase {
         XCTAssertEqual(machineRecovery["mappingAttemptCount"] as? Int, 2)
         XCTAssertEqual(machineRecovery["colmapComputeMode"] as? String, "cpu")
         XCTAssertEqual(machineRecovery["pendingPairRecoveryLevel"] as? String, "expanded")
+        let plannedCadence = try XCTUnwrap(
+            machineRecovery["plannedIncrementalCadence"] as? [String: Any]
+        )
+        XCTAssertEqual(plannedCadence["localMaxRefinements"] as? Int, 1)
+        XCTAssertEqual(plannedCadence["globalFramesRatio"] as? Double, 4)
+        XCTAssertEqual(plannedCadence["globalPointsRatio"] as? Double, 4)
+        XCTAssertEqual(plannedCadence["globalMaxRefinements"] as? Int, 5)
+        let activeCadence = try XCTUnwrap(
+            machineRecovery["activeIncrementalCadence"] as? [String: Any]
+        )
+        XCTAssertEqual(activeCadence["localMaxRefinements"] as? Int, 2)
+        XCTAssertEqual(activeCadence["globalFramesRatio"] as? Double, 1.4)
+        XCTAssertEqual(activeCadence["globalPointsRatio"] as? Double, 1.4)
+        XCTAssertEqual(activeCadence["globalMaxRefinements"] as? Int, 5)
         XCTAssertNil(machineRecovery["orderedImageNames"])
         XCTAssertNil(machineRecovery["selectedFramesDigest"])
     }

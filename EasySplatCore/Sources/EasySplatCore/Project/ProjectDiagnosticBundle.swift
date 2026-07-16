@@ -15,7 +15,7 @@ public enum ProjectDiagnosticBundle {
     /// Schema version embedded in the machine-readable JSON block. Bump
     /// when adding/removing/renaming top-level keys so downstream tools can
     /// detect a format change.
-    public static let machineReadableSchemaVersion = 7
+    public static let machineReadableSchemaVersion = 8
 
     /// Scrub a user-visible technical payload before it reaches a clipboard,
     /// save panel, or share surface. Project identity is included when the
@@ -291,6 +291,8 @@ public enum ProjectDiagnosticBundle {
             var pendingPairRecoveryLevel: String?
             var da3DescriptorMatcher: String?
             var colmapComputeMode: String?
+            var plannedIncrementalCadence: IncrementalMappingCadenceArtifact?
+            var activeIncrementalCadence: IncrementalMappingCadenceArtifact?
 
             init(_ recovery: GeometryRecoveryState) {
                 activeBackend = recovery.activeBackend.rawValue
@@ -299,6 +301,8 @@ public enum ProjectDiagnosticBundle {
                 pendingPairRecoveryLevel = recovery.pendingPairRecoveryLevel?.rawValue
                 da3DescriptorMatcher = recovery.da3DescriptorMatcher?.rawValue
                 colmapComputeMode = recovery.colmapComputeMode?.rawValue
+                plannedIncrementalCadence = recovery.plannedIncrementalCadence
+                activeIncrementalCadence = recovery.activeIncrementalCadence
             }
         }
         struct Payload: Encodable {

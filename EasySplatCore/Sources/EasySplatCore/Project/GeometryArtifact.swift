@@ -227,6 +227,29 @@ public struct IncrementalMappingCadenceArtifact: Codable, Sendable, Equatable {
         self.globalPointsRatio = globalPointsRatio
         self.globalMaxRefinements = globalMaxRefinements
     }
+
+    public static let orderedFast = Self(
+        localMaxRefinements: 1,
+        globalFramesRatio: 4,
+        globalPointsRatio: 4,
+        globalMaxRefinements: 5
+    )
+
+    public static let conservative = Self(
+        localMaxRefinements: 2,
+        globalFramesRatio: 1.4,
+        globalPointsRatio: 1.4,
+        globalMaxRefinements: 5
+    )
+
+    var isValid: Bool {
+        localMaxRefinements > 0
+            && globalFramesRatio.isFinite
+            && globalFramesRatio > 1
+            && globalPointsRatio.isFinite
+            && globalPointsRatio > 1
+            && globalMaxRefinements > 0
+    }
 }
 
 public struct MappingArtifact: Codable, Sendable, Equatable {
@@ -390,7 +413,7 @@ public struct CanonicalOrientationArtifact: Codable, Sendable, Equatable {
 }
 
 public struct GeometryArtifact: Codable, Sendable, Equatable {
-    public static let currentSchemaVersion = 9
+    public static let currentSchemaVersion = 10
 
     public var schemaVersion: Int
     public var solverVersion: String

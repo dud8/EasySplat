@@ -11,7 +11,7 @@ public enum GeometryRecoveryComputeMode: String, Codable, Sendable, Equatable {
 }
 
 public struct GeometryRecoveryState: Codable, Sendable, Equatable {
-    public static let currentSchemaVersion = 2
+    public static let currentSchemaVersion = 3
     public static let maximumMappingAttemptCount = 10_000
 
     public enum ValidationError: Swift.Error, LocalizedError, Equatable {
@@ -52,6 +52,8 @@ public struct GeometryRecoveryState: Codable, Sendable, Equatable {
     public var pendingPairRecoveryLevel: PairGraphRecoveryLevel?
     public var da3DescriptorMatcher: DescriptorMatcher?
     public var colmapComputeMode: GeometryRecoveryComputeMode?
+    public var plannedIncrementalCadence: IncrementalMappingCadenceArtifact?
+    public var activeIncrementalCadence: IncrementalMappingCadenceArtifact?
 
     public init(
         selectedFramesDigest: String,
@@ -61,7 +63,9 @@ public struct GeometryRecoveryState: Codable, Sendable, Equatable {
         mappingFallbackReasons: [String],
         pendingPairRecoveryLevel: PairGraphRecoveryLevel? = nil,
         da3DescriptorMatcher: DescriptorMatcher? = nil,
-        colmapComputeMode: GeometryRecoveryComputeMode? = nil
+        colmapComputeMode: GeometryRecoveryComputeMode? = nil,
+        plannedIncrementalCadence: IncrementalMappingCadenceArtifact? = nil,
+        activeIncrementalCadence: IncrementalMappingCadenceArtifact? = nil
     ) {
         schemaVersion = Self.currentSchemaVersion
         self.selectedFramesDigest = selectedFramesDigest
@@ -72,6 +76,8 @@ public struct GeometryRecoveryState: Codable, Sendable, Equatable {
         self.pendingPairRecoveryLevel = pendingPairRecoveryLevel
         self.da3DescriptorMatcher = da3DescriptorMatcher
         self.colmapComputeMode = colmapComputeMode
+        self.plannedIncrementalCadence = plannedIncrementalCadence
+        self.activeIncrementalCadence = activeIncrementalCadence
     }
 
     public func validate() throws {
@@ -113,12 +119,23 @@ public struct GeometryRecoveryState: Codable, Sendable, Equatable {
         case .da3:
             guard pendingPairRecoveryLevel == nil,
                   da3DescriptorMatcher == nil || da3DescriptorMatcher == .exact,
-                  colmapComputeMode == nil else {
+                  colmapComputeMode == nil,
+                  plannedIncrementalCadence == nil,
+                  activeIncrementalCadence == nil else {
                 throw ValidationError.invalidBackendFields
             }
         case .colmap:
             guard da3DescriptorMatcher == nil,
-                  colmapComputeMode != nil else {
+                  colmapComputeMode != nil,
+                  let plannedIncrementalCadence,
+                  let activeIncrementalCadence,
+                  plannedIncrementalCadence.isValid,
+                  activeIncrementalCadence.isValid,
+                  activeIncrementalCadence == plannedIncrementalCadence
+                    || (
+                        plannedIncrementalCadence == .orderedFast
+                            && activeIncrementalCadence == .conservative
+                    ) else {
                 throw ValidationError.invalidBackendFields
             }
         }
@@ -126,11 +143,13 @@ public struct GeometryRecoveryState: Codable, Sendable, Equatable {
 
     public func validateBinding(
         expectedImageNames: [String],
-        expectedSelectedFramesDigest: String
+        expectedSelectedFramesDigest: String,
+        expectedPlannedIncrementalCadence: IncrementalMappingCadenceArtifact?
     ) throws {
         try validate()
         guard orderedImageNames == expectedImageNames,
-              selectedFramesDigest == expectedSelectedFramesDigest else {
+              selectedFramesDigest == expectedSelectedFramesDigest,
+              plannedIncrementalCadence == expectedPlannedIncrementalCadence else {
             throw ValidationError.bindingMismatch
         }
     }

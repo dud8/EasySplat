@@ -877,6 +877,7 @@ public final class PipelineRunner: @unchecked Sendable {
                 orderedImageNames: geometryRecoveryImageNames,
                 projectPaths: paths
             )
+            let plannedIncrementalCadence = resolvedRunPlan.incrementalMappingCadence
 
             func sfmBackend(for backend: GeometryRecoveryBackend) -> SfmBackend {
                 switch backend {
@@ -890,7 +891,10 @@ public final class PipelineRunner: @unchecked Sendable {
                 do {
                     try recovery.validateBinding(
                         expectedImageNames: geometryRecoveryImageNames,
-                        expectedSelectedFramesDigest: geometryRecoveryFramesDigest
+                        expectedSelectedFramesDigest: geometryRecoveryFramesDigest,
+                        expectedPlannedIncrementalCadence: recovery.activeBackend == .colmap
+                            ? plannedIncrementalCadence
+                            : nil
                     )
                     guard backendOrder.contains(sfmBackend(for: recovery.activeBackend)) else {
                         throw GeometryRecoveryState.ValidationError.invalidBackendFields
@@ -926,6 +930,8 @@ public final class PipelineRunner: @unchecked Sendable {
             var mappingAttemptCount = restoredGeometryRecovery?.mappingAttemptCount ?? 0
             var acceptedMappingArtifact: MappingArtifact?
             var mappingFallbackReasons = restoredGeometryRecovery?.mappingFallbackReasons ?? []
+            var activeIncrementalCadence = restoredGeometryRecovery?
+                .activeIncrementalCadence ?? plannedIncrementalCadence
             var recoveredActiveBackend = restoredGeometryRecovery.map {
                 sfmBackend(for: $0.activeBackend)
             }
@@ -991,6 +997,12 @@ public final class PipelineRunner: @unchecked Sendable {
                     da3DescriptorMatcher: da3DescriptorMatcher,
                     colmapComputeMode: recoveryBackend == .colmap
                         ? (colmapMatchOptions.useGPU ? .gpu : .cpu)
+                        : nil,
+                    plannedIncrementalCadence: recoveryBackend == .colmap
+                        ? plannedIncrementalCadence
+                        : nil,
+                    activeIncrementalCadence: recoveryBackend == .colmap
+                        ? activeIncrementalCadence
                         : nil
                 )
                 try state.validate()
@@ -2587,24 +2599,16 @@ public final class PipelineRunner: @unchecked Sendable {
                         line: "Tool log: \(paths.colmapLogURL.lastPathComponent)",
                         isError: false
                     ))
-                    let mappingProgress = ColmapMappingProgressTracker(totalImages: selectedFrames.count)
-                    let onMappingLog: @Sendable (String, Bool) -> Void = { line, isErr in
-                        let sanitized = Self.sanitizeToolLogLine(line)
-                        let effectiveIsErr = Self.normalizedToolLogIsError(sanitized, isError: isErr)
-                        if Self.shouldEmitToolLogLine(sanitized, isError: effectiveIsErr) {
-                            emit(.stageLog(stage: .sfmMapping, line: sanitized, isError: effectiveIsErr))
-                        }
-                        if let update = mappingProgress.ingest(line) {
-                            emit(.stageProgress(stage: .sfmMapping, fraction: update.fraction, message: update.message))
-                        }
-                    }
                     var mappingSucceeded = false
                     var lastMappingError: Error?
                     var selectedMappedModel: MappedSparseModelCandidate?
                     var selectedMappedModelSnapshot: MappedSparseModelSnapshot?
                     var selectedMappedModelTextIsCanonical = false
 
-                    func evaluateMappingResult() async throws -> Bool {
+                    func evaluateMappingResult(
+                        acceptedRefinementInvocationCount: Int,
+                        cadence: IncrementalMappingCadenceArtifact
+                    ) async throws -> Bool {
                         let modelDirectories = try self.mappedSparseModelDirectories(
                             in: paths.colmapSparseURL
                         )
@@ -2807,17 +2811,8 @@ public final class PipelineRunner: @unchecked Sendable {
                                     attemptCount: mappingAttemptCount,
                                     acceptedRefinementKind: .incrementalGlobal,
                                     acceptedRefinementInvocationCount:
-                                        mappingProgress.globalRefinementInvocationCount,
-                                    incrementalCadence: IncrementalMappingCadenceArtifact(
-                                        localMaxRefinements:
-                                            resolvedRunPlan.baLocalMaxRefinements,
-                                        globalFramesRatio:
-                                            resolvedRunPlan.baGlobalFramesRatio,
-                                        globalPointsRatio:
-                                            resolvedRunPlan.baGlobalPointsRatio,
-                                        globalMaxRefinements:
-                                            resolvedRunPlan.baGlobalMaxRefinements
-                                    ),
+                                        acceptedRefinementInvocationCount,
+                                    incrementalCadence: cadence,
                                     fallbackReason: nil
                                 )
                                 self.warnIfWeakAcceptedSolve(
@@ -2865,34 +2860,96 @@ public final class PipelineRunner: @unchecked Sendable {
                         return false
                     }
 
-                    do {
-                        try beginMappingAttempt(activeBackend: .colmap)
-                        try self.resetDirectory(paths.colmapSparseURL)
-                        try await self.tooling.colmap.runMapper(
-                            colmapPath: self.config.toolchain.colmap,
-                            database: paths.colmapDatabaseURL,
-                            imagePath: paths.framesSelectedURL,
-                            outputPath: paths.colmapSparseURL,
-                            options: colmapMatchOptions,
-                            mapperOptions: try ColmapMapperOptions(
-                                globalFramesRatio: resolvedRunPlan.baGlobalFramesRatio,
-                                globalPointsRatio: resolvedRunPlan.baGlobalPointsRatio,
-                                localMaxRefinements: resolvedRunPlan.baLocalMaxRefinements,
-                                globalMaxRefinements: resolvedRunPlan.baGlobalMaxRefinements,
-                                globalMaxNumIterations: resolvedRunPlan.refinementIterationLimit,
-                                randomSeed: resolvedRunPlan.deterministicSeed,
-                                refineFocalLength: true
-                            ),
-                            onLog: { line, isErr in
-                                colmapToolLog.append(stream: isErr ? "stderr" : "stdout", line: line)
-                                onMappingLog(line, isErr)
-                            }
+                    mappingAttemptLoop: while true {
+                        let cadence = activeIncrementalCadence
+                        let mappingProgress = ColmapMappingProgressTracker(
+                            totalImages: selectedFrames.count
                         )
-                        mappingSucceeded = try await evaluateMappingResult()
-                    } catch {
-                        if error is CancellationError { throw error }
-                        try Task.checkCancellation()
-                        lastMappingError = Self.normalizedUnusableSparseModelError(error)
+                        let onMappingLog: @Sendable (String, Bool) -> Void = { line, isErr in
+                            let sanitized = Self.sanitizeToolLogLine(line)
+                            let effectiveIsErr = Self.normalizedToolLogIsError(
+                                sanitized,
+                                isError: isErr
+                            )
+                            if Self.shouldEmitToolLogLine(
+                                sanitized,
+                                isError: effectiveIsErr
+                            ) {
+                                emit(.stageLog(
+                                    stage: .sfmMapping,
+                                    line: sanitized,
+                                    isError: effectiveIsErr
+                                ))
+                            }
+                            if let update = mappingProgress.ingest(line) {
+                                emit(.stageProgress(
+                                    stage: .sfmMapping,
+                                    fraction: update.fraction,
+                                    message: update.message
+                                ))
+                            }
+                        }
+                        lastMappingError = nil
+                        selectedMappedModel = nil
+                        selectedMappedModelSnapshot = nil
+                        selectedMappedModelTextIsCanonical = false
+                        acceptedMappingArtifact = nil
+                        acceptedReconstructionSummary = nil
+                        do {
+                            try beginMappingAttempt(activeBackend: .colmap)
+                            try self.resetDirectory(paths.colmapSparseURL)
+                            try await self.tooling.colmap.runMapper(
+                                colmapPath: self.config.toolchain.colmap,
+                                database: paths.colmapDatabaseURL,
+                                imagePath: paths.framesSelectedURL,
+                                outputPath: paths.colmapSparseURL,
+                                options: colmapMatchOptions,
+                                mapperOptions: try ColmapMapperOptions(
+                                    globalFramesRatio: cadence.globalFramesRatio,
+                                    globalPointsRatio: cadence.globalPointsRatio,
+                                    localMaxRefinements: cadence.localMaxRefinements,
+                                    globalMaxRefinements: cadence.globalMaxRefinements,
+                                    globalMaxNumIterations:
+                                        resolvedRunPlan.refinementIterationLimit,
+                                    randomSeed: resolvedRunPlan.deterministicSeed,
+                                    refineFocalLength: true
+                                ),
+                                onLog: { line, isErr in
+                                    colmapToolLog.append(
+                                        stream: isErr ? "stderr" : "stdout",
+                                        line: line
+                                    )
+                                    onMappingLog(line, isErr)
+                                }
+                            )
+                            mappingSucceeded = try await evaluateMappingResult(
+                                acceptedRefinementInvocationCount:
+                                    mappingProgress.globalRefinementInvocationCount,
+                                cadence: cadence
+                            )
+                        } catch {
+                            if error is CancellationError { throw error }
+                            try Task.checkCancellation()
+                            lastMappingError = Self.normalizedUnusableSparseModelError(error)
+                        }
+                        if mappingSucceeded {
+                            break mappingAttemptLoop
+                        }
+                        guard cadence == .orderedFast,
+                              let reason = Self.conservativeCadenceFallbackReason(
+                                after: lastMappingError
+                              ) else {
+                            break mappingAttemptLoop
+                        }
+                        activeIncrementalCadence = .conservative
+                        recordMappingFallback(reason)
+                        try persistGeometryRecovery(activeBackend: .colmap)
+                        try self.resetDirectory(paths.colmapSparseURL)
+                        emit(.stageLog(
+                            stage: .sfmMapping,
+                            line: "The fast camera solve missed a geometry gate. Retrying the accepted image graph with conservative refinement.",
+                            isError: true
+                        ))
                     }
                     if !mappingSucceeded,
                        Self.shouldEscalateTargetedExact(after: lastMappingError),

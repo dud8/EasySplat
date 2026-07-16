@@ -65,6 +65,75 @@ final class PipelineRunnerRetryTests: XCTestCase {
         ))
     }
 
+    func testConservativeCadenceRetriesOnlyMeasuredGeometryRejections() {
+        let lowQuality = PipelineRunner.PipelineError.lowQualityReconstruction(
+            ReconstructionScore(
+                registeredImages: 80,
+                totalImages: 100,
+                meanReprojectionError: 1
+            ),
+            mapper: "colmap"
+        )
+        let fragmentation = PipelineRunner.PipelineError.fragmentedReconstruction(
+            MappingFragmentationEvidence(
+                selectedModelOrder: 0,
+                selectedRegisteredViewCount: 80,
+                credibleUnionRegisteredViewCount: 95,
+                omittedRecoverableViewCount: 15,
+                totalSelectedViewCount: 100
+            )
+        )
+
+        XCTAssertNotNil(PipelineRunner.conservativeCadenceFallbackReason(after: lowQuality))
+        XCTAssertNotNil(PipelineRunner.conservativeCadenceFallbackReason(after: fragmentation))
+        XCTAssertNotNil(PipelineRunner.conservativeCadenceFallbackReason(
+            after: PipelineRunner.PipelineError.geometryCoverageTooLow(
+                registered: 80,
+                total: 100
+            )
+        ))
+        XCTAssertNotNil(PipelineRunner.conservativeCadenceFallbackReason(
+            after: PipelineRunner.PipelineError.geometryResidualCoverageTooLow(
+                measured: 80,
+                total: 100
+            )
+        ))
+        XCTAssertNotNil(PipelineRunner.conservativeCadenceFallbackReason(
+            after: PipelineRunner.PipelineError.geometryResidualsTooHigh(
+                median: 2,
+                p90: 4
+            )
+        ))
+
+        XCTAssertNil(PipelineRunner.conservativeCadenceFallbackReason(
+            after: CancellationError()
+        ))
+        XCTAssertNil(PipelineRunner.conservativeCadenceFallbackReason(
+            after: PipelineRunner.PipelineError.invalidInput
+        ))
+        XCTAssertNil(PipelineRunner.conservativeCadenceFallbackReason(
+            after: PipelineRunner.PipelineError.geometryRegisteredImagesMismatch
+        ))
+        XCTAssertNil(PipelineRunner.conservativeCadenceFallbackReason(
+            after: PipelineRunner.PipelineError.geometryResidualsUnavailable("parse failed")
+        ))
+        XCTAssertNil(PipelineRunner.conservativeCadenceFallbackReason(
+            after: PipelineRunner.PipelineError.geometryProvenanceUnavailable("missing")
+        ))
+        XCTAssertNil(PipelineRunner.conservativeCadenceFallbackReason(
+            after: PipelineRunner.PipelineError.outputMissing
+        ))
+        XCTAssertNil(PipelineRunner.conservativeCadenceFallbackReason(
+            after: ColmapRunnerError.failed(
+                command: "mapper",
+                exitCode: 1,
+                terminationReason: .exit,
+                stdoutTail: "",
+                stderrTail: "fatal"
+            )
+        ))
+    }
+
     func testPipelineStageDecodingRejectsUnknownStage() throws {
         let unknown = try JSONEncoder().encode("unknownStage")
 

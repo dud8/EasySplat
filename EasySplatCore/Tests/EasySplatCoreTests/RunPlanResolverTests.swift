@@ -82,7 +82,7 @@ final class RunPlanResolverTests: XCTestCase {
         )
     }
 
-    func testOrderedPlansUseLessFrequentGlobalBundleAdjustment() {
+    func testOrderedPlansUseMeasuredFastMappingCadence() {
         let hardware = HardwareProfile(memoryGB: 48, cpuCount: 16, gpuWorkingSetGB: 36)
 
         for capturePath in [
@@ -101,9 +101,9 @@ final class RunPlanResolverTests: XCTestCase {
                 developmentOverrides: .none
             )
 
-            XCTAssertEqual(plan.baGlobalFramesRatio, 1.4, "capture path: \(capturePath)")
-            XCTAssertEqual(plan.baGlobalPointsRatio, 1.4, "capture path: \(capturePath)")
-            XCTAssertEqual(plan.baLocalMaxRefinements, 2, "capture path: \(capturePath)")
+            XCTAssertEqual(plan.baGlobalFramesRatio, 4, "capture path: \(capturePath)")
+            XCTAssertEqual(plan.baGlobalPointsRatio, 4, "capture path: \(capturePath)")
+            XCTAssertEqual(plan.baLocalMaxRefinements, 1, "capture path: \(capturePath)")
             XCTAssertEqual(plan.baGlobalMaxRefinements, 5, "capture path: \(capturePath)")
         }
     }
@@ -925,7 +925,7 @@ final class RunPlanResolverTests: XCTestCase {
                 previousPlan: currentVideoPlan,
                 currentPlan: mappingPolicyPlan
             ),
-            .sfmFeatures
+            .sfmMatching
         )
 
         mappingPolicyPlan = currentVideoPlan
@@ -937,11 +937,11 @@ final class RunPlanResolverTests: XCTestCase {
                 previousPlan: currentVideoPlan,
                 currentPlan: mappingPolicyPlan
             ),
-            .sfmFeatures
+            .sfmMatching
         )
 
         mappingPolicyPlan = currentVideoPlan
-        mappingPolicyPlan.baLocalMaxRefinements = 1
+        mappingPolicyPlan.baLocalMaxRefinements = 2
         XCTAssertEqual(
             RunPlanResolver.safeResumeStage(
                 .exportSplat,
@@ -949,7 +949,7 @@ final class RunPlanResolverTests: XCTestCase {
                 previousPlan: currentVideoPlan,
                 currentPlan: mappingPolicyPlan
             ),
-            .sfmFeatures
+            .sfmMatching
         )
 
         mappingPolicyPlan = currentVideoPlan
@@ -961,7 +961,7 @@ final class RunPlanResolverTests: XCTestCase {
                 previousPlan: currentVideoPlan,
                 currentPlan: mappingPolicyPlan
             ),
-            .sfmFeatures
+            .sfmMatching
         )
 
         mappingPolicyPlan = currentVideoPlan
@@ -972,6 +972,18 @@ final class RunPlanResolverTests: XCTestCase {
                 input: video,
                 previousPlan: currentVideoPlan,
                 currentPlan: mappingPolicyPlan
+            ),
+            .sfmMatching
+        )
+
+        var pairingPolicyPlan = currentVideoPlan
+        pairingPolicyPlan.temporalOffsets = [1, 2, 4]
+        XCTAssertEqual(
+            RunPlanResolver.safeResumeStage(
+                .exportSplat,
+                input: video,
+                previousPlan: currentVideoPlan,
+                currentPlan: pairingPolicyPlan
             ),
             .sfmFeatures
         )
