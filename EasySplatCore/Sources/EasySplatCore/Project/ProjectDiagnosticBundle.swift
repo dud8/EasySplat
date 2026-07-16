@@ -96,7 +96,6 @@ public enum ProjectDiagnosticBundle {
         let logSources: [(label: String, url: URL)] = [
             ("pipeline.log", paths.pipelineLogURL),
             ("colmap.log", paths.colmapLogURL),
-            ("global_mapper.log", paths.globalMapperLogURL),
             ("da3.log", paths.da3LogURL),
             ("msplat.log", paths.msplatLogURL)
         ]

@@ -32,7 +32,6 @@ final class ProjectPathsTests: XCTestCase {
         XCTAssertTrue(fm.fileExists(atPath: paths.logsURL.path))
         XCTAssertTrue(paths.da3LogURL.path.hasSuffix("Logs/da3.log"))
         XCTAssertTrue(paths.da3CoverageManifestURL.path.hasSuffix("Logs/da3_coverage_manifest.json"))
-        XCTAssertTrue(paths.globalMapperLogURL.path.hasSuffix("Logs/global_mapper.log"))
         XCTAssertTrue(paths.msplatLogURL.path.hasSuffix("Logs/msplat.log"))
     }
 

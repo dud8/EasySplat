@@ -331,7 +331,6 @@ payload = {
         "matches_importer",
         "sequential_matcher",
         "exhaustive_matcher",
-        "global_mapper",
         "mapper",
         "point_triangulator",
         "bundle_adjuster",
@@ -402,7 +401,6 @@ validate_commands() {
     matches_importer \
     sequential_matcher \
     exhaustive_matcher \
-    global_mapper \
     mapper \
     point_triangulator \
     bundle_adjuster \

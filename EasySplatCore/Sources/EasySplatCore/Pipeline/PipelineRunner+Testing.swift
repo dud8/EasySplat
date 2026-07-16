@@ -137,10 +137,6 @@ extension PipelineRunner {
         da3SharedCameraPreference(input: input, cameraGrouping: cameraGrouping)
     }
 
-    func test_globalMapperOptions(threadHint: Int, defaultUseGpu: Bool = true) -> ColmapGlobalMapperOptions {
-        globalMapperOptions(threadHint: threadHint, defaultUseGpu: defaultUseGpu)
-    }
-
     func test_colmapErrorIndicatesGpuFailure(_ error: ColmapRunnerError) -> Bool {
         colmapErrorIndicatesGpuFailure(error)
     }

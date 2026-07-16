@@ -143,7 +143,7 @@ Accepted geometry must provide:
 
 `ColmapResidualAnalyzer` recomputes residuals from actual tracks. Placeholder or mapper-reported pseudo-residuals cannot pass. The pipeline requires at least 90% registration, median residual at most 1.5 px, and p90 at most 3 px before training. A learned candidate must also give at least 90% of selected views 20 or more verified track observations; one residual is not meaningful camera support.
 
-The retained COLMAP binary supplies feature extraction, matching, `point_triangulator`, bounded `bundle_adjuster`, `global_mapper`, classic `mapper`, conversion, and analysis. It is the correctness reference and recovery route, not a user option.
+The retained COLMAP runtime supplies feature extraction, FAISS and exact matching, `point_triangulator`, bounded `bundle_adjuster`, classic incremental `mapper`, conversion, and analysis. It is the correctness reference and recovery route, not a user option.
 
 The release benchmark calls the 3,000-frame measurement the long-sequence route. It measures whichever route actually ships. The beta does not claim a separate streaming engine or package unless one later clears the same license, memory, throughput, and quality gates.
 
@@ -153,6 +153,7 @@ Novelty is not a shipping criterion. Code, weights, training data, transitive li
 
 | Work | Current decision |
 | --- | --- |
+| COLMAP integrated `global_mapper` | Removed. The measured candidate was 2.45× slower in geometric mean and used more peak memory than the optimized incremental mapper. Its occasional coverage recovery did not meet the 30% speedup retention gate. |
 | [Depth Anything 3](https://github.com/ByteDance-Seed/Depth-Anything-3) Base and Small | Keep as the only learned candidate. The official small checkpoints are Apache-2.0 and use safetensors. Multi-window stitching is disabled. |
 | [LingBot-Map](https://arxiv.org/abs/2604.14141) | Do not port or redistribute yet. The official path is CUDA/FlashInfer, its checkpoints are executable `.pt` files, and the paper lists Waymo training data. [Waymo's terms](https://waymo.com/open/terms/) treat trained parameters as derivative IP restricted to non-commercial use. Written lineage clearance is required first. |
 | [Anchor3R](https://arxiv.org/abs/2606.05035) | Best current long-sequence architecture to watch: transient anchors, loop reinsertion, and motion averaging. No auditable implementation or weights are available. |

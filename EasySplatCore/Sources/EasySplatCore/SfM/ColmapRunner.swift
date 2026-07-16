@@ -191,35 +191,6 @@ public struct ColmapOptions: Sendable {
     }
 }
 
-/// Options for COLMAP's integrated `global_mapper` pipeline.
-public struct ColmapGlobalMapperOptions: Sendable {
-    public var useGpuForGlobalPositioning: Bool
-    public var gpuIndexForGlobalPositioning: String
-    public var useGpuForBundleAdjustment: Bool
-    public var gpuIndexForBundleAdjustment: String
-    public var numThreads: Int
-    public var minNumMatches: Int?
-    public var baNumIterations: Int?
-
-    public init(
-        useGpuForGlobalPositioning: Bool = true,
-        gpuIndexForGlobalPositioning: String = "-1",
-        useGpuForBundleAdjustment: Bool = true,
-        gpuIndexForBundleAdjustment: String = "-1",
-        numThreads: Int = max(1, ProcessInfo.processInfo.activeProcessorCount),
-        minNumMatches: Int? = nil,
-        baNumIterations: Int? = nil
-    ) {
-        self.useGpuForGlobalPositioning = useGpuForGlobalPositioning
-        self.gpuIndexForGlobalPositioning = gpuIndexForGlobalPositioning
-        self.useGpuForBundleAdjustment = useGpuForBundleAdjustment
-        self.gpuIndexForBundleAdjustment = gpuIndexForBundleAdjustment
-        self.numThreads = max(1, numThreads)
-        self.minNumMatches = minNumMatches.map { max(1, $0) }
-        self.baNumIterations = baNumIterations.map { max(1, $0) }
-    }
-}
-
 public enum ColmapRunnerError: Error, LocalizedError {
     case failed(command: String, exitCode: Int32, terminationReason: Process.TerminationReason, stdoutTail: String, stderrTail: String)
 
@@ -418,44 +389,6 @@ public final class ColmapRunner {
             onStderr: { onLog($0, true) }
         )
         try checkResult(result, command: "mapper")
-    }
-
-    public func runGlobalMapper(
-        colmapPath: URL,
-        database: URL,
-        imagePath: URL,
-        outputPath: URL,
-        options: ColmapGlobalMapperOptions,
-        environment: [String: String] = [:],
-        onLog: @escaping @Sendable (String, Bool) -> Void
-    ) async throws {
-        var args = [
-            "global_mapper",
-            "--database_path", database.path,
-            "--image_path", imagePath.path,
-            "--output_path", outputPath.path,
-            "--GlobalMapper.num_threads", "\(options.numThreads)",
-            "--GlobalMapper.gp_use_gpu", options.useGpuForGlobalPositioning ? "1" : "0",
-            "--GlobalMapper.gp_gpu_index", options.gpuIndexForGlobalPositioning,
-            "--GlobalMapper.ba_ceres_use_gpu", options.useGpuForBundleAdjustment ? "1" : "0",
-            "--GlobalMapper.ba_ceres_gpu_index", options.gpuIndexForBundleAdjustment
-        ]
-        if let minNumMatches = options.minNumMatches {
-            args.append(contentsOf: ["--GlobalMapper.min_num_matches", "\(minNumMatches)"])
-        }
-        if let baNumIterations = options.baNumIterations {
-            args.append(contentsOf: ["--GlobalMapper.ba_num_iterations", "\(baNumIterations)"])
-        }
-        onLog("EasySplat: colmap argv: \(colmapPath.path) \(args.joined(separator: " "))", false)
-        let result = try await runner.runAsync(
-            colmapPath.path,
-            args,
-            currentDirectory: nil,
-            environment: environment,
-            onStdout: { onLog($0, false) },
-            onStderr: { onLog($0, true) }
-        )
-        try checkResult(result, command: "global_mapper")
     }
 
     public func runPointTriangulator(

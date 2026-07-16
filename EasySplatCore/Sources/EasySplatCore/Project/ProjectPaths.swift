@@ -43,7 +43,6 @@ public struct ProjectPaths: Sendable {
     public var pipelineLogURL: URL { logsURL.appendingPathComponent("pipeline.log") }
     public var eventsLogURL: URL { logsURL.appendingPathComponent("events.jsonl") }
     public var colmapLogURL: URL { logsURL.appendingPathComponent("colmap.log") }
-    public var globalMapperLogURL: URL { logsURL.appendingPathComponent("global_mapper.log") }
     public var da3LogURL: URL { logsURL.appendingPathComponent("da3.log") }
     public var da3CoverageManifestURL: URL { logsURL.appendingPathComponent("da3_coverage_manifest.json") }
     public var msplatLogURL: URL { logsURL.appendingPathComponent("msplat.log") }

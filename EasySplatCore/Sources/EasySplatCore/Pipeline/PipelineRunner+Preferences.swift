@@ -51,19 +51,6 @@ extension PipelineRunner {
         detectColmapGpuSupport(colmapPath: colmapPath)
     }
 
-    func globalMapperOptions(threadHint: Int, defaultUseGpu: Bool = true) -> ColmapGlobalMapperOptions {
-        let preferredThreads = max(1, threadHint)
-        return ColmapGlobalMapperOptions(
-            useGpuForGlobalPositioning: defaultUseGpu,
-            gpuIndexForGlobalPositioning: "-1",
-            useGpuForBundleAdjustment: defaultUseGpu,
-            gpuIndexForBundleAdjustment: "-1",
-            numThreads: preferredThreads,
-            minNumMatches: nil,
-            baNumIterations: nil
-        )
-    }
-
     func updateThreadEnvironment(_ options: inout ColmapOptions, threadCount: Int) {
         if options.environment.isEmpty { return }
         options.environment["OMP_NUM_THREADS"] = "\(threadCount)"
@@ -93,18 +80,6 @@ extension PipelineRunner {
         if output.contains("cuda") { return true }
         if output.contains("use_gpu") { return true }
         if output.contains("gpu") { return true }
-        return false
-    }
-
-    func colmapErrorIndicatesMissingGlobalMapper(_ error: ColmapRunnerError) -> Bool {
-        let output: String
-        switch error {
-        case let .failed(_, _, _, stdoutTail, stderrTail):
-            output = (stderrTail + "\n" + stdoutTail).lowercased()
-        }
-        if output.contains("command `global_mapper` not recognized") { return true }
-        if output.contains("global_mapper") && output.contains("not recognized") { return true }
-        if output.contains("unknown option") && output.contains("globalmapper.") { return true }
         return false
     }
 }

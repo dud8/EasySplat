@@ -187,26 +187,6 @@ final class ProjectDiagnosticBundleTests: XCTestCase {
         XCTAssertFalse(bundle.contains("## pipeline.log (tail)"))
     }
 
-    func testEmbedsGlobalMapperLogTailWhenPresent() throws {
-        let root = try TestFileBuilder.makeTempDir()
-        defer { try? FileManager.default.removeItem(at: root) }
-        let paths = ProjectPaths(root: root)
-        try paths.ensureDirectories()
-        try ProjectMetadataStore.save(
-            ProjectMetadata(
-                title: "WithGlobalMapperLog",
-                input: .photos(folder: "/tmp/photos"),
-                requestedRunOptions: RequestedRunOptions(capturePath: .orbit, detailProfile: .fast)
-            ),
-            to: paths.metadataURL
-        )
-        try "global mapper failed here".write(to: paths.globalMapperLogURL, atomically: true, encoding: .utf8)
-
-        let bundle = try XCTUnwrap(ProjectDiagnosticBundle.build(projectURL: root))
-        XCTAssertTrue(bundle.contains("## global_mapper.log (tail)"))
-        XCTAssertTrue(bundle.contains("global mapper failed here"))
-    }
-
     func testSkipsLogTailsForEmptyFiles() throws {
         let root = try TestFileBuilder.makeTempDir()
         defer { try? FileManager.default.removeItem(at: root) }
@@ -340,7 +320,7 @@ final class ProjectDiagnosticBundleTests: XCTestCase {
             requestedRunOptions: RequestedRunOptions(capturePath: .orbit, detailProfile: .balanced),
             state: PipelineState(stage: .sfmMapping, lastError: "mapper exploded"),
             reconstruction: ReconstructionSummary(
-                mapper: "global_mapper",
+                mapper: "colmap",
                 capturedAt: Date(timeIntervalSince1970: 1_700_000_000),
                 registeredImages: 1,
                 totalImages: 2

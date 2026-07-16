@@ -405,7 +405,6 @@ final class PipelineIntegrationTests: XCTestCase {
         )
         XCTAssertEqual(finalMetadata.geometryArtifact, geometry)
         XCTAssertNotNil(events.stageLog(containing: "SfM backend: COLMAP mapper."))
-        XCTAssertNil(events.stageLog(containing: "global mapper"))
         XCTAssertNotNil(events.stageLog(containing: "Could not inspect COLMAP model 0"))
         XCTAssertNotNil(events.stageLog(containing: "Selected COLMAP model 1 (100/100 registered views)."))
         XCTAssertEqual(
@@ -4164,7 +4163,6 @@ final class PipelineIntegrationTests: XCTestCase {
         XCTAssertEqual(value(for: "--fallback-model-subdir", in: da3Args), "DA3-SMALL")
         XCTAssertTrue(runner.calls.contains(where: { $0.0 == toolchain.colmap.path && $0.1.first == "model_analyzer" }))
         XCTAssertTrue(runner.calls.contains(where: { $0.0 == toolchain.colmap.path && $0.1.first == "point_triangulator" }))
-        XCTAssertFalse(runner.calls.contains(where: { $0.0 == toolchain.colmap.path && $0.1.first == "global_mapper" }))
         let finished = try ProjectMetadataStore.load(from: paths.metadataURL)
         let geometry = try XCTUnwrap(finished.geometryArtifact)
         XCTAssertEqual(
@@ -4292,7 +4290,6 @@ final class PipelineIntegrationTests: XCTestCase {
             }
         })
 
-        XCTAssertFalse(runner.calls.contains { $0.1.first == "global_mapper" })
         XCTAssertFalse(runner.calls.contains { $0.1.first == "mapper" })
         XCTAssertNil(events.stageLog(containing: "Falling back to COLMAP"))
         let finished = try ProjectMetadataStore.load(from: paths.metadataURL)
@@ -4383,7 +4380,6 @@ final class PipelineIntegrationTests: XCTestCase {
         XCTAssertEqual(value(for: "--input-ordering", in: da3Args), "continuous")
         let commands = runner.calls.filter { $0.0 == toolchain.colmap.path }.compactMap { $0.1.first }
         XCTAssertEqual(commands, ["feature_extractor", "matches_importer", "point_triangulator", "bundle_adjuster", "model_analyzer"])
-        XCTAssertFalse(commands.contains("global_mapper"))
         XCTAssertFalse(commands.contains("mapper"))
         XCTAssertNotNil(events.stageLog(containing: "DA3 refinement pair plan"))
 

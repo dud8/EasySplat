@@ -135,6 +135,16 @@ if rg -n 'DA3-(LARGE|GIANT)|DA3-NESTED|DA3NESTED|DA3-GIANT|DA3-LARGE|CC-BY-NC' \
   exit 1
 fi
 
+if rg -n -i 'global_mapper|globalmapper|global mapper' \
+  "$ROOT/EasySplatCore/Sources" \
+  "$ROOT/EasySplatApp" \
+  "$ROOT/Tools/Da3Sfm/easysplat_da3_sfm/colmap_cli.py" \
+  "$ROOT/scripts/toolchain/build_colmap.sh" \
+  "$ROOT/scripts/toolchain/package_toolchain.sh" >/dev/null; then
+  echo "The rejected COLMAP global-mapper candidate remains in a runtime surface." >&2
+  exit 1
+fi
+
 if git -C "$ROOT" ls-files scripts/benchmark | rg '(^|/)suite\.json$|(^|/)raw/|\.(mov|mp4|m4v|heic|jpe?g|png|tiff?)$' >/dev/null; then
   echo "Generated benchmark results or corpus media are tracked in Git." >&2
   exit 1

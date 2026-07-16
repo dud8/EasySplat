@@ -869,26 +869,6 @@ final class PipelineRunnerHelperTests: XCTestCase {
         return (Double(left) / sampleCount, Double(right) / sampleCount)
     }
 
-    func testMapperDefaultsToIntegratedGlobalMapperWithGpuEnabled() async throws {
-        let root = try TestFileBuilder.makeTempDir()
-        defer { try? FileManager.default.removeItem(at: root) }
-        let runner = makeRunner(projectURL: root)
-
-        let options = runner.test_globalMapperOptions(threadHint: 8)
-        XCTAssertTrue(options.useGpuForGlobalPositioning)
-        XCTAssertTrue(options.useGpuForBundleAdjustment)
-    }
-
-    func testGlobalMapperDefaultUseGpuFalseDisablesGpuWithoutOverrides() async throws {
-        let root = try TestFileBuilder.makeTempDir()
-        defer { try? FileManager.default.removeItem(at: root) }
-        let runner = makeRunner(projectURL: root)
-
-        let options = runner.test_globalMapperOptions(threadHint: 8, defaultUseGpu: false)
-        XCTAssertFalse(options.useGpuForGlobalPositioning)
-        XCTAssertFalse(options.useGpuForBundleAdjustment)
-    }
-
     func testResetPerRunToolLogsRemovesDa3Log() throws {
         let root = try TestFileBuilder.makeTempDir()
         defer { try? FileManager.default.removeItem(at: root) }
@@ -897,7 +877,6 @@ final class PipelineRunnerHelperTests: XCTestCase {
 
         let urls = [
             paths.colmapLogURL,
-            paths.globalMapperLogURL,
             paths.da3LogURL,
             paths.msplatLogURL
         ]

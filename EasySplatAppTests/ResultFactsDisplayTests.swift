@@ -6,7 +6,6 @@ final class ResultFactsDisplayTests: XCTestCase {
     func testTechnicalSolverLabelsCoverCurrentRoutes() {
         let labels = [
             "da3-refined": "Depth Anything 3 + refinement",
-            "global_mapper": "COLMAP global mapper",
             "colmap": "COLMAP mapper",
         ]
         for (raw, expected) in labels {

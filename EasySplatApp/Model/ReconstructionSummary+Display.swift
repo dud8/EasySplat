@@ -10,12 +10,6 @@ extension ReconstructionSummary {
             return "Point triangulator + BA"
         case "point_triangulator":
             return "Point triangulator"
-        case "global_mapper":
-            return "COLMAP global mapper"
-        case "global_mapper-gpu":
-            return "COLMAP global mapper (GPU)"
-        case "global_mapper-cpu":
-            return "COLMAP global mapper (CPU)"
         case "colmap":
             return "COLMAP mapper"
         default:

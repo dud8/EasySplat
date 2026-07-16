@@ -3524,7 +3524,6 @@ public final class PipelineRunner: @unchecked Sendable {
         let fm = FileManager.default
         let toolLogs: [URL] = [
             paths.colmapLogURL,
-            paths.globalMapperLogURL,
             paths.da3LogURL,
             paths.msplatLogURL,
         ]
