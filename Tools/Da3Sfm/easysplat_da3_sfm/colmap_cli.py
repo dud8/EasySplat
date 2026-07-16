@@ -78,6 +78,7 @@ _REQUIRED_OPTION_FIELDS = {
         "ba_use_gpu",
         "ba_global_frames_ratio",
         "ba_global_points_ratio",
+        "ba_local_max_refinements",
         "ba_global_max_refinements",
         "ba_global_max_num_iterations",
         "min_num_matches",
@@ -153,6 +154,7 @@ _COMMAND_OPTIONS = {
         "output_path",
         "Mapper.ba_global_frames_ratio",
         "Mapper.ba_global_points_ratio",
+        "Mapper.ba_local_max_refinements",
         "Mapper.ba_global_max_refinements",
         "Mapper.ba_global_max_num_iterations",
         "Mapper.min_num_matches",
@@ -1121,6 +1123,11 @@ def _run_mapper(pycolmap: Any, options: dict[str, str]) -> None:
         options,
         "Mapper.ba_global_points_ratio",
         pipeline.ba_global_points_ratio,
+    )
+    pipeline.ba_local_max_refinements = _positive_integer(
+        options,
+        "Mapper.ba_local_max_refinements",
+        pipeline.ba_local_max_refinements,
     )
     pipeline.ba_global_max_refinements = _positive_integer(
         options,

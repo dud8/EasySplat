@@ -53,9 +53,9 @@ final class GeometryArtifactStoreTests: XCTestCase {
         }
     }
 
-    func testLoadRejectsSchemaSevenBeforeDecodingRetiredMappingState() throws {
+    func testLoadRejectsSchemaEightBeforeDecodingRetiredMappingState() throws {
         let baselineSchemaVersion = GeometryArtifact.currentSchemaVersion - 1
-        XCTAssertEqual(baselineSchemaVersion, 7)
+        XCTAssertEqual(baselineSchemaVersion, 8)
 
         let root = try TestFileBuilder.makeTempDir()
         defer { try? FileManager.default.removeItem(at: root) }
@@ -406,6 +406,7 @@ final class GeometryArtifactStoreTests: XCTestCase {
         )
         artifact.pairGraph = .notEvaluated()
         artifact.mapping.acceptedRefinementKind = .seededBundleAdjustment
+        artifact.mapping.incrementalCadence = nil
         XCTAssertNoThrow(try GeometryArtifactStore.validate(artifact, projectPaths: paths))
 
         var fabricatedInvocationCount = artifact
@@ -520,6 +521,7 @@ final class GeometryArtifactStoreTests: XCTestCase {
         )
         artifact.pairGraph = .notEvaluated()
         artifact.mapping.acceptedRefinementKind = .seededBundleAdjustment
+        artifact.mapping.incrementalCadence = nil
 
         XCTAssertNoThrow(try GeometryArtifactStore.validate(artifact, projectPaths: paths))
     }
@@ -683,6 +685,12 @@ final class GeometryArtifactStoreTests: XCTestCase {
             attemptCount: 2,
             acceptedRefinementKind: .incrementalGlobal,
             acceptedRefinementInvocationCount: 0,
+            incrementalCadence: IncrementalMappingCadenceArtifact(
+                localMaxRefinements: 2,
+                globalFramesRatio: 1.4,
+                globalPointsRatio: 1.4,
+                globalMaxRefinements: 5
+            ),
             fallbackReason: "normal graph missed coverage; denser graph accepted"
         )
 
@@ -707,6 +715,19 @@ final class GeometryArtifactStoreTests: XCTestCase {
             { (mapping: inout MappingArtifact) in mapping.unionRegisteredViewCount = 2 },
             { (mapping: inout MappingArtifact) in mapping.attemptCount = 0 },
             { (mapping: inout MappingArtifact) in mapping.acceptedRefinementInvocationCount = -1 },
+            { (mapping: inout MappingArtifact) in mapping.incrementalCadence = nil },
+            { (mapping: inout MappingArtifact) in
+                mapping.incrementalCadence?.localMaxRefinements = 0
+            },
+            { (mapping: inout MappingArtifact) in
+                mapping.incrementalCadence?.globalFramesRatio = 1
+            },
+            { (mapping: inout MappingArtifact) in
+                mapping.incrementalCadence?.globalPointsRatio = .infinity
+            },
+            { (mapping: inout MappingArtifact) in
+                mapping.incrementalCadence?.globalMaxRefinements = 0
+            },
             { (mapping: inout MappingArtifact) in
                 mapping.attemptCount = 2
                 mapping.fallbackReason = nil
@@ -821,6 +842,7 @@ final class GeometryArtifactStoreTests: XCTestCase {
             attemptCount: 1,
             acceptedRefinementKind: .seededBundleAdjustment,
             acceptedRefinementInvocationCount: 1,
+            incrementalCadence: nil,
             fallbackReason: nil
         )
         XCTAssertThrowsError(
@@ -970,6 +992,12 @@ final class GeometryArtifactStoreTests: XCTestCase {
                 attemptCount: 1,
                 acceptedRefinementKind: .incrementalGlobal,
                 acceptedRefinementInvocationCount: 1,
+                incrementalCadence: IncrementalMappingCadenceArtifact(
+                    localMaxRefinements: 2,
+                    globalFramesRatio: 1.4,
+                    globalPointsRatio: 1.4,
+                    globalMaxRefinements: 5
+                ),
                 fallbackReason: nil
             ),
             canonicalOrientation: .unresolved(
@@ -1033,6 +1061,12 @@ final class GeometryArtifactStoreTests: XCTestCase {
             attemptCount: 1,
             acceptedRefinementKind: .incrementalGlobal,
             acceptedRefinementInvocationCount: 1,
+            incrementalCadence: IncrementalMappingCadenceArtifact(
+                localMaxRefinements: 2,
+                globalFramesRatio: 1.4,
+                globalPointsRatio: 1.4,
+                globalMaxRefinements: 5
+            ),
             fallbackReason: nil
         )
         return artifact

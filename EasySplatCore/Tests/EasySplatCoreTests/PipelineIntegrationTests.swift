@@ -280,6 +280,7 @@ final class PipelineIntegrationTests: XCTestCase {
                 onRun: { args in
                     XCTAssertEqual(self.value(for: "--Mapper.ba_global_frames_ratio", in: args), "1.1")
                     XCTAssertEqual(self.value(for: "--Mapper.ba_global_points_ratio", in: args), "1.1")
+                    XCTAssertEqual(self.value(for: "--Mapper.ba_local_max_refinements", in: args), "2")
                     XCTAssertEqual(self.value(for: "--Mapper.ba_global_max_refinements", in: args), "5")
                     XCTAssertEqual(self.value(for: "--Mapper.random_seed", in: args), "42")
                     XCTAssertEqual(self.value(for: "--Mapper.ba_refine_focal_length", in: args), "1")
@@ -387,6 +388,15 @@ final class PipelineIntegrationTests: XCTestCase {
         XCTAssertEqual(geometry.mapping.attemptCount, 1)
         XCTAssertEqual(geometry.mapping.acceptedRefinementKind, .incrementalGlobal)
         XCTAssertEqual(geometry.mapping.acceptedRefinementInvocationCount, 2)
+        XCTAssertEqual(
+            geometry.mapping.incrementalCadence,
+            IncrementalMappingCadenceArtifact(
+                localMaxRefinements: 2,
+                globalFramesRatio: 1.1,
+                globalPointsRatio: 1.1,
+                globalMaxRefinements: 5
+            )
+        )
         XCTAssertNil(geometry.mapping.fallbackReason)
         XCTAssertEqual(geometry.canonicalOrientation.status, .unresolved)
         XCTAssertFalse(
@@ -572,6 +582,7 @@ final class PipelineIntegrationTests: XCTestCase {
             .init(path: toolchain.colmap.path, argsPrefix: ["mapper"], result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""), stdoutLines: ["Retriangulation and Global bundle adjustment"], onRun: { args in
                 XCTAssertEqual(self.value(for: "--Mapper.ba_global_frames_ratio", in: args), "1.4")
                 XCTAssertEqual(self.value(for: "--Mapper.ba_global_points_ratio", in: args), "1.4")
+                XCTAssertEqual(self.value(for: "--Mapper.ba_local_max_refinements", in: args), "2")
                 try? self.writeSparseModel(at: projectURL)
             }),
             .init(path: toolchain.colmap.path, argsPrefix: ["model_analyzer"], result: .init(exitCode: 0, terminationReason: .exit, stdout: "Registered images: 30 / 30\nPoints: 1\nObservations: 30\nMean track length: 30.0\n", stderr: ""), onRun: nil),
@@ -5737,6 +5748,12 @@ final class PipelineIntegrationTests: XCTestCase {
                 attemptCount: 1,
                 acceptedRefinementKind: .incrementalGlobal,
                 acceptedRefinementInvocationCount: 1,
+                incrementalCadence: IncrementalMappingCadenceArtifact(
+                    localMaxRefinements: 2,
+                    globalFramesRatio: 1.4,
+                    globalPointsRatio: 1.4,
+                    globalMaxRefinements: 5
+                ),
                 fallbackReason: nil
             ),
             canonicalOrientation: .unresolved(

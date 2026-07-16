@@ -17,6 +17,7 @@ final class ColmapRunnerTests: XCTestCase {
                     )
                     XCTAssertEqual(self.value(for: "--Mapper.ba_global_frames_ratio", in: args), "1.4")
                     XCTAssertEqual(self.value(for: "--Mapper.ba_global_points_ratio", in: args), "1.4")
+                    XCTAssertEqual(self.value(for: "--Mapper.ba_local_max_refinements", in: args), "2")
                     XCTAssertEqual(self.value(for: "--Mapper.ba_global_max_refinements", in: args), "5")
                     XCTAssertEqual(self.value(for: "--Mapper.random_seed", in: args), "42")
                     XCTAssertEqual(self.value(for: "--Mapper.min_num_matches", in: args), "15")
@@ -38,6 +39,7 @@ final class ColmapRunnerTests: XCTestCase {
             mapperOptions: try ColmapMapperOptions(
                 globalFramesRatio: 1.4,
                 globalPointsRatio: 1.4,
+                localMaxRefinements: 2,
                 globalMaxRefinements: 5,
                 globalMaxNumIterations: 75,
                 randomSeed: 42,
@@ -51,6 +53,7 @@ final class ColmapRunnerTests: XCTestCase {
         XCTAssertThrowsError(try ColmapMapperOptions(
             globalFramesRatio: 1,
             globalPointsRatio: 1.4,
+            localMaxRefinements: 2,
             globalMaxRefinements: 5,
             globalMaxNumIterations: 75,
             randomSeed: 42,
@@ -64,6 +67,7 @@ final class ColmapRunnerTests: XCTestCase {
         XCTAssertThrowsError(try ColmapMapperOptions(
             globalFramesRatio: .infinity,
             globalPointsRatio: 1.4,
+            localMaxRefinements: 2,
             globalMaxRefinements: 5,
             globalMaxNumIterations: 75,
             randomSeed: 42,
@@ -72,6 +76,7 @@ final class ColmapRunnerTests: XCTestCase {
         XCTAssertThrowsError(try ColmapMapperOptions(
             globalFramesRatio: 1.4,
             globalPointsRatio: .nan,
+            localMaxRefinements: 2,
             globalMaxRefinements: 5,
             globalMaxNumIterations: 75,
             randomSeed: 42,
@@ -85,6 +90,21 @@ final class ColmapRunnerTests: XCTestCase {
         XCTAssertThrowsError(try ColmapMapperOptions(
             globalFramesRatio: 1.4,
             globalPointsRatio: 1.4,
+            localMaxRefinements: 0,
+            globalMaxRefinements: 5,
+            globalMaxNumIterations: 75,
+            randomSeed: 42,
+            refineFocalLength: true
+        )) { error in
+            XCTAssertEqual(
+                error as? ColmapMapperOptionsValidationError,
+                .nonPositiveValue("Local refinement limit")
+            )
+        }
+        XCTAssertThrowsError(try ColmapMapperOptions(
+            globalFramesRatio: 1.4,
+            globalPointsRatio: 1.4,
+            localMaxRefinements: 2,
             globalMaxRefinements: 0,
             globalMaxNumIterations: 75,
             randomSeed: 42,
@@ -98,6 +118,7 @@ final class ColmapRunnerTests: XCTestCase {
         XCTAssertThrowsError(try ColmapMapperOptions(
             globalFramesRatio: 1.4,
             globalPointsRatio: 1.4,
+            localMaxRefinements: 2,
             globalMaxRefinements: 5,
             globalMaxNumIterations: 0,
             randomSeed: 42,
@@ -111,6 +132,7 @@ final class ColmapRunnerTests: XCTestCase {
         XCTAssertThrowsError(try ColmapMapperOptions(
             globalFramesRatio: 1.4,
             globalPointsRatio: 1.4,
+            localMaxRefinements: 2,
             globalMaxRefinements: 5,
             globalMaxNumIterations: 75,
             randomSeed: UInt64(Int32.max) + 1,

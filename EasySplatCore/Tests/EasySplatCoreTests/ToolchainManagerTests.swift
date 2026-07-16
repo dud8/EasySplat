@@ -1106,6 +1106,7 @@ enum ColmapBridgeHelpFixture {
         "output_path",
         "Mapper.ba_global_frames_ratio",
         "Mapper.ba_global_points_ratio",
+        "Mapper.ba_local_max_refinements",
         "Mapper.ba_global_max_refinements",
         "Mapper.ba_global_max_num_iterations",
         "Mapper.random_seed",

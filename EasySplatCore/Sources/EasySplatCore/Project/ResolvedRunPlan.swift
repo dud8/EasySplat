@@ -21,6 +21,7 @@ public enum RetrievalEngine: String, Codable, Sendable, Equatable {
 
 public enum ResolvedRunPlanValidationError: Error, LocalizedError, Equatable {
     case emptyToolchainCapabilities
+    case invalidBundleAdjustmentConfiguration
     case invalidPairingConfiguration
     case unsupportedNormalDescriptorMatcher
     case unknownToolchainCapability(String)
@@ -30,6 +31,8 @@ public enum ResolvedRunPlanValidationError: Error, LocalizedError, Equatable {
         switch self {
         case .emptyToolchainCapabilities:
             return "Run plan does not request any tool capabilities."
+        case .invalidBundleAdjustmentConfiguration:
+            return "Run plan contains an invalid bundle-adjustment configuration."
         case .invalidPairingConfiguration:
             return "Run plan contains an invalid image-pairing configuration."
         case .unsupportedNormalDescriptorMatcher:
@@ -76,6 +79,7 @@ public struct ResolvedRunPlan: Codable, Sendable, Equatable {
     public var normalDescriptorMatcher: DescriptorMatcher
     public var baGlobalFramesRatio: Double
     public var baGlobalPointsRatio: Double
+    public var baLocalMaxRefinements: Int
     public var baGlobalMaxRefinements: Int
     public var deterministicSeed: UInt64
 
@@ -113,6 +117,7 @@ public struct ResolvedRunPlan: Codable, Sendable, Equatable {
         normalDescriptorMatcher: DescriptorMatcher = .faiss,
         baGlobalFramesRatio: Double = 1.1,
         baGlobalPointsRatio: Double = 1.1,
+        baLocalMaxRefinements: Int = 2,
         baGlobalMaxRefinements: Int = 5,
         deterministicSeed: UInt64 = 42
     ) {
@@ -149,12 +154,14 @@ public struct ResolvedRunPlan: Codable, Sendable, Equatable {
         self.normalDescriptorMatcher = normalDescriptorMatcher
         self.baGlobalFramesRatio = baGlobalFramesRatio
         self.baGlobalPointsRatio = baGlobalPointsRatio
+        self.baLocalMaxRefinements = baLocalMaxRefinements
         self.baGlobalMaxRefinements = baGlobalMaxRefinements
         self.deterministicSeed = deterministicSeed
     }
 
     public func toolchainCapabilityRequest() throws -> ToolchainCapabilityRequest {
         try validatePairingConfiguration()
+        try validateBundleAdjustmentConfiguration()
         _ = try validatedBackendOrder()
         var capabilities = Set<ToolchainCapability>()
         for rawValue in requiredToolchainCapabilities {
@@ -199,6 +206,17 @@ public struct ResolvedRunPlan: Codable, Sendable, Equatable {
               retrievalNeighborCount <= retrievalCandidateCount,
               retrievalQueryStride > 0 else {
             throw ResolvedRunPlanValidationError.invalidPairingConfiguration
+        }
+    }
+
+    private func validateBundleAdjustmentConfiguration() throws {
+        guard baGlobalFramesRatio.isFinite,
+              baGlobalFramesRatio > 1,
+              baGlobalPointsRatio.isFinite,
+              baGlobalPointsRatio > 1,
+              baLocalMaxRefinements > 0,
+              baGlobalMaxRefinements > 0 else {
+            throw ResolvedRunPlanValidationError.invalidBundleAdjustmentConfiguration
         }
     }
 }

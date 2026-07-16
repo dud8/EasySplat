@@ -1496,6 +1496,7 @@ public final class PipelineRunner: @unchecked Sendable {
                                 attemptCount: mappingAttemptCount,
                                 acceptedRefinementKind: .seededBundleAdjustment,
                                 acceptedRefinementInvocationCount: 1,
+                                incrementalCadence: nil,
                                 fallbackReason: nil
                             )
                             acceptedReconstructionSummary = ReconstructionSummary(
@@ -2807,6 +2808,16 @@ public final class PipelineRunner: @unchecked Sendable {
                                     acceptedRefinementKind: .incrementalGlobal,
                                     acceptedRefinementInvocationCount:
                                         mappingProgress.globalRefinementInvocationCount,
+                                    incrementalCadence: IncrementalMappingCadenceArtifact(
+                                        localMaxRefinements:
+                                            resolvedRunPlan.baLocalMaxRefinements,
+                                        globalFramesRatio:
+                                            resolvedRunPlan.baGlobalFramesRatio,
+                                        globalPointsRatio:
+                                            resolvedRunPlan.baGlobalPointsRatio,
+                                        globalMaxRefinements:
+                                            resolvedRunPlan.baGlobalMaxRefinements
+                                    ),
                                     fallbackReason: nil
                                 )
                                 self.warnIfWeakAcceptedSolve(
@@ -2866,6 +2877,7 @@ public final class PipelineRunner: @unchecked Sendable {
                             mapperOptions: try ColmapMapperOptions(
                                 globalFramesRatio: resolvedRunPlan.baGlobalFramesRatio,
                                 globalPointsRatio: resolvedRunPlan.baGlobalPointsRatio,
+                                localMaxRefinements: resolvedRunPlan.baLocalMaxRefinements,
                                 globalMaxRefinements: resolvedRunPlan.baGlobalMaxRefinements,
                                 globalMaxNumIterations: resolvedRunPlan.refinementIterationLimit,
                                 randomSeed: resolvedRunPlan.deterministicSeed,

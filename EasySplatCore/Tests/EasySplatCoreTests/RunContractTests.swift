@@ -64,15 +64,15 @@ final class RequestedRunOptionsTests: XCTestCase {
     }
 }
 
-final class ProjectMetadataVersionSevenTests: XCTestCase {
-    func testNewMetadataUsesVersionSevenAndSuppliedRequestedOptions() {
+final class ProjectMetadataVersionEightTests: XCTestCase {
+    func testNewMetadataUsesVersionEightAndSuppliedRequestedOptions() {
         let metadata = ProjectMetadata(
             title: "New project",
             input: .photos(folder: "/tmp/photos"),
             requestedRunOptions: RequestedRunOptions(capturePath: .orbit, detailProfile: .balanced)
         )
 
-        XCTAssertEqual(ProjectMetadataStore.supportedFormatVersion, 7)
+        XCTAssertEqual(ProjectMetadataStore.supportedFormatVersion, 8)
         XCTAssertEqual(metadata.formatVersion, ProjectMetadataStore.supportedFormatVersion)
         XCTAssertEqual(
             metadata.requestedRunOptions,
@@ -177,6 +177,7 @@ private func makeResolvedRunPlan() -> ResolvedRunPlan {
         fallbackRouteIdentifiers: ["geometry.apple-silicon.fallback"],
         baGlobalFramesRatio: 1.4,
         baGlobalPointsRatio: 1.4,
+        baLocalMaxRefinements: 2,
         baGlobalMaxRefinements: 5
     )
 }
@@ -231,6 +232,12 @@ func makeGeometryArtifact(
             attemptCount: 1,
             acceptedRefinementKind: .incrementalGlobal,
             acceptedRefinementInvocationCount: 1,
+            incrementalCadence: IncrementalMappingCadenceArtifact(
+                localMaxRefinements: 2,
+                globalFramesRatio: 1.4,
+                globalPointsRatio: 1.4,
+                globalMaxRefinements: 5
+            ),
             fallbackReason: nil
         ),
         canonicalOrientation: .unresolved(

@@ -56,6 +56,7 @@ class _IncrementalPipelineOptions:
     __slots__ = (
         "ba_global_frames_ratio",
         "ba_global_points_ratio",
+        "ba_local_max_refinements",
         "ba_global_max_refinements",
         "ba_global_max_num_iterations",
         "min_num_matches",
@@ -67,6 +68,7 @@ class _IncrementalPipelineOptions:
     def __init__(self) -> None:
         self.ba_global_frames_ratio = 1.1
         self.ba_global_points_ratio = 1.1
+        self.ba_local_max_refinements = 2
         self.ba_global_max_refinements = 5
         self.ba_global_max_num_iterations = 50
         self.min_num_matches = 15
@@ -1390,6 +1392,7 @@ class ColmapCliTests(unittest.TestCase):
             | {
                 "Mapper.ba_global_frames_ratio": "1.4",
                 "Mapper.ba_global_points_ratio": "1.25",
+                "Mapper.ba_local_max_refinements": "2",
                 "Mapper.ba_global_max_refinements": "4",
                 "Mapper.ba_global_max_num_iterations": "17",
                 "Mapper.min_num_matches": "15",
@@ -1402,6 +1405,7 @@ class ColmapCliTests(unittest.TestCase):
         mapper = calls[0]["options"]
         self.assertEqual(mapper.ba_global_frames_ratio, 1.4)
         self.assertEqual(mapper.ba_global_points_ratio, 1.25)
+        self.assertEqual(mapper.ba_local_max_refinements, 2)
         self.assertEqual(mapper.ba_global_max_refinements, 4)
         self.assertEqual(mapper.ba_global_max_num_iterations, 17)
         self.assertEqual(mapper.min_num_matches, 15)
@@ -1426,6 +1430,7 @@ class ColmapCliTests(unittest.TestCase):
         for name in (
             "Mapper.ba_global_frames_ratio",
             "Mapper.ba_global_points_ratio",
+            "Mapper.ba_local_max_refinements",
             "Mapper.ba_global_max_refinements",
             "Mapper.ba_global_max_num_iterations",
             "Mapper.min_num_matches",
@@ -1455,6 +1460,7 @@ class ColmapCliTests(unittest.TestCase):
         options = calls[0]["options"]
         self.assertEqual(options.ba_global_frames_ratio, 1.1)
         self.assertEqual(options.ba_global_points_ratio, 1.1)
+        self.assertEqual(options.ba_local_max_refinements, 2)
         self.assertEqual(options.ba_global_max_refinements, 5)
         self.assertEqual(options.ba_global_max_num_iterations, 50)
         self.assertEqual(options.min_num_matches, 15)
@@ -1474,6 +1480,7 @@ class ColmapCliTests(unittest.TestCase):
         cases = {
             "Mapper.ba_global_frames_ratio": ("1", "nan", "inf", "-inf"),
             "Mapper.ba_global_points_ratio": ("0.99", "nan", "infinity"),
+            "Mapper.ba_local_max_refinements": ("0", "-1", "1.5"),
             "Mapper.ba_global_max_refinements": ("0", "-1", "1.5"),
             "Mapper.ba_global_max_num_iterations": ("0", "-1", "1.5"),
             "Mapper.min_num_matches": ("0", "-1", "1.5"),

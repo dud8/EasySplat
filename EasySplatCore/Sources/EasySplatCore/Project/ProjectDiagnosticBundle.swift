@@ -15,7 +15,7 @@ public enum ProjectDiagnosticBundle {
     /// Schema version embedded in the machine-readable JSON block. Bump
     /// when adding/removing/renaming top-level keys so downstream tools can
     /// detect a format change.
-    public static let machineReadableSchemaVersion = 6
+    public static let machineReadableSchemaVersion = 7
 
     /// Scrub a user-visible technical payload before it reaches a clipboard,
     /// save panel, or share surface. Project identity is included when the
@@ -180,6 +180,14 @@ public enum ProjectDiagnosticBundle {
                 "Accepted refinement: \(refinementName) "
                     + "(\(mapping.acceptedRefinementInvocationCount) \(invocationLabel))"
             )
+            if let cadence = mapping.incrementalCadence {
+                lines.append(
+                    "Bundle adjustment: local \(cadence.localMaxRefinements), "
+                        + "global \(String(format: "%.1f", cadence.globalFramesRatio))× frames / "
+                        + "\(String(format: "%.1f", cadence.globalPointsRatio))× points, "
+                        + "up to \(cadence.globalMaxRefinements) refinements"
+                )
+            }
             if let fallbackReason = mapping.fallbackReason {
                 lines.append("Mapping fallback: \(sanitizer.sanitize(fallbackReason))")
             }
@@ -261,6 +269,7 @@ public enum ProjectDiagnosticBundle {
             var attemptCount: Int
             var acceptedRefinementKind: String
             var acceptedRefinementInvocationCount: Int
+            var incrementalCadence: IncrementalMappingCadenceArtifact?
             var fallbackReason: String?
 
             init(_ mapping: MappingArtifact) {
@@ -271,6 +280,7 @@ public enum ProjectDiagnosticBundle {
                 attemptCount = mapping.attemptCount
                 acceptedRefinementKind = mapping.acceptedRefinementKind.rawValue
                 acceptedRefinementInvocationCount = mapping.acceptedRefinementInvocationCount
+                incrementalCadence = mapping.incrementalCadence
                 fallbackReason = mapping.fallbackReason
             }
         }

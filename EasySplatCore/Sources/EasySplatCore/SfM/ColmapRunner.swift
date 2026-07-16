@@ -46,6 +46,7 @@ enum ColmapMappingPolicy {
 public struct ColmapMapperOptions: Sendable, Equatable {
     public let globalFramesRatio: Double
     public let globalPointsRatio: Double
+    public let localMaxRefinements: Int
     public let globalMaxRefinements: Int
     public let globalMaxNumIterations: Int
     public let randomSeed: Int32
@@ -54,6 +55,7 @@ public struct ColmapMapperOptions: Sendable, Equatable {
     public init(
         globalFramesRatio: Double,
         globalPointsRatio: Double,
+        localMaxRefinements: Int,
         globalMaxRefinements: Int,
         globalMaxNumIterations: Int,
         randomSeed: UInt64,
@@ -64,6 +66,9 @@ public struct ColmapMapperOptions: Sendable, Equatable {
         }
         guard globalPointsRatio.isFinite, globalPointsRatio > 1 else {
             throw ColmapMapperOptionsValidationError.invalidRatio("Global point ratio")
+        }
+        guard localMaxRefinements > 0 else {
+            throw ColmapMapperOptionsValidationError.nonPositiveValue("Local refinement limit")
         }
         guard globalMaxRefinements > 0 else {
             throw ColmapMapperOptionsValidationError.nonPositiveValue("Global refinement limit")
@@ -77,6 +82,7 @@ public struct ColmapMapperOptions: Sendable, Equatable {
 
         self.globalFramesRatio = globalFramesRatio
         self.globalPointsRatio = globalPointsRatio
+        self.localMaxRefinements = localMaxRefinements
         self.globalMaxRefinements = globalMaxRefinements
         self.globalMaxNumIterations = globalMaxNumIterations
         self.randomSeed = randomSeed
@@ -395,6 +401,7 @@ public final class ColmapRunner {
             "--output_path", outputPath.path,
             "--Mapper.ba_global_frames_ratio", "\(mapperOptions.globalFramesRatio)",
             "--Mapper.ba_global_points_ratio", "\(mapperOptions.globalPointsRatio)",
+            "--Mapper.ba_local_max_refinements", "\(mapperOptions.localMaxRefinements)",
             "--Mapper.ba_global_max_refinements", "\(mapperOptions.globalMaxRefinements)",
             "--Mapper.ba_global_max_num_iterations", "\(mapperOptions.globalMaxNumIterations)",
             "--Mapper.random_seed", "\(mapperOptions.randomSeed)",

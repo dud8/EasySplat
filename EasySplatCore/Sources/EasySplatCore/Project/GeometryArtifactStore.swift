@@ -493,14 +493,23 @@ enum GeometryArtifactStore {
 
         switch artifact.acceptedRefinementKind {
         case .incrementalGlobal:
-            guard !hasLearnedProvenance, pairGraphStatus == .measured else {
+            guard !hasLearnedProvenance,
+                  pairGraphStatus == .measured,
+                  let cadence = artifact.incrementalCadence,
+                  cadence.localMaxRefinements > 0,
+                  cadence.globalFramesRatio.isFinite,
+                  cadence.globalFramesRatio > 1,
+                  cadence.globalPointsRatio.isFinite,
+                  cadence.globalPointsRatio > 1,
+                  cadence.globalMaxRefinements > 0 else {
                 throw Error.invalidMapping
             }
         case .seededBundleAdjustment:
             guard hasLearnedProvenance,
                   pairGraphStatus == .notEvaluated,
                   artifact.modelCount == 1,
-                  artifact.acceptedRefinementInvocationCount == 1 else {
+                  artifact.acceptedRefinementInvocationCount == 1,
+                  artifact.incrementalCadence == nil else {
                 throw Error.invalidMapping
             }
         }

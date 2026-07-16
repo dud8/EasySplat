@@ -197,6 +197,7 @@ public enum RunPlanResolver {
             || previousPlan.inputOrdering != currentPlan.inputOrdering
         let matchingOrMappingPolicyChanged = previousPlan.baGlobalFramesRatio != currentPlan.baGlobalFramesRatio
             || previousPlan.baGlobalPointsRatio != currentPlan.baGlobalPointsRatio
+            || previousPlan.baLocalMaxRefinements != currentPlan.baLocalMaxRefinements
             || previousPlan.baGlobalMaxRefinements != currentPlan.baGlobalMaxRefinements
             || previousPlan.deterministicSeed != currentPlan.deterministicSeed
             || previousPlan.pairingPolicy != currentPlan.pairingPolicy
@@ -333,6 +334,7 @@ public enum RunPlanResolver {
             normalDescriptorMatcher: .faiss,
             baGlobalFramesRatio: baGlobalRatio,
             baGlobalPointsRatio: baGlobalRatio,
+            baLocalMaxRefinements: 2,
             baGlobalMaxRefinements: 5,
             deterministicSeed: UInt64(max(0, developmentOverrides.benchmarkSeed ?? 42))
         )

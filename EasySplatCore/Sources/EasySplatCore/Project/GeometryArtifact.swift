@@ -210,6 +210,25 @@ public enum MappingRefinementKind: String, Codable, Sendable, Equatable {
     case seededBundleAdjustment
 }
 
+public struct IncrementalMappingCadenceArtifact: Codable, Sendable, Equatable {
+    public var localMaxRefinements: Int
+    public var globalFramesRatio: Double
+    public var globalPointsRatio: Double
+    public var globalMaxRefinements: Int
+
+    public init(
+        localMaxRefinements: Int,
+        globalFramesRatio: Double,
+        globalPointsRatio: Double,
+        globalMaxRefinements: Int
+    ) {
+        self.localMaxRefinements = localMaxRefinements
+        self.globalFramesRatio = globalFramesRatio
+        self.globalPointsRatio = globalPointsRatio
+        self.globalMaxRefinements = globalMaxRefinements
+    }
+}
+
 public struct MappingArtifact: Codable, Sendable, Equatable {
     public var modelCount: Int
     public var largestModelRegisteredViewCount: Int
@@ -219,6 +238,7 @@ public struct MappingArtifact: Codable, Sendable, Equatable {
     public var acceptedRefinementKind: MappingRefinementKind
     /// Observed global-refinement invocations from the accepted mapping attempt.
     public var acceptedRefinementInvocationCount: Int
+    public var incrementalCadence: IncrementalMappingCadenceArtifact?
     public var fallbackReason: String?
 
     public init(
@@ -229,6 +249,7 @@ public struct MappingArtifact: Codable, Sendable, Equatable {
         attemptCount: Int,
         acceptedRefinementKind: MappingRefinementKind,
         acceptedRefinementInvocationCount: Int,
+        incrementalCadence: IncrementalMappingCadenceArtifact?,
         fallbackReason: String?
     ) {
         self.modelCount = modelCount
@@ -238,6 +259,7 @@ public struct MappingArtifact: Codable, Sendable, Equatable {
         self.attemptCount = attemptCount
         self.acceptedRefinementKind = acceptedRefinementKind
         self.acceptedRefinementInvocationCount = acceptedRefinementInvocationCount
+        self.incrementalCadence = incrementalCadence
         self.fallbackReason = fallbackReason
     }
 }
@@ -368,7 +390,7 @@ public struct CanonicalOrientationArtifact: Codable, Sendable, Equatable {
 }
 
 public struct GeometryArtifact: Codable, Sendable, Equatable {
-    public static let currentSchemaVersion = 8
+    public static let currentSchemaVersion = 9
 
     public var schemaVersion: Int
     public var solverVersion: String

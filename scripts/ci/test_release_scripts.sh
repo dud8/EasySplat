@@ -1698,6 +1698,7 @@ grep -Fq 'unexpected COLMAP runtime self-check' "$ROOT/scripts/toolchain/package
 grep -q 'colmap" local_vocab_retriever -h' "$ROOT/scripts/toolchain/package_toolchain.sh"
 grep -q 'colmap" image_undistorter -h' "$ROOT/scripts/toolchain/package_toolchain.sh"
 grep -Fq 'Mapper.ba_global_frames_ratio' "$ROOT/scripts/toolchain/package_toolchain.sh"
+grep -Fq 'Mapper.ba_local_max_refinements' "$ROOT/scripts/toolchain/package_toolchain.sh"
 grep -Fq 'Mapper.ba_global_points_ratio' "$ROOT/scripts/toolchain/package_toolchain.sh"
 grep -Fq 'Mapper.ba_global_max_refinements' "$ROOT/scripts/toolchain/package_toolchain.sh"
 grep -Fq 'Mapper.random_seed' "$ROOT/scripts/toolchain/package_toolchain.sh"

@@ -64,6 +64,7 @@ final class RunPlanResolverTests: XCTestCase {
         XCTAssertEqual(plan.colmapThreadLimit, 8)
         XCTAssertEqual(plan.baGlobalFramesRatio, 1.1)
         XCTAssertEqual(plan.baGlobalPointsRatio, 1.1)
+        XCTAssertEqual(plan.baLocalMaxRefinements, 2)
         XCTAssertEqual(plan.baGlobalMaxRefinements, 5)
         XCTAssertEqual(plan.deterministicSeed, 42)
         XCTAssertEqual(
@@ -102,6 +103,7 @@ final class RunPlanResolverTests: XCTestCase {
 
             XCTAssertEqual(plan.baGlobalFramesRatio, 1.4, "capture path: \(capturePath)")
             XCTAssertEqual(plan.baGlobalPointsRatio, 1.4, "capture path: \(capturePath)")
+            XCTAssertEqual(plan.baLocalMaxRefinements, 2, "capture path: \(capturePath)")
             XCTAssertEqual(plan.baGlobalMaxRefinements, 5, "capture path: \(capturePath)")
         }
     }
@@ -556,6 +558,15 @@ final class RunPlanResolverTests: XCTestCase {
                 .unknownRouteIdentifier("geometry.unknown")
             )
         }
+
+        corrupt = plan
+        corrupt.baLocalMaxRefinements = 0
+        XCTAssertThrowsError(try corrupt.toolchainCapabilityRequest()) { error in
+            XCTAssertEqual(
+                error as? ResolvedRunPlanValidationError,
+                .invalidBundleAdjustmentConfiguration
+            )
+        }
     }
 
     func testResolvedPlanPersistsBeforeImportProcessCompletes() async throws {
@@ -919,6 +930,18 @@ final class RunPlanResolverTests: XCTestCase {
 
         mappingPolicyPlan = currentVideoPlan
         mappingPolicyPlan.baGlobalPointsRatio = 1.5
+        XCTAssertEqual(
+            RunPlanResolver.safeResumeStage(
+                .exportSplat,
+                input: video,
+                previousPlan: currentVideoPlan,
+                currentPlan: mappingPolicyPlan
+            ),
+            .sfmFeatures
+        )
+
+        mappingPolicyPlan = currentVideoPlan
+        mappingPolicyPlan.baLocalMaxRefinements = 1
         XCTAssertEqual(
             RunPlanResolver.safeResumeStage(
                 .exportSplat,

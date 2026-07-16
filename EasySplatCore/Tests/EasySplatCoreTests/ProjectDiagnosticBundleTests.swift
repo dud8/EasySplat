@@ -499,6 +499,12 @@ final class ProjectDiagnosticBundleTests: XCTestCase {
             attemptCount: 3,
             acceptedRefinementKind: .incrementalGlobal,
             acceptedRefinementInvocationCount: 4,
+            incrementalCadence: IncrementalMappingCadenceArtifact(
+                localMaxRefinements: 2,
+                globalFramesRatio: 1.4,
+                globalPointsRatio: 1.4,
+                globalMaxRefinements: 5
+            ),
             fallbackReason: "Retry for Private Site at \(NSHomeDirectory())/private/input.mov"
         )
         try ProjectMetadataStore.save(
@@ -523,6 +529,7 @@ final class ProjectDiagnosticBundleTests: XCTestCase {
         XCTAssertTrue(bundle.contains("Union registered: 20"))
         XCTAssertTrue(bundle.contains("Mapping attempts: 3"))
         XCTAssertTrue(bundle.contains("Accepted refinement: Incremental global (4 invocations)"))
+        XCTAssertTrue(bundle.contains("Bundle adjustment: local 2, global 1.4× frames / 1.4× points, up to 5 refinements"))
         XCTAssertTrue(bundle.contains("Mapping fallback: Retry for <redacted> at ~/private/input.mov"))
         XCTAssertFalse(bundle.contains("Private Site"))
         XCTAssertFalse(bundle.contains(NSHomeDirectory()))
@@ -540,6 +547,11 @@ final class ProjectDiagnosticBundleTests: XCTestCase {
         XCTAssertEqual(mapping["attemptCount"] as? Int, 3)
         XCTAssertEqual(mapping["acceptedRefinementKind"] as? String, "incrementalGlobal")
         XCTAssertEqual(mapping["acceptedRefinementInvocationCount"] as? Int, 4)
+        let cadence = try XCTUnwrap(mapping["incrementalCadence"] as? [String: Any])
+        XCTAssertEqual(cadence["localMaxRefinements"] as? Int, 2)
+        XCTAssertEqual(cadence["globalFramesRatio"] as? Double, 1.4)
+        XCTAssertEqual(cadence["globalPointsRatio"] as? Double, 1.4)
+        XCTAssertEqual(cadence["globalMaxRefinements"] as? Int, 5)
         XCTAssertEqual(
             mapping["fallbackReason"] as? String,
             "Retry for <redacted> at ~/private/input.mov"
@@ -552,6 +564,7 @@ final class ProjectDiagnosticBundleTests: XCTestCase {
             "attemptCount",
             "acceptedRefinementKind",
             "acceptedRefinementInvocationCount",
+            "incrementalCadence",
             "fallbackReason",
         ])
     }

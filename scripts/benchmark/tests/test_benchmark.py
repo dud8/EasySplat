@@ -1487,6 +1487,12 @@ def write_orientation_evidence_artifacts(
                         "acceptedRefinementInvocationCount": 1,
                         "acceptedRefinementKind": "incrementalGlobal",
                         "attemptCount": 1,
+                        "incrementalCadence": {
+                            "globalFramesRatio": 1.4,
+                            "globalMaxRefinements": 5,
+                            "globalPointsRatio": 1.4,
+                            "localMaxRefinements": 2,
+                        },
                         "largestModelRegisteredViewCount": 30,
                         "modelCount": 1,
                         "secondLargestModelRegisteredViewCount": 0,
@@ -1494,7 +1500,7 @@ def write_orientation_evidence_artifacts(
                     },
                     "poseConvention": "world-to-camera",
                     "quaternionOrder": "wxyz",
-                    "schemaVersion": 8,
+                    "schemaVersion": 9,
                 }
             )
             + b"\n"
@@ -5381,12 +5387,18 @@ class RunnerIntegrityTests(unittest.TestCase):
                             "acceptedRefinementInvocationCount": 1,
                             "acceptedRefinementKind": "incrementalGlobal",
                             "attemptCount": 1,
+                            "incrementalCadence": {
+                                "globalFramesRatio": 1.4,
+                                "globalMaxRefinements": 5,
+                                "globalPointsRatio": 1.4,
+                                "localMaxRefinements": 2,
+                            },
                             "largestModelRegisteredViewCount": 30,
                             "modelCount": 1,
                             "secondLargestModelRegisteredViewCount": 0,
                             "unionRegisteredViewCount": 30,
                         },
-                        "schemaVersion": 8,
+                        "schemaVersion": 9,
                     }
                 )
                 + b"\n"
