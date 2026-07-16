@@ -145,6 +145,51 @@ void testSubpixelOffscreenAndInvalidInputs() {
             "non-finite conics must conservatively survive");
 }
 
+void testIllConditionedConicKeepsBroadBounds() {
+    const float adjacentToOne = std::nextafter(1.0f, 0.0f);
+    const Conic<float> conic {1.0f, adjacentToOne, 1.0f};
+    const Conic<double> conic64 {conic.a, conic.b, conic.c};
+    const float powerLimit = 0.0114841f;
+    const auto span = culling::ellipseTileRowSpan(
+        conic, -100.0f, 100.0f, 0, 256, 256, powerLimit, 0, 16
+    );
+
+    require(span.has_value() && span->begin == 0 && span->end == 16,
+            "ill-conditioned conic must keep its broad row bounds");
+    require(rasterHasContributingPixel(
+                conic64, -100.0, 100.0, Rect<int> {0, 0, 15, 15}, powerLimit),
+            "ill-conditioned regression must contain a raster contribution");
+
+    const Conic<float> moderate {
+        0x1.b319p-1f, 0x1.68c8eep-1f, 0x1.2b3228p-1f
+    };
+    const float moderateMeanX = 0x1.b7ed48p+6f;
+    const float moderateMeanY = 0x1.46b058p+8f;
+    const float moderatePowerLimit = 0x1.ba227ep-1f;
+    const auto moderateSpan = culling::ellipseTileRowSpan(
+        moderate, moderateMeanX, moderateMeanY, 9, 256, 256,
+        moderatePowerLimit, 0, 16
+    );
+    const float acceptedPower = culling::powerAt(
+        moderate, 249.0f - moderateMeanX, 159.0f - moderateMeanY
+    );
+    require(acceptedPower >= 0.0f && acceptedPower <= moderatePowerLimit,
+            "moderate-condition regression pixel must pass production raster math");
+    require(moderateSpan.has_value() && moderateSpan->begin <= 15 &&
+                moderateSpan->end > 15,
+            "determinant lower bound must preserve a tangent raster pixel");
+
+    const Conic<float> extreme {
+        1.89509e-22f, 2.32107e-22f, 4.79807e-22f
+    };
+    const auto extremeSpan = culling::ellipseTileRowSpan(
+        extreme, 163.512f, 253.243f, 6, 256, 256, 3.13212f, 0, 16
+    );
+    require(extremeSpan.has_value() && extremeSpan->begin == 0 &&
+                extremeSpan->end == 16,
+            "finite out-of-range roots must clamp before integer conversion");
+}
+
 void testRandomProperties() {
     std::mt19937 rng(0x5A17u);
     std::uniform_real_distribution<float> center(-48.0f, 176.0f);
@@ -207,12 +252,13 @@ void testRowSpanProperties() {
     std::mt19937 rng(0xACC0711Eu);
     std::uniform_real_distribution<float> center(-48.0f, 176.0f);
     std::uniform_real_distribution<float> angle(-3.14159265f, 3.14159265f);
-    std::uniform_real_distribution<float> logEigen(-4.0f, 2.0f);
+    std::uniform_real_distribution<float> logEigen(-12.0f, 4.0f);
     std::uniform_real_distribution<float> powerLimit(0.0f, 5.55f);
     std::uniform_int_distribution<int> rowIndex(0, 7);
 
     std::uint64_t exactTiles = 0;
     std::uint64_t spanTiles = 0;
+    std::uint64_t rasterContributions = 0;
     for (int sample = 0; sample < 200000; ++sample) {
         const float theta = angle(rng);
         const float cs = std::cos(theta);
@@ -231,6 +277,20 @@ void testRowSpanProperties() {
         const auto span = culling::ellipseTileRowSpan(
             conic, meanX, meanY, row, 128, 128, limit, 0, 8
         );
+
+        const int sampledX = sample % 128;
+        const int sampledY = row * 16 + (sample / 128) % 16;
+        const double sampledPower = powerAt(
+            Conic<double> {conic.a, conic.b, conic.c},
+            meanX, meanY, sampledX, sampledY
+        );
+        if (sampledPower >= 0.0 && sampledPower <= limit) {
+            ++rasterContributions;
+            require(span.has_value() && sampledX / 16 >= span->begin &&
+                        sampledX / 16 < span->end,
+                    "row span dropped a sampled raster contribution at sample " +
+                        std::to_string(sample));
+        }
 
         for (int column = 0; column < 8; ++column) {
             const bool exact = culling::ellipseIntersectsPixelTile(
@@ -254,6 +314,8 @@ void testRowSpanProperties() {
     }
     require(spanTiles <= exactTiles * 1.08 + 64,
             "row span admitted excessive false positives");
+    require(rasterContributions >= 100,
+            "wide-condition row property did not exercise enough raster contributions");
 }
 
 } // namespace
@@ -264,6 +326,7 @@ int main() {
         testThreeSigmaCapIsNotRasterExact();
         testBoundariesAndTangency();
         testSubpixelOffscreenAndInvalidInputs();
+        testIllConditionedConicKeepsBroadBounds();
         testRandomProperties();
         testRowSpanProperties();
         std::cout << "tile_culling_tests: PASS\n";

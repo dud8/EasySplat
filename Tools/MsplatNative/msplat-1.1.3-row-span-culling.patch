@@ -10,12 +10,10 @@
  void msplat_set_raster_memory_budget_for_testing(uint64_t budget_bytes);
 --- a/core/metal/msplat_metal.metal
 +++ b/core/metal/msplat_metal.metal
-@@ -84,6 +84,101 @@
-         pix_radius.x / (float)BLOCK_X, pix_radius.y / (float)BLOCK_Y
-     };
+@@ -86,6 +86,143 @@
      get_bbox(tile_center, tile_radius, tile_bounds, tile_min, tile_max);
-+}
-+
+ }
+ 
 +inline bool opacity_power_limit(const float raw_opacity, thread float &power_limit) {
 +    if (!isfinite(raw_opacity)) {
 +        return false;
@@ -48,9 +46,20 @@
 +        return false;
 +    }
 +    const float determinant = fma(conic.x, conic.z, -conic.y * conic.y);
++    const float determinant_scale = max(
++        max(abs(conic.x * conic.z), conic.y * conic.y),
++        FLT_MIN
++    );
++    const float determinant_error =
++        8.0f * FLT_EPSILON * determinant_scale;
++    const float determinant_lower = nextafter(
++        determinant - determinant_error,
++        -INFINITY
++    );
 +    if (!isfinite(conic.x) || !isfinite(conic.y) || !isfinite(conic.z) ||
 +        !isfinite(mean.x) || !isfinite(mean.y) || !isfinite(power_limit) ||
-+        !(conic.x > 0.0f) || !(conic.z > 0.0f) || !(determinant > 0.0f)) {
++        !isfinite(determinant_scale) || !(conic.x > 0.0f) ||
++        !(conic.z > 0.0f) || !(determinant_lower > 0.0f)) {
 +        span_begin = broad_begin;
 +        span_end = broad_end;
 +        return true;
@@ -64,7 +73,12 @@
 +    const float support_guard = 128.0f * FLT_EPSILON *
 +        (1.0f + 2.0f * abs(power_limit));
 +    const float q = 2.0f * (power_limit + support_guard);
-+    const float y_radius = sqrt(max(0.0f, q * conic.x / determinant));
++    const float y_radius = sqrt(max(0.0f, q * conic.x / determinant_lower));
++    if (!isfinite(y_radius)) {
++        span_begin = broad_begin;
++        span_end = broad_end;
++        return true;
++    }
 +    const float feasible_min_y = max(float(pixel_min_y) - mean.y, -y_radius);
 +    const float feasible_max_y = min(float(pixel_max_y) - mean.y, y_radius);
 +    if (feasible_min_y > feasible_max_y) {
@@ -72,9 +86,9 @@
 +    }
 +
 +    const float lower_radicand = max(
-+        0.0f, fma(-determinant, feasible_min_y * feasible_min_y, conic.x * q));
++        0.0f, fma(-determinant_lower, feasible_min_y * feasible_min_y, conic.x * q));
 +    const float upper_radicand = max(
-+        0.0f, fma(-determinant, feasible_max_y * feasible_max_y, conic.x * q));
++        0.0f, fma(-determinant_lower, feasible_max_y * feasible_max_y, conic.x * q));
 +    const float lower_center = -conic.y * feasible_min_y / conic.x;
 +    const float upper_center = -conic.y * feasible_max_y / conic.x;
 +    const float lower_half_width = sqrt(lower_radicand) / conic.x;
@@ -88,7 +102,14 @@
 +        upper_center + upper_half_width
 +    );
 +
-+    const float x_radius = sqrt(max(0.0f, q * conic.z / determinant));
++    const float x_radius = sqrt(max(0.0f, q * conic.z / determinant_lower));
++    if (!isfinite(lower_center) || !isfinite(upper_center) ||
++        !isfinite(lower_half_width) || !isfinite(upper_half_width) ||
++        !isfinite(x_radius)) {
++        span_begin = broad_begin;
++        span_end = broad_end;
++        return true;
++    }
 +    const float minimum_critical_y = conic.y * x_radius / conic.z;
 +    if (minimum_critical_y >= feasible_min_y &&
 +        minimum_critical_y <= feasible_max_y) {
@@ -104,18 +125,40 @@
 +    maximum_x += mean.x;
 +    const float pixel_guard = 64.0f * FLT_EPSILON *
 +        (1.0f + abs(mean.x) + abs(minimum_x) + abs(maximum_x));
-+    const int lower = int(floor((minimum_x - pixel_guard) / float(BLOCK_X)));
-+    const int upper = int(floor((maximum_x + pixel_guard) / float(BLOCK_X))) + 1;
-+    span_begin = uint(clamp(lower, int(broad_begin), int(broad_end)));
-+    span_end = uint(clamp(upper, int(broad_begin), int(broad_end)));
++    if (!isfinite(minimum_x) || !isfinite(maximum_x) ||
++        !isfinite(pixel_guard)) {
++        span_begin = broad_begin;
++        span_end = broad_end;
++        return true;
++    }
++    const float lower_tile = floor(
++        (minimum_x - pixel_guard) / float(BLOCK_X)
++    );
++    const float upper_tile = floor(
++        (maximum_x + pixel_guard) / float(BLOCK_X)
++    ) + 1.0f;
++    if (!isfinite(lower_tile) || !isfinite(upper_tile)) {
++        span_begin = broad_begin;
++        span_end = broad_end;
++        return true;
++    }
++    span_begin = uint(clamp(
++        lower_tile, float(broad_begin), float(broad_end)
++    ));
++    span_end = uint(clamp(
++        upper_tile, float(broad_begin), float(broad_end)
++    ));
 +    return span_begin < span_end;
- }
- 
++}
++
  // Affine transform: mat (row-major 4x3) applied to point p.
-@@ -951,6 +1046,60 @@
+ inline float3 transform_4x3(constant float *mat, const float3 p) {
+     float3 out = {
+@@ -950,7 +1087,61 @@
+     if (!exact_raster_enabled(overflow_flag, raster_stats) || idx >= num_tiles) return;
      write_packed_int2(tile_bins, idx, int2(0));
  }
- 
++
 +kernel void count_exact_tile_intersections_kernel(
 +    constant uint& num_points [[buffer(0)]],
 +    constant float* xys [[buffer(1)]],
@@ -139,7 +182,7 @@
 +        num_tiles_hit[idx] = 0;
 +        return;
 +    }
-+
+ 
 +    const float2 center = read_packed_float2(xys, idx);
 +    uint2 tile_min, tile_max;
 +    get_tile_bbox(
@@ -173,7 +216,7 @@
  // Build full (tile_id, IEEE-754 depth) pairs for each gaussian-tile intersection.
  kernel void map_gaussian_to_intersects_kernel(
      constant int& num_points,
-@@ -965,6 +1114,10 @@
+@@ -965,6 +1156,10 @@
      constant float* aabb, // float2: per-axis pixel extents
      device atomic_uint* overflow_flag,
      device atomic_uint* raster_stats,
@@ -184,7 +227,7 @@
      uint3 gp [[thread_position_in_grid]]
  ) {
      if (!exact_raster_enabled(overflow_flag, raster_stats)) return;
-@@ -978,10 +1131,29 @@
+@@ -978,10 +1173,29 @@
      float2 center = read_packed_float2(xys, idx);
      get_tile_bbox(center, read_packed_float2(aabb, idx), (int3)tile_bounds, tile_min, tile_max);
  
@@ -216,7 +259,7 @@
              if (cur_idx >= (uint64_t)capacity) {
                  atomic_store_explicit(&raster_stats[3], 1u, memory_order_relaxed);
                  return;
-@@ -2202,6 +2374,10 @@
+@@ -2202,6 +2416,10 @@
      device atomic_uint* scatter_counters    [[buffer(6)]],
      device uint64_t* prealloc_bins          [[buffer(7)]],
      device atomic_uint* overflow_flag       [[buffer(8)]],
@@ -227,11 +270,10 @@
      uint idx [[thread_position_in_grid]]
  ) {
      if (idx >= num_points) return;
-@@ -2210,11 +2386,30 @@
-     float2 center = read_packed_float2(xys, idx);
+@@ -2211,10 +2429,29 @@
      uint2 tile_min, tile_max;
      get_tile_bbox(center, read_packed_float2(aabb, idx), (int3)tile_bounds, tile_min, tile_max);
-+
+ 
 +    const uint tile_area =
 +        (tile_max.x - tile_min.x) * (tile_max.y - tile_min.y);
 +    const bool apply_tile_culling =
@@ -240,7 +282,7 @@
 +    const bool has_support = !apply_tile_culling ||
 +        opacity_power_limit(opacities[idx], power_limit);
 +    const float3 conic = read_packed_float3(conics, idx);
- 
++
      uint depth_bits = as_type<uint>(depths[idx]);
  
 +    if (!has_support) {

@@ -490,7 +490,7 @@ extension ToolchainManager {
             "stage_timing_patch_sha256": "41e7146c2047a7a93b45927d1ee40d1e310db9898c25ab892a27c158acff75dd",
             "memory_efficiency_patch_sha256": "bfacc105454e80102139f120dd6375037360c6a9763f1e1f708aa2a7f22eca6c",
             "densification_memory_patch_sha256": "b429540372d807f280929ebba1670257990bd36b28dfee5b42bc377ccef60ac7",
-            "row_span_culling_patch_sha256": "1147bb070a054f057fb8fa72b82263bfcf9398d31c9314ae51545f1b4e501050",
+            "row_span_culling_patch_sha256": "481c4c9a70f1da5eb1590b20a64e25a3c64bb3c19f14e27996ab9b25a119594d",
             "deployment_target": "macOS 15.0",
             "build_configuration": "Release",
         ]

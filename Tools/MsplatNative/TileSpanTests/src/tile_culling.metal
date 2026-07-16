@@ -114,9 +114,20 @@ inline bool ellipseTileRowSpan(
         return false;
     }
     const float determinant = fma(conic.x, conic.z, -conic.y * conic.y);
+    const float determinantScale = max(
+        max(abs(conic.x * conic.z), conic.y * conic.y),
+        FLT_MIN
+    );
+    const float determinantError =
+        8.0f * FLT_EPSILON * determinantScale;
+    const float determinantLower = nextafter(
+        determinant - determinantError,
+        -INFINITY
+    );
     if (!isfinite(conic.x) || !isfinite(conic.y) || !isfinite(conic.z) ||
         !isfinite(mean.x) || !isfinite(mean.y) || !isfinite(powerLimit) ||
-        !(conic.x > 0.0f) || !(conic.z > 0.0f) || !(determinant > 0.0f)) {
+        !isfinite(determinantScale) || !(conic.x > 0.0f) ||
+        !(conic.z > 0.0f) || !(determinantLower > 0.0f)) {
         spanBegin = broadBegin;
         spanEnd = broadEnd;
         return true;
@@ -130,7 +141,12 @@ inline bool ellipseTileRowSpan(
     const float supportGuard = 128.0f * FLT_EPSILON *
         (1.0f + 2.0f * abs(powerLimit));
     const float q = 2.0f * (powerLimit + supportGuard);
-    const float yRadius = sqrt(max(0.0f, q * conic.x / determinant));
+    const float yRadius = sqrt(max(0.0f, q * conic.x / determinantLower));
+    if (!isfinite(yRadius)) {
+        spanBegin = broadBegin;
+        spanEnd = broadEnd;
+        return true;
+    }
     const float feasibleMinY = max(float(pixelMinY) - mean.y, -yRadius);
     const float feasibleMaxY = min(float(pixelMaxY) - mean.y, yRadius);
     if (feasibleMinY > feasibleMaxY) {
@@ -138,9 +154,9 @@ inline bool ellipseTileRowSpan(
     }
 
     const float lowerRadicand = max(
-        0.0f, fma(-determinant, feasibleMinY * feasibleMinY, conic.x * q));
+        0.0f, fma(-determinantLower, feasibleMinY * feasibleMinY, conic.x * q));
     const float upperRadicand = max(
-        0.0f, fma(-determinant, feasibleMaxY * feasibleMaxY, conic.x * q));
+        0.0f, fma(-determinantLower, feasibleMaxY * feasibleMaxY, conic.x * q));
     const float lowerCenter = -conic.y * feasibleMinY / conic.x;
     const float upperCenter = -conic.y * feasibleMaxY / conic.x;
     const float lowerHalfWidth = sqrt(lowerRadicand) / conic.x;
@@ -150,7 +166,14 @@ inline bool ellipseTileRowSpan(
     float maximumX = max(lowerCenter + lowerHalfWidth,
                          upperCenter + upperHalfWidth);
 
-    const float xRadius = sqrt(max(0.0f, q * conic.z / determinant));
+    const float xRadius = sqrt(max(0.0f, q * conic.z / determinantLower));
+    if (!isfinite(lowerCenter) || !isfinite(upperCenter) ||
+        !isfinite(lowerHalfWidth) || !isfinite(upperHalfWidth) ||
+        !isfinite(xRadius)) {
+        spanBegin = broadBegin;
+        spanEnd = broadEnd;
+        return true;
+    }
     const float minimumCriticalY = conic.y * xRadius / conic.z;
     if (minimumCriticalY >= feasibleMinY && minimumCriticalY <= feasibleMaxY) {
         minimumX = -xRadius;
@@ -164,10 +187,21 @@ inline bool ellipseTileRowSpan(
     maximumX += mean.x;
     const float pixelGuard = 64.0f * FLT_EPSILON *
         (1.0f + abs(mean.x) + abs(minimumX) + abs(maximumX));
-    const int lower = int(floor((minimumX - pixelGuard) / 16.0f));
-    const int upper = int(floor((maximumX + pixelGuard) / 16.0f)) + 1;
-    spanBegin = uint(clamp(lower, int(broadBegin), int(broadEnd)));
-    spanEnd = uint(clamp(upper, int(broadBegin), int(broadEnd)));
+    if (!isfinite(minimumX) || !isfinite(maximumX) ||
+        !isfinite(pixelGuard)) {
+        spanBegin = broadBegin;
+        spanEnd = broadEnd;
+        return true;
+    }
+    const float lowerTile = floor((minimumX - pixelGuard) / 16.0f);
+    const float upperTile = floor((maximumX + pixelGuard) / 16.0f) + 1.0f;
+    if (!isfinite(lowerTile) || !isfinite(upperTile)) {
+        spanBegin = broadBegin;
+        spanEnd = broadEnd;
+        return true;
+    }
+    spanBegin = uint(clamp(lowerTile, float(broadBegin), float(broadEnd)));
+    spanEnd = uint(clamp(upperTile, float(broadBegin), float(broadEnd)));
     return spanBegin < spanEnd;
 }
 

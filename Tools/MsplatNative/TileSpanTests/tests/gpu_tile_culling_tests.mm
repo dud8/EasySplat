@@ -29,7 +29,7 @@ std::vector<culling::GPUCase> makeCases() {
     std::mt19937 rng(0xC011u);
     std::uniform_real_distribution<float> center(-128.0f, 384.0f);
     std::uniform_real_distribution<float> angle(-3.14159265f, 3.14159265f);
-    std::uniform_real_distribution<float> logEigen(-6.0f, 4.0f);
+    std::uniform_real_distribution<float> logEigen(-12.0f, 4.0f);
     std::uniform_real_distribution<float> limit(0.0f, 5.55f);
     std::uniform_int_distribution<int> tileIndex(0, 15);
 
@@ -56,12 +56,27 @@ std::vector<culling::GPUCase> makeCases() {
 }
 
 std::vector<culling::GPURowCase> makeRowCases() {
-    std::vector<culling::GPURowCase> cases;
-    cases.reserve(200000);
+    const float adjacentToOne = std::nextafter(1.0f, 0.0f);
+    std::vector<culling::GPURowCase> cases {
+        {
+            1.0f, adjacentToOne, 1.0f,
+            -100.0f, 100.0f, 0.0114841f, 0, 256, 256, 0, 16
+        },
+        {
+            0x1.b319p-1f, 0x1.68c8eep-1f, 0x1.2b3228p-1f,
+            0x1.b7ed48p+6f, 0x1.46b058p+8f, 0x1.ba227ep-1f,
+            9, 256, 256, 0, 16
+        },
+        {
+            1.89509e-22f, 2.32107e-22f, 4.79807e-22f,
+            163.512f, 253.243f, 3.13212f, 6, 256, 256, 0, 16
+        },
+    };
+    cases.reserve(200003);
     std::mt19937 rng(0x5A6B07u);
     std::uniform_real_distribution<float> center(-128.0f, 384.0f);
     std::uniform_real_distribution<float> angle(-3.14159265f, 3.14159265f);
-    std::uniform_real_distribution<float> logEigen(-6.0f, 4.0f);
+    std::uniform_real_distribution<float> logEigen(-12.0f, 4.0f);
     std::uniform_real_distribution<float> limit(0.0f, 5.55f);
     std::uniform_int_distribution<std::uint32_t> row(0, 15);
 
@@ -112,6 +127,15 @@ int main(int argc, char** argv) {
         const auto rowCases = makeRowCases();
         const auto rowActual = culling::evaluateRowSpansOnGPU(rowCases, argv[1]);
         require(rowActual.size() == rowCases.size(), "GPU row result count mismatch");
+        require(rowActual[0].included && rowActual[0].begin == 0 &&
+                    rowActual[0].end == 16,
+                "Metal must keep broad bounds for an ill-conditioned conic");
+        require(rowActual[1].included && rowActual[1].begin <= 15 &&
+                    rowActual[1].end > 15,
+                "Metal determinant lower bound dropped a tangent raster pixel");
+        require(rowActual[2].included && rowActual[2].begin == 0 &&
+                    rowActual[2].end == 16,
+                "Metal must clamp finite roots before integer conversion");
         std::uint64_t rowMismatchCount = 0;
         std::uint64_t rowFalseNegativeCount = 0;
         for (std::size_t index = 0; index < rowCases.size(); ++index) {
