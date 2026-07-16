@@ -15,6 +15,8 @@ EXACT_RASTER_PATCH="$ROOT/Tools/MsplatNative/msplat-1.1.3-exact-raster.patch"
 STAGE_TIMING_PATCH="$ROOT/Tools/MsplatNative/msplat-1.1.3-stage-timing.patch"
 MEMORY_EFFICIENCY_PATCH="$ROOT/Tools/MsplatNative/msplat-1.1.3-memory-efficiency.patch"
 DENSIFICATION_MEMORY_PATCH="$ROOT/Tools/MsplatNative/msplat-1.1.3-densification-memory.patch"
+ROW_SPAN_CULLING_PATCH="$ROOT/Tools/MsplatNative/msplat-1.1.3-row-span-culling.patch"
+TILE_SPAN_TEST_ROOT="$ROOT/Tools/MsplatNative/TileSpanTests"
 FIXTURE_GENERATOR="$ROOT/scripts/ci/generate_msplat_sparse_fixtures.py"
 VALIDATOR="$ROOT/scripts/toolchain/validate_native_msplat.sh"
 SWIFT_VALIDATOR="$ROOT/EasySplatCore/Sources/EasySplatCore/Tools/ToolchainManager+Validation.swift"
@@ -56,6 +58,16 @@ require_file "$EXACT_RASTER_PATCH"
 require_file "$STAGE_TIMING_PATCH"
 require_file "$MEMORY_EFFICIENCY_PATCH"
 require_file "$DENSIFICATION_MEMORY_PATCH"
+require_file "$ROW_SPAN_CULLING_PATCH"
+for source in \
+  "$TILE_SPAN_TEST_ROOT/include/tile_culling.hpp" \
+  "$TILE_SPAN_TEST_ROOT/include/gpu_tile_culling.hpp" \
+  "$TILE_SPAN_TEST_ROOT/src/tile_culling.metal" \
+  "$TILE_SPAN_TEST_ROOT/src/gpu_tile_culling.mm" \
+  "$TILE_SPAN_TEST_ROOT/tests/tile_culling_tests.cpp" \
+  "$TILE_SPAN_TEST_ROOT/tests/gpu_tile_culling_tests.mm"; do
+  require_file "$source"
+done
 require_file "$FIXTURE_GENERATOR"
 require_file "$VALIDATOR"
 require_file "$SWIFT_VALIDATOR"
@@ -130,6 +142,26 @@ require_contains '"densification_memory_patch_sha256": "b429540372d807f280929ebb
 require_contains 'ensureDensificationCompactScratch' "$DENSIFICATION_MEMORY_PATCH"
 require_contains 'densify_compact_scratch.reset()' "$DENSIFICATION_MEMORY_PATCH"
 require_contains 'densification scratch lifecycle passed' "$RASTER_TEST_SOURCE"
+require_contains 'ROW_SPAN_CULLING_PATCH_SHA256="1147bb070a054f057fb8fa72b82263bfcf9398d31c9314ae51545f1b4e501050"' "$BUILD_SCRIPT"
+require_contains '[ "$(sha256 "$ROW_SPAN_CULLING_PATCH")" = "$ROW_SPAN_CULLING_PATCH_SHA256" ]' "$BUILD_SCRIPT"
+require_contains 'git -C "$SOURCE_DIR" apply --check "$ROW_SPAN_CULLING_PATCH"' "$BUILD_SCRIPT"
+require_contains 'git -C "$SOURCE_DIR" apply "$ROW_SPAN_CULLING_PATCH"' "$BUILD_SCRIPT"
+require_contains 'row_span_culling_patch_sha256' "$BUILD_SCRIPT"
+require_contains '"row_span_culling_patch_sha256": "1147bb070a054f057fb8fa72b82263bfcf9398d31c9314ae51545f1b4e501050"' "$VALIDATOR"
+require_contains 'static constexpr uint32_t g_tile_culling_min_area_for_testing = 4' "$ROW_SPAN_CULLING_PATCH"
+require_contains 'power_limit = log(scaled_opacity)' "$ROW_SPAN_CULLING_PATCH"
+require_contains 'count_exact_tile_intersections_kernel' "$ROW_SPAN_CULLING_PATCH"
+require_contains 'ellipse_tile_row_span' "$ROW_SPAN_CULLING_PATCH"
+require_absent 'ellipse_intersects_pixel_tile' "$ROW_SPAN_CULLING_PATCH"
+require_absent 'min(4.5' "$ROW_SPAN_CULLING_PATCH"
+require_contains 'testThreeSigmaCapIsNotRasterExact' "$TILE_SPAN_TEST_ROOT/tests/tile_culling_tests.cpp"
+require_contains 'for (int sample = 0; sample < 200000; ++sample)' "$TILE_SPAN_TEST_ROOT/tests/tile_culling_tests.cpp"
+require_contains 'cases.reserve(200005)' "$TILE_SPAN_TEST_ROOT/tests/gpu_tile_culling_tests.mm"
+require_contains 'cases.reserve(200000)' "$TILE_SPAN_TEST_ROOT/tests/gpu_tile_culling_tests.mm"
+require_contains 'tile_span_cpu_tests' "$BUILD_SCRIPT"
+require_contains 'tile_span_metal_tests' "$BUILD_SCRIPT"
+require_contains 'tile_span_intersections baseline=' "$RASTER_TEST_SOURCE"
+require_contains 'msplat_set_tile_culling_min_area_for_testing' "$BUILD_SCRIPT"
 require_absent 'queryTimestampFrequency' "$STAGE_TIMING_PATCH"
 require_contains 'sampleTimestamps:&cpuTimestamp gpuTimestamp:&gpuTimestamp' "$STAGE_TIMING_PATCH"
 require_contains 'mach_timebase_info(&timebase)' "$STAGE_TIMING_PATCH"
@@ -156,6 +188,7 @@ for contract_file in "$SWIFT_VALIDATOR" "$SWIFT_FIXTURE"; do
   require_contains 'stage_timing_patch_sha256' "$contract_file"
   require_contains 'memory_efficiency_patch_sha256' "$contract_file"
   require_contains 'densification_memory_patch_sha256' "$contract_file"
+  require_contains 'row_span_culling_patch_sha256' "$contract_file"
   require_contains 'raster_test_sha256' "$contract_file"
   require_contains 'MSPLAT_BUILD_RASTER_TESTS=ON' "$contract_file"
 done
@@ -556,7 +589,7 @@ set -e
 [ ! -s "$negative_dir/truncated-ply.stdout" ] || fail "truncated PLY emitted a false success event"
 grep -qi 'payload' "$negative_dir/truncated-ply.stderr" || fail "truncated PLY diagnostic is not useful"
 
-for key in source_commit source_version source_url source_tree_sha256 overlay_sha256 raster_test_sha256 patch_sha256 checkpoint_patch_sha256 numeric_stability_patch_sha256 metal_safety_patch_sha256 exact_raster_patch_sha256 stage_timing_patch_sha256 memory_efficiency_patch_sha256 densification_memory_patch_sha256 executable_sha256 metallib_sha256 compiler deployment_target cmake_arguments build_timestamp; do
+for key in source_commit source_version source_url source_tree_sha256 overlay_sha256 raster_test_sha256 patch_sha256 checkpoint_patch_sha256 numeric_stability_patch_sha256 metal_safety_patch_sha256 exact_raster_patch_sha256 stage_timing_patch_sha256 memory_efficiency_patch_sha256 densification_memory_patch_sha256 row_span_culling_patch_sha256 executable_sha256 metallib_sha256 compiler deployment_target cmake_arguments build_timestamp; do
   require_contains "\"$key\"" "$BUILD_INFO"
 done
 overlay_hash="$(shasum -a 256 "$OVERLAY" | awk '{print $1}')"
@@ -566,10 +599,11 @@ exact_raster_patch_hash="$(shasum -a 256 "$EXACT_RASTER_PATCH" | awk '{print $1}
 stage_timing_patch_hash="$(shasum -a 256 "$STAGE_TIMING_PATCH" | awk '{print $1}')"
 memory_efficiency_patch_hash="$(shasum -a 256 "$MEMORY_EFFICIENCY_PATCH" | awk '{print $1}')"
 densification_memory_patch_hash="$(shasum -a 256 "$DENSIFICATION_MEMORY_PATCH" | awk '{print $1}')"
+row_span_culling_patch_hash="$(shasum -a 256 "$ROW_SPAN_CULLING_PATCH" | awk '{print $1}')"
 raster_test_hash="$(shasum -a 256 "$RASTER_TEST_SOURCE" | awk '{print $1}')"
 exe_hash="$(shasum -a 256 "$BIN" | awk '{print $1}')"
 metallib_hash="$(shasum -a 256 "$METALLIB" | awk '{print $1}')"
-python3 - "$BUILD_INFO" "$overlay_hash" "$numeric_stability_patch_hash" "$metal_safety_patch_hash" "$exact_raster_patch_hash" "$stage_timing_patch_hash" "$memory_efficiency_patch_hash" "$densification_memory_patch_hash" "$raster_test_hash" "$exe_hash" "$metallib_hash" <<'PY'
+python3 - "$BUILD_INFO" "$overlay_hash" "$numeric_stability_patch_hash" "$metal_safety_patch_hash" "$exact_raster_patch_hash" "$stage_timing_patch_hash" "$memory_efficiency_patch_hash" "$densification_memory_patch_hash" "$row_span_culling_patch_hash" "$raster_test_hash" "$exe_hash" "$metallib_hash" <<'PY'
 import json
 import sys
 
@@ -590,9 +624,10 @@ expected = {
     "stage_timing_patch_sha256": sys.argv[6],
     "memory_efficiency_patch_sha256": sys.argv[7],
     "densification_memory_patch_sha256": sys.argv[8],
-    "raster_test_sha256": sys.argv[9],
-    "executable_sha256": sys.argv[10],
-    "metallib_sha256": sys.argv[11],
+    "row_span_culling_patch_sha256": sys.argv[9],
+    "raster_test_sha256": sys.argv[10],
+    "executable_sha256": sys.argv[11],
+    "metallib_sha256": sys.argv[12],
 }
 for key, value in expected.items():
     if payload.get(key) != value:

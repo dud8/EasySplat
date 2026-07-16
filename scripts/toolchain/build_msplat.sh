@@ -29,6 +29,9 @@ MEMORY_EFFICIENCY_PATCH="$ROOT/Tools/MsplatNative/msplat-1.1.3-memory-efficiency
 MEMORY_EFFICIENCY_PATCH_SHA256="bfacc105454e80102139f120dd6375037360c6a9763f1e1f708aa2a7f22eca6c"
 DENSIFICATION_MEMORY_PATCH="$ROOT/Tools/MsplatNative/msplat-1.1.3-densification-memory.patch"
 DENSIFICATION_MEMORY_PATCH_SHA256="b429540372d807f280929ebba1670257990bd36b28dfee5b42bc377ccef60ac7"
+ROW_SPAN_CULLING_PATCH="$ROOT/Tools/MsplatNative/msplat-1.1.3-row-span-culling.patch"
+ROW_SPAN_CULLING_PATCH_SHA256="1147bb070a054f057fb8fa72b82263bfcf9398d31c9314ae51545f1b4e501050"
+TILE_SPAN_TEST_ROOT="$ROOT/Tools/MsplatNative/TileSpanTests"
 RASTER_TEST_FIXTURES="$BUILD_DIR/raster-test-fixtures"
 
 MSPLAT_REPO="https://github.com/rayanht/msplat.git"
@@ -77,6 +80,7 @@ reject_raster_test_symbols() {
     msplat_set_exact_execution_capacity_for_testing \
     msplat_set_exact_capacity_limit_for_testing \
     msplat_set_raster_memory_budget_for_testing \
+    msplat_set_tile_culling_min_area_for_testing \
     msplat_fail_next_sync_for_testing \
     msplat_pending_exact_raster_timing_handlers_for_testing \
     msplat_gpu_ticks_to_seconds_for_testing \
@@ -128,6 +132,18 @@ preflight() {
   [ -f "$DENSIFICATION_MEMORY_PATCH" ] || die "missing densification-memory patch: $DENSIFICATION_MEMORY_PATCH"
   [ "$(sha256 "$DENSIFICATION_MEMORY_PATCH")" = "$DENSIFICATION_MEMORY_PATCH_SHA256" ] \
     || die "densification-memory patch SHA-256 mismatch"
+  [ -f "$ROW_SPAN_CULLING_PATCH" ] || die "missing row-span culling patch: $ROW_SPAN_CULLING_PATCH"
+  [ "$(sha256 "$ROW_SPAN_CULLING_PATCH")" = "$ROW_SPAN_CULLING_PATCH_SHA256" ] \
+    || die "row-span culling patch SHA-256 mismatch"
+  for source in \
+    "$TILE_SPAN_TEST_ROOT/include/tile_culling.hpp" \
+    "$TILE_SPAN_TEST_ROOT/include/gpu_tile_culling.hpp" \
+    "$TILE_SPAN_TEST_ROOT/src/tile_culling.metal" \
+    "$TILE_SPAN_TEST_ROOT/src/gpu_tile_culling.mm" \
+    "$TILE_SPAN_TEST_ROOT/tests/tile_culling_tests.cpp" \
+    "$TILE_SPAN_TEST_ROOT/tests/gpu_tile_culling_tests.mm"; do
+    [ -f "$source" ] || die "missing tile-span property source: $source"
+  done
 }
 
 download_verified() {
@@ -216,6 +232,8 @@ prepare_source() {
   git -C "$SOURCE_DIR" apply "$MEMORY_EFFICIENCY_PATCH"
   git -C "$SOURCE_DIR" apply --check "$DENSIFICATION_MEMORY_PATCH"
   git -C "$SOURCE_DIR" apply "$DENSIFICATION_MEMORY_PATCH"
+  git -C "$SOURCE_DIR" apply --check "$ROW_SPAN_CULLING_PATCH"
+  git -C "$SOURCE_DIR" apply "$ROW_SPAN_CULLING_PATCH"
 }
 
 configure_and_build() {
@@ -231,6 +249,25 @@ configure_and_build() {
     -DFETCHCONTENT_SOURCE_DIR_NANOFLANN="$DEPS_DIR/nanoflann-1.5.5" \
     -DFETCHCONTENT_SOURCE_DIR_CLI11="$DEPS_DIR/CLI11-2.4.2"
   cmake --build "$NATIVE_BUILD_DIR" --target msplat metallib msplat_raster_tests
+  xcrun clang++ -std=c++20 -O2 \
+    -I"$TILE_SPAN_TEST_ROOT/include" \
+    "$TILE_SPAN_TEST_ROOT/tests/tile_culling_tests.cpp" \
+    -o "$NATIVE_BUILD_DIR/tile_span_cpu_tests"
+  xcrun -sdk macosx metal -std=metal3.1 \
+    -c "$TILE_SPAN_TEST_ROOT/src/tile_culling.metal" \
+    -o "$NATIVE_BUILD_DIR/tile_span_property.air"
+  xcrun -sdk macosx metallib \
+    "$NATIVE_BUILD_DIR/tile_span_property.air" \
+    -o "$NATIVE_BUILD_DIR/tile_span_property.metallib"
+  xcrun clang++ -std=c++20 -O2 -fobjc-arc \
+    -I"$TILE_SPAN_TEST_ROOT/include" \
+    "$TILE_SPAN_TEST_ROOT/tests/gpu_tile_culling_tests.mm" \
+    "$TILE_SPAN_TEST_ROOT/src/gpu_tile_culling.mm" \
+    -framework Foundation -framework Metal \
+    -o "$NATIVE_BUILD_DIR/tile_span_metal_tests"
+  "$NATIVE_BUILD_DIR/tile_span_cpu_tests"
+  "$NATIVE_BUILD_DIR/tile_span_metal_tests" \
+    "$NATIVE_BUILD_DIR/tile_span_property.metallib"
   rm -rf "$RASTER_TEST_FIXTURES"
   python3 "$FIXTURE_GENERATOR" --output "$RASTER_TEST_FIXTURES"
   "$NATIVE_BUILD_DIR/msplat_raster_tests" \
@@ -247,7 +284,7 @@ configure_and_build() {
 write_build_info() {
   local executable_sha256="$1"
   local metallib_sha256="$2"
-  local build_info compiler cmake_version ninja_version timestamp overlay_sha256 raster_test_sha256 patch_sha256 checkpoint_patch_sha256 numeric_stability_patch_sha256 metal_safety_patch_sha256 exact_raster_patch_sha256 stage_timing_patch_sha256 memory_efficiency_patch_sha256 densification_memory_patch_sha256
+  local build_info compiler cmake_version ninja_version timestamp overlay_sha256 raster_test_sha256 patch_sha256 checkpoint_patch_sha256 numeric_stability_patch_sha256 metal_safety_patch_sha256 exact_raster_patch_sha256 stage_timing_patch_sha256 memory_efficiency_patch_sha256 densification_memory_patch_sha256 row_span_culling_patch_sha256
   build_info="$STAGE_DIR/build_info.json"
   compiler="$(xcrun clang++ --version | head -n 1)"
   cmake_version="$(cmake --version | head -n 1)"
@@ -263,10 +300,11 @@ write_build_info() {
   stage_timing_patch_sha256="$(sha256 "$STAGE_TIMING_PATCH")"
   memory_efficiency_patch_sha256="$(sha256 "$MEMORY_EFFICIENCY_PATCH")"
   densification_memory_patch_sha256="$(sha256 "$DENSIFICATION_MEMORY_PATCH")"
+  row_span_culling_patch_sha256="$(sha256 "$ROW_SPAN_CULLING_PATCH")"
 
   python3 - "$build_info" \
     "$MSPLAT_REPO" "$MSPLAT_COMMIT" "$MSPLAT_VERSION" "$SOURCE_TREE_SHA256" \
-    "$overlay_sha256" "$raster_test_sha256" "$patch_sha256" "$checkpoint_patch_sha256" "$numeric_stability_patch_sha256" "$metal_safety_patch_sha256" "$exact_raster_patch_sha256" "$stage_timing_patch_sha256" "$memory_efficiency_patch_sha256" "$densification_memory_patch_sha256" \
+    "$overlay_sha256" "$raster_test_sha256" "$patch_sha256" "$checkpoint_patch_sha256" "$numeric_stability_patch_sha256" "$metal_safety_patch_sha256" "$exact_raster_patch_sha256" "$stage_timing_patch_sha256" "$memory_efficiency_patch_sha256" "$densification_memory_patch_sha256" "$row_span_culling_patch_sha256" \
     "$NLOHMANN_JSON_SHA256" "$NANOFLANN_SHA256" "$CLI11_SHA256" \
     "$executable_sha256" "$metallib_sha256" \
     "$compiler" "$cmake_version" "$ninja_version" "$timestamp" <<'PY'
@@ -289,6 +327,7 @@ import sys
     stage_timing_patch_sha256,
     memory_efficiency_patch_sha256,
     densification_memory_patch_sha256,
+    row_span_culling_patch_sha256,
     nlohmann_json_sha256,
     nanoflann_sha256,
     cli11_sha256,
@@ -316,6 +355,7 @@ payload = {
     "stage_timing_patch_sha256": stage_timing_patch_sha256,
     "memory_efficiency_patch_sha256": memory_efficiency_patch_sha256,
     "densification_memory_patch_sha256": densification_memory_patch_sha256,
+    "row_span_culling_patch_sha256": row_span_culling_patch_sha256,
     "dependencies": {
         "nlohmann_json_v3.11.3_sha256": nlohmann_json_sha256,
         "nanoflann_v1.5.5_sha256": nanoflann_sha256,

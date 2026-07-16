@@ -287,11 +287,16 @@ void makeBroadSplats(Model &model) {
     std::fill(scales, scales + model.scales.numel(), 0.0f);
 }
 
-RasterResult runSingleStep(const std::string &dataset, bool forceExact) {
+RasterResult runSingleStep(
+    const std::string &dataset,
+    bool forceExact,
+    bool tileSpanCulling = false
+) {
     cleanup_msplat_metal();
     msplat_set_raster_memory_budget_bytes(memoryBudgetBytes);
     msplat_set_raster_fallback_count(0);
     msplat_set_force_exact_for_testing(forceExact);
+    msplat_set_tile_culling_min_area_for_testing(tileSpanCulling ? 4 : 0);
 
     RasterResult result;
     {
@@ -1475,6 +1480,54 @@ int main(int argc, char **argv) {
         requireNear("color_second_moment", fast.colorSecondMoment, exact.colorSecondMoment);
         requireNear("opacity_first_moment", fast.opacityFirstMoment, exact.opacityFirstMoment);
         requireNear("opacity_second_moment", fast.opacitySecondMoment, exact.opacitySecondMoment);
+
+        const RasterResult culledFast = runSingleStep(dataset, false, true);
+        const RasterResult culledExact = runSingleStep(dataset, true, true);
+        if (culledFast.stats.fallback_count != 0 ||
+            culledExact.stats.fallback_count != 1 ||
+            culledFast.stats.dropped_intersection_count != 0 ||
+            culledExact.stats.dropped_intersection_count != 0) {
+            throw std::runtime_error(
+                "tile-span test did not exercise both raster routes"
+            );
+        }
+        requireNear("culled_fast_exact_rgb", culledFast.rgb, culledExact.rgb);
+        requireNear("culled_fast_exact_alpha", culledFast.alpha, culledExact.alpha);
+        requireNear(
+            "culled_fast_exact_position_gradients",
+            culledFast.positionGradients,
+            culledExact.positionGradients
+        );
+        requireNear(
+            "culled_fast_exact_color_gradients",
+            culledFast.colorGradients,
+            culledExact.colorGradients
+        );
+        requireNear(
+            "culled_fast_exact_opacity_gradients",
+            culledFast.opacityGradients,
+            culledExact.opacityGradients
+        );
+        requireNear("culled_baseline_rgb", fast.rgb, culledFast.rgb);
+        requireNear("culled_baseline_alpha", fast.alpha, culledFast.alpha);
+        requireNear("culled_baseline_positions", fast.positions, culledFast.positions);
+        requireNear("culled_baseline_colors", fast.colors, culledFast.colors);
+        requireNear("culled_baseline_opacities", fast.opacities, culledFast.opacities);
+        if (exact.stats.latest_intersection_count == 0 ||
+            culledExact.stats.latest_intersection_count == 0 ||
+            culledExact.stats.latest_intersection_count * 100 >=
+                exact.stats.latest_intersection_count * 95) {
+            throw std::runtime_error(
+                "tile-span culling did not reduce exact intersections by five percent: baseline=" +
+                std::to_string(exact.stats.latest_intersection_count) +
+                " candidate=" +
+                std::to_string(culledExact.stats.latest_intersection_count)
+            );
+        }
+        std::cout << "tile_span_intersections baseline="
+                  << exact.stats.latest_intersection_count
+                  << " candidate=" << culledExact.stats.latest_intersection_count
+                  << '\n';
 
         std::vector<double> disabledSamples;
         std::vector<double> enabledSamples;
