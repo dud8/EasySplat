@@ -72,7 +72,7 @@ final class ColmapLogProgressTests: XCTestCase {
             ))
         }
 
-        XCTAssertEqual(tracker.globalRefinementCycleCount, 4)
+        XCTAssertEqual(tracker.globalRefinementInvocationCount, 4)
     }
 
     func testMappingProgressIgnoresLocalAndUnrelatedBundleAdjustmentLogs() {
@@ -82,7 +82,7 @@ final class ColmapLogProgressTests: XCTestCase {
         XCTAssertNil(tracker.ingest("Global bundle adjustment"))
         XCTAssertNil(tracker.ingest("Retriangulation and global bundle adjustment"))
 
-        XCTAssertEqual(tracker.globalRefinementCycleCount, 0)
+        XCTAssertEqual(tracker.globalRefinementInvocationCount, 0)
     }
 
     func testMappingProgressCountsRepeatedGlobalRefinementMarkers() {
@@ -92,7 +92,7 @@ final class ColmapLogProgressTests: XCTestCase {
         XCTAssertNil(tracker.ingest(marker))
         XCTAssertNil(tracker.ingest(marker))
 
-        XCTAssertEqual(tracker.globalRefinementCycleCount, 2)
+        XCTAssertEqual(tracker.globalRefinementInvocationCount, 2)
     }
 
     func testMappingProgressCountsGlobalRefinementMarkersConcurrently() {
@@ -106,7 +106,7 @@ final class ColmapLogProgressTests: XCTestCase {
             _ = tracker.ingest(line)
         }
 
-        XCTAssertEqual(tracker.globalRefinementCycleCount, markerCount)
+        XCTAssertEqual(tracker.globalRefinementInvocationCount, markerCount)
     }
 }
 #endif

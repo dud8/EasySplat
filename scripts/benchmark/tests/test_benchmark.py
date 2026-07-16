@@ -1483,9 +1483,18 @@ def write_orientation_evidence_artifacts(
                         "images.txt": hashlib.sha256(candidate_data).hexdigest(),
                         "points3D.txt": "2" * 64,
                     },
+                    "mapping": {
+                        "acceptedRefinementInvocationCount": 1,
+                        "acceptedRefinementKind": "incrementalGlobal",
+                        "attemptCount": 1,
+                        "largestModelRegisteredViewCount": 30,
+                        "modelCount": 1,
+                        "secondLargestModelRegisteredViewCount": 0,
+                        "unionRegisteredViewCount": 30,
+                    },
                     "poseConvention": "world-to-camera",
                     "quaternionOrder": "wxyz",
-                    "schemaVersion": 7,
+                    "schemaVersion": 8,
                 }
             )
             + b"\n"
@@ -5368,7 +5377,16 @@ class RunnerIntegrityTests(unittest.TestCase):
             (run_root / "geometry-manifest.json").write_bytes(
                 evidence.canonical_json_bytes(
                     {
-                        "schemaVersion": 7,
+                        "mapping": {
+                            "acceptedRefinementInvocationCount": 1,
+                            "acceptedRefinementKind": "incrementalGlobal",
+                            "attemptCount": 1,
+                            "largestModelRegisteredViewCount": 30,
+                            "modelCount": 1,
+                            "secondLargestModelRegisteredViewCount": 0,
+                            "unionRegisteredViewCount": 30,
+                        },
+                        "schemaVersion": 8,
                     }
                 )
                 + b"\n"

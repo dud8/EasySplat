@@ -10,6 +10,7 @@ public struct ProjectMetadata: Codable, Sendable {
     public var requestedRunOptions: RequestedRunOptions
     public var resolvedRunPlan: ResolvedRunPlan?
     public var trainingMemoryRetryBudgetBytes: Int64?
+    public var geometryRecovery: GeometryRecoveryState?
     public var geometryArtifact: GeometryArtifact?
     public var trainingArtifact: TrainingArtifact?
     public var viewerPreferences: ViewerPreferences
@@ -31,6 +32,7 @@ public struct ProjectMetadata: Codable, Sendable {
         requestedRunOptions: RequestedRunOptions = RequestedRunOptions(),
         resolvedRunPlan: ResolvedRunPlan? = nil,
         trainingMemoryRetryBudgetBytes: Int64? = nil,
+        geometryRecovery: GeometryRecoveryState? = nil,
         geometryArtifact: GeometryArtifact? = nil,
         trainingArtifact: TrainingArtifact? = nil,
         viewerPreferences: ViewerPreferences = ViewerPreferences(),
@@ -51,6 +53,7 @@ public struct ProjectMetadata: Codable, Sendable {
         self.requestedRunOptions = requestedRunOptions
         self.resolvedRunPlan = resolvedRunPlan
         self.trainingMemoryRetryBudgetBytes = trainingMemoryRetryBudgetBytes
+        self.geometryRecovery = geometryRecovery
         self.geometryArtifact = geometryArtifact
         self.trainingArtifact = trainingArtifact
         self.viewerPreferences = viewerPreferences

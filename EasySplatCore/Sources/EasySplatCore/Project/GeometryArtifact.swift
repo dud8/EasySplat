@@ -181,51 +181,64 @@ public struct PairGraphMeasurement: Codable, Sendable, Equatable {
 public struct PairGraphArtifact: Codable, Sendable, Equatable {
     public var status: PairGraphMeasurementStatus
     public var measurement: PairGraphMeasurement?
-    public var mappingAttemptNumber: Int
-    public var bundleAdjustmentCycleCount: Int
-    public var fallbackReason: String?
 
     public init(
         status: PairGraphMeasurementStatus,
-        measurement: PairGraphMeasurement?,
-        mappingAttemptNumber: Int,
-        bundleAdjustmentCycleCount: Int,
-        fallbackReason: String?
+        measurement: PairGraphMeasurement?
     ) {
         self.status = status
         self.measurement = measurement
-        self.mappingAttemptNumber = mappingAttemptNumber
-        self.bundleAdjustmentCycleCount = bundleAdjustmentCycleCount
-        self.fallbackReason = fallbackReason
     }
 
-    public static func notEvaluated(
-        mappingAttemptNumber: Int,
-        bundleAdjustmentCycleCount: Int,
-        fallbackReason: String?
-    ) -> PairGraphArtifact {
+    public static func notEvaluated() -> PairGraphArtifact {
         PairGraphArtifact(
             status: .notEvaluated,
-            measurement: nil,
-            mappingAttemptNumber: mappingAttemptNumber,
-            bundleAdjustmentCycleCount: bundleAdjustmentCycleCount,
-            fallbackReason: fallbackReason
+            measurement: nil
         )
     }
 
-    public static func measured(
-        _ measurement: PairGraphMeasurement,
-        mappingAttemptNumber: Int,
-        bundleAdjustmentCycleCount: Int,
-        fallbackReason: String?
-    ) -> PairGraphArtifact {
+    public static func measured(_ measurement: PairGraphMeasurement) -> PairGraphArtifact {
         PairGraphArtifact(
             status: .measured,
-            measurement: measurement,
-            mappingAttemptNumber: mappingAttemptNumber,
-            bundleAdjustmentCycleCount: bundleAdjustmentCycleCount,
-            fallbackReason: fallbackReason
+            measurement: measurement
         )
+    }
+}
+
+public enum MappingRefinementKind: String, Codable, Sendable, Equatable {
+    case incrementalGlobal
+    case seededBundleAdjustment
+}
+
+public struct MappingArtifact: Codable, Sendable, Equatable {
+    public var modelCount: Int
+    public var largestModelRegisteredViewCount: Int
+    public var secondLargestModelRegisteredViewCount: Int
+    public var unionRegisteredViewCount: Int
+    public var attemptCount: Int
+    public var acceptedRefinementKind: MappingRefinementKind
+    /// Observed global-refinement invocations from the accepted mapping attempt.
+    public var acceptedRefinementInvocationCount: Int
+    public var fallbackReason: String?
+
+    public init(
+        modelCount: Int,
+        largestModelRegisteredViewCount: Int,
+        secondLargestModelRegisteredViewCount: Int,
+        unionRegisteredViewCount: Int,
+        attemptCount: Int,
+        acceptedRefinementKind: MappingRefinementKind,
+        acceptedRefinementInvocationCount: Int,
+        fallbackReason: String?
+    ) {
+        self.modelCount = modelCount
+        self.largestModelRegisteredViewCount = largestModelRegisteredViewCount
+        self.secondLargestModelRegisteredViewCount = secondLargestModelRegisteredViewCount
+        self.unionRegisteredViewCount = unionRegisteredViewCount
+        self.attemptCount = attemptCount
+        self.acceptedRefinementKind = acceptedRefinementKind
+        self.acceptedRefinementInvocationCount = acceptedRefinementInvocationCount
+        self.fallbackReason = fallbackReason
     }
 }
 
@@ -355,7 +368,7 @@ public struct CanonicalOrientationArtifact: Codable, Sendable, Equatable {
 }
 
 public struct GeometryArtifact: Codable, Sendable, Equatable {
-    public static let currentSchemaVersion = 7
+    public static let currentSchemaVersion = 8
 
     public var schemaVersion: Int
     public var solverVersion: String
@@ -390,6 +403,7 @@ public struct GeometryArtifact: Codable, Sendable, Equatable {
     public var provenance: GeometryProvenance
     public var learnedPointInitializer: LearnedPointInitializerArtifact?
     public var pairGraph: PairGraphArtifact
+    public var mapping: MappingArtifact
     public var canonicalOrientation: CanonicalOrientationArtifact
 
     public var allowsViewOnlyUprightFlip: Bool {
@@ -429,6 +443,7 @@ public struct GeometryArtifact: Codable, Sendable, Equatable {
         fallbackReason: String?,
         provenance: GeometryProvenance,
         pairGraph: PairGraphArtifact,
+        mapping: MappingArtifact,
         learnedPointInitializer: LearnedPointInitializerArtifact? = nil,
         canonicalOrientation: CanonicalOrientationArtifact
     ) {
@@ -461,6 +476,7 @@ public struct GeometryArtifact: Codable, Sendable, Equatable {
         self.provenance = provenance
         self.learnedPointInitializer = learnedPointInitializer
         self.pairGraph = pairGraph
+        self.mapping = mapping
         self.canonicalOrientation = canonicalOrientation
     }
 }

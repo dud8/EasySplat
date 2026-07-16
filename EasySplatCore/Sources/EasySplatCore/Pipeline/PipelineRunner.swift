@@ -9,6 +9,7 @@ public final class PipelineRunner: @unchecked Sendable {
         public var msplat: MsplatRunner
         public var da3Sfm: Da3SfmRunning
         let checkCancellation: @Sendable () throws -> Void
+        let colmapGPUSupport: (@Sendable (URL) -> Bool)?
 
         public init(colmap: ColmapRunner = ColmapRunner(),
                     msplat: MsplatRunner = MsplatRunner(),
@@ -17,6 +18,7 @@ public final class PipelineRunner: @unchecked Sendable {
             self.msplat = msplat
             self.da3Sfm = da3Sfm
             self.checkCancellation = { try Task.checkCancellation() }
+            self.colmapGPUSupport = nil
         }
 
         public init(runner: SubprocessRunning) {
@@ -24,16 +26,21 @@ public final class PipelineRunner: @unchecked Sendable {
             self.msplat = MsplatRunner(runner: runner)
             self.da3Sfm = Da3SfmRunner(runner: runner)
             self.checkCancellation = { try Task.checkCancellation() }
+            self.colmapGPUSupport = nil
         }
 
         init(
             runner: SubprocessRunning,
-            checkCancellation: @escaping @Sendable () throws -> Void
+            checkCancellation: @escaping @Sendable () throws -> Void = {
+                try Task.checkCancellation()
+            },
+            colmapGPUSupport: (@Sendable (URL) -> Bool)? = nil
         ) {
             self.colmap = ColmapRunner(runner: runner)
             self.msplat = MsplatRunner(runner: runner)
             self.da3Sfm = Da3SfmRunner(runner: runner)
             self.checkCancellation = checkCancellation
+            self.colmapGPUSupport = colmapGPUSupport
         }
     }
 
@@ -139,6 +146,13 @@ public final class PipelineRunner: @unchecked Sendable {
             _ = try TrainingArtifactStore.reconcile(metadata: &metadata, paths: paths)
         } catch {
             trainingManifestWarning = error.localizedDescription
+        }
+        if metadata.state.lastError != nil, metadata.geometryRecovery != nil {
+            metadata.geometryRecovery = nil
+            try ProjectMetadataStore.savePreservingUserEditableFields(
+                metadata,
+                to: paths.metadataURL
+            )
         }
         let metadataForResumeValidation = metadata
 
@@ -257,8 +271,32 @@ public final class PipelineRunner: @unchecked Sendable {
         }
 
         func shouldRunStage(_ stage: PipelineStage) throws -> Bool {
-            guard let lastCompletedStage = effectiveLastCompletedStage else { return true }
             let validationMetadata = resumeValidationMode ? metadataForResumeValidation : metadata
+            if stage == .sfmMapping,
+               !reranStageBeforeTraining,
+               validationMetadata.geometryArtifact != nil,
+               try validateStageOutput(
+                   stage,
+                   paths: paths,
+                   metadata: validationMetadata
+               ) == .valid {
+                metadata.geometryArtifact = validationMetadata.geometryArtifact
+                metadata.geometryRecovery = nil
+                metadata.reconstruction = validationMetadata.reconstruction
+                metadata.state = PipelineState(stage: .sfmMapping, lastError: nil)
+                metadata.checkpoint = nil
+                try ProjectMetadataStore.savePreservingUserEditableFields(
+                    metadata,
+                    to: paths.metadataURL
+                )
+                emit(.stageLog(
+                    stage: .sfmMapping,
+                    line: "Recovered the completed camera reconstruction.",
+                    isError: false
+                ))
+                return false
+            }
+            guard let lastCompletedStage = effectiveLastCompletedStage else { return true }
             if stage == .trainSplat,
                !reranStageBeforeTraining,
                validationMetadata.trainingArtifact?.completionStatus == .completed {
@@ -393,7 +431,8 @@ public final class PipelineRunner: @unchecked Sendable {
             let colmapMaxImageSize = resolvedRunPlan.colmapMaximumImageDimension
             var colmapExtractOptions = colmapOptionsForExtraction()
             var colmapMatchOptions = colmapOptionsForMatching()
-            let preferColmapGpu = shouldUseColmapGpu(colmapPath: config.toolchain.colmap)
+            let preferColmapGpu = tooling.colmapGPUSupport?(config.toolchain.colmap)
+                ?? shouldUseColmapGpu(colmapPath: config.toolchain.colmap)
             colmapExtractOptions.useGPU = preferColmapGpu
             colmapMatchOptions.useGPU = preferColmapGpu
             let colmapThreads = min(
@@ -833,6 +872,46 @@ public final class PipelineRunner: @unchecked Sendable {
             try Task.checkCancellation()
             let da3WindowSize = resolvedRunPlan.chunkSize
             let backendOrder = try sfmBackendFallbackOrder(resolvedPlan: resolvedRunPlan)
+            let geometryRecoveryImageNames = selectedFrames.map(\.lastPathComponent)
+            let geometryRecoveryFramesDigest = try GeometryArtifactStore.selectedFramesDigest(
+                orderedImageNames: geometryRecoveryImageNames,
+                projectPaths: paths
+            )
+
+            func sfmBackend(for backend: GeometryRecoveryBackend) -> SfmBackend {
+                switch backend {
+                case .da3: return .da3
+                case .colmap: return .colmap
+                }
+            }
+
+            let restoredGeometryRecovery: GeometryRecoveryState?
+            if let recovery = metadata.geometryRecovery {
+                do {
+                    try recovery.validateBinding(
+                        expectedImageNames: geometryRecoveryImageNames,
+                        expectedSelectedFramesDigest: geometryRecoveryFramesDigest
+                    )
+                    guard backendOrder.contains(sfmBackend(for: recovery.activeBackend)) else {
+                        throw GeometryRecoveryState.ValidationError.invalidBackendFields
+                    }
+                    restoredGeometryRecovery = recovery
+                } catch {
+                    metadata.geometryRecovery = nil
+                    try ProjectMetadataStore.savePreservingUserEditableFields(
+                        metadata,
+                        to: paths.metadataURL
+                    )
+                    restoredGeometryRecovery = nil
+                    emit(.stageLog(
+                        stage: .sfmMapping,
+                        line: "Discarded stale reconstruction recovery data.",
+                        isError: true
+                    ))
+                }
+            } else {
+                restoredGeometryRecovery = nil
+            }
 
             let backendName: (SfmBackend) -> String = { backend in
                 switch backend {
@@ -844,20 +923,116 @@ public final class PipelineRunner: @unchecked Sendable {
             }
 
             var acceptedReconstructionSummary: ReconstructionSummary?
-            var mappingAttemptCount = 0
-            var bundleAdjustmentCycleCount = 0
-            var mappingFallbackReasons: [String] = []
+            var mappingAttemptCount = restoredGeometryRecovery?.mappingAttemptCount ?? 0
+            var acceptedMappingArtifact: MappingArtifact?
+            var mappingFallbackReasons = restoredGeometryRecovery?.mappingFallbackReasons ?? []
+            var recoveredActiveBackend = restoredGeometryRecovery.map {
+                sfmBackend(for: $0.activeBackend)
+            }
+            var resumingInterruptedMapping = restoredGeometryRecovery != nil
+                && metadata.checkpoint?.stage == .sfmMapping
+                && mappingAttemptCount > 0
+
+            if let recovery = restoredGeometryRecovery {
+                if recovery.activeBackend == .colmap {
+                    switch recovery.colmapComputeMode {
+                    case .cpu:
+                        colmapExtractOptions.useGPU = false
+                        colmapMatchOptions.useGPU = false
+                    case .gpu:
+                        break
+                    case nil:
+                        throw GeometryRecoveryState.ValidationError.invalidBackendFields
+                    }
+                }
+                if recovery.activeBackend == .colmap,
+                   let level = recovery.pendingPairRecoveryLevel {
+                    pairRecoveryLevel = PairRecoveryLevel(level)
+                }
+                if recovery.activeBackend == .da3,
+                   recovery.da3DescriptorMatcher == .exact {
+                    colmapMatchOptions.descriptorMatcher = .exact
+                    didRetryWithExactMatcher = true
+                }
+                if recovery.activeBackend == .colmap,
+                   sparseModelFilesExist(at: paths.colmapSeedModelURL) {
+                    try prepareForClassicalFeatureExtraction(paths: paths)
+                    try paths.ensureDirectories()
+                    emit(.stageLog(
+                        stage: .sfmFeatures,
+                        line: "Finished an interrupted reconstruction-route handoff before resuming.",
+                        isError: false
+                    ))
+                }
+            }
 
             func recordMappingFallback(_ reason: String) {
                 guard !mappingFallbackReasons.contains(reason) else { return }
                 mappingFallbackReasons.append(reason)
             }
 
+            func persistGeometryRecovery(
+                activeBackend: SfmBackend,
+                pendingPairRecoveryLevel: PairGraphRecoveryLevel? = nil,
+                da3DescriptorMatcher: DescriptorMatcher? = nil
+            ) throws {
+                let recoveryBackend: GeometryRecoveryBackend
+                switch activeBackend {
+                case .da3: recoveryBackend = .da3
+                case .colmap: recoveryBackend = .colmap
+                }
+                let state = GeometryRecoveryState(
+                    selectedFramesDigest: geometryRecoveryFramesDigest,
+                    orderedImageNames: geometryRecoveryImageNames,
+                    activeBackend: recoveryBackend,
+                    mappingAttemptCount: mappingAttemptCount,
+                    mappingFallbackReasons: mappingFallbackReasons,
+                    pendingPairRecoveryLevel: pendingPairRecoveryLevel,
+                    da3DescriptorMatcher: da3DescriptorMatcher,
+                    colmapComputeMode: recoveryBackend == .colmap
+                        ? (colmapMatchOptions.useGPU ? .gpu : .cpu)
+                        : nil
+                )
+                try state.validate()
+                metadata.geometryRecovery = state
+                try ProjectMetadataStore.savePreservingUserEditableFields(
+                    metadata,
+                    to: paths.metadataURL
+                )
+            }
+
+            func beginMappingAttempt(
+                activeBackend: SfmBackend,
+                pendingPairRecoveryLevel: PairGraphRecoveryLevel? = nil,
+                da3DescriptorMatcher: DescriptorMatcher? = nil
+            ) throws {
+                if resumingInterruptedMapping {
+                    recordMappingFallback("interrupted mapping resumed")
+                    resumingInterruptedMapping = false
+                }
+                guard mappingAttemptCount < GeometryRecoveryState.maximumMappingAttemptCount else {
+                    throw GeometryRecoveryState.ValidationError.invalidMappingAttemptCount
+                }
+                mappingAttemptCount += 1
+                try persistGeometryRecovery(
+                    activeBackend: activeBackend,
+                    pendingPairRecoveryLevel: pendingPairRecoveryLevel,
+                    da3DescriptorMatcher: da3DescriptorMatcher
+                )
+            }
+
             for (index, backendPolicy) in backendOrder.enumerated() {
+                if let pendingRecoveredBackend = recoveredActiveBackend {
+                    guard backendPolicy == pendingRecoveredBackend else { continue }
+                    // Apply the persisted route exactly once; later entries remain
+                    // available as the normal fallback order for this resumed run.
+                    recoveredActiveBackend = nil
+                }
                 // Reset accepted-quality state at the start of every backend attempt so a
                 // partial failure from the previous backend cannot leak its score/summary
                 // into a later backend's successful run.
                 acceptedReconstructionSummary = nil
+                acceptedMappingArtifact = nil
                 var completedMappingThisAttempt = false
                 var acceptedDa3ModelSubdirectory: String?
                 var da3ConfigurationForAttempt: Da3SfmConfig?
@@ -1113,6 +1288,12 @@ public final class PipelineRunner: @unchecked Sendable {
                             )
                             self.logKeypointStats(database: paths.colmapDatabaseURL, stage: .sfmMatching, emit: emit)
                             try resetMatchingIfNeeded()
+                            if restoredGeometryRecovery?.activeBackend == .da3,
+                               restoredGeometryRecovery?.da3DescriptorMatcher == .exact {
+                                try ColmapDatabaseMatchStore.clearMatchingResults(
+                                    at: paths.colmapDatabaseURL
+                                )
+                            }
 
                             let seedManifest = try readDa3CoverageManifest(required: true)
                             guard let localPairs = seedManifest?.boundedMatchPairs,
@@ -1157,7 +1338,13 @@ public final class PipelineRunner: @unchecked Sendable {
                                 onLog: matcherLog,
                                 emit: emit,
                                 onExactRecovery: {
+                                    didRetryWithExactMatcher = true
+                                    colmapMatchOptions.descriptorMatcher = .exact
                                     recordMappingFallback("exact descriptor matching")
+                                    try persistGeometryRecovery(
+                                        activeBackend: .da3,
+                                        da3DescriptorMatcher: .exact
+                                    )
                                 }
                             )
                             let expectedPairs = pairPlan.pairs.count
@@ -1176,6 +1363,13 @@ public final class PipelineRunner: @unchecked Sendable {
                             )
                             emit(.stageFinished(stage: .sfmMatching))
                             markStageComplete(.sfmMatching)
+                            try persistGeometryRecovery(
+                                activeBackend: .da3,
+                                da3DescriptorMatcher:
+                                    colmapMatchOptions.descriptorMatcher == .exact
+                                        ? .exact
+                                        : nil
+                            )
                             try stopIfRequested(after: .sfmMatching)
                         }
 
@@ -1200,6 +1394,23 @@ public final class PipelineRunner: @unchecked Sendable {
                                     isError: false
                                 ))
                             }
+                            writeCheckpoint(
+                                stage: .sfmMapping,
+                                progress: 0,
+                                message: "DA3 refinement started",
+                                details: .sfmMapping(SfmMappingCheckpoint(
+                                    mapper: "da3-refined",
+                                    sparsePath: try paths.projectRelativePath(for: sparseZero),
+                                    registeredImages: nil
+                                ))
+                            )
+                            try beginMappingAttempt(
+                                activeBackend: .da3,
+                                da3DescriptorMatcher:
+                                    colmapMatchOptions.descriptorMatcher == .exact
+                                        ? .exact
+                                        : nil
+                            )
                             try self.resetDirectory(paths.colmapSparseURL)
                             try self.resetDirectory(sparseZero)
                             let colmapToolLog = ToolLogWriter(fileURL: paths.colmapLogURL, toolName: "colmap")
@@ -1214,7 +1425,6 @@ public final class PipelineRunner: @unchecked Sendable {
                                 ]
                             )
                             emit(.stageLog(stage: .sfmMapping, line: "Running DA3 refinement: point_triangulator.", isError: false))
-                            mappingAttemptCount += 1
                             try self.tooling.checkCancellation()
                             try await self.tooling.colmap.runPointTriangulator(
                                 colmapPath: self.config.toolchain.colmap,
@@ -1232,7 +1442,6 @@ public final class PipelineRunner: @unchecked Sendable {
                             self.removeIfExists(baOutput)
                             try fm.createDirectory(at: baOutput, withIntermediateDirectories: true)
                             emit(.stageLog(stage: .sfmMapping, line: "Running DA3 refinement: bundle_adjuster.", isError: false))
-                            bundleAdjustmentCycleCount += 1
                             try await self.tooling.colmap.runBundleAdjuster(
                                 colmapPath: self.config.toolchain.colmap,
                                 inputPath: sparseZero,
@@ -1253,6 +1462,15 @@ public final class PipelineRunner: @unchecked Sendable {
                             }
                             self.removeIfExists(sparseZero)
                             try fm.moveItem(at: baOutput, to: sparseZero)
+                            _ = try self.ensureTextSparseModelFiles(at: sparseZero)
+
+                            let membership = try ColmapSparseModelMembershipReader(
+                                databaseURL: paths.colmapDatabaseURL,
+                                selectedImageNames: selectedFrames.map(\.lastPathComponent)
+                            ).read(
+                                modelDirectories: [sparseZero],
+                                checkCancellation: self.tooling.checkCancellation
+                            )
 
                             let score = try await analyzeDa3Model(
                                 at: sparseZero,
@@ -1262,10 +1480,24 @@ public final class PipelineRunner: @unchecked Sendable {
                                 score,
                                 capturePath: resolvedRunPlan.capturePath
                             ),
+                                  score.registeredImages
+                                    == membership.largestModelRegisteredViewCount,
                                   let residual = score.meanReprojectionError,
                                   residual.isFinite else {
                                 throw PipelineError.lowQualityReconstruction(score, mapper: "da3-refined")
                             }
+                            acceptedMappingArtifact = MappingArtifact(
+                                modelCount: membership.modelCount,
+                                largestModelRegisteredViewCount:
+                                    membership.largestModelRegisteredViewCount,
+                                secondLargestModelRegisteredViewCount:
+                                    membership.secondLargestModelRegisteredViewCount,
+                                unionRegisteredViewCount: membership.unionRegisteredViewCount,
+                                attemptCount: mappingAttemptCount,
+                                acceptedRefinementKind: .seededBundleAdjustment,
+                                acceptedRefinementInvocationCount: 1,
+                                fallbackReason: nil
+                            )
                             acceptedReconstructionSummary = ReconstructionSummary(
                                 score: score,
                                 mapper: "da3-refined",
@@ -1288,6 +1520,10 @@ public final class PipelineRunner: @unchecked Sendable {
                             ))
                         }
                     } else {
+            var resumingPersistedPolicyRecovery =
+                restoredGeometryRecovery?.activeBackend == .colmap
+                && restoredGeometryRecovery?.pendingPairRecoveryLevel != nil
+
             func restoreAcceptedPairEvidence(_ evidence: PairGraphEvidence) throws {
                 guard let acceptedAttempt = evidence.attempts.last else {
                     throw PairGraphEvidenceStoreError.invalidEvidence
@@ -1331,6 +1567,7 @@ public final class PipelineRunner: @unchecked Sendable {
             var resumingPersistedExactRecovery = false
             var recoveredAcceptedExactEvidence = false
             var restartingAfterInvalidRecoveryState = false
+            var recoveredPolicyRecoverySidecar = false
 
             func selectedFramesDigestForExactRecovery() throws -> String {
                 if let selectedFramesDigestForRecovery {
@@ -1346,7 +1583,7 @@ public final class PipelineRunner: @unchecked Sendable {
 
             func exactRecoveryMode(
                 for mode: PairAttemptMode
-            ) -> PairGraphExactRecoveryMode? {
+            ) -> PairGraphRecoveryMode? {
                 guard colmapMatchOptions.descriptorMatcher == .exact else {
                     return nil
                 }
@@ -1360,17 +1597,32 @@ public final class PipelineRunner: @unchecked Sendable {
                 }
             }
 
-            func persistExactRecoveryIntent(
-                mode: PairAttemptMode,
-                activePlan: ColmapPairPlan
+            func persistPairRecoveryIntent(
+                mode: PairGraphRecoveryMode,
+                activePlan: ColmapPairPlan,
+                phase: PairGraphRecoveryPhase = .matching
             ) throws {
-                guard let recoveryMode = exactRecoveryMode(for: mode) else {
-                    return
-                }
+                metadata.checkpoint = PipelineCheckpoint(
+                    stage: .sfmMatching,
+                    updatedAt: Date(),
+                    progressFraction: 0,
+                    message: "Image matching recovery pending",
+                    details: .sfmMatching(SfmMatchingCheckpoint(
+                        databasePath: try paths.projectRelativePath(
+                            for: paths.colmapDatabaseURL
+                        ),
+                        expectedPairs: phase == .matching
+                            ? activePlan.pairs.count
+                            : nil,
+                        processedPairs: 0
+                    ))
+                )
                 let state = PairGraphRecoveryState(
                     selectedFramesDigest: try selectedFramesDigestForExactRecovery(),
                     imageNames: selectedImageNames,
-                    mode: recoveryMode,
+                    mode: mode,
+                    computeMode: colmapMatchOptions.useGPU ? .gpu : .cpu,
+                    phase: phase,
                     activeRecoveryLevel: pairRecoveryLevel.artifactValue,
                     activePlan: activePlan,
                     attempts: pairGraphAttempts,
@@ -1382,26 +1634,80 @@ public final class PipelineRunner: @unchecked Sendable {
                     to: paths.pairGraphRecoveryURL,
                     projectPaths: paths
                 )
+                try persistGeometryRecovery(
+                    activeBackend: .colmap,
+                    pendingPairRecoveryLevel: pairRecoveryLevel.artifactValue
+                )
             }
 
-            func restorePendingExactRecovery(
+            func persistExactRecoveryIntent(
+                mode: PairAttemptMode,
+                activePlan: ColmapPairPlan
+            ) throws {
+                guard let recoveryMode = exactRecoveryMode(for: mode) else {
+                    return
+                }
+                try persistPairRecoveryIntent(
+                    mode: recoveryMode,
+                    activePlan: activePlan
+                )
+            }
+
+            func restorePendingPairRecovery(
                 _ recovered: RestoredPairGraphRecovery
-            ) {
+            ) throws {
+                if recovered.computeMode == .cpu {
+                    colmapExtractOptions.useGPU = false
+                    colmapMatchOptions.useGPU = false
+                }
                 pairGraphAttempts = recovered.attempts
                 matchingDurationSeconds = recovered.matchingDurationSeconds
                 pairRecoveryLevel = PairRecoveryLevel(recovered.recoveryLevel)
-                colmapMatchOptions.descriptorMatcher = .exact
-                didRetryWithExactMatcher = true
-                latestPreparedPairPlan = recovered.activePlan
+                if recovered.phase == .preparing {
+                    colmapMatchOptions.descriptorMatcher = recovered.mode == .policy
+                        ? resolvedRunPlan.normalDescriptorMatcher
+                        : .exact
+                    didRetryWithExactMatcher = recovered.mode != .policy
+                    pairAttemptMode = .policy
+                    latestPreparedPairPlan = nil
+                    latestCompletedPairPlan = nil
+                    latestCompletedPairInspection = nil
+                    resumingPersistedPolicyRecovery = recovered.mode == .policy
+                    resumingPersistedExactRecovery = recovered.mode != .policy
+                    recoveredPolicyRecoverySidecar = recovered.mode == .policy
+                    for reason in recovered.fallbackReasons {
+                        recordMappingFallback(reason)
+                    }
+                    return
+                }
                 switch recovered.mode {
+                case .policy:
+                    colmapMatchOptions.descriptorMatcher = resolvedRunPlan
+                        .normalDescriptorMatcher
+                    didRetryWithExactMatcher = false
+                    pairAttemptMode = .policy
+                    latestPreparedPairPlan = nil
+                    latestCompletedPairPlan = nil
+                    latestCompletedPairInspection = nil
+                    resumingPersistedPolicyRecovery = true
+                    recoveredPolicyRecoverySidecar = true
                 case .sameScheduleExact:
+                    colmapMatchOptions.descriptorMatcher = .exact
+                    didRetryWithExactMatcher = true
+                    latestPreparedPairPlan = recovered.activePlan
                     pairAttemptMode = .sameScheduleExact(recovered.activePlan)
                 case .targetedExact:
+                    colmapMatchOptions.descriptorMatcher = .exact
+                    didRetryWithExactMatcher = true
+                    latestPreparedPairPlan = recovered.activePlan
                     pairAttemptMode = .targetedExact(
                         plan: recovered.activePlan,
                         source: recovered.sourcePlan
                     )
                 case .fullExact:
+                    colmapMatchOptions.descriptorMatcher = .exact
+                    didRetryWithExactMatcher = true
+                    latestPreparedPairPlan = recovered.activePlan
                     pairAttemptMode = .fullExact(source: recovered.sourcePlan)
                 }
                 for reason in recovered.fallbackReasons {
@@ -1413,23 +1719,29 @@ public final class PipelineRunner: @unchecked Sendable {
                 _ evidence: PairGraphEvidence,
                 recovered: RestoredPairGraphRecovery
             ) -> Bool {
-                guard evidence.attempts.count == recovered.attempts.count + 1,
+                guard recovered.phase == .matching,
+                      evidence.attempts.count == recovered.attempts.count + 1,
                       Array(evidence.attempts.dropLast()) == recovered.attempts,
                       evidence.fallbackReasons == recovered.fallbackReasons,
                       let accepted = evidence.attempts.last,
-                      accepted.artifact.matcher == .exact,
                       accepted.artifact.recoveryLevel == recovered.recoveryLevel,
                       accepted.artifact.outcome == .completed,
                       accepted.scheduledPairs == recovered.activePlan.pairs else {
                     return false
                 }
                 switch recovered.mode {
+                case .policy:
+                    return accepted.purpose == .policy
+                        && accepted.artifact.matcher == .faiss
                 case .sameScheduleExact:
                     return accepted.purpose == .policy
+                        && accepted.artifact.matcher == .exact
                 case .targetedExact:
                     return accepted.purpose == .targetedExactGraphRecovery
+                        && accepted.artifact.matcher == .exact
                 case .fullExact:
                     return accepted.purpose == .fullExactGraphRecovery
+                        && accepted.artifact.matcher == .exact
                 }
             }
 
@@ -1440,6 +1752,7 @@ public final class PipelineRunner: @unchecked Sendable {
                 atPath: paths.pairGraphRecoveryURL.path
             )) != nil)
             if recoveryFileExists {
+                resumingPersistedPolicyRecovery = false
                 do {
                     let recoveryState = try PairGraphRecoveryStore.loadBound(
                         from: paths.pairGraphRecoveryURL,
@@ -1447,6 +1760,10 @@ public final class PipelineRunner: @unchecked Sendable {
                         projectPaths: paths
                     )
                     let recovered = try recoveryState.restoredRecovery()
+                    if recovered.computeMode == .cpu {
+                        colmapExtractOptions.useGPU = false
+                        colmapMatchOptions.useGPU = false
+                    }
                     let completedEvidence: PairGraphEvidence?
                     do {
                         completedEvidence = try PairGraphEvidenceStore.loadVerified(
@@ -1466,13 +1783,16 @@ public final class PipelineRunner: @unchecked Sendable {
                         recovered: recovered
                        ) {
                         try restoreAcceptedPairEvidence(completedEvidence)
+                        try persistGeometryRecovery(activeBackend: .colmap)
                         markStageComplete(.sfmMatching)
                         try self.removeItemIfPresent(paths.pairGraphRecoveryURL)
                         recoveredAcceptedExactEvidence = true
                     } else {
-                        restorePendingExactRecovery(recovered)
+                        try restorePendingPairRecovery(recovered)
                         acceptedPairGraphEvidence = nil
-                        resumingPersistedExactRecovery = true
+                        if recovered.mode != .policy {
+                            resumingPersistedExactRecovery = true
+                        }
                     }
                 } catch is CancellationError {
                     throw CancellationError()
@@ -1491,9 +1811,65 @@ public final class PipelineRunner: @unchecked Sendable {
                     colmapMatchOptions.descriptorMatcher = resolvedRunPlan.normalDescriptorMatcher
                     pendingMatchingResetMessage = "Discarded inconsistent image-matching recovery data before resuming reconstruction."
                     restartingAfterInvalidRecoveryState = true
+                    try persistGeometryRecovery(activeBackend: .colmap)
                     emit(.stageLog(
                         stage: .sfmMatching,
                         line: "Discarded inconsistent pair-graph recovery state and restarted matching from preserved features.",
+                        isError: true
+                    ))
+                }
+            }
+
+            if resumingPersistedPolicyRecovery && !recoveredPolicyRecoverySidecar {
+                do {
+                    let previousEvidence = try PairGraphEvidenceStore.loadVerified(
+                        from: paths.pairGraphEvidenceURL,
+                        expectedImageNames: selectedImageNames,
+                        databaseURL: paths.colmapDatabaseURL,
+                        projectPaths: paths
+                    )
+                    try restoreAcceptedPairEvidence(previousEvidence)
+                    guard let pendingLevel = restoredGeometryRecovery?
+                        .pendingPairRecoveryLevel else {
+                        throw PairGraphEvidenceStoreError.invalidEvidence
+                    }
+                    pairRecoveryLevel = PairRecoveryLevel(pendingLevel)
+                    pairAttemptMode = .policy
+                    colmapMatchOptions.descriptorMatcher = resolvedRunPlan
+                        .normalDescriptorMatcher
+                    didRetryWithExactMatcher = false
+                    latestPreparedPairPlan = nil
+                    latestCompletedPairPlan = nil
+                    latestCompletedPairInspection = nil
+                    acceptedPairGraphEvidence = nil
+                    emit(.stageLog(
+                        stage: .sfmMatching,
+                        line: "Resuming the denser image-pair recovery graph.",
+                        isError: false
+                    ))
+                } catch is CancellationError {
+                    throw CancellationError()
+                } catch {
+                    try self.removeItemIfPresent(paths.pairGraphEvidenceURL)
+                    pairGraphAttempts.removeAll(keepingCapacity: true)
+                    matchingDurationSeconds = 0
+                    pairRecoveryLevel = .normal
+                    pairAttemptMode = .policy
+                    latestPreparedPairPlan = nil
+                    latestCompletedPairPlan = nil
+                    latestCompletedPairInspection = nil
+                    acceptedPairGraphEvidence = nil
+                    didRetryWithExactMatcher = false
+                    colmapMatchOptions.descriptorMatcher = resolvedRunPlan
+                        .normalDescriptorMatcher
+                    pendingMatchingResetMessage =
+                        "Discarded inconsistent image-pair recovery data before resuming reconstruction."
+                    restartingAfterInvalidRecoveryState = true
+                    resumingPersistedPolicyRecovery = false
+                    try persistGeometryRecovery(activeBackend: .colmap)
+                    emit(.stageLog(
+                        stage: .sfmMatching,
+                        line: "Discarded inconsistent image-pair recovery data and restarted matching from preserved features.",
                         isError: true
                     ))
                 }
@@ -1556,6 +1932,8 @@ public final class PipelineRunner: @unchecked Sendable {
                 resumingPersistedExactRecovery = false
                 recoveredAcceptedExactEvidence = false
                 restartingAfterInvalidRecoveryState = false
+                resumingPersistedPolicyRecovery = false
+                try persistGeometryRecovery(activeBackend: .colmap)
                 emit(.stageLog(
                     stage: .sfmFeatures,
                     line: colmapExtractOptions.useGPU ? "Using GPU for COLMAP feature extraction." : "Using CPU for COLMAP feature extraction.",
@@ -1624,12 +2002,14 @@ public final class PipelineRunner: @unchecked Sendable {
                 }
                 guard try (force
                     || resumingPersistedExactRecovery
+                    || resumingPersistedPolicyRecovery
                     || restartingAfterInvalidRecoveryState
                     || shouldRunStage(.sfmMatching)) else {
                     try loadPairGraphEvidenceIfNeeded()
                     return
                 }
                 resumingPersistedExactRecovery = false
+                resumingPersistedPolicyRecovery = false
                 restartingAfterInvalidRecoveryState = false
                 currentStage = .sfmMatching
                 emit(.stageStarted(stage: .sfmMatching))
@@ -1793,10 +2173,19 @@ public final class PipelineRunner: @unchecked Sendable {
                     attemptNumber: attemptNumber,
                     paths: paths
                 )
-                try persistExactRecoveryIntent(
-                    mode: attemptMode,
-                    activePlan: pairPlan
-                )
+                if case .policy = attemptMode,
+                   colmapMatchOptions.descriptorMatcher == .faiss,
+                   !pairGraphAttempts.isEmpty {
+                    try persistPairRecoveryIntent(
+                        mode: .policy,
+                        activePlan: pairPlan
+                    )
+                } else {
+                    try persistExactRecoveryIntent(
+                        mode: attemptMode,
+                        activePlan: pairPlan
+                    )
+                }
                 try self.removeItemIfPresent(paths.pairGraphEvidenceURL)
                 if pendingMatchingResetMessage == nil {
                     try ColmapDatabaseMatchStore.clearMatchingResults(
@@ -1871,10 +2260,18 @@ public final class PipelineRunner: @unchecked Sendable {
                         scheduledPairs: pairPlan.pairs
                     ))
                     matchingDurationSeconds += duration
-                    try persistExactRecoveryIntent(
-                        mode: attemptMode,
-                        activePlan: pairPlan
-                    )
+                    if case .policy = attemptMode,
+                       colmapMatchOptions.descriptorMatcher == .faiss {
+                        try persistPairRecoveryIntent(
+                            mode: .policy,
+                            activePlan: pairPlan
+                        )
+                    } else {
+                        try persistExactRecoveryIntent(
+                            mode: attemptMode,
+                            activePlan: pairPlan
+                        )
+                    }
                     throw matcherError
                 }
 
@@ -1931,6 +2328,7 @@ public final class PipelineRunner: @unchecked Sendable {
                     projectPaths: paths
                 )
                 acceptedPairGraphEvidence = evidence
+                try persistGeometryRecovery(activeBackend: .colmap)
                 writeCheckpoint(
                     stage: .sfmMatching,
                     progress: 1,
@@ -1949,7 +2347,7 @@ public final class PipelineRunner: @unchecked Sendable {
                 try stopIfRequested(after: .sfmMatching)
             }
 
-            let retryWithCpuIfNeeded: (Error) -> Bool = { error in
+            let retryWithCpuIfNeeded: (Error) throws -> Bool = { error in
                 guard !didRetryWithCpu else { return false }
                 guard colmapExtractOptions.useGPU || colmapMatchOptions.useGPU else { return false }
                 guard let colmapError = error as? ColmapRunnerError else { return false }
@@ -1958,17 +2356,39 @@ public final class PipelineRunner: @unchecked Sendable {
                 colmapExtractOptions.useGPU = false
                 colmapMatchOptions.useGPU = false
                 recordMappingFallback("CPU recovery after GPU failure")
+                if colmapMatchOptions.descriptorMatcher == .exact,
+                   let activePlan = latestPreparedPairPlan {
+                    try persistExactRecoveryIntent(
+                        mode: pairAttemptMode,
+                        activePlan: activePlan
+                    )
+                } else if let activePlan = latestPreparedPairPlan,
+                          !pairGraphAttempts.isEmpty {
+                    try persistPairRecoveryIntent(
+                        mode: .policy,
+                        activePlan: activePlan
+                    )
+                } else {
+                    try persistGeometryRecovery(
+                        activeBackend: .colmap,
+                        pendingPairRecoveryLevel: pairRecoveryLevel.artifactValue
+                    )
+                }
                 emit(.stageLog(stage: currentStage, line: "COLMAP GPU failed or unsupported; retrying on CPU.", isError: true))
                 return true
             }
 
-            let advancePairRecovery: (String) -> Bool = { reason in
+            let advancePairRecovery: (String) throws -> Bool = { reason in
                 guard let next = Self.nextPairRecoveryLevel(
                     after: pairRecoveryLevel,
                     imageCount: selectedFrames.count,
                     pairingPolicy: resolvedRunPlan.pairingPolicy
                 ) else {
                     return false
+                }
+                guard let recoverySourcePlan = latestCompletedPairPlan
+                        ?? latestPreparedPairPlan else {
+                    throw PairGraphEvidenceStoreError.invalidEvidence
                 }
                 pairRecoveryLevel = next
                 pairAttemptMode = .policy
@@ -1977,6 +2397,15 @@ public final class PipelineRunner: @unchecked Sendable {
                 latestCompletedPairInspection = nil
                 acceptedPairGraphEvidence = nil
                 recordMappingFallback(reason)
+                let recoveryMode: PairGraphRecoveryMode =
+                    colmapMatchOptions.descriptorMatcher == .exact
+                        ? .sameScheduleExact
+                        : .policy
+                try persistPairRecoveryIntent(
+                    mode: recoveryMode,
+                    activePlan: recoverySourcePlan,
+                    phase: .preparing
+                )
                 emit(.stageLog(
                     stage: currentStage,
                     line: "\(reason). Retrying with a denser pair graph.",
@@ -2003,7 +2432,7 @@ public final class PipelineRunner: @unchecked Sendable {
                     } catch {
                         if error is CancellationError { throw error }
                         try Task.checkCancellation()
-                        if retryWithCpuIfNeeded(error) {
+                        if try retryWithCpuIfNeeded(error) {
                             forceSfMRun = currentStage == .sfmFeatures
                             forceMatchingRun = currentStage == .sfmMatching
                             continue
@@ -2053,14 +2482,14 @@ public final class PipelineRunner: @unchecked Sendable {
                             continue
                         }
                         if pairPlanningError == .repeatedAttempt,
-                           advancePairRecovery("Image retrieval repeated the previous pair graph") {
+                           try advancePairRecovery("Image retrieval repeated the previous pair graph") {
                             forceSfMRun = false
                             forceMatchingRun = true
                             continue
                         }
                         if (pairPlanningError == .disconnectedPairSchedule
                                 || pairPlanningError == .disconnectedVerifiedGraph),
-                           advancePairRecovery("Image matching did not produce a connected graph") {
+                           try advancePairRecovery("Image matching did not produce a connected graph") {
                             self.emitColmapRetryDiagnostics(
                                 error,
                                 stage: .sfmMatching,
@@ -2172,21 +2601,47 @@ public final class PipelineRunner: @unchecked Sendable {
                     var lastMappingError: Error?
                     var selectedMappedModel: MappedSparseModelCandidate?
                     var selectedMappedModelSnapshot: MappedSparseModelSnapshot?
+                    var selectedMappedModelTextIsCanonical = false
 
                     func evaluateMappingResult() async throws -> Bool {
                         let modelDirectories = try self.mappedSparseModelDirectories(
                             in: paths.colmapSparseURL
                         )
-                        var candidates: [(
-                            candidate: MappedSparseModelCandidate,
-                            snapshot: MappedSparseModelSnapshot
-                        )] = []
+                        var snapshots: [Int: MappedSparseModelSnapshot] = [:]
+                        snapshots.reserveCapacity(modelDirectories.count)
+                        for model in modelDirectories {
+                            snapshots[model.order] = try self.captureMappedSparseModel(
+                                at: model.url
+                            )
+                        }
+                        let memberships = try ColmapSparseModelMembershipReader(
+                            databaseURL: paths.colmapDatabaseURL,
+                            selectedImageNames: selectedFrames.map(\.lastPathComponent)
+                        ).read(
+                            modelDirectories: modelDirectories.map(\.url),
+                            checkCancellation: self.tooling.checkCancellation
+                        )
+                        for model in modelDirectories {
+                            guard let snapshot = snapshots[model.order] else {
+                                throw PipelineError.outputMissing
+                            }
+                            try self.validateMappedSparseModel(snapshot, at: model.url)
+                        }
+                        let membershipByOrder = Dictionary(
+                            uniqueKeysWithValues: memberships.models.map {
+                                ($0.modelOrder, $0.imageIDs.count)
+                            }
+                        )
+                        var candidates: [MappedSparseModelCandidate] = []
                         candidates.reserveCapacity(modelDirectories.count)
                         var firstAnalysisError: Error?
                         for model in modelDirectories {
                             try Task.checkCancellation()
                             do {
-                                let snapshot = try self.captureMappedSparseModel(at: model.url)
+                                guard let snapshot = snapshots[model.order],
+                                      let membershipCount = membershipByOrder[model.order] else {
+                                    throw PipelineError.outputMissing
+                                }
                                 let report = try await self.tooling.colmap.runModelAnalyzer(
                                     colmapPath: self.config.toolchain.colmap,
                                     modelPath: model.url,
@@ -2197,16 +2652,17 @@ public final class PipelineRunner: @unchecked Sendable {
                                 for line in report.split(separator: "\n", omittingEmptySubsequences: false) {
                                     colmapToolLog.append(stream: "stdout", line: String(line))
                                 }
-                                candidates.append((
-                                    candidate: MappedSparseModelCandidate(
-                                        url: model.url,
-                                        order: model.order,
-                                        score: ReconstructionScorer.applyingExpectedTotalImages(
-                                            ReconstructionScorer.parseModelAnalyzerOutput(report),
-                                            expectedTotalImages: selectedFrames.count
-                                        )
-                                    ),
-                                    snapshot: snapshot
+                                let score = ReconstructionScorer.applyingExpectedTotalImages(
+                                    ReconstructionScorer.parseModelAnalyzerOutput(report),
+                                    expectedTotalImages: selectedFrames.count
+                                )
+                                guard score.registeredImages == membershipCount else {
+                                    throw PipelineError.geometryRegisteredImagesMismatch
+                                }
+                                candidates.append(MappedSparseModelCandidate(
+                                    url: model.url,
+                                    order: model.order,
+                                    score: score
                                 ))
                             } catch {
                                 if error is CancellationError { throw error }
@@ -2222,80 +2678,128 @@ public final class PipelineRunner: @unchecked Sendable {
                         guard !candidates.isEmpty else {
                             throw firstAnalysisError ?? PipelineError.outputMissing
                         }
-                        guard let selectedCandidate = Self.selectMappedSparseModel(
-                            from: candidates.map(\.candidate),
+                        let rankedCandidates = Self.rankedMappedSparseModels(
+                            candidates,
                             capturePath: resolvedRunPlan.capturePath
-                        ), let selected = candidates.first(where: {
-                            $0.candidate.order == selectedCandidate.order
-                                && $0.candidate.url == selectedCandidate.url
-                        }) else {
+                        )
+                        guard !rankedCandidates.isEmpty else {
                             throw PipelineError.outputMissing
                         }
-                        var selectedSnapshot = selected.snapshot
-                        let score = selected.candidate.score
-                        let modelLabel = String(selected.candidate.order)
-                        writeCheckpoint(
-                            stage: .sfmMapping,
-                            progress: 0.95,
-                            message: "Mapping score: \(ReconstructionScorer.summary(score))",
-                            details: .sfmMapping(SfmMappingCheckpoint(
-                                mapper: "colmap",
-                                sparsePath: try paths.projectRelativePath(for: selected.candidate.url),
-                                registeredImages: score.registeredImages
-                            ))
-                        )
-                        emit(.stageLog(
-                            stage: .sfmMapping,
-                            line: "Selected COLMAP model \(modelLabel) (\(score.registeredImages)/\(score.totalImages) registered views).",
-                            isError: false
-                        ))
-                        emit(.stageLog(
-                            stage: .sfmMapping,
-                            line: "Reconstruction score (colmap): \(ReconstructionScorer.summary(score)).",
-                            isError: false
-                        ))
-                        if ReconstructionScorer.isAcceptable(
-                            score,
-                            capturePath: resolvedRunPlan.capturePath
-                        ) {
-                            if case .targetedExact = pairAttemptMode {
-                                do {
-                                    _ = try self.ensureTextSparseModelFiles(
-                                        at: selected.candidate.url
-                                    )
-                                    _ = try self.validatedGeometryMeasurement(
-                                        modelDirectory: selected.candidate.url,
-                                        selectedFrames: selectedFrames,
-                                        requireStrongObservationCoverage: true
-                                    )
-                                    selectedSnapshot = try self.captureMappedSparseModel(
-                                        at: selected.candidate.url
-                                    )
-                                } catch {
-                                    if error is CancellationError { throw error }
-                                    try Task.checkCancellation()
-                                    lastMappingError = Self.normalizedUnusableSparseModelError(error)
-                                    return false
+                        var preferredValidationError: Error?
+                        var preferredLowQualityScore: ReconstructionScore?
+                        for selected in rankedCandidates {
+                            let score = selected.score
+                            guard ReconstructionScorer.isAcceptable(
+                                score,
+                                capturePath: resolvedRunPlan.capturePath
+                            ) else {
+                                if preferredLowQualityScore == nil {
+                                    preferredLowQualityScore = score
                                 }
+                                continue
                             }
-                            selectedMappedModel = selected.candidate
-                            selectedMappedModelSnapshot = selectedSnapshot
-                            self.warnIfWeakAcceptedSolve(score: score, mapper: "colmap", emit: emit)
-                            acceptedReconstructionSummary = ReconstructionSummary(
-                                score: score,
-                                mapper: "colmap",
-                                capturedAt: Date()
-                            )
-                            return true
-                        } else {
-                            lastMappingError = PipelineError.lowQualityReconstruction(score, mapper: "colmap")
-                            return false
+                            let modelLabel = String(selected.order)
+                            do {
+                                _ = try self.ensureTextSparseModelFiles(
+                                    at: selected.url
+                                )
+                                let requireStrongObservationCoverage: Bool
+                                if case .targetedExact = pairAttemptMode {
+                                    requireStrongObservationCoverage = true
+                                } else {
+                                    requireStrongObservationCoverage = false
+                                }
+                                _ = try self.validatedGeometryMeasurement(
+                                    modelDirectory: selected.url,
+                                    selectedFrames: selectedFrames,
+                                    requireStrongObservationCoverage: requireStrongObservationCoverage
+                                )
+                                let selectedSnapshot = try self.captureMappedSparseModel(
+                                    at: selected.url
+                                )
+                                writeCheckpoint(
+                                    stage: .sfmMapping,
+                                    progress: 0.95,
+                                    message: "Mapping score: \(ReconstructionScorer.summary(score))",
+                                    details: .sfmMapping(SfmMappingCheckpoint(
+                                        mapper: "colmap",
+                                        sparsePath: try paths.projectRelativePath(
+                                            for: selected.url
+                                        ),
+                                        registeredImages: score.registeredImages
+                                    ))
+                                )
+                                emit(.stageLog(
+                                    stage: .sfmMapping,
+                                    line: "Selected COLMAP model \(modelLabel) (\(score.registeredImages)/\(score.totalImages) registered views).",
+                                    isError: false
+                                ))
+                                emit(.stageLog(
+                                    stage: .sfmMapping,
+                                    line: "Reconstruction score (colmap): \(ReconstructionScorer.summary(score)).",
+                                    isError: false
+                                ))
+                                selectedMappedModel = selected
+                                selectedMappedModelSnapshot = selectedSnapshot
+                                selectedMappedModelTextIsCanonical = true
+                                acceptedMappingArtifact = MappingArtifact(
+                                    modelCount: memberships.modelCount,
+                                    largestModelRegisteredViewCount:
+                                        memberships.largestModelRegisteredViewCount,
+                                    secondLargestModelRegisteredViewCount:
+                                        memberships.secondLargestModelRegisteredViewCount,
+                                    unionRegisteredViewCount:
+                                        memberships.unionRegisteredViewCount,
+                                    attemptCount: mappingAttemptCount,
+                                    acceptedRefinementKind: .incrementalGlobal,
+                                    acceptedRefinementInvocationCount:
+                                        mappingProgress.globalRefinementInvocationCount,
+                                    fallbackReason: nil
+                                )
+                                self.warnIfWeakAcceptedSolve(
+                                    score: score,
+                                    mapper: "colmap",
+                                    emit: emit
+                                )
+                                acceptedReconstructionSummary = ReconstructionSummary(
+                                    score: score,
+                                    mapper: "colmap",
+                                    capturedAt: Date()
+                                )
+                                return true
+                            } catch {
+                                if error is CancellationError { throw error }
+                                try Task.checkCancellation()
+                                let validationError = Self.normalizedUnusableSparseModelError(
+                                    error
+                                )
+                                if preferredValidationError == nil {
+                                    preferredValidationError = validationError
+                                }
+                                emit(.stageLog(
+                                    stage: .sfmMapping,
+                                    line: "Rejected COLMAP model \(modelLabel) because its measured geometry did not pass validation; trying the next reconstruction candidate.",
+                                    isError: true
+                                ))
+                            }
                         }
+
+                        if let preferredValidationError {
+                            lastMappingError = preferredValidationError
+                        } else if let preferredLowQualityScore {
+                            lastMappingError = PipelineError.lowQualityReconstruction(
+                                preferredLowQualityScore,
+                                mapper: "colmap"
+                            )
+                        } else {
+                            lastMappingError = PipelineError.outputMissing
+                        }
+                        return false
                     }
 
                     do {
+                        try beginMappingAttempt(activeBackend: .colmap)
                         try self.resetDirectory(paths.colmapSparseURL)
-                        mappingAttemptCount += 1
                         try await self.tooling.colmap.runMapper(
                             colmapPath: self.config.toolchain.colmap,
                             database: paths.colmapDatabaseURL,
@@ -2321,8 +2825,6 @@ public final class PipelineRunner: @unchecked Sendable {
                         try Task.checkCancellation()
                         lastMappingError = Self.normalizedUnusableSparseModelError(error)
                     }
-                    bundleAdjustmentCycleCount += mappingProgress.globalRefinementCycleCount
-
                     if !mappingSucceeded,
                        Self.shouldEscalateTargetedExact(after: lastMappingError),
                        case .targetedExact(_, let sourcePlan) = pairAttemptMode {
@@ -2347,7 +2849,7 @@ public final class PipelineRunner: @unchecked Sendable {
                     if !mappingSucceeded,
                        let pipelineError = lastMappingError as? PipelineError,
                        case .lowQualityReconstruction = pipelineError,
-                       advancePairRecovery("Reconstruction coverage was below the acceptance gate") {
+                       try advancePairRecovery("Reconstruction coverage was below the acceptance gate") {
                         suspendStageTimingForRetry(.sfmMapping)
                         forceSfMRun = false
                         forceMatchingRun = true
@@ -2417,7 +2919,16 @@ public final class PipelineRunner: @unchecked Sendable {
                         at: paths.colmapSparseURL
                     )
                     let canonicalSparseModel = paths.colmapSparseURL.appendingPathComponent("0", isDirectory: true)
-                    if try ensureTextSparseModelFiles(at: canonicalSparseModel) {
+                    let convertedCanonicalModel: Bool
+                    if selectedMappedModelTextIsCanonical {
+                        try requireTextSparseModelFiles(at: canonicalSparseModel)
+                        convertedCanonicalModel = false
+                    } else {
+                        convertedCanonicalModel = try ensureTextSparseModelFiles(
+                            at: canonicalSparseModel
+                        )
+                    }
+                    if convertedCanonicalModel {
                         emit(.stageLog(
                             stage: .sfmMapping,
                             line: "Converted sparse model to COLMAP text format for training compatibility.",
@@ -2495,21 +3006,20 @@ public final class PipelineRunner: @unchecked Sendable {
                     : mappingFallbackReasons.joined(separator: "; ")
                 let measuredPairGraph: PairGraphArtifact
                 if mapper.lowercased().contains("da3") {
-                    measuredPairGraph = .notEvaluated(
-                        mappingAttemptNumber: mappingAttemptCount,
-                        bundleAdjustmentCycleCount: bundleAdjustmentCycleCount,
-                        fallbackReason: mappingFallbackReason
-                    )
+                    measuredPairGraph = .notEvaluated()
                 } else {
                     guard let pairEvidence = acceptedPairGraphEvidence else {
                         throw PairGraphEvidenceStoreError.invalidEvidence
                     }
-                    measuredPairGraph = try pairEvidence.pairGraphArtifact(
-                        mappingAttemptNumber: mappingAttemptCount,
-                        bundleAdjustmentCycleCount: bundleAdjustmentCycleCount,
-                        fallbackReason: mappingFallbackReason
+                    measuredPairGraph = try pairEvidence.pairGraphArtifact()
+                }
+                guard var measuredMapping = acceptedMappingArtifact else {
+                    throw PipelineError.geometryResidualsUnavailable(
+                        "The accepted camera solve did not produce mapping evidence"
                     )
                 }
+                measuredMapping.attemptCount = mappingAttemptCount
+                measuredMapping.fallbackReason = mappingFallbackReason
                 try persistMeasuredGeometryArtifact(
                     metadata: &metadata,
                     paths: paths,
@@ -2520,6 +3030,7 @@ public final class PipelineRunner: @unchecked Sendable {
                     selectedFrameManifest: currentSelectedFrameManifest,
                     peakMemoryBytes: geometryPeakMemoryBytes,
                     pairGraph: measuredPairGraph,
+                    mapping: measuredMapping,
                     acceptedReconstructionSummary: acceptedReconstructionSummary,
                     currentMappingDurationSeconds: {
                         stageTiming.elapsedSeconds(.sfmMapping)
@@ -2575,6 +3086,7 @@ public final class PipelineRunner: @unchecked Sendable {
                 ))
                 try cleanForRetry(failedStage: .sfmFeatures, paths: paths)
                 try paths.ensureDirectories()
+                try persistGeometryRecovery(activeBackend: nextBackend)
                 continue
             }
             break

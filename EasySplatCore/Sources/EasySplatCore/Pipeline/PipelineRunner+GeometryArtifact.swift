@@ -67,13 +67,14 @@ extension PipelineRunner {
         selectedFrameManifest: [SelectedFrameMapping],
         peakMemoryBytes: Int64,
         pairGraph: PairGraphArtifact,
+        mapping: MappingArtifact,
         acceptedReconstructionSummary: ReconstructionSummary?,
         currentMappingDurationSeconds: () -> TimeInterval?
     ) throws {
         let modelDirectory = paths.colmapSparseURL.appendingPathComponent("0", isDirectory: true)
         // The artifact contract uses COLMAP's text form so residuals remain inspectable
         // and model files remain hashable across trainer versions.
-        _ = try ensureTextSparseModelFiles(at: modelDirectory)
+        try requireTextSparseModelFiles(at: modelDirectory)
         let measurement = try validatedGeometryMeasurement(
             modelDirectory: modelDirectory,
             selectedFrames: selectedFrames,
@@ -198,6 +199,7 @@ extension PipelineRunner {
             fallbackReason: fallbackReason,
             provenance: provenance,
             pairGraph: pairGraph,
+            mapping: mapping,
             learnedPointInitializer: learnedPointInitializer,
             canonicalOrientation: orientation.artifact
         )
@@ -217,6 +219,7 @@ extension PipelineRunner {
         try Task.checkCancellation()
         var persistedMetadata = metadata
         persistedMetadata.reconstruction = reconstruction
+        persistedMetadata.geometryRecovery = nil
         try GeometryArtifactStore.persist(
             artifact,
             metadata: &persistedMetadata,

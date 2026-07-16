@@ -5,7 +5,7 @@ public enum ProjectMetadataStore {
     private static let maximumMetadataBytes = 8 * 1_024 * 1_024
     private static let fileLocks = ProjectMetadataFileLocks()
     /// The one project format this beta reads and writes.
-    public static let supportedFormatVersion: Int = 6
+    public static let supportedFormatVersion: Int = 7
 
     public enum LoadError: Error, LocalizedError {
         case unsupportedFormatVersion(Int)
@@ -13,6 +13,7 @@ public enum ProjectMetadataStore {
         case invalidArtifactNamespace(field: String, path: String)
         case unsupportedGeometryArtifactSchema(Int)
         case invalidTrainingMemoryRetryBudget(Int64)
+        case invalidGeometryRecovery(String)
 
         public var errorDescription: String? {
             switch self {
@@ -26,6 +27,8 @@ public enum ProjectMetadataStore {
                 return "Project metadata contains unsupported geometry artifact schema \(schema)."
             case .invalidTrainingMemoryRetryBudget(let bytes):
                 return "Project metadata contains an invalid training memory retry budget: \(bytes) bytes."
+            case .invalidGeometryRecovery(let reason):
+                return "Project metadata contains invalid geometry recovery state: \(reason)"
             }
         }
     }
@@ -88,7 +91,13 @@ public enum ProjectMetadataStore {
     }
 
     private static func loadWithoutLock(from url: URL) throws -> ProjectMetadata {
-        let metadata = try decodeWithoutArtifactValidation(from: url)
+        var metadata = try decodeWithoutArtifactValidation(from: url)
+        if let recovery = metadata.geometryRecovery,
+           (try? recovery.validate()) == nil {
+            // Recovery evidence is disposable internal state. A torn or stale
+            // recovery payload must not make the project itself unreadable.
+            metadata.geometryRecovery = nil
+        }
         try validateArtifactPaths(in: metadata, metadataURL: url)
         return metadata
     }
@@ -158,6 +167,13 @@ public enum ProjectMetadataStore {
         if let artifact = metadata.geometryArtifact,
            artifact.schemaVersion != GeometryArtifact.currentSchemaVersion {
             throw LoadError.unsupportedGeometryArtifactSchema(artifact.schemaVersion)
+        }
+        if let recovery = metadata.geometryRecovery {
+            do {
+                try recovery.validate()
+            } catch {
+                throw LoadError.invalidGeometryRecovery(error.localizedDescription)
+            }
         }
         var artifactPaths: [(field: String, path: String)] = []
         if let path = metadata.geometryArtifact?.sourceModelPath {

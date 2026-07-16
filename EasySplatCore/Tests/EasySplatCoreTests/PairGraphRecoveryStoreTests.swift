@@ -25,14 +25,14 @@ final class PairGraphRecoveryStoreTests: XCTestCase {
             matchingDurationSeconds: 0.5,
             fallbackReasons: ["exact descriptor matching"]
         )
-        state.schemaVersion = 1
+        state.schemaVersion = 2
 
         XCTAssertThrowsError(try PairGraphRecoveryStore.save(
             state,
             to: fixture.paths.pairGraphRecoveryURL,
             projectPaths: fixture.paths
         )) { error in
-            XCTAssertEqual(error as? PairGraphRecoveryStoreError, .invalidSchema(1))
+            XCTAssertEqual(error as? PairGraphRecoveryStoreError, .invalidSchema(2))
         }
     }
 
@@ -51,6 +51,7 @@ final class PairGraphRecoveryStoreTests: XCTestCase {
             selectedFramesDigest: fixture.selectedFramesDigest,
             imageNames: plans.source.imageNames,
             mode: .targetedExact,
+            computeMode: .cpu,
             activeRecoveryLevel: .maximum,
             activePlan: plans.targeted,
             attempts: [policy],
@@ -72,11 +73,174 @@ final class PairGraphRecoveryStoreTests: XCTestCase {
 
         XCTAssertEqual(loaded, state)
         XCTAssertEqual(restored.mode, .targetedExact)
+        XCTAssertEqual(restored.computeMode, .cpu)
         XCTAssertEqual(restored.activePlan, plans.targeted)
         XCTAssertEqual(restored.sourcePlan, plans.source)
         XCTAssertEqual(restored.attempts, [policy])
         XCTAssertEqual(restored.matchingDurationSeconds, 1.25)
         XCTAssertEqual(restored.fallbackReasons, ["exact descriptor matching"])
+    }
+
+    func testPolicyRecoveryRoundTripPreservesHistoryAcrossDensityEscalation() throws {
+        let fixture = try makeProject()
+        defer { try? FileManager.default.removeItem(at: fixture.root) }
+        let plans = try makePlans()
+        let normalAttempt = makeAttempt(
+            number: 1,
+            matcher: .faiss,
+            recoveryLevel: .normal,
+            outcome: .completed,
+            plan: plans.targeted,
+            duration: 1.25
+        )
+        let state = PairGraphRecoveryState(
+            selectedFramesDigest: fixture.selectedFramesDigest,
+            imageNames: plans.source.imageNames,
+            mode: .policy,
+            activeRecoveryLevel: .expanded,
+            activePlan: plans.source,
+            attempts: [normalAttempt],
+            matchingDurationSeconds: 1.25,
+            fallbackReasons: ["Reconstruction coverage was below the acceptance gate"]
+        )
+
+        try PairGraphRecoveryStore.save(
+            state,
+            to: fixture.paths.pairGraphRecoveryURL,
+            projectPaths: fixture.paths
+        )
+        let restored = try PairGraphRecoveryStore.loadBound(
+            from: fixture.paths.pairGraphRecoveryURL,
+            expectedImageNames: plans.source.imageNames,
+            projectPaths: fixture.paths
+        ).restoredRecovery()
+
+        XCTAssertEqual(restored.mode, .policy)
+        XCTAssertEqual(restored.recoveryLevel, .expanded)
+        XCTAssertEqual(restored.activePlan, plans.source)
+        XCTAssertEqual(restored.sourcePlan, plans.targeted)
+        XCTAssertEqual(restored.attempts, [normalAttempt])
+    }
+
+    func testPreparingPolicyRecoveryPreservesDisconnectedPlanningFailure() throws {
+        let fixture = try makeProject()
+        defer { try? FileManager.default.removeItem(at: fixture.root) }
+        let imageNames = ["a.jpg", "b.jpg", "c.jpg", "d.jpg"]
+        let disconnected = try ColmapPairPlan.persisted(
+            imageNames: imageNames,
+            scheduledPairs: [ColmapScheduledPair("a.jpg", "b.jpg", role: .local)]
+        )
+        let attempt = makeAttempt(
+            number: 1,
+            matcher: .faiss,
+            recoveryLevel: .normal,
+            outcome: .failed,
+            plan: disconnected,
+            duration: 1
+        )
+        let state = PairGraphRecoveryState(
+            selectedFramesDigest: fixture.selectedFramesDigest,
+            imageNames: imageNames,
+            mode: .policy,
+            phase: .preparing,
+            activeRecoveryLevel: .expanded,
+            activePlan: disconnected,
+            attempts: [attempt],
+            matchingDurationSeconds: 1,
+            fallbackReasons: ["Image matching did not produce a connected graph"]
+        )
+
+        let restored = try state.restoredRecovery()
+
+        XCTAssertEqual(restored.phase, .preparing)
+        XCTAssertEqual(restored.mode, .policy)
+        XCTAssertEqual(restored.activePlan, disconnected)
+        XCTAssertEqual(restored.recoveryLevel, .expanded)
+    }
+
+    func testPreparingExactRecoveryPreservesDensityTransitionBeforePlanExists() throws {
+        let fixture = try makeProject()
+        defer { try? FileManager.default.removeItem(at: fixture.root) }
+        let plans = try makePlans()
+        let attempts = [
+            makeAttempt(
+                number: 1,
+                matcher: .faiss,
+                recoveryLevel: .normal,
+                outcome: .failed,
+                plan: plans.targeted,
+                duration: 1
+            ),
+            makeAttempt(
+                number: 2,
+                matcher: .exact,
+                recoveryLevel: .normal,
+                outcome: .completed,
+                plan: plans.targeted,
+                duration: 2
+            ),
+        ]
+        let state = PairGraphRecoveryState(
+            selectedFramesDigest: fixture.selectedFramesDigest,
+            imageNames: plans.source.imageNames,
+            mode: .sameScheduleExact,
+            phase: .preparing,
+            activeRecoveryLevel: .expanded,
+            activePlan: plans.targeted,
+            attempts: attempts,
+            matchingDurationSeconds: 3,
+            fallbackReasons: ["exact descriptor matching"]
+        )
+
+        let restored = try state.restoredRecovery()
+
+        XCTAssertEqual(restored.phase, .preparing)
+        XCTAssertEqual(restored.mode, .sameScheduleExact)
+        XCTAssertEqual(restored.activePlan, plans.targeted)
+        XCTAssertEqual(restored.recoveryLevel, .expanded)
+    }
+
+    func testPolicyRecoveryRejectsExactOrSkippedDensityHistory() throws {
+        let fixture = try makeProject()
+        defer { try? FileManager.default.removeItem(at: fixture.root) }
+        let plans = try makePlans()
+        let exactAttempt = makeAttempt(
+            number: 1,
+            matcher: .exact,
+            recoveryLevel: .normal,
+            outcome: .failed,
+            plan: plans.targeted,
+            duration: 1
+        )
+        let skippedDensity = makeAttempt(
+            number: 1,
+            matcher: .faiss,
+            recoveryLevel: .normal,
+            outcome: .completed,
+            plan: plans.targeted,
+            duration: 1
+        )
+
+        XCTAssertThrowsError(try PairGraphRecoveryState(
+            selectedFramesDigest: fixture.selectedFramesDigest,
+            imageNames: plans.source.imageNames,
+            mode: .policy,
+            activeRecoveryLevel: .expanded,
+            activePlan: plans.source,
+            attempts: [exactAttempt],
+            matchingDurationSeconds: 1,
+            fallbackReasons: []
+        ).restoredRecovery())
+        XCTAssertThrowsError(try PairGraphRecoveryState(
+            selectedFramesDigest: fixture.selectedFramesDigest,
+            imageNames: plans.source.imageNames,
+            mode: .policy,
+            activeRecoveryLevel: .maximum,
+            activePlan: plans.source,
+            attempts: [skippedDensity],
+            matchingDurationSeconds: 1,
+            fallbackReasons: []
+        ).restoredRecovery())
     }
 
     func testSameScheduleAndFullRecoveryRestoreCanonicalPlans() throws {
@@ -438,7 +602,7 @@ final class PairGraphRecoveryStoreTests: XCTestCase {
         let plans = try makePlans()
 
         func state(
-            mode: PairGraphExactRecoveryMode,
+            mode: PairGraphRecoveryMode,
             attempts: [PairGraphAttemptEvidence],
             activeLevel: PairGraphRecoveryLevel,
             activePlan: ColmapPairPlan

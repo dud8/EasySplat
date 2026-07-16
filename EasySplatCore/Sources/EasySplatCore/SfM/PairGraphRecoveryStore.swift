@@ -1,18 +1,26 @@
 import Foundation
 
-enum PairGraphExactRecoveryMode: String, Codable, Sendable, Equatable {
+enum PairGraphRecoveryMode: String, Codable, Sendable, Equatable {
+    case policy
     case sameScheduleExact
     case targetedExact
     case fullExact
 }
 
+enum PairGraphRecoveryPhase: String, Codable, Sendable, Equatable {
+    case preparing
+    case matching
+}
+
 struct PairGraphRecoveryState: Codable, Sendable, Equatable {
-    static let currentSchemaVersion = 2
+    static let currentSchemaVersion = 4
 
     var schemaVersion: Int
     var selectedFramesDigest: String
     var imageNames: [String]
-    var mode: PairGraphExactRecoveryMode
+    var mode: PairGraphRecoveryMode
+    var computeMode: GeometryRecoveryComputeMode
+    var phase: PairGraphRecoveryPhase
     var activeRecoveryLevel: PairGraphRecoveryLevel
     var activeScheduledPairs: [ColmapScheduledPair]
     var activePairListDigest: String
@@ -23,7 +31,9 @@ struct PairGraphRecoveryState: Codable, Sendable, Equatable {
     init(
         selectedFramesDigest: String,
         imageNames: [String],
-        mode: PairGraphExactRecoveryMode,
+        mode: PairGraphRecoveryMode,
+        computeMode: GeometryRecoveryComputeMode = .gpu,
+        phase: PairGraphRecoveryPhase = .matching,
         activeRecoveryLevel: PairGraphRecoveryLevel,
         activePlan: ColmapPairPlan,
         attempts: [PairGraphAttemptEvidence],
@@ -34,6 +44,8 @@ struct PairGraphRecoveryState: Codable, Sendable, Equatable {
         self.selectedFramesDigest = selectedFramesDigest
         self.imageNames = imageNames
         self.mode = mode
+        self.computeMode = computeMode
+        self.phase = phase
         self.activeRecoveryLevel = activeRecoveryLevel
         activeScheduledPairs = activePlan.pairs
         activePairListDigest = activePlan.sha256
@@ -48,7 +60,9 @@ struct PairGraphRecoveryState: Codable, Sendable, Equatable {
 }
 
 struct RestoredPairGraphRecovery: Sendable, Equatable {
-    let mode: PairGraphExactRecoveryMode
+    let mode: PairGraphRecoveryMode
+    let computeMode: GeometryRecoveryComputeMode
+    let phase: PairGraphRecoveryPhase
     let activePlan: ColmapPairPlan
     let sourcePlan: ColmapPairPlan
     let recoveryLevel: PairGraphRecoveryLevel
@@ -184,8 +198,7 @@ enum PairGraphRecoveryStore {
             imageNames: state.imageNames,
             scheduledPairs: state.activeScheduledPairs
         )
-        guard activePlan.isConnected,
-              activePlan.sha256 == state.activePairListDigest else {
+        guard activePlan.sha256 == state.activePairListDigest else {
             throw PairGraphRecoveryStoreError.invalidState
         }
         let policyHistory = try validatePolicyHistory(
@@ -195,6 +208,42 @@ enum PairGraphRecoveryStore {
 
         let firstRecoveryIndex = state.attempts.firstIndex {
             $0.purpose != .policy
+        }
+        if state.mode == .policy {
+            guard firstRecoveryIndex == nil,
+                  policyHistory.lastAttempt.artifact.matcher == .faiss else {
+                throw PairGraphRecoveryStoreError.invalidState
+            }
+            let historicalLevel = recoveryLevelIndex(
+                policyHistory.lastAttempt.artifact.recoveryLevel
+            )
+            let activeLevel = recoveryLevelIndex(state.activeRecoveryLevel)
+            let validPhase: Bool
+            switch state.phase {
+            case .preparing:
+                validPhase = activeLevel == historicalLevel + 1
+                    && activePlan == policyHistory.lastPlan
+            case .matching:
+                validPhase = activePlan.isConnected
+                    && activeLevel >= historicalLevel
+                    && activeLevel - historicalLevel <= 1
+                    && (activeLevel != historicalLevel
+                        || activePlan == policyHistory.lastPlan)
+            }
+            guard validPhase else {
+                throw PairGraphRecoveryStoreError.invalidState
+            }
+            return RestoredPairGraphRecovery(
+                mode: state.mode,
+                computeMode: state.computeMode,
+                phase: state.phase,
+                activePlan: activePlan,
+                sourcePlan: policyHistory.lastPlan,
+                recoveryLevel: state.activeRecoveryLevel,
+                attempts: state.attempts,
+                matchingDurationSeconds: state.matchingDurationSeconds,
+                fallbackReasons: state.fallbackReasons
+            )
         }
         if state.mode == .sameScheduleExact {
             guard firstRecoveryIndex == nil else {
@@ -208,7 +257,13 @@ enum PairGraphRecoveryStore {
                   activeLevel - historicalLevel <= 1 else {
                 throw PairGraphRecoveryStoreError.invalidState
             }
-            if activeLevel == historicalLevel {
+            if state.phase == .preparing {
+                guard activeLevel == historicalLevel + 1,
+                      policyHistory.lastAttempt.artifact.matcher == .exact,
+                      activePlan == policyHistory.lastPlan else {
+                    throw PairGraphRecoveryStoreError.invalidState
+                }
+            } else if activeLevel == historicalLevel {
                 guard activePlan == policyHistory.lastPlan,
                       policyHistory.lastAttempt.artifact.matcher != .exact
                           || policyHistory.lastAttempt.artifact.outcome != .completed else {
@@ -217,12 +272,15 @@ enum PairGraphRecoveryStore {
             } else {
                 let predecessor = policyHistory.lastAttempt.artifact
                 guard predecessor.matcher == .exact,
+                      activePlan.isConnected,
                       activePlan != policyHistory.lastPlan else {
                     throw PairGraphRecoveryStoreError.invalidState
                 }
             }
             return RestoredPairGraphRecovery(
                 mode: state.mode,
+                computeMode: state.computeMode,
+                phase: state.phase,
                 activePlan: activePlan,
                 sourcePlan: activePlan,
                 recoveryLevel: state.activeRecoveryLevel,
@@ -232,6 +290,9 @@ enum PairGraphRecoveryStore {
             )
         }
 
+        guard state.phase == .matching, activePlan.isConnected else {
+            throw PairGraphRecoveryStoreError.invalidState
+        }
         let sourceAttemptIndex: Int?
         if let firstRecoveryIndex {
             sourceAttemptIndex = firstRecoveryIndex > 0
@@ -260,6 +321,8 @@ enum PairGraphRecoveryStore {
 
         let recoveryAttempts = Array(state.attempts.dropFirst(sourceAttemptIndex + 1))
         switch state.mode {
+        case .policy:
+            throw PairGraphRecoveryStoreError.invalidState
         case .sameScheduleExact:
             throw PairGraphRecoveryStoreError.invalidState
 
@@ -304,6 +367,8 @@ enum PairGraphRecoveryStore {
         try Task.checkCancellation()
         return RestoredPairGraphRecovery(
             mode: state.mode,
+            computeMode: state.computeMode,
+            phase: state.phase,
             activePlan: activePlan,
             sourcePlan: sourcePlan,
             recoveryLevel: state.activeRecoveryLevel,

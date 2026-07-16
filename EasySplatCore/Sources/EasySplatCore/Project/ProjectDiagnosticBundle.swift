@@ -15,7 +15,7 @@ public enum ProjectDiagnosticBundle {
     /// Schema version embedded in the machine-readable JSON block. Bump
     /// when adding/removing/renaming top-level keys so downstream tools can
     /// detect a format change.
-    public static let machineReadableSchemaVersion = 4
+    public static let machineReadableSchemaVersion = 6
 
     /// Scrub a user-visible technical payload before it reaches a clipboard,
     /// save panel, or share surface. Project identity is included when the
@@ -77,7 +77,10 @@ public enum ProjectDiagnosticBundle {
             let suffix = notes.count > cap ? "\n…(notes truncated to \(cap) characters)" : ""
             sections.append("## Notes\n\(sanitized)\(suffix)")
         }
-        if let reconstructionSection = reconstructionSection(metadata: metadata) {
+        if let reconstructionSection = reconstructionSection(
+            metadata: metadata,
+            sanitizer: pathSanitizer
+        ) {
             sections.append(reconstructionSection)
         }
         if let timingSection = stageTimingSection(metadata: metadata) {
@@ -134,23 +137,52 @@ public enum ProjectDiagnosticBundle {
         return lines.joined(separator: "\n")
     }
 
-    private static func reconstructionSection(metadata: ProjectMetadata) -> String? {
-        guard let reconstruction = metadata.reconstruction else { return nil }
+    private static func reconstructionSection(
+        metadata: ProjectMetadata,
+        sanitizer: HomePathSanitizer
+    ) -> String? {
+        let mapping = metadata.geometryArtifact?.mapping
+        guard metadata.reconstruction != nil || mapping != nil else { return nil }
         var lines: [String] = ["## Reconstruction"]
-        lines.append("Mapper: \(reconstruction.mapper)")
-        lines.append("Captured: \(iso8601(reconstruction.capturedAt))")
-        lines.append("Registered: \(reconstruction.registeredImages) / \(reconstruction.totalImages)")
-        if let reproj = reconstruction.meanReprojectionError {
-            lines.append("Mean reprojection error: \(String(format: "%.3f px", reproj))")
+        if let reconstruction = metadata.reconstruction {
+            lines.append("Mapper: \(reconstruction.mapper)")
+            lines.append("Captured: \(iso8601(reconstruction.capturedAt))")
+            lines.append("Registered: \(reconstruction.registeredImages) / \(reconstruction.totalImages)")
+            if let reproj = reconstruction.meanReprojectionError {
+                lines.append("Mean reprojection error: \(String(format: "%.3f px", reproj))")
+            }
+            if let points = reconstruction.pointCount {
+                lines.append("Points: \(points)")
+            }
+            if let observations = reconstruction.observationCount {
+                lines.append("Observations: \(observations)")
+            }
+            if let track = reconstruction.meanTrackLength {
+                lines.append("Mean track length: \(String(format: "%.2f", track))")
+            }
         }
-        if let points = reconstruction.pointCount {
-            lines.append("Points: \(points)")
-        }
-        if let observations = reconstruction.observationCount {
-            lines.append("Observations: \(observations)")
-        }
-        if let track = reconstruction.meanTrackLength {
-            lines.append("Mean track length: \(String(format: "%.2f", track))")
+        if let mapping {
+            lines.append(
+                "Models: \(mapping.modelCount) "
+                    + "(largest \(mapping.largestModelRegisteredViewCount), "
+                    + "second \(mapping.secondLargestModelRegisteredViewCount))"
+            )
+            lines.append("Union registered: \(mapping.unionRegisteredViewCount)")
+            lines.append("Mapping attempts: \(mapping.attemptCount)")
+            let invocationLabel = mapping.acceptedRefinementInvocationCount == 1
+                ? "invocation"
+                : "invocations"
+            let refinementName = switch mapping.acceptedRefinementKind {
+            case .incrementalGlobal: "Incremental global"
+            case .seededBundleAdjustment: "Seeded bundle adjustment"
+            }
+            lines.append(
+                "Accepted refinement: \(refinementName) "
+                    + "(\(mapping.acceptedRefinementInvocationCount) \(invocationLabel))"
+            )
+            if let fallbackReason = mapping.fallbackReason {
+                lines.append("Mapping fallback: \(sanitizer.sanitize(fallbackReason))")
+            }
         }
         return lines.joined(separator: "\n")
     }
@@ -186,6 +218,22 @@ public enum ProjectDiagnosticBundle {
                 lines.append("Checkpoint message: \(sanitizer.sanitize(message))")
             }
         }
+        if let recovery = metadata.geometryRecovery {
+            lines.append("Recovery backend: \(recovery.activeBackend.rawValue)")
+            lines.append("Recovery mapping attempts: \(recovery.mappingAttemptCount)")
+            if let mode = recovery.colmapComputeMode {
+                lines.append("Recovery compute: \(mode.rawValue)")
+            }
+            if let level = recovery.pendingPairRecoveryLevel {
+                lines.append("Pending pair recovery: \(level.rawValue)")
+            }
+            if let matcher = recovery.da3DescriptorMatcher {
+                lines.append("Recovery matcher: \(matcher.rawValue)")
+            }
+            for reason in recovery.mappingFallbackReasons {
+                lines.append("Recovery reason: \(sanitizer.sanitize(reason))")
+            }
+        }
         if lines.count == 1 { return nil }
         return lines.joined(separator: "\n")
     }
@@ -199,14 +247,56 @@ public enum ProjectDiagnosticBundle {
         sanitizer: HomePathSanitizer
     ) -> String? {
         guard metadata.reconstruction != nil
+            || metadata.geometryArtifact?.mapping != nil
+            || metadata.geometryRecovery != nil
             || (metadata.stageTimings?.isEmpty == false)
             || metadata.lastFailureAt != nil else {
             return nil
+        }
+        struct DiagnosticMapping: Encodable {
+            var modelCount: Int
+            var largestModelRegisteredViewCount: Int
+            var secondLargestModelRegisteredViewCount: Int
+            var unionRegisteredViewCount: Int
+            var attemptCount: Int
+            var acceptedRefinementKind: String
+            var acceptedRefinementInvocationCount: Int
+            var fallbackReason: String?
+
+            init(_ mapping: MappingArtifact) {
+                modelCount = mapping.modelCount
+                largestModelRegisteredViewCount = mapping.largestModelRegisteredViewCount
+                secondLargestModelRegisteredViewCount = mapping.secondLargestModelRegisteredViewCount
+                unionRegisteredViewCount = mapping.unionRegisteredViewCount
+                attemptCount = mapping.attemptCount
+                acceptedRefinementKind = mapping.acceptedRefinementKind.rawValue
+                acceptedRefinementInvocationCount = mapping.acceptedRefinementInvocationCount
+                fallbackReason = mapping.fallbackReason
+            }
+        }
+        struct DiagnosticGeometryRecovery: Encodable {
+            var activeBackend: String
+            var mappingAttemptCount: Int
+            var mappingFallbackReasons: [String]
+            var pendingPairRecoveryLevel: String?
+            var da3DescriptorMatcher: String?
+            var colmapComputeMode: String?
+
+            init(_ recovery: GeometryRecoveryState) {
+                activeBackend = recovery.activeBackend.rawValue
+                mappingAttemptCount = recovery.mappingAttemptCount
+                mappingFallbackReasons = recovery.mappingFallbackReasons
+                pendingPairRecoveryLevel = recovery.pendingPairRecoveryLevel?.rawValue
+                da3DescriptorMatcher = recovery.da3DescriptorMatcher?.rawValue
+                colmapComputeMode = recovery.colmapComputeMode?.rawValue
+            }
         }
         struct Payload: Encodable {
             var schemaVersion: Int
             var requestedRunOptions: RequestedRunOptions
             var reconstruction: ReconstructionSummary?
+            var mapping: DiagnosticMapping?
+            var geometryRecovery: DiagnosticGeometryRecovery?
             var stageTimings: [StageTimingRecord]?
             var lastFailureAt: Date?
         }
@@ -214,6 +304,8 @@ public enum ProjectDiagnosticBundle {
             schemaVersion: ProjectDiagnosticBundle.machineReadableSchemaVersion,
             requestedRunOptions: metadata.requestedRunOptions,
             reconstruction: metadata.reconstruction,
+            mapping: metadata.geometryArtifact.map { DiagnosticMapping($0.mapping) },
+            geometryRecovery: metadata.geometryRecovery.map(DiagnosticGeometryRecovery.init),
             stageTimings: metadata.stageTimings,
             lastFailureAt: metadata.lastFailureAt
         )

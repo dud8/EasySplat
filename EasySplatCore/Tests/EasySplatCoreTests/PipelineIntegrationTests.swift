@@ -241,7 +241,7 @@ final class PipelineIntegrationTests: XCTestCase {
 
         let metadata = ProjectMetadata(title: "Test",
                                        input: .photos(folder: sourcePhotos.path),
-                                       requestedRunOptions: RequestedRunOptions(capturePath: .orbit, detailProfile: .fast))
+                                       requestedRunOptions: RequestedRunOptions(capturePath: .orbit, detailProfile: .balanced))
         let paths = ProjectPaths(root: projectURL)
         try paths.ensureDirectories()
         try ProjectMetadataStore.save(metadata, to: paths.metadataURL)
@@ -380,9 +380,14 @@ final class PipelineIntegrationTests: XCTestCase {
             pairEvidence.acceptedInspection.secondLargestBiconnectedBlockViewCount
         )
         XCTAssertGreaterThan(pairGraph.retrievalPairCount, 0)
-        XCTAssertEqual(geometry.pairGraph.mappingAttemptNumber, 1)
-        XCTAssertEqual(geometry.pairGraph.bundleAdjustmentCycleCount, 2)
-        XCTAssertNil(geometry.pairGraph.fallbackReason)
+        XCTAssertEqual(geometry.mapping.modelCount, 2)
+        XCTAssertEqual(geometry.mapping.largestModelRegisteredViewCount, 100)
+        XCTAssertEqual(geometry.mapping.secondLargestModelRegisteredViewCount, 80)
+        XCTAssertEqual(geometry.mapping.unionRegisteredViewCount, 100)
+        XCTAssertEqual(geometry.mapping.attemptCount, 1)
+        XCTAssertEqual(geometry.mapping.acceptedRefinementKind, .incrementalGlobal)
+        XCTAssertEqual(geometry.mapping.acceptedRefinementInvocationCount, 2)
+        XCTAssertNil(geometry.mapping.fallbackReason)
         XCTAssertEqual(geometry.canonicalOrientation.status, .unresolved)
         XCTAssertFalse(
             try FileManager.default.contentsOfDirectory(atPath: paths.colmapSparseURL.path)
@@ -404,6 +409,117 @@ final class PipelineIntegrationTests: XCTestCase {
         XCTAssertEqual(analyzedModels, ["0", "1"])
         let selectedManifest = try String(contentsOf: paths.framesSelectedManifestURL, encoding: .utf8)
         XCTAssertFalse(selectedManifest.contains("sourcePath"))
+    }
+
+    func testMapperPublishesSecondaryModelWhenPreferredAnalyzerCandidateHasHighMeasuredResiduals() async throws {
+        let temp = makeTempRoot()
+        let projectURL = temp.appendingPathComponent(
+            "ResidualValidatedMapperSelection.easysplatproj",
+            isDirectory: true
+        )
+        let sourcePhotos = temp.appendingPathComponent("SourcePhotos", isDirectory: true)
+        try FileManager.default.createDirectory(
+            at: sourcePhotos,
+            withIntermediateDirectories: true
+        )
+        for index in 0..<10 {
+            try writeTestImage(
+                url: sourcePhotos.appendingPathComponent("img\(index).jpg"),
+                value: UInt8(index)
+            )
+        }
+
+        let paths = ProjectPaths(root: projectURL)
+        try paths.ensureDirectories()
+        try ProjectMetadataStore.save(
+            ProjectMetadata(
+                title: "Residual-validated mapper selection",
+                input: .photos(folder: sourcePhotos.path),
+                requestedRunOptions: RequestedRunOptions(
+                    detailProfile: .fast,
+                    inputOrdering: .unordered,
+                    photoSelection: .useAllValidPhotos
+                )
+            ),
+            to: paths.metadataURL
+        )
+        let toolchain = try makeToolchain(root: temp)
+        let runner = MockSubprocessRunner(scripts: [
+            .init(
+                path: toolchain.colmap.path,
+                argsPrefix: ["feature_extractor"],
+                result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""),
+                onRun: { try self.writeFeatureDatabase(for: $0) }
+            ),
+            .init(
+                path: toolchain.colmap.path,
+                argsPrefix: ["matches_importer"],
+                result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""),
+                onRun: { try self.writeVerifiedPairResults(for: $0) }
+            ),
+            .init(
+                path: toolchain.colmap.path,
+                argsPrefix: ["mapper"],
+                result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""),
+                stdoutLines: ["Retriangulation and Global bundle adjustment"],
+                onRun: { _ in
+                    let imageNames = self.selectedImageNames(in: paths)
+                    let preferred = paths.colmapSparseURL.appendingPathComponent(
+                        "0",
+                        isDirectory: true
+                    )
+                    try self.writeSparseModel(at: preferred, imageNames: imageNames)
+                    try self.makeSparseModelHighResidual(at: preferred)
+                    try self.writeSparseModel(
+                        at: paths.colmapSparseURL.appendingPathComponent("1", isDirectory: true),
+                        imageNames: Array(imageNames.prefix(9))
+                    )
+                }
+            ),
+            .init(
+                path: toolchain.colmap.path,
+                argsPrefix: ["model_analyzer"],
+                result: .init(
+                    exitCode: 0,
+                    terminationReason: .exit,
+                    stdout: "Registered images: 10 / 10\nPoints: 1\nObservations: 10\nMean track length: 10.0\nMean reprojection error: 0.4\n",
+                    stderr: ""
+                )
+            ),
+            .init(
+                path: toolchain.colmap.path,
+                argsPrefix: ["model_analyzer"],
+                result: .init(
+                    exitCode: 0,
+                    terminationReason: .exit,
+                    stdout: "Registered images: 9 / 10\nPoints: 1\nObservations: 9\nMean track length: 9.0\nMean reprojection error: 0.5\n",
+                    stderr: ""
+                )
+            ),
+        ])
+        let pipeline = PipelineRunner(
+            projectURL: projectURL,
+            config: makePipelineConfig(
+                toolchain: toolchain,
+                candidateRoute: .colmap,
+                skipTraining: true
+            ),
+            tooling: .init(runner: runner)
+        )
+        let events = PipelineEventSink()
+
+        try await pipeline.run { events.append($0) }
+
+        let canonicalModel = paths.colmapSparseURL.appendingPathComponent("0", isDirectory: true)
+        let residuals = try ColmapResidualAnalyzer.analyze(modelDirectory: canonicalModel)
+        XCTAssertEqual(residuals.registeredViewCount, 9)
+        XCTAssertEqual(residuals.medianPixelResidual, 0, accuracy: 0.000_001)
+        XCTAssertEqual(
+            try FileManager.default.contentsOfDirectory(atPath: paths.colmapSparseURL.path),
+            ["0"]
+        )
+        XCTAssertNotNil(events.stageLog(containing: "Rejected COLMAP model 0"))
+        XCTAssertNotNil(events.stageLog(containing: "Selected COLMAP model 1 (9/10 registered views)."))
     }
 
     func testOrderedColmapMatchingAddsVerifiedLoopPairs() async throws {
@@ -603,8 +719,8 @@ final class PipelineIntegrationTests: XCTestCase {
             from: paths.geometryManifestURL,
             projectPaths: paths
         )
-        XCTAssertEqual(geometry.pairGraph.mappingAttemptNumber, 1)
-        XCTAssertEqual(geometry.pairGraph.fallbackReason, "exact descriptor matching")
+        XCTAssertEqual(geometry.mapping.attemptCount, 1)
+        XCTAssertEqual(geometry.mapping.fallbackReason, "exact descriptor matching")
         let evidence = try PairGraphEvidenceStore.load(
             from: paths.pairGraphEvidenceURL,
             projectPaths: paths
@@ -1055,6 +1171,14 @@ final class PipelineIntegrationTests: XCTestCase {
             .fullExactGraphRecovery,
         ])
         XCTAssertEqual(run.runner.calls.count { $0.1.first == "mapper" }, 2)
+        let geometry = try GeometryArtifactStore.load(
+            from: fixture.paths.geometryManifestURL,
+            projectPaths: fixture.paths
+        )
+        XCTAssertEqual(geometry.mapping.attemptCount, 2)
+        XCTAssertEqual(geometry.mapping.acceptedRefinementKind, .incrementalGlobal)
+        XCTAssertEqual(geometry.mapping.acceptedRefinementInvocationCount, 1)
+        XCTAssertNotNil(geometry.mapping.fallbackReason)
     }
 
     func testUnsafeTargetedSparseLayoutFallsBackToFullExactSchedule() async throws {
@@ -2940,7 +3064,10 @@ final class PipelineIntegrationTests: XCTestCase {
                 stdoutLines: ["Retriangulation and Global bundle adjustment"],
                 onRun: { _ in
                     do {
-                        try self.writeSparseModel(at: projectURL)
+                        try self.writeSparseModel(
+                            at: projectURL,
+                            registeredImageCount: 100
+                        )
                     } catch {
                         XCTFail("Could not write first sparse model: \(error)")
                     }
@@ -4268,11 +4395,16 @@ final class PipelineIntegrationTests: XCTestCase {
             0,
             "Persisted reconstruction facts must use residuals recomputed from COLMAP tracks."
         )
-        let pairGraph = try XCTUnwrap(finished.geometryArtifact?.pairGraph)
-        XCTAssertEqual(pairGraph.status, .notEvaluated)
-        XCTAssertEqual(pairGraph.mappingAttemptNumber, 1)
-        XCTAssertEqual(pairGraph.bundleAdjustmentCycleCount, 1)
-        XCTAssertNil(pairGraph.fallbackReason)
+        let geometry = try XCTUnwrap(finished.geometryArtifact)
+        XCTAssertEqual(geometry.pairGraph.status, .notEvaluated)
+        XCTAssertEqual(geometry.mapping.modelCount, 1)
+        XCTAssertEqual(geometry.mapping.largestModelRegisteredViewCount, 29)
+        XCTAssertEqual(geometry.mapping.secondLargestModelRegisteredViewCount, 0)
+        XCTAssertEqual(geometry.mapping.unionRegisteredViewCount, 29)
+        XCTAssertEqual(geometry.mapping.attemptCount, 1)
+        XCTAssertEqual(geometry.mapping.acceptedRefinementKind, .seededBundleAdjustment)
+        XCTAssertEqual(geometry.mapping.acceptedRefinementInvocationCount, 1)
+        XCTAssertNil(geometry.mapping.fallbackReason)
     }
 
     func testDa3CancellationBeforeTriangulationDoesNotLaunchColmap() async throws {
@@ -4494,9 +4626,10 @@ final class PipelineIntegrationTests: XCTestCase {
             from: paths.geometryManifestURL,
             projectPaths: paths
         )
-        XCTAssertEqual(geometry.pairGraph.mappingAttemptNumber, 1)
-        XCTAssertEqual(geometry.pairGraph.bundleAdjustmentCycleCount, 1)
-        XCTAssertEqual(geometry.pairGraph.fallbackReason, "exact descriptor matching")
+        XCTAssertEqual(geometry.mapping.attemptCount, 1)
+        XCTAssertEqual(geometry.mapping.acceptedRefinementKind, .seededBundleAdjustment)
+        XCTAssertEqual(geometry.mapping.acceptedRefinementInvocationCount, 1)
+        XCTAssertEqual(geometry.mapping.fallbackReason, "exact descriptor matching")
     }
 
     func testInterruptedDa3MatchingClearsPartialExactRowsBeforeFaissResume() async throws {
@@ -4934,25 +5067,12 @@ final class PipelineIntegrationTests: XCTestCase {
         let imageNames = registeredImageCount.map {
             Array(selectedNames.prefix(max(0, $0)))
         } ?? selectedNames
+        let safeImageNames = imageNames.isEmpty ? ["frame_000000.jpg"] : imageNames
         try writeDa3SparseModel(
             at: modelURL,
-            imageNames: imageNames.isEmpty ? ["frame_000000.jpg"] : imageNames,
+            imageNames: safeImageNames,
             pointCount: pointCount
         )
-        try writeSparseModelBinaryOnly(at: modelURL)
-    }
-
-    private func writeSparseModelBinaryOnlyForProject(at projectURL: URL) throws {
-        let modelURL = projectURL.appendingPathComponent("SfM/colmap/sparse/0", isDirectory: true)
-        try writeSparseModelBinaryOnly(at: modelURL)
-    }
-
-    private func writeSparseModelBinaryOnly(at modelURL: URL) throws {
-        try FileManager.default.createDirectory(at: modelURL, withIntermediateDirectories: true)
-        for name in ["cameras.bin", "images.bin", "points3D.bin"] {
-            let url = modelURL.appendingPathComponent(name)
-            FileManager.default.createFile(atPath: url.path, contents: Data([0x00]))
-        }
     }
 
     private func writeSparseModel(at modelURL: URL, imageName: String) throws {
@@ -4966,11 +5086,6 @@ final class PipelineIntegrationTests: XCTestCase {
             imageNames: safeImageNames,
             pointCount: 1
         )
-        try FileManager.default.createDirectory(at: modelURL, withIntermediateDirectories: true)
-        for name in ["cameras.bin", "images.bin", "points3D.bin"] {
-            let url = modelURL.appendingPathComponent(name)
-            FileManager.default.createFile(atPath: url.path, contents: Data([0x00]))
-        }
     }
 
     private func selectedImageNames(in paths: ProjectPaths) -> [String] {
@@ -5613,9 +5728,15 @@ final class PipelineIntegrationTests: XCTestCase {
                 runtime: nil,
                 model: nil
             ),
-            pairGraph: try pairGraphEvidence.pairGraphArtifact(
-                mappingAttemptNumber: 1,
-                bundleAdjustmentCycleCount: 1,
+            pairGraph: try pairGraphEvidence.pairGraphArtifact(),
+            mapping: MappingArtifact(
+                modelCount: 1,
+                largestModelRegisteredViewCount: residuals.registeredViewCount,
+                secondLargestModelRegisteredViewCount: 0,
+                unionRegisteredViewCount: residuals.registeredViewCount,
+                attemptCount: 1,
+                acceptedRefinementKind: .incrementalGlobal,
+                acceptedRefinementInvocationCount: 1,
                 fallbackReason: nil
             ),
             canonicalOrientation: .unresolved(

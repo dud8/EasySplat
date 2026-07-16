@@ -205,7 +205,7 @@ extension PipelineRunner {
         database: URL,
         matchListPath: URL,
         options: ColmapOptions,
-        onExactRecovery: () -> Void
+        onExactRecovery: () throws -> Void
     ) async throws {
         try await runDa3MatchesImporterWithOneShotExactRecovery(
             database: database,

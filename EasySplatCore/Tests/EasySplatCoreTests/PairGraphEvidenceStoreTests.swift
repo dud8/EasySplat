@@ -35,16 +35,9 @@ final class PairGraphEvidenceStoreTests: XCTestCase {
         XCTAssertEqual(measurement.matchingDurationSeconds, 4)
         XCTAssertEqual(loaded.fallbackReasons, ["denser pair graph"])
 
-        let artifact = try loaded.pairGraphArtifact(
-            mappingAttemptNumber: 3,
-            bundleAdjustmentCycleCount: 2,
-            fallbackReason: "dense FAISS recovery"
-        )
+        let artifact = try loaded.pairGraphArtifact()
         XCTAssertEqual(artifact.status, .measured)
         XCTAssertEqual(artifact.measurement, measurement)
-        XCTAssertEqual(artifact.mappingAttemptNumber, 3)
-        XCTAssertEqual(artifact.bundleAdjustmentCycleCount, 2)
-        XCTAssertEqual(artifact.fallbackReason, "dense FAISS recovery")
     }
 
     func testSaveProducesDeterministicBytes() throws {

@@ -2,6 +2,51 @@ import XCTest
 @testable import EasySplatCore
 
 final class ProjectMetadataStoreTests: XCTestCase {
+    func testRoundTripValidatesGeometryRecoveryState() throws {
+        let root = try TestFileBuilder.makeTempDir()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let url = root.appendingPathComponent("project.json")
+        let recovery = GeometryRecoveryState(
+            selectedFramesDigest: String(repeating: "a", count: 64),
+            orderedImageNames: [
+                "frame_000001.jpg",
+                "frame_000002.jpg",
+                "frame_000003.jpg",
+            ],
+            activeBackend: .colmap,
+            mappingAttemptCount: 1,
+            mappingFallbackReasons: ["interrupted mapping resumed"],
+            colmapComputeMode: .cpu
+        )
+        let metadata = ProjectMetadata(
+            title: "Recovering geometry",
+            input: .photos(folder: "/tmp/photos"),
+            geometryRecovery: recovery
+        )
+
+        try ProjectMetadataStore.save(metadata, to: url)
+        XCTAssertEqual(
+            try ProjectMetadataStore.load(from: url).geometryRecovery,
+            recovery
+        )
+
+        var invalid = metadata
+        invalid.geometryRecovery?.mappingAttemptCount = -1
+        XCTAssertThrowsError(try ProjectMetadataStore.save(invalid, to: url)) { error in
+            guard case ProjectMetadataStore.LoadError.invalidGeometryRecovery = error else {
+                return XCTFail("Expected invalid geometry recovery, got \(error)")
+            }
+        }
+
+        let encoder = JSONEncoder()
+        encoder.dateEncodingStrategy = .iso8601
+        try encoder.encode(invalid).write(to: url, options: .atomic)
+        XCTAssertNil(
+            try ProjectMetadataStore.load(from: url).geometryRecovery,
+            "Disposable recovery corruption must not make the project unreadable."
+        )
+    }
+
     func testRoundTripPreservesPermittedUprightFlipWithoutChangingGeometryArtifact() throws {
         let root = try TestFileBuilder.makeTempDir()
         defer { try? FileManager.default.removeItem(at: root) }

@@ -1,3 +1,4 @@
+import Darwin
 import ImageIO
 import SQLite3
 import UniformTypeIdentifiers
@@ -100,34 +101,20 @@ final class PipelineRunnerHelperTests: XCTestCase {
         )
     }
 
-    func testMappedSparseModelDiscoveryRejectsSymlinksHardLinksAndNonnumericFolders() throws {
+    func testMappedSparseModelDiscoveryIgnoresNonnumericFoldersAndSortsCanonicalModels() throws {
         let root = try TestFileBuilder.makeTempDir()
         defer { try? FileManager.default.removeItem(at: root) }
         let sparse = root.appendingPathComponent("sparse", isDirectory: true)
         let valid = sparse.appendingPathComponent("0", isDirectory: true)
-        let external = root.appendingPathComponent("external", isDirectory: true)
         let named = sparse.appendingPathComponent("named", isDirectory: true)
         let second = sparse.appendingPathComponent("2", isDirectory: true)
         let tenth = sparse.appendingPathComponent("10", isDirectory: true)
-        let noncanonical = sparse.appendingPathComponent("01", isDirectory: true)
-        let hardLinked = sparse.appendingPathComponent("3", isDirectory: true)
-        for directory in [valid, external, named, second, tenth, noncanonical, hardLinked] {
+        for directory in [valid, named, second, tenth] {
             try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
             for name in ["cameras.bin", "images.bin", "points3D.bin"] {
                 try Data([1, 2, 3]).write(to: directory.appendingPathComponent(name))
             }
         }
-        try FileManager.default.createSymbolicLink(
-            at: sparse.appendingPathComponent("1", isDirectory: true),
-            withDestinationURL: external
-        )
-        let externalFile = root.appendingPathComponent("shared.bin")
-        try Data([4, 5, 6]).write(to: externalFile)
-        try FileManager.default.removeItem(at: hardLinked.appendingPathComponent("images.bin"))
-        try FileManager.default.linkItem(
-            at: externalFile,
-            to: hardLinked.appendingPathComponent("images.bin")
-        )
 
         let discovered = try makeRunner(projectURL: root).mappedSparseModelDirectories(in: sparse)
 
@@ -136,13 +123,51 @@ final class PipelineRunnerHelperTests: XCTestCase {
             discovered.map { $0.url.resolvingSymlinksInPath() },
             [valid, second, tenth].map { $0.resolvingSymlinksInPath() }
         )
+    }
+
+    func testMappedSparseModelDiscoveryRejectsEveryMalformedOrUnsafeNumericEntry() throws {
+        let root = try TestFileBuilder.makeTempDir()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let sparse = root.appendingPathComponent("sparse", isDirectory: true)
+        let external = root.appendingPathComponent("external", isDirectory: true)
+        try FileManager.default.createDirectory(at: sparse, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: external, withIntermediateDirectories: true)
+        for name in ["cameras.bin", "images.bin", "points3D.bin"] {
+            try Data([1, 2, 3]).write(to: external.appendingPathComponent(name))
+        }
+        let runner = makeRunner(projectURL: root)
+
+        for unsafeName in ["-1", "+1", "01", "999999999999999999999999999999999999999"] {
+            let unsafe = sparse.appendingPathComponent(unsafeName, isDirectory: true)
+            try FileManager.default.createDirectory(at: unsafe, withIntermediateDirectories: true)
+            XCTAssertThrowsError(try runner.mappedSparseModelDirectories(in: sparse))
+            try FileManager.default.removeItem(at: unsafe)
+        }
+
+        let numericSymlink = sparse.appendingPathComponent("1", isDirectory: true)
+        try FileManager.default.createSymbolicLink(at: numericSymlink, withDestinationURL: external)
+        XCTAssertThrowsError(try runner.mappedSparseModelDirectories(in: sparse))
+        try FileManager.default.removeItem(at: numericSymlink)
+
+        let hardLinked = sparse.appendingPathComponent("2", isDirectory: true)
+        try FileManager.default.createDirectory(at: hardLinked, withIntermediateDirectories: true)
+        for name in ["cameras.bin", "images.bin", "points3D.bin"] {
+            try Data([1, 2, 3]).write(to: hardLinked.appendingPathComponent(name))
+        }
+        let externalFile = root.appendingPathComponent("shared.bin")
+        try Data([4, 5, 6]).write(to: externalFile)
+        try FileManager.default.removeItem(at: hardLinked.appendingPathComponent("images.bin"))
+        try FileManager.default.linkItem(
+            at: externalFile,
+            to: hardLinked.appendingPathComponent("images.bin")
+        )
+        XCTAssertThrowsError(try runner.mappedSparseModelDirectories(in: sparse))
 
         let linkedSparse = root.appendingPathComponent("linked-sparse", isDirectory: true)
         try FileManager.default.createSymbolicLink(at: linkedSparse, withDestinationURL: sparse)
         XCTAssertThrowsError(
             try makeRunner(projectURL: root).mappedSparseModelDirectories(in: linkedSparse)
         )
-        XCTAssertTrue(FileManager.default.fileExists(atPath: valid.path))
     }
 
     func testCanonicalSparsePublicationCancelsOrRejectsBeforeChangingModelZero() throws {
@@ -820,6 +845,199 @@ final class PipelineRunnerHelperTests: XCTestCase {
         for name in ["cameras.bin", "images.bin", "points3D.bin"] {
             XCTAssertEqual(try Data(contentsOf: model.appendingPathComponent(name)), Data([1, 2, 3]))
         }
+    }
+
+    func testEnsureTextSparseModelDerivesTextFromBinaryWhenBothFamiliesExist() throws {
+        let root = try TestFileBuilder.makeTempDir()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let model = root.appendingPathComponent("model", isDirectory: true)
+        try writeSparseTextModel(at: model, cameraModel: "OPENCV_FISHEYE")
+        let staleText = try sparseTextModelBytes(at: model)
+        for name in ["cameras.bin", "images.bin", "points3D.bin"] {
+            try Data("authoritative \(name)".utf8).write(
+                to: model.appendingPathComponent(name)
+            )
+        }
+        let subprocess = MockSubprocessRunner(scripts: [modelConverterScript { args in
+            let input = URL(
+                fileURLWithPath: try XCTUnwrap(self.argumentValue("--input_path", args))
+            )
+            let output = URL(
+                fileURLWithPath: try XCTUnwrap(self.argumentValue("--output_path", args))
+            )
+            XCTAssertNotEqual(input.standardizedFileURL, model.standardizedFileURL)
+            XCTAssertNotEqual(output.standardizedFileURL, model.standardizedFileURL)
+            for name in ["cameras.bin", "images.bin", "points3D.bin"] {
+                XCTAssertEqual(
+                    try Data(contentsOf: input.appendingPathComponent(name)),
+                    Data("authoritative \(name)".utf8)
+                )
+            }
+            for name in ["cameras.txt", "images.txt", "points3D.txt"] {
+                XCTAssertFalse(
+                    FileManager.default.fileExists(
+                        atPath: input.appendingPathComponent(name).path
+                    )
+                )
+            }
+            try self.writeSparseTextModel(at: output, cameraModel: "PINHOLE")
+        }])
+        let runner = makeRunner(projectURL: root, subprocess: subprocess)
+        var originalDirectory = stat()
+        XCTAssertEqual(Darwin.lstat(model.path, &originalDirectory), 0)
+
+        XCTAssertTrue(try runner.ensureTextSparseModelFiles(at: model))
+        var publishedDirectory = stat()
+        XCTAssertEqual(Darwin.lstat(model.path, &publishedDirectory), 0)
+        XCTAssertNotEqual(publishedDirectory.st_ino, originalDirectory.st_ino)
+        XCTAssertNotEqual(try sparseTextModelBytes(at: model), staleText)
+        XCTAssertTrue(
+            try String(
+                contentsOf: model.appendingPathComponent("cameras.txt"),
+                encoding: .utf8
+            ).contains(" PINHOLE ")
+        )
+        XCTAssertEqual(subprocess.calls.map { $0.1.first }, ["model_converter"])
+    }
+
+    func testEnsureTextSparseModelKeepsTextOnlyModelWithoutConversion() throws {
+        let root = try TestFileBuilder.makeTempDir()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let model = root.appendingPathComponent("model", isDirectory: true)
+        try writeSparseTextModel(at: model, cameraModel: "PINHOLE")
+        let original = try sparseTextModelBytes(at: model)
+        let runner = makeRunner(projectURL: root)
+
+        XCTAssertFalse(try runner.ensureTextSparseModelFiles(at: model))
+        XCTAssertEqual(try sparseTextModelBytes(at: model), original)
+    }
+
+    func testEnsureTextSparseModelPreservesExistingTextWhenConversionFails() throws {
+        let root = try TestFileBuilder.makeTempDir()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let model = root.appendingPathComponent("model", isDirectory: true)
+        try writeSparseTextModel(at: model, cameraModel: "OPENCV_FISHEYE")
+        let original = try sparseTextModelBytes(at: model)
+        for name in ["cameras.bin", "images.bin", "points3D.bin"] {
+            try Data("authoritative \(name)".utf8).write(
+                to: model.appendingPathComponent(name)
+            )
+        }
+        let subprocess = MockSubprocessRunner(scripts: [.init(
+            path: "/mock/colmap",
+            argsPrefix: ["model_converter"],
+            result: .init(
+                exitCode: 1,
+                terminationReason: .exit,
+                stdout: "",
+                stderr: "simulated conversion failure"
+            ),
+            onRun: nil
+        )])
+        let runner = makeRunner(projectURL: root, subprocess: subprocess)
+
+        XCTAssertThrowsError(try runner.ensureTextSparseModelFiles(at: model))
+        XCTAssertEqual(try sparseTextModelBytes(at: model), original)
+    }
+
+    func testEnsureTextSparseModelPreservesExistingTextWhenConverterOutputIsIncomplete() throws {
+        let root = try TestFileBuilder.makeTempDir()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let model = root.appendingPathComponent("model", isDirectory: true)
+        try writeSparseTextModel(at: model, cameraModel: "OPENCV_FISHEYE")
+        let original = try sparseTextModelBytes(at: model)
+        for name in ["cameras.bin", "images.bin", "points3D.bin"] {
+            try Data("authoritative \(name)".utf8).write(
+                to: model.appendingPathComponent(name)
+            )
+        }
+        let subprocess = MockSubprocessRunner(scripts: [modelConverterScript { args in
+            let output = URL(
+                fileURLWithPath: try XCTUnwrap(self.argumentValue("--output_path", args))
+            )
+            try FileManager.default.createDirectory(
+                at: output,
+                withIntermediateDirectories: true
+            )
+            try Data("# incomplete output\n".utf8).write(
+                to: output.appendingPathComponent("cameras.txt")
+            )
+        }])
+        let runner = makeRunner(projectURL: root, subprocess: subprocess)
+
+        XCTAssertThrowsError(try runner.ensureTextSparseModelFiles(at: model))
+        XCTAssertEqual(try sparseTextModelBytes(at: model), original)
+    }
+
+    func testEnsureTextSparseModelPreservesExistingTextWhenConverterOutputIsMalformed() throws {
+        let root = try TestFileBuilder.makeTempDir()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let model = root.appendingPathComponent("model", isDirectory: true)
+        try writeSparseTextModel(at: model, cameraModel: "OPENCV_FISHEYE")
+        let original = try sparseTextModelBytes(at: model)
+        for name in ["cameras.bin", "images.bin", "points3D.bin"] {
+            try Data("authoritative \(name)".utf8).write(
+                to: model.appendingPathComponent(name)
+            )
+        }
+        let subprocess = MockSubprocessRunner(scripts: [modelConverterScript { args in
+            let output = URL(
+                fileURLWithPath: try XCTUnwrap(self.argumentValue("--output_path", args))
+            )
+            try FileManager.default.createDirectory(
+                at: output,
+                withIntermediateDirectories: true
+            )
+            for name in ["cameras.txt", "images.txt", "points3D.txt"] {
+                try Data("truncated\n".utf8).write(
+                    to: output.appendingPathComponent(name)
+                )
+            }
+        }])
+        let runner = makeRunner(projectURL: root, subprocess: subprocess)
+
+        XCTAssertThrowsError(try runner.ensureTextSparseModelFiles(at: model))
+        XCTAssertEqual(try sparseTextModelBytes(at: model), original)
+    }
+
+    func testEnsureTextSparseModelRollsBackFailureAfterAtomicSwap() throws {
+        enum InjectedFailure: Error { case afterSwap }
+
+        let root = try TestFileBuilder.makeTempDir()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let model = root.appendingPathComponent("model", isDirectory: true)
+        try writeSparseTextModel(at: model, cameraModel: "OPENCV_FISHEYE")
+        let original = try sparseTextModelBytes(at: model)
+        for name in ["cameras.bin", "images.bin", "points3D.bin"] {
+            try Data("authoritative \(name)".utf8).write(
+                to: model.appendingPathComponent(name)
+            )
+        }
+        let subprocess = MockSubprocessRunner(scripts: [modelConverterScript { args in
+            let output = URL(
+                fileURLWithPath: try XCTUnwrap(self.argumentValue("--output_path", args))
+            )
+            try self.writeSparseTextModel(at: output, cameraModel: "PINHOLE")
+        }])
+        let runner = makeRunner(projectURL: root, subprocess: subprocess)
+
+        XCTAssertThrowsError(try runner.ensureTextSparseModelFiles(
+            at: model,
+            publicationCheckpoint: { checkpoint in
+                if case .afterSwap = checkpoint {
+                    throw InjectedFailure.afterSwap
+                }
+            }
+        )) { error in
+            guard case InjectedFailure.afterSwap = error else {
+                return XCTFail("Expected injected post-swap failure, got \(error)")
+            }
+        }
+        XCTAssertEqual(try sparseTextModelBytes(at: model), original)
+        XCTAssertFalse(
+            try FileManager.default.contentsOfDirectory(atPath: root.path)
+                .contains(where: { $0.hasPrefix(".text-model-") })
+        )
     }
 
     func testPrepareMsplatDatasetAddsLearnedDepthInitializer() async throws {

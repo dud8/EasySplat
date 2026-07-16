@@ -12,9 +12,17 @@ struct MappedSparseModelSnapshot: Sendable {
     fileprivate let files: [String: SparseFileState]
 }
 
+enum SparseTextPublicationCheckpoint: Sendable {
+    case beforeSwap
+    case afterSwap
+    case beforePublishedValidation
+}
+
 private enum SparseModelPublicationError: Error, LocalizedError {
     case unsafeLayout
     case atomicRenameFailed(Int32)
+    case atomicTextPublicationFailed(Int32)
+    case atomicTextRollbackFailed(Int32, recoveryDirectory: String)
 
     var errorDescription: String? {
         switch self {
@@ -22,6 +30,10 @@ private enum SparseModelPublicationError: Error, LocalizedError {
             return "COLMAP produced an unsafe sparse-model layout."
         case .atomicRenameFailed(let code):
             return "Could not publish the selected COLMAP model atomically (errno \(code))."
+        case .atomicTextPublicationFailed(let code):
+            return "Could not publish the COLMAP text model atomically (errno \(code))."
+        case .atomicTextRollbackFailed(let code, let recoveryDirectory):
+            return "Could not restore the previous COLMAP text model (errno \(code)). The preserved recovery directory is \(recoveryDirectory)."
         }
     }
 }
@@ -34,7 +46,8 @@ extension PipelineRunner {
         switch publicationError {
         case .unsafeLayout:
             return PipelineError.outputMissing
-        case .atomicRenameFailed:
+        case .atomicRenameFailed, .atomicTextPublicationFailed,
+                .atomicTextRollbackFailed:
             return error
         }
     }
@@ -59,14 +72,24 @@ extension PipelineRunner {
             includingPropertiesForKeys: [.isDirectoryKey, .isSymbolicLinkKey],
             options: [.skipsHiddenFiles]
         )
-        let candidates = children.compactMap { child -> (url: URL, order: Int)? in
+        var candidates: [(url: URL, order: Int)] = []
+        candidates.reserveCapacity(children.count)
+        for child in children {
             let name = child.lastPathComponent
+            let bytes = Array(name.utf8)
+            let hasSign = bytes.first == 43 || bytes.first == 45
+            let numericBytes = hasSign ? bytes.dropFirst() : bytes[...]
+            let isNumericName = !numericBytes.isEmpty && numericBytes.allSatisfy {
+                $0 >= 48 && $0 <= 57
+            }
+            guard isNumericName else { continue }
             guard let order = Int(name), order >= 0, String(order) == name,
                   isSafeSparseModelDirectory(child) else {
-                return nil
+                throw SparseModelPublicationError.unsafeLayout
             }
-            return (child, order)
-        }.sorted { lhs, rhs in
+            candidates.append((child, order))
+        }
+        candidates.sort { lhs, rhs in
             lhs.order < rhs.order
         }
         guard !candidates.isEmpty else { throw PipelineError.outputMissing }
@@ -151,17 +174,30 @@ extension PipelineRunner {
         from candidates: [MappedSparseModelCandidate],
         capturePath: CapturePath
     ) -> MappedSparseModelCandidate? {
-        guard !candidates.isEmpty else { return nil }
-        let acceptable = candidates.filter {
-            ReconstructionScorer.isAcceptable($0.score, capturePath: capturePath)
+        rankedMappedSparseModels(
+            candidates,
+            capturePath: capturePath
+        ).first
+    }
+
+    static func rankedMappedSparseModels(
+        _ candidates: [MappedSparseModelCandidate],
+        capturePath: CapturePath
+    ) -> [MappedSparseModelCandidate] {
+        candidates.sorted { lhs, rhs in
+            let lhsAcceptable = ReconstructionScorer.isAcceptable(
+                lhs.score,
+                capturePath: capturePath
+            )
+            let rhsAcceptable = ReconstructionScorer.isAcceptable(
+                rhs.score,
+                capturePath: capturePath
+            )
+            if lhsAcceptable != rhsAcceptable {
+                return lhsAcceptable
+            }
+            return preferredMappedSparseModel(lhs, over: rhs)
         }
-        let pool = acceptable.isEmpty ? candidates : acceptable
-        var selected = pool[0]
-        for candidate in pool.dropFirst()
-            where preferredMappedSparseModel(candidate, over: selected) {
-            selected = candidate
-        }
-        return selected
     }
 
     func publishCanonicalSparseModel(
@@ -248,32 +284,219 @@ extension PipelineRunner {
         return SparseFileState(metadata)
     }
 
+    private func synchronizeSparseModelFile(at url: URL) throws {
+        let descriptor = Darwin.open(
+            url.path,
+            O_RDONLY | O_NOFOLLOW | O_CLOEXEC
+        )
+        guard descriptor >= 0 else {
+            throw SparseModelPublicationError.atomicTextPublicationFailed(errno)
+        }
+        defer { Darwin.close(descriptor) }
+        var metadata = stat()
+        guard Darwin.fstat(descriptor, &metadata) == 0,
+              (metadata.st_mode & S_IFMT) == S_IFREG,
+              metadata.st_nlink == 1 else {
+            throw SparseModelPublicationError.unsafeLayout
+        }
+        while Darwin.fsync(descriptor) != 0 {
+            let code = errno
+            if code == EINTR { continue }
+            throw SparseModelPublicationError.atomicTextPublicationFailed(code)
+        }
+    }
+
+    private func synchronizeSparseModelDirectory(_ descriptor: Int32) throws {
+        while Darwin.fsync(descriptor) != 0 {
+            let code = errno
+            if code == EINTR { continue }
+            throw SparseModelPublicationError.atomicTextPublicationFailed(code)
+        }
+    }
+
     @discardableResult
-    func ensureTextSparseModelFiles(at url: URL) throws -> Bool {
+    func ensureTextSparseModelFiles(
+        at url: URL,
+        publicationCheckpoint: (SparseTextPublicationCheckpoint) throws -> Void = { _ in }
+    ) throws -> Bool {
         let fm = FileManager.default
         let txtFiles = ["cameras.txt", "images.txt", "points3D.txt"]
-        if txtFiles.allSatisfy({ fm.fileExists(atPath: url.appendingPathComponent($0).path) }) {
+        let binFiles = ["cameras.bin", "images.bin", "points3D.bin"]
+        let hasBinaryModel = binFiles.allSatisfy {
+            fm.fileExists(atPath: url.appendingPathComponent($0).path)
+        }
+        if !hasBinaryModel {
+            guard txtFiles.allSatisfy({
+                fm.fileExists(atPath: url.appendingPathComponent($0).path)
+            }) else {
+                throw PipelineError.outputMissing
+            }
+            _ = try captureMappedSparseModel(at: url)
             return false
         }
 
-        let binFiles = ["cameras.bin", "images.bin", "points3D.bin"]
-        guard binFiles.allSatisfy({ fm.fileExists(atPath: url.appendingPathComponent($0).path) }) else {
-            throw PipelineError.outputMissing
+        let sourceSnapshot = try captureMappedSparseModel(at: url)
+        let stagingRoot = url.deletingLastPathComponent().appendingPathComponent(
+            ".text-model-\(UUID().uuidString)",
+            isDirectory: true
+        )
+        let binaryInput = stagingRoot.appendingPathComponent("binary", isDirectory: true)
+        let textOutput = stagingRoot.appendingPathComponent("text", isDirectory: true)
+        let replacement = stagingRoot.appendingPathComponent("replacement", isDirectory: true)
+        try fm.createDirectory(at: binaryInput, withIntermediateDirectories: true)
+        try fm.createDirectory(at: textOutput, withIntermediateDirectories: true)
+        var preserveStaging = false
+        defer {
+            if !preserveStaging {
+                try? fm.removeItem(at: stagingRoot)
+            }
+        }
+        for name in binFiles {
+            try fm.copyItem(
+                at: url.appendingPathComponent(name),
+                to: binaryInput.appendingPathComponent(name)
+            )
         }
 
         let converterOptions = colmapOptionsForMatching()
         try tooling.colmap.runModelConverter(
             colmapPath: config.toolchain.colmap,
-            inputPath: url,
-            outputPath: url,
+            inputPath: binaryInput,
+            outputPath: textOutput,
             outputType: "TXT",
             environment: converterOptions.environment,
             onLog: { _, _ in }
         )
-
-        guard txtFiles.allSatisfy({ fm.fileExists(atPath: url.appendingPathComponent($0).path) }) else {
+        for name in txtFiles {
+            guard let state = privateRegularFileState(
+                at: textOutput.appendingPathComponent(name)
+            ), state.byteCount > 0 else {
+                throw PipelineError.outputMissing
+            }
+        }
+        try validateMappedSparseModel(sourceSnapshot, at: url)
+        try fm.createDirectory(at: replacement, withIntermediateDirectories: true)
+        for name in sourceSnapshot.files.keys.sorted() {
+            try fm.copyItem(
+                at: url.appendingPathComponent(name),
+                to: replacement.appendingPathComponent(name)
+            )
+        }
+        for name in txtFiles {
+            let source = textOutput.appendingPathComponent(name)
+            let destination = replacement.appendingPathComponent(name)
+            if fm.fileExists(atPath: destination.path) {
+                try fm.removeItem(at: destination)
+            }
+            try fm.moveItem(at: source, to: destination)
+        }
+        let replacementSnapshot = try captureMappedSparseModel(at: replacement)
+        for name in txtFiles where replacementSnapshot.files[name]?.byteCount ?? 0 <= 0 {
             throw PipelineError.outputMissing
         }
+        let convertedModel = try ColmapResidualAnalyzer.analyze(
+            modelDirectory: replacement
+        )
+        guard convertedModel.registeredViewCount > 0,
+              convertedModel.pointCount > 0,
+              convertedModel.observationCount > 0 else {
+            throw PipelineError.outputMissing
+        }
+        try validateMappedSparseModel(sourceSnapshot, at: url)
+
+        for name in replacementSnapshot.files.keys.sorted() {
+            try synchronizeSparseModelFile(at: replacement.appendingPathComponent(name))
+        }
+        let replacementDescriptor = Darwin.open(
+            replacement.path,
+            O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC
+        )
+        guard replacementDescriptor >= 0 else {
+            throw SparseModelPublicationError.unsafeLayout
+        }
+        defer { Darwin.close(replacementDescriptor) }
+        try synchronizeSparseModelDirectory(replacementDescriptor)
+
+        let parent = url.deletingLastPathComponent()
+        let parentDescriptor = Darwin.open(
+            parent.path,
+            O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC
+        )
+        guard parentDescriptor >= 0 else {
+            throw SparseModelPublicationError.unsafeLayout
+        }
+        defer { Darwin.close(parentDescriptor) }
+        let stagingDescriptor = Darwin.open(
+            stagingRoot.path,
+            O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC
+        )
+        guard stagingDescriptor >= 0 else {
+            throw SparseModelPublicationError.unsafeLayout
+        }
+        defer { Darwin.close(stagingDescriptor) }
+        try synchronizeSparseModelDirectory(stagingDescriptor)
+
+        func exchangeModels() -> Int32 {
+            url.lastPathComponent.withCString { currentName in
+                "replacement".withCString { replacementName in
+                    renameatx_np(
+                        parentDescriptor,
+                        currentName,
+                        stagingDescriptor,
+                        replacementName,
+                        UInt32(RENAME_SWAP)
+                    )
+                }
+            }
+        }
+        try validateMappedSparseModel(replacementSnapshot, at: replacement)
+        try publicationCheckpoint(.beforeSwap)
+        let renameResult = exchangeModels()
+        guard renameResult == 0 else {
+            throw SparseModelPublicationError.atomicTextPublicationFailed(errno)
+        }
+
+        do {
+            try publicationCheckpoint(.afterSwap)
+            try synchronizeSparseModelDirectory(parentDescriptor)
+            try synchronizeSparseModelDirectory(stagingDescriptor)
+            try publicationCheckpoint(.beforePublishedValidation)
+            try validateMappedSparseModel(replacementSnapshot, at: url)
+        } catch {
+            do {
+                try validateMappedSparseModel(sourceSnapshot, at: replacement)
+                let rollbackResult = exchangeModels()
+                guard rollbackResult == 0 else {
+                    let rollbackCode = errno
+                    preserveStaging = true
+                    throw SparseModelPublicationError.atomicTextRollbackFailed(
+                        rollbackCode,
+                        recoveryDirectory: stagingRoot.path
+                    )
+                }
+                try synchronizeSparseModelDirectory(parentDescriptor)
+                try synchronizeSparseModelDirectory(stagingDescriptor)
+                try validateMappedSparseModel(sourceSnapshot, at: url)
+            } catch let rollbackError as SparseModelPublicationError {
+                if case .atomicTextRollbackFailed = rollbackError {
+                    throw rollbackError
+                }
+                preserveStaging = true
+                throw SparseModelPublicationError.atomicTextRollbackFailed(
+                    EIO,
+                    recoveryDirectory: stagingRoot.path
+                )
+            } catch {
+                preserveStaging = true
+                throw SparseModelPublicationError.atomicTextRollbackFailed(
+                    EIO,
+                    recoveryDirectory: stagingRoot.path
+                )
+            }
+            throw error
+        }
+        try? fm.removeItem(at: replacement)
+        try? synchronizeSparseModelDirectory(stagingDescriptor)
         return true
     }
 
@@ -374,7 +597,7 @@ extension PipelineRunner {
         options: ColmapOptions,
         onLog: @escaping @Sendable (String, Bool) -> Void,
         emit: @escaping @Sendable (PipelineEvent) -> Void,
-        onExactRecovery: () -> Void
+        onExactRecovery: () throws -> Void
     ) async throws {
         var attemptOptions = options
         do {
@@ -397,9 +620,9 @@ extension PipelineRunner {
                 throw error
             }
 
-            try ColmapDatabaseMatchStore.clearMatchingResults(at: database)
             attemptOptions.descriptorMatcher = .exact
-            onExactRecovery()
+            try onExactRecovery()
+            try ColmapDatabaseMatchStore.clearMatchingResults(at: database)
             emit(.stageLog(
                 stage: .sfmMatching,
                 line: "FAISS matching failed (\(reason.rawValue)); preserving features and retrying with exact matching.",

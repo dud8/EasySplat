@@ -86,22 +86,22 @@ final class ColmapMappingProgressTracker: @unchecked Sendable {
     private let lock = NSLock()
     private let totalImages: Int
     private var lastFraction: Double = 0
-    private var recordedGlobalRefinementCycleCount = 0
+    private var recordedGlobalRefinementInvocationCount = 0
 
     init(totalImages: Int) {
         self.totalImages = totalImages
     }
 
-    var globalRefinementCycleCount: Int {
+    var globalRefinementInvocationCount: Int {
         lock.lock()
         defer { lock.unlock() }
-        return recordedGlobalRefinementCycleCount
+        return recordedGlobalRefinementInvocationCount
     }
 
     func ingest(_ line: String) -> (fraction: Double, message: String)? {
         if line.contains(Self.globalRefinementMarker) {
             lock.lock()
-            recordedGlobalRefinementCycleCount += 1
+            recordedGlobalRefinementInvocationCount += 1
             lock.unlock()
         }
 

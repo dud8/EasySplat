@@ -64,15 +64,15 @@ final class RequestedRunOptionsTests: XCTestCase {
     }
 }
 
-final class ProjectMetadataVersionSixTests: XCTestCase {
-    func testNewMetadataUsesVersionSixAndSuppliedRequestedOptions() {
+final class ProjectMetadataVersionSevenTests: XCTestCase {
+    func testNewMetadataUsesVersionSevenAndSuppliedRequestedOptions() {
         let metadata = ProjectMetadata(
             title: "New project",
             input: .photos(folder: "/tmp/photos"),
             requestedRunOptions: RequestedRunOptions(capturePath: .orbit, detailProfile: .balanced)
         )
 
-        XCTAssertEqual(ProjectMetadataStore.supportedFormatVersion, 6)
+        XCTAssertEqual(ProjectMetadataStore.supportedFormatVersion, 7)
         XCTAssertEqual(metadata.formatVersion, ProjectMetadataStore.supportedFormatVersion)
         XCTAssertEqual(
             metadata.requestedRunOptions,
@@ -222,9 +222,15 @@ func makeGeometryArtifact(
             runtime: nil,
             model: nil
         ),
-        pairGraph: .notEvaluated(
-            mappingAttemptNumber: 1,
-            bundleAdjustmentCycleCount: 1,
+        pairGraph: .notEvaluated(),
+        mapping: MappingArtifact(
+            modelCount: 1,
+            largestModelRegisteredViewCount: 2,
+            secondLargestModelRegisteredViewCount: 0,
+            unionRegisteredViewCount: 2,
+            attemptCount: 1,
+            acceptedRefinementKind: .incrementalGlobal,
+            acceptedRefinementInvocationCount: 1,
             fallbackReason: nil
         ),
         canonicalOrientation: .unresolved(

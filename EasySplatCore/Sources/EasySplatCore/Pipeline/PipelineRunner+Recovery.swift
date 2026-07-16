@@ -214,6 +214,7 @@ extension PipelineRunner {
             try self.removeItemIfPresent(paths.pairGraphRecoveryURL)
             try removeAcceptedGeometryAndTraining()
         case .sfmMapping:
+            try self.removeItemIfPresent(paths.pairGraphRecoveryURL)
             try removeAcceptedGeometryAndTraining()
         case .trainSplat:
             return
@@ -313,6 +314,7 @@ extension PipelineRunner {
             (stages.firstIndex(of: timing.stage) ?? stages.count) <= boundaryIndex
         }
         metadata.resolvedRunPlan = resolvedPlan
+        metadata.geometryRecovery = nil
         metadata.state = PipelineState(stage: completedBoundary ?? .importInput, lastError: nil)
         metadata.checkpoint = nil
         metadata.lastRunStartedAt = nil

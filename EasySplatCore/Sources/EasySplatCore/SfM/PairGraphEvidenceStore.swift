@@ -128,24 +128,8 @@ struct PairGraphEvidence: Codable, Sendable, Equatable {
         )
     }
 
-    func pairGraphArtifact(
-        mappingAttemptNumber: Int,
-        bundleAdjustmentCycleCount: Int,
-        fallbackReason: String?
-    ) throws -> PairGraphArtifact {
-        guard mappingAttemptNumber > 0,
-              bundleAdjustmentCycleCount > 0,
-              fallbackReason.map({
-                  !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-              }) ?? true else {
-            throw PairGraphEvidenceStoreError.invalidEvidence
-        }
-        return .measured(
-            try pairGraphMeasurement(),
-            mappingAttemptNumber: mappingAttemptNumber,
-            bundleAdjustmentCycleCount: bundleAdjustmentCycleCount,
-            fallbackReason: fallbackReason
-        )
+    func pairGraphArtifact() throws -> PairGraphArtifact {
+        .measured(try pairGraphMeasurement())
     }
 
     func restoredPairPlans() throws -> (

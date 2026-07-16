@@ -104,7 +104,7 @@ The new-project order is deliberate:
 
 A setup failure therefore creates no failed project and keeps input available for Try Again.
 
-`project.json` format v6 is the only supported project format. The project library logs and skips older, newer, malformed, and unsafe bundles without changing or deleting them.
+`project.json` format v7 is the only supported project format. The project library logs and skips older, newer, malformed, and unsafe bundles without changing or deleting them.
 
 ## Durable stages and recovery
 

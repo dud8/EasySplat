@@ -431,6 +431,161 @@ final class ProjectDiagnosticBundleTests: XCTestCase {
         XCTAssertEqual(reconstruction["meanReprojectionError"] as? Double, 0.85)
     }
 
+    func testIncludesRecoveryFactsWithoutSelectedFrameIdentity() throws {
+        let root = try TestFileBuilder.makeTempDir()
+            .appendingPathComponent("Private Recovery.easysplatproj", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root.deletingLastPathComponent()) }
+        let paths = ProjectPaths(root: root)
+        try paths.ensureDirectories()
+        let privateFrameName = "client-address-frame.jpg"
+        let recovery = GeometryRecoveryState(
+            selectedFramesDigest: String(repeating: "a", count: 64),
+            orderedImageNames: [
+                privateFrameName,
+                "client-address-frame-2.jpg",
+                "client-address-frame-3.jpg",
+            ],
+            activeBackend: .colmap,
+            mappingAttemptCount: 2,
+            mappingFallbackReasons: ["interrupted mapping resumed"],
+            pendingPairRecoveryLevel: .expanded,
+            colmapComputeMode: .cpu
+        )
+        try ProjectMetadataStore.save(
+            ProjectMetadata(
+                title: "Private Recovery",
+                input: .photos(folder: "/tmp/photos"),
+                geometryRecovery: recovery,
+                state: PipelineState(stage: .sfmMatching, lastError: nil)
+            ),
+            to: paths.metadataURL
+        )
+
+        let bundle = try XCTUnwrap(ProjectDiagnosticBundle.build(projectURL: root))
+
+        XCTAssertTrue(bundle.contains("Recovery backend: colmap"))
+        XCTAssertTrue(bundle.contains("Recovery mapping attempts: 2"))
+        XCTAssertTrue(bundle.contains("Recovery compute: cpu"))
+        XCTAssertTrue(bundle.contains("Pending pair recovery: expanded"))
+        XCTAssertTrue(bundle.contains("Recovery reason: interrupted mapping resumed"))
+        XCTAssertFalse(bundle.contains(privateFrameName))
+        XCTAssertFalse(bundle.contains(String(repeating: "a", count: 64)))
+        let payload = try machineReadablePayload(from: bundle)
+        let machineRecovery = try XCTUnwrap(
+            payload["geometryRecovery"] as? [String: Any]
+        )
+        XCTAssertEqual(machineRecovery["activeBackend"] as? String, "colmap")
+        XCTAssertEqual(machineRecovery["mappingAttemptCount"] as? Int, 2)
+        XCTAssertEqual(machineRecovery["colmapComputeMode"] as? String, "cpu")
+        XCTAssertEqual(machineRecovery["pendingPairRecoveryLevel"] as? String, "expanded")
+        XCTAssertNil(machineRecovery["orderedImageNames"])
+        XCTAssertNil(machineRecovery["selectedFramesDigest"])
+    }
+
+    func testIncludesSanitizedMappingEvidenceInReconstructionAndMachineReadableMetrics() throws {
+        let root = try TestFileBuilder.makeTempDir()
+            .appendingPathComponent("Private Site.easysplatproj", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root.deletingLastPathComponent()) }
+        let paths = ProjectPaths(root: root)
+        try paths.ensureDirectories()
+        var geometry = makeGeometryArtifact()
+        geometry.registeredViewCount = 18
+        geometry.totalViewCount = 20
+        geometry.mapping = MappingArtifact(
+            modelCount: 2,
+            largestModelRegisteredViewCount: 18,
+            secondLargestModelRegisteredViewCount: 5,
+            unionRegisteredViewCount: 20,
+            attemptCount: 3,
+            acceptedRefinementKind: .incrementalGlobal,
+            acceptedRefinementInvocationCount: 4,
+            fallbackReason: "Retry for Private Site at \(NSHomeDirectory())/private/input.mov"
+        )
+        try ProjectMetadataStore.save(
+            ProjectMetadata(
+                title: "Private Site",
+                input: .photos(folder: "/tmp/photos"),
+                requestedRunOptions: RequestedRunOptions(capturePath: .walkthrough, detailProfile: .balanced),
+                geometryArtifact: geometry,
+                reconstruction: ReconstructionSummary(
+                    mapper: "colmap",
+                    capturedAt: Date(timeIntervalSince1970: 1_700_000_000),
+                    registeredImages: 18,
+                    totalImages: 20
+                )
+            ),
+            to: paths.metadataURL
+        )
+
+        let bundle = try XCTUnwrap(ProjectDiagnosticBundle.build(projectURL: root))
+
+        XCTAssertTrue(bundle.contains("Models: 2 (largest 18, second 5)"))
+        XCTAssertTrue(bundle.contains("Union registered: 20"))
+        XCTAssertTrue(bundle.contains("Mapping attempts: 3"))
+        XCTAssertTrue(bundle.contains("Accepted refinement: Incremental global (4 invocations)"))
+        XCTAssertTrue(bundle.contains("Mapping fallback: Retry for <redacted> at ~/private/input.mov"))
+        XCTAssertFalse(bundle.contains("Private Site"))
+        XCTAssertFalse(bundle.contains(NSHomeDirectory()))
+
+        let payload = try machineReadablePayload(from: bundle)
+        XCTAssertEqual(
+            payload["schemaVersion"] as? Int,
+            ProjectDiagnosticBundle.machineReadableSchemaVersion
+        )
+        let mapping = try XCTUnwrap(payload["mapping"] as? [String: Any])
+        XCTAssertEqual(mapping["modelCount"] as? Int, 2)
+        XCTAssertEqual(mapping["largestModelRegisteredViewCount"] as? Int, 18)
+        XCTAssertEqual(mapping["secondLargestModelRegisteredViewCount"] as? Int, 5)
+        XCTAssertEqual(mapping["unionRegisteredViewCount"] as? Int, 20)
+        XCTAssertEqual(mapping["attemptCount"] as? Int, 3)
+        XCTAssertEqual(mapping["acceptedRefinementKind"] as? String, "incrementalGlobal")
+        XCTAssertEqual(mapping["acceptedRefinementInvocationCount"] as? Int, 4)
+        XCTAssertEqual(
+            mapping["fallbackReason"] as? String,
+            "Retry for <redacted> at ~/private/input.mov"
+        )
+        XCTAssertEqual(Set(mapping.keys), [
+            "modelCount",
+            "largestModelRegisteredViewCount",
+            "secondLargestModelRegisteredViewCount",
+            "unionRegisteredViewCount",
+            "attemptCount",
+            "acceptedRefinementKind",
+            "acceptedRefinementInvocationCount",
+            "fallbackReason",
+        ])
+    }
+
+    func testOmitsMappingFallbackLineWhenNoFallbackWasNeeded() throws {
+        let root = try TestFileBuilder.makeTempDir()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let paths = ProjectPaths(root: root)
+        try paths.ensureDirectories()
+        let geometry = makeGeometryArtifact()
+        try ProjectMetadataStore.save(
+            ProjectMetadata(
+                title: "Direct Mapping",
+                input: .photos(folder: "/tmp/photos"),
+                geometryArtifact: geometry,
+                reconstruction: ReconstructionSummary(
+                    mapper: "colmap",
+                    capturedAt: Date(timeIntervalSince1970: 1_700_000_000),
+                    registeredImages: 2,
+                    totalImages: 2
+                )
+            ),
+            to: paths.metadataURL
+        )
+
+        let bundle = try XCTUnwrap(ProjectDiagnosticBundle.build(projectURL: root))
+
+        XCTAssertFalse(bundle.contains("Mapping fallback:"))
+        let mapping = try XCTUnwrap(
+            try machineReadablePayload(from: bundle)["mapping"] as? [String: Any]
+        )
+        XCTAssertNil(mapping["fallbackReason"])
+    }
+
     func testNotesAreIncludedOnlyWhenOptedIn() throws {
         let root = try TestFileBuilder.makeTempDir()
         defer { try? FileManager.default.removeItem(at: root) }

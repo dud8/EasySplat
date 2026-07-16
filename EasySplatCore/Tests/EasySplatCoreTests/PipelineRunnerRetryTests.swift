@@ -944,6 +944,23 @@ final class PipelineRunnerRetryTests: XCTestCase {
         )
     }
 
+    func testCleanForMappingRetryRemovesPendingIntentButPreservesVerifiedGraph() throws {
+        let root = try TestFileBuilder.makeTempDir()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let paths = ProjectPaths(root: root)
+        try paths.ensureDirectories()
+        try Data("verified".utf8).write(to: paths.pairGraphEvidenceURL)
+        try Data("pending".utf8).write(to: paths.pairGraphRecoveryURL)
+
+        try makeRunner(projectURL: root).test_cleanForRetry(
+            failedStage: .sfmMapping,
+            paths: paths
+        )
+
+        XCTAssertTrue(FileManager.default.fileExists(atPath: paths.pairGraphEvidenceURL.path))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: paths.pairGraphRecoveryURL.path))
+    }
+
     func testCleanForRetryRemovesDanglingDatabaseSymlink() throws {
         let parent = try TestFileBuilder.makeTempDir()
         defer { try? FileManager.default.removeItem(at: parent) }

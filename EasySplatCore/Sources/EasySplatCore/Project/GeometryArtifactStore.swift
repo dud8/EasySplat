@@ -7,6 +7,7 @@ enum GeometryArtifactStore {
     static let maximumMedianPixelResidual = 1.5
     static let maximumP90PixelResidual = 3.0
     static let minimumLearnedObservationsPerView = 20
+    static let maximumMappingFallbackReasonBytes = 4_096
 
     enum Error: Swift.Error, LocalizedError, Equatable {
         case invalidSchema(Int)
@@ -22,6 +23,7 @@ enum GeometryArtifactStore {
         case invalidLearnedInitializer
         case learnedInitializerDigestMismatch
         case invalidPairGraph
+        case invalidMapping
         case invalidCanonicalOrientation
         case invalidTimings
 
@@ -53,6 +55,8 @@ enum GeometryArtifactStore {
                 return "Learned point initialization no longer matches accepted geometry."
             case .invalidPairGraph:
                 return "Geometry artifact pair-graph evidence is incomplete or inconsistent."
+            case .invalidMapping:
+                return "Geometry artifact mapping evidence is incomplete or inconsistent."
             case .invalidCanonicalOrientation:
                 return "Geometry artifact orientation evidence is incomplete or inconsistent."
             case .invalidTimings:
@@ -245,6 +249,13 @@ enum GeometryArtifactStore {
             totalViewCount: artifact.totalViewCount,
             registeredViewCount: artifact.registeredViewCount
         )
+        try validateMapping(
+            artifact.mapping,
+            totalViewCount: artifact.totalViewCount,
+            registeredViewCount: artifact.registeredViewCount,
+            pairGraphStatus: artifact.pairGraph.status,
+            hasLearnedProvenance: provenance.runtime != nil && provenance.model != nil
+        )
         try validateCanonicalOrientation(
             artifact.canonicalOrientation,
             registeredViewCount: artifact.registeredViewCount
@@ -323,13 +334,6 @@ enum GeometryArtifactStore {
         totalViewCount: Int,
         registeredViewCount: Int
     ) throws {
-        guard artifact.mappingAttemptNumber > 0,
-              artifact.bundleAdjustmentCycleCount > 0,
-              artifact.fallbackReason.map({
-                  !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-              }) ?? true else {
-            throw Error.invalidPairGraph
-        }
         switch artifact.status {
         case .notEvaluated:
             guard artifact.measurement == nil else { throw Error.invalidPairGraph }
@@ -427,6 +431,77 @@ enum GeometryArtifactStore {
                   acceptedAttempt.spatiallyVerifiedPairCount
                     == measurement.spatiallyVerifiedPairCount else {
                 throw Error.invalidPairGraph
+            }
+        }
+    }
+
+    private static func validateMapping(
+        _ artifact: MappingArtifact,
+        totalViewCount: Int,
+        registeredViewCount: Int,
+        pairGraphStatus: PairGraphMeasurementStatus,
+        hasLearnedProvenance: Bool
+    ) throws {
+        let fallbackIsValid = artifact.fallbackReason.map { reason in
+            let trimmed = reason.trimmingCharacters(in: .whitespacesAndNewlines)
+            return !trimmed.isEmpty
+                && trimmed == reason
+                && reason.utf8.count <= maximumMappingFallbackReasonBytes
+                && reason.unicodeScalars.allSatisfy {
+                    !CharacterSet.controlCharacters.contains($0)
+                }
+        } ?? true
+        guard artifact.modelCount >= 1,
+              artifact.modelCount <= artifact.unionRegisteredViewCount,
+              artifact.largestModelRegisteredViewCount >= registeredViewCount,
+              artifact.largestModelRegisteredViewCount >= 1,
+              artifact.unionRegisteredViewCount >= artifact.largestModelRegisteredViewCount,
+              artifact.unionRegisteredViewCount <= totalViewCount,
+              artifact.attemptCount >= 1,
+              artifact.acceptedRefinementInvocationCount >= 0,
+              fallbackIsValid,
+              artifact.attemptCount == 1 || artifact.fallbackReason != nil else {
+            throw Error.invalidMapping
+        }
+
+        if artifact.modelCount == 1 {
+            guard artifact.largestModelRegisteredViewCount == registeredViewCount,
+                  artifact.secondLargestModelRegisteredViewCount == 0,
+                  artifact.unionRegisteredViewCount
+                    == artifact.largestModelRegisteredViewCount else {
+                throw Error.invalidMapping
+            }
+        } else {
+            guard artifact.secondLargestModelRegisteredViewCount >= 1,
+                  artifact.secondLargestModelRegisteredViewCount
+                    <= artifact.largestModelRegisteredViewCount else {
+                throw Error.invalidMapping
+            }
+            if artifact.modelCount == 2 {
+                guard registeredViewCount == artifact.largestModelRegisteredViewCount
+                        || registeredViewCount
+                            == artifact.secondLargestModelRegisteredViewCount else {
+                    throw Error.invalidMapping
+                }
+            } else if registeredViewCount
+                > artifact.secondLargestModelRegisteredViewCount {
+                guard registeredViewCount == artifact.largestModelRegisteredViewCount else {
+                    throw Error.invalidMapping
+                }
+            }
+        }
+
+        switch artifact.acceptedRefinementKind {
+        case .incrementalGlobal:
+            guard !hasLearnedProvenance, pairGraphStatus == .measured else {
+                throw Error.invalidMapping
+            }
+        case .seededBundleAdjustment:
+            guard hasLearnedProvenance,
+                  pairGraphStatus == .notEvaluated,
+                  artifact.modelCount == 1,
+                  artifact.acceptedRefinementInvocationCount == 1 else {
+                throw Error.invalidMapping
             }
         }
     }
