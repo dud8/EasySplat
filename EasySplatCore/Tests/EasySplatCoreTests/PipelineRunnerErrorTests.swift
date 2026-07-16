@@ -71,6 +71,30 @@ final class PipelineRunnerErrorTests: XCTestCase {
         XCTAssertTrue(message.debugMessage.contains("mean reprojection error 1.25"))
     }
 
+    func testFragmentedMappingFailureExplainsTheMeasuredSplit() {
+        let runner = makeRunner()
+        let error = PipelineRunner.PipelineError.fragmentedReconstruction(
+            MappingFragmentationEvidence(
+                selectedModelOrder: 0,
+                selectedRegisteredViewCount: 226,
+                credibleUnionRegisteredViewCount: 249,
+                omittedRecoverableViewCount: 23,
+                totalSelectedViewCount: 250
+            )
+        )
+
+        let message = runner.test_failureMessages(for: error, stage: .sfmMapping)
+
+        XCTAssertEqual(
+            message.userMessage,
+            "The capture split into separate camera solves. Try again with more overlap."
+        )
+        XCTAssertTrue(message.debugMessage.contains("selected model 0 registered 226 of 250"))
+        XCTAssertTrue(message.debugMessage.contains("credible union registered 249"))
+        XCTAssertTrue(message.debugMessage.contains("23 recoverable views"))
+        XCTAssertFalse(message.userMessage.lowercased().contains("colmap"))
+    }
+
     func testFailureMessagesForSubprocessFailure() throws {
         let runner = makeRunner()
         let failure = SubprocessFailure(

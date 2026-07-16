@@ -34,6 +34,37 @@ final class PipelineRunnerRetryTests: XCTestCase {
         ))
     }
 
+    func testFragmentedMappingUsesOnlyThePairGraphRecoveryPath() {
+        let fragmentation = PipelineRunner.PipelineError.fragmentedReconstruction(
+            MappingFragmentationEvidence(
+                selectedModelOrder: 0,
+                selectedRegisteredViewCount: 226,
+                credibleUnionRegisteredViewCount: 249,
+                omittedRecoverableViewCount: 23,
+                totalSelectedViewCount: 250
+            )
+        )
+
+        XCTAssertTrue(PipelineRunner.shouldRecoverPairGraph(after: fragmentation))
+        XCTAssertTrue(PipelineRunner.shouldEscalateTargetedExact(after: fragmentation))
+        XCTAssertTrue(PipelineRunner.shouldRecoverPairGraph(
+            after: PipelineRunner.PipelineError.lowQualityReconstruction(
+                ReconstructionScore(
+                    registeredImages: 80,
+                    totalImages: 100,
+                    meanReprojectionError: 1
+                ),
+                mapper: "colmap"
+            )
+        ))
+        XCTAssertFalse(PipelineRunner.shouldRecoverPairGraph(
+            after: PipelineRunner.PipelineError.geometryResidualsTooHigh(
+                median: 2,
+                p90: 4
+            )
+        ))
+    }
+
     func testPipelineStageDecodingRejectsUnknownStage() throws {
         let unknown = try JSONEncoder().encode("unknownStage")
 

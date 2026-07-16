@@ -15,6 +15,7 @@ extension PipelineRunner {
         case invalidInput
         case insufficientInputImages(Int)
         case lowQualityReconstruction(ReconstructionScore, mapper: String?)
+        case fragmentedReconstruction(MappingFragmentationEvidence)
         case geometryCoverageTooLow(registered: Int, total: Int)
         case geometryResidualCoverageTooLow(measured: Int, total: Int)
         case geometryRegisteredImagesMismatch
@@ -336,6 +337,11 @@ extension PipelineRunner {
             case let .lowQualityReconstruction(score, _):
                 let summary = ReconstructionScorer.summary(score)
                 return ("The camera solve was unstable. Try a slower capture with more light.", "Low-quality reconstruction. \(summary).")
+            case let .fragmentedReconstruction(evidence):
+                return (
+                    "The capture split into separate camera solves. Try again with more overlap.",
+                    "Fragmented reconstruction: selected model \(evidence.selectedModelOrder) registered \(evidence.selectedRegisteredViewCount) of \(evidence.totalSelectedViewCount) views; credible union registered \(evidence.credibleUnionRegisteredViewCount), leaving \(evidence.omittedRecoverableViewCount) recoverable views outside the selected model."
+                )
             case let .geometryCoverageTooLow(registered, total):
                 return (
                     "The capture did not have enough connected overlap. Try again with more overlap.",

@@ -4,6 +4,7 @@ extension PipelineRunner {
     func validatedGeometryMeasurement(
         modelDirectory: URL,
         selectedFrames: [URL],
+        minimumRegisteredViewCount: Int? = nil,
         requireStrongObservationCoverage: Bool
     ) throws -> (
         residuals: ColmapResidualAnalyzer.Result,
@@ -17,9 +18,21 @@ extension PipelineRunner {
         } catch {
             throw PipelineError.geometryResidualsUnavailable(error.localizedDescription)
         }
-        let requiredRegisteredViews = Int(ceil(
-            Double(selectedFrames.count) * ReconstructionScorer.minimumRegisteredViewFraction
-        ))
+        let requiredRegisteredViews: Int
+        if let minimumRegisteredViewCount {
+            guard minimumRegisteredViewCount > 0,
+                  minimumRegisteredViewCount <= selectedFrames.count else {
+                throw PipelineError.geometryCoverageTooLow(
+                    registered: residuals.registeredViewCount,
+                    total: selectedFrames.count
+                )
+            }
+            requiredRegisteredViews = minimumRegisteredViewCount
+        } else {
+            requiredRegisteredViews = Int(ceil(
+                Double(selectedFrames.count) * ReconstructionScorer.minimumRegisteredViewFraction
+            ))
+        }
         let selectedNames = Set(selectedFrames.map(\.lastPathComponent))
         guard Set(residuals.registeredImageNames).isSubset(of: selectedNames) else {
             throw PipelineError.geometryRegisteredImagesMismatch

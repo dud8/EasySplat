@@ -39,6 +39,7 @@ public enum ColmapMapperOptionsValidationError: Error, LocalizedError, Equatable
 
 enum ColmapMappingPolicy {
     static let minimumPairInlierCount = 15
+    static let maximumAcceptedRecoverableViewLoss = 2
 }
 
 /// Fixed incremental-mapper policy passed across the native COLMAP process boundary.

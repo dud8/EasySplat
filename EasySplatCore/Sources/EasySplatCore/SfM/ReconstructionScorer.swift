@@ -27,6 +27,7 @@ public struct ReconstructionScore: Sendable {
 
 public enum ReconstructionScorer {
     static let minimumRegisteredViewFraction = 0.90
+    static let maximumMeanReprojectionError = 2.5
 
     static func parseSparseTextModel(at sparseModelURL: URL, expectedTotalImages: Int? = nil) -> ReconstructionScore? {
         let imagesTxt = sparseModelURL.appendingPathComponent("images.txt")
@@ -179,7 +180,7 @@ public enum ReconstructionScorer {
         let ratio = Double(score.registeredImages) / Double(score.totalImages)
         if ratio < minimumRegisteredViewFraction { return false }
         if let reproj = score.meanReprojectionError,
-           !reproj.isFinite || reproj < 0 || reproj > 2.5 {
+           !reproj.isFinite || reproj < 0 || reproj > maximumMeanReprojectionError {
             return false
         }
         if let points = score.pointCount, points <= 0 { return false }

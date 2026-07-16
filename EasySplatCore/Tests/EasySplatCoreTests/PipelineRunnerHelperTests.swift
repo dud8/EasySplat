@@ -101,6 +101,157 @@ final class PipelineRunnerHelperTests: XCTestCase {
         )
     }
 
+    func testMappingFragmentationRetriesOnlyForMoreThanTwoCredibleOmittedViews() {
+        func candidate(order: Int, imageIDs: Set<UInt32>) -> MappedSparseModelCandidate {
+            MappedSparseModelCandidate(
+                url: URL(fileURLWithPath: "/tmp/\(order)"),
+                order: order,
+                score: ReconstructionScore(
+                    registeredImages: imageIDs.count,
+                    totalImages: 250,
+                    meanReprojectionError: 0.7,
+                    pointCount: max(1, imageIDs.count * 10),
+                    observationCount: max(1, imageIDs.count * 30),
+                    meanTrackLength: 3
+                )
+            )
+        }
+
+        let selectedIDs = Set((1...226).map(UInt32.init))
+        let selected = candidate(order: 0, imageIDs: selectedIDs)
+
+        for omittedCount in [2, 3, 23] {
+            let siblingIDs = Set(
+                ((227)..<(227 + omittedCount)).map(UInt32.init)
+            )
+            let sibling = candidate(order: 1, imageIDs: siblingIDs)
+            let evidence = PipelineRunner.mappingFragmentationEvidence(
+                selected: selected,
+                candidates: [selected, sibling],
+                memberships: [
+                    .init(modelOrder: 0, imageIDs: selectedIDs),
+                    .init(modelOrder: 1, imageIDs: siblingIDs),
+                ],
+                residualValidatedModelOrders: [1],
+                totalSelectedViewCount: 250
+            )
+
+            if omittedCount <= 2 {
+                XCTAssertNil(evidence)
+            } else {
+                XCTAssertEqual(evidence?.selectedModelOrder, 0)
+                XCTAssertEqual(evidence?.selectedRegisteredViewCount, 226)
+                XCTAssertEqual(evidence?.credibleUnionRegisteredViewCount, 226 + omittedCount)
+                XCTAssertEqual(evidence?.omittedRecoverableViewCount, omittedCount)
+                XCTAssertEqual(evidence?.totalSelectedViewCount, 250)
+            }
+        }
+    }
+
+    func testMappingFragmentationUsesCredibleMembershipUnionDeterministically() {
+        func candidate(
+            order: Int,
+            imageIDs: Set<UInt32>,
+            points: Int? = 100,
+            residual: Double? = 0.5
+        ) -> MappedSparseModelCandidate {
+            MappedSparseModelCandidate(
+                url: URL(fileURLWithPath: "/tmp/\(order)"),
+                order: order,
+                score: ReconstructionScore(
+                    registeredImages: imageIDs.count,
+                    totalImages: 100,
+                    meanReprojectionError: residual,
+                    pointCount: points,
+                    observationCount: 300,
+                    meanTrackLength: 3
+                )
+            )
+        }
+
+        let selectedIDs = Set((1...90).map(UInt32.init))
+        let selected = candidate(order: 3, imageIDs: selectedIDs)
+        let overlapping = candidate(order: 8, imageIDs: Set((11...80).map(UInt32.init)))
+        let credible = candidate(order: 5, imageIDs: Set((91...93).map(UInt32.init)))
+        let analyzerInvalid = candidate(
+            order: 2,
+            imageIDs: Set((94...99).map(UInt32.init)),
+            points: nil
+        )
+        let highResidual = candidate(
+            order: 1,
+            imageIDs: Set((100...102).map(UInt32.init)),
+            residual: 2.6
+        )
+        let candidates = [selected, overlapping, credible, analyzerInvalid, highResidual]
+        let memberships = [
+            ColmapSparseModelMembership(modelOrder: 8, imageIDs: Set((11...80).map(UInt32.init))),
+            .init(modelOrder: 2, imageIDs: Set((94...99).map(UInt32.init))),
+            .init(modelOrder: 5, imageIDs: Set((91...93).map(UInt32.init))),
+            .init(modelOrder: 3, imageIDs: selectedIDs),
+            .init(modelOrder: 1, imageIDs: Set((100...102).map(UInt32.init))),
+        ]
+
+        let forward = PipelineRunner.mappingFragmentationEvidence(
+            selected: selected,
+            candidates: candidates,
+            memberships: memberships,
+            residualValidatedModelOrders: [5, 8],
+            totalSelectedViewCount: 100
+        )
+        let reversed = PipelineRunner.mappingFragmentationEvidence(
+            selected: selected,
+            candidates: Array(candidates.reversed()),
+            memberships: Array(memberships.reversed()),
+            residualValidatedModelOrders: [5, 8],
+            totalSelectedViewCount: 100
+        )
+
+        XCTAssertEqual(forward, reversed)
+        XCTAssertEqual(forward?.credibleUnionRegisteredViewCount, 93)
+        XCTAssertEqual(forward?.omittedRecoverableViewCount, 3)
+    }
+
+    func testMappingFragmentationExcludesSiblingWithoutMeasuredResidualValidation() {
+        let selectedIDs = Set((1...27).map(UInt32.init))
+        let siblingIDs = Set((28...30).map(UInt32.init))
+        let selected = MappedSparseModelCandidate(
+            url: URL(fileURLWithPath: "/tmp/0"),
+            order: 0,
+            score: ReconstructionScore(
+                registeredImages: 27,
+                totalImages: 30,
+                meanReprojectionError: 0.5,
+                pointCount: 100,
+                observationCount: 2_700,
+                meanTrackLength: 27
+            )
+        )
+        let analyzerOnlySibling = MappedSparseModelCandidate(
+            url: URL(fileURLWithPath: "/tmp/1"),
+            order: 1,
+            score: ReconstructionScore(
+                registeredImages: 3,
+                totalImages: 30,
+                meanReprojectionError: 0.5,
+                pointCount: 20,
+                observationCount: 60,
+                meanTrackLength: 3
+            )
+        )
+
+        XCTAssertNil(PipelineRunner.mappingFragmentationEvidence(
+            selected: selected,
+            candidates: [selected, analyzerOnlySibling],
+            memberships: [
+                .init(modelOrder: 0, imageIDs: selectedIDs),
+                .init(modelOrder: 1, imageIDs: siblingIDs),
+            ],
+            residualValidatedModelOrders: [],
+            totalSelectedViewCount: 30
+        ))
+    }
+
     func testMappedSparseModelDiscoveryIgnoresNonnumericFoldersAndSortsCanonicalModels() throws {
         let root = try TestFileBuilder.makeTempDir()
         defer { try? FileManager.default.removeItem(at: root) }

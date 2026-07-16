@@ -7,6 +7,14 @@ struct MappedSparseModelCandidate: Sendable {
     let score: ReconstructionScore
 }
 
+struct MappingFragmentationEvidence: Sendable, Equatable {
+    let selectedModelOrder: Int
+    let selectedRegisteredViewCount: Int
+    let credibleUnionRegisteredViewCount: Int
+    let omittedRecoverableViewCount: Int
+    let totalSelectedViewCount: Int
+}
+
 struct MappedSparseModelSnapshot: Sendable {
     fileprivate let directory: SparseDirectoryState
     fileprivate let files: [String: SparseFileState]
@@ -198,6 +206,78 @@ extension PipelineRunner {
             }
             return preferredMappedSparseModel(lhs, over: rhs)
         }
+    }
+
+    static func mappingFragmentationEvidence(
+        selected: MappedSparseModelCandidate,
+        candidates: [MappedSparseModelCandidate],
+        memberships: [ColmapSparseModelMembership],
+        residualValidatedModelOrders: Set<Int>,
+        totalSelectedViewCount: Int
+    ) -> MappingFragmentationEvidence? {
+        guard totalSelectedViewCount > 0 else { return nil }
+
+        var membershipByOrder: [Int: Set<UInt32>] = [:]
+        for membership in memberships {
+            guard membershipByOrder[membership.modelOrder] == nil else { return nil }
+            membershipByOrder[membership.modelOrder] = membership.imageIDs
+        }
+        guard let selectedImageIDs = membershipByOrder[selected.order],
+              selectedImageIDs.count == selected.score.registeredImages,
+              selectedImageIDs.count <= totalSelectedViewCount else {
+            return nil
+        }
+
+        var credibleUnion = selectedImageIDs
+        var seenCandidateOrders: Set<Int> = []
+        for candidate in candidates {
+            guard seenCandidateOrders.insert(candidate.order).inserted,
+                  candidate.order != selected.order,
+                  let imageIDs = membershipByOrder[candidate.order],
+                  residualValidatedModelOrders.contains(candidate.order),
+                  credibleFragmentCandidate(
+                    candidate,
+                    imageIDs: imageIDs,
+                    totalSelectedViewCount: totalSelectedViewCount
+                  ) else {
+                continue
+            }
+            credibleUnion.formUnion(imageIDs)
+        }
+
+        guard credibleUnion.count <= totalSelectedViewCount else { return nil }
+        let omittedCount = credibleUnion.subtracting(selectedImageIDs).count
+        guard omittedCount > ColmapMappingPolicy.maximumAcceptedRecoverableViewLoss else {
+            return nil
+        }
+        return MappingFragmentationEvidence(
+            selectedModelOrder: selected.order,
+            selectedRegisteredViewCount: selectedImageIDs.count,
+            credibleUnionRegisteredViewCount: credibleUnion.count,
+            omittedRecoverableViewCount: omittedCount,
+            totalSelectedViewCount: totalSelectedViewCount
+        )
+    }
+
+    static func credibleFragmentCandidate(
+        _ candidate: MappedSparseModelCandidate,
+        imageIDs: Set<UInt32>,
+        totalSelectedViewCount: Int
+    ) -> Bool {
+        guard imageIDs.count == candidate.score.registeredImages,
+              imageIDs.count > ColmapMappingPolicy.maximumAcceptedRecoverableViewLoss,
+              imageIDs.count <= totalSelectedViewCount,
+              let points = candidate.score.pointCount, points > 0,
+              let observations = candidate.score.observationCount, observations > 0,
+              let trackLength = candidate.score.meanTrackLength,
+              trackLength.isFinite, trackLength > 0,
+              let residual = candidate.score.meanReprojectionError,
+              residual.isFinite,
+              residual >= 0,
+              residual <= ReconstructionScorer.maximumMeanReprojectionError else {
+            return false
+        }
+        return true
     }
 
     func publishCanonicalSparseModel(

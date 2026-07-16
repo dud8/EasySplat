@@ -79,6 +79,7 @@ extension PipelineRunner {
         guard let error = error as? PipelineError else { return false }
         switch error {
         case .lowQualityReconstruction,
+             .fragmentedReconstruction,
              .geometryCoverageTooLow,
              .geometryResidualCoverageTooLow,
              .geometryRegisteredImagesMismatch,
@@ -92,6 +93,27 @@ extension PipelineRunner {
              .videoFrameBudgetTooSmall,
              .photoSelectionExceedsBudget,
              .imageTranscodeFailed:
+            return false
+        }
+    }
+
+    static func shouldRecoverPairGraph(after error: Error?) -> Bool {
+        guard let error = error as? PipelineError else { return false }
+        switch error {
+        case .lowQualityReconstruction, .fragmentedReconstruction:
+            return true
+        case .invalidInput,
+             .insufficientInputImages,
+             .geometryCoverageTooLow,
+             .geometryResidualCoverageTooLow,
+             .geometryRegisteredImagesMismatch,
+             .geometryResidualsUnavailable,
+             .geometryResidualsTooHigh,
+             .geometryProvenanceUnavailable,
+             .videoFrameBudgetTooSmall,
+             .photoSelectionExceedsBudget,
+             .imageTranscodeFailed,
+             .outputMissing:
             return false
         }
     }

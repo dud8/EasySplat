@@ -2629,7 +2629,7 @@ public final class PipelineRunner: @unchecked Sendable {
                         }
                         let membershipByOrder = Dictionary(
                             uniqueKeysWithValues: memberships.models.map {
-                                ($0.modelOrder, $0.imageIDs.count)
+                                ($0.modelOrder, $0.imageIDs)
                             }
                         )
                         var candidates: [MappedSparseModelCandidate] = []
@@ -2639,7 +2639,7 @@ public final class PipelineRunner: @unchecked Sendable {
                             try Task.checkCancellation()
                             do {
                                 guard let snapshot = snapshots[model.order],
-                                      let membershipCount = membershipByOrder[model.order] else {
+                                      let membership = membershipByOrder[model.order] else {
                                     throw PipelineError.outputMissing
                                 }
                                 let report = try await self.tooling.colmap.runModelAnalyzer(
@@ -2656,7 +2656,7 @@ public final class PipelineRunner: @unchecked Sendable {
                                     ReconstructionScorer.parseModelAnalyzerOutput(report),
                                     expectedTotalImages: selectedFrames.count
                                 )
-                                guard score.registeredImages == membershipCount else {
+                                guard score.registeredImages == membership.count else {
                                     throw PipelineError.geometryRegisteredImagesMismatch
                                 }
                                 candidates.append(MappedSparseModelCandidate(
@@ -2678,6 +2678,41 @@ public final class PipelineRunner: @unchecked Sendable {
                         guard !candidates.isEmpty else {
                             throw firstAnalysisError ?? PipelineError.outputMissing
                         }
+                        var residualValidatedModelOrders: Set<Int> = []
+                        if candidates.count > 1 {
+                            for candidate in candidates {
+                                guard let imageIDs = membershipByOrder[candidate.order],
+                                      Self.credibleFragmentCandidate(
+                                        candidate,
+                                        imageIDs: imageIDs,
+                                        totalSelectedViewCount: selectedFrames.count
+                                      ) else {
+                                    continue
+                                }
+                                do {
+                                    _ = try self.ensureTextSparseModelFiles(at: candidate.url)
+                                    let measurement = try self.validatedGeometryMeasurement(
+                                        modelDirectory: candidate.url,
+                                        selectedFrames: selectedFrames,
+                                        minimumRegisteredViewCount: candidate.score.registeredImages,
+                                        requireStrongObservationCoverage: false
+                                    )
+                                    guard measurement.residuals.registeredViewCount
+                                            == candidate.score.registeredImages else {
+                                        throw PipelineError.geometryRegisteredImagesMismatch
+                                    }
+                                    residualValidatedModelOrders.insert(candidate.order)
+                                } catch {
+                                    if error is CancellationError { throw error }
+                                    try Task.checkCancellation()
+                                    emit(.stageLog(
+                                        stage: .sfmMapping,
+                                        line: "Ignored COLMAP model \(candidate.order) as fragmentation evidence because its measured tracks did not validate.",
+                                        isError: false
+                                    ))
+                                }
+                            }
+                        }
                         let rankedCandidates = Self.rankedMappedSparseModels(
                             candidates,
                             capturePath: resolvedRunPlan.capturePath
@@ -2687,6 +2722,7 @@ public final class PipelineRunner: @unchecked Sendable {
                         }
                         var preferredValidationError: Error?
                         var preferredLowQualityScore: ReconstructionScore?
+                        var preferredFragmentationEvidence: MappingFragmentationEvidence?
                         for selected in rankedCandidates {
                             let score = selected.score
                             guard ReconstructionScorer.isAcceptable(
@@ -2714,6 +2750,23 @@ public final class PipelineRunner: @unchecked Sendable {
                                     selectedFrames: selectedFrames,
                                     requireStrongObservationCoverage: requireStrongObservationCoverage
                                 )
+                                if let fragmentation = Self.mappingFragmentationEvidence(
+                                    selected: selected,
+                                    candidates: candidates,
+                                    memberships: memberships.models,
+                                    residualValidatedModelOrders: residualValidatedModelOrders,
+                                    totalSelectedViewCount: selectedFrames.count
+                                ) {
+                                    if preferredFragmentationEvidence == nil {
+                                        preferredFragmentationEvidence = fragmentation
+                                    }
+                                    emit(.stageLog(
+                                        stage: .sfmMapping,
+                                        line: "Rejected COLMAP model \(modelLabel): it omitted \(fragmentation.omittedRecoverableViewCount) views that reconstructed in credible sibling models (\(fragmentation.selectedRegisteredViewCount)/\(fragmentation.credibleUnionRegisteredViewCount) selected/union).",
+                                        isError: true
+                                    ))
+                                    continue
+                                }
                                 let selectedSnapshot = try self.captureMappedSparseModel(
                                     at: selected.url
                                 )
@@ -2784,7 +2837,11 @@ public final class PipelineRunner: @unchecked Sendable {
                             }
                         }
 
-                        if let preferredValidationError {
+                        if let preferredFragmentationEvidence {
+                            lastMappingError = PipelineError.fragmentedReconstruction(
+                                preferredFragmentationEvidence
+                            )
+                        } else if let preferredValidationError {
                             lastMappingError = preferredValidationError
                         } else if let preferredLowQualityScore {
                             lastMappingError = PipelineError.lowQualityReconstruction(
@@ -2846,10 +2903,18 @@ public final class PipelineRunner: @unchecked Sendable {
                         continue sfmAttemptLoop
                     }
 
+                    let mappingPairRecoveryReason: String?
+                    if let pipelineError = lastMappingError as? PipelineError,
+                       case .fragmentedReconstruction = pipelineError {
+                        mappingPairRecoveryReason = "Camera mapping split recoverable views across separate models"
+                    } else if Self.shouldRecoverPairGraph(after: lastMappingError) {
+                        mappingPairRecoveryReason = "Reconstruction coverage was below the acceptance gate"
+                    } else {
+                        mappingPairRecoveryReason = nil
+                    }
                     if !mappingSucceeded,
-                       let pipelineError = lastMappingError as? PipelineError,
-                       case .lowQualityReconstruction = pipelineError,
-                       try advancePairRecovery("Reconstruction coverage was below the acceptance gate") {
+                       let mappingPairRecoveryReason,
+                       try advancePairRecovery(mappingPairRecoveryReason) {
                         suspendStageTimingForRetry(.sfmMapping)
                         forceSfMRun = false
                         forceMatchingRun = true
@@ -2857,8 +2922,7 @@ public final class PipelineRunner: @unchecked Sendable {
                     }
 
                     if !mappingSucceeded,
-                       let pipelineError = lastMappingError as? PipelineError,
-                       case .lowQualityReconstruction = pipelineError,
+                       Self.shouldRecoverPairGraph(after: lastMappingError),
                        !didRetryWithExactMatcher,
                        colmapMatchOptions.descriptorMatcher == .faiss,
                        Self.nextPairRecoveryLevel(
@@ -2882,7 +2946,7 @@ public final class PipelineRunner: @unchecked Sendable {
                         acceptedPairGraphEvidence = nil
                         emit(.stageLog(
                             stage: .sfmMatching,
-                            line: "The densest FAISS solve missed the coverage gate. Retrying the same schedule with exact descriptor matching.",
+                            line: "The densest FAISS solve did not produce one acceptable camera solve. Retrying the same schedule with exact descriptor matching.",
                             isError: true
                         ))
                         forceSfMRun = false
@@ -2891,6 +2955,19 @@ public final class PipelineRunner: @unchecked Sendable {
                     }
 
                     guard mappingSucceeded else {
+                        if let pipelineError = lastMappingError as? PipelineError,
+                           case .fragmentedReconstruction = pipelineError {
+                            let message = failureMessages(
+                                for: pipelineError,
+                                stage: .sfmMapping
+                            )
+                            emitFailure(
+                                stage: .sfmMapping,
+                                userMessage: message.userMessage,
+                                debugMessage: message.debugMessage
+                            )
+                            throw pipelineError
+                        }
                         let debugMessage: String
                         if let pipelineError = lastMappingError as? PipelineError,
                            case let .lowQualityReconstruction(score, _) = pipelineError {

@@ -492,6 +492,228 @@ final class GeometryRecoveryIntegrationTests: XCTestCase {
         XCTAssertNil(finished.geometryRecovery)
     }
 
+    func testAnalyzerOnlyFragmentDoesNotRejectAnOtherwiseAcceptableModel() async throws {
+        let fixture = try makeFixture(
+            named: "AnalyzerOnlyFragment",
+            imageCount: 30,
+            requestedRunOptions: RequestedRunOptions(
+                capturePath: .automatic,
+                detailProfile: .fast,
+                inputOrdering: .continuous,
+                photoSelection: .useAllValidPhotos
+            )
+        )
+        let runner = MockSubprocessRunner(scripts: [
+            featureExtractionScript(for: fixture),
+            matchingScript(for: fixture),
+            .init(
+                path: fixture.toolchain.colmap.path,
+                argsPrefix: ["mapper"],
+                result: successfulResult,
+                onRun: { arguments in
+                    guard let outputPath = self.value(for: "--output_path", in: arguments) else {
+                        throw FixtureError.missingArgument
+                    }
+                    let names = try self.selectedImageNames(for: fixture)
+                    let sparseRoot = URL(fileURLWithPath: outputPath, isDirectory: true)
+                    try self.writeSparseModel(
+                        at: sparseRoot.appendingPathComponent("0", isDirectory: true),
+                        for: fixture,
+                        imageNames: Array(names.prefix(27))
+                    )
+                    let invalidSibling = sparseRoot.appendingPathComponent("1", isDirectory: true)
+                    try self.writeSparseModel(
+                        at: invalidSibling,
+                        for: fixture,
+                        imageNames: Array(names.suffix(3))
+                    )
+                    try "# No real points\n".write(
+                        to: invalidSibling.appendingPathComponent("points3D.txt"),
+                        atomically: true,
+                        encoding: .utf8
+                    )
+                }
+            ),
+            .init(
+                path: fixture.toolchain.colmap.path,
+                argsPrefix: ["model_analyzer"],
+                result: SubprocessResult(
+                    exitCode: 0,
+                    terminationReason: .exit,
+                    stdout: "Registered images: 27 / 30\nPoints: 20\nObservations: 540\nMean track length: 27.0\nMean reprojection error: 0.5\n",
+                    stderr: ""
+                )
+            ),
+            .init(
+                path: fixture.toolchain.colmap.path,
+                argsPrefix: ["model_analyzer"],
+                result: SubprocessResult(
+                    exitCode: 0,
+                    terminationReason: .exit,
+                    stdout: "Registered images: 3 / 30\nPoints: 20\nObservations: 60\nMean track length: 3.0\nMean reprojection error: 0.5\n",
+                    stderr: ""
+                )
+            ),
+        ])
+
+        try await makePipeline(fixture: fixture, runner: runner).run { _ in }
+
+        XCTAssertEqual(
+            runner.calls.compactMap { $0.1.first },
+            ["feature_extractor", "matches_importer", "mapper", "model_analyzer", "model_analyzer"]
+        )
+        let finished = try ProjectMetadataStore.load(from: fixture.paths.metadataURL)
+        XCTAssertEqual(finished.geometryArtifact?.mapping.attemptCount, 1)
+        XCTAssertNil(finished.geometryArtifact?.mapping.fallbackReason)
+        XCTAssertNil(finished.geometryRecovery)
+        XCTAssertEqual(
+            try FileManager.default.contentsOfDirectory(atPath: fixture.paths.colmapSparseURL.path),
+            ["0"]
+        )
+    }
+
+    func testFragmentedMappingRecoveryResumesExpandedScheduleWithoutPublishingTheSplit() async throws {
+        let fixture = try makeFixture(
+            named: "FragmentedMappingRecoveryResume",
+            imageCount: 30,
+            requestedRunOptions: RequestedRunOptions(
+                capturePath: .automatic,
+                detailProfile: .fast,
+                inputOrdering: .continuous,
+                photoSelection: .useAllValidPhotos
+            )
+        )
+        let pairSchedules = PairScheduleProbe()
+        let events = GeometryRecoveryEventSink()
+        let firstRunner = MockSubprocessRunner(scripts: [
+            featureExtractionScript(for: fixture),
+            .init(
+                path: fixture.toolchain.colmap.path,
+                argsPrefix: ["matches_importer"],
+                result: successfulResult,
+                onRun: { arguments in
+                    let pairs = try self.pairListLines(for: arguments)
+                    pairSchedules.recordNormal(pairs)
+                    try self.writeVerifiedMatches(for: arguments)
+                }
+            ),
+            .init(
+                path: fixture.toolchain.colmap.path,
+                argsPrefix: ["mapper"],
+                result: successfulResult,
+                onRun: { arguments in
+                    guard let outputPath = self.value(for: "--output_path", in: arguments) else {
+                        throw FixtureError.missingArgument
+                    }
+                    let names = try self.selectedImageNames(for: fixture)
+                    let sparseRoot = URL(fileURLWithPath: outputPath, isDirectory: true)
+                    try self.writeSparseModel(
+                        at: sparseRoot.appendingPathComponent("0", isDirectory: true),
+                        for: fixture,
+                        imageNames: Array(names.prefix(27))
+                    )
+                    try self.writeSparseModel(
+                        at: sparseRoot.appendingPathComponent("1", isDirectory: true),
+                        for: fixture,
+                        imageNames: Array(names.suffix(3))
+                    )
+                }
+            ),
+            .init(
+                path: fixture.toolchain.colmap.path,
+                argsPrefix: ["model_analyzer"],
+                result: SubprocessResult(
+                    exitCode: 0,
+                    terminationReason: .exit,
+                    stdout: "Registered images: 27 / 30\nPoints: 20\nObservations: 540\nMean track length: 27.0\nMean reprojection error: 0.5\n",
+                    stderr: ""
+                )
+            ),
+            .init(
+                path: fixture.toolchain.colmap.path,
+                argsPrefix: ["model_analyzer"],
+                result: SubprocessResult(
+                    exitCode: 0,
+                    terminationReason: .exit,
+                    stdout: "Registered images: 3 / 30\nPoints: 20\nObservations: 60\nMean track length: 3.0\nMean reprojection error: 0.5\n",
+                    stderr: ""
+                )
+            ),
+            .init(
+                path: fixture.toolchain.colmap.path,
+                argsPrefix: ["matches_importer"],
+                result: successfulResult,
+                onRun: { arguments in
+                    let pairs = try self.pairListLines(for: arguments)
+                    XCTAssertGreaterThan(pairs.count, pairSchedules.normal.count)
+                    pairSchedules.recordExpanded(pairs)
+                    throw CancellationError()
+                }
+            ),
+        ])
+
+        do {
+            try await makePipeline(fixture: fixture, runner: firstRunner).run {
+                events.append($0)
+            }
+            XCTFail("Expected expanded matching cancellation")
+        } catch is CancellationError {
+            // The recovery intent must survive without accepting either coordinate frame.
+        }
+
+        XCTAssertFalse(FileManager.default.fileExists(atPath: fixture.paths.geometryManifestURL.path))
+        XCTAssertTrue(FileManager.default.fileExists(
+            atPath: fixture.paths.colmapSparseURL.appendingPathComponent("1").path
+        ), "The split mapper output must not be mistaken for canonical publication.")
+        XCTAssertNotNil(events.stageLog(containing: "omitted 3 views"))
+        let interrupted = try ProjectMetadataStore.load(from: fixture.paths.metadataURL)
+        XCTAssertEqual(interrupted.geometryRecovery?.mappingAttemptCount, 1)
+        XCTAssertEqual(interrupted.geometryRecovery?.pendingPairRecoveryLevel, .expanded)
+        XCTAssertEqual(
+            interrupted.geometryRecovery?.mappingFallbackReasons,
+            ["Camera mapping split recoverable views across separate models"]
+        )
+
+        let expandedSchedule = pairSchedules.expanded
+        XCTAssertFalse(expandedSchedule.isEmpty)
+        let resumeRunner = MockSubprocessRunner(scripts: [
+            .init(
+                path: fixture.toolchain.colmap.path,
+                argsPrefix: ["matches_importer"],
+                result: successfulResult,
+                onRun: { arguments in
+                    XCTAssertEqual(try self.pairListLines(for: arguments), expandedSchedule)
+                    try self.writeVerifiedMatches(for: arguments)
+                }
+            ),
+            .init(
+                path: fixture.toolchain.colmap.path,
+                argsPrefix: ["mapper"],
+                result: successfulResult,
+                onRun: { arguments in
+                    try self.writeSparseModel(for: fixture, mapperArguments: arguments)
+                }
+            ),
+            analyzerScript(for: fixture),
+        ])
+        try await makePipeline(fixture: fixture, runner: resumeRunner).run(
+            resumeFrom: .sfmMatching
+        ) { _ in }
+
+        let finished = try ProjectMetadataStore.load(from: fixture.paths.metadataURL)
+        let mapping = try XCTUnwrap(finished.geometryArtifact?.mapping)
+        XCTAssertEqual(mapping.attemptCount, 2)
+        XCTAssertEqual(
+            mapping.fallbackReason,
+            "Camera mapping split recoverable views across separate models"
+        )
+        XCTAssertNil(finished.geometryRecovery)
+        XCTAssertEqual(
+            try FileManager.default.contentsOfDirectory(atPath: fixture.paths.colmapSparseURL.path),
+            ["0"]
+        )
+    }
+
     func testPersistedGeometrySurvivesResumeBeforeMappingStageCommit() async throws {
         let fixture = try makeFixture(named: "PersistedGeometryResume")
         let initialRunner = MockSubprocessRunner(
@@ -1016,15 +1238,37 @@ final class GeometryRecoveryIntegrationTests: XCTestCase {
         for fixture: Fixture,
         registeredImageCount: Int? = nil
     ) throws {
-        try FileManager.default.createDirectory(at: modelURL, withIntermediateDirectories: true)
-        let allImageNames = try FileManager.default.contentsOfDirectory(
+        let allImageNames = try selectedImageNames(for: fixture)
+        let imageNames = Array(allImageNames.prefix(registeredImageCount ?? allImageNames.count))
+
+        try writeSparseModel(at: modelURL, for: fixture, imageNames: imageNames)
+    }
+
+    private func selectedImageNames(for fixture: Fixture) throws -> [String] {
+        try FileManager.default.contentsOfDirectory(
             at: fixture.paths.framesSelectedURL,
             includingPropertiesForKeys: [.isRegularFileKey],
             options: [.skipsHiddenFiles]
         )
         .map(\.lastPathComponent)
         .sorted()
-        let imageNames = Array(allImageNames.prefix(registeredImageCount ?? allImageNames.count))
+    }
+
+    private func writeSparseModel(
+        at modelURL: URL,
+        for fixture: Fixture,
+        imageNames: [String]
+    ) throws {
+        let allImageNames = try selectedImageNames(for: fixture)
+        let imageIDByName = Dictionary(
+            uniqueKeysWithValues: allImageNames.enumerated().map { ($0.element, $0.offset + 1) }
+        )
+        guard !imageNames.isEmpty,
+              Set(imageNames).count == imageNames.count,
+              imageNames.allSatisfy({ imageIDByName[$0] != nil }) else {
+            throw FixtureError.invalidSparseModelImageNames
+        }
+        try FileManager.default.createDirectory(at: modelURL, withIntermediateDirectories: true)
 
         try "1 SIMPLE_PINHOLE 24 24 20 12 12\n".write(
             to: modelURL.appendingPathComponent("cameras.txt"),
@@ -1032,8 +1276,9 @@ final class GeometryRecoveryIntegrationTests: XCTestCase {
             encoding: .utf8
         )
         var images = "# Image list\n"
-        for (offset, imageName) in imageNames.enumerated() {
-            images += "\(offset + 1) 1 0 0 0 0 0 0 1 \(imageName)\n"
+        for imageName in imageNames {
+            let imageID = imageIDByName[imageName]!
+            images += "\(imageID) 1 0 0 0 0 0 0 1 \(imageName)\n"
             images += (1...20).map { "12 12 \($0)" }.joined(separator: " ") + "\n"
         }
         try images.write(
@@ -1042,8 +1287,8 @@ final class GeometryRecoveryIntegrationTests: XCTestCase {
             encoding: .utf8
         )
         let points = (1...20).map { pointID -> String in
-            let track = imageNames.indices
-                .map { "\($0 + 1) \(pointID - 1)" }
+            let track = imageNames
+                .map { "\(imageIDByName[$0]!) \(pointID - 1)" }
                 .joined(separator: " ")
             return "\(pointID) 0 0 1 128 128 128 0 \(track)"
         }
@@ -1114,6 +1359,7 @@ final class GeometryRecoveryIntegrationTests: XCTestCase {
         case invalidDa3ImageCount(Int)
         case databaseOpenFailed
         case databaseQueryFailed
+        case invalidSparseModelImageNames
         case sqlFailed(String)
     }
 }
