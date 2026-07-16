@@ -1950,7 +1950,7 @@ int main(int argc, char *argv[]) {
                     resolutionSchedule, shDegree, shDegreeInterval, refineEvery,
                     warmupLength, resetAlphaEvery, densifyGradThreshold,
                     densifySizeThreshold, stopScreenSizeAt, splitScreenSize,
-                    profile.iterationLimit, false, background);
+                    profile.iterationLimit, true, background);
 
         std::vector<size_t> camIndices(cameras.size());
         std::iota(camIndices.begin(), camIndices.end(), 0);

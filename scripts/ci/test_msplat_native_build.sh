@@ -156,6 +156,7 @@ require_contains 'getrusage(RUSAGE_SELF' "$OVERLAY"
 require_contains '"peak_memory_bytes"' "$OVERLAY"
 require_contains 'std::vector<Camera> &cameras = inputData.cameras;' "$OVERLAY"
 require_contains 'constexpr float background[3] = {0.0f, 0.0f, 0.0f};' "$OVERLAY"
+require_contains 'profile.iterationLimit, true, background);' "$OVERLAY"
 require_contains 'constexpr int cameraReuseCount = 2;' "$OVERLAY"
 require_contains 'releaseCameraResources' "$OVERLAY"
 require_absent 'for (Camera &camera : inputData.cameras) camera.loadImage' "$OVERLAY"
@@ -734,6 +735,100 @@ if sum(record.get("event") == "completed" for record in records) != 1:
 PY
 }
 
+validate_ply_scene_bounds() {
+  local jsonl="$1"
+  local ply="$2"
+  python3 - "$jsonl" "$ply" <<'PY'
+import json
+import math
+import statistics
+import struct
+import sys
+from pathlib import Path
+
+
+records = [json.loads(line) for line in Path(sys.argv[1]).read_text().splitlines()]
+completed = [record for record in records if record.get("event") == "completed"]
+if len(completed) != 1:
+    raise SystemExit("scene-bounds parity requires one completed event")
+completed = completed[0]
+
+with Path(sys.argv[2]).open("rb") as source:
+    if source.readline() != b"ply\n":
+        raise SystemExit("scene-bounds parity expected a PLY output")
+    properties = []
+    vertex_count = None
+    in_vertices = False
+    while True:
+        line = source.readline()
+        if not line:
+            raise SystemExit("scene-bounds parity found a truncated PLY header")
+        fields = line.decode("ascii").strip().split()
+        if fields[:2] == ["format", "binary_little_endian"]:
+            continue
+        if fields[:2] == ["element", "vertex"]:
+            vertex_count = int(fields[2])
+            in_vertices = True
+        elif fields[:1] == ["element"]:
+            in_vertices = False
+        elif in_vertices and fields[:2] == ["property", "float"]:
+            properties.append(fields[2])
+        elif fields == ["end_header"]:
+            break
+    if vertex_count is None or not properties:
+        raise SystemExit("scene-bounds parity found no PLY vertices")
+    required = {"x", "y", "z", "opacity", "scale_0", "scale_1", "scale_2"}
+    if not required.issubset(properties):
+        raise SystemExit("scene-bounds parity is missing required PLY properties")
+    row = struct.Struct("<" + "f" * len(properties))
+    samples = []
+    for _ in range(vertex_count):
+        payload = source.read(row.size)
+        if len(payload) != row.size:
+            raise SystemExit("scene-bounds parity found a truncated PLY payload")
+        values = dict(zip(properties, row.unpack(payload), strict=True))
+        raw = [
+            values["x"], values["y"], values["z"], values["opacity"],
+            values["scale_0"], values["scale_1"], values["scale_2"],
+        ]
+        if not all(math.isfinite(value) for value in raw):
+            continue
+        physical_scales = [math.exp(value) for value in raw[4:]]
+        if not all(math.isfinite(value) and value > 0 for value in physical_scales):
+            continue
+        opacity = raw[3]
+        alpha = (
+            1 / (1 + math.exp(-opacity))
+            if opacity >= 0
+            else math.exp(opacity) / (1 + math.exp(opacity))
+        )
+        samples.append((raw[:3], max(physical_scales), alpha))
+    if source.read(1):
+        raise SystemExit("scene-bounds parity found trailing PLY payload")
+
+if completed.get("gaussian_count") != vertex_count or not samples:
+    raise SystemExit("scene-bounds parity has inconsistent Gaussian counts")
+opaque = [sample for sample in samples if sample[2] >= 0.01]
+minimum_opaque = min(len(samples), max(8, (len(samples) + 999) // 1000))
+selected = opaque if len(opaque) >= minimum_opaque else samples
+center = [statistics.median(sample[0][axis] for sample in selected) for axis in range(3)]
+extents = sorted(
+    math.dist(sample[0], center) + 3 * sample[1]
+    for sample in selected
+)
+radius = extents[max(1, (995 * len(extents) + 999) // 1000) - 1]
+reported_center = completed.get("scene_center")
+reported_radius = completed.get("scene_radius")
+if not isinstance(reported_center, list) or len(reported_center) != 3:
+    raise SystemExit("completed event has no scene center for PLY parity")
+for axis, (reported, actual) in enumerate(zip(reported_center, center, strict=True)):
+    if not math.isclose(reported, actual, rel_tol=1e-6, abs_tol=1e-6):
+        raise SystemExit(f"completed scene center axis {axis} disagrees with emitted PLY")
+if not math.isclose(reported_radius, radius, rel_tol=1e-6, abs_tol=1e-6):
+    raise SystemExit("completed scene radius disagrees with emitted PLY")
+PY
+}
+
 assert_identity_input_rejected() {
   local label="$1"
   local dataset="$2"
@@ -932,6 +1027,9 @@ while IFS=$'\t' read -r fixture_name expected_points metal_pipeline_stress; do
   "$BIN" --validate-ply "$training_dir/splat.ply" --events-fd 1 \
     >"$training_dir/validation.jsonl" 2>"$training_dir/validation.stderr"
   require_contains '"status":"ok"' "$training_dir/validation.jsonl"
+  if [ "$fixture_name" = "01-sphere-500" ]; then
+    validate_ply_scene_bounds "$training_dir/events.jsonl" "$training_dir/splat.ply"
+  fi
   if find "$training_dir" -maxdepth 1 -name '*.tmp.*' -print -quit | grep -q .; then
     fail "Fast-profile training left a temporary output behind"
   fi
