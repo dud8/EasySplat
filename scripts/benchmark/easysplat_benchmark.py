@@ -141,6 +141,10 @@ APPROVED_PAIRED_BASELINE = {
             "walkthrough": 75,
             "large_area": 94,
         },
+        "ba_global_frames_ratio": 1.1,
+        "ba_global_points_ratio": 1.1,
+        "ba_global_max_refinements": 5,
+        "ba_local_max_refinements": 2,
         "trainer": "native_msplat",
         "trainer_iterations": 7_000,
         "trainer_plateau_window": 800,
@@ -2551,6 +2555,7 @@ def _evidence_request(
         vocabulary_neighbors = 0 if scale <= 60 else 8
         vocabulary_stride = 1
         ba_ratio = 1.1
+        ba_local_max_refinements = 2
     elif input_kind == "mixed" or "segmented" in traits:
         topology = "segmented_mixed"
         capture_path = "automatic"
@@ -2561,6 +2566,7 @@ def _evidence_request(
         vocabulary_neighbors = 8
         vocabulary_stride = 1
         ba_ratio = 1.1
+        ba_local_max_refinements = 2
     elif scene["category"] == "object_orbit":
         topology = "continuous"
         capture_path = "around_subject"
@@ -2570,7 +2576,8 @@ def _evidence_request(
         vocabulary_candidates = 20 if scale >= 120 else 0
         vocabulary_neighbors = 2 if scale >= 120 else 0
         vocabulary_stride = 5
-        ba_ratio = 1.4
+        ba_ratio = 4.0
+        ba_local_max_refinements = 1
     elif scene["category"] == "interior_walkthrough":
         topology = "continuous"
         capture_path = "through_space"
@@ -2580,7 +2587,8 @@ def _evidence_request(
         vocabulary_candidates = 20
         vocabulary_neighbors = 2
         vocabulary_stride = 10
-        ba_ratio = 1.4
+        ba_ratio = 4.0
+        ba_local_max_refinements = 1
     elif scene["category"] == "large_area_exterior":
         topology = "continuous"
         capture_path = "large_area"
@@ -2590,7 +2598,8 @@ def _evidence_request(
         vocabulary_candidates = 20
         vocabulary_neighbors = 4
         vocabulary_stride = 10
-        ba_ratio = 1.4
+        ba_ratio = 4.0
+        ba_local_max_refinements = 1
     else:
         topology = "continuous"
         capture_path = "automatic"
@@ -2600,7 +2609,8 @@ def _evidence_request(
         vocabulary_candidates = 20 if scale >= 120 else 0
         vocabulary_neighbors = 2 if scale >= 120 else 0
         vocabulary_stride = 10
-        ba_ratio = 1.4
+        ba_ratio = 4.0
+        ba_local_max_refinements = 1
 
     detail_profile = "balanced" if lane == evidence.LANE_REFERENCE else "fast"
     split = scene["split"]
@@ -2638,6 +2648,7 @@ def _evidence_request(
         "ba_global_frames_ratio": ba_ratio,
         "ba_global_points_ratio": ba_ratio,
         "ba_global_max_refinements": 5,
+        "ba_local_max_refinements": ba_local_max_refinements,
         "trainer_iterations": 7_000 if detail_profile == "balanced" else 3_000,
         "trainer_plateau_window": 800 if detail_profile == "balanced" else 400,
         "deterministic_seed": 42,

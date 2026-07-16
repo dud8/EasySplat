@@ -1192,6 +1192,271 @@ def _configuration_digest(value: Mapping[str, Any]) -> str:
     return sha256_bytes(canonical_json_bytes(value))
 
 
+def _baseline_mapper_cadence(
+    configuration: Mapping[str, Any],
+) -> tuple[float, float, int, int]:
+    frames = configuration.get("ba_global_frames_ratio")
+    points = configuration.get("ba_global_points_ratio")
+    global_refinements = configuration.get("ba_global_max_refinements")
+    local_refinements = configuration.get("ba_local_max_refinements")
+    if (
+        frames != 1.1
+        or points != 1.1
+        or global_refinements != 5
+        or local_refinements != 2
+    ):
+        raise EvidenceError(
+            "request baseline mapper effective defaults must remain 1.1/1.1/global5/local2"
+        )
+    return 1.1, 1.1, 5, 2
+
+
+def _candidate_mapper_cadence(
+    configuration: Mapping[str, Any],
+) -> tuple[float, float, int, int]:
+    topology = configuration["input_topology"]
+    if not isinstance(topology, str) or topology not in {
+        "continuous",
+        "segmented_mixed",
+        "unordered",
+    }:
+        raise EvidenceError("request input topology is invalid for mapper cadence")
+    expected_ratio = 4.0 if topology == "continuous" else 1.1
+    expected_local = 1 if topology == "continuous" else 2
+    frames = configuration["ba_global_frames_ratio"]
+    points = configuration["ba_global_points_ratio"]
+    global_refinements = configuration["ba_global_max_refinements"]
+    local_refinements = configuration["ba_local_max_refinements"]
+    if (
+        isinstance(frames, bool)
+        or isinstance(points, bool)
+        or not isinstance(frames, (int, float))
+        or not isinstance(points, (int, float))
+        or not math.isfinite(frames)
+        or not math.isfinite(points)
+    ):
+        raise EvidenceError("candidate mapper global ratios must be finite numbers")
+    if type(local_refinements) is not int or local_refinements <= 0:
+        raise EvidenceError("ba_local_max_refinements must be a positive integer")
+    if global_refinements != 5:
+        raise EvidenceError("ba_global_max_refinements must remain 5")
+    if frames != expected_ratio or points != expected_ratio or local_refinements != expected_local:
+        raise EvidenceError(
+            f"{topology} mapper cadence requires global ratios {expected_ratio} "
+            f"and local refinements {expected_local}"
+        )
+    return float(frames), float(points), global_refinements, local_refinements
+
+
+MAPPER_CADENCE_OPTIONS = (
+    "--Mapper.ba_global_frames_ratio",
+    "--Mapper.ba_global_points_ratio",
+    "--Mapper.ba_global_max_refinements",
+    "--Mapper.ba_local_max_refinements",
+)
+
+
+def _validate_mapper_invocation_argv(
+    raw: Any,
+    variant: str,
+    *,
+    expected_cadence: tuple[float, float, int, int] | None,
+    label: str,
+) -> None:
+    if not isinstance(raw, list) or len(raw) < 2 or any(
+        not isinstance(argument, str) or not argument for argument in raw
+    ):
+        raise EvidenceError(f"{label} argv must be a nonempty redacted argument array")
+    if any("/Users/" in argument or "/home/" in argument for argument in raw):
+        raise EvidenceError(f"{label} argv must use redacted paths")
+    expected_executable = (
+        "baseline-toolchain://resolved/bin/colmap"
+        if variant == "baseline"
+        else "toolchain://resolved/bin/colmap"
+    )
+    if raw[0] != expected_executable or raw[1] != "mapper":
+        raise EvidenceError(f"{label} argv does not identify the canonical COLMAP mapper executable")
+    if expected_cadence is None:
+        if any(
+            argument == option or argument.startswith(option + "=")
+            for argument in raw
+            for option in MAPPER_CADENCE_OPTIONS
+        ):
+            raise EvidenceError(
+                f"{label} cannot contain production cadence options"
+            )
+        return
+    expected = {
+        "--Mapper.ba_global_frames_ratio": str(expected_cadence[0]),
+        "--Mapper.ba_global_points_ratio": str(expected_cadence[1]),
+        "--Mapper.ba_global_max_refinements": str(expected_cadence[2]),
+        "--Mapper.ba_local_max_refinements": str(expected_cadence[3]),
+    }
+    for option, expected_value in expected.items():
+        indices = [index for index, argument in enumerate(raw) if argument == option]
+        ambiguous = any(argument.startswith(option + "=") for argument in raw)
+        if len(indices) != 1 or ambiguous or indices[0] + 1 >= len(raw):
+            raise EvidenceError(f"{label} cadence must contain one split {option} value")
+        if raw[indices[0] + 1] != expected_value:
+            raise EvidenceError(f"{label} cadence {option} does not match the bound value")
+
+
+def _validate_mapper_invocations(
+    raw: Any,
+    variant: str,
+    request: Mapping[str, Any],
+    *,
+    valid_outcome: bool,
+) -> None:
+    if not isinstance(raw, list):
+        raise EvidenceError("mapper_invocations must be an ordered array")
+    if not valid_outcome:
+        if raw:
+            raise EvidenceError("invalid-input execution receipts require empty mapper_invocations")
+        return
+    invocations: list[Mapping[str, Any]] = []
+    for index, item in enumerate(raw):
+        invocation = _mapping(item, f"mapper_invocations[{index}]")
+        _exact_keys(
+            invocation,
+            {
+                "argv",
+                "outcome",
+                "matching_attempt",
+                "pair_list_digest",
+                "descriptor_matcher",
+            },
+            f"mapper_invocations[{index}]",
+        )
+        if invocation["outcome"] not in {"accepted", "rejected_geometry_gate"}:
+            raise EvidenceError(f"mapper_invocations[{index}].outcome is invalid")
+        matching_attempt = invocation["matching_attempt"]
+        if type(matching_attempt) is not int or matching_attempt <= 0:
+            raise EvidenceError(
+                f"mapper_invocations[{index}].matching_attempt must be a positive integer"
+            )
+        _digest(
+            invocation["pair_list_digest"],
+            f"mapper_invocations[{index}].pair_list_digest",
+        )
+        if invocation["descriptor_matcher"] not in {"faiss", "exact"}:
+            raise EvidenceError(
+                f"mapper_invocations[{index}].descriptor_matcher is invalid"
+            )
+        invocations.append(invocation)
+    accepted = [
+        index for index, invocation in enumerate(invocations)
+        if invocation["outcome"] == "accepted"
+    ]
+    if len(accepted) != 1:
+        raise EvidenceError("mapper_invocations require exactly one accepted invocation")
+    if accepted[0] != len(invocations) - 1:
+        raise EvidenceError("the accepted mapper invocation must be last")
+    if any(
+        invocation["outcome"] != "rejected_geometry_gate"
+        for invocation in invocations[:-1]
+    ):
+        raise EvidenceError(
+            "every mapper invocation before the accepted final invocation must fail its geometry gate"
+        )
+
+    if variant in {"baseline", "accurate_reference"}:
+        if len(invocations) != 1:
+            raise EvidenceError(f"{variant} requires exactly one mapper invocation")
+        if invocations[0]["descriptor_matcher"] != "exact":
+            raise EvidenceError(f"{variant} mapper invocation must record exact matching")
+        _validate_mapper_invocation_argv(
+            invocations[0]["argv"],
+            variant,
+            expected_cadence=None,
+            label=f"{variant} mapper invocation",
+        )
+        return
+
+    initial_cadence = _candidate_mapper_cadence(request["candidate_run_configuration"])
+    topology = request["candidate_run_configuration"]["input_topology"]
+    planned_matcher = request["candidate_run_configuration"]["descriptor_matcher"]
+    first_invocation = invocations[0]
+    if first_invocation["descriptor_matcher"] != planned_matcher:
+        if (
+            first_invocation["descriptor_matcher"] != "exact"
+            or first_invocation["matching_attempt"] <= 1
+        ):
+            raise EvidenceError(
+                "candidate first exact mapper invocation requires a prior FAISS matching attempt"
+            )
+    if topology != "continuous":
+        for index, invocation in enumerate(invocations):
+            _validate_mapper_invocation_argv(
+                invocation["argv"],
+                variant,
+                expected_cadence=initial_cadence,
+                label=f"{topology} candidate mapper invocation {index}",
+            )
+            if index == 0:
+                continue
+            previous = invocations[index - 1]
+            if invocation["matching_attempt"] <= previous["matching_attempt"]:
+                raise EvidenceError(
+                    f"{topology} mapper matching attempts must strictly increase after a retry"
+                )
+            if (
+                invocation["pair_list_digest"] == previous["pair_list_digest"]
+                and invocation["descriptor_matcher"] == previous["descriptor_matcher"]
+            ):
+                raise EvidenceError(
+                    f"{topology} mapper retries must change the pair list or matcher"
+                )
+            if (
+                previous["descriptor_matcher"] == "exact"
+                and invocation["descriptor_matcher"] == "faiss"
+            ):
+                raise EvidenceError("mapper recovery cannot return from exact to faiss matching")
+        return
+
+    _validate_mapper_invocation_argv(
+        invocations[0]["argv"],
+        variant,
+        expected_cadence=initial_cadence,
+        label="continuous candidate fast 4.0/1 invocation",
+    )
+    if len(invocations) == 1:
+        return
+    for index, invocation in enumerate(invocations[1:], start=1):
+        _validate_mapper_invocation_argv(
+            invocation["argv"],
+            variant,
+            expected_cadence=(1.4, 1.4, 5, 2),
+            label=f"continuous candidate conservative 1.4/2 recovery invocation {index}",
+        )
+    if any(
+        invocations[1][field] != invocations[0][field]
+        for field in ("matching_attempt", "pair_list_digest", "descriptor_matcher")
+    ):
+        raise EvidenceError(
+            "the first continuous conservative retry must reuse the fast mapper pair graph"
+        )
+    for index in range(2, len(invocations)):
+        previous = invocations[index - 1]
+        invocation = invocations[index]
+        if invocation["matching_attempt"] <= previous["matching_attempt"]:
+            raise EvidenceError(
+                "continuous mapper matching attempts must strictly increase after rematching"
+            )
+        if (
+            invocation["pair_list_digest"] == previous["pair_list_digest"]
+            and invocation["descriptor_matcher"] == previous["descriptor_matcher"]
+        ):
+            raise EvidenceError(
+                "continuous mapper rematches must change the pair list or matcher"
+            )
+        if (
+            previous["descriptor_matcher"] == "exact"
+            and invocation["descriptor_matcher"] == "faiss"
+        ):
+            raise EvidenceError("mapper recovery cannot return from exact to faiss matching")
+
+
 def _expected_variant_identity(
     variant: str,
     request: Mapping[str, Any],
@@ -1273,6 +1538,7 @@ def _validate_execution_receipts(
         "phase",
         "variant",
         "argv",
+        "mapper_invocations",
         "started_monotonic_seconds",
         "ended_monotonic_seconds",
         "exit_code",
@@ -1360,6 +1626,12 @@ def _validate_execution_receipts(
                 raise EvidenceError("execution receipt argv must use redacted paths")
         if any(not any(argument.startswith(prefix) for argument in argv) for prefix in prefixes):
             raise EvidenceError("execution receipt argv does not identify its variant closure")
+        _validate_mapper_invocations(
+            receipt["mapper_invocations"],
+            receipt["variant"],
+            request,
+            valid_outcome=valid_outcome,
+        )
     if valid_outcome and published_receipts != 1:
         raise EvidenceError("valid evidence requires exactly one receipt for the published output")
     if not valid_outcome and published_receipts:
@@ -3162,6 +3434,7 @@ def validate_request(request: Any) -> Mapping[str, Any]:
             "ba_global_frames_ratio",
             "ba_global_points_ratio",
             "ba_global_max_refinements",
+            "ba_local_max_refinements",
             "trainer_iterations",
             "trainer_plateau_window",
             "deterministic_seed",
@@ -3180,6 +3453,8 @@ def validate_request(request: Any) -> Mapping[str, Any]:
         raise EvidenceError("candidate selected frame count does not match request scale")
     if candidate_configuration["descriptor_matcher"] != "faiss":
         raise EvidenceError("candidate descriptor matcher must be faiss")
+    _baseline_mapper_cadence(baseline_configuration)
+    _candidate_mapper_cadence(candidate_configuration)
     if candidate_configuration["deterministic_seed"] != 42:
         raise EvidenceError("candidate deterministic seed must be 42")
     gate_scopes = value["gate_scopes"]

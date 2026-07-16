@@ -28,6 +28,10 @@
           "walkthrough": 75,
           "large_area": 94
         },
+        "ba_global_frames_ratio": 1.1,
+        "ba_global_points_ratio": 1.1,
+        "ba_global_max_refinements": 5,
+        "ba_local_max_refinements": 2,
         "trainer": "native_msplat",
         "trainer_iterations": 7000,
         "trainer_plateau_window": 800,

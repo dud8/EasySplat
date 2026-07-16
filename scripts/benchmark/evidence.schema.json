@@ -83,6 +83,10 @@
         "exhaustive_block_size",
         "mapper",
         "bundle_adjustment_max_iterations",
+        "ba_global_frames_ratio",
+        "ba_global_points_ratio",
+        "ba_global_max_refinements",
+        "ba_local_max_refinements",
         "trainer",
         "trainer_iterations",
         "trainer_plateau_window",
@@ -122,6 +126,10 @@
             "large_area": {"const": 94}
           }
         },
+        "ba_global_frames_ratio": {"const": 1.1},
+        "ba_global_points_ratio": {"const": 1.1},
+        "ba_global_max_refinements": {"const": 5},
+        "ba_local_max_refinements": {"const": 2},
         "trainer": {"const": "native_msplat"},
         "trainer_iterations": {"const": 7000},
         "trainer_plateau_window": {"const": 800},
@@ -223,6 +231,7 @@
           "phase",
           "variant",
           "argv",
+          "mapper_invocations",
           "started_monotonic_seconds",
           "ended_monotonic_seconds",
           "exit_code",
@@ -245,6 +254,31 @@
             "type": "array",
             "minItems": 1,
             "items": {"type": "string", "minLength": 1}
+          },
+          "mapper_invocations": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "argv",
+                "outcome",
+                "matching_attempt",
+                "pair_list_digest",
+                "descriptor_matcher"
+              ],
+              "properties": {
+                "argv": {
+                  "type": "array",
+                  "minItems": 2,
+                  "items": {"type": "string", "minLength": 1}
+                },
+                "outcome": {"enum": ["accepted", "rejected_geometry_gate"]},
+                "matching_attempt": {"type": "integer", "minimum": 1},
+                "pair_list_digest": {"$ref": "#/$defs/sha256"},
+                "descriptor_matcher": {"enum": ["faiss", "exact"]}
+              }
+            }
           },
           "started_monotonic_seconds": {"type": "number", "minimum": 0},
           "ended_monotonic_seconds": {"type": "number", "exclusiveMinimum": 0},
@@ -428,6 +462,7 @@
         "ba_global_frames_ratio",
         "ba_global_points_ratio",
         "ba_global_max_refinements",
+        "ba_local_max_refinements",
         "trainer_iterations",
         "trainer_plateau_window",
         "deterministic_seed"
@@ -462,13 +497,44 @@
         "vocabulary_verified_neighbor_count": {"type": "integer", "minimum": 0},
         "vocabulary_query_stride": {"type": "integer", "minimum": 1},
         "descriptor_matcher": {"const": "faiss"},
-        "ba_global_frames_ratio": {"enum": [1.1, 1.4]},
-        "ba_global_points_ratio": {"enum": [1.1, 1.4]},
+        "ba_global_frames_ratio": {"enum": [1.1, 4.0]},
+        "ba_global_points_ratio": {"enum": [1.1, 4.0]},
         "ba_global_max_refinements": {"const": 5},
+        "ba_local_max_refinements": {"type": "integer", "minimum": 1},
         "trainer_iterations": {"enum": [3000, 7000]},
         "trainer_plateau_window": {"enum": [400, 800]},
         "deterministic_seed": {"const": 42}
-      }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {"input_topology": {"const": "continuous"}},
+            "required": ["input_topology"]
+          },
+          "then": {
+            "properties": {
+              "ba_global_frames_ratio": {"const": 4.0},
+              "ba_global_points_ratio": {"const": 4.0},
+              "ba_local_max_refinements": {"const": 1}
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "input_topology": {"enum": ["segmented_mixed", "unordered"]}
+            },
+            "required": ["input_topology"]
+          },
+          "then": {
+            "properties": {
+              "ba_global_frames_ratio": {"const": 1.1},
+              "ba_global_points_ratio": {"const": 1.1},
+              "ba_local_max_refinements": {"const": 2}
+            }
+          }
+        }
+      ]
     }
   }
 }

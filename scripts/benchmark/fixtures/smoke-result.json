@@ -4,7 +4,7 @@
   "scene_id": "harness-smoke",
   "input_digest": "sha256:9a5bcf92d9a3c45e5613c93f2cf4eab0503d225f4857a7e22d2f79f29bed39f3",
   "corpus_digest": "sha256:8e3e5c2040b43854e53d441f5ae4ce5482e630a9797b47cba6425ad86a509c8a",
-  "thresholds_digest": "sha256:f7ba9a0702ce88f556add649af0381c9502f28dd4fc370f3d9a55574da796335",
+  "thresholds_digest": "sha256:75344135fee340b8e690628625521de0d78e45e568af22d16bd9f591559b3c58",
   "git_commit": "fixture",
   "app_version": "0.2.0-beta.1",
   "toolchain_identity": "fixture:smoke",

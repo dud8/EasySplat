@@ -485,6 +485,10 @@ def valid_reference_config() -> dict[str, object]:
                         "walkthrough": 75,
                         "large_area": 94,
                     },
+                    "ba_global_frames_ratio": 1.1,
+                    "ba_global_points_ratio": 1.1,
+                    "ba_global_max_refinements": 5,
+                    "ba_local_max_refinements": 2,
                     "trainer": "native_msplat",
                     "trainer_iterations": 7000,
                     "trainer_plateau_window": 800,
@@ -724,8 +728,14 @@ def evidence_request(
     scene_id: str = "orbit-01",
     scale: int = 30,
     lane: str = evidence.LANE_REFERENCE,
+    *,
+    category: str = "object_orbit",
+    input_kind: str = "video",
+    capture_traits: list[str] | None = None,
 ) -> dict[str, object]:
-    scene = valid_scene(scene_id=scene_id)
+    scene = valid_scene(scene_id=scene_id, category=category)
+    scene["input"]["kind"] = input_kind
+    scene["capture_traits"] = ["ordered"] if capture_traits is None else capture_traits
     scene["scale_lanes"] = [scale]
     scene["aggregate_scale"] = scale
     scene["split"] = {
@@ -1018,6 +1028,103 @@ def _timing_records(timing: dict[str, object]) -> list[tuple[str, dict[str, obje
     ]
 
 
+def mapper_argv_for_cadence(
+    variant: str,
+    cadence: tuple[float, float, int, int] | None,
+) -> list[str]:
+    argv = [
+        (
+            "baseline-toolchain://resolved/bin/colmap"
+            if variant == "baseline"
+            else "toolchain://resolved/bin/colmap"
+        ),
+        "mapper",
+    ]
+    if cadence is None:
+        return argv
+    return [
+        *argv,
+        "--Mapper.ba_global_frames_ratio",
+        str(cadence[0]),
+        "--Mapper.ba_global_points_ratio",
+        str(cadence[1]),
+        "--Mapper.ba_global_max_refinements",
+        str(cadence[2]),
+        "--Mapper.ba_local_max_refinements",
+        str(cadence[3]),
+    ]
+
+
+def mapper_invocation(
+    variant: str,
+    cadence: tuple[float, float, int, int] | None,
+    outcome: str,
+    *,
+    matching_attempt: int,
+    digest_character: str,
+    descriptor_matcher: str,
+) -> dict[str, object]:
+    return {
+        "argv": mapper_argv_for_cadence(variant, cadence),
+        "outcome": outcome,
+        "matching_attempt": matching_attempt,
+        "pair_list_digest": "sha256:" + digest_character * 64,
+        "descriptor_matcher": descriptor_matcher,
+    }
+
+
+def mapper_invocations_for_variant(
+    variant: str,
+    request: dict[str, object],
+    *,
+    fallback: bool = False,
+) -> list[dict[str, object]]:
+    if variant in {"baseline", "accurate_reference"}:
+        return [
+            mapper_invocation(
+                variant,
+                None,
+                "accepted",
+                matching_attempt=1,
+                digest_character="b" if variant == "baseline" else "c",
+                descriptor_matcher="exact",
+            )
+        ]
+    topology = request["candidate_run_configuration"]["input_topology"]
+    if topology != "continuous":
+        return [
+            mapper_invocation(
+                variant,
+                (1.1, 1.1, 5, 2),
+                "accepted",
+                matching_attempt=1,
+                digest_character="a",
+                descriptor_matcher="faiss",
+            )
+        ]
+    fast = mapper_invocation(
+        variant,
+        (4.0, 4.0, 5, 1),
+        "rejected_geometry_gate" if fallback else "accepted",
+        matching_attempt=1,
+        digest_character="a",
+        descriptor_matcher="faiss",
+    )
+    if not fallback:
+        return [fast]
+    return [
+        fast,
+        mapper_invocation(
+            variant,
+            (1.4, 1.4, 5, 2),
+            "accepted",
+            matching_attempt=1,
+            digest_character="a",
+            descriptor_matcher="faiss",
+        ),
+    ]
+
+
 def execution_receipts(
     timing: dict[str, object],
     lane: str,
@@ -1068,6 +1175,7 @@ def execution_receipts(
                 "phase": phase.removesuffix("_runs"),
                 "variant": variant,
                 "argv": ["easysplat-benchmark", *prefixes[variant], "corpus://orbit-01"],
+                "mapper_invocations": mapper_invocations_for_variant(variant, request),
                 "started_monotonic_seconds": cursor,
                 "ended_monotonic_seconds": cursor + duration,
                 "exit_code": 0,
@@ -1145,6 +1253,7 @@ def invalid_execution_receipt(
             "phase": "invalid_input",
             "variant": "candidate",
             "argv": ["candidate://invalid-input", "toolchain://current"],
+            "mapper_invocations": [],
             "started_monotonic_seconds": 0.0,
             "ended_monotonic_seconds": 1.0,
             "exit_code": actual["exit_code"],
@@ -1500,7 +1609,7 @@ def write_orientation_evidence_artifacts(
                     },
                     "poseConvention": "world-to-camera",
                     "quaternionOrder": "wxyz",
-                    "schemaVersion": 9,
+                    "schemaVersion": 10,
                 }
             )
             + b"\n"
@@ -2085,6 +2194,10 @@ class ConfigurationValidationTests(unittest.TestCase):
             baseline["run_configuration"]["bundle_adjustment_max_iterations"],
             {"automatic": 75, "orbit": 75, "walkthrough": 75, "large_area": 94},
         )
+        self.assertEqual(baseline["run_configuration"]["ba_global_frames_ratio"], 1.1)
+        self.assertEqual(baseline["run_configuration"]["ba_global_points_ratio"], 1.1)
+        self.assertEqual(baseline["run_configuration"]["ba_global_max_refinements"], 5)
+        self.assertEqual(baseline["run_configuration"]["ba_local_max_refinements"], 2)
         for replacement in ("0" * 40, None):
             changed = valid_reference_config()
             changed["references"]["paired_baseline"]["git_commit"] = replacement
@@ -3280,6 +3393,7 @@ class EvidenceProtocolTests(unittest.TestCase):
                 "vocabulary_query_stride": 1,
                 "ba_global_frames_ratio": 1.1,
                 "ba_global_points_ratio": 1.1,
+                "ba_local_max_refinements": 2,
             }
         )
         selection = evidence.canonical_json_bytes(
@@ -4498,6 +4612,634 @@ class EvidenceProtocolTests(unittest.TestCase):
         with self.assertRaisesRegex(evidence.EvidenceError, "every fifth"):
             evidence.validate_request(malformed)
 
+    def test_mapper_cadence_is_derived_from_input_topology(self) -> None:
+        cases = (
+            ("ordered", evidence_request(
+                category="object_orbit",
+                input_kind="video",
+                capture_traits=["ordered"],
+            ), 4.0, 1),
+            ("unordered", evidence_request(
+                category="professional_photos",
+                input_kind="photos",
+                capture_traits=["unordered"],
+            ), 1.1, 2),
+            ("segmented", evidence_request(
+                category="interior_walkthrough",
+                input_kind="mixed",
+                capture_traits=["segmented"],
+            ), 1.1, 2),
+        )
+        for label, request, global_ratio, local_refinements in cases:
+            with self.subTest(topology=label):
+                configuration = request["candidate_run_configuration"]
+                self.assertEqual(configuration["ba_global_frames_ratio"], global_ratio)
+                self.assertEqual(configuration["ba_global_points_ratio"], global_ratio)
+                self.assertEqual(configuration["ba_local_max_refinements"], local_refinements)
+                evidence.validate_request(request)
+
+    def test_mapper_cadence_request_fails_closed(self) -> None:
+        mutations = (
+            (
+                "missing local cadence",
+                lambda configuration: configuration.pop("ba_local_max_refinements"),
+                "missing.*ba_local_max_refinements",
+            ),
+            (
+                "nonpositive local cadence",
+                lambda configuration: configuration.update({"ba_local_max_refinements": 0}),
+                "ba_local_max_refinements.*positive integer",
+            ),
+            (
+                "ordered conservative cadence",
+                lambda configuration: configuration.update(
+                    {
+                        "ba_global_frames_ratio": 1.4,
+                        "ba_global_points_ratio": 1.4,
+                        "ba_local_max_refinements": 2,
+                    }
+                ),
+                "continuous.*4.0.*local.*1",
+            ),
+        )
+        for label, mutate, expected in mutations:
+            request = evidence_request()
+            configuration = request["candidate_run_configuration"]
+            configuration["ba_global_frames_ratio"] = 4.0
+            configuration["ba_global_points_ratio"] = 4.0
+            configuration["ba_local_max_refinements"] = 1
+            mutate(configuration)
+            with self.subTest(case=label), self.assertRaisesRegex(
+                evidence.EvidenceError,
+                expected,
+            ):
+                evidence.validate_request(request)
+
+    def test_evidence_schema_rejects_topology_mismatched_mapper_cadence(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            _, attestation = self.produce(Path(directory), evidence.LANE_REFERENCE)
+        attestation["candidate_run_configuration"].update(
+            {
+                "ba_global_frames_ratio": 1.1,
+                "ba_global_points_ratio": 1.1,
+                "ba_local_max_refinements": 2,
+            }
+        )
+        with self.assertRaises(ValidationError):
+            validate_attestation_schema(attestation)
+
+    def test_unordered_mapper_cadence_rejects_ordered_values(self) -> None:
+        request = evidence_request(
+            category="professional_photos",
+            input_kind="photos",
+            capture_traits=["unordered"],
+        )
+        request["candidate_run_configuration"].update(
+            {
+                "ba_global_frames_ratio": 4.0,
+                "ba_global_points_ratio": 4.0,
+                "ba_local_max_refinements": 1,
+            }
+        )
+        with self.assertRaisesRegex(
+            evidence.EvidenceError,
+            "unordered.*1.1.*local.*2",
+        ):
+            evidence.validate_request(request)
+
+    def test_continuous_mapper_invocations_accept_fast_or_recovered_shape(self) -> None:
+        request = evidence_request()
+        for variant in ("candidate", "fast_candidate"):
+            for fallback in (False, True):
+                with self.subTest(variant=variant, fallback=fallback):
+                    evidence._validate_mapper_invocations(
+                        mapper_invocations_for_variant(
+                            variant,
+                            request,
+                            fallback=fallback,
+                        ),
+                        variant,
+                        request,
+                        valid_outcome=True,
+                    )
+
+    def test_continuous_mapper_invocations_accept_repeated_graph_recovery(self) -> None:
+        request = evidence_request()
+        fast_rejected = mapper_invocation(
+            "candidate",
+            (4.0, 4.0, 5, 1),
+            "rejected_geometry_gate",
+            matching_attempt=1,
+            digest_character="a",
+            descriptor_matcher="faiss",
+        )
+        same_graph_rejected = mapper_invocation(
+            "candidate",
+            (1.4, 1.4, 5, 2),
+            "rejected_geometry_gate",
+            matching_attempt=1,
+            digest_character="a",
+            descriptor_matcher="faiss",
+        )
+        denser_faiss_accepted = mapper_invocation(
+            "candidate",
+            (1.4, 1.4, 5, 2),
+            "accepted",
+            matching_attempt=2,
+            digest_character="b",
+            descriptor_matcher="faiss",
+        )
+        evidence._validate_mapper_invocations(
+            [fast_rejected, same_graph_rejected, denser_faiss_accepted],
+            "candidate",
+            request,
+            valid_outcome=True,
+        )
+
+    def test_first_mapper_invocation_accepts_proven_exact_matching_recovery(self) -> None:
+        cases = (
+            ("continuous", evidence_request(), (4.0, 4.0, 5, 1)),
+            (
+                "segmented_mixed",
+                evidence_request(
+                    category="interior_walkthrough",
+                    input_kind="mixed",
+                    capture_traits=["segmented"],
+                ),
+                (1.1, 1.1, 5, 2),
+            ),
+            (
+                "unordered",
+                evidence_request(
+                    category="professional_photos",
+                    input_kind="photos",
+                    capture_traits=["unordered"],
+                ),
+                (1.1, 1.1, 5, 2),
+            ),
+        )
+        for topology, request, cadence in cases:
+            with self.subTest(topology=topology):
+                evidence._validate_mapper_invocations(
+                    [
+                        mapper_invocation(
+                            "candidate",
+                            cadence,
+                            "accepted",
+                            matching_attempt=2,
+                            digest_character="a",
+                            descriptor_matcher="exact",
+                        )
+                    ],
+                    "candidate",
+                    request,
+                    valid_outcome=True,
+                )
+
+    def test_first_mapper_invocation_rejects_unproven_exact_matching(self) -> None:
+        cases = (
+            ("continuous", evidence_request(), (4.0, 4.0, 5, 1)),
+            (
+                "segmented_mixed",
+                evidence_request(
+                    category="interior_walkthrough",
+                    input_kind="mixed",
+                    capture_traits=["segmented"],
+                ),
+                (1.1, 1.1, 5, 2),
+            ),
+            (
+                "unordered",
+                evidence_request(
+                    category="professional_photos",
+                    input_kind="photos",
+                    capture_traits=["unordered"],
+                ),
+                (1.1, 1.1, 5, 2),
+            ),
+        )
+        for topology, request, cadence in cases:
+            with self.subTest(topology=topology), self.assertRaisesRegex(
+                evidence.EvidenceError,
+                "exact.*prior FAISS",
+            ):
+                evidence._validate_mapper_invocations(
+                    [
+                        mapper_invocation(
+                            "candidate",
+                            cadence,
+                            "accepted",
+                            matching_attempt=1,
+                            digest_character="a",
+                            descriptor_matcher="exact",
+                        )
+                    ],
+                    "candidate",
+                    request,
+                    valid_outcome=True,
+                )
+
+    def test_continuous_mapper_invocations_accept_exact_retry_of_same_pair_list(self) -> None:
+        request = evidence_request()
+        invocations = [
+            mapper_invocation(
+                "candidate",
+                (4.0, 4.0, 5, 1),
+                "rejected_geometry_gate",
+                matching_attempt=1,
+                digest_character="a",
+                descriptor_matcher="faiss",
+            ),
+            mapper_invocation(
+                "candidate",
+                (1.4, 1.4, 5, 2),
+                "rejected_geometry_gate",
+                matching_attempt=1,
+                digest_character="a",
+                descriptor_matcher="faiss",
+            ),
+            mapper_invocation(
+                "candidate",
+                (1.4, 1.4, 5, 2),
+                "rejected_geometry_gate",
+                matching_attempt=2,
+                digest_character="b",
+                descriptor_matcher="faiss",
+            ),
+            mapper_invocation(
+                "candidate",
+                (1.4, 1.4, 5, 2),
+                "accepted",
+                matching_attempt=3,
+                digest_character="b",
+                descriptor_matcher="exact",
+            ),
+        ]
+        evidence._validate_mapper_invocations(
+            invocations,
+            "candidate",
+            request,
+            valid_outcome=True,
+        )
+
+    def test_mapper_execution_receipt_cannot_omit_mapper_invocations(self) -> None:
+        request = evidence_request()
+        observations = raw_observations(evidence.LANE_REFERENCE)
+        next(
+            receipt for receipt in observations["commands"]
+            if receipt["variant"] == "candidate"
+        ).pop("mapper_invocations")
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            write_evidence_artifacts(root, observations, request)
+            with self.assertRaisesRegex(
+                evidence.EvidenceError,
+                "missing mapper_invocations",
+            ):
+                evidence.produce_attestation(
+                    request,
+                    observations,
+                    root,
+                    root / "attestation.json",
+                    self.key,
+                    evidence.LANE_REFERENCE,
+                    runner_identity(evidence.LANE_REFERENCE),
+                    machine=evidence_machine(evidence.LANE_REFERENCE),
+                )
+
+    def test_continuous_mapper_invocation_shapes_fail_closed(self) -> None:
+        request = evidence_request()
+        fast = mapper_invocations_for_variant("candidate", request)
+        recovered = mapper_invocations_for_variant("candidate", request, fallback=True)
+        conservative = mapper_invocation(
+            "candidate",
+            (1.4, 1.4, 5, 2),
+            "accepted",
+            matching_attempt=1,
+            digest_character="a",
+            descriptor_matcher="faiss",
+        )
+        cases = (
+            ("fallback missing accepted second", recovered[:1], "exactly one accepted"),
+            (
+                "accepted fast followed by extra retry",
+                [*fast, {**conservative, "outcome": "rejected_geometry_gate"}],
+                "accepted.*last",
+            ),
+            ("conservative only", [conservative], "fast 4.0/1"),
+        )
+        for label, invocations, expected in cases:
+            with self.subTest(case=label), self.assertRaisesRegex(
+                evidence.EvidenceError,
+                expected,
+            ):
+                evidence._validate_mapper_invocations(
+                    invocations,
+                    "candidate",
+                    request,
+                    valid_outcome=True,
+                )
+
+    def test_candidate_mapper_invocation_cadence_arguments_fail_closed(self) -> None:
+        request = evidence_request()
+        option = "--Mapper.ba_global_frames_ratio"
+        cases = {}
+        missing = mapper_invocations_for_variant("candidate", request)
+        index = missing[0]["argv"].index(option)
+        del missing[0]["argv"][index : index + 2]
+        cases["missing"] = missing
+        duplicate = mapper_invocations_for_variant("candidate", request)
+        duplicate[0]["argv"].extend((option, "4.0"))
+        cases["duplicate"] = duplicate
+        equals = mapper_invocations_for_variant("candidate", request)
+        index = equals[0]["argv"].index(option)
+        equals[0]["argv"][index : index + 2] = [f"{option}=4.0"]
+        cases["equals"] = equals
+        for label, invocations in cases.items():
+            with self.subTest(case=label), self.assertRaisesRegex(
+                evidence.EvidenceError,
+                "cadence.*ba_global_frames_ratio",
+            ):
+                evidence._validate_mapper_invocations(
+                    invocations,
+                    "candidate",
+                    request,
+                    valid_outcome=True,
+                )
+
+    def test_mapper_invocation_requires_the_canonical_colmap_executable(self) -> None:
+        request = evidence_request()
+        for executable in (
+            "toolchain://resolved/bin/not-colmap",
+            "toolchain://spoof/resolved/bin/colmap",
+        ):
+            invocations = mapper_invocations_for_variant("candidate", request)
+            invocations[0]["argv"][0] = executable
+            with self.subTest(executable=executable), self.assertRaisesRegex(
+                evidence.EvidenceError,
+                "canonical.*COLMAP",
+            ):
+                evidence._validate_mapper_invocations(
+                    invocations,
+                    "candidate",
+                    request,
+                    valid_outcome=True,
+                )
+
+    def test_accurate_reference_mapper_receipt_rejects_production_cadence_options(self) -> None:
+        request = evidence_request()
+        options = (
+            "--Mapper.ba_global_frames_ratio",
+            "--Mapper.ba_global_points_ratio",
+            "--Mapper.ba_global_max_refinements",
+            "--Mapper.ba_local_max_refinements",
+        )
+        for option in options:
+            for form in ("split", "equals"):
+                invocations = mapper_invocations_for_variant("accurate_reference", request)
+                argv = invocations[0]["argv"]
+                if form == "split":
+                    argv.extend((option, "1"))
+                else:
+                    argv.append(f"{option}=1")
+                with self.subTest(option=option, form=form), self.assertRaisesRegex(
+                    evidence.EvidenceError,
+                    "accurate_reference.*production cadence",
+                ):
+                    evidence._validate_mapper_invocations(
+                        invocations,
+                        "accurate_reference",
+                        request,
+                        valid_outcome=True,
+                    )
+
+    def test_baseline_mapper_receipt_uses_frozen_implicit_defaults(self) -> None:
+        request = evidence_request()
+        baseline = next(
+            receipt for receipt in execution_receipts(
+                paired_timing(), evidence.LANE_REFERENCE, request
+            )
+            if receipt["variant"] == "baseline"
+        )
+        self.assertEqual(
+            baseline["mapper_invocations"],
+            [
+                {
+                    "argv": ["baseline-toolchain://resolved/bin/colmap", "mapper"],
+                    "outcome": "accepted",
+                    "matching_attempt": 1,
+                    "pair_list_digest": "sha256:" + "b" * 64,
+                    "descriptor_matcher": "exact",
+                }
+            ],
+        )
+        self.assertEqual(request["baseline_run_configuration"]["ba_global_frames_ratio"], 1.1)
+        self.assertEqual(request["baseline_run_configuration"]["ba_global_points_ratio"], 1.1)
+        self.assertEqual(request["baseline_run_configuration"]["ba_global_max_refinements"], 5)
+        self.assertEqual(request["baseline_run_configuration"]["ba_local_max_refinements"], 2)
+
+    def test_unordered_mapper_invocations_accept_denser_recovery_attempt(self) -> None:
+        request = evidence_request(
+            category="professional_photos",
+            input_kind="photos",
+            capture_traits=["unordered"],
+        )
+        invocations = mapper_invocations_for_variant("candidate", request)
+        invocations[0]["outcome"] = "rejected_geometry_gate"
+        invocations.append(
+            mapper_invocation(
+                "candidate",
+                (1.1, 1.1, 5, 2),
+                "accepted",
+                matching_attempt=2,
+                digest_character="b",
+                descriptor_matcher="faiss",
+            )
+        )
+        evidence._validate_mapper_invocations(
+            invocations,
+            "candidate",
+            request,
+            valid_outcome=True,
+        )
+
+    def test_candidate_mapper_recovery_graph_identity_fails_closed(self) -> None:
+        request = evidence_request()
+        fast_rejected = mapper_invocation(
+            "candidate",
+            (4.0, 4.0, 5, 1),
+            "rejected_geometry_gate",
+            matching_attempt=1,
+            digest_character="a",
+            descriptor_matcher="faiss",
+        )
+        same_graph_rejected = mapper_invocation(
+            "candidate",
+            (1.4, 1.4, 5, 2),
+            "rejected_geometry_gate",
+            matching_attempt=1,
+            digest_character="a",
+            descriptor_matcher="faiss",
+        )
+        cases = {
+            "repeated conservative graph": [
+                fast_rejected,
+                same_graph_rejected,
+                mapper_invocation(
+                    "candidate",
+                    (1.4, 1.4, 5, 2),
+                    "accepted",
+                    matching_attempt=1,
+                    digest_character="a",
+                    descriptor_matcher="faiss",
+                ),
+            ],
+            "equal rematch attempt": [
+                fast_rejected,
+                same_graph_rejected,
+                mapper_invocation(
+                    "candidate",
+                    (1.4, 1.4, 5, 2),
+                    "accepted",
+                    matching_attempt=1,
+                    digest_character="b",
+                    descriptor_matcher="faiss",
+                ),
+            ],
+            "decreasing rematch attempt": [
+                mapper_invocation(
+                    "candidate",
+                    (4.0, 4.0, 5, 1),
+                    "rejected_geometry_gate",
+                    matching_attempt=2,
+                    digest_character="a",
+                    descriptor_matcher="faiss",
+                ),
+                mapper_invocation(
+                    "candidate",
+                    (1.4, 1.4, 5, 2),
+                    "rejected_geometry_gate",
+                    matching_attempt=2,
+                    digest_character="a",
+                    descriptor_matcher="faiss",
+                ),
+                mapper_invocation(
+                    "candidate",
+                    (1.4, 1.4, 5, 2),
+                    "accepted",
+                    matching_attempt=1,
+                    digest_character="b",
+                    descriptor_matcher="faiss",
+                ),
+            ],
+            "exact back to faiss": [
+                fast_rejected,
+                same_graph_rejected,
+                mapper_invocation(
+                    "candidate",
+                    (1.4, 1.4, 5, 2),
+                    "rejected_geometry_gate",
+                    matching_attempt=2,
+                    digest_character="b",
+                    descriptor_matcher="exact",
+                ),
+                mapper_invocation(
+                    "candidate",
+                    (1.4, 1.4, 5, 2),
+                    "accepted",
+                    matching_attempt=3,
+                    digest_character="c",
+                    descriptor_matcher="faiss",
+                ),
+            ],
+        }
+        for label, invocations in cases.items():
+            with self.subTest(case=label), self.assertRaises(evidence.EvidenceError):
+                evidence._validate_mapper_invocations(
+                    invocations,
+                    "candidate",
+                    request,
+                    valid_outcome=True,
+                )
+
+    def test_mapper_invocation_graph_identity_fields_fail_closed(self) -> None:
+        request = evidence_request()
+        cases = {}
+        missing = mapper_invocations_for_variant("candidate", request)
+        missing[0].pop("matching_attempt")
+        cases["missing"] = missing
+        non_positive = mapper_invocations_for_variant("candidate", request)
+        non_positive[0]["matching_attempt"] = 0
+        cases["non-positive attempt"] = non_positive
+        invalid_digest = mapper_invocations_for_variant("candidate", request)
+        invalid_digest[0]["pair_list_digest"] = "sha256:not-a-digest"
+        cases["invalid digest"] = invalid_digest
+        invalid_matcher = mapper_invocations_for_variant("candidate", request)
+        invalid_matcher[0]["descriptor_matcher"] = "flann"
+        cases["invalid matcher"] = invalid_matcher
+        for label, invocations in cases.items():
+            with self.subTest(case=label), self.assertRaises(evidence.EvidenceError):
+                evidence._validate_mapper_invocations(
+                    invocations,
+                    "candidate",
+                    request,
+                    valid_outcome=True,
+                )
+
+    def test_evidence_schema_accepts_unbounded_mapper_retries_with_graph_identity(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            _, attestation = self.produce(Path(directory), evidence.LANE_REFERENCE)
+        candidate = next(
+            receipt for receipt in attestation["commands"]
+            if receipt["variant"] == "candidate"
+        )
+        candidate["mapper_invocations"] = [
+            mapper_invocation(
+                "candidate",
+                (4.0, 4.0, 5, 1),
+                "rejected_geometry_gate",
+                matching_attempt=1,
+                digest_character="a",
+                descriptor_matcher="faiss",
+            ),
+            mapper_invocation(
+                "candidate",
+                (1.4, 1.4, 5, 2),
+                "rejected_geometry_gate",
+                matching_attempt=1,
+                digest_character="a",
+                descriptor_matcher="faiss",
+            ),
+            mapper_invocation(
+                "candidate",
+                (1.4, 1.4, 5, 2),
+                "accepted",
+                matching_attempt=2,
+                digest_character="b",
+                descriptor_matcher="faiss",
+            ),
+        ]
+        validate_attestation_schema(attestation)
+
+    def test_evidence_schema_rejects_missing_or_invalid_mapper_graph_identity(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            _, attestation = self.produce(Path(directory), evidence.LANE_REFERENCE)
+        cases = {
+            "missing": lambda item: item.pop("matching_attempt"),
+            "non-positive attempt": lambda item: item.update(matching_attempt=0),
+            "invalid digest": lambda item: item.update(pair_list_digest="sha256:no"),
+            "invalid matcher": lambda item: item.update(descriptor_matcher="flann"),
+        }
+        for label, mutate in cases.items():
+            invalid = json.loads(json.dumps(attestation))
+            invalid_candidate = next(
+                receipt for receipt in invalid["commands"]
+                if receipt["variant"] == "candidate"
+            )
+            mutate(invalid_candidate["mapper_invocations"][0])
+            with self.subTest(case=label), self.assertRaises(ValidationError):
+                validate_attestation_schema(invalid)
+
     def test_verified_orientation_rejects_wrong_sign_or_physical_up(self) -> None:
         metrics = passing_metrics()
         metrics["orientation_sign_correct"] = measured(False)
@@ -5398,7 +6140,7 @@ class RunnerIntegrityTests(unittest.TestCase):
                             "secondLargestModelRegisteredViewCount": 0,
                             "unionRegisteredViewCount": 30,
                         },
-                        "schemaVersion": 9,
+                        "schemaVersion": 10,
                     }
                 )
                 + b"\n"
