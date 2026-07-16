@@ -12,6 +12,7 @@ CHECKPOINT_PATCH="$ROOT/Tools/MsplatNative/msplat-1.1.3-checkpoint.patch"
 NUMERIC_STABILITY_PATCH="$ROOT/Tools/MsplatNative/msplat-1.1.3-numeric-stability.patch"
 METAL_SAFETY_PATCH="$ROOT/Tools/MsplatNative/msplat-1.1.3-metal-safety.patch"
 EXACT_RASTER_PATCH="$ROOT/Tools/MsplatNative/msplat-1.1.3-exact-raster.patch"
+STAGE_TIMING_PATCH="$ROOT/Tools/MsplatNative/msplat-1.1.3-stage-timing.patch"
 FIXTURE_GENERATOR="$ROOT/scripts/ci/generate_msplat_sparse_fixtures.py"
 VALIDATOR="$ROOT/scripts/toolchain/validate_native_msplat.sh"
 SWIFT_VALIDATOR="$ROOT/EasySplatCore/Sources/EasySplatCore/Tools/ToolchainManager+Validation.swift"
@@ -50,6 +51,7 @@ require_file "$CHECKPOINT_PATCH"
 require_file "$NUMERIC_STABILITY_PATCH"
 require_file "$METAL_SAFETY_PATCH"
 require_file "$EXACT_RASTER_PATCH"
+require_file "$STAGE_TIMING_PATCH"
 require_file "$FIXTURE_GENERATOR"
 require_file "$VALIDATOR"
 require_file "$SWIFT_VALIDATOR"
@@ -98,6 +100,25 @@ require_contains 'git -C "$SOURCE_DIR" apply --check "$EXACT_RASTER_PATCH"' "$BU
 require_contains 'git -C "$SOURCE_DIR" apply "$EXACT_RASTER_PATCH"' "$BUILD_SCRIPT"
 require_contains 'exact_raster_patch_sha256' "$BUILD_SCRIPT"
 require_contains 'exact_raster_patch_sha256' "$VALIDATOR"
+require_contains 'msplat-1.1.3-stage-timing.patch' "$BUILD_SCRIPT"
+require_contains 'STAGE_TIMING_PATCH_SHA256="ce26212e07d155f436f3f91a78c47f880fc3684cdada88e76623acf56bd3f9f8"' "$BUILD_SCRIPT"
+require_contains '[ "$(sha256 "$STAGE_TIMING_PATCH")" = "$STAGE_TIMING_PATCH_SHA256" ]' "$BUILD_SCRIPT"
+require_contains 'git -C "$SOURCE_DIR" apply --check "$STAGE_TIMING_PATCH"' "$BUILD_SCRIPT"
+require_contains 'git -C "$SOURCE_DIR" apply "$STAGE_TIMING_PATCH"' "$BUILD_SCRIPT"
+require_contains 'stage_timing_patch_sha256' "$BUILD_SCRIPT"
+require_contains '"stage_timing_patch_sha256": "ce26212e07d155f436f3f91a78c47f880fc3684cdada88e76623acf56bd3f9f8"' "$VALIDATOR"
+require_absent 'queryTimestampFrequency' "$STAGE_TIMING_PATCH"
+require_contains 'sampleTimestamps:&cpuTimestamp gpuTimestamp:&gpuTimestamp' "$STAGE_TIMING_PATCH"
+require_contains 'mach_timebase_info(&timebase)' "$STAGE_TIMING_PATCH"
+require_contains 'frequencyFromTimestampPairs' "$STAGE_TIMING_PATCH"
+require_contains 'kResolvedCounterTimestampFrequencyHz = 1.0e9' "$STAGE_TIMING_PATCH"
+require_contains 'dispatch_semaphore_wait' "$STAGE_TIMING_PATCH"
+require_contains 'end <= start' "$STAGE_TIMING_PATCH"
+require_contains 'stageTimingValid' "$STAGE_TIMING_PATCH"
+require_contains 'ratio >= 0.25 && ratio <= 1.05' "$STAGE_TIMING_PATCH"
+require_contains 'stageTimingIterations = 512' "$RASTER_TEST_SOURCE"
+require_contains '--stage-timing' "$RASTER_TEST_SOURCE"
+require_contains '--stage-timing "$RASTER_TEST_FIXTURES/01-sphere-500"' "$BUILD_SCRIPT"
 require_contains 'MSPLAT_BUILD_RASTER_TESTS=ON' "$BUILD_SCRIPT"
 require_contains 'msplat_raster_tests' "$BUILD_SCRIPT"
 require_contains 'add_library(msplat_core_raster_tests STATIC' "$EXACT_RASTER_PATCH"
@@ -108,6 +129,7 @@ require_contains 'raster_test_sha256' "$BUILD_SCRIPT"
 require_contains 'raster_test_sha256' "$VALIDATOR"
 for contract_file in "$SWIFT_VALIDATOR" "$SWIFT_FIXTURE"; do
   require_contains 'exact_raster_patch_sha256' "$contract_file"
+  require_contains 'stage_timing_patch_sha256' "$contract_file"
   require_contains 'raster_test_sha256' "$contract_file"
   require_contains 'MSPLAT_BUILD_RASTER_TESTS=ON' "$contract_file"
 done
@@ -342,6 +364,11 @@ for symbol in \
   msplat_set_raster_memory_budget_for_testing \
   msplat_fail_next_sync_for_testing \
   msplat_pending_exact_raster_timing_handlers_for_testing \
+  msplat_gpu_ticks_to_seconds_for_testing \
+  msplat_gpu_frequency_from_timestamp_pairs_for_testing \
+  msplat_stage_timing_coherent_for_testing \
+  msplat_enable_stage_profiling_for_testing \
+  msplat_gpu_timestamp_calibration_for_testing \
   msplat_copy_last_raster_debug; do
   if nm -gU "$BIN" | grep -Fq "$symbol"; then
     fail "production CLI exports raster test hook: $symbol"
@@ -502,17 +529,18 @@ set -e
 [ ! -s "$negative_dir/truncated-ply.stdout" ] || fail "truncated PLY emitted a false success event"
 grep -qi 'payload' "$negative_dir/truncated-ply.stderr" || fail "truncated PLY diagnostic is not useful"
 
-for key in source_commit source_version source_url source_tree_sha256 overlay_sha256 raster_test_sha256 patch_sha256 checkpoint_patch_sha256 numeric_stability_patch_sha256 metal_safety_patch_sha256 exact_raster_patch_sha256 executable_sha256 metallib_sha256 compiler deployment_target cmake_arguments build_timestamp; do
+for key in source_commit source_version source_url source_tree_sha256 overlay_sha256 raster_test_sha256 patch_sha256 checkpoint_patch_sha256 numeric_stability_patch_sha256 metal_safety_patch_sha256 exact_raster_patch_sha256 stage_timing_patch_sha256 executable_sha256 metallib_sha256 compiler deployment_target cmake_arguments build_timestamp; do
   require_contains "\"$key\"" "$BUILD_INFO"
 done
 overlay_hash="$(shasum -a 256 "$OVERLAY" | awk '{print $1}')"
 numeric_stability_patch_hash="$(shasum -a 256 "$NUMERIC_STABILITY_PATCH" | awk '{print $1}')"
 metal_safety_patch_hash="$(shasum -a 256 "$METAL_SAFETY_PATCH" | awk '{print $1}')"
 exact_raster_patch_hash="$(shasum -a 256 "$EXACT_RASTER_PATCH" | awk '{print $1}')"
+stage_timing_patch_hash="$(shasum -a 256 "$STAGE_TIMING_PATCH" | awk '{print $1}')"
 raster_test_hash="$(shasum -a 256 "$RASTER_TEST_SOURCE" | awk '{print $1}')"
 exe_hash="$(shasum -a 256 "$BIN" | awk '{print $1}')"
 metallib_hash="$(shasum -a 256 "$METALLIB" | awk '{print $1}')"
-python3 - "$BUILD_INFO" "$overlay_hash" "$numeric_stability_patch_hash" "$metal_safety_patch_hash" "$exact_raster_patch_hash" "$raster_test_hash" "$exe_hash" "$metallib_hash" <<'PY'
+python3 - "$BUILD_INFO" "$overlay_hash" "$numeric_stability_patch_hash" "$metal_safety_patch_hash" "$exact_raster_patch_hash" "$stage_timing_patch_hash" "$raster_test_hash" "$exe_hash" "$metallib_hash" <<'PY'
 import json
 import sys
 
@@ -530,9 +558,10 @@ expected = {
     "numeric_stability_patch_sha256": sys.argv[3],
     "metal_safety_patch_sha256": sys.argv[4],
     "exact_raster_patch_sha256": sys.argv[5],
-    "raster_test_sha256": sys.argv[6],
-    "executable_sha256": sys.argv[7],
-    "metallib_sha256": sys.argv[8],
+    "stage_timing_patch_sha256": sys.argv[6],
+    "raster_test_sha256": sys.argv[7],
+    "executable_sha256": sys.argv[8],
+    "metallib_sha256": sys.argv[9],
 }
 for key, value in expected.items():
     if payload.get(key) != value:

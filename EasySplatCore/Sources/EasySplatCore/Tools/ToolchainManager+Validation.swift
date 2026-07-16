@@ -442,6 +442,7 @@ extension ToolchainManager {
             "numeric_stability_patch_sha256",
             "metal_safety_patch_sha256",
             "exact_raster_patch_sha256",
+            "stage_timing_patch_sha256",
             "dependencies",
             "executable_sha256",
             "metallib_sha256",
@@ -481,8 +482,9 @@ extension ToolchainManager {
             "source_commit": "106499b0a53f82b0c92d013b0861fbebd341b17e",
             "source_version": "1.1.3",
             "overlay_sha256": "cfefabcf9366571241e5a0923ae35fa3b8b263d6d024a87485bccc2e842ad29e",
-            "raster_test_sha256": "01678dbef4b7cc5bd3f65ab7c16ded68cbb353b6ef88f01d11416ddcacf8b3a6",
+            "raster_test_sha256": "1322a4f6801345167b7b1eddac5e51ba7cb5cac2bf95ee5ab8dae63552c39c88",
             "exact_raster_patch_sha256": "278deba531d1503b8f6fe3428e0b6c5103129f388a6bc425c41780ff9e4c453b",
+            "stage_timing_patch_sha256": "ce26212e07d155f436f3f91a78c47f880fc3684cdada88e76623acf56bd3f9f8",
             "deployment_target": "macOS 15.0",
             "build_configuration": "Release",
         ]
@@ -504,6 +506,7 @@ extension ToolchainManager {
             "numeric_stability_patch_sha256",
             "metal_safety_patch_sha256",
             "exact_raster_patch_sha256",
+            "stage_timing_patch_sha256",
             "executable_sha256",
             "metallib_sha256",
         ]

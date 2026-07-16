@@ -1,0 +1,470 @@
+diff --git a/core/metal/bindings.h b/core/metal/bindings.h
+index 89be4ee..1242a37 100644
+--- a/core/metal/bindings.h
++++ b/core/metal/bindings.h
+@@ -2,6 +2,7 @@
+ #define MSPLAT_BINDINGS_H
+ 
+ #include <tuple>
++#include <cstddef>
+ #include <cstdint>
+ #include "metal_tensor.hpp"
+ 
+@@ -64,6 +65,13 @@ void msplat_grow_exact_raster_capacity(uint64_t intersection_count);
+ void msplat_restore_exact_raster_capacity(uint64_t intersection_count);
+ void msplat_clear_raster_capacity_failure();
+ #ifdef MSPLAT_ENABLE_RASTER_TEST_HOOKS
++struct MsplatGpuTimestampCalibration {
++    double frequency_hz;
++    double reference_frequency_hz;
++    uint32_t sample_count;
++    uint32_t method;
++};
++
+ void msplat_set_force_exact_for_testing(bool force_exact);
+ void msplat_set_exact_fallback_enabled_for_testing(bool enabled);
+ void msplat_set_exact_execution_capacity_for_testing(uint64_t capacity);
+@@ -71,6 +79,18 @@ void msplat_set_exact_capacity_limit_for_testing(uint64_t capacity);
+ void msplat_set_raster_memory_budget_for_testing(uint64_t budget_bytes);
+ void msplat_fail_next_sync_for_testing();
+ uint64_t msplat_pending_exact_raster_timing_handlers_for_testing();
++double msplat_gpu_ticks_to_seconds_for_testing(uint64_t ticks, double frequency_hz);
++double msplat_gpu_frequency_from_timestamp_pairs_for_testing(
++    const uint64_t* cpu_timestamps,
++    const uint64_t* gpu_timestamps,
++    std::size_t sample_count,
++    uint32_t timebase_numer,
++    uint32_t timebase_denom,
++    uint32_t* valid_interval_count
++);
++bool msplat_stage_timing_coherent_for_testing(double stage_seconds, double command_buffer_seconds);
++void msplat_enable_stage_profiling_for_testing();
++MsplatGpuTimestampCalibration msplat_gpu_timestamp_calibration_for_testing();
+ void msplat_copy_last_raster_debug(
+     float* rgb,
+     float* alpha,
+diff --git a/core/metal/msplat_metal.mm b/core/metal/msplat_metal.mm
+index 9fff022..d258886 100644
+--- a/core/metal/msplat_metal.mm
++++ b/core/metal/msplat_metal.mm
+@@ -8,6 +8,8 @@
+ #import <MetalPerformanceShaders/MetalPerformanceShaders.h>
+ #import <dlfcn.h>
+ #import <exception>
++#import <algorithm>
++#import <atomic>
+ #import <unordered_map>
+ #import <functional>
+ #import <array>
+@@ -43,6 +45,148 @@ static std::mutex g_stage_timing_mutex;
+ static std::vector<double> g_stage_times[N_TRAIN_STAGES];
+ static int g_stage_report_count = 0;
+ 
++static constexpr double kMinimumPlausibleGPUTimestampFrequencyHz = 1.0e6;
++static constexpr double kMaximumPlausibleGPUTimestampFrequencyHz = 10.0e9;
++// Metal resolves MTLCounterResultTimestamp into nanoseconds even when the
++// device's CPU/GPU reference timestamps use Mach absolute-time ticks.
++static constexpr double kResolvedCounterTimestampFrequencyHz = 1.0e9;
++static constexpr uint32_t kTimestampCalibrationMethodUnavailable = 0;
++static constexpr uint32_t kTimestampCalibrationMethodSamplePairs = 1;
++
++struct GPUTimestampCalibration {
++    double counterFrequencyHz = std::numeric_limits<double>::quiet_NaN();
++    double referenceFrequencyHz = std::numeric_limits<double>::quiet_NaN();
++    uint32_t sampleCount = 0;
++    uint32_t method = kTimestampCalibrationMethodUnavailable;
++};
++
++static bool plausibleGPUTimestampFrequency(double frequencyHz) {
++    return std::isfinite(frequencyHz) &&
++        frequencyHz >= kMinimumPlausibleGPUTimestampFrequencyHz &&
++        frequencyHz <= kMaximumPlausibleGPUTimestampFrequencyHz;
++}
++
++static double secondsFromGPUTicks(uint64_t ticks, double frequencyHz) {
++    if (!plausibleGPUTimestampFrequency(frequencyHz)) {
++        return std::numeric_limits<double>::quiet_NaN();
++    }
++    const double seconds = static_cast<double>(ticks) / frequencyHz;
++    return std::isfinite(seconds)
++        ? seconds
++        : std::numeric_limits<double>::quiet_NaN();
++}
++
++static bool coherentStageTiming(double stageSeconds, double commandBufferSeconds) {
++    if (!std::isfinite(stageSeconds) || !std::isfinite(commandBufferSeconds) ||
++        stageSeconds <= 0 || commandBufferSeconds <= 0) {
++        return false;
++    }
++    const double ratio = stageSeconds / commandBufferSeconds;
++    return ratio >= 0.25 && ratio <= 1.05;
++}
++
++static double frequencyFromTimestampPairs(
++    const uint64_t* cpuTimestamps,
++    const uint64_t* gpuTimestamps,
++    std::size_t sampleCount,
++    uint32_t timebaseNumer,
++    uint32_t timebaseDenom,
++    uint32_t* validIntervalCount
++) {
++    if (validIntervalCount) *validIntervalCount = 0;
++    if (!cpuTimestamps || !gpuTimestamps || sampleCount < 2 ||
++        timebaseNumer == 0 || timebaseDenom == 0) {
++        return std::numeric_limits<double>::quiet_NaN();
++    }
++
++    std::vector<double> frequencies;
++    frequencies.reserve(sampleCount - 1);
++    for (std::size_t index = 1; index < sampleCount; ++index) {
++        if (cpuTimestamps[index] <= cpuTimestamps[index - 1] ||
++            gpuTimestamps[index] <= gpuTimestamps[index - 1]) {
++            continue;
++        }
++        const uint64_t cpuDelta = cpuTimestamps[index] - cpuTimestamps[index - 1];
++        const uint64_t gpuDelta = gpuTimestamps[index] - gpuTimestamps[index - 1];
++        const double cpuSeconds = static_cast<double>(cpuDelta) *
++            static_cast<double>(timebaseNumer) /
++            static_cast<double>(timebaseDenom) / 1.0e9;
++        if (!std::isfinite(cpuSeconds) || cpuSeconds <= 0) continue;
++        const double frequencyHz = static_cast<double>(gpuDelta) / cpuSeconds;
++        if (plausibleGPUTimestampFrequency(frequencyHz)) {
++            frequencies.push_back(frequencyHz);
++        }
++    }
++    if (validIntervalCount) {
++        *validIntervalCount = static_cast<uint32_t>(frequencies.size());
++    }
++    if (frequencies.size() < 4) {
++        return std::numeric_limits<double>::quiet_NaN();
++    }
++
++    std::sort(frequencies.begin(), frequencies.end());
++    const double median = frequencies[frequencies.size() / 2];
++    if (!plausibleGPUTimestampFrequency(median)) {
++        return std::numeric_limits<double>::quiet_NaN();
++    }
++    const std::size_t consistent = static_cast<std::size_t>(std::count_if(
++        frequencies.begin(),
++        frequencies.end(),
++        [median](double frequencyHz) {
++            return std::abs(frequencyHz - median) / median <= 0.10;
++        }
++    ));
++    if (consistent * 4 < frequencies.size() * 3) {
++        return std::numeric_limits<double>::quiet_NaN();
++    }
++    return median;
++}
++
++static GPUTimestampCalibration calibrateGPUTimestamps(id<MTLDevice> device) {
++    constexpr std::size_t kSampleCount = 9;
++    constexpr double kSampleSpacingNanoseconds = 2.0e6;
++    std::array<uint64_t, kSampleCount> cpuTimestamps {};
++    std::array<uint64_t, kSampleCount> gpuTimestamps {};
++    mach_timebase_info_data_t timebase {};
++    if (mach_timebase_info(&timebase) != KERN_SUCCESS ||
++        timebase.numer == 0 || timebase.denom == 0) {
++        return {};
++    }
++    const uint64_t spacingTicks = std::max<uint64_t>(
++        1,
++        static_cast<uint64_t>(std::ceil(
++            kSampleSpacingNanoseconds * static_cast<double>(timebase.denom) /
++            static_cast<double>(timebase.numer)
++        ))
++    );
++    for (std::size_t index = 0; index < kSampleCount; ++index) {
++        MTLTimestamp cpuTimestamp = 0;
++        MTLTimestamp gpuTimestamp = 0;
++        [device sampleTimestamps:&cpuTimestamp gpuTimestamp:&gpuTimestamp];
++        cpuTimestamps[index] = static_cast<uint64_t>(cpuTimestamp);
++        gpuTimestamps[index] = static_cast<uint64_t>(gpuTimestamp);
++        if (index + 1 < kSampleCount) {
++            mach_wait_until(mach_absolute_time() + spacingTicks);
++        }
++    }
++    uint32_t validIntervalCount = 0;
++    const double frequencyHz = frequencyFromTimestampPairs(
++        cpuTimestamps.data(),
++        gpuTimestamps.data(),
++        cpuTimestamps.size(),
++        timebase.numer,
++        timebase.denom,
++        &validIntervalCount
++    );
++    if (!plausibleGPUTimestampFrequency(frequencyHz)) return {};
++    return {
++        kResolvedCounterTimestampFrequencyHz,
++        frequencyHz,
++        validIntervalCount,
++        kTimestampCalibrationMethodSamplePairs,
++    };
++}
++
+ struct MetalContext {
+     id<MTLDevice>       device;
+     id<MTLCommandQueue> queue;
+@@ -94,13 +238,12 @@ struct MetalContext {
+ 
+     // Per-stage GPU timestamp profiling (Metal counter sample buffer)
+     id<MTLCounterSampleBuffer> counterSampleBuffer;
++    dispatch_semaphore_t stageCounterSemaphore;
++    std::atomic_bool stageTimingValid {true};
+     bool counterSamplingAvailable = false;
+-    double ticksToMs = 0.0;  // conversion factor from GPU ticks to milliseconds
++    GPUTimestampCalibration timestampCalibration;
+ 
+     void initCounterSampling() {
+-        // Need 2 samples per stage (start + end)
+-        NSUInteger sampleCount = N_TRAIN_STAGES * 2;
+-
+         // Find timestamp counter set
+         id<MTLCounterSet> timestampSet = nil;
+         for (id<MTLCounterSet> cs in device.counterSets) {
+@@ -120,28 +263,38 @@ struct MetalContext {
+             return;
+         }
+ 
++        timestampCalibration = calibrateGPUTimestamps(device);
++        if (!plausibleGPUTimestampFrequency(timestampCalibration.counterFrequencyHz) ||
++            !plausibleGPUTimestampFrequency(timestampCalibration.referenceFrequencyHz)) {
++            fprintf(stderr, "PROFILE_STAGES: GPU timestamp frequency calibration failed\n");
++            return;
++        }
++
+         MTLCounterSampleBufferDescriptor *desc = [MTLCounterSampleBufferDescriptor new];
+         desc.counterSet = timestampSet;
+-        desc.sampleCount = sampleCount;
++        desc.sampleCount = N_TRAIN_STAGES * 2;
+         desc.storageMode = MTLStorageModeShared;
+         desc.label = @"msplat stage profiling";
+-
+         NSError *error = nil;
+         counterSampleBuffer = [device newCounterSampleBufferWithDescriptor:desc error:&error];
++        [desc release];
+         if (!counterSampleBuffer) {
+             fprintf(stderr, "PROFILE_STAGES: Failed to create counter sample buffer: %s\n",
+                     error.localizedDescription.UTF8String);
+             return;
+         }
+-
+-        // Compute ticks-to-ms conversion (Apple Silicon: mach_absolute_time units)
+-        mach_timebase_info_data_t tb;
+-        mach_timebase_info(&tb);
+-        ticksToMs = (double)tb.numer / (double)tb.denom / 1e6;
++        stageCounterSemaphore = dispatch_semaphore_create(1);
+ 
+         counterSamplingAvailable = true;
+-        fprintf(stderr, "PROFILE_STAGES: GPU timestamp profiling enabled (%lu sample slots)\n",
+-                (unsigned long)sampleCount);
++        fprintf(
++            stderr,
++            "PROFILE_STAGES: GPU timestamp profiling enabled "
++            "(counter_frequency=%.0fHz reference_frequency=%.0fHz method=%u samples=%u)\n",
++            timestampCalibration.counterFrequencyHz,
++            timestampCalibration.referenceFrequencyHz,
++            timestampCalibration.method,
++            timestampCalibration.sampleCount
++        );
+     }
+ 
+     // Forward pipeline kernels
+@@ -337,8 +490,10 @@ MetalContext* init_msplat_metal_context() {
+ 
+     // Initialize counter sampling if PROFILE_STAGES is set
+     ctx->counterSampleBuffer = nil;
++    ctx->stageCounterSemaphore = nullptr;
++    ctx->stageTimingValid.store(true, std::memory_order_relaxed);
+     ctx->counterSamplingAvailable = false;
+-    ctx->ticksToMs = 0.0;
++    ctx->timestampCalibration = {};
+     if (std::getenv("PROFILE_STAGES")) {
+         g_profile_stages = true;
+         g_profile_stages_checked = true;
+@@ -467,6 +622,54 @@ void msplat_drain_stage_times(std::vector<double> stage_times[], int max_stages,
+     }
+ }
+ 
++#ifdef MSPLAT_ENABLE_RASTER_TEST_HOOKS
++double msplat_gpu_ticks_to_seconds_for_testing(uint64_t ticks, double frequency_hz) {
++    return secondsFromGPUTicks(ticks, frequency_hz);
++}
++
++double msplat_gpu_frequency_from_timestamp_pairs_for_testing(
++    const uint64_t* cpu_timestamps,
++    const uint64_t* gpu_timestamps,
++    std::size_t sample_count,
++    uint32_t timebase_numer,
++    uint32_t timebase_denom,
++    uint32_t* valid_interval_count
++) {
++    return frequencyFromTimestampPairs(
++        cpu_timestamps,
++        gpu_timestamps,
++        sample_count,
++        timebase_numer,
++        timebase_denom,
++        valid_interval_count
++    );
++}
++
++bool msplat_stage_timing_coherent_for_testing(
++    double stage_seconds,
++    double command_buffer_seconds
++) {
++    return coherentStageTiming(stage_seconds, command_buffer_seconds);
++}
++
++void msplat_enable_stage_profiling_for_testing() {
++    g_profile_stages = true;
++    g_profile_stages_checked = true;
++    MetalContext *context = get_global_context();
++    if (!context->counterSamplingAvailable) context->initCounterSampling();
++}
++
++MsplatGpuTimestampCalibration msplat_gpu_timestamp_calibration_for_testing() {
++    const GPUTimestampCalibration calibration = get_global_context()->timestampCalibration;
++    return {
++        calibration.counterFrequencyHz,
++        calibration.referenceFrequencyHz,
++        calibration.sampleCount,
++        calibration.method,
++    };
++}
++#endif
++
+ #define RAST_BLOCK_X 8
+ #define RAST_BLOCK_Y 8
+ static constexpr int64_t kMaxTileElements = 2048;
+@@ -2430,15 +2633,20 @@ std::tuple<MTensor, float> msplat_train_step(
+         g_profile_stages_checked = true;
+     }
+ 
+-    if (g_profile_stages && ctx->counterSamplingAvailable) {
++    if (g_profile_stages && ctx->counterSamplingAvailable &&
++        ctx->stageTimingValid.load(std::memory_order_acquire)) {
+         // Per-stage profiling: separate encoders on the SAME command buffer,
+         // each with start/end timestamp sampling via the pass descriptor.
+         // Metal handles inter-encoder resource hazard tracking automatically.
+         id<MTLCommandBuffer> command_buffer = ctx->getCommandBuffer();
+         assert(command_buffer && "Failed to retrieve command buffer reference");
+ 
++        // A Metal device may expose only one timestamp counter sample buffer.
++        // Keep at most one profiled command buffer in flight so its samples are
++        // resolved before the next iteration reuses those slots.
++        dispatch_semaphore_wait(ctx->stageCounterSemaphore, DISPATCH_TIME_FOREVER);
+         id<MTLCounterSampleBuffer> csb = ctx->counterSampleBuffer;
+-        double ticksToMs = ctx->ticksToMs;
++        const double timestampFrequencyHz = ctx->timestampCalibration.counterFrequencyHz;
+ 
+         // Encode each stage in its own encoder with timestamp bookends
+         typedef void (^encode_fn_t)(id<MTLComputeCommandEncoder>);
+@@ -2519,38 +2727,77 @@ std::tuple<MTensor, float> msplat_train_step(
+         [command_buffer addCompletedHandler:^(id<MTLCommandBuffer> cb) {
+             @autoreleasepool {
+                 NSData *data = [csb resolveCounterRange:NSMakeRange(0, (N_TRAIN_STAGES - 1) * 2)];
+-                if (!data) return;
+-                const MTLCounterResultTimestamp *samples =
+-                    (const MTLCounterResultTimestamp *)[data bytes];
+-
+-                std::lock_guard<std::mutex> lock(g_stage_timing_mutex);
+-                for (int i = 0; i < N_TRAIN_STAGES - 1; i++) {
+-                    uint64_t start = samples[i * 2].timestamp;
+-                    uint64_t end = samples[i * 2 + 1].timestamp;
+-                    if (start == MTLCounterErrorValue || end == MTLCounterErrorValue) continue;
+-                    // stage_idx 0-7 maps to g_train_stage_names[1-8] (skip blit_zero)
+-                    g_stage_times[i + 1].push_back((double)(end - start) * ticksToMs);
+-                }
+-                g_stage_report_count++;
+-
+-                if (g_stage_report_count % 500 == 0) {
+-                    fprintf(stderr, "\n  === GPU Stage Profile (n=%d) ===\n", g_stage_report_count);
+-                    double total_median = 0;
+-                    for (int i = 1; i < N_TRAIN_STAGES; i++) {
+-                        auto &v = g_stage_times[i];
+-                        if (v.empty()) continue;
+-                        auto sorted = v;
+-                        std::sort(sorted.begin(), sorted.end());
+-                        double med = sorted[sorted.size() / 2];
+-                        double sum = 0;
+-                        for (auto x : sorted) sum += x;
+-                        total_median += med;
+-                        fprintf(stderr, "  %-20s median=%.3fms  mean=%.3fms\n",
+-                                g_train_stage_names[i], med, sum / sorted.size());
++                if (data) {
++                    const MTLCounterResultTimestamp *samples =
++                        (const MTLCounterResultTimestamp *)[data bytes];
++                    std::array<double, N_TRAIN_STAGES - 1> durations {};
++                    bool timingValid = true;
++                    double stageSeconds = 0;
++                    for (int i = 0; i < N_TRAIN_STAGES - 1; i++) {
++                        uint64_t start = samples[i * 2].timestamp;
++                        uint64_t end = samples[i * 2 + 1].timestamp;
++                        if (start == MTLCounterErrorValue || end == MTLCounterErrorValue ||
++                            end <= start) {
++                            timingValid = false;
++                            break;
++                        }
++                        const double seconds = secondsFromGPUTicks(
++                            end - start,
++                            timestampFrequencyHz
++                        );
++                        if (!std::isfinite(seconds) || seconds < 0) {
++                            timingValid = false;
++                            break;
++                        }
++                        durations[i] = seconds;
++                        stageSeconds += seconds;
++                    }
++                    const double commandBufferSeconds = cb.GPUEndTime - cb.GPUStartTime;
++                    timingValid = timingValid &&
++                        coherentStageTiming(stageSeconds, commandBufferSeconds);
++                    if (timingValid) {
++                        std::lock_guard<std::mutex> lock(g_stage_timing_mutex);
++                        for (int i = 0; i < N_TRAIN_STAGES - 1; ++i) {
++                            // stage_idx 0-6 maps to g_train_stage_names[1-7]
++                            // because the blit encoder is intentionally unmeasured.
++                            g_stage_times[i + 1].push_back(durations[i] * 1000.0);
++                        }
++                        g_stage_report_count++;
++
++                        if (g_stage_report_count % 500 == 0) {
++                            fprintf(stderr, "\n  === GPU Stage Profile (n=%d) ===\n", g_stage_report_count);
++                            double total_median = 0;
++                            for (int i = 1; i < N_TRAIN_STAGES; i++) {
++                                auto &v = g_stage_times[i];
++                                if (v.empty()) continue;
++                                auto sorted = v;
++                                std::sort(sorted.begin(), sorted.end());
++                                double med = sorted[sorted.size() / 2];
++                                double sum = 0;
++                                for (auto x : sorted) sum += x;
++                                total_median += med;
++                                fprintf(stderr, "  %-20s median=%.3fms  mean=%.3fms\n",
++                                        g_train_stage_names[i], med, sum / sorted.size());
++                            }
++                            fprintf(stderr, "  %-20s %.3fms\n", "TOTAL (sum medians)", total_median);
++                        }
++                    } else if (ctx->stageTimingValid.exchange(
++                                   false,
++                                   std::memory_order_acq_rel
++                               )) {
++                        fprintf(
++                            stderr,
++                            "PROFILE_STAGES: timestamp calibration failed runtime coherence "
++                            "(stages=%.6fs command_buffer=%.6fs); profiling disabled\n",
++                            stageSeconds,
++                            commandBufferSeconds
++                        );
+                     }
+-                    fprintf(stderr, "  %-20s %.3fms\n", "TOTAL (sum medians)", total_median);
++                } else if (ctx->stageTimingValid.exchange(false, std::memory_order_acq_rel)) {
++                    fprintf(stderr, "PROFILE_STAGES: counter resolve failed; profiling disabled\n");
+                 }
++                dispatch_semaphore_signal(ctx->stageCounterSemaphore);
+             }
+         }];
+-
++
+     } else {

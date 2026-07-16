@@ -18,6 +18,123 @@ namespace {
 constexpr std::uint64_t memoryBudgetBytes = 512ULL * 1024ULL * 1024ULL;
 constexpr float relativeTolerance = 2.0e-3f;
 constexpr float absoluteTolerance = 2.0e-4f;
+constexpr int stageTimingIterations = 512;
+
+void requireRelativeNear(
+    const std::string &label,
+    double actual,
+    double expected,
+    double relativeTolerance
+) {
+    const double scale = std::max(std::abs(expected), 1.0);
+    if (!std::isfinite(actual) || std::abs(actual - expected) > scale * relativeTolerance) {
+        throw std::runtime_error(
+            label + " expected " + std::to_string(expected) +
+            ", got " + std::to_string(actual)
+        );
+    }
+}
+
+void verifyTimestampMath() {
+    struct ConversionCase {
+        std::uint64_t ticks;
+        double frequencyHz;
+        double expectedSeconds;
+    };
+    const ConversionCase cases[] = {
+        {24'000'000ULL, 24'000'000.0, 1.0},
+        {37'500'000ULL, 25'000'000.0, 1.5},
+        {2'000'000'000ULL, 1'000'000'000.0, 2.0},
+        {5'000'000'000ULL, 2'500'000'000.0, 2.0},
+    };
+    for (const auto &testCase : cases) {
+        requireRelativeNear(
+            "GPU tick conversion",
+            msplat_gpu_ticks_to_seconds_for_testing(testCase.ticks, testCase.frequencyHz),
+            testCase.expectedSeconds,
+            1.0e-12
+        );
+    }
+    for (double invalidFrequency : {
+             0.0,
+             -1.0,
+             100.0,
+             1.0e12,
+             std::numeric_limits<double>::infinity(),
+             std::numeric_limits<double>::quiet_NaN(),
+         }) {
+        if (std::isfinite(msplat_gpu_ticks_to_seconds_for_testing(1, invalidFrequency))) {
+            throw std::runtime_error("invalid GPU frequency produced a finite duration");
+        }
+    }
+    if (!msplat_stage_timing_coherent_for_testing(0.95, 1.0) ||
+        !msplat_stage_timing_coherent_for_testing(1.05, 1.0) ||
+        msplat_stage_timing_coherent_for_testing(0.249, 1.0) ||
+        msplat_stage_timing_coherent_for_testing(1.051, 1.0) ||
+        msplat_stage_timing_coherent_for_testing(0.0, 1.0) ||
+        msplat_stage_timing_coherent_for_testing(1.0, 0.0)) {
+        throw std::runtime_error("GPU stage timing coherence bounds are invalid");
+    }
+
+    constexpr std::uint32_t numer = 125;
+    constexpr std::uint32_t denom = 3;
+    constexpr double expectedFrequency = 24'000'000.0;
+    constexpr std::uint64_t cpuStep = 48'000;
+    constexpr std::uint64_t gpuStep = 48'000;
+    std::uint64_t cpuSamples[] = {
+        10'000'000,
+        10'048'000,
+        10'096'000,
+        10'144'000,
+        10'192'000,
+        10'240'000,
+        10'288'000,
+    };
+    std::uint64_t gpuSamples[] = {
+        20'000'000,
+        20'000'000 + gpuStep,
+        20'000'000 + gpuStep * 2,
+        20'000'000 + gpuStep * 3,
+        20'000'000 + gpuStep * 4,
+        20'000'000 + gpuStep * 5,
+        20'000'000 + gpuStep * 6 + 12'000,
+    };
+    std::uint32_t validIntervals = 0;
+    const double calibrated = msplat_gpu_frequency_from_timestamp_pairs_for_testing(
+        cpuSamples,
+        gpuSamples,
+        std::size(cpuSamples),
+        numer,
+        denom,
+        &validIntervals
+    );
+    requireRelativeNear(
+        "GPU timestamp calibration",
+        calibrated,
+        expectedFrequency,
+        1.0e-12
+    );
+    if (validIntervals != std::size(cpuSamples) - 1) {
+        throw std::runtime_error("legacy calibration did not inspect every valid interval");
+    }
+
+    const std::uint64_t invalidCPU[] = {7, 7, 6, 5, 4};
+    const std::uint64_t invalidGPU[] = {9, 9, 8, 7, 6};
+    validIntervals = 99;
+    const double rejected = msplat_gpu_frequency_from_timestamp_pairs_for_testing(
+        invalidCPU,
+        invalidGPU,
+        std::size(invalidCPU),
+        numer,
+        denom,
+        &validIntervals
+    );
+    if (std::isfinite(rejected) || validIntervals != 0) {
+        throw std::runtime_error("invalid timestamp pairs produced a calibration");
+    }
+
+    std::cout << "gpu_timestamp_math passed\n";
+}
 
 std::uint64_t geometricCapacity(std::uint64_t required) {
     const std::uint64_t maximum = std::numeric_limits<std::uint32_t>::max();
@@ -1131,15 +1248,151 @@ void verifyGPUCapacityFailure(const std::string &dataset) {
     std::cout << "gpu_capacity_failure passed\n";
 }
 
+void verifyStageTiming(const std::string &dataset) {
+    verifyTimestampMath();
+    cleanup_msplat_metal();
+    msplat_enable_gpu_timing(true);
+    msplat_enable_stage_profiling_for_testing();
+
+    const MsplatGpuTimestampCalibration calibration =
+        msplat_gpu_timestamp_calibration_for_testing();
+    if (!std::isfinite(calibration.frequency_hz) || calibration.frequency_hz <= 0 ||
+        !std::isfinite(calibration.reference_frequency_hz) ||
+        calibration.reference_frequency_hz <= 0 ||
+        calibration.sample_count == 0 || calibration.method == 0) {
+        throw std::runtime_error("runtime GPU timestamp calibration is invalid");
+    }
+
+    std::vector<double> discardedGpuTimes;
+    msplat_drain_gpu_times(discardedGpuTimes);
+    std::vector<double> discardedStageTimes[8];
+    const char *discardedStageNames[8] {};
+    int discardedStageCount = 0;
+    msplat_drain_stage_times(
+        discardedStageTimes,
+        8,
+        discardedStageCount,
+        discardedStageNames
+    );
+
+    double wallMilliseconds = 0;
+    {
+        InputData inputData = inputDataFromX(dataset);
+        if (inputData.cameras.empty() || inputData.points.count <= 0) {
+            throw std::runtime_error("stage timing fixture has no camera or sparse points");
+        }
+        Camera &camera = inputData.cameras.front();
+        camera.loadImage(1.0f);
+        if (camera.image.empty()) {
+            throw std::runtime_error("stage timing fixture image did not decode");
+        }
+        Model model = makeModel(inputData);
+        MTensor target = camera.getGPUImage(1);
+        msplat_commit();
+        msplat_gpu_sync();
+        msplat_drain_gpu_times(discardedGpuTimes);
+
+        const auto started = std::chrono::steady_clock::now();
+        for (int step = 1; step <= stageTimingIterations; ++step) {
+            model.fullIteration(camera, step, target, 0.2f);
+            model.schedulersStep(step);
+            msplat_commit();
+            // The profiler reuses one counter-sample buffer. Synchronizing each
+            // iteration keeps every resolve paired with the command buffer that
+            // wrote it, which makes this an absolute-timing validation rather
+            // than a throughput benchmark.
+            msplat_gpu_sync();
+        }
+        wallMilliseconds = std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - started
+        ).count();
+    }
+
+    std::vector<double> gpuTimes;
+    msplat_drain_gpu_times(gpuTimes);
+    if (gpuTimes.size() != stageTimingIterations) {
+        throw std::runtime_error(
+            "stage timing fixture expected " + std::to_string(stageTimingIterations) +
+            " command-buffer samples, got " + std::to_string(gpuTimes.size())
+        );
+    }
+
+    std::vector<double> stageTimes[8];
+    const char *stageNames[8] {};
+    int stageCount = 0;
+    msplat_drain_stage_times(stageTimes, 8, stageCount, stageNames);
+    if (stageCount != 8 || !stageTimes[0].empty()) {
+        throw std::runtime_error("stage timing fixture reported an invalid stage layout");
+    }
+
+    double stageMilliseconds = 0;
+    for (int stage = 1; stage < stageCount; ++stage) {
+        if (stageNames[stage] == nullptr || stageTimes[stage].size() != stageTimingIterations) {
+            throw std::runtime_error(
+                "stage timing fixture did not report every iteration for stage " +
+                std::to_string(stage)
+            );
+        }
+        for (double duration : stageTimes[stage]) {
+            if (!std::isfinite(duration) || duration < 0) {
+                throw std::runtime_error("stage timing fixture reported an invalid duration");
+            }
+            stageMilliseconds += duration;
+        }
+    }
+    double gpuMilliseconds = 0;
+    for (double duration : gpuTimes) {
+        if (!std::isfinite(duration) || duration < 0) {
+            throw std::runtime_error("command-buffer timing reported an invalid duration");
+        }
+        gpuMilliseconds += duration;
+    }
+    if (stageMilliseconds <= 0 || gpuMilliseconds <= 0 || wallMilliseconds <= 0) {
+        throw std::runtime_error("stage timing fixture reported an empty duration");
+    }
+
+    // All seven measured compute encoders execute serially on each command
+    // buffer. Their sum excludes the blit encoder and inter-encoder overhead,
+    // so it cannot materially exceed either total command-buffer GPU time or
+    // synchronized wall time. Five percent accommodates timestamp sampling and
+    // floating-point aggregation without hiding a clock-domain error.
+    constexpr double aggregationTolerance = 1.05;
+    if (stageMilliseconds > gpuMilliseconds * aggregationTolerance ||
+        stageMilliseconds > wallMilliseconds * aggregationTolerance ||
+        gpuMilliseconds > wallMilliseconds * aggregationTolerance) {
+        throw std::runtime_error(
+            "stage timing is incoherent: stages=" + std::to_string(stageMilliseconds) +
+            "ms gpu=" + std::to_string(gpuMilliseconds) +
+            "ms wall=" + std::to_string(wallMilliseconds) + "ms"
+        );
+    }
+
+    std::cout << "gpu_timestamp_frequency_hz=" << calibration.frequency_hz
+              << " reference_frequency_hz=" << calibration.reference_frequency_hz
+              << " calibration_method=" << calibration.method
+              << " calibration_samples=" << calibration.sample_count << '\n';
+    std::cout << "stage_profile_iterations=" << stageTimingIterations
+              << " stage_ms=" << stageMilliseconds
+              << " gpu_ms=" << gpuMilliseconds
+              << " wall_ms=" << wallMilliseconds << '\n';
+    cleanup_msplat_metal();
+    std::cout << "msplat stage timing passed\n";
+}
+
 } // namespace
 
 int main(int argc, char **argv) {
     try {
+        if (argc == 3 && std::string(argv[1]) == "--stage-timing") {
+            verifyStageTiming(argv[2]);
+            return 0;
+        }
         if (argc != 7) {
             throw std::runtime_error(
                 "usage: msplat-raster-tests <parity dataset> <mixed-resolution dataset> "
                 "<overflow dataset> <broad-overflow dataset> "
-                "<increasing-overflow dataset> <exact-budget dataset>"
+                "<increasing-overflow dataset> <exact-budget dataset>\n"
+                "       msplat-raster-tests --stage-timing <profile dataset>"
             );
         }
         const std::string dataset = argv[1];

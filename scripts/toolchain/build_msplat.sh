@@ -23,6 +23,8 @@ METAL_SAFETY_PATCH="$ROOT/Tools/MsplatNative/msplat-1.1.3-metal-safety.patch"
 METAL_SAFETY_PATCH_SHA256="5d3dfff3edcbca940d37f6ee3145c76c678ebd36ebc03016cfd5dab78e1d45ac"
 EXACT_RASTER_PATCH="$ROOT/Tools/MsplatNative/msplat-1.1.3-exact-raster.patch"
 EXACT_RASTER_PATCH_SHA256="278deba531d1503b8f6fe3428e0b6c5103129f388a6bc425c41780ff9e4c453b"
+STAGE_TIMING_PATCH="$ROOT/Tools/MsplatNative/msplat-1.1.3-stage-timing.patch"
+STAGE_TIMING_PATCH_SHA256="ce26212e07d155f436f3f91a78c47f880fc3684cdada88e76623acf56bd3f9f8"
 RASTER_TEST_FIXTURES="$BUILD_DIR/raster-test-fixtures"
 
 MSPLAT_REPO="https://github.com/rayanht/msplat.git"
@@ -73,6 +75,11 @@ reject_raster_test_symbols() {
     msplat_set_raster_memory_budget_for_testing \
     msplat_fail_next_sync_for_testing \
     msplat_pending_exact_raster_timing_handlers_for_testing \
+    msplat_gpu_ticks_to_seconds_for_testing \
+    msplat_gpu_frequency_from_timestamp_pairs_for_testing \
+    msplat_stage_timing_coherent_for_testing \
+    msplat_enable_stage_profiling_for_testing \
+    msplat_gpu_timestamp_calibration_for_testing \
     msplat_copy_last_raster_debug; do
     if /usr/bin/nm -gU "$binary" | grep -Fq "$symbol"; then
       die "staged CLI exports raster test hook: $symbol"
@@ -107,6 +114,9 @@ preflight() {
   [ -f "$EXACT_RASTER_PATCH" ] || die "missing exact-raster patch: $EXACT_RASTER_PATCH"
   [ "$(sha256 "$EXACT_RASTER_PATCH")" = "$EXACT_RASTER_PATCH_SHA256" ] \
     || die "exact-raster patch SHA-256 mismatch"
+  [ -f "$STAGE_TIMING_PATCH" ] || die "missing stage-timing patch: $STAGE_TIMING_PATCH"
+  [ "$(sha256 "$STAGE_TIMING_PATCH")" = "$STAGE_TIMING_PATCH_SHA256" ] \
+    || die "stage-timing patch SHA-256 mismatch"
 }
 
 download_verified() {
@@ -189,6 +199,8 @@ prepare_source() {
   git -C "$SOURCE_DIR" apply --unidiff-zero "$METAL_SAFETY_PATCH"
   git -C "$SOURCE_DIR" apply --check "$EXACT_RASTER_PATCH"
   git -C "$SOURCE_DIR" apply "$EXACT_RASTER_PATCH"
+  git -C "$SOURCE_DIR" apply --check "$STAGE_TIMING_PATCH"
+  git -C "$SOURCE_DIR" apply "$STAGE_TIMING_PATCH"
 }
 
 configure_and_build() {
@@ -213,12 +225,14 @@ configure_and_build() {
     "$RASTER_TEST_FIXTURES/16-broad-overflow-2304" \
     "$RASTER_TEST_FIXTURES/15-increasing-overflow-10000" \
     "$RASTER_TEST_FIXTURES/17-exact-budget-1279"
+  "$NATIVE_BUILD_DIR/msplat_raster_tests" \
+    --stage-timing "$RASTER_TEST_FIXTURES/01-sphere-500"
 }
 
 write_build_info() {
   local executable_sha256="$1"
   local metallib_sha256="$2"
-  local build_info compiler cmake_version ninja_version timestamp overlay_sha256 raster_test_sha256 patch_sha256 checkpoint_patch_sha256 numeric_stability_patch_sha256 metal_safety_patch_sha256 exact_raster_patch_sha256
+  local build_info compiler cmake_version ninja_version timestamp overlay_sha256 raster_test_sha256 patch_sha256 checkpoint_patch_sha256 numeric_stability_patch_sha256 metal_safety_patch_sha256 exact_raster_patch_sha256 stage_timing_patch_sha256
   build_info="$STAGE_DIR/build_info.json"
   compiler="$(xcrun clang++ --version | head -n 1)"
   cmake_version="$(cmake --version | head -n 1)"
@@ -231,10 +245,11 @@ write_build_info() {
   numeric_stability_patch_sha256="$(sha256 "$NUMERIC_STABILITY_PATCH")"
   metal_safety_patch_sha256="$(sha256 "$METAL_SAFETY_PATCH")"
   exact_raster_patch_sha256="$(sha256 "$EXACT_RASTER_PATCH")"
+  stage_timing_patch_sha256="$(sha256 "$STAGE_TIMING_PATCH")"
 
   python3 - "$build_info" \
     "$MSPLAT_REPO" "$MSPLAT_COMMIT" "$MSPLAT_VERSION" "$SOURCE_TREE_SHA256" \
-    "$overlay_sha256" "$raster_test_sha256" "$patch_sha256" "$checkpoint_patch_sha256" "$numeric_stability_patch_sha256" "$metal_safety_patch_sha256" "$exact_raster_patch_sha256" \
+    "$overlay_sha256" "$raster_test_sha256" "$patch_sha256" "$checkpoint_patch_sha256" "$numeric_stability_patch_sha256" "$metal_safety_patch_sha256" "$exact_raster_patch_sha256" "$stage_timing_patch_sha256" \
     "$NLOHMANN_JSON_SHA256" "$NANOFLANN_SHA256" "$CLI11_SHA256" \
     "$executable_sha256" "$metallib_sha256" \
     "$compiler" "$cmake_version" "$ninja_version" "$timestamp" <<'PY'
@@ -254,6 +269,7 @@ import sys
     numeric_stability_patch_sha256,
     metal_safety_patch_sha256,
     exact_raster_patch_sha256,
+    stage_timing_patch_sha256,
     nlohmann_json_sha256,
     nanoflann_sha256,
     cli11_sha256,
@@ -278,6 +294,7 @@ payload = {
     "numeric_stability_patch_sha256": numeric_stability_patch_sha256,
     "metal_safety_patch_sha256": metal_safety_patch_sha256,
     "exact_raster_patch_sha256": exact_raster_patch_sha256,
+    "stage_timing_patch_sha256": stage_timing_patch_sha256,
     "dependencies": {
         "nlohmann_json_v3.11.3_sha256": nlohmann_json_sha256,
         "nanoflann_v1.5.5_sha256": nanoflann_sha256,
