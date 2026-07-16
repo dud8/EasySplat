@@ -807,6 +807,10 @@ private enum ColmapBridgeContract {
         "Mapper.ba_local_max_refinements",
         "Mapper.ba_global_max_refinements",
         "Mapper.ba_global_max_num_iterations",
+        "Mapper.ba_local_max_num_iterations",
+        "Mapper.ba_local_function_tolerance",
+        "Mapper.ba_global_function_tolerance",
+        "Mapper.ba_local_num_images",
         "Mapper.random_seed",
         "Mapper.ba_refine_focal_length",
     ]

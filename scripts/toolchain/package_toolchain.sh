@@ -540,6 +540,8 @@ require_colmap_options mapper \
   Mapper.ba_global_frames_ratio Mapper.ba_global_points_ratio \
   Mapper.ba_local_max_refinements \
   Mapper.ba_global_max_refinements Mapper.ba_global_max_num_iterations \
+  Mapper.ba_local_max_num_iterations Mapper.ba_local_function_tolerance \
+  Mapper.ba_global_function_tolerance Mapper.ba_local_num_images \
   Mapper.random_seed Mapper.ba_refine_focal_length
 require_colmap_options local_vocab_retriever \
   database_path output_pair_list_path query_image_list_path excluded_pair_list_path \
