@@ -30,19 +30,118 @@ E2E_DIR=""
 SMOKE_LOG=""
 REMOTE_MANIFEST=""
 MAX_PUBLISHED_MANIFEST_BYTES=16777216
+FINAL_SUCCESS_MESSAGE=""
 
 usage() {
   echo "Usage: verify_beta.sh --app <app> --dmg <dmg> --expected-version <semver> --artifacts --source-url <https-url> --source-commit <sha> --fixture <media> --manifest-url <https-url> --public-key-file <file> --toolchain-root <dir> --e2e-runner <executable> --offline-cache-root <dir> --offline-runner <executable>"
 }
 
+detach_disk_image_once() {
+  python3 - "$HDIUTIL_BIN" "$MOUNT_DIR" <<'PY'
+import os
+import signal
+import subprocess
+import sys
+
+try:
+    process = subprocess.Popen(
+        [sys.argv[1], "detach", sys.argv[2]],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,
+    )
+except OSError:
+    raise SystemExit(127)
+
+def terminate_process_group():
+    if process.poll() is not None:
+        return
+    try:
+        os.killpg(process.pid, signal.SIGTERM)
+    except ProcessLookupError:
+        return
+    try:
+        process.wait(timeout=0.2)
+        return
+    except subprocess.TimeoutExpired:
+        pass
+    try:
+        os.killpg(process.pid, signal.SIGKILL)
+    except ProcessLookupError:
+        return
+    try:
+        process.wait(timeout=0.2)
+    except subprocess.TimeoutExpired:
+        pass
+
+handled_signals = (signal.SIGHUP, signal.SIGINT, signal.SIGTERM)
+
+def abort_for_signal(signum, _frame):
+    for handled_signal in handled_signals:
+        signal.signal(handled_signal, signal.SIG_DFL)
+    raise SystemExit(128 + signum)
+
+for handled_signal in handled_signals:
+    signal.signal(handled_signal, abort_for_signal)
+
+try:
+    return_code = process.wait(timeout=5.0)
+except subprocess.TimeoutExpired:
+    terminate_process_group()
+    raise SystemExit(124)
+except BaseException:
+    terminate_process_group()
+    raise
+
+raise SystemExit(return_code)
+PY
+}
+
 cleanup() {
+  local status=$?
+  local detached=0
+  local cleanup_failed=0
+  trap - EXIT
+  set +e
   if [ "$MOUNT_ATTACHED" -eq 1 ] && [ -n "$MOUNT_DIR" ]; then
-    "$HDIUTIL_BIN" detach "$MOUNT_DIR" >/dev/null 2>&1 || true
+    for _ in {1..3}; do
+      if detach_disk_image_once; then
+        detached=1
+        MOUNT_ATTACHED=0
+        break
+      fi
+      sleep 0.1
+    done
+    if [ "$detached" -eq 0 ]; then
+      echo "error: could not detach beta verification disk image: $MOUNT_DIR" >&2
+      cleanup_failed=1
+    fi
   fi
-  [ -z "$MOUNT_DIR" ] || rm -rf "$MOUNT_DIR"
-  [ -z "$E2E_DIR" ] || rm -rf "$E2E_DIR"
-  [ -z "$SMOKE_LOG" ] || rm -f "$SMOKE_LOG"
-  [ -z "$REMOTE_MANIFEST" ] || rm -f "$REMOTE_MANIFEST"
+  if [ "$MOUNT_ATTACHED" -eq 0 ] && [ -n "$MOUNT_DIR" ]; then
+    if ! rm -rf "$MOUNT_DIR"; then
+      echo "error: could not remove beta verification mount directory: $MOUNT_DIR" >&2
+      cleanup_failed=1
+    fi
+  fi
+  if [ -n "$E2E_DIR" ] && ! rm -rf "$E2E_DIR"; then
+    echo "error: could not remove beta verification end-to-end directory: $E2E_DIR" >&2
+    cleanup_failed=1
+  fi
+  if [ -n "$SMOKE_LOG" ] && ! rm -f "$SMOKE_LOG"; then
+    echo "error: could not remove beta verification smoke log: $SMOKE_LOG" >&2
+    cleanup_failed=1
+  fi
+  if [ -n "$REMOTE_MANIFEST" ] && ! rm -f "$REMOTE_MANIFEST"; then
+    echo "error: could not remove beta verification manifest: $REMOTE_MANIFEST" >&2
+    cleanup_failed=1
+  fi
+  if [ "$status" -eq 0 ] && [ "$cleanup_failed" -ne 0 ]; then
+    status=1
+  fi
+  if [ "$status" -eq 0 ] && [ -n "$FINAL_SUCCESS_MESSAGE" ]; then
+    printf '%s\n' "$FINAL_SUCCESS_MESSAGE"
+  fi
+  exit "$status"
 }
 trap cleanup EXIT
 
@@ -612,7 +711,7 @@ else
 fi
 
 if [ "$ALLOW_INCOMPLETE" -eq 1 ]; then
-  echo "Inspection only: static checks completed for $EXPECTED_VERSION; release verification is incomplete."
+  FINAL_SUCCESS_MESSAGE="Inspection only: static checks completed for $EXPECTED_VERSION; release verification is incomplete."
 else
-  echo "Verified unsigned public beta: $EXPECTED_VERSION"
+  FINAL_SUCCESS_MESSAGE="Verified unsigned public beta: $EXPECTED_VERSION"
 fi

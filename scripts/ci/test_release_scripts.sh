@@ -350,7 +350,32 @@ case "$1" in
     test -d "$EASYSPLAT_TEST_APP_PATH"
     cp -R "$EASYSPLAT_TEST_APP_PATH" "$mountpoint/EasySplat.app"
     ;;
-  detach) test -d "$2" ;;
+  detach)
+    test -d "$2"
+    if [[ -n "${EASYSPLAT_TEST_HDIUTIL_PID_FILE:-}" ]]; then
+      printf '%s\n' "$$" >"$EASYSPLAT_TEST_HDIUTIL_PID_FILE"
+    fi
+    if [[ "${EASYSPLAT_TEST_HDIUTIL_DETACH_ALWAYS_FAIL:-}" == "1" ]]; then
+      exit 1
+    fi
+    if [[ "${EASYSPLAT_TEST_HDIUTIL_DETACH_BLOCK:-}" == "1" ]]; then
+      sleep 30
+      exit 1
+    fi
+    if [[ "${EASYSPLAT_TEST_HDIUTIL_DETACH_DELAY:-}" == "1" ]]; then
+      sleep 2
+    fi
+    if [[ "${EASYSPLAT_TEST_HDIUTIL_DETACH_FAIL_ONCE:-}" == "1" ]]; then
+      test -n "${EASYSPLAT_TEST_HDIUTIL_DETACH_STATE:-}"
+      if [[ ! -e "$EASYSPLAT_TEST_HDIUTIL_DETACH_STATE" ]]; then
+        : >"$EASYSPLAT_TEST_HDIUTIL_DETACH_STATE"
+        exit 1
+      fi
+    fi
+    if [[ "${EASYSPLAT_TEST_HDIUTIL_LOCK_MOUNT_PARENT:-}" == "1" ]]; then
+      chmod a-w "$(dirname "$2")"
+    fi
+    ;;
   *) exit 2 ;;
 esac
 EOF
@@ -376,6 +401,262 @@ EASYSPLAT_TEST_APP_PATH="$app_bundle" \
   --expected-version "0.2.0-beta.1" \
   --allow-incomplete \
   --skip-launch-smoke
+
+detach_retry_log="$TMP_DIR/hdiutil-detach-retry.log"
+detach_retry_state="$TMP_DIR/hdiutil-detach-retry.state"
+detach_retry_tmp="$TMP_DIR/hdiutil-detach-retry-tmp"
+mkdir -p "$detach_retry_tmp"
+TMPDIR="$detach_retry_tmp" \
+EASYSPLAT_HDIUTIL_BIN="$mock_hdiutil" \
+EASYSPLAT_TEST_HDIUTIL_LOG="$detach_retry_log" \
+EASYSPLAT_TEST_HDIUTIL_DETACH_FAIL_ONCE=1 \
+EASYSPLAT_TEST_HDIUTIL_DETACH_STATE="$detach_retry_state" \
+EASYSPLAT_TEST_APP_PATH="$app_bundle" \
+  "$ROOT/scripts/release/verify_beta.sh" \
+  --app "$app_bundle" \
+  --dmg "$TMP_DIR/EasySplat-0.2.0-beta.1-unsigned.dmg" \
+  --expected-version "0.2.0-beta.1" \
+  --allow-incomplete \
+  --skip-launch-smoke >/dev/null
+if [[ "$(grep -c '^detach ' "$detach_retry_log")" -ne 2 ]]; then
+  echo "Beta verifier did not retry a transient disk-image detach failure" >&2
+  exit 1
+fi
+if find "$detach_retry_tmp" -maxdepth 1 -name 'easysplat-beta-mount.*' -print -quit | grep -q .; then
+  echo "Beta verifier left a mount directory after detach retry" >&2
+  exit 1
+fi
+
+detach_delay_log="$TMP_DIR/hdiutil-detach-delay.log"
+detach_delay_tmp="$TMP_DIR/hdiutil-detach-delay-tmp"
+mkdir -p "$detach_delay_tmp"
+TMPDIR="$detach_delay_tmp" \
+EASYSPLAT_HDIUTIL_BIN="$mock_hdiutil" \
+EASYSPLAT_TEST_HDIUTIL_LOG="$detach_delay_log" \
+EASYSPLAT_TEST_HDIUTIL_DETACH_DELAY=1 \
+EASYSPLAT_TEST_APP_PATH="$app_bundle" \
+  "$ROOT/scripts/release/verify_beta.sh" \
+  --app "$app_bundle" \
+  --dmg "$TMP_DIR/EasySplat-0.2.0-beta.1-unsigned.dmg" \
+  --expected-version "0.2.0-beta.1" \
+  --allow-incomplete \
+  --skip-launch-smoke >/dev/null
+if [[ "$(grep -c '^detach ' "$detach_delay_log")" -ne 1 ]]; then
+  echo "Beta verifier killed a healthy slow disk-image detach" >&2
+  exit 1
+fi
+if find "$detach_delay_tmp" -maxdepth 1 -name 'easysplat-beta-mount.*' -print -quit | grep -q .; then
+  echo "Beta verifier left a mount directory after a healthy slow detach" >&2
+  exit 1
+fi
+
+detach_failure_log="$TMP_DIR/hdiutil-detach-failure.log"
+detach_failure_error="$TMP_DIR/hdiutil-detach-failure.stderr"
+detach_failure_output="$TMP_DIR/hdiutil-detach-failure.stdout"
+detach_failure_tmp="$TMP_DIR/hdiutil-detach-failure-tmp"
+mkdir -p "$detach_failure_tmp"
+if TMPDIR="$detach_failure_tmp" \
+  EASYSPLAT_HDIUTIL_BIN="$mock_hdiutil" \
+  EASYSPLAT_TEST_HDIUTIL_LOG="$detach_failure_log" \
+  EASYSPLAT_TEST_HDIUTIL_DETACH_ALWAYS_FAIL=1 \
+  EASYSPLAT_TEST_APP_PATH="$app_bundle" \
+  "$ROOT/scripts/release/verify_beta.sh" \
+  --app "$app_bundle" \
+  --dmg "$TMP_DIR/EasySplat-0.2.0-beta.1-unsigned.dmg" \
+  --expected-version "0.2.0-beta.1" \
+  --allow-incomplete \
+  --skip-launch-smoke >"$detach_failure_output" 2>"$detach_failure_error"; then
+  echo "Beta verifier accepted a persistent disk-image detach failure" >&2
+  exit 1
+fi
+grep -Fq 'could not detach beta verification disk image' "$detach_failure_error"
+if grep -Eiq 'Verified unsigned public beta|Inspection only|static checks completed' \
+  "$detach_failure_output"; then
+  echo "Beta verifier claimed success before a persistent detach failure" >&2
+  exit 1
+fi
+if [[ "$(grep -c '^detach ' "$detach_failure_log")" -ne 3 ]]; then
+  echo "Beta verifier did not exhaust its bounded detach retries" >&2
+  exit 1
+fi
+detach_failure_mount_count=$(find "$detach_failure_tmp" -maxdepth 1 \
+  -name 'easysplat-beta-mount.*' -type d | wc -l | tr -d ' ')
+if [[ "$detach_failure_mount_count" -ne 1 ]]; then
+  echo "Beta verifier removed or duplicated a mount directory after detach failure" >&2
+  exit 1
+fi
+detach_failure_mount=$(find "$detach_failure_tmp" -maxdepth 1 \
+  -name 'easysplat-beta-mount.*' -type d -print -quit)
+if [[ ! -d "$detach_failure_mount/EasySplat.app" ]]; then
+  echo "Beta verifier removed mounted contents after detach failure" >&2
+  exit 1
+fi
+
+detach_block_log="$TMP_DIR/hdiutil-detach-block.log"
+detach_block_error="$TMP_DIR/hdiutil-detach-block.stderr"
+detach_block_output="$TMP_DIR/hdiutil-detach-block.stdout"
+detach_block_tmp="$TMP_DIR/hdiutil-detach-block-tmp"
+mkdir -p "$detach_block_tmp"
+detach_block_started=$(python3 -c 'import time; print(time.monotonic())')
+if TMPDIR="$detach_block_tmp" \
+  EASYSPLAT_HDIUTIL_BIN="$mock_hdiutil" \
+  EASYSPLAT_TEST_HDIUTIL_LOG="$detach_block_log" \
+  EASYSPLAT_TEST_HDIUTIL_DETACH_BLOCK=1 \
+  EASYSPLAT_TEST_APP_PATH="$app_bundle" \
+  "$ROOT/scripts/release/verify_beta.sh" \
+  --app "$app_bundle" \
+  --dmg "$TMP_DIR/EasySplat-0.2.0-beta.1-unsigned.dmg" \
+  --expected-version "0.2.0-beta.1" \
+  --allow-incomplete \
+  --skip-launch-smoke >"$detach_block_output" 2>"$detach_block_error"; then
+  echo "Beta verifier accepted a hung disk-image detach" >&2
+  exit 1
+fi
+detach_block_finished=$(python3 -c 'import time; print(time.monotonic())')
+python3 - "$detach_block_started" "$detach_block_finished" <<'PY'
+import sys
+
+elapsed = float(sys.argv[2]) - float(sys.argv[1])
+if not 0 < elapsed < 28:
+    raise SystemExit(f"Beta verifier detach timeout was not bounded: {elapsed:.3f}s")
+PY
+grep -Fq 'could not detach beta verification disk image' "$detach_block_error"
+if [[ "$(grep -c '^detach ' "$detach_block_log")" -ne 3 ]]; then
+  echo "Beta verifier did not bound every hung detach attempt" >&2
+  exit 1
+fi
+if grep -Eiq 'Verified unsigned public beta|Inspection only|static checks completed' \
+  "$detach_block_output"; then
+  echo "Beta verifier claimed success after a hung detach" >&2
+  exit 1
+fi
+detach_block_mount_count=$(find "$detach_block_tmp" -maxdepth 1 \
+  -name 'easysplat-beta-mount.*' -type d | wc -l | tr -d ' ')
+if [[ "$detach_block_mount_count" -ne 1 ]]; then
+  echo "Beta verifier removed or duplicated a mount directory after a hung detach" >&2
+  exit 1
+fi
+detach_block_mount=$(find "$detach_block_tmp" -maxdepth 1 \
+  -name 'easysplat-beta-mount.*' -type d -print -quit)
+if [[ ! -d "$detach_block_mount/EasySplat.app" ]]; then
+  echo "Beta verifier removed mounted contents after a hung detach" >&2
+  exit 1
+fi
+
+detach_signal_tmp="$TMP_DIR/hdiutil-detach-signal-tmp"
+detach_signal_pid="$TMP_DIR/hdiutil-detach-signal.pid"
+mkdir -p "$detach_signal_tmp"
+python3 - \
+  "$ROOT/scripts/release/verify_beta.sh" \
+  "$mock_hdiutil" \
+  "$app_bundle" \
+  "$TMP_DIR/EasySplat-0.2.0-beta.1-unsigned.dmg" \
+  "$detach_signal_tmp" \
+  "$detach_signal_pid" <<'PY'
+import os
+import signal
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+verifier, hdiutil, app, dmg, temp_dir, pid_path_raw = sys.argv[1:]
+pid_path = Path(pid_path_raw)
+environment = os.environ.copy()
+environment.update(
+    {
+        "TMPDIR": temp_dir,
+        "EASYSPLAT_HDIUTIL_BIN": hdiutil,
+        "EASYSPLAT_TEST_HDIUTIL_DETACH_BLOCK": "1",
+        "EASYSPLAT_TEST_HDIUTIL_LOG": f"{pid_path}.log",
+        "EASYSPLAT_TEST_HDIUTIL_PID_FILE": str(pid_path),
+        "EASYSPLAT_TEST_APP_PATH": app,
+    }
+)
+process = subprocess.Popen(
+    [
+        verifier,
+        "--app",
+        app,
+        "--dmg",
+        dmg,
+        "--expected-version",
+        "0.2.0-beta.1",
+        "--allow-incomplete",
+        "--skip-launch-smoke",
+    ],
+    env=environment,
+    stdout=subprocess.DEVNULL,
+    stderr=subprocess.DEVNULL,
+    start_new_session=True,
+)
+mock_pid = None
+try:
+    deadline = time.monotonic() + 10
+    while time.monotonic() < deadline and not pid_path.exists():
+        if process.poll() is not None:
+            raise SystemExit("Beta verifier exited before its detach helper started")
+        time.sleep(0.05)
+    if not pid_path.exists():
+        raise SystemExit("Beta verifier did not start its detach helper")
+    mock_pid = int(pid_path.read_text(encoding="utf-8").strip())
+
+    os.killpg(process.pid, signal.SIGTERM)
+    try:
+        return_code = process.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        raise SystemExit("Interrupted beta verifier did not exit promptly")
+    if return_code == 0:
+        raise SystemExit("Interrupted beta verifier reported success")
+
+    deadline = time.monotonic() + 2
+    while time.monotonic() < deadline:
+        try:
+            os.kill(mock_pid, 0)
+        except ProcessLookupError:
+            break
+        time.sleep(0.05)
+    else:
+        os.killpg(mock_pid, signal.SIGKILL)
+        raise SystemExit("Interrupted beta verifier orphaned its hdiutil process group")
+finally:
+    if process.poll() is None:
+        os.killpg(process.pid, signal.SIGKILL)
+        process.wait()
+    if mock_pid is not None:
+        try:
+            os.killpg(mock_pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+PY
+
+cleanup_failure_log="$TMP_DIR/hdiutil-cleanup-failure.log"
+cleanup_failure_error="$TMP_DIR/hdiutil-cleanup-failure.stderr"
+cleanup_failure_output="$TMP_DIR/hdiutil-cleanup-failure.stdout"
+cleanup_failure_tmp="$TMP_DIR/hdiutil-cleanup-failure-tmp"
+mkdir -p "$cleanup_failure_tmp"
+if TMPDIR="$cleanup_failure_tmp" \
+  EASYSPLAT_HDIUTIL_BIN="$mock_hdiutil" \
+  EASYSPLAT_TEST_HDIUTIL_LOG="$cleanup_failure_log" \
+  EASYSPLAT_TEST_HDIUTIL_LOCK_MOUNT_PARENT=1 \
+  EASYSPLAT_TEST_APP_PATH="$app_bundle" \
+  "$ROOT/scripts/release/verify_beta.sh" \
+  --app "$app_bundle" \
+  --dmg "$TMP_DIR/EasySplat-0.2.0-beta.1-unsigned.dmg" \
+  --expected-version "0.2.0-beta.1" \
+  --allow-incomplete \
+  --skip-launch-smoke >"$cleanup_failure_output" 2>"$cleanup_failure_error"; then
+  chmod u+w "$cleanup_failure_tmp"
+  echo "Beta verifier accepted a mount-directory cleanup failure" >&2
+  exit 1
+fi
+chmod u+w "$cleanup_failure_tmp"
+grep -Fq 'could not remove beta verification mount directory' "$cleanup_failure_error"
+if grep -Eiq 'Verified unsigned public beta|Inspection only|static checks completed' \
+  "$cleanup_failure_output"; then
+  echo "Beta verifier claimed success after a cleanup failure" >&2
+  exit 1
+fi
 
 bundled_contract_only_output="$TMP_DIR/release-verifier-bundled-contract-only.stdout"
 EASYSPLAT_HDIUTIL_BIN="$mock_hdiutil" \
