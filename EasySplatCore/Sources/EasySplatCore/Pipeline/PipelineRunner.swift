@@ -810,7 +810,7 @@ public final class PipelineRunner: @unchecked Sendable {
                 selectedFrames = try loadImages(in: paths.framesSelectedURL)
                 selectedFrameManifest = (try? loadSelectedFrameManifest(from: paths.framesSelectedManifestURL)) ?? selectedFrameManifest
             }
-            if selectedFrames.count < 2 {
+            if selectedFrames.count < RunPlanResolver.minimumReconstructionImageCount {
                 throw PipelineError.insufficientInputImages(selectedFrames.count)
             }
             let sharedCameraRequested = da3SharedCameraPreference(

@@ -327,7 +327,10 @@ extension PipelineRunner {
             case .invalidInput:
                 return ("No usable photos or video frames were found.", String(reflecting: pipelineError))
             case let .insufficientInputImages(actual):
-                return ("At least two usable photos or video frames are required.", "Insufficient input images after selection: \(actual).")
+                return (
+                    "At least \(RunPlanResolver.minimumReconstructionImageCount) usable photos or video frames are required.",
+                    "Insufficient input images after selection: \(actual)."
+                )
             case let .lowQualityReconstruction(score, _):
                 let summary = ReconstructionScorer.summary(score)
                 return ("The camera solve was unstable. Try a slower capture with more light.", "Low-quality reconstruction. \(summary).")

@@ -135,7 +135,7 @@ final class AppModelTests: XCTestCase {
         try FileManager.default.createDirectory(at: base, withIntermediateDirectories: true)
         let folder = base.appendingPathComponent("Thin", isDirectory: true)
         try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
-        for index in 0..<3 {
+        for index in 0..<2 {
             try Data("img".utf8).write(to: folder.appendingPathComponent("img\(index).jpg"))
         }
         let model = AppModel(toolchainManager: MockToolchainManager(), projectBaseURL: base) { url, config in
@@ -147,10 +147,36 @@ final class AppModelTests: XCTestCase {
         }
         let warning = try XCTUnwrap(model.selectionWarning)
         XCTAssertTrue(warning.contains("Thin"), "Warning should name the folder, got: \(warning)")
-        XCTAssertTrue(warning.contains("3 image"), "Warning should mention the actual count, got: \(warning)")
+        XCTAssertTrue(warning.contains("2 photos"), "Warning should mention the actual count, got: \(warning)")
+        XCTAssertTrue(warning.contains("Add at least 3"), "Warning should explain the hard floor, got: \(warning)")
+        XCTAssertFalse(warning.contains("will still attempt"), "Warning must not promise a run below the hard floor.")
 
         model.removePhotoFolder()
         XCTAssertNil(model.pendingPhotosFolderURL)
+        XCTAssertNil(model.selectionWarning)
+    }
+
+    func testAddInputsDoesNotApplyPhotoOnlyFloorToMixedInput() async throws {
+        let base = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: base) }
+        try FileManager.default.createDirectory(at: base, withIntermediateDirectories: true)
+        let folder = base.appendingPathComponent("Supplemental", isDirectory: true)
+        try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        for index in 0..<2 {
+            try Data("img".utf8).write(to: folder.appendingPathComponent("img\(index).jpg"))
+        }
+        let video = base.appendingPathComponent("capture.mov")
+        try Data("video".utf8).write(to: video)
+        let model = AppModel(toolchainManager: MockToolchainManager(), projectBaseURL: base)
+
+        model.addInputs(urls: [video, folder])
+        for _ in 0..<100 where model.photoFolderCountTask != nil {
+            try await Task.sleep(for: .milliseconds(10))
+        }
+
+        XCTAssertEqual(model.pendingVideoURLs, [video])
+        XCTAssertEqual(model.pendingPhotosFolderURL, folder)
+        XCTAssertNil(model.photoFolderCountTask)
         XCTAssertNil(model.selectionWarning)
     }
 
@@ -632,6 +658,42 @@ final class AppModelTests: XCTestCase {
         XCTAssertNil(toolchain.lastRequest)
         XCTAssertNil(model.currentProjectURL)
         let projects = try FileManager.default.contentsOfDirectory(at: base, includingPropertiesForKeys: nil)
+        XCTAssertFalse(projects.contains { $0.pathExtension == "easysplatproj" })
+    }
+
+    func testPhotoPreflightRejectsTwoUsableViewsBeforeSetup() async throws {
+        let base = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: base) }
+        let photos = base.appendingPathComponent("Photos", isDirectory: true)
+        try FileManager.default.createDirectory(at: photos, withIntermediateDirectories: true)
+        for index in 0..<2 {
+            XCTAssertTrue(try writeTestGrayscaleImage(
+                at: photos.appendingPathComponent("photo-\(index).png"),
+                value: UInt8(index)
+            ))
+        }
+        let toolchain = CapabilityRecordingToolchainManager()
+        let model = AppModel(toolchainManager: toolchain, projectBaseURL: base) { projectURL, config in
+            MockPipelineRunner(projectURL: projectURL, config: config)
+        }
+        model.addInputs(urls: [photos])
+
+        model.startFromPendingSelection()
+        try await waitForLastError(model: model)
+
+        XCTAssertEqual(
+            model.lastError,
+            RunPlanResolver.ValidationError.insufficientValidPhotos(
+                actual: 2,
+                minimum: 3
+            ).localizedDescription
+        )
+        XCTAssertNil(toolchain.lastRequest)
+        XCTAssertNil(model.currentProjectURL)
+        let projects = try FileManager.default.contentsOfDirectory(
+            at: base,
+            includingPropertiesForKeys: nil
+        )
         XCTAssertFalse(projects.contains { $0.pathExtension == "easysplatproj" })
     }
 

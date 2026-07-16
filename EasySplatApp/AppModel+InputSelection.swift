@@ -67,8 +67,7 @@ extension AppModel {
     }
 
     /// Recommended floor used by the pre-flight check. Phrased as a quality
-    /// recommendation rather than a hard minimum because the pipeline only
-    /// fails outright below 2 selected frames.
+    /// recommendation rather than the pipeline's three-view hard minimum.
     nonisolated static let minimumRecommendedPhotos: Int = 12
 
     /// Count non-hidden image files in a folder. Recurses into subdirectories
@@ -177,7 +176,16 @@ extension AppModel {
                   count < Self.minimumRecommendedPhotos else {
                 return
             }
-            let message = "\"\(folder.lastPathComponent)\" has \(count) image file\(count == 1 ? "" : "s"). \(Self.minimumRecommendedPhotos)+ images is the recommended floor for a high-coverage solve, but EasySplat will still attempt the run."
+            // A photo folder is optional beside video input, so its count is
+            // neither a reconstruction floor nor a useful warning.
+            guard self.pendingVideoURLs.isEmpty else { return }
+            let countText = "\(count) \(count == 1 ? "photo" : "photos")"
+            let message: String
+            if count < RunPlanResolver.minimumReconstructionImageCount {
+                message = "\"\(folder.lastPathComponent)\" has \(countText). Add at least \(RunPlanResolver.minimumReconstructionImageCount) from different viewpoints."
+            } else {
+                message = "\"\(folder.lastPathComponent)\" has \(countText). \(Self.minimumRecommendedPhotos) or more is recommended for reliable coverage."
+            }
             if let warning = self.selectionWarning, !warning.isEmpty {
                 self.selectionWarning = warning + "\n" + message
             } else {

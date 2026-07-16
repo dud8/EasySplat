@@ -3186,7 +3186,7 @@ final class PipelineIntegrationTests: XCTestCase {
         let projectURL = temp.appendingPathComponent("StrictDa3.easysplatproj", isDirectory: true)
         let sourcePhotos = temp.appendingPathComponent("SourcePhotos", isDirectory: true)
         try FileManager.default.createDirectory(at: sourcePhotos, withIntermediateDirectories: true)
-        for index in 0..<2 {
+        for index in 0..<3 {
             try writeTestImage(url: sourcePhotos.appendingPathComponent("img\(index).jpg"), value: UInt8(index % 255))
         }
 
@@ -3449,8 +3449,8 @@ final class PipelineIntegrationTests: XCTestCase {
             reconstruction: ReconstructionSummary(
                 mapper: "colmap",
                 capturedAt: Date(timeIntervalSince1970: 1),
-                registeredImages: 2,
-                totalImages: 2
+                registeredImages: 3,
+                totalImages: 3
             )
         )
         let paths = ProjectPaths(root: projectURL)
@@ -3461,7 +3461,7 @@ final class PipelineIntegrationTests: XCTestCase {
             to: paths.importedPhotosURL
         )
         var selectedMappings: [TestSelectedFrameMapping] = []
-        for index in 0..<2 {
+        for index in 0..<3 {
             let name = String(format: "frame_%06d.jpg", index)
             try writeTestImage(
                 url: paths.framesSelectedURL.appendingPathComponent(name),
@@ -3490,12 +3490,14 @@ final class PipelineIntegrationTests: XCTestCase {
         320 240 1
         2 1 0 0 0 0 0 0 1 frame_000001.jpg
         320 240 1
+        3 1 0 0 0 0 0 0 1 frame_000002.jpg
+        320 240 1
         """.write(
             to: sparse.appendingPathComponent("images.txt"),
             atomically: true,
             encoding: .utf8
         )
-        try "1 0 0 1 128 128 128 0.5 1 0 2 0\n".write(
+        try "1 0 0 1 128 128 128 0.5 1 0 2 0 3 0\n".write(
             to: sparse.appendingPathComponent("points3D.txt"),
             atomically: true,
             encoding: .utf8
@@ -3641,7 +3643,7 @@ final class PipelineIntegrationTests: XCTestCase {
         try paths.ensureDirectories()
         let sourcePhotos = temp.appendingPathComponent("SourcePhotos", isDirectory: true)
         try FileManager.default.createDirectory(at: sourcePhotos, withIntermediateDirectories: true)
-        for index in 0..<2 {
+        for index in 0..<3 {
             try writeTestImage(
                 url: sourcePhotos.appendingPathComponent("img\(index).jpg"),
                 value: UInt8(index * 40)
@@ -3652,7 +3654,7 @@ final class PipelineIntegrationTests: XCTestCase {
             to: paths.importedPhotosURL
         )
 
-        let selectedMappings = try (0..<2).map { index in
+        let selectedMappings = try (0..<3).map { index in
             let name = String(format: "frame_%06d.jpg", index)
             try writeTestImage(
                 url: paths.framesSelectedURL.appendingPathComponent(name),
@@ -3681,12 +3683,14 @@ final class PipelineIntegrationTests: XCTestCase {
         320 240 1
         2 1 0 0 0 0 0 0 1 frame_000001.jpg
         320 240 1
+        3 1 0 0 0 0 0 0 1 frame_000002.jpg
+        320 240 1
         """.write(
             to: sparse.appendingPathComponent("images.txt"),
             atomically: true,
             encoding: .utf8
         )
-        try "1 0 0 1 128 128 128 0.5 1 0 2 0\n".write(
+        try "1 0 0 1 128 128 128 0.5 1 0 2 0 3 0\n".write(
             to: sparse.appendingPathComponent("points3D.txt"),
             atomically: true,
             encoding: .utf8
@@ -3758,8 +3762,8 @@ final class PipelineIntegrationTests: XCTestCase {
             reconstruction: ReconstructionSummary(
                 mapper: "colmap",
                 capturedAt: Date(timeIntervalSince1970: 1),
-                registeredImages: 2,
-                totalImages: 2
+                registeredImages: 3,
+                totalImages: 3
             )
         )
         try persistGeometryArtifactFixture(metadata: &metadata, paths: paths)
@@ -3899,7 +3903,7 @@ final class PipelineIntegrationTests: XCTestCase {
         let projectURL = temp.appendingPathComponent("Test.easysplatproj", isDirectory: true)
         let sourcePhotos = temp.appendingPathComponent("SourcePhotos", isDirectory: true)
         try FileManager.default.createDirectory(at: sourcePhotos, withIntermediateDirectories: true)
-        for index in 0..<2 {
+        for index in 0..<3 {
             try writeTestImage(url: sourcePhotos.appendingPathComponent("img\(index).jpg"), value: UInt8(index % 255))
         }
 
@@ -3949,7 +3953,7 @@ final class PipelineIntegrationTests: XCTestCase {
                     pointCount: 20
                 )
             }),
-            .init(path: toolchain.colmap.path, argsPrefix: ["model_analyzer"], result: .init(exitCode: 0, terminationReason: .exit, stdout: "Registered images: 2 / 2\nPoints: 16000\nObservations: 32000\nMean track length: 2.0\nMean reprojection error: 0.8\n", stderr: ""), onRun: nil)
+            .init(path: toolchain.colmap.path, argsPrefix: ["model_analyzer"], result: .init(exitCode: 0, terminationReason: .exit, stdout: "Registered images: 3 / 3\nPoints: 16000\nObservations: 48000\nMean track length: 3.0\nMean reprojection error: 0.8\n", stderr: ""), onRun: nil)
         ])
 
         let pipeline = PipelineRunner(
@@ -4000,7 +4004,7 @@ final class PipelineIntegrationTests: XCTestCase {
         let projectURL = temp.appendingPathComponent("ResidualFallback.easysplatproj", isDirectory: true)
         let sourcePhotos = temp.appendingPathComponent("SourcePhotos", isDirectory: true)
         try FileManager.default.createDirectory(at: sourcePhotos, withIntermediateDirectories: true)
-        for index in 0..<2 {
+        for index in 0..<3 {
             try writeTestImage(
                 url: sourcePhotos.appendingPathComponent("img\(index).jpg"),
                 value: UInt8(index)
@@ -4016,7 +4020,7 @@ final class PipelineIntegrationTests: XCTestCase {
         try paths.ensureDirectories()
         try ProjectMetadataStore.save(metadata, to: paths.metadataURL)
         let toolchain = try makeToolchain(root: temp, createDa3Files: true)
-        let acceptedReport = "Registered images: 2 / 2\nPoints: 16000\nObservations: 32000\nMean track length: 2.0\nMean reprojection error: 0.8\n"
+        let acceptedReport = "Registered images: 3 / 3\nPoints: 16000\nObservations: 48000\nMean track length: 3.0\nMean reprojection error: 0.8\n"
         let runner = MockSubprocessRunner(scripts: [
             .init(
                 path: toolchain.da3.sfmTool.path,
@@ -4073,7 +4077,11 @@ final class PipelineIntegrationTests: XCTestCase {
                     guard let output = self.value(for: "--output_path", in: args) else { return }
                     try? self.writeDa3SparseModel(
                         at: URL(fileURLWithPath: output).appendingPathComponent("0", isDirectory: true),
-                        imageNames: ["frame_000000.jpg", "frame_000001.jpg"],
+                        imageNames: [
+                            "frame_000000.jpg",
+                            "frame_000001.jpg",
+                            "frame_000002.jpg",
+                        ],
                         pointCount: 4
                     )
                 }
@@ -4219,7 +4227,7 @@ final class PipelineIntegrationTests: XCTestCase {
         )
         let sourcePhotos = temp.appendingPathComponent("SourcePhotos", isDirectory: true)
         try FileManager.default.createDirectory(at: sourcePhotos, withIntermediateDirectories: true)
-        for index in 0..<2 {
+        for index in 0..<3 {
             try writeTestImage(
                 url: sourcePhotos.appendingPathComponent("img\(index).jpg"),
                 value: UInt8(index)
@@ -4591,6 +4599,7 @@ final class PipelineIntegrationTests: XCTestCase {
         try FileManager.default.createDirectory(at: sourcePhotos, withIntermediateDirectories: true)
         try writeTestImage(url: sourcePhotos.appendingPathComponent("img1.jpg"), value: 20)
         try writeTestImage(url: sourcePhotos.appendingPathComponent("img2.jpg"), value: 40)
+        try writeTestImage(url: sourcePhotos.appendingPathComponent("img3.jpg"), value: 60)
 
         let metadata = ProjectMetadata(title: "Test",
                                        input: .photos(folder: sourcePhotos.path),
@@ -4601,23 +4610,27 @@ final class PipelineIntegrationTests: XCTestCase {
 
         let toolchain = try makeToolchain(root: temp)
         let belowCoverageReport = """
-        Registered images: 8 / 10
+        Registered images: 2 / 3
         Points: 100
-        Observations: 300
-        Mean track length: 3.0
+        Observations: 200
+        Mean track length: 2.0
         Mean reprojection error: 0.8
         """
 
         let runner = MockSubprocessRunner(scripts: [
             .init(path: toolchain.colmap.path, argsPrefix: ["feature_extractor"], result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""), onRun: { try? self.writeFeatureDatabase(for: $0) }),
             .init(path: toolchain.colmap.path, argsPrefix: ["matches_importer"], result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""), onRun: { try? self.writeVerifiedPairResults(for: $0) }),
-            .init(path: toolchain.colmap.path, argsPrefix: ["mapper"], result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""), onRun: { _ in try? self.writeSparseModel(at: projectURL) }),
+            .init(path: toolchain.colmap.path, argsPrefix: ["mapper"], result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""), onRun: { _ in
+                try? self.writeSparseModel(at: projectURL, registeredImageCount: 2, pointCount: 100)
+            }),
             .init(path: toolchain.colmap.path, argsPrefix: ["model_analyzer"], result: .init(exitCode: 0, terminationReason: .exit, stdout: belowCoverageReport, stderr: ""), onRun: nil),
             .init(path: toolchain.colmap.path, argsPrefix: ["matches_importer"], result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""), onRun: { args in
                 XCTAssertEqual(self.value(for: "--SiftMatching.cpu_brute_force_matcher", in: args), "1")
                 try? self.writeVerifiedPairResults(for: args)
             }),
-            .init(path: toolchain.colmap.path, argsPrefix: ["mapper"], result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""), onRun: { _ in try? self.writeSparseModel(at: projectURL) }),
+            .init(path: toolchain.colmap.path, argsPrefix: ["mapper"], result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""), onRun: { _ in
+                try? self.writeSparseModel(at: projectURL, registeredImageCount: 2, pointCount: 100)
+            }),
             .init(path: toolchain.colmap.path, argsPrefix: ["model_analyzer"], result: .init(exitCode: 0, terminationReason: .exit, stdout: belowCoverageReport, stderr: ""), onRun: nil),
         ])
 
@@ -4668,15 +4681,16 @@ final class PipelineIntegrationTests: XCTestCase {
         }
     }
 
-    func testPipelineFailsWhenOnlyOneUsableImageRemains() async throws {
+    func testPipelineFailsWhenOnlyTwoUsableImagesRemain() async throws {
         let temp = makeTempRoot()
-        let projectURL = temp.appendingPathComponent("OneImage.easysplatproj", isDirectory: true)
+        let projectURL = temp.appendingPathComponent("TwoImages.easysplatproj", isDirectory: true)
         let sourcePhotos = temp.appendingPathComponent("SourcePhotos", isDirectory: true)
         try FileManager.default.createDirectory(at: sourcePhotos, withIntermediateDirectories: true)
         try writeTestImage(url: sourcePhotos.appendingPathComponent("img0.jpg"), value: 42)
+        try writeTestImage(url: sourcePhotos.appendingPathComponent("img1.jpg"), value: 84)
 
         let metadata = ProjectMetadata(
-            title: "OneImage",
+            title: "TwoImages",
             input: .photos(folder: sourcePhotos.path),
             requestedRunOptions: RequestedRunOptions(capturePath: .orbit, detailProfile: .fast)
         )
@@ -4697,7 +4711,7 @@ final class PipelineIntegrationTests: XCTestCase {
         }
 
         let saved = try ProjectMetadataStore.load(from: paths.metadataURL)
-        XCTAssertEqual(saved.state.lastError, "At least two usable photos or video frames are required.")
+        XCTAssertEqual(saved.state.lastError, "At least 3 usable photos or video frames are required.")
         XCTAssertTrue(runner.calls.isEmpty)
     }
 
@@ -4708,6 +4722,7 @@ final class PipelineIntegrationTests: XCTestCase {
         try FileManager.default.createDirectory(at: sourcePhotos, withIntermediateDirectories: true)
         try writeTestImage(url: sourcePhotos.appendingPathComponent("img1.jpg"), value: 20)
         try writeTestImage(url: sourcePhotos.appendingPathComponent("img2.jpg"), value: 40)
+        try writeTestImage(url: sourcePhotos.appendingPathComponent("img3.jpg"), value: 60)
 
         let metadata = ProjectMetadata(title: "Test",
                                        input: .photos(folder: sourcePhotos.path),

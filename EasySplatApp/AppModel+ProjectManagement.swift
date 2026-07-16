@@ -39,7 +39,7 @@ extension AppModel {
             return .useFast
         case .highDetailRequiresMoreMemory:
             return .useBalanced
-        case .noValidPhotos:
+        case .noValidPhotos, .insufficientValidPhotos:
             return nil
         case .photoSelectionExceedsSafeLimit:
             return .useAutomaticPhotoSelection

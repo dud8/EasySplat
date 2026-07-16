@@ -3,12 +3,14 @@ import Foundation
 /// Turns user intent and measured hardware into the fixed contract used by every pipeline stage.
 public enum RunPlanResolver {
     public static let minimumHighDetailMemoryGB = 24.0
+    public static let minimumReconstructionImageCount = 3
 
     public enum ValidationError: Error, LocalizedError, Equatable {
         case continuousMultipleClipsUnsupported
         case fastDetailRequired
         case highDetailRequiresMoreMemory
         case noValidPhotos
+        case insufficientValidPhotos(actual: Int, minimum: Int)
         case photoSelectionExceedsSafeLimit(selected: Int, maximum: Int)
 
         public var errorDescription: String? {
@@ -21,6 +23,9 @@ public enum RunPlanResolver {
                 return "High Detail requires a Mac with at least 24 GB of unified memory. Choose Balanced or Fast."
             case .noValidPhotos:
                 return "This folder has no readable photos. Choose a folder with JPEG, PNG, HEIC, or HEIF images."
+            case let .insufficientValidPhotos(actual, minimum):
+                let noun = actual == 1 ? "photo" : "photos"
+                return "This folder has \(actual) usable \(noun). Choose at least \(minimum) photos from different viewpoints."
             case let .photoSelectionExceedsSafeLimit(selected, maximum):
                 return "This folder has \(selected) valid photos. This run can safely use up to \(maximum). Choose Automatic selection or a smaller folder."
             }
@@ -105,6 +110,7 @@ public enum RunPlanResolver {
     ) throws {
         try validatePhotoSelection(
             validPhotoCount: validPhotoCount,
+            minimum: minimumReconstructionImageCount,
             maximum: maximumValidPhotoCount(for: resolvedPlan)
         )
     }
@@ -114,21 +120,29 @@ public enum RunPlanResolver {
         resolvedPlan: ResolvedRunPlan,
         input: InputSpec
     ) throws {
-        if validPhotoCount == 0, input.hasVideos {
-            return
-        }
         try validatePhotoSelection(
             validPhotoCount: validPhotoCount,
+            minimum: input.hasVideos ? 0 : minimumReconstructionImageCount,
             maximum: maximumValidPhotoCount(for: resolvedPlan, input: input)
         )
     }
 
     private static func validatePhotoSelection(
         validPhotoCount: Int,
+        minimum: Int,
         maximum: Int?
     ) throws {
-        guard validPhotoCount > 0 else {
+        guard validPhotoCount >= 0 else {
             throw ValidationError.noValidPhotos
+        }
+        guard validPhotoCount > 0 || minimum == 0 else {
+            throw ValidationError.noValidPhotos
+        }
+        guard validPhotoCount >= minimum else {
+            throw ValidationError.insufficientValidPhotos(
+                actual: validPhotoCount,
+                minimum: minimum
+            )
         }
         guard let maximum, validPhotoCount > maximum else { return }
         throw ValidationError.photoSelectionExceedsSafeLimit(

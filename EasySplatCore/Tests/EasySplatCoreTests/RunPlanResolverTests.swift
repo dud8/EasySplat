@@ -697,6 +697,32 @@ final class RunPlanResolverTests: XCTestCase {
         }
     }
 
+    func testPhotoOnlyPreflightRequiresThreeUsableViews() {
+        let input = InputSpec.photos(folder: "/tmp/photos")
+        let plan = RunPlanResolver.resolve(
+            requestedOptions: RequestedRunOptions(),
+            input: input,
+            hardware: HardwareProfile(memoryGB: 24, cpuCount: 12, gpuWorkingSetGB: 18),
+            developmentOverrides: .none
+        )
+
+        XCTAssertThrowsError(try RunPlanResolver.validatePhotoSelection(
+            validPhotoCount: 2,
+            resolvedPlan: plan,
+            input: input
+        )) { error in
+            XCTAssertEqual(
+                error as? RunPlanResolver.ValidationError,
+                .insufficientValidPhotos(actual: 2, minimum: 3)
+            )
+        }
+        XCTAssertNoThrow(try RunPlanResolver.validatePhotoSelection(
+            validPhotoCount: 3,
+            resolvedPlan: plan,
+            input: input
+        ))
+    }
+
     func testMixedInputAllowsNoValidPhotosWhenVideoRemains() {
         let input = InputSpec.mixed(
             videos: ["/tmp/walkthrough.mov"],
@@ -711,6 +737,11 @@ final class RunPlanResolverTests: XCTestCase {
 
         XCTAssertNoThrow(try RunPlanResolver.validatePhotoSelection(
             validPhotoCount: 0,
+            resolvedPlan: plan,
+            input: input
+        ))
+        XCTAssertNoThrow(try RunPlanResolver.validatePhotoSelection(
+            validPhotoCount: 2,
             resolvedPlan: plan,
             input: input
         ))

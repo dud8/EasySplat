@@ -12,7 +12,7 @@ final class PipelineFeatureRecoverySafetyTests: XCTestCase {
         defer { try? FileManager.default.removeItem(at: root) }
         let sourcePhotos = root.appendingPathComponent("SourcePhotos", isDirectory: true)
         try TestFileBuilder.createDirectory(sourcePhotos)
-        for index in 0..<2 {
+        for index in 0..<3 {
             XCTAssertTrue(try TestFileBuilder.writeGrayscaleImage(
                 url: sourcePhotos.appendingPathComponent("image_\(index).png"),
                 size: 16,
@@ -106,7 +106,7 @@ final class PipelineFeatureRecoverySafetyTests: XCTestCase {
         defer { try? FileManager.default.removeItem(at: root) }
         let sourcePhotos = root.appendingPathComponent("SourcePhotos", isDirectory: true)
         try TestFileBuilder.createDirectory(sourcePhotos)
-        for index in 0..<2 {
+        for index in 0..<3 {
             XCTAssertTrue(try TestFileBuilder.writeGrayscaleImage(
                 url: sourcePhotos.appendingPathComponent("image_\(index).png"),
                 size: 16,
