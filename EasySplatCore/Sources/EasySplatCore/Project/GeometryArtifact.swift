@@ -116,6 +116,10 @@ public struct PairGraphMeasurement: Codable, Sendable, Equatable {
     public var connectedComponentCount: Int
     public var isolatedViewCount: Int
     public var descriptorlessViewCount: Int
+    public var articulationViewCount: Int
+    public var biconnectedBlockCount: Int
+    public var largestBiconnectedBlockViewCount: Int
+    public var secondLargestBiconnectedBlockViewCount: Int
     public var degreeP10: Int
     public var degreeMedian: Int
     public var degreeP90: Int
@@ -136,6 +140,10 @@ public struct PairGraphMeasurement: Codable, Sendable, Equatable {
         connectedComponentCount: Int,
         isolatedViewCount: Int,
         descriptorlessViewCount: Int = 0,
+        articulationViewCount: Int,
+        biconnectedBlockCount: Int,
+        largestBiconnectedBlockViewCount: Int,
+        secondLargestBiconnectedBlockViewCount: Int,
         degreeP10: Int,
         degreeMedian: Int,
         degreeP90: Int,
@@ -155,6 +163,10 @@ public struct PairGraphMeasurement: Codable, Sendable, Equatable {
         self.connectedComponentCount = connectedComponentCount
         self.isolatedViewCount = isolatedViewCount
         self.descriptorlessViewCount = descriptorlessViewCount
+        self.articulationViewCount = articulationViewCount
+        self.biconnectedBlockCount = biconnectedBlockCount
+        self.largestBiconnectedBlockViewCount = largestBiconnectedBlockViewCount
+        self.secondLargestBiconnectedBlockViewCount = secondLargestBiconnectedBlockViewCount
         self.degreeP10 = degreeP10
         self.degreeMedian = degreeMedian
         self.degreeP90 = degreeP90
@@ -343,7 +355,7 @@ public struct CanonicalOrientationArtifact: Codable, Sendable, Equatable {
 }
 
 public struct GeometryArtifact: Codable, Sendable, Equatable {
-    public static let currentSchemaVersion = 6
+    public static let currentSchemaVersion = 7
 
     public var schemaVersion: Int
     public var solverVersion: String

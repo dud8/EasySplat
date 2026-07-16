@@ -357,8 +357,28 @@ final class PipelineIntegrationTests: XCTestCase {
         XCTAssertNil(geometry.provenance.model)
         XCTAssertEqual(geometry.pairGraph.status, .measured)
         let pairGraph = try XCTUnwrap(geometry.pairGraph.measurement)
+        let pairEvidence = try PairGraphEvidenceStore.load(
+            from: paths.pairGraphEvidenceURL,
+            projectPaths: paths
+        )
         XCTAssertEqual(pairGraph.connectedComponentCount, 1)
         XCTAssertEqual(pairGraph.isolatedViewCount, 0)
+        XCTAssertEqual(
+            pairGraph.articulationViewCount,
+            pairEvidence.acceptedInspection.articulationViewCount
+        )
+        XCTAssertEqual(
+            pairGraph.biconnectedBlockCount,
+            pairEvidence.acceptedInspection.biconnectedBlockCount
+        )
+        XCTAssertEqual(
+            pairGraph.largestBiconnectedBlockViewCount,
+            pairEvidence.acceptedInspection.largestBiconnectedBlockViewCount
+        )
+        XCTAssertEqual(
+            pairGraph.secondLargestBiconnectedBlockViewCount,
+            pairEvidence.acceptedInspection.secondLargestBiconnectedBlockViewCount
+        )
         XCTAssertGreaterThan(pairGraph.retrievalPairCount, 0)
         XCTAssertEqual(geometry.pairGraph.mappingAttemptNumber, 1)
         XCTAssertEqual(geometry.pairGraph.bundleAdjustmentCycleCount, 2)
@@ -671,6 +691,42 @@ final class PipelineIntegrationTests: XCTestCase {
         )
         XCTAssertEqual(geometry.registeredViewCount, 59)
         XCTAssertEqual(geometry.pairGraph.measurement?.descriptorlessViewCount, 1)
+        XCTAssertEqual(
+            geometry.pairGraph.measurement?.articulationViewCount,
+            evidence.acceptedInspection.articulationViewCount
+        )
+        XCTAssertEqual(
+            geometry.pairGraph.measurement?.biconnectedBlockCount,
+            evidence.acceptedInspection.biconnectedBlockCount
+        )
+
+        var tampered = evidence
+        let descriptorBearingViewCount = tampered.imageNames.count
+            - tampered.acceptedInspection.descriptorlessViewCount
+        if tampered.acceptedInspection.biconnectedBlockCount == 1 {
+            tampered.acceptedInspection.articulationViewCount = 1
+            tampered.acceptedInspection.biconnectedBlockCount = 2
+            tampered.acceptedInspection.largestBiconnectedBlockViewCount
+                = descriptorBearingViewCount - 1
+            tampered.acceptedInspection.secondLargestBiconnectedBlockViewCount = 2
+        } else {
+            tampered.acceptedInspection.articulationViewCount = 0
+            tampered.acceptedInspection.biconnectedBlockCount = 1
+            tampered.acceptedInspection.largestBiconnectedBlockViewCount
+                = descriptorBearingViewCount
+            tampered.acceptedInspection.secondLargestBiconnectedBlockViewCount = 0
+        }
+        try PairGraphEvidenceStore.save(
+            tampered,
+            to: fixture.paths.pairGraphEvidenceURL,
+            projectPaths: fixture.paths
+        )
+        XCTAssertThrowsError(try PairGraphEvidenceStore.loadVerified(
+            from: fixture.paths.pairGraphEvidenceURL,
+            expectedImageNames: selectedImageNames(in: fixture.paths),
+            databaseURL: fixture.paths.colmapDatabaseURL,
+            projectPaths: fixture.paths
+        ))
     }
 
     func testDisconnectedFaissGraphUsesTargetedExactSchedule() async throws {

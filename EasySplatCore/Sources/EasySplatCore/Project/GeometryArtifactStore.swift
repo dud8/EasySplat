@@ -343,6 +343,7 @@ enum GeometryArtifactStore {
                 throw Error.invalidPairGraph
             }
             let matchableViewCount = totalViewCount - descriptorlessViewCount
+            let hasSingleBiconnectedBlock = measurement.biconnectedBlockCount == 1
             guard matchableViewCount >= 2,
                   registeredViewCount <= matchableViewCount,
                   measurement.scheduledPairCount >= 0,
@@ -365,6 +366,24 @@ enum GeometryArtifactStore {
                   measurement.connectedComponentCount == descriptorlessViewCount + 1,
                   measurement.isolatedViewCount == descriptorlessViewCount,
                   measurement.spatiallyVerifiedPairCount >= matchableViewCount - 1,
+                  measurement.articulationViewCount >= 0,
+                  measurement.articulationViewCount <= matchableViewCount - 2,
+                  measurement.biconnectedBlockCount >= 1,
+                  measurement.biconnectedBlockCount
+                    <= min(measurement.spatiallyVerifiedPairCount, matchableViewCount - 1),
+                  measurement.articulationViewCount < measurement.biconnectedBlockCount,
+                  measurement.largestBiconnectedBlockViewCount >= 2,
+                  measurement.largestBiconnectedBlockViewCount <= matchableViewCount,
+                  measurement.secondLargestBiconnectedBlockViewCount >= 0,
+                  measurement.secondLargestBiconnectedBlockViewCount
+                    <= measurement.largestBiconnectedBlockViewCount,
+                  hasSingleBiconnectedBlock
+                    ? measurement.articulationViewCount == 0
+                        && measurement.largestBiconnectedBlockViewCount == matchableViewCount
+                        && measurement.secondLargestBiconnectedBlockViewCount == 0
+                    : measurement.articulationViewCount > 0
+                        && measurement.largestBiconnectedBlockViewCount < matchableViewCount
+                        && measurement.secondLargestBiconnectedBlockViewCount >= 2,
                   measurement.degreeP10 >= 0,
                   measurement.degreeP10 <= measurement.degreeMedian,
                   measurement.degreeMedian <= measurement.degreeP90,

@@ -5,7 +5,7 @@ public enum ProjectMetadataStore {
     private static let maximumMetadataBytes = 8 * 1_024 * 1_024
     private static let fileLocks = ProjectMetadataFileLocks()
     /// The one project format this beta reads and writes.
-    public static let supportedFormatVersion: Int = 5
+    public static let supportedFormatVersion: Int = 6
 
     public enum LoadError: Error, LocalizedError {
         case unsupportedFormatVersion(Int)

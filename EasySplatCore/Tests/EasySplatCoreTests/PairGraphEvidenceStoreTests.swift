@@ -27,6 +27,10 @@ final class PairGraphEvidenceStoreTests: XCTestCase {
         XCTAssertEqual(measurement.retrievalPairCount, 1)
         XCTAssertEqual(measurement.loopRevisitPairCount, 1)
         XCTAssertEqual(measurement.descriptorlessViewCount, 0)
+        XCTAssertEqual(measurement.articulationViewCount, 2)
+        XCTAssertEqual(measurement.biconnectedBlockCount, 3)
+        XCTAssertEqual(measurement.largestBiconnectedBlockViewCount, 2)
+        XCTAssertEqual(measurement.secondLargestBiconnectedBlockViewCount, 2)
         XCTAssertEqual(measurement.matcherAttempts, evidence.attempts.map(\.artifact))
         XCTAssertEqual(measurement.matchingDurationSeconds, 4)
         XCTAssertEqual(loaded.fallbackReasons, ["denser pair graph"])
@@ -313,6 +317,55 @@ final class PairGraphEvidenceStoreTests: XCTestCase {
         ))
     }
 
+    func testSaveRejectsIncoherentBiconnectedGraphFacts() throws {
+        let fixture = try makeProject()
+        defer { try? FileManager.default.removeItem(at: fixture.root) }
+        let mutations: [(inout PersistedColmapPairGraphInspection) -> Void] = [
+            { $0.articulationViewCount = -1 },
+            { $0.articulationViewCount = 3 },
+            { $0.biconnectedBlockCount = 0 },
+            { $0.biconnectedBlockCount = 4 },
+            { $0.largestBiconnectedBlockViewCount = 5 },
+            { $0.secondLargestBiconnectedBlockViewCount = 3 },
+            {
+                $0.articulationViewCount = 0
+                $0.biconnectedBlockCount = 3
+            },
+            {
+                $0.articulationViewCount = 0
+                $0.biconnectedBlockCount = 1
+                $0.largestBiconnectedBlockViewCount = 2
+                $0.secondLargestBiconnectedBlockViewCount = 0
+            },
+        ]
+
+        for mutate in mutations {
+            var evidence = makeEvidence()
+            mutate(&evidence.acceptedInspection)
+            XCTAssertThrowsError(try PairGraphEvidenceStore.save(
+                evidence,
+                to: fixture.paths.pairGraphEvidenceURL,
+                projectPaths: fixture.paths
+            ))
+        }
+    }
+
+    func testLoadRejectsRetiredSchemaBeforeStrictPayloadDecoding() throws {
+        let fixture = try makeProject()
+        defer { try? FileManager.default.removeItem(at: fixture.root) }
+        try Data(#"{"schemaVersion":3,"retiredPayload":true}"#.utf8).write(
+            to: fixture.paths.pairGraphEvidenceURL,
+            options: [.atomic]
+        )
+
+        XCTAssertThrowsError(try PairGraphEvidenceStore.load(
+            from: fixture.paths.pairGraphEvidenceURL,
+            projectPaths: fixture.paths
+        )) { error in
+            XCTAssertEqual(error as? PairGraphEvidenceStoreError, .invalidSchema(3))
+        }
+    }
+
     func testDescriptorlessSingletonEvidenceRoundTripsWithoutFlatteningGraphFacts() throws {
         let fixture = try makeProject()
         defer { try? FileManager.default.removeItem(at: fixture.root) }
@@ -331,6 +384,10 @@ final class PairGraphEvidenceStoreTests: XCTestCase {
         XCTAssertEqual(loaded.acceptedInspection.connectedComponentCount, 2)
         XCTAssertEqual(loaded.acceptedInspection.isolatedViewCount, 1)
         XCTAssertEqual(loaded.acceptedInspection.descriptorlessViewCount, 1)
+        XCTAssertEqual(loaded.acceptedInspection.articulationViewCount, 0)
+        XCTAssertEqual(loaded.acceptedInspection.biconnectedBlockCount, 1)
+        XCTAssertEqual(loaded.acceptedInspection.largestBiconnectedBlockViewCount, 3)
+        XCTAssertEqual(loaded.acceptedInspection.secondLargestBiconnectedBlockViewCount, 0)
         XCTAssertEqual(try loaded.pairGraphMeasurement().descriptorlessViewCount, 1)
     }
 
@@ -363,13 +420,13 @@ final class PairGraphEvidenceStoreTests: XCTestCase {
         ))
 
         evidence = makeDescriptorlessEvidence()
-        evidence.schemaVersion = 2
+        evidence.schemaVersion = 3
         XCTAssertThrowsError(try PairGraphEvidenceStore.save(
             evidence,
             to: fixture.paths.pairGraphEvidenceURL,
             projectPaths: fixture.paths
         )) { error in
-            XCTAssertEqual(error as? PairGraphEvidenceStoreError, .invalidSchema(2))
+            XCTAssertEqual(error as? PairGraphEvidenceStoreError, .invalidSchema(3))
         }
     }
 
@@ -553,6 +610,10 @@ final class PairGraphEvidenceStoreTests: XCTestCase {
             loopRevisitPairCount: 1,
             connectedComponentCount: 1,
             isolatedViewCount: 0,
+            articulationViewCount: 2,
+            biconnectedBlockCount: 3,
+            largestBiconnectedBlockViewCount: 2,
+            secondLargestBiconnectedBlockViewCount: 2,
             degreeP10: 1,
             degreeMedian: 2,
             degreeP90: 2,
@@ -628,6 +689,7 @@ final class PairGraphEvidenceStoreTests: XCTestCase {
         let acceptedPairs = attempts.last?.scheduledPairs ?? []
         let acceptedLocalCount = acceptedPairs.count { $0.role == .local }
         let acceptedRetrievalCount = acceptedPairs.count { $0.role == .retrieval }
+        let acceptedIsCycle = includeFullRecovery
         let inspection = ColmapPairGraphInspection(
             scheduledPairCount: acceptedPairs.count,
             attemptedPairCount: acceptedPairs.count,
@@ -638,6 +700,10 @@ final class PairGraphEvidenceStoreTests: XCTestCase {
             loopRevisitPairCount: 0,
             connectedComponentCount: 1,
             isolatedViewCount: 0,
+            articulationViewCount: acceptedIsCycle ? 0 : 2,
+            biconnectedBlockCount: acceptedIsCycle ? 1 : 3,
+            largestBiconnectedBlockViewCount: acceptedIsCycle ? 4 : 2,
+            secondLargestBiconnectedBlockViewCount: acceptedIsCycle ? 0 : 2,
             degreeP10: 1,
             degreeMedian: 2,
             degreeP90: 2,
@@ -687,6 +753,10 @@ final class PairGraphEvidenceStoreTests: XCTestCase {
             loopRevisitPairCount: 0,
             connectedComponentCount: 2,
             isolatedViewCount: 1,
+            articulationViewCount: 0,
+            biconnectedBlockCount: 1,
+            largestBiconnectedBlockViewCount: 3,
+            secondLargestBiconnectedBlockViewCount: 0,
             degreeP10: 0,
             degreeMedian: 2,
             degreeP90: 2,

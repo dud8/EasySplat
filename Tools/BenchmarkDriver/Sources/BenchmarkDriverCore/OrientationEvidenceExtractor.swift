@@ -1,5 +1,6 @@
 import CryptoKit
 import Darwin
+import EasySplatCore
 import Foundation
 
 public enum OrientationBenchmarkStatus: String, Codable, Sendable {
@@ -204,7 +205,7 @@ public enum OrientationEvidenceExtractor {
     }
 
     private static func validateManifestContract(_ manifest: GeometryManifest) throws {
-        guard manifest.schemaVersion == 5 else {
+        guard manifest.schemaVersion == GeometryArtifact.currentSchemaVersion else {
             throw invalid("The geometry manifest uses an unsupported schema.")
         }
         guard manifest.poseConvention == "world-to-camera",

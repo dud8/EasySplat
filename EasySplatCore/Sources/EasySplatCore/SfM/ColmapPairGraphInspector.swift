@@ -26,6 +26,10 @@ struct ColmapPairGraphInspection: Sendable, Equatable {
     let loopRevisitPairCount: Int
     let connectedComponentCount: Int
     let isolatedViewCount: Int
+    let articulationViewCount: Int
+    let biconnectedBlockCount: Int
+    let largestBiconnectedBlockViewCount: Int
+    let secondLargestBiconnectedBlockViewCount: Int
     let degreeP10: Int
     let degreeMedian: Int
     let degreeP90: Int
@@ -283,9 +287,13 @@ struct ColmapPairGraphInspector: Sendable {
             }
             return verifiedPairIDs.contains(pairID)
         }
+        let descriptorlessImageNames = validatedSchedule.imageNames.filter { name in
+            imageIDByName[name].map(descriptorlessImageIDs.contains) ?? false
+        }
         let graph = try graphSnapshot(
             imageNames: validatedSchedule.imageNames,
-            verifiedPairs: verifiedPairs
+            verifiedPairs: verifiedPairs,
+            descriptorlessImageNames: Set(descriptorlessImageNames)
         )
         let databaseDigests = try ColmapDatabaseDigester.digests(in: database)
         inspection = ColmapPairGraphInspection(
@@ -298,14 +306,16 @@ struct ColmapPairGraphInspector: Sendable {
             loopRevisitPairCount: validatedSchedule.pairs.count(where: { $0.role == .loopRevisit }),
             connectedComponentCount: graph.componentCount,
             isolatedViewCount: graph.isolatedCount,
+            articulationViewCount: graph.articulationCount,
+            biconnectedBlockCount: graph.biconnectedBlockSizes.count,
+            largestBiconnectedBlockViewCount: graph.biconnectedBlockSizes.first ?? 0,
+            secondLargestBiconnectedBlockViewCount: graph.biconnectedBlockSizes.dropFirst().first ?? 0,
             degreeP10: nearestRank(graph.sortedDegrees, percentile: 0.10),
             degreeMedian: nearestRank(graph.sortedDegrees, percentile: 0.50),
             degreeP90: nearestRank(graph.sortedDegrees, percentile: 0.90),
             featureDatabaseDigest: databaseDigests.feature,
             matchingDatabaseDigest: databaseDigests.matching,
-            descriptorlessImageNames: validatedSchedule.imageNames.filter { name in
-                imageIDByName[name].map(descriptorlessImageIDs.contains) ?? false
-            },
+            descriptorlessImageNames: descriptorlessImageNames,
             verifiedGraph: graph.snapshot
         )
         try Task.checkCancellation()
@@ -640,11 +650,14 @@ struct ColmapPairGraphInspector: Sendable {
 
     private func graphSnapshot(
         imageNames: [String],
-        verifiedPairs: [ColmapScheduledPair]
+        verifiedPairs: [ColmapScheduledPair],
+        descriptorlessImageNames: Set<String>
     ) throws -> (
         componentCount: Int,
         isolatedCount: Int,
         sortedDegrees: [Int],
+        articulationCount: Int,
+        biconnectedBlockSizes: [Int],
         snapshot: ColmapVerifiedGraphSnapshot
     ) {
         let indexByName = Dictionary(uniqueKeysWithValues: imageNames.enumerated().map {
@@ -689,15 +702,162 @@ struct ColmapPairGraphInspector: Sendable {
             indexByName[first[0]]! < indexByName[second[0]]!
         }
         let sortedDegrees = degrees.sorted()
+        let robustness = try biconnectedRobustness(
+            imageNames: imageNames,
+            verifiedPairs: verifiedPairs,
+            descriptorlessImageNames: descriptorlessImageNames,
+            indexByName: indexByName
+        )
         return (
             componentCount: components.count,
             isolatedCount: sortedDegrees.count(where: { $0 == 0 }),
             sortedDegrees: sortedDegrees,
+            articulationCount: robustness.articulationCount,
+            biconnectedBlockSizes: robustness.blockSizes,
             snapshot: ColmapVerifiedGraphSnapshot(
                 verifiedPairs: verifiedPairs,
                 components: components
             )
         )
+    }
+
+    private func biconnectedRobustness(
+        imageNames: [String],
+        verifiedPairs: [ColmapScheduledPair],
+        descriptorlessImageNames: Set<String>,
+        indexByName: [String: Int]
+    ) throws -> (articulationCount: Int, blockSizes: [Int]) {
+        struct Edge: Sendable {
+            let id: Int
+            let first: Int
+            let second: Int
+
+            func other(than vertex: Int) -> Int {
+                vertex == first ? second : first
+            }
+        }
+        struct Frame: Sendable {
+            let vertex: Int
+            var nextEdgeIndex: Int
+        }
+
+        var adjacency = Array(repeating: [Edge](), count: imageNames.count)
+        for (edgeID, pair) in verifiedPairs.enumerated() {
+            try Task.checkCancellation()
+            if descriptorlessImageNames.contains(pair.firstImageName)
+                || descriptorlessImageNames.contains(pair.secondImageName) {
+                continue
+            }
+            guard let first = indexByName[pair.firstImageName],
+                  let second = indexByName[pair.secondImageName] else {
+                throw ColmapPairGraphInspectorError.scheduledPairUnknownImage(
+                    indexByName[pair.firstImageName] == nil
+                        ? pair.firstImageName
+                        : pair.secondImageName
+                )
+            }
+            let edge = Edge(id: edgeID, first: first, second: second)
+            adjacency[first].append(edge)
+            adjacency[second].append(edge)
+        }
+
+        var discovery = Array(repeating: -1, count: imageNames.count)
+        var low = Array(repeating: 0, count: imageNames.count)
+        var parent = Array(repeating: -1, count: imageNames.count)
+        var parentEdge = Array(repeating: -1, count: imageNames.count)
+        var childCount = Array(repeating: 0, count: imageNames.count)
+        var articulationVertices: Set<Int> = []
+        var edgeStack: [Edge] = []
+        var blockSizes: [Int] = []
+        var timestamp = 0
+
+        // Blocks partition verified edges: bridges form two-view blocks, while
+        // isolated and descriptorless views form no block.
+        func popBlock(endingAt edgeID: Int) throws -> Int {
+            var vertices: Set<Int> = []
+            var foundBoundary = false
+            while let edge = edgeStack.popLast() {
+                try Task.checkCancellation()
+                vertices.insert(edge.first)
+                vertices.insert(edge.second)
+                if edge.id == edgeID {
+                    foundBoundary = true
+                    break
+                }
+            }
+            guard foundBoundary else {
+                throw ColmapPairGraphInspectorError.malformedSchema(
+                    table: "two_view_geometries",
+                    message: "verified graph block boundary is missing"
+                )
+            }
+            return vertices.count
+        }
+
+        for root in imageNames.indices {
+            try Task.checkCancellation()
+            guard !descriptorlessImageNames.contains(imageNames[root]),
+                  discovery[root] == -1 else {
+                continue
+            }
+            discovery[root] = timestamp
+            low[root] = timestamp
+            timestamp += 1
+            var traversal = [Frame(vertex: root, nextEdgeIndex: 0)]
+
+            while !traversal.isEmpty {
+                try Task.checkCancellation()
+                let vertex = traversal[traversal.count - 1].vertex
+                let nextEdgeIndex = traversal[traversal.count - 1].nextEdgeIndex
+                if nextEdgeIndex < adjacency[vertex].count {
+                    let edge = adjacency[vertex][nextEdgeIndex]
+                    traversal[traversal.count - 1].nextEdgeIndex += 1
+                    let neighbor = edge.other(than: vertex)
+                    if discovery[neighbor] == -1 {
+                        parent[neighbor] = vertex
+                        parentEdge[neighbor] = edge.id
+                        childCount[vertex] += 1
+                        edgeStack.append(edge)
+                        discovery[neighbor] = timestamp
+                        low[neighbor] = timestamp
+                        timestamp += 1
+                        traversal.append(Frame(vertex: neighbor, nextEdgeIndex: 0))
+                    } else if edge.id != parentEdge[vertex],
+                              discovery[neighbor] < discovery[vertex] {
+                        low[vertex] = min(low[vertex], discovery[neighbor])
+                        edgeStack.append(edge)
+                    }
+                    continue
+                }
+
+                traversal.removeLast()
+                let parentVertex = parent[vertex]
+                guard parentVertex != -1 else {
+                    if childCount[vertex] > 1 {
+                        articulationVertices.insert(vertex)
+                    }
+                    continue
+                }
+                low[parentVertex] = min(low[parentVertex], low[vertex])
+                if low[vertex] >= discovery[parentVertex] {
+                    if parent[parentVertex] != -1 || childCount[parentVertex] > 1 {
+                        articulationVertices.insert(parentVertex)
+                    }
+                    let blockSize = try popBlock(endingAt: parentEdge[vertex])
+                    if blockSize > 0 { blockSizes.append(blockSize) }
+                }
+            }
+            // Each DFS tree drains its own edges at articulation boundaries.
+            guard edgeStack.isEmpty else {
+                throw ColmapPairGraphInspectorError.malformedSchema(
+                    table: "two_view_geometries",
+                    message: "verified graph traversal left unassigned edges"
+                )
+            }
+        }
+
+        blockSizes.sort(by: >)
+        return (articulationVertices.count, blockSizes)
     }
 
     private func nearestRank(_ sortedValues: [Int], percentile: Double) -> Int {

@@ -53,9 +53,9 @@ final class GeometryArtifactStoreTests: XCTestCase {
         }
     }
 
-    func testLoadRejectsSchemaFiveBeforeDecodingRetiredPairGraphState() throws {
+    func testLoadRejectsSchemaSixBeforeDecodingRetiredPairGraphState() throws {
         let baselineSchemaVersion = GeometryArtifact.currentSchemaVersion - 1
-        XCTAssertEqual(baselineSchemaVersion, 5)
+        XCTAssertEqual(baselineSchemaVersion, 6)
 
         let root = try TestFileBuilder.makeTempDir()
         defer { try? FileManager.default.removeItem(at: root) }
@@ -603,6 +603,44 @@ final class GeometryArtifactStoreTests: XCTestCase {
         }
     }
 
+    func testMeasuredPairGraphValidatesSingleAndMultipleBiconnectedBlocks() throws {
+        let root = try TestFileBuilder.makeTempDir()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let paths = ProjectPaths(root: root)
+        try paths.ensureDirectories()
+        let fixture = try writeDescriptorlessGeometryFixture(at: paths)
+        let multipleBlocks = makeDescriptorlessMeasuredArtifact(fixture: fixture)
+
+        XCTAssertNoThrow(try GeometryArtifactStore.validate(multipleBlocks, projectPaths: paths))
+
+        var singleBlock = multipleBlocks
+        singleBlock.pairGraph.measurement?.rawMatchedPairCount = 9
+        singleBlock.pairGraph.measurement?.spatiallyVerifiedPairCount = 9
+        singleBlock.pairGraph.measurement?.matcherAttempts[0].rawMatchedPairCount = 9
+        singleBlock.pairGraph.measurement?.matcherAttempts[0].spatiallyVerifiedPairCount = 9
+        singleBlock.pairGraph.measurement?.articulationViewCount = 0
+        singleBlock.pairGraph.measurement?.biconnectedBlockCount = 1
+        singleBlock.pairGraph.measurement?.largestBiconnectedBlockViewCount = 9
+        singleBlock.pairGraph.measurement?.secondLargestBiconnectedBlockViewCount = 0
+
+        XCTAssertNoThrow(try GeometryArtifactStore.validate(singleBlock, projectPaths: paths))
+
+        singleBlock.pairGraph.measurement?.largestBiconnectedBlockViewCount = 8
+        XCTAssertThrowsError(
+            try GeometryArtifactStore.validate(singleBlock, projectPaths: paths)
+        ) { error in
+            XCTAssertEqual(error as? GeometryArtifactStore.Error, .invalidPairGraph)
+        }
+
+        var multipleWithoutArticulation = multipleBlocks
+        multipleWithoutArticulation.pairGraph.measurement?.articulationViewCount = 0
+        XCTAssertThrowsError(
+            try GeometryArtifactStore.validate(multipleWithoutArticulation, projectPaths: paths)
+        ) { error in
+            XCTAssertEqual(error as? GeometryArtifactStore.Error, .invalidPairGraph)
+        }
+    }
+
     func testRejectsFabricatedPairAndOrientationEvidence() throws {
         let root = try TestFileBuilder.makeTempDir()
         defer { try? FileManager.default.removeItem(at: root) }
@@ -623,6 +661,10 @@ final class GeometryArtifactStoreTests: XCTestCase {
                 loopRevisitPairCount: 0,
                 connectedComponentCount: 1,
                 isolatedViewCount: 1,
+                articulationViewCount: 0,
+                biconnectedBlockCount: 0,
+                largestBiconnectedBlockViewCount: 0,
+                secondLargestBiconnectedBlockViewCount: 0,
                 degreeP10: 0,
                 degreeMedian: 0,
                 degreeP90: 0,
@@ -769,6 +811,10 @@ final class GeometryArtifactStoreTests: XCTestCase {
                 connectedComponentCount: 2,
                 isolatedViewCount: 1,
                 descriptorlessViewCount: 1,
+                articulationViewCount: 7,
+                biconnectedBlockCount: 8,
+                largestBiconnectedBlockViewCount: 2,
+                secondLargestBiconnectedBlockViewCount: 2,
                 degreeP10: 0,
                 degreeMedian: 2,
                 degreeP90: 2,

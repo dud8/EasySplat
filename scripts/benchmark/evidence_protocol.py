@@ -80,6 +80,10 @@ PIPELINE_INTEGER_METRICS = {
     "spatially_verified_pairs",
     "connected_components",
     "isolated_views",
+    "articulation_views",
+    "biconnected_blocks",
+    "largest_biconnected_block_views",
+    "second_largest_biconnected_block_views",
     "local_pairs",
     "retrieval_pairs",
     "loop_pairs",
@@ -2577,6 +2581,10 @@ def derive_metrics(
                     "spatially_verified_pairs",
                     "connected_components",
                     "isolated_views",
+                    "articulation_views",
+                    "biconnected_blocks",
+                    "largest_biconnected_block_views",
+                    "second_largest_biconnected_block_views",
                     "local_pairs",
                     "retrieval_pairs",
                     "loop_pairs",
@@ -4351,6 +4359,93 @@ def _load_bounded_json(path: Path, label: str, maximum_bytes: int = 256 * 1024 *
         raise EvidenceError(f"{label} is not valid JSON") from error
 
 
+def _biconnected_robustness(adjacency: list[set[int]]) -> dict[str, int]:
+    """Measure vertex-biconnected edge blocks without recursive DFS."""
+    edges: list[tuple[int, int]] = []
+    incident_edges: list[list[tuple[int, int]]] = [[] for _ in adjacency]
+    for left, neighbors in enumerate(adjacency):
+        for right in sorted(neighbors):
+            if left >= right:
+                continue
+            edge_id = len(edges)
+            edges.append((left, right))
+            incident_edges[left].append((right, edge_id))
+            incident_edges[right].append((left, edge_id))
+    for incident in incident_edges:
+        incident.sort()
+
+    discovery = [-1] * len(adjacency)
+    low = [-1] * len(adjacency)
+    next_discovery = 0
+    articulation_views: set[int] = set()
+    edge_stack: list[int] = []
+    block_sizes: list[int] = []
+
+    def pop_block(boundary_edge: int | None) -> None:
+        vertices: set[int] = set()
+        while edge_stack:
+            edge_id = edge_stack.pop()
+            vertices.update(edges[edge_id])
+            if edge_id == boundary_edge:
+                block_sizes.append(len(vertices))
+                return
+        if boundary_edge is not None:
+            raise EvidenceError("pair_list verified graph block boundary is corrupt")
+        if vertices:
+            block_sizes.append(len(vertices))
+
+    # Each frame is [vertex, parent edge, next incident index, DFS child count].
+    for root in range(len(adjacency)):
+        if discovery[root] >= 0 or not incident_edges[root]:
+            continue
+        discovery[root] = next_discovery
+        low[root] = next_discovery
+        next_discovery += 1
+        frames = [[root, -1, 0, 0]]
+        while frames:
+            vertex, parent_edge, next_index, child_count = frames[-1]
+            if next_index < len(incident_edges[vertex]):
+                neighbor, edge_id = incident_edges[vertex][next_index]
+                frames[-1][2] += 1
+                if edge_id == parent_edge:
+                    continue
+                if discovery[neighbor] < 0:
+                    frames[-1][3] += 1
+                    edge_stack.append(edge_id)
+                    discovery[neighbor] = next_discovery
+                    low[neighbor] = next_discovery
+                    next_discovery += 1
+                    frames.append([neighbor, edge_id, 0, 0])
+                elif discovery[neighbor] < discovery[vertex]:
+                    edge_stack.append(edge_id)
+                    low[vertex] = min(low[vertex], discovery[neighbor])
+                continue
+
+            frames.pop()
+            if parent_edge < 0:
+                if child_count > 1:
+                    articulation_views.add(vertex)
+                pop_block(None)
+                continue
+
+            parent = frames[-1][0]
+            low[parent] = min(low[parent], low[vertex])
+            if low[vertex] >= discovery[parent]:
+                if frames[-1][1] >= 0:
+                    articulation_views.add(parent)
+                pop_block(parent_edge)
+
+    block_sizes.sort(reverse=True)
+    return {
+        "articulation_views": len(articulation_views),
+        "biconnected_blocks": len(block_sizes),
+        "largest_biconnected_block_views": block_sizes[0] if block_sizes else 0,
+        "second_largest_biconnected_block_views": (
+            block_sizes[1] if len(block_sizes) > 1 else 0
+        ),
+    }
+
+
 def _validate_pair_list(
     pair_list_path: Path,
     selection_manifest_path: Path,
@@ -4771,6 +4866,9 @@ def _validate_pair_list(
         raise EvidenceError("pair_list connected component count does not match pipeline metrics")
     if pipeline_metrics.get("isolated_views") != isolated_views:
         raise EvidenceError("pair_list isolated view count does not match pipeline metrics")
+    for name, count in _biconnected_robustness(adjacency).items():
+        if pipeline_metrics.get(name) != count:
+            raise EvidenceError(f"pair_list {name} does not match pipeline metrics")
 
 
 def produce_attestation(

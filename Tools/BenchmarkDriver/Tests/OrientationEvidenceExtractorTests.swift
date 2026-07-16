@@ -1,4 +1,5 @@
 import Darwin
+import EasySplatCore
 import Foundation
 import XCTest
 @testable import EasySplatBenchmarkDriverCore
@@ -435,7 +436,7 @@ final class OrientationEvidenceExtractorTests: XCTestCase {
         if let evidence { orientation["evidence"] = evidence }
         let imagesDigest = try bareSHA256(fileAt: candidateImages)
         let manifestObject: [String: Any] = [
-            "schemaVersion": 5,
+            "schemaVersion": GeometryArtifact.currentSchemaVersion,
             "poseConvention": "world-to-camera",
             "quaternionOrder": "wxyz",
             "handedness": "right-handed",

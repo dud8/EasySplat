@@ -635,6 +635,10 @@ def passing_metrics() -> dict[str, object]:
             "spatially_verified_pairs": measured(80),
             "connected_components": measured(1),
             "isolated_views": measured(0),
+            "articulation_views": measured(0),
+            "biconnected_blocks": measured(1),
+            "largest_biconnected_block_views": measured(30),
+            "second_largest_biconnected_block_views": measured(0),
             "local_pairs": measured(70),
             "retrieval_pairs": measured(10),
             "loop_pairs": measured(0),
@@ -1277,6 +1281,10 @@ def raw_observations(
             "spatially_verified_pairs": 119,
             "connected_components": 1,
             "isolated_views": 0,
+            "articulation_views": 0,
+            "biconnected_blocks": 1,
+            "largest_biconnected_block_views": 30,
+            "second_largest_biconnected_block_views": 0,
             "local_pairs": 119,
             "retrieval_pairs": 0,
             "loop_pairs": 0,
@@ -1477,7 +1485,7 @@ def write_orientation_evidence_artifacts(
                     },
                     "poseConvention": "world-to-camera",
                     "quaternionOrder": "wxyz",
-                    "schemaVersion": 5,
+                    "schemaVersion": 7,
                 }
             )
             + b"\n"
@@ -2100,6 +2108,10 @@ class ConfigurationValidationTests(unittest.TestCase):
             "spatially_verified_pairs",
             "connected_components",
             "isolated_views",
+            "articulation_views",
+            "biconnected_blocks",
+            "largest_biconnected_block_views",
+            "second_largest_biconnected_block_views",
             "local_pairs",
             "retrieval_pairs",
             "loop_pairs",
@@ -2757,6 +2769,58 @@ class EvidenceProtocolTests(unittest.TestCase):
             abs(first.mean() - second.mean())
         )
 
+    def test_biconnected_robustness_is_iterative_and_component_safe(self) -> None:
+        def graph(view_count: int, edges: list[tuple[int, int]]) -> list[set[int]]:
+            adjacency = [set() for _ in range(view_count)]
+            for left, right in edges:
+                adjacency[left].add(right)
+                adjacency[right].add(left)
+            return adjacency
+
+        cases = {
+            "single edge": (
+                graph(2, [(0, 1)]),
+                {
+                    "articulation_views": 0,
+                    "biconnected_blocks": 1,
+                    "largest_biconnected_block_views": 2,
+                    "second_largest_biconnected_block_views": 0,
+                },
+            ),
+            "bow tie": (
+                graph(5, [(0, 1), (1, 2), (2, 0), (2, 3), (3, 4), (4, 2)]),
+                {
+                    "articulation_views": 1,
+                    "biconnected_blocks": 2,
+                    "largest_biconnected_block_views": 3,
+                    "second_largest_biconnected_block_views": 3,
+                },
+            ),
+            "disconnected cycles and singleton": (
+                graph(8, [(0, 1), (1, 2), (2, 0), (3, 4), (4, 5), (5, 6), (6, 3)]),
+                {
+                    "articulation_views": 0,
+                    "biconnected_blocks": 2,
+                    "largest_biconnected_block_views": 4,
+                    "second_largest_biconnected_block_views": 3,
+                },
+            ),
+        }
+        for label, (adjacency, expected) in cases.items():
+            with self.subTest(case=label):
+                self.assertEqual(evidence._biconnected_robustness(adjacency), expected)
+
+        long_path = graph(3_000, [(index, index + 1) for index in range(2_999)])
+        self.assertEqual(
+            evidence._biconnected_robustness(long_path),
+            {
+                "articulation_views": 2_998,
+                "biconnected_blocks": 2_999,
+                "largest_biconnected_block_views": 2,
+                "second_largest_biconnected_block_views": 2,
+            },
+        )
+
     def tearDown(self) -> None:
         evidence.LPIPS_DISTANCE_OVERRIDE = None
 
@@ -2990,6 +3054,31 @@ class EvidenceProtocolTests(unittest.TestCase):
                     evidence.produce_attestation(
                         evidence_request(),
                         observations,
+                        root,
+                        root / "attestation.json",
+                        self.key,
+                        evidence.LANE_REFERENCE,
+                        runner_identity(evidence.LANE_REFERENCE),
+                        machine=evidence_machine(evidence.LANE_REFERENCE),
+                    )
+
+    def test_pair_list_binds_biconnected_robustness_metrics(self) -> None:
+        observations = raw_observations(evidence.LANE_REFERENCE)
+        for metric in (
+            "articulation_views",
+            "biconnected_blocks",
+            "largest_biconnected_block_views",
+            "second_largest_biconnected_block_views",
+        ):
+            with self.subTest(metric=metric), tempfile.TemporaryDirectory() as directory:
+                changed = json.loads(json.dumps(observations))
+                changed["pipeline_metrics"][metric] += 1
+                root = Path(directory)
+                write_evidence_artifacts(root, changed)
+                with self.assertRaisesRegex(evidence.EvidenceError, f"pair_list {metric}"):
+                    evidence.produce_attestation(
+                        evidence_request(),
+                        changed,
                         root,
                         root / "attestation.json",
                         self.key,
@@ -5279,7 +5368,7 @@ class RunnerIntegrityTests(unittest.TestCase):
             (run_root / "geometry-manifest.json").write_bytes(
                 evidence.canonical_json_bytes(
                     {
-                        "schemaVersion": 5,
+                        "schemaVersion": 7,
                     }
                 )
                 + b"\n"

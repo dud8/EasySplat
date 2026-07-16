@@ -34,6 +34,10 @@ struct PersistedColmapPairGraphInspection: Codable, Sendable, Equatable {
     var connectedComponentCount: Int
     var isolatedViewCount: Int
     var descriptorlessViewCount: Int
+    var articulationViewCount: Int
+    var biconnectedBlockCount: Int
+    var largestBiconnectedBlockViewCount: Int
+    var secondLargestBiconnectedBlockViewCount: Int
     var degreeP10: Int
     var degreeMedian: Int
     var degreeP90: Int
@@ -51,6 +55,10 @@ struct PersistedColmapPairGraphInspection: Codable, Sendable, Equatable {
         connectedComponentCount = inspection.connectedComponentCount
         isolatedViewCount = inspection.isolatedViewCount
         descriptorlessViewCount = inspection.descriptorlessViewCount
+        articulationViewCount = inspection.articulationViewCount
+        biconnectedBlockCount = inspection.biconnectedBlockCount
+        largestBiconnectedBlockViewCount = inspection.largestBiconnectedBlockViewCount
+        secondLargestBiconnectedBlockViewCount = inspection.secondLargestBiconnectedBlockViewCount
         degreeP10 = inspection.degreeP10
         degreeMedian = inspection.degreeMedian
         degreeP90 = inspection.degreeP90
@@ -60,7 +68,7 @@ struct PersistedColmapPairGraphInspection: Codable, Sendable, Equatable {
 }
 
 struct PairGraphEvidence: Codable, Sendable, Equatable {
-    static let currentSchemaVersion = 3
+    static let currentSchemaVersion = 4
 
     var schemaVersion: Int
     var selectedFramesDigest: String
@@ -105,6 +113,10 @@ struct PairGraphEvidence: Codable, Sendable, Equatable {
             connectedComponentCount: acceptedInspection.connectedComponentCount,
             isolatedViewCount: acceptedInspection.isolatedViewCount,
             descriptorlessViewCount: acceptedInspection.descriptorlessViewCount,
+            articulationViewCount: acceptedInspection.articulationViewCount,
+            biconnectedBlockCount: acceptedInspection.biconnectedBlockCount,
+            largestBiconnectedBlockViewCount: acceptedInspection.largestBiconnectedBlockViewCount,
+            secondLargestBiconnectedBlockViewCount: acceptedInspection.secondLargestBiconnectedBlockViewCount,
             degreeP10: acceptedInspection.degreeP10,
             degreeMedian: acceptedInspection.degreeMedian,
             degreeP90: acceptedInspection.degreeP90,
@@ -181,6 +193,15 @@ enum PairGraphEvidenceStore {
             maximumBytes: maximumBytes
         )
         guard !data.isEmpty else { throw PairGraphEvidenceStoreError.invalidEvidence }
+        let envelope: SchemaEnvelope
+        do {
+            envelope = try JSONDecoder().decode(SchemaEnvelope.self, from: data)
+        } catch {
+            throw PairGraphEvidenceStoreError.invalidEvidence
+        }
+        guard envelope.schemaVersion == PairGraphEvidence.currentSchemaVersion else {
+            throw PairGraphEvidenceStoreError.invalidSchema(envelope.schemaVersion)
+        }
         let evidence: PairGraphEvidence
         do {
             evidence = try JSONDecoder().decode(PairGraphEvidence.self, from: data)
@@ -397,6 +418,7 @@ enum PairGraphEvidenceStore {
             throw PairGraphEvidenceStoreError.invalidEvidence
         }
         let matchableViewCount = imageCount - descriptorlessViewCount
+        let hasSingleBiconnectedBlock = inspection.biconnectedBlockCount == 1
         guard inspection.scheduledPairCount == artifact.scheduledPairCount,
               artifact.outcome == .completed,
               inspection.attemptedPairCount == artifact.attemptedPairCount,
@@ -416,6 +438,24 @@ enum PairGraphEvidenceStore {
               matchableViewCount >= 2,
               inspection.connectedComponentCount == descriptorlessViewCount + 1,
               inspection.isolatedViewCount == descriptorlessViewCount,
+              inspection.articulationViewCount >= 0,
+              inspection.articulationViewCount <= matchableViewCount - 2,
+              inspection.biconnectedBlockCount >= 1,
+              inspection.biconnectedBlockCount
+                <= min(inspection.spatiallyVerifiedPairCount, matchableViewCount - 1),
+              inspection.articulationViewCount < inspection.biconnectedBlockCount,
+              inspection.largestBiconnectedBlockViewCount >= 2,
+              inspection.largestBiconnectedBlockViewCount <= matchableViewCount,
+              inspection.secondLargestBiconnectedBlockViewCount >= 0,
+              inspection.secondLargestBiconnectedBlockViewCount
+                <= inspection.largestBiconnectedBlockViewCount,
+              hasSingleBiconnectedBlock
+                ? inspection.articulationViewCount == 0
+                    && inspection.largestBiconnectedBlockViewCount == matchableViewCount
+                    && inspection.secondLargestBiconnectedBlockViewCount == 0
+                : inspection.articulationViewCount > 0
+                    && inspection.largestBiconnectedBlockViewCount < matchableViewCount
+                    && inspection.secondLargestBiconnectedBlockViewCount >= 2,
               inspection.degreeP10 >= 0,
               inspection.degreeP10 <= inspection.degreeMedian,
               inspection.degreeMedian <= inspection.degreeP90,
@@ -552,6 +592,10 @@ enum PairGraphEvidenceStore {
     private struct PairEdge: Hashable {
         let first: Int
         let second: Int
+    }
+
+    private struct SchemaEnvelope: Decodable {
+        let schemaVersion: Int
     }
 }
 

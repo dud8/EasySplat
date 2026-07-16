@@ -116,6 +116,10 @@ final class ColmapPairGraphInspectorTests: XCTestCase {
         XCTAssertEqual(result.degreeP10, 0)
         XCTAssertEqual(result.degreeMedian, 1)
         XCTAssertEqual(result.degreeP90, 2)
+        XCTAssertEqual(result.articulationViewCount, 1)
+        XCTAssertEqual(result.biconnectedBlockCount, 2)
+        XCTAssertEqual(result.largestBiconnectedBlockViewCount, 2)
+        XCTAssertEqual(result.secondLargestBiconnectedBlockViewCount, 2)
         XCTAssertEqual(result.featureDatabaseDigest.count, 64)
         XCTAssertEqual(result.matchingDatabaseDigest.count, 64)
         XCTAssertEqual(result.verifiedGraph.verifiedPairs, [
@@ -126,6 +130,184 @@ final class ColmapPairGraphInspectorTests: XCTestCase {
             [imageName(2), imageName(7), imageName(11)],
             [imageName(20)],
         ])
+    }
+
+    func testMeasuresBiconnectedRobustnessAcrossGraphShapes() throws {
+        struct GraphCase {
+            let name: String
+            let imageIDs: [Int]
+            let edges: [(Int, Int)]
+            let articulationViews: Int
+            let blockSizes: [Int]
+        }
+        let cases = [
+            GraphCase(
+                name: "line",
+                imageIDs: [1, 2, 3, 4],
+                edges: [(1, 2), (2, 3), (3, 4)],
+                articulationViews: 2,
+                blockSizes: [2, 2, 2]
+            ),
+            GraphCase(
+                name: "cycle",
+                imageIDs: [1, 2, 3, 4],
+                edges: [(1, 2), (2, 3), (3, 4), (1, 4)],
+                articulationViews: 0,
+                blockSizes: [4]
+            ),
+            GraphCase(
+                name: "bow tie",
+                imageIDs: [1, 2, 3, 4, 5],
+                edges: [(1, 2), (2, 3), (1, 3), (3, 4), (4, 5), (3, 5)],
+                articulationViews: 1,
+                blockSizes: [3, 3]
+            ),
+        ]
+
+        for graphCase in cases {
+            let rows = graphCase.edges.map { edge in
+                (pairID(edge.0, edge.1), Int64(20))
+            }
+            let databaseURL = try makeDatabase(
+                imageIDs: graphCase.imageIDs,
+                matches: rows,
+                verified: rows
+            )
+            let result = try ColmapPairGraphInspector(databaseURL: databaseURL).inspect(
+                schedule: makeSchedule(
+                    imageIDs: graphCase.imageIDs,
+                    pairs: graphCase.edges.map { ($0.0, $0.1, .local) }
+                ),
+                completion: .succeeded
+            )
+
+            XCTAssertEqual(
+                result.articulationViewCount,
+                graphCase.articulationViews,
+                graphCase.name
+            )
+            XCTAssertEqual(
+                result.biconnectedBlockCount,
+                graphCase.blockSizes.count,
+                graphCase.name
+            )
+            XCTAssertEqual(
+                result.largestBiconnectedBlockViewCount,
+                graphCase.blockSizes.first ?? 0,
+                graphCase.name
+            )
+            XCTAssertEqual(
+                result.secondLargestBiconnectedBlockViewCount,
+                graphCase.blockSizes.dropFirst().first ?? 0,
+                graphCase.name
+            )
+        }
+    }
+
+    func testBiconnectedRobustnessExcludesDescriptorlessSingletons() throws {
+        let databaseURL = try makeDatabase(
+            imageIDs: [1, 2, 3, 4],
+            descriptorRecords: [(1, 64), (2, 64), (3, 64), (4, 0)],
+            matches: [
+                (pairID(1, 2), 20),
+                (pairID(2, 3), 20),
+                (pairID(3, 4), 0),
+            ],
+            verified: [
+                (pairID(1, 2), 20),
+                (pairID(2, 3), 20),
+                (pairID(3, 4), 0),
+            ]
+        )
+        let result = try ColmapPairGraphInspector(databaseURL: databaseURL).inspect(
+            schedule: makeSchedule(
+                imageIDs: [1, 2, 3, 4],
+                pairs: [(1, 2, .local), (2, 3, .local), (3, 4, .local)]
+            ),
+            completion: .succeeded
+        )
+
+        XCTAssertEqual(result.descriptorlessImageNames, [imageName(4)])
+        XCTAssertEqual(result.articulationViewCount, 1)
+        XCTAssertEqual(result.biconnectedBlockCount, 2)
+        XCTAssertEqual(result.largestBiconnectedBlockViewCount, 2)
+        XCTAssertEqual(result.secondLargestBiconnectedBlockViewCount, 2)
+    }
+
+    func testSparseGraphsHaveTotalBiconnectedMeasurements() throws {
+        let noDescriptorDatabase = try makeDatabase(
+            imageIDs: [1, 2],
+            descriptorRecords: [(1, 0), (2, 0)],
+            matches: [],
+            verified: []
+        )
+        let noDescriptors = try ColmapPairGraphInspector(
+            databaseURL: noDescriptorDatabase
+        ).inspect(
+            schedule: makeSchedule(imageIDs: [1, 2], pairs: []),
+            completion: .succeeded
+        )
+        XCTAssertEqual(noDescriptors.articulationViewCount, 0)
+        XCTAssertEqual(noDescriptors.biconnectedBlockCount, 0)
+        XCTAssertEqual(noDescriptors.largestBiconnectedBlockViewCount, 0)
+        XCTAssertEqual(noDescriptors.secondLargestBiconnectedBlockViewCount, 0)
+
+        let oneDescriptorDatabase = try makeDatabase(
+            imageIDs: [1, 2],
+            descriptorRecords: [(1, 64), (2, 0)],
+            matches: [],
+            verified: []
+        )
+        let oneDescriptor = try ColmapPairGraphInspector(
+            databaseURL: oneDescriptorDatabase
+        ).inspect(
+            schedule: makeSchedule(imageIDs: [1, 2], pairs: []),
+            completion: .succeeded
+        )
+        XCTAssertEqual(oneDescriptor.articulationViewCount, 0)
+        XCTAssertEqual(oneDescriptor.biconnectedBlockCount, 0)
+        XCTAssertEqual(oneDescriptor.largestBiconnectedBlockViewCount, 0)
+        XCTAssertEqual(oneDescriptor.secondLargestBiconnectedBlockViewCount, 0)
+
+        let singleEdgeDatabase = try makeDatabase(
+            imageIDs: [1, 2],
+            matches: [(pairID(1, 2), 20)],
+            verified: [(pairID(1, 2), 20)]
+        )
+        let singleEdge = try ColmapPairGraphInspector(
+            databaseURL: singleEdgeDatabase
+        ).inspect(
+            schedule: makeSchedule(imageIDs: [1, 2], pairs: [(1, 2, .local)]),
+            completion: .succeeded
+        )
+        XCTAssertEqual(singleEdge.articulationViewCount, 0)
+        XCTAssertEqual(singleEdge.biconnectedBlockCount, 1)
+        XCTAssertEqual(singleEdge.largestBiconnectedBlockViewCount, 2)
+        XCTAssertEqual(singleEdge.secondLargestBiconnectedBlockViewCount, 0)
+    }
+
+    func testBiconnectedAnalysisUsesAnIterativeTraversalForLongPaths() throws {
+        let imageIDs = Array(1...3_000)
+        let edges = imageIDs.dropLast().map { ($0, $0 + 1) }
+        let rows = edges.map { (pairID($0.0, $0.1), Int64(20)) }
+        let databaseURL = try makeDatabase(
+            imageIDs: imageIDs,
+            matches: rows,
+            verified: rows
+        )
+
+        let result = try ColmapPairGraphInspector(databaseURL: databaseURL).inspect(
+            schedule: makeSchedule(
+                imageIDs: imageIDs,
+                pairs: edges.map { ($0.0, $0.1, .local) }
+            ),
+            completion: .succeeded
+        )
+
+        XCTAssertEqual(result.articulationViewCount, 2_998)
+        XCTAssertEqual(result.biconnectedBlockCount, 2_999)
+        XCTAssertEqual(result.largestBiconnectedBlockViewCount, 2)
+        XCTAssertEqual(result.secondLargestBiconnectedBlockViewCount, 2)
     }
 
     func testZeroRowPairsAreAttemptedButNotMatchedOrVerified() throws {
@@ -383,6 +565,16 @@ final class ColmapPairGraphInspectorTests: XCTestCase {
         )
 
         XCTAssertEqual(first.verifiedGraph, second.verifiedGraph)
+        XCTAssertEqual(first.articulationViewCount, second.articulationViewCount)
+        XCTAssertEqual(first.biconnectedBlockCount, second.biconnectedBlockCount)
+        XCTAssertEqual(
+            first.largestBiconnectedBlockViewCount,
+            second.largestBiconnectedBlockViewCount
+        )
+        XCTAssertEqual(
+            first.secondLargestBiconnectedBlockViewCount,
+            second.secondLargestBiconnectedBlockViewCount
+        )
         XCTAssertEqual(first.verifiedGraph.verifiedPairs, [
             ColmapScheduledPair(imageName(40), imageName(3), role: .local),
             ColmapScheduledPair(imageName(900), imageName(12), role: .retrieval),
@@ -792,6 +984,7 @@ final class ColmapPairGraphInspectorTests: XCTestCase {
             "CREATE TABLE two_view_geometries(pair_id INTEGER PRIMARY KEY, rows INTEGER, cols INTEGER, data BLOB);"
         )
 
+        try execute(database, "BEGIN IMMEDIATE TRANSACTION;")
         try execute(database, "INSERT INTO cameras(camera_id) VALUES (1);")
         for imageID in imageIDs {
             try execute(
@@ -810,7 +1003,10 @@ final class ColmapPairGraphInspectorTests: XCTestCase {
                 "INSERT INTO descriptors(image_id, rows, cols, data) VALUES (\(imageID), \(rowsSQL), 128, X'00');"
             )
         }
-        guard matchesHasRowsColumn else { return databaseURL }
+        guard matchesHasRowsColumn else {
+            try execute(database, "COMMIT;")
+            return databaseURL
+        }
 
         for (encodedPair, rows) in matches {
             try execute(
@@ -824,6 +1020,7 @@ final class ColmapPairGraphInspectorTests: XCTestCase {
                 "INSERT INTO two_view_geometries(pair_id, rows, cols, data) VALUES (\(encodedPair), \(rows), 2, X'00');"
             )
         }
+        try execute(database, "COMMIT;")
         return databaseURL
     }
 
