@@ -473,6 +473,7 @@ final class ToolchainManagerTests: XCTestCase {
             "overlay_sha256",
             "raster_test_sha256",
             "stage_timing_patch_sha256",
+            "memory_efficiency_patch_sha256",
         ] {
             for mutation in ["missing", "malformed"] {
                 let root = try TestFileBuilder.makeTempDir()
@@ -512,6 +513,7 @@ final class ToolchainManagerTests: XCTestCase {
             "overlay_sha256",
             "raster_test_sha256",
             "stage_timing_patch_sha256",
+            "memory_efficiency_patch_sha256",
         ] {
             let root = try TestFileBuilder.makeTempDir()
             defer { try? FileManager.default.removeItem(at: root) }

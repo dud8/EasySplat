@@ -104,6 +104,7 @@ expected_keys = {
     "executable_sha256",
     "metallib_sha256",
     "metal_safety_patch_sha256",
+    "memory_efficiency_patch_sha256",
     "ninja",
     "numeric_stability_patch_sha256",
     "overlay_sha256",
@@ -139,6 +140,7 @@ exact_values = {
     "metal_safety_patch_sha256": "5d3dfff3edcbca940d37f6ee3145c76c678ebd36ebc03016cfd5dab78e1d45ac",
     "exact_raster_patch_sha256": "278deba531d1503b8f6fe3428e0b6c5103129f388a6bc425c41780ff9e4c453b",
     "stage_timing_patch_sha256": "41e7146c2047a7a93b45927d1ee40d1e310db9898c25ab892a27c158acff75dd",
+    "memory_efficiency_patch_sha256": "bfacc105454e80102139f120dd6375037360c6a9763f1e1f708aa2a7f22eca6c",
     "deployment_target": "macOS 15.0",
     "build_configuration": "Release",
 }
@@ -182,6 +184,7 @@ for key in (
     "metal_safety_patch_sha256",
     "exact_raster_patch_sha256",
     "stage_timing_patch_sha256",
+    "memory_efficiency_patch_sha256",
     "raster_test_sha256",
     "executable_sha256",
     "metallib_sha256",
