@@ -14,6 +14,7 @@ METAL_SAFETY_PATCH="$ROOT/Tools/MsplatNative/msplat-1.1.3-metal-safety.patch"
 EXACT_RASTER_PATCH="$ROOT/Tools/MsplatNative/msplat-1.1.3-exact-raster.patch"
 STAGE_TIMING_PATCH="$ROOT/Tools/MsplatNative/msplat-1.1.3-stage-timing.patch"
 MEMORY_EFFICIENCY_PATCH="$ROOT/Tools/MsplatNative/msplat-1.1.3-memory-efficiency.patch"
+DENSIFICATION_MEMORY_PATCH="$ROOT/Tools/MsplatNative/msplat-1.1.3-densification-memory.patch"
 FIXTURE_GENERATOR="$ROOT/scripts/ci/generate_msplat_sparse_fixtures.py"
 VALIDATOR="$ROOT/scripts/toolchain/validate_native_msplat.sh"
 SWIFT_VALIDATOR="$ROOT/EasySplatCore/Sources/EasySplatCore/Tools/ToolchainManager+Validation.swift"
@@ -54,6 +55,7 @@ require_file "$METAL_SAFETY_PATCH"
 require_file "$EXACT_RASTER_PATCH"
 require_file "$STAGE_TIMING_PATCH"
 require_file "$MEMORY_EFFICIENCY_PATCH"
+require_file "$DENSIFICATION_MEMORY_PATCH"
 require_file "$FIXTURE_GENERATOR"
 require_file "$VALIDATOR"
 require_file "$SWIFT_VALIDATOR"
@@ -119,6 +121,15 @@ require_contains '"memory_efficiency_patch_sha256": "bfacc105454e80102139f120dd6
 require_contains 'MTensor {}, MTensor {}, v_opacity' "$MEMORY_EFFICIENCY_PATCH"
 require_contains 'constexpr float kSphericalHarmonicDc' "$MEMORY_EFFICIENCY_PATCH"
 require_contains 'iw, 9}, DType::Float32' "$MEMORY_EFFICIENCY_PATCH"
+require_contains 'DENSIFICATION_MEMORY_PATCH_SHA256="b429540372d807f280929ebba1670257990bd36b28dfee5b42bc377ccef60ac7"' "$BUILD_SCRIPT"
+require_contains '[ "$(sha256 "$DENSIFICATION_MEMORY_PATCH")" = "$DENSIFICATION_MEMORY_PATCH_SHA256" ]' "$BUILD_SCRIPT"
+require_contains 'git -C "$SOURCE_DIR" apply --check "$DENSIFICATION_MEMORY_PATCH"' "$BUILD_SCRIPT"
+require_contains 'git -C "$SOURCE_DIR" apply "$DENSIFICATION_MEMORY_PATCH"' "$BUILD_SCRIPT"
+require_contains 'densification_memory_patch_sha256' "$BUILD_SCRIPT"
+require_contains '"densification_memory_patch_sha256": "b429540372d807f280929ebba1670257990bd36b28dfee5b42bc377ccef60ac7"' "$VALIDATOR"
+require_contains 'ensureDensificationCompactScratch' "$DENSIFICATION_MEMORY_PATCH"
+require_contains 'densify_compact_scratch.reset()' "$DENSIFICATION_MEMORY_PATCH"
+require_contains 'densification scratch lifecycle passed' "$RASTER_TEST_SOURCE"
 require_absent 'queryTimestampFrequency' "$STAGE_TIMING_PATCH"
 require_contains 'sampleTimestamps:&cpuTimestamp gpuTimestamp:&gpuTimestamp' "$STAGE_TIMING_PATCH"
 require_contains 'mach_timebase_info(&timebase)' "$STAGE_TIMING_PATCH"
@@ -144,6 +155,7 @@ for contract_file in "$SWIFT_VALIDATOR" "$SWIFT_FIXTURE"; do
   require_contains 'exact_raster_patch_sha256' "$contract_file"
   require_contains 'stage_timing_patch_sha256' "$contract_file"
   require_contains 'memory_efficiency_patch_sha256' "$contract_file"
+  require_contains 'densification_memory_patch_sha256' "$contract_file"
   require_contains 'raster_test_sha256' "$contract_file"
   require_contains 'MSPLAT_BUILD_RASTER_TESTS=ON' "$contract_file"
 done
@@ -544,7 +556,7 @@ set -e
 [ ! -s "$negative_dir/truncated-ply.stdout" ] || fail "truncated PLY emitted a false success event"
 grep -qi 'payload' "$negative_dir/truncated-ply.stderr" || fail "truncated PLY diagnostic is not useful"
 
-for key in source_commit source_version source_url source_tree_sha256 overlay_sha256 raster_test_sha256 patch_sha256 checkpoint_patch_sha256 numeric_stability_patch_sha256 metal_safety_patch_sha256 exact_raster_patch_sha256 stage_timing_patch_sha256 memory_efficiency_patch_sha256 executable_sha256 metallib_sha256 compiler deployment_target cmake_arguments build_timestamp; do
+for key in source_commit source_version source_url source_tree_sha256 overlay_sha256 raster_test_sha256 patch_sha256 checkpoint_patch_sha256 numeric_stability_patch_sha256 metal_safety_patch_sha256 exact_raster_patch_sha256 stage_timing_patch_sha256 memory_efficiency_patch_sha256 densification_memory_patch_sha256 executable_sha256 metallib_sha256 compiler deployment_target cmake_arguments build_timestamp; do
   require_contains "\"$key\"" "$BUILD_INFO"
 done
 overlay_hash="$(shasum -a 256 "$OVERLAY" | awk '{print $1}')"
@@ -553,10 +565,11 @@ metal_safety_patch_hash="$(shasum -a 256 "$METAL_SAFETY_PATCH" | awk '{print $1}
 exact_raster_patch_hash="$(shasum -a 256 "$EXACT_RASTER_PATCH" | awk '{print $1}')"
 stage_timing_patch_hash="$(shasum -a 256 "$STAGE_TIMING_PATCH" | awk '{print $1}')"
 memory_efficiency_patch_hash="$(shasum -a 256 "$MEMORY_EFFICIENCY_PATCH" | awk '{print $1}')"
+densification_memory_patch_hash="$(shasum -a 256 "$DENSIFICATION_MEMORY_PATCH" | awk '{print $1}')"
 raster_test_hash="$(shasum -a 256 "$RASTER_TEST_SOURCE" | awk '{print $1}')"
 exe_hash="$(shasum -a 256 "$BIN" | awk '{print $1}')"
 metallib_hash="$(shasum -a 256 "$METALLIB" | awk '{print $1}')"
-python3 - "$BUILD_INFO" "$overlay_hash" "$numeric_stability_patch_hash" "$metal_safety_patch_hash" "$exact_raster_patch_hash" "$stage_timing_patch_hash" "$memory_efficiency_patch_hash" "$raster_test_hash" "$exe_hash" "$metallib_hash" <<'PY'
+python3 - "$BUILD_INFO" "$overlay_hash" "$numeric_stability_patch_hash" "$metal_safety_patch_hash" "$exact_raster_patch_hash" "$stage_timing_patch_hash" "$memory_efficiency_patch_hash" "$densification_memory_patch_hash" "$raster_test_hash" "$exe_hash" "$metallib_hash" <<'PY'
 import json
 import sys
 
@@ -576,9 +589,10 @@ expected = {
     "exact_raster_patch_sha256": sys.argv[5],
     "stage_timing_patch_sha256": sys.argv[6],
     "memory_efficiency_patch_sha256": sys.argv[7],
-    "raster_test_sha256": sys.argv[8],
-    "executable_sha256": sys.argv[9],
-    "metallib_sha256": sys.argv[10],
+    "densification_memory_patch_sha256": sys.argv[8],
+    "raster_test_sha256": sys.argv[9],
+    "executable_sha256": sys.argv[10],
+    "metallib_sha256": sys.argv[11],
 }
 for key, value in expected.items():
     if payload.get(key) != value:

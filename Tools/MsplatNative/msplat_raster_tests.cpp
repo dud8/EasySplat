@@ -207,6 +207,53 @@ Model makeModel(const InputData &inputData) {
     );
 }
 
+void verifyDensificationScratchLifecycle(const std::string &dataset) {
+    cleanup_msplat_metal();
+    msplat_set_raster_memory_budget_bytes(memoryBudgetBytes);
+    {
+        InputData inputData = inputDataFromX(dataset);
+        Model model = makeModel(inputData);
+        if (model.densify_compact_scratch.defined()) {
+            throw std::runtime_error("densification scratch memory was allocated eagerly");
+        }
+
+        const int pointCount = model.num_active;
+        const int64_t featureStride = model.featuresRest_buf.stride0();
+        model.ensureCapacity(3 * pointCount);
+        model.ensureDensificationCompactScratch(pointCount);
+        const int64_t expectedElements = 3LL * pointCount * featureStride;
+        if (!model.densify_compact_scratch.defined() ||
+            model.densify_compact_scratch.numel() != expectedElements) {
+            throw std::runtime_error("densification scratch memory has an invalid shape");
+        }
+        const void *storage = model.densify_compact_scratch.data_ptr();
+        model.ensureDensificationCompactScratch(pointCount);
+        if (model.densify_compact_scratch.data_ptr() != storage) {
+            throw std::runtime_error("sufficient densification scratch memory was reallocated");
+        }
+
+        model.radii = gpu_zeros({pointCount}, DType::Float32);
+        model.afterTrain(model.stopSplitAt);
+        if (model.densify_compact_scratch.defined()) {
+            throw std::runtime_error("densification scratch memory survived the final boundary");
+        }
+        try {
+            model.ensureDensificationCompactScratch(0);
+            throw std::runtime_error("invalid densification point count was accepted");
+        } catch (const std::runtime_error &error) {
+            if (std::string(error.what()).find("inconsistent densification scratch") ==
+                std::string::npos) {
+                throw;
+            }
+        }
+        if (model.densify_compact_scratch.defined()) {
+            throw std::runtime_error("invalid densification request retained scratch memory");
+        }
+    }
+    cleanup_msplat_metal();
+    std::cout << "densification scratch lifecycle passed\n";
+}
+
 void enqueueStep(Model &model, Camera &camera, int step, std::size_t cameraIndex) {
     if (camera.image.empty()) {
         camera.loadImage(1.0f);
@@ -1444,6 +1491,7 @@ int main(int argc, char **argv) {
         if (enabledMedian > allowed) {
             throw std::runtime_error("zero-group exact dispatch materially slowed the common path");
         }
+        verifyDensificationScratchLifecycle(dataset);
         verifyMixedResolutionGrowth(argv[2]);
         verifyExactOnlyBudgetEvidence(argv[6]);
         verifySharedAllocationBudget(argv[3]);

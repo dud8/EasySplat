@@ -27,6 +27,8 @@ STAGE_TIMING_PATCH="$ROOT/Tools/MsplatNative/msplat-1.1.3-stage-timing.patch"
 STAGE_TIMING_PATCH_SHA256="41e7146c2047a7a93b45927d1ee40d1e310db9898c25ab892a27c158acff75dd"
 MEMORY_EFFICIENCY_PATCH="$ROOT/Tools/MsplatNative/msplat-1.1.3-memory-efficiency.patch"
 MEMORY_EFFICIENCY_PATCH_SHA256="bfacc105454e80102139f120dd6375037360c6a9763f1e1f708aa2a7f22eca6c"
+DENSIFICATION_MEMORY_PATCH="$ROOT/Tools/MsplatNative/msplat-1.1.3-densification-memory.patch"
+DENSIFICATION_MEMORY_PATCH_SHA256="b429540372d807f280929ebba1670257990bd36b28dfee5b42bc377ccef60ac7"
 RASTER_TEST_FIXTURES="$BUILD_DIR/raster-test-fixtures"
 
 MSPLAT_REPO="https://github.com/rayanht/msplat.git"
@@ -123,6 +125,9 @@ preflight() {
   [ -f "$MEMORY_EFFICIENCY_PATCH" ] || die "missing memory-efficiency patch: $MEMORY_EFFICIENCY_PATCH"
   [ "$(sha256 "$MEMORY_EFFICIENCY_PATCH")" = "$MEMORY_EFFICIENCY_PATCH_SHA256" ] \
     || die "memory-efficiency patch SHA-256 mismatch"
+  [ -f "$DENSIFICATION_MEMORY_PATCH" ] || die "missing densification-memory patch: $DENSIFICATION_MEMORY_PATCH"
+  [ "$(sha256 "$DENSIFICATION_MEMORY_PATCH")" = "$DENSIFICATION_MEMORY_PATCH_SHA256" ] \
+    || die "densification-memory patch SHA-256 mismatch"
 }
 
 download_verified() {
@@ -209,6 +214,8 @@ prepare_source() {
   git -C "$SOURCE_DIR" apply "$STAGE_TIMING_PATCH"
   git -C "$SOURCE_DIR" apply --check "$MEMORY_EFFICIENCY_PATCH"
   git -C "$SOURCE_DIR" apply "$MEMORY_EFFICIENCY_PATCH"
+  git -C "$SOURCE_DIR" apply --check "$DENSIFICATION_MEMORY_PATCH"
+  git -C "$SOURCE_DIR" apply "$DENSIFICATION_MEMORY_PATCH"
 }
 
 configure_and_build() {
@@ -240,7 +247,7 @@ configure_and_build() {
 write_build_info() {
   local executable_sha256="$1"
   local metallib_sha256="$2"
-  local build_info compiler cmake_version ninja_version timestamp overlay_sha256 raster_test_sha256 patch_sha256 checkpoint_patch_sha256 numeric_stability_patch_sha256 metal_safety_patch_sha256 exact_raster_patch_sha256 stage_timing_patch_sha256 memory_efficiency_patch_sha256
+  local build_info compiler cmake_version ninja_version timestamp overlay_sha256 raster_test_sha256 patch_sha256 checkpoint_patch_sha256 numeric_stability_patch_sha256 metal_safety_patch_sha256 exact_raster_patch_sha256 stage_timing_patch_sha256 memory_efficiency_patch_sha256 densification_memory_patch_sha256
   build_info="$STAGE_DIR/build_info.json"
   compiler="$(xcrun clang++ --version | head -n 1)"
   cmake_version="$(cmake --version | head -n 1)"
@@ -255,10 +262,11 @@ write_build_info() {
   exact_raster_patch_sha256="$(sha256 "$EXACT_RASTER_PATCH")"
   stage_timing_patch_sha256="$(sha256 "$STAGE_TIMING_PATCH")"
   memory_efficiency_patch_sha256="$(sha256 "$MEMORY_EFFICIENCY_PATCH")"
+  densification_memory_patch_sha256="$(sha256 "$DENSIFICATION_MEMORY_PATCH")"
 
   python3 - "$build_info" \
     "$MSPLAT_REPO" "$MSPLAT_COMMIT" "$MSPLAT_VERSION" "$SOURCE_TREE_SHA256" \
-    "$overlay_sha256" "$raster_test_sha256" "$patch_sha256" "$checkpoint_patch_sha256" "$numeric_stability_patch_sha256" "$metal_safety_patch_sha256" "$exact_raster_patch_sha256" "$stage_timing_patch_sha256" "$memory_efficiency_patch_sha256" \
+    "$overlay_sha256" "$raster_test_sha256" "$patch_sha256" "$checkpoint_patch_sha256" "$numeric_stability_patch_sha256" "$metal_safety_patch_sha256" "$exact_raster_patch_sha256" "$stage_timing_patch_sha256" "$memory_efficiency_patch_sha256" "$densification_memory_patch_sha256" \
     "$NLOHMANN_JSON_SHA256" "$NANOFLANN_SHA256" "$CLI11_SHA256" \
     "$executable_sha256" "$metallib_sha256" \
     "$compiler" "$cmake_version" "$ninja_version" "$timestamp" <<'PY'
@@ -280,6 +288,7 @@ import sys
     exact_raster_patch_sha256,
     stage_timing_patch_sha256,
     memory_efficiency_patch_sha256,
+    densification_memory_patch_sha256,
     nlohmann_json_sha256,
     nanoflann_sha256,
     cli11_sha256,
@@ -306,6 +315,7 @@ payload = {
     "exact_raster_patch_sha256": exact_raster_patch_sha256,
     "stage_timing_patch_sha256": stage_timing_patch_sha256,
     "memory_efficiency_patch_sha256": memory_efficiency_patch_sha256,
+    "densification_memory_patch_sha256": densification_memory_patch_sha256,
     "dependencies": {
         "nlohmann_json_v3.11.3_sha256": nlohmann_json_sha256,
         "nanoflann_v1.5.5_sha256": nanoflann_sha256,

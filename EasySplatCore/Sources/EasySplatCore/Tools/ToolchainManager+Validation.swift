@@ -439,6 +439,7 @@ extension ToolchainManager {
             "raster_test_sha256",
             "patch_sha256",
             "checkpoint_patch_sha256",
+            "densification_memory_patch_sha256",
             "numeric_stability_patch_sha256",
             "metal_safety_patch_sha256",
             "exact_raster_patch_sha256",
@@ -483,10 +484,11 @@ extension ToolchainManager {
             "source_commit": "106499b0a53f82b0c92d013b0861fbebd341b17e",
             "source_version": "1.1.3",
             "overlay_sha256": "cfefabcf9366571241e5a0923ae35fa3b8b263d6d024a87485bccc2e842ad29e",
-            "raster_test_sha256": "6d8b13a0b80b82520303950e472b32aa18ec1ee6986d2c67def2db52c270650f",
+            "raster_test_sha256": "6f4a180d75bda88f39379b9be8521e63e1a76ecb507c1841ec113673d6bef110",
             "exact_raster_patch_sha256": "278deba531d1503b8f6fe3428e0b6c5103129f388a6bc425c41780ff9e4c453b",
             "stage_timing_patch_sha256": "41e7146c2047a7a93b45927d1ee40d1e310db9898c25ab892a27c158acff75dd",
             "memory_efficiency_patch_sha256": "bfacc105454e80102139f120dd6375037360c6a9763f1e1f708aa2a7f22eca6c",
+            "densification_memory_patch_sha256": "b429540372d807f280929ebba1670257990bd36b28dfee5b42bc377ccef60ac7",
             "deployment_target": "macOS 15.0",
             "build_configuration": "Release",
         ]
@@ -510,6 +512,7 @@ extension ToolchainManager {
             "exact_raster_patch_sha256",
             "stage_timing_patch_sha256",
             "memory_efficiency_patch_sha256",
+            "densification_memory_patch_sha256",
             "executable_sha256",
             "metallib_sha256",
         ]
