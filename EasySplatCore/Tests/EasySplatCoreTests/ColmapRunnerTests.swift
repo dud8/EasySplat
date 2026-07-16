@@ -19,6 +19,10 @@ final class ColmapRunnerTests: XCTestCase {
                     XCTAssertEqual(self.value(for: "--Mapper.ba_global_points_ratio", in: args), "1.4")
                     XCTAssertEqual(self.value(for: "--Mapper.ba_local_max_refinements", in: args), "2")
                     XCTAssertEqual(self.value(for: "--Mapper.ba_global_max_refinements", in: args), "5")
+                    XCTAssertEqual(self.value(for: "--Mapper.ba_local_max_num_iterations", in: args), "10")
+                    XCTAssertEqual(self.value(for: "--Mapper.ba_local_function_tolerance", in: args), "0.001")
+                    XCTAssertEqual(self.value(for: "--Mapper.ba_global_function_tolerance", in: args), "1e-06")
+                    XCTAssertEqual(self.value(for: "--Mapper.ba_local_num_images", in: args), "6")
                     XCTAssertEqual(self.value(for: "--Mapper.random_seed", in: args), "42")
                     XCTAssertEqual(self.value(for: "--Mapper.min_num_matches", in: args), "15")
                     XCTAssertEqual(self.value(for: "--Mapper.ba_refine_focal_length", in: args), "1")
@@ -42,6 +46,10 @@ final class ColmapRunnerTests: XCTestCase {
                 localMaxRefinements: 2,
                 globalMaxRefinements: 5,
                 globalMaxNumIterations: 75,
+                localMaxNumIterations: 10,
+                localFunctionTolerance: 0.001,
+                globalFunctionTolerance: 0.000_001,
+                localImageCount: 6,
                 randomSeed: 42,
                 refineFocalLength: true
             ),
@@ -141,6 +149,72 @@ final class ColmapRunnerTests: XCTestCase {
             XCTAssertEqual(
                 error as? ColmapMapperOptionsValidationError,
                 .randomSeedOutOfRange
+            )
+        }
+
+        XCTAssertThrowsError(try ColmapMapperOptions(
+            globalFramesRatio: 1.4,
+            globalPointsRatio: 1.4,
+            localMaxRefinements: 2,
+            globalMaxRefinements: 5,
+            globalMaxNumIterations: 75,
+            localMaxNumIterations: 0,
+            randomSeed: 42,
+            refineFocalLength: true
+        )) { error in
+            XCTAssertEqual(
+                error as? ColmapMapperOptionsValidationError,
+                .nonPositiveValue("Local iteration limit")
+            )
+        }
+
+        for tolerance in [Double.nan, -.infinity, -0.001] {
+            XCTAssertThrowsError(try ColmapMapperOptions(
+                globalFramesRatio: 1.4,
+                globalPointsRatio: 1.4,
+                localMaxRefinements: 2,
+                globalMaxRefinements: 5,
+                globalMaxNumIterations: 75,
+                localFunctionTolerance: tolerance,
+                randomSeed: 42,
+                refineFocalLength: true
+            )) { error in
+                XCTAssertEqual(
+                    error as? ColmapMapperOptionsValidationError,
+                    .invalidTolerance("Local function tolerance")
+                )
+            }
+        }
+
+        XCTAssertThrowsError(try ColmapMapperOptions(
+            globalFramesRatio: 1.4,
+            globalPointsRatio: 1.4,
+            localMaxRefinements: 2,
+            globalMaxRefinements: 5,
+            globalMaxNumIterations: 75,
+            globalFunctionTolerance: -.infinity,
+            randomSeed: 42,
+            refineFocalLength: true
+        )) { error in
+            XCTAssertEqual(
+                error as? ColmapMapperOptionsValidationError,
+                .invalidTolerance("Global function tolerance")
+            )
+        }
+
+        XCTAssertThrowsError(try ColmapMapperOptions(
+            globalFramesRatio: 1.4,
+            globalPointsRatio: 1.4,
+            localMaxRefinements: 2,
+            globalMaxRefinements: 5,
+            globalMaxNumIterations: 75,
+            localImageCount: 0,
+            randomSeed: 42,
+            refineFocalLength: true
+        )) { error in
+            XCTAssertEqual(
+                error as? ColmapMapperOptionsValidationError,
+                .nonPositiveValue("Local image count")
             )
         }
     }

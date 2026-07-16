@@ -1240,6 +1240,15 @@ def _candidate_mapper_cadence(
         raise EvidenceError("ba_local_max_refinements must be a positive integer")
     if global_refinements != 5:
         raise EvidenceError("ba_global_max_refinements must remain 5")
+    promoted_convergence = {
+        "ba_local_max_num_iterations": 10,
+        "ba_local_function_tolerance": 0.001,
+        "ba_global_function_tolerance": 0.000_001,
+        "ba_local_num_images": 6,
+    }
+    for field, expected in promoted_convergence.items():
+        if configuration[field] != expected:
+            raise EvidenceError(f"{field} must remain {expected!r}")
     if frames != expected_ratio or points != expected_ratio or local_refinements != expected_local:
         raise EvidenceError(
             f"{topology} mapper cadence requires global ratios {expected_ratio} "
@@ -1253,6 +1262,10 @@ MAPPER_CADENCE_OPTIONS = (
     "--Mapper.ba_global_points_ratio",
     "--Mapper.ba_global_max_refinements",
     "--Mapper.ba_local_max_refinements",
+    "--Mapper.ba_local_max_num_iterations",
+    "--Mapper.ba_local_function_tolerance",
+    "--Mapper.ba_global_function_tolerance",
+    "--Mapper.ba_local_num_images",
 )
 
 
@@ -1291,6 +1304,10 @@ def _validate_mapper_invocation_argv(
         "--Mapper.ba_global_points_ratio": str(expected_cadence[1]),
         "--Mapper.ba_global_max_refinements": str(expected_cadence[2]),
         "--Mapper.ba_local_max_refinements": str(expected_cadence[3]),
+        "--Mapper.ba_local_max_num_iterations": "10",
+        "--Mapper.ba_local_function_tolerance": "0.001",
+        "--Mapper.ba_global_function_tolerance": "1e-06",
+        "--Mapper.ba_local_num_images": "6",
     }
     for option, expected_value in expected.items():
         indices = [index for index, argument in enumerate(raw) if argument == option]
@@ -3435,6 +3452,10 @@ def validate_request(request: Any) -> Mapping[str, Any]:
             "ba_global_points_ratio",
             "ba_global_max_refinements",
             "ba_local_max_refinements",
+            "ba_local_max_num_iterations",
+            "ba_local_function_tolerance",
+            "ba_global_function_tolerance",
+            "ba_local_num_images",
             "trainer_iterations",
             "trainer_plateau_window",
             "deterministic_seed",

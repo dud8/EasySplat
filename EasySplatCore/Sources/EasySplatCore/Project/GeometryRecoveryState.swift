@@ -11,7 +11,7 @@ public enum GeometryRecoveryComputeMode: String, Codable, Sendable, Equatable {
 }
 
 public struct GeometryRecoveryState: Codable, Sendable, Equatable {
-    public static let currentSchemaVersion = 3
+    public static let currentSchemaVersion = 4
     public static let maximumMappingAttemptCount = 10_000
 
     public enum ValidationError: Swift.Error, LocalizedError, Equatable {

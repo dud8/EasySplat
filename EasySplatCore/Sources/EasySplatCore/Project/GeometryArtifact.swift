@@ -215,17 +215,29 @@ public struct IncrementalMappingCadenceArtifact: Codable, Sendable, Equatable {
     public var globalFramesRatio: Double
     public var globalPointsRatio: Double
     public var globalMaxRefinements: Int
+    public var localMaxNumIterations: Int
+    public var localFunctionTolerance: Double
+    public var globalFunctionTolerance: Double
+    public var localImageCount: Int
 
     public init(
         localMaxRefinements: Int,
         globalFramesRatio: Double,
         globalPointsRatio: Double,
-        globalMaxRefinements: Int
+        globalMaxRefinements: Int,
+        localMaxNumIterations: Int = 10,
+        localFunctionTolerance: Double = 0.001,
+        globalFunctionTolerance: Double = 0.000_001,
+        localImageCount: Int = 6
     ) {
         self.localMaxRefinements = localMaxRefinements
         self.globalFramesRatio = globalFramesRatio
         self.globalPointsRatio = globalPointsRatio
         self.globalMaxRefinements = globalMaxRefinements
+        self.localMaxNumIterations = localMaxNumIterations
+        self.localFunctionTolerance = localFunctionTolerance
+        self.globalFunctionTolerance = globalFunctionTolerance
+        self.localImageCount = localImageCount
     }
 
     public static let orderedFast = Self(
@@ -249,6 +261,12 @@ public struct IncrementalMappingCadenceArtifact: Codable, Sendable, Equatable {
             && globalPointsRatio.isFinite
             && globalPointsRatio > 1
             && globalMaxRefinements > 0
+            && localMaxNumIterations > 0
+            && localFunctionTolerance.isFinite
+            && localFunctionTolerance > 0
+            && globalFunctionTolerance.isFinite
+            && globalFunctionTolerance > 0
+            && localImageCount > 0
     }
 }
 
@@ -413,7 +431,7 @@ public struct CanonicalOrientationArtifact: Codable, Sendable, Equatable {
 }
 
 public struct GeometryArtifact: Codable, Sendable, Equatable {
-    public static let currentSchemaVersion = 10
+    public static let currentSchemaVersion = 11
 
     public var schemaVersion: Int
     public var solverVersion: String

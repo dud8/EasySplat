@@ -22,6 +22,7 @@ public struct ColmapBundleAdjustmentOptions: Sendable {
 
 public enum ColmapMapperOptionsValidationError: Error, LocalizedError, Equatable {
     case invalidRatio(String)
+    case invalidTolerance(String)
     case nonPositiveValue(String)
     case randomSeedOutOfRange
 
@@ -29,6 +30,8 @@ public enum ColmapMapperOptionsValidationError: Error, LocalizedError, Equatable
         switch self {
         case .invalidRatio(let name):
             return "\(name) must be finite and greater than one."
+        case .invalidTolerance(let name):
+            return "\(name) must be finite and nonnegative."
         case .nonPositiveValue(let name):
             return "\(name) must be greater than zero."
         case .randomSeedOutOfRange:
@@ -49,6 +52,10 @@ public struct ColmapMapperOptions: Sendable, Equatable {
     public let localMaxRefinements: Int
     public let globalMaxRefinements: Int
     public let globalMaxNumIterations: Int
+    public let localMaxNumIterations: Int
+    public let localFunctionTolerance: Double
+    public let globalFunctionTolerance: Double
+    public let localImageCount: Int
     public let randomSeed: Int32
     public let refineFocalLength: Bool
 
@@ -58,6 +65,10 @@ public struct ColmapMapperOptions: Sendable, Equatable {
         localMaxRefinements: Int,
         globalMaxRefinements: Int,
         globalMaxNumIterations: Int,
+        localMaxNumIterations: Int = 10,
+        localFunctionTolerance: Double = 0.001,
+        globalFunctionTolerance: Double = 0.000_001,
+        localImageCount: Int = 6,
         randomSeed: UInt64,
         refineFocalLength: Bool
     ) throws {
@@ -76,6 +87,18 @@ public struct ColmapMapperOptions: Sendable, Equatable {
         guard globalMaxNumIterations > 0 else {
             throw ColmapMapperOptionsValidationError.nonPositiveValue("Global iteration limit")
         }
+        guard localMaxNumIterations > 0 else {
+            throw ColmapMapperOptionsValidationError.nonPositiveValue("Local iteration limit")
+        }
+        guard localFunctionTolerance.isFinite, localFunctionTolerance >= 0 else {
+            throw ColmapMapperOptionsValidationError.invalidTolerance("Local function tolerance")
+        }
+        guard globalFunctionTolerance.isFinite, globalFunctionTolerance >= 0 else {
+            throw ColmapMapperOptionsValidationError.invalidTolerance("Global function tolerance")
+        }
+        guard localImageCount > 0 else {
+            throw ColmapMapperOptionsValidationError.nonPositiveValue("Local image count")
+        }
         guard let randomSeed = Int32(exactly: randomSeed) else {
             throw ColmapMapperOptionsValidationError.randomSeedOutOfRange
         }
@@ -85,6 +108,10 @@ public struct ColmapMapperOptions: Sendable, Equatable {
         self.localMaxRefinements = localMaxRefinements
         self.globalMaxRefinements = globalMaxRefinements
         self.globalMaxNumIterations = globalMaxNumIterations
+        self.localMaxNumIterations = localMaxNumIterations
+        self.localFunctionTolerance = localFunctionTolerance
+        self.globalFunctionTolerance = globalFunctionTolerance
+        self.localImageCount = localImageCount
         self.randomSeed = randomSeed
         self.refineFocalLength = refineFocalLength
     }
@@ -375,6 +402,10 @@ public final class ColmapRunner {
             "--Mapper.ba_local_max_refinements", "\(mapperOptions.localMaxRefinements)",
             "--Mapper.ba_global_max_refinements", "\(mapperOptions.globalMaxRefinements)",
             "--Mapper.ba_global_max_num_iterations", "\(mapperOptions.globalMaxNumIterations)",
+            "--Mapper.ba_local_max_num_iterations", "\(mapperOptions.localMaxNumIterations)",
+            "--Mapper.ba_local_function_tolerance", "\(mapperOptions.localFunctionTolerance)",
+            "--Mapper.ba_global_function_tolerance", "\(mapperOptions.globalFunctionTolerance)",
+            "--Mapper.ba_local_num_images", "\(mapperOptions.localImageCount)",
             "--Mapper.random_seed", "\(mapperOptions.randomSeed)",
             "--Mapper.min_num_matches", "\(ColmapMappingPolicy.minimumPairInlierCount)",
             "--Mapper.ba_refine_focal_length", mapperOptions.refineFocalLength ? "1" : "0",

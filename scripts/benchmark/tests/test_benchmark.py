@@ -1052,6 +1052,14 @@ def mapper_argv_for_cadence(
         str(cadence[2]),
         "--Mapper.ba_local_max_refinements",
         str(cadence[3]),
+        "--Mapper.ba_local_max_num_iterations",
+        "10",
+        "--Mapper.ba_local_function_tolerance",
+        "0.001",
+        "--Mapper.ba_global_function_tolerance",
+        "1e-06",
+        "--Mapper.ba_local_num_images",
+        "6",
     ]
 
 
@@ -1609,7 +1617,7 @@ def write_orientation_evidence_artifacts(
                     },
                     "poseConvention": "world-to-camera",
                     "quaternionOrder": "wxyz",
-                    "schemaVersion": 10,
+                    "schemaVersion": 11,
                 }
             )
             + b"\n"
@@ -4636,6 +4644,10 @@ class EvidenceProtocolTests(unittest.TestCase):
                 self.assertEqual(configuration["ba_global_frames_ratio"], global_ratio)
                 self.assertEqual(configuration["ba_global_points_ratio"], global_ratio)
                 self.assertEqual(configuration["ba_local_max_refinements"], local_refinements)
+                self.assertEqual(configuration["ba_local_max_num_iterations"], 10)
+                self.assertEqual(configuration["ba_local_function_tolerance"], 0.001)
+                self.assertEqual(configuration["ba_global_function_tolerance"], 0.000001)
+                self.assertEqual(configuration["ba_local_num_images"], 6)
                 evidence.validate_request(request)
 
     def test_mapper_cadence_request_fails_closed(self) -> None:
@@ -4660,6 +4672,26 @@ class EvidenceProtocolTests(unittest.TestCase):
                     }
                 ),
                 "continuous.*4.0.*local.*1",
+            ),
+            (
+                "wrong local iteration limit",
+                lambda configuration: configuration.update({"ba_local_max_num_iterations": 11}),
+                "ba_local_max_num_iterations.*10",
+            ),
+            (
+                "wrong local tolerance",
+                lambda configuration: configuration.update({"ba_local_function_tolerance": 0.002}),
+                "ba_local_function_tolerance.*0.001",
+            ),
+            (
+                "wrong global tolerance",
+                lambda configuration: configuration.update({"ba_global_function_tolerance": 0.000002}),
+                "ba_global_function_tolerance.*1e-06",
+            ),
+            (
+                "wrong local image count",
+                lambda configuration: configuration.update({"ba_local_num_images": 7}),
+                "ba_local_num_images.*6",
             ),
         )
         for label, mutate, expected in mutations:
@@ -4967,6 +4999,28 @@ class EvidenceProtocolTests(unittest.TestCase):
                     valid_outcome=True,
                 )
 
+    def test_candidate_mapper_invocation_requires_promoted_convergence_arguments(self) -> None:
+        request = evidence_request()
+        for option in (
+            "--Mapper.ba_local_max_num_iterations",
+            "--Mapper.ba_local_function_tolerance",
+            "--Mapper.ba_global_function_tolerance",
+            "--Mapper.ba_local_num_images",
+        ):
+            invocations = mapper_invocations_for_variant("candidate", request)
+            index = invocations[0]["argv"].index(option)
+            del invocations[0]["argv"][index : index + 2]
+            with self.subTest(option=option), self.assertRaisesRegex(
+                evidence.EvidenceError,
+                option.removeprefix("--Mapper."),
+            ):
+                evidence._validate_mapper_invocations(
+                    invocations,
+                    "candidate",
+                    request,
+                    valid_outcome=True,
+                )
+
     def test_mapper_invocation_requires_the_canonical_colmap_executable(self) -> None:
         request = evidence_request()
         for executable in (
@@ -4993,6 +5047,10 @@ class EvidenceProtocolTests(unittest.TestCase):
             "--Mapper.ba_global_points_ratio",
             "--Mapper.ba_global_max_refinements",
             "--Mapper.ba_local_max_refinements",
+            "--Mapper.ba_local_max_num_iterations",
+            "--Mapper.ba_local_function_tolerance",
+            "--Mapper.ba_global_function_tolerance",
+            "--Mapper.ba_local_num_images",
         )
         for option in options:
             for form in ("split", "equals"):
@@ -6140,7 +6198,7 @@ class RunnerIntegrityTests(unittest.TestCase):
                             "secondLargestModelRegisteredViewCount": 0,
                             "unionRegisteredViewCount": 30,
                         },
-                        "schemaVersion": 10,
+                        "schemaVersion": 11,
                     }
                 )
                 + b"\n"

@@ -463,6 +463,10 @@
         "ba_global_points_ratio",
         "ba_global_max_refinements",
         "ba_local_max_refinements",
+        "ba_local_max_num_iterations",
+        "ba_local_function_tolerance",
+        "ba_global_function_tolerance",
+        "ba_local_num_images",
         "trainer_iterations",
         "trainer_plateau_window",
         "deterministic_seed"
@@ -501,6 +505,10 @@
         "ba_global_points_ratio": {"enum": [1.1, 4.0]},
         "ba_global_max_refinements": {"const": 5},
         "ba_local_max_refinements": {"type": "integer", "minimum": 1},
+        "ba_local_max_num_iterations": {"const": 10},
+        "ba_local_function_tolerance": {"const": 0.001},
+        "ba_global_function_tolerance": {"const": 0.000001},
+        "ba_local_num_images": {"const": 6},
         "trainer_iterations": {"enum": [3000, 7000]},
         "trainer_plateau_window": {"enum": [400, 800]},
         "deterministic_seed": {"const": 42}

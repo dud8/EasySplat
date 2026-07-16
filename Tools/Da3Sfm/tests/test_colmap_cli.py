@@ -59,10 +59,14 @@ class _IncrementalPipelineOptions:
         "ba_local_max_refinements",
         "ba_global_max_refinements",
         "ba_global_max_num_iterations",
+        "ba_local_max_num_iterations",
+        "ba_local_function_tolerance",
+        "ba_global_function_tolerance",
         "min_num_matches",
         "random_seed",
         "ba_refine_focal_length",
         "ba_use_gpu",
+        "mapper",
     )
 
     def __init__(self) -> None:
@@ -71,10 +75,14 @@ class _IncrementalPipelineOptions:
         self.ba_local_max_refinements = 2
         self.ba_global_max_refinements = 5
         self.ba_global_max_num_iterations = 50
+        self.ba_local_max_num_iterations = 25
+        self.ba_local_function_tolerance = 0.0
+        self.ba_global_function_tolerance = 0.0
         self.min_num_matches = 15
         self.random_seed = -1
         self.ba_refine_focal_length = True
         self.ba_use_gpu = False
+        self.mapper = types.SimpleNamespace(ba_local_num_images=6)
 
 
 class _Image:
@@ -1395,6 +1403,10 @@ class ColmapCliTests(unittest.TestCase):
                 "Mapper.ba_local_max_refinements": "2",
                 "Mapper.ba_global_max_refinements": "4",
                 "Mapper.ba_global_max_num_iterations": "17",
+                "Mapper.ba_local_max_num_iterations": "10",
+                "Mapper.ba_local_function_tolerance": "0.001",
+                "Mapper.ba_global_function_tolerance": "0.000001",
+                "Mapper.ba_local_num_images": "6",
                 "Mapper.min_num_matches": "15",
                 "Mapper.random_seed": "42",
                 "Mapper.ba_refine_focal_length": "0",
@@ -1408,6 +1420,10 @@ class ColmapCliTests(unittest.TestCase):
         self.assertEqual(mapper.ba_local_max_refinements, 2)
         self.assertEqual(mapper.ba_global_max_refinements, 4)
         self.assertEqual(mapper.ba_global_max_num_iterations, 17)
+        self.assertEqual(mapper.ba_local_max_num_iterations, 10)
+        self.assertEqual(mapper.ba_local_function_tolerance, 0.001)
+        self.assertEqual(mapper.ba_global_function_tolerance, 0.000001)
+        self.assertEqual(mapper.mapper.ba_local_num_images, 6)
         self.assertEqual(mapper.min_num_matches, 15)
         self.assertEqual(mapper.random_seed, 42)
         self.assertFalse(mapper.ba_refine_focal_length)
@@ -1433,6 +1449,10 @@ class ColmapCliTests(unittest.TestCase):
             "Mapper.ba_local_max_refinements",
             "Mapper.ba_global_max_refinements",
             "Mapper.ba_global_max_num_iterations",
+            "Mapper.ba_local_max_num_iterations",
+            "Mapper.ba_local_function_tolerance",
+            "Mapper.ba_global_function_tolerance",
+            "Mapper.ba_local_num_images",
             "Mapper.min_num_matches",
             "Mapper.random_seed",
             "Mapper.ba_refine_focal_length",
@@ -1463,6 +1483,10 @@ class ColmapCliTests(unittest.TestCase):
         self.assertEqual(options.ba_local_max_refinements, 2)
         self.assertEqual(options.ba_global_max_refinements, 5)
         self.assertEqual(options.ba_global_max_num_iterations, 50)
+        self.assertEqual(options.ba_local_max_num_iterations, 25)
+        self.assertEqual(options.ba_local_function_tolerance, 0.0)
+        self.assertEqual(options.ba_global_function_tolerance, 0.0)
+        self.assertEqual(options.mapper.ba_local_num_images, 6)
         self.assertEqual(options.min_num_matches, 15)
         self.assertEqual(options.random_seed, 42)
         self.assertTrue(options.ba_refine_focal_length)
@@ -1483,6 +1507,10 @@ class ColmapCliTests(unittest.TestCase):
             "Mapper.ba_local_max_refinements": ("0", "-1", "1.5"),
             "Mapper.ba_global_max_refinements": ("0", "-1", "1.5"),
             "Mapper.ba_global_max_num_iterations": ("0", "-1", "1.5"),
+            "Mapper.ba_local_max_num_iterations": ("0", "-1", "1.5"),
+            "Mapper.ba_local_function_tolerance": ("-0.001", "nan", "inf", "bad"),
+            "Mapper.ba_global_function_tolerance": ("-0.001", "nan", "inf", "bad"),
+            "Mapper.ba_local_num_images": ("0", "-1", "1.5"),
             "Mapper.min_num_matches": ("0", "-1", "1.5"),
             "Mapper.random_seed": ("-1", "2147483648", "1.5"),
             "Mapper.ba_refine_focal_length": ("true", "false", "2"),

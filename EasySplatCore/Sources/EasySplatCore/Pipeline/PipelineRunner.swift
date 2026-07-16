@@ -2911,6 +2911,10 @@ public final class PipelineRunner: @unchecked Sendable {
                                     globalMaxRefinements: cadence.globalMaxRefinements,
                                     globalMaxNumIterations:
                                         resolvedRunPlan.refinementIterationLimit,
+                                    localMaxNumIterations: cadence.localMaxNumIterations,
+                                    localFunctionTolerance: cadence.localFunctionTolerance,
+                                    globalFunctionTolerance: cadence.globalFunctionTolerance,
+                                    localImageCount: cadence.localImageCount,
                                     randomSeed: resolvedRunPlan.deterministicSeed,
                                     refineFocalLength: true
                                 ),

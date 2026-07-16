@@ -81,6 +81,10 @@ _REQUIRED_OPTION_FIELDS = {
         "ba_local_max_refinements",
         "ba_global_max_refinements",
         "ba_global_max_num_iterations",
+        "ba_local_max_num_iterations",
+        "ba_local_function_tolerance",
+        "ba_global_function_tolerance",
+        "mapper.ba_local_num_images",
         "min_num_matches",
         "random_seed",
         "ba_refine_focal_length",
@@ -157,6 +161,10 @@ _COMMAND_OPTIONS = {
         "Mapper.ba_local_max_refinements",
         "Mapper.ba_global_max_refinements",
         "Mapper.ba_global_max_num_iterations",
+        "Mapper.ba_local_max_num_iterations",
+        "Mapper.ba_local_function_tolerance",
+        "Mapper.ba_global_function_tolerance",
+        "Mapper.ba_local_num_images",
         "Mapper.min_num_matches",
         "Mapper.random_seed",
         "Mapper.ba_refine_focal_length",
@@ -280,6 +288,21 @@ def _refinement_ratio(options: dict[str, str], name: str, default: float) -> flo
         raise ColmapCliError(f"--{name} must be a finite number")
     if value <= 1.0:
         raise ColmapCliError(f"--{name} must be greater than 1.0")
+    return value
+
+
+def _nonnegative_finite_number(
+    options: dict[str, str], name: str, default: float
+) -> float:
+    text = options.get(name)
+    if text is None:
+        return default
+    try:
+        value = float(text)
+    except ValueError as exc:
+        raise ColmapCliError(f"--{name} must be finite and nonnegative") from exc
+    if not math.isfinite(value) or value < 0:
+        raise ColmapCliError(f"--{name} must be finite and nonnegative")
     return value
 
 
@@ -1138,6 +1161,26 @@ def _run_mapper(pycolmap: Any, options: dict[str, str]) -> None:
         options,
         "Mapper.ba_global_max_num_iterations",
         pipeline.ba_global_max_num_iterations,
+    )
+    pipeline.ba_local_max_num_iterations = _positive_integer(
+        options,
+        "Mapper.ba_local_max_num_iterations",
+        pipeline.ba_local_max_num_iterations,
+    )
+    pipeline.ba_local_function_tolerance = _nonnegative_finite_number(
+        options,
+        "Mapper.ba_local_function_tolerance",
+        pipeline.ba_local_function_tolerance,
+    )
+    pipeline.ba_global_function_tolerance = _nonnegative_finite_number(
+        options,
+        "Mapper.ba_global_function_tolerance",
+        pipeline.ba_global_function_tolerance,
+    )
+    pipeline.mapper.ba_local_num_images = _positive_integer(
+        options,
+        "Mapper.ba_local_num_images",
+        pipeline.mapper.ba_local_num_images,
     )
     pipeline.min_num_matches = _positive_integer(
         options,

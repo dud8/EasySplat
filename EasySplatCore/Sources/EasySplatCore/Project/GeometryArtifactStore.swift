@@ -496,12 +496,7 @@ enum GeometryArtifactStore {
             guard !hasLearnedProvenance,
                   pairGraphStatus == .measured,
                   let cadence = artifact.incrementalCadence,
-                  cadence.localMaxRefinements > 0,
-                  cadence.globalFramesRatio.isFinite,
-                  cadence.globalFramesRatio > 1,
-                  cadence.globalPointsRatio.isFinite,
-                  cadence.globalPointsRatio > 1,
-                  cadence.globalMaxRefinements > 0 else {
+                  cadence.isValid else {
                 throw Error.invalidMapping
             }
         case .seededBundleAdjustment:

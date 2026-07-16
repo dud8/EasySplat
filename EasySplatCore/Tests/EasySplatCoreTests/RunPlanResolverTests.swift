@@ -66,6 +66,10 @@ final class RunPlanResolverTests: XCTestCase {
         XCTAssertEqual(plan.baGlobalPointsRatio, 1.1)
         XCTAssertEqual(plan.baLocalMaxRefinements, 2)
         XCTAssertEqual(plan.baGlobalMaxRefinements, 5)
+        XCTAssertEqual(plan.baLocalMaxNumIterations, 10)
+        XCTAssertEqual(plan.baLocalFunctionTolerance, 0.001)
+        XCTAssertEqual(plan.baGlobalFunctionTolerance, 0.000_001)
+        XCTAssertEqual(plan.baLocalImageCount, 6)
         XCTAssertEqual(plan.deterministicSeed, 42)
         XCTAssertEqual(
             plan.requiredToolchainCapabilities,
@@ -105,6 +109,10 @@ final class RunPlanResolverTests: XCTestCase {
             XCTAssertEqual(plan.baGlobalPointsRatio, 4, "capture path: \(capturePath)")
             XCTAssertEqual(plan.baLocalMaxRefinements, 1, "capture path: \(capturePath)")
             XCTAssertEqual(plan.baGlobalMaxRefinements, 5, "capture path: \(capturePath)")
+            XCTAssertEqual(plan.baLocalMaxNumIterations, 10, "capture path: \(capturePath)")
+            XCTAssertEqual(plan.baLocalFunctionTolerance, 0.001, "capture path: \(capturePath)")
+            XCTAssertEqual(plan.baGlobalFunctionTolerance, 0.000_001, "capture path: \(capturePath)")
+            XCTAssertEqual(plan.baLocalImageCount, 6, "capture path: \(capturePath)")
         }
     }
 
@@ -966,6 +974,54 @@ final class RunPlanResolverTests: XCTestCase {
 
         mappingPolicyPlan = currentVideoPlan
         mappingPolicyPlan.deterministicSeed = 43
+        XCTAssertEqual(
+            RunPlanResolver.safeResumeStage(
+                .exportSplat,
+                input: video,
+                previousPlan: currentVideoPlan,
+                currentPlan: mappingPolicyPlan
+            ),
+            .sfmMatching
+        )
+
+        mappingPolicyPlan = currentVideoPlan
+        mappingPolicyPlan.baLocalMaxNumIterations = 11
+        XCTAssertEqual(
+            RunPlanResolver.safeResumeStage(
+                .exportSplat,
+                input: video,
+                previousPlan: currentVideoPlan,
+                currentPlan: mappingPolicyPlan
+            ),
+            .sfmMatching
+        )
+
+        mappingPolicyPlan = currentVideoPlan
+        mappingPolicyPlan.baLocalFunctionTolerance = 0.002
+        XCTAssertEqual(
+            RunPlanResolver.safeResumeStage(
+                .exportSplat,
+                input: video,
+                previousPlan: currentVideoPlan,
+                currentPlan: mappingPolicyPlan
+            ),
+            .sfmMatching
+        )
+
+        mappingPolicyPlan = currentVideoPlan
+        mappingPolicyPlan.baGlobalFunctionTolerance = 0.000_002
+        XCTAssertEqual(
+            RunPlanResolver.safeResumeStage(
+                .exportSplat,
+                input: video,
+                previousPlan: currentVideoPlan,
+                currentPlan: mappingPolicyPlan
+            ),
+            .sfmMatching
+        )
+
+        mappingPolicyPlan = currentVideoPlan
+        mappingPolicyPlan.baLocalImageCount = 7
         XCTAssertEqual(
             RunPlanResolver.safeResumeStage(
                 .exportSplat,

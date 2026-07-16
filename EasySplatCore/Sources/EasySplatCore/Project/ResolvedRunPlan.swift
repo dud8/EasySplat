@@ -81,6 +81,10 @@ public struct ResolvedRunPlan: Codable, Sendable, Equatable {
     public var baGlobalPointsRatio: Double
     public var baLocalMaxRefinements: Int
     public var baGlobalMaxRefinements: Int
+    public var baLocalMaxNumIterations: Int
+    public var baLocalFunctionTolerance: Double
+    public var baGlobalFunctionTolerance: Double
+    public var baLocalImageCount: Int
     public var deterministicSeed: UInt64
 
     public init(
@@ -119,6 +123,10 @@ public struct ResolvedRunPlan: Codable, Sendable, Equatable {
         baGlobalPointsRatio: Double = 1.1,
         baLocalMaxRefinements: Int = 2,
         baGlobalMaxRefinements: Int = 5,
+        baLocalMaxNumIterations: Int = 10,
+        baLocalFunctionTolerance: Double = 0.001,
+        baGlobalFunctionTolerance: Double = 0.000_001,
+        baLocalImageCount: Int = 6,
         deterministicSeed: UInt64 = 42
     ) {
         self.routeIdentifier = routeIdentifier
@@ -156,6 +164,10 @@ public struct ResolvedRunPlan: Codable, Sendable, Equatable {
         self.baGlobalPointsRatio = baGlobalPointsRatio
         self.baLocalMaxRefinements = baLocalMaxRefinements
         self.baGlobalMaxRefinements = baGlobalMaxRefinements
+        self.baLocalMaxNumIterations = baLocalMaxNumIterations
+        self.baLocalFunctionTolerance = baLocalFunctionTolerance
+        self.baGlobalFunctionTolerance = baGlobalFunctionTolerance
+        self.baLocalImageCount = baLocalImageCount
         self.deterministicSeed = deterministicSeed
     }
 
@@ -194,7 +206,11 @@ public struct ResolvedRunPlan: Codable, Sendable, Equatable {
             localMaxRefinements: baLocalMaxRefinements,
             globalFramesRatio: baGlobalFramesRatio,
             globalPointsRatio: baGlobalPointsRatio,
-            globalMaxRefinements: baGlobalMaxRefinements
+            globalMaxRefinements: baGlobalMaxRefinements,
+            localMaxNumIterations: baLocalMaxNumIterations,
+            localFunctionTolerance: baLocalFunctionTolerance,
+            globalFunctionTolerance: baGlobalFunctionTolerance,
+            localImageCount: baLocalImageCount
         )
     }
 
@@ -224,7 +240,13 @@ public struct ResolvedRunPlan: Codable, Sendable, Equatable {
               baGlobalPointsRatio.isFinite,
               baGlobalPointsRatio > 1,
               baLocalMaxRefinements > 0,
-              baGlobalMaxRefinements > 0 else {
+              baGlobalMaxRefinements > 0,
+              baLocalMaxNumIterations > 0,
+              baLocalFunctionTolerance.isFinite,
+              baLocalFunctionTolerance > 0,
+              baGlobalFunctionTolerance.isFinite,
+              baGlobalFunctionTolerance > 0,
+              baLocalImageCount > 0 else {
             throw ResolvedRunPlanValidationError.invalidBundleAdjustmentConfiguration
         }
     }

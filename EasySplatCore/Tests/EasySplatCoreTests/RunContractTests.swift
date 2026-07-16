@@ -64,15 +64,15 @@ final class RequestedRunOptionsTests: XCTestCase {
     }
 }
 
-final class ProjectMetadataVersionNineTests: XCTestCase {
-    func testNewMetadataUsesVersionNineAndSuppliedRequestedOptions() {
+final class ProjectMetadataVersionTenTests: XCTestCase {
+    func testNewMetadataUsesVersionTenAndSuppliedRequestedOptions() {
         let metadata = ProjectMetadata(
             title: "New project",
             input: .photos(folder: "/tmp/photos"),
             requestedRunOptions: RequestedRunOptions(capturePath: .orbit, detailProfile: .balanced)
         )
 
-        XCTAssertEqual(ProjectMetadataStore.supportedFormatVersion, 9)
+        XCTAssertEqual(ProjectMetadataStore.supportedFormatVersion, 10)
         XCTAssertEqual(metadata.formatVersion, ProjectMetadataStore.supportedFormatVersion)
         XCTAssertEqual(
             metadata.requestedRunOptions,
