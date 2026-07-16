@@ -308,10 +308,6 @@ class MetalKitSceneRenderer: NSObject, MTKViewDelegate {
         requestDraw()
     }
 
-    func zoom(delta: Float) {
-        zoomByScroll(delta: delta, anchoredAt: nil)
-    }
-
     func zoomByScroll(delta: Float, anchoredAt pointer: CGPoint?) {
         cameraState.zoomByScroll(delta: delta, anchoredAt: pointer)
         requestDraw()

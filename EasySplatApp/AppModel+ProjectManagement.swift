@@ -393,6 +393,9 @@ extension AppModel {
         guard persistedMetadata.state.stage == .done,
               persistedMetadata.state.lastError == nil,
               let relativePath = persistedMetadata.outputs?.splatPlyPath,
+              let trainingArtifact = persistedMetadata.trainingArtifact,
+              trainingArtifact.completionStatus == .completed,
+              trainingArtifact.outputPath == relativePath,
               let outputURL = try? ProjectPaths(root: projectURL)
                 .resolveProjectRelativePath(relativePath) else {
             return nil
@@ -403,16 +406,12 @@ extension AppModel {
                 return nil
             }
         case .full:
-            if let trainingArtifact = persistedMetadata.trainingArtifact {
-                do {
-                    try TrainingArtifactStore.validateCompletedOutput(
-                        trainingArtifact,
-                        at: outputURL
-                    )
-                } catch {
-                    return nil
-                }
-            } else if ProjectArtifactValidator.validatePlyFile(at: outputURL) != .valid {
+            do {
+                try TrainingArtifactStore.validateCompletedOutput(
+                    trainingArtifact,
+                    at: outputURL
+                )
+            } catch {
                 return nil
             }
         }

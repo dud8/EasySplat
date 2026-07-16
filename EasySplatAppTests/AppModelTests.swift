@@ -1713,6 +1713,10 @@ final class AppModelTests: XCTestCase {
             title: "Project",
             input: .photos(folder: "/tmp/photos"),
             requestedRunOptions: options,
+            trainingArtifact: try makeCompletedTrainingArtifact(
+                for: output,
+                detailProfile: .highDetail
+            ),
             state: PipelineState(stage: .done, lastError: nil),
             outputs: OutputSpec(splatPlyPath: "Output/splat.ply", colmapModelPath: "SfM/colmap/sparse/0")
         )
@@ -2272,6 +2276,33 @@ final class AppModelTests: XCTestCase {
         XCTAssertNil(model.readyOutputURL(projectURL: projectURL, validationDepth: .quick))
     }
 
+    func testRefreshProjectSummariesDoesNotMarkBarePlyReady() throws {
+        let base = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: base) }
+        try FileManager.default.createDirectory(at: base, withIntermediateDirectories: true)
+        let projectURL = base.appendingPathComponent("BareOutput.easysplatproj", isDirectory: true)
+        let paths = ProjectPaths(root: projectURL)
+        try paths.ensureDirectories()
+        try writeMinimalPly(at: paths.outputURL.appendingPathComponent("splat.ply"))
+        let metadata = ProjectMetadata(
+            title: "Bare Output",
+            input: .photos(folder: "/tmp/photos"),
+            requestedRunOptions: RequestedRunOptions(capturePath: .orbit, detailProfile: .balanced),
+            state: PipelineState(stage: .done, lastError: nil),
+            outputs: OutputSpec(splatPlyPath: "Output/splat.ply", colmapModelPath: "SfM/colmap/sparse/0")
+        )
+        try ProjectMetadataStore.save(metadata, to: paths.metadataURL)
+
+        let model = AppModel(toolchainManager: MockToolchainManager(), projectBaseURL: base) { _, config in
+            MockPipelineRunner(projectURL: base, config: config)
+        }
+        model.refreshProjectSummaries()
+
+        XCTAssertEqual(model.projectSummaries.first?.status, .failed)
+        XCTAssertNil(model.readyOutputURL(projectURL: projectURL, validationDepth: .quick))
+        XCTAssertNil(model.readyOutputURL(projectURL: projectURL, validationDepth: .full))
+    }
+
     func testRefreshProjectSummariesDoesNotDeepScanLargeAsciiOutput() throws {
         let base = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
         defer { try? FileManager.default.removeItem(at: base) }
@@ -2301,12 +2332,16 @@ final class AppModelTests: XCTestCase {
         end_header
         0 0 0 1 1 1 -4 -4 -4 1 1 0 0 0
         """.write(to: paths.outputURL.appendingPathComponent("splat.ply"), atomically: true, encoding: .utf8)
-        let metadata = ProjectMetadata(
+        var metadata = ProjectMetadata(
             title: "LargeAsciiOutput",
             input: .photos(folder: "/tmp/photos"),
             requestedRunOptions: RequestedRunOptions(capturePath: .orbit, detailProfile: .balanced),
             state: PipelineState(stage: .done, lastError: nil),
             outputs: OutputSpec(splatPlyPath: "Output/splat.ply", colmapModelPath: "SfM/colmap/sparse/0")
+        )
+        metadata.trainingArtifact = try makeCompletedTrainingArtifact(
+            for: paths.outputURL.appendingPathComponent("splat.ply"),
+            detailProfile: .balanced
         )
         try ProjectMetadataStore.save(metadata, to: paths.metadataURL)
 
@@ -2814,14 +2849,18 @@ final class AppModelTests: XCTestCase {
         try FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
         let paths = ProjectPaths(root: url)
         try paths.ensureDirectories()
+        let outputURL = paths.outputURL.appendingPathComponent("splat.ply")
         if withOutput {
             try FileManager.default.createDirectory(at: paths.outputURL, withIntermediateDirectories: true)
-            try writeMinimalPly(at: paths.outputURL.appendingPathComponent("splat.ply"))
+            try writeMinimalPly(at: outputURL)
         }
         let metadata = ProjectMetadata(
             title: name,
             input: .photos(folder: "/tmp/photos"),
             requestedRunOptions: RequestedRunOptions(capturePath: .orbit, detailProfile: .balanced),
+            trainingArtifact: withOutput
+                ? try makeCompletedTrainingArtifact(for: outputURL, detailProfile: .balanced)
+                : nil,
             state: PipelineState(stage: stage, lastError: lastError),
             outputs: withOutput ? OutputSpec(splatPlyPath: "Output/splat.ply", colmapModelPath: "SfM/colmap/sparse/0") : nil,
             checkpoint: checkpoint,
@@ -3146,6 +3185,10 @@ final class MockPipelineRunner: PipelineRunning {
         try FileManager.default.createDirectory(at: paths.outputURL, withIntermediateDirectories: true)
         try writeMinimalPly(at: outputURL)
         metadata.outputs = OutputSpec(splatPlyPath: "Output/splat.ply", colmapModelPath: "SfM/colmap/sparse/0")
+        metadata.trainingArtifact = try makeCompletedTrainingArtifact(
+            for: outputURL,
+            detailProfile: metadata.effectiveDetailProfile
+        )
         metadata.state = PipelineState(stage: .done, lastError: nil)
         try ProjectMetadataStore.save(metadata, to: paths.metadataURL)
     }
@@ -3172,6 +3215,10 @@ final class ResumeRecordingPipelineRunner: PipelineRunning {
         metadata.outputs = OutputSpec(
             splatPlyPath: "Output/splat.ply",
             colmapModelPath: "SfM/colmap/sparse/0"
+        )
+        metadata.trainingArtifact = try makeCompletedTrainingArtifact(
+            for: outputURL,
+            detailProfile: metadata.effectiveDetailProfile
         )
         metadata.state = PipelineState(stage: .done, lastError: nil)
         try ProjectMetadataStore.save(metadata, to: paths.metadataURL)
@@ -3214,6 +3261,10 @@ final class DirectoryOutputRepairingPipelineRunner: PipelineRunning {
 
         var metadata = try ProjectMetadataStore.load(from: paths.metadataURL)
         metadata.outputs = OutputSpec(splatPlyPath: "Output/splat.ply", colmapModelPath: "SfM/colmap/sparse/0")
+        metadata.trainingArtifact = try makeCompletedTrainingArtifact(
+            for: outputURL,
+            detailProfile: metadata.effectiveDetailProfile
+        )
         metadata.state = PipelineState(stage: .done, lastError: nil)
         try ProjectMetadataStore.save(metadata, to: paths.metadataURL)
     }
@@ -3257,5 +3308,50 @@ private func writeMinimalPly(at url: URL, vertexCount: Int = 1) throws {
     \(body)
     """
     try text.write(to: url, atomically: true, encoding: .utf8)
+}
+
+private func makeCompletedTrainingArtifact(
+    for outputURL: URL,
+    detailProfile: DetailProfile
+) throws -> TrainingArtifact {
+    let budget: (iterationLimit: Int, plateauWindow: Int) = switch detailProfile {
+    case .fast: (3_000, 400)
+    case .balanced: (7_000, 800)
+    case .highDetail: (15_000, 1_500)
+    }
+    guard let header = ProjectArtifactValidator.readPlyHeader(at: outputURL),
+          let fileSize = try outputURL.resourceValues(forKeys: [.fileSizeKey]).fileSize else {
+        throw CocoaError(.fileReadCorruptFile)
+    }
+    return TrainingArtifact(
+        trainerVersion: "test",
+        runtimeVersion: "native-metal-cli-v2",
+        trainerBuildDigest: String(repeating: "a", count: 64),
+        inputDigest: String(repeating: "b", count: 64),
+        geometryDigest: String(repeating: "c", count: 64),
+        detailProfile: detailProfile,
+        iterationLimit: budget.iterationLimit,
+        plateauWindow: budget.plateauWindow,
+        deterministicSeed: 42,
+        completedIteration: 1,
+        checkpointPath: nil,
+        checkpointDigest: nil,
+        outputPath: "Output/splat.ply",
+        outputSHA256: try GeometryArtifactStore.sha256(of: outputURL),
+        outputBytes: Int64(fileSize),
+        gaussianCount: header.vertexCount,
+        elapsedSeconds: 1,
+        peakMemoryBytes: 1,
+        memoryBudgetBytes: 1,
+        rasterFallbackCount: 0,
+        rasterExactFallbackElapsedSeconds: 0,
+        rasterExactBufferGrowthCount: 0,
+        rasterExactBufferBytesAdded: 0,
+        rasterReplayElapsedSeconds: 0,
+        rasterPeakExactIntersectionCapacity: 0,
+        droppedIntersectionCount: 0,
+        sceneBounds: SplatSceneBounds(center: .init(x: 0, y: 0, z: 0), radius: 1),
+        completionStatus: .completed
+    )
 }
 #endif

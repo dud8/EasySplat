@@ -895,7 +895,7 @@ final class ResultWorkspaceTests: XCTestCase {
         in base: URL,
         validOutput: Bool,
         stage: PipelineStage = .done,
-        includeTrainingArtifact: Bool = false
+        includeTrainingArtifact: Bool = true
     ) throws -> URL {
         let projectURL = base.appendingPathComponent("Result.easysplatproj", isDirectory: true)
         let paths = ProjectPaths(root: projectURL)
