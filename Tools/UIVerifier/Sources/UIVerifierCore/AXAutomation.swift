@@ -320,6 +320,20 @@ final class AXApplicationController {
         try await Task.sleep(for: .milliseconds(120))
     }
 
+    func pressAdvertisedAccessibilityAction(
+        identifier: String,
+        timeoutSeconds: Double = 8
+    ) async throws {
+        let element = try await waitForElement(identifier: identifier, timeoutSeconds: timeoutSeconds)
+        guard Self.supportsPressAction(actionNames(of: element)) else {
+            throw AXAutomationError.actionFailed("\(identifier) does not advertise AXPress")
+        }
+        guard AXUIElementPerformAction(element, kAXPressAction as CFString) == .success else {
+            throw AXAutomationError.actionFailed("performing AXPress on \(identifier)")
+        }
+        try await Task.sleep(for: .milliseconds(120))
+    }
+
     func press(named name: String, timeoutSeconds: Double = 5) async throws {
         let element = try await waitForElement(named: name, timeoutSeconds: timeoutSeconds)
         try press(element, description: name)
@@ -337,14 +351,123 @@ final class AXApplicationController {
         try await Task.sleep(for: .milliseconds(120))
     }
 
-    func pressAndCancelDialog(identifier: String, relativeTo mainWindow: AXUIElement) async throws {
+    func pressAndCancelSavePanel(
+        identifier: String,
+        title: String,
+        relativeTo mainWindow: AXUIElement
+    ) async throws {
         try await press(identifier: identifier)
-        guard await waitForDialog(relativeTo: mainWindow, presented: true) else {
-            throw AXAutomationError.actionFailed("opening the dialog from \(identifier)")
+        guard await waitForNativeSavePanel(
+            relativeTo: mainWindow,
+            title: title,
+            presented: true
+        ) else {
+            throw AXAutomationError.actionFailed("opening the save panel from \(identifier)")
         }
-        try sendKey(CGKeyCode(53))
-        guard await waitForDialog(relativeTo: mainWindow, presented: false) else {
-            throw AXAutomationError.actionFailed("cancelling the dialog from \(identifier)")
+        guard let panel = nativeSavePanel(relativeTo: mainWindow, title: title),
+              let cancel = savePanelCancelButton(in: panel) else {
+            throw AXAutomationError.elementNotFound("the Cancel button in the \(identifier) save panel")
+        }
+        _ = AXUIElementPerformAction(cancel, kAXPressAction as CFString)
+        guard await waitForNativeSavePanel(
+            relativeTo: mainWindow,
+            title: title,
+            presented: false
+        ) else {
+            throw AXAutomationError.actionFailed("cancelling the save panel from \(identifier)")
+        }
+    }
+
+    func pressAndCancelConfirmation(
+        identifier: String,
+        title: String,
+        actionTitle: String,
+        relativeTo mainWindow: AXUIElement
+    ) async throws {
+        try await press(identifier: identifier)
+        guard await waitForNativeConfirmation(
+            relativeTo: mainWindow,
+            title: title,
+            actionTitle: actionTitle,
+            presented: true
+        ) else {
+            throw AXAutomationError.actionFailed("opening the confirmation from \(identifier)")
+        }
+        guard let confirmation = nativeConfirmation(
+            relativeTo: mainWindow,
+            title: title,
+            actionTitle: actionTitle
+        ), let cancel = cancelButton(in: confirmation) else {
+            throw AXAutomationError.elementNotFound("the Cancel button in the \(identifier) confirmation")
+        }
+        // SwiftUI dismisses this native sheet even when AX reports an error for the handled press.
+        _ = AXUIElementPerformAction(cancel, kAXPressAction as CFString)
+        guard await waitForNativeConfirmation(
+            relativeTo: mainWindow,
+            title: title,
+            actionTitle: actionTitle,
+            presented: false
+        ) else {
+            throw AXAutomationError.actionFailed("cancelling the confirmation from \(identifier)")
+        }
+    }
+
+    nonisolated static func isNativeConfirmationPresentation(
+        _ nodes: [AccessibilityNodeSnapshot],
+        title: String,
+        actionTitle: String,
+        presentationVisible: Bool = true
+    ) -> Bool {
+        guard presentationVisible else { return false }
+        guard let root = nodes.min(by: { $0.order < $1.order }) else { return false }
+        let isPresentation = root.role == "AXSheet"
+            || root.role == "AXPopover"
+            || (root.role == "AXWindow" && root.subrole == "AXDialog")
+        guard isPresentation else { return false }
+
+        func hasExactName(_ node: AccessibilityNodeSnapshot, _ expected: String) -> Bool {
+            [node.title, node.label, node.value, node.placeholder]
+                .compactMap { $0?.trimmingCharacters(in: .whitespacesAndNewlines) }
+                .contains(expected)
+        }
+
+        let hasTitle = nodes.contains { node in
+            node.role == "AXStaticText" && hasExactName(node, title)
+        }
+        let hasAction = nodes.contains { node in
+            node.role == "AXButton"
+                && node.enabled
+                && node.actions.contains("AXPress")
+                && hasExactName(node, actionTitle)
+        }
+        let hasCancel = nodes.contains { node in
+            node.role == "AXButton"
+                && node.enabled
+                && node.actions.contains("AXPress")
+                && hasExactName(node, "Cancel")
+        }
+        return hasTitle && hasAction && hasCancel
+    }
+
+    nonisolated static func isNativeSavePanelPresentation(
+        _ nodes: [AccessibilityNodeSnapshot],
+        title: String,
+        presentationVisible: Bool = true
+    ) -> Bool {
+        guard presentationVisible else { return false }
+        guard let root = nodes.min(by: { $0.order < $1.order }),
+              root.role == "AXWindow",
+              root.subrole == "AXStandardWindow",
+              root.title?.trimmingCharacters(in: .whitespacesAndNewlines) == title,
+              root.identifier == "save-panel" else { return false }
+        return nodes.contains { node in
+            node.role == "AXButton"
+                && node.enabled
+                && node.identifier == "CancelButton"
+                && node.actions.contains("AXPress")
+                && [node.title, node.label, node.value]
+                    .compactMap { $0?.trimmingCharacters(in: .whitespacesAndNewlines) }
+                    .contains("Cancel")
         }
     }
 
@@ -394,7 +517,10 @@ final class AXApplicationController {
             order.append(nextName)
         }
 
-        try sendKey(CGKeyCode(48), flags: .maskShift)
+        try sendKey(
+            CGKeyCode(48),
+            flags: Self.reverseTraversalFlags(forRole: stringAttribute(next, kAXRoleAttribute))
+        )
         try await Task.sleep(for: .milliseconds(120))
         guard let returned = focusedApplicationElement(),
               stringAttribute(returned, kAXIdentifierAttribute) == "result.viewer" else {
@@ -406,6 +532,15 @@ final class AXApplicationController {
             order.append("result.viewer")
         }
         return order
+    }
+
+    nonisolated static func reverseTraversalFlags(forRole role: String?) -> CGEventFlags {
+        switch role {
+        case "AXTextArea", "AXTextField":
+            [.maskControl, .maskShift]
+        default:
+            .maskShift
+        }
     }
 
     func performViewerShortcutGroup(_ group: ViewerShortcutGroup) async throws {
@@ -524,7 +659,8 @@ final class AXApplicationController {
     }
 
     private func press(_ element: AXUIElement, description: String) throws {
-        if AXUIElementPerformAction(element, kAXPressAction as CFString) == .success {
+        if Self.supportsPressAction(actionNames(of: element)),
+           AXUIElementPerformAction(element, kAXPressAction as CFString) == .success {
             return
         }
         if let actionable = findElement(in: element, matching: {
@@ -533,6 +669,10 @@ final class AXApplicationController {
             return
         }
         try click(element, description: description)
+    }
+
+    nonisolated static func supportsPressAction(_ actions: [String]) -> Bool {
+        actions.contains(kAXPressAction as String)
     }
 
     private func click(_ element: AXUIElement, description: String) throws {
@@ -665,6 +805,124 @@ final class AXApplicationController {
             try? await Task.sleep(for: .milliseconds(100))
         } while Date() < deadline
         return false
+    }
+
+    private func waitForNativeConfirmation(
+        relativeTo mainWindow: AXUIElement,
+        title: String,
+        actionTitle: String,
+        presented: Bool,
+        timeoutSeconds: Double = 5
+    ) async -> Bool {
+        let deadline = Date().addingTimeInterval(timeoutSeconds)
+        repeat {
+            let found = nativeConfirmation(
+                relativeTo: mainWindow,
+                title: title,
+                actionTitle: actionTitle
+            ) != nil
+            if found == presented {
+                return true
+            }
+            try? await Task.sleep(for: .milliseconds(100))
+        } while Date() < deadline
+        return false
+    }
+
+    private func waitForNativeSavePanel(
+        relativeTo mainWindow: AXUIElement,
+        title: String,
+        presented: Bool,
+        timeoutSeconds: Double = 5
+    ) async -> Bool {
+        let deadline = Date().addingTimeInterval(timeoutSeconds)
+        repeat {
+            let found = nativeSavePanel(relativeTo: mainWindow, title: title) != nil
+            if found == presented {
+                return true
+            }
+            try? await Task.sleep(for: .milliseconds(100))
+        } while Date() < deadline
+        return false
+    }
+
+    private func nativeConfirmation(
+        relativeTo mainWindow: AXUIElement,
+        title: String,
+        actionTitle: String
+    ) -> AXUIElement? {
+        nativePresentationElements(relativeTo: mainWindow).first { presentation in
+            Self.isNativeConfirmationPresentation(
+                snapshots(from: presentation),
+                title: title,
+                actionTitle: actionTitle,
+                presentationVisible: isNativePresentationVisible(presentation)
+            )
+        }
+    }
+
+    private func nativeSavePanel(
+        relativeTo mainWindow: AXUIElement,
+        title: String
+    ) -> AXUIElement? {
+        elementsAttribute(application, kAXWindowsAttribute).first { window in
+            !CFEqual(window, mainWindow)
+                && isUsableWindow(window)
+                && Self.isNativeSavePanelPresentation(
+                    snapshots(from: window),
+                    title: title,
+                    presentationVisible: isNativePresentationVisible(window)
+                )
+        }
+    }
+
+    private func nativePresentationElements(relativeTo mainWindow: AXUIElement) -> [AXUIElement] {
+        let attached = elementsAttribute(mainWindow, kAXChildrenAttribute).filter { element in
+            let role = stringAttribute(element, kAXRoleAttribute)
+            return (role == "AXSheet" || role == "AXPopover")
+                && isNativePresentationVisible(element)
+        }
+        let dialogWindows = elementsAttribute(application, kAXWindowsAttribute).filter { window in
+            !CFEqual(window, mainWindow)
+                && isUsableWindow(window)
+                && isNativePresentationVisible(window)
+        }
+        return attached + dialogWindows
+    }
+
+    private func isNativePresentationVisible(_ presentation: AXUIElement) -> Bool {
+        guard boolAttribute(presentation, "AXVisible") != false,
+              let presentationFrame = frame(of: presentation),
+              !presentationFrame.isEmpty else { return false }
+        return true
+    }
+
+    private func cancelButton(in confirmation: AXUIElement) -> AXUIElement? {
+        findElement(in: confirmation, matching: { element in
+            stringAttribute(element, kAXRoleAttribute) == "AXButton"
+                && (boolAttribute(element, kAXEnabledAttribute) ?? true)
+                && actionNames(of: element).contains(kAXPressAction as String)
+                && [
+                    stringAttribute(element, kAXDescriptionAttribute),
+                    stringAttribute(element, kAXTitleAttribute),
+                    stringAttribute(element, kAXValueAttribute),
+                    stringAttribute(element, kAXHelpAttribute),
+                ].compactMap { $0 }.contains("Cancel")
+        })
+    }
+
+    private func savePanelCancelButton(in panel: AXUIElement) -> AXUIElement? {
+        findElement(in: panel, matching: { element in
+            stringAttribute(element, kAXRoleAttribute) == "AXButton"
+                && stringAttribute(element, kAXIdentifierAttribute) == "CancelButton"
+                && (boolAttribute(element, kAXEnabledAttribute) ?? true)
+                && actionNames(of: element).contains(kAXPressAction as String)
+                && [
+                    stringAttribute(element, kAXDescriptionAttribute),
+                    stringAttribute(element, kAXTitleAttribute),
+                    stringAttribute(element, kAXValueAttribute),
+                ].compactMap { $0 }.contains("Cancel")
+        })
     }
 
     private func isDialogPresented(relativeTo mainWindow: AXUIElement) -> Bool {

@@ -73,7 +73,6 @@ struct ProjectSidebar: View {
                         ForEach(visibleProjects, id: \.url) { project in
                             projectRow(project)
                                 .tag(Self.selectionID(for: project))
-                                .accessibilityIdentifier(Self.rowAccessibilityIdentifier(for: project.url))
                                 .contextMenu { projectMenu(project) }
                         }
                     }
@@ -168,25 +167,16 @@ struct ProjectSidebar: View {
 
     private func projectRow(_ project: ProjectSummary) -> some View {
         HStack(spacing: Theme.Spacing.small) {
-            VStack(alignment: .leading, spacing: 3) {
-                Text(project.title)
-                    .font(.body)
-                    .lineLimit(1)
-                    .truncationMode(.middle)
-                    .help(project.title)
-
-                HStack(spacing: Theme.Spacing.small) {
-                    Text(statusText(for: project))
-                    Spacer(minLength: Theme.Spacing.small)
-                    Text(project.lastActivityAt.formatted(date: .abbreviated, time: .omitted))
-                }
-                .font(.caption)
-                .foregroundStyle(.secondary)
+            if project.status == .ready && !isRunActive {
+                projectLabel(project)
+                    .accessibilityAddTraits(.isButton)
+                    .accessibilityHint("Open project")
+                    .accessibilityAction {
+                        _ = open(project)
+                    }
+            } else {
+                projectLabel(project)
             }
-            .accessibilityElement(children: .combine)
-            .accessibilityLabel(
-                "\(project.title), \(statusText(for: project)), \(project.lastActivityAt.formatted(date: .long, time: .omitted))"
-            )
 
             if !isRunActive,
                let actionTitle = Self.rowActionTitle(status: project.status) {
@@ -201,6 +191,29 @@ struct ProjectSidebar: View {
             }
         }
         .padding(.vertical, 2)
+    }
+
+    private func projectLabel(_ project: ProjectSummary) -> some View {
+        VStack(alignment: .leading, spacing: 3) {
+            Text(project.title)
+                .font(.body)
+                .lineLimit(1)
+                .truncationMode(.middle)
+                .help(project.title)
+
+            HStack(spacing: Theme.Spacing.small) {
+                Text(statusText(for: project))
+                Spacer(minLength: Theme.Spacing.small)
+                Text(project.lastActivityAt.formatted(date: .abbreviated, time: .omitted))
+            }
+            .font(.caption)
+            .foregroundStyle(.secondary)
+        }
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel(
+            "\(project.title), \(statusText(for: project)), \(project.lastActivityAt.formatted(date: .long, time: .omitted))"
+        )
+        .accessibilityIdentifier(Self.rowAccessibilityIdentifier(for: project.url))
     }
 
     @ViewBuilder

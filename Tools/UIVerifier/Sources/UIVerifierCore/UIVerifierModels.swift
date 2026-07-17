@@ -44,7 +44,9 @@ public enum UIVerificationWorkspace: String, Codable, CaseIterable, Hashable, Se
         switch self {
         case .processing:
             Set(requiredVoiceOverOrder).union(["processing.stop"])
-        case .home, .result, .failure:
+        case .result:
+            Set(requiredVoiceOverOrder).union(["result.viewer"])
+        case .home, .failure:
             Set(requiredVoiceOverOrder)
         }
     }
@@ -61,7 +63,7 @@ public enum UIVerificationWorkspace: String, Codable, CaseIterable, Hashable, Se
                 "processing.technicalDetails",
             ]
         case .result:
-            ["result.export", "result.share", "result.inspector", "result.viewer"]
+            ["result.export", "result.share", "result.inspector"]
         case .failure:
             [
                 "processing.phase",

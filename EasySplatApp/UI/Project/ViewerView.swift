@@ -43,7 +43,7 @@ struct ViewerView: View {
         .toolbar { resultToolbar }
         .inspector(isPresented: $isInspectorPresented) {
             resultInspector
-                .inspectorColumnWidth(min: 260, ideal: 300, max: 380)
+                .inspectorColumnWidth(min: 240, ideal: 280, max: 360)
         }
         .alert(item: $viewerAlert) { alert in
             Alert(
@@ -115,7 +115,7 @@ struct ViewerView: View {
                     .accessibilityHint("Changes only the viewer. The exported PLY is unchanged.")
                 }
 
-                Button("Check for Updates…", systemImage: "arrow.triangle.2.circlepath") {
+                Button("View Releases…", systemImage: "arrow.triangle.2.circlepath") {
                     let releases = AppConfig.projectHomeURL
                         .appendingPathComponent("releases", isDirectory: true)
                     NSWorkspace.shared.open(releases)

@@ -144,7 +144,7 @@ public enum PackagedAppVerifier {
         viewportResults.append(contentsOf: homeCapture.results)
         failures.append(contentsOf: homeCapture.failures)
 
-        try await controller.press(identifier: readyRowIdentifier)
+        try await controller.pressAdvertisedAccessibilityAction(identifier: readyRowIdentifier)
         let resultIdentifiers = UIVerificationWorkspace.result.requiredVisibleIdentifiers
         try await controller.requireIdentifiers(resultIdentifiers)
         observedIdentifiers.formUnion(resultIdentifiers)
@@ -168,8 +168,9 @@ public enum PackagedAppVerifier {
 
         try await controller.verifyInspectorToggle()
         passedInteractions.append(.toggleResultInspector)
-        try await controller.pressAndCancelDialog(
+        try await controller.pressAndCancelSavePanel(
             identifier: "result.export",
+            title: "Export Splat",
             relativeTo: mainWindow
         )
         passedInteractions.append(.cancelResultExport)
@@ -477,8 +478,10 @@ public enum PackagedAppVerifier {
             screenshotDirectory: screenshotDirectory
         )
 
-        try await controller.pressAndCancelDialog(
+        try await controller.pressAndCancelConfirmation(
             identifier: "processing.stop",
+            title: "Stop this project?",
+            actionTitle: "Stop and Keep Project",
             relativeTo: mainWindow
         )
         interactions.append(.cancelProcessingStop)
@@ -686,11 +689,51 @@ public enum PackagedAppVerifier {
         guard ProjectArtifactValidator.validatePlyFile(at: outputURL) == .valid else {
             throw PackagedAppVerificationError.invalidFixture("ready-project PLY did not pass validation")
         }
+        guard let outputHeader = ProjectArtifactValidator.readPlyHeader(at: outputURL),
+              let outputBytes = try outputURL.resourceValues(forKeys: [.fileSizeKey]).fileSize else {
+            throw PackagedAppVerificationError.invalidFixture("ready-project PLY metadata is unreadable")
+        }
+        let trainingArtifact = TrainingArtifact(
+            trainerVersion: "ui-verification-fixture",
+            runtimeVersion: "native-metal-cli-v2",
+            trainerBuildDigest: String(repeating: "a", count: 64),
+            inputDigest: String(repeating: "b", count: 64),
+            geometryDigest: String(repeating: "c", count: 64),
+            detailProfile: .balanced,
+            iterationLimit: 7_000,
+            plateauWindow: 800,
+            cameraOrderSeed: 42,
+            completedIteration: 1,
+            checkpointPath: nil,
+            checkpointDigest: nil,
+            outputPath: "Output/splat.ply",
+            outputSHA256: try sha256(of: outputURL),
+            outputBytes: Int64(outputBytes),
+            gaussianCount: outputHeader.vertexCount,
+            elapsedSeconds: 1,
+            peakMemoryBytes: 1,
+            memoryBudgetBytes: 1,
+            rasterFallbackCount: 0,
+            rasterExactFallbackElapsedSeconds: 0,
+            rasterExactBufferGrowthCount: 0,
+            rasterExactBufferBytesAdded: 0,
+            rasterReplayElapsedSeconds: 0,
+            rasterPeakExactIntersectionCapacity: 0,
+            droppedIntersectionCount: 0,
+            sceneBounds: SplatSceneBounds(center: .init(x: 0, y: 0, z: 0), radius: 1),
+            completionStatus: .completed
+        )
+        try TrainingArtifactStore.save(
+            trainingArtifact,
+            to: readyPaths.trainingManifestURL,
+            projectPaths: readyPaths
+        )
         let readyMetadata = ProjectMetadata(
             createdAt: Date(timeIntervalSince1970: 1_700_000_100),
             title: "Harbor House Ready Result",
             input: .photos(folder: photoFolder.path),
             requestedRunOptions: RequestedRunOptions(capturePath: .walkthrough, detailProfile: .balanced),
+            trainingArtifact: trainingArtifact,
             state: PipelineState(stage: .done, lastError: nil),
             outputs: OutputSpec(
                 splatPlyPath: "Output/splat.ply",

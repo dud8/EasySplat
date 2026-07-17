@@ -22,7 +22,7 @@ struct RootView: View {
                 isRunActive: isRunActive,
                 onNewSplat: beginNewSplat
             )
-            .navigationSplitViewColumnWidth(min: 220, ideal: 280, max: 340)
+            .navigationSplitViewColumnWidth(min: 200, ideal: 260, max: 320)
         } detail: {
             WorkspaceView(
                 onNewSplat: beginNewSplat,

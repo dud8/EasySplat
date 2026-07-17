@@ -5,6 +5,30 @@ import UniformTypeIdentifiers
 import XCTest
 @testable import EasySplatUIVerifierCore
 
+private func accessibilityNode(
+    order: Int = 0,
+    role: String,
+    subrole: String? = nil,
+    title: String? = nil,
+    value: String? = nil,
+    identifier: String? = nil,
+    actions: [String] = []
+) -> AccessibilityNodeSnapshot {
+    AccessibilityNodeSnapshot(
+        order: order,
+        role: role,
+        subrole: subrole,
+        title: title,
+        label: nil,
+        value: value,
+        placeholder: nil,
+        identifier: identifier,
+        enabled: true,
+        frame: nil,
+        actions: actions
+    )
+}
+
 final class UIVerifierCoreTests: XCTestCase {
     @MainActor
     func testActivationReturnsWithoutRequestsWhenTargetIsAlreadyFrontmost() async throws {
@@ -251,6 +275,167 @@ final class UIVerifierCoreTests: XCTestCase {
         ))
     }
 
+    func testPressActionRequiresAnAdvertisedAXPressCapability() {
+        XCTAssertTrue(AXApplicationController.supportsPressAction(["AXPress", "AXShowMenu"]))
+        XCTAssertFalse(AXApplicationController.supportsPressAction(["AXShowMenu"]))
+        XCTAssertFalse(AXApplicationController.supportsPressAction([]))
+    }
+
+    func testReverseFocusTraversalUsesTheNativeTextControlShortcut() {
+        XCTAssertEqual(
+            AXApplicationController.reverseTraversalFlags(forRole: "AXTextArea"),
+            [.maskControl, .maskShift]
+        )
+        XCTAssertEqual(
+            AXApplicationController.reverseTraversalFlags(forRole: "AXTextField"),
+            [.maskControl, .maskShift]
+        )
+        XCTAssertEqual(
+            AXApplicationController.reverseTraversalFlags(forRole: "AXButton"),
+            .maskShift
+        )
+    }
+
+    func testNativeConfirmationRequiresARealPresentationWithExactActions() {
+        let confirmation = [
+            accessibilityNode(role: "AXSheet"),
+            accessibilityNode(order: 1, role: "AXStaticText", value: "Stop this project?"),
+            accessibilityNode(
+                order: 2,
+                role: "AXButton",
+                title: "Stop and Keep Project",
+                actions: ["AXPress"]
+            ),
+            accessibilityNode(
+                order: 3,
+                role: "AXButton",
+                title: "Cancel",
+                actions: ["AXPress"]
+            ),
+        ]
+
+        XCTAssertTrue(AXApplicationController.isNativeConfirmationPresentation(
+            confirmation,
+            title: "Stop this project?",
+            actionTitle: "Stop and Keep Project"
+        ))
+
+        var ordinaryWindow = confirmation
+        ordinaryWindow[0] = accessibilityNode(role: "AXWindow")
+        XCTAssertFalse(AXApplicationController.isNativeConfirmationPresentation(
+            ordinaryWindow,
+            title: "Stop this project?",
+            actionTitle: "Stop and Keep Project"
+        ))
+
+        var popover = confirmation
+        popover[0] = accessibilityNode(role: "AXPopover")
+        XCTAssertTrue(AXApplicationController.isNativeConfirmationPresentation(
+            popover,
+            title: "Stop this project?",
+            actionTitle: "Stop and Keep Project"
+        ))
+
+        var dialogWindow = confirmation
+        dialogWindow[0] = accessibilityNode(role: "AXWindow", subrole: "AXDialog")
+        XCTAssertTrue(AXApplicationController.isNativeConfirmationPresentation(
+            dialogWindow,
+            title: "Stop this project?",
+            actionTitle: "Stop and Keep Project"
+        ))
+
+        XCTAssertFalse(AXApplicationController.isNativeConfirmationPresentation(
+            confirmation,
+            title: "Stop training?",
+            actionTitle: "Stop and Keep Project"
+        ))
+        XCTAssertFalse(AXApplicationController.isNativeConfirmationPresentation(
+            confirmation,
+            title: "Stop this project?",
+            actionTitle: "Stop Setup"
+        ))
+        XCTAssertFalse(AXApplicationController.isNativeConfirmationPresentation(
+            confirmation,
+            title: "Stop this project?",
+            actionTitle: "Stop and Keep Project",
+            presentationVisible: false
+        ))
+
+        XCTAssertFalse(AXApplicationController.isNativeConfirmationPresentation(
+            Array(confirmation.dropLast()),
+            title: "Stop this project?",
+            actionTitle: "Stop and Keep Project"
+        ))
+    }
+
+    func testNativeSavePanelRequiresExactPanelIdentityAndCancelAction() {
+        let savePanel = [
+            accessibilityNode(
+                role: "AXWindow",
+                subrole: "AXStandardWindow",
+                title: "Export Splat",
+                identifier: "save-panel"
+            ),
+            accessibilityNode(
+                order: 1,
+                role: "AXButton",
+                title: "Cancel",
+                identifier: "CancelButton",
+                actions: ["AXPress"]
+            ),
+        ]
+
+        XCTAssertTrue(AXApplicationController.isNativeSavePanelPresentation(
+            savePanel,
+            title: "Export Splat"
+        ))
+
+        var wrongIdentifier = savePanel
+        wrongIdentifier[0] = accessibilityNode(
+            role: "AXWindow",
+            subrole: "AXStandardWindow",
+            title: "Export Splat"
+        )
+        XCTAssertFalse(AXApplicationController.isNativeSavePanelPresentation(
+            wrongIdentifier,
+            title: "Export Splat"
+        ))
+
+        var wrongTitle = savePanel
+        wrongTitle[0] = accessibilityNode(
+            role: "AXWindow",
+            subrole: "AXStandardWindow",
+            title: "Save Diagnostics",
+            identifier: "save-panel"
+        )
+        XCTAssertFalse(AXApplicationController.isNativeSavePanelPresentation(
+            wrongTitle,
+            title: "Export Splat"
+        ))
+
+        var ordinaryWindow = savePanel
+        ordinaryWindow[0] = accessibilityNode(
+            role: "AXWindow",
+            subrole: "AXDialog",
+            title: "Export Splat",
+            identifier: "save-panel"
+        )
+        XCTAssertFalse(AXApplicationController.isNativeSavePanelPresentation(
+            ordinaryWindow,
+            title: "Export Splat"
+        ))
+
+        XCTAssertFalse(AXApplicationController.isNativeSavePanelPresentation(
+            Array(savePanel.dropLast()),
+            title: "Export Splat"
+        ))
+        XCTAssertFalse(AXApplicationController.isNativeSavePanelPresentation(
+            savePanel,
+            title: "Export Splat",
+            presentationVisible: false
+        ))
+    }
+
     func testRunArgumentsRequirePackagedAppScenarioAndOutput() throws {
         let arguments = try UIVerifierArguments.parse([
             "run",
@@ -339,6 +524,16 @@ final class UIVerifierCoreTests: XCTestCase {
                 "processing.timing",
                 "processing.technicalDetails",
             ]
+        )
+
+        let result = try XCTUnwrap(UIVerificationWorkspace(rawValue: "result"))
+        XCTAssertEqual(
+            result.requiredVisibleIdentifiers,
+            Set(["result.export", "result.share", "result.inspector", "result.viewer"])
+        )
+        XCTAssertEqual(
+            result.requiredVoiceOverOrder,
+            ["result.export", "result.share", "result.inspector"]
         )
     }
 
@@ -703,11 +898,11 @@ final class UIVerifierCoreTests: XCTestCase {
         ).contains(where: { $0.contains("processing.tryAgain before processing.backToProjects") }))
 
         XCTAssertTrue(AccessibilityAudit.voiceOverOrderIssues(
-            nodes: nodes(["result.export", "result.share", "result.inspector", "result.viewer"]),
+            nodes: nodes(["result.viewer", "result.export", "result.share", "result.inspector"]),
             workspace: .result
         ).isEmpty)
         XCTAssertTrue(AccessibilityAudit.voiceOverOrderIssues(
-            nodes: nodes(["result.share", "result.export", "result.inspector", "result.viewer"]),
+            nodes: nodes(["result.viewer", "result.share", "result.export", "result.inspector"]),
             workspace: .result
         ).contains(where: { $0.contains("result.export before result.share") }))
     }
@@ -1131,6 +1326,8 @@ final class UIVerifierCoreTests: XCTestCase {
         var identifiers = workspace.requiredVoiceOverOrder
         if workspace == .processing {
             identifiers.append("processing.stop")
+        } else if workspace == .result {
+            identifiers.insert("result.viewer", at: 0)
         }
         nodes.append(contentsOf: identifiers.enumerated().map { index, identifier in
             AccessibilityNodeSnapshot(
