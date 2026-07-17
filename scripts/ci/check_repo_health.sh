@@ -80,6 +80,11 @@ if rg -n 'github.com/EasySplat/EasySplat|http://localhost:8000' \
   exit 1
 fi
 
+if rg -n 'activate\s*\(\s*ignoringOtherApps\s*:' "$ROOT/EasySplatApp" >/dev/null; then
+  echo "Shipped app sources use the deprecated focus-stealing activation API." >&2
+  exit 1
+fi
+
 toolchain_workflow="$ROOT/.github/workflows/toolchain-build.yml"
 for builder in \
   build_msplat.sh \

@@ -6,7 +6,7 @@ import Foundation
 enum AXAutomationError: Error, LocalizedError {
     case attribute(String, AXError)
     case noMainWindow(String)
-    case cannotActivate
+    case cannotActivate(accessibilityError: AXError?)
     case cannotResize(AXError)
     case keyboardEventCreation
     case elementNotFound(String)
@@ -18,7 +18,10 @@ enum AXAutomationError: Error, LocalizedError {
             return "Could not read accessibility attribute \(name): AX error \(error.rawValue)."
         case .noMainWindow(let detail):
             return "The packaged app did not expose a main accessibility window (\(detail))."
-        case .cannotActivate:
+        case .cannotActivate(let accessibilityError):
+            if let accessibilityError {
+                return "The packaged app did not become the frontmost application; AX error \(accessibilityError.rawValue)."
+            }
             return "The packaged app did not become the frontmost application."
         case .cannotResize(let error):
             return "The packaged app window could not be resized: AX error \(error.rawValue)."
@@ -34,31 +37,66 @@ enum AXAutomationError: Error, LocalizedError {
 
 @MainActor
 final class AXApplicationController {
+    struct ActivationRequests {
+        let frontmostProcessIdentifier: () -> pid_t?
+        let activateWithAppKit: () -> Bool?
+        let activateWithAccessibility: () -> AXError
+    }
+
     private let application: AXUIElement
     private let processIdentifier: pid_t
     private let systemWide = AXUIElementCreateSystemWide()
+    private let activationRequests: ActivationRequests
 
     init(processIdentifier: pid_t) {
         self.processIdentifier = processIdentifier
+        let application = AXUIElementCreateApplication(processIdentifier)
+        self.application = application
+        activationRequests = ActivationRequests(
+            frontmostProcessIdentifier: {
+                NSWorkspace.shared.frontmostApplication?.processIdentifier
+            },
+            activateWithAppKit: {
+                NSRunningApplication(processIdentifier: processIdentifier)?
+                    .activate(options: [.activateAllWindows])
+            },
+            activateWithAccessibility: {
+                AXUIElementSetAttributeValue(
+                    application,
+                    kAXFrontmostAttribute as CFString,
+                    kCFBooleanTrue
+                )
+            }
+        )
+    }
+
+    init(processIdentifier: pid_t, activationRequests: ActivationRequests) {
+        self.processIdentifier = processIdentifier
         application = AXUIElementCreateApplication(processIdentifier)
+        self.activationRequests = activationRequests
     }
 
     func activate(timeoutSeconds: Double = 5) async throws {
-        guard let running = NSRunningApplication(processIdentifier: processIdentifier) else {
-            throw AXAutomationError.cannotActivate
-        }
-        if NSWorkspace.shared.frontmostApplication?.processIdentifier == processIdentifier {
+        if activationRequests.frontmostProcessIdentifier() == processIdentifier {
             return
         }
-        _ = running.activate(options: [.activateAllWindows])
+        guard activationRequests.activateWithAppKit() != nil else {
+            throw AXAutomationError.cannotActivate(accessibilityError: nil)
+        }
+        if activationRequests.frontmostProcessIdentifier() == processIdentifier {
+            return
+        }
+        let accessibilityError = activationRequests.activateWithAccessibility()
         let deadline = Date().addingTimeInterval(timeoutSeconds)
         repeat {
-            if NSWorkspace.shared.frontmostApplication?.processIdentifier == processIdentifier {
+            if activationRequests.frontmostProcessIdentifier() == processIdentifier {
                 return
             }
             try await Task.sleep(for: .milliseconds(100))
         } while Date() < deadline
-        throw AXAutomationError.cannotActivate
+        throw AXAutomationError.cannotActivate(
+            accessibilityError: accessibilityError == .success ? nil : accessibilityError
+        )
     }
 
     func waitForMainWindow(timeoutSeconds: Double = 15) async throws -> AXUIElement {

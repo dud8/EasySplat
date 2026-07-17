@@ -1,3 +1,4 @@
+import ApplicationServices
 import CoreGraphics
 import ImageIO
 import UniformTypeIdentifiers
@@ -5,6 +6,149 @@ import XCTest
 @testable import EasySplatUIVerifierCore
 
 final class UIVerifierCoreTests: XCTestCase {
+    @MainActor
+    func testActivationReturnsWithoutRequestsWhenTargetIsAlreadyFrontmost() async throws {
+        let targetPID = pid_t(42)
+        var appKitRequests = 0
+        var accessibilityRequests = 0
+        let controller = AXApplicationController(
+            processIdentifier: targetPID,
+            activationRequests: .init(
+                frontmostProcessIdentifier: { targetPID },
+                activateWithAppKit: {
+                    appKitRequests += 1
+                    return true
+                },
+                activateWithAccessibility: {
+                    accessibilityRequests += 1
+                    return .success
+                }
+            )
+        )
+
+        try await controller.activate(timeoutSeconds: 0)
+
+        XCTAssertEqual(appKitRequests, 0)
+        XCTAssertEqual(accessibilityRequests, 0)
+    }
+
+    @MainActor
+    func testActivationStopsAfterAppKitMakesExactTargetFrontmost() async throws {
+        let targetPID = pid_t(42)
+        var frontmostPID: pid_t? = 7
+        var appKitRequests = 0
+        var accessibilityRequests = 0
+        let controller = AXApplicationController(
+            processIdentifier: targetPID,
+            activationRequests: .init(
+                frontmostProcessIdentifier: { frontmostPID },
+                activateWithAppKit: {
+                    appKitRequests += 1
+                    frontmostPID = targetPID
+                    return true
+                },
+                activateWithAccessibility: {
+                    accessibilityRequests += 1
+                    return .success
+                }
+            )
+        )
+
+        try await controller.activate(timeoutSeconds: 0)
+
+        XCTAssertEqual(appKitRequests, 1)
+        XCTAssertEqual(accessibilityRequests, 0)
+    }
+
+    @MainActor
+    func testActivationUsesAccessibilityWhenAppKitRequestIsDenied() async throws {
+        let targetPID = pid_t(42)
+        var frontmostPID: pid_t? = 7
+        var accessibilityRequests = 0
+        let controller = AXApplicationController(
+            processIdentifier: targetPID,
+            activationRequests: .init(
+                frontmostProcessIdentifier: { frontmostPID },
+                activateWithAppKit: { false },
+                activateWithAccessibility: {
+                    accessibilityRequests += 1
+                    frontmostPID = targetPID
+                    return .success
+                }
+            )
+        )
+
+        try await controller.activate(timeoutSeconds: 0)
+
+        XCTAssertEqual(accessibilityRequests, 1)
+    }
+
+    @MainActor
+    func testActivationReportsAccessibilityRejectionWhenTargetStaysInBackground() async {
+        let targetPID = pid_t(42)
+        let controller = AXApplicationController(
+            processIdentifier: targetPID,
+            activationRequests: .init(
+                frontmostProcessIdentifier: { 7 },
+                activateWithAppKit: { false },
+                activateWithAccessibility: { .apiDisabled }
+            )
+        )
+
+        do {
+            try await controller.activate(timeoutSeconds: 0)
+            XCTFail("Expected activation to fail")
+        } catch AXAutomationError.cannotActivate(let accessibilityError) {
+            XCTAssertEqual(accessibilityError, .apiDisabled)
+        } catch {
+            XCTFail("Unexpected error: \(error)")
+        }
+    }
+
+    @MainActor
+    func testActivationRejectsWrongFrontmostProcessAfterSuccessfulAccessibilityRequest() async {
+        let targetPID = pid_t(42)
+        let controller = AXApplicationController(
+            processIdentifier: targetPID,
+            activationRequests: .init(
+                frontmostProcessIdentifier: { 99 },
+                activateWithAppKit: { false },
+                activateWithAccessibility: { .success }
+            )
+        )
+
+        do {
+            try await controller.activate(timeoutSeconds: 0)
+            XCTFail("Expected activation to fail")
+        } catch AXAutomationError.cannotActivate(let accessibilityError) {
+            XCTAssertNil(accessibilityError)
+        } catch {
+            XCTFail("Unexpected error: \(error)")
+        }
+    }
+
+    @MainActor
+    func testActivationRejectsMissingFrontmostProcessAfterSuccessfulAccessibilityRequest() async {
+        let targetPID = pid_t(42)
+        let controller = AXApplicationController(
+            processIdentifier: targetPID,
+            activationRequests: .init(
+                frontmostProcessIdentifier: { nil },
+                activateWithAppKit: { false },
+                activateWithAccessibility: { .success }
+            )
+        )
+
+        do {
+            try await controller.activate(timeoutSeconds: 0)
+            XCTFail("Expected activation to fail")
+        } catch AXAutomationError.cannotActivate(let accessibilityError) {
+            XCTAssertNil(accessibilityError)
+        } catch {
+            XCTFail("Unexpected error: \(error)")
+        }
+    }
+
     func testKeyboardFocusProxyMustCoverTheTargetControl() {
         let target = CGRect(x: 120, y: 80, width: 580, height: 180)
 
