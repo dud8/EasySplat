@@ -155,11 +155,19 @@ public struct ProjectPaths: Sendable {
     }
 
     public func projectRelativePath(for url: URL) throws -> String {
+        let literalRootPath = root.path
+        let literalPrefix = literalRootPath.hasSuffix("/")
+            ? literalRootPath
+            : literalRootPath + "/"
         let standardizedRoot = root.standardizedFileURL
         let standardizedURL = url.standardizedFileURL
         let rootPrefix = standardizedRoot.path + "/"
         let relativePath: String
-        if standardizedURL.path.hasPrefix(rootPrefix) {
+        if url.path.hasPrefix(literalPrefix) {
+            // Derived URLs retain the root's original spelling even when a
+            // missing descendant cannot yet be canonicalized consistently.
+            relativePath = String(url.path.dropFirst(literalPrefix.count))
+        } else if standardizedURL.path.hasPrefix(rootPrefix) {
             relativePath = String(standardizedURL.path.dropFirst(rootPrefix.count))
         } else {
             // File APIs may return the alternate `/var` spelling

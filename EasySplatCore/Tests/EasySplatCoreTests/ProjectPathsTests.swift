@@ -110,6 +110,21 @@ final class ProjectPathsTests: XCTestCase {
         XCTAssertEqual(relativePath, "Output/splat.ply")
     }
 
+    func testProjectRelativePathRoundTripsPrivateTemporaryDirectoryAlias() throws {
+        let root = URL(
+            fileURLWithPath: "/private/tmp/EasySplat-ProjectPaths-\(UUID().uuidString).easysplatproj",
+            isDirectory: true
+        )
+        defer { try? FileManager.default.removeItem(at: root) }
+        let paths = ProjectPaths(root: root)
+        try paths.ensureDirectories()
+
+        XCTAssertEqual(
+            try paths.projectRelativePath(for: paths.colmapDatabaseURL),
+            "SfM/colmap/database.db"
+        )
+    }
+
     func testProjectRelativePathRejectsAnOutsideFile() throws {
         let parent = try TestFileBuilder.makeTempDir()
         defer { try? FileManager.default.removeItem(at: parent) }
