@@ -185,6 +185,19 @@ public struct ProjectPaths: Sendable {
         return relativePath
     }
 
+    /// Validates a reserved artifact path without accepting a caller-supplied
+    /// symlink alias. The literal comparison matters because atomic writes replace
+    /// the alias itself instead of the in-project destination it resolves to.
+    func validateReservedProjectPath(_ url: URL, relativePath: String) throws -> URL {
+        try validateRootDirectory()
+        let resolved = try resolveProjectRelativePath(relativePath)
+        let expected = root.appendingPathComponent(relativePath)
+        guard url.path == expected.path else {
+            throw ProjectPathError.escapesProjectRoot(url.path)
+        }
+        return resolved
+    }
+
     private func ensurePlainDirectory(_ relativePath: String) throws {
         var current = root
         for component in relativePath.split(separator: "/").map(String.init) {

@@ -241,8 +241,12 @@ public enum TrainingArtifactStore {
     }
 
     private static func validateManifestLocation(_ url: URL, projectPaths: ProjectPaths) throws {
-        let expected = try projectPaths.resolveProjectRelativePath("Training/training_manifest.json")
-        guard expected.standardizedFileURL == url.standardizedFileURL else {
+        do {
+            _ = try projectPaths.validateReservedProjectPath(
+                url,
+                relativePath: "Training/training_manifest.json"
+            )
+        } catch {
             throw TrainingArtifactStoreError.invalidManifest
         }
     }

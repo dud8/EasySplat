@@ -5,6 +5,27 @@ import XCTest
 @testable import EasySplatCore
 
 final class ColmapFeatureEvidenceStoreTests: XCTestCase {
+    func testStoreAcceptsCanonicalMissingPathThroughPrivateTemporaryAlias() throws {
+        let root = URL(
+            fileURLWithPath: "/private/tmp/EasySplat-FeatureEvidence-\(UUID().uuidString).easysplatproj",
+            isDirectory: true
+        )
+        defer { try? FileManager.default.removeItem(at: root) }
+        let paths = ProjectPaths(root: root)
+        try paths.ensureDirectories()
+        let evidence = ColmapFeatureEvidence(
+            selectedFramesDigest: String(repeating: "a", count: 64),
+            imageNames: ["a.jpg", "b.jpg"],
+            featureDatabaseDigest: String(repeating: "b", count: 64)
+        )
+
+        XCTAssertNoThrow(try ColmapFeatureEvidenceStore.save(
+            evidence,
+            to: paths.colmapFeatureEvidenceURL,
+            projectPaths: paths
+        ))
+    }
+
     func testVerifiedEvidenceRejectsChangedFrameOrDescriptorBytes() throws {
         let fixture = try makeProject()
         defer { try? FileManager.default.removeItem(at: fixture.root) }
@@ -79,7 +100,27 @@ final class ColmapFeatureEvidenceStoreTests: XCTestCase {
             projectPaths: fixture.paths
         ))
 
+        try ColmapFeatureEvidenceStore.save(
+            evidence,
+            to: fixture.paths.colmapFeatureEvidenceURL,
+            projectPaths: fixture.paths
+        )
+        let externalAlias = fixture.root.appendingPathComponent("feature-evidence-alias.json")
+        try FileManager.default.createSymbolicLink(
+            at: externalAlias,
+            withDestinationURL: fixture.paths.colmapFeatureEvidenceURL
+        )
+        XCTAssertThrowsError(try ColmapFeatureEvidenceStore.save(
+            evidence,
+            to: externalAlias,
+            projectPaths: fixture.paths
+        ))
+        XCTAssertNotNil(
+            try? FileManager.default.destinationOfSymbolicLink(atPath: externalAlias.path)
+        )
+
         try Data("{}".utf8).write(to: outside)
+        try FileManager.default.removeItem(at: fixture.paths.colmapFeatureEvidenceURL)
         try FileManager.default.createSymbolicLink(
             at: fixture.paths.colmapFeatureEvidenceURL,
             withDestinationURL: outside

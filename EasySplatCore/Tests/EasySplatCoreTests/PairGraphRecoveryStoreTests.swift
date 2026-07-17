@@ -5,6 +5,46 @@ import XCTest
 @testable import EasySplatCore
 
 final class PairGraphRecoveryStoreTests: XCTestCase {
+    func testStoreAcceptsCanonicalPathThroughPrivateTemporaryAlias() throws {
+        let root = URL(
+            fileURLWithPath: "/private/tmp/EasySplat-PairGraphRecovery-\(UUID().uuidString).easysplatproj",
+            isDirectory: true
+        )
+        defer { try? FileManager.default.removeItem(at: root) }
+        let paths = ProjectPaths(root: root)
+        try paths.ensureDirectories()
+        let imageNames = ["a.jpg", "b.jpg", "c.jpg", "d.jpg"]
+        for (index, imageName) in imageNames.enumerated() {
+            try Data("frame-\(index)".utf8).write(
+                to: paths.framesSelectedURL.appendingPathComponent(imageName)
+            )
+        }
+        let fixture = (
+            root: root,
+            paths: paths,
+            selectedFramesDigest: try GeometryArtifactStore.selectedFramesDigest(
+                orderedImageNames: imageNames,
+                projectPaths: paths
+            )
+        )
+        let state = try makeSameScheduleState(fixture: fixture)
+
+        try PairGraphRecoveryStore.save(
+            state,
+            to: paths.pairGraphRecoveryURL,
+            projectPaths: paths
+        )
+
+        XCTAssertEqual(
+            try PairGraphRecoveryStore.loadBound(
+                from: paths.pairGraphRecoveryURL,
+                expectedImageNames: imageNames,
+                projectPaths: paths
+            ),
+            state
+        )
+    }
+
     func testRetiredRecoverySchemaInvalidatesPendingExactIntent() throws {
         let fixture = try makeProject()
         defer { try? FileManager.default.removeItem(at: fixture.root) }
@@ -919,6 +959,20 @@ final class PairGraphRecoveryStoreTests: XCTestCase {
 
         try save(state, fixture: fixture)
         let data = try Data(contentsOf: fixture.paths.pairGraphRecoveryURL)
+        let externalAlias = fixture.root.appendingPathComponent("pair-recovery-alias.json")
+        try FileManager.default.createSymbolicLink(
+            at: externalAlias,
+            withDestinationURL: fixture.paths.pairGraphRecoveryURL
+        )
+        XCTAssertThrowsError(try PairGraphRecoveryStore.save(
+            state,
+            to: externalAlias,
+            projectPaths: fixture.paths
+        ))
+        XCTAssertNotNil(
+            try? FileManager.default.destinationOfSymbolicLink(atPath: externalAlias.path)
+        )
+
         try FileManager.default.removeItem(at: fixture.paths.pairGraphRecoveryURL)
         try data.write(to: outside)
         try FileManager.default.createSymbolicLink(

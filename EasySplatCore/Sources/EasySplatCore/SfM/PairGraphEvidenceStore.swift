@@ -547,11 +547,13 @@ enum PairGraphEvidenceStore {
     }
 
     private static func validateLocation(_ url: URL, projectPaths: ProjectPaths) throws {
-        try projectPaths.validateRootDirectory()
-        let expected = try projectPaths.resolveProjectRelativePath(
-            "SfM/pair_graph_evidence.json"
-        )
-        guard expected.standardizedFileURL == url.standardizedFileURL else {
+        let expected: URL
+        do {
+            expected = try projectPaths.validateReservedProjectPath(
+                url,
+                relativePath: "SfM/pair_graph_evidence.json"
+            )
+        } catch {
             throw PairGraphEvidenceStoreError.invalidLocation
         }
         let parentValues = try expected.deletingLastPathComponent().resourceValues(

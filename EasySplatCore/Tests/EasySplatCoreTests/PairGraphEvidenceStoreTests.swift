@@ -5,6 +5,31 @@ import XCTest
 @testable import EasySplatCore
 
 final class PairGraphEvidenceStoreTests: XCTestCase {
+    func testStoreAcceptsCanonicalPathThroughPrivateTemporaryAlias() throws {
+        let root = URL(
+            fileURLWithPath: "/private/tmp/EasySplat-PairGraphEvidence-\(UUID().uuidString).easysplatproj",
+            isDirectory: true
+        )
+        defer { try? FileManager.default.removeItem(at: root) }
+        let paths = ProjectPaths(root: root)
+        try paths.ensureDirectories()
+        let evidence = makeEvidence()
+
+        try PairGraphEvidenceStore.save(
+            evidence,
+            to: paths.pairGraphEvidenceURL,
+            projectPaths: paths
+        )
+
+        XCTAssertEqual(
+            try PairGraphEvidenceStore.load(
+                from: paths.pairGraphEvidenceURL,
+                projectPaths: paths
+            ),
+            evidence
+        )
+    }
+
     func testRoundTripPreservesEvidenceAndBuildsMeasuredArtifact() throws {
         let fixture = try makeProject()
         defer { try? FileManager.default.removeItem(at: fixture.root) }
@@ -101,6 +126,20 @@ final class PairGraphEvidenceStoreTests: XCTestCase {
             projectPaths: fixture.paths
         )
         let data = try Data(contentsOf: fixture.paths.pairGraphEvidenceURL)
+        let externalAlias = fixture.root.appendingPathComponent("pair-graph-alias.json")
+        try FileManager.default.createSymbolicLink(
+            at: externalAlias,
+            withDestinationURL: fixture.paths.pairGraphEvidenceURL
+        )
+        XCTAssertThrowsError(try PairGraphEvidenceStore.save(
+            makeEvidence(),
+            to: externalAlias,
+            projectPaths: fixture.paths
+        ))
+        XCTAssertNotNil(
+            try? FileManager.default.destinationOfSymbolicLink(atPath: externalAlias.path)
+        )
+
         try FileManager.default.removeItem(at: fixture.paths.pairGraphEvidenceURL)
         try data.write(to: outsideURL)
         try FileManager.default.createSymbolicLink(

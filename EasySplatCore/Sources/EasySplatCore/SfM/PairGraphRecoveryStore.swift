@@ -463,11 +463,13 @@ enum PairGraphRecoveryStore {
         _ url: URL,
         projectPaths: ProjectPaths
     ) throws {
-        try projectPaths.validateRootDirectory()
-        let expected = try projectPaths.resolveProjectRelativePath(
-            "SfM/pair_graph_recovery.json"
-        )
-        guard expected.standardizedFileURL == url.standardizedFileURL else {
+        let expected: URL
+        do {
+            expected = try projectPaths.validateReservedProjectPath(
+                url,
+                relativePath: "SfM/pair_graph_recovery.json"
+            )
+        } catch {
             throw PairGraphRecoveryStoreError.invalidLocation
         }
         let parentValues = try expected.deletingLastPathComponent().resourceValues(

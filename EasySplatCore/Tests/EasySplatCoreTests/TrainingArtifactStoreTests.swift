@@ -2,6 +2,86 @@ import XCTest
 @testable import EasySplatCore
 
 final class TrainingArtifactStoreTests: XCTestCase {
+    func testStoreAcceptsCanonicalPathThroughPrivateTemporaryAlias() throws {
+        let root = URL(
+            fileURLWithPath: "/private/tmp/EasySplat-TrainingArtifact-\(UUID().uuidString).easysplatproj",
+            isDirectory: true
+        )
+        defer { try? FileManager.default.removeItem(at: root) }
+        let paths = ProjectPaths(root: root)
+        try paths.ensureDirectories()
+        let artifact = makeCheckpointedArtifact()
+
+        try TrainingArtifactStore.save(
+            artifact,
+            to: paths.trainingManifestURL,
+            projectPaths: paths
+        )
+
+        XCTAssertEqual(
+            try TrainingArtifactStore.load(
+                from: paths.trainingManifestURL,
+                projectPaths: paths
+            ),
+            artifact
+        )
+    }
+
+    func testStoreRejectsExternalAliasToCanonicalManifestAndSymlinkedRoot() throws {
+        let context = try makeContext()
+        defer { context.cleanup() }
+        let artifact = makeCheckpointedArtifact()
+        try TrainingArtifactStore.save(
+            artifact,
+            to: context.paths.trainingManifestURL,
+            projectPaths: context.paths
+        )
+        let externalAlias = context.root.deletingLastPathComponent()
+            .appendingPathComponent("training-manifest-alias-\(UUID().uuidString).json")
+        try FileManager.default.createSymbolicLink(
+            at: externalAlias,
+            withDestinationURL: context.paths.trainingManifestURL
+        )
+
+        XCTAssertThrowsError(try TrainingArtifactStore.save(
+            artifact,
+            to: externalAlias,
+            projectPaths: context.paths
+        ))
+        XCTAssertNotNil(
+            try? FileManager.default.destinationOfSymbolicLink(atPath: externalAlias.path)
+        )
+
+        let actualRoot = context.root.deletingLastPathComponent()
+            .appendingPathComponent("outside-root-\(UUID().uuidString)", isDirectory: true)
+        let symlinkRoot = context.root.deletingLastPathComponent()
+            .appendingPathComponent("linked-project-\(UUID().uuidString).easysplatproj")
+        defer {
+            try? FileManager.default.removeItem(at: symlinkRoot)
+            try? FileManager.default.removeItem(at: actualRoot)
+        }
+        try FileManager.default.createDirectory(
+            at: actualRoot.appendingPathComponent("Training", isDirectory: true),
+            withIntermediateDirectories: true
+        )
+        try FileManager.default.createSymbolicLink(
+            at: symlinkRoot,
+            withDestinationURL: actualRoot
+        )
+        let linkedPaths = ProjectPaths(root: symlinkRoot)
+
+        XCTAssertThrowsError(try TrainingArtifactStore.save(
+            artifact,
+            to: linkedPaths.trainingManifestURL,
+            projectPaths: linkedPaths
+        ))
+        XCTAssertFalse(
+            FileManager.default.fileExists(
+                atPath: actualRoot.appendingPathComponent("Training/training_manifest.json").path
+            )
+        )
+    }
+
     func testCheckpointedArtifactPersistsAndRepairsStaleProjectMetadata() throws {
         let context = try makeContext()
         defer { context.cleanup() }

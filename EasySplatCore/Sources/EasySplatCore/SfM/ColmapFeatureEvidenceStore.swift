@@ -113,11 +113,13 @@ enum ColmapFeatureEvidenceStore {
         _ url: URL,
         projectPaths: ProjectPaths
     ) throws {
-        try projectPaths.validateRootDirectory()
-        let expected = try projectPaths.resolveProjectRelativePath(
-            "SfM/colmap/feature_evidence.json"
-        )
-        guard expected.standardizedFileURL == url.standardizedFileURL else {
+        let expected: URL
+        do {
+            expected = try projectPaths.validateReservedProjectPath(
+                url,
+                relativePath: "SfM/colmap/feature_evidence.json"
+            )
+        } catch {
             throw ColmapFeatureEvidenceStoreError.invalidLocation
         }
         let parent = try expected.deletingLastPathComponent().resourceValues(
