@@ -1452,10 +1452,13 @@ def _selected_lane_entries(
 
 def _canonical_collector_status_bytes(path: Path, output_root: Path) -> tuple[bytes, Mapping[str, Any], Path]:
     try:
+        output_metadata = output_root.lstat()
         canonical_output = output_root.resolve(strict=True)
         relative = path.relative_to(output_root)
     except (OSError, ValueError) as error:
         raise benchmark.ConfigError("collector status escapes the benchmark output root") from error
+    if output_root.is_symlink() or not stat.S_ISDIR(output_metadata.st_mode):
+        raise benchmark.ConfigError("benchmark output root must be a real directory")
     if relative.as_posix() != PurePosixPath(relative.as_posix()).as_posix():
         raise benchmark.ConfigError("collector status path is not canonical")
     cursor = output_root
@@ -2404,6 +2407,22 @@ def _run_lane_attempt(
                     machine=machine,
                 )
             )
+            continue
+        artifact_root = output_root / evidence_relative / str(scale) / lane
+        if artifact_root.exists() or artifact_root.is_symlink():
+            collection = _collection_from_status(
+                output_root=output_root,
+                status_path=output_root / expected_status_relative,
+                scene_id=scene_id,
+                scale=scale,
+                lane=lane,
+                request=request,
+                runner_identity=approved_runner,
+                machine=machine,
+                expected_relative=expected_status_relative,
+            )
+            completed_collections[key] = collection
+            results.append(collection)
             continue
         artifact_root = _prepare_artifact_root(output_root, evidence_relative, scale, lane)
         command_log = artifact_root / "command.jsonl"
