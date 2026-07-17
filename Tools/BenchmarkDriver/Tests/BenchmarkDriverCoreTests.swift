@@ -4,7 +4,360 @@ import Metal
 import XCTest
 @testable import EasySplatBenchmarkDriverCore
 
+private final class HostSnapshotFixture: @unchecked Sendable {
+    private let lock = NSLock()
+    private var lowPowerMode = false
+    private var tick: UInt64 = 1
+
+    func setLowPowerMode(_ enabled: Bool) {
+        lock.lock()
+        lowPowerMode = enabled
+        lock.unlock()
+    }
+
+    func capture() -> HostStateSnapshot {
+        lock.lock()
+        defer { lock.unlock() }
+        tick += 1
+        return HostStateSnapshot(
+            cpuTicks: .init(user: tick, system: tick, idle: tick * 10, nice: 0),
+            vmPageouts: 0,
+            vmSwapouts: 0,
+            thermalState: .nominal,
+            lowPowerMode: lowPowerMode,
+            powerSource: .acPower
+        )
+    }
+}
+
+private final class MonitorResultBox: @unchecked Sendable {
+    private let lock = NSLock()
+    private var value: Result<HostStateMonitorReceipt, Error>?
+
+    func store(_ result: Result<HostStateMonitorReceipt, Error>) {
+        lock.lock()
+        value = result
+        lock.unlock()
+    }
+
+    func result() -> Result<HostStateMonitorReceipt, Error>? {
+        lock.lock()
+        defer { lock.unlock() }
+        return value
+    }
+}
+
 final class BenchmarkDriverCoreTests: XCTestCase {
+    func testHostStateSnapshotUsesStablePublicSchema() throws {
+        let snapshot = try HostStateSnapshot.capture()
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.sortedKeys, .withoutEscapingSlashes]
+        let data = try encoder.encode(snapshot)
+        let object = try XCTUnwrap(
+            try JSONSerialization.jsonObject(with: data) as? [String: Any]
+        )
+
+        XCTAssertEqual(
+            Set(object.keys),
+            [
+                "cpu_ticks",
+                "vm_pageouts",
+                "vm_swapouts",
+                "thermal_state",
+                "low_power_mode",
+                "power_source",
+            ]
+        )
+        let ticks = try XCTUnwrap(object["cpu_ticks"] as? [String: NSNumber])
+        XCTAssertEqual(Set(ticks.keys), ["user", "system", "idle", "nice"])
+        XCTAssertGreaterThan(ticks.values.reduce(UInt64(0)) { $0 + $1.uint64Value }, 0)
+        XCTAssertTrue(
+            ["nominal", "fair", "serious", "critical"].contains(
+                try XCTUnwrap(object["thermal_state"] as? String)
+            )
+        )
+        XCTAssertTrue(
+            ["ac_power", "battery_power", "ups_power"].contains(
+                try XCTUnwrap(object["power_source"] as? String)
+            )
+        )
+        XCTAssertEqual(try JSONDecoder().decode(HostStateSnapshot.self, from: data), snapshot)
+    }
+
+    func testHostStateMonitorCapturesAStopBoundedReceipt() throws {
+        var readyDescriptors = [Int32](repeating: 0, count: 2)
+        var stopDescriptors = [Int32](repeating: 0, count: 2)
+        XCTAssertEqual(pipe(&readyDescriptors), 0)
+        XCTAssertEqual(pipe(&stopDescriptors), 0)
+        defer {
+            readyDescriptors.forEach { close($0) }
+            stopDescriptors.forEach { close($0) }
+        }
+
+        var stopByte: UInt8 = 1
+        XCTAssertEqual(write(stopDescriptors[1], &stopByte, 1), 1)
+        let receipt = try HostStateMonitor.capture(
+            sampleIntervalSeconds: 0.05,
+            readyFileDescriptor: readyDescriptors[1],
+            stopFileDescriptor: stopDescriptors[0]
+        )
+
+        var readyByte: UInt8 = 0
+        XCTAssertEqual(read(readyDescriptors[0], &readyByte, 1), 1)
+        XCTAssertEqual(readyByte, 1)
+        XCTAssertEqual(receipt.schemaVersion, 1)
+        XCTAssertEqual(receipt.monotonicClock, "mach_absolute_time")
+        XCTAssertEqual(receipt.sampleIntervalSeconds, 0.05)
+        XCTAssertEqual(receipt.samples.count, 2)
+        XCTAssertTrue(receipt.events.isEmpty)
+        XCTAssertLessThan(
+            receipt.samples[0].monotonicSeconds,
+            receipt.samples[1].monotonicSeconds
+        )
+
+        let data = try JSONEncoder().encode(receipt)
+        let object = try XCTUnwrap(
+            try JSONSerialization.jsonObject(with: data) as? [String: Any]
+        )
+        XCTAssertEqual(
+            Set(object.keys),
+            [
+                "schema_version",
+                "monotonic_clock",
+                "sample_interval_seconds",
+                "samples",
+                "events",
+            ]
+        )
+    }
+
+    func testHostStateMonitorRejectsAnUnsafeSamplingInterval() throws {
+        XCTAssertThrowsError(
+            try HostStateMonitor.capture(
+                sampleIntervalSeconds: 0.01,
+                readyFileDescriptor: -1,
+                stopFileDescriptor: -1
+            )
+        )
+    }
+
+    func testHostStateMonitorPreservesEventWhenPowerStateRecoversBeforeSnapshot() throws {
+        var readyDescriptors = [Int32](repeating: 0, count: 2)
+        var stopDescriptors = [Int32](repeating: 0, count: 2)
+        XCTAssertEqual(pipe(&readyDescriptors), 0)
+        XCTAssertEqual(pipe(&stopDescriptors), 0)
+        defer {
+            readyDescriptors.forEach { close($0) }
+            stopDescriptors.forEach { close($0) }
+        }
+
+        let notificationCenter = NotificationCenter()
+        let notificationQueue = OperationQueue()
+        notificationQueue.name = "EasySplat host monitor transient test callbacks"
+        notificationQueue.maxConcurrentOperationCount = 1
+        notificationQueue.isSuspended = true
+        let snapshots = HostSnapshotFixture()
+        let resultBox = MonitorResultBox()
+        let finished = DispatchSemaphore(value: 0)
+        let readyWriteDescriptor = readyDescriptors[1]
+        let stopReadDescriptor = stopDescriptors[0]
+        DispatchQueue.global().async {
+            resultBox.store(
+                Result {
+                    try HostStateMonitor.captureForTesting(
+                        sampleIntervalSeconds: 0.05,
+                        readyFileDescriptor: readyWriteDescriptor,
+                        stopFileDescriptor: stopReadDescriptor,
+                        notificationCenter: notificationCenter,
+                        notificationQueue: notificationQueue,
+                        snapshotProvider: snapshots.capture
+                    )
+                }
+            )
+            finished.signal()
+        }
+
+        var readyByte: UInt8 = 0
+        XCTAssertEqual(read(readyDescriptors[0], &readyByte, 1), 1)
+        XCTAssertEqual(readyByte, 1)
+        snapshots.setLowPowerMode(true)
+        notificationCenter.post(
+            name: Notification.Name.NSProcessInfoPowerStateDidChange,
+            object: nil
+        )
+        snapshots.setLowPowerMode(false)
+        notificationQueue.isSuspended = false
+        notificationQueue.waitUntilAllOperationsAreFinished()
+        var stopByte: UInt8 = 1
+        XCTAssertEqual(write(stopDescriptors[1], &stopByte, 1), 1)
+        XCTAssertEqual(finished.wait(timeout: .now() + 5), .success)
+
+        let receipt = try XCTUnwrap(resultBox.result()).get()
+        XCTAssertGreaterThanOrEqual(receipt.samples.count, 3)
+        XCTAssertFalse(receipt.samples.contains { $0.state.lowPowerMode })
+        XCTAssertEqual(
+            receipt.events.map(\.kind),
+            [.lowPowerMode]
+        )
+        XCTAssertEqual(
+            receipt.events.map(\.monotonicSeconds),
+            receipt.events.map(\.monotonicSeconds).sorted()
+        )
+        XCTAssertLessThan(
+            try XCTUnwrap(receipt.events.first).monotonicSeconds,
+            try XCTUnwrap(receipt.samples.last).monotonicSeconds
+        )
+        XCTAssertEqual(
+            receipt.samples.map(\.monotonicSeconds),
+            receipt.samples.map(\.monotonicSeconds).sorted()
+        )
+        let data = try JSONEncoder().encode(receipt)
+        let object = try XCTUnwrap(
+            try JSONSerialization.jsonObject(with: data) as? [String: Any]
+        )
+        let events = try XCTUnwrap(object["events"] as? [[String: Any]])
+        let event = try XCTUnwrap(events.first)
+        XCTAssertEqual(Set(event.keys), ["kind", "monotonic_seconds"])
+        XCTAssertEqual(event["kind"] as? String, "low_power_mode")
+    }
+
+    func testHostStateMonitorDrainsQueuedNotificationsBeforeReturningReceipt() throws {
+        var readyDescriptors = [Int32](repeating: 0, count: 2)
+        var stopDescriptors = [Int32](repeating: 0, count: 2)
+        XCTAssertEqual(pipe(&readyDescriptors), 0)
+        XCTAssertEqual(pipe(&stopDescriptors), 0)
+        defer {
+            readyDescriptors.forEach { close($0) }
+            stopDescriptors.forEach { close($0) }
+        }
+
+        let notificationCenter = NotificationCenter()
+        let notificationQueue = OperationQueue()
+        notificationQueue.name = "EasySplat host monitor test callbacks"
+        notificationQueue.maxConcurrentOperationCount = 1
+        notificationQueue.isSuspended = true
+        let snapshots = HostSnapshotFixture()
+        let resultBox = MonitorResultBox()
+        let monitorFinished = DispatchSemaphore(value: 0)
+        let notificationFinished = DispatchSemaphore(value: 0)
+        let readyWriteDescriptor = readyDescriptors[1]
+        let stopReadDescriptor = stopDescriptors[0]
+        DispatchQueue.global().async {
+            resultBox.store(
+                Result {
+                    try HostStateMonitor.captureForTesting(
+                        sampleIntervalSeconds: 0.05,
+                        readyFileDescriptor: readyWriteDescriptor,
+                        stopFileDescriptor: stopReadDescriptor,
+                        notificationCenter: notificationCenter,
+                        notificationQueue: notificationQueue,
+                        snapshotProvider: snapshots.capture
+                    )
+                }
+            )
+            monitorFinished.signal()
+        }
+
+        var readyByte: UInt8 = 0
+        XCTAssertEqual(read(readyDescriptors[0], &readyByte, 1), 1)
+        XCTAssertEqual(readyByte, 1)
+        DispatchQueue.global().async {
+            notificationCenter.post(
+                name: ProcessInfo.thermalStateDidChangeNotification,
+                object: nil
+            )
+            notificationFinished.signal()
+        }
+        let notificationWasQueued = expectation(description: "notification callback was queued")
+        DispatchQueue.global().async {
+            let deadline = Date().addingTimeInterval(2)
+            while notificationQueue.operationCount == 0, Date() < deadline {
+                Thread.sleep(forTimeInterval: 0.001)
+            }
+            notificationWasQueued.fulfill()
+        }
+        wait(for: [notificationWasQueued], timeout: 3)
+        XCTAssertGreaterThan(notificationQueue.operationCount, 0)
+
+        var stopByte: UInt8 = 1
+        XCTAssertEqual(write(stopDescriptors[1], &stopByte, 1), 1)
+        XCTAssertEqual(monitorFinished.wait(timeout: .now() + 0.1), .timedOut)
+
+        notificationQueue.isSuspended = false
+        XCTAssertEqual(notificationFinished.wait(timeout: .now() + 3), .success)
+        XCTAssertEqual(monitorFinished.wait(timeout: .now() + 3), .success)
+        let receipt = try XCTUnwrap(resultBox.result()).get()
+        XCTAssertEqual(receipt.events.map(\.kind), [.thermalState])
+    }
+
+    func testPowerSourceObserverCancelsTimedOutStartupAndWaitsForExit() throws {
+        let startupEntered = DispatchSemaphore(value: 0)
+        let releaseStartup = DispatchSemaphore(value: 0)
+        let threadReachedExit = DispatchSemaphore(value: 0)
+        DispatchQueue.global().asyncAfter(deadline: .now() + 0.05) {
+            releaseStartup.signal()
+        }
+
+        XCTAssertThrowsError(
+            try PowerSourceChangeObserver.startForTesting(
+                startupTimeoutSeconds: 0.01,
+                shutdownTimeoutSeconds: 1,
+                beforeSourceCreation: {
+                    startupEntered.signal()
+                    releaseStartup.wait()
+                },
+                beforeThreadExit: {
+                    threadReachedExit.signal()
+                }
+            )
+        ) { error in
+            XCTAssertTrue(error.localizedDescription.contains("starting"))
+        }
+        XCTAssertEqual(startupEntered.wait(timeout: .now()), .success)
+        XCTAssertEqual(threadReachedExit.wait(timeout: .now()), .success)
+    }
+
+    func testPowerSourceObserverSurfacesShutdownTimeoutAndCanFinishOnRetry() throws {
+        let threadReachedExit = DispatchSemaphore(value: 0)
+        let releaseThreadExit = DispatchSemaphore(value: 0)
+        let observer = try PowerSourceChangeObserver.startForTesting(
+            startupTimeoutSeconds: 1,
+            shutdownTimeoutSeconds: 1,
+            beforeThreadExit: {
+                threadReachedExit.signal()
+                releaseThreadExit.wait()
+            }
+        )
+
+        XCTAssertThrowsError(try observer.stop(timeoutSeconds: 0.01)) { error in
+            XCTAssertTrue(error.localizedDescription.contains("stopping"))
+        }
+        XCTAssertEqual(threadReachedExit.wait(timeout: .now()), .success)
+        releaseThreadExit.signal()
+        XCTAssertNoThrow(try observer.stop(timeoutSeconds: 1))
+    }
+
+    func testHostStateMonitorRejectsAClosedStopDescriptor() throws {
+        var readyDescriptors = [Int32](repeating: 0, count: 2)
+        var stopDescriptors = [Int32](repeating: 0, count: 2)
+        XCTAssertEqual(pipe(&readyDescriptors), 0)
+        XCTAssertEqual(pipe(&stopDescriptors), 0)
+        close(stopDescriptors[0])
+        stopDescriptors[0] = -1
+        defer {
+            readyDescriptors.forEach { close($0) }
+            stopDescriptors.filter { $0 >= 0 }.forEach { close($0) }
+        }
+
+        XCTAssertThrowsError(
+            try HostStateMonitor.capture(
+                sampleIntervalSeconds: 0.05,
+                readyFileDescriptor: readyDescriptors[1],
+                stopFileDescriptor: stopDescriptors[0]
+            )
+        )
+    }
+
     func testValidationRejectsHeldOutViewInTrainingSelection() throws {
         var job = makeJob()
         job.trainingViewIndices.append(4)

@@ -27,8 +27,7 @@
     "resolved_compute",
     "actual",
     "metrics",
-    "artifacts",
-    "signature"
+    "artifacts"
   ],
   "properties": {
     "schema_version": {"const": 2},
@@ -48,7 +47,8 @@
         "toolchain_identity",
         "baseline_git_commit",
         "baseline_toolchain_identity",
-        "baseline_configuration_digest"
+        "baseline_configuration_digest",
+        "benchmark_contract_sha256"
       ],
       "properties": {
         "profile": {"const": "release"},
@@ -63,7 +63,8 @@
         "toolchain_identity": {"$ref": "#/$defs/sha256"},
         "baseline_git_commit": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
         "baseline_toolchain_identity": {"$ref": "#/$defs/sha256"},
-        "baseline_configuration_digest": {"$ref": "#/$defs/sha256"}
+        "baseline_configuration_digest": {"$ref": "#/$defs/sha256"},
+        "benchmark_contract_sha256": {"$ref": "#/$defs/sha256"}
       }
     },
     "baseline_run_configuration": {
@@ -234,6 +235,7 @@
           "mapper_invocations",
           "started_monotonic_seconds",
           "ended_monotonic_seconds",
+          "process_cpu_microseconds",
           "exit_code",
           "checkout_commit",
           "toolchain_identity",
@@ -282,6 +284,15 @@
           },
           "started_monotonic_seconds": {"type": "number", "minimum": 0},
           "ended_monotonic_seconds": {"type": "number", "exclusiveMinimum": 0},
+          "process_cpu_microseconds": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["user", "system"],
+            "properties": {
+              "user": {"type": "integer", "minimum": 0, "maximum": 18446744073709551615},
+              "system": {"type": "integer", "minimum": 0, "maximum": 18446744073709551615}
+            }
+          },
           "exit_code": {"type": "integer"},
           "checkout_commit": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
           "toolchain_identity": {"$ref": "#/$defs/sha256"},
@@ -378,8 +389,7 @@
           "bytes": {"type": "integer", "minimum": 0}
         }
       }
-    },
-    "signature": {"type": "string", "pattern": "^hmac-sha256:[0-9a-f]{64}$"}
+    }
   },
   "allOf": [
     {

@@ -7,7 +7,6 @@ CORPUS=""
 TOOLCHAIN_ROOT="${EASYSPLAT_LOCAL_TOOLCHAIN_ROOT:-$ROOT/Toolchains/out}"
 OUTPUT="$ROOT/tmp/benchmark-results"
 DRY_RUN=0
-EVIDENCE_KEY_FILE=""
 EMIT_REQUESTS=""
 EVIDENCE_ROOT=""
 REQUEST_INDEX=""
@@ -23,7 +22,6 @@ Options:
   --corpus PATH             Corpus manifest (profile default when omitted)
   --toolchain-root PATH     Resolved EasySplat toolchain
   --output DIRECTORY        Result directory (default: tmp/benchmark-results)
-  --evidence-key-file PATH  Protected release-evidence authentication key
   --emit-requests DIRECTORY Write bound producer requests instead of verifying
   --evidence-root DIRECTORY Read protected attestations from this separate root
   --request-index PATH      Bound protected-producer request index
@@ -55,11 +53,6 @@ while [ "$#" -gt 0 ]; do
     --output)
       [ "$#" -ge 2 ] || { echo "--output requires a directory" >&2; exit 64; }
       OUTPUT="$2"
-      shift 2
-      ;;
-    --evidence-key-file)
-      [ "$#" -ge 2 ] || { echo "--evidence-key-file requires a value" >&2; exit 64; }
-      EVIDENCE_KEY_FILE="$2"
       shift 2
       ;;
     --emit-requests)
@@ -130,9 +123,6 @@ arguments=(
 )
 if [ "$DRY_RUN" -eq 1 ]; then
   arguments+=(--dry-run)
-fi
-if [ -n "$EVIDENCE_KEY_FILE" ]; then
-  arguments+=(--evidence-key-file "$EVIDENCE_KEY_FILE")
 fi
 if [ -n "$EMIT_REQUESTS" ]; then
   arguments+=(--emit-requests "$EMIT_REQUESTS")

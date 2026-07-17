@@ -4,3 +4,4 @@ self-hosted-runner:
     - easysplat-benchmark-reference
     - easysplat-benchmark-constrained
     - easysplat-benchmark-8gb
+    - easysplat-ephemeral

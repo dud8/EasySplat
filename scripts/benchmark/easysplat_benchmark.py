@@ -153,6 +153,9 @@ APPROVED_PAIRED_BASELINE = {
 }
 MAX_TOOLCHAIN_INSTALL_STATE_BYTES = 16 * 1024 * 1024
 PINNED_TOOLCHAIN_PUBLIC_KEY_PATH = ROOT / "EasySplatApp/Resources/public_key_ed25519.txt"
+PUBLIC_BETA_TOOLCHAIN_COMPONENTS = frozenset(
+    {"macos-arm64-core", "geometry-da3-base", "geometry-da3-small"}
+)
 SHA256_PATTERN = re.compile(r"^sha256:[0-9a-f]{64}$")
 SAFE_TOKEN_PATTERN = re.compile(r"^[a-z0-9][a-z0-9_.-]{0,63}$")
 ARTIFACT_NAME_PATTERN = re.compile(r"^[a-z][a-z0-9_]*$")
@@ -1302,11 +1305,23 @@ def _load_json(path: Path, label: str) -> Any:
     def reject_constant(value: str) -> None:
         raise ConfigError(f"{label} contains non-finite JSON number {value}")
 
+    def finite_float(raw: str) -> float:
+        value = float(raw)
+        if not math.isfinite(value):
+            raise ConfigError(f"{label} contains a non-finite JSON number")
+        return value
+
     try:
-        return json.loads(path.read_text(encoding="utf-8"), parse_constant=reject_constant)
+        return json.loads(
+            path.read_text(encoding="utf-8"),
+            parse_constant=reject_constant,
+            parse_float=finite_float,
+        )
+    except ConfigError:
+        raise
     except FileNotFoundError as error:
         raise ConfigError(f"{label} not found: {path}") from error
-    except (OSError, json.JSONDecodeError) as error:
+    except (OSError, UnicodeError, ValueError) as error:
         raise ConfigError(f"{label} is not valid JSON: {path}: {error}") from error
 
 
@@ -1504,6 +1519,68 @@ def _verify_toolchain_manifest_signature(
         raise ConfigError("toolchain signed manifest signature is invalid") from error
 
 
+def _validate_toolchain_install_tree(
+    toolchain_root: Path,
+    expected_files: set[str],
+) -> None:
+    expected_files = set(expected_files)
+    expected_files.add(".easysplat_toolchain_state.json")
+    expected_directories: set[str] = set()
+    for relative in expected_files:
+        parts = PurePosixPath(relative).parts
+        for end in range(1, len(parts)):
+            expected_directories.add(PurePosixPath(*parts[:end]).as_posix())
+
+    found_files: set[str] = set()
+
+    def inspect(directory: Path, relative_directory: PurePosixPath | None = None) -> None:
+        try:
+            entries = list(os.scandir(directory))
+        except OSError as error:
+            raise ConfigError("toolchain install tree could not be inspected") from error
+        for entry in entries:
+            relative = (
+                PurePosixPath(entry.name)
+                if relative_directory is None
+                else relative_directory / entry.name
+            )
+            relative_text = relative.as_posix()
+            try:
+                metadata = entry.stat(follow_symlinks=False)
+            except OSError as error:
+                raise ConfigError(
+                    f"toolchain entry could not be inspected: {relative_text}"
+                ) from error
+            if stat.S_ISDIR(metadata.st_mode):
+                if relative_text not in expected_directories:
+                    raise ConfigError(
+                        f"toolchain install tree contains an undeclared directory: {relative_text}"
+                    )
+                inspect(Path(entry.path), relative)
+            elif stat.S_ISREG(metadata.st_mode):
+                if relative_text not in expected_files:
+                    raise ConfigError(
+                        f"toolchain install tree contains an undeclared file: {relative_text}"
+                    )
+                if metadata.st_nlink != 1:
+                    raise ConfigError(
+                        f"toolchain install tree contains a multiply linked file: {relative_text}"
+                    )
+                found_files.add(relative_text)
+            else:
+                raise ConfigError(
+                    f"toolchain install tree contains an unsafe entry: {relative_text}"
+                )
+
+    inspect(toolchain_root)
+    if found_files != expected_files:
+        missing = sorted(expected_files - found_files)
+        raise ConfigError(
+            "toolchain install tree is missing signed files: "
+            + ", ".join(missing[:5])
+        )
+
+
 def _validated_toolchain_closure(
     toolchain_root: Path,
     public_key_base64: str,
@@ -1584,6 +1661,7 @@ def _validated_toolchain_closure(
 
     normalized_components: list[dict[str, Any]] = []
     component_names: set[str] = set()
+    content_owners: dict[str, str] = {}
     manifest_artifacts: dict[str, str] = {}
     components_by_name: dict[str, Mapping[str, Any]] = {}
     canonical_root = toolchain_root.resolve()
@@ -1652,6 +1730,16 @@ def _validated_toolchain_closure(
                 or any(part in {"", ".", ".."} for part in content_path.parts)
             ):
                 raise ConfigError(f"toolchain content path is unsafe: {relative}")
+            if relative in content_owners:
+                raise ConfigError(
+                    "toolchain content path is owned by multiple components: "
+                    + relative
+                )
+            content_owners[relative] = name
+        if not set(critical_hashes).issubset(contents):
+            raise ConfigError(
+                f"toolchain critical-file closure is outside component contents: {name}"
+            )
         for relative, expected_hash in critical_hashes.items():
             if (
                 not isinstance(relative, str)
@@ -1714,6 +1802,12 @@ def _validated_toolchain_closure(
     }
     if set(installed_capabilities) != selected_capabilities:
         raise ConfigError("toolchain installed capability receipt does not match its components")
+    installed_files = {
+        relative
+        for name in installed_names
+        for relative in components_by_name[name]["contents"]
+    }
+    _validate_toolchain_install_tree(toolchain_root, installed_files)
     app_range = manifest.get("appVersionRange")
     if (
         not isinstance(app_range, dict)
@@ -1773,6 +1867,35 @@ def resolved_toolchain_identity(
     return evidence.toolchain_identity_from_closure(closure)
 
 
+def resolved_public_beta_toolchain_identity(
+    toolchain_root: Path,
+    *,
+    public_key_base64: str | None = None,
+) -> str:
+    if not toolchain_root.is_dir() or toolchain_root.is_symlink():
+        raise ConfigError("public-beta toolchain root is unavailable or unsafe")
+    if public_key_base64 is None:
+        try:
+            public_key_base64 = PINNED_TOOLCHAIN_PUBLIC_KEY_PATH.read_text(
+                encoding="utf-8"
+            ).strip()
+        except OSError as error:
+            raise ConfigError("pinned toolchain public key is unavailable") from error
+    closure = _validated_toolchain_closure(toolchain_root, public_key_base64)
+    if closure is None:
+        raise ConfigError("public-beta toolchain install state is unavailable")
+    manifest_names = {component["name"] for component in closure["components"]}
+    installed_names = set(closure["installed_artifacts"])
+    if (
+        manifest_names != PUBLIC_BETA_TOOLCHAIN_COMPONENTS
+        or installed_names != PUBLIC_BETA_TOOLCHAIN_COMPONENTS
+    ):
+        raise ConfigError(
+            "public-beta component closure must install exactly core, DA3 Base, and DA3 Small"
+        )
+    return evidence.toolchain_identity_from_closure(closure)
+
+
 def make_run_identity(
     profile: str,
     corpus: Mapping[str, Any],
@@ -1813,6 +1936,47 @@ def required_evidence_lanes(scene: Mapping[str, Any], scale: int) -> tuple[str, 
     return tuple(lanes)
 
 
+def benchmark_contract(corpus: Mapping[str, Any]) -> dict[str, Any]:
+    """Return the privacy-safe, tracked release-corpus structure."""
+    scenes = []
+    for scene in sorted(corpus["scenes"], key=lambda item: item["id"]):
+        scales = list(scene["scale_lanes"])
+        scenes.append(
+            {
+                "scene_id": scene["id"],
+                "category": scene["category"],
+                "capture_traits": list(scene["capture_traits"]),
+                "gate_scopes": list(scene["gate_scopes"]),
+                "input_kind": scene["input"]["kind"],
+                "scale_lanes": scales,
+                "aggregate_scale": scene["aggregate_scale"],
+                "expected_outcome": dict(scene["expected_outcome"]),
+                "evidence_path": scene["adapter"]["evidence_path"],
+                "required_evidence_lanes": {
+                    str(scale): list(required_evidence_lanes(scene, scale))
+                    for scale in scales
+                },
+            }
+        )
+    return {"schema_version": 1, "scenes": scenes}
+
+
+def benchmark_contract_sha256(corpus: Mapping[str, Any]) -> str:
+    return sha256_json(benchmark_contract(corpus))
+
+
+def validate_tracked_benchmark_contract(corpus: Mapping[str, Any]) -> str:
+    tracked_path = ROOT / "scripts/benchmark/corpus.json"
+    tracked = _load_json(tracked_path, "tracked benchmark contract")
+    expected = benchmark_contract(tracked)
+    actual = benchmark_contract(corpus)
+    if actual != expected:
+        raise ConfigError(
+            "release corpus public structure does not match scripts/benchmark/corpus.json"
+        )
+    return sha256_json(expected)
+
+
 def parse_runner_identities(
     values: list[str] | None,
     rendering_driver_identity_path: Path | None = None,
@@ -1845,6 +2009,7 @@ def validate_request_index(
     value: Any,
     identity: RunIdentity,
     corpus: Mapping[str, Any],
+    config: Mapping[str, Any],
 ) -> dict[str, Any]:
     index = _require_mapping(value, "request index")
     _require_exact_keys(
@@ -1863,6 +2028,11 @@ def validate_request_index(
             "baseline_toolchain_identity",
             "baseline_configuration_digest",
             "baseline_run_configuration",
+            "benchmark_contract_sha256",
+            "corpus_manifest",
+            "corpus_manifest_sha256",
+            "reference_config",
+            "reference_config_sha256",
             "runner_identities",
             "requests",
         },
@@ -1882,6 +2052,15 @@ def validate_request_index(
         "baseline_toolchain_identity": APPROVED_PAIRED_BASELINE["toolchain_identity"],
         "baseline_configuration_digest": sha256_json(APPROVED_PAIRED_BASELINE["run_configuration"]),
         "baseline_run_configuration": APPROVED_PAIRED_BASELINE["run_configuration"],
+        "benchmark_contract_sha256": benchmark_contract_sha256(corpus),
+        "corpus_manifest": "corpus.json",
+        "corpus_manifest_sha256": evidence.sha256_bytes(
+            evidence.canonical_json_bytes(corpus) + b"\n"
+        ),
+        "reference_config": "reference-config.json",
+        "reference_config_sha256": evidence.sha256_bytes(
+            evidence.canonical_json_bytes(config) + b"\n"
+        ),
     }
     for field, expected_value in expected.items():
         if index[field] != expected_value:
@@ -1953,7 +2132,6 @@ def _requirements(
     toolchain_root: Path,
     profile: str,
     toolchain_identity: str | None,
-    evidence_key_path: Path | None,
     request_index_path: Path | None,
 ) -> dict[str, Any]:
     missing_media = []
@@ -1976,7 +2154,13 @@ def _requirements(
                         / "attestation.json"
                     ).as_posix()
                     attestation = evidence_directory / Path(*PurePosixPath(relative).parts)
-                    if not attestation.is_file() or attestation.is_symlink():
+                    outcome = attestation.with_name("lane-outcome.json")
+                    if (
+                        not attestation.exists()
+                        and not attestation.is_symlink()
+                        and not outcome.exists()
+                        and not outcome.is_symlink()
+                    ):
                         missing_evidence.append({"scene_id": scene["id"], "path": relative})
     missing_toolchain = []
     if profile == "release" and toolchain_identity is None:
@@ -1986,13 +2170,6 @@ def _requirements(
         if missing_toolchain
         else None
     )
-    missing_key = None
-    if profile == "release" and (
-        evidence_key_path is None
-        or evidence_key_path.is_symlink()
-        or not evidence_key_path.is_file()
-    ):
-        missing_key = "protected evidence key file"
     missing_index = None
     if profile == "release" and (
         request_index_path is None
@@ -2004,7 +2181,6 @@ def _requirements(
         "media": missing_media,
         "evidence": missing_evidence,
         "toolchain": toolchain,
-        "evidence_key": missing_key,
         "request_index": missing_index,
     }
 
@@ -2033,12 +2209,11 @@ def _result_shell(
         "thresholds_digest": sha256_json(config),
         "corpus_digest": sha256_json(corpus),
         "git": collect_git_state(),
-        "raw_artifact_directory": "raw",
+        "raw_evidence_retention": "local_only",
         "missing_requirements": {
             "media": [],
             "evidence": [],
             "toolchain": None,
-            "evidence_key": None,
             "request_index": None,
         },
     }
@@ -2077,7 +2252,7 @@ def validate_suite_result(result: Any) -> None:
             "thresholds_digest",
             "corpus_digest",
             "git",
-            "raw_artifact_directory",
+            "raw_evidence_retention",
             "missing_requirements",
         },
         "suite result",
@@ -2105,8 +2280,17 @@ def validate_suite_result(result: Any) -> None:
             raise ConfigError(f"suite result.{key} is invalid")
     _validate_string_list(root["blocking_reasons"], "suite result.blocking_reasons")
     _validate_string_list(root["failures"], "suite result.failures")
-    if root["raw_artifact_directory"] != "raw":
-        raise ConfigError("suite result raw_artifact_directory is invalid")
+    expected_status = (
+        "failed"
+        if root["failures"]
+        else "blocked"
+        if root["blocking_reasons"]
+        else "passed"
+    )
+    if root["status"] != expected_status:
+        raise ConfigError("suite result status contradicts its failures and blockers")
+    if root["raw_evidence_retention"] not in {"local_only", "excluded"}:
+        raise ConfigError("suite result raw_evidence_retention is invalid")
 
     git = _require_mapping(root["git"], "suite result.git")
     _require_exact_keys(git, {"commit", "dirty"}, "suite result.git")
@@ -2205,6 +2389,15 @@ def validate_suite_result(result: Any) -> None:
         _require_safe_token(scene["detail_profile"], f"{label}.detail_profile")
         _validate_string_list(scene["blocking_reasons"], f"{label}.blocking_reasons")
         _validate_string_list(scene["failures"], f"{label}.failures")
+        expected_scene_status = (
+            "failed"
+            if scene["failures"]
+            else "blocked"
+            if scene["blocking_reasons"]
+            else "passed"
+        )
+        if scene["status"] != expected_scene_status:
+            raise ConfigError(f"{label}.status contradicts its failures and blockers")
         exit_evidence = _require_mapping(scene["exit"], f"{label}.exit")
         _require_exact_keys(exit_evidence, {"code", "reason", "cancelled"}, f"{label}.exit")
         _validate_actual_evidence(
@@ -2234,7 +2427,14 @@ def validate_suite_result(result: Any) -> None:
             record = _require_mapping(raw_evidence, evidence_label)
             _require_exact_keys(
                 record,
-                {"lane", "machine", "producer", "measurement_runner", "attestation_digest"},
+                {
+                    "lane",
+                    "machine",
+                    "producer",
+                    "measurement_runner",
+                    "evidence_digest",
+                    *({"collector_status_digest"} if "collector_status_digest" in record else set()),
+                },
                 evidence_label,
             )
             lane = record["lane"]
@@ -2252,10 +2452,15 @@ def validate_suite_result(result: Any) -> None:
             _require_safe_token(producer["version"], f"{evidence_label}.producer.version")
             if producer["executable"] != evidence.PRODUCER_RELATIVE_PATH:
                 raise ConfigError(f"{evidence_label}.producer executable is invalid")
-            for digest_field, digest_value in (
+            digest_fields = [
                 ("producer.sha256", producer["sha256"]),
-                ("attestation_digest", record["attestation_digest"]),
-            ):
+                ("evidence_digest", record["evidence_digest"]),
+            ]
+            if "collector_status_digest" in record:
+                digest_fields.append(
+                    ("collector_status_digest", record["collector_status_digest"])
+                )
+            for digest_field, digest_value in digest_fields:
                 if not isinstance(digest_value, str) or not SHA256_PATTERN.fullmatch(digest_value):
                     raise ConfigError(f"{evidence_label}.{digest_field} is invalid")
             try:
@@ -2268,6 +2473,21 @@ def validate_suite_result(result: Any) -> None:
             except evidence.EvidenceError as error:
                 raise ConfigError(f"{evidence_label}.machine is invalid: {error}") from error
 
+    expected_scene_failures = {
+        f"{scene['scene_id']}@{scene['scale']}: {failure}"
+        for scene in scene_results
+        for failure in scene["failures"]
+    }
+    expected_scene_blockers = {
+        f"{scene['scene_id']}@{scene['scale']}: {reason}"
+        for scene in scene_results
+        for reason in scene["blocking_reasons"]
+    }
+    if not expected_scene_failures.issubset(set(root["failures"])):
+        raise ConfigError("suite result failures omit scene failures")
+    if not expected_scene_blockers.issubset(set(root["blocking_reasons"])):
+        raise ConfigError("suite result blocking_reasons omit scene blockers")
+
     aggregates = _require_mapping(root["aggregates"], "suite result.aggregates")
     if aggregates:
         _require_exact_keys(
@@ -2278,6 +2498,14 @@ def validate_suite_result(result: Any) -> None:
         for key in ("scene_scale_runs", "passed", "failed", "blocked"):
             if type(aggregates[key]) is not int or aggregates[key] < 0:
                 raise ConfigError(f"suite result.aggregates.{key} is invalid")
+        expected_counts = {
+            "scene_scale_runs": len(scene_results),
+            "passed": sum(scene["status"] == "passed" for scene in scene_results),
+            "failed": sum(scene["status"] == "failed" for scene in scene_results),
+            "blocked": sum(scene["status"] == "blocked" for scene in scene_results),
+        }
+        if any(aggregates[key] != value for key, value in expected_counts.items()):
+            raise ConfigError("suite result aggregates contradict scene statuses")
         errors = metric_validation_failures(
             {"wall_time_seconds": aggregates["wall_time_geometric_mean_seconds"]}
         )
@@ -2287,7 +2515,7 @@ def validate_suite_result(result: Any) -> None:
     missing = _require_mapping(root["missing_requirements"], "suite result.missing_requirements")
     _require_exact_keys(
         missing,
-        {"media", "evidence", "toolchain", "evidence_key", "request_index"},
+        {"media", "evidence", "toolchain", "request_index"},
         "suite result.missing_requirements",
     )
     for key in ("media", "evidence"):
@@ -2304,15 +2532,10 @@ def validate_suite_result(result: Any) -> None:
         if toolchain["label"] != "toolchain://resolved":
             raise ConfigError("suite result toolchain label is invalid")
         _validate_string_list(toolchain["missing"], "suite result.missing_requirements.toolchain.missing")
-    if missing["evidence_key"] is not None:
-        if missing["evidence_key"] != "protected evidence key file":
-            raise ConfigError("suite result missing evidence key label is invalid")
     if missing["request_index"] is not None:
         if missing["request_index"] != "protected request index":
             raise ConfigError("suite result missing request index label is invalid")
 
-    if root["status"] == "passed" and (root["blocking_reasons"] or root["failures"]):
-        raise ConfigError("passed suite result contains blockers or failures")
     canonical_json_bytes(root)
 
 
@@ -2539,6 +2762,7 @@ def _evidence_request(
     identity: RunIdentity,
     input_digest: str,
     rendering_driver_identity: Mapping[str, str],
+    benchmark_contract_digest: str,
 ) -> dict[str, Any]:
     if lane not in required_evidence_lanes(scene, scale):
         raise ConfigError(f"{scene['id']}@{scale} does not support the {lane} evidence lane")
@@ -2673,6 +2897,7 @@ def _evidence_request(
             "baseline_git_commit": APPROVED_PAIRED_BASELINE["git_commit"],
             "baseline_toolchain_identity": APPROVED_PAIRED_BASELINE["toolchain_identity"],
             "baseline_configuration_digest": sha256_json(APPROVED_PAIRED_BASELINE["run_configuration"]),
+            "benchmark_contract_sha256": benchmark_contract_digest,
         },
         "baseline_run_configuration": APPROVED_PAIRED_BASELINE["run_configuration"],
         "candidate_run_configuration": candidate_configuration,
@@ -2712,7 +2937,7 @@ def _evaluate_protected_attestations(
         blocking = [reason for item in evaluations for reason in item["blocking_reasons"]]
         return (
             {
-                "status": "blocked" if blocking else "failed" if failures else "passed",
+                "status": "failed" if failures else "blocked" if blocking else "passed",
                 "blocking_reasons": blocking,
                 "failures": failures,
             },
@@ -2801,22 +3026,64 @@ def _evaluate_protected_attestations(
             memory_lane = _required_lane_metric(metrics, "memory_lane", blocking)
             machine_memory = _required_lane_metric(metrics, "machine_memory_bytes", blocking)
             peak_memory = _required_lane_metric(metrics, "peak_memory_bytes", blocking)
+            peak_metal = _required_lane_metric(
+                metrics,
+                "peak_metal_allocated_bytes",
+                blocking,
+            )
             if memory_lane is not None and memory_lane != expected_memory_lane:
                 failures.append(f"{lane} reports the wrong memory lane")
             physical_memory = attestation["machine"].get("physical_memory_bytes")
             if machine_memory is not None and machine_memory != physical_memory:
                 failures.append(f"{lane} memory metric does not match the attested machine")
-            if maximum_peak is not None and peak_memory is not None and peak_memory > maximum_peak:
-                failures.append(f"{lane} peak memory exceeds {maximum_peak}")
+            unified_peak = (
+                max(peak_memory, peak_metal)
+                if peak_memory is not None and peak_metal is not None
+                else None
+            )
+            if (
+                unified_peak is not None
+                and physical_memory is not None
+                and unified_peak > physical_memory
+            ):
+                failures.append(f"{lane} unified memory exceeds the attested machine")
+            if maximum_peak is not None and unified_peak is not None and unified_peak > maximum_peak:
+                failures.append(f"{lane} unified memory exceeds {maximum_peak}")
 
     return (
         {
-            "status": "blocked" if blocking else "failed" if failures else "passed",
+            "status": "failed" if failures else "blocked" if blocking else "passed",
             "blocking_reasons": blocking,
             "failures": failures,
         },
         reference_metrics,
     )
+
+
+def _protected_evidence_parent_error(path: Path, trusted_root: Path) -> str | None:
+    try:
+        relative = path.relative_to(trusted_root)
+    except ValueError:
+        return "path escapes the trusted corpus root"
+    try:
+        root_metadata = trusted_root.lstat()
+    except OSError:
+        return "trusted corpus root is unreadable"
+    if trusted_root.is_symlink() or not stat.S_ISDIR(root_metadata.st_mode):
+        return "trusted corpus root is not a real directory"
+
+    cursor = trusted_root
+    for part in relative.parts[:-1]:
+        cursor /= part
+        try:
+            metadata = cursor.lstat()
+        except FileNotFoundError:
+            break
+        except OSError:
+            return "parent path is unreadable"
+        if cursor.is_symlink() or not stat.S_ISDIR(metadata.st_mode):
+            return "unsafe parent path"
+    return None
 
 
 def _copy_protected_evidence(
@@ -2825,14 +3092,15 @@ def _copy_protected_evidence(
     corpus_directory: Path,
     identity: RunIdentity,
     input_digest: str,
-    key: bytes,
     runner_identities: Mapping[str, Mapping[str, Any]],
+    benchmark_contract_digest: str,
 ) -> dict[str, Any]:
     evidence_root = corpus_directory / scene["adapter"]["evidence_path"] / str(scale)
     attestations: dict[str, Mapping[str, Any]] = {}
     summaries = []
     artifacts: dict[str, str] = {}
     verification_failures = []
+    verification_blocking = []
     for lane in required_evidence_lanes(scene, scale):
         request = _evidence_request(
             scene,
@@ -2841,14 +3109,80 @@ def _copy_protected_evidence(
             identity,
             input_digest,
             runner_identities[evidence.RENDERING_DRIVER_IDENTITY],
+            benchmark_contract_digest,
         )
         path = evidence_root / lane / "attestation.json"
+        outcome_path = evidence_root / lane / "lane-outcome.json"
+        parent_error = _protected_evidence_parent_error(path, corpus_directory)
+        if parent_error is not None:
+            verification_failures.append(
+                f"{lane} evidence rejected: {parent_error}"
+            )
+            continue
         try:
-            attestation = evidence.verify_attestation(
+            attestation_metadata = path.lstat()
+        except FileNotFoundError:
+            attestation_metadata = None
+        except OSError:
+            verification_failures.append(f"{lane} evidence rejected: attestation is unreadable")
+            continue
+        try:
+            outcome_metadata = outcome_path.lstat()
+        except FileNotFoundError:
+            outcome_metadata = None
+        except OSError:
+            verification_failures.append(f"{lane} evidence rejected: lane outcome is unreadable")
+            continue
+        if attestation_metadata is not None and outcome_metadata is not None:
+            verification_failures.append(
+                f"{lane} evidence rejected: attestation and lane outcome are both present"
+            )
+            continue
+        if attestation_metadata is None and outcome_metadata is None:
+            verification_blocking.append(f"{lane} timing attestation is unavailable")
+            continue
+        if outcome_metadata is not None:
+            try:
+                outcome = evidence.validate_prepared_lane_outcome_file(
+                    outcome_path,
+                    request,
+                    lane,
+                    runner_identities[lane],
+                )
+            except evidence.EvidenceError as error:
+                verification_failures.append(f"{lane} evidence rejected: {error}")
+                continue
+            artifacts[f"{lane}_lane_outcome"] = evidence.sha256_file(outcome_path)
+            if outcome["outcome"]["kind"] == "execution_failed":
+                reason = outcome["outcome"]["reason"].replace("_", " ")
+                exit_code = outcome["outcome"]["exit_code"]
+                exit_suffix = (
+                    f" (exit {exit_code})"
+                    if exit_code not in {None, 0}
+                    else ""
+                )
+                verification_failures.append(
+                    f"{lane} measurement runner {reason}{exit_suffix}"
+                )
+            elif outcome["outcome"]["kind"] == "environment_rejected":
+                verification_blocking.append(
+                    f"{lane} timing evidence was rejected by measured host conditions"
+                )
+            else:
+                reason = outcome["outcome"]["reason"].replace("_", " ")
+                verification_blocking.append(
+                    f"{lane} protected evidence infrastructure {reason}"
+                )
+            continue
+        assert attestation_metadata is not None
+        if not stat.S_ISREG(attestation_metadata.st_mode) or path.is_symlink():
+            verification_failures.append(f"{lane} evidence rejected: attestation is unsafe")
+            continue
+        try:
+            attestation = evidence.validate_prepared_attestation_file(
                 path,
                 request,
                 lane,
-                key,
                 runner_identities[lane],
             )
         except evidence.EvidenceError as error:
@@ -2865,7 +3199,7 @@ def _copy_protected_evidence(
                 "machine": dict(attestation["machine"]),
                 "producer": dict(attestation["producer"]),
                 "measurement_runner": dict(attestation["measurement_runner"]),
-                "attestation_digest": evidence.sha256_file(path),
+                "evidence_digest": evidence.sha256_file(path),
             }
         )
         for name, descriptor in attestation["artifacts"].items():
@@ -2874,7 +3208,18 @@ def _copy_protected_evidence(
                 artifacts[output_name] = descriptor["sha256"]
 
     if verification_failures:
-        evaluation = {"status": "failed", "blocking_reasons": [], "failures": verification_failures}
+        evaluation = {
+            "status": "failed",
+            "blocking_reasons": verification_blocking,
+            "failures": verification_failures,
+        }
+        metrics: dict[str, Any] = {}
+    elif verification_blocking:
+        evaluation = {
+            "status": "blocked",
+            "blocking_reasons": verification_blocking,
+            "failures": [],
+        }
         metrics: dict[str, Any] = {}
     else:
         evaluation, metrics = _evaluate_protected_attestations(scene, scale, attestations)
@@ -2923,13 +3268,12 @@ def emit_evidence_requests(
         approved_runners = evidence.validate_runner_identities(runner_identities)
     except evidence.EvidenceError as error:
         raise ConfigError(f"cannot emit requests without complete runner identities: {error}") from error
-    toolchain_identity = resolved_toolchain_identity(toolchain_root, "release")
-    if toolchain_identity is None:
-        raise ConfigError("cannot emit evidence requests without a resolved toolchain identity")
+    toolchain_identity = resolved_public_beta_toolchain_identity(toolchain_root)
     git = collect_git_state()
     if git["dirty"]:
         raise ConfigError("cannot emit release evidence requests from a dirty Git worktree")
     identity = make_run_identity("release", corpus, config, toolchain_root, toolchain_identity)
+    contract_digest = validate_tracked_benchmark_contract(corpus)
     input_digests: dict[str, str] = {}
     input_digest_owners: dict[str, str] = {}
     for scene in corpus["scenes"]:
@@ -2947,6 +3291,8 @@ def emit_evidence_requests(
         )
 
     destination.mkdir(parents=True, exist_ok=True)
+    atomic_write_json(destination / "corpus.json", corpus)
+    atomic_write_json(destination / "reference-config.json", config)
     requests = []
     for scene in corpus["scenes"]:
         for scale in scene["scale_lanes"]:
@@ -2958,6 +3304,7 @@ def emit_evidence_requests(
                     identity,
                     input_digests[scene["id"]],
                     approved_runners[evidence.RENDERING_DRIVER_IDENTITY],
+                    contract_digest,
                 )
                 relative = Path(scene["id"]) / str(scale) / f"{lane}.request.json"
                 atomic_write_json(destination / relative, request)
@@ -2971,24 +3318,17 @@ def emit_evidence_requests(
                         "evidence_path": scene["adapter"]["evidence_path"],
                         "producer_command": [
                             "python3",
-                            evidence.PRODUCER_RELATIVE_PATH,
-                            "produce",
-                            "--request",
-                            f"requests://{relative.as_posix()}",
-                            "--observations",
-                            "evidence://observations.json",
-                            "--artifact-root",
-                            "evidence://run",
-                            "--output",
-                            f"evidence://{lane}/attestation.json",
+                            "scripts/benchmark/prepare_evidence.py",
+                            "--index",
+                            "requests://index.json",
+                            "--requests-root",
+                            "requests://",
+                            "--raw-evidence-root",
+                            f"evidence://raw/{lane}",
+                            "--output-root",
+                            f"evidence://prepared/{lane}",
                             "--lane",
                             lane,
-                            "--runner-label",
-                            approved_runners[lane]["label"],
-                            "--runner-sha256",
-                            approved_runners[lane]["sha256"],
-                            "--key-file",
-                            "protected://evidence-key",
                         ],
                     }
                 )
@@ -3006,6 +3346,13 @@ def emit_evidence_requests(
         "baseline_toolchain_identity": APPROVED_PAIRED_BASELINE["toolchain_identity"],
         "baseline_configuration_digest": sha256_json(APPROVED_PAIRED_BASELINE["run_configuration"]),
         "baseline_run_configuration": APPROVED_PAIRED_BASELINE["run_configuration"],
+        "benchmark_contract_sha256": contract_digest,
+        "corpus_manifest": "corpus.json",
+        "corpus_manifest_sha256": evidence.sha256_file(destination / "corpus.json"),
+        "reference_config": "reference-config.json",
+        "reference_config_sha256": evidence.sha256_file(
+            destination / "reference-config.json"
+        ),
         "runner_identities": approved_runners,
         "requests": requests,
     }
@@ -3129,7 +3476,7 @@ def evaluate_suite_performance(
             failures.append(f"{scene_id}: unordered mapping regresses more than allowed")
 
     return {
-        "status": "blocked" if blocking else "failed" if failures else "passed",
+        "status": "failed" if failures else "blocked" if blocking else "passed",
         "blocking_reasons": blocking,
         "failures": failures,
     }
@@ -3222,7 +3569,7 @@ def evaluate_suite_quality(
             if statistics.median(measured_values) > limit:
                 failures.append(f"{category} median {name} exceeds maximum {limit}")
     return {
-        "status": "blocked" if blocking else "failed" if failures else "passed",
+        "status": "failed" if failures else "blocked" if blocking else "passed",
         "blocking_reasons": blocking,
         "failures": failures,
     }
@@ -3256,7 +3603,6 @@ def run_suite(
     output_directory: Path,
     dry_run: bool,
     stdout: TextIO = sys.stdout,
-    evidence_key_path: Path | None = None,
     emit_requests_directory: Path | None = None,
     evidence_root: Path | None = None,
     request_index_path: Path | None = None,
@@ -3302,19 +3648,16 @@ def run_suite(
         toolchain_root,
         profile,
         toolchain_identity,
-        evidence_key_path,
         request_index_path,
     )
     result["missing_requirements"] = requirements
     missing_labels = []
     if requirements["media"]:
         missing_labels.append(f"missing media for {len(requirements['media'])} scene(s)")
-    if requirements["evidence"]:
+    if requirements["evidence"] and profile != "release":
         missing_labels.append(f"missing protected evidence for {len(requirements['evidence'])} run(s)")
     if requirements["toolchain"]:
         missing_labels.append("resolved toolchain is unavailable")
-    if requirements["evidence_key"]:
-        missing_labels.append("protected evidence key is unavailable")
     if requirements["request_index"]:
         missing_labels.append("protected request index is unavailable")
     if profile == "release" and result["git"]["dirty"]:
@@ -3335,7 +3678,6 @@ def run_suite(
         toolchain_identity,
     )
     result["toolchain_identity"] = identity.toolchain_identity
-    evidence_key = evidence.load_key(evidence_key_path) if profile == "release" and evidence_key_path else None
     approved_runners: dict[str, dict[str, str]] = {}
     if profile == "release":
         if request_index_path is None:
@@ -3344,6 +3686,7 @@ def run_suite(
             _load_json(request_index_path, "request index"),
             identity,
             corpus,
+            config,
         )
         approved_runners = request_index["runner_identities"]
     input_digests: dict[str, str] = {}
@@ -3369,16 +3712,14 @@ def run_suite(
                     input_digests[scene["id"]],
                 )
             else:
-                if evidence_key is None:
-                    raise ConfigError("protected evidence key is unavailable")
                 scene_result = _copy_protected_evidence(
                     scene,
                     scale,
                     evidence_root or corpus_path.parent,
                     identity,
                     input_digests[scene["id"]],
-                    evidence_key,
                     approved_runners,
+                    benchmark_contract_sha256(corpus),
                 )
             scene_results.append(scene_result)
     result["scene_results"] = scene_results
@@ -3408,7 +3749,7 @@ def run_suite(
         result["failures"].extend(
             f"suite quality: {failure}" for failure in suite_quality["failures"]
         )
-    status = "blocked" if result["blocking_reasons"] else "failed" if result["failures"] else "passed"
+    status = "failed" if result["failures"] else "blocked" if result["blocking_reasons"] else "passed"
     _finish_result(result, status)
     write_suite_result(output_directory / "suite.json", result)
     stdout.write(canonical_json_bytes({"status": status, "result": str(output_directory / "suite.json")}).decode("utf-8") + "\n")
@@ -3422,7 +3763,6 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--reference-config", type=Path, required=True)
     parser.add_argument("--toolchain-root", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
-    parser.add_argument("--evidence-key-file", type=Path)
     parser.add_argument("--emit-requests", type=Path)
     parser.add_argument("--evidence-root", type=Path)
     parser.add_argument("--request-index", type=Path)
@@ -3442,7 +3782,6 @@ def main(argv: list[str] | None = None) -> int:
             toolchain_root=args.toolchain_root,
             output_directory=args.output,
             dry_run=args.dry_run,
-            evidence_key_path=args.evidence_key_file,
             emit_requests_directory=args.emit_requests,
             evidence_root=args.evidence_root,
             request_index_path=args.request_index,

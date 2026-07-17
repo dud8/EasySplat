@@ -1,17 +1,15 @@
 #!/usr/bin/env python3
-"""Derive and seal benchmark evidence from raw measurements.
+"""Derive and validate benchmark evidence from raw measurements.
 
 Release metrics are never accepted directly from a corpus manifest. A protected
-runner records raw observations and command logs, then invokes this program to
-derive the gate metrics and authenticate the resulting machine attestation.
+runner records raw observations and command logs. A separate hosted job derives
+compact evidence from those observations without retaining the raw artifacts.
 """
 
 from __future__ import annotations
 
-import argparse
 import base64
 import hashlib
-import hmac
 import io
 import json
 import math
@@ -24,7 +22,6 @@ import stat
 import statistics
 import struct
 import subprocess
-import sys
 import tempfile
 import warnings
 import zipfile
@@ -34,8 +31,8 @@ from pathlib import Path, PurePosixPath
 from typing import Any, Iterable, Mapping
 
 
-PROTOCOL_VERSION = 2
-PRODUCER_VERSION = "2.1.0"
+PROTOCOL_VERSION = 3
+PRODUCER_VERSION = "3.0.0"
 PRODUCER_RELATIVE_PATH = "scripts/benchmark/evidence_protocol.py"
 LANE_REFERENCE = "reference_m4_max"
 LANE_CONSTRAINED = "constrained_14_16gb"
@@ -55,7 +52,6 @@ ACCURATE_REFERENCE_CONFIGURATION = {
     "pose_source": "accurate_colmap",
 }
 SHA256_PATTERN = re.compile(r"^sha256:[0-9a-f]{64}$")
-HMAC_PATTERN = re.compile(r"^hmac-sha256:[0-9a-f]{64}$")
 SAFE_TOKEN_PATTERN = re.compile(r"^[a-z0-9][a-z0-9_.-]{0,63}$")
 MONOTONIC_TIMESTAMP_TOLERANCE_SECONDS = 1e-6
 PINNED_TOOLCHAIN_PUBLIC_KEY_PATH = (
@@ -64,6 +60,12 @@ PINNED_TOOLCHAIN_PUBLIC_KEY_PATH = (
 )
 PINNED_TOOLCHAIN_PUBLIC_KEY_BASE64_OVERRIDE: str | None = None
 MAX_TOOLCHAIN_INSTALL_STATE_BYTES = 16 * 1024 * 1024
+MAX_HOST_MONITOR_BYTES = 64 * 1024 * 1024
+MAX_LANE_OUTCOME_BYTES = 1024 * 1024
+MAX_ATTESTATION_BYTES = 16 * 1024 * 1024
+MAX_OBSERVATIONS_BYTES = 256 * 1024 * 1024
+MAX_EXTERNAL_CPU_FRACTION = 0.10
+MAX_UNATTRIBUTED_CHILD_CPU_FRACTION = 0.02
 ALLOWED_GATE_SCOPES = {
     "scene_quality",
     "scene_performance",
@@ -310,6 +312,28 @@ class RenderingEvidence:
 
 class EvidenceError(ValueError):
     """Raw evidence is incomplete, inconsistent, or unsafe."""
+
+
+def _decode_json_text(value: str, label: str) -> Any:
+    def reject_constant(constant: str) -> None:
+        raise EvidenceError(f"{label} contains {constant}")
+
+    def finite_float(raw: str) -> float:
+        parsed = float(raw)
+        if not math.isfinite(parsed):
+            raise EvidenceError(f"{label} contains a non-finite number")
+        return parsed
+
+    try:
+        return json.loads(
+            value,
+            parse_constant=reject_constant,
+            parse_float=finite_float,
+        )
+    except EvidenceError:
+        raise
+    except (UnicodeError, ValueError, RecursionError) as error:
+        raise EvidenceError(f"{label} is not valid JSON") from error
 
 
 def canonical_json_bytes(value: Any) -> bytes:
@@ -881,7 +905,7 @@ def _paired_losses(
         _exact_keys(record, fields, f"{label}[{index}]")
         if record["holdout_index"] != expected_holdout_indices[index]:
             raise EvidenceError(
-                f"{label} must cover each signed holdout index exactly once and in order"
+                f"{label} must cover each bound holdout index exactly once and in order"
             )
         values = {}
         for field in fields - {"holdout_index"}:
@@ -928,6 +952,24 @@ def _nonnegative_number(value: Any, label: str) -> float:
     return float(value)
 
 
+def _validate_timing_repeatability(
+    grouped: Mapping[str, list[dict[str, float]]],
+    label: str,
+    measurement_fields: tuple[str, ...],
+) -> None:
+    for variant, records in grouped.items():
+        for field in measurement_fields:
+            values = [record[field] for record in records]
+            median = statistics.median(values)
+            spread = max(values) - min(values)
+            maximum_spread = max(0.05, 0.25 * median)
+            maximum_ratio = max(values) / min(values)
+            if spread > maximum_spread + 1e-9 or maximum_ratio > 1.5 + 1e-9:
+                raise EvidenceError(
+                    f"{label} {variant} {field} failed the timing repeatability gate"
+                )
+
+
 def _validate_timing_sequence(
     value: Any,
     label: str,
@@ -937,16 +979,16 @@ def _validate_timing_sequence(
     baseline_variant: str = "baseline",
     candidate_variant: str = "candidate",
 ) -> dict[str, list[dict[str, float]]]:
-    expected_count = 1 + repetitions * 2
+    expected_count = 2 + repetitions * 2
     if not isinstance(value, list) or len(value) != expected_count:
         raise EvidenceError(
-            f"{label} must contain one discarded warm-up and {repetitions} alternating paired repetitions"
+            f"{label} must contain one discarded warm-up per variant and "
+            f"{repetitions} counterbalanced paired repetitions"
         )
-    expected_variants = [candidate_variant] + [
-        variant
-        for _ in range(repetitions)
-        for variant in (baseline_variant, candidate_variant)
-    ]
+    expected_variants = [baseline_variant, candidate_variant]
+    for pair_index in range(repetitions):
+        pair = (baseline_variant, candidate_variant)
+        expected_variants.extend(pair if pair_index % 2 == 0 else reversed(pair))
     grouped: dict[str, list[dict[str, float]]] = {
         baseline_variant: [],
         candidate_variant: [],
@@ -956,11 +998,13 @@ def _validate_timing_sequence(
         expected_fields = {"run_id", "variant", "discarded", *measurement_fields}
         _exact_keys(record, expected_fields, f"{label}[{index}]")
         if record["variant"] != expected_variant:
-            raise EvidenceError(f"{label} must alternate baseline and candidate runs")
+            raise EvidenceError(
+                f"{label} must follow the counterbalanced baseline/candidate order"
+            )
         run_id = _token(record["run_id"], f"{label}[{index}].run_id")
-        expected_discarded = index == 0
+        expected_discarded = index < 2
         if type(record["discarded"]) is not bool or record["discarded"] != expected_discarded:
-            raise EvidenceError(f"{label} must mark only its first candidate warm-up as discarded")
+            raise EvidenceError(f"{label} must discard exactly one warm-up per variant")
         measurements = {
             field: _positive_number(record[field], f"{label}[{index}].{field}")
             for field in measurement_fields
@@ -973,6 +1017,7 @@ def _validate_timing_sequence(
         measurements["run_id"] = run_id
         if not expected_discarded:
             grouped[expected_variant].append(measurements)
+    _validate_timing_repeatability(grouped, label, measurement_fields)
     return grouped
 
 
@@ -998,6 +1043,11 @@ def _validate_candidate_timing(value: Any) -> list[float]:
         )
         if not expected_discarded:
             result.append(seconds)
+    _validate_timing_repeatability(
+        {"candidate": [{"end_to_end_seconds": seconds} for seconds in result]},
+        "timing.candidate_runs",
+        ("end_to_end_seconds",),
+    )
     return result
 
 
@@ -1514,8 +1564,14 @@ def _expected_variant_identity(
 def _read_command_log(path: Path) -> list[Any]:
     try:
         lines = path.read_text(encoding="utf-8").splitlines()
-        return [json.loads(line) for line in lines if line.strip()]
-    except (OSError, json.JSONDecodeError) as error:
+        return [
+            _decode_json_text(line, "command_log")
+            for line in lines
+            if line.strip()
+        ]
+    except EvidenceError:
+        raise
+    except (OSError, UnicodeError, ValueError) as error:
         raise EvidenceError("command_log is not valid JSONL") from error
 
 
@@ -1531,7 +1587,7 @@ def _validate_execution_receipts(
     if not isinstance(commands, list) or not commands:
         raise EvidenceError("observations.commands must be a nonempty receipt array")
     if _read_command_log(command_log_path) != commands:
-        raise EvidenceError("command_log does not match the signed execution receipts")
+        raise EvidenceError("command_log does not match the bound execution receipts")
     scopes = set(request["gate_scopes"])
     valid_outcome = request["expected_outcome"]["kind"] == "valid"
     if valid_outcome:
@@ -1558,6 +1614,7 @@ def _validate_execution_receipts(
         "mapper_invocations",
         "started_monotonic_seconds",
         "ended_monotonic_seconds",
+        "process_cpu_microseconds",
         "exit_code",
         "checkout_commit",
         "toolchain_identity",
@@ -1593,6 +1650,24 @@ def _validate_execution_receipts(
         ):
             raise EvidenceError("execution receipt timestamps are invalid or overlap")
         previous_end = float(ended)
+        process_cpu = _mapping(
+            receipt["process_cpu_microseconds"],
+            f"commands[{index}].process_cpu_microseconds",
+        )
+        try:
+            _exact_keys(
+                process_cpu,
+                {"user", "system"},
+                f"commands[{index}].process_cpu_microseconds",
+            )
+        except EvidenceError as error:
+            raise EvidenceError("execution receipt process CPU fields are invalid") from error
+        if any(
+            type(process_cpu[field]) is not int
+            or not 0 <= process_cpu[field] < 1 << 64
+            for field in ("user", "system")
+        ):
+            raise EvidenceError("execution receipt process CPU time is outside UInt64")
         if expected["duration"] is not None and not math.isclose(
             float(ended) - float(started),
             expected["duration"],
@@ -1656,11 +1731,368 @@ def _validate_execution_receipts(
     return expected_runs
 
 
+def _host_state_snapshot(value: Any, label: str) -> dict[str, Any]:
+    snapshot = _mapping(value, label)
+    _exact_keys(
+        snapshot,
+        {
+            "cpu_ticks",
+            "vm_pageouts",
+            "vm_swapouts",
+            "thermal_state",
+            "low_power_mode",
+            "power_source",
+        },
+        label,
+    )
+    ticks = _mapping(snapshot["cpu_ticks"], f"{label}.cpu_ticks")
+    _exact_keys(ticks, {"user", "system", "idle", "nice"}, f"{label}.cpu_ticks")
+    for field, value in ticks.items():
+        if type(value) is not int or not 0 <= value <= 0xFFFFFFFF:
+            raise EvidenceError(f"{label}.cpu_ticks.{field} is outside UInt32")
+    for field in ("vm_pageouts", "vm_swapouts"):
+        value = snapshot[field]
+        if type(value) is not int or not 0 <= value < 1 << 64:
+            raise EvidenceError(f"{label}.{field} is outside UInt64")
+    if snapshot["thermal_state"] not in {"nominal", "fair", "serious", "critical"}:
+        raise EvidenceError(f"{label}.thermal_state is invalid")
+    if type(snapshot["low_power_mode"]) is not bool:
+        raise EvidenceError(f"{label}.low_power_mode must be boolean")
+    if snapshot["power_source"] not in {"ac_power", "battery_power", "ups_power"}:
+        raise EvidenceError(f"{label}.power_source is invalid")
+    return dict(snapshot)
+
+
+def _wrapped_cpu_tick_delta(start: int, end: int) -> int:
+    return end - start if end >= start else (1 << 32) - start + end
+
+
+def measurement_environment_rejections(
+    value: Any,
+    machine: Mapping[str, Any],
+    commands: list[dict[str, Any]],
+    supervisor_started: float,
+    supervisor_ended: float,
+    supervisor_path: Path,
+    expected_monitor_executable_sha256: str,
+) -> tuple[str, ...]:
+    environment = _mapping(value, "supervisor_run.measurement_environment")
+    _exact_keys(
+        environment,
+        {
+            "schema_version",
+            "monotonic_clock",
+            "monitor_sha256",
+            "monitor_executable_sha256",
+            "sample_interval_seconds",
+            "sample_count",
+            "maximum_sample_gap_seconds",
+            "first_monotonic_seconds",
+            "last_monotonic_seconds",
+            "state_change_events",
+            "power_sources",
+            "thermal_states",
+            "low_power_mode_observed",
+            "vm_pageouts_delta",
+            "vm_swapouts_delta",
+            "outer_child_cpu_microseconds",
+            "supervisor_host_busy_fraction",
+            "supervisor_process_cpu_fraction",
+            "supervisor_external_cpu_fraction",
+            "unattributed_child_cpu_fraction",
+            "commands",
+        },
+        "supervisor_run.measurement_environment",
+    )
+    if environment["schema_version"] != 1:
+        raise EvidenceError("measurement environment schema is invalid")
+    if environment["monotonic_clock"] != "mach_absolute_time":
+        raise EvidenceError("measurement environment monotonic clock is invalid")
+    _digest(environment["monitor_sha256"], "measurement environment monitor sha256")
+    _digest(
+        environment["monitor_executable_sha256"],
+        "measurement environment monitor executable sha256",
+    )
+    if environment["monitor_executable_sha256"] != expected_monitor_executable_sha256:
+        raise EvidenceError("measurement environment monitor executable is not approved")
+    monitor_path = supervisor_path.parent / "host-monitor.json"
+    try:
+        metadata = monitor_path.lstat()
+    except OSError as error:
+        raise EvidenceError("host monitor artifact is missing") from error
+    if (
+        not stat.S_ISREG(metadata.st_mode)
+        or monitor_path.is_symlink()
+        or metadata.st_nlink != 1
+        or metadata.st_size <= 0
+        or metadata.st_size > MAX_HOST_MONITOR_BYTES
+    ):
+        raise EvidenceError("host monitor artifact is unsafe or too large")
+    if sha256_file(monitor_path) != environment["monitor_sha256"]:
+        raise EvidenceError("host monitor artifact digest is invalid")
+
+    interval = _positive_number(
+        environment["sample_interval_seconds"],
+        "measurement environment sample interval",
+    )
+    if interval > 1.0:
+        raise EvidenceError("measurement environment sample interval exceeds one second")
+    sample_count = environment["sample_count"]
+    if type(sample_count) is not int or not 2 <= sample_count <= 100_000:
+        raise EvidenceError("measurement environment sample count is invalid")
+    maximum_gap = _positive_number(
+        environment["maximum_sample_gap_seconds"],
+        "measurement environment maximum sample gap",
+    )
+    if maximum_gap > max(2.5 * interval, 0.125) + 1e-9:
+        raise EvidenceError("measurement environment sample gap is too large")
+    first = _nonnegative_number(
+        environment["first_monotonic_seconds"],
+        "measurement environment first timestamp",
+    )
+    last = _positive_number(
+        environment["last_monotonic_seconds"],
+        "measurement environment last timestamp",
+    )
+    if (
+        last <= first
+        or first > supervisor_started + 0.05
+        or last < supervisor_ended - 0.05
+        or supervisor_started - first > maximum_gap + 0.05
+        or last - supervisor_ended > maximum_gap + 0.05
+    ):
+        raise EvidenceError("measurement environment does not bracket the supervisor window")
+
+    state_change_events = environment["state_change_events"]
+    if not isinstance(state_change_events, list) or len(state_change_events) > sample_count:
+        raise EvidenceError("measurement environment state-change events are invalid")
+    previous_event_key: tuple[float, str] | None = None
+    for index, raw_event in enumerate(state_change_events):
+        event = _mapping(
+            raw_event,
+            f"measurement environment state_change_events[{index}]",
+        )
+        _exact_keys(
+            event,
+            {"monotonic_seconds", "kind"},
+            f"measurement environment state_change_events[{index}]",
+        )
+        timestamp = _nonnegative_number(
+            event["monotonic_seconds"],
+            f"measurement environment state_change_events[{index}].monotonic_seconds",
+        )
+        kind = event["kind"]
+        if (
+            not isinstance(kind, str)
+            or kind not in {"thermal_state", "low_power_mode", "power_source"}
+            or timestamp < supervisor_started
+            or timestamp > supervisor_ended
+        ):
+            raise EvidenceError("measurement environment state-change event is invalid")
+        event_key = (timestamp, kind)
+        if previous_event_key is not None and event_key < previous_event_key:
+            raise EvidenceError("measurement environment state-change events are not canonical")
+        previous_event_key = event_key
+    if state_change_events:
+        rejections = ["host_state_change"]
+    else:
+        rejections = []
+
+    def string_set(field: str, allowed: set[str]) -> list[str]:
+        raw = environment[field]
+        if (
+            not isinstance(raw, list)
+            or not raw
+            or raw != sorted(set(raw))
+            or any(not isinstance(item, str) or item not in allowed for item in raw)
+        ):
+            raise EvidenceError(f"measurement environment {field} is invalid")
+        return raw
+
+    power_sources = string_set(
+        "power_sources",
+        {"ac_power", "battery_power", "ups_power"},
+    )
+    thermal_states = string_set(
+        "thermal_states",
+        {"nominal", "fair", "serious", "critical"},
+    )
+    if power_sources != ["ac_power"]:
+        rejections.append("ac_power")
+    if any(state in {"serious", "critical"} for state in thermal_states):
+        rejections.append("thermal_state")
+    if type(environment["low_power_mode_observed"]) is not bool:
+        raise EvidenceError("measurement environment Low Power Mode state is invalid")
+    if environment["low_power_mode_observed"]:
+        rejections.append("low_power_mode")
+    for field in ("vm_pageouts_delta", "vm_swapouts_delta"):
+        if type(environment[field]) is not int or not 0 <= environment[field] < 1 << 64:
+            raise EvidenceError(f"measurement environment {field} is outside UInt64")
+        if environment[field] != 0:
+            rejections.append(field.removesuffix("_delta"))
+
+    child_cpu = _mapping(
+        environment["outer_child_cpu_microseconds"],
+        "supervisor_run.measurement_environment.outer_child_cpu_microseconds",
+    )
+    _exact_keys(
+        child_cpu,
+        {"user", "system"},
+        "supervisor_run.measurement_environment.outer_child_cpu_microseconds",
+    )
+    if any(
+        type(child_cpu[field]) is not int or not 0 <= child_cpu[field] < 1 << 64
+        for field in ("user", "system")
+    ):
+        raise EvidenceError("measurement outer child CPU is outside UInt64")
+    logical_cpus = machine.get("logical_cpus")
+    if type(logical_cpus) is not int or logical_cpus <= 0:
+        raise EvidenceError("measurement logical CPU count is unavailable")
+    command_environment = environment["commands"]
+    if not isinstance(command_environment, list) or len(command_environment) != len(commands):
+        raise EvidenceError("measurement environment command closure is incomplete")
+    process_cpu_total = 0
+    for index, (raw, command) in enumerate(zip(command_environment, commands, strict=True)):
+        item = _mapping(raw, f"measurement environment commands[{index}]")
+        _exact_keys(
+            item,
+            {"run_id", "host_busy_fraction", "process_cpu_fraction", "external_cpu_fraction"},
+            f"measurement environment commands[{index}]",
+        )
+        if item["run_id"] != command["run_id"]:
+            raise EvidenceError("measurement environment command order is invalid")
+        duration = float(command["ended_monotonic_seconds"]) - float(
+            command["started_monotonic_seconds"]
+        )
+        process_cpu = command["process_cpu_microseconds"]
+        process_microseconds = process_cpu["user"] + process_cpu["system"]
+        process_cpu_total += process_microseconds
+        expected_process_fraction = process_microseconds / (
+            duration * logical_cpus * 1_000_000
+        )
+        host_busy = _nonnegative_number(
+            item["host_busy_fraction"],
+            f"measurement environment commands[{index}].host_busy_fraction",
+        )
+        process_fraction = _nonnegative_number(
+            item["process_cpu_fraction"],
+            f"measurement environment commands[{index}].process_cpu_fraction",
+        )
+        external_fraction = _nonnegative_number(
+            item["external_cpu_fraction"],
+            f"measurement environment commands[{index}].external_cpu_fraction",
+        )
+        if host_busy > 1 + 1e-12 or process_fraction > 1.05 + 1e-12:
+            raise EvidenceError("measurement environment CPU fraction is outside its domain")
+        if not math.isclose(process_fraction, expected_process_fraction, rel_tol=0, abs_tol=1e-9):
+            raise EvidenceError("measurement environment process CPU fraction is inconsistent")
+        if not math.isclose(
+            external_fraction,
+            max(0.0, host_busy - process_fraction),
+            rel_tol=0,
+            abs_tol=1e-9,
+        ):
+            raise EvidenceError("measurement environment external CPU fraction is inconsistent")
+        if external_fraction > MAX_EXTERNAL_CPU_FRACTION + 1e-12:
+            rejections.append("external_cpu")
+    outer_cpu_total = child_cpu["user"] + child_cpu["system"]
+    if process_cpu_total > outer_cpu_total + max(100_000, math.ceil(outer_cpu_total * 0.01)):
+        raise EvidenceError("measurement command CPU exceeds outer child CPU")
+    supervisor_duration = supervisor_ended - supervisor_started
+    supervisor_host_busy = _nonnegative_number(
+        environment["supervisor_host_busy_fraction"],
+        "measurement environment supervisor host busy fraction",
+    )
+    supervisor_process_fraction = _nonnegative_number(
+        environment["supervisor_process_cpu_fraction"],
+        "measurement environment supervisor process CPU fraction",
+    )
+    supervisor_external_fraction = _nonnegative_number(
+        environment["supervisor_external_cpu_fraction"],
+        "measurement environment supervisor external CPU fraction",
+    )
+    unattributed_child_fraction = _nonnegative_number(
+        environment["unattributed_child_cpu_fraction"],
+        "measurement environment unattributed child CPU fraction",
+    )
+    expected_process_fraction = outer_cpu_total / (
+        supervisor_duration * logical_cpus * 1_000_000
+    )
+    expected_unattributed_fraction = max(0, outer_cpu_total - process_cpu_total) / (
+        supervisor_duration * logical_cpus * 1_000_000
+    )
+    if (
+        supervisor_host_busy > 1 + 1e-12
+        or supervisor_process_fraction > 1.05 + 1e-12
+        or not math.isclose(
+            supervisor_process_fraction,
+            expected_process_fraction,
+            rel_tol=0,
+            abs_tol=1e-9,
+        )
+        or not math.isclose(
+            supervisor_external_fraction,
+            max(0.0, supervisor_host_busy - supervisor_process_fraction),
+            rel_tol=0,
+            abs_tol=1e-9,
+        )
+        or not math.isclose(
+            unattributed_child_fraction,
+            expected_unattributed_fraction,
+            rel_tol=0,
+            abs_tol=1e-9,
+        )
+    ):
+        raise EvidenceError("measurement environment supervisor CPU accounting is inconsistent")
+    if supervisor_external_fraction > MAX_EXTERNAL_CPU_FRACTION + 1e-12:
+        rejections.append("supervisor_external_cpu")
+    if unattributed_child_fraction > MAX_UNATTRIBUTED_CHILD_CPU_FRACTION + 1e-12:
+        rejections.append("unattributed_child_cpu")
+    return tuple(dict.fromkeys(rejections))
+
+
+def _validate_measurement_environment(
+    value: Any,
+    machine: Mapping[str, Any],
+    commands: list[dict[str, Any]],
+    supervisor_started: float,
+    supervisor_ended: float,
+    supervisor_path: Path,
+    expected_monitor_executable_sha256: str,
+) -> None:
+    rejections = measurement_environment_rejections(
+        value,
+        machine,
+        commands,
+        supervisor_started,
+        supervisor_ended,
+        supervisor_path,
+        expected_monitor_executable_sha256,
+    )
+    if not rejections:
+        return
+    messages = {
+        "ac_power": "release timing evidence requires uninterrupted AC power",
+        "thermal_state": "release timing evidence has a serious thermal state",
+        "low_power_mode": "release timing evidence cannot use Low Power Mode",
+        "vm_pageouts": "measurement environment recorded vm_pageouts",
+        "vm_swapouts": "measurement environment recorded vm_swapouts",
+        "external_cpu": "measurement external CPU utilization exceeds 0.10",
+        "supervisor_external_cpu": "measurement-wide external CPU utilization exceeds 0.10",
+        "unattributed_child_cpu": "measurement runner CPU is not covered by execution receipts",
+        "host_state_change": "measurement host state changed during the protected run",
+    }
+    raise EvidenceError(messages[rejections[0]])
+
+
 def _validate_supervisor_run(
     path: Path,
     request: Mapping[str, Any],
     runner_identity: Mapping[str, Any],
     commands: list[dict[str, Any]],
+    machine: Mapping[str, Any],
+    *,
+    enforce_environment_policy: bool = True,
 ) -> None:
     receipt = _mapping(_load_bounded_json(path, "supervisor_run"), "supervisor_run")
     fields = {
@@ -1678,11 +2110,12 @@ def _validate_supervisor_run(
         "started_monotonic_seconds",
         "ended_monotonic_seconds",
         "exit_code",
+        "measurement_environment",
     }
     _exact_keys(receipt, fields, "supervisor_run")
     binding = request["binding"]
     expected_bindings = {
-        "schema_version": 1,
+        "schema_version": 3,
         "scene_id": binding["scene_id"],
         "scale": binding["scale"],
         "lane": binding["lane"],
@@ -1751,8 +2184,28 @@ def _validate_supervisor_run(
             merged_start, merged_end = interval_start, interval_end
     covered_seconds += merged_end - merged_start
     supervisor_span = supervisor_end - supervisor_start
+    if enforce_environment_policy:
+        _validate_measurement_environment(
+            receipt["measurement_environment"],
+            machine,
+            commands,
+            supervisor_start,
+            supervisor_end,
+            path,
+            request["rendering_driver_identity"]["executable_sha256"],
+        )
+    else:
+        measurement_environment_rejections(
+            receipt["measurement_environment"],
+            machine,
+            commands,
+            supervisor_start,
+            supervisor_end,
+            path,
+            request["rendering_driver_identity"]["executable_sha256"],
+        )
     unattributed_seconds = supervisor_span - covered_seconds
-    if unattributed_seconds > max(60.0, supervisor_span * 0.1):
+    if unattributed_seconds > max(2.0, supervisor_span * 0.1):
         raise EvidenceError("execution receipts leave too much supervisor time unattributed")
 
 
@@ -2287,7 +2740,7 @@ def _validate_resolved_compute(
     if dict(reasons) != expected_reasons:
         raise EvidenceError("CPU-only stage reasons do not match the supported backend closure")
     if candidate_configuration.get("compute_policy") != "metal_for_supported_stages":
-        raise EvidenceError("resolved compute does not match the signed compute policy")
+        raise EvidenceError("resolved compute does not match the bound compute policy")
     return {"stages": dict(stages), "cpu_only_reasons": dict(reasons)}
 
 
@@ -3254,13 +3707,16 @@ def validate_machine_lane(machine: Mapping[str, Any], lane: str) -> None:
         raise EvidenceError("machine macOS version is unavailable")
     if int(version.split(".", 1)[0]) < 15:
         raise EvidenceError("release evidence requires macOS 15 or newer")
+    xcode_version = machine["xcode_version"]
+    if not isinstance(xcode_version, str) or xcode_version.splitlines()[:1] != ["Xcode 16.4"]:
+        raise EvidenceError("release evidence requires Xcode 16.4")
     memory = machine["physical_memory_bytes"]
     if type(memory) is not int:
         raise EvidenceError("machine physical memory is unavailable")
     gib = 1024**3
     if lane == LANE_REFERENCE:
-        if "M4 Max" not in str(machine["chip"]) or not 40 * gib <= memory <= 64 * gib:
-            raise EvidenceError("reference lane requires an M4 Max with 40-64 GiB memory")
+        if "M4 Max" not in str(machine["chip"]) or memory != 48 * gib:
+            raise EvidenceError("reference lane requires an M4 Max with exactly 48 GiB memory")
     elif lane == LANE_CONSTRAINED:
         if not 14 * gib <= memory <= 17 * gib:
             raise EvidenceError("constrained lane requires a 14-16 GiB Mac")
@@ -3315,6 +3771,7 @@ def validate_request(request: Any) -> Mapping[str, Any]:
             "baseline_git_commit",
             "baseline_toolchain_identity",
             "baseline_configuration_digest",
+            "benchmark_contract_sha256",
         },
         "request.binding",
     )
@@ -3328,6 +3785,7 @@ def validate_request(request: Any) -> Mapping[str, Any]:
         "toolchain_identity",
         "baseline_toolchain_identity",
         "baseline_configuration_digest",
+        "benchmark_contract_sha256",
     ):
         _digest(binding[field], f"request.binding.{field}")
     baseline_configuration = _mapping(
@@ -3496,16 +3954,262 @@ def validate_request(request: Any) -> Mapping[str, Any]:
     return value
 
 
-def load_key(path: Path) -> bytes:
-    if path.is_symlink() or not path.is_file():
-        raise EvidenceError("evidence key must be a regular file")
-    metadata = path.stat()
-    if metadata.st_uid != os.getuid() or metadata.st_mode & (stat.S_IRWXG | stat.S_IRWXO):
-        raise EvidenceError("evidence key must be owned by the current user and mode 0600 or stricter")
-    key = path.read_bytes().rstrip(b"\r\n")
-    if not 32 <= len(key) <= 4096:
-        raise EvidenceError("evidence key must contain 32-4096 bytes")
-    return key
+def _validate_lane_outcome_payload(value: Any) -> dict[str, Any]:
+    outcome = _mapping(value, "lane outcome")
+    _exact_keys(outcome, {"kind", "stage", "reason", "exit_code"}, "lane outcome")
+    kind = outcome["kind"]
+    stage = outcome["stage"]
+    reason = outcome["reason"]
+    exit_code = outcome["exit_code"]
+    if kind == "execution_failed":
+        if stage != "measurement_runner":
+            raise EvidenceError("execution lane outcome stage is invalid")
+        if reason == "launch_failed":
+            if exit_code is not None:
+                raise EvidenceError("launch failure cannot report an exit code")
+        elif reason == "timed_out":
+            if type(exit_code) is not int or not -255 <= exit_code <= 255:
+                raise EvidenceError("timeout outcome requires a bounded exit code")
+        elif reason == "nonzero_exit":
+            if type(exit_code) is not int or exit_code == 0 or not -255 <= exit_code <= 255:
+                raise EvidenceError("nonzero outcome requires a bounded nonzero exit code")
+        elif reason == "invalid_output":
+            if exit_code != 0:
+                raise EvidenceError("invalid output outcome requires exit code zero")
+        elif reason in {"process_isolation_failed", "integrity_failed"}:
+            if exit_code is not None:
+                raise EvidenceError(f"{reason} cannot report an exit code")
+        else:
+            raise EvidenceError("execution lane outcome reason is invalid")
+    elif kind == "environment_rejected":
+        if (
+            stage != "measurement_environment"
+            or reason != "policy_violation"
+            or exit_code != 0
+        ):
+            raise EvidenceError("environment lane outcome is invalid")
+    elif kind == "infrastructure_blocked":
+        if (
+            reason not in {"host_monitor_failed", "postprocessing_failed"}
+            or stage
+            != {
+                "host_monitor_failed": "host_monitor",
+                "postprocessing_failed": "postprocessing",
+            }.get(reason)
+            or (
+                reason == "host_monitor_failed"
+                and exit_code not in {None, 0}
+            )
+            or (
+                reason == "postprocessing_failed"
+                and exit_code != 0
+            )
+        ):
+            raise EvidenceError("infrastructure lane outcome is invalid")
+    else:
+        raise EvidenceError("lane outcome kind is invalid")
+    return dict(outcome)
+
+
+def _validate_environment_rejection_receipt(
+    environment_path: Path,
+    descriptor: Mapping[str, Any],
+    request: Mapping[str, Any],
+    machine: Mapping[str, Any],
+) -> None:
+    _exact_keys(
+        descriptor,
+        {"path", "sha256", "bytes"},
+        "lane outcome environment receipt",
+    )
+    if descriptor["path"] != "measurement-environment.json":
+        raise EvidenceError("lane outcome environment receipt path is invalid")
+    artifact = _artifact_descriptor(environment_path, environment_path.parent)
+    if artifact != descriptor:
+        raise EvidenceError("lane outcome environment receipt descriptor is invalid")
+    environment = _mapping(
+        _load_bounded_json(environment_path, "measurement environment receipt"),
+        "measurement environment receipt",
+    )
+    _exact_keys(
+        environment,
+        {
+            "schema_version",
+            "started_monotonic_seconds",
+            "ended_monotonic_seconds",
+            "commands",
+            "measurement_environment",
+        },
+        "measurement environment receipt",
+    )
+    if environment["schema_version"] != 1:
+        raise EvidenceError("measurement environment receipt schema is invalid")
+    commands = environment["commands"]
+    if not isinstance(commands, list) or any(
+        not isinstance(item, Mapping) for item in commands
+    ):
+        raise EvidenceError("measurement environment receipt commands are invalid")
+    rejections = measurement_environment_rejections(
+        environment["measurement_environment"],
+        machine,
+        commands,
+        environment["started_monotonic_seconds"],
+        environment["ended_monotonic_seconds"],
+        environment_path,
+        request["rendering_driver_identity"]["executable_sha256"],
+    )
+    if not rejections:
+        raise EvidenceError("environment lane outcome does not prove a policy rejection")
+
+
+def derive_lane_outcome(
+    request: Mapping[str, Any],
+    lane: str,
+    runner_identity: Mapping[str, Any],
+    machine: Mapping[str, Any],
+    *,
+    kind: str,
+    reason: str,
+    exit_code: int | None,
+    environment_receipt_path: Path | None = None,
+) -> dict[str, Any]:
+    """Validate raw lane status evidence and return an unsigned receipt payload."""
+    validated_request = validate_request(request)
+    if lane not in RELEASE_LANES or lane != validated_request["binding"]["lane"]:
+        raise EvidenceError("lane outcome does not match its request")
+    runner = validate_runner_identity(runner_identity, lane)
+    validate_machine_lane(machine, lane)
+    stage = {
+        "environment_rejected": "measurement_environment",
+        "infrastructure_blocked": {
+            "host_monitor_failed": "host_monitor",
+            "postprocessing_failed": "postprocessing",
+        }.get(reason),
+    }.get(kind, "measurement_runner")
+    outcome = _validate_lane_outcome_payload(
+        {
+            "kind": kind,
+            "stage": stage,
+            "reason": reason,
+            "exit_code": exit_code,
+        }
+    )
+    if kind == "environment_rejected":
+        if environment_receipt_path is None:
+            raise EvidenceError("environment rejection requires an environment receipt")
+        descriptor = _artifact_descriptor(
+            environment_receipt_path,
+            environment_receipt_path.parent,
+        )
+        if descriptor["path"] != "measurement-environment.json":
+            raise EvidenceError("environment receipt path is not canonical")
+        environment_receipt: dict[str, Any] | None = descriptor
+        _validate_environment_rejection_receipt(
+            environment_receipt_path,
+            environment_receipt,
+            validated_request,
+            machine,
+        )
+    else:
+        if environment_receipt_path is not None:
+            raise EvidenceError("lane outcome cannot carry an environment receipt")
+        environment_receipt = None
+    producer_path = Path(__file__).resolve()
+    unsigned = {
+        "schema_version": 1,
+        "request_sha256": sha256_bytes(canonical_json_bytes(validated_request)),
+        "lane": lane,
+        "machine": dict(machine),
+        "producer": {
+            "protocol_version": PROTOCOL_VERSION,
+            "version": PRODUCER_VERSION,
+            "executable": PRODUCER_RELATIVE_PATH,
+            "sha256": sha256_file(producer_path),
+        },
+        "measurement_runner": runner,
+        "outcome": outcome,
+        "environment_receipt": environment_receipt,
+    }
+    return unsigned
+
+
+def validate_prepared_lane_outcome_file(
+    path: Path,
+    expected_request: Mapping[str, Any],
+    expected_lane: str,
+    expected_measurement_runner: Mapping[str, Any],
+) -> Mapping[str, Any]:
+    try:
+        metadata = path.lstat()
+    except OSError as error:
+        raise EvidenceError("lane outcome is missing") from error
+    if (
+        not stat.S_ISREG(metadata.st_mode)
+        or path.is_symlink()
+        or metadata.st_nlink != 1
+        or metadata.st_size <= 0
+        or metadata.st_size > MAX_LANE_OUTCOME_BYTES
+    ):
+        raise EvidenceError("lane outcome must be a bounded single-link regular file")
+    receipt = _mapping(_load_bounded_json(path, "lane outcome"), "lane outcome")
+    _exact_keys(
+        receipt,
+        {
+            "schema_version",
+            "request_sha256",
+            "lane",
+            "machine",
+            "producer",
+            "measurement_runner",
+            "outcome",
+            "environment_receipt",
+        },
+        "lane outcome",
+    )
+    request = validate_request(expected_request)
+    if (
+        receipt["schema_version"] != 1
+        or receipt["lane"] != expected_lane
+        or expected_lane != request["binding"]["lane"]
+        or receipt["request_sha256"] != sha256_bytes(canonical_json_bytes(request))
+    ):
+        raise EvidenceError("lane outcome request binding is invalid")
+    producer = _mapping(receipt["producer"], "lane outcome producer")
+    _exact_keys(
+        producer,
+        {"protocol_version", "version", "executable", "sha256"},
+        "lane outcome producer",
+    )
+    if producer != {
+        "protocol_version": PROTOCOL_VERSION,
+        "version": PRODUCER_VERSION,
+        "executable": PRODUCER_RELATIVE_PATH,
+        "sha256": sha256_file(Path(__file__).resolve()),
+    }:
+        raise EvidenceError("lane outcome producer is invalid")
+    if validate_runner_identity(receipt["measurement_runner"], expected_lane) != (
+        validate_runner_identity(expected_measurement_runner, expected_lane)
+    ):
+        raise EvidenceError("lane outcome measurement runner is invalid")
+    machine = _mapping(receipt["machine"], "lane outcome machine")
+    validate_machine_lane(machine, expected_lane)
+    outcome = _validate_lane_outcome_payload(receipt["outcome"])
+    environment_descriptor = receipt["environment_receipt"]
+    if outcome["kind"] in {"execution_failed", "infrastructure_blocked"}:
+        if environment_descriptor is not None:
+            raise EvidenceError(
+                f"{outcome['kind']} lane outcome cannot carry environment evidence"
+            )
+        return receipt
+
+    descriptor = _mapping(environment_descriptor, "lane outcome environment receipt")
+    _validate_environment_rejection_receipt(
+        path.parent / "measurement-environment.json",
+        descriptor,
+        request,
+        machine,
+    )
+    return receipt
 
 
 def _artifact_descriptor(path: Path, root: Path) -> dict[str, Any]:
@@ -3655,7 +4359,7 @@ def _load_render_image(
                     break
                 total += len(chunk)
                 if total > maximum_bytes:
-                    raise EvidenceError(f"{label} is larger than its signed dimensions allow")
+                    raise EvidenceError(f"{label} is larger than its bound dimensions allow")
                 chunks.append(chunk)
             after = os.fstat(descriptor)
         except EvidenceError:
@@ -3685,7 +4389,7 @@ def _load_render_image(
                 if image.format != "PNG" or image.mode != "RGB":
                     raise EvidenceError(f"{label} must be an 8-bit RGB PNG")
                 if image.size != (expected_width, expected_height):
-                    raise EvidenceError(f"{label} dimensions do not match its signed camera")
+                    raise EvidenceError(f"{label} dimensions do not match its bound camera")
                 image.load()
                 pixels = numpy.asarray(image, dtype=numpy.float32) / 255.0
     except EvidenceError:
@@ -3952,7 +4656,7 @@ def validate_and_score_rendering(
         != request["rendering_driver_identity"]["sha256"]
         or manifest["renderer_executable_sha256"] != renderer_executable_sha256
     ):
-        raise EvidenceError("rendering manifest does not match its signed request")
+        raise EvidenceError("rendering manifest does not match its bound request")
     _digest(renderer_executable_sha256, "approved renderer executable digest")
     scale = binding.get("scale")
     if type(scale) is not int or not isinstance(holdouts, list):
@@ -3976,7 +4680,7 @@ def validate_and_score_rendering(
         or len(views) != len(holdouts)
         or len(reference_views) != len(holdouts)
     ):
-        raise EvidenceError("rendering views must cover every signed holdout")
+        raise EvidenceError("rendering views must cover every bound holdout")
 
     source_specs = {
         "accurate_reference": ("fast_profile", "accurate_reference"),
@@ -4068,7 +4772,7 @@ def validate_and_score_rendering(
             f"accurate rendering reference.views[{position}]",
         )
         if view["holdout_index"] != holdout_index or reference_view["holdout_index"] != holdout_index:
-            raise EvidenceError("rendering views must be ordered by signed holdout index")
+            raise EvidenceError("rendering views must be ordered by bound holdout index")
         camera = _render_camera(view["camera"], f"rendering manifest.views[{position}].camera")
         reference_camera = _render_camera(
             reference_view["camera"],
@@ -4260,7 +4964,7 @@ def select_render_source_receipts(
             if source not in matching:
                 raise EvidenceError("candidate_balanced must bind the sole published output receipt")
         else:
-            # Execution receipts are already validated against their signed timing
+            # Execution receipts are already validated against their bound timing
             # order. The final receipt is therefore deterministic and independent
             # of any rendered image or quality score.
             source = matching[-1]
@@ -4498,7 +5202,7 @@ def _validate_training_manifest(
         or "sha256:" + digest != output_descriptor["sha256"]
     ):
         raise EvidenceError("training manifest output digest does not match output_ply")
-    signed_integer_fields = (
+    bound_integer_fields = (
         "iterationLimit",
         "plateauWindow",
         "completedIteration",
@@ -4512,7 +5216,7 @@ def _validate_training_manifest(
         "rasterPeakExactIntersectionCapacity",
         "droppedIntersectionCount",
     )
-    for name in signed_integer_fields:
+    for name in bound_integer_fields:
         if (
             type(manifest[name]) is not int
             or manifest[name] < 0
@@ -4646,12 +5350,18 @@ def _validate_training_manifest(
             )
 
 
-def _load_bounded_json(path: Path, label: str, maximum_bytes: int = 256 * 1024 * 1024) -> Any:
-    if path.stat().st_size > maximum_bytes:
-        raise EvidenceError(f"{label} exceeds its size limit")
+def _load_bounded_json(
+    path: Path,
+    label: str,
+    maximum_bytes: int = MAX_OBSERVATIONS_BYTES,
+) -> Any:
     try:
-        return json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as error:
+        if path.stat().st_size > maximum_bytes:
+            raise EvidenceError(f"{label} exceeds its size limit")
+        return _decode_json_text(path.read_text(encoding="utf-8"), label)
+    except EvidenceError:
+        raise
+    except (OSError, UnicodeError, ValueError) as error:
         raise EvidenceError(f"{label} is not valid JSON") from error
 
 
@@ -4784,7 +5494,7 @@ def _validate_pair_list(
         "pair_list",
     )
     if pair_list["schema_version"] != 2 or pair_list["selected_frame_count"] != requested_scale:
-        raise EvidenceError("pair_list does not match the signed selected frame count")
+        raise EvidenceError("pair_list does not match the bound selected frame count")
     raw_pairs = pair_list["pairs"]
     if not isinstance(raw_pairs, list) or not raw_pairs:
         raise EvidenceError("pair_list must contain scheduled pairs")
@@ -5167,16 +5877,18 @@ def _validate_pair_list(
             raise EvidenceError(f"pair_list {name} does not match pipeline metrics")
 
 
-def produce_attestation(
+def derive_attestation(
     request: Mapping[str, Any],
     observations: Mapping[str, Any],
     artifact_root: Path,
     output_path: Path,
-    key: bytes,
     lane: str,
     measurement_runner: Mapping[str, Any],
     machine: Mapping[str, Any] | None = None,
+    *,
+    enforce_environment_policy: bool = True,
 ) -> dict[str, Any]:
+    """Validate raw benchmark artifacts and derive an unsigned attestation."""
     request = validate_request(request)
     if request["binding"]["lane"] != lane:
         raise EvidenceError("request hardware lane does not match the attested lane")
@@ -5224,7 +5936,7 @@ def produce_attestation(
         "configuration_digest": request["binding"]["baseline_configuration_digest"],
     }
     if baseline != expected_baseline:
-        raise EvidenceError("observations.baseline does not match the signed request")
+        raise EvidenceError("observations.baseline does not match the bound request")
 
     raw_artifacts = _mapping(observations.get("artifacts"), "observations.artifacts")
     orientation_required = (
@@ -5244,6 +5956,7 @@ def produce_attestation(
     canonical_artifacts = {
         "command_log": "command.jsonl",
         "supervisor_run": "supervisor-run.json",
+        "host_monitor": "host-monitor.json",
         "toolchain_scenarios": "toolchain-scenarios.jsonl",
         "normal_photo_toolchain": "normal-photo.zip",
         "normal_photo_toolchain_state": "normal-photo-toolchain-state.json",
@@ -5290,7 +6003,14 @@ def produce_attestation(
     stored_observations = _load_bounded_json(observation_path, "observations.json")
     if stored_observations != observations:
         raise EvidenceError("in-memory observations do not match observations.json")
-    required = {"command_log", "supervisor_run", "stdout_log", "stderr_log", "observations"}
+    required = {
+        "command_log",
+        "supervisor_run",
+        "host_monitor",
+        "stdout_log",
+        "stderr_log",
+        "observations",
+    }
     if request["expected_outcome"]["kind"] == "valid":
         required.update({"output_ply", "training_manifest"})
     if lane == LANE_REFERENCE and "toolchain" in scopes:
@@ -5341,7 +6061,7 @@ def produce_attestation(
             artifact_root / descriptors["toolchain_scenarios"]["path"]
         ) != observations.get("toolchain_scenarios"):
             raise EvidenceError(
-                "toolchain_scenarios log does not match the signed scenario receipts"
+                "toolchain_scenarios log does not match the bound scenario receipts"
             )
     rendering_evidence: RenderingEvidence | None = None
     if lane == LANE_REFERENCE and "scene_quality" in scopes:
@@ -5454,6 +6174,8 @@ def produce_attestation(
         request,
         runner_identity,
         commands,
+        machine,
+        enforce_environment_policy=enforce_environment_policy,
     )
     resolved_compute: dict[str, Any]
     if request["expected_outcome"]["kind"] == "valid":
@@ -5503,23 +6225,54 @@ def produce_attestation(
         "metrics": metrics,
         "artifacts": descriptors,
     }
-    signature = "hmac-sha256:" + hmac.new(key, canonical_json_bytes(unsigned), hashlib.sha256).hexdigest()
-    return {**unsigned, "signature": signature}
+    return unsigned
 
 
-def verify_attestation(
+def validate_attestation_candidate(
+    request: Mapping[str, Any],
+    observations: Mapping[str, Any],
+    artifact_root: Path,
+    output_path: Path,
+    lane: str,
+    measurement_runner: Mapping[str, Any],
+    machine: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Validate all runner output while deferring host-policy classification."""
+    return derive_attestation(
+        request,
+        observations,
+        artifact_root,
+        output_path,
+        lane,
+        measurement_runner,
+        machine,
+        enforce_environment_policy=False,
+    )
+
+
+def validate_prepared_attestation_file(
     attestation_path: Path,
     expected_request: Mapping[str, Any],
     expected_lane: str,
-    key: bytes,
     expected_measurement_runner: Mapping[str, Any],
 ) -> Mapping[str, Any]:
-    if attestation_path.is_symlink() or not attestation_path.is_file():
-        raise EvidenceError("attestation must be a regular file")
     try:
-        value = json.loads(attestation_path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as error:
-        raise EvidenceError("attestation is not valid JSON") from error
+        metadata = attestation_path.lstat()
+    except OSError as error:
+        raise EvidenceError("attestation is missing") from error
+    if (
+        not stat.S_ISREG(metadata.st_mode)
+        or attestation_path.is_symlink()
+        or metadata.st_nlink != 1
+        or metadata.st_size <= 0
+        or metadata.st_size > MAX_ATTESTATION_BYTES
+    ):
+        raise EvidenceError("attestation must be a bounded single-link regular file")
+    value = _load_bounded_json(
+        attestation_path,
+        "attestation",
+        maximum_bytes=MAX_ATTESTATION_BYTES,
+    )
     attestation = _mapping(value, "attestation")
     _exact_keys(
         attestation,
@@ -5547,7 +6300,6 @@ def verify_attestation(
             "actual",
             "metrics",
             "artifacts",
-            "signature",
         },
         "attestation",
     )
@@ -5597,14 +6349,6 @@ def verify_attestation(
     producer_path = Path(__file__).resolve()
     if producer["sha256"] != sha256_file(producer_path):
         raise EvidenceError("attestation producer digest does not match this checkout")
-    signature = attestation["signature"]
-    if not isinstance(signature, str) or not HMAC_PATTERN.fullmatch(signature):
-        raise EvidenceError("attestation signature is invalid")
-    unsigned = dict(attestation)
-    del unsigned["signature"]
-    expected_signature = hmac.new(key, canonical_json_bytes(unsigned), hashlib.sha256).hexdigest()
-    if not hmac.compare_digest(signature.removeprefix("hmac-sha256:"), expected_signature):
-        raise EvidenceError("attestation signature verification failed")
     expected_runner = validate_runner_identity(expected_measurement_runner, expected_lane)
     actual_runner = validate_runner_identity(attestation["measurement_runner"], expected_lane)
     if actual_runner != expected_runner:
@@ -5639,51 +6383,3 @@ def verify_attestation(
         if descriptor["sha256"] != sha256_file(path):
             raise EvidenceError(f"attestation artifact digest mismatch: {raw_path}")
     return attestation
-
-
-def _load_json(path: Path, label: str) -> Any:
-    try:
-        return json.loads(path.read_text(encoding="utf-8"), parse_constant=lambda value: (_ for _ in ()).throw(EvidenceError(f"{label} contains {value}")))
-    except FileNotFoundError as error:
-        raise EvidenceError(f"{label} is missing") from error
-    except (OSError, json.JSONDecodeError) as error:
-        raise EvidenceError(f"{label} is not valid JSON") from error
-
-
-def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("produce", nargs="?")
-    parser.add_argument("--request", type=Path, required=True)
-    parser.add_argument("--observations", type=Path, required=True)
-    parser.add_argument("--artifact-root", type=Path, required=True)
-    parser.add_argument("--output", type=Path, required=True)
-    parser.add_argument("--lane", choices=sorted(RELEASE_LANES), required=True)
-    parser.add_argument("--key-file", type=Path, required=True)
-    parser.add_argument("--runner-label", required=True)
-    parser.add_argument("--runner-sha256", required=True)
-    args = parser.parse_args(argv)
-    if args.produce != "produce":
-        parser.error("the only supported operation is 'produce'")
-    try:
-        request = _load_json(args.request, "request")
-        observations = _load_json(args.observations, "observations")
-        if args.observations.resolve() != (args.artifact_root / "observations.json").resolve():
-            raise EvidenceError("observations must be artifact-root/observations.json")
-        attestation = produce_attestation(
-            request,
-            observations,
-            args.artifact_root,
-            args.output,
-            load_key(args.key_file),
-            args.lane,
-            {"label": args.runner_label, "sha256": args.runner_sha256},
-        )
-        args.output.write_bytes(canonical_json_bytes(attestation) + b"\n")
-        return 0
-    except EvidenceError as error:
-        print(f"evidence error: {error}", file=sys.stderr)
-        return 64
-
-
-if __name__ == "__main__":
-    raise SystemExit(main())

@@ -497,7 +497,7 @@ class RenderEvidenceTests(unittest.TestCase):
             root = Path(directory)
             req, reference_path = write_render_closure(root)
 
-            with self.assertRaisesRegex(evidence.EvidenceError, "signed request"):
+            with self.assertRaisesRegex(evidence.EvidenceError, "bound request"):
                 self.score(
                     root,
                     req,

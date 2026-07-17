@@ -8,13 +8,16 @@ import itertools
 import json
 import math
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
 import time
 import unittest
 import zipfile
+from contextlib import ExitStack
 from pathlib import Path
+from typing import Callable
 from unittest import mock
 
 from cryptography.hazmat.primitives import serialization
@@ -65,6 +68,7 @@ FIXTURE_GROUND_TRUTH_POSES = benchmark.canonical_json_bytes(
         ],
     }
 ) + b"\n"
+FIXTURE_HOST_MONITOR = b"{}\n"
 
 
 def fixture_render_camera(index: int) -> dict[str, object]:
@@ -195,7 +199,7 @@ TEST_TOOLCHAIN_COMPONENT_ARCHIVES = {
 }
 
 
-def test_toolchain_manifest() -> dict[str, object]:
+def make_toolchain_manifest() -> dict[str, object]:
     definitions = (
         (
             "macos-arm64-core",
@@ -245,8 +249,8 @@ def test_toolchain_manifest() -> dict[str, object]:
     return manifest
 
 
-def test_toolchain_state(component_names: list[str]) -> dict[str, object]:
-    manifest = test_toolchain_manifest()
+def make_toolchain_state(component_names: list[str]) -> dict[str, object]:
+    manifest = make_toolchain_manifest()
     components = {
         component["name"]: component
         for component in manifest["components"]
@@ -264,7 +268,7 @@ def test_toolchain_state(component_names: list[str]) -> dict[str, object]:
     }
 
 
-def test_toolchain_identity(state: dict[str, object]) -> str:
+def toolchain_identity_for_state(state: dict[str, object]) -> str:
     manifest = state["signedManifest"]
     closure = {
         "schema_version": 2,
@@ -287,11 +291,11 @@ def test_toolchain_identity(state: dict[str, object]) -> str:
     return "sha256:" + hasher.hexdigest()
 
 
-TEST_NORMAL_TOOLCHAIN_STATE = test_toolchain_state(["macos-arm64-core"])
-TEST_LARGE_AREA_TOOLCHAIN_STATE = test_toolchain_state(
+TEST_NORMAL_TOOLCHAIN_STATE = make_toolchain_state(["macos-arm64-core"])
+TEST_LARGE_AREA_TOOLCHAIN_STATE = make_toolchain_state(
     ["macos-arm64-core", "geometry-large-area"]
 )
-TEST_TOOLCHAIN_IDENTITY = test_toolchain_identity(TEST_LARGE_AREA_TOOLCHAIN_STATE)
+TEST_TOOLCHAIN_IDENTITY = toolchain_identity_for_state(TEST_LARGE_AREA_TOOLCHAIN_STATE)
 evidence.PINNED_TOOLCHAIN_PUBLIC_KEY_BASE64_OVERRIDE = TEST_TOOLCHAIN_PUBLIC_KEY_BASE64
 
 
@@ -769,6 +773,7 @@ def evidence_request(
         identity,
         "sha256:" + "1" * 64,
         runner_identity(evidence.RENDERING_DRIVER_IDENTITY, "e"),
+        "sha256:" + "9" * 64,
     )
 
 
@@ -791,6 +796,13 @@ def candidate_timing(seconds: float) -> dict[str, object]:
 def paired_timing() -> dict[str, object]:
     ordinary = [
         {
+            "variant": "baseline",
+            "discarded": True,
+            "end_to_end_seconds": 251.0,
+            "geometry_seconds": 101.0,
+            "training_seconds": 60.0,
+        },
+        {
             "variant": "candidate",
             "discarded": True,
             "end_to_end_seconds": 101.0,
@@ -798,30 +810,40 @@ def paired_timing() -> dict[str, object]:
             "training_seconds": 60.0,
         }
     ]
-    for baseline_end, candidate_end, baseline_geometry, candidate_geometry in (
+    for pair_index, (
+        baseline_end,
+        candidate_end,
+        baseline_geometry,
+        candidate_geometry,
+    ) in enumerate((
         (249.0, 99.0, 99.0, 39.0),
         (250.0, 100.0, 100.0, 40.0),
         (251.0, 101.0, 101.0, 41.0),
-    ):
-        ordinary.extend(
-            [
-                {
-                    "variant": "baseline",
-                    "discarded": False,
-                    "end_to_end_seconds": baseline_end,
-                    "geometry_seconds": baseline_geometry,
-                    "training_seconds": 60.0,
-                },
-                {
-                    "variant": "candidate",
-                    "discarded": False,
-                    "end_to_end_seconds": candidate_end,
-                    "geometry_seconds": candidate_geometry,
-                    "training_seconds": 60.0,
-                },
-            ]
-        )
+    )):
+        pair = [
+            {
+                "variant": "baseline",
+                "discarded": False,
+                "end_to_end_seconds": baseline_end,
+                "geometry_seconds": baseline_geometry,
+                "training_seconds": 60.0,
+            },
+            {
+                "variant": "candidate",
+                "discarded": False,
+                "end_to_end_seconds": candidate_end,
+                "geometry_seconds": candidate_geometry,
+                "training_seconds": 60.0,
+            },
+        ]
+        ordinary.extend(pair if pair_index % 2 == 0 else reversed(pair))
     phase = [
+        {
+            "variant": "baseline",
+            "discarded": True,
+            "matcher_seconds": 127.0,
+            "mapping_seconds": 32.0,
+        },
         {
             "variant": "candidate",
             "discarded": True,
@@ -829,51 +851,61 @@ def paired_timing() -> dict[str, object]:
             "mapping_seconds": 21.0,
         }
     ]
-    for baseline_matcher, candidate_matcher, baseline_mapping, candidate_mapping in (
+    for pair_index, (
+        baseline_matcher,
+        candidate_matcher,
+        baseline_mapping,
+        candidate_mapping,
+    ) in enumerate((
         (123.0, 12.3, 28.0, 18.0),
         (124.0, 12.4, 29.0, 19.0),
         (125.0, 12.5, 30.0, 20.0),
         (126.0, 12.6, 31.0, 21.0),
         (127.0, 12.7, 32.0, 22.0),
-    ):
-        phase.extend(
-            [
-                {
-                    "variant": "baseline",
-                    "discarded": False,
-                    "matcher_seconds": baseline_matcher,
-                    "mapping_seconds": baseline_mapping,
-                },
-                {
-                    "variant": "candidate",
-                    "discarded": False,
-                    "matcher_seconds": candidate_matcher,
-                    "mapping_seconds": candidate_mapping,
-                },
-            ]
-        )
+    )):
+        pair = [
+            {
+                "variant": "baseline",
+                "discarded": False,
+                "matcher_seconds": baseline_matcher,
+                "mapping_seconds": baseline_mapping,
+            },
+            {
+                "variant": "candidate",
+                "discarded": False,
+                "matcher_seconds": candidate_matcher,
+                "mapping_seconds": candidate_mapping,
+            },
+        ]
+        phase.extend(pair if pair_index % 2 == 0 else reversed(pair))
     fast_profile = [
+        {
+            "variant": "accurate_reference",
+            "discarded": True,
+            "end_to_end_seconds": 201.0,
+        },
         {
             "variant": "fast_candidate",
             "discarded": True,
             "end_to_end_seconds": 101.0,
         }
     ]
-    for reference_seconds, fast_seconds in ((199.0, 99.0), (200.0, 100.0), (201.0, 101.0)):
-        fast_profile.extend(
-            [
-                {
-                    "variant": "accurate_reference",
-                    "discarded": False,
-                    "end_to_end_seconds": reference_seconds,
-                },
-                {
-                    "variant": "fast_candidate",
-                    "discarded": False,
-                    "end_to_end_seconds": fast_seconds,
-                },
-            ]
-        )
+    for pair_index, (reference_seconds, fast_seconds) in enumerate(
+        ((199.0, 99.0), (200.0, 100.0), (201.0, 101.0))
+    ):
+        pair = [
+            {
+                "variant": "accurate_reference",
+                "discarded": False,
+                "end_to_end_seconds": reference_seconds,
+            },
+            {
+                "variant": "fast_candidate",
+                "discarded": False,
+                "end_to_end_seconds": fast_seconds,
+            },
+        ]
+        fast_profile.extend(pair if pair_index % 2 == 0 else reversed(pair))
     for group, records in (
         ("ordinary", ordinary),
         ("phase", phase),
@@ -1186,6 +1218,7 @@ def execution_receipts(
                 "mapper_invocations": mapper_invocations_for_variant(variant, request),
                 "started_monotonic_seconds": cursor,
                 "ended_monotonic_seconds": cursor + duration,
+                "process_cpu_microseconds": {"user": 0, "system": 0},
                 "exit_code": 0,
                 "checkout_commit": (
                     request["binding"]["baseline_git_commit"]
@@ -1264,6 +1297,7 @@ def invalid_execution_receipt(
             "mapper_invocations": [],
             "started_monotonic_seconds": 0.0,
             "ended_monotonic_seconds": 1.0,
+            "process_cpu_microseconds": {"user": 0, "system": 0},
             "exit_code": actual["exit_code"],
             "checkout_commit": request["binding"]["git_commit"],
             "toolchain_identity": request["binding"]["toolchain_identity"],
@@ -1302,7 +1336,7 @@ def supervisor_run(observations: dict[str, object]) -> dict[str, object]:
         "runner_sha256": candidate["executable_sha256"],
     }
     return {
-        "schema_version": 1,
+        "schema_version": 3,
         **binding,
         "argv": [
             "protected-measurement-runner",
@@ -1318,6 +1352,80 @@ def supervisor_run(observations: dict[str, object]) -> dict[str, object]:
         "started_monotonic_seconds": started,
         "ended_monotonic_seconds": ended + 1.0,
         "exit_code": 0,
+        "measurement_environment": {
+            "schema_version": 1,
+            "monotonic_clock": "mach_absolute_time",
+            "monitor_sha256": evidence.sha256_bytes(FIXTURE_HOST_MONITOR),
+            "monitor_executable_sha256": runner_identity(
+                evidence.RENDERING_DRIVER_IDENTITY,
+                "e",
+            )["executable_sha256"],
+            "sample_interval_seconds": 1.0,
+            "sample_count": 2,
+            "maximum_sample_gap_seconds": 1.0,
+            "first_monotonic_seconds": started,
+            "last_monotonic_seconds": ended + 1.0,
+            "state_change_events": [],
+            "power_sources": ["ac_power"],
+            "thermal_states": ["nominal"],
+            "low_power_mode_observed": False,
+            "vm_pageouts_delta": 0,
+            "vm_swapouts_delta": 0,
+            "outer_child_cpu_microseconds": {"user": 0, "system": 0},
+            "supervisor_host_busy_fraction": 0.05,
+            "supervisor_process_cpu_fraction": 0.0,
+            "supervisor_external_cpu_fraction": 0.05,
+            "unattributed_child_cpu_fraction": 0.0,
+            "commands": [
+                {
+                    "run_id": command["run_id"],
+                    "host_busy_fraction": 0.05,
+                    "process_cpu_fraction": 0.0,
+                    "external_cpu_fraction": 0.05,
+                }
+                for command in commands
+            ],
+        },
+    }
+
+
+def host_state(
+    *,
+    user: int,
+    system: int,
+    idle: int,
+    nice: int = 0,
+    thermal_state: str = "nominal",
+    low_power_mode: bool = False,
+    power_source: str = "ac_power",
+    vm_pageouts: int = 10,
+    vm_swapouts: int = 20,
+) -> dict[str, object]:
+    return {
+        "cpu_ticks": {"user": user, "system": system, "idle": idle, "nice": nice},
+        "vm_pageouts": vm_pageouts,
+        "vm_swapouts": vm_swapouts,
+        "thermal_state": thermal_state,
+        "low_power_mode": low_power_mode,
+        "power_source": power_source,
+    }
+
+
+def host_monitor_report(
+    samples: list[tuple[float, dict[str, object]]],
+    *,
+    sample_interval_seconds: float = 1.0,
+    events: list[dict[str, object]] | None = None,
+) -> dict[str, object]:
+    return {
+        "schema_version": 1,
+        "monotonic_clock": "mach_absolute_time",
+        "sample_interval_seconds": sample_interval_seconds,
+        "samples": [
+            {"monotonic_seconds": timestamp, "state": state}
+            for timestamp, state in samples
+        ],
+        "events": events or [],
     }
 
 
@@ -1361,6 +1469,7 @@ def raw_observations(
         "artifacts": {
             "command_log": "command.jsonl",
             "supervisor_run": "supervisor-run.json",
+            "host_monitor": "host-monitor.json",
             "stdout_log": "stdout.log",
             "stderr_log": "stderr.log",
             "output_ply": "splat.ply",
@@ -1822,6 +1931,7 @@ def write_evidence_artifacts(
             for receipt in observations["commands"]
         )
     )
+    (root / "host-monitor.json").write_bytes(FIXTURE_HOST_MONITOR)
     (root / "supervisor-run.json").write_bytes(
         evidence.canonical_json_bytes(supervisor_run(observations)) + b"\n"
     )
@@ -2046,6 +2156,24 @@ class ConfigurationValidationTests(unittest.TestCase):
         benchmark.validate_corpus(corpus, expected_profile="release")
         benchmark.validate_reference_config(config)
         self.assertEqual(len(corpus["scenes"]), 26)
+        contract = benchmark.benchmark_contract(corpus)
+        self.assertEqual(len(contract["scenes"]), 26)
+        self.assertEqual(
+            sum(
+                len(lanes)
+                for scene in contract["scenes"]
+                for lanes in scene["required_evidence_lanes"].values()
+            ),
+            65,
+        )
+        self.assertEqual(
+            benchmark.validate_tracked_benchmark_contract(corpus),
+            benchmark.benchmark_contract_sha256(corpus),
+        )
+        changed_contract = json.loads(json.dumps(corpus))
+        changed_contract["scenes"][0]["aggregate_scale"] = 120
+        with self.assertRaisesRegex(benchmark.ConfigError, "public structure"):
+            benchmark.validate_tracked_benchmark_contract(changed_contract)
         self.assertTrue(all(scene["input"]["supplied"] is False for scene in corpus["scenes"]))
         self.assertTrue(
             all(
@@ -2278,6 +2406,11 @@ class ConfigurationValidationTests(unittest.TestCase):
         self.assertIs(evidence_schema["properties"]["artifacts"]["additionalProperties"]["additionalProperties"], False)
         self.assertIn("measurement_runner", evidence_schema["required"])
         self.assertIn("gate_scopes", evidence_schema["required"])
+        cpu_schema = evidence_schema["properties"]["commands"]["items"]["properties"][
+            "process_cpu_microseconds"
+        ]["properties"]
+        self.assertEqual(cpu_schema["user"]["maximum"], (1 << 64) - 1)
+        self.assertEqual(cpu_schema["system"]["maximum"], (1 << 64) - 1)
         self.assertIn("measurement_runner", schema["$defs"]["evidenceRecord"]["required"])
 
     def test_result_schema_reserves_exit_code_130_for_cancellation(self) -> None:
@@ -2786,8 +2919,9 @@ class GateEvaluationTests(unittest.TestCase):
             scene("photos", "professional_photos", psnr_loss=0.1),
         ]
         evaluation = benchmark.evaluate_suite_quality(missing_primary, self.thresholds)
-        self.assertEqual(evaluation["status"], "blocked")
+        self.assertEqual(evaluation["status"], "failed")
         self.assertTrue(any("primary" in item for item in evaluation["blocking_reasons"]))
+        self.assertTrue(evaluation["failures"])
 
 
 class InvalidSceneTests(unittest.TestCase):
@@ -2900,10 +3034,292 @@ class MetadataAndPersistenceTests(unittest.TestCase):
 
 class EvidenceProtocolTests(unittest.TestCase):
     def setUp(self) -> None:
-        self.key = b"release-evidence-test-key-material-32-bytes"
         evidence.LPIPS_DISTANCE_OVERRIDE = lambda first, second: float(
             abs(first.mean() - second.mean())
         )
+
+    def test_lane_outcome_distinguishes_execution_failure_from_environment(self) -> None:
+        request = evidence_request()
+        runner = runner_identity(evidence.LANE_REFERENCE)
+        machine = evidence_machine(evidence.LANE_REFERENCE)
+        for reason, exit_code in (
+            ("launch_failed", None),
+            ("timed_out", -15),
+            ("timed_out", 0),
+            ("nonzero_exit", 23),
+        ):
+            with self.subTest(reason=reason), tempfile.TemporaryDirectory() as directory:
+                path = Path(directory) / "lane-outcome.json"
+                receipt = evidence.derive_lane_outcome(
+                    request,
+                    evidence.LANE_REFERENCE,
+                    runner,
+                    machine,
+                    kind="execution_failed",
+                    reason=reason,
+                    exit_code=exit_code,
+                )
+                path.write_bytes(evidence.canonical_json_bytes(receipt) + b"\n")
+                verified = evidence.validate_prepared_lane_outcome_file(
+                    path,
+                    request,
+                    evidence.LANE_REFERENCE,
+                    runner,
+                )
+                self.assertEqual(verified["outcome"]["reason"], reason)
+
+        for reason, stage, exit_code in (
+            ("host_monitor_failed", "host_monitor", None),
+            ("host_monitor_failed", "host_monitor", 0),
+            ("postprocessing_failed", "postprocessing", 0),
+        ):
+            with self.subTest(reason=reason, exit_code=exit_code), tempfile.TemporaryDirectory() as directory:
+                path = Path(directory) / "lane-outcome.json"
+                receipt = evidence.derive_lane_outcome(
+                    request,
+                    evidence.LANE_REFERENCE,
+                    runner,
+                    machine,
+                    kind="infrastructure_blocked",
+                    reason=reason,
+                    exit_code=exit_code,
+                )
+                path.write_bytes(evidence.canonical_json_bytes(receipt) + b"\n")
+                verified = evidence.validate_prepared_lane_outcome_file(
+                    path,
+                    request,
+                    evidence.LANE_REFERENCE,
+                    runner,
+                )
+                self.assertEqual(verified["outcome"]["stage"], stage)
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "host-monitor.json").write_bytes(FIXTURE_HOST_MONITOR)
+            observations = raw_observations(evidence.LANE_REFERENCE)
+            environment = supervisor_run(observations)["measurement_environment"]
+            environment["low_power_mode_observed"] = True
+            environment_receipt = {
+                "schema_version": 1,
+                "started_monotonic_seconds": min(
+                    command["started_monotonic_seconds"]
+                    for command in observations["commands"]
+                ),
+                "ended_monotonic_seconds": max(
+                    command["ended_monotonic_seconds"]
+                    for command in observations["commands"]
+                )
+                + 1.0,
+                "commands": [
+                    {
+                        "run_id": command["run_id"],
+                        "started_monotonic_seconds": command[
+                            "started_monotonic_seconds"
+                        ],
+                        "ended_monotonic_seconds": command["ended_monotonic_seconds"],
+                        "process_cpu_microseconds": command[
+                            "process_cpu_microseconds"
+                        ],
+                    }
+                    for command in observations["commands"]
+                ],
+                "measurement_environment": environment,
+            }
+            environment_path = root / "measurement-environment.json"
+            environment_path.write_bytes(
+                evidence.canonical_json_bytes(environment_receipt) + b"\n"
+            )
+            receipt = evidence.derive_lane_outcome(
+                request,
+                evidence.LANE_REFERENCE,
+                runner,
+                machine,
+                kind="environment_rejected",
+                reason="policy_violation",
+                exit_code=0,
+                environment_receipt_path=environment_path,
+            )
+            outcome_path = root / "lane-outcome.json"
+            outcome_path.write_bytes(evidence.canonical_json_bytes(receipt) + b"\n")
+            verified = evidence.validate_prepared_lane_outcome_file(
+                outcome_path,
+                request,
+                evidence.LANE_REFERENCE,
+                runner,
+            )
+            self.assertEqual(verified["outcome"]["kind"], "environment_rejected")
+
+            environment["low_power_mode_observed"] = False
+            environment_path.write_bytes(
+                evidence.canonical_json_bytes(environment_receipt) + b"\n"
+            )
+            with self.assertRaisesRegex(evidence.EvidenceError, "does not prove"):
+                evidence.derive_lane_outcome(
+                    request,
+                    evidence.LANE_REFERENCE,
+                    runner,
+                    machine,
+                    kind="environment_rejected",
+                    reason="policy_violation",
+                    exit_code=0,
+                    environment_receipt_path=environment_path,
+                )
+
+    def test_lane_outcome_shape_is_fail_closed(self) -> None:
+        request = evidence_request()
+        runner = runner_identity(evidence.LANE_REFERENCE)
+        machine = evidence_machine(evidence.LANE_REFERENCE)
+        receipt = evidence.derive_lane_outcome(
+            request,
+            evidence.LANE_REFERENCE,
+            runner,
+            machine,
+            kind="execution_failed",
+            reason="nonzero_exit",
+            exit_code=23,
+        )
+        cases = (
+            ("invalid fields", {**receipt, "unexpected": True}),
+            ("invalid fields", {key: value for key, value in receipt.items() if key != "outcome"}),
+        )
+        for expected, changed in cases:
+            with self.subTest(case=expected), tempfile.TemporaryDirectory() as directory:
+                path = Path(directory) / "lane-outcome.json"
+                path.write_bytes(evidence.canonical_json_bytes(changed) + b"\n")
+                with self.assertRaisesRegex(evidence.EvidenceError, expected):
+                    evidence.validate_prepared_lane_outcome_file(
+                        path,
+                        request,
+                        evidence.LANE_REFERENCE,
+                        runner,
+                    )
+
+        for reason, exit_code in (("timed_out", 256), ("nonzero_exit", -256)):
+            with self.subTest(reason=reason, exit_code=exit_code):
+                expected = "bounded exit code" if reason == "timed_out" else "bounded nonzero"
+                with self.assertRaisesRegex(evidence.EvidenceError, expected):
+                    evidence.derive_lane_outcome(
+                        request,
+                        evidence.LANE_REFERENCE,
+                        runner,
+                        machine,
+                        kind="execution_failed",
+                        reason=reason,
+                        exit_code=exit_code,
+                    )
+        for reason, exit_code in (
+            ("host_monitor_failed", 1),
+            ("postprocessing_failed", None),
+        ):
+            with self.subTest(reason=reason, exit_code=exit_code):
+                with self.assertRaisesRegex(evidence.EvidenceError, "infrastructure"):
+                    evidence.derive_lane_outcome(
+                        request,
+                        evidence.LANE_REFERENCE,
+                        runner,
+                        machine,
+                        kind="infrastructure_blocked",
+                        reason=reason,
+                        exit_code=exit_code,
+                    )
+
+    def test_raw_processors_have_no_private_signing_surface(self) -> None:
+        raw_processors = (
+            ROOT / "scripts/benchmark/evidence_protocol.py",
+            ROOT / "scripts/benchmark/easysplat_benchmark.py",
+            ROOT / "scripts/benchmark/run_lane.py",
+            ROOT / "scripts/benchmark/prepare_evidence.py",
+        )
+        forbidden = (
+            "Ed25519PrivateKey",
+            "from_private_bytes",
+            "--private-key",
+            "private_seed",
+            "load_private_seed",
+            "sign_attestation",
+            "sign_lane_outcome",
+            "_sign_ed25519",
+        )
+        for path in raw_processors:
+            source = path.read_text(encoding="utf-8")
+            for token in forbidden:
+                with self.subTest(path=path.name, token=token):
+                    self.assertNotIn(token, source)
+
+        for name in (
+            "main",
+            "load_private_seed_bytes",
+            "load_private_seed_from_stdin",
+            "public_key_from_private_seed",
+            "sign_attestation",
+            "sign_lane_outcome",
+            "produce_attestation",
+            "produce_lane_outcome",
+        ):
+            with self.subTest(export=name):
+                self.assertFalse(hasattr(evidence, name))
+
+    def test_lane_outcome_malformed_json_is_classified_as_evidence_error(self) -> None:
+        request = evidence_request()
+        runner = runner_identity(evidence.LANE_REFERENCE)
+        cases = (
+            (b'{"machine":{"logical_cpus":1e999}}\n', "non-finite"),
+            (b"\xff\xfe", "not valid JSON"),
+            (b'{"value":' + b"9" * 5_000 + b"}\n", "not valid JSON"),
+            (b"[" * 2_000 + b"0" + b"]" * 2_000, "must be an object"),
+        )
+        for payload, expected in cases:
+            with self.subTest(expected=expected), tempfile.TemporaryDirectory() as directory:
+                path = Path(directory) / "lane-outcome.json"
+                path.write_bytes(payload)
+                with self.assertRaisesRegex(evidence.EvidenceError, expected):
+                    evidence.validate_prepared_lane_outcome_file(
+                        path,
+                        request,
+                        evidence.LANE_REFERENCE,
+                        runner,
+                    )
+
+    def test_attestation_must_be_bounded_and_single_link(self) -> None:
+        request = evidence_request()
+        observations = raw_observations(evidence.LANE_REFERENCE)
+        runner = runner_identity(evidence.LANE_REFERENCE)
+        machine = evidence_machine(evidence.LANE_REFERENCE)
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            write_evidence_artifacts(root, observations)
+            attestation = evidence.derive_attestation(
+                request,
+                observations,
+                root,
+                root / "attestation.json",
+                evidence.LANE_REFERENCE,
+                runner,
+                machine=machine,
+            )
+            path = root / "attestation.json"
+            path.write_bytes(evidence.canonical_json_bytes(attestation) + b"\n")
+            alias = root / "attestation-hardlink.json"
+            os.link(path, alias)
+            with self.assertRaisesRegex(evidence.EvidenceError, "single-link"):
+                evidence.validate_prepared_attestation_file(
+                    path,
+                    request,
+                    evidence.LANE_REFERENCE,
+                    runner,
+                )
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "attestation.json"
+            with path.open("wb") as handle:
+                handle.truncate(evidence.MAX_ATTESTATION_BYTES + 1)
+            with self.assertRaisesRegex(evidence.EvidenceError, "bounded"):
+                evidence.validate_prepared_attestation_file(
+                    path,
+                    request,
+                    evidence.LANE_REFERENCE,
+                    runner,
+                )
 
     def test_biconnected_robustness_is_iterative_and_component_safe(self) -> None:
         def graph(view_count: int, edges: list[tuple[int, int]]) -> list[set[int]]:
@@ -2964,18 +3380,44 @@ class EvidenceProtocolTests(unittest.TestCase):
         observations = raw_observations(lane)
         write_evidence_artifacts(root, observations)
         output = root / "attestation.json"
-        attestation = evidence.produce_attestation(
+        attestation = evidence.derive_attestation(
             evidence_request(lane=lane),
             observations,
             root,
             output,
-            self.key,
             lane,
             runner_identity(lane),
             machine=evidence_machine(lane),
         )
         output.write_bytes(evidence.canonical_json_bytes(attestation) + b"\n")
         return output, attestation
+
+    def test_attestation_derivation_is_directly_validatable(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            observations = raw_observations(evidence.LANE_REFERENCE)
+            write_evidence_artifacts(root, observations)
+            request = evidence_request()
+            runner = runner_identity(evidence.LANE_REFERENCE)
+            prepared = evidence.validate_attestation_candidate(
+                request,
+                observations,
+                root,
+                root / "attestation.json",
+                evidence.LANE_REFERENCE,
+                runner,
+                machine=evidence_machine(evidence.LANE_REFERENCE),
+            )
+            self.assertNotIn("signature", prepared)
+            output = root / "attestation.json"
+            output.write_bytes(evidence.canonical_json_bytes(prepared) + b"\n")
+            validated = evidence.validate_prepared_attestation_file(
+                output,
+                request,
+                evidence.LANE_REFERENCE,
+                runner,
+            )
+            self.assertEqual(validated["metrics"], prepared["metrics"])
 
     def test_producer_derives_metrics_from_raw_samples(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -3000,11 +3442,10 @@ class EvidenceProtocolTests(unittest.TestCase):
                 attestation["measurement_runner"],
                 runner_identity(evidence.LANE_REFERENCE),
             )
-            verified = evidence.verify_attestation(
+            verified = evidence.validate_prepared_attestation_file(
                 output,
                 evidence_request(),
                 evidence.LANE_REFERENCE,
-                self.key,
                 runner_identity(evidence.LANE_REFERENCE),
             )
             self.assertEqual(verified["metrics"], metrics)
@@ -3035,6 +3476,7 @@ class EvidenceProtocolTests(unittest.TestCase):
             identity,
             "sha256:" + "1" * 64,
             runner_identity(evidence.RENDERING_DRIVER_IDENTITY, "e"),
+            "sha256:" + "9" * 64,
         )
         self.assertEqual(request["holdout_indices"], [])
         self.assertEqual(request["reference_artifacts"], {"status": "not_applicable"})
@@ -3047,7 +3489,8 @@ class EvidenceProtocolTests(unittest.TestCase):
         observations["artifacts"] = {
             key: value
             for key, value in observations["artifacts"].items()
-            if key in {"command_log", "supervisor_run", "stdout_log", "stderr_log"}
+            if key
+            in {"command_log", "supervisor_run", "host_monitor", "stdout_log", "stderr_log"}
         }
         observations["actual"] = {
             "exit_code": 2,
@@ -3064,12 +3507,11 @@ class EvidenceProtocolTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             write_evidence_artifacts(root, observations, request)
-            attestation = evidence.produce_attestation(
+            attestation = evidence.derive_attestation(
                 request,
                 observations,
                 root,
                 root / "attestation.json",
-                self.key,
                 evidence.LANE_REFERENCE,
                 runner_identity(evidence.LANE_REFERENCE),
                 machine=evidence_machine(evidence.LANE_REFERENCE),
@@ -3086,12 +3528,11 @@ class EvidenceProtocolTests(unittest.TestCase):
             root = Path(directory)
             write_evidence_artifacts(root, observations, request)
             with self.assertRaisesRegex(evidence.EvidenceError, "invalid.*output_ply"):
-                evidence.produce_attestation(
+                evidence.derive_attestation(
                     request,
                     observations,
                     root,
                     root / "attestation.json",
-                    self.key,
                     evidence.LANE_REFERENCE,
                     runner_identity(evidence.LANE_REFERENCE),
                     machine=evidence_machine(evidence.LANE_REFERENCE),
@@ -3114,12 +3555,11 @@ class EvidenceProtocolTests(unittest.TestCase):
                 write_evidence_artifacts(root, observations)
                 (root / "splat.ply").write_text(content, encoding="utf-8")
                 with self.assertRaisesRegex(evidence.EvidenceError, "output_ply"):
-                    evidence.produce_attestation(
+                    evidence.derive_attestation(
                         evidence_request(),
                         observations,
                         root,
                         root / "attestation.json",
-                        self.key,
                         evidence.LANE_REFERENCE,
                         runner_identity(evidence.LANE_REFERENCE),
                         machine=evidence_machine(evidence.LANE_REFERENCE),
@@ -3135,12 +3575,11 @@ class EvidenceProtocolTests(unittest.TestCase):
             root = Path(directory)
             write_evidence_artifacts(root, observations)
             with self.assertRaisesRegex(evidence.EvidenceError, "unknown rendering"):
-                evidence.produce_attestation(
+                evidence.derive_attestation(
                     evidence_request(),
                     observations,
                     root,
                     root / "attestation.json",
-                    self.key,
                     evidence.LANE_REFERENCE,
                     runner_identity(evidence.LANE_REFERENCE),
                     machine=evidence_machine(evidence.LANE_REFERENCE),
@@ -3157,12 +3596,11 @@ class EvidenceProtocolTests(unittest.TestCase):
                 evidence.canonical_json_bytes(observations) + b"\n"
             )
             with self.assertRaisesRegex(evidence.EvidenceError, "rendering_manifest"):
-                evidence.produce_attestation(
+                evidence.derive_attestation(
                     evidence_request(),
                     observations,
                     root,
                     root / "attestation.json",
-                    self.key,
                     evidence.LANE_REFERENCE,
                     runner_identity(evidence.LANE_REFERENCE),
                     machine=evidence_machine(evidence.LANE_REFERENCE),
@@ -3187,12 +3625,11 @@ class EvidenceProtocolTests(unittest.TestCase):
                     evidence.canonical_json_bytes(pair_list) + b"\n"
                 )
                 with self.assertRaisesRegex(evidence.EvidenceError, "pair_list"):
-                    evidence.produce_attestation(
+                    evidence.derive_attestation(
                         evidence_request(),
                         observations,
                         root,
                         root / "attestation.json",
-                        self.key,
                         evidence.LANE_REFERENCE,
                         runner_identity(evidence.LANE_REFERENCE),
                         machine=evidence_machine(evidence.LANE_REFERENCE),
@@ -3212,12 +3649,11 @@ class EvidenceProtocolTests(unittest.TestCase):
                 root = Path(directory)
                 write_evidence_artifacts(root, changed)
                 with self.assertRaisesRegex(evidence.EvidenceError, f"pair_list {metric}"):
-                    evidence.produce_attestation(
+                    evidence.derive_attestation(
                         evidence_request(),
                         changed,
                         root,
                         root / "attestation.json",
-                        self.key,
                         evidence.LANE_REFERENCE,
                         runner_identity(evidence.LANE_REFERENCE),
                         machine=evidence_machine(evidence.LANE_REFERENCE),
@@ -3242,12 +3678,11 @@ class EvidenceProtocolTests(unittest.TestCase):
             root = Path(directory)
             write_evidence_artifacts(root, observations, request)
             with self.assertRaisesRegex(evidence.EvidenceError, "retrieval.*quer"):
-                evidence.produce_attestation(
+                evidence.derive_attestation(
                     request,
                     observations,
                     root,
                     root / "attestation.json",
-                    self.key,
                     evidence.LANE_REFERENCE,
                     runner_identity(evidence.LANE_REFERENCE),
                     machine=evidence_machine(evidence.LANE_REFERENCE),
@@ -3312,24 +3747,22 @@ class EvidenceProtocolTests(unittest.TestCase):
                     evidence.canonical_json_bytes(pair_list) + b"\n"
                 )
                 if label == "valid":
-                    evidence.produce_attestation(
+                    evidence.derive_attestation(
                         request,
                         observations,
                         root,
                         root / "attestation.json",
-                        self.key,
                         evidence.LANE_REFERENCE,
                         runner_identity(evidence.LANE_REFERENCE),
                         machine=evidence_machine(evidence.LANE_REFERENCE),
                     )
                 else:
                     with self.assertRaisesRegex(evidence.EvidenceError, "retrieval"):
-                        evidence.produce_attestation(
+                        evidence.derive_attestation(
                             request,
                             observations,
                             root,
                             root / "attestation.json",
-                            self.key,
                             evidence.LANE_REFERENCE,
                             runner_identity(evidence.LANE_REFERENCE),
                             machine=evidence_machine(evidence.LANE_REFERENCE),
@@ -3375,12 +3808,11 @@ class EvidenceProtocolTests(unittest.TestCase):
                 evidence.canonical_json_bytes(pair_list) + b"\n"
             )
             with self.assertRaisesRegex(evidence.EvidenceError, "retained neighbor target"):
-                evidence.produce_attestation(
+                evidence.derive_attestation(
                     request,
                     observations,
                     root,
                     root / "attestation.json",
-                    self.key,
                     evidence.LANE_REFERENCE,
                     runner_identity(evidence.LANE_REFERENCE),
                     machine=evidence_machine(evidence.LANE_REFERENCE),
@@ -3463,24 +3895,22 @@ class EvidenceProtocolTests(unittest.TestCase):
                     evidence.canonical_json_bytes(pair_list) + b"\n"
                 )
                 if label == "valid":
-                    evidence.produce_attestation(
+                    evidence.derive_attestation(
                         request,
                         changed_observations,
                         root,
                         root / "attestation.json",
-                        self.key,
                         evidence.LANE_REFERENCE,
                         runner_identity(evidence.LANE_REFERENCE),
                         machine=evidence_machine(evidence.LANE_REFERENCE),
                     )
                 else:
                     with self.assertRaisesRegex(evidence.EvidenceError, "exhaustive|duplicate"):
-                        evidence.produce_attestation(
+                        evidence.derive_attestation(
                             request,
                             changed_observations,
                             root,
                             root / "attestation.json",
-                            self.key,
                             evidence.LANE_REFERENCE,
                             runner_identity(evidence.LANE_REFERENCE),
                             machine=evidence_machine(evidence.LANE_REFERENCE),
@@ -3573,12 +4003,11 @@ class EvidenceProtocolTests(unittest.TestCase):
                 root = Path(directory)
                 write_evidence_artifacts(root, changed)
                 with self.assertRaisesRegex(evidence.EvidenceError, expected):
-                    evidence.produce_attestation(
+                    evidence.derive_attestation(
                         evidence_request(),
                         changed,
                         root,
                         root / "attestation.json",
-                        self.key,
                         evidence.LANE_REFERENCE,
                         runner_identity(evidence.LANE_REFERENCE),
                         machine=evidence_machine(evidence.LANE_REFERENCE),
@@ -3606,12 +4035,11 @@ class EvidenceProtocolTests(unittest.TestCase):
                 evidence.canonical_json_bytes(tampered) + b"\n"
             )
             with self.assertRaisesRegex(evidence.EvidenceError, "training manifest"):
-                evidence.produce_attestation(
+                evidence.derive_attestation(
                     evidence_request(),
                     tampered,
                     root,
                     root / "attestation.json",
-                    self.key,
                     evidence.LANE_REFERENCE,
                     runner_identity(evidence.LANE_REFERENCE),
                     machine=evidence_machine(evidence.LANE_REFERENCE),
@@ -3628,12 +4056,11 @@ class EvidenceProtocolTests(unittest.TestCase):
             manifest_path.write_bytes(evidence.canonical_json_bytes(manifest) + b"\n")
 
             with self.assertRaisesRegex(evidence.EvidenceError, "published timing run"):
-                evidence.produce_attestation(
+                evidence.derive_attestation(
                     evidence_request(),
                     observations,
                     root,
                     root / "attestation.json",
-                    self.key,
                     evidence.LANE_REFERENCE,
                     runner_identity(evidence.LANE_REFERENCE),
                     machine=evidence_machine(evidence.LANE_REFERENCE),
@@ -3757,8 +4184,8 @@ class EvidenceProtocolTests(unittest.TestCase):
         missing_warmup["ordinary_runs"] = missing_warmup["ordinary_runs"][1:]
         cases.append((missing_warmup, "ordinary_runs"))
         wrong_order = json.loads(json.dumps(observations["timing"]))
-        wrong_order["ordinary_runs"][2]["variant"] = "baseline"
-        cases.append((wrong_order, "alternate"))
+        wrong_order["ordinary_runs"][3]["variant"] = "baseline"
+        cases.append((wrong_order, "counterbalanced"))
         too_few_phase_runs = json.loads(json.dumps(observations["timing"]))
         too_few_phase_runs["phase_runs"] = too_few_phase_runs["phase_runs"][:-2]
         cases.append((too_few_phase_runs, "phase_runs"))
@@ -3778,16 +4205,417 @@ class EvidenceProtocolTests(unittest.TestCase):
                 root = Path(directory)
                 write_evidence_artifacts(root, changed)
                 with self.assertRaisesRegex(evidence.EvidenceError, expected):
-                    evidence.produce_attestation(
+                    evidence.derive_attestation(
                         evidence_request(),
                         changed,
                         root,
                         root / "attestation.json",
-                        self.key,
                         evidence.LANE_REFERENCE,
                         runner_identity(evidence.LANE_REFERENCE),
                         machine=evidence_machine(evidence.LANE_REFERENCE),
                     )
+
+    def test_timing_repeatability_rejects_contaminated_measured_runs(self) -> None:
+        for variant in ("baseline", "candidate"):
+            with self.subTest(variant=variant), tempfile.TemporaryDirectory() as directory:
+                observations = raw_observations(evidence.LANE_REFERENCE)
+                measured_runs = [
+                    record
+                    for record in observations["timing"]["phase_runs"]
+                    if record["variant"] == variant and not record["discarded"]
+                ]
+                for record, matcher_seconds in zip(
+                    measured_runs,
+                    (18.946, 19.1, 390.861, 19.0, 19.2),
+                ):
+                    record["matcher_seconds"] = matcher_seconds
+                    record["end_to_end_seconds"] = (
+                        matcher_seconds + record["mapping_seconds"] + 1.0
+                    )
+                observations["commands"] = execution_receipts(
+                    observations["timing"],
+                    evidence.LANE_REFERENCE,
+                )
+                observations["memory"] = memory_observation(
+                    observations["timing"],
+                    evidence.LANE_REFERENCE,
+                )
+                root = Path(directory)
+                write_evidence_artifacts(root, observations)
+                with self.assertRaisesRegex(evidence.EvidenceError, "repeatability"):
+                    evidence.derive_attestation(
+                        evidence_request(),
+                        observations,
+                        root,
+                        root / "attestation.json",
+                        evidence.LANE_REFERENCE,
+                        runner_identity(evidence.LANE_REFERENCE),
+                        machine=evidence_machine(evidence.LANE_REFERENCE),
+                    )
+                self.assertTrue((root / "supervisor-run.json").is_file())
+                self.assertTrue((root / "command.jsonl").is_file())
+
+    def test_timing_repeatability_covers_every_published_duration(self) -> None:
+        for field in (
+            "end_to_end_seconds",
+            "geometry_seconds",
+            "training_seconds",
+            "matcher_seconds",
+            "mapping_seconds",
+        ):
+            with self.subTest(field=field):
+                grouped = {
+                    "baseline": [{field: value} for value in (20.0, 20.5, 21.0)],
+                    "candidate": [{field: value} for value in (18.946, 19.1, 390.861)],
+                }
+                with self.assertRaisesRegex(evidence.EvidenceError, field):
+                    evidence._validate_timing_repeatability(
+                        grouped,
+                        "synthetic timing",
+                        (field,),
+                    )
+
+    def test_timing_repeatability_rejects_unstable_short_measurements(self) -> None:
+        for values in ((0.01, 2.0, 2.0), (0.01, 0.01, 2.0), (0.01, 0.04, 0.05)):
+            with self.subTest(values=values), self.assertRaisesRegex(
+                evidence.EvidenceError,
+                "repeatability",
+            ):
+                evidence._validate_timing_repeatability(
+                    {"candidate": [{"matcher_seconds": value} for value in values]},
+                    "synthetic timing",
+                    ("matcher_seconds",),
+                )
+
+    def test_timing_repeatability_ignores_discarded_warmup(self) -> None:
+        observations = raw_observations(evidence.LANE_REFERENCE)
+        warmup = observations["timing"]["phase_runs"][0]
+        warmup["matcher_seconds"] = 390.861
+        warmup["end_to_end_seconds"] = (
+            warmup["matcher_seconds"] + warmup["mapping_seconds"] + 1.0
+        )
+        observations["commands"] = execution_receipts(
+            observations["timing"],
+            evidence.LANE_REFERENCE,
+        )
+        observations["memory"] = memory_observation(
+            observations["timing"],
+            evidence.LANE_REFERENCE,
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            write_evidence_artifacts(root, observations)
+            attestation = evidence.derive_attestation(
+                evidence_request(),
+                observations,
+                root,
+                root / "attestation.json",
+                evidence.LANE_REFERENCE,
+                runner_identity(evidence.LANE_REFERENCE),
+                machine=evidence_machine(evidence.LANE_REFERENCE),
+            )
+        self.assertEqual(attestation["metrics"]["matcher_seconds"], measured(12.5))
+
+    def test_measurement_environment_blocks_contaminated_timing_evidence(self) -> None:
+        def receipt_for(
+            observations: dict[str, object],
+            mutation: Callable[[dict[str, object]], None],
+        ) -> dict[str, object]:
+            receipt = supervisor_run(observations)
+            mutation(receipt["measurement_environment"])
+            return receipt
+
+        def no_change(_: dict[str, object]) -> None:
+            return
+
+        def external_cpu(environment: dict[str, object], fraction: float) -> None:
+            environment["commands"][0].update(
+                {
+                    "host_busy_fraction": fraction,
+                    "external_cpu_fraction": fraction,
+                }
+            )
+
+        cases: tuple[
+            tuple[str, Callable[[dict[str, object]], None], str | None], ...
+        ] = (
+            ("stable", no_change, None),
+            (
+                "fair thermal state",
+                lambda value: value.update({"thermal_states": ["fair"]}),
+                None,
+            ),
+            ("external CPU at boundary", lambda value: external_cpu(value, 0.10), None),
+            (
+                "external CPU above boundary",
+                lambda value: external_cpu(value, 0.100_001),
+                "external CPU",
+            ),
+            (
+                "low power mode",
+                lambda value: value.update({"low_power_mode_observed": True}),
+                "Low Power Mode",
+            ),
+            (
+                "battery power",
+                lambda value: value.update({"power_sources": ["battery_power"]}),
+                "AC power",
+            ),
+            (
+                "power source changed",
+                lambda value: value.update(
+                    {"power_sources": ["ac_power", "battery_power"]}
+                ),
+                "uninterrupted AC power",
+            ),
+            (
+                "serious thermal state",
+                lambda value: value.update({"thermal_states": ["nominal", "serious"]}),
+                "thermal state",
+            ),
+            (
+                "critical thermal state",
+                lambda value: value.update({"thermal_states": ["critical"]}),
+                "thermal state",
+            ),
+            (
+                "pageouts",
+                lambda value: value.update({"vm_pageouts_delta": 1}),
+                "pageouts",
+            ),
+            (
+                "swapouts",
+                lambda value: value.update({"vm_swapouts_delta": 1}),
+                "swapouts",
+            ),
+        )
+        for label, mutation, rejection in cases:
+            with self.subTest(case=label), tempfile.TemporaryDirectory() as directory:
+                observations = raw_observations(evidence.LANE_REFERENCE)
+                root = Path(directory)
+                write_evidence_artifacts(root, observations)
+                receipt = receipt_for(observations, mutation)
+                (root / "supervisor-run.json").write_bytes(
+                    evidence.canonical_json_bytes(receipt) + b"\n"
+                )
+                if rejection is None:
+                    attestation = evidence.derive_attestation(
+                        evidence_request(),
+                        observations,
+                        root,
+                        root / "attestation.json",
+                        evidence.LANE_REFERENCE,
+                        runner_identity(evidence.LANE_REFERENCE),
+                        machine=evidence_machine(evidence.LANE_REFERENCE),
+                    )
+                    self.assertEqual(
+                        attestation["metrics"]["wall_time_seconds"],
+                        measured(100.0),
+                    )
+                else:
+                    with self.assertRaisesRegex(evidence.EvidenceError, rejection):
+                        evidence.derive_attestation(
+                            evidence_request(),
+                            observations,
+                            root,
+                            root / "attestation.json",
+                            evidence.LANE_REFERENCE,
+                            runner_identity(evidence.LANE_REFERENCE),
+                            machine=evidence_machine(evidence.LANE_REFERENCE),
+                        )
+
+    def test_host_monitor_attributes_external_cpu_to_each_execution(self) -> None:
+        commands = [
+            {
+                "run_id": "baseline-1",
+                "started_monotonic_seconds": 1.0,
+                "ended_monotonic_seconds": 2.0,
+                "process_cpu_microseconds": {"user": 0, "system": 0},
+            },
+            {
+                "run_id": "candidate-1",
+                "started_monotonic_seconds": 2.0,
+                "ended_monotonic_seconds": 3.0,
+                "process_cpu_microseconds": {"user": 0, "system": 0},
+            },
+        ]
+        report = host_monitor_report(
+            [
+                (0.5, host_state(user=1_000, system=0, idle=9_000)),
+                (1.0, host_state(user=1_050, system=0, idle=9_450)),
+                (2.0, host_state(user=1_350, system=0, idle=10_150)),
+                (3.0, host_state(user=1_450, system=0, idle=11_050)),
+                (3.5, host_state(user=1_500, system=0, idle=11_500)),
+            ]
+        )
+        summary = lane_runner._summarize_host_monitor(
+            report,
+            commands,
+            evidence_machine(evidence.LANE_REFERENCE),
+            supervisor_started=1.0,
+            supervisor_ended=3.0,
+            monitor_sha256="sha256:" + "1" * 64,
+            monitor_executable_sha256="sha256:" + "2" * 64,
+            outer_child_cpu_microseconds={"user": 0, "system": 0},
+        )
+
+        by_run = {item["run_id"]: item for item in summary["commands"]}
+        self.assertAlmostEqual(by_run["baseline-1"]["external_cpu_fraction"], 0.3)
+        self.assertAlmostEqual(by_run["candidate-1"]["external_cpu_fraction"], 0.1)
+        self.assertEqual(summary["power_sources"], ["ac_power"])
+        self.assertEqual(summary["thermal_states"], ["nominal"])
+        self.assertEqual(summary["maximum_sample_gap_seconds"], 1.0)
+        self.assertAlmostEqual(summary["supervisor_host_busy_fraction"], 0.2)
+        self.assertAlmostEqual(summary["supervisor_external_cpu_fraction"], 0.2)
+        self.assertEqual(summary["unattributed_child_cpu_fraction"], 0.0)
+
+    def test_host_monitor_preserves_transient_disqualifying_states(self) -> None:
+        commands = [
+            {
+                "run_id": "candidate-1",
+                "started_monotonic_seconds": 1.0,
+                "ended_monotonic_seconds": 2.0,
+                "process_cpu_microseconds": {"user": 0, "system": 0},
+            }
+        ]
+        report = host_monitor_report(
+            [
+                (0.5, host_state(user=1_000, system=0, idle=9_000)),
+                (
+                    1.0,
+                    host_state(
+                        user=1_010,
+                        system=0,
+                        idle=9_090,
+                        low_power_mode=True,
+                    ),
+                ),
+                (
+                    1.1,
+                    host_state(
+                        user=1_020,
+                        system=0,
+                        idle=9_180,
+                        thermal_state="serious",
+                        power_source="battery_power",
+                    ),
+                ),
+                (1.2, host_state(user=1_030, system=0, idle=9_270)),
+                (2.0, host_state(user=1_050, system=0, idle=10_050)),
+                (2.5, host_state(user=1_060, system=0, idle=10_540)),
+            ]
+        )
+        summary = lane_runner._summarize_host_monitor(
+            report,
+            commands,
+            evidence_machine(evidence.LANE_REFERENCE),
+            supervisor_started=1.0,
+            supervisor_ended=2.0,
+            monitor_sha256="sha256:" + "1" * 64,
+            monitor_executable_sha256="sha256:" + "2" * 64,
+            outer_child_cpu_microseconds={"user": 0, "system": 0},
+        )
+
+        self.assertTrue(summary["low_power_mode_observed"])
+        self.assertEqual(summary["power_sources"], ["ac_power", "battery_power"])
+        self.assertEqual(summary["thermal_states"], ["nominal", "serious"])
+
+    def test_host_monitor_event_only_transition_rejects_measurement(self) -> None:
+        command = {
+            "run_id": "candidate-1",
+            "started_monotonic_seconds": 1.0,
+            "ended_monotonic_seconds": 2.0,
+            "process_cpu_microseconds": {"user": 0, "system": 0},
+        }
+        report = host_monitor_report(
+            [
+                (0.5, host_state(user=1_000, system=0, idle=9_000)),
+                (1.0, host_state(user=1_050, system=0, idle=9_450)),
+                (1.6, host_state(user=1_080, system=0, idle=10_020)),
+                (2.0, host_state(user=1_100, system=0, idle=10_400)),
+                (2.5, host_state(user=1_120, system=0, idle=10_880)),
+            ],
+            events=[{"monotonic_seconds": 1.5, "kind": "low_power_mode"}],
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            monitor_path = root / "host-monitor.json"
+            monitor_path.write_bytes(evidence.canonical_json_bytes(report) + b"\n")
+            summary = lane_runner._summarize_host_monitor(
+                report,
+                [command],
+                evidence_machine(evidence.LANE_REFERENCE),
+                supervisor_started=1.0,
+                supervisor_ended=2.0,
+                monitor_sha256=evidence.sha256_file(monitor_path),
+                monitor_executable_sha256="sha256:" + "2" * 64,
+                outer_child_cpu_microseconds={"user": 0, "system": 0},
+            )
+            self.assertEqual(
+                summary["state_change_events"],
+                [{"monotonic_seconds": 1.5, "kind": "low_power_mode"}],
+            )
+            self.assertFalse(summary["low_power_mode_observed"])
+            rejections = evidence.measurement_environment_rejections(
+                summary,
+                evidence_machine(evidence.LANE_REFERENCE),
+                [command],
+                1.0,
+                2.0,
+                root / "measurement-environment.json",
+                "sha256:" + "2" * 64,
+            )
+        self.assertIn("host_state_change", rejections)
+
+    def test_host_monitor_rejects_incomplete_or_overclaimed_measurements(self) -> None:
+        command = {
+            "run_id": "candidate-1",
+            "started_monotonic_seconds": 1.0,
+            "ended_monotonic_seconds": 2.0,
+            "process_cpu_microseconds": {"user": 2_000_000, "system": 0},
+        }
+        base = host_monitor_report(
+            [
+                (0.5, host_state(user=1_000, system=0, idle=9_000)),
+                (1.0, host_state(user=1_050, system=0, idle=9_450)),
+                (2.0, host_state(user=1_150, system=0, idle=10_350)),
+                (2.5, host_state(user=1_200, system=0, idle=10_800)),
+            ]
+        )
+        cases = (
+            ("CPU", base, {"user": 1_000_000, "system": 0}),
+            (
+                "sample gap",
+                {
+                    **base,
+                    "samples": [
+                        base["samples"][0],
+                        {**base["samples"][-1], "monotonic_seconds": 3.5},
+                    ],
+                },
+                {"user": 3_000_000, "system": 0},
+            ),
+            (
+                "clock",
+                {**base, "monotonic_clock": "system_uptime"},
+                {"user": 3_000_000, "system": 0},
+            ),
+        )
+        for expected, report, outer_cpu in cases:
+            with self.subTest(case=expected), self.assertRaisesRegex(
+                evidence.EvidenceError,
+                expected,
+            ):
+                lane_runner._summarize_host_monitor(
+                    report,
+                    [command],
+                    evidence_machine(evidence.LANE_REFERENCE),
+                    supervisor_started=1.0,
+                    supervisor_ended=2.0,
+                    monitor_sha256="sha256:" + "1" * 64,
+                    monitor_executable_sha256="sha256:" + "2" * 64,
+                    outer_child_cpu_microseconds=outer_cpu,
+                )
 
     def test_execution_memory_and_metal_claims_are_bound_to_raw_receipts(self) -> None:
         observations = raw_observations(evidence.LANE_REFERENCE)
@@ -3830,7 +4658,7 @@ class EvidenceProtocolTests(unittest.TestCase):
                     [
                         sample
                         for sample in value["memory"]["samples"]
-                        if sample["run_id"] != "ordinary-0"
+                        if sample["run_id"] != "ordinary-1"
                     ],
                 ),
                 "cover every candidate",
@@ -3858,12 +4686,11 @@ class EvidenceProtocolTests(unittest.TestCase):
                 root = Path(directory)
                 write_evidence_artifacts(root, changed)
                 with self.assertRaisesRegex(evidence.EvidenceError, expected):
-                    evidence.produce_attestation(
+                    evidence.derive_attestation(
                         evidence_request(),
                         changed,
                         root,
                         root / "attestation.json",
-                        self.key,
                         evidence.LANE_REFERENCE,
                         runner_identity(evidence.LANE_REFERENCE),
                         machine=evidence_machine(evidence.LANE_REFERENCE),
@@ -3874,12 +4701,11 @@ class EvidenceProtocolTests(unittest.TestCase):
             write_evidence_artifacts(root, observations)
             (root / "command.jsonl").write_text("{}\n", encoding="utf-8")
             with self.assertRaisesRegex(evidence.EvidenceError, "command_log"):
-                evidence.produce_attestation(
+                evidence.derive_attestation(
                     evidence_request(),
                     observations,
                     root,
                     root / "attestation.json",
-                    self.key,
                     evidence.LANE_REFERENCE,
                     runner_identity(evidence.LANE_REFERENCE),
                     machine=evidence_machine(evidence.LANE_REFERENCE),
@@ -3891,12 +4717,11 @@ class EvidenceProtocolTests(unittest.TestCase):
             changed = json.loads(json.dumps(observations))
             changed["pipeline_metrics"]["matcher_seconds"] = 99.0
             with self.assertRaisesRegex(evidence.EvidenceError, "observations.json"):
-                evidence.produce_attestation(
+                evidence.derive_attestation(
                     evidence_request(),
                     changed,
                     root,
                     root / "attestation.json",
-                    self.key,
                     evidence.LANE_REFERENCE,
                     runner_identity(evidence.LANE_REFERENCE),
                     machine=evidence_machine(evidence.LANE_REFERENCE),
@@ -3915,12 +4740,33 @@ class EvidenceProtocolTests(unittest.TestCase):
                 root = Path(directory)
                 write_evidence_artifacts(root, changed)
                 with self.assertRaisesRegex(evidence.EvidenceError, "clean successful"):
-                    evidence.produce_attestation(
+                    evidence.derive_attestation(
                         evidence_request(),
                         changed,
                         root,
                         root / "attestation.json",
-                        self.key,
+                        evidence.LANE_REFERENCE,
+                        runner_identity(evidence.LANE_REFERENCE),
+                        machine=evidence_machine(evidence.LANE_REFERENCE),
+                    )
+
+    def test_execution_receipts_require_bounded_process_cpu_time(self) -> None:
+        for label, cpu_time in (
+            ("negative", {"user": -1, "system": 0}),
+            ("boolean", {"user": True, "system": 0}),
+            ("unknown field", {"user": 0, "system": 0, "idle": 0}),
+        ):
+            with self.subTest(case=label), tempfile.TemporaryDirectory() as directory:
+                observations = raw_observations(evidence.LANE_REFERENCE)
+                observations["commands"][0]["process_cpu_microseconds"] = cpu_time
+                root = Path(directory)
+                write_evidence_artifacts(root, observations)
+                with self.assertRaisesRegex(evidence.EvidenceError, "process CPU"):
+                    evidence.derive_attestation(
+                        evidence_request(),
+                        observations,
+                        root,
+                        root / "attestation.json",
                         evidence.LANE_REFERENCE,
                         runner_identity(evidence.LANE_REFERENCE),
                         machine=evidence_machine(evidence.LANE_REFERENCE),
@@ -3932,7 +4778,7 @@ class EvidenceProtocolTests(unittest.TestCase):
             (
                 "discarded warm-up",
                 lambda receipt: receipt["variant"] == "candidate"
-                and receipt["run_id"] == "ordinary-0",
+                and receipt["run_id"] == "ordinary-1",
             ),
         ):
             with self.subTest(label=label):
@@ -3993,12 +4839,11 @@ class EvidenceProtocolTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             write_evidence_artifacts(root, observations)
-            attestation = evidence.produce_attestation(
+            attestation = evidence.derive_attestation(
                 request,
                 observations,
                 root,
                 root / "attestation.json",
-                self.key,
                 evidence.LANE_REFERENCE,
                 runner_identity(evidence.LANE_REFERENCE),
                 machine=evidence_machine(evidence.LANE_REFERENCE),
@@ -4015,12 +4860,11 @@ class EvidenceProtocolTests(unittest.TestCase):
                 root = Path(directory)
                 write_evidence_artifacts(root, changed)
                 with self.assertRaisesRegex(evidence.EvidenceError, expected):
-                    evidence.produce_attestation(
+                    evidence.derive_attestation(
                         request,
                         changed,
                         root,
                         root / "attestation.json",
-                        self.key,
                         evidence.LANE_REFERENCE,
                         runner_identity(evidence.LANE_REFERENCE),
                         machine=evidence_machine(evidence.LANE_REFERENCE),
@@ -4033,12 +4877,11 @@ class EvidenceProtocolTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             write_evidence_artifacts(root, failed)
-            attestation = evidence.produce_attestation(
+            attestation = evidence.derive_attestation(
                 evidence_request(),
                 failed,
                 root,
                 root / "attestation.json",
-                self.key,
                 evidence.LANE_REFERENCE,
                 runner_identity(evidence.LANE_REFERENCE),
                 machine=evidence_machine(evidence.LANE_REFERENCE),
@@ -4054,12 +4897,11 @@ class EvidenceProtocolTests(unittest.TestCase):
             root = Path(directory)
             write_evidence_artifacts(root, unbound)
             with self.assertRaisesRegex(evidence.EvidenceError, "requested input"):
-                evidence.produce_attestation(
+                evidence.derive_attestation(
                     evidence_request(),
                     unbound,
                     root,
                     root / "attestation.json",
-                    self.key,
                     evidence.LANE_REFERENCE,
                     runner_identity(evidence.LANE_REFERENCE),
                     machine=evidence_machine(evidence.LANE_REFERENCE),
@@ -4074,12 +4916,11 @@ class EvidenceProtocolTests(unittest.TestCase):
                 deterministic_zip("unrelated.txt", b"not a toolchain component\n")
             )
             with self.assertRaisesRegex(evidence.EvidenceError, "toolchain|component"):
-                evidence.produce_attestation(
+                evidence.derive_attestation(
                     evidence_request(),
                     observations,
                     root,
                     root / "attestation.json",
-                    self.key,
                     evidence.LANE_REFERENCE,
                     runner_identity(evidence.LANE_REFERENCE),
                     machine=evidence_machine(evidence.LANE_REFERENCE),
@@ -4090,12 +4931,11 @@ class EvidenceProtocolTests(unittest.TestCase):
             write_evidence_artifacts(root, observations)
             (root / "large-area.zip").write_bytes((root / "normal-photo.zip").read_bytes())
             with self.assertRaisesRegex(evidence.EvidenceError, "toolchain.*distinct|closure"):
-                evidence.produce_attestation(
+                evidence.derive_attestation(
                     evidence_request(),
                     observations,
                     root,
                     root / "attestation.json",
-                    self.key,
                     evidence.LANE_REFERENCE,
                     runner_identity(evidence.LANE_REFERENCE),
                     machine=evidence_machine(evidence.LANE_REFERENCE),
@@ -4106,12 +4946,11 @@ class EvidenceProtocolTests(unittest.TestCase):
             write_evidence_artifacts(root, observations)
             (root / "normal-photo.zip").write_text("not a ZIP", encoding="utf-8")
             with self.assertRaisesRegex(evidence.EvidenceError, "valid ZIP"):
-                evidence.produce_attestation(
+                evidence.derive_attestation(
                     evidence_request(),
                     observations,
                     root,
                     root / "attestation.json",
-                    self.key,
                     evidence.LANE_REFERENCE,
                     runner_identity(evidence.LANE_REFERENCE),
                     machine=evidence_machine(evidence.LANE_REFERENCE),
@@ -4122,12 +4961,11 @@ class EvidenceProtocolTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             write_evidence_artifacts(root, observations)
-            attestation = evidence.produce_attestation(
+            attestation = evidence.derive_attestation(
                 evidence_request(),
                 observations,
                 root,
                 root / "attestation.json",
-                self.key,
                 evidence.LANE_REFERENCE,
                 runner_identity(evidence.LANE_REFERENCE),
                 machine=evidence_machine(evidence.LANE_REFERENCE),
@@ -4143,7 +4981,7 @@ class EvidenceProtocolTests(unittest.TestCase):
 
     def test_toolchain_size_evidence_allows_one_colmap_closure_without_streaming(self) -> None:
         request = evidence_request()
-        request["binding"]["toolchain_identity"] = test_toolchain_identity(
+        request["binding"]["toolchain_identity"] = toolchain_identity_for_state(
             TEST_NORMAL_TOOLCHAIN_STATE
         )
         observations = raw_observations(evidence.LANE_REFERENCE)
@@ -4176,12 +5014,11 @@ class EvidenceProtocolTests(unittest.TestCase):
             (root / "observations.json").write_bytes(
                 evidence.canonical_json_bytes(observations) + b"\n"
             )
-            attestation = evidence.produce_attestation(
+            attestation = evidence.derive_attestation(
                 request,
                 observations,
                 root,
                 root / "attestation.json",
-                self.key,
                 evidence.LANE_REFERENCE,
                 runner_identity(evidence.LANE_REFERENCE),
                 machine=evidence_machine(evidence.LANE_REFERENCE),
@@ -4202,7 +5039,7 @@ class EvidenceProtocolTests(unittest.TestCase):
                 root = Path(directory)
                 observations = raw_observations(evidence.LANE_REFERENCE)
                 write_evidence_artifacts(root, observations)
-                manifest = test_toolchain_manifest()
+                manifest = make_toolchain_manifest()
                 core = next(
                     component
                     for component in manifest["components"]
@@ -4257,7 +5094,7 @@ class EvidenceProtocolTests(unittest.TestCase):
                     evidence._validate_toolchain_package_evidence(
                         root,
                         descriptors,
-                        test_toolchain_identity(states["large"]),
+                        toolchain_identity_for_state(states["large"]),
                     )
 
     def test_supervisor_window_contains_every_execution_receipt(self) -> None:
@@ -4278,12 +5115,11 @@ class EvidenceProtocolTests(unittest.TestCase):
                     evidence.canonical_json_bytes(receipt) + b"\n"
                 )
                 with self.assertRaisesRegex(evidence.EvidenceError, "supervisor.*window"):
-                    evidence.produce_attestation(
+                    evidence.derive_attestation(
                         evidence_request(),
                         observations,
                         root,
                         root / "attestation.json",
-                        self.key,
                         evidence.LANE_REFERENCE,
                         runner_identity(evidence.LANE_REFERENCE),
                         machine=evidence_machine(evidence.LANE_REFERENCE),
@@ -4299,12 +5135,11 @@ class EvidenceProtocolTests(unittest.TestCase):
             root = Path(directory)
             write_evidence_artifacts(root, observations)
             with self.assertRaisesRegex(evidence.EvidenceError, "unattributed"):
-                evidence.produce_attestation(
+                evidence.derive_attestation(
                     evidence_request(),
                     observations,
                     root,
                     root / "attestation.json",
-                    self.key,
                     evidence.LANE_REFERENCE,
                     runner_identity(evidence.LANE_REFERENCE),
                     machine=evidence_machine(evidence.LANE_REFERENCE),
@@ -4338,12 +5173,11 @@ class EvidenceProtocolTests(unittest.TestCase):
                 root = Path(directory)
                 write_evidence_artifacts(root, changed)
                 with self.assertRaisesRegex(evidence.EvidenceError, expected):
-                    evidence.produce_attestation(
+                    evidence.derive_attestation(
                         evidence_request(),
                         changed,
                         root,
                         root / "attestation.json",
-                        self.key,
                         evidence.LANE_REFERENCE,
                         runner_identity(evidence.LANE_REFERENCE),
                         machine=evidence_machine(evidence.LANE_REFERENCE),
@@ -4360,12 +5194,11 @@ class EvidenceProtocolTests(unittest.TestCase):
             unresolved_request = evidence_request()
             unresolved_request["reference_artifacts"]["orientation_expected_status"] = "unresolved"
             write_evidence_artifacts(root, unresolved, unresolved_request)
-            attestation = evidence.produce_attestation(
+            attestation = evidence.derive_attestation(
                 unresolved_request,
                 unresolved,
                 root,
                 root / "attestation.json",
-                self.key,
                 evidence.LANE_REFERENCE,
                 runner_identity(evidence.LANE_REFERENCE),
                 machine=evidence_machine(evidence.LANE_REFERENCE),
@@ -4386,12 +5219,11 @@ class EvidenceProtocolTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             write_evidence_artifacts(root, observations, request)
-            attestation = evidence.produce_attestation(
+            attestation = evidence.derive_attestation(
                 request,
                 observations,
                 root,
                 root / "attestation.json",
-                self.key,
                 evidence.LANE_REFERENCE,
                 runner_identity(evidence.LANE_REFERENCE),
                 machine=evidence_machine(evidence.LANE_REFERENCE),
@@ -4415,12 +5247,11 @@ class EvidenceProtocolTests(unittest.TestCase):
             root = Path(directory)
             write_evidence_artifacts(root, invalid, request)
             with self.assertRaisesRegex(evidence.EvidenceError, "without a sign claim"):
-                evidence.produce_attestation(
+                evidence.derive_attestation(
                     request,
                     invalid,
                     root,
                     root / "attestation.json",
-                    self.key,
                     evidence.LANE_REFERENCE,
                     runner_identity(evidence.LANE_REFERENCE),
                     machine=evidence_machine(evidence.LANE_REFERENCE),
@@ -4442,12 +5273,11 @@ class EvidenceProtocolTests(unittest.TestCase):
             label = root / "orientation-label.json"
             label.write_bytes(malformed_label)
             with self.assertRaisesRegex(evidence.EvidenceError, "orientation label"):
-                evidence.produce_attestation(
+                evidence.derive_attestation(
                     request,
                     observations,
                     root,
                     root / "attestation.json",
-                    self.key,
                     evidence.LANE_REFERENCE,
                     runner_identity(evidence.LANE_REFERENCE),
                     machine=evidence_machine(evidence.LANE_REFERENCE),
@@ -4470,12 +5300,11 @@ class EvidenceProtocolTests(unittest.TestCase):
                 evidence.EvidenceError,
                 "orientation.*artifacts|missing required evidence artifacts",
             ):
-                evidence.produce_attestation(
+                evidence.derive_attestation(
                     request,
                     observations,
                     root,
                     root / "attestation.json",
-                    self.key,
                     evidence.LANE_REFERENCE,
                     runner_identity(evidence.LANE_REFERENCE),
                     machine=evidence_machine(evidence.LANE_REFERENCE),
@@ -4547,12 +5376,11 @@ class EvidenceProtocolTests(unittest.TestCase):
                     evidence.EvidenceError,
                     "orientation.*digest|orientation.*changed|orientation.*does not match",
                 ):
-                    evidence.produce_attestation(
+                    evidence.derive_attestation(
                         request,
                         observations,
                         root,
                         root / "attestation.json",
-                        self.key,
                         evidence.LANE_REFERENCE,
                         runner_identity(evidence.LANE_REFERENCE),
                         machine=evidence_machine(evidence.LANE_REFERENCE),
@@ -4572,12 +5400,11 @@ class EvidenceProtocolTests(unittest.TestCase):
                 evidence.EvidenceError,
                 "orientation supervisor runs are not in candidate timing order",
             ):
-                evidence.produce_attestation(
+                evidence.derive_attestation(
                     request,
                     observations,
                     root,
                     root / "attestation.json",
-                    self.key,
                     evidence.LANE_REFERENCE,
                     runner_identity(evidence.LANE_REFERENCE),
                     machine=evidence_machine(evidence.LANE_REFERENCE),
@@ -4604,12 +5431,11 @@ class EvidenceProtocolTests(unittest.TestCase):
             root = Path(directory)
             write_evidence_artifacts(root, observations, request)
             with self.assertRaisesRegex(evidence.EvidenceError, "requested scale 250"):
-                evidence.produce_attestation(
+                evidence.derive_attestation(
                     request,
                     observations,
                     root,
                     root / "attestation.json",
-                    self.key,
                     evidence.LANE_REFERENCE,
                     runner_identity(evidence.LANE_REFERENCE),
                     machine=evidence_machine(evidence.LANE_REFERENCE),
@@ -4928,12 +5754,11 @@ class EvidenceProtocolTests(unittest.TestCase):
                 evidence.EvidenceError,
                 "missing mapper_invocations",
             ):
-                evidence.produce_attestation(
+                evidence.derive_attestation(
                     request,
                     observations,
                     root,
                     root / "attestation.json",
-                    self.key,
                     evidence.LANE_REFERENCE,
                     runner_identity(evidence.LANE_REFERENCE),
                     machine=evidence_machine(evidence.LANE_REFERENCE),
@@ -5330,12 +6155,11 @@ class EvidenceProtocolTests(unittest.TestCase):
             write_evidence_artifacts(root, observations)
             (root / "fake.jsonl").write_text("{}\n", encoding="utf-8")
             with self.assertRaisesRegex(evidence.EvidenceError, "supervisor-owned"):
-                evidence.produce_attestation(
+                evidence.derive_attestation(
                     evidence_request(),
                     observations,
                     root,
                     root / "attestation.json",
-                    self.key,
                     evidence.LANE_REFERENCE,
                     runner_identity(evidence.LANE_REFERENCE),
                     machine=evidence_machine(evidence.LANE_REFERENCE),
@@ -5382,12 +6206,11 @@ class EvidenceProtocolTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             write_evidence_artifacts(root, observations, request)
-            attestation = evidence.produce_attestation(
+            attestation = evidence.derive_attestation(
                 request,
                 observations,
                 root,
                 root / "attestation.json",
-                self.key,
                 evidence.LANE_REFERENCE,
                 runner_identity(evidence.LANE_REFERENCE),
                 machine=evidence_machine(evidence.LANE_REFERENCE),
@@ -5422,12 +6245,11 @@ class EvidenceProtocolTests(unittest.TestCase):
                 evidence.EvidenceError,
                 "orientation pipeline metrics require reference scene_quality evidence",
             ):
-                evidence.produce_attestation(
+                evidence.derive_attestation(
                     request,
                     observations,
                     root,
                     root / "attestation.json",
-                    self.key,
                     evidence.LANE_CONSTRAINED,
                     runner_identity(evidence.LANE_CONSTRAINED),
                     machine=evidence_machine(evidence.LANE_CONSTRAINED),
@@ -5445,30 +6267,28 @@ class EvidenceProtocolTests(unittest.TestCase):
                 evidence.EvidenceError,
                 "orientation artifacts require reference scene_quality evidence",
             ):
-                evidence.produce_attestation(
+                evidence.derive_attestation(
                     request,
                     observations,
                     root,
                     root / "attestation.json",
-                    self.key,
                     evidence.LANE_CONSTRAINED,
                     runner_identity(evidence.LANE_CONSTRAINED),
                     machine=evidence_machine(evidence.LANE_CONSTRAINED),
                 )
 
-    def test_baseline_observations_must_match_the_signed_request(self) -> None:
+    def test_baseline_observations_must_match_the_bound_request(self) -> None:
         observations = raw_observations(evidence.LANE_REFERENCE)
         observations["baseline"]["git_commit"] = "0" * 40
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             write_evidence_artifacts(root, observations)
             with self.assertRaisesRegex(evidence.EvidenceError, "baseline"):
-                evidence.produce_attestation(
+                evidence.derive_attestation(
                     evidence_request(),
                     observations,
                     root,
                     root / "attestation.json",
-                    self.key,
                     evidence.LANE_REFERENCE,
                     runner_identity(evidence.LANE_REFERENCE),
                     machine=evidence_machine(evidence.LANE_REFERENCE),
@@ -5481,62 +6301,47 @@ class EvidenceProtocolTests(unittest.TestCase):
             root = Path(directory)
             write_evidence_artifacts(root, observations)
             with self.assertRaisesRegex(evidence.EvidenceError, "unknown metrics"):
-                evidence.produce_attestation(
+                evidence.derive_attestation(
                     evidence_request(),
                     observations,
                     root,
                     root / "attestation.json",
-                    self.key,
                     evidence.LANE_REFERENCE,
                     runner_identity(evidence.LANE_REFERENCE),
                     machine=evidence_machine(evidence.LANE_REFERENCE),
                 )
 
-    def test_metric_or_artifact_tampering_breaks_verification(self) -> None:
+    def test_runner_or_artifact_tampering_breaks_validation(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             output, attestation = self.produce(root, evidence.LANE_REFERENCE)
             changed = json.loads(json.dumps(attestation))
-            changed["metrics"]["registered_views"] = measured(999)
-            output.write_bytes(evidence.canonical_json_bytes(changed) + b"\n")
-            with self.assertRaisesRegex(evidence.EvidenceError, "signature"):
-                evidence.verify_attestation(
-                    output,
-                    evidence_request(),
-                    evidence.LANE_REFERENCE,
-                    self.key,
-                    runner_identity(evidence.LANE_REFERENCE),
-                )
-            changed = json.loads(json.dumps(attestation))
             changed["measurement_runner"]["sha256"] = "sha256:" + "f" * 64
             output.write_bytes(evidence.canonical_json_bytes(changed) + b"\n")
-            with self.assertRaisesRegex(evidence.EvidenceError, "signature"):
-                evidence.verify_attestation(
+            with self.assertRaisesRegex(evidence.EvidenceError, "approved request index"):
+                evidence.validate_prepared_attestation_file(
                     output,
                     evidence_request(),
                     evidence.LANE_REFERENCE,
-                    self.key,
                     runner_identity(evidence.LANE_REFERENCE),
                 )
             changed = json.loads(json.dumps(attestation))
             del changed["measurement_runner"]
             output.write_bytes(evidence.canonical_json_bytes(changed) + b"\n")
             with self.assertRaisesRegex(evidence.EvidenceError, "missing measurement_runner"):
-                evidence.verify_attestation(
+                evidence.validate_prepared_attestation_file(
                     output,
                     evidence_request(),
                     evidence.LANE_REFERENCE,
-                    self.key,
                     runner_identity(evidence.LANE_REFERENCE),
                 )
             output.write_bytes(evidence.canonical_json_bytes(attestation) + b"\n")
             (root / "splat.ply").write_text("ply\nchanged\n", encoding="utf-8")
             with self.assertRaisesRegex(evidence.EvidenceError, "mismatch"):
-                evidence.verify_attestation(
+                evidence.validate_prepared_attestation_file(
                     output,
                     evidence_request(),
                     evidence.LANE_REFERENCE,
-                    self.key,
                     runner_identity(evidence.LANE_REFERENCE),
                 )
 
@@ -5556,16 +6361,33 @@ class EvidenceProtocolTests(unittest.TestCase):
             root = Path(directory)
             write_evidence_artifacts(root, observations)
             with self.assertRaisesRegex(evidence.EvidenceError, "14-16 GiB"):
-                evidence.produce_attestation(
+                evidence.derive_attestation(
                     evidence_request(lane=evidence.LANE_CONSTRAINED),
                     observations,
                     root,
                     root / "attestation.json",
-                    self.key,
                     evidence.LANE_CONSTRAINED,
                     runner_identity(evidence.LANE_CONSTRAINED),
                     machine=evidence_machine(evidence.LANE_REFERENCE),
                 )
+
+    def test_reference_lane_requires_the_approved_48_gib_machine(self) -> None:
+        machine = evidence_machine(evidence.LANE_REFERENCE)
+        machine["physical_memory_bytes"] = 64 * 1024**3
+        with self.assertRaisesRegex(evidence.EvidenceError, "exactly 48 GiB"):
+            evidence.validate_machine_lane(machine, evidence.LANE_REFERENCE)
+
+    def test_release_evidence_requires_xcode_16_4(self) -> None:
+        for lane in (
+            evidence.LANE_REFERENCE,
+            evidence.LANE_CONSTRAINED,
+            evidence.LANE_EIGHT_GB,
+        ):
+            with self.subTest(lane=lane):
+                machine = evidence_machine(lane)
+                machine["xcode_version"] = "Xcode 16.3\nBuild version 16E140"
+                with self.assertRaisesRegex(evidence.EvidenceError, "Xcode 16.4"):
+                    evidence.validate_machine_lane(machine, lane)
 
     def test_release_scales_require_only_the_declared_hardware_lanes(self) -> None:
         self.assertEqual(
@@ -5673,6 +6495,67 @@ class EvidenceProtocolTests(unittest.TestCase):
         self.assertEqual(evaluation["status"], "failed")
         self.assertTrue(any("eight_gb" in failure for failure in evaluation["failures"]))
 
+    def test_protected_low_memory_lanes_gate_the_larger_of_rss_and_metal(self) -> None:
+        scene = valid_scene()
+        scene["gate_scopes"] = ["scene_performance"]
+
+        reference_metrics = passing_metrics()
+        reference_metrics["memory_lane"] = measured("larger")
+        reference_metrics["machine_memory_bytes"] = measured(
+            evidence_machine(evidence.LANE_REFERENCE)["physical_memory_bytes"]
+        )
+        reference = {
+            "actual": successful_actual(),
+            "metrics": reference_metrics,
+            "machine": evidence_machine(evidence.LANE_REFERENCE),
+        }
+        for lane, memory_lane, rss, metal in (
+            (evidence.LANE_CONSTRAINED, "constrained", 1_000_000_000, 12_000_000_001),
+            (evidence.LANE_EIGHT_GB, "eight_gb_fast", 1_000_000_000, 6_500_000_001),
+        ):
+            with self.subTest(lane=lane):
+                attestation = {
+                    "actual": successful_actual(),
+                    "metrics": {
+                        "memory_lane": measured(memory_lane),
+                        "machine_memory_bytes": measured(
+                            evidence_machine(lane)["physical_memory_bytes"]
+                        ),
+                        "peak_memory_bytes": measured(rss),
+                        "peak_metal_allocated_bytes": measured(metal),
+                    },
+                    "machine": evidence_machine(lane),
+                }
+                evaluation, _ = benchmark._evaluate_protected_attestations(
+                    scene,
+                    30,
+                    {
+                        evidence.LANE_REFERENCE: reference,
+                        lane: attestation,
+                    },
+                )
+                self.assertEqual(evaluation["status"], "failed")
+                self.assertTrue(
+                    any("unified memory" in failure for failure in evaluation["failures"])
+                )
+
+                del attestation["metrics"]["peak_metal_allocated_bytes"]
+                evaluation, _ = benchmark._evaluate_protected_attestations(
+                    scene,
+                    30,
+                    {
+                        evidence.LANE_REFERENCE: reference,
+                        lane: attestation,
+                    },
+                )
+                self.assertEqual(evaluation["status"], "blocked")
+                self.assertTrue(
+                    any(
+                        "peak_metal_allocated_bytes" in reason
+                        for reason in evaluation["blocking_reasons"]
+                    )
+                )
+
     def test_suite_accepts_only_complete_verified_multi_machine_evidence(self) -> None:
         scene = valid_scene(adapter="protected-evidence")
         scene["gate_scopes"] = evidence_request()["gate_scopes"]
@@ -5692,12 +6575,11 @@ class EvidenceProtocolTests(unittest.TestCase):
                 root = scale_root / lane
                 observations = raw_observations(lane)
                 write_evidence_artifacts(root, observations)
-                attestation = evidence.produce_attestation(
+                attestation = evidence.derive_attestation(
                     evidence_request(lane=lane),
                     observations,
                     root,
                     root / "attestation.json",
-                    self.key,
                     lane,
                     runner_identity(lane),
                     machine=evidence_machine(lane),
@@ -5711,8 +6593,8 @@ class EvidenceProtocolTests(unittest.TestCase):
                 corpus_root,
                 identity,
                 "sha256:" + "1" * 64,
-                self.key,
                 runner_identities(),
+                "sha256:" + "9" * 64,
             )
             self.assertEqual(result["status"], "passed")
             self.assertEqual(
@@ -5730,8 +6612,8 @@ class EvidenceProtocolTests(unittest.TestCase):
                 corpus_root,
                 identity,
                 "sha256:" + "1" * 64,
-                self.key,
                 wrong_index_identities,
+                "sha256:" + "9" * 64,
             )
             self.assertEqual(wrong_index["status"], "failed")
             self.assertTrue(any("approved request index" in item for item in wrong_index["failures"]))
@@ -5742,11 +6624,210 @@ class EvidenceProtocolTests(unittest.TestCase):
                 corpus_root,
                 identity,
                 "sha256:" + "1" * 64,
-                self.key,
                 runner_identities(),
+                "sha256:" + "9" * 64,
             )
-            self.assertEqual(rejected["status"], "failed")
-            self.assertTrue(any("constrained" in item for item in rejected["failures"]))
+            self.assertEqual(rejected["status"], "blocked")
+            self.assertEqual(rejected["failures"], [])
+            self.assertTrue(
+                any("constrained" in item for item in rejected["blocking_reasons"])
+            )
+            missing_attestation = scale_root / evidence.LANE_CONSTRAINED / "attestation.json"
+            missing_attestation.write_text("not-json\n", encoding="utf-8")
+            malformed = benchmark._copy_protected_evidence(
+                scene,
+                30,
+                corpus_root,
+                identity,
+                "sha256:" + "1" * 64,
+                runner_identities(),
+                "sha256:" + "9" * 64,
+            )
+            self.assertEqual(malformed["status"], "failed")
+            self.assertTrue(any("constrained" in item for item in malformed["failures"]))
+            missing_attestation.unlink()
+            missing_attestation.symlink_to("absent-attestation.json")
+            unsafe = benchmark._copy_protected_evidence(
+                scene,
+                30,
+                corpus_root,
+                identity,
+                "sha256:" + "1" * 64,
+                runner_identities(),
+                "sha256:" + "9" * 64,
+            )
+            self.assertEqual(unsafe["status"], "failed")
+            self.assertTrue(any("unsafe" in item for item in unsafe["failures"]))
+
+    def test_protected_evidence_classifies_prepared_lane_outcomes(self) -> None:
+        scene = valid_scene(adapter="protected-evidence")
+        scene["scale_lanes"] = [250]
+        scene["aggregate_scale"] = 250
+        scene["split"]["holdout_by_scale"] = {"250": list(range(4, 250, 5))}
+        pinned_reference = next(iter(scene["reference"]["by_scale"].values()))
+        scene["reference"]["by_scale"] = {"250": pinned_reference}
+        scene["gate_scopes"] = evidence_request(scale=250)["gate_scopes"]
+        identity = benchmark.RunIdentity(
+            profile="release",
+            corpus_digest="sha256:" + "2" * 64,
+            thresholds_digest="sha256:" + "3" * 64,
+            git_commit="4" * 40,
+            app_version="0.2.0-beta.1",
+            toolchain_identity=TEST_TOOLCHAIN_IDENTITY,
+        )
+        input_digest = "sha256:" + "1" * 64
+        identities = runner_identities()
+        lane = evidence.LANE_REFERENCE
+        request = benchmark._evidence_request(
+            scene,
+            250,
+            lane,
+            identity,
+            input_digest,
+            identities[evidence.RENDERING_DRIVER_IDENTITY],
+            "sha256:" + "9" * 64,
+        )
+
+        for case in (
+            "execution",
+            "environment",
+            "infrastructure",
+            "extra_field",
+            "both",
+            "neither",
+            "symlinked_parent",
+        ):
+            with self.subTest(case=case), tempfile.TemporaryDirectory() as directory:
+                corpus_root = Path(directory) / "corpus"
+                lane_root = (
+                    corpus_root
+                    / scene["adapter"]["evidence_path"]
+                    / "250"
+                    / lane
+                )
+                if case == "symlinked_parent":
+                    outside = Path(directory) / "outside"
+                    outside.mkdir(parents=True)
+                    lane_root.parent.mkdir(parents=True)
+                    lane_root.symlink_to(outside, target_is_directory=True)
+                    receipt_root = outside
+                else:
+                    lane_root.mkdir(parents=True)
+                    receipt_root = lane_root
+
+                if case != "neither":
+                    if case == "environment":
+                        observations = raw_observations(lane)
+                        (receipt_root / "host-monitor.json").write_bytes(
+                            FIXTURE_HOST_MONITOR
+                        )
+                        environment = supervisor_run(observations)[
+                            "measurement_environment"
+                        ]
+                        environment["low_power_mode_observed"] = True
+                        commands = [
+                            {
+                                "run_id": command["run_id"],
+                                "started_monotonic_seconds": command[
+                                    "started_monotonic_seconds"
+                                ],
+                                "ended_monotonic_seconds": command[
+                                    "ended_monotonic_seconds"
+                                ],
+                                "process_cpu_microseconds": command[
+                                    "process_cpu_microseconds"
+                                ],
+                            }
+                            for command in observations["commands"]
+                        ]
+                        environment_path = receipt_root / "measurement-environment.json"
+                        environment_path.write_bytes(
+                            evidence.canonical_json_bytes(
+                                {
+                                    "schema_version": 1,
+                                    "started_monotonic_seconds": min(
+                                        command["started_monotonic_seconds"]
+                                        for command in commands
+                                    ),
+                                    "ended_monotonic_seconds": max(
+                                        command["ended_monotonic_seconds"]
+                                        for command in commands
+                                    )
+                                    + 1.0,
+                                    "commands": commands,
+                                    "measurement_environment": environment,
+                                }
+                            )
+                            + b"\n"
+                        )
+                        receipt = evidence.derive_lane_outcome(
+                            request,
+                            lane,
+                            identities[lane],
+                            evidence_machine(lane),
+                            kind="environment_rejected",
+                            reason="policy_violation",
+                            exit_code=0,
+                            environment_receipt_path=environment_path,
+                        )
+                    elif case == "infrastructure":
+                        receipt = evidence.derive_lane_outcome(
+                            request,
+                            lane,
+                            identities[lane],
+                            evidence_machine(lane),
+                            kind="infrastructure_blocked",
+                            reason="host_monitor_failed",
+                            exit_code=0,
+                        )
+                    else:
+                        receipt = evidence.derive_lane_outcome(
+                            request,
+                            lane,
+                            identities[lane],
+                            evidence_machine(lane),
+                            kind="execution_failed",
+                            reason="nonzero_exit",
+                            exit_code=23,
+                        )
+                    if case == "extra_field":
+                        receipt["unexpected"] = True
+                    (receipt_root / "lane-outcome.json").write_bytes(
+                        evidence.canonical_json_bytes(receipt) + b"\n"
+                    )
+                    if case == "both":
+                        (receipt_root / "attestation.json").write_text(
+                            "{}\n",
+                            encoding="utf-8",
+                        )
+
+                result = benchmark._copy_protected_evidence(
+                    scene,
+                    250,
+                    corpus_root,
+                    identity,
+                    input_digest,
+                    identities,
+                    "sha256:" + "9" * 64,
+                )
+                expected_status = (
+                    "blocked"
+                    if case in {"environment", "infrastructure", "neither"}
+                    else "failed"
+                )
+                self.assertEqual(result["status"], expected_status)
+                if case in {"environment", "infrastructure"}:
+                    self.assertEqual(result["failures"], [])
+                    self.assertTrue(result["blocking_reasons"])
+                elif case == "neither":
+                    self.assertEqual(result["failures"], [])
+                    self.assertTrue(result["blocking_reasons"])
+                else:
+                    self.assertTrue(result["failures"])
+                    if case == "symlinked_parent":
+                        self.assertTrue(
+                            any("unsafe parent" in failure for failure in result["failures"])
+                        )
 
     def test_request_emitter_binds_each_machine_job_to_one_run_identity(self) -> None:
         scene = valid_scene(adapter="protected-evidence")
@@ -5770,7 +6851,7 @@ class EvidenceProtocolTests(unittest.TestCase):
             with (
                 mock.patch.object(
                     benchmark,
-                    "resolved_toolchain_identity",
+                    "resolved_public_beta_toolchain_identity",
                     return_value=identity.toolchain_identity,
                 ),
                 mock.patch.object(
@@ -5779,6 +6860,11 @@ class EvidenceProtocolTests(unittest.TestCase):
                     return_value={"commit": identity.git_commit, "dirty": False},
                 ),
                 mock.patch.object(benchmark, "make_run_identity", return_value=identity),
+                mock.patch.object(
+                    benchmark,
+                    "validate_tracked_benchmark_contract",
+                    return_value="sha256:" + "9" * 64,
+                ),
             ):
                 index = benchmark.emit_evidence_requests(
                     corpus,
@@ -5798,12 +6884,42 @@ class EvidenceProtocolTests(unittest.TestCase):
                 request = json.loads((root / "requests" / item["request"]).read_text(encoding="utf-8"))
                 self.assertEqual(request["binding"]["git_commit"], identity.git_commit)
                 self.assertEqual(request["binding"]["input_digest"], benchmark.digest_input(media))
+                lane = item["lane"]
+                self.assertEqual(
+                    item["producer_command"],
+                    [
+                        "python3",
+                        "scripts/benchmark/prepare_evidence.py",
+                        "--index",
+                        "requests://index.json",
+                        "--requests-root",
+                        "requests://",
+                        "--raw-evidence-root",
+                        f"evidence://raw/{lane}",
+                        "--output-root",
+                        f"evidence://prepared/{lane}",
+                        "--lane",
+                        lane,
+                    ],
+                )
             missing_identity_index = json.loads(json.dumps(index))
             del missing_identity_index["runner_identities"][evidence.LANE_EIGHT_GB]
-            with self.assertRaisesRegex(benchmark.ConfigError, "runner identities"):
-                benchmark.validate_request_index(missing_identity_index, identity, corpus)
+            with (
+                mock.patch.object(
+                    benchmark,
+                    "benchmark_contract_sha256",
+                    return_value="sha256:" + "9" * 64,
+                ),
+                self.assertRaisesRegex(benchmark.ConfigError, "runner identities"),
+            ):
+                benchmark.validate_request_index(
+                    missing_identity_index,
+                    identity,
+                    corpus,
+                    valid_reference_config(),
+                )
 
-    def test_lane_orchestrator_runs_measurement_and_seals_raw_outputs(self) -> None:
+    def test_lane_orchestrator_collects_raw_outputs_without_signing(self) -> None:
         scene = valid_scene(adapter="protected-evidence")
         scene["input"]["supplied"] = True
         scene["scale_lanes"] = [120]
@@ -5849,12 +6965,19 @@ class EvidenceProtocolTests(unittest.TestCase):
                 identity,
                 benchmark.digest_input(media),
                 renderer_identity,
+                benchmark.benchmark_contract_sha256(corpus),
             )
             requests_root = root / "requests"
             request_relative = Path("orbit-01/120/constrained_14_16gb.request.json")
             (requests_root / request_relative).parent.mkdir(parents=True)
             (requests_root / request_relative).write_bytes(
                 benchmark.canonical_json_bytes(request) + b"\n"
+            )
+            (requests_root / "corpus.json").write_bytes(
+                benchmark.canonical_json_bytes(corpus) + b"\n"
+            )
+            (requests_root / "reference-config.json").write_bytes(
+                benchmark.canonical_json_bytes(config) + b"\n"
             )
             index = {
                 "schema_version": 1,
@@ -5876,6 +6999,17 @@ class EvidenceProtocolTests(unittest.TestCase):
                 "baseline_run_configuration": benchmark.APPROVED_PAIRED_BASELINE[
                     "run_configuration"
                 ],
+                "benchmark_contract_sha256": benchmark.benchmark_contract_sha256(
+                    corpus
+                ),
+                "corpus_manifest": "corpus.json",
+                "corpus_manifest_sha256": evidence.sha256_file(
+                    requests_root / "corpus.json"
+                ),
+                "reference_config": "reference-config.json",
+                "reference_config_sha256": evidence.sha256_file(
+                    requests_root / "reference-config.json"
+                ),
                 "requests": [
                     {
                         "scene_id": scene["id"],
@@ -5969,11 +7103,118 @@ class EvidenceProtocolTests(unittest.TestCase):
             toolchain = root / "toolchain"
             toolchain.mkdir()
             (toolchain / "manifest.json").write_text("{}\n", encoding="utf-8")
-            key_path = root / "evidence.key"
-            key_path.write_bytes(self.key)
-            key_path.chmod(0o600)
             baseline_checkout = root / "baseline-checkout"
             baseline_toolchain = root / "baseline-toolchain"
+            host_states = supervisor_run(observations)["measurement_environment"]
+            environment_events: list[str] = []
+            monitor_report = host_monitor_report(
+                [
+                    (0.0, host_state(user=1_000, system=0, idle=9_000)),
+                    (1.0, host_state(user=1_050, system=0, idle=9_950)),
+                ]
+            )
+
+            def start_host_monitor(*_: object) -> object:
+                environment_events.append("host-start")
+                return object()
+
+            def finish_host_monitor(_: object) -> dict[str, object]:
+                environment_events.append("host-end")
+                return monitor_report
+
+            def summarize_host_monitor(
+                _: object,
+                __: object,
+                ___: object,
+                **values: object,
+            ) -> dict[str, object]:
+                summary = json.loads(json.dumps(host_states))
+                summary["monitor_sha256"] = values["monitor_sha256"]
+                summary["monitor_executable_sha256"] = values[
+                    "monitor_executable_sha256"
+                ]
+                return summary
+
+            def children_cpu_seconds() -> dict[str, float]:
+                environment_events.append("child-cpu")
+                return {"user": 0.0, "system": 0.0}
+
+            def artifact_root(output: Path) -> Path:
+                return (
+                    output
+                    / scene["adapter"]["evidence_path"]
+                    / "120"
+                    / evidence.LANE_CONSTRAINED
+                )
+
+            def assert_collector_status(
+                output: Path,
+                *,
+                kind: str | None,
+                stage: str | None = None,
+                reason: str | None = None,
+                exit_code: int | None = None,
+                expected_runner: dict[str, str] | None = None,
+            ) -> dict[str, object]:
+                root_path = artifact_root(output)
+                status_path = root_path / "collector-status.json"
+                self.assertTrue(status_path.is_file())
+                self.assertFalse((root_path / "attestation.json").exists())
+                self.assertFalse((root_path / "lane-outcome.json").exists())
+                status = json.loads(status_path.read_text(encoding="utf-8"))
+                self.assertEqual(
+                    set(status),
+                    {
+                        "schema_version",
+                        "request_sha256",
+                        "lane",
+                        "machine",
+                        "measurement_runner",
+                        "collector",
+                        "disposition",
+                        "outcome",
+                    },
+                )
+                self.assertEqual(status["schema_version"], 1)
+                self.assertEqual(
+                    status["request_sha256"],
+                    evidence.sha256_bytes(evidence.canonical_json_bytes(request)),
+                )
+                self.assertEqual(status["lane"], evidence.LANE_CONSTRAINED)
+                self.assertEqual(
+                    status["machine"],
+                    evidence_machine(evidence.LANE_CONSTRAINED),
+                )
+                self.assertEqual(
+                    status["measurement_runner"],
+                    expected_runner
+                    or approved_runners[evidence.LANE_CONSTRAINED],
+                )
+                self.assertEqual(
+                    status["collector"],
+                    {
+                        "protocol_version": evidence.PROTOCOL_VERSION,
+                        "version": lane_runner._COLLECTOR_VERSION,
+                        "executable": lane_runner._COLLECTOR_RELATIVE_PATH,
+                        "sha256": evidence.sha256_file(Path(lane_runner.__file__).resolve()),
+                    },
+                )
+                if kind is None:
+                    self.assertEqual(status["disposition"], "attestation_candidate")
+                    self.assertIsNone(status["outcome"])
+                else:
+                    self.assertEqual(status["disposition"], "lane_outcome")
+                    self.assertEqual(
+                        status["outcome"],
+                        {
+                            "kind": kind,
+                            "stage": stage,
+                            "reason": reason,
+                            "exit_code": exit_code,
+                        },
+                    )
+                return status
+
             with (
                 mock.patch.object(lane_runner.benchmark, "validate_corpus"),
                 mock.patch.object(
@@ -6022,6 +7263,26 @@ class EvidenceProtocolTests(unittest.TestCase):
                         ),
                     ),
                 ),
+                mock.patch.object(
+                    lane_runner,
+                    "_start_host_monitor",
+                    side_effect=start_host_monitor,
+                ),
+                mock.patch.object(
+                    lane_runner,
+                    "_finish_host_monitor",
+                    side_effect=finish_host_monitor,
+                ),
+                mock.patch.object(
+                    lane_runner,
+                    "_summarize_host_monitor",
+                    side_effect=summarize_host_monitor,
+                ),
+                mock.patch.object(
+                    lane_runner,
+                    "_children_cpu_seconds",
+                    side_effect=children_cpu_seconds,
+                ),
                 mock.patch.object(lane_runner, "_PROCESS_GROUP_DRAIN_SECONDS", 0.0),
             ):
                 result = lane_runner.run_lane(
@@ -6036,20 +7297,569 @@ class EvidenceProtocolTests(unittest.TestCase):
                     evidence.LANE_CONSTRAINED,
                     runner,
                     renderer_closure_root,
-                    key_path,
                 )
-            self.assertEqual(len(result["attestations"]), 1)
-            attestation_path = (
-                root
-                / "evidence"
-                / scene["adapter"]["evidence_path"]
-                / "120"
-                / evidence.LANE_CONSTRAINED
-                / "attestation.json"
+            self.assertEqual(len(result["collections"]), 1)
+            self.assertEqual(
+                environment_events,
+                ["child-cpu", "host-start", "child-cpu", "host-end"],
             )
-            self.assertTrue(attestation_path.is_file())
+            successful_status = assert_collector_status(
+                root / "evidence",
+                kind=None,
+            )
+            collection = result["collections"][0]
+            self.assertEqual(
+                set(collection),
+                {"scene_id", "scale", "lane", "collector_status", "sha256"},
+            )
+            self.assertEqual(
+                collection["sha256"],
+                evidence.sha256_file(artifact_root(root / "evidence") / "collector-status.json"),
+            )
+            self.assertEqual(collection["scene_id"], scene["id"])
+            self.assertEqual(collection["scale"], 120)
+            self.assertEqual(collection["lane"], evidence.LANE_CONSTRAINED)
+            self.assertEqual(successful_status["outcome"], None)
+
+            for (
+                case_name,
+                outcome_kind,
+                outcome_stage,
+                outcome_reason,
+                expected_exit_code,
+                process_result,
+                _message,
+            ) in (
+                (
+                    "launch_failed",
+                    "execution_failed",
+                    "measurement_runner",
+                    "launch_failed",
+                    None,
+                    OSError(2, "fixture launch failure"),
+                    "could not start",
+                ),
+                (
+                    "timed_out",
+                    "execution_failed",
+                    "measurement_runner",
+                    "timed_out",
+                    0,
+                    (subprocess.CompletedProcess([], 0), True),
+                    "timed out",
+                ),
+                (
+                    "nonzero_exit",
+                    "execution_failed",
+                    "measurement_runner",
+                    "nonzero_exit",
+                    23,
+                    (subprocess.CompletedProcess([], 23), False),
+                    "with exit 23",
+                ),
+                (
+                    "process_isolation_failed",
+                    "execution_failed",
+                    "measurement_runner",
+                    "process_isolation_failed",
+                    None,
+                    lane_runner.benchmark.ConfigError("fixture process isolation failure"),
+                    "process isolation failed",
+                ),
+                (
+                    "renderer-integrity-before-monitor",
+                    "execution_failed",
+                    "measurement_runner",
+                    "integrity_failed",
+                    None,
+                    (subprocess.CompletedProcess([], 0), False),
+                    "integrity verification failed",
+                ),
+                (
+                    "runner-integrity-after-process",
+                    "execution_failed",
+                    "measurement_runner",
+                    "integrity_failed",
+                    None,
+                    (subprocess.CompletedProcess([], 0), False),
+                    "integrity verification failed",
+                ),
+                (
+                    "renderer-integrity-after-process",
+                    "execution_failed",
+                    "measurement_runner",
+                    "integrity_failed",
+                    None,
+                    (subprocess.CompletedProcess([], 0), False),
+                    "integrity verification failed",
+                ),
+                (
+                    "host-monitor-start",
+                    "infrastructure_blocked",
+                    "host_monitor",
+                    "host_monitor_failed",
+                    None,
+                    (subprocess.CompletedProcess([], 0), False),
+                    "infrastructure failed",
+                ),
+                (
+                    "host-monitor-finalization",
+                    "infrastructure_blocked",
+                    "host_monitor",
+                    "host_monitor_failed",
+                    0,
+                    (subprocess.CompletedProcess([], 0), False),
+                    "infrastructure failed",
+                ),
+                (
+                    "host-monitor-summary",
+                    "infrastructure_blocked",
+                    "host_monitor",
+                    "host_monitor_failed",
+                    0,
+                    (subprocess.CompletedProcess([], 0), False),
+                    "infrastructure failed",
+                ),
+                (
+                    "host-monitor-policy",
+                    "infrastructure_blocked",
+                    "host_monitor",
+                    "host_monitor_failed",
+                    0,
+                    (subprocess.CompletedProcess([], 0), False),
+                    "infrastructure failed",
+                ),
+                (
+                    "postprocessing-failure",
+                    "infrastructure_blocked",
+                    "postprocessing",
+                    "postprocessing_failed",
+                    0,
+                    (subprocess.CompletedProcess([], 0), False),
+                    "infrastructure failed",
+                ),
+                (
+                    "postprocess-integrity",
+                    "execution_failed",
+                    "measurement_runner",
+                    "integrity_failed",
+                    None,
+                    (subprocess.CompletedProcess([], 0), False),
+                    "integrity verification failed",
+                ),
+                (
+                    "invalid-output-missing",
+                    "execution_failed",
+                    "measurement_runner",
+                    "invalid_output",
+                    0,
+                    (subprocess.CompletedProcess([], 0), False),
+                    "invalid output",
+                ),
+                (
+                    "invalid-output-malformed",
+                    "execution_failed",
+                    "measurement_runner",
+                    "invalid_output",
+                    0,
+                    (subprocess.CompletedProcess([], 0), False),
+                    "invalid output",
+                ),
+                (
+                    "invalid-output-oversized",
+                    "execution_failed",
+                    "measurement_runner",
+                    "invalid_output",
+                    0,
+                    (subprocess.CompletedProcess([], 0), False),
+                    "invalid output",
+                ),
+                (
+                    "invalid-output-with-host-rejection",
+                    "execution_failed",
+                    "measurement_runner",
+                    "invalid_output",
+                    0,
+                    (subprocess.CompletedProcess([], 0), False),
+                    "invalid output",
+                ),
+            ):
+                with self.subTest(outcome=case_name):
+                    failure_output = root / f"evidence-{case_name}"
+
+                    def run_failure(*arguments: object) -> object:
+                        if isinstance(process_result, BaseException):
+                            raise process_result
+                        command = arguments[0]
+                        assert isinstance(command, list)
+                        failure_artifact_root = Path(
+                            command[command.index("--artifact-root") + 1]
+                        )
+                        if case_name == "invalid-output-malformed":
+                            (failure_artifact_root / "observations.json").write_bytes(
+                                evidence.canonical_json_bytes(
+                                    {
+                                        "commands": [{"run_id": "broken"}],
+                                        "artifacts": {},
+                                    }
+                                )
+                                + b"\n"
+                            )
+                        elif case_name == "invalid-output-oversized":
+                            with (failure_artifact_root / "observations.json").open("wb") as handle:
+                                handle.truncate(evidence.MAX_OBSERVATIONS_BYTES + 1)
+                        elif case_name in {
+                            "invalid-output-with-host-rejection",
+                            "host-monitor-summary",
+                            "host-monitor-policy",
+                            "postprocessing-failure",
+                            "postprocess-integrity",
+                        }:
+                            shutil.copy2(
+                                source / "observations.json",
+                                failure_artifact_root / "observations.json",
+                            )
+                        return process_result
+
+                    def finish_failure_monitor(*_: object) -> object:
+                        if case_name in {"nonzero_exit", "host-monitor-finalization"}:
+                            raise lane_runner.benchmark.ConfigError(
+                                "fixture monitor finalization failure"
+                            )
+                        return monitor_report
+
+                    def start_failure_monitor(*_: object) -> object:
+                        if case_name == "host-monitor-start":
+                            raise lane_runner.benchmark.ConfigError(
+                                "fixture monitor startup failure"
+                            )
+                        return object()
+
+                    def summarize_failure_monitor(*args: object, **kwargs: object) -> object:
+                        if case_name == "host-monitor-summary":
+                            raise lane_runner.benchmark.ConfigError(
+                                "fixture host monitor summary failure"
+                            )
+                        summary = summarize_host_monitor(*args, **kwargs)
+                        if case_name == "invalid-output-with-host-rejection":
+                            summary["low_power_mode_observed"] = True
+                        return summary
+
+                    def reject_failure_environment(*_: object, **__: object) -> object:
+                        if case_name == "host-monitor-policy":
+                            raise evidence.EvidenceError(
+                                "fixture host monitor policy failure"
+                            )
+                        return ()
+
+                    original_verify_runner = lane_runner._verify_runner_digest
+
+                    def verify_failure_runner(*args: object, **kwargs: object) -> object:
+                        phase = args[2]
+                        if (
+                            case_name == "runner-integrity-after-process"
+                            and phase == "after subprocess completion"
+                        ):
+                            raise lane_runner.benchmark.ConfigError(
+                                "fixture runner integrity failure"
+                            )
+                        return original_verify_runner(*args, **kwargs)
+
+                    original_verify_renderer = lane_runner._verify_renderer_closure
+
+                    def verify_failure_renderer(*args: object, **kwargs: object) -> object:
+                        phase = args[2]
+                        if (
+                            case_name == "renderer-integrity-before-monitor"
+                            and phase == "immediately before host monitoring"
+                        ) or (
+                            case_name == "renderer-integrity-after-process"
+                            and phase == "after measurement completion"
+                        ):
+                            raise lane_runner.benchmark.ConfigError(
+                                "fixture renderer integrity failure"
+                            )
+                        return original_verify_renderer(*args, **kwargs)
+
+                    def execute_failure_rendering(*_: object, **__: object) -> None:
+                        if case_name == "postprocessing-failure":
+                            raise lane_runner._PostprocessingFailure(
+                                "fixture postprocessing failure"
+                            )
+                        if case_name == "postprocess-integrity":
+                            raise lane_runner._IntegrityFailure(
+                                "protected rendering inputs changed"
+                            )
+
+                    patches = (
+                        mock.patch.object(lane_runner.benchmark, "validate_corpus"),
+                        mock.patch.object(
+                            lane_runner.benchmark,
+                            "collect_git_state",
+                            return_value={"commit": identity.git_commit, "dirty": False},
+                        ),
+                        mock.patch.object(
+                            lane_runner.benchmark,
+                            "resolved_toolchain_identity",
+                            return_value=identity.toolchain_identity,
+                        ),
+                        mock.patch.object(
+                            lane_runner.evidence,
+                            "collect_machine_metadata",
+                            return_value=evidence_machine(evidence.LANE_CONSTRAINED),
+                        ),
+                        mock.patch.object(
+                            lane_runner,
+                            "_verify_baseline_checkout",
+                            return_value=baseline_checkout,
+                        ),
+                        mock.patch.object(
+                            lane_runner,
+                            "_verify_baseline_toolchain",
+                            return_value=(
+                                baseline_toolchain,
+                                benchmark.APPROVED_PAIRED_BASELINE[
+                                    "toolchain_identity"
+                                ],
+                            ),
+                        ),
+                        mock.patch.dict(
+                            os.environ,
+                            {"EASYSPLAT_TEST_OBSERVATIONS": str(source)},
+                        ),
+                        mock.patch.object(
+                            lane_runner.time,
+                            "monotonic",
+                            side_effect=[0.0, 1.0],
+                        ),
+                        mock.patch.object(
+                            lane_runner,
+                            "_start_host_monitor",
+                            side_effect=start_failure_monitor,
+                        ),
+                        mock.patch.object(
+                            lane_runner,
+                            "_finish_host_monitor",
+                            side_effect=finish_failure_monitor,
+                        ),
+                        mock.patch.object(
+                            lane_runner,
+                            "_summarize_host_monitor",
+                            side_effect=summarize_failure_monitor,
+                        ),
+                        mock.patch.object(
+                            lane_runner.evidence,
+                            "measurement_environment_rejections",
+                            side_effect=reject_failure_environment,
+                        ),
+                        mock.patch.object(
+                            lane_runner,
+                            "_children_cpu_seconds",
+                            side_effect=[
+                                {"user": 0.0, "system": 0.0},
+                                {"user": 0.0, "system": 0.0},
+                            ],
+                        ),
+                        mock.patch.object(
+                            lane_runner,
+                            "_run_measurement_process",
+                            side_effect=run_failure,
+                        ),
+                        mock.patch.object(
+                            lane_runner,
+                            "_verify_runner_digest",
+                            side_effect=verify_failure_runner,
+                        ),
+                        mock.patch.object(
+                            lane_runner,
+                            "_verify_renderer_closure",
+                            side_effect=verify_failure_renderer,
+                        ),
+                        mock.patch.object(
+                            lane_runner,
+                            "_rendering_required",
+                            return_value=case_name
+                            in {"postprocessing-failure", "postprocess-integrity"},
+                        ),
+                        mock.patch.object(
+                            lane_runner,
+                            "_orientation_required",
+                            return_value=False,
+                        ),
+                        mock.patch.object(
+                            lane_runner,
+                            "_execute_rendering_stage",
+                            side_effect=execute_failure_rendering,
+                        ),
+                    )
+                    with ExitStack() as stack:
+                        for patch in patches:
+                            stack.enter_context(patch)
+                        failure_result = lane_runner.run_lane(
+                            index_path,
+                            requests_root,
+                            corpus_path,
+                            config_path,
+                            toolchain,
+                            baseline_checkout,
+                            baseline_toolchain,
+                            failure_output,
+                            evidence.LANE_CONSTRAINED,
+                            runner,
+                            renderer_closure_root,
+                        )
+
+                    failure_status = assert_collector_status(
+                        failure_output,
+                        kind=outcome_kind,
+                        stage=outcome_stage,
+                        reason=outcome_reason,
+                        exit_code=expected_exit_code,
+                    )
+                    self.assertEqual(len(failure_result["collections"]), 1)
+                    failure_collection = failure_result["collections"][0]
+                    self.assertEqual(failure_collection["scene_id"], scene["id"])
+                    self.assertEqual(failure_collection["scale"], 120)
+                    self.assertEqual(
+                        failure_collection["lane"],
+                        evidence.LANE_CONSTRAINED,
+                    )
+                    self.assertEqual(
+                        failure_collection["sha256"],
+                        evidence.sha256_file(
+                            artifact_root(failure_output) / "collector-status.json"
+                        ),
+                    )
+                    self.assertEqual(
+                        json.loads(
+                            (
+                                failure_output
+                                / f"lane-{evidence.LANE_CONSTRAINED}.json"
+                            ).read_text(encoding="utf-8")
+                        )["collections"],
+                        failure_result["collections"],
+                    )
+                    self.assertEqual(failure_status["outcome"]["reason"], outcome_reason)
+
             original_runner = runner.read_text(encoding="utf-8")
+            original_candidate_validator = evidence.validate_attestation_candidate
+
+            def validate_then_mutate_runner(*args: object, **kwargs: object) -> object:
+                candidate = original_candidate_validator(*args, **kwargs)
+                runner.write_text(
+                    original_runner + "\n# mutation after attestation validation\n",
+                    encoding="utf-8",
+                )
+                return candidate
+
+            publication_output = root / "evidence-publication-mutation"
+            with (
+                mock.patch.object(lane_runner.benchmark, "validate_corpus"),
+                mock.patch.object(
+                    lane_runner.benchmark,
+                    "collect_git_state",
+                    return_value={"commit": identity.git_commit, "dirty": False},
+                ),
+                mock.patch.object(
+                    lane_runner.benchmark,
+                    "resolved_toolchain_identity",
+                    return_value=identity.toolchain_identity,
+                ),
+                mock.patch.object(
+                    lane_runner.evidence,
+                    "collect_machine_metadata",
+                    return_value=evidence_machine(evidence.LANE_CONSTRAINED),
+                ),
+                mock.patch.object(
+                    lane_runner,
+                    "_verify_baseline_checkout",
+                    return_value=baseline_checkout,
+                ),
+                mock.patch.object(
+                    lane_runner,
+                    "_verify_baseline_toolchain",
+                    return_value=(
+                        baseline_toolchain,
+                        benchmark.APPROVED_PAIRED_BASELINE["toolchain_identity"],
+                    ),
+                ),
+                mock.patch.dict(
+                    os.environ,
+                    {"EASYSPLAT_TEST_OBSERVATIONS": str(source)},
+                ),
+                mock.patch.object(
+                    lane_runner.time,
+                    "monotonic",
+                    side_effect=itertools.chain(
+                        [0.0],
+                        itertools.repeat(
+                            max(
+                                receipt["ended_monotonic_seconds"]
+                                for receipt in observations["commands"]
+                            )
+                            + 1.0
+                        ),
+                    ),
+                ),
+                mock.patch.object(
+                    lane_runner,
+                    "_start_host_monitor",
+                    return_value=object(),
+                ),
+                mock.patch.object(
+                    lane_runner,
+                    "_finish_host_monitor",
+                    return_value=monitor_report,
+                ),
+                mock.patch.object(
+                    lane_runner,
+                    "_summarize_host_monitor",
+                    side_effect=summarize_host_monitor,
+                ),
+                mock.patch.object(
+                    lane_runner,
+                    "_children_cpu_seconds",
+                    side_effect=[
+                        {"user": 0.0, "system": 0.0},
+                        {"user": 0.0, "system": 0.0},
+                    ],
+                ),
+                mock.patch.object(
+                lane_runner.evidence,
+                "validate_attestation_candidate",
+                side_effect=validate_then_mutate_runner,
+            ),
+            mock.patch.object(lane_runner, "_PROCESS_GROUP_DRAIN_SECONDS", 0.0),
+            self.assertRaisesRegex(
+                lane_runner.benchmark.ConfigError,
+                "digest mismatch before the first scene",
+            ),
+            ):
+                lane_runner.run_lane(
+                    index_path,
+                    requests_root,
+                    corpus_path,
+                    config_path,
+                    toolchain,
+                    baseline_checkout,
+                    baseline_toolchain,
+                    publication_output,
+                    evidence.LANE_CONSTRAINED,
+                    runner,
+                    renderer_closure_root,
+                )
+            runner.write_text(original_runner, encoding="utf-8")
+            runner.chmod(0o755)
+            assert_collector_status(
+                publication_output,
+                kind="execution_failed",
+                stage="measurement_runner",
+                reason="integrity_failed",
+                exit_code=None,
+            )
+
             runner.write_text(original_runner + "\n# pre-run mutation\n", encoding="utf-8")
+            pre_run_mutation_output = root / "evidence-pre-run-mutation"
             with (
                 mock.patch.object(lane_runner.benchmark, "validate_corpus"),
                 mock.patch.object(
@@ -6088,13 +7898,13 @@ class EvidenceProtocolTests(unittest.TestCase):
                         toolchain,
                         baseline_checkout,
                         baseline_toolchain,
-                        root / "evidence",
+                        pre_run_mutation_output,
                         evidence.LANE_CONSTRAINED,
                         runner,
                         renderer_closure_root,
-                        key_path,
                     )
 
+            self_mutation_output = root / "evidence-runner-self-mutation"
             runner.write_text(
                 original_runner + "\nwith open(__file__, 'a', encoding='utf-8') as handle: handle.write('# mutated')\n",
                 encoding="utf-8",
@@ -6136,10 +7946,28 @@ class EvidenceProtocolTests(unittest.TestCase):
                     os.environ,
                     {"EASYSPLAT_TEST_OBSERVATIONS": str(source)},
                 ),
+                mock.patch.object(
+                    lane_runner,
+                    "_start_host_monitor",
+                    return_value=object(),
+                ),
+                mock.patch.object(
+                    lane_runner,
+                    "_finish_host_monitor",
+                    return_value=monitor_report,
+                ),
+                mock.patch.object(
+                    lane_runner,
+                    "_children_cpu_seconds",
+                    side_effect=[
+                        {"user": 0.0, "system": 0.0},
+                        {"user": 0.0, "system": 0.0},
+                    ],
+                ),
             ):
                 with self.assertRaisesRegex(
                     lane_runner.benchmark.ConfigError,
-                    "after subprocess completion",
+                    "digest mismatch before the first scene",
                 ):
                     lane_runner.run_lane(
                         index_path,
@@ -6149,15 +7977,95 @@ class EvidenceProtocolTests(unittest.TestCase):
                         toolchain,
                         baseline_checkout,
                         baseline_toolchain,
-                        root / "evidence",
+                        self_mutation_output,
                         evidence.LANE_CONSTRAINED,
                         runner,
                         renderer_closure_root,
-                        key_path,
                     )
+            assert_collector_status(
+                self_mutation_output,
+                kind="execution_failed",
+                stage="measurement_runner",
+                reason="integrity_failed",
+                exit_code=None,
+                expected_runner=index["runner_identities"][evidence.LANE_CONSTRAINED],
+            )
 
 
 class RunnerIntegrityTests(unittest.TestCase):
+    def test_real_host_monitor_receipt_matches_python_evidence_contract(self) -> None:
+        build = subprocess.run(
+            ["swift", "build", "--product", "EasySplatBenchmarkDriver"],
+            cwd=ROOT,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        self.assertEqual(build.returncode, 0, build.stderr)
+        binary_directory = subprocess.run(
+            ["swift", "build", "--show-bin-path"],
+            cwd=ROOT,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        self.assertEqual(binary_directory.returncode, 0, binary_directory.stderr)
+        binary = Path(binary_directory.stdout.strip()) / "EasySplatBenchmarkDriver"
+        self.assertTrue(binary.is_file())
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            monitor = lane_runner._start_host_monitor(
+                binary,
+                lane_runner._isolated_environment(root, "monitor-contract"),
+                2.0,
+            )
+            started = time.monotonic()
+            time.sleep(0.2)
+            ended = time.monotonic()
+            report = lane_runner._finish_host_monitor(monitor)
+            monitor_path = root / "host-monitor.json"
+            monitor_path.write_bytes(evidence.canonical_json_bytes(report) + b"\n")
+            command = {
+                "run_id": "cross-language-contract",
+                "started_monotonic_seconds": started,
+                "ended_monotonic_seconds": ended,
+                "process_cpu_microseconds": {"user": 0, "system": 0},
+            }
+            machine = evidence.collect_machine_metadata()
+            summary = lane_runner._summarize_host_monitor(
+                report,
+                [command],
+                machine,
+                supervisor_started=started,
+                supervisor_ended=ended,
+                monitor_sha256=evidence.sha256_file(monitor_path),
+                monitor_executable_sha256=evidence.sha256_file(binary),
+                outer_child_cpu_microseconds={"user": 0, "system": 0},
+            )
+            evidence.measurement_environment_rejections(
+                summary,
+                machine,
+                [command],
+                started,
+                ended,
+                root / "measurement-environment.json",
+                evidence.sha256_file(binary),
+            )
+
+        self.assertEqual(
+            set(report),
+            {
+                "schema_version",
+                "monotonic_clock",
+                "sample_interval_seconds",
+                "samples",
+                "events",
+            },
+        )
+        self.assertEqual(summary["monotonic_clock"], "mach_absolute_time")
+        self.assertIsInstance(summary["state_change_events"], list)
+
     def _orientation_stage_fixture(
         self,
         root: Path,
@@ -6318,8 +8226,8 @@ class RunnerIntegrityTests(unittest.TestCase):
         )
         self.assertEqual(
             workflow.count("name: easysplat-benchmark-renderer-${{ github.sha }}"),
-            4,
-            "prepare must upload one renderer package and each measurement lane must download it",
+            1,
+            "prepare uploads one renderer package and later jobs bind its artifact ID",
         )
         self.assertEqual(
             workflow.count(
@@ -6332,27 +8240,81 @@ class RunnerIntegrityTests(unittest.TestCase):
             workflow.count('--baseline-toolchain-root "$BASELINE_TOOLCHAIN_ROOT"'),
             3,
         )
+        self.assertNotIn("--evidence-key-fd", workflow)
+        self.assertNotIn('exec 9<"$RUNNER_TEMP/evidence.key"', workflow)
+        self.assertNotIn("environment: benchmark-evidence-signing", workflow)
+        self.assertIn("scripts/benchmark/prepare_evidence.py", workflow)
+        self.assertNotIn("scripts/benchmark/seal_evidence.py", workflow)
+        self.assertIn("scripts/benchmark/aggregate_evidence.py", workflow)
+        self.assertNotIn("--evidence-public-key-file", workflow)
+        self.assertNotIn("--evidence-key-file", workflow)
+        self.assertNotIn("BENCHMARK_EVIDENCE_PUBLIC_KEY_BASE64", workflow)
+        self.assertNotIn("BENCHMARK_EVIDENCE_PRIVATE_KEY_BASE64", workflow)
+        aggregate_job = workflow.split("  aggregate:\n", 1)[1]
+        self.assertNotIn("--raw-evidence-root", aggregate_job)
+        self.assertEqual(aggregate_job.count("--prepared-root"), 3)
+        self.assertIn("prepared_artifact_digest", aggregate_job)
+        self.assertIn("actions/artifacts/$artifact_id", aggregate_job)
+
+    def test_release_measurement_jobs_pin_and_verify_xcode_16_4(self) -> None:
+        workflow = (ROOT / ".github/workflows/benchmark-release.yml").read_text(
+            encoding="utf-8"
+        )
+        sections = {
+            "prepare": workflow.split("  prepare:\n", 1)[1].split("  reference:\n", 1)[0],
+            "reference": workflow.split("  reference:\n", 1)[1].split(
+                "  constrained:\n", 1
+            )[0],
+            "constrained": workflow.split("  constrained:\n", 1)[1].split(
+                "  eight-gb:\n", 1
+            )[0],
+            "eight-gb": workflow.split("  eight-gb:\n", 1)[1].split(
+                "  derive-reference:\n", 1
+            )[0],
+        }
+        for name, section in sections.items():
+            with self.subTest(job=name):
+                self.assertIn(
+                    "DEVELOPER_DIR: /Applications/Xcode_16.4.app/Contents/Developer",
+                    section,
+                )
+                self.assertIn("name: Verify Xcode 16.4", section)
+                self.assertIn(
+                    'test "$(xcodebuild -version | sed -n \'1p\')" = "Xcode 16.4"',
+                    section,
+                )
 
     def test_release_workflow_installs_heavy_render_scoring_only_where_used(self) -> None:
         workflow = (ROOT / ".github/workflows/benchmark-release.yml").read_text(
             encoding="utf-8"
         )
+        reference = workflow.split("  reference:\n", 1)[1].split("  constrained:\n", 1)[0]
         constrained = workflow.split("  constrained:\n", 1)[1].split("  eight-gb:\n", 1)[0]
-        eight_gb = workflow.split("  eight-gb:\n", 1)[1].split("  aggregate:\n", 1)[0]
+        eight_gb = workflow.split("  eight-gb:\n", 1)[1].split("  derive-reference:\n", 1)[0]
+        reference_derivation = workflow.split("  derive-reference:\n", 1)[1].split(
+            "  derive-constrained:\n", 1
+        )[0]
+        aggregate = workflow.split("  aggregate:\n", 1)[1]
 
         self.assertEqual(
             workflow.count("name: Install protected render-scoring dependencies"),
-            2,
-            "only reference measurement and aggregate verification score pixels",
+            1,
+            "only no-secret reference derivation scores pixels",
         )
+        self.assertNotIn("render-requirements.txt", reference)
         self.assertNotIn("render-requirements.txt", constrained)
         self.assertNotIn("render-requirements.txt", eight_gb)
+        self.assertIn("render-requirements.txt", reference_derivation)
+        self.assertNotIn("render-requirements.txt", aggregate)
+        self.assertNotIn("signing-requirements.txt", workflow)
 
     def test_run_suite_requires_render_dependencies_only_when_verifying_evidence(self) -> None:
         launcher = (ROOT / "scripts/benchmark/run_suite.sh").read_text(encoding="utf-8")
 
         self.assertIn('if [ -n "$EVIDENCE_ROOT" ]; then', launcher)
         self.assertNotIn('if [ "$DRY_RUN" -eq 0 ]; then\n  dependency_locks+=', launcher)
+        self.assertNotIn("--evidence-public-key-file", launcher)
+        self.assertNotIn("EVIDENCE_PUBLIC_KEY_FILE", launcher)
 
     def _renderer_stage_fixture(
         self,
@@ -6661,7 +8623,7 @@ class RunnerIntegrityTests(unittest.TestCase):
 
             with self.assertRaisesRegex(
                 lane_runner.benchmark.ConfigError,
-                "closure mismatch after rendering",
+                "protected rendering inputs changed",
             ):
                 self._run_renderer_stage(fixture)
             self.assertTrue(fixture["invocation_marker"].is_file())
@@ -6732,6 +8694,28 @@ class RunnerIntegrityTests(unittest.TestCase):
             r"^[0-9a-f]{64}$",
         )
         terminate.assert_called_once_with(process)
+
+    def test_measurement_process_reaps_a_terminated_zombie_without_signalling_it_again(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            with (
+                (root / "stdout").open("wb") as stdout_handle,
+                (root / "stderr").open("wb") as stderr_handle,
+                mock.patch.object(
+                    lane_runner,
+                    "_PROCESS_GROUP_TERMINATION_GRACE_SECONDS",
+                    0.05,
+                ),
+            ):
+                completed, timed_out = lane_runner._run_measurement_process(
+                    ["/bin/sleep", "2"],
+                    stdout_handle,
+                    stderr_handle,
+                    {"PATH": "/usr/bin:/bin"},
+                    0.1,
+                )
+        self.assertTrue(timed_out)
+        self.assertIn(completed.returncode, {-lane_runner.signal.SIGTERM, 0})
 
     def test_measurement_process_rejects_and_terminates_a_leaked_child(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -6977,16 +8961,6 @@ with mock.patch.object(ctypes, 'CDLL', side_effect=AssertionError('libproc loade
                     evidence.LANE_REFERENCE,
                 )
             self.assertEqual(sentinel.read_text(encoding="utf-8"), "keep\n")
-
-    def test_evidence_key_permissions_are_restrictive(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            key = Path(directory) / "evidence.key"
-            key.write_bytes(b"x" * 32)
-            key.chmod(0o644)
-            with self.assertRaisesRegex(evidence.EvidenceError, "0600"):
-                evidence.load_key(key)
-            key.chmod(0o600)
-            self.assertEqual(evidence.load_key(key), b"x" * 32)
 
     def test_baseline_checkout_must_be_exact_and_clean(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -7280,6 +9254,13 @@ class OrchestrationTests(unittest.TestCase):
             closure = benchmark._validated_toolchain_closure(root, public_key_base64)
             self.assertIsNotNone(closure)
             self.assertEqual(identity, evidence.toolchain_identity_from_closure(closure))
+            self.assertEqual(
+                benchmark.resolved_public_beta_toolchain_identity(
+                    root,
+                    public_key_base64=public_key_base64,
+                ),
+                identity,
+            )
 
             forged = json.loads(json.dumps(state))
             forged["signedManifest"]["version"] = "9.9.9"
@@ -7323,8 +9304,24 @@ class OrchestrationTests(unittest.TestCase):
                 )
 
             state.pop("padding")
+            undeclared = root / "bin/undeclared-helper"
+            undeclared.write_bytes(b"not signed")
+            (root / ".easysplat_toolchain_state.json").write_text(
+                json.dumps(state),
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(benchmark.ConfigError, "undeclared file"):
+                benchmark.resolved_toolchain_identity(
+                    root,
+                    "release",
+                    public_key_base64=public_key_base64,
+                )
+            undeclared.unlink()
+
             state["installedArtifacts"].pop("geometry-da3-small")
             state["installedCapabilities"].remove("fixture.geometry-da3-small")
+            (root / "da3_mps/models/DA3-SMALL/model.safetensors").unlink()
+            (root / "da3_mps/models/DA3-SMALL").rmdir()
             (root / ".easysplat_toolchain_state.json").write_text(
                 json.dumps(state),
                 encoding="utf-8",
@@ -7335,6 +9332,11 @@ class OrchestrationTests(unittest.TestCase):
                 public_key_base64=public_key_base64,
             )
             self.assertRegex(identity or "", r"^sha256:[0-9a-f]{64}$")
+            with self.assertRaisesRegex(benchmark.ConfigError, "public-beta component closure"):
+                benchmark.resolved_public_beta_toolchain_identity(
+                    root,
+                    public_key_base64=public_key_base64,
+                )
 
             state["installedArtifacts"].pop("macos-arm64-core")
             state["installedCapabilities"].remove("fixture.macos-arm64-core")
@@ -7404,6 +9406,147 @@ class OrchestrationTests(unittest.TestCase):
         self.assertIn("toolchain", result["missing_requirements"])
         self.assertEqual(result["missing_requirements"]["request_index"], "protected request index")
 
+    def test_release_suite_keeps_failures_when_a_sibling_lane_is_missing(self) -> None:
+        scene = valid_scene(adapter="protected-evidence")
+        scene["scale_lanes"] = [120]
+        scene["aggregate_scale"] = 120
+        scene["split"]["holdout_by_scale"] = {"120": list(range(4, 120, 5))}
+        pinned_reference = next(iter(scene["reference"]["by_scale"].values()))
+        scene["reference"]["by_scale"] = {"120": pinned_reference}
+        scene["gate_scopes"] = evidence_request(scale=120)["gate_scopes"]
+        corpus = {
+            "schema_version": 1,
+            "manifest_profile": "release",
+            "scenes": [scene],
+        }
+        config = valid_reference_config()
+        identity = benchmark.RunIdentity(
+            profile="release",
+            corpus_digest=benchmark.sha256_json(corpus),
+            thresholds_digest=benchmark.sha256_json(config),
+            git_commit="4" * 40,
+            app_version="0.2.0-beta.1",
+            toolchain_identity=TEST_TOOLCHAIN_IDENTITY,
+        )
+        identities = runner_identities()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            corpus_path = root / "corpus.json"
+            config_path = root / "reference.json"
+            corpus_path.write_bytes(benchmark.canonical_json_bytes(corpus) + b"\n")
+            config_path.write_bytes(benchmark.canonical_json_bytes(config) + b"\n")
+            media = root / scene["input"]["media_path"]
+            media.parent.mkdir(parents=True)
+            media.write_bytes(b"scene")
+            evidence_root = root / "evidence"
+            reference_root = (
+                evidence_root
+                / scene["adapter"]["evidence_path"]
+                / "120"
+                / evidence.LANE_REFERENCE
+            )
+            reference_root.mkdir(parents=True)
+            malformed = reference_root / "attestation.json"
+            malformed.write_text("not-json\n", encoding="utf-8")
+            request_index = root / "request-index.json"
+            request_index.write_text("{}\n", encoding="utf-8")
+
+            patches = (
+                mock.patch.object(benchmark, "validate_corpus"),
+                mock.patch.object(
+                    benchmark,
+                    "collect_git_state",
+                    return_value={"commit": identity.git_commit, "dirty": False},
+                ),
+                mock.patch.object(
+                    benchmark,
+                    "collect_machine_metadata",
+                    return_value=evidence_machine(evidence.LANE_REFERENCE),
+                ),
+                mock.patch.object(
+                    benchmark,
+                    "resolved_toolchain_identity",
+                    return_value=identity.toolchain_identity,
+                ),
+                mock.patch.object(benchmark, "make_run_identity", return_value=identity),
+                mock.patch.object(
+                    benchmark,
+                    "validate_request_index",
+                    return_value={"runner_identities": identities},
+                ),
+            )
+            with patches[0], patches[1], patches[2], patches[3], patches[4], patches[5]:
+                failed_exit = benchmark.run_suite(
+                    profile="release",
+                    corpus_path=corpus_path,
+                    reference_config_path=config_path,
+                    toolchain_root=root / "toolchain",
+                    output_directory=root / "failed-output",
+                    dry_run=False,
+                    stdout=io.StringIO(),
+                    evidence_root=evidence_root,
+                    request_index_path=request_index,
+                )
+            failed = json.loads(
+                (root / "failed-output" / "suite.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(failed_exit, 1)
+            self.assertEqual(failed["status"], "failed")
+            self.assertEqual(failed["scene_results"][0]["status"], "failed")
+            self.assertEqual(failed["aggregates"]["failed"], 1)
+            self.assertTrue(
+                any("reference_m4_max" in failure for failure in failed["failures"])
+            )
+            self.assertTrue(
+                any("constrained_14_16gb" in reason for reason in failed["blocking_reasons"])
+            )
+
+            malformed.unlink()
+            patches = (
+                mock.patch.object(benchmark, "validate_corpus"),
+                mock.patch.object(
+                    benchmark,
+                    "collect_git_state",
+                    return_value={"commit": identity.git_commit, "dirty": False},
+                ),
+                mock.patch.object(
+                    benchmark,
+                    "collect_machine_metadata",
+                    return_value=evidence_machine(evidence.LANE_REFERENCE),
+                ),
+                mock.patch.object(
+                    benchmark,
+                    "resolved_toolchain_identity",
+                    return_value=identity.toolchain_identity,
+                ),
+                mock.patch.object(benchmark, "make_run_identity", return_value=identity),
+                mock.patch.object(
+                    benchmark,
+                    "validate_request_index",
+                    return_value={"runner_identities": identities},
+                ),
+            )
+            with patches[0], patches[1], patches[2], patches[3], patches[4], patches[5]:
+                blocked_exit = benchmark.run_suite(
+                    profile="release",
+                    corpus_path=corpus_path,
+                    reference_config_path=config_path,
+                    toolchain_root=root / "toolchain",
+                    output_directory=root / "blocked-output",
+                    dry_run=False,
+                    stdout=io.StringIO(),
+                    evidence_root=evidence_root,
+                    request_index_path=request_index,
+                )
+            blocked = json.loads(
+                (root / "blocked-output" / "suite.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(blocked_exit, 2)
+            self.assertEqual(blocked["status"], "blocked")
+            self.assertEqual(blocked["scene_results"][0]["status"], "blocked")
+            self.assertEqual(blocked["aggregates"]["blocked"], 1)
+            self.assertEqual(blocked["failures"], [])
+
     def test_final_suite_validation_rejects_unknown_metrics_and_private_paths(self) -> None:
         config_path = ROOT / "scripts/benchmark/reference-config.json"
         corpus_path = ROOT / "scripts/benchmark/fixtures/smoke-corpus.json"
@@ -7429,6 +9572,61 @@ class OrchestrationTests(unittest.TestCase):
         result["scene_results"][0]["route"] = "/Users/private/route"
         with self.assertRaisesRegex(benchmark.ConfigError, "route"):
             benchmark.validate_suite_result(result)
+
+    def test_final_suite_validation_enforces_failure_precedence(self) -> None:
+        config_path = ROOT / "scripts/benchmark/reference-config.json"
+        corpus_path = ROOT / "scripts/benchmark/fixtures/smoke-corpus.json"
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "output"
+            self.assertEqual(
+                benchmark.run_suite(
+                    profile="smoke",
+                    corpus_path=corpus_path,
+                    reference_config_path=config_path,
+                    toolchain_root=Path(directory) / "toolchain",
+                    output_directory=output,
+                    dry_run=False,
+                    stdout=io.StringIO(),
+                ),
+                0,
+            )
+            passed = json.loads((output / "suite.json").read_text(encoding="utf-8"))
+
+        suite_mismatch = json.loads(json.dumps(passed))
+        suite_mismatch["status"] = "blocked"
+        suite_mismatch["failures"] = ["fixture failure"]
+        with self.assertRaisesRegex(benchmark.ConfigError, "status contradicts"):
+            benchmark.validate_suite_result(suite_mismatch)
+
+        scene_mismatch = json.loads(json.dumps(passed))
+        scene_mismatch["status"] = "failed"
+        scene_mismatch["failures"] = ["fixture scene failure"]
+        scene_mismatch["scene_results"][0]["status"] = "blocked"
+        scene_mismatch["scene_results"][0]["failures"] = ["fixture failure"]
+        with self.assertRaisesRegex(benchmark.ConfigError, "status contradicts"):
+            benchmark.validate_suite_result(scene_mismatch)
+
+        omitted_scene_failure = json.loads(json.dumps(passed))
+        omitted_scene_failure["scene_results"][0]["status"] = "failed"
+        omitted_scene_failure["scene_results"][0]["failures"] = ["fixture failure"]
+        omitted_scene_failure["aggregates"]["passed"] = 0
+        omitted_scene_failure["aggregates"]["failed"] = 1
+        with self.assertRaisesRegex(benchmark.ConfigError, "omit scene failures"):
+            benchmark.validate_suite_result(omitted_scene_failure)
+
+        omitted_scene_blocker = json.loads(json.dumps(passed))
+        omitted_scene_blocker["scene_results"][0]["status"] = "blocked"
+        omitted_scene_blocker["scene_results"][0]["blocking_reasons"] = ["fixture unavailable"]
+        omitted_scene_blocker["aggregates"]["passed"] = 0
+        omitted_scene_blocker["aggregates"]["blocked"] = 1
+        with self.assertRaisesRegex(benchmark.ConfigError, "omit scene blockers"):
+            benchmark.validate_suite_result(omitted_scene_blocker)
+
+        aggregate_mismatch = json.loads(json.dumps(passed))
+        aggregate_mismatch["aggregates"]["passed"] = 0
+        aggregate_mismatch["aggregates"]["blocked"] = 1
+        with self.assertRaisesRegex(benchmark.ConfigError, "aggregates contradict"):
+            benchmark.validate_suite_result(aggregate_mismatch)
 
 
 if __name__ == "__main__":

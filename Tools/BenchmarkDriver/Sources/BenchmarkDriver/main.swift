@@ -59,6 +59,25 @@ do {
             to: outputURL,
             options: [.atomic]
         )
+    } else if arguments.count == 10,
+              arguments[1] == "monitor-host-state",
+              arguments[2] == "--sample-interval",
+              arguments[4] == "--max-samples",
+              arguments[6] == "--ready-fd",
+              arguments[8] == "--stop-fd",
+              let sampleInterval = TimeInterval(arguments[3]),
+              let maximumSamples = Int(arguments[5]),
+              let readyFileDescriptor = Int32(arguments[7]),
+              let stopFileDescriptor = Int32(arguments[9]) {
+        let receipt = try HostStateMonitor.capture(
+            sampleIntervalSeconds: sampleInterval,
+            readyFileDescriptor: readyFileDescriptor,
+            stopFileDescriptor: stopFileDescriptor,
+            maximumSampleCount: maximumSamples
+        )
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.sortedKeys, .withoutEscapingSlashes]
+        FileHandle.standardOutput.write(try encoder.encode(receipt) + Data("\n".utf8))
     } else {
         fail(
             "usage: EasySplatBenchmarkDriver render --job <job.json> "
@@ -69,7 +88,10 @@ do {
                 + "--ground-truth-poses <ground-truth-poses.json> "
                 + "--ground-truth-poses-sha256 <sha256:...> "
                 + "--orientation-label <orientation-label.json> "
-                + "--orientation-label-sha256 <sha256:...> --output <orientation-metrics.json>",
+                + "--orientation-label-sha256 <sha256:...> --output <orientation-metrics.json>\n"
+                + "   or: EasySplatBenchmarkDriver monitor-host-state "
+                + "--sample-interval <seconds> --max-samples <count> "
+                + "--ready-fd <descriptor> --stop-fd <descriptor>",
             status: 64
         )
     }

@@ -1,15 +1,18 @@
 #!/usr/bin/env python3
-"""Run one protected benchmark lane and seal its raw evidence."""
+"""Run one protected benchmark lane and collect its raw evidence."""
 
 from __future__ import annotations
 
 import argparse
+import bisect
 import ctypes
+import json
 import math
 import os
+import resource
+import select
 import secrets
 import signal
-import shutil
 import stat
 import subprocess
 import sys
@@ -18,7 +21,7 @@ import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
-from typing import Any, BinaryIO, Mapping, Sequence
+from typing import Any, BinaryIO, Mapping, MutableMapping, NoReturn, Sequence
 
 try:
     from scripts.benchmark import easysplat_benchmark as benchmark
@@ -32,12 +35,54 @@ except ModuleNotFoundError:
 
 _TIMEOUT_OVERRIDE_ENVIRONMENT_KEY = "EASYSPLAT_INTERNAL_BENCHMARK_TIMEOUT_SECONDS"
 _MINIMUM_TIMEOUT_OVERRIDE_SECONDS = 0.1
-_MAXIMUM_TIMEOUT_OVERRIDE_SECONDS = 7 * 24 * 60 * 60
+_MAXIMUM_TIMEOUT_OVERRIDE_SECONDS = 24 * 60 * 60
 _PROCESS_GROUP_TERMINATION_GRACE_SECONDS = 5.0
 _PROCESS_GROUP_DRAIN_SECONDS = 0.25
 _PROCESS_TREE_SCAN_SECONDS = 0.01
 _PROCESS_TOKEN_ENVIRONMENT_KEY = "EASYSPLAT_INTERNAL_BENCHMARK_PROCESS_TOKEN"
 _ORIENTATION_EXTRACTION_TIMEOUT_SECONDS = 60.0
+_HOST_MONITOR_MAXIMUM_SAMPLES = 100_000
+_HOST_MONITOR_MAXIMUM_INTERVAL_SECONDS = 1.0
+_HOST_MONITOR_TIMESTAMP_TOLERANCE_SECONDS = 0.05
+_HOST_MONITOR_READY_TIMEOUT_SECONDS = 10.0
+_HOST_MONITOR_STOP_TIMEOUT_SECONDS = 30.0
+_HOST_MONITOR_MAXIMUM_OUTPUT_BYTES = 64 * 1024 * 1024
+_HOST_MONITOR_EVENT_SAMPLE_HEADROOM = 4_096
+_COLLECTOR_VERSION = "1.0.0"
+_COLLECTOR_RELATIVE_PATH = "scripts/benchmark/run_lane.py"
+
+
+class _PostprocessingFailure(benchmark.ConfigError):
+    """A pinned supervisor-side evidence tool failed after runner preflight."""
+
+
+class _IntegrityFailure(benchmark.ConfigError):
+    """A protected input or executable changed during evidence collection."""
+
+
+class _CollectedOutcome(benchmark.ConfigError):
+    """A terminal lane outcome was durably collected for later preparation."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        scene_id: str,
+        scale: int,
+        lane: str,
+        status_path: Path,
+        request: Mapping[str, Any],
+        runner_identity: Mapping[str, Any],
+        machine: Mapping[str, Any],
+    ) -> None:
+        super().__init__(message)
+        self.scene_id = scene_id
+        self.scale = scale
+        self.lane = lane
+        self.status_path = status_path
+        self.request = dict(request)
+        self.runner_identity = dict(runner_identity)
+        self.machine = dict(machine)
 
 
 def _load(path: Path, label: str) -> Any:
@@ -155,10 +200,8 @@ def _prepare_artifact_root(output_root: Path, relative: Path, scale: int, lane: 
     resolved_parent = parent.resolve(strict=True)
     if resolved_parent != canonical_output and canonical_output not in resolved_parent.parents:
         raise benchmark.ConfigError("benchmark artifact path escapes the output root")
-    if artifact_root.exists():
-        if artifact_root.is_symlink() or not artifact_root.is_dir():
-            raise benchmark.ConfigError("benchmark artifact root must be a real directory")
-        shutil.rmtree(artifact_root)
+    if artifact_root.exists() or artifact_root.is_symlink():
+        raise benchmark.ConfigError("benchmark artifact root already exists; refusing untrusted output")
     artifact_root.mkdir()
     return artifact_root
 
@@ -181,6 +224,439 @@ def _isolated_environment(artifact_root: Path, namespace: str) -> dict[str, str]
 
 def _measurement_environment(artifact_root: Path) -> dict[str, str]:
     return _isolated_environment(artifact_root, "runner")
+
+
+def _children_cpu_seconds() -> dict[str, float]:
+    usage = resource.getrusage(resource.RUSAGE_CHILDREN)
+    return {"user": float(usage.ru_utime), "system": float(usage.ru_stime)}
+
+
+@dataclass
+class _HostMonitorProcess:
+    process: subprocess.Popen[bytes]
+    stop_file_descriptor: int
+    ready_bracket_started: float
+    ready_bracket_ended: float
+
+
+def _start_host_monitor(
+    executable: Path,
+    environment: Mapping[str, str],
+    timeout_seconds: float,
+) -> _HostMonitorProcess:
+    ready_read, ready_write = os.pipe()
+    stop_read, stop_write = os.pipe()
+    process: subprocess.Popen[bytes] | None = None
+    started_ok = False
+    ready_started = time.monotonic()
+    maximum_samples = min(
+        _HOST_MONITOR_MAXIMUM_SAMPLES,
+        max(
+            2,
+            math.ceil(timeout_seconds / _HOST_MONITOR_MAXIMUM_INTERVAL_SECONDS)
+            + _HOST_MONITOR_EVENT_SAMPLE_HEADROOM,
+        ),
+    )
+    try:
+        process = subprocess.Popen(
+            [
+                str(executable),
+                "monitor-host-state",
+                "--sample-interval",
+                str(_HOST_MONITOR_MAXIMUM_INTERVAL_SECONDS),
+                "--max-samples",
+                str(maximum_samples),
+                "--ready-fd",
+                str(ready_write),
+                "--stop-fd",
+                str(stop_read),
+            ],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env=dict(environment),
+            pass_fds=(ready_write, stop_read),
+        )
+        os.close(ready_write)
+        ready_write = -1
+        os.close(stop_read)
+        stop_read = -1
+        readable, _, _ = select.select(
+            [ready_read],
+            [],
+            [],
+            _HOST_MONITOR_READY_TIMEOUT_SECONDS,
+        )
+        if not readable or os.read(ready_read, 1) != b"\x01":
+            raise benchmark.ConfigError("host monitor did not become ready")
+        ready_ended = time.monotonic()
+        if process.poll() is not None:
+            raise benchmark.ConfigError("host monitor exited during startup")
+        monitor = _HostMonitorProcess(
+            process=process,
+            stop_file_descriptor=stop_write,
+            ready_bracket_started=ready_started,
+            ready_bracket_ended=ready_ended,
+        )
+        started_ok = True
+        return monitor
+    except (OSError, subprocess.SubprocessError) as error:
+        raise benchmark.ConfigError("host monitor could not start") from error
+    finally:
+        os.close(ready_read)
+        if ready_write >= 0:
+            os.close(ready_write)
+        if stop_read >= 0:
+            os.close(stop_read)
+        if process is not None and process.poll() is None and not started_ok:
+            process.kill()
+            process.wait()
+        if not started_ok:
+            os.close(stop_write)
+
+
+def _finish_host_monitor(monitor: _HostMonitorProcess) -> dict[str, Any]:
+    try:
+        os.close(monitor.stop_file_descriptor)
+    except OSError as error:
+        monitor.process.kill()
+        monitor.process.wait()
+        raise benchmark.ConfigError("host monitor stop signal failed") from error
+    try:
+        stdout, stderr = monitor.process.communicate(
+            timeout=_HOST_MONITOR_STOP_TIMEOUT_SECONDS,
+        )
+    except subprocess.TimeoutExpired as error:
+        monitor.process.kill()
+        monitor.process.communicate()
+        raise benchmark.ConfigError("host monitor did not stop") from error
+    if monitor.process.returncode != 0:
+        raise benchmark.ConfigError("host monitor failed")
+    if stderr:
+        raise benchmark.ConfigError("host monitor wrote unexpected diagnostics")
+    if not stdout or len(stdout) > _HOST_MONITOR_MAXIMUM_OUTPUT_BYTES:
+        raise benchmark.ConfigError("host monitor output is missing or too large")
+    try:
+        report = evidence._decode_json_text(
+            stdout.decode("utf-8"),
+            "host monitor output",
+        )
+    except (UnicodeError, ValueError) as error:
+        raise benchmark.ConfigError("host monitor output is not valid JSON") from error
+    if not isinstance(report, Mapping):
+        raise benchmark.ConfigError("host monitor output must be an object")
+    samples = report.get("samples")
+    if not isinstance(samples, list) or not samples:
+        raise benchmark.ConfigError("host monitor output has no samples")
+    initial = samples[0]
+    if not isinstance(initial, Mapping):
+        raise benchmark.ConfigError("host monitor initial sample is invalid")
+    initial_timestamp = initial.get("monotonic_seconds")
+    if (
+        isinstance(initial_timestamp, bool)
+        or not isinstance(initial_timestamp, (int, float))
+        or not math.isfinite(initial_timestamp)
+        or initial_timestamp < monitor.ready_bracket_started
+        - _HOST_MONITOR_TIMESTAMP_TOLERANCE_SECONDS
+        or initial_timestamp > monitor.ready_bracket_ended
+        + _HOST_MONITOR_TIMESTAMP_TOLERANCE_SECONDS
+    ):
+        raise benchmark.ConfigError("host monitor ready clock bracket is invalid")
+    return dict(report)
+
+
+def _summarize_host_monitor(
+    report: Any,
+    commands: Sequence[Mapping[str, Any]],
+    machine: Mapping[str, Any],
+    *,
+    supervisor_started: float,
+    supervisor_ended: float,
+    monitor_sha256: str,
+    monitor_executable_sha256: str,
+    outer_child_cpu_microseconds: Mapping[str, int],
+) -> dict[str, Any]:
+    monitor = evidence._mapping(report, "host monitor")
+    evidence._exact_keys(
+        monitor,
+        {
+            "schema_version",
+            "monotonic_clock",
+            "sample_interval_seconds",
+            "samples",
+            "events",
+        },
+        "host monitor",
+    )
+    if monitor["schema_version"] != 1:
+        raise evidence.EvidenceError("host monitor schema is invalid")
+    if monitor["monotonic_clock"] != "mach_absolute_time":
+        raise evidence.EvidenceError("host monitor clock is not mach_absolute_time")
+    interval = monitor["sample_interval_seconds"]
+    if (
+        isinstance(interval, bool)
+        or not isinstance(interval, (int, float))
+        or not math.isfinite(interval)
+        or not 0.05 <= interval <= _HOST_MONITOR_MAXIMUM_INTERVAL_SECONDS
+    ):
+        raise evidence.EvidenceError("host monitor sample interval is invalid")
+    if (
+        isinstance(supervisor_started, bool)
+        or isinstance(supervisor_ended, bool)
+        or not math.isfinite(supervisor_started)
+        or not math.isfinite(supervisor_ended)
+        or supervisor_started < 0
+        or supervisor_ended <= supervisor_started
+    ):
+        raise evidence.EvidenceError("host monitor supervisor window is invalid")
+
+    raw_samples = monitor["samples"]
+    if (
+        not isinstance(raw_samples, list)
+        or not 2 <= len(raw_samples) <= _HOST_MONITOR_MAXIMUM_SAMPLES
+    ):
+        raise evidence.EvidenceError("host monitor sample closure is incomplete")
+    samples: list[tuple[float, dict[str, Any]]] = []
+    previous_timestamp = -math.inf
+    for index, raw_sample in enumerate(raw_samples):
+        sample = evidence._mapping(raw_sample, f"host monitor samples[{index}]")
+        evidence._exact_keys(
+            sample,
+            {"monotonic_seconds", "state"},
+            f"host monitor samples[{index}]",
+        )
+        timestamp = sample["monotonic_seconds"]
+        if (
+            isinstance(timestamp, bool)
+            or not isinstance(timestamp, (int, float))
+            or not math.isfinite(timestamp)
+            or timestamp < 0
+            or timestamp <= previous_timestamp
+        ):
+            raise evidence.EvidenceError("host monitor timestamps are invalid")
+        state = evidence._host_state_snapshot(
+            sample["state"],
+            f"host monitor samples[{index}].state",
+        )
+        samples.append((float(timestamp), state))
+        previous_timestamp = float(timestamp)
+
+    timestamps = [timestamp for timestamp, _ in samples]
+    gaps = [right - left for left, right in zip(timestamps, timestamps[1:])]
+    maximum_gap = max(gaps)
+    if maximum_gap > max(2.5 * float(interval), 0.125) + 1e-9:
+        raise evidence.EvidenceError("host monitor sample gap exceeds the allowed interval")
+    first_timestamp = timestamps[0]
+    last_timestamp = timestamps[-1]
+    tolerance = _HOST_MONITOR_TIMESTAMP_TOLERANCE_SECONDS
+    if (
+        first_timestamp > supervisor_started + tolerance
+        or last_timestamp < supervisor_ended - tolerance
+        or supervisor_started - first_timestamp > maximum_gap + tolerance
+        or last_timestamp - supervisor_ended > maximum_gap + tolerance
+    ):
+        raise evidence.EvidenceError("host monitor does not bracket the supervisor clock window")
+
+    raw_events = monitor["events"]
+    if not isinstance(raw_events, list) or len(raw_events) > len(samples):
+        raise evidence.EvidenceError("host monitor event closure is invalid")
+    state_change_events = []
+    previous_event_key: tuple[float, str] | None = None
+    for index, raw_event in enumerate(raw_events):
+        event = evidence._mapping(raw_event, f"host monitor events[{index}]")
+        evidence._exact_keys(
+            event,
+            {"monotonic_seconds", "kind"},
+            f"host monitor events[{index}]",
+        )
+        event_timestamp = event["monotonic_seconds"]
+        event_kind = event["kind"]
+        if (
+            isinstance(event_timestamp, bool)
+            or not isinstance(event_timestamp, (int, float))
+            or not math.isfinite(event_timestamp)
+            or event_timestamp < first_timestamp - tolerance
+            or event_timestamp > last_timestamp + tolerance
+            or not isinstance(event_kind, str)
+            or event_kind not in {"thermal_state", "low_power_mode", "power_source"}
+        ):
+            raise evidence.EvidenceError("host monitor event is invalid")
+        event_key = (float(event_timestamp), event_kind)
+        if previous_event_key is not None and event_key < previous_event_key:
+            raise evidence.EvidenceError("host monitor events are not canonical")
+        previous_event_key = event_key
+        if supervisor_started <= float(event_timestamp) <= supervisor_ended:
+            state_change_events.append(
+                {
+                    "monotonic_seconds": float(event_timestamp),
+                    "kind": event_kind,
+                }
+            )
+
+    tick_fields = ("user", "system", "idle", "nice")
+    cumulative: list[dict[str, float]] = [{field: 0.0 for field in tick_fields}]
+    for (_, previous), (_, current) in zip(samples, samples[1:]):
+        cumulative.append(
+            {
+                field: cumulative[-1][field]
+                + evidence._wrapped_cpu_tick_delta(
+                    previous["cpu_ticks"][field],
+                    current["cpu_ticks"][field],
+                )
+                for field in tick_fields
+            }
+        )
+
+    def interpolated_ticks(timestamp: float) -> dict[str, float]:
+        if timestamp < first_timestamp - tolerance or timestamp > last_timestamp + tolerance:
+            raise evidence.EvidenceError("execution receipt falls outside host monitoring")
+        if timestamp <= first_timestamp:
+            return dict(cumulative[0])
+        if timestamp >= last_timestamp:
+            return dict(cumulative[-1])
+        lower_index = bisect.bisect_right(timestamps, timestamp) - 1
+        upper_index = lower_index + 1
+        span = timestamps[upper_index] - timestamps[lower_index]
+        ratio = (timestamp - timestamps[lower_index]) / span
+        return {
+            field: cumulative[lower_index][field]
+            + ratio * (cumulative[upper_index][field] - cumulative[lower_index][field])
+            for field in tick_fields
+        }
+
+    logical_cpus = machine.get("logical_cpus")
+    if type(logical_cpus) is not int or logical_cpus <= 0:
+        raise evidence.EvidenceError("host monitor logical CPU count is unavailable")
+    evidence._digest(monitor_sha256, "host monitor sha256")
+    evidence._digest(monitor_executable_sha256, "host monitor executable sha256")
+    evidence._exact_keys(
+        outer_child_cpu_microseconds,
+        {"user", "system"},
+        "outer child CPU",
+    )
+    if any(
+        type(outer_child_cpu_microseconds[field]) is not int
+        or not 0 <= outer_child_cpu_microseconds[field] < 1 << 64
+        for field in ("user", "system")
+    ):
+        raise evidence.EvidenceError("outer child CPU is outside UInt64")
+
+    command_environment = []
+    process_cpu_total = 0
+    for index, command in enumerate(commands):
+        run_id = command.get("run_id")
+        if not isinstance(run_id, str) or not run_id:
+            raise evidence.EvidenceError(f"commands[{index}] run_id is invalid")
+        started = command.get("started_monotonic_seconds")
+        ended = command.get("ended_monotonic_seconds")
+        if (
+            isinstance(started, bool)
+            or isinstance(ended, bool)
+            or not isinstance(started, (int, float))
+            or not isinstance(ended, (int, float))
+            or not math.isfinite(started)
+            or not math.isfinite(ended)
+            or ended <= started
+        ):
+            raise evidence.EvidenceError(f"commands[{index}] monitor timestamps are invalid")
+        process_cpu = evidence._mapping(
+            command.get("process_cpu_microseconds"),
+            f"commands[{index}].process_cpu_microseconds",
+        )
+        evidence._exact_keys(
+            process_cpu,
+            {"user", "system"},
+            f"commands[{index}].process_cpu_microseconds",
+        )
+        if any(
+            type(process_cpu[field]) is not int
+            or not 0 <= process_cpu[field] < 1 << 64
+            for field in ("user", "system")
+        ):
+            raise evidence.EvidenceError("execution receipt process CPU is outside UInt64")
+        duration = float(ended) - float(started)
+        command_process_cpu = process_cpu["user"] + process_cpu["system"]
+        if command_process_cpu > duration * logical_cpus * 1_000_000 * 1.05:
+            raise evidence.EvidenceError("execution receipt process CPU exceeds its wall-time bound")
+        process_cpu_total += command_process_cpu
+        start_ticks = interpolated_ticks(float(started))
+        end_ticks = interpolated_ticks(float(ended))
+        deltas = {field: end_ticks[field] - start_ticks[field] for field in tick_fields}
+        total_ticks = sum(deltas.values())
+        if total_ticks <= 0:
+            raise evidence.EvidenceError("host monitor CPU ticks did not advance")
+        host_busy = (deltas["user"] + deltas["system"] + deltas["nice"]) / total_ticks
+        process_fraction = command_process_cpu / (duration * logical_cpus * 1_000_000)
+        command_environment.append(
+            {
+                "run_id": run_id,
+                "host_busy_fraction": host_busy,
+                "process_cpu_fraction": process_fraction,
+                "external_cpu_fraction": max(0.0, host_busy - process_fraction),
+            }
+        )
+
+    outer_cpu_total = sum(outer_child_cpu_microseconds.values())
+    accounting_tolerance = max(100_000, math.ceil(outer_cpu_total * 0.01))
+    if process_cpu_total > outer_cpu_total + accounting_tolerance:
+        raise evidence.EvidenceError("execution receipt process CPU exceeds outer child CPU")
+
+    supervisor_start_ticks = interpolated_ticks(supervisor_started)
+    supervisor_end_ticks = interpolated_ticks(supervisor_ended)
+    supervisor_tick_deltas = {
+        field: supervisor_end_ticks[field] - supervisor_start_ticks[field]
+        for field in tick_fields
+    }
+    supervisor_total_ticks = sum(supervisor_tick_deltas.values())
+    if supervisor_total_ticks <= 0:
+        raise evidence.EvidenceError("host monitor supervisor CPU ticks did not advance")
+    supervisor_duration = supervisor_ended - supervisor_started
+    supervisor_host_busy = (
+        supervisor_tick_deltas["user"]
+        + supervisor_tick_deltas["system"]
+        + supervisor_tick_deltas["nice"]
+    ) / supervisor_total_ticks
+    supervisor_process_fraction = outer_cpu_total / (
+        supervisor_duration * logical_cpus * 1_000_000
+    )
+    if supervisor_process_fraction > 1.05 + 1e-12:
+        raise evidence.EvidenceError("outer child CPU exceeds its wall-time bound")
+    unattributed_child_cpu = max(0, outer_cpu_total - process_cpu_total)
+    unattributed_child_fraction = unattributed_child_cpu / (
+        supervisor_duration * logical_cpus * 1_000_000
+    )
+
+    first_state = samples[0][1]
+    last_state = samples[-1][1]
+    for field in ("vm_pageouts", "vm_swapouts"):
+        if last_state[field] < first_state[field]:
+            raise evidence.EvidenceError(f"host monitor {field} counter moved backwards")
+    return {
+        "schema_version": 1,
+        "monotonic_clock": "mach_absolute_time",
+        "monitor_sha256": monitor_sha256,
+        "monitor_executable_sha256": monitor_executable_sha256,
+        "sample_interval_seconds": float(interval),
+        "sample_count": len(samples),
+        "maximum_sample_gap_seconds": maximum_gap,
+        "first_monotonic_seconds": first_timestamp,
+        "last_monotonic_seconds": last_timestamp,
+        "state_change_events": state_change_events,
+        "power_sources": sorted({state["power_source"] for _, state in samples}),
+        "thermal_states": sorted({state["thermal_state"] for _, state in samples}),
+        "low_power_mode_observed": any(state["low_power_mode"] for _, state in samples),
+        "vm_pageouts_delta": last_state["vm_pageouts"] - first_state["vm_pageouts"],
+        "vm_swapouts_delta": last_state["vm_swapouts"] - first_state["vm_swapouts"],
+        "outer_child_cpu_microseconds": dict(outer_child_cpu_microseconds),
+        "supervisor_host_busy_fraction": supervisor_host_busy,
+        "supervisor_process_cpu_fraction": supervisor_process_fraction,
+        "supervisor_external_cpu_fraction": max(
+            0.0,
+            supervisor_host_busy - supervisor_process_fraction,
+        ),
+        "unattributed_child_cpu_fraction": unattributed_child_fraction,
+        "commands": command_environment,
+    }
 
 
 def _measurement_timeout_seconds(scale: int, override: str | None = None) -> float:
@@ -230,7 +706,8 @@ def _terminate_process_group(
     # Do not reap the session leader before the final group signal. Keeping it
     # unreaped prevents its process-group ID from being reused for unrelated work.
     time.sleep(grace_seconds)
-    _signal_process_group(process, signal.SIGKILL)
+    if _process_group_exists(process.pid):
+        _signal_process_group(process, signal.SIGKILL)
     try:
         return process.wait(timeout=grace_seconds)
     except subprocess.TimeoutExpired as error:
@@ -774,7 +1251,16 @@ def _orientation_candidate_records(
 ) -> list[Mapping[str, Any]]:
     timing = benchmark._require_mapping(observations.get("timing"), "observations timing")
     ordinary = timing.get("ordinary_runs")
-    expected_variants = ["candidate"] + ["baseline", "candidate"] * 3
+    expected_variants = [
+        "baseline",
+        "candidate",
+        "baseline",
+        "candidate",
+        "candidate",
+        "baseline",
+        "baseline",
+        "candidate",
+    ]
     if not isinstance(ordinary, list) or len(ordinary) != len(expected_variants):
         raise benchmark.ConfigError(
             "orientation extraction requires the bounded ordinary timing sequence"
@@ -790,7 +1276,7 @@ def _orientation_candidate_records(
         )
         if (
             record.get("variant") != expected_variant
-            or record.get("discarded") is not (index == 0)
+            or record.get("discarded") is not (index < 2)
         ):
             raise benchmark.ConfigError(
                 "orientation extraction requires the canonical ordinary timing sequence"
@@ -830,10 +1316,371 @@ def _write_exclusive_json(path: Path, value: Mapping[str, Any], label: str) -> N
             handle.write(evidence.canonical_json_bytes(value) + b"\n")
             handle.flush()
             os.fsync(handle.fileno())
+        directory_descriptor = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            os.fsync(directory_descriptor)
+        finally:
+            os.close(directory_descriptor)
     except FileExistsError as error:
         raise benchmark.ConfigError(
             f"measurement runner cannot pre-create supervisor-owned {label}"
         ) from error
+
+
+def _collector_identity() -> dict[str, Any]:
+    collector_path = Path(__file__).resolve()
+    root = collector_path.parents[2]
+    if collector_path != root / _COLLECTOR_RELATIVE_PATH:
+        raise benchmark.ConfigError("evidence collector is not running from the repository path")
+    return {
+        "protocol_version": evidence.PROTOCOL_VERSION,
+        "version": _COLLECTOR_VERSION,
+        "executable": _COLLECTOR_RELATIVE_PATH,
+        "sha256": evidence.sha256_file(collector_path),
+    }
+
+
+def _write_collector_status(
+    *,
+    artifact_root: Path,
+    request: Mapping[str, Any],
+    lane: str,
+    runner_identity: Mapping[str, Any],
+    machine: Mapping[str, Any],
+    disposition: str,
+    outcome: Mapping[str, Any] | None,
+) -> Path:
+    status_path = artifact_root / "collector-status.json"
+    for path, label in (
+        (artifact_root / "attestation.json", "attestation.json"),
+        (artifact_root / "lane-outcome.json", "lane-outcome.json"),
+        (status_path, "collector-status.json"),
+    ):
+        if path.exists() or path.is_symlink():
+            raise benchmark.ConfigError(
+                f"measurement runner cannot pre-create supervisor-owned {label}"
+            )
+    if disposition not in {"attestation_candidate", "lane_outcome"}:
+        raise benchmark.ConfigError("collector disposition is invalid")
+    if (disposition == "attestation_candidate") != (outcome is None):
+        raise benchmark.ConfigError("collector disposition does not match its outcome")
+    status = {
+        "schema_version": 1,
+        "request_sha256": evidence.sha256_bytes(
+            evidence.canonical_json_bytes(evidence.validate_request(request))
+        ),
+        "lane": lane,
+        "machine": dict(machine),
+        "measurement_runner": dict(runner_identity),
+        "collector": _collector_identity(),
+        "disposition": disposition,
+        "outcome": dict(outcome) if outcome is not None else None,
+    }
+    _write_exclusive_json(status_path, status, "collector-status.json")
+    return status_path
+
+
+def _collector_outcome_payload(
+    *,
+    kind: str,
+    reason: str,
+    exit_code: int | None,
+) -> dict[str, Any]:
+    stage = (
+        "measurement_environment"
+        if kind == "environment_rejected"
+        else {
+            "host_monitor_failed": "host_monitor",
+            "postprocessing_failed": "postprocessing",
+        }.get(reason, "measurement_runner")
+    )
+    return {
+        "kind": kind,
+        "stage": stage,
+        "reason": reason,
+        "exit_code": exit_code,
+    }
+
+
+def _write_collector_outcome(
+    *,
+    artifact_root: Path,
+    request: Mapping[str, Any],
+    lane: str,
+    runner_identity: Mapping[str, Any],
+    machine: Mapping[str, Any],
+    kind: str,
+    reason: str,
+    exit_code: int | None,
+) -> Path:
+    return _write_collector_status(
+        artifact_root=artifact_root,
+        request=request,
+        lane=lane,
+        runner_identity=runner_identity,
+        machine=machine,
+        disposition="lane_outcome",
+        outcome=_collector_outcome_payload(
+            kind=kind,
+            reason=reason,
+            exit_code=exit_code,
+        ),
+    )
+
+
+def _selected_lane_entries(
+    requests: Sequence[Any],
+    lane: str,
+) -> list[Mapping[str, Any]]:
+    selected: list[Mapping[str, Any]] = []
+    seen: set[tuple[str, int, str]] = set()
+    for raw_entry in requests:
+        if not isinstance(raw_entry, Mapping) or raw_entry.get("lane") != lane:
+            continue
+        entry = benchmark._require_mapping(raw_entry, "request index entry")
+        scene_id = benchmark._require_safe_token(entry.get("scene_id"), "request scene_id")
+        scale = entry.get("scale")
+        if type(scale) is not int or scale <= 0:
+            raise benchmark.ConfigError("request index entry scale is invalid")
+        key = (scene_id, scale, lane)
+        if key in seen:
+            raise benchmark.ConfigError("request index duplicates a scene-scale-lane key")
+        seen.add(key)
+        selected.append(entry)
+    return selected
+
+
+def _canonical_collector_status_bytes(path: Path, output_root: Path) -> tuple[bytes, Mapping[str, Any], Path]:
+    try:
+        canonical_output = output_root.resolve(strict=True)
+        relative = path.relative_to(output_root)
+    except (OSError, ValueError) as error:
+        raise benchmark.ConfigError("collector status escapes the benchmark output root") from error
+    if relative.as_posix() != PurePosixPath(relative.as_posix()).as_posix():
+        raise benchmark.ConfigError("collector status path is not canonical")
+    cursor = output_root
+    for component in relative.parts[:-1]:
+        cursor /= component
+        try:
+            metadata = cursor.lstat()
+        except OSError as error:
+            raise benchmark.ConfigError("collector status parent is missing") from error
+        if cursor.is_symlink() or not stat.S_ISDIR(metadata.st_mode):
+            raise benchmark.ConfigError("collector status path contains an unsafe parent")
+    try:
+        metadata = path.lstat()
+        resolved_parent = path.parent.resolve(strict=True)
+    except OSError as error:
+        raise benchmark.ConfigError("collector status is missing") from error
+    if (
+        path.is_symlink()
+        or not stat.S_ISREG(metadata.st_mode)
+        or metadata.st_nlink != 1
+        or metadata.st_size <= 0
+        or metadata.st_size > evidence.MAX_LANE_OUTCOME_BYTES
+        or (resolved_parent != canonical_output and canonical_output not in resolved_parent.parents)
+    ):
+        raise benchmark.ConfigError("collector status must be a bounded single-link regular file")
+    flags = os.O_RDONLY
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    try:
+        descriptor = os.open(path, flags)
+        with os.fdopen(descriptor, "rb", closefd=True) as handle:
+            opened = os.fstat(handle.fileno())
+            data = handle.read(evidence.MAX_LANE_OUTCOME_BYTES + 1)
+            after = os.fstat(handle.fileno())
+    except OSError as error:
+        raise benchmark.ConfigError("collector status could not be read safely") from error
+    stable_fields = ("st_dev", "st_ino", "st_size", "st_mtime_ns", "st_nlink")
+    if (
+        len(data) > evidence.MAX_LANE_OUTCOME_BYTES
+        or not stat.S_ISREG(opened.st_mode)
+        or opened.st_nlink != 1
+        or any(getattr(opened, field) != getattr(metadata, field) for field in stable_fields)
+        or any(getattr(after, field) != getattr(opened, field) for field in stable_fields)
+    ):
+        raise benchmark.ConfigError("collector status changed while it was read")
+    try:
+        value = json.loads(data.decode("utf-8"))
+        canonical = evidence.canonical_json_bytes(value) + b"\n"
+    except (UnicodeError, ValueError, TypeError, RecursionError) as error:
+        raise benchmark.ConfigError("collector status is not strict JSON") from error
+    if data != canonical or not isinstance(value, Mapping):
+        raise benchmark.ConfigError("collector status is not canonical JSON")
+    return data, value, relative
+
+
+def _collection_from_status(
+    *,
+    output_root: Path,
+    status_path: Path,
+    scene_id: str,
+    scale: int,
+    lane: str,
+    request: Mapping[str, Any],
+    runner_identity: Mapping[str, Any],
+    machine: Mapping[str, Any],
+    expected_relative: Path | None = None,
+) -> dict[str, Any]:
+    data, raw_status, relative = _canonical_collector_status_bytes(status_path, output_root)
+    if expected_relative is not None and relative != expected_relative:
+        raise benchmark.ConfigError("collector status path does not match its request index entry")
+    status = benchmark._require_mapping(raw_status, "collector status")
+    benchmark._require_exact_keys(
+        status,
+        {
+            "schema_version",
+            "request_sha256",
+            "lane",
+            "machine",
+            "measurement_runner",
+            "collector",
+            "disposition",
+            "outcome",
+        },
+        "collector status",
+    )
+    expected_request_digest = evidence.sha256_bytes(
+        evidence.canonical_json_bytes(evidence.validate_request(request))
+    )
+    if (
+        status["schema_version"] != 1
+        or status["request_sha256"] != expected_request_digest
+        or status["lane"] != lane
+        or status["machine"] != dict(machine)
+        or status["measurement_runner"] != dict(runner_identity)
+        or status["collector"] != _collector_identity()
+    ):
+        raise benchmark.ConfigError("collector status identity does not match its protected request")
+    disposition = status["disposition"]
+    outcome = status["outcome"]
+    if disposition == "attestation_candidate":
+        if outcome is not None:
+            raise benchmark.ConfigError("attestation candidate collector status carries an outcome")
+    elif disposition == "lane_outcome":
+        try:
+            evidence._validate_lane_outcome_payload(outcome)
+        except evidence.EvidenceError as error:
+            raise benchmark.ConfigError(f"collector lane outcome is invalid: {error}") from error
+    else:
+        raise benchmark.ConfigError("collector status disposition is invalid")
+    return {
+        "scene_id": scene_id,
+        "scale": scale,
+        "lane": lane,
+        "collector_status": relative.as_posix(),
+        "sha256": evidence.sha256_bytes(data),
+    }
+
+
+def _validate_completed_collection(
+    descriptor: Mapping[str, Any],
+    *,
+    output_root: Path,
+    expected_relative: Path,
+    scene_id: str,
+    scale: int,
+    lane: str,
+    request: Mapping[str, Any],
+    runner_identity: Mapping[str, Any],
+    machine: Mapping[str, Any],
+) -> dict[str, Any]:
+    collection = benchmark._require_mapping(descriptor, "completed lane collection")
+    benchmark._require_exact_keys(
+        collection,
+        {"scene_id", "scale", "lane", "collector_status", "sha256"},
+        "completed lane collection",
+    )
+    if (
+        collection["scene_id"] != scene_id
+        or collection["scale"] != scale
+        or collection["lane"] != lane
+        or collection["collector_status"] != expected_relative.as_posix()
+    ):
+        raise benchmark.ConfigError("completed lane collection does not match request order")
+    current = _collection_from_status(
+        output_root=output_root,
+        status_path=output_root / expected_relative,
+        scene_id=scene_id,
+        scale=scale,
+        lane=lane,
+        request=request,
+        runner_identity=runner_identity,
+        machine=machine,
+        expected_relative=expected_relative,
+    )
+    if current != dict(collection):
+        raise benchmark.ConfigError("completed collector status digest changed")
+    return current
+
+
+def _raise_invalid_runner_output(
+    *,
+    artifact_root: Path,
+    request: Mapping[str, Any],
+    lane: str,
+    runner_identity: Mapping[str, Any],
+    machine: Mapping[str, Any],
+    scene_id: str,
+    scale: int,
+    cause: BaseException,
+) -> NoReturn:
+    status_path = _write_collector_outcome(
+        artifact_root=artifact_root,
+        request=request,
+        lane=lane,
+        runner_identity=runner_identity,
+        machine=machine,
+        kind="execution_failed",
+        reason="invalid_output",
+        exit_code=0,
+    )
+    raise _CollectedOutcome(
+        f"{lane} measurement runner emitted invalid output for {scene_id}@{scale}",
+        scene_id=scene_id,
+        scale=scale,
+        lane=lane,
+        status_path=status_path,
+        request=request,
+        runner_identity=runner_identity,
+        machine=machine,
+    ) from cause
+
+
+def _raise_infrastructure_blocked(
+    *,
+    artifact_root: Path,
+    request: Mapping[str, Any],
+    lane: str,
+    runner_identity: Mapping[str, Any],
+    machine: Mapping[str, Any],
+    scene_id: str,
+    scale: int,
+    reason: str,
+    exit_code: int | None,
+    cause: BaseException,
+) -> NoReturn:
+    status_path = _write_collector_outcome(
+        artifact_root=artifact_root,
+        request=request,
+        lane=lane,
+        runner_identity=runner_identity,
+        machine=machine,
+        kind="infrastructure_blocked",
+        reason=reason,
+        exit_code=exit_code,
+    )
+    raise _CollectedOutcome(
+        f"{lane} protected evidence infrastructure failed for {scene_id}@{scale}",
+        scene_id=scene_id,
+        scale=scale,
+        lane=lane,
+        status_path=status_path,
+        request=request,
+        runner_identity=runner_identity,
+        machine=machine,
+    ) from cause
 
 
 def _execute_orientation_stage(
@@ -909,11 +1756,16 @@ def _execute_orientation_stage(
                     f"measurement runner cannot pre-create supervisor-owned {label}"
                 )
 
-        verified = _verify_renderer_closure(
-            renderer_closure_path,
-            renderer_identity,
-            f"immediately before orientation extraction for {run_id}",
-        )
+        try:
+            verified = _verify_renderer_closure(
+                renderer_closure_path,
+                renderer_identity,
+                f"immediately before orientation extraction for {run_id}",
+            )
+        except Exception as error:
+            raise _IntegrityFailure(
+                f"renderer closure changed before orientation extraction for {run_id}"
+            ) from error
         immutable_digests = {
             geometry_manifest: evidence.sha256_file(geometry_manifest),
             candidate_images: evidence.sha256_file(candidate_images),
@@ -978,40 +1830,45 @@ def _execute_orientation_stage(
             launch_error = error
         finally:
             ended_monotonic = time.monotonic()
-            _verify_renderer_closure(
-                renderer_closure_path,
-                renderer_identity,
-                f"after orientation extraction for {run_id}",
-            )
-            for path, digest in immutable_digests.items():
-                _verify_file_digest(path, digest, f"orientation input {path.name}")
-            _verify_file_digest(request_path, request_digest, "evidence request")
+            try:
+                _verify_renderer_closure(
+                    renderer_closure_path,
+                    renderer_identity,
+                    f"after orientation extraction for {run_id}",
+                )
+                for path, digest in immutable_digests.items():
+                    _verify_file_digest(path, digest, f"orientation input {path.name}")
+                _verify_file_digest(request_path, request_digest, "evidence request")
+            except Exception as error:
+                raise _IntegrityFailure(
+                    f"protected orientation inputs changed during {run_id}"
+                ) from error
         if completed is None:
             detail = launch_error.strerror if launch_error is not None else "unknown launch failure"
-            raise benchmark.ConfigError(
+            raise _PostprocessingFailure(
                 f"orientation driver could not start for {run_id}: {detail}"
             )
         if timed_out:
-            raise benchmark.ConfigError(
+            raise _PostprocessingFailure(
                 f"orientation driver timed out for {run_id} after {orientation_timeout:g} seconds"
             )
         if completed.returncode != 0:
-            raise benchmark.ConfigError(
+            raise _PostprocessingFailure(
                 f"orientation driver failed for {run_id} with exit {completed.returncode}"
             )
-        _require_single_link_artifact(
-            metrics_path,
-            artifact_root,
-            f"orientation metrics for {run_id}",
-        )
-        raw_metrics = _load(metrics_path, f"orientation metrics for {run_id}")
         try:
+            _require_single_link_artifact(
+                metrics_path,
+                artifact_root,
+                f"orientation metrics for {run_id}",
+            )
+            raw_metrics = _load(metrics_path, f"orientation metrics for {run_id}")
             metrics = evidence.validate_orientation_metrics(
                 raw_metrics,
                 f"orientation metrics for {run_id}",
             )
-        except evidence.EvidenceError as error:
-            raise benchmark.ConfigError(str(error)) from error
+        except (benchmark.ConfigError, evidence.EvidenceError) as error:
+            raise _PostprocessingFailure(str(error)) from error
         metrics_digest = evidence.sha256_file(metrics_path)
         aggregate_runs.append(
             {
@@ -1165,7 +2022,7 @@ def _validate_render_job(
             f"render job views[{position}]",
         )
         if view.get("holdout_index") != holdout_index:
-            raise benchmark.ConfigError("render job views are not in signed holdout order")
+            raise benchmark.ConfigError("render job views are not in bound holdout order")
         sources = view.get("sources")
         if not isinstance(sources, list) or len(sources) != len(evidence.RENDER_VARIANTS):
             raise benchmark.ConfigError("render job sources are incomplete")
@@ -1249,11 +2106,14 @@ def _execute_rendering_stage(
                 f"measurement runner cannot pre-create supervisor-owned {label}"
             )
 
-    verified = _verify_renderer_closure(
-        renderer_closure_path,
-        renderer_identity,
-        "immediately before rendering",
-    )
+    try:
+        verified = _verify_renderer_closure(
+            renderer_closure_path,
+            renderer_identity,
+            "immediately before rendering",
+        )
+    except Exception as error:
+        raise _IntegrityFailure("renderer closure changed before rendering") from error
     _validate_render_job(
         job_path,
         artifact_root,
@@ -1304,27 +2164,35 @@ def _execute_rendering_stage(
         launch_error = error
     finally:
         ended_monotonic = time.monotonic()
-        _verify_renderer_closure(
-            renderer_closure_path,
-            renderer_identity,
-            "after rendering",
-        )
-        _verify_file_digest(job_path, job_digest, "render job")
-        _verify_file_digest(request_path, request_digest, "evidence request")
+        try:
+            _verify_renderer_closure(
+                renderer_closure_path,
+                renderer_identity,
+                "after rendering",
+            )
+            _verify_file_digest(job_path, job_digest, "render job")
+            _verify_file_digest(request_path, request_digest, "evidence request")
+        except Exception as error:
+            raise _IntegrityFailure("protected rendering inputs changed") from error
     if completed is None:
         detail = launch_error.strerror if launch_error is not None else "unknown launch failure"
-        raise benchmark.ConfigError(f"rendering driver could not start: {detail}")
+        raise _PostprocessingFailure(f"rendering driver could not start: {detail}")
     if timed_out:
-        raise benchmark.ConfigError(
+        raise _PostprocessingFailure(
             f"rendering driver timed out after {timeout_seconds:g} seconds"
         )
     if completed.returncode != 0:
-        raise benchmark.ConfigError(
+        raise _PostprocessingFailure(
             f"rendering driver failed with exit {completed.returncode}"
         )
-    _require_owned_artifact(manifest_path, artifact_root, "rendering-manifest.json")
-    if supervisor_path.exists() or supervisor_path.is_symlink():
-        raise benchmark.ConfigError("rendering driver cannot pre-create render-supervisor.json")
+    try:
+        _require_owned_artifact(manifest_path, artifact_root, "rendering-manifest.json")
+        if supervisor_path.exists() or supervisor_path.is_symlink():
+            raise benchmark.ConfigError(
+                "rendering driver cannot pre-create render-supervisor.json"
+            )
+    except benchmark.ConfigError as error:
+        raise _PostprocessingFailure(str(error)) from error
     manifest_digest = evidence.sha256_file(manifest_path)
     actual_argv_digest = evidence.sha256_bytes(evidence.canonical_json_bytes(command))
     receipt = {
@@ -1352,7 +2220,7 @@ def _execute_rendering_stage(
     return receipt
 
 
-def run_lane(
+def _run_lane_attempt(
     index_path: Path,
     requests_root: Path,
     corpus_path: Path,
@@ -1364,7 +2232,8 @@ def run_lane(
     lane: str,
     runner_path: Path,
     renderer_closure_path: Path,
-    evidence_key_path: Path,
+    *,
+    completed_collections: MutableMapping[tuple[str, int, str], dict[str, Any]],
 ) -> dict[str, Any]:
     if lane not in evidence.RELEASE_LANES:
         raise benchmark.ConfigError("unsupported benchmark lane")
@@ -1386,6 +2255,11 @@ def run_lane(
             "baseline_toolchain_identity",
             "baseline_configuration_digest",
             "baseline_run_configuration",
+            "benchmark_contract_sha256",
+            "corpus_manifest",
+            "corpus_manifest_sha256",
+            "reference_config",
+            "reference_config_sha256",
             "runner_identities",
             "requests",
         },
@@ -1425,7 +2299,7 @@ def run_lane(
         app_version=benchmark.APP_VERSION,
         toolchain_identity=toolchain_identity,
     )
-    index = benchmark.validate_request_index(index, identity, corpus)
+    index = benchmark.validate_request_index(index, identity, corpus, config)
     approved_runner = index["runner_identities"][lane]
     renderer_identity = index["runner_identities"][evidence.RENDERING_DRIVER_IDENTITY]
     _verify_runner_digest(runner, approved_runner, "before the first scene")
@@ -1437,11 +2311,10 @@ def run_lane(
 
     machine = evidence.collect_machine_metadata()
     evidence.validate_machine_lane(machine, lane)
-    key = evidence.load_key(evidence_key_path)
     requests = index["requests"]
     if not isinstance(requests, list):
         raise benchmark.ConfigError("request index requests must be an array")
-    selected = [entry for entry in requests if isinstance(entry, Mapping) and entry.get("lane") == lane]
+    selected = _selected_lane_entries(requests, lane)
     if not selected:
         raise benchmark.ConfigError(f"request index contains no {lane} work")
 
@@ -1483,6 +2356,7 @@ def run_lane(
             identity,
             request["binding"]["input_digest"],
             index["runner_identities"][evidence.RENDERING_DRIVER_IDENTITY],
+            index["benchmark_contract_sha256"],
         )
         if request != expected_request:
             raise benchmark.ConfigError("request policy does not match the prepared corpus and lane")
@@ -1496,6 +2370,7 @@ def run_lane(
             "baseline_git_commit",
             "baseline_toolchain_identity",
             "baseline_configuration_digest",
+            "benchmark_contract_sha256",
         ):
             if request["binding"][field] != index[field]:
                 raise benchmark.ConfigError(f"request {field} does not match its approved index")
@@ -1511,6 +2386,25 @@ def run_lane(
             raise benchmark.ConfigError(f"{scene_id} input does not match the prepared request")
 
         evidence_relative = _relative(entry.get("evidence_path"), "request evidence path")
+        key = (scene_id, scale, lane)
+        expected_status_relative = (
+            evidence_relative / str(scale) / lane / "collector-status.json"
+        )
+        if key in completed_collections:
+            results.append(
+                _validate_completed_collection(
+                    completed_collections[key],
+                    output_root=output_root,
+                    expected_relative=expected_status_relative,
+                    scene_id=scene_id,
+                    scale=scale,
+                    lane=lane,
+                    request=request,
+                    runner_identity=approved_runner,
+                    machine=machine,
+                )
+            )
+            continue
         artifact_root = _prepare_artifact_root(output_root, evidence_relative, scale, lane)
         command_log = artifact_root / "command.jsonl"
         supervisor_log = artifact_root / "supervisor-command.jsonl"
@@ -1575,43 +2469,207 @@ def run_lane(
             evidence.canonical_json_bytes({"event": "started", "at": started, "argv": redacted_command})
             + b"\n"
         )
-        _verify_runner_digest(runner, approved_runner, "immediately before subprocess launch")
+        try:
+            _verify_runner_digest(
+                runner,
+                approved_runner,
+                "immediately before subprocess launch",
+            )
+        except Exception as error:
+            status_path = _write_collector_outcome(
+                artifact_root=artifact_root,
+                request=request,
+                lane=lane,
+                runner_identity=approved_runner,
+                machine=machine,
+                kind="execution_failed",
+                reason="integrity_failed",
+                exit_code=None,
+            )
+            raise _CollectedOutcome(
+                f"{lane} measurement integrity verification failed for {scene_id}@{scale}",
+                scene_id=scene_id,
+                scale=scale,
+                lane=lane,
+                status_path=status_path,
+                request=request,
+                runner_identity=approved_runner,
+                machine=machine,
+            ) from error
         completed: subprocess.CompletedProcess[bytes] | None = None
         launch_error: OSError | None = None
+        process_error: benchmark.ConfigError | None = None
+        monitor_error: Exception | None = None
+        integrity_error: Exception | None = None
         timed_out = False
+        runner_environment = _measurement_environment(artifact_root)
+        try:
+            child_cpu_start = _children_cpu_seconds()
+        except Exception as error:
+            _raise_infrastructure_blocked(
+                artifact_root=artifact_root,
+                request=request,
+                lane=lane,
+                runner_identity=approved_runner,
+                machine=machine,
+                scene_id=scene_id,
+                scale=scale,
+                reason="host_monitor_failed",
+                exit_code=None,
+                cause=error,
+            )
+        try:
+            verified_renderer = _verify_renderer_closure(
+                renderer_closure_path,
+                renderer_identity,
+                "immediately before host monitoring",
+            )
+        except Exception as error:
+            status_path = _write_collector_outcome(
+                artifact_root=artifact_root,
+                request=request,
+                lane=lane,
+                runner_identity=approved_runner,
+                machine=machine,
+                kind="execution_failed",
+                reason="integrity_failed",
+                exit_code=None,
+            )
+            raise _CollectedOutcome(
+                f"{lane} measurement integrity verification failed for {scene_id}@{scale}",
+                scene_id=scene_id,
+                scale=scale,
+                lane=lane,
+                status_path=status_path,
+                request=request,
+                runner_identity=approved_runner,
+                machine=machine,
+            ) from error
+        try:
+            host_monitor = _start_host_monitor(
+                verified_renderer.executable,
+                runner_environment,
+                timeout_seconds,
+            )
+        except Exception as error:
+            _raise_infrastructure_blocked(
+                artifact_root=artifact_root,
+                request=request,
+                lane=lane,
+                runner_identity=approved_runner,
+                machine=machine,
+                scene_id=scene_id,
+                scale=scale,
+                reason="host_monitor_failed",
+                exit_code=None,
+                cause=error,
+            )
         started_monotonic = time.monotonic()
+        host_monitor_report: dict[str, Any] | None = None
+        child_cpu_end: dict[str, float] | None = None
         try:
             with stdout_log.open("wb") as stdout_handle, stderr_log.open("wb") as stderr_handle:
                 completed, timed_out = _run_measurement_process(
                     command,
                     stdout_handle,
                     stderr_handle,
-                    _measurement_environment(artifact_root),
+                    runner_environment,
                     timeout_seconds,
                 )
         except OSError as error:
             launch_error = error
+        except benchmark.ConfigError as error:
+            process_error = error
         finally:
             ended_monotonic = time.monotonic()
-            _verify_runner_digest(runner, approved_runner, "after subprocess completion")
-            _verify_candidate_checkout(index["git_commit"])
-            for label, digest in protected_file_digests.items():
-                _verify_file_digest(
-                    {"request index": index_path, "corpus": corpus_path, "reference config": reference_config_path}[label],
-                    digest,
-                    label,
+            try:
+                child_cpu_end = _children_cpu_seconds()
+            except Exception as error:
+                monitor_error = error
+            try:
+                host_monitor_report = _finish_host_monitor(host_monitor)
+            except Exception as error:
+                monitor_error = monitor_error or error
+            try:
+                _verify_runner_digest(runner, approved_runner, "after subprocess completion")
+                _verify_candidate_checkout(index["git_commit"])
+                for label, digest in protected_file_digests.items():
+                    _verify_file_digest(
+                        {"request index": index_path, "corpus": corpus_path, "reference config": reference_config_path}[label],
+                        digest,
+                        label,
+                    )
+                _verify_file_digest(request_path, request_digest, "evidence request")
+                _verify_renderer_closure(
+                    renderer_closure_path,
+                    renderer_identity,
+                    "after measurement completion",
                 )
-            _verify_file_digest(request_path, request_digest, "evidence request")
-            _verify_renderer_closure(
-                renderer_closure_path,
-                renderer_identity,
-                "after measurement completion",
+            except Exception as error:
+                integrity_error = error
+        if integrity_error is not None:
+            status_path = _write_collector_outcome(
+                artifact_root=artifact_root,
+                request=request,
+                lane=lane,
+                runner_identity=approved_runner,
+                machine=machine,
+                kind="execution_failed",
+                reason="integrity_failed",
+                exit_code=None,
             )
+            raise _CollectedOutcome(
+                f"{lane} measurement integrity verification failed for {scene_id}@{scale}",
+                scene_id=scene_id,
+                scale=scale,
+                lane=lane,
+                status_path=status_path,
+                request=request,
+                runner_identity=approved_runner,
+                machine=machine,
+            ) from integrity_error
+        if process_error is not None:
+            status_path = _write_collector_outcome(
+                artifact_root=artifact_root,
+                request=request,
+                lane=lane,
+                runner_identity=approved_runner,
+                machine=machine,
+                kind="execution_failed",
+                reason="process_isolation_failed",
+                exit_code=None,
+            )
+            raise _CollectedOutcome(
+                f"{lane} measurement process isolation failed for {scene_id}@{scale}",
+                scene_id=scene_id,
+                scale=scale,
+                lane=lane,
+                status_path=status_path,
+                request=request,
+                runner_identity=approved_runner,
+                machine=machine,
+            ) from process_error
         if completed is None:
-            detail = launch_error.strerror if launch_error is not None else "unknown launch failure"
-            raise benchmark.ConfigError(
-                f"{lane} measurement runner could not start for {scene_id}@{scale}: {detail}"
+            status_path = _write_collector_outcome(
+                artifact_root=artifact_root,
+                request=request,
+                lane=lane,
+                runner_identity=approved_runner,
+                machine=machine,
+                kind="execution_failed",
+                reason="launch_failed",
+                exit_code=None,
             )
+            raise _CollectedOutcome(
+                f"{lane} measurement runner could not start for {scene_id}@{scale}",
+                scene_id=scene_id,
+                scale=scale,
+                lane=lane,
+                status_path=status_path,
+                request=request,
+                runner_identity=approved_runner,
+                machine=machine,
+            ) from launch_error
         ended = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
         with supervisor_log.open("ab") as handle:
             handle.write(
@@ -1621,62 +2679,294 @@ def run_lane(
                 + b"\n"
             )
         if timed_out:
-            raise benchmark.ConfigError(
+            status_path = _write_collector_outcome(
+                artifact_root=artifact_root,
+                request=request,
+                lane=lane,
+                runner_identity=approved_runner,
+                machine=machine,
+                kind="execution_failed",
+                reason="timed_out",
+                exit_code=completed.returncode,
+            )
+            raise _CollectedOutcome(
                 f"{lane} measurement runner timed out for {scene_id}@{scale} "
-                f"after {timeout_seconds:g} seconds"
+                f"after {timeout_seconds:g} seconds",
+                scene_id=scene_id,
+                scale=scale,
+                lane=lane,
+                status_path=status_path,
+                request=request,
+                runner_identity=approved_runner,
+                machine=machine,
             )
         if completed.returncode != 0:
-            raise benchmark.ConfigError(
-                f"{lane} measurement runner failed for {scene_id}@{scale} with exit {completed.returncode}"
+            status_path = _write_collector_outcome(
+                artifact_root=artifact_root,
+                request=request,
+                lane=lane,
+                runner_identity=approved_runner,
+                machine=machine,
+                kind="execution_failed",
+                reason="nonzero_exit",
+                exit_code=completed.returncode,
             )
+            raise _CollectedOutcome(
+                f"{lane} measurement runner failed for {scene_id}@{scale} with exit {completed.returncode}",
+                scene_id=scene_id,
+                scale=scale,
+                lane=lane,
+                status_path=status_path,
+                request=request,
+                runner_identity=approved_runner,
+                machine=machine,
+            )
+        if monitor_error is not None or host_monitor_report is None or child_cpu_end is None:
+            _raise_infrastructure_blocked(
+                artifact_root=artifact_root,
+                request=request,
+                lane=lane,
+                runner_identity=approved_runner,
+                machine=machine,
+                scene_id=scene_id,
+                scale=scale,
+                reason="host_monitor_failed",
+                exit_code=0,
+                cause=monitor_error
+                or benchmark.ConfigError("measurement environment receipt is incomplete"),
+            )
+        host_monitor_path = artifact_root / "host-monitor.json"
+        _write_exclusive_json(host_monitor_path, host_monitor_report, "host-monitor.json")
+        host_monitor_digest = evidence.sha256_file(host_monitor_path)
+        outer_child_cpu_microseconds = {
+            field: max(0, round((child_cpu_end[field] - child_cpu_start[field]) * 1_000_000))
+            for field in ("user", "system")
+        }
 
         observations_path = artifact_root / "observations.json"
-        observations = _load(observations_path, "raw observations")
-        if not isinstance(observations, Mapping):
-            raise benchmark.ConfigError("measurement runner observations must be an object")
-        raw_receipts = observations.get("commands")
-        if not isinstance(raw_receipts, list) or any(
-            not isinstance(receipt, Mapping) for receipt in raw_receipts
-        ):
-            raise benchmark.ConfigError("measurement runner did not emit execution receipts")
+        try:
+            observations = evidence._load_bounded_json(
+                observations_path,
+                "raw observations",
+                maximum_bytes=evidence.MAX_OBSERVATIONS_BYTES,
+            )
+            if not isinstance(observations, Mapping):
+                raise benchmark.ConfigError(
+                    "measurement runner observations must be an object"
+                )
+            raw_receipts = observations.get("commands")
+            if (
+                not isinstance(raw_receipts, list)
+                or not raw_receipts
+                or any(not isinstance(receipt, Mapping) for receipt in raw_receipts)
+            ):
+                raise benchmark.ConfigError(
+                    "measurement runner did not emit execution receipts"
+                )
+            raw_artifacts = observations.get("artifacts")
+            if not isinstance(raw_artifacts, dict):
+                raise benchmark.ConfigError(
+                    "measurement runner artifacts must be an object"
+                )
+            environment_commands = []
+            logical_cpus = machine.get("logical_cpus")
+            if type(logical_cpus) is not int or logical_cpus <= 0:
+                raise benchmark.ConfigError("measurement machine CPU count is unavailable")
+            declared_process_cpu = 0
+            for receipt in raw_receipts:
+                run_id = receipt.get("run_id")
+                receipt_started = receipt.get("started_monotonic_seconds")
+                receipt_ended = receipt.get("ended_monotonic_seconds")
+                process_cpu = receipt.get("process_cpu_microseconds")
+                if (
+                    not isinstance(run_id, str)
+                    or not run_id
+                    or isinstance(receipt_started, bool)
+                    or isinstance(receipt_ended, bool)
+                    or not isinstance(receipt_started, (int, float))
+                    or not isinstance(receipt_ended, (int, float))
+                    or not math.isfinite(receipt_started)
+                    or not math.isfinite(receipt_ended)
+                    or receipt_ended <= receipt_started
+                    or receipt_started
+                    < started_monotonic - _HOST_MONITOR_TIMESTAMP_TOLERANCE_SECONDS
+                    or receipt_ended
+                    > ended_monotonic + _HOST_MONITOR_TIMESTAMP_TOLERANCE_SECONDS
+                    or not isinstance(process_cpu, Mapping)
+                    or set(process_cpu) != {"user", "system"}
+                    or any(
+                        type(process_cpu[field]) is not int
+                        or not 0 <= process_cpu[field] < 1 << 64
+                        for field in ("user", "system")
+                    )
+                ):
+                    raise benchmark.ConfigError(
+                        "measurement runner emitted an invalid execution receipt"
+                    )
+                process_cpu_total = process_cpu["user"] + process_cpu["system"]
+                if process_cpu_total > (
+                    (receipt_ended - receipt_started)
+                    * logical_cpus
+                    * 1_000_000
+                    * 1.05
+                ):
+                    raise benchmark.ConfigError(
+                        "measurement runner execution receipt exceeds its wall-time CPU bound"
+                    )
+                declared_process_cpu += process_cpu_total
+                environment_commands.append(
+                    {
+                        "run_id": run_id,
+                        "started_monotonic_seconds": receipt_started,
+                        "ended_monotonic_seconds": receipt_ended,
+                        "process_cpu_microseconds": dict(process_cpu),
+                    }
+                )
+            outer_child_cpu = sum(outer_child_cpu_microseconds.values())
+            if declared_process_cpu > outer_child_cpu + max(
+                100_000,
+                math.ceil(outer_child_cpu * 0.01),
+            ):
+                raise benchmark.ConfigError(
+                    "measurement runner execution receipts exceed outer child CPU"
+                )
+        except (benchmark.ConfigError, OSError, UnicodeError, ValueError) as error:
+            _raise_invalid_runner_output(
+                artifact_root=artifact_root,
+                request=request,
+                lane=lane,
+                runner_identity=approved_runner,
+                machine=machine,
+                scene_id=scene_id,
+                scale=scale,
+                cause=error,
+            )
+        try:
+            measurement_environment = _summarize_host_monitor(
+                host_monitor_report,
+                raw_receipts,
+                machine,
+                supervisor_started=started_monotonic,
+                supervisor_ended=ended_monotonic,
+                monitor_sha256=host_monitor_digest,
+                monitor_executable_sha256=renderer_identity["executable_sha256"],
+                outer_child_cpu_microseconds=outer_child_cpu_microseconds,
+            )
+            environment_rejections = evidence.measurement_environment_rejections(
+                measurement_environment,
+                machine,
+                environment_commands,
+                started_monotonic,
+                ended_monotonic,
+                artifact_root / "measurement-environment.json",
+                renderer_identity["executable_sha256"],
+            )
+        except (benchmark.ConfigError, evidence.EvidenceError) as error:
+            _raise_infrastructure_blocked(
+                artifact_root=artifact_root,
+                request=request,
+                lane=lane,
+                runner_identity=approved_runner,
+                machine=machine,
+                scene_id=scene_id,
+                scale=scale,
+                reason="host_monitor_failed",
+                exit_code=0,
+                cause=error,
+            )
 
         oriented = _orientation_required(request, lane)
-        if oriented:
-            _execute_orientation_stage(
-                artifact_root=artifact_root,
-                request=request,
-                request_path=request_path,
-                request_digest=request_digest,
-                renderer_closure_path=renderer_closure_path,
-                renderer_identity=renderer_identity,
-                observations=observations,
-                commands=raw_receipts,
-                timeout_seconds=timeout_seconds,
-            )
-            _verify_candidate_checkout(index["git_commit"])
-
         rendered = _rendering_required(request, lane)
-        if rendered:
-            _execute_rendering_stage(
+        try:
+            if oriented:
+                _execute_orientation_stage(
+                    artifact_root=artifact_root,
+                    request=request,
+                    request_path=request_path,
+                    request_digest=request_digest,
+                    renderer_closure_path=renderer_closure_path,
+                    renderer_identity=renderer_identity,
+                    observations=observations,
+                    commands=raw_receipts,
+                    timeout_seconds=timeout_seconds,
+                )
+                try:
+                    _verify_candidate_checkout(index["git_commit"])
+                except Exception as error:
+                    raise _IntegrityFailure(
+                        "candidate checkout changed during orientation extraction"
+                    ) from error
+
+            if rendered:
+                _execute_rendering_stage(
+                    artifact_root=artifact_root,
+                    request=request,
+                    request_path=request_path,
+                    request_digest=request_digest,
+                    renderer_closure_path=renderer_closure_path,
+                    renderer_identity=renderer_identity,
+                    candidate_checkout=candidate_checkout,
+                    baseline_checkout=baseline_checkout,
+                    commands=raw_receipts,
+                    timeout_seconds=timeout_seconds,
+                )
+                try:
+                    _verify_candidate_checkout(index["git_commit"])
+                except Exception as error:
+                    raise _IntegrityFailure(
+                        "candidate checkout changed during rendering"
+                    ) from error
+        except _IntegrityFailure as error:
+            status_path = _write_collector_outcome(
                 artifact_root=artifact_root,
                 request=request,
-                request_path=request_path,
-                request_digest=request_digest,
-                renderer_closure_path=renderer_closure_path,
-                renderer_identity=renderer_identity,
-                candidate_checkout=candidate_checkout,
-                baseline_checkout=baseline_checkout,
-                commands=raw_receipts,
-                timeout_seconds=timeout_seconds,
+                lane=lane,
+                runner_identity=approved_runner,
+                machine=machine,
+                kind="execution_failed",
+                reason="integrity_failed",
+                exit_code=None,
+            )
+            raise _CollectedOutcome(
+                f"{lane} measurement integrity verification failed for {scene_id}@{scale}",
+                scene_id=scene_id,
+                scale=scale,
+                lane=lane,
+                status_path=status_path,
+                request=request,
+                runner_identity=approved_runner,
+                machine=machine,
+            ) from error
+        except _PostprocessingFailure as error:
+            _raise_infrastructure_blocked(
+                artifact_root=artifact_root,
+                request=request,
+                lane=lane,
+                runner_identity=approved_runner,
+                machine=machine,
+                scene_id=scene_id,
+                scale=scale,
+                reason="postprocessing_failed",
+                exit_code=0,
+                cause=error,
+            )
+        except (benchmark.ConfigError, evidence.EvidenceError) as error:
+            _raise_invalid_runner_output(
+                artifact_root=artifact_root,
+                request=request,
+                lane=lane,
+                runner_identity=approved_runner,
+                machine=machine,
+                scene_id=scene_id,
+                scale=scale,
+                cause=error,
             )
 
         command_log.write_bytes(
             b"".join(evidence.canonical_json_bytes(receipt) + b"\n" for receipt in raw_receipts)
         )
-        raw_artifacts = observations.get("artifacts")
-        if not isinstance(raw_artifacts, dict):
-            raise benchmark.ConfigError("measurement runner artifacts must be an object")
         raw_artifacts["supervisor_run"] = "supervisor-run.json"
+        raw_artifacts["host_monitor"] = "host-monitor.json"
         if oriented:
             raw_artifacts.update(
                 {
@@ -1695,7 +2985,7 @@ def run_lane(
                 }
             )
         supervisor_run = {
-            "schema_version": 1,
+            "schema_version": 3,
             "scene_id": scene_id,
             "scale": scale,
             "lane": lane,
@@ -1709,60 +2999,193 @@ def run_lane(
             "started_monotonic_seconds": started_monotonic,
             "ended_monotonic_seconds": ended_monotonic,
             "exit_code": completed.returncode,
+            "measurement_environment": measurement_environment,
         }
-        (artifact_root / "supervisor-run.json").write_bytes(
-            evidence.canonical_json_bytes(supervisor_run) + b"\n"
+        _write_exclusive_json(
+            artifact_root / "supervisor-run.json",
+            supervisor_run,
+            "supervisor-run.json",
         )
         observations_path.write_bytes(evidence.canonical_json_bytes(observations) + b"\n")
-        attestation = evidence.produce_attestation(
-            request,
-            observations,
-            artifact_root,
-            artifact_root / "attestation.json",
-            key,
-            lane,
-            approved_runner,
-            machine=machine,
-        )
-        attestation_path = artifact_root / "attestation.json"
-        benchmark.atomic_write_json(attestation_path, attestation)
-        if benchmark.digest_input(
-            media,
-            trusted_root=corpus_path.parent,
-        ) != expected_input_digest:
-            raise benchmark.ConfigError(f"{scene_id} input changed during measurement")
-        results.append(
-            {
-                "scene_id": scene_id,
-                "scale": scale,
-                "lane": lane,
-                "attestation": (evidence_relative / str(scale) / lane / "attestation.json").as_posix(),
-                "sha256": evidence.sha256_file(attestation_path),
-            }
-        )
+        for path, label in (
+            (artifact_root / "attestation.json", "attestation.json"),
+            (artifact_root / "lane-outcome.json", "lane-outcome.json"),
+            (artifact_root / "collector-status.json", "collector-status.json"),
+        ):
+            if path.exists() or path.is_symlink():
+                raise benchmark.ConfigError(
+                    f"measurement runner cannot pre-create supervisor-owned {label}"
+                )
 
-    _verify_runner_digest(runner, approved_runner, "at lane completion")
-    _verify_renderer_closure(
-        renderer_closure_path,
-        renderer_identity,
-        "at lane completion",
-    )
-    _verify_candidate_checkout(index["git_commit"])
-    for label, digest in protected_file_digests.items():
-        _verify_file_digest(
-            {"request index": index_path, "corpus": corpus_path, "reference config": reference_config_path}[label],
-            digest,
-            label,
+        def verify_publication_integrity(phase: str) -> None:
+            _verify_runner_digest(runner, approved_runner, phase)
+            _verify_renderer_closure(renderer_closure_path, renderer_identity, phase)
+            _verify_candidate_checkout(index["git_commit"])
+            for label, digest in protected_file_digests.items():
+                _verify_file_digest(
+                    {
+                        "request index": index_path,
+                        "corpus": corpus_path,
+                        "reference config": reference_config_path,
+                    }[label],
+                    digest,
+                    label,
+                )
+            _verify_file_digest(request_path, request_digest, "evidence request")
+            if benchmark.digest_input(
+                media,
+                trusted_root=corpus_path.parent,
+            ) != expected_input_digest:
+                raise benchmark.ConfigError(
+                    f"{scene_id} input changed during measurement"
+                )
+            if (
+                benchmark.resolved_toolchain_identity(toolchain_root, "release")
+                != toolchain_identity
+            ):
+                raise benchmark.ConfigError("toolchain changed during lane measurement")
+            _verify_baseline_checkout(
+                baseline_checkout,
+                index["baseline_git_commit"],
+            )
+            _, current_baseline_toolchain_identity = _verify_baseline_toolchain(
+                baseline_toolchain,
+                baseline_toolchain_identity,
+            )
+            if current_baseline_toolchain_identity != baseline_toolchain_identity:
+                raise benchmark.ConfigError(
+                    "baseline toolchain changed during lane measurement"
+                )
+
+        try:
+            verify_publication_integrity("before attestation validation")
+        except Exception as error:
+            status_path = _write_collector_outcome(
+                artifact_root=artifact_root,
+                request=request,
+                lane=lane,
+                runner_identity=approved_runner,
+                machine=machine,
+                kind="execution_failed",
+                reason="integrity_failed",
+                exit_code=None,
+            )
+            raise _CollectedOutcome(
+                f"{lane} measurement integrity verification failed for {scene_id}@{scale}",
+                scene_id=scene_id,
+                scale=scale,
+                lane=lane,
+                status_path=status_path,
+                request=request,
+                runner_identity=approved_runner,
+                machine=machine,
+            ) from error
+
+        try:
+            evidence.validate_attestation_candidate(
+                request,
+                observations,
+                artifact_root,
+                artifact_root / "attestation.json",
+                lane,
+                approved_runner,
+                machine=machine,
+            )
+        except evidence.EvidenceError as error:
+            _raise_invalid_runner_output(
+                artifact_root=artifact_root,
+                request=request,
+                lane=lane,
+                runner_identity=approved_runner,
+                machine=machine,
+                scene_id=scene_id,
+                scale=scale,
+                cause=error,
+            )
+
+        try:
+            verify_publication_integrity("immediately before evidence publication")
+        except Exception as error:
+            status_path = _write_collector_outcome(
+                artifact_root=artifact_root,
+                request=request,
+                lane=lane,
+                runner_identity=approved_runner,
+                machine=machine,
+                kind="execution_failed",
+                reason="integrity_failed",
+                exit_code=None,
+            )
+            raise _CollectedOutcome(
+                f"{lane} measurement integrity verification failed for {scene_id}@{scale}",
+                scene_id=scene_id,
+                scale=scale,
+                lane=lane,
+                status_path=status_path,
+                request=request,
+                runner_identity=approved_runner,
+                machine=machine,
+            ) from error
+
+        if environment_rejections:
+            environment_receipt_path = artifact_root / "measurement-environment.json"
+            _write_exclusive_json(
+                environment_receipt_path,
+                {
+                    "schema_version": 1,
+                    "started_monotonic_seconds": started_monotonic,
+                    "ended_monotonic_seconds": ended_monotonic,
+                    "commands": environment_commands,
+                    "measurement_environment": measurement_environment,
+                },
+                "measurement-environment.json",
+            )
+            status_path = _write_collector_outcome(
+                artifact_root=artifact_root,
+                request=request,
+                lane=lane,
+                runner_identity=approved_runner,
+                machine=machine,
+                kind="environment_rejected",
+                reason="policy_violation",
+                exit_code=0,
+            )
+            raise _CollectedOutcome(
+                f"{lane} measurement environment was rejected for {scene_id}@{scale}",
+                scene_id=scene_id,
+                scale=scale,
+                lane=lane,
+                status_path=status_path,
+                request=request,
+                runner_identity=approved_runner,
+                machine=machine,
+            )
+
+        status_path = _write_collector_status(
+            artifact_root=artifact_root,
+            request=request,
+            lane=lane,
+            runner_identity=approved_runner,
+            machine=machine,
+            disposition="attestation_candidate",
+            outcome=None,
         )
-    if benchmark.resolved_toolchain_identity(toolchain_root, "release") != toolchain_identity:
-        raise benchmark.ConfigError("toolchain changed during lane measurement")
-    _verify_baseline_checkout(baseline_checkout, index["baseline_git_commit"])
-    _, final_baseline_toolchain_identity = _verify_baseline_toolchain(
-        baseline_toolchain,
-        baseline_toolchain_identity,
-    )
-    if final_baseline_toolchain_identity != baseline_toolchain_identity:
-        raise benchmark.ConfigError("baseline toolchain changed during lane measurement")
+        collection = _collection_from_status(
+            output_root=output_root,
+            status_path=status_path,
+            scene_id=scene_id,
+            scale=scale,
+            lane=lane,
+            request=request,
+            runner_identity=approved_runner,
+            machine=machine,
+            expected_relative=expected_status_relative,
+        )
+        if key in completed_collections:
+            raise benchmark.ConfigError("lane request was collected more than once")
+        completed_collections[key] = collection
+        results.append(collection)
+
     lane_result = {
         "schema_version": 1,
         "lane": lane,
@@ -1774,10 +3197,98 @@ def run_lane(
         "producer_digest": index["producer_digest"],
         "runner_identity": approved_runner,
         "rendering_driver_identity": renderer_identity,
-        "attestations": results,
+        "collections": results,
     }
-    benchmark.atomic_write_json(output_root / f"lane-{lane}.json", lane_result)
     return lane_result
+
+
+def run_lane(
+    index_path: Path,
+    requests_root: Path,
+    corpus_path: Path,
+    reference_config_path: Path,
+    toolchain_root: Path,
+    baseline_checkout_root: Path,
+    baseline_toolchain_root: Path,
+    output_root: Path,
+    lane: str,
+    runner_path: Path,
+    renderer_closure_path: Path,
+) -> dict[str, Any]:
+    collection_started_at = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+    lane_path = output_root / f"lane-{lane}.json"
+    if lane_path.exists() or lane_path.is_symlink():
+        raise benchmark.ConfigError("benchmark lane result already exists; refusing untrusted output")
+    completed: dict[tuple[str, int, str], dict[str, Any]] = {}
+    while True:
+        try:
+            result = _run_lane_attempt(
+                index_path,
+                requests_root,
+                corpus_path,
+                reference_config_path,
+                toolchain_root,
+                baseline_checkout_root,
+                baseline_toolchain_root,
+                output_root,
+                lane,
+                runner_path,
+                renderer_closure_path,
+                completed_collections=completed,
+            )
+        except _CollectedOutcome as outcome:
+            key = (outcome.scene_id, outcome.scale, outcome.lane)
+            if outcome.lane != lane or key in completed:
+                raise benchmark.ConfigError(
+                    "collector produced a duplicate or wrong-lane terminal outcome"
+                ) from outcome
+            collection = _collection_from_status(
+                output_root=output_root,
+                status_path=outcome.status_path,
+                scene_id=outcome.scene_id,
+                scale=outcome.scale,
+                lane=outcome.lane,
+                request=outcome.request,
+                runner_identity=outcome.runner_identity,
+                machine=outcome.machine,
+            )
+            completed[key] = collection
+            continue
+
+        collections = result.get("collections")
+        if not isinstance(collections, list):
+            raise benchmark.ConfigError("completed lane result has no collection list")
+        actual: dict[tuple[str, int, str], Mapping[str, Any]] = {}
+        for raw_collection in collections:
+            collection = benchmark._require_mapping(raw_collection, "lane collection")
+            key = (
+                collection.get("scene_id"),
+                collection.get("scale"),
+                collection.get("lane"),
+            )
+            if (
+                not isinstance(key[0], str)
+                or type(key[1]) is not int
+                or key[2] != lane
+                or key in actual
+            ):
+                raise benchmark.ConfigError("lane collections are duplicated or malformed")
+            actual[key] = collection
+        if set(actual) != set(completed) or any(
+            actual.get(key) != descriptor for key, descriptor in completed.items()
+        ):
+            raise benchmark.ConfigError(
+                "completed lane result does not contain the exact durable collection closure"
+            )
+        completed_result = {
+            **result,
+            "collection_started_at_utc": collection_started_at,
+            "collection_ended_at_utc": datetime.now(timezone.utc)
+            .isoformat()
+            .replace("+00:00", "Z"),
+        }
+        _write_exclusive_json(lane_path, completed_result, lane_path.name)
+        return completed_result
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -1793,7 +3304,6 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--lane", choices=sorted(evidence.RELEASE_LANES), required=True)
     parser.add_argument("--runner", type=Path, required=True)
     parser.add_argument("--rendering-driver-closure", type=Path, required=True)
-    parser.add_argument("--evidence-key-file", type=Path, required=True)
     args = parser.parse_args(argv)
     try:
         result = run_lane(
@@ -1808,9 +3318,12 @@ def main(argv: list[str] | None = None) -> int:
             args.lane,
             args.runner,
             args.rendering_driver_closure,
-            args.evidence_key_file,
         )
-        print(evidence.canonical_json_bytes({"status": "attested", "count": len(result["attestations"])}).decode())
+        print(
+            evidence.canonical_json_bytes(
+                {"status": "collected", "count": len(result["collections"])}
+            ).decode()
+        )
         return 0
     except (benchmark.ConfigError, evidence.EvidenceError) as error:
         print(f"benchmark lane error: {error}", file=sys.stderr)

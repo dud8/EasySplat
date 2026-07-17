@@ -21,7 +21,7 @@
     "thresholds_digest",
     "corpus_digest",
     "git",
-    "raw_artifact_directory",
+    "raw_evidence_retention",
     "missing_requirements"
   ],
   "properties": {
@@ -55,7 +55,7 @@
     "thresholds_digest": {"$ref": "#/$defs/sha256"},
     "corpus_digest": {"$ref": "#/$defs/sha256"},
     "git": {"$ref": "#/$defs/git"},
-    "raw_artifact_directory": {"const": "raw"},
+    "raw_evidence_retention": {"enum": ["local_only", "excluded"]},
     "missing_requirements": {"$ref": "#/$defs/missingRequirements"}
   },
   "$defs": {
@@ -438,8 +438,8 @@
       "additionalProperties": false,
       "required": ["protocol_version", "version", "executable", "sha256"],
       "properties": {
-        "protocol_version": {"const": 2},
-        "version": {"const": "2.1.0"},
+        "protocol_version": {"const": 3},
+        "version": {"const": "3.0.0"},
         "executable": {"const": "scripts/benchmark/evidence_protocol.py"},
         "sha256": {"$ref": "#/$defs/sha256"}
       }
@@ -543,7 +543,7 @@
     "evidenceRecord": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["lane", "machine", "producer", "measurement_runner", "attestation_digest"],
+      "required": ["lane", "machine", "producer", "measurement_runner", "evidence_digest"],
       "properties": {
         "lane": {
           "enum": ["reference_m4_max", "constrained_14_16gb", "eight_gb_fast"]
@@ -551,7 +551,8 @@
         "machine": {"$ref": "#/$defs/machine"},
         "producer": {"$ref": "#/$defs/producer"},
         "measurement_runner": {"$ref": "#/$defs/measurementRunner"},
-        "attestation_digest": {"$ref": "#/$defs/sha256"}
+        "evidence_digest": {"$ref": "#/$defs/sha256"},
+        "collector_status_digest": {"$ref": "#/$defs/sha256"}
       }
     },
     "aggregates": {
@@ -615,7 +616,7 @@
     "missingRequirements": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["media", "evidence", "toolchain", "evidence_key", "request_index"],
+      "required": ["media", "evidence", "toolchain", "request_index"],
       "properties": {
         "media": {"type": "array", "items": {"$ref": "#/$defs/missingRequirement"}},
         "evidence": {"type": "array", "items": {"$ref": "#/$defs/missingRequirement"}},
@@ -632,10 +633,6 @@
               }
             }
           ]
-        },
-        "evidence_key": {
-          "type": ["string", "null"],
-          "enum": [null, "protected evidence key file"]
         },
         "request_index": {
           "type": ["string", "null"],
