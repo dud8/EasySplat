@@ -186,11 +186,8 @@ enum GeometryArtifactStore {
             }
         }
         if provenance.model != nil {
-            let expectedInitializerPath = artifact.canonicalOrientation.status == .unresolved
-                ? "SfM/colmap/seed/0/learned_points3D.txt"
-                : "SfM/colmap/sparse/0/learned_points3D.txt"
             guard let initializer = artifact.learnedPointInitializer,
-                  initializer.path == expectedInitializerPath,
+                  initializer.path == "SfM/colmap/seed/0/learned_points3D.txt",
                   initializer.pointCount > 0,
                   isSHA256(initializer.sha256),
                   let initializerURL = try? projectPaths.resolveProjectRelativePath(initializer.path) else {
@@ -237,13 +234,8 @@ enum GeometryArtifactStore {
         guard let orientationEstimationDuration = artifact.timings[
             "orientation_estimation_seconds"
         ],
-              let orientationCanonicalizationDuration = artifact.timings[
-                  "orientation_canonicalization_seconds"
-              ],
               orientationEstimationDuration.isFinite,
               orientationEstimationDuration >= 0,
-              orientationCanonicalizationDuration.isFinite,
-              orientationCanonicalizationDuration >= 0,
               artifact.timings["orientation_seconds"] == nil,
               artifact.timings.allSatisfy({ key, value in
                   !key.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
@@ -303,28 +295,6 @@ enum GeometryArtifactStore {
 
         let measured = try measuredResiduals
             ?? ColmapResidualAnalyzer.analyze(modelDirectory: sourceModel)
-        do {
-            let publishedOrientation = try CanonicalColmapModelTransformer.loadPublishedResult(
-                modelDirectory: sourceModel,
-                measurement: measured
-            )
-            switch artifact.canonicalOrientation.status {
-            case .unresolved:
-                guard case nil = publishedOrientation else {
-                    throw Error.invalidCanonicalOrientation
-                }
-            case .verified, .axisAlignedSignUnverified:
-                guard let publishedOrientation,
-                      publishedOrientation.artifact == artifact.canonicalOrientation,
-                      publishedOrientation.snapshot.modelHashes == artifact.modelHashes else {
-                    throw Error.invalidCanonicalOrientation
-                }
-            }
-        } catch let error as Error {
-            throw error
-        } catch {
-            throw Error.invalidCanonicalOrientation
-        }
         let stronglyMeasuredViewCount = measured.observationCountByImage.values.filter {
             $0 >= minimumLearnedObservationsPerView
         }.count
@@ -558,7 +528,7 @@ enum GeometryArtifactStore {
         case .verified, .axisAlignedSignUnverified:
             guard let method = artifact.method,
                   let quaternion = artifact.sourceToCanonicalQuaternionWXYZ,
-                  validUnitQuaternion(quaternion),
+                  quaternion.isCanonicalUnitRotation,
                   let evidence = artifact.evidence,
                   let direction = artifact.canonicalOpeningViewDirection,
                   validUnitDirection(direction) else {
@@ -671,19 +641,6 @@ enum GeometryArtifactStore {
               validDegrees(evidence.cameraUpP90SpreadDegrees) else {
             throw Error.invalidCanonicalOrientation
         }
-    }
-
-    private static func validUnitQuaternion(_ value: CanonicalQuaternionWXYZ) -> Bool {
-        let components = [value.w, value.x, value.y, value.z]
-        guard components.allSatisfy(\.isFinite) else { return false }
-        let squaredNorm = components.reduce(0) { $0 + $1 * $1 }
-        guard abs(squaredNorm - 1) <= 1e-6 else { return false }
-        if value.w > 0 { return true }
-        if value.w < 0 { return false }
-        for component in [value.x, value.y, value.z] where component != 0 {
-            return component > 0
-        }
-        return false
     }
 
     private static func validUnitDirection(_ value: CanonicalDirection) -> Bool {

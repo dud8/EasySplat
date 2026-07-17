@@ -53,9 +53,9 @@ final class GeometryArtifactStoreTests: XCTestCase {
         }
     }
 
-    func testLoadRejectsSchemaElevenBeforeDecodingSourceFrameOrientationState() throws {
+    func testLoadRejectsSchemaTwelveBeforeDecodingSourceFrameOrientationState() throws {
         let baselineSchemaVersion = GeometryArtifact.currentSchemaVersion - 1
-        XCTAssertEqual(baselineSchemaVersion, 11)
+        XCTAssertEqual(baselineSchemaVersion, 12)
 
         let root = try TestFileBuilder.makeTempDir()
         defer { try? FileManager.default.removeItem(at: root) }
@@ -605,7 +605,7 @@ final class GeometryArtifactStoreTests: XCTestCase {
         }
     }
 
-    func testResolvedOrientationRequiresReceiptBoundToCanonicalModelHashes() throws {
+    func testResolvedOrientationKeepsAcceptedSourceModelImmutable() throws {
         let root = try TestFileBuilder.makeTempDir()
         defer { try? FileManager.default.removeItem(at: root) }
         let paths = ProjectPaths(root: root)
@@ -613,13 +613,10 @@ final class GeometryArtifactStoreTests: XCTestCase {
         let fixture = try writeCanonicalModel(at: paths, imageCount: 8)
         let model = paths.colmapSparseURL.appendingPathComponent("0", isDirectory: true)
         let sourceMeasurement = try ColmapResidualAnalyzer.analyze(modelDirectory: model)
-        let canonical = try CanonicalColmapModelTransformer.canonicalize(
-            modelDirectory: model,
-            solution: resolvedOrientationSolution(),
-            sourceMeasurement: sourceMeasurement,
-            sourceSnapshot: GeometryModelSnapshot.capture(in: model),
-            learnedPointInitializer: nil
-        )
+        let sourceSnapshot = try GeometryModelSnapshot.capture(in: model)
+        let sourceBytes = try Dictionary(uniqueKeysWithValues: sourceSnapshot.modelHashes.keys.map {
+            ($0, try Data(contentsOf: model.appendingPathComponent($0)))
+        })
 
         let imageNames = (1...8).map { String(format: "frame_%06d.jpg", $0) }
         var artifact = makeArtifact(fixture: fixture)
@@ -627,12 +624,12 @@ final class GeometryArtifactStoreTests: XCTestCase {
         artifact.orderedImageTimestamps = Array(repeating: nil, count: imageNames.count)
         artifact.registeredViewCount = imageNames.count
         artifact.totalViewCount = imageNames.count
-        artifact.trackCount = canonical.measurement.observationCount
-        artifact.pointCount = canonical.measurement.pointCount
-        artifact.medianPixelResidual = canonical.measurement.medianPixelResidual
-        artifact.p90PixelResidual = canonical.measurement.p90PixelResidual
-        artifact.modelHashes = canonical.snapshot.modelHashes
-        artifact.canonicalOrientation = canonical.artifact
+        artifact.trackCount = sourceMeasurement.observationCount
+        artifact.pointCount = sourceMeasurement.pointCount
+        artifact.medianPixelResidual = sourceMeasurement.medianPixelResidual
+        artifact.p90PixelResidual = sourceMeasurement.p90PixelResidual
+        artifact.modelHashes = sourceSnapshot.modelHashes
+        artifact.canonicalOrientation = resolvedOrientationSolution().artifact
         artifact.pairGraph = .measured(PairGraphMeasurement(
             scheduledPairCount: 28,
             attemptedPairCount: 28,
@@ -674,24 +671,16 @@ final class GeometryArtifactStoreTests: XCTestCase {
             try GeometryArtifactStore.validate(
                 artifact,
                 projectPaths: paths,
-                measuredResiduals: canonical.measurement,
-                verifiedSourceSnapshot: canonical.snapshot
+                measuredResiduals: sourceMeasurement,
+                verifiedSourceSnapshot: sourceSnapshot
             )
         )
-
-        try FileManager.default.removeItem(
-            at: model.appendingPathComponent(CanonicalColmapModelTransformer.receiptFileName)
+        XCTAssertEqual(
+            try Dictionary(uniqueKeysWithValues: sourceSnapshot.modelHashes.keys.map {
+                ($0, try Data(contentsOf: model.appendingPathComponent($0)))
+            }),
+            sourceBytes
         )
-        XCTAssertThrowsError(
-            try GeometryArtifactStore.validate(
-                artifact,
-                projectPaths: paths,
-                measuredResiduals: canonical.measurement,
-                verifiedSourceSnapshot: canonical.snapshot
-            )
-        ) { error in
-            XCTAssertEqual(error as? GeometryArtifactStore.Error, .invalidCanonicalOrientation)
-        }
     }
 
     func testMeasuredPairGraphAllowsOnlyDescriptorlessUnregisteredViews() throws {
@@ -1027,7 +1016,6 @@ final class GeometryArtifactStoreTests: XCTestCase {
             timings: [
                 "sfmMapping": 1.5,
                 "orientation_estimation_seconds": 0.001,
-                "orientation_canonicalization_seconds": 0.002,
             ],
             peakMemoryBytes: 1_024,
             modelHashes: fixture.modelHashes,

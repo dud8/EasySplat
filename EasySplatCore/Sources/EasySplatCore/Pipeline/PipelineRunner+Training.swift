@@ -136,7 +136,10 @@ extension PipelineRunner {
             _ = try regenerateBinarySparseModelFiles(at: candidateSparse)
         }
         try Task.checkCancellation()
-        try MsplatOrientationOverlay.writeIdentity(to: candidateSparse)
+        try MsplatOrientationOverlay.write(
+            geometryArtifact.canonicalOrientation,
+            to: candidateSparse
+        )
         let identity = try msplatDatasetIdentity(at: candidate)
         try Task.checkCancellation()
 
@@ -251,7 +254,10 @@ extension PipelineRunner {
         _ = try regenerateBinarySparseModelFiles(at: sparse)
         try requireBinarySparseModelFiles(at: sparse)
         progress(0.99, "Preparing msplat dataset (sparse): conversion complete.")
-        try MsplatOrientationOverlay.writeIdentity(to: sparse)
+        try MsplatOrientationOverlay.write(
+            geometryArtifact.canonicalOrientation,
+            to: sparse
+        )
         let identity = try msplatDatasetIdentity(at: candidate)
         try Task.checkCancellation()
         let dataset = try publishMsplatDatasetCandidate(

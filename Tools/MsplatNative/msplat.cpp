@@ -1102,7 +1102,8 @@ void applyOrientationOverlay(InputData &inputData, const OrientationOverlay &ori
 void verifyOrientationOverlaySelfCheck() {
     const OrientationOverlay orientation = parseOrientationOverlay(
         "{\"schema_version\":1,\"source_to_canonical_wxyz\":"
-        "[0.9238795325112867,0,0,0.3826834323650898]}"
+        "[0.8660254037844386,0.1336306209562122,"
+        "0.2672612419124244,0.4008918628686366]}"
     );
 
     const std::array<std::string, 4> invalid = {
@@ -1121,44 +1122,136 @@ void verifyOrientationOverlaySelfCheck() {
         if (!rejected) throw std::runtime_error("orientation parser self-check accepted invalid input");
     }
 
+    // Raw camera centers are (4,-1,2), (-2,3,0), and (1,5,-4), with
+    // mean (1,7/3,-2/3); sourceCameras stores their normalized c2w values.
+    constexpr std::array<std::array<float, 16>, 3> sourceCameras = {{
+        {1, 0, 0, 0.9f, 0, 1, 0, -1, 0, 0, 1, 0.8f, 0, 0, 0, 1},
+        {0, -1, 0, -0.9f, 1, 0, 0, 0.2f, 0, 0, 1, 0.2f, 0, 0, 0, 1},
+        {1, 0, 0, 0, 0, 0, -1, 0.8f, 0, 1, 0, -1, 0, 0, 0, 1},
+    }};
     InputData inputData;
-    inputData.scale = 2;
-    inputData.translation[0] = 3;
-    inputData.translation[1] = 4;
-    inputData.translation[2] = 5;
-    inputData.points.count = 1;
-    inputData.points.xyz = {1, 0, 0};
-    inputData.points.rgb = {0, 0, 0};
-    for (float centerSign : {1.0f, -1.0f}) {
+    inputData.scale = 0.3f;
+    inputData.translation[0] = 1;
+    inputData.translation[1] = 7.0f / 3.0f;
+    inputData.translation[2] = -2.0f / 3.0f;
+    inputData.points.count = 4;
+    // The first two points represent COLMAP sparse points; the latter two
+    // represent points merged from a learned initializer.
+    inputData.points.xyz = {
+        0.3f, -0.7f, -0.7f,
+        -0.6f, 0.5f, 0.8f,
+        1.2f, -1.3f, 0.5f,
+        -1.2f, -0.4f, -0.1f,
+    };
+    inputData.points.rgb.assign(12, 0);
+    for (const auto &source : sourceCameras) {
         Camera camera;
-        camera.camToWorld[0] = 1;
-        camera.camToWorld[5] = 1;
-        camera.camToWorld[10] = 1;
-        camera.camToWorld[15] = 1;
-        camera.camToWorld[3] = centerSign;
-        camera.camToWorld[7] = centerSign;
+        std::copy(source.begin(), source.end(), camera.camToWorld);
         inputData.cameras.push_back(std::move(camera));
     }
 
     applyOrientationOverlay(inputData, orientation);
-    const auto approximately = [](double actual, double expected) {
-        return std::abs(actual - expected) <= 2.0e-6;
+
+    // These constants come from rotating the raw fixture first, then applying
+    // the same mean and L-infinity normalization as a physically rotated model.
+    // They intentionally do not use the overlay's matrix or vector helpers.
+    constexpr std::array<std::array<double, 16>, 3> expectedCameras = {{
+        {
+            0.5357142857142857, -0.6229365034008422, 0.5700529070291329, 1,
+            0.765793646257985, 0.6428571428571428, -0.017169310657423553,
+            0.020896314834495874,
+            -0.35576719274341856, 0.44574073922885216, 0.8214285714285714,
+            -0.06968601904581694,
+            0, 0, 0, 1,
+        },
+        {
+            -0.6229365034008422, -0.5357142857142857, 0.5700529070291329,
+            -0.31561894295822923,
+            0.6428571428571428, -0.765793646257985, -0.017169310657423553,
+            -0.3613278325389292,
+            0.44574073922885216, 0.35576719274341856, 0.8214285714285714,
+            0.36744370453847897,
+            0, 0, 0, 1,
+        },
+        {
+            0.5357142857142857, 0.5700529070291329, 0.6229365034008422,
+            -0.6843810570417704,
+            0.765793646257985, -0.017169310657423553, -0.6428571428571428,
+            0.34043151770443325,
+            -0.35576719274341856, 0.8214285714285714, -0.44574073922885216,
+            -0.2977576854926622,
+            0, 0, 0, 1,
+        },
+    }};
+    constexpr std::array<double, 12> expectedPoints = {
+        0.12666072409766602, -0.13339343787716143, -0.636560675627507,
+        -0.11328681106205996, -0.09722692740553023, 0.7004409406983003,
+        1.1131105705535043, 0.04782038141426362, -0.381564942600894,
+        -0.28869487637846147, -0.7522657022785499, 0.10664221753684251,
     };
-    const double inverseRootTwo = 1.0 / std::sqrt(2.0);
-    const Camera &camera = inputData.cameras.front();
-    if (!approximately(camera.camToWorld[0], inverseRootTwo) ||
-        !approximately(camera.camToWorld[1], -inverseRootTwo) ||
-        !approximately(camera.camToWorld[4], inverseRootTwo) ||
-        !approximately(camera.camToWorld[5], inverseRootTwo) ||
-        !approximately(camera.camToWorld[3], 0) ||
-        !approximately(camera.camToWorld[7], 1) ||
-        !approximately(inputData.points.xyz[0], 0.5) ||
-        !approximately(inputData.points.xyz[1], 0.5) ||
-        !approximately(inputData.scale, std::sqrt(2.0)) ||
-        !approximately(inputData.translation[0], -inverseRootTwo) ||
-        !approximately(inputData.translation[1], 7.0 * inverseRootTwo) ||
-        !approximately(inputData.translation[2], 5)) {
-        throw std::runtime_error("orientation transform self-check failed");
+    constexpr std::array<double, 3> expectedTranslation = {
+        -1.2978394935737683,
+        2.277239853362934,
+        0.13667548450485578,
+    };
+    constexpr double expectedScale = 0.1921695167380479;
+    constexpr double tolerance = 2.0e-6;
+    const auto requireNear = [](double actual, double expected, const char *field) {
+        if (!std::isfinite(actual) || std::abs(actual - expected) > tolerance) {
+            throw std::runtime_error(std::string("orientation parity mismatch: ") + field);
+        }
+    };
+    for (std::size_t cameraIndex = 0; cameraIndex < inputData.cameras.size(); ++cameraIndex) {
+        for (std::size_t component = 0; component < 16; ++component) {
+            requireNear(
+                inputData.cameras[cameraIndex].camToWorld[component],
+                expectedCameras[cameraIndex][component],
+                "camera c2w"
+            );
+        }
+    }
+    for (std::size_t component = 0; component < expectedPoints.size(); ++component) {
+        requireNear(inputData.points.xyz[component], expectedPoints[component], "point");
+    }
+    for (std::size_t component = 0; component < expectedTranslation.size(); ++component) {
+        requireNear(inputData.translation[component], expectedTranslation[component], "translation");
+    }
+    requireNear(inputData.scale, expectedScale, "scale");
+
+    const auto project = [](const Camera &camera, const float *point) {
+        const std::array<double, 3> delta = {
+            point[0] - camera.camToWorld[3],
+            point[1] - camera.camToWorld[7],
+            point[2] - camera.camToWorld[11],
+        };
+        const double viewX = camera.camToWorld[0] * delta[0]
+            + camera.camToWorld[4] * delta[1]
+            + camera.camToWorld[8] * delta[2];
+        const double viewY = camera.camToWorld[1] * delta[0]
+            + camera.camToWorld[5] * delta[1]
+            + camera.camToWorld[9] * delta[2];
+        const double viewZ = camera.camToWorld[2] * delta[0]
+            + camera.camToWorld[6] * delta[1]
+            + camera.camToWorld[10] * delta[2];
+        if (!std::isfinite(viewZ) || std::abs(viewZ) <= 1.0e-9) {
+            throw std::runtime_error("orientation parity projection has invalid depth");
+        }
+        return std::array<double, 2> {viewX / viewZ, viewY / viewZ};
+    };
+    constexpr std::array<std::size_t, 3> projectedPointIndices = {0, 1, 2};
+    constexpr std::array<std::array<double, 2>, 3> expectedProjections = {{
+        {0.4, -0.2},
+        {0.5, -0.5},
+        {4.0 / 7.0, 5.0 / 7.0},
+    }};
+    for (std::size_t cameraIndex = 0; cameraIndex < inputData.cameras.size(); ++cameraIndex) {
+        const std::size_t pointIndex = projectedPointIndices[cameraIndex];
+        const auto projected = project(
+            inputData.cameras[cameraIndex],
+            inputData.points.xyz.data() + pointIndex * 3
+        );
+        requireNear(projected[0], expectedProjections[cameraIndex][0], "projection x");
+        requireNear(projected[1], expectedProjections[cameraIndex][1], "projection y");
     }
 }
 

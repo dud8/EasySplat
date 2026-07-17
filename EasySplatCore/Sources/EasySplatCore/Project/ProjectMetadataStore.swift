@@ -251,7 +251,6 @@ public enum ProjectMetadataStore {
             return path == "SfM/colmap/sparse/0"
         case "geometryArtifact.learnedPointInitializer.path":
             return path == "SfM/colmap/seed/0/learned_points3D.txt"
-                || path == "SfM/colmap/sparse/0/learned_points3D.txt"
         case "trainingArtifact.checkpointPath":
             return path == "Training/checkpoints/msplat"
                 || path.hasPrefix("Training/checkpoints/msplat/")

@@ -195,33 +195,11 @@ final class ProjectMetadataValidationTests: XCTestCase {
         XCTAssertNoThrow(try ProjectMetadataStore.save(metadata, to: url))
     }
 
-    func testSaveAcceptsCanonicalSourceModelLearnedInitializerPath() throws {
-        let root = try TestFileBuilder.makeTempDir()
-        defer { try? FileManager.default.removeItem(at: root) }
-        let url = root.appendingPathComponent("project.json")
-        var geometry = makeGeometryArtifact()
-        geometry.learnedPointInitializer = LearnedPointInitializerArtifact(
-            path: "SfM/colmap/sparse/0/learned_points3D.txt",
-            sha256: String(repeating: "a", count: 64),
-            pointCount: 1
-        )
-        let metadata = ProjectMetadata(
-            title: "Source-model learned initializer",
-            input: .photos(folder: "/tmp/photos"),
-            requestedRunOptions: RequestedRunOptions(
-                capturePath: .orbit,
-                detailProfile: .balanced
-            ),
-            geometryArtifact: geometry
-        )
-
-        XCTAssertNoThrow(try ProjectMetadataStore.save(metadata, to: url))
-    }
-
     func testSaveRejectsNearSeedLearnedInitializerPaths() throws {
         for path in [
             "SfM/colmap/seed/1/learned_points3D.txt",
             "SfM/colmap/seed/0/other.txt",
+            "SfM/colmap/sparse/0/learned_points3D.txt",
             "SfM/colmap/sparse/1/learned_points3D.txt",
             "SfM/colmap/sparse/0/other.txt",
         ] {

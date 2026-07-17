@@ -13,6 +13,7 @@ STAGE_DIR="$INSTALL_PARENT/msplat.stage.$$"
 BACKUP_DIR="$INSTALL_PARENT/msplat.previous.$$"
 
 OVERLAY="$ROOT/Tools/MsplatNative/msplat.cpp"
+OVERLAY_SHA256="f4b9238d58f80c1bf56a83ece9dae8c44801906dd35055f64309c98da698bb22"
 RASTER_TEST_SOURCE="$ROOT/Tools/MsplatNative/msplat_raster_tests.cpp"
 RASTER_TEST_SHA256="55a20875f031e5d5425c0efc4ebea2bff5adb03bee23001c7ee2a86738d75588"
 FIXTURE_GENERATOR="$ROOT/scripts/ci/generate_msplat_sparse_fixtures.py"
@@ -114,6 +115,8 @@ preflight() {
     exit 1
   fi
   [ -f "$OVERLAY" ] || die "missing CLI overlay: $OVERLAY"
+  [ "$(sha256 "$OVERLAY")" = "$OVERLAY_SHA256" ] \
+    || die "CLI overlay SHA-256 mismatch"
   [ -f "$RASTER_TEST_SOURCE" ] || die "missing raster parity test: $RASTER_TEST_SOURCE"
   [ -f "$FIXTURE_GENERATOR" ] || die "missing sparse fixture generator: $FIXTURE_GENERATOR"
   [ -f "$UPSTREAM_PATCH" ] || die "missing upstream patch: $UPSTREAM_PATCH"

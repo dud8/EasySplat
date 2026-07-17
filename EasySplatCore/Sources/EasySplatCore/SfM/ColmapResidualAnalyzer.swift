@@ -17,7 +17,6 @@ enum ColmapResidualAnalyzer {
         case inconsistentTrack(pointID: Int64, imageID: Int, point2DIndex: Int)
         case unprojectableObservation(pointID: Int64, imageLine: Int)
         case noTrackedObservations
-        case modelTopologyChanged
 
         var errorDescription: String? {
             switch self {
@@ -45,8 +44,6 @@ enum ColmapResidualAnalyzer {
                 return "COLMAP observation for point \(pointID) at images.txt line \(imageLine) cannot be projected."
             case .noTrackedObservations:
                 return "COLMAP model has no tracked observations with measurable pixel residuals."
-            case .modelTopologyChanged:
-                return "Canonical orientation changed the COLMAP model topology."
             }
         }
     }
@@ -220,48 +217,6 @@ enum ColmapResidualAnalyzer {
             statistics.add(observation.pixelResidual)
         }
         return try makeResult(stream: stream, statistics: statistics)
-    }
-
-    /// Compares corresponding real track residuals without materializing them.
-    /// Canonical world rotations must preserve every projection, not merely the
-    /// aggregate median or mean.
-    static func maximumResidualDifference(
-        between sourceModelDirectory: URL,
-        and candidateModelDirectory: URL
-    ) throws -> Double {
-        let source = try ObservationStream(modelDirectory: sourceModelDirectory)
-        let candidate = try ObservationStream(modelDirectory: candidateModelDirectory)
-        var maximumDifference = 0.0
-        var comparedCount = 0
-
-        while true {
-            let sourceObservation = try source.next()
-            let candidateObservation = try candidate.next()
-            guard (sourceObservation == nil) == (candidateObservation == nil) else {
-                throw Error.modelTopologyChanged
-            }
-            guard let sourceObservation, let candidateObservation else { break }
-            guard sourceObservation.pointID == candidateObservation.pointID,
-                  sourceObservation.imageID == candidateObservation.imageID,
-                  sourceObservation.point2DIndex == candidateObservation.point2DIndex else {
-                throw Error.modelTopologyChanged
-            }
-            maximumDifference = max(
-                maximumDifference,
-                abs(sourceObservation.pixelResidual - candidateObservation.pixelResidual)
-            )
-            comparedCount += 1
-        }
-
-        guard comparedCount == source.expectedObservationCount,
-              comparedCount == candidate.expectedObservationCount,
-              source.pointCount == candidate.pointCount,
-              source.cameraModel == candidate.cameraModel,
-              source.registeredImageNamesByID == candidate.registeredImageNamesByID,
-              source.observationCountByImage == candidate.observationCountByImage else {
-            throw Error.modelTopologyChanged
-        }
-        return maximumDifference
     }
 
     private static func makeResult(

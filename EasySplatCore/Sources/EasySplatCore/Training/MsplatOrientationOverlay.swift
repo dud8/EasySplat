@@ -3,16 +3,34 @@ import Foundation
 
 struct MsplatOrientationOverlay: Sendable, Equatable {
     static let fileName = "easysplat_orientation.json"
+    private let quaternion: CanonicalQuaternionWXYZ
 
-    init() {}
+    init(canonicalOrientation: CanonicalOrientationArtifact) throws {
+        switch canonicalOrientation.status {
+        case .unresolved:
+            guard canonicalOrientation.sourceToCanonicalQuaternionWXYZ == nil else {
+                throw MsplatOrientationOverlayError.invalidOrientation
+            }
+            quaternion = CanonicalQuaternionWXYZ(w: 1, x: 0, y: 0, z: 0)
+        case .verified, .axisAlignedSignUnverified:
+            guard let resolved = canonicalOrientation.sourceToCanonicalQuaternionWXYZ,
+                  resolved.isCanonicalUnitRotation else {
+                throw MsplatOrientationOverlayError.invalidOrientation
+            }
+            quaternion = resolved
+        }
+    }
 
     func encodedData() throws -> Data {
         var data = try JSONSerialization.data(
             withJSONObject: [
                 "schema_version": 1,
-                // Native msplat still requires this closed-schema file. Geometry
-                // is already canonical, so any other value would rotate it twice.
-                "source_to_canonical_wxyz": [1, 0, 0, 0],
+                "source_to_canonical_wxyz": [
+                    quaternion.w,
+                    quaternion.x,
+                    quaternion.y,
+                    quaternion.z,
+                ],
             ],
             options: [.sortedKeys]
         )
@@ -20,8 +38,13 @@ struct MsplatOrientationOverlay: Sendable, Equatable {
         return data
     }
 
-    static func writeIdentity(to sparseDirectory: URL) throws {
-        try MsplatOrientationOverlay().write(to: sparseDirectory)
+    static func write(
+        _ canonicalOrientation: CanonicalOrientationArtifact,
+        to sparseDirectory: URL
+    ) throws {
+        try MsplatOrientationOverlay(
+            canonicalOrientation: canonicalOrientation
+        ).write(to: sparseDirectory)
     }
 
     private func write(to sparseDirectory: URL) throws {
@@ -202,12 +225,15 @@ struct MsplatOrientationOverlay: Sendable, Equatable {
 }
 
 private enum MsplatOrientationOverlayError: Error, LocalizedError {
+    case invalidOrientation
     case invalidDestination
     case destinationChanged
     case posix(Int32)
 
     var errorDescription: String? {
         switch self {
+        case .invalidOrientation:
+            return "The training orientation is not a canonical proper rotation."
         case .invalidDestination:
             return "The training orientation file is not a private ordinary file."
         case .destinationChanged:

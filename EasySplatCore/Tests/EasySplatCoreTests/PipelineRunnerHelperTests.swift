@@ -1231,7 +1231,7 @@ final class PipelineRunnerHelperTests: XCTestCase {
         XCTAssertEqual(subprocess.calls.map { $0.1.first }, ["model_converter"])
         XCTAssertEqual(
             try orientationQuaternion(in: dataset),
-            [1, 0, 0, 0]
+            [0, 1, 0, 0]
         )
         XCTAssertEqual(preparedDataset.identity.inputDigest.count, 64)
         XCTAssertEqual(preparedDataset.identity.geometryDigest.count, 64)
@@ -1321,8 +1321,9 @@ final class PipelineRunnerHelperTests: XCTestCase {
         let geometryArtifact = try trainingGeometryArtifact(
             sourceSparse: sourceSparse,
             learnedPointInitializer: initializer,
-            canonicalOrientation: .unresolved(
-                openingViewDirection: CanonicalDirection(x: 0, y: 0, z: -1)
+            canonicalOrientation: testOrientation(
+                status: .verified,
+                quaternion: CanonicalQuaternionWXYZ(w: 0, x: 1, y: 0, z: 0)
             )
         )
 
@@ -1343,7 +1344,7 @@ final class PipelineRunnerHelperTests: XCTestCase {
             subprocess.calls.map { $0.1.first },
             ["model_converter", "image_undistorter", "model_converter", "model_converter"]
         )
-        XCTAssertEqual(try orientationQuaternion(in: dataset), [1, 0, 0, 0])
+        XCTAssertEqual(try orientationQuaternion(in: dataset), [0, 1, 0, 0])
         XCTAssertEqual(preparedDataset.identity.inputDigest.count, 64)
         XCTAssertEqual(preparedDataset.identity.geometryDigest.count, 64)
         XCTAssertFalse(

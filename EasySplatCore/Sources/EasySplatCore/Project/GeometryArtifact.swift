@@ -328,6 +328,19 @@ public struct CanonicalQuaternionWXYZ: Codable, Sendable, Equatable {
         self.y = y
         self.z = z
     }
+
+    var isCanonicalUnitRotation: Bool {
+        let components = [w, x, y, z]
+        guard components.allSatisfy(\.isFinite) else { return false }
+        let squaredNorm = components.reduce(0) { $0 + $1 * $1 }
+        guard abs(squaredNorm - 1) <= 1e-6 else { return false }
+        if w > 0 { return true }
+        if w < 0 { return false }
+        for component in [x, y, z] where component != 0 {
+            return component > 0
+        }
+        return false
+    }
 }
 
 public struct CanonicalDirection: Codable, Sendable, Equatable {
@@ -431,7 +444,7 @@ public struct CanonicalOrientationArtifact: Codable, Sendable, Equatable {
 }
 
 public struct GeometryArtifact: Codable, Sendable, Equatable {
-    public static let currentSchemaVersion = 12
+    public static let currentSchemaVersion = 13
 
     public var schemaVersion: Int
     public var solverVersion: String
@@ -441,7 +454,8 @@ public struct GeometryArtifact: Codable, Sendable, Equatable {
     public var selectedFramesDigest: String
     public var orderedImageNames: [String]
     public var orderedImageTimestamps: [Double?]
-    /// Accepted COLMAP model after any confidence-gated canonical world rotation.
+    /// Accepted COLMAP model in its source reconstruction frame. The orientation
+    /// artifact maps this immutable model into EasySplat's canonical output frame.
     public var sourceModelPath: String
     /// Describes whether persisted poses transform world-to-camera or camera-to-world.
     public var poseConvention: String
