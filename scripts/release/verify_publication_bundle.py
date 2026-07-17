@@ -62,6 +62,26 @@ SYSTEM_TOOLS = {
     "codesign": "/usr/bin/codesign",
     "dwarfdump": "/usr/bin/dwarfdump",
 }
+APP_TOOLCHAIN_RESOURCE_PATHS = (
+    "Contents/Resources/public_key_ed25519.txt",
+    "Contents/Resources/toolchain_manifest_url.txt",
+    (
+        "Contents/Resources/EasySplat_EasySplatApp.bundle/"
+        "public_key_ed25519.txt"
+    ),
+    (
+        "Contents/Resources/EasySplat_EasySplatApp.bundle/"
+        "toolchain_manifest_url.txt"
+    ),
+    (
+        "Contents/Resources/EasySplat_EasySplatApp.bundle/Contents/Resources/"
+        "public_key_ed25519.txt"
+    ),
+    (
+        "Contents/Resources/EasySplat_EasySplatApp.bundle/Contents/Resources/"
+        "toolchain_manifest_url.txt"
+    ),
+)
 
 
 class PublicationError(ValueError):
@@ -303,6 +323,10 @@ def validate_identity(
         parse_semver(toolchain_version)
     except PublicationError:
         fail("app and toolchain versions must use strict semantic versioning")
+    if "+" in app_version or "+" in toolchain_version:
+        fail(
+            "public release versions must not contain semantic version build metadata"
+        )
     if app_prerelease is None:
         fail("app version must be a semantic prerelease")
     if not REPOSITORY.fullmatch(source_repository):
@@ -1467,7 +1491,60 @@ def parse_uuid(output: str, label: str) -> str:
     return match.group(1)
 
 
-def validate_app_bundle(app: Path, *, app_version: str) -> str:
+def validate_app_toolchain_resources(
+    app: Path,
+    *,
+    toolchain_version: str,
+    source_repository: str,
+    toolchain_public_key: Path,
+) -> None:
+    resource_names = {"public_key_ed25519.txt", "toolchain_manifest_url.txt"}
+    found = {
+        path.relative_to(app).as_posix()
+        for path in app.rglob("*")
+        if path.name in resource_names
+    }
+    expected = set(APP_TOOLCHAIN_RESOURCE_PATHS)
+    if found != expected:
+        fail("bundled toolchain resource closure is not exact")
+
+    expected_public_key = file_record(
+        toolchain_public_key,
+        maximum_size=1_024,
+    )
+    expected_manifest_url = (
+        f"https://github.com/{source_repository}/releases/download/"
+        f"toolchain-v{toolchain_version}/manifest.json"
+    ).encode("ascii")
+    expected_records = {
+        "public_key_ed25519.txt": (
+            expected_public_key["size_bytes"],
+            expected_public_key["sha256"],
+        ),
+        "toolchain_manifest_url.txt": (
+            len(expected_manifest_url),
+            hashlib.sha256(expected_manifest_url).hexdigest(),
+        ),
+    }
+
+    for relative in APP_TOOLCHAIN_RESOURCE_PATHS:
+        resource = app / relative
+        actual = file_record(resource, maximum_size=1_024)
+        if (actual["size_bytes"], actual["sha256"]) != expected_records[resource.name]:
+            fail(
+                "bundled toolchain resource does not match release authority: "
+                f"{relative}"
+            )
+
+
+def validate_app_bundle(
+    app: Path,
+    *,
+    app_version: str,
+    toolchain_version: str,
+    source_repository: str,
+    toolchain_public_key: Path,
+) -> str:
     if app.is_symlink() or not app.is_dir():
         fail("DMG must contain a real EasySplat.app directory")
     contents = app / "Contents"
@@ -1478,6 +1555,12 @@ def validate_app_bundle(app: Path, *, app_version: str) -> str:
     ):
         fail("app Contents allowlist is invalid")
     validate_regular_tree(app, maximum_bytes=4 * 1_024 * 1_024 * 1_024)
+    validate_app_toolchain_resources(
+        app,
+        toolchain_version=toolchain_version,
+        source_repository=source_repository,
+        toolchain_public_key=toolchain_public_key,
+    )
     plist = contents / "Info.plist"
     executable = contents / "MacOS/EasySplatApp"
     if not executable.is_file() or executable.is_symlink():
@@ -2521,7 +2604,13 @@ def verify_and_prepare_publication(
         ):
             fail("DMG Applications link is invalid")
         app = mount / "EasySplat.app"
-        app_uuid = validate_app_bundle(app, app_version=app_version)
+        app_uuid = validate_app_bundle(
+            app,
+            app_version=app_version,
+            toolchain_version=toolchain_version,
+            source_repository=source_repository,
+            toolchain_public_key=toolchain_public_key,
+        )
         app_binary = app / "Contents/MacOS/EasySplatApp"
         validate_dsym_archive(dsym, app_binary)
         if app_uuid != parse_uuid(

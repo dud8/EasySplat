@@ -55,6 +55,11 @@ def fail(message: str) -> NoReturn:
     raise MetadataError(message)
 
 
+def reject_semver_build_metadata(value: str, label: str) -> None:
+    if "+" in value:
+        fail(f"{label} must not contain semantic version build metadata")
+
+
 def sha256_stream(stream: BinaryIO) -> str:
     digest = hashlib.sha256()
     for chunk in iter(lambda: stream.read(1024 * 1024), b""):
@@ -447,6 +452,7 @@ def inspect_archive(
 
 
 def validate_archives(specs: dict[str, ArchiveSpec], expected_version: str) -> ValidatedClosure:
+    reject_semver_build_metadata(expected_version, "toolchain version")
     if set(specs) != set(ARCHIVE_ORDER):
         fail("release requires core, DA3 Base, and DA3 Small archives")
     validate_normal_photo_install_size({
@@ -524,6 +530,7 @@ def artifact_row(path: Path, download_url: str) -> dict[str, Any]:
 
 
 def release_asset_url(source_url: str, app_version: str, file_name: str) -> str:
+    reject_semver_build_metadata(app_version, "app version")
     root = source_url.removesuffix(".git").rstrip("/")
     return f"{root}/releases/download/v{quote(app_version, safe='.-')}/{quote(file_name)}"
 
