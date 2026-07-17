@@ -59,6 +59,20 @@ public final class BenchmarkRenderDriver {
             throw BenchmarkDriverError.invalidJob("A render checkout does not match its signed commit.")
         }
 
+        let preparationInput = try StableArtifactInput.capture(
+            artifactRoot: artifacts.root,
+            relativePath: job.groundTruthPreparation.path,
+            expectedSHA256: job.groundTruthPreparation.sha256,
+            label: "ground-truth preparation receipt"
+        )
+        let groundTruthSourceInputs = try job.views.enumerated().map { position, view in
+            try StableArtifactInput.capture(
+                artifactRoot: artifacts.root,
+                relativePath: view.groundTruth.sourcePath,
+                expectedSHA256: view.groundTruth.sourceSHA256,
+                label: "held-out ground-truth source \(position)"
+            )
+        }
         let groundTruthInputs = try job.views.enumerated().map { position, view in
             try StableArtifactInput.capture(
                 artifactRoot: artifacts.root,
@@ -67,7 +81,7 @@ public final class BenchmarkRenderDriver {
                 label: "held-out ground-truth image \(position)"
             )
         }
-        let cameraDigests = try job.views.map { try Self.digest(of: $0.camera) }
+        let cameraDigests = try job.views.map { try $0.camera.stableDigest() }
         let snapshots = try RenderInputSnapshotDirectory()
         var rendersByView = Array(
             repeating: [RenderVariant: RenderingManifestRender](),
@@ -77,6 +91,10 @@ public final class BenchmarkRenderDriver {
         var previousCommandEnd = 0.0
 
         func verifyProtectedState() throws {
+            try preparationInput.verifyUnchanged()
+            for input in groundTruthSourceInputs {
+                try input.verifyUnchanged()
+            }
             for input in groundTruthInputs {
                 try input.verifyUnchanged()
             }
@@ -172,6 +190,9 @@ public final class BenchmarkRenderDriver {
                 groundTruth: ManifestGroundTruth(
                     path: view.groundTruth.path,
                     sha256: groundTruthInputs[viewIndex].fingerprint.sha256,
+                    sourcePath: view.groundTruth.sourcePath,
+                    sourceSHA256: groundTruthSourceInputs[viewIndex].fingerprint.sha256,
+                    preparationViewSHA256: view.groundTruth.preparationViewSHA256,
                     inputDigest: job.inputDigest
                 ),
                 renders: renders
@@ -179,7 +200,7 @@ public final class BenchmarkRenderDriver {
         }
 
         let manifest = RenderingManifest(
-            schemaVersion: 1,
+            schemaVersion: 2,
             sceneID: job.sceneID,
             scale: job.scale,
             requestDigest: job.requestDigest,
@@ -190,6 +211,7 @@ public final class BenchmarkRenderDriver {
             pixelFormat: "png_rgb8",
             rendererClosureSHA256: job.rendererClosureSHA256,
             rendererExecutableSHA256: rendererExecutableSHA256,
+            groundTruthPreparationSHA256: preparationInput.fingerprint.sha256,
             renderOperations: renderOperations,
             views: manifestViews
         )
@@ -207,21 +229,13 @@ public final class BenchmarkRenderDriver {
         return try JSONSerialization.data(withJSONObject: object, options: [.sortedKeys]) + Data("\n".utf8)
     }
 
-    private static func digest<T: Encodable>(of value: T) throws -> String {
-        var data = try canonicalJSON(value)
-        if data.last == Character("\n").asciiValue { data.removeLast() }
-        return "sha256:" + SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
-    }
-
     private static func regularFile(_ url: URL, label: String) throws -> URL {
-        let resolved = url.resolvingSymlinksInPath().standardizedFileURL
-        let values = try resolved.resourceValues(forKeys: [.isRegularFileKey, .isSymbolicLinkKey])
-        guard url.isFileURL,
-              values.isRegularFile == true,
-              values.isSymbolicLink != true else {
+        var metadata = stat()
+        let status = url.path.withCString { lstat($0, &metadata) }
+        guard url.isFileURL, status == 0, (metadata.st_mode & S_IFMT) == S_IFREG else {
             throw BenchmarkDriverError.invalidJob("The \(label) is not a regular file.")
         }
-        return resolved
+        return url.standardizedFileURL
     }
 }
 
@@ -241,11 +255,10 @@ struct ArtifactRoot {
     let root: URL
 
     init(root: URL) throws {
+        var metadata = stat()
+        let status = root.path.withCString { lstat($0, &metadata) }
         let resolved = root.resolvingSymlinksInPath().standardizedFileURL
-        let values = try resolved.resourceValues(forKeys: [.isDirectoryKey, .isSymbolicLinkKey])
-        guard root.isFileURL,
-              values.isDirectory == true,
-              values.isSymbolicLink != true else {
+        guard root.isFileURL, status == 0, (metadata.st_mode & S_IFMT) == S_IFDIR else {
             throw BenchmarkDriverError.invalidJob("The render artifact root is not a real directory.")
         }
         self.root = resolved
@@ -330,6 +343,7 @@ private struct RenderingManifest: Encodable {
     let pixelFormat: String
     let rendererClosureSHA256: String
     let rendererExecutableSHA256: String
+    let groundTruthPreparationSHA256: String
     let renderOperations: [RenderOperationReceipt]
     let views: [RenderingManifestView]
 
@@ -345,6 +359,7 @@ private struct RenderingManifest: Encodable {
         case pixelFormat = "pixel_format"
         case rendererClosureSHA256 = "renderer_closure_sha256"
         case rendererExecutableSHA256 = "renderer_executable_sha256"
+        case groundTruthPreparationSHA256 = "ground_truth_preparation_sha256"
         case renderOperations = "render_operations"
         case views
     }
@@ -369,10 +384,16 @@ private struct RenderingManifestView: Encodable {
 private struct ManifestGroundTruth: Encodable {
     let path: String
     let sha256: String
+    let sourcePath: String
+    let sourceSHA256: String
+    let preparationViewSHA256: String
     let inputDigest: String
 
     enum CodingKeys: String, CodingKey {
         case path, sha256
+        case sourcePath = "source_path"
+        case sourceSHA256 = "source_sha256"
+        case preparationViewSHA256 = "preparation_view_sha256"
         case inputDigest = "input_digest"
     }
 }

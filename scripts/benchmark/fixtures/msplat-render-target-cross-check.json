@@ -1,0 +1,67 @@
+{
+  "expected_pixel_sha256": "sha256:b9fb2fe00c61c90304988eddbd32c0cad9991475fb8a082ccbf41c5813805d58",
+  "expected_source_pixel_sha256": "sha256:942135e3360f2dcb0181a514eefc59a58b622c21d8b224f5eb0f5984d307b097",
+  "expected_roi": [0, 0, 96, 63],
+  "expected_target_camera": {
+    "height": 63,
+    "model": "PINHOLE",
+    "parameters": [70.0, 70.0, 47.5, 31.5],
+    "width": 96
+  },
+  "native_reference": {
+    "image_io_sha256": "sha256:6259dd991b0cf3e0f2d181ad7ea8392ba97ccdc785dd9cf67c75307affe12779",
+    "msplat_commit": "106499b0a53f82b0c92d013b0861fbebd341b17e",
+    "source": "core/src/loaders/image_io.cpp"
+  },
+  "render_camera": {
+    "height": 63,
+    "projection_matrix_column_major": [
+      1.4583333333333333,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      2.2222222222222223,
+      0.0,
+      0.0,
+      0.01041666666666663,
+      0.0,
+      -1.0002000331878662,
+      -1.0,
+      0.0,
+      0.0,
+      -0.020002000033855438,
+      0.0
+    ],
+    "width": 96,
+    "world_to_camera_matrix_column_major": [
+      1.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      1.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      1.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      1.0
+    ]
+  },
+  "source_camera": {
+    "height": 64,
+    "model": "SIMPLE_RADIAL",
+    "parameters": [70.0, 47.5, 31.5, -0.08],
+    "width": 96
+  },
+  "source_pattern": {
+    "blue": "(13*x + 17*y) % 256",
+    "green": "(7*x + 11*y) % 256",
+    "red": "(3*x + 5*y) % 256"
+  }
+}

@@ -101,21 +101,123 @@ FIXTURE_GROUND_TRUTH_IMAGES = {
     index: fixture_png(80 + position)
     for position, index in enumerate(FIXTURE_HOLDOUTS)
 }
+FIXTURE_PREPARATION_VIEWS = []
+for position, index in enumerate(FIXTURE_HOLDOUTS):
+    image_bytes = FIXTURE_GROUND_TRUTH_IMAGES[index]
+    camera_digest = evidence.render_camera_digest(fixture_render_camera(index))
+    view = {
+        "holdout_index": index,
+        "source": {
+            "path": f"rendering/source/{index:06d}.png",
+            "sha256": evidence.sha256_bytes(image_bytes),
+            "pixel_sha256": evidence.sha256_bytes(
+                bytes([80 + position]) * 64 * 64 * 3
+            ),
+            "format": "png_rgb8",
+            "width": 64,
+            "height": 64,
+            "native_decode_receipt_sha256": "sha256:" + "5" * 64,
+            "native_decoded_rgb8_sha256": evidence.sha256_bytes(
+                bytes([80 + position]) * 64 * 64 * 3
+            ),
+        },
+        "source_camera": {
+            "model": "PINHOLE",
+            "width": 64,
+            "height": 64,
+            "parameters": [32.0, 32.0, 32.0, 32.0],
+        },
+        "transform": {"kind": "identity", "roi": [0, 0, 64, 64]},
+        "target": {
+            "path": f"rendering/ground-truth/{index:06d}.png",
+            "sha256": evidence.sha256_bytes(image_bytes),
+            "pixel_sha256": evidence.sha256_bytes(
+                bytes([80 + position]) * 64 * 64 * 3
+            ),
+            "format": "png_rgb8",
+            "width": 64,
+            "height": 64,
+        },
+        "target_camera": {
+            "model": "PINHOLE",
+            "width": 64,
+            "height": 64,
+            "parameters": [32.0, 32.0, 32.0, 32.0],
+        },
+        "render_camera_digest": camera_digest,
+    }
+    view["preparation_view_sha256"] = evidence.sha256_bytes(
+        evidence.canonical_json_bytes(view)
+    )
+    FIXTURE_PREPARATION_VIEWS.append(view)
+FIXTURE_GROUND_TRUTH_PREPARATION = benchmark.canonical_json_bytes(
+    {
+        "schema_version": 2,
+        "input_digest": "sha256:" + "1" * 64,
+        "selection_manifest": {
+            "path": "selection-manifest.json",
+            "sha256": evidence.sha256_bytes(FIXTURE_SELECTION_MANIFEST),
+        },
+        "source_spec": {
+            "path": "render-target-spec.json",
+            "sha256": "sha256:" + "9" * 64,
+        },
+        "algorithm": {
+            "id": "native_msplat_decode_brown_conrady_alpha0",
+            "version": 2,
+            "float_precision": "float32",
+            "inverse_iterations": 20,
+            "boundary_samples": 200,
+            "interpolation": "bilinear",
+            "boundary_mode": "clamp",
+        },
+        "producer": {
+            "path": "scripts/benchmark/prepare_render_targets.py",
+            "sha256": evidence.sha256_file(
+                ROOT / "scripts" / "benchmark" / "prepare_render_targets.py"
+            ),
+            "runtime": {
+                "implementation": "cpython",
+                "python_version": "fixture",
+                "numpy_version": "fixture",
+                "pillow_version": "fixture",
+            },
+        },
+        "native_decoder": {
+            "contract": "native_coregraphics_imageio_rgb8_v1",
+            "mode_version": 1,
+            "executable_bytes": 1,
+            "executable_sha256": "sha256:" + "2" * 64,
+            "metallib_bytes": 1,
+            "metallib_sha256": "sha256:" + "3" * 64,
+            "trainer_build_digest": "sha256:" + "4" * 64,
+            "msplat_source_commit": "106499b0a53f82b0c92d013b0861fbebd341b17e",
+        },
+        "views": FIXTURE_PREPARATION_VIEWS,
+    }
+) + b"\n"
+FIXTURE_GROUND_TRUTH_PREPARATION_SHA256 = evidence.sha256_bytes(
+    FIXTURE_GROUND_TRUTH_PREPARATION
+)
 FIXTURE_ACCURATE_RENDERING_REFERENCE = benchmark.canonical_json_bytes(
     {
-        "schema_version": 1,
+        "schema_version": 2,
+        "ground_truth_preparation_sha256": FIXTURE_GROUND_TRUTH_PREPARATION_SHA256,
         "views": [
             {
                 "holdout_index": index,
                 "camera": fixture_render_camera(index),
-                "camera_digest": evidence.sha256_bytes(
-                    evidence.canonical_json_bytes(fixture_render_camera(index))
+                "camera_digest": evidence.render_camera_digest(
+                    fixture_render_camera(index)
                 ),
                 "ground_truth_sha256": evidence.sha256_bytes(
                     FIXTURE_GROUND_TRUTH_IMAGES[index]
                 ),
+                "preparation_view_sha256": FIXTURE_PREPARATION_VIEWS[position][
+                    "preparation_view_sha256"
+                ],
             }
-            for index in FIXTURE_HOLDOUTS
+            for position, index in enumerate(FIXTURE_HOLDOUTS)
         ],
     }
 ) + b"\n"
@@ -130,6 +232,10 @@ REFERENCE_ARTIFACT_CONTENTS = {
     "accurate_rendering_reference_sha256": (
         "accurate-rendering-reference.json",
         FIXTURE_ACCURATE_RENDERING_REFERENCE,
+    ),
+    "ground_truth_preparation_sha256": (
+        "ground-truth-preparation.json",
+        FIXTURE_GROUND_TRUTH_PREPARATION,
     ),
     "paired_baseline_rendering_reference_sha256": (
         "paired-baseline-rendering-reference.json",
@@ -1726,7 +1832,7 @@ def write_orientation_evidence_artifacts(
                     },
                     "poseConvention": "world-to-camera",
                     "quaternionOrder": "wxyz",
-                    "schemaVersion": 11,
+                    "schemaVersion": 14,
                 }
             )
             + b"\n"
@@ -1837,7 +1943,7 @@ def training_manifest_for_observations(
 ) -> dict[str, object]:
     pipeline = observations["pipeline_metrics"]
     return {
-        "schemaVersion": 4,
+        "schemaVersion": 5,
         "trainerVersion": "1.1.3 (git 106499b)",
         "runtimeVersion": "native-metal-cli-v2",
         "trainerBuildDigest": "3" * 64,
@@ -1846,7 +1952,7 @@ def training_manifest_for_observations(
         "detailProfile": candidate_configuration["detail_profile"],
         "iterationLimit": candidate_configuration["trainer_iterations"],
         "plateauWindow": candidate_configuration["trainer_plateau_window"],
-        "deterministicSeed": candidate_configuration["deterministic_seed"],
+        "cameraOrderSeed": candidate_configuration["deterministic_seed"],
         "completedIteration": candidate_configuration["trainer_iterations"],
         "outputPath": "Output/splat.ply",
         "outputSHA256": hashlib.sha256(VALID_SPLAT_PLY.encode("utf-8")).hexdigest(),
@@ -1976,12 +2082,20 @@ def write_evidence_artifacts(
         manifest_views = []
         render_operations = []
         for holdout_index in holdouts:
+            preparation_view = next(
+                view
+                for view in FIXTURE_PREPARATION_VIEWS
+                if view["holdout_index"] == holdout_index
+            )
             ground_truth = FIXTURE_GROUND_TRUTH_IMAGES[holdout_index]
+            source_path = Path(preparation_view["source"]["path"])
+            (root / source_path).parent.mkdir(parents=True, exist_ok=True)
+            (root / source_path).write_bytes(ground_truth)
             ground_truth_path = Path("rendering/ground-truth") / f"{holdout_index:06d}.png"
             (root / ground_truth_path).parent.mkdir(parents=True, exist_ok=True)
             (root / ground_truth_path).write_bytes(ground_truth)
             camera = fixture_render_camera(holdout_index)
-            camera_digest = evidence.sha256_bytes(evidence.canonical_json_bytes(camera))
+            camera_digest = evidence.render_camera_digest(camera)
             render_records = []
             for variant in evidence.RENDER_VARIANTS:
                 render_path = Path("rendering") / variant / f"{holdout_index:06d}.png"
@@ -2031,6 +2145,11 @@ def write_evidence_artifacts(
                     "ground_truth": {
                         "path": ground_truth_path.as_posix(),
                         "sha256": evidence.sha256_bytes(ground_truth),
+                        "source_path": source_path.as_posix(),
+                        "source_sha256": evidence.sha256_bytes(ground_truth),
+                        "preparation_view_sha256": preparation_view[
+                            "preparation_view_sha256"
+                        ],
                         "input_digest": representative["input_digest"],
                     },
                     "renders": render_records,
@@ -2049,7 +2168,7 @@ def write_evidence_artifacts(
             operation["started_monotonic_seconds"] = float(index)
             operation["ended_monotonic_seconds"] = float(index + 1)
         manifest = {
-            "schema_version": 1,
+            "schema_version": 2,
             "scene_id": representative["scene_id"],
             "scale": scale,
             "request_digest": evidence.sha256_bytes(
@@ -2064,6 +2183,9 @@ def write_evidence_artifacts(
             "pixel_format": "png_rgb8",
             "renderer_closure_sha256": renderer_closure_digest,
             "renderer_executable_sha256": renderer_digest,
+            "ground_truth_preparation_sha256": render_request[
+                "reference_artifacts"
+            ]["ground_truth_preparation_sha256"],
             "render_operations": render_operations,
             "views": manifest_views,
         }
@@ -2083,6 +2205,9 @@ def write_evidence_artifacts(
             "baseline_checkout_commit": render_request["binding"]["baseline_git_commit"],
             "renderer_closure_sha256": renderer_identity["sha256"],
             "renderer_executable_sha256": renderer_identity["executable_sha256"],
+            "ground_truth_preparation_sha256": render_request[
+                "reference_artifacts"
+            ]["ground_truth_preparation_sha256"],
             "job_sha256": evidence.sha256_file(root / "render-job.json"),
             "manifest_sha256": evidence.sha256_file(root / "rendering-manifest.json"),
             "stdout_sha256": evidence.sha256_file(root / "renderer-stdout.log"),
@@ -3038,6 +3163,16 @@ class EvidenceProtocolTests(unittest.TestCase):
             abs(first.mean() - second.mean())
         )
 
+    def test_request_pins_the_current_render_target_contract(self) -> None:
+        request = evidence_request()
+
+        self.assertEqual(request["schema_version"], 3)
+        self.assertIn(
+            "ground_truth_preparation_sha256",
+            request["reference_artifacts"],
+        )
+        evidence.validate_request(request)
+
     def test_lane_outcome_distinguishes_execution_failure_from_environment(self) -> None:
         request = evidence_request()
         runner = runner_identity(evidence.LANE_REFERENCE)
@@ -3848,6 +3983,24 @@ class EvidenceProtocolTests(unittest.TestCase):
         request["reference_artifacts"]["selection_manifest_sha256"] = evidence.sha256_bytes(
             selection
         )
+        preparation = json.loads(FIXTURE_GROUND_TRUTH_PREPARATION)
+        preparation["selection_manifest"]["sha256"] = request["reference_artifacts"][
+            "selection_manifest_sha256"
+        ]
+        preparation_bytes = evidence.canonical_json_bytes(preparation) + b"\n"
+        request["reference_artifacts"]["ground_truth_preparation_sha256"] = (
+            evidence.sha256_bytes(preparation_bytes)
+        )
+        rendering_reference = json.loads(FIXTURE_ACCURATE_RENDERING_REFERENCE)
+        rendering_reference["ground_truth_preparation_sha256"] = request[
+            "reference_artifacts"
+        ]["ground_truth_preparation_sha256"]
+        rendering_reference_bytes = (
+            evidence.canonical_json_bytes(rendering_reference) + b"\n"
+        )
+        request["reference_artifacts"]["accurate_rendering_reference_sha256"] = (
+            evidence.sha256_bytes(rendering_reference_bytes)
+        )
         observations = raw_observations(evidence.LANE_REFERENCE)
         observations["commands"] = execution_receipts(
             observations["timing"],
@@ -3891,6 +4044,12 @@ class EvidenceProtocolTests(unittest.TestCase):
                 root = Path(directory)
                 write_evidence_artifacts(root, changed_observations, request)
                 (root / "selection-manifest.json").write_bytes(selection)
+                (root / "ground-truth-preparation.json").write_bytes(
+                    preparation_bytes
+                )
+                (root / "accurate-rendering-reference.json").write_bytes(
+                    rendering_reference_bytes
+                )
                 (root / "pair-list.json").write_bytes(
                     evidence.canonical_json_bytes(pair_list) + b"\n"
                 )
@@ -4079,7 +4238,7 @@ class EvidenceProtocolTests(unittest.TestCase):
             ("detailProfile", "balanced"),
             ("iterationLimit", 7_000),
             ("plateauWindow", 800),
-            ("deterministicSeed", 43),
+            ("cameraOrderSeed", 43),
         )
         for field, value in cases:
             with self.subTest(field=field), tempfile.TemporaryDirectory() as directory:
@@ -4096,6 +4255,21 @@ class EvidenceProtocolTests(unittest.TestCase):
                         configuration,
                         60.0,
                     )
+
+        with tempfile.TemporaryDirectory() as directory:
+            manifest = training_manifest_for_observations(observations, configuration)
+            manifest["deterministicSeed"] = manifest.pop("cameraOrderSeed")
+            path = Path(directory) / "training-manifest.json"
+            path.write_bytes(evidence.canonical_json_bytes(manifest) + b"\n")
+            with self.assertRaisesRegex(evidence.EvidenceError, "fields"):
+                evidence._validate_training_manifest(
+                    path,
+                    descriptor,
+                    1,
+                    observations["pipeline_metrics"],
+                    configuration,
+                    60.0,
+                )
 
     def test_training_manifest_mirrors_swift_integer_and_resource_guards(self) -> None:
         request = evidence_request(lane=evidence.LANE_REFERENCE)
@@ -4132,7 +4306,7 @@ class EvidenceProtocolTests(unittest.TestCase):
                 "fallback evidence",
             ),
             ("signed integer overflow", {"peakMemoryBytes": 1 << 63}, "nonnegative integer"),
-            ("seed overflow", {"deterministicSeed": 1 << 64}, "outside UInt64"),
+            ("seed overflow", {"cameraOrderSeed": 1 << 64}, "outside UInt64"),
             (
                 "malformed exact duration",
                 {"rasterExactFallbackElapsedSeconds": "not-a-number"},
@@ -8106,7 +8280,7 @@ class RunnerIntegrityTests(unittest.TestCase):
                             "secondLargestModelRegisteredViewCount": 0,
                             "unionRegisteredViewCount": 30,
                         },
-                        "schemaVersion": 11,
+                        "schemaVersion": 14,
                     }
                 )
                 + b"\n"
@@ -8322,6 +8496,7 @@ class RunnerIntegrityTests(unittest.TestCase):
         *,
         exit_code: int = 0,
         mutate_shader: bool = False,
+        mutate_preparation: bool = False,
     ) -> dict[str, object]:
         root = root.resolve()
         artifact_root = root / "artifacts"
@@ -8350,6 +8525,12 @@ class RunnerIntegrityTests(unittest.TestCase):
                 if mutate_shader
                 else ""
             )
+            + (
+                "    (pathlib.Path(sys.argv[sys.argv.index('--artifact-root')+1]) / "
+                "'ground-truth-preparation.json').write_text('tampered\\n', encoding='utf-8')\n"
+                if mutate_preparation
+                else ""
+            )
             +
             "raise SystemExit(status)\n",
             encoding="utf-8",
@@ -8369,6 +8550,22 @@ class RunnerIntegrityTests(unittest.TestCase):
         request_path.write_bytes(evidence.canonical_json_bytes(request) + b"\n")
         request_digest = evidence.sha256_file(request_path)
         holdouts = request["holdout_indices"]
+        (artifact_root / "ground-truth-preparation.json").write_bytes(
+            FIXTURE_GROUND_TRUTH_PREPARATION
+        )
+        (artifact_root / "selection-manifest.json").write_bytes(
+            FIXTURE_SELECTION_MANIFEST
+        )
+        for holdout in holdouts:
+            preparation_view = next(
+                view
+                for view in FIXTURE_PREPARATION_VIEWS
+                if view["holdout_index"] == holdout
+            )
+            for image_kind in ("source", "target"):
+                image_path = artifact_root / preparation_view[image_kind]["path"]
+                image_path.parent.mkdir(parents=True, exist_ok=True)
+                image_path.write_bytes(FIXTURE_GROUND_TRUTH_IMAGES[holdout])
         commands = [
             {
                 "run_id": "baseline-run",
@@ -8417,20 +8614,20 @@ class RunnerIntegrityTests(unittest.TestCase):
             "candidate_balanced": commands[1],
             "candidate_fast": commands[3],
         }
-        identity_matrix = [
-            1.0, 0.0, 0.0, 0.0,
-            0.0, 1.0, 0.0, 0.0,
-            0.0, 0.0, 1.0, 0.0,
-            0.0, 0.0, 0.0, 1.0,
-        ]
         job = {
-            "schema_version": 1,
+            "schema_version": 2,
             "scene_id": request["binding"]["scene_id"],
             "scale": request["binding"]["scale"],
             "request_digest": request_digest,
             "input_digest": request["binding"]["input_digest"],
             "renderer_closure_sha256": identity["sha256"],
             "renderer_executable_sha256": identity["executable_sha256"],
+            "ground_truth_preparation": {
+                "path": "ground-truth-preparation.json",
+                "sha256": request["reference_artifacts"][
+                    "ground_truth_preparation_sha256"
+                ],
+            },
             "holdout_indices": holdouts,
             "training_view_indices": [
                 index for index in range(request["binding"]["scale"])
@@ -8447,15 +8644,21 @@ class RunnerIntegrityTests(unittest.TestCase):
             "views": [
                 {
                     "holdout_index": holdout,
-                    "camera": {
-                        "width": 64,
-                        "height": 64,
-                        "projection_matrix_column_major": identity_matrix,
-                        "world_to_camera_matrix_column_major": identity_matrix,
-                    },
+                    "camera": fixture_render_camera(holdout),
                     "ground_truth": {
                         "path": f"rendering/ground-truth/{holdout:06d}.png",
-                        "sha256": "sha256:" + "e" * 64,
+                        "sha256": evidence.sha256_bytes(
+                            FIXTURE_GROUND_TRUTH_IMAGES[holdout]
+                        ),
+                        "source_path": f"rendering/source/{holdout:06d}.png",
+                        "source_sha256": evidence.sha256_bytes(
+                            FIXTURE_GROUND_TRUTH_IMAGES[holdout]
+                        ),
+                        "preparation_view_sha256": next(
+                            view["preparation_view_sha256"]
+                            for view in FIXTURE_PREPARATION_VIEWS
+                            if view["holdout_index"] == holdout
+                        ),
                     },
                     "sources": [
                         {
@@ -8627,6 +8830,35 @@ class RunnerIntegrityTests(unittest.TestCase):
             ):
                 self._run_renderer_stage(fixture)
             self.assertTrue(fixture["invocation_marker"].is_file())
+
+    def test_rendering_stage_rejects_preparation_mutation_after_invocation(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = self._renderer_stage_fixture(
+                Path(directory),
+                mutate_preparation=True,
+            )
+
+            with self.assertRaisesRegex(
+                lane_runner.benchmark.ConfigError,
+                "protected rendering inputs changed",
+            ):
+                self._run_renderer_stage(fixture)
+            self.assertTrue(fixture["invocation_marker"].is_file())
+
+    def test_render_job_rejects_preparation_binding_drift_before_invocation(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = self._renderer_stage_fixture(Path(directory))
+            job_path = fixture["artifact_root"] / "render-job.json"
+            job = json.loads(job_path.read_text(encoding="utf-8"))
+            job["ground_truth_preparation"]["sha256"] = "sha256:" + "0" * 64
+            job_path.write_bytes(evidence.canonical_json_bytes(job) + b"\n")
+
+            with self.assertRaisesRegex(
+                lane_runner.benchmark.ConfigError,
+                "ground-truth preparation",
+            ):
+                self._run_renderer_stage(fixture)
+            self.assertFalse(fixture["invocation_marker"].exists())
 
     def test_render_job_rejects_a_checkout_path_with_a_symlinked_ancestor(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

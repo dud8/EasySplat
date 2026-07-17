@@ -1951,6 +1951,7 @@ def _validate_render_job(
             "input_digest",
             "renderer_closure_sha256",
             "renderer_executable_sha256",
+            "ground_truth_preparation",
             "holdout_indices",
             "training_view_indices",
             "candidate_checkout",
@@ -1961,7 +1962,7 @@ def _validate_render_job(
     )
     binding = request["binding"]
     expected = {
-        "schema_version": 1,
+        "schema_version": 2,
         "scene_id": binding["scene_id"],
         "scale": binding["scale"],
         "request_digest": request_digest,
@@ -1978,6 +1979,38 @@ def _validate_render_job(
     for field, expected_value in expected.items():
         if job.get(field) != expected_value:
             raise benchmark.ConfigError(f"render job {field} does not match the protected request")
+    preparation_binding = benchmark._require_mapping(
+        job.get("ground_truth_preparation"),
+        "render job ground_truth_preparation",
+    )
+    benchmark._require_exact_keys(
+        preparation_binding,
+        {"path", "sha256"},
+        "render job ground_truth_preparation",
+    )
+    expected_preparation_sha256 = request["reference_artifacts"][
+        "ground_truth_preparation_sha256"
+    ]
+    if preparation_binding != {
+        "path": "ground-truth-preparation.json",
+        "sha256": expected_preparation_sha256,
+    }:
+        raise benchmark.ConfigError(
+            "render job ground-truth preparation does not match the protected request"
+        )
+    try:
+        preparation_records, _ = evidence._validate_ground_truth_preparation(
+            artifact_root=artifact_root,
+            preparation_path=artifact_root / "ground-truth-preparation.json",
+            expected_sha256=expected_preparation_sha256,
+            expected_input_digest=binding["input_digest"],
+            expected_selection_sha256=request["reference_artifacts"][
+                "selection_manifest_sha256"
+            ],
+            holdout_indices=request["holdout_indices"],
+        )
+    except evidence.EvidenceError as error:
+        raise benchmark.ConfigError(str(error)) from error
     checkout_expectations = (
         ("candidate_checkout", candidate_checkout, binding["git_commit"]),
         ("baseline_checkout", baseline_checkout, binding["baseline_git_commit"]),
@@ -2014,7 +2047,10 @@ def _validate_render_job(
         "output_path",
     }
     immutable_paths: dict[str, str] = {}
-    output_paths: set[Path] = set()
+    output_paths: set[Path] = {Path("ground-truth-preparation.json")}
+    for preparation_view in preparation_records.values():
+        output_paths.add(Path(preparation_view["source"]["path"]))
+        output_paths.add(Path(preparation_view["target"]["path"]))
     for position, (raw_view, holdout_index) in enumerate(
         zip(views, request["holdout_indices"], strict=True)
     ):
@@ -2026,6 +2062,46 @@ def _validate_render_job(
         )
         if view.get("holdout_index") != holdout_index:
             raise benchmark.ConfigError("render job views are not in bound holdout order")
+        try:
+            camera = evidence._render_camera(
+                view.get("camera"),
+                f"render job views[{position}].camera",
+            )
+        except evidence.EvidenceError as error:
+            raise benchmark.ConfigError(str(error)) from error
+        preparation_view = preparation_records[holdout_index]
+        camera_digest = evidence.render_camera_digest(camera)
+        ground_truth = benchmark._require_mapping(
+            view.get("ground_truth"),
+            f"render job views[{position}].ground_truth",
+        )
+        benchmark._require_exact_keys(
+            ground_truth,
+            {
+                "path",
+                "sha256",
+                "source_path",
+                "source_sha256",
+                "preparation_view_sha256",
+            },
+            f"render job views[{position}].ground_truth",
+        )
+        expected_ground_truth = {
+            "path": preparation_view["target"]["path"],
+            "sha256": preparation_view["target"]["sha256"],
+            "source_path": preparation_view["source"]["path"],
+            "source_sha256": preparation_view["source"]["sha256"],
+            "preparation_view_sha256": preparation_view[
+                "preparation_view_sha256"
+            ],
+        }
+        if (
+            ground_truth != expected_ground_truth
+            or preparation_view["render_camera_digest"] != camera_digest
+        ):
+            raise benchmark.ConfigError(
+                "render job ground truth does not match its preparation receipt"
+            )
         sources = view.get("sources")
         if not isinstance(sources, list) or len(sources) != len(evidence.RENDER_VARIANTS):
             raise benchmark.ConfigError("render job sources are incomplete")
@@ -2117,7 +2193,7 @@ def _execute_rendering_stage(
         )
     except Exception as error:
         raise _IntegrityFailure("renderer closure changed before rendering") from error
-    _validate_render_job(
+    job = _validate_render_job(
         job_path,
         artifact_root,
         request,
@@ -2128,6 +2204,18 @@ def _execute_rendering_stage(
         commands,
     )
     job_digest = evidence.sha256_file(job_path)
+    protected_render_inputs = {
+        artifact_root / job["ground_truth_preparation"]["path"]: job[
+            "ground_truth_preparation"
+        ]["sha256"]
+    }
+    for view in job["views"]:
+        protected_render_inputs[artifact_root / view["ground_truth"]["path"]] = view[
+            "ground_truth"
+        ]["sha256"]
+        protected_render_inputs[
+            artifact_root / view["ground_truth"]["source_path"]
+        ] = view["ground_truth"]["source_sha256"]
     redacted_command = [
         "approved-rendering-driver",
         f"renderer-closure://{renderer_identity['sha256']}",
@@ -2175,6 +2263,12 @@ def _execute_rendering_stage(
             )
             _verify_file_digest(job_path, job_digest, "render job")
             _verify_file_digest(request_path, request_digest, "evidence request")
+            for protected_path, protected_digest in protected_render_inputs.items():
+                _verify_file_digest(
+                    protected_path,
+                    protected_digest,
+                    f"protected render input {protected_path.name}",
+                )
         except Exception as error:
             raise _IntegrityFailure("protected rendering inputs changed") from error
     if completed is None:
@@ -2208,6 +2302,9 @@ def _execute_rendering_stage(
         "baseline_checkout_commit": request["binding"]["baseline_git_commit"],
         "renderer_closure_sha256": renderer_identity["sha256"],
         "renderer_executable_sha256": renderer_identity["executable_sha256"],
+        "ground_truth_preparation_sha256": request["reference_artifacts"][
+            "ground_truth_preparation_sha256"
+        ],
         "job_sha256": job_digest,
         "manifest_sha256": manifest_digest,
         "stdout_sha256": evidence.sha256_file(renderer_stdout),

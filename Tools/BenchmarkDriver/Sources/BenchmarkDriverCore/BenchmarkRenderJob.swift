@@ -1,3 +1,4 @@
+import CryptoKit
 import Foundation
 
 public enum BenchmarkDriverError: LocalizedError, Equatable {
@@ -51,6 +52,49 @@ public struct RenderCamera: Codable, Equatable, Sendable {
         self.worldToCameraMatrixColumnMajor = worldToCameraMatrixColumnMajor
     }
 
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        width = try container.decode(Int.self, forKey: .width)
+        height = try container.decode(Int.self, forKey: .height)
+        projectionMatrixColumnMajor = try container
+            .decode([Double].self, forKey: .projectionMatrixColumnMajor)
+            .map(Float.init)
+        worldToCameraMatrixColumnMajor = try container
+            .decode([Double].self, forKey: .worldToCameraMatrixColumnMajor)
+            .map(Float.init)
+    }
+
+    public func stableDigest() throws -> String {
+        var payload = Data("EasySplat render camera digest v1\0".utf8)
+
+        func appendBigEndian(_ value: UInt32) {
+            payload.append(UInt8(truncatingIfNeeded: value >> 24))
+            payload.append(UInt8(truncatingIfNeeded: value >> 16))
+            payload.append(UInt8(truncatingIfNeeded: value >> 8))
+            payload.append(UInt8(truncatingIfNeeded: value))
+        }
+
+        guard let encodedWidth = UInt32(exactly: width),
+              let encodedHeight = UInt32(exactly: height) else {
+            throw BenchmarkDriverError.invalidJob("A render camera dimension is invalid.")
+        }
+        appendBigEndian(encodedWidth)
+        appendBigEndian(encodedHeight)
+        for value in projectionMatrixColumnMajor + worldToCameraMatrixColumnMajor {
+            let encoded = Float(value)
+            guard encoded.isFinite else {
+                throw BenchmarkDriverError.invalidJob(
+                    "A render camera value is outside the Float32 domain."
+                )
+            }
+            let bits = encoded.bitPattern & 0x7fff_ffff == 0 ? 0 : encoded.bitPattern
+            appendBigEndian(bits)
+        }
+        return "sha256:" + SHA256.hash(data: payload)
+            .map { String(format: "%02x", $0) }
+            .joined()
+    }
+
     enum CodingKeys: String, CodingKey {
         case width
         case height
@@ -60,6 +104,35 @@ public struct RenderCamera: Codable, Equatable, Sendable {
 }
 
 public struct GroundTruthImage: Codable, Equatable, Sendable {
+    public var path: String
+    public var sha256: String
+    public var sourcePath: String
+    public var sourceSHA256: String
+    public var preparationViewSHA256: String
+
+    public init(
+        path: String,
+        sha256: String,
+        sourcePath: String,
+        sourceSHA256: String,
+        preparationViewSHA256: String
+    ) {
+        self.path = path
+        self.sha256 = sha256
+        self.sourcePath = sourcePath
+        self.sourceSHA256 = sourceSHA256
+        self.preparationViewSHA256 = preparationViewSHA256
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case path, sha256
+        case sourcePath = "source_path"
+        case sourceSHA256 = "source_sha256"
+        case preparationViewSHA256 = "preparation_view_sha256"
+    }
+}
+
+public struct GroundTruthPreparationBinding: Codable, Equatable, Sendable {
     public var path: String
     public var sha256: String
 
@@ -145,6 +218,7 @@ public struct BenchmarkRenderJob: Codable, Equatable, Sendable {
     public var inputDigest: String
     public var rendererClosureSHA256: String
     public var rendererExecutableSHA256: String
+    public var groundTruthPreparation: GroundTruthPreparationBinding
     public var holdoutIndices: [Int]
     public var trainingViewIndices: [Int]
     public var candidateCheckout: CheckoutBinding
@@ -159,6 +233,7 @@ public struct BenchmarkRenderJob: Codable, Equatable, Sendable {
         inputDigest: String,
         rendererClosureSHA256: String,
         rendererExecutableSHA256: String,
+        groundTruthPreparation: GroundTruthPreparationBinding,
         holdoutIndices: [Int],
         trainingViewIndices: [Int],
         candidateCheckout: CheckoutBinding,
@@ -172,6 +247,7 @@ public struct BenchmarkRenderJob: Codable, Equatable, Sendable {
         self.inputDigest = inputDigest
         self.rendererClosureSHA256 = rendererClosureSHA256
         self.rendererExecutableSHA256 = rendererExecutableSHA256
+        self.groundTruthPreparation = groundTruthPreparation
         self.holdoutIndices = holdoutIndices
         self.trainingViewIndices = trainingViewIndices
         self.candidateCheckout = candidateCheckout
@@ -187,6 +263,7 @@ public struct BenchmarkRenderJob: Codable, Equatable, Sendable {
         case inputDigest = "input_digest"
         case rendererClosureSHA256 = "renderer_closure_sha256"
         case rendererExecutableSHA256 = "renderer_executable_sha256"
+        case groundTruthPreparation = "ground_truth_preparation"
         case holdoutIndices = "holdout_indices"
         case trainingViewIndices = "training_view_indices"
         case candidateCheckout = "candidate_checkout"
@@ -195,7 +272,7 @@ public struct BenchmarkRenderJob: Codable, Equatable, Sendable {
     }
 
     public func validate() throws {
-        guard schemaVersion == 1 else {
+        guard schemaVersion == 2 else {
             throw BenchmarkDriverError.invalidJob("The render-job schema is unsupported.")
         }
         guard Self.isToken(sceneID), scale > 0 else {
@@ -223,12 +300,22 @@ public struct BenchmarkRenderJob: Codable, Equatable, Sendable {
         guard Self.isCommit(candidateCheckout.commit), Self.isCommit(baselineCheckout.commit) else {
             throw BenchmarkDriverError.invalidJob("A checkout commit is invalid.")
         }
-        var imagePaths = Set<String>()
+        guard groundTruthPreparation.path == "ground-truth-preparation.json",
+              Self.isDigest(groundTruthPreparation.sha256) else {
+            throw BenchmarkDriverError.invalidJob(
+                "The ground-truth preparation binding is invalid."
+            )
+        }
+        var imagePaths: Set<String> = [groundTruthPreparation.path]
         var immutableSources = [RenderVariant: RenderSource]()
         for view in views {
             try Self.validate(camera: view.camera)
             guard Self.isSafeRelativePath(view.groundTruth.path),
                   Self.isDigest(view.groundTruth.sha256),
+                  Self.isSafeRelativePath(view.groundTruth.sourcePath),
+                  Self.isDigest(view.groundTruth.sourceSHA256),
+                  Self.isDigest(view.groundTruth.preparationViewSHA256),
+                  imagePaths.insert(view.groundTruth.sourcePath).inserted,
                   imagePaths.insert(view.groundTruth.path).inserted else {
                 throw BenchmarkDriverError.invalidJob("A ground-truth image binding is invalid.")
             }

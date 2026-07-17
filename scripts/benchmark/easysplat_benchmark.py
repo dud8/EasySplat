@@ -726,6 +726,7 @@ def validate_corpus(corpus: Any, expected_profile: str) -> None:
                 "ground_truth_poses_sha256",
                 "accurate_colmap_model_sha256",
                 "accurate_rendering_reference_sha256",
+                "ground_truth_preparation_sha256",
                 "paired_baseline_rendering_reference_sha256",
                 "orientation_label_sha256",
             }
@@ -2882,7 +2883,7 @@ def _evidence_request(
         "deterministic_seed": 42,
     }
     return {
-        "schema_version": 2,
+        "schema_version": 3,
         "binding": {
             "profile": identity.profile,
             "scene_id": scene["id"],

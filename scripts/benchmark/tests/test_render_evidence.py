@@ -30,6 +30,17 @@ RENDERER_SHA256 = "sha256:" + "e" * 64
 RENDERER_CLOSURE_SHA256 = "sha256:" + "f" * 64
 
 
+def camera_digest_fixture() -> dict[str, object]:
+    path = (
+        ROOT
+        / "scripts"
+        / "benchmark"
+        / "fixtures"
+        / "render-camera-digest-v1.json"
+    )
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
 def camera(index: int) -> dict[str, object]:
     return {
         "width": 64,
@@ -53,6 +64,10 @@ def write_png(path: Path, value: int) -> str:
     path.parent.mkdir(parents=True, exist_ok=True)
     Image.new("RGB", (64, 64), (value, value, value)).save(path, format="PNG")
     return evidence.sha256_file(path)
+
+
+def pixel_digest(value: int) -> str:
+    return evidence.sha256_bytes(bytes([value, value, value]) * 64 * 64)
 
 
 def request() -> dict[str, object]:
@@ -93,7 +108,32 @@ def commands() -> list[dict[str, object]]:
 
 def write_render_closure(root: Path) -> tuple[dict[str, object], Path]:
     req = request()
-    request_digest = evidence.sha256_bytes(evidence.canonical_json_bytes(req) + b"\n")
+    producer_sha256 = evidence.sha256_file(
+        ROOT / "scripts" / "benchmark" / "prepare_render_targets.py"
+    )
+    runtime = {
+        "implementation": "cpython",
+        "python_version": "fixture",
+        "numpy_version": "fixture",
+        "pillow_version": "fixture",
+    }
+    native_decoder = {
+        "contract": "native_coregraphics_imageio_rgb8_v1",
+        "mode_version": 1,
+        "executable_bytes": 1,
+        "executable_sha256": "sha256:" + "2" * 64,
+        "metallib_bytes": 1,
+        "metallib_sha256": "sha256:" + "3" * 64,
+        "trainer_build_digest": "sha256:" + "4" * 64,
+        "msplat_source_commit": "106499b0a53f82b0c92d013b0861fbebd341b17e",
+    }
+    selection = {
+        "schema_version": 1,
+        "holdout_indices": HOLDOUTS,
+    }
+    selection_path = root / "selection-manifest.json"
+    selection_path.write_bytes(evidence.canonical_json_bytes(selection) + b"\n")
+    selection_sha256 = evidence.sha256_file(selection_path)
     command_by_variant = {
         "paired_baseline": commands()[0],
         "candidate_balanced": commands()[1],
@@ -103,17 +143,76 @@ def write_render_closure(root: Path) -> tuple[dict[str, object], Path]:
     reference_views = []
     manifest_views = []
     render_operations = []
+    preparation_views = []
+    spec_views = []
     for view_offset, holdout_index in enumerate(HOLDOUTS):
         camera_record = camera(holdout_index)
-        camera_digest = evidence.sha256_bytes(evidence.canonical_json_bytes(camera_record))
+        camera_digest = evidence.render_camera_digest(camera_record)
+        source_path = Path("rendering") / "source" / f"{holdout_index:06d}.png"
+        source_sha = write_png(root / source_path, 64 + view_offset)
         ground_truth_path = Path("rendering") / "ground-truth" / f"{holdout_index:06d}.png"
         ground_truth_sha = write_png(root / ground_truth_path, 64 + view_offset)
+        preparation_view = {
+            "holdout_index": holdout_index,
+            "source": {
+                "path": source_path.as_posix(),
+                "sha256": source_sha,
+                "pixel_sha256": pixel_digest(64 + view_offset),
+                "format": "png_rgb8",
+                "width": 64,
+                "height": 64,
+                "native_decode_receipt_sha256": "sha256:" + "5" * 64,
+                "native_decoded_rgb8_sha256": pixel_digest(64 + view_offset),
+            },
+            "source_camera": {
+                "model": "PINHOLE",
+                "width": 64,
+                "height": 64,
+                "parameters": [32.0, 32.0, 32.0, 32.0],
+            },
+            "transform": {"kind": "identity", "roi": [0, 0, 64, 64]},
+            "target": {
+                "path": ground_truth_path.as_posix(),
+                "sha256": ground_truth_sha,
+                "pixel_sha256": pixel_digest(64 + view_offset),
+                "format": "png_rgb8",
+                "width": 64,
+                "height": 64,
+            },
+            "target_camera": {
+                "model": "PINHOLE",
+                "width": 64,
+                "height": 64,
+                "parameters": [32.0, 32.0, 32.0, 32.0],
+            },
+            "render_camera_digest": camera_digest,
+        }
+        preparation_view["preparation_view_sha256"] = evidence.sha256_bytes(
+            evidence.canonical_json_bytes(preparation_view)
+        )
+        preparation_views.append(preparation_view)
+        spec_views.append(
+            {
+                "holdout_index": holdout_index,
+                "source": {
+                    "path": source_path.as_posix(),
+                    "sha256": source_sha,
+                    "format": "png_rgb8",
+                    "width": 64,
+                    "height": 64,
+                },
+                "source_camera": preparation_view["source_camera"],
+                "render_camera": camera_record,
+                "target_path": ground_truth_path.as_posix(),
+            }
+        )
         reference_views.append(
             {
                 "holdout_index": holdout_index,
                 "camera": camera_record,
                 "camera_digest": camera_digest,
                 "ground_truth_sha256": ground_truth_sha,
+                "preparation_view_sha256": preparation_view["preparation_view_sha256"],
             }
         )
         rendered = []
@@ -161,13 +260,72 @@ def write_render_closure(root: Path) -> tuple[dict[str, object], Path]:
                 "ground_truth": {
                     "path": ground_truth_path.as_posix(),
                     "sha256": ground_truth_sha,
+                    "source_path": source_path.as_posix(),
+                    "source_sha256": source_sha,
+                    "preparation_view_sha256": preparation_view[
+                        "preparation_view_sha256"
+                    ],
                     "input_digest": req["binding"]["input_digest"],
                 },
                 "renders": rendered,
             }
         )
+    spec = {
+        "schema_version": 2,
+        "input_digest": req["binding"]["input_digest"],
+        "selection_manifest": {
+            "path": "selection-manifest.json",
+            "sha256": selection_sha256,
+        },
+        "producer": {
+            "path": "scripts/benchmark/prepare_render_targets.py",
+            "sha256": producer_sha256,
+        },
+        "native_decoder": native_decoder,
+        "runtime": runtime,
+        "views": spec_views,
+    }
+    spec_path = root / "render-target-spec.json"
+    spec_path.write_bytes(evidence.canonical_json_bytes(spec) + b"\n")
+    preparation = {
+        "schema_version": 2,
+        "input_digest": req["binding"]["input_digest"],
+        "selection_manifest": {
+            "path": "selection-manifest.json",
+            "sha256": selection_sha256,
+        },
+        "source_spec": {
+            "path": "render-target-spec.json",
+            "sha256": evidence.sha256_file(spec_path),
+        },
+        "algorithm": {
+            "id": "native_msplat_decode_brown_conrady_alpha0",
+            "version": 2,
+            "float_precision": "float32",
+            "inverse_iterations": 20,
+            "boundary_samples": 200,
+            "interpolation": "bilinear",
+            "boundary_mode": "clamp",
+        },
+        "producer": {
+            "path": "scripts/benchmark/prepare_render_targets.py",
+            "sha256": producer_sha256,
+            "runtime": runtime,
+        },
+        "native_decoder": native_decoder,
+        "views": preparation_views,
+    }
+    preparation_path = root / "ground-truth-preparation.json"
+    preparation_path.write_bytes(evidence.canonical_json_bytes(preparation) + b"\n")
+    preparation_sha = evidence.sha256_file(preparation_path)
+    req["reference_artifacts"] = {
+        "ground_truth_preparation_sha256": preparation_sha,
+        "selection_manifest_sha256": selection_sha256,
+    }
+    request_digest = evidence.sha256_bytes(evidence.canonical_json_bytes(req) + b"\n")
     reference = {
-        "schema_version": 1,
+        "schema_version": 2,
+        "ground_truth_preparation_sha256": preparation_sha,
         "views": reference_views,
     }
     reference_path = root / "accurate-rendering-reference.json"
@@ -185,7 +343,7 @@ def write_render_closure(root: Path) -> tuple[dict[str, object], Path]:
         operation["started_monotonic_seconds"] = float(index)
         operation["ended_monotonic_seconds"] = float(index + 1)
     manifest = {
-        "schema_version": 1,
+        "schema_version": 2,
         "scene_id": req["binding"]["scene_id"],
         "scale": req["binding"]["scale"],
         "request_digest": request_digest,
@@ -196,6 +354,7 @@ def write_render_closure(root: Path) -> tuple[dict[str, object], Path]:
         "pixel_format": "png_rgb8",
         "renderer_closure_sha256": RENDERER_CLOSURE_SHA256,
         "renderer_executable_sha256": RENDERER_SHA256,
+        "ground_truth_preparation_sha256": preparation_sha,
         "render_operations": render_operations,
         "views": manifest_views,
     }
@@ -205,6 +364,69 @@ def write_render_closure(root: Path) -> tuple[dict[str, object], Path]:
 
 
 class RenderEvidenceTests(unittest.TestCase):
+    def test_render_camera_digest_matches_shared_float32_vector(self) -> None:
+        fixture = camera_digest_fixture()
+        self.assertEqual(fixture["schema_version"], 1)
+        self.assertEqual(
+            evidence.render_camera_digest(fixture["camera"]),
+            fixture["digest"],
+        )
+
+    def test_render_camera_digest_normalizes_signed_and_underflowed_zero(self) -> None:
+        positive = camera(0)
+        negative = json.loads(json.dumps(positive))
+        negative["projection_matrix_column_major"][1] = -0.0
+        negative["projection_matrix_column_major"][2] = -1e-50
+        self.assertEqual(
+            evidence.render_camera_digest(positive),
+            evidence.render_camera_digest(negative),
+        )
+
+    def test_preparation_validator_treats_float32_underflowed_radial_as_identity(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            req, _ = write_render_closure(root)
+            spec_path = root / "render-target-spec.json"
+            preparation_path = root / "ground-truth-preparation.json"
+            spec = json.loads(spec_path.read_text(encoding="utf-8"))
+            preparation = json.loads(preparation_path.read_text(encoding="utf-8"))
+            for spec_view, prepared_view in zip(
+                spec["views"], preparation["views"], strict=True
+            ):
+                radial_camera = {
+                    "model": "SIMPLE_RADIAL",
+                    "width": 64,
+                    "height": 64,
+                    "parameters": [32.0, 32.0, 32.0, -1e-50],
+                }
+                spec_view["source_camera"] = radial_camera
+                prepared_view["source_camera"] = radial_camera
+                unsigned = dict(prepared_view)
+                unsigned.pop("preparation_view_sha256")
+                prepared_view["preparation_view_sha256"] = evidence.sha256_bytes(
+                    evidence.canonical_json_bytes(unsigned)
+                )
+            spec_path.write_bytes(evidence.canonical_json_bytes(spec) + b"\n")
+            preparation["source_spec"]["sha256"] = evidence.sha256_file(spec_path)
+            preparation_path.write_bytes(
+                evidence.canonical_json_bytes(preparation) + b"\n"
+            )
+
+            records, _ = evidence._validate_ground_truth_preparation(
+                artifact_root=root,
+                preparation_path=preparation_path,
+                expected_sha256=evidence.sha256_file(preparation_path),
+                expected_input_digest=req["binding"]["input_digest"],
+                expected_selection_sha256=req["reference_artifacts"][
+                    "selection_manifest_sha256"
+                ],
+                holdout_indices=HOLDOUTS,
+            )
+
+            self.assertTrue(
+                all(view["transform"]["kind"] == "identity" for view in records.values())
+            )
+
     def score(
         self,
         root: Path,
@@ -216,6 +438,7 @@ class RenderEvidenceTests(unittest.TestCase):
             artifact_root=root,
             manifest_path=root / "rendering-manifest.json",
             reference_path=reference_path,
+            preparation_path=root / "ground-truth-preparation.json",
             request=req,
             commands=commands(),
             renderer_executable_sha256=renderer_sha256,
@@ -230,7 +453,7 @@ class RenderEvidenceTests(unittest.TestCase):
             result = self.score(root, req, reference_path)
 
             self.assertEqual([sample["holdout_index"] for sample in result.samples], HOLDOUTS)
-            self.assertEqual(len(result.artifacts), len(HOLDOUTS) * 5 + 1)
+            self.assertEqual(len(result.artifacts), len(HOLDOUTS) * 6 + 3)
             self.assertTrue(all(sample["candidate_psnr"] < 100 for sample in result.samples))
 
     def test_scores_the_ground_truth_bytes_that_were_hashed(self) -> None:
@@ -379,6 +602,7 @@ class RenderEvidenceTests(unittest.TestCase):
                     artifact_root=root,
                     manifest_path=manifest_path,
                     reference_path=reference_path,
+                    preparation_path=root / "ground-truth-preparation.json",
                     request=req,
                     commands=[*commands(), alternate],
                     renderer_executable_sha256=RENDERER_SHA256,
@@ -415,6 +639,7 @@ class RenderEvidenceTests(unittest.TestCase):
                     artifact_root=root,
                     manifest_path=manifest_path,
                     reference_path=reference_path,
+                    preparation_path=root / "ground-truth-preparation.json",
                     request=req,
                     commands=[alternate, *commands()],
                     renderer_executable_sha256=RENDERER_SHA256,
@@ -504,6 +729,49 @@ class RenderEvidenceTests(unittest.TestCase):
                     reference_path,
                     renderer_sha256="sha256:" + "f" * 64,
                 )
+
+    def test_rejects_preparation_digest_drift_across_request_manifest_and_reference(self) -> None:
+        mutations = {
+            "request": lambda root, req, reference: req["reference_artifacts"].update(
+                {"ground_truth_preparation_sha256": "sha256:" + "0" * 64}
+            ),
+            "manifest": lambda root, req, reference: json.loads(
+                (root / "rendering-manifest.json").read_text(encoding="utf-8")
+            ),
+            "reference": lambda root, req, reference: reference.update(
+                {"ground_truth_preparation_sha256": "sha256:" + "0" * 64}
+            ),
+        }
+        for label, mutate in mutations.items():
+            with self.subTest(label=label), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                req, reference_path = write_render_closure(root)
+                reference = json.loads(reference_path.read_text(encoding="utf-8"))
+                result = mutate(root, req, reference)
+                if label == "manifest":
+                    result["ground_truth_preparation_sha256"] = "sha256:" + "0" * 64
+                    (root / "rendering-manifest.json").write_bytes(
+                        evidence.canonical_json_bytes(result) + b"\n"
+                    )
+                elif label == "reference":
+                    reference_path.write_bytes(evidence.canonical_json_bytes(reference) + b"\n")
+
+                with self.assertRaisesRegex(evidence.EvidenceError, "preparation"):
+                    self.score(root, req, reference_path)
+
+    def test_rejects_preparation_view_drift(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            req, reference_path = write_render_closure(root)
+            manifest_path = root / "rendering-manifest.json"
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            manifest["views"][0]["ground_truth"]["preparation_view_sha256"] = (
+                "sha256:" + "0" * 64
+            )
+            manifest_path.write_bytes(evidence.canonical_json_bytes(manifest) + b"\n")
+
+            with self.assertRaisesRegex(evidence.EvidenceError, "preparation"):
+                self.score(root, req, reference_path)
 
     def test_rejects_render_target_above_pixel_budget(self) -> None:
         oversized = camera(HOLDOUTS[0])

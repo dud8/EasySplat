@@ -13,7 +13,7 @@ STAGE_DIR="$INSTALL_PARENT/msplat.stage.$$"
 BACKUP_DIR="$INSTALL_PARENT/msplat.previous.$$"
 
 OVERLAY="$ROOT/Tools/MsplatNative/msplat.cpp"
-OVERLAY_SHA256="f4b9238d58f80c1bf56a83ece9dae8c44801906dd35055f64309c98da698bb22"
+OVERLAY_SHA256="d9945b3030b7f9bc0c4513a7fd36d6d95729cabf137f82458af69bf0cee0a1a1"
 RASTER_TEST_SOURCE="$ROOT/Tools/MsplatNative/msplat_raster_tests.cpp"
 RASTER_TEST_SHA256="abe7bd5f09f64fde35085dfcf48a673d5cb3594247dd43f842396ded422e0146"
 FIXTURE_GENERATOR="$ROOT/scripts/ci/generate_msplat_sparse_fixtures.py"

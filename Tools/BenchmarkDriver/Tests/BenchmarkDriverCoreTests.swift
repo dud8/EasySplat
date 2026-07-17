@@ -48,6 +48,34 @@ private final class MonitorResultBox: @unchecked Sendable {
 }
 
 final class BenchmarkDriverCoreTests: XCTestCase {
+    func testRenderCameraDigestMatchesSharedFloat32Vector() throws {
+        let repositoryRoot = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+        let fixtureURL = repositoryRoot
+            .appendingPathComponent("scripts/benchmark/fixtures/render-camera-digest-v1.json")
+        let data = try Data(contentsOf: fixtureURL)
+        let fixture = try JSONDecoder().decode(RenderCameraDigestFixture.self, from: data)
+        XCTAssertEqual(fixture.schemaVersion, 1)
+        XCTAssertEqual(try fixture.camera.stableDigest(), fixture.digest)
+    }
+
+    func testRenderCameraDigestNormalizesSignedAndUnderflowedZero() throws {
+        var positive = RenderCamera(
+            width: 64,
+            height: 64,
+            projectionMatrixColumnMajor: Array(repeating: 0, count: 16),
+            worldToCameraMatrixColumnMajor: Array(repeating: 0, count: 16)
+        )
+        var negative = positive
+        negative.projectionMatrixColumnMajor[1] = -0.0
+        XCTAssertEqual(try positive.stableDigest(), try negative.stableDigest())
+        positive.projectionMatrixColumnMajor[3] = 1
+        XCTAssertNotEqual(try positive.stableDigest(), try negative.stableDigest())
+    }
+
     func testHostStateSnapshotUsesStablePublicSchema() throws {
         let snapshot = try HostStateSnapshot.capture()
         let encoder = JSONEncoder()
@@ -476,6 +504,10 @@ final class BenchmarkDriverCoreTests: XCTestCase {
         try Data("renderer executable".utf8).write(to: executable)
         let groundTruth = artifacts.appendingPathComponent("ground-truth.png")
         try Data("ground truth".utf8).write(to: groundTruth)
+        let groundTruthSource = artifacts.appendingPathComponent("ground-truth-source.png")
+        try Data("ground truth source".utf8).write(to: groundTruthSource)
+        let preparation = artifacts.appendingPathComponent("ground-truth-preparation.json")
+        try Data("preparation".utf8).write(to: preparation)
 
         let sources = try RenderVariant.allCases.map { variant -> RenderSource in
             let sourcePath = "sources/\(variant.rawValue).ply"
@@ -497,13 +529,17 @@ final class BenchmarkDriverCoreTests: XCTestCase {
             )
         }
         let job = BenchmarkRenderJob(
-            schemaVersion: 1,
+            schemaVersion: 2,
             sceneID: "orbit-01",
             scale: 2,
             requestDigest: digest("0"),
             inputDigest: digest("2"),
             rendererClosureSHA256: digest("8"),
             rendererExecutableSHA256: try MetalOffscreenRenderer.sha256(fileAt: executable),
+            groundTruthPreparation: GroundTruthPreparationBinding(
+                path: "ground-truth-preparation.json",
+                sha256: try MetalOffscreenRenderer.sha256(fileAt: preparation)
+            ),
             holdoutIndices: [1],
             trainingViewIndices: [0],
             candidateCheckout: CheckoutBinding(path: candidate.root.path, commit: candidate.commit),
@@ -519,7 +555,10 @@ final class BenchmarkDriverCoreTests: XCTestCase {
                     ),
                     groundTruth: GroundTruthImage(
                         path: "ground-truth.png",
-                        sha256: try MetalOffscreenRenderer.sha256(fileAt: groundTruth)
+                        sha256: try MetalOffscreenRenderer.sha256(fileAt: groundTruth),
+                        sourcePath: "ground-truth-source.png",
+                        sourceSHA256: try MetalOffscreenRenderer.sha256(fileAt: groundTruthSource),
+                        preparationViewSHA256: digest("9")
                     ),
                     sources: sources
                 )
@@ -559,6 +598,11 @@ final class BenchmarkDriverCoreTests: XCTestCase {
                        job.rendererClosureSHA256)
         XCTAssertEqual(manifest["renderer_executable_sha256"] as? String,
                        try MetalOffscreenRenderer.sha256(fileAt: executable))
+        XCTAssertEqual(manifest["schema_version"] as? Int, 2)
+        XCTAssertEqual(
+            manifest["ground_truth_preparation_sha256"] as? String,
+            job.groundTruthPreparation.sha256
+        )
         let operations = try XCTUnwrap(manifest["render_operations"] as? [[String: Any]])
         XCTAssertEqual(operations.count, RenderVariant.allCases.count)
         XCTAssertEqual(operations.map { $0["variant"] as? String }, RenderVariant.allCases.map(\.rawValue))
@@ -677,6 +721,51 @@ final class BenchmarkDriverCoreTests: XCTestCase {
         }
     }
 
+    func testDriverRejectsPreparationInputMutationBeforeCompletion() throws {
+        for kind in ["receipt", "source"] {
+            let fixture = try makeDriverFixture()
+            defer { try? FileManager.default.removeItem(at: fixture.root) }
+            let protectedInput = fixture.artifacts.appendingPathComponent(
+                kind == "receipt"
+                    ? fixture.job.groundTruthPreparation.path
+                    : fixture.job.views[0].groundTruth.sourcePath
+            )
+            var mutated = false
+            let driver = BenchmarkRenderDriver(loadScene: { source in
+                StubLoadedScene { _, output in
+                    if !mutated {
+                        mutated = true
+                        try Data("changed \(kind)".utf8).write(
+                            to: protectedInput,
+                            options: .atomic
+                        )
+                    }
+                    try Data("rendered \(source.lastPathComponent)".utf8).write(
+                        to: output,
+                        options: .atomic
+                    )
+                    return try MetalOffscreenRenderer.sha256(fileAt: output)
+                }
+            })
+
+            XCTAssertThrowsError(
+                try driver.execute(
+                    job: fixture.job,
+                    artifactRoot: fixture.artifacts,
+                    manifestURL: fixture.artifacts.appendingPathComponent(
+                        "rendering-manifest.json"
+                    ),
+                    rendererExecutableURL: fixture.executable
+                )
+            ) { error in
+                XCTAssertTrue(
+                    error.localizedDescription.contains("changed"),
+                    error.localizedDescription
+                )
+            }
+        }
+    }
+
     func testProductionRendererProducesDeterministicRGBPNG() throws {
         guard let device = MTLCreateSystemDefaultDevice() else {
             throw XCTSkip("Metal is unavailable on this test host.")
@@ -738,8 +827,10 @@ final class BenchmarkDriverCoreTests: XCTestCase {
         let executable = root.appendingPathComponent("benchmark-driver")
         try Data("renderer executable".utf8).write(to: executable)
         let outsideGroundTruth = outside.appendingPathComponent("ground-truth.png")
+        let outsideGroundTruthSource = outside.appendingPathComponent("ground-truth-source.png")
         let outsidePLY = outside.appendingPathComponent("source.ply")
         try Data("ground truth".utf8).write(to: outsideGroundTruth)
+        try Data("ground truth source".utf8).write(to: outsideGroundTruthSource)
         try Data("ply source".utf8).write(to: outsidePLY)
         try FileManager.default.createSymbolicLink(
             at: artifacts.appendingPathComponent("linked"),
@@ -757,9 +848,18 @@ final class BenchmarkDriverCoreTests: XCTestCase {
             }
         }
         job.rendererExecutableSHA256 = try MetalOffscreenRenderer.sha256(fileAt: executable)
+        let preparation = artifacts.appendingPathComponent("ground-truth-preparation.json")
+        try Data("preparation".utf8).write(to: preparation)
+        job.groundTruthPreparation = GroundTruthPreparationBinding(
+            path: "ground-truth-preparation.json",
+            sha256: try MetalOffscreenRenderer.sha256(fileAt: preparation)
+        )
         job.views[0].groundTruth = GroundTruthImage(
             path: "linked/ground-truth.png",
-            sha256: try MetalOffscreenRenderer.sha256(fileAt: outsideGroundTruth)
+            sha256: try MetalOffscreenRenderer.sha256(fileAt: outsideGroundTruth),
+            sourcePath: "linked/ground-truth-source.png",
+            sourceSHA256: try MetalOffscreenRenderer.sha256(fileAt: outsideGroundTruthSource),
+            preparationViewSHA256: digest("9")
         )
         var rendered = false
         let driver = BenchmarkRenderDriver { _, _, _ in
@@ -791,10 +891,21 @@ final class BenchmarkDriverCoreTests: XCTestCase {
                 withIntermediateDirectories: true
             )
             try Data("ground truth \(index)".utf8).write(to: groundTruth)
+            let groundTruthSource = artifacts.appendingPathComponent(
+                "rendering/source/\(index).png"
+            )
+            try FileManager.default.createDirectory(
+                at: groundTruthSource.deletingLastPathComponent(),
+                withIntermediateDirectories: true
+            )
+            try Data("ground truth source \(index)".utf8).write(to: groundTruthSource)
             let position = try XCTUnwrap(job.views.firstIndex { $0.holdoutIndex == index })
             job.views[position].groundTruth = GroundTruthImage(
                 path: "rendering/ground-truth/\(index).png",
-                sha256: try MetalOffscreenRenderer.sha256(fileAt: groundTruth)
+                sha256: try MetalOffscreenRenderer.sha256(fileAt: groundTruth),
+                sourcePath: "rendering/source/\(index).png",
+                sourceSHA256: try MetalOffscreenRenderer.sha256(fileAt: groundTruthSource),
+                preparationViewSHA256: digest("9")
             )
         }
         for viewIndex in job.views.indices {
@@ -819,16 +930,75 @@ final class BenchmarkDriverCoreTests: XCTestCase {
         XCTAssertFalse(rendered)
     }
 
+    func testDriverRejectsSymlinkedArtifactRootAndExecutable() throws {
+        let parent = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        let realArtifacts = parent.appendingPathComponent("artifacts", isDirectory: true)
+        let linkedArtifacts = parent.appendingPathComponent("linked-artifacts", isDirectory: true)
+        try FileManager.default.createDirectory(at: realArtifacts, withIntermediateDirectories: true)
+        try FileManager.default.createSymbolicLink(
+            at: linkedArtifacts,
+            withDestinationURL: realArtifacts
+        )
+        defer { try? FileManager.default.removeItem(at: parent) }
+
+        let realExecutable = parent.appendingPathComponent("benchmark-driver")
+        let linkedExecutable = parent.appendingPathComponent("linked-benchmark-driver")
+        try Data("renderer executable".utf8).write(to: realExecutable)
+        try FileManager.default.createSymbolicLink(
+            at: linkedExecutable,
+            withDestinationURL: realExecutable
+        )
+        var job = makeJob()
+        job.rendererExecutableSHA256 = try MetalOffscreenRenderer.sha256(fileAt: realExecutable)
+        let driver = BenchmarkRenderDriver { _, _, _ in
+            XCTFail("A rejected trust root must not render.")
+            return self.digest("f")
+        }
+
+        XCTAssertThrowsError(
+            try driver.execute(
+                job: job,
+                artifactRoot: linkedArtifacts,
+                manifestURL: linkedArtifacts.appendingPathComponent("rendering-manifest.json"),
+                rendererExecutableURL: realExecutable
+            )
+        ) { error in
+            XCTAssertTrue(
+                error.localizedDescription.contains("real directory"),
+                error.localizedDescription
+            )
+        }
+
+        XCTAssertThrowsError(
+            try driver.execute(
+                job: job,
+                artifactRoot: realArtifacts,
+                manifestURL: realArtifacts.appendingPathComponent("rendering-manifest.json"),
+                rendererExecutableURL: linkedExecutable
+            )
+        ) { error in
+            XCTAssertTrue(
+                error.localizedDescription.contains("regular file"),
+                error.localizedDescription
+            )
+        }
+    }
+
     private func makeJob() -> BenchmarkRenderJob {
         let holdouts = [4, 9]
         let job = BenchmarkRenderJob(
-            schemaVersion: 1,
+            schemaVersion: 2,
             sceneID: "orbit-01",
             scale: 12,
             requestDigest: digest("0"),
             inputDigest: digest("2"),
             rendererClosureSHA256: digest("8"),
             rendererExecutableSHA256: digest("7"),
+            groundTruthPreparation: GroundTruthPreparationBinding(
+                path: "ground-truth-preparation.json",
+                sha256: digest("1")
+            ),
             holdoutIndices: holdouts,
             trainingViewIndices: (0..<12).filter { !holdouts.contains($0) },
             candidateCheckout: CheckoutBinding(path: "/tmp/candidate", commit: String(repeating: "a", count: 40)),
@@ -844,7 +1014,10 @@ final class BenchmarkDriverCoreTests: XCTestCase {
                     ),
                     groundTruth: GroundTruthImage(
                         path: "rendering/ground-truth/\(index).png",
-                        sha256: digest("3")
+                        sha256: digest("3"),
+                        sourcePath: "rendering/source/\(index).png",
+                        sourceSHA256: digest("a"),
+                        preparationViewSHA256: digest("9")
                     ),
                     sources: RenderVariant.allCases.map { variant in
                         RenderSource(
@@ -880,6 +1053,12 @@ final class BenchmarkDriverCoreTests: XCTestCase {
         job.candidateCheckout = CheckoutBinding(path: candidate.root.path, commit: candidate.commit)
         job.baselineCheckout = CheckoutBinding(path: baseline.root.path, commit: baseline.commit)
         job.rendererExecutableSHA256 = try MetalOffscreenRenderer.sha256(fileAt: executable)
+        let preparation = artifacts.appendingPathComponent("ground-truth-preparation.json")
+        try Data("preparation".utf8).write(to: preparation)
+        job.groundTruthPreparation = GroundTruthPreparationBinding(
+            path: "ground-truth-preparation.json",
+            sha256: try MetalOffscreenRenderer.sha256(fileAt: preparation)
+        )
         for variant in RenderVariant.allCases {
             let source = artifacts.appendingPathComponent("sources/\(variant.rawValue).ply")
             try FileManager.default.createDirectory(
@@ -893,14 +1072,25 @@ final class BenchmarkDriverCoreTests: XCTestCase {
             let groundTruth = artifacts.appendingPathComponent(
                 "rendering/ground-truth/\(holdout).png"
             )
+            let groundTruthSource = artifacts.appendingPathComponent(
+                "rendering/source/\(holdout).png"
+            )
             try FileManager.default.createDirectory(
                 at: groundTruth.deletingLastPathComponent(),
                 withIntermediateDirectories: true
             )
             try Data("ground truth \(holdout)".utf8).write(to: groundTruth)
+            try FileManager.default.createDirectory(
+                at: groundTruthSource.deletingLastPathComponent(),
+                withIntermediateDirectories: true
+            )
+            try Data("ground truth source \(holdout)".utf8).write(to: groundTruthSource)
             job.views[viewIndex].groundTruth = GroundTruthImage(
                 path: "rendering/ground-truth/\(holdout).png",
-                sha256: try MetalOffscreenRenderer.sha256(fileAt: groundTruth)
+                sha256: try MetalOffscreenRenderer.sha256(fileAt: groundTruth),
+                sourcePath: "rendering/source/\(holdout).png",
+                sourceSHA256: try MetalOffscreenRenderer.sha256(fileAt: groundTruthSource),
+                preparationViewSHA256: digest("9")
             )
             for sourceIndex in job.views[viewIndex].sources.indices {
                 let variant = job.views[viewIndex].sources[sourceIndex].variant
@@ -1016,6 +1206,17 @@ private struct DriverFixture {
     let artifacts: URL
     let executable: URL
     let job: BenchmarkRenderJob
+}
+
+private struct RenderCameraDigestFixture: Decodable {
+    let schemaVersion: Int
+    let camera: RenderCamera
+    let digest: String
+
+    enum CodingKeys: String, CodingKey {
+        case schemaVersion = "schema_version"
+        case camera, digest
+    }
 }
 
 private final class StubLoadedScene: LoadedSceneRendering {

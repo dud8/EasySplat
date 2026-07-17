@@ -78,9 +78,9 @@ require_file "$SWIFT_FIXTURE"
 require_contains 'MSPLAT_REPO="https://github.com/rayanht/msplat.git"' "$BUILD_SCRIPT"
 require_contains 'MSPLAT_COMMIT="106499b0a53f82b0c92d013b0861fbebd341b17e"' "$BUILD_SCRIPT"
 require_contains 'MSPLAT_VERSION="1.1.3"' "$BUILD_SCRIPT"
-require_contains 'OVERLAY_SHA256="f4b9238d58f80c1bf56a83ece9dae8c44801906dd35055f64309c98da698bb22"' "$BUILD_SCRIPT"
+require_contains 'OVERLAY_SHA256="d9945b3030b7f9bc0c4513a7fd36d6d95729cabf137f82458af69bf0cee0a1a1"' "$BUILD_SCRIPT"
 require_contains '[ "$(sha256 "$OVERLAY")" = "$OVERLAY_SHA256" ]' "$BUILD_SCRIPT"
-require_contains '"overlay_sha256": "f4b9238d58f80c1bf56a83ece9dae8c44801906dd35055f64309c98da698bb22"' "$VALIDATOR"
+require_contains '"overlay_sha256": "d9945b3030b7f9bc0c4513a7fd36d6d95729cabf137f82458af69bf0cee0a1a1"' "$VALIDATOR"
 require_contains 'RASTER_TEST_SHA256="abe7bd5f09f64fde35085dfcf48a673d5cb3594247dd43f842396ded422e0146"' "$BUILD_SCRIPT"
 require_contains '[ "$(sha256 "$RASTER_TEST_SOURCE")" = "$RASTER_TEST_SHA256" ]' "$BUILD_SCRIPT"
 require_contains 'NLOHMANN_JSON_SHA256="04022b05d806eb5ff73023c280b68697d12b93e1b7267a0b22a1a39ec7578069"' "$BUILD_SCRIPT"
@@ -235,7 +235,7 @@ for contract_file in "$SWIFT_VALIDATOR" "$SWIFT_FIXTURE"; do
   require_contains 'geometry_adam_fusion_patch_sha256' "$contract_file"
   require_contains 'raster_test_sha256' "$contract_file"
   require_contains 'MSPLAT_BUILD_RASTER_TESTS=ON' "$contract_file"
-  require_contains '"overlay_sha256": "f4b9238d58f80c1bf56a83ece9dae8c44801906dd35055f64309c98da698bb22"' "$contract_file"
+  require_contains '"overlay_sha256": "d9945b3030b7f9bc0c4513a7fd36d6d95729cabf137f82458af69bf0cee0a1a1"' "$contract_file"
   require_contains '"raster_test_sha256": "abe7bd5f09f64fde35085dfcf48a673d5cb3594247dd43f842396ded422e0146"' "$contract_file"
 done
 require_contains 'scene_bounds_status' "$SWIFT_VALIDATOR"
@@ -249,7 +249,7 @@ for forbidden in 'pip install' 'python-build-standalone' 'site-packages' '_core.
   require_absent "$forbidden" "$BUILD_SCRIPT"
 done
 
-for flag in --dataset --output --profile --checkpoint --resume --seed --expected-input-digest --expected-geometry-digest --memory-budget-bytes --events-fd --self-check --validate-ply --version --help; do
+for flag in --dataset --output --profile --checkpoint --resume --seed --expected-input-digest --expected-geometry-digest --memory-budget-bytes --events-fd --self-check --validate-ply --benchmark-decode --benchmark-decode-output --version --help; do
   require_contains "$flag" "$OVERLAY"
 done
 for flag in --input --num-iters --num-downscales --downscale-factor --eval --events-jsonl; do
@@ -494,7 +494,7 @@ done
 done
 "$BIN" --version | grep -Fq '1.1.3' || fail "CLI version does not report 1.1.3"
 help="$($BIN --help)"
-for flag in --dataset --output --profile --checkpoint --resume --seed --expected-input-digest --expected-geometry-digest --memory-budget-bytes --events-fd --self-check --validate-ply --version --help; do
+for flag in --dataset --output --profile --checkpoint --resume --seed --expected-input-digest --expected-geometry-digest --memory-budget-bytes --events-fd --self-check --validate-ply --benchmark-decode --benchmark-decode-output --version --help; do
   grep -Fq -- "$flag" <<<"$help" || fail "CLI help is missing $flag"
 done
 for flag in --input --num-iters --num-downscales --downscale-factor --eval --events-jsonl; do
@@ -505,7 +505,7 @@ done
 
 self_check_stdout="$(mktemp "${TMPDIR:-/tmp}/easysplat-msplat-self-check.XXXXXX")"
 self_check_stderr="$self_check_stdout.stderr"
-trap 'rm -f "$self_check_stdout" "$self_check_stderr"; rm -rf "${negative_dir:-}"' EXIT
+trap 'rm -f "$self_check_stdout" "$self_check_stderr"; rm -rf "${decode_dir:-}" "${negative_dir:-}"' EXIT
 "$BIN" --self-check --events-fd 1 >"$self_check_stdout" 2>"$self_check_stderr"
 [ "$(wc -l <"$self_check_stdout" | tr -d ' ')" = "1" ] || fail "self-check stdout is not exactly one JSONL record"
 require_contains '"schema_version":2' "$self_check_stdout"
@@ -513,6 +513,83 @@ require_contains '"sequence":1' "$self_check_stdout"
 require_contains '"event":"self_check"' "$self_check_stdout"
 require_contains '"status":"ok"' "$self_check_stdout"
 require_contains '"scene_bounds_status":"ok"' "$self_check_stdout"
+
+decode_dir="$(mktemp -d "${TMPDIR:-/tmp}/easysplat-msplat-decode.XXXXXX")"
+/usr/bin/python3 - "$decode_dir/source.png" <<'PY'
+from PIL import Image
+import sys
+
+Image.new("RGB", (64, 64), (12, 34, 56)).save(sys.argv[1], format="PNG")
+PY
+decode_receipt="$decode_dir/receipt.json"
+"$BIN" \
+  --benchmark-decode "$decode_dir/source.png" \
+  --benchmark-decode-output "$decode_dir/output.rgb8" \
+  >"$decode_receipt" \
+  2>"$decode_dir/stderr.log"
+[ ! -s "$decode_dir/stderr.log" ] || fail "benchmark decode polluted stderr"
+[ "$(wc -c <"$decode_dir/output.rgb8" | tr -d ' ')" = 12288 ] \
+  || fail "benchmark decode output has the wrong byte count"
+python3 - "$decode_receipt" "$decode_dir/output.rgb8" "$BIN" "$METALLIB" <<'PY'
+import hashlib
+import json
+import pathlib
+import sys
+
+receipt_path, output_path, executable_path, metallib_path = map(pathlib.Path, sys.argv[1:])
+receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+expected_fields = {
+    "contract", "executable_bytes", "executable_sha256", "height",
+    "metallib_bytes", "metallib_sha256", "mode", "mode_version",
+    "msplat_source_commit", "output_bytes", "output_sha256", "pixel_sha256",
+    "schema_version", "source_bytes", "source_sha256", "status",
+    "trainer_build_digest", "width",
+}
+if set(receipt) != expected_fields:
+    raise SystemExit("benchmark decode receipt schema is not closed")
+sha = lambda path: "sha256:" + hashlib.sha256(path.read_bytes()).hexdigest()
+if receipt["output_sha256"] != sha(output_path) or receipt["pixel_sha256"] != sha(output_path):
+    raise SystemExit("benchmark decode output digest mismatch")
+if receipt["executable_sha256"] != sha(executable_path):
+    raise SystemExit("benchmark decode executable digest mismatch")
+if receipt["metallib_sha256"] != sha(metallib_path):
+    raise SystemExit("benchmark decode metallib digest mismatch")
+if receipt["width"] != 64 or receipt["height"] != 64 or receipt["output_bytes"] != 12288:
+    raise SystemExit("benchmark decode dimensions mismatch")
+if receipt["msplat_source_commit"] != "106499b0a53f82b0c92d013b0861fbebd341b17e":
+    raise SystemExit("benchmark decode source commit mismatch")
+PY
+
+printf 'preserve me\n' >"$decode_dir/collision.rgb8"
+set +e
+"$BIN" \
+  --benchmark-decode "$decode_dir/source.png" \
+  --benchmark-decode-output "$decode_dir/collision.rgb8" \
+  >"$decode_dir/collision.stdout" \
+  2>"$decode_dir/collision.stderr"
+collision_status=$?
+set -e
+[ "$collision_status" -ne 0 ] || fail "benchmark decode overwrote an existing output"
+[ "$(cat "$decode_dir/collision.rgb8")" = "preserve me" ] \
+  || fail "benchmark decode changed an existing output"
+if find "$decode_dir" -maxdepth 1 -name '.benchmark-decode.*' -print -quit | grep -q .; then
+  fail "benchmark decode left a partial temporary output"
+fi
+
+mkdir "$decode_dir/missing-closure"
+cp "$BIN" "$decode_dir/missing-closure/easysplat-train"
+chmod +x "$decode_dir/missing-closure/easysplat-train"
+set +e
+"$decode_dir/missing-closure/easysplat-train" \
+  --benchmark-decode "$decode_dir/source.png" \
+  --benchmark-decode-output "$decode_dir/missing-closure/output.rgb8" \
+  >"$decode_dir/missing-closure/stdout" \
+  2>"$decode_dir/missing-closure/stderr"
+missing_closure_status=$?
+set -e
+[ "$missing_closure_status" -ne 0 ] || fail "benchmark decode accepted a missing closure"
+[ ! -e "$decode_dir/missing-closure/output.rgb8" ] \
+  || fail "benchmark decode published output before validating its closure"
 
 negative_dir="$(mktemp -d "${TMPDIR:-/tmp}/easysplat-msplat-negative.XXXXXX")"
 "$BIN" --self-check --events-fd 3 \

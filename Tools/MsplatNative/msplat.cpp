@@ -123,6 +123,9 @@ constexpr std::array<TrainingProfileConfig, 3> trainingProfiles = {{
     {"high-detail", 15000, 1500, 0},
 }};
 
+constexpr std::string_view msplatSourceCommit =
+    "106499b0a53f82b0c92d013b0861fbebd341b17e";
+
 const TrainingProfileConfig &trainingProfileNamed(const std::string &name) {
     const auto match = std::find_if(
         trainingProfiles.begin(), trainingProfiles.end(),
@@ -439,6 +442,7 @@ bool rasterRecoveryMetricsAreValid(
 }
 
 void throwSystemError(const std::string &operation, const fs::path &path);
+void requirePlainDirectory(const fs::path &path);
 
 class Sha256Accumulator {
 public:
@@ -675,7 +679,7 @@ TrainingIdentity computeTrainingIdentity(
     return TrainingIdentity {digestFiles(images, imageNames, true), geometryDigest.finish()};
 }
 
-std::string computeTrainerBuildDigest() {
+fs::path trainerExecutablePath() {
     std::uint32_t capacity = 0;
     if (_NSGetExecutablePath(nullptr, &capacity) != -1 || capacity == 0 || capacity > 1024 * 1024) {
         throw std::runtime_error("cannot resolve trainer executable path");
@@ -684,12 +688,129 @@ std::string computeTrainerBuildDigest() {
     if (_NSGetExecutablePath(buffer.data(), &capacity) != 0) {
         throw std::runtime_error("cannot resolve trainer executable path");
     }
-    const fs::path executable = fs::canonical(fs::path(buffer.data()));
+    return fs::canonical(fs::path(buffer.data()));
+}
+
+std::string computeTrainerBuildDigest() {
+    const fs::path executable = trainerExecutablePath();
     const fs::path directory = executable.parent_path();
     return digestFiles(
         directory,
         {executable.filename().string(), "default.metallib"}
     );
+}
+
+struct BenchmarkDecodeOutput {
+    std::string sha256;
+    std::uintmax_t bytes;
+};
+
+BenchmarkDecodeOutput writeRGB8Atomically(const fs::path &output, const Image &image) {
+    if (image.width <= 0 || image.height <= 0 ||
+        image.data.size() != static_cast<std::size_t>(image.width) *
+            static_cast<std::size_t>(image.height) * 3) {
+        throw std::runtime_error("decoded benchmark image has invalid dimensions");
+    }
+    const fs::path parent = output.parent_path().empty() ? fs::current_path() : output.parent_path();
+    requirePlainDirectory(parent);
+    const int parentDescriptor = ::open(
+        parent.c_str(), O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC
+    );
+    if (parentDescriptor < 0) throwSystemError("cannot open benchmark output directory", parent);
+
+    std::string temporaryName;
+    int outputDescriptor = -1;
+    for (unsigned int attempt = 0; attempt < 100; ++attempt) {
+        temporaryName = ".benchmark-decode." +
+            std::to_string(static_cast<long long>(::getpid())) + "." +
+            std::to_string(attempt);
+        outputDescriptor = ::openat(
+            parentDescriptor,
+            temporaryName.c_str(),
+            O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC,
+            0600
+        );
+        if (outputDescriptor >= 0) break;
+        if (errno != EEXIST) {
+            const int savedErrno = errno;
+            ::close(parentDescriptor);
+            errno = savedErrno;
+            throwSystemError("cannot create benchmark decode output", output);
+        }
+    }
+    if (outputDescriptor < 0) {
+        ::close(parentDescriptor);
+        throw std::runtime_error("cannot allocate a benchmark decode output name");
+    }
+
+    Sha256Accumulator digest;
+    std::uintmax_t byteCount = 0;
+    bool installed = false;
+    bool parentOpen = true;
+    try {
+        std::array<std::uint8_t, 1024 * 1024> buffer {};
+        std::size_t buffered = 0;
+        auto flush = [&]() {
+            std::size_t writtenTotal = 0;
+            while (writtenTotal < buffered) {
+                const ssize_t written = ::write(
+                    outputDescriptor,
+                    buffer.data() + writtenTotal,
+                    buffered - writtenTotal
+                );
+                if (written < 0 && errno == EINTR) continue;
+                if (written <= 0) throwSystemError("cannot write benchmark decode output", output);
+                writtenTotal += static_cast<std::size_t>(written);
+            }
+            digest.update(buffer.data(), buffered);
+            byteCount += buffered;
+            buffered = 0;
+        };
+        for (float value : image.data) {
+            if (!std::isfinite(value)) {
+                throw std::runtime_error("decoded benchmark image contains a non-finite pixel");
+            }
+            const float scaled = std::clamp(value * 255.0f, 0.0f, 255.0f);
+            buffer[buffered++] = static_cast<std::uint8_t>(scaled + 0.5f);
+            if (buffered == buffer.size()) flush();
+        }
+        if (buffered > 0) flush();
+        if (::fsync(outputDescriptor) != 0) {
+            throwSystemError("cannot sync benchmark decode output", output);
+        }
+        if (::close(outputDescriptor) != 0) {
+            outputDescriptor = -1;
+            throwSystemError("cannot close benchmark decode output", output);
+        }
+        outputDescriptor = -1;
+        if (::renameatx_np(
+                parentDescriptor,
+                temporaryName.c_str(),
+                parentDescriptor,
+                output.filename().c_str(),
+                RENAME_EXCL
+            ) != 0) {
+            throwSystemError("cannot install benchmark decode output", output);
+        }
+        installed = true;
+        if (::fsync(parentDescriptor) != 0) {
+            throwSystemError("cannot sync benchmark output directory", parent);
+        }
+        (void)::close(parentDescriptor);
+        parentOpen = false;
+        return {"sha256:" + digest.finish(), byteCount};
+    } catch (...) {
+        if (outputDescriptor >= 0) ::close(outputDescriptor);
+        if (parentOpen) {
+            ::unlinkat(
+                parentDescriptor,
+                installed ? output.filename().c_str() : temporaryName.c_str(),
+                0
+            );
+            ::close(parentDescriptor);
+        }
+        throw;
+    }
 }
 
 void throwSystemError(const std::string &operation, const fs::path &path) {
@@ -1893,6 +2014,8 @@ int main(int argc, char *argv[]) {
     int eventsFileDescriptor = -1;
     bool selfCheck = false;
     std::string plyToValidate;
+    std::string benchmarkDecodePath;
+    std::string benchmarkDecodeOutputPath;
 
     CLI::Option *datasetOption = app.add_option(
         "--dataset", datasetPath, "Canonical COLMAP dataset directory"
@@ -1930,6 +2053,16 @@ int main(int argc, char *argv[]) {
     app.add_flag("--self-check", selfCheck, "Initialize Metal and load the adjacent metallib");
     app.add_option("--validate-ply", plyToValidate, "Validate a binary Gaussian PLY")
         ->check(CLI::ExistingFile);
+    CLI::Option *benchmarkDecodeOption = app.add_option(
+        "--benchmark-decode",
+        benchmarkDecodePath,
+        "Decode one benchmark source through production CoreGraphics/ImageIO"
+    );
+    CLI::Option *benchmarkDecodeOutputOption = app.add_option(
+        "--benchmark-decode-output",
+        benchmarkDecodeOutputPath,
+        "Write the production-decoded benchmark source as tightly packed RGB8"
+    );
 
     CLI11_PARSE(app, argc, argv);
 
@@ -1945,6 +2078,76 @@ int main(int argc, char *argv[]) {
         }
         events.emplace(eventsFileDescriptor);
         if (eventsFileDescriptor == STDOUT_FILENO) std::cout.rdbuf(std::cerr.rdbuf());
+
+        const bool benchmarkDecodeRequested =
+            benchmarkDecodeOption->count() != 0 || benchmarkDecodeOutputOption->count() != 0;
+        if (benchmarkDecodeRequested) {
+            if (benchmarkDecodeOption->count() != 1 ||
+                benchmarkDecodeOutputOption->count() != 1) {
+                throw std::runtime_error(
+                    "--benchmark-decode and --benchmark-decode-output must be provided together"
+                );
+            }
+            if (datasetOption->count() != 0 || outputOption->count() != 0 ||
+                profileOption->count() != 0 || seedOption->count() != 0 ||
+                memoryBudgetOption->count() != 0 || checkpointOption->count() != 0 ||
+                !resumePath.empty() || !plyToValidate.empty() || selfCheck ||
+                eventsOption->count() != 0) {
+                throw std::runtime_error(
+                    "benchmark decode mode cannot be combined with another trainer mode"
+                );
+            }
+            const fs::path source(benchmarkDecodePath);
+            const fs::path output(benchmarkDecodeOutputPath);
+            (void)requireRegularFile(source, true);
+            if (output.extension() != ".rgb8") {
+                throw std::runtime_error("--benchmark-decode-output must end in .rgb8");
+            }
+            if (fs::exists(output) || fs::is_symlink(output)) {
+                throw std::runtime_error("benchmark decode output already exists");
+            }
+            const fs::path outputParent = output.parent_path().empty()
+                ? fs::current_path()
+                : output.parent_path();
+            requirePlainDirectory(outputParent);
+
+            const auto [sourceDigestBefore, sourceBytes] = hashFileContent(source, true);
+            const Image decoded = imreadRGB(source.string());
+            const auto [sourceDigestAfter, sourceBytesAfter] = hashFileContent(source, true);
+            if (sourceDigestAfter != sourceDigestBefore || sourceBytesAfter != sourceBytes) {
+                throw std::runtime_error("benchmark decode source changed during native decoding");
+            }
+            const fs::path executable = trainerExecutablePath();
+            const auto [executableDigest, executableBytes] = hashFileContent(executable, true);
+            const auto [metallibDigest, metallibBytes] = hashFileContent(
+                executable.parent_path() / "default.metallib",
+                true
+            );
+            const std::string trainerBuildDigest = computeTrainerBuildDigest();
+            const BenchmarkDecodeOutput outputReceipt = writeRGB8Atomically(output, decoded);
+            const json receipt = {
+                {"contract", "native_coregraphics_imageio_rgb8_v1"},
+                {"executable_bytes", executableBytes},
+                {"executable_sha256", "sha256:" + executableDigest},
+                {"height", decoded.height},
+                {"mode", "benchmark_decode"},
+                {"mode_version", 1},
+                {"metallib_bytes", metallibBytes},
+                {"metallib_sha256", "sha256:" + metallibDigest},
+                {"msplat_source_commit", std::string(msplatSourceCommit)},
+                {"output_bytes", outputReceipt.bytes},
+                {"output_sha256", outputReceipt.sha256},
+                {"pixel_sha256", outputReceipt.sha256},
+                {"schema_version", 1},
+                {"source_bytes", sourceBytes},
+                {"source_sha256", "sha256:" + sourceDigestBefore},
+                {"status", "completed"},
+                {"trainer_build_digest", "sha256:" + trainerBuildDigest},
+                {"width", decoded.width},
+            };
+            std::cout << receipt.dump() << '\n';
+            return 0;
+        }
 
         if (!plyToValidate.empty()) {
             const PlyValidation validation = validateBinaryPly(plyToValidate);

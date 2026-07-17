@@ -169,6 +169,7 @@
             "ground_truth_poses_sha256",
             "accurate_colmap_model_sha256",
             "accurate_rendering_reference_sha256",
+            "ground_truth_preparation_sha256",
             "paired_baseline_rendering_reference_sha256",
             "orientation_label_sha256",
             "orientation_expected_status"
@@ -178,6 +179,7 @@
             "ground_truth_poses_sha256": {"$ref": "#/$defs/sha256"},
             "accurate_colmap_model_sha256": {"$ref": "#/$defs/sha256"},
             "accurate_rendering_reference_sha256": {"$ref": "#/$defs/sha256"},
+            "ground_truth_preparation_sha256": {"$ref": "#/$defs/sha256"},
             "paired_baseline_rendering_reference_sha256": {"$ref": "#/$defs/sha256"},
             "orientation_label_sha256": {"$ref": "#/$defs/sha256"},
             "orientation_expected_status": {

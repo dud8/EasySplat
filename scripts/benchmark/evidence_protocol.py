@@ -350,6 +350,28 @@ def sha256_bytes(value: bytes) -> str:
     return "sha256:" + hashlib.sha256(value).hexdigest()
 
 
+def render_camera_digest(value: Any) -> str:
+    camera = _render_camera(value, "render camera digest")
+    payload = bytearray(b"EasySplat render camera digest v1\0")
+    payload.extend(struct.pack(">II", camera["width"], camera["height"]))
+    values = (
+        camera["projection_matrix_column_major"]
+        + camera["world_to_camera_matrix_column_major"]
+    )
+    for position, value in enumerate(values):
+        try:
+            encoded = struct.pack(">f", value)
+        except (OverflowError, struct.error) as error:
+            raise EvidenceError(
+                f"render camera digest value {position} is outside Float32"
+            ) from error
+        bits = struct.unpack(">I", encoded)[0]
+        if bits & 0x7FFF_FFFF == 0:
+            bits = 0
+        payload.extend(struct.pack(">I", bits))
+    return sha256_bytes(bytes(payload))
+
+
 def sha256_file(path: Path) -> str:
     if path.is_symlink() or not path.is_file():
         raise EvidenceError(f"evidence artifact must be a regular file: {path.name}")
@@ -2232,6 +2254,7 @@ def _validate_render_supervisor(
             "baseline_checkout_commit",
             "renderer_closure_sha256",
             "renderer_executable_sha256",
+            "ground_truth_preparation_sha256",
             "job_sha256",
             "manifest_sha256",
             "stdout_sha256",
@@ -2256,6 +2279,9 @@ def _validate_render_supervisor(
         "baseline_checkout_commit": binding["baseline_git_commit"],
         "renderer_closure_sha256": renderer_identity["sha256"],
         "renderer_executable_sha256": renderer_identity["executable_sha256"],
+        "ground_truth_preparation_sha256": request["reference_artifacts"][
+            "ground_truth_preparation_sha256"
+        ],
         "job_sha256": sha256_file(job_path),
         "manifest_sha256": sha256_file(manifest_path),
         "stdout_sha256": sha256_file(path.parent / "renderer-stdout.log"),
@@ -3748,8 +3774,8 @@ def validate_request(request: Any) -> Mapping[str, Any]:
         },
         "request",
     )
-    if value["schema_version"] != 2:
-        raise EvidenceError("request schema_version must be 2")
+    if value["schema_version"] != 3:
+        raise EvidenceError("request schema_version must be 3")
     binding = _mapping(value["binding"], "request.binding")
     validate_runner_identity(
         value["rendering_driver_identity"],
@@ -3865,6 +3891,7 @@ def validate_request(request: Any) -> Mapping[str, Any]:
         "ground_truth_poses_sha256",
         "accurate_colmap_model_sha256",
         "accurate_rendering_reference_sha256",
+        "ground_truth_preparation_sha256",
         "paired_baseline_rendering_reference_sha256",
         "orientation_label_sha256",
     }
@@ -4608,11 +4635,341 @@ def _lpips_distance(candidate: Any, target: Any) -> float:
     return float(value.detach().to("cpu").item())
 
 
+def _validate_ground_truth_preparation(
+    *,
+    artifact_root: Path,
+    preparation_path: Path,
+    expected_sha256: str,
+    expected_input_digest: str,
+    expected_selection_sha256: str,
+    holdout_indices: list[int],
+) -> tuple[dict[int, Mapping[str, Any]], dict[str, dict[str, Any]]]:
+    descriptor = _artifact_descriptor(preparation_path, artifact_root)
+    _digest(expected_sha256, "ground-truth preparation digest")
+    if descriptor["sha256"] != expected_sha256:
+        raise EvidenceError("ground-truth preparation does not match its pinned digest")
+    preparation = _mapping(
+        _load_bounded_json(preparation_path, "ground-truth preparation"),
+        "ground-truth preparation",
+    )
+    _exact_keys(
+        preparation,
+        {
+            "schema_version",
+            "input_digest",
+            "selection_manifest",
+            "source_spec",
+            "algorithm",
+            "producer",
+            "native_decoder",
+            "views",
+        },
+        "ground-truth preparation",
+    )
+    if preparation["schema_version"] != 2:
+        raise EvidenceError("ground-truth preparation schema is unsupported")
+    _digest(expected_input_digest, "expected ground-truth input digest")
+    if preparation["input_digest"] != expected_input_digest:
+        raise EvidenceError("ground-truth preparation input digest is invalid")
+
+    selection = _mapping(
+        preparation["selection_manifest"],
+        "ground-truth preparation.selection_manifest",
+    )
+    _exact_keys(
+        selection,
+        {"path", "sha256"},
+        "ground-truth preparation.selection_manifest",
+    )
+    if selection["path"] != "selection-manifest.json":
+        raise EvidenceError("ground-truth preparation selection path is invalid")
+    _digest(expected_selection_sha256, "expected selection manifest digest")
+    if selection["sha256"] != expected_selection_sha256:
+        raise EvidenceError("ground-truth preparation selection digest is invalid")
+    selection_descriptor = _artifact_descriptor(
+        artifact_root / selection["path"], artifact_root
+    )
+    if selection_descriptor["sha256"] != expected_selection_sha256:
+        raise EvidenceError("ground-truth preparation selection file is invalid")
+
+    source_spec = _mapping(
+        preparation["source_spec"],
+        "ground-truth preparation.source_spec",
+    )
+    _exact_keys(source_spec, {"path", "sha256"}, "ground-truth preparation.source_spec")
+    if source_spec["path"] != "render-target-spec.json":
+        raise EvidenceError("ground-truth preparation source spec path is invalid")
+    _digest(source_spec["sha256"], "ground-truth preparation source spec digest")
+    algorithm = _mapping(preparation["algorithm"], "ground-truth preparation.algorithm")
+    expected_algorithm = {
+        "id": "native_msplat_decode_brown_conrady_alpha0",
+        "version": 2,
+        "float_precision": "float32",
+        "inverse_iterations": 20,
+        "boundary_samples": 200,
+        "interpolation": "bilinear",
+        "boundary_mode": "clamp",
+    }
+    if algorithm != expected_algorithm:
+        raise EvidenceError("ground-truth preparation algorithm is unsupported")
+    producer = _mapping(preparation["producer"], "ground-truth preparation.producer")
+    _exact_keys(
+        producer,
+        {"path", "sha256", "runtime"},
+        "ground-truth preparation.producer",
+    )
+    if producer["path"] != "scripts/benchmark/prepare_render_targets.py":
+        raise EvidenceError("ground-truth preparation producer is invalid")
+    _digest(producer["sha256"], "ground-truth preparation producer digest")
+    producer_runtime = _mapping(
+        producer["runtime"],
+        "ground-truth preparation.producer.runtime",
+    )
+    _exact_keys(
+        producer_runtime,
+        {"implementation", "python_version", "numpy_version", "pillow_version"},
+        "ground-truth preparation.producer.runtime",
+    )
+    if any(
+        not isinstance(producer_runtime[field], str) or not producer_runtime[field]
+        for field in producer_runtime
+    ):
+        raise EvidenceError("ground-truth preparation producer runtime is invalid")
+    producer_path = Path(__file__).resolve().parents[2] / producer["path"]
+    if sha256_file(producer_path) != producer["sha256"]:
+        raise EvidenceError("ground-truth preparation producer digest is not current")
+
+    native_decoder = _mapping(
+        preparation["native_decoder"],
+        "ground-truth preparation.native_decoder",
+    )
+    _exact_keys(
+        native_decoder,
+        {
+            "contract",
+            "mode_version",
+            "executable_bytes",
+            "executable_sha256",
+            "metallib_bytes",
+            "metallib_sha256",
+            "trainer_build_digest",
+            "msplat_source_commit",
+        },
+        "ground-truth preparation.native_decoder",
+    )
+    if (
+        native_decoder["contract"] != "native_coregraphics_imageio_rgb8_v1"
+        or native_decoder["mode_version"] != 1
+        or native_decoder["msplat_source_commit"]
+        != "106499b0a53f82b0c92d013b0861fbebd341b17e"
+    ):
+        raise EvidenceError("ground-truth preparation native decoder is unsupported")
+    for field in ("executable_sha256", "metallib_sha256", "trainer_build_digest"):
+        _digest(native_decoder[field], f"ground-truth preparation.native_decoder.{field}")
+    for field in ("executable_bytes", "metallib_bytes"):
+        if type(native_decoder[field]) is not int or native_decoder[field] <= 0:
+            raise EvidenceError(
+                f"ground-truth preparation.native_decoder.{field} is invalid"
+            )
+
+    raw_views = preparation["views"]
+    if not isinstance(raw_views, list) or len(raw_views) != len(holdout_indices):
+        raise EvidenceError("ground-truth preparation must cover every bound holdout")
+
+    artifacts = {
+        "ground_truth_preparation": descriptor,
+        "selection_manifest": selection_descriptor,
+    }
+    records: dict[int, Mapping[str, Any]] = {}
+    paths: set[PurePosixPath] = set()
+    for position, (raw_view, holdout_index) in enumerate(
+        zip(raw_views, holdout_indices, strict=True)
+    ):
+        label = f"ground-truth preparation.views[{position}]"
+        view = _mapping(raw_view, label)
+        _exact_keys(
+            view,
+            {
+                "holdout_index",
+                "source",
+                "source_camera",
+                "transform",
+                "target",
+                "target_camera",
+                "render_camera_digest",
+                "preparation_view_sha256",
+            },
+            label,
+        )
+        if view["holdout_index"] != holdout_index:
+            raise EvidenceError("ground-truth preparation views are not in holdout order")
+        unsigned_view = dict(view)
+        supplied_view_digest = unsigned_view.pop("preparation_view_sha256")
+        _digest(supplied_view_digest, f"{label}.preparation_view_sha256")
+        if sha256_bytes(canonical_json_bytes(unsigned_view)) != supplied_view_digest:
+            raise EvidenceError("ground-truth preparation view digest is invalid")
+        _digest(view["render_camera_digest"], f"{label}.render_camera_digest")
+        image_records: dict[str, Mapping[str, Any]] = {}
+        for kind in ("source", "target"):
+            image = _mapping(view[kind], f"{label}.{kind}")
+            image_fields = {
+                "path",
+                "sha256",
+                "pixel_sha256",
+                "format",
+                "width",
+                "height",
+            }
+            if kind == "source":
+                image_fields.update(
+                    {
+                        "native_decode_receipt_sha256",
+                        "native_decoded_rgb8_sha256",
+                    }
+                )
+            _exact_keys(
+                image,
+                image_fields,
+                f"{label}.{kind}",
+            )
+            path = _render_relative_path(image["path"], f"{label}.{kind}.path")
+            if path in paths:
+                raise EvidenceError("ground-truth preparation image paths must be unique")
+            paths.add(path)
+            _digest(image["sha256"], f"{label}.{kind}.sha256")
+            _digest(image["pixel_sha256"], f"{label}.{kind}.pixel_sha256")
+            if kind == "source":
+                _digest(
+                    image["native_decode_receipt_sha256"],
+                    f"{label}.source.native_decode_receipt_sha256",
+                )
+                _digest(
+                    image["native_decoded_rgb8_sha256"],
+                    f"{label}.source.native_decoded_rgb8_sha256",
+                )
+                if image["native_decoded_rgb8_sha256"] != image["pixel_sha256"]:
+                    raise EvidenceError(
+                        f"{label}.source native decoded pixels are inconsistent"
+                    )
+            if image["format"] not in {"png_rgb8", "jpeg_rgb8"}:
+                raise EvidenceError(f"{label}.{kind}.format is unsupported")
+            if kind == "target" and image["format"] != "png_rgb8":
+                raise EvidenceError(f"{label}.target must be png_rgb8")
+            if (
+                type(image["width"]) is not int
+                or type(image["height"]) is not int
+                or not 1 <= image["width"] <= 16_384
+                or not 1 <= image["height"] <= 16_384
+                or image["width"] * image["height"] > 4_194_304
+            ):
+                raise EvidenceError(f"{label}.{kind} dimensions are invalid")
+            file_descriptor = _artifact_descriptor(
+                artifact_root / Path(*path.parts), artifact_root
+            )
+            if file_descriptor["sha256"] != image["sha256"]:
+                raise EvidenceError(f"{label}.{kind} digest does not match its file")
+            if kind == "source":
+                artifacts[f"render_source_{holdout_index:06d}"] = file_descriptor
+            image_records[kind] = image
+
+        def camera_record(kind: str) -> Mapping[str, Any]:
+            camera = _mapping(view[kind], f"{label}.{kind}")
+            _exact_keys(camera, {"model", "width", "height", "parameters"}, f"{label}.{kind}")
+            model = camera["model"]
+            expected_parameter_count = {
+                "PINHOLE": 4,
+                "SIMPLE_PINHOLE": 3,
+                "SIMPLE_RADIAL": 4,
+            }.get(model)
+            parameters = camera["parameters"]
+            if (
+                expected_parameter_count is None
+                or not isinstance(parameters, list)
+                or len(parameters) != expected_parameter_count
+                or any(
+                    isinstance(value, bool)
+                    or not isinstance(value, (int, float))
+                    or not math.isfinite(value)
+                    for value in parameters
+                )
+                or camera["width"] != image_records["source" if kind == "source_camera" else "target"]["width"]
+                or camera["height"] != image_records["source" if kind == "source_camera" else "target"]["height"]
+            ):
+                raise EvidenceError(f"{label}.{kind} is invalid")
+            return camera
+
+        source_camera = camera_record("source_camera")
+        target_camera = camera_record("target_camera")
+        if target_camera["model"] != "PINHOLE":
+            raise EvidenceError("ground-truth preparation target camera must be PINHOLE")
+        transform = _mapping(view["transform"], f"{label}.transform")
+        _exact_keys(transform, {"kind", "roi"}, f"{label}.transform")
+        roi = transform["roi"]
+        if (
+            transform["kind"] not in {"identity", "brown_conrady_alpha0"}
+            or not isinstance(roi, list)
+            or len(roi) != 4
+            or any(type(value) is not int for value in roi)
+        ):
+            raise EvidenceError(f"{label}.transform is invalid")
+        roi_x, roi_y, roi_width, roi_height = roi
+        if (
+            roi_x < 0
+            or roi_y < 0
+            or roi_width <= 0
+            or roi_height <= 0
+            or roi_x + roi_width > source_camera["width"]
+            or roi_y + roi_height > source_camera["height"]
+            or target_camera["width"] != roi_width
+            or target_camera["height"] != roi_height
+        ):
+            raise EvidenceError(f"{label}.transform ROI is invalid")
+        radial_is_nonzero_float32 = False
+        if source_camera["model"] == "SIMPLE_RADIAL":
+            try:
+                radial_bits = struct.unpack(
+                    ">I", struct.pack(">f", source_camera["parameters"][3])
+                )[0]
+            except (OverflowError, struct.error) as error:
+                raise EvidenceError(f"{label}.source radial coefficient is outside Float32") from error
+            radial_is_nonzero_float32 = radial_bits & 0x7FFF_FFFF != 0
+        if transform["kind"] == "identity" and (
+            radial_is_nonzero_float32
+            or roi != [0, 0, source_camera["width"], source_camera["height"]]
+        ):
+            raise EvidenceError(f"{label}.identity transform is invalid")
+        if transform["kind"] == "brown_conrady_alpha0" and (
+            source_camera["model"] != "SIMPLE_RADIAL" or not radial_is_nonzero_float32
+        ):
+            raise EvidenceError(f"{label}.distortion transform is invalid")
+        source_parameters = source_camera["parameters"]
+        if source_camera["model"] == "PINHOLE":
+            fx, fy, cx, cy = source_parameters
+        else:
+            fx = fy = source_parameters[0]
+            cx, cy = source_parameters[1:3]
+        expected_target_parameters = [fx, fy, cx - roi_x, cy - roi_y]
+        if any(
+            not math.isclose(actual, expected, rel_tol=1e-12, abs_tol=1e-12)
+            for actual, expected in zip(
+                target_camera["parameters"],
+                expected_target_parameters,
+                strict=True,
+            )
+        ):
+            raise EvidenceError(
+                f"{label}.target camera intrinsics do not match the transform"
+            )
+        records[holdout_index] = view
+    return records, artifacts
+
+
 def validate_and_score_rendering(
     *,
     artifact_root: Path,
     manifest_path: Path,
     reference_path: Path,
+    preparation_path: Path,
     request: Mapping[str, Any],
     commands: Any,
     renderer_executable_sha256: str,
@@ -4635,6 +4992,7 @@ def validate_and_score_rendering(
             "pixel_format",
             "renderer_closure_sha256",
             "renderer_executable_sha256",
+            "ground_truth_preparation_sha256",
             "render_operations",
             "views",
         },
@@ -4642,8 +5000,16 @@ def validate_and_score_rendering(
     )
     binding = _mapping(request.get("binding"), "request.binding")
     holdouts = request.get("holdout_indices")
+    request_preparation_sha256 = request["reference_artifacts"][
+        "ground_truth_preparation_sha256"
+    ]
+    _digest(request_preparation_sha256, "request ground-truth preparation digest")
+    if manifest["ground_truth_preparation_sha256"] != request_preparation_sha256:
+        raise EvidenceError(
+            "rendering manifest ground-truth preparation does not match the request"
+        )
     if (
-        manifest["schema_version"] != 1
+        manifest["schema_version"] != 2
         or manifest["scene_id"] != binding.get("scene_id")
         or manifest["scale"] != binding.get("scale")
         or manifest["input_digest"] != binding.get("input_digest")
@@ -4665,13 +5031,31 @@ def validate_and_score_rendering(
     if manifest["training_view_indices"] != expected_training:
         raise EvidenceError("held-out views must be excluded from the training selection")
 
+    preparation_records, preparation_artifacts = _validate_ground_truth_preparation(
+        artifact_root=artifact_root,
+        preparation_path=preparation_path,
+        expected_sha256=request_preparation_sha256,
+        expected_input_digest=binding["input_digest"],
+        expected_selection_sha256=request["reference_artifacts"][
+            "selection_manifest_sha256"
+        ],
+        holdout_indices=holdouts,
+    )
     reference = _mapping(
         _load_bounded_json(reference_path, "accurate rendering reference"),
         "accurate rendering reference",
     )
-    _exact_keys(reference, {"schema_version", "views"}, "accurate rendering reference")
-    if reference["schema_version"] != 1:
+    _exact_keys(
+        reference,
+        {"schema_version", "ground_truth_preparation_sha256", "views"},
+        "accurate rendering reference",
+    )
+    if reference["schema_version"] != 2:
         raise EvidenceError("accurate rendering reference schema is unsupported")
+    if reference["ground_truth_preparation_sha256"] != request_preparation_sha256:
+        raise EvidenceError(
+            "accurate rendering reference ground-truth preparation does not match the request"
+        )
     reference_views = reference["views"]
     views = manifest["views"]
     if (
@@ -4748,7 +5132,10 @@ def validate_and_score_rendering(
         previous_render_end = float(ended)
         render_operations_by_key[(holdout_index, variant)] = operation
 
-    artifacts = {"rendering_manifest": _artifact_descriptor(manifest_path, artifact_root)}
+    artifacts = {
+        "rendering_manifest": _artifact_descriptor(manifest_path, artifact_root),
+        **preparation_artifacts,
+    }
     image_paths: set[PurePosixPath] = set()
     balanced: list[dict[str, float | int]] = []
     fast: list[dict[str, float | int]] = []
@@ -4764,6 +5151,7 @@ def validate_and_score_rendering(
             "camera",
             "camera_digest",
             "ground_truth_sha256",
+            "preparation_view_sha256",
         }
         _exact_keys(view, view_fields, f"rendering manifest.views[{position}]")
         _exact_keys(
@@ -4778,13 +5166,33 @@ def validate_and_score_rendering(
             reference_view["camera"],
             f"accurate rendering reference.views[{position}].camera",
         )
-        camera_digest = sha256_bytes(canonical_json_bytes(camera))
+        camera_digest = render_camera_digest(camera)
+        preparation_view = preparation_records[holdout_index]
+        target_camera = preparation_view["target_camera"]
+        fx, fy, cx, cy = target_camera["parameters"]
+        expected_projection = {
+            0: 2.0 * fx / camera["width"],
+            5: 2.0 * fy / camera["height"],
+            8: 1.0 - 2.0 * cx / camera["width"],
+            9: 2.0 * cy / camera["height"] - 1.0,
+        }
+        projection = camera["projection_matrix_column_major"]
         if (
             camera != reference_camera
             or view["camera_digest"] != camera_digest
             or reference_view["camera_digest"] != camera_digest
+            or preparation_view["render_camera_digest"] != camera_digest
+            or reference_view["preparation_view_sha256"]
+            != preparation_view["preparation_view_sha256"]
         ):
             raise EvidenceError("render camera does not match the pinned holdout camera")
+        if any(
+            not math.isclose(projection[index], expected, rel_tol=1e-6, abs_tol=1e-6)
+            for index, expected in expected_projection.items()
+        ):
+            raise EvidenceError(
+                "render camera intrinsics do not match the prepared ground truth"
+            )
 
         ground_truth = _mapping(
             view["ground_truth"],
@@ -4792,11 +5200,27 @@ def validate_and_score_rendering(
         )
         _exact_keys(
             ground_truth,
-            {"path", "sha256", "input_digest"},
+            {
+                "path",
+                "sha256",
+                "source_path",
+                "source_sha256",
+                "preparation_view_sha256",
+                "input_digest",
+            },
             f"rendering manifest.views[{position}].ground_truth",
         )
         if ground_truth["input_digest"] != binding["input_digest"]:
             raise EvidenceError("ground-truth image is not bound to the requested input")
+        if (
+            ground_truth["path"] != preparation_view["target"]["path"]
+            or ground_truth["sha256"] != preparation_view["target"]["sha256"]
+            or ground_truth["source_path"] != preparation_view["source"]["path"]
+            or ground_truth["source_sha256"] != preparation_view["source"]["sha256"]
+            or ground_truth["preparation_view_sha256"]
+            != preparation_view["preparation_view_sha256"]
+        ):
+            raise EvidenceError("ground-truth image does not match its preparation receipt")
         ground_truth_relative = _render_relative_path(
             ground_truth["path"],
             f"rendering manifest.views[{position}].ground_truth.path",
@@ -5153,7 +5577,7 @@ def _validate_training_manifest(
             "detailProfile",
             "iterationLimit",
             "plateauWindow",
-            "deterministicSeed",
+            "cameraOrderSeed",
             "completedIteration",
             "outputPath",
             "outputSHA256",
@@ -5174,8 +5598,8 @@ def _validate_training_manifest(
         },
         "training manifest",
     )
-    if manifest["schemaVersion"] != 4 or manifest["completionStatus"] != "completed":
-        raise EvidenceError("training manifest is not a completed schema-4 artifact")
+    if manifest["schemaVersion"] != 5 or manifest["completionStatus"] != "completed":
+        raise EvidenceError("training manifest is not a completed schema-5 artifact")
     if manifest["runtimeVersion"] != "native-metal-cli-v2":
         raise EvidenceError("training manifest runtime contract is unsupported")
     if (
@@ -5224,12 +5648,12 @@ def _validate_training_manifest(
         ):
             raise EvidenceError(f"training manifest {name} must be a nonnegative integer")
     if (
-        type(manifest["deterministicSeed"]) is not int
-        or not 0 <= manifest["deterministicSeed"] <= (1 << 64) - 1
+        type(manifest["cameraOrderSeed"]) is not int
+        or not 0 <= manifest["cameraOrderSeed"] <= (1 << 64) - 1
     ):
-        raise EvidenceError("training manifest deterministicSeed is outside UInt64")
-    if manifest["deterministicSeed"] != candidate_configuration["deterministic_seed"]:
-        raise EvidenceError("training manifest deterministicSeed does not match request")
+        raise EvidenceError("training manifest cameraOrderSeed is outside UInt64")
+    if manifest["cameraOrderSeed"] != candidate_configuration["deterministic_seed"]:
+        raise EvidenceError("training manifest cameraOrderSeed does not match request")
     if manifest["iterationLimit"] == 0 or manifest["plateauWindow"] == 0:
         raise EvidenceError("training manifest iteration contract is invalid")
     if not 0 < manifest["completedIteration"] <= manifest["iterationLimit"]:
@@ -5971,6 +6395,7 @@ def derive_attestation(
         "ground_truth_poses": "ground-truth-poses.json",
         "accurate_colmap_model": "accurate-colmap-model.json",
         "accurate_rendering_reference": "accurate-rendering-reference.json",
+        "ground_truth_preparation": "ground-truth-preparation.json",
         "paired_baseline_rendering_reference": "paired-baseline-rendering-reference.json",
         "orientation_label": "orientation-label.json",
         "orientation_metrics": "orientation-metrics.json",
@@ -6028,6 +6453,7 @@ def derive_attestation(
         "ground_truth_poses": "ground_truth_poses_sha256",
         "accurate_colmap_model": "accurate_colmap_model_sha256",
         "accurate_rendering_reference": "accurate_rendering_reference_sha256",
+        "ground_truth_preparation": "ground_truth_preparation_sha256",
         "paired_baseline_rendering_reference": "paired_baseline_rendering_reference_sha256",
         "orientation_label": "orientation_label_sha256",
     }
@@ -6097,6 +6523,8 @@ def derive_attestation(
             artifact_root=artifact_root,
             manifest_path=artifact_root / descriptors["rendering_manifest"]["path"],
             reference_path=artifact_root / descriptors["accurate_rendering_reference"]["path"],
+            preparation_path=artifact_root
+            / descriptors["ground_truth_preparation"]["path"],
             request=request,
             commands=observations.get("commands"),
             renderer_executable_sha256=request["rendering_driver_identity"][
