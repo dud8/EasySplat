@@ -16,6 +16,30 @@ struct ColmapVerifiedGraphSnapshot: Sendable, Equatable {
     let components: [[String]]
 }
 
+enum PairGraphConnectivityPolicy {
+    static func dominantViewCount(
+        totalViewCount: Int,
+        connectedComponentCount: Int,
+        isolatedViewCount: Int,
+        descriptorlessViewCount: Int
+    ) -> Int? {
+        guard totalViewCount >= 2,
+              descriptorlessViewCount >= 0,
+              descriptorlessViewCount <= isolatedViewCount,
+              isolatedViewCount >= 0,
+              isolatedViewCount <= totalViewCount - 2,
+              connectedComponentCount == isolatedViewCount + 1 else {
+            return nil
+        }
+        let dominantViewCount = totalViewCount - isolatedViewCount
+        guard Double(dominantViewCount) / Double(totalViewCount)
+                >= ReconstructionScorer.minimumRegisteredViewFraction else {
+            return nil
+        }
+        return dominantViewCount
+    }
+}
+
 struct ColmapPairGraphInspection: Sendable, Equatable {
     let scheduledPairCount: Int
     let attemptedPairCount: Int
@@ -45,31 +69,28 @@ struct ColmapPairGraphInspection: Sendable, Equatable {
         descriptorlessImageNames.count
     }
 
-    var hasSingleDescriptorBearingComponent: Bool {
-        let descriptorless = Set(descriptorlessImageNames)
-        let descriptorBearingViewCount = verifiedGraph.components.reduce(0) {
-            $0 + $1.count(where: { !descriptorless.contains($0) })
+    var hasAcceptableDominantVerifiedComponent: Bool {
+        let totalViewCount = verifiedGraph.components.reduce(0) { $0 + $1.count }
+        guard let dominantViewCount = PairGraphConnectivityPolicy.dominantViewCount(
+            totalViewCount: totalViewCount,
+            connectedComponentCount: connectedComponentCount,
+            isolatedViewCount: isolatedViewCount,
+            descriptorlessViewCount: descriptorlessViewCount
+        ) else {
+            return false
         }
-        guard descriptorBearingViewCount >= 2 else { return false }
-
-        var descriptorBearingComponents = 0
-        for component in verifiedGraph.components {
-            let descriptorBearingNames = component.filter { !descriptorless.contains($0) }
-            if descriptorBearingNames.isEmpty {
-                guard component.count == 1,
-                      let name = component.first,
-                      descriptorless.contains(name) else {
-                    return false
-                }
-            } else {
-                guard descriptorBearingNames.count == component.count else { return false }
-                descriptorBearingComponents += 1
-                guard descriptorBearingNames.count == descriptorBearingViewCount else {
-                    return false
-                }
-            }
+        let nonSingletonComponents = verifiedGraph.components.filter { $0.count > 1 }
+        guard nonSingletonComponents.count == 1,
+              nonSingletonComponents[0].count == dominantViewCount,
+              verifiedGraph.components.allSatisfy({
+                  $0.count == 1 || $0.count == dominantViewCount
+              }) else {
+            return false
         }
-        return descriptorBearingComponents == 1
+        let singletonNames = Set(
+            verifiedGraph.components.filter { $0.count == 1 }.compactMap(\.first)
+        )
+        return Set(descriptorlessImageNames).isSubset(of: singletonNames)
     }
 }
 

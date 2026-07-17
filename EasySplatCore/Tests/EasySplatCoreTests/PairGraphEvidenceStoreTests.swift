@@ -416,10 +416,10 @@ final class PairGraphEvidenceStoreTests: XCTestCase {
         XCTAssertEqual(loaded.acceptedInspection.connectedComponentCount, 2)
         XCTAssertEqual(loaded.acceptedInspection.isolatedViewCount, 1)
         XCTAssertEqual(loaded.acceptedInspection.descriptorlessViewCount, 1)
-        XCTAssertEqual(loaded.acceptedInspection.articulationViewCount, 0)
-        XCTAssertEqual(loaded.acceptedInspection.biconnectedBlockCount, 1)
-        XCTAssertEqual(loaded.acceptedInspection.largestBiconnectedBlockViewCount, 3)
-        XCTAssertEqual(loaded.acceptedInspection.secondLargestBiconnectedBlockViewCount, 0)
+        XCTAssertEqual(loaded.acceptedInspection.articulationViewCount, 7)
+        XCTAssertEqual(loaded.acceptedInspection.biconnectedBlockCount, 8)
+        XCTAssertEqual(loaded.acceptedInspection.largestBiconnectedBlockViewCount, 2)
+        XCTAssertEqual(loaded.acceptedInspection.secondLargestBiconnectedBlockViewCount, 2)
         XCTAssertEqual(try loaded.pairGraphMeasurement().descriptorlessViewCount, 1)
     }
 
@@ -428,7 +428,7 @@ final class PairGraphEvidenceStoreTests: XCTestCase {
         defer { try? FileManager.default.removeItem(at: fixture.root) }
 
         var evidence = makeDescriptorlessEvidence()
-        evidence.acceptedInspection.descriptorlessViewCount = 0
+        evidence.acceptedInspection.descriptorlessViewCount = 2
         XCTAssertThrowsError(try PairGraphEvidenceStore.save(
             evidence,
             to: fixture.paths.pairGraphEvidenceURL,
@@ -755,50 +755,52 @@ final class PairGraphEvidenceStoreTests: XCTestCase {
     }
 
     private func makeDescriptorlessEvidence() -> PairGraphEvidence {
-        let scheduledPairs = [
-            ColmapScheduledPair("a.jpg", "b.jpg", role: .local),
-            ColmapScheduledPair("a.jpg", "c.jpg", role: .retrieval),
-            ColmapScheduledPair("b.jpg", "c.jpg", role: .local),
-            ColmapScheduledPair("c.jpg", "d.jpg", role: .retrieval),
-        ]
+        let imageNames = (0..<10).map { "image_\($0).jpg" }
+        let scheduledPairs = (0..<9).map { index in
+            ColmapScheduledPair(
+                imageNames[index],
+                imageNames[index + 1],
+                role: .local
+            )
+        }
         let attempt = PairGraphAttemptEvidence(
             artifact: PairMatchingAttemptArtifact(
                 attemptNumber: 1,
                 matcher: .faiss,
                 recoveryLevel: .normal,
                 outcome: .completed,
-                scheduledPairCount: 4,
-                attemptedPairCount: 4,
-                rawMatchedPairCount: 3,
-                spatiallyVerifiedPairCount: 3,
+                scheduledPairCount: 9,
+                attemptedPairCount: 9,
+                rawMatchedPairCount: 8,
+                spatiallyVerifiedPairCount: 8,
                 durationSeconds: 1
             ),
             scheduledPairs: scheduledPairs
         )
         let inspection = ColmapPairGraphInspection(
-            scheduledPairCount: 4,
-            attemptedPairCount: 4,
-            rawMatchedPairCount: 3,
-            spatiallyVerifiedPairCount: 3,
-            localPairCount: 2,
-            retrievalPairCount: 2,
+            scheduledPairCount: 9,
+            attemptedPairCount: 9,
+            rawMatchedPairCount: 8,
+            spatiallyVerifiedPairCount: 8,
+            localPairCount: 9,
+            retrievalPairCount: 0,
             loopRevisitPairCount: 0,
             connectedComponentCount: 2,
             isolatedViewCount: 1,
-            articulationViewCount: 0,
-            biconnectedBlockCount: 1,
-            largestBiconnectedBlockViewCount: 3,
-            secondLargestBiconnectedBlockViewCount: 0,
+            articulationViewCount: 7,
+            biconnectedBlockCount: 8,
+            largestBiconnectedBlockViewCount: 2,
+            secondLargestBiconnectedBlockViewCount: 2,
             degreeP10: 0,
             degreeMedian: 2,
             degreeP90: 2,
             featureDatabaseDigest: String(repeating: "b", count: 64),
             matchingDatabaseDigest: String(repeating: "c", count: 64),
-            descriptorlessImageNames: ["d.jpg"]
+            descriptorlessImageNames: [imageNames[9]]
         )
         return PairGraphEvidence(
             selectedFramesDigest: String(repeating: "a", count: 64),
-            imageNames: ["a.jpg", "b.jpg", "c.jpg", "d.jpg"],
+            imageNames: imageNames,
             attempts: [attempt],
             acceptedAttemptNumber: 1,
             acceptedInspection: inspection,

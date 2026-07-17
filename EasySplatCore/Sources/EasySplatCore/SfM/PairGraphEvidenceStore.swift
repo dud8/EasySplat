@@ -401,7 +401,14 @@ enum PairGraphEvidenceStore {
               descriptorlessViewCount < imageCount else {
             throw PairGraphEvidenceStoreError.invalidEvidence
         }
-        let matchableViewCount = imageCount - descriptorlessViewCount
+        guard let dominantViewCount = PairGraphConnectivityPolicy.dominantViewCount(
+            totalViewCount: imageCount,
+            connectedComponentCount: inspection.connectedComponentCount,
+            isolatedViewCount: inspection.isolatedViewCount,
+            descriptorlessViewCount: descriptorlessViewCount
+        ) else {
+            throw PairGraphEvidenceStoreError.invalidEvidence
+        }
         let hasSingleBiconnectedBlock = inspection.biconnectedBlockCount == 1
         guard inspection.scheduledPairCount == artifact.scheduledPairCount,
               artifact.outcome == .completed,
@@ -419,26 +426,24 @@ enum PairGraphEvidenceStore {
               inspection.rawMatchedPairCount <= inspection.attemptedPairCount,
               inspection.spatiallyVerifiedPairCount >= 0,
               inspection.spatiallyVerifiedPairCount <= inspection.rawMatchedPairCount,
-              matchableViewCount >= 2,
-              inspection.connectedComponentCount == descriptorlessViewCount + 1,
-              inspection.isolatedViewCount == descriptorlessViewCount,
+              dominantViewCount >= 2,
               inspection.articulationViewCount >= 0,
-              inspection.articulationViewCount <= matchableViewCount - 2,
+              inspection.articulationViewCount <= dominantViewCount - 2,
               inspection.biconnectedBlockCount >= 1,
               inspection.biconnectedBlockCount
-                <= min(inspection.spatiallyVerifiedPairCount, matchableViewCount - 1),
+                <= min(inspection.spatiallyVerifiedPairCount, dominantViewCount - 1),
               inspection.articulationViewCount < inspection.biconnectedBlockCount,
               inspection.largestBiconnectedBlockViewCount >= 2,
-              inspection.largestBiconnectedBlockViewCount <= matchableViewCount,
+              inspection.largestBiconnectedBlockViewCount <= dominantViewCount,
               inspection.secondLargestBiconnectedBlockViewCount >= 0,
               inspection.secondLargestBiconnectedBlockViewCount
                 <= inspection.largestBiconnectedBlockViewCount,
               hasSingleBiconnectedBlock
                 ? inspection.articulationViewCount == 0
-                    && inspection.largestBiconnectedBlockViewCount == matchableViewCount
+                    && inspection.largestBiconnectedBlockViewCount == dominantViewCount
                     && inspection.secondLargestBiconnectedBlockViewCount == 0
                 : inspection.articulationViewCount > 0
-                    && inspection.largestBiconnectedBlockViewCount < matchableViewCount
+                    && inspection.largestBiconnectedBlockViewCount < dominantViewCount
                     && inspection.secondLargestBiconnectedBlockViewCount >= 2,
               inspection.degreeP10 >= 0,
               inspection.degreeP10 <= inspection.degreeMedian,
@@ -453,8 +458,8 @@ enum PairGraphEvidenceStore {
         }
 
         let verifiedEdges = inspection.spatiallyVerifiedPairCount
-        guard verifiedEdges >= matchableViewCount - 1,
-              inspection.degreeP90 <= min(matchableViewCount - 1, verifiedEdges) else {
+        guard verifiedEdges >= dominantViewCount - 1,
+              inspection.degreeP90 <= min(dominantViewCount - 1, verifiedEdges) else {
             throw PairGraphEvidenceStoreError.invalidEvidence
         }
     }

@@ -346,10 +346,17 @@ enum GeometryArtifactStore {
                   descriptorlessViewCount < totalViewCount else {
                 throw Error.invalidPairGraph
             }
-            let matchableViewCount = totalViewCount - descriptorlessViewCount
+            guard let dominantViewCount = PairGraphConnectivityPolicy.dominantViewCount(
+                totalViewCount: totalViewCount,
+                connectedComponentCount: measurement.connectedComponentCount,
+                isolatedViewCount: measurement.isolatedViewCount,
+                descriptorlessViewCount: descriptorlessViewCount
+            ) else {
+                throw Error.invalidPairGraph
+            }
             let hasSingleBiconnectedBlock = measurement.biconnectedBlockCount == 1
-            guard matchableViewCount >= 2,
-                  registeredViewCount <= matchableViewCount,
+            guard dominantViewCount >= 2,
+                  registeredViewCount <= dominantViewCount,
                   measurement.scheduledPairCount >= 0,
                   measurement.attemptedPairCount >= 0,
                   measurement.attemptedPairCount <= measurement.scheduledPairCount,
@@ -367,31 +374,29 @@ enum GeometryArtifactStore {
                     + measurement.retrievalPairCount
                     + measurement.loopRevisitPairCount
                     == measurement.scheduledPairCount,
-                  measurement.connectedComponentCount == descriptorlessViewCount + 1,
-                  measurement.isolatedViewCount == descriptorlessViewCount,
-                  measurement.spatiallyVerifiedPairCount >= matchableViewCount - 1,
+                  measurement.spatiallyVerifiedPairCount >= dominantViewCount - 1,
                   measurement.articulationViewCount >= 0,
-                  measurement.articulationViewCount <= matchableViewCount - 2,
+                  measurement.articulationViewCount <= dominantViewCount - 2,
                   measurement.biconnectedBlockCount >= 1,
                   measurement.biconnectedBlockCount
-                    <= min(measurement.spatiallyVerifiedPairCount, matchableViewCount - 1),
+                    <= min(measurement.spatiallyVerifiedPairCount, dominantViewCount - 1),
                   measurement.articulationViewCount < measurement.biconnectedBlockCount,
                   measurement.largestBiconnectedBlockViewCount >= 2,
-                  measurement.largestBiconnectedBlockViewCount <= matchableViewCount,
+                  measurement.largestBiconnectedBlockViewCount <= dominantViewCount,
                   measurement.secondLargestBiconnectedBlockViewCount >= 0,
                   measurement.secondLargestBiconnectedBlockViewCount
                     <= measurement.largestBiconnectedBlockViewCount,
                   hasSingleBiconnectedBlock
                     ? measurement.articulationViewCount == 0
-                        && measurement.largestBiconnectedBlockViewCount == matchableViewCount
+                        && measurement.largestBiconnectedBlockViewCount == dominantViewCount
                         && measurement.secondLargestBiconnectedBlockViewCount == 0
                     : measurement.articulationViewCount > 0
-                        && measurement.largestBiconnectedBlockViewCount < matchableViewCount
+                        && measurement.largestBiconnectedBlockViewCount < dominantViewCount
                         && measurement.secondLargestBiconnectedBlockViewCount >= 2,
                   measurement.degreeP10 >= 0,
                   measurement.degreeP10 <= measurement.degreeMedian,
                   measurement.degreeMedian <= measurement.degreeP90,
-                  measurement.degreeP90 < matchableViewCount,
+                  measurement.degreeP90 < dominantViewCount,
                   !measurement.matcherAttempts.isEmpty,
                   isSHA256(measurement.pairListDigest),
                   isSHA256(measurement.featureDatabaseDigest),

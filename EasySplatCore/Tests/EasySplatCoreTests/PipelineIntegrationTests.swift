@@ -855,6 +855,88 @@ final class PipelineIntegrationTests: XCTestCase {
         ))
     }
 
+    func testAutomaticPhotoSelectionAcceptsDominantGraphWithoutExactRecovery() async throws {
+        try await assertPhotoSelectionAcceptsDominantGraphWithoutExactRecovery(
+            .automatic,
+            projectName: "AutomaticDominantGraph"
+        )
+    }
+
+    func testUseAllPhotoSelectionAcceptsDominantGraphWithoutExactRecovery() async throws {
+        try await assertPhotoSelectionAcceptsDominantGraphWithoutExactRecovery(
+            .useAllValidPhotos,
+            projectName: "UseAllDominantGraph"
+        )
+    }
+
+    private func assertPhotoSelectionAcceptsDominantGraphWithoutExactRecovery(
+        _ photoSelection: PhotoSelection,
+        projectName: String
+    ) async throws {
+        let temp = makeTempRoot()
+        let fixture = try makePhotoRecoveryProject(
+            in: temp,
+            name: projectName,
+            photoSelection: photoSelection
+        )
+        let run = makePhotoRecoveryPipeline(
+            projectURL: fixture.projectURL,
+            toolchain: fixture.toolchain,
+            scripts: [
+                .init(
+                    path: fixture.toolchain.colmap.path,
+                    argsPrefix: ["feature_extractor"],
+                    result: .init(
+                        exitCode: 0,
+                        terminationReason: .exit,
+                        stdout: "",
+                        stderr: ""
+                    ),
+                    onRun: { try self.writeFeatureDatabase(for: $0) }
+                ),
+                .init(
+                    path: fixture.toolchain.colmap.path,
+                    argsPrefix: ["matches_importer"],
+                    result: .init(
+                        exitCode: 0,
+                        terminationReason: .exit,
+                        stdout: "",
+                        stderr: ""
+                    ),
+                    onRun: { try self.writeFiftyNinePlusOneFaissResults(for: $0) }
+                ),
+            ] + successfulMappingScripts(
+                colmapPath: fixture.toolchain.colmap.path,
+                projectURL: fixture.projectURL,
+                registeredViews: 59,
+                totalViews: 60,
+                pointCount: 20
+            )
+        )
+        let events = PipelineEventSink()
+
+        try await run.pipeline.run { events.append($0) }
+
+        XCTAssertEqual(run.runner.calls.count { $0.1.first == "feature_extractor" }, 1)
+        XCTAssertEqual(run.runner.calls.count { $0.1.first == "matches_importer" }, 1)
+        XCTAssertNotNil(events.stageLog(containing: "had no verified overlap"))
+        let evidence = try PairGraphEvidenceStore.load(
+            from: fixture.paths.pairGraphEvidenceURL,
+            projectPaths: fixture.paths
+        )
+        XCTAssertEqual(evidence.attempts.count, 1)
+        XCTAssertEqual(evidence.acceptedInspection.connectedComponentCount, 2)
+        XCTAssertEqual(evidence.acceptedInspection.isolatedViewCount, 1)
+        XCTAssertEqual(evidence.acceptedInspection.descriptorlessViewCount, 0)
+        XCTAssertTrue(evidence.fallbackReasons.isEmpty)
+        let geometry = try GeometryArtifactStore.load(
+            from: fixture.paths.geometryManifestURL,
+            projectPaths: fixture.paths
+        )
+        XCTAssertEqual(geometry.registeredViewCount, 59)
+        XCTAssertEqual(geometry.totalViewCount, 60)
+    }
+
     func testDisconnectedFaissGraphUsesTargetedExactSchedule() async throws {
         let temp = makeTempRoot()
         let fixture = try makePhotoRecoveryProject(
@@ -881,21 +963,7 @@ final class PipelineIntegrationTests: XCTestCase {
                         "0"
                     )
                     do {
-                        let lines = try self.pairListLines(for: arguments)
-                        XCTAssertEqual(lines.count, 1_770)
-                        let imageNames = Set(lines.flatMap {
-                            $0.split(whereSeparator: \.isWhitespace).map(String.init)
-                        }).sorted()
-                        let isolated = try XCTUnwrap(imageNames.last)
-                        let verified = Set(lines.filter { line in
-                            !line.split(whereSeparator: \.isWhitespace).map(String.init)
-                                .contains(isolated)
-                        }.prefix(230))
-                        XCTAssertEqual(verified.count, 230)
-                        try self.writeSelectiveVerifiedPairResults(
-                            for: arguments,
-                            verifiedPairLines: verified
-                        )
+                        try self.writeFiftyThreePlusSevenFaissResults(for: arguments)
                     } catch {
                         XCTFail("Could not create disconnected FAISS results: \(error)")
                     }
@@ -911,7 +979,7 @@ final class PipelineIntegrationTests: XCTestCase {
                         "1"
                     )
                     do {
-                        XCTAssertEqual(try self.pairListLines(for: arguments).count, 289)
+                        XCTAssertEqual(try self.pairListLines(for: arguments).count, 622)
                         XCTAssertEqual(
                             try self.matchingRowCounts(
                                 databasePath: try XCTUnwrap(
@@ -948,8 +1016,8 @@ final class PipelineIntegrationTests: XCTestCase {
             .policy,
             .targetedExactGraphRecovery,
         ])
-        XCTAssertEqual(evidence.attempts.map(\.scheduledPairs.count), [1_770, 289])
-        XCTAssertEqual(evidence.acceptedInspection.scheduledPairCount, 289)
+        XCTAssertEqual(evidence.attempts.map(\.scheduledPairs.count), [1_770, 622])
+        XCTAssertEqual(evidence.acceptedInspection.scheduledPairCount, 622)
         let acceptedPlan = try ColmapPairPlan.persisted(
             imageNames: evidence.imageNames,
             scheduledPairs: evidence.attempts[1].scheduledPairs
@@ -979,7 +1047,7 @@ final class PipelineIntegrationTests: XCTestCase {
                 result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""),
                 onRun: { arguments in
                     do {
-                        try self.writeFiftyNinePlusOneFaissResults(for: arguments)
+                        try self.writeFiftyThreePlusSevenFaissResults(for: arguments)
                     } catch {
                         XCTFail("Could not create disconnected FAISS results: \(error)")
                     }
@@ -991,7 +1059,7 @@ final class PipelineIntegrationTests: XCTestCase {
                 result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""),
                 onRun: { arguments in
                     do {
-                        XCTAssertEqual(try self.pairListLines(for: arguments).count, 289)
+                        XCTAssertEqual(try self.pairListLines(for: arguments).count, 622)
                         try self.writeVerifiedPairResults(for: arguments, verifiedRows: 0)
                     } catch {
                         XCTFail("Could not create disconnected targeted results: \(error)")
@@ -1039,7 +1107,7 @@ final class PipelineIntegrationTests: XCTestCase {
             .targetedExactGraphRecovery,
             .fullExactGraphRecovery,
         ])
-        XCTAssertEqual(evidence.attempts.map(\.scheduledPairs.count), [1_770, 289, 1_770])
+        XCTAssertEqual(evidence.attempts.map(\.scheduledPairs.count), [1_770, 622, 1_770])
         XCTAssertEqual(evidence.acceptedInspection.scheduledPairCount, 1_770)
     }
 
@@ -1063,14 +1131,14 @@ final class PipelineIntegrationTests: XCTestCase {
                 path: fixture.toolchain.colmap.path,
                 argsPrefix: ["matches_importer"],
                 result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""),
-                onRun: { try self.writeFiftyNinePlusOneFaissResults(for: $0) }
+                onRun: { try self.writeFiftyThreePlusSevenFaissResults(for: $0) }
             ),
             .init(
                 path: fixture.toolchain.colmap.path,
                 argsPrefix: ["matches_importer"],
                 result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""),
                 onRun: { arguments in
-                    XCTAssertEqual(try self.pairListLines(for: arguments).count, 289)
+                    XCTAssertEqual(try self.pairListLines(for: arguments).count, 622)
                     try self.writeVerifiedPairResults(for: arguments)
                 }
             ),
@@ -1110,7 +1178,7 @@ final class PipelineIntegrationTests: XCTestCase {
             .targetedExactGraphRecovery,
             .fullExactGraphRecovery,
         ])
-        XCTAssertEqual(evidence.attempts.map(\.scheduledPairs.count), [1_770, 289, 1_770])
+        XCTAssertEqual(evidence.attempts.map(\.scheduledPairs.count), [1_770, 622, 1_770])
         XCTAssertEqual(run.runner.calls.count { $0.1.first == "mapper" }, 2)
     }
 
@@ -1134,14 +1202,14 @@ final class PipelineIntegrationTests: XCTestCase {
                 path: fixture.toolchain.colmap.path,
                 argsPrefix: ["matches_importer"],
                 result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""),
-                onRun: { try self.writeFiftyNinePlusOneFaissResults(for: $0) }
+                onRun: { try self.writeFiftyThreePlusSevenFaissResults(for: $0) }
             ),
             .init(
                 path: fixture.toolchain.colmap.path,
                 argsPrefix: ["matches_importer"],
                 result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""),
                 onRun: { arguments in
-                    XCTAssertEqual(try self.pairListLines(for: arguments).count, 289)
+                    XCTAssertEqual(try self.pairListLines(for: arguments).count, 622)
                     try self.writeVerifiedPairResults(for: arguments)
                 }
             ),
@@ -1232,7 +1300,7 @@ final class PipelineIntegrationTests: XCTestCase {
                         stdout: "",
                         stderr: ""
                     ),
-                    onRun: { try self.writeFiftyNinePlusOneFaissResults(for: $0) }
+                    onRun: { try self.writeFiftyThreePlusSevenFaissResults(for: $0) }
                 ),
                 .init(
                     path: fixture.toolchain.colmap.path,
@@ -1244,7 +1312,7 @@ final class PipelineIntegrationTests: XCTestCase {
                         stderr: ""
                     ),
                     onRun: { arguments in
-                        XCTAssertEqual(try self.pairListLines(for: arguments).count, 289)
+                        XCTAssertEqual(try self.pairListLines(for: arguments).count, 622)
                         try self.writeVerifiedPairResults(for: arguments)
                     }
                 ),
@@ -1507,7 +1575,7 @@ final class PipelineIntegrationTests: XCTestCase {
             .targetedExactGraphRecovery,
             .fullExactGraphRecovery,
         ])
-        XCTAssertEqual(evidence.attempts.map(\.scheduledPairs.count), [1_770, 289, 1_770])
+        XCTAssertEqual(evidence.attempts.map(\.scheduledPairs.count), [1_770, 622, 1_770])
     }
 
     func testPendingFullExactRecoverySupersedesStaleTargetedEvidence() async throws {
@@ -1521,7 +1589,7 @@ final class PipelineIntegrationTests: XCTestCase {
         )
         let plans = try staleTargetEvidence.restoredPairPlans()
         let sourcePlan = try XCTUnwrap(plans.recoverySource)
-        XCTAssertEqual(plans.accepted.pairs.count, 289)
+        XCTAssertEqual(plans.accepted.pairs.count, 622)
         XCTAssertEqual(sourcePlan.pairs.count, 1_770)
 
         try PairGraphRecoveryStore.save(
@@ -1603,7 +1671,7 @@ final class PipelineIntegrationTests: XCTestCase {
             .targetedExactGraphRecovery,
             .fullExactGraphRecovery,
         ])
-        XCTAssertEqual(accepted.attempts.map(\.scheduledPairs.count), [1_770, 289, 1_770])
+        XCTAssertEqual(accepted.attempts.map(\.scheduledPairs.count), [1_770, 622, 1_770])
         XCTAssertFalse(FileManager.default.fileExists(
             atPath: fixture.paths.pairGraphRecoveryURL.path
         ))
@@ -2048,7 +2116,7 @@ final class PipelineIntegrationTests: XCTestCase {
                         stdout: "",
                         stderr: ""
                     ),
-                    onRun: { try self.writeFiftyNinePlusOneFaissResults(for: $0) }
+                    onRun: { try self.writeFiftyThreePlusSevenFaissResults(for: $0) }
                 ),
                 .init(
                     path: fixture.toolchain.colmap.path,
@@ -2067,7 +2135,7 @@ final class PipelineIntegrationTests: XCTestCase {
                             ),
                             "1"
                         )
-                        XCTAssertEqual(try self.pairListLines(for: arguments).count, 289)
+                        XCTAssertEqual(try self.pairListLines(for: arguments).count, 622)
                         let databasePath = try XCTUnwrap(
                             self.value(for: "--database_path", in: arguments)
                         )
@@ -2093,7 +2161,7 @@ final class PipelineIntegrationTests: XCTestCase {
             projectPaths: fixture.paths
         ).restoredRecovery()
         XCTAssertEqual(pendingRecovery.mode, .targetedExact)
-        XCTAssertEqual(pendingRecovery.activePlan.pairs.count, 289)
+        XCTAssertEqual(pendingRecovery.activePlan.pairs.count, 622)
         XCTAssertEqual(pendingRecovery.sourcePlan.pairs.count, 1_770)
         XCTAssertEqual(pendingRecovery.attempts.map(\.purpose), [.policy])
         XCTAssertEqual(pendingRecovery.attempts.map(\.artifact.matcher), [.faiss])
@@ -2134,7 +2202,7 @@ final class PipelineIntegrationTests: XCTestCase {
                             ),
                             "1"
                         )
-                        XCTAssertEqual(try self.pairListLines(for: arguments).count, 289)
+                        XCTAssertEqual(try self.pairListLines(for: arguments).count, 622)
                         XCTAssertEqual(
                             try self.matchingRowCounts(
                                 databasePath: fixture.paths.colmapDatabaseURL.path
@@ -2178,7 +2246,7 @@ final class PipelineIntegrationTests: XCTestCase {
             .targetedExactGraphRecovery,
         ])
         XCTAssertEqual(accepted.attempts.map(\.artifact.matcher), [.faiss, .exact])
-        XCTAssertEqual(accepted.attempts.map(\.scheduledPairs.count), [1_770, 289])
+        XCTAssertEqual(accepted.attempts.map(\.scheduledPairs.count), [1_770, 622])
         XCTAssertEqual(accepted.pairListDigest, pendingRecovery.activePlan.sha256)
         XCTAssertFalse(FileManager.default.fileExists(
             atPath: fixture.paths.pairGraphRecoveryURL.path
@@ -2209,14 +2277,14 @@ final class PipelineIntegrationTests: XCTestCase {
                 path: fixture.toolchain.colmap.path,
                 argsPrefix: ["matches_importer"],
                 result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""),
-                onRun: { try self.writeFiftyNinePlusOneFaissResults(for: $0) }
+                onRun: { try self.writeFiftyThreePlusSevenFaissResults(for: $0) }
             ),
             .init(
                 path: fixture.toolchain.colmap.path,
                 argsPrefix: ["matches_importer"],
                 result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""),
                 onRun: { arguments in
-                    XCTAssertEqual(try self.pairListLines(for: arguments).count, 289)
+                    XCTAssertEqual(try self.pairListLines(for: arguments).count, 622)
                     try self.writeVerifiedPairResults(for: arguments, verifiedRows: 0)
                 }
             ),
@@ -5249,7 +5317,8 @@ final class PipelineIntegrationTests: XCTestCase {
     private func makePhotoRecoveryProject(
         in root: URL,
         name: String,
-        photoCount: Int = 60
+        photoCount: Int = 60,
+        photoSelection: PhotoSelection = .useAllValidPhotos
     ) throws -> (
         projectURL: URL,
         paths: ProjectPaths,
@@ -5282,7 +5351,7 @@ final class PipelineIntegrationTests: XCTestCase {
                 requestedRunOptions: RequestedRunOptions(
                     detailProfile: .fast,
                     inputOrdering: .unordered,
-                    photoSelection: .useAllValidPhotos
+                    photoSelection: photoSelection
                 )
             ),
             to: paths.metadataURL
@@ -5391,7 +5460,7 @@ final class PipelineIntegrationTests: XCTestCase {
                             ),
                             "0"
                         )
-                        try self.writeFiftyNinePlusOneFaissResults(for: arguments)
+                        try self.writeFiftyThreePlusSevenFaissResults(for: arguments)
                     }
                 ),
                 .init(
@@ -5411,7 +5480,7 @@ final class PipelineIntegrationTests: XCTestCase {
                             ),
                             "1"
                         )
-                        XCTAssertEqual(try self.pairListLines(for: arguments).count, 289)
+                        XCTAssertEqual(try self.pairListLines(for: arguments).count, 622)
                         try self.writeVerifiedPairResults(for: arguments)
                     }
                 ),
@@ -5428,6 +5497,25 @@ final class PipelineIntegrationTests: XCTestCase {
     private func writeFiftyNinePlusOneFaissResults(
         for arguments: [String]
     ) throws {
+        try writeDominantFaissResults(
+            for: arguments,
+            dominantViewCount: 59
+        )
+    }
+
+    private func writeFiftyThreePlusSevenFaissResults(
+        for arguments: [String]
+    ) throws {
+        try writeDominantFaissResults(
+            for: arguments,
+            dominantViewCount: 53
+        )
+    }
+
+    private func writeDominantFaissResults(
+        for arguments: [String],
+        dominantViewCount: Int
+    ) throws {
         let lines = try pairListLines(for: arguments)
         guard lines.count == 1_770 else {
             throw NSError(domain: "PipelineIntegrationTests", code: 26)
@@ -5435,12 +5523,15 @@ final class PipelineIntegrationTests: XCTestCase {
         let imageNames = Set(lines.flatMap {
             $0.split(whereSeparator: \.isWhitespace).map(String.init)
         }).sorted()
-        guard let isolated = imageNames.last else {
+        guard dominantViewCount > 1,
+              dominantViewCount < imageNames.count else {
             throw NSError(domain: "PipelineIntegrationTests", code: 27)
         }
+        let dominantNames = Set(imageNames.prefix(dominantViewCount))
         let verified = Set(lines.filter { line in
-            !line.split(whereSeparator: \.isWhitespace).map(String.init)
-                .contains(isolated)
+            line.split(whereSeparator: \.isWhitespace)
+                .map(String.init)
+                .allSatisfy(dominantNames.contains)
         }.prefix(230))
         guard verified.count == 230 else {
             throw NSError(domain: "PipelineIntegrationTests", code: 28)

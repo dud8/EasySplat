@@ -2329,13 +2329,22 @@ public final class PipelineRunner: @unchecked Sendable {
                 matchingDurationSeconds += duration
                 latestCompletedPairPlan = pairPlan
                 latestCompletedPairInspection = inspection
-                guard inspection.hasSingleDescriptorBearingComponent else {
+                guard inspection.hasAcceptableDominantVerifiedComponent else {
                     emit(.stageLog(
                         stage: .sfmMatching,
                         line: "Pair graph remained disconnected (\(inspection.connectedComponentCount) components, \(inspection.isolatedViewCount) isolated views).",
                         isError: true
                     ))
                     throw ColmapPairPlanningError.disconnectedVerifiedGraph
+                }
+                let unmatchedViewCount = inspection.isolatedViewCount
+                    - inspection.descriptorlessViewCount
+                if unmatchedViewCount > 0 {
+                    emit(.stageLog(
+                        stage: .sfmMatching,
+                        line: "\(unmatchedViewCount) view\(unmatchedViewCount == 1 ? "" : "s") had no verified overlap and may stay unregistered.",
+                        isError: false
+                    ))
                 }
                 if inspection.descriptorlessViewCount > 0 {
                     emit(.stageLog(

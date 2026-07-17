@@ -4,6 +4,42 @@ import XCTest
 @testable import EasySplatCore
 
 final class ColmapPairGraphInspectorTests: XCTestCase {
+    func testDominantConnectivityPolicyRequiresNinetyPercentAndOnlySingletonOutliers() {
+        XCTAssertEqual(
+            PairGraphConnectivityPolicy.dominantViewCount(
+                totalViewCount: 60,
+                connectedComponentCount: 7,
+                isolatedViewCount: 6,
+                descriptorlessViewCount: 2
+            ),
+            54
+        )
+        XCTAssertNil(PairGraphConnectivityPolicy.dominantViewCount(
+            totalViewCount: 60,
+            connectedComponentCount: 8,
+            isolatedViewCount: 7,
+            descriptorlessViewCount: 0
+        ))
+        XCTAssertNil(PairGraphConnectivityPolicy.dominantViewCount(
+            totalViewCount: 60,
+            connectedComponentCount: 2,
+            isolatedViewCount: 0,
+            descriptorlessViewCount: 0
+        ))
+        XCTAssertNil(PairGraphConnectivityPolicy.dominantViewCount(
+            totalViewCount: 60,
+            connectedComponentCount: 2,
+            isolatedViewCount: 1,
+            descriptorlessViewCount: 2
+        ))
+        XCTAssertNil(PairGraphConnectivityPolicy.dominantViewCount(
+            totalViewCount: 22,
+            connectedComponentCount: 5,
+            isolatedViewCount: 4,
+            descriptorlessViewCount: 0
+        ))
+    }
+
     func testRejectsSymlinkDatabaseWithoutReadingItsTarget() throws {
         let externalDatabase = try makeDatabase(
             imageIDs: [1, 2],
@@ -357,7 +393,7 @@ final class ColmapPairGraphInspectorTests: XCTestCase {
         XCTAssertTrue(result.verifiedGraph.verifiedPairs.isEmpty)
     }
 
-    func testAcceptsDescriptorlessSingletonWithoutHidingRawGraphDisconnection() throws {
+    func testRejectsDescriptorlessSingletonWhenDominantCoverageIsBelowNinetyPercent() throws {
         let databaseURL = try makeDatabase(
             imageIDs: [1, 2, 3],
             descriptorRecords: [(1, 64), (2, 64), (3, 0)],
@@ -377,7 +413,7 @@ final class ColmapPairGraphInspectorTests: XCTestCase {
         XCTAssertEqual(result.connectedComponentCount, 2)
         XCTAssertEqual(result.isolatedViewCount, 1)
         XCTAssertEqual(result.descriptorlessImageNames, [imageName(3)])
-        XCTAssertTrue(result.hasSingleDescriptorBearingComponent)
+        XCTAssertFalse(result.hasAcceptableDominantVerifiedComponent)
     }
 
     func testDescriptorBearingSingletonRemainsDisconnected() throws {
@@ -397,7 +433,7 @@ final class ColmapPairGraphInspectorTests: XCTestCase {
         )
 
         XCTAssertTrue(result.descriptorlessImageNames.isEmpty)
-        XCTAssertFalse(result.hasSingleDescriptorBearingComponent)
+        XCTAssertFalse(result.hasAcceptableDominantVerifiedComponent)
     }
 
     func testDescriptorlessSingletonDoesNotExcuseTwoDescriptorBearingComponents() throws {
@@ -434,7 +470,7 @@ final class ColmapPairGraphInspectorTests: XCTestCase {
 
         XCTAssertEqual(result.descriptorlessImageNames, [imageName(5)])
         XCTAssertEqual(result.connectedComponentCount, 3)
-        XCTAssertFalse(result.hasSingleDescriptorBearingComponent)
+        XCTAssertFalse(result.hasAcceptableDominantVerifiedComponent)
     }
 
     func testRejectsMissingDuplicateNullAndNegativeDescriptorRows() throws {
