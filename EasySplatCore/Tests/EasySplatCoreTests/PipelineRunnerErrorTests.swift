@@ -87,7 +87,7 @@ final class PipelineRunnerErrorTests: XCTestCase {
 
         XCTAssertEqual(
             message.userMessage,
-            "The capture split into separate camera solves. Try again with more overlap."
+            "The scene could not be connected. Keep the subject and surroundings still, and include more shared detail between views."
         )
         XCTAssertTrue(message.debugMessage.contains("selected model 0 registered 226 of 250"))
         XCTAssertTrue(message.debugMessage.contains("credible union registered 249"))
@@ -164,19 +164,26 @@ final class PipelineRunnerErrorTests: XCTestCase {
         XCTAssertTrue(message.debugMessage.contains("Exit code: 10"))
     }
 
-    func testDisconnectedRetrievalGraphOffersCaptureGuidance() {
+    func testDisconnectedSceneFailuresOfferStableCaptureGuidance() {
         let runner = makeRunner()
+        let errors: [Error] = [
+            ColmapPairPlanningError.disconnectedPairSchedule,
+            ColmapPairPlanningError.disconnectedVerifiedGraph,
+            PipelineRunner.PipelineError.geometryCoverageTooLow(registered: 18, total: 22),
+        ]
 
-        let message = runner.test_failureMessages(
+        for error in errors {
+            XCTAssertEqual(
+                runner.test_failureMessages(for: error, stage: .sfmMatching).userMessage,
+                "The scene could not be connected. Keep the subject and surroundings still, and include more shared detail between views."
+            )
+        }
+
+        let verifiedGraph = runner.test_failureMessages(
             for: ColmapPairPlanningError.disconnectedVerifiedGraph,
             stage: .sfmMatching
         )
-
-        XCTAssertEqual(
-            message.userMessage,
-            "The capture did not have enough connected overlap. Try again with more overlap."
-        )
-        XCTAssertTrue(message.debugMessage.contains("pair graph remained disconnected"))
+        XCTAssertTrue(verifiedGraph.debugMessage.contains("pair graph remained disconnected"))
     }
 
     func testRetryDiagnosticEventIncludesCommandTerminationAndLastStderrLine() {
