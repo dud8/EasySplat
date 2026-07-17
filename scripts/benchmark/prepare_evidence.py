@@ -587,6 +587,18 @@ def _derive_one(
             if outcome["kind"] == "environment_rejected"
             else None
         )
+        environment_receipt = (
+            _mapping(
+                _load_json(
+                    environment_path,
+                    "measurement environment receipt",
+                    MAX_OBSERVATIONS_BYTES,
+                ),
+                "measurement environment receipt",
+            )
+            if environment_path is not None
+            else None
+        )
         prepared_path = destination / PREPARED_OUTCOME_NAME
         try:
             prepared_value = evidence.derive_lane_outcome(
@@ -601,6 +613,37 @@ def _derive_one(
             )
         except evidence.EvidenceError as error:
             raise PreparationError(f"raw lane outcome is invalid: {error}") from error
+        if environment_path is not None:
+            assert environment_receipt is not None
+            environment_descriptor = _mapping(
+                prepared_value["environment_receipt"],
+                "prepared environment receipt",
+            )
+            prepared_environment_path = destination / "measurement-environment.json"
+            _copy_control_file(
+                environment_path,
+                prepared_environment_path,
+                environment_descriptor["sha256"],
+            )
+            if _descriptor(prepared_environment_path, destination) != environment_descriptor:
+                raise PreparationError(
+                    "prepared environment receipt does not match its lane outcome"
+                )
+            measurement_environment = _mapping(
+                environment_receipt.get("measurement_environment"),
+                "measurement environment",
+            )
+            monitor_sha256 = measurement_environment.get("monitor_sha256")
+            if (
+                not isinstance(monitor_sha256, str)
+                or not SHA256_PATTERN.fullmatch(monitor_sha256)
+            ):
+                raise PreparationError("measurement environment monitor digest is invalid")
+            _copy_control_file(
+                artifact_root / "host-monitor.json",
+                destination / "host-monitor.json",
+                monitor_sha256,
+            )
     _write_exclusive_json(prepared_path, prepared_value, "prepared evidence")
     return {
         "status": status,

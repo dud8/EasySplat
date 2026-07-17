@@ -6,6 +6,7 @@ from __future__ import annotations
 import copy
 import contextlib
 import os
+import shutil
 import subprocess
 import tempfile
 import unittest
@@ -15,12 +16,16 @@ from unittest import mock
 from scripts.benchmark import aggregate_evidence as aggregate
 from scripts.benchmark import easysplat_benchmark as benchmark
 from scripts.benchmark import evidence_protocol as evidence
+from scripts.benchmark import prepare_evidence as prepare
 from scripts.benchmark.tests.test_benchmark import (
+    FIXTURE_HOST_MONITOR,
     evidence_machine,
     evidence_request,
     raw_observations,
     runner_identity,
     runner_identities,
+    supervisor_run,
+    valid_scene,
     write_evidence_artifacts,
 )
 
@@ -239,6 +244,193 @@ class AggregateEvidenceTests(unittest.TestCase):
                 aggregate._scan_compact_tree(
                     fixture.root,
                     expected | {Path("target.json"), Path("symlink.json")},
+                )
+
+    def test_prepared_environment_rejection_is_self_contained_and_protocol_valid(self) -> None:
+        lane = evidence.LANE_REFERENCE
+        request = evidence_request(scene_id="scene-01", scale=30, lane=lane)
+        runner = runner_identity(lane)
+        machine = evidence_machine(lane)
+        outcome = {
+            "kind": "environment_rejected",
+            "stage": "measurement_environment",
+            "reason": "policy_violation",
+            "exit_code": 0,
+        }
+
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary)
+            fixtures = self.make_roots(base / "prepared")
+            fixture = fixtures[lane]
+            write_json(fixture.request_path, request)
+            fixture.record["request"] = descriptor(fixture.request_path, fixture.root)
+            fixture.record["request_sha256"] = evidence.sha256_file(fixture.request_path)
+
+            raw_root = base / "raw"
+            raw_root.mkdir()
+            (raw_root / "host-monitor.json").write_bytes(FIXTURE_HOST_MONITOR)
+            observations = raw_observations(lane)
+            measurement_environment = supervisor_run(observations)[
+                "measurement_environment"
+            ]
+            measurement_environment["low_power_mode_observed"] = True
+            commands = [
+                {
+                    "run_id": command["run_id"],
+                    "started_monotonic_seconds": command[
+                        "started_monotonic_seconds"
+                    ],
+                    "ended_monotonic_seconds": command["ended_monotonic_seconds"],
+                    "process_cpu_microseconds": command[
+                        "process_cpu_microseconds"
+                    ],
+                }
+                for command in observations["commands"]
+            ]
+            environment_receipt = {
+                "schema_version": 1,
+                "started_monotonic_seconds": min(
+                    command["started_monotonic_seconds"] for command in commands
+                ),
+                "ended_monotonic_seconds": max(
+                    command["ended_monotonic_seconds"] for command in commands
+                )
+                + 1.0,
+                "commands": commands,
+                "measurement_environment": measurement_environment,
+            }
+            write_json(raw_root / "measurement-environment.json", environment_receipt)
+            write_json(
+                raw_root / "collector-status.json",
+                {
+                    "schema_version": 1,
+                    "request_sha256": evidence.sha256_bytes(
+                        evidence.canonical_json_bytes(request)
+                    ),
+                    "lane": lane,
+                    "machine": machine,
+                    "measurement_runner": runner,
+                    "collector": {
+                        "protocol_version": prepare.PROTOCOL_VERSION,
+                        "version": prepare.COLLECTOR_VERSION,
+                        "executable": prepare.COLLECTOR_PATH,
+                        "sha256": evidence.sha256_file(
+                            prepare.REPOSITORY_ROOT / prepare.COLLECTOR_PATH
+                        ),
+                    },
+                    "disposition": "lane_outcome",
+                    "outcome": outcome,
+                },
+            )
+
+            artifact_root = Path(fixture.record["artifact_root"])
+            shutil.rmtree(fixture.prepared_path.parent)
+            derived = prepare._derive_one(
+                request=request,
+                artifact_root=raw_root,
+                lane=lane,
+                runner=runner,
+                compact_root=fixture.root,
+                artifact_relative=artifact_root,
+            )
+            fixture.record.update(
+                {
+                    "collector_status_sha256": derived["status"][
+                        "collector_status_sha256"
+                    ],
+                    "disposition": "lane_outcome",
+                    "outcome": outcome,
+                    "prepared": derived["prepared"],
+                }
+            )
+            fixture.lane_result["collections"][0]["sha256"] = derived["status"][
+                "collector_status_sha256"
+            ]
+            write_json(fixture.root / "lane-result.json", fixture.lane_result)
+            fixture.index["lane_result"] = descriptor(
+                fixture.root / "lane-result.json", fixture.root
+            )
+            fixture.write_index()
+
+            prepared_root = fixture.root / artifact_root
+            outcome_path = prepared_root / "lane-outcome.json"
+            environment_path = prepared_root / "measurement-environment.json"
+            host_monitor_path = prepared_root / "host-monitor.json"
+            self.assertTrue(
+                environment_path.is_file(),
+                "prepared environment rejection must retain its canonical receipt",
+            )
+            self.assertTrue(
+                host_monitor_path.is_file(),
+                "prepared environment rejection must retain its bound host monitor",
+            )
+            expected_environment = artifact_root / "measurement-environment.json"
+            expected_host_monitor = artifact_root / "host-monitor.json"
+            self.assertIn(
+                expected_environment,
+                aggregate._expected_tree_files(fixture.index),
+            )
+            self.assertIn(
+                expected_host_monitor,
+                aggregate._expected_tree_files(fixture.index),
+            )
+            roots, _ = aggregate._load_prepared_roots(
+                [item.root for item in fixtures.values()]
+            )
+            verified = evidence.validate_prepared_lane_outcome_file(
+                outcome_path,
+                request,
+                lane,
+                runner,
+            )
+            self.assertEqual(verified["outcome"], outcome)
+
+            key = ("scene-01", 30, lane)
+            record = {
+                "scene_id": "scene-01",
+                "scale": 30,
+                "lane": lane,
+                "kind": "environment_rejected",
+                "evidence": (artifact_root / "lane-outcome.json").as_posix(),
+                "sha256": derived["prepared"]["sha256"],
+                "bytes": derived["prepared"]["bytes"],
+                "collector_status_sha256": derived["status"][
+                    "collector_status_sha256"
+                ],
+            }
+            scene = valid_scene("scene-01", adapter="protected-evidence")
+            scene["scale_lanes"] = [30]
+            scene["aggregate_scale"] = 30
+            scene["expected_outcome"] = {
+                "kind": "invalid",
+                "failure_type": "insufficient_overlap",
+            }
+            scene["gate_scopes"] = ["invalid_input"]
+            result, _ = aggregate._scene_result(
+                roots,
+                scene,
+                30,
+                {key: record},
+                {key: request},
+                runner_identities(),
+            )
+            self.assertEqual(result["status"], "blocked")
+
+            environment_receipt["measurement_environment"][
+                "low_power_mode_observed"
+            ] = False
+            write_json(environment_path, environment_receipt)
+            with self.assertRaisesRegex(
+                aggregate.AggregationError,
+                "environment receipt",
+            ):
+                aggregate._scene_result(
+                    roots,
+                    scene,
+                    30,
+                    {key: record},
+                    {key: request},
+                    runner_identities(),
                 )
 
     def test_record_lookup_rejects_missing_duplicate_and_reordered_requests(self) -> None:

@@ -389,44 +389,24 @@ def _validate_prepared_attestation(
 
 def _validate_prepared_lane_outcome(
     value: Any,
+    path: Path,
     request: Mapping[str, Any],
     lane: str,
     runner: Mapping[str, Any],
 ) -> dict[str, Any]:
     receipt = _mapping(value, "lane outcome")
-    _exact_keys(
-        receipt,
-        {
-            "schema_version", "request_sha256", "lane", "machine", "producer",
-            "measurement_runner", "outcome", "environment_receipt",
-        },
-        "lane outcome",
-    )
-    validated_request = evidence.validate_request(request)
-    if (
-        receipt["schema_version"] != 1
-        or receipt["lane"] != lane
-        or lane != validated_request["binding"]["lane"]
-        or receipt["request_sha256"]
-        != evidence.sha256_bytes(evidence.canonical_json_bytes(validated_request))
-    ):
-        raise AggregationError("lane outcome request binding is invalid")
-    _validate_producer(receipt["producer"], "lane outcome producer")
-    if evidence.validate_runner_identity(receipt["measurement_runner"], lane) != (
-        evidence.validate_runner_identity(runner, lane)
-    ):
-        raise AggregationError("lane outcome measurement runner is invalid")
-    evidence.validate_machine_lane(_mapping(receipt["machine"], "lane outcome machine"), lane)
-    outcome = evidence._validate_lane_outcome_payload(receipt["outcome"])
-    if outcome["kind"] == "environment_rejected":
-        _validate_descriptor(
-            receipt["environment_receipt"],
-            "lane outcome environment receipt",
-            expected_path="measurement-environment.json",
+    try:
+        validated = evidence.validate_prepared_lane_outcome_file(
+            path,
+            request,
+            lane,
+            runner,
         )
-    elif receipt["environment_receipt"] is not None:
-        raise AggregationError(f"{outcome['kind']} lane outcome cannot carry environment evidence")
-    return dict(receipt)
+    except evidence.EvidenceError as error:
+        raise AggregationError(f"prepared lane outcome is invalid: {error}") from error
+    if dict(validated) != dict(receipt):
+        raise AggregationError("prepared lane outcome changed while it was validated")
+    return dict(validated)
 
 
 def _source_identity(path: str, version: str) -> dict[str, Any]:
@@ -558,6 +538,14 @@ def _expected_tree_files(
         artifact_root = _safe_relative_path(item.get("artifact_root"), "prepared artifact root")
         expected.add(_safe_relative_path(request["path"], "prepared request path"))
         expected.add(artifact_root / _safe_relative_path(prepared["path"], "prepared evidence path"))
+        if item.get("disposition") == "lane_outcome":
+            try:
+                outcome = evidence._validate_lane_outcome_payload(item.get("outcome"))
+            except evidence.EvidenceError as error:
+                raise AggregationError(f"prepared lane outcome is invalid: {error}") from error
+            if outcome["kind"] == "environment_rejected":
+                expected.add(artifact_root / "measurement-environment.json")
+                expected.add(artifact_root / "host-monitor.json")
     return expected
 
 
@@ -839,7 +827,7 @@ def _scene_result(
                     artifacts[output_name] = descriptor["sha256"]
         else:
             outcome_receipt = _validate_prepared_lane_outcome(
-                value, requests[key], lane, runners[lane]
+                value, path, requests[key], lane, runners[lane]
             )
             receipts.append(outcome_receipt)
             outcome = outcome_receipt["outcome"]
