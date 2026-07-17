@@ -31,6 +31,8 @@ DENSIFICATION_MEMORY_PATCH="$ROOT/Tools/MsplatNative/msplat-1.1.3-densification-
 DENSIFICATION_MEMORY_PATCH_SHA256="b429540372d807f280929ebba1670257990bd36b28dfee5b42bc377ccef60ac7"
 ROW_SPAN_CULLING_PATCH="$ROOT/Tools/MsplatNative/msplat-1.1.3-row-span-culling.patch"
 ROW_SPAN_CULLING_PATCH_SHA256="481c4c9a70f1da5eb1590b20a64e25a3c64bb3c19f14e27996ab9b25a119594d"
+GEOMETRY_ADAM_FUSION_PATCH="$ROOT/Tools/MsplatNative/msplat-1.1.3-geometry-adam-fusion.patch"
+GEOMETRY_ADAM_FUSION_PATCH_SHA256="927ad1fdbffee7ad762396c7acc965cd4a20da781f172240c62aa94f41e1cd2c"
 TILE_SPAN_TEST_ROOT="$ROOT/Tools/MsplatNative/TileSpanTests"
 RASTER_TEST_FIXTURES="$BUILD_DIR/raster-test-fixtures"
 
@@ -81,6 +83,7 @@ reject_raster_test_symbols() {
     msplat_set_exact_capacity_limit_for_testing \
     msplat_set_raster_memory_budget_for_testing \
     msplat_set_tile_culling_min_area_for_testing \
+    msplat_set_geometry_adam_fusion_enabled_for_testing \
     msplat_fail_next_sync_for_testing \
     msplat_pending_exact_raster_timing_handlers_for_testing \
     msplat_gpu_ticks_to_seconds_for_testing \
@@ -135,6 +138,10 @@ preflight() {
   [ -f "$ROW_SPAN_CULLING_PATCH" ] || die "missing row-span culling patch: $ROW_SPAN_CULLING_PATCH"
   [ "$(sha256 "$ROW_SPAN_CULLING_PATCH")" = "$ROW_SPAN_CULLING_PATCH_SHA256" ] \
     || die "row-span culling patch SHA-256 mismatch"
+  [ -f "$GEOMETRY_ADAM_FUSION_PATCH" ] \
+    || die "missing geometry-Adam fusion patch: $GEOMETRY_ADAM_FUSION_PATCH"
+  [ "$(sha256 "$GEOMETRY_ADAM_FUSION_PATCH")" = "$GEOMETRY_ADAM_FUSION_PATCH_SHA256" ] \
+    || die "geometry-Adam fusion patch SHA-256 mismatch"
   for source in \
     "$TILE_SPAN_TEST_ROOT/include/tile_culling.hpp" \
     "$TILE_SPAN_TEST_ROOT/include/gpu_tile_culling.hpp" \
@@ -234,6 +241,8 @@ prepare_source() {
   git -C "$SOURCE_DIR" apply "$DENSIFICATION_MEMORY_PATCH"
   git -C "$SOURCE_DIR" apply --check "$ROW_SPAN_CULLING_PATCH"
   git -C "$SOURCE_DIR" apply "$ROW_SPAN_CULLING_PATCH"
+  git -C "$SOURCE_DIR" apply --check "$GEOMETRY_ADAM_FUSION_PATCH"
+  git -C "$SOURCE_DIR" apply "$GEOMETRY_ADAM_FUSION_PATCH"
 }
 
 configure_and_build() {
@@ -284,7 +293,7 @@ configure_and_build() {
 write_build_info() {
   local executable_sha256="$1"
   local metallib_sha256="$2"
-  local build_info compiler cmake_version ninja_version timestamp overlay_sha256 raster_test_sha256 patch_sha256 checkpoint_patch_sha256 numeric_stability_patch_sha256 metal_safety_patch_sha256 exact_raster_patch_sha256 stage_timing_patch_sha256 memory_efficiency_patch_sha256 densification_memory_patch_sha256 row_span_culling_patch_sha256
+  local build_info compiler cmake_version ninja_version timestamp overlay_sha256 raster_test_sha256 patch_sha256 checkpoint_patch_sha256 numeric_stability_patch_sha256 metal_safety_patch_sha256 exact_raster_patch_sha256 stage_timing_patch_sha256 memory_efficiency_patch_sha256 densification_memory_patch_sha256 row_span_culling_patch_sha256 geometry_adam_fusion_patch_sha256
   build_info="$STAGE_DIR/build_info.json"
   compiler="$(xcrun clang++ --version | head -n 1)"
   cmake_version="$(cmake --version | head -n 1)"
@@ -301,10 +310,11 @@ write_build_info() {
   memory_efficiency_patch_sha256="$(sha256 "$MEMORY_EFFICIENCY_PATCH")"
   densification_memory_patch_sha256="$(sha256 "$DENSIFICATION_MEMORY_PATCH")"
   row_span_culling_patch_sha256="$(sha256 "$ROW_SPAN_CULLING_PATCH")"
+  geometry_adam_fusion_patch_sha256="$(sha256 "$GEOMETRY_ADAM_FUSION_PATCH")"
 
   python3 - "$build_info" \
     "$MSPLAT_REPO" "$MSPLAT_COMMIT" "$MSPLAT_VERSION" "$SOURCE_TREE_SHA256" \
-    "$overlay_sha256" "$raster_test_sha256" "$patch_sha256" "$checkpoint_patch_sha256" "$numeric_stability_patch_sha256" "$metal_safety_patch_sha256" "$exact_raster_patch_sha256" "$stage_timing_patch_sha256" "$memory_efficiency_patch_sha256" "$densification_memory_patch_sha256" "$row_span_culling_patch_sha256" \
+    "$overlay_sha256" "$raster_test_sha256" "$patch_sha256" "$checkpoint_patch_sha256" "$numeric_stability_patch_sha256" "$metal_safety_patch_sha256" "$exact_raster_patch_sha256" "$stage_timing_patch_sha256" "$memory_efficiency_patch_sha256" "$densification_memory_patch_sha256" "$row_span_culling_patch_sha256" "$geometry_adam_fusion_patch_sha256" \
     "$NLOHMANN_JSON_SHA256" "$NANOFLANN_SHA256" "$CLI11_SHA256" \
     "$executable_sha256" "$metallib_sha256" \
     "$compiler" "$cmake_version" "$ninja_version" "$timestamp" <<'PY'
@@ -328,6 +338,7 @@ import sys
     memory_efficiency_patch_sha256,
     densification_memory_patch_sha256,
     row_span_culling_patch_sha256,
+    geometry_adam_fusion_patch_sha256,
     nlohmann_json_sha256,
     nanoflann_sha256,
     cli11_sha256,
@@ -356,6 +367,7 @@ payload = {
     "memory_efficiency_patch_sha256": memory_efficiency_patch_sha256,
     "densification_memory_patch_sha256": densification_memory_patch_sha256,
     "row_span_culling_patch_sha256": row_span_culling_patch_sha256,
+    "geometry_adam_fusion_patch_sha256": geometry_adam_fusion_patch_sha256,
     "dependencies": {
         "nlohmann_json_v3.11.3_sha256": nlohmann_json_sha256,
         "nanoflann_v1.5.5_sha256": nanoflann_sha256,

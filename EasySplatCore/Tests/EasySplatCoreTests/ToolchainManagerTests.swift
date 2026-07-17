@@ -476,6 +476,7 @@ final class ToolchainManagerTests: XCTestCase {
             "memory_efficiency_patch_sha256",
             "densification_memory_patch_sha256",
             "row_span_culling_patch_sha256",
+            "geometry_adam_fusion_patch_sha256",
         ] {
             for mutation in ["missing", "malformed"] {
                 let root = try TestFileBuilder.makeTempDir()
@@ -518,6 +519,7 @@ final class ToolchainManagerTests: XCTestCase {
             "memory_efficiency_patch_sha256",
             "densification_memory_patch_sha256",
             "row_span_culling_patch_sha256",
+            "geometry_adam_fusion_patch_sha256",
         ] {
             let root = try TestFileBuilder.makeTempDir()
             defer { try? FileManager.default.removeItem(at: root) }

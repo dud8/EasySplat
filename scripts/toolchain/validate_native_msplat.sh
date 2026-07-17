@@ -27,6 +27,7 @@ reject_raster_test_symbols() {
     msplat_set_exact_execution_capacity_for_testing \
     msplat_set_exact_capacity_limit_for_testing \
     msplat_set_raster_memory_budget_for_testing \
+    msplat_set_geometry_adam_fusion_enabled_for_testing \
     msplat_fail_next_sync_for_testing \
     msplat_pending_exact_raster_timing_handlers_for_testing \
     msplat_gpu_ticks_to_seconds_for_testing \
@@ -103,6 +104,7 @@ expected_keys = {
     "densification_memory_patch_sha256",
     "exact_raster_patch_sha256",
     "executable_sha256",
+    "geometry_adam_fusion_patch_sha256",
     "metallib_sha256",
     "metal_safety_patch_sha256",
     "memory_efficiency_patch_sha256",
@@ -135,7 +137,7 @@ exact_values = {
     "source_version": "1.1.3",
     "source_tree_sha256": "866fd6d051b5cf98ca08ae1552236473f504d8f13756cbda68201e48532c3e6a",
     "overlay_sha256": "cfefabcf9366571241e5a0923ae35fa3b8b263d6d024a87485bccc2e842ad29e",
-    "raster_test_sha256": "8c3905839c31685cb836d75cc5bef1188c8e370bcab99dfe7a7696acd814ef46",
+    "raster_test_sha256": "55a20875f031e5d5425c0efc4ebea2bff5adb03bee23001c7ee2a86738d75588",
     "patch_sha256": "fafbf6f43a3be474a708607a903fc0dbb0029a4d4664c261a1ebaf301f3e9f3f",
     "checkpoint_patch_sha256": "c8b9a8dd03afb4bc50b8a12adf78dc46f5280d67bb62823c58aff2305a4870dc",
     "numeric_stability_patch_sha256": "231586b17e4f47c8c55432a631e08bf293b31a92f8d6ec49b367d11632350ec3",
@@ -145,6 +147,7 @@ exact_values = {
     "memory_efficiency_patch_sha256": "bfacc105454e80102139f120dd6375037360c6a9763f1e1f708aa2a7f22eca6c",
     "densification_memory_patch_sha256": "b429540372d807f280929ebba1670257990bd36b28dfee5b42bc377ccef60ac7",
     "row_span_culling_patch_sha256": "481c4c9a70f1da5eb1590b20a64e25a3c64bb3c19f14e27996ab9b25a119594d",
+    "geometry_adam_fusion_patch_sha256": "927ad1fdbffee7ad762396c7acc965cd4a20da781f172240c62aa94f41e1cd2c",
     "deployment_target": "macOS 15.0",
     "build_configuration": "Release",
 }
@@ -191,6 +194,7 @@ for key in (
     "memory_efficiency_patch_sha256",
     "densification_memory_patch_sha256",
     "row_span_culling_patch_sha256",
+    "geometry_adam_fusion_patch_sha256",
     "raster_test_sha256",
     "executable_sha256",
     "metallib_sha256",

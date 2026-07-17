@@ -16,6 +16,7 @@ STAGE_TIMING_PATCH="$ROOT/Tools/MsplatNative/msplat-1.1.3-stage-timing.patch"
 MEMORY_EFFICIENCY_PATCH="$ROOT/Tools/MsplatNative/msplat-1.1.3-memory-efficiency.patch"
 DENSIFICATION_MEMORY_PATCH="$ROOT/Tools/MsplatNative/msplat-1.1.3-densification-memory.patch"
 ROW_SPAN_CULLING_PATCH="$ROOT/Tools/MsplatNative/msplat-1.1.3-row-span-culling.patch"
+GEOMETRY_ADAM_FUSION_PATCH="$ROOT/Tools/MsplatNative/msplat-1.1.3-geometry-adam-fusion.patch"
 TILE_SPAN_TEST_ROOT="$ROOT/Tools/MsplatNative/TileSpanTests"
 FIXTURE_GENERATOR="$ROOT/scripts/ci/generate_msplat_sparse_fixtures.py"
 VALIDATOR="$ROOT/scripts/toolchain/validate_native_msplat.sh"
@@ -59,6 +60,7 @@ require_file "$STAGE_TIMING_PATCH"
 require_file "$MEMORY_EFFICIENCY_PATCH"
 require_file "$DENSIFICATION_MEMORY_PATCH"
 require_file "$ROW_SPAN_CULLING_PATCH"
+require_file "$GEOMETRY_ADAM_FUSION_PATCH"
 for source in \
   "$TILE_SPAN_TEST_ROOT/include/tile_culling.hpp" \
   "$TILE_SPAN_TEST_ROOT/include/gpu_tile_culling.hpp" \
@@ -156,6 +158,40 @@ require_contains 'determinant_lower = nextafter' "$ROW_SPAN_CULLING_PATCH"
 require_contains '8.0f * FLT_EPSILON * determinant_scale' "$ROW_SPAN_CULLING_PATCH"
 require_absent 'ellipse_intersects_pixel_tile' "$ROW_SPAN_CULLING_PATCH"
 require_absent 'min(4.5' "$ROW_SPAN_CULLING_PATCH"
+require_contains 'msplat-1.1.3-geometry-adam-fusion.patch' "$BUILD_SCRIPT"
+require_contains 'GEOMETRY_ADAM_FUSION_PATCH_SHA256="927ad1fdbffee7ad762396c7acc965cd4a20da781f172240c62aa94f41e1cd2c"' "$BUILD_SCRIPT"
+actual_geometry_adam_fusion_patch_sha256="$(shasum -a 256 "$GEOMETRY_ADAM_FUSION_PATCH" | awk '{print $1}')"
+[ "$actual_geometry_adam_fusion_patch_sha256" = "927ad1fdbffee7ad762396c7acc965cd4a20da781f172240c62aa94f41e1cd2c" ] \
+  || fail "geometry-Adam fusion patch SHA-256 mismatch"
+require_contains '[ "$(sha256 "$GEOMETRY_ADAM_FUSION_PATCH")" = "$GEOMETRY_ADAM_FUSION_PATCH_SHA256" ]' "$BUILD_SCRIPT"
+require_contains 'git -C "$SOURCE_DIR" apply --check "$GEOMETRY_ADAM_FUSION_PATCH"' "$BUILD_SCRIPT"
+require_contains 'git -C "$SOURCE_DIR" apply "$GEOMETRY_ADAM_FUSION_PATCH"' "$BUILD_SCRIPT"
+require_contains 'geometry_adam_fusion_patch_sha256' "$BUILD_SCRIPT"
+require_contains '"geometry_adam_fusion_patch_sha256": "927ad1fdbffee7ad762396c7acc965cd4a20da781f172240c62aa94f41e1cd2c"' "$VALIDATOR"
+require_contains 'project_geometry_adam_backward_kernel' "$GEOMETRY_ADAM_FUSION_PATCH"
+require_contains 'sh_adam_backward_kernel' "$GEOMETRY_ADAM_FUSION_PATCH"
+require_contains 'msplat_set_geometry_adam_fusion_enabled_for_testing' "$RASTER_TEST_SOURCE"
+for symbol_contract in "$BUILD_SCRIPT" "$VALIDATOR"; do
+  require_contains 'msplat_set_geometry_adam_fusion_enabled_for_testing' "$symbol_contract"
+done
+require_contains 'geometryAdamShDegreeInterval = 4' "$RASTER_TEST_SOURCE"
+require_contains 'makeModel(inputData, geometryAdamShDegreeInterval)' "$RASTER_TEST_SOURCE"
+require_contains 'requireNonzeroDegree("coefficients", snapshot.colorsRest, degree)' "$RASTER_TEST_SOURCE"
+require_contains 'requireNonzeroDegree("first_moment", snapshot.colorRestFirstMoment, degree)' "$RASTER_TEST_SOURCE"
+require_contains 'requireNonzeroDegree("second_moment", snapshot.colorRestSecondMoment, degree)' "$RASTER_TEST_SOURCE"
+require_contains 'requireSphericalHarmonicStateExercised("geometry_adam_common", fused)' "$RASTER_TEST_SOURCE"
+require_contains 'requireSphericalHarmonicStateExercised("geometry_adam_exact", exactFused)' "$RASTER_TEST_SOURCE"
+require_contains '"geometry_adam_checkpoint_prefix", checkpointPrefix' "$RASTER_TEST_SOURCE"
+require_contains 'requireSphericalHarmonicStateExercised("geometry_adam_checkpoint_resume", resumed)' "$RASTER_TEST_SOURCE"
+require_contains 'requireModelNear("geometry_adam_checkpoint_resume", fused, resumed)' "$RASTER_TEST_SOURCE"
+require_contains 'TemporaryCheckpoint' "$RASTER_TEST_SOURCE"
+require_contains '::mkstemp' "$RASTER_TEST_SOURCE"
+require_contains 'geometry_adam_checkpoint_resume' "$RASTER_TEST_SOURCE"
+require_contains 'geometry_adam_fusion_parity' "$RASTER_TEST_SOURCE"
+require_contains 'verifyGeometryAdamFusionParity(argv[2]);' "$RASTER_TEST_SOURCE"
+require_contains '--geometry-adam-benchmark' "$RASTER_TEST_SOURCE"
+# Performance sampling is an opt-in diagnostic. CI gates deterministic parity and dispatch contracts.
+require_absent '--geometry-adam-benchmark' "$BUILD_SCRIPT"
 require_contains 'testThreeSigmaCapIsNotRasterExact' "$TILE_SPAN_TEST_ROOT/tests/tile_culling_tests.cpp"
 require_contains 'for (int sample = 0; sample < 200000; ++sample)' "$TILE_SPAN_TEST_ROOT/tests/tile_culling_tests.cpp"
 require_contains 'cases.reserve(200003)' "$TILE_SPAN_TEST_ROOT/tests/gpu_tile_culling_tests.mm"
@@ -191,8 +227,10 @@ for contract_file in "$SWIFT_VALIDATOR" "$SWIFT_FIXTURE"; do
   require_contains 'memory_efficiency_patch_sha256' "$contract_file"
   require_contains 'densification_memory_patch_sha256' "$contract_file"
   require_contains 'row_span_culling_patch_sha256' "$contract_file"
+  require_contains 'geometry_adam_fusion_patch_sha256' "$contract_file"
   require_contains 'raster_test_sha256' "$contract_file"
   require_contains 'MSPLAT_BUILD_RASTER_TESTS=ON' "$contract_file"
+  require_contains '"raster_test_sha256": "55a20875f031e5d5425c0efc4ebea2bff5adb03bee23001c7ee2a86738d75588"' "$contract_file"
 done
 require_contains 'scene_bounds_status' "$SWIFT_VALIDATOR"
 require_contains 'python3 - "$build_info"' "$BUILD_SCRIPT"
@@ -423,6 +461,7 @@ for symbol in \
   msplat_set_exact_execution_capacity_for_testing \
   msplat_set_exact_capacity_limit_for_testing \
   msplat_set_raster_memory_budget_for_testing \
+  msplat_set_geometry_adam_fusion_enabled_for_testing \
   msplat_fail_next_sync_for_testing \
   msplat_pending_exact_raster_timing_handlers_for_testing \
   msplat_gpu_ticks_to_seconds_for_testing \
@@ -591,7 +630,7 @@ set -e
 [ ! -s "$negative_dir/truncated-ply.stdout" ] || fail "truncated PLY emitted a false success event"
 grep -qi 'payload' "$negative_dir/truncated-ply.stderr" || fail "truncated PLY diagnostic is not useful"
 
-for key in source_commit source_version source_url source_tree_sha256 overlay_sha256 raster_test_sha256 patch_sha256 checkpoint_patch_sha256 numeric_stability_patch_sha256 metal_safety_patch_sha256 exact_raster_patch_sha256 stage_timing_patch_sha256 memory_efficiency_patch_sha256 densification_memory_patch_sha256 row_span_culling_patch_sha256 executable_sha256 metallib_sha256 compiler deployment_target cmake_arguments build_timestamp; do
+for key in source_commit source_version source_url source_tree_sha256 overlay_sha256 raster_test_sha256 patch_sha256 checkpoint_patch_sha256 numeric_stability_patch_sha256 metal_safety_patch_sha256 exact_raster_patch_sha256 stage_timing_patch_sha256 memory_efficiency_patch_sha256 densification_memory_patch_sha256 row_span_culling_patch_sha256 geometry_adam_fusion_patch_sha256 executable_sha256 metallib_sha256 compiler deployment_target cmake_arguments build_timestamp; do
   require_contains "\"$key\"" "$BUILD_INFO"
 done
 overlay_hash="$(shasum -a 256 "$OVERLAY" | awk '{print $1}')"
@@ -602,10 +641,11 @@ stage_timing_patch_hash="$(shasum -a 256 "$STAGE_TIMING_PATCH" | awk '{print $1}
 memory_efficiency_patch_hash="$(shasum -a 256 "$MEMORY_EFFICIENCY_PATCH" | awk '{print $1}')"
 densification_memory_patch_hash="$(shasum -a 256 "$DENSIFICATION_MEMORY_PATCH" | awk '{print $1}')"
 row_span_culling_patch_hash="$(shasum -a 256 "$ROW_SPAN_CULLING_PATCH" | awk '{print $1}')"
+geometry_adam_fusion_patch_hash="$(shasum -a 256 "$GEOMETRY_ADAM_FUSION_PATCH" | awk '{print $1}')"
 raster_test_hash="$(shasum -a 256 "$RASTER_TEST_SOURCE" | awk '{print $1}')"
 exe_hash="$(shasum -a 256 "$BIN" | awk '{print $1}')"
 metallib_hash="$(shasum -a 256 "$METALLIB" | awk '{print $1}')"
-python3 - "$BUILD_INFO" "$overlay_hash" "$numeric_stability_patch_hash" "$metal_safety_patch_hash" "$exact_raster_patch_hash" "$stage_timing_patch_hash" "$memory_efficiency_patch_hash" "$densification_memory_patch_hash" "$row_span_culling_patch_hash" "$raster_test_hash" "$exe_hash" "$metallib_hash" <<'PY'
+python3 - "$BUILD_INFO" "$overlay_hash" "$numeric_stability_patch_hash" "$metal_safety_patch_hash" "$exact_raster_patch_hash" "$stage_timing_patch_hash" "$memory_efficiency_patch_hash" "$densification_memory_patch_hash" "$row_span_culling_patch_hash" "$geometry_adam_fusion_patch_hash" "$raster_test_hash" "$exe_hash" "$metallib_hash" <<'PY'
 import json
 import sys
 
@@ -627,9 +667,10 @@ expected = {
     "memory_efficiency_patch_sha256": sys.argv[7],
     "densification_memory_patch_sha256": sys.argv[8],
     "row_span_culling_patch_sha256": sys.argv[9],
-    "raster_test_sha256": sys.argv[10],
-    "executable_sha256": sys.argv[11],
-    "metallib_sha256": sys.argv[12],
+    "geometry_adam_fusion_patch_sha256": sys.argv[10],
+    "raster_test_sha256": sys.argv[11],
+    "executable_sha256": sys.argv[12],
+    "metallib_sha256": sys.argv[13],
 }
 for key, value in expected.items():
     if payload.get(key) != value:

@@ -2,12 +2,16 @@
 #include <chrono>
 #include <cmath>
 #include <cstdint>
+#include <cstdlib>
+#include <filesystem>
 #include <iostream>
 #include <limits>
 #include <stdexcept>
 #include <string>
 #include <tuple>
 #include <vector>
+
+#include <unistd.h>
 
 #include "bindings.h"
 #include "loaders.hpp"
@@ -16,9 +20,11 @@
 namespace {
 
 constexpr std::uint64_t memoryBudgetBytes = 512ULL * 1024ULL * 1024ULL;
+constexpr std::uint64_t benchmarkMemoryBudgetBytes = 8ULL * 1024ULL * 1024ULL * 1024ULL;
 constexpr float relativeTolerance = 2.0e-3f;
 constexpr float absoluteTolerance = 2.0e-4f;
 constexpr int stageTimingIterations = 512;
+constexpr int geometryAdamShDegreeInterval = 4;
 
 void requireRelativeNear(
     const std::string &label,
@@ -170,14 +176,24 @@ struct RasterResult {
 
 struct ModelSnapshot {
     std::vector<float> positions;
-    std::vector<float> colors;
+    std::vector<float> scales;
+    std::vector<float> quaternions;
+    std::vector<float> colorsDc;
+    std::vector<float> colorsRest;
     std::vector<float> opacities;
     std::vector<float> positionFirstMoment;
     std::vector<float> positionSecondMoment;
-    std::vector<float> colorFirstMoment;
-    std::vector<float> colorSecondMoment;
+    std::vector<float> scaleFirstMoment;
+    std::vector<float> scaleSecondMoment;
+    std::vector<float> quaternionFirstMoment;
+    std::vector<float> quaternionSecondMoment;
+    std::vector<float> colorDcFirstMoment;
+    std::vector<float> colorDcSecondMoment;
+    std::vector<float> colorRestFirstMoment;
+    std::vector<float> colorRestSecondMoment;
     std::vector<float> opacityFirstMoment;
     std::vector<float> opacitySecondMoment;
+    std::vector<float> rendered;
 };
 
 std::vector<float> copyTensor(const MTensor &tensor) {
@@ -185,7 +201,7 @@ std::vector<float> copyTensor(const MTensor &tensor) {
     return std::vector<float>(values, values + tensor.numel());
 }
 
-Model makeModel(const InputData &inputData) {
+Model makeModel(const InputData &inputData, int shDegreeInterval = 1000) {
     constexpr float background[3] = {0.0f, 0.0f, 0.0f};
     return Model(
         inputData,
@@ -193,7 +209,7 @@ Model makeModel(const InputData &inputData) {
         0,
         3000,
         3,
-        1000,
+        shDegreeInterval,
         100,
         500,
         30,
@@ -206,6 +222,42 @@ Model makeModel(const InputData &inputData) {
         background
     );
 }
+
+class TemporaryCheckpoint {
+public:
+    TemporaryCheckpoint() {
+        const std::string pattern = (
+            std::filesystem::temp_directory_path() /
+            "easysplat-geometry-adam-parity.XXXXXX"
+        ).string();
+        std::vector<char> writablePattern(pattern.begin(), pattern.end());
+        writablePattern.push_back('\0');
+        const int descriptor = ::mkstemp(writablePattern.data());
+        if (descriptor == -1) {
+            throw std::runtime_error("could not create a unique geometry-Adam checkpoint");
+        }
+        path_ = writablePattern.data();
+        if (::close(descriptor) != 0) {
+            std::error_code ignored;
+            std::filesystem::remove(path_, ignored);
+            path_.clear();
+            throw std::runtime_error("could not close the temporary geometry-Adam checkpoint");
+        }
+    }
+
+    ~TemporaryCheckpoint() {
+        std::error_code ignored;
+        std::filesystem::remove(path_, ignored);
+    }
+
+    TemporaryCheckpoint(const TemporaryCheckpoint &) = delete;
+    TemporaryCheckpoint &operator=(const TemporaryCheckpoint &) = delete;
+
+    const std::filesystem::path &path() const { return path_; }
+
+private:
+    std::filesystem::path path_;
+};
 
 void verifyDensificationScratchLifecycle(const std::string &dataset) {
     cleanup_msplat_metal();
@@ -268,17 +320,27 @@ void enqueueStep(Model &model, Camera &camera, int step, std::size_t cameraIndex
     msplat_commit();
 }
 
-ModelSnapshot snapshotModel(const Model &model) {
+ModelSnapshot snapshotModel(const Model &model, const MTensor *rendered = nullptr) {
     return ModelSnapshot {
         copyTensor(model.means),
+        copyTensor(model.scales),
+        copyTensor(model.quats),
         copyTensor(model.featuresDc),
+        copyTensor(model.featuresRest),
         copyTensor(model.opacities),
         copyTensor(model.adam_exp_avg[0]),
         copyTensor(model.adam_exp_avg_sq[0]),
+        copyTensor(model.adam_exp_avg[1]),
+        copyTensor(model.adam_exp_avg_sq[1]),
+        copyTensor(model.adam_exp_avg[2]),
+        copyTensor(model.adam_exp_avg_sq[2]),
         copyTensor(model.adam_exp_avg[3]),
         copyTensor(model.adam_exp_avg_sq[3]),
+        copyTensor(model.adam_exp_avg[4]),
+        copyTensor(model.adam_exp_avg_sq[4]),
         copyTensor(model.adam_exp_avg[5]),
         copyTensor(model.adam_exp_avg_sq[5]),
+        rendered == nullptr ? std::vector<float> {} : copyTensor(*rendered),
     };
 }
 
@@ -413,7 +475,10 @@ void requireModelNear(
     const ModelSnapshot &candidate
 ) {
     requireNear(label + "_positions", reference.positions, candidate.positions);
-    requireNear(label + "_colors", reference.colors, candidate.colors);
+    requireNear(label + "_scales", reference.scales, candidate.scales);
+    requireNear(label + "_quaternions", reference.quaternions, candidate.quaternions);
+    requireNear(label + "_colors_dc", reference.colorsDc, candidate.colorsDc);
+    requireNear(label + "_colors_rest", reference.colorsRest, candidate.colorsRest);
     requireNear(label + "_opacities", reference.opacities, candidate.opacities);
     requireNear(
         label + "_position_first_moment",
@@ -426,14 +491,44 @@ void requireModelNear(
         candidate.positionSecondMoment
     );
     requireNear(
-        label + "_color_first_moment",
-        reference.colorFirstMoment,
-        candidate.colorFirstMoment
+        label + "_scale_first_moment",
+        reference.scaleFirstMoment,
+        candidate.scaleFirstMoment
     );
     requireNear(
-        label + "_color_second_moment",
-        reference.colorSecondMoment,
-        candidate.colorSecondMoment
+        label + "_scale_second_moment",
+        reference.scaleSecondMoment,
+        candidate.scaleSecondMoment
+    );
+    requireNear(
+        label + "_quaternion_first_moment",
+        reference.quaternionFirstMoment,
+        candidate.quaternionFirstMoment
+    );
+    requireNear(
+        label + "_quaternion_second_moment",
+        reference.quaternionSecondMoment,
+        candidate.quaternionSecondMoment
+    );
+    requireNear(
+        label + "_color_dc_first_moment",
+        reference.colorDcFirstMoment,
+        candidate.colorDcFirstMoment
+    );
+    requireNear(
+        label + "_color_dc_second_moment",
+        reference.colorDcSecondMoment,
+        candidate.colorDcSecondMoment
+    );
+    requireNear(
+        label + "_color_rest_first_moment",
+        reference.colorRestFirstMoment,
+        candidate.colorRestFirstMoment
+    );
+    requireNear(
+        label + "_color_rest_second_moment",
+        reference.colorRestSecondMoment,
+        candidate.colorRestSecondMoment
     );
     requireNear(
         label + "_opacity_first_moment",
@@ -445,6 +540,171 @@ void requireModelNear(
         reference.opacitySecondMoment,
         candidate.opacitySecondMoment
     );
+    if (!reference.rendered.empty() || !candidate.rendered.empty()) {
+        requireNear(label + "_rendered", reference.rendered, candidate.rendered);
+    }
+}
+
+void requireSphericalHarmonicStateExercised(
+    const std::string &label,
+    const ModelSnapshot &snapshot
+) {
+    constexpr std::size_t colorChannels = 3;
+    constexpr std::size_t basesWithoutDc = 15;
+    constexpr std::size_t pointStride = basesWithoutDc * colorChannels;
+
+    const auto requireNonzeroDegree = [&](
+        const std::string &stateLabel,
+        const std::vector<float> &values,
+        int degree
+    ) {
+        if (values.empty() || values.size() % pointStride != 0) {
+            throw std::runtime_error(label + "_" + stateLabel + " has an invalid SH shape");
+        }
+        const std::size_t firstBasis = static_cast<std::size_t>(degree * degree - 1);
+        const std::size_t basisCount = static_cast<std::size_t>(2 * degree + 1);
+        const std::size_t firstValue = firstBasis * colorChannels;
+        const std::size_t valueCount = basisCount * colorChannels;
+        bool foundNonzero = false;
+        for (std::size_t point = 0; point < values.size(); point += pointStride) {
+            for (std::size_t offset = 0; offset < valueCount; ++offset) {
+                const float value = values[point + firstValue + offset];
+                if (!std::isfinite(value)) {
+                    throw std::runtime_error(
+                        label + "_" + stateLabel + " contains a non-finite value"
+                    );
+                }
+                foundNonzero = foundNonzero || value != 0.0f;
+            }
+        }
+        if (!foundNonzero) {
+            throw std::runtime_error(
+                label + "_" + stateLabel + " did not exercise SH degree " +
+                std::to_string(degree)
+            );
+        }
+    };
+
+    for (int degree = 1; degree <= 3; ++degree) {
+        requireNonzeroDegree("coefficients", snapshot.colorsRest, degree);
+        requireNonzeroDegree("first_moment", snapshot.colorRestFirstMoment, degree);
+        requireNonzeroDegree("second_moment", snapshot.colorRestSecondMoment, degree);
+    }
+}
+
+std::uint64_t primeExactWorkspace(
+    Model &model,
+    Camera &camera,
+    int probeIteration,
+    std::size_t cameraIndex
+);
+
+ModelSnapshot runGeometryAdamWindow(
+    const std::string &dataset,
+    bool fused,
+    bool forceExact,
+    int firstStep,
+    int lastStep,
+    const std::string &resumeCheckpoint = {}
+) {
+    cleanup_msplat_metal();
+    msplat_set_raster_memory_budget_bytes(memoryBudgetBytes);
+    msplat_set_raster_fallback_count(0);
+    msplat_set_force_exact_for_testing(forceExact);
+    msplat_set_geometry_adam_fusion_enabled_for_testing(fused);
+
+    ModelSnapshot snapshot;
+    {
+        InputData inputData = inputDataFromX(dataset);
+        if (inputData.cameras.empty()) {
+            throw std::runtime_error("geometry-Adam parity fixture has no camera");
+        }
+        Camera &camera = inputData.cameras.front();
+        Model model = makeModel(inputData, geometryAdamShDegreeInterval);
+        if (!resumeCheckpoint.empty()) {
+            const int loadedStep = model.loadCheckpoint(resumeCheckpoint);
+            if (loadedStep != firstStep - 1) {
+                throw std::runtime_error("geometry-Adam checkpoint resumed at the wrong step");
+            }
+        }
+        if (forceExact && resumeCheckpoint.empty()) {
+            (void)primeExactWorkspace(model, camera, 1, 0);
+        }
+        for (int step = firstStep; step <= lastStep; ++step) {
+            enqueueStep(model, camera, step, 0);
+        }
+        msplat_gpu_sync_for_raster_replay();
+        Camera &renderCamera = forceExact ? camera : inputData.cameras.back();
+        MTensor rendered = model.render(renderCamera, lastStep);
+        msplat_commit();
+        msplat_gpu_sync();
+        snapshot = snapshotModel(model, &rendered);
+    }
+    cleanup_msplat_metal();
+    return snapshot;
+}
+
+ModelSnapshot runGeometryAdamCheckpointPrefix(
+    const std::string &dataset,
+    bool fused,
+    int lastStep,
+    const std::string &checkpoint
+) {
+    cleanup_msplat_metal();
+    msplat_set_raster_memory_budget_bytes(memoryBudgetBytes);
+    msplat_set_raster_fallback_count(0);
+    msplat_set_force_exact_for_testing(false);
+    msplat_set_geometry_adam_fusion_enabled_for_testing(fused);
+
+    ModelSnapshot snapshot;
+    {
+        InputData inputData = inputDataFromX(dataset);
+        Camera &camera = inputData.cameras.front();
+        Model model = makeModel(inputData, geometryAdamShDegreeInterval);
+        for (int step = 1; step <= lastStep; ++step) {
+            enqueueStep(model, camera, step, 0);
+        }
+        model.saveCheckpoint(checkpoint, lastStep);
+        snapshot = snapshotModel(model);
+    }
+    cleanup_msplat_metal();
+    return snapshot;
+}
+
+void verifyGeometryAdamFusionParity(const std::string &dataset) {
+    constexpr int lastStep = 24;
+    const ModelSnapshot legacy = runGeometryAdamWindow(
+        dataset, false, false, 1, lastStep
+    );
+    const ModelSnapshot fused = runGeometryAdamWindow(
+        dataset, true, false, 1, lastStep
+    );
+    requireSphericalHarmonicStateExercised("geometry_adam_common", fused);
+    requireModelNear("geometry_adam_common", legacy, fused);
+
+    const ModelSnapshot exactLegacy = runGeometryAdamWindow(
+        dataset, false, true, 1, lastStep
+    );
+    const ModelSnapshot exactFused = runGeometryAdamWindow(
+        dataset, true, true, 1, lastStep
+    );
+    requireSphericalHarmonicStateExercised("geometry_adam_exact", exactFused);
+    requireModelNear("geometry_adam_exact", exactLegacy, exactFused);
+
+    const TemporaryCheckpoint checkpoint;
+    constexpr int checkpointStep = 12;
+    const ModelSnapshot checkpointPrefix = runGeometryAdamCheckpointPrefix(
+        dataset, true, checkpointStep, checkpoint.path().string()
+    );
+    requireSphericalHarmonicStateExercised(
+        "geometry_adam_checkpoint_prefix", checkpointPrefix
+    );
+    const ModelSnapshot resumed = runGeometryAdamWindow(
+        dataset, true, false, checkpointStep + 1, lastStep, checkpoint.path().string()
+    );
+    requireSphericalHarmonicStateExercised("geometry_adam_checkpoint_resume", resumed);
+    requireModelNear("geometry_adam_checkpoint_resume", fused, resumed);
+    std::cout << "geometry_adam_fusion_parity passed\n";
 }
 
 double benchmarkCommonPath(const std::string &dataset, bool exactDispatchEnabled) {
@@ -484,6 +744,66 @@ double benchmarkCommonPath(const std::string &dataset, bool exactDispatchEnabled
     }
     cleanup_msplat_metal();
     return elapsed;
+}
+
+double median(std::vector<double> values);
+
+double benchmarkGeometryAdamPath(const std::string &dataset, bool fused) {
+    cleanup_msplat_metal();
+    msplat_set_raster_memory_budget_bytes(benchmarkMemoryBudgetBytes);
+    msplat_set_raster_fallback_count(0);
+    msplat_set_geometry_adam_fusion_enabled_for_testing(fused);
+
+    double elapsed = 0;
+    {
+        InputData inputData = inputDataFromX(dataset);
+        Camera &camera = inputData.cameras.front();
+        camera.loadImage(1.0f);
+        Model model = makeModel(inputData);
+        MTensor target = camera.getGPUImage(1);
+
+        constexpr int warmupSteps = 100;
+        constexpr int measuredSteps = 1000;
+        for (int step = 1; step <= warmupSteps; ++step) {
+            model.fullIteration(camera, step, target, 0.2f);
+            msplat_commit();
+        }
+        msplat_gpu_sync();
+        const auto started = std::chrono::steady_clock::now();
+        for (int step = warmupSteps + 1; step <= warmupSteps + measuredSteps; ++step) {
+            model.fullIteration(camera, step, target, 0.2f);
+            msplat_commit();
+        }
+        msplat_gpu_sync();
+        elapsed = std::chrono::duration<double>(
+            std::chrono::steady_clock::now() - started
+        ).count();
+        const MsplatRasterStats stats = msplat_get_raster_stats();
+        if (stats.fallback_count != 0 || stats.dropped_intersection_count != 0) {
+            throw std::runtime_error("geometry-Adam benchmark left the common raster path");
+        }
+    }
+    cleanup_msplat_metal();
+    return elapsed;
+}
+
+void benchmarkGeometryAdamFusion(const std::string &dataset) {
+    std::vector<double> legacySamples;
+    std::vector<double> fusedSamples;
+    for (int sample = 0; sample < 5; ++sample) {
+        if (sample % 2 == 0) {
+            legacySamples.push_back(benchmarkGeometryAdamPath(dataset, false));
+            fusedSamples.push_back(benchmarkGeometryAdamPath(dataset, true));
+        } else {
+            fusedSamples.push_back(benchmarkGeometryAdamPath(dataset, true));
+            legacySamples.push_back(benchmarkGeometryAdamPath(dataset, false));
+        }
+    }
+    const double legacyMedian = median(legacySamples);
+    const double fusedMedian = median(fusedSamples);
+    std::cout << "geometry_adam_legacy_seconds=" << legacyMedian
+              << " fused_seconds=" << fusedMedian
+              << " speedup=" << legacyMedian / fusedMedian << '\n';
 }
 
 double median(std::vector<double> values) {
@@ -608,6 +928,7 @@ void verifySharedAllocationBudget(const std::string &dataset) {
     msplat_set_raster_memory_budget_bytes(memoryBudgetBytes);
     msplat_set_raster_fallback_count(0);
     msplat_set_force_exact_for_testing(true);
+    msplat_set_geometry_adam_fusion_enabled_for_testing(true);
     {
         InputData inputData = inputDataFromX(dataset);
         Camera &camera = inputData.cameras.front();
@@ -682,6 +1003,7 @@ ModelSnapshot runSingleCameraWindow(
     msplat_set_raster_memory_budget_bytes(memoryBudgetBytes);
     msplat_set_raster_fallback_count(0);
     msplat_set_force_exact_for_testing(true);
+    msplat_set_geometry_adam_fusion_enabled_for_testing(true);
 
     ModelSnapshot snapshot;
     {
@@ -759,6 +1081,7 @@ void verifyDeterministicWindowReplay(const std::string &dataset) {
     msplat_set_raster_memory_budget_bytes(memoryBudgetBytes);
     msplat_set_raster_fallback_count(0);
     msplat_set_force_exact_for_testing(true);
+    msplat_set_geometry_adam_fusion_enabled_for_testing(true);
     ModelSnapshot shortReference;
     {
         InputData inputData = inputDataFromX(dataset);
@@ -1056,6 +1379,7 @@ ModelSnapshot runIncreasingWindow(const std::string &dataset, bool replay) {
     msplat_set_raster_memory_budget_bytes(memoryBudgetBytes);
     msplat_set_raster_fallback_count(0);
     msplat_set_force_exact_for_testing(true);
+    msplat_set_geometry_adam_fusion_enabled_for_testing(true);
 
     ModelSnapshot snapshot;
     {
@@ -1310,6 +1634,7 @@ void verifyGPUCapacityFailure(const std::string &dataset) {
 void verifyStageTiming(const std::string &dataset) {
     verifyTimestampMath();
     cleanup_msplat_metal();
+    msplat_set_geometry_adam_fusion_enabled_for_testing(true);
     msplat_enable_gpu_timing(true);
     msplat_enable_stage_profiling_for_testing();
 
@@ -1445,6 +1770,10 @@ void verifyStageTiming(const std::string &dataset) {
 
 int main(int argc, char **argv) {
     try {
+        if (argc == 3 && std::string(argv[1]) == "--geometry-adam-benchmark") {
+            benchmarkGeometryAdamFusion(argv[2]);
+            return 0;
+        }
         if (argc == 3 && std::string(argv[1]) == "--stage-timing") {
             verifyStageTiming(argv[2]);
             return 0;
@@ -1454,7 +1783,8 @@ int main(int argc, char **argv) {
                 "usage: msplat-raster-tests <parity dataset> <mixed-resolution dataset> "
                 "<overflow dataset> <broad-overflow dataset> "
                 "<increasing-overflow dataset> <exact-budget dataset>\n"
-                "       msplat-raster-tests --stage-timing <profile dataset>"
+                "       msplat-raster-tests --stage-timing <profile dataset>\n"
+                "       msplat-raster-tests --geometry-adam-benchmark <dataset>"
             );
         }
         const std::string dataset = argv[1];
@@ -1544,6 +1874,7 @@ int main(int argc, char **argv) {
         if (enabledMedian > allowed) {
             throw std::runtime_error("zero-group exact dispatch materially slowed the common path");
         }
+        verifyGeometryAdamFusionParity(argv[2]);
         verifyDensificationScratchLifecycle(dataset);
         verifyMixedResolutionGrowth(argv[2]);
         verifyExactOnlyBudgetEvidence(argv[6]);
