@@ -19,7 +19,7 @@ on:
         type: string
 
 permissions:
-  contents: write
+  contents: read
   actions: read
 
 concurrency:
@@ -27,10 +27,14 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  release:
+  build-and-test:
     if: github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
-    runs-on: [self-hosted, macOS, ARM64, easysplat-release]
-    environment: public-beta-release
+    runs-on: [self-hosted, macOS, ARM64, easysplat-release, easysplat-ephemeral]
+    outputs:
+      build_artifact_id: ${{ steps.upload-build.outputs.artifact-id }}
+      build_artifact_digest: ${{ format('sha256:{0}', steps.upload-build.outputs.artifact-digest) }}
+      benchmark_artifact_id: ${{ steps.benchmark-identity.outputs.artifact_id }}
+      benchmark_artifact_digest: ${{ steps.benchmark-identity.outputs.artifact_digest }}
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
@@ -40,12 +44,13 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: Verify protected source and existing tag
+      - name: Verify protected source, tag, and repository policy
         env:
           GH_TOKEN: ${{ github.token }}
           DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
           INPUT_VERSION: ${{ inputs.version }}
           INPUT_TOOLCHAIN_VERSION: ${{ inputs.toolchain_version }}
+          INPUT_BENCHMARK_RUN_ID: ${{ inputs.benchmark_run_id }}
         run: |
           semver_re='^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]+)?$'
           VERSION="$INPUT_VERSION"
@@ -58,22 +63,17 @@ jobs:
             echo "Invalid toolchain semantic version: $TOOLCHAIN_VERSION" >&2
             exit 1
           fi
-          CURRENT_HEAD="$(gh api "repos/$GITHUB_REPOSITORY/commits/$DEFAULT_BRANCH" --jq .sha)"
-          if [ "$GITHUB_SHA" != "$CURRENT_HEAD" ]; then
-            echo "Public beta releases must use the current protected $DEFAULT_BRANCH commit." >&2
+          if ! [[ "$INPUT_BENCHMARK_RUN_ID" =~ ^[1-9][0-9]*$ ]]; then
+            echo "Benchmark run ID must be a positive integer." >&2
             exit 1
           fi
-          if [ "$(gh api "repos/$GITHUB_REPOSITORY/immutable-releases" --jq .enabled)" != "true" ]; then
-            echo "Enable GitHub Immutable Releases before publishing the public beta." >&2
-            exit 1
-          fi
+          CURRENT_HEAD="$(gh api -H "X-GitHub-Api-Version: 2026-03-10" "repos/$GITHUB_REPOSITORY/commits/$DEFAULT_BRANCH" --jq .sha)"
+          test "$GITHUB_SHA" = "$CURRENT_HEAD"
+          test -z "$(git status --porcelain)"
           TAG="v$VERSION"
-          TAG_COMMIT="$(git rev-parse "$TAG^{commit}" 2>/dev/null || true)"
-          if [ "$TAG_COMMIT" != "$GITHUB_SHA" ]; then
-            echo "Create $TAG on the reviewed main commit before starting this workflow." >&2
-            exit 1
-          fi
-          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+          test "$(git rev-parse "$TAG^{commit}")" = "$GITHUB_SHA"
+          test "$(gh api -H "X-GitHub-Api-Version: 2026-03-10" "repos/$GITHUB_REPOSITORY/commits/$TAG" --jq .sha)" = "$GITHUB_SHA"
+          if gh api -H "X-GitHub-Api-Version: 2026-03-10" "repos/$GITHUB_REPOSITORY/releases/tags/$TAG" >/dev/null 2>&1; then
             echo "Release $TAG already exists and will not be overwritten." >&2
             exit 1
           fi
@@ -82,6 +82,7 @@ jobs:
             echo "TAG=$TAG"
             echo "TOOLCHAIN_VERSION=$TOOLCHAIN_VERSION"
             echo "TOOLCHAIN_TAG=toolchain-v$TOOLCHAIN_VERSION"
+            echo "BENCHMARK_RUN_ID=$INPUT_BENCHMARK_RUN_ID"
           } >>"$GITHUB_ENV"
 
       - name: Select Xcode 16.4
@@ -92,29 +93,42 @@ jobs:
           sudo xcode-select -s /Applications/Xcode_16.4.app
           test "$(xcodebuild -version | sed -n '1s/^Xcode //p')" = "16.4"
 
+      - name: Run source gates
+        run: |
+          ./scripts/test.sh
+          swift test --package-path Tools/ManifestTool
+          ./scripts/test_python_tools.sh
+          ./scripts/ci/check_repo_health.sh
+          ./scripts/ci/test_release_scripts.sh
+          find scripts -type f -name '*.sh' -print0 | xargs -0 -n1 bash -n
+          git ls-files -z 'scripts/*.sh' 'scripts/**/*.sh' | xargs -0 shellcheck
+          actionlint
+          gitleaks git --redact
+
       - name: Fetch signed toolchain closure
         env:
           GH_TOKEN: ${{ github.token }}
-          TOOLCHAIN_PUBLIC_KEY_BASE64: ${{ secrets.TOOLCHAIN_PUBLIC_KEY_BASE64 }}
         run: |
-          test -n "$TOOLCHAIN_PUBLIC_KEY_BASE64"
-          TRACKED_PUBLIC_KEY="$(tr -d '[:space:]' <EasySplatApp/Resources/public_key_ed25519.txt)"
-          if [ "$TOOLCHAIN_PUBLIC_KEY_BASE64" != "$TRACKED_PUBLIC_KEY" ]; then
-            echo "TOOLCHAIN_PUBLIC_KEY_BASE64 does not match the reviewed app trust root." >&2
-            exit 1
-          fi
+          test -s EasySplatApp/Resources/public_key_ed25519.txt
           rm -rf Toolchains/out
           mkdir -p Toolchains/out
           gh release download "$TOOLCHAIN_TAG" \
             --repo "$GITHUB_REPOSITORY" \
             --dir Toolchains/out \
             --pattern manifest.json \
+            --pattern toolchain-release-request.json \
+            --pattern authority-envelope.json \
+            --pattern authority-receipt.json \
             --pattern "toolchain-macos-arm64-$TOOLCHAIN_VERSION-core.zip" \
             --pattern "toolchain-geometry-da3-base-$TOOLCHAIN_VERSION.zip" \
             --pattern "toolchain-geometry-da3-small-$TOOLCHAIN_VERSION.zip"
           mv Toolchains/out/manifest.json Toolchains/manifest.json
-          printf '%s' "$TRACKED_PUBLIC_KEY" >Toolchains/public_key_ed25519.txt
-          unset TOOLCHAIN_PUBLIC_KEY_BASE64 TRACKED_PUBLIC_KEY
+          install -m 0644 \
+            EasySplatApp/Resources/public_key_ed25519.txt \
+            Toolchains/public_key_ed25519.txt
+          cmp -s \
+            EasySplatApp/Resources/public_key_ed25519.txt \
+            Toolchains/public_key_ed25519.txt
 
       - name: Build unsigned public beta
         run: |
@@ -130,12 +144,11 @@ jobs:
             --use-existing-toolchain \
             --unsigned-beta
 
-      - name: Verify beta artifacts
+      - name: Verify beta artifacts and cached offline use
         env:
           RELEASE_FIXTURE: ${{ vars.EASYSPLAT_RELEASE_FIXTURE }}
         run: |
-          test -n "$RELEASE_FIXTURE"
-          test -e "$RELEASE_FIXTURE"
+          test -n "$RELEASE_FIXTURE" && test -e "$RELEASE_FIXTURE"
           swift build -c release --product EasySplatReleaseVerifier
           CACHE_ROOT="$RUNNER_TEMP/easysplat-release-toolchains"
           rm -rf "$CACHE_ROOT"
@@ -154,7 +167,7 @@ jobs:
             --da3-small-archive "Toolchains/out/toolchain-geometry-da3-small-$TOOLCHAIN_VERSION.zip" \
             --fixture "$RELEASE_FIXTURE" \
             --manifest-url "$BASE_URL/manifest.json" \
-            --public-key-file Toolchains/public_key_ed25519.txt \
+            --public-key-file EasySplatApp/Resources/public_key_ed25519.txt \
             --toolchain-root "$CACHE_ROOT" \
             --e2e-runner .build/release/EasySplatReleaseVerifier \
             --offline-cache-root "$CACHE_ROOT" \
@@ -178,65 +191,6 @@ jobs:
           path: ${{ runner.temp }}/easysplat-ui-verification
           if-no-files-found: warn
           retention-days: 30
-
-      - name: Consume and reverify protected benchmark evidence
-        env:
-          RELEASE_CORPUS: ${{ vars.EASYSPLAT_RELEASE_CORPUS }}
-          EVIDENCE_KEY_BASE64: ${{ secrets.BENCHMARK_EVIDENCE_KEY_BASE64 }}
-          INPUT_BENCHMARK_RUN_ID: ${{ inputs.benchmark_run_id }}
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          test -n "$RELEASE_CORPUS"
-          test -f "$RELEASE_CORPUS"
-          test -n "$EVIDENCE_KEY_BASE64"
-          test -n "$INPUT_BENCHMARK_RUN_ID"
-          RUN_API="repos/$GITHUB_REPOSITORY/actions/runs/$INPUT_BENCHMARK_RUN_ID"
-          test "$(gh api "$RUN_API" --jq .head_sha)" = "$GITHUB_SHA"
-          test "$(gh api "$RUN_API" --jq .event)" = "workflow_dispatch"
-          test "$(gh api "$RUN_API" --jq .conclusion)" = "success"
-          test "$(gh api "$RUN_API" --jq '.path | split("@")[0]')" = ".github/workflows/benchmark-release.yml"
-          BENCHMARK_ARTIFACT="$RUNNER_TEMP/easysplat-benchmark-artifact"
-          rm -rf "$BENCHMARK_ARTIFACT"
-          mkdir -p "$BENCHMARK_ARTIFACT"
-          gh run download "$INPUT_BENCHMARK_RUN_ID" \
-            --repo "$GITHUB_REPOSITORY" \
-            --name "easysplat-benchmark-$GITHUB_SHA" \
-            --dir "$BENCHMARK_ARTIFACT"
-          test -f "$BENCHMARK_ARTIFACT/suite.json"
-          test -d "$BENCHMARK_ARTIFACT/evidence"
-          umask 077
-          trap 'rm -f "$RUNNER_TEMP/evidence.key"' EXIT
-          python3 - "$RUNNER_TEMP/evidence.key" <<'PY'
-          import base64, os, pathlib, sys
-          pathlib.Path(sys.argv[1]).write_bytes(base64.b64decode(os.environ["EVIDENCE_KEY_BASE64"], validate=True))
-          PY
-          unset EVIDENCE_KEY_BASE64
-          BENCHMARK_OUTPUT="$RUNNER_TEMP/easysplat-release-benchmark"
-          rm -rf "$BENCHMARK_OUTPUT"
-          scripts/benchmark/run_suite.sh \
-            --profile release \
-            --corpus "$RELEASE_CORPUS" \
-            --toolchain-root "$RUNNER_TEMP/easysplat-release-toolchains/$TOOLCHAIN_VERSION" \
-            --evidence-root "$BENCHMARK_ARTIFACT/evidence" \
-            --evidence-key-file "$RUNNER_TEMP/evidence.key" \
-            --request-index "$BENCHMARK_ARTIFACT/requests/index.json" \
-            --output "$BENCHMARK_OUTPUT"
-          python3 - "$BENCHMARK_ARTIFACT/suite.json" "$BENCHMARK_OUTPUT/suite.json" <<'PY'
-          import json, os, sys
-          recorded = json.load(open(sys.argv[1], encoding="utf-8"))
-          verified = json.load(open(sys.argv[2], encoding="utf-8"))
-          for field in ("status", "app_version", "toolchain_identity", "thresholds_digest", "corpus_digest", "scene_results", "aggregates"):
-              if recorded[field] != verified[field]:
-                  raise SystemExit(f"downloaded benchmark field changed during reverification: {field}")
-          if (
-              verified["status"] != "passed"
-              or verified["git"]["commit"] != os.environ["GITHUB_SHA"]
-              or verified["app_version"] != os.environ["VERSION"]
-          ):
-              raise SystemExit("benchmark evidence is not bound to this release commit")
-          PY
-          cp "$BENCHMARK_OUTPUT/suite.json" \
-            "release/DMG/EasySplat-$VERSION-benchmark.json"
 
       - name: Validate SPDX 2.3 output independently
         run: |
@@ -272,102 +226,422 @@ jobs:
             --only-fixed \
             --fail-on high
 
-      - name: Record trusted release asset hashes
-        run: |
-          LOCAL_ASSET_HASHES="$RUNNER_TEMP/app-release-assets.sha256"
-          (
-            cd release/DMG
-            shasum -a 256 \
-              "EasySplat-$VERSION-unsigned.dmg" \
-              "EasySplat-$VERSION-unsigned.dmg.sha256" \
-              "EasySplat-$VERSION.provenance.json" \
-              "EasySplat-$VERSION.spdx.json" \
-              "EasySplat-$VERSION-licenses.zip" \
-              "EasySplat-$VERSION-dSYM.zip" \
-              "EasySplat-$VERSION-benchmark.json"
-          ) >"$LOCAL_ASSET_HASHES"
-          test "$(wc -l <"$LOCAL_ASSET_HASHES" | tr -d '[:space:]')" = "7"
-
-      - name: Create immutable draft prerelease
-        uses: softprops/action-gh-release@b4309332981a82ec1c5618f44dd2e27cc8bfbfda # v3.0.0
-        with:
-          tag_name: ${{ env.TAG }}
-          prerelease: true
-          draft: true
-          overwrite_files: false
-          fail_on_unmatched_files: true
-          token: ${{ github.token }}
-          generate_release_notes: false
-          body_path: release/DMG/EasySplat-${{ env.VERSION }}-release-notes.txt
-          files: |
-            release/DMG/EasySplat-${{ env.VERSION }}-unsigned.dmg
-            release/DMG/EasySplat-${{ env.VERSION }}-unsigned.dmg.sha256
-            release/DMG/EasySplat-${{ env.VERSION }}.provenance.json
-            release/DMG/EasySplat-${{ env.VERSION }}.spdx.json
-            release/DMG/EasySplat-${{ env.VERSION }}-licenses.zip
-            release/DMG/EasySplat-${{ env.VERSION }}-dSYM.zip
-            release/DMG/EasySplat-${{ env.VERSION }}-benchmark.json
-
-      - name: Verify downloaded draft assets
+      - name: Bind the successful benchmark artifact
+        id: benchmark-identity
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          REMOTE="$RUNNER_TEMP/app-release-download"
-          LOCAL_ASSET_HASHES="$RUNNER_TEMP/app-release-assets.sha256"
-          rm -rf "$REMOTE"
-          mkdir -p "$REMOTE"
-          gh release download "$TAG" \
-            --repo "$GITHUB_REPOSITORY" \
-            --dir "$REMOTE" \
-            --pattern "EasySplat-$VERSION-unsigned.dmg" \
-            --pattern "EasySplat-$VERSION-unsigned.dmg.sha256" \
-            --pattern "EasySplat-$VERSION.provenance.json" \
-            --pattern "EasySplat-$VERSION.spdx.json" \
-            --pattern "EasySplat-$VERSION-licenses.zip" \
-            --pattern "EasySplat-$VERSION-dSYM.zip" \
-            --pattern "EasySplat-$VERSION-benchmark.json"
-          test -s "$LOCAL_ASSET_HASHES"
-          (cd "$REMOTE" && shasum -a 256 -c "$LOCAL_ASSET_HASHES")
-          (cd "$REMOTE" && shasum -a 256 -c "EasySplat-$VERSION-unsigned.dmg.sha256")
-          python3 scripts/release/generate_release_metadata.py verify \
+          RUN_API="repos/$GITHUB_REPOSITORY/actions/runs/$BENCHMARK_RUN_ID"
+          test "$(gh api -H "X-GitHub-Api-Version: 2026-03-10" "$RUN_API" --jq .head_sha)" = "$GITHUB_SHA"
+          test "$(gh api -H "X-GitHub-Api-Version: 2026-03-10" "$RUN_API" --jq .event)" = "workflow_dispatch"
+          test "$(gh api -H "X-GitHub-Api-Version: 2026-03-10" "$RUN_API" --jq .conclusion)" = "success"
+          test "$(gh api -H "X-GitHub-Api-Version: 2026-03-10" "$RUN_API" --jq '.path | split("@")[0]')" = ".github/workflows/benchmark-release.yml"
+          EXPECTED_NAME="easysplat-benchmark-$GITHUB_SHA"
+          ARTIFACT_IDS="$(gh api -H "X-GitHub-Api-Version: 2026-03-10" --paginate "$RUN_API/artifacts" \
+            --jq ".artifacts[] | select(.name == \"$EXPECTED_NAME\" and .expired == false) | .id")"
+          test "$(printf '%s\n' "$ARTIFACT_IDS" | sed '/^$/d' | wc -l | tr -d '[:space:]')" = "1"
+          ARTIFACT_ID="$(printf '%s\n' "$ARTIFACT_IDS" | sed '/^$/d')"
+          ARTIFACT_DIGEST="$(gh api -H "X-GitHub-Api-Version: 2026-03-10" "repos/$GITHUB_REPOSITORY/actions/artifacts/$ARTIFACT_ID" --jq .digest)"
+          [[ "$ARTIFACT_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]
+          {
+            echo "artifact_id=$ARTIFACT_ID"
+            echo "artifact_digest=$ARTIFACT_DIGEST"
+          } >>"$GITHUB_OUTPUT"
+
+      - name: Download bound benchmark artifact
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          run-id: ${{ inputs.benchmark_run_id }}
+          github-token: ${{ github.token }}
+          artifact-ids: ${{ steps.benchmark-identity.outputs.artifact_id }}
+          path: ${{ runner.temp }}/bound-benchmark
+
+      - name: Confirm compact benchmark closure is present
+        run: |
+          test -f "$RUNNER_TEMP/bound-benchmark/suite.json"
+          test -f "$RUNNER_TEMP/bound-benchmark/evidence/reference_m4_max/prepared-index.json"
+          test -f "$RUNNER_TEMP/bound-benchmark/evidence/constrained_14_16gb/prepared-index.json"
+          test -f "$RUNNER_TEMP/bound-benchmark/evidence/eight_gb_fast/prepared-index.json"
+
+      - name: Create exact build bundle
+        run: |
+          BUILD_BUNDLE="$RUNNER_TEMP/easysplat-build-bundle"
+          rm -rf "$BUILD_BUNDLE"
+          mkdir -p "$BUILD_BUNDLE"
+          install -m 0644 "release/DMG/EasySplat-$VERSION-unsigned.dmg" "$BUILD_BUNDLE/"
+          install -m 0644 "release/DMG/EasySplat-$VERSION-unsigned.dmg.sha256" "$BUILD_BUNDLE/"
+          install -m 0644 "release/DMG/EasySplat-$VERSION.provenance.json" "$BUILD_BUNDLE/"
+          install -m 0644 "release/DMG/EasySplat-$VERSION.spdx.json" "$BUILD_BUNDLE/"
+          install -m 0644 "release/DMG/EasySplat-$VERSION-licenses.zip" "$BUILD_BUNDLE/"
+          install -m 0644 "release/DMG/EasySplat-$VERSION-dSYM.zip" "$BUILD_BUNDLE/"
+          install -m 0644 "release/DMG/EasySplat-$VERSION-release-notes.txt" "$BUILD_BUNDLE/"
+          install -m 0644 Toolchains/manifest.json "$BUILD_BUNDLE/toolchain-manifest.json"
+          install -m 0644 \
+            Toolchains/out/toolchain-release-request.json \
+            "$BUILD_BUNDLE/toolchain-release-request.json"
+          install -m 0644 \
+            Toolchains/out/authority-envelope.json \
+            "$BUILD_BUNDLE/toolchain-authority-envelope.json"
+          install -m 0644 \
+            Toolchains/out/authority-receipt.json \
+            "$BUILD_BUNDLE/toolchain-authority-receipt.json"
+          python3 scripts/release/verify_publication_bundle.py create-build-closure \
+            --bundle "$BUILD_BUNDLE" \
             --app-version "$VERSION" \
             --toolchain-version "$TOOLCHAIN_VERSION" \
-            --release-mode unsigned-beta \
-            --source-url "https://github.com/$GITHUB_REPOSITORY" \
+            --source-repository "$GITHUB_REPOSITORY" \
             --source-commit "$GITHUB_SHA" \
-            --dmg "$REMOTE/EasySplat-$VERSION-unsigned.dmg" \
-            --manifest Toolchains/manifest.json \
-            --core "Toolchains/out/toolchain-macos-arm64-$TOOLCHAIN_VERSION-core.zip" \
-            --da3-base "Toolchains/out/toolchain-geometry-da3-base-$TOOLCHAIN_VERSION.zip" \
-            --da3-small "Toolchains/out/toolchain-geometry-da3-small-$TOOLCHAIN_VERSION.zip" \
-            --app-license LICENSE \
-            --notice NOTICE.md \
-            --viewer-license ThirdParty/MetalSplatter/LICENSE \
-            --provenance "$REMOTE/EasySplat-$VERSION.provenance.json" \
-            --spdx "$REMOTE/EasySplat-$VERSION.spdx.json" \
-            --licenses "$REMOTE/EasySplat-$VERSION-licenses.zip"
-          "$RUNNER_TEMP/spdx-tools/bin/pyspdxtools" \
-            -i "$REMOTE/EasySplat-$VERSION.spdx.json"
-          unzip -tq "$REMOTE/EasySplat-$VERSION-dSYM.zip"
-          REMOTE_DSYM_ROOT="$RUNNER_TEMP/app-release-dsym"
-          rm -rf "$REMOTE_DSYM_ROOT"
-          mkdir -p "$REMOTE_DSYM_ROOT"
-          ditto -x -k "$REMOTE/EasySplat-$VERSION-dSYM.zip" "$REMOTE_DSYM_ROOT"
-          REMOTE_DSYM="$REMOTE_DSYM_ROOT/EasySplat.app.dSYM"
-          test -d "$REMOTE_DSYM"
-          APP_UUIDS="$(xcrun dwarfdump --uuid \
-            build/Export/EasySplat.app/Contents/MacOS/EasySplatApp)"
-          DSYM_UUIDS="$(xcrun dwarfdump --uuid "$REMOTE_DSYM")"
-          test "$(awk '/^UUID: / { count += 1 } END { print count + 0 }' <<<"$APP_UUIDS")" = "1"
-          test "$(awk '/^UUID: / { count += 1 } END { print count + 0 }' <<<"$DSYM_UUIDS")" = "1"
-          test "$(awk '/^UUID: / { print $2 " " $3 }' <<<"$APP_UUIDS")" = \
-            "$(awk '/^UUID: / { print $2 " " $3 }' <<<"$DSYM_UUIDS")"
+            --tag "$TAG" \
+            --benchmark-run-id "$BENCHMARK_RUN_ID" \
+            --benchmark-artifact-id "${{ steps.benchmark-identity.outputs.artifact_id }}" \
+            --benchmark-artifact-digest "${{ steps.benchmark-identity.outputs.artifact_digest }}"
 
-      - name: Publish verified prerelease
+      - name: Upload exact build bundle
+        id: upload-build
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: easysplat-build-${{ github.sha }}
+          path: ${{ runner.temp }}/easysplat-build-bundle
+          if-no-files-found: error
+          retention-days: 7
+
+  verify-publication:
+    needs: build-and-test
+    runs-on: macos-15
+    outputs:
+      publication_artifact_id: ${{ steps.upload-publication.outputs.artifact-id }}
+      publication_artifact_digest: ${{ format('sha256:{0}', steps.upload-publication.outputs.artifact-digest) }}
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+          ref: ${{ github.sha }}
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: "3.12"
+
+      - name: Reverify protected source and artifact identities
         env:
           GH_TOKEN: ${{ github.token }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+          BUILD_ARTIFACT_ID: ${{ needs.build-and-test.outputs.build_artifact_id }}
+          BUILD_ARTIFACT_DIGEST: ${{ needs.build-and-test.outputs.build_artifact_digest }}
+          BENCHMARK_ARTIFACT_ID: ${{ needs.build-and-test.outputs.benchmark_artifact_id }}
+          BENCHMARK_ARTIFACT_DIGEST: ${{ needs.build-and-test.outputs.benchmark_artifact_digest }}
         run: |
-          RELEASE_ID="$(gh api "repos/$GITHUB_REPOSITORY/releases/tags/$TAG" --jq .id)"
-          gh api --method PATCH "repos/$GITHUB_REPOSITORY/releases/$RELEASE_ID" \
+          test "$(gh api -H "X-GitHub-Api-Version: 2026-03-10" "repos/$GITHUB_REPOSITORY/commits/$DEFAULT_BRANCH" --jq .sha)" = "$GITHUB_SHA"
+          test "$(git rev-parse "v${{ inputs.version }}^{commit}")" = "$GITHUB_SHA"
+          test "$(gh api -H "X-GitHub-Api-Version: 2026-03-10" "repos/$GITHUB_REPOSITORY/commits/v${{ inputs.version }}" --jq .sha)" = "$GITHUB_SHA"
+          test -z "$(git status --porcelain)"
+          BUILD_API="repos/$GITHUB_REPOSITORY/actions/artifacts/$BUILD_ARTIFACT_ID"
+          test "$(gh api -H "X-GitHub-Api-Version: 2026-03-10" "$BUILD_API" --jq .expired)" = "false"
+          test "$(gh api -H "X-GitHub-Api-Version: 2026-03-10" "$BUILD_API" --jq .digest)" = "$BUILD_ARTIFACT_DIGEST"
+          test "$(gh api -H "X-GitHub-Api-Version: 2026-03-10" "$BUILD_API" --jq .workflow_run.head_sha)" = "$GITHUB_SHA"
+          BENCHMARK_API="repos/$GITHUB_REPOSITORY/actions/artifacts/$BENCHMARK_ARTIFACT_ID"
+          test "$(gh api -H "X-GitHub-Api-Version: 2026-03-10" "$BENCHMARK_API" --jq .expired)" = "false"
+          test "$(gh api -H "X-GitHub-Api-Version: 2026-03-10" "$BENCHMARK_API" --jq .digest)" = "$BENCHMARK_ARTIFACT_DIGEST"
+          test "$(gh api -H "X-GitHub-Api-Version: 2026-03-10" "$BENCHMARK_API" --jq .workflow_run.id)" = "${{ inputs.benchmark_run_id }}"
+          test "$(gh api -H "X-GitHub-Api-Version: 2026-03-10" "$BENCHMARK_API" --jq .workflow_run.head_sha)" = "$GITHUB_SHA"
+
+      - name: Download exact build bundle
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          artifact-ids: ${{ needs.build-and-test.outputs.build_artifact_id }}
+          path: ${{ runner.temp }}/build-bundle
+
+      - name: Re-download exact prepared benchmark closure
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          run-id: ${{ inputs.benchmark_run_id }}
+          github-token: ${{ github.token }}
+          artifact-ids: ${{ needs.build-and-test.outputs.benchmark_artifact_id }}
+          path: ${{ runner.temp }}/prepared-benchmark
+
+      - name: Reaggregate benchmark evidence on the clean verifier
+        run: |
+          BENCHMARK_OUTPUT="$RUNNER_TEMP/verified-benchmark"
+          test ! -e "$BENCHMARK_OUTPUT"
+          python3 scripts/benchmark/aggregate_evidence.py \
+            --prepared-root "$RUNNER_TEMP/prepared-benchmark/evidence/reference_m4_max" \
+            --prepared-root "$RUNNER_TEMP/prepared-benchmark/evidence/constrained_14_16gb" \
+            --prepared-root "$RUNNER_TEMP/prepared-benchmark/evidence/eight_gb_fast" \
+            --output "$BENCHMARK_OUTPUT"
+          test -f "$BENCHMARK_OUTPUT/suite.json"
+          cmp -s \
+            "$RUNNER_TEMP/prepared-benchmark/suite.json" \
+            "$BENCHMARK_OUTPUT/suite.json"
+
+      - name: Verify build closure and prepare inert publication bundle
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          PUBLICATION="$RUNNER_TEMP/easysplat-publication"
+          test ! -e "$PUBLICATION"
+          python3 scripts/release/verify_publication_bundle.py verify-build \
+            --bundle "$RUNNER_TEMP/build-bundle" \
+            --output "$PUBLICATION" \
+            --benchmark-suite "$RUNNER_TEMP/verified-benchmark/suite.json" \
+            --toolchain-public-key EasySplatApp/Resources/public_key_ed25519.txt \
+            --app-version "${{ inputs.version }}" \
+            --toolchain-version "${{ inputs.toolchain_version }}" \
+            --source-repository "$GITHUB_REPOSITORY" \
+            --source-commit "$GITHUB_SHA" \
+            --tag "v${{ inputs.version }}" \
+            --benchmark-run-id "${{ inputs.benchmark_run_id }}" \
+            --benchmark-artifact-id "${{ needs.build-and-test.outputs.benchmark_artifact_id }}" \
+            --benchmark-artifact-digest "${{ needs.build-and-test.outputs.benchmark_artifact_digest }}"
+
+      - name: Upload exact publication bundle
+        id: upload-publication
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: easysplat-publication-${{ github.sha }}
+          path: ${{ runner.temp }}/easysplat-publication
+          if-no-files-found: error
+          retention-days: 7
+
+  publish:
+    needs: verify-publication
+    runs-on: macos-15
+    permissions:
+      contents: write
+      actions: read
+    environment: public-beta-release
+    steps:
+      - name: Reverify publication artifact identity
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PUBLICATION_ARTIFACT_ID: ${{ needs.verify-publication.outputs.publication_artifact_id }}
+          PUBLICATION_ARTIFACT_DIGEST: ${{ needs.verify-publication.outputs.publication_artifact_digest }}
+        run: |
+          ARTIFACT_API="repos/$GITHUB_REPOSITORY/actions/artifacts/$PUBLICATION_ARTIFACT_ID"
+          test "$(gh api -H "X-GitHub-Api-Version: 2026-03-10" "$ARTIFACT_API" --jq .expired)" = "false"
+          test "$(gh api -H "X-GitHub-Api-Version: 2026-03-10" "$ARTIFACT_API" --jq .digest)" = "$PUBLICATION_ARTIFACT_DIGEST"
+          test "$(gh api -H "X-GitHub-Api-Version: 2026-03-10" "$ARTIFACT_API" --jq .workflow_run.head_sha)" = "$GITHUB_SHA"
+
+      - name: Download exact publication bundle
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          artifact-ids: ${{ needs.verify-publication.outputs.publication_artifact_id }}
+          path: ${{ runner.temp }}/publication
+
+      - name: Validate inert publication manifest
+        env:
+          PUBLICATION_ROOT: ${{ runner.temp }}/publication
+          VERSION: ${{ inputs.version }}
+          TOOLCHAIN_VERSION: ${{ inputs.toolchain_version }}
+          BENCHMARK_RUN_ID: ${{ inputs.benchmark_run_id }}
+        run: |
+          python3 - <<'PY'
+          import hashlib, json, os, re, stat
+          from pathlib import Path
+
+          root = Path(os.environ["PUBLICATION_ROOT"])
+          version = os.environ["VERSION"]
+          manifest_name = "publication-manifest.json"
+          stem = f"EasySplat-{version}"
+          names = {
+              f"{stem}-unsigned.dmg",
+              f"{stem}-unsigned.dmg.sha256",
+              f"{stem}.provenance.json",
+              f"{stem}.spdx.json",
+              f"{stem}-licenses.zip",
+              f"{stem}-dSYM.zip",
+              f"{stem}-benchmark.json",
+              f"{stem}-release-notes.txt",
+          }
+          limits = {name: 2_147_483_648 for name in names}
+          limits[f"{stem}-unsigned.dmg.sha256"] = 1024
+          limits[f"{stem}.provenance.json"] = 8 * 1024 * 1024
+          limits[f"{stem}.spdx.json"] = 64 * 1024 * 1024
+          limits[f"{stem}-benchmark.json"] = 128 * 1024 * 1024
+          limits[f"{stem}-release-notes.txt"] = 64 * 1024
+          if root.is_symlink() or not root.is_dir() or {p.name for p in root.iterdir()} != names | {manifest_name}:
+              raise SystemExit("publication artifact has an unexpected file set")
+          def record(path):
+              metadata = path.lstat()
+              if not stat.S_ISREG(metadata.st_mode) or path.is_symlink() or metadata.st_nlink != 1:
+                  raise SystemExit(f"publication entry is not a single-link regular file: {path.name}")
+              if not 0 < metadata.st_size <= limits[path.name]:
+                  raise SystemExit(f"publication entry is empty or oversized: {path.name}")
+              digest = hashlib.sha256()
+              with path.open("rb") as stream:
+                  for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+                      digest.update(chunk)
+              return {"name": path.name, "sha256": digest.hexdigest(), "size_bytes": metadata.st_size}
+          manifest_path = root / manifest_name
+          metadata = manifest_path.lstat()
+          if not stat.S_ISREG(metadata.st_mode) or manifest_path.is_symlink() or metadata.st_nlink != 1 or not 0 < metadata.st_size <= 4 * 1024 * 1024:
+              raise SystemExit("publication manifest is not a bounded single-link regular file")
+          manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+          expected_keys = {"schema_version", "app_version", "toolchain_version", "source_repository", "source_commit", "tag", "release_mode", "benchmark", "files"}
+          if set(manifest) != expected_keys:
+              raise SystemExit("publication manifest fields are invalid")
+          if manifest["schema_version"] != 1 or manifest["app_version"] != version or manifest["toolchain_version"] != os.environ["TOOLCHAIN_VERSION"]:
+              raise SystemExit("publication manifest version identity is invalid")
+          if manifest["source_repository"] != os.environ["GITHUB_REPOSITORY"] or manifest["source_commit"] != os.environ["GITHUB_SHA"] or manifest["tag"] != f"v{version}" or manifest["release_mode"] != "unsigned-beta":
+              raise SystemExit("publication manifest source identity is invalid")
+          benchmark = manifest["benchmark"]
+          if set(benchmark) != {"run_id", "artifact_id", "artifact_digest", "suite_sha256"} or benchmark["run_id"] != os.environ["BENCHMARK_RUN_ID"]:
+              raise SystemExit("publication manifest benchmark identity is invalid")
+          if not re.fullmatch(r"sha256:[0-9a-f]{64}", benchmark["artifact_digest"]) or not re.fullmatch(r"[0-9a-f]{64}", benchmark["suite_sha256"]):
+              raise SystemExit("publication manifest benchmark digest is invalid")
+          records = [record(root / name) for name in sorted(names)]
+          if manifest["files"] != records:
+              raise SystemExit("publication payload differs from its manifest")
+          benchmark_record = next(row for row in records if row["name"] == f"{stem}-benchmark.json")
+          if benchmark["suite_sha256"] != benchmark_record["sha256"]:
+              raise SystemExit("publication benchmark digest is invalid")
+          checksum = (root / f"{stem}-unsigned.dmg.sha256").read_text(encoding="ascii")
+          dmg_record = next(row for row in records if row["name"] == f"{stem}-unsigned.dmg")
+          if checksum != f"{dmg_record['sha256']}  {stem}-unsigned.dmg\n":
+              raise SystemExit("publication DMG checksum is invalid")
+          PY
+
+      - name: Reverify tag and release policy
+        env:
+          GH_TOKEN: ${{ secrets.EASYSPLAT_RELEASE_ADMIN_TOKEN }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+          TAG: v${{ inputs.version }}
+        run: |
+          test -n "$GH_TOKEN"
+          test "$(gh api -H "X-GitHub-Api-Version: 2026-03-10" "repos/$GITHUB_REPOSITORY/immutable-releases" --jq .enabled)" = "true"
+          test "$(gh api -H "X-GitHub-Api-Version: 2026-03-10" "repos/$GITHUB_REPOSITORY/commits/$DEFAULT_BRANCH" --jq .sha)" = "$GITHUB_SHA"
+          test "$(gh api -H "X-GitHub-Api-Version: 2026-03-10" "repos/$GITHUB_REPOSITORY/commits/$TAG" --jq .sha)" = "$GITHUB_SHA"
+          if gh api -H "X-GitHub-Api-Version: 2026-03-10" "repos/$GITHUB_REPOSITORY/releases/tags/$TAG" >/dev/null 2>&1; then
+            echo "Release $TAG already exists and will not be overwritten." >&2
+            exit 1
+          fi
+
+      - name: Create draft and upload exact assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: v${{ inputs.version }}
+          VERSION: ${{ inputs.version }}
+          PUBLICATION_ROOT: ${{ runner.temp }}/publication
+        run: |
+          gh release create "$TAG" \
+            --repo "$GITHUB_REPOSITORY" \
+            --verify-tag \
+            --title "EasySplat $VERSION" \
+            --notes-file "$PUBLICATION_ROOT/EasySplat-$VERSION-release-notes.txt" \
+            --draft \
+            --prerelease
+          touch "$RUNNER_TEMP/easysplat-draft-created"
+          gh release upload "$TAG" \
+            "$PUBLICATION_ROOT/EasySplat-$VERSION-unsigned.dmg" \
+            "$PUBLICATION_ROOT/EasySplat-$VERSION-unsigned.dmg.sha256" \
+            "$PUBLICATION_ROOT/EasySplat-$VERSION.provenance.json" \
+            "$PUBLICATION_ROOT/EasySplat-$VERSION.spdx.json" \
+            "$PUBLICATION_ROOT/EasySplat-$VERSION-licenses.zip" \
+            "$PUBLICATION_ROOT/EasySplat-$VERSION-dSYM.zip" \
+            "$PUBLICATION_ROOT/EasySplat-$VERSION-benchmark.json" \
+            --repo "$GITHUB_REPOSITORY"
+
+      - name: Verify remote draft assets without executing them
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: v${{ inputs.version }}
+          VERSION: ${{ inputs.version }}
+          PUBLICATION_ROOT: ${{ runner.temp }}/publication
+        run: |
+          DRAFT_JSON="$RUNNER_TEMP/draft-release.json"
+          gh api -H "X-GitHub-Api-Version: 2026-03-10" "repos/$GITHUB_REPOSITORY/releases/tags/$TAG" >"$DRAFT_JSON"
+          python3 - <<'PY'
+          import hashlib, json, os
+          from pathlib import Path
+          version = os.environ["VERSION"]
+          root = Path(os.environ["PUBLICATION_ROOT"])
+          names = [
+              f"EasySplat-{version}-unsigned.dmg",
+              f"EasySplat-{version}-unsigned.dmg.sha256",
+              f"EasySplat-{version}.provenance.json",
+              f"EasySplat-{version}.spdx.json",
+              f"EasySplat-{version}-licenses.zip",
+              f"EasySplat-{version}-dSYM.zip",
+              f"EasySplat-{version}-benchmark.json",
+          ]
+          release_path = Path(os.environ["RUNNER_TEMP"]) / "draft-release.json"
+          if not 0 < release_path.stat().st_size <= 1024 * 1024:
+              raise SystemExit("draft release API response is oversized")
+          release = json.loads(release_path.read_text(encoding="utf-8"))
+          if release.get("draft") is not True or release.get("prerelease") is not True:
+              raise SystemExit("uploaded release is not a draft prerelease")
+          assets = release.get("assets")
+          if not isinstance(assets, list) or {row.get("name") for row in assets} != set(names):
+              raise SystemExit("draft release asset set is invalid")
+          by_name = {row["name"]: row for row in assets}
+          for name in names:
+              path = root / name
+              digest = hashlib.sha256()
+              with path.open("rb") as stream:
+                  for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+                      digest.update(chunk)
+              if by_name[name].get("size") != path.stat().st_size or by_name[name].get("digest") != f"sha256:{digest.hexdigest()}":
+                  raise SystemExit(f"draft asset API identity differs: {name}")
+          PY
+          REMOTE="$RUNNER_TEMP/remote-draft-assets"
+          rm -rf "$REMOTE"
+          mkdir -p "$REMOTE"
+          gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --dir "$REMOTE"
+          python3 - <<'PY'
+          import hashlib, os
+          from pathlib import Path
+          version = os.environ["VERSION"]
+          local = Path(os.environ["PUBLICATION_ROOT"])
+          remote = Path(os.environ["RUNNER_TEMP"]) / "remote-draft-assets"
+          names = {
+              f"EasySplat-{version}-unsigned.dmg",
+              f"EasySplat-{version}-unsigned.dmg.sha256",
+              f"EasySplat-{version}.provenance.json",
+              f"EasySplat-{version}.spdx.json",
+              f"EasySplat-{version}-licenses.zip",
+              f"EasySplat-{version}-dSYM.zip",
+              f"EasySplat-{version}-benchmark.json",
+          }
+          if {path.name for path in remote.iterdir()} != names:
+              raise SystemExit("downloaded draft asset set is invalid")
+          def digest(path):
+              value = hashlib.sha256()
+              with path.open("rb") as stream:
+                  for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+                      value.update(chunk)
+              return value.digest()
+          for name in names:
+              if digest(local / name) != digest(remote / name):
+                  raise SystemExit(f"downloaded draft asset differs: {name}")
+          PY
+
+      - name: Publish and confirm immutable prerelease
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: v${{ inputs.version }}
+        run: |
+          RELEASE_ID="$(gh api -H "X-GitHub-Api-Version: 2026-03-10" "repos/$GITHUB_REPOSITORY/releases/tags/$TAG" --jq .id)"
+          gh api -H "X-GitHub-Api-Version: 2026-03-10" --method PATCH "repos/$GITHUB_REPOSITORY/releases/$RELEASE_ID" \
             -F draft=false \
             -F prerelease=true >/dev/null
+          for attempt in {1..10}; do
+            if [ "$(gh api -H "X-GitHub-Api-Version: 2026-03-10" "repos/$GITHUB_REPOSITORY/releases/$RELEASE_ID" --jq .immutable)" = "true" ]; then
+              break
+            fi
+            if [ "$attempt" = "10" ]; then
+              echo "Published prerelease did not become immutable." >&2
+              exit 1
+            fi
+            sleep 2
+          done
+          test "$(gh api -H "X-GitHub-Api-Version: 2026-03-10" "repos/$GITHUB_REPOSITORY/releases/$RELEASE_ID" --jq .draft)" = "false"
+          test "$(gh api -H "X-GitHub-Api-Version: 2026-03-10" "repos/$GITHUB_REPOSITORY/releases/$RELEASE_ID" --jq .prerelease)" = "true"
+          test "$(gh api -H "X-GitHub-Api-Version: 2026-03-10" "repos/$GITHUB_REPOSITORY/releases/$RELEASE_ID" --jq '.assets | length')" = "7"
+
+      - name: Remove an incomplete release
+        if: ${{ failure() }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: v${{ inputs.version }}
+        run: |
+          if [ -f "$RUNNER_TEMP/easysplat-draft-created" ] && [ "$(gh api -H "X-GitHub-Api-Version: 2026-03-10" "repos/$GITHUB_REPOSITORY/releases/tags/$TAG" --jq .immutable 2>/dev/null || true)" != "true" ]; then
+            gh release delete "$TAG" --repo "$GITHUB_REPOSITORY" --yes
+          fi

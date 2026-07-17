@@ -118,6 +118,28 @@ public struct ManifestArtifactInput: Equatable {
     }
 }
 
+public struct ReleaseSigningRequest: Codable, Equatable {
+    public var schemaVersion: Int
+    public var sourceRepository: String
+    public var sourceCommit: String
+    public var manifestSHA256: String
+    public var manifest: ManifestDocument
+
+    public init(
+        schemaVersion: Int = 1,
+        sourceRepository: String,
+        sourceCommit: String,
+        manifestSHA256: String,
+        manifest: ManifestDocument
+    ) {
+        self.schemaVersion = schemaVersion
+        self.sourceRepository = sourceRepository
+        self.sourceCommit = sourceCommit
+        self.manifestSHA256 = manifestSHA256
+        self.manifest = manifest
+    }
+}
+
 public enum ManifestBuilder {
     public static let maximumReleaseAssetBytes: UInt64 = 2_147_483_648
     public static let maximumExpandedComponentBytes: UInt64 = 16 * 1_024 * 1_024 * 1_024
@@ -165,6 +187,71 @@ public enum ManifestBuilder {
         )
         manifest.signatureEd25519 = try key.signature(for: canonicalData(for: manifest)).base64EncodedString()
         return manifest
+    }
+
+    public static func releaseComponentURLs(repository: String, version: String) -> [String: String] {
+        let base = "https://github.com/\(repository)/releases/download/toolchain-v\(version)"
+        return [
+            "macos-arm64-core": "\(base)/toolchain-macos-arm64-\(version)-core.zip",
+            "geometry-da3-base": "\(base)/toolchain-geometry-da3-base-\(version).zip",
+            "geometry-da3-small": "\(base)/toolchain-geometry-da3-small-\(version).zip",
+        ]
+    }
+
+    public static func prepareRelease(
+        repository: String,
+        sourceCommit: String,
+        version: String,
+        publishedAt: Date,
+        appVersionRange: ManifestDocument.AppVersionRange,
+        publicKeyBase64: String,
+        components: [ManifestArtifactInput]
+    ) throws -> ReleaseSigningRequest {
+        try requireValidToolchainVersion(version)
+        guard validAppVersionRange(appVersionRange) else {
+            try releaseFailure("Release app version bounds are invalid.")
+        }
+        let publicKeyData = try validatedPublicKeyData(publicKeyBase64)
+        let keyID = sha256Hex(data: publicKeyData)
+        let builtComponents = try components.map(makeComponent)
+        try validateContentOwnership(builtComponents)
+        let manifest = ManifestDocument(
+            keyID: keyID,
+            version: version,
+            publishedAt: publishedAt,
+            appVersionRange: appVersionRange,
+            components: builtComponents,
+            signatureEd25519: ""
+        )
+        let request = ReleaseSigningRequest(
+            sourceRepository: repository,
+            sourceCommit: sourceCommit,
+            manifestSHA256: sha256Hex(data: try canonicalData(for: manifest)),
+            manifest: manifest
+        )
+        try validateReleaseSigningRequest(
+            request,
+            expectedRepository: repository,
+            expectedSourceCommit: sourceCommit,
+            expectedVersion: version,
+            expectedAppVersionRange: appVersionRange,
+            publicKeyData: publicKeyData
+        )
+        return request
+    }
+
+    public static func canonicalData(for request: ReleaseSigningRequest) throws -> Data {
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.sortedKeys, .withoutEscapingSlashes]
+        encoder.dateEncodingStrategy = .iso8601
+        return try encoder.encode(request)
+    }
+
+    public static func writeReleaseSigningRequest(
+        _ request: ReleaseSigningRequest,
+        to url: URL
+    ) throws {
+        try canonicalData(for: request).write(to: url, options: [.atomic])
     }
 
     public static func generateKeypair() -> (publicKeyBase64: String, privateKeyBase64: String) {
@@ -285,6 +372,10 @@ public enum ManifestBuilder {
         return hasher.finalize().map { String(format: "%02x", $0) }.joined()
     }
 
+    public static func sha256Hex(data: Data) -> String {
+        SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
+    }
+
     static func validateContentOwnership(_ components: [ManifestDocument.Component]) throws {
         let paths = components.flatMap(\.contents)
         let ownershipKeys = paths.map(pathOwnershipKey)
@@ -354,6 +445,130 @@ public enum ManifestBuilder {
             throw NSError(domain: "ManifestTool", code: 3, userInfo: [NSLocalizedDescriptionKey: "Invalid private key base64"])
         }
         return try Curve25519.Signing.PrivateKey(rawRepresentation: keyData)
+    }
+
+    private static func validateReleaseSigningRequest(
+        _ request: ReleaseSigningRequest,
+        expectedRepository: String,
+        expectedSourceCommit: String,
+        expectedVersion: String,
+        expectedAppVersionRange: ManifestDocument.AppVersionRange,
+        publicKeyData: Data
+    ) throws {
+        guard request.schemaVersion == 1 else {
+            try releaseFailure("Release signing request schema is invalid.")
+        }
+        try requireValidRepository(expectedRepository)
+        try requireValidSourceCommit(expectedSourceCommit)
+        guard request.sourceRepository == expectedRepository,
+              request.sourceCommit == expectedSourceCommit else {
+            try releaseFailure("Release signing request source identity is invalid.")
+        }
+
+        let manifest = request.manifest
+        guard manifest.schemaVersion == 2,
+              manifest.toolchainAPI == 2,
+              manifest.signatureEd25519.isEmpty,
+              manifest.version == expectedVersion,
+              manifest.appVersionRange == expectedAppVersionRange,
+              validAppVersionRange(manifest.appVersionRange),
+              semanticVersion(from: manifest.version) != nil else {
+            try releaseFailure("Release signing request version or app bounds are invalid.")
+        }
+        guard request.manifestSHA256 == sha256Hex(data: try canonicalData(for: manifest)) else {
+            try releaseFailure("Prepared release manifest was modified after derivation.")
+        }
+        guard manifest.keyID == sha256Hex(data: publicKeyData) else {
+            try releaseFailure("Release signing request key identifier is invalid.")
+        }
+
+        let names = ["macos-arm64-core", "geometry-da3-base", "geometry-da3-small"]
+        guard manifest.components.map(\.name) == names else {
+            try releaseFailure("Release signing request component set or order is invalid.")
+        }
+        let urls = releaseComponentURLs(repository: expectedRepository, version: expectedVersion)
+        for component in manifest.components {
+            guard component.url == urls[component.name],
+                  component.sha256.count == 64,
+                  component.sha256.allSatisfy(isLowercaseHex),
+                  component.sizeBytes > 0,
+                  component.sizeBytes < maximumReleaseAssetBytes,
+                  component.expandedSizeBytes > 0,
+                  component.expandedSizeBytes <= maximumExpandedComponentBytes,
+                  component.contents == component.contents.sorted(),
+                  !component.contents.isEmpty,
+                  Set(component.contents).count == component.contents.count,
+                  !component.criticalFileHashes.isEmpty,
+                  Set(component.criticalFileHashes.keys).isSubset(of: Set(component.contents)),
+                  component.criticalFileHashes.values.allSatisfy({
+                      $0.count == 64 && $0.allSatisfy(isLowercaseHex)
+                  }) else {
+                try releaseFailure("Release signing request component metadata is invalid: \(component.name)")
+            }
+        }
+        let core = manifest.components[0]
+        let base = manifest.components[1]
+        let small = manifest.components[2]
+        guard core.capabilities == ManifestToolDefaults.coreCapabilities,
+              core.dependencies.isEmpty,
+              core.requirement == .required,
+              ManifestToolDefaults.criticalCoreFiles(in: core.contents)
+                .isSubset(of: Set(core.criticalFileHashes.keys)),
+              base.capabilities == ["geometry.da3.base"],
+              base.dependencies == ["macos-arm64-core"],
+              base.requirement == .required,
+              Set(base.contents) == Set(ManifestToolDefaults.da3BaseContents),
+              Set(base.criticalFileHashes.keys) == Set(base.contents),
+              small.capabilities == ["geometry.da3.small"],
+              small.dependencies == ["macos-arm64-core"],
+              small.requirement == .optional,
+              Set(small.contents) == Set(ManifestToolDefaults.da3SmallContents),
+              Set(small.criticalFileHashes.keys) == Set(small.contents) else {
+            try releaseFailure("Release signing request component policy is invalid.")
+        }
+        try validateContentOwnership(manifest.components)
+    }
+
+    private static func validatedPublicKeyData(_ publicKeyBase64: String) throws -> Data {
+        guard let data = Data(base64Encoded: publicKeyBase64),
+              data.count == 32,
+              data.base64EncodedString() == publicKeyBase64,
+              (try? Curve25519.Signing.PublicKey(rawRepresentation: data)) != nil else {
+            try releaseFailure("Tracked release public key is invalid.")
+        }
+        return data
+    }
+
+    private static func requireValidRepository(_ repository: String) throws {
+        let parts = repository.split(separator: "/", omittingEmptySubsequences: false)
+        let allowed = CharacterSet(charactersIn: "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_.")
+        guard parts.count == 2,
+              parts.allSatisfy({ part in
+                  !part.isEmpty
+                      && part != "."
+                      && part != ".."
+                      && part.unicodeScalars.allSatisfy(allowed.contains)
+              }) else {
+            try releaseFailure("Release repository identity is invalid.")
+        }
+    }
+
+    private static func requireValidSourceCommit(_ sourceCommit: String) throws {
+        guard sourceCommit.count == 40, sourceCommit.allSatisfy(isLowercaseHex) else {
+            try releaseFailure("Release source commit must be a lowercase 40-character Git object ID.")
+        }
+    }
+
+    private static func isLowercaseHex(_ character: Character) -> Bool {
+        ("0"..."9").contains(character) || ("a"..."f").contains(character)
+    }
+
+    private static func releaseFailure(_ message: String) throws -> Never {
+        throw NSError(
+            domain: "ManifestTool",
+            code: 14,
+            userInfo: [NSLocalizedDescriptionKey: message]
+        )
     }
 
     private struct SemanticVersion: Equatable {
@@ -860,5 +1075,30 @@ public struct ArgParser {
         guard let index = args.firstIndex(of: key), index + 1 < args.count else { return nil }
         let value = args[index + 1]
         return value.hasPrefix("--") ? nil : value
+    }
+
+    public func requireOnly(_ allowed: Set<String>) throws {
+        guard args.count.isMultiple(of: 2) else {
+            throw NSError(
+                domain: "ManifestTool",
+                code: 4,
+                userInfo: [NSLocalizedDescriptionKey: "Command options must be complete key-value pairs."]
+            )
+        }
+        var seen = Set<String>()
+        for index in stride(from: 0, to: args.count, by: 2) {
+            let key = args[index]
+            let value = args[index + 1]
+            guard key.hasPrefix("--"),
+                  allowed.contains(key),
+                  !value.hasPrefix("--"),
+                  seen.insert(key).inserted else {
+                throw NSError(
+                    domain: "ManifestTool",
+                    code: 4,
+                    userInfo: [NSLocalizedDescriptionKey: "Command contains an unknown, duplicate, or incomplete option: \(key)"]
+                )
+            }
+        }
     }
 }

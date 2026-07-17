@@ -32,17 +32,6 @@ require_line() {
   grep -Eq -- "$pattern" "$file" || fail "${file#"$ROOT/"} is missing an active contract line: $pattern"
 }
 
-require_single_job() {
-  local file="$1"
-  local count
-  count="$(awk '
-    /^jobs:$/ { in_jobs = 1; next }
-    in_jobs && /^  [A-Za-z0-9_-]+:$/ { count += 1 }
-    END { print count + 0 }
-  ' "$file")"
-  [ "$count" -eq 1 ] || fail "${file#"$ROOT/"} must contain exactly one release job"
-}
-
 require_job_count() {
   local file="$1"
   local expected="$2"
@@ -98,10 +87,11 @@ for language in swift python c-cpp actions; do
 done
 require_line '^[[:space:]]+security-events: write$' "$CODEQL"
 
-require_single_job "$RELEASE_GATE"
+require_job_count "$RELEASE_GATE" 3
 require_line '^  workflow_dispatch:$' "$RELEASE_GATE"
 require_line '^    if: github\.ref == format\('\''refs/heads/\{0\}'\'', github\.event\.repository\.default_branch\)$' "$RELEASE_GATE"
-require_line '^    runs-on: \[self-hosted, macOS, ARM64, easysplat-release\]$' "$RELEASE_GATE"
+require_line '^    runs-on: \[self-hosted, macOS, ARM64, easysplat-release, easysplat-ephemeral\]$' "$RELEASE_GATE"
+require_line '^    runs-on: macos-15$' "$RELEASE_GATE"
 require_line '^    environment: public-beta-release$' "$RELEASE_GATE"
 require_line '^[[:space:]]+scripts/release/build_dmg\.sh \\$' "$RELEASE_GATE"
 require_line '^[[:space:]]+scripts/release/verify_beta\.sh \\$' "$RELEASE_GATE"
@@ -110,10 +100,24 @@ require_line '^[[:space:]]+--artifacts \\$' "$RELEASE_GATE"
 require_text 'EASYSPLAT_ISOLATED_UI_RUNNER: "1"' "$RELEASE_GATE"
 require_text 'name: easysplat-ui-${{ github.sha }}' "$RELEASE_GATE"
 require_text 'benchmark_run_id:' "$RELEASE_GATE"
-require_text 'gh run download "$INPUT_BENCHMARK_RUN_ID"' "$RELEASE_GATE"
-require_text '--evidence-root "$BENCHMARK_ARTIFACT/evidence"' "$RELEASE_GATE"
-require_text '--evidence-key-file "$RUNNER_TEMP/evidence.key"' "$RELEASE_GATE"
-require_text '--request-index "$BENCHMARK_ARTIFACT/requests/index.json"' "$RELEASE_GATE"
+require_text 'artifact-ids: ${{ steps.benchmark-identity.outputs.artifact_id }}' "$RELEASE_GATE"
+require_text 'scripts/benchmark/aggregate_evidence.py' "$RELEASE_GATE"
+require_text 'scripts/release/verify_publication_bundle.py create-build-closure' "$RELEASE_GATE"
+require_text 'scripts/release/verify_publication_bundle.py verify-build' "$RELEASE_GATE"
+require_text 'build_artifact_id:' "$RELEASE_GATE"
+require_text 'build_artifact_digest:' "$RELEASE_GATE"
+require_text 'benchmark_artifact_id:' "$RELEASE_GATE"
+require_text 'benchmark_artifact_digest:' "$RELEASE_GATE"
+require_text 'publication_artifact_id:' "$RELEASE_GATE"
+require_text 'publication_artifact_digest:' "$RELEASE_GATE"
+require_text 'secrets.EASYSPLAT_RELEASE_ADMIN_TOKEN' "$RELEASE_GATE"
+require_text 'repos/$GITHUB_REPOSITORY/immutable-releases' "$RELEASE_GATE"
+if grep -Fq 'EASYSPLAT_IMMUTABLE_RELEASES_ENABLED' "$RELEASE_GATE"; then
+  fail "immutable release enforcement must query GitHub instead of trusting a repository variable"
+fi
+if grep -Fq 'BENCHMARK_EVIDENCE_PRIVATE_KEY_BASE64' "$RELEASE_GATE"; then
+  fail "the app release job must never receive the benchmark private key"
+fi
 require_text 'GRYPE_VERSION: 0.115.0' "$RELEASE_GATE"
 require_text 'GRYPE_DARWIN_ARM64_SHA256: a5faa957bca6f39e252a046b9431cd79745030c692dd400ab4c0c74266edc406' "$RELEASE_GATE"
 require_text 'GRYPE_DB_REQUIRE_UPDATE_CHECK: "true"' "$RELEASE_GATE"
@@ -123,38 +127,77 @@ require_text '--only-fixed \' "$RELEASE_GATE"
 require_line '^[[:space:]]+--fail-on high$' "$RELEASE_GATE"
 spdx_validation_line="$(grep -n -m1 'name: Validate SPDX 2.3 output independently' "$RELEASE_GATE" | cut -d: -f1)"
 vulnerability_scan_line="$(grep -n -m1 'name: Scan shipped SBOM for actionable vulnerabilities' "$RELEASE_GATE" | cut -d: -f1)"
-draft_release_line="$(grep -n -m1 'name: Create immutable draft prerelease' "$RELEASE_GATE" | cut -d: -f1)"
+draft_release_line="$(grep -n -m1 'name: Create draft and upload exact assets' "$RELEASE_GATE" | cut -d: -f1)"
 test -n "$spdx_validation_line"
 test -n "$vulnerability_scan_line"
 test -n "$draft_release_line"
 test "$spdx_validation_line" -lt "$vulnerability_scan_line"
 test "$vulnerability_scan_line" -lt "$draft_release_line"
+build_release_block="$(sed -n '/^  build-and-test:/,/^  verify-publication:/p' "$RELEASE_GATE")"
+verify_release_block="$(sed -n '/^  verify-publication:/,/^  publish:/p' "$RELEASE_GATE")"
+publish_release_block="$(sed -n '/^  publish:/,$p' "$RELEASE_GATE")"
+if printf '%s\n' "$build_release_block" | grep -Eq '^[[:space:]]+environment:|contents: write'; then
+  fail "the self-hosted build job must have no release environment or write token"
+fi
+printf '%s\n' "$verify_release_block" | grep -Fq 'runs-on: macos-15' \
+  || fail "publication verification must run on a fresh GitHub-hosted runner"
+if printf '%s\n' "$verify_release_block" | grep -Eq '^[[:space:]]+environment:|contents: write|verify_beta\.sh|verify_ui\.sh'; then
+  fail "the clean publication verifier must be static and secret-free"
+fi
+printf '%s\n' "$publish_release_block" | grep -Fq 'contents: write' \
+  || fail "only the publish job may receive release write permission"
+printf '%s\n' "$publish_release_block" | grep -Fq 'environment: public-beta-release' \
+  || fail "the publish job must use the protected release environment"
+if printf '%s\n' "$publish_release_block" | grep -Eq 'actions/checkout@|scripts/|swift[[:space:]]|hdiutil|open[[:space:]].*EasySplat'; then
+  fail "the publish job must not checkout or execute repository, app, or toolchain code"
+fi
+contents_write_count="$(grep -Fc 'contents: write' "$RELEASE_GATE")"
+[ "$contents_write_count" -eq 1 ] \
+  || fail "release contents write permission must appear exactly once"
+if grep -Fq 'softprops/action-gh-release' "$RELEASE_GATE"; then
+  fail "release publication must use the audited GitHub CLI path"
+fi
 if grep -Eq '^[[:space:]]*(pull_request|pull_request_target):' "$RELEASE_GATE"; then
   fail "public beta gate must never run pull-request code"
 fi
 
-require_single_job "$TOOLCHAIN_GATE"
+require_job_count "$TOOLCHAIN_GATE" 2
 require_line '^  workflow_dispatch:$' "$TOOLCHAIN_GATE"
 require_line '^    if: github\.ref == format\('\''refs/heads/\{0\}'\'', github\.event\.repository\.default_branch\)$' "$TOOLCHAIN_GATE"
-require_line '^    runs-on: \[self-hosted, macOS, ARM64, easysplat-release\]$' "$TOOLCHAIN_GATE"
-require_line '^    environment: toolchain-release$' "$TOOLCHAIN_GATE"
+require_line '^    runs-on: \[self-hosted, macOS, ARM64, easysplat-ephemeral\]$' "$TOOLCHAIN_GATE"
+require_line '^    runs-on: macos-15$' "$TOOLCHAIN_GATE"
+require_text 'name: toolchain-components-${{ steps.release.outputs.version }}' "$TOOLCHAIN_GATE"
+require_text 'name: toolchain-signing-request-${{ inputs.version }}' "$TOOLCHAIN_GATE"
+require_text 'ManifestTool prepare-release' "$TOOLCHAIN_GATE"
+require_text 'artifact-ids: ${{ needs.build.outputs.artifact_id }}' "$TOOLCHAIN_GATE"
+require_text 'actions/artifacts/$ARTIFACT_ID' "$TOOLCHAIN_GATE"
+toolchain_build_block="$(sed -n '/^  build:/,/^  derive-signing-request:/p' "$TOOLCHAIN_GATE")"
+toolchain_derive_block="$(sed -n '/^  derive-signing-request:/,$p' "$TOOLCHAIN_GATE")"
+printf '%s\n' "$toolchain_build_block" | grep -Fq 'easysplat-ephemeral' \
+  || fail "toolchain compilation must use the isolated Apple Silicon builder"
+printf '%s\n' "$toolchain_derive_block" | grep -Fq 'runs-on: macos-15' \
+  || fail "toolchain signing-request derivation must use a fresh hosted runner"
+if grep -Eq '^[[:space:]]+environment:|contents: write|\$\{\{ secrets\.|sign-release|gh release|TOOLCHAIN_PRIVATE_KEY|private[_-]key' "$TOOLCHAIN_GATE"; then
+  fail "the source toolchain workflow must be secretless, read-only, and unable to sign or publish"
+fi
 if grep -Eq '^[[:space:]]*(pull_request|pull_request_target):' "$TOOLCHAIN_GATE"; then
-  fail "toolchain release must never run pull-request code"
+  fail "toolchain build requests must never run pull-request code"
 fi
 
-require_job_count "$BENCHMARK_GATE" 5
+require_job_count "$BENCHMARK_GATE" 8
 require_line '^  workflow_dispatch:$' "$BENCHMARK_GATE"
-require_line '^    runs-on: \[self-hosted, macOS, ARM64, easysplat-benchmark-reference\]$' "$BENCHMARK_GATE"
-require_line '^    runs-on: \[self-hosted, macOS, ARM64, easysplat-benchmark-constrained\]$' "$BENCHMARK_GATE"
-require_line '^    runs-on: \[self-hosted, macOS, ARM64, easysplat-benchmark-8gb\]$' "$BENCHMARK_GATE"
+require_line '^    runs-on: \[self-hosted, macOS, ARM64, easysplat-benchmark-reference, easysplat-ephemeral\]$' "$BENCHMARK_GATE"
+require_line '^    runs-on: \[self-hosted, macOS, ARM64, easysplat-benchmark-constrained, easysplat-ephemeral\]$' "$BENCHMARK_GATE"
+require_line '^    runs-on: \[self-hosted, macOS, ARM64, easysplat-benchmark-8gb, easysplat-ephemeral\]$' "$BENCHMARK_GATE"
+require_line '^    runs-on: macos-15$' "$BENCHMARK_GATE"
 require_line '^    environment: benchmark-release$' "$BENCHMARK_GATE"
 require_text 'scripts/benchmark/render-requirements.txt' "$BENCHMARK_GATE"
 base_install_count="$(grep -Fc 'name: Install protected benchmark dependencies' "$BENCHMARK_GATE")"
-[ "$base_install_count" -eq 5 ] \
-  || fail "all release benchmark jobs must install the base evidence dependencies"
+[ "$base_install_count" -eq 8 ] \
+  || fail "every benchmark job must install the base evidence dependencies"
 render_install_count="$(grep -Fc 'name: Install protected render-scoring dependencies' "$BENCHMARK_GATE")"
-[ "$render_install_count" -eq 2 ] \
-  || fail "only reference measurement and aggregate verification may install render scoring"
+[ "$render_install_count" -eq 1 ] \
+  || fail "only no-secret reference derivation may install render scoring"
 for required in \
   EASYSPLAT_BENCHMARK_REFERENCE_RUNNER \
   EASYSPLAT_BENCHMARK_CONSTRAINED_RUNNER \
@@ -164,8 +207,9 @@ for required in \
   EASYSPLAT_BENCHMARK_8GB_RUNNER_SHA256 \
   EASYSPLAT_BENCHMARK_BASELINE_TOOLCHAIN_ROOT \
   EASYSPLAT_BENCHMARK_LPIPS_BACKBONE \
-  BENCHMARK_EVIDENCE_KEY_BASE64 \
   scripts/benchmark/run_lane.py \
+  scripts/benchmark/prepare_evidence.py \
+  scripts/benchmark/aggregate_evidence.py \
   reference_m4_max \
   constrained_14_16gb \
   eight_gb_fast \
@@ -182,7 +226,33 @@ require_text 'easysplat-benchmark-renderer-${{ github.sha }}' "$BENCHMARK_GATE"
 require_text '--rendering-driver-closure "$RUNNER_TEMP/renderer-package/closure"' "$BENCHMARK_GATE"
 require_text '--baseline-checkout-root "$BASELINE_CHECKOUT"' "$BENCHMARK_GATE"
 require_text '--baseline-toolchain-root "$BASELINE_TOOLCHAIN_ROOT"' "$BENCHMARK_GATE"
-require_text '--request-index "$RUNNER_TEMP/requests/index.json"' "$BENCHMARK_GATE"
+require_text '--prepared-root "$RUNNER_TEMP/prepared-reference"' "$BENCHMARK_GATE"
+require_text '--prepared-root "$RUNNER_TEMP/prepared-constrained"' "$BENCHMARK_GATE"
+require_text '--prepared-root "$RUNNER_TEMP/prepared-eight-gb"' "$BENCHMARK_GATE"
+require_text 'artifact-ids: ${{ needs.prepare.outputs.requests_artifact_id }}' "$BENCHMARK_GATE"
+require_text 'artifact-ids: ${{ needs.derive-reference.outputs.prepared_artifact_id }}' "$BENCHMARK_GATE"
+require_text 'artifact-ids: ${{ needs.derive-constrained.outputs.prepared_artifact_id }}' "$BENCHMARK_GATE"
+require_text 'artifact-ids: ${{ needs.derive-eight-gb.outputs.prepared_artifact_id }}' "$BENCHMARK_GATE"
+require_text '${{ needs.derive-reference.outputs.prepared_artifact_digest }}' "$BENCHMARK_GATE"
+require_text '${{ needs.derive-constrained.outputs.prepared_artifact_digest }}' "$BENCHMARK_GATE"
+require_text '${{ needs.derive-eight-gb.outputs.prepared_artifact_digest }}' "$BENCHMARK_GATE"
+require_text 'actions/artifacts/$artifact_id' "$BENCHMARK_GATE"
+require_text 'artifact-digest' "$BENCHMARK_GATE"
+if grep -Eq 'BENCHMARK_EVIDENCE_(PRIVATE|PUBLIC)_KEY|benchmark-evidence-signing|seal_evidence\.py|signing-requirements|benchmark/public_key_ed25519\.txt|--private-key-stdin|--sealed-root' "$BENCHMARK_GATE"; then
+  fail "benchmark evidence must not claim a repository-controlled signing authority"
+fi
+aggregate_block="$(sed -n '/^  aggregate:/,$p' "$BENCHMARK_GATE")"
+if printf '%s\n' "$aggregate_block" | grep -Eq '^[[:space:]]+environment:'; then
+  fail "aggregate validation must not enter a secret-bearing environment"
+fi
+for derive_job in derive-reference derive-constrained derive-eight-gb; do
+  derive_block="$(sed -n "/^  $derive_job:/,/^  [A-Za-z0-9_-]*:/p" "$BENCHMARK_GATE")"
+  printf '%s\n' "$derive_block" | grep -Fq 'runs-on: macos-15' \
+    || fail "$derive_job must run on a fresh GitHub-hosted runner"
+done
+self_hosted_count="$(grep -Ec '^    runs-on: \[self-hosted, macOS, ARM64, .*easysplat-ephemeral\]$' "$BENCHMARK_GATE")"
+[ "$self_hosted_count" -eq 4 ] \
+  || fail "every self-hosted benchmark job must require the ephemeral-runner label"
 if grep -Eq '^[[:space:]]*(pull_request|pull_request_target):' "$BENCHMARK_GATE"; then
   fail "release benchmark must never run pull-request code"
 fi

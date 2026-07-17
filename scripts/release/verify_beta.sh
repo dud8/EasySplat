@@ -315,6 +315,9 @@ EXECUTABLE="$APP_PATH/Contents/MacOS/EasySplatApp"
 NUMERIC_VERSION="${EXPECTED_VERSION%%+*}"
 NUMERIC_VERSION="${NUMERIC_VERSION%%-*}"
 read_plist() { /usr/libexec/PlistBuddy -c "Print :$1" "$INFO_PLIST"; }
+read_optional_plist() {
+  /usr/libexec/PlistBuddy -c "Print :$1" "$INFO_PLIST" 2>/dev/null || true
+}
 verify_adhoc_bundle() {
   local bundle=$1
   local signature
@@ -446,6 +449,11 @@ plutil -lint "$INFO_PLIST" >/dev/null
 [ "$(read_plist CFBundleShortVersionString)" = "$NUMERIC_VERSION" ]
 [ "$(read_plist CFBundleVersion)" = "$NUMERIC_VERSION" ]
 [ "$(read_plist NSPrincipalClass)" = "NSApplication" ]
+if [ "$(read_optional_plist LSUIElement)" = "true" ] || \
+   [ "$(read_optional_plist LSBackgroundOnly)" = "true" ]; then
+  echo "Release app must use the regular application activation policy." >&2
+  exit 1
+fi
 [ "$(read_plist EasySplatReleaseVersion)" = "$EXPECTED_VERSION" ]
 [ "$(read_plist EasySplatReleaseChannel)" = "unsigned-beta" ]
 [ -x "$EXECUTABLE" ]
@@ -485,6 +493,11 @@ plutil -lint "$DISTRIBUTED_INFO_PLIST" >/dev/null
 }
 [ "$(/usr/libexec/PlistBuddy -c 'Print :EasySplatReleaseVersion' "$DISTRIBUTED_INFO_PLIST")" = "$EXPECTED_VERSION" ]
 [ "$(/usr/libexec/PlistBuddy -c 'Print :EasySplatReleaseChannel' "$DISTRIBUTED_INFO_PLIST")" = "unsigned-beta" ]
+if [ "$(/usr/libexec/PlistBuddy -c 'Print :LSUIElement' "$DISTRIBUTED_INFO_PLIST" 2>/dev/null || true)" = "true" ] || \
+   [ "$(/usr/libexec/PlistBuddy -c 'Print :LSBackgroundOnly' "$DISTRIBUTED_INFO_PLIST" 2>/dev/null || true)" = "true" ]; then
+  echo "Mounted app must use the regular application activation policy." >&2
+  exit 1
+fi
 verify_matching_executable_hashes "$EXECUTABLE" "$DISTRIBUTED_EXECUTABLE"
 EFFECTIVE_MANIFEST_URL=""
 EFFECTIVE_PUBLIC_KEY_FILE=""
@@ -578,7 +591,7 @@ func stop(_ application: NSRunningApplication) {
     }
 }
 
-func hasVisibleWindow(processIdentifier: pid_t) -> Bool {
+func hasAppWindow(processIdentifier: pid_t) -> Bool {
     let options: CGWindowListOption = [.optionOnScreenOnly, .excludeDesktopElements]
     guard let windows = CGWindowListCopyWindowInfo(options, kCGNullWindowID) as? [[String: Any]] else {
         return false
@@ -588,7 +601,13 @@ func hasVisibleWindow(processIdentifier: pid_t) -> Bool {
         let layer = (window[kCGWindowLayer as String] as? NSNumber)?.intValue
         let isOnScreen = (window[kCGWindowIsOnscreen as String] as? NSNumber)?.boolValue
         let alpha = (window[kCGWindowAlpha as String] as? NSNumber)?.doubleValue ?? 0
-        return owner == processIdentifier && layer == 0 && isOnScreen == true && alpha > 0
+        let rawBounds = window[kCGWindowBounds as String] as? NSDictionary
+        let bounds = rawBounds.flatMap(CGRect.init(dictionaryRepresentation:))
+        return owner == processIdentifier
+            && layer == 0
+            && isOnScreen == true
+            && alpha > 0
+            && bounds.map { $0.width > 0 && $0.height > 0 } == true
     }
 }
 
@@ -604,6 +623,9 @@ let configuration = NSWorkspace.OpenConfiguration()
 configuration.activates = true
 configuration.addsToRecentItems = false
 configuration.createsNewApplicationInstance = true
+if ProcessInfo.processInfo.environment["EASYSPLAT_TEST_ACCESSORY_FIXTURE"] == "1" {
+    configuration.environment = ["EASYSPLAT_TEST_ACCESSORY_FIXTURE": "1"]
+}
 
 var launchedApplication: NSRunningApplication?
 var launchError: Error?
@@ -623,20 +645,28 @@ guard let application = launchedApplication else {
     fail("App exited during launch smoke, or LaunchServices did not return it before the timeout.")
 }
 
-var foundVisibleWindow = false
+var foundAppWindow = false
+var sawAnyAppWindow = false
 while Date() < deadline {
     if application.isTerminated {
         fail("App exited during launch smoke.")
     }
-    if hasVisibleWindow(processIdentifier: application.processIdentifier) {
-        foundVisibleWindow = true
-        break
+    if !application.isHidden && hasAppWindow(processIdentifier: application.processIdentifier) {
+        sawAnyAppWindow = true
+        if application.activationPolicy == .regular {
+            foundAppWindow = true
+            break
+        }
     }
     runLoopBriefly()
 }
+let finalActivationPolicy = application.activationPolicy
 stop(application)
-if !foundVisibleWindow {
-    fail("App opened without an on-screen window during launch smoke.")
+if !foundAppWindow && sawAnyAppWindow && finalActivationPolicy != .regular {
+    fail("App did not use the regular application activation policy during launch smoke.")
+}
+if !foundAppWindow {
+    fail("App opened without a normal app window during launch smoke.")
 }
 SWIFT
   then

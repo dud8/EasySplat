@@ -58,6 +58,51 @@ struct ManifestTool {
                 exit(ExitCode.ok.rawValue)
             }
 
+            if command == "prepare-release" {
+                var parser = ArgParser(Array(args.dropFirst()))
+                try parser.requireOnly([
+                    "--repository",
+                    "--source-commit",
+                    "--version",
+                    "--published-at",
+                    "--app-version-minimum",
+                    "--app-version-maximum-exclusive",
+                    "--public-key-file",
+                    "--core-zip",
+                    "--core-url",
+                    "--da3-base-zip",
+                    "--da3-base-url",
+                    "--da3-small-zip",
+                    "--da3-small-url",
+                    "--request-out",
+                ])
+                let repository = try parser.require("--repository")
+                let sourceCommit = try parser.require("--source-commit")
+                let version = try parser.require("--version")
+                let publishedAt = try parsePublishedAt(parser.require("--published-at"))
+                let appRange = ManifestDocument.AppVersionRange(
+                    minimum: try parser.require("--app-version-minimum"),
+                    maximumExclusive: try parser.require("--app-version-maximum-exclusive")
+                )
+                let publicKey = try readPublicKey(
+                    at: URL(fileURLWithPath: parser.require("--public-key-file"))
+                )
+                let request = try ManifestBuilder.prepareRelease(
+                    repository: repository,
+                    sourceCommit: sourceCommit,
+                    version: version,
+                    publishedAt: publishedAt,
+                    appVersionRange: appRange,
+                    publicKeyBase64: publicKey,
+                    components: buildComponentInputs(parser: &parser)
+                )
+                try ManifestBuilder.writeReleaseSigningRequest(
+                    request,
+                    to: URL(fileURLWithPath: parser.require("--request-out"))
+                )
+                exit(ExitCode.ok.rawValue)
+            }
+
             var parser = ArgParser(Array(args))
             let version = try parser.require("--version")
             let publishedAtValue = try parser.require("--published-at")
@@ -105,6 +150,16 @@ struct ManifestTool {
             --da3-base-zip <path> --da3-base-url <url> \
             --da3-small-zip <path> --da3-small-url <url>
 
+        Prepare a canonical release signing request without a private key:
+          ManifestTool prepare-release --repository <owner/repo> --source-commit <sha> \
+            --version <semver> --published-at <iso8601> \
+            --app-version-minimum <semver> --app-version-maximum-exclusive <semver> \
+            --public-key-file <path> \
+            --core-zip <path> --core-url <url> \
+            --da3-base-zip <path> --da3-base-url <url> \
+            --da3-small-zip <path> --da3-small-url <url> \
+            --request-out <path>
+
         Private key source:
           Use exactly one of --private-key-file <path> or --private-key-env <name>.
         """
@@ -123,7 +178,14 @@ struct ManifestTool {
         return date
     }
 
-    private static func buildComponentInputs(parser: inout ArgParser) throws -> [ManifestArtifactInput] {
+    private static func readPublicKey(at url: URL) throws -> String {
+        try String(contentsOf: url, encoding: .utf8)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    private static func buildComponentInputs(
+        parser: inout ArgParser
+    ) throws -> [ManifestArtifactInput] {
         let coreZipPath = try parser.require("--core-zip")
         let coreURL = try parser.require("--core-url")
         let baseZipPath = try parser.require("--da3-base-zip")

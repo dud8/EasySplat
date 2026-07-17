@@ -401,10 +401,23 @@ Path("${target}/easysplat_model_info.json").write_text(
 )
 PY
   install -m 0644 "$DA3_SOURCE/LICENSE" "$target/LICENSE"
-  test -f "$target/config.json"
-  test -f "$target/model.safetensors"
-  test -f "$target/easysplat_model_info.json"
-  test -f "$target/LICENSE"
+  rm -rf "$target/.cache"
+  PYTHONNOUSERSITE=1 "$PYTHON_DIR/bin/python3" - "$target" <<'PY'
+import sys
+from pathlib import Path
+
+root = Path(sys.argv[1])
+expected = {"LICENSE", "config.json", "easysplat_model_info.json", "model.safetensors"}
+actual = {entry.name for entry in root.iterdir()}
+if actual != expected:
+    raise SystemExit(
+        f"DA3 model payload must contain exactly {sorted(expected)}; got {sorted(actual)}"
+    )
+for name in expected:
+    path = root / name
+    if not path.is_file() or path.is_symlink() or path.stat().st_size <= 0:
+        raise SystemExit(f"DA3 model payload entry must be a nonempty regular file: {path}")
+PY
 }
 
 stage_da3_app() {

@@ -61,6 +61,7 @@ cleanup() {
 trap cleanup EXIT
 
 python3 "$ROOT/scripts/toolchain/tests/test_generate_supply_chain_manifest.py"
+python3 "$ROOT/scripts/release/tests/test_verify_publication_bundle.py"
 
 unsafe_toolchain_root="$TMP_DIR/unsafe-toolchain-root"
 mkdir -p "$unsafe_toolchain_root"
@@ -927,7 +928,7 @@ if EASYSPLAT_HDIUTIL_BIN="$mock_hdiutil" \
   echo "Beta verification accepted an app that opened without a window" >&2
   exit 1
 fi
-if ! grep -Fqi 'without an on-screen window' "$headless_error"; then
+if ! grep -Fqi 'without a normal app window' "$headless_error"; then
   cat "$headless_error" >&2
   exit 1
 fi
@@ -939,7 +940,10 @@ cat >"$window_fixture_source" <<'EOF'
 int main(void) {
     @autoreleasepool {
         NSApplication *application = [NSApplication sharedApplication];
-        [application setActivationPolicy:NSApplicationActivationPolicyRegular];
+        BOOL accessory = getenv("EASYSPLAT_TEST_ACCESSORY_FIXTURE") != NULL;
+        [application setActivationPolicy:(accessory
+            ? NSApplicationActivationPolicyAccessory
+            : NSApplicationActivationPolicyRegular)];
         NSWindow *window = [[NSWindow alloc]
             initWithContentRect:NSMakeRect(0, 0, 640, 480)
             styleMask:(NSWindowStyleMaskTitled | NSWindowStyleMaskClosable)
@@ -976,6 +980,25 @@ EASYSPLAT_SMOKE_SECONDS=3 \
   --dmg "$TMP_DIR/EasySplat-0.2.0-beta.1-unsigned.dmg" \
   --expected-version "0.2.0-beta.1" \
   --allow-incomplete >/dev/null
+
+accessory_error="$TMP_DIR/release-verifier-accessory.stderr"
+if EASYSPLAT_HDIUTIL_BIN="$mock_hdiutil" \
+  EASYSPLAT_TEST_HDIUTIL_LOG="$hdiutil_log" \
+  EASYSPLAT_TEST_APP_PATH="$window_app_fixture/EasySplat.app" \
+  EASYSPLAT_TEST_ACCESSORY_FIXTURE=1 \
+  EASYSPLAT_SMOKE_SECONDS=1 \
+  "$ROOT/scripts/release/verify_beta.sh" \
+  --app "$window_app_fixture/EasySplat.app" \
+  --dmg "$TMP_DIR/EasySplat-0.2.0-beta.1-unsigned.dmg" \
+  --expected-version "0.2.0-beta.1" \
+  --allow-incomplete >/dev/null 2>"$accessory_error"; then
+  echo "Beta verification accepted an accessory app with a window" >&2
+  exit 1
+fi
+if ! grep -Fqi 'regular application activation policy' "$accessory_error"; then
+  cat "$accessory_error" >&2
+  exit 1
+fi
 
 missing_public_key_fixture="$TMP_DIR/missing-public-key-fixture"
 mkdir -p "$missing_public_key_fixture"
@@ -1667,16 +1690,20 @@ fi
 
 app_workflow="$ROOT/.github/workflows/release-app.yml"
 grep -Fq 'workflow_dispatch:' "$app_workflow"
-grep -Fq 'runs-on: [self-hosted, macOS, ARM64, easysplat-release]' "$app_workflow"
+grep -Fq 'runs-on: [self-hosted, macOS, ARM64, easysplat-release, easysplat-ephemeral]' "$app_workflow"
+grep -Fq 'runs-on: macos-15' "$app_workflow"
 grep -Fq 'test "$(uname -m)" = "arm64"' "$app_workflow"
 grep -Fq 'environment: public-beta-release' "$app_workflow"
 grep -Fq 'uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0' "$app_workflow"
 grep -Fq 'uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1' "$app_workflow"
 grep -Fq 'python-version: "3.12"' "$app_workflow"
-grep -Fq 'uses: softprops/action-gh-release@b4309332981a82ec1c5618f44dd2e27cc8bfbfda' "$app_workflow"
-grep -Fq 'CURRENT_HEAD="$(gh api "repos/$GITHUB_REPOSITORY/commits/$DEFAULT_BRANCH" --jq .sha)"' "$app_workflow"
-grep -Fq 'if [ "$GITHUB_SHA" != "$CURRENT_HEAD" ]; then' "$app_workflow"
-grep -Fq 'prerelease: true' "$app_workflow"
+if grep -Fq 'softprops/action-gh-release' "$app_workflow"; then
+  echo "App release workflow restored an unaudited release action." >&2
+  exit 1
+fi
+grep -Fq 'CURRENT_HEAD="$(gh api -H "X-GitHub-Api-Version: 2026-03-10" "repos/$GITHUB_REPOSITORY/commits/$DEFAULT_BRANCH" --jq .sha)"' "$app_workflow"
+grep -Fq 'test "$GITHUB_SHA" = "$CURRENT_HEAD"' "$app_workflow"
+grep -Fq -- '--prerelease' "$app_workflow"
 grep -Fq 'scripts/release/verify_beta.sh' "$app_workflow"
 grep -Fq 'scripts/release/verify_ui.sh' "$app_workflow"
 grep -Fq -- '--manifest-url "$BASE_URL/manifest.json"' "$app_workflow"
@@ -1698,26 +1725,54 @@ grep -Fq 'Required accessibility element \(required) does not have a visible fra
 grep -Fq 'pressAndCancelDialog(' "$ROOT/Tools/UIVerifier/Sources/UIVerifierCore/PackagedAppVerifier.swift"
 grep -Fq 'keeping technical failure details collapsed' "$ROOT/Tools/UIVerifier/Sources/UIVerifierCore/PackagedAppVerifier.swift"
 grep -Fq 'UIVerificationWorkspace.allCases.count' "$ROOT/Tools/UIVerifier/Sources/UIVerifierCore/UIHarnessSuiteValidator.swift"
-grep -Fq 'scripts/benchmark/run_suite.sh' "$app_workflow"
-grep -Fq -- '--profile release' "$app_workflow"
-grep -Fq 'EASYSPLAT_RELEASE_CORPUS' "$app_workflow"
+grep -Fq 'scripts/benchmark/aggregate_evidence.py' "$app_workflow"
+grep -Fq 'scripts/release/verify_publication_bundle.py create-build-closure' "$app_workflow"
+grep -Fq 'scripts/release/verify_publication_bundle.py verify-build' "$app_workflow"
 grep -Fq 'benchmark_run_id:' "$app_workflow"
-grep -Fq 'gh run download "$INPUT_BENCHMARK_RUN_ID"' "$app_workflow"
-grep -Fq -- '--evidence-root "$BENCHMARK_ARTIFACT/evidence"' "$app_workflow"
-grep -Fq -- '--evidence-key-file "$RUNNER_TEMP/evidence.key"' "$app_workflow"
-grep -Fq -- '--request-index "$BENCHMARK_ARTIFACT/requests/index.json"' "$app_workflow"
+grep -Fq 'artifact-ids: ${{ steps.benchmark-identity.outputs.artifact_id }}' "$app_workflow"
+grep -Fq 'artifact-ids: ${{ needs.build-and-test.outputs.benchmark_artifact_id }}' "$app_workflow"
+grep -Fq 'secrets.EASYSPLAT_RELEASE_ADMIN_TOKEN' "$app_workflow"
+grep -Fq 'repos/$GITHUB_REPOSITORY/immutable-releases' "$app_workflow"
+if grep -Fq 'EASYSPLAT_IMMUTABLE_RELEASES_ENABLED' "$app_workflow"; then
+  echo "App release workflow trusts a variable instead of the live immutable-release policy." >&2
+  exit 1
+fi
+if grep -Fq 'BENCHMARK_EVIDENCE_PRIVATE_KEY_BASE64' "$app_workflow"; then
+  echo "App release workflow must never receive the benchmark private key." >&2
+  exit 1
+fi
 python3 - "$app_workflow" <<'PY'
 import sys
 from pathlib import Path
 
 workflow = Path(sys.argv[1]).read_text(encoding="utf-8")
-record_marker = "      - name: Record trusted release asset hashes"
-upload_marker = "      - name: Create immutable draft prerelease"
-verify_marker = "      - name: Verify downloaded draft assets"
-assert record_marker in workflow
-assert workflow.index(record_marker) < workflow.index(upload_marker) < workflow.index(verify_marker)
-record_block = workflow.split(record_marker, 1)[1].split("\n      - name:", 1)[0]
-verify_block = workflow.split(verify_marker, 1)[1].split("\n      - name:", 1)[0]
+build_marker = "  build-and-test:"
+verify_marker = "  verify-publication:"
+publish_marker = "  publish:"
+assert workflow.index(build_marker) < workflow.index(verify_marker) < workflow.index(publish_marker)
+build_block = workflow.split(build_marker, 1)[1].split(verify_marker, 1)[0]
+verify_block = workflow.split(verify_marker, 1)[1].split(publish_marker, 1)[0]
+publish_block = workflow.split(publish_marker, 1)[1]
+assert "environment:" not in build_block
+assert "contents: write" not in build_block
+assert "EASYSPLAT_RELEASE_ADMIN_TOKEN" not in build_block
+assert "runs-on: macos-15" in verify_block
+assert "environment:" not in verify_block
+assert "contents: write" not in verify_block
+assert "EASYSPLAT_RELEASE_ADMIN_TOKEN" not in verify_block
+assert "scripts/release/verify_beta.sh" not in verify_block
+assert "scripts/release/verify_ui.sh" not in verify_block
+assert "contents: write" in publish_block
+assert "environment: public-beta-release" in publish_block
+assert publish_block.count("secrets.EASYSPLAT_RELEASE_ADMIN_TOKEN") == 1
+assert "actions/checkout@" not in publish_block
+assert "scripts/" not in publish_block
+assert workflow.count("contents: write") == 1
+assert workflow.count("secrets.BENCHMARK_EVIDENCE_PRIVATE_KEY_BASE64") == 0
+assert "build_artifact_id:" in workflow and "build_artifact_digest:" in workflow
+assert "publication_artifact_id:" in workflow and "publication_artifact_digest:" in workflow
+assert "touch \"$RUNNER_TEMP/easysplat-draft-created\"" in publish_block
+assert "Remove an incomplete release" in publish_block
 expected_assets = (
     "EasySplat-$VERSION-unsigned.dmg",
     "EasySplat-$VERSION-unsigned.dmg.sha256",
@@ -1728,12 +1783,10 @@ expected_assets = (
     "EasySplat-$VERSION-benchmark.json",
 )
 for asset in expected_assets:
-    assert asset in record_block, f"trusted hash list omits {asset}"
-assert 'shasum -a 256 -c "$LOCAL_ASSET_HASHES"' in verify_block
-assert '--source-url "https://github.com/$GITHUB_REPOSITORY"' in verify_block
-assert '--source-commit "$GITHUB_SHA"' in verify_block
-assert 'ditto -x -k' in verify_block
-assert 'dwarfdump --uuid "$REMOTE_DSYM"' in verify_block
+    assert asset in publish_block, f"publication allowlist omits {asset}"
+assert "Validate inert publication manifest" in publish_block
+assert "Verify remote draft assets without executing them" in publish_block
+assert "Publish and confirm immutable prerelease" in publish_block
 PY
 if rg -n '^  push:|uses: [^ ]+@(v[0-9]+|main|master)$' "$app_workflow" >/dev/null; then
   echo "App release workflow must be manual and pin actions to commit SHAs" >&2
@@ -1742,20 +1795,34 @@ fi
 
 benchmark_workflow="$ROOT/.github/workflows/benchmark-release.yml"
 grep -Fq 'workflow_dispatch:' "$benchmark_workflow"
-grep -Fq 'runs-on: [self-hosted, macOS, ARM64, easysplat-benchmark-reference]' "$benchmark_workflow"
-grep -Fq 'runs-on: [self-hosted, macOS, ARM64, easysplat-benchmark-constrained]' "$benchmark_workflow"
-grep -Fq 'runs-on: [self-hosted, macOS, ARM64, easysplat-benchmark-8gb]' "$benchmark_workflow"
+grep -Fq 'runs-on: [self-hosted, macOS, ARM64, easysplat-benchmark-reference, easysplat-ephemeral]' "$benchmark_workflow"
+grep -Fq 'runs-on: [self-hosted, macOS, ARM64, easysplat-benchmark-constrained, easysplat-ephemeral]' "$benchmark_workflow"
+grep -Fq 'runs-on: [self-hosted, macOS, ARM64, easysplat-benchmark-8gb, easysplat-ephemeral]' "$benchmark_workflow"
 grep -Fq 'environment: benchmark-release' "$benchmark_workflow"
 grep -Fq 'scripts/benchmark/run_lane.py' "$benchmark_workflow"
 grep -Fq -- '--lane reference_m4_max' "$benchmark_workflow"
 grep -Fq -- '--lane constrained_14_16gb' "$benchmark_workflow"
 grep -Fq -- '--lane eight_gb_fast' "$benchmark_workflow"
-grep -Fq 'BENCHMARK_EVIDENCE_KEY_BASE64' "$benchmark_workflow"
+grep -Fq 'runs-on: macos-15' "$benchmark_workflow"
+grep -Fq 'scripts/benchmark/prepare_evidence.py' "$benchmark_workflow"
+grep -Fq 'scripts/benchmark/aggregate_evidence.py' "$benchmark_workflow"
+if rg -n 'BENCHMARK_EVIDENCE_(PRIVATE|PUBLIC)_KEY|benchmark-evidence-signing|seal_evidence\.py|signing-requirements|benchmark/public_key_ed25519\.txt|--private-key-stdin|--sealed-root' "$benchmark_workflow" >/dev/null; then
+  echo "Benchmark workflow contains a misleading signing authority." >&2
+  exit 1
+fi
 grep -Fq 'EASYSPLAT_BENCHMARK_REFERENCE_RUNNER_SHA256' "$benchmark_workflow"
 grep -Fq 'EASYSPLAT_BENCHMARK_CONSTRAINED_RUNNER_SHA256' "$benchmark_workflow"
 grep -Fq 'EASYSPLAT_BENCHMARK_8GB_RUNNER_SHA256' "$benchmark_workflow"
 grep -Fq -- '--runner-identity "reference_m4_max=$REFERENCE_RUNNER_SHA256"' "$benchmark_workflow"
-grep -Fq -- '--request-index "$RUNNER_TEMP/requests/index.json"' "$benchmark_workflow"
+grep -Fq 'artifact-ids: ${{ needs.prepare.outputs.requests_artifact_id }}' "$benchmark_workflow"
+grep -Fq 'artifact-ids: ${{ needs.derive-reference.outputs.prepared_artifact_id }}' "$benchmark_workflow"
+grep -Fq 'artifact-ids: ${{ needs.derive-constrained.outputs.prepared_artifact_id }}' "$benchmark_workflow"
+grep -Fq 'artifact-ids: ${{ needs.derive-eight-gb.outputs.prepared_artifact_id }}' "$benchmark_workflow"
+grep -Fq '${{ needs.derive-reference.outputs.prepared_artifact_digest }}' "$benchmark_workflow"
+grep -Fq '${{ needs.derive-constrained.outputs.prepared_artifact_digest }}' "$benchmark_workflow"
+grep -Fq '${{ needs.derive-eight-gb.outputs.prepared_artifact_digest }}' "$benchmark_workflow"
+grep -Fq 'actions/artifacts/$artifact_id' "$benchmark_workflow"
+test "$(grep -Fc -- '--prepared-root' "$benchmark_workflow")" -eq 3
 grep -Fq 'name: easysplat-benchmark-${{ github.sha }}' "$benchmark_workflow"
 grep -Fq 'uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a' "$benchmark_workflow"
 grep -Fq 'uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c' "$benchmark_workflow"
@@ -1902,6 +1969,8 @@ test "$launch_line" -lt "$supply_line"
 grep -Fq 'zip -q -r -D "$CORE_ZIP"' "$ROOT/scripts/toolchain/package_toolchain.sh"
 grep -Fq 'zip -q -r -D "$DA3_BASE_ZIP" da3_mps/models/DA3-BASE' "$ROOT/scripts/toolchain/package_toolchain.sh"
 grep -Fq 'zip -q -r -D "$DA3_SMALL_ZIP" da3_mps/models/DA3-SMALL' "$ROOT/scripts/toolchain/package_toolchain.sh"
+grep -Fq 'rm -rf "$target/.cache"' "$ROOT/scripts/toolchain/build_da3_mps.sh"
+grep -Fq 'assert_exact_da3_model_payload "$DA3_MPS_INSTALL/da3_mps/models/$model"' "$ROOT/scripts/toolchain/package_toolchain.sh"
 grep -Fq 'MAX_RELEASE_ASSET_BYTES=2147483648' "$ROOT/scripts/toolchain/package_toolchain.sh"
 grep -Fq 'MAX_NORMAL_PHOTO_INSTALL_BYTES=2500000000' "$ROOT/scripts/toolchain/package_toolchain.sh"
 grep -Fq 'assert_release_asset_size "$CORE_ZIP"' "$ROOT/scripts/toolchain/package_toolchain.sh"
@@ -1923,20 +1992,25 @@ grep -Fq 'ensure_msplat_bundle' "$ROOT/scripts/run.sh"
 grep -Fq 'ensure_da3_mps_bundle' "$ROOT/scripts/run.sh"
 
 workflow="$ROOT/.github/workflows/toolchain-build.yml"
-grep -Fq 'runs-on: [self-hosted, macOS, ARM64, easysplat-release]' "$workflow"
-grep -Fq 'environment: toolchain-release' "$workflow"
+grep -Fq 'runs-on: [self-hosted, macOS, ARM64, easysplat-ephemeral]' "$workflow"
+grep -Fq 'runs-on: macos-15' "$workflow"
 grep -Fq 'if: github.ref == format(' "$workflow"
 grep -Fq 'fetch-depth: 0' "$workflow"
-grep -Fq 'CURRENT_HEAD="$(gh api "repos/$GITHUB_REPOSITORY/commits/$DEFAULT_BRANCH" --jq .sha)"' "$workflow"
-grep -Fq 'if [ "$GITHUB_SHA" != "$CURRENT_HEAD" ]; then' "$workflow"
+grep -Fq 'test "$GITHUB_SHA" = "$(gh api -H "X-GitHub-Api-Version: 2026-03-10" "repos/$GITHUB_REPOSITORY/commits/$DEFAULT_BRANCH" --jq .sha)"' "$workflow"
 grep -Fq 'uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0' "$workflow"
-grep -Fq 'uses: softprops/action-gh-release@b4309332981a82ec1c5618f44dd2e27cc8bfbfda' "$workflow"
-grep -Fq -- '--da3-base-zip "$DA3_BASE_ZIP"' "$workflow"
-grep -Fq -- '--da3-small-zip "$DA3_SMALL_ZIP"' "$workflow"
+grep -Fq 'name: toolchain-components-${{ steps.release.outputs.version }}' "$workflow"
+grep -Fq 'name: toolchain-signing-request-${{ inputs.version }}' "$workflow"
+grep -Fq 'artifact-ids: ${{ needs.build.outputs.artifact_id }}' "$workflow"
+grep -Fq 'actions/artifacts/$ARTIFACT_ID' "$workflow"
+grep -Fq 'ManifestTool prepare-release' "$workflow"
+grep -Fq -- '--da3-base-zip "$BUILD/toolchain-geometry-da3-base-$VERSION.zip"' "$workflow"
+grep -Fq -- '--da3-small-zip "$BUILD/toolchain-geometry-da3-small-$VERSION.zip"' "$workflow"
 grep -Fq -- '--app-version-minimum "$APP_VERSION_MINIMUM"' "$workflow"
 grep -Fq -- '--app-version-maximum-exclusive "$APP_VERSION_MAXIMUM_EXCLUSIVE"' "$workflow"
-grep -Fq 'Toolchains/out/toolchain-geometry-da3-base-${{ env.VERSION }}.zip' "$workflow"
-grep -Fq 'Toolchains/out/toolchain-geometry-da3-small-${{ env.VERSION }}.zip' "$workflow"
+if rg -n '^[[:space:]]+environment:|contents: write|\$\{\{ secrets\.|sign-release|gh release|TOOLCHAIN_PRIVATE_KEY|private[_-]key' "$workflow" >/dev/null; then
+  echo "Source toolchain workflow can access a secret, sign, or publish." >&2
+  exit 1
+fi
 if rg -n -- '--models-(zip|url)|MODELS_(ZIP|URL)|toolchain-macos-arm64-.*-models\.zip' \
   "$ROOT/scripts/release/build_dmg.sh" \
   "$ROOT/scripts/run.sh" \

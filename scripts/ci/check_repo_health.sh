@@ -21,11 +21,16 @@ required_files=(
   "$ROOT/scripts/benchmark/easysplat_benchmark.py"
   "$ROOT/scripts/benchmark/evidence_protocol.py"
   "$ROOT/scripts/benchmark/run_lane.py"
+  "$ROOT/scripts/benchmark/prepare_evidence.py"
+  "$ROOT/scripts/benchmark/aggregate_evidence.py"
   "$ROOT/scripts/benchmark/result.schema.json"
   "$ROOT/scripts/benchmark/evidence.schema.json"
   "$ROOT/scripts/benchmark/corpus.json"
   "$ROOT/scripts/benchmark/reference-config.json"
   "$ROOT/scripts/benchmark/tests/test_benchmark.py"
+  "$ROOT/scripts/benchmark/tests/test_aggregate_evidence.py"
+  "$ROOT/scripts/release/verify_publication_bundle.py"
+  "$ROOT/scripts/release/tests/test_verify_publication_bundle.py"
   "$ROOT/.github/workflows/benchmark-release.yml"
 )
 
@@ -114,10 +119,15 @@ for path in \
   fi
 done
 
-if ! rg -n 'refuses EASYSPLAT_ALLOW_UNPINNED_DA3_SOURCE' "$toolchain_workflow" >/dev/null; then
-  echo "Toolchain workflow no longer rejects unpinned DA3 source overrides: $toolchain_workflow" >&2
-  exit 1
-fi
+for contract in \
+  "case \"\${EASYSPLAT_ALLOW_UNPINNED_DA3_SOURCE:-0}\" in" \
+  '""|0|false|FALSE|no|NO|off|OFF) ;;' \
+  'scripts/toolchain/build_da3_mps.sh'; do
+  if ! rg -n -F "$contract" "$toolchain_workflow" >/dev/null; then
+    echo "Toolchain workflow no longer rejects unpinned DA3 source overrides: $toolchain_workflow" >&2
+    exit 1
+  fi
+done
 
 if rg -n '(^|[^A-Za-z0-9_])(xformers|flash[-_]attn|triton|torch[-_]scatter)([^A-Za-z0-9_]|$)' \
   "$ROOT/Tools/Da3Sfm" \

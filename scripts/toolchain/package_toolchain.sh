@@ -87,6 +87,26 @@ assert_normal_photo_install_size() {
   fi
 }
 
+assert_exact_da3_model_payload() {
+  local model_root="$1"
+  local actual
+  local expected
+  expected="$(printf '%s\n' LICENSE config.json easysplat_model_info.json model.safetensors)"
+  actual="$(find "$model_root" -mindepth 1 -maxdepth 1 -exec basename {} \; | LC_ALL=C sort)"
+  if [ "$actual" != "$expected" ]; then
+    echo "DA3 model payload must contain exactly four release files: $model_root" >&2
+    printf 'Found:\n%s\n' "$actual" >&2
+    exit 1
+  fi
+  local name
+  for name in LICENSE config.json easysplat_model_info.json model.safetensors; do
+    if [ ! -f "$model_root/$name" ] || [ -L "$model_root/$name" ] || [ ! -s "$model_root/$name" ]; then
+      echo "DA3 model payload entry must be a nonempty regular file: $model_root/$name" >&2
+      exit 1
+    fi
+  done
+}
+
 require_committed_packaging_sources
 rm -rf "$OUT"
 mkdir -p "$BIN" "$LICENSES" "$PROVENANCE" "$SUPPLY_CHAIN"
@@ -435,6 +455,7 @@ for model in DA3-BASE DA3-SMALL; do
     echo "da3_mps bundle missing models/$model/easysplat_model_info.json. Rebuild da3_mps." >&2
     exit 1
   fi
+  assert_exact_da3_model_payload "$DA3_MPS_INSTALL/da3_mps/models/$model"
 done
 if [ ! -f "$DA3_MPS_INSTALL/da3_mps/vendor/depth-anything-3/src/depth_anything_3/api.py" ]; then
   echo "da3_mps bundle missing vendor/depth-anything-3. Rebuild da3_mps." >&2
