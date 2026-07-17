@@ -85,7 +85,7 @@ public struct ResolvedRunPlan: Codable, Sendable, Equatable {
     public var baLocalFunctionTolerance: Double
     public var baGlobalFunctionTolerance: Double
     public var baLocalImageCount: Int
-    public var deterministicSeed: UInt64
+    public var runSeed: UInt64
 
     public init(
         routeIdentifier: String,
@@ -127,7 +127,7 @@ public struct ResolvedRunPlan: Codable, Sendable, Equatable {
         baLocalFunctionTolerance: Double = 0.001,
         baGlobalFunctionTolerance: Double = 0.000_001,
         baLocalImageCount: Int = 6,
-        deterministicSeed: UInt64 = 42
+        runSeed: UInt64 = 42
     ) {
         self.routeIdentifier = routeIdentifier
         self.modelIdentifier = modelIdentifier
@@ -168,7 +168,7 @@ public struct ResolvedRunPlan: Codable, Sendable, Equatable {
         self.baLocalFunctionTolerance = baLocalFunctionTolerance
         self.baGlobalFunctionTolerance = baGlobalFunctionTolerance
         self.baLocalImageCount = baLocalImageCount
-        self.deterministicSeed = deterministicSeed
+        self.runSeed = runSeed
     }
 
     public func toolchainCapabilityRequest() throws -> ToolchainCapabilityRequest {

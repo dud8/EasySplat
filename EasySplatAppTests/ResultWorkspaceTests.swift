@@ -918,7 +918,7 @@ final class ResultWorkspaceTests: XCTestCase {
                 detailProfile: .balanced,
                 iterationLimit: 7_000,
                 plateauWindow: 800,
-                deterministicSeed: 42,
+                cameraOrderSeed: 42,
                 completedIteration: 7_000,
                 checkpointPath: nil,
                 checkpointDigest: nil,

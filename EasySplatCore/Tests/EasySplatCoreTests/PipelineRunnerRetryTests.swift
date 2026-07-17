@@ -4,26 +4,26 @@ import SQLite3
 @testable import EasySplatCore
 
 final class PipelineRunnerRetryTests: XCTestCase {
-    func testTargetedExactEscalatesOnlyRecoverableGeometryFailures() {
-        XCTAssertTrue(PipelineRunner.shouldEscalateTargetedExact(
+    func testPairGraphRecoveryRecognizesRecoverableGeometryFailures() {
+        XCTAssertTrue(PipelineRunner.shouldRecoverPairGraph(
             after: PipelineRunner.PipelineError.outputMissing
         ))
-        XCTAssertTrue(PipelineRunner.shouldEscalateTargetedExact(
+        XCTAssertTrue(PipelineRunner.shouldRecoverPairGraph(
             after: PipelineRunner.PipelineError.geometryResidualCoverageTooLow(
                 measured: 12,
                 total: 60
             )
         ))
-        XCTAssertTrue(PipelineRunner.shouldEscalateTargetedExact(
+        XCTAssertTrue(PipelineRunner.shouldRecoverPairGraph(
             after: PipelineRunner.PipelineError.geometryResidualsTooHigh(
                 median: 2,
                 p90: 4
             )
         ))
-        XCTAssertFalse(PipelineRunner.shouldEscalateTargetedExact(
+        XCTAssertFalse(PipelineRunner.shouldRecoverPairGraph(
             after: PipelineRunner.PipelineError.geometryProvenanceUnavailable("missing")
         ))
-        XCTAssertFalse(PipelineRunner.shouldEscalateTargetedExact(
+        XCTAssertFalse(PipelineRunner.shouldRecoverPairGraph(
             after: ColmapRunnerError.failed(
                 command: "mapper",
                 exitCode: 1,
@@ -46,7 +46,6 @@ final class PipelineRunnerRetryTests: XCTestCase {
         )
 
         XCTAssertTrue(PipelineRunner.shouldRecoverPairGraph(after: fragmentation))
-        XCTAssertTrue(PipelineRunner.shouldEscalateTargetedExact(after: fragmentation))
         XCTAssertTrue(PipelineRunner.shouldRecoverPairGraph(
             after: PipelineRunner.PipelineError.lowQualityReconstruction(
                 ReconstructionScore(
@@ -57,7 +56,7 @@ final class PipelineRunnerRetryTests: XCTestCase {
                 mapper: "colmap"
             )
         ))
-        XCTAssertFalse(PipelineRunner.shouldRecoverPairGraph(
+        XCTAssertTrue(PipelineRunner.shouldRecoverPairGraph(
             after: PipelineRunner.PipelineError.geometryResidualsTooHigh(
                 median: 2,
                 p90: 4

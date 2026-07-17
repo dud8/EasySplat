@@ -3332,7 +3332,7 @@ private func makeCompletedTrainingArtifact(
         detailProfile: detailProfile,
         iterationLimit: budget.iterationLimit,
         plateauWindow: budget.plateauWindow,
-        deterministicSeed: 42,
+        cameraOrderSeed: 42,
         completedIteration: 1,
         checkpointPath: nil,
         checkpointDigest: nil,

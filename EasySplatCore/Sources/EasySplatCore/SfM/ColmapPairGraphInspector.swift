@@ -17,23 +17,56 @@ struct ColmapVerifiedGraphSnapshot: Sendable, Equatable {
 }
 
 enum PairGraphConnectivityPolicy {
+    static let minimumDominantFractionWithVerifiedMinority = 0.95
+
     static func dominantViewCount(
         totalViewCount: Int,
+        componentViewCounts: [Int],
         connectedComponentCount: Int,
         isolatedViewCount: Int,
         descriptorlessViewCount: Int
     ) -> Int? {
         guard totalViewCount >= 2,
+              !componentViewCounts.isEmpty,
+              componentViewCounts.count <= totalViewCount,
+              connectedComponentCount == componentViewCounts.count,
               descriptorlessViewCount >= 0,
               descriptorlessViewCount <= isolatedViewCount,
               isolatedViewCount >= 0,
-              isolatedViewCount <= totalViewCount - 2,
-              connectedComponentCount == isolatedViewCount + 1 else {
+              isolatedViewCount <= totalViewCount - 2 else {
             return nil
         }
-        let dominantViewCount = totalViewCount - isolatedViewCount
-        guard Double(dominantViewCount) / Double(totalViewCount)
-                >= ReconstructionScorer.minimumRegisteredViewFraction else {
+        var sum = 0
+        var previous = totalViewCount
+        var measuredIsolatedViewCount = 0
+        for count in componentViewCounts {
+            guard count > 0,
+                  count <= previous,
+                  count <= totalViewCount else {
+                return nil
+            }
+            let addition = sum.addingReportingOverflow(count)
+            guard !addition.overflow, addition.partialValue <= totalViewCount else {
+                return nil
+            }
+            sum = addition.partialValue
+            previous = count
+            if count == 1 {
+                measuredIsolatedViewCount += 1
+            }
+        }
+        guard sum == totalViewCount,
+              measuredIsolatedViewCount == isolatedViewCount,
+              let dominantViewCount = componentViewCounts.first,
+              dominantViewCount >= 2,
+              componentViewCounts.dropFirst().first.map({ dominantViewCount > $0 }) ?? true else {
+            return nil
+        }
+        let hasMinorVerifiedComponent = componentViewCounts.dropFirst().contains { $0 > 1 }
+        let requiredFraction = hasMinorVerifiedComponent
+            ? minimumDominantFractionWithVerifiedMinority
+            : ReconstructionScorer.minimumRegisteredViewFraction
+        guard Double(dominantViewCount) / Double(totalViewCount) >= requiredFraction else {
             return nil
         }
         return dominantViewCount
@@ -70,27 +103,106 @@ struct ColmapPairGraphInspection: Sendable, Equatable {
     }
 
     var hasAcceptableDominantVerifiedComponent: Bool {
-        let totalViewCount = verifiedGraph.components.reduce(0) { $0 + $1.count }
-        guard let dominantViewCount = PairGraphConnectivityPolicy.dominantViewCount(
-            totalViewCount: totalViewCount,
+        hasAcceptableDominantVerifiedComponent(allowMinorVerifiedComponents: false)
+    }
+
+    func hasAcceptableDominantVerifiedComponent(
+        allowMinorVerifiedComponents: Bool
+    ) -> Bool {
+        let components = verifiedGraph.components
+        guard connectedComponentCount == components.count,
+              isolatedViewCount == components.count(where: { $0.count == 1 }),
+              spatiallyVerifiedPairCount == verifiedGraph.verifiedPairs.count,
+              components.allSatisfy({ !$0.isEmpty }) else {
+            return false
+        }
+
+        var componentIndexByImageName: [String: Int] = [:]
+        var componentNames: [Set<String>] = []
+        componentNames.reserveCapacity(components.count)
+        for (componentIndex, component) in components.enumerated() {
+            let names = Set(component)
+            guard names.count == component.count else {
+                return false
+            }
+            for name in names {
+                guard componentIndexByImageName.updateValue(
+                    componentIndex,
+                    forKey: name
+                ) == nil else {
+                    return false
+                }
+            }
+            componentNames.append(names)
+        }
+
+        let descriptorlessNames = Set(descriptorlessImageNames)
+        let singletonNames = Set(
+            components.filter { $0.count == 1 }.compactMap(\.first)
+        )
+        guard descriptorlessNames.count == descriptorlessImageNames.count,
+              descriptorlessNames.isSubset(of: singletonNames) else {
+            return false
+        }
+
+        var adjacency = Dictionary(
+            uniqueKeysWithValues: componentIndexByImageName.keys.map { ($0, Set<String>()) }
+        )
+        var verifiedEdges: Set<Set<String>> = []
+        for pair in verifiedGraph.verifiedPairs {
+            let first = pair.firstImageName
+            let second = pair.secondImageName
+            guard first != second,
+                  let firstComponent = componentIndexByImageName[first],
+                  let secondComponent = componentIndexByImageName[second],
+                  firstComponent == secondComponent else {
+                return false
+            }
+            let edge = Set([first, second])
+            guard verifiedEdges.insert(edge).inserted else {
+                return false
+            }
+            adjacency[first, default: []].insert(second)
+            adjacency[second, default: []].insert(first)
+        }
+
+        for names in componentNames {
+            guard let start = names.first else {
+                return false
+            }
+            var reached: Set<String> = [start]
+            var pending = [start]
+            while let imageName = pending.popLast() {
+                for neighbor in adjacency[imageName, default: []]
+                    where reached.insert(neighbor).inserted {
+                    pending.append(neighbor)
+                }
+            }
+            guard reached == names else {
+                return false
+            }
+        }
+
+        let sortedComponentSizes = components.map(\.count).sorted(by: >)
+        guard PairGraphConnectivityPolicy.dominantViewCount(
+            totalViewCount: componentIndexByImageName.count,
+            componentViewCounts: sortedComponentSizes,
             connectedComponentCount: connectedComponentCount,
             isolatedViewCount: isolatedViewCount,
             descriptorlessViewCount: descriptorlessViewCount
-        ) else {
+        ) != nil else {
             return false
         }
-        let nonSingletonComponents = verifiedGraph.components.filter { $0.count > 1 }
-        guard nonSingletonComponents.count == 1,
-              nonSingletonComponents[0].count == dominantViewCount,
-              verifiedGraph.components.allSatisfy({
-                  $0.count == 1 || $0.count == dominantViewCount
-              }) else {
+
+        let hasMinorVerifiedComponent = sortedComponentSizes.dropFirst().contains { $0 > 1 }
+        guard hasMinorVerifiedComponent else {
+            return true
+        }
+        guard allowMinorVerifiedComponents,
+              sortedComponentSizes.first != nil else {
             return false
         }
-        let singletonNames = Set(
-            verifiedGraph.components.filter { $0.count == 1 }.compactMap(\.first)
-        )
-        return Set(descriptorlessImageNames).isSubset(of: singletonNames)
+        return true
     }
 }
 
@@ -722,11 +834,16 @@ struct ColmapPairGraphInspector: Sendable {
         let components = membersByRoot.values.sorted { first, second in
             indexByName[first[0]]! < indexByName[second[0]]!
         }
+        var dominantComponent = components[0]
+        for component in components.dropFirst() where component.count > dominantComponent.count {
+            dominantComponent = component
+        }
         let sortedDegrees = degrees.sorted()
         let robustness = try biconnectedRobustness(
             imageNames: imageNames,
             verifiedPairs: verifiedPairs,
             descriptorlessImageNames: descriptorlessImageNames,
+            includedImageNames: Set(dominantComponent),
             indexByName: indexByName
         )
         return (
@@ -746,6 +863,7 @@ struct ColmapPairGraphInspector: Sendable {
         imageNames: [String],
         verifiedPairs: [ColmapScheduledPair],
         descriptorlessImageNames: Set<String>,
+        includedImageNames: Set<String>,
         indexByName: [String: Int]
     ) throws -> (articulationCount: Int, blockSizes: [Int]) {
         struct Edge: Sendable {
@@ -765,7 +883,9 @@ struct ColmapPairGraphInspector: Sendable {
         var adjacency = Array(repeating: [Edge](), count: imageNames.count)
         for (edgeID, pair) in verifiedPairs.enumerated() {
             try Task.checkCancellation()
-            if descriptorlessImageNames.contains(pair.firstImageName)
+            if !includedImageNames.contains(pair.firstImageName)
+                || !includedImageNames.contains(pair.secondImageName)
+                || descriptorlessImageNames.contains(pair.firstImageName)
                 || descriptorlessImageNames.contains(pair.secondImageName) {
                 continue
             }
@@ -817,7 +937,8 @@ struct ColmapPairGraphInspector: Sendable {
 
         for root in imageNames.indices {
             try Task.checkCancellation()
-            guard !descriptorlessImageNames.contains(imageNames[root]),
+            guard includedImageNames.contains(imageNames[root]),
+                  !descriptorlessImageNames.contains(imageNames[root]),
                   discovery[root] == -1 else {
                 continue
             }

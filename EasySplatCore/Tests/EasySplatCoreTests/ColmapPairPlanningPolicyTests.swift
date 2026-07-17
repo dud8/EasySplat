@@ -208,6 +208,64 @@ final class ColmapPairPlanningPolicyTests: XCTestCase {
         )
     }
 
+    func testMinorVerifiedComponentsRequireOrderedInputAndOneDensityRetry() {
+        for policy in [
+            ResolvedPairingPolicy.orderedContinuous,
+            .orderedOrbit,
+            .orderedWalkthrough,
+            .orderedLargeArea,
+        ] {
+            XCTAssertFalse(PipelineRunner.allowsMinorVerifiedComponents(
+                pairingPolicy: policy,
+                recoveryLevel: .normal
+            ))
+            XCTAssertTrue(PipelineRunner.allowsMinorVerifiedComponents(
+                pairingPolicy: policy,
+                recoveryLevel: .expanded
+            ))
+            XCTAssertTrue(PipelineRunner.allowsMinorVerifiedComponents(
+                pairingPolicy: policy,
+                recoveryLevel: .maximum
+            ))
+        }
+
+        for policy in [
+            ResolvedPairingPolicy.unorderedRetrieval,
+            .segmentedMixed,
+        ] {
+            XCTAssertFalse(PipelineRunner.allowsMinorVerifiedComponents(
+                pairingPolicy: policy,
+                recoveryLevel: .expanded
+            ))
+            XCTAssertFalse(PipelineRunner.allowsMinorVerifiedComponents(
+                pairingPolicy: policy,
+                recoveryLevel: .maximum
+            ))
+        }
+
+        let minorVerifiedComponents = [57, 2, 1]
+        XCTAssertFalse(PipelineRunner.permitsAcceptedComponentShape(
+            minorVerifiedComponents,
+            pairingPolicy: .orderedContinuous,
+            recoveryLevel: .normal
+        ))
+        XCTAssertTrue(PipelineRunner.permitsAcceptedComponentShape(
+            minorVerifiedComponents,
+            pairingPolicy: .orderedContinuous,
+            recoveryLevel: .expanded
+        ))
+        XCTAssertFalse(PipelineRunner.permitsAcceptedComponentShape(
+            minorVerifiedComponents,
+            pairingPolicy: .unorderedRetrieval,
+            recoveryLevel: .maximum
+        ))
+        XCTAssertTrue(PipelineRunner.permitsAcceptedComponentShape(
+            [54, 1, 1, 1, 1, 1, 1],
+            pairingPolicy: .unorderedRetrieval,
+            recoveryLevel: .normal
+        ))
+    }
+
     func testRetrievalOutputRequiresDirectedQueriesAndNovelBoundedPairs() throws {
         let names = (0..<20).map { "frame_\($0).jpg" }
         let base = try ColmapPairPlan.temporal(

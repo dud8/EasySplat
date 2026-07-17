@@ -4,8 +4,6 @@ extension PipelineRunner {
     enum PairAttemptMode: Sendable, Equatable {
         case policy
         case sameScheduleExact(ColmapPairPlan)
-        case targetedExact(plan: ColmapPairPlan, source: ColmapPairPlan)
-        case fullExact(source: ColmapPairPlan)
 
         var planOverride: ColmapPairPlan? {
             switch self {
@@ -13,30 +11,6 @@ extension PipelineRunner {
                 nil
             case .sameScheduleExact(let plan):
                 plan
-            case .targetedExact(let plan, _):
-                plan
-            case .fullExact(let source):
-                source
-            }
-        }
-
-        var evidencePurpose: PairGraphAttemptPurpose {
-            switch self {
-            case .policy, .sameScheduleExact:
-                .policy
-            case .targetedExact:
-                .targetedExactGraphRecovery
-            case .fullExact:
-                .fullExactGraphRecovery
-            }
-        }
-
-        var sourcePlan: ColmapPairPlan? {
-            switch self {
-            case .targetedExact(_, let source), .fullExact(let source):
-                source
-            case .policy, .sameScheduleExact:
-                nil
             }
         }
     }
@@ -75,7 +49,35 @@ extension PipelineRunner {
         case invalidRetrievalOutput
     }
 
-    static func shouldEscalateTargetedExact(after error: Error?) -> Bool {
+    static func allowsMinorVerifiedComponents(
+        pairingPolicy: ResolvedPairingPolicy,
+        recoveryLevel: PairRecoveryLevel
+    ) -> Bool {
+        guard recoveryLevel != .normal else { return false }
+        switch pairingPolicy {
+        case .orderedContinuous,
+             .orderedOrbit,
+             .orderedWalkthrough,
+             .orderedLargeArea:
+            return true
+        case .unorderedRetrieval, .segmentedMixed:
+            return false
+        }
+    }
+
+    static func permitsAcceptedComponentShape(
+        _ componentViewCounts: [Int],
+        pairingPolicy: ResolvedPairingPolicy,
+        recoveryLevel: PairRecoveryLevel
+    ) -> Bool {
+        let hasMinorVerifiedComponent = componentViewCounts.dropFirst().contains { $0 > 1 }
+        return !hasMinorVerifiedComponent || allowsMinorVerifiedComponents(
+            pairingPolicy: pairingPolicy,
+            recoveryLevel: recoveryLevel
+        )
+    }
+
+    static func shouldRecoverPairGraph(after error: Error?) -> Bool {
         guard let error = error as? PipelineError else { return false }
         switch error {
         case .lowQualityReconstruction,
@@ -93,27 +95,6 @@ extension PipelineRunner {
              .videoFrameBudgetTooSmall,
              .photoSelectionExceedsBudget,
              .imageTranscodeFailed:
-            return false
-        }
-    }
-
-    static func shouldRecoverPairGraph(after error: Error?) -> Bool {
-        guard let error = error as? PipelineError else { return false }
-        switch error {
-        case .lowQualityReconstruction, .fragmentedReconstruction:
-            return true
-        case .invalidInput,
-             .insufficientInputImages,
-             .geometryCoverageTooLow,
-             .geometryResidualCoverageTooLow,
-             .geometryRegisteredImagesMismatch,
-             .geometryResidualsUnavailable,
-             .geometryResidualsTooHigh,
-             .geometryProvenanceUnavailable,
-             .videoFrameBudgetTooSmall,
-             .photoSelectionExceedsBudget,
-             .imageTranscodeFailed,
-             .outputMissing:
             return false
         }
     }

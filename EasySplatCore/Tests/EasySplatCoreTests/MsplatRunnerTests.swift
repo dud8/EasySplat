@@ -1924,7 +1924,7 @@ private func checkpointedArtifact(for receipt: MsplatCheckpointReceipt) -> Train
         detailProfile: .balanced,
         iterationLimit: 7_000,
         plateauWindow: 800,
-        deterministicSeed: 42,
+        cameraOrderSeed: 42,
         completedIteration: receipt.iteration,
         checkpointPath: "Training/checkpoints/msplat",
         checkpointDigest: receipt.payloadSHA256,

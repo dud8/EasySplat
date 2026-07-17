@@ -1,23 +1,14 @@
 import CryptoKit
 import Foundation
 
-enum PairGraphAttemptPurpose: String, Codable, Sendable, Equatable {
-    case policy
-    case targetedExactGraphRecovery
-    case fullExactGraphRecovery
-}
-
 struct PairGraphAttemptEvidence: Codable, Sendable, Equatable {
-    var purpose: PairGraphAttemptPurpose
     var artifact: PairMatchingAttemptArtifact
     var scheduledPairs: [ColmapScheduledPair]
 
     init(
-        purpose: PairGraphAttemptPurpose = .policy,
         artifact: PairMatchingAttemptArtifact,
         scheduledPairs: [ColmapScheduledPair]
     ) {
-        self.purpose = purpose
         self.artifact = artifact
         self.scheduledPairs = scheduledPairs
     }
@@ -34,6 +25,7 @@ struct PersistedColmapPairGraphInspection: Codable, Sendable, Equatable {
     var connectedComponentCount: Int
     var isolatedViewCount: Int
     var descriptorlessViewCount: Int
+    var componentViewCounts: [Int]
     var articulationViewCount: Int
     var biconnectedBlockCount: Int
     var largestBiconnectedBlockViewCount: Int
@@ -55,6 +47,9 @@ struct PersistedColmapPairGraphInspection: Codable, Sendable, Equatable {
         connectedComponentCount = inspection.connectedComponentCount
         isolatedViewCount = inspection.isolatedViewCount
         descriptorlessViewCount = inspection.descriptorlessViewCount
+        componentViewCounts = inspection.verifiedGraph.components
+            .map(\.count)
+            .sorted(by: >)
         articulationViewCount = inspection.articulationViewCount
         biconnectedBlockCount = inspection.biconnectedBlockCount
         largestBiconnectedBlockViewCount = inspection.largestBiconnectedBlockViewCount
@@ -68,11 +63,12 @@ struct PersistedColmapPairGraphInspection: Codable, Sendable, Equatable {
 }
 
 struct PairGraphEvidence: Codable, Sendable, Equatable {
-    static let currentSchemaVersion = 4
+    static let currentSchemaVersion = 6
 
     var schemaVersion: Int
     var selectedFramesDigest: String
     var imageNames: [String]
+    var pairingPolicy: ResolvedPairingPolicy
     var attempts: [PairGraphAttemptEvidence]
     var acceptedAttemptNumber: Int
     var acceptedInspection: PersistedColmapPairGraphInspection
@@ -83,6 +79,7 @@ struct PairGraphEvidence: Codable, Sendable, Equatable {
     init(
         selectedFramesDigest: String,
         imageNames: [String],
+        pairingPolicy: ResolvedPairingPolicy = .orderedContinuous,
         attempts: [PairGraphAttemptEvidence],
         acceptedAttemptNumber: Int,
         acceptedInspection: ColmapPairGraphInspection,
@@ -92,6 +89,7 @@ struct PairGraphEvidence: Codable, Sendable, Equatable {
         schemaVersion = Self.currentSchemaVersion
         self.selectedFramesDigest = selectedFramesDigest
         self.imageNames = imageNames
+        self.pairingPolicy = pairingPolicy
         self.attempts = attempts
         self.acceptedAttemptNumber = acceptedAttemptNumber
         self.acceptedInspection = PersistedColmapPairGraphInspection(acceptedInspection)
@@ -103,6 +101,7 @@ struct PairGraphEvidence: Codable, Sendable, Equatable {
     func pairGraphMeasurement() throws -> PairGraphMeasurement {
         try PairGraphEvidenceStore.validate(self)
         return PairGraphMeasurement(
+            pairingPolicy: pairingPolicy,
             scheduledPairCount: acceptedInspection.scheduledPairCount,
             attemptedPairCount: acceptedInspection.attemptedPairCount,
             rawMatchedPairCount: acceptedInspection.rawMatchedPairCount,
@@ -113,6 +112,7 @@ struct PairGraphEvidence: Codable, Sendable, Equatable {
             connectedComponentCount: acceptedInspection.connectedComponentCount,
             isolatedViewCount: acceptedInspection.isolatedViewCount,
             descriptorlessViewCount: acceptedInspection.descriptorlessViewCount,
+            componentViewCounts: acceptedInspection.componentViewCounts,
             articulationViewCount: acceptedInspection.articulationViewCount,
             biconnectedBlockCount: acceptedInspection.biconnectedBlockCount,
             largestBiconnectedBlockViewCount: acceptedInspection.largestBiconnectedBlockViewCount,
@@ -132,31 +132,15 @@ struct PairGraphEvidence: Codable, Sendable, Equatable {
         .measured(try pairGraphMeasurement())
     }
 
-    func restoredPairPlans() throws -> (
-        accepted: ColmapPairPlan,
-        recoverySource: ColmapPairPlan?
-    ) {
+    func restoredPairPlan() throws -> ColmapPairPlan {
         try PairGraphEvidenceStore.validate(self)
         guard let acceptedAttempt = attempts.last else {
             throw PairGraphEvidenceStoreError.invalidEvidence
         }
-        let accepted = try ColmapPairPlan.persisted(
+        return try ColmapPairPlan.persisted(
             imageNames: imageNames,
             scheduledPairs: acceptedAttempt.scheduledPairs
         )
-        guard acceptedAttempt.purpose != .policy,
-              let firstRecoveryIndex = attempts.firstIndex(where: {
-                  $0.purpose != .policy
-              }),
-              firstRecoveryIndex > 0 else {
-            return (accepted, nil)
-        }
-        let sourceAttempt = attempts[firstRecoveryIndex - 1]
-        let source = try ColmapPairPlan.persisted(
-            imageNames: imageNames,
-            scheduledPairs: sourceAttempt.scheduledPairs
-        )
-        return (accepted, source)
     }
 
     fileprivate static func digest(of pairs: [ColmapScheduledPair]) -> String {
@@ -271,6 +255,7 @@ enum PairGraphEvidenceStore {
         }
         try validateAttemptHistory(
             imageNames: evidence.imageNames,
+            pairingPolicy: evidence.pairingPolicy,
             attempts: evidence.attempts,
             matchingDurationSeconds: evidence.matchingDurationSeconds,
             fallbackReasons: evidence.fallbackReasons
@@ -286,13 +271,15 @@ enum PairGraphEvidenceStore {
         try validate(
             evidence.acceptedInspection,
             against: acceptedAttempt,
-            imageCount: evidence.imageNames.count
+            imageCount: evidence.imageNames.count,
+            pairingPolicy: evidence.pairingPolicy
         )
 
     }
 
     static func validateAttemptHistory(
         imageNames: [String],
+        pairingPolicy: ResolvedPairingPolicy,
         attempts: [PairGraphAttemptEvidence],
         matchingDurationSeconds: Double,
         fallbackReasons: [String]
@@ -325,7 +312,11 @@ enum PairGraphEvidenceStore {
                 imageIndexByName: imageIndexByName
             )
         }
-        try validateRecoverySequence(attempts)
+        try validateRecoverySequence(
+            attempts,
+            imageNames: imageNames,
+            pairingPolicy: pairingPolicy
+        )
 
         let measuredDuration = attempts.reduce(0.0) {
             $0 + $1.artifact.durationSeconds
@@ -390,7 +381,8 @@ enum PairGraphEvidenceStore {
     private static func validate(
         _ inspection: PersistedColmapPairGraphInspection,
         against attempt: PairGraphAttemptEvidence,
-        imageCount: Int
+        imageCount: Int,
+        pairingPolicy: ResolvedPairingPolicy
     ) throws {
         let artifact = attempt.artifact
         let localCount = attempt.scheduledPairs.count { $0.role == .local }
@@ -403,11 +395,21 @@ enum PairGraphEvidenceStore {
         }
         guard let dominantViewCount = PairGraphConnectivityPolicy.dominantViewCount(
             totalViewCount: imageCount,
+            componentViewCounts: inspection.componentViewCounts,
             connectedComponentCount: inspection.connectedComponentCount,
             isolatedViewCount: inspection.isolatedViewCount,
             descriptorlessViewCount: descriptorlessViewCount
         ) else {
             throw PairGraphEvidenceStoreError.invalidEvidence
+        }
+        let hasMinorVerifiedComponent = inspection.componentViewCounts
+            .dropFirst()
+            .contains { $0 > 1 }
+        if hasMinorVerifiedComponent {
+            guard isOrdered(pairingPolicy),
+                  attempt.artifact.recoveryLevel != .normal else {
+                throw PairGraphEvidenceStoreError.invalidEvidence
+            }
         }
         let hasSingleBiconnectedBlock = inspection.biconnectedBlockCount == 1
         guard inspection.scheduledPairCount == artifact.scheduledPairCount,
@@ -465,89 +467,109 @@ enum PairGraphEvidenceStore {
     }
 
     private static func validateRecoverySequence(
-        _ attempts: [PairGraphAttemptEvidence]
+        _ attempts: [PairGraphAttemptEvidence],
+        imageNames: [String],
+        pairingPolicy: ResolvedPairingPolicy
     ) throws {
-        var recoverySource: PairGraphAttemptEvidence?
-        var recoveryPhase: PairGraphAttemptPurpose?
-        var recoveryPhasePlan: [ColmapScheduledPair]?
-        var recoveryPhaseCompleted = false
-
-        for (index, attempt) in attempts.enumerated() {
+        guard let first = attempts.first,
+              first.artifact.matcher == .faiss,
+              first.artifact.recoveryLevel == .normal else {
+            throw PairGraphEvidenceStoreError.invalidEvidence
+        }
+        var previousAttempt: PairGraphAttemptEvidence?
+        var previousPlan: ColmapPairPlan?
+        for attempt in attempts {
             try Task.checkCancellation()
-            switch attempt.purpose {
-            case .policy:
-                guard recoveryPhase == nil else {
+            let plan = try ColmapPairPlan.persisted(
+                imageNames: imageNames,
+                scheduledPairs: attempt.scheduledPairs
+            )
+            guard attempt.artifact.outcome != .completed || plan.isConnected else {
+                throw PairGraphEvidenceStoreError.invalidEvidence
+            }
+            defer {
+                previousAttempt = attempt
+                previousPlan = plan
+            }
+            guard let previousAttempt, let previousPlan else {
+                continue
+            }
+            let previousLevel = recoveryLevelIndex(
+                previousAttempt.artifact.recoveryLevel
+            )
+            let level = recoveryLevelIndex(attempt.artifact.recoveryLevel)
+            guard level >= previousLevel,
+                  level - previousLevel <= 1 else {
+                throw PairGraphEvidenceStoreError.invalidEvidence
+            }
+            if level == previousLevel {
+                if attempt.artifact.matcher == previousAttempt.artifact.matcher {
+                    guard previousAttempt.artifact.outcome == .failed,
+                          plan == previousPlan else {
+                        throw PairGraphEvidenceStoreError.invalidEvidence
+                    }
+                } else {
+                    guard previousAttempt.artifact.matcher == .faiss,
+                          attempt.artifact.matcher == .exact,
+                          plan == previousPlan,
+                          permitsExactMatcherTransition(
+                              after: previousAttempt.artifact,
+                              imageCount: imageNames.count,
+                              pairingPolicy: pairingPolicy
+                          ) else {
+                        throw PairGraphEvidenceStoreError.invalidEvidence
+                    }
+                }
+            } else {
+                let repeatedPlanningFailure = plan == previousPlan
+                    && attempt.artifact.outcome == .failed
+                    && attempt.artifact.attemptedPairCount == 0
+                    && attempt.artifact.rawMatchedPairCount == 0
+                    && attempt.artifact.spatiallyVerifiedPairCount == 0
+                guard attempt.artifact.matcher == previousAttempt.artifact.matcher,
+                      plan != previousPlan || repeatedPlanningFailure else {
                     throw PairGraphEvidenceStoreError.invalidEvidence
-                }
-
-            case .targetedExactGraphRecovery:
-                if recoveryPhase == nil {
-                    guard index > 0 else {
-                        throw PairGraphEvidenceStoreError.invalidEvidence
-                    }
-                    let source = attempts[index - 1]
-                    guard source.purpose == .policy,
-                          source.artifact.matcher == .faiss,
-                          source.artifact.outcome == .completed,
-                          attempt.scheduledPairs.count < source.scheduledPairs.count else {
-                        throw PairGraphEvidenceStoreError.invalidEvidence
-                    }
-                    let sourcePairs = Set(source.scheduledPairs)
-                    guard attempt.scheduledPairs.allSatisfy(sourcePairs.contains) else {
-                        throw PairGraphEvidenceStoreError.invalidEvidence
-                    }
-                    recoverySource = source
-                    recoveryPhase = .targetedExactGraphRecovery
-                    recoveryPhasePlan = attempt.scheduledPairs
-                }
-                guard recoveryPhase == .targetedExactGraphRecovery,
-                      !recoveryPhaseCompleted,
-                      let source = recoverySource,
-                      attempt.artifact.matcher == .exact,
-                      attempt.artifact.recoveryLevel == source.artifact.recoveryLevel,
-                      attempt.scheduledPairs == recoveryPhasePlan else {
-                    throw PairGraphEvidenceStoreError.invalidEvidence
-                }
-                if attempt.artifact.outcome == .completed {
-                    recoveryPhaseCompleted = true
-                }
-
-            case .fullExactGraphRecovery:
-                if recoveryPhase == nil {
-                    guard index > 0 else {
-                        throw PairGraphEvidenceStoreError.invalidEvidence
-                    }
-                    let source = attempts[index - 1]
-                    guard source.purpose == .policy,
-                          source.artifact.matcher == .faiss,
-                          source.artifact.outcome == .completed else {
-                        throw PairGraphEvidenceStoreError.invalidEvidence
-                    }
-                    recoverySource = source
-                    recoveryPhase = .fullExactGraphRecovery
-                    recoveryPhasePlan = source.scheduledPairs
-                } else if recoveryPhase == .targetedExactGraphRecovery {
-                    guard recoveryPhaseCompleted,
-                          let source = recoverySource else {
-                        throw PairGraphEvidenceStoreError.invalidEvidence
-                    }
-                    recoveryPhase = .fullExactGraphRecovery
-                    recoveryPhasePlan = source.scheduledPairs
-                    recoveryPhaseCompleted = false
-                }
-                guard recoveryPhase == .fullExactGraphRecovery,
-                      !recoveryPhaseCompleted,
-                      let source = recoverySource,
-                      attempt.artifact.matcher == .exact,
-                      attempt.artifact.recoveryLevel == source.artifact.recoveryLevel,
-                      attempt.scheduledPairs == recoveryPhasePlan,
-                      attempt.scheduledPairs == source.scheduledPairs else {
-                    throw PairGraphEvidenceStoreError.invalidEvidence
-                }
-                if attempt.artifact.outcome == .completed {
-                    recoveryPhaseCompleted = true
                 }
             }
+        }
+    }
+
+    static func permitsExactMatcherTransition(
+        after previous: PairMatchingAttemptArtifact,
+        imageCount: Int,
+        pairingPolicy: ResolvedPairingPolicy
+    ) -> Bool {
+        guard previous.matcher == .faiss else { return false }
+        if previous.outcome == .failed { return true }
+        if previous.recoveryLevel == .maximum { return true }
+        guard previous.recoveryLevel == .normal,
+              pairingPolicy == .unorderedRetrieval,
+              imageCount >= 2,
+              imageCount <= 60 else {
+            return false
+        }
+        let product = imageCount.multipliedReportingOverflow(by: imageCount - 1)
+        guard !product.overflow else { return false }
+        return previous.scheduledPairCount == product.partialValue / 2
+    }
+
+    private static func recoveryLevelIndex(_ level: PairGraphRecoveryLevel) -> Int {
+        switch level {
+        case .normal: return 0
+        case .expanded: return 1
+        case .maximum: return 2
+        }
+    }
+
+    private static func isOrdered(_ policy: ResolvedPairingPolicy) -> Bool {
+        switch policy {
+        case .orderedContinuous,
+             .orderedOrbit,
+             .orderedWalkthrough,
+             .orderedLargeArea:
+            return true
+        case .unorderedRetrieval, .segmentedMixed:
+            return false
         }
     }
 

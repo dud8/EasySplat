@@ -48,6 +48,14 @@ private enum SparseModelPublicationError: Error, LocalizedError {
 
 extension PipelineRunner {
     static func normalizedUnusableSparseModelError(_ error: Error) -> Error {
+        if let pathError = error as? ProjectPathError {
+            switch pathError {
+            case .escapesProjectRoot, .unsafeDirectory:
+                return PipelineError.outputMissing
+            case .emptyPath, .absolutePath, .unsafeComponent:
+                return error
+            }
+        }
         guard let publicationError = error as? SparseModelPublicationError else {
             return error
         }

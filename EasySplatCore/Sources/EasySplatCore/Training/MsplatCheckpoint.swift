@@ -351,7 +351,7 @@ enum MsplatCheckpointValidator {
                     profile: profile,
                     iterationLimit: artifact.iterationLimit,
                     plateauWindow: artifact.plateauWindow,
-                    seed: artifact.deterministicSeed,
+                    seed: artifact.cameraOrderSeed,
                     cameraCount: manifest.cameraCount,
                     inputDigest: artifact.inputDigest,
                     geometryDigest: artifact.geometryDigest,

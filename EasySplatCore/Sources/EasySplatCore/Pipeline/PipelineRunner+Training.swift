@@ -394,7 +394,7 @@ extension PipelineRunner {
         metadata: ProjectMetadata,
         paths: ProjectPaths,
         profile: DetailProfile,
-        seed: UInt64,
+        cameraOrderSeed: UInt64,
         resolvedPlan: ResolvedRunPlan,
         datasetIdentity: MsplatDatasetIdentity
     ) throws -> URL? {
@@ -404,7 +404,7 @@ extension PipelineRunner {
               artifact.iterationLimit == resolvedPlan.trainerIterationLimit,
               artifact.plateauWindow == resolvedPlan.plateauWindow,
               artifact.memoryBudgetBytes == resolvedPlan.trainerMemoryBudgetBytes,
-              artifact.deterministicSeed == seed,
+              artifact.cameraOrderSeed == cameraOrderSeed,
               artifact.checkpointPath == "Training/checkpoints/msplat" else {
             throw MsplatCheckpointValidationError(
                 "saved training state does not match the resolved training plan"
@@ -435,7 +435,7 @@ extension PipelineRunner {
     func persistMsplatCheckpoint(
         _ receipt: MsplatCheckpointReceipt,
         profile: DetailProfile,
-        seed: UInt64,
+        cameraOrderSeed: UInt64,
         resolvedPlan: ResolvedRunPlan,
         datasetIdentity: MsplatDatasetIdentity,
         paths: ProjectPaths
@@ -457,7 +457,7 @@ extension PipelineRunner {
             detailProfile: profile,
             iterationLimit: resolvedPlan.trainerIterationLimit,
             plateauWindow: resolvedPlan.plateauWindow,
-            deterministicSeed: seed,
+            cameraOrderSeed: cameraOrderSeed,
             completedIteration: receipt.iteration,
             checkpointPath: "Training/checkpoints/msplat",
             checkpointDigest: receipt.payloadSHA256,
@@ -484,7 +484,7 @@ extension PipelineRunner {
     func persistMsplatCompletion(
         _ result: MsplatTrainingResult,
         profile: DetailProfile,
-        seed: UInt64,
+        cameraOrderSeed: UInt64,
         resolvedPlan: ResolvedRunPlan,
         datasetIdentity: MsplatDatasetIdentity,
         paths: ProjectPaths
@@ -511,7 +511,7 @@ extension PipelineRunner {
             detailProfile: profile,
             iterationLimit: result.iterationLimit,
             plateauWindow: result.plateauWindow,
-            deterministicSeed: seed,
+            cameraOrderSeed: cameraOrderSeed,
             completedIteration: result.completedIteration,
             checkpointPath: nil,
             checkpointDigest: nil,

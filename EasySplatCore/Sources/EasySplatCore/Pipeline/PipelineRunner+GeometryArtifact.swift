@@ -173,7 +173,7 @@ extension PipelineRunner {
             orderedImageNames: orderedFrames.map(\.lastPathComponent),
             orderedInput: isOrderedInput,
             allowCameraUpFallback: allowCameraUpFallback,
-            deterministicSeed: resolvedPlan.deterministicSeed
+            deterministicSeed: resolvedPlan.runSeed
         )
         let orientationEstimationDuration = orientationEstimationClock.now - orientationEstimationStart
         try Task.checkCancellation()

@@ -582,7 +582,7 @@ final class TrainingArtifactStoreTests: XCTestCase {
                 try runner.persistMsplatCompletion(
                     result,
                     profile: .balanced,
-                    seed: plan.deterministicSeed,
+                    cameraOrderSeed: plan.runSeed,
                     resolvedPlan: plan,
                     datasetIdentity: datasetIdentity,
                     paths: context.paths
@@ -815,7 +815,7 @@ final class TrainingArtifactStoreTests: XCTestCase {
             detailProfile: .balanced,
             iterationLimit: 7_000,
             plateauWindow: 800,
-            deterministicSeed: 42,
+            cameraOrderSeed: 42,
             completedIteration: 500,
             checkpointPath: "Training/checkpoints/msplat",
             checkpointDigest: String(repeating: "d", count: 64),

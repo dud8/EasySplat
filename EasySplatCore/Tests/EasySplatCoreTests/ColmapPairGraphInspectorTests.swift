@@ -4,10 +4,11 @@ import XCTest
 @testable import EasySplatCore
 
 final class ColmapPairGraphInspectorTests: XCTestCase {
-    func testDominantConnectivityPolicyRequiresNinetyPercentAndOnlySingletonOutliers() {
+    func testDominantConnectivityPolicyRequiresConsistentComponentsAndNinetyPercent() {
         XCTAssertEqual(
             PairGraphConnectivityPolicy.dominantViewCount(
                 totalViewCount: 60,
+                componentViewCounts: [54, 1, 1, 1, 1, 1, 1],
                 connectedComponentCount: 7,
                 isolatedViewCount: 6,
                 descriptorlessViewCount: 2
@@ -16,27 +17,174 @@ final class ColmapPairGraphInspectorTests: XCTestCase {
         )
         XCTAssertNil(PairGraphConnectivityPolicy.dominantViewCount(
             totalViewCount: 60,
+            componentViewCounts: [53, 1, 1, 1, 1, 1, 1, 1],
             connectedComponentCount: 8,
             isolatedViewCount: 7,
             descriptorlessViewCount: 0
         ))
         XCTAssertNil(PairGraphConnectivityPolicy.dominantViewCount(
             totalViewCount: 60,
+            componentViewCounts: [59, 1],
             connectedComponentCount: 2,
             isolatedViewCount: 0,
             descriptorlessViewCount: 0
         ))
         XCTAssertNil(PairGraphConnectivityPolicy.dominantViewCount(
             totalViewCount: 60,
+            componentViewCounts: [59, 1],
             connectedComponentCount: 2,
             isolatedViewCount: 1,
             descriptorlessViewCount: 2
         ))
         XCTAssertNil(PairGraphConnectivityPolicy.dominantViewCount(
             totalViewCount: 22,
+            componentViewCounts: [18, 1, 1, 1, 1],
             connectedComponentCount: 5,
             isolatedViewCount: 4,
             descriptorlessViewCount: 0
+        ))
+        XCTAssertNil(PairGraphConnectivityPolicy.dominantViewCount(
+            totalViewCount: 60,
+            componentViewCounts: [54, 2, 1, 1, 1, 1],
+            connectedComponentCount: 6,
+            isolatedViewCount: 4,
+            descriptorlessViewCount: 0
+        ))
+        XCTAssertEqual(PairGraphConnectivityPolicy.dominantViewCount(
+            totalViewCount: 60,
+            componentViewCounts: [57, 2, 1],
+            connectedComponentCount: 3,
+            isolatedViewCount: 1,
+            descriptorlessViewCount: 0
+        ), 57)
+    }
+
+    func testOrderedDominantComponentPolicyAcceptsMinorVerifiedComponents() {
+        let inspection = makeInspection(componentSizes: [239, 2, 2, 1, 1, 1, 1, 1, 1, 1])
+
+        XCTAssertFalse(inspection.hasAcceptableDominantVerifiedComponent)
+        XCTAssertTrue(inspection.hasAcceptableDominantVerifiedComponent(
+            allowMinorVerifiedComponents: true
+        ))
+    }
+
+    func testDominantComponentPoliciesRetainStrictAndCoverageBoundaries() {
+        let singletonMinority = makeInspection(componentSizes: [54, 1, 1, 1, 1, 1, 1])
+        XCTAssertTrue(singletonMinority.hasAcceptableDominantVerifiedComponent)
+        XCTAssertTrue(singletonMinority.hasAcceptableDominantVerifiedComponent(
+            allowMinorVerifiedComponents: true
+        ))
+
+        let verifiedMinority = makeInspection(componentSizes: [54, 2, 1, 1, 1, 1])
+        XCTAssertFalse(verifiedMinority.hasAcceptableDominantVerifiedComponent)
+        XCTAssertFalse(verifiedMinority.hasAcceptableDominantVerifiedComponent(
+            allowMinorVerifiedComponents: true
+        ))
+
+        let verifiedMinorityAtQualityFloor = makeInspection(componentSizes: [57, 2, 1])
+        XCTAssertTrue(verifiedMinorityAtQualityFloor.hasAcceptableDominantVerifiedComponent(
+            allowMinorVerifiedComponents: true
+        ))
+
+        let belowCoverage = makeInspection(componentSizes: [224, 26])
+        XCTAssertFalse(belowCoverage.hasAcceptableDominantVerifiedComponent(
+            allowMinorVerifiedComponents: true
+        ))
+
+        let tiedLargest = makeInspection(componentSizes: [125, 125])
+        XCTAssertFalse(tiedLargest.hasAcceptableDominantVerifiedComponent(
+            allowMinorVerifiedComponents: true
+        ))
+    }
+
+    func testDominantComponentPolicyRejectsScalarSnapshotDisagreement() {
+        let valid = makeInspection(componentSizes: [9, 1])
+        XCTAssertTrue(valid.hasAcceptableDominantVerifiedComponent(
+            allowMinorVerifiedComponents: true
+        ))
+
+        let wrongComponentCount = makeInspection(
+            componentSizes: [9, 1],
+            connectedComponentCount: 3
+        )
+        XCTAssertFalse(wrongComponentCount.hasAcceptableDominantVerifiedComponent(
+            allowMinorVerifiedComponents: true
+        ))
+
+        let wrongIsolatedCount = makeInspection(
+            componentSizes: [9, 1],
+            isolatedViewCount: 0
+        )
+        XCTAssertFalse(wrongIsolatedCount.hasAcceptableDominantVerifiedComponent(
+            allowMinorVerifiedComponents: true
+        ))
+
+        let wrongVerifiedPairCount = makeInspection(
+            componentSizes: [9, 1],
+            spatiallyVerifiedPairCount: 9
+        )
+        XCTAssertFalse(wrongVerifiedPairCount.hasAcceptableDominantVerifiedComponent(
+            allowMinorVerifiedComponents: true
+        ))
+    }
+
+    func testDominantComponentPolicyRejectsMalformedNamesAndEdges() {
+        let duplicateName = makeInspection(components: [
+            ["image-1.jpg", "image-2.jpg"],
+            ["image-2.jpg"],
+        ])
+        XCTAssertFalse(duplicateName.hasAcceptableDominantVerifiedComponent(
+            allowMinorVerifiedComponents: true
+        ))
+
+        let crossComponentEdge = makeInspection(
+            components: [
+                (1...9).map(imageName),
+                [imageName(10)],
+            ],
+            verifiedPairs: [
+                ColmapScheduledPair(imageName(1), imageName(10), role: .local),
+            ]
+        )
+        XCTAssertFalse(crossComponentEdge.hasAcceptableDominantVerifiedComponent(
+            allowMinorVerifiedComponents: true
+        ))
+
+        let disconnectedSnapshotComponent = makeInspection(
+            components: [
+                (1...9).map(imageName),
+                [imageName(10)],
+            ],
+            verifiedPairs: []
+        )
+        XCTAssertFalse(disconnectedSnapshotComponent.hasAcceptableDominantVerifiedComponent(
+            allowMinorVerifiedComponents: true
+        ))
+    }
+
+    func testDominantComponentPolicyRequiresDescriptorlessViewsToBeExcludedSingletons() {
+        let descriptorlessSingleton = makeInspection(
+            componentSizes: [9, 1],
+            descriptorlessImageNames: [imageName(10)]
+        )
+        XCTAssertTrue(descriptorlessSingleton.hasAcceptableDominantVerifiedComponent(
+            allowMinorVerifiedComponents: true
+        ))
+
+        let descriptorlessViewWithEdges = makeInspection(
+            componentSizes: [9, 1],
+            descriptorlessImageNames: [imageName(1)]
+        )
+        XCTAssertFalse(descriptorlessViewWithEdges.hasAcceptableDominantVerifiedComponent(
+            allowMinorVerifiedComponents: true
+        ))
+
+        let unknownDescriptorlessView = makeInspection(
+            componentSizes: [9, 1],
+            descriptorlessImageNames: ["unknown.jpg"]
+        )
+        XCTAssertFalse(unknownDescriptorlessView.hasAcceptableDominantVerifiedComponent(
+            allowMinorVerifiedComponents: true
         ))
     }
 
@@ -268,6 +416,32 @@ final class ColmapPairGraphInspectorTests: XCTestCase {
         XCTAssertEqual(result.biconnectedBlockCount, 2)
         XCTAssertEqual(result.largestBiconnectedBlockViewCount, 2)
         XCTAssertEqual(result.secondLargestBiconnectedBlockViewCount, 2)
+    }
+
+    func testBiconnectedRobustnessDescribesTheDominantAcceptedComponent() throws {
+        let dominantCycle = (1..<38).map { ($0, $0 + 1, ColmapPairRole.local) }
+            + [(1, 38, .local)]
+        let minorEdge = [(39, 40, ColmapPairRole.local)]
+        let pairs = dominantCycle + minorEdge
+        let rows = pairs.map { (pairID($0.0, $0.1), Int64(20)) }
+        let databaseURL = try makeDatabase(
+            imageIDs: Array(1...40),
+            matches: rows,
+            verified: rows
+        )
+
+        let result = try ColmapPairGraphInspector(databaseURL: databaseURL).inspect(
+            schedule: makeSchedule(imageIDs: Array(1...40), pairs: pairs),
+            completion: .succeeded
+        )
+
+        XCTAssertTrue(result.hasAcceptableDominantVerifiedComponent(
+            allowMinorVerifiedComponents: true
+        ))
+        XCTAssertEqual(result.articulationViewCount, 0)
+        XCTAssertEqual(result.biconnectedBlockCount, 1)
+        XCTAssertEqual(result.largestBiconnectedBlockViewCount, 38)
+        XCTAssertEqual(result.secondLargestBiconnectedBlockViewCount, 0)
     }
 
     func testSparseGraphsHaveTotalBiconnectedMeasurements() throws {
@@ -968,6 +1142,69 @@ final class ColmapPairGraphInspectorTests: XCTestCase {
             pairs: pairs.map { first, second, role in
                 ColmapScheduledPair(imageName(first), imageName(second), role: role)
             }
+        )
+    }
+
+    private func makeInspection(
+        componentSizes: [Int],
+        descriptorlessImageNames: [String] = [],
+        connectedComponentCount: Int? = nil,
+        isolatedViewCount: Int? = nil,
+        spatiallyVerifiedPairCount: Int? = nil
+    ) -> ColmapPairGraphInspection {
+        var nextImageID = 1
+        let components = componentSizes.map { componentSize in
+            defer { nextImageID += componentSize }
+            return (nextImageID..<(nextImageID + componentSize)).map(imageName)
+        }
+        return makeInspection(
+            components: components,
+            descriptorlessImageNames: descriptorlessImageNames,
+            connectedComponentCount: connectedComponentCount,
+            isolatedViewCount: isolatedViewCount,
+            spatiallyVerifiedPairCount: spatiallyVerifiedPairCount
+        )
+    }
+
+    private func makeInspection(
+        components: [[String]],
+        verifiedPairs: [ColmapScheduledPair]? = nil,
+        descriptorlessImageNames: [String] = [],
+        connectedComponentCount: Int? = nil,
+        isolatedViewCount: Int? = nil,
+        spatiallyVerifiedPairCount: Int? = nil
+    ) -> ColmapPairGraphInspection {
+        let defaultVerifiedPairs = components.flatMap { component in
+            zip(component, component.dropFirst()).map { first, second in
+                ColmapScheduledPair(first, second, role: .local)
+            }
+        }
+        let snapshotPairs = verifiedPairs ?? defaultVerifiedPairs
+        return ColmapPairGraphInspection(
+            scheduledPairCount: snapshotPairs.count,
+            attemptedPairCount: snapshotPairs.count,
+            rawMatchedPairCount: snapshotPairs.count,
+            spatiallyVerifiedPairCount: spatiallyVerifiedPairCount ?? snapshotPairs.count,
+            localPairCount: snapshotPairs.count,
+            retrievalPairCount: 0,
+            loopRevisitPairCount: 0,
+            connectedComponentCount: connectedComponentCount ?? components.count,
+            isolatedViewCount: isolatedViewCount
+                ?? components.count(where: { $0.count == 1 }),
+            articulationViewCount: 0,
+            biconnectedBlockCount: 0,
+            largestBiconnectedBlockViewCount: 0,
+            secondLargestBiconnectedBlockViewCount: 0,
+            degreeP10: 0,
+            degreeMedian: 0,
+            degreeP90: 0,
+            featureDatabaseDigest: String(repeating: "0", count: 64),
+            matchingDatabaseDigest: String(repeating: "1", count: 64),
+            descriptorlessImageNames: descriptorlessImageNames,
+            verifiedGraph: ColmapVerifiedGraphSnapshot(
+                verifiedPairs: snapshotPairs,
+                components: components
+            )
         )
     }
 

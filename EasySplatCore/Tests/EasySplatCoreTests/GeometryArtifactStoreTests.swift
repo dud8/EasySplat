@@ -53,9 +53,9 @@ final class GeometryArtifactStoreTests: XCTestCase {
         }
     }
 
-    func testLoadRejectsSchemaTwelveBeforeDecodingSourceFrameOrientationState() throws {
+    func testLoadRejectsPreviousSchemaBeforeDecodingItsPayload() throws {
         let baselineSchemaVersion = GeometryArtifact.currentSchemaVersion - 1
-        XCTAssertEqual(baselineSchemaVersion, 12)
+        XCTAssertEqual(baselineSchemaVersion, 14)
 
         let root = try TestFileBuilder.makeTempDir()
         defer { try? FileManager.default.removeItem(at: root) }
@@ -641,6 +641,7 @@ final class GeometryArtifactStoreTests: XCTestCase {
             connectedComponentCount: 1,
             isolatedViewCount: 0,
             descriptorlessViewCount: 0,
+            componentViewCounts: [8],
             articulationViewCount: 0,
             biconnectedBlockCount: 1,
             largestBiconnectedBlockViewCount: 8,
@@ -950,6 +951,7 @@ final class GeometryArtifactStoreTests: XCTestCase {
                 loopRevisitPairCount: 0,
                 connectedComponentCount: 1,
                 isolatedViewCount: 1,
+                componentViewCounts: [1],
                 articulationViewCount: 0,
                 biconnectedBlockCount: 0,
                 largestBiconnectedBlockViewCount: 0,
@@ -970,6 +972,18 @@ final class GeometryArtifactStoreTests: XCTestCase {
             XCTAssertEqual(error as? GeometryArtifactStore.Error, .invalidPairGraph)
         }
 
+        var overflowingPairGraph = makeArtifact(fixture: fixture)
+        var measurement = try XCTUnwrap(overflowingPairGraph.pairGraph.measurement)
+        measurement.componentViewCounts = [Int.max, 1]
+        measurement.connectedComponentCount = 2
+        measurement.isolatedViewCount = 1
+        overflowingPairGraph.pairGraph = .measured(measurement)
+        XCTAssertThrowsError(
+            try GeometryArtifactStore.validate(overflowingPairGraph, projectPaths: paths)
+        ) { error in
+            XCTAssertEqual(error as? GeometryArtifactStore.Error, .invalidPairGraph)
+        }
+
         var fabricatedOrientation = makeArtifact(fixture: fixture)
         fabricatedOrientation.canonicalOrientation.sourceToCanonicalQuaternionWXYZ =
             CanonicalQuaternionWXYZ(w: 1, x: 0, y: 0, z: 0)
@@ -978,6 +992,218 @@ final class GeometryArtifactStoreTests: XCTestCase {
         ) { error in
             XCTAssertEqual(error as? GeometryArtifactStore.Error, .invalidCanonicalOrientation)
         }
+    }
+
+    func testRejectsOverflowingPairRoleCounts() throws {
+        let root = try TestFileBuilder.makeTempDir()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let paths = ProjectPaths(root: root)
+        try paths.ensureDirectories()
+        let fixture = try writeCanonicalModel(at: paths)
+        var artifact = makeArtifact(fixture: fixture)
+        var measurement = try XCTUnwrap(artifact.pairGraph.measurement)
+        measurement.scheduledPairCount = Int.max
+        measurement.localPairCount = Int.max
+        measurement.retrievalPairCount = Int.max
+        measurement.loopRevisitPairCount = 0
+        measurement.matcherAttempts[0].scheduledPairCount = Int.max
+        artifact.pairGraph = .measured(measurement)
+
+        XCTAssertThrowsError(
+            try GeometryArtifactStore.validate(artifact, projectPaths: paths)
+        ) { error in
+            XCTAssertEqual(error as? GeometryArtifactStore.Error, .invalidPairGraph)
+        }
+    }
+
+    func testRejectsExactSwitchAfterCompletedNondensestFaissAttempt() throws {
+        let root = try TestFileBuilder.makeTempDir()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let paths = ProjectPaths(root: root)
+        try paths.ensureDirectories()
+        let fixture = try writeCanonicalModel(at: paths)
+        var artifact = makeArtifact(fixture: fixture)
+        var measurement = try XCTUnwrap(artifact.pairGraph.measurement)
+        measurement.pairingPolicy = .orderedContinuous
+        measurement.matcherAttempts.append(PairMatchingAttemptArtifact(
+            attemptNumber: 2,
+            matcher: .exact,
+            recoveryLevel: .normal,
+            outcome: .completed,
+            scheduledPairCount: 3,
+            attemptedPairCount: 3,
+            rawMatchedPairCount: 3,
+            spatiallyVerifiedPairCount: 3,
+            durationSeconds: 0.01
+        ))
+        measurement.matchingDurationSeconds = 0.02
+        artifact.pairGraph = .measured(measurement)
+
+        XCTAssertThrowsError(
+            try GeometryArtifactStore.validate(artifact, projectPaths: paths)
+        ) { error in
+            XCTAssertEqual(error as? GeometryArtifactStore.Error, .invalidPairGraph)
+        }
+    }
+
+    func testAllowsExactSwitchAfterFailedFaissAttempt() throws {
+        let root = try TestFileBuilder.makeTempDir()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let paths = ProjectPaths(root: root)
+        try paths.ensureDirectories()
+        let fixture = try writeCanonicalModel(at: paths)
+        var artifact = makeArtifact(fixture: fixture)
+        var measurement = try XCTUnwrap(artifact.pairGraph.measurement)
+        measurement.pairingPolicy = .orderedContinuous
+        measurement.matcherAttempts[0].outcome = .failed
+        measurement.matcherAttempts[0].attemptedPairCount = 0
+        measurement.matcherAttempts[0].rawMatchedPairCount = 0
+        measurement.matcherAttempts[0].spatiallyVerifiedPairCount = 0
+        measurement.matcherAttempts.append(PairMatchingAttemptArtifact(
+            attemptNumber: 2,
+            matcher: .exact,
+            recoveryLevel: .normal,
+            outcome: .completed,
+            scheduledPairCount: 3,
+            attemptedPairCount: 3,
+            rawMatchedPairCount: 3,
+            spatiallyVerifiedPairCount: 3,
+            durationSeconds: 0.01
+        ))
+        measurement.matchingDurationSeconds = 0.02
+        artifact.pairGraph = .measured(measurement)
+
+        XCTAssertNoThrow(
+            try GeometryArtifactStore.validate(artifact, projectPaths: paths)
+        )
+    }
+
+    func testRejectsCompletedExactSwitchForIncompleteSmallUnorderedSchedule() throws {
+        let root = try TestFileBuilder.makeTempDir()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let paths = ProjectPaths(root: root)
+        try paths.ensureDirectories()
+        let fixture = try writeCanonicalModel(at: paths)
+        var artifact = makeArtifact(fixture: fixture)
+        var measurement = try XCTUnwrap(artifact.pairGraph.measurement)
+        measurement.scheduledPairCount = 2
+        measurement.attemptedPairCount = 2
+        measurement.rawMatchedPairCount = 2
+        measurement.spatiallyVerifiedPairCount = 2
+        measurement.localPairCount = 2
+        measurement.matcherAttempts[0].scheduledPairCount = 2
+        measurement.matcherAttempts[0].attemptedPairCount = 2
+        measurement.matcherAttempts[0].rawMatchedPairCount = 2
+        measurement.matcherAttempts[0].spatiallyVerifiedPairCount = 2
+        measurement.matcherAttempts.append(PairMatchingAttemptArtifact(
+            attemptNumber: 2,
+            matcher: .exact,
+            recoveryLevel: .normal,
+            outcome: .completed,
+            scheduledPairCount: 2,
+            attemptedPairCount: 2,
+            rawMatchedPairCount: 2,
+            spatiallyVerifiedPairCount: 2,
+            durationSeconds: 0.01
+        ))
+        measurement.matchingDurationSeconds = 0.02
+        artifact.pairGraph = .measured(measurement)
+
+        XCTAssertThrowsError(
+            try GeometryArtifactStore.validate(artifact, projectPaths: paths)
+        ) { error in
+            XCTAssertEqual(error as? GeometryArtifactStore.Error, .invalidPairGraph)
+        }
+    }
+
+    func testAllowsCompletedExactSwitchForExhaustiveSmallUnorderedSchedule() throws {
+        let root = try TestFileBuilder.makeTempDir()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let paths = ProjectPaths(root: root)
+        try paths.ensureDirectories()
+        let fixture = try writeCanonicalModel(at: paths)
+        var artifact = makeArtifact(fixture: fixture)
+        var measurement = try XCTUnwrap(artifact.pairGraph.measurement)
+        measurement.matcherAttempts.append(PairMatchingAttemptArtifact(
+            attemptNumber: 2,
+            matcher: .exact,
+            recoveryLevel: .normal,
+            outcome: .completed,
+            scheduledPairCount: 3,
+            attemptedPairCount: 3,
+            rawMatchedPairCount: 3,
+            spatiallyVerifiedPairCount: 3,
+            durationSeconds: 0.01
+        ))
+        measurement.matchingDurationSeconds = 0.02
+        artifact.pairGraph = .measured(measurement)
+
+        XCTAssertNoThrow(
+            try GeometryArtifactStore.validate(artifact, projectPaths: paths)
+        )
+    }
+
+    func testAllowsCompletedExactSwitchAtMaximumRecoveryLevel() throws {
+        let root = try TestFileBuilder.makeTempDir()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let paths = ProjectPaths(root: root)
+        try paths.ensureDirectories()
+        let fixture = try writeCanonicalModel(at: paths)
+        var artifact = makeArtifact(fixture: fixture)
+        var measurement = try XCTUnwrap(artifact.pairGraph.measurement)
+        measurement.pairingPolicy = .orderedContinuous
+        measurement.matcherAttempts = [
+            PairMatchingAttemptArtifact(
+                attemptNumber: 1,
+                matcher: .faiss,
+                recoveryLevel: .normal,
+                outcome: .failed,
+                scheduledPairCount: 1,
+                attemptedPairCount: 0,
+                rawMatchedPairCount: 0,
+                spatiallyVerifiedPairCount: 0,
+                durationSeconds: 0.01
+            ),
+            PairMatchingAttemptArtifact(
+                attemptNumber: 2,
+                matcher: .faiss,
+                recoveryLevel: .expanded,
+                outcome: .failed,
+                scheduledPairCount: 2,
+                attemptedPairCount: 0,
+                rawMatchedPairCount: 0,
+                spatiallyVerifiedPairCount: 0,
+                durationSeconds: 0.01
+            ),
+            PairMatchingAttemptArtifact(
+                attemptNumber: 3,
+                matcher: .faiss,
+                recoveryLevel: .maximum,
+                outcome: .completed,
+                scheduledPairCount: 3,
+                attemptedPairCount: 3,
+                rawMatchedPairCount: 3,
+                spatiallyVerifiedPairCount: 3,
+                durationSeconds: 0.01
+            ),
+            PairMatchingAttemptArtifact(
+                attemptNumber: 4,
+                matcher: .exact,
+                recoveryLevel: .maximum,
+                outcome: .completed,
+                scheduledPairCount: 3,
+                attemptedPairCount: 3,
+                rawMatchedPairCount: 3,
+                spatiallyVerifiedPairCount: 3,
+                durationSeconds: 0.01
+            ),
+        ]
+        measurement.matchingDurationSeconds = 0.04
+        artifact.pairGraph = .measured(measurement)
+
+        XCTAssertNoThrow(
+            try GeometryArtifactStore.validate(artifact, projectPaths: paths)
+        )
     }
 
     private typealias Fixture = (
@@ -1042,6 +1268,7 @@ final class GeometryArtifactStoreTests: XCTestCase {
                 connectedComponentCount: 1,
                 isolatedViewCount: 0,
                 descriptorlessViewCount: 0,
+                componentViewCounts: [3],
                 articulationViewCount: 0,
                 biconnectedBlockCount: 1,
                 largestBiconnectedBlockViewCount: 3,
@@ -1110,6 +1337,7 @@ final class GeometryArtifactStoreTests: XCTestCase {
                 connectedComponentCount: 2,
                 isolatedViewCount: 1,
                 descriptorlessViewCount: 1,
+                componentViewCounts: [9, 1],
                 articulationViewCount: 7,
                 biconnectedBlockCount: 8,
                 largestBiconnectedBlockViewCount: 2,

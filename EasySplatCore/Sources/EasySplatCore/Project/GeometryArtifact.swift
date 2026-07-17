@@ -106,6 +106,7 @@ public struct PairMatchingAttemptArtifact: Codable, Sendable, Equatable {
 }
 
 public struct PairGraphMeasurement: Codable, Sendable, Equatable {
+    public var pairingPolicy: ResolvedPairingPolicy
     public var scheduledPairCount: Int
     public var attemptedPairCount: Int
     public var rawMatchedPairCount: Int
@@ -116,6 +117,7 @@ public struct PairGraphMeasurement: Codable, Sendable, Equatable {
     public var connectedComponentCount: Int
     public var isolatedViewCount: Int
     public var descriptorlessViewCount: Int
+    public var componentViewCounts: [Int]
     public var articulationViewCount: Int
     public var biconnectedBlockCount: Int
     public var largestBiconnectedBlockViewCount: Int
@@ -130,6 +132,7 @@ public struct PairGraphMeasurement: Codable, Sendable, Equatable {
     public var matchingDurationSeconds: Double
 
     public init(
+        pairingPolicy: ResolvedPairingPolicy = .unorderedRetrieval,
         scheduledPairCount: Int,
         attemptedPairCount: Int,
         rawMatchedPairCount: Int,
@@ -140,6 +143,7 @@ public struct PairGraphMeasurement: Codable, Sendable, Equatable {
         connectedComponentCount: Int,
         isolatedViewCount: Int,
         descriptorlessViewCount: Int = 0,
+        componentViewCounts: [Int],
         articulationViewCount: Int,
         biconnectedBlockCount: Int,
         largestBiconnectedBlockViewCount: Int,
@@ -153,6 +157,7 @@ public struct PairGraphMeasurement: Codable, Sendable, Equatable {
         matchingDatabaseDigest: String,
         matchingDurationSeconds: Double
     ) {
+        self.pairingPolicy = pairingPolicy
         self.scheduledPairCount = scheduledPairCount
         self.attemptedPairCount = attemptedPairCount
         self.rawMatchedPairCount = rawMatchedPairCount
@@ -163,6 +168,7 @@ public struct PairGraphMeasurement: Codable, Sendable, Equatable {
         self.connectedComponentCount = connectedComponentCount
         self.isolatedViewCount = isolatedViewCount
         self.descriptorlessViewCount = descriptorlessViewCount
+        self.componentViewCounts = componentViewCounts
         self.articulationViewCount = articulationViewCount
         self.biconnectedBlockCount = biconnectedBlockCount
         self.largestBiconnectedBlockViewCount = largestBiconnectedBlockViewCount
@@ -444,7 +450,7 @@ public struct CanonicalOrientationArtifact: Codable, Sendable, Equatable {
 }
 
 public struct GeometryArtifact: Codable, Sendable, Equatable {
-    public static let currentSchemaVersion = 13
+    public static let currentSchemaVersion = 15
 
     public var schemaVersion: Int
     public var solverVersion: String

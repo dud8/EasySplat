@@ -203,7 +203,7 @@ public enum RunPlanResolver {
             || previousPlan.baLocalFunctionTolerance != currentPlan.baLocalFunctionTolerance
             || previousPlan.baGlobalFunctionTolerance != currentPlan.baGlobalFunctionTolerance
             || previousPlan.baLocalImageCount != currentPlan.baLocalImageCount
-            || previousPlan.deterministicSeed != currentPlan.deterministicSeed
+            || previousPlan.runSeed != currentPlan.runSeed
         let matchingPolicyChanged = previousPlan.pairingPolicy != currentPlan.pairingPolicy
             || previousPlan.temporalPairing != currentPlan.temporalPairing
             || previousPlan.temporalOffsets != currentPlan.temporalOffsets
@@ -349,7 +349,7 @@ public enum RunPlanResolver {
             baLocalFunctionTolerance: 0.001,
             baGlobalFunctionTolerance: 0.000_001,
             baLocalImageCount: 6,
-            deterministicSeed: UInt64(max(0, developmentOverrides.benchmarkSeed ?? 42))
+            runSeed: UInt64(max(0, developmentOverrides.benchmarkSeed ?? 42))
         )
     }
 

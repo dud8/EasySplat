@@ -348,13 +348,23 @@ enum GeometryArtifactStore {
             }
             guard let dominantViewCount = PairGraphConnectivityPolicy.dominantViewCount(
                 totalViewCount: totalViewCount,
+                componentViewCounts: measurement.componentViewCounts,
                 connectedComponentCount: measurement.connectedComponentCount,
                 isolatedViewCount: measurement.isolatedViewCount,
                 descriptorlessViewCount: descriptorlessViewCount
             ) else {
                 throw Error.invalidPairGraph
             }
+            let hasMinorVerifiedComponent = measurement.componentViewCounts
+                .dropFirst()
+                .contains { $0 > 1 }
             let hasSingleBiconnectedBlock = measurement.biconnectedBlockCount == 1
+            let localAndRetrieval = measurement.localPairCount.addingReportingOverflow(
+                measurement.retrievalPairCount
+            )
+            let pairRoleCount = localAndRetrieval.partialValue.addingReportingOverflow(
+                measurement.loopRevisitPairCount
+            )
             guard dominantViewCount >= 2,
                   registeredViewCount <= dominantViewCount,
                   measurement.scheduledPairCount >= 0,
@@ -370,10 +380,9 @@ enum GeometryArtifactStore {
                   measurement.localPairCount <= measurement.scheduledPairCount,
                   measurement.retrievalPairCount <= measurement.scheduledPairCount,
                   measurement.loopRevisitPairCount <= measurement.scheduledPairCount,
-                  measurement.localPairCount
-                    + measurement.retrievalPairCount
-                    + measurement.loopRevisitPairCount
-                    == measurement.scheduledPairCount,
+                  !localAndRetrieval.overflow,
+                  !pairRoleCount.overflow,
+                  pairRoleCount.partialValue == measurement.scheduledPairCount,
                   measurement.spatiallyVerifiedPairCount >= dominantViewCount - 1,
                   measurement.articulationViewCount >= 0,
                   measurement.articulationViewCount <= dominantViewCount - 2,
@@ -405,6 +414,11 @@ enum GeometryArtifactStore {
                   measurement.matchingDurationSeconds >= 0 else {
                 throw Error.invalidPairGraph
             }
+            try validatePairAttemptHistory(
+                measurement.matcherAttempts,
+                pairingPolicy: measurement.pairingPolicy,
+                totalViewCount: totalViewCount
+            )
             let attemptNumbers = measurement.matcherAttempts.map(\.attemptNumber)
             let measuredDuration = measurement.matcherAttempts.reduce(0.0) {
                 $0 + $1.durationSeconds
@@ -437,6 +451,74 @@ enum GeometryArtifactStore {
                     == measurement.spatiallyVerifiedPairCount else {
                 throw Error.invalidPairGraph
             }
+            if hasMinorVerifiedComponent {
+                guard isOrdered(measurement.pairingPolicy),
+                      acceptedAttempt.recoveryLevel != .normal else {
+                    throw Error.invalidPairGraph
+                }
+            }
+        }
+    }
+
+    private static func validatePairAttemptHistory(
+        _ attempts: [PairMatchingAttemptArtifact],
+        pairingPolicy: ResolvedPairingPolicy,
+        totalViewCount: Int
+    ) throws {
+        guard let first = attempts.first,
+              first.matcher == .faiss,
+              first.recoveryLevel == .normal else {
+            throw Error.invalidPairGraph
+        }
+        for index in attempts.indices.dropFirst() {
+            let previous = attempts[index - 1]
+            let attempt = attempts[index]
+            let previousLevel = pairRecoveryLevelIndex(previous.recoveryLevel)
+            let level = pairRecoveryLevelIndex(attempt.recoveryLevel)
+            guard level >= previousLevel,
+                  level - previousLevel <= 1 else {
+                throw Error.invalidPairGraph
+            }
+            if level == previousLevel {
+                if attempt.matcher == previous.matcher {
+                    guard previous.outcome == .failed else {
+                        throw Error.invalidPairGraph
+                    }
+                } else {
+                    guard previous.matcher == .faiss,
+                          attempt.matcher == .exact,
+                          previous.scheduledPairCount == attempt.scheduledPairCount,
+                          PairGraphEvidenceStore.permitsExactMatcherTransition(
+                              after: previous,
+                              imageCount: totalViewCount,
+                              pairingPolicy: pairingPolicy
+                          ) else {
+                        throw Error.invalidPairGraph
+                    }
+                }
+            } else if attempt.matcher != previous.matcher {
+                throw Error.invalidPairGraph
+            }
+        }
+    }
+
+    private static func pairRecoveryLevelIndex(_ level: PairGraphRecoveryLevel) -> Int {
+        switch level {
+        case .normal: return 0
+        case .expanded: return 1
+        case .maximum: return 2
+        }
+    }
+
+    private static func isOrdered(_ policy: ResolvedPairingPolicy) -> Bool {
+        switch policy {
+        case .orderedContinuous,
+             .orderedOrbit,
+             .orderedWalkthrough,
+             .orderedLargeArea:
+            return true
+        case .unorderedRetrieval, .segmentedMixed:
+            return false
         }
     }
 

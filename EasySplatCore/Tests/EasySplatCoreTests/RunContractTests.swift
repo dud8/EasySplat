@@ -58,21 +58,38 @@ final class RequestedRunOptionsTests: XCTestCase {
         try assertJSONRoundTrip([plan])
     }
 
+    func testResolvedRunPlanPersistsRunSeedWithoutRetiredDeterministicKey() throws {
+        let plan = makeResolvedRunPlan()
+        let encoded = try JSONEncoder().encode(plan)
+        let object = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: encoded) as? [String: Any]
+        )
+
+        XCTAssertEqual(object["runSeed"] as? NSNumber, NSNumber(value: 42))
+        XCTAssertNil(object["deterministicSeed"])
+
+        var retiredObject = object
+        retiredObject.removeValue(forKey: "runSeed")
+        retiredObject["deterministicSeed"] = 42
+        let retiredData = try JSONSerialization.data(withJSONObject: retiredObject)
+        XCTAssertThrowsError(try JSONDecoder().decode(ResolvedRunPlan.self, from: retiredData))
+    }
+
     private func assertJSONRoundTrip<Value: Codable & Equatable>(_ values: [Value]) throws {
         let data = try JSONEncoder().encode(values)
         XCTAssertEqual(try JSONDecoder().decode([Value].self, from: data), values)
     }
 }
 
-final class ProjectMetadataVersionElevenTests: XCTestCase {
-    func testNewMetadataUsesVersionElevenAndSuppliedRequestedOptions() {
+final class ProjectMetadataVersionTwelveTests: XCTestCase {
+    func testNewMetadataUsesVersionTwelveAndSuppliedRequestedOptions() {
         let metadata = ProjectMetadata(
             title: "New project",
             input: .photos(folder: "/tmp/photos"),
             requestedRunOptions: RequestedRunOptions(capturePath: .orbit, detailProfile: .balanced)
         )
 
-        XCTAssertEqual(ProjectMetadataStore.supportedFormatVersion, 11)
+        XCTAssertEqual(ProjectMetadataStore.supportedFormatVersion, 12)
         XCTAssertEqual(metadata.formatVersion, ProjectMetadataStore.supportedFormatVersion)
         XCTAssertEqual(
             metadata.requestedRunOptions,
@@ -85,6 +102,25 @@ final class ProjectMetadataVersionElevenTests: XCTestCase {
 }
 
 final class PipelineArtifactContractTests: XCTestCase {
+    func testTrainingArtifactPersistsCameraOrderSeedWithoutRetiredDeterministicKey() throws {
+        let training = makeTrainingArtifact()
+        let encoded = try JSONEncoder().encode(training)
+        let object = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: encoded) as? [String: Any]
+        )
+
+        XCTAssertEqual(TrainingArtifact.currentSchemaVersion, 5)
+        XCTAssertEqual(object["schemaVersion"] as? NSNumber, NSNumber(value: 5))
+        XCTAssertEqual(object["cameraOrderSeed"] as? NSNumber, NSNumber(value: 42))
+        XCTAssertNil(object["deterministicSeed"])
+
+        var retiredObject = object
+        retiredObject.removeValue(forKey: "cameraOrderSeed")
+        retiredObject["deterministicSeed"] = 42
+        let retiredData = try JSONSerialization.data(withJSONObject: retiredObject)
+        XCTAssertThrowsError(try JSONDecoder().decode(TrainingArtifact.self, from: retiredData))
+    }
+
     func testGeometryAndTrainingArtifactsRoundTripWithProjectRelativePaths() throws {
         let geometry = makeGeometryArtifact()
         let training = makeTrainingArtifact()
@@ -260,7 +296,7 @@ func makeTrainingArtifact(
         detailProfile: .highDetail,
         iterationLimit: 15_000,
         plateauWindow: 1_500,
-        deterministicSeed: 42,
+        cameraOrderSeed: 42,
         completedIteration: 15_000,
         checkpointPath: checkpointPath,
         checkpointDigest: checkpointPath == nil ? nil : String(repeating: "d", count: 64),

@@ -36,7 +36,7 @@ public struct SplatSceneBounds: Codable, Sendable, Equatable {
 }
 
 public struct TrainingArtifact: Codable, Sendable, Equatable {
-    public static let currentSchemaVersion = 4
+    public static let currentSchemaVersion = 5
 
     public var schemaVersion: Int
     public var trainerVersion: String
@@ -47,7 +47,7 @@ public struct TrainingArtifact: Codable, Sendable, Equatable {
     public var detailProfile: DetailProfile
     public var iterationLimit: Int
     public var plateauWindow: Int
-    public var deterministicSeed: UInt64
+    public var cameraOrderSeed: UInt64
     public var completedIteration: Int
     public var checkpointPath: String?
     public var checkpointDigest: String?
@@ -78,7 +78,7 @@ public struct TrainingArtifact: Codable, Sendable, Equatable {
         detailProfile: DetailProfile,
         iterationLimit: Int,
         plateauWindow: Int,
-        deterministicSeed: UInt64,
+        cameraOrderSeed: UInt64,
         completedIteration: Int,
         checkpointPath: String?,
         checkpointDigest: String?,
@@ -108,7 +108,7 @@ public struct TrainingArtifact: Codable, Sendable, Equatable {
         self.detailProfile = detailProfile
         self.iterationLimit = iterationLimit
         self.plateauWindow = plateauWindow
-        self.deterministicSeed = deterministicSeed
+        self.cameraOrderSeed = cameraOrderSeed
         self.completedIteration = completedIteration
         self.checkpointPath = checkpointPath
         self.checkpointDigest = checkpointDigest

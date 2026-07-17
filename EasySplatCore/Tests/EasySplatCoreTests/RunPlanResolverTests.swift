@@ -70,7 +70,7 @@ final class RunPlanResolverTests: XCTestCase {
         XCTAssertEqual(plan.baLocalFunctionTolerance, 0.001)
         XCTAssertEqual(plan.baGlobalFunctionTolerance, 0.000_001)
         XCTAssertEqual(plan.baLocalImageCount, 6)
-        XCTAssertEqual(plan.deterministicSeed, 42)
+        XCTAssertEqual(plan.runSeed, 42)
         XCTAssertEqual(
             plan.requiredToolchainCapabilities,
             [
@@ -522,7 +522,7 @@ final class RunPlanResolverTests: XCTestCase {
         XCTAssertEqual(plan.cameraGrouping, .mixedCamerasOrLenses)
         XCTAssertEqual(plan.lensProjection, .fisheye)
         XCTAssertEqual(plan.inputOrdering, .continuous)
-        XCTAssertEqual(plan.deterministicSeed, 99)
+        XCTAssertEqual(plan.runSeed, 99)
     }
 
     func testResolvedPlanConvertsEveryPersistedCapabilityToTypedInstallerRequest() throws {
@@ -623,7 +623,7 @@ final class RunPlanResolverTests: XCTestCase {
         XCTAssertEqual(plan.routeIdentifier, SfmBackend.colmap.rawValue)
         XCTAssertEqual(plan.modelIdentifier, "none")
         XCTAssertEqual(plan.photoSelection, .useAllValidPhotos)
-        XCTAssertEqual(plan.deterministicSeed, 7)
+        XCTAssertEqual(plan.runSeed, 7)
         XCTAssertEqual(saved.state.stage, .importInput)
         XCTAssertNil(saved.lastRunStartedAt)
     }
@@ -973,7 +973,7 @@ final class RunPlanResolverTests: XCTestCase {
         )
 
         mappingPolicyPlan = currentVideoPlan
-        mappingPolicyPlan.deterministicSeed = 43
+        mappingPolicyPlan.runSeed = 43
         XCTAssertEqual(
             RunPlanResolver.safeResumeStage(
                 .exportSplat,
