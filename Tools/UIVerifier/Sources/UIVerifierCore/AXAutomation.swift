@@ -80,20 +80,23 @@ final class AXApplicationController {
         if activationRequests.frontmostProcessIdentifier() == processIdentifier {
             return
         }
-        guard activationRequests.activateWithAppKit() != nil else {
-            throw AXAutomationError.cannotActivate(accessibilityError: nil)
-        }
-        if activationRequests.frontmostProcessIdentifier() == processIdentifier {
-            return
-        }
-        let accessibilityError = activationRequests.activateWithAccessibility()
         let deadline = Date().addingTimeInterval(timeoutSeconds)
+        var accessibilityError: AXError?
         repeat {
+            guard activationRequests.activateWithAppKit() != nil else {
+                throw AXAutomationError.cannotActivate(accessibilityError: accessibilityError)
+            }
             if activationRequests.frontmostProcessIdentifier() == processIdentifier {
                 return
             }
+
+            accessibilityError = activationRequests.activateWithAccessibility()
+            if activationRequests.frontmostProcessIdentifier() == processIdentifier {
+                return
+            }
+            guard Date() < deadline else { break }
             try await Task.sleep(for: .milliseconds(100))
-        } while Date() < deadline
+        } while true
         throw AXAutomationError.cannotActivate(
             accessibilityError: accessibilityError == .success ? nil : accessibilityError
         )
@@ -114,14 +117,35 @@ final class AXApplicationController {
         throw AXAutomationError.noMainWindow(windowDiagnostic())
     }
 
-    func setSize(_ viewport: VerificationViewport, of window: AXUIElement) throws {
+    func setSize(
+        _ viewport: VerificationViewport,
+        of window: AXUIElement,
+        timeoutSeconds: Double = 1
+    ) async throws {
         var size = CGSize(width: viewport.width, height: viewport.height)
         guard let value = AXValueCreate(.cgSize, &size) else {
             throw AXAutomationError.cannotResize(.failure)
         }
-        let result = AXUIElementSetAttributeValue(window, kAXSizeAttribute as CFString, value)
+        let result = try await Self.retryTransientOperation(timeoutSeconds: timeoutSeconds) {
+            AXUIElementSetAttributeValue(window, kAXSizeAttribute as CFString, value)
+        }
         guard result == .success else {
             throw AXAutomationError.cannotResize(result)
+        }
+    }
+
+    static func retryTransientOperation(
+        timeoutSeconds: Double,
+        retryDelay: Duration = .milliseconds(75),
+        _ operation: () -> AXError
+    ) async throws -> AXError {
+        let deadline = Date().addingTimeInterval(timeoutSeconds)
+        while true {
+            let result = operation()
+            guard result == .cannotComplete, Date() < deadline else {
+                return result
+            }
+            try await Task.sleep(for: retryDelay)
         }
     }
 

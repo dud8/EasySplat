@@ -149,6 +149,91 @@ final class UIVerifierCoreTests: XCTestCase {
         }
     }
 
+    @MainActor
+    func testActivationRetriesRequestsUntilTheExactTargetIsFrontmost() async throws {
+        let targetPID = pid_t(42)
+        var frontmostPID: pid_t? = 7
+        var appKitRequests = 0
+        var accessibilityRequests = 0
+        let controller = AXApplicationController(
+            processIdentifier: targetPID,
+            activationRequests: .init(
+                frontmostProcessIdentifier: { frontmostPID },
+                activateWithAppKit: {
+                    appKitRequests += 1
+                    return false
+                },
+                activateWithAccessibility: {
+                    accessibilityRequests += 1
+                    if accessibilityRequests == 2 {
+                        frontmostPID = targetPID
+                    }
+                    return .success
+                }
+            )
+        )
+
+        try await controller.activate(timeoutSeconds: 0.25)
+
+        XCTAssertGreaterThanOrEqual(appKitRequests, 2)
+        XCTAssertEqual(accessibilityRequests, 2)
+    }
+
+    @MainActor
+    func testTransientAccessibilityOperationRetriesCannotComplete() async throws {
+        var attempts = 0
+
+        let result = try await AXApplicationController.retryTransientOperation(
+            timeoutSeconds: 0.25,
+            retryDelay: .milliseconds(1)
+        ) {
+            attempts += 1
+            return attempts == 1 ? .cannotComplete : .success
+        }
+
+        XCTAssertEqual(result, .success)
+        XCTAssertEqual(attempts, 2)
+    }
+
+    @MainActor
+    func testTransientAccessibilityOperationDoesNotRetryPermanentFailure() async throws {
+        var attempts = 0
+
+        let result = try await AXApplicationController.retryTransientOperation(
+            timeoutSeconds: 0.25,
+            retryDelay: .milliseconds(1)
+        ) {
+            attempts += 1
+            return .illegalArgument
+        }
+
+        XCTAssertEqual(result, .illegalArgument)
+        XCTAssertEqual(attempts, 1)
+    }
+
+    @MainActor
+    func testTransientAccessibilityOperationPropagatesCancellation() async {
+        let task = Task { @MainActor () throws -> AXError in
+            try await AXApplicationController.retryTransientOperation(
+                timeoutSeconds: 0.05,
+                retryDelay: .seconds(1)
+            ) {
+                .cannotComplete
+            }
+        }
+        await Task.yield()
+        task.cancel()
+
+        do {
+            _ = try await task.value
+            XCTFail("Expected cancellation to stop accessibility retries")
+        } catch is CancellationError {
+            // Expected.
+        } catch {
+            XCTFail("Unexpected error: \(error)")
+        }
+    }
+
     func testKeyboardFocusProxyMustCoverTheTargetControl() {
         let target = CGRect(x: 120, y: 80, width: 580, height: 180)
 

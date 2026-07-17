@@ -514,7 +514,7 @@ public enum PackagedAppVerifier {
         var longTitleFound = false
         var failures: [String] = []
         for viewport in VerificationViewport.required {
-            try controller.setSize(viewport, of: mainWindow)
+            try await controller.setSize(viewport, of: mainWindow)
             guard let actualFrame = await controller.waitForSize(viewport, of: mainWindow) else {
                 throw AXAutomationError.noMainWindow("window disappeared during resize")
             }
@@ -584,7 +584,7 @@ public enum PackagedAppVerifier {
         screenshotDirectory: URL
     ) async throws -> ViewerShortcutVerificationEvidence {
         let viewport = VerificationViewport(width: 1_100, height: 760)
-        try controller.setSize(viewport, of: mainWindow)
+        try await controller.setSize(viewport, of: mainWindow)
         guard await controller.waitForSize(viewport, of: mainWindow) != nil else {
             throw AXAutomationError.noMainWindow("window disappeared before viewer shortcut evidence")
         }
