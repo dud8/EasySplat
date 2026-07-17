@@ -15,7 +15,7 @@ BACKUP_DIR="$INSTALL_PARENT/msplat.previous.$$"
 OVERLAY="$ROOT/Tools/MsplatNative/msplat.cpp"
 OVERLAY_SHA256="f4b9238d58f80c1bf56a83ece9dae8c44801906dd35055f64309c98da698bb22"
 RASTER_TEST_SOURCE="$ROOT/Tools/MsplatNative/msplat_raster_tests.cpp"
-RASTER_TEST_SHA256="55a20875f031e5d5425c0efc4ebea2bff5adb03bee23001c7ee2a86738d75588"
+RASTER_TEST_SHA256="abe7bd5f09f64fde35085dfcf48a673d5cb3594247dd43f842396ded422e0146"
 FIXTURE_GENERATOR="$ROOT/scripts/ci/generate_msplat_sparse_fixtures.py"
 UPSTREAM_PATCH="$ROOT/Tools/MsplatNative/msplat-1.1.3-easysplat.patch"
 CHECKPOINT_PATCH="$ROOT/Tools/MsplatNative/msplat-1.1.3-checkpoint.patch"
@@ -24,9 +24,9 @@ NUMERIC_STABILITY_PATCH_SHA256="231586b17e4f47c8c55432a631e08bf293b31a92f8d6ec49
 METAL_SAFETY_PATCH="$ROOT/Tools/MsplatNative/msplat-1.1.3-metal-safety.patch"
 METAL_SAFETY_PATCH_SHA256="5d3dfff3edcbca940d37f6ee3145c76c678ebd36ebc03016cfd5dab78e1d45ac"
 EXACT_RASTER_PATCH="$ROOT/Tools/MsplatNative/msplat-1.1.3-exact-raster.patch"
-EXACT_RASTER_PATCH_SHA256="278deba531d1503b8f6fe3428e0b6c5103129f388a6bc425c41780ff9e4c453b"
+EXACT_RASTER_PATCH_SHA256="c34a8860ed8ae9bc92c976aaa1c3f89eec8aa9be9cab4778f074491e98860855"
 STAGE_TIMING_PATCH="$ROOT/Tools/MsplatNative/msplat-1.1.3-stage-timing.patch"
-STAGE_TIMING_PATCH_SHA256="41e7146c2047a7a93b45927d1ee40d1e310db9898c25ab892a27c158acff75dd"
+STAGE_TIMING_PATCH_SHA256="e803a9e6027fb81835d3c30bccd6cec1fa7ad63315ffb6bbae0f135cc476941d"
 MEMORY_EFFICIENCY_PATCH="$ROOT/Tools/MsplatNative/msplat-1.1.3-memory-efficiency.patch"
 MEMORY_EFFICIENCY_PATCH_SHA256="bfacc105454e80102139f120dd6375037360c6a9763f1e1f708aa2a7f22eca6c"
 DENSIFICATION_MEMORY_PATCH="$ROOT/Tools/MsplatNative/msplat-1.1.3-densification-memory.patch"
@@ -88,6 +88,7 @@ reject_raster_test_symbols() {
     msplat_set_geometry_adam_fusion_enabled_for_testing \
     msplat_fail_next_sync_for_testing \
     msplat_pending_exact_raster_timing_handlers_for_testing \
+    msplat_exact_radix_pass_count_for_testing \
     msplat_gpu_ticks_to_seconds_for_testing \
     msplat_gpu_frequency_from_timestamp_pairs_for_testing \
     msplat_stage_timing_sample_valid_for_testing \

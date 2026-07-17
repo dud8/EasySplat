@@ -24,10 +24,11 @@ index 89be4ee..1242a37 100644
  void msplat_set_force_exact_for_testing(bool force_exact);
  void msplat_set_exact_fallback_enabled_for_testing(bool enabled);
  void msplat_set_exact_execution_capacity_for_testing(uint64_t capacity);
-@@ -71,6 +79,22 @@ void msplat_set_exact_capacity_limit_for_testing(uint64_t capacity);
+@@ -71,7 +79,23 @@ void msplat_set_exact_capacity_limit_for_testing(uint64_t capacity);
  void msplat_set_raster_memory_budget_for_testing(uint64_t budget_bytes);
  void msplat_fail_next_sync_for_testing();
  uint64_t msplat_pending_exact_raster_timing_handlers_for_testing();
+ uint32_t msplat_exact_radix_pass_count_for_testing(uint32_t tile_count);
 +double msplat_gpu_ticks_to_seconds_for_testing(uint64_t ticks, double frequency_hz);
 +double msplat_gpu_frequency_from_timestamp_pairs_for_testing(
 +    const uint64_t* cpu_timestamps,

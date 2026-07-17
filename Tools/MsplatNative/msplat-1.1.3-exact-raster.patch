@@ -111,7 +111,7 @@ index 159e98b..89be4ee 100644
  // Release all cached GPU tensors (call before exit to prevent GPU memory leak)
  void cleanup_msplat_metal();
  
-@@ -23,6 +43,49 @@ void msplat_commit();
+@@ -23,6 +43,50 @@ void msplat_commit();
  
  // Synchronize (commit + wait for completion)
  void msplat_gpu_sync();
@@ -143,6 +143,7 @@ index 159e98b..89be4ee 100644
 +void msplat_set_raster_memory_budget_for_testing(uint64_t budget_bytes);
 +void msplat_fail_next_sync_for_testing();
 +uint64_t msplat_pending_exact_raster_timing_handlers_for_testing();
++uint32_t msplat_exact_radix_pass_count_for_testing(uint32_t tile_count);
 +void msplat_copy_last_raster_debug(
 +    float* rgb,
 +    float* alpha,
@@ -1014,7 +1015,7 @@ index 2763c99..9fff022 100644
              bwd_num_points = np;
              features_rest_bases = frb;
              v_xy = mtensor_empty(dev, {np, 2}, DType::Float32);
-@@ -513,9 +852,643 @@ struct FusedTensorCache {
+@@ -513,9 +852,663 @@ struct FusedTensorCache {
              v_features_rest = mtensor_empty(dev, {(int64_t)np, (int64_t)frb, 3}, DType::Float32);
          }
      }
@@ -1153,6 +1154,26 @@ index 2763c99..9fff022 100644
 +    }
 +    return static_cast<uint32_t>(capacity);
 +}
++
++static uint32_t exact_radix_pass_count(uint32_t tile_count) {
++    if (tile_count == 0) {
++        throw std::runtime_error("msplat: raster grid has no tiles");
++    }
++    uint32_t highest_tile_id = tile_count - 1;
++    uint32_t tile_bytes = 0;
++    while (highest_tile_id != 0) {
++        ++tile_bytes;
++        highest_tile_id >>= 8;
++    }
++    const uint32_t passes = 4 + tile_bytes;
++    return passes + (passes & 1u);
++}
++
++#ifdef MSPLAT_ENABLE_RASTER_TEST_HOOKS
++uint32_t msplat_exact_radix_pass_count_for_testing(uint32_t tile_count) {
++    return exact_radix_pass_count(tile_count);
++}
++#endif
 +
 +void msplat_preflight_raster_memory(
 +    int point_count,
@@ -1667,7 +1688,7 @@ index 2763c99..9fff022 100644
      const float* losses = g_tcache.loss_history.data<float>();
      for (int index = 0; index < count; ++index) {
          const double value = static_cast<double>(losses[index]) *
-@@ -567,7 +1540,192 @@ void msplat_sync_loss_window(int count, float* output) {
+@@ -567,7 +1540,193 @@ void msplat_sync_loss_window(int count, float* output) {
  }
  
  void cleanup_msplat_metal() {
@@ -1798,7 +1819,8 @@ index 2763c99..9fff022 100644
 +    [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
 +
 +    const uint32_t radix_blocks = (capacity + 255) / 256;
-+    for (uint32_t pass = 0; pass < 8; ++pass) {
++    const uint32_t radix_pass_count = exact_radix_pass_count(num_tiles);
++    for (uint32_t pass = 0; pass < radix_pass_count; ++pass) {
 +        const uint32_t shift = pass * 8;
 +        MTensor &keys_in = (pass % 2 == 0) ? g_tcache.exact_isect_ids : g_tcache.exact_sort_keys_tmp;
 +        MTensor &vals_in = (pass % 2 == 0) ? gaussian_ids : g_tcache.exact_sort_vals_tmp;

@@ -30,6 +30,7 @@ reject_raster_test_symbols() {
     msplat_set_geometry_adam_fusion_enabled_for_testing \
     msplat_fail_next_sync_for_testing \
     msplat_pending_exact_raster_timing_handlers_for_testing \
+    msplat_exact_radix_pass_count_for_testing \
     msplat_gpu_ticks_to_seconds_for_testing \
     msplat_gpu_frequency_from_timestamp_pairs_for_testing \
     msplat_stage_timing_sample_valid_for_testing \
@@ -137,13 +138,13 @@ exact_values = {
     "source_version": "1.1.3",
     "source_tree_sha256": "866fd6d051b5cf98ca08ae1552236473f504d8f13756cbda68201e48532c3e6a",
     "overlay_sha256": "f4b9238d58f80c1bf56a83ece9dae8c44801906dd35055f64309c98da698bb22",
-    "raster_test_sha256": "55a20875f031e5d5425c0efc4ebea2bff5adb03bee23001c7ee2a86738d75588",
+    "raster_test_sha256": "abe7bd5f09f64fde35085dfcf48a673d5cb3594247dd43f842396ded422e0146",
     "patch_sha256": "fafbf6f43a3be474a708607a903fc0dbb0029a4d4664c261a1ebaf301f3e9f3f",
     "checkpoint_patch_sha256": "c8b9a8dd03afb4bc50b8a12adf78dc46f5280d67bb62823c58aff2305a4870dc",
     "numeric_stability_patch_sha256": "231586b17e4f47c8c55432a631e08bf293b31a92f8d6ec49b367d11632350ec3",
     "metal_safety_patch_sha256": "5d3dfff3edcbca940d37f6ee3145c76c678ebd36ebc03016cfd5dab78e1d45ac",
-    "exact_raster_patch_sha256": "278deba531d1503b8f6fe3428e0b6c5103129f388a6bc425c41780ff9e4c453b",
-    "stage_timing_patch_sha256": "41e7146c2047a7a93b45927d1ee40d1e310db9898c25ab892a27c158acff75dd",
+    "exact_raster_patch_sha256": "c34a8860ed8ae9bc92c976aaa1c3f89eec8aa9be9cab4778f074491e98860855",
+    "stage_timing_patch_sha256": "e803a9e6027fb81835d3c30bccd6cec1fa7ad63315ffb6bbae0f135cc476941d",
     "memory_efficiency_patch_sha256": "bfacc105454e80102139f120dd6375037360c6a9763f1e1f708aa2a7f22eca6c",
     "densification_memory_patch_sha256": "b429540372d807f280929ebba1670257990bd36b28dfee5b42bc377ccef60ac7",
     "row_span_culling_patch_sha256": "481c4c9a70f1da5eb1590b20a64e25a3c64bb3c19f14e27996ab9b25a119594d",

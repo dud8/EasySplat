@@ -26,6 +26,45 @@ constexpr float absoluteTolerance = 2.0e-4f;
 constexpr int stageTimingIterations = 512;
 constexpr int geometryAdamShDegreeInterval = 4;
 
+void verifyExactRadixPassPlanning() {
+    struct PassCase {
+        std::uint32_t tileCount;
+        std::uint32_t expectedPasses;
+    };
+    const PassCase cases[] = {
+        {1, 4},
+        {2, 6},
+        {256, 6},
+        {257, 6},
+        {65'536, 6},
+        {65'537, 8},
+        {16'777'216, 8},
+        {16'777'217, 8},
+        {std::numeric_limits<std::uint32_t>::max(), 8},
+    };
+    for (const auto &testCase : cases) {
+        const std::uint32_t actual =
+            msplat_exact_radix_pass_count_for_testing(testCase.tileCount);
+        if (actual != testCase.expectedPasses) {
+            throw std::runtime_error(
+                "exact radix pass count for " + std::to_string(testCase.tileCount) +
+                " tiles expected " + std::to_string(testCase.expectedPasses) +
+                ", got " + std::to_string(actual)
+            );
+        }
+    }
+
+    bool rejectedEmptyGrid = false;
+    try {
+        (void)msplat_exact_radix_pass_count_for_testing(0);
+    } catch (const std::runtime_error &) {
+        rejectedEmptyGrid = true;
+    }
+    if (!rejectedEmptyGrid) {
+        throw std::runtime_error("exact radix planner accepted an empty tile grid");
+    }
+}
+
 void requireRelativeNear(
     const std::string &label,
     double actual,
@@ -1770,6 +1809,7 @@ void verifyStageTiming(const std::string &dataset) {
 
 int main(int argc, char **argv) {
     try {
+        verifyExactRadixPassPlanning();
         if (argc == 3 && std::string(argv[1]) == "--geometry-adam-benchmark") {
             benchmarkGeometryAdamFusion(argv[2]);
             return 0;
