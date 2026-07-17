@@ -7,17 +7,39 @@ constant const int kMaxViewCount = 2;
 constant static const float kBoundsRadius = 2;
 constant static const float kBoundsRadiusSquared = kBoundsRadius*kBoundsRadius;
 
+constant const float kSHC0 = 0.28209479177387814;
+constant const float kSHC1 = 0.4886025119029199;
+constant const float kSHC2[] = {
+     1.0925484305920792,
+    -1.0925484305920792,
+     0.31539156525252005,
+    -1.0925484305920792,
+     0.5462742152960396,
+};
+constant const float kSHC3[] = {
+    -0.5900435899266435,
+     2.890611442640554,
+    -0.4570457994644658,
+     0.3731763325901154,
+    -0.4570457994644658,
+     1.445305721320277,
+    -0.5900435899266435,
+};
+
 enum BufferIndex: int32_t
 {
     BufferIndexUniforms = 0,
     BufferIndexSplat    = 1,
     BufferIndexOrder    = 2,
+    BufferIndexSphericalHarmonic = 3,
 };
 
 typedef struct
 {
     matrix_float4x4 projectionMatrix;
     matrix_float4x4 viewMatrix;
+    packed_float3 cameraWorldPosition;
+    uint sphericalHarmonicDegree;
     uint2 screenSize;
 } Uniforms;
 
@@ -40,6 +62,44 @@ typedef struct
     float2 textureCoordinates;
     float4 color;
 } ColorInOut;
+
+float3 evaluateSphericalHarmonics(float3 direction,
+                                  device const packed_half3* coefficients,
+                                  uint splatIndex) {
+    device const packed_half3* payload = coefficients + splatIndex * 16;
+    float3 result = kSHC0 * float3(payload[0]);
+    device const packed_half3* sh = payload + 1;
+    float x = direction.x;
+    float y = direction.y;
+    float z = direction.z;
+    result -= kSHC1 * y * float3(sh[0]);
+    result += kSHC1 * z * float3(sh[1]);
+    result -= kSHC1 * x * float3(sh[2]);
+
+    float xx = x * x;
+    float yy = y * y;
+    float zz = z * z;
+    float xy = x * y;
+    float yz = y * z;
+    float xz = x * z;
+    float xxPlusYy = xx + yy;
+    float xxMinusYy = xx - yy;
+    result += kSHC2[0] * xy * float3(sh[3]);
+    result += kSHC2[1] * yz * float3(sh[4]);
+    result += kSHC2[2] * (2.0 * zz - xxPlusYy) * float3(sh[5]);
+    result += kSHC2[3] * xz * float3(sh[6]);
+    result += kSHC2[4] * xxMinusYy * float3(sh[7]);
+
+    float fourZZMinusXXYY = 4.0 * zz - xxPlusYy;
+    result += kSHC3[0] * y * (3.0 * xx - yy) * float3(sh[8]);
+    result += kSHC3[1] * xy * z * float3(sh[9]);
+    result += kSHC3[2] * y * fourZZMinusXXYY * float3(sh[10]);
+    result += kSHC3[3] * z * (2.0 * zz - 3.0 * xxPlusYy) * float3(sh[11]);
+    result += kSHC3[4] * x * fourZZMinusXXYY * float3(sh[12]);
+    result += kSHC3[5] * z * xxMinusYy * float3(sh[13]);
+    result += kSHC3[6] * x * (xx - 3.0 * yy) * float3(sh[14]);
+    return max(result + 0.5, 0.0);
+}
 
 float3 calcCovariance2D(float3 viewPos,
                         packed_half3 cov3Da,
@@ -122,12 +182,14 @@ vertex ColorInOut splatVertexShader(uint vertexID [[vertex_id]],
                                     ushort amp_id [[amplification_id]],
                                     constant Splat* splatArray [[ buffer(BufferIndexSplat) ]],
                                     constant metal::uint32_t* orderArray [[ buffer(BufferIndexOrder) ]],
+                                    device const packed_half3* sphericalHarmonicCoefficients [[ buffer(BufferIndexSphericalHarmonic) ]],
                                     constant UniformsArray & uniformsArray [[ buffer(BufferIndexUniforms) ]]) {
     ColorInOut out;
 
     Uniforms uniforms = uniformsArray.uniforms[min(int(amp_id), kMaxViewCount)];
 
-    Splat splat = splatArray[orderArray[instanceID]];
+    uint splatIndex = orderArray[instanceID];
+    Splat splat = splatArray[splatIndex];
     float4 viewPosition4 = uniforms.viewMatrix * float4(splat.position, 1);
     float3 viewPosition3 = viewPosition4.xyz;
 
@@ -170,7 +232,21 @@ vertex ColorInOut splatVertexShader(uint vertexID [[vertex_id]],
 
     out.position = float4(screenVertex.x, screenVertex.y, 0, 1);
     out.textureCoordinates = textureCoordinates;
-    out.color = float4(splat.color);
+    if (uniforms.sphericalHarmonicDegree < 3) {
+        out.color = float4(splat.color);
+    } else {
+        float3 cameraToSplat = float3(splat.position) - float3(uniforms.cameraWorldPosition);
+        float directionLengthSquared = dot(cameraToSplat, cameraToSplat);
+        float3 direction = isfinite(directionLengthSquared) && directionLengthSquared > 1e-12
+            ? cameraToSplat * rsqrt(directionLengthSquared)
+            : float3(0, 0, 1);
+        float3 srgb = evaluateSphericalHarmonics(
+            direction,
+            sphericalHarmonicCoefficients,
+            splatIndex
+        );
+        out.color = float4(pow(srgb, float3(2.2)), splat.color.a);
+    }
     return out;
 }
 
@@ -184,4 +260,3 @@ fragment float4 splatFragmentShader(ColorInOut in [[stage_in]]) {
     float alpha = saturate(exp(negativeVSquared)) * in.color.a;
     return float4(alpha * in.color.rgb, alpha);
 }
-

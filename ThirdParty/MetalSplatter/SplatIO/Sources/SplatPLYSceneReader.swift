@@ -212,11 +212,11 @@ private struct PointElementMapping {
         if let sh0_rPropertyIndex = try headerElement.index(forOptionalFloat32PropertyNamed: PropertyName.sh0_r),
            let sh0_gPropertyIndex = try headerElement.index(forOptionalFloat32PropertyNamed: PropertyName.sh0_g),
             let sh0_bPropertyIndex = try headerElement.index(forOptionalFloat32PropertyNamed: PropertyName.sh0_b) {
-            let sphericalHarmonicsPropertyIndices: [Int]
-            if headerElement.hasProperty(forName: "\(PropertyName.sphericalHarmonicsPrefix)0") {
-                sphericalHarmonicsPropertyIndices = try (0..<sphericalHarmonicsCount).map {
-                    try headerElement.index(forFloat32PropertyNamed: [ "\(PropertyName.sphericalHarmonicsPrefix)\($0)" ])
-                }
+            let sphericalHarmonicsPropertyIndices = try headerElement.sphericalHarmonicPropertyIndices(
+                prefix: PropertyName.sphericalHarmonicsPrefix,
+                expectedCount: sphericalHarmonicsCount
+            )
+            if !sphericalHarmonicsPropertyIndices.isEmpty {
                 color = .sphericalHarmonic(sh0_rPropertyIndex, sh0_gPropertyIndex, sh0_bPropertyIndex, sphericalHarmonicsPropertyIndices)
             } else {
                 color = .firstOrderSphericalHarmonic(sh0_rPropertyIndex, sh0_gPropertyIndex, sh0_bPropertyIndex)
@@ -321,6 +321,19 @@ private struct PointElementMapping {
 }
 
 private extension PLYHeader.Element {
+    func sphericalHarmonicPropertyIndices(prefix: String, expectedCount: Int) throws -> [Int] {
+        let names = properties.lazy.map(\.name).filter { $0.hasPrefix(prefix) }
+        guard !names.isEmpty else { return [] }
+
+        let expectedNames = (0..<expectedCount).map { "\(prefix)\($0)" }
+        guard names.count == expectedCount, Set(names) == Set(expectedNames) else {
+            throw SplatPLYSceneReader.Error.unsupportedFileContents(
+                "Expected higher-order properties \(prefix)0 through \(prefix)\(expectedCount - 1) with no gaps"
+            )
+        }
+        return try expectedNames.map { try index(forFloat32PropertyNamed: [$0]) }
+    }
+
     func hasProperty(forName name: String, type: PLYHeader.PrimitivePropertyType? = nil) -> Bool {
         guard let index = index(forPropertyNamed: name) else {
             return false

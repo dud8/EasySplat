@@ -190,6 +190,61 @@ final class SplatRendererSortTests: XCTestCase {
         )
     }
 
+    func testCPUSortWorkerUsesCapturedMetalBufferAcrossCapacityGrowth() async throws {
+        try await assertSortWorkerUsesCapturedMetalBuffer { renderer in
+            renderer.resortIndicesOnCPU()
+        }
+    }
+
+    func testAccelerateSortWorkerUsesCapturedMetalBufferAcrossCapacityGrowth() async throws {
+        try await assertSortWorkerUsesCapturedMetalBuffer { renderer in
+            renderer.resortIndicesViaAccelerate()
+        }
+    }
+
+    private func assertSortWorkerUsesCapturedMetalBuffer(
+        start: (SplatRenderer) -> Void
+    ) async throws {
+        let renderer = try makeRenderer()
+        try renderer.add(makePoint(x: -1))
+        try renderer.add(makePoint(x: 1))
+        let originalBuffer = renderer.splatBuffer.buffer
+        let completed = expectation(description: "sort completed after capacity growth")
+        let workerBound = expectation(description: "sort worker bound captured buffer")
+        var capturedBuffer: MTLBuffer?
+        var workerBuffer: MTLBuffer?
+        renderer.onSortSnapshotCapturedForTesting = { capturedBuffer = $0 }
+        renderer.onSortWorkerBufferBoundForTesting = {
+            workerBuffer = $0
+            workerBound.fulfill()
+        }
+        renderer.onSortStart = {
+            do {
+                try renderer.ensureAdditionalCapacity(100)
+            } catch {
+                XCTFail("Capacity growth failed: \(error)")
+            }
+        }
+        renderer.onSortComplete = { _ in completed.fulfill() }
+
+        start(renderer)
+        await fulfillment(of: [workerBound, completed], timeout: 2)
+
+        XCTAssertEqual(
+            bufferIdentity(try XCTUnwrap(capturedBuffer)),
+            bufferIdentity(originalBuffer)
+        )
+        XCTAssertEqual(
+            bufferIdentity(try XCTUnwrap(workerBuffer)),
+            bufferIdentity(originalBuffer)
+        )
+        XCTAssertNotEqual(
+            bufferIdentity(renderer.splatBuffer.buffer),
+            bufferIdentity(originalBuffer)
+        )
+        XCTAssertEqual(renderer.orderBuffer.count, 2)
+    }
+
     private func completeCPUSort(_ renderer: SplatRenderer) async throws {
         let completed = expectation(description: "CPU sort completed")
         renderer.onSortComplete = { _ in completed.fulfill() }

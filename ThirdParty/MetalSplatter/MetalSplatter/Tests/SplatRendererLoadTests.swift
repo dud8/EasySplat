@@ -66,6 +66,46 @@ final class SplatRendererLoadTests: XCTestCase {
         XCTAssertEqual(renderer.splatCount, originalCount)
     }
 
+    func testAddRejectsNonFiniteHigherOrderCoefficientWithoutPublishing() throws {
+        let renderer = try makeRenderer()
+        try renderer.add(makePoint())
+        let originalSplats = bufferIdentity(renderer.splatBuffer.buffer)
+        let originalOrder = bufferIdentity(renderer.orderBuffer.buffer)
+
+        XCTAssertThrowsError(try renderer.add(makeSH3Point(restValue: .nan)))
+
+        XCTAssertEqual(renderer.splatCount, 1)
+        XCTAssertEqual(bufferIdentity(renderer.splatBuffer.buffer), originalSplats)
+        XCTAssertEqual(bufferIdentity(renderer.orderBuffer.buffer), originalOrder)
+    }
+
+    func testAddRejectsHigherOrderCoefficientThatOverflowsFloat16WithoutPublishing() throws {
+        let renderer = try makeRenderer()
+        try renderer.add(makePoint())
+        let originalSplats = bufferIdentity(renderer.splatBuffer.buffer)
+        let originalOrder = bufferIdentity(renderer.orderBuffer.buffer)
+
+        XCTAssertThrowsError(try renderer.add(makeSH3Point(restValue: 70_000)))
+
+        XCTAssertEqual(renderer.splatCount, 1)
+        XCTAssertEqual(bufferIdentity(renderer.splatBuffer.buffer), originalSplats)
+        XCTAssertEqual(bufferIdentity(renderer.orderBuffer.buffer), originalOrder)
+    }
+
+    func testReadPLYRejectsUnrepresentableHigherOrderCoefficientWithoutPublishing() throws {
+        let renderer = try makeRenderer()
+        try renderer.add(makePoint())
+        let originalSplats = bufferIdentity(renderer.splatBuffer.buffer)
+        let originalOrder = bufferIdentity(renderer.orderBuffer.buffer)
+        let url = try makeSphericalHarmonicPLY(restValue: "70000")
+
+        XCTAssertThrowsError(try renderer.readPLY(from: url))
+
+        XCTAssertEqual(renderer.splatCount, 1)
+        XCTAssertEqual(bufferIdentity(renderer.splatBuffer.buffer), originalSplats)
+        XCTAssertEqual(bufferIdentity(renderer.orderBuffer.buffer), originalOrder)
+    }
+
     private func makeRenderer(maximumSplatCount: Int? = nil) throws -> SplatRenderer {
         guard let device = MTLCreateSystemDefaultDevice() else {
             throw XCTSkip("Metal is unavailable")
@@ -91,6 +131,57 @@ final class SplatRendererLoadTests: XCTestCase {
             scale: .zero,
             rotation: simd_quatf(real: 1, imag: .zero)
         )
+    }
+
+    private func makeSH3Point(restValue: Float) -> SplatScenePoint {
+        SplatScenePoint(
+            position: .zero,
+            normal: .zero,
+            color: .sphericalHarmonic(0, 0, 0, Array(repeating: restValue, count: 45)),
+            opacity: 1,
+            scale: .zero,
+            rotation: simd_quatf(real: 1, imag: .zero)
+        )
+    }
+
+    private func bufferIdentity(_ buffer: MTLBuffer) -> ObjectIdentifier {
+        ObjectIdentifier(buffer as AnyObject)
+    }
+
+    private func makeSphericalHarmonicPLY(restValue: String) throws -> URL {
+        let restProperties = (0..<45).map { "property float f_rest_\($0)" }.joined(separator: "\n")
+        let restValues = Array(repeating: restValue, count: 45).joined(separator: " ")
+        let contents = """
+        ply
+        format ascii 1.0
+        element vertex 1
+        property float x
+        property float y
+        property float z
+        property float f_dc_0
+        property float f_dc_1
+        property float f_dc_2
+        \(restProperties)
+        property float scale_0
+        property float scale_1
+        property float scale_2
+        property float opacity
+        property float rot_0
+        property float rot_1
+        property float rot_2
+        property float rot_3
+        end_header
+        0 0 0 0 0 0 \(restValues) 0 0 0 1 1 0 0 0
+        """
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        let url = directory.appendingPathComponent("sh3-test.ply")
+        try contents.write(to: url, atomically: true, encoding: .utf8)
+        addTeardownBlock {
+            try? FileManager.default.removeItem(at: directory)
+        }
+        return url
     }
 
     private func makePLY(declaredPointCount: Int, body: String) throws -> URL {
