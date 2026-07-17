@@ -71,7 +71,7 @@ final class VideoFrameAllocationTests: XCTestCase {
         ))
     )
 
-    func testDurationAwareTargetTreatsProfileBudgetAsACeiling() {
+    func testBalancedAndHighDetailAlwaysUseFullProfileBudget() {
         XCTAssertEqual(
             PipelineRunner.test_durationAwareVideoFrameTarget(
                 durations: [9.5428666667],
@@ -79,7 +79,7 @@ final class VideoFrameAllocationTests: XCTestCase {
                 analysisFrameRate: 3,
                 detail: .balanced
             ),
-            30
+            250
         )
         XCTAssertEqual(
             PipelineRunner.test_durationAwareVideoFrameTarget(
@@ -90,12 +90,24 @@ final class VideoFrameAllocationTests: XCTestCase {
             ),
             500
         )
+    }
+
+    func testFastTreatsProfileBudgetAsADurationAwareCeiling() {
+        XCTAssertEqual(
+            PipelineRunner.test_durationAwareVideoFrameTarget(
+                durations: [9.5428666667],
+                frameCeiling: 250,
+                analysisFrameRate: 3,
+                detail: .fast
+            ),
+            30
+        )
         XCTAssertEqual(
             PipelineRunner.test_durationAwareVideoFrameTarget(
                 durations: [100],
                 frameCeiling: 250,
                 analysisFrameRate: 3,
-                detail: .balanced
+                detail: .fast
             ),
             250
         )
@@ -104,7 +116,7 @@ final class VideoFrameAllocationTests: XCTestCase {
                 durations: [66.0326333333],
                 frameCeiling: 250,
                 analysisFrameRate: 3,
-                detail: .balanced
+                detail: .fast
             ),
             199
         )
@@ -116,7 +128,7 @@ final class VideoFrameAllocationTests: XCTestCase {
                 durations: [1, 2, 3],
                 frameCeiling: 250,
                 analysisFrameRate: 3,
-                detail: .balanced
+                detail: .fast
             ),
             30
         )
@@ -125,7 +137,7 @@ final class VideoFrameAllocationTests: XCTestCase {
                 durations: [20, 20],
                 frameCeiling: 250,
                 analysisFrameRate: 3,
-                detail: .balanced
+                detail: .fast
             ),
             120
         )
@@ -134,7 +146,7 @@ final class VideoFrameAllocationTests: XCTestCase {
                 durations: [1, 1, 1, 1],
                 frameCeiling: 6,
                 analysisFrameRate: 3,
-                detail: .balanced
+                detail: .fast
             ),
             6
         )

@@ -100,7 +100,10 @@ extension PipelineRunner {
               durations.allSatisfy({ $0.isFinite && $0 > 0 }) else {
             return nil
         }
-        guard detail != .highDetail else { return frameCeiling }
+        // Balanced and High Detail are quality contracts: they consume their full
+        // resolved keyframe budget whenever the source can supply it. Only Fast
+        // trades temporal density for shorter captures.
+        guard detail == .fast else { return frameCeiling }
         let totalDuration = durations.reduce(0, +)
         guard totalDuration.isFinite, totalDuration > 0 else { return nil }
         let density = Double(analysisFrameRate)
