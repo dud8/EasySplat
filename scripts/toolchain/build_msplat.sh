@@ -14,6 +14,7 @@ BACKUP_DIR="$INSTALL_PARENT/msplat.previous.$$"
 
 OVERLAY="$ROOT/Tools/MsplatNative/msplat.cpp"
 RASTER_TEST_SOURCE="$ROOT/Tools/MsplatNative/msplat_raster_tests.cpp"
+RASTER_TEST_SHA256="55a20875f031e5d5425c0efc4ebea2bff5adb03bee23001c7ee2a86738d75588"
 FIXTURE_GENERATOR="$ROOT/scripts/ci/generate_msplat_sparse_fixtures.py"
 UPSTREAM_PATCH="$ROOT/Tools/MsplatNative/msplat-1.1.3-easysplat.patch"
 CHECKPOINT_PATCH="$ROOT/Tools/MsplatNative/msplat-1.1.3-checkpoint.patch"
@@ -116,6 +117,8 @@ preflight() {
   [ -f "$RASTER_TEST_SOURCE" ] || die "missing raster parity test: $RASTER_TEST_SOURCE"
   [ -f "$FIXTURE_GENERATOR" ] || die "missing sparse fixture generator: $FIXTURE_GENERATOR"
   [ -f "$UPSTREAM_PATCH" ] || die "missing upstream patch: $UPSTREAM_PATCH"
+  [ "$(sha256 "$RASTER_TEST_SOURCE")" = "$RASTER_TEST_SHA256" ] \
+    || die "raster parity test SHA-256 mismatch"
   [ -f "$CHECKPOINT_PATCH" ] || die "missing checkpoint patch: $CHECKPOINT_PATCH"
   [ -f "$NUMERIC_STABILITY_PATCH" ] || die "missing numeric-stability patch: $NUMERIC_STABILITY_PATCH"
   [ "$(sha256 "$NUMERIC_STABILITY_PATCH")" = "$NUMERIC_STABILITY_PATCH_SHA256" ] \
