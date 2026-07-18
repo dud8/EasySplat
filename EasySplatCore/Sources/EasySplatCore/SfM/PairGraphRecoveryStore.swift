@@ -11,7 +11,7 @@ enum PairGraphRecoveryPhase: String, Codable, Sendable, Equatable {
 }
 
 struct PairGraphRecoveryState: Codable, Sendable, Equatable {
-    static let currentSchemaVersion = 5
+    static let currentSchemaVersion = 6
 
     var schemaVersion: Int
     var selectedFramesDigest: String

@@ -63,7 +63,7 @@ struct PersistedColmapPairGraphInspection: Codable, Sendable, Equatable {
 }
 
 struct PairGraphEvidence: Codable, Sendable, Equatable {
-    static let currentSchemaVersion = 6
+    static let currentSchemaVersion = 7
 
     var schemaVersion: Int
     var selectedFramesDigest: String
@@ -484,8 +484,12 @@ enum PairGraphEvidenceStore {
                 imageNames: imageNames,
                 scheduledPairs: attempt.scheduledPairs
             )
-            guard attempt.artifact.outcome != .completed || plan.isConnected else {
-                throw PairGraphEvidenceStoreError.invalidEvidence
+            if attempt.artifact.outcome != .failed {
+                guard plan.isConnected,
+                      attempt.artifact.attemptedPairCount
+                        == attempt.artifact.scheduledPairCount else {
+                    throw PairGraphEvidenceStoreError.invalidEvidence
+                }
             }
             defer {
                 previousAttempt = attempt
@@ -504,7 +508,7 @@ enum PairGraphEvidenceStore {
             }
             if level == previousLevel {
                 if attempt.artifact.matcher == previousAttempt.artifact.matcher {
-                    guard previousAttempt.artifact.outcome == .failed,
+                    guard previousAttempt.artifact.outcome != .completed,
                           plan == previousPlan else {
                         throw PairGraphEvidenceStoreError.invalidEvidence
                     }

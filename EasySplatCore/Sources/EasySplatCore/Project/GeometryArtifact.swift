@@ -68,6 +68,7 @@ public enum PairGraphRecoveryLevel: String, Codable, Sendable, Equatable {
 
 public enum PairMatchingAttemptOutcome: String, Codable, Sendable, Equatable {
     case completed
+    case rejected
     case failed
 }
 
@@ -450,7 +451,7 @@ public struct CanonicalOrientationArtifact: Codable, Sendable, Equatable {
 }
 
 public struct GeometryArtifact: Codable, Sendable, Equatable {
-    public static let currentSchemaVersion = 15
+    public static let currentSchemaVersion = 16
 
     public var schemaVersion: Int
     public var solverVersion: String

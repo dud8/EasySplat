@@ -3,14 +3,24 @@ import Foundation
 extension PipelineRunner {
     enum PairAttemptMode: Sendable, Equatable {
         case policy
+        case restoredPolicy(ColmapPairPlan)
         case sameScheduleExact(ColmapPairPlan)
 
         var planOverride: ColmapPairPlan? {
             switch self {
             case .policy:
                 nil
-            case .sameScheduleExact(let plan):
+            case .restoredPolicy(let plan), .sameScheduleExact(let plan):
                 plan
+            }
+        }
+
+        var isPolicyRecovery: Bool {
+            switch self {
+            case .policy, .restoredPolicy:
+                true
+            case .sameScheduleExact:
+                false
             }
         }
     }

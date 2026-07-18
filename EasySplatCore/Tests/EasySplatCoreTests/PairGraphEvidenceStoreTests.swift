@@ -228,6 +228,36 @@ final class PairGraphEvidenceStoreTests: XCTestCase {
         ))
     }
 
+    func testSaveRejectsPartialOrDisconnectedRejectedAttempts() throws {
+        let fixture = try makeProject()
+        defer { try? FileManager.default.removeItem(at: fixture.root) }
+        var evidence = makeSmallUnorderedExactEvidence()
+        evidence.attempts[0].artifact.outcome = .rejected
+        evidence.attempts[0].artifact.attemptedPairCount = 2
+        evidence.attempts[0].artifact.rawMatchedPairCount = 2
+        evidence.attempts[0].artifact.spatiallyVerifiedPairCount = 1
+
+        XCTAssertThrowsError(try PairGraphEvidenceStore.save(
+            evidence,
+            to: fixture.paths.pairGraphEvidenceURL,
+            projectPaths: fixture.paths
+        ))
+
+        evidence = makeEvidence()
+        evidence.attempts[0].artifact.outcome = .rejected
+        evidence.attempts[0].scheduledPairs.removeLast()
+        evidence.attempts[0].artifact.scheduledPairCount = 2
+        evidence.attempts[0].artifact.attemptedPairCount = 2
+        evidence.attempts[0].artifact.rawMatchedPairCount = 1
+        evidence.attempts[0].artifact.spatiallyVerifiedPairCount = 1
+
+        XCTAssertThrowsError(try PairGraphEvidenceStore.save(
+            evidence,
+            to: fixture.paths.pairGraphEvidenceURL,
+            projectPaths: fixture.paths
+        ))
+    }
+
     func testSaveRejectsExactSwitchAfterCompletedNondensestFaissAttempt() throws {
         let fixture = try makeProject()
         defer { try? FileManager.default.removeItem(at: fixture.root) }
@@ -275,6 +305,26 @@ final class PairGraphEvidenceStoreTests: XCTestCase {
             to: fixture.paths.pairGraphEvidenceURL,
             projectPaths: fixture.paths
         )
+    }
+
+    func testSaveAcceptsSameScheduleSuccessAfterRejectedExactRetry() throws {
+        let fixture = try makeProject()
+        defer { try? FileManager.default.removeItem(at: fixture.root) }
+        var evidence = makeSmallUnorderedExactEvidence()
+        evidence.attempts[0].artifact.outcome = .rejected
+        evidence.attempts[1].artifact.outcome = .rejected
+        var accepted = evidence.attempts[1]
+        accepted.artifact.attemptNumber = 3
+        accepted.artifact.outcome = .completed
+        evidence.attempts.append(accepted)
+        evidence.acceptedAttemptNumber = 3
+        evidence.matchingDurationSeconds = 1.5
+
+        XCTAssertNoThrow(try PairGraphEvidenceStore.save(
+            evidence,
+            to: fixture.paths.pairGraphEvidenceURL,
+            projectPaths: fixture.paths
+        ))
     }
 
     func testSaveAcceptsCompletedExactSwitchAtMaximumRecoveryLevel() throws {

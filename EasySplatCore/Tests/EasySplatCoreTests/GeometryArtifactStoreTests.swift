@@ -55,7 +55,7 @@ final class GeometryArtifactStoreTests: XCTestCase {
 
     func testLoadRejectsPreviousSchemaBeforeDecodingItsPayload() throws {
         let baselineSchemaVersion = GeometryArtifact.currentSchemaVersion - 1
-        XCTAssertEqual(baselineSchemaVersion, 14)
+        XCTAssertEqual(baselineSchemaVersion, 15)
 
         let root = try TestFileBuilder.makeTempDir()
         defer { try? FileManager.default.removeItem(at: root) }
@@ -1078,6 +1078,39 @@ final class GeometryArtifactStoreTests: XCTestCase {
         )
     }
 
+    func testRejectsPartialGraphRejectedAttemptBeforeAcceptedExactAttempt() throws {
+        let root = try TestFileBuilder.makeTempDir()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let paths = ProjectPaths(root: root)
+        try paths.ensureDirectories()
+        let fixture = try writeCanonicalModel(at: paths)
+        var artifact = makeArtifact(fixture: fixture)
+        var measurement = try XCTUnwrap(artifact.pairGraph.measurement)
+        measurement.matcherAttempts[0].outcome = .rejected
+        measurement.matcherAttempts[0].attemptedPairCount = 2
+        measurement.matcherAttempts[0].rawMatchedPairCount = 2
+        measurement.matcherAttempts[0].spatiallyVerifiedPairCount = 1
+        measurement.matcherAttempts.append(PairMatchingAttemptArtifact(
+            attemptNumber: 2,
+            matcher: .exact,
+            recoveryLevel: .normal,
+            outcome: .completed,
+            scheduledPairCount: 3,
+            attemptedPairCount: 3,
+            rawMatchedPairCount: 3,
+            spatiallyVerifiedPairCount: 3,
+            durationSeconds: 0.01
+        ))
+        measurement.matchingDurationSeconds = 0.02
+        artifact.pairGraph = .measured(measurement)
+
+        XCTAssertThrowsError(
+            try GeometryArtifactStore.validate(artifact, projectPaths: paths)
+        ) { error in
+            XCTAssertEqual(error as? GeometryArtifactStore.Error, .invalidPairGraph)
+        }
+    }
+
     func testRejectsCompletedExactSwitchForIncompleteSmallUnorderedSchedule() throws {
         let root = try TestFileBuilder.makeTempDir()
         defer { try? FileManager.default.removeItem(at: root) }
@@ -1141,6 +1174,98 @@ final class GeometryArtifactStoreTests: XCTestCase {
         XCTAssertNoThrow(
             try GeometryArtifactStore.validate(artifact, projectPaths: paths)
         )
+    }
+
+    func testAllowsSameScheduleSuccessAfterRejectedExactRetry() throws {
+        let root = try TestFileBuilder.makeTempDir()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let paths = ProjectPaths(root: root)
+        try paths.ensureDirectories()
+        let fixture = try writeCanonicalModel(at: paths)
+        var artifact = makeArtifact(fixture: fixture)
+        var measurement = try XCTUnwrap(artifact.pairGraph.measurement)
+        measurement.matcherAttempts[0].outcome = .rejected
+        measurement.matcherAttempts.append(PairMatchingAttemptArtifact(
+            attemptNumber: 2,
+            matcher: .exact,
+            recoveryLevel: .normal,
+            outcome: .rejected,
+            scheduledPairCount: 3,
+            attemptedPairCount: 3,
+            rawMatchedPairCount: 3,
+            spatiallyVerifiedPairCount: 3,
+            durationSeconds: 0.01
+        ))
+        measurement.matcherAttempts.append(PairMatchingAttemptArtifact(
+            attemptNumber: 3,
+            matcher: .exact,
+            recoveryLevel: .normal,
+            outcome: .completed,
+            scheduledPairCount: 3,
+            attemptedPairCount: 3,
+            rawMatchedPairCount: 3,
+            spatiallyVerifiedPairCount: 3,
+            durationSeconds: 0.01
+        ))
+        measurement.matchingDurationSeconds = 0.03
+        artifact.pairGraph = .measured(measurement)
+
+        XCTAssertNoThrow(
+            try GeometryArtifactStore.validate(artifact, projectPaths: paths)
+        )
+    }
+
+    func testRejectsDifferentScheduleSizeAfterRejectedExactRetry() throws {
+        let root = try TestFileBuilder.makeTempDir()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let paths = ProjectPaths(root: root)
+        try paths.ensureDirectories()
+        let fixture = try writeCanonicalModel(at: paths)
+        var artifact = makeArtifact(fixture: fixture)
+        var measurement = try XCTUnwrap(artifact.pairGraph.measurement)
+        measurement.matcherAttempts[0].outcome = .rejected
+        measurement.matcherAttempts.append(PairMatchingAttemptArtifact(
+            attemptNumber: 2,
+            matcher: .exact,
+            recoveryLevel: .normal,
+            outcome: .rejected,
+            scheduledPairCount: 3,
+            attemptedPairCount: 3,
+            rawMatchedPairCount: 3,
+            spatiallyVerifiedPairCount: 3,
+            durationSeconds: 0.01
+        ))
+        measurement.matcherAttempts.append(PairMatchingAttemptArtifact(
+            attemptNumber: 3,
+            matcher: .exact,
+            recoveryLevel: .normal,
+            outcome: .completed,
+            scheduledPairCount: 2,
+            attemptedPairCount: 2,
+            rawMatchedPairCount: 2,
+            spatiallyVerifiedPairCount: 2,
+            durationSeconds: 0.01
+        ))
+        measurement.scheduledPairCount = 2
+        measurement.attemptedPairCount = 2
+        measurement.rawMatchedPairCount = 2
+        measurement.spatiallyVerifiedPairCount = 2
+        measurement.localPairCount = 2
+        measurement.articulationViewCount = 1
+        measurement.biconnectedBlockCount = 2
+        measurement.largestBiconnectedBlockViewCount = 2
+        measurement.secondLargestBiconnectedBlockViewCount = 2
+        measurement.degreeP10 = 1
+        measurement.degreeMedian = 1
+        measurement.degreeP90 = 2
+        measurement.matchingDurationSeconds = 0.03
+        artifact.pairGraph = .measured(measurement)
+
+        XCTAssertThrowsError(
+            try GeometryArtifactStore.validate(artifact, projectPaths: paths)
+        ) { error in
+            XCTAssertEqual(error as? GeometryArtifactStore.Error, .invalidPairGraph)
+        }
     }
 
     func testAllowsCompletedExactSwitchAtMaximumRecoveryLevel() throws {

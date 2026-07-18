@@ -418,17 +418,30 @@ final class ProjectDiagnosticBundleTests: XCTestCase {
         let paths = ProjectPaths(root: root)
         try paths.ensureDirectories()
         let privateFrameName = "client-address-frame.jpg"
+        let imageNames = [
+            privateFrameName,
+            "client-address-frame-2.jpg",
+            "client-address-frame-3.jpg",
+        ]
+        for (index, imageName) in imageNames.enumerated() {
+            try Data("frame-\(index)".utf8).write(
+                to: paths.framesSelectedURL.appendingPathComponent(imageName)
+            )
+        }
+        let selectedFramesDigest = try GeometryArtifactStore.selectedFramesDigest(
+            orderedImageNames: imageNames,
+            projectPaths: paths
+        )
         let recovery = GeometryRecoveryState(
-            selectedFramesDigest: String(repeating: "a", count: 64),
-            orderedImageNames: [
-                privateFrameName,
-                "client-address-frame-2.jpg",
-                "client-address-frame-3.jpg",
-            ],
+            selectedFramesDigest: selectedFramesDigest,
+            orderedImageNames: imageNames,
             activeBackend: .colmap,
             mappingAttemptCount: 2,
-            mappingFallbackReasons: ["interrupted mapping resumed"],
-            pendingPairRecoveryLevel: .expanded,
+            mappingFallbackReasons: [
+                "interrupted mapping resumed",
+                "exact descriptor matching",
+            ],
+            pendingPairRecoveryLevel: .normal,
             colmapComputeMode: .cpu,
             plannedIncrementalCadence: .orderedFast,
             activeIncrementalCadence: .conservative
@@ -442,16 +455,69 @@ final class ProjectDiagnosticBundleTests: XCTestCase {
             ),
             to: paths.metadataURL
         )
+        let plan = try ColmapPairPlan.exhaustive(imageNames: imageNames)
+        let attempts = [
+            PairGraphAttemptEvidence(
+                artifact: PairMatchingAttemptArtifact(
+                    attemptNumber: 1,
+                    matcher: .faiss,
+                    recoveryLevel: .normal,
+                    outcome: .rejected,
+                    scheduledPairCount: 3,
+                    attemptedPairCount: 3,
+                    rawMatchedPairCount: 2,
+                    spatiallyVerifiedPairCount: 1,
+                    durationSeconds: 1
+                ),
+                scheduledPairs: plan.pairs
+            ),
+            PairGraphAttemptEvidence(
+                artifact: PairMatchingAttemptArtifact(
+                    attemptNumber: 2,
+                    matcher: .exact,
+                    recoveryLevel: .normal,
+                    outcome: .rejected,
+                    scheduledPairCount: 3,
+                    attemptedPairCount: 3,
+                    rawMatchedPairCount: 2,
+                    spatiallyVerifiedPairCount: 1,
+                    durationSeconds: 2
+                ),
+                scheduledPairs: plan.pairs
+            ),
+        ]
+        try PairGraphRecoveryStore.save(
+            PairGraphRecoveryState(
+                selectedFramesDigest: selectedFramesDigest,
+                imageNames: imageNames,
+                pairingPolicy: .unorderedRetrieval,
+                mode: .sameScheduleExact,
+                computeMode: .cpu,
+                activeRecoveryLevel: .normal,
+                activePlan: plan,
+                attempts: attempts,
+                matchingDurationSeconds: 3,
+                fallbackReasons: [
+                    "interrupted mapping resumed",
+                    "exact descriptor matching",
+                ]
+            ),
+            to: paths.pairGraphRecoveryURL,
+            projectPaths: paths
+        )
 
         let bundle = try XCTUnwrap(ProjectDiagnosticBundle.build(projectURL: root))
 
         XCTAssertTrue(bundle.contains("Recovery backend: colmap"))
         XCTAssertTrue(bundle.contains("Recovery mapping attempts: 2"))
         XCTAssertTrue(bundle.contains("Recovery compute: cpu"))
-        XCTAssertTrue(bundle.contains("Pending pair recovery: expanded"))
+        XCTAssertTrue(bundle.contains("Pending pair recovery: normal"))
         XCTAssertTrue(bundle.contains("Recovery reason: interrupted mapping resumed"))
+        XCTAssertTrue(bundle.contains("Matching attempts: 2"))
+        XCTAssertTrue(bundle.contains("Matching time: 3.00s"))
+        XCTAssertTrue(bundle.contains("Matching attempt 2: exact, rejected"))
         XCTAssertFalse(bundle.contains(privateFrameName))
-        XCTAssertFalse(bundle.contains(String(repeating: "a", count: 64)))
+        XCTAssertFalse(bundle.contains(selectedFramesDigest))
         let payload = try machineReadablePayload(from: bundle)
         let machineRecovery = try XCTUnwrap(
             payload["geometryRecovery"] as? [String: Any]
@@ -459,7 +525,7 @@ final class ProjectDiagnosticBundleTests: XCTestCase {
         XCTAssertEqual(machineRecovery["activeBackend"] as? String, "colmap")
         XCTAssertEqual(machineRecovery["mappingAttemptCount"] as? Int, 2)
         XCTAssertEqual(machineRecovery["colmapComputeMode"] as? String, "cpu")
-        XCTAssertEqual(machineRecovery["pendingPairRecoveryLevel"] as? String, "expanded")
+        XCTAssertEqual(machineRecovery["pendingPairRecoveryLevel"] as? String, "normal")
         let plannedCadence = try XCTUnwrap(
             machineRecovery["plannedIncrementalCadence"] as? [String: Any]
         )
@@ -476,6 +542,18 @@ final class ProjectDiagnosticBundleTests: XCTestCase {
         XCTAssertEqual(activeCadence["globalMaxRefinements"] as? Int, 5)
         XCTAssertNil(machineRecovery["orderedImageNames"])
         XCTAssertNil(machineRecovery["selectedFramesDigest"])
+        let pairRecovery = try XCTUnwrap(
+            payload["pairMatchingRecovery"] as? [String: Any]
+        )
+        XCTAssertEqual(pairRecovery["matchingDurationSeconds"] as? Double, 3)
+        let matcherAttempts = try XCTUnwrap(
+            pairRecovery["attempts"] as? [[String: Any]]
+        )
+        XCTAssertEqual(matcherAttempts.count, 2)
+        XCTAssertEqual(matcherAttempts[0]["matcher"] as? String, "faiss")
+        XCTAssertEqual(matcherAttempts[0]["outcome"] as? String, "rejected")
+        XCTAssertEqual(matcherAttempts[1]["matcher"] as? String, "exact")
+        XCTAssertEqual(matcherAttempts[1]["outcome"] as? String, "rejected")
     }
 
     func testIncludesSanitizedMappingEvidenceInReconstructionAndMachineReadableMetrics() throws {

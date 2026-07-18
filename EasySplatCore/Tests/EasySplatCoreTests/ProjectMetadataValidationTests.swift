@@ -3,7 +3,7 @@ import XCTest
 
 final class ProjectMetadataValidationTests: XCTestCase {
     func testLoadRejectsPreviousFormatBeforeDecodingCanonicalGeometryState() throws {
-        XCTAssertEqual(ProjectMetadataStore.supportedFormatVersion, 13)
+        XCTAssertEqual(ProjectMetadataStore.supportedFormatVersion, 14)
         let retiredFormatVersion = ProjectMetadataStore.supportedFormatVersion - 1
 
         let metadata = makeMetadata()

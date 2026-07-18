@@ -1611,14 +1611,12 @@ public final class PipelineRunner: @unchecked Sendable {
             func persistedRecoveryMode(
                 for mode: PairAttemptMode
             ) -> PairGraphRecoveryMode {
-                switch mode {
-                case .policy:
+                if mode.isPolicyRecovery {
                     return colmapMatchOptions.descriptorMatcher == .faiss
                         ? .policy
                         : .sameScheduleExact
-                case .sameScheduleExact:
-                    return .sameScheduleExact
                 }
+                return .sameScheduleExact
             }
 
             func persistPairRecoveryIntent(
@@ -1669,7 +1667,7 @@ public final class PipelineRunner: @unchecked Sendable {
                 mode: PairAttemptMode,
                 activePlan: ColmapPairPlan
             ) throws {
-                if case .policy = mode, pairGraphAttempts.isEmpty {
+                if mode.isPolicyRecovery, pairGraphAttempts.isEmpty {
                     return
                 }
                 let recoveryMode = persistedRecoveryMode(for: mode)
@@ -1713,8 +1711,8 @@ public final class PipelineRunner: @unchecked Sendable {
                     colmapMatchOptions.descriptorMatcher = resolvedRunPlan
                         .normalDescriptorMatcher
                     didRetryWithExactMatcher = false
-                    pairAttemptMode = .policy
-                    latestPreparedPairPlan = nil
+                    pairAttemptMode = .restoredPolicy(recovered.activePlan)
+                    latestPreparedPairPlan = recovered.activePlan
                     latestCompletedPairPlan = nil
                     resumingPersistedPolicyRecovery = true
                     recoveredPolicyRecoverySidecar = true
@@ -2173,7 +2171,7 @@ public final class PipelineRunner: @unchecked Sendable {
                     attemptNumber: attemptNumber,
                     paths: paths
                 )
-                if case .policy = attemptMode,
+                if attemptMode.isPolicyRecovery,
                    colmapMatchOptions.descriptorMatcher == .faiss,
                    !pairGraphAttempts.isEmpty {
                     try persistPairRecoveryIntent(
@@ -2259,7 +2257,7 @@ public final class PipelineRunner: @unchecked Sendable {
                         scheduledPairs: pairPlan.pairs
                     ))
                     matchingDurationSeconds += duration
-                    if case .policy = attemptMode,
+                    if attemptMode.isPolicyRecovery,
                        colmapMatchOptions.descriptorMatcher == .faiss {
                         try persistPairRecoveryIntent(
                             mode: .policy,
@@ -2274,13 +2272,20 @@ public final class PipelineRunner: @unchecked Sendable {
                     throw matcherError
                 }
 
+                let allowsMinorVerifiedComponents = Self.allowsMinorVerifiedComponents(
+                    pairingPolicy: resolvedRunPlan.pairingPolicy,
+                    recoveryLevel: pairRecoveryLevel
+                )
+                let graphWasAccepted = inspection.hasAcceptableDominantVerifiedComponent(
+                    allowMinorVerifiedComponents: allowsMinorVerifiedComponents
+                )
                 let duration = Self.durationInSeconds(attemptClock.now - attemptStart)
                 pairGraphAttempts.append(PairGraphAttemptEvidence(
                     artifact: PairMatchingAttemptArtifact(
                         attemptNumber: attemptNumber,
                         matcher: colmapMatchOptions.descriptorMatcher,
                         recoveryLevel: pairRecoveryLevel.artifactValue,
-                        outcome: .completed,
+                        outcome: graphWasAccepted ? .completed : .rejected,
                         scheduledPairCount: inspection.scheduledPairCount,
                         attemptedPairCount: inspection.attemptedPairCount,
                         rawMatchedPairCount: inspection.rawMatchedPairCount,
@@ -2291,13 +2296,19 @@ public final class PipelineRunner: @unchecked Sendable {
                 ))
                 matchingDurationSeconds += duration
                 latestCompletedPairPlan = pairPlan
-                let allowsMinorVerifiedComponents = Self.allowsMinorVerifiedComponents(
-                    pairingPolicy: resolvedRunPlan.pairingPolicy,
-                    recoveryLevel: pairRecoveryLevel
-                )
-                guard inspection.hasAcceptableDominantVerifiedComponent(
-                    allowMinorVerifiedComponents: allowsMinorVerifiedComponents
-                ) else {
+                guard graphWasAccepted else {
+                    if attemptMode.isPolicyRecovery,
+                       colmapMatchOptions.descriptorMatcher == .faiss {
+                        try persistPairRecoveryIntent(
+                            mode: .policy,
+                            activePlan: pairPlan
+                        )
+                    } else {
+                        try persistAttemptRecoveryIntent(
+                            mode: attemptMode,
+                            activePlan: pairPlan
+                        )
+                    }
                     emit(.stageLog(
                         stage: .sfmMatching,
                         line: "Pair graph remained disconnected (\(inspection.connectedComponentCount) components, \(inspection.isolatedViewCount) isolated views).",

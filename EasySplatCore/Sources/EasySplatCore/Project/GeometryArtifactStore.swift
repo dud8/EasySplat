@@ -435,6 +435,8 @@ enum GeometryArtifactStore {
                           && attempt.spatiallyVerifiedPairCount <= attempt.rawMatchedPairCount
                           && attempt.durationSeconds.isFinite
                           && attempt.durationSeconds >= 0
+                          && (attempt.outcome == .failed
+                              || attempt.attemptedPairCount == attempt.scheduledPairCount)
                   }),
                   measuredDuration.isFinite,
                   approximatelyEqual(
@@ -481,7 +483,9 @@ enum GeometryArtifactStore {
             }
             if level == previousLevel {
                 if attempt.matcher == previous.matcher {
-                    guard previous.outcome == .failed else {
+                    guard previous.outcome != .completed,
+                          attempt.scheduledPairCount
+                            == previous.scheduledPairCount else {
                         throw Error.invalidPairGraph
                     }
                 } else {

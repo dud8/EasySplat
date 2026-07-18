@@ -15,7 +15,7 @@ public enum ProjectDiagnosticBundle {
     /// Schema version embedded in the machine-readable JSON block. Bump
     /// when adding/removing/renaming top-level keys so downstream tools can
     /// detect a format change.
-    public static let machineReadableSchemaVersion = 8
+    public static let machineReadableSchemaVersion = 9
 
     /// Scrub a user-visible technical payload before it reaches a clipboard,
     /// save panel, or share surface. Project identity is included when the
@@ -62,6 +62,10 @@ public enum ProjectDiagnosticBundle {
         let pathSanitizer = HomePathSanitizer(
             sensitiveValues: [metadata.title, metadata.id.uuidString, projectURL.lastPathComponent]
         )
+        let pairMatchingRecovery = validatedPairMatchingRecovery(
+            metadata: metadata,
+            paths: paths
+        )
 
         var sections: [String] = []
         sections.append(buildHeader(metadata: metadata, now: now, hardwareLine: hardwareLine, includeNotes: includeNotes))
@@ -86,10 +90,18 @@ public enum ProjectDiagnosticBundle {
         if let timingSection = stageTimingSection(metadata: metadata) {
             sections.append(timingSection)
         }
-        if let stateSection = stateSection(metadata: metadata, sanitizer: pathSanitizer) {
+        if let stateSection = stateSection(
+            metadata: metadata,
+            pairMatchingRecovery: pairMatchingRecovery,
+            sanitizer: pathSanitizer
+        ) {
             sections.append(stateSection)
         }
-        if let machineSection = machineReadableSection(metadata: metadata, sanitizer: pathSanitizer) {
+        if let machineSection = machineReadableSection(
+            metadata: metadata,
+            pairMatchingRecovery: pairMatchingRecovery,
+            sanitizer: pathSanitizer
+        ) {
             sections.append(machineSection)
         }
 
@@ -207,7 +219,11 @@ public enum ProjectDiagnosticBundle {
         return lines.joined(separator: "\n")
     }
 
-    private static func stateSection(metadata: ProjectMetadata, sanitizer: HomePathSanitizer) -> String? {
+    private static func stateSection(
+        metadata: ProjectMetadata,
+        pairMatchingRecovery: PairGraphRecoveryState?,
+        sanitizer: HomePathSanitizer
+    ) -> String? {
         var lines: [String] = ["## Pipeline State"]
         lines.append("Current stage: \(metadata.state.stage.rawValue)")
         if let lastFailureAt = metadata.lastFailureAt {
@@ -241,6 +257,24 @@ public enum ProjectDiagnosticBundle {
                 lines.append("Recovery reason: \(sanitizer.sanitize(reason))")
             }
         }
+        if let pairMatchingRecovery {
+            lines.append("Matching attempts: \(pairMatchingRecovery.attempts.count)")
+            lines.append(String(
+                format: "Matching time: %.2fs",
+                pairMatchingRecovery.matchingDurationSeconds
+            ))
+            for attempt in pairMatchingRecovery.attempts.map(\.artifact) {
+                lines.append(
+                    "Matching attempt \(attempt.attemptNumber): "
+                        + "\(attempt.matcher.rawValue), \(attempt.outcome.rawValue) · "
+                        + "\(attempt.scheduledPairCount) scheduled · "
+                        + "\(attempt.attemptedPairCount) attempted · "
+                        + "\(attempt.rawMatchedPairCount) raw · "
+                        + "\(attempt.spatiallyVerifiedPairCount) verified · "
+                        + String(format: "%.2fs", attempt.durationSeconds)
+                )
+            }
+        }
         if lines.count == 1 { return nil }
         return lines.joined(separator: "\n")
     }
@@ -251,6 +285,7 @@ public enum ProjectDiagnosticBundle {
     /// identifiers regardless of `includeNotes`.
     private static func machineReadableSection(
         metadata: ProjectMetadata,
+        pairMatchingRecovery: PairGraphRecoveryState?,
         sanitizer: HomePathSanitizer
     ) -> String? {
         guard metadata.reconstruction != nil
@@ -304,12 +339,22 @@ public enum ProjectDiagnosticBundle {
                 activeIncrementalCadence = recovery.activeIncrementalCadence
             }
         }
+        struct DiagnosticPairMatchingRecovery: Encodable {
+            var attempts: [PairMatchingAttemptArtifact]
+            var matchingDurationSeconds: Double
+
+            init(_ recovery: PairGraphRecoveryState) {
+                attempts = recovery.attempts.map(\.artifact)
+                matchingDurationSeconds = recovery.matchingDurationSeconds
+            }
+        }
         struct Payload: Encodable {
             var schemaVersion: Int
             var requestedRunOptions: RequestedRunOptions
             var reconstruction: ReconstructionSummary?
             var mapping: DiagnosticMapping?
             var geometryRecovery: DiagnosticGeometryRecovery?
+            var pairMatchingRecovery: DiagnosticPairMatchingRecovery?
             var stageTimings: [StageTimingRecord]?
             var lastFailureAt: Date?
         }
@@ -319,6 +364,9 @@ public enum ProjectDiagnosticBundle {
             reconstruction: metadata.reconstruction,
             mapping: metadata.geometryArtifact.map { DiagnosticMapping($0.mapping) },
             geometryRecovery: metadata.geometryRecovery.map(DiagnosticGeometryRecovery.init),
+            pairMatchingRecovery: pairMatchingRecovery.map(
+                DiagnosticPairMatchingRecovery.init
+            ),
             stageTimings: metadata.stageTimings,
             lastFailureAt: metadata.lastFailureAt
         )
@@ -330,6 +378,26 @@ public enum ProjectDiagnosticBundle {
             return nil
         }
         return "## Metrics (machine readable)\n```json\n\(sanitizer.sanitize(json))\n```"
+    }
+
+    private static func validatedPairMatchingRecovery(
+        metadata: ProjectMetadata,
+        paths: ProjectPaths
+    ) -> PairGraphRecoveryState? {
+        guard let geometryRecovery = metadata.geometryRecovery,
+              geometryRecovery.activeBackend == .colmap,
+              let pendingLevel = geometryRecovery.pendingPairRecoveryLevel,
+              let state = try? PairGraphRecoveryStore.loadBound(
+                  from: paths.pairGraphRecoveryURL,
+                  expectedImageNames: geometryRecovery.orderedImageNames,
+                  projectPaths: paths
+              ),
+              state.activeRecoveryLevel == pendingLevel,
+              state.computeMode == geometryRecovery.colmapComputeMode,
+              state.fallbackReasons == geometryRecovery.mappingFallbackReasons else {
+            return nil
+        }
+        return state
     }
 
     private static func logTailSection(
