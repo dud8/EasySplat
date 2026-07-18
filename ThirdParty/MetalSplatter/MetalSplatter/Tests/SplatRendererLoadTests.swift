@@ -106,6 +106,48 @@ final class SplatRendererLoadTests: XCTestCase {
         XCTAssertEqual(bufferIdentity(renderer.orderBuffer.buffer), originalOrder)
     }
 
+    func testAddRejectsUnencodableGeometryWithoutPublishing() throws {
+        let renderer = try makeRenderer()
+        try renderer.add(makePoint())
+        let originalSplats = bufferIdentity(renderer.splatBuffer.buffer)
+        let originalOrder = bufferIdentity(renderer.orderBuffer.buffer)
+
+        var overflowingScale = makePoint()
+        overflowingScale.scale.x = 100
+        XCTAssertThrowsError(try renderer.add(overflowingScale))
+
+        var unrepresentableCovariance = makePoint()
+        unrepresentableCovariance.scale.x = log(sqrt(66_000))
+        XCTAssertThrowsError(try renderer.add(unrepresentableCovariance))
+
+        for magnitude: Float in [0, 1e-10] {
+            var degenerateRotation = makePoint()
+            degenerateRotation.rotation = simd_quatf(real: magnitude, imag: .zero)
+            XCTAssertThrowsError(try renderer.add(degenerateRotation))
+        }
+
+        XCTAssertEqual(renderer.splatCount, 1)
+        XCTAssertEqual(bufferIdentity(renderer.splatBuffer.buffer), originalSplats)
+        XCTAssertEqual(bufferIdentity(renderer.orderBuffer.buffer), originalOrder)
+    }
+
+    func testAddAcceptsLargestRepresentableCovarianceBoundary() throws {
+        let renderer = try makeRenderer()
+        var point = makePoint()
+        point.scale = SIMD3<Float>(repeating: log(sqrt(65_000)))
+
+        try renderer.add(point)
+
+        XCTAssertEqual(renderer.splatCount, 1)
+        let encoded = renderer.splatBuffer.values[0]
+        XCTAssertTrue(encoded.covA.x.isFinite)
+        XCTAssertTrue(encoded.covA.y.isFinite)
+        XCTAssertTrue(encoded.covA.z.isFinite)
+        XCTAssertTrue(encoded.covB.x.isFinite)
+        XCTAssertTrue(encoded.covB.y.isFinite)
+        XCTAssertTrue(encoded.covB.z.isFinite)
+    }
+
     private func makeRenderer(maximumSplatCount: Int? = nil) throws -> SplatRenderer {
         guard let device = MTLCreateSystemDefaultDevice() else {
             throw XCTSkip("Metal is unavailable")

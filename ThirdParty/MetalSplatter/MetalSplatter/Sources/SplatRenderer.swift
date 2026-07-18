@@ -23,24 +23,18 @@ public class SplatRenderer {
     }
 
     private enum SplatEncodingError: LocalizedError {
-        case invalidSphericalHarmonicCount(Int)
         case invalidAdditionalCapacity(Int)
         case mixedColorEncodings
         case sphericalHarmonicCapacityOverflow
-        case unrepresentableSphericalHarmonic
 
         var errorDescription: String? {
             switch self {
-            case .invalidSphericalHarmonicCount(let count):
-                "Expected 45 higher-order spherical-harmonic values, found \(count)."
             case .invalidAdditionalCapacity(let count):
                 "Additional splat capacity cannot be negative (\(count))."
             case .mixedColorEncodings:
                 "A splat scene cannot mix full spherical-harmonic and fixed-color points."
             case .sphericalHarmonicCapacityOverflow:
                 "The spherical-harmonic coefficient buffer is too large."
-            case .unrepresentableSphericalHarmonic:
-                "A spherical-harmonic value cannot be represented by the renderer."
             }
         }
     }
@@ -116,7 +110,6 @@ public class SplatRenderer {
 
         // Full-SH payload: one raw DC RGB triplet followed by 15 higher-order triplets.
         static let payloadCount = 16
-        static let higherOrderCoefficientCount = 15
     }
 
     // Keep in sync with Shaders.metal : Uniforms
@@ -331,7 +324,10 @@ public class SplatRenderer {
         shouldCancel: @escaping @Sendable () -> Bool
     ) throws {
         try readScene(shouldCancel: shouldCancel) { delegate in
-            SplatPLYSceneReader(url).read(to: delegate, shouldCancel: shouldCancel)
+            SplatPLYSceneReader(
+                url,
+                validatesRenderEncoding: false
+            ).read(to: delegate, shouldCancel: shouldCancel)
         }
     }
 
@@ -456,10 +452,11 @@ public class SplatRenderer {
     }
 
     public func add(_ point: SplatScenePoint) throws {
-        let encoded = try Splat(point)
+        let validated = try SplatRenderEncodingValidator.encode(point)
+        let encoded = Splat(validated)
         try withSortStateLock {
             try Self.validateColorEncoding(
-                for: point,
+                usesFullSphericalHarmonics: validated.sphericalHarmonics != nil,
                 existingPointCount: splatBuffer.count,
                 degree: sphericalHarmonicDegree
             )
@@ -474,7 +471,7 @@ public class SplatRenderer {
             var coefficients = sphericalHarmonicCoefficientBuffer
             var degree = sphericalHarmonicDegree
             try Self.appendSphericalHarmonics(
-                for: point,
+                payload: validated.sphericalHarmonics,
                 existingPointCount: splatBuffer.count,
                 targetPointCapacity: splatBuffer.capacity,
                 device: splatBuffer.device,
@@ -844,7 +841,7 @@ public class SplatRenderer {
     }
 
     private static func appendSphericalHarmonics(
-        for point: SplatScenePoint,
+        payload: SplatRenderSphericalHarmonics?,
         existingPointCount: Int,
         targetPointCapacity: Int,
         device: MTLDevice,
@@ -852,14 +849,7 @@ public class SplatRenderer {
         buffer: inout MetalBuffer<PackedHalf3>?,
         degree: inout SHDegree
     ) throws {
-        let fullSH: (rawDC: SIMD3<Float>, rest: [Float])?
-        if case .sphericalHarmonic(let r, let g, let b, let values) = point.color {
-            fullSH = (SIMD3<Float>(r, g, b), values)
-        } else {
-            fullSH = nil
-        }
-
-        if fullSH != nil, buffer == nil {
+        if payload != nil, buffer == nil {
             guard existingPointCount == 0 else {
                 throw SplatEncodingError.mixedColorEncodings
             }
@@ -876,17 +866,13 @@ public class SplatRenderer {
         guard let buffer else { return }
         let requiredCount = try sphericalHarmonicCoefficientCount(for: existingPointCount + 1)
         try buffer.ensureCapacity(requiredCount)
-        if let fullSH {
-            buffer.append(PackedHalf3(
-                x: Float16(fullSH.rawDC.x),
-                y: Float16(fullSH.rawDC.y),
-                z: Float16(fullSH.rawDC.z)
-            ))
-            for basis in 0..<SHDegree.higherOrderCoefficientCount {
+        if let payload {
+            for index in 0..<SplatRenderSphericalHarmonics.coefficientCount {
+                let coefficient = payload[index]
                 buffer.append(PackedHalf3(
-                    x: Float16(fullSH.rest[basis]),
-                    y: Float16(fullSH.rest[SHDegree.higherOrderCoefficientCount + basis]),
-                    z: Float16(fullSH.rest[2 * SHDegree.higherOrderCoefficientCount + basis])
+                    x: Float16(coefficient.x),
+                    y: Float16(coefficient.y),
+                    z: Float16(coefficient.z)
                 ))
             }
         } else {
@@ -895,18 +881,12 @@ public class SplatRenderer {
     }
 
     private static func validateColorEncoding(
-        for point: SplatScenePoint,
+        usesFullSphericalHarmonics: Bool,
         existingPointCount: Int,
         degree: SHDegree
     ) throws {
         guard existingPointCount > 0 else { return }
-        let pointUsesFullSH: Bool
-        if case .sphericalHarmonic = point.color {
-            pointUsesFullSH = true
-        } else {
-            pointUsesFullSH = false
-        }
-        guard pointUsesFullSH == (degree == .sh3) else {
+        guard usesFullSphericalHarmonics == (degree == .sh3) else {
             throw SplatEncodingError.mixedColorEncodings
         }
     }
@@ -948,16 +928,17 @@ extension SplatRenderer: SplatSceneReaderDelegate {
         do {
             try pendingSplatBuffer.ensureCapacity(pendingSplatBuffer.count + points.count)
             for point in points {
-                let encoded = try Splat(point)
+                let validated = try SplatRenderEncodingValidator.encode(point)
+                let encoded = Splat(validated)
                 try Self.validateColorEncoding(
-                    for: point,
+                    usesFullSphericalHarmonics: validated.sphericalHarmonics != nil,
                     existingPointCount: pendingSplatBuffer.count,
                     degree: pendingSphericalHarmonicDegree
                 )
                 var coefficients = pendingSphericalHarmonicCoefficientBuffer
                 var degree = pendingSphericalHarmonicDegree
                 try Self.appendSphericalHarmonics(
-                    for: point,
+                    payload: validated.sphericalHarmonics,
                     existingPointCount: pendingSplatBuffer.count,
                     targetPointCapacity: pendingSplatBuffer.capacity,
                     device: pendingSplatBuffer.device,
@@ -991,77 +972,33 @@ extension SplatRenderer: SplatSceneReaderDelegate {
 }
 
 extension SplatRenderer.Splat {
-    init(_ splat: SplatScenePoint) throws {
-        let scale = SIMD3<Float>(exp(splat.scale.x),
-                                 exp(splat.scale.y),
-                                 exp(splat.scale.z))
-        let rotation = splat.rotation.normalized
-
-        let color: SIMD3<Float>
-        switch splat.color {
-        case let .sphericalHarmonic(r, g, b, rest):
-            guard rest.count == 45 else {
-                throw SplatRenderer.SplatEncodingError.invalidSphericalHarmonicCount(rest.count)
-            }
-            try Self.validateSphericalHarmonics(r: r, g: g, b: b, rest: rest)
-            let shC0: Float = 0.28209479177387814
-            color = SIMD3(
-                max(0, min(1, 0.5 + shC0 * r)),
-                max(0, min(1, 0.5 + shC0 * g)),
-                max(0, min(1, 0.5 + shC0 * b))
+    init(_ encoding: SplatRenderEncoding) {
+        let color = encoding.linearColorOpacity
+        let covA = encoding.covarianceA
+        let covB = encoding.covarianceB
+        self.init(
+            position: MTLPackedFloat3Make(
+                encoding.position.x,
+                encoding.position.y,
+                encoding.position.z
+            ),
+            color: SplatRenderer.PackedRGBHalf4(
+                r: Float16(color.x),
+                g: Float16(color.y),
+                b: Float16(color.z),
+                a: Float16(color.w)
+            ),
+            covA: SplatRenderer.PackedHalf3(
+                x: Float16(covA.x),
+                y: Float16(covA.y),
+                z: Float16(covA.z)
+            ),
+            covB: SplatRenderer.PackedHalf3(
+                x: Float16(covB.x),
+                y: Float16(covB.y),
+                z: Float16(covB.z)
             )
-        case let .firstOrderSphericalHarmonic(r, g, b):
-            try Self.validateSphericalHarmonics(r: r, g: g, b: b)
-            let shC0: Float = 0.28209479177387814
-            color = SIMD3(
-                max(0, min(1, 0.5 + shC0 * r)),
-                max(0, min(1, 0.5 + shC0 * g)),
-                max(0, min(1, 0.5 + shC0 * b))
-            )
-        case .linearFloat(let r, let g, let b):
-            color = SIMD3(r, g, b) / 255
-        case .linearUInt8(let r, let g, let b):
-            color = SIMD3(Float(r), Float(g), Float(b)) / 255
-        case .none:
-            color = .zero
-        }
-
-        let opacity = 1 / (1 + exp(-splat.opacity))
-
-        self.init(position: splat.position,
-                  color: .init(color.sRGBToLinear, opacity),
-                  scale: scale,
-                  rotation: rotation)
-    }
-
-    private static func validateSphericalHarmonics(
-        r: Float,
-        g: Float,
-        b: Float,
-        rest: [Float] = []
-    ) throws {
-        guard isRepresentableSphericalHarmonic(r),
-              isRepresentableSphericalHarmonic(g),
-              isRepresentableSphericalHarmonic(b),
-              rest.allSatisfy(isRepresentableSphericalHarmonic) else {
-            throw SplatRenderer.SplatEncodingError.unrepresentableSphericalHarmonic
-        }
-    }
-
-    private static func isRepresentableSphericalHarmonic(_ value: Float) -> Bool {
-        value.isFinite && Float16(value).isFinite
-    }
-
-    init(position: SIMD3<Float>,
-         color: SIMD4<Float>,
-         scale: SIMD3<Float>,
-         rotation: simd_quatf) {
-        let transform = simd_float3x3(rotation) * simd_float3x3(diagonal: scale)
-        let cov3D = transform * transform.transpose
-        self.init(position: MTLPackedFloat3Make(position.x, position.y, position.z),
-                  color: SplatRenderer.PackedRGBHalf4(r: Float16(color.x), g: Float16(color.y), b: Float16(color.z), a: Float16(color.w)),
-                  covA: SplatRenderer.PackedHalf3(x: Float16(cov3D[0, 0]), y: Float16(cov3D[0, 1]), z: Float16(cov3D[0, 2])),
-                  covB: SplatRenderer.PackedHalf3(x: Float16(cov3D[1, 1]), y: Float16(cov3D[1, 2]), z: Float16(cov3D[2, 2])))
+        )
     }
 }
 
@@ -1098,12 +1035,6 @@ private extension SIMD3 where Scalar: BinaryFloatingPoint, Scalar.RawSignificand
 
     static func random(in range: Range<Scalar>) -> SIMD3<Scalar> {
         Self(x: Scalar.random(in: range), y: .random(in: range), z: .random(in: range))
-    }
-}
-
-private extension SIMD3<Float> {
-    var sRGBToLinear: SIMD3<Float> {
-        SIMD3(x: pow(x, 2.2), y: pow(y, 2.2), z: pow(z, 2.2))
     }
 }
 
