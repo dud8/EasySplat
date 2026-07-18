@@ -1,0 +1,61 @@
+diff --git a/src/colmap/exe/CMakeLists.txt b/src/colmap/exe/CMakeLists.txt
+index d3cc87a..5eb1ef6 100644
+--- a/src/colmap/exe/CMakeLists.txt
++++ b/src/colmap/exe/CMakeLists.txt
+@@ -80,6 +80,7 @@ set(COLMAP_MAIN_SRCS
+     colmap.cc
+     database.cc
+     feature.cc
++    local_vocab_retriever.cc
+     gui.cc
+     image.cc
+     model.cc
+diff --git a/src/colmap/exe/colmap.cc b/src/colmap/exe/colmap.cc
+index a12f899..cedc985 100644
+--- a/src/colmap/exe/colmap.cc
++++ b/src/colmap/exe/colmap.cc
+@@ -31,6 +31,7 @@
+ #include "colmap/exe/database.h"
+ #include "colmap/exe/feature.h"
+ #include "colmap/exe/gui.h"
++#include "colmap/exe/local_vocab_retriever.h"
+ #include "colmap/exe/image.h"
+ #include "colmap/exe/model.h"
+ #if defined(COLMAP_MVS_ENABLED)
+@@ -155,6 +156,8 @@ int main(int argc, char** argv) {
+                         &colmap::RunViewGraphCalibrator);
+   commands.emplace_back("vocab_tree_builder", &colmap::RunVocabTreeBuilder);
+   commands.emplace_back("vocab_tree_matcher", &colmap::RunVocabTreeMatcher);
++  commands.emplace_back("local_vocab_retriever",
++                        &colmap::RunLocalVocabularyRetriever);
+   commands.emplace_back("vocab_tree_retriever", &colmap::RunVocabTreeRetriever);
+ 
+   if (argc == 1) {
+diff --git a/src/thirdparty/CMakeLists.txt b/src/thirdparty/CMakeLists.txt
+index 5968943..10887ac 100644
+--- a/src/thirdparty/CMakeLists.txt
++++ b/src/thirdparty/CMakeLists.txt
+@@ -54,8 +54,8 @@ endif()
+ if(FETCH_FAISS)
+     include(FetchContent)
+     FetchContent_Declare(faiss
+-        URL https://github.com/facebookresearch/faiss/archive/refs/tags/v1.14.1.zip
+-        URL_HASH SHA256=4b1ae7e7a0a46385b4084f0e3945623a15fcf99d793bf44d82aae8e24f11e5f5
++        URL https://github.com/facebookresearch/faiss/archive/refs/tags/v1.14.3.zip
++        URL_HASH SHA256=fdb01044e707caa7e16d009a8ed11816aebe17fefbccb428c495486e28e6046d
+         ${_fetch_content_declare_args}
+     )
+     message(STATUS "Configuring faiss...")
+@@ -63,10 +63,11 @@ if(FETCH_FAISS)
+     # Use dynamic dispatch (dd) to automatically select the highest SIMD
+     # instruction set supported by the target machine (e.g., AVX2, AVX512).
+     # Dynamic dispatch is not supported on MSVC (faiss v1.14.1).
+-    if(NOT IS_MSVC)
++    if(NOT IS_MSVC AND NOT DEFINED FAISS_OPT_LEVEL)
+         set(FAISS_OPT_LEVEL dd)
+     endif()
+     set(FAISS_ENABLE_GPU OFF)
++    set(FAISS_ENABLE_METAL OFF)
+     set(FAISS_ENABLE_PYTHON OFF)
+     set(FAISS_ENABLE_MKL OFF)
+     set(BUILD_TESTING OFF)

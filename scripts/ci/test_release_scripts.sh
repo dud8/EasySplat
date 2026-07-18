@@ -61,6 +61,7 @@ cleanup() {
 trap cleanup EXIT
 
 python3 "$ROOT/scripts/toolchain/tests/test_generate_supply_chain_manifest.py"
+python3 "$ROOT/scripts/toolchain/tests/test_native_colmap_retriever.py" SourceContractTests
 python3 "$ROOT/scripts/release/tests/test_verify_publication_bundle.py"
 
 unsafe_toolchain_root="$TMP_DIR/unsafe-toolchain-root"
