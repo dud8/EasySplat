@@ -206,9 +206,9 @@ struct ManifestTool {
                 name: "geometry-da3-base",
                 artifactURL: baseURL,
                 zipURL: URL(fileURLWithPath: baseZipPath),
-                capabilities: ["geometry.da3.base"],
+                capabilities: ["geometry.da3.runtime", "geometry.da3.base"],
                 dependencies: ["macos-arm64-core"],
-                requirement: .required,
+                requirement: .optional,
                 criticalFilePaths: ManifestToolDefaults.da3BaseContents
             ),
             ManifestArtifactInput(
@@ -216,7 +216,7 @@ struct ManifestTool {
                 artifactURL: smallURL,
                 zipURL: URL(fileURLWithPath: smallZipPath),
                 capabilities: ["geometry.da3.small"],
-                dependencies: ["macos-arm64-core"],
+                dependencies: ["geometry-da3-base"],
                 requirement: .optional,
                 criticalFilePaths: ManifestToolDefaults.da3SmallContents
             ),

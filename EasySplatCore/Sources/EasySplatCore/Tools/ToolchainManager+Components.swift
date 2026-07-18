@@ -3,6 +3,7 @@ import Foundation
 extension ToolchainManager {
     static let maximumReleaseComponentDownloadBytes: UInt64 = 2_147_483_648
     static let maximumNormalPhotoToolchainDownloadBytes: UInt64 = 2_500_000_000
+    static let maximumFullToolchainDownloadBytes: UInt64 = 6_000_000_000
 
     static let schema2ComponentNames = Set([
         "macos-arm64-core",
@@ -13,7 +14,6 @@ extension ToolchainManager {
     static let coreCapabilities = Set([
         ToolchainCapability.core.rawValue,
         ToolchainCapability.colmap.rawValue,
-        ToolchainCapability.da3Runtime.rawValue,
         ToolchainCapability.msplat.rawValue,
     ])
 
@@ -21,17 +21,53 @@ extension ToolchainManager {
         "bin/colmap",
         "bin/easysplat-train",
         "bin/default.metallib",
-        "da3_mps/bin/easysplat_da3_sfm",
-        "da3_mps/python/bin/python3",
-        "da3_mps/app/easysplat_da3_sfm/run.py",
-        "da3_mps/build_info.json",
+        "lib/libomp.dylib",
+        "provenance/colmap.json",
+        "provenance/colmap-support.json",
+        "provenance/ceres.json",
+        "provenance/openimageio.json",
         "msplat/build_info.json",
+        "msplat/LICENSE",
+        "supply-chain/components.json",
     ])
+
+    static func isAllowedCoreFile(_ path: String) -> Bool {
+        criticalCoreAnchors.contains(path)
+            || (path.hasPrefix("licenses/") && path.count > "licenses/".count)
+    }
 
     static func criticalCoreFiles(in contents: [String]) -> Set<String> {
         var required = criticalCoreAnchors
         for path in contents {
             let lowercased = path.lowercased()
+            let pathExtension = URL(fileURLWithPath: lowercased).pathExtension
+            let isLoadedLibrary = ["dylib", "so"].contains(pathExtension)
+                && lowercased.hasPrefix("lib/")
+            let isMetalLibrary = pathExtension == "metallib"
+            let isExecutablePayload = lowercased.hasPrefix("bin/")
+            let isReceiptOrLicense = lowercased.hasPrefix("provenance/")
+                || lowercased.hasPrefix("licenses/")
+                || lowercased.hasPrefix("msplat/")
+                || lowercased.hasPrefix("supply-chain/")
+            if isLoadedLibrary || isMetalLibrary || isExecutablePayload || isReceiptOrLicense {
+                required.insert(path)
+            }
+        }
+        return required
+    }
+
+    static let criticalDa3RuntimeAnchors = Set([
+        "da3_mps/bin/easysplat_da3_sfm",
+        "da3_mps/python/bin/python3",
+        "da3_mps/app/easysplat_da3_sfm/run.py",
+        "da3_mps/build_info.json",
+    ])
+
+    static func criticalDa3BaseFiles(in contents: [String]) -> Set<String> {
+        var required = criticalDa3RuntimeAnchors.union(criticalBaseModelFiles)
+        for path in contents {
+            let lowercased = path.lowercased()
+            guard lowercased.hasPrefix("da3_mps/") else { continue }
             let pathExtension = URL(fileURLWithPath: lowercased).pathExtension
             let isPythonCode = ["py", "pyc", "pth"].contains(pathExtension)
                 && (
@@ -40,40 +76,45 @@ extension ToolchainManager {
                         || lowercased.hasPrefix("da3_mps/python/")
                 )
             let isRuntimeConfiguration = ["yaml", "yml", "json", "toml"].contains(pathExtension)
-                && (
-                    lowercased.hasPrefix("da3_mps/app/")
-                        || lowercased.hasPrefix("da3_mps/vendor/")
-                        || lowercased.hasPrefix("da3_mps/python/")
-                )
             let isLoadedLibrary = ["dylib", "so"].contains(pathExtension)
-                && (
-                    lowercased.hasPrefix("lib/")
-                        || lowercased.hasPrefix("da3_mps/")
-                )
-            let isMetalLibrary = pathExtension == "metallib"
             let pathComponents = lowercased.split(separator: "/")
-            let isNestedExecutablePayload = lowercased.hasPrefix("da3_mps/")
-                && pathComponents.dropLast().contains(where: { $0 == "bin" || $0 == "libexec" })
-            let isExecutablePayload = lowercased.hasPrefix("bin/")
-                || lowercased.hasPrefix("da3_mps/bin/")
-                || lowercased.hasPrefix("da3_mps/python/bin/")
-                || isNestedExecutablePayload
-            if isPythonCode || isRuntimeConfiguration || isLoadedLibrary || isMetalLibrary || isExecutablePayload {
+            let isExecutablePayload = pathComponents.dropLast().contains(where: {
+                $0 == "bin" || $0 == "libexec"
+            })
+            let filename = pathComponents.last.map(String.init) ?? ""
+            let isLicenseOrNotice = lowercased.hasPrefix("da3_mps/licenses/")
+                || filename.hasPrefix("license")
+                || filename.hasPrefix("copying")
+                || filename.hasPrefix("notice")
+            if isPythonCode || isRuntimeConfiguration || isLoadedLibrary
+                || isExecutablePayload || isLicenseOrNotice {
                 required.insert(path)
             }
         }
         return required
     }
 
+    static func isAllowedDa3BaseFile(_ path: String) -> Bool {
+        path == "da3_mps/build_info.json"
+            || path.hasPrefix("da3_mps/bin/")
+            || path.hasPrefix("da3_mps/python/")
+            || path.hasPrefix("da3_mps/app/")
+            || path.hasPrefix("da3_mps/vendor/")
+            || path.hasPrefix("da3_mps/licenses/")
+            || path.hasPrefix("da3_mps/models/DA3-BASE/")
+    }
+
     static let criticalBaseModelFiles = Set([
         "da3_mps/models/DA3-BASE/config.json",
         "da3_mps/models/DA3-BASE/easysplat_model_info.json",
+        "da3_mps/models/DA3-BASE/LICENSE",
         "da3_mps/models/DA3-BASE/model.safetensors",
     ])
 
     static let criticalSmallModelFiles = Set([
         "da3_mps/models/DA3-SMALL/config.json",
         "da3_mps/models/DA3-SMALL/easysplat_model_info.json",
+        "da3_mps/models/DA3-SMALL/LICENSE",
         "da3_mps/models/DA3-SMALL/model.safetensors",
     ])
 
@@ -99,8 +140,18 @@ extension ToolchainManager {
             criticalFiles: Set<String>
         )] = [
             "macos-arm64-core": (Self.coreCapabilities, [], .required, []),
-            "geometry-da3-base": ([ToolchainCapability.da3Base.rawValue], ["macos-arm64-core"], .required, Self.criticalBaseModelFiles),
-            "geometry-da3-small": ([ToolchainCapability.da3Small.rawValue], ["macos-arm64-core"], .optional, Self.criticalSmallModelFiles),
+            "geometry-da3-base": (
+                [ToolchainCapability.da3Runtime.rawValue, ToolchainCapability.da3Base.rawValue],
+                ["macos-arm64-core"],
+                .optional,
+                []
+            ),
+            "geometry-da3-small": (
+                [ToolchainCapability.da3Small.rawValue],
+                ["geometry-da3-base"],
+                .optional,
+                Self.criticalSmallModelFiles
+            ),
         ]
 
         let allContents = manifest.components.flatMap(\.contents)
@@ -114,9 +165,15 @@ extension ToolchainManager {
         }
 
         for component in manifest.components {
-            let requiredCriticalFiles = component.name == "macos-arm64-core"
-                ? Self.criticalCoreFiles(in: component.contents)
-                : expected[component.name]?.criticalFiles ?? []
+            let requiredCriticalFiles: Set<String>
+            switch component.name {
+            case "macos-arm64-core":
+                requiredCriticalFiles = Self.criticalCoreFiles(in: component.contents)
+            case "geometry-da3-base":
+                requiredCriticalFiles = Self.criticalDa3BaseFiles(in: component.contents)
+            default:
+                requiredCriticalFiles = expected[component.name]?.criticalFiles ?? []
+            }
             let declaredCriticalFiles = Set(component.criticalFileHashes.keys)
             let declaredContents = Set(component.contents)
             guard let contract = expected[component.name],
@@ -151,13 +208,25 @@ extension ToolchainManager {
         guard manifest.components.allSatisfy({ !$0.criticalFileHashes.isEmpty }) else {
             throw ToolchainError.invalidManifest
         }
+
+        guard let core = manifest.components.first(where: { $0.name == "macos-arm64-core" }),
+              let base = manifest.components.first(where: { $0.name == "geometry-da3-base" }),
+              let small = manifest.components.first(where: { $0.name == "geometry-da3-small" }),
+              core.sizeBytes <= Self.maximumNormalPhotoToolchainDownloadBytes,
+              core.contents.allSatisfy(Self.isAllowedCoreFile),
+              Set(core.contents.filter { $0.hasPrefix("lib/") }) == ["lib/libomp.dylib"],
+              base.contents.allSatisfy(Self.isAllowedDa3BaseFile),
+              Set(small.contents) == Self.criticalSmallModelFiles else {
+            throw ToolchainError.invalidManifest
+        }
+
         var totalDownloadBytes: UInt64 = 0
         for component in manifest.components {
             let sum = totalDownloadBytes.addingReportingOverflow(component.sizeBytes)
             guard !sum.overflow else { throw ToolchainError.invalidManifest }
             totalDownloadBytes = sum.partialValue
         }
-        guard totalDownloadBytes <= Self.maximumNormalPhotoToolchainDownloadBytes else {
+        guard totalDownloadBytes <= Self.maximumFullToolchainDownloadBytes else {
             throw ToolchainError.invalidManifest
         }
     }

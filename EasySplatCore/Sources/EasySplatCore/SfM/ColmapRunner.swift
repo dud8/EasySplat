@@ -253,7 +253,7 @@ public final class ColmapRunner {
             "--image_path", imagePath.path,
             "--ImageReader.single_camera", singleCamera ? "1" : "0",
             "--ImageReader.camera_model", cameraModel,
-            "--SiftExtraction.max_image_size", "\(maxImageSize)",
+            "--FeatureExtraction.max_image_size", "\(maxImageSize)",
             "--FeatureExtraction.use_gpu", options.useGPU ? "1" : "0",
             "--FeatureExtraction.num_threads", "\(options.extractThreads)"
         ]
@@ -469,44 +469,25 @@ public final class ColmapRunner {
             try fm.createDirectory(at: outputPath, withIntermediateDirectories: true)
         }
 
-        let baseArgs = [
+        let args = [
             "bundle_adjuster",
             "--input_path", inputPath.path,
             "--output_path", outputPath.path,
             "--BundleAdjustment.refine_focal_length", bundleOptions.refineFocalLength ? "1" : "0",
             "--BundleAdjustment.refine_principal_point", bundleOptions.refinePrincipalPoint ? "1" : "0",
-            "--BundleAdjustment.refine_extra_params", bundleOptions.refineExtraParams ? "1" : "0"
+            "--BundleAdjustment.refine_extra_params", bundleOptions.refineExtraParams ? "1" : "0",
+            "--BundleAdjustmentCeres.max_num_iterations", "\(max(1, bundleOptions.maxNumIterations))"
         ]
-        let maxIterations = "\(max(1, bundleOptions.maxNumIterations))"
-        let ceresArgs = baseArgs + ["--BundleAdjustmentCeres.max_num_iterations", maxIterations]
 
-        onLog("EasySplat: colmap argv: \(colmapPath.path) \(ceresArgs.joined(separator: " "))", false)
-        var result = try await runner.runAsync(
+        onLog("EasySplat: colmap argv: \(colmapPath.path) \(args.joined(separator: " "))", false)
+        let result = try await runner.runAsync(
             colmapPath.path,
-            ceresArgs,
+            args,
             currentDirectory: nil,
             environment: options.environment,
             onStdout: { onLog($0, false) },
             onStderr: { onLog($0, true) }
         )
-
-        if shouldRetryBundleAdjusterWithLegacyIterationFlag(result: result) {
-            let legacyArgs = baseArgs + ["--BundleAdjustment.max_num_iterations", maxIterations]
-            onLog(
-                "EasySplat: bundle_adjuster rejected BundleAdjustmentCeres.max_num_iterations; retrying with BundleAdjustment.max_num_iterations.",
-                true
-            )
-            onLog("EasySplat: colmap argv: \(colmapPath.path) \(legacyArgs.joined(separator: " "))", false)
-            result = try await runner.runAsync(
-                colmapPath.path,
-                legacyArgs,
-                currentDirectory: nil,
-                environment: options.environment,
-                onStdout: { onLog($0, false) },
-                onStderr: { onLog($0, true) }
-            )
-        }
-
         try checkResult(result, command: "bundle_adjuster")
     }
 
@@ -595,16 +576,6 @@ public final class ColmapRunner {
                 stderrTail: tailLines(result.stderr, limit: 40)
             )
         }
-    }
-
-    private func shouldRetryBundleAdjusterWithLegacyIterationFlag(result: SubprocessResult) -> Bool {
-        guard result.exitCode != 0 else { return false }
-        let text = "\(result.stdout)\n\(result.stderr)".lowercased()
-        if text.contains("bundleadjustmentceres.max_num_iterations"),
-           (text.contains("unrecognised option") || text.contains("unrecognized option")) {
-            return true
-        }
-        return false
     }
 
     private func tailLines(_ text: String, limit: Int) -> String {

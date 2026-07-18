@@ -38,7 +38,8 @@ METALSPLATTER_SOURCE_ROOTS = (
     "PLYIO/Sources",
     "SplatIO/Sources",
 )
-MAX_NORMAL_PHOTO_INSTALL_BYTES = 2_500_000_000
+MAX_CORE_DOWNLOAD_BYTES = 2_500_000_000
+MAX_FULL_TOOLCHAIN_DOWNLOAD_BYTES = 6_000_000_000
 CPU_TYPE_ARM64 = 0x0100000C
 CPU_SUBTYPE_ARM64_ALL = 0
 THIN_64_MACHO_ENDIAN = {
@@ -132,9 +133,12 @@ def validate_normal_photo_install_size(sizes: dict[str, int]) -> None:
         fail("normal photo install size requires all release archives")
     if any(not isinstance(size, int) or size <= 0 for size in sizes.values()):
         fail("normal photo install archive sizes must be positive integers")
+    core_size = sizes["core"]
+    if core_size > MAX_CORE_DOWNLOAD_BYTES:
+        fail(f"core-only toolchain download exceeds 2.5 GB: {core_size} bytes")
     total = sum(sizes.values())
-    if total > MAX_NORMAL_PHOTO_INSTALL_BYTES:
-        fail(f"normal photo toolchain download exceeds 2.5 GB: {total} bytes")
+    if total > MAX_FULL_TOOLCHAIN_DOWNLOAD_BYTES:
+        fail(f"full optional toolchain download exceeds 6 GB: {total} bytes")
 
 
 def load_json(path: Path, label: str) -> dict[str, Any]:
@@ -207,10 +211,10 @@ def is_zip_symlink(info: zipfile.ZipInfo) -> bool:
 
 
 def archive_for_path(path: str) -> str:
-    if path.startswith("da3_mps/models/DA3-BASE/"):
-        return "geometry-da3-base"
     if path.startswith("da3_mps/models/DA3-SMALL/"):
         return "geometry-da3-small"
+    if path.startswith("da3_mps/"):
+        return "geometry-da3-base"
     return "core"
 
 

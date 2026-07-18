@@ -20,10 +20,10 @@ Implementation names belong in Technical Details and maintainer logs. The main U
 - `EasySplatApp/UI/`: native split-view project workspace, new-project flow, processing state, result viewer, and inspector.
 - `EasySplatCore/Project/`: strict metadata, safe project paths, artifact contracts, validation, and diagnostic scrubbing.
 - `EasySplatCore/Pipeline/`: durable-stage orchestration, typed run policy, frame selection, geometry acceptance, training, and recovery.
-- `EasySplatCore/SfM/`: DA3 bridge, retained COLMAP commands, scoring, real residual analysis, and model normalization.
+- `EasySplatCore/SfM/`: DA3 runner, native COLMAP commands, scoring, real residual analysis, and model normalization.
 - `EasySplatCore/Training/`: native msplat process contract and training artifacts.
 - `EasySplatCore/Tools/`: signed manifests, capability selection, resumable downloads, safe extraction, receipts, rollback, and subprocesses.
-- `Tools/Da3Sfm/`: local DA3-to-COLMAP bridge.
+- `Tools/Da3Sfm/`: local DA3 runner and canonical COLMAP-model export.
 - `Tools/MsplatNative/`: pinned native C++/Metal trainer.
 - `Tools/ManifestTool/`: manifest builder, critical-file hashing, Ed25519 signing, and release key utilities.
 - `ThirdParty/MetalSplatter/`: native viewer dependency.
@@ -119,7 +119,7 @@ Do not call an intermediate file a checkpoint or snapshot unless its complete-st
 
 ## Geometry
 
-The public-beta route uses bounded COLMAP matching and camera reconstruction. A DA3 Base experiment remains behind the typed candidate override, with DA3 Small as its memory-failure retry: one coherent batch of at most 29 images at 336 px, followed by triangulation and bounded bundle adjustment. The bridge rejects a second inference window because independently inferred windows do not share a trustworthy coordinate frame.
+The public-beta route uses bounded COLMAP matching and camera reconstruction. A DA3 Base experiment remains behind the typed candidate override, with DA3 Small as its memory-failure retry: one coherent batch of at most 29 images at 336 px, followed by triangulation and bounded bundle adjustment. The runner rejects a second inference window because independently inferred windows do not share a trustworthy coordinate frame.
 
 Video extraction is dual-purpose: low-resolution analysis chooses useful timestamps, and only selected timestamps are extracted at training resolution. Selected-frame names and manifests preserve exact video timestamps.
 
@@ -153,7 +153,7 @@ Novelty is not a shipping criterion. Code, weights, training data, transitive li
 
 | Work | Current decision |
 | --- | --- |
-| COLMAP and PyCOLMAP | The packaged Apple-Silicon runtime is the reviewed PyCOLMAP 4.1.0 arm64 wheel released on June 26, 2026. The latest tagged native COLMAP release is still 4.0.4; development documentation labeled 4.1.0 is not a native release. A native build must beat the packaged route before replacing it. |
+| Native COLMAP | The packaged Apple-Silicon runtime is a pinned, arm64-only COLMAP 4.1.0 source build with the exact nine-command surface EasySplat uses. It ships in the core component with its reviewed `libomp` runtime dependency; PyCOLMAP is not shipped. |
 | COLMAP integrated `global_mapper` | Removed. The measured candidate was 2.45× slower in geometric mean and used more peak memory than the optimized incremental mapper. Its occasional coverage recovery did not meet the 30% speedup retention gate. |
 | [FastMap](https://github.com/pals-ttic/fastmap) | Do not ship the PyTorch runtime or its internally inconsistent sparse-model export, which writes 3D tracks referencing image records with zero 2D observations. On the M4 Max, the pinned CPU implementation was 1.73× slower than the current mapper on the apartment walkthrough and 3.66× slower on the DJI orbit. A future unshipped Metal/Accelerate experiment is limited to its voting, accumulation, and fused-gradient kernels; it must also cap quadratic track completion and beat the full current mapper by at least 2× before product integration. |
 | [XFeat](https://github.com/verlab/accelerated_features) | Highest-priority learned-feature challenger, not a default. A fixed-shape Core ML backbone ran in 3.53 ms and a 30-view apartment graph registered 30/30 where the same SIFT graph registered 15/30. The DJI subset also registered 30/30, but its p90 residual reached 2.86 px and SIFT retained more inliers. Redistribution remains blocked on explicit checkpoint and training-lineage clearance. LighterGlue was not benchmarked and receives no product slot unless XFeat first clears licensing and corpus gates. |
@@ -181,7 +181,7 @@ Novelty is not a shipping criterion. Code, weights, training data, transitive li
 | [ShorterSplatting](https://arxiv.org/abs/2603.09277) | Reject the non-commercial code and current reset idea. A clean-room 0.8 scale-reset diagnostic was 3.9% slower, raised peak resident memory from 3.43 GB to 6.16 GB, and increased exact raster fallbacks from 894 to 1,044. |
 | [TurboGS](https://arxiv.org/abs/2606.15924) | Watchlist. No implementation was available to validate against Metal's tile-coherent renderer. |
 
-The scale-reset result and the DA3 result below are untracked single-capture diagnostics, not release evidence. A 29-view Base run at 336 px spent 1.39 seconds in the model forward pass and 3.61 seconds in the full DA3 bridge, followed by a separately timed 32-second refinement. The bridge reported a 15.74 GB peak footprint. It registered every view with low aggregate residuals, but several cameras had weak track support. The 392 px variant contained a camera with only two observations and a 25× adjacent-position jump; a same-frame COLMAP comparison also showed a grossly different camera path. The fast result was not trustworthy.
+The scale-reset result and the DA3 result below are untracked single-capture diagnostics, not release evidence. A 29-view Base run at 336 px spent 1.39 seconds in the model forward pass and 3.61 seconds in the full DA3 runner, followed by a separately timed 32-second refinement. The runner reported a 15.74 GB peak footprint. It registered every view with low aggregate residuals, but several cameras had weak track support. The 392 px variant contained a camera with only two observations and a 25× adjacent-position jump; a same-frame COLMAP comparison also showed a grossly different camera path. The fast result was not trustworthy.
 
 The default route has a separate local end-to-end sanity result on an M4 Max with 48 GB. A 9.54-second 4K HEVC drone clip selected 30 frames at the persisted 3 FPS analysis rate, registered 30/30 views, produced 4,728 sparse points and 43,709 observations at 0.55 px mean reprojection error, then trained 247,750 Gaussians in 46.08 seconds. Input-to-validated-PLY time was 85.46 seconds with 2.61 GB maximum resident memory, down from 258.77 seconds for the earlier 1,600 px/55-frame plan. This proves the signed-cache COLMAP-to-Metal path on one real capture; it does not replace the release corpus or held-out rendering gates.
 

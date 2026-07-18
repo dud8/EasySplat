@@ -64,6 +64,22 @@ enum ToolchainFixtureBuilder {
         }
         """.write(to: colmapProvenance, atomically: true, encoding: .utf8)
 
+        let coreSupportFiles: [String: String] = [
+            "lib/libomp.dylib": "fixture OpenMP runtime\n",
+            "provenance/colmap-support.json": "{}\n",
+            "provenance/ceres.json": "{}\n",
+            "provenance/openimageio.json": "{}\n",
+            "licenses/COLMAP/COPYING.txt": "BSD-3-Clause\n",
+            "licenses/COLMAPSupport/OpenMP-LICENSE.txt": "Apache-2.0 WITH LLVM-exception\n",
+            "licenses/Ceres/LICENSE": "BSD-3-Clause\n",
+            "licenses/OpenImageIO/LICENSE.md": "BSD-3-Clause\n",
+        ]
+        for (relativePath, contents) in coreSupportFiles {
+            let url = root.appendingPathComponent(relativePath)
+            try fm.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+            try contents.write(to: url, atomically: true, encoding: .utf8)
+        }
+
 
         if includeMsplat {
             let msplat = bin.appendingPathComponent("easysplat-train")
@@ -176,11 +192,21 @@ enum ToolchainFixtureBuilder {
             fm.createFile(atPath: da3ModelFile.path, contents: Data([0x00]))
             try "{}\n".write(to: da3ConfigFile, atomically: true, encoding: .utf8)
             try #"{"repo_id":"depth-anything/DA3-BASE","requested_revision":"fixture-revision","resolved_sha":"0123456789abcdef0123456789abcdef01234567","license":"apache-2.0"}"#.write(to: da3ModelInfoFile, atomically: true, encoding: .utf8)
+            try "Apache License 2.0\n".write(
+                to: da3ModelBundle.appendingPathComponent("LICENSE"),
+                atomically: true,
+                encoding: .utf8
+            )
         }
         if includeDa3FallbackModel {
             fm.createFile(atPath: da3FallbackModelFile.path, contents: Data([0x00]))
             try "{}\n".write(to: da3FallbackConfigFile, atomically: true, encoding: .utf8)
             try #"{"repo_id":"depth-anything/DA3-SMALL","requested_revision":"fixture-revision","resolved_sha":"89abcdef0123456789abcdef0123456789abcdef","license":"apache-2.0"}"#.write(to: da3FallbackModelInfoFile, atomically: true, encoding: .utf8)
+            try "Apache License 2.0\n".write(
+                to: da3FallbackModelBundle.appendingPathComponent("LICENSE"),
+                atomically: true,
+                encoding: .utf8
+            )
         }
         if includeDa3VendorSentinel {
             fm.createFile(atPath: da3VendorSentinel.path, contents: Data([0x00]))

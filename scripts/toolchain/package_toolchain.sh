@@ -27,13 +27,20 @@ if [[ ! "$VERSION" =~ $SEMVER_PATTERN ]]; then
   exit 1
 fi
 
+COLMAP_INSTALL="${COLMAP_INSTALL:-$ROOT/Toolchains/build/colmap/install}"
+COLMAP_SUPPORT_INSTALL="${COLMAP_SUPPORT_INSTALL:-$ROOT/Toolchains/build/colmap-support/install}"
+CERES_INSTALL="${CERES_INSTALL:-$ROOT/Toolchains/build/ceres/install}"
+OPENIMAGEIO_INSTALL="${OPENIMAGEIO_INSTALL:-$ROOT/Toolchains/build/openimageio/install}"
 MSPLAT_INSTALL="${MSPLAT_INSTALL:-$ROOT/Toolchains/build/msplat/install}"
 DA3_MPS_INSTALL="${DA3_MPS_INSTALL:-$ROOT/Toolchains/build/da3_mps/install}"
 MSPLAT_VALIDATOR="$ROOT/scripts/toolchain/validate_native_msplat.sh"
+DA3_PAYLOAD_VALIDATOR="$ROOT/scripts/toolchain/validate_da3_payload.py"
 SUPPLY_CHAIN_GENERATOR="$ROOT/scripts/toolchain/generate_supply_chain_manifest.py"
+REPRODUCIBLE_ZIP="$ROOT/scripts/toolchain/create_reproducible_zip.py"
 
 OUT="$ROOT/Toolchains/out"
 BIN="$OUT/bin"
+LIB="$OUT/lib"
 LICENSES="$OUT/licenses"
 PROVENANCE="$OUT/provenance"
 SUPPLY_CHAIN="$OUT/supply-chain"
@@ -41,20 +48,50 @@ CORE_ZIP="$OUT/toolchain-macos-arm64-$VERSION-core.zip"
 DA3_BASE_ZIP="$OUT/toolchain-geometry-da3-base-$VERSION.zip"
 DA3_SMALL_ZIP="$OUT/toolchain-geometry-da3-small-$VERSION.zip"
 MAX_RELEASE_ASSET_BYTES=2147483648
-MAX_NORMAL_PHOTO_INSTALL_BYTES=2500000000
+MAX_CORE_DOWNLOAD_BYTES=2500000000
+MAX_FULL_DOWNLOAD_BYTES=6000000000
+
+die() {
+  echo "$*" >&2
+  exit 1
+}
 
 require_committed_packaging_sources() {
   local status_output
+  local -a source_pathspecs=(
+    LICENSE
+    Tools/Da3Sfm
+    Tools/ManifestTool
+    Tools/MsplatNative
+    Tools/NativeColmap
+    scripts/ci/generate_msplat_sparse_fixtures.py
+    scripts/toolchain/atomic_swap_install.py
+    scripts/toolchain/build_colmap_support.sh
+    scripts/toolchain/build_colmap_support_impl.sh
+    scripts/toolchain/colmap-support-lock.json
+    scripts/toolchain/build_ceres.sh
+    scripts/toolchain/build_ceres_impl.sh
+    scripts/toolchain/ceres-lock.json
+    scripts/toolchain/build_openimageio.sh
+    scripts/toolchain/build_openimageio_impl.sh
+    scripts/toolchain/openimageio-lock.json
+    scripts/toolchain/build_colmap.sh
+    scripts/toolchain/build_colmap_impl.sh
+    scripts/toolchain/patches/colmap-4.1.0-easysplat.patch
+    scripts/toolchain/build_da3_mps.sh
+    scripts/toolchain/da3-model-lock.json
+    scripts/toolchain/build_msplat.sh
+    scripts/toolchain/create_reproducible_zip.py
+    scripts/toolchain/generate_supply_chain_manifest.py
+    scripts/toolchain/package_toolchain.sh
+    scripts/toolchain/safe_extract_source.py
+    scripts/toolchain/tests
+    scripts/toolchain/validate_da3_payload.py
+    scripts/toolchain/validate_native_msplat.sh
+  )
   status_output="$(
     git -C "$ROOT" status --porcelain --untracked-files=all -- \
-      LICENSE \
-      Tools/Da3Sfm \
-      Tools/MsplatNative \
-      scripts/toolchain/build_da3_mps.sh \
-      scripts/toolchain/build_msplat.sh \
-      scripts/toolchain/generate_supply_chain_manifest.py \
-      scripts/toolchain/package_toolchain.sh \
-      scripts/toolchain/validate_native_msplat.sh
+      "${source_pathspecs[@]}"
   )"
   if [ -n "$status_output" ]; then
     echo "Toolchain source inputs must be committed before release packaging." >&2
@@ -63,166 +100,369 @@ require_committed_packaging_sources() {
   fi
 }
 
+require_regular_file() {
+  local path="$1"
+  [ -f "$path" ] && [ ! -L "$path" ] && [ -s "$path" ] || \
+    die "Required release input is missing, empty, or a symlink: $path"
+}
+
 assert_release_asset_size() {
   local archive="$1"
   local size
   size="$(stat -f '%z' "$archive")"
-  if (( size >= MAX_RELEASE_ASSET_BYTES )); then
-    echo "Release component must be smaller than 2 GiB: $archive ($size bytes)" >&2
-    exit 1
-  fi
+  (( size < MAX_RELEASE_ASSET_BYTES )) || \
+    die "Release component must be smaller than 2 GiB: $archive ($size bytes)"
 }
 
-assert_normal_photo_install_size() {
-  local total=0
-  local archive
-  local size
+assert_download_closure_size() {
+  local core_size total_size archive size
+  core_size="$(stat -f '%z' "$CORE_ZIP")"
+  (( core_size <= MAX_CORE_DOWNLOAD_BYTES )) || \
+    die "Core-only toolchain download exceeds 2.5 GB: $core_size bytes"
+  total_size=0
   for archive in "$@"; do
     size="$(stat -f '%z' "$archive")"
-    total=$((total + size))
+    total_size=$((total_size + size))
   done
-  if (( total > MAX_NORMAL_PHOTO_INSTALL_BYTES )); then
-    echo "Normal photo toolchain download exceeds 2.5 GB: $total bytes" >&2
-    exit 1
-  fi
+  (( total_size <= MAX_FULL_DOWNLOAD_BYTES )) || \
+    die "Full optional toolchain download exceeds 6 GB: $total_size bytes"
 }
 
 assert_exact_da3_model_payload() {
   local model_root="$1"
-  local actual
-  local expected
+  local actual expected name
   expected="$(printf '%s\n' LICENSE config.json easysplat_model_info.json model.safetensors)"
   actual="$(find "$model_root" -mindepth 1 -maxdepth 1 -exec basename {} \; | LC_ALL=C sort)"
-  if [ "$actual" != "$expected" ]; then
+  [ "$actual" = "$expected" ] || {
     echo "DA3 model payload must contain exactly four release files: $model_root" >&2
     printf 'Found:\n%s\n' "$actual" >&2
     exit 1
-  fi
-  local name
+  }
   for name in LICENSE config.json easysplat_model_info.json model.safetensors; do
-    if [ ! -f "$model_root/$name" ] || [ -L "$model_root/$name" ] || [ ! -s "$model_root/$name" ]; then
-      echo "DA3 model payload entry must be a nonempty regular file: $model_root/$name" >&2
-      exit 1
-    fi
+    require_regular_file "$model_root/$name"
   done
 }
 
-require_committed_packaging_sources
-rm -rf "$OUT"
-mkdir -p "$BIN" "$LICENSES" "$PROVENANCE" "$SUPPLY_CHAIN"
-
-validate_build_info() {
-  local python_bin="$1"
-  local build_info="$2"
-  local tool_name="$3"
-  local colmap_launcher="$4"
-  PYTHONNOUSERSITE=1 "$python_bin" - "$build_info" "$tool_name" "$colmap_launcher" <<'PY'
-import hashlib
-import json
-import re
-import sys
-from pathlib import Path
-
-build_info = Path(sys.argv[1])
-tool_name = sys.argv[2]
-colmap_launcher = Path(sys.argv[3])
-required_keys = {
-    "colmap_bridge_source_sha256",
-    "colmap_launcher_sha256",
-    "supplemental_license_manifest_sha256",
-    "toolchain_name",
-    "source_path",
-    "python_version",
-    "torch_version",
-    "torchvision_version",
-}
-
-try:
-    payload = json.loads(build_info.read_text(encoding="utf-8"))
-except Exception as exc:  # noqa: BLE001
-    raise SystemExit(f"{tool_name} build_info.json is invalid JSON: {exc}")
-
-if not isinstance(payload, dict):
-    raise SystemExit(f"{tool_name} build_info.json must contain a JSON object.")
-
-missing = sorted(key for key in required_keys if not payload.get(key))
-if missing:
-    raise SystemExit(f"{tool_name} build_info.json is missing required keys: {', '.join(missing)}")
-
-if payload.get("toolchain_name") != tool_name:
-    raise SystemExit(
-        f"{tool_name} build_info.json toolchain_name mismatch: expected {tool_name}, "
-        f"got {payload.get('toolchain_name')!r}"
-    )
-
-if tool_name == "da3_mps" and payload.get("source_provenance") != "pinned-git":
-    raise SystemExit(
-        "da3_mps build_info.json must record pinned-git source_provenance; "
-        f"got {payload.get('source_provenance')!r}"
-    )
-
-launcher_sha256 = str(payload.get("colmap_launcher_sha256") or "")
-if not re.fullmatch(r"[0-9a-f]{64}", launcher_sha256):
-    raise SystemExit("da3_mps build_info.json has no valid colmap_launcher_sha256")
-actual_launcher_sha256 = hashlib.sha256(colmap_launcher.read_bytes()).hexdigest()
-if actual_launcher_sha256 != launcher_sha256:
-    raise SystemExit("DA3 COLMAP launcher does not match build_info.json")
-
-bridge_source = build_info.parent / "app/easysplat_da3_sfm/colmap_cli.py"
-bridge_sha256 = hashlib.sha256(bridge_source.read_bytes()).hexdigest()
-if bridge_sha256 != payload["colmap_bridge_source_sha256"]:
-    raise SystemExit("DA3 COLMAP bridge source does not match build_info.json")
-
-license_manifest = build_info.parent / "licenses/python-package-upstream-notices.json"
-license_manifest_sha256 = hashlib.sha256(license_manifest.read_bytes()).hexdigest()
-if license_manifest_sha256 != payload["supplemental_license_manifest_sha256"]:
-    raise SystemExit("DA3 supplemental license manifest does not match build_info.json")
-PY
-}
-
 require_arm64_only_macho() {
-  local label="$1"
-  local binary="$2"
-  local desc
-  local architectures
+  local label="$1" binary="$2" desc architectures
   desc="$(/usr/bin/file -b "$binary")"
-  if [[ "$desc" != *Mach-O* ]]; then
-    echo "$label is not a Mach-O binary (file reported: $desc)." >&2
-    exit 1
-  fi
-  if ! architectures="$(/usr/bin/lipo -archs "$binary" 2>/dev/null)"; then
-    echo "$label architecture could not be inspected with lipo." >&2
-    exit 1
-  fi
-  if [[ "$architectures" != "arm64" || "$desc" == *"universal binary"* ]]; then
-    echo "$label must be an arm64-only Mach-O binary (found: $architectures)." >&2
-    exit 1
-  fi
+  [[ "$desc" == *Mach-O* ]] || die "$label is not a Mach-O binary (file reported: $desc)."
+  architectures="$(/usr/bin/lipo -archs "$binary" 2>/dev/null)" || \
+    die "$label architecture could not be inspected with lipo."
+  [[ "$architectures" == "arm64" && "$desc" != *"universal binary"* ]] || \
+    die "$label must be an arm64-only Mach-O binary (found: $architectures)."
 }
 
-require_bundled_arm64_python() {
-  local tool_name="$1"
-  local python_bin="$2"
-  local target
-  require_arm64_only_macho "$tool_name python" "$python_bin"
-  if [ -L "$python_bin" ]; then
-    target="$(readlink "$python_bin" || true)"
-    if [[ "$target" == /* ]]; then
-      echo "$tool_name python3 is an absolute symlink ($target). Rebuild $tool_name with bundled CPython." >&2
-      exit 1
-    fi
-  fi
+require_macos_15_binary() {
+  local label="$1" binary="$2"
+  /usr/bin/vtool -show-build "$binary" 2>/dev/null | \
+    awk '$1 == "minos" && $2 == "15.0" { found = 1 } END { exit found ? 0 : 1 }' || \
+    die "$label must declare macOS 15.0 as its minimum deployment target."
+}
+
+require_adhoc_signature() {
+  local label="$1" binary="$2" details
+  /usr/bin/codesign --verify --strict "$binary" || die "$label has an invalid code signature."
+  details="$(/usr/bin/codesign -dvv "$binary" 2>&1)"
+  printf '%s\n' "$details" | grep -Fx 'Signature=adhoc' >/dev/null || \
+    die "$label must carry an ad-hoc code signature."
 }
 
 is_system_dependency() {
   case "$1" in
-    /usr/lib/*|/System/Library/*)
-      return 0
-      ;;
-    *)
-      return 1
-      ;;
+    /usr/lib/*|/System/Library/*) return 0 ;;
+    *) return 1 ;;
   esac
+}
+
+otool_dependency_names() {
+  otool -L "$1" | awk 'NR > 1 { print $1 }'
+}
+
+validate_native_colmap_linkage() {
+  local binary="$1" dependency install_id found_openmp=0
+  install_id="$(otool -D "$binary" 2>/dev/null | awk 'NR == 2 { print; exit }' || true)"
+  while IFS= read -r dependency; do
+    [ -n "$dependency" ] || continue
+    [ "$dependency" = "$install_id" ] && continue
+    if is_system_dependency "$dependency"; then
+      continue
+    fi
+    if [ "$dependency" = '@rpath/libomp.dylib' ]; then
+      found_openmp=1
+      continue
+    fi
+    die "Native COLMAP has an unapproved runtime dependency: $dependency"
+  done < <(otool_dependency_names "$binary")
+  (( found_openmp == 1 )) || die "Native COLMAP does not link @rpath/libomp.dylib."
+  otool -l "$binary" | \
+    awk '$1 == "cmd" && $2 == "LC_RPATH" { in_rpath = 1; next }
+         in_rpath && $1 == "path" && $2 == "@executable_path/../lib" { found = 1 }
+         in_rpath && $1 == "path" { in_rpath = 0 }
+         END { exit found ? 0 : 1 }' || \
+    die "Native COLMAP is missing the @executable_path/../lib rpath."
+}
+
+validate_libomp_linkage() {
+  local binary="$1" dependency install_id
+  install_id="$(otool -D "$binary" 2>/dev/null | awk 'NR == 2 { print; exit }' || true)"
+  [ "$install_id" = '@rpath/libomp.dylib' ] || \
+    die "Packaged libomp has an unexpected install name: $install_id"
+  while IFS= read -r dependency; do
+    [ -n "$dependency" ] || continue
+    [ "$dependency" = "$install_id" ] && continue
+    is_system_dependency "$dependency" || \
+      die "Packaged libomp has an unapproved runtime dependency: $dependency"
+  done < <(otool_dependency_names "$binary")
+}
+
+validate_native_receipts() {
+  python3 - \
+    "$COLMAP_INSTALL" \
+    "$COLMAP_SUPPORT_INSTALL" \
+    "$CERES_INSTALL" \
+    "$OPENIMAGEIO_INSTALL" <<'PY'
+import hashlib
+import json
+import os
+import stat
+import sys
+from pathlib import Path
+
+colmap, support, ceres, openimageio = map(Path, sys.argv[1:])
+
+
+def sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for block in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def load_receipt(root: Path, name: str) -> dict:
+    path = root / "build_info.json"
+    if path.is_symlink() or not path.is_file():
+        raise SystemExit(f"{name} receipt is missing or unsafe: {path}")
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(payload, dict) or payload.get("toolchain_name") != name:
+        raise SystemExit(f"unexpected toolchain_name in {path}")
+    return payload
+
+
+def library_hashes(root: Path, receipt: dict) -> dict[str, str]:
+    declared: dict[str, str] = {}
+    for entry in receipt.get("libraries", []):
+        declared[f"lib/{entry['file']}"] = entry["sha256"]
+    for raw_path, digest in receipt.get("library_sha256", {}).items():
+        relative = raw_path if "/" in raw_path else f"lib/{raw_path}"
+        declared[relative] = digest
+    if not declared:
+        raise SystemExit(f"dependency receipt has no library hashes: {root}")
+    for relative, expected in declared.items():
+        if relative.startswith("/") or ".." in Path(relative).parts:
+            raise SystemExit(f"unsafe library path in receipt: {relative}")
+        path = root / relative
+        if path.is_symlink() or not path.is_file() or sha256(path) != expected:
+            raise SystemExit(f"dependency library hash mismatch: {path}")
+    return dict(sorted(declared.items()))
+
+
+def prefix_tree_sha256(root: Path) -> str:
+    if root.is_symlink() or not root.is_dir():
+        raise SystemExit(f"dependency prefix is missing or unsafe: {root}")
+    digest = hashlib.sha256()
+    paths = [root, *sorted(
+        root.rglob("*"), key=lambda path: path.relative_to(root).as_posix()
+    )]
+    for path in paths:
+        relative = "." if path == root else path.relative_to(root).as_posix()
+        metadata = path.lstat()
+        if (metadata.st_uid, metadata.st_gid) != (os.getuid(), os.getgid()):
+            raise SystemExit(f"dependency has noncanonical ownership: {relative}")
+        if relative == "build_info.json":
+            continue
+        if stat.S_ISDIR(metadata.st_mode):
+            kind, content = "directory", ""
+        elif stat.S_ISREG(metadata.st_mode):
+            kind, content = "file", sha256(path)
+        else:
+            raise SystemExit(f"dependency has an unsupported entry: {relative}")
+        for value in (
+            relative,
+            kind,
+            f"{stat.S_IMODE(metadata.st_mode):o}",
+            str(metadata.st_mtime_ns),
+            content,
+        ):
+            digest.update(value.encode())
+            digest.update(b"\0")
+    return digest.hexdigest()
+
+
+colmap_receipt = load_receipt(colmap, "colmap")
+dependency_roots = {
+    "colmap-support": support,
+    "ceres": ceres,
+    "openimageio": openimageio,
+}
+dependency_receipts = {
+    name: load_receipt(root, expected)
+    for name, root, expected in (
+        ("colmap-support", support, "colmap-support"),
+        ("ceres", ceres, "ceres-static"),
+        ("openimageio", openimageio, "openimageio-static"),
+    )
+}
+for name, receipt in dependency_receipts.items():
+    if receipt.get("architecture") != "arm64" or receipt.get("deployment_target") != "macOS 15.0":
+        raise SystemExit(f"{name} receipt does not describe the arm64 macOS 15 build")
+    if receipt.get("ownership_policy") != "invoking-build-user-and-primary-group":
+        raise SystemExit(f"{name} receipt has an unsupported ownership policy")
+    if "normalized_owner_uid" in receipt or "normalized_owner_gid" in receipt:
+        raise SystemExit(f"{name} receipt contains host-specific numeric ownership")
+
+binary = colmap / "bin/colmap"
+if binary.is_symlink() or not binary.is_file():
+    raise SystemExit("native COLMAP executable is missing or unsafe")
+if colmap_receipt.get("schema_version") != 2:
+    raise SystemExit("native COLMAP receipt schema is not 2")
+if colmap_receipt.get("executable_sha256") != sha256(binary):
+    raise SystemExit("native COLMAP executable does not match its receipt")
+expected_commands = [
+    "feature_extractor", "matches_importer", "local_vocab_retriever", "mapper",
+    "point_triangulator", "bundle_adjuster", "model_analyzer",
+    "image_undistorter", "model_converter",
+]
+if colmap_receipt.get("enabled_capabilities") != expected_commands:
+    raise SystemExit("native COLMAP receipt does not declare the exact nine-command surface")
+options = colmap_receipt.get("build_options", {})
+if options.get("architecture") != "arm64" or options.get("deployment_target") != "15.0":
+    raise SystemExit("native COLMAP receipt has the wrong architecture or deployment target")
+if options.get("gpu") is not False or options.get("mvs") is not False:
+    raise SystemExit("native COLMAP receipt enables an unapproved GPU or MVS surface")
+
+inputs = colmap_receipt.get("build_inputs", {})
+expected_receipt_hashes = {
+    name: sha256(root / "build_info.json")
+    for name, root in dependency_roots.items()
+}
+if inputs.get("dependency_receipt_sha256") != expected_receipt_hashes:
+    raise SystemExit("native COLMAP dependency receipt hashes do not match the installed receipts")
+expected_library_hashes = {
+    name: library_hashes(dependency_roots[name], dependency_receipts[name])
+    for name in sorted(dependency_roots)
+}
+if inputs.get("dependency_library_sha256") != expected_library_hashes:
+    raise SystemExit("native COLMAP dependency library hashes do not match the installed libraries")
+expected_tree_hashes = {
+    "ceres": prefix_tree_sha256(ceres),
+    "colmap-support": prefix_tree_sha256(support),
+    "openimageio": prefix_tree_sha256(openimageio),
+}
+if inputs.get("dependency_tree_sha256") != expected_tree_hashes:
+    raise SystemExit("native COLMAP dependency trees do not match the reviewed receipt")
+
+for root, receipt in ((support, dependency_receipts["colmap-support"]),
+                      (ceres, dependency_receipts["ceres"]),
+                      (openimageio, dependency_receipts["openimageio"])):
+    for dependency in receipt.get("dependencies", {}).values():
+        for relative in dependency.get("license_files", []):
+            path = root / relative
+            if path.is_symlink() or not path.is_file() or path.stat().st_size == 0:
+                raise SystemExit(f"dependency license is missing or unsafe: {path}")
+PY
+}
+
+validate_da3_receipt() {
+  python3 - "$DA3_MPS_INSTALL/da3_mps" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+root = Path(sys.argv[1])
+receipt_path = root / "build_info.json"
+if receipt_path.is_symlink() or not receipt_path.is_file():
+    raise SystemExit("DA3 build_info.json is missing or unsafe")
+payload = json.loads(receipt_path.read_text(encoding="utf-8"))
+required = {
+    "toolchain_name", "source_path", "python_version", "torch_version",
+    "torchvision_version",
+}
+if payload.get("toolchain_name") != "da3_mps":
+    raise SystemExit("DA3 build_info.json has the wrong toolchain_name")
+missing = sorted(key for key in required if not payload.get(key))
+if missing:
+    raise SystemExit(f"DA3 build_info.json is missing required keys: {', '.join(missing)}")
+if payload.get("source_provenance") != "pinned-git":
+    raise SystemExit("DA3 build_info.json must record pinned-git source provenance")
+PY
+}
+
+require_colmap_options() {
+  local command="$1"
+  shift
+  local help_output option
+  help_output="$("$BIN/colmap" "$command" -h 2>&1)" || \
+    die "Native COLMAP command failed to launch: $command"
+  for option in "$@"; do
+    printf '%s\n' "$help_output" | \
+      awk -v required="--$option" '$1 == required { found = 1 } END { exit found ? 0 : 1 }' || \
+      die "Native COLMAP $command is missing required option --$option"
+  done
+}
+
+validate_native_colmap_cli() {
+  local command actual expected
+  expected="$(printf '%s\n' \
+    help version \
+    feature_extractor matches_importer local_vocab_retriever mapper \
+    point_triangulator bundle_adjuster model_analyzer image_undistorter model_converter | \
+    LC_ALL=C sort)"
+  actual="$("$BIN/colmap" help 2>&1 | awk '
+    $0 == "Available commands:" { in_commands = 1; next }
+    in_commands && NF == 1 { print $1 }
+  ' | LC_ALL=C sort)"
+  [ "$actual" = "$expected" ] || {
+    echo "Native COLMAP does not expose the exact reviewed command surface." >&2
+    printf 'Expected:\n%s\nActual:\n%s\n' "$expected" "$actual" >&2
+    exit 1
+  }
+  for command in \
+    feature_extractor matches_importer local_vocab_retriever mapper \
+    point_triangulator bundle_adjuster model_analyzer image_undistorter model_converter; do
+    "$BIN/colmap" "$command" -h >/dev/null 2>&1 || \
+      die "Native COLMAP command failed to launch: $command"
+  done
+  require_colmap_options feature_extractor \
+    database_path image_path ImageReader.single_camera ImageReader.camera_model \
+    FeatureExtraction.max_image_size FeatureExtraction.use_gpu \
+    FeatureExtraction.num_threads SiftExtraction.max_num_features
+  require_colmap_options matches_importer \
+    database_path match_list_path match_type FeatureMatching.use_gpu \
+    FeatureMatching.num_threads FeatureMatching.max_num_matches \
+    SiftMatching.cpu_brute_force_matcher
+  require_colmap_options local_vocab_retriever \
+    database_path output_pair_list_path query_image_list_path excluded_pair_list_path \
+    num_images returned_neighbor_count minimum_frame_separation num_visual_words \
+    max_features_per_image max_training_descriptors num_iterations num_rounds \
+    num_checks num_threads
+  require_colmap_options mapper \
+    database_path image_path output_path Mapper.ba_global_frames_ratio \
+    Mapper.ba_global_points_ratio Mapper.ba_local_max_refinements \
+    Mapper.ba_global_max_refinements Mapper.ba_global_max_num_iterations \
+    Mapper.ba_local_max_num_iterations Mapper.ba_local_function_tolerance \
+    Mapper.ba_global_function_tolerance Mapper.ba_local_num_images Mapper.random_seed \
+    Mapper.min_num_matches Mapper.ba_refine_focal_length
+  require_colmap_options point_triangulator database_path image_path input_path output_path
+  require_colmap_options bundle_adjuster \
+    input_path output_path BundleAdjustment.refine_focal_length \
+    BundleAdjustment.refine_principal_point BundleAdjustment.refine_extra_params \
+    BundleAdjustmentCeres.max_num_iterations
+  require_colmap_options model_analyzer path
+  require_colmap_options image_undistorter \
+    image_path input_path output_path output_type copy_policy max_image_size
+  require_colmap_options model_converter input_path output_path output_type
 }
 
 find_macho_files() {
@@ -233,46 +473,26 @@ from pathlib import Path
 
 root = Path(sys.argv[1])
 magics = {
-    b"\xca\xfe\xba\xbe",
-    b"\xbe\xba\xfe\xca",
-    b"\xca\xfe\xba\xbf",
-    b"\xbf\xba\xfe\xca",
-    b"\xcf\xfa\xed\xfe",
-    b"\xfe\xed\xfa\xcf",
-    b"\xce\xfa\xed\xfe",
-    b"\xfe\xed\xfa\xce",
+    b"\xca\xfe\xba\xbe", b"\xbe\xba\xfe\xca", b"\xca\xfe\xba\xbf",
+    b"\xbf\xba\xfe\xca", b"\xcf\xfa\xed\xfe", b"\xfe\xed\xfa\xcf",
+    b"\xce\xfa\xed\xfe", b"\xfe\xed\xfa\xce",
 }
 for path in root.rglob("*"):
     if path.is_symlink() or not path.is_file():
         continue
-    try:
-        with path.open("rb") as stream:
-            is_macho = stream.read(4) in magics
-    except OSError as exc:
-        raise SystemExit(f"Could not inspect packaged file {path}: {exc}") from exc
-    if is_macho:
-        sys.stdout.buffer.write(os.fsencode(path) + b"\0")
+    with path.open("rb") as stream:
+        if stream.read(4) in magics:
+            sys.stdout.buffer.write(os.fsencode(path) + b"\0")
 PY
 }
 
-validate_packaged_architectures() {
-  local file
-  local relative
+validate_packaged_native_files() {
+  local file relative dependency install_id
   while IFS= read -r -d '' file; do
     relative="${file#"$OUT"/}"
     require_arm64_only_macho "Packaged native file $relative" "$file"
-  done < <(find_macho_files)
-}
-
-otool_dependency_names() {
-  otool -L "$1" | awk 'NR > 1 { print $1 }'
-}
-
-validate_portable_dependencies() {
-  local file
-  local dependency
-  local install_id
-  while IFS= read -r -d '' file; do
+    /usr/bin/codesign --verify --strict "$file" || \
+      die "Packaged Mach-O has no valid embedded signature: $relative"
     install_id="$(otool -D "$file" 2>/dev/null | awk 'NR == 2 { print; exit }' || true)"
     while IFS= read -r dependency; do
       [ -n "$dependency" ] || continue
@@ -281,328 +501,153 @@ validate_portable_dependencies() {
         continue
       fi
       case "$dependency" in
-        @loader_path/*|@executable_path/*|@rpath/*)
-          ;;
-        *)
-          echo "Unportable dependency in ${file#"$OUT"/}: $dependency" >&2
-          exit 1
-          ;;
+        @loader_path/*|@executable_path/*|@rpath/*) ;;
+        *) die "Unportable dependency in $relative: $dependency" ;;
       esac
     done < <(otool_dependency_names "$file")
   done < <(find_macho_files)
 }
 
-verify_packaged_signatures() {
-  local file
-  while IFS= read -r -d '' file; do
-    /usr/bin/codesign --verify --strict "$file" || {
-      echo "Packaged Mach-O has no valid embedded signature: ${file#"$OUT"/}" >&2
-      exit 1
-    }
-  done < <(find_macho_files)
-}
+require_committed_packaging_sources
+for path in \
+  "$COLMAP_INSTALL/bin/colmap" \
+  "$COLMAP_INSTALL/build_info.json" \
+  "$COLMAP_SUPPORT_INSTALL/lib/libomp.dylib" \
+  "$COLMAP_SUPPORT_INSTALL/build_info.json" \
+  "$CERES_INSTALL/build_info.json" \
+  "$OPENIMAGEIO_INSTALL/build_info.json"; do
+  require_regular_file "$path"
+done
+validate_native_receipts
 
-write_colmap_provenance() {
-  local repository_revision
-  repository_revision="$(git -C "$ROOT" rev-parse HEAD)"
-  python3 - \
-    "$OUT/da3_mps/licenses/python-packages-install-report.json" \
-    "$OUT/da3_mps/build_info.json" \
-    "$BIN/colmap" \
-    "$PROVENANCE/colmap.json" \
-    "$repository_revision" <<'PY'
-import hashlib
-import json
-import re
-import sys
-from pathlib import Path
+rm -rf "$OUT"
+mkdir -p "$BIN" "$LIB" "$LICENSES" "$PROVENANCE" "$SUPPLY_CHAIN"
 
-report_path = Path(sys.argv[1])
-build_info_path = Path(sys.argv[2])
-executable_path = Path(sys.argv[3])
-receipt_path = Path(sys.argv[4])
-repository_revision = sys.argv[5]
+install -m 0755 "$COLMAP_INSTALL/bin/colmap" "$BIN/colmap"
+install -m 0755 "$COLMAP_SUPPORT_INSTALL/lib/libomp.dylib" "$LIB/libomp.dylib"
+install -m 0644 "$COLMAP_INSTALL/build_info.json" "$PROVENANCE/colmap.json"
+install -m 0644 "$COLMAP_SUPPORT_INSTALL/build_info.json" "$PROVENANCE/colmap-support.json"
+install -m 0644 "$CERES_INSTALL/build_info.json" "$PROVENANCE/ceres.json"
+install -m 0644 "$OPENIMAGEIO_INSTALL/build_info.json" "$PROVENANCE/openimageio.json"
 
-report = json.loads(report_path.read_text(encoding="utf-8"))
-matches = [
-    entry
-    for entry in report.get("install", [])
-    if re.sub(r"[-_.]+", "-", str(entry.get("metadata", {}).get("name") or "")).lower()
-    == "pycolmap"
-]
-if len(matches) != 1:
-    raise SystemExit("pip install report must contain exactly one PyCOLMAP artifact")
-entry = matches[0]
-metadata = entry.get("metadata", {})
-download = entry.get("download_info", {})
-archive = download.get("archive_info", {})
-artifact_sha256 = str(archive.get("hashes", {}).get("sha256") or "")
-if not artifact_sha256:
-    raw_hash = str(archive.get("hash") or "")
-    if raw_hash.startswith("sha256="):
-        artifact_sha256 = raw_hash.removeprefix("sha256=")
-
-expected_version = "4.1.0"
-expected_sha256 = "f31c0584d6c85ad5192fb224a9ec1a2413c6af405bc558ca38e9017eb510967f"
-artifact_url = str(download.get("url") or "")
-if metadata.get("version") != expected_version or artifact_sha256 != expected_sha256:
-    raise SystemExit(
-        f"packaged PyCOLMAP is not the reviewed {expected_version} arm64 wheel"
-    )
-if metadata.get("license") != "BSD-3-Clause" or not artifact_url.startswith("https://"):
-    raise SystemExit("PyCOLMAP license or artifact provenance is incomplete")
-
-build_info = json.loads(build_info_path.read_text(encoding="utf-8"))
-python_version = str(build_info.get("python_version") or "")
-if not python_version:
-    raise SystemExit("DA3 build receipt does not identify the bundled Python runtime")
-
-receipt = {
-    "toolchain_name": "colmap",
-    "source_url": "https://github.com/colmap/colmap",
-    "source_repo": "https://github.com/colmap/colmap",
-    "source_version": expected_version,
-    "source_commit": "fa8e3b3ff591552855f8ad2806723c80f963f69c",
-    "license": "BSD-3-Clause",
-    "backend": "pycolmap",
-    "runtime": "bundled-python",
-    "runtime_version": python_version,
-    "artifact_url": artifact_url,
-    "artifact_sha256": artifact_sha256,
-    "bridge_source_url": "https://github.com/dud8/EasySplat",
-    "bridge_revision": repository_revision,
-    "bridge_source": build_info.get("colmap_bridge_source"),
-    "bridge_source_sha256": build_info.get("colmap_bridge_source_sha256"),
-    "supplemental_license_manifest_sha256": build_info.get(
-        "supplemental_license_manifest_sha256"
-    ),
-    "executable_sha256": hashlib.sha256(executable_path.read_bytes()).hexdigest(),
-}
-receipt_path.write_text(
-    json.dumps(receipt, indent=2, sort_keys=True) + "\n",
-    encoding="utf-8",
-)
-PY
-}
-
+cp -R "$COLMAP_INSTALL/licenses/COLMAP" "$LICENSES/COLMAP"
+cp -R "$COLMAP_SUPPORT_INSTALL/licenses/COLMAPSupport" "$LICENSES/COLMAPSupport"
+cp -R "$CERES_INSTALL/licenses/Ceres" "$LICENSES/Ceres"
+cp -R "$CERES_INSTALL/licenses/Eigen" "$LICENSES/Eigen"
+cp -R "$OPENIMAGEIO_INSTALL/licenses/OpenImageIO" "$LICENSES/OpenImageIO"
 mkdir -p "$LICENSES/EasySplat"
 install -m 0644 "$ROOT/LICENSE" "$LICENSES/EasySplat/LICENSE"
 
+require_arm64_only_macho "Native COLMAP" "$BIN/colmap"
+require_macos_15_binary "Native COLMAP" "$BIN/colmap"
+require_adhoc_signature "Native COLMAP" "$BIN/colmap"
+validate_native_colmap_linkage "$BIN/colmap"
+require_arm64_only_macho "Packaged libomp" "$LIB/libomp.dylib"
+require_macos_15_binary "Packaged libomp" "$LIB/libomp.dylib"
+require_adhoc_signature "Packaged libomp" "$LIB/libomp.dylib"
+validate_libomp_linkage "$LIB/libomp.dylib"
+
+python3 - "$PROVENANCE/colmap.json" "$BIN/colmap" "$PROVENANCE/colmap-support.json" "$LIB/libomp.dylib" <<'PY'
+import hashlib
+import json
+import sys
+from pathlib import Path
+
+colmap_receipt, colmap_binary, support_receipt, libomp = map(Path, sys.argv[1:])
+sha = lambda path: hashlib.sha256(path.read_bytes()).hexdigest()
+if json.loads(colmap_receipt.read_text())["executable_sha256"] != sha(colmap_binary):
+    raise SystemExit("packaged native COLMAP hash differs from its receipt")
+support = json.loads(support_receipt.read_text())
+if support["library_sha256"].get("lib/libomp.dylib") != sha(libomp):
+    raise SystemExit("packaged libomp hash differs from its receipt")
+PY
+
+validate_native_colmap_cli
+
 "$MSPLAT_VALIDATOR" --source "$MSPLAT_INSTALL/msplat"
 mkdir -p "$OUT/msplat"
-cp "$MSPLAT_INSTALL/msplat/bin/easysplat-train" "$BIN/easysplat-train"
-cp "$MSPLAT_INSTALL/msplat/bin/default.metallib" "$BIN/default.metallib"
-cp "$MSPLAT_INSTALL/msplat/build_info.json" "$OUT/msplat/build_info.json"
-cp "$MSPLAT_INSTALL/msplat/LICENSE" "$OUT/msplat/LICENSE"
-
+install -m 0755 "$MSPLAT_INSTALL/msplat/bin/easysplat-train" "$BIN/easysplat-train"
+install -m 0644 "$MSPLAT_INSTALL/msplat/bin/default.metallib" "$BIN/default.metallib"
+install -m 0644 "$MSPLAT_INSTALL/msplat/build_info.json" "$OUT/msplat/build_info.json"
+install -m 0644 "$MSPLAT_INSTALL/msplat/LICENSE" "$OUT/msplat/LICENSE"
 MSPLAT_DEPS="$ROOT/Toolchains/build/msplat/dependencies"
 mkdir -p "$LICENSES/msplat/CLI11" "$LICENSES/msplat/nanoflann" "$LICENSES/msplat/nlohmann-json"
 install -m 0644 "$MSPLAT_DEPS/CLI11-2.4.2/LICENSE" "$LICENSES/msplat/CLI11/LICENSE"
 install -m 0644 "$MSPLAT_DEPS/nanoflann-1.5.5/COPYING" "$LICENSES/msplat/nanoflann/COPYING"
 install -m 0644 "$MSPLAT_DEPS/nlohmann-json-3.11.3/LICENSE.MIT" "$LICENSES/msplat/nlohmann-json/LICENSE.MIT"
 
-chmod +x "$BIN/easysplat-train"
-
-if [ ! -d "$DA3_MPS_INSTALL/da3_mps" ]; then
-  echo "da3_mps bundle not found at $DA3_MPS_INSTALL/da3_mps. Build it before packaging." >&2
-  exit 1
-fi
-if [ ! -x "$DA3_MPS_INSTALL/da3_mps/bin/easysplat_da3_sfm" ]; then
-  echo "da3_mps bundle missing bin/easysplat_da3_sfm. Rebuild da3_mps." >&2
-  exit 1
-fi
-if [ ! -x "$DA3_MPS_INSTALL/da3_mps/bin/easysplat_colmap" ]; then
-  echo "da3_mps bundle missing bin/easysplat_colmap. Rebuild da3_mps." >&2
-  exit 1
-fi
-if [ ! -x "$DA3_MPS_INSTALL/da3_mps/python/bin/python3" ]; then
-  echo "da3_mps bundle missing python/bin/python3. Rebuild da3_mps." >&2
-  exit 1
-fi
-if [ ! -f "$DA3_MPS_INSTALL/da3_mps/build_info.json" ]; then
-  echo "da3_mps bundle missing build_info.json. Rebuild da3_mps." >&2
-  exit 1
-fi
-if [ ! -f "$DA3_MPS_INSTALL/da3_mps/app/easysplat_da3_sfm/run.py" ]; then
-  echo "da3_mps bundle missing app/easysplat_da3_sfm/run.py. Rebuild da3_mps." >&2
-  exit 1
-fi
-if [ ! -f "$DA3_MPS_INSTALL/da3_mps/app/easysplat_da3_sfm/colmap_cli.py" ]; then
-  echo "da3_mps bundle missing app/easysplat_da3_sfm/colmap_cli.py. Rebuild da3_mps." >&2
-  exit 1
-fi
-DA3_PY_BIN="$DA3_MPS_INSTALL/da3_mps/python/bin/python3"
-require_bundled_arm64_python "da3_mps" "$DA3_PY_BIN"
-validate_build_info \
-  "$DA3_PY_BIN" \
-  "$DA3_MPS_INSTALL/da3_mps/build_info.json" \
-  "da3_mps" \
-  "$DA3_MPS_INSTALL/da3_mps/bin/easysplat_colmap"
-if [ ! -d "$DA3_MPS_INSTALL/da3_mps/models" ]; then
-  echo "da3_mps bundle missing models/. Rebuild da3_mps." >&2
-  exit 1
-fi
-for model in DA3-BASE DA3-SMALL; do
-  if [ ! -f "$DA3_MPS_INSTALL/da3_mps/models/$model/model.safetensors" ]; then
-    echo "da3_mps bundle missing models/$model/model.safetensors. Rebuild da3_mps." >&2
-    exit 1
-  fi
-  if [ ! -f "$DA3_MPS_INSTALL/da3_mps/models/$model/config.json" ]; then
-    echo "da3_mps bundle missing models/$model/config.json. Rebuild da3_mps." >&2
-    exit 1
-  fi
-  if [ ! -f "$DA3_MPS_INSTALL/da3_mps/models/$model/easysplat_model_info.json" ]; then
-    echo "da3_mps bundle missing models/$model/easysplat_model_info.json. Rebuild da3_mps." >&2
-    exit 1
-  fi
-  assert_exact_da3_model_payload "$DA3_MPS_INSTALL/da3_mps/models/$model"
+DA3_ROOT="$DA3_MPS_INSTALL/da3_mps"
+python3 "$DA3_PAYLOAD_VALIDATOR" --root "$DA3_ROOT"
+for path in \
+  "$DA3_ROOT/bin/easysplat_da3_sfm" \
+  "$DA3_ROOT/python/bin/python3" \
+  "$DA3_ROOT/build_info.json" \
+  "$DA3_ROOT/app/easysplat_da3_sfm/run.py" \
+  "$DA3_ROOT/vendor/depth-anything-3/src/depth_anything_3/api.py"; do
+  require_regular_file "$path"
 done
-if [ ! -f "$DA3_MPS_INSTALL/da3_mps/vendor/depth-anything-3/src/depth_anything_3/api.py" ]; then
-  echo "da3_mps bundle missing vendor/depth-anything-3. Rebuild da3_mps." >&2
-  exit 1
-fi
-cp -R "$DA3_MPS_INSTALL/da3_mps" "$OUT/da3_mps"
+[ -d "$DA3_ROOT/licenses" ] || die "DA3 bundle is missing its license closure."
+validate_da3_receipt
+for model in DA3-BASE DA3-SMALL; do
+  assert_exact_da3_model_payload "$DA3_ROOT/models/$model"
+done
+mkdir -p "$OUT/da3_mps/models"
+cp -R "$DA3_ROOT/bin" "$OUT/da3_mps/bin"
+cp -R "$DA3_ROOT/python" "$OUT/da3_mps/python"
+cp -R "$DA3_ROOT/app" "$OUT/da3_mps/app"
+cp -R "$DA3_ROOT/vendor" "$OUT/da3_mps/vendor"
+cp -R "$DA3_ROOT/licenses" "$OUT/da3_mps/licenses"
+cp -R "$DA3_ROOT/models/DA3-BASE" "$OUT/da3_mps/models/DA3-BASE"
+cp -R "$DA3_ROOT/models/DA3-SMALL" "$OUT/da3_mps/models/DA3-SMALL"
+install -m 0644 "$DA3_ROOT/build_info.json" "$OUT/da3_mps/build_info.json"
 find "$OUT/da3_mps/python" -type f -name '*.pyc' -delete
 find "$OUT/da3_mps/python" -type d -name '__pycache__' -empty -delete
-install -m 0755 "$OUT/da3_mps/bin/easysplat_colmap" "$BIN/colmap"
+python3 "$DA3_PAYLOAD_VALIDATOR" --root "$OUT/da3_mps"
 
-if ! command -v otool >/dev/null 2>&1; then
-  echo "otool not found; cannot validate toolchain binary dependencies." >&2
-  exit 1
-fi
-if [ ! -x /usr/bin/codesign ]; then
-  echo "codesign not found; cannot verify the packaged Mach-O closure." >&2
-  exit 1
-fi
-
-validate_packaged_architectures
-validate_portable_dependencies
-verify_packaged_signatures
-write_colmap_provenance
-
-PYTHONNOUSERSITE=1 PYTHONDONTWRITEBYTECODE=1 \
-  PYTHONPATH="$OUT/da3_mps/app" \
-  "$OUT/da3_mps/python/bin/python3" - <<'PY'
-import pycolmap
-
-if pycolmap.__version__ != "4.1.0":
-    raise SystemExit(f"unexpected PyCOLMAP version: {pycolmap.__version__}")
-if not callable(getattr(pycolmap, "match_image_pairs", None)):
-    raise SystemExit("packaged PyCOLMAP is missing native imported-pair matching")
-PY
-
-EASYSPLAT_REQUIRE_REAL_PYCOLMAP=1 \
-  PYTHONNOUSERSITE=1 \
-  PYTHONDONTWRITEBYTECODE=1 \
-  PYTHONPATH="$OUT/da3_mps/app" \
-  "$OUT/da3_mps/python/bin/python3" \
-  "$ROOT/Tools/Da3Sfm/tests/test_colmap_cli.py" \
-  ColmapCliTests.test_real_pycolmap_local_vocab_retrieval_is_deterministic \
-  ColmapCliTests.test_real_pycolmap_feature_extraction_uses_reviewed_signature
-
-colmap_root_help="$("$BIN/colmap" -h 2>&1)" || {
-  echo "colmap bridge failed to launch" >&2
-  exit 1
-}
-if ! printf '%s\n' "$colmap_root_help" | awk '$1 == "pycolmap" && $2 == "4.1.0" { found = 1 } END { exit found ? 0 : 1 }'; then
-  echo "colmap bridge does not declare the reviewed PyCOLMAP 4.1.0 runtime" >&2
-  exit 1
-fi
-colmap_self_check="$("$BIN/colmap" --self-check)" || {
-  echo "colmap bridge runtime self-check failed" >&2
-  exit 1
-}
-"$OUT/da3_mps/python/bin/python3" - "$colmap_self_check" <<'PY'
-import json
-import sys
-
-expected = {
-    "runtime": "pycolmap",
-    "runtime_version": "4.1.0",
-    "schema_version": 1,
-    "status": "ok",
-}
-try:
-    payload = json.loads(sys.argv[1])
-except (IndexError, json.JSONDecodeError) as exc:
-    raise SystemExit(f"invalid COLMAP runtime self-check JSON: {exc}") from exc
-if payload != expected:
-    raise SystemExit(f"unexpected COLMAP runtime self-check: {payload!r}")
-PY
-
-require_colmap_options() {
-  local command="$1"
-  shift
-  local help_output option
-  help_output="$("$BIN/colmap" "$command" -h 2>&1)" || {
-    echo "colmap bridge missing $command" >&2
-    exit 1
-  }
-  for option in "$@"; do
-    if ! printf '%s\n' "$help_output" | awk -v required="--$option" '$1 == required { found = 1 } END { exit found ? 0 : 1 }'; then
-      echo "colmap $command is missing required option --$option" >&2
-      exit 1
-    fi
-  done
-}
-
-"$BIN/colmap" feature_extractor -h >/dev/null 2>&1 || { echo "colmap bridge missing feature_extractor" >&2; exit 1; }
-"$BIN/colmap" matches_importer -h >/dev/null 2>&1 || { echo "colmap bridge missing matches_importer" >&2; exit 1; }
-"$BIN/colmap" mapper -h >/dev/null 2>&1 || { echo "colmap bridge missing mapper" >&2; exit 1; }
-"$BIN/colmap" local_vocab_retriever -h >/dev/null 2>&1 || { echo "colmap bridge missing local_vocab_retriever" >&2; exit 1; }
-"$BIN/colmap" point_triangulator -h >/dev/null 2>&1 || { echo "colmap bridge missing point_triangulator" >&2; exit 1; }
-"$BIN/colmap" bundle_adjuster -h >/dev/null 2>&1 || { echo "colmap bridge missing bundle_adjuster" >&2; exit 1; }
-"$BIN/colmap" model_analyzer -h >/dev/null 2>&1 || { echo "colmap bridge missing model_analyzer" >&2; exit 1; }
-"$BIN/colmap" image_undistorter -h >/dev/null 2>&1 || { echo "colmap missing working image_undistorter command" >&2; exit 1; }
-"$BIN/colmap" model_converter -h >/dev/null 2>&1 || { echo "colmap bridge missing model_converter" >&2; exit 1; }
-
-require_colmap_options mapper \
-  database_path image_path output_path \
-  Mapper.ba_global_frames_ratio Mapper.ba_global_points_ratio \
-  Mapper.ba_local_max_refinements \
-  Mapper.ba_global_max_refinements Mapper.ba_global_max_num_iterations \
-  Mapper.ba_local_max_num_iterations Mapper.ba_local_function_tolerance \
-  Mapper.ba_global_function_tolerance Mapper.ba_local_num_images \
-  Mapper.random_seed Mapper.ba_refine_focal_length
-require_colmap_options local_vocab_retriever \
-  database_path output_pair_list_path query_image_list_path excluded_pair_list_path \
-  num_images returned_neighbor_count minimum_frame_separation num_visual_words \
-  max_features_per_image max_training_descriptors num_iterations num_rounds \
-  num_checks num_threads
-
+validate_packaged_native_files
 "$MSPLAT_VALIDATOR" --packaged "$OUT"
 
-if [ ! -x "$SUPPLY_CHAIN_GENERATOR" ]; then
-  echo "Supply-chain manifest generator is missing or not executable: $SUPPLY_CHAIN_GENERATOR" >&2
-  exit 1
-fi
-"$SUPPLY_CHAIN_GENERATOR" \
-  --toolchain-root "$OUT" \
-  --version "$VERSION"
+[ -x "$SUPPLY_CHAIN_GENERATOR" ] || \
+  die "Supply-chain manifest generator is missing or not executable: $SUPPLY_CHAIN_GENERATOR"
+"$SUPPLY_CHAIN_GENERATOR" --toolchain-root "$OUT" --version "$VERSION"
 
 for forbidden in AGPL CGAL LSD SPQR SiftGPU da3_streaming salad; do
   if find "$OUT" -mindepth 1 -print | \
     grep -Ei "(^|/)${forbidden}([^/]*)(/|$)" >/dev/null; then
-    echo "Forbidden release payload entry matched ${forbidden}." >&2
-    exit 1
+    die "Forbidden release payload entry matched ${forbidden}."
   fi
 done
 
-pushd "$OUT" >/dev/null
-zip -q -r -D -X "$CORE_ZIP" \
-  bin \
-  licenses provenance supply-chain/components.json \
-  msplat/build_info.json msplat/LICENSE \
-  da3_mps/bin da3_mps/python da3_mps/app da3_mps/vendor da3_mps/licenses da3_mps/build_info.json
-zip -q -r -D -X "$DA3_BASE_ZIP" da3_mps/models/DA3-BASE
-zip -q -r -D -X "$DA3_SMALL_ZIP" da3_mps/models/DA3-SMALL
-popd >/dev/null
+python3 "$REPRODUCIBLE_ZIP" \
+  --root "$OUT" \
+  --output "$CORE_ZIP" \
+  --path "bin" \
+  --path "lib" \
+  --path "licenses" \
+  --path "provenance" \
+  --path "supply-chain/components.json" \
+  --path "msplat/build_info.json" \
+  --path "msplat/LICENSE"
+python3 "$REPRODUCIBLE_ZIP" \
+  --root "$OUT" \
+  --output "$DA3_BASE_ZIP" \
+  --path "da3_mps/bin" \
+  --path "da3_mps/python" \
+  --path "da3_mps/app" \
+  --path "da3_mps/vendor" \
+  --path "da3_mps/licenses" \
+  --path "da3_mps/build_info.json" \
+  --path "da3_mps/models/DA3-BASE"
+python3 "$REPRODUCIBLE_ZIP" \
+  --root "$OUT" \
+  --output "$DA3_SMALL_ZIP" \
+  --path "da3_mps/models/DA3-SMALL"
 
 assert_release_asset_size "$CORE_ZIP"
 assert_release_asset_size "$DA3_BASE_ZIP"
 assert_release_asset_size "$DA3_SMALL_ZIP"
-assert_normal_photo_install_size "$CORE_ZIP" "$DA3_BASE_ZIP" "$DA3_SMALL_ZIP"
+assert_download_closure_size "$CORE_ZIP" "$DA3_BASE_ZIP" "$DA3_SMALL_ZIP"
 
 echo "Packaged toolchain (core): $CORE_ZIP"
-echo "Packaged component (DA3-BASE): $DA3_BASE_ZIP"
-echo "Packaged component (DA3-SMALL): $DA3_SMALL_ZIP"
+echo "Packaged optional component (DA3 runtime + BASE): $DA3_BASE_ZIP"
+echo "Packaged optional component (DA3-SMALL): $DA3_SMALL_ZIP"

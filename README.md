@@ -138,7 +138,7 @@ The release toolchain is split into signed capabilities:
 - `geometry-da3-base`
 - `geometry-da3-small`
 
-Normal runs install only the capabilities they need. The automatic route does not download DA3 weight components; the shared core still contains the Python runtime used by the stripped COLMAP bridge.
+Normal runs install only the capabilities they need. The automatic route uses native COLMAP from the core component and does not download DA3 or its Python runtime. The optional Base component carries the DA3 runtime; Small adds only the fallback weights.
 
 See [ONBOARDING.md](ONBOARDING.md) for maintainer architecture and [CONTRIBUTING.md](CONTRIBUTING.md) for change rules.
 

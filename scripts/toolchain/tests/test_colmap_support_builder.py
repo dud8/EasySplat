@@ -12,10 +12,13 @@ import re
 import shutil
 import stat
 import subprocess
+import sys
 import tarfile
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
+from unittest import mock
 
 
 ROOT = Path(__file__).resolve().parents[3]
@@ -27,6 +30,7 @@ EXTRACTOR = ROOT / "scripts" / "toolchain" / "safe_extract_source.py"
 PROMOTER = ROOT / "scripts" / "toolchain" / "atomic_swap_install.py"
 RELEASE_TEST = ROOT / "scripts" / "ci" / "test_release_scripts.sh"
 PACKAGE_TOOLCHAIN = ROOT / "scripts" / "toolchain" / "package_toolchain.sh"
+REPRODUCIBLE_ZIP = ROOT / "scripts" / "toolchain" / "create_reproducible_zip.py"
 DEFAULT_INSTALL = ROOT / "Toolchains" / "build" / "colmap-support" / "install"
 NORMALIZED_MTIME_EPOCH = 946684800
 DEPENDENCIES = ("boost", "gflags", "glog", "libomp")
@@ -76,7 +80,10 @@ def sha256(path: Path) -> str:
 
 def install_tree_digest(root: Path) -> str:
     digest = hashlib.sha256()
-    paths = [root, *sorted(root.rglob("*"), key=lambda item: item.relative_to(root).as_posix())]
+    paths = [
+        root,
+        *sorted(root.rglob("*"), key=lambda item: item.relative_to(root).as_posix()),
+    ]
     for path in paths:
         relative = "." if path == root else path.relative_to(root).as_posix()
         if relative == "build_info.json":
@@ -96,10 +103,6 @@ def install_tree_digest(root: Path) -> str:
         digest.update(kind.encode("ascii"))
         digest.update(b"\0")
         digest.update(f"{mode:o}".encode("ascii"))
-        digest.update(b"\0")
-        digest.update(str(metadata.st_uid).encode("ascii"))
-        digest.update(b"\0")
-        digest.update(str(metadata.st_gid).encode("ascii"))
         digest.update(b"\0")
         digest.update(str(metadata.st_mtime_ns).encode("ascii"))
         digest.update(b"\0")
@@ -167,7 +170,9 @@ class SourceContractTests(unittest.TestCase):
     def wrapper_source(self) -> str:
         return BUILDER.read_text(encoding="utf-8")
 
-    def test_builder_uses_the_reviewed_lock_and_is_wired_into_release_tests(self) -> None:
+    def test_builder_uses_the_reviewed_lock_and_is_wired_into_release_tests(
+        self,
+    ) -> None:
         script = self.builder_source()
         self.assertTrue(LOCK.is_file(), LOCK)
         lock = json.loads(LOCK.read_text(encoding="utf-8"))
@@ -184,14 +189,15 @@ class SourceContractTests(unittest.TestCase):
             r'test_colmap_support_builder\.py"\s+\\?\s*SourceContractTests\s+ArchiveSafetyTests\s+ReleaseArchiveMetadataTests\s+AtomicPromotionTests',
         )
 
-    def test_release_archives_strip_host_metadata(self) -> None:
+    def test_release_archives_use_the_reproducible_writer(self) -> None:
         script = PACKAGE_TOOLCHAIN.read_text(encoding="utf-8")
-        for contract in (
-            'zip -q -r -D -X "$CORE_ZIP"',
-            'zip -q -r -D -X "$DA3_BASE_ZIP"',
-            'zip -q -r -D -X "$DA3_SMALL_ZIP"',
-        ):
-            self.assertIn(contract, script)
+        self.assertTrue(REPRODUCIBLE_ZIP.is_file(), REPRODUCIBLE_ZIP)
+        self.assertIn(
+            'REPRODUCIBLE_ZIP="$ROOT/scripts/toolchain/create_reproducible_zip.py"',
+            script,
+        )
+        self.assertEqual(script.count('python3 "$REPRODUCIBLE_ZIP"'), 3)
+        self.assertNotIn("zip -q -r", script)
 
     def test_support_boundary_excludes_unused_metis(self) -> None:
         lock = json.loads(LOCK.read_text(encoding="utf-8"))
@@ -222,7 +228,9 @@ class SourceContractTests(unittest.TestCase):
         self.assertIn("-DWITH_UNWIND=none", script)
         self.assertNotIn("-DWITH_UNWIND=OFF", script)
 
-    def test_builds_static_support_and_only_shared_openmp_for_macos_15_arm64(self) -> None:
+    def test_builds_static_support_and_only_shared_openmp_for_macos_15_arm64(
+        self,
+    ) -> None:
         script = self.builder_source()
         for contract in (
             "CMAKE_OSX_ARCHITECTURES=arm64",
@@ -322,7 +330,9 @@ class SourceContractTests(unittest.TestCase):
             self.assertIn("checkout path contains whitespace", result.stderr)
             self.assertNotIn("must run natively", result.stderr)
 
-    def test_validation_rejects_host_paths_wrong_architecture_and_newer_macos(self) -> None:
+    def test_validation_rejects_host_paths_wrong_architecture_and_newer_macos(
+        self,
+    ) -> None:
         script = self.builder_source()
         for contract in (
             "compile_commands.json",
@@ -393,6 +403,45 @@ class SourceContractTests(unittest.TestCase):
         ):
             self.assertIn(contract, script)
 
+    def test_receipt_identity_is_independent_of_the_build_account(self) -> None:
+        script = self.builder_source()
+        self.assertIn(
+            '"ownership_policy": "invoking-build-user-and-primary-group"',
+            script,
+        )
+        self.assertNotRegex(script, r'"normalized_owner_(?:uid|gid)"\s*:')
+        self.assertEqual(script.count("metadata.st_uid"), 1)
+        self.assertEqual(script.count("metadata.st_gid"), 1)
+
+
+class PortableTreeIdentityTests(unittest.TestCase):
+    def test_normalized_tree_digest_ignores_simulated_numeric_ownership(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary) / "install"
+            root.mkdir()
+            payload = root / "payload.bin"
+            payload.write_bytes(b"portable payload\n")
+            os.chmod(root, 0o755)
+            os.chmod(payload, 0o644)
+            os.utime(payload, (NORMALIZED_MTIME_EPOCH, NORMALIZED_MTIME_EPOCH))
+            os.utime(root, (NORMALIZED_MTIME_EPOCH, NORMALIZED_MTIME_EPOCH))
+            expected = install_tree_digest(root)
+            original_lstat = Path.lstat
+
+            def alternate_owner(path: Path) -> SimpleNamespace:
+                metadata = original_lstat(path)
+                return SimpleNamespace(
+                    st_mode=metadata.st_mode,
+                    st_uid=4_000_000_001,
+                    st_gid=4_000_000_002,
+                    st_mtime_ns=metadata.st_mtime_ns,
+                )
+
+            with mock.patch.object(Path, "lstat", alternate_owner):
+                actual = install_tree_digest(root)
+
+            self.assertEqual(actual, expected)
+
 
 class ArchiveSafetyTests(unittest.TestCase):
     def add_directory(self, archive: tarfile.TarFile, name: str) -> None:
@@ -416,7 +465,9 @@ class ArchiveSafetyTests(unittest.TestCase):
         member.mode = 0o777
         archive.addfile(member)
 
-    def run_extractor(self, archive: Path, destination: Path) -> subprocess.CompletedProcess[str]:
+    def run_extractor(
+        self, archive: Path, destination: Path
+    ) -> subprocess.CompletedProcess[str]:
         return subprocess.run(
             ["/usr/bin/python3", str(EXTRACTOR), str(archive), str(destination)],
             check=False,
@@ -424,7 +475,9 @@ class ArchiveSafetyTests(unittest.TestCase):
             text=True,
         )
 
-    def test_stock_python_extracts_regular_files_and_safe_relative_symlinks(self) -> None:
+    def test_stock_python_extracts_regular_files_and_safe_relative_symlinks(
+        self,
+    ) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             archive_path = root / "valid.tar.gz"
@@ -450,10 +503,15 @@ class ArchiveSafetyTests(unittest.TestCase):
 
     def test_escape_duplicate_hardlink_and_special_members_are_rejected(self) -> None:
         fixtures = (
-            ("path", lambda archive: self.add_file(archive, "source/../../escape", b"x")),
+            (
+                "path",
+                lambda archive: self.add_file(archive, "source/../../escape", b"x"),
+            ),
             (
                 "symlink",
-                lambda archive: self.add_symlink(archive, "source/link", "../../escape"),
+                lambda archive: self.add_symlink(
+                    archive, "source/link", "../../escape"
+                ),
             ),
             (
                 "duplicate",
@@ -552,15 +610,15 @@ class ReleaseArchiveMetadataTests(unittest.TestCase):
                 archive = root / f"{name}.zip"
                 subprocess.run(
                     [
-                        "/usr/bin/zip",
-                        "-q",
-                        "-r",
-                        "-D",
-                        "-X",
+                        sys.executable,
+                        str(REPRODUCIBLE_ZIP),
+                        "--root",
+                        str(fixture.parent),
+                        "--output",
                         str(archive),
+                        "--path",
                         "payload",
                     ],
-                    cwd=fixture.parent,
                     check=True,
                 )
                 archives.append(archive.read_bytes())
@@ -602,12 +660,16 @@ class AtomicPromotionTests(unittest.TestCase):
             (nested / "nested-file").write_text("nested", encoding="utf-8")
             events = []
             module.sync_regular_file = lambda path: events.append(("file", Path(path)))
-            module.sync_directory = lambda path: events.append(("directory", Path(path)))
+            module.sync_directory = lambda path: events.append(
+                ("directory", Path(path))
+            )
 
             module.sync_tree(root)
 
             kinds = [kind for kind, _ in events]
-            self.assertEqual(kinds, ["file", "file", "directory", "directory", "directory"])
+            self.assertEqual(
+                kinds, ["file", "file", "directory", "directory", "directory"]
+            )
             self.assertEqual(
                 [path for kind, path in events if kind == "directory"],
                 [nested, nested.parent, root],
@@ -660,7 +722,12 @@ class AtomicPromotionTests(unittest.TestCase):
             (install / "marker").write_text("old", encoding="utf-8")
 
             result = subprocess.run(
-                ["/usr/bin/python3", str(PROMOTER), str(root / "missing"), str(install)],
+                [
+                    "/usr/bin/python3",
+                    str(PROMOTER),
+                    str(root / "missing"),
+                    str(install),
+                ],
                 check=False,
                 capture_output=True,
                 text=True,
@@ -710,7 +777,9 @@ class ArtifactTests(unittest.TestCase):
         configured = os.environ.get("EASYSPLAT_COLMAP_SUPPORT_ROOT")
         cls.install = Path(configured).resolve() if configured else DEFAULT_INSTALL
         if not cls.install.is_dir():
-            raise unittest.SkipTest("build_colmap_support.sh has not produced an install")
+            raise unittest.SkipTest(
+                "build_colmap_support.sh has not produced an install"
+            )
 
     def test_file_set_and_linkage_are_bounded(self) -> None:
         symlinks = [path for path in self.install.rglob("*") if path.is_symlink()]
@@ -729,7 +798,9 @@ class ArtifactTests(unittest.TestCase):
                 NORMALIZED_MTIME_EPOCH * 1_000_000_000,
                 path,
             )
-            self.assertEqual((metadata.st_uid, metadata.st_gid), (os.getuid(), os.getgid()), path)
+            self.assertEqual(
+                (metadata.st_uid, metadata.st_gid), (os.getuid(), os.getgid()), path
+            )
             if path.is_file():
                 self.assertTrue(stat.S_ISREG(metadata.st_mode), path)
                 expected_mode = 0o755 if path.suffix == ".dylib" else 0o644
@@ -763,13 +834,22 @@ class ArtifactTests(unittest.TestCase):
                         capture_output=True,
                         text=True,
                     ).stdout
-                    versions = re.findall(r"^\s*minos\s+([0-9.]+)$", load_commands, re.MULTILINE)
+                    versions = re.findall(
+                        r"^\s*minos\s+([0-9.]+)$", load_commands, re.MULTILINE
+                    )
                     platforms = re.findall(
                         r"^\s*platform\s+([0-9]+)$", load_commands, re.MULTILINE
                     )
                     self.assertTrue(versions, library)
-                    self.assertTrue(all(tuple(map(int, value.split("."))) <= (15, 0) for value in versions))
-                    self.assertEqual(set(platforms), {"1"}, f"not a macOS object: {library}")
+                    self.assertTrue(
+                        all(
+                            tuple(map(int, value.split("."))) <= (15, 0)
+                            for value in versions
+                        )
+                    )
+                    self.assertEqual(
+                        set(platforms), {"1"}, f"not a macOS object: {library}"
+                    )
                     members = subprocess.run(
                         [str(selected_xcode_tool("ar")), "-t", str(library)],
                         check=True,
@@ -777,14 +857,20 @@ class ArtifactTests(unittest.TestCase):
                         text=True,
                     ).stdout.splitlines()
                     object_members = [
-                        member for member in members if not member.startswith("__.SYMDEF")
+                        member
+                        for member in members
+                        if not member.startswith("__.SYMDEF")
                     ]
                     self.assertEqual(len(platforms), len(object_members), library)
                     self.assertEqual(len(versions), len(object_members), library)
                     self.assert_archive_headers_are_deterministic(library)
                 else:
                     metadata = subprocess.run(
-                        [str(selected_xcode_tool("vtool")), "-show-build", str(library)],
+                        [
+                            str(selected_xcode_tool("vtool")),
+                            "-show-build",
+                            str(library),
+                        ],
                         check=True,
                         capture_output=True,
                         text=True,
@@ -792,7 +878,9 @@ class ArtifactTests(unittest.TestCase):
                     match = re.search(r"^\s*minos\s+([0-9.]+)$", metadata, re.MULTILINE)
                     self.assertIsNotNone(match, library)
                     assert match is not None
-                    self.assertLessEqual(tuple(map(int, match.group(1).split("."))), (15, 0))
+                    self.assertLessEqual(
+                        tuple(map(int, match.group(1).split("."))), (15, 0)
+                    )
                     self.assertIsNotNone(
                         re.search(r"^\s*platform\s+MACOS$", metadata, re.MULTILINE),
                         library,
@@ -820,15 +908,19 @@ class ArtifactTests(unittest.TestCase):
             size = int(header[48:58].decode("ascii").strip())
             if raw_name.startswith("#1/"):
                 name_size = int(raw_name[3:])
-                name = data[offset + 60 : offset + 60 + name_size].rstrip(b"\0").decode(
-                    "utf-8", errors="replace"
+                name = (
+                    data[offset + 60 : offset + 60 + name_size]
+                    .rstrip(b"\0")
+                    .decode("utf-8", errors="replace")
                 )
             expected_mode = "100644" if name.startswith("__.SYMDEF") else "644"
             self.assertEqual(mode, expected_mode, archive)
             offset += 60 + size + (size % 2)
         self.assertEqual(offset, len(data), archive)
 
-    def test_installed_bytes_do_not_contain_build_or_homebrew_dependency_paths(self) -> None:
+    def test_installed_bytes_do_not_contain_build_or_homebrew_dependency_paths(
+        self,
+    ) -> None:
         forbidden = (
             str(ROOT),
             "/opt/homebrew/",
@@ -882,8 +974,8 @@ class ArtifactTests(unittest.TestCase):
                         "#include <glog/logging.h>",
                         "int main(int argc, char** argv) {",
                         "  google::InitGoogleLogging(argv[0]);",
-                        "  boost::program_options::options_description options(\"Options\");",
-                        "  options.add_options()(\"help\", \"show help\");",
+                        '  boost::program_options::options_description options("Options");',
+                        '  options.add_options()("help", "show help");',
                         "  return argc > 0 && !options.options().empty() ? 0 : 1;",
                         "}",
                     )
@@ -946,7 +1038,9 @@ class ArtifactTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             moved = root / "moved"
-            subprocess.run(["/usr/bin/ditto", str(self.install), str(moved)], check=True)
+            subprocess.run(
+                ["/usr/bin/ditto", str(self.install), str(moved)], check=True
+            )
             source = root / "openmp-smoke.c"
             executable = moved / "bin" / "openmp-smoke"
             executable.parent.mkdir()
@@ -1031,16 +1125,21 @@ class ArtifactTests(unittest.TestCase):
         self.assertEqual(receipt["promoter_sha256"], sha256(PROMOTER))
         self.assertEqual(receipt["source_date_epoch"], 0)
         self.assertEqual(receipt["normalized_mtime_epoch"], NORMALIZED_MTIME_EPOCH)
-        self.assertEqual(receipt["normalized_owner_uid"], os.getuid())
-        self.assertEqual(receipt["normalized_owner_gid"], os.getgid())
-        self.assertEqual(receipt["dependencies"]["libomp"]["license"], "Apache-2.0 WITH LLVM-exception")
+        self.assertEqual(
+            receipt["ownership_policy"],
+            "invoking-build-user-and-primary-group",
+        )
+        self.assertNotIn("normalized_owner_uid", receipt)
+        self.assertNotIn("normalized_owner_gid", receipt)
+        self.assertEqual(
+            receipt["dependencies"]["libomp"]["license"],
+            "Apache-2.0 WITH LLVM-exception",
+        )
         self.assertEqual(
             receipt["dependencies"]["libomp"]["license_files"],
             ["licenses/COLMAPSupport/OpenMP-LICENSE.txt"],
         )
-        self.assertIn(
-            "LIBOMP_USE_ITT_NOTIFY=OFF", receipt["build_options"]["openmp"]
-        )
+        self.assertIn("LIBOMP_USE_ITT_NOTIFY=OFF", receipt["build_options"]["openmp"])
         self.assertEqual(
             set(receipt["build_tools"]),
             {"clang", "cmake", "macos_sdk", "ninja", "python", "ripgrep", "xcode"},
@@ -1104,7 +1203,9 @@ class ArtifactTests(unittest.TestCase):
             self.assertEqual(actual["license"], expected["license"])
         for relative, expected_hash in receipt["library_sha256"].items():
             self.assertEqual(sha256(self.install / relative), expected_hash)
-        self.assertEqual(receipt["install_tree_sha256"], install_tree_digest(self.install))
+        self.assertEqual(
+            receipt["install_tree_sha256"], install_tree_digest(self.install)
+        )
 
 
 if __name__ == "__main__":

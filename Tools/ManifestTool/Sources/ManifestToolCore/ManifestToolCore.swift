@@ -142,6 +142,8 @@ public struct ReleaseSigningRequest: Codable, Equatable {
 
 public enum ManifestBuilder {
     public static let maximumReleaseAssetBytes: UInt64 = 2_147_483_648
+    public static let maximumCoreDownloadBytes: UInt64 = 2_500_000_000
+    public static let maximumFullToolchainDownloadBytes: UInt64 = 6_000_000_000
     public static let maximumExpandedComponentBytes: UInt64 = 16 * 1_024 * 1_024 * 1_024
     static let installStateFilename = ".easysplat_toolchain_state.json"
 
@@ -421,6 +423,11 @@ public enum ManifestBuilder {
                 ManifestToolDefaults.criticalCoreFiles(in: contents)
             )
             criticalFilePaths.formUnion(try archiveExecutablePaths(at: input.zipURL))
+        } else if input.name == "geometry-da3-base" {
+            criticalFilePaths.formUnion(
+                ManifestToolDefaults.criticalDa3BaseFiles(in: contents)
+            )
+            criticalFilePaths.formUnion(try archiveExecutablePaths(at: input.zipURL))
         }
         let criticalFileHashes = try archiveCriticalFileHashes(
             zipURL: input.zipURL,
@@ -512,19 +519,34 @@ public enum ManifestBuilder {
         guard core.capabilities == ManifestToolDefaults.coreCapabilities,
               core.dependencies.isEmpty,
               core.requirement == .required,
+              core.sizeBytes <= maximumCoreDownloadBytes,
+              core.contents.allSatisfy(ManifestToolDefaults.isAllowedCoreFile),
+              Set(core.contents.filter { $0.hasPrefix("lib/") }) == ["lib/libomp.dylib"],
               ManifestToolDefaults.criticalCoreFiles(in: core.contents)
                 .isSubset(of: Set(core.criticalFileHashes.keys)),
-              base.capabilities == ["geometry.da3.base"],
+              base.capabilities == ["geometry.da3.runtime", "geometry.da3.base"],
               base.dependencies == ["macos-arm64-core"],
-              base.requirement == .required,
-              Set(base.contents) == Set(ManifestToolDefaults.da3BaseContents),
-              Set(base.criticalFileHashes.keys) == Set(base.contents),
+              base.requirement == .optional,
+              base.contents.allSatisfy(ManifestToolDefaults.isAllowedDa3BaseFile),
+              ManifestToolDefaults.criticalDa3BaseFiles(in: base.contents)
+                .isSubset(of: Set(base.criticalFileHashes.keys)),
               small.capabilities == ["geometry.da3.small"],
-              small.dependencies == ["macos-arm64-core"],
+              small.dependencies == ["geometry-da3-base"],
               small.requirement == .optional,
               Set(small.contents) == Set(ManifestToolDefaults.da3SmallContents),
               Set(small.criticalFileHashes.keys) == Set(small.contents) else {
             try releaseFailure("Release signing request component policy is invalid.")
+        }
+        var totalDownloadBytes: UInt64 = 0
+        for component in manifest.components {
+            let sum = totalDownloadBytes.addingReportingOverflow(component.sizeBytes)
+            guard !sum.overflow else {
+                try releaseFailure("Release signing request component size total overflowed.")
+            }
+            totalDownloadBytes = sum.partialValue
+        }
+        guard totalDownloadBytes <= maximumFullToolchainDownloadBytes else {
+            try releaseFailure("Release signing request exceeds the 6 GB full toolchain budget.")
         }
         try validateContentOwnership(manifest.components)
     }
@@ -901,7 +923,6 @@ public enum ManifestToolDefaults {
     public static let coreCapabilities = [
         "runtime.core",
         "geometry.colmap",
-        "geometry.da3.runtime",
         "training.msplat",
     ]
 
@@ -909,20 +930,60 @@ public enum ManifestToolDefaults {
         "bin/colmap",
         "bin/easysplat-train",
         "bin/default.metallib",
-        "da3_mps/bin/easysplat_da3_sfm",
-        "da3_mps/python/bin/python3",
-        "da3_mps/app/easysplat_da3_sfm/run.py",
-        "da3_mps/build_info.json",
+        "lib/libomp.dylib",
+        "provenance/colmap.json",
+        "provenance/colmap-support.json",
+        "provenance/ceres.json",
+        "provenance/openimageio.json",
         "msplat/build_info.json",
+        "msplat/LICENSE",
         "supply-chain/components.json",
     ]
 
     public static let criticalCoreFiles = criticalCoreAnchors
 
+    public static func isAllowedCoreFile(_ path: String) -> Bool {
+        criticalCoreAnchors.contains(path)
+            || (path.hasPrefix("licenses/") && path.count > "licenses/".count)
+    }
+
     public static func criticalCoreFiles(in contents: [String]) -> Set<String> {
         var required = Set(criticalCoreAnchors)
         for path in contents {
             let lowercased = path.lowercased()
+            let pathExtension = URL(fileURLWithPath: lowercased).pathExtension
+            let isLoadedLibrary = ["dylib", "so"].contains(pathExtension)
+                && lowercased.hasPrefix("lib/")
+            let isMetalLibrary = pathExtension == "metallib"
+            let isExecutablePayload = lowercased.hasPrefix("bin/")
+            let isReceiptOrLicense = lowercased.hasPrefix("provenance/")
+                || lowercased.hasPrefix("licenses/")
+                || lowercased.hasPrefix("msplat/")
+                || lowercased.hasPrefix("supply-chain/")
+            if isLoadedLibrary || isMetalLibrary || isExecutablePayload || isReceiptOrLicense {
+                required.insert(path)
+            }
+        }
+        return required
+    }
+
+    public static let da3BaseContents = [
+        "da3_mps/bin/easysplat_da3_sfm",
+        "da3_mps/python/bin/python3",
+        "da3_mps/app/easysplat_da3_sfm/run.py",
+        "da3_mps/vendor/depth-anything-3/src/depth_anything_3/api.py",
+        "da3_mps/build_info.json",
+        "da3_mps/models/DA3-BASE/config.json",
+        "da3_mps/models/DA3-BASE/model.safetensors",
+        "da3_mps/models/DA3-BASE/easysplat_model_info.json",
+        "da3_mps/models/DA3-BASE/LICENSE",
+    ]
+
+    public static func criticalDa3BaseFiles(in contents: [String]) -> Set<String> {
+        var required = Set(da3BaseContents)
+        for path in contents {
+            let lowercased = path.lowercased()
+            guard lowercased.hasPrefix("da3_mps/") else { continue }
             let pathExtension = URL(fileURLWithPath: lowercased).pathExtension
             let isPythonCode = ["py", "pyc", "pth"].contains(pathExtension)
                 && (
@@ -931,37 +992,33 @@ public enum ManifestToolDefaults {
                         || lowercased.hasPrefix("da3_mps/python/")
                 )
             let isRuntimeConfiguration = ["yaml", "yml", "json", "toml"].contains(pathExtension)
-                && (
-                    lowercased.hasPrefix("da3_mps/app/")
-                        || lowercased.hasPrefix("da3_mps/vendor/")
-                        || lowercased.hasPrefix("da3_mps/python/")
-                )
             let isLoadedLibrary = ["dylib", "so"].contains(pathExtension)
-                && (
-                    lowercased.hasPrefix("lib/")
-                        || lowercased.hasPrefix("da3_mps/")
-                )
-            let isMetalLibrary = pathExtension == "metallib"
             let pathComponents = lowercased.split(separator: "/")
-            let isNestedExecutablePayload = lowercased.hasPrefix("da3_mps/")
-                && pathComponents.dropLast().contains(where: { $0 == "bin" || $0 == "libexec" })
-            let isExecutablePayload = lowercased.hasPrefix("bin/")
-                || lowercased.hasPrefix("da3_mps/bin/")
-                || lowercased.hasPrefix("da3_mps/python/bin/")
-                || isNestedExecutablePayload
-            if isPythonCode || isRuntimeConfiguration || isLoadedLibrary || isMetalLibrary || isExecutablePayload {
+            let isExecutablePayload = pathComponents.dropLast().contains(where: {
+                $0 == "bin" || $0 == "libexec"
+            })
+            let filename = pathComponents.last.map(String.init) ?? ""
+            let isLicenseOrNotice = lowercased.hasPrefix("da3_mps/licenses/")
+                || filename.hasPrefix("license")
+                || filename.hasPrefix("copying")
+                || filename.hasPrefix("notice")
+            if isPythonCode || isRuntimeConfiguration || isLoadedLibrary
+                || isExecutablePayload || isLicenseOrNotice {
                 required.insert(path)
             }
         }
         return required
     }
 
-    public static let da3BaseContents = [
-        "da3_mps/models/DA3-BASE/config.json",
-        "da3_mps/models/DA3-BASE/model.safetensors",
-        "da3_mps/models/DA3-BASE/easysplat_model_info.json",
-        "da3_mps/models/DA3-BASE/LICENSE",
-    ]
+    public static func isAllowedDa3BaseFile(_ path: String) -> Bool {
+        path == "da3_mps/build_info.json"
+            || path.hasPrefix("da3_mps/bin/")
+            || path.hasPrefix("da3_mps/python/")
+            || path.hasPrefix("da3_mps/app/")
+            || path.hasPrefix("da3_mps/vendor/")
+            || path.hasPrefix("da3_mps/licenses/")
+            || path.hasPrefix("da3_mps/models/DA3-BASE/")
+    }
 
     public static let da3SmallContents = [
         "da3_mps/models/DA3-SMALL/config.json",

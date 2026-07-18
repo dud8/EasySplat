@@ -5,25 +5,21 @@ import XCTest
 import CryptoKit
 
 final class ToolchainManifestTests: XCTestCase {
-    func testCriticalCoreFileDiscoveryCoversEveryRuntimeCodeClass() {
+    func testCriticalCoreFileDiscoveryCoversNativeRuntimeWithoutClaimingDA3() {
         let discovered = ToolchainManager.criticalCoreFiles(in: [
-            "lib/libceres.2.dylib",
+            "lib/libomp.dylib",
+            "provenance/colmap.json",
+            "licenses/COLMAP/COPYING.txt",
             "da3_mps/vendor/depth_anything_3/api.py",
-            "da3_mps/vendor/depth_anything_3/configs/da3-base.yaml",
-            "da3_mps/python/bin/torchrun",
-            "da3_mps/python/lib/python3.11/site-packages/torch/bin/protoc",
-            "da3_mps/python/lib/python3.11/site-packages/native_extension.so",
             "bin/auxiliary-tool",
             "share/LICENSE",
         ])
 
-        XCTAssertTrue(discovered.contains("lib/libceres.2.dylib"))
-        XCTAssertTrue(discovered.contains("da3_mps/vendor/depth_anything_3/api.py"))
-        XCTAssertTrue(discovered.contains("da3_mps/vendor/depth_anything_3/configs/da3-base.yaml"))
-        XCTAssertTrue(discovered.contains("da3_mps/python/bin/torchrun"))
-        XCTAssertTrue(discovered.contains("da3_mps/python/lib/python3.11/site-packages/torch/bin/protoc"))
-        XCTAssertTrue(discovered.contains("da3_mps/python/lib/python3.11/site-packages/native_extension.so"))
+        XCTAssertTrue(discovered.contains("lib/libomp.dylib"))
+        XCTAssertTrue(discovered.contains("provenance/colmap.json"))
+        XCTAssertTrue(discovered.contains("licenses/COLMAP/COPYING.txt"))
         XCTAssertTrue(discovered.contains("bin/auxiliary-tool"))
+        XCTAssertFalse(discovered.contains("da3_mps/vendor/depth_anything_3/api.py"))
         XCTAssertFalse(discovered.contains("share/LICENSE"))
     }
 
@@ -167,20 +163,24 @@ final class ToolchainManifestTests: XCTestCase {
             publishedAt: Date(),
             appVersionRange: .init(minimum: "1.0.0", maximumExclusive: "3.0.0"),
             components: [
-                .init(name: "macos-arm64-core", capabilities: ["runtime.core"], url: "https://example.com/core.zip", sha256: String(repeating: "1", count: 64), sizeBytes: 1, contents: ["bin/colmap"], criticalFileHashes: [:], dependencies: [], requirement: .required),
-                .init(name: "geometry-da3-base", capabilities: ["geometry.da3.base"], url: "https://example.com/base.zip", sha256: String(repeating: "2", count: 64), sizeBytes: 1, contents: ["da3_mps/models/DA3-BASE/model.safetensors"], criticalFileHashes: [:], dependencies: ["macos-arm64-core"], requirement: .required),
-                .init(name: "geometry-da3-small", capabilities: ["geometry.da3.small"], url: "https://example.com/small.zip", sha256: String(repeating: "3", count: 64), sizeBytes: 1, contents: ["da3_mps/models/DA3-SMALL/model.safetensors"], criticalFileHashes: [:], dependencies: ["macos-arm64-core"], requirement: .optional),
+                .init(name: "macos-arm64-core", capabilities: ["runtime.core", "geometry.colmap", "training.msplat"], url: "https://example.com/core.zip", sha256: String(repeating: "1", count: 64), sizeBytes: 1, contents: ["bin/colmap"], criticalFileHashes: [:], dependencies: [], requirement: .required),
+                .init(name: "geometry-da3-base", capabilities: ["geometry.da3.runtime", "geometry.da3.base"], url: "https://example.com/base.zip", sha256: String(repeating: "2", count: 64), sizeBytes: 1, contents: ["da3_mps/bin/easysplat_da3_sfm", "da3_mps/models/DA3-BASE/model.safetensors"], criticalFileHashes: [:], dependencies: ["macos-arm64-core"], requirement: .optional),
+                .init(name: "geometry-da3-small", capabilities: ["geometry.da3.small"], url: "https://example.com/small.zip", sha256: String(repeating: "3", count: 64), sizeBytes: 1, contents: ["da3_mps/models/DA3-SMALL/model.safetensors"], criticalFileHashes: [:], dependencies: ["geometry-da3-base"], requirement: .optional),
             ],
             signatureEd25519: ""
         )
 
         XCTAssertEqual(
-            try manifest.resolvedComponents(requesting: ["geometry.da3.base"]).map(\.name),
-            ["macos-arm64-core", "geometry-da3-base"]
+            try manifest.resolvedComponents(requesting: ["geometry.colmap"]).map(\.name),
+            ["macos-arm64-core"]
         )
         XCTAssertEqual(
-            try manifest.resolvedComponents(requesting: ["geometry.da3.small"]).map(\.name),
-            ["macos-arm64-core", "geometry-da3-small"]
+            try manifest.resolvedComponents(requesting: [
+                "geometry.da3.runtime",
+                "geometry.da3.base",
+                "geometry.da3.small",
+            ]).map(\.name),
+            ["macos-arm64-core", "geometry-da3-base", "geometry-da3-small"]
         )
     }
 
@@ -193,11 +193,19 @@ final class ToolchainManifestTests: XCTestCase {
         XCTAssertNoThrow(try manager.test_validateSchema2Manifest(manifest, publicKeyBase64: publicKey))
 
         var executableSuperset = manifest
-        let nativeHelper = "da3_mps/python/lib/python3.11/site-packages/foo/native_helper"
+        let nativeHelper = "bin/native-helper"
         executableSuperset.components[0].contents.append(nativeHelper)
         executableSuperset.components[0].criticalFileHashes[nativeHelper] = String(repeating: "b", count: 64)
-        XCTAssertNoThrow(
+        XCTAssertThrowsError(
             try manager.test_validateSchema2Manifest(executableSuperset, publicKeyBase64: publicKey)
+        )
+
+        var unreviewedBaseModel = manifest
+        let unexpectedModel = "da3_mps/models/DA3-LARGE/model.safetensors"
+        unreviewedBaseModel.components[1].contents.append(unexpectedModel)
+        unreviewedBaseModel.components[1].criticalFileHashes[unexpectedModel] = String(repeating: "b", count: 64)
+        XCTAssertThrowsError(
+            try manager.test_validateSchema2Manifest(unreviewedBaseModel, publicKeyBase64: publicKey)
         )
 
         var overlappingContents = manifest
@@ -268,18 +276,18 @@ final class ToolchainManifestTests: XCTestCase {
         )
     }
 
-    func testManagerRejectsNormalPhotoToolchainAboveTwoPointFiveGB() throws {
+    func testManagerEnforcesPerAssetAndSixGBFullClosureBudgets() throws {
         let key = Curve25519.Signing.PrivateKey()
         let publicKey = key.publicKey.rawRepresentation.base64EncodedString()
         var manifest = validSchema2Manifest(publicKey: publicKey)
         let manager = ToolchainManager(appVersion: "2.0.0")
 
-        manifest.components[0].sizeBytes = 1_000_000_000
-        manifest.components[1].sizeBytes = 1_000_000_000
-        manifest.components[2].sizeBytes = 500_000_000
+        manifest.components[0].sizeBytes = 2_000_000_000
+        manifest.components[1].sizeBytes = 2_000_000_000
+        manifest.components[2].sizeBytes = 2_000_000_000
         XCTAssertNoThrow(try manager.test_validateSchema2Manifest(manifest, publicKeyBase64: publicKey))
 
-        manifest.components[0].sizeBytes += 1
+        manifest.components[2].sizeBytes += 1
         XCTAssertThrowsError(
             try manager.test_validateSchema2Manifest(manifest, publicKeyBase64: publicKey)
         )
@@ -354,26 +362,35 @@ final class ToolchainManifestTests: XCTestCase {
             "bin/colmap",
             "bin/easysplat-train",
             "bin/default.metallib",
-            "da3_mps/bin/easysplat_da3_sfm",
-            "da3_mps/python/bin/python3",
-            "da3_mps/app/easysplat_da3_sfm/run.py",
-            "da3_mps/build_info.json",
+            "lib/libomp.dylib",
+            "provenance/colmap.json",
+            "provenance/colmap-support.json",
+            "provenance/ceres.json",
+            "provenance/openimageio.json",
+            "licenses/COLMAP/COPYING.txt",
+            "licenses/COLMAPSupport/OpenMP-LICENSE.txt",
             "msplat/build_info.json",
-            "lib/libceres.2.dylib",
-            "da3_mps/vendor/depth_anything_3/api.py",
             "msplat/LICENSE",
+            "supply-chain/components.json",
         ]
         let coreCriticalFiles = ToolchainManager.criticalCoreFiles(in: coreContents)
         let coreHashes = Dictionary(uniqueKeysWithValues: coreCriticalFiles.map { ($0, hash) })
         let baseFiles = [
+            "da3_mps/bin/easysplat_da3_sfm",
+            "da3_mps/python/bin/python3",
+            "da3_mps/app/easysplat_da3_sfm/run.py",
+            "da3_mps/vendor/depth_anything_3/api.py",
+            "da3_mps/build_info.json",
             "da3_mps/models/DA3-BASE/config.json",
             "da3_mps/models/DA3-BASE/easysplat_model_info.json",
             "da3_mps/models/DA3-BASE/model.safetensors",
+            "da3_mps/models/DA3-BASE/LICENSE",
         ]
         let smallFiles = [
             "da3_mps/models/DA3-SMALL/config.json",
             "da3_mps/models/DA3-SMALL/easysplat_model_info.json",
             "da3_mps/models/DA3-SMALL/model.safetensors",
+            "da3_mps/models/DA3-SMALL/LICENSE",
         ]
         return ToolchainManifest(
             schemaVersion: 2,
@@ -383,9 +400,9 @@ final class ToolchainManifestTests: XCTestCase {
             publishedAt: Date(),
             appVersionRange: .init(minimum: "1.0.0", maximumExclusive: "3.0.0"),
             components: [
-                .init(name: "macos-arm64-core", capabilities: ["runtime.core", "geometry.colmap", "geometry.da3.runtime", "training.msplat"], url: "https://example.com/core.zip", sha256: hash, sizeBytes: 1, contents: coreContents, criticalFileHashes: coreHashes, dependencies: [], requirement: .required),
-                .init(name: "geometry-da3-base", capabilities: ["geometry.da3.base"], url: "https://example.com/base.zip", sha256: hash, sizeBytes: 1, contents: baseFiles, criticalFileHashes: Dictionary(uniqueKeysWithValues: baseFiles.map { ($0, hash) }), dependencies: ["macos-arm64-core"], requirement: .required),
-                .init(name: "geometry-da3-small", capabilities: ["geometry.da3.small"], url: "https://example.com/small.zip", sha256: hash, sizeBytes: 1, contents: smallFiles, criticalFileHashes: Dictionary(uniqueKeysWithValues: smallFiles.map { ($0, hash) }), dependencies: ["macos-arm64-core"], requirement: .optional),
+                .init(name: "macos-arm64-core", capabilities: ["runtime.core", "geometry.colmap", "training.msplat"], url: "https://example.com/core.zip", sha256: hash, sizeBytes: 1, contents: coreContents, criticalFileHashes: coreHashes, dependencies: [], requirement: .required),
+                .init(name: "geometry-da3-base", capabilities: ["geometry.da3.runtime", "geometry.da3.base"], url: "https://example.com/base.zip", sha256: hash, sizeBytes: 1, contents: baseFiles, criticalFileHashes: Dictionary(uniqueKeysWithValues: baseFiles.map { ($0, hash) }), dependencies: ["macos-arm64-core"], requirement: .optional),
+                .init(name: "geometry-da3-small", capabilities: ["geometry.da3.small"], url: "https://example.com/small.zip", sha256: hash, sizeBytes: 1, contents: smallFiles, criticalFileHashes: Dictionary(uniqueKeysWithValues: smallFiles.map { ($0, hash) }), dependencies: ["geometry-da3-base"], requirement: .optional),
             ],
             signatureEd25519: ""
         )

@@ -145,7 +145,7 @@ class Da3RunTests(unittest.TestCase):
         self.assertNotIn("transformers==5.8.1", lines)
         self.assertIn("einops==0.8.2", lines)
         self.assertIn("omegaconf==2.3.0", lines)
-        self.assertIn("pycolmap==4.1.0", lines)
+        self.assertNotIn("pycolmap==4.1.0", lines)
         self.assertIn("addict==2.4.0", lines)
 
         lock = (root / "requirements.txt").read_text(encoding="utf-8")
@@ -155,6 +155,7 @@ class Da3RunTests(unittest.TestCase):
             self.assertIn(f"{normalized}=={version} \\", lock)
         self.assertIn("antlr4-python3-runtime==4.9.3 \\", lock)
         self.assertNotIn("opencv-python-headless", lock)
+        self.assertNotIn("pycolmap", lock)
         self.assertNotIn("transformers==", lock)
         self.assertNotIn("==unknown", lock)
         self.assertGreaterEqual(lock.count("--hash=sha256:"), len(lines) + 1)

@@ -61,9 +61,14 @@ cleanup() {
 trap cleanup EXIT
 
 python3 "$ROOT/scripts/toolchain/tests/test_generate_supply_chain_manifest.py"
+python3 "$ROOT/scripts/toolchain/tests/test_da3_payload.py"
+python3 "$ROOT/scripts/toolchain/tests/test_create_reproducible_zip.py"
 python3 "$ROOT/scripts/toolchain/tests/test_colmap_support_builder.py" \
   SourceContractTests ArchiveSafetyTests ReleaseArchiveMetadataTests AtomicPromotionTests
+python3 "$ROOT/scripts/toolchain/tests/test_ceres_builder.py"
+python3 "$ROOT/scripts/toolchain/tests/test_openimageio_builder.py"
 python3 "$ROOT/scripts/toolchain/tests/test_native_colmap_retriever.py" SourceContractTests
+swift test --package-path "$ROOT/Tools/ManifestTool"
 python3 "$ROOT/scripts/release/tests/test_verify_publication_bundle.py"
 
 unsafe_toolchain_root="$TMP_DIR/unsafe-toolchain-root"
@@ -1065,11 +1070,14 @@ grep -Fq -- '-licenses.zip' "$ROOT/scripts/release/build_dmg.sh"
 metadata_fixture="$TMP_DIR/release-metadata"
 mkdir -p \
   "$metadata_fixture/core/bin" \
-  "$metadata_fixture/core/da3_mps/bin" \
-  "$metadata_fixture/core/da3_mps/python/bin" \
-  "$metadata_fixture/core/da3_mps/app/easysplat_da3_sfm" \
+  "$metadata_fixture/core/lib" \
+  "$metadata_fixture/core/provenance" \
   "$metadata_fixture/core/msplat" \
   "$metadata_fixture/core/licenses/example" \
+  "$metadata_fixture/base/da3_mps/bin" \
+  "$metadata_fixture/base/da3_mps/python/bin" \
+  "$metadata_fixture/base/da3_mps/app/easysplat_da3_sfm" \
+  "$metadata_fixture/base/da3_mps/vendor/depth-anything-3/src/depth_anything_3" \
   "$metadata_fixture/base/da3_mps/models/DA3-BASE" \
   "$metadata_fixture/small/da3_mps/models/DA3-SMALL"
 printf 'Apache-2.0 test license\n' >"$metadata_fixture/core/licenses/example/LICENSE"
@@ -1078,12 +1086,22 @@ for path in \
   bin/colmap \
   bin/easysplat-train \
   bin/default.metallib \
+  lib/libomp.dylib \
+  provenance/colmap.json \
+  provenance/colmap-support.json \
+  provenance/ceres.json \
+  provenance/openimageio.json \
+  msplat/build_info.json \
+  msplat/LICENSE; do
+  printf 'release fixture: %s\n' "$path" >"$metadata_fixture/core/$path"
+done
+for path in \
   da3_mps/bin/easysplat_da3_sfm \
   da3_mps/python/bin/python3 \
   da3_mps/app/easysplat_da3_sfm/run.py \
-  da3_mps/build_info.json \
-  msplat/build_info.json; do
-  printf 'release fixture: %s\n' "$path" >"$metadata_fixture/core/$path"
+  da3_mps/vendor/depth-anything-3/src/depth_anything_3/api.py \
+  da3_mps/build_info.json; do
+  printf 'release fixture: %s\n' "$path" >"$metadata_fixture/base/$path"
 done
 for model in DA3-BASE DA3-SMALL; do
   case "$model" in
@@ -1108,11 +1126,18 @@ locations = {
     "bin/colmap": root / "core/bin/colmap",
     "bin/default.metallib": root / "core/bin/default.metallib",
     "bin/easysplat-train": root / "core/bin/easysplat-train",
-    "da3_mps/app/easysplat_da3_sfm/run.py": root / "core/da3_mps/app/easysplat_da3_sfm/run.py",
-    "da3_mps/bin/easysplat_da3_sfm": root / "core/da3_mps/bin/easysplat_da3_sfm",
-    "da3_mps/build_info.json": root / "core/da3_mps/build_info.json",
-    "da3_mps/python/bin/python3": root / "core/da3_mps/python/bin/python3",
+    "lib/libomp.dylib": root / "core/lib/libomp.dylib",
+    "provenance/colmap.json": root / "core/provenance/colmap.json",
+    "provenance/colmap-support.json": root / "core/provenance/colmap-support.json",
+    "provenance/ceres.json": root / "core/provenance/ceres.json",
+    "provenance/openimageio.json": root / "core/provenance/openimageio.json",
+    "da3_mps/app/easysplat_da3_sfm/run.py": root / "base/da3_mps/app/easysplat_da3_sfm/run.py",
+    "da3_mps/bin/easysplat_da3_sfm": root / "base/da3_mps/bin/easysplat_da3_sfm",
+    "da3_mps/build_info.json": root / "base/da3_mps/build_info.json",
+    "da3_mps/python/bin/python3": root / "base/da3_mps/python/bin/python3",
+    "da3_mps/vendor/depth-anything-3/src/depth_anything_3/api.py": root / "base/da3_mps/vendor/depth-anything-3/src/depth_anything_3/api.py",
     "msplat/build_info.json": root / "core/msplat/build_info.json",
+    "msplat/LICENSE": root / "core/msplat/LICENSE",
     "licenses/example/LICENSE": root / "core/licenses/example/LICENSE",
 }
 for model, archive in (("DA3-BASE", "base"), ("DA3-SMALL", "small")):
@@ -1197,20 +1222,30 @@ module = importlib.util.module_from_spec(spec)
 sys.modules[spec.name] = module
 spec.loader.exec_module(module)
 module.validate_normal_photo_install_size({
-    "core": 1_000_000_000,
-    "geometry-da3-base": 1_000_000_000,
-    "geometry-da3-small": 500_000_000,
+    "core": 2_000_000_000,
+    "geometry-da3-base": 1_999_999_999,
+    "geometry-da3-small": 1_999_999_999,
 })
 try:
     module.validate_normal_photo_install_size({
-        "core": 1_000_000_001,
-        "geometry-da3-base": 1_000_000_000,
-        "geometry-da3-small": 500_000_000,
+        "core": 2_500_000_001,
+        "geometry-da3-base": 1,
+        "geometry-da3-small": 1,
     })
 except module.MetadataError:
     pass
 else:
-    raise AssertionError("normal photo install size gate accepted more than 2.5 GB")
+    raise AssertionError("core-only size gate accepted more than 2.5 GB")
+try:
+    module.validate_normal_photo_install_size({
+        "core": 2_000_000_000,
+        "geometry-da3-base": 2_000_000_000,
+        "geometry-da3-small": 2_000_000_001,
+    })
+except module.MetadataError:
+    pass
+else:
+    raise AssertionError("full optional size gate accepted more than 6 GB")
 
 wheel_url = "https://files.pythonhosted.org/packages/addict-2.4.0-py3-none-any.whl"
 assert module.validate_https_url(wheel_url, "wheel URL") == wheel_url
@@ -1863,16 +1898,79 @@ test "$metadata_verify_line" -lt "$app_build_line"
 grep -q 'scripts/toolchain/build_msplat.sh' "$ROOT/.github/workflows/toolchain-build.yml"
 grep -q 'scripts/toolchain/build_da3_mps.sh' "$ROOT/.github/workflows/toolchain-build.yml"
 toolchain_workflow="$ROOT/.github/workflows/toolchain-build.yml"
-if rg -n 'Homebrew|verify_homebrew_lock|build_(colmap|suitesparse|ceres|openimageio)\.sh' \
+if rg -n 'Homebrew|verify_homebrew_lock|build_suitesparse\.sh' \
   "$toolchain_workflow" "$ROOT/scripts/run.sh" >/dev/null; then
-  echo "Release and local launch paths still require the removed native COLMAP/Homebrew closure." >&2
+  echo "Release and local launch paths still require Homebrew or the retired SuiteSparse builder." >&2
   exit 1
 fi
-grep -q 'colmap" mapper -h' "$ROOT/scripts/toolchain/package_toolchain.sh"
-grep -q 'colmap" --self-check' "$ROOT/scripts/toolchain/package_toolchain.sh"
-grep -Fq 'unexpected COLMAP runtime self-check' "$ROOT/scripts/toolchain/package_toolchain.sh"
-grep -q 'colmap" local_vocab_retriever -h' "$ROOT/scripts/toolchain/package_toolchain.sh"
-grep -q 'colmap" image_undistorter -h' "$ROOT/scripts/toolchain/package_toolchain.sh"
+python3 - "$toolchain_workflow" <<'PY'
+import sys
+from pathlib import Path
+
+workflow = Path(sys.argv[1]).read_text(encoding="utf-8")
+builders = [
+    "build_colmap_support.sh",
+    "build_ceres.sh",
+    "build_openimageio.sh",
+    "build_colmap.sh",
+    "build_msplat.sh",
+    "build_da3_mps.sh",
+    "package_toolchain.sh",
+]
+positions = [workflow.index(f"scripts/toolchain/{builder}") for builder in builders]
+assert positions == sorted(positions), "native toolchain builders run out of dependency order"
+PY
+
+assert_dirty_toolchain_source_rejected() {
+  local relative_path="$1"
+  local fixture_name="${relative_path//\//-}"
+  local fixture="$TMP_DIR/dirty-toolchain-source-$fixture_name"
+  local error_path="$fixture/package.stderr"
+
+  mkdir -p "$fixture/scripts/toolchain" "$(dirname "$fixture/$relative_path")"
+  install -m 0755 \
+    "$ROOT/scripts/toolchain/package_toolchain.sh" \
+    "$fixture/scripts/toolchain/package_toolchain.sh"
+  printf '%s\n' fixture >"$fixture/$relative_path"
+  git -C "$fixture" init -q
+  git -C "$fixture" add .
+  git -C "$fixture" \
+    -c user.name='EasySplat release test' \
+    -c user.email='release-test@easysplat.invalid' \
+    commit -qm 'test fixture'
+
+  printf '%s\n' dirty >>"$fixture/$relative_path"
+  if "$fixture/scripts/toolchain/package_toolchain.sh" --version 2.0.0 \
+    >/dev/null 2>"$error_path"; then
+    echo "Toolchain packaging accepted dirty source input: $relative_path" >&2
+    exit 1
+  fi
+  if ! grep -Fq 'Toolchain source inputs must be committed before release packaging.' \
+    "$error_path"; then
+    cat "$error_path" >&2
+    echo "Toolchain packaging did not reject dirty source input: $relative_path" >&2
+    exit 1
+  fi
+  grep -Fq "$relative_path" "$error_path"
+}
+
+for dirty_toolchain_source in \
+  Tools/NativeColmap/local_vocab_retriever.cc \
+  scripts/ci/generate_msplat_sparse_fixtures.py \
+  scripts/toolchain/da3-model-lock.json \
+  scripts/toolchain/safe_extract_source.py \
+  scripts/toolchain/atomic_swap_install.py \
+  scripts/toolchain/tests/test_colmap_support_builder.py \
+  scripts/toolchain/tests/test_ceres_builder.py \
+  scripts/toolchain/tests/test_openimageio_builder.py \
+  scripts/toolchain/tests/test_native_colmap_retriever.py; do
+  assert_dirty_toolchain_source_rejected "$dirty_toolchain_source"
+done
+
+grep -Fq 'feature_extractor matches_importer local_vocab_retriever mapper' "$ROOT/scripts/toolchain/package_toolchain.sh"
+grep -Fq 'point_triangulator bundle_adjuster model_analyzer image_undistorter model_converter' "$ROOT/scripts/toolchain/package_toolchain.sh"
+grep -Fq 'Native COLMAP does not expose the exact reviewed command surface.' "$ROOT/scripts/toolchain/package_toolchain.sh"
+grep -Fq '"$BIN/colmap" "$command" -h' "$ROOT/scripts/toolchain/package_toolchain.sh"
 grep -Fq 'Mapper.ba_global_frames_ratio' "$ROOT/scripts/toolchain/package_toolchain.sh"
 grep -Fq 'Mapper.ba_local_max_refinements' "$ROOT/scripts/toolchain/package_toolchain.sh"
 grep -Fq 'Mapper.ba_global_points_ratio' "$ROOT/scripts/toolchain/package_toolchain.sh"
@@ -1882,20 +1980,32 @@ grep -Fq 'Mapper.ba_local_function_tolerance' "$ROOT/scripts/toolchain/package_t
 grep -Fq 'Mapper.ba_global_function_tolerance' "$ROOT/scripts/toolchain/package_toolchain.sh"
 grep -Fq 'Mapper.ba_local_num_images' "$ROOT/scripts/toolchain/package_toolchain.sh"
 grep -Fq 'Mapper.random_seed' "$ROOT/scripts/toolchain/package_toolchain.sh"
+grep -Fq 'Mapper.min_num_matches' "$ROOT/scripts/toolchain/package_toolchain.sh"
 grep -Fq 'returned_neighbor_count' "$ROOT/scripts/toolchain/package_toolchain.sh"
 grep -Fq 'minimum_frame_separation' "$ROOT/scripts/toolchain/package_toolchain.sh"
 grep -Fq 'max_training_descriptors' "$ROOT/scripts/toolchain/package_toolchain.sh"
-grep -Fq 'EASYSPLAT_REQUIRE_REAL_PYCOLMAP=1' "$ROOT/scripts/toolchain/package_toolchain.sh"
-grep -q 'easysplat_colmap" --self-check' "$ROOT/scripts/toolchain/build_da3_mps.sh"
-grep -Fq 'unexpected COLMAP runtime self-check' "$ROOT/scripts/toolchain/build_da3_mps.sh"
-grep -Fq 'test_real_pycolmap_local_vocab_retrieval_is_deterministic' \
-  "$ROOT/scripts/toolchain/package_toolchain.sh"
-sed -n \
-  '/EASYSPLAT_REQUIRE_REAL_PYCOLMAP=1/,/test_real_pycolmap_local_vocab_retrieval_is_deterministic/p' \
-  "$ROOT/scripts/toolchain/package_toolchain.sh" \
-  | grep -Fq 'PYTHONPATH="$OUT/da3_mps/app"'
-if grep -q 'colmap" global_mapper -h' "$ROOT/scripts/toolchain/package_toolchain.sh"; then
-  echo "Toolchain package probes the removed global_mapper facade." >&2
+if rg -n 'pycolmap|--self-check|EASYSPLAT_REQUIRE_REAL_PYCOLMAP|test_real_pycolmap|easysplat[_-]colmap[_-]bridge|global_mapper' \
+  "$ROOT/scripts/toolchain/package_toolchain.sh" >/dev/null; then
+  echo "Core packaging retains a Python COLMAP bridge, self-check, or unreviewed command." >&2
+  exit 1
+fi
+for retired_source in \
+  "$ROOT/Tools/Da3Sfm/colmap_launcher.c" \
+  "$ROOT/Tools/Da3Sfm/easysplat_da3_sfm/colmap_cli.py" \
+  "$ROOT/Tools/Da3Sfm/tests/test_colmap_cli.py"; do
+  if [ -e "$retired_source" ]; then
+    echo "Retired DA3 Python COLMAP bridge source still exists: $retired_source" >&2
+    exit 1
+  fi
+done
+if rg -n 'pycolmap|PYCOLMAP|easysplat_colmap|colmap_launcher|colmap_cli\.py|--self-check' \
+  "$ROOT/Tools/Da3Sfm/requirements.in" \
+  "$ROOT/Tools/Da3Sfm/requirements.txt" \
+  "$ROOT/Tools/Da3Sfm/easysplat_da3_sfm" \
+  "$ROOT/scripts/toolchain/build_da3_mps.sh" \
+  "$ROOT/scripts/toolchain/generate_supply_chain_manifest.py" \
+  "$ROOT/scripts/toolchain/package_toolchain.sh" >/dev/null; then
+  echo "Release runtime retains a retired DA3 Python COLMAP bridge surface." >&2
   exit 1
 fi
 grep -q 'DA3_SOURCE_DESCRIPTOR="git:${DA3_REPO}@${DA3_SOURCE_COMMIT}"' "$ROOT/scripts/toolchain/build_da3_mps.sh"
@@ -1934,10 +2044,13 @@ grep -Fq -- '--report "$PIP_INSTALL_REPORT"' "$ROOT/scripts/toolchain/build_da3_
 grep -Fq 'export PYTHONDONTWRITEBYTECODE=1' "$ROOT/scripts/toolchain/build_da3_mps.sh"
 grep -q 'rm -rf "$target"' "$ROOT/scripts/toolchain/build_da3_mps.sh"
 grep -Fq '/usr/bin/lipo -archs "$binary"' "$ROOT/scripts/toolchain/package_toolchain.sh"
-grep -Fq '"$desc" == *"universal binary"*' "$ROOT/scripts/toolchain/package_toolchain.sh"
-grep -Fq 'validate_packaged_architectures' "$ROOT/scripts/toolchain/package_toolchain.sh"
+grep -Fq '"$desc" != *"universal binary"*' "$ROOT/scripts/toolchain/package_toolchain.sh"
 grep -Fq 'require_arm64_only_macho "Packaged native file $relative" "$file"' \
   "$ROOT/scripts/toolchain/package_toolchain.sh"
+grep -Fq '/usr/bin/vtool -show-build "$binary"' "$ROOT/scripts/toolchain/package_toolchain.sh"
+grep -Fq "grep -Fx 'Signature=adhoc'" "$ROOT/scripts/toolchain/package_toolchain.sh"
+grep -Fq "'@rpath/libomp.dylib'" "$ROOT/scripts/toolchain/package_toolchain.sh"
+grep -Fq '"@executable_path/../lib"' "$ROOT/scripts/toolchain/package_toolchain.sh"
 grep -Fq 'validate_arm64_only(source)' "$ROOT/scripts/toolchain/generate_supply_chain_manifest.py"
 grep -q 'source_provenance' "$ROOT/scripts/toolchain/package_toolchain.sh"
 grep -q 'pinned-git' "$ROOT/scripts/toolchain/package_toolchain.sh"
@@ -1949,7 +2062,21 @@ if grep -Fq '"$DA3_SOURCE/" "$DA3_VENDOR/"' "$ROOT/scripts/toolchain/build_da3_m
   exit 1
 fi
 grep -Fq 'test ! -e "$DA3_VENDOR/da3_streaming"' "$ROOT/scripts/toolchain/build_da3_mps.sh"
-grep -q 'require_bundled_arm64_python "da3_mps" "$DA3_PY_BIN"' "$ROOT/scripts/toolchain/package_toolchain.sh"
+grep -Fq 'install -m 0755 "$COLMAP_INSTALL/bin/colmap" "$BIN/colmap"' "$ROOT/scripts/toolchain/package_toolchain.sh"
+grep -Fq 'install -m 0755 "$COLMAP_SUPPORT_INSTALL/lib/libomp.dylib" "$LIB/libomp.dylib"' "$ROOT/scripts/toolchain/package_toolchain.sh"
+grep -Fq 'install -m 0644 "$COLMAP_INSTALL/build_info.json" "$PROVENANCE/colmap.json"' "$ROOT/scripts/toolchain/package_toolchain.sh"
+grep -Fq 'install -m 0644 "$COLMAP_SUPPORT_INSTALL/build_info.json" "$PROVENANCE/colmap-support.json"' "$ROOT/scripts/toolchain/package_toolchain.sh"
+grep -Fq 'install -m 0644 "$CERES_INSTALL/build_info.json" "$PROVENANCE/ceres.json"' "$ROOT/scripts/toolchain/package_toolchain.sh"
+grep -Fq 'install -m 0644 "$OPENIMAGEIO_INSTALL/build_info.json" "$PROVENANCE/openimageio.json"' "$ROOT/scripts/toolchain/package_toolchain.sh"
+grep -Fq 'inputs.get("dependency_receipt_sha256")' "$ROOT/scripts/toolchain/package_toolchain.sh"
+if grep -Fq 'dependency_receipt_canonical_sha256' "$ROOT/scripts/toolchain/package_toolchain.sh"; then
+  echo "Toolchain packaging still expects the superseded canonical dependency receipt field." >&2
+  exit 1
+fi
+if grep -Fq 'EIGEN_INSTALL' "$ROOT/scripts/toolchain/package_toolchain.sh"; then
+  echo "Toolchain packaging still expects a separate Eigen prefix instead of the Ceres-bound dependency tree." >&2
+  exit 1
+fi
 grep -Fq 'find "$OUT/da3_mps/python" -type f -name '\''*.pyc'\'' -delete' "$ROOT/scripts/toolchain/package_toolchain.sh"
 grep -Fq 'find "$OUT/da3_mps/python" -type d -name '\''__pycache__'\'' -empty -delete' "$ROOT/scripts/toolchain/package_toolchain.sh"
 grep -Fq '/usr/bin/codesign --verify --strict "$file"' "$ROOT/scripts/toolchain/package_toolchain.sh"
@@ -1958,37 +2085,42 @@ if grep -Fq '/usr/bin/codesign --force' "$ROOT/scripts/toolchain/package_toolcha
   echo "Toolchain packaging mutates signed wheel Mach-Os and invalidates RECORD hashes." >&2
   exit 1
 fi
-architecture_line="$(grep -n -m1 '^validate_packaged_architectures$' "$ROOT/scripts/toolchain/package_toolchain.sh" | cut -d: -f1)"
-portable_line="$(grep -n -m1 '^validate_portable_dependencies$' "$ROOT/scripts/toolchain/package_toolchain.sh" | cut -d: -f1)"
-verify_line="$(grep -n -m1 '^verify_packaged_signatures$' "$ROOT/scripts/toolchain/package_toolchain.sh" | cut -d: -f1)"
-receipt_line="$(grep -n -m1 '^write_colmap_provenance$' "$ROOT/scripts/toolchain/package_toolchain.sh" | cut -d: -f1)"
-launch_line="$(grep -n -m1 '^colmap_root_help=' "$ROOT/scripts/toolchain/package_toolchain.sh" | cut -d: -f1)"
-# This asserts the command continuation backslash.
-# shellcheck disable=SC1003
-supply_line="$(grep -n -m1 '^"$SUPPLY_CHAIN_GENERATOR" \\' "$ROOT/scripts/toolchain/package_toolchain.sh" | cut -d: -f1)"
-test "$architecture_line" -lt "$portable_line"
-test "$portable_line" -lt "$verify_line"
-test "$verify_line" -lt "$receipt_line"
+receipt_line="$(grep -n -m1 '^validate_native_receipts$' "$ROOT/scripts/toolchain/package_toolchain.sh" | cut -d: -f1)"
+launch_line="$(grep -n -m1 '^validate_native_colmap_cli$' "$ROOT/scripts/toolchain/package_toolchain.sh" | cut -d: -f1)"
+native_line="$(grep -n -m1 '^validate_packaged_native_files$' "$ROOT/scripts/toolchain/package_toolchain.sh" | cut -d: -f1)"
+supply_line="$(grep -n -m1 '^"$SUPPLY_CHAIN_GENERATOR" --toolchain-root' "$ROOT/scripts/toolchain/package_toolchain.sh" | cut -d: -f1)"
 test "$receipt_line" -lt "$launch_line"
-test "$launch_line" -lt "$supply_line"
-grep -Fq 'zip -q -r -D -X "$CORE_ZIP"' "$ROOT/scripts/toolchain/package_toolchain.sh"
-grep -Fq 'zip -q -r -D -X "$DA3_BASE_ZIP" da3_mps/models/DA3-BASE' "$ROOT/scripts/toolchain/package_toolchain.sh"
-grep -Fq 'zip -q -r -D -X "$DA3_SMALL_ZIP" da3_mps/models/DA3-SMALL' "$ROOT/scripts/toolchain/package_toolchain.sh"
+test "$launch_line" -lt "$native_line"
+test "$native_line" -lt "$supply_line"
+grep -Fq 'REPRODUCIBLE_ZIP="$ROOT/scripts/toolchain/create_reproducible_zip.py"' \
+  "$ROOT/scripts/toolchain/package_toolchain.sh"
+test "$(grep -Fc 'python3 "$REPRODUCIBLE_ZIP"' "$ROOT/scripts/toolchain/package_toolchain.sh")" -eq 3
+if grep -Fq 'zip -q -r' "$ROOT/scripts/toolchain/package_toolchain.sh"; then
+  echo "Toolchain packaging still uses host-metadata-dependent ZIP construction." >&2
+  exit 1
+fi
+grep -Fq -- '--output "$CORE_ZIP"' "$ROOT/scripts/toolchain/package_toolchain.sh"
+grep -Fq -- '--output "$DA3_BASE_ZIP"' "$ROOT/scripts/toolchain/package_toolchain.sh"
+grep -Fq -- '--path "da3_mps/models/DA3-BASE"' "$ROOT/scripts/toolchain/package_toolchain.sh"
+grep -Fq -- '--output "$DA3_SMALL_ZIP"' "$ROOT/scripts/toolchain/package_toolchain.sh"
+grep -Fq -- '--path "da3_mps/models/DA3-SMALL"' "$ROOT/scripts/toolchain/package_toolchain.sh"
 grep -Fq 'rm -rf "$target/.cache"' "$ROOT/scripts/toolchain/build_da3_mps.sh"
-grep -Fq 'assert_exact_da3_model_payload "$DA3_MPS_INSTALL/da3_mps/models/$model"' "$ROOT/scripts/toolchain/package_toolchain.sh"
+grep -Fq 'assert_exact_da3_model_payload "$DA3_ROOT/models/$model"' "$ROOT/scripts/toolchain/package_toolchain.sh"
 grep -Fq 'MAX_RELEASE_ASSET_BYTES=2147483648' "$ROOT/scripts/toolchain/package_toolchain.sh"
-grep -Fq 'MAX_NORMAL_PHOTO_INSTALL_BYTES=2500000000' "$ROOT/scripts/toolchain/package_toolchain.sh"
+grep -Fq 'MAX_CORE_DOWNLOAD_BYTES=2500000000' "$ROOT/scripts/toolchain/package_toolchain.sh"
+grep -Fq 'MAX_FULL_DOWNLOAD_BYTES=6000000000' "$ROOT/scripts/toolchain/package_toolchain.sh"
 grep -Fq 'assert_release_asset_size "$CORE_ZIP"' "$ROOT/scripts/toolchain/package_toolchain.sh"
 grep -Fq 'assert_release_asset_size "$DA3_BASE_ZIP"' "$ROOT/scripts/toolchain/package_toolchain.sh"
 grep -Fq 'assert_release_asset_size "$DA3_SMALL_ZIP"' "$ROOT/scripts/toolchain/package_toolchain.sh"
-grep -Fq 'assert_normal_photo_install_size "$CORE_ZIP" "$DA3_BASE_ZIP" "$DA3_SMALL_ZIP"' "$ROOT/scripts/toolchain/package_toolchain.sh"
-grep -Fq 'licenses provenance supply-chain/components.json' "$ROOT/scripts/toolchain/package_toolchain.sh"
-grep -Fq '"easysplat-colmap-bridge"' "$ROOT/scripts/toolchain/generate_supply_chain_manifest.py"
-grep -Fq '"python:pycolmap"' "$ROOT/scripts/toolchain/generate_supply_chain_manifest.py"
-if rg -n 'homebrewBuild|COLMAP_INSTALL|CERES_INSTALL|SUITESPARSE_INSTALL|OPENIMAGEIO_INSTALL|colmap:(faiss|poselib|poissonrecon|vlfeat)|openimageio:' \
+grep -Fq 'assert_download_closure_size "$CORE_ZIP" "$DA3_BASE_ZIP" "$DA3_SMALL_ZIP"' "$ROOT/scripts/toolchain/package_toolchain.sh"
+grep -Fq -- '--path "supply-chain/components.json"' "$ROOT/scripts/toolchain/package_toolchain.sh"
+grep -Fq '"bin/colmap": "colmap"' "$ROOT/scripts/toolchain/generate_supply_chain_manifest.py"
+grep -Fq '"lib/libomp.dylib": "colmap-support:libomp"' "$ROOT/scripts/toolchain/generate_supply_chain_manifest.py"
+grep -Fq '"easysplat-da3-runner"' "$ROOT/scripts/toolchain/generate_supply_chain_manifest.py"
+if rg -n 'homebrewBuild|SUITESPARSE_INSTALL|colmap:poissonrecon|easysplat[_-]colmap[_-]bridge' \
   "$ROOT/scripts/toolchain/package_toolchain.sh" \
   "$ROOT/scripts/toolchain/generate_supply_chain_manifest.py" >/dev/null; then
-  echo "Lean toolchain packaging still references the removed native/Homebrew closure." >&2
+  echo "Lean native toolchain packaging references a forbidden closure." >&2
   exit 1
 fi
 grep -Fq -- '--da3-base-zip "$DA3_BASE_ZIP"' "$ROOT/scripts/run.sh"
@@ -2053,7 +2185,8 @@ msplat_validator="$ROOT/scripts/toolchain/validate_native_msplat.sh"
 
 grep -Fq '"$MSPLAT_VALIDATOR" --source "$MSPLAT_INSTALL/msplat"' "$ROOT/scripts/toolchain/package_toolchain.sh"
 grep -Fq '"$MSPLAT_VALIDATOR" --packaged "$OUT"' "$ROOT/scripts/toolchain/package_toolchain.sh"
-grep -Fq 'msplat/build_info.json msplat/LICENSE' "$ROOT/scripts/toolchain/package_toolchain.sh"
+grep -Fq -- '--path "msplat/build_info.json"' "$ROOT/scripts/toolchain/package_toolchain.sh"
+grep -Fq -- '--path "msplat/LICENSE"' "$ROOT/scripts/toolchain/package_toolchain.sh"
 grep -Fq 'find "$ROOT/Tools/MsplatNative" -type f -newer "$CORE_ZIP"' "$ROOT/scripts/run.sh"
 grep -Fq 'find "$ROOT/Tools/MsplatNative" -type f -newer "$MSPLAT_BUNDLE/build_info.json"' "$ROOT/scripts/run.sh"
 grep -Fq '[ "$MSPLAT_BUILD" -nt "$MSPLAT_BUNDLE/build_info.json" ]' "$ROOT/scripts/run.sh"
@@ -2292,4 +2425,8 @@ if [ "$second_build_succeeded" -eq 1 ]; then
   echo "Concurrent app builds were allowed to corrupt shared release output" >&2
   exit 1
 fi
-grep -Fqi 'app build is already in progress' "$second_build_error"
+if ! grep -Fqi 'app build is already in progress' "$second_build_error"; then
+  echo "Concurrent-build rejection did not report the active build lock" >&2
+  cat "$second_build_error" >&2
+  exit 1
+fi

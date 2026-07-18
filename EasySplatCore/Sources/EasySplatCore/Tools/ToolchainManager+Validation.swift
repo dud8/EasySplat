@@ -13,15 +13,14 @@ extension ToolchainManager {
 
         let colmapCheck: SubprocessResult
         do {
-            colmapCheck = try runner.run(colmap.path, ["-h"])
+            colmapCheck = try runner.run(colmap.path, ["help"])
         } catch {
             throw ToolchainError.invalidToolchain("COLMAP could not be launched.")
         }
         guard colmapCheck.terminationReason == .exit, colmapCheck.exitCode == 0 else {
             throw ToolchainError.invalidToolchain("COLMAP failed to launch (exit \(colmapCheck.exitCode)).")
         }
-        try validateColmapBridgeRoot(colmapCheck)
-        try validateColmapRuntime(executable: colmap)
+        try validateNativeColmapRoot(colmapCheck)
 
         let mapperProbe: SubprocessResult
         do {
@@ -40,7 +39,7 @@ extension ToolchainManager {
             throw ToolchainError.invalidToolchain("COLMAP mapper self-check failed (exit \(mapperProbe.exitCode)).")
         }
         try requireColmapHelpTokens(
-            ColmapBridgeContract.mapperOptions,
+            NativeColmapContract.mapperOptions,
             in: mapperProbe,
             subject: "COLMAP mapper"
         )
@@ -63,7 +62,7 @@ extension ToolchainManager {
             )
         }
         try requireColmapHelpTokens(
-            ColmapBridgeContract.vocabularyOptions,
+            NativeColmapContract.vocabularyOptions,
             in: vocabularyProbe,
             subject: "COLMAP local_vocab_retriever"
         )
@@ -83,21 +82,35 @@ extension ToolchainManager {
         let da3SmallConfigFile = da3FallbackModelBundle.appendingPathComponent("config.json")
         let da3SmallModelInfoFile = da3FallbackModelBundle.appendingPathComponent("easysplat_model_info.json")
         let da3VendorSentinel = da3Root.appendingPathComponent("vendor/depth-anything-3/src/depth_anything_3/api.py")
-
-        guard fileManager.fileExists(atPath: da3SfmTool.path) else {
-            throw ToolchainError.missingBinary("da3_mps/bin/easysplat_da3_sfm")
-        }
-        guard fileManager.fileExists(atPath: da3Python.path) else {
-            throw ToolchainError.missingBinary("da3_mps/python/bin/python3")
-        }
-        guard fileManager.fileExists(atPath: da3BuildInfo.path) else {
-            throw ToolchainError.missingLibrary("da3_mps/build_info.json")
-        }
-        guard fileManager.fileExists(atPath: da3AppSentinel.path) else {
-            throw ToolchainError.missingLibrary("da3_mps/app/easysplat_da3_sfm/run.py")
-        }
         let needsBase = requiredCapabilities.contains(.da3Base)
         let needsSmall = requiredCapabilities.contains(.da3Small)
+        let needsDa3Runtime = requiredCapabilities.contains(.da3Runtime) || needsBase || needsSmall
+        if needsDa3Runtime {
+            guard fileManager.fileExists(atPath: da3SfmTool.path) else {
+                throw ToolchainError.missingBinary("da3_mps/bin/easysplat_da3_sfm")
+            }
+            guard fileManager.fileExists(atPath: da3Python.path) else {
+                throw ToolchainError.missingBinary("da3_mps/python/bin/python3")
+            }
+            guard fileManager.fileExists(atPath: da3BuildInfo.path) else {
+                throw ToolchainError.missingLibrary("da3_mps/build_info.json")
+            }
+            guard fileManager.fileExists(atPath: da3AppSentinel.path) else {
+                throw ToolchainError.missingLibrary("da3_mps/app/easysplat_da3_sfm/run.py")
+            }
+            guard fileManager.fileExists(atPath: da3VendorSentinel.path) else {
+                throw ToolchainError.missingLibrary("da3_mps/vendor/depth-anything-3")
+            }
+
+            ensureExecutable(at: da3SfmTool)
+            ensureExecutable(at: da3Python)
+            try validateBuildInfo(at: da3BuildInfo, expectedToolchainName: "da3_mps")
+            try requireArm64Binary(at: da3Python, label: "da3_mps python")
+            let da3Check = try runner.run(da3SfmTool.path, ["--help"])
+            guard da3Check.exitCode == 0 else {
+                throw ToolchainError.invalidToolchain("da3_mps failed to launch (exit \(da3Check.exitCode)).")
+            }
+        }
         if needsBase || needsSmall {
             guard fileManager.fileExists(atPath: da3Models.path) else {
                 throw ToolchainError.missingLibrary("da3_mps/models")
@@ -125,20 +138,6 @@ extension ToolchainManager {
                 throw ToolchainError.missingLibrary("da3_mps/models/DA3-SMALL/easysplat_model_info.json")
             }
         }
-        guard fileManager.fileExists(atPath: da3VendorSentinel.path) else {
-            throw ToolchainError.missingLibrary("da3_mps/vendor/depth-anything-3")
-        }
-
-        ensureExecutable(at: da3SfmTool)
-        ensureExecutable(at: da3Python)
-        try validateBuildInfo(at: da3BuildInfo, expectedToolchainName: "da3_mps")
-
-        try requireArm64Binary(at: da3Python, label: "da3_mps python")
-        let da3Check = try runner.run(da3SfmTool.path, ["--help"])
-        guard da3Check.exitCode == 0 else {
-            throw ToolchainError.invalidToolchain("da3_mps failed to launch (exit \(da3Check.exitCode)).")
-        }
-
         let da3 = Da3Toolchain(
             root: da3Root,
             sfmTool: da3SfmTool,
@@ -192,24 +191,12 @@ extension ToolchainManager {
         try? fileManager.setAttributes([.posixPermissions: 0o755], ofItemAtPath: url.path)
     }
 
-    private func validateColmapBridgeRoot(_ result: SubprocessResult) throws {
+    private func validateNativeColmapRoot(_ result: SubprocessResult) throws {
         let lines = colmapHelpLines(in: result)
-        let hasReviewedRuntime = lines.contains { line in
-            let fields = line.split(whereSeparator: \Character.isWhitespace)
-            return fields.count >= 2
-                && fields[0] == "pycolmap"
-                && fields[1] == Substring(ColmapBridgeContract.pycolmapVersion)
-        }
-        guard hasReviewedRuntime else {
-            throw ToolchainError.invalidToolchain(
-                "COLMAP bridge requires the reviewed pycolmap \(ColmapBridgeContract.pycolmapVersion) runtime."
-            )
-        }
-
         var insideCommands = false
         var commands = Set<String>()
         for line in lines {
-            if line == "Commands:" {
+            if line == "Available commands:" {
                 insideCommands = true
                 continue
             }
@@ -219,36 +206,19 @@ extension ToolchainManager {
                 commands.insert(String(fields[0]))
             }
         }
-        let missing = ColmapBridgeContract.commands.subtracting(commands).sorted()
-        if !missing.isEmpty {
-            let suffix = missing.count == 1 ? "" : "s"
+        let missing = NativeColmapContract.rootCommands.subtracting(commands).sorted()
+        let unexpected = commands.subtracting(NativeColmapContract.rootCommands).sorted()
+        if !missing.isEmpty || !unexpected.isEmpty {
+            var details: [String] = []
+            if !missing.isEmpty {
+                details.append("missing: \(missing.joined(separator: ", "))")
+            }
+            if !unexpected.isEmpty {
+                details.append("unexpected: \(unexpected.joined(separator: ", "))")
+            }
             throw ToolchainError.invalidToolchain(
-                "COLMAP bridge is missing required command\(suffix): \(missing.joined(separator: ", "))."
+                "Native COLMAP command surface is invalid (\(details.joined(separator: "; ")))."
             )
-        }
-    }
-
-    private func validateColmapRuntime(executable: URL) throws {
-        let result: SubprocessResult
-        do {
-            result = try runner.run(executable.path, ["--self-check"])
-        } catch {
-            throw ToolchainError.invalidToolchain("COLMAP runtime self-check could not be launched.")
-        }
-        guard result.terminationReason == .exit, result.exitCode == 0 else {
-            throw ToolchainError.invalidToolchain(
-                "COLMAP runtime self-check failed (exit \(result.exitCode))."
-            )
-        }
-
-        guard let data = result.stdout.data(using: .utf8),
-              let payload = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-              Set(payload.keys) == ["runtime", "runtime_version", "schema_version", "status"],
-              payload["schema_version"] as? Int == 1,
-              payload["status"] as? String == "ok",
-              payload["runtime"] as? String == "pycolmap",
-              payload["runtime_version"] as? String == ColmapBridgeContract.pycolmapVersion else {
-            throw ToolchainError.invalidToolchain("COLMAP runtime self-check returned an invalid result.")
         }
     }
 
@@ -707,7 +677,8 @@ extension ToolchainManager {
 
     func artifactLooksInstalled(name: String, root: URL) -> Bool {
         if name == "geometry-da3-base" {
-            return da3ModelLooksInstalled(named: "DA3-BASE", root: root)
+            return da3RuntimeLooksInstalled(root: root)
+                && da3ModelLooksInstalled(named: "DA3-BASE", root: root)
         }
         if name == "geometry-da3-small" {
             return da3ModelLooksInstalled(named: "DA3-SMALL", root: root)
@@ -728,6 +699,17 @@ extension ToolchainManager {
             && fileManager.fileExists(atPath: bundle.appendingPathComponent("easysplat_model_info.json").path)
     }
 
+    func da3RuntimeLooksInstalled(root: URL) -> Bool {
+        let da3 = root.appendingPathComponent("da3_mps", isDirectory: true)
+        return fileManager.fileExists(atPath: da3.appendingPathComponent("bin/easysplat_da3_sfm").path)
+            && fileManager.fileExists(atPath: da3.appendingPathComponent("python/bin/python3").path)
+            && fileManager.fileExists(atPath: da3.appendingPathComponent("build_info.json").path)
+            && fileManager.fileExists(atPath: da3.appendingPathComponent("app/easysplat_da3_sfm/run.py").path)
+            && fileManager.fileExists(
+                atPath: da3.appendingPathComponent("vendor/depth-anything-3/src/depth_anything_3/api.py").path
+            )
+    }
+
     func coreToolchainLooksInstalled(root: URL) -> Bool {
         let colmap = root.appendingPathComponent("bin/colmap")
         let msplat = root.appendingPathComponent("msplat", isDirectory: true)
@@ -735,12 +717,6 @@ extension ToolchainManager {
         let msplatMetallib = root.appendingPathComponent("bin/default.metallib")
         let msplatBuildInfo = msplat.appendingPathComponent("build_info.json")
         let msplatLicense = msplat.appendingPathComponent("LICENSE")
-        let da3 = root.appendingPathComponent("da3_mps", isDirectory: true)
-        let da3SfmTool = da3.appendingPathComponent("bin/easysplat_da3_sfm")
-        let da3Python = da3.appendingPathComponent("python/bin/python3")
-        let da3BuildInfo = da3.appendingPathComponent("build_info.json")
-        let da3AppSentinel = da3.appendingPathComponent("app/easysplat_da3_sfm/run.py")
-        let da3VendorSentinel = da3.appendingPathComponent("vendor/depth-anything-3/src/depth_anything_3/api.py")
         let legacyMsplatPresent = [
             root.appendingPathComponent("bin/msplat-train"),
             root.appendingPathComponent("msplat/bin"),
@@ -760,11 +736,6 @@ extension ToolchainManager {
 
         return fileManager.isExecutableFile(atPath: colmap.path)
             && msplatOK
-            && fileManager.fileExists(atPath: da3SfmTool.path)
-            && fileManager.fileExists(atPath: da3Python.path)
-            && fileManager.fileExists(atPath: da3BuildInfo.path)
-            && fileManager.fileExists(atPath: da3AppSentinel.path)
-            && fileManager.fileExists(atPath: da3VendorSentinel.path)
     }
 
     func modelsToolchainLooksInstalled(root: URL) -> Bool {
@@ -789,8 +760,7 @@ extension ToolchainManager {
     }
 }
 
-private enum ColmapBridgeContract {
-    static let pycolmapVersion = "4.1.0"
+private enum NativeColmapContract {
 
     static let commands: Set<String> = [
         "feature_extractor",
@@ -803,6 +773,8 @@ private enum ColmapBridgeContract {
         "image_undistorter",
         "model_converter",
     ]
+
+    static let rootCommands = commands.union(["help", "version"])
 
     static let mapperOptions: Set<String> = [
         "database_path",
@@ -818,6 +790,7 @@ private enum ColmapBridgeContract {
         "Mapper.ba_global_function_tolerance",
         "Mapper.ba_local_num_images",
         "Mapper.random_seed",
+        "Mapper.min_num_matches",
         "Mapper.ba_refine_focal_length",
     ]
 

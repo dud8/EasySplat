@@ -13,19 +13,14 @@ DA3_VENDOR="$VENDOR_DIR/depth-anything-3"
 REQUIREMENTS_LOCK="$ROOT/Tools/Da3Sfm/requirements.txt"
 DA3_RUNTIME_PATCH="$ROOT/Tools/Da3Sfm/patches/da3-api-lazy-export.patch"
 DA3_RUNTIME_PATCH_SHA256="885ade24b466ab3dff04169ff47dd3813d64c40ffd0bdb7dd9b779de97a370eb"
-COLMAP_LAUNCHER_SOURCE="$ROOT/Tools/Da3Sfm/colmap_launcher.c"
-COLMAP_LAUNCHER_SOURCE_SHA256="ab491ab2bf2aac71c7c0e65ae10241dd695aefd7158d967a2244d9ce692f8900"
+DA3_PAYLOAD_VALIDATOR="$ROOT/scripts/toolchain/validate_da3_payload.py"
+DA3_MODEL_LOCK="$ROOT/scripts/toolchain/da3-model-lock.json"
 PIP_INSTALL_REPORT="$INSTALL_DIR/licenses/python-packages-install-report.json"
 SUPPLEMENTAL_LICENSE_MANIFEST="$INSTALL_DIR/licenses/python-package-upstream-notices.json"
 ANTLR_LICENSE_COMMIT="e4c1a74c66bd5290364ea2b36c97cd724b247357"
 ANTLR_LICENSE_URL="https://raw.githubusercontent.com/antlr/antlr4/${ANTLR_LICENSE_COMMIT}/LICENSE.txt"
 ANTLR_LICENSE_SHA256="b1b379fcaf3219593a4c433feb1b35c780bed23fafaae440b1ae2771a9521e3a"
 ANTLR_LICENSE_CACHE="$BUILD_DIR/licenses/antlr4-python3-runtime-4.9.3-LICENSE.txt"
-FAISS_VERSION="1.14.1"
-FAISS_SOURCE_COMMIT="5622e93733b64b2e033362dbdfda019b2ab33ef0"
-FAISS_LICENSE_URL="https://raw.githubusercontent.com/facebookresearch/faiss/${FAISS_SOURCE_COMMIT}/LICENSE"
-FAISS_LICENSE_SHA256="52412d7bc7ce4157ea628bbaacb8829e0a9cb3c58f57f99176126bc8cf2bfc85"
-FAISS_LICENSE_CACHE="$BUILD_DIR/licenses/faiss-${FAISS_VERSION}-LICENSE.txt"
 
 ALLOW_UNPINNED_DA3_SOURCE="${EASYSPLAT_ALLOW_UNPINNED_DA3_SOURCE:-0}"
 if [ -n "${DA3_SOURCE:-}" ] && [ "$ALLOW_UNPINNED_DA3_SOURCE" != "1" ]; then
@@ -41,10 +36,6 @@ done
 DA3_SOURCE="${DA3_SOURCE:-$ROOT/ThirdParty/Depth-Anything-3}"
 DA3_REPO="https://github.com/ByteDance-Seed/Depth-Anything-3.git"
 DA3_REF="41736238f5bced4debf3f2a12375d2466874866d"
-DA3_BASE_REPO="depth-anything/DA3-BASE"
-DA3_SMALL_REPO="depth-anything/DA3-SMALL"
-DA3_BASE_REVISION="f4a6c9b3c95e41c82048423d3493a81ec3fa810e"
-DA3_SMALL_REVISION="e08cab65ca0ec38e7826075418411ab90cab4da3"
 DA3_SOURCE_COMMIT=""
 DA3_SOURCE_DESCRIPTOR=""
 DA3_SOURCE_PROVENANCE=""
@@ -167,35 +158,19 @@ install_supplemental_python_licenses() {
     echo "Expected exactly one antlr4-python3-runtime 4.9.3 distribution." >&2
     exit 1
   fi
-  local -a pycolmap_dist_info=(
-    "$PYTHON_DIR"/lib/python*/site-packages/pycolmap-4.1.0.dist-info
-  )
-  if [ "${#pycolmap_dist_info[@]}" -ne 1 ] || [ ! -d "${pycolmap_dist_info[0]}" ]; then
-    echo "Expected exactly one PyCOLMAP 4.1.0 distribution." >&2
-    exit 1
-  fi
-
   download_verified \
     "$ANTLR_LICENSE_URL" \
     "$ANTLR_LICENSE_CACHE" \
     "$ANTLR_LICENSE_SHA256"
-  download_verified \
-    "$FAISS_LICENSE_URL" \
-    "$FAISS_LICENSE_CACHE" \
-    "$FAISS_LICENSE_SHA256"
 
   local antlr_license="${antlr_dist_info[0]}/licenses/UPSTREAM_LICENSE.txt"
   mkdir -p "$(dirname "$antlr_license")"
   install -m 0644 "$ANTLR_LICENSE_CACHE" "$antlr_license"
-  local faiss_license="${pycolmap_dist_info[0]}/licenses/FAISS-LICENSE"
-  mkdir -p "$(dirname "$faiss_license")"
-  install -m 0644 "$FAISS_LICENSE_CACHE" "$faiss_license"
 
   "$PYTHON_DIR/bin/python3" - \
     "$INSTALL_DIR" \
     "$SUPPLEMENTAL_LICENSE_MANIFEST" \
-    "$antlr_license" \
-    "$faiss_license" <<PY
+    "$antlr_license" <<PY
 import json
 import sys
 from pathlib import Path
@@ -221,18 +196,6 @@ payload = {
             "distInfo": "antlr4_python3_runtime-4.9.3.dist-info",
             "filename": "UPSTREAM_LICENSE.txt",
             "installedPath": relative(sys.argv[3]),
-        },
-        {
-            "package": "faiss",
-            "version": "${FAISS_VERSION}",
-            "license": "MIT",
-            "source": "https://github.com/facebookresearch/faiss",
-            "sourceCommit": "${FAISS_SOURCE_COMMIT}",
-            "artifact": "${FAISS_LICENSE_URL}",
-            "artifactSha256": "${FAISS_LICENSE_SHA256}",
-            "distInfo": "pycolmap-4.1.0.dist-info",
-            "filename": "FAISS-LICENSE",
-            "installedPath": relative(sys.argv[4]),
         },
     ],
 }
@@ -284,6 +247,43 @@ remove_build_only_python_tools() {
   fi
 }
 
+materialize_runtime_symlinks() {
+  python3 - "$INSTALL_DIR" <<'PY'
+import os
+import shutil
+import sys
+from pathlib import Path
+
+root = Path(sys.argv[1]).resolve(strict=True)
+links = []
+for path in sorted(root.rglob("*")):
+    if not path.is_symlink():
+        continue
+    try:
+        target = path.resolve(strict=True)
+        target.relative_to(root)
+    except (OSError, ValueError) as exc:
+        raise SystemExit(f"DA3 runtime has an unsafe symlink: {path}: {exc}") from exc
+    if not target.is_file():
+        raise SystemExit(
+            f"DA3 runtime symlink does not resolve to an internal regular file: {path}"
+        )
+    links.append((path, target))
+
+for index, (path, target) in enumerate(links):
+    temporary = path.with_name(f".{path.name}.materialize-{os.getpid()}-{index}")
+    try:
+        shutil.copy2(target, temporary, follow_symlinks=True)
+        os.replace(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+remaining = [path for path in root.rglob("*") if path.is_symlink()]
+if remaining:
+    raise SystemExit(f"DA3 runtime still contains symlinks: {remaining}")
+PY
+}
+
 require_arm64_python() {
   local arch
   arch="$("$PYTHON_DIR/bin/python3" - <<'PY'
@@ -310,34 +310,6 @@ verify_runtime_patch() {
   fi
 }
 
-build_colmap_launcher() {
-  if [ ! -f "$COLMAP_LAUNCHER_SOURCE" ] || [ -L "$COLMAP_LAUNCHER_SOURCE" ]; then
-    echo "COLMAP launcher source is missing or is not a regular file: $COLMAP_LAUNCHER_SOURCE" >&2
-    exit 1
-  fi
-  local actual_sha256
-  actual_sha256="$(shasum -a 256 "$COLMAP_LAUNCHER_SOURCE" | awk '{print $1}')"
-  if [ "$actual_sha256" != "$COLMAP_LAUNCHER_SOURCE_SHA256" ]; then
-    echo "COLMAP launcher source checksum mismatch: expected $COLMAP_LAUNCHER_SOURCE_SHA256, got $actual_sha256" >&2
-    exit 1
-  fi
-  xcrun clang \
-    -arch arm64 \
-    -mmacosx-version-min=15.0 \
-    -O2 \
-    -Wall \
-    -Wextra \
-    -Werror \
-    "$COLMAP_LAUNCHER_SOURCE" \
-    -o "$BIN_DIR/easysplat_colmap"
-  chmod +x "$BIN_DIR/easysplat_colmap"
-  /usr/bin/file -b "$BIN_DIR/easysplat_colmap" | \
-    grep -q 'Mach-O 64-bit executable arm64' || {
-      echo "COLMAP launcher is not an arm64 Mach-O executable." >&2
-      exit 1
-    }
-}
-
 verify_torch_mps() {
   PYTHONNOUSERSITE=1 "$PYTHON_DIR/bin/python3" - <<'PY'
 import sys
@@ -356,20 +328,39 @@ PY
 }
 
 download_model() {
-  local repo_id="$1"
-  local local_name="$2"
-  local revision="$3"
+  local local_name="$1"
   local target="$MODELS_DIR/$local_name"
   rm -rf "$target"
   mkdir -p "$target"
-  echo "Downloading ${repo_id}@${revision} into $target"
-  HF_HUB_DISABLE_TELEMETRY=1 DO_NOT_TRACK=1 PYTHONNOUSERSITE=1 "$PYTHON_DIR/bin/python3" - <<PY
+  HF_HUB_DISABLE_TELEMETRY=1 DO_NOT_TRACK=1 PYTHONNOUSERSITE=1 \
+    "$PYTHON_DIR/bin/python3" - "$DA3_MODEL_LOCK" "$local_name" "$target" <<'PY'
+import hashlib
 import json
+import sys
 from pathlib import Path
 
 from huggingface_hub import model_info, snapshot_download
 
-info = model_info(repo_id="${repo_id}", revision="${revision}")
+lock_path = Path(sys.argv[1])
+local_name = sys.argv[2]
+target = Path(sys.argv[3])
+lock = json.loads(lock_path.read_text(encoding="utf-8"))
+try:
+    expected = lock["models"][local_name]
+    repo_id = expected["repo_id"]
+    revision = expected["requested_revision"]
+except (KeyError, TypeError) as exc:
+    raise SystemExit(f"invalid DA3 model lock for {local_name}: {exc}") from exc
+
+def sha256(path):
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+print(f"Downloading {repo_id}@{revision} into {target}")
+info = model_info(repo_id=repo_id, revision=revision)
 license_value = ""
 card_data = getattr(info, "cardData", None)
 if isinstance(card_data, dict):
@@ -378,24 +369,36 @@ elif card_data is not None and getattr(card_data, "license", None):
     license_value = str(card_data.license).lower()
 tags = {str(tag).lower() for tag in (getattr(info, "tags", None) or [])}
 if license_value != "apache-2.0" and "license:apache-2.0" not in tags:
-    raise SystemExit(f"${repo_id}@${revision} is not Apache-2.0 (license={license_value!r}, tags={sorted(tags)!r})")
+    raise SystemExit(
+        f"{repo_id}@{revision} is not Apache-2.0 "
+        f"(license={license_value!r}, tags={sorted(tags)!r})"
+    )
+if info.sha != expected["resolved_sha"]:
+    raise SystemExit(
+        f"{repo_id}@{revision} resolved to {info.sha}, expected "
+        f"{expected['resolved_sha']}"
+    )
+if expected["license"] != "apache-2.0":
+    raise SystemExit(f"{repo_id}@{revision} has an unreviewed locked license")
 
 snapshot_download(
-    repo_id="${repo_id}",
-    revision="${revision}",
-    local_dir="${target}",
-    allow_patterns=["config.json", "model.safetensors", "*.json", "*.safetensors"],
+    repo_id=repo_id,
+    revision=revision,
+    local_dir=target,
+    allow_patterns=["config.json", "model.safetensors"],
 )
-Path("${target}/easysplat_model_info.json").write_text(
-    json.dumps(
-        {
-            "repo_id": "${repo_id}",
-            "requested_revision": "${revision}",
-            "resolved_sha": info.sha,
-            "license": license_value or "apache-2.0",
-        },
-        indent=2,
-    )
+for filename in ("config.json", "model.safetensors"):
+    path = target / filename
+    artifact = expected["artifacts"][filename]
+    if not path.is_file() or path.is_symlink():
+        raise SystemExit(f"missing regular DA3 model artifact: {path}")
+    if path.stat().st_size != artifact["size_bytes"]:
+        raise SystemExit(f"DA3 model artifact byte size mismatch: {path}")
+    if sha256(path) != artifact["sha256"]:
+        raise SystemExit(f"DA3 model artifact SHA-256 mismatch: {path}")
+
+(target / "easysplat_model_info.json").write_text(
+    json.dumps(expected, indent=2, sort_keys=True)
     + "\n",
     encoding="utf-8",
 )
@@ -500,9 +503,8 @@ if [ ! -f "$DA3_VENDOR/src/depth_anything_3/api.py" ]; then
 fi
 
 stage_da3_app
-build_colmap_launcher
-download_model "$DA3_BASE_REPO" "DA3-BASE" "$DA3_BASE_REVISION"
-download_model "$DA3_SMALL_REPO" "DA3-SMALL" "$DA3_SMALL_REVISION"
+download_model "DA3-BASE"
+download_model "DA3-SMALL"
 
 PYTHONNOUSERSITE=1 "$PYTHON_DIR/bin/python3" - <<PY
 import hashlib
@@ -523,16 +525,12 @@ requirements_lock = Path("${REQUIREMENTS_LOCK}")
 requirements_lock_sha256 = hashlib.sha256(requirements_lock.read_bytes()).hexdigest()
 runtime_patch = Path("${DA3_RUNTIME_PATCH}")
 runtime_patch_sha256 = hashlib.sha256(runtime_patch.read_bytes()).hexdigest()
-colmap_launcher_source = Path("${COLMAP_LAUNCHER_SOURCE}")
-colmap_launcher_source_sha256 = hashlib.sha256(colmap_launcher_source.read_bytes()).hexdigest()
-colmap_launcher = Path("${BIN_DIR}/easysplat_colmap")
-colmap_launcher_sha256 = hashlib.sha256(colmap_launcher.read_bytes()).hexdigest()
-colmap_bridge_source = Path("${APP_DIR}/easysplat_da3_sfm/colmap_cli.py")
-colmap_bridge_source_sha256 = hashlib.sha256(colmap_bridge_source.read_bytes()).hexdigest()
 supplemental_license_manifest = Path("${SUPPLEMENTAL_LICENSE_MANIFEST}")
 supplemental_license_manifest_sha256 = hashlib.sha256(
     supplemental_license_manifest.read_bytes()
 ).hexdigest()
+model_lock = Path("${DA3_MODEL_LOCK}")
+model_lock_sha256 = hashlib.sha256(model_lock.read_bytes()).hexdigest()
 
 Path("${INSTALL_DIR}").mkdir(parents=True, exist_ok=True)
 Path("${INSTALL_DIR}/build_info.json").write_text(
@@ -546,12 +544,14 @@ Path("${INSTALL_DIR}/build_info.json").write_text(
             "source_provenance": "${DA3_SOURCE_PROVENANCE}",
             "expected_upstream_repo": "${DA3_REPO}",
             "expected_upstream_ref": "${DA3_REF}",
-            "base_checkpoint_repo": "${DA3_BASE_REPO}",
-            "base_checkpoint_revision": "${DA3_BASE_REVISION}",
+            "base_checkpoint_repo": base_info["repo_id"],
+            "base_checkpoint_revision": base_info["requested_revision"],
             "base_checkpoint_commit": base_info["resolved_sha"],
-            "small_checkpoint_repo": "${DA3_SMALL_REPO}",
-            "small_checkpoint_revision": "${DA3_SMALL_REVISION}",
+            "small_checkpoint_repo": small_info["repo_id"],
+            "small_checkpoint_revision": small_info["requested_revision"],
             "small_checkpoint_commit": small_info["resolved_sha"],
+            "model_lock": "scripts/toolchain/da3-model-lock.json",
+            "model_lock_sha256": model_lock_sha256,
             "python_version": platform.python_version(),
             "python_standalone_url": "${PYTHON_STANDALONE_URL}",
             "python_standalone_sha256": "${PYTHON_STANDALONE_SHA256}",
@@ -561,11 +561,6 @@ Path("${INSTALL_DIR}/build_info.json").write_text(
             "requirements_lock_sha256": requirements_lock_sha256,
             "runtime_patch": "Tools/Da3Sfm/patches/da3-api-lazy-export.patch",
             "runtime_patch_sha256": runtime_patch_sha256,
-            "colmap_launcher_source": "Tools/Da3Sfm/colmap_launcher.c",
-            "colmap_launcher_source_sha256": colmap_launcher_source_sha256,
-            "colmap_launcher_sha256": colmap_launcher_sha256,
-            "colmap_bridge_source": "Tools/Da3Sfm/easysplat_da3_sfm/colmap_cli.py",
-            "colmap_bridge_source_sha256": colmap_bridge_source_sha256,
             "supplemental_license_manifest": "licenses/python-package-upstream-notices.json",
             "supplemental_license_manifest_sha256": supplemental_license_manifest_sha256,
             "pip_install_report": "licenses/python-packages-install-report.json",
@@ -607,44 +602,20 @@ exec "$PY" -m easysplat_da3_sfm.run "$@"
 SCRIPT
 chmod +x "$BIN_DIR/easysplat_da3_sfm"
 
+materialize_runtime_symlinks
+
 KMP_DUPLICATE_LIB_OK=TRUE PYTHONDONTWRITEBYTECODE=1 PYTHONNOUSERSITE=1 \
   PYTHONPATH="$APP_DIR:$DA3_VENDOR/src" "$PYTHON_DIR/bin/python3" - <<'PY'
 import sys
 try:
-    import pycolmap
     import depth_anything_3.api  # noqa: F401
     import easysplat_da3_sfm  # noqa: F401
 except Exception as exc:  # noqa: BLE001
     sys.stderr.write(f"da3_mps import sanity check failed: {exc}\n")
     raise SystemExit(1)
-if pycolmap.__version__ != "4.1.0" or not callable(
-    getattr(pycolmap, "match_image_pairs", None)
-):
-    raise SystemExit("da3_mps requires the reviewed PyCOLMAP 4.1.0 pair matcher")
 PY
 
 "$BIN_DIR/easysplat_da3_sfm" --help >/dev/null
-"$BIN_DIR/easysplat_colmap" -h >/dev/null
-colmap_self_check="$("$BIN_DIR/easysplat_colmap" --self-check)" || {
-  echo "da3_mps COLMAP runtime self-check failed" >&2
-  exit 1
-}
-"$PYTHON_DIR/bin/python3" - "$colmap_self_check" <<'PY'
-import json
-import sys
-
-expected = {
-    "runtime": "pycolmap",
-    "runtime_version": "4.1.0",
-    "schema_version": 1,
-    "status": "ok",
-}
-try:
-    payload = json.loads(sys.argv[1])
-except (IndexError, json.JSONDecodeError) as exc:
-    raise SystemExit(f"invalid COLMAP runtime self-check JSON: {exc}") from exc
-if payload != expected:
-    raise SystemExit(f"unexpected COLMAP runtime self-check: {payload!r}")
-PY
+python3 "$DA3_PAYLOAD_VALIDATOR" --root "$INSTALL_DIR"
 
 echo "da3_mps ready at $INSTALL_DIR"

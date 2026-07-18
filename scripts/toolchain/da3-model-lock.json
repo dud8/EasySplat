@@ -1,0 +1,37 @@
+{
+  "models": {
+    "DA3-BASE": {
+      "artifacts": {
+        "config.json": {
+          "sha256": "5e34115ebc17bd2d8d43033c5f72e9446ac8833fd61d3fa160b7e67e0bb5b7b5",
+          "size_bytes": 1205
+        },
+        "model.safetensors": {
+          "sha256": "e01067dc1659613083d9145a9a2547ccdbe6ccbbf83c4fe7b3e8a4e2bdae78b5",
+          "size_bytes": 541518028
+        }
+      },
+      "license": "apache-2.0",
+      "repo_id": "depth-anything/DA3-BASE",
+      "requested_revision": "f4a6c9b3c95e41c82048423d3493a81ec3fa810e",
+      "resolved_sha": "f4a6c9b3c95e41c82048423d3493a81ec3fa810e"
+    },
+    "DA3-SMALL": {
+      "artifacts": {
+        "config.json": {
+          "sha256": "a486e29e82b7ab4a7d4cefc1ea4526cfe2ae438a572c8ca98917cfbcde7447d2",
+          "size_bytes": 1202
+        },
+        "model.safetensors": {
+          "sha256": "364492e38a3a06d221ac75da7f6621ada3f2361cd24fde11ba79091e9f40efcf",
+          "size_bytes": 137248940
+        }
+      },
+      "license": "apache-2.0",
+      "repo_id": "depth-anything/DA3-SMALL",
+      "requested_revision": "e08cab65ca0ec38e7826075418411ab90cab4da3",
+      "resolved_sha": "e08cab65ca0ec38e7826075418411ab90cab4da3"
+    }
+  },
+  "schema_version": 1
+}

@@ -69,6 +69,69 @@ final class ReleaseSigningTests: XCTestCase {
         ))
     }
 
+    func testPrepareReleaseRejectsUnexpectedCoreAndBasePayloads() throws {
+        let fixture = try makeFixture()
+        defer { fixture.remove() }
+
+        let unexpectedCore = try makeZip(
+            named: "unexpected-core",
+            files: Dictionary(uniqueKeysWithValues:
+                (ManifestToolDefaults.criticalCoreFiles + ["bin/unreviewed-helper"]).map {
+                    ($0, Data($0.utf8))
+                }
+            ),
+            in: fixture.root
+        )
+        var coreInputs = fixture.inputs
+        coreInputs[0] = ManifestArtifactInput(
+            name: coreInputs[0].name,
+            artifactURL: coreInputs[0].artifactURL,
+            zipURL: unexpectedCore,
+            capabilities: coreInputs[0].capabilities,
+            dependencies: coreInputs[0].dependencies,
+            requirement: coreInputs[0].requirement,
+            criticalFilePaths: coreInputs[0].criticalFilePaths
+        )
+        XCTAssertThrowsError(try ManifestBuilder.prepareRelease(
+            repository: repository,
+            sourceCommit: sourceCommit,
+            version: version,
+            publishedAt: Date(timeIntervalSince1970: 0),
+            appVersionRange: appRange,
+            publicKeyBase64: fixture.publicKeyBase64,
+            components: coreInputs
+        ))
+
+        let unexpectedBase = try makeZip(
+            named: "unexpected-base",
+            files: Dictionary(uniqueKeysWithValues:
+                (ManifestToolDefaults.da3BaseContents + ["da3_mps/models/DA3-LARGE/model.safetensors"]).map {
+                    ($0, Data($0.utf8))
+                }
+            ),
+            in: fixture.root
+        )
+        var baseInputs = fixture.inputs
+        baseInputs[1] = ManifestArtifactInput(
+            name: baseInputs[1].name,
+            artifactURL: baseInputs[1].artifactURL,
+            zipURL: unexpectedBase,
+            capabilities: baseInputs[1].capabilities,
+            dependencies: baseInputs[1].dependencies,
+            requirement: baseInputs[1].requirement,
+            criticalFilePaths: baseInputs[1].criticalFilePaths
+        )
+        XCTAssertThrowsError(try ManifestBuilder.prepareRelease(
+            repository: repository,
+            sourceCommit: sourceCommit,
+            version: version,
+            publishedAt: Date(timeIntervalSince1970: 0),
+            appVersionRange: appRange,
+            publicKeyBase64: fixture.publicKeyBase64,
+            components: baseInputs
+        ))
+    }
+
     func testReleaseCommandArgumentsRejectUnknownAndDuplicateOptions() throws {
         let unknown = ArgParser(["--request", "request.json", "--archive", "payload.zip"])
         XCTAssertThrowsError(try unknown.requireOnly(["--request"]))
@@ -111,8 +174,8 @@ final class ReleaseSigningTests: XCTestCase {
             publicKeyBase64: publicKeyBase64,
             inputs: [
                 .init(name: "macos-arm64-core", artifactURL: urls["macos-arm64-core"]!, zipURL: core, capabilities: ManifestToolDefaults.coreCapabilities, dependencies: [], requirement: .required, criticalFilePaths: ManifestToolDefaults.criticalCoreFiles),
-                .init(name: "geometry-da3-base", artifactURL: urls["geometry-da3-base"]!, zipURL: base, capabilities: ["geometry.da3.base"], dependencies: ["macos-arm64-core"], requirement: .required, criticalFilePaths: ManifestToolDefaults.da3BaseContents),
-                .init(name: "geometry-da3-small", artifactURL: urls["geometry-da3-small"]!, zipURL: small, capabilities: ["geometry.da3.small"], dependencies: ["macos-arm64-core"], requirement: .optional, criticalFilePaths: ManifestToolDefaults.da3SmallContents),
+                .init(name: "geometry-da3-base", artifactURL: urls["geometry-da3-base"]!, zipURL: base, capabilities: ["geometry.da3.runtime", "geometry.da3.base"], dependencies: ["macos-arm64-core"], requirement: .optional, criticalFilePaths: ManifestToolDefaults.da3BaseContents),
+                .init(name: "geometry-da3-small", artifactURL: urls["geometry-da3-small"]!, zipURL: small, capabilities: ["geometry.da3.small"], dependencies: ["geometry-da3-base"], requirement: .optional, criticalFilePaths: ManifestToolDefaults.da3SmallContents),
             ]
         )
     }

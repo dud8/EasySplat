@@ -31,6 +31,8 @@ required_files=(
   "$ROOT/scripts/benchmark/tests/test_aggregate_evidence.py"
   "$ROOT/scripts/release/verify_publication_bundle.py"
   "$ROOT/scripts/release/tests/test_verify_publication_bundle.py"
+  "$ROOT/scripts/toolchain/validate_da3_payload.py"
+  "$ROOT/scripts/toolchain/tests/test_da3_payload.py"
   "$ROOT/.github/workflows/benchmark-release.yml"
 )
 
@@ -87,6 +89,10 @@ fi
 
 toolchain_workflow="$ROOT/.github/workflows/toolchain-build.yml"
 for builder in \
+  build_colmap_support.sh \
+  build_ceres.sh \
+  build_openimageio.sh \
+  build_colmap.sh \
   build_msplat.sh \
   build_da3_mps.sh; do
   if ! rg -n "scripts/toolchain/$builder" "$toolchain_workflow" >/dev/null; then
@@ -95,16 +101,49 @@ for builder in \
   fi
 done
 
-for retired_builder in \
-  build_suitesparse.sh \
-  build_ceres.sh \
-  build_openimageio.sh \
-  build_colmap.sh; do
-  if rg -n "scripts/toolchain/$retired_builder" "$toolchain_workflow" >/dev/null; then
-    echo "Toolchain workflow restored retired native builder $retired_builder: $toolchain_workflow" >&2
+if rg -n 'scripts/toolchain/build_suitesparse\.sh' "$toolchain_workflow" >/dev/null; then
+  echo "Toolchain workflow restored retired native SuiteSparse builder: $toolchain_workflow" >&2
+  exit 1
+fi
+
+python3 - "$toolchain_workflow" <<'PY'
+import sys
+from pathlib import Path
+
+workflow = Path(sys.argv[1]).read_text(encoding="utf-8")
+builders = [
+    "build_colmap_support.sh",
+    "build_ceres.sh",
+    "build_openimageio.sh",
+    "build_colmap.sh",
+    "build_msplat.sh",
+    "build_da3_mps.sh",
+    "package_toolchain.sh",
+]
+positions = [workflow.index(f"scripts/toolchain/{builder}") for builder in builders]
+if positions != sorted(positions):
+    raise SystemExit("Toolchain workflow build order is not the reviewed native release order.")
+PY
+
+for retired_source in \
+  "$ROOT/Tools/Da3Sfm/colmap_launcher.c" \
+  "$ROOT/Tools/Da3Sfm/easysplat_da3_sfm/colmap_cli.py" \
+  "$ROOT/Tools/Da3Sfm/tests/test_colmap_cli.py"; do
+  if [ -e "$retired_source" ]; then
+    echo "Retired DA3 Python COLMAP bridge source still exists: $retired_source" >&2
     exit 1
   fi
 done
+if rg -n 'pycolmap|PYCOLMAP|easysplat_colmap|colmap_launcher|colmap_cli\.py|--self-check' \
+  "$ROOT/Tools/Da3Sfm/requirements.in" \
+  "$ROOT/Tools/Da3Sfm/requirements.txt" \
+  "$ROOT/Tools/Da3Sfm/easysplat_da3_sfm" \
+  "$ROOT/scripts/toolchain/build_da3_mps.sh" \
+  "$ROOT/scripts/toolchain/generate_supply_chain_manifest.py" \
+  "$ROOT/scripts/toolchain/package_toolchain.sh" >/dev/null; then
+  echo "Release runtime retains a retired DA3 Python COLMAP bridge surface." >&2
+  exit 1
+fi
 
 if rg -n 'brew install .*\b(suitesparse|ceres-solver|cgal|freeimage|qt)\b' \
   "$ROOT/.github/workflows/toolchain-build.yml" >/dev/null; then
@@ -153,7 +192,6 @@ fi
 if rg -n -i 'global_mapper|globalmapper|global mapper' \
   "$ROOT/EasySplatCore/Sources" \
   "$ROOT/EasySplatApp" \
-  "$ROOT/Tools/Da3Sfm/easysplat_da3_sfm/colmap_cli.py" \
   "$ROOT/scripts/toolchain/build_colmap.sh" \
   "$ROOT/scripts/toolchain/package_toolchain.sh" >/dev/null; then
   echo "The rejected COLMAP global-mapper candidate remains in a runtime surface." >&2
@@ -166,4 +204,5 @@ if git -C "$ROOT" ls-files scripts/benchmark | rg '(^|/)suite\.json$|(^|/)raw/|\
 fi
 
 python3 -m unittest discover -s "$ROOT/scripts/benchmark/tests" -p 'test_*.py' >/dev/null
+python3 "$ROOT/scripts/toolchain/tests/test_da3_payload.py" >/dev/null
 "$ROOT/scripts/benchmark/run_suite.sh" --profile release --dry-run >/dev/null

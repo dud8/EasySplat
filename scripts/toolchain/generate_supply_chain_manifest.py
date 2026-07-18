@@ -18,19 +18,7 @@ from pathlib import Path, PurePosixPath
 from typing import Any, NoReturn
 
 
-PYCOLMAP_VERSION = "4.1.0"
-PYCOLMAP_SOURCE_COMMIT = "fa8e3b3ff591552855f8ad2806723c80f963f69c"
-FAISS_VERSION = "1.14.1"
-FAISS_SOURCE_COMMIT = "5622e93733b64b2e033362dbdfda019b2ab33ef0"
-FAISS_SOURCE_ARCHIVE_URL = (
-    "https://github.com/facebookresearch/faiss/archive/refs/tags/v1.14.1.zip"
-)
-FAISS_SOURCE_ARCHIVE_SHA256 = (
-    "4b1ae7e7a0a46385b4084f0e3945623a15fcf99d793bf44d82aae8e24f11e5f5"
-)
-FAISS_LICENSE_SHA256 = (
-    "52412d7bc7ce4157ea628bbaacb8829e0a9cb3c58f57f99176126bc8cf2bfc85"
-)
+DA3_MODEL_LOCK = Path(__file__).resolve().with_name("da3-model-lock.json")
 FORBIDDEN_LICENSE = re.compile(r"AGPL|(?<!L)GPL|NON.?COMMERCIAL", re.IGNORECASE)
 MACHO_MAGICS = {
     b"\xca\xfe\xba\xbe",
@@ -78,7 +66,11 @@ REVIEWED_LICENSE_IDENTIFIERS = {
     "MPL-2.0",
     "PSF-2.0",
     "Python-2.0",
+    "IJG",
+    "Zlib",
+    "libpng-2.0",
 }
+REVIEWED_LICENSE_EXCEPTIONS = {"LLVM-exception"}
 REVIEWED_SUPPLEMENTAL_LICENSES = {
     "antlr4-python3-runtime": {
         "package": "antlr4-python3-runtime",
@@ -90,20 +82,6 @@ REVIEWED_SUPPLEMENTAL_LICENSES = {
         "artifactSha256": "b1b379fcaf3219593a4c433feb1b35c780bed23fafaae440b1ae2771a9521e3a",
         "distInfo": "antlr4_python3_runtime-4.9.3.dist-info",
         "filename": "UPSTREAM_LICENSE.txt",
-    },
-    "faiss": {
-        "package": "faiss",
-        "version": FAISS_VERSION,
-        "license": "MIT",
-        "source": "https://github.com/facebookresearch/faiss",
-        "sourceCommit": FAISS_SOURCE_COMMIT,
-        "artifact": (
-            "https://raw.githubusercontent.com/facebookresearch/faiss/"
-            f"{FAISS_SOURCE_COMMIT}/LICENSE"
-        ),
-        "artifactSha256": FAISS_LICENSE_SHA256,
-        "distInfo": f"pycolmap-{PYCOLMAP_VERSION}.dist-info",
-        "filename": "FAISS-LICENSE",
     },
 }
 CLASSIFIER_LICENSES = {
@@ -152,6 +130,56 @@ def load_json(path: Path) -> dict[str, Any]:
     if not isinstance(payload, dict):
         fail(f"receipt must be an object: {path}")
     return payload
+
+
+def load_da3_model_lock() -> dict[str, dict[str, Any]]:
+    lock = load_json(DA3_MODEL_LOCK)
+    if set(lock) != {"schema_version", "models"} or lock.get("schema_version") != 1:
+        fail("DA3 model lock does not match schema 1")
+    models = lock.get("models")
+    if not isinstance(models, dict) or set(models) != {"DA3-BASE", "DA3-SMALL"}:
+        fail("DA3 model lock must contain exactly DA3-BASE and DA3-SMALL")
+    expected_fields = {
+        "repo_id",
+        "requested_revision",
+        "resolved_sha",
+        "license",
+        "artifacts",
+    }
+    for model_name, model in models.items():
+        if not isinstance(model, dict) or set(model) != expected_fields:
+            fail(f"{model_name} model lock fields do not match the reviewed contract")
+        if model.get("license") != "apache-2.0":
+            fail(f"{model_name} model lock has an unreviewed license")
+        revision = model.get("requested_revision")
+        if (
+            not isinstance(revision, str)
+            or not re.fullmatch(r"[0-9a-f]{40}", revision)
+            or model.get("resolved_sha") != revision
+        ):
+            fail(f"{model_name} model lock has an invalid revision")
+        repo_id = model.get("repo_id")
+        if not isinstance(repo_id, str) or not repo_id:
+            fail(f"{model_name} model lock has an invalid repo_id")
+        artifacts = model.get("artifacts")
+        if not isinstance(artifacts, dict) or set(artifacts) != {
+            "config.json",
+            "model.safetensors",
+        }:
+            fail(f"{model_name} model lock has an incomplete artifact closure")
+        for filename, artifact in artifacts.items():
+            if not isinstance(artifact, dict) or set(artifact) != {
+                "sha256",
+                "size_bytes",
+            }:
+                fail(f"{model_name} {filename} lock fields are invalid")
+            size = artifact.get("size_bytes")
+            digest = artifact.get("sha256")
+            if isinstance(size, bool) or not isinstance(size, int) or size <= 0:
+                fail(f"{model_name} {filename} has an invalid locked byte size")
+            if not isinstance(digest, str) or not re.fullmatch(r"[0-9a-f]{64}", digest):
+                fail(f"{model_name} {filename} has an invalid locked SHA-256")
+    return models
 
 
 def relative(path: Path, root: Path) -> str:
@@ -333,7 +361,9 @@ def normalize_license(value: Any) -> str:
     if FORBIDDEN_LICENSE.search(normalized):
         fail(f"forbidden release license: {normalized}")
     compact = re.sub(r"\s+", "", normalized)
-    tokens = re.findall(r"\(|\)|AND|OR|[A-Za-z0-9][A-Za-z0-9.+-]*", normalized)
+    tokens = re.findall(
+        r"\(|\)|AND|OR|WITH|[A-Za-z0-9][A-Za-z0-9.+-]*", normalized
+    )
     if "".join(tokens) != compact:
         fail(f"unreviewed license expression: {normalized}")
 
@@ -354,6 +384,14 @@ def normalize_license(value: Any) -> str:
         if token not in REVIEWED_LICENSE_IDENTIFIERS:
             fail(f"unreviewed license identifier: {token}")
         position += 1
+        if position < len(tokens) and tokens[position] == "WITH":
+            position += 1
+            if (
+                position >= len(tokens)
+                or tokens[position] not in REVIEWED_LICENSE_EXCEPTIONS
+            ):
+                fail(f"unreviewed license exception: {normalized}")
+            position += 1
 
     def parse_and_expression() -> None:
         nonlocal position
@@ -402,13 +440,21 @@ def metadata_license(metadata: email.message.Message) -> str:
 
 
 def component_build_command(component_id: str, component: dict[str, Any]) -> str:
+    if component_id == "colmap" or component_id.startswith("colmap:"):
+        return "./scripts/toolchain/build_colmap.sh"
+    if component_id == "colmap-support" or component_id.startswith(
+        "colmap-support:"
+    ):
+        return "./scripts/toolchain/build_colmap_support.sh"
+    if component_id == "ceres" or component_id.startswith("ceres:"):
+        return "./scripts/toolchain/build_ceres.sh"
+    if component_id == "openimageio" or component_id.startswith("openimageio:"):
+        return "./scripts/toolchain/build_openimageio.sh"
     if component_id == "msplat" or component_id.startswith("msplat:"):
         return "./scripts/toolchain/build_msplat.sh"
     if component_id in {
         "da3",
-        "easysplat-colmap-bridge",
-        "easysplat-da3-bridge",
-        "faiss",
+        "easysplat-da3-runner",
         "python-build-standalone",
     } or component_id.startswith(("model:", "python:")):
         return "./scripts/toolchain/build_da3_mps.sh"
@@ -695,8 +741,6 @@ def python_components(
                 dependencies.append(
                     f"python:{re.sub(r'[-_.]+', '-', dependency).lower()}"
                 )
-        if slug == "pycolmap":
-            dependencies.append("faiss")
         components[component_id] = {
             "id": component_id,
             "name": name,
@@ -753,137 +797,201 @@ def python_components(
     return components, ownership
 
 
-def faiss_component(root: Path) -> dict[str, Any]:
-    notice = REVIEWED_SUPPLEMENTAL_LICENSES["faiss"]
-    candidates = sorted(
-        root.glob(
-            "da3_mps/python/lib/python*/site-packages/"
-            f"{notice['distInfo']}/licenses/{notice['filename']}"
-        )
-    )
-    if len(candidates) != 1 or not candidates[0].is_file():
-        fail("FAISS compiled-in dependency notice is missing or ambiguous")
-    return {
-        "id": "faiss",
-        "name": "FAISS",
-        "type": "static-dependency",
-        "version": FAISS_VERSION,
-        "revision": FAISS_SOURCE_COMMIT,
-        "source": "https://github.com/facebookresearch/faiss",
-        "artifact": FAISS_SOURCE_ARCHIVE_URL,
-        "artifactSha256": FAISS_SOURCE_ARCHIVE_SHA256,
-        "license": "MIT",
-        "licenseFiles": [relative(candidates[0], root)],
-        "linkage": "compiled-in",
-        "dependencies": [],
-        "incorporatedInto": ["python:pycolmap"],
-    }
-
-
-def colmap_bridge_component(
-    root: Path,
-    version: str,
-    repository_revision: str,
-    python_components: dict[str, dict[str, Any]],
+def receipt_dependency_component(
+    component_id: str,
+    name: str,
+    entry: dict[str, Any],
+    *,
+    incorporated_into: str,
 ) -> dict[str, Any]:
+    source = str(entry.get("source_url") or "")
+    version = str(entry.get("source_version") or "")
+    revision = str(
+        entry.get("source_commit")
+        or entry.get("source_sha256")
+        or entry.get("source_tree_sha256")
+        or version
+    )
+    license_files = entry.get("license_files", [])
+    if (
+        not source.startswith("https://")
+        or not version
+        or not revision
+        or not isinstance(license_files, list)
+        or not license_files
+    ):
+        fail(f"native dependency receipt is incomplete: {component_id}")
+    component: dict[str, Any] = {
+        "id": component_id,
+        "name": name,
+        "type": "static-dependency",
+        "version": version,
+        "revision": revision,
+        "source": source,
+        "license": normalize_license(entry.get("license")),
+        "licenseFiles": sorted(str(path) for path in license_files),
+        "linkage": str(entry.get("linkage") or "compiled-in"),
+        "dependencies": [],
+        "incorporatedInto": [incorporated_into],
+    }
+    artifact = str(entry.get("artifact_url") or entry.get("source_archive_url") or "")
+    artifact_sha256 = str(
+        entry.get("artifact_sha256") or entry.get("source_archive_sha256") or ""
+    )
+    if not artifact and artifact_sha256:
+        artifact = source
+    if not artifact and re.search(
+        r"\.(?:zip|tar|tar\.gz|tar\.xz|tgz|txz)(?:$|[?#])", source, re.IGNORECASE
+    ):
+        source_sha256 = str(entry.get("source_sha256") or "")
+        if source_sha256:
+            artifact = source
+            artifact_sha256 = source_sha256
+    if artifact:
+        if not artifact.startswith("https://") or not re.fullmatch(
+            r"[0-9a-f]{64}", artifact_sha256
+        ):
+            fail(f"native dependency artifact is incomplete: {component_id}")
+        component["artifact"] = artifact
+        component["artifactSha256"] = artifact_sha256
+    return component
+
+
+def native_colmap_components(root: Path) -> dict[str, dict[str, Any]]:
     receipt = load_json(root / "provenance" / "colmap.json")
     executable = root / "bin" / "colmap"
     if not executable.is_file():
-        fail("EasySplat COLMAP bridge executable is missing")
-
-    pycolmap = python_components.get("python:pycolmap")
-    if not isinstance(pycolmap, dict):
-        fail("EasySplat COLMAP bridge requires PyCOLMAP")
-    if "python:opencv-python-headless" in python_components:
-        fail("opencv-python-headless is forbidden from the lean release toolchain")
-
-    wheel_sha256 = str(pycolmap.get("artifactSha256") or "")
-    if not re.fullmatch(r"[0-9a-f]{64}", wheel_sha256):
-        fail("PyCOLMAP has no exact wheel SHA-256")
-    expected_source = "https://github.com/colmap/colmap"
-    if receipt.get("toolchain_name") != "colmap":
-        fail("COLMAP bridge receipt has the wrong toolchain_name")
-    if (
-        receipt.get("source_url") != expected_source
-        or receipt.get("source_repo") != expected_source
-    ):
-        fail("COLMAP bridge receipt has the wrong source repository")
-    if (
-        receipt.get("source_version") != PYCOLMAP_VERSION
-        or pycolmap.get("version") != PYCOLMAP_VERSION
-    ):
-        fail(
-            f"COLMAP bridge receipt does not identify PyCOLMAP {PYCOLMAP_VERSION}"
-        )
-    if receipt.get("source_commit") != PYCOLMAP_SOURCE_COMMIT:
-        fail("COLMAP bridge receipt has an unreviewed PyCOLMAP source revision")
-    if receipt.get("artifact_sha256") != wheel_sha256:
-        fail("COLMAP bridge receipt is not bound to the PyCOLMAP wheel")
-    if receipt.get("license") != "BSD-3-Clause":
-        fail("COLMAP bridge receipt has the wrong PyCOLMAP license")
-    if (
-        receipt.get("backend") != "pycolmap"
-        or receipt.get("runtime") != "bundled-python"
-    ):
-        fail("COLMAP bridge receipt does not identify its runtime")
+        fail("native COLMAP executable is missing")
+    if receipt.get("schema_version") != 2 or receipt.get("toolchain_name") != "colmap":
+        fail("native COLMAP receipt has the wrong schema or toolchain_name")
+    source = str(receipt.get("source_url") or "")
+    source_version = str(receipt.get("source_version") or "")
+    source_commit = str(receipt.get("source_commit") or "")
+    if not source.startswith("https://") or not source_version or not source_commit:
+        fail("native COLMAP receipt has incomplete source provenance")
     if receipt.get("executable_sha256") != sha256(executable):
-        fail("COLMAP bridge receipt does not match the installed executable")
-    da3_receipt = load_json(root / "da3_mps" / "build_info.json")
-    if (
-        receipt.get("bridge_source") != da3_receipt.get("colmap_bridge_source")
-        or receipt.get("bridge_source_sha256")
-        != da3_receipt.get("colmap_bridge_source_sha256")
-        or receipt.get("supplemental_license_manifest_sha256")
-        != da3_receipt.get("supplemental_license_manifest_sha256")
-    ):
-        fail("COLMAP bridge provenance does not match the DA3 builder receipt")
+        fail("native COLMAP receipt does not match the installed executable")
+    main_license = root / "licenses" / "COLMAP" / "COPYING.txt"
+    if not main_license.is_file():
+        fail("native COLMAP license is missing")
+    dependencies = receipt.get("dependencies")
+    if not isinstance(dependencies, dict) or set(dependencies) != {
+        "faiss",
+        "poselib",
+        "vlfeat",
+    }:
+        fail("native COLMAP receipt has an unexpected static dependency closure")
+    components: dict[str, dict[str, Any]] = {}
+    dependency_ids = []
+    for name, entry in sorted(dependencies.items()):
+        component_id = f"colmap:{name}"
+        dependency_ids.append(component_id)
+        components[component_id] = receipt_dependency_component(
+            component_id,
+            name,
+            entry,
+            incorporated_into="colmap",
+        )
+    components["colmap"] = {
+        "id": "colmap",
+        "name": "COLMAP",
+        "type": "executable",
+        "version": source_version,
+        "revision": source_commit,
+        "source": source,
+        "license": normalize_license(receipt.get("license")),
+        "licenseFiles": [relative(main_license, root)],
+        "linkage": "native-executable",
+        "dependencies": dependency_ids,
+    }
+    return components
 
+
+def aggregate_native_components(root: Path) -> dict[str, dict[str, Any]]:
+    components = native_colmap_components(root)
     project_license = root / "licenses" / "EasySplat" / "LICENSE"
     if not project_license.is_file():
         fail("EasySplat license is missing")
-    return {
-        "id": "easysplat-colmap-bridge",
-        "name": "EasySplat COLMAP bridge",
-        "type": "executable-wrapper",
-        "version": version,
-        "revision": repository_revision,
+
+    support = load_json(root / "provenance" / "colmap-support.json")
+    if support.get("toolchain_name") != "colmap-support":
+        fail("COLMAP support receipt has the wrong toolchain_name")
+    support_dependencies = support.get("dependencies")
+    if not isinstance(support_dependencies, dict) or set(support_dependencies) != {
+        "boost",
+        "gflags",
+        "glog",
+        "libomp",
+    }:
+        fail("COLMAP support receipt has an unexpected dependency closure")
+    support_ids = []
+    for name, entry in sorted(support_dependencies.items()):
+        component_id = f"colmap-support:{name}"
+        support_ids.append(component_id)
+        components[component_id] = receipt_dependency_component(
+            component_id,
+            name,
+            entry,
+            incorporated_into="colmap-support",
+        )
+    components["colmap-support"] = {
+        "id": "colmap-support",
+        "name": "EasySplat COLMAP support closure",
+        "type": "native-build-input",
+        "version": str(support.get("schema_version") or "1"),
+        "revision": str(support.get("source_lock_sha256") or ""),
         "source": "https://github.com/dud8/EasySplat",
-        "runtimeVersion": PYCOLMAP_VERSION,
-        "runtimeRevision": PYCOLMAP_SOURCE_COMMIT,
-        "license": "MIT",
+        "license": "LicenseRef-Dependency-Closure",
         "licenseFiles": [relative(project_license, root)],
-        "linkage": "python-launcher",
-        "dependencies": [
-            "python-build-standalone",
-            "python:pycolmap",
-        ],
+        "linkage": "build-input",
+        "dependencies": support_ids,
     }
 
-
-def validate_da3_bridge_receipt(root: Path, receipt: dict[str, Any]) -> None:
-    bindings = (
-        (
-            "launcher hash",
-            root / "da3_mps/bin/easysplat_colmap",
-            "colmap_launcher_sha256",
-        ),
-        (
-            "bridge source hash",
-            root / "da3_mps/app/easysplat_da3_sfm/colmap_cli.py",
-            "colmap_bridge_source_sha256",
-        ),
-        (
-            "supplemental license manifest hash",
-            root / "da3_mps/licenses/python-package-upstream-notices.json",
-            "supplemental_license_manifest_sha256",
-        ),
+    ceres = load_json(root / "provenance" / "ceres.json")
+    ceres_dependencies = ceres.get("dependencies")
+    if ceres.get("toolchain_name") != "ceres-static" or not isinstance(
+        ceres_dependencies, dict
+    ) or set(ceres_dependencies) != {"ceres", "eigen"}:
+        fail("Ceres receipt has an unexpected dependency closure")
+    components["ceres"] = receipt_dependency_component(
+        "ceres", "Ceres Solver", ceres_dependencies["ceres"], incorporated_into="colmap"
     )
-    for label, path, field in bindings:
-        expected = str(receipt.get(field) or "")
-        if not re.fullmatch(r"[0-9a-f]{64}", expected) or not path.is_file():
-            fail(f"DA3 build receipt has no valid {label}")
-        if sha256(path) != expected:
-            fail(f"DA3 build receipt {label} does not match the packaged file")
+    components["ceres"]["type"] = "static-library"
+    components["ceres"]["dependencies"] = ["ceres:eigen"]
+    components["ceres:eigen"] = receipt_dependency_component(
+        "ceres:eigen", "Eigen", ceres_dependencies["eigen"], incorporated_into="ceres"
+    )
+
+    openimageio = load_json(root / "provenance" / "openimageio.json")
+    oiio_dependencies = openimageio.get("dependencies")
+    if openimageio.get("toolchain_name") != "openimageio-static" or not isinstance(
+        oiio_dependencies, dict
+    ) or "openimageio" not in oiio_dependencies:
+        fail("OpenImageIO receipt has an unexpected dependency closure")
+    components["openimageio"] = receipt_dependency_component(
+        "openimageio",
+        "OpenImageIO",
+        oiio_dependencies["openimageio"],
+        incorporated_into="colmap",
+    )
+    components["openimageio"]["type"] = "static-library"
+    oiio_ids = []
+    for name, entry in sorted(oiio_dependencies.items()):
+        if name == "openimageio":
+            continue
+        component_id = f"openimageio:{name}"
+        oiio_ids.append(component_id)
+        components[component_id] = receipt_dependency_component(
+            component_id,
+            name,
+            entry,
+            incorporated_into="openimageio",
+        )
+    components["openimageio"]["dependencies"] = oiio_ids
+    components["colmap"]["dependencies"].extend(
+        ["colmap-support", "ceres", "openimageio"]
+    )
+    return components
 
 
 def builder_components(
@@ -893,7 +1001,6 @@ def builder_components(
 ) -> dict[str, dict[str, Any]]:
     msplat = load_json(root / "msplat" / "build_info.json")
     da3 = load_json(root / "da3_mps" / "build_info.json")
-    validate_da3_bridge_receipt(root, da3)
     repository_revision = run("git", "rev-parse", "HEAD", cwd=root.parents[1]).strip()
     lock_path = root / "da3_mps" / "licenses" / "python-packages-requirements.txt"
     lock_hash = str(da3.get("requirements_lock_sha256") or "")
@@ -905,6 +1012,14 @@ def builder_components(
         fail(
             "DA3 Python requirements lock is missing or does not match its builder receipt"
         )
+    reviewed_models = load_da3_model_lock()
+    model_lock_hash = str(da3.get("model_lock_sha256") or "")
+    if (
+        da3.get("model_lock") != "scripts/toolchain/da3-model-lock.json"
+        or not re.fullmatch(r"[0-9a-f]{64}", model_lock_hash)
+        or sha256(DA3_MODEL_LOCK) != model_lock_hash
+    ):
+        fail("DA3 model lock is missing or does not match its builder receipt")
 
     msplat_source = str(msplat.get("source_url") or msplat.get("source_repo") or "")
     msplat_revision = str(msplat.get("source_commit") or "")
@@ -918,14 +1033,11 @@ def builder_components(
     ):
         fail("msplat builder receipt or license is incomplete")
 
-    components: dict[str, dict[str, Any]] = {
-        "easysplat-colmap-bridge": colmap_bridge_component(
-            root,
-            version,
-            repository_revision,
-            python_components,
-        ),
-        "faiss": faiss_component(root),
+    if "python:opencv-python-headless" in python_components:
+        fail("opencv-python-headless is forbidden from the lean release toolchain")
+
+    components = aggregate_native_components(root)
+    components.update({
         "msplat": {
             "id": "msplat",
             "name": "msplat",
@@ -942,7 +1054,7 @@ def builder_components(
                 "msplat:nlohmann-json",
             ],
         },
-    }
+    })
 
     static_dependencies = [
         (
@@ -1025,9 +1137,9 @@ def builder_components(
     }
 
     project_license = root / "licenses" / "EasySplat" / "LICENSE"
-    components["easysplat-da3-bridge"] = {
-        "id": "easysplat-da3-bridge",
-        "name": "EasySplat DA3 bridge",
+    components["easysplat-da3-runner"] = {
+        "id": "easysplat-da3-runner",
+        "name": "EasySplat DA3 runner",
         "type": "script",
         "version": version,
         "revision": repository_revision,
@@ -1070,9 +1182,37 @@ def builder_components(
     for model_name in ("DA3-BASE", "DA3-SMALL"):
         model_root = root / "da3_mps" / "models" / model_name
         info = load_json(model_root / "easysplat_model_info.json")
+        reviewed = reviewed_models[model_name]
+        if info != reviewed:
+            fail(f"{model_name} model metadata does not match the reviewed model lock")
         model_license = model_root / "LICENSE"
         if not model_license.is_file():
             fail(f"{model_name} license is missing")
+        source_artifacts = []
+        for filename in ("config.json", "model.safetensors"):
+            path = model_root / filename
+            artifact = reviewed["artifacts"][filename]
+            if not path.is_file() or path.is_symlink():
+                fail(f"{model_name} model artifact is missing or unsafe: {filename}")
+            if path.stat().st_size != artifact["size_bytes"]:
+                fail(
+                    f"{model_name} {filename} artifact byte size does not match the lock"
+                )
+            if sha256(path) != artifact["sha256"]:
+                fail(
+                    f"{model_name} {filename} artifact SHA-256 does not match the lock"
+                )
+            source_artifacts.append(
+                {
+                    "name": filename,
+                    "sha256": artifact["sha256"],
+                    "size": artifact["size_bytes"],
+                    "url": (
+                        f"https://huggingface.co/{reviewed['repo_id']}/resolve/"
+                        f"{reviewed['resolved_sha']}/{filename}"
+                    ),
+                }
+            )
         component_id = f"model:{model_name.lower()}"
         components[component_id] = {
             "id": component_id,
@@ -1085,6 +1225,7 @@ def builder_components(
             "licenseFiles": [relative(model_license, root)],
             "linkage": "model-data",
             "dependencies": ["da3"],
+            "sourceArtifacts": source_artifacts,
         }
     return components
 
@@ -1110,12 +1251,21 @@ def main() -> int:
     components.update(distributions)
 
     ownership: dict[str, str] = {
-        "bin/colmap": "easysplat-colmap-bridge",
+        "bin/colmap": "colmap",
         "bin/easysplat-train": "msplat",
         "bin/default.metallib": "msplat",
-        "da3_mps/bin/easysplat_colmap": "easysplat-colmap-bridge",
-        "provenance/colmap.json": "easysplat-colmap-bridge",
+        "lib/libomp.dylib": "colmap-support:libomp",
+        "provenance/colmap.json": "colmap",
+        "provenance/colmap-support.json": "colmap-support",
+        "provenance/ceres.json": "ceres",
+        "provenance/openimageio.json": "openimageio",
     }
+    license_ownership: dict[str, str] = {}
+    for component_id, component in components.items():
+        for license_file in component.get("licenseFiles", []):
+            if str(license_file).startswith("licenses/EasySplat/"):
+                continue
+            license_ownership.setdefault(str(license_file), component_id)
     files: list[dict[str, Any]] = []
     component_files: dict[str, list[str]] = defaultdict(list)
     macho_owner_by_name: dict[str, set[str]] = defaultdict(set)
@@ -1123,6 +1273,8 @@ def main() -> int:
     def owner_for(path: Path, path_text: str) -> str:
         if path_text in ownership:
             return ownership[path_text]
+        if path_text in license_ownership:
+            return license_ownership[path_text]
         resolved = path.resolve(strict=False)
         if resolved in python_ownership:
             return python_ownership[resolved]
@@ -1142,7 +1294,7 @@ def main() -> int:
         if path_text.startswith("da3_mps/licenses/python-build-standalone/"):
             return "python-build-standalone"
         if path_text.startswith("da3_mps/"):
-            return "easysplat-da3-bridge"
+            return "easysplat-da3-runner"
         if path_text.startswith(("msplat/", "licenses/msplat/")):
             if "/CLI11/" in f"/{path_text}":
                 return "msplat:cli11"
@@ -1152,7 +1304,7 @@ def main() -> int:
                 return "msplat:nlohmann-json"
             return "msplat"
         if path_text.startswith("licenses/EasySplat/"):
-            return "easysplat-da3-bridge"
+            return "easysplat-da3-runner"
         if path_text.startswith("licenses/python-packages/"):
             slug = path_text.split("/", 3)[2]
             return f"python:{slug}"

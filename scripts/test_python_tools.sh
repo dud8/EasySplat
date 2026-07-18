@@ -5,7 +5,7 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 PYTHON_BIN="${PYTHON_BIN:-python3}"
 
 python_help() {
-  echo "Python bridge tests need a prepared Python with numpy, Pillow, and torch installed." >&2
+  echo "Python tool tests need a prepared Python with numpy, Pillow, and torch installed." >&2
   echo "Set PYTHON_BIN to that interpreter, for example:" >&2
   echo "  PYTHON_BIN=/opt/homebrew/bin/python3 ./scripts/test_python_tools.sh" >&2
 }
@@ -39,11 +39,10 @@ run_suite() {
   local pythonpath="$1"
   local module_path="$2"
   if ! PYTHONPATH="$ROOT/$pythonpath" "$PYTHON_BIN" -m unittest "$module_path"; then
-    echo "Python bridge test failed: $module_path" >&2
+    echo "Python tool test failed: $module_path" >&2
     echo "If the failure mentions missing modules, rerun with PYTHON_BIN pointing at a prepared Python." >&2
     exit 1
   fi
 }
 
 run_suite "Tools/Da3Sfm" "Tools/Da3Sfm/tests/test_run.py"
-run_suite "Tools/Da3Sfm" "Tools/Da3Sfm/tests/test_colmap_cli.py"

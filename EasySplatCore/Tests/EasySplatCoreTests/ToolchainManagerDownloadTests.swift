@@ -10,15 +10,37 @@ final class ToolchainManagerDownloadTests: XCTestCase {
         "bin/colmap",
         "bin/easysplat-train",
         "bin/default.metallib",
+        "lib/libomp.dylib",
+        "msplat/build_info.json",
+        "msplat/LICENSE",
+        "provenance/colmap.json",
+        "provenance/colmap-support.json",
+        "provenance/ceres.json",
+        "provenance/openimageio.json",
+        "licenses/COLMAP/COPYING.txt",
+        "licenses/COLMAPSupport/OpenMP-LICENSE.txt",
+        "licenses/Ceres/LICENSE",
+        "licenses/OpenImageIO/LICENSE.md",
+        "supply-chain/components.json",
+    ]
+
+    private static let baseFixtureContents = [
         "da3_mps/bin/easysplat_da3_sfm",
         "da3_mps/python/bin/python3",
         "da3_mps/app/easysplat_da3_sfm/run.py",
         "da3_mps/vendor/depth-anything-3/src/depth_anything_3/api.py",
         "da3_mps/build_info.json",
-        "msplat/build_info.json",
-        "msplat/LICENSE",
-        "provenance/colmap.json",
-        "supply-chain/components.json",
+        "da3_mps/models/DA3-BASE/config.json",
+        "da3_mps/models/DA3-BASE/easysplat_model_info.json",
+        "da3_mps/models/DA3-BASE/model.safetensors",
+        "da3_mps/models/DA3-BASE/LICENSE",
+    ]
+
+    private static let smallFixtureContents = [
+        "da3_mps/models/DA3-SMALL/config.json",
+        "da3_mps/models/DA3-SMALL/easysplat_model_info.json",
+        "da3_mps/models/DA3-SMALL/model.safetensors",
+        "da3_mps/models/DA3-SMALL/LICENSE",
     ]
 
     private final class LockedMessages: @unchecked Sendable {
@@ -392,16 +414,8 @@ final class ToolchainManagerDownloadTests: XCTestCase {
         )
 
         let corePaths = Self.coreFixtureContents.sorted()
-        let basePaths = [
-            "da3_mps/models/DA3-BASE/config.json",
-            "da3_mps/models/DA3-BASE/easysplat_model_info.json",
-            "da3_mps/models/DA3-BASE/model.safetensors",
-        ]
-        let smallPaths = [
-            "da3_mps/models/DA3-SMALL/config.json",
-            "da3_mps/models/DA3-SMALL/easysplat_model_info.json",
-            "da3_mps/models/DA3-SMALL/model.safetensors",
-        ]
+        let basePaths = Self.baseFixtureContents.sorted()
+        let smallPaths = Self.smallFixtureContents.sorted()
         func hashes(for paths: [String]) throws -> [String: String] {
             try Dictionary(uniqueKeysWithValues: paths.map { path in
                 (path, try manager.test_sha256Hex(url: root.appendingPathComponent(path)))
@@ -417,8 +431,8 @@ final class ToolchainManagerDownloadTests: XCTestCase {
             appVersionRange: .init(minimum: "0.2.0-beta.1", maximumExclusive: "0.3.0"),
             components: [
                 .init(name: "macos-arm64-core", capabilities: Array(ToolchainManager.coreCapabilities), url: "https://example.com/core.zip", sha256: String(repeating: "a", count: 64), sizeBytes: 1, contents: corePaths, criticalFileHashes: try hashes(for: corePaths), dependencies: [], requirement: .required),
-                .init(name: "geometry-da3-base", capabilities: [ToolchainCapability.da3Base.rawValue], url: "https://example.com/base.zip", sha256: String(repeating: "b", count: 64), sizeBytes: 1, contents: basePaths, criticalFileHashes: try hashes(for: basePaths), dependencies: ["macos-arm64-core"], requirement: .required),
-                .init(name: "geometry-da3-small", capabilities: [ToolchainCapability.da3Small.rawValue], url: "https://example.com/small.zip", sha256: String(repeating: "c", count: 64), sizeBytes: 1, contents: smallPaths, criticalFileHashes: try hashes(for: smallPaths), dependencies: ["macos-arm64-core"], requirement: .optional),
+                .init(name: "geometry-da3-base", capabilities: [ToolchainCapability.da3Runtime.rawValue, ToolchainCapability.da3Base.rawValue], url: "https://example.com/base.zip", sha256: String(repeating: "b", count: 64), sizeBytes: 1, contents: basePaths, criticalFileHashes: try hashes(for: basePaths), dependencies: ["macos-arm64-core"], requirement: .optional),
+                .init(name: "geometry-da3-small", capabilities: [ToolchainCapability.da3Small.rawValue], url: "https://example.com/small.zip", sha256: String(repeating: "c", count: 64), sizeBytes: 1, contents: smallPaths, criticalFileHashes: try hashes(for: smallPaths), dependencies: ["geometry-da3-base"], requirement: .optional),
             ],
             signatureEd25519: ""
         )
@@ -589,16 +603,8 @@ final class ToolchainManagerDownloadTests: XCTestCase {
         )
 
         let corePaths = Self.coreFixtureContents.sorted()
-        let basePaths = [
-            "da3_mps/models/DA3-BASE/config.json",
-            "da3_mps/models/DA3-BASE/easysplat_model_info.json",
-            "da3_mps/models/DA3-BASE/model.safetensors",
-        ]
-        let smallPaths = [
-            "da3_mps/models/DA3-SMALL/config.json",
-            "da3_mps/models/DA3-SMALL/easysplat_model_info.json",
-            "da3_mps/models/DA3-SMALL/model.safetensors",
-        ]
+        let basePaths = Self.baseFixtureContents.sorted()
+        let smallPaths = Self.smallFixtureContents.sorted()
         func hashes(for paths: [String]) throws -> [String: String] {
             try Dictionary(uniqueKeysWithValues: paths.map { path in
                 (path, try manager.test_sha256Hex(url: backupRoot.appendingPathComponent(path)))
@@ -613,8 +619,8 @@ final class ToolchainManagerDownloadTests: XCTestCase {
             appVersionRange: .init(minimum: "0.2.0-beta.1", maximumExclusive: "0.3.0"),
             components: [
                 .init(name: "macos-arm64-core", capabilities: Array(ToolchainManager.coreCapabilities), url: "https://example.com/core.zip", sha256: String(repeating: "a", count: 64), sizeBytes: 1, contents: corePaths, criticalFileHashes: try hashes(for: corePaths), dependencies: [], requirement: .required),
-                .init(name: "geometry-da3-base", capabilities: [ToolchainCapability.da3Base.rawValue], url: "https://example.com/base.zip", sha256: String(repeating: "b", count: 64), sizeBytes: 1, contents: basePaths, criticalFileHashes: try hashes(for: basePaths), dependencies: ["macos-arm64-core"], requirement: .required),
-                .init(name: "geometry-da3-small", capabilities: [ToolchainCapability.da3Small.rawValue], url: "https://example.com/small.zip", sha256: String(repeating: "c", count: 64), sizeBytes: 1, contents: smallPaths, criticalFileHashes: try hashes(for: smallPaths), dependencies: ["macos-arm64-core"], requirement: .optional),
+                .init(name: "geometry-da3-base", capabilities: [ToolchainCapability.da3Runtime.rawValue, ToolchainCapability.da3Base.rawValue], url: "https://example.com/base.zip", sha256: String(repeating: "b", count: 64), sizeBytes: 1, contents: basePaths, criticalFileHashes: try hashes(for: basePaths), dependencies: ["macos-arm64-core"], requirement: .optional),
+                .init(name: "geometry-da3-small", capabilities: [ToolchainCapability.da3Small.rawValue], url: "https://example.com/small.zip", sha256: String(repeating: "c", count: 64), sizeBytes: 1, contents: smallPaths, criticalFileHashes: try hashes(for: smallPaths), dependencies: ["geometry-da3-base"], requirement: .optional),
             ],
             signatureEd25519: ""
         )
@@ -1154,7 +1160,7 @@ final class ToolchainManagerDownloadTests: XCTestCase {
 
     func testSchema2IncrementalCapabilityInstallPreservesExistingModelAndDownloadsOnlyDelta() async throws {
         try await withEnvironmentAsync(["EASYSPLAT_LOCAL_TOOLCHAIN_ROOT": nil]) {
-            for firstCapability in [ToolchainCapability.da3Base, .da3Small] {
+            for firstCapability in [ToolchainCapability.da3Base] {
             let secondCapability: ToolchainCapability = firstCapability == .da3Base ? .da3Small : .da3Base
             let token = UUID().uuidString
             let version = "2.4.\(Int.random(in: 1000...9999))"
@@ -1174,27 +1180,25 @@ final class ToolchainManagerDownloadTests: XCTestCase {
             let criticalCoreHashes = try Dictionary(uniqueKeysWithValues: criticalCorePaths.map { path in
                 (path, try bootstrap.test_sha256Hex(url: versionedRoot.appendingPathComponent(path)))
             })
+            let baseContents = Self.baseFixtureContents
+            let smallContents = Self.smallFixtureContents
+            let basePayloads = try Dictionary(uniqueKeysWithValues: baseContents.map { path in
+                (path, try Data(contentsOf: versionedRoot.appendingPathComponent(path)))
+            })
+            let smallPayloads = try Dictionary(uniqueKeysWithValues: smallContents.map { path in
+                (path, try Data(contentsOf: versionedRoot.appendingPathComponent(path)))
+            })
             try FileManager.default.removeItem(at: versionedRoot)
             defer { try? FileManager.default.removeItem(at: versionedRoot) }
 
             func componentHash(_ data: Data) -> String {
                 SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
             }
-            let baseContents = [
-                "da3_mps/models/DA3-BASE/model.safetensors",
-                "da3_mps/models/DA3-BASE/config.json",
-                "da3_mps/models/DA3-BASE/easysplat_model_info.json",
-            ]
-            let smallContents = [
-                "da3_mps/models/DA3-SMALL/model.safetensors",
-                "da3_mps/models/DA3-SMALL/config.json",
-                "da3_mps/models/DA3-SMALL/easysplat_model_info.json",
-            ]
             let baseCriticalHashes = Dictionary(
-                uniqueKeysWithValues: baseContents.map { ($0, componentHash(Data([0x01]))) }
+                uniqueKeysWithValues: basePayloads.map { ($0.key, componentHash($0.value)) }
             )
             let smallCriticalHashes = Dictionary(
-                uniqueKeysWithValues: smallContents.map { ($0, componentHash(Data([0x02]))) }
+                uniqueKeysWithValues: smallPayloads.map { ($0.key, componentHash($0.value)) }
             )
             let manifest = ToolchainManifest(
                 schemaVersion: 2,
@@ -1204,9 +1208,9 @@ final class ToolchainManagerDownloadTests: XCTestCase {
                 publishedAt: Date(),
                 appVersionRange: .init(minimum: "1.0.0", maximumExclusive: "3.0.0"),
                 components: [
-                    .init(name: "macos-arm64-core", capabilities: ["runtime.core", "geometry.colmap", "geometry.da3.runtime", "training.msplat"], url: coreURL.absoluteString, sha256: componentHash(coreData), sizeBytes: UInt64(coreData.count), contents: Self.coreFixtureContents, criticalFileHashes: criticalCoreHashes, dependencies: [], requirement: .required),
-                    .init(name: "geometry-da3-base", capabilities: ["geometry.da3.base"], url: baseURL.absoluteString, sha256: componentHash(baseData), sizeBytes: UInt64(baseData.count), contents: baseContents, criticalFileHashes: baseCriticalHashes, dependencies: ["macos-arm64-core"], requirement: .required),
-                    .init(name: "geometry-da3-small", capabilities: ["geometry.da3.small"], url: smallURL.absoluteString, sha256: componentHash(smallData), sizeBytes: UInt64(smallData.count), contents: smallContents, criticalFileHashes: smallCriticalHashes, dependencies: ["macos-arm64-core"], requirement: .optional),
+                    .init(name: "macos-arm64-core", capabilities: ["runtime.core", "geometry.colmap", "training.msplat"], url: coreURL.absoluteString, sha256: componentHash(coreData), sizeBytes: UInt64(coreData.count), contents: Self.coreFixtureContents, criticalFileHashes: criticalCoreHashes, dependencies: [], requirement: .required),
+                    .init(name: "geometry-da3-base", capabilities: ["geometry.da3.runtime", "geometry.da3.base"], url: baseURL.absoluteString, sha256: componentHash(baseData), sizeBytes: UInt64(baseData.count), contents: baseContents, criticalFileHashes: baseCriticalHashes, dependencies: ["macos-arm64-core"], requirement: .optional),
+                    .init(name: "geometry-da3-small", capabilities: ["geometry.da3.small"], url: smallURL.absoluteString, sha256: componentHash(smallData), sizeBytes: UInt64(smallData.count), contents: smallContents, criticalFileHashes: smallCriticalHashes, dependencies: ["geometry-da3-base"], requirement: .optional),
                 ],
                 signatureEd25519: ""
             )
@@ -1250,7 +1254,7 @@ final class ToolchainManagerDownloadTests: XCTestCase {
                     guard let index = args.firstIndex(of: "-d") else { return }
                     let destination = URL(fileURLWithPath: args[index + 1], isDirectory: true)
                     _ = try? ToolchainFixtureBuilder.createToolchain(at: destination)
-                    try? FileManager.default.removeItem(at: destination.appendingPathComponent("da3_mps/models"))
+                    try? FileManager.default.removeItem(at: destination.appendingPathComponent("da3_mps"))
                 }
             )
             let baseUnzip = MockSubprocessRunner.Script(
@@ -1260,10 +1264,10 @@ final class ToolchainManagerDownloadTests: XCTestCase {
                 onRun: { @Sendable args in
                     guard let index = args.firstIndex(of: "-d") else { return }
                     let destination = URL(fileURLWithPath: args[index + 1], isDirectory: true)
-                    for path in baseContents {
+                    for (path, payload) in basePayloads {
                         let file = destination.appendingPathComponent(path)
                         try? FileManager.default.createDirectory(at: file.deletingLastPathComponent(), withIntermediateDirectories: true)
-                        FileManager.default.createFile(atPath: file.path, contents: Data([0x01]))
+                        FileManager.default.createFile(atPath: file.path, contents: payload)
                     }
                 }
             )
@@ -1274,10 +1278,10 @@ final class ToolchainManagerDownloadTests: XCTestCase {
                 onRun: { @Sendable args in
                     guard let index = args.firstIndex(of: "-d") else { return }
                     let destination = URL(fileURLWithPath: args[index + 1], isDirectory: true)
-                    for path in smallContents {
+                    for (path, payload) in smallPayloads {
                         let file = destination.appendingPathComponent(path)
                         try? FileManager.default.createDirectory(at: file.deletingLastPathComponent(), withIntermediateDirectories: true)
-                        FileManager.default.createFile(atPath: file.path, contents: Data([0x02]))
+                        FileManager.default.createFile(atPath: file.path, contents: payload)
                     }
                 }
             )
@@ -1317,7 +1321,10 @@ final class ToolchainManagerDownloadTests: XCTestCase {
             XCTAssertEqual(Set(receipt.installedArtifacts.keys), ["macos-arm64-core", firstComponentName])
             XCTAssertEqual(
                 Set(receipt.installedCapabilities),
-                Set(ToolchainManager.coreCapabilities).union([firstCapability.rawValue])
+                Set(ToolchainManager.coreCapabilities).union([
+                    ToolchainCapability.da3Runtime.rawValue,
+                    firstCapability.rawValue,
+                ])
             )
 
             _ = try await manager.ensureToolchain(
@@ -2063,16 +2070,8 @@ final class ToolchainManagerDownloadTests: XCTestCase {
         }
 
         let coreContents = (Self.coreFixtureContents + Array(additionalCoreFiles.keys)).sorted()
-        let baseContents = [
-            "da3_mps/models/DA3-BASE/config.json",
-            "da3_mps/models/DA3-BASE/easysplat_model_info.json",
-            "da3_mps/models/DA3-BASE/model.safetensors",
-        ]
-        let smallContents = [
-            "da3_mps/models/DA3-SMALL/config.json",
-            "da3_mps/models/DA3-SMALL/easysplat_model_info.json",
-            "da3_mps/models/DA3-SMALL/model.safetensors",
-        ]
+        let baseContents = Self.baseFixtureContents.sorted()
+        let smallContents = Self.smallFixtureContents.sorted()
         func hashes(for paths: [String]) throws -> [String: String] {
             try Dictionary(uniqueKeysWithValues: paths.map { path in
                 (path, try manager.test_sha256Hex(url: root.appendingPathComponent(path)))
@@ -2089,8 +2088,8 @@ final class ToolchainManagerDownloadTests: XCTestCase {
             appVersionRange: .init(minimum: "0.2.0-beta.1", maximumExclusive: "0.3.0"),
             components: [
                 .init(name: "macos-arm64-core", capabilities: Array(ToolchainManager.coreCapabilities), url: "https://example.com/core.zip", sha256: String(repeating: "a", count: 64), sizeBytes: 1, contents: coreContents, criticalFileHashes: try hashes(for: coreCritical), dependencies: [], requirement: .required),
-                .init(name: "geometry-da3-base", capabilities: [ToolchainCapability.da3Base.rawValue], url: "https://example.com/base.zip", sha256: String(repeating: "b", count: 64), sizeBytes: 1, contents: baseContents, criticalFileHashes: try hashes(for: baseContents), dependencies: ["macos-arm64-core"], requirement: .required),
-                .init(name: "geometry-da3-small", capabilities: [ToolchainCapability.da3Small.rawValue], url: "https://example.com/small.zip", sha256: String(repeating: "c", count: 64), sizeBytes: 1, contents: smallContents, criticalFileHashes: try hashes(for: smallContents), dependencies: ["macos-arm64-core"], requirement: .optional),
+                .init(name: "geometry-da3-base", capabilities: [ToolchainCapability.da3Runtime.rawValue, ToolchainCapability.da3Base.rawValue], url: "https://example.com/base.zip", sha256: String(repeating: "b", count: 64), sizeBytes: 1, contents: baseContents, criticalFileHashes: try hashes(for: baseContents), dependencies: ["macos-arm64-core"], requirement: .optional),
+                .init(name: "geometry-da3-small", capabilities: [ToolchainCapability.da3Small.rawValue], url: "https://example.com/small.zip", sha256: String(repeating: "c", count: 64), sizeBytes: 1, contents: smallContents, criticalFileHashes: try hashes(for: smallContents), dependencies: ["geometry-da3-base"], requirement: .optional),
             ],
             signatureEd25519: ""
         )
@@ -2120,22 +2119,11 @@ final class ToolchainManagerDownloadTests: XCTestCase {
             ),
             .init(
                 path: fixture.colmap.path,
-                argsPrefix: ["-h"],
+                argsPrefix: ["help"],
                 result: .init(
                     exitCode: 0,
                     terminationReason: .exit,
-                    stdout: ColmapBridgeHelpFixture.root,
-                    stderr: ""
-                ),
-                onRun: nil
-            ),
-            .init(
-                path: fixture.colmap.path,
-                argsPrefix: ["--self-check"],
-                result: .init(
-                    exitCode: 0,
-                    terminationReason: .exit,
-                    stdout: ColmapBridgeHelpFixture.selfCheck,
+                    stdout: NativeColmapHelpFixture.root,
                     stderr: ""
                 ),
                 onRun: nil
@@ -2146,7 +2134,7 @@ final class ToolchainManagerDownloadTests: XCTestCase {
                 result: .init(
                     exitCode: 0,
                     terminationReason: .exit,
-                    stdout: ColmapBridgeHelpFixture.mapper,
+                    stdout: NativeColmapHelpFixture.mapper,
                     stderr: ""
                 ),
                 onRun: nil
@@ -2157,7 +2145,7 @@ final class ToolchainManagerDownloadTests: XCTestCase {
                 result: .init(
                     exitCode: 0,
                     terminationReason: .exit,
-                    stdout: ColmapBridgeHelpFixture.vocabulary,
+                    stdout: NativeColmapHelpFixture.vocabulary,
                     stderr: ""
                 ),
                 onRun: nil

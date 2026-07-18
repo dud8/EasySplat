@@ -226,6 +226,8 @@ final class ColmapRunnerTests: XCTestCase {
                 argsPrefix: ["feature_extractor"],
                 result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""),
                 onRun: { args in
+                    XCTAssertEqual(self.value(for: "--FeatureExtraction.max_image_size", in: args), "1024")
+                    XCTAssertNil(self.value(for: "--SiftExtraction.max_image_size", in: args))
                     XCTAssertEqual(self.value(for: "--SiftExtraction.max_num_features", in: args), "5000")
                     XCTAssertEqual(self.value(for: "--ImageReader.single_camera", in: args), "1")
                 }
@@ -438,6 +440,7 @@ final class ColmapRunnerTests: XCTestCase {
                     XCTAssertEqual(self.value(for: "--input_path", in: args), "/tmp/in")
                     XCTAssertEqual(self.value(for: "--output_path", in: args), "/tmp/out")
                     XCTAssertEqual(self.value(for: "--BundleAdjustmentCeres.max_num_iterations", in: args), "35")
+                    XCTAssertNil(self.value(for: "--BundleAdjustment.max_num_iterations", in: args))
                     XCTAssertEqual(self.value(for: "--BundleAdjustment.refine_focal_length", in: args), "0")
                     XCTAssertEqual(self.value(for: "--BundleAdjustment.refine_principal_point", in: args), "1")
                     XCTAssertEqual(self.value(for: "--BundleAdjustment.refine_extra_params", in: args), "1")
@@ -497,7 +500,7 @@ final class ColmapRunnerTests: XCTestCase {
         )
     }
 
-    func testBundleAdjusterRetriesWithLegacyIterationFlag() async throws {
+    func testBundleAdjusterDoesNotRetryWithUnsupportedLegacyIterationFlag() async throws {
         let runner = MockSubprocessRunner(scripts: [
             .init(
                 path: "/mock/colmap",
@@ -512,32 +515,29 @@ final class ColmapRunnerTests: XCTestCase {
                     XCTAssertEqual(self.value(for: "--BundleAdjustmentCeres.max_num_iterations", in: args), "20")
                     XCTAssertNil(self.value(for: "--BundleAdjustment.max_num_iterations", in: args))
                 }
-            ),
-            .init(
-                path: "/mock/colmap",
-                argsPrefix: ["bundle_adjuster"],
-                result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""),
-                onRun: { args in
-                    XCTAssertEqual(self.value(for: "--BundleAdjustment.max_num_iterations", in: args), "20")
-                    XCTAssertNil(self.value(for: "--BundleAdjustmentCeres.max_num_iterations", in: args))
-                }
             )
         ])
 
         let colmap = ColmapRunner(runner: runner)
-        try await colmap.runBundleAdjuster(
-            colmapPath: URL(fileURLWithPath: "/mock/colmap"),
-            inputPath: URL(fileURLWithPath: "/tmp/in"),
-            outputPath: URL(fileURLWithPath: "/tmp/out"),
-            options: ColmapOptions(useGPU: false, extractThreads: 1, matchThreads: 1),
-            bundleOptions: ColmapBundleAdjustmentOptions(
-                maxNumIterations: 20,
-                refineFocalLength: true,
-                refinePrincipalPoint: false,
-                refineExtraParams: false
-            ),
-            onLog: { _, _ in }
-        )
+        do {
+            try await colmap.runBundleAdjuster(
+                colmapPath: URL(fileURLWithPath: "/mock/colmap"),
+                inputPath: URL(fileURLWithPath: "/tmp/in"),
+                outputPath: URL(fileURLWithPath: "/tmp/out"),
+                options: ColmapOptions(useGPU: false, extractThreads: 1, matchThreads: 1),
+                bundleOptions: ColmapBundleAdjustmentOptions(
+                    maxNumIterations: 20,
+                    refineFocalLength: true,
+                    refinePrincipalPoint: false,
+                    refineExtraParams: false
+                ),
+                onLog: { _, _ in }
+            )
+            XCTFail("Expected unsupported native option failure")
+        } catch {
+            XCTAssertTrue(error is ColmapRunnerError, "Unexpected error: \(error)")
+        }
+        XCTAssertEqual(runner.calls.count, 1)
     }
 
     func testModelConverterUsesTxtOutput() throws {

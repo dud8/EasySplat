@@ -6,6 +6,7 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 
 SCRIPT = Path(__file__).resolve().parents[1] / "generate_supply_chain_manifest.py"
@@ -15,17 +16,8 @@ MODULE = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(MODULE)
 
 
-PYCOLMAP_WHEEL_SHA256 = (
-    "f31c0584d6c85ad5192fb224a9ec1a2413c6af405bc558ca38e9017eb510967f"
-)
-PYCOLMAP_SOURCE_COMMIT = "fa8e3b3ff591552855f8ad2806723c80f963f69c"
-FAISS_LICENSE_SHA256 = (
-    "52412d7bc7ce4157ea628bbaacb8829e0a9cb3c58f57f99176126bc8cf2bfc85"
-)
+COLMAP_SOURCE_COMMIT = "fa8e3b3ff591552855f8ad2806723c80f963f69c"
 FAISS_SOURCE_COMMIT = "5622e93733b64b2e033362dbdfda019b2ab33ef0"
-FAISS_SOURCE_ARCHIVE_SHA256 = (
-    "4b1ae7e7a0a46385b4084f0e3945623a15fcf99d793bf44d82aae8e24f11e5f5"
-)
 ANTLR_LICENSE_SHA256 = (
     "b1b379fcaf3219593a4c433feb1b35c780bed23fafaae440b1ae2771a9521e3a"
 )
@@ -44,6 +36,9 @@ class PythonLicenseTests(unittest.TestCase):
             "MIT-CMU": "MIT-CMU",
             "MPL-2.0 AND MIT": "MPL-2.0 AND MIT",
             "PSF-2.0": "PSF-2.0",
+            "Apache-2.0 WITH LLVM-exception": "Apache-2.0 WITH LLVM-exception",
+            "IJG AND BSD-3-Clause AND Zlib": "IJG AND BSD-3-Clause AND Zlib",
+            "libpng-2.0": "libpng-2.0",
         }
         for raw, expected in expressions.items():
             with self.subTest(raw=raw):
@@ -160,30 +155,20 @@ class SupplementalLicenseTests(unittest.TestCase):
             ANTLR_LICENSE_SHA256,
         )
         self.assertEqual(
-            MODULE.REVIEWED_SUPPLEMENTAL_LICENSES["faiss"]["artifactSha256"],
-            FAISS_LICENSE_SHA256,
+            set(MODULE.REVIEWED_SUPPLEMENTAL_LICENSES),
+            {"antlr4-python3-runtime"},
         )
 
     def _write_fixture(self, root: Path) -> dict[str, dict[str, str]]:
         notices = []
-        entries = (
-            (
-                "antlr4-python3-runtime",
-                "4.9.3",
-                "BSD-3-Clause",
-                "antlr4_python3_runtime-4.9.3.dist-info",
-                "UPSTREAM_LICENSE.txt",
-                b"antlr license",
-            ),
-            (
-                "faiss",
-                "1.14.1",
-                "MIT",
-                "pycolmap-4.1.0.dist-info",
-                "FAISS-LICENSE",
-                b"faiss license",
-            ),
-        )
+        entries = ((
+            "antlr4-python3-runtime",
+            "4.9.3",
+            "BSD-3-Clause",
+            "antlr4_python3_runtime-4.9.3.dist-info",
+            "UPSTREAM_LICENSE.txt",
+            b"antlr license",
+        ),)
         reviewed: dict[str, dict[str, str]] = {}
         for package, version, license_name, dist_info, filename, content in entries:
             path = (
@@ -232,94 +217,6 @@ class SupplementalLicenseTests(unittest.TestCase):
             (root / notice["installedPath"]).write_bytes(b"tampered")
             with self.assertRaisesRegex(SystemExit, "artifact hash"):
                 MODULE.validate_supplemental_license_receipts(root, reviewed=reviewed)
-
-
-class PythonComponentTests(unittest.TestCase):
-    def test_pycolmap_declares_its_compiled_faiss_dependency(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            site_packages = root / "da3_mps/python/lib/python3.13/site-packages"
-            dist_info = site_packages / "pycolmap-4.1.0.dist-info"
-            dist_info.mkdir(parents=True)
-            (dist_info / "METADATA").write_text(
-                "\n".join(
-                    (
-                        "Name: pycolmap",
-                        "Version: 4.1.0",
-                        "License: BSD-3-Clause",
-                        "Home-page: https://github.com/colmap/colmap",
-                        "",
-                    )
-                ),
-                encoding="utf-8",
-            )
-            (dist_info / "LICENSE").write_text("BSD\n", encoding="utf-8")
-            (dist_info / "RECORD").write_text(
-                "\n".join(
-                    (
-                        "pycolmap-4.1.0.dist-info/METADATA,,",
-                        "pycolmap-4.1.0.dist-info/LICENSE,,",
-                        "pycolmap-4.1.0.dist-info/RECORD,,",
-                        "",
-                    )
-                ),
-                encoding="utf-8",
-            )
-            install_report = root / "da3_mps/licenses/python-packages-install-report.json"
-            install_report.parent.mkdir(parents=True)
-            install_report.write_text(
-                json.dumps(
-                    {
-                        "install": [
-                            {
-                                "metadata": {"name": "pycolmap", "version": "4.1.0"},
-                                "download_info": {
-                                    "url": "https://example.com/pycolmap.whl",
-                                    "archive_info": {"hashes": {"sha256": "f" * 64}},
-                                },
-                            }
-                        ]
-                    }
-                ),
-                encoding="utf-8",
-            )
-
-            components, _ = MODULE.python_components(root)
-
-            self.assertEqual(components["python:pycolmap"]["dependencies"], ["faiss"])
-
-
-class FaissComponentTests(unittest.TestCase):
-    def test_component_describes_faiss_compiled_into_pycolmap(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            license_path = (
-                root
-                / "da3_mps/python/lib/python3.13/site-packages"
-                / "pycolmap-4.1.0.dist-info/licenses/FAISS-LICENSE"
-            )
-            license_path.parent.mkdir(parents=True)
-            license_path.write_text("MIT\n", encoding="utf-8")
-
-            component = MODULE.faiss_component(root)
-
-            self.assertEqual(component["id"], "faiss")
-            self.assertEqual(component["version"], "1.14.1")
-            self.assertEqual(component["revision"], FAISS_SOURCE_COMMIT)
-            self.assertEqual(
-                component["artifact"],
-                "https://github.com/facebookresearch/faiss/archive/refs/tags/v1.14.1.zip",
-            )
-            self.assertEqual(
-                component["artifactSha256"], FAISS_SOURCE_ARCHIVE_SHA256
-            )
-            self.assertEqual(component["license"], "MIT")
-            self.assertEqual(component["linkage"], "compiled-in")
-            self.assertEqual(component["incorporatedInto"], ["python:pycolmap"])
-            self.assertEqual(
-                component["licenseFiles"],
-                [license_path.relative_to(root).as_posix()],
-            )
 
 
 class MachOPortabilityTests(unittest.TestCase):
@@ -448,15 +345,27 @@ class FilesystemSafetyTests(unittest.TestCase):
 class BuildCommandTests(unittest.TestCase):
     def test_components_map_only_to_current_reproducible_builders(self) -> None:
         self.assertEqual(
-            MODULE.component_build_command("easysplat-colmap-bridge", {}),
-            "./scripts/toolchain/build_da3_mps.sh",
+            MODULE.component_build_command("colmap", {}),
+            "./scripts/toolchain/build_colmap.sh",
+        )
+        self.assertEqual(
+            MODULE.component_build_command("colmap-support:libomp", {}),
+            "./scripts/toolchain/build_colmap_support.sh",
+        )
+        self.assertEqual(
+            MODULE.component_build_command("ceres:eigen", {}),
+            "./scripts/toolchain/build_ceres.sh",
+        )
+        self.assertEqual(
+            MODULE.component_build_command("openimageio:libpng", {}),
+            "./scripts/toolchain/build_openimageio.sh",
         )
         self.assertEqual(
             MODULE.component_build_command("python:numpy", {}),
             "./scripts/toolchain/build_da3_mps.sh",
         )
         self.assertEqual(
-            MODULE.component_build_command("faiss", {}),
+            MODULE.component_build_command("easysplat-da3-runner", {}),
             "./scripts/toolchain/build_da3_mps.sh",
         )
         self.assertEqual(
@@ -553,55 +462,57 @@ class PythonRecordTests(unittest.TestCase):
             )
 
 
-class ColmapBridgeComponentTests(unittest.TestCase):
+class NativeColmapComponentTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temporary_directory = tempfile.TemporaryDirectory()
         self.root = Path(self.temporary_directory.name)
         (self.root / "bin").mkdir()
         (self.root / "provenance").mkdir()
-        (self.root / "da3_mps").mkdir()
-        (self.root / "licenses" / "EasySplat").mkdir(parents=True)
+        (self.root / "licenses" / "COLMAP").mkdir(parents=True)
         self.executable = self.root / "bin" / "colmap"
-        self.executable.write_bytes(b"signed bridge")
-        (self.root / "licenses" / "EasySplat" / "LICENSE").write_text(
-            "MIT\n", encoding="utf-8"
-        )
+        self.executable.write_bytes(b"native colmap")
+        for name in ("COPYING.txt", "FAISS-LICENSE", "PoseLib-LICENSE", "VLFeat-LICENSE"):
+            (self.root / "licenses" / "COLMAP" / name).write_text(
+                "license\n", encoding="utf-8"
+            )
         self.receipt = {
+            "schema_version": 2,
             "toolchain_name": "colmap",
-            "source_url": "https://github.com/colmap/colmap",
-            "source_repo": "https://github.com/colmap/colmap",
+            "source_url": "https://github.com/colmap/colmap.git",
             "source_version": "4.1.0",
-            "source_commit": PYCOLMAP_SOURCE_COMMIT,
-            "artifact_sha256": PYCOLMAP_WHEEL_SHA256,
+            "source_commit": COLMAP_SOURCE_COMMIT,
             "license": "BSD-3-Clause",
-            "backend": "pycolmap",
-            "runtime": "bundled-python",
-            "bridge_source": "Tools/Da3Sfm/easysplat_da3_sfm/colmap_cli.py",
-            "bridge_source_sha256": "1" * 64,
-            "supplemental_license_manifest_sha256": "2" * 64,
-            "executable_sha256": hashlib.sha256(
-                self.executable.read_bytes()
-            ).hexdigest(),
-        }
-        (self.root / "da3_mps" / "build_info.json").write_text(
-            json.dumps(
-                {
-                    "colmap_bridge_source": self.receipt["bridge_source"],
-                    "colmap_bridge_source_sha256": self.receipt["bridge_source_sha256"],
-                    "supplemental_license_manifest_sha256": self.receipt[
-                        "supplemental_license_manifest_sha256"
-                    ],
-                }
-            ),
-            encoding="utf-8",
-        )
-        self._write_receipt()
-        self.python_components = {
-            "python:pycolmap": {
-                "version": "4.1.0",
-                "artifactSha256": PYCOLMAP_WHEEL_SHA256,
+            "executable_sha256": hashlib.sha256(self.executable.read_bytes()).hexdigest(),
+            "dependencies": {
+                "faiss": {
+                    "source_url": "https://github.com/facebookresearch/faiss.git",
+                    "source_version": "1.14.1",
+                    "source_commit": FAISS_SOURCE_COMMIT,
+                    "license": "MIT",
+                    "license_files": ["licenses/COLMAP/FAISS-LICENSE"],
+                    "linkage": "compiled-in",
+                },
+                "poselib": {
+                    "source_url": "https://github.com/PoseLib/PoseLib.git",
+                    "source_version": "fixture",
+                    "source_commit": "b" * 40,
+                    "license": "BSD-3-Clause",
+                    "license_files": ["licenses/COLMAP/PoseLib-LICENSE"],
+                    "linkage": "compiled-in",
+                },
+                "vlfeat": {
+                    "source_url": "https://github.com/colmap/colmap/tree/fixture/src/thirdparty/VLFeat",
+                    "source_version": "vendored",
+                    "source_commit": COLMAP_SOURCE_COMMIT,
+                    "license": "BSD-2-Clause",
+                    "license_files": ["licenses/COLMAP/VLFeat-LICENSE"],
+                    "linkage": "compiled-in",
+                },
             },
         }
+        (self.root / "provenance" / "colmap.json").write_text(
+            json.dumps(self.receipt), encoding="utf-8"
+        )
 
     def tearDown(self) -> None:
         self.temporary_directory.cleanup()
@@ -611,93 +522,209 @@ class ColmapBridgeComponentTests(unittest.TestCase):
             json.dumps(self.receipt), encoding="utf-8"
         )
 
-    def test_bridge_owns_launcher_and_depends_on_exact_python_runtime(self) -> None:
-        component = MODULE.colmap_bridge_component(
-            self.root,
-            version="2.0.0",
-            repository_revision="a" * 40,
-            python_components=self.python_components,
-        )
+    def test_native_colmap_owns_binary_without_python_runtime_dependency(self) -> None:
+        components = MODULE.native_colmap_components(self.root)
+        component = components["colmap"]
 
-        self.assertEqual(component["id"], "easysplat-colmap-bridge")
-        self.assertEqual(component["linkage"], "python-launcher")
-        self.assertEqual(component["runtimeVersion"], "4.1.0")
-        self.assertEqual(component["runtimeRevision"], PYCOLMAP_SOURCE_COMMIT)
+        self.assertEqual(component["id"], "colmap")
+        self.assertEqual(component["linkage"], "native-executable")
+        self.assertNotIn("python:pycolmap", component["dependencies"])
         self.assertEqual(
-            component["dependencies"],
-            [
-                "python-build-standalone",
-                "python:pycolmap",
-            ],
+            {"colmap:faiss", "colmap:poselib", "colmap:vlfeat"},
+            set(component["dependencies"]),
         )
 
-    def test_bridge_rejects_receipt_not_bound_to_packaged_executable(self) -> None:
+    def test_native_colmap_rejects_receipt_not_bound_to_packaged_executable(self) -> None:
         self.receipt["executable_sha256"] = "f" * 64
         self._write_receipt()
 
         with self.assertRaisesRegex(SystemExit, "installed executable"):
-            MODULE.colmap_bridge_component(
-                self.root,
-                version="2.0.0",
-                repository_revision="a" * 40,
-                python_components=self.python_components,
+            MODULE.native_colmap_components(self.root)
+
+    def test_native_dependency_records_pinned_source_archive(self) -> None:
+        component = MODULE.receipt_dependency_component(
+            "openimageio:libpng",
+            "libpng",
+            {
+                "source_url": "https://example.com/libpng-1.6.58.tar.gz",
+                "source_version": "1.6.58",
+                "source_sha256": "a" * 64,
+                "license": "libpng-2.0",
+                "license_files": ["licenses/OpenImageIO/libpng-LICENSE"],
+                "linkage": "static",
+            },
+            incorporated_into="openimageio",
+        )
+
+        self.assertEqual(component["artifact"], "https://example.com/libpng-1.6.58.tar.gz")
+        self.assertEqual(component["artifactSha256"], "a" * 64)
+
+
+class Da3ModelComponentTests(unittest.TestCase):
+    MODEL_REVISIONS = {
+        "DA3-BASE": (
+            "depth-anything/DA3-BASE",
+            "f4a6c9b3c95e41c82048423d3493a81ec3fa810e",
+        ),
+        "DA3-SMALL": (
+            "depth-anything/DA3-SMALL",
+            "e08cab65ca0ec38e7826075418411ab90cab4da3",
+        ),
+    }
+
+    def setUp(self) -> None:
+        self.temporary_directory = tempfile.TemporaryDirectory()
+        self.root = Path(self.temporary_directory.name) / "Toolchains/out/stage"
+        self.root.mkdir(parents=True)
+        requirements = self.root / "da3_mps/licenses/python-packages-requirements.txt"
+        requirements.parent.mkdir(parents=True)
+        requirements.write_text("numpy==2.3.5\n", encoding="utf-8")
+        da3_receipt = {
+            "source_repo": "https://github.com/ByteDance-Seed/Depth-Anything-3.git",
+            "source_ref": "41736238f5bced4debf3f2a12375d2466874866d",
+            "source_commit": "41736238f5bced4debf3f2a12375d2466874866d",
+            "requirements_lock_sha256": hashlib.sha256(
+                requirements.read_bytes()
+            ).hexdigest(),
+            "python_standalone_url": "https://example.com/python.tar.gz",
+            "python_standalone_sha256": "a" * 64,
+            "python_version": "3.13.11",
+            "model_lock": "scripts/toolchain/da3-model-lock.json",
+            "model_lock_sha256": "0" * 64,
+        }
+        (self.root / "da3_mps/build_info.json").write_text(
+            json.dumps(da3_receipt), encoding="utf-8"
+        )
+        msplat_receipt = {
+            "source_url": "https://github.com/rayanht/msplat",
+            "source_commit": "b" * 40,
+            "source_version": "fixture",
+            "dependencies": {
+                "cli11_v2.4.2_sha256": "c" * 64,
+                "nanoflann_v1.5.5_sha256": "d" * 64,
+                "nlohmann_json_v3.11.3_sha256": "e" * 64,
+            },
+        }
+        (self.root / "msplat").mkdir()
+        (self.root / "msplat/build_info.json").write_text(
+            json.dumps(msplat_receipt), encoding="utf-8"
+        )
+        for relative in (
+            "msplat/LICENSE",
+            "licenses/msplat/CLI11/LICENSE",
+            "licenses/msplat/nanoflann/COPYING",
+            "licenses/msplat/nlohmann-json/LICENSE.MIT",
+            "licenses/EasySplat/LICENSE",
+            "da3_mps/vendor/depth-anything-3/LICENSE",
+            "da3_mps/licenses/python-build-standalone/PYTHON.json",
+        ):
+            path = self.root / relative
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text("license\n", encoding="utf-8")
+        (self.root / "da3_mps/licenses/python-build-standalone/licenses").mkdir(
+            parents=True
+        )
+        for model, (repo_id, revision) in self.MODEL_REVISIONS.items():
+            model_root = self.root / "da3_mps/models" / model
+            model_root.mkdir(parents=True)
+            (model_root / "LICENSE").write_text("Apache-2.0\n", encoding="utf-8")
+            (model_root / "config.json").write_text(
+                json.dumps({"model": model}) + "\n", encoding="utf-8"
             )
-
-    def test_bridge_rejects_receipt_not_bound_to_pycolmap_wheel(self) -> None:
-        self.receipt["artifact_sha256"] = "f" * 64
-        self._write_receipt()
-
-        with self.assertRaisesRegex(SystemExit, "PyCOLMAP wheel"):
-            MODULE.colmap_bridge_component(
-                self.root,
-                version="2.0.0",
-                repository_revision="a" * 40,
-                python_components=self.python_components,
+            (model_root / "model.safetensors").write_bytes(
+                f"{model}:weights\n".encode()
             )
-
-    def test_bridge_rejects_unreviewed_pycolmap_source_revision(self) -> None:
-        self.receipt["source_commit"] = "f" * 40
-        self._write_receipt()
-
-        with self.assertRaisesRegex(SystemExit, "source revision"):
-            MODULE.colmap_bridge_component(
-                self.root,
-                version="2.0.0",
-                repository_revision="a" * 40,
-                python_components=self.python_components,
-            )
-
-
-class Da3BridgeReceiptTests(unittest.TestCase):
-    def test_receipt_binds_final_staged_launcher_and_bridge_source(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            launcher = root / "da3_mps/bin/easysplat_colmap"
-            bridge = root / "da3_mps/app/easysplat_da3_sfm/colmap_cli.py"
-            manifest = root / "da3_mps/licenses/python-package-upstream-notices.json"
-            for path, content in (
-                (launcher, b"launcher"),
-                (bridge, b"bridge"),
-                (manifest, b"manifest"),
-            ):
-                path.parent.mkdir(parents=True, exist_ok=True)
-                path.write_bytes(content)
-            receipt = {
-                "colmap_launcher_sha256": hashlib.sha256(
-                    launcher.read_bytes()
-                ).hexdigest(),
-                "colmap_bridge_source_sha256": hashlib.sha256(
-                    bridge.read_bytes()
-                ).hexdigest(),
-                "supplemental_license_manifest_sha256": hashlib.sha256(
-                    manifest.read_bytes()
-                ).hexdigest(),
+            artifacts = {
+                filename: {
+                    "sha256": hashlib.sha256(
+                        (model_root / filename).read_bytes()
+                    ).hexdigest(),
+                    "size_bytes": (model_root / filename).stat().st_size,
+                }
+                for filename in ("config.json", "model.safetensors")
             }
+            (model_root / "easysplat_model_info.json").write_text(
+                json.dumps(
+                    {
+                        "repo_id": repo_id,
+                        "requested_revision": revision,
+                        "resolved_sha": revision,
+                        "license": "apache-2.0",
+                        "artifacts": artifacts,
+                    }
+                ),
+                encoding="utf-8",
+            )
+        self.model_lock = (
+            Path(self.temporary_directory.name) / "fixture-model-lock.json"
+        )
+        self.model_lock.write_text(
+            json.dumps(
+                {
+                    "schema_version": 1,
+                    "models": {
+                        model: json.loads(
+                            (
+                                self.root
+                                / "da3_mps/models"
+                                / model
+                                / "easysplat_model_info.json"
+                            ).read_text(encoding="utf-8")
+                        )
+                        for model in self.MODEL_REVISIONS
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+        da3_receipt_path = self.root / "da3_mps/build_info.json"
+        da3_receipt = json.loads(da3_receipt_path.read_text(encoding="utf-8"))
+        da3_receipt["model_lock_sha256"] = hashlib.sha256(
+            self.model_lock.read_bytes()
+        ).hexdigest()
+        da3_receipt_path.write_text(json.dumps(da3_receipt), encoding="utf-8")
 
-            MODULE.validate_da3_bridge_receipt(root, receipt)
-            launcher.write_bytes(b"mutated")
-            with self.assertRaisesRegex(SystemExit, "launcher hash"):
-                MODULE.validate_da3_bridge_receipt(root, receipt)
+    def tearDown(self) -> None:
+        self.temporary_directory.cleanup()
+
+    def components(self) -> dict[str, dict]:
+        with (
+            mock.patch.object(MODULE, "aggregate_native_components", return_value={}),
+            mock.patch.object(MODULE, "run", return_value="f" * 40 + "\n"),
+            mock.patch.object(MODULE, "DA3_MODEL_LOCK", self.model_lock),
+        ):
+            return MODULE.builder_components(self.root, "2.0.0", {})
+
+    def test_model_components_publish_exact_source_artifact_hashes(self) -> None:
+        components = self.components()
+
+        for model, (repo_id, revision) in self.MODEL_REVISIONS.items():
+            model_root = self.root / "da3_mps/models" / model
+            self.assertEqual(
+                components[f"model:{model.lower()}"]["sourceArtifacts"],
+                [
+                    {
+                        "name": filename,
+                        "sha256": hashlib.sha256(
+                            (model_root / filename).read_bytes()
+                        ).hexdigest(),
+                        "size": (model_root / filename).stat().st_size,
+                        "url": (
+                            f"https://huggingface.co/{repo_id}/resolve/"
+                            f"{revision}/{filename}"
+                        ),
+                    }
+                    for filename in ("config.json", "model.safetensors")
+                ],
+            )
+
+    def test_model_component_rejects_bytes_that_do_not_match_provenance(self) -> None:
+        path = self.root / "da3_mps/models/DA3-BASE/model.safetensors"
+        content = path.read_bytes()
+        path.write_bytes(bytes([content[0] ^ 1]) + content[1:])
+
+        with self.assertRaisesRegex(SystemExit, "artifact SHA-256"):
+            self.components()
 
 
 class PackageScriptTests(unittest.TestCase):
@@ -707,17 +734,15 @@ class PackageScriptTests(unittest.TestCase):
             encoding="utf-8"
         )
 
-    def test_package_uses_staged_pycolmap_bridge_without_native_stack(self) -> None:
-        self.assertIn('da3_mps/bin/easysplat_colmap" "$BIN/colmap', self.script)
-        for obsolete in (
-            "COLMAP_INSTALL",
-            "CERES_INSTALL",
-            "SUITESPARSE_INSTALL",
-            "OPENIMAGEIO_INSTALL",
-            "dependency-origins.tsv",
-            "--dependency-origins",
-        ):
-            self.assertNotIn(obsolete, self.script)
+    def test_package_uses_native_colmap_and_only_bundles_libomp(self) -> None:
+        self.assertIn('COLMAP_INSTALL="${COLMAP_INSTALL:-', self.script)
+        self.assertIn('CERES_INSTALL="${CERES_INSTALL:-', self.script)
+        self.assertIn('OPENIMAGEIO_INSTALL="${OPENIMAGEIO_INSTALL:-', self.script)
+        self.assertIn('install -m 0755 "$COLMAP_INSTALL/bin/colmap" "$BIN/colmap"', self.script)
+        self.assertIn('install -m 0755 "$COLMAP_SUPPORT_INSTALL/lib/libomp.dylib"', self.script)
+        self.assertNotIn('da3_mps/bin/easysplat_colmap" "$BIN/colmap', self.script)
+        self.assertNotIn("SUITESPARSE_INSTALL", self.script)
+        self.assertNotIn("EIGEN_INSTALL", self.script)
 
     def test_package_validates_semver_before_constructing_archive_paths(self) -> None:
         validation = self.script.index("SEMVER_PATTERN=")
@@ -741,21 +766,36 @@ class PackageScriptTests(unittest.TestCase):
         self.assertIn("status --porcelain", self.script)
         self.assertNotIn("--ignored", self.script)
 
-    def test_package_probes_only_commands_exposed_by_bridge(self) -> None:
-        self.assertIn('"$BIN/colmap" point_triangulator -h', self.script)
-        self.assertIn('"$BIN/colmap" image_undistorter -h', self.script)
-        self.assertNotIn('"$BIN/colmap" global_mapper -h', self.script)
+    def test_package_probes_exact_native_command_and_option_surface(self) -> None:
+        for command in (
+            "feature_extractor", "matches_importer", "local_vocab_retriever",
+            "mapper", "point_triangulator", "bundle_adjuster",
+            "model_analyzer", "image_undistorter", "model_converter",
+        ):
+            self.assertIn(command, self.script)
+        self.assertIn("Mapper.min_num_matches", self.script)
+        self.assertIn("FeatureExtraction.max_image_size", self.script)
+        self.assertNotIn("SiftExtraction.max_image_size", self.script)
+        self.assertIn("BundleAdjustmentCeres.max_num_iterations", self.script)
+        self.assertNotIn('"$BIN/colmap" --self-check', self.script)
+        self.assertNotIn('"$BIN/colmap" global_mapper', self.script)
 
-    def test_package_preserves_signed_wheel_bytes(self) -> None:
+    def test_package_preserves_signed_native_bytes(self) -> None:
         self.assertNotIn("lipo -thin", self.script)
         self.assertNotIn("codesign --force", self.script)
         self.assertIn('/usr/bin/codesign --verify --strict "$file"', self.script)
 
-    def test_package_checks_staged_colmap_launcher_against_builder_receipt(
+    def test_package_checks_native_receipts_and_dependency_hashes(
         self,
     ) -> None:
-        self.assertIn('"colmap_launcher_sha256"', self.script)
-        self.assertIn("DA3 COLMAP launcher does not match build_info.json", self.script)
+        self.assertIn('"executable_sha256"', self.script)
+        self.assertIn('"dependency_receipt_sha256"', self.script)
+        self.assertNotIn('"dependency_receipt_canonical_sha256"', self.script)
+        self.assertIn('"dependency_library_sha256"', self.script)
+        self.assertIn('"dependency_tree_sha256"', self.script)
+        self.assertIn("metadata.st_mtime_ns", self.script)
+        self.assertIn('relative = "." if path == root', self.script)
+        self.assertNotIn('"colmap_launcher_sha256"', self.script)
 
     def test_portability_check_distinguishes_dylib_self_id(self) -> None:
         self.assertIn('otool -D "$file"', self.script)
@@ -768,9 +808,23 @@ class PackageScriptTests(unittest.TestCase):
         delete_caches = self.script.index(
             "find \"$OUT/da3_mps/python\" -type d -name '__pycache__' -empty -delete"
         )
-        generate_manifest = self.script.index('"$SUPPLY_CHAIN_GENERATOR" \\\n')
+        generate_manifest = self.script.index('"$SUPPLY_CHAIN_GENERATOR" --toolchain-root')
         self.assertLess(delete_bytecode, generate_manifest)
         self.assertLess(delete_caches, generate_manifest)
+
+    def test_package_validates_and_copies_only_the_exact_da3_runtime(self) -> None:
+        self.assertIn('DA3_PAYLOAD_VALIDATOR="$ROOT/scripts/toolchain/validate_da3_payload.py"', self.script)
+        self.assertEqual(
+            self.script.count('python3 "$DA3_PAYLOAD_VALIDATOR" --root'),
+            2,
+        )
+        self.assertNotIn('cp -R "$DA3_ROOT" "$OUT/da3_mps"', self.script)
+        for relative in ("bin", "python", "app", "vendor", "licenses"):
+            self.assertIn(f'cp -R "$DA3_ROOT/{relative}" "$OUT/da3_mps/{relative}"', self.script)
+        self.assertIn(
+            'install -m 0644 "$DA3_ROOT/build_info.json" "$OUT/da3_mps/build_info.json"',
+            self.script,
+        )
 
     def test_forbidden_payload_scan_consumes_find_output(self) -> None:
         self.assertNotIn("grep -Eqi", self.script)
@@ -786,18 +840,37 @@ class Da3BuilderLicenseTests(unittest.TestCase):
         for expected in (
             "e4c1a74c66bd5290364ea2b36c97cd724b247357",
             ANTLR_LICENSE_SHA256,
-            FAISS_SOURCE_COMMIT,
-            FAISS_LICENSE_SHA256,
             "python-package-upstream-notices.json",
             "UPSTREAM_LICENSE.txt",
-            "FAISS-LICENSE",
         ):
             self.assertIn(expected, self.script)
+        self.assertNotIn("FAISS_LICENSE", self.script)
         self.assertNotIn("TOKENIZERS_LICENSE", self.script)
 
-    def test_builder_records_exact_staged_bridge_sources(self) -> None:
-        self.assertIn('"colmap_bridge_source_sha256"', self.script)
+    def test_builder_records_and_validates_exact_staged_runtime(self) -> None:
         self.assertIn('"supplemental_license_manifest_sha256"', self.script)
+        self.assertIn(
+            'DA3_PAYLOAD_VALIDATOR="$ROOT/scripts/toolchain/validate_da3_payload.py"',
+            self.script,
+        )
+        materialize = self.script.rindex("materialize_runtime_symlinks")
+        validate = self.script.rindex('python3 "$DA3_PAYLOAD_VALIDATOR" --root')
+        self.assertLess(materialize, validate)
+
+    def test_builder_verifies_reviewed_model_bytes_before_recording_metadata(
+        self,
+    ) -> None:
+        self.assertIn(
+            'DA3_MODEL_LOCK="$ROOT/scripts/toolchain/da3-model-lock.json"',
+            self.script,
+        )
+        verify_size = self.script.index('path.stat().st_size != artifact["size_bytes"]')
+        verify_hash = self.script.index('sha256(path) != artifact["sha256"]')
+        write_metadata = self.script.index(
+            '(target / "easysplat_model_info.json").write_text('
+        )
+        self.assertLess(verify_size, write_metadata)
+        self.assertLess(verify_hash, write_metadata)
 
     def test_builder_pins_whitespace_clean_runtime_patch(self) -> None:
         self.assertIn(
@@ -823,6 +896,48 @@ class Da3BuilderLicenseTests(unittest.TestCase):
         self.assertIn('rm -f "$PYTHON_DIR/bin/pip"', self.script)
         self.assertLess(install, strip_tools)
         self.assertLess(strip_tools, verify_runtime)
+
+
+class RetiredDa3ColmapBridgeTests(unittest.TestCase):
+    def test_bridge_sources_and_tests_are_deleted(self) -> None:
+        root = SCRIPT.parents[2]
+        for relative in (
+            "Tools/Da3Sfm/colmap_launcher.c",
+            "Tools/Da3Sfm/easysplat_da3_sfm/colmap_cli.py",
+            "Tools/Da3Sfm/tests/test_colmap_cli.py",
+        ):
+            self.assertFalse((root / relative).exists(), relative)
+
+    def test_da3_builder_and_lock_have_no_python_colmap_runtime(self) -> None:
+        root = SCRIPT.parents[2]
+        surfaces = "\n".join(
+            (root / relative).read_text(encoding="utf-8")
+            for relative in (
+                "Tools/Da3Sfm/requirements.in",
+                "Tools/Da3Sfm/requirements.txt",
+                "scripts/toolchain/build_da3_mps.sh",
+            )
+        )
+        for retired in (
+            "pycolmap",
+            "easysplat_colmap",
+            "colmap_cli",
+            "COLMAP_LAUNCHER",
+            "colmap_launcher",
+            "--self-check",
+        ):
+            self.assertNotIn(retired, surfaces)
+
+    def test_supply_chain_has_no_retired_python_colmap_component(self) -> None:
+        source = SCRIPT.read_text(encoding="utf-8")
+        for retired in (
+            "PYCOLMAP_VERSION",
+            "faiss_component",
+            '"easysplat-da3-bridge"',
+            'if slug == "pycolmap"',
+        ):
+            self.assertNotIn(retired, source)
+        self.assertIn('"easysplat-da3-runner"', source)
 
 
 if __name__ == "__main__":

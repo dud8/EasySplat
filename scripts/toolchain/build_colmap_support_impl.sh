@@ -756,7 +756,6 @@ stage_receipt() {
     "$NORMALIZED_MTIME_EPOCH" <<'PY'
 import hashlib
 import json
-import os
 import stat
 import subprocess
 import sys
@@ -895,10 +894,6 @@ for path in paths:
     tree.update(b"\0")
     tree.update(f"{mode:o}".encode("ascii"))
     tree.update(b"\0")
-    tree.update(str(metadata.st_uid).encode("ascii"))
-    tree.update(b"\0")
-    tree.update(str(metadata.st_gid).encode("ascii"))
-    tree.update(b"\0")
     tree.update(str(metadata.st_mtime_ns).encode("ascii"))
     tree.update(b"\0")
     tree.update(content.encode("ascii"))
@@ -911,8 +906,7 @@ payload = {
     "architecture": "arm64",
     "source_date_epoch": 0,
     "normalized_mtime_epoch": normalized_mtime_epoch,
-    "normalized_owner_uid": os.getuid(),
-    "normalized_owner_gid": os.getgid(),
+    "ownership_policy": "invoking-build-user-and-primary-group",
     "builder_sha256": file_sha256(builder),
     "builder_implementation_sha256": file_sha256(implementation),
     "source_lock_sha256": file_sha256(lock_path),
@@ -958,7 +952,7 @@ payload = {
             "install-mtime=2000-01-01T00:00:00Z",
             "regular-mode=0644",
             "dylib-and-directory-mode=0755",
-            "owner=current-build-user",
+            "ownership-policy=invoking-build-user-and-primary-group",
             "extended-attributes=none",
             "umask=022",
         ],
@@ -1017,10 +1011,10 @@ for relative, expected in receipt["library_sha256"].items():
         raise SystemExit(f"library hash mismatch in build_info.json: {relative}")
 if receipt.get("normalized_mtime_epoch") != normalized_mtime_epoch:
     raise SystemExit("normalized_mtime_epoch does not match the build contract")
-if receipt.get("normalized_owner_uid") != os.getuid():
-    raise SystemExit("normalized_owner_uid does not match the build user")
-if receipt.get("normalized_owner_gid") != os.getgid():
-    raise SystemExit("normalized_owner_gid does not match the build group")
+if receipt.get("ownership_policy") != "invoking-build-user-and-primary-group":
+    raise SystemExit("ownership_policy does not match the build contract")
+if "normalized_owner_uid" in receipt or "normalized_owner_gid" in receipt:
+    raise SystemExit("build_info.json contains host-specific numeric ownership")
 
 for path in [root, *sorted(root.rglob("*"))]:
     metadata = path.lstat()
@@ -1058,10 +1052,6 @@ for path in paths:
     tree.update(kind.encode("ascii"))
     tree.update(b"\0")
     tree.update(f"{mode:o}".encode("ascii"))
-    tree.update(b"\0")
-    tree.update(str(metadata.st_uid).encode("ascii"))
-    tree.update(b"\0")
-    tree.update(str(metadata.st_gid).encode("ascii"))
     tree.update(b"\0")
     tree.update(str(metadata.st_mtime_ns).encode("ascii"))
     tree.update(b"\0")

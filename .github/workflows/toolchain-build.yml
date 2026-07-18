@@ -97,6 +97,18 @@ jobs:
           command -v unzstd
           command -v zip
 
+      - name: Build pinned native COLMAP support closure
+        run: scripts/toolchain/build_colmap_support.sh
+
+      - name: Build pinned static Ceres
+        run: scripts/toolchain/build_ceres.sh
+
+      - name: Build pinned static OpenImageIO
+        run: scripts/toolchain/build_openimageio.sh
+
+      - name: Build native COLMAP
+        run: scripts/toolchain/build_colmap.sh
+
       - name: Build msplat
         run: scripts/toolchain/build_msplat.sh
 
@@ -143,6 +155,12 @@ jobs:
                   raise SystemExit(f"toolchain component is not a single-link regular file: {path.name}")
               if not 0 < metadata.st_size < 2_147_483_648:
                   raise SystemExit(f"toolchain component is empty or exceeds GitHub's asset limit: {path.name}")
+          sizes = {path.name: path.stat().st_size for path in root.iterdir()}
+          core = sizes[f"toolchain-macos-arm64-{version}-core.zip"]
+          if core > 2_500_000_000:
+              raise SystemExit("core-only toolchain exceeds the 2.5 GB download budget")
+          if sum(sizes.values()) > 6_000_000_000:
+              raise SystemExit("full optional toolchain exceeds the 6 GB download budget")
           PY
 
       - name: Upload exact unsigned component closure

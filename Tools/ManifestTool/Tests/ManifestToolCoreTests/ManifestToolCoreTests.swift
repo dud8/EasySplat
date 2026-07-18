@@ -4,6 +4,23 @@ import XCTest
 @testable import ManifestToolCore
 
 final class ManifestToolCoreTests: XCTestCase {
+    func testProductionComponentDefaultsSplitNativeCoreFromOptionalDA3Runtime() {
+        XCTAssertEqual(
+            ManifestToolDefaults.coreCapabilities,
+            ["runtime.core", "geometry.colmap", "training.msplat"]
+        )
+        XCTAssertFalse(ManifestToolDefaults.criticalCoreFiles.contains { $0.hasPrefix("da3_mps/") })
+
+        let baseRuntime = ManifestToolDefaults.da3BaseContents + [
+            "da3_mps/python/lib/python3.13/site-packages/torch/_C.so",
+            "da3_mps/vendor/depth-anything-3/src/depth_anything_3/api.py",
+        ]
+        XCTAssertEqual(
+            ManifestToolDefaults.criticalDa3BaseFiles(in: baseRuntime),
+            Set(baseRuntime)
+        )
+    }
+
     func testSchema2BuilderRejectsCrossComponentAndInstallerStateCollisions() throws {
         let tempDir = try makeTempDir()
         defer { try? FileManager.default.removeItem(at: tempDir) }
@@ -187,8 +204,8 @@ final class ManifestToolCoreTests: XCTestCase {
             appVersionRange: .init(minimum: "0.2.0-beta.1", maximumExclusive: "0.3.0"),
             components: [
                 .init(name: "macos-arm64-core", artifactURL: urls["macos-arm64-core"]!, zipURL: coreZip, capabilities: ManifestToolDefaults.coreCapabilities, dependencies: [], requirement: .required, criticalFilePaths: ManifestToolDefaults.criticalCoreFiles),
-                .init(name: "geometry-da3-base", artifactURL: urls["geometry-da3-base"]!, zipURL: baseZip, capabilities: ["geometry.da3.base"], dependencies: ["macos-arm64-core"], requirement: .required, criticalFilePaths: ManifestToolDefaults.da3BaseContents),
-                .init(name: "geometry-da3-small", artifactURL: urls["geometry-da3-small"]!, zipURL: smallZip, capabilities: ["geometry.da3.small"], dependencies: ["macos-arm64-core"], requirement: .optional, criticalFilePaths: ManifestToolDefaults.da3SmallContents),
+                .init(name: "geometry-da3-base", artifactURL: urls["geometry-da3-base"]!, zipURL: baseZip, capabilities: ["geometry.da3.runtime", "geometry.da3.base"], dependencies: ["macos-arm64-core"], requirement: .optional, criticalFilePaths: ManifestToolDefaults.da3BaseContents),
+                .init(name: "geometry-da3-small", artifactURL: urls["geometry-da3-small"]!, zipURL: smallZip, capabilities: ["geometry.da3.small"], dependencies: ["geometry-da3-base"], requirement: .optional, criticalFilePaths: ManifestToolDefaults.da3SmallContents),
             ],
             privateKeyBase64: keypair.privateKeyBase64
         )
@@ -309,20 +326,18 @@ final class ManifestToolCoreTests: XCTestCase {
         let tempDir = try makeTempDir()
         defer { try? FileManager.default.removeItem(at: tempDir) }
 
-        let corePaths = ManifestToolDefaults.criticalCoreFiles + [
-            "lib/libceres.2.dylib",
-            "da3_mps/vendor/depth-anything-3/src/depth_anything_3/api.py",
+        let corePaths = ManifestToolDefaults.criticalCoreFiles
+        let coreFiles = Dictionary(uniqueKeysWithValues: corePaths.enumerated().map {
+            ($0.element, Data("core-\($0.offset)".utf8))
+        })
+        let basePaths = ManifestToolDefaults.da3BaseContents + [
             "da3_mps/vendor/depth-anything-3/src/depth_anything_3/configs/da3-base.yaml",
             "da3_mps/python/bin/torchrun",
             "da3_mps/python/lib/python3.11/site-packages/torch/bin/protoc",
             "da3_mps/python/lib/python3.11/site-packages/foo/native_helper",
             "da3_mps/python/lib/python3.11/site-packages/native_extension.so",
-            "msplat/LICENSE",
         ]
-        let coreFiles = Dictionary(uniqueKeysWithValues: corePaths.enumerated().map {
-            ($0.element, Data("core-\($0.offset)".utf8))
-        })
-        let baseFiles = Dictionary(uniqueKeysWithValues: ManifestToolDefaults.da3BaseContents.enumerated().map {
+        let baseFiles = Dictionary(uniqueKeysWithValues: basePaths.enumerated().map {
             ($0.element, Data("base-\($0.offset)".utf8))
         })
         let smallFiles = Dictionary(uniqueKeysWithValues: ManifestToolDefaults.da3SmallContents.enumerated().map {
@@ -332,10 +347,14 @@ final class ManifestToolCoreTests: XCTestCase {
         let coreZip = try makeZip(
             named: "core",
             files: coreFiles,
+            in: tempDir
+        )
+        let baseZip = try makeZip(
+            named: "base",
+            files: baseFiles,
             executablePaths: [nativeHelper],
             in: tempDir
         )
-        let baseZip = try makeZip(named: "base", files: baseFiles, in: tempDir)
         let smallZip = try makeZip(named: "small", files: smallFiles, in: tempDir)
         let keypair = ManifestBuilder.generateKeypair()
 
@@ -357,9 +376,9 @@ final class ManifestToolCoreTests: XCTestCase {
                     name: "geometry-da3-base",
                     artifactURL: "https://example.com/base.zip",
                     zipURL: baseZip,
-                    capabilities: ["geometry.da3.base"],
+                    capabilities: ["geometry.da3.runtime", "geometry.da3.base"],
                     dependencies: ["macos-arm64-core"],
-                    requirement: .required,
+                    requirement: .optional,
                     criticalFilePaths: ManifestToolDefaults.da3BaseContents
                 ),
                 .init(
@@ -367,7 +386,7 @@ final class ManifestToolCoreTests: XCTestCase {
                     artifactURL: "https://example.com/small.zip",
                     zipURL: smallZip,
                     capabilities: ["geometry.da3.small"],
-                    dependencies: ["macos-arm64-core"],
+                    dependencies: ["geometry-da3-base"],
                     requirement: .optional,
                     criticalFilePaths: ManifestToolDefaults.da3SmallContents
                 ),
@@ -386,7 +405,7 @@ final class ManifestToolCoreTests: XCTestCase {
         XCTAssertEqual(manifest.keyID.count, 64)
         XCTAssertEqual(
             Set(manifest.components[0].criticalFileHashes.keys),
-            ManifestToolDefaults.criticalCoreFiles(in: Array(coreFiles.keys)).union([nativeHelper])
+            ManifestToolDefaults.criticalCoreFiles(in: Array(coreFiles.keys))
         )
         XCTAssertEqual(Set(manifest.components[1].criticalFileHashes.keys), Set(baseFiles.keys))
         XCTAssertEqual(Set(manifest.components[2].criticalFileHashes.keys), Set(smallFiles.keys))
@@ -405,16 +424,16 @@ final class ManifestToolCoreTests: XCTestCase {
         for component in manifest.components {
             XCTAssertTrue(component.criticalFileHashes.values.allSatisfy { $0.count == 64 })
         }
-        XCTAssertFalse(manifest.components[0].criticalFileHashes.keys.contains("msplat/LICENSE"))
-        XCTAssertNotNil(manifest.components[0].criticalFileHashes["da3_mps/python/bin/torchrun"])
+        XCTAssertNotNil(manifest.components[0].criticalFileHashes["msplat/LICENSE"])
+        XCTAssertNotNil(manifest.components[1].criticalFileHashes["da3_mps/python/bin/torchrun"])
         XCTAssertNotNil(
-            manifest.components[0].criticalFileHashes[
+            manifest.components[1].criticalFileHashes[
                 "da3_mps/python/lib/python3.11/site-packages/torch/bin/protoc"
             ]
         )
-        XCTAssertNotNil(manifest.components[0].criticalFileHashes[nativeHelper])
+        XCTAssertNotNil(manifest.components[1].criticalFileHashes[nativeHelper])
         XCTAssertNotNil(
-            manifest.components[0].criticalFileHashes[
+            manifest.components[1].criticalFileHashes[
                 "da3_mps/vendor/depth-anything-3/src/depth_anything_3/configs/da3-base.yaml"
             ]
         )
