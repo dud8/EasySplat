@@ -44,9 +44,9 @@ struct ColmapDatabaseProgressPoller: Sendable {
     }
 
     /// Actual per-image keypoint counts read back from the database after feature extraction.
-    /// This build's COLMAP silently ignores `--SiftExtraction.max_num_features`, so the count
-    /// is content-driven, not the requested cap — reading it back gives the true figure for the
-    /// log and lets us flag frames that extracted almost nothing (flat/low-texture/degenerate).
+    /// COLMAP applies `max_num_features` before assigning multiple feature orientations, so the
+    /// stored count may exceed the requested cap. Reading it back gives the true figure for the
+    /// log and flags frames that extracted almost nothing (flat/low-texture/degenerate).
     struct KeypointStats: Sendable, Equatable {
         var imageCount: Int
         var totalKeypoints: Int

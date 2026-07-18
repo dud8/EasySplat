@@ -57,6 +57,14 @@ class ProfileError(ValueError):
     """The mapper log cannot produce a trustworthy aggregate profile."""
 
 
+def _missing_solver_report(line_number: int) -> ProfileError:
+    return ProfileError(
+        "native mapper log has no solver report before "
+        f"line {line_number}; rerun the profiling mapper command with "
+        "--log_level 1 (benchmark capture only)"
+    )
+
+
 def _scan_timestamps(
     lines: list[str],
 ) -> tuple[dict[int, tuple[datetime, str]], datetime, datetime, int]:
@@ -238,9 +246,7 @@ def parse_mapping_profile(
 
             if message in {INITIAL_GLOBAL_MARKER, ITERATIVE_GLOBAL_MARKER}:
                 if current_global_marker_reported is False:
-                    raise ProfileError(
-                        f"global refinement marker has no report before line {line_number}"
-                    )
+                    raise _missing_solver_report(line_number)
                 if global_region_start is None:
                     global_region_start = timestamp
                 current_global_marker_reported = False
@@ -255,10 +261,7 @@ def parse_mapping_profile(
                 marker_counts["registration_attempts"] += 1
                 if global_region_start is not None:
                     if current_global_marker_reported is False:
-                        raise ProfileError(
-                            "global refinement marker has no report before "
-                            f"line {line_number}"
-                        )
+                        raise _missing_solver_report(line_number)
                     current_global_marker_reported = None
                     global_region_seconds += (
                         timestamp - global_region_start
@@ -273,9 +276,7 @@ def parse_mapping_profile(
             if is_reconstruction_end or line_number == final_elapsed_line:
                 saw_reconstruction_end = saw_reconstruction_end or is_reconstruction_end
                 if current_global_marker_reported is False:
-                    raise ProfileError(
-                        f"global refinement marker has no report before line {line_number}"
-                    )
+                    raise _missing_solver_report(line_number)
                 current_global_marker_reported = None
                 if global_region_start is not None:
                     global_region_seconds += (

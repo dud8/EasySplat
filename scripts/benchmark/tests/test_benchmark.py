@@ -1602,7 +1602,7 @@ def raw_observations(
             },
             "cpu_only_reasons": {
                 "feature_extraction": "colmap_sift_has_no_supported_metal_backend",
-                "matching": "faiss_has_no_supported_metal_backend",
+                "matching": "faiss_metal_disabled_selected_indices_unsupported",
                 "mapping": "ceres_has_no_supported_metal_backend",
             },
         },

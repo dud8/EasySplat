@@ -2755,7 +2755,7 @@ def _validate_resolved_compute(
     )
     reason_tokens = {
         "feature_extraction": "colmap_sift_has_no_supported_metal_backend",
-        "matching": "faiss_has_no_supported_metal_backend",
+        "matching": "faiss_metal_disabled_selected_indices_unsupported",
         "mapping": "ceres_has_no_supported_metal_backend",
     }
     expected_reasons = {

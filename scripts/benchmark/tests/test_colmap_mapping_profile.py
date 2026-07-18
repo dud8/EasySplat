@@ -419,6 +419,22 @@ class ColmapMappingProfileTests(unittest.TestCase):
                 with self.assertRaises(profiler.ProfileError):
                     profiler.parse_mapping_profile(log)
 
+    def test_nonverbose_native_log_explains_how_to_capture_solver_reports(self) -> None:
+        log = "\n".join(
+            [
+                _line("00.000000", "Loading database"),
+                _line("01.000000", "Global bundle adjustment"),
+                _line("03.000000", "Keeping successful reconstruction"),
+                _line("04.000000", "Elapsed time: 0.067 [minutes]"),
+            ]
+        )
+
+        with self.assertRaisesRegex(
+            _profiler().ProfileError,
+            r"rerun .* --log_level 1",
+        ):
+            _profiler().parse_mapping_profile(log)
+
     def test_rejects_impossible_solver_and_region_shares(self) -> None:
         profiler = _profiler()
         too_much_total_solver_time = _valid_log().replace(
