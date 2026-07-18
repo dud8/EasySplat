@@ -3,7 +3,7 @@ import XCTest
 
 final class ProjectMetadataValidationTests: XCTestCase {
     func testLoadRejectsPreviousFormatBeforeDecodingCanonicalGeometryState() throws {
-        XCTAssertEqual(ProjectMetadataStore.supportedFormatVersion, 14)
+        XCTAssertEqual(ProjectMetadataStore.supportedFormatVersion, 17)
         let retiredFormatVersion = ProjectMetadataStore.supportedFormatVersion - 1
 
         let metadata = makeMetadata()
@@ -189,6 +189,7 @@ final class ProjectMetadataValidationTests: XCTestCase {
                 capturePath: .orbit,
                 detailProfile: .balanced
             ),
+            resolvedRunPlan: makeResolvedRunPlan(for: geometry),
             geometryArtifact: geometry
         )
 
@@ -220,6 +221,7 @@ final class ProjectMetadataValidationTests: XCTestCase {
                     capturePath: .orbit,
                     detailProfile: .balanced
                 ),
+                resolvedRunPlan: makeResolvedRunPlan(for: geometry),
                 geometryArtifact: geometry
             )
 
@@ -246,9 +248,30 @@ final class ProjectMetadataValidationTests: XCTestCase {
             title: "Artifact paths",
             input: .photos(folder: "/tmp/photos"),
             requestedRunOptions: RequestedRunOptions(capturePath: .orbit, detailProfile: .balanced),
+            resolvedRunPlan: makeResolvedRunPlan(for: geometry),
             geometryArtifact: geometry,
             trainingArtifact: training
         )
+    }
+
+    private func makeResolvedRunPlan(
+        for geometry: GeometryArtifact
+    ) -> ResolvedRunPlan {
+        var plan = RunPlanResolver.resolve(
+            requestedOptions: RequestedRunOptions(
+                capturePath: .orbit,
+                detailProfile: .balanced
+            ),
+            input: .photos(folder: "/tmp/photos"),
+            hardware: HardwareProfile(
+                memoryGB: 48,
+                cpuCount: 16,
+                gpuWorkingSetGB: 36
+            ),
+            developmentOverrides: .none
+        )
+        plan.geometryWorkerBudget = geometry.workerExecution.resolvedBudget
+        return plan
     }
 
     private func writeMetadataWithoutStoreValidation(

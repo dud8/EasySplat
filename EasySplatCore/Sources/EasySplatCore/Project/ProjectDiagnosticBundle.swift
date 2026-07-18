@@ -15,7 +15,7 @@ public enum ProjectDiagnosticBundle {
     /// Schema version embedded in the machine-readable JSON block. Bump
     /// when adding/removing/renaming top-level keys so downstream tools can
     /// detect a format change.
-    public static let machineReadableSchemaVersion = 9
+    public static let machineReadableSchemaVersion = 12
 
     /// Scrub a user-visible technical payload before it reaches a clipboard,
     /// save panel, or share surface. Project identity is included when the
@@ -134,6 +134,19 @@ public enum ProjectDiagnosticBundle {
         lines.append("Created: \(iso8601(metadata.createdAt))")
         let options = metadata.requestedRunOptions
         lines.append("Options: capture=\(options.capturePath.rawValue) detail=\(options.detailProfile.rawValue)")
+        if let workers = metadata.resolvedRunPlan?.geometryWorkerBudget {
+            let videoSourceLimit = workers.maximumConcurrentVideoSourceAnalysisTasks
+            let clipNoun = videoSourceLimit == 1 ? "clip" : "clips"
+            lines.append(
+                "Geometry workers: extract \(workers.featureExtractionWorkers) · "
+                    + "match \(workers.coupledMatchingWorkers) · "
+                    + "retrieve \(workers.vocabularyRetrievalWorkers)"
+            )
+            lines.append(
+                "Video source analysis: up to "
+                    + "\(videoSourceLimit) \(clipNoun) at once"
+            )
+        }
         switch metadata.input {
         case .video(let files):
             lines.append("Input: \(files.count) video(s)")
@@ -180,6 +193,9 @@ public enum ProjectDiagnosticBundle {
             )
             lines.append("Union registered: \(mapping.unionRegisteredViewCount)")
             lines.append("Mapping attempts: \(mapping.attemptCount)")
+            lines.append(
+                "Accepted mapping attempt: \(mapping.acceptedMappingAttemptOrdinal)"
+            )
             let invocationLabel = mapping.acceptedRefinementInvocationCount == 1
                 ? "invocation"
                 : "invocations"
@@ -301,6 +317,7 @@ public enum ProjectDiagnosticBundle {
             var secondLargestModelRegisteredViewCount: Int
             var unionRegisteredViewCount: Int
             var attemptCount: Int
+            var acceptedMappingAttemptOrdinal: Int
             var acceptedRefinementKind: String
             var acceptedRefinementInvocationCount: Int
             var incrementalCadence: IncrementalMappingCadenceArtifact?
@@ -312,6 +329,7 @@ public enum ProjectDiagnosticBundle {
                 secondLargestModelRegisteredViewCount = mapping.secondLargestModelRegisteredViewCount
                 unionRegisteredViewCount = mapping.unionRegisteredViewCount
                 attemptCount = mapping.attemptCount
+                acceptedMappingAttemptOrdinal = mapping.acceptedMappingAttemptOrdinal
                 acceptedRefinementKind = mapping.acceptedRefinementKind.rawValue
                 acceptedRefinementInvocationCount = mapping.acceptedRefinementInvocationCount
                 incrementalCadence = mapping.incrementalCadence
@@ -351,6 +369,7 @@ public enum ProjectDiagnosticBundle {
         struct Payload: Encodable {
             var schemaVersion: Int
             var requestedRunOptions: RequestedRunOptions
+            var resolvedGeometryExecutionBudget: GeometryWorkerBudget?
             var reconstruction: ReconstructionSummary?
             var mapping: DiagnosticMapping?
             var geometryRecovery: DiagnosticGeometryRecovery?
@@ -361,6 +380,7 @@ public enum ProjectDiagnosticBundle {
         let payload = Payload(
             schemaVersion: ProjectDiagnosticBundle.machineReadableSchemaVersion,
             requestedRunOptions: metadata.requestedRunOptions,
+            resolvedGeometryExecutionBudget: metadata.resolvedRunPlan?.geometryWorkerBudget,
             reconstruction: metadata.reconstruction,
             mapping: metadata.geometryArtifact.map { DiagnosticMapping($0.mapping) },
             geometryRecovery: metadata.geometryRecovery.map(DiagnosticGeometryRecovery.init),

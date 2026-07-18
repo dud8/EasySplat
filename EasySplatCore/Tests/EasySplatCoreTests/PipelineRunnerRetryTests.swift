@@ -4,6 +4,53 @@ import SQLite3
 @testable import EasySplatCore
 
 final class PipelineRunnerRetryTests: XCTestCase {
+    func testRunRejectsInjectedInvalidWorkerBudgetBeforePersistenceOrSubprocessLaunch() async throws {
+        let root = try TestFileBuilder.makeTempDir()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let paths = ProjectPaths(root: root)
+        try paths.ensureDirectories()
+
+        let options = RequestedRunOptions(inputOrdering: .unordered)
+        let input = InputSpec.photos(folder: "/tmp/Photos")
+        let metadata = ProjectMetadata(
+            title: "Invalid worker budget",
+            input: input,
+            requestedRunOptions: options
+        )
+        try ProjectMetadataStore.save(metadata, to: paths.metadataURL)
+
+        var invalidPlan = RunPlanResolver.resolve(
+            requestedOptions: options,
+            input: input,
+            hardware: HardwareProfile(memoryGB: 48, cpuCount: 16, gpuWorkingSetGB: 36),
+            developmentOverrides: .none
+        )
+        invalidPlan.geometryWorkerBudget.coupledMatchingWorkers = 0
+        let subprocess = MockSubprocessRunner(scripts: [])
+        let runner = PipelineRunner(
+            projectURL: root,
+            config: PipelineRunner.PipelineConfig(
+                toolchain: TestToolchains.toolchainPaths(root: root),
+                hardwareProfile: HardwareProfile(memoryGB: 48, cpuCount: 16, gpuWorkingSetGB: 36),
+                resolvedRunPlan: invalidPlan
+            ),
+            tooling: PipelineRunner.Tooling(runner: subprocess)
+        )
+
+        do {
+            try await runner.run { _ in }
+            XCTFail("Expected invalid worker budget to stop the run")
+        } catch {
+            XCTAssertEqual(
+                error as? ResolvedRunPlanValidationError,
+                .invalidGeometryWorkerBudget
+            )
+        }
+
+        XCTAssertTrue(subprocess.calls.isEmpty)
+        XCTAssertNil(try ProjectMetadataStore.load(from: paths.metadataURL).resolvedRunPlan)
+    }
+
     func testPairGraphRecoveryRecognizesRecoverableGeometryFailures() {
         XCTAssertTrue(PipelineRunner.shouldRecoverPairGraph(
             after: PipelineRunner.PipelineError.outputMissing
@@ -1226,19 +1273,21 @@ final class PipelineRunnerRetryTests: XCTestCase {
 
         let options = RequestedRunOptions(inputOrdering: .unordered)
         let hardware = HardwareProfile(memoryGB: 48, cpuCount: 16, gpuWorkingSetGB: 36)
-        var previousPlan = RunPlanResolver.resolve(
+        let previousPlan = RunPlanResolver.resolve(
             requestedOptions: options,
             input: .photos(folder: "/tmp/Photos"),
             hardware: hardware,
             developmentOverrides: .none
         )
-        previousPlan.baGlobalFramesRatio = 1.2
-        let currentPlan = RunPlanResolver.resolve(
-            requestedOptions: options,
+        var currentPlan = previousPlan
+        currentPlan.geometryWorkerBudget.coupledMatchingWorkers -= 1
+        let completedBoundary = RunPlanResolver.safeResumeStage(
+            .sfmMapping,
             input: .photos(folder: "/tmp/Photos"),
-            hardware: hardware,
-            developmentOverrides: .none
+            previousPlan: previousPlan,
+            currentPlan: currentPlan
         )
+        XCTAssertEqual(completedBoundary, .sfmFeatures)
         var metadata = ProjectMetadata(
             title: "Durable plan change",
             input: .photos(folder: "/tmp/Photos"),
@@ -1262,7 +1311,7 @@ final class PipelineRunnerRetryTests: XCTestCase {
 
         try makeRunner(projectURL: root).test_persistResolvedPlanChange(
             currentPlan,
-            completedBoundary: .sfmFeatures,
+            completedBoundary: completedBoundary,
             metadata: &metadata,
             paths: paths
         )

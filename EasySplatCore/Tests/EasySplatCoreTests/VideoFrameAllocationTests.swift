@@ -2,39 +2,46 @@ import XCTest
 @testable import EasySplatCore
 
 final class VideoFrameAllocationTests: XCTestCase {
-    func testAnalysisConcurrencyFollowsResolvedResourcePolicy() {
+    func testAnalysisConcurrencyUsesTheResolvedStageLimitDirectly() {
         XCTAssertEqual(
-            PipelineRunner.test_videoAnalysisConcurrency(
-                threadLimit: 2,
-                videoCount: 6
+            PipelineRunner.test_videoSourceAnalysisConcurrency(
+                maximumConcurrentTasks: 4,
+                videoSourceCount: 0
+            ),
+            0
+        )
+        XCTAssertEqual(
+            PipelineRunner.test_videoSourceAnalysisConcurrency(
+                maximumConcurrentTasks: 1,
+                videoSourceCount: 6
             ),
             1
         )
         XCTAssertEqual(
-            PipelineRunner.test_videoAnalysisConcurrency(
-                threadLimit: 4,
-                videoCount: 6
+            PipelineRunner.test_videoSourceAnalysisConcurrency(
+                maximumConcurrentTasks: 2,
+                videoSourceCount: 6
             ),
             2
         )
         XCTAssertEqual(
-            PipelineRunner.test_videoAnalysisConcurrency(
-                threadLimit: 6,
-                videoCount: 6
+            PipelineRunner.test_videoSourceAnalysisConcurrency(
+                maximumConcurrentTasks: 3,
+                videoSourceCount: 6
             ),
             3
         )
         XCTAssertEqual(
-            PipelineRunner.test_videoAnalysisConcurrency(
-                threadLimit: 8,
-                videoCount: 6
+            PipelineRunner.test_videoSourceAnalysisConcurrency(
+                maximumConcurrentTasks: 4,
+                videoSourceCount: 6
             ),
             4
         )
         XCTAssertEqual(
-            PipelineRunner.test_videoAnalysisConcurrency(
-                threadLimit: 10,
-                videoCount: 2
+            PipelineRunner.test_videoSourceAnalysisConcurrency(
+                maximumConcurrentTasks: 4,
+                videoSourceCount: 2
             ),
             2
         )

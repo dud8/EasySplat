@@ -446,13 +446,13 @@ extension PipelineRunner {
             )
         }
 
-        let converterOptions = colmapOptionsForMatching()
         try tooling.colmap.runModelConverter(
             colmapPath: config.toolchain.colmap,
             inputPath: binaryInput,
             outputPath: textOutput,
             outputType: "TXT",
-            environment: converterOptions.environment,
+            environment: colmapUtilityEnvironment(),
+            recordGeometryWorkerExecution: true,
             onLog: { _, _ in }
         )
         for name in txtFiles {
@@ -643,40 +643,40 @@ extension PipelineRunner {
         }
     }
 
-    func colmapOptionsForExtraction() -> ColmapOptions {
-        let cores = ProcessInfo.processInfo.activeProcessorCount
-        let extractThreads = min(8, max(2, cores / 2))
+    func colmapOptionsForExtraction(workerCount: Int) -> ColmapOptions {
         return ColmapOptions(
             useGPU: false,
-            extractThreads: extractThreads,
+            extractThreads: workerCount,
             matchThreads: 1,
             maxNumFeatures: 8192,
             maxNumMatches: nil,
             descriptorMatcher: .faiss,
-            environment: [
-                "OMP_NUM_THREADS": "\(extractThreads)",
-                "OPENBLAS_NUM_THREADS": "\(extractThreads)",
-                "MKL_NUM_THREADS": "\(extractThreads)"
-            ]
+            environment: colmapWorkerEnvironment(workerCount: workerCount)
         )
     }
 
-    func colmapOptionsForMatching() -> ColmapOptions {
-        let cores = ProcessInfo.processInfo.activeProcessorCount
-        let matchThreads = min(8, max(2, cores / 2))
+    func colmapOptionsForMatching(workerCount: Int) -> ColmapOptions {
         return ColmapOptions(
             useGPU: false,
-            extractThreads: matchThreads,
-            matchThreads: matchThreads,
+            extractThreads: workerCount,
+            matchThreads: workerCount,
             maxNumFeatures: nil,
             maxNumMatches: 8192,
             descriptorMatcher: .faiss,
-            environment: [
-                "OMP_NUM_THREADS": "\(matchThreads)",
-                "OPENBLAS_NUM_THREADS": "\(matchThreads)",
-                "MKL_NUM_THREADS": "\(matchThreads)"
-            ]
+            environment: colmapWorkerEnvironment(workerCount: workerCount)
         )
+    }
+
+    func colmapUtilityEnvironment() -> [String: String] {
+        [:]
+    }
+
+    func colmapWorkerEnvironment(workerCount: Int) -> [String: String] {
+        [
+            "OMP_NUM_THREADS": "\(workerCount)",
+            "OPENBLAS_NUM_THREADS": "\(workerCount)",
+            "MKL_NUM_THREADS": "\(workerCount)",
+        ]
     }
 
     func runDa3MatchesImporterWithOneShotExactRecovery(

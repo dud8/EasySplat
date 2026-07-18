@@ -63,6 +63,7 @@ final class PairGraphEvidenceStoreTests: XCTestCase {
         let artifact = try loaded.pairGraphArtifact()
         XCTAssertEqual(artifact.status, .measured)
         XCTAssertEqual(artifact.measurement, measurement)
+        XCTAssertTrue(artifact.usedLocalVocabularyRetrieval)
     }
 
     func testSaveProducesDeterministicBytes() throws {
@@ -740,6 +741,7 @@ final class PairGraphEvidenceStoreTests: XCTestCase {
             attempts: [firstAttempt, acceptedAttempt],
             acceptedAttemptNumber: 2,
             acceptedInspection: inspection,
+            usedLocalVocabularyRetrieval: true,
             matchingDurationSeconds: 4,
             fallbackReasons: ["denser pair graph"]
         )

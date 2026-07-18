@@ -11,7 +11,7 @@ enum PairGraphRecoveryPhase: String, Codable, Sendable, Equatable {
 }
 
 struct PairGraphRecoveryState: Codable, Sendable, Equatable {
-    static let currentSchemaVersion = 6
+    static let currentSchemaVersion = 7
 
     var schemaVersion: Int
     var selectedFramesDigest: String
@@ -24,6 +24,7 @@ struct PairGraphRecoveryState: Codable, Sendable, Equatable {
     var activeScheduledPairs: [ColmapScheduledPair]
     var activePairListDigest: String
     var attempts: [PairGraphAttemptEvidence]
+    var usedLocalVocabularyRetrieval: Bool
     var matchingDurationSeconds: Double
     var fallbackReasons: [String]
 
@@ -37,6 +38,7 @@ struct PairGraphRecoveryState: Codable, Sendable, Equatable {
         activeRecoveryLevel: PairGraphRecoveryLevel,
         activePlan: ColmapPairPlan,
         attempts: [PairGraphAttemptEvidence],
+        usedLocalVocabularyRetrieval: Bool = false,
         matchingDurationSeconds: Double,
         fallbackReasons: [String]
     ) {
@@ -51,6 +53,7 @@ struct PairGraphRecoveryState: Codable, Sendable, Equatable {
         activeScheduledPairs = activePlan.pairs
         activePairListDigest = activePlan.sha256
         self.attempts = attempts
+        self.usedLocalVocabularyRetrieval = usedLocalVocabularyRetrieval
         self.matchingDurationSeconds = matchingDurationSeconds
         self.fallbackReasons = fallbackReasons
     }
@@ -68,6 +71,7 @@ struct RestoredPairGraphRecovery: Sendable, Equatable {
     let activePlan: ColmapPairPlan
     let recoveryLevel: PairGraphRecoveryLevel
     let attempts: [PairGraphAttemptEvidence]
+    let usedLocalVocabularyRetrieval: Bool
     let matchingDurationSeconds: Double
     let fallbackReasons: [String]
 
@@ -241,6 +245,7 @@ enum PairGraphRecoveryStore {
                 activePlan: activePlan,
                 recoveryLevel: state.activeRecoveryLevel,
                 attempts: state.attempts,
+                usedLocalVocabularyRetrieval: state.usedLocalVocabularyRetrieval,
                 matchingDurationSeconds: state.matchingDurationSeconds,
                 fallbackReasons: state.fallbackReasons
             )
@@ -282,6 +287,7 @@ enum PairGraphRecoveryStore {
                 activePlan: activePlan,
                 recoveryLevel: state.activeRecoveryLevel,
                 attempts: state.attempts,
+                usedLocalVocabularyRetrieval: state.usedLocalVocabularyRetrieval,
                 matchingDurationSeconds: state.matchingDurationSeconds,
                 fallbackReasons: state.fallbackReasons
             )

@@ -31,6 +31,7 @@ public struct ProjectPaths: Sendable {
     public var colmapSparseURL: URL { root.appendingPathComponent("SfM/colmap/sparse", isDirectory: true) }
     public var pairGraphEvidenceURL: URL { root.appendingPathComponent("SfM/pair_graph_evidence.json") }
     public var pairGraphRecoveryURL: URL { root.appendingPathComponent("SfM/pair_graph_recovery.json") }
+    public var workerExecutionURL: URL { root.appendingPathComponent("SfM/worker_execution.json") }
     public var geometryManifestURL: URL { root.appendingPathComponent("SfM/geometry_manifest.json") }
     public var trainingURL: URL { root.appendingPathComponent("Training", isDirectory: true) }
     public var trainingManifestURL: URL { trainingURL.appendingPathComponent("training_manifest.json") }

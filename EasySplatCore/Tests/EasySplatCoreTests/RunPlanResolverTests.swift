@@ -3,6 +3,128 @@ import XCTest
 @testable import EasySplatCore
 
 final class RunPlanResolverTests: XCTestCase {
+    func testGeometryWorkerBudgetSeparatesStagesAcrossHardwarePolicies() {
+        struct Fixture {
+            let memoryGB: Double
+            let cpuCount: Int
+            let resourcePolicy: ResourcePolicy
+            let expected: GeometryWorkerBudget
+        }
+
+        let fixtures = [
+            Fixture(
+                memoryGB: 8,
+                cpuCount: 8,
+                resourcePolicy: .automatic,
+                expected: GeometryWorkerBudget(
+                    featureExtractionWorkers: 4,
+                    coupledMatchingWorkers: 4,
+                    vocabularyRetrievalWorkers: 4,
+                    maximumConcurrentVideoSourceAnalysisTasks: 2
+                )
+            ),
+            Fixture(
+                memoryGB: 16,
+                cpuCount: 10,
+                resourcePolicy: .automatic,
+                expected: GeometryWorkerBudget(
+                    featureExtractionWorkers: 10,
+                    coupledMatchingWorkers: 5,
+                    vocabularyRetrievalWorkers: 5,
+                    maximumConcurrentVideoSourceAnalysisTasks: 2
+                )
+            ),
+            Fixture(
+                memoryGB: 16,
+                cpuCount: 12,
+                resourcePolicy: .automatic,
+                expected: GeometryWorkerBudget(
+                    featureExtractionWorkers: 12,
+                    coupledMatchingWorkers: 6,
+                    vocabularyRetrievalWorkers: 6,
+                    maximumConcurrentVideoSourceAnalysisTasks: 2
+                )
+            ),
+            Fixture(
+                memoryGB: 16,
+                cpuCount: 12,
+                resourcePolicy: .maximumPerformance,
+                expected: GeometryWorkerBudget(
+                    featureExtractionWorkers: 12,
+                    coupledMatchingWorkers: 6,
+                    vocabularyRetrievalWorkers: 6,
+                    maximumConcurrentVideoSourceAnalysisTasks: 2
+                )
+            ),
+            Fixture(
+                memoryGB: 24,
+                cpuCount: 12,
+                resourcePolicy: .automatic,
+                expected: GeometryWorkerBudget(
+                    featureExtractionWorkers: 12,
+                    coupledMatchingWorkers: 6,
+                    vocabularyRetrievalWorkers: 6,
+                    maximumConcurrentVideoSourceAnalysisTasks: 3
+                )
+            ),
+            Fixture(
+                memoryGB: 48,
+                cpuCount: 16,
+                resourcePolicy: .automatic,
+                expected: GeometryWorkerBudget(
+                    featureExtractionWorkers: 12,
+                    coupledMatchingWorkers: 8,
+                    vocabularyRetrievalWorkers: 8,
+                    maximumConcurrentVideoSourceAnalysisTasks: 4
+                )
+            ),
+            Fixture(
+                memoryGB: 48,
+                cpuCount: 16,
+                resourcePolicy: .maximumPerformance,
+                expected: GeometryWorkerBudget(
+                    featureExtractionWorkers: 16,
+                    coupledMatchingWorkers: 8,
+                    vocabularyRetrievalWorkers: 8,
+                    maximumConcurrentVideoSourceAnalysisTasks: 4
+                )
+            ),
+            Fixture(
+                memoryGB: 48,
+                cpuCount: 16,
+                resourcePolicy: .conserveMemory,
+                expected: GeometryWorkerBudget(
+                    featureExtractionWorkers: 4,
+                    coupledMatchingWorkers: 4,
+                    vocabularyRetrievalWorkers: 4,
+                    maximumConcurrentVideoSourceAnalysisTasks: 2
+                )
+            ),
+        ]
+
+        for fixture in fixtures {
+            let plan = RunPlanResolver.resolve(
+                requestedOptions: RequestedRunOptions(
+                    detailProfile: .balanced,
+                    resourcePolicy: fixture.resourcePolicy
+                ),
+                input: .video(files: ["/tmp/clip.mov"]),
+                hardware: HardwareProfile(
+                    memoryGB: fixture.memoryGB,
+                    cpuCount: fixture.cpuCount,
+                    gpuWorkingSetGB: nil
+                ),
+                developmentOverrides: .none
+            )
+
+            XCTAssertEqual(
+                plan.geometryWorkerBudget,
+                fixture.expected,
+                "\(fixture.memoryGB) GB, \(fixture.cpuCount) CPUs, \(fixture.resourcePolicy)"
+            )
+        }
+    }
+
     func testIncompleteRunPlanIsRejected() throws {
         let json = """
         {
@@ -61,7 +183,9 @@ final class RunPlanResolverTests: XCTestCase {
         XCTAssertEqual(plan.trainerMemoryBudgetBytes, 34_789_235_097)
         XCTAssertEqual(plan.colmapMaximumFeatureCount, 10_000)
         XCTAssertEqual(plan.colmapMaximumMatchCount, 10_000)
-        XCTAssertEqual(plan.colmapThreadLimit, 8)
+        XCTAssertEqual(plan.geometryWorkerBudget.featureExtractionWorkers, 12)
+        XCTAssertEqual(plan.geometryWorkerBudget.coupledMatchingWorkers, 8)
+        XCTAssertEqual(plan.geometryWorkerBudget.maximumConcurrentVideoSourceAnalysisTasks, 1)
         XCTAssertEqual(plan.baGlobalFramesRatio, 1.1)
         XCTAssertEqual(plan.baGlobalPointsRatio, 1.1)
         XCTAssertEqual(plan.baLocalMaxRefinements, 2)
@@ -150,7 +274,7 @@ final class RunPlanResolverTests: XCTestCase {
             XCTAssertEqual(plan.colmapMaximumImageDimension, 1_024)
             XCTAssertEqual(plan.colmapMaximumFeatureCount, 4_096)
             XCTAssertEqual(plan.colmapMaximumMatchCount, 4_096)
-            XCTAssertEqual(plan.colmapThreadLimit, 4)
+            XCTAssertEqual(plan.geometryWorkerBudget.coupledMatchingWorkers, 4)
         }
     }
 
@@ -293,7 +417,8 @@ final class RunPlanResolverTests: XCTestCase {
         XCTAssertGreaterThan(performance.maximumImageDimension, constrained.maximumImageDimension)
         XCTAssertEqual(performance.colmapMaximumFeatureCount, 12_000)
         XCTAssertEqual(performance.colmapMaximumMatchCount, 12_000)
-        XCTAssertEqual(performance.colmapThreadLimit, 10)
+        XCTAssertEqual(performance.geometryWorkerBudget.featureExtractionWorkers, 12)
+        XCTAssertEqual(performance.geometryWorkerBudget.coupledMatchingWorkers, 6)
     }
 
     func testHighDetailRequiresTheFullNominalTwentyFourGBTier() {
@@ -574,6 +699,41 @@ final class RunPlanResolverTests: XCTestCase {
                 error as? ResolvedRunPlanValidationError,
                 .invalidBundleAdjustmentConfiguration
             )
+        }
+    }
+
+    func testResolvedPlanRejectsInvalidGeometryWorkerBudgets() {
+        let plan = RunPlanResolver.resolve(
+            requestedOptions: RequestedRunOptions(),
+            input: .video(files: ["/tmp/clip.mov"]),
+            hardware: HardwareProfile(memoryGB: 48, cpuCount: 16, gpuWorkingSetGB: 36),
+            developmentOverrides: .none
+        )
+        var invalidPlans: [ResolvedRunPlan] = []
+
+        var invalid = plan
+        invalid.geometryWorkerBudget.featureExtractionWorkers = 0
+        invalidPlans.append(invalid)
+
+        invalid = plan
+        invalid.geometryWorkerBudget.coupledMatchingWorkers = 65
+        invalidPlans.append(invalid)
+
+        invalid = plan
+        invalid.geometryWorkerBudget.vocabularyRetrievalWorkers = 0
+        invalidPlans.append(invalid)
+
+        invalid = plan
+        invalid.geometryWorkerBudget.maximumConcurrentVideoSourceAnalysisTasks = 65
+        invalidPlans.append(invalid)
+
+        for invalidPlan in invalidPlans {
+            XCTAssertThrowsError(try invalidPlan.toolchainCapabilityRequest()) { error in
+                XCTAssertEqual(
+                    error as? ResolvedRunPlanValidationError,
+                    .invalidGeometryWorkerBudget
+                )
+            }
         }
     }
 
@@ -1040,6 +1200,66 @@ final class RunPlanResolverTests: XCTestCase {
                 input: video,
                 previousPlan: currentVideoPlan,
                 currentPlan: pairingPolicyPlan
+            ),
+            .sfmFeatures
+        )
+
+        var videoWorkersPlan = currentVideoPlan
+        videoWorkersPlan.geometryWorkerBudget.maximumConcurrentVideoSourceAnalysisTasks += 1
+        XCTAssertEqual(
+            RunPlanResolver.safeResumeStage(
+                .exportSplat,
+                input: video,
+                previousPlan: currentVideoPlan,
+                currentPlan: videoWorkersPlan
+            ),
+            .importInput
+        )
+
+        var photoVideoWorkersPlan = currentPhotoPlan
+        photoVideoWorkersPlan.geometryWorkerBudget.maximumConcurrentVideoSourceAnalysisTasks += 1
+        XCTAssertEqual(
+            RunPlanResolver.safeResumeStage(
+                .exportSplat,
+                input: photos,
+                previousPlan: currentPhotoPlan,
+                currentPlan: photoVideoWorkersPlan
+            ),
+            .exportSplat
+        )
+
+        var extractionWorkersPlan = currentVideoPlan
+        extractionWorkersPlan.geometryWorkerBudget.featureExtractionWorkers += 1
+        XCTAssertEqual(
+            RunPlanResolver.safeResumeStage(
+                .exportSplat,
+                input: video,
+                previousPlan: currentVideoPlan,
+                currentPlan: extractionWorkersPlan
+            ),
+            .selectFrames
+        )
+
+        var matchingWorkersPlan = currentVideoPlan
+        matchingWorkersPlan.geometryWorkerBudget.coupledMatchingWorkers += 1
+        XCTAssertEqual(
+            RunPlanResolver.safeResumeStage(
+                .exportSplat,
+                input: video,
+                previousPlan: currentVideoPlan,
+                currentPlan: matchingWorkersPlan
+            ),
+            .sfmFeatures
+        )
+
+        var retrievalWorkersPlan = currentVideoPlan
+        retrievalWorkersPlan.geometryWorkerBudget.vocabularyRetrievalWorkers += 1
+        XCTAssertEqual(
+            RunPlanResolver.safeResumeStage(
+                .exportSplat,
+                input: video,
+                previousPlan: currentVideoPlan,
+                currentPlan: retrievalWorkersPlan
             ),
             .sfmFeatures
         )

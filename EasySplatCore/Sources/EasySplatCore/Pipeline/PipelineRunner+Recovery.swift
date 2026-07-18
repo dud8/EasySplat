@@ -439,6 +439,8 @@ extension PipelineRunner {
             Stderr tail:
             \(stderrTail)
             """
+        case .executionEvidenceUnavailable(let command):
+            return "COLMAP worker execution evidence was unavailable for \(command)."
         }
     }
 

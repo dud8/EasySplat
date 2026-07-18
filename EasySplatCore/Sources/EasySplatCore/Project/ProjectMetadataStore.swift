@@ -5,7 +5,7 @@ public enum ProjectMetadataStore {
     private static let maximumMetadataBytes = 8 * 1_024 * 1_024
     private static let fileLocks = ProjectMetadataFileLocks()
     /// The one project format this beta reads and writes.
-    public static let supportedFormatVersion: Int = 14
+    public static let supportedFormatVersion: Int = 17
 
     public enum LoadError: Error, LocalizedError {
         case unsupportedFormatVersion(Int)
@@ -14,6 +14,8 @@ public enum ProjectMetadataStore {
         case unsupportedGeometryArtifactSchema(Int)
         case invalidTrainingMemoryRetryBudget(Int64)
         case invalidGeometryRecovery(String)
+        case invalidResolvedRunPlan
+        case invalidWorkerExecution
 
         public var errorDescription: String? {
             switch self {
@@ -29,6 +31,10 @@ public enum ProjectMetadataStore {
                 return "Project metadata contains an invalid training memory retry budget: \(bytes) bytes."
             case .invalidGeometryRecovery(let reason):
                 return "Project metadata contains invalid geometry recovery state: \(reason)"
+            case .invalidResolvedRunPlan:
+                return "Project metadata contains an invalid resolved run plan."
+            case .invalidWorkerExecution:
+                return "Project metadata worker evidence does not match its resolved run plan."
             }
         }
     }
@@ -164,9 +170,33 @@ public enum ProjectMetadataStore {
            retryBudget <= 0 {
             throw LoadError.invalidTrainingMemoryRetryBudget(retryBudget)
         }
+        if let plan = metadata.resolvedRunPlan {
+            do {
+                try plan.validate()
+            } catch {
+                throw LoadError.invalidResolvedRunPlan
+            }
+        }
         if let artifact = metadata.geometryArtifact,
            artifact.schemaVersion != GeometryArtifact.currentSchemaVersion {
             throw LoadError.unsupportedGeometryArtifactSchema(artifact.schemaVersion)
+        }
+        if let artifact = metadata.geometryArtifact {
+            guard let expectedBudget = metadata.resolvedRunPlan?.geometryWorkerBudget else {
+                throw LoadError.invalidWorkerExecution
+            }
+            do {
+                try artifact.workerExecution.validateForPublishedGeometry(
+                    expectedBudget: expectedBudget,
+                    context: GeometryWorkerExecutionPublicationContext(
+                        mapping: artifact.mapping,
+                        pairGraph: artifact.pairGraph,
+                        input: metadata.input
+                    )
+                )
+            } catch {
+                throw LoadError.invalidWorkerExecution
+            }
         }
         if let recovery = metadata.geometryRecovery {
             do {

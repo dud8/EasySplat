@@ -81,6 +81,7 @@ extension PipelineRunner {
         peakMemoryBytes: Int64,
         pairGraph: PairGraphArtifact,
         mapping: MappingArtifact,
+        workerExecution: GeometryWorkerExecutionArtifact,
         acceptedReconstructionSummary: ReconstructionSummary?,
         currentMappingDurationSeconds: () -> TimeInterval?
     ) throws {
@@ -223,6 +224,7 @@ extension PipelineRunner {
             modelHashes: sourceModelHashes,
             fallbackReason: fallbackReason,
             provenance: provenance,
+            workerExecution: workerExecution,
             pairGraph: pairGraph,
             mapping: mapping,
             learnedPointInitializer: learnedPointInitializer,

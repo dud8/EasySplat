@@ -2364,6 +2364,7 @@ private final class StreamingArchiveInspectionRunner: @unchecked Sendable, Subpr
         _ arguments: [String],
         currentDirectory: URL?,
         environment: [String: String],
+        removingEnvironmentKeys: Set<String>,
         onStdout: @escaping @Sendable (String) -> Void,
         onStderr: @escaping @Sendable (String) -> Void
     ) throws -> SubprocessResult {
@@ -2397,6 +2398,7 @@ private final class StreamingArchiveInspectionRunner: @unchecked Sendable, Subpr
         _ arguments: [String],
         currentDirectory: URL?,
         environment: [String: String],
+        removingEnvironmentKeys: Set<String>,
         onStdout: @escaping @Sendable (String) -> Void,
         onStderr: @escaping @Sendable (String) -> Void
     ) async throws -> SubprocessResult {
@@ -2405,6 +2407,7 @@ private final class StreamingArchiveInspectionRunner: @unchecked Sendable, Subpr
             arguments,
             currentDirectory: currentDirectory,
             environment: environment,
+            removingEnvironmentKeys: removingEnvironmentKeys,
             onStdout: onStdout,
             onStderr: onStderr
         )

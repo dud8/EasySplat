@@ -26,6 +26,7 @@ enum GeometryArtifactStore {
         case invalidMapping
         case invalidCanonicalOrientation
         case invalidTimings
+        case invalidWorkerExecution
 
         var errorDescription: String? {
             switch self {
@@ -61,6 +62,8 @@ enum GeometryArtifactStore {
                 return "Geometry artifact orientation evidence is incomplete or inconsistent."
             case .invalidTimings:
                 return "Geometry artifact timing evidence is incomplete or invalid."
+            case .invalidWorkerExecution:
+                return "Geometry artifact worker execution evidence is incomplete or invalid."
             }
         }
     }
@@ -75,7 +78,8 @@ enum GeometryArtifactStore {
             throw Error.invalidSchema(envelope.schemaVersion)
         }
         let artifact = try JSONDecoder().decode(GeometryArtifact.self, from: data)
-        try validate(artifact, projectPaths: projectPaths)
+        let input = try projectInputIfPresent(projectPaths: projectPaths)
+        try validate(artifact, projectPaths: projectPaths, input: input)
         return artifact
     }
 
@@ -90,11 +94,16 @@ enum GeometryArtifactStore {
         measuredResiduals: ColmapResidualAnalyzer.Result? = nil,
         verifiedSourceSnapshot: GeometryModelSnapshot.Verified? = nil
     ) throws {
+        guard metadata.resolvedRunPlan?.geometryWorkerBudget
+                == artifact.workerExecution.resolvedBudget else {
+            throw Error.invalidWorkerExecution
+        }
         try validate(
             artifact,
             projectPaths: paths,
             measuredResiduals: measuredResiduals,
-            verifiedSourceSnapshot: verifiedSourceSnapshot
+            verifiedSourceSnapshot: verifiedSourceSnapshot,
+            input: metadata.input
         )
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
@@ -141,10 +150,28 @@ enum GeometryArtifactStore {
         _ artifact: GeometryArtifact,
         projectPaths: ProjectPaths,
         measuredResiduals: ColmapResidualAnalyzer.Result? = nil,
-        verifiedSourceSnapshot: GeometryModelSnapshot.Verified? = nil
+        verifiedSourceSnapshot: GeometryModelSnapshot.Verified? = nil,
+        input: InputSpec? = nil
     ) throws {
         guard artifact.schemaVersion == GeometryArtifact.currentSchemaVersion else {
             throw Error.invalidSchema(artifact.schemaVersion)
+        }
+        do {
+            try artifact.workerExecution.validate(
+                expectedBudget: artifact.workerExecution.resolvedBudget
+            )
+            let persistedWorkerExecution = try GeometryWorkerExecutionArtifactStore.load(
+                from: GeometryWorkerExecutionArtifactStore.canonicalURL(for: projectPaths),
+                expectedBudget: artifact.workerExecution.resolvedBudget,
+                projectPaths: projectPaths
+            )
+            guard persistedWorkerExecution == artifact.workerExecution else {
+                throw Error.invalidWorkerExecution
+            }
+        } catch let error as Error {
+            throw error
+        } catch {
+            throw Error.invalidWorkerExecution
         }
         let provenance = artifact.provenance
         guard !artifact.solverVersion.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
@@ -256,6 +283,19 @@ enum GeometryArtifactStore {
             pairGraphStatus: artifact.pairGraph.status,
             hasLearnedProvenance: provenance.runtime != nil && provenance.model != nil
         )
+        do {
+            try artifact.workerExecution.validateForPublishedGeometry(
+                expectedBudget: artifact.workerExecution.resolvedBudget,
+                context: GeometryWorkerExecutionPublicationContext(
+                    mapping: artifact.mapping,
+                    pairGraph: artifact.pairGraph,
+                    expectedVideoSourceCount: input?.videoFiles.count
+                        ?? artifact.workerExecution.videoSourceAnalysis.videoSourceCount
+                )
+            )
+        } catch {
+            throw Error.invalidWorkerExecution
+        }
         try validateCanonicalOrientation(
             artifact.canonicalOrientation,
             registeredViewCount: artifact.registeredViewCount
@@ -336,7 +376,10 @@ enum GeometryArtifactStore {
     ) throws {
         switch artifact.status {
         case .notEvaluated:
-            guard artifact.measurement == nil else { throw Error.invalidPairGraph }
+            guard artifact.measurement == nil,
+                  !artifact.usedLocalVocabularyRetrieval else {
+                throw Error.invalidPairGraph
+            }
         case .measured:
             guard let measurement = artifact.measurement else {
                 throw Error.invalidPairGraph
@@ -462,6 +505,15 @@ enum GeometryArtifactStore {
         }
     }
 
+    private static func projectInputIfPresent(
+        projectPaths: ProjectPaths
+    ) throws -> InputSpec? {
+        guard FileManager.default.fileExists(atPath: projectPaths.metadataURL.path) else {
+            return nil
+        }
+        return try ProjectMetadataStore.load(from: projectPaths.metadataURL).input
+    }
+
     private static func validatePairAttemptHistory(
         _ attempts: [PairMatchingAttemptArtifact],
         pairingPolicy: ResolvedPairingPolicy,
@@ -549,6 +601,7 @@ enum GeometryArtifactStore {
               artifact.unionRegisteredViewCount >= artifact.largestModelRegisteredViewCount,
               artifact.unionRegisteredViewCount <= totalViewCount,
               artifact.attemptCount >= 1,
+              artifact.acceptedMappingAttemptOrdinal >= 1,
               artifact.acceptedRefinementInvocationCount >= 0,
               fallbackIsValid,
               artifact.attemptCount == 1 || artifact.fallbackReason != nil else {

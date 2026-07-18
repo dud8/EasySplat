@@ -8,6 +8,7 @@ import itertools
 import json
 import math
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -40,10 +41,11 @@ from scripts.benchmark import run_lane as lane_runner  # noqa: E402
 
 FIXTURE_SELECTION_MANIFEST = benchmark.canonical_json_bytes(
     {
-        "schema_version": 1,
+        "schema_version": 2,
         "views": [
             {
                 "view_index": index,
+                "image_name": f"frame-{index:06d}.jpg",
                 "clip_id": "clip-0",
                 "source_kind": "video",
             }
@@ -471,6 +473,11 @@ def valid_scene(
                         name: evidence.sha256_bytes(content)
                         for name, (_, content) in REFERENCE_ARTIFACT_CONTENTS.items()
                     },
+                    "geometry_input_digest": "sha256:" + "d" * 64,
+                    "selected_frames_digests": {
+                        "candidate": "sha256:" + "e" * 64,
+                        "fast_candidate": "sha256:" + "f" * 64,
+                    },
                     "orientation_expected_status": "verified",
                 }
                 for scale in pinned_scales
@@ -841,10 +848,16 @@ def evidence_request(
     *,
     category: str = "object_orbit",
     input_kind: str = "video",
+    video_source_count: int | None = None,
     capture_traits: list[str] | None = None,
 ) -> dict[str, object]:
     scene = valid_scene(scene_id=scene_id, category=category)
     scene["input"]["kind"] = input_kind
+    scene["input"]["video_source_count"] = (
+        (0 if input_kind == "photos" else 1)
+        if video_source_count is None
+        else video_source_count
+    )
     scene["capture_traits"] = ["ordered"] if capture_traits is None else capture_traits
     scene["scale_lanes"] = [scale]
     scene["aggregate_scale"] = scale
@@ -1082,7 +1095,7 @@ def fixture_pair_list() -> dict[str, object]:
     }
 
 
-def fixture_pair_list_with_retrieval() -> dict[str, object]:
+def fixture_pair_list_with_retrieval(*, ordered: bool = True) -> dict[str, object]:
     pair_list = fixture_pair_list()
     retrieval_targets = {0: [13, 14], 10: [23, 24], 20: [7, 8]}
     for query, targets in retrieval_targets.items():
@@ -1091,7 +1104,7 @@ def fixture_pair_list_with_retrieval() -> dict[str, object]:
                 {
                     "view_a": min(query, target),
                     "view_b": max(query, target),
-                    "pair_type": "retrieval",
+                    "pair_type": "loop" if ordered else "retrieval",
                     "query_view": query,
                     "attempted": True,
                     "raw_matched": True,
@@ -1158,6 +1171,33 @@ def fixture_unordered_exhaustive_pair_list() -> dict[str, object]:
     }
 
 
+def fixture_pair_plan_digest(pair_list: dict[str, object]) -> str:
+    pairs = sorted(
+        (int(pair["view_a"]), int(pair["view_b"]))
+        for pair in pair_list["pairs"]
+    )
+    serialized = "".join(
+        f"frame-{view_a:06d}.jpg frame-{view_b:06d}.jpg\n"
+        for view_a, view_b in pairs
+    ).encode("utf-8")
+    return evidence.sha256_bytes(serialized)
+
+
+def fixture_pair_list_for_configuration(
+    configuration: dict[str, object],
+) -> dict[str, object]:
+    if configuration["pairing_policy"] == "unordered_exhaustive":
+        return fixture_unordered_exhaustive_pair_list()
+    if (
+        int(configuration["vocabulary_candidate_count"]) > 0
+        and int(configuration["vocabulary_verified_neighbor_count"]) > 0
+    ):
+        return fixture_pair_list_with_retrieval(
+            ordered=configuration["input_topology"] == "continuous"
+        )
+    return fixture_pair_list()
+
+
 def _timing_records(timing: dict[str, object]) -> list[tuple[str, dict[str, object]]]:
     return [
         (phase, record)
@@ -1206,6 +1246,7 @@ def mapper_invocation(
     cadence: tuple[float, float, int, int] | None,
     outcome: str,
     *,
+    mapping_attempt_ordinal: int = 1,
     matching_attempt: int,
     digest_character: str,
     descriptor_matcher: str,
@@ -1213,6 +1254,7 @@ def mapper_invocation(
     return {
         "argv": mapper_argv_for_cadence(variant, cadence),
         "outcome": outcome,
+        "mapping_attempt_ordinal": mapping_attempt_ordinal,
         "matching_attempt": matching_attempt,
         "pair_list_digest": "sha256:" + digest_character * 64,
         "descriptor_matcher": descriptor_matcher,
@@ -1264,11 +1306,326 @@ def mapper_invocations_for_variant(
             variant,
             (1.4, 1.4, 5, 2),
             "accepted",
+            mapping_attempt_ordinal=2,
             matching_attempt=1,
             digest_character="a",
             descriptor_matcher="faiss",
         ),
     ]
+
+
+def worker_execution_artifact(
+    configuration: dict[str, object],
+    input_kind: str,
+    video_source_count: int | None = None,
+    mapping_attempt_count: int = 1,
+) -> dict[str, object]:
+    budget = {
+        "featureExtractionWorkers": configuration["feature_extraction_workers"],
+        "coupledMatchingWorkers": configuration["coupled_matching_workers"],
+        "vocabularyRetrievalWorkers": configuration["vocabulary_retrieval_workers"],
+        "maximumConcurrentVideoSourceAnalysisTasks": configuration[
+            "maximum_concurrent_video_source_analysis_tasks"
+        ],
+    }
+
+    def invocation(
+        command: str,
+        policy: str,
+        worker_count: int | None,
+        mapping_attempt_ordinal: int | None = None,
+    ) -> dict[str, object]:
+        environment = (
+            {
+                "OMP_NUM_THREADS": str(worker_count),
+                "OPENBLAS_NUM_THREADS": str(worker_count),
+                "MKL_NUM_THREADS": str(worker_count),
+            }
+            if worker_count is not None
+            else {}
+        )
+        return {
+            "command": command,
+            "mappingAttemptOrdinal": mapping_attempt_ordinal,
+            "threadPolicy": policy,
+            "argvWorkerCount": worker_count,
+            "explicitThreadEnvironment": dict(environment),
+            "removedThreadEnvironmentKeysSHA256": (
+                evidence.COLMAP_THREAD_ENVIRONMENT_KEYS_SHA256
+            ),
+            "effectiveSanitizedThreadEnvironment": dict(environment),
+            "exitStatus": 0,
+            "succeeded": True,
+        }
+
+    retrieval_scheduled = (
+        int(configuration["vocabulary_candidate_count"]) > 0
+        and int(configuration["vocabulary_verified_neighbor_count"]) > 0
+    )
+    if video_source_count is None:
+        video_source_count = 0 if input_kind == "photos" else 1
+    mapping_invocations = [
+        invocation("mapper", "nativeAuto", None, ordinal)
+        for ordinal in range(1, mapping_attempt_count + 1)
+    ]
+    mapping_invocations.append(
+        invocation("modelAnalyzer", "nativeAuto", None, mapping_attempt_count)
+    )
+    return {
+        "schemaVersion": evidence.GEOMETRY_WORKER_EXECUTION_SCHEMA_VERSION,
+        "resolvedBudget": budget,
+        "featureExtractionInvocations": [
+            invocation(
+                "featureExtractor",
+                "bounded",
+                int(configuration["feature_extraction_workers"]),
+            )
+        ],
+        "matchingInvocations": [
+            invocation(
+                "matchesImporter",
+                "bounded",
+                int(configuration["coupled_matching_workers"]),
+            )
+        ],
+        "vocabularyRetrievalInvocations": (
+            [
+                invocation(
+                    "localVocabularyRetriever",
+                    "bounded",
+                    int(configuration["vocabulary_retrieval_workers"]),
+                )
+            ]
+            if retrieval_scheduled
+            else []
+        ),
+        "mappingAndRefinementInvocations": mapping_invocations,
+        "videoSourceAnalysis": {
+            "videoSourceCount": video_source_count,
+            "startedAnalysisTaskCount": video_source_count * 2,
+            "peakInFlightAnalysisTaskCount": min(
+                video_source_count,
+                int(configuration["maximum_concurrent_video_source_analysis_tasks"]),
+            ),
+        },
+    }
+
+
+def worker_execution_artifact_name(run_id: str) -> str:
+    digest = hashlib.sha256(run_id.encode("utf-8")).hexdigest()[:20]
+    return f"worker_execution_{digest}"
+
+
+def worker_execution_artifact_path(run_id: str) -> str:
+    return f"worker-runs/{run_id}/SfM/worker_execution.json"
+
+
+def geometry_manifest_artifact_name(run_id: str) -> str:
+    digest = hashlib.sha256(run_id.encode("utf-8")).hexdigest()[:20]
+    return f"geometry_manifest_{digest}"
+
+
+def geometry_manifest_artifact_path(run_id: str) -> str:
+    return f"worker-runs/{run_id}/SfM/geometry_manifest.json"
+
+
+def geometry_manifest_artifact(
+    configuration: dict[str, object],
+    input_kind: str,
+    geometry_input_digest: str,
+    selected_frames_digest: str,
+    video_source_count: int,
+    pipeline_metrics: dict[str, object] | None = None,
+    pair_list_digest: str = "a" * 64,
+    mapping_attempt_count: int = 1,
+) -> dict[str, object]:
+    selected_frame_count = int(configuration["selected_frame_count"])
+    ordered_names = [f"frame-{index:06d}.jpg" for index in range(selected_frame_count)]
+    retrieval_used = (
+        int(configuration["vocabulary_candidate_count"]) > 0
+        and int(configuration["vocabulary_verified_neighbor_count"]) > 0
+    )
+    local_pair_count = sum(
+        selected_frame_count - int(offset)
+        for offset in configuration["temporal_offsets"]
+        if int(offset) < selected_frame_count
+    )
+    retrieval_pair_count = (
+        1 if retrieval_used and configuration["input_topology"] != "continuous" else 0
+    )
+    loop_pair_count = (
+        1 if retrieval_used and configuration["input_topology"] == "continuous" else 0
+    )
+    scheduled_pair_count = local_pair_count + retrieval_pair_count + loop_pair_count
+    attempted_pair_count = scheduled_pair_count
+    raw_matched_pair_count = scheduled_pair_count
+    verified_pair_count = scheduled_pair_count
+    connected_component_count = 1
+    isolated_view_count = 0
+    articulation_view_count = 0
+    biconnected_block_count = 1
+    largest_biconnected_block_view_count = selected_frame_count
+    second_largest_biconnected_block_view_count = 0
+    matching_duration_seconds = 12.5
+    if pipeline_metrics is not None:
+        scheduled_pair_count = int(pipeline_metrics["scheduled_pairs"])
+        attempted_pair_count = int(pipeline_metrics["attempted_pairs"])
+        raw_matched_pair_count = int(pipeline_metrics["raw_matched_pairs"])
+        verified_pair_count = int(pipeline_metrics["spatially_verified_pairs"])
+        local_pair_count = int(pipeline_metrics["local_pairs"])
+        retrieval_pair_count = int(pipeline_metrics["retrieval_pairs"])
+        loop_pair_count = int(pipeline_metrics["loop_pairs"])
+        connected_component_count = int(pipeline_metrics["connected_components"])
+        isolated_view_count = int(pipeline_metrics["isolated_views"])
+        articulation_view_count = int(pipeline_metrics["articulation_views"])
+        biconnected_block_count = int(pipeline_metrics["biconnected_blocks"])
+        largest_biconnected_block_view_count = int(
+            pipeline_metrics["largest_biconnected_block_views"]
+        )
+        second_largest_biconnected_block_view_count = int(
+            pipeline_metrics["second_largest_biconnected_block_views"]
+        )
+        matching_duration_seconds = float(pipeline_metrics["matcher_seconds"])
+    pairing_policy = {
+        "generic_continuous": "orderedContinuous",
+        "object_orbit": "orderedOrbit",
+        "walkthrough": "orderedWalkthrough",
+        "large_area": "orderedLargeArea",
+        "segmented_mixed": "segmentedMixed",
+        "unordered_exhaustive": "unorderedRetrieval",
+        "unordered_retrieval": "unorderedRetrieval",
+    }[configuration["pairing_policy"]]
+    recovered_continuous_mapping = (
+        mapping_attempt_count > 1
+        and configuration["input_topology"] == "continuous"
+    )
+    return {
+        "schemaVersion": evidence.GEOMETRY_ARTIFACT_SCHEMA_VERSION,
+        "inputDigest": geometry_input_digest.removeprefix("sha256:"),
+        "selectedFramesDigest": selected_frames_digest.removeprefix("sha256:"),
+        "orderedImageNames": ordered_names,
+        "orderedImageTimestamps": [float(index) for index in range(selected_frame_count)],
+        "totalViewCount": selected_frame_count,
+        "pairGraph": {
+            "status": "measured",
+            "measurement": {
+                "pairingPolicy": pairing_policy,
+                "scheduledPairCount": scheduled_pair_count,
+                "attemptedPairCount": attempted_pair_count,
+                "rawMatchedPairCount": raw_matched_pair_count,
+                "spatiallyVerifiedPairCount": verified_pair_count,
+                "localPairCount": local_pair_count,
+                "retrievalPairCount": retrieval_pair_count,
+                "loopRevisitPairCount": loop_pair_count,
+                "connectedComponentCount": connected_component_count,
+                "isolatedViewCount": isolated_view_count,
+                "descriptorlessViewCount": 0,
+                "componentViewCounts": [selected_frame_count],
+                "articulationViewCount": articulation_view_count,
+                "biconnectedBlockCount": biconnected_block_count,
+                "largestBiconnectedBlockViewCount": largest_biconnected_block_view_count,
+                "secondLargestBiconnectedBlockViewCount": second_largest_biconnected_block_view_count,
+                "degreeP10": 1,
+                "degreeMedian": 2,
+                "degreeP90": 2,
+                "matcherAttempts": [
+                    {
+                        "attemptNumber": 1,
+                        "matcher": "faiss",
+                        "recoveryLevel": "normal",
+                        "outcome": "completed",
+                        "scheduledPairCount": scheduled_pair_count,
+                        "attemptedPairCount": attempted_pair_count,
+                        "rawMatchedPairCount": raw_matched_pair_count,
+                        "spatiallyVerifiedPairCount": verified_pair_count,
+                        "durationSeconds": matching_duration_seconds,
+                    }
+                ],
+                "pairListDigest": pair_list_digest,
+                "featureDatabaseDigest": "b" * 64,
+                "matchingDatabaseDigest": "c" * 64,
+                "matchingDurationSeconds": matching_duration_seconds,
+            },
+            "usedLocalVocabularyRetrieval": retrieval_used,
+        },
+        "mapping": {
+            "modelCount": 1,
+            "largestModelRegisteredViewCount": selected_frame_count,
+            "secondLargestModelRegisteredViewCount": 0,
+            "unionRegisteredViewCount": selected_frame_count,
+            "attemptCount": mapping_attempt_count,
+            "acceptedMappingAttemptOrdinal": mapping_attempt_count,
+            "acceptedRefinementKind": "incrementalGlobal",
+            "acceptedRefinementInvocationCount": 1,
+            "incrementalCadence": {
+                "localMaxRefinements": (
+                    2
+                    if recovered_continuous_mapping
+                    else configuration["ba_local_max_refinements"]
+                ),
+                "globalFramesRatio": (
+                    1.4
+                    if recovered_continuous_mapping
+                    else configuration["ba_global_frames_ratio"]
+                ),
+                "globalPointsRatio": (
+                    1.4
+                    if recovered_continuous_mapping
+                    else configuration["ba_global_points_ratio"]
+                ),
+                "globalMaxRefinements": configuration["ba_global_max_refinements"],
+                "localMaxNumIterations": 10,
+                "localFunctionTolerance": 0.001,
+                "globalFunctionTolerance": 0.000001,
+                "localImageCount": 6,
+            },
+            "fallbackReason": (
+                "mapper_recovery" if mapping_attempt_count > 1 else None
+            ),
+        },
+        "workerExecution": worker_execution_artifact(
+            configuration,
+            input_kind,
+            video_source_count,
+            mapping_attempt_count,
+        ),
+    }
+
+
+def runtime_worker_evidence(
+    run_id: str,
+    configuration: dict[str, object],
+    input_kind: str,
+    geometry_input_digest: str = "sha256:" + "d" * 64,
+    selected_frames_digest: str = "sha256:" + "e" * 64,
+    video_source_count: int | None = None,
+) -> dict[str, object]:
+    if video_source_count is None:
+        video_source_count = 0 if input_kind == "photos" else 1
+    artifact = worker_execution_artifact(
+        configuration,
+        input_kind,
+        video_source_count,
+    )
+    geometry = geometry_manifest_artifact(
+        configuration,
+        input_kind,
+        geometry_input_digest,
+        selected_frames_digest,
+        video_source_count,
+    )
+    return {
+        "artifact_name": worker_execution_artifact_name(run_id),
+        "artifact_sha256": evidence.sha256_bytes(
+            evidence.canonical_json_bytes(artifact)
+        ),
+        "geometry_manifest_name": geometry_manifest_artifact_name(run_id),
+        "geometry_manifest_sha256": evidence.sha256_bytes(
+            evidence.canonical_json_bytes(geometry)
+        ),
+        "geometry_input_digest": "sha256:" + geometry["inputDigest"],
+        "selected_frames_digest": "sha256:" + geometry["selectedFramesDigest"],
+    }
 
 
 def execution_receipts(
@@ -1322,6 +1679,22 @@ def execution_receipts(
                 "variant": variant,
                 "argv": ["easysplat-benchmark", *prefixes[variant], "corpus://orbit-01"],
                 "mapper_invocations": mapper_invocations_for_variant(variant, request),
+                "runtime_worker_evidence": (
+                    runtime_worker_evidence(
+                        str(record["run_id"]),
+                        configurations[variant],
+                        str(request["input_kind"]),
+                        str(request["reference_artifacts"]["geometry_input_digest"]),
+                        str(
+                            request["reference_artifacts"]["selected_frames_digests"][
+                                variant
+                            ]
+                        ),
+                        int(request["video_source_count"]),
+                    )
+                    if variant in {"candidate", "fast_candidate"}
+                    else None
+                ),
                 "started_monotonic_seconds": cursor,
                 "ended_monotonic_seconds": cursor + duration,
                 "process_cpu_microseconds": {"user": 0, "system": 0},
@@ -1401,6 +1774,7 @@ def invalid_execution_receipt(
             "variant": "candidate",
             "argv": ["candidate://invalid-input", "toolchain://current"],
             "mapper_invocations": [],
+            "runtime_worker_evidence": None,
             "started_monotonic_seconds": 0.0,
             "ended_monotonic_seconds": 1.0,
             "process_cpu_microseconds": {"user": 0, "system": 0},
@@ -1564,7 +1938,27 @@ def raw_observations(
     lane: str,
     *,
     include_long_sequence: bool = False,
+    request: dict[str, object] | None = None,
 ) -> dict[str, object]:
+    request = request or evidence_request(lane=lane)
+    configuration = request["candidate_run_configuration"]
+    selected_frame_count = int(configuration["selected_frame_count"])
+    local_pair_count = sum(
+        selected_frame_count - int(offset)
+        for offset in configuration["temporal_offsets"]
+        if int(offset) < selected_frame_count
+    )
+    retrieval_used = (
+        int(configuration["vocabulary_candidate_count"]) > 0
+        and int(configuration["vocabulary_verified_neighbor_count"]) > 0
+    )
+    retrieval_pair_count = (
+        1 if retrieval_used and configuration["input_topology"] != "continuous" else 0
+    )
+    loop_pair_count = (
+        1 if retrieval_used and configuration["input_topology"] == "continuous" else 0
+    )
+    scheduled_pair_count = local_pair_count + retrieval_pair_count + loop_pair_count
     timing = (
         paired_timing()
         if lane == evidence.LANE_REFERENCE
@@ -1581,7 +1975,7 @@ def raw_observations(
             "output_ply": "splat.ply",
             "training_manifest": "training-manifest.json",
         },
-        "commands": execution_receipts(timing, lane),
+        "commands": execution_receipts(timing, lane, request),
         "actual": successful_actual(),
         "baseline": {
             "git_commit": "4f3c11735ad15e1318ee2043ce351e185c225d30",
@@ -1607,19 +2001,19 @@ def raw_observations(
             },
         },
         "pipeline_metrics": {
-            "scheduled_pairs": 119,
-            "attempted_pairs": 119,
-            "raw_matched_pairs": 119,
-            "spatially_verified_pairs": 119,
+            "scheduled_pairs": scheduled_pair_count,
+            "attempted_pairs": scheduled_pair_count,
+            "raw_matched_pairs": scheduled_pair_count,
+            "spatially_verified_pairs": scheduled_pair_count,
             "connected_components": 1,
             "isolated_views": 0,
             "articulation_views": 0,
             "biconnected_blocks": 1,
-            "largest_biconnected_block_views": 30,
+            "largest_biconnected_block_views": selected_frame_count,
             "second_largest_biconnected_block_views": 0,
-            "local_pairs": 119,
-            "retrieval_pairs": 0,
-            "loop_pairs": 0,
+            "local_pairs": local_pair_count,
+            "retrieval_pairs": retrieval_pair_count,
+            "loop_pairs": loop_pair_count,
             "matcher_seconds": 12.5,
             "mapping_seconds": 20.0,
             "bundle_adjustment_cycles": 3,
@@ -1817,6 +2211,7 @@ def write_orientation_evidence_artifacts(
                     },
                     "mapping": {
                         "acceptedRefinementInvocationCount": 1,
+                        "acceptedMappingAttemptOrdinal": 1,
                         "acceptedRefinementKind": "incrementalGlobal",
                         "attemptCount": 1,
                         "incrementalCadence": {
@@ -1832,7 +2227,16 @@ def write_orientation_evidence_artifacts(
                     },
                     "poseConvention": "world-to-camera",
                     "quaternionOrder": "wxyz",
-                    "schemaVersion": 14,
+                    "pairGraph": {
+                        "status": "measured",
+                        "measurement": {"fixture": True},
+                        "usedLocalVocabularyRetrieval": False,
+                    },
+                    "schemaVersion": evidence.GEOMETRY_ARTIFACT_SCHEMA_VERSION,
+                    "workerExecution": worker_execution_artifact(
+                        request["candidate_run_configuration"],
+                        str(request["input_kind"]),
+                    ),
                 }
             )
             + b"\n"
@@ -1998,6 +2402,90 @@ def write_evidence_artifacts(
         )
     else:
         artifact_request = render_request
+    candidate_configuration = artifact_request["candidate_run_configuration"]
+    protected_pair_list = fixture_pair_list_for_configuration(
+        candidate_configuration
+    )
+    protected_pair_list_digest = fixture_pair_plan_digest(protected_pair_list)
+    for receipt in observations["commands"]:
+        if receipt.get("variant") not in {"candidate", "fast_candidate"}:
+            continue
+        runtime_receipt = receipt.get("runtime_worker_evidence")
+        if not isinstance(runtime_receipt, dict):
+            continue
+        artifact_name = runtime_receipt.get("artifact_name")
+        run_id = receipt.get("run_id")
+        if (
+            not isinstance(artifact_name, str)
+            or not isinstance(run_id, str)
+            or evidence.SAFE_TOKEN_PATTERN.fullmatch(run_id) is None
+        ):
+            continue
+        configuration = dict(candidate_configuration)
+        if receipt["variant"] == "fast_candidate":
+            configuration.update(
+                {
+                    "detail_profile": "fast",
+                    "trainer_iterations": 3000,
+                    "trainer_plateau_window": 400,
+                }
+            )
+        mapper_history = receipt.get("mapper_invocations")
+        mapping_attempt_count = (
+            max(1, len(mapper_history))
+            if isinstance(mapper_history, list)
+            else 1
+        )
+        artifact_path = worker_execution_artifact_path(run_id)
+        output = root / artifact_path
+        output.parent.mkdir(parents=True, exist_ok=True)
+        output.write_bytes(
+            evidence.canonical_json_bytes(
+                worker_execution_artifact(
+                    configuration,
+                    str(artifact_request["input_kind"]),
+                    int(artifact_request["video_source_count"]),
+                    mapping_attempt_count,
+                )
+            )
+        )
+        runtime_receipt["artifact_sha256"] = evidence.sha256_file(output)
+        observations["artifacts"][artifact_name] = artifact_path
+        geometry_name = runtime_receipt.get("geometry_manifest_name")
+        if not isinstance(geometry_name, str):
+            continue
+        geometry_path = geometry_manifest_artifact_path(run_id)
+        geometry_output = root / geometry_path
+        geometry_output.write_bytes(
+            evidence.canonical_json_bytes(
+                geometry_manifest_artifact(
+                    configuration,
+                    str(artifact_request["input_kind"]),
+                    str(artifact_request["reference_artifacts"]["geometry_input_digest"]),
+                    str(
+                        artifact_request["reference_artifacts"]["selected_frames_digests"][
+                            receipt["variant"]
+                        ]
+                    ),
+                    int(artifact_request["video_source_count"]),
+                    observations["pipeline_metrics"],
+                    protected_pair_list_digest.removeprefix("sha256:"),
+                    mapping_attempt_count,
+                )
+            )
+        )
+        runtime_receipt["geometry_manifest_sha256"] = evidence.sha256_file(
+            geometry_output
+        )
+        if isinstance(mapper_history, list):
+            for mapper_invocation in mapper_history:
+                if (
+                    isinstance(mapper_invocation, dict)
+                    and mapper_invocation.get("pair_list_digest")
+                    == "sha256:" + "a" * 64
+                ):
+                    mapper_invocation["pair_list_digest"] = protected_pair_list_digest
+        observations["artifacts"][geometry_name] = geometry_path
     for name, content in (
         ("stdout.log", "complete\n"),
         ("stderr.log", ""),
@@ -2236,9 +2724,71 @@ def write_evidence_artifacts(
     for _, (name, content) in REFERENCE_ARTIFACT_CONTENTS.items():
         (root / name).write_bytes(content)
     (root / "pair-list.json").write_bytes(
-        evidence.canonical_json_bytes(fixture_pair_list()) + b"\n"
+        evidence.canonical_json_bytes(protected_pair_list) + b"\n"
     )
     (root / "observations.json").write_bytes(evidence.canonical_json_bytes(observations) + b"\n")
+
+
+def rewrite_worker_execution_artifact(
+    root: Path,
+    observations: dict[str, object],
+    receipt: dict[str, object],
+    mutation: Callable[[dict[str, object]], None],
+    *,
+    update_embedded_copy: bool = True,
+) -> None:
+    runtime_receipt = receipt["runtime_worker_evidence"]
+    artifact_name = runtime_receipt["artifact_name"]
+    artifact_path = root / observations["artifacts"][artifact_name]
+    artifact = json.loads(artifact_path.read_text(encoding="utf-8"))
+    mutation(artifact)
+    artifact_bytes = evidence.canonical_json_bytes(artifact)
+    artifact_path.write_bytes(artifact_bytes)
+    runtime_receipt["artifact_sha256"] = evidence.sha256_bytes(artifact_bytes)
+    if update_embedded_copy:
+        geometry_name = runtime_receipt["geometry_manifest_name"]
+        geometry_path = root / observations["artifacts"][geometry_name]
+        geometry = json.loads(geometry_path.read_text(encoding="utf-8"))
+        geometry["workerExecution"] = artifact
+        geometry_bytes = evidence.canonical_json_bytes(geometry)
+        geometry_path.write_bytes(geometry_bytes)
+        runtime_receipt["geometry_manifest_sha256"] = evidence.sha256_bytes(
+            geometry_bytes
+        )
+    (root / "command.jsonl").write_bytes(
+        b"".join(
+            evidence.canonical_json_bytes(command) + b"\n"
+            for command in observations["commands"]
+        )
+    )
+    (root / "observations.json").write_bytes(
+        evidence.canonical_json_bytes(observations) + b"\n"
+    )
+
+
+def rewrite_geometry_manifest_artifact(
+    root: Path,
+    observations: dict[str, object],
+    receipt: dict[str, object],
+    mutation: Callable[[dict[str, object]], None],
+) -> None:
+    runtime_receipt = receipt["runtime_worker_evidence"]
+    artifact_name = runtime_receipt["geometry_manifest_name"]
+    artifact_path = root / observations["artifacts"][artifact_name]
+    artifact = json.loads(artifact_path.read_text(encoding="utf-8"))
+    mutation(artifact)
+    artifact_bytes = evidence.canonical_json_bytes(artifact)
+    artifact_path.write_bytes(artifact_bytes)
+    runtime_receipt["geometry_manifest_sha256"] = evidence.sha256_bytes(artifact_bytes)
+    (root / "command.jsonl").write_bytes(
+        b"".join(
+            evidence.canonical_json_bytes(command) + b"\n"
+            for command in observations["commands"]
+        )
+    )
+    (root / "observations.json").write_bytes(
+        evidence.canonical_json_bytes(observations) + b"\n"
+    )
 
 
 def external_envelope(
@@ -2536,7 +3086,7 @@ class ConfigurationValidationTests(unittest.TestCase):
         evidence_schema = json.loads(
             (ROOT / "scripts/benchmark/evidence.schema.json").read_text(encoding="utf-8")
         )
-        self.assertEqual(evidence_schema["properties"]["schema_version"], {"const": 3})
+        self.assertEqual(evidence_schema["properties"]["schema_version"], {"const": 7})
         self.assertIs(evidence_schema["additionalProperties"], False)
         self.assertIs(evidence_schema["properties"]["artifacts"]["additionalProperties"]["additionalProperties"], False)
         self.assertIn("measurement_runner", evidence_schema["required"])
@@ -2547,6 +3097,18 @@ class ConfigurationValidationTests(unittest.TestCase):
         self.assertEqual(cpu_schema["user"]["maximum"], (1 << 64) - 1)
         self.assertEqual(cpu_schema["system"]["maximum"], (1 << 64) - 1)
         self.assertIn("measurement_runner", schema["$defs"]["evidenceRecord"]["required"])
+        self.assertIn(
+            "collector_status_digest",
+            schema["$defs"]["evidenceRecord"]["required"],
+        )
+        self.assertEqual(
+            schema["$defs"]["producer"]["properties"]["protocol_version"],
+            {"const": 8},
+        )
+        self.assertEqual(
+            schema["$defs"]["producer"]["properties"]["version"],
+            {"const": "8.0.0"},
+        )
 
     def test_result_schema_reserves_exit_code_130_for_cancellation(self) -> None:
         schema = json.loads((ROOT / "scripts/benchmark/result.schema.json").read_text(encoding="utf-8"))
@@ -3176,15 +3738,82 @@ class EvidenceProtocolTests(unittest.TestCase):
     def test_request_pins_the_current_render_target_contract(self) -> None:
         request = evidence_request()
 
-        self.assertEqual(request["schema_version"], 4)
+        self.assertEqual(request["schema_version"], 8)
         configuration = request["candidate_run_configuration"]
         self.assertEqual(configuration["run_seed"], 42)
+        self.assertEqual(configuration["feature_extraction_workers"], 12)
+        self.assertEqual(configuration["coupled_matching_workers"], 8)
+        self.assertEqual(configuration["vocabulary_retrieval_workers"], 8)
+        self.assertEqual(
+            configuration["maximum_concurrent_video_source_analysis_tasks"],
+            4,
+        )
         self.assertNotIn("deterministic_seed", configuration)
         self.assertIn(
             "ground_truth_preparation_sha256",
             request["reference_artifacts"],
         )
         evidence.validate_request(request)
+
+    def test_request_pins_worker_budgets_to_the_hardware_lane(self) -> None:
+        constrained = evidence_request(lane=evidence.LANE_CONSTRAINED)
+        configuration = constrained["candidate_run_configuration"]
+        self.assertEqual(configuration["feature_extraction_workers"], 4)
+        self.assertEqual(configuration["coupled_matching_workers"], 4)
+        self.assertEqual(configuration["vocabulary_retrieval_workers"], 4)
+        self.assertEqual(
+            configuration["maximum_concurrent_video_source_analysis_tasks"],
+            2,
+        )
+        evidence.validate_request(constrained)
+
+        for lane in (evidence.LANE_REFERENCE, evidence.LANE_CONSTRAINED):
+            with self.subTest(lane=lane, input_kind="photos"):
+                photos = evidence_request(
+                    lane=lane,
+                    category="professional_photos",
+                    input_kind="photos",
+                    capture_traits=["unordered"],
+                )
+                self.assertEqual(
+                    photos["candidate_run_configuration"][
+                        "maximum_concurrent_video_source_analysis_tasks"
+                    ],
+                    1,
+                )
+                evidence.validate_request(photos)
+
+        for field in (
+            "feature_extraction_workers",
+            "coupled_matching_workers",
+            "vocabulary_retrieval_workers",
+            "maximum_concurrent_video_source_analysis_tasks",
+        ):
+            with self.subTest(field=field, failure="missing"):
+                invalid = evidence_request()
+                del invalid["candidate_run_configuration"][field]
+                with self.assertRaisesRegex(
+                    evidence.EvidenceError,
+                    "candidate_run_configuration.*invalid fields",
+                ):
+                    evidence.validate_request(invalid)
+            for value in (0, 65, True):
+                with self.subTest(field=field, failure=value):
+                    invalid = evidence_request()
+                    invalid["candidate_run_configuration"][field] = value
+                    with self.assertRaisesRegex(
+                        evidence.EvidenceError,
+                        "candidate worker budget is invalid",
+                    ):
+                        evidence.validate_request(invalid)
+
+        mismatched = evidence_request(lane=evidence.LANE_CONSTRAINED)
+        mismatched["candidate_run_configuration"]["feature_extraction_workers"] = 12
+        with self.assertRaisesRegex(
+            evidence.EvidenceError,
+            "candidate worker budget does not match its hardware lane",
+        ):
+            evidence.validate_request(mismatched)
 
     def test_request_rejects_retired_determinism_contract_names(self) -> None:
         request = evidence_request()
@@ -3607,6 +4236,17 @@ class EvidenceProtocolTests(unittest.TestCase):
             schema_invalid["gate_scopes"] = ["invalid_input"]
             with self.assertRaises(ValidationError):
                 validate_attestation_schema(schema_invalid)
+            schema_invalid = json.loads(json.dumps(attestation))
+            schema_invalid["candidate_run_configuration"].update(
+                {
+                    "feature_extraction_workers": 4,
+                    "coupled_matching_workers": 4,
+                    "vocabulary_retrieval_workers": 4,
+                    "maximum_concurrent_video_source_analysis_tasks": 2,
+                }
+            )
+            with self.assertRaises(ValidationError):
+                validate_attestation_schema(schema_invalid)
             self.assertEqual(metrics["registered_views"], measured(30))
             self.assertEqual(metrics["repeat_runs"], measured(50))
             self.assertEqual(metrics["durable_state_recovery_succeeded"], measured(True))
@@ -3847,15 +4487,24 @@ class EvidenceProtocolTests(unittest.TestCase):
                 "vocabulary_query_stride": 10,
             }
         )
-        observations = raw_observations(evidence.LANE_REFERENCE)
-        observations["commands"] = execution_receipts(
-            observations["timing"],
+        observations = raw_observations(
             evidence.LANE_REFERENCE,
-            request,
+            request=request,
         )
+        for field in (
+            "scheduled_pairs",
+            "attempted_pairs",
+            "raw_matched_pairs",
+            "spatially_verified_pairs",
+        ):
+            observations["pipeline_metrics"][field] -= 1
+        observations["pipeline_metrics"]["retrieval_pairs"] = 0
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             write_evidence_artifacts(root, observations, request)
+            (root / "pair-list.json").write_bytes(
+                evidence.canonical_json_bytes(fixture_pair_list()) + b"\n"
+            )
             with self.assertRaisesRegex(evidence.EvidenceError, "retrieval.*quer"):
                 evidence.derive_attestation(
                     request,
@@ -3888,11 +4537,15 @@ class EvidenceProtocolTests(unittest.TestCase):
                 "attempted_pairs": 125,
                 "raw_matched_pairs": 125,
                 "spatially_verified_pairs": 125,
-                "retrieval_pairs": 6,
+                "retrieval_pairs": 0,
+                "loop_pairs": 6,
             }
         )
         mutations = {
             "valid": lambda value: None,
+            "wrong ordered role": lambda value: value["pairs"][-1].update(
+                {"pair_type": "retrieval"}
+            ),
             "missing query": lambda value: value["retrieval"]["queries"].pop(),
             "unbounded attempt": lambda value: value["retrieval"]["queries"][0].update(
                 {
@@ -3968,7 +4621,8 @@ class EvidenceProtocolTests(unittest.TestCase):
                 "attempted_pairs": 125,
                 "raw_matched_pairs": 125,
                 "spatially_verified_pairs": 124,
-                "retrieval_pairs": 6,
+                "retrieval_pairs": 0,
+                "loop_pairs": 6,
             }
         )
         with tempfile.TemporaryDirectory() as directory:
@@ -3978,7 +4632,7 @@ class EvidenceProtocolTests(unittest.TestCase):
             pair_list["retrieval"]["queries"][0]["verified_retained_neighbors"] = [13]
             for pair in pair_list["pairs"]:
                 if (
-                    pair["pair_type"] == "retrieval"
+                    pair["pair_type"] == "loop"
                     and pair["query_view"] == 0
                     and 14 in {pair["view_a"], pair["view_b"]}
                 ):
@@ -4000,6 +4654,7 @@ class EvidenceProtocolTests(unittest.TestCase):
     def test_unordered_small_photo_route_requires_exact_exhaustive_faiss_closure(self) -> None:
         request = evidence_request()
         request["input_kind"] = "photos"
+        request["video_source_count"] = 0
         request["capture_traits"] = ["unordered"]
         request["candidate_run_configuration"].update(
             {
@@ -4010,6 +4665,7 @@ class EvidenceProtocolTests(unittest.TestCase):
                 "vocabulary_candidate_count": 0,
                 "vocabulary_verified_neighbor_count": 0,
                 "vocabulary_query_stride": 1,
+                "maximum_concurrent_video_source_analysis_tasks": 1,
                 "ba_global_frames_ratio": 1.1,
                 "ba_global_points_ratio": 1.1,
                 "ba_local_max_refinements": 2,
@@ -4017,9 +4673,14 @@ class EvidenceProtocolTests(unittest.TestCase):
         )
         selection = evidence.canonical_json_bytes(
             {
-                "schema_version": 1,
+                "schema_version": 2,
                 "views": [
-                    {"view_index": index, "clip_id": f"photo-{index}", "source_kind": "photo"}
+                    {
+                        "view_index": index,
+                        "image_name": f"frame-{index:06d}.jpg",
+                        "clip_id": f"photo-{index}",
+                        "source_kind": "photo",
+                    }
                     for index in range(30)
                 ],
             }
@@ -4058,7 +4719,7 @@ class EvidenceProtocolTests(unittest.TestCase):
                 "raw_matched_pairs": 435,
                 "spatially_verified_pairs": 435,
                 "local_pairs": 0,
-                "retrieval_pairs": 0,
+                "retrieval_pairs": 435,
                 "loop_pairs": 0,
             }
         )
@@ -5027,6 +5688,7 @@ class EvidenceProtocolTests(unittest.TestCase):
         observations = raw_observations(
             evidence.LANE_REFERENCE,
             include_long_sequence=True,
+            request=request,
         )
         observations["timing"] = candidate_timing(500.0)
         observations["commands"] = execution_receipts(
@@ -5813,6 +6475,7 @@ class EvidenceProtocolTests(unittest.TestCase):
             "candidate",
             (1.4, 1.4, 5, 2),
             "rejected_geometry_gate",
+            mapping_attempt_ordinal=2,
             matching_attempt=1,
             digest_character="a",
             descriptor_matcher="faiss",
@@ -5821,6 +6484,7 @@ class EvidenceProtocolTests(unittest.TestCase):
             "candidate",
             (1.4, 1.4, 5, 2),
             "accepted",
+            mapping_attempt_ordinal=3,
             matching_attempt=2,
             digest_character="b",
             descriptor_matcher="faiss",
@@ -5930,6 +6594,7 @@ class EvidenceProtocolTests(unittest.TestCase):
                 "candidate",
                 (1.4, 1.4, 5, 2),
                 "rejected_geometry_gate",
+                mapping_attempt_ordinal=2,
                 matching_attempt=1,
                 digest_character="a",
                 descriptor_matcher="faiss",
@@ -5938,6 +6603,7 @@ class EvidenceProtocolTests(unittest.TestCase):
                 "candidate",
                 (1.4, 1.4, 5, 2),
                 "rejected_geometry_gate",
+                mapping_attempt_ordinal=3,
                 matching_attempt=2,
                 digest_character="b",
                 descriptor_matcher="faiss",
@@ -5946,6 +6612,7 @@ class EvidenceProtocolTests(unittest.TestCase):
                 "candidate",
                 (1.4, 1.4, 5, 2),
                 "accepted",
+                mapping_attempt_ordinal=4,
                 matching_attempt=3,
                 digest_character="b",
                 descriptor_matcher="exact",
@@ -5982,6 +6649,1862 @@ class EvidenceProtocolTests(unittest.TestCase):
                     machine=evidence_machine(evidence.LANE_REFERENCE),
                 )
 
+    def test_candidate_receipts_bind_resolved_and_launched_worker_contracts(self) -> None:
+        cases = (
+            (
+                "boolean schema",
+                lambda artifact: artifact.update({"schemaVersion": True}),
+                "artifact schema is invalid",
+            ),
+            (
+                "missing feature execution",
+                lambda artifact: artifact["featureExtractionInvocations"].clear(),
+                "measured COLMAP geometry requires successful feature",
+            ),
+            (
+                "missing matching execution",
+                lambda artifact: artifact["matchingInvocations"].clear(),
+                "measured COLMAP geometry requires successful feature",
+            ),
+            (
+                "missing mapping execution",
+                lambda artifact: artifact["mappingAndRefinementInvocations"].clear(),
+                "missing required execution evidence",
+            ),
+            (
+                "analyzer without mapping",
+                lambda artifact: artifact.update(
+                    {
+                        "mappingAndRefinementInvocations": [
+                            artifact["mappingAndRefinementInvocations"][-1]
+                        ]
+                    }
+                ),
+                "invalid mapper",
+            ),
+            (
+                "resolved budget",
+                lambda artifact: artifact["resolvedBudget"].update(
+                    {"coupledMatchingWorkers": 7}
+                ),
+                "runtime worker budget",
+            ),
+            (
+                "matcher argv",
+                lambda artifact: artifact["matchingInvocations"][0].update(
+                    {"argvWorkerCount": 7}
+                ),
+                "bounded worker launch",
+            ),
+            (
+                "matcher environment",
+                lambda artifact: artifact["matchingInvocations"][0][
+                    "explicitThreadEnvironment"
+                ].update({"OMP_NUM_THREADS": "7"}),
+                "bounded worker launch",
+            ),
+            (
+                "effective environment",
+                lambda artifact: artifact["featureExtractionInvocations"][0][
+                    "effectiveSanitizedThreadEnvironment"
+                ].update({"OMP_NUM_THREADS": "7"}),
+                "bounded worker launch",
+            ),
+            (
+                "sanitization digest",
+                lambda artifact: artifact["featureExtractionInvocations"][0].update(
+                    {"removedThreadEnvironmentKeysSHA256": "sha256:" + "0" * 64}
+                ),
+                "sanitizer digest",
+            ),
+            (
+                "mapping inheritance",
+                lambda artifact: artifact["mappingAndRefinementInvocations"][0][
+                    "explicitThreadEnvironment"
+                ].update({"OMP_NUM_THREADS": "8"}),
+                "native-auto launch",
+            ),
+            (
+                "wrong stage command",
+                lambda artifact: artifact["matchingInvocations"][0].update(
+                    {"command": "mapper"}
+                ),
+                "command belongs to another stage",
+            ),
+            (
+                "nonmapping attempt ordinal",
+                lambda artifact: artifact["featureExtractionInvocations"][0].update(
+                    {"mappingAttemptOrdinal": 1}
+                ),
+                "cannot claim a mapping-attempt ordinal",
+            ),
+            (
+                "zero mapping attempt ordinal",
+                lambda artifact: artifact["mappingAndRefinementInvocations"][0].update(
+                    {"mappingAttemptOrdinal": 0}
+                ),
+                "mapping-attempt ordinal is invalid",
+            ),
+            (
+                "decreasing mapping attempt ordinal",
+                lambda artifact: (
+                    artifact["mappingAndRefinementInvocations"][0].update(
+                        {"mappingAttemptOrdinal": 2}
+                    ),
+                    artifact["mappingAndRefinementInvocations"][1].update(
+                        {"mappingAttemptOrdinal": 1}
+                    ),
+                ),
+                "mapping-attempt ordinal is invalid",
+            ),
+            (
+                "process status",
+                lambda artifact: artifact["matchingInvocations"][0].update(
+                    {"succeeded": False}
+                ),
+                "process status is inconsistent",
+            ),
+            (
+                "invocation cap",
+                lambda artifact: artifact.update(
+                    {
+                        "matchingInvocations": [
+                            dict(artifact["matchingInvocations"][0])
+                            for _ in range(
+                                evidence.MAX_WORKER_INVOCATIONS_PER_STAGE + 1
+                            )
+                        ]
+                    }
+                ),
+                "too many invocations",
+            ),
+            (
+                "video concurrency",
+                lambda artifact: artifact["videoSourceAnalysis"].update(
+                    {"peakInFlightAnalysisTaskCount": 5}
+                ),
+                "runtime video-analysis worker evidence",
+            ),
+        )
+        for label, mutation, expected in cases:
+            with self.subTest(case=label), tempfile.TemporaryDirectory() as directory:
+                request = evidence_request()
+                observations = raw_observations(evidence.LANE_REFERENCE)
+                candidate = next(
+                    receipt
+                    for receipt in observations["commands"]
+                    if receipt["variant"] == "candidate"
+                )
+                root = Path(directory)
+                write_evidence_artifacts(root, observations, request)
+                rewrite_worker_execution_artifact(
+                    root,
+                    observations,
+                    candidate,
+                    mutation,
+                )
+                with self.assertRaisesRegex(evidence.EvidenceError, expected):
+                    evidence.derive_attestation(
+                        request,
+                        observations,
+                        root,
+                        root / "attestation.json",
+                        evidence.LANE_REFERENCE,
+                        runner_identity(evidence.LANE_REFERENCE),
+                        machine=evidence_machine(evidence.LANE_REFERENCE),
+                    )
+
+        with tempfile.TemporaryDirectory() as directory:
+            request = evidence_request()
+            observations = raw_observations(evidence.LANE_REFERENCE)
+            baseline = next(
+                receipt
+                for receipt in observations["commands"]
+                if receipt["variant"] == "baseline"
+            )
+            baseline["runtime_worker_evidence"] = runtime_worker_evidence(
+                str(baseline["run_id"]),
+                request["candidate_run_configuration"],
+                str(request["input_kind"]),
+            )
+            root = Path(directory)
+            write_evidence_artifacts(root, observations, request)
+            with self.assertRaisesRegex(
+                evidence.EvidenceError,
+                "noncandidate.*runtime worker evidence",
+            ):
+                evidence.derive_attestation(
+                    request,
+                    observations,
+                    root,
+                    root / "attestation.json",
+                    evidence.LANE_REFERENCE,
+                    runner_identity(evidence.LANE_REFERENCE),
+                    machine=evidence_machine(evidence.LANE_REFERENCE),
+                    )
+
+    def test_unscheduled_retrieval_records_no_fake_worker_invocation(self) -> None:
+        request = evidence_request(scale=30)
+        self.assertEqual(
+            request["candidate_run_configuration"]["vocabulary_candidate_count"],
+            0,
+        )
+        artifact = worker_execution_artifact(
+            request["candidate_run_configuration"],
+            str(request["input_kind"]),
+        )
+        self.assertEqual(artifact["vocabularyRetrievalInvocations"], [])
+        observations = raw_observations(evidence.LANE_REFERENCE)
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            write_evidence_artifacts(root, observations, request)
+            evidence.derive_attestation(
+                request,
+                observations,
+                root,
+                root / "attestation.json",
+                evidence.LANE_REFERENCE,
+                runner_identity(evidence.LANE_REFERENCE),
+                machine=evidence_machine(evidence.LANE_REFERENCE),
+            )
+
+    def test_photo_worker_artifact_requires_zero_video_execution(self) -> None:
+        request = evidence_request(
+            category="professional_photos",
+            input_kind="photos",
+            capture_traits=["unordered"],
+        )
+        observations = raw_observations(evidence.LANE_REFERENCE, request=request)
+        candidate = next(
+            receipt
+            for receipt in observations["commands"]
+            if receipt["variant"] == "candidate"
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            write_evidence_artifacts(root, observations, request)
+            rewrite_worker_execution_artifact(
+                root,
+                observations,
+                candidate,
+                lambda artifact: artifact["videoSourceAnalysis"].update(
+                    {
+                        "videoSourceCount": 1,
+                        "startedAnalysisTaskCount": 1,
+                        "peakInFlightAnalysisTaskCount": 1,
+                    }
+                ),
+            )
+            descriptors = {
+                name: evidence._artifact_descriptor(root / path, root)
+                for name, path in observations["artifacts"].items()
+            }
+            with self.assertRaisesRegex(evidence.EvidenceError, "video source count"):
+                evidence._validate_runtime_worker_evidence(
+                    candidate["runtime_worker_evidence"],
+                    request["candidate_run_configuration"],
+                    request,
+                    "candidate",
+                    candidate["run_id"],
+                    root,
+                    descriptors,
+                    set(),
+                    "runtime_worker_evidence",
+                    observations["pipeline_metrics"],
+                )
+
+    def test_runtime_worker_receipt_rejects_digest_and_path_substitution(self) -> None:
+        for case in ("worker digest", "worker path", "geometry digest", "geometry path"):
+            with self.subTest(case=case), tempfile.TemporaryDirectory() as directory:
+                request = evidence_request()
+                observations = raw_observations(evidence.LANE_REFERENCE)
+                candidate = next(
+                    receipt
+                    for receipt in observations["commands"]
+                    if receipt["variant"] == "candidate"
+                )
+                root = Path(directory)
+                write_evidence_artifacts(root, observations, request)
+                runtime_receipt = candidate["runtime_worker_evidence"]
+                if case == "worker digest":
+                    runtime_receipt["artifact_sha256"] = "sha256:" + "0" * 64
+                    expected = "digest does not match"
+                elif case == "worker path":
+                    artifact_name = runtime_receipt["artifact_name"]
+                    original = root / observations["artifacts"][artifact_name]
+                    substituted = root / "worker-runs/substituted/SfM/worker_execution.json"
+                    substituted.parent.mkdir(parents=True)
+                    shutil.copyfile(original, substituted)
+                    observations["artifacts"][artifact_name] = (
+                        "worker-runs/substituted/SfM/worker_execution.json"
+                    )
+                    expected = "path does not match"
+                elif case == "geometry digest":
+                    runtime_receipt["geometry_manifest_sha256"] = (
+                        "sha256:" + "0" * 64
+                    )
+                    expected = "geometry manifest digest does not match"
+                else:
+                    artifact_name = runtime_receipt["geometry_manifest_name"]
+                    original = root / observations["artifacts"][artifact_name]
+                    substituted = (
+                        root / "worker-runs/substituted/SfM/geometry_manifest.json"
+                    )
+                    substituted.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.copyfile(original, substituted)
+                    observations["artifacts"][artifact_name] = (
+                        "worker-runs/substituted/SfM/geometry_manifest.json"
+                    )
+                    expected = "geometry manifest path does not match"
+                (root / "command.jsonl").write_bytes(
+                    b"".join(
+                        evidence.canonical_json_bytes(command) + b"\n"
+                        for command in observations["commands"]
+                    )
+                )
+                (root / "observations.json").write_bytes(
+                    evidence.canonical_json_bytes(observations) + b"\n"
+                )
+                with self.assertRaisesRegex(evidence.EvidenceError, expected):
+                    evidence.derive_attestation(
+                        request,
+                        observations,
+                        root,
+                        root / "attestation.json",
+                        evidence.LANE_REFERENCE,
+                        runner_identity(evidence.LANE_REFERENCE),
+                        machine=evidence_machine(evidence.LANE_REFERENCE),
+                    )
+
+    def test_runtime_worker_sanitization_digest_matches_the_swift_launch_policy(self) -> None:
+        source = (
+            ROOT
+            / "EasySplatCore/Sources/EasySplatCore/Project/GeometryWorkerExecutionArtifact.swift"
+        ).read_text(encoding="utf-8")
+        match = re.search(
+            r"canonicalRemovedThreadEnvironmentKeys = \[(.*?)\n    \]",
+            source,
+            re.DOTALL,
+        )
+        self.assertIsNotNone(match)
+        swift_keys = tuple(re.findall(r'"([A-Z0-9_]+)"', match.group(1)))
+
+        self.assertEqual(swift_keys, evidence.COLMAP_THREAD_ENVIRONMENT_KEYS)
+        self.assertEqual(
+            evidence.COLMAP_THREAD_ENVIRONMENT_KEYS_SHA256,
+            evidence.sha256_bytes(evidence.canonical_json_bytes(list(swift_keys))),
+        )
+        self.assertIn("SHA256.hash(data: Data(canonicalJSON.utf8))", source)
+
+    def test_runtime_artifact_schema_versions_match_the_swift_contract(self) -> None:
+        worker_source = (
+            ROOT
+            / "EasySplatCore/Sources/EasySplatCore/Project/GeometryWorkerExecutionArtifact.swift"
+        ).read_text(encoding="utf-8")
+        geometry_source = (
+            ROOT
+            / "EasySplatCore/Sources/EasySplatCore/Project/GeometryArtifact.swift"
+        ).read_text(encoding="utf-8")
+
+        worker_version = re.search(
+            r"public static let currentSchemaVersion = (\d+)",
+            worker_source,
+        )
+        geometry_version = re.search(
+            r"public static let currentSchemaVersion = (\d+)",
+            geometry_source,
+        )
+        self.assertIsNotNone(worker_version)
+        self.assertIsNotNone(geometry_version)
+        self.assertEqual(
+            int(worker_version.group(1)),
+            evidence.GEOMETRY_WORKER_EXECUTION_SCHEMA_VERSION,
+        )
+        self.assertEqual(
+            int(geometry_version.group(1)),
+            evidence.GEOMETRY_ARTIFACT_SCHEMA_VERSION,
+        )
+
+    def test_python_accepts_the_exact_swift_worker_invocation_json_shape(self) -> None:
+        source = (
+            ROOT
+            / "EasySplatCore/Sources/EasySplatCore/Project/GeometryWorkerExecutionArtifact.swift"
+        ).read_text(encoding="utf-8")
+        coding_keys = re.search(
+            r"private enum CodingKeys: String, CodingKey, CaseIterable \{(.*?)\n    \}",
+            source,
+            re.DOTALL,
+        )
+        self.assertIsNotNone(coding_keys)
+        swift_keys = {
+            match.group(1)
+            for match in re.finditer(r"\bcase ([a-z][A-Za-z0-9]*)", coding_keys.group(1))
+        }
+        expected_keys = {
+            "command",
+            "mappingAttemptOrdinal",
+            "threadPolicy",
+            "argvWorkerCount",
+            "explicitThreadEnvironment",
+            "removedThreadEnvironmentKeysSHA256",
+            "effectiveSanitizedThreadEnvironment",
+            "exitStatus",
+            "succeeded",
+        }
+        self.assertEqual(swift_keys, expected_keys)
+        self.assertIn(
+            "container.encodeNil(forKey: .mappingAttemptOrdinal)",
+            source,
+        )
+
+        configuration = evidence_request()["candidate_run_configuration"]
+        artifact = worker_execution_artifact(configuration, "video")
+        feature_invocation = artifact["featureExtractionInvocations"][0]
+        mapper_invocation = artifact["mappingAndRefinementInvocations"][0]
+        self.assertEqual(set(feature_invocation), swift_keys)
+        self.assertIsNone(feature_invocation["mappingAttemptOrdinal"])
+        self.assertEqual(set(mapper_invocation), swift_keys)
+        self.assertEqual(mapper_invocation["mappingAttemptOrdinal"], 1)
+
+        evidence._validate_worker_invocations(
+            [feature_invocation],
+            context="featureExtractionInvocations",
+            allowed_commands=frozenset({"featureExtractor"}),
+            expected_policy="bounded",
+            expected_worker_count=configuration["feature_extraction_workers"],
+            expects_mapping_attempt_ordinal=False,
+            required=True,
+        )
+        evidence._validate_worker_invocations(
+            [mapper_invocation],
+            context="mappingAndRefinementInvocations",
+            allowed_commands=frozenset({"mapper"}),
+            expected_policy="nativeAuto",
+            expected_worker_count=None,
+            expects_mapping_attempt_ordinal=True,
+            required=True,
+        )
+
+    def test_worker_invocation_rejects_non_string_command_as_evidence_error(self) -> None:
+        invocation = worker_execution_artifact(
+            evidence_request()["candidate_run_configuration"],
+            "video",
+        )["matchingInvocations"][0]
+        invocation["command"] = {"untrusted": "matchesImporter"}
+
+        with self.assertRaisesRegex(evidence.EvidenceError, "command is invalid"):
+            evidence._validate_worker_invocations(
+                [invocation],
+                context="matchingInvocations",
+                allowed_commands=frozenset({"matchesImporter"}),
+                expected_policy="bounded",
+                expected_worker_count=8,
+                expects_mapping_attempt_ordinal=False,
+                required=True,
+            )
+
+    def test_worker_fixture_copies_explicit_and_effective_environments(self) -> None:
+        invocation = worker_execution_artifact(
+            evidence_request()["candidate_run_configuration"],
+            "video",
+        )["matchingInvocations"][0]
+
+        invocation["explicitThreadEnvironment"]["OMP_NUM_THREADS"] = "7"
+
+        self.assertEqual(
+            invocation["effectiveSanitizedThreadEnvironment"]["OMP_NUM_THREADS"],
+            "8",
+        )
+
+    def test_worker_invocations_retain_failed_optional_attempts_and_model_conversion(self) -> None:
+        artifact = worker_execution_artifact(
+            evidence_request()["candidate_run_configuration"],
+            "video",
+        )
+        failed_analyzer = dict(artifact["mappingAndRefinementInvocations"][-1])
+        failed_analyzer.update({"exitStatus": 1, "succeeded": False})
+        model_converter = dict(failed_analyzer)
+        model_converter.update(
+            {"command": "modelConverter", "exitStatus": 0, "succeeded": True}
+        )
+
+        evidence._validate_worker_invocations(
+            [
+                artifact["mappingAndRefinementInvocations"][0],
+                failed_analyzer,
+                model_converter,
+            ],
+            context="mappingAndRefinementInvocations",
+            allowed_commands=frozenset(
+                {
+                    "mapper",
+                    "pointTriangulator",
+                    "bundleAdjuster",
+                    "modelAnalyzer",
+                    "modelConverter",
+                }
+            ),
+            expected_policy="nativeAuto",
+            expected_worker_count=None,
+            expects_mapping_attempt_ordinal=True,
+            required=True,
+        )
+
+    def test_evidence_request_binds_exact_video_source_count(self) -> None:
+        for input_kind, count in (("video", 1), ("photos", 0), ("mixed", 65)):
+            with self.subTest(input_kind=input_kind):
+                request = evidence_request(
+                    input_kind=input_kind,
+                    video_source_count=count,
+                )
+                self.assertEqual(request["video_source_count"], count)
+                evidence.validate_request(request)
+
+    def test_video_source_count_is_derived_from_the_benchmark_input(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            mixed = root / "mixed"
+            mixed.mkdir()
+            (mixed / "first.mov").write_bytes(b"video-one")
+            (mixed / "second.MP4").write_bytes(b"video-two")
+            (mixed / "still.jpg").write_bytes(b"photo")
+            nested = mixed / "nested"
+            nested.mkdir()
+            (nested / "third.m4v").write_bytes(b"video-three")
+
+            self.assertEqual(benchmark._video_source_count(mixed, "mixed"), 3)
+            self.assertEqual(benchmark._video_source_count(mixed, "photos"), 0)
+            self.assertEqual(
+                benchmark._video_source_count(mixed / "first.mov", "video"),
+                1,
+            )
+
+    def test_runtime_worker_evidence_is_bound_to_geometry_manifest(self) -> None:
+        cases = (
+            (
+                "schema",
+                lambda manifest: manifest.update({"schemaVersion": 17}),
+                "geometry manifest schema",
+            ),
+            (
+                "input",
+                lambda manifest: manifest.update({"inputDigest": "0" * 64}),
+                "geometry manifest input digest",
+            ),
+            (
+                "selection digest",
+                lambda manifest: manifest.update({"selectedFramesDigest": "0" * 64}),
+                "selected-frame digest",
+            ),
+            (
+                "selection identity",
+                lambda manifest: manifest["orderedImageNames"].__setitem__(
+                    1,
+                    manifest["orderedImageNames"][0],
+                ),
+                "selected-frame identity",
+            ),
+            (
+                "selection name type",
+                lambda manifest: manifest["orderedImageNames"].__setitem__(
+                    0,
+                    {"untrusted": "frame.jpg"},
+                ),
+                "selected-frame identity",
+            ),
+            (
+                "pair graph status type",
+                lambda manifest: manifest["pairGraph"].update(
+                    {"status": {"untrusted": "measured"}}
+                ),
+                "pair graph",
+            ),
+        )
+        for label, mutation, expected in cases:
+            with self.subTest(case=label), tempfile.TemporaryDirectory() as directory:
+                request = evidence_request()
+                observations = raw_observations(evidence.LANE_REFERENCE)
+                candidate = next(
+                    receipt
+                    for receipt in observations["commands"]
+                    if receipt["variant"] == "candidate"
+                )
+                root = Path(directory)
+                write_evidence_artifacts(root, observations, request)
+                rewrite_geometry_manifest_artifact(
+                    root,
+                    observations,
+                    candidate,
+                    mutation,
+                )
+                with self.assertRaisesRegex(evidence.EvidenceError, expected):
+                    evidence.derive_attestation(
+                        request,
+                        observations,
+                        root,
+                        root / "attestation.json",
+                        evidence.LANE_REFERENCE,
+                        runner_identity(evidence.LANE_REFERENCE),
+                        machine=evidence_machine(evidence.LANE_REFERENCE),
+                    )
+
+    def test_runtime_worker_evidence_rejects_embedded_worker_mismatch(self) -> None:
+        request = evidence_request()
+        observations = raw_observations(evidence.LANE_REFERENCE)
+        candidate = next(
+            receipt
+            for receipt in observations["commands"]
+            if receipt["variant"] == "candidate"
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            write_evidence_artifacts(root, observations, request)
+            rewrite_worker_execution_artifact(
+                root,
+                observations,
+                candidate,
+                lambda artifact: artifact["resolvedBudget"].update(
+                    {"coupledMatchingWorkers": 7}
+                ),
+                update_embedded_copy=False,
+            )
+            with self.assertRaisesRegex(
+                evidence.EvidenceError,
+                "embedded worker execution does not match",
+            ):
+                evidence.derive_attestation(
+                    request,
+                    observations,
+                    root,
+                    root / "attestation.json",
+                    evidence.LANE_REFERENCE,
+                    runner_identity(evidence.LANE_REFERENCE),
+                    machine=evidence_machine(evidence.LANE_REFERENCE),
+                )
+
+    def test_runtime_worker_evidence_compares_embedded_types_strictly(self) -> None:
+        request = evidence_request()
+        observations = raw_observations(evidence.LANE_REFERENCE)
+        candidate = next(
+            receipt
+            for receipt in observations["commands"]
+            if receipt["variant"] == "candidate"
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            write_evidence_artifacts(root, observations, request)
+            rewrite_geometry_manifest_artifact(
+                root,
+                observations,
+                candidate,
+                lambda manifest: manifest["workerExecution"]["resolvedBudget"].update(
+                    {"coupledMatchingWorkers": 8.0}
+                ),
+            )
+            with self.assertRaisesRegex(
+                evidence.EvidenceError,
+                "embedded worker execution does not match",
+            ):
+                evidence.derive_attestation(
+                    request,
+                    observations,
+                    root,
+                    root / "attestation.json",
+                    evidence.LANE_REFERENCE,
+                    runner_identity(evidence.LANE_REFERENCE),
+                    machine=evidence_machine(evidence.LANE_REFERENCE),
+                )
+
+    def test_runtime_worker_evidence_rejects_stale_cross_run_geometry(self) -> None:
+        request = evidence_request()
+        observations = raw_observations(evidence.LANE_REFERENCE)
+        candidates = [
+            receipt
+            for receipt in observations["commands"]
+            if receipt["variant"] == "candidate"
+        ]
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            write_evidence_artifacts(root, observations, request)
+            first = candidates[0]["runtime_worker_evidence"]
+            second = candidates[1]["runtime_worker_evidence"]
+            first["geometry_manifest_name"] = second["geometry_manifest_name"]
+            first["geometry_manifest_sha256"] = second["geometry_manifest_sha256"]
+            (root / "command.jsonl").write_bytes(
+                b"".join(
+                    evidence.canonical_json_bytes(command) + b"\n"
+                    for command in observations["commands"]
+                )
+            )
+            (root / "observations.json").write_bytes(
+                evidence.canonical_json_bytes(observations) + b"\n"
+            )
+
+            with self.assertRaisesRegex(
+                evidence.EvidenceError,
+                "geometry manifest path does not match its execution run",
+            ):
+                evidence.derive_attestation(
+                    request,
+                    observations,
+                    root,
+                    root / "attestation.json",
+                    evidence.LANE_REFERENCE,
+                    runner_identity(evidence.LANE_REFERENCE),
+                    machine=evidence_machine(evidence.LANE_REFERENCE),
+                )
+
+    def test_runtime_geometry_digests_are_bound_to_independent_request_evidence(self) -> None:
+        cases = (
+            ("input", "inputDigest", "geometry_input_digest", "protected input"),
+            (
+                "selected frames",
+                "selectedFramesDigest",
+                "selected_frames_digest",
+                "protected selected frames",
+            ),
+        )
+        for label, manifest_field, request_field, expected in cases:
+            with self.subTest(case=label), tempfile.TemporaryDirectory() as directory:
+                request = evidence_request()
+                observations = raw_observations(evidence.LANE_REFERENCE, request=request)
+                candidate = next(
+                    receipt
+                    for receipt in observations["commands"]
+                    if receipt["variant"] == "candidate"
+                )
+                root = Path(directory)
+                write_evidence_artifacts(root, observations, request)
+                runtime_receipt = candidate["runtime_worker_evidence"]
+                geometry_path = root / observations["artifacts"][
+                    runtime_receipt["geometry_manifest_name"]
+                ]
+                geometry = json.loads(geometry_path.read_text(encoding="utf-8"))
+                request["reference_artifacts"][request_field] = (
+                    "sha256:" + geometry[manifest_field]
+                )
+                geometry[manifest_field] = "0" * 64
+                runtime_receipt[
+                    "geometry_input_digest"
+                    if manifest_field == "inputDigest"
+                    else "selected_frames_digest"
+                ] = "sha256:" + geometry[manifest_field]
+                geometry_bytes = evidence.canonical_json_bytes(geometry)
+                geometry_path.write_bytes(geometry_bytes)
+                runtime_receipt["geometry_manifest_sha256"] = evidence.sha256_bytes(
+                    geometry_bytes
+                )
+                descriptors = {
+                    name: evidence._artifact_descriptor(root / path, root)
+                    for name, path in observations["artifacts"].items()
+                }
+
+                with self.assertRaisesRegex(evidence.EvidenceError, expected):
+                    evidence._validate_runtime_worker_evidence(
+                        runtime_receipt,
+                        request["candidate_run_configuration"],
+                        request,
+                        "candidate",
+                        candidate["run_id"],
+                        root,
+                        descriptors,
+                        set(),
+                        "runtime_worker_evidence",
+                        observations["pipeline_metrics"],
+                    )
+
+    def test_runtime_geometry_rejects_pair_policy_that_contradicts_the_request(self) -> None:
+        request = evidence_request()
+        observations = raw_observations(evidence.LANE_REFERENCE, request=request)
+        candidate = next(
+            receipt
+            for receipt in observations["commands"]
+            if receipt["variant"] == "candidate"
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            write_evidence_artifacts(root, observations, request)
+            rewrite_geometry_manifest_artifact(
+                root,
+                observations,
+                candidate,
+                lambda geometry: geometry["pairGraph"]["measurement"].update(
+                    {"pairingPolicy": "orderedLargeArea"}
+                ),
+            )
+            descriptors = {
+                name: evidence._artifact_descriptor(root / path, root)
+                for name, path in observations["artifacts"].items()
+            }
+
+            with self.assertRaisesRegex(evidence.EvidenceError, "pairing policy"):
+                evidence._validate_runtime_worker_evidence(
+                    candidate["runtime_worker_evidence"],
+                    request["candidate_run_configuration"],
+                    request,
+                    "candidate",
+                    candidate["run_id"],
+                    root,
+                    descriptors,
+                    set(),
+                    "runtime_worker_evidence",
+                    observations["pipeline_metrics"],
+                )
+
+    def test_runtime_geometry_cadence_must_match_the_accepted_mapper_receipt(self) -> None:
+        request = evidence_request()
+        observations = raw_observations(evidence.LANE_REFERENCE, request=request)
+        candidate = next(
+            receipt
+            for receipt in observations["commands"]
+            if receipt["variant"] == "candidate"
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            write_evidence_artifacts(root, observations, request)
+            rewrite_geometry_manifest_artifact(
+                root,
+                observations,
+                candidate,
+                lambda geometry: geometry["mapping"]["incrementalCadence"].update(
+                    {"globalFramesRatio": 2.0}
+                ),
+            )
+
+            with self.assertRaisesRegex(evidence.EvidenceError, "accepted mapper cadence"):
+                evidence.derive_attestation(
+                    request,
+                    observations,
+                    root,
+                    root / "attestation.json",
+                    evidence.LANE_REFERENCE,
+                    runner_identity(evidence.LANE_REFERENCE),
+                    machine=evidence_machine(evidence.LANE_REFERENCE),
+                )
+
+    def test_published_geometry_pair_digest_is_bound_to_protected_pair_evidence(self) -> None:
+        request = evidence_request()
+        observations = raw_observations(evidence.LANE_REFERENCE, request=request)
+        candidate = next(
+            receipt
+            for receipt in observations["commands"]
+            if receipt["published_output"]
+        )
+        substituted_digest = "sha256:" + "b" * 64
+        for invocation in candidate["mapper_invocations"]:
+            if invocation["outcome"] == "accepted":
+                invocation["pair_list_digest"] = substituted_digest
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            write_evidence_artifacts(root, observations, request)
+            rewrite_geometry_manifest_artifact(
+                root,
+                observations,
+                candidate,
+                lambda geometry: geometry["pairGraph"]["measurement"].update(
+                    {"pairListDigest": substituted_digest.removeprefix("sha256:")}
+                ),
+            )
+
+            with self.assertRaisesRegex(
+                evidence.EvidenceError,
+                "protected pair evidence",
+            ):
+                evidence.derive_attestation(
+                    request,
+                    observations,
+                    root,
+                    root / "attestation.json",
+                    evidence.LANE_REFERENCE,
+                    runner_identity(evidence.LANE_REFERENCE),
+                    machine=evidence_machine(evidence.LANE_REFERENCE),
+                )
+
+    def test_nonpublished_geometry_keeps_its_own_matching_duration(self) -> None:
+        request = evidence_request()
+        observations = raw_observations(evidence.LANE_REFERENCE, request=request)
+        candidate = next(
+            receipt
+            for receipt in observations["commands"]
+            if receipt["variant"] == "candidate" and not receipt["published_output"]
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            write_evidence_artifacts(root, observations, request)
+
+            def change_duration(geometry: dict[str, object]) -> None:
+                measurement = geometry["pairGraph"]["measurement"]
+                measurement["matchingDurationSeconds"] = 17.25
+                measurement["matcherAttempts"][0]["durationSeconds"] = 17.25
+
+            rewrite_geometry_manifest_artifact(
+                root,
+                observations,
+                candidate,
+                change_duration,
+            )
+
+            evidence.derive_attestation(
+                request,
+                observations,
+                root,
+                root / "attestation.json",
+                evidence.LANE_REFERENCE,
+                runner_identity(evidence.LANE_REFERENCE),
+                machine=evidence_machine(evidence.LANE_REFERENCE),
+            )
+
+    def test_vocabulary_execution_is_bound_to_the_resolved_schedule(self) -> None:
+        cases = (
+            (30, True, False, "unscheduled"),
+            (120, False, False, "resolved retrieval policy"),
+            (120, False, True, None),
+        )
+        for scale, inject, scheduled_empty, expected in cases:
+            with self.subTest(scale=scale, inject=inject, scheduled_empty=scheduled_empty):
+                request = evidence_request(scale=scale)
+                observations = raw_observations(
+                    evidence.LANE_REFERENCE,
+                    request=request,
+                )
+                candidate = next(
+                    receipt
+                    for receipt in observations["commands"]
+                    if receipt["variant"] == "candidate"
+                )
+                if scheduled_empty:
+                    for field in (
+                        "scheduled_pairs",
+                        "attempted_pairs",
+                        "raw_matched_pairs",
+                        "spatially_verified_pairs",
+                    ):
+                        observations["pipeline_metrics"][field] -= 1
+                    role_field = (
+                        "loop_pairs"
+                        if request["candidate_run_configuration"]["input_topology"]
+                        == "continuous"
+                        else "retrieval_pairs"
+                    )
+                    observations["pipeline_metrics"][role_field] = 0
+                with tempfile.TemporaryDirectory() as directory:
+                    root = Path(directory)
+                    write_evidence_artifacts(root, observations, request)
+                    if inject:
+                        def mutate(worker: dict[str, object]) -> None:
+                            invocation = dict(worker["matchingInvocations"][0])
+                            invocation["command"] = "localVocabularyRetriever"
+                            worker["vocabularyRetrievalInvocations"] = [invocation]
+
+                        rewrite_worker_execution_artifact(
+                            root,
+                            observations,
+                            candidate,
+                            mutate,
+                        )
+                    elif not scheduled_empty:
+                        rewrite_worker_execution_artifact(
+                            root,
+                            observations,
+                            candidate,
+                            lambda worker: worker[
+                                "vocabularyRetrievalInvocations"
+                            ].clear(),
+                        )
+                        rewrite_geometry_manifest_artifact(
+                            root,
+                            observations,
+                            candidate,
+                            lambda geometry: geometry["pairGraph"].update(
+                                {"usedLocalVocabularyRetrieval": False}
+                            ),
+                        )
+                    descriptors = {
+                        name: evidence._artifact_descriptor(root / path, root)
+                        for name, path in observations["artifacts"].items()
+                    }
+                    def validate_runtime_worker() -> None:
+                        evidence._validate_runtime_worker_evidence(
+                            candidate["runtime_worker_evidence"],
+                            request["candidate_run_configuration"],
+                            request,
+                            "candidate",
+                            candidate["run_id"],
+                            root,
+                            descriptors,
+                            set(),
+                            "runtime_worker_evidence",
+                            observations["pipeline_metrics"],
+                        )
+
+                    if expected is None:
+                        validate_runtime_worker()
+                    else:
+                        with self.assertRaisesRegex(evidence.EvidenceError, expected):
+                            validate_runtime_worker()
+
+    def test_seeded_geometry_cannot_claim_an_accepted_incremental_mapper(self) -> None:
+        request = evidence_request()
+        observations = raw_observations(evidence.LANE_REFERENCE, request=request)
+        candidate = next(
+            receipt
+            for receipt in observations["commands"]
+            if receipt["variant"] == "candidate"
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            write_evidence_artifacts(root, observations, request)
+            runtime_receipt = candidate["runtime_worker_evidence"]
+            worker_path = root / observations["artifacts"][runtime_receipt["artifact_name"]]
+            geometry_path = root / observations["artifacts"][
+                runtime_receipt["geometry_manifest_name"]
+            ]
+            worker = json.loads(worker_path.read_text(encoding="utf-8"))
+            template = worker["mappingAndRefinementInvocations"][0]
+            worker["vocabularyRetrievalInvocations"] = []
+            worker["mappingAndRefinementInvocations"] = [
+                {**template, "command": command}
+                for command in ("pointTriangulator", "bundleAdjuster", "modelAnalyzer")
+            ]
+            geometry = json.loads(geometry_path.read_text(encoding="utf-8"))
+            geometry["mapping"].update(
+                {
+                    "acceptedRefinementKind": "seededBundleAdjustment",
+                    "acceptedRefinementInvocationCount": 1,
+                    "incrementalCadence": None,
+                }
+            )
+            geometry["pairGraph"].update(
+                {
+                    "status": "notEvaluated",
+                    "measurement": None,
+                    "usedLocalVocabularyRetrieval": False,
+                }
+            )
+            geometry["workerExecution"] = worker
+            worker_bytes = evidence.canonical_json_bytes(worker)
+            geometry_bytes = evidence.canonical_json_bytes(geometry)
+            worker_path.write_bytes(worker_bytes)
+            geometry_path.write_bytes(geometry_bytes)
+            runtime_receipt["artifact_sha256"] = evidence.sha256_bytes(worker_bytes)
+            runtime_receipt["geometry_manifest_sha256"] = evidence.sha256_bytes(
+                geometry_bytes
+            )
+            (root / "command.jsonl").write_bytes(
+                b"".join(
+                    evidence.canonical_json_bytes(command) + b"\n"
+                    for command in observations["commands"]
+                )
+            )
+            (root / "observations.json").write_bytes(
+                evidence.canonical_json_bytes(observations) + b"\n"
+            )
+
+            with self.assertRaisesRegex(
+                evidence.EvidenceError,
+                "mapper invocation ordinals",
+            ):
+                evidence.derive_attestation(
+                    request,
+                    observations,
+                    root,
+                    root / "attestation.json",
+                    evidence.LANE_REFERENCE,
+                    runner_identity(evidence.LANE_REFERENCE),
+                    machine=evidence_machine(evidence.LANE_REFERENCE),
+                )
+
+    def test_mapping_attempt_identity_rejects_split_and_rollback_substitution(self) -> None:
+        cases = (
+            (
+                "incremental split",
+                lambda worker, geometry: (
+                    worker.update(
+                        {
+                            "mappingAndRefinementInvocations": [
+                                {
+                                    **worker["mappingAndRefinementInvocations"][0],
+                                    "mappingAttemptOrdinal": 1,
+                                },
+                                {
+                                    **worker["mappingAndRefinementInvocations"][-1],
+                                    "mappingAttemptOrdinal": 2,
+                                },
+                            ]
+                        }
+                    ),
+                    geometry["mapping"].update(
+                        {
+                            "attemptCount": 2,
+                            "acceptedMappingAttemptOrdinal": 2,
+                            "fallbackReason": "recovered_after_geometry_rejection",
+                        }
+                    ),
+                ),
+                "accepted attempt",
+            ),
+            (
+                "seeded split",
+                lambda worker, geometry: (
+                    worker.update(
+                        {
+                            "vocabularyRetrievalInvocations": [],
+                            "mappingAndRefinementInvocations": [
+                                {
+                                    **worker["mappingAndRefinementInvocations"][0],
+                                    "command": "pointTriangulator",
+                                    "mappingAttemptOrdinal": 1,
+                                },
+                                {
+                                    **worker["mappingAndRefinementInvocations"][0],
+                                    "command": "bundleAdjuster",
+                                    "mappingAttemptOrdinal": 2,
+                                },
+                                {
+                                    **worker["mappingAndRefinementInvocations"][0],
+                                    "command": "modelAnalyzer",
+                                    "mappingAttemptOrdinal": 2,
+                                },
+                            ],
+                        }
+                    ),
+                    geometry["pairGraph"].update(
+                        {
+                            "status": "notEvaluated",
+                            "measurement": None,
+                            "usedLocalVocabularyRetrieval": False,
+                        }
+                    ),
+                    geometry["mapping"].update(
+                        {
+                            "attemptCount": 2,
+                            "acceptedMappingAttemptOrdinal": 2,
+                            "acceptedRefinementKind": "seededBundleAdjustment",
+                            "acceptedRefinementInvocationCount": 1,
+                            "incrementalCadence": None,
+                            "fallbackReason": "seeded_after_incremental_rejection",
+                        }
+                    ),
+                ),
+                "accepted attempt",
+            ),
+            (
+                "rollback to older accepted attempt",
+                lambda worker, geometry: worker[
+                    "mappingAndRefinementInvocations"
+                ].append(
+                    {
+                        **worker["mappingAndRefinementInvocations"][-1],
+                        "mappingAttemptOrdinal": 2,
+                        "command": "modelConverter",
+                        "exitStatus": 1,
+                        "succeeded": False,
+                    }
+                ),
+                "final recorded attempt",
+            ),
+        )
+        for label, mutate, expected in cases:
+            with self.subTest(case=label), tempfile.TemporaryDirectory() as directory:
+                request = evidence_request()
+                observations = raw_observations(
+                    evidence.LANE_REFERENCE,
+                    request=request,
+                )
+                candidate = next(
+                    receipt
+                    for receipt in observations["commands"]
+                    if receipt["variant"] == "candidate"
+                )
+                root = Path(directory)
+                write_evidence_artifacts(root, observations, request)
+                runtime_receipt = candidate["runtime_worker_evidence"]
+                worker_path = root / observations["artifacts"][
+                    runtime_receipt["artifact_name"]
+                ]
+                geometry_path = root / observations["artifacts"][
+                    runtime_receipt["geometry_manifest_name"]
+                ]
+                worker = json.loads(worker_path.read_text(encoding="utf-8"))
+                geometry = json.loads(geometry_path.read_text(encoding="utf-8"))
+                mutate(worker, geometry)
+                geometry["workerExecution"] = worker
+                worker_bytes = evidence.canonical_json_bytes(worker)
+                geometry_bytes = evidence.canonical_json_bytes(geometry)
+                worker_path.write_bytes(worker_bytes)
+                geometry_path.write_bytes(geometry_bytes)
+                runtime_receipt["artifact_sha256"] = evidence.sha256_bytes(worker_bytes)
+                runtime_receipt["geometry_manifest_sha256"] = evidence.sha256_bytes(
+                    geometry_bytes
+                )
+                descriptors = {
+                    name: evidence._artifact_descriptor(root / path, root)
+                    for name, path in observations["artifacts"].items()
+                }
+                with self.assertRaisesRegex(evidence.EvidenceError, expected):
+                    evidence._validate_runtime_worker_evidence(
+                        runtime_receipt,
+                        request["candidate_run_configuration"],
+                        request,
+                        "candidate",
+                        candidate["run_id"],
+                        root,
+                        descriptors,
+                        set(),
+                        "runtime_worker_evidence",
+                        observations["pipeline_metrics"],
+                    )
+
+    def test_mapping_attempt_ordinal_is_independent_from_attempt_count(self) -> None:
+        request = evidence_request()
+        observations = raw_observations(evidence.LANE_REFERENCE, request=request)
+        candidate = next(
+            receipt
+            for receipt in observations["commands"]
+            if receipt["variant"] == "candidate"
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            write_evidence_artifacts(root, observations, request)
+            rewrite_worker_execution_artifact(
+                root,
+                observations,
+                candidate,
+                lambda worker: [
+                    invocation.update({"mappingAttemptOrdinal": 7})
+                    for invocation in worker["mappingAndRefinementInvocations"]
+                ],
+            )
+            rewrite_geometry_manifest_artifact(
+                root,
+                observations,
+                candidate,
+                lambda geometry: geometry["mapping"].update(
+                    {
+                        "attemptCount": 2,
+                        "acceptedMappingAttemptOrdinal": 7,
+                        "fallbackReason": "recovered_after_persisted_attempts",
+                    }
+                ),
+            )
+            descriptors = {
+                name: evidence._artifact_descriptor(root / path, root)
+                for name, path in observations["artifacts"].items()
+            }
+
+            evidence._validate_runtime_worker_evidence(
+                candidate["runtime_worker_evidence"],
+                request["candidate_run_configuration"],
+                request,
+                "candidate",
+                candidate["run_id"],
+                root,
+                descriptors,
+                set(),
+                "runtime_worker_evidence",
+                observations["pipeline_metrics"],
+            )
+
+    def test_seeded_route_cannot_erase_an_earlier_successful_mapper(self) -> None:
+        request = evidence_request()
+        observations = raw_observations(evidence.LANE_REFERENCE, request=request)
+        candidate = next(
+            receipt
+            for receipt in observations["commands"]
+            if receipt["variant"] == "candidate"
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            write_evidence_artifacts(root, observations, request)
+
+            def seed_after_mapper(worker: dict[str, object]) -> None:
+                template = worker["mappingAndRefinementInvocations"][0]
+                worker["vocabularyRetrievalInvocations"] = []
+                worker["mappingAndRefinementInvocations"] = [
+                    {**template, "command": "mapper", "mappingAttemptOrdinal": 1},
+                    {
+                        **template,
+                        "command": "pointTriangulator",
+                        "mappingAttemptOrdinal": 2,
+                    },
+                    {
+                        **template,
+                        "command": "bundleAdjuster",
+                        "mappingAttemptOrdinal": 2,
+                    },
+                    {
+                        **template,
+                        "command": "modelAnalyzer",
+                        "mappingAttemptOrdinal": 2,
+                    },
+                ]
+
+            rewrite_worker_execution_artifact(
+                root,
+                observations,
+                candidate,
+                seed_after_mapper,
+            )
+            rewrite_geometry_manifest_artifact(
+                root,
+                observations,
+                candidate,
+                lambda geometry: (
+                    geometry["pairGraph"].update(
+                        {
+                            "status": "notEvaluated",
+                            "measurement": None,
+                            "usedLocalVocabularyRetrieval": False,
+                        }
+                    ),
+                    geometry["mapping"].update(
+                        {
+                            "attemptCount": 2,
+                            "acceptedMappingAttemptOrdinal": 2,
+                            "acceptedRefinementKind": "seededBundleAdjustment",
+                            "acceptedRefinementInvocationCount": 1,
+                            "incrementalCadence": None,
+                            "fallbackReason": "seeded_after_incremental_rejection",
+                        }
+                    ),
+                ),
+            )
+            candidate["mapper_invocations"] = []
+            (root / "command.jsonl").write_bytes(
+                b"".join(
+                    evidence.canonical_json_bytes(command) + b"\n"
+                    for command in observations["commands"]
+                )
+            )
+            (root / "observations.json").write_bytes(
+                evidence.canonical_json_bytes(observations) + b"\n"
+            )
+
+            with self.assertRaisesRegex(
+                evidence.EvidenceError,
+                "mapper invocation ordinals",
+            ):
+                evidence.derive_attestation(
+                    request,
+                    observations,
+                    root,
+                    root / "attestation.json",
+                    evidence.LANE_REFERENCE,
+                    runner_identity(evidence.LANE_REFERENCE),
+                    machine=evidence_machine(evidence.LANE_REFERENCE),
+                )
+
+    def test_outer_mapper_ordinals_bind_one_to_one_with_worker_attempts(self) -> None:
+        mutations = {
+            "valid": (lambda invocations: None, None),
+            "swapped": (
+                lambda invocations: (
+                    invocations[0].update({"mapping_attempt_ordinal": 2}),
+                    invocations[1].update({"mapping_attempt_ordinal": 1}),
+                ),
+                "strictly increase",
+            ),
+            "substituted": (
+                lambda invocations: invocations[1].update(
+                    {"mapping_attempt_ordinal": 3}
+                ),
+                "do not match successful worker",
+            ),
+        }
+        for label, (mutate, expected) in mutations.items():
+            with self.subTest(case=label), tempfile.TemporaryDirectory() as directory:
+                request = evidence_request()
+                observations = raw_observations(
+                    evidence.LANE_REFERENCE,
+                    request=request,
+                )
+                candidate = next(
+                    receipt
+                    for receipt in observations["commands"]
+                    if receipt["published_output"]
+                )
+                candidate["mapper_invocations"] = mapper_invocations_for_variant(
+                    "candidate",
+                    request,
+                    fallback=True,
+                )
+                root = Path(directory)
+                write_evidence_artifacts(root, observations, request)
+                mutate(candidate["mapper_invocations"])
+                (root / "command.jsonl").write_bytes(
+                    b"".join(
+                        evidence.canonical_json_bytes(command) + b"\n"
+                        for command in observations["commands"]
+                    )
+                )
+                (root / "observations.json").write_bytes(
+                    evidence.canonical_json_bytes(observations) + b"\n"
+                )
+                if expected is None:
+                    evidence.derive_attestation(
+                        request,
+                        observations,
+                        root,
+                        root / "attestation.json",
+                        evidence.LANE_REFERENCE,
+                        runner_identity(evidence.LANE_REFERENCE),
+                        machine=evidence_machine(evidence.LANE_REFERENCE),
+                    )
+                else:
+                    with self.assertRaisesRegex(evidence.EvidenceError, expected):
+                        evidence.derive_attestation(
+                            request,
+                            observations,
+                            root,
+                            root / "attestation.json",
+                            evidence.LANE_REFERENCE,
+                            runner_identity(evidence.LANE_REFERENCE),
+                            machine=evidence_machine(evidence.LANE_REFERENCE),
+                        )
+    def test_worker_publication_follows_geometry_route_and_retrieval_evidence(self) -> None:
+        cases = (
+            (
+                "incremental route validates refinement count",
+                evidence_request(),
+                lambda worker, geometry: geometry["mapping"].update(
+                    {"acceptedRefinementInvocationCount": -1}
+                ),
+                "accepted refinement count",
+            ),
+            (
+                "model converter is not incremental mapping",
+                evidence_request(),
+                lambda worker, geometry: worker.update(
+                    {
+                        "mappingAndRefinementInvocations": [
+                            {
+                                **worker["mappingAndRefinementInvocations"][0],
+                                "exitStatus": 1,
+                                "succeeded": False,
+                            },
+                            {
+                                **worker["mappingAndRefinementInvocations"][0],
+                                "command": "modelConverter",
+                            },
+                        ]
+                    }
+                ),
+                "invalid mapper",
+            ),
+            (
+                "seeded route requires accepted refinement count",
+                evidence_request(),
+                lambda worker, geometry: (
+                    geometry["mapping"].update(
+                        {
+                            "acceptedRefinementKind": "seededBundleAdjustment",
+                            "acceptedRefinementInvocationCount": 0,
+                        }
+                    ),
+                    worker.update(
+                        {
+                            "mappingAndRefinementInvocations": [
+                                {
+                                    **worker["mappingAndRefinementInvocations"][0],
+                                    "command": command,
+                                }
+                                for command in (
+                                    "pointTriangulator",
+                                    "bundleAdjuster",
+                                    "modelAnalyzer",
+                                )
+                            ]
+                        }
+                    ),
+                ),
+                "accepted refinement count",
+            ),
+            (
+                "seeded route rejects multiple accepted refinements",
+                evidence_request(),
+                lambda worker, geometry: (
+                    geometry["pairGraph"].update(
+                        {
+                            "status": "notEvaluated",
+                            "measurement": None,
+                            "usedLocalVocabularyRetrieval": False,
+                        }
+                    ),
+                    geometry["mapping"].update(
+                        {
+                            "acceptedRefinementKind": "seededBundleAdjustment",
+                            "acceptedRefinementInvocationCount": 2,
+                            "incrementalCadence": None,
+                        }
+                    ),
+                    worker.update(
+                        {
+                            "vocabularyRetrievalInvocations": [],
+                            "mappingAndRefinementInvocations": [
+                                {
+                                    **worker["mappingAndRefinementInvocations"][0],
+                                    "command": command,
+                                }
+                                for command in (
+                                    "pointTriangulator",
+                                    "bundleAdjuster",
+                                    "modelAnalyzer",
+                                )
+                            ],
+                        }
+                    ),
+                ),
+                "accepted refinement count",
+            ),
+            (
+                "seeded route rejects a measured pair graph",
+                evidence_request(),
+                lambda worker, geometry: (
+                    geometry["mapping"].update(
+                        {
+                            "acceptedRefinementKind": "seededBundleAdjustment",
+                            "acceptedRefinementInvocationCount": 1,
+                            "incrementalCadence": None,
+                        }
+                    ),
+                    worker.update(
+                        {
+                            "mappingAndRefinementInvocations": [
+                                {
+                                    **worker["mappingAndRefinementInvocations"][0],
+                                    "command": command,
+                                }
+                                for command in (
+                                    "pointTriangulator",
+                                    "bundleAdjuster",
+                                    "modelAnalyzer",
+                                )
+                            ]
+                        }
+                    ),
+                ),
+                "pair graph",
+            ),
+            (
+                "incremental route rejects an unevaluated pair graph",
+                evidence_request(),
+                lambda worker, geometry: (
+                    geometry["pairGraph"].update(
+                        {
+                            "status": "notEvaluated",
+                            "measurement": None,
+                            "usedLocalVocabularyRetrieval": False,
+                        }
+                    ),
+                    worker.update({"vocabularyRetrievalInvocations": []}),
+                ),
+                "pair graph",
+            ),
+            (
+                "retrieval disabled rejects fake success",
+                evidence_request(scale=30),
+                lambda worker, geometry: worker.update(
+                    {
+                        "vocabularyRetrievalInvocations": [
+                            {
+                                **worker["matchingInvocations"][0],
+                                "command": "localVocabularyRetriever",
+                            }
+                        ]
+                    }
+                ),
+                "vocabulary retrieval",
+            ),
+            (
+                "retrieval used requires success",
+                evidence_request(scale=30),
+                lambda worker, geometry: (
+                    geometry["pairGraph"].update(
+                        {"usedLocalVocabularyRetrieval": True}
+                    ),
+                    geometry["pairGraph"]["measurement"].update(
+                        {
+                            "localPairCount": (
+                                geometry["pairGraph"]["measurement"][
+                                    "localPairCount"
+                                ]
+                                - 1
+                            ),
+                            "retrievalPairCount": 1,
+                        }
+                    ),
+                    worker.update(
+                        {
+                            "vocabularyRetrievalInvocations": [
+                                {
+                                    **worker["matchingInvocations"][0],
+                                    "command": "localVocabularyRetriever",
+                                    "exitStatus": 1,
+                                    "succeeded": False,
+                                }
+                            ]
+                        }
+                    ),
+                ),
+                "vocabulary retrieval",
+            ),
+        )
+        for label, request, mutation, expected in cases:
+            with self.subTest(case=label), tempfile.TemporaryDirectory() as directory:
+                observations = raw_observations(evidence.LANE_REFERENCE, request=request)
+                candidate = next(
+                    receipt
+                    for receipt in observations["commands"]
+                    if receipt["variant"] == "candidate"
+                )
+                root = Path(directory)
+                write_evidence_artifacts(root, observations, request)
+                runtime_receipt = candidate["runtime_worker_evidence"]
+                worker_path = root / observations["artifacts"][runtime_receipt["artifact_name"]]
+                geometry_path = root / observations["artifacts"][
+                    runtime_receipt["geometry_manifest_name"]
+                ]
+                worker = json.loads(worker_path.read_text(encoding="utf-8"))
+                geometry = json.loads(geometry_path.read_text(encoding="utf-8"))
+                mutation(worker, geometry)
+                geometry["workerExecution"] = worker
+                worker_bytes = evidence.canonical_json_bytes(worker)
+                geometry_bytes = evidence.canonical_json_bytes(geometry)
+                worker_path.write_bytes(worker_bytes)
+                geometry_path.write_bytes(geometry_bytes)
+                runtime_receipt["artifact_sha256"] = evidence.sha256_bytes(worker_bytes)
+                runtime_receipt["geometry_manifest_sha256"] = evidence.sha256_bytes(
+                    geometry_bytes
+                )
+                (root / "command.jsonl").write_bytes(
+                    b"".join(
+                        evidence.canonical_json_bytes(command) + b"\n"
+                        for command in observations["commands"]
+                    )
+                )
+                (root / "observations.json").write_bytes(
+                    evidence.canonical_json_bytes(observations) + b"\n"
+                )
+                with self.assertRaisesRegex(evidence.EvidenceError, expected):
+                    evidence.derive_attestation(
+                        request,
+                        observations,
+                        root,
+                        root / "attestation.json",
+                        evidence.LANE_REFERENCE,
+                        runner_identity(evidence.LANE_REFERENCE),
+                        machine=evidence_machine(evidence.LANE_REFERENCE),
+                    )
+
+    def test_worker_publication_accepts_seeded_route_and_failed_optional_attempts(self) -> None:
+        request = evidence_request()
+        request["candidate_run_configuration"].update(
+            {
+                "vocabulary_candidate_count": 20,
+                "vocabulary_verified_neighbor_count": 2,
+                "vocabulary_query_stride": 10,
+            }
+        )
+        observations = raw_observations(evidence.LANE_REFERENCE, request=request)
+        observations["pipeline_metrics"].update(
+            {
+                "scheduled_pairs": 125,
+                "attempted_pairs": 125,
+                "raw_matched_pairs": 125,
+                "spatially_verified_pairs": 125,
+                "retrieval_pairs": 0,
+                "loop_pairs": 6,
+            }
+        )
+        candidate = next(
+            receipt
+            for receipt in observations["commands"]
+            if receipt["variant"] == "candidate"
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            write_evidence_artifacts(root, observations, request)
+            runtime_receipt = candidate["runtime_worker_evidence"]
+            worker_path = root / observations["artifacts"][runtime_receipt["artifact_name"]]
+            geometry_path = root / observations["artifacts"][
+                runtime_receipt["geometry_manifest_name"]
+            ]
+            worker = json.loads(worker_path.read_text(encoding="utf-8"))
+            template = worker["mappingAndRefinementInvocations"][0]
+            worker["vocabularyRetrievalInvocations"] = [
+                {
+                    **worker["matchingInvocations"][0],
+                    "command": "localVocabularyRetriever",
+                    "exitStatus": 1,
+                    "succeeded": False,
+                }
+            ]
+            worker["mappingAndRefinementInvocations"] = [
+                {**template, "command": "pointTriangulator"},
+                {**template, "command": "bundleAdjuster"},
+                {**template, "command": "modelAnalyzer"},
+                {
+                    **template,
+                    "command": "modelConverter",
+                    "exitStatus": 1,
+                    "succeeded": False,
+                },
+            ]
+            geometry = json.loads(geometry_path.read_text(encoding="utf-8"))
+            geometry["mapping"].update(
+                {
+                    "acceptedRefinementKind": "seededBundleAdjustment",
+                    "acceptedRefinementInvocationCount": 1,
+                    "incrementalCadence": None,
+                }
+            )
+            geometry["pairGraph"].update(
+                {
+                    "status": "notEvaluated",
+                    "measurement": None,
+                    "usedLocalVocabularyRetrieval": False,
+                }
+            )
+            geometry["workerExecution"] = worker
+            worker_bytes = evidence.canonical_json_bytes(worker)
+            geometry_bytes = evidence.canonical_json_bytes(geometry)
+            worker_path.write_bytes(worker_bytes)
+            geometry_path.write_bytes(geometry_bytes)
+            runtime_receipt["artifact_sha256"] = evidence.sha256_bytes(worker_bytes)
+            runtime_receipt["geometry_manifest_sha256"] = evidence.sha256_bytes(
+                geometry_bytes
+            )
+            candidate["mapper_invocations"] = []
+            (root / "command.jsonl").write_bytes(
+                b"".join(
+                    evidence.canonical_json_bytes(command) + b"\n"
+                    for command in observations["commands"]
+                )
+            )
+            (root / "observations.json").write_bytes(
+                evidence.canonical_json_bytes(observations) + b"\n"
+            )
+
+            evidence.derive_attestation(
+                request,
+                observations,
+                root,
+                root / "attestation.json",
+                evidence.LANE_REFERENCE,
+                runner_identity(evidence.LANE_REFERENCE),
+                machine=evidence_machine(evidence.LANE_REFERENCE),
+            )
+
+    def test_seeded_worker_rejects_a_nonempty_all_failed_required_stage(self) -> None:
+        for stage_name in ("featureExtractionInvocations", "matchingInvocations"):
+            with self.subTest(stage=stage_name), tempfile.TemporaryDirectory() as directory:
+                request = evidence_request()
+                observations = raw_observations(evidence.LANE_REFERENCE, request=request)
+                candidate = next(
+                    receipt
+                    for receipt in observations["commands"]
+                    if receipt["variant"] == "candidate"
+                )
+                root = Path(directory)
+                write_evidence_artifacts(root, observations, request)
+
+                def make_seeded_worker(worker: dict[str, object]) -> None:
+                    template = worker["mappingAndRefinementInvocations"][0]
+                    worker["vocabularyRetrievalInvocations"] = []
+                    worker["mappingAndRefinementInvocations"] = [
+                        {**template, "command": command}
+                        for command in (
+                            "pointTriangulator",
+                            "bundleAdjuster",
+                            "modelAnalyzer",
+                        )
+                    ]
+                    worker[stage_name][0].update(
+                        {"exitStatus": 1, "succeeded": False}
+                    )
+
+                rewrite_worker_execution_artifact(
+                    root,
+                    observations,
+                    candidate,
+                    make_seeded_worker,
+                )
+                rewrite_geometry_manifest_artifact(
+                    root,
+                    observations,
+                    candidate,
+                    lambda geometry: (
+                        geometry["pairGraph"].update(
+                            {
+                                "status": "notEvaluated",
+                                "measurement": None,
+                                "usedLocalVocabularyRetrieval": False,
+                            }
+                        ),
+                        geometry["mapping"].update(
+                            {
+                                "acceptedRefinementKind": "seededBundleAdjustment",
+                                "acceptedRefinementInvocationCount": 1,
+                                "incrementalCadence": None,
+                            }
+                        ),
+                    ),
+                )
+                with self.assertRaisesRegex(
+                    evidence.EvidenceError,
+                    "required worker stage has no successful invocation",
+                ):
+                    evidence.derive_attestation(
+                        request,
+                        observations,
+                        root,
+                        root / "attestation.json",
+                        evidence.LANE_REFERENCE,
+                        runner_identity(evidence.LANE_REFERENCE),
+                        machine=evidence_machine(evidence.LANE_REFERENCE),
+                    )
+
+    def test_worker_publication_requires_exact_video_source_count(self) -> None:
+        request = evidence_request(input_kind="mixed", video_source_count=2)
+        observations = raw_observations(evidence.LANE_REFERENCE, request=request)
+        candidate = next(
+            receipt
+            for receipt in observations["commands"]
+            if receipt["variant"] == "candidate"
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            write_evidence_artifacts(root, observations, request)
+            rewrite_worker_execution_artifact(
+                root,
+                observations,
+                candidate,
+                lambda artifact: artifact["videoSourceAnalysis"].update(
+                    {
+                        "videoSourceCount": 1,
+                        "startedAnalysisTaskCount": 2,
+                        "peakInFlightAnalysisTaskCount": 1,
+                    }
+                ),
+            )
+            descriptors = {
+                name: evidence._artifact_descriptor(root / path, root)
+                for name, path in observations["artifacts"].items()
+            }
+            with self.assertRaisesRegex(evidence.EvidenceError, "video source count"):
+                evidence._validate_runtime_worker_evidence(
+                    candidate["runtime_worker_evidence"],
+                    request["candidate_run_configuration"],
+                    request,
+                    "candidate",
+                    candidate["run_id"],
+                    root,
+                    descriptors,
+                    set(),
+                    "runtime_worker_evidence",
+                    observations["pipeline_metrics"],
+                )
+
     def test_continuous_mapper_invocation_shapes_fail_closed(self) -> None:
         request = evidence_request()
         fast = mapper_invocations_for_variant("candidate", request)
@@ -5998,7 +8521,14 @@ class EvidenceProtocolTests(unittest.TestCase):
             ("fallback missing accepted second", recovered[:1], "exactly one accepted"),
             (
                 "accepted fast followed by extra retry",
-                [*fast, {**conservative, "outcome": "rejected_geometry_gate"}],
+                [
+                    *fast,
+                    {
+                        **conservative,
+                        "mapping_attempt_ordinal": 2,
+                        "outcome": "rejected_geometry_gate",
+                    },
+                ],
                 "accepted.*last",
             ),
             ("conservative only", [conservative], "fast 4.0/1"),
@@ -6128,6 +8658,7 @@ class EvidenceProtocolTests(unittest.TestCase):
                 {
                     "argv": ["baseline-toolchain://resolved/bin/colmap", "mapper"],
                     "outcome": "accepted",
+                    "mapping_attempt_ordinal": 1,
                     "matching_attempt": 1,
                     "pair_list_digest": "sha256:" + "b" * 64,
                     "descriptor_matcher": "exact",
@@ -6152,6 +8683,7 @@ class EvidenceProtocolTests(unittest.TestCase):
                 "candidate",
                 (1.1, 1.1, 5, 2),
                 "accepted",
+                mapping_attempt_ordinal=2,
                 matching_attempt=2,
                 digest_character="b",
                 descriptor_matcher="faiss",
@@ -6307,6 +8839,7 @@ class EvidenceProtocolTests(unittest.TestCase):
                 "candidate",
                 (1.4, 1.4, 5, 2),
                 "rejected_geometry_gate",
+                mapping_attempt_ordinal=2,
                 matching_attempt=1,
                 digest_character="a",
                 descriptor_matcher="faiss",
@@ -6315,6 +8848,7 @@ class EvidenceProtocolTests(unittest.TestCase):
                 "candidate",
                 (1.4, 1.4, 5, 2),
                 "accepted",
+                mapping_attempt_ordinal=3,
                 matching_attempt=2,
                 digest_character="b",
                 descriptor_matcher="faiss",
@@ -6562,6 +9096,50 @@ class EvidenceProtocolTests(unittest.TestCase):
                     evidence.LANE_REFERENCE,
                     runner_identity(evidence.LANE_REFERENCE),
                 )
+
+    def test_prepared_attestation_revalidates_mapper_and_worker_receipts(self) -> None:
+        mutations = {
+            "invalid mapper digest": lambda candidate: candidate["mapper_invocations"][0].update(
+                {"pair_list_digest": "not-a-digest"}
+            ),
+            "missing runtime worker": lambda candidate: candidate.update(
+                {"runtime_worker_evidence": None}
+            ),
+        }
+        for label, mutate in mutations.items():
+            with self.subTest(case=label), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                output, attestation = self.produce(root, evidence.LANE_REFERENCE)
+                changed = json.loads(json.dumps(attestation))
+                candidate = next(
+                    receipt
+                    for receipt in changed["commands"]
+                    if receipt["variant"] == "candidate"
+                )
+                mutate(candidate)
+                command_bytes = b"".join(
+                    evidence.canonical_json_bytes(command) + b"\n"
+                    for command in changed["commands"]
+                )
+                (root / "command.jsonl").write_bytes(command_bytes)
+                changed["artifacts"]["command_log"].update(
+                    {
+                        "sha256": evidence.sha256_bytes(command_bytes),
+                        "bytes": len(command_bytes),
+                    }
+                )
+                output.write_bytes(evidence.canonical_json_bytes(changed) + b"\n")
+
+                with self.assertRaisesRegex(
+                    evidence.EvidenceError,
+                    "pair_list_digest|runtime_worker_evidence",
+                ):
+                    evidence.validate_prepared_attestation_file(
+                        output,
+                        evidence_request(),
+                        evidence.LANE_REFERENCE,
+                        runner_identity(evidence.LANE_REFERENCE),
+                    )
 
     def test_missing_or_malformed_runner_identities_are_rejected(self) -> None:
         missing = runner_identities()
@@ -6811,6 +9389,7 @@ class EvidenceProtocolTests(unittest.TestCase):
                 corpus_root,
                 identity,
                 "sha256:" + "1" * 64,
+                1,
                 runner_identities(),
                 "sha256:" + "9" * 64,
             )
@@ -6830,6 +9409,7 @@ class EvidenceProtocolTests(unittest.TestCase):
                 corpus_root,
                 identity,
                 "sha256:" + "1" * 64,
+                1,
                 wrong_index_identities,
                 "sha256:" + "9" * 64,
             )
@@ -6842,6 +9422,7 @@ class EvidenceProtocolTests(unittest.TestCase):
                 corpus_root,
                 identity,
                 "sha256:" + "1" * 64,
+                1,
                 runner_identities(),
                 "sha256:" + "9" * 64,
             )
@@ -6858,6 +9439,7 @@ class EvidenceProtocolTests(unittest.TestCase):
                 corpus_root,
                 identity,
                 "sha256:" + "1" * 64,
+                1,
                 runner_identities(),
                 "sha256:" + "9" * 64,
             )
@@ -6871,6 +9453,7 @@ class EvidenceProtocolTests(unittest.TestCase):
                 corpus_root,
                 identity,
                 "sha256:" + "1" * 64,
+                1,
                 runner_identities(),
                 "sha256:" + "9" * 64,
             )
@@ -7025,6 +9608,7 @@ class EvidenceProtocolTests(unittest.TestCase):
                     corpus_root,
                     identity,
                     input_digest,
+                    1,
                     identities,
                     "sha256:" + "9" * 64,
                 )
@@ -7244,7 +9828,10 @@ class EvidenceProtocolTests(unittest.TestCase):
             index_path.write_bytes(benchmark.canonical_json_bytes(index) + b"\n")
             source = root / "runner-source"
             source.mkdir()
-            observations = raw_observations(evidence.LANE_CONSTRAINED)
+            observations = raw_observations(
+                evidence.LANE_CONSTRAINED,
+                request=request,
+            )
             for record in observations["timing"]["candidate_runs"]:
                 record["end_to_end_seconds"] = 0.001
             observations["commands"] = execution_receipts(
@@ -7256,13 +9843,7 @@ class EvidenceProtocolTests(unittest.TestCase):
                 observations["timing"],
                 evidence.LANE_CONSTRAINED,
             )
-            (source / "observations.json").write_bytes(
-                evidence.canonical_json_bytes(observations) + b"\n"
-            )
-            (source / "splat.ply").write_text(
-                VALID_SPLAT_PLY,
-                encoding="utf-8",
-            )
+            write_evidence_artifacts(source, observations, request)
             training_manifest = training_manifest_for_observations(
                 observations,
                 request["candidate_run_configuration"],
@@ -7284,7 +9865,8 @@ class EvidenceProtocolTests(unittest.TestCase):
                 "root=pathlib.Path(a.artifact_root)\n"
                 "shutil.copy2(source/'observations.json', root/'observations.json')\n"
                 "shutil.copy2(source/'splat.ply', root/'splat.ply')\n"
-                "shutil.copy2(source/'training-manifest.json', root/'training-manifest.json')\n",
+                "shutil.copy2(source/'training-manifest.json', root/'training-manifest.json')\n"
+                "shutil.copytree(source/'worker-runs', root/'worker-runs')\n",
                 encoding="utf-8",
             )
             runner.chmod(0o755)
@@ -8311,6 +10893,7 @@ class RunnerIntegrityTests(unittest.TestCase):
                     {
                         "mapping": {
                             "acceptedRefinementInvocationCount": 1,
+                            "acceptedMappingAttemptOrdinal": 1,
                             "acceptedRefinementKind": "incrementalGlobal",
                             "attemptCount": 1,
                             "incrementalCadence": {
@@ -8324,7 +10907,16 @@ class RunnerIntegrityTests(unittest.TestCase):
                             "secondLargestModelRegisteredViewCount": 0,
                             "unionRegisteredViewCount": 30,
                         },
-                        "schemaVersion": 14,
+                        "pairGraph": {
+                            "status": "measured",
+                            "measurement": {"fixture": True},
+                            "usedLocalVocabularyRetrieval": False,
+                        },
+                        "schemaVersion": evidence.GEOMETRY_ARTIFACT_SCHEMA_VERSION,
+                        "workerExecution": worker_execution_artifact(
+                            request["candidate_run_configuration"],
+                            str(request["input_kind"]),
+                        ),
                     }
                 )
                 + b"\n"

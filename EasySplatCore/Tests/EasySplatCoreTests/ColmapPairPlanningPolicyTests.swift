@@ -341,6 +341,12 @@ final class ColmapPairPlanningPolicyTests: XCTestCase {
             trainerIterationLimit: 3_000,
             plateauWindow: 400,
             trainerMemoryBudgetBytes: 1_024 * 1_024 * 1_024,
+            geometryWorkerBudget: GeometryWorkerBudget(
+                featureExtractionWorkers: 12,
+                coupledMatchingWorkers: 8,
+                vocabularyRetrievalWorkers: 8,
+                maximumConcurrentVideoSourceAnalysisTasks: 4
+            ),
             requiredToolchainCapabilities: ["geometry.colmap", "runtime.core", "training.msplat"],
             fallbackRouteIdentifiers: [],
             pairingPolicy: policy,

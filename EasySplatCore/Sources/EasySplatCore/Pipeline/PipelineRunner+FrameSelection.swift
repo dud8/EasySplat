@@ -32,6 +32,44 @@ struct IndexedFrameAnalysis: Sendable {
     let analysis: FrameExtractionAnalysis
 }
 
+struct VideoSourceAnalysisConcurrencySnapshot: Sendable, Equatable {
+    let startedAnalysisTaskCount: Int
+    let peakInFlightAnalysisTaskCount: Int
+}
+
+final class VideoSourceAnalysisConcurrencyMeter: @unchecked Sendable {
+    private let lock = NSLock()
+    private var activeCount = 0
+    private var startedAnalysisTaskCount = 0
+    private var peakInFlightAnalysisTaskCount = 0
+
+    func measure<T: Sendable>(
+        _ operation: @escaping @Sendable () async throws -> T
+    ) async throws -> T {
+        try Task.checkCancellation()
+        lock.withLock {
+            activeCount += 1
+            startedAnalysisTaskCount += 1
+            peakInFlightAnalysisTaskCount = max(peakInFlightAnalysisTaskCount, activeCount)
+        }
+        defer {
+            lock.withLock {
+                activeCount -= 1
+            }
+        }
+        return try await operation()
+    }
+
+    func snapshot() -> VideoSourceAnalysisConcurrencySnapshot {
+        lock.withLock {
+            VideoSourceAnalysisConcurrencySnapshot(
+                startedAnalysisTaskCount: startedAnalysisTaskCount,
+                peakInFlightAnalysisTaskCount: peakInFlightAnalysisTaskCount
+            )
+        }
+    }
+}
+
 final class WeightedVideoAnalysisProgress: @unchecked Sendable {
     private let lock = NSLock()
     private let weights: [Double]
@@ -80,12 +118,12 @@ extension PipelineRunner {
         code == ENOTSUP || code == EXDEV
     }
 
-    static func videoAnalysisConcurrency(
-        threadLimit: Int,
-        videoCount: Int
+    static func videoSourceAnalysisConcurrency(
+        maximumConcurrentTasks: Int,
+        videoSourceCount: Int
     ) -> Int {
-        guard videoCount > 0 else { return 1 }
-        return min(videoCount, 4, max(1, threadLimit / 2))
+        guard videoSourceCount > 0 else { return 0 }
+        return min(videoSourceCount, max(1, maximumConcurrentTasks))
     }
 
     static func durationAwareVideoFrameTarget(
@@ -124,7 +162,8 @@ extension PipelineRunner {
         _ sources: [FrameExtractionSource],
         options: FrameExtractionOptions,
         targetCounts: [Int],
-        maximumConcurrency: Int,
+        maximumConcurrentTasks: Int,
+        concurrencyMeter: VideoSourceAnalysisConcurrencyMeter,
         progress: @escaping @Sendable (Int, Double) -> Void
     ) async throws -> [FrameExtractionAnalysis] {
         guard !sources.isEmpty,
@@ -132,7 +171,7 @@ extension PipelineRunner {
               targetCounts.allSatisfy({ $0 > 0 }) else {
             throw PipelineError.invalidInput
         }
-        let workerCount = min(sources.count, max(1, maximumConcurrency))
+        let concurrentSourceCount = min(sources.count, max(1, maximumConcurrentTasks))
         return try await withThrowingTaskGroup(
             of: IndexedFrameAnalysis.self,
             returning: [FrameExtractionAnalysis].self
@@ -145,22 +184,26 @@ extension PipelineRunner {
 
             func submit(_ index: Int) {
                 let source = sources[index]
-                var sourceOptions = options
-                sourceOptions.targetCount = targetCounts[index]
+                var configuredOptions = options
+                configuredOptions.targetCount = targetCounts[index]
+                let sourceOptions = configuredOptions
                 group.addTask {
-                    let extractor = FrameExtractor()
-                    let analysis = try await extractor.analyze(
-                        source,
-                        options: sourceOptions,
-                        progress: { fraction, _ in
-                            progress(index, fraction)
-                        }
-                    )
+                    try Task.checkCancellation()
+                    let analysis = try await concurrencyMeter.measure {
+                        let extractor = FrameExtractor()
+                        return try await extractor.analyze(
+                            source,
+                            options: sourceOptions,
+                            progress: { fraction, _ in
+                                progress(index, fraction)
+                            }
+                        )
+                    }
                     return IndexedFrameAnalysis(index: index, analysis: analysis)
                 }
             }
 
-            while nextIndex < workerCount {
+            while nextIndex < concurrentSourceCount {
                 submit(nextIndex)
                 nextIndex += 1
             }

@@ -729,12 +729,14 @@ def validate_corpus(corpus: Any, expected_profile: str) -> None:
                 "ground_truth_preparation_sha256",
                 "paired_baseline_rendering_reference_sha256",
                 "orientation_label_sha256",
+                "geometry_input_digest",
             }
             for scale in lanes:
                 pinned = _require_mapping(by_scale[str(scale)], f"{label}.reference.{scale}")
                 _require_exact_keys(
                     pinned,
-                    digest_fields | {"orientation_expected_status"},
+                    digest_fields
+                    | {"orientation_expected_status", "selected_frames_digests"},
                     f"{label}.reference.{scale}",
                 )
                 for field in digest_fields:
@@ -746,6 +748,21 @@ def validate_corpus(corpus: Any, expected_profile: str) -> None:
                     "unresolved",
                 }:
                     raise ConfigError(f"{label}.reference.{scale} orientation expectation is invalid")
+                selected_frames_digests = _require_mapping(
+                    pinned["selected_frames_digests"],
+                    f"{label}.reference.{scale}.selected_frames_digests",
+                )
+                _require_exact_keys(
+                    selected_frames_digests,
+                    {"candidate", "fast_candidate"},
+                    f"{label}.reference.{scale}.selected_frames_digests",
+                )
+                for variant, digest in selected_frames_digests.items():
+                    if not isinstance(digest, str) or not SHA256_PATTERN.fullmatch(digest):
+                        raise ConfigError(
+                            f"{label}.reference.{scale}.selected_frames_digests.{variant} "
+                            "is not a SHA-256 digest"
+                        )
         elif reference_status == "not_applicable":
             _require_exact_keys(reference, {"status"}, f"{label}.reference")
             if category != "invalid":
@@ -1391,6 +1408,39 @@ def digest_input(path: Path, *, trusted_root: Path | None = None) -> str:
         ):
             raise ConfigError("benchmark input changed while it was being hashed")
     return "sha256:" + hasher.hexdigest()
+
+
+def _video_source_count(path: Path, input_kind: str) -> int:
+    if input_kind == "photos":
+        return 0
+    if input_kind == "video":
+        if path.is_symlink() or not path.is_file():
+            raise ConfigError("video benchmark input must be one regular file")
+        return 1
+    if input_kind != "mixed" or path.is_symlink() or not path.is_dir():
+        raise ConfigError("mixed benchmark input must be a real directory")
+    video_extensions = {
+        ".3gp",
+        ".avi",
+        ".m2ts",
+        ".m4v",
+        ".mkv",
+        ".mov",
+        ".mp4",
+        ".mpeg",
+        ".mpg",
+        ".mts",
+        ".qt",
+    }
+    count = 0
+    for candidate in path.rglob("*"):
+        if candidate.is_symlink():
+            raise ConfigError("benchmark input tree must not contain symlinks")
+        if candidate.is_file() and candidate.suffix.lower() in video_extensions:
+            count += 1
+    if count == 0:
+        raise ConfigError("mixed benchmark input contains no supported video files")
+    return count
 
 
 def _record_unique_release_input_digest(
@@ -2764,6 +2814,7 @@ def _evidence_request(
     input_digest: str,
     rendering_driver_identity: Mapping[str, str],
     benchmark_contract_digest: str,
+    video_source_count: int | None = None,
 ) -> dict[str, Any]:
     if lane not in required_evidence_lanes(scene, scale):
         raise ConfigError(f"{scene['id']}@{scale} does not support the {lane} evidence lane")
@@ -2838,6 +2889,13 @@ def _evidence_request(
         ba_local_max_refinements = 1
 
     detail_profile = "balanced" if lane == evidence.LANE_REFERENCE else "fast"
+    video_source_count = (
+        scene["input"].get("video_source_count")
+        if video_source_count is None
+        else video_source_count
+    )
+    if video_source_count is None:
+        video_source_count = 0 if input_kind == "photos" else 1
     split = scene["split"]
     references = scene["reference"]
     if scene["expected_outcome"]["kind"] == "invalid":
@@ -2880,10 +2938,18 @@ def _evidence_request(
         "ba_local_num_images": 6,
         "trainer_iterations": 7_000 if detail_profile == "balanced" else 3_000,
         "trainer_plateau_window": 800 if detail_profile == "balanced" else 400,
+        "feature_extraction_workers": 12 if lane == evidence.LANE_REFERENCE else 4,
+        "coupled_matching_workers": 8 if lane == evidence.LANE_REFERENCE else 4,
+        "vocabulary_retrieval_workers": 8 if lane == evidence.LANE_REFERENCE else 4,
+        "maximum_concurrent_video_source_analysis_tasks": (
+            1
+            if scene["input"]["kind"] == "photos"
+            else (4 if lane == evidence.LANE_REFERENCE else 2)
+        ),
         "run_seed": 42,
     }
     return {
-        "schema_version": 4,
+        "schema_version": evidence.REQUEST_SCHEMA_VERSION,
         "binding": {
             "profile": identity.profile,
             "scene_id": scene["id"],
@@ -2909,6 +2975,7 @@ def _evidence_request(
         "timing_basis": "selected_view_count",
         "expected_outcome": scene["expected_outcome"],
         "input_kind": scene["input"]["kind"],
+        "video_source_count": video_source_count,
         "gate_scopes": scene["gate_scopes"],
         "rendering_driver_identity": evidence.validate_runner_identity(
             rendering_driver_identity,
@@ -3093,6 +3160,7 @@ def _copy_protected_evidence(
     corpus_directory: Path,
     identity: RunIdentity,
     input_digest: str,
+    video_source_count: int,
     runner_identities: Mapping[str, Mapping[str, Any]],
     benchmark_contract_digest: str,
 ) -> dict[str, Any]:
@@ -3111,6 +3179,7 @@ def _copy_protected_evidence(
             input_digest,
             runner_identities[evidence.RENDERING_DRIVER_IDENTITY],
             benchmark_contract_digest,
+            video_source_count,
         )
         path = evidence_root / lane / "attestation.json"
         outcome_path = evidence_root / lane / "lane-outcome.json"
@@ -3276,6 +3345,7 @@ def emit_evidence_requests(
     identity = make_run_identity("release", corpus, config, toolchain_root, toolchain_identity)
     contract_digest = validate_tracked_benchmark_contract(corpus)
     input_digests: dict[str, str] = {}
+    video_source_counts: dict[str, int] = {}
     input_digest_owners: dict[str, str] = {}
     for scene in corpus["scenes"]:
         media = corpus_path.parent / scene["input"]["media_path"]
@@ -3284,6 +3354,10 @@ def emit_evidence_requests(
         input_digests[scene["id"]] = digest_input(
             media,
             trusted_root=corpus_path.parent,
+        )
+        video_source_counts[scene["id"]] = _video_source_count(
+            media,
+            scene["input"]["kind"],
         )
         _record_unique_release_input_digest(
             scene,
@@ -3306,6 +3380,7 @@ def emit_evidence_requests(
                     input_digests[scene["id"]],
                     approved_runners[evidence.RENDERING_DRIVER_IDENTITY],
                     contract_digest,
+                    video_source_counts[scene["id"]],
                 )
                 relative = Path(scene["id"]) / str(scale) / f"{lane}.request.json"
                 atomic_write_json(destination / relative, request)
@@ -3691,11 +3766,17 @@ def run_suite(
         )
         approved_runners = request_index["runner_identities"]
     input_digests: dict[str, str] = {}
+    video_source_counts: dict[str, int] = {}
     input_digest_owners: dict[str, str] = {}
     for scene in corpus["scenes"]:
+        input_path = corpus_path.parent / scene["input"]["media_path"]
         input_digests[scene["id"]] = digest_input(
-            corpus_path.parent / scene["input"]["media_path"],
+            input_path,
             trusted_root=corpus_path.parent,
+        )
+        video_source_counts[scene["id"]] = _video_source_count(
+            input_path,
+            scene["input"]["kind"],
         )
         if profile == "release":
             _record_unique_release_input_digest(
@@ -3719,6 +3800,7 @@ def run_suite(
                     evidence_root or corpus_path.parent,
                     identity,
                     input_digests[scene["id"]],
+                    video_source_counts[scene["id"]],
                     approved_runners,
                     benchmark_contract_sha256(corpus),
                 )

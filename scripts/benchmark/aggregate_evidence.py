@@ -339,20 +339,24 @@ def _validate_prepared_attestation(
             "schema_version", "binding", "baseline_run_configuration",
             "candidate_run_configuration", "category", "capture_traits",
             "holdout_indices", "reference_artifacts", "timing_basis",
-            "expected_outcome", "input_kind", "gate_scopes",
+            "expected_outcome", "input_kind", "video_source_count", "gate_scopes",
             "rendering_driver_identity", "scoring_runtime", "lane", "machine",
             "producer", "measurement_runner", "commands", "resolved_compute",
             "actual", "metrics", "artifacts",
         },
         "prepared evidence",
     )
-    if attestation["schema_version"] != 3 or attestation["lane"] != lane:
+    if (
+        attestation["schema_version"] != evidence.ATTESTATION_SCHEMA_VERSION
+        or attestation["lane"] != lane
+    ):
         raise AggregationError("prepared evidence schema or lane is invalid")
     validated_request = evidence.validate_request(request)
     for field in (
         "binding", "baseline_run_configuration", "candidate_run_configuration", "category",
         "capture_traits", "holdout_indices", "reference_artifacts", "timing_basis",
-        "expected_outcome", "input_kind", "gate_scopes", "rendering_driver_identity",
+        "expected_outcome", "input_kind", "video_source_count", "gate_scopes",
+        "rendering_driver_identity",
     ):
         if attestation[field] != validated_request[field]:
             raise AggregationError(f"prepared evidence {field} does not match its request")
@@ -384,6 +388,21 @@ def _validate_prepared_attestation(
         if not isinstance(name, str) or not evidence.SAFE_TOKEN_PATTERN.fullmatch(name):
             raise AggregationError("prepared artifact name is invalid")
         _validate_descriptor(descriptor, f"prepared artifact {name}")
+    try:
+        output_descriptor = artifacts.get("output_ply")
+        evidence._validate_prepared_execution_receipts(
+            attestation["commands"],
+            validated_request,
+            evidence.validate_runner_identity(runner, lane),
+            attestation["actual"],
+            (
+                _mapping(output_descriptor, "prepared output descriptor")["sha256"]
+                if output_descriptor is not None
+                else None
+            ),
+        )
+    except evidence.EvidenceError as error:
+        raise AggregationError(f"prepared execution receipts are invalid: {error}") from error
     return dict(attestation)
 
 

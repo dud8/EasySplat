@@ -34,6 +34,7 @@ final class MockSubprocessRunner: @unchecked Sendable, SubprocessRunning {
     private var scripts: [Script]
     private var recordedCalls: [(String, [String])] = []
     private var recordedEnvironments: [[String: String]] = []
+    private var recordedRemovedEnvironmentKeys: [Set<String>] = []
 
     var calls: [(String, [String])] {
         lock.withLock { recordedCalls }
@@ -41,6 +42,10 @@ final class MockSubprocessRunner: @unchecked Sendable, SubprocessRunning {
 
     var environments: [[String: String]] {
         lock.withLock { recordedEnvironments }
+    }
+
+    var removedEnvironmentKeys: [Set<String>] {
+        lock.withLock { recordedRemovedEnvironmentKeys }
     }
 
     init(scripts: [Script]) {
@@ -52,6 +57,7 @@ final class MockSubprocessRunner: @unchecked Sendable, SubprocessRunning {
         _ arguments: [String],
         currentDirectory: URL?,
         environment: [String: String],
+        removingEnvironmentKeys: Set<String>,
         onStdout: @escaping @Sendable (String) -> Void,
         onStderr: @escaping @Sendable (String) -> Void
     ) throws -> SubprocessResult {
@@ -62,12 +68,29 @@ final class MockSubprocessRunner: @unchecked Sendable, SubprocessRunning {
             let script = scripts.remove(at: index)
             recordedCalls.append((launchPath, arguments))
             recordedEnvironments.append(environment)
+            recordedRemovedEnvironmentKeys.append(removingEnvironmentKeys)
             return script
         }
         try script.onRun?(arguments)
         (script.stdoutLinesProvider?(arguments) ?? script.stdoutLines).forEach(onStdout)
         script.stderrLines.forEach(onStderr)
-        return script.result
+        let controlledKeys = removingEnvironmentKeys.union(environment.keys)
+        let effectiveValues = Dictionary(
+            uniqueKeysWithValues: controlledKeys.compactMap { key in
+                environment[key].map { (key, $0) }
+            }
+        )
+        return SubprocessResult(
+            exitCode: script.result.exitCode,
+            terminationReason: script.result.terminationReason,
+            stdout: script.result.stdout,
+            stderr: script.result.stderr,
+            environmentReceipt: SubprocessEnvironmentReceipt(
+                explicitOverrides: environment,
+                removedKeys: removingEnvironmentKeys,
+                effectiveValuesForControlledKeys: effectiveValues
+            )
+        )
     }
 
     func runAsync(
@@ -75,6 +98,7 @@ final class MockSubprocessRunner: @unchecked Sendable, SubprocessRunning {
         _ arguments: [String],
         currentDirectory: URL?,
         environment: [String: String],
+        removingEnvironmentKeys: Set<String>,
         onStdout: @escaping @Sendable (String) -> Void,
         onStderr: @escaping @Sendable (String) -> Void
     ) async throws -> SubprocessResult {
@@ -83,6 +107,7 @@ final class MockSubprocessRunner: @unchecked Sendable, SubprocessRunning {
             arguments,
             currentDirectory: currentDirectory,
             environment: environment,
+            removingEnvironmentKeys: removingEnvironmentKeys,
             onStdout: onStdout,
             onStderr: onStderr
         )
@@ -105,6 +130,7 @@ final class CheckpointCancellingSubprocessRunner: @unchecked Sendable, Subproces
         _ arguments: [String],
         currentDirectory: URL?,
         environment: [String: String],
+        removingEnvironmentKeys: Set<String>,
         onStdout: @escaping @Sendable (String) -> Void,
         onStderr: @escaping @Sendable (String) -> Void
     ) throws -> SubprocessResult {
@@ -113,6 +139,7 @@ final class CheckpointCancellingSubprocessRunner: @unchecked Sendable, Subproces
             arguments,
             currentDirectory: currentDirectory,
             environment: environment,
+            removingEnvironmentKeys: removingEnvironmentKeys,
             onStdout: onStdout,
             onStderr: onStderr
         )
@@ -123,6 +150,7 @@ final class CheckpointCancellingSubprocessRunner: @unchecked Sendable, Subproces
         _ arguments: [String],
         currentDirectory: URL?,
         environment: [String: String],
+        removingEnvironmentKeys: Set<String>,
         onStdout: @escaping @Sendable (String) -> Void,
         onStderr: @escaping @Sendable (String) -> Void
     ) async throws -> SubprocessResult {
@@ -132,6 +160,7 @@ final class CheckpointCancellingSubprocessRunner: @unchecked Sendable, Subproces
                 arguments,
                 currentDirectory: currentDirectory,
                 environment: environment,
+                removingEnvironmentKeys: removingEnvironmentKeys,
                 onStdout: onStdout,
                 onStderr: onStderr
             )

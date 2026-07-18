@@ -95,6 +95,7 @@ final class PairGraphRecoveryStoreTests: XCTestCase {
             activeRecoveryLevel: .expanded,
             activePlan: plans.source,
             attempts: [normalAttempt],
+            usedLocalVocabularyRetrieval: true,
             matchingDurationSeconds: 1.25,
             fallbackReasons: ["Reconstruction coverage was below the acceptance gate"]
         )
@@ -114,6 +115,7 @@ final class PairGraphRecoveryStoreTests: XCTestCase {
         XCTAssertEqual(restored.recoveryLevel, .expanded)
         XCTAssertEqual(restored.activePlan, plans.source)
         XCTAssertEqual(restored.attempts, [normalAttempt])
+        XCTAssertTrue(restored.usedLocalVocabularyRetrieval)
     }
 
     func testPreparingPolicyRecoveryPreservesDisconnectedPlanningFailure() throws {

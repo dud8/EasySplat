@@ -31,9 +31,55 @@ from pathlib import Path, PurePosixPath
 from typing import Any, Iterable, Mapping
 
 
-PROTOCOL_VERSION = 4
-PRODUCER_VERSION = "4.0.0"
+PROTOCOL_VERSION = 8
+PRODUCER_VERSION = "8.0.0"
+REQUEST_SCHEMA_VERSION = 8
+ATTESTATION_SCHEMA_VERSION = 7
+GEOMETRY_ARTIFACT_SCHEMA_VERSION = 20
+GEOMETRY_WORKER_EXECUTION_SCHEMA_VERSION = 3
+MAXIMUM_MAPPING_ATTEMPT_ORDINAL = 10_000
 PRODUCER_RELATIVE_PATH = "scripts/benchmark/evidence_protocol.py"
+COLMAP_THREAD_ENVIRONMENT_KEYS = (
+    "BLIS_NUM_THREADS",
+    "GOMP_CPU_AFFINITY",
+    "GOMP_SPINCOUNT",
+    "GOMP_STACKSIZE",
+    "GOTO_NUM_THREADS",
+    "KMP_AFFINITY",
+    "KMP_ALL_THREADS",
+    "KMP_BLOCKTIME",
+    "KMP_DETERMINISTIC_REDUCTION",
+    "KMP_DEVICE_THREAD_LIMIT",
+    "KMP_HW_SUBSET",
+    "KMP_LIBRARY",
+    "KMP_PLACE_THREADS",
+    "KMP_SETTINGS",
+    "KMP_STACKSIZE",
+    "KMP_TEAMS_THREAD_LIMIT",
+    "MKL_DOMAIN_NUM_THREADS",
+    "MKL_DYNAMIC",
+    "MKL_NUM_THREADS",
+    "OMP_DYNAMIC",
+    "OMP_MAX_ACTIVE_LEVELS",
+    "OMP_NESTED",
+    "OMP_NUM_THREADS",
+    "OMP_PLACES",
+    "OMP_PROC_BIND",
+    "OMP_SCHEDULE",
+    "OMP_STACKSIZE",
+    "OMP_THREAD_LIMIT",
+    "OMP_WAIT_POLICY",
+    "OPENBLAS_NUM_THREADS",
+    "VECLIB_MAXIMUM_THREADS",
+)
+COLMAP_THREAD_ENVIRONMENT_KEYS_SHA256 = "sha256:" + hashlib.sha256(
+    json.dumps(
+        list(COLMAP_THREAD_ENVIRONMENT_KEYS),
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+).hexdigest()
 LANE_REFERENCE = "reference_m4_max"
 LANE_CONSTRAINED = "constrained_14_16gb"
 LANE_EIGHT_GB = "eight_gb_fast"
@@ -64,6 +110,9 @@ MAX_HOST_MONITOR_BYTES = 64 * 1024 * 1024
 MAX_LANE_OUTCOME_BYTES = 1024 * 1024
 MAX_ATTESTATION_BYTES = 16 * 1024 * 1024
 MAX_OBSERVATIONS_BYTES = 256 * 1024 * 1024
+MAX_WORKER_EXECUTION_ARTIFACT_BYTES = 2 * 1024 * 1024
+MAX_GEOMETRY_MANIFEST_BYTES = 16 * 1024 * 1024
+MAX_WORKER_INVOCATIONS_PER_STAGE = 4_096
 MAX_EXTERNAL_CPU_FRACTION = 0.10
 MAX_UNATTRIBUTED_CHILD_CPU_FRACTION = 0.02
 ALLOWED_GATE_SCOPES = {
@@ -1401,6 +1450,7 @@ def _validate_mapper_invocations(
     request: Mapping[str, Any],
     *,
     valid_outcome: bool,
+    geometry_execution: Mapping[str, Any] | None = None,
 ) -> None:
     if not isinstance(raw, list):
         raise EvidenceError("mapper_invocations must be an ordered array")
@@ -1416,6 +1466,7 @@ def _validate_mapper_invocations(
             {
                 "argv",
                 "outcome",
+                "mapping_attempt_ordinal",
                 "matching_attempt",
                 "pair_list_digest",
                 "descriptor_matcher",
@@ -1424,6 +1475,21 @@ def _validate_mapper_invocations(
         )
         if invocation["outcome"] not in {"accepted", "rejected_geometry_gate"}:
             raise EvidenceError(f"mapper_invocations[{index}].outcome is invalid")
+        mapping_attempt_ordinal = invocation["mapping_attempt_ordinal"]
+        if (
+            type(mapping_attempt_ordinal) is not int
+            or not 1
+            <= mapping_attempt_ordinal
+            <= MAXIMUM_MAPPING_ATTEMPT_ORDINAL
+            or (
+                invocations
+                and mapping_attempt_ordinal
+                <= invocations[-1]["mapping_attempt_ordinal"]
+            )
+        ):
+            raise EvidenceError(
+                "mapper_invocations mapping-attempt ordinals must strictly increase"
+            )
         matching_attempt = invocation["matching_attempt"]
         if type(matching_attempt) is not int or matching_attempt <= 0:
             raise EvidenceError(
@@ -1442,6 +1508,60 @@ def _validate_mapper_invocations(
         index for index, invocation in enumerate(invocations)
         if invocation["outcome"] == "accepted"
     ]
+    if geometry_execution is not None:
+        outer_ordinals = [
+            invocation["mapping_attempt_ordinal"] for invocation in invocations
+        ]
+        if outer_ordinals != geometry_execution["successful_mapper_attempt_ordinals"]:
+            raise EvidenceError(
+                "mapper invocation ordinals do not match successful worker mapping attempts"
+            )
+    if geometry_execution is not None and geometry_execution["refinement_kind"] == (
+        "seededBundleAdjustment"
+    ):
+        if accepted:
+            raise EvidenceError(
+                "seeded geometry cannot claim an accepted incremental mapper invocation"
+            )
+        if variant not in {"candidate", "fast_candidate"}:
+            raise EvidenceError("seeded geometry is only valid for candidate execution")
+        initial_cadence = _candidate_mapper_cadence(
+            request["candidate_run_configuration"]
+        )
+        topology = request["candidate_run_configuration"]["input_topology"]
+        for index, invocation in enumerate(invocations):
+            expected_cadence = (
+                (1.4, 1.4, 5, 2)
+                if topology == "continuous" and index > 0
+                else initial_cadence
+            )
+            _validate_mapper_invocation_argv(
+                invocation["argv"],
+                variant,
+                expected_cadence=expected_cadence,
+                label=f"seeded fallback rejected mapper invocation {index}",
+            )
+            if index == 0:
+                continue
+            previous = invocations[index - 1]
+            same_first_graph_retry = topology == "continuous" and index == 1
+            if same_first_graph_retry:
+                if any(
+                    invocation[field] != previous[field]
+                    for field in (
+                        "matching_attempt",
+                        "pair_list_digest",
+                        "descriptor_matcher",
+                    )
+                ):
+                    raise EvidenceError(
+                        "seeded conservative retry must reuse the fast mapper pair graph"
+                    )
+            elif invocation["matching_attempt"] <= previous["matching_attempt"]:
+                raise EvidenceError(
+                    "seeded mapper matching attempts must increase after rematching"
+                )
+        return
     if len(accepted) != 1:
         raise EvidenceError("mapper_invocations require exactly one accepted invocation")
     if accepted[0] != len(invocations) - 1:
@@ -1452,6 +1572,14 @@ def _validate_mapper_invocations(
     ):
         raise EvidenceError(
             "every mapper invocation before the accepted final invocation must fail its geometry gate"
+        )
+    if (
+        geometry_execution is not None
+        and invocations[accepted[0]]["mapping_attempt_ordinal"]
+        != geometry_execution["accepted_mapping_attempt_ordinal"]
+    ):
+        raise EvidenceError(
+            "accepted mapper ordinal does not match the geometry accepted attempt"
         )
 
     if variant in {"baseline", "accurate_reference"}:
@@ -1470,6 +1598,39 @@ def _validate_mapper_invocations(
     initial_cadence = _candidate_mapper_cadence(request["candidate_run_configuration"])
     topology = request["candidate_run_configuration"]["input_topology"]
     planned_matcher = request["candidate_run_configuration"]["descriptor_matcher"]
+
+    def validate_accepted_geometry(expected_cadence: tuple[float, float, int, int]) -> None:
+        if geometry_execution is None:
+            return
+        if geometry_execution["refinement_kind"] != "incrementalGlobal":
+            raise EvidenceError("incremental mapper receipt contradicts the geometry route")
+        cadence = _mapping(
+            geometry_execution["incremental_cadence"],
+            "geometry accepted mapper cadence",
+        )
+        expected_manifest_cadence = {
+            "localMaxRefinements": expected_cadence[3],
+            "globalFramesRatio": expected_cadence[0],
+            "globalPointsRatio": expected_cadence[1],
+            "globalMaxRefinements": expected_cadence[2],
+            "localMaxNumIterations": 10,
+            "localFunctionTolerance": 0.001,
+            "globalFunctionTolerance": 0.000_001,
+            "localImageCount": 6,
+        }
+        if dict(cadence) != expected_manifest_cadence:
+            raise EvidenceError(
+                "geometry accepted mapper cadence contradicts the execution receipt"
+            )
+        accepted_invocation = invocations[accepted[0]]
+        if accepted_invocation["pair_list_digest"] != geometry_execution["pair_list_digest"]:
+            raise EvidenceError(
+                "geometry pair-list digest contradicts the accepted mapper receipt"
+            )
+        if accepted_invocation["descriptor_matcher"] != geometry_execution["accepted_matcher"]:
+            raise EvidenceError(
+                "geometry matcher contradicts the accepted mapper receipt"
+            )
     first_invocation = invocations[0]
     if first_invocation["descriptor_matcher"] != planned_matcher:
         if (
@@ -1506,6 +1667,7 @@ def _validate_mapper_invocations(
                 and invocation["descriptor_matcher"] == "faiss"
             ):
                 raise EvidenceError("mapper recovery cannot return from exact to faiss matching")
+        validate_accepted_geometry(initial_cadence)
         return
 
     _validate_mapper_invocation_argv(
@@ -1515,6 +1677,7 @@ def _validate_mapper_invocations(
         label="continuous candidate fast 4.0/1 invocation",
     )
     if len(invocations) == 1:
+        validate_accepted_geometry(initial_cadence)
         return
     for index, invocation in enumerate(invocations[1:], start=1):
         _validate_mapper_invocation_argv(
@@ -1549,6 +1712,7 @@ def _validate_mapper_invocations(
             and invocation["descriptor_matcher"] == "faiss"
         ):
             raise EvidenceError("mapper recovery cannot return from exact to faiss matching")
+    validate_accepted_geometry((1.4, 1.4, 5, 2))
 
 
 def _expected_variant_identity(
@@ -1602,14 +1766,1020 @@ def _read_command_log(path: Path) -> list[Any]:
         raise EvidenceError("command_log is not valid JSONL") from error
 
 
+def _validate_worker_invocations(
+    value: Any,
+    *,
+    context: str,
+    allowed_commands: frozenset[str],
+    expected_policy: str,
+    expected_worker_count: int | None,
+    expects_mapping_attempt_ordinal: bool,
+    required: bool,
+) -> None:
+    if not isinstance(value, list):
+        raise EvidenceError(f"{context} must be an invocation array")
+    if len(value) > MAX_WORKER_INVOCATIONS_PER_STAGE:
+        raise EvidenceError(f"{context} contains too many invocations")
+    if required and not value:
+        raise EvidenceError(f"{context} is missing required execution evidence")
+    invocation_fields = {
+        "command",
+        "mappingAttemptOrdinal",
+        "threadPolicy",
+        "argvWorkerCount",
+        "explicitThreadEnvironment",
+        "removedThreadEnvironmentKeysSHA256",
+        "effectiveSanitizedThreadEnvironment",
+        "exitStatus",
+        "succeeded",
+    }
+    previous_mapping_attempt_ordinal = 0
+    for index, raw in enumerate(value):
+        invocation_context = f"{context}[{index}]"
+        invocation = _mapping(raw, invocation_context)
+        _exact_keys(invocation, invocation_fields, invocation_context)
+        command = invocation["command"]
+        if (
+            not isinstance(command, str)
+            or not command
+            or len(command) > 64
+            or re.fullmatch(r"[A-Za-z][A-Za-z0-9]*", command) is None
+        ):
+            raise EvidenceError(f"{invocation_context} command is invalid")
+        if command not in allowed_commands:
+            raise EvidenceError(f"{invocation_context} command belongs to another stage")
+        mapping_attempt_ordinal = invocation["mappingAttemptOrdinal"]
+        if expects_mapping_attempt_ordinal:
+            if (
+                type(mapping_attempt_ordinal) is not int
+                or not 1
+                <= mapping_attempt_ordinal
+                <= MAXIMUM_MAPPING_ATTEMPT_ORDINAL
+                or mapping_attempt_ordinal < previous_mapping_attempt_ordinal
+            ):
+                raise EvidenceError(
+                    f"{invocation_context} mapping-attempt ordinal is invalid"
+                )
+            previous_mapping_attempt_ordinal = mapping_attempt_ordinal
+        elif mapping_attempt_ordinal is not None:
+            raise EvidenceError(
+                f"{invocation_context} cannot claim a mapping-attempt ordinal"
+            )
+        if invocation["threadPolicy"] != expected_policy:
+            raise EvidenceError(f"{invocation_context} thread policy is invalid")
+        exit_status = invocation["exitStatus"]
+        succeeded = invocation["succeeded"]
+        if (
+            type(exit_status) is not int
+            or not 0 <= exit_status <= 2_147_483_647
+            or type(succeeded) is not bool
+            or succeeded != (exit_status == 0)
+        ):
+            raise EvidenceError(f"{invocation_context} process status is inconsistent")
+        if (
+            invocation["removedThreadEnvironmentKeysSHA256"]
+            != COLMAP_THREAD_ENVIRONMENT_KEYS_SHA256
+        ):
+            raise EvidenceError(f"{invocation_context} sanitizer digest is invalid")
+        explicit_environment = _mapping(
+            invocation["explicitThreadEnvironment"],
+            f"{invocation_context}.explicitThreadEnvironment",
+        )
+        effective_environment = _mapping(
+            invocation["effectiveSanitizedThreadEnvironment"],
+            f"{invocation_context}.effectiveSanitizedThreadEnvironment",
+        )
+        if expected_policy == "bounded":
+            expected_environment = {
+                "OMP_NUM_THREADS": str(expected_worker_count),
+                "OPENBLAS_NUM_THREADS": str(expected_worker_count),
+                "MKL_NUM_THREADS": str(expected_worker_count),
+            }
+            if (
+                type(invocation["argvWorkerCount"]) is not int
+                or invocation["argvWorkerCount"] != expected_worker_count
+                or dict(explicit_environment) != expected_environment
+                or dict(effective_environment) != expected_environment
+            ):
+                raise EvidenceError(f"{invocation_context} bounded worker launch is invalid")
+        elif (
+            invocation["argvWorkerCount"] is not None
+            or explicit_environment
+            or effective_environment
+        ):
+            raise EvidenceError(f"{invocation_context} native-auto launch is invalid")
+
+
+def _load_runtime_json_artifact(
+    artifact_root: Path,
+    relative_path: PurePosixPath,
+    expected_sha256: str,
+    label: str,
+    maximum_bytes: int,
+) -> Any:
+    descriptor = _open_render_artifact(artifact_root, relative_path, label)
+    try:
+        before = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(before.st_mode)
+            or before.st_nlink != 1
+            or not 0 < before.st_size <= maximum_bytes
+        ):
+            raise EvidenceError(f"{label} must be a bounded single-link regular file")
+        chunks = []
+        total = 0
+        while True:
+            try:
+                chunk = os.read(descriptor, 256 * 1024)
+            except InterruptedError:
+                continue
+            if not chunk:
+                break
+            total += len(chunk)
+            if total > maximum_bytes:
+                raise EvidenceError(f"{label} exceeds its size limit")
+            chunks.append(chunk)
+        after = os.fstat(descriptor)
+    except EvidenceError:
+        raise
+    except OSError as error:
+        raise EvidenceError(f"{label} could not be read safely") from error
+    finally:
+        os.close(descriptor)
+    stable_fields = (
+        "st_dev",
+        "st_ino",
+        "st_mode",
+        "st_size",
+        "st_mtime_ns",
+        "st_ctime_ns",
+        "st_nlink",
+    )
+    if any(getattr(before, field) != getattr(after, field) for field in stable_fields):
+        raise EvidenceError(f"{label} changed while it was read")
+    encoded = b"".join(chunks)
+    if sha256_bytes(encoded) != expected_sha256:
+        raise EvidenceError(f"{label} digest changed after artifact attestation")
+    try:
+        decoded = _decode_json_text(encoded.decode("utf-8"), label)
+    except UnicodeError as error:
+        raise EvidenceError(f"{label} is not valid UTF-8 JSON") from error
+    if encoded != canonical_json_bytes(decoded):
+        raise EvidenceError(f"{label} is not canonical JSON")
+    return decoded
+
+
+def _validate_pair_graph_artifact(
+    value: Any,
+    *,
+    total_view_count: int,
+) -> tuple[str, bool]:
+    context = "geometry manifest pair graph"
+    pair_graph = _mapping(value, context)
+    _exact_keys(
+        pair_graph,
+        {"status", "measurement", "usedLocalVocabularyRetrieval"},
+        context,
+    )
+    status = pair_graph["status"]
+    retrieval_used = pair_graph["usedLocalVocabularyRetrieval"]
+    if (
+        not isinstance(status, str)
+        or status not in {"measured", "notEvaluated"}
+        or type(retrieval_used) is not bool
+    ):
+        raise EvidenceError(f"{context} is invalid")
+    if status == "notEvaluated":
+        if pair_graph["measurement"] is not None or retrieval_used:
+            raise EvidenceError(f"{context} is invalid")
+        return status, retrieval_used
+
+    measurement = _mapping(pair_graph["measurement"], f"{context} measurement")
+    measurement_fields = {
+        "pairingPolicy",
+        "scheduledPairCount",
+        "attemptedPairCount",
+        "rawMatchedPairCount",
+        "spatiallyVerifiedPairCount",
+        "localPairCount",
+        "retrievalPairCount",
+        "loopRevisitPairCount",
+        "connectedComponentCount",
+        "isolatedViewCount",
+        "descriptorlessViewCount",
+        "componentViewCounts",
+        "articulationViewCount",
+        "biconnectedBlockCount",
+        "largestBiconnectedBlockViewCount",
+        "secondLargestBiconnectedBlockViewCount",
+        "degreeP10",
+        "degreeMedian",
+        "degreeP90",
+        "matcherAttempts",
+        "pairListDigest",
+        "featureDatabaseDigest",
+        "matchingDatabaseDigest",
+        "matchingDurationSeconds",
+    }
+    _exact_keys(measurement, measurement_fields, f"{context} measurement")
+    if measurement["pairingPolicy"] not in {
+        "unorderedRetrieval",
+        "segmentedMixed",
+        "orderedContinuous",
+        "orderedOrbit",
+        "orderedWalkthrough",
+        "orderedLargeArea",
+    }:
+        raise EvidenceError(f"{context} measurement is invalid")
+    count_fields = {
+        "scheduledPairCount",
+        "attemptedPairCount",
+        "rawMatchedPairCount",
+        "spatiallyVerifiedPairCount",
+        "localPairCount",
+        "retrievalPairCount",
+        "loopRevisitPairCount",
+        "connectedComponentCount",
+        "isolatedViewCount",
+        "descriptorlessViewCount",
+        "articulationViewCount",
+        "biconnectedBlockCount",
+        "largestBiconnectedBlockViewCount",
+        "secondLargestBiconnectedBlockViewCount",
+        "degreeP10",
+        "degreeMedian",
+        "degreeP90",
+    }
+    if any(
+        type(measurement[field]) is not int or measurement[field] < 0
+        for field in count_fields
+    ):
+        raise EvidenceError(f"{context} measurement is invalid")
+    scheduled = measurement["scheduledPairCount"]
+    attempted = measurement["attemptedPairCount"]
+    raw_matched = measurement["rawMatchedPairCount"]
+    verified = measurement["spatiallyVerifiedPairCount"]
+    role_count = (
+        measurement["localPairCount"]
+        + measurement["retrievalPairCount"]
+        + measurement["loopRevisitPairCount"]
+    )
+    component_counts = measurement["componentViewCounts"]
+    if (
+        not 0 <= verified <= raw_matched <= attempted <= scheduled
+        or role_count != scheduled
+        or not isinstance(component_counts, list)
+        or not component_counts
+        or any(type(count) is not int or count <= 0 for count in component_counts)
+        or sum(component_counts)
+        + measurement["isolatedViewCount"]
+        + measurement["descriptorlessViewCount"]
+        != total_view_count
+        or measurement["connectedComponentCount"] != len(component_counts)
+        or measurement["degreeP10"] > measurement["degreeMedian"]
+        or measurement["degreeMedian"] > measurement["degreeP90"]
+        or measurement["degreeP90"] >= max(component_counts)
+    ):
+        raise EvidenceError(f"{context} measurement is invalid")
+    for digest_field in (
+        "pairListDigest",
+        "featureDatabaseDigest",
+        "matchingDatabaseDigest",
+    ):
+        digest = measurement[digest_field]
+        if not isinstance(digest, str) or re.fullmatch(r"[0-9a-f]{64}", digest) is None:
+            raise EvidenceError(f"{context} measurement is invalid")
+    duration = measurement["matchingDurationSeconds"]
+    attempts = measurement["matcherAttempts"]
+    if (
+        isinstance(duration, bool)
+        or not isinstance(duration, (int, float))
+        or not math.isfinite(duration)
+        or duration < 0
+        or not isinstance(attempts, list)
+        or not attempts
+        or len(attempts) > 4
+    ):
+        raise EvidenceError(f"{context} measurement is invalid")
+    attempt_fields = {
+        "attemptNumber",
+        "matcher",
+        "recoveryLevel",
+        "outcome",
+        "scheduledPairCount",
+        "attemptedPairCount",
+        "rawMatchedPairCount",
+        "spatiallyVerifiedPairCount",
+        "durationSeconds",
+    }
+    measured_duration = 0.0
+    for index, raw_attempt in enumerate(attempts, start=1):
+        attempt = _mapping(raw_attempt, f"{context} matcher attempt {index}")
+        _exact_keys(attempt, attempt_fields, f"{context} matcher attempt {index}")
+        attempt_duration = attempt["durationSeconds"]
+        attempt_counts = [
+            attempt["scheduledPairCount"],
+            attempt["attemptedPairCount"],
+            attempt["rawMatchedPairCount"],
+            attempt["spatiallyVerifiedPairCount"],
+        ]
+        if (
+            type(attempt["attemptNumber"]) is not int
+            or attempt["attemptNumber"] != index
+            or attempt["matcher"] not in {"faiss", "exact"}
+            or attempt["recoveryLevel"] not in {"normal", "expanded", "maximum"}
+            or attempt["outcome"] not in {"completed", "rejected", "failed"}
+            or any(type(count) is not int or count < 0 for count in attempt_counts)
+            or not 0 <= attempt_counts[3] <= attempt_counts[2] <= attempt_counts[1] <= attempt_counts[0]
+            or (
+                attempt["outcome"] != "failed"
+                and attempt["attemptedPairCount"] != attempt["scheduledPairCount"]
+            )
+            or isinstance(attempt_duration, bool)
+            or not isinstance(attempt_duration, (int, float))
+            or not math.isfinite(attempt_duration)
+            or attempt_duration < 0
+        ):
+            raise EvidenceError(f"{context} matcher attempt is invalid")
+        measured_duration += float(attempt_duration)
+    accepted_attempt = attempts[-1]
+    if (
+        attempts[0]["matcher"] != "faiss"
+        or attempts[0]["recoveryLevel"] != "normal"
+        or accepted_attempt["outcome"] != "completed"
+        or accepted_attempt["scheduledPairCount"] != scheduled
+        or accepted_attempt["attemptedPairCount"] != attempted
+        or accepted_attempt["rawMatchedPairCount"] != raw_matched
+        or accepted_attempt["spatiallyVerifiedPairCount"] != verified
+        or not math.isclose(measured_duration, float(duration), rel_tol=1e-12, abs_tol=1e-12)
+    ):
+        raise EvidenceError(f"{context} measurement is invalid")
+    return status, retrieval_used
+
+
+def _validate_runtime_worker_evidence(
+    value: Any,
+    candidate_configuration: Mapping[str, Any],
+    request: Mapping[str, Any],
+    execution_variant: str,
+    run_id: str,
+    artifact_root: Path,
+    descriptors: Mapping[str, Any],
+    used_artifacts: set[str],
+    context: str,
+    pipeline_metrics: Mapping[str, Any] | None,
+) -> dict[str, Any]:
+    receipt = _mapping(value, context)
+    _exact_keys(
+        receipt,
+        {
+            "artifact_name",
+            "artifact_sha256",
+            "geometry_manifest_name",
+            "geometry_manifest_sha256",
+            "geometry_input_digest",
+            "selected_frames_digest",
+        },
+        context,
+    )
+    artifact_name = _token(receipt["artifact_name"], f"{context}.artifact_name")
+    receipt_digest = _digest(
+        receipt["artifact_sha256"],
+        f"{context}.artifact_sha256",
+    )
+    geometry_name = _token(
+        receipt["geometry_manifest_name"],
+        f"{context}.geometry_manifest_name",
+    )
+    geometry_digest = _digest(
+        receipt["geometry_manifest_sha256"],
+        f"{context}.geometry_manifest_sha256",
+    )
+    geometry_input_digest = _digest(
+        receipt["geometry_input_digest"],
+        f"{context}.geometry_input_digest",
+    )
+    selected_frames_digest = _digest(
+        receipt["selected_frames_digest"],
+        f"{context}.selected_frames_digest",
+    )
+    reference_artifacts = _mapping(
+        request["reference_artifacts"],
+        "request.reference_artifacts",
+    )
+    protected_geometry_input_digest = _digest(
+        reference_artifacts["geometry_input_digest"],
+        "request.reference_artifacts.geometry_input_digest",
+    )
+    selected_frame_digests = _mapping(
+        reference_artifacts["selected_frames_digests"],
+        "request.reference_artifacts.selected_frames_digests",
+    )
+    if execution_variant not in {"candidate", "fast_candidate"}:
+        raise EvidenceError("runtime geometry execution variant is invalid")
+    expected_selected_frames_digest = _digest(
+        selected_frame_digests[execution_variant],
+        "request.reference_artifacts selected-frame digest",
+    )
+    if geometry_input_digest != protected_geometry_input_digest:
+        raise EvidenceError(
+            "runtime geometry input digest does not match the protected input"
+        )
+    if selected_frames_digest != expected_selected_frames_digest:
+        raise EvidenceError(
+            "runtime geometry selected-frame digest does not match the protected selected frames"
+        )
+    if artifact_name == geometry_name:
+        raise EvidenceError("worker and geometry artifacts must use distinct descriptors")
+    if artifact_name in used_artifacts or geometry_name in used_artifacts:
+        raise EvidenceError("runtime worker artifact cannot be reused across runs")
+    used_artifacts.update({artifact_name, geometry_name})
+    descriptor = _mapping(
+        descriptors.get(artifact_name),
+        f"artifacts.{artifact_name}",
+    )
+    _exact_keys(descriptor, {"path", "sha256", "bytes"}, f"artifacts.{artifact_name}")
+    expected_path = f"worker-runs/{run_id}/SfM/worker_execution.json"
+    if descriptor["path"] != expected_path:
+        raise EvidenceError("runtime worker artifact path does not match its execution run")
+    if descriptor["sha256"] != receipt_digest:
+        raise EvidenceError("runtime worker artifact digest does not match its receipt")
+    if (
+        type(descriptor["bytes"]) is not int
+        or not 0 < descriptor["bytes"] <= MAX_WORKER_EXECUTION_ARTIFACT_BYTES
+    ):
+        raise EvidenceError("runtime worker artifact exceeds its size limit")
+    relative_path = PurePosixPath(expected_path)
+    artifact = _mapping(
+        _load_runtime_json_artifact(
+            artifact_root,
+            relative_path,
+            receipt_digest,
+            f"runtime worker artifact {run_id}",
+            MAX_WORKER_EXECUTION_ARTIFACT_BYTES,
+        ),
+        f"runtime worker artifact {run_id}",
+    )
+
+    geometry_descriptor = _mapping(
+        descriptors.get(geometry_name),
+        f"artifacts.{geometry_name}",
+    )
+    _exact_keys(
+        geometry_descriptor,
+        {"path", "sha256", "bytes"},
+        f"artifacts.{geometry_name}",
+    )
+    expected_geometry_path = f"worker-runs/{run_id}/SfM/geometry_manifest.json"
+    if geometry_descriptor["path"] != expected_geometry_path:
+        raise EvidenceError("geometry manifest path does not match its execution run")
+    if geometry_descriptor["sha256"] != geometry_digest:
+        raise EvidenceError("geometry manifest digest does not match its receipt")
+    if (
+        type(geometry_descriptor["bytes"]) is not int
+        or not 0 < geometry_descriptor["bytes"] <= MAX_GEOMETRY_MANIFEST_BYTES
+    ):
+        raise EvidenceError("geometry manifest exceeds its size limit")
+    geometry = _mapping(
+        _load_runtime_json_artifact(
+            artifact_root,
+            PurePosixPath(expected_geometry_path),
+            geometry_digest,
+            f"geometry manifest {run_id}",
+            MAX_GEOMETRY_MANIFEST_BYTES,
+        ),
+        f"geometry manifest {run_id}",
+    )
+    geometry_context = f"geometry manifest {run_id}"
+    required_geometry_fields = {
+        "schemaVersion",
+        "inputDigest",
+        "selectedFramesDigest",
+        "orderedImageNames",
+        "orderedImageTimestamps",
+        "totalViewCount",
+        "pairGraph",
+        "mapping",
+        "workerExecution",
+    }
+    missing_geometry_fields = required_geometry_fields - set(geometry)
+    if missing_geometry_fields:
+        raise EvidenceError(
+            f"{geometry_context} is missing required fields: "
+            + ", ".join(sorted(missing_geometry_fields))
+        )
+    if (
+        type(geometry["schemaVersion"]) is not int
+        or geometry["schemaVersion"] != GEOMETRY_ARTIFACT_SCHEMA_VERSION
+    ):
+        raise EvidenceError("geometry manifest schema is invalid")
+    input_digest = geometry["inputDigest"]
+    if (
+        not isinstance(input_digest, str)
+        or re.fullmatch(r"[0-9a-f]{64}", input_digest) is None
+        or f"sha256:{input_digest}" != geometry_input_digest
+    ):
+        raise EvidenceError("geometry manifest input digest does not match its receipt")
+    manifest_selected_digest = geometry["selectedFramesDigest"]
+    if (
+        not isinstance(manifest_selected_digest, str)
+        or re.fullmatch(r"[0-9a-f]{64}", manifest_selected_digest) is None
+        or f"sha256:{manifest_selected_digest}" != selected_frames_digest
+    ):
+        raise EvidenceError("geometry manifest selected-frame digest is invalid")
+    total_view_count = geometry["totalViewCount"]
+    image_names = geometry["orderedImageNames"]
+    image_timestamps = geometry["orderedImageTimestamps"]
+    if (
+        type(total_view_count) is not int
+        or total_view_count != candidate_configuration["selected_frame_count"]
+        or not isinstance(image_names, list)
+        or len(image_names) != total_view_count
+        or any(
+            not isinstance(name, str)
+            or not name
+            or len(name.encode("utf-8")) > 255
+            or "/" in name
+            or "\\" in name
+            or name in {".", ".."}
+            for name in image_names
+        )
+        or len(set(image_names)) != total_view_count
+        or not isinstance(image_timestamps, list)
+        or len(image_timestamps) != total_view_count
+        or any(
+            timestamp is not None
+            and (
+                isinstance(timestamp, bool)
+                or not isinstance(timestamp, (int, float))
+                or not math.isfinite(timestamp)
+                or timestamp < 0
+            )
+            for timestamp in image_timestamps
+        )
+    ):
+        raise EvidenceError("geometry manifest selected-frame identity is invalid")
+    if canonical_json_bytes(geometry["workerExecution"]) != canonical_json_bytes(artifact):
+        raise EvidenceError(
+            "geometry manifest embedded worker execution does not match the standalone artifact"
+        )
+    artifact_fields = {
+        "schemaVersion",
+        "resolvedBudget",
+        "featureExtractionInvocations",
+        "matchingInvocations",
+        "vocabularyRetrievalInvocations",
+        "mappingAndRefinementInvocations",
+        "videoSourceAnalysis",
+    }
+    _exact_keys(artifact, artifact_fields, f"runtime worker artifact {run_id}")
+    if (
+        type(artifact["schemaVersion"]) is not int
+        or artifact["schemaVersion"] != GEOMETRY_WORKER_EXECUTION_SCHEMA_VERSION
+    ):
+        raise EvidenceError("runtime worker artifact schema is invalid")
+
+    budget_fields = {
+        "featureExtractionWorkers": "feature_extraction_workers",
+        "coupledMatchingWorkers": "coupled_matching_workers",
+        "vocabularyRetrievalWorkers": "vocabulary_retrieval_workers",
+        "maximumConcurrentVideoSourceAnalysisTasks": (
+            "maximum_concurrent_video_source_analysis_tasks"
+        ),
+    }
+    resolved_budget = _mapping(
+        artifact["resolvedBudget"],
+        f"runtime worker artifact {run_id}.resolvedBudget",
+    )
+    _exact_keys(
+        resolved_budget,
+        set(budget_fields),
+        f"runtime worker artifact {run_id}.resolvedBudget",
+    )
+    expected_budget = {
+        artifact_field: candidate_configuration[configuration_field]
+        for artifact_field, configuration_field in budget_fields.items()
+    }
+    if (
+        any(
+            type(resolved_budget[field]) is not int
+            or not 1 <= resolved_budget[field] <= 64
+            for field in budget_fields
+        )
+        or dict(resolved_budget) != expected_budget
+    ):
+        raise EvidenceError("runtime worker budget does not match the bound request")
+
+    artifact_context = f"runtime worker artifact {run_id}"
+    _validate_worker_invocations(
+        artifact["featureExtractionInvocations"],
+        context=f"{artifact_context}.featureExtractionInvocations",
+        allowed_commands=frozenset({"featureExtractor", "featureImporter"}),
+        expected_policy="bounded",
+        expected_worker_count=expected_budget["featureExtractionWorkers"],
+        expects_mapping_attempt_ordinal=False,
+        required=False,
+    )
+    _validate_worker_invocations(
+        artifact["matchingInvocations"],
+        context=f"{artifact_context}.matchingInvocations",
+        allowed_commands=frozenset({"matchesImporter"}),
+        expected_policy="bounded",
+        expected_worker_count=expected_budget["coupledMatchingWorkers"],
+        expects_mapping_attempt_ordinal=False,
+        required=False,
+    )
+    _validate_worker_invocations(
+        artifact["vocabularyRetrievalInvocations"],
+        context=f"{artifact_context}.vocabularyRetrievalInvocations",
+        allowed_commands=frozenset({"localVocabularyRetriever"}),
+        expected_policy="bounded",
+        expected_worker_count=expected_budget["vocabularyRetrievalWorkers"],
+        expects_mapping_attempt_ordinal=False,
+        required=False,
+    )
+    _validate_worker_invocations(
+        artifact["mappingAndRefinementInvocations"],
+        context=f"{artifact_context}.mappingAndRefinementInvocations",
+        allowed_commands=frozenset(
+            {
+                "mapper",
+                "pointTriangulator",
+                "bundleAdjuster",
+                "modelAnalyzer",
+                "modelConverter",
+            }
+        ),
+        expected_policy="nativeAuto",
+        expected_worker_count=None,
+        expects_mapping_attempt_ordinal=True,
+        required=True,
+    )
+    for invocations in (
+        artifact["featureExtractionInvocations"],
+        artifact["matchingInvocations"],
+        artifact["mappingAndRefinementInvocations"],
+    ):
+        if invocations and not any(item["succeeded"] for item in invocations):
+            raise EvidenceError(
+                "required worker stage has no successful invocation"
+            )
+
+    pair_graph_status, retrieval_used = _validate_pair_graph_artifact(
+        geometry["pairGraph"],
+        total_view_count=total_view_count,
+    )
+    if pair_graph_status == "measured" and (
+        not any(item["succeeded"] for item in artifact["featureExtractionInvocations"])
+        or not any(item["succeeded"] for item in artifact["matchingInvocations"])
+    ):
+        raise EvidenceError(
+            "measured COLMAP geometry requires successful feature and matching execution"
+        )
+    successful_retrieval = any(
+        item["command"] == "localVocabularyRetriever" and item["succeeded"]
+        for item in artifact["vocabularyRetrievalInvocations"]
+    )
+    retrieval_configured = (
+        candidate_configuration["vocabulary_candidate_count"] > 0
+        and candidate_configuration["vocabulary_verified_neighbor_count"] > 0
+    )
+    if pair_graph_status == "measured":
+        if retrieval_used != retrieval_configured:
+            raise EvidenceError(
+                "runtime vocabulary retrieval does not match the resolved retrieval policy"
+            )
+        if successful_retrieval != retrieval_used:
+            if successful_retrieval:
+                raise EvidenceError("runtime vocabulary retrieval was unscheduled")
+            raise EvidenceError(
+                "runtime vocabulary retrieval disagrees with the accepted pair graph"
+            )
+    elif retrieval_used or successful_retrieval:
+        raise EvidenceError(
+            "unmeasured seeded geometry cannot claim vocabulary retrieval execution"
+        )
+    pair_measurement: Mapping[str, Any] | None = None
+    accepted_matcher: str | None = None
+    pair_list_digest: str | None = None
+    if pair_graph_status == "measured":
+        pair_measurement = _mapping(
+            geometry["pairGraph"]["measurement"],
+            "geometry manifest pair graph measurement",
+        )
+        expected_pairing_policy = {
+            "generic_continuous": "orderedContinuous",
+            "object_orbit": "orderedOrbit",
+            "walkthrough": "orderedWalkthrough",
+            "large_area": "orderedLargeArea",
+            "segmented_mixed": "segmentedMixed",
+            "unordered_exhaustive": "unorderedRetrieval",
+            "unordered_retrieval": "unorderedRetrieval",
+        }[candidate_configuration["pairing_policy"]]
+        if pair_measurement["pairingPolicy"] != expected_pairing_policy:
+            raise EvidenceError(
+                "geometry manifest pairing policy contradicts the protected request"
+            )
+        metric_fields = {
+            "scheduledPairCount": "scheduled_pairs",
+            "attemptedPairCount": "attempted_pairs",
+            "rawMatchedPairCount": "raw_matched_pairs",
+            "spatiallyVerifiedPairCount": "spatially_verified_pairs",
+            "localPairCount": "local_pairs",
+            "retrievalPairCount": "retrieval_pairs",
+            "loopRevisitPairCount": "loop_pairs",
+            "connectedComponentCount": "connected_components",
+            "isolatedViewCount": "isolated_views",
+            "articulationViewCount": "articulation_views",
+            "biconnectedBlockCount": "biconnected_blocks",
+            "largestBiconnectedBlockViewCount": "largest_biconnected_block_views",
+            "secondLargestBiconnectedBlockViewCount": (
+                "second_largest_biconnected_block_views"
+            ),
+        }
+        if pipeline_metrics is not None:
+            for manifest_field, metric_field in metric_fields.items():
+                if pair_measurement[manifest_field] != pipeline_metrics.get(metric_field):
+                    raise EvidenceError(
+                        f"geometry pair graph {manifest_field} does not match pipeline evidence"
+                    )
+            if not math.isclose(
+                float(pair_measurement["matchingDurationSeconds"]),
+                float(pipeline_metrics.get("matcher_seconds", math.nan)),
+                rel_tol=0,
+                abs_tol=1e-6,
+            ):
+                raise EvidenceError(
+                    "geometry pair graph matching duration does not match pipeline evidence"
+                )
+        accepted_attempt = pair_measurement["matcherAttempts"][-1]
+        accepted_matcher = accepted_attempt["matcher"]
+        pair_list_digest = "sha256:" + pair_measurement["pairListDigest"]
+
+    mapping_context = "geometry manifest mapping"
+    mapping = _mapping(geometry["mapping"], mapping_context)
+    _exact_keys(
+        mapping,
+        {
+            "modelCount",
+            "largestModelRegisteredViewCount",
+            "secondLargestModelRegisteredViewCount",
+            "unionRegisteredViewCount",
+            "attemptCount",
+            "acceptedMappingAttemptOrdinal",
+            "acceptedRefinementKind",
+            "acceptedRefinementInvocationCount",
+            "incrementalCadence",
+            "fallbackReason",
+        },
+        mapping_context,
+    )
+    mapping_count_fields = (
+        "modelCount",
+        "largestModelRegisteredViewCount",
+        "secondLargestModelRegisteredViewCount",
+        "unionRegisteredViewCount",
+        "attemptCount",
+        "acceptedMappingAttemptOrdinal",
+        "acceptedRefinementInvocationCount",
+    )
+    if any(type(mapping[field]) is not int for field in mapping_count_fields):
+        raise EvidenceError("geometry manifest mapping is invalid")
+    model_count = mapping["modelCount"]
+    largest_model = mapping["largestModelRegisteredViewCount"]
+    second_model = mapping["secondLargestModelRegisteredViewCount"]
+    union_views = mapping["unionRegisteredViewCount"]
+    accepted_mapping_attempt_ordinal = mapping["acceptedMappingAttemptOrdinal"]
+    refinement_count = mapping["acceptedRefinementInvocationCount"]
+    fallback_reason = mapping["fallbackReason"]
+    if refinement_count < 0:
+        raise EvidenceError("geometry has an invalid accepted refinement count")
+    if (
+        not 1 <= model_count <= union_views <= total_view_count
+        or largest_model < 1
+        or largest_model > union_views
+        or second_model < 0
+        or second_model > largest_model
+        or mapping["attemptCount"] < 1
+        or not 1
+        <= accepted_mapping_attempt_ordinal
+        <= MAXIMUM_MAPPING_ATTEMPT_ORDINAL
+        or (
+            fallback_reason is not None
+            and (
+                not isinstance(fallback_reason, str)
+                or not fallback_reason
+                or fallback_reason != fallback_reason.strip()
+                or len(fallback_reason.encode("utf-8")) > 1_024
+                or any(ord(character) < 32 for character in fallback_reason)
+            )
+        )
+        or (mapping["attemptCount"] > 1 and fallback_reason is None)
+    ):
+        raise EvidenceError("geometry manifest mapping is invalid")
+    refinement_kind = mapping["acceptedRefinementKind"]
+    mapping_invocations = artifact["mappingAndRefinementInvocations"]
+    maximum_mapping_attempt_ordinal = max(
+        item["mappingAttemptOrdinal"] for item in mapping_invocations
+    )
+    if accepted_mapping_attempt_ordinal != maximum_mapping_attempt_ordinal:
+        raise EvidenceError(
+            "geometry accepted mapping-attempt ordinal is not the final recorded attempt"
+        )
+    accepted_invocations = [
+        item
+        for item in mapping_invocations
+        if item["mappingAttemptOrdinal"] == accepted_mapping_attempt_ordinal
+    ]
+    accepted_commands = {item["command"] for item in accepted_invocations}
+    successful_mapper_attempt_ordinals = [
+        item["mappingAttemptOrdinal"]
+        for item in mapping_invocations
+        if item["command"] == "mapper" and item["succeeded"]
+    ]
+    if len(successful_mapper_attempt_ordinals) != len(
+        set(successful_mapper_attempt_ordinals)
+    ):
+        raise EvidenceError(
+            "worker evidence contains multiple successful mappers for one mapping attempt"
+        )
+
+    def successful_accepted_count(command: str) -> int:
+        return sum(
+            item["command"] == command and item["succeeded"]
+            for item in accepted_invocations
+        )
+
+    if refinement_kind == "incrementalGlobal":
+        if pair_graph_status != "measured":
+            raise EvidenceError(
+                "incremental geometry has an invalid pair graph"
+            )
+        cadence = _mapping(
+            mapping["incrementalCadence"],
+            "geometry manifest mapping incremental cadence",
+        )
+        cadence_fields = {
+            "localMaxRefinements",
+            "globalFramesRatio",
+            "globalPointsRatio",
+            "globalMaxRefinements",
+            "localMaxNumIterations",
+            "localFunctionTolerance",
+            "globalFunctionTolerance",
+            "localImageCount",
+        }
+        _exact_keys(
+            cadence,
+            cadence_fields,
+            "geometry manifest mapping incremental cadence",
+        )
+        for field in (
+            "localMaxRefinements",
+            "globalMaxRefinements",
+            "localMaxNumIterations",
+            "localImageCount",
+        ):
+            if type(cadence[field]) is not int or cadence[field] <= 0:
+                raise EvidenceError("geometry manifest mapping cadence is invalid")
+        for field in (
+            "globalFramesRatio",
+            "globalPointsRatio",
+            "localFunctionTolerance",
+            "globalFunctionTolerance",
+        ):
+            value = cadence[field]
+            if (
+                isinstance(value, bool)
+                or not isinstance(value, (int, float))
+                or not math.isfinite(value)
+                or value <= 0
+                or (field in {"globalFramesRatio", "globalPointsRatio"} and value <= 1)
+            ):
+                raise EvidenceError("geometry manifest mapping cadence is invalid")
+        accepted_mapper_invocations = [
+            item for item in accepted_invocations if item["command"] == "mapper"
+        ]
+        if (
+            not accepted_commands.issubset(
+                {"mapper", "modelAnalyzer", "modelConverter"}
+            )
+            or len(accepted_mapper_invocations) != 1
+            or not accepted_mapper_invocations[0]["succeeded"]
+            or successful_accepted_count("modelAnalyzer") < 1
+        ):
+            raise EvidenceError(
+                "incremental geometry accepted attempt has invalid mapper or analysis evidence"
+            )
+    elif refinement_kind == "seededBundleAdjustment":
+        if (
+            pair_graph_status != "notEvaluated"
+            or refinement_count != 1
+            or model_count != 1
+            or mapping["incrementalCadence"] is not None
+        ):
+            raise EvidenceError(
+                "seeded geometry has an invalid pair graph or accepted refinement count"
+            )
+        accepted_triangulator_invocations = [
+            item
+            for item in accepted_invocations
+            if item["command"] == "pointTriangulator"
+        ]
+        accepted_adjuster_invocations = [
+            item
+            for item in accepted_invocations
+            if item["command"] == "bundleAdjuster"
+        ]
+        if (
+            not accepted_commands.issubset(
+                {
+                    "pointTriangulator",
+                    "bundleAdjuster",
+                    "modelAnalyzer",
+                    "modelConverter",
+                }
+            )
+            or len(accepted_triangulator_invocations) != 1
+            or not accepted_triangulator_invocations[0]["succeeded"]
+            or len(accepted_adjuster_invocations) != 1
+            or not accepted_adjuster_invocations[0]["succeeded"]
+            or successful_accepted_count("modelAnalyzer") < 1
+            or not any(
+                item["succeeded"]
+                for item in artifact["featureExtractionInvocations"]
+            )
+            or not any(item["succeeded"] for item in artifact["matchingInvocations"])
+        ):
+            raise EvidenceError(
+                "seeded geometry accepted attempt has invalid triangulation, refinement, or analysis evidence"
+            )
+    else:
+        raise EvidenceError("geometry manifest accepted refinement kind is invalid")
+
+    video = _mapping(
+        artifact["videoSourceAnalysis"],
+        f"{artifact_context}.videoSourceAnalysis",
+    )
+    _exact_keys(
+        video,
+        {
+            "videoSourceCount",
+            "startedAnalysisTaskCount",
+            "peakInFlightAnalysisTaskCount",
+        },
+        f"{artifact_context}.videoSourceAnalysis",
+    )
+    if any(
+        type(video[field]) is not int
+        or not 0 <= video[field] <= 9_223_372_036_854_775_807
+        for field in (
+            "videoSourceCount",
+            "startedAnalysisTaskCount",
+            "peakInFlightAnalysisTaskCount",
+        )
+    ):
+        raise EvidenceError("runtime video-analysis worker evidence is invalid")
+    source_count = video["videoSourceCount"]
+    task_count = video["startedAnalysisTaskCount"]
+    observed_concurrency = video["peakInFlightAnalysisTaskCount"]
+    expected_source_count = request["video_source_count"]
+    if source_count != expected_source_count:
+        raise EvidenceError("runtime video source count does not match the protected request")
+    if expected_source_count == 0:
+        if (source_count, task_count, observed_concurrency) != (0, 0, 0):
+            raise EvidenceError("photo input cannot claim video-analysis execution")
+    elif (
+        source_count < 1
+        or not source_count <= task_count <= source_count * 2
+        or not 1 <= observed_concurrency <= min(
+            source_count,
+            expected_budget["maximumConcurrentVideoSourceAnalysisTasks"],
+        )
+    ):
+        raise EvidenceError("runtime video-analysis worker evidence is invalid")
+    return {
+        "refinement_kind": refinement_kind,
+        "accepted_mapping_attempt_ordinal": accepted_mapping_attempt_ordinal,
+        "incremental_cadence": mapping["incrementalCadence"],
+        "pair_list_digest": pair_list_digest,
+        "accepted_matcher": accepted_matcher,
+        "successful_mapper_attempt_ordinals": successful_mapper_attempt_ordinals,
+    }
+
+
 def _validate_execution_receipts(
     commands: Any,
     command_log_path: Path,
+    artifact_root: Path,
+    descriptors: Mapping[str, Any],
     request: Mapping[str, Any],
     runner_identity: Mapping[str, Any],
     timing: Mapping[str, Any] | None,
     actual: Mapping[str, Any],
     published_output_sha256: str | None,
+    pipeline_metrics: Mapping[str, Any] | None,
+    expected_pair_list_digest: str | None,
 ) -> list[dict[str, Any]]:
     if not isinstance(commands, list) or not commands:
         raise EvidenceError("observations.commands must be a nonempty receipt array")
@@ -1639,6 +2809,7 @@ def _validate_execution_receipts(
         "variant",
         "argv",
         "mapper_invocations",
+        "runtime_worker_evidence",
         "started_monotonic_seconds",
         "ended_monotonic_seconds",
         "process_cpu_microseconds",
@@ -1656,9 +2827,12 @@ def _validate_execution_receipts(
     }
     previous_end = -math.inf
     published_receipts = 0
+    used_worker_artifacts: set[str] = set()
     for index, (raw, expected) in enumerate(zip(commands, expected_runs, strict=True)):
         receipt = _mapping(raw, f"commands[{index}]")
         _exact_keys(receipt, receipt_fields, f"commands[{index}]")
+        if type(receipt["published_output"]) is not bool:
+            raise EvidenceError("execution receipt published_output must be boolean")
         for field in ("run_id", "phase", "variant"):
             if receipt[field] != expected[field]:
                 raise EvidenceError(f"commands[{index}].{field} does not match its timing record")
@@ -1715,6 +2889,44 @@ def _validate_execution_receipts(
             raise EvidenceError("execution receipt toolchain identity is invalid")
         if receipt["run_configuration_digest"] != configuration_digest:
             raise EvidenceError("execution receipt configuration digest is invalid")
+        geometry_execution: dict[str, Any] | None = None
+        if valid_outcome and receipt["variant"] in {"candidate", "fast_candidate"}:
+            configuration = dict(request["candidate_run_configuration"])
+            if receipt["variant"] == "fast_candidate":
+                configuration.update(
+                    {
+                        "detail_profile": "fast",
+                        "trainer_iterations": 3000,
+                        "trainer_plateau_window": 400,
+                    }
+                )
+            if receipt["published_output"] and pipeline_metrics is None:
+                raise EvidenceError("candidate worker evidence requires pipeline metrics")
+            geometry_execution = _validate_runtime_worker_evidence(
+                receipt["runtime_worker_evidence"],
+                configuration,
+                request,
+                receipt["variant"],
+                receipt["run_id"],
+                artifact_root,
+                descriptors,
+                used_worker_artifacts,
+                f"commands[{index}].runtime_worker_evidence",
+                pipeline_metrics if receipt["published_output"] else None,
+            )
+            if (
+                receipt["published_output"]
+                and expected_pair_list_digest is not None
+                and geometry_execution["pair_list_digest"]
+                != expected_pair_list_digest
+            ):
+                raise EvidenceError(
+                    "published geometry pair-list digest does not match protected pair evidence"
+                )
+        elif receipt["runtime_worker_evidence"] is not None:
+            raise EvidenceError(
+                "noncandidate or invalid-input receipt cannot claim runtime worker evidence"
+            )
         if receipt["executable_sha256"] != runner_identity["sha256"]:
             raise EvidenceError("execution receipt executable digest is invalid")
         for field, expected_value in (
@@ -1726,8 +2938,6 @@ def _validate_execution_receipts(
             if receipt[field] != expected_value:
                 raise EvidenceError(f"execution receipt {field} is invalid")
         _digest(receipt["output_sha256"], f"commands[{index}].output_sha256")
-        if type(receipt["published_output"]) is not bool:
-            raise EvidenceError("execution receipt published_output must be boolean")
         if receipt["published_output"]:
             published_receipts += 1
             if published_output_sha256 is None or receipt["output_sha256"] != published_output_sha256:
@@ -1750,12 +2960,306 @@ def _validate_execution_receipts(
             receipt["variant"],
             request,
             valid_outcome=valid_outcome,
+            geometry_execution=geometry_execution,
         )
     if valid_outcome and published_receipts != 1:
         raise EvidenceError("valid evidence requires exactly one receipt for the published output")
     if not valid_outcome and published_receipts:
         raise EvidenceError("invalid evidence cannot claim a published output receipt")
     return expected_runs
+
+
+def _validate_prepared_execution_receipts(
+    commands: Any,
+    request: Mapping[str, Any],
+    runner_identity: Mapping[str, Any],
+    actual: Any,
+    published_output_sha256: str | None,
+    *,
+    artifact_root: Path | None = None,
+    descriptors: Mapping[str, Any] | None = None,
+) -> None:
+    """Revalidate compact receipts without trusting the original derivation pass."""
+    if not isinstance(commands, list) or not commands:
+        raise EvidenceError("prepared commands must be a nonempty receipt array")
+    valid_outcome = request["expected_outcome"]["kind"] == "valid"
+    actual = _validate_actual(actual, request["expected_outcome"])
+    receipt_fields = {
+        "run_id",
+        "phase",
+        "variant",
+        "argv",
+        "mapper_invocations",
+        "runtime_worker_evidence",
+        "started_monotonic_seconds",
+        "ended_monotonic_seconds",
+        "process_cpu_microseconds",
+        "exit_code",
+        "checkout_commit",
+        "toolchain_identity",
+        "run_configuration_digest",
+        "executable_sha256",
+        "output_sha256",
+        "scene_id",
+        "input_digest",
+        "scale",
+        "lane",
+        "published_output",
+    }
+    scopes = set(request["gate_scopes"])
+    lane = request["binding"]["lane"]
+    if not valid_outcome:
+        allowed_phases = {"invalid_input": frozenset({"candidate"})}
+    elif lane == LANE_REFERENCE and "suite_performance" in scopes:
+        allowed_phases = {
+            "ordinary": frozenset({"baseline", "candidate"}),
+            "phase": frozenset({"baseline", "candidate"}),
+            "fast_profile": frozenset({"accurate_reference", "fast_candidate"}),
+        }
+    elif lane == LANE_REFERENCE and "scene_quality" in scopes:
+        allowed_phases = {
+            "ordinary": frozenset({"baseline", "candidate"}),
+            "fast_profile": frozenset({"accurate_reference", "fast_candidate"}),
+        }
+    else:
+        allowed_phases = {"candidate": frozenset({"candidate"})}
+
+    if artifact_root is not None:
+        if descriptors is None:
+            raise EvidenceError("prepared runtime validation requires artifact descriptors")
+        command_descriptor = _mapping(
+            descriptors.get("command_log"),
+            "attestation.artifacts.command_log",
+        )
+        command_path = artifact_root / Path(
+            *_render_relative_path(
+                command_descriptor["path"],
+                "attestation.artifacts.command_log.path",
+            ).parts
+        )
+        if _read_command_log(command_path) != commands:
+            raise EvidenceError("command_log does not match the prepared execution receipts")
+
+    seen_run_ids: set[str] = set()
+    used_worker_artifacts: set[str] = set()
+    previous_end = -math.inf
+    published_count = 0
+    for index, raw in enumerate(commands):
+        context = f"commands[{index}]"
+        receipt = _mapping(raw, context)
+        _exact_keys(receipt, receipt_fields, context)
+        run_id = _token(receipt["run_id"], f"{context}.run_id")
+        if run_id in seen_run_ids:
+            raise EvidenceError("prepared execution receipt run IDs must be unique")
+        seen_run_ids.add(run_id)
+        phase = receipt["phase"]
+        variant = receipt["variant"]
+        if phase not in allowed_phases or variant not in allowed_phases[phase]:
+            raise EvidenceError("prepared execution receipt phase or variant is invalid")
+        started = receipt["started_monotonic_seconds"]
+        ended = receipt["ended_monotonic_seconds"]
+        if (
+            isinstance(started, bool)
+            or isinstance(ended, bool)
+            or not isinstance(started, (int, float))
+            or not isinstance(ended, (int, float))
+            or not math.isfinite(started)
+            or not math.isfinite(ended)
+            or started < 0
+            or ended <= started
+            or started < previous_end
+        ):
+            raise EvidenceError("prepared execution receipt timestamps are invalid or overlap")
+        previous_end = float(ended)
+        process_cpu = _mapping(
+            receipt["process_cpu_microseconds"],
+            f"{context}.process_cpu_microseconds",
+        )
+        _exact_keys(
+            process_cpu,
+            {"user", "system"},
+            f"{context}.process_cpu_microseconds",
+        )
+        if any(
+            type(process_cpu[field]) is not int
+            or not 0 <= process_cpu[field] < 1 << 64
+            for field in ("user", "system")
+        ):
+            raise EvidenceError("prepared execution receipt process CPU time is invalid")
+        expected_exit = 0 if valid_outcome else actual["exit_code"]
+        if type(receipt["exit_code"]) is not int or receipt["exit_code"] != expected_exit:
+            raise EvidenceError("prepared execution receipt exit code is invalid")
+        checkout, toolchain, configuration_digest, prefixes = _expected_variant_identity(
+            variant,
+            request,
+        )
+        if (
+            receipt["checkout_commit"] != checkout
+            or receipt["toolchain_identity"] != toolchain
+            or receipt["run_configuration_digest"] != configuration_digest
+            or receipt["executable_sha256"] != runner_identity["sha256"]
+        ):
+            raise EvidenceError("prepared execution receipt identity is invalid")
+        for field, expected in (
+            ("scene_id", request["binding"]["scene_id"]),
+            ("input_digest", request["binding"]["input_digest"]),
+            ("scale", request["binding"]["scale"]),
+            ("lane", lane),
+        ):
+            if receipt[field] != expected:
+                raise EvidenceError(f"prepared execution receipt {field} is invalid")
+        _digest(receipt["output_sha256"], f"{context}.output_sha256")
+        if type(receipt["published_output"]) is not bool:
+            raise EvidenceError("prepared execution receipt published_output must be boolean")
+        if receipt["published_output"]:
+            published_count += 1
+            if (
+                published_output_sha256 is None
+                or receipt["output_sha256"] != published_output_sha256
+            ):
+                raise EvidenceError("prepared published receipt does not match output_ply")
+        argv = receipt["argv"]
+        if (
+            not isinstance(argv, list)
+            or not argv
+            or any(
+                not isinstance(argument, str)
+                or not argument
+                or "/Users/" in argument
+                or "/home/" in argument
+                for argument in argv
+            )
+            or any(
+                not any(argument.startswith(prefix) for argument in argv)
+                for prefix in prefixes
+            )
+        ):
+            raise EvidenceError("prepared execution receipt argv is invalid")
+
+        geometry_execution: Mapping[str, Any] | None = None
+        if valid_outcome and variant in {"candidate", "fast_candidate"}:
+            worker_receipt = _mapping(
+                receipt["runtime_worker_evidence"],
+                f"{context}.runtime_worker_evidence",
+            )
+            _exact_keys(
+                worker_receipt,
+                {
+                    "artifact_name",
+                    "artifact_sha256",
+                    "geometry_manifest_name",
+                    "geometry_manifest_sha256",
+                    "geometry_input_digest",
+                    "selected_frames_digest",
+                },
+                f"{context}.runtime_worker_evidence",
+            )
+            artifact_name = _token(
+                worker_receipt["artifact_name"],
+                f"{context}.runtime_worker_evidence.artifact_name",
+            )
+            geometry_name = _token(
+                worker_receipt["geometry_manifest_name"],
+                f"{context}.runtime_worker_evidence.geometry_manifest_name",
+            )
+            if artifact_name == geometry_name:
+                raise EvidenceError("prepared worker and geometry artifacts must be distinct")
+            for field in (
+                "artifact_sha256",
+                "geometry_manifest_sha256",
+                "geometry_input_digest",
+                "selected_frames_digest",
+            ):
+                _digest(
+                    worker_receipt[field],
+                    f"{context}.runtime_worker_evidence.{field}",
+                )
+            expected_selected_digest = request["reference_artifacts"][
+                "selected_frames_digests"
+            ][variant]
+            if (
+                worker_receipt["geometry_input_digest"]
+                != request["reference_artifacts"]["geometry_input_digest"]
+                or worker_receipt["selected_frames_digest"] != expected_selected_digest
+            ):
+                raise EvidenceError("prepared runtime worker input binding is invalid")
+            if artifact_root is not None:
+                assert descriptors is not None
+                configuration = dict(request["candidate_run_configuration"])
+                if variant == "fast_candidate":
+                    configuration.update(
+                        {
+                            "detail_profile": "fast",
+                            "trainer_iterations": 3_000,
+                            "trainer_plateau_window": 400,
+                        }
+                    )
+                geometry_execution = _validate_runtime_worker_evidence(
+                    worker_receipt,
+                    configuration,
+                    request,
+                    variant,
+                    run_id,
+                    artifact_root,
+                    descriptors,
+                    used_worker_artifacts,
+                    f"{context}.runtime_worker_evidence",
+                    None,
+                )
+        elif receipt["runtime_worker_evidence"] is not None:
+            raise EvidenceError(
+                "prepared noncandidate receipt cannot claim runtime worker evidence"
+            )
+
+        if geometry_execution is not None:
+            _validate_mapper_invocations(
+                receipt["mapper_invocations"],
+                variant,
+                request,
+                valid_outcome=valid_outcome,
+                geometry_execution=geometry_execution,
+            )
+        elif valid_outcome and variant in {"candidate", "fast_candidate"}:
+            mapper_invocations = receipt["mapper_invocations"]
+            accepted_count = (
+                sum(
+                    isinstance(item, Mapping) and item.get("outcome") == "accepted"
+                    for item in mapper_invocations
+                )
+                if isinstance(mapper_invocations, list)
+                else -1
+            )
+            seeded_hint = (
+                {
+                    "refinement_kind": "seededBundleAdjustment",
+                    "successful_mapper_attempt_ordinals": [
+                        item.get("mapping_attempt_ordinal")
+                        for item in mapper_invocations
+                        if isinstance(item, Mapping)
+                    ],
+                }
+                if accepted_count == 0
+                else None
+            )
+            _validate_mapper_invocations(
+                mapper_invocations,
+                variant,
+                request,
+                valid_outcome=True,
+                geometry_execution=seeded_hint,
+            )
+        else:
+            _validate_mapper_invocations(
+                receipt["mapper_invocations"],
+                variant,
+                request,
+                valid_outcome=valid_outcome,
+            )
+    if valid_outcome and published_count != 1:
+        raise EvidenceError("prepared valid evidence requires one published receipt")
+    if not valid_outcome:
+        if len(commands) != 1 or published_count:
+            raise EvidenceError("prepared invalid evidence has an invalid receipt closure")
 
 
 def _host_state_snapshot(value: Any, label: str) -> dict[str, Any]:
@@ -3395,7 +4899,12 @@ def derive_metrics(
             verified = raw_pipeline["spatially_verified_pairs"]
             if candidate_run_configuration["pairing_policy"] == "unordered_exhaustive":
                 expected_exhaustive = requested_scale * (requested_scale - 1) // 2
-                if scheduled != expected_exhaustive or any((local, retrieval, loop)):
+                if (
+                    scheduled != expected_exhaustive
+                    or retrieval != expected_exhaustive
+                    or local != 0
+                    or loop != 0
+                ):
                     raise EvidenceError(
                         "unordered exhaustive scheduled pair count is incomplete"
                     )
@@ -3774,13 +5283,14 @@ def validate_request(request: Any) -> Mapping[str, Any]:
             "timing_basis",
             "expected_outcome",
             "input_kind",
+            "video_source_count",
             "gate_scopes",
             "rendering_driver_identity",
         },
         "request",
     )
-    if value["schema_version"] != 4:
-        raise EvidenceError("request schema_version must be 4")
+    if value["schema_version"] != REQUEST_SCHEMA_VERSION:
+        raise EvidenceError(f"request schema_version must be {REQUEST_SCHEMA_VERSION}")
     binding = _mapping(value["binding"], "request.binding")
     validate_runner_identity(
         value["rendering_driver_identity"],
@@ -3855,6 +5365,15 @@ def validate_request(request: Any) -> Mapping[str, Any]:
         raise EvidenceError("request.capture_traits must be a sorted unique token array")
     if value["input_kind"] not in {"video", "photos", "mixed"}:
         raise EvidenceError("request.input_kind is invalid")
+    video_source_count = value["video_source_count"]
+    if type(video_source_count) is not int or video_source_count < 0:
+        raise EvidenceError("request.video_source_count is invalid")
+    if value["input_kind"] == "photos" and video_source_count != 0:
+        raise EvidenceError("photo input must bind zero video sources")
+    if value["input_kind"] == "video" and video_source_count != 1:
+        raise EvidenceError("video input must bind exactly one video source")
+    if value["input_kind"] == "mixed" and video_source_count < 1:
+        raise EvidenceError("mixed input must bind at least one video source")
     expected = _mapping(value["expected_outcome"], "request.expected_outcome")
     if expected.get("kind") == "valid":
         _exact_keys(expected, {"kind"}, "request.expected_outcome")
@@ -3899,11 +5418,13 @@ def validate_request(request: Any) -> Mapping[str, Any]:
         "ground_truth_preparation_sha256",
         "paired_baseline_rendering_reference_sha256",
         "orientation_label_sha256",
+        "geometry_input_digest",
     }
     if expected["kind"] == "valid":
         _exact_keys(
             reference_artifacts,
-            reference_digest_fields | {"orientation_expected_status"},
+            reference_digest_fields
+            | {"orientation_expected_status", "selected_frames_digests"},
             "request.reference_artifacts",
         )
         for field in reference_digest_fields:
@@ -3912,6 +5433,20 @@ def validate_request(request: Any) -> Mapping[str, Any]:
             "orientation_status"
         ]:
             raise EvidenceError("request orientation_expected_status is invalid")
+        selected_frames_digests = _mapping(
+            reference_artifacts["selected_frames_digests"],
+            "request.reference_artifacts.selected_frames_digests",
+        )
+        _exact_keys(
+            selected_frames_digests,
+            {"candidate", "fast_candidate"},
+            "request.reference_artifacts.selected_frames_digests",
+        )
+        for variant, digest in selected_frames_digests.items():
+            _digest(
+                digest,
+                f"request.reference_artifacts.selected_frames_digests.{variant}",
+            )
     else:
         _exact_keys(reference_artifacts, {"status"}, "request.reference_artifacts")
         if reference_artifacts["status"] != "not_applicable":
@@ -3948,6 +5483,10 @@ def validate_request(request: Any) -> Mapping[str, Any]:
             "ba_local_num_images",
             "trainer_iterations",
             "trainer_plateau_window",
+            "feature_extraction_workers",
+            "coupled_matching_workers",
+            "vocabulary_retrieval_workers",
+            "maximum_concurrent_video_source_analysis_tasks",
             "run_seed",
         },
         "request.candidate_run_configuration",
@@ -3964,6 +5503,41 @@ def validate_request(request: Any) -> Mapping[str, Any]:
         raise EvidenceError("candidate selected frame count does not match request scale")
     if candidate_configuration["descriptor_matcher"] != "faiss":
         raise EvidenceError("candidate descriptor matcher must be faiss")
+    worker_fields = (
+        "feature_extraction_workers",
+        "coupled_matching_workers",
+        "vocabulary_retrieval_workers",
+        "maximum_concurrent_video_source_analysis_tasks",
+    )
+    if any(
+        type(candidate_configuration[field]) is not int
+        or not 1 <= candidate_configuration[field] <= 64
+        for field in worker_fields
+    ):
+        raise EvidenceError("candidate worker budget is invalid")
+    expected_worker_budget = (
+        {
+            "feature_extraction_workers": 12,
+            "coupled_matching_workers": 8,
+            "vocabulary_retrieval_workers": 8,
+        }
+        if binding["lane"] == LANE_REFERENCE
+        else {
+            "feature_extraction_workers": 4,
+            "coupled_matching_workers": 4,
+            "vocabulary_retrieval_workers": 4,
+        }
+    )
+    expected_worker_budget["maximum_concurrent_video_source_analysis_tasks"] = (
+        1
+        if value["input_kind"] == "photos"
+        else (4 if binding["lane"] == LANE_REFERENCE else 2)
+    )
+    if any(
+        candidate_configuration[field] != expected_worker_budget[field]
+        for field in worker_fields
+    ):
+        raise EvidenceError("candidate worker budget does not match its hardware lane")
     _baseline_mapper_cadence(baseline_configuration)
     _candidate_mapper_cadence(candidate_configuration)
     if candidate_configuration["run_seed"] != 42:
@@ -5887,13 +7461,13 @@ def _validate_pair_list(
     requested_scale: int,
     candidate_configuration: Mapping[str, Any],
     pipeline_metrics: Mapping[str, Any],
-) -> None:
+) -> str:
     selection = _mapping(
         _load_bounded_json(selection_manifest_path, "selection_manifest"),
         "selection_manifest",
     )
     _exact_keys(selection, {"schema_version", "views"}, "selection_manifest")
-    if selection["schema_version"] != 1:
+    if selection["schema_version"] != 2:
         raise EvidenceError("selection_manifest schema is unsupported")
     raw_views = selection["views"]
     if not isinstance(raw_views, list) or len(raw_views) != requested_scale:
@@ -5901,20 +7475,35 @@ def _validate_pair_list(
             f"selection_manifest must cover the requested scale {requested_scale}"
         )
     clip_ids: list[str] = []
+    image_names: list[str] = []
     source_kinds: list[str] = []
     for index, raw_view in enumerate(raw_views):
         view = _mapping(raw_view, f"selection_manifest.views[{index}]")
         _exact_keys(
             view,
-            {"view_index", "clip_id", "source_kind"},
+            {"view_index", "image_name", "clip_id", "source_kind"},
             f"selection_manifest.views[{index}]",
         )
         if view["view_index"] != index:
             raise EvidenceError("selection_manifest view indices must be contiguous")
+        image_name = view["image_name"]
+        if (
+            not isinstance(image_name, str)
+            or not image_name
+            or len(image_name.encode("utf-8")) > 255
+            or any(character.isspace() for character in image_name)
+            or "/" in image_name
+            or "\\" in image_name
+            or image_name in {".", ".."}
+        ):
+            raise EvidenceError("selection_manifest image name is invalid")
+        image_names.append(image_name)
         clip_ids.append(_token(view["clip_id"], f"selection_manifest.views[{index}].clip_id"))
         if view["source_kind"] not in {"video", "photo"}:
             raise EvidenceError("selection_manifest source kind is invalid")
         source_kinds.append(view["source_kind"])
+    if len(set(image_names)) != len(image_names):
+        raise EvidenceError("selection_manifest image names must be unique")
 
     pair_list = _mapping(_load_bounded_json(pair_list_path, "pair_list"), "pair_list")
     _exact_keys(
@@ -5993,7 +7582,12 @@ def _validate_pair_list(
             if query_view is not None or clip_ids[view_a] != clip_ids[view_b]:
                 raise EvidenceError("pair_list local pair crosses a clip boundary")
             local_pairs.add(edge)
-        elif pair_type == "retrieval":
+        elif pair_type in {"retrieval", "loop"}:
+            expected_role = "loop" if topology == "continuous" else "retrieval"
+            if pair_type != expected_role:
+                raise EvidenceError(
+                    "pair_list retrieval vocabulary pair role does not match the resolved topology"
+                )
             if query_view not in edge:
                 raise EvidenceError("pair_list retrieval pair has an invalid query view")
             if query_view % candidate_configuration["vocabulary_query_stride"] != 0:
@@ -6005,14 +7599,6 @@ def _validate_pair_list(
                 retrieval_targets_by_query.setdefault(query_view, set()).add(target_view)
             if pair["spatially_verified"]:
                 verified_retrieval_by_query.setdefault(query_view, set()).add(target_view)
-        elif pair_type == "loop":
-            if query_view is not None or candidate_configuration["capture_path"] not in {
-                "around_subject",
-                "large_area",
-            }:
-                raise EvidenceError("pair_list loop closure is not valid for this capture path")
-            if view_b - view_a < distance_minimum:
-                raise EvidenceError("pair_list loop closure is not distant")
         else:
             if (
                 topology != "unordered"
@@ -6275,7 +7861,7 @@ def _validate_pair_list(
         "raw_matched_pairs": raw_matched_count,
         "spatially_verified_pairs": verified_count,
         "local_pairs": type_counts["local"],
-        "retrieval_pairs": type_counts["retrieval"],
+        "retrieval_pairs": type_counts["retrieval"] + type_counts["exhaustive"],
         "loop_pairs": type_counts["loop"],
     }
     for name, count in derived_counts.items():
@@ -6304,6 +7890,11 @@ def _validate_pair_list(
     for name, count in _biconnected_robustness(adjacency).items():
         if pipeline_metrics.get(name) != count:
             raise EvidenceError(f"pair_list {name} does not match pipeline metrics")
+    serialized_pairs = "".join(
+        f"{image_names[view_a]} {image_names[view_b]}\n"
+        for view_a, view_b in sorted(pairs)
+    ).encode("utf-8")
+    return sha256_bytes(serialized_pairs)
 
 
 def derive_attestation(
@@ -6495,6 +8086,7 @@ def derive_attestation(
                 "toolchain_scenarios log does not match the bound scenario receipts"
             )
     rendering_evidence: RenderingEvidence | None = None
+    protected_pair_list_digest: str | None = None
     if lane == LANE_REFERENCE and "scene_quality" in scopes:
         for artifact_name, request_field in reference_descriptor_fields.items():
             if descriptors[artifact_name]["sha256"] != request["reference_artifacts"][request_field]:
@@ -6517,7 +8109,7 @@ def derive_attestation(
             if existing is not None and existing != descriptor:
                 raise EvidenceError(f"orientation artifact descriptor conflicts with {name}")
             descriptors[name] = descriptor
-        _validate_pair_list(
+        protected_pair_list_digest = _validate_pair_list(
             artifact_root / descriptors["pair_list"]["path"],
             artifact_root / descriptors["selection_manifest"]["path"],
             request["binding"]["scale"],
@@ -6592,6 +8184,8 @@ def derive_attestation(
     _validate_execution_receipts(
         commands,
         artifact_root / descriptors["command_log"]["path"],
+        artifact_root,
+        descriptors,
         request,
         runner_identity,
         (
@@ -6601,6 +8195,12 @@ def derive_attestation(
         ),
         actual,
         descriptors.get("output_ply", {}).get("sha256"),
+        (
+            _mapping(observations.get("pipeline_metrics"), "observations.pipeline_metrics")
+            if request["expected_outcome"]["kind"] == "valid"
+            else None
+        ),
+        protected_pair_list_digest,
     )
     _validate_supervisor_run(
         artifact_root / descriptors["supervisor_run"]["path"],
@@ -6625,7 +8225,7 @@ def derive_attestation(
     if producer_path != root / PRODUCER_RELATIVE_PATH:
         raise EvidenceError("protected producer is not running from the repository path")
     unsigned = {
-        "schema_version": 3,
+        "schema_version": ATTESTATION_SCHEMA_VERSION,
         "binding": dict(request["binding"]),
         "baseline_run_configuration": dict(request["baseline_run_configuration"]),
         "candidate_run_configuration": dict(request["candidate_run_configuration"]),
@@ -6636,6 +8236,7 @@ def derive_attestation(
         "timing_basis": request["timing_basis"],
         "expected_outcome": dict(request["expected_outcome"]),
         "input_kind": request["input_kind"],
+        "video_source_count": request["video_source_count"],
         "gate_scopes": list(request["gate_scopes"]),
         "rendering_driver_identity": dict(request["rendering_driver_identity"]),
         "scoring_runtime": (
@@ -6721,6 +8322,7 @@ def validate_prepared_attestation_file(
             "timing_basis",
             "expected_outcome",
             "input_kind",
+            "video_source_count",
             "gate_scopes",
             "rendering_driver_identity",
             "scoring_runtime",
@@ -6736,7 +8338,10 @@ def validate_prepared_attestation_file(
         },
         "attestation",
     )
-    if attestation["schema_version"] != 3 or attestation["lane"] != expected_lane:
+    if (
+        attestation["schema_version"] != ATTESTATION_SCHEMA_VERSION
+        or attestation["lane"] != expected_lane
+    ):
         raise EvidenceError("attestation schema or lane is invalid")
     request = validate_request(expected_request)
     for field in (
@@ -6750,6 +8355,7 @@ def validate_prepared_attestation_file(
         "timing_basis",
         "expected_outcome",
         "input_kind",
+        "video_source_count",
         "gate_scopes",
         "rendering_driver_identity",
         "resolved_compute",
@@ -6815,4 +8421,18 @@ def validate_prepared_attestation_file(
         _digest(descriptor["sha256"], f"attestation.artifacts.{name}.sha256")
         if descriptor["sha256"] != sha256_file(path):
             raise EvidenceError(f"attestation artifact digest mismatch: {raw_path}")
+    output_descriptor = artifacts.get("output_ply")
+    _validate_prepared_execution_receipts(
+        attestation["commands"],
+        request,
+        actual_runner,
+        attestation["actual"],
+        (
+            _mapping(output_descriptor, "attestation.artifacts.output_ply")["sha256"]
+            if output_descriptor is not None
+            else None
+        ),
+        artifact_root=attestation_path.parent,
+        descriptors=artifacts,
+    )
     return attestation

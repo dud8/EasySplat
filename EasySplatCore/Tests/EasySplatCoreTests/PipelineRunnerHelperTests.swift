@@ -6,6 +6,47 @@ import XCTest
 @testable import EasySplatCore
 
 final class PipelineRunnerHelperTests: XCTestCase {
+    func testColmapOptionsUseResolvedStageWorkerCounts() throws {
+        let root = try TestFileBuilder.makeTempDir()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let runner = makeRunner(projectURL: root)
+
+        let extraction = runner.colmapOptionsForExtraction(workerCount: 12)
+        XCTAssertEqual(extraction.extractThreads, 12)
+        XCTAssertEqual(extraction.environment["OMP_NUM_THREADS"], "12")
+        XCTAssertEqual(extraction.environment["OPENBLAS_NUM_THREADS"], "12")
+        XCTAssertEqual(extraction.environment["MKL_NUM_THREADS"], "12")
+
+        let matching = runner.colmapOptionsForMatching(workerCount: 8)
+        XCTAssertEqual(matching.matchThreads, 8)
+        XCTAssertEqual(matching.environment["OMP_NUM_THREADS"], "8")
+        XCTAssertEqual(matching.environment["OPENBLAS_NUM_THREADS"], "8")
+        XCTAssertEqual(matching.environment["MKL_NUM_THREADS"], "8")
+    }
+
+    func testColmapUtilityEnvironmentLeavesNativeUtilitiesOnSanitizedAutoPolicy() throws {
+        let root = try TestFileBuilder.makeTempDir()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let runner = makeRunner(projectURL: root)
+
+        XCTAssertEqual(runner.colmapUtilityEnvironment(), [:])
+    }
+
+    func testColmapWorkerEnvironmentCanBindVocabularyRetrievalIndependently() throws {
+        let root = try TestFileBuilder.makeTempDir()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let runner = makeRunner(projectURL: root)
+
+        XCTAssertEqual(
+            runner.colmapWorkerEnvironment(workerCount: 6),
+            [
+                "OMP_NUM_THREADS": "6",
+                "OPENBLAS_NUM_THREADS": "6",
+                "MKL_NUM_THREADS": "6",
+            ]
+        )
+    }
+
     func testAutomaticCameraSharingRequiresOneVideoClip() throws {
         let root = try TestFileBuilder.makeTempDir()
         defer { try? FileManager.default.removeItem(at: root) }

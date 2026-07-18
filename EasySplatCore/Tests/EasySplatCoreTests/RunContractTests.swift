@@ -75,21 +75,58 @@ final class RequestedRunOptionsTests: XCTestCase {
         XCTAssertThrowsError(try JSONDecoder().decode(ResolvedRunPlan.self, from: retiredData))
     }
 
+    func testResolvedRunPlanPersistsStageWorkerBudgetWithoutRetiredCoupledLimit() throws {
+        let plan = makeResolvedRunPlan()
+        let encoded = try JSONEncoder().encode(plan)
+        let object = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: encoded) as? [String: Any]
+        )
+        let workers = try XCTUnwrap(object["geometryWorkerBudget"] as? [String: Any])
+
+        XCTAssertEqual(workers["featureExtractionWorkers"] as? NSNumber, 12)
+        XCTAssertEqual(workers["coupledMatchingWorkers"] as? NSNumber, 8)
+        XCTAssertEqual(workers["vocabularyRetrievalWorkers"] as? NSNumber, 8)
+        XCTAssertEqual(
+            workers["maximumConcurrentVideoSourceAnalysisTasks"] as? NSNumber,
+            4
+        )
+        XCTAssertNil(workers["videoAnalysisWorkerLimit"])
+        XCTAssertNil(object["colmapThreadLimit"])
+
+        var retiredObject = object
+        retiredObject.removeValue(forKey: "geometryWorkerBudget")
+        retiredObject["colmapThreadLimit"] = 6
+        let retiredData = try JSONSerialization.data(withJSONObject: retiredObject)
+        XCTAssertThrowsError(try JSONDecoder().decode(ResolvedRunPlan.self, from: retiredData))
+    }
+
+    func testResolvedRunPlanGeneralValidationRejectsInvalidWorkerBudget() throws {
+        var plan = makeResolvedRunPlan()
+        plan.geometryWorkerBudget.maximumConcurrentVideoSourceAnalysisTasks = 0
+
+        XCTAssertThrowsError(try plan.validate()) { error in
+            XCTAssertEqual(
+                error as? ResolvedRunPlanValidationError,
+                .invalidGeometryWorkerBudget
+            )
+        }
+    }
+
     private func assertJSONRoundTrip<Value: Codable & Equatable>(_ values: [Value]) throws {
         let data = try JSONEncoder().encode(values)
         XCTAssertEqual(try JSONDecoder().decode([Value].self, from: data), values)
     }
 }
 
-final class ProjectMetadataVersionFourteenTests: XCTestCase {
-    func testNewMetadataUsesVersionFourteenAndSuppliedRequestedOptions() {
+final class ProjectMetadataVersionSeventeenTests: XCTestCase {
+    func testNewMetadataUsesVersionSeventeenAndSuppliedRequestedOptions() {
         let metadata = ProjectMetadata(
             title: "New project",
             input: .photos(folder: "/tmp/photos"),
             requestedRunOptions: RequestedRunOptions(capturePath: .orbit, detailProfile: .balanced)
         )
 
-        XCTAssertEqual(ProjectMetadataStore.supportedFormatVersion, 14)
+        XCTAssertEqual(ProjectMetadataStore.supportedFormatVersion, 17)
         XCTAssertEqual(metadata.formatVersion, ProjectMetadataStore.supportedFormatVersion)
         XCTAssertEqual(
             metadata.requestedRunOptions,
@@ -124,6 +161,9 @@ final class PipelineArtifactContractTests: XCTestCase {
     func testGeometryAndTrainingArtifactsRoundTripWithProjectRelativePaths() throws {
         let geometry = makeGeometryArtifact()
         let training = makeTrainingArtifact()
+
+        XCTAssertEqual(GeometryArtifact.currentSchemaVersion, 20)
+        XCTAssertEqual(GeometryWorkerExecutionArtifact.currentSchemaVersion, 3)
 
         let encoder = JSONEncoder()
         let decoder = JSONDecoder()
@@ -209,6 +249,12 @@ private func makeResolvedRunPlan() -> ResolvedRunPlan {
         trainerIterationLimit: 15_000,
         plateauWindow: 1_500,
         trainerMemoryBudgetBytes: 32_212_254_720,
+        geometryWorkerBudget: GeometryWorkerBudget(
+            featureExtractionWorkers: 12,
+            coupledMatchingWorkers: 8,
+            vocabularyRetrievalWorkers: 8,
+            maximumConcurrentVideoSourceAnalysisTasks: 4
+        ),
         requiredToolchainCapabilities: ["geometry-v2", "training-v2"],
         fallbackRouteIdentifiers: ["geometry.apple-silicon.fallback"],
         baGlobalFramesRatio: 1.4,
@@ -219,7 +265,13 @@ private func makeResolvedRunPlan() -> ResolvedRunPlan {
 }
 
 func makeGeometryArtifact(
-    sourceModelPath: String = "SfM/colmap/sparse/0"
+    sourceModelPath: String = "SfM/colmap/sparse/0",
+    workerBudget: GeometryWorkerBudget = GeometryWorkerBudget(
+        featureExtractionWorkers: 12,
+        coupledMatchingWorkers: 8,
+        vocabularyRetrievalWorkers: 8,
+        maximumConcurrentVideoSourceAnalysisTasks: 4
+    )
 ) -> GeometryArtifact {
     GeometryArtifact(
         schemaVersion: GeometryArtifact.currentSchemaVersion,
@@ -259,6 +311,9 @@ func makeGeometryArtifact(
             runtime: nil,
             model: nil
         ),
+        workerExecution: makeGeometryWorkerExecutionArtifact(
+            resolvedBudget: workerBudget
+        ),
         pairGraph: .notEvaluated(),
         mapping: MappingArtifact(
             modelCount: 1,
@@ -266,6 +321,7 @@ func makeGeometryArtifact(
             secondLargestModelRegisteredViewCount: 0,
             unionRegisteredViewCount: 2,
             attemptCount: 1,
+            acceptedMappingAttemptOrdinal: 1,
             acceptedRefinementKind: .incrementalGlobal,
             acceptedRefinementInvocationCount: 1,
             incrementalCadence: IncrementalMappingCadenceArtifact(
@@ -278,6 +334,78 @@ func makeGeometryArtifact(
         ),
         canonicalOrientation: .unresolved(
             openingViewDirection: CanonicalDirection(x: 0, y: 0, z: 1)
+        )
+    )
+}
+
+func makeGeometryWorkerExecutionArtifact(
+    resolvedBudget: GeometryWorkerBudget,
+    videoSourceCount: Int = 0
+) -> GeometryWorkerExecutionArtifact {
+    func boundedInvocation(
+        _ command: ColmapWorkerCommandIdentity,
+        workerCount: Int
+    ) -> ColmapWorkerInvocationEvidence {
+        let environment = [
+            "OMP_NUM_THREADS": "\(workerCount)",
+            "OPENBLAS_NUM_THREADS": "\(workerCount)",
+            "MKL_NUM_THREADS": "\(workerCount)",
+        ]
+        return ColmapWorkerInvocationEvidence(
+            command: command,
+            mappingAttemptOrdinal: nil,
+            threadPolicy: .bounded,
+            argvWorkerCount: workerCount,
+            explicitThreadEnvironment: environment,
+            removedThreadEnvironmentKeysSHA256:
+                GeometryWorkerExecutionArtifact.canonicalRemovedThreadEnvironmentKeysSHA256,
+            effectiveSanitizedThreadEnvironment: environment,
+            exitStatus: 0,
+            succeeded: true
+        )
+    }
+
+    func nativeInvocation(
+        _ command: ColmapWorkerCommandIdentity
+    ) -> ColmapWorkerInvocationEvidence {
+        ColmapWorkerInvocationEvidence(
+            command: command,
+            mappingAttemptOrdinal: 1,
+            threadPolicy: .nativeAuto,
+            argvWorkerCount: nil,
+            explicitThreadEnvironment: [:],
+            removedThreadEnvironmentKeysSHA256:
+                GeometryWorkerExecutionArtifact.canonicalRemovedThreadEnvironmentKeysSHA256,
+            effectiveSanitizedThreadEnvironment: [:],
+            exitStatus: 0,
+            succeeded: true
+        )
+    }
+    return GeometryWorkerExecutionArtifact(
+        resolvedBudget: resolvedBudget,
+        featureExtractionInvocations: [
+            boundedInvocation(
+                .featureExtractor,
+                workerCount: resolvedBudget.featureExtractionWorkers
+            ),
+        ],
+        matchingInvocations: [
+            boundedInvocation(
+                .matchesImporter,
+                workerCount: resolvedBudget.coupledMatchingWorkers
+            ),
+        ],
+        vocabularyRetrievalInvocations: [],
+        mappingAndRefinementInvocations: [
+            nativeInvocation(.mapper),
+            nativeInvocation(.modelAnalyzer),
+        ],
+        videoSourceAnalysis: VideoSourceAnalysisExecutionEvidence(
+            videoSourceCount: videoSourceCount,
+            startedAnalysisTaskCount: videoSourceCount,
+            peakInFlightAnalysisTaskCount: videoSourceCount == 0
+                ? 0
+                : min(videoSourceCount, resolvedBudget.maximumConcurrentVideoSourceAnalysisTasks)
         )
     )
 }

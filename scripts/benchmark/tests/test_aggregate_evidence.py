@@ -503,6 +503,33 @@ class AggregateEvidenceTests(unittest.TestCase):
                     tampered, request, lane, runner_identity(lane)
                 )
 
+            command_mutations = {
+                "invalid mapper digest": lambda candidate: candidate[
+                    "mapper_invocations"
+                ][0].update({"pair_list_digest": "not-a-digest"}),
+                "missing runtime worker": lambda candidate: candidate.update(
+                    {"runtime_worker_evidence": None}
+                ),
+            }
+            for label, mutate in command_mutations.items():
+                changed = copy.deepcopy(prepared)
+                candidate = next(
+                    receipt
+                    for receipt in changed["commands"]
+                    if receipt["variant"] == "candidate"
+                )
+                mutate(candidate)
+                with self.subTest(case=label), self.assertRaisesRegex(
+                    aggregate.AggregationError,
+                    "prepared execution receipts are invalid",
+                ):
+                    aggregate._validate_prepared_attestation(
+                        changed,
+                        request,
+                        lane,
+                        runner_identity(lane),
+                    )
+
             evidence_path = root / "prepared.json"
             write_json(evidence_path, prepared)
             expected_digest = evidence.sha256_file(evidence_path)

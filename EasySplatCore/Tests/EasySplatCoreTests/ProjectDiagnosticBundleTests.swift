@@ -278,10 +278,21 @@ final class ProjectDiagnosticBundleTests: XCTestCase {
         defer { try? FileManager.default.removeItem(at: root) }
         let paths = ProjectPaths(root: root)
         try paths.ensureDirectories()
+        let requestedOptions = RequestedRunOptions(
+            capturePath: .walkthrough,
+            detailProfile: .highDetail
+        )
+        let resolvedPlan = RunPlanResolver.resolve(
+            requestedOptions: requestedOptions,
+            input: .photos(folder: "/tmp/photos"),
+            hardware: HardwareProfile(memoryGB: 48, cpuCount: 16, gpuWorkingSetGB: 36),
+            developmentOverrides: .none
+        )
         let metadata = ProjectMetadata(
             title: "MachineDetailed",
             input: .photos(folder: "/tmp/photos"),
-            requestedRunOptions: RequestedRunOptions(capturePath: .walkthrough, detailProfile: .highDetail),
+            requestedRunOptions: requestedOptions,
+            resolvedRunPlan: resolvedPlan,
             reconstruction: ReconstructionSummary(
                 mapper: "colmap",
                 capturedAt: Date(timeIntervalSince1970: 1_700_000_000),
@@ -294,6 +305,12 @@ final class ProjectDiagnosticBundleTests: XCTestCase {
         )
         try ProjectMetadataStore.save(metadata, to: paths.metadataURL)
         let bundle = try XCTUnwrap(ProjectDiagnosticBundle.build(projectURL: root))
+        XCTAssertTrue(
+            bundle.contains("Geometry workers: extract 12 · match 8 · retrieve 8")
+        )
+        XCTAssertTrue(
+            bundle.contains("Video source analysis: up to 1 clip at once")
+        )
         guard let start = bundle.range(of: "```json\n"),
               let end = bundle.range(of: "\n```", range: start.upperBound..<bundle.endIndex) else {
             return XCTFail("JSON fence missing")
@@ -303,6 +320,13 @@ final class ProjectDiagnosticBundleTests: XCTestCase {
         let options = parsed?["requestedRunOptions"] as? [String: Any]
         XCTAssertEqual(options?["capturePath"] as? String, "walkthrough")
         XCTAssertEqual(options?["detailProfile"] as? String, "highDetail")
+        XCTAssertEqual(parsed?["schemaVersion"] as? Int, 12)
+        XCTAssertNil(parsed?["resolvedGeometryWorkers"])
+        let workers = parsed?["resolvedGeometryExecutionBudget"] as? [String: Any]
+        XCTAssertEqual(workers?["featureExtractionWorkers"] as? Int, 12)
+        XCTAssertEqual(workers?["coupledMatchingWorkers"] as? Int, 8)
+        XCTAssertEqual(workers?["vocabularyRetrievalWorkers"] as? Int, 8)
+        XCTAssertEqual(workers?["maximumConcurrentVideoSourceAnalysisTasks"] as? Int, 1)
         let timings = parsed?["stageTimings"] as? [[String: Any]]
         XCTAssertEqual(timings?.count, 1)
         XCTAssertEqual(timings?.first?["stage"] as? String, "sfmFeatures")
@@ -565,12 +589,17 @@ final class ProjectDiagnosticBundleTests: XCTestCase {
         var geometry = makeGeometryArtifact()
         geometry.registeredViewCount = 18
         geometry.totalViewCount = 20
+        for index in geometry.workerExecution.mappingAndRefinementInvocations.indices {
+            geometry.workerExecution.mappingAndRefinementInvocations[index]
+                .mappingAttemptOrdinal = 3
+        }
         geometry.mapping = MappingArtifact(
             modelCount: 2,
             largestModelRegisteredViewCount: 18,
             secondLargestModelRegisteredViewCount: 5,
             unionRegisteredViewCount: 20,
             attemptCount: 3,
+            acceptedMappingAttemptOrdinal: 3,
             acceptedRefinementKind: .incrementalGlobal,
             acceptedRefinementInvocationCount: 4,
             incrementalCadence: IncrementalMappingCadenceArtifact(
@@ -586,6 +615,7 @@ final class ProjectDiagnosticBundleTests: XCTestCase {
                 title: "Private Site",
                 input: .photos(folder: "/tmp/photos"),
                 requestedRunOptions: RequestedRunOptions(capturePath: .walkthrough, detailProfile: .balanced),
+                resolvedRunPlan: makeResolvedRunPlan(for: geometry),
                 geometryArtifact: geometry,
                 reconstruction: ReconstructionSummary(
                     mapper: "colmap",
@@ -602,6 +632,7 @@ final class ProjectDiagnosticBundleTests: XCTestCase {
         XCTAssertTrue(bundle.contains("Models: 2 (largest 18, second 5)"))
         XCTAssertTrue(bundle.contains("Union registered: 20"))
         XCTAssertTrue(bundle.contains("Mapping attempts: 3"))
+        XCTAssertTrue(bundle.contains("Accepted mapping attempt: 3"))
         XCTAssertTrue(bundle.contains("Accepted refinement: Incremental global (4 invocations)"))
         XCTAssertTrue(bundle.contains("Bundle adjustment: local 2, global 1.4× frames / 1.4× points, up to 5 refinements"))
         XCTAssertTrue(bundle.contains("Mapping fallback: Retry for <redacted> at ~/private/input.mov"))
@@ -619,6 +650,7 @@ final class ProjectDiagnosticBundleTests: XCTestCase {
         XCTAssertEqual(mapping["secondLargestModelRegisteredViewCount"] as? Int, 5)
         XCTAssertEqual(mapping["unionRegisteredViewCount"] as? Int, 20)
         XCTAssertEqual(mapping["attemptCount"] as? Int, 3)
+        XCTAssertEqual(mapping["acceptedMappingAttemptOrdinal"] as? Int, 3)
         XCTAssertEqual(mapping["acceptedRefinementKind"] as? String, "incrementalGlobal")
         XCTAssertEqual(mapping["acceptedRefinementInvocationCount"] as? Int, 4)
         let cadence = try XCTUnwrap(mapping["incrementalCadence"] as? [String: Any])
@@ -636,6 +668,7 @@ final class ProjectDiagnosticBundleTests: XCTestCase {
             "secondLargestModelRegisteredViewCount",
             "unionRegisteredViewCount",
             "attemptCount",
+            "acceptedMappingAttemptOrdinal",
             "acceptedRefinementKind",
             "acceptedRefinementInvocationCount",
             "incrementalCadence",
@@ -653,6 +686,7 @@ final class ProjectDiagnosticBundleTests: XCTestCase {
             ProjectMetadata(
                 title: "Direct Mapping",
                 input: .photos(folder: "/tmp/photos"),
+                resolvedRunPlan: makeResolvedRunPlan(for: geometry),
                 geometryArtifact: geometry,
                 reconstruction: ReconstructionSummary(
                     mapper: "colmap",
@@ -809,5 +843,25 @@ final class ProjectDiagnosticBundleTests: XCTestCase {
         return try XCTUnwrap(
             JSONSerialization.jsonObject(with: Data(json.utf8), options: []) as? [String: Any]
         )
+    }
+
+    private func makeResolvedRunPlan(
+        for geometry: GeometryArtifact
+    ) -> ResolvedRunPlan {
+        var plan = RunPlanResolver.resolve(
+            requestedOptions: RequestedRunOptions(
+                capturePath: .walkthrough,
+                detailProfile: .balanced
+            ),
+            input: .photos(folder: "/tmp/photos"),
+            hardware: HardwareProfile(
+                memoryGB: 48,
+                cpuCount: 16,
+                gpuWorkingSetGB: 36
+            ),
+            developmentOverrides: .none
+        )
+        plan.geometryWorkerBudget = geometry.workerExecution.resolvedBudget
+        return plan
     }
 }

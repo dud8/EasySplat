@@ -5,6 +5,33 @@ import XCTest
 @testable import EasySplatCore
 
 final class GeometryArtifactStoreTests: XCTestCase {
+    private var geometryWorkerBudget: GeometryWorkerBudget {
+        GeometryWorkerBudget(
+            featureExtractionWorkers: 12,
+            coupledMatchingWorkers: 8,
+            vocabularyRetrievalWorkers: 8,
+            maximumConcurrentVideoSourceAnalysisTasks: 4
+        )
+    }
+
+    private var resolvedRunPlan: ResolvedRunPlan {
+        var plan = RunPlanResolver.resolve(
+            requestedOptions: RequestedRunOptions(
+                capturePath: .orbit,
+                detailProfile: .balanced
+            ),
+            input: .photos(folder: "/tmp/photos"),
+            hardware: HardwareProfile(
+                memoryGB: 48,
+                cpuCount: 16,
+                gpuWorkingSetGB: 36
+            ),
+            developmentOverrides: .none
+        )
+        plan.geometryWorkerBudget = geometryWorkerBudget
+        return plan
+    }
+
     func testValidateAcceptsCurrentTrustedCanonicalSnapshot() throws {
         let root = try TestFileBuilder.makeTempDir()
         defer { try? FileManager.default.removeItem(at: root) }
@@ -23,6 +50,165 @@ final class GeometryArtifactStoreTests: XCTestCase {
                 verifiedSourceSnapshot: snapshot
             )
         )
+    }
+
+    func testValidateRejectsMissingOrMismatchedCanonicalWorkerExecution() throws {
+        let root = try TestFileBuilder.makeTempDir()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let paths = ProjectPaths(root: root)
+        try paths.ensureDirectories()
+        let fixture = try writeCanonicalModel(at: paths)
+        let artifact = makeArtifact(fixture: fixture)
+        let workerURL = GeometryWorkerExecutionArtifactStore.canonicalURL(for: paths)
+
+        try FileManager.default.removeItem(at: workerURL)
+        XCTAssertThrowsError(
+            try GeometryArtifactStore.validate(artifact, projectPaths: paths)
+        ) { error in
+            XCTAssertEqual(
+                error as? GeometryArtifactStore.Error,
+                .invalidWorkerExecution
+            )
+        }
+
+        var differentWorkerExecution = artifact.workerExecution
+        differentWorkerExecution.featureExtractionInvocations.append(
+            try XCTUnwrap(
+                differentWorkerExecution.featureExtractionInvocations.first
+            )
+        )
+        _ = try GeometryWorkerExecutionArtifactStore.save(
+            differentWorkerExecution,
+            to: workerURL,
+            expectedBudget: geometryWorkerBudget,
+            projectPaths: paths
+        )
+        XCTAssertThrowsError(
+            try GeometryArtifactStore.validate(artifact, projectPaths: paths)
+        ) { error in
+            XCTAssertEqual(
+                error as? GeometryArtifactStore.Error,
+                .invalidWorkerExecution
+            )
+        }
+    }
+
+    func testValidateBindsWorkerEvidenceToTheAcceptedMappingAndPairGraph() throws {
+        let root = try TestFileBuilder.makeTempDir()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let paths = ProjectPaths(root: root)
+        try paths.ensureDirectories()
+        let fixture = try writeCanonicalModel(at: paths)
+
+        var incrementalWithoutMapper = makeArtifact(fixture: fixture)
+        incrementalWithoutMapper.workerExecution.mappingAndRefinementInvocations = [
+            nativeAutoInvocation(.pointTriangulator),
+            nativeAutoInvocation(.bundleAdjuster),
+            nativeAutoInvocation(.modelAnalyzer),
+        ]
+        try saveCanonicalWorkerExecution(
+            incrementalWithoutMapper.workerExecution,
+            paths: paths
+        )
+        XCTAssertThrowsError(
+            try GeometryArtifactStore.validate(incrementalWithoutMapper, projectPaths: paths)
+        ) { error in
+            XCTAssertEqual(error as? GeometryArtifactStore.Error, .invalidWorkerExecution)
+        }
+
+        var retrievalWithoutVocabulary = makeArtifact(fixture: fixture)
+        var measurement = try XCTUnwrap(retrievalWithoutVocabulary.pairGraph.measurement)
+        measurement.localPairCount -= 1
+        measurement.retrievalPairCount = 1
+        retrievalWithoutVocabulary.pairGraph = .measured(
+            measurement,
+            usedLocalVocabularyRetrieval: true
+        )
+        retrievalWithoutVocabulary.workerExecution.vocabularyRetrievalInvocations = []
+        try saveCanonicalWorkerExecution(
+            retrievalWithoutVocabulary.workerExecution,
+            paths: paths
+        )
+        XCTAssertThrowsError(
+            try GeometryArtifactStore.validate(retrievalWithoutVocabulary, projectPaths: paths)
+        ) { error in
+            XCTAssertEqual(error as? GeometryArtifactStore.Error, .invalidWorkerExecution)
+        }
+    }
+
+    func testPersistBindsVideoSourceAnalysisEvidenceToMetadataInput() throws {
+        let root = try TestFileBuilder.makeTempDir()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let paths = ProjectPaths(root: root)
+        try paths.ensureDirectories()
+        let fixture = try writeCanonicalModel(at: paths)
+        var artifact = makeArtifact(fixture: fixture)
+        artifact.workerExecution.videoSourceAnalysis = VideoSourceAnalysisExecutionEvidence(
+            videoSourceCount: 0,
+            startedAnalysisTaskCount: 0,
+            peakInFlightAnalysisTaskCount: 0
+        )
+        try saveCanonicalWorkerExecution(artifact.workerExecution, paths: paths)
+        var metadata = ProjectMetadata(
+            title: "Video evidence mismatch",
+            input: .video(files: ["/tmp/capture.mov"]),
+            requestedRunOptions: RequestedRunOptions(
+                capturePath: .orbit,
+                detailProfile: .balanced
+            ),
+            resolvedRunPlan: resolvedRunPlan
+        )
+
+        XCTAssertThrowsError(
+            try GeometryArtifactStore.persist(artifact, metadata: &metadata, paths: paths)
+        ) { error in
+            XCTAssertEqual(error as? GeometryArtifactStore.Error, .invalidWorkerExecution)
+        }
+
+        artifact.workerExecution.videoSourceAnalysis = VideoSourceAnalysisExecutionEvidence(
+            videoSourceCount: 1,
+            startedAnalysisTaskCount: 1,
+            peakInFlightAnalysisTaskCount: 1
+        )
+        try saveCanonicalWorkerExecution(artifact.workerExecution, paths: paths)
+        metadata.input = .photos(folder: "/tmp/photos")
+        XCTAssertThrowsError(
+            try GeometryArtifactStore.persist(artifact, metadata: &metadata, paths: paths)
+        ) { error in
+            XCTAssertEqual(error as? GeometryArtifactStore.Error, .invalidWorkerExecution)
+        }
+    }
+
+    func testLoadBindsResumedWorkerEvidenceToPersistedMetadataInput() throws {
+        let root = try TestFileBuilder.makeTempDir()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let paths = ProjectPaths(root: root)
+        try paths.ensureDirectories()
+        let fixture = try writeCanonicalModel(at: paths)
+        let artifact = makeArtifact(fixture: fixture)
+        let metadata = ProjectMetadata(
+            title: "Resumed video evidence mismatch",
+            input: .video(files: ["/tmp/capture.mov"]),
+            requestedRunOptions: RequestedRunOptions(
+                capturePath: .orbit,
+                detailProfile: .balanced
+            ),
+            resolvedRunPlan: resolvedRunPlan
+        )
+        try ProjectMetadataStore.save(metadata, to: paths.metadataURL)
+        try JSONEncoder().encode(artifact).write(
+            to: paths.geometryManifestURL,
+            options: [.atomic]
+        )
+
+        XCTAssertThrowsError(
+            try GeometryArtifactStore.load(
+                from: paths.geometryManifestURL,
+                projectPaths: paths
+            )
+        ) { error in
+            XCTAssertEqual(error as? GeometryArtifactStore.Error, .invalidWorkerExecution)
+        }
     }
 
     func testValidateRejectsInvalidTimingEvidence() throws {
@@ -55,7 +241,7 @@ final class GeometryArtifactStoreTests: XCTestCase {
 
     func testLoadRejectsPreviousSchemaBeforeDecodingItsPayload() throws {
         let baselineSchemaVersion = GeometryArtifact.currentSchemaVersion - 1
-        XCTAssertEqual(baselineSchemaVersion, 15)
+        XCTAssertEqual(baselineSchemaVersion, 19)
 
         let root = try TestFileBuilder.makeTempDir()
         defer { try? FileManager.default.removeItem(at: root) }
@@ -95,7 +281,8 @@ final class GeometryArtifactStoreTests: XCTestCase {
         var metadata = ProjectMetadata(
             title: "Measured",
             input: .photos(folder: "/tmp/photos"),
-            requestedRunOptions: RequestedRunOptions(capturePath: .orbit, detailProfile: .balanced)
+            requestedRunOptions: RequestedRunOptions(capturePath: .orbit, detailProfile: .balanced),
+            resolvedRunPlan: resolvedRunPlan
         )
         try ProjectMetadataStore.save(metadata, to: paths.metadataURL)
         let artifact = makeArtifact(fixture: fixture)
@@ -204,7 +391,8 @@ final class GeometryArtifactStoreTests: XCTestCase {
         var metadata = ProjectMetadata(
             title: "Measured",
             input: .photos(folder: "/tmp/photos"),
-            requestedRunOptions: RequestedRunOptions(capturePath: .orbit, detailProfile: .balanced)
+            requestedRunOptions: RequestedRunOptions(capturePath: .orbit, detailProfile: .balanced),
+            resolvedRunPlan: resolvedRunPlan
         )
         try ProjectMetadataStore.save(metadata, to: paths.metadataURL)
         let outside = parent.appendingPathComponent("outside-geometry.json")
@@ -235,7 +423,8 @@ final class GeometryArtifactStoreTests: XCTestCase {
         var metadata = ProjectMetadata(
             title: "Measured",
             input: .photos(folder: "/tmp/photos"),
-            requestedRunOptions: RequestedRunOptions(capturePath: .orbit, detailProfile: .balanced)
+            requestedRunOptions: RequestedRunOptions(capturePath: .orbit, detailProfile: .balanced),
+            resolvedRunPlan: resolvedRunPlan
         )
         try ProjectMetadataStore.save(metadata, to: paths.metadataURL)
         let previousManifest = Data("previous manifest bytes".utf8)
@@ -407,6 +596,12 @@ final class GeometryArtifactStoreTests: XCTestCase {
         artifact.pairGraph = .notEvaluated()
         artifact.mapping.acceptedRefinementKind = .seededBundleAdjustment
         artifact.mapping.incrementalCadence = nil
+        artifact.workerExecution.mappingAndRefinementInvocations = [
+            nativeAutoInvocation(.pointTriangulator),
+            nativeAutoInvocation(.bundleAdjuster),
+            nativeAutoInvocation(.modelAnalyzer),
+        ]
+        try saveCanonicalWorkerExecution(artifact.workerExecution, paths: paths)
         XCTAssertNoThrow(try GeometryArtifactStore.validate(artifact, projectPaths: paths))
 
         var fabricatedInvocationCount = artifact
@@ -522,6 +717,12 @@ final class GeometryArtifactStoreTests: XCTestCase {
         artifact.pairGraph = .notEvaluated()
         artifact.mapping.acceptedRefinementKind = .seededBundleAdjustment
         artifact.mapping.incrementalCadence = nil
+        artifact.workerExecution.mappingAndRefinementInvocations = [
+            nativeAutoInvocation(.pointTriangulator),
+            nativeAutoInvocation(.bundleAdjuster),
+            nativeAutoInvocation(.modelAnalyzer),
+        ]
+        try saveCanonicalWorkerExecution(artifact.workerExecution, paths: paths)
 
         XCTAssertNoThrow(try GeometryArtifactStore.validate(artifact, projectPaths: paths))
     }
@@ -762,6 +963,7 @@ final class GeometryArtifactStoreTests: XCTestCase {
             secondLargestModelRegisteredViewCount: 8,
             unionRegisteredViewCount: 9,
             attemptCount: 2,
+            acceptedMappingAttemptOrdinal: 1,
             acceptedRefinementKind: .incrementalGlobal,
             acceptedRefinementInvocationCount: 0,
             incrementalCadence: IncrementalMappingCadenceArtifact(
@@ -919,6 +1121,7 @@ final class GeometryArtifactStoreTests: XCTestCase {
             secondLargestModelRegisteredViewCount: 0,
             unionRegisteredViewCount: 9,
             attemptCount: 1,
+            acceptedMappingAttemptOrdinal: 1,
             acceptedRefinementKind: .seededBundleAdjustment,
             acceptedRefinementInvocationCount: 1,
             incrementalCadence: nil,
@@ -1382,6 +1585,9 @@ final class GeometryArtifactStoreTests: XCTestCase {
                 runtime: nil,
                 model: nil
             ),
+            workerExecution: makeGeometryWorkerExecutionArtifact(
+                resolvedBudget: geometryWorkerBudget
+            ),
             pairGraph: .measured(PairGraphMeasurement(
                 scheduledPairCount: 3,
                 attemptedPairCount: 3,
@@ -1423,6 +1629,7 @@ final class GeometryArtifactStoreTests: XCTestCase {
                 secondLargestModelRegisteredViewCount: 0,
                 unionRegisteredViewCount: imageNames.count,
                 attemptCount: 1,
+                acceptedMappingAttemptOrdinal: 1,
                 acceptedRefinementKind: .incrementalGlobal,
                 acceptedRefinementInvocationCount: 1,
                 incrementalCadence: IncrementalMappingCadenceArtifact(
@@ -1436,6 +1643,35 @@ final class GeometryArtifactStoreTests: XCTestCase {
             canonicalOrientation: .unresolved(
                 openingViewDirection: CanonicalDirection(x: 0, y: 0, z: 1)
             )
+        )
+    }
+
+    private func nativeAutoInvocation(
+        _ command: ColmapWorkerCommandIdentity
+    ) -> ColmapWorkerInvocationEvidence {
+        ColmapWorkerInvocationEvidence(
+            command: command,
+            mappingAttemptOrdinal: 1,
+            threadPolicy: .nativeAuto,
+            argvWorkerCount: nil,
+            explicitThreadEnvironment: [:],
+            removedThreadEnvironmentKeysSHA256:
+                GeometryWorkerExecutionArtifact.canonicalRemovedThreadEnvironmentKeysSHA256,
+            effectiveSanitizedThreadEnvironment: [:],
+            exitStatus: 0,
+            succeeded: true
+        )
+    }
+
+    private func saveCanonicalWorkerExecution(
+        _ artifact: GeometryWorkerExecutionArtifact,
+        paths: ProjectPaths
+    ) throws {
+        _ = try GeometryWorkerExecutionArtifactStore.save(
+            artifact,
+            to: GeometryWorkerExecutionArtifactStore.canonicalURL(for: paths),
+            expectedBudget: geometryWorkerBudget,
+            projectPaths: paths
         )
     }
 
@@ -1493,6 +1729,7 @@ final class GeometryArtifactStoreTests: XCTestCase {
             secondLargestModelRegisteredViewCount: 8,
             unionRegisteredViewCount: 9,
             attemptCount: 1,
+            acceptedMappingAttemptOrdinal: 1,
             acceptedRefinementKind: .incrementalGlobal,
             acceptedRefinementInvocationCount: 1,
             incrementalCadence: IncrementalMappingCadenceArtifact(
@@ -1552,6 +1789,15 @@ final class GeometryArtifactStoreTests: XCTestCase {
                 options: [.atomic]
             )
         }
+        let workerExecution = makeGeometryWorkerExecutionArtifact(
+            resolvedBudget: geometryWorkerBudget
+        )
+        _ = try GeometryWorkerExecutionArtifactStore.save(
+            workerExecution,
+            to: GeometryWorkerExecutionArtifactStore.canonicalURL(for: paths),
+            expectedBudget: geometryWorkerBudget,
+            projectPaths: paths
+        )
         return (
             modelHashes: hashes,
             inputDigest: try GeometryArtifactStore.inputDigest(projectPaths: paths),
@@ -1629,6 +1875,15 @@ final class GeometryArtifactStoreTests: XCTestCase {
                 options: [.atomic]
             )
         }
+        let workerExecution = makeGeometryWorkerExecutionArtifact(
+            resolvedBudget: geometryWorkerBudget
+        )
+        _ = try GeometryWorkerExecutionArtifactStore.save(
+            workerExecution,
+            to: GeometryWorkerExecutionArtifactStore.canonicalURL(for: paths),
+            expectedBudget: geometryWorkerBudget,
+            projectPaths: paths
+        )
         return (
             modelHashes: hashes,
             inputDigest: try GeometryArtifactStore.inputDigest(projectPaths: paths),

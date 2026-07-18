@@ -51,13 +51,6 @@ extension PipelineRunner {
         detectColmapGpuSupport(colmapPath: colmapPath)
     }
 
-    func updateThreadEnvironment(_ options: inout ColmapOptions, threadCount: Int) {
-        if options.environment.isEmpty { return }
-        options.environment["OMP_NUM_THREADS"] = "\(threadCount)"
-        options.environment["OPENBLAS_NUM_THREADS"] = "\(threadCount)"
-        options.environment["MKL_NUM_THREADS"] = "\(threadCount)"
-    }
-
     func detectColmapGpuSupport(colmapPath: URL) -> Bool {
         let fm = FileManager.default
         guard fm.isExecutableFile(atPath: colmapPath.path) else { return false }
@@ -75,6 +68,8 @@ extension PipelineRunner {
         switch error {
         case let .failed(_, _, _, stdoutTail, stderrTail):
             output = (stderrTail + "\n" + stdoutTail).lowercased()
+        case .executionEvidenceUnavailable:
+            return false
         }
         if output.contains("without cuda") { return true }
         if output.contains("cuda") { return true }

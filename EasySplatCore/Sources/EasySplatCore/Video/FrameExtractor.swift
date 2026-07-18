@@ -474,12 +474,14 @@ public final class FrameExtractor {
         isHDR: Bool,
         progress: @escaping @Sendable (Double, String) -> Void
     ) async throws -> FrameAnalysisPass {
+        try Task.checkCancellation()
         let (reader, output) = try Self.makeReader(
             asset: asset,
             track: track,
             dimensions: dimensions,
             isHDR: isHDR
         )
+        try Task.checkCancellation()
         guard reader.startReading() else { throw ExtractionError.extractionFailed }
         defer {
             if reader.status == .reading {

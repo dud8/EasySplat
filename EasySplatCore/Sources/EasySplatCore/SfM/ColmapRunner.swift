@@ -203,38 +203,111 @@ public struct ColmapOptions: Sendable {
         self.environment = environment
     }
 
-    public static func stabilityDefaults() -> ColmapOptions {
-        let cores = ProcessInfo.processInfo.activeProcessorCount
-        let extractThreads = min(8, max(2, cores / 2))
-        return ColmapOptions(
-            useGPU: false,
-            extractThreads: extractThreads,
-            matchThreads: 1,
-            maxNumFeatures: 8192,
-            maxNumMatches: 8192,
-            descriptorMatcher: .faiss,
-            environment: [:]
-        )
-    }
 }
 
 public enum ColmapRunnerError: Error, LocalizedError {
     case failed(command: String, exitCode: Int32, terminationReason: Process.TerminationReason, stdoutTail: String, stderrTail: String)
+    case executionEvidenceUnavailable(String)
 
     public var errorDescription: String? {
         switch self {
         case let .failed(command, exitCode, terminationReason, _, _):
             return "Colmap failed: \(command) (exit \(exitCode), reason: \(terminationReason))"
+        case .executionEvidenceUnavailable(let command):
+            return "COLMAP did not expose verified launch evidence for \(command)."
         }
     }
 }
 
 /// Subprocess-backed wrapper around the COLMAP command-line tools.
-public final class ColmapRunner {
+public final class ColmapRunner: @unchecked Sendable {
+    private static let inheritedThreadEnvironmentKeys = Set(
+        GeometryWorkerExecutionArtifact.canonicalRemovedThreadEnvironmentKeys
+    )
+
     private let runner: SubprocessRunning
+    private let observerLock = NSLock()
+    private var workerExecutionObserver: (
+        @Sendable (ColmapWorkerInvocationEvidence) throws -> Void
+    )?
 
     public init(runner: SubprocessRunning = SubprocessRunner()) {
         self.runner = runner
+    }
+
+    public func setWorkerExecutionObserver(
+        _ observer: (@Sendable (ColmapWorkerInvocationEvidence) throws -> Void)?
+    ) {
+        observerLock.withLock {
+            workerExecutionObserver = observer
+        }
+    }
+
+    private static func boundedWorkerEnvironment(
+        _ environment: [String: String],
+        workerCount: Int
+    ) -> [String: String] {
+        var bounded = sanitizedNativeAutoEnvironment(environment)
+        let value = "\(workerCount)"
+        bounded["OMP_NUM_THREADS"] = value
+        bounded["OPENBLAS_NUM_THREADS"] = value
+        bounded["MKL_NUM_THREADS"] = value
+        return bounded
+    }
+
+    private static func sanitizedNativeAutoEnvironment(
+        _ environment: [String: String]
+    ) -> [String: String] {
+        environment.filter { !inheritedThreadEnvironmentKeys.contains($0.key) }
+    }
+
+    private func recordWorkerExecution(
+        command: ColmapWorkerCommandIdentity,
+        threadPolicy: GeometryWorkerThreadPolicy,
+        argvWorkerCount: Int?,
+        result: SubprocessResult
+    ) throws {
+        guard let observer = observerLock.withLock({ workerExecutionObserver }) else {
+            return
+        }
+        guard let receipt = result.environmentReceipt,
+              receipt.removedKeys == Self.inheritedThreadEnvironmentKeys else {
+            throw ColmapRunnerError.executionEvidenceUnavailable(command.rawValue)
+        }
+        let threadKeys = Self.inheritedThreadEnvironmentKeys
+        let explicitThreadEnvironment = receipt.explicitOverrides.filter {
+            threadKeys.contains($0.key)
+        }
+        let effectiveThreadEnvironment = receipt.effectiveValuesForControlledKeys.filter {
+            threadKeys.contains($0.key)
+        }
+        try observer(ColmapWorkerInvocationEvidence(
+            command: command,
+            mappingAttemptOrdinal: nil,
+            threadPolicy: threadPolicy,
+            argvWorkerCount: argvWorkerCount,
+            explicitThreadEnvironment: explicitThreadEnvironment,
+            removedThreadEnvironmentKeysSHA256:
+                GeometryWorkerExecutionArtifact.canonicalRemovedThreadEnvironmentKeysSHA256,
+            effectiveSanitizedThreadEnvironment: effectiveThreadEnvironment,
+            exitStatus: result.exitCode,
+            succeeded: result.exitCode == 0 && result.terminationReason == .exit
+        ))
+    }
+
+    private func workerTerminationHandler(
+        command: ColmapWorkerCommandIdentity,
+        threadPolicy: GeometryWorkerThreadPolicy,
+        argvWorkerCount: Int?
+    ) -> @Sendable (SubprocessResult) throws -> Void {
+        { [self] result in
+            try recordWorkerExecution(
+                command: command,
+                threadPolicy: threadPolicy,
+                argvWorkerCount: argvWorkerCount,
+                result: result
+            )
+        }
     }
 
     public func runFeatureExtractor(
@@ -266,7 +339,16 @@ public final class ColmapRunner {
             colmapPath.path,
             finalArgs,
             currentDirectory: nil,
-            environment: options.environment,
+            environment: Self.boundedWorkerEnvironment(
+                options.environment,
+                workerCount: options.extractThreads
+            ),
+            removingEnvironmentKeys: Self.inheritedThreadEnvironmentKeys,
+            onTermination: workerTerminationHandler(
+                command: .featureExtractor,
+                threadPolicy: .bounded,
+                argvWorkerCount: options.extractThreads
+            ),
             onStdout: { onLog($0, false) },
             onStderr: { onLog($0, true) }
         )
@@ -297,7 +379,16 @@ public final class ColmapRunner {
             colmapPath.path,
             args,
             currentDirectory: nil,
-            environment: options.environment,
+            environment: Self.boundedWorkerEnvironment(
+                options.environment,
+                workerCount: options.extractThreads
+            ),
+            removingEnvironmentKeys: Self.inheritedThreadEnvironmentKeys,
+            onTermination: workerTerminationHandler(
+                command: .featureImporter,
+                threadPolicy: .bounded,
+                argvWorkerCount: options.extractThreads
+            ),
             onStdout: { onLog($0, false) },
             onStderr: { onLog($0, true) }
         )
@@ -333,7 +424,16 @@ public final class ColmapRunner {
             colmapPath.path,
             finalArgs,
             currentDirectory: nil,
-            environment: options.environment,
+            environment: Self.boundedWorkerEnvironment(
+                options.environment,
+                workerCount: options.matchThreads
+            ),
+            removingEnvironmentKeys: Self.inheritedThreadEnvironmentKeys,
+            onTermination: workerTerminationHandler(
+                command: .matchesImporter,
+                threadPolicy: .bounded,
+                argvWorkerCount: options.matchThreads
+            ),
             onStdout: { onLog($0, false) },
             onStderr: { onLog($0, true) }
         )
@@ -376,7 +476,16 @@ public final class ColmapRunner {
             colmapPath.path,
             args,
             currentDirectory: nil,
-            environment: environment,
+            environment: Self.boundedWorkerEnvironment(
+                environment,
+                workerCount: options.threadCount
+            ),
+            removingEnvironmentKeys: Self.inheritedThreadEnvironmentKeys,
+            onTermination: workerTerminationHandler(
+                command: .localVocabularyRetriever,
+                threadPolicy: .bounded,
+                argvWorkerCount: options.threadCount
+            ),
             onStdout: { onLog($0, false) },
             onStderr: { onLog($0, true) }
         )
@@ -388,7 +497,7 @@ public final class ColmapRunner {
         database: URL,
         imagePath: URL,
         outputPath: URL,
-        options: ColmapOptions,
+        environment: [String: String],
         mapperOptions: ColmapMapperOptions,
         onLog: @escaping @Sendable (String, Bool) -> Void
     ) async throws {
@@ -415,7 +524,13 @@ public final class ColmapRunner {
             colmapPath.path,
             args,
             currentDirectory: nil,
-            environment: options.environment,
+            environment: Self.sanitizedNativeAutoEnvironment(environment),
+            removingEnvironmentKeys: Self.inheritedThreadEnvironmentKeys,
+            onTermination: workerTerminationHandler(
+                command: .mapper,
+                threadPolicy: .nativeAuto,
+                argvWorkerCount: nil
+            ),
             onStdout: { onLog($0, false) },
             onStderr: { onLog($0, true) }
         )
@@ -428,7 +543,7 @@ public final class ColmapRunner {
         imagePath: URL,
         inputPath: URL,
         outputPath: URL,
-        options: ColmapOptions,
+        environment: [String: String],
         onLog: @escaping @Sendable (String, Bool) -> Void
     ) async throws {
         let args = [
@@ -443,7 +558,13 @@ public final class ColmapRunner {
             colmapPath.path,
             args,
             currentDirectory: nil,
-            environment: options.environment,
+            environment: Self.sanitizedNativeAutoEnvironment(environment),
+            removingEnvironmentKeys: Self.inheritedThreadEnvironmentKeys,
+            onTermination: workerTerminationHandler(
+                command: .pointTriangulator,
+                threadPolicy: .nativeAuto,
+                argvWorkerCount: nil
+            ),
             onStdout: { onLog($0, false) },
             onStderr: { onLog($0, true) }
         )
@@ -454,7 +575,7 @@ public final class ColmapRunner {
         colmapPath: URL,
         inputPath: URL,
         outputPath: URL,
-        options: ColmapOptions,
+        environment: [String: String],
         bundleOptions: ColmapBundleAdjustmentOptions,
         onLog: @escaping @Sendable (String, Bool) -> Void
     ) async throws {
@@ -484,7 +605,13 @@ public final class ColmapRunner {
             colmapPath.path,
             args,
             currentDirectory: nil,
-            environment: options.environment,
+            environment: Self.sanitizedNativeAutoEnvironment(environment),
+            removingEnvironmentKeys: Self.inheritedThreadEnvironmentKeys,
+            onTermination: workerTerminationHandler(
+                command: .bundleAdjuster,
+                threadPolicy: .nativeAuto,
+                argvWorkerCount: nil
+            ),
             onStdout: { onLog($0, false) },
             onStderr: { onLog($0, true) }
         )
@@ -494,14 +621,20 @@ public final class ColmapRunner {
     public func runModelAnalyzer(
         colmapPath: URL,
         modelPath: URL,
-        options: ColmapOptions
+        environment: [String: String]
     ) async throws -> String {
         let args = ["model_analyzer", "--path", modelPath.path]
         let result = try await runner.runAsync(
             colmapPath.path,
             args,
             currentDirectory: nil,
-            environment: options.environment,
+            environment: Self.sanitizedNativeAutoEnvironment(environment),
+            removingEnvironmentKeys: Self.inheritedThreadEnvironmentKeys,
+            onTermination: workerTerminationHandler(
+                command: .modelAnalyzer,
+                threadPolicy: .nativeAuto,
+                argvWorkerCount: nil
+            ),
             onStdout: { _ in },
             onStderr: { _ in }
         )
@@ -533,7 +666,8 @@ public final class ColmapRunner {
             colmapPath.path,
             args,
             currentDirectory: nil,
-            environment: environment,
+            environment: Self.sanitizedNativeAutoEnvironment(environment),
+            removingEnvironmentKeys: Self.inheritedThreadEnvironmentKeys,
             onStdout: { onLog($0, false) },
             onStderr: { onLog($0, true) }
         )
@@ -546,6 +680,7 @@ public final class ColmapRunner {
         outputPath: URL,
         outputType: String = "TXT",
         environment: [String: String] = [:],
+        recordGeometryWorkerExecution: Bool = false,
         onLog: @escaping @Sendable (String, Bool) -> Void
     ) throws {
         let args = [
@@ -559,10 +694,19 @@ public final class ColmapRunner {
             colmapPath.path,
             args,
             currentDirectory: nil,
-            environment: environment,
+            environment: Self.sanitizedNativeAutoEnvironment(environment),
+            removingEnvironmentKeys: Self.inheritedThreadEnvironmentKeys,
             onStdout: { onLog($0, false) },
             onStderr: { onLog($0, true) }
         )
+        if recordGeometryWorkerExecution {
+            try recordWorkerExecution(
+                command: .modelConverter,
+                threadPolicy: .nativeAuto,
+                argvWorkerCount: nil,
+                result: result
+            )
+        }
         try checkResult(result, command: "model_converter")
     }
 

@@ -188,26 +188,34 @@ public struct PairGraphMeasurement: Codable, Sendable, Equatable {
 public struct PairGraphArtifact: Codable, Sendable, Equatable {
     public var status: PairGraphMeasurementStatus
     public var measurement: PairGraphMeasurement?
+    public var usedLocalVocabularyRetrieval: Bool
 
     public init(
         status: PairGraphMeasurementStatus,
-        measurement: PairGraphMeasurement?
+        measurement: PairGraphMeasurement?,
+        usedLocalVocabularyRetrieval: Bool = false
     ) {
         self.status = status
         self.measurement = measurement
+        self.usedLocalVocabularyRetrieval = usedLocalVocabularyRetrieval
     }
 
     public static func notEvaluated() -> PairGraphArtifact {
         PairGraphArtifact(
             status: .notEvaluated,
-            measurement: nil
+            measurement: nil,
+            usedLocalVocabularyRetrieval: false
         )
     }
 
-    public static func measured(_ measurement: PairGraphMeasurement) -> PairGraphArtifact {
+    public static func measured(
+        _ measurement: PairGraphMeasurement,
+        usedLocalVocabularyRetrieval: Bool = false
+    ) -> PairGraphArtifact {
         PairGraphArtifact(
             status: .measured,
-            measurement: measurement
+            measurement: measurement,
+            usedLocalVocabularyRetrieval: usedLocalVocabularyRetrieval
         )
     }
 }
@@ -283,6 +291,7 @@ public struct MappingArtifact: Codable, Sendable, Equatable {
     public var secondLargestModelRegisteredViewCount: Int
     public var unionRegisteredViewCount: Int
     public var attemptCount: Int
+    public var acceptedMappingAttemptOrdinal: Int
     public var acceptedRefinementKind: MappingRefinementKind
     /// Observed global-refinement invocations from the accepted mapping attempt.
     public var acceptedRefinementInvocationCount: Int
@@ -295,6 +304,7 @@ public struct MappingArtifact: Codable, Sendable, Equatable {
         secondLargestModelRegisteredViewCount: Int,
         unionRegisteredViewCount: Int,
         attemptCount: Int,
+        acceptedMappingAttemptOrdinal: Int,
         acceptedRefinementKind: MappingRefinementKind,
         acceptedRefinementInvocationCount: Int,
         incrementalCadence: IncrementalMappingCadenceArtifact?,
@@ -305,6 +315,7 @@ public struct MappingArtifact: Codable, Sendable, Equatable {
         self.secondLargestModelRegisteredViewCount = secondLargestModelRegisteredViewCount
         self.unionRegisteredViewCount = unionRegisteredViewCount
         self.attemptCount = attemptCount
+        self.acceptedMappingAttemptOrdinal = acceptedMappingAttemptOrdinal
         self.acceptedRefinementKind = acceptedRefinementKind
         self.acceptedRefinementInvocationCount = acceptedRefinementInvocationCount
         self.incrementalCadence = incrementalCadence
@@ -451,7 +462,7 @@ public struct CanonicalOrientationArtifact: Codable, Sendable, Equatable {
 }
 
 public struct GeometryArtifact: Codable, Sendable, Equatable {
-    public static let currentSchemaVersion = 16
+    public static let currentSchemaVersion = 20
 
     public var schemaVersion: Int
     public var solverVersion: String
@@ -485,6 +496,7 @@ public struct GeometryArtifact: Codable, Sendable, Equatable {
     public var fallbackReason: String?
     public var provenance: GeometryProvenance
     public var learnedPointInitializer: LearnedPointInitializerArtifact?
+    public var workerExecution: GeometryWorkerExecutionArtifact
     public var pairGraph: PairGraphArtifact
     public var mapping: MappingArtifact
     public var canonicalOrientation: CanonicalOrientationArtifact
@@ -525,6 +537,7 @@ public struct GeometryArtifact: Codable, Sendable, Equatable {
         modelHashes: [String: String],
         fallbackReason: String?,
         provenance: GeometryProvenance,
+        workerExecution: GeometryWorkerExecutionArtifact,
         pairGraph: PairGraphArtifact,
         mapping: MappingArtifact,
         learnedPointInitializer: LearnedPointInitializerArtifact? = nil,
@@ -558,6 +571,7 @@ public struct GeometryArtifact: Codable, Sendable, Equatable {
         self.fallbackReason = fallbackReason
         self.provenance = provenance
         self.learnedPointInitializer = learnedPointInitializer
+        self.workerExecution = workerExecution
         self.pairGraph = pairGraph
         self.mapping = mapping
         self.canonicalOrientation = canonicalOrientation

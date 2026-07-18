@@ -2062,6 +2062,7 @@ private final class CancellingSubprocessRunner: @unchecked Sendable, SubprocessR
         _ arguments: [String],
         currentDirectory: URL?,
         environment: [String: String],
+        removingEnvironmentKeys: Set<String>,
         onStdout: @escaping @Sendable (String) -> Void,
         onStderr: @escaping @Sendable (String) -> Void
     ) throws -> SubprocessResult {
@@ -2073,6 +2074,7 @@ private final class CancellingSubprocessRunner: @unchecked Sendable, SubprocessR
         _ arguments: [String],
         currentDirectory: URL?,
         environment: [String: String],
+        removingEnvironmentKeys: Set<String>,
         onStdout: @escaping @Sendable (String) -> Void,
         onStderr: @escaping @Sendable (String) -> Void
     ) async throws -> SubprocessResult {

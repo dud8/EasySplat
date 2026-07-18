@@ -93,7 +93,7 @@ extension PipelineRunner {
             inputPath: undistorterInput,
             outputPath: workspace,
             maxImageSize: maxImageSize,
-            environment: colmapOptionsForMatching().environment,
+            environment: colmapUtilityEnvironment(),
             onLog: { _, _ in }
         )
         try Task.checkCancellation()
@@ -354,13 +354,12 @@ extension PipelineRunner {
             )
         }
 
-        let converterOptions = colmapOptionsForMatching()
         try tooling.colmap.runModelConverter(
             colmapPath: config.toolchain.colmap,
             inputPath: textInput,
             outputPath: binaryOutput,
             outputType: "BIN",
-            environment: converterOptions.environment,
+            environment: colmapUtilityEnvironment(),
             onLog: { _, _ in }
         )
 

@@ -63,7 +63,7 @@ struct PersistedColmapPairGraphInspection: Codable, Sendable, Equatable {
 }
 
 struct PairGraphEvidence: Codable, Sendable, Equatable {
-    static let currentSchemaVersion = 7
+    static let currentSchemaVersion = 8
 
     var schemaVersion: Int
     var selectedFramesDigest: String
@@ -72,6 +72,7 @@ struct PairGraphEvidence: Codable, Sendable, Equatable {
     var attempts: [PairGraphAttemptEvidence]
     var acceptedAttemptNumber: Int
     var acceptedInspection: PersistedColmapPairGraphInspection
+    var usedLocalVocabularyRetrieval: Bool
     var pairListDigest: String
     var matchingDurationSeconds: Double
     var fallbackReasons: [String]
@@ -83,6 +84,7 @@ struct PairGraphEvidence: Codable, Sendable, Equatable {
         attempts: [PairGraphAttemptEvidence],
         acceptedAttemptNumber: Int,
         acceptedInspection: ColmapPairGraphInspection,
+        usedLocalVocabularyRetrieval: Bool = false,
         matchingDurationSeconds: Double,
         fallbackReasons: [String]
     ) {
@@ -93,6 +95,7 @@ struct PairGraphEvidence: Codable, Sendable, Equatable {
         self.attempts = attempts
         self.acceptedAttemptNumber = acceptedAttemptNumber
         self.acceptedInspection = PersistedColmapPairGraphInspection(acceptedInspection)
+        self.usedLocalVocabularyRetrieval = usedLocalVocabularyRetrieval
         pairListDigest = Self.digest(of: attempts.last?.scheduledPairs ?? [])
         self.matchingDurationSeconds = matchingDurationSeconds
         self.fallbackReasons = fallbackReasons
@@ -129,7 +132,10 @@ struct PairGraphEvidence: Codable, Sendable, Equatable {
     }
 
     func pairGraphArtifact() throws -> PairGraphArtifact {
-        .measured(try pairGraphMeasurement())
+        .measured(
+            try pairGraphMeasurement(),
+            usedLocalVocabularyRetrieval: usedLocalVocabularyRetrieval
+        )
     }
 
     func restoredPairPlan() throws -> ColmapPairPlan {

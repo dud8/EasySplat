@@ -175,9 +175,21 @@ public enum RunPlanResolver {
               previousPlan != currentPlan else {
             return lastCompletedStage
         }
+        if !input.hasVideos {
+            var inputRelevantPreviousPlan = previousPlan
+            inputRelevantPreviousPlan.geometryWorkerBudget.maximumConcurrentVideoSourceAnalysisTasks =
+                currentPlan.geometryWorkerBudget.maximumConcurrentVideoSourceAnalysisTasks
+            if inputRelevantPreviousPlan == currentPlan {
+                return lastCompletedStage
+            }
+        }
+        let videoSourceAnalysisChanged = input.hasVideos
+            && previousPlan.geometryWorkerBudget.maximumConcurrentVideoSourceAnalysisTasks
+                != currentPlan.geometryWorkerBudget.maximumConcurrentVideoSourceAnalysisTasks
         let framePreparationChanged = previousPlan.keyframeBudget != currentPlan.keyframeBudget
             || previousPlan.maximumImageDimension != currentPlan.maximumImageDimension
             || previousPlan.analysisFrameRate != currentPlan.analysisFrameRate
+            || videoSourceAnalysisChanged
             || previousPlan.photoSelection != currentPlan.photoSelection
             || previousPlan.capturePath != currentPlan.capturePath
         let geometryChanged = previousPlan.routeIdentifier != currentPlan.routeIdentifier
@@ -191,7 +203,8 @@ public enum RunPlanResolver {
             || previousPlan.refinementIterationLimit != currentPlan.refinementIterationLimit
             || previousPlan.colmapMaximumFeatureCount != currentPlan.colmapMaximumFeatureCount
             || previousPlan.colmapMaximumMatchCount != currentPlan.colmapMaximumMatchCount
-            || previousPlan.colmapThreadLimit != currentPlan.colmapThreadLimit
+            || previousPlan.geometryWorkerBudget.featureExtractionWorkers
+                != currentPlan.geometryWorkerBudget.featureExtractionWorkers
             || previousPlan.requiredToolchainCapabilities != currentPlan.requiredToolchainCapabilities
             || previousPlan.fallbackRouteIdentifiers != currentPlan.fallbackRouteIdentifiers
             || previousPlan.inputOrdering != currentPlan.inputOrdering
@@ -212,6 +225,10 @@ public enum RunPlanResolver {
             || previousPlan.retrievalNeighborCount != currentPlan.retrievalNeighborCount
             || previousPlan.retrievalQueryStride != currentPlan.retrievalQueryStride
             || previousPlan.normalDescriptorMatcher != currentPlan.normalDescriptorMatcher
+            || previousPlan.geometryWorkerBudget.coupledMatchingWorkers
+                != currentPlan.geometryWorkerBudget.coupledMatchingWorkers
+            || previousPlan.geometryWorkerBudget.vocabularyRetrievalWorkers
+                != currentPlan.geometryWorkerBudget.vocabularyRetrievalWorkers
         let safeBoundary: PipelineStage
         if framePreparationChanged {
             safeBoundary = input.hasVideos ? .importInput : .extractFrames
@@ -299,9 +316,19 @@ public enum RunPlanResolver {
         let lensProjection = options.lensProjection
         let colmapBudget = resolvedColmapBudget(
             memoryTier: memoryTier,
+            resourcePolicy: options.resourcePolicy
+        )
+        var geometryWorkerBudget = resolvedGeometryWorkerBudget(
+            memoryGB: hardware.memoryGB,
             resourcePolicy: options.resourcePolicy,
             cpuCount: hardware.cpuCount
         )
+        // Photo-only projects never launch video analysis. Resolve that unused
+        // dimension to one worker so hardware changes cannot invalidate otherwise
+        // reusable photo geometry.
+        if !input.hasVideos {
+            geometryWorkerBudget.maximumConcurrentVideoSourceAnalysisTasks = 1
+        }
 
         return ResolvedRunPlan(
             routeIdentifier: route.rawValue,
@@ -327,7 +354,7 @@ public enum RunPlanResolver {
             trainerMemoryBudgetBytes: resolvedTrainingMemoryBudget,
             colmapMaximumFeatureCount: colmapBudget.features,
             colmapMaximumMatchCount: colmapBudget.matches,
-            colmapThreadLimit: colmapBudget.threads,
+            geometryWorkerBudget: geometryWorkerBudget,
             requiredToolchainCapabilities: requiredCapabilities(route: route, model: model),
             fallbackRouteIdentifiers: [],
             capturePath: capturePath,
@@ -526,24 +553,54 @@ public enum RunPlanResolver {
 
     private static func resolvedColmapBudget(
         memoryTier: MemoryTier,
-        resourcePolicy: ResourcePolicy,
-        cpuCount: Int
-    ) -> (features: Int, matches: Int, threads: Int) {
-        let values: (features: Int, matches: Int, threadCap: Int)
+        resourcePolicy: ResourcePolicy
+    ) -> (features: Int, matches: Int) {
+        let values: (features: Int, matches: Int)
         switch memoryTier {
         case .constrained:
-            values = (4_096, 4_096, 4)
+            values = (4_096, 4_096)
         case .standard:
-            values = (8_192, 8_192, 6)
+            values = (8_192, 8_192)
         case .performance where resourcePolicy == .maximumPerformance:
-            values = (12_000, 12_000, 10)
+            values = (12_000, 12_000)
         case .performance:
-            values = (10_000, 10_000, 8)
+            values = (10_000, 10_000)
         }
-        return (
-            values.features,
-            values.matches,
-            min(max(1, cpuCount), values.threadCap)
+        return values
+    }
+
+    private static func resolvedGeometryWorkerBudget(
+        memoryGB: Double,
+        resourcePolicy: ResourcePolicy,
+        cpuCount: Int
+    ) -> GeometryWorkerBudget {
+        let logicalCPUs = max(1, cpuCount)
+        let halfLogicalCPUs = max(1, logicalCPUs / 2)
+        let caps: (
+            extraction: Int,
+            matching: Int,
+            retrieval: Int,
+            videoSourceAnalysis: Int
+        )
+        if resourcePolicy == .conserveMemory || memoryGB <= 8.5 {
+            caps = (4, 4, 4, 2)
+        } else if memoryGB <= 16.5 {
+            // Extraction and matching are sequential stages. Measurements on the
+            // constrained lane put these Pareto points well below its memory gate.
+            caps = (12, 6, 6, 2)
+        } else if resourcePolicy == .maximumPerformance {
+            caps = (16, 8, 8, 4)
+        } else if memoryGB <= 32 {
+            caps = (12, 6, 6, 3)
+        } else {
+            caps = (12, 8, 8, 4)
+        }
+
+        return GeometryWorkerBudget(
+            featureExtractionWorkers: min(logicalCPUs, caps.extraction),
+            coupledMatchingWorkers: min(halfLogicalCPUs, caps.matching),
+            vocabularyRetrievalWorkers: min(halfLogicalCPUs, caps.retrieval),
+            maximumConcurrentVideoSourceAnalysisTasks: min(logicalCPUs, caps.videoSourceAnalysis)
         )
     }
 

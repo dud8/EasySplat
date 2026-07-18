@@ -19,9 +19,29 @@ public enum RetrievalEngine: String, Codable, Sendable, Equatable {
     case localSiftVocabularyV1
 }
 
+public struct GeometryWorkerBudget: Codable, Sendable, Equatable {
+    public var featureExtractionWorkers: Int
+    public var coupledMatchingWorkers: Int
+    public var vocabularyRetrievalWorkers: Int
+    public var maximumConcurrentVideoSourceAnalysisTasks: Int
+
+    public init(
+        featureExtractionWorkers: Int,
+        coupledMatchingWorkers: Int,
+        vocabularyRetrievalWorkers: Int,
+        maximumConcurrentVideoSourceAnalysisTasks: Int
+    ) {
+        self.featureExtractionWorkers = featureExtractionWorkers
+        self.coupledMatchingWorkers = coupledMatchingWorkers
+        self.vocabularyRetrievalWorkers = vocabularyRetrievalWorkers
+        self.maximumConcurrentVideoSourceAnalysisTasks = maximumConcurrentVideoSourceAnalysisTasks
+    }
+}
+
 public enum ResolvedRunPlanValidationError: Error, LocalizedError, Equatable {
     case emptyToolchainCapabilities
     case invalidBundleAdjustmentConfiguration
+    case invalidGeometryWorkerBudget
     case invalidPairingConfiguration
     case unsupportedNormalDescriptorMatcher
     case unknownToolchainCapability(String)
@@ -33,6 +53,8 @@ public enum ResolvedRunPlanValidationError: Error, LocalizedError, Equatable {
             return "Run plan does not request any tool capabilities."
         case .invalidBundleAdjustmentConfiguration:
             return "Run plan contains an invalid bundle-adjustment configuration."
+        case .invalidGeometryWorkerBudget:
+            return "Run plan contains an invalid geometry worker budget."
         case .invalidPairingConfiguration:
             return "Run plan contains an invalid image-pairing configuration."
         case .unsupportedNormalDescriptorMatcher:
@@ -63,7 +85,7 @@ public struct ResolvedRunPlan: Codable, Sendable, Equatable {
     public var trainerMemoryBudgetBytes: Int64
     public var colmapMaximumFeatureCount: Int
     public var colmapMaximumMatchCount: Int
-    public var colmapThreadLimit: Int
+    public var geometryWorkerBudget: GeometryWorkerBudget
     public var requiredToolchainCapabilities: [String]
     public var fallbackRouteIdentifiers: [String]
     public var capturePath: CapturePath
@@ -105,7 +127,7 @@ public struct ResolvedRunPlan: Codable, Sendable, Equatable {
         trainerMemoryBudgetBytes: Int64,
         colmapMaximumFeatureCount: Int = 8_192,
         colmapMaximumMatchCount: Int = 8_192,
-        colmapThreadLimit: Int = 6,
+        geometryWorkerBudget: GeometryWorkerBudget,
         requiredToolchainCapabilities: [String],
         fallbackRouteIdentifiers: [String],
         capturePath: CapturePath = .automatic,
@@ -146,7 +168,7 @@ public struct ResolvedRunPlan: Codable, Sendable, Equatable {
         self.trainerMemoryBudgetBytes = trainerMemoryBudgetBytes
         self.colmapMaximumFeatureCount = colmapMaximumFeatureCount
         self.colmapMaximumMatchCount = colmapMaximumMatchCount
-        self.colmapThreadLimit = colmapThreadLimit
+        self.geometryWorkerBudget = geometryWorkerBudget
         self.requiredToolchainCapabilities = requiredToolchainCapabilities
         self.fallbackRouteIdentifiers = fallbackRouteIdentifiers
         self.capturePath = capturePath
@@ -171,10 +193,22 @@ public struct ResolvedRunPlan: Codable, Sendable, Equatable {
         self.runSeed = runSeed
     }
 
-    public func toolchainCapabilityRequest() throws -> ToolchainCapabilityRequest {
+    public func validate() throws {
+        try validateGeometryWorkerBudget()
         try validatePairingConfiguration()
         try validateBundleAdjustmentConfiguration()
         _ = try validatedBackendOrder()
+        _ = try validatedToolchainCapabilities()
+    }
+
+    public func toolchainCapabilityRequest() throws -> ToolchainCapabilityRequest {
+        try validate()
+        return ToolchainCapabilityRequest(
+            capabilities: try validatedToolchainCapabilities()
+        )
+    }
+
+    private func validatedToolchainCapabilities() throws -> Set<ToolchainCapability> {
         var capabilities = Set<ToolchainCapability>()
         for rawValue in requiredToolchainCapabilities {
             guard let capability = ToolchainCapability(rawValue: rawValue) else {
@@ -185,7 +219,7 @@ public struct ResolvedRunPlan: Codable, Sendable, Equatable {
         guard !capabilities.isEmpty else {
             throw ResolvedRunPlanValidationError.emptyToolchainCapabilities
         }
-        return ToolchainCapabilityRequest(capabilities: capabilities)
+        return capabilities
     }
 
     public func validatedBackendOrder() throws -> [SfmBackend] {
@@ -231,6 +265,18 @@ public struct ResolvedRunPlan: Codable, Sendable, Equatable {
               retrievalNeighborCount <= retrievalCandidateCount,
               retrievalQueryStride > 0 else {
             throw ResolvedRunPlanValidationError.invalidPairingConfiguration
+        }
+    }
+
+    private func validateGeometryWorkerBudget() throws {
+        let counts = [
+            geometryWorkerBudget.featureExtractionWorkers,
+            geometryWorkerBudget.coupledMatchingWorkers,
+            geometryWorkerBudget.vocabularyRetrievalWorkers,
+            geometryWorkerBudget.maximumConcurrentVideoSourceAnalysisTasks,
+        ]
+        guard counts.allSatisfy({ (1...64).contains($0) }) else {
+            throw ResolvedRunPlanValidationError.invalidGeometryWorkerBudget
         }
     }
 

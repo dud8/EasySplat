@@ -351,6 +351,16 @@ final class GeometryRecoveryIntegrationTests: XCTestCase {
             mapping.fallbackReason,
             "da3 fallback to colmap; interrupted mapping resumed"
         )
+        let workerExecution = try XCTUnwrap(finished.geometryArtifact?.workerExecution)
+        XCTAssertEqual(
+            workerExecution.mappingAndRefinementInvocations.map(\.command),
+            [.pointTriangulator, .mapper, .modelAnalyzer]
+        )
+        XCTAssertEqual(
+            workerExecution.mappingAndRefinementInvocations.map(\.succeeded),
+            [false, true, true],
+            "Resume must append to the failed mapping attempt instead of erasing it."
+        )
         XCTAssertNil(finished.geometryRecovery)
     }
 
@@ -839,6 +849,48 @@ final class GeometryRecoveryIntegrationTests: XCTestCase {
         XCTAssertNil(resumed.lastRunStartedAt)
     }
 
+    func testCorruptWorkerLedgerIsQuarantinedAndGeometryRegeneratesOnRetry() async throws {
+        let fixture = try makeFixture(named: "CorruptWorkerLedgerRecovery")
+        let initialRunner = MockSubprocessRunner(
+            scripts: successfulGeometryScripts(for: fixture, includePreparation: true)
+        )
+        try await makePipeline(fixture: fixture, runner: initialRunner).run { _ in }
+
+        let corrupt = Data("{not-json".utf8)
+        try corrupt.write(to: fixture.paths.workerExecutionURL, options: [.atomic])
+        let retryRunner = MockSubprocessRunner(
+            scripts: successfulGeometryScripts(for: fixture, includePreparation: true)
+        )
+
+        try await makePipeline(fixture: fixture, runner: retryRunner).run(
+            resumeFrom: .sfmMapping
+        ) { _ in }
+
+        XCTAssertEqual(
+            retryRunner.calls.compactMap { $0.1.first },
+            ["feature_extractor", "matches_importer", "mapper", "model_analyzer"]
+        )
+        let quarantined = try FileManager.default.contentsOfDirectory(
+            at: fixture.paths.logsURL,
+            includingPropertiesForKeys: nil
+        ).filter { $0.lastPathComponent.hasPrefix("worker_execution.corrupt-") }
+        XCTAssertEqual(quarantined.count, 1)
+        XCTAssertEqual(try Data(contentsOf: try XCTUnwrap(quarantined.first)), corrupt)
+        let finished = try ProjectMetadataStore.load(from: fixture.paths.metadataURL)
+        let geometry = try XCTUnwrap(finished.geometryArtifact)
+        XCTAssertFalse(geometry.pairGraph.usedLocalVocabularyRetrieval)
+        let workerExecution = geometry.workerExecution
+        XCTAssertEqual(
+            workerExecution.featureExtractionInvocations.map(\.succeeded),
+            [true]
+        )
+        XCTAssertEqual(workerExecution.matchingInvocations.map(\.succeeded), [true])
+        XCTAssertEqual(
+            workerExecution.mappingAndRefinementInvocations.map(\.succeeded),
+            [true, true]
+        )
+    }
+
     func testCancelledClassicalMappingPreservesAttemptEvidenceOnResume() async throws {
         let fixture = try makeFixture(named: "CancelledMappingResume")
         let cancellationRunner = MockSubprocessRunner(scripts: [
@@ -887,6 +939,58 @@ final class GeometryRecoveryIntegrationTests: XCTestCase {
         XCTAssertNil(finished.checkpoint)
         XCTAssertNil(finished.lastRunStartedAt)
         XCTAssertNil(finished.geometryRecovery)
+    }
+
+    func testTerminalRetryAllocatesOrdinalAfterPreservedFailedAttempt() async throws {
+        let fixture = try makeFixture(named: "TerminalMappingRetry")
+        let failedRunner = MockSubprocessRunner(scripts: [
+            featureExtractionScript(for: fixture),
+            matchingScript(for: fixture),
+            .init(
+                path: fixture.toolchain.colmap.path,
+                argsPrefix: ["mapper"],
+                result: SubprocessResult(
+                    exitCode: 1,
+                    terminationReason: .exit,
+                    stdout: "",
+                    stderr: "mapping failed"
+                )
+            ),
+        ])
+
+        await XCTAssertThrowsErrorAsync {
+            try await self.makePipeline(fixture: fixture, runner: failedRunner).run { _ in }
+        }
+        let failed = try ProjectMetadataStore.load(from: fixture.paths.metadataURL)
+        XCTAssertNotNil(failed.state.lastError)
+        XCTAssertEqual(failed.geometryRecovery?.mappingAttemptCount, 1)
+        XCTAssertEqual(
+            try GeometryWorkerExecutionArtifactStore.load(
+                from: fixture.paths.workerExecutionURL,
+                projectPaths: fixture.paths
+            ).mappingAndRefinementInvocations.map(\.mappingAttemptOrdinal),
+            [1]
+        )
+
+        let retryRunner = MockSubprocessRunner(
+            scripts: successfulGeometryScripts(for: fixture, includePreparation: false)
+        )
+        try await makePipeline(fixture: fixture, runner: retryRunner).run(
+            resumeFrom: .sfmMatching
+        ) { _ in }
+
+        let mapping = try XCTUnwrap(
+            ProjectMetadataStore.load(from: fixture.paths.metadataURL).geometryArtifact?.mapping
+        )
+        XCTAssertEqual(mapping.attemptCount, 1)
+        XCTAssertEqual(mapping.acceptedMappingAttemptOrdinal, 2)
+        XCTAssertEqual(
+            try GeometryWorkerExecutionArtifactStore.load(
+                from: fixture.paths.workerExecutionURL,
+                projectPaths: fixture.paths
+            ).mappingAndRefinementInvocations.map(\.mappingAttemptOrdinal),
+            [1, 2, 2]
+        )
     }
 
     func testOrderedQualityRejectionRetriesSameGraphWithConservativeCadence() async throws {

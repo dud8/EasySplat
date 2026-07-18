@@ -311,6 +311,33 @@ final class PipelineIntegrationTests: XCTestCase {
         let events = PipelineEventSink()
         try await pipeline.run { events.append($0) }
 
+        let launched = zip(runner.calls, runner.environments).map {
+            (command: $0.0.1.first, environment: $0.1)
+        }
+        XCTAssertEqual(
+            launched.first(where: { $0.command == "feature_extractor" })?
+                .environment["OMP_NUM_THREADS"],
+            "12"
+        )
+        XCTAssertEqual(
+            launched.first(where: { $0.command == "matches_importer" })?
+                .environment["OMP_NUM_THREADS"],
+            "8"
+        )
+        XCTAssertEqual(
+            launched.first(where: { $0.command == "local_vocab_retriever" })?
+                .environment["OMP_NUM_THREADS"],
+            "8"
+        )
+        XCTAssertNil(
+            launched.first(where: { $0.command == "mapper" })?
+                .environment["OMP_NUM_THREADS"]
+        )
+        XCTAssertTrue(
+            launched.filter { $0.command == "model_analyzer" }
+                .allSatisfy { $0.environment["OMP_NUM_THREADS"] == nil }
+        )
+
         XCTAssertEqual(powerAssertion.begun, 1, "A successful run holds exactly one idle-sleep assertion.")
         XCTAssertEqual(powerAssertion.released, 1, "A successful run must release the idle-sleep assertion.")
         XCTAssertEqual(powerAssertion.active, 0)
@@ -357,7 +384,48 @@ final class PipelineIntegrationTests: XCTestCase {
         XCTAssertEqual(geometry.provenance.solver.identifier, "colmap")
         XCTAssertNil(geometry.provenance.runtime)
         XCTAssertNil(geometry.provenance.model)
+        XCTAssertEqual(
+            geometry.workerExecution.resolvedBudget,
+            try XCTUnwrap(finalMetadata.resolvedRunPlan).geometryWorkerBudget
+        )
+        XCTAssertEqual(
+            geometry.workerExecution.featureExtractionInvocations.map(\.command),
+            [.featureExtractor]
+        )
+        XCTAssertEqual(
+            geometry.workerExecution.matchingInvocations.map(\.command),
+            [.matchesImporter]
+        )
+        XCTAssertEqual(
+            geometry.workerExecution.vocabularyRetrievalInvocations.map(\.command),
+            [.localVocabularyRetriever]
+        )
+        XCTAssertEqual(
+            geometry.workerExecution.mappingAndRefinementInvocations.map(\.command),
+            [.mapper, .modelAnalyzer, .modelAnalyzer]
+        )
+        XCTAssertEqual(
+            geometry.workerExecution.mappingAndRefinementInvocations.map(\.succeeded),
+            [true, false, true]
+        )
+        XCTAssertEqual(
+            geometry.workerExecution.videoSourceAnalysis,
+            VideoSourceAnalysisExecutionEvidence(
+                videoSourceCount: 0,
+                startedAnalysisTaskCount: 0,
+                peakInFlightAnalysisTaskCount: 0
+            )
+        )
+        XCTAssertEqual(
+            try GeometryWorkerExecutionArtifactStore.load(
+                from: paths.workerExecutionURL,
+                expectedBudget: geometry.workerExecution.resolvedBudget,
+                projectPaths: paths
+            ),
+            geometry.workerExecution
+        )
         XCTAssertEqual(geometry.pairGraph.status, .measured)
+        XCTAssertTrue(geometry.pairGraph.usedLocalVocabularyRetrieval)
         let pairGraph = try XCTUnwrap(geometry.pairGraph.measurement)
         let pairEvidence = try PairGraphEvidenceStore.load(
             from: paths.pairGraphEvidenceURL,
@@ -1521,6 +1589,17 @@ final class PipelineIntegrationTests: XCTestCase {
             accepted.attempts[1].scheduledPairs
         )
         XCTAssertEqual(accepted.pairListDigest, pendingRecovery.activePlan.sha256)
+        let finished = try ProjectMetadataStore.load(from: fixture.paths.metadataURL)
+        let workerExecution = try XCTUnwrap(finished.geometryArtifact?.workerExecution)
+        XCTAssertEqual(
+            workerExecution.matchingInvocations.map(\.command),
+            [.matchesImporter, .matchesImporter]
+        )
+        XCTAssertEqual(
+            workerExecution.matchingInvocations.map(\.succeeded),
+            [false, true],
+            "Resume must append to the failed matching attempt instead of erasing it."
+        )
         XCTAssertFalse(FileManager.default.fileExists(
             atPath: fixture.paths.pairGraphRecoveryURL.path
         ))
@@ -1913,6 +1992,286 @@ final class PipelineIntegrationTests: XCTestCase {
             28
         )
         XCTAssertEqual(try Data(contentsOf: paths.pairGraphEvidenceURL), pairEvidenceBefore)
+    }
+
+    func testPhotoOnlyInjectedPlanIgnoresUnusedVideoSourceAnalysisWorkerDifference() async throws {
+        let temp = makeTempRoot()
+        let projectURL = temp.appendingPathComponent(
+            "PhotoOnlyInjectedPlan.easysplatproj",
+            isDirectory: true
+        )
+        let sourcePhotos = temp.appendingPathComponent("SourcePhotos", isDirectory: true)
+        try FileManager.default.createDirectory(at: sourcePhotos, withIntermediateDirectories: true)
+        for index in 0..<8 {
+            try writeTestImage(
+                url: sourcePhotos.appendingPathComponent("img\(index).jpg"),
+                value: UInt8(index)
+            )
+        }
+
+        let paths = ProjectPaths(root: projectURL)
+        try paths.ensureDirectories()
+        try ProjectMetadataStore.save(
+            ProjectMetadata(
+                title: "Photo-only injected plan",
+                input: .photos(folder: sourcePhotos.path),
+                requestedRunOptions: RequestedRunOptions(
+                    detailProfile: .fast,
+                    inputOrdering: .unordered,
+                    photoSelection: .useAllValidPhotos
+                )
+            ),
+            to: paths.metadataURL
+        )
+        let toolchain = try makeToolchain(root: temp)
+        let firstRunner = MockSubprocessRunner(scripts: [
+            .init(
+                path: toolchain.colmap.path,
+                argsPrefix: ["feature_extractor"],
+                result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""),
+                onRun: { try? self.writeFeatureDatabase(for: $0) }
+            ),
+            .init(
+                path: toolchain.colmap.path,
+                argsPrefix: ["matches_importer"],
+                result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""),
+                onRun: { try? self.writeVerifiedPairResults(for: $0) }
+            ),
+            .init(
+                path: toolchain.colmap.path,
+                argsPrefix: ["mapper"],
+                result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""),
+                stdoutLines: ["Retriangulation and Global bundle adjustment"],
+                onRun: { _ in try? self.writeSparseModel(at: projectURL) }
+            ),
+            .init(
+                path: toolchain.colmap.path,
+                argsPrefix: ["model_analyzer"],
+                result: .init(
+                    exitCode: 0,
+                    terminationReason: .exit,
+                    stdout: "Registered images: 8 / 8\nPoints: 1\nObservations: 8\nMean track length: 8.0\nMean reprojection error: 0.5\n",
+                    stderr: ""
+                )
+            ),
+        ])
+        let firstPipeline = PipelineRunner(
+            projectURL: projectURL,
+            config: makePipelineConfig(
+                toolchain: toolchain,
+                candidateRoute: .colmap,
+                skipTraining: true
+            ),
+            tooling: .init(runner: firstRunner)
+        )
+        try await firstPipeline.run { _ in }
+
+        let completedMetadata = try ProjectMetadataStore.load(from: paths.metadataURL)
+        let acceptedPlan = try XCTUnwrap(completedMetadata.resolvedRunPlan)
+        let acceptedGeometry = try XCTUnwrap(completedMetadata.geometryArtifact)
+        XCTAssertEqual(acceptedPlan.geometryWorkerBudget.maximumConcurrentVideoSourceAnalysisTasks, 1)
+        let manifestBeforeResume = try Data(contentsOf: paths.geometryManifestURL)
+        let workerEvidenceBeforeResume = try Data(contentsOf: paths.workerExecutionURL)
+
+        var injectedPlan = acceptedPlan
+        injectedPlan.geometryWorkerBudget.maximumConcurrentVideoSourceAnalysisTasks += 1
+        let resumeRunner = MockSubprocessRunner(scripts: [])
+        let resumedPipeline = PipelineRunner(
+            projectURL: projectURL,
+            config: PipelineRunner.PipelineConfig(
+                toolchain: toolchain,
+                developmentOverrides: DevelopmentOverrides(
+                    candidateRoute: .colmap,
+                    skipTraining: true
+                ),
+                hardwareProfile: HardwareProfile(
+                    memoryGB: 48,
+                    cpuCount: 16,
+                    gpuWorkingSetGB: 36
+                ),
+                resolvedRunPlan: injectedPlan
+            ),
+            tooling: .init(runner: resumeRunner)
+        )
+        try await resumedPipeline.run(resumeFrom: .sfmMapping) { _ in }
+
+        XCTAssertTrue(
+            resumeRunner.calls.isEmpty,
+            "An unused photo-only video-analysis limit must not invalidate completed geometry."
+        )
+        XCTAssertEqual(try Data(contentsOf: paths.geometryManifestURL), manifestBeforeResume)
+        XCTAssertEqual(try Data(contentsOf: paths.workerExecutionURL), workerEvidenceBeforeResume)
+        let resumedMetadata = try ProjectMetadataStore.load(from: paths.metadataURL)
+        XCTAssertEqual(resumedMetadata.resolvedRunPlan, acceptedPlan)
+        XCTAssertEqual(resumedMetadata.geometryArtifact, acceptedGeometry)
+        XCTAssertEqual(resumedMetadata.state.stage, .sfmMapping)
+    }
+
+    func testPlanChangeRecoversWhenWorkerEvidenceWasRebasedBeforeMetadata() async throws {
+        let temp = makeTempRoot()
+        let projectURL = temp.appendingPathComponent(
+            "EvidenceFirstPlanChange.easysplatproj",
+            isDirectory: true
+        )
+        let sourcePhotos = temp.appendingPathComponent("SourcePhotos", isDirectory: true)
+        try FileManager.default.createDirectory(at: sourcePhotos, withIntermediateDirectories: true)
+        for index in 0..<8 {
+            try writeTestImage(
+                url: sourcePhotos.appendingPathComponent("img\(index).jpg"),
+                value: UInt8(index)
+            )
+        }
+
+        let paths = ProjectPaths(root: projectURL)
+        try paths.ensureDirectories()
+        try ProjectMetadataStore.save(
+            ProjectMetadata(
+                title: "Evidence-first plan change",
+                input: .photos(folder: sourcePhotos.path),
+                requestedRunOptions: RequestedRunOptions(
+                    detailProfile: .fast,
+                    inputOrdering: .unordered,
+                    photoSelection: .useAllValidPhotos
+                )
+            ),
+            to: paths.metadataURL
+        )
+        let toolchain = try makeToolchain(root: temp)
+        let firstRunner = MockSubprocessRunner(scripts: [
+            .init(
+                path: toolchain.colmap.path,
+                argsPrefix: ["feature_extractor"],
+                result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""),
+                onRun: { try? self.writeFeatureDatabase(for: $0) }
+            ),
+            .init(
+                path: toolchain.colmap.path,
+                argsPrefix: ["matches_importer"],
+                result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""),
+                onRun: { try? self.writeVerifiedPairResults(for: $0) }
+            ),
+            .init(
+                path: toolchain.colmap.path,
+                argsPrefix: ["mapper"],
+                result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""),
+                stdoutLines: ["Retriangulation and Global bundle adjustment"],
+                onRun: { _ in try? self.writeSparseModel(at: projectURL) }
+            ),
+            .init(
+                path: toolchain.colmap.path,
+                argsPrefix: ["model_analyzer"],
+                result: .init(
+                    exitCode: 0,
+                    terminationReason: .exit,
+                    stdout: "Registered images: 8 / 8\nPoints: 1\nObservations: 8\nMean track length: 8.0\nMean reprojection error: 0.5\n",
+                    stderr: ""
+                )
+            ),
+        ])
+        try await PipelineRunner(
+            projectURL: projectURL,
+            config: makePipelineConfig(
+                toolchain: toolchain,
+                candidateRoute: .colmap,
+                skipTraining: true
+            ),
+            tooling: .init(runner: firstRunner)
+        ).run { _ in }
+
+        let oldMetadata = try ProjectMetadataStore.load(from: paths.metadataURL)
+        let oldPlan = try XCTUnwrap(oldMetadata.resolvedRunPlan)
+        var changedPlan = oldPlan
+        changedPlan.geometryWorkerBudget.coupledMatchingWorkers -= 1
+        XCTAssertEqual(
+            RunPlanResolver.safeResumeStage(
+                .sfmMapping,
+                input: oldMetadata.input,
+                previousPlan: oldPlan,
+                currentPlan: changedPlan
+            ),
+            .sfmFeatures
+        )
+
+        var rebasedEvidence = try GeometryWorkerExecutionArtifactStore.load(
+            from: paths.workerExecutionURL,
+            expectedBudget: oldPlan.geometryWorkerBudget,
+            projectPaths: paths
+        )
+        rebasedEvidence.resolvedBudget = changedPlan.geometryWorkerBudget
+        rebasedEvidence.matchingInvocations = []
+        rebasedEvidence.vocabularyRetrievalInvocations = []
+        rebasedEvidence.mappingAndRefinementInvocations = []
+        _ = try GeometryWorkerExecutionArtifactStore.save(
+            rebasedEvidence,
+            to: paths.workerExecutionURL,
+            expectedBudget: changedPlan.geometryWorkerBudget,
+            projectPaths: paths
+        )
+        XCTAssertEqual(
+            try ProjectMetadataStore.load(from: paths.metadataURL).resolvedRunPlan,
+            oldPlan,
+            "The fixture represents a stop after evidence rebase but before metadata commit."
+        )
+
+        let resumeRunner = MockSubprocessRunner(scripts: [
+            .init(
+                path: toolchain.colmap.path,
+                argsPrefix: ["matches_importer"],
+                result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""),
+                onRun: { try? self.writeVerifiedPairResults(for: $0) }
+            ),
+            .init(
+                path: toolchain.colmap.path,
+                argsPrefix: ["mapper"],
+                result: .init(exitCode: 0, terminationReason: .exit, stdout: "", stderr: ""),
+                stdoutLines: ["Retriangulation and Global bundle adjustment"],
+                onRun: { _ in try? self.writeSparseModel(at: projectURL) }
+            ),
+            .init(
+                path: toolchain.colmap.path,
+                argsPrefix: ["model_analyzer"],
+                result: .init(
+                    exitCode: 0,
+                    terminationReason: .exit,
+                    stdout: "Registered images: 8 / 8\nPoints: 1\nObservations: 8\nMean track length: 8.0\nMean reprojection error: 0.5\n",
+                    stderr: ""
+                )
+            ),
+        ])
+        try await PipelineRunner(
+            projectURL: projectURL,
+            config: PipelineRunner.PipelineConfig(
+                toolchain: toolchain,
+                developmentOverrides: DevelopmentOverrides(
+                    candidateRoute: .colmap,
+                    skipTraining: true
+                ),
+                hardwareProfile: HardwareProfile(
+                    memoryGB: 48,
+                    cpuCount: 16,
+                    gpuWorkingSetGB: 36
+                ),
+                resolvedRunPlan: changedPlan
+            ),
+            tooling: .init(runner: resumeRunner)
+        ).run(resumeFrom: .sfmMapping) { _ in }
+
+        XCTAssertEqual(
+            resumeRunner.calls.compactMap { $0.1.first },
+            ["matches_importer", "mapper", "model_analyzer"]
+        )
+        let resumedMetadata = try ProjectMetadataStore.load(from: paths.metadataURL)
+        XCTAssertEqual(resumedMetadata.resolvedRunPlan, changedPlan)
+        let resumedGeometry = try XCTUnwrap(resumedMetadata.geometryArtifact)
+        XCTAssertEqual(resumedGeometry.workerExecution.resolvedBudget, changedPlan.geometryWorkerBudget)
+        XCTAssertEqual(
+            try GeometryWorkerExecutionArtifactStore.load(
+                from: paths.workerExecutionURL,
+                expectedBudget: changedPlan.geometryWorkerBudget,
+                projectPaths: paths
+            ),
+            resumedGeometry.workerExecution
+        )
     }
 
     func testFaissCrashOnDenserRetryUsesExactMatchingWithoutReextractingFeatures() async throws {
@@ -4994,6 +5353,30 @@ final class PipelineIntegrationTests: XCTestCase {
         metadata: inout ProjectMetadata,
         paths: ProjectPaths
     ) throws {
+        if metadata.resolvedRunPlan == nil {
+            metadata.resolvedRunPlan = RunPlanResolver.resolve(
+                requestedOptions: metadata.requestedRunOptions,
+                input: metadata.input,
+                hardware: HardwareProfile(
+                    memoryGB: 48,
+                    cpuCount: 16,
+                    gpuWorkingSetGB: 36
+                ),
+                developmentOverrides: .none
+            )
+        }
+        let workerBudget = try XCTUnwrap(
+            metadata.resolvedRunPlan?.geometryWorkerBudget
+        )
+        let workerExecution = makeGeometryWorkerExecutionArtifact(
+            resolvedBudget: workerBudget
+        )
+        _ = try GeometryWorkerExecutionArtifactStore.save(
+            workerExecution,
+            to: GeometryWorkerExecutionArtifactStore.canonicalURL(for: paths),
+            expectedBudget: workerBudget,
+            projectPaths: paths
+        )
         let modelURL = paths.colmapSparseURL.appendingPathComponent("0", isDirectory: true)
         let residuals = try ColmapResidualAnalyzer.analyze(modelDirectory: modelURL)
         let imageNames = residuals.registeredImageNames.sorted()
@@ -5052,6 +5435,7 @@ final class PipelineIntegrationTests: XCTestCase {
                 runtime: nil,
                 model: nil
             ),
+            workerExecution: workerExecution,
             pairGraph: try pairGraphEvidence.pairGraphArtifact(),
             mapping: MappingArtifact(
                 modelCount: 1,
@@ -5059,6 +5443,7 @@ final class PipelineIntegrationTests: XCTestCase {
                 secondLargestModelRegisteredViewCount: 0,
                 unionRegisteredViewCount: residuals.registeredViewCount,
                 attemptCount: 1,
+                acceptedMappingAttemptOrdinal: 1,
                 acceptedRefinementKind: .incrementalGlobal,
                 acceptedRefinementInvocationCount: 1,
                 incrementalCadence: IncrementalMappingCadenceArtifact(
@@ -5522,6 +5907,7 @@ private final class CancellationOnSfmRunner: @unchecked Sendable, SubprocessRunn
         _ arguments: [String],
         currentDirectory: URL?,
         environment: [String: String],
+        removingEnvironmentKeys: Set<String>,
         onStdout: @escaping @Sendable (String) -> Void,
         onStderr: @escaping @Sendable (String) -> Void
     ) throws -> SubprocessResult {
@@ -5533,6 +5919,7 @@ private final class CancellationOnSfmRunner: @unchecked Sendable, SubprocessRunn
         _ arguments: [String],
         currentDirectory: URL?,
         environment: [String: String],
+        removingEnvironmentKeys: Set<String>,
         onStdout: @escaping @Sendable (String) -> Void,
         onStderr: @escaping @Sendable (String) -> Void
     ) async throws -> SubprocessResult {

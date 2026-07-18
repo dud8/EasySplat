@@ -16,6 +16,7 @@
     "timing_basis",
     "expected_outcome",
     "input_kind",
+    "video_source_count",
     "gate_scopes",
     "rendering_driver_identity",
     "scoring_runtime",
@@ -30,7 +31,7 @@
     "artifacts"
   ],
   "properties": {
-    "schema_version": {"const": 3},
+    "schema_version": {"const": 7},
     "binding": {
       "type": "object",
       "additionalProperties": false,
@@ -166,6 +167,8 @@
           "additionalProperties": false,
           "required": [
             "selection_manifest_sha256",
+            "geometry_input_digest",
+            "selected_frames_digests",
             "ground_truth_poses_sha256",
             "accurate_colmap_model_sha256",
             "accurate_rendering_reference_sha256",
@@ -176,6 +179,16 @@
           ],
           "properties": {
             "selection_manifest_sha256": {"$ref": "#/$defs/sha256"},
+            "geometry_input_digest": {"$ref": "#/$defs/sha256"},
+            "selected_frames_digests": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["candidate", "fast_candidate"],
+              "properties": {
+                "candidate": {"$ref": "#/$defs/sha256"},
+                "fast_candidate": {"$ref": "#/$defs/sha256"}
+              }
+            },
             "ground_truth_poses_sha256": {"$ref": "#/$defs/sha256"},
             "accurate_colmap_model_sha256": {"$ref": "#/$defs/sha256"},
             "accurate_rendering_reference_sha256": {"$ref": "#/$defs/sha256"},
@@ -216,6 +229,7 @@
       ]
     },
     "input_kind": {"enum": ["video", "photos", "mixed"]},
+    "video_source_count": {"type": "integer", "minimum": 0},
     "gate_scopes": {"$ref": "result.schema.json#/$defs/gateScopes"},
     "rendering_driver_identity": {"$ref": "result.schema.json#/$defs/renderingDriver"},
     "scoring_runtime": {"$ref": "result.schema.json#/$defs/renderScoringRuntime"},
@@ -235,6 +249,7 @@
           "variant",
           "argv",
           "mapper_invocations",
+          "runtime_worker_evidence",
           "started_monotonic_seconds",
           "ended_monotonic_seconds",
           "process_cpu_microseconds",
@@ -267,6 +282,7 @@
               "required": [
                 "argv",
                 "outcome",
+                "mapping_attempt_ordinal",
                 "matching_attempt",
                 "pair_list_digest",
                 "descriptor_matcher"
@@ -278,11 +294,22 @@
                   "items": {"type": "string", "minLength": 1}
                 },
                 "outcome": {"enum": ["accepted", "rejected_geometry_gate"]},
+                "mapping_attempt_ordinal": {
+                  "type": "integer",
+                  "minimum": 1,
+                  "maximum": 10000
+                },
                 "matching_attempt": {"type": "integer", "minimum": 1},
                 "pair_list_digest": {"$ref": "#/$defs/sha256"},
                 "descriptor_matcher": {"enum": ["faiss", "exact"]}
               }
             }
+          },
+          "runtime_worker_evidence": {
+            "oneOf": [
+              {"type": "null"},
+              {"$ref": "#/$defs/runtimeWorkerEvidence"}
+            ]
           },
           "started_monotonic_seconds": {"type": "number", "minimum": 0},
           "ended_monotonic_seconds": {"type": "number", "exclusiveMinimum": 0},
@@ -448,10 +475,106 @@
           "artifacts": {"not": {"required": ["output_ply"]}}
         }
       }
+    },
+    {
+      "if": {
+        "properties": {"lane": {"const": "reference_m4_max"}},
+        "required": ["lane"]
+      },
+      "then": {
+        "properties": {
+          "candidate_run_configuration": {
+            "properties": {
+              "feature_extraction_workers": {"const": 12},
+              "coupled_matching_workers": {"const": 8},
+              "vocabulary_retrieval_workers": {"const": 8}
+            }
+          }
+        }
+      },
+      "else": {
+        "properties": {
+          "candidate_run_configuration": {
+            "properties": {
+              "feature_extraction_workers": {"const": 4},
+              "coupled_matching_workers": {"const": 4},
+              "vocabulary_retrieval_workers": {"const": 4}
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {"input_kind": {"const": "photos"}},
+        "required": ["input_kind"]
+      },
+      "then": {
+        "properties": {
+          "video_source_count": {"const": 0},
+          "candidate_run_configuration": {
+            "properties": {"maximum_concurrent_video_source_analysis_tasks": {"const": 1}}
+          }
+        }
+      },
+      "else": {
+        "if": {
+          "properties": {"lane": {"const": "reference_m4_max"}},
+          "required": ["lane"]
+        },
+        "then": {
+          "properties": {
+            "candidate_run_configuration": {
+              "properties": {"maximum_concurrent_video_source_analysis_tasks": {"const": 4}}
+            }
+          }
+        },
+        "else": {
+          "properties": {
+            "candidate_run_configuration": {
+              "properties": {"maximum_concurrent_video_source_analysis_tasks": {"const": 2}}
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {"input_kind": {"const": "video"}},
+        "required": ["input_kind"]
+      },
+      "then": {"properties": {"video_source_count": {"const": 1}}}
+    },
+    {
+      "if": {
+        "properties": {"input_kind": {"const": "mixed"}},
+        "required": ["input_kind"]
+      },
+      "then": {"properties": {"video_source_count": {"minimum": 1}}}
     }
   ],
   "$defs": {
     "sha256": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"},
+    "runtimeWorkerEvidence": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "artifact_name",
+        "artifact_sha256",
+        "geometry_manifest_name",
+        "geometry_manifest_sha256",
+        "geometry_input_digest",
+        "selected_frames_digest"
+      ],
+      "properties": {
+        "artifact_name": {"type": "string", "pattern": "^[a-z0-9][a-z0-9_.-]{0,63}$"},
+        "artifact_sha256": {"$ref": "#/$defs/sha256"},
+        "geometry_manifest_name": {"type": "string", "pattern": "^[a-z0-9][a-z0-9_.-]{0,63}$"},
+        "geometry_manifest_sha256": {"$ref": "#/$defs/sha256"},
+        "geometry_input_digest": {"$ref": "#/$defs/sha256"},
+        "selected_frames_digest": {"$ref": "#/$defs/sha256"}
+      }
+    },
     "candidateRunConfiguration": {
       "type": "object",
       "additionalProperties": false,
@@ -481,6 +604,10 @@
         "ba_local_num_images",
         "trainer_iterations",
         "trainer_plateau_window",
+        "feature_extraction_workers",
+        "coupled_matching_workers",
+        "vocabulary_retrieval_workers",
+        "maximum_concurrent_video_source_analysis_tasks",
         "run_seed"
       ],
       "properties": {
@@ -523,6 +650,10 @@
         "ba_local_num_images": {"const": 6},
         "trainer_iterations": {"enum": [3000, 7000]},
         "trainer_plateau_window": {"enum": [400, 800]},
+        "feature_extraction_workers": {"type": "integer", "minimum": 1, "maximum": 64},
+        "coupled_matching_workers": {"type": "integer", "minimum": 1, "maximum": 64},
+        "vocabulary_retrieval_workers": {"type": "integer", "minimum": 1, "maximum": 64},
+        "maximum_concurrent_video_source_analysis_tasks": {"type": "integer", "minimum": 1, "maximum": 64},
         "run_seed": {"const": 42}
       },
       "allOf": [

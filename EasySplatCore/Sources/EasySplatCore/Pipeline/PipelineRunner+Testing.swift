@@ -37,11 +37,14 @@ extension PipelineRunner {
         try copyFileContents(from: source, to: destination)
     }
 
-    static func test_videoAnalysisConcurrency(
-        threadLimit: Int,
-        videoCount: Int
+    static func test_videoSourceAnalysisConcurrency(
+        maximumConcurrentTasks: Int,
+        videoSourceCount: Int
     ) -> Int {
-        videoAnalysisConcurrency(threadLimit: threadLimit, videoCount: videoCount)
+        videoSourceAnalysisConcurrency(
+            maximumConcurrentTasks: maximumConcurrentTasks,
+            videoSourceCount: videoSourceCount
+        )
     }
 
     static func test_durationAwareVideoFrameTarget(

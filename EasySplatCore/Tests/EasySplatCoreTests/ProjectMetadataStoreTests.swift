@@ -2,6 +2,100 @@ import XCTest
 @testable import EasySplatCore
 
 final class ProjectMetadataStoreTests: XCTestCase {
+    func testSaveAndLoadRejectInvalidResolvedRunPlanWithoutGeometry() throws {
+        let root = try TestFileBuilder.makeTempDir()
+        defer { try? FileManager.default.removeItem(at: root) }
+        for invalidWorkerCount in [0, 65] {
+            let url = root.appendingPathComponent("project-\(invalidWorkerCount).json")
+            var plan = RunPlanResolver.resolve(
+                requestedOptions: RequestedRunOptions(),
+                input: .video(files: ["/tmp/clip.mov"]),
+                hardware: HardwareProfile(memoryGB: 48, cpuCount: 16, gpuWorkingSetGB: 36),
+                developmentOverrides: .none
+            )
+            plan.geometryWorkerBudget.coupledMatchingWorkers = invalidWorkerCount
+            let metadata = ProjectMetadata(
+                title: "Invalid plan",
+                input: .video(files: ["/tmp/clip.mov"]),
+                resolvedRunPlan: plan
+            )
+
+            XCTAssertThrowsError(try ProjectMetadataStore.save(metadata, to: url)) { error in
+                guard case ProjectMetadataStore.LoadError.invalidResolvedRunPlan = error else {
+                    return XCTFail("Expected invalid resolved plan, got \(error)")
+                }
+            }
+
+            let encoder = JSONEncoder()
+            encoder.dateEncodingStrategy = .iso8601
+            try encoder.encode(metadata).write(to: url, options: .atomic)
+            XCTAssertThrowsError(try ProjectMetadataStore.load(from: url)) { error in
+                guard case ProjectMetadataStore.LoadError.invalidResolvedRunPlan = error else {
+                    return XCTFail("Expected invalid resolved plan, got \(error)")
+                }
+            }
+        }
+    }
+
+    func testSaveAndLoadRejectMalformedEmbeddedWorkerExecution() throws {
+        let root = try TestFileBuilder.makeTempDir()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let url = root.appendingPathComponent("project.json")
+        var geometry = makeGeometryArtifact()
+        geometry.workerExecution.matchingInvocations[0].argvWorkerCount =
+            geometry.workerExecution.resolvedBudget.coupledMatchingWorkers - 1
+        let metadata = ProjectMetadata(
+            title: "Invalid worker evidence",
+            input: .photos(folder: "/tmp/photos"),
+            resolvedRunPlan: makeResolvedRunPlan(for: geometry),
+            geometryArtifact: geometry
+        )
+
+        XCTAssertThrowsError(try ProjectMetadataStore.save(metadata, to: url)) { error in
+            guard case ProjectMetadataStore.LoadError.invalidWorkerExecution = error else {
+                return XCTFail("Expected invalid worker evidence, got \(error)")
+            }
+        }
+
+        let encoder = JSONEncoder()
+        encoder.dateEncodingStrategy = .iso8601
+        try encoder.encode(metadata).write(to: url, options: .atomic)
+        XCTAssertThrowsError(try ProjectMetadataStore.load(from: url)) { error in
+            guard case ProjectMetadataStore.LoadError.invalidWorkerExecution = error else {
+                return XCTFail("Expected invalid worker evidence, got \(error)")
+            }
+        }
+    }
+
+    func testSaveAndLoadRejectEmbeddedAcceptedMappingAttemptSubstitution() throws {
+        let root = try TestFileBuilder.makeTempDir()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let url = root.appendingPathComponent("project.json")
+        var geometry = makeGeometryArtifact()
+        geometry.mapping.acceptedMappingAttemptOrdinal = 2
+        let metadata = ProjectMetadata(
+            title: "Substituted mapping attempt",
+            input: .photos(folder: "/tmp/photos"),
+            resolvedRunPlan: makeResolvedRunPlan(for: geometry),
+            geometryArtifact: geometry
+        )
+
+        XCTAssertThrowsError(try ProjectMetadataStore.save(metadata, to: url)) { error in
+            guard case ProjectMetadataStore.LoadError.invalidWorkerExecution = error else {
+                return XCTFail("Expected invalid worker evidence, got \(error)")
+            }
+        }
+
+        let encoder = JSONEncoder()
+        encoder.dateEncodingStrategy = .iso8601
+        try encoder.encode(metadata).write(to: url, options: .atomic)
+        XCTAssertThrowsError(try ProjectMetadataStore.load(from: url)) { error in
+            guard case ProjectMetadataStore.LoadError.invalidWorkerExecution = error else {
+                return XCTFail("Expected invalid worker evidence, got \(error)")
+            }
+        }
+    }
+
     func testRoundTripValidatesGeometryRecoveryState() throws {
         let root = try TestFileBuilder.makeTempDir()
         defer { try? FileManager.default.removeItem(at: root) }
@@ -61,6 +155,7 @@ final class ProjectMetadataStoreTests: XCTestCase {
         let metadata = ProjectMetadata(
             title: "Ambiguous upright",
             input: .photos(folder: "/tmp/photos"),
+            resolvedRunPlan: makeResolvedRunPlan(for: geometry),
             geometryArtifact: geometry
         )
 
@@ -96,6 +191,7 @@ final class ProjectMetadataStoreTests: XCTestCase {
             let metadata = ProjectMetadata(
                 title: name,
                 input: .photos(folder: "/tmp/photos"),
+                resolvedRunPlan: makeResolvedRunPlan(for: geometry),
                 geometryArtifact: geometry,
                 viewerPreferences: ViewerPreferences(isUprightFlipActive: true)
             )
@@ -114,10 +210,12 @@ final class ProjectMetadataStoreTests: XCTestCase {
         let root = try TestFileBuilder.makeTempDir()
         defer { try? FileManager.default.removeItem(at: root) }
         let url = root.appendingPathComponent("project.json")
+        let geometry = makeGeometryArtifact()
         let metadata = ProjectMetadata(
             title: "Forged preference",
             input: .photos(folder: "/tmp/photos"),
-            geometryArtifact: makeGeometryArtifact(),
+            resolvedRunPlan: makeResolvedRunPlan(for: geometry),
+            geometryArtifact: geometry,
             viewerPreferences: ViewerPreferences(isUprightFlipActive: true)
         )
         let encoder = JSONEncoder()
@@ -159,6 +257,7 @@ final class ProjectMetadataStoreTests: XCTestCase {
             let metadata = ProjectMetadata(
                 title: name,
                 input: .photos(folder: "/tmp/photos"),
+                resolvedRunPlan: makeResolvedRunPlan(for: geometry),
                 geometryArtifact: geometry,
                 viewerPreferences: ViewerPreferences(isUprightFlipActive: true)
             )
@@ -566,11 +665,13 @@ final class ProjectMetadataStoreTests: XCTestCase {
         let root = try TestFileBuilder.makeTempDir()
         defer { try? FileManager.default.removeItem(at: root) }
         let url = root.appendingPathComponent("project.json")
+        let geometry = makeAxisAlignedSignUnverifiedGeometryArtifact()
         let initial = ProjectMetadata(
             title: "Original",
             input: .photos(folder: "/tmp/photos"),
             requestedRunOptions: RequestedRunOptions(capturePath: .orbit, detailProfile: .balanced),
-            geometryArtifact: makeAxisAlignedSignUnverifiedGeometryArtifact(),
+            resolvedRunPlan: makeResolvedRunPlan(for: geometry),
+            geometryArtifact: geometry,
             state: PipelineState(stage: .importInput, lastError: nil),
             notes: "old note"
         )
@@ -852,4 +953,24 @@ private func makeVerifiedGeometryArtifact() -> GeometryArtifact {
     geometry.canonicalOrientation.evidence?.medianAbsoluteImageUpAgreement = 0.8
     geometry.canonicalOrientation.evidence?.signAgreement = 0.9
     return geometry
+}
+
+private func makeResolvedRunPlan(
+    for geometry: GeometryArtifact
+) -> ResolvedRunPlan {
+    var plan = RunPlanResolver.resolve(
+        requestedOptions: RequestedRunOptions(
+            capturePath: .orbit,
+            detailProfile: .balanced
+        ),
+        input: .photos(folder: "/tmp/photos"),
+        hardware: HardwareProfile(
+            memoryGB: 48,
+            cpuCount: 16,
+            gpuWorkingSetGB: 36
+        ),
+        developmentOverrides: .none
+    )
+    plan.geometryWorkerBudget = geometry.workerExecution.resolvedBudget
+    return plan
 }
