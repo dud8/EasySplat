@@ -125,12 +125,48 @@ DA3_BASE_ZIP="$OUT/toolchain-geometry-da3-base-$TOOLCHAIN_VERSION.zip"
 DA3_SMALL_ZIP="$OUT/toolchain-geometry-da3-small-$TOOLCHAIN_VERSION.zip"
 MANIFEST="$TOOLCHAINS/manifest.json"
 PUB="$TOOLCHAINS/public_key_ed25519.txt"
+TRACKED_APP_AUTHORITY="$ROOT/EasySplatApp/Resources/public_key_ed25519.txt"
 for required in "$PUB" "$MANIFEST" "$CORE_ZIP" "$DA3_BASE_ZIP" "$DA3_SMALL_ZIP"; do
   if [ ! -f "$required" ]; then
     echo "Missing existing signed toolchain artifact: $required" >&2
     exit 1
   fi
 done
+if [ ! -f "$TRACKED_APP_AUTHORITY" ]; then
+  echo "Missing tracked app authority: $TRACKED_APP_AUTHORITY" >&2
+  exit 1
+fi
+
+python3 - "$PUB" "$TRACKED_APP_AUTHORITY" <<'PY'
+import base64
+import binascii
+import sys
+from pathlib import Path
+
+
+def read_ed25519_public_key(path_value: str, label: str) -> bytes:
+    path = Path(path_value)
+    try:
+        encoded = path.read_text(encoding="ascii").strip()
+        decoded = base64.b64decode(encoded, validate=True)
+    except (OSError, UnicodeError, binascii.Error, ValueError) as error:
+        raise SystemExit(f"{label} is not a valid base64 Ed25519 public key: {path}") from error
+    if len(decoded) != 32:
+        raise SystemExit(f"{label} must decode to exactly 32 bytes: {path}")
+    return decoded
+
+
+toolchain_authority = read_ed25519_public_key(
+    sys.argv[1], "Signed toolchain authority"
+)
+tracked_app_authority = read_ed25519_public_key(
+    sys.argv[2], "Tracked app authority"
+)
+if toolchain_authority != tracked_app_authority:
+    raise SystemExit(
+        "Signed toolchain authority does not match the tracked app authority."
+    )
+PY
 
 swift run --package-path "$ROOT/Tools/ManifestTool" ManifestTool verify-release \
   --manifest "$MANIFEST" \

@@ -438,6 +438,106 @@ if "$ROOT/scripts/release/build_dmg.sh" \
 fi
 grep -Fqi 'must use HTTPS' "$insecure_release_url_error"
 
+authority_fixture="$TMP_DIR/build-dmg-authority-fixture"
+mkdir -p \
+  "$authority_fixture/scripts/release" \
+  "$authority_fixture/EasySplatApp/Resources" \
+  "$authority_fixture/Toolchains/out" \
+  "$authority_fixture/mock-bin"
+cp "$ROOT/scripts/release/build_dmg.sh" \
+  "$authority_fixture/scripts/release/build_dmg.sh"
+python3 - "$authority_fixture" <<'PY'
+import base64
+import sys
+from pathlib import Path
+
+root = Path(sys.argv[1])
+(root / "EasySplatApp/Resources/public_key_ed25519.txt").write_text(
+    base64.b64encode(bytes(range(32))).decode("ascii") + "\n",
+    encoding="ascii",
+)
+(root / "Toolchains/public_key_ed25519.txt").write_text(
+    base64.b64encode(bytes(range(1, 33))).decode("ascii"),
+    encoding="ascii",
+)
+PY
+printf '%s' '{}' >"$authority_fixture/Toolchains/manifest.json"
+for archive in \
+  "toolchain-macos-arm64-2.0.0-core.zip" \
+  "toolchain-geometry-da3-base-2.0.0.zip" \
+  "toolchain-geometry-da3-small-2.0.0.zip"; do
+  printf '%s' 'fixture' >"$authority_fixture/Toolchains/out/$archive"
+done
+cat >"$authority_fixture/mock-bin/xcodebuild" <<'EOF'
+#!/usr/bin/env bash
+test "$*" = "-license check"
+EOF
+cat >"$authority_fixture/mock-bin/swift" <<'EOF'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >>"$EASYSPLAT_TEST_SWIFT_LOG"
+echo "reached signed-closure verification" >&2
+exit 73
+EOF
+chmod +x "$authority_fixture/mock-bin/xcodebuild" \
+  "$authority_fixture/mock-bin/swift"
+authority_swift_log="$TMP_DIR/build-dmg-authority-swift.log"
+authority_mismatch_error="$TMP_DIR/build-dmg-authority-mismatch.stderr"
+if PATH="$authority_fixture/mock-bin:$PATH" \
+  EASYSPLAT_TEST_SWIFT_LOG="$authority_swift_log" \
+  "$authority_fixture/scripts/release/build_dmg.sh" \
+  --app-version "0.2.0-beta.1" \
+  --toolchain-version "2.0.0" \
+  --manifest-url "https://example.com/toolchain/manifest.json" \
+  --core-artifact-url "https://example.com/toolchain/core.zip" \
+  --da3-base-artifact-url "https://example.com/toolchain/da3-base.zip" \
+  --da3-small-artifact-url "https://example.com/toolchain/da3-small.zip" \
+  --use-existing-toolchain \
+  --unsigned-beta >/dev/null 2>"$authority_mismatch_error"; then
+  echo "Unsigned beta packaging accepted a toolchain authority that differs from the tracked app authority" >&2
+  exit 1
+fi
+grep -Fqi 'does not match the tracked app authority' "$authority_mismatch_error"
+if [ -e "$authority_swift_log" ]; then
+  echo "Unsigned beta packaging verified or built artifacts before rejecting an authority mismatch" >&2
+  exit 1
+fi
+if [ -e "$authority_fixture/build" ] || [ -e "$authority_fixture/release" ]; then
+  echo "Unsigned beta packaging produced output before rejecting an authority mismatch" >&2
+  exit 1
+fi
+
+# Cosmetic trailing whitespace must not make the same 32-byte Ed25519 authority differ.
+python3 - "$authority_fixture" <<'PY'
+import sys
+from pathlib import Path
+
+root = Path(sys.argv[1])
+tracked = (root / "EasySplatApp/Resources/public_key_ed25519.txt").read_text(
+    encoding="ascii"
+).strip()
+(root / "Toolchains/public_key_ed25519.txt").write_text(
+    tracked + "\n",
+    encoding="ascii",
+)
+PY
+authority_match_error="$TMP_DIR/build-dmg-authority-match.stderr"
+if PATH="$authority_fixture/mock-bin:$PATH" \
+  EASYSPLAT_TEST_SWIFT_LOG="$authority_swift_log" \
+  "$authority_fixture/scripts/release/build_dmg.sh" \
+  --app-version "0.2.0-beta.1" \
+  --toolchain-version "2.0.0" \
+  --manifest-url "https://example.com/toolchain/manifest.json" \
+  --core-artifact-url "https://example.com/toolchain/core.zip" \
+  --da3-base-artifact-url "https://example.com/toolchain/da3-base.zip" \
+  --da3-small-artifact-url "https://example.com/toolchain/da3-small.zip" \
+  --use-existing-toolchain \
+  --unsigned-beta >/dev/null 2>"$authority_match_error"; then
+  echo "Authority fixture unexpectedly completed packaging" >&2
+  exit 1
+fi
+grep -Fq 'reached signed-closure verification' "$authority_match_error"
+test "$(wc -l <"$authority_swift_log" | tr -d '[:space:]')" -eq 1
+
 mock_hdiutil="$TMP_DIR/mock-hdiutil.sh"
 cat >"$mock_hdiutil" <<'EOF'
 #!/usr/bin/env bash
@@ -465,9 +565,27 @@ case "$1" in
     test -d "$mountpoint"
     test -d "$EASYSPLAT_TEST_APP_PATH"
     cp -R "$EASYSPLAT_TEST_APP_PATH" "$mountpoint/EasySplat.app"
+    case "${EASYSPLAT_TEST_HDIUTIL_ATTACH_OUTPUT:-none}" in
+      canonical)
+        printf '/dev/disk42\tGUID_partition_scheme\n'
+        printf '/dev/disk42s1\tApple_HFS\t%s\n' "$mountpoint"
+        ;;
+      unrelated)
+        printf '/dev/disk98\tGUID_partition_scheme\n'
+        printf '/dev/disk98s1\tApple_HFS\t/Volumes/Not-EasySplat\n'
+        ;;
+      none) ;;
+      *) exit 2 ;;
+    esac
     ;;
   detach)
-    test -d "$2"
+    if [[ "$2" == /dev/disk* ]]; then
+      if [[ -n "${EASYSPLAT_TEST_EXPECTED_DETACH_DEVICE:-}" ]]; then
+        test "$2" = "$EASYSPLAT_TEST_EXPECTED_DETACH_DEVICE"
+      fi
+    else
+      test -d "$2"
+    fi
     if [[ -n "${EASYSPLAT_TEST_HDIUTIL_PID_FILE:-}" ]]; then
       printf '%s\n' "$$" >"$EASYSPLAT_TEST_HDIUTIL_PID_FILE"
     fi
@@ -517,6 +635,76 @@ EASYSPLAT_TEST_APP_PATH="$app_bundle" \
   --expected-version "0.2.0-beta.1" \
   --allow-incomplete \
   --skip-launch-smoke
+
+mount_device_log="$TMP_DIR/hdiutil-mount-device.log"
+mount_device_tmp="$TMP_DIR/hdiutil mount device tmp"
+mkdir -p "$mount_device_tmp"
+TMPDIR="$mount_device_tmp" \
+EASYSPLAT_HDIUTIL_BIN="$mock_hdiutil" \
+EASYSPLAT_TEST_HDIUTIL_LOG="$mount_device_log" \
+EASYSPLAT_TEST_HDIUTIL_ATTACH_OUTPUT=canonical \
+EASYSPLAT_TEST_EXPECTED_DETACH_DEVICE=/dev/disk42s1 \
+EASYSPLAT_TEST_APP_PATH="$app_bundle" \
+  "$ROOT/scripts/release/verify_beta.sh" \
+  --app "$app_bundle" \
+  --dmg "$TMP_DIR/EasySplat-0.2.0-beta.1-unsigned.dmg" \
+  --expected-version "0.2.0-beta.1" \
+  --allow-incomplete \
+  --skip-launch-smoke >/dev/null
+if [[ "$(grep -c '^detach /dev/disk42s1$' "$mount_device_log")" -ne 1 ]]; then
+  echo "Beta verifier did not detach the device mounted at its exact mount point" >&2
+  exit 1
+fi
+
+unrelated_device_log="$TMP_DIR/hdiutil-unrelated-device.log"
+unrelated_device_tmp="$TMP_DIR/hdiutil-unrelated-device-tmp"
+mkdir -p "$unrelated_device_tmp"
+TMPDIR="$unrelated_device_tmp" \
+EASYSPLAT_HDIUTIL_BIN="$mock_hdiutil" \
+EASYSPLAT_TEST_HDIUTIL_LOG="$unrelated_device_log" \
+EASYSPLAT_TEST_HDIUTIL_ATTACH_OUTPUT=unrelated \
+EASYSPLAT_TEST_APP_PATH="$app_bundle" \
+  "$ROOT/scripts/release/verify_beta.sh" \
+  --app "$app_bundle" \
+  --dmg "$TMP_DIR/EasySplat-0.2.0-beta.1-unsigned.dmg" \
+  --expected-version "0.2.0-beta.1" \
+  --allow-incomplete \
+  --skip-launch-smoke >/dev/null
+if grep -q '^detach /dev/disk' "$unrelated_device_log"; then
+  echo "Beta verifier detached a device that was not tied to its mount point" >&2
+  exit 1
+fi
+unrelated_detach_target="$(awk '$1 == "detach" { sub(/^detach /, ""); print; exit }' \
+  "$unrelated_device_log")"
+case "$unrelated_detach_target" in
+  "$unrelated_device_tmp"/easysplat-beta-mount.*) ;;
+  *)
+    echo "Beta verifier did not fall back to its own mount point" >&2
+    exit 1
+    ;;
+esac
+
+python3 - "$ROOT/scripts/release/verify_beta.sh" <<'PY'
+import sys
+from pathlib import Path
+
+source = Path(sys.argv[1]).read_text(encoding="utf-8")
+if 'SMOKE_APPLICATIONS_DIR="$SMOKE_INSTALL_ROOT/Applications"' not in source:
+    raise SystemExit(
+        "Beta verifier does not create a unique temporary Applications directory"
+    )
+if '"$INSTALLED_APP" "${EASYSPLAT_SMOKE_SECONDS:-3}"' not in source:
+    raise SystemExit("Beta verifier does not launch the temporary installed app")
+launch_guard = source.index("guard let application = launchedApplication else")
+window_deadline = source.index(
+    "let windowDeadline = Date().addingTimeInterval(timeout)", launch_guard
+)
+window_loop = source.index("while Date() < windowDeadline", window_deadline)
+if not launch_guard < window_deadline < window_loop:
+    raise SystemExit(
+        "Beta verifier does not give window discovery a fresh timeout after launch completes"
+    )
+PY
 
 detach_retry_log="$TMP_DIR/hdiutil-detach-retry.log"
 detach_retry_state="$TMP_DIR/hdiutil-detach-retry.state"
@@ -927,7 +1115,10 @@ if ! grep -Fqi 'exited during launch smoke' "$early_exit_error"; then
 fi
 
 headless_error="$TMP_DIR/release-verifier-headless.stderr"
-if EASYSPLAT_HDIUTIL_BIN="$mock_hdiutil" \
+headless_install_tmp="$TMP_DIR/headless-install-tmp"
+mkdir -p "$headless_install_tmp"
+if TMPDIR="$headless_install_tmp" \
+  EASYSPLAT_HDIUTIL_BIN="$mock_hdiutil" \
   EASYSPLAT_TEST_HDIUTIL_LOG="$hdiutil_log" \
   EASYSPLAT_TEST_APP_PATH="$app_bundle" \
   EASYSPLAT_SMOKE_SECONDS=1 \
@@ -943,6 +1134,11 @@ if ! grep -Fqi 'without a normal app window' "$headless_error"; then
   cat "$headless_error" >&2
   exit 1
 fi
+if find "$headless_install_tmp" -maxdepth 1 -name 'easysplat-beta-install.*' \
+  -print -quit | grep -q .; then
+  echo "Beta verifier left its temporary installation after a no-window failure" >&2
+  exit 1
+fi
 
 window_fixture_source="$TMP_DIR/window-fixture.m"
 cat >"$window_fixture_source" <<'EOF'
@@ -950,6 +1146,11 @@ cat >"$window_fixture_source" <<'EOF'
 
 int main(void) {
     @autoreleasepool {
+        NSString *bundlePath = [[NSBundle mainBundle] bundlePath];
+        if (![[[bundlePath stringByDeletingLastPathComponent] lastPathComponent]
+                isEqualToString:@"Applications"]) {
+            return 2;
+        }
         NSApplication *application = [NSApplication sharedApplication];
         BOOL accessory = getenv("EASYSPLAT_TEST_ACCESSORY_FIXTURE") != NULL;
         [application setActivationPolicy:(accessory
@@ -982,6 +1183,9 @@ cp "$window_fixture_binary" "$window_app_fixture/EasySplat.app/Contents/MacOS/Ea
 xcrun dsymutil "$window_fixture_binary" -o "$window_app_fixture/EasySplat.app.dSYM"
 /usr/bin/codesign --force --deep --sign - --timestamp=none \
   "$window_app_fixture/EasySplat.app"
+smoke_install_tmp="$TMP_DIR/launch-smoke-install-tmp"
+mkdir -p "$smoke_install_tmp"
+TMPDIR="$smoke_install_tmp" \
 EASYSPLAT_HDIUTIL_BIN="$mock_hdiutil" \
 EASYSPLAT_TEST_HDIUTIL_LOG="$hdiutil_log" \
 EASYSPLAT_TEST_APP_PATH="$window_app_fixture/EasySplat.app" \
@@ -991,6 +1195,11 @@ EASYSPLAT_SMOKE_SECONDS=3 \
   --dmg "$TMP_DIR/EasySplat-0.2.0-beta.1-unsigned.dmg" \
   --expected-version "0.2.0-beta.1" \
   --allow-incomplete >/dev/null
+if find "$smoke_install_tmp" -maxdepth 1 -name 'easysplat-beta-install.*' \
+  -print -quit | grep -q .; then
+  echo "Beta verifier left its temporary Applications installation after launch smoke" >&2
+  exit 1
+fi
 
 accessory_error="$TMP_DIR/release-verifier-accessory.stderr"
 if EASYSPLAT_HDIUTIL_BIN="$mock_hdiutil" \

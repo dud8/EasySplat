@@ -25,9 +25,11 @@ HDIUTIL_BIN="${EASYSPLAT_HDIUTIL_BIN:-hdiutil}"
 CURL_BIN="${EASYSPLAT_CURL_BIN:-/usr/bin/curl}"
 EXPECTED_RELEASE_RUNNER=""
 MOUNT_DIR=""
+MOUNT_DEVICE=""
 MOUNT_ATTACHED=0
 E2E_DIR=""
 SMOKE_LOG=""
+SMOKE_INSTALL_ROOT=""
 REMOTE_MANIFEST=""
 MAX_PUBLISHED_MANIFEST_BYTES=16777216
 FINAL_SUCCESS_MESSAGE=""
@@ -37,7 +39,8 @@ usage() {
 }
 
 detach_disk_image_once() {
-  python3 - "$HDIUTIL_BIN" "$MOUNT_DIR" <<'PY'
+  local detach_target="${MOUNT_DEVICE:-$MOUNT_DIR}"
+  python3 - "$HDIUTIL_BIN" "$detach_target" <<'PY'
 import os
 import signal
 import subprocess
@@ -129,6 +132,10 @@ cleanup() {
   fi
   if [ -n "$SMOKE_LOG" ] && ! rm -f "$SMOKE_LOG"; then
     echo "error: could not remove beta verification smoke log: $SMOKE_LOG" >&2
+    cleanup_failed=1
+  fi
+  if [ -n "$SMOKE_INSTALL_ROOT" ] && ! rm -rf "$SMOKE_INSTALL_ROOT"; then
+    echo "error: could not remove beta verification installed app: $SMOKE_INSTALL_ROOT" >&2
     cleanup_failed=1
   fi
   if [ -n "$REMOTE_MANIFEST" ] && ! rm -f "$REMOTE_MANIFEST"; then
@@ -474,8 +481,17 @@ fi
 
 "$HDIUTIL_BIN" verify "$DMG_PATH" >/dev/null
 MOUNT_DIR="$(mktemp -d "${TMPDIR:-/tmp}/easysplat-beta-mount.XXXXXX")"
-"$HDIUTIL_BIN" attach -readonly -nobrowse -mountpoint "$MOUNT_DIR" "$DMG_PATH" >/dev/null
+ATTACH_OUTPUT="$("$HDIUTIL_BIN" attach -readonly -nobrowse -mountpoint "$MOUNT_DIR" "$DMG_PATH")"
 MOUNT_ATTACHED=1
+MOUNT_DEVICE="$(printf '%s\n' "$ATTACH_OUTPUT" | awk -v mount="$MOUNT_DIR" '
+  $1 ~ /^\/dev\/disk[0-9]+(s[0-9]+)*$/ &&
+  length($0) > length(mount) &&
+  substr($0, length($0) - length(mount) + 1) == mount &&
+  substr($0, length($0) - length(mount), 1) ~ /[[:space:]]/ {
+    print $1
+    exit
+  }
+')"
 DISTRIBUTED_APP="$MOUNT_DIR/EasySplat.app"
 DISTRIBUTED_INFO_PLIST="$DISTRIBUTED_APP/Contents/Info.plist"
 DISTRIBUTED_EXECUTABLE="$DISTRIBUTED_APP/Contents/MacOS/EasySplatApp"
@@ -563,8 +579,26 @@ PY
 fi
 
 if [ "$SKIP_LAUNCH_SMOKE" -eq 0 ]; then
+  SMOKE_INSTALL_ROOT="$(mktemp -d "${TMPDIR:-/tmp}/easysplat-beta-install.XXXXXX")"
+  SMOKE_APPLICATIONS_DIR="$SMOKE_INSTALL_ROOT/Applications"
+  INSTALLED_APP="$SMOKE_APPLICATIONS_DIR/EasySplat.app"
+  INSTALLED_INFO_PLIST="$INSTALLED_APP/Contents/Info.plist"
+  INSTALLED_EXECUTABLE="$INSTALLED_APP/Contents/MacOS/EasySplatApp"
+  mkdir -p "$SMOKE_APPLICATIONS_DIR"
+  /usr/bin/ditto "$DISTRIBUTED_APP" "$INSTALLED_APP"
+  [ -d "$INSTALLED_APP" ] && [ -x "$INSTALLED_EXECUTABLE" ]
+  plutil -lint "$INSTALLED_INFO_PLIST" >/dev/null
+  [ "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$INSTALLED_INFO_PLIST")" = "com.easysplat.app" ]
+  [ "$(/usr/libexec/PlistBuddy -c 'Print :EasySplatReleaseVersion' "$INSTALLED_INFO_PLIST")" = "$EXPECTED_VERSION" ]
+  [ "$(/usr/libexec/PlistBuddy -c 'Print :EasySplatReleaseChannel' "$INSTALLED_INFO_PLIST")" = "unsigned-beta" ]
+  verify_arm64_executable "Installed app" "$INSTALLED_EXECUTABLE"
+  verify_adhoc_bundle "$INSTALLED_APP"
+  verify_matching_executable_hashes "$DISTRIBUTED_EXECUTABLE" "$INSTALLED_EXECUTABLE"
+  if [ "$VERIFY_BUNDLED_TOOLCHAIN" -eq 1 ]; then
+    validate_bundled_toolchain_contract "$INSTALLED_APP"
+  fi
   SMOKE_LOG="$(mktemp "${TMPDIR:-/tmp}/easysplat-launch-smoke.XXXXXX")"
-  if ! /usr/bin/xcrun swift - "$DISTRIBUTED_APP" "${EASYSPLAT_SMOKE_SECONDS:-3}" \
+  if ! /usr/bin/xcrun swift - "$INSTALLED_APP" "${EASYSPLAT_SMOKE_SECONDS:-3}" \
     >"$SMOKE_LOG" 2>&1 <<'SWIFT'
 import AppKit
 import CoreGraphics
@@ -647,7 +681,8 @@ guard let application = launchedApplication else {
 
 var foundAppWindow = false
 var sawAnyAppWindow = false
-while Date() < deadline {
+let windowDeadline = Date().addingTimeInterval(timeout)
+while Date() < windowDeadline {
     if application.isTerminated {
         fail("App exited during launch smoke.")
     }
@@ -675,6 +710,8 @@ SWIFT
   fi
   rm -f "$SMOKE_LOG"
   SMOKE_LOG=""
+  rm -rf "$SMOKE_INSTALL_ROOT"
+  SMOKE_INSTALL_ROOT=""
 else
   echo "INCOMPLETE TEST MODE: launch smoke disabled."
 fi
