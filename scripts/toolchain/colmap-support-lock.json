@@ -1,0 +1,37 @@
+{
+  "dependencies": {
+    "boost": {
+      "license": "BSL-1.0",
+      "source": {
+        "sha256": "9e6bee9ab529fb2b0733049692d57d10a72202af085e553539a05b4204211a6f",
+        "url": "https://github.com/boostorg/boost/releases/download/boost-1.90.0/boost-1.90.0-b2-nodocs.tar.xz"
+      },
+      "version": "1.90.0"
+    },
+    "gflags": {
+      "license": "BSD-3-Clause",
+      "source": {
+        "sha256": "f619a51371f41c0ad6837b2a98af9d4643b3371015d873887f7e8d3237320b2f",
+        "url": "https://github.com/gflags/gflags/archive/refs/tags/v2.3.0.tar.gz"
+      },
+      "version": "2.3.0"
+    },
+    "glog": {
+      "license": "BSD-3-Clause",
+      "source": {
+        "sha256": "00e4a87e87b7e7612f519a41e491f16623b12423620006f59f5688bfd8d13b08",
+        "url": "https://github.com/google/glog/archive/refs/tags/v0.7.1.tar.gz"
+      },
+      "version": "0.7.1"
+    },
+    "libomp": {
+      "license": "Apache-2.0 WITH LLVM-exception",
+      "source": {
+        "sha256": "922f1817a0df7b1489272d18134ee0087a8b068828f87ac63b9861b1a9965888",
+        "url": "https://github.com/llvm/llvm-project/releases/download/llvmorg-22.1.8/llvm-project-22.1.8.src.tar.xz"
+      },
+      "version": "22.1.8"
+    }
+  },
+  "schemaVersion": 1
+}

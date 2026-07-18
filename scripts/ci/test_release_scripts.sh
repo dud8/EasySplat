@@ -61,6 +61,8 @@ cleanup() {
 trap cleanup EXIT
 
 python3 "$ROOT/scripts/toolchain/tests/test_generate_supply_chain_manifest.py"
+python3 "$ROOT/scripts/toolchain/tests/test_colmap_support_builder.py" \
+  SourceContractTests ArchiveSafetyTests ReleaseArchiveMetadataTests AtomicPromotionTests
 python3 "$ROOT/scripts/toolchain/tests/test_native_colmap_retriever.py" SourceContractTests
 python3 "$ROOT/scripts/release/tests/test_verify_publication_bundle.py"
 
@@ -1969,9 +1971,9 @@ test "$portable_line" -lt "$verify_line"
 test "$verify_line" -lt "$receipt_line"
 test "$receipt_line" -lt "$launch_line"
 test "$launch_line" -lt "$supply_line"
-grep -Fq 'zip -q -r -D "$CORE_ZIP"' "$ROOT/scripts/toolchain/package_toolchain.sh"
-grep -Fq 'zip -q -r -D "$DA3_BASE_ZIP" da3_mps/models/DA3-BASE' "$ROOT/scripts/toolchain/package_toolchain.sh"
-grep -Fq 'zip -q -r -D "$DA3_SMALL_ZIP" da3_mps/models/DA3-SMALL' "$ROOT/scripts/toolchain/package_toolchain.sh"
+grep -Fq 'zip -q -r -D -X "$CORE_ZIP"' "$ROOT/scripts/toolchain/package_toolchain.sh"
+grep -Fq 'zip -q -r -D -X "$DA3_BASE_ZIP" da3_mps/models/DA3-BASE' "$ROOT/scripts/toolchain/package_toolchain.sh"
+grep -Fq 'zip -q -r -D -X "$DA3_SMALL_ZIP" da3_mps/models/DA3-SMALL' "$ROOT/scripts/toolchain/package_toolchain.sh"
 grep -Fq 'rm -rf "$target/.cache"' "$ROOT/scripts/toolchain/build_da3_mps.sh"
 grep -Fq 'assert_exact_da3_model_payload "$DA3_MPS_INSTALL/da3_mps/models/$model"' "$ROOT/scripts/toolchain/package_toolchain.sh"
 grep -Fq 'MAX_RELEASE_ASSET_BYTES=2147483648' "$ROOT/scripts/toolchain/package_toolchain.sh"

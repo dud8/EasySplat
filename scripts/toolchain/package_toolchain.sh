@@ -589,13 +589,13 @@ for forbidden in AGPL CGAL LSD SPQR SiftGPU da3_streaming salad; do
 done
 
 pushd "$OUT" >/dev/null
-zip -q -r -D "$CORE_ZIP" \
+zip -q -r -D -X "$CORE_ZIP" \
   bin \
   licenses provenance supply-chain/components.json \
   msplat/build_info.json msplat/LICENSE \
   da3_mps/bin da3_mps/python da3_mps/app da3_mps/vendor da3_mps/licenses da3_mps/build_info.json
-zip -q -r -D "$DA3_BASE_ZIP" da3_mps/models/DA3-BASE
-zip -q -r -D "$DA3_SMALL_ZIP" da3_mps/models/DA3-SMALL
+zip -q -r -D -X "$DA3_BASE_ZIP" da3_mps/models/DA3-BASE
+zip -q -r -D -X "$DA3_SMALL_ZIP" da3_mps/models/DA3-SMALL
 popd >/dev/null
 
 assert_release_asset_size "$CORE_ZIP"
