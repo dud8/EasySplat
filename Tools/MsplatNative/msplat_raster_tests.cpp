@@ -3,9 +3,11 @@
 #include <cmath>
 #include <cstdint>
 #include <cstdlib>
+#include <cstring>
 #include <filesystem>
 #include <iostream>
 #include <limits>
+#include <sstream>
 #include <stdexcept>
 #include <string>
 #include <tuple>
@@ -63,6 +65,288 @@ void verifyExactRadixPassPlanning() {
     if (!rejectedEmptyGrid) {
         throw std::runtime_error("exact radix planner accepted an empty tile grid");
     }
+}
+
+struct RadixEntry {
+    std::uint64_t key;
+    std::uint32_t value;
+};
+
+constexpr std::size_t radixCanaryCount = 16;
+constexpr std::uint64_t radixKeyCanary = 0xd15ea5e5c0decafeULL;
+constexpr std::uint32_t radixValueCanary = 0xf00dcafeU;
+
+std::uint32_t radixValue(std::size_t index) {
+    return 0x9e3779b9U ^ static_cast<std::uint32_t>(index * 2'654'435'761ULL);
+}
+
+std::string radixMismatch(
+    const std::string &label,
+    int repetition,
+    std::size_t index,
+    const RadixEntry &expected,
+    std::uint64_t actualKey,
+    std::uint32_t actualValue
+) {
+    std::ostringstream message;
+    message << label << " repetition " << repetition
+            << " differs from stable CPU order at index " << index
+            << std::hex
+            << ": expected key=0x" << expected.key
+            << " value=0x" << expected.value
+            << ", got key=0x" << actualKey
+            << " value=0x" << actualValue;
+    return message.str();
+}
+
+void verifyExactRadixCase(
+    const std::string &label,
+    const std::vector<std::uint64_t> &keys,
+    std::uint32_t capacity,
+    std::uint32_t tileCount,
+    int repetitions,
+    bool verifyTileDepthOrder = false
+) {
+    if (keys.size() > capacity) {
+        throw std::runtime_error(label + " test data exceeds its declared capacity");
+    }
+
+    const std::uint32_t count = static_cast<std::uint32_t>(keys.size());
+    const std::size_t allocationCount =
+        static_cast<std::size_t>(capacity) + radixCanaryCount;
+    std::vector<std::uint64_t> inputKeys(allocationCount, radixKeyCanary);
+    std::vector<std::uint32_t> inputValues(allocationCount, radixValueCanary);
+    std::vector<RadixEntry> expected;
+    expected.reserve(keys.size());
+    for (std::size_t index = 0; index < keys.size(); ++index) {
+        const std::uint32_t value = radixValue(index);
+        inputKeys[index] = keys[index];
+        inputValues[index] = value;
+        expected.push_back({keys[index], value});
+    }
+    std::stable_sort(
+        expected.begin(),
+        expected.end(),
+        [](const RadixEntry &left, const RadixEntry &right) {
+            return left.key < right.key;
+        }
+    );
+    const std::vector<std::uint64_t> originalKeys = inputKeys;
+    const std::vector<std::uint32_t> originalValues = inputValues;
+
+    for (int repetition = 0; repetition < repetitions; ++repetition) {
+        std::vector<std::uint64_t> actualKeys(allocationCount, radixKeyCanary);
+        std::vector<std::uint32_t> actualValues(allocationCount, radixValueCanary);
+        msplat_exact_radix_sort_for_testing(
+            inputKeys.data(),
+            inputValues.data(),
+            count,
+            capacity,
+            tileCount,
+            actualKeys.data(),
+            actualValues.data()
+        );
+
+        for (std::size_t index = 0; index < expected.size(); ++index) {
+            if (actualKeys[index] != expected[index].key ||
+                actualValues[index] != expected[index].value) {
+                throw std::runtime_error(
+                    radixMismatch(
+                        label,
+                        repetition + 1,
+                        index,
+                        expected[index],
+                        actualKeys[index],
+                        actualValues[index]
+                    )
+                );
+            }
+        }
+        if (verifyTileDepthOrder) {
+            for (std::size_t index = 1; index < count; ++index) {
+                const std::uint32_t previousTile =
+                    static_cast<std::uint32_t>(actualKeys[index - 1] >> 32);
+                const std::uint32_t tile =
+                    static_cast<std::uint32_t>(actualKeys[index] >> 32);
+                const std::uint32_t previousDepthBits =
+                    static_cast<std::uint32_t>(actualKeys[index - 1]);
+                const std::uint32_t depthBits =
+                    static_cast<std::uint32_t>(actualKeys[index]);
+                float previousDepth = 0;
+                float depth = 0;
+                std::memcpy(&previousDepth, &previousDepthBits, sizeof(previousDepth));
+                std::memcpy(&depth, &depthBits, sizeof(depth));
+                if (tile < previousTile ||
+                    (tile == previousTile && depth < previousDepth)) {
+                    throw std::runtime_error(
+                        label + " is not numerically ordered by tile and positive depth"
+                    );
+                }
+            }
+        }
+        for (std::size_t index = count; index < allocationCount; ++index) {
+            if (actualKeys[index] != radixKeyCanary ||
+                actualValues[index] != radixValueCanary) {
+                throw std::runtime_error(
+                    label + " wrote beyond its logical output at index " +
+                    std::to_string(index)
+                );
+            }
+        }
+        if (inputKeys != originalKeys || inputValues != originalValues) {
+            throw std::runtime_error(label + " modified its input buffers");
+        }
+    }
+    std::cout << "radix_oracle_case=" << label
+              << " count=" << count
+              << " capacity=" << capacity
+              << " repetitions=" << repetitions << '\n';
+}
+
+std::uint64_t nextRadixRandom(std::uint64_t &state) {
+    state ^= state >> 12;
+    state ^= state << 25;
+    state ^= state >> 27;
+    return state * 2'685'821'657'736'338'717ULL;
+}
+
+void deterministicShuffle(std::vector<std::uint64_t> &values, std::uint64_t seed) {
+    for (std::size_t index = values.size(); index > 1; --index) {
+        const std::size_t destination = static_cast<std::size_t>(
+            nextRadixRandom(seed) % index
+        );
+        std::swap(values[index - 1], values[destination]);
+    }
+}
+
+std::uint32_t positiveFloatBits(float value) {
+    std::uint32_t bits = 0;
+    static_assert(sizeof(bits) == sizeof(value));
+    std::memcpy(&bits, &value, sizeof(bits));
+    return bits;
+}
+
+void verifyExactRadixOracle() {
+    msplat_exact_radix_sort_for_testing(nullptr, nullptr, 0, 0, 1, nullptr, nullptr);
+    verifyExactRadixCase("empty", {}, 0, 1, 2);
+    verifyExactRadixCase("single", {0x12345678ULL}, 1, 1, 2);
+
+    verifyExactRadixCase(
+        "equal_513",
+        std::vector<std::uint64_t>(513, 0x01020304ULL),
+        1024,
+        1,
+        2
+    );
+
+    std::vector<std::uint64_t> sameLowDigit;
+    sameLowDigit.reserve(256);
+    for (std::uint64_t index = 0; index < 256; ++index) {
+        sameLowDigit.push_back(((index * 193) % 256) << 8 | 0x5aULL);
+    }
+    verifyExactRadixCase("same_low_digit_256", sameLowDigit, 256, 1, 2);
+
+    std::vector<std::uint64_t> everyDigit;
+    everyDigit.reserve(256);
+    for (std::uint64_t digit = 0; digit < 256; ++digit) {
+        everyDigit.push_back(digit);
+    }
+    deterministicShuffle(everyDigit, 0x256d1617ULL);
+    verifyExactRadixCase("all_low_digits_shuffled", everyDigit, 256, 1, 2);
+
+    std::vector<std::uint64_t> crossSimdDuplicates;
+    crossSimdDuplicates.reserve(512);
+    for (std::uint64_t index = 0; index < 512; ++index) {
+        const std::uint64_t key = ((index * 37 + index / 32) % 23) << 8 |
+            ((index * 11) % 7);
+        crossSimdDuplicates.push_back(key);
+    }
+    verifyExactRadixCase(
+        "cross_simd_duplicates_512", crossSimdDuplicates, 512, 1, 2
+    );
+
+    std::vector<std::uint64_t> partialGroup;
+    partialGroup.reserve(239);
+    for (std::uint64_t index = 0; index < 239; ++index) {
+        partialGroup.push_back((((index * 73) % 67) + (index % 5) * 256) << 8);
+    }
+    verifyExactRadixCase(
+        "partial_group_digit_zero_239", partialGroup, 2048, 1, 2
+    );
+
+    for (std::uint32_t count : {31U, 32U, 33U, 255U, 256U, 257U, 511U, 512U, 513U}) {
+        std::vector<std::uint64_t> boundary;
+        boundary.reserve(count);
+        std::uint64_t state = 0x424f554e44415259ULL ^ count;
+        for (std::uint32_t index = 0; index < count; ++index) {
+            const std::uint64_t random = nextRadixRandom(state);
+            const std::uint64_t tile = random % 513;
+            const std::uint64_t depth = (random >> 16) & 0xffffU;
+            boundary.push_back(tile << 32 | depth);
+        }
+        verifyExactRadixCase(
+            "boundary_" + std::to_string(count),
+            boundary,
+            count,
+            513,
+            2
+        );
+    }
+
+    std::vector<std::uint64_t> realistic;
+    realistic.reserve(4096);
+    constexpr float depths[] = {
+        0.01f, 0.5f, 0.5f, 1.0f, 3.25f, 10.0f, 10.0f, 250.0f,
+    };
+    for (std::uint32_t index = 0; index < 4096; ++index) {
+        const std::uint32_t tile = (index * 193 + index / 17) % 258;
+        const float depth = depths[(index * 5 + index / 11) % std::size(depths)];
+        realistic.push_back(
+            static_cast<std::uint64_t>(tile) << 32 | positiveFloatBits(depth)
+        );
+    }
+    deterministicShuffle(realistic, 0x7265616c69737469ULL);
+    verifyExactRadixCase(
+        "realistic_tile_depth_ties", realistic, 8192, 258, 2, true
+    );
+
+    std::vector<std::uint64_t> eightPass {
+        0ULL,
+        1ULL << 63,
+        std::numeric_limits<std::uint64_t>::max(),
+        1ULL << 56,
+        1ULL << 48,
+        (1ULL << 48) | 0xffffffffULL,
+        0x7fffffffffffffffULL,
+        0xff00000000000000ULL,
+        0x0102030405060708ULL,
+        0x0102030405060708ULL,
+    };
+    deterministicShuffle(eightPass, 0x3862697470617373ULL);
+    verifyExactRadixCase("eight_pass_high_bits", eightPass, 64, 65'537, 2);
+
+    constexpr std::uint32_t stressCount = 1'048'579;
+    constexpr std::uint32_t stressCapacity = 2'097'152;
+    std::vector<std::uint64_t> stress;
+    stress.reserve(stressCount);
+    std::uint64_t state = 0x6d73706c61742d31ULL;
+    for (std::uint32_t index = 0; index < stressCount; ++index) {
+        std::uint64_t key = nextRadixRandom(state);
+        if (index % 17 == 0) {
+            key &= 0x0000fffffffff000ULL;
+        }
+        stress.push_back(key);
+    }
+    verifyExactRadixCase(
+        "deterministic_stress_1048579",
+        stress,
+        stressCapacity,
+        65'537,
+        1
+    );
+
+    cleanup_msplat_metal();
+    std::cout << "msplat exact radix oracle passed\n";
 }
 
 void requireRelativeNear(
@@ -1810,6 +2094,10 @@ void verifyStageTiming(const std::string &dataset) {
 int main(int argc, char **argv) {
     try {
         verifyExactRadixPassPlanning();
+        if (argc == 2 && std::string(argv[1]) == "--radix-oracle") {
+            verifyExactRadixOracle();
+            return 0;
+        }
         if (argc == 3 && std::string(argv[1]) == "--geometry-adam-benchmark") {
             benchmarkGeometryAdamFusion(argv[2]);
             return 0;
@@ -1823,6 +2111,7 @@ int main(int argc, char **argv) {
                 "usage: msplat-raster-tests <parity dataset> <mixed-resolution dataset> "
                 "<overflow dataset> <broad-overflow dataset> "
                 "<increasing-overflow dataset> <exact-budget dataset>\n"
+                "       msplat-raster-tests --radix-oracle\n"
                 "       msplat-raster-tests --stage-timing <profile dataset>\n"
                 "       msplat-raster-tests --geometry-adam-benchmark <dataset>"
             );

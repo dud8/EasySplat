@@ -17,6 +17,7 @@ MEMORY_EFFICIENCY_PATCH="$ROOT/Tools/MsplatNative/msplat-1.1.3-memory-efficiency
 DENSIFICATION_MEMORY_PATCH="$ROOT/Tools/MsplatNative/msplat-1.1.3-densification-memory.patch"
 ROW_SPAN_CULLING_PATCH="$ROOT/Tools/MsplatNative/msplat-1.1.3-row-span-culling.patch"
 GEOMETRY_ADAM_FUSION_PATCH="$ROOT/Tools/MsplatNative/msplat-1.1.3-geometry-adam-fusion.patch"
+PARALLEL_RADIX_SCAN_PATCH="$ROOT/Tools/MsplatNative/msplat-1.1.3-parallel-radix-scan.patch"
 TILE_SPAN_TEST_ROOT="$ROOT/Tools/MsplatNative/TileSpanTests"
 FIXTURE_GENERATOR="$ROOT/scripts/ci/generate_msplat_sparse_fixtures.py"
 VALIDATOR="$ROOT/scripts/toolchain/validate_native_msplat.sh"
@@ -61,6 +62,7 @@ require_file "$MEMORY_EFFICIENCY_PATCH"
 require_file "$DENSIFICATION_MEMORY_PATCH"
 require_file "$ROW_SPAN_CULLING_PATCH"
 require_file "$GEOMETRY_ADAM_FUSION_PATCH"
+require_file "$PARALLEL_RADIX_SCAN_PATCH"
 for source in \
   "$TILE_SPAN_TEST_ROOT/include/tile_culling.hpp" \
   "$TILE_SPAN_TEST_ROOT/include/gpu_tile_culling.hpp" \
@@ -81,7 +83,7 @@ require_contains 'MSPLAT_VERSION="1.1.3"' "$BUILD_SCRIPT"
 require_contains 'OVERLAY_SHA256="d9945b3030b7f9bc0c4513a7fd36d6d95729cabf137f82458af69bf0cee0a1a1"' "$BUILD_SCRIPT"
 require_contains '[ "$(sha256 "$OVERLAY")" = "$OVERLAY_SHA256" ]' "$BUILD_SCRIPT"
 require_contains '"overlay_sha256": "d9945b3030b7f9bc0c4513a7fd36d6d95729cabf137f82458af69bf0cee0a1a1"' "$VALIDATOR"
-require_contains 'RASTER_TEST_SHA256="abe7bd5f09f64fde35085dfcf48a673d5cb3594247dd43f842396ded422e0146"' "$BUILD_SCRIPT"
+require_contains 'RASTER_TEST_SHA256="419edd5c082402bfae673842caa70fb9a0d7508465627cb3cba6dbccbda46f1b"' "$BUILD_SCRIPT"
 require_contains '[ "$(sha256 "$RASTER_TEST_SOURCE")" = "$RASTER_TEST_SHA256" ]' "$BUILD_SCRIPT"
 require_contains 'NLOHMANN_JSON_SHA256="04022b05d806eb5ff73023c280b68697d12b93e1b7267a0b22a1a39ec7578069"' "$BUILD_SCRIPT"
 require_contains 'NANOFLANN_SHA256="57496cb27e1310a77a367e5a902c8f1c700496d91ac54ccc87fbe9ccc28bc6cc"' "$BUILD_SCRIPT"
@@ -173,11 +175,29 @@ require_contains 'git -C "$SOURCE_DIR" apply --check "$GEOMETRY_ADAM_FUSION_PATC
 require_contains 'git -C "$SOURCE_DIR" apply "$GEOMETRY_ADAM_FUSION_PATCH"' "$BUILD_SCRIPT"
 require_contains 'geometry_adam_fusion_patch_sha256' "$BUILD_SCRIPT"
 require_contains '"geometry_adam_fusion_patch_sha256": "927ad1fdbffee7ad762396c7acc965cd4a20da781f172240c62aa94f41e1cd2c"' "$VALIDATOR"
+require_contains 'msplat-1.1.3-parallel-radix-scan.patch' "$BUILD_SCRIPT"
+require_contains 'PARALLEL_RADIX_SCAN_PATCH_SHA256="1caedde675063dd0b119e91ec39a6945328ecf37134a83b079dce964a7a816c4"' "$BUILD_SCRIPT"
+actual_parallel_radix_scan_patch_sha256="$(shasum -a 256 "$PARALLEL_RADIX_SCAN_PATCH" | awk '{print $1}')"
+[ "$actual_parallel_radix_scan_patch_sha256" = "1caedde675063dd0b119e91ec39a6945328ecf37134a83b079dce964a7a816c4" ] \
+  || fail "parallel radix-scan patch SHA-256 mismatch"
+require_contains '[ "$(sha256 "$PARALLEL_RADIX_SCAN_PATCH")" = "$PARALLEL_RADIX_SCAN_PATCH_SHA256" ]' "$BUILD_SCRIPT"
+require_contains 'git -C "$SOURCE_DIR" apply --check "$PARALLEL_RADIX_SCAN_PATCH"' "$BUILD_SCRIPT"
+require_contains 'git -C "$SOURCE_DIR" apply "$PARALLEL_RADIX_SCAN_PATCH"' "$BUILD_SCRIPT"
+require_contains 'parallel_radix_scan_patch_sha256' "$BUILD_SCRIPT"
+require_contains '"parallel_radix_scan_patch_sha256": "1caedde675063dd0b119e91ec39a6945328ecf37134a83b079dce964a7a816c4"' "$VALIDATOR"
+require_contains 'radix_sort_scan_blocks_kernel' "$PARALLEL_RADIX_SCAN_PATCH"
+require_contains 'radix_sort_scan_digit_offsets_kernel' "$PARALLEL_RADIX_SCAN_PATCH"
+require_contains 'msplat_exact_radix_sort_for_testing' "$PARALLEL_RADIX_SCAN_PATCH"
+require_contains 'msplat_exact_radix_sort_for_testing' "$RASTER_TEST_SOURCE"
+require_contains 'verifyExactRadixOracle' "$RASTER_TEST_SOURCE"
+require_contains '--radix-oracle' "$RASTER_TEST_SOURCE"
+require_contains '"$NATIVE_BUILD_DIR/msplat_raster_tests" --radix-oracle' "$BUILD_SCRIPT"
 require_contains 'project_geometry_adam_backward_kernel' "$GEOMETRY_ADAM_FUSION_PATCH"
 require_contains 'sh_adam_backward_kernel' "$GEOMETRY_ADAM_FUSION_PATCH"
 require_contains 'msplat_set_geometry_adam_fusion_enabled_for_testing' "$RASTER_TEST_SOURCE"
 for symbol_contract in "$BUILD_SCRIPT" "$VALIDATOR"; do
   require_contains 'msplat_set_geometry_adam_fusion_enabled_for_testing' "$symbol_contract"
+  require_contains 'msplat_exact_radix_sort_for_testing' "$symbol_contract"
 done
 require_contains 'geometryAdamShDegreeInterval = 4' "$RASTER_TEST_SOURCE"
 require_contains 'makeModel(inputData, geometryAdamShDegreeInterval)' "$RASTER_TEST_SOURCE"
@@ -233,10 +253,12 @@ for contract_file in "$SWIFT_VALIDATOR" "$SWIFT_FIXTURE"; do
   require_contains 'densification_memory_patch_sha256' "$contract_file"
   require_contains 'row_span_culling_patch_sha256' "$contract_file"
   require_contains 'geometry_adam_fusion_patch_sha256' "$contract_file"
+  require_contains 'parallel_radix_scan_patch_sha256' "$contract_file"
   require_contains 'raster_test_sha256' "$contract_file"
   require_contains 'MSPLAT_BUILD_RASTER_TESTS=ON' "$contract_file"
   require_contains '"overlay_sha256": "d9945b3030b7f9bc0c4513a7fd36d6d95729cabf137f82458af69bf0cee0a1a1"' "$contract_file"
-  require_contains '"raster_test_sha256": "abe7bd5f09f64fde35085dfcf48a673d5cb3594247dd43f842396ded422e0146"' "$contract_file"
+  require_contains '"raster_test_sha256": "419edd5c082402bfae673842caa70fb9a0d7508465627cb3cba6dbccbda46f1b"' "$contract_file"
+  require_contains '"parallel_radix_scan_patch_sha256": "1caedde675063dd0b119e91ec39a6945328ecf37134a83b079dce964a7a816c4"' "$contract_file"
 done
 require_contains 'scene_bounds_status' "$SWIFT_VALIDATOR"
 require_contains 'python3 - "$build_info"' "$BUILD_SCRIPT"
@@ -475,6 +497,7 @@ for symbol in \
   msplat_set_geometry_adam_fusion_enabled_for_testing \
   msplat_fail_next_sync_for_testing \
   msplat_pending_exact_raster_timing_handlers_for_testing \
+  msplat_exact_radix_sort_for_testing \
   msplat_gpu_ticks_to_seconds_for_testing \
   msplat_gpu_frequency_from_timestamp_pairs_for_testing \
   msplat_stage_timing_sample_valid_for_testing \
@@ -718,7 +741,7 @@ set -e
 [ ! -s "$negative_dir/truncated-ply.stdout" ] || fail "truncated PLY emitted a false success event"
 grep -qi 'payload' "$negative_dir/truncated-ply.stderr" || fail "truncated PLY diagnostic is not useful"
 
-for key in source_commit source_version source_url source_tree_sha256 overlay_sha256 raster_test_sha256 patch_sha256 checkpoint_patch_sha256 numeric_stability_patch_sha256 metal_safety_patch_sha256 exact_raster_patch_sha256 stage_timing_patch_sha256 memory_efficiency_patch_sha256 densification_memory_patch_sha256 row_span_culling_patch_sha256 geometry_adam_fusion_patch_sha256 executable_sha256 metallib_sha256 compiler deployment_target cmake_arguments build_timestamp; do
+for key in source_commit source_version source_url source_tree_sha256 overlay_sha256 raster_test_sha256 patch_sha256 checkpoint_patch_sha256 numeric_stability_patch_sha256 metal_safety_patch_sha256 exact_raster_patch_sha256 stage_timing_patch_sha256 memory_efficiency_patch_sha256 densification_memory_patch_sha256 row_span_culling_patch_sha256 geometry_adam_fusion_patch_sha256 parallel_radix_scan_patch_sha256 executable_sha256 metallib_sha256 compiler deployment_target cmake_arguments build_timestamp; do
   require_contains "\"$key\"" "$BUILD_INFO"
 done
 overlay_hash="$(shasum -a 256 "$OVERLAY" | awk '{print $1}')"
@@ -730,10 +753,11 @@ memory_efficiency_patch_hash="$(shasum -a 256 "$MEMORY_EFFICIENCY_PATCH" | awk '
 densification_memory_patch_hash="$(shasum -a 256 "$DENSIFICATION_MEMORY_PATCH" | awk '{print $1}')"
 row_span_culling_patch_hash="$(shasum -a 256 "$ROW_SPAN_CULLING_PATCH" | awk '{print $1}')"
 geometry_adam_fusion_patch_hash="$(shasum -a 256 "$GEOMETRY_ADAM_FUSION_PATCH" | awk '{print $1}')"
+parallel_radix_scan_patch_hash="$(shasum -a 256 "$PARALLEL_RADIX_SCAN_PATCH" | awk '{print $1}')"
 raster_test_hash="$(shasum -a 256 "$RASTER_TEST_SOURCE" | awk '{print $1}')"
 exe_hash="$(shasum -a 256 "$BIN" | awk '{print $1}')"
 metallib_hash="$(shasum -a 256 "$METALLIB" | awk '{print $1}')"
-python3 - "$BUILD_INFO" "$overlay_hash" "$numeric_stability_patch_hash" "$metal_safety_patch_hash" "$exact_raster_patch_hash" "$stage_timing_patch_hash" "$memory_efficiency_patch_hash" "$densification_memory_patch_hash" "$row_span_culling_patch_hash" "$geometry_adam_fusion_patch_hash" "$raster_test_hash" "$exe_hash" "$metallib_hash" <<'PY'
+python3 - "$BUILD_INFO" "$overlay_hash" "$numeric_stability_patch_hash" "$metal_safety_patch_hash" "$exact_raster_patch_hash" "$stage_timing_patch_hash" "$memory_efficiency_patch_hash" "$densification_memory_patch_hash" "$row_span_culling_patch_hash" "$geometry_adam_fusion_patch_hash" "$parallel_radix_scan_patch_hash" "$raster_test_hash" "$exe_hash" "$metallib_hash" <<'PY'
 import json
 import sys
 
@@ -756,9 +780,10 @@ expected = {
     "densification_memory_patch_sha256": sys.argv[8],
     "row_span_culling_patch_sha256": sys.argv[9],
     "geometry_adam_fusion_patch_sha256": sys.argv[10],
-    "raster_test_sha256": sys.argv[11],
-    "executable_sha256": sys.argv[12],
-    "metallib_sha256": sys.argv[13],
+    "parallel_radix_scan_patch_sha256": sys.argv[11],
+    "raster_test_sha256": sys.argv[12],
+    "executable_sha256": sys.argv[13],
+    "metallib_sha256": sys.argv[14],
 }
 for key, value in expected.items():
     if payload.get(key) != value:
@@ -1205,6 +1230,7 @@ require_file "$RASTER_TEST_BIN"
   "$fixture_root/16-broad-overflow-2304" \
   "$fixture_root/15-increasing-overflow-10000" \
   "$fixture_root/17-exact-budget-1279"
+"$RASTER_TEST_BIN" --radix-oracle
 fixture_count=0
 while IFS=$'\t' read -r fixture_name expected_points metal_pipeline_stress; do
   fixture_count=$((fixture_count + 1))

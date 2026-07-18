@@ -1,0 +1,497 @@
+diff --git a/core/metal/bindings.h b/core/metal/bindings.h
+index b1d2418..2e5440d 100644
+--- a/core/metal/bindings.h
++++ b/core/metal/bindings.h
+@@ -82,6 +82,15 @@ void msplat_set_raster_memory_budget_for_testing(uint64_t budget_bytes);
+ void msplat_fail_next_sync_for_testing();
+ uint64_t msplat_pending_exact_raster_timing_handlers_for_testing();
+ uint32_t msplat_exact_radix_pass_count_for_testing(uint32_t tile_count);
++void msplat_exact_radix_sort_for_testing(
++    const uint64_t* keys,
++    const uint32_t* values,
++    uint32_t count,
++    uint32_t capacity,
++    uint32_t tile_count,
++    uint64_t* sorted_keys,
++    uint32_t* sorted_values
++);
+ double msplat_gpu_ticks_to_seconds_for_testing(uint64_t ticks, double frequency_hz);
+ double msplat_gpu_frequency_from_timestamp_pairs_for_testing(
+     const uint64_t* cpu_timestamps,
+diff --git a/core/metal/msplat_metal.metal b/core/metal/msplat_metal.metal
+index c72b276..d5140c1 100644
+--- a/core/metal/msplat_metal.metal
++++ b/core/metal/msplat_metal.metal
+@@ -949,6 +949,7 @@ inline bool raster_execution_blocked(device atomic_uint* fatal_flag) {
+ #define EXACT_DISPATCH_ITEMS 2
+ #define EXACT_DISPATCH_TILES 3
+ #define EXACT_DISPATCH_SCAN 4
++#define EXACT_DISPATCH_DIGIT_OFFSETS 5
+ 
+ inline void write_exact_dispatch(
+     device uint* arguments,
+@@ -969,7 +970,7 @@ kernel void prepare_exact_dispatch_kernel(
+     uint index [[thread_position_in_grid]]
+ ) {
+     if (index != 0) return;
+-    for (uint slot = 0; slot < 5; ++slot) {
++    for (uint slot = 0; slot < 6; ++slot) {
+         write_exact_dispatch(dispatch_arguments, slot, 0);
+     }
+     if (atomic_load_explicit(&raster_stats[3], memory_order_relaxed) == 0u &&
+@@ -1067,14 +1068,19 @@ kernel void prepare_exact_raster_kernel(
+     write_exact_dispatch(
+         dispatch_arguments,
+         EXACT_DISPATCH_ITEMS,
+-        ((uint)actual + 255u) / 256u
++        (uint)actual / 256u + ((uint)actual % 256u != 0u)
+     );
+     write_exact_dispatch(
+         dispatch_arguments,
+         EXACT_DISPATCH_TILES,
+         (num_tiles + 255u) / 256u
+     );
+-    write_exact_dispatch(dispatch_arguments, EXACT_DISPATCH_SCAN, actual > 0 ? 1u : 0u);
++    write_exact_dispatch(dispatch_arguments, EXACT_DISPATCH_SCAN, actual > 0 ? 256u : 0u);
++    write_exact_dispatch(
++        dispatch_arguments,
++        EXACT_DISPATCH_DIGIT_OFFSETS,
++        actual > 0 ? 1u : 0u
++    );
+ }
+ 
+ kernel void clear_exact_tile_bins_kernel(
+@@ -2882,9 +2888,9 @@ kernel void bitonic_sort_per_tile_kernel(
+     }
+ }
+ 
+-// ===== Radix Sort Kernels (legacy, kept for reference) =====
++// ===== Exact Stable Radix Sort =====
+ // 8-bit LSB radix sort for int64 keys + int32 values.
+-// 3 kernels per pass: histogram, scan, scatter.
++// Four kernels per pass: histogram, block scan, digit offsets, scatter.
+ // TG_SIZE = 256 = RS_RADIX (one element per thread, one histogram bin per thread).
+ 
+ #define RS_RADIX 256
+@@ -2904,10 +2910,11 @@ kernel void radix_sort_histogram_kernel(
+ ) {
+     if (!exact_raster_enabled(overflow_flag, raster_stats)) return;
+     uint N = (uint)cum_tiles_hit[num_points - 1];
++    uint num_blocks = capacity / RS_TG_SIZE + (capacity % RS_TG_SIZE != 0);
+ 
+     // Early exit for threadgroups entirely beyond N — write zero and return
+     if (bid * RS_TG_SIZE >= N) {
+-        counts[bid * RS_RADIX + tid] = 0;
++        counts[tid * num_blocks + bid] = 0;
+         return;
+     }
+ 
+@@ -2925,11 +2932,11 @@ kernel void radix_sort_histogram_kernel(
+     }
+     threadgroup_barrier(mem_flags::mem_threadgroup);
+ 
+-    // Write histogram to global memory (row-major: counts[block_id * 256 + digit])
+-    counts[bid * RS_RADIX + tid] = atomic_load_explicit(&local_hist[tid], memory_order_relaxed);
++    // Digit-major storage makes the following per-digit scan contiguous.
++    counts[tid * num_blocks + bid] = atomic_load_explicit(&local_hist[tid], memory_order_relaxed);
+ }
+ 
+-kernel void radix_sort_scan_kernel(
++kernel void radix_sort_scan_blocks_kernel(
+     device uint* counts                     [[buffer(0)]],
+     constant uint& num_blocks               [[buffer(1)]],
+     device const uint64_t* cum_tiles_hit    [[buffer(2)]],
+@@ -2937,45 +2944,80 @@ kernel void radix_sort_scan_kernel(
+     constant uint& num_points               [[buffer(4)]],
+     device atomic_uint* overflow_flag       [[buffer(5)]],
+     device atomic_uint* raster_stats        [[buffer(6)]],
+-    uint tid [[thread_position_in_threadgroup]]
++    device uint* digit_offsets              [[buffer(7)]],
++    uint digit [[threadgroup_position_in_grid]],
++    uint tid [[thread_position_in_threadgroup]],
++    uint sg_id [[simdgroup_index_in_threadgroup]],
++    uint sg_lane [[thread_index_in_simdgroup]],
++    uint sg_size [[threads_per_simdgroup]]
+ ) {
+     if (!exact_raster_enabled(overflow_flag, raster_stats)) return;
+     uint actual_N = (uint)cum_tiles_hit[num_points - 1];
+-    uint actual_num_blocks = (actual_N + RS_TG_SIZE - 1) / RS_TG_SIZE;
+-
+-    // Each thread handles one digit value (tid = digit d)
+-    uint d = tid;
++    uint actual_num_blocks = actual_N / RS_TG_SIZE + (actual_N % RS_TG_SIZE != 0u);
++    uint chunk = (actual_num_blocks + RS_TG_SIZE - 1) / RS_TG_SIZE;
++    uint start = tid * chunk;
++    uint end = min(start + chunk, actual_num_blocks);
+ 
+-    // Phase 1: Exclusive prefix sum across actual blocks only
+     uint running = 0;
+-    for (uint b = 0; b < actual_num_blocks; b++) {
+-        uint idx = b * RS_RADIX + d;
+-        uint count = counts[idx];
+-        counts[idx] = running;
++    for (uint block = start; block < end; block++) {
++        uint index = digit * num_blocks + block;
++        uint count = counts[index];
++        counts[index] = running;
+         running += count;
+     }
+ 
+-    // Phase 2: Cross-digit prefix sum to get global offsets
+-    threadgroup uint digit_totals[RS_RADIX];
+-    digit_totals[d] = running;
++    uint sg_prefix = simd_prefix_exclusive_sum(running);
++    uint sg_total = simd_sum(running);
++    threadgroup uint sg_totals[RS_TG_SIZE / 32];
++    threadgroup uint sg_offsets[RS_TG_SIZE / 32];
++    if (sg_lane == 0) sg_totals[sg_id] = sg_total;
+     threadgroup_barrier(mem_flags::mem_threadgroup);
+ 
+-    // Thread 0 does sequential exclusive prefix sum of 256 digit totals
+-    if (d == 0) {
++    uint num_sg = (RS_TG_SIZE + sg_size - 1) / sg_size;
++    if (tid == 0) {
+         uint accum = 0;
+-        for (uint i = 0; i < RS_RADIX; i++) {
+-            uint t = digit_totals[i];
+-            digit_totals[i] = accum;
+-            accum += t;
++        for (uint index = 0; index < num_sg; index++) {
++            sg_offsets[index] = accum;
++            accum += sg_totals[index];
+         }
+     }
+     threadgroup_barrier(mem_flags::mem_threadgroup);
+ 
+-    // Phase 3: Add global digit offset to actual blocks only
+-    uint global_offset = digit_totals[d];
+-    for (uint b = 0; b < actual_num_blocks; b++) {
+-        counts[b * RS_RADIX + d] += global_offset;
++    uint thread_offset = sg_offsets[sg_id] + sg_prefix;
++    for (uint block = start; block < end; block++) {
++        counts[digit * num_blocks + block] += thread_offset;
+     }
++    if (tid == RS_TG_SIZE - 1) digit_offsets[digit] = thread_offset + running;
++}
++
++kernel void radix_sort_scan_digit_offsets_kernel(
++    device uint* digit_offsets              [[buffer(0)]],
++    device atomic_uint* overflow_flag       [[buffer(1)]],
++    device atomic_uint* raster_stats        [[buffer(2)]],
++    uint tid [[thread_position_in_threadgroup]],
++    uint sg_id [[simdgroup_index_in_threadgroup]],
++    uint sg_lane [[thread_index_in_simdgroup]],
++    uint sg_size [[threads_per_simdgroup]]
++) {
++    if (!exact_raster_enabled(overflow_flag, raster_stats)) return;
++    uint value = digit_offsets[tid];
++    uint sg_prefix = simd_prefix_exclusive_sum(value);
++    uint sg_total = simd_sum(value);
++    threadgroup uint sg_totals[RS_TG_SIZE / 32];
++    threadgroup uint sg_offsets[RS_TG_SIZE / 32];
++    if (sg_lane == 0) sg_totals[sg_id] = sg_total;
++    threadgroup_barrier(mem_flags::mem_threadgroup);
++
++    uint num_sg = (RS_TG_SIZE + sg_size - 1) / sg_size;
++    if (tid == 0) {
++        uint accum = 0;
++        for (uint index = 0; index < num_sg; index++) {
++            sg_offsets[index] = accum;
++            accum += sg_totals[index];
++        }
++    }
++    threadgroup_barrier(mem_flags::mem_threadgroup);
++    digit_offsets[tid] = sg_offsets[sg_id] + sg_prefix;
+ }
+ 
+ kernel void radix_sort_scatter_kernel(
+@@ -2990,6 +3032,7 @@ kernel void radix_sort_scatter_kernel(
+     constant uint& num_points          [[buffer(8)]],
+     device atomic_uint* overflow_flag  [[buffer(9)]],
+     device atomic_uint* raster_stats   [[buffer(10)]],
++    device const uint* digit_offsets   [[buffer(11)]],
+     uint tid [[thread_position_in_threadgroup]],
+     uint bid [[threadgroup_position_in_grid]],
+     uint sg_id [[simdgroup_index_in_threadgroup]],
+@@ -2997,6 +3040,7 @@ kernel void radix_sort_scatter_kernel(
+ ) {
+     if (!exact_raster_enabled(overflow_flag, raster_stats)) return;
+     uint N = (uint)cum_tiles_hit[num_points - 1];
++    uint num_blocks = capacity / RS_TG_SIZE + (capacity % RS_TG_SIZE != 0);
+ 
+     // Early exit for threadgroups entirely beyond N
+     if (bid * RS_TG_SIZE >= N) return;
+@@ -3046,7 +3090,8 @@ kernel void radix_sort_scatter_kernel(
+ 
+     // Write to global output at computed position
+     if (valid) {
+-        uint global_pos = counts[bid * RS_RADIX + my_digit] + rank;
++        uint global_pos = digit_offsets[my_digit] +
++            counts[my_digit * num_blocks + bid] + rank;
+         keys_out[global_pos] = my_key;
+         vals_out[global_pos] = my_val;
+     }
+diff --git a/core/metal/msplat_metal.mm b/core/metal/msplat_metal.mm
+index 709b3ed..b992ce4 100644
+--- a/core/metal/msplat_metal.mm
++++ b/core/metal/msplat_metal.mm
+@@ -319,7 +319,8 @@ struct MetalContext {
+     id<MTLComputePipelineState> exact_block_scan_propagate_u64_kernel_cpso;
+     id<MTLComputePipelineState> map_gaussian_to_intersects_kernel_cpso;
+     id<MTLComputePipelineState> radix_sort_histogram_kernel_cpso;
+-    id<MTLComputePipelineState> radix_sort_scan_kernel_cpso;
++    id<MTLComputePipelineState> radix_sort_scan_blocks_kernel_cpso;
++    id<MTLComputePipelineState> radix_sort_scan_digit_offsets_kernel_cpso;
+     id<MTLComputePipelineState> radix_sort_scatter_kernel_cpso;
+     id<MTLComputePipelineState> get_tile_bin_edges_kernel_cpso;
+     id<MTLComputePipelineState> pack_sorted_gaussians_kernel_cpso;
+@@ -459,7 +460,9 @@ MetalContext* init_msplat_metal_context() {
+         load(@"exact_block_scan_propagate_u64_kernel");
+     ctx->map_gaussian_to_intersects_kernel_cpso   = load(@"map_gaussian_to_intersects_kernel");
+     ctx->radix_sort_histogram_kernel_cpso         = load(@"radix_sort_histogram_kernel");
+-    ctx->radix_sort_scan_kernel_cpso              = load(@"radix_sort_scan_kernel");
++    ctx->radix_sort_scan_blocks_kernel_cpso       = load(@"radix_sort_scan_blocks_kernel");
++    ctx->radix_sort_scan_digit_offsets_kernel_cpso =
++        load(@"radix_sort_scan_digit_offsets_kernel");
+     ctx->radix_sort_scatter_kernel_cpso           = load(@"radix_sort_scatter_kernel");
+     ctx->get_tile_bin_edges_kernel_cpso           = load(@"get_tile_bin_edges_kernel");
+     ctx->pack_sorted_gaussians_kernel_cpso        = load(@"pack_sorted_gaussians_kernel");
+@@ -913,6 +916,7 @@ struct FusedTensorCache {
+     // Exact global radix fallback. The A values reuse gaussian_ids; the exact
+     // keys and B ping-pong buffers are separate from the tile-local fast bins.
+     MTensor exact_isect_ids, exact_sort_keys_tmp, exact_sort_vals_tmp, exact_sort_counts;
++    MTensor exact_sort_digit_offsets;
+     MTensor exact_dispatch_args;
+     MTensor exact_timing_flags;
+ 
+@@ -1009,10 +1013,10 @@ struct FusedTensorCache {
+         }
+         if (!exact_dispatch_args.defined()) {
+             reserve_raster_allocation(dev, {
+-                {{5, 3}, DType::Int32},
++                {{6, 3}, DType::Int32},
+                 {{static_cast<int64_t>(kExactRasterTimingSlotCount)}, DType::Int32},
+             });
+-            exact_dispatch_args = mtensor_zeros(dev, {5, 3}, DType::Int32);
++            exact_dispatch_args = mtensor_zeros(dev, {6, 3}, DType::Int32);
+             exact_timing_flags = mtensor_zeros(
+                 dev,
+                 {static_cast<int64_t>(kExactRasterTimingSlotCount)},
+@@ -1023,12 +1027,14 @@ struct FusedTensorCache {
+             reserve_raster_allocation(dev, {
+                 {{1}, DType::Int64}, {{1}, DType::Int64},
+                 {{1}, DType::Int32}, {{256}, DType::Int32},
++                {{256}, DType::Int32},
+             });
+             exact_capacity = 1;
+             exact_isect_ids = mtensor_empty(dev, {1}, DType::Int64);
+             exact_sort_keys_tmp = mtensor_empty(dev, {1}, DType::Int64);
+             exact_sort_vals_tmp = mtensor_empty(dev, {1}, DType::Int32);
+             exact_sort_counts = mtensor_empty(dev, {256}, DType::Int32);
++            exact_sort_digit_offsets = mtensor_empty(dev, {256}, DType::Int32);
+         }
+     }
+ 
+@@ -1065,6 +1071,7 @@ struct FusedTensorCache {
+             &out_img, &final_Ts, &final_idx, &loss_intermediates, &ssim_h_buf,
+             &tile_bins, &loss_sum, &tile_offsets, &tile_scatter_counters, &prealloc_bins,
+             &exact_isect_ids, &exact_sort_keys_tmp, &exact_sort_vals_tmp, &exact_sort_counts,
++            &exact_sort_digit_offsets,
+             &exact_dispatch_args,
+             &exact_timing_flags,
+             &block_totals, &overflow_flag, &raster_stats, &v_rendered, &v_xy, &v_conic,
+@@ -1089,7 +1096,7 @@ struct FusedTensorCache {
+     uint64_t exact_allocation_bytes() const {
+         const MTensor *tensors[] = {
+             &exact_isect_ids, &exact_sort_keys_tmp, &exact_sort_vals_tmp,
+-            &exact_sort_counts,
++            &exact_sort_counts, &exact_sort_digit_offsets,
+         };
+         uint64_t total = 0;
+         for (const MTensor *tensor : tensors) {
+@@ -1126,6 +1133,7 @@ struct FusedTensorCache {
+         exact_sort_keys_tmp = MTensor {};
+         exact_sort_vals_tmp = MTensor {};
+         exact_sort_counts = MTensor {};
++        exact_sort_digit_offsets = MTensor {};
+         exact_capacity = 0;
+     }
+ 
+@@ -1216,6 +1224,106 @@ static uint32_t exact_radix_pass_count(uint32_t tile_count) {
+ uint32_t msplat_exact_radix_pass_count_for_testing(uint32_t tile_count) {
+     return exact_radix_pass_count(tile_count);
+ }
++
++void msplat_exact_radix_sort_for_testing(
++    const uint64_t* keys,
++    const uint32_t* values,
++    uint32_t count,
++    uint32_t capacity,
++    uint32_t tile_count,
++    uint64_t* sorted_keys,
++    uint32_t* sorted_values
++) {
++    if (count == 0) return;
++    if (!keys || !values || !sorted_keys || !sorted_values) {
++        throw std::invalid_argument("msplat: radix oracle received a null buffer");
++    }
++    if (tile_count == 0 || capacity < count) {
++        throw std::invalid_argument("msplat: radix oracle dimensions are invalid");
++    }
++
++    MetalContext *context = get_global_context();
++    const uint32_t block_count = capacity / 256u + (capacity % 256u != 0);
++    const int64_t count_capacity = static_cast<int64_t>(capacity);
++    const int64_t radix_count = static_cast<int64_t>(block_count) * 256;
++    MTensor keys_a = mtensor_empty(context->device, {count_capacity}, DType::Int64);
++    MTensor keys_b = mtensor_empty(context->device, {count_capacity}, DType::Int64);
++    MTensor values_a = mtensor_empty(context->device, {count_capacity}, DType::Int32);
++    MTensor values_b = mtensor_empty(context->device, {count_capacity}, DType::Int32);
++    MTensor counts = mtensor_empty(context->device, {radix_count}, DType::Int32);
++    MTensor digit_offsets = mtensor_empty(context->device, {256}, DType::Int32);
++    MTensor cumulative = mtensor_empty(context->device, {1}, DType::Int64);
++    MTensor overflow = mtensor_zeros(context->device, {1}, DType::Int32);
++    MTensor stats = mtensor_zeros(context->device, {kRasterStatCount}, DType::Int32);
++    const size_t key_bytes = static_cast<size_t>(capacity) * sizeof(*keys);
++    const size_t value_bytes = static_cast<size_t>(capacity) * sizeof(*values);
++    std::memcpy(keys_a.data<uint64_t>(), keys, key_bytes);
++    std::memcpy(keys_b.data<uint64_t>(), keys, key_bytes);
++    std::memcpy(
++        values_a.data<uint32_t>(),
++        values,
++        value_bytes
++    );
++    std::memcpy(values_b.data<uint32_t>(), values, value_bytes);
++    cumulative.data<uint64_t>()[0] = count;
++    overflow.data<uint32_t>()[0] = 1;
++
++    id<MTLCommandBuffer> command_buffer = context->getCommandBuffer();
++    id<MTLComputeCommandEncoder> encoder = [command_buffer computeCommandEncoder];
++    const uint32_t actual_blocks = count / 256u + (count % 256u != 0);
++    const uint32_t num_points = 1;
++    const uint32_t pass_count = exact_radix_pass_count(tile_count);
++    for (uint32_t pass = 0; pass < pass_count; ++pass) {
++        const uint32_t shift = pass * 8;
++        MTensor &keys_in = (pass % 2 == 0) ? keys_a : keys_b;
++        MTensor &values_in = (pass % 2 == 0) ? values_a : values_b;
++        MTensor &keys_out = (pass % 2 == 0) ? keys_b : keys_a;
++        MTensor &values_out = (pass % 2 == 0) ? values_b : values_a;
++
++        [encoder setComputePipelineState:context->radix_sort_histogram_kernel_cpso];
++        ENC_SCALAR(encoder, capacity, 0); ENC_BUF(encoder, keys_in, 1);
++        ENC_BUF(encoder, counts, 2); ENC_SCALAR(encoder, shift, 3);
++        ENC_BUF(encoder, cumulative, 4); ENC_SCALAR(encoder, num_points, 5);
++        ENC_BUF(encoder, overflow, 6); ENC_BUF(encoder, stats, 7);
++        [encoder dispatchThreadgroups:MTLSizeMake(actual_blocks, 1, 1)
++                    threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
++        [encoder memoryBarrierWithScope:MTLBarrierScopeBuffers];
++
++        [encoder setComputePipelineState:context->radix_sort_scan_blocks_kernel_cpso];
++        ENC_BUF(encoder, counts, 0); ENC_SCALAR(encoder, block_count, 1);
++        ENC_BUF(encoder, cumulative, 2); ENC_SCALAR(encoder, capacity, 3);
++        ENC_SCALAR(encoder, num_points, 4); ENC_BUF(encoder, overflow, 5);
++        ENC_BUF(encoder, stats, 6); ENC_BUF(encoder, digit_offsets, 7);
++        [encoder dispatchThreadgroups:MTLSizeMake(256, 1, 1)
++                    threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
++        [encoder memoryBarrierWithScope:MTLBarrierScopeBuffers];
++
++        [encoder setComputePipelineState:context->radix_sort_scan_digit_offsets_kernel_cpso];
++        ENC_BUF(encoder, digit_offsets, 0); ENC_BUF(encoder, overflow, 1);
++        ENC_BUF(encoder, stats, 2);
++        [encoder dispatchThreadgroups:MTLSizeMake(1, 1, 1)
++                    threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
++        [encoder memoryBarrierWithScope:MTLBarrierScopeBuffers];
++
++        [encoder setComputePipelineState:context->radix_sort_scatter_kernel_cpso];
++        ENC_SCALAR(encoder, capacity, 0); ENC_BUF(encoder, keys_in, 1);
++        ENC_BUF(encoder, values_in, 2); ENC_BUF(encoder, keys_out, 3);
++        ENC_BUF(encoder, values_out, 4); ENC_BUF(encoder, counts, 5);
++        ENC_SCALAR(encoder, shift, 6); ENC_BUF(encoder, cumulative, 7);
++        ENC_SCALAR(encoder, num_points, 8); ENC_BUF(encoder, overflow, 9);
++        ENC_BUF(encoder, stats, 10); ENC_BUF(encoder, digit_offsets, 11);
++        [encoder dispatchThreadgroups:MTLSizeMake(actual_blocks, 1, 1)
++                    threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
++        [encoder memoryBarrierWithScope:MTLBarrierScopeBuffers];
++    }
++    [encoder endEncoding];
++    context->syncCB();
++
++    MTensor &final_keys = (pass_count % 2 == 0) ? keys_a : keys_b;
++    MTensor &final_values = (pass_count % 2 == 0) ? values_a : values_b;
++    std::memcpy(sorted_keys, final_keys.data<uint64_t>(), key_bytes);
++    std::memcpy(sorted_values, final_values.data<uint32_t>(), value_bytes);
++}
+ #endif
+ 
+ void msplat_preflight_raster_memory(
+@@ -1388,6 +1496,7 @@ static void resize_exact_raster_capacity(
+             {{capacity}, DType::Int64},
+             {{capacity}, DType::Int32},
+             {{radixCount}, DType::Int32},
++            {{256}, DType::Int32},
+         };
+         if (growPacked) {
+             requests.insert(requests.end(), {
+@@ -1451,6 +1560,11 @@ static void resize_exact_raster_capacity(
+     g_tcache.exact_sort_keys_tmp = mtensor_empty(context->device, {capacity}, DType::Int64);
+     g_tcache.exact_sort_vals_tmp = mtensor_empty(context->device, {capacity}, DType::Int32);
+     g_tcache.exact_sort_counts = mtensor_empty(context->device, {radixCount}, DType::Int32);
++    g_tcache.exact_sort_digit_offsets = mtensor_empty(
++        context->device,
++        {256},
++        DType::Int32
++    );
+     uint64_t trackedBytesAfterGrowth = g_tcache.exact_allocation_bytes();
+     if (growPacked) {
+         trackedBytesAfterGrowth = checked_add_u64(
+@@ -1855,6 +1969,7 @@ static void encode_exact_raster_fallback(
+     constexpr NSUInteger item_dispatch_offset = 2 * 3 * sizeof(uint32_t);
+     constexpr NSUInteger tile_dispatch_offset = 3 * 3 * sizeof(uint32_t);
+     constexpr NSUInteger scan_dispatch_offset = 4 * 3 * sizeof(uint32_t);
++    constexpr NSUInteger digit_offset_dispatch_offset = 5 * 3 * sizeof(uint32_t);
+     id<MTLBuffer> dispatch_args = g_tcache.exact_dispatch_args.buffer();
+ 
+     [enc setComputePipelineState:ctx->prepare_exact_dispatch_kernel_cpso];
+@@ -1932,7 +2047,7 @@ static void encode_exact_raster_fallback(
+                           threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+     [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+ 
+-    const uint32_t radix_blocks = (capacity + 255) / 256;
++    const uint32_t radix_blocks = capacity / 256u + (capacity % 256u != 0);
+     const uint32_t radix_pass_count = exact_radix_pass_count(num_tiles);
+     for (uint32_t pass = 0; pass < radix_pass_count; ++pass) {
+         const uint32_t shift = pass * 8;
+@@ -1951,22 +2066,32 @@ static void encode_exact_raster_fallback(
+                               threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+         [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+ 
+-        [enc setComputePipelineState:ctx->radix_sort_scan_kernel_cpso];
++        [enc setComputePipelineState:ctx->radix_sort_scan_blocks_kernel_cpso];
+         ENC_BUF(enc, g_tcache.exact_sort_counts, 0); ENC_SCALAR(enc, radix_blocks, 1);
+         ENC_BUF(enc, g_tcache.cum_tiles_hit, 2); ENC_SCALAR(enc, capacity, 3);
+         ENC_SCALAR(enc, num_points, 4); ENC_BUF(enc, g_tcache.overflow_flag, 5);
+         ENC_BUF(enc, g_tcache.raster_stats, 6);
++        ENC_BUF(enc, g_tcache.exact_sort_digit_offsets, 7);
+         [enc dispatchThreadgroupsWithIndirectBuffer:dispatch_args
+                                indirectBufferOffset:scan_dispatch_offset
+                               threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+         [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+ 
++        [enc setComputePipelineState:ctx->radix_sort_scan_digit_offsets_kernel_cpso];
++        ENC_BUF(enc, g_tcache.exact_sort_digit_offsets, 0);
++        ENC_BUF(enc, g_tcache.overflow_flag, 1); ENC_BUF(enc, g_tcache.raster_stats, 2);
++        [enc dispatchThreadgroupsWithIndirectBuffer:dispatch_args
++                               indirectBufferOffset:digit_offset_dispatch_offset
++                              threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
++        [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
++
+         [enc setComputePipelineState:ctx->radix_sort_scatter_kernel_cpso];
+         ENC_SCALAR(enc, capacity, 0); ENC_BUF(enc, keys_in, 1); ENC_BUF(enc, vals_in, 2);
+         ENC_BUF(enc, keys_out, 3); ENC_BUF(enc, vals_out, 4);
+         ENC_BUF(enc, g_tcache.exact_sort_counts, 5); ENC_SCALAR(enc, shift, 6);
+         ENC_BUF(enc, g_tcache.cum_tiles_hit, 7); ENC_SCALAR(enc, num_points, 8);
+         ENC_BUF(enc, g_tcache.overflow_flag, 9); ENC_BUF(enc, g_tcache.raster_stats, 10);
++        ENC_BUF(enc, g_tcache.exact_sort_digit_offsets, 11);
+         [enc dispatchThreadgroupsWithIndirectBuffer:dispatch_args
+                                indirectBufferOffset:item_dispatch_offset
+                               threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];

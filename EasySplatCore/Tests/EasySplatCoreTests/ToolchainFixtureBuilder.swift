@@ -106,7 +106,7 @@ enum ToolchainFixtureBuilder {
                 "source_version": "1.1.3",
                 "source_tree_sha256": String(repeating: "a", count: 64),
                 "overlay_sha256": "d9945b3030b7f9bc0c4513a7fd36d6d95729cabf137f82458af69bf0cee0a1a1",
-                "raster_test_sha256": "abe7bd5f09f64fde35085dfcf48a673d5cb3594247dd43f842396ded422e0146",
+                "raster_test_sha256": "419edd5c082402bfae673842caa70fb9a0d7508465627cb3cba6dbccbda46f1b",
                 "patch_sha256": String(repeating: "c", count: 64),
                 "checkpoint_patch_sha256": String(repeating: "d", count: 64),
                 "numeric_stability_patch_sha256": String(repeating: "e", count: 64),
@@ -117,6 +117,7 @@ enum ToolchainFixtureBuilder {
                 "densification_memory_patch_sha256": "b429540372d807f280929ebba1670257990bd36b28dfee5b42bc377ccef60ac7",
                 "row_span_culling_patch_sha256": "481c4c9a70f1da5eb1590b20a64e25a3c64bb3c19f14e27996ab9b25a119594d",
                 "geometry_adam_fusion_patch_sha256": "927ad1fdbffee7ad762396c7acc965cd4a20da781f172240c62aa94f41e1cd2c",
+                "parallel_radix_scan_patch_sha256": "1caedde675063dd0b119e91ec39a6945328ecf37134a83b079dce964a7a816c4",
                 "dependencies": [
                     "nlohmann_json_v3.11.3_sha256": "04022b05d806eb5ff73023c280b68697d12b93e1b7267a0b22a1a39ec7578069",
                     "nanoflann_v1.5.5_sha256": "57496cb27e1310a77a367e5a902c8f1c700496d91ac54ccc87fbe9ccc28bc6cc",
