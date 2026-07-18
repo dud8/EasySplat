@@ -36,7 +36,7 @@ shellcheck $(git ls-files 'scripts/*.sh' 'scripts/**/*.sh')
 actionlint
 ```
 
-Native trainer or packaging changes also require `./scripts/ci/test_msplat_native_build.sh`. Packaged-app release changes must pass the full `verify_beta.sh` and isolated `verify_ui.sh` jobs in the protected Release App workflow.
+Native trainer or packaging changes also require `./scripts/ci/test_msplat_native_build.sh`. Packaged-app release changes must pass the full `verify_beta.sh` and isolated `verify_ui.sh` jobs in the Release App workflow.
 
 ## Change guidelines
 

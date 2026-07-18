@@ -74,7 +74,7 @@ if [ -z "$APP_VERSION" ] || [ -z "$TOOLCHAIN_VERSION" ] || [ -z "$RELEASE_MODE" 
   exit 1
 fi
 if [ "$USE_EXISTING_TOOLCHAIN" -ne 1 ]; then
-  echo "Unsigned beta packaging requires --use-existing-toolchain. Build and sign toolchains through the protected Toolchain Build workflow." >&2
+  echo "Unsigned beta packaging requires --use-existing-toolchain. Toolchain Build creates unsigned archives and a signing request; the independent release authority signs and publishes the closure." >&2
   exit 1
 fi
 if [ -z "$MANIFEST_URL" ] || [ -z "$CORE_ARTIFACT_URL" ] || [ -z "$DA3_BASE_ARTIFACT_URL" ] || [ -z "$DA3_SMALL_ARTIFACT_URL" ]; then

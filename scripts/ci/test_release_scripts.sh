@@ -419,6 +419,9 @@ if EASYSPLAT_ALLOW_UNPINNED_DA3_SOURCE=1 \
   exit 1
 fi
 grep -Fqi 'requires --use-existing-toolchain' "$missing_existing_toolchain_error"
+grep -Fq \
+  'Toolchain Build creates unsigned archives and a signing request; the independent release authority signs and publishes the closure.' \
+  "$missing_existing_toolchain_error"
 
 insecure_release_url_error="$TMP_DIR/insecure-release-url.stderr"
 if "$ROOT/scripts/release/build_dmg.sh" \
