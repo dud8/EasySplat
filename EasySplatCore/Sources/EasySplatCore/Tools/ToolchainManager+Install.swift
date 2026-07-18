@@ -10,15 +10,16 @@ extension ToolchainManager {
                 return false
             }
         }
-        if error is URLError {
-            return true
+        if let error = error as? URLError {
+            return isTransient(error)
         }
         return false
     }
 
     func loadBestCachedToolchain(
         publicKeyBase64: String,
-        request: ToolchainCapabilityRequest
+        request: ToolchainCapabilityRequest,
+        minimumVersion: String? = nil
     ) throws -> ToolchainPaths? {
         let root = try toolchainRootURL()
         guard fileManager.fileExists(atPath: root.path) else {
@@ -75,25 +76,39 @@ extension ToolchainManager {
             return lhs.url.lastPathComponent > rhs.url.lastPathComponent
         }
 
+        let minimumSemanticVersion = minimumVersion.flatMap(semanticVersionComponents(from:))
         var firstRejectedCandidateError: Error?
+        var validCandidates: [(version: SemanticVersion, toolchain: ToolchainPaths)] = []
         for candidate in candidates {
             do {
-                _ = try validateSignedReceipt(
+                let receipt = try validateSignedReceipt(
                     root: candidate.url,
                     publicKeyBase64: publicKeyBase64,
                     request: request
                 )
+                guard let receiptVersion = semanticVersionComponents(from: receipt.version) else {
+                    throw ToolchainError.invalidManifest
+                }
+                if let minimumSemanticVersion,
+                   compareSemanticVersions(receiptVersion, minimumSemanticVersion) == .orderedAscending {
+                    continue
+                }
                 let toolchain = try validateToolchain(
                     root: candidate.url,
                     requiredCapabilities: request.capabilities
                 )
-                return toolchain
+                validCandidates.append((receiptVersion, toolchain))
             } catch {
                 if firstRejectedCandidateError == nil {
                     firstRejectedCandidateError = error
                 }
                 continue
             }
+        }
+        if let best = validCandidates.max(by: {
+            compareSemanticVersions($0.version, $1.version) == .orderedAscending
+        }) {
+            return best.toolchain
         }
         if let firstRejectedCandidateError {
             throw firstRejectedCandidateError

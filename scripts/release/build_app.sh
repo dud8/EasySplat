@@ -7,9 +7,28 @@ PUBLIC_KEY_PATH=""
 PROJECT_URL=""
 VERSION=""
 RELEASE_MODE=""
+BOOTSTRAP_MANIFEST=""
+BOOTSTRAP_CORE_ARCHIVE=""
 BUILD_ROOT="$ROOT/build"
 XCODEBUILD_BIN="${EASYSPLAT_XCODEBUILD_BIN:-xcodebuild}"
 CODESIGN_BIN="${EASYSPLAT_CODESIGN_BIN:-codesign}"
+INPUT_SNAPSHOT_DIR=""
+BUILD_LOCK=""
+BUILD_LOCK_HELD=0
+
+cleanup() {
+  local status=$?
+  trap - EXIT
+  if [ "$BUILD_LOCK_HELD" -eq 1 ] && [ -n "$BUILD_LOCK" ]; then
+    rm -f "$BUILD_LOCK/pid"
+    rmdir "$BUILD_LOCK" 2>/dev/null || true
+  fi
+  if [ -n "$INPUT_SNAPSHOT_DIR" ]; then
+    rm -rf "$INPUT_SNAPSHOT_DIR"
+  fi
+  exit "$status"
+}
+trap cleanup EXIT
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -27,6 +46,22 @@ while [[ $# -gt 0 ]]; do
       ;;
     --version)
       VERSION="$2"
+      shift 2
+      ;;
+    --bootstrap-manifest)
+      if [ -n "$BOOTSTRAP_MANIFEST" ]; then
+        echo "--bootstrap-manifest may be supplied only once." >&2
+        exit 1
+      fi
+      BOOTSTRAP_MANIFEST="$2"
+      shift 2
+      ;;
+    --bootstrap-core-archive)
+      if [ -n "$BOOTSTRAP_CORE_ARCHIVE" ]; then
+        echo "--bootstrap-core-archive may be supplied only once." >&2
+        exit 1
+      fi
+      BOOTSTRAP_CORE_ARCHIVE="$2"
       shift 2
       ;;
     --build-root)
@@ -61,7 +96,16 @@ while [[ $# -gt 0 ]]; do
 done
 
 if [ -z "$MANIFEST_URL" ] || [ -z "$PUBLIC_KEY_PATH" ] || [ -z "$VERSION" ] || [ -z "$RELEASE_MODE" ]; then
-  echo "Usage: build_app.sh --manifest-url <url> --public-key-path <path> --version <semver> [--project-url <url>] [--build-root <absolute-path>] --unsigned-beta" >&2
+  echo "Usage: build_app.sh --manifest-url <url> --public-key-path <path> --version <semver> --bootstrap-manifest <path> --bootstrap-core-archive <path> [--project-url <url>] [--build-root <absolute-path>] --unsigned-beta" >&2
+  exit 1
+fi
+if { [ -n "$BOOTSTRAP_MANIFEST" ] && [ -z "$BOOTSTRAP_CORE_ARCHIVE" ]; } \
+  || { [ -z "$BOOTSTRAP_MANIFEST" ] && [ -n "$BOOTSTRAP_CORE_ARCHIVE" ]; }; then
+  echo "--bootstrap-manifest and --bootstrap-core-archive must be supplied together." >&2
+  exit 1
+fi
+if [ -z "$BOOTSTRAP_MANIFEST" ]; then
+  echo "Unsigned beta app builds require --bootstrap-manifest and --bootstrap-core-archive." >&2
   exit 1
 fi
 
@@ -126,10 +170,52 @@ if [[ "$VERSION" != *-* ]]; then
   exit 1
 fi
 
-if [ ! -f "$PUBLIC_KEY_PATH" ]; then
-  echo "Missing public key at $PUBLIC_KEY_PATH" >&2
-  exit 1
-fi
+python3 - "$PUBLIC_KEY_PATH" "$BOOTSTRAP_MANIFEST" "$BOOTSTRAP_CORE_ARCHIVE" <<'PY'
+import os
+import stat
+import sys
+
+for label, value in (
+    ("Public key", sys.argv[1]),
+    ("Bootstrap manifest", sys.argv[2]),
+    ("Bootstrap core archive", sys.argv[3]),
+):
+    try:
+        metadata = os.lstat(value)
+    except FileNotFoundError:
+        raise SystemExit(f"{label} is missing: {value}")
+    if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1:
+        raise SystemExit(f"{label} must be an ordinary, non-hardlinked regular file: {value}")
+    if metadata.st_size == 0:
+        raise SystemExit(f"{label} must not be empty: {value}")
+PY
+
+INPUT_SNAPSHOT_DIR="$(mktemp -d "${TMPDIR:-/tmp}/easysplat-release-inputs.XXXXXX")"
+chmod 0700 "$INPUT_SNAPSHOT_DIR"
+SNAPSHOT_PUBLIC_KEY="$INPUT_SNAPSHOT_DIR/public_key_ed25519.txt"
+SNAPSHOT_BOOTSTRAP_MANIFEST="$INPUT_SNAPSHOT_DIR/manifest.json"
+SNAPSHOT_BOOTSTRAP_CORE="$INPUT_SNAPSHOT_DIR/macos-arm64-core.zip"
+install -m 0600 "$PUBLIC_KEY_PATH" "$SNAPSHOT_PUBLIC_KEY"
+install -m 0600 "$BOOTSTRAP_MANIFEST" "$SNAPSHOT_BOOTSTRAP_MANIFEST"
+install -m 0600 "$BOOTSTRAP_CORE_ARCHIVE" "$SNAPSHOT_BOOTSTRAP_CORE"
+
+verify_bootstrap() {
+  local public_key=$1
+  local manifest=$2
+  local core_archive=$3
+  local args=(
+    verify-bootstrap
+    --manifest "$manifest"
+    --public-key-file "$public_key"
+    --app-version "$VERSION"
+    --core-zip "$core_archive"
+  )
+  swift run --package-path "$ROOT/Tools/ManifestTool" ManifestTool "${args[@]}"
+}
+verify_bootstrap \
+  "$SNAPSHOT_PUBLIC_KEY" \
+  "$SNAPSHOT_BOOTSTRAP_MANIFEST" \
+  "$SNAPSHOT_BOOTSTRAP_CORE"
 
 if [ "${XCODEBUILD_BIN##*/}" = "xcodebuild" ]; then
   if ! "$XCODEBUILD_BIN" -license check >/dev/null 2>&1; then
@@ -155,12 +241,8 @@ if ! mkdir "$BUILD_LOCK" 2>/dev/null; then
   echo "An app build is already in progress$lock_owner. If no build is running, remove $BUILD_LOCK." >&2
   exit 1
 fi
+BUILD_LOCK_HELD=1
 printf '%s\n' "$$" >"$BUILD_LOCK/pid"
-release_build_lock() {
-  rm -f "$BUILD_LOCK/pid"
-  rmdir "$BUILD_LOCK" 2>/dev/null || true
-}
-trap release_build_lock EXIT
 
 DERIVED="$BUILD_ROOT/DerivedData"
 OUT="$BUILD_ROOT/Export"
@@ -258,6 +340,16 @@ EOF
 if [ -d "$ROOT/EasySplatApp/Resources" ]; then
   cp -R "$ROOT/EasySplatApp/Resources/." "$RES_DIR/"
 fi
+BOOTSTRAP_RES_DIR="$RES_DIR/ToolchainBootstrap"
+rm -rf "$BOOTSTRAP_RES_DIR"
+mkdir -p "$BOOTSTRAP_RES_DIR"
+install -m 0644 "$SNAPSHOT_BOOTSTRAP_MANIFEST" "$BOOTSTRAP_RES_DIR/manifest.json"
+install -m 0644 "$SNAPSHOT_BOOTSTRAP_CORE" "$BOOTSTRAP_RES_DIR/macos-arm64-core.zip"
+if ! cmp -s "$SNAPSHOT_BOOTSTRAP_MANIFEST" "$BOOTSTRAP_RES_DIR/manifest.json" \
+  || ! cmp -s "$SNAPSHOT_BOOTSTRAP_CORE" "$BOOTSTRAP_RES_DIR/macos-arm64-core.zip"; then
+  echo "Copied bootstrap bytes changed while the app bundle was being assembled." >&2
+  exit 1
+fi
 if [ ! -s "$RES_DIR/EasySplatAppIcon.icns" ]; then
   echo "Missing bundled app icon at $RES_DIR/EasySplatAppIcon.icns" >&2
   exit 1
@@ -270,7 +362,7 @@ install -m 0644 "$ROOT/ThirdParty/MetalSplatter/LICENSE" "$LICENSE_DIR/MetalSpla
 
 mkdir -p "$OVERRIDE_RES_DIR"
 printf "%s" "$MANIFEST_URL" > "$OVERRIDE_RES_DIR/toolchain_manifest_url.txt"
-cp "$PUBLIC_KEY_PATH" "$OVERRIDE_RES_DIR/public_key_ed25519.txt"
+install -m 0644 "$SNAPSHOT_PUBLIC_KEY" "$OVERRIDE_RES_DIR/public_key_ed25519.txt"
 printf "%s" "$PROJECT_URL" > "$OVERRIDE_RES_DIR/project_home_url.txt"
 cp -R "$OVERRIDE_RES_DIR/." "$RES_DIR/"
 printf '%s' 'unsigned public beta' >"$RES_DIR/release_channel.txt"
@@ -289,6 +381,24 @@ fi
 
 rm -rf "$EXPORTED_DSYM_PATH"
 cp -R "$BUILT_DSYM_PATH" "$EXPORTED_DSYM_PATH"
+
+BUNDLED_PUBLIC_KEY="$RES_DIR/public_key_ed25519.txt"
+authority_files=("$BUNDLED_PUBLIC_KEY")
+if [ -d "$RES_DIR/EasySplat_EasySplatApp.bundle" ]; then
+  authority_files+=("$RES_DIR/EasySplat_EasySplatApp.bundle/public_key_ed25519.txt")
+  if [ -d "$RES_DIR/EasySplat_EasySplatApp.bundle/Contents/Resources" ]; then
+    authority_files+=("$RES_DIR/EasySplat_EasySplatApp.bundle/Contents/Resources/public_key_ed25519.txt")
+  fi
+fi
+for authority_file in "${authority_files[@]}"; do
+  if ! cmp -s "$SNAPSHOT_PUBLIC_KEY" "$authority_file"; then
+    echo "Bundled app authority differs from the verified release input snapshot: $authority_file" >&2
+    exit 1
+  fi
+done
+verify_bootstrap "$BUNDLED_PUBLIC_KEY" \
+  "$BOOTSTRAP_RES_DIR/manifest.json" \
+  "$BOOTSTRAP_RES_DIR/macos-arm64-core.zip"
 
 plutil -lint "$APP_BUNDLE/Contents/Info.plist" >/dev/null
 "$CODESIGN_BIN" --force --deep --sign - --timestamp=none "$APP_BUNDLE"

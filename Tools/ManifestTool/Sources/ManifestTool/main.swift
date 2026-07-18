@@ -21,6 +21,36 @@ struct ManifestTool {
                 exit(ExitCode.ok.rawValue)
             }
 
+            if command == "verify-bootstrap" {
+                var parser = ArgParser(Array(args.dropFirst()))
+                try parser.requireOnly([
+                    "--manifest",
+                    "--public-key-file",
+                    "--app-version",
+                    "--core-zip",
+                ])
+                let manifestURL = URL(fileURLWithPath: try parser.require("--manifest"))
+                let publicKeyURL = URL(fileURLWithPath: try parser.require("--public-key-file"))
+                let appVersion = try parser.require("--app-version")
+                let coreArchive = URL(fileURLWithPath: try parser.require("--core-zip"))
+                let decoder = JSONDecoder()
+                decoder.dateDecodingStrategy = .iso8601
+                let manifest = try decoder.decode(
+                    ManifestDocument.self,
+                    from: Data(contentsOf: manifestURL)
+                )
+                let publicKeyBase64 = try String(contentsOf: publicKeyURL, encoding: .utf8)
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+                try ManifestBuilder.verifyBootstrap(
+                    manifest: manifest,
+                    publicKeyBase64: publicKeyBase64,
+                    expectedAppVersion: appVersion,
+                    coreArchive: coreArchive
+                )
+                print("Verified signed core bootstrap \(manifest.version)")
+                exit(ExitCode.ok.rawValue)
+            }
+
             if command == "verify-release" {
                 var parser = ArgParser(Array(args.dropFirst()))
                 let manifestURL = URL(fileURLWithPath: try parser.require("--manifest"))
@@ -149,6 +179,10 @@ struct ManifestTool {
             --core-zip <path> --core-url <url> \
             --da3-base-zip <path> --da3-base-url <url> \
             --da3-small-zip <path> --da3-small-url <url>
+
+        Verify a signed bundled core bootstrap:
+          ManifestTool verify-bootstrap --manifest <path> --public-key-file <path> \
+            --app-version <semver> --core-zip <path>
 
         Prepare a canonical release signing request without a private key:
           ManifestTool prepare-release --repository <owner/repo> --source-commit <sha> \

@@ -39,6 +39,17 @@ public struct Da3Toolchain: Sendable {
     }
 }
 
+/// Authenticated, app-bundled bootstrap inputs used when the network and signed cache are unavailable.
+public struct ToolchainBootstrap: Sendable, Equatable {
+    public let manifestURL: URL
+    public let coreArchiveURL: URL
+
+    public init(manifestURL: URL, coreArchiveURL: URL) {
+        self.manifestURL = manifestURL
+        self.coreArchiveURL = coreArchiveURL
+    }
+}
+
 /// Interface for acquiring and validating an EasySplat toolchain.
 public protocol ToolchainManaging: Sendable {
     func ensureToolchain(
@@ -169,6 +180,7 @@ public final class ToolchainManager: @unchecked Sendable, ToolchainManaging {
     let localToolchainRoot: URL?
     let installationRoot: URL?
     let allowInsecureLoopbackHTTP: Bool
+    let bundledBootstrap: ToolchainBootstrap?
 
     public init(
         runner: SubprocessRunning = SubprocessRunner(),
@@ -176,7 +188,8 @@ public final class ToolchainManager: @unchecked Sendable, ToolchainManaging {
         appVersion: String = EasySplatReleaseIdentity.version(),
         localToolchainRoot: URL? = DevelopmentOverrides.fromProcessEnvironment().localToolchainRoot,
         installationRoot: URL? = nil,
-        allowInsecureLoopbackHTTP: Bool = false
+        allowInsecureLoopbackHTTP: Bool = false,
+        bundledBootstrap: ToolchainBootstrap? = nil
     ) {
         self.runner = runner
         self.urlSession = urlSession
@@ -184,6 +197,7 @@ public final class ToolchainManager: @unchecked Sendable, ToolchainManaging {
         self.localToolchainRoot = localToolchainRoot
         self.installationRoot = installationRoot
         self.allowInsecureLoopbackHTTP = allowInsecureLoopbackHTTP
+        self.bundledBootstrap = bundledBootstrap
     }
 
     public func toolchainRoot() -> URL {
@@ -221,6 +235,11 @@ public final class ToolchainManager: @unchecked Sendable, ToolchainManaging {
             return toolchain
         }
 
+        let validatedBootstrap = try validateBundledBootstrap(
+            bundledBootstrap,
+            publicKeyBase64: publicKeyBase64
+        )
+
         onProgress(-1.0, "Checking installed tools")
         let manifest: ToolchainManifest
         do {
@@ -231,15 +250,31 @@ public final class ToolchainManager: @unchecked Sendable, ToolchainManaging {
                 do {
                     if let cached = try loadBestCachedToolchain(
                         publicKeyBase64: publicKeyBase64,
-                        request: request
+                        request: request,
+                        minimumVersion: validatedBootstrap?.manifest.version
                     ) {
                         onProgress(1.0, "Tools ready (offline cached)")
                         return cached
                     }
                 } catch {
-                    throw ToolchainError.invalidToolchain(
-                        "The download failed, and cached tools could not be verified. \(error.localizedDescription)"
+                    let canUseBundledCore = validatedBootstrap.map {
+                        bundledCoreCanSatisfy(request, bootstrap: $0)
+                    } ?? false
+                    if !canUseBundledCore {
+                        throw ToolchainError.invalidToolchain(
+                            "The download failed, and cached tools could not be verified. \(error.localizedDescription)"
+                        )
+                    }
+                }
+                if let validatedBootstrap,
+                   bundledCoreCanSatisfy(request, bootstrap: validatedBootstrap) {
+                    let installed = try await installBundledBootstrap(
+                        validatedBootstrap,
+                        request: request,
+                        onProgress: onProgress
                     )
+                    onProgress(1.0, "Tools ready (bundled)")
+                    return installed
                 }
             }
             throw error
@@ -252,6 +287,7 @@ public final class ToolchainManager: @unchecked Sendable, ToolchainManaging {
         }
 
         try validateSchema2Manifest(manifest, publicKeyBase64: publicKeyBase64)
+        try validateRemoteVersionFloor(manifest, bootstrap: validatedBootstrap)
         let components: [ToolchainManifest.Component]
         do {
             components = try manifest.resolvedComponents(requesting: request.manifestCapabilities)

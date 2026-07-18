@@ -1,13 +1,21 @@
 import EasySplatCore
 import Foundation
 
+private enum InstallationPolicy: String {
+    case remoteOnly = "remote-only"
+    case bundledBootstrapOnly = "bundled-bootstrap-only"
+}
+
 private struct Arguments {
     var fixture: URL
     var manifestURL: URL
     var publicKeyFile: URL
+    var bootstrapManifest: URL?
+    var bootstrapCoreArchive: URL?
     var cacheRoot: URL
     var output: URL
     var appVersion: String
+    var installationPolicy: InstallationPolicy
     var offline: Bool
     var allowInsecureLoopbackHTTP: Bool
 
@@ -30,7 +38,8 @@ private struct Arguments {
             }
             guard [
                 "--fixture", "--manifest-url", "--public-key-file", "--cache-root", "--output",
-                "--app-version",
+                "--app-version", "--bootstrap-manifest", "--bootstrap-core-archive",
+                "--installation-policy",
             ].contains(option), index + 1 < raw.count else {
                 throw VerificationError.usage("Unknown or incomplete option: \(option)")
             }
@@ -44,20 +53,41 @@ private struct Arguments {
               let publicKeyFile = values["--public-key-file"],
               let cacheRoot = values["--cache-root"],
               let output = values["--output"],
-              let appVersion = values["--app-version"] else {
+              let appVersion = values["--app-version"],
+              let policyValue = values["--installation-policy"],
+              let installationPolicy = InstallationPolicy(rawValue: policyValue) else {
             throw VerificationError.usage(
                 "Usage: EasySplatReleaseVerifier --fixture <media> --manifest-url <https-url> "
                     + "--public-key-file <file> --cache-root <dir> --output <splat.ply> "
-                    + "--app-version <semver> [--offline] [--allow-insecure-loopback-http]"
+                    + "--app-version <semver> --installation-policy <remote-only|bundled-bootstrap-only> "
+                    + "[--bootstrap-manifest <manifest.json> --bootstrap-core-archive <core.zip> --offline] "
+                    + "[--allow-insecure-loopback-http]"
             )
+        }
+        switch installationPolicy {
+        case .remoteOnly where offline:
+            throw VerificationError.usage("The remote-only installation policy cannot be combined with --offline.")
+        case .remoteOnly where values["--bootstrap-manifest"] != nil || values["--bootstrap-core-archive"] != nil:
+            throw VerificationError.usage("The remote-only installation policy cannot receive bundled-bootstrap inputs.")
+        case .bundledBootstrapOnly where !offline:
+            throw VerificationError.usage("The bundled-bootstrap-only installation policy requires --offline.")
+        case .bundledBootstrapOnly where values["--bootstrap-manifest"] == nil || values["--bootstrap-core-archive"] == nil:
+            throw VerificationError.usage(
+                "The bundled-bootstrap-only installation policy requires both bootstrap inputs."
+            )
+        default:
+            break
         }
         return Arguments(
             fixture: URL(fileURLWithPath: fixture),
             manifestURL: manifestURL,
             publicKeyFile: URL(fileURLWithPath: publicKeyFile),
+            bootstrapManifest: values["--bootstrap-manifest"].map(URL.init(fileURLWithPath:)),
+            bootstrapCoreArchive: values["--bootstrap-core-archive"].map(URL.init(fileURLWithPath:)),
             cacheRoot: URL(fileURLWithPath: cacheRoot, isDirectory: true),
             output: URL(fileURLWithPath: output),
             appVersion: appVersion,
+            installationPolicy: installationPolicy,
             offline: offline,
             allowInsecureLoopbackHTTP: allowInsecureLoopbackHTTP
         )
@@ -68,12 +98,14 @@ private enum VerificationError: Error, LocalizedError {
     case usage(String)
     case invalidFixture(String)
     case invalidPublicKey
+    case nonemptyCacheRoot(String)
     case missingOutput
     case invalidOutput(String)
 
     var errorDescription: String? {
         switch self {
-        case .usage(let message), .invalidFixture(let message), .invalidOutput(let message):
+        case .usage(let message), .invalidFixture(let message), .invalidOutput(let message),
+             .nonemptyCacheRoot(let message):
             return message
         case .invalidPublicKey:
             return "The toolchain public-key file is empty."
@@ -112,6 +144,11 @@ private enum ReleaseVerifier {
             .trimmingCharacters(in: .whitespacesAndNewlines)
         guard !publicKey.isEmpty else { throw VerificationError.invalidPublicKey }
         try fileManager.createDirectory(at: arguments.cacheRoot, withIntermediateDirectories: true)
+        guard try fileManager.contentsOfDirectory(atPath: arguments.cacheRoot.path).isEmpty else {
+            throw VerificationError.nonemptyCacheRoot(
+                "Release-verification cache root must start empty: \(arguments.cacheRoot.path)"
+            )
+        }
 
         let options = RequestedRunOptions(
             capturePath: .automatic,
@@ -129,14 +166,29 @@ private enum ReleaseVerifier {
             developmentOverrides: DevelopmentOverrides(benchmarkSeed: 42)
         )
         let request = try plan.toolchainCapabilityRequest()
-        let manifestURL = arguments.offline
-            ? URL(string: "https://127.0.0.1:1/easysplat-offline-verification.json")!
-            : arguments.manifestURL
+        let manifestURL: URL
+        let bundledBootstrap: ToolchainBootstrap?
+        switch arguments.installationPolicy {
+        case .remoteOnly:
+            manifestURL = arguments.manifestURL
+            bundledBootstrap = nil
+        case .bundledBootstrapOnly:
+            guard let bootstrapManifest = arguments.bootstrapManifest,
+                  let bootstrapCoreArchive = arguments.bootstrapCoreArchive else {
+                throw VerificationError.usage("Bundled-bootstrap inputs are missing.")
+            }
+            manifestURL = URL(string: "https://127.0.0.1:1/easysplat-offline-verification.json")!
+            bundledBootstrap = ToolchainBootstrap(
+                manifestURL: bootstrapManifest,
+                coreArchiveURL: bootstrapCoreArchive
+            )
+        }
         let manager = ToolchainManager(
             appVersion: arguments.appVersion,
             localToolchainRoot: nil,
             installationRoot: arguments.cacheRoot,
-            allowInsecureLoopbackHTTP: arguments.allowInsecureLoopbackHTTP
+            allowInsecureLoopbackHTTP: arguments.allowInsecureLoopbackHTTP,
+            bundledBootstrap: bundledBootstrap
         )
         let toolchain = try await manager.ensureToolchain(
             manifestURL: manifestURL,
@@ -201,6 +253,8 @@ private enum ReleaseVerifier {
         guard case .valid = ProjectArtifactValidator.validatePlyFile(at: arguments.output) else {
             throw VerificationError.invalidOutput("The copied release-verification output is not a valid Gaussian PLY.")
         }
-        print(arguments.offline ? "Cached offline reconstruction passed." : "Fresh signed installation and reconstruction passed.")
+        print(arguments.installationPolicy == .bundledBootstrapOnly
+            ? "Bundled-bootstrap-only reconstruction passed."
+            : "Fresh remote-only signed installation and reconstruction passed.")
     }
 }

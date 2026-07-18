@@ -234,10 +234,7 @@ final class AppModel: ObservableObject {
     }
 
     init(
-        toolchainManager: ToolchainManaging = ToolchainManager(
-            appVersion: EasySplatReleaseIdentity.version(),
-            allowInsecureLoopbackHTTP: AppConfig.allowInsecureLoopbackToolchainHTTP
-        ),
+        toolchainManager: ToolchainManaging = AppModel.makeDefaultToolchainManager(),
         projectBaseURL: URL? = nil,
         hardwareProfile: HardwareProfile? = nil,
         pipelineRunnerFactory: @escaping (URL, PipelineRunner.PipelineConfig) -> PipelineRunning = { projectURL, config in
@@ -269,6 +266,19 @@ final class AppModel: ObservableObject {
         if projectBaseURL != nil {
             refreshProjectSummaries()
         }
+    }
+
+    static func makeDefaultToolchainManager(
+        bundledBootstrap: ToolchainBootstrap? = AppConfig.bundledToolchainBootstrap,
+        factory: (ToolchainBootstrap?) -> ToolchainManaging = { bundledBootstrap in
+            ToolchainManager(
+                appVersion: EasySplatReleaseIdentity.version(),
+                allowInsecureLoopbackHTTP: AppConfig.allowInsecureLoopbackToolchainHTTP,
+                bundledBootstrap: bundledBootstrap
+            )
+        }
+    ) -> ToolchainManaging {
+        factory(bundledBootstrap)
     }
 
     func applyUIVerificationProcessingFixture(

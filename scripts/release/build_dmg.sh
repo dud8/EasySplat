@@ -194,6 +194,8 @@ build_app_args=(
   --manifest-url "$MANIFEST_URL"
   --public-key-path "$PUB"
   --version "$APP_VERSION"
+  --bootstrap-manifest "$MANIFEST"
+  --bootstrap-core-archive "$CORE_ZIP"
   --unsigned-beta
 )
 if [ -n "$PROJECT_URL" ]; then

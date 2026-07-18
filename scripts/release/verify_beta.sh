@@ -1,7 +1,10 @@
 #!/usr/bin/env bash
+# shellcheck source-path=SCRIPTDIR
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+# shellcheck source=lib/token_process_cleanup.sh
+source "$ROOT/scripts/release/lib/token_process_cleanup.sh"
 APP_PATH=""
 DMG_PATH=""
 EXPECTED_VERSION=""
@@ -30,6 +33,9 @@ MOUNT_ATTACHED=0
 E2E_DIR=""
 SMOKE_LOG=""
 SMOKE_INSTALL_ROOT=""
+APP_WIRING_PID=""
+APP_WIRING_LOG=""
+APP_WIRING_TOKEN=""
 REMOTE_MANIFEST=""
 MAX_PUBLISHED_MANIFEST_BYTES=16777216
 FINAL_SUCCESS_MESSAGE=""
@@ -106,6 +112,10 @@ cleanup() {
   local cleanup_failed=0
   trap - EXIT
   set +e
+  if ! cleanup_packaged_app_verification_processes; then
+    cleanup_failed=1
+  fi
+  APP_WIRING_TOKEN=""
   if [ "$MOUNT_ATTACHED" -eq 1 ] && [ -n "$MOUNT_DIR" ]; then
     for _ in {1..3}; do
       if detach_disk_image_once; then
@@ -134,6 +144,10 @@ cleanup() {
     echo "error: could not remove beta verification smoke log: $SMOKE_LOG" >&2
     cleanup_failed=1
   fi
+  if [ -n "$APP_WIRING_LOG" ] && ! rm -f "$APP_WIRING_LOG"; then
+    echo "error: could not remove packaged-app wiring smoke log: $APP_WIRING_LOG" >&2
+    cleanup_failed=1
+  fi
   if [ -n "$SMOKE_INSTALL_ROOT" ] && ! rm -rf "$SMOKE_INSTALL_ROOT"; then
     echo "error: could not remove beta verification installed app: $SMOKE_INSTALL_ROOT" >&2
     cleanup_failed=1
@@ -151,6 +165,26 @@ cleanup() {
   exit "$status"
 }
 trap cleanup EXIT
+
+cleanup_packaged_app_verification_processes() {
+  local cleanup_status=0
+  if [ -n "$APP_WIRING_TOKEN" ]; then
+    if ! easysplat_cleanup_token_processes "$APP_WIRING_TOKEN"; then
+      echo "error: could not clean all packaged-app verification processes." >&2
+      cleanup_status=1
+    fi
+  fi
+  if [ -n "$APP_WIRING_PID" ]; then
+    if kill -0 "$APP_WIRING_PID" 2>/dev/null; then
+      kill -TERM "$APP_WIRING_PID" 2>/dev/null || true
+      sleep 0.1
+      kill -KILL "$APP_WIRING_PID" 2>/dev/null || true
+    fi
+    wait "$APP_WIRING_PID" 2>/dev/null || true
+    APP_WIRING_PID=""
+  fi
+  return "$cleanup_status"
+}
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -291,7 +325,7 @@ if [ "$ALLOW_INCOMPLETE" -eq 0 ]; then
     exit 1
   fi
   if [ ! -d "$OFFLINE_CACHE_ROOT" ] || [ -z "$OFFLINE_RUNNER" ]; then
-    echo "Release verification requires a shared offline cache and runner." >&2
+    echo "Release verification requires a distinct offline bootstrap root and runner." >&2
     exit 1
   fi
 
@@ -301,14 +335,16 @@ if [ "$ALLOW_INCOMPLETE" -eq 0 ]; then
     echo "Strict release verification requires the repository-built EasySplatReleaseVerifier for both runs." >&2
     exit 1
   fi
-  if [ "$(canonical_path "$TOOLCHAIN_ROOT")" != "$(canonical_path "$OFFLINE_CACHE_ROOT")" ]; then
-    echo "Online and offline release verification must use the exact same toolchain cache." >&2
+  if [ "$(canonical_path "$TOOLCHAIN_ROOT")" = "$(canonical_path "$OFFLINE_CACHE_ROOT")" ]; then
+    echo "Online and offline release verification must use distinct toolchain roots." >&2
     exit 1
   fi
-  if find "$TOOLCHAIN_ROOT" -mindepth 1 -print -quit | grep -q .; then
-    echo "Release verification must start with an empty toolchain cache." >&2
-    exit 1
-  fi
+  for root in "$OFFLINE_CACHE_ROOT" "$TOOLCHAIN_ROOT"; do
+    if find "$root" -mindepth 1 -print -quit | grep -q .; then
+      echo "Release verification must start with two empty toolchain roots." >&2
+      exit 1
+    fi
+  done
 fi
 
 SEMVER_RE='^[0-9]+\.[0-9]+\.[0-9]+-[0-9A-Za-z.-]+(\+[0-9A-Za-z.-]+)?$'
@@ -441,6 +477,269 @@ validate_bundled_toolchain_contract() {
   fi
 }
 
+run_bootstrap_verifier() {
+  local manifest=$1
+  local core_archive=$2
+  local public_key=$3
+  local args=(
+    verify-bootstrap
+    --manifest "$manifest"
+    --public-key-file "$public_key"
+    --app-version "$EXPECTED_VERSION"
+    --core-zip "$core_archive"
+  )
+  swift run --package-path "$ROOT/Tools/ManifestTool" ManifestTool "${args[@]}"
+}
+
+validate_bundled_bootstrap_contract() {
+  local app=$1
+  local bootstrap_dir="$app/Contents/Resources/ToolchainBootstrap"
+  local bundled_manifest="$bootstrap_dir/manifest.json"
+  local bundled_core="$bootstrap_dir/macos-arm64-core.zip"
+
+  python3 - "$bootstrap_dir" "$bundled_manifest" "$bundled_core" <<'PY'
+import os
+import stat
+import sys
+from pathlib import Path
+
+directory = Path(sys.argv[1])
+try:
+    directory_metadata = directory.lstat()
+except FileNotFoundError:
+    raise SystemExit(f"Bundled toolchain bootstrap directory is missing: {directory}")
+if not stat.S_ISDIR(directory_metadata.st_mode):
+    raise SystemExit(f"Bundled toolchain bootstrap path is not an ordinary directory: {directory}")
+
+expected = {"manifest.json", "macos-arm64-core.zip"}
+actual = {entry.name for entry in os.scandir(directory)}
+if actual != expected:
+    raise SystemExit("Bundled toolchain bootstrap must contain exactly manifest.json and macos-arm64-core.zip.")
+
+for label, raw_path in (
+    ("manifest", sys.argv[2]),
+    ("core archive", sys.argv[3]),
+):
+    path = Path(raw_path)
+    metadata = path.lstat()
+    if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1:
+        raise SystemExit(f"Bundled toolchain bootstrap {label} must be an ordinary, non-hardlinked regular file: {path}")
+    if metadata.st_size == 0:
+        raise SystemExit(f"Bundled toolchain bootstrap {label} must not be empty: {path}")
+PY
+
+  local authority_file
+  if [ "$VERIFY_BUNDLED_TOOLCHAIN" -eq 1 ]; then
+    authority_file="$PUBLIC_KEY_FILE"
+  else
+    authority_file="$(bundled_app_resource "$app" public_key_ed25519.txt)"
+    if [ ! -f "$authority_file" ] || [ -L "$authority_file" ] || [ ! -s "$authority_file" ]; then
+      echo "Bundled app public-key authority is missing: $authority_file" >&2
+      return 1
+    fi
+  fi
+  run_bootstrap_verifier "$bundled_manifest" "$bundled_core" "$authority_file"
+
+  if [ -n "$RELEASE_MANIFEST" ] || [ -n "$CORE_ARCHIVE" ]; then
+    if [ -z "$RELEASE_MANIFEST" ] || [ -z "$CORE_ARCHIVE" ]; then
+      echo "Bootstrap byte verification requires --release-manifest and --core-archive together." >&2
+      return 1
+    fi
+    if ! cmp -s "$bundled_manifest" "$RELEASE_MANIFEST"; then
+      echo "Bundled bootstrap manifest bytes differ from the supplied verified release manifest." >&2
+      return 1
+    fi
+    if ! cmp -s "$bundled_core" "$CORE_ARCHIVE"; then
+      echo "Bundled bootstrap core bytes differ from the supplied verified core archive." >&2
+      return 1
+    fi
+  fi
+}
+
+run_packaged_app_bootstrap_smoke() {
+  local verifier_home="$SMOKE_INSTALL_ROOT/ReleaseVerificationHome"
+  local photo_folder="$verifier_home/InputPhotos"
+  local toolchain_root="$verifier_home/Library/Application Support/EasySplat/Toolchains"
+  local project_root="$verifier_home/Documents/EasySplat Projects"
+  local success_marker="$verifier_home/release-verification-toolchain-ready.json"
+  local receipt=""
+  local sandbox_profile=""
+  local verification_token=""
+  local app_status=0
+  verification_token="easysplat-release-verify-$(uuidgen)"
+  if ! easysplat_validate_release_verification_token "$verification_token"; then
+    echo "Could not create a valid packaged-app verification token." >&2
+    return 1
+  fi
+  APP_WIRING_TOKEN="$verification_token"
+
+  if [ ! -x /usr/bin/sandbox-exec ]; then
+    echo "Strict packaged-app verification requires /usr/bin/sandbox-exec." >&2
+    return 1
+  fi
+  mkdir -p "$photo_folder" "$verifier_home/tmp" "$project_root"
+  verifier_home="$(cd "$verifier_home" && pwd -P)"
+  photo_folder="$verifier_home/InputPhotos"
+  toolchain_root="$verifier_home/Library/Application Support/EasySplat/Toolchains"
+  project_root="$verifier_home/Documents/EasySplat Projects"
+  success_marker="$verifier_home/release-verification-toolchain-ready.json"
+  sandbox_profile="(version 1)
+(deny default)
+(allow process*)
+(allow file-read*)
+(allow file-write* (subpath \"$verifier_home\"))
+(allow mach-lookup)
+(allow ipc-posix*)
+(allow sysctl-read)
+(allow iokit-open)
+(allow signal)"
+
+  /usr/bin/sandbox-exec -p "$sandbox_profile" /usr/bin/touch "$verifier_home/write-probe"
+  if /usr/bin/sandbox-exec -p "$sandbox_profile" \
+    /usr/bin/touch "$SMOKE_INSTALL_ROOT/outside-write-probe" 2>/dev/null; then
+    echo "Packaged-app sandbox allowed a write outside the isolated verifier home." >&2
+    return 1
+  fi
+  /usr/bin/xcrun swift - "$photo_folder" <<'SWIFT'
+import AppKit
+import Foundation
+
+guard CommandLine.arguments.count == 2 else { exit(1) }
+let output = URL(fileURLWithPath: CommandLine.arguments[1], isDirectory: true)
+for index in 1...3 {
+    guard let context = CGContext(
+        data: nil,
+        width: 32,
+        height: 32,
+        bitsPerComponent: 8,
+        bytesPerRow: 32 * 4,
+        space: CGColorSpaceCreateDeviceRGB(),
+        bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
+    ) else { exit(1) }
+    context.setFillColor(
+        red: CGFloat(index) / 4,
+        green: CGFloat(4 - index) / 4,
+        blue: 0.5,
+        alpha: 1
+    )
+    context.fill(CGRect(x: 0, y: 0, width: 32, height: 32))
+    guard let image = context.makeImage(),
+          let data = NSBitmapImageRep(cgImage: image).representation(using: .png, properties: [:]) else {
+        exit(1)
+    }
+    try data.write(to: output.appendingPathComponent("view-\(index).png"), options: .atomic)
+}
+SWIFT
+
+  APP_WIRING_LOG="$(mktemp "${TMPDIR:-/tmp}/easysplat-packaged-app-wiring.XXXXXX")"
+  /usr/bin/sandbox-exec -p "$sandbox_profile" \
+    /usr/bin/env -i \
+    PATH=/usr/bin:/bin:/usr/sbin:/sbin \
+    HOME="$verifier_home" \
+    CFFIXED_USER_HOME="$verifier_home" \
+    TMPDIR="$verifier_home/tmp" \
+    EASYSPLAT_ISOLATED_UI_RUNNER=1 \
+    EASYSPLAT_RELEASE_VERIFY_TOKEN="$verification_token" \
+    "$INSTALLED_EXECUTABLE" \
+    --easysplat-release-verify-bundled-bootstrap \
+    "$photo_folder" >"$APP_WIRING_LOG" 2>&1 &
+  APP_WIRING_PID=$!
+
+  for _ in {1..2400}; do
+    receipt="$(find "$toolchain_root" -type f -name .easysplat_toolchain_state.json -print -quit 2>/dev/null || true)"
+    if [ -n "$receipt" ] && [ -s "$success_marker" ]; then
+      break
+    fi
+    if ! kill -0 "$APP_WIRING_PID" 2>/dev/null; then
+      echo "Installed app exited before proving bundled-bootstrap production wiring." >&2
+      cat "$APP_WIRING_LOG" >&2
+      cleanup_packaged_app_verification_processes || true
+      return 1
+    fi
+    sleep 0.05
+  done
+  if [ -z "$receipt" ] || [ ! -s "$success_marker" ]; then
+    echo "Installed app did not validate bundled tools and write its success marker before the timeout." >&2
+    cat "$APP_WIRING_LOG" >&2
+    cleanup_packaged_app_verification_processes || true
+    return 1
+  fi
+
+  python3 - "$receipt" "$success_marker" \
+    "$INSTALLED_APP/Contents/Resources/ToolchainBootstrap/manifest.json" \
+    "$photo_folder" "$toolchain_root" "$project_root" <<'PY'
+import json
+import os
+import sys
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+
+receipt_path, marker_path, manifest_path, photo_path, expected_root, project_root = map(Path, sys.argv[1:])
+if os.path.commonpath((receipt_path.resolve(), expected_root.resolve())) != str(expected_root.resolve()):
+    raise SystemExit("Packaged app wrote its toolchain receipt outside the isolated toolchain root.")
+state = json.loads(receipt_path.read_text(encoding="utf-8"))
+manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+signed_manifest = state.get("signedManifest") or {}
+receipt_published_at = signed_manifest.pop("publishedAt", None)
+manifest_published_at = manifest.pop("publishedAt", None)
+if not isinstance(receipt_published_at, (int, float)) or not isinstance(manifest_published_at, str):
+    raise SystemExit("Installed-app receipt has an invalid signed-manifest publication date.")
+receipt_date = datetime(2001, 1, 1, tzinfo=timezone.utc) + timedelta(seconds=receipt_published_at)
+manifest_date = datetime.fromisoformat(manifest_published_at.replace("Z", "+00:00"))
+if signed_manifest != manifest or receipt_date != manifest_date:
+    raise SystemExit("Installed-app receipt does not preserve the packaged signed manifest.")
+core = [row for row in signed_manifest.get("components", []) if row.get("name") == "macos-arm64-core"]
+if len(core) != 1:
+    raise SystemExit("Packaged signed manifest has no unique core component.")
+if state.get("installedArtifacts") != {"macos-arm64-core": core[0].get("sha256")}:
+    raise SystemExit("Installed app prepared an artifact other than the packaged signed core.")
+if set(state.get("installedCapabilities", [])) != set(core[0].get("capabilities", [])):
+    raise SystemExit("Installed-app receipt capabilities do not match the packaged signed core.")
+marker = json.loads(marker_path.read_text(encoding="utf-8"))
+if marker.get("schemaVersion") != 1:
+    raise SystemExit("Installed app wrote an unsupported release-verification marker.")
+if marker.get("toolchainRoot") != str(receipt_path.parent.resolve()):
+    raise SystemExit("Installed-app marker does not identify the validated toolchain root.")
+if marker.get("inputFolder") != str(photo_path.resolve()):
+    raise SystemExit("Installed-app marker does not record the isolated verifier input.")
+if set(marker.get("requestedCapabilities", [])) != set(core[0].get("capabilities", [])):
+    raise SystemExit("Installed-app marker capabilities do not match the packaged signed core.")
+if project_root.exists() and any(project_root.iterdir()):
+    raise SystemExit("Release-verification tool preparation unexpectedly created a project or started the pipeline.")
+PY
+
+  for _ in {1..100}; do
+    kill -0 "$APP_WIRING_PID" 2>/dev/null || break
+    sleep 0.05
+  done
+  if kill -0 "$APP_WIRING_PID" 2>/dev/null; then
+    echo "Installed app did not terminate cleanly after validating bundled tools." >&2
+    cleanup_packaged_app_verification_processes || true
+    return 1
+  fi
+  set +e
+  wait "$APP_WIRING_PID"
+  app_status=$?
+  set -e
+  if [ "$app_status" -ne 0 ]; then
+    echo "Installed app exited unsuccessfully after writing its verification marker." >&2
+    cat "$APP_WIRING_LOG" >&2
+    cleanup_packaged_app_verification_processes || true
+    return 1
+  fi
+  APP_WIRING_PID=""
+
+  if [ -n "$(easysplat_token_process_ids "$APP_WIRING_TOKEN")" ]; then
+    echo "Packaged-app verification left a detached pipeline or toolchain worker process." >&2
+    cleanup_packaged_app_verification_processes || true
+    return 1
+  fi
+  APP_WIRING_TOKEN=""
+  rm -f "$APP_WIRING_LOG"
+  APP_WIRING_LOG=""
+  echo "Installed app bundled-bootstrap production wiring passed."
+}
+
 VERIFY_BUNDLED_TOOLCHAIN=0
 if [ -n "$MANIFEST_URL" ] || [ -n "$PUBLIC_KEY_FILE" ]; then
   if [ -z "$MANIFEST_URL" ] || [ ! -f "$PUBLIC_KEY_FILE" ]; then
@@ -475,6 +774,7 @@ EXPORTED_DSYM="$(dirname "$APP_PATH")/EasySplat.app.dSYM"
 [ -d "$EXPORTED_DSYM" ]
 verify_dsym_matches_executable "$EXECUTABLE" "$EXPORTED_DSYM"
 [ "$(cat "$APP_PATH/Contents/Resources/release_channel.txt")" = "unsigned public beta" ]
+validate_bundled_bootstrap_contract "$APP_PATH"
 if [ "$VERIFY_BUNDLED_TOOLCHAIN" -eq 1 ]; then
   validate_bundled_toolchain_contract "$APP_PATH"
 fi
@@ -522,6 +822,7 @@ if [ "$VERIFY_BUNDLED_TOOLCHAIN" -eq 1 ]; then
   EFFECTIVE_MANIFEST_URL="$(cat "$(bundled_app_resource "$DISTRIBUTED_APP" toolchain_manifest_url.txt)")"
   EFFECTIVE_PUBLIC_KEY_FILE="$(bundled_app_resource "$DISTRIBUTED_APP" public_key_ed25519.txt)"
 fi
+validate_bundled_bootstrap_contract "$DISTRIBUTED_APP"
 
 if [ "$VERIFY_ARTIFACTS" -eq 1 ]; then
   STEM="${DMG_PATH%-unsigned.dmg}"
@@ -549,6 +850,8 @@ PY
   CORE_ARCHIVE="${CORE_ARCHIVE:-$ROOT/Toolchains/out/toolchain-macos-arm64-$TOOLCHAIN_VERSION-core.zip}"
   DA3_BASE_ARCHIVE="${DA3_BASE_ARCHIVE:-$ROOT/Toolchains/out/toolchain-geometry-da3-base-$TOOLCHAIN_VERSION.zip}"
   DA3_SMALL_ARCHIVE="${DA3_SMALL_ARCHIVE:-$ROOT/Toolchains/out/toolchain-geometry-da3-small-$TOOLCHAIN_VERSION.zip}"
+  validate_bundled_bootstrap_contract "$APP_PATH"
+  validate_bundled_bootstrap_contract "$DISTRIBUTED_APP"
   python3 "$ROOT/scripts/release/generate_release_metadata.py" verify \
     --app-version "$EXPECTED_VERSION" \
     --toolchain-version "$TOOLCHAIN_VERSION" \
@@ -597,8 +900,13 @@ if [ "$SKIP_LAUNCH_SMOKE" -eq 0 ]; then
   if [ "$VERIFY_BUNDLED_TOOLCHAIN" -eq 1 ]; then
     validate_bundled_toolchain_contract "$INSTALLED_APP"
   fi
+  validate_bundled_bootstrap_contract "$INSTALLED_APP"
+  WINDOW_SMOKE_HOME="$SMOKE_INSTALL_ROOT/WindowSmokeHome"
+  mkdir -p "$WINDOW_SMOKE_HOME/tmp"
+  WINDOW_SMOKE_HOME="$(cd "$WINDOW_SMOKE_HOME" && pwd -P)"
   SMOKE_LOG="$(mktemp "${TMPDIR:-/tmp}/easysplat-launch-smoke.XXXXXX")"
   if ! /usr/bin/xcrun swift - "$INSTALLED_APP" "${EASYSPLAT_SMOKE_SECONDS:-3}" \
+    "$WINDOW_SMOKE_HOME" \
     >"$SMOKE_LOG" 2>&1 <<'SWIFT'
 import AppKit
 import CoreGraphics
@@ -645,21 +953,34 @@ func hasAppWindow(processIdentifier: pid_t) -> Bool {
     }
 }
 
-guard CommandLine.arguments.count == 3 else {
-    fail("Launch smoke requires an app bundle and timeout.")
+guard CommandLine.arguments.count == 4 else {
+    fail("Launch smoke requires an app bundle, timeout, and isolated home.")
 }
 let appURL = URL(fileURLWithPath: CommandLine.arguments[1], isDirectory: true)
 guard let timeout = Double(CommandLine.arguments[2]), timeout.isFinite, timeout > 0 else {
     fail("Invalid launch-smoke duration: \(CommandLine.arguments[2]).")
+}
+let isolatedHome = URL(fileURLWithPath: CommandLine.arguments[3], isDirectory: true)
+    .standardizedFileURL
+    .resolvingSymlinksInPath()
+guard isolatedHome.path.hasPrefix("/"),
+      FileManager.default.fileExists(atPath: isolatedHome.path) else {
+    fail("Launch smoke requires an existing absolute isolated home.")
 }
 
 let configuration = NSWorkspace.OpenConfiguration()
 configuration.activates = true
 configuration.addsToRecentItems = false
 configuration.createsNewApplicationInstance = true
+var launchEnvironment = [
+    "HOME": isolatedHome.path,
+    "CFFIXED_USER_HOME": isolatedHome.path,
+    "TMPDIR": isolatedHome.appendingPathComponent("tmp", isDirectory: true).path,
+]
 if ProcessInfo.processInfo.environment["EASYSPLAT_TEST_ACCESSORY_FIXTURE"] == "1" {
-    configuration.environment = ["EASYSPLAT_TEST_ACCESSORY_FIXTURE": "1"]
+    launchEnvironment["EASYSPLAT_TEST_ACCESSORY_FIXTURE"] = "1"
 }
+configuration.environment = launchEnvironment
 
 var launchedApplication: NSRunningApplication?
 var launchError: Error?
@@ -710,13 +1031,17 @@ SWIFT
   fi
   rm -f "$SMOKE_LOG"
   SMOKE_LOG=""
+  if [ "$ALLOW_INCOMPLETE" -eq 0 ]; then
+    run_packaged_app_bootstrap_smoke
+  fi
   rm -rf "$SMOKE_INSTALL_ROOT"
   SMOKE_INSTALL_ROOT=""
 else
   echo "INCOMPLETE TEST MODE: launch smoke disabled."
 fi
 
-if [ -n "$E2E_FIXTURE" ] || [ -n "$TOOLCHAIN_ROOT" ] || [ -n "$E2E_RUNNER" ]; then
+if [ -n "$E2E_FIXTURE" ] || [ -n "$TOOLCHAIN_ROOT" ] || [ -n "$E2E_RUNNER" ] \
+  || [ -n "$OFFLINE_CACHE_ROOT" ] || [ -n "$OFFLINE_RUNNER" ]; then
   if [ "$ALLOW_INCOMPLETE" -eq 0 ]; then
     swift build --package-path "$ROOT" -c release --product EasySplatReleaseVerifier >/dev/null
     [ -x "$EXPECTED_RELEASE_RUNNER" ] || {
@@ -732,14 +1057,62 @@ if [ -n "$E2E_FIXTURE" ] || [ -n "$TOOLCHAIN_ROOT" ] || [ -n "$E2E_RUNNER" ]; th
     exit 1
   fi
   E2E_DIR="$(mktemp -d "${TMPDIR:-/tmp}/easysplat-beta-e2e.XXXXXX")"
-  E2E_OUTPUT="$E2E_DIR/splat.ply"
+  BUNDLED_BOOTSTRAP_MANIFEST="$DISTRIBUTED_APP/Contents/Resources/ToolchainBootstrap/manifest.json"
+  BUNDLED_BOOTSTRAP_CORE="$DISTRIBUTED_APP/Contents/Resources/ToolchainBootstrap/macos-arm64-core.zip"
+
+  if [ -n "$OFFLINE_CACHE_ROOT" ] || [ -n "$OFFLINE_RUNNER" ]; then
+    if [ ! -d "$OFFLINE_CACHE_ROOT" ] || [ ! -x "$OFFLINE_RUNNER" ] \
+      || [ ! -e "$E2E_FIXTURE" ] || [ -z "$MANIFEST_URL" ] || [ ! -f "$PUBLIC_KEY_FILE" ]; then
+      echo "Offline verification requires the fixture, manifest contract, empty bootstrap root, and executable runner." >&2
+      exit 1
+    fi
+    OFFLINE_OUTPUT="$E2E_DIR/offline-splat.ply"
+    "$OFFLINE_RUNNER" \
+      --fixture "$E2E_FIXTURE" \
+      --manifest-url "$EFFECTIVE_MANIFEST_URL" \
+      --public-key-file "$EFFECTIVE_PUBLIC_KEY_FILE" \
+      --bootstrap-manifest "$BUNDLED_BOOTSTRAP_MANIFEST" \
+      --bootstrap-core-archive "$BUNDLED_BOOTSTRAP_CORE" \
+      --cache-root "$OFFLINE_CACHE_ROOT" \
+      --output "$OFFLINE_OUTPUT" \
+      --app-version "$EXPECTED_VERSION" \
+      --installation-policy bundled-bootstrap-only \
+      --offline
+    [ -s "$OFFLINE_OUTPUT" ]
+    head -n 1 "$OFFLINE_OUTPUT" | grep -qx 'ply'
+    grep -a -m1 -Eq '^element vertex [1-9][0-9]*$' "$OFFLINE_OUTPUT"
+    python3 - "$OFFLINE_CACHE_ROOT" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+receipts = list(Path(sys.argv[1]).rglob(".easysplat_toolchain_state.json"))
+if len(receipts) != 1:
+    raise SystemExit(f"Offline bootstrap must create exactly one toolchain receipt (found {len(receipts)}).")
+state = json.loads(receipts[0].read_text(encoding="utf-8"))
+if set(state.get("installedArtifacts", {})) != {"macos-arm64-core"}:
+    raise SystemExit("Offline bootstrap receipt installed a component other than macos-arm64-core.")
+manifest = state.get("signedManifest") or {}
+core = [row for row in manifest.get("components", []) if row.get("name") == "macos-arm64-core"]
+if len(core) != 1 or set(state.get("installedCapabilities", [])) != set(core[0].get("capabilities", [])):
+    raise SystemExit("Offline bootstrap receipt capabilities do not match the signed core component.")
+PY
+  elif [ "$ALLOW_INCOMPLETE" -eq 0 ]; then
+    echo "Release verification requires a distinct offline bootstrap root and runner." >&2
+    exit 1
+  else
+    :
+  fi
+
+  E2E_OUTPUT="$E2E_DIR/online-splat.ply"
   "$E2E_RUNNER" \
     --fixture "$E2E_FIXTURE" \
     --manifest-url "$EFFECTIVE_MANIFEST_URL" \
     --public-key-file "$EFFECTIVE_PUBLIC_KEY_FILE" \
     --cache-root "$TOOLCHAIN_ROOT" \
     --output "$E2E_OUTPUT" \
-    --app-version "$EXPECTED_VERSION"
+    --app-version "$EXPECTED_VERSION" \
+    --installation-policy remote-only
   [ -s "$E2E_OUTPUT" ]
   head -n 1 "$E2E_OUTPUT" | grep -qx 'ply'
   grep -a -m1 -Eq '^element vertex [1-9][0-9]*$' "$E2E_OUTPUT"
@@ -750,31 +1123,8 @@ else
   fi
   echo "INCOMPLETE TEST MODE: end-to-end splat not supplied."
 fi
-
-if [ -n "$OFFLINE_CACHE_ROOT" ] || [ -n "$OFFLINE_RUNNER" ]; then
-  if [ ! -d "$OFFLINE_CACHE_ROOT" ] || [ ! -x "$OFFLINE_RUNNER" ] \
-    || [ ! -e "$E2E_FIXTURE" ] || [ -z "$MANIFEST_URL" ] || [ ! -f "$PUBLIC_KEY_FILE" ]; then
-    echo "Offline verification requires the fixture, manifest contract, populated cache, and executable runner." >&2
-    exit 1
-  fi
-  OFFLINE_OUTPUT="$E2E_DIR/offline-splat.ply"
-  "$OFFLINE_RUNNER" \
-    --fixture "$E2E_FIXTURE" \
-    --manifest-url "$EFFECTIVE_MANIFEST_URL" \
-    --public-key-file "$EFFECTIVE_PUBLIC_KEY_FILE" \
-    --cache-root "$OFFLINE_CACHE_ROOT" \
-    --output "$OFFLINE_OUTPUT" \
-    --app-version "$EXPECTED_VERSION" \
-    --offline
-  [ -s "$OFFLINE_OUTPUT" ]
-  head -n 1 "$OFFLINE_OUTPUT" | grep -qx 'ply'
-  grep -a -m1 -Eq '^element vertex [1-9][0-9]*$' "$OFFLINE_OUTPUT"
-else
-  if [ "$ALLOW_INCOMPLETE" -eq 0 ]; then
-    echo "Release verification requires a shared offline cache and runner." >&2
-    exit 1
-  fi
-  echo "INCOMPLETE TEST MODE: cached offline run not supplied."
+if [ -z "$OFFLINE_CACHE_ROOT" ] && [ -z "$OFFLINE_RUNNER" ] && [ "$ALLOW_INCOMPLETE" -eq 1 ]; then
+  echo "INCOMPLETE TEST MODE: offline bootstrap run not supplied."
 fi
 
 if [ "$ALLOW_INCOMPLETE" -eq 1 ]; then

@@ -2539,6 +2539,314 @@ final class AppModelTests: XCTestCase {
         }
     }
 
+    func testAppConfigDiscoversPairedBundledToolchainBootstrapFiles() throws {
+        let fixture = try makeToolchainBootstrapFixture()
+        defer { try? FileManager.default.removeItem(at: fixture.resourceRoot) }
+
+        let bootstrap = try XCTUnwrap(AppConfig.bundledToolchainBootstrap(
+            environment: [:],
+            resourceRoot: fixture.resourceRoot
+        ))
+
+        XCTAssertEqual(bootstrap.manifestURL, fixture.manifestURL)
+        XCTAssertEqual(bootstrap.coreArchiveURL, fixture.coreArchiveURL)
+    }
+
+    func testReleaseVerificationPhotoFolderRequiresExactIsolatedGate() throws {
+        let fixedHome = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        let input = fixedHome.appendingPathComponent("release-input", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: fixedHome) }
+        try FileManager.default.createDirectory(at: input, withIntermediateDirectories: true)
+        let environment = [
+            "HOME": fixedHome.path,
+            "CFFIXED_USER_HOME": fixedHome.path,
+            "EASYSPLAT_ISOLATED_UI_RUNNER": "1",
+        ]
+        let arguments = [
+            "/Applications/EasySplat.app/Contents/MacOS/EasySplatApp",
+            "--easysplat-release-verify-bundled-bootstrap",
+            input.path,
+        ]
+
+        XCTAssertEqual(
+            AppConfig.releaseVerificationPhotoFolderURL(
+                environment: environment,
+                arguments: arguments
+            ),
+            input.standardizedFileURL
+        )
+        XCTAssertEqual(
+            AppConfig.releaseVerificationConfiguration(
+                environment: environment,
+                arguments: arguments
+            )?.successMarkerURL,
+            fixedHome.appendingPathComponent("release-verification-toolchain-ready.json")
+                .standardizedFileURL
+        )
+
+        var missingRunner = environment
+        missingRunner.removeValue(forKey: "EASYSPLAT_ISOLATED_UI_RUNNER")
+        XCTAssertNil(AppConfig.releaseVerificationPhotoFolderURL(
+            environment: missingRunner,
+            arguments: arguments
+        ))
+        XCTAssertNil(AppConfig.releaseVerificationPhotoFolderURL(
+            environment: environment,
+            arguments: [arguments[0], input.path]
+        ))
+    }
+
+    func testReleaseVerificationPhotoFolderRejectsNonisolatedAndOverrideInputs() throws {
+        let fixedHome = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        let input = fixedHome.appendingPathComponent("release-input", isDirectory: true)
+        let outside = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        defer {
+            try? FileManager.default.removeItem(at: fixedHome)
+            try? FileManager.default.removeItem(at: outside)
+        }
+        try FileManager.default.createDirectory(at: input, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: outside, withIntermediateDirectories: true)
+        let executable = "/Applications/EasySplat.app/Contents/MacOS/EasySplatApp"
+        let gate = "--easysplat-release-verify-bundled-bootstrap"
+        let base = [
+            "HOME": fixedHome.path,
+            "CFFIXED_USER_HOME": fixedHome.path,
+            "EASYSPLAT_ISOLATED_UI_RUNNER": "1",
+        ]
+
+        XCTAssertNil(AppConfig.releaseVerificationPhotoFolderURL(
+            environment: base,
+            arguments: [executable, gate, outside.path]
+        ))
+        XCTAssertNil(AppConfig.releaseVerificationPhotoFolderURL(
+            environment: base.merging(["HOME": outside.path]) { _, new in new },
+            arguments: [executable, gate, input.path]
+        ))
+        for override in [
+            "EASYSPLAT_TOOLCHAIN_MANIFEST_URL",
+            "EASYSPLAT_TOOLCHAIN_PUBLIC_KEY_BASE64",
+            "EASYSPLAT_LOCAL_TOOLCHAIN_ROOT",
+        ] {
+            XCTAssertNil(AppConfig.releaseVerificationPhotoFolderURL(
+                environment: base.merging([override: "forbidden"]) { _, new in new },
+                arguments: [executable, gate, input.path]
+            ))
+        }
+    }
+
+    func testReleaseVerificationPreparationWritesMarkerWithoutStartingProjectOrPipeline() async throws {
+        let base = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        let photoFolder = base.appendingPathComponent("InputPhotos", isDirectory: true)
+        let marker = base.appendingPathComponent("toolchain-ready.json")
+        defer { try? FileManager.default.removeItem(at: base) }
+        try FileManager.default.createDirectory(at: photoFolder, withIntermediateDirectories: true)
+        let manager = CapabilityRecordingToolchainManager()
+        var pipelineFactoryInvocations = 0
+        let model = AppModel(
+            toolchainManager: manager,
+            projectBaseURL: base.appendingPathComponent("Projects", isDirectory: true),
+            hardwareProfile: standardHardwareProfile
+        ) { projectURL, config in
+            pipelineFactoryInvocations += 1
+            return MockPipelineRunner(projectURL: projectURL, config: config)
+        }
+
+        try await model.prepareBundledToolchainForReleaseVerification(
+            photoFolder: photoFolder,
+            successMarkerURL: marker
+        )
+
+        XCTAssertEqual(manager.lastRequest?.capabilities, [.core, .colmap, .msplat])
+        XCTAssertEqual(pipelineFactoryInvocations, 0)
+        XCTAssertNil(model.currentProjectURL)
+        XCTAssertFalse(model.isRunActive)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: marker.path))
+        let evidence = try JSONSerialization.jsonObject(with: Data(contentsOf: marker)) as? [String: Any]
+        XCTAssertEqual(evidence?["schemaVersion"] as? Int, 1)
+        XCTAssertEqual(evidence?["toolchainRoot"] as? String, makeMockToolchainPaths().root.path)
+        XCTAssertEqual(
+            Set(evidence?["requestedCapabilities"] as? [String] ?? []),
+            Set(["runtime.core", "geometry.colmap", "training.msplat"])
+        )
+        XCTAssertEqual(evidence?["inputFolder"] as? String, photoFolder.standardizedFileURL.path)
+    }
+
+    func testReleaseVerificationPreparationDoesNotWriteMarkerWhenToolValidationFails() async throws {
+        let base = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        let photoFolder = base.appendingPathComponent("InputPhotos", isDirectory: true)
+        let marker = base.appendingPathComponent("toolchain-ready.json")
+        defer { try? FileManager.default.removeItem(at: base) }
+        try FileManager.default.createDirectory(at: photoFolder, withIntermediateDirectories: true)
+        let model = AppModel(
+            toolchainManager: FailingToolchainManager(message: "validation failed"),
+            projectBaseURL: base.appendingPathComponent("Projects", isDirectory: true),
+            hardwareProfile: standardHardwareProfile
+        ) { projectURL, config in
+            MockPipelineRunner(projectURL: projectURL, config: config)
+        }
+
+        do {
+            try await model.prepareBundledToolchainForReleaseVerification(
+                photoFolder: photoFolder,
+                successMarkerURL: marker
+            )
+            XCTFail("Expected release-verification tool preparation to fail")
+        } catch {
+            XCTAssertEqual(error.localizedDescription, "validation failed")
+        }
+        XCTAssertFalse(FileManager.default.fileExists(atPath: marker.path))
+        XCTAssertNil(model.currentProjectURL)
+    }
+
+    func testReleaseVerificationMarkerRemovesRenamedDestinationWhenDirectorySyncFails() throws {
+        let base = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        let marker = base.appendingPathComponent("toolchain-ready.json")
+        defer { try? FileManager.default.removeItem(at: base) }
+        try FileManager.default.createDirectory(at: base, withIntermediateDirectories: true)
+        var synchronizationAttempts = 0
+
+        XCTAssertThrowsError(try AppModel.writeReleaseVerificationMarker(
+            Data("evidence".utf8),
+            to: marker
+        ) { _ in
+            synchronizationAttempts += 1
+            throw CocoaError(.fileWriteUnknown)
+        })
+
+        XCTAssertEqual(synchronizationAttempts, 2)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: marker.path))
+        XCTAssertEqual(
+            try FileManager.default.contentsOfDirectory(atPath: base.path),
+            []
+        )
+    }
+
+    func testAppConfigRejectsPartialBundledToolchainBootstrapPairs() throws {
+        for missingName in ["manifest.json", "macos-arm64-core.zip"] {
+            let fixture = try makeToolchainBootstrapFixture()
+            defer { try? FileManager.default.removeItem(at: fixture.resourceRoot) }
+            try FileManager.default.removeItem(
+                at: fixture.bootstrapRoot.appendingPathComponent(missingName)
+            )
+
+            XCTAssertNil(AppConfig.bundledToolchainBootstrap(
+                environment: [:],
+                resourceRoot: fixture.resourceRoot
+            ))
+        }
+    }
+
+    func testAppConfigRejectsEmptyBundledToolchainBootstrapManifest() throws {
+        let fixture = try makeToolchainBootstrapFixture()
+        defer { try? FileManager.default.removeItem(at: fixture.resourceRoot) }
+        try Data().write(to: fixture.manifestURL)
+
+        XCTAssertNil(AppConfig.bundledToolchainBootstrap(
+            environment: [:],
+            resourceRoot: fixture.resourceRoot
+        ))
+    }
+
+    func testAppConfigRejectsEmptyBundledToolchainBootstrapCoreArchive() throws {
+        let fixture = try makeToolchainBootstrapFixture()
+        defer { try? FileManager.default.removeItem(at: fixture.resourceRoot) }
+        try Data().write(to: fixture.coreArchiveURL)
+
+        XCTAssertNil(AppConfig.bundledToolchainBootstrap(
+            environment: [:],
+            resourceRoot: fixture.resourceRoot
+        ))
+    }
+
+    func testAppConfigRejectsSymbolicLinkInBundledToolchainBootstrapPair() throws {
+        let fixture = try makeToolchainBootstrapFixture()
+        defer { try? FileManager.default.removeItem(at: fixture.resourceRoot) }
+        let manifestTarget = fixture.resourceRoot.appendingPathComponent("real-manifest.json")
+        try Data("manifest".utf8).write(to: manifestTarget)
+        try FileManager.default.removeItem(at: fixture.manifestURL)
+        try FileManager.default.createSymbolicLink(
+            at: fixture.manifestURL,
+            withDestinationURL: manifestTarget
+        )
+
+        XCTAssertNil(AppConfig.bundledToolchainBootstrap(
+            environment: [:],
+            resourceRoot: fixture.resourceRoot
+        ))
+    }
+
+    func testAppConfigRejectsDirectoryInBundledToolchainBootstrapPair() throws {
+        let fixture = try makeToolchainBootstrapFixture()
+        defer { try? FileManager.default.removeItem(at: fixture.resourceRoot) }
+        try FileManager.default.removeItem(at: fixture.coreArchiveURL)
+        try FileManager.default.createDirectory(
+            at: fixture.coreArchiveURL,
+            withIntermediateDirectories: false
+        )
+
+        XCTAssertNil(AppConfig.bundledToolchainBootstrap(
+            environment: [:],
+            resourceRoot: fixture.resourceRoot
+        ))
+    }
+
+    func testAppConfigRejectsMultiplyLinkedBundledToolchainBootstrapFile() throws {
+        let fixture = try makeToolchainBootstrapFixture()
+        defer { try? FileManager.default.removeItem(at: fixture.resourceRoot) }
+        try FileManager.default.linkItem(
+            at: fixture.coreArchiveURL,
+            to: fixture.resourceRoot.appendingPathComponent("second-core-link.zip")
+        )
+
+        XCTAssertNil(AppConfig.bundledToolchainBootstrap(
+            environment: [:],
+            resourceRoot: fixture.resourceRoot
+        ))
+    }
+
+    func testAppConfigManifestOverrideDisablesBundledToolchainBootstrap() throws {
+        let fixture = try makeToolchainBootstrapFixture()
+        defer { try? FileManager.default.removeItem(at: fixture.resourceRoot) }
+
+        XCTAssertNil(AppConfig.bundledToolchainBootstrap(
+            environment: ["EASYSPLAT_TOOLCHAIN_MANIFEST_URL": "https://example.com/manifest.json"],
+            resourceRoot: fixture.resourceRoot
+        ))
+    }
+
+    func testAppConfigPublicKeyOverrideDisablesBundledToolchainBootstrap() throws {
+        let fixture = try makeToolchainBootstrapFixture()
+        defer { try? FileManager.default.removeItem(at: fixture.resourceRoot) }
+
+        XCTAssertNil(AppConfig.bundledToolchainBootstrap(
+            environment: ["EASYSPLAT_TOOLCHAIN_PUBLIC_KEY_BASE64": "release-authority-override"],
+            resourceRoot: fixture.resourceRoot
+        ))
+    }
+
+    func testDefaultToolchainManagerFactoryReceivesBundledBootstrap() throws {
+        let fixture = try makeToolchainBootstrapFixture()
+        defer { try? FileManager.default.removeItem(at: fixture.resourceRoot) }
+        let expected = try XCTUnwrap(AppConfig.bundledToolchainBootstrap(
+            environment: [:],
+            resourceRoot: fixture.resourceRoot
+        ))
+        var received: ToolchainBootstrap?
+
+        _ = AppModel.makeDefaultToolchainManager(bundledBootstrap: expected) { bootstrap in
+            received = bootstrap
+            return MockToolchainManager()
+        }
+
+        XCTAssertEqual(received, expected)
+    }
+
     func testAppConfigEnablesInsecureLoopbackOnlyForDebugManifest() async {
         await withAppEnvironmentAsync([
             "EASYSPLAT_TOOLCHAIN_MANIFEST_URL": "http://127.0.0.1:8000/manifest.json",
@@ -3024,6 +3332,24 @@ private func appResourceURL(named name: String) -> URL {
         .deletingLastPathComponent()
         .deletingLastPathComponent()
         .appendingPathComponent("EasySplatApp/Resources/\(name)")
+}
+
+private func makeToolchainBootstrapFixture() throws -> (
+    resourceRoot: URL,
+    bootstrapRoot: URL,
+    manifestURL: URL,
+    coreArchiveURL: URL
+) {
+    let resourceRoot = FileManager.default.temporaryDirectory
+        .appendingPathComponent(UUID().uuidString, isDirectory: true)
+    let bootstrapRoot = resourceRoot
+        .appendingPathComponent("ToolchainBootstrap", isDirectory: true)
+    try FileManager.default.createDirectory(at: bootstrapRoot, withIntermediateDirectories: true)
+    let manifestURL = bootstrapRoot.appendingPathComponent("manifest.json", isDirectory: false)
+    let coreArchiveURL = bootstrapRoot.appendingPathComponent("macos-arm64-core.zip", isDirectory: false)
+    try Data("manifest".utf8).write(to: manifestURL)
+    try Data("core".utf8).write(to: coreArchiveURL)
+    return (resourceRoot, bootstrapRoot, manifestURL, coreArchiveURL)
 }
 
 private func captureAppEnvironment(_ changes: [String: String?]) -> [String: String?] {

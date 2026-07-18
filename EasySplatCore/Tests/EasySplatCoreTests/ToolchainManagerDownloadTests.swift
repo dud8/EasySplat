@@ -864,6 +864,129 @@ final class ToolchainManagerDownloadTests: XCTestCase {
         })
     }
 
+    func testDA3RequestWithCorruptCacheAndValidCoreBootstrapReportsCacheIntegrityFailure() async throws {
+        let installationRoot = try TestFileBuilder.makeTempDir()
+        defer { try? FileManager.default.removeItem(at: installationRoot) }
+        let versionedRoot = installationRoot.appendingPathComponent("2.0.0", isDirectory: true)
+        let archiveData = Data("fixture bundled core archive".utf8)
+        let bootstrapManifestURL = installationRoot.appendingPathComponent("bootstrap-manifest.json")
+        let bootstrapArchiveURL = installationRoot.appendingPathComponent("bootstrap-core.zip")
+        let token = UUID().uuidString
+        let remoteManifestURL = tokenizedURL("https://example.com/manifest.json", token: token)
+        let bootstrapManager = ToolchainManager(
+            runner: MockSubprocessRunner(scripts: []),
+            urlSession: makeSession(),
+            appVersion: "0.2.0-beta.1",
+            localToolchainRoot: nil,
+            installationRoot: installationRoot
+        )
+        let signed = try makeSignedCachedFixture(
+            at: versionedRoot,
+            manager: bootstrapManager,
+            coreArchiveData: archiveData
+        )
+        let manifestEncoder = JSONEncoder()
+        manifestEncoder.outputFormatting = [.sortedKeys, .withoutEscapingSlashes]
+        manifestEncoder.dateEncodingStrategy = .iso8601
+        try manifestEncoder.encode(signed.manifest).write(to: bootstrapManifestURL)
+        try archiveData.write(to: bootstrapArchiveURL)
+        try Data("undeclared bytecode".utf8).write(
+            to: versionedRoot.appendingPathComponent("da3_mps/python/runtime.pyc")
+        )
+        MockURLProtocol.register(token: token) { request in
+            (
+                HTTPURLResponse(url: request.url!, statusCode: 404, httpVersion: nil, headerFields: nil)!,
+                Data()
+            )
+        }
+        defer { MockURLProtocol.unregister(token: token) }
+
+        let inspectionScripts = bootstrapArchiveInspectionScripts(contents: Self.coreFixtureContents)
+        let manager = ToolchainManager(
+            runner: MockSubprocessRunner(scripts: inspectionScripts),
+            urlSession: makeSession(),
+            appVersion: "0.2.0-beta.1",
+            localToolchainRoot: nil,
+            installationRoot: installationRoot,
+            bundledBootstrap: .init(
+                manifestURL: bootstrapManifestURL,
+                coreArchiveURL: bootstrapArchiveURL
+            )
+        )
+
+        await XCTAssertThrowsErrorAsync({
+            _ = try await manager.ensureToolchain(
+                manifestURL: remoteManifestURL,
+                publicKeyBase64: signed.publicKey,
+                request: .init(capabilities: [.da3Base, .da3Small]),
+                onProgress: { _, _ in }
+            )
+        }, errorHandler: { error in
+            guard case ToolchainManager.ToolchainError.invalidToolchain(let message) = error else {
+                return XCTFail("Expected cached invalidToolchain, got \(error)")
+            }
+            XCTAssertTrue(message.contains("cached tools could not be verified"))
+            XCTAssertTrue(message.contains("undeclared file"))
+            XCTAssertTrue(message.contains("da3_mps/python/runtime.pyc"))
+        })
+    }
+
+    func testCacheFloorUsesSignedReceiptVersionInsteadOfDirectoryNameAndSkipsOlderReceipt() throws {
+        let installationRoot = try TestFileBuilder.makeTempDir()
+        defer { try? FileManager.default.removeItem(at: installationRoot) }
+        let misleadingRoot = installationRoot.appendingPathComponent("99.0.0", isDirectory: true)
+        let manager = ToolchainManager(
+            runner: MockSubprocessRunner(scripts: []),
+            urlSession: makeSession(),
+            appVersion: "0.2.0-beta.1",
+            localToolchainRoot: nil,
+            installationRoot: installationRoot
+        )
+        let signed = try makeSignedCachedFixture(at: misleadingRoot, manager: manager)
+
+        let result = try manager.loadBestCachedToolchain(
+            publicKeyBase64: signed.publicKey,
+            request: .init(capabilities: [.da3Base, .da3Small]),
+            minimumVersion: "2.0.1"
+        )
+
+        XCTAssertNil(result)
+    }
+
+    func testCacheFloorAllowsEqualAndNewerSignedReceiptVersions() throws {
+        for floor in ["2.0.0", "1.9.9"] {
+            let temporaryRoot = try TestFileBuilder.makeTempDir()
+            let installationRoot = temporaryRoot.path.hasPrefix("/var/")
+                ? URL(fileURLWithPath: "/private\(temporaryRoot.path)", isDirectory: true)
+                : temporaryRoot
+            defer { try? FileManager.default.removeItem(at: installationRoot) }
+            let misleadingRoot = installationRoot.appendingPathComponent("0.0.1", isDirectory: true)
+            let bootstrapManager = ToolchainManager(
+                runner: MockSubprocessRunner(scripts: []),
+                urlSession: makeSession(),
+                appVersion: "0.2.0-beta.1",
+                localToolchainRoot: nil,
+                installationRoot: installationRoot
+            )
+            let signed = try makeSignedCachedFixture(at: misleadingRoot, manager: bootstrapManager)
+            let manager = ToolchainManager(
+                runner: MockSubprocessRunner(scripts: validationScripts(for: signed.fixture)),
+                urlSession: makeSession(),
+                appVersion: "0.2.0-beta.1",
+                localToolchainRoot: nil,
+                installationRoot: installationRoot
+            )
+
+            let result = try manager.loadBestCachedToolchain(
+                publicKeyBase64: signed.publicKey,
+                request: .init(capabilities: [.da3Base, .da3Small]),
+                minimumVersion: floor
+            )
+
+            XCTAssertEqual(result?.root.standardizedFileURL, misleadingRoot.standardizedFileURL)
+        }
+    }
+
     func testDownloadManifestInvalidJSON() async {
         await withEnvironmentAsync(["EASYSPLAT_LOCAL_TOOLCHAIN_ROOT": nil]) {
             let token = UUID().uuidString
@@ -1724,6 +1847,55 @@ final class ToolchainManagerDownloadTests: XCTestCase {
         )
     }
 
+    func testBundledDiskRequirementExcludesLocalArchiveBytesAndAllowsExactBoundary() throws {
+        let manager = ToolchainManager(runner: MockSubprocessRunner(scripts: []), urlSession: makeSession())
+        let component = ToolchainManifest.Component(
+            name: "macos-arm64-core",
+            capabilities: Array(ToolchainManager.coreCapabilities),
+            url: "https://example.com/core.zip",
+            sha256: String(repeating: "a", count: 64),
+            sizeBytes: 900_000_000,
+            expandedSizeBytes: 1_200_000_000,
+            contents: ["bin/colmap"],
+            criticalFileHashes: ["bin/colmap": String(repeating: "b", count: 64)],
+            dependencies: [],
+            requirement: .required
+        )
+        let headroom: UInt64 = 64 * 1_024 * 1_024
+
+        let required = try manager.requiredBundledDiskBytes(for: component)
+
+        XCTAssertEqual(required, headroom + component.expandedSizeBytes)
+        XCTAssertNoThrow(try manager.validateAvailableDiskSpace(required: required, available: required))
+        XCTAssertThrowsError(try manager.validateAvailableDiskSpace(required: required, available: required - 1))
+    }
+
+    func testBundledReplacementDoesNotChargeExistingCanonicalTreeAsBackup() throws {
+        let root = try TestFileBuilder.makeTempDir()
+        defer { try? FileManager.default.removeItem(at: root) }
+        try Data(repeating: 0x01, count: 4_096).write(to: root.appendingPathComponent("existing.bin"))
+        let component = testComponent(
+            name: "macos-arm64-core",
+            url: "https://example.com/core.zip",
+            sha256: String(repeating: "a", count: 64),
+            sizeBytes: 8_192,
+            contents: ["bin/colmap"]
+        )
+        var expanded = component
+        expanded.expandedSizeBytes = 16_384
+        let manager = ToolchainManager(runner: MockSubprocessRunner(scripts: []), urlSession: makeSession())
+        let headroom: UInt64 = 64 * 1_024 * 1_024
+
+        XCTAssertEqual(
+            try manager.requiredBundledDiskBytes(for: expanded),
+            headroom + expanded.expandedSizeBytes
+        )
+        XCTAssertEqual(
+            try manager.requiredBundledDiskBytes(for: expanded, seedFromExistingRoot: root),
+            headroom + expanded.expandedSizeBytes + 4_096
+        )
+    }
+
     func testPreflightAndStagingShareAParentDownloadCache() throws {
         let parent = try TestFileBuilder.makeTempDir()
         defer { try? FileManager.default.removeItem(at: parent) }
@@ -2057,8 +2229,9 @@ final class ToolchainManagerDownloadTests: XCTestCase {
     private func makeSignedCachedFixture(
         at root: URL,
         manager: ToolchainManager,
-        additionalCoreFiles: [String: Data] = [:]
-    ) throws -> (fixture: ToolchainFixture, publicKey: String) {
+        additionalCoreFiles: [String: Data] = [:],
+        coreArchiveData: Data? = nil
+    ) throws -> (fixture: ToolchainFixture, publicKey: String, manifest: ToolchainManifest) {
         let fixture = try ToolchainFixtureBuilder.createToolchain(at: root)
         for (relativePath, data) in additionalCoreFiles {
             let url = root.appendingPathComponent(relativePath)
@@ -2079,6 +2252,10 @@ final class ToolchainManagerDownloadTests: XCTestCase {
         }
 
         let coreCritical = ToolchainManager.criticalCoreFiles(in: coreContents).sorted()
+        let coreArchiveSHA = coreArchiveData.map {
+            SHA256.hash(data: $0).map { String(format: "%02x", $0) }.joined()
+        } ?? String(repeating: "a", count: 64)
+        let coreArchiveSize = coreArchiveData.map { UInt64($0.count) } ?? 1
         let unsigned = ToolchainManifest(
             schemaVersion: 2,
             toolchainAPI: 2,
@@ -2087,7 +2264,7 @@ final class ToolchainManagerDownloadTests: XCTestCase {
             publishedAt: Date(timeIntervalSince1970: 0),
             appVersionRange: .init(minimum: "0.2.0-beta.1", maximumExclusive: "0.3.0"),
             components: [
-                .init(name: "macos-arm64-core", capabilities: Array(ToolchainManager.coreCapabilities), url: "https://example.com/core.zip", sha256: String(repeating: "a", count: 64), sizeBytes: 1, contents: coreContents, criticalFileHashes: try hashes(for: coreCritical), dependencies: [], requirement: .required),
+                .init(name: "macos-arm64-core", capabilities: Array(ToolchainManager.coreCapabilities), url: "https://example.com/core.zip", sha256: coreArchiveSHA, sizeBytes: coreArchiveSize, contents: coreContents, criticalFileHashes: try hashes(for: coreCritical), dependencies: [], requirement: .required),
                 .init(name: "geometry-da3-base", capabilities: [ToolchainCapability.da3Runtime.rawValue, ToolchainCapability.da3Base.rawValue], url: "https://example.com/base.zip", sha256: String(repeating: "b", count: 64), sizeBytes: 1, contents: baseContents, criticalFileHashes: try hashes(for: baseContents), dependencies: ["macos-arm64-core"], requirement: .optional),
                 .init(name: "geometry-da3-small", capabilities: [ToolchainCapability.da3Small.rawValue], url: "https://example.com/small.zip", sha256: String(repeating: "c", count: 64), sizeBytes: 1, contents: smallContents, criticalFileHashes: try hashes(for: smallContents), dependencies: ["geometry-da3-base"], requirement: .optional),
             ],
@@ -2105,7 +2282,29 @@ final class ToolchainManagerDownloadTests: XCTestCase {
             ),
             root: root
         )
-        return (fixture, signed.publicKey)
+        return (fixture, signed.publicKey, signed.manifest)
+    }
+
+    private func bootstrapArchiveInspectionScripts(
+        contents: [String]
+    ) -> [MockSubprocessRunner.Script] {
+        let success = SubprocessResult(exitCode: 0, terminationReason: .exit, stdout: "", stderr: "")
+        return [
+            .init(
+                path: "/usr/bin/zipinfo",
+                argsPrefix: ["-l"],
+                result: success,
+                stdoutLines: contents.map {
+                    "-rw-r--r--  3.0 unx 1 bx 1 stor 01-Jan-26 00:00 \($0)"
+                }
+            ),
+            .init(
+                path: "/usr/bin/unzip",
+                argsPrefix: ["-Z1"],
+                result: success,
+                stdoutLines: contents
+            ),
+        ]
     }
 
     private func validationScripts(for fixture: ToolchainFixture) -> [MockSubprocessRunner.Script] {

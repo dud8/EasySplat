@@ -326,6 +326,9 @@ public enum ManifestBuilder {
               Set(componentArchives.keys) == expectedNames else {
             try fail("Release manifest component set does not match the expected closure.")
         }
+        if expectedNames == Set(productionComponentNames) {
+            try validateProductionReleasePolicy(manifest)
+        }
         try validateContentOwnership(manifest.components)
 
         for name in expectedNames.sorted() {
@@ -353,6 +356,44 @@ public enum ManifestBuilder {
                 try fail("Release component critical-file hashes do not match: \(name)")
             }
         }
+    }
+
+    public static func verifyBootstrap(
+        manifest: ManifestDocument,
+        publicKeyBase64: String,
+        expectedAppVersion: String,
+        coreArchive: URL
+    ) throws {
+        func fail(_ message: String) throws -> Never {
+            throw NSError(
+                domain: "ManifestTool",
+                code: 11,
+                userInfo: [NSLocalizedDescriptionKey: message]
+            )
+        }
+
+        guard manifest.schemaVersion == 2, manifest.toolchainAPI == 2 else {
+            try fail("Bootstrap manifest must use schema 2 and toolchain API 2.")
+        }
+        guard semanticVersion(from: manifest.version) != nil,
+              appVersion(expectedAppVersion, isWithin: manifest.appVersionRange) else {
+            try fail("Bootstrap manifest app compatibility range does not match the build.")
+        }
+        guard let publicKeyData = Data(base64Encoded: publicKeyBase64),
+              publicKeyData.count == 32,
+              publicKeyData.base64EncodedString() == publicKeyBase64 else {
+            try fail("Bootstrap public key is not valid canonical base64.")
+        }
+        guard manifest.keyID == sha256Hex(data: publicKeyData),
+              verifySignature(for: manifest, publicKeyBase64: publicKeyBase64) else {
+            try fail("Bootstrap manifest signature or key identifier is invalid.")
+        }
+
+        try validateProductionReleasePolicy(manifest, requireCanonicalReleaseURLs: true)
+        guard let core = manifest.components.first(where: { $0.name == "macos-arm64-core" }) else {
+            try fail("Bootstrap manifest does not contain the required core component.")
+        }
+        try verifyArchive(coreArchive, matches: core, purpose: "Bootstrap")
     }
 
     public static func writeManifest(_ manifest: ManifestDocument, to url: URL) throws {
@@ -489,13 +530,38 @@ public enum ManifestBuilder {
             try releaseFailure("Release signing request key identifier is invalid.")
         }
 
-        let names = ["macos-arm64-core", "geometry-da3-base", "geometry-da3-small"]
-        guard manifest.components.map(\.name) == names else {
+        guard manifest.components.map(\.name) == productionComponentNames else {
             try releaseFailure("Release signing request component set or order is invalid.")
         }
         let urls = releaseComponentURLs(repository: expectedRepository, version: expectedVersion)
         for component in manifest.components {
-            guard component.url == urls[component.name],
+            guard component.url == urls[component.name] else {
+                try releaseFailure("Release signing request component URL is invalid: \(component.name)")
+            }
+        }
+        try validateProductionReleasePolicy(manifest)
+    }
+
+    private static let productionComponentNames = [
+        "macos-arm64-core",
+        "geometry-da3-base",
+        "geometry-da3-small",
+    ]
+
+    private static func validateProductionReleasePolicy(
+        _ manifest: ManifestDocument,
+        requireCanonicalReleaseURLs: Bool = false
+    ) throws {
+        guard manifest.components.map(\.name) == productionComponentNames else {
+            try releaseFailure("Release component set or order is invalid.")
+        }
+        for component in manifest.components {
+            guard let url = URL(string: component.url),
+                  url.scheme?.lowercased() == "https",
+                  url.host?.isEmpty == false,
+                  url.user == nil,
+                  url.password == nil,
+                  url.fragment == nil,
                   component.sha256.count == 64,
                   component.sha256.allSatisfy(isLowercaseHex),
                   component.sizeBytes > 0,
@@ -510,12 +576,16 @@ public enum ManifestBuilder {
                   component.criticalFileHashes.values.allSatisfy({
                       $0.count == 64 && $0.allSatisfy(isLowercaseHex)
                   }) else {
-                try releaseFailure("Release signing request component metadata is invalid: \(component.name)")
+                try releaseFailure("Release component metadata is invalid: \(component.name)")
             }
         }
+
         let core = manifest.components[0]
         let base = manifest.components[1]
         let small = manifest.components[2]
+        if requireCanonicalReleaseURLs {
+            try validateCanonicalReleaseURLs(manifest)
+        }
         guard core.capabilities == ManifestToolDefaults.coreCapabilities,
               core.dependencies.isEmpty,
               core.requirement == .required,
@@ -535,20 +605,67 @@ public enum ManifestBuilder {
               small.requirement == .optional,
               Set(small.contents) == Set(ManifestToolDefaults.da3SmallContents),
               Set(small.criticalFileHashes.keys) == Set(small.contents) else {
-            try releaseFailure("Release signing request component policy is invalid.")
+            try releaseFailure("Release component policy is invalid.")
         }
+
         var totalDownloadBytes: UInt64 = 0
         for component in manifest.components {
             let sum = totalDownloadBytes.addingReportingOverflow(component.sizeBytes)
             guard !sum.overflow else {
-                try releaseFailure("Release signing request component size total overflowed.")
+                try releaseFailure("Release component size total overflowed.")
             }
             totalDownloadBytes = sum.partialValue
         }
         guard totalDownloadBytes <= maximumFullToolchainDownloadBytes else {
-            try releaseFailure("Release signing request exceeds the 6 GB full toolchain budget.")
+            try releaseFailure("Release exceeds the 6 GB full toolchain budget.")
         }
         try validateContentOwnership(manifest.components)
+    }
+
+    private static func validateCanonicalReleaseURLs(_ manifest: ManifestDocument) throws {
+        guard let coreURL = URLComponents(string: manifest.components[0].url),
+              coreURL.scheme?.lowercased() == "https",
+              coreURL.host?.lowercased() == "github.com",
+              coreURL.port == nil,
+              coreURL.query == nil,
+              coreURL.fragment == nil else {
+            try releaseFailure("Release component URLs are not canonical GitHub release assets.")
+        }
+        let path = coreURL.path.split(separator: "/", omittingEmptySubsequences: true).map(String.init)
+        guard path.count == 6,
+              path[2] == "releases",
+              path[3] == "download",
+              path[4] == "toolchain-v\(manifest.version)" else {
+            try releaseFailure("Release component URLs are not canonical GitHub release assets.")
+        }
+        let repository = "\(path[0])/\(path[1])"
+        let expected = releaseComponentURLs(repository: repository, version: manifest.version)
+        guard manifest.components.allSatisfy({ $0.url == expected[$0.name] }) else {
+            try releaseFailure("Release component URLs are not canonical GitHub release assets.")
+        }
+    }
+
+    private static func verifyArchive(
+        _ archiveURL: URL,
+        matches component: ManifestDocument.Component,
+        purpose: String
+    ) throws {
+        let size = try FileManager.default.attributesOfItem(atPath: archiveURL.path)[.size] as? UInt64 ?? 0
+        guard size == component.sizeBytes,
+              try archiveExpandedSize(at: archiveURL) == component.expandedSizeBytes,
+              try sha256Hex(url: archiveURL) == component.sha256 else {
+            try releaseFailure("\(purpose) core archive size or SHA-256 does not match the signed manifest.")
+        }
+        guard try archiveContents(at: archiveURL) == component.contents else {
+            try releaseFailure("\(purpose) core archive contents do not match the signed manifest.")
+        }
+        let hashes = try archiveCriticalFileHashes(
+            zipURL: archiveURL,
+            paths: component.criticalFileHashes.keys.sorted()
+        )
+        guard hashes == component.criticalFileHashes else {
+            try releaseFailure("\(purpose) core archive critical-file hashes do not match the signed manifest.")
+        }
     }
 
     private static func validatedPublicKeyData(_ publicKeyBase64: String) throws -> Data {
@@ -750,7 +867,7 @@ public enum ManifestBuilder {
     }
 
     private static func archiveContents(at zipURL: URL) throws -> [String] {
-        try rejectArchiveLinks(at: zipURL)
+        try rejectArchiveLinksAndSpecialFiles(at: zipURL)
         let output = try runUnzip(arguments: ["-Z1", zipURL.path])
         let entries = String(decoding: output, as: UTF8.self)
             .split(whereSeparator: \.isNewline)
@@ -763,7 +880,7 @@ public enum ManifestBuilder {
         return entries.sorted()
     }
 
-    private static func rejectArchiveLinks(at zipURL: URL) throws {
+    private static func rejectArchiveLinksAndSpecialFiles(at zipURL: URL) throws {
         let process = Process()
         let stdout = Pipe()
         process.executableURL = URL(fileURLWithPath: "/usr/bin/zipinfo")
@@ -776,14 +893,18 @@ public enum ManifestBuilder {
         guard process.terminationReason == .exit, process.terminationStatus == 0 else {
             throw NSError(domain: "ManifestTool", code: 8, userInfo: [NSLocalizedDescriptionKey: "Unable to inspect component archive metadata"])
         }
-        let text = String(decoding: output, as: UTF8.self)
-        if text.split(whereSeparator: \.isNewline).contains(where: { $0.first == "l" }) {
-            throw NSError(domain: "ManifestTool", code: 8, userInfo: [NSLocalizedDescriptionKey: "Component archive contains a symbolic link"])
+        for line in String(decoding: output, as: UTF8.self).split(whereSeparator: \.isNewline) {
+            if line.first == "l" {
+                throw NSError(domain: "ManifestTool", code: 8, userInfo: [NSLocalizedDescriptionKey: "Component archive contains a symbolic link"])
+            }
+            if let type = line.first, ["b", "c", "p", "s"].contains(type) {
+                throw NSError(domain: "ManifestTool", code: 8, userInfo: [NSLocalizedDescriptionKey: "Component archive contains a special file"])
+            }
         }
     }
 
     private static func archiveExpandedSize(at zipURL: URL) throws -> UInt64 {
-        try rejectArchiveLinks(at: zipURL)
+        try rejectArchiveLinksAndSpecialFiles(at: zipURL)
         let process = Process()
         let stdout = Pipe()
         process.executableURL = URL(fileURLWithPath: "/usr/bin/zipinfo")

@@ -1,6 +1,7 @@
 import Foundation
 
 extension ToolchainManager {
+    static let toolchainDiskHeadroomBytes: UInt64 = 64 * 1_024 * 1_024
     static let maximumReleaseComponentDownloadBytes: UInt64 = 2_147_483_648
     static let maximumNormalPhotoToolchainDownloadBytes: UInt64 = 2_500_000_000
     static let maximumFullToolchainDownloadBytes: UInt64 = 6_000_000_000
@@ -432,8 +433,7 @@ extension ToolchainManager {
         at root: URL,
         seedFromExistingRoot: URL? = nil
     ) throws -> UInt64 {
-        let headroom: UInt64 = 64 * 1_024 * 1_024
-        var required = headroom
+        var required = Self.toolchainDiskHeadroomBytes
         if let seedFromExistingRoot {
             let seedBytes = try installTreeSize(at: seedFromExistingRoot)
             let sum = required.addingReportingOverflow(seedBytes)
@@ -477,6 +477,43 @@ extension ToolchainManager {
             seedFromExistingRoot: seedFromExistingRoot
         )
 
+        guard let available = availableDiskSpace(at: root) else { return }
+        try validateAvailableDiskSpace(required: required, available: available)
+    }
+
+    func requiredBundledDiskBytes(
+        for component: ToolchainManifest.Component,
+        seedFromExistingRoot: URL? = nil
+    ) throws -> UInt64 {
+        var required = Self.toolchainDiskHeadroomBytes
+        if let seedFromExistingRoot {
+            let addition = required.addingReportingOverflow(try installTreeSize(at: seedFromExistingRoot))
+            required = addition.overflow ? UInt64.max : addition.partialValue
+        }
+        let expanded = required.addingReportingOverflow(component.expandedSizeBytes)
+        return expanded.overflow ? UInt64.max : expanded.partialValue
+    }
+
+    func preflightBundledDiskSpace(
+        for component: ToolchainManifest.Component,
+        at root: URL,
+        seedFromExistingRoot: URL? = nil
+    ) throws {
+        let required = try requiredBundledDiskBytes(
+            for: component,
+            seedFromExistingRoot: seedFromExistingRoot
+        )
+        guard let available = availableDiskSpace(at: root) else { return }
+        try validateAvailableDiskSpace(required: required, available: available)
+    }
+
+    func validateAvailableDiskSpace(required: UInt64, available: UInt64) throws {
+        guard available >= required else {
+            throw ToolchainError.insufficientDiskSpace(required: required, available: available)
+        }
+    }
+
+    private func availableDiskSpace(at root: URL) -> UInt64? {
         var probe = root.deletingLastPathComponent()
         while !fileManager.fileExists(atPath: probe.path), probe.path != "/" {
             probe.deleteLastPathComponent()
@@ -491,11 +528,8 @@ extension ToolchainManager {
         let availableSigned = values?.volumeAvailableCapacityForImportantUsage
             ?? regularCapacity
             ?? fallback
-        guard availableSigned > 0 else { return }
-        let available = UInt64(availableSigned)
-        guard available >= required else {
-            throw ToolchainError.insufficientDiskSpace(required: required, available: available)
-        }
+        guard availableSigned > 0 else { return nil }
+        return UInt64(availableSigned)
     }
 
     func installTreeSize(at root: URL) throws -> UInt64 {

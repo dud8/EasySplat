@@ -1,4 +1,5 @@
 import CryptoKit
+import Darwin
 import Foundation
 
 extension ToolchainManager {
@@ -6,7 +7,7 @@ extension ToolchainManager {
 
     // The signed manifest carries the exact Python runtime closure. Keep the
     // unauthenticated response and cached receipt bounded above that real size.
-    private static let maximumManifestDownloadBytes = 16 * 1_024 * 1_024
+    static let maximumManifestDownloadBytes = 16 * 1_024 * 1_024
     private static let maximumInstallStateBytes = 16 * 1_024 * 1_024
 
     final class RedirectValidationDelegate: NSObject, URLSessionTaskDelegate, @unchecked Sendable {
@@ -919,9 +920,10 @@ extension ToolchainManager {
     func unzip(
         zipURL: URL,
         to destination: URL,
-        exactComponent: ToolchainManifest.Component? = nil
+        exactComponent: ToolchainManifest.Component? = nil,
+        forceInspection: Bool = false
     ) throws {
-        let archiveEntries = try inspectArchiveEntries(zipURL: zipURL)
+        let archiveEntries = try inspectArchiveEntries(zipURL: zipURL, forceInspection: forceInspection)
         try validateArchiveEntries(archiveEntries)
         if let exactComponent {
             try validateExactArchiveContents(archiveEntries, component: exactComponent)
@@ -1012,26 +1014,40 @@ extension ToolchainManager {
             onProgress: onProgress
         )
 
-        let attributes = try fileManager.attributesOfItem(atPath: zipURL.path)
-        let downloadedSize = (attributes[.size] as? NSNumber)?.uint64Value
-        guard downloadedSize == artifact.sizeBytes else {
-            throw ToolchainError.hashMismatch
-        }
-        let computedHash = try sha256Hex(url: zipURL)
-        guard computedHash.lowercased() == expectedSha else {
-            throw ToolchainError.hashMismatch
-        }
-        onProgress(-1.0, "Verified download integrity (\(artifactLabel(for: name)))")
-
-        let unpackMessage = unpackingMessage(for: name)
-        onProgress(-1.0, unpackMessage)
-
-        try unzip(
-            zipURL: zipURL,
-            to: root,
-            exactComponent: artifact.capabilities.isEmpty ? nil : artifact
+        try installVerifiedArchive(
+            artifact,
+            archiveURL: zipURL,
+            root: root,
+            forceArchiveInspection: false,
+            onProgress: onProgress
         )
         try? fileManager.removeItem(at: zipURL)
+
+        state.installedArtifacts[name] = artifact.sha256
+        try? saveInstallState(state, root: root)
+    }
+
+    func installVerifiedArchive(
+        _ artifact: ToolchainManifest.Component,
+        archiveURL: URL,
+        root: URL,
+        forceArchiveInspection: Bool,
+        onProgress: @escaping @Sendable (Double, String) -> Void
+    ) throws {
+        guard try isRegularSingleLinkFile(archiveURL, exactSize: artifact.sizeBytes),
+              try sha256Hex(url: archiveURL).lowercased() == artifact.sha256.lowercased() else {
+            throw ToolchainError.hashMismatch
+        }
+        onProgress(-1.0, "Verified download integrity (\(artifactLabel(for: artifact.name)))")
+
+        let unpackMessage = unpackingMessage(for: artifact.name)
+        onProgress(-1.0, unpackMessage)
+        try unzip(
+            zipURL: archiveURL,
+            to: root,
+            exactComponent: artifact.capabilities.isEmpty ? nil : artifact,
+            forceInspection: forceArchiveInspection
+        )
         try enforceExpectedContents(
             artifact: artifact,
             root: root,
@@ -1039,9 +1055,15 @@ extension ToolchainManager {
             onProgress: onProgress
         )
         try validateCriticalFileHashes(artifact.criticalFileHashes, root: root)
+    }
 
-        state.installedArtifacts[name] = artifact.sha256
-        try? saveInstallState(state, root: root)
+    func isRegularSingleLinkFile(_ url: URL, exactSize: UInt64) throws -> Bool {
+        var metadata = stat()
+        guard lstat(url.path, &metadata) == 0 else { return false }
+        return (metadata.st_mode & S_IFMT) == S_IFREG
+            && metadata.st_nlink == 1
+            && metadata.st_size >= 0
+            && UInt64(metadata.st_size) == exactSize
     }
 
     func inspectArchiveEntries(zipURL: URL, forceInspection: Bool = false) throws -> [String] {

@@ -1,4 +1,5 @@
 import AppKit
+import Darwin
 import EasySplatCore
 import SwiftUI
 
@@ -25,7 +26,25 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         DispatchQueue.main.async { [weak self] in
-            self?.showMainWindow()
+            guard let self else { return }
+            if let configuration = AppConfig.releaseVerificationConfiguration {
+                Task { @MainActor in
+                    do {
+                        try await model.prepareBundledToolchainForReleaseVerification(
+                            photoFolder: configuration.photoFolderURL,
+                            successMarkerURL: configuration.successMarkerURL
+                        )
+                    } catch {
+                        FileHandle.standardError.write(
+                            Data("Release verification failed: \(error.localizedDescription)\n".utf8)
+                        )
+                        Darwin.exit(EXIT_FAILURE)
+                    }
+                    NSApp.terminate(nil)
+                }
+                return
+            }
+            showMainWindow()
         }
     }
 
