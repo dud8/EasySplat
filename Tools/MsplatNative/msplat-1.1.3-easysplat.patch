@@ -194,3 +194,13 @@ index 1111349..1ab144d 100644
 @@ -53,0 +56,2 @@ void saveGaussianPly(const std::string &path, GaussianParams &p, int step) {
 +    o.flush();
 +    o.close();
+diff --git a/core/src/loaders/image_io.cpp b/core/src/loaders/image_io.cpp
+index f916922..56d9b37 100644
+--- a/core/src/loaders/image_io.cpp
++++ b/core/src/loaders/image_io.cpp
+@@ -34 +34 @@ Image imreadRGB(const std::string &path) {
+-    CGColorSpaceRef colorSpace = CGColorSpaceCreateDeviceRGB();
++    CGColorSpaceRef colorSpace = CGColorSpaceCreateWithName(kCGColorSpaceSRGB);
+@@ -69 +69 @@ void imwriteRGB(const std::string &path, const Image &img) {
+-    CGColorSpaceRef colorSpace = CGColorSpaceCreateDeviceRGB();
++    CGColorSpaceRef colorSpace = CGColorSpaceCreateWithName(kCGColorSpaceSRGB);

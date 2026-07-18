@@ -13,11 +13,12 @@ STAGE_DIR="$INSTALL_PARENT/msplat.stage.$$"
 BACKUP_DIR="$INSTALL_PARENT/msplat.previous.$$"
 
 OVERLAY="$ROOT/Tools/MsplatNative/msplat.cpp"
-OVERLAY_SHA256="e295e396e3ff7e4f2be252a720314322237dc015d4960bcfc02383d6df861184"
+OVERLAY_SHA256="0bb2bfb121d6c3bd7c6ac801f43baf2dfa0b9db6c2499bce95f10cc39ef927c6"
 RASTER_TEST_SOURCE="$ROOT/Tools/MsplatNative/msplat_raster_tests.cpp"
 RASTER_TEST_SHA256="7f339369c399fb77b832fb6ad4db65e1d63d26ad0f7b46c2177b8be6ec2ce5a7"
 FIXTURE_GENERATOR="$ROOT/scripts/ci/generate_msplat_sparse_fixtures.py"
 UPSTREAM_PATCH="$ROOT/Tools/MsplatNative/msplat-1.1.3-easysplat.patch"
+UPSTREAM_PATCH_SHA256="047ef2547d4478bc77a7a1537284e58fdb20de4c52c5c37982674fa2af70927e"
 CHECKPOINT_PATCH="$ROOT/Tools/MsplatNative/msplat-1.1.3-checkpoint.patch"
 NUMERIC_STABILITY_PATCH="$ROOT/Tools/MsplatNative/msplat-1.1.3-numeric-stability.patch"
 NUMERIC_STABILITY_PATCH_SHA256="231586b17e4f47c8c55432a631e08bf293b31a92f8d6ec49b367d11632350ec3"
@@ -124,6 +125,8 @@ preflight() {
   [ -f "$RASTER_TEST_SOURCE" ] || die "missing raster parity test: $RASTER_TEST_SOURCE"
   [ -f "$FIXTURE_GENERATOR" ] || die "missing sparse fixture generator: $FIXTURE_GENERATOR"
   [ -f "$UPSTREAM_PATCH" ] || die "missing upstream patch: $UPSTREAM_PATCH"
+  [ "$(sha256 "$UPSTREAM_PATCH")" = "$UPSTREAM_PATCH_SHA256" ] \
+    || die "upstream patch SHA-256 mismatch"
   [ "$(sha256 "$RASTER_TEST_SOURCE")" = "$RASTER_TEST_SHA256" ] \
     || die "raster parity test SHA-256 mismatch"
   [ -f "$CHECKPOINT_PATCH" ] || die "missing checkpoint patch: $CHECKPOINT_PATCH"

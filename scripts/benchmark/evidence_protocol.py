@@ -4763,8 +4763,8 @@ def _validate_ground_truth_preparation(
         "ground-truth preparation.native_decoder",
     )
     if (
-        native_decoder["contract"] != "native_coregraphics_imageio_rgb8_v1"
-        or native_decoder["mode_version"] != 1
+        native_decoder["contract"] != "native_coregraphics_imageio_srgb8_v2"
+        or native_decoder["mode_version"] != 2
         or native_decoder["msplat_source_commit"]
         != "106499b0a53f82b0c92d013b0861fbebd341b17e"
     ):

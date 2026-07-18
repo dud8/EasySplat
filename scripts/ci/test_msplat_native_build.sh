@@ -80,9 +80,12 @@ require_file "$SWIFT_FIXTURE"
 require_contains 'MSPLAT_REPO="https://github.com/rayanht/msplat.git"' "$BUILD_SCRIPT"
 require_contains 'MSPLAT_COMMIT="106499b0a53f82b0c92d013b0861fbebd341b17e"' "$BUILD_SCRIPT"
 require_contains 'MSPLAT_VERSION="1.1.3"' "$BUILD_SCRIPT"
-require_contains 'OVERLAY_SHA256="e295e396e3ff7e4f2be252a720314322237dc015d4960bcfc02383d6df861184"' "$BUILD_SCRIPT"
+require_contains 'UPSTREAM_PATCH_SHA256="047ef2547d4478bc77a7a1537284e58fdb20de4c52c5c37982674fa2af70927e"' "$BUILD_SCRIPT"
+require_contains '[ "$(sha256 "$UPSTREAM_PATCH")" = "$UPSTREAM_PATCH_SHA256" ]' "$BUILD_SCRIPT"
+require_contains 'OVERLAY_SHA256="0bb2bfb121d6c3bd7c6ac801f43baf2dfa0b9db6c2499bce95f10cc39ef927c6"' "$BUILD_SCRIPT"
 require_contains '[ "$(sha256 "$OVERLAY")" = "$OVERLAY_SHA256" ]' "$BUILD_SCRIPT"
-require_contains '"overlay_sha256": "e295e396e3ff7e4f2be252a720314322237dc015d4960bcfc02383d6df861184"' "$VALIDATOR"
+require_contains '"overlay_sha256": "0bb2bfb121d6c3bd7c6ac801f43baf2dfa0b9db6c2499bce95f10cc39ef927c6"' "$VALIDATOR"
+require_contains '"patch_sha256": "047ef2547d4478bc77a7a1537284e58fdb20de4c52c5c37982674fa2af70927e"' "$VALIDATOR"
 require_contains 'RASTER_TEST_SHA256="7f339369c399fb77b832fb6ad4db65e1d63d26ad0f7b46c2177b8be6ec2ce5a7"' "$BUILD_SCRIPT"
 require_contains '[ "$(sha256 "$RASTER_TEST_SOURCE")" = "$RASTER_TEST_SHA256" ]' "$BUILD_SCRIPT"
 require_contains 'NLOHMANN_JSON_SHA256="04022b05d806eb5ff73023c280b68697d12b93e1b7267a0b22a1a39ec7578069"' "$BUILD_SCRIPT"
@@ -256,7 +259,7 @@ for contract_file in "$SWIFT_VALIDATOR" "$SWIFT_FIXTURE"; do
   require_contains 'parallel_radix_scan_patch_sha256' "$contract_file"
   require_contains 'raster_test_sha256' "$contract_file"
   require_contains 'MSPLAT_BUILD_RASTER_TESTS=ON' "$contract_file"
-  require_contains '"overlay_sha256": "e295e396e3ff7e4f2be252a720314322237dc015d4960bcfc02383d6df861184"' "$contract_file"
+  require_contains '"overlay_sha256": "0bb2bfb121d6c3bd7c6ac801f43baf2dfa0b9db6c2499bce95f10cc39ef927c6"' "$contract_file"
   require_contains '"raster_test_sha256": "7f339369c399fb77b832fb6ad4db65e1d63d26ad0f7b46c2177b8be6ec2ce5a7"' "$contract_file"
   require_contains '"parallel_radix_scan_patch_sha256": "1caedde675063dd0b119e91ec39a6945328ecf37134a83b079dce964a7a816c4"' "$contract_file"
 done
@@ -329,6 +332,12 @@ require_contains 'pipelineLoadFailed' "$UPSTREAM_PATCH"
 require_contains 'std::ios::failbit' "$UPSTREAM_PATCH"
 require_contains 'float3 b_conic = float3(0.0f)' "$UPSTREAM_PATCH"
 require_contains 'int32_t b_id = 0' "$UPSTREAM_PATCH"
+if [ "$(grep -Fc 'CGColorSpaceCreateWithName(kCGColorSpaceSRGB)' "$UPSTREAM_PATCH")" -lt 2 ]; then
+  fail "$UPSTREAM_PATCH must make production image reads and writes explicitly sRGB"
+fi
+if grep -Eq '^\+.*CGColorSpaceCreateDeviceRGB' "$UPSTREAM_PATCH"; then
+  fail "$UPSTREAM_PATCH must not add device-dependent RGB color spaces"
+fi
 if [ "$(grep -Fc 'std::array<float, 4>' "$UPSTREAM_PATCH")" -lt 2 ] ||
    [ "$(grep -Fc 'cam_pos[0], cam_pos[1], cam_pos[2], 0.0f' "$UPSTREAM_PATCH")" -lt 2 ]; then
   fail "$UPSTREAM_PATCH must pad every inline Metal float3 argument to sixteen bytes"
@@ -386,6 +395,8 @@ require_contains '{"payload_schema", 2}' "$OVERLAY"
 require_contains 'fields["schema_version"] = 2' "$OVERLAY"
 require_contains 'Descriptor for schema-v2 JSONL events' "$OVERLAY"
 require_contains 'checkpoint manifest keys do not match schema 3' "$OVERLAY"
+require_contains 'native_coregraphics_imageio_srgb8_v2' "$OVERLAY"
+require_absent 'native_coregraphics_imageio_rgb8_v1' "$OVERLAY"
 
 require_contains 'radix_sort_histogram_kernel_cpso' "$EXACT_RASTER_PATCH"
 require_contains 'radix_sort_scan_kernel_cpso' "$EXACT_RASTER_PATCH"
@@ -541,10 +552,15 @@ require_contains '"scene_bounds_status":"ok"' "$self_check_stdout"
 
 decode_dir="$(mktemp -d "${TMPDIR:-/tmp}/easysplat-msplat-decode.XXXXXX")"
 /usr/bin/python3 - "$decode_dir/source.png" <<'PY'
-from PIL import Image
+from PIL import Image, ImageCms
 import sys
 
-Image.new("RGB", (64, 64), (12, 34, 56)).save(sys.argv[1], format="PNG")
+profile = ImageCms.ImageCmsProfile(ImageCms.createProfile("sRGB"))
+Image.new("RGB", (64, 64), (12, 34, 56)).save(
+    sys.argv[1],
+    format="PNG",
+    icc_profile=profile.tobytes(),
+)
 PY
 decode_receipt="$decode_dir/receipt.json"
 "$BIN" \
@@ -581,8 +597,60 @@ if receipt["metallib_sha256"] != sha(metallib_path):
     raise SystemExit("benchmark decode metallib digest mismatch")
 if receipt["width"] != 64 or receipt["height"] != 64 or receipt["output_bytes"] != 12288:
     raise SystemExit("benchmark decode dimensions mismatch")
+if receipt["contract"] != "native_coregraphics_imageio_srgb8_v2":
+    raise SystemExit("benchmark decode color contract mismatch")
+if receipt["mode_version"] != 2:
+    raise SystemExit("benchmark decode mode version mismatch")
+if output_path.read_bytes() != bytes((12, 34, 56)) * (64 * 64):
+    raise SystemExit("production decoder changed tagged sRGB pixel values")
 if receipt["msplat_source_commit"] != "106499b0a53f82b0c92d013b0861fbebd341b17e":
     raise SystemExit("benchmark decode source commit mismatch")
+PY
+
+display_p3_profile="/System/Library/ColorSync/Profiles/Display P3.icc"
+[ -f "$display_p3_profile" ] || fail "macOS Display P3 profile is unavailable"
+/usr/bin/python3 - "$decode_dir/display-p3.png" "$display_p3_profile" <<'PY'
+from pathlib import Path
+from PIL import Image
+import sys
+
+image = Image.new("RGB", (4, 1))
+image.putdata(((180, 60, 80), (60, 180, 80), (80, 60, 180), (140, 120, 40)))
+image.save(sys.argv[1], format="PNG", icc_profile=Path(sys.argv[2]).read_bytes())
+PY
+"$BIN" \
+  --benchmark-decode "$decode_dir/display-p3.png" \
+  --benchmark-decode-output "$decode_dir/display-p3.rgb8" \
+  >"$decode_dir/display-p3.json" \
+  2>"$decode_dir/display-p3.stderr"
+[ ! -s "$decode_dir/display-p3.stderr" ] || fail "Display P3 decode polluted stderr"
+/usr/bin/python3 - \
+  "$decode_dir/display-p3.json" \
+  "$decode_dir/display-p3.rgb8" <<'PY'
+import hashlib
+import json
+from pathlib import Path
+import sys
+
+receipt_path, output_path = map(Path, sys.argv[1:])
+receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+pixels = output_path.read_bytes()
+expected = bytes((196, 47, 78, 0, 183, 64, 84, 59, 187, 144, 119, 11))
+if len(pixels) != len(expected) or max(abs(a - b) for a, b in zip(pixels, expected)) > 1:
+    raise SystemExit("Display P3 source was not converted to the fixed sRGB oracle")
+if pixels == bytes((180, 60, 80, 60, 180, 80, 80, 60, 180, 140, 120, 40)):
+    raise SystemExit("Display P3 source passed through without color conversion")
+digest = "sha256:" + hashlib.sha256(pixels).hexdigest()
+if (
+    receipt["contract"] != "native_coregraphics_imageio_srgb8_v2"
+    or receipt["mode_version"] != 2
+    or receipt["width"] != 4
+    or receipt["height"] != 1
+    or receipt["output_bytes"] != len(expected)
+    or receipt["pixel_sha256"] != digest
+    or receipt["output_sha256"] != digest
+):
+    raise SystemExit("Display P3 decoder receipt does not bind the converted pixels")
 PY
 
 printf 'preserve me\n' >"$decode_dir/collision.rgb8"

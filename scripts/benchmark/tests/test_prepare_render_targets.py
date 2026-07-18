@@ -178,14 +178,14 @@ executable = content(Path(__file__))
 metal = content(root / "default.metallib")
 source_bytes = content(source)
 print(json.dumps({
-    "contract": "native_coregraphics_imageio_rgb8_v1",
+    "contract": "native_coregraphics_imageio_srgb8_v2",
     "executable_bytes": len(executable),
     "executable_sha256": sha(executable),
     "height": height,
     "metallib_bytes": len(metal),
     "metallib_sha256": sha(metal),
     "mode": "benchmark_decode",
-    "mode_version": 1,
+    "mode_version": 2,
     "msplat_source_commit": "106499b0a53f82b0c92d013b0861fbebd341b17e",
     "output_bytes": len(pixels),
     "output_sha256": sha(pixels),
@@ -215,8 +215,8 @@ print(json.dumps({
             digest.update(struct.pack(">Q", len(data)))
             digest.update(data)
         return {
-            "contract": "native_coregraphics_imageio_rgb8_v1",
-            "mode_version": 1,
+            "contract": "native_coregraphics_imageio_srgb8_v2",
+            "mode_version": 2,
             "executable_bytes": len(executable),
             "executable_sha256": "sha256:" + hashlib.sha256(executable).hexdigest(),
             "metallib_bytes": len(metallib),

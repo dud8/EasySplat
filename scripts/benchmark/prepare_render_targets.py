@@ -32,7 +32,8 @@ BOUNDARY_SAMPLES = 200
 INVERSE_ITERATIONS = 20
 SHA256_PREFIX = "sha256:"
 MSPLAT_SOURCE_COMMIT = "106499b0a53f82b0c92d013b0861fbebd341b17e"
-NATIVE_DECODE_CONTRACT = "native_coregraphics_imageio_rgb8_v1"
+NATIVE_DECODE_CONTRACT = "native_coregraphics_imageio_srgb8_v2"
+NATIVE_DECODE_MODE_VERSION = 2
 CAMERA_DIGEST_PREFIX = b"EasySplat render camera digest v1\0"
 
 
@@ -619,7 +620,10 @@ def _native_decoder_identity(value: Any, label: str) -> dict[str, Any]:
         },
         label,
     )
-    if identity["contract"] != NATIVE_DECODE_CONTRACT or identity["mode_version"] != 1:
+    if (
+        identity["contract"] != NATIVE_DECODE_CONTRACT
+        or identity["mode_version"] != NATIVE_DECODE_MODE_VERSION
+    ):
         raise PreparationError(f"{label} contract is unsupported")
     for field in ("executable_sha256", "metallib_sha256", "trainer_build_digest"):
         _digest(identity[field], f"{label}.{field}")
@@ -648,7 +652,7 @@ def _snapshot_native_decoder(
     )
     actual = {
         "contract": NATIVE_DECODE_CONTRACT,
-        "mode_version": 1,
+        "mode_version": NATIVE_DECODE_MODE_VERSION,
         "executable_bytes": len(executable),
         "executable_sha256": sha256_bytes(executable),
         "metallib_bytes": len(metallib),
@@ -764,7 +768,7 @@ def _native_decode_source(
         fixed = {
             "contract": NATIVE_DECODE_CONTRACT,
             "mode": "benchmark_decode",
-            "mode_version": 1,
+            "mode_version": NATIVE_DECODE_MODE_VERSION,
             "msplat_source_commit": MSPLAT_SOURCE_COMMIT,
             "schema_version": 1,
             "source_bytes": len(source_bytes),

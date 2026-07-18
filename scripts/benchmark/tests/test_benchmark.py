@@ -184,8 +184,8 @@ FIXTURE_GROUND_TRUTH_PREPARATION = benchmark.canonical_json_bytes(
             },
         },
         "native_decoder": {
-            "contract": "native_coregraphics_imageio_rgb8_v1",
-            "mode_version": 1,
+            "contract": "native_coregraphics_imageio_srgb8_v2",
+            "mode_version": 2,
             "executable_bytes": 1,
             "executable_sha256": "sha256:" + "2" * 64,
             "metallib_bytes": 1,

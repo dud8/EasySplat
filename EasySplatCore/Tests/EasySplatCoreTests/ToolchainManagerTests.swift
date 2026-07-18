@@ -443,6 +443,7 @@ final class ToolchainManagerTests: XCTestCase {
 
     func testValidateToolchainPinsNativeMsplatSourceArtifacts() throws {
         for key in [
+            "patch_sha256",
             "exact_raster_patch_sha256",
             "overlay_sha256",
             "raster_test_sha256",

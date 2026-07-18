@@ -2126,12 +2126,12 @@ int main(int argc, char *argv[]) {
             const std::string trainerBuildDigest = computeTrainerBuildDigest();
             const BenchmarkDecodeOutput outputReceipt = writeRGB8Atomically(output, decoded);
             const json receipt = {
-                {"contract", "native_coregraphics_imageio_rgb8_v1"},
+                {"contract", "native_coregraphics_imageio_srgb8_v2"},
                 {"executable_bytes", executableBytes},
                 {"executable_sha256", "sha256:" + executableDigest},
                 {"height", decoded.height},
                 {"mode", "benchmark_decode"},
-                {"mode_version", 1},
+                {"mode_version", 2},
                 {"metallib_bytes", metallibBytes},
                 {"metallib_sha256", "sha256:" + metallibDigest},
                 {"msplat_source_commit", std::string(msplatSourceCommit)},
