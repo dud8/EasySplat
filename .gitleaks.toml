@@ -22,3 +22,10 @@ condition = "AND"
 regexTarget = "line"
 regexes = ['''^[[:space:]]*forKey: \.alignmentP90ResidualDegrees[[:space:]]*$''']
 paths = ['''^Tools/BenchmarkDriver/Sources/BenchmarkDriverCore/OrientationEvidenceExtractor\.swift$''']
+
+[[rules.allowlists]]
+description = "Frozen native vocabulary output digest"
+condition = "AND"
+regexTarget = "line"
+regexes = ['''^[[:space:]]*"mixed_keypoints": "7bded7db318146a967b8476cb1d0b2fddf3e0c43d8f4aad05a2e951b5201e2d3",[[:space:]]*$''']
+paths = ['''^scripts/toolchain/tests/test_native_colmap_retriever\.py$''']
