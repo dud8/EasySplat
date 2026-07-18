@@ -2,11 +2,13 @@
 
 EasySplat turns video, photos, or both into a 3D Gaussian splat on an Apple Silicon Mac. Processing stays on the Mac. The result is a conventional PLY file.
 
-The current milestone is `v0.2.0-beta.1`, an unsigned public beta for macOS 15 and later. It is not a production-signed release: there is no Developer ID signature, notarization, or Gatekeeper approval yet.
+The next release target is `v0.2.0-beta.1`, an unsigned public beta for macOS 15 and later. It is not a production-signed release: there is no Developer ID signature, notarization, or Gatekeeper approval yet.
 
 ## Install the beta
 
-1. Download `EasySplat-0.2.0-beta.1-unsigned.dmg` from [GitHub Releases](https://github.com/dud8/EasySplat/releases).
+`v0.2.0-beta.1` is not published yet. When it appears under [GitHub Releases](https://github.com/dud8/EasySplat/releases):
+
+1. Download `EasySplat-0.2.0-beta.1-unsigned.dmg`.
 2. Drag EasySplat to Applications.
 3. On first launch, Control-click EasySplat, choose **Open**, then confirm.
 4. Let EasySplat download and verify the components required for the selected job.
@@ -159,7 +161,7 @@ gitleaks git --redact
 ```
 
 The full release benchmark needs the external 26-scene corpus described by `scripts/benchmark/corpus.json`; large media is intentionally not stored in Git.
-Native trainer changes also run `./scripts/ci/test_msplat_native_build.sh`. The protected Release App workflow supplies the signed toolchain, fixture, online/offline runners, and caches to `verify_beta.sh`, then runs `verify_ui.sh` from an isolated interactive macOS 15/Xcode 16.4 account. Printing either script's help is not a release check.
+Native trainer changes also run `./scripts/ci/test_msplat_native_build.sh`. The Release App workflow supplies the signed toolchain, fixture, online/offline runners, and caches to `verify_beta.sh`, then runs `verify_ui.sh` from an isolated interactive macOS 15/Xcode 16.4 account. Printing either script's help is not a release check.
 
 ## Release modes
 
@@ -177,7 +179,7 @@ Build the unsigned beta only with the explicit mode:
   --unsigned-beta
 ```
 
-The signed manifest, public key, and component archives must already be present under `Toolchains/`. The protected Toolchain Build workflow creates that release closure; `./scripts/run.sh` owns local development builds.
+The signed manifest, public key, and component archives must already be present under `Toolchains/`. The Toolchain Build workflow creates unsigned archives and a signing request. An independent release-authority workflow verifies, signs, and publishes that closure. `./scripts/run.sh` owns local development builds.
 
 Production packaging is intentionally disabled. `v1.0.0` remains blocked until Developer ID signing, hardened runtime, notarization, stapling, strict code-sign verification, Gatekeeper assessment, and a quarantined clean-Mac install all pass.
 

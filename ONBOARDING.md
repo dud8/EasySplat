@@ -8,7 +8,7 @@ Start with `./scripts/run.sh`. Do not add another launcher.
 
 The beta supports static-scene reconstruction from video, photo folders, and mixed input. It exports PLY and renders it with MetalSplatter.
 
-`v0.2.0-beta.1` is an unsigned public beta, not a production release. Only one reconstruction runs at a time.
+`v0.2.0-beta.1` is the current unsigned public-beta target. It is not published or production-signed. Only one reconstruction runs at a time.
 
 It does not include cloud processing, telemetry, 4D reconstruction, meshes, measurements, a plugin system, generated sharing copy, or additional public export formats.
 
@@ -185,7 +185,9 @@ The scale-reset result and the DA3 result below are untracked single-capture dia
 
 The default route has a separate local end-to-end sanity result on an M4 Max with 48 GB. A 9.54-second 4K HEVC drone clip selected 30 frames at the persisted 3 FPS analysis rate, registered 30/30 views, produced 4,728 sparse points and 43,709 observations at 0.55 px mean reprojection error, then trained 247,750 Gaussians in 46.08 seconds. Input-to-validated-PLY time was 85.46 seconds with 2.61 GB maximum resident memory, down from 258.77 seconds for the earlier 1,600 px/55-frame plan. This proves the signed-cache COLMAP-to-Metal path on one real capture; it does not replace the release corpus or held-out rendering gates.
 
-The private 250-view DJI regression completed from a freshly signed toolchain in 196.60 seconds on the same machine, down from the original 1,262-second app run. Prepare took 15 seconds; SIFT took 21 seconds; FAISS matching took 13 seconds; mapping took 54 seconds; and training took 87 seconds. It registered 250/250 views with 79,310 points and 966,106 observations at 0.37 px median and 1.27 px p90 residual. The process peaked at 3.40 GB resident memory, training published 688,487 Gaussians with no dropped raster intersections, and canonical orientation resolved as verified with 0.48° median and 0.68° p90 right-axis residuals. This is a 6.42× same-capture speedup. A second run with the tool server stopped completed from the verified 610 MB cache in 206.07 seconds and again registered 250/250 views with zero dropped intersections. These are signed-install and offline-reuse proofs for one private capture, not release-corpus evidence.
+At `d41617e`, the private 250-view DJI regression completed in 194.01 seconds on the same M4 Max, down from the original 1,262-second app run. Frame extraction and selection took 15.04 seconds; SIFT took 20.08 seconds; FAISS matching took 12.51 seconds; mapping took 60.14 seconds; and native training took 83.21 seconds. It registered 250/250 views with 79,139 points and 965,890 observations at 0.371 px median and 1.279 px p90 residual. Geometry peaked at 2.21 GB and training at 3.39 GB. Training produced 696,290 Gaussians with zero dropped intersections, and canonical orientation resolved as verified with 0.469° median and 0.675° p90 right-axis residuals. This is a 6.50× same-capture speedup.
+
+The run fetched a 9.33 MB native-core archive from an ephemerally signed loopback closure into a 35.6 MiB installed cache; neither DA3 nor Python was installed. With the server stopped, the same verified cache completed offline in 200.75 seconds, registered 250/250 views, and again reported zero dropped intersections. These are one-capture local install and offline-reuse checks, not public-release or corpus evidence.
 
 A separate 4 minute 56 second 8K apartment walkthrough completed in 360.82 seconds. Sequential analysis and extraction took 144.32 seconds, SIFT took 17.69 seconds, three FAISS graph passes took 110.23 seconds, mapping took 26.65 seconds, and training took 60.55 seconds. The maximum FAISS graph contained a 239-view dominant component plus eleven weak views and met the 95% ordered-video floor, so exact matching was unnecessary. COLMAP registered 236/250 views with 33,034 points and 151,748 observations at 0.58 px median and 1.55 px p90 residual. Training published 515,481 Gaussians with zero dropped intersections and peaked at 2.82 GB resident memory. Orientation resolved as verified from all 236 cameras. This validates the bounded ordered-video recovery behavior on one difficult interior capture, not the complete release corpus.
 
@@ -277,6 +279,6 @@ Unsigned beta packaging consumes an existing signed toolchain closure. Call `bui
 
 Unsigned beta artifacts say so in the filename, plist, release notes, provenance, and verification output. `--production` fails closed in both app and DMG builders.
 
-The app release workflow is manual, runs only from current protected `main` on the isolated self-hosted Apple Silicon runner, requires the release environment, and publishes to an existing reviewed prerelease tag. It does not create or move tags.
+The app release workflow is manual and requires a version tag pointing at current `main`. Build and packaged verification use an isolated self-hosted Apple Silicon runner; publication is a separate hosted job behind the `public-beta-release` environment. The workflow refuses to overwrite an existing GitHub release, creates and verifies a draft prerelease, then publishes it as immutable. It never creates or moves the tag.
 
 Production packaging is intentionally disabled until Developer ID signing, hardened runtime, notarization, stapling, strict nested-code verification, Gatekeeper assessment, and a quarantined clean-Mac install all pass. It must never fall back to an unsigned artifact.

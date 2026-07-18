@@ -1,8 +1,8 @@
 # Security policy
 
-## Supported release
+## Supported versions
 
-Security fixes currently target the latest `0.2.x` public beta. The beta app is unsigned and not notarized; that limitation is stated in the DMG filename, app metadata, release notes, and provenance.
+Security fixes target the `0.2.x` beta line. No public beta has been published yet. The planned beta is unsigned and not notarized; that limitation is stated in the DMG filename, app metadata, release notes, and provenance.
 
 ## Report privately
 
