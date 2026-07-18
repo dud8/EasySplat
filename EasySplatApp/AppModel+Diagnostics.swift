@@ -136,7 +136,7 @@ extension AppModel {
         }
     }
 
-    /// Deterministic default filename used in the Save Diagnostics panel.
+    /// Timestamped default filename used in the Save Diagnostics panel.
     static func diagnosticBundleFileName(for projectURL: URL) -> String {
         let formatter = DateFormatter()
         formatter.dateFormat = "yyyyMMdd-HHmm"

@@ -148,7 +148,7 @@ APPROVED_PAIRED_BASELINE = {
         "trainer": "native_msplat",
         "trainer_iterations": 7_000,
         "trainer_plateau_window": 800,
-        "deterministic_seed": 42,
+        "run_seed": 42,
     },
 }
 MAX_TOOLCHAIN_INSTALL_STATE_BYTES = 16 * 1024 * 1024
@@ -249,7 +249,7 @@ NONNEGATIVE_NUMBER_METRICS = {
     "mapping_speedup",
 }
 BOOLEAN_METRICS = {
-    "deterministic_restart",
+    "durable_state_recovery_succeeded",
     "orientation_sign_correct",
     "toolchain_fresh_install",
     "toolchain_cached_offline_run",
@@ -340,7 +340,7 @@ GATE_SCOPE_METRICS = {
         "long_sequence_frames",
         "long_sequence_rss_growth_fraction",
     },
-    "stability": {"repeat_runs", "crashes", "corrupt_outputs", "deterministic_restart"},
+    "stability": {"repeat_runs", "crashes", "corrupt_outputs", "durable_state_recovery_succeeded"},
     "invalid_input": set(),
     "toolchain": {
         "normal_photo_toolchain_bytes",
@@ -422,7 +422,7 @@ APPROVED_THRESHOLDS: dict[str, Any] = {
         "repeat_runs_min": 50,
         "crashes_max": 0,
         "corrupt_outputs_max": 0,
-        "deterministic_restart_required": True,
+        "durable_state_recovery_required": True,
     },
     "toolchain": {
         "normal_photo_bytes_max": 2_500_000_000,
@@ -851,8 +851,8 @@ def validate_corpus(corpus: Any, expected_profile: str) -> None:
 def validate_reference_config(config: Any) -> None:
     root = _require_mapping(config, "reference config")
     _require_exact_keys(root, {"schema_version", "references", "thresholds"}, "reference config")
-    if root["schema_version"] != 1:
-        raise ConfigError("reference config schema_version must be 1")
+    if root["schema_version"] != 2:
+        raise ConfigError("reference config schema_version must be 2")
     references = _require_mapping(root["references"], "references")
     _require_exact_keys(
         references,
@@ -1122,10 +1122,10 @@ def evaluate_gates(
         if values["corrupt_outputs"] > values["repeat_runs"]:
             failures.append("corrupt_outputs exceeds repeat_runs")
         if (
-            thresholds["stability"]["deterministic_restart_required"]
-            and values["deterministic_restart"] is not True
+            thresholds["stability"]["durable_state_recovery_required"]
+            and values["durable_state_recovery_succeeded"] is not True
         ):
-            failures.append("deterministic_restart must be true")
+            failures.append("durable_state_recovery_succeeded must be true")
 
     if "toolchain" in selected_scopes:
         maximum("normal_photo_toolchain_bytes", thresholds["toolchain"]["normal_photo_bytes_max"])
@@ -2040,7 +2040,7 @@ def validate_request_index(
         "request index",
     )
     expected = {
-        "schema_version": 1,
+        "schema_version": 2,
         "producer_protocol": evidence.PROTOCOL_VERSION,
         "producer_version": evidence.PRODUCER_VERSION,
         "producer_digest": evidence.sha256_file(ROOT / evidence.PRODUCER_RELATIVE_PATH),
@@ -2194,7 +2194,7 @@ def _result_shell(
     started_at: datetime,
 ) -> dict[str, Any]:
     return {
-        "schema_version": 1,
+        "schema_version": 2,
         "run_id": str(uuid.uuid4()),
         "started_at_utc": started_at.isoformat().replace("+00:00", "Z"),
         "ended_at_utc": None,
@@ -2258,7 +2258,7 @@ def validate_suite_result(result: Any) -> None:
         },
         "suite result",
     )
-    if root["schema_version"] != 1 or root["profile"] not in {"smoke", "release"}:
+    if root["schema_version"] != 2 or root["profile"] not in {"smoke", "release"}:
         raise ConfigError("suite result schema or profile is invalid")
     if root["status"] not in {"passed", "failed", "blocked"}:
         raise ConfigError("suite result status is invalid")
@@ -2622,8 +2622,8 @@ def _validate_fixture_envelope(
         },
         label,
     )
-    if value["schema_version"] != 1:
-        raise ConfigError(f"{label} must use schema_version 1")
+    if value["schema_version"] != 2:
+        raise ConfigError(f"{label} must use schema_version 2")
     expected = {
         "profile": identity.profile,
         "scene_id": scene["id"],
@@ -2880,10 +2880,10 @@ def _evidence_request(
         "ba_local_num_images": 6,
         "trainer_iterations": 7_000 if detail_profile == "balanced" else 3_000,
         "trainer_plateau_window": 800 if detail_profile == "balanced" else 400,
-        "deterministic_seed": 42,
+        "run_seed": 42,
     }
     return {
-        "schema_version": 3,
+        "schema_version": 4,
         "binding": {
             "profile": identity.profile,
             "scene_id": scene["id"],
@@ -3334,7 +3334,7 @@ def emit_evidence_requests(
                     }
                 )
     index = {
-        "schema_version": 1,
+        "schema_version": 2,
         "producer_protocol": evidence.PROTOCOL_VERSION,
         "producer_version": evidence.PRODUCER_VERSION,
         "producer_digest": evidence.sha256_file(ROOT / evidence.PRODUCER_RELATIVE_PATH),

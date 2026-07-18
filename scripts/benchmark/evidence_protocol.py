@@ -31,8 +31,8 @@ from pathlib import Path, PurePosixPath
 from typing import Any, Iterable, Mapping
 
 
-PROTOCOL_VERSION = 3
-PRODUCER_VERSION = "3.0.0"
+PROTOCOL_VERSION = 4
+PRODUCER_VERSION = "4.0.0"
 PRODUCER_RELATIVE_PATH = "scripts/benchmark/evidence_protocol.py"
 LANE_REFERENCE = "reference_m4_max"
 LANE_CONSTRAINED = "constrained_14_16gb"
@@ -172,7 +172,12 @@ LONG_SEQUENCE_METRICS = {
     "long_sequence_frames",
     "long_sequence_rss_growth_fraction",
 }
-STABILITY_METRICS = {"repeat_runs", "crashes", "corrupt_outputs", "deterministic_restart"}
+STABILITY_METRICS = {
+    "repeat_runs",
+    "crashes",
+    "corrupt_outputs",
+    "durable_state_recovery_succeeded",
+}
 TOOLCHAIN_CHECK_METRICS = {
     "toolchain_fresh_install",
     "toolchain_cached_offline_run",
@@ -3576,7 +3581,7 @@ def derive_metrics(
         interruption_stages: set[str] = set()
         recovery_actions: set[str] = set()
         stage_recovery_pairs: set[tuple[str, str]] = set()
-        deterministic_restarts: list[bool] = []
+        recovery_results: list[bool] = []
         for index, raw in enumerate(stability_runs):
             sample = _mapping(raw, f"stability.runs[{index}]")
             _exact_keys(
@@ -3588,7 +3593,7 @@ def derive_metrics(
                     "recovery_action",
                     "crashed",
                     "corrupt_output",
-                    "resumed_deterministically",
+                    "recovery_succeeded",
                 },
                 f"stability.runs[{index}]",
             )
@@ -3621,10 +3626,10 @@ def derive_metrics(
             if is_uninterrupted != (sample["recovery_action"] == "none"):
                 raise EvidenceError("stability interruption none must pair only with recovery none")
             if is_uninterrupted:
-                if sample["resumed_deterministically"] is not None:
-                    raise EvidenceError("uninterrupted stability runs must not claim optimizer resume")
-            elif type(sample["resumed_deterministically"]) is not bool:
-                raise EvidenceError("interrupted stability runs must report deterministic resume")
+                if sample["recovery_succeeded"] is not None:
+                    raise EvidenceError("uninterrupted stability runs must not report recovery")
+            elif type(sample["recovery_succeeded"]) is not bool:
+                raise EvidenceError("interrupted stability runs must report recovery success")
             crashes += sample["crashed"]
             corrupt_outputs += sample["corrupt_output"]
             categories.add(sample["category"])
@@ -3635,7 +3640,7 @@ def derive_metrics(
                 (sample["interruption_stage"], sample["recovery_action"])
             )
             if not is_uninterrupted:
-                deterministic_restarts.append(sample["resumed_deterministically"])
+                recovery_results.append(sample["recovery_succeeded"])
         if categories != {
             "object_orbit",
             "interior_walkthrough",
@@ -3662,7 +3667,7 @@ def derive_metrics(
                 "repeat_runs": measured(len(stability_runs)),
                 "crashes": measured(crashes),
                 "corrupt_outputs": measured(corrupt_outputs),
-                "deterministic_restart": measured(all(deterministic_restarts)),
+                "durable_state_recovery_succeeded": measured(all(recovery_results)),
             }
         )
 
@@ -3774,8 +3779,8 @@ def validate_request(request: Any) -> Mapping[str, Any]:
         },
         "request",
     )
-    if value["schema_version"] != 3:
-        raise EvidenceError("request schema_version must be 3")
+    if value["schema_version"] != 4:
+        raise EvidenceError("request schema_version must be 4")
     binding = _mapping(value["binding"], "request.binding")
     validate_runner_identity(
         value["rendering_driver_identity"],
@@ -3943,7 +3948,7 @@ def validate_request(request: Any) -> Mapping[str, Any]:
             "ba_local_num_images",
             "trainer_iterations",
             "trainer_plateau_window",
-            "deterministic_seed",
+            "run_seed",
         },
         "request.candidate_run_configuration",
     )
@@ -3961,8 +3966,8 @@ def validate_request(request: Any) -> Mapping[str, Any]:
         raise EvidenceError("candidate descriptor matcher must be faiss")
     _baseline_mapper_cadence(baseline_configuration)
     _candidate_mapper_cadence(candidate_configuration)
-    if candidate_configuration["deterministic_seed"] != 42:
-        raise EvidenceError("candidate deterministic seed must be 42")
+    if candidate_configuration["run_seed"] != 42:
+        raise EvidenceError("candidate run seed must be 42")
     gate_scopes = value["gate_scopes"]
     if (
         not isinstance(gate_scopes, list)
@@ -5652,7 +5657,7 @@ def _validate_training_manifest(
         or not 0 <= manifest["cameraOrderSeed"] <= (1 << 64) - 1
     ):
         raise EvidenceError("training manifest cameraOrderSeed is outside UInt64")
-    if manifest["cameraOrderSeed"] != candidate_configuration["deterministic_seed"]:
+    if manifest["cameraOrderSeed"] != candidate_configuration["run_seed"]:
         raise EvidenceError("training manifest cameraOrderSeed does not match request")
     if manifest["iterationLimit"] == 0 or manifest["plateauWindow"] == 0:
         raise EvidenceError("training manifest iteration contract is invalid")
@@ -6345,8 +6350,8 @@ def derive_attestation(
         if "toolchain" in scopes:
             observation_keys.add("toolchain_scenarios")
     _exact_keys(observations, observation_keys, "observations")
-    if observations["schema_version"] != 2:
-        raise EvidenceError("observations.schema_version must be 2")
+    if observations["schema_version"] != 3:
+        raise EvidenceError("observations.schema_version must be 3")
 
     baseline = _mapping(observations.get("baseline"), "observations.baseline")
     _exact_keys(
@@ -6620,7 +6625,7 @@ def derive_attestation(
     if producer_path != root / PRODUCER_RELATIVE_PATH:
         raise EvidenceError("protected producer is not running from the repository path")
     unsigned = {
-        "schema_version": 2,
+        "schema_version": 3,
         "binding": dict(request["binding"]),
         "baseline_run_configuration": dict(request["baseline_run_configuration"]),
         "candidate_run_configuration": dict(request["candidate_run_configuration"]),
@@ -6731,7 +6736,7 @@ def validate_prepared_attestation_file(
         },
         "attestation",
     )
-    if attestation["schema_version"] != 2 or attestation["lane"] != expected_lane:
+    if attestation["schema_version"] != 3 or attestation["lane"] != expected_lane:
         raise EvidenceError("attestation schema or lane is invalid")
     request = validate_request(expected_request)
     for field in (

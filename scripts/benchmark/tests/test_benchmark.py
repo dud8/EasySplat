@@ -566,7 +566,7 @@ def release_corpus() -> dict[str, object]:
 
 def valid_reference_config() -> dict[str, object]:
     return {
-        "schema_version": 1,
+        "schema_version": 2,
         "references": {
             "paired_baseline": {
                 "git_commit": "4f3c11735ad15e1318ee2043ce351e185c225d30",
@@ -602,7 +602,7 @@ def valid_reference_config() -> dict[str, object]:
                     "trainer": "native_msplat",
                     "trainer_iterations": 7000,
                     "trainer_plateau_window": 800,
-                    "deterministic_seed": 42,
+                    "run_seed": 42,
                 },
             },
             "accurate_colmap": {
@@ -677,7 +677,7 @@ def valid_reference_config() -> dict[str, object]:
                 "repeat_runs_min": 50,
                 "crashes_max": 0,
                 "corrupt_outputs_max": 0,
-                "deterministic_restart_required": True,
+                "durable_state_recovery_required": True,
             },
             "toolchain": {
                 "normal_photo_bytes_max": 2_500_000_000,
@@ -731,7 +731,7 @@ def passing_metrics() -> dict[str, object]:
         "corrupt_outputs": measured(0),
         "normal_photo_toolchain_bytes": measured(2_500_000_000),
         "large_area_toolchain_bytes": measured(2_500_000_000),
-        "deterministic_restart": measured(True),
+        "durable_state_recovery_succeeded": measured(True),
         "toolchain_fresh_install": measured(True),
         "toolchain_cached_offline_run": measured(True),
         "toolchain_interrupted_download_recovered": measured(True),
@@ -1053,7 +1053,7 @@ def stability_runs() -> list[dict[str, object]]:
                 "recovery_action": action,
                 "crashed": False,
                 "corrupt_output": False,
-                "resumed_deterministically": None if stage == "none" else True,
+                "recovery_succeeded": None if stage == "none" else True,
             }
         )
     return runs
@@ -1571,7 +1571,7 @@ def raw_observations(
         else candidate_timing(250.0 if lane == evidence.LANE_CONSTRAINED else 300.0)
     )
     observations: dict[str, object] = {
-        "schema_version": 2,
+        "schema_version": 3,
         "artifacts": {
             "command_log": "command.jsonl",
             "supervisor_run": "supervisor-run.json",
@@ -1952,7 +1952,7 @@ def training_manifest_for_observations(
         "detailProfile": candidate_configuration["detail_profile"],
         "iterationLimit": candidate_configuration["trainer_iterations"],
         "plateauWindow": candidate_configuration["trainer_plateau_window"],
-        "cameraOrderSeed": candidate_configuration["deterministic_seed"],
+        "cameraOrderSeed": candidate_configuration["run_seed"],
         "completedIteration": candidate_configuration["trainer_iterations"],
         "outputPath": "Output/splat.ply",
         "outputSHA256": hashlib.sha256(VALID_SPLAT_PLY.encode("utf-8")).hexdigest(),
@@ -2252,7 +2252,7 @@ def external_envelope(
     route: str = "fixture-route",
 ) -> dict[str, object]:
     return {
-        "schema_version": 1,
+        "schema_version": 2,
         "profile": identity.profile,
         "scene_id": scene["id"],
         "input_digest": input_digest,
@@ -2280,6 +2280,12 @@ class ConfigurationValidationTests(unittest.TestCase):
         config = json.loads((ROOT / "scripts/benchmark/reference-config.json").read_text(encoding="utf-8"))
         benchmark.validate_corpus(corpus, expected_profile="release")
         benchmark.validate_reference_config(config)
+        self.assertEqual(config["schema_version"], 2)
+        baseline_configuration = config["references"]["paired_baseline"]["run_configuration"]
+        self.assertEqual(baseline_configuration["run_seed"], 42)
+        self.assertNotIn("deterministic_seed", baseline_configuration)
+        self.assertTrue(config["thresholds"]["stability"]["durable_state_recovery_required"])
+        self.assertNotIn("deterministic_restart_required", config["thresholds"]["stability"])
         self.assertEqual(len(corpus["scenes"]), 26)
         contract = benchmark.benchmark_contract(corpus)
         self.assertEqual(len(contract["scenes"]), 26)
@@ -2472,6 +2478,7 @@ class ConfigurationValidationTests(unittest.TestCase):
 
     def test_result_schema_closes_top_level_and_scene_contracts(self) -> None:
         schema = json.loads((ROOT / "scripts/benchmark/result.schema.json").read_text(encoding="utf-8"))
+        self.assertEqual(schema["properties"]["schema_version"], {"const": 2})
         self.assertIs(schema["additionalProperties"], False)
         self.assertIs(schema["$defs"]["sceneResult"]["additionalProperties"], False)
         self.assertIs(schema["$defs"]["metrics"]["additionalProperties"], False)
@@ -2483,6 +2490,8 @@ class ConfigurationValidationTests(unittest.TestCase):
             if definition == {"$ref": "#/$defs/booleanMetric"}
         }
         self.assertEqual(boolean_metrics, benchmark.BOOLEAN_METRICS)
+        self.assertIn("durable_state_recovery_succeeded", boolean_metrics)
+        self.assertNotIn("deterministic_restart", boolean_metrics)
         self.assertIn("gate_scopes", schema["$defs"]["sceneResult"]["required"])
         self.assertIn("category", schema["$defs"]["sceneResult"]["required"])
         self.assertIn("capture_traits", schema["$defs"]["sceneResult"]["required"])
@@ -2527,6 +2536,7 @@ class ConfigurationValidationTests(unittest.TestCase):
         evidence_schema = json.loads(
             (ROOT / "scripts/benchmark/evidence.schema.json").read_text(encoding="utf-8")
         )
+        self.assertEqual(evidence_schema["properties"]["schema_version"], {"const": 3})
         self.assertIs(evidence_schema["additionalProperties"], False)
         self.assertIs(evidence_schema["properties"]["artifacts"]["additionalProperties"]["additionalProperties"], False)
         self.assertIn("measurement_runner", evidence_schema["required"])
@@ -2774,7 +2784,7 @@ class GateEvaluationTests(unittest.TestCase):
             "corrupt_outputs": measured(1),
             "normal_photo_toolchain_bytes": measured(2_500_000_001),
             "large_area_toolchain_bytes": measured(2_500_000_001),
-            "deterministic_restart": measured(False),
+            "durable_state_recovery_succeeded": measured(False),
         }
         for key, value in misses.items():
             with self.subTest(metric=key):
@@ -3166,12 +3176,46 @@ class EvidenceProtocolTests(unittest.TestCase):
     def test_request_pins_the_current_render_target_contract(self) -> None:
         request = evidence_request()
 
-        self.assertEqual(request["schema_version"], 3)
+        self.assertEqual(request["schema_version"], 4)
+        configuration = request["candidate_run_configuration"]
+        self.assertEqual(configuration["run_seed"], 42)
+        self.assertNotIn("deterministic_seed", configuration)
         self.assertIn(
             "ground_truth_preparation_sha256",
             request["reference_artifacts"],
         )
         evidence.validate_request(request)
+
+    def test_request_rejects_retired_determinism_contract_names(self) -> None:
+        request = evidence_request()
+        configuration = request["candidate_run_configuration"]
+        configuration["deterministic_seed"] = configuration.pop("run_seed")
+        with self.assertRaisesRegex(
+            evidence.EvidenceError,
+            "candidate_run_configuration.*invalid fields",
+        ):
+            evidence.validate_request(request)
+
+        observations = raw_observations(evidence.LANE_REFERENCE)
+        interrupted = next(
+            run
+            for run in observations["stability"]["runs"]
+            if run["interruption_stage"] != "none"
+        )
+        interrupted["resumed_deterministically"] = interrupted.pop("recovery_succeeded")
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            write_evidence_artifacts(root, observations, evidence_request())
+            with self.assertRaisesRegex(evidence.EvidenceError, "stability.*invalid fields"):
+                evidence.derive_attestation(
+                    evidence_request(),
+                    observations,
+                    root,
+                    root / "attestation.json",
+                    evidence.LANE_REFERENCE,
+                    runner_identity(evidence.LANE_REFERENCE),
+                    machine=evidence_machine(evidence.LANE_REFERENCE),
+                )
 
     def test_lane_outcome_distinguishes_execution_failure_from_environment(self) -> None:
         request = evidence_request()
@@ -3565,7 +3609,7 @@ class EvidenceProtocolTests(unittest.TestCase):
                 validate_attestation_schema(schema_invalid)
             self.assertEqual(metrics["registered_views"], measured(30))
             self.assertEqual(metrics["repeat_runs"], measured(50))
-            self.assertEqual(metrics["deterministic_restart"], measured(True))
+            self.assertEqual(metrics["durable_state_recovery_succeeded"], measured(True))
             self.assertEqual(metrics["m4_max_p50_seconds"], measured(100.0))
             self.assertEqual(metrics["fast_end_to_end_speedup"], measured(2.0))
             self.assertEqual(metrics["scheduled_pairs"], measured(119))
@@ -5329,7 +5373,7 @@ class EvidenceProtocolTests(unittest.TestCase):
             if run["interruption_stage"] == "none"
         )
         none_run["recovery_action"] = "relaunch_resume"
-        none_run["resumed_deterministically"] = True
+        none_run["recovery_succeeded"] = True
 
         missing_pair = json.loads(json.dumps(observations))
         for run in missing_pair["stability"]["runs"]:
@@ -7154,7 +7198,7 @@ class EvidenceProtocolTests(unittest.TestCase):
                 benchmark.canonical_json_bytes(config) + b"\n"
             )
             index = {
-                "schema_version": 1,
+                "schema_version": 2,
                 "producer_protocol": evidence.PROTOCOL_VERSION,
                 "producer_version": evidence.PRODUCER_VERSION,
                 "producer_digest": evidence.sha256_file(ROOT / evidence.PRODUCER_RELATIVE_PATH),

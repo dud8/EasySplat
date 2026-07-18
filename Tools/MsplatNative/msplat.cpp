@@ -2025,7 +2025,7 @@ int main(int argc, char *argv[]) {
         "--profile", profileName, "Training profile: fast, balanced, or high-detail"
     );
     CLI::Option *seedOption = app.add_option(
-        "--seed", seed, "Deterministic uint64 camera-order seed"
+        "--seed", seed, "UInt64 seed for reproducible camera ordering"
     );
     CLI::Option *memoryBudgetOption = app.add_option(
         "--memory-budget-bytes",

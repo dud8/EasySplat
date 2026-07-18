@@ -117,7 +117,7 @@ Useful variants:
 ./scripts/run.sh --toolchain-root /absolute/path/to/toolchain
 ```
 
-The only supported development overrides are the local toolchain root, candidate route, stop-after stage, skip-training, and deterministic benchmark seed. Product policy lives in typed run options and resolved plans, not backend-specific environment variables.
+The only supported development overrides are the local toolchain root, candidate route, stop-after stage, skip-training, and benchmark run seed. Product policy lives in typed run options and resolved plans, not backend-specific environment variables.
 
 ## Architecture
 

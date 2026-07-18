@@ -59,7 +59,7 @@ RequestedRunOptions {
 - bounded refinement iterations;
 - native training and plateau budgets;
 - required toolchain capabilities;
-- deterministic benchmark seed.
+- benchmark run seed.
 
 Automatic capture remains neutral. Runtime decisions use requested options or the resolved plan.
 
@@ -208,6 +208,8 @@ Resolved maximum iterations and plateau windows are:
 | High Detail | 15,000 | 1,500 |
 
 The process contract binds the checkpoint and final artifact to the geometry digest, input identity, profile, budget, seed, and trainer version. Exit zero without a validated completion event and PLY is failure.
+
+The run seed fixes COLMAP sampling, orientation bootstrap sampling, and trainer camera order. Relaxed FP32 Metal atomics can still change accumulation order, so matching seeds do not promise byte-identical checkpoints or PLY files.
 
 ## Toolchain trust
 

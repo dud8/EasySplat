@@ -91,7 +91,7 @@ class _RestartFixture:
 
         baseline = benchmark.APPROVED_PAIRED_BASELINE
         self.index = {
-            "schema_version": 1,
+            "schema_version": 2,
             "producer_protocol": evidence.PROTOCOL_VERSION,
             "producer_version": evidence.PRODUCER_VERSION,
             "producer_digest": evidence.sha256_file(

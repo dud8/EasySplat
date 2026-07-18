@@ -346,7 +346,7 @@ def _validate_prepared_attestation(
         },
         "prepared evidence",
     )
-    if attestation["schema_version"] != 2 or attestation["lane"] != lane:
+    if attestation["schema_version"] != 3 or attestation["lane"] != lane:
         raise AggregationError("prepared evidence schema or lane is invalid")
     validated_request = evidence.validate_request(request)
     for field in (
@@ -1044,7 +1044,7 @@ def aggregate_evidence(*, prepared_roots: Iterable[Path], output: Path) -> dict[
         for lane in RELEASE_LANES
     ).isoformat().replace("+00:00", "Z")
     result = {
-        "schema_version": 1,
+        "schema_version": 2,
         "run_id": str(uuid.UUID(bytes=index_digest[:16], version=5)),
         "started_at_utc": started_at,
         "ended_at_utc": ended_at,

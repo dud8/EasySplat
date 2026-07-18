@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import copy
 import contextlib
+import json
 import os
 import shutil
 import subprocess
@@ -647,6 +648,12 @@ class AggregateEvidenceTests(unittest.TestCase):
             self.assertEqual(
                 (outputs[0] / "suite.json").read_bytes(),
                 (outputs[1] / "suite.json").read_bytes(),
+            )
+            self.assertEqual(
+                json.loads((outputs[0] / "suite.json").read_text(encoding="utf-8"))[
+                    "schema_version"
+                ],
+                2,
             )
 
 

@@ -1385,7 +1385,7 @@ ModelSnapshot runSingleCameraWindow(
     return snapshot;
 }
 
-void verifyDeterministicWindowReplay(const std::string &dataset) {
+void verifyWindowReplayNumericalParity(const std::string &dataset) {
     const ModelSnapshot reference = runSingleCameraWindow(dataset, 0, 0);
     for (int overflowIteration : {1, 50, 100}) {
         const ModelSnapshot replayed = runSingleCameraWindow(dataset, overflowIteration, 0);
@@ -1397,7 +1397,8 @@ void verifyDeterministicWindowReplay(const std::string &dataset) {
     }
 
     constexpr int cancelledReplayLength = 37;
-    // A stopped replay must match the same number of committed exact iterations.
+    // A stopped replay must remain numerically equivalent after the same number
+    // of committed exact iterations.
     // Run the short reference directly so cancellation cannot accidentally retain
     // any guarded optimizer work from the original 100-step attempt.
     cleanup_msplat_metal();
@@ -1424,7 +1425,7 @@ void verifyDeterministicWindowReplay(const std::string &dataset) {
         cancelledReplayLength
     );
     requireModelNear("cancelled_replay_prefix", shortReference, cancelled);
-    std::cout << "deterministic_window_replay passed\n";
+    std::cout << "window_replay_numerical_parity passed\n";
 }
 
 void verifyRepeatedExactFallbackMetrics(const std::string &dataset) {
@@ -2212,7 +2213,7 @@ int main(int argc, char **argv) {
         verifyRestoredExactCapacity(argv[3]);
         verifyQueuedExactFallbackTiming(argv[3]);
         verifySyncFailureDrainsTimingHandlers(argv[3]);
-        verifyDeterministicWindowReplay(argv[3]);
+        verifyWindowReplayNumericalParity(argv[3]);
         verifyGPUCapacityFailure(argv[4]);
         verifyIncreasingWindowReplay(argv[5]);
         std::cout << "msplat raster parity passed\n";

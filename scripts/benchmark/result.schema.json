@@ -25,7 +25,7 @@
     "missing_requirements"
   ],
   "properties": {
-    "schema_version": {"const": 1},
+    "schema_version": {"const": 2},
     "run_id": {"type": "string", "format": "uuid"},
     "started_at_utc": {"type": "string", "format": "date-time"},
     "ended_at_utc": {"type": ["string", "null"], "format": "date-time"},
@@ -247,7 +247,7 @@
         "corrupt_outputs": {"$ref": "#/$defs/nonnegativeIntegerMetric"},
         "normal_photo_toolchain_bytes": {"$ref": "#/$defs/nonnegativeIntegerMetric"},
         "large_area_toolchain_bytes": {"$ref": "#/$defs/nonnegativeIntegerMetric"},
-        "deterministic_restart": {"$ref": "#/$defs/booleanMetric"},
+        "durable_state_recovery_succeeded": {"$ref": "#/$defs/booleanMetric"},
         "toolchain_fresh_install": {"$ref": "#/$defs/booleanMetric"},
         "toolchain_cached_offline_run": {"$ref": "#/$defs/booleanMetric"},
         "toolchain_interrupted_download_recovered": {"$ref": "#/$defs/booleanMetric"},
@@ -438,8 +438,8 @@
       "additionalProperties": false,
       "required": ["protocol_version", "version", "executable", "sha256"],
       "properties": {
-        "protocol_version": {"const": 3},
-        "version": {"const": "3.0.0"},
+        "protocol_version": {"const": 4},
+        "version": {"const": "4.0.0"},
         "executable": {"const": "scripts/benchmark/evidence_protocol.py"},
         "sha256": {"$ref": "#/$defs/sha256"}
       }

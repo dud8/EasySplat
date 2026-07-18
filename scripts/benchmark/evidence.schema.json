@@ -30,7 +30,7 @@
     "artifacts"
   ],
   "properties": {
-    "schema_version": {"const": 2},
+    "schema_version": {"const": 3},
     "binding": {
       "type": "object",
       "additionalProperties": false,
@@ -91,7 +91,7 @@
         "trainer",
         "trainer_iterations",
         "trainer_plateau_window",
-        "deterministic_seed"
+        "run_seed"
       ],
       "properties": {
         "detail_profile": {"const": "balanced"},
@@ -134,7 +134,7 @@
         "trainer": {"const": "native_msplat"},
         "trainer_iterations": {"const": 7000},
         "trainer_plateau_window": {"const": 800},
-        "deterministic_seed": {"const": 42}
+        "run_seed": {"const": 42}
       }
     },
     "candidate_run_configuration": {"$ref": "#/$defs/candidateRunConfiguration"},
@@ -481,7 +481,7 @@
         "ba_local_num_images",
         "trainer_iterations",
         "trainer_plateau_window",
-        "deterministic_seed"
+        "run_seed"
       ],
       "properties": {
         "detail_profile": {"enum": ["fast", "balanced"]},
@@ -523,7 +523,7 @@
         "ba_local_num_images": {"const": 6},
         "trainer_iterations": {"enum": [3000, 7000]},
         "trainer_plateau_window": {"enum": [400, 800]},
-        "deterministic_seed": {"const": 42}
+        "run_seed": {"const": 42}
       },
       "allOf": [
         {
