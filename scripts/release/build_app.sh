@@ -347,6 +347,7 @@ verify_bootstrap() {
     --public-key-file "$public_key"
     --app-version "$VERSION"
     --core-zip "$core_archive"
+    --url-policy "$BOOTSTRAP_URL_POLICY"
   )
   if [ -n "$PREPARED_BOOTSTRAP_VERIFIER" ]; then
     "$PREPARED_BOOTSTRAP_VERIFIER" "${args[@]}"
@@ -354,6 +355,10 @@ verify_bootstrap() {
     /usr/bin/swift run --package-path "$ROOT/Tools/ManifestTool" ManifestTool "${args[@]}"
   fi
 }
+BOOTSTRAP_URL_POLICY=release
+if [ "$RELEASE_MODE" = development-unsigned ]; then
+  BOOTSTRAP_URL_POLICY=loopback-development
+fi
 verify_bootstrap \
   "$SNAPSHOT_PUBLIC_KEY" \
   "$SNAPSHOT_BOOTSTRAP_MANIFEST" \

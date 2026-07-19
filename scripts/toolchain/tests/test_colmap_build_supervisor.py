@@ -46,7 +46,7 @@ class SourceContractTests(unittest.TestCase):
     def test_mandatory_release_gate_runs_the_supervisor_suite(self) -> None:
         script = RELEASE_TESTS.read_text(encoding="utf-8")
         self.assertIn(
-            'python3 "$ROOT/scripts/toolchain/tests/test_colmap_build_supervisor.py"',
+            '/usr/bin/python3 -I "$ROOT/scripts/toolchain/tests/test_colmap_build_supervisor.py"',
             script,
         )
 

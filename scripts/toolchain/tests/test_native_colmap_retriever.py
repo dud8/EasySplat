@@ -6,6 +6,7 @@ import importlib.util
 import json
 import os
 import re
+import shlex
 import shutil
 import sqlite3
 import stat
@@ -24,6 +25,7 @@ ROOT = Path(__file__).resolve().parents[3]
 BUILD_SCRIPT = ROOT / "scripts/toolchain/build_colmap.sh"
 BUILD_IMPLEMENTATION = ROOT / "scripts/toolchain/build_colmap_impl.sh"
 BUILD_SUPERVISOR = ROOT / "scripts/toolchain/secure_colmap_build.py"
+ATOMIC_PROMOTER = ROOT / "scripts/toolchain/atomic_swap_install.py"
 RELEASE_SCRIPT_TEST = ROOT / "scripts/ci/test_release_scripts.sh"
 OVERLAY_ROOT = ROOT / "Tools/NativeColmap"
 PATCH_PATH = ROOT / "scripts/toolchain/patches/colmap-4.1.1-easysplat.patch"
@@ -1448,13 +1450,25 @@ class SourceContractTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            wrapper = root / BUILD_SCRIPT.name
-            implementation = root / BUILD_IMPLEMENTATION.name
+            fixture_root = root / "fixture"
+            fixture_toolchain = fixture_root / "scripts/toolchain"
+            fixture_overlay = fixture_root / "Tools/NativeColmap"
+            fixture_patch_root = fixture_toolchain / "patches"
+            fixture_toolchain.mkdir(parents=True)
+            fixture_overlay.mkdir(parents=True)
+            fixture_patch_root.mkdir()
+            wrapper = fixture_toolchain / BUILD_SCRIPT.name
+            implementation = fixture_toolchain / BUILD_IMPLEMENTATION.name
             tools = root / "tools"
             capture = root / "captured-environment.txt"
             tools.mkdir()
             shutil.copy2(BUILD_SCRIPT, wrapper)
             wrapper.chmod(0o755)
+            shutil.copy2(BUILD_SUPERVISOR, fixture_toolchain / BUILD_SUPERVISOR.name)
+            shutil.copy2(ATOMIC_PROMOTER, fixture_toolchain / ATOMIC_PROMOTER.name)
+            shutil.copy2(PATCH_PATH, fixture_patch_root / PATCH_PATH.name)
+            for name in ("local_vocab_retriever.h", "local_vocab_retriever.cc"):
+                shutil.copy2(OVERLAY_ROOT / name, fixture_overlay / name)
 
             for name in ("cmake", "git", "ninja", "rg"):
                 executable = tools / name
@@ -1474,7 +1488,7 @@ class SourceContractTests(unittest.TestCase):
                         "  builtin printf 'git=%s\\n' \"$EASYSPLAT_BOOTSTRAP_GIT\"",
                         "  builtin printf 'ninja=%s\\n' \"$EASYSPLAT_BOOTSTRAP_NINJA\"",
                         "  builtin printf 'rg=%s\\n' \"$EASYSPLAT_BOOTSTRAP_RG\"",
-                        '} > "$1"',
+                        f'}} > {shlex.quote(str(capture))}',
                     )
                 )
                 + "\n",
@@ -1487,7 +1501,7 @@ class SourceContractTests(unittest.TestCase):
                     "cmake() { builtin printf 'inherited function ran\\n'; return 97; }",
                     "hostile_function() { return 98; }",
                     "export -f cmake hostile_function",
-                    'exec "$1" "$2"',
+                    'exec "$1"',
                 )
             )
             environment = os.environ.copy()
@@ -1507,7 +1521,6 @@ class SourceContractTests(unittest.TestCase):
                     launcher,
                     "bash",
                     str(wrapper),
-                    str(capture),
                 ],
                 check=False,
                 capture_output=True,
@@ -1534,8 +1547,13 @@ class SourceContractTests(unittest.TestCase):
         implementation = BUILD_IMPLEMENTATION.read_text(encoding="utf-8")
 
         for tool in ("CMAKE", "GIT", "NINJA", "RG"):
+            bootstrap_name = f"bootstrap_{tool.lower()}"
             self.assertIn(
-                f'BOOTSTRAP_{tool}_BIN="$(builtin type -P {tool.lower()} || true)"',
+                f'{bootstrap_name}="$(builtin type -P {tool.lower()} || true)"',
+                wrapper,
+            )
+            self.assertIn(
+                f'EASYSPLAT_BOOTSTRAP_{tool}="${bootstrap_name}"',
                 wrapper,
             )
             self.assertIn(
@@ -1559,10 +1577,10 @@ class SourceContractTests(unittest.TestCase):
         ):
             self.assertIn(dependency_binding, implementation)
         for bound_builder in (
-            '"builder_sha256": sha256(builder_path)',
-            '"builder_implementation_sha256": sha256(builder_implementation_path)',
-            '"build_supervisor_sha256": sha256(build_supervisor_path)',
-            '"promoter_sha256": sha256(promoter_path)',
+            '"builder_sha256": builder_sha256',
+            '"builder_implementation_sha256": builder_implementation_sha256',
+            '"build_supervisor_sha256": build_supervisor_sha256',
+            '"promoter_sha256": promoter_sha256',
         ):
             self.assertEqual(implementation.count(bound_builder), 2)
 
@@ -1577,7 +1595,7 @@ class SourceContractTests(unittest.TestCase):
 
         promotion = implementation.split("promote_install() {", 1)[1].split("\n}", 1)[0]
         self.assertIn(
-            '"$SELECTED_PYTHON" "$PROMOTER" "$INSTALL" "$LIVE_INSTALL"',
+            'run_frozen_promoter "$INSTALL" "$LIVE_INSTALL" "$tree_receipt"',
             promotion,
         )
         final_pipeline = implementation.rsplit("\npreflight\n", 1)[1]
@@ -2042,12 +2060,13 @@ class SourceContractTests(unittest.TestCase):
     def test_ci_and_clean_builder_run_the_honest_test_boundaries(self) -> None:
         release_test = RELEASE_SCRIPT_TEST.read_text(encoding="utf-8")
         source_only_command = (
-            'python3 "$ROOT/scripts/toolchain/tests/'
+            '/usr/bin/python3 -I "$ROOT/scripts/toolchain/tests/'
             'test_native_colmap_retriever.py" SourceContractTests'
         )
         self.assertIn(source_only_command, release_test)
         self.assertNotIn(
-            'python3 "$ROOT/scripts/toolchain/tests/test_native_colmap_retriever.py"\n',
+            '/usr/bin/python3 -I "$ROOT/scripts/toolchain/tests/'
+            'test_native_colmap_retriever.py"\n',
             release_test,
         )
 

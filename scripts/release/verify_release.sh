@@ -1477,12 +1477,17 @@ run_bootstrap_verifier() {
   local manifest=$1
   local core_archive=$2
   local public_key=$3
+  local url_policy=release
+  if [ "$ALLOW_INCOMPLETE" -eq 1 ]; then
+    url_policy=release-or-loopback-development
+  fi
   local args=(
     verify-bootstrap
     --manifest "$manifest"
     --public-key-file "$public_key"
     --app-version "$EXPECTED_VERSION"
     --core-zip "$core_archive"
+    --url-policy "$url_policy"
   )
   swift run --package-path "$ROOT/Tools/ManifestTool" ManifestTool "${args[@]}"
 }

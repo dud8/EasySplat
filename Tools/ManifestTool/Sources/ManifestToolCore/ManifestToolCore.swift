@@ -144,6 +144,12 @@ public struct ReleaseSigningRequest: Codable, Equatable {
     }
 }
 
+public enum BootstrapURLPolicy: String, Equatable {
+    case release
+    case loopbackDevelopment = "loopback-development"
+    case releaseOrLoopbackDevelopment = "release-or-loopback-development"
+}
+
 public enum ManifestBuilder {
     public static let maximumEncodedManifestBytes = 8 * 1_024 * 1_024
     public static let maximumReleaseSigningRequestBytes = 8 * 1_024 * 1_024
@@ -410,7 +416,8 @@ public enum ManifestBuilder {
         manifest: ManifestDocument,
         publicKeyBase64: String,
         expectedAppVersion: String,
-        coreArchive: URL
+        coreArchive: URL,
+        urlPolicy: BootstrapURLPolicy = .release
     ) throws {
         func fail(_ message: String) throws -> Never {
             throw NSError(
@@ -437,7 +444,22 @@ public enum ManifestBuilder {
             try fail("Bootstrap manifest signature or key identifier is invalid.")
         }
 
-        try validateProductionReleasePolicy(manifest, requireCanonicalReleaseURLs: true)
+        let usesLoopback = manifest.components.allSatisfy({ explicitLoopbackURL($0.url) })
+        switch urlPolicy {
+        case .release:
+            try validateProductionReleasePolicy(manifest, requireCanonicalReleaseURLs: true)
+        case .loopbackDevelopment:
+            guard usesLoopback else {
+                try fail("Development bootstrap component URLs must use an explicit loopback host.")
+            }
+            try validateProductionReleasePolicy(manifest, allowExplicitLoopbackHTTP: true)
+        case .releaseOrLoopbackDevelopment:
+            try validateProductionReleasePolicy(
+                manifest,
+                requireCanonicalReleaseURLs: !usesLoopback,
+                allowExplicitLoopbackHTTP: usesLoopback
+            )
+        }
         guard let core = manifest.components.first(where: { $0.name == "macos-arm64-core" }) else {
             try fail("Bootstrap manifest does not contain the required core component.")
         }
@@ -634,14 +656,16 @@ public enum ManifestBuilder {
 
     private static func validateProductionReleasePolicy(
         _ manifest: ManifestDocument,
-        requireCanonicalReleaseURLs: Bool = false
+        requireCanonicalReleaseURLs: Bool = false,
+        allowExplicitLoopbackHTTP: Bool = false
     ) throws {
         guard manifest.components.map(\.name) == productionComponentNames else {
             try releaseFailure("Release component set or order is invalid.")
         }
         for component in manifest.components {
             guard let url = URL(string: component.url),
-                  url.scheme?.lowercased() == "https",
+                  url.scheme?.lowercased() == "https"
+                    || (allowExplicitLoopbackHTTP && explicitLoopbackURL(component.url)),
                   url.host?.isEmpty == false,
                   url.user == nil,
                   url.password == nil,

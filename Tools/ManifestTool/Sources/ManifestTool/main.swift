@@ -28,11 +28,24 @@ struct ManifestTool {
                     "--public-key-file",
                     "--app-version",
                     "--core-zip",
+                    "--url-policy",
                 ])
                 let manifestURL = URL(fileURLWithPath: try parser.require("--manifest"))
                 let publicKeyURL = URL(fileURLWithPath: try parser.require("--public-key-file"))
                 let appVersion = try parser.require("--app-version")
                 let coreArchive = URL(fileURLWithPath: try parser.require("--core-zip"))
+                let rawURLPolicy = try parser.require("--url-policy")
+                guard let urlPolicy = BootstrapURLPolicy(rawValue: rawURLPolicy) else {
+                    throw NSError(
+                        domain: "ManifestTool",
+                        code: 4,
+                        userInfo: [
+                            NSLocalizedDescriptionKey:
+                                "--url-policy must be release, loopback-development, "
+                                    + "or release-or-loopback-development."
+                        ]
+                    )
+                }
                 let decoder = JSONDecoder()
                 decoder.dateDecodingStrategy = .iso8601
                 let manifest = try decoder.decode(
@@ -45,7 +58,8 @@ struct ManifestTool {
                     manifest: manifest,
                     publicKeyBase64: publicKeyBase64,
                     expectedAppVersion: appVersion,
-                    coreArchive: coreArchive
+                    coreArchive: coreArchive,
+                    urlPolicy: urlPolicy
                 )
                 print("Verified signed core bootstrap \(manifest.version)")
                 exit(ExitCode.ok.rawValue)
@@ -183,7 +197,8 @@ struct ManifestTool {
 
         Verify a signed bundled core bootstrap:
           ManifestTool verify-bootstrap --manifest <path> --public-key-file <path> \
-            --app-version <semver> --core-zip <path>
+            --app-version <semver> --core-zip <path> \
+            --url-policy release|loopback-development|release-or-loopback-development
 
         Prepare a canonical release signing request without a private key:
           ManifestTool prepare-release --repository <owner/repo> --source-commit <sha> \

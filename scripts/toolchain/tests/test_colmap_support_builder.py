@@ -561,6 +561,10 @@ class SourceContractTests(unittest.TestCase):
             RELEASE_TEST.read_text(encoding="utf-8"),
             r'test_colmap_support_builder\.py"\s+\\?\s*SourceContractTests\s+ArchiveSafetyTests\s+ReleaseArchiveMetadataTests\s+AtomicPromotionTests',
         )
+        self.assertIn(
+            '/usr/bin/python3 -I "$ROOT/scripts/toolchain/tests/test_colmap_support_builder.py"',
+            RELEASE_TEST.read_text(encoding="utf-8"),
+        )
 
     def test_release_archives_use_the_reproducible_writer(self) -> None:
         script = PACKAGE_TOOLCHAIN.read_text(encoding="utf-8")

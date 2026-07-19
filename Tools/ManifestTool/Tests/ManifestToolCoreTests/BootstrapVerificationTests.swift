@@ -19,7 +19,13 @@ final class BootstrapVerificationTests: XCTestCase {
     }
 
     func testBootstrapCommandArgumentsRejectUnknownDuplicateAndMissingOptions() throws {
-        let allowed: Set<String> = ["--manifest", "--public-key-file", "--app-version", "--core-zip"]
+        let allowed: Set<String> = [
+            "--manifest",
+            "--public-key-file",
+            "--app-version",
+            "--core-zip",
+            "--url-policy",
+        ]
         let unknown = ArgParser(["--manifest", "manifest.json", "--unknown", "value"])
         XCTAssertThrowsError(try unknown.requireOnly(allowed))
 
@@ -35,6 +41,7 @@ final class BootstrapVerificationTests: XCTestCase {
             "--public-key-base64", "key",
             "--app-version", "1.0.0",
             "--core-zip", "core.zip",
+            "--url-policy", "release",
         ])
         XCTAssertThrowsError(try inlineKey.requireOnly(allowed))
     }
@@ -76,6 +83,60 @@ final class BootstrapVerificationTests: XCTestCase {
             let manifest = try fixture.resigned(mutation)
             XCTAssertThrowsError(try verify(fixture, manifest: manifest))
         }
+    }
+
+    func testBootstrapVerifierRequiresExplicitPolicyForLoopbackDevelopmentManifest() throws {
+        let fixture = try makeFixture()
+        defer { fixture.remove() }
+
+        let loopback = try fixture.resigned { manifest in
+            manifest.components[0].url = "http://127.0.0.1/toolchain/core.zip"
+            manifest.components[1].url = "http://127.0.0.1/toolchain/base.zip"
+            manifest.components[2].url = "http://127.0.0.1/toolchain/small.zip"
+        }
+
+        XCTAssertThrowsError(try verify(fixture, manifest: loopback))
+        XCTAssertNoThrow(try ManifestBuilder.verifyBootstrap(
+            manifest: loopback,
+            publicKeyBase64: fixture.keypair.publicKeyBase64,
+            expectedAppVersion: "0.2.1",
+            coreArchive: fixture.coreArchive,
+            urlPolicy: .loopbackDevelopment
+        ))
+        XCTAssertNoThrow(try ManifestBuilder.verifyBootstrap(
+            manifest: loopback,
+            publicKeyBase64: fixture.keypair.publicKeyBase64,
+            expectedAppVersion: "0.2.1",
+            coreArchive: fixture.coreArchive,
+            urlPolicy: .releaseOrLoopbackDevelopment
+        ))
+        XCTAssertNoThrow(try ManifestBuilder.verifyBootstrap(
+            manifest: fixture.manifest,
+            publicKeyBase64: fixture.keypair.publicKeyBase64,
+            expectedAppVersion: "0.2.1",
+            coreArchive: fixture.coreArchive,
+            urlPolicy: .releaseOrLoopbackDevelopment
+        ))
+
+        let remoteDevelopment = try fixture.resigned { manifest in
+            manifest.components[0].url = "https://example.com/core.zip"
+            manifest.components[1].url = "https://example.com/base.zip"
+            manifest.components[2].url = "https://example.com/small.zip"
+        }
+        XCTAssertThrowsError(try ManifestBuilder.verifyBootstrap(
+            manifest: remoteDevelopment,
+            publicKeyBase64: fixture.keypair.publicKeyBase64,
+            expectedAppVersion: "0.2.1",
+            coreArchive: fixture.coreArchive,
+            urlPolicy: .loopbackDevelopment
+        ))
+        XCTAssertThrowsError(try ManifestBuilder.verifyBootstrap(
+            manifest: remoteDevelopment,
+            publicKeyBase64: fixture.keypair.publicKeyBase64,
+            expectedAppVersion: "0.2.1",
+            coreArchive: fixture.coreArchive,
+            urlPolicy: .releaseOrLoopbackDevelopment
+        ))
     }
 
     func testBootstrapVerifierBindsEveryCoreArchiveProperty() throws {

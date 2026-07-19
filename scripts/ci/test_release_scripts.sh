@@ -440,13 +440,13 @@ python3 "$ROOT/scripts/toolchain/tests/test_generate_supply_chain_manifest.py"
 python3 "$ROOT/scripts/toolchain/tests/test_da3_payload.py"
 python3 "$ROOT/scripts/toolchain/tests/test_create_reproducible_zip.py"
 /usr/bin/python3 -I "$ROOT/scripts/toolchain/tests/test_atomic_swap_install.py"
-python3 "$ROOT/scripts/toolchain/tests/test_colmap_build_supervisor.py"
-python3 "$ROOT/scripts/toolchain/tests/test_colmap_support_builder.py" \
+/usr/bin/python3 -I "$ROOT/scripts/toolchain/tests/test_colmap_build_supervisor.py"
+/usr/bin/python3 -I "$ROOT/scripts/toolchain/tests/test_colmap_support_builder.py" \
   SourceContractTests ArchiveSafetyTests ReleaseArchiveMetadataTests AtomicPromotionTests \
   BuildLockSafetyTests
-python3 "$ROOT/scripts/toolchain/tests/test_ceres_builder.py"
-python3 "$ROOT/scripts/toolchain/tests/test_openimageio_builder.py"
-python3 "$ROOT/scripts/toolchain/tests/test_native_colmap_retriever.py" SourceContractTests
+/usr/bin/python3 -I "$ROOT/scripts/toolchain/tests/test_ceres_builder.py"
+/usr/bin/python3 -I "$ROOT/scripts/toolchain/tests/test_openimageio_builder.py"
+/usr/bin/python3 -I "$ROOT/scripts/toolchain/tests/test_native_colmap_retriever.py" SourceContractTests
 python3 "$ROOT/scripts/release/tests/test_verify_publication_bundle.py"
 python3 "$ROOT/scripts/release/tests/test_release_policy_workflow.py"
 python3 "$ROOT/scripts/release/tests/test_finalize_signed_toolchain.py"
@@ -3272,13 +3272,21 @@ import sys
 from pathlib import Path
 
 arguments = Path(sys.argv[1]).read_text(encoding="utf-8").splitlines()
-if arguments[0] != "verify-bootstrap" or len(arguments) != 9:
+if arguments[0] != "verify-bootstrap" or len(arguments) != 11:
     raise SystemExit("Prepared ManifestTool received an unexpected command shape.")
 pairs = dict(zip(arguments[1::2], arguments[2::2]))
-if set(pairs) != {"--manifest", "--public-key-file", "--app-version", "--core-zip"}:
+if set(pairs) != {
+    "--manifest",
+    "--public-key-file",
+    "--app-version",
+    "--core-zip",
+    "--url-policy",
+}:
     raise SystemExit("Prepared ManifestTool did not receive the expected option set.")
 if pairs["--app-version"] != "0.2.0":
     raise SystemExit("Prepared ManifestTool received the wrong app version.")
+if pairs["--url-policy"] != "release":
+    raise SystemExit("Prepared ManifestTool did not enforce the release URL policy.")
 if Path(pairs["--manifest"]).name != "manifest.json":
     raise SystemExit("Prepared ManifestTool did not receive the manifest snapshot.")
 if Path(pairs["--public-key-file"]).name != "public_key_ed25519.txt":
@@ -5637,7 +5645,8 @@ swift run --package-path "$ROOT/Tools/ManifestTool" ManifestTool verify-bootstra
   --manifest "$resources_dir/ToolchainBootstrap/manifest.json" \
   --public-key-file "$public_key_path" \
   --app-version 0.2.0 \
-  --core-zip "$resources_dir/ToolchainBootstrap/macos-arm64-core.zip"
+  --core-zip "$resources_dir/ToolchainBootstrap/macos-arm64-core.zip" \
+  --url-policy loopback-development
 
 development_dmg="$TMP_DIR/EasySplat-0.2.0-unsigned.dmg"
 development_stem="${development_dmg%-unsigned.dmg}"
@@ -6030,6 +6039,134 @@ EASYSPLAT_TEST_APP_PATH="$app_bundle" \
   --allow-incomplete \
   --skip-packaged-app-smoke
 
+# The strict verifier must exercise canonical release URLs. The public CLI
+# intentionally refuses direct production signing, so only this hermetic
+# fixture is re-signed with the ephemeral test key created above.
+canonical_manifest="$metadata_fixture/canonical-manifest.json"
+/usr/bin/xcrun swift - \
+  "$private_key_path" \
+  "$metadata_fixture/manifest.json" \
+  "$canonical_manifest" <<'SWIFT'
+import CryptoKit
+import Foundation
+
+struct TestManifest: Codable {
+    struct AppVersionRange: Codable {
+        var minimum: String
+        var maximumExclusive: String?
+    }
+
+    enum Requirement: String, Codable {
+        case required
+        case optional
+    }
+
+    struct Component: Codable {
+        var name: String
+        var capabilities: [String]
+        var url: String
+        var sha256: String
+        var sizeBytes: UInt64
+        var expandedSizeBytes: UInt64
+        var expandedClosureSHA256: String
+        var contents: [String]
+        var criticalFileHashes: [String: String]
+        var dependencies: [String]
+        var requirement: Requirement
+    }
+
+    var schemaVersion: Int
+    var toolchainAPI: Int
+    var keyID: String
+    var version: String
+    var publishedAt: Date
+    var appVersionRange: AppVersionRange
+    var components: [Component]
+    var signatureEd25519: String
+}
+
+enum FixtureError: Error {
+    case invalidPrivateKey
+    case unexpectedComponent
+}
+
+let arguments = CommandLine.arguments
+let privateKeyText = try String(contentsOfFile: arguments[1], encoding: .utf8)
+    .trimmingCharacters(in: .whitespacesAndNewlines)
+guard let privateKeyData = Data(base64Encoded: privateKeyText) else {
+    throw FixtureError.invalidPrivateKey
+}
+
+let decoder = JSONDecoder()
+decoder.dateDecodingStrategy = .iso8601
+var manifest = try decoder.decode(
+    TestManifest.self,
+    from: Data(contentsOf: URL(fileURLWithPath: arguments[2]))
+)
+let releaseRoot = "https://github.com/dud8/EasySplat/releases/download/toolchain-v\(manifest.version)"
+let componentURLs = [
+    "macos-arm64-core": "\(releaseRoot)/toolchain-macos-arm64-\(manifest.version)-core.zip",
+    "geometry-da3-base": "\(releaseRoot)/toolchain-geometry-da3-base-\(manifest.version).zip",
+    "geometry-da3-small": "\(releaseRoot)/toolchain-geometry-da3-small-\(manifest.version).zip",
+]
+for index in manifest.components.indices {
+    guard let url = componentURLs[manifest.components[index].name] else {
+        throw FixtureError.unexpectedComponent
+    }
+    manifest.components[index].url = url
+}
+
+let encoder = JSONEncoder()
+encoder.outputFormatting = [.sortedKeys, .withoutEscapingSlashes]
+encoder.dateEncodingStrategy = .iso8601
+manifest.signatureEd25519 = ""
+let privateKey = try Curve25519.Signing.PrivateKey(rawRepresentation: privateKeyData)
+manifest.signatureEd25519 = try privateKey.signature(for: encoder.encode(manifest))
+    .base64EncodedString()
+try encoder.encode(manifest).write(
+    to: URL(fileURLWithPath: arguments[3]),
+    options: .atomic
+)
+SWIFT
+
+fixture_core_url="https://github.com/dud8/EasySplat/releases/download/toolchain-v2.0.0/toolchain-macos-arm64-2.0.0-core.zip"
+fixture_base_url="https://github.com/dud8/EasySplat/releases/download/toolchain-v2.0.0/toolchain-geometry-da3-base-2.0.0.zip"
+fixture_small_url="https://github.com/dud8/EasySplat/releases/download/toolchain-v2.0.0/toolchain-geometry-da3-small-2.0.0.zip"
+swift run --package-path "$ROOT/Tools/ManifestTool" ManifestTool verify-bootstrap \
+  --manifest "$canonical_manifest" \
+  --public-key-file "$public_key_path" \
+  --app-version 0.2.0 \
+  --core-zip "$metadata_fixture/core.zip" \
+  --url-policy release
+install -m 0600 "$metadata_fixture/manifest.json" \
+  "$metadata_fixture/development-manifest.json"
+install -m 0600 "$canonical_manifest" "$metadata_fixture/manifest.json"
+install -m 0644 "$canonical_manifest" \
+  "$resources_dir/ToolchainBootstrap/manifest.json"
+/usr/bin/codesign --force --deep --sign - --timestamp=none "$app_bundle"
+
+python3 "$metadata_tool" generate \
+  --app-version 0.2.0 \
+  --toolchain-version 2.0.0 \
+  --release-mode development-unsigned \
+  --source-url https://example.com/EasySplat \
+  --source-commit deadbeef \
+  --dmg "$development_dmg" \
+  --manifest "$metadata_fixture/manifest.json" \
+  --manifest-url https://example.com/manifest.json \
+  --core "$metadata_fixture/core.zip" \
+  --core-url "$fixture_core_url" \
+  --da3-base "$metadata_fixture/base.zip" \
+  --da3-base-url "$fixture_base_url" \
+  --da3-small "$metadata_fixture/small.zip" \
+  --da3-small-url "$fixture_small_url" \
+  --app-license "$ROOT/LICENSE" \
+  --notice "$ROOT/NOTICE.md" \
+  --viewer-license "$ROOT/ThirdParty/MetalSplatter/LICENSE" \
+  --provenance-out "$development_stem.provenance.json" \
+  --spdx-out "$development_stem.spdx.json" \
+  --licenses-out "$development_stem-licenses.zip"
+
 online_cache="$TMP_DIR/release-verifier-online-cache"
 offline_cache="$TMP_DIR/release-verifier-offline-cache"
 cached_cache="$TMP_DIR/release-verifier-cached-cache"
@@ -6082,6 +6219,9 @@ run_strict_verifier() {
     --evidence-dir "$evidence"
 }
 
+install -m 0644 "$metadata_fixture/development-manifest.json" \
+  "$resources_dir/ToolchainBootstrap/manifest.json"
+/usr/bin/codesign --force --deep --sign - --timestamp=none "$app_bundle"
 partial_e2e_error="$TMP_DIR/release-verifier-partial-e2e.stderr"
 if EASYSPLAT_HDIUTIL_BIN="$mock_hdiutil" \
   EASYSPLAT_TEST_HDIUTIL_LOG="$hdiutil_log" \
@@ -6099,6 +6239,9 @@ if EASYSPLAT_HDIUTIL_BIN="$mock_hdiutil" \
   exit 1
 fi
 grep -Fqi 'End-to-end verification requires' "$partial_e2e_error"
+install -m 0644 "$canonical_manifest" \
+  "$resources_dir/ToolchainBootstrap/manifest.json"
+/usr/bin/codesign --force --deep --sign - --timestamp=none "$app_bundle"
 
 missing_e2e_error="$TMP_DIR/release-verifier-missing-e2e.stderr"
 missing_evidence_error="$TMP_DIR/release-verifier-missing-evidence.stderr"
@@ -6506,6 +6649,9 @@ grep -Fq 'run_release_verifier "$@" >"$raw_log" 2>&1' \
 grep -Fq 'VERIFIED_MANIFEST_SHA256=' "$ROOT/scripts/release/verify_release.sh"
 grep -Fq 'VERIFIED_TOOLCHAIN_KEY_ID=' "$ROOT/scripts/release/verify_release.sh"
 grep -Fq 'VERIFIED_TOOLCHAIN_SIGNATURE_SHA256=' "$ROOT/scripts/release/verify_release.sh"
+grep -Fq 'url_policy=release-or-loopback-development' \
+  "$ROOT/scripts/release/verify_release.sh"
+grep -Fq -- '--url-policy "$url_policy"' "$ROOT/scripts/release/verify_release.sh"
 if rg -n 'cat "\$APP_WIRING_LOG"' \
   "$ROOT/scripts/release/verify_release.sh" >/dev/null; then
   echo "Strict release verification can print an unsanitized app log." >&2
